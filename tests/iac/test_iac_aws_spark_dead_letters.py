@@ -9,6 +9,7 @@ dead letters."""
 from __future__ import annotations
 
 import copy
+import os
 import subprocess
 
 import pytest
@@ -129,10 +130,10 @@ def test_lake_formation_lets_the_job_commit_to_its_dead_letters(contract):
     assert GRANT_KEY not in resources.get("aws_lakeformation_permissions", {})
 
 
-def test_a_location_forge_registers_refuses_a_dead_letters_table(contract):
+def test_a_location_forge_registers_refuses_a_dead_letters_table(contract, listed_topic):
     with pytest.raises(UnsupportedBindingError) as caught:
         emit(with_dead_letters(governed(contract, registerLocation=True)))
-    assert caught.value.kind == "spark-dead-letters-registered-location"
+    assert caught.value.kind == "spark-dead-letters-table-unsupported"
     # A topic needs no location.
     topic = with_dead_letters(
         governed(copy.deepcopy(CONTRACT), registerLocation=True),
@@ -143,7 +144,34 @@ def test_a_location_forge_registers_refuses_a_dead_letters_table(contract):
     assert TABLE_KEY not in resources["aws_glue_catalog_table"]
 
 
-def test_a_dead_letters_topic_may_be_written_on_the_cluster_and_nothing_else(contract):
+@pytest.fixture
+def listed_topic(monkeypatch):
+    """The operator lists the dead letters' topic for writing, beside the examples' entries."""
+    from fluid_build.iac.providers.aws_identity import TARGET_ALLOWLIST_ENV
+
+    entries = os.environ[TARGET_ALLOWLIST_ENV]
+    monkeypatch.setenv(TARGET_ALLOWLIST_ENV, f"{entries},msk-write:{MSK_ARN}/commerce.orders.dlq")
+
+
+def test_a_topic_the_operator_has_not_listed_for_writing_is_refused(contract):
+    from fluid_build.spark.policy import SparkPolicyError
+
+    with pytest.raises(SparkPolicyError) as caught:
+        emit(with_dead_letters(contract, sink="topic", topic="payments.commands"))
+    assert f"msk-write:{MSK_ARN}/payments.commands" in caught.value.why
+
+
+def test_the_streams_own_topic_is_never_its_dead_letters(contract):
+    with pytest.raises(ValueError, match="read its dead letters again"):
+        compile_job_config(
+            with_dead_letters(contract, sink="topic", topic="commerce.orders"),
+            contract["builds"][0],
+        )
+
+
+def test_a_dead_letters_topic_may_be_written_on_the_cluster_and_nothing_else(
+    contract, listed_topic
+):
     resources, data = emit(with_dead_letters(contract, sink="topic", topic="commerce.orders.dlq"))
     access = data["aws_iam_policy_document"][f"{KEY}_access"]
     write = statement(access, "MskDeadLetterTopic")
@@ -175,3 +203,39 @@ def test_the_dead_letters_module_passes_tofu_validate(contract, tmp_path):
         [_TOFU, "validate", "-no-color"], cwd=tmp_path, capture_output=True, text=True
     )
     assert done.returncode == 0, done.stderr or done.stdout
+
+
+def test_a_bucketless_output_forge_does_not_register_keeps_its_dead_letters_table(contract):
+    loc = contract["exposes"][0]["binding"]["location"]
+    del loc["bucket"]  # the account's shared bucket, under the product's own prefix
+    loc["path"] = "commerce.orders-stream/order_lines/"
+    resources, _ = emit(with_dead_letters(governed(contract, registerLocation=True)))
+    assert TABLE_KEY in resources["aws_glue_catalog_table"]
+
+
+@pytest.mark.parametrize(
+    ("change", "says"),
+    [
+        (
+            lambda c: c["exposes"][0].update(lifecycle={"retention": "P30D", "expire": True}),
+            "lifecycle expires",
+        ),
+        (lambda c: c["exposes"][0]["binding"]["location"].update(path=""), "bucket's root"),
+    ],
+)
+def test_a_dead_letters_table_forge_cannot_place_or_expire_is_refused(contract, change, says):
+    change(contract)
+    with pytest.raises(UnsupportedBindingError, match=says) as caught:
+        emit(with_dead_letters(contract))
+    assert caught.value.kind == "spark-dead-letters-table-unsupported"
+
+
+def test_two_builds_never_share_a_dead_letters_table(contract):
+    second = copy.deepcopy(contract["builds"][0])
+    second["id"] = "ingest-orders-again"
+    contract["builds"].append(second)
+    for build in contract["builds"]:
+        build["properties"]["stream"]["deadLetter"] = {"table": "rejects"}
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(contract)
+    assert caught.value.kind == "spark-address-conflict"

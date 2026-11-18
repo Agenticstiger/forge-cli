@@ -41,6 +41,7 @@ import hmac
 import json
 import os
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -62,7 +63,7 @@ DEAD_LETTER_SELECT = (
     "current_timestamp() AS `dead_lettered_at`",
 )
 #: Snapshot summary keys that make a dead-letter table append happen once per batch.
-_DL_CHECKPOINT_PROPERTY = "fluid.dead-letter.checkpoint"
+_DL_QUERY_PROPERTY = "fluid.dead-letter.query"
 _DL_BATCH_PROPERTY = "fluid.dead-letter.batch"
 GLUE_CATALOG_IMPL = "org.apache.iceberg.aws.glue.GlueCatalog"
 S3_FILE_IO = "org.apache.iceberg.aws.s3.S3FileIO"
@@ -193,22 +194,6 @@ def fetch_reader_schema(registry: dict, subject: str, version: object) -> str:
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise JobConfigError(f"the schema registry answered {code} with a redirect; refused")
-
-
-def with_decoded_mark(schema: str, mark) -> str:
-    """The reader schema with ``mark``, a boolean defaulting to true, appended to its
-    fields: schema resolution fills the default in for every record it decodes, so a
-    record that reads it as null is one the permissive handler replaced."""
-    if not mark:
-        return schema
-    parsed = json.loads(schema)
-    if not isinstance(parsed, dict) or parsed.get("type") != "record":
-        raise JobConfigError("dead letters read an Avro value that is a record")
-    fields = parsed.get("fields") or []
-    if any(f.get("name") == mark for f in fields if isinstance(f, dict)):
-        raise JobConfigError(f"the registry's schema already has a field named {mark}")
-    parsed["fields"] = [*fields, {"name": mark, "type": ["boolean", "null"], "default": True}]
-    return json.dumps(parsed)
 
 
 def registry_conf(registry: dict) -> dict:
@@ -409,32 +394,26 @@ def decode(spark, source: dict, column: str):
     jvm = spark.sparkContext._jvm
     abris = (
         jvm.za.co.absa.abris.config.AbrisConfig.fromConfluentAvro()
-        .provideReaderSchema(
-            with_decoded_mark(
-                fetch_reader_schema(registry, spec["subject"], spec["version"]),
-                spec.get("decodedMark"),
-            )
-        )
+        .provideReaderSchema(fetch_reader_schema(registry, spec["subject"], spec["version"]))
         .usingSchemaRegistry(jvm.PythonUtils.toScalaMap(registry_conf(registry)))
     )
-    if spec.get("decodedMark"):
-        # Dead letters: a record ABRiS cannot read becomes a row of nulls, decoded mark
-        # included, for sql.check (ABRiS 6.4.0 PermissiveRecordExceptionHandler).
-        handler = jvm.za.co.absa.abris.avro.errors.PermissiveRecordExceptionHandler()
-        abris = abris.withExceptionHandler(handler)
     return Column(
         jvm.za.co.absa.abris.avro.functions.from_avro(_to_java_column(col(column)), abris)
     )
 
 
-def read_records(spark, config: dict):
-    """``kafka_records``: the Kafka source's columns, ``value`` and ``key`` decoded."""
+def read_records(spark, config: dict, starting_offsets: str | None = None):
+    """``kafka_records``: the Kafka source's columns, ``value`` and ``key`` decoded, read
+    from ``starting_offsets`` (Spark's JSON form) when given, else from the config's."""
     from pyspark.sql.functions import col
 
     source = config["source"]
     if source.get("kind") != "kafka":
         raise JobConfigError("the source must be kafka")
-    raw = spark.readStream.format("kafka").options(**kafka_options(source)).load()
+    options = kafka_options(source)
+    if starting_offsets is not None:
+        options["startingOffsets"] = starting_offsets
+    raw = spark.readStream.format("kafka").options(**options).load()
     # With dead letters, the bytes travel beside the decoded value and key.
     kept = (
         [col("value").alias(RAW_VALUE), col("key").alias(RAW_KEY)]
@@ -472,7 +451,6 @@ def build_output(spark, config: dict):
         if config.get("deadLetter"):
             records.createOrReplaceTempView(DECODED_TABLE)
             checked = spark.sql(queries["check"])
-            checked.createOrReplaceTempView("fluid_checked_records")
             records = checked.where(f"`{ERROR_COLUMN}` IS NULL").drop(
                 ERROR_COLUMN, RAW_VALUE, RAW_KEY
             )
@@ -521,11 +499,16 @@ def run(spark, config: dict) -> None:
         writer = writer.trigger(availableNow=True)
     elif trigger.get("processingTime"):
         writer = writer.trigger(processingTime=trigger["processingTime"])
+    dead = config.get("deadLetter")
+    # Where the output resumes, read before it starts: a new dead-letter query starts there.
+    seed = dead_letter_start(spark, config) if dead else None
     query = writer.toTable(table)
     log("streaming", table=table, id=str(query.id))
     queries = [query]
-    if config.get("deadLetter"):
-        queries.append(start_dead_letters(spark, config, trigger))
+    if dead:
+        if seed is None and not _names(spark, f"{dead['checkpoint']}offsets"):
+            seed = await_initial_offsets(spark, config["checkpoint"], query)
+        queries.append(start_dead_letters(spark, config, trigger, seed))
     await_queries(spark, queries)
     log("done", table=table)
 
@@ -537,6 +520,8 @@ def await_queries(spark, queries) -> None:
         while any(q.isActive for q in queries):
             spark.streams.awaitAnyTermination()
             spark.streams.resetTerminated()
+        for q in queries:
+            q.awaitTermination()  # raises the error of one that failed after the reset
     except BaseException:
         for q in queries:
             if q.isActive:
@@ -556,7 +541,16 @@ class DeadLetters:
         self.spark, self.config = spark, config
         self.spec = config["deadLetter"]
         self.total = 0
-        self.checkpoint_id = hashlib.sha256(self.spec["checkpoint"].encode()).hexdigest()[:16]
+        self._query_id: str | None = None
+
+    def query_id(self) -> str:
+        """This query's id, from its checkpoint (Spark writes ``metadata`` when the query
+        starts): the same across restarts, a new one when the checkpoint is replaced, so
+        a batch id is only ever matched with this checkpoint's own batches."""
+        if self._query_id is None:
+            text = _read_small(self.spark, f"{self.spec['checkpoint']}metadata")
+            self._query_id = str(json.loads(text)["id"])
+        return self._query_id
 
     def __call__(self, batch, batch_id: int) -> None:
         batch = batch.persist()
@@ -582,16 +576,17 @@ class DeadLetters:
 
     def to_table(self, batch, batch_id: int) -> None:
         """Append the batch once: a batch replayed after a failure finds its own snapshot,
-        which carries this query's checkpoint and the batch id (as Iceberg's streaming
-        sink skips an epoch it already committed)."""
+        which carries this query's id and the batch id (as Iceberg's streaming sink keeps
+        the query id and epoch of what it committed)."""
         from pyspark.sql.functions import col
 
         table = f"{self.config['sink']['catalog']}.{self.spec['table']}"
         summary = col("summary")
+        query = self.query_id()
         done = (
             self.spark.table(f"{table}.snapshots")
             .where(
-                (summary[_DL_CHECKPOINT_PROPERTY] == self.checkpoint_id)
+                (summary[_DL_QUERY_PROPERTY] == query)
                 & (summary[_DL_BATCH_PROPERTY] == str(int(batch_id)))
             )
             .limit(1)
@@ -601,7 +596,7 @@ class DeadLetters:
             return
         (
             batch.writeTo(table)
-            .option(f"snapshot-property.{_DL_CHECKPOINT_PROPERTY}", self.checkpoint_id)
+            .option(f"snapshot-property.{_DL_QUERY_PROPERTY}", query)
             .option(f"snapshot-property.{_DL_BATCH_PROPERTY}", str(int(batch_id)))
             .option("check-nullability", "false")
             .append()
@@ -646,11 +641,14 @@ class DeadLetters:
         )
 
 
-def start_dead_letters(spark, config: dict, trigger: dict):
-    """The dead letters' own query: the checked records ``sql.check`` refused, with their
-    own checkpoint inside the stream's and the stream's trigger."""
-    spec = config["deadLetter"]
-    rows = spark.table("fluid_checked_records").where(f"`{ERROR_COLUMN}` IS NOT NULL")
+def start_dead_letters(spark, config: dict, trigger: dict, starting_offsets: str | None):
+    """The dead letters' own query: the records ``sql.check`` refuses, read by a source of
+    its own (from ``starting_offsets`` when its checkpoint is new), with a checkpoint
+    inside the stream's and the stream's trigger."""
+    spec, queries = config["deadLetter"], config["sql"]
+    read_records(spark, config, starting_offsets).createOrReplaceTempView(DECODED_TABLE)
+    checked = spark.sql(queries["check"])
+    rows = checked.where(f"`{ERROR_COLUMN}` IS NOT NULL")
     select = list(DEAD_LETTER_SELECT)
     if spec.get("raw") is False:
         # The build masks fields at ingest: a raw record would hold them in clear.
@@ -666,8 +664,95 @@ def start_dead_letters(spark, config: dict, trigger: dict):
         writer = writer.trigger(processingTime=trigger["processingTime"])
     query = writer.start()
     target = spec.get("table") or spec.get("topic")
-    log("dead_letters_streaming", sink=spec["sink"], to=target, id=str(query.id))
+    log(
+        "dead_letters_streaming",
+        sink=spec["sink"],
+        to=target,
+        id=str(query.id),
+        startingOffsets=starting_offsets or "its checkpoint, or the config's",
+    )
     return query
+
+
+# --- where a new dead-letter query starts --------------------------------------------
+#
+# The output query resumes from its own checkpoint. A dead-letter query whose checkpoint
+# is new (dead letters added to a stream that runs, perhaps one stopped by a record it
+# could not read) must start where the output does, or a record the output now refuses
+# and its dead letters never read is lost. Spark keeps a query's offsets in its
+# checkpoint: ``offsets/<n>`` (``v1``, the batch's metadata, then one line per source:
+# the offsets the batch ended at) for each batch, ``commits/<n>`` once it is done, and
+# ``sources/0/0`` (a NUL byte, ``v1``, the offsets the source started at).
+
+
+def _names(spark, directory: str) -> list:
+    """The names in ``directory``, on any file system Spark reads; none when it is missing."""
+    jvm = spark.sparkContext._jvm
+    path = jvm.org.apache.hadoop.fs.Path(directory)
+    fs = path.getFileSystem(spark.sparkContext._jsc.hadoopConfiguration())
+    if not fs.exists(path):
+        return []
+    return [status.getPath().getName() for status in fs.listStatus(path)]
+
+
+def _read_small(spark, path: str) -> str:
+    jvm = spark.sparkContext._jvm
+    hadoop_path = jvm.org.apache.hadoop.fs.Path(path)
+    stream = hadoop_path.getFileSystem(spark.sparkContext._jsc.hadoopConfiguration()).open(
+        hadoop_path
+    )
+    try:
+        return bytes(jvm.org.apache.commons.io.IOUtils.toByteArray(stream)).decode("utf-8")
+    finally:
+        stream.close()
+
+
+def source_offsets(text: str, line: int) -> str | None:
+    """The Kafka offsets on ``line`` of a checkpoint file, as ``startingOffsets`` takes them
+    (``{"<topic>": {"<partition>": <offset>}}``), or None."""
+    lines = text.lstrip("\x00").splitlines()
+    try:
+        offsets = json.loads(lines[line])
+    except (IndexError, ValueError):
+        return None
+    if not isinstance(offsets, dict) or not offsets:
+        return None
+    if not all(
+        isinstance(parts, dict) and all(isinstance(o, int) for o in parts.values())
+        for parts in offsets.values()
+    ):
+        return None
+    return json.dumps(offsets, sort_keys=True)
+
+
+def dead_letter_start(spark, config: dict) -> str | None:
+    """Where the output query starts, read before it does: its last committed batch's end,
+    or where its source started when no batch is committed. None when the dead letters'
+    checkpoint exists (Spark resumes it) or the output has never run."""
+    if _names(spark, f"{config['deadLetter']['checkpoint']}offsets"):
+        return None
+    checkpoint = config["checkpoint"]
+    done = [int(n) for n in _names(spark, f"{checkpoint}commits") if n.isdigit()]
+    if done:
+        return source_offsets(_read_small(spark, f"{checkpoint}offsets/{max(done)}"), 2)
+    if "0" in _names(spark, f"{checkpoint}sources/0"):
+        return source_offsets(_read_small(spark, f"{checkpoint}sources/0/0"), 1)
+    return None
+
+
+def await_initial_offsets(spark, checkpoint: str, query, timeout: float = 300.0) -> str | None:
+    """A new output query's starting offsets, once its source has written them (as it plans
+    its first batch). None if it ends or the time passes first: the dead letters then
+    start from the config's startingOffsets."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if "0" in _names(spark, f"{checkpoint}sources/0"):
+            return source_offsets(_read_small(spark, f"{checkpoint}sources/0/0"), 1)
+        if not query.isActive:
+            break
+        time.sleep(0.5)
+    log("dead_letters_start_unknown", checkpoint=checkpoint)
+    return None
 
 
 def read_text(spark, path: str) -> str:

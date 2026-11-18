@@ -148,20 +148,20 @@ def test_the_check_names_the_first_reason_decoding_first(contract):
     assert sql.endswith("FROM `kafka_records_decoded`")
 
 
-def test_an_avro_value_is_checked_by_its_decoded_mark():
-    stream = parse_stream(
-        {
-            "kind": "kafka",
-            "topic": "t",
-            "format": "avro-confluent",
-            "schema": [{"name": "id", "type": "string"}],
-        }
-    )
-    sql = dead_letter.check_select(stream, {"value": {"format": "avro-confluent"}, "key": None})
-    assert (
-        "WHEN `fluid_raw_value` IS NOT NULL AND `value`.`fluid_decoded` IS NULL THEN "
-        "'the value is not Avro that the registry schema decodes'" in sql
-    )
+def test_an_avro_stream_s_dead_letters_are_refused_for_now(contract):
+    """The decoder's permissive mode would also turn a schema registry outage into dead
+    letters, and the output and the dead letters decode each record apart."""
+    stream = contract["builds"][0]["properties"]["stream"]
+    stream["format"] = "avro-confluent"
+    stream["registry"] = {
+        "kind": "confluent",
+        "url": "https://registry.example:8081",
+        "subject": "orders-value",
+    }
+    with_dead_letters(contract)
+    with pytest.raises(ValueError, match="Avro stream's dead letters are not supported"):
+        # The operator's registry gate is apply's; the refusal is the contract's.
+        compile_job_config(contract, contract["builds"][0], host_gate=False)
 
 
 def test_a_local_stream_creates_its_dead_letter_table(contract):
@@ -204,23 +204,6 @@ def test_a_dead_letter_config_the_runner_cannot_follow_is_refused(runner, contra
     change(config)
     with pytest.raises(runner.JobConfigError, match=says):
         runner.parse_config(json.dumps(config))
-
-
-def test_the_reader_schema_gets_the_decoded_mark(runner):
-    schema = json.dumps(
-        {"type": "record", "name": "o", "fields": [{"name": "id", "type": "string"}]}
-    )
-    marked = json.loads(runner.with_decoded_mark(schema, dead_letter.DECODED_MARK))
-    assert marked["fields"][-1] == {
-        "name": "fluid_decoded",
-        "type": ["boolean", "null"],
-        "default": True,
-    }
-    assert runner.with_decoded_mark(schema, None) == schema
-    with pytest.raises(runner.JobConfigError, match="is a record"):
-        runner.with_decoded_mark('"string"', dead_letter.DECODED_MARK)
-    with pytest.raises(runner.JobConfigError, match="already has a field"):
-        runner.with_decoded_mark(json.dumps(marked), dead_letter.DECODED_MARK)
 
 
 def test_managed_flink_refuses_dead_letters():
@@ -313,3 +296,115 @@ def test_fluid_validate_reports_a_dead_letter_block_apply_would_refuse(contract,
     assert main(["validate", str(path), "--offline"]) != 0
     path.write_text(yaml.safe_dump(good, sort_keys=False), encoding="utf-8")
     assert main(["validate", str(path), "--offline"]) == 0
+
+
+# --- where a new dead-letter query starts ---------------------------------------------
+
+#: The offset log and the initial offsets Spark 3.5 wrote for a live run of this lane.
+OFFSETS_FILE = (
+    'v1\n{"batchWatermarkMs":0,"batchTimestampMs":1795025520028,"conf":{}}\n'
+    '{"source.events":{"1":3,"0":9}}'
+)
+INITIAL_FILE = '\x00v1\n{"source.events":{"1":0,"0":0}}'
+
+
+def test_spark_s_checkpoint_offsets_read_as_starting_offsets(runner):
+    assert runner.source_offsets(OFFSETS_FILE, 2) == '{"source.events": {"0": 9, "1": 3}}'
+    assert runner.source_offsets(INITIAL_FILE, 1) == '{"source.events": {"0": 0, "1": 0}}'
+    for text, line in (("v1\n{}", 1), ("v1\nnot json", 1), ('v1\n{"t": {"0": "x"}}', 1)):
+        assert runner.source_offsets(text, line) is None
+    assert runner.source_offsets("v1", 2) is None
+
+
+def checkpoints(runner, monkeypatch, files):
+    """``files``: path -> text, standing in for the checkpoints' file system."""
+
+    def names(spark, directory):
+        prefix = directory.rstrip("/") + "/"
+        return sorted({p[len(prefix) :].split("/")[0] for p in files if p.startswith(prefix)})
+
+    monkeypatch.setattr(runner, "_names", names)
+    monkeypatch.setattr(runner, "_read_small", lambda spark, path: files[path])
+
+
+def seed_of(runner, contract, monkeypatch, files):
+    config = runner.parse_config(runner_config(contract))
+    checkpoints(runner, monkeypatch, files)
+    return config, runner.dead_letter_start(None, config)
+
+
+def test_new_dead_letters_start_where_the_output_resumes(runner, contract, monkeypatch):
+    out = "s3://commerce-lake/_checkpoints/commerce.orders-stream/ingest-orders/"
+    later = OFFSETS_FILE.replace('"0":9', '"0":12')
+    config, seed = seed_of(
+        runner,
+        contract,
+        monkeypatch,
+        {
+            f"{out}commits/0": "v1",
+            f"{out}commits/1": "v1",
+            f"{out}offsets/0": OFFSETS_FILE.replace('"0":9', '"0":4'),
+            f"{out}offsets/1": OFFSETS_FILE,
+            f"{out}offsets/2": later,  # planned, not committed: replayed from batch 1's end
+            f"{out}sources/0/0": INITIAL_FILE,
+        },
+    )
+    assert config["deadLetter"]["checkpoint"] == f"{out}dead-letter/"
+    assert seed == '{"source.events": {"0": 9, "1": 3}}'
+
+
+def test_an_output_that_never_committed_resumes_where_its_source_started(
+    runner, contract, monkeypatch
+):
+    out = "s3://commerce-lake/_checkpoints/commerce.orders-stream/ingest-orders/"
+    _, seed = seed_of(
+        runner,
+        contract,
+        monkeypatch,
+        {f"{out}offsets/0": OFFSETS_FILE, f"{out}sources/0/0": INITIAL_FILE},
+    )
+    assert seed == '{"source.events": {"0": 0, "1": 0}}'
+
+
+def test_dead_letters_with_a_checkpoint_resume_it_and_a_new_output_is_waited_for(
+    runner, contract, monkeypatch
+):
+    out = "s3://commerce-lake/_checkpoints/commerce.orders-stream/ingest-orders/"
+    _, seed = seed_of(
+        runner,
+        contract,
+        monkeypatch,
+        {f"{out}dead-letter/offsets/0": OFFSETS_FILE, f"{out}commits/0": "v1"},
+    )
+    assert seed is None  # Spark resumes the dead letters' own checkpoint
+    _, seed = seed_of(runner, contract, monkeypatch, {})
+    assert seed is None  # a new output: run() waits for where its source starts
+
+    class Query:
+        isActive = False
+
+    assert runner.await_initial_offsets(None, out, Query(), timeout=1) is None
+    checkpoints(runner, monkeypatch, {f"{out}sources/0/0": INITIAL_FILE})
+    assert runner.await_initial_offsets(None, out, Query(), timeout=1) == (
+        '{"source.events": {"0": 0, "1": 0}}'
+    )
+
+
+def test_a_batch_is_known_by_its_query_s_id_which_a_new_checkpoint_changes(
+    runner, contract, monkeypatch
+):
+    config = runner.parse_config(runner_config(contract))
+    ckpt = config["deadLetter"]["checkpoint"]
+    checkpoints(runner, monkeypatch, {f"{ckpt}metadata": '{"id":"8f6d6c1e"}'})
+    assert runner.DeadLetters(spark=None, config=config).query_id() == "8f6d6c1e"
+
+
+def test_the_runner_names_the_columns_the_compiler_does(runner):
+    assert (runner.RAW_VALUE, runner.RAW_KEY, runner.ERROR_COLUMN, runner.DECODED_TABLE) == (
+        dead_letter.RAW_VALUE,
+        dead_letter.RAW_KEY,
+        dead_letter.ERROR_COLUMN,
+        dead_letter.DECODED_TABLE,
+    )
+    aliases = [s.rsplit(" AS ", 1)[1].strip("`") for s in runner.DEAD_LETTER_SELECT]
+    assert aliases == [name for name, _, _ in dead_letter.COLUMNS]

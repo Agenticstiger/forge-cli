@@ -39,21 +39,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer set `SPARK_*`, `PYSPARK_*`, `HADOOP_*` or `YARN_*`, which choose what spark-submit
   starts. The runner changed, so each running Spark stream restarts once on its next apply.
 - **A Spark stream sends the records it cannot land elsewhere: `properties.stream.deadLetter`
-  (0.7.7 preview).** A record whose value or key is not the declared JSON, is not Avro the
-  registry's schema decodes, or lacks a required field no longer fails the stream. It goes to a
-  dead-letter table beside the output (`<table>__dead_letter` by default, Iceberg v2: the reason,
-  the raw value and key, and the record's topic, partition, offset and timestamp), or with
-  `sink: topic` to a topic on the cluster the stream reads, with Kafka Connect's
-  `__connect.errors.*` headers. The output keeps its own exactly-once query. The dead letters are
-  a second query over the same decoded records, with its own checkpoint inside the stream's, and
-  each of its batches is committed to the table once. Past `maxRecordsBeforeAbort` dead letters
-  (10000 by default) since the job started, the stream stops once the batch that crossed it has
-  landed, and starts again when the build changes. `alertOn: [schema_violation]` logs an alert
-  for each batch that has dead letters. A build that masks fields at ingest keeps no raw bytes.
-  On AWS, OpenTofu emits the table and grants the job's role what writing it takes (its S3
-  prefix, its Glue table, and Lake Formation's permissions when Lake Formation governs the
-  output), or what writing the topic takes on MSK with IAM. A location forge registers with Lake
-  Formation is refused for now. The managed Flink lane refuses the block.
+  (0.7.7 preview).** A record whose value or key is not the declared JSON, or that lacks a
+  required field, no longer fails the stream. It goes to a dead-letter table beside the output
+  (`<table>__dead_letter` by default, Iceberg v2: the reason, the raw value and key, and the
+  record's topic, partition, offset and timestamp), or with `sink: topic` to a topic on the cluster
+  the stream reads (never the stream's own), with Kafka Connect's `__connect.errors.*` headers. The
+  output keeps its own exactly-once query. The dead letters are a second query over the same
+  records, with its own checkpoint inside the stream's: a new one starts where the output
+  resumes, so dead letters added to a stream a record had stopped take that record too. Each of
+  its batches is committed to the table once. Past `maxRecordsBeforeAbort` dead letters (10000 by
+  default) since the job started, the stream stops once the batch that crossed it has landed, and
+  starts again when the build changes. `alertOn: [schema_violation]` logs an alert for each batch
+  that has dead letters. A build that masks fields at ingest keeps no raw bytes. An Avro stream's
+  dead letters are refused for now, as the decoder's permissive mode would also turn a schema
+  registry outage into dead letters. On AWS, OpenTofu emits the table and grants the job's role
+  what writing it takes (its S3 prefix, its Glue table, and Lake Formation's permissions when Lake
+  Formation governs the output), or what writing the topic takes on MSK with IAM, once the
+  operator lists it in `FLUID_SPARK_TARGET_ALLOWLIST` as `msk-write:<cluster ARN>/<topic>`. A
+  table is refused beside a bucket-root output, a location forge registers with Lake Formation,
+  and an output whose lifecycle expires its objects; a topic takes their place. The managed Flink
+  lane refuses the block.
 
 ### Fixed
 

@@ -7,23 +7,24 @@
 ``deadLetter`` block and its ``sql.check`` query; the runner holds no contract logic:
 
 - **What a dead letter is.** A value or key that is not the declared JSON (Spark's
-  corrupt-record column, :data:`CORRUPT_COLUMN`) or not Avro the registry's schema
-  decodes (ABRiS's permissive handler turns it into a row of nulls, told apart from a real
-  record by :data:`DECODED_MARK`), and a required field
-  that is null. :func:`check_select` compiles one ``fluid_error`` reason per record from
-  the stream's declared fields, with the same reads as the source query
+  corrupt-record column, :data:`CORRUPT_COLUMN`), and a required field that is null.
+  :func:`check_select` compiles one ``fluid_error`` reason per record from the stream's
+  declared fields, with the same reads as the source query
   (``streaming.mapping.spark_source_select``), so a record the check passes can never
-  fail that query.
+  fail that query. An Avro stream's are not supported yet: the decoder's permissive mode
+  (ABRiS's ``PermissiveRecordExceptionHandler``) would also turn a schema registry outage
+  into dead letters.
 - **Where it goes.** ``sink: table``: an Iceberg table beside the output,
   ``<output>__dead_letter`` by default, as late events go to ``<output>__late_events``
   (``build_runners/_late_arrival.py``). ``sink: topic``: a Kafka topic on the cluster the
   stream reads, each record with Kafka Connect's error-context headers
   (``__connect.errors.*``, KIP-298).
 - **How it is landed.** The output keeps its own query and Iceberg's streaming sink, so
-  it stays exactly-once; the dead letters are a second query over the same decoded
-  stream, with its own checkpoint inside the stream's. Each of its micro-batches is
-  committed to the table at most once (the batch id goes into the snapshot's summary), and
-  sent to a topic at least once.
+  it stays exactly-once; the dead letters are a second query over the same records, with
+  its own checkpoint inside the stream's, which starts where the output resumes when it is
+  new (dead letters added to a running stream, perhaps one a record stopped). Each of its
+  micro-batches is committed to the table at most once (the query id and batch id go into
+  the snapshot's summary), and sent to a topic at least once.
 - **What it keeps.** The raw value and key bytes, the reason, the record's topic, partition,
   offset and timestamp. A build that masks fields at ingest (``maskAtIngest``) keeps no raw
   bytes, which would hold those fields in clear; its topic, partition and offset still find
@@ -41,11 +42,6 @@ from fluid_build.providers._sql_safety import validate_ident
 
 #: The JSON decoder's corrupt-record field (Spark's ``columnNameOfCorruptRecord``).
 CORRUPT_COLUMN = "fluid_corrupt_record"
-#: The field the runner adds to an Avro reader schema, with ``default: true``: Avro's
-#: schema resolution fills it in for every record it decodes, and ABRiS's permissive
-#: handler, which replaces a record it cannot read with a row of nulls (ABRiS 6.4.0
-#: ``PermissiveRecordExceptionHandler``), leaves it null.
-DECODED_MARK = "fluid_decoded"
 #: The undecoded bytes the runner keeps beside the decoded value and key.
 RAW_VALUE, RAW_KEY = "fluid_raw_value", "fluid_raw_key"
 #: The reason a record is a dead letter, or null.
@@ -181,22 +177,15 @@ def _violations(sql: str, dtype: Any, label: str, depth: int = 0) -> list[tuple[
     return found
 
 
-def _decode_error(
-    column: str, raw: str, spec: Optional[Mapping[str, Any]]
-) -> list[tuple[str, str]]:
+def _decode_error(column: str, spec: Optional[Mapping[str, Any]]) -> list[tuple[str, str]]:
     if spec is None or spec.get("format") == "raw":
         return []
-    if spec["format"] == "json":
-        return [
-            (
-                f"`{column}`.`{CORRUPT_COLUMN}` IS NOT NULL",
-                f"the {column} is not JSON of the declared fields and types",
-            )
-        ]
+    if spec["format"] != "json":
+        raise ValueError(f"dead letters read a JSON {column}, not {spec['format']}")
     return [
         (
-            f"`{raw}` IS NOT NULL AND `{column}`.`{DECODED_MARK}` IS NULL",
-            f"the {column} is not Avro that the registry schema decodes",
+            f"`{column}`.`{CORRUPT_COLUMN}` IS NOT NULL",
+            f"the {column} is not JSON of the declared fields and types",
         )
     ]
 
@@ -207,8 +196,8 @@ def check_select(stream: Any, decoders: Mapping[str, Any]) -> str:
     It reads :data:`DECODED_TABLE` (the Kafka records, ``value`` and ``key`` decoded, the
     raw bytes beside them) and adds :data:`ERROR_COLUMN`: the first reason that applies,
     decoding first, then the required fields in the source query's order."""
-    checks = _decode_error("value", RAW_VALUE, decoders.get("value"))
-    checks += _decode_error("key", RAW_KEY, decoders.get("key"))
+    checks = _decode_error("value", decoders.get("value"))
+    checks += _decode_error("key", decoders.get("key"))
     for name, dtype in stream.value:
         checks += _violations(f"`value`.`{name}`", dtype, name)
     if stream.key_format == "raw":

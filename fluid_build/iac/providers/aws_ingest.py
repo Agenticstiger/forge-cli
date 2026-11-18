@@ -433,7 +433,7 @@ def _emit_build(
     dead_table = dead["table"].split(".", 1)[1] if dead.get("sink") == "table" else None
     dead_prefix = None
     if dead_table:
-        _refuse_dead_letters_on_a_registered_location(b, expose)
+        _refuse_unsupported_dead_letter_table(b, contract, expose, data_prefix)
         dead_prefix = _dead_letter_prefix(data_prefix, dead_table)
     access = aws_identity.JobAccess(
         region=b.region,
@@ -873,19 +873,46 @@ def _dead_letter_prefix(data_prefix: str, dead_table: str) -> str:
     return f"{parent}/{dead_table}/" if parent else f"{dead_table}/"
 
 
-def _refuse_dead_letters_on_a_registered_location(b: _Build, expose: Mapping[str, Any]) -> None:
-    gov = ((expose.get("binding") or {}).get("governance") or {}).get("lakeFormation") or {}
-    if isinstance(gov, Mapping) and gov.get("registerLocation"):
+def _refuse_unsupported_dead_letter_table(
+    b: _Build, contract: Mapping[str, Any], expose: Mapping[str, Any], data_prefix: str
+) -> None:
+    """Refuse a dead-letter table forge cannot place or govern as it does the output: beside
+    a bucket-root output (it would sit inside its location), beside a location forge
+    registers with Lake Formation (it would need a registration of its own), or beside an
+    output whose lifecycle expires its objects (the rule would not reach the dead letters,
+    which hold the records' raw bytes)."""
+    from . import aws as _aws  # imported here: aws imports this module
+
+    binding = expose.get("binding") or {}
+    gov = (binding.get("governance") or {}).get("lakeFormation") or {}
+    lifecycle = expose.get("lifecycle")
+    problem = None
+    if not data_prefix.strip("/"):
+        problem = (
+            "the output's location is its bucket's root, and a table of the dead letters' own "
+            "would sit inside it"
+        )
+    elif isinstance(gov, Mapping) and gov.get("registerLocation"):
+        placement = _aws._placement(resolve_packaging(contract), expose)
+        if _aws._lf_location(binding.get("location") or {}, placement)[0]:
+            problem = (
+                "forge registers the output's location with Lake Formation "
+                "(registerLocation), and the dead letters' location would need a "
+                "registration of its own, which forge does not emit yet"
+            )
+    elif isinstance(lifecycle, Mapping) and lifecycle.get("expire") is True:
+        problem = (
+            "the output's lifecycle expires its objects, and the rule would not reach the dead "
+            "letters' table, which holds the records' raw bytes"
+        )
+    if problem:
         raise UnsupportedBindingError(
-            "spark-dead-letters-registered-location",
+            "spark-dead-letters-table-unsupported",
             f"{b.where}: properties.stream.deadLetter writes a table of its own beside the "
-            "output, and forge registers the output's location with Lake Formation "
-            "(registerLocation); the dead letters' location would need a registration of its "
-            "own, which forge does not emit yet.",
+            f"output, and {problem}.",
             (
-                "Send the dead letters to a topic (deadLetter.sink: topic).",
-                "Or register the locations outside forge (governance.lakeFormation without "
-                "registerLocation).",
+                "Send the dead letters to a topic (deadLetter.sink: topic), whose retention is "
+                "the topic's.",
             ),
         )
 
@@ -933,7 +960,15 @@ def _emit_dead_letter_table(
         f"The records the forge Spark build {b.build_id} could not land in "
         f"{database}.{loc.get('table')}, with why and where they were read"
     )
-    blocks.resources.setdefault("aws_glue_catalog_table", {})[key] = body
+    tables = blocks.resources.setdefault("aws_glue_catalog_table", {})
+    if key in tables:
+        raise UnsupportedBindingError(
+            "spark-address-conflict",
+            f"{b.where}: properties.stream.deadLetter.table {database}.{dead_table} is another "
+            "Spark build's dead-letter table.",
+            ("Give each build's dead letters a table of their own.",),
+        )
+    tables[key] = body
     gov = (binding.get("governance") or {}).get("lakeFormation")
     if gov and principal is not None:
         blocks.resources.setdefault("aws_lakeformation_permissions", {})[

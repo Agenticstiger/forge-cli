@@ -165,7 +165,8 @@ def test_the_runner_imports_nothing_but_the_standard_library_at_module_level():
         elif isinstance(node, ast.ImportFrom):
             names.add(node.module.split(".")[0])
     assert names <= {
-        "__future__", "argparse", "base64", "hashlib", "hmac", "json", "os", "sys", "urllib",
+        "__future__", "argparse", "base64", "hashlib", "hmac", "json", "os", "sys", "time",
+        "urllib",
     }  # fmt: skip
 
 
@@ -178,8 +179,7 @@ def test_the_runner_never_formats_the_query_text():
         if "spark.sql(" in line and not line.strip().startswith("#")
     ]
     assert calls and all(
-        c.endswith('spark.sql(queries["source"])')
-        or c.endswith('spark.sql(queries["select"])')
+        c.endswith('spark.sql(queries["source"])') or c.endswith('spark.sql(queries["select"])')
         # the dead letters' check, compiled by forge-cli like the other two
         or c.endswith('spark.sql(queries["check"])')
         # the sink's own CREATE ... IF NOT EXISTS statements, compiled by forge-cli

@@ -69,10 +69,11 @@ CONFIG_VERSION = 1
 #: streaming.policy), which a tier-0 leaf importing this module must not.
 CONTRACT_SQL_ALLOWLIST_ENV = "FLUID_SPARK_CONTRACT_SQL_ALLOWLIST"
 #: Operator-only: the existing runtimes and MSK clusters a contract may name, as
-#: ``<runtime>:<id>`` or ``msk:<cluster ARN>``. A job reads whichever cluster its build
-#: names, with a role that may read it, so a contract naming another team's cluster would
-#: read that team's topics. Unset allows none. The IaC applies the same list
-#: (``iac/providers/aws_identity.py``).
+#: ``<runtime>:<id>`` or ``msk:<cluster ARN>``, and the topics a stream's dead letters may
+#: be written to, as ``msk-write:<cluster ARN>/<topic>``. A job reads whichever cluster its
+#: build names, with a role that may read it, so a contract naming another team's cluster
+#: would read that team's topics, and write the one its dead letters go to. Unset allows
+#: none. The IaC applies the same list (``iac/providers/aws_identity.py``).
 TARGET_ALLOWLIST_ENV = "FLUID_SPARK_TARGET_ALLOWLIST"
 #: The Spark catalog the runner registers for the Glue catalog, and the default one,
 #: so contract SQL names a table as ``<database>.<table>``.
@@ -447,10 +448,9 @@ def _decoders(
     stream: Any, registry: Optional[Mapping[str, Any]], *, dead_letters: bool = False
 ) -> dict[str, Any]:
     """How the runner decodes ``value`` and ``key``, by the stream's formats. With dead
-    letters, a record that does not decode is kept, its error visible to the check query:
-    JSON into Spark's corrupt-record column, Avro as a row of nulls without the decoded
-    mark (ABRiS's permissive handler; :data:`dead_letter.DECODED_MARK`)."""
-    from fluid_build.spark.dead_letter import CORRUPT_COLUMN, DECODED_MARK
+    letters, a JSON record that does not decode is kept, its text in Spark's corrupt-record
+    column for the check query."""
+    from fluid_build.spark.dead_letter import CORRUPT_COLUMN
 
     def decoder(fmt: str, fields: Any, subject: Optional[str]) -> dict[str, Any]:
         if fmt == "json":
@@ -463,14 +463,13 @@ def _decoders(
             }
         if fmt == "avro-confluent":
             version = registry["version"] if subject == registry["subject"] else "latest"
-            spec = {
+            return {
                 "format": "avro-confluent",
                 "subject": subject,
                 "version": version,
                 # The runner checks the decoded record against the declared fields.
                 "schema": spark_schema(fields),
             }
-            return {**spec, "decodedMark": DECODED_MARK} if dead_letters else spec
         return {"format": "raw"}
 
     key = None
@@ -739,6 +738,17 @@ def compile_job_config(
         dead = dead_letter.parse(stream_spec.get("deadLetter"), swhere)
         if dead is not None:
             _refuse_corrupt_column_name(stream, swhere)
+            if "avro-confluent" in (stream.format, stream.key_format):
+                raise ValueError(
+                    f"{swhere}.deadLetter: an Avro stream's dead letters are not supported "
+                    "yet: the decoder's permissive mode would also turn a schema registry "
+                    "outage into dead letters"
+                )
+            if dead["topic"] is not None and dead["topic"] == stream_spec.get("topic"):
+                raise ValueError(
+                    f"{swhere}.deadLetter.topic: the stream's own topic; the stream would read "
+                    "its dead letters again"
+                )
         decoders = _decoders(stream, registry, dead_letters=dead is not None)
         source = {
             "kind": "kafka",
@@ -814,16 +824,15 @@ def compile_job_config(
 
 
 def _refuse_corrupt_column_name(stream: Any, where: str) -> None:
-    from fluid_build.spark.dead_letter import CORRUPT_COLUMN, DECODED_MARK
+    from fluid_build.spark.dead_letter import CORRUPT_COLUMN
 
     names = {name.casefold() for name, _ in stream.value}
     names |= {name[len(stream.key_prefix) :].casefold() for name, _ in stream.key}
-    for reserved in (CORRUPT_COLUMN, DECODED_MARK):
-        if reserved in names:
-            raise ValueError(
-                f"{where}.deadLetter: the stream declares a field named {reserved}, which "
-                "the runner keeps a record's decoding outcome in; rename it"
-            )
+    if CORRUPT_COLUMN in names:
+        raise ValueError(
+            f"{where}.deadLetter: the stream declares a field named {CORRUPT_COLUMN}, which "
+            "the runner keeps a record's undecoded text in; rename it"
+        )
 
 
 def _dead_letter_block(
