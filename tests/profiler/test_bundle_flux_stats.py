@@ -327,6 +327,17 @@ def test_records_no_group_holds_that_pass_the_checks_leave_the_groups_published(
     assert {g["status"] for g in by_market["groups"]} == {"F"}
 
 
+def test_records_no_group_holds_that_the_block_refuses_withhold_the_groups(tmp_path):
+    # Only the grouped mean reads the amount as the block declares it, so the row in no
+    # group is never refused; the profile cannot vouch for it, and withholds the groups.
+    rows = _rows()
+    rows[6]["market"] = None
+    rows[6]["amount"] = "500"  # outside the declared range of 0 to 100
+    result = _profile(tmp_path, rows, [PROPERTIES[1]], market_null="exclude")
+    by_market = _entry(result, "amount", "mean/1", "market")
+    assert {g["status"] for g in by_market["groups"]} == {"D"}
+
+
 def test_a_null_key_on_a_null_value_hides_nothing(tmp_path):
     rows = _rows()
     rows[6]["market"] = None

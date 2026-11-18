@@ -234,14 +234,6 @@ def _run(argv):
         return exited.code
 
 
-def test_an_empty_bundle_value_is_refused_rather_than_dropped(workspace, registry, capsys):
-    rc = main(["profile", "contract.fluid.yaml", "--source", "orders.ndjson", "--bundle", ""])
-    out = capsys.readouterr().out
-    assert rc == 1
-    assert "profile_bundle_not_a_directory" in out and "--bundle names no directory" in out
-    assert not (workspace / "orders.profile.json").exists()
-
-
 def test_the_summary_names_each_statistic_once_with_its_columns_and_shape():
     assert profile_cmd._named(
         [
@@ -354,6 +346,13 @@ def _bundle_for_another_expose(workspace):
     ("prepare", "given", "said"),
     [
         pytest.param(_no_bundle, "nope", ("nope",), id="missing"),
+        # An unset variable (--bundle "$BUNDLE") must not drop the block unnoticed.
+        pytest.param(
+            _no_bundle,
+            "",
+            ("profile_bundle_not_a_directory", "--bundle names no directory"),
+            id="empty",
+        ),
         pytest.param(
             _no_bundle, "contract.fluid.yaml", ("profile_bundle_not_a_directory",), id="a-file"
         ),
