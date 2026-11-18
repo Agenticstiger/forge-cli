@@ -9,16 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`fluid profile --bundle` writes `C` for every withheld group and cell of a histogram.** In
-  0.32.0 a `marginalHistogram/1` or `levelHistogram/1` value that an output check withheld kept
-  that check's code, `A` for a small count, and a code that names the check tells a reader a
-  range: cells of 10, 9, 9 and 10 records written `F`, `A`, `A` and `F`, under a total the reader
-  knows, give both withheld cells as 9. FLUX PROFILE-SPEC now asks a profiler to write `C`
-  (withheld statistical information) for every withheld group and cell of a count table, whatever
-  withheld it (FLUX ADR 0012). The summary still counts each by the check that withheld it, and
-  now says so: `Withheld, by the check (CL_CONF_STATUS code): A (small count) 3.` A new line
-  counts the histogram cells withheld inside published groups. Every other statistic keeps the
-  check's code, and a profile 0.32.0 wrote still reads.
+- **`fluid profile --bundle` writes `C` for every withheld group and cell of a histogram or a
+  quantile.** In 0.32.0 a `marginalHistogram/1`, `levelHistogram/1` or `quantile/1` value that an
+  output check withheld kept that check's code, `A` for a small count, and a code that names the
+  check tells a reader a range: cells of 10, 9, 9 and 10 records written `F`, `A`, `A` and `F`,
+  under a total the reader knows, give both withheld cells as 9. FLUX PROFILE-SPEC now asks a
+  profiler to write `C` (withheld statistical information) for every withheld group and cell of a
+  count table and of a `quantile/1`, whatever withheld it (FLUX ADR 0012). The summary still
+  counts each by the check that withheld it, and now says so:
+  `Withheld, by the check (CL_CONF_STATUS code): A (small count) 3.` A new line counts the
+  histogram cells withheld inside published groups. Every other statistic keeps the check's code,
+  and a profile 0.32.0 wrote still reads.
 
 ### Fixed
 
@@ -58,9 +59,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A quantile is published only when the records below and above it pass the threshold too.**
   A `quantile/1` group was published when ten records held its witness, with its two ranks, so a
   rank could say that 3 records lie below the witness, or that 2 lie above it. A group is now
-  published only when the records below its witness and those above it are each none or at least
-  `minimumCell`, on unrounded counts (the three cells of FLUX ADR 0012), and it is withheld with
-  `A` otherwise. `fluid profile --help` names the rule.
+  published only when the records below its witness and those above it each number at least
+  `minimumCell`, on unrounded counts (the three cells of FLUX ADR 0012). None is allowed only
+  where the rule does not hold zeros disclosive: it says no record lies between the witness and
+  the end of the range. `fluid profile --help` names the rule.
+- **A quantile is withheld beside another statistic that counts at its column's edges.** Its
+  ranks count records at its witness, an edge no declaration fixes, so next to a histogram of its
+  column they could give a withheld cell back (ranks of 17 beside a published cell of 12 give a
+  withheld 5), and two quantiles of one column give back the records between their witnesses. A
+  quantile is now published only as its column's one histogram or quantile; beside another level,
+  a histogram, or the whole beside a groupBy, every group is withheld. A quantile checked there
+  needs bins, once forge-cli writes FLUX's binned quantile.
+- **A group withheld for its size withholds its siblings in a grouped histogram or quantile.**
+  Every grouped statistic publishes each group's size, so a group of 5 records was the column's
+  count less its siblings' sizes, which only a grouped mean or support withheld. Now, when a group
+  of a groupBy (or the rows a null key leaves out of every group) fails the size check, every
+  group of that groupBy's histograms and quantiles on the column is withheld too, counted as `D`.
 
 ## [0.32.0] — 2026-11-18
 
