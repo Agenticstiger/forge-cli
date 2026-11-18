@@ -164,7 +164,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validate each contract. `--format sarif` also refuses `--list-versions` and `--show-schema`,
   whose text would end the log.
 
+- **`fluid ship --release-dir DIR` publishes a run as a release once every stage it ran
+  passed.** The run stages into a new `DIR.partial-<run-id>-*` beside `DIR`. It copies the
+  bundle, the artifacts the artifacts MANIFEST lists (each checked against its digest), the
+  plan when stage 6 ran, and the reports there. It writes `release.json` last and renames the
+  directory to `DIR`. `release.json` keeps the release's `identity` apart from its
+  `provenance`. The identity holds the product id, environment, `fluidVersion`, Forge
+  version, exact emit set, bundle MANIFEST digest, archive sha256, artifacts MANIFEST digest
+  and the plan's digests, plus the apply mode when stage 7 ran (so a dry run never reads as
+  an apply); two clean runs of one checkout give the same identity and
+  `identity_digest`. The provenance holds the run id, the stage times, the CI run and the
+  report time. A run that fails, or is interrupted, publishes nothing: its reports stay in
+  `runtime/` and in the staging directory, and `ship-report.json` names the stage that
+  stopped it. A release run first removes the stage reports in `runtime/`, so only this run's
+  are published. `DIR` must not
+  exist, and stages 1-4 must run in the invocation; otherwise ship refuses with exit 2, and
+  `--explain` says why. A release run reads only local files: it opens no network connection
+  of its own.
+
 ### Changed
+
+- **`ship-report.json` is versioned: `"schema": "fluid-ship-report/2"`.** Every stage has one
+  of six statuses: `passed`, `failed`, `skipped-by-policy` (a flag, a `RUN_STAGE_*` switch or
+  a dry run turned it off), `unsupported` (nothing to act on: no policy bindings, no DAGs, no
+  scheduler), `not-run` (not selected, or after a failure) or `unknown`. It also has one
+  `reason`, which replaces `skip_reason` and `failure_reason`, and `started_at` /
+  `finished_at` in UTC. An interrupted stage is `unknown`, not `failed`: what it had done by
+  then is not known. In one-step-per-stage CI, an earlier step's report that is the run's but
+  cannot be read leaves the stages before this step `unknown`, and the run's `exit_code` is
+  not 0. A
+  version 1 record still merges, with `skipped` read as `skipped-by-policy`. The report gains
+  `written_at`, and a `release` block under `--release-dir`. JUnit counts `unknown` as a
+  failure and both kinds of skip as skipped.
 
 - **`fluid profile --bundle` writes `C` for every withheld group and cell of a histogram or a
   quantile.** In 0.32.0 a `marginalHistogram/1`, `levelHistogram/1` or `quantile/1` value that an

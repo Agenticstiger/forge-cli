@@ -126,6 +126,9 @@ class StageAction:
     name: str
     argv: Optional[List[str]] = None
     skip_reason: Optional[str] = None
+    # A skip because there is nothing for the stage to act on (no policy
+    # bindings, no DAGs, no scheduler), not because a flag or switch said so.
+    unsupported: bool = False
     notes: List[str] = field(default_factory=list)
 
 
@@ -398,6 +401,12 @@ def compact_spec(numbers: Sequence[int]) -> str:
         else:
             spans.append([num])
     return ",".join(str(s[0]) if len(s) == 1 else f"{s[0]}-{s[-1]}" for s in spans)
+
+
+def skipped_by_policy(reason: Optional[str]) -> bool:
+    """Whether a stage :func:`select_stages` left out was switched off (``--skip-stage``,
+    a ``RUN_STAGE_<N>_<NAME>=false`` variable) rather than not selected."""
+    return reason == "--skip-stage" or (reason or "").endswith("=false")
 
 
 def _why_not_chosen(num: int, stage_spec: Optional[str]) -> str:
@@ -689,6 +698,7 @@ def _apply(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
 def _policy_apply(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
     if not ws.has_file(POLICY_BINDINGS):
         a.skip_reason = f"{POLICY_BINDINGS} does not exist (no policy bindings to apply)"
+        a.unsupported = True
         return
     mode = o.policy_mode
     if dry_run_applied_nothing(o) and mode == "enforce":
@@ -736,7 +746,9 @@ def _schedule_sync(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
         a.skip_reason = reason
     elif not o.scheduler:
         a.skip_reason = "SCHEDULER is blank: no scheduler to sync to"
+        a.unsupported = True
     elif not ws.dir_has_entries(SCHEDULE_DIR):
+        a.unsupported = True
         a.skip_reason = (
             f"no {SCHEDULE_DIR}/ DAGs to sync (stage 3 not run, or the contract declares "
             "no orchestration.engine and no scheduled build)"
@@ -861,7 +873,7 @@ def forget_artifacts_manifest(root: Path) -> None:
         (root / ARTIFACTS_MANIFEST).unlink()
 
 
-def _unwritten(root: Path, files: Mapping[str, object], rel: str) -> Optional[str]:
+def listed_file_problem(root: Path, files: Mapping[str, object], rel: str) -> Optional[str]:
     """Why ``rel`` (under dist/artifacts/) is not this run's output, or ``None``."""
     from fluid_build.cli._attestation import _sha256_file
 
@@ -883,10 +895,9 @@ def _unwritten(root: Path, files: Mapping[str, object], rel: str) -> Optional[st
     return None
 
 
-def _bundle_ports(root: Path) -> List[str]:
-    """The ``exposes[]`` ids of the contract stage 1 bundled, as the ODCS
-    emitter names them (``exposeId``, else ``id``; an entry without either has
-    no file). ``ValueError`` when the bundle cannot be read."""
+def bundled_contract(root: Path) -> Dict[str, Any]:
+    """The contract stage 1 bundled (``contract.resolved.yaml`` in the bundle,
+    read without extracting). ``ValueError`` when the bundle cannot be read."""
     import tarfile
 
     import yaml
@@ -899,7 +910,14 @@ def _bundle_ports(root: Path) -> List[str]:
         contract = yaml.safe_load(text.decode("utf-8"))
     except (OSError, KeyError, tarfile.TarError, yaml.YAMLError, UnicodeDecodeError) as exc:
         raise ValueError(f"cannot read the contract in {BUNDLE_PATH}: {exc}") from None
-    exposes = contract.get("exposes") if isinstance(contract, dict) else None
+    return contract if isinstance(contract, dict) else {}
+
+
+def _bundle_ports(root: Path) -> List[str]:
+    """The ``exposes[]`` ids of the contract stage 1 bundled, as the ODCS
+    emitter names them (``exposeId``, else ``id``; an entry without either has
+    no file). ``ValueError`` when the bundle cannot be read."""
+    exposes = bundled_contract(root).get("exposes")
     ports: List[str] = []
     for expose in exposes if isinstance(exposes, list) else []:
         if isinstance(expose, dict):
@@ -922,7 +940,7 @@ def _odcs_problems(root: Path, files: Mapping[str, object]) -> List[str]:
     for port in ports:
         # The name the ODCS writer gives the port's file (artifact_fanout._emit_odcs).
         rel = f"odcs/{safe_filename_stem(f'product.odcs.{port}', 'product.odcs')}.yaml"
-        why = _unwritten(root, files, rel)
+        why = listed_file_problem(root, files, rel)
         if why:
             problems.append(f"odcs: port {port!r} has no ODCS ({ARTIFACTS_DIR}{rel} {why})")
     return problems
@@ -936,7 +954,7 @@ def _one_or_more(
         return [f"{key}: stage 3 wrote no {what}"]
     return [
         f"{key}: {ARTIFACTS_DIR}{rel} {why}"
-        for rel, why in ((rel, _unwritten(root, files, rel)) for rel in found)
+        for rel, why in ((rel, listed_file_problem(root, files, rel)) for rel in found)
         if why
     ]
 
@@ -960,7 +978,7 @@ def _key_problems(key: str, root: Path, files: Mapping[str, object]) -> List[str
             root, files, key, "OPDS document (opds/*.opds.json)", _top_level("opds", ".opds.json")
         )
     if key == "policies":
-        why = _unwritten(root, files, "policy/bindings.json")
+        why = listed_file_problem(root, files, "policy/bindings.json")
         return [f"policies: {POLICY_BINDINGS} {why}"] if why else []
     what = (
         "schedule file (orchestration.engine is none, or it is unset and no build has a "
