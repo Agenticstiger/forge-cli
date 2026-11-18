@@ -96,11 +96,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   histogram cells withheld inside published groups. Every other statistic keeps the check's code,
   and a profile 0.32.0 wrote still reads.
 - **`fluid profile --help` says what a published `min` or `max` leaves readable.** A `min` or
-  `max` says that no record lies beyond it, a range of no records the zero rule does not reach
-  (FLUX ADR 0012, amended 2026-11-18). So under the defaults, which hold zeros disclosive, a
-  quantile whose witness is the column's smallest or largest value is withheld, though the `min`
-  or `max` says the same. The help and the output checks' documentation now say so. Nothing the
-  profiler writes changes.
+  `max` shows that no record lies below or above it, a range of no records that no check
+  withholds (FLUX ADR 0012, amended 2026-11-18). A quantile whose value is the column's smallest
+  or largest shows the same, and under the defaults, which hold zeros disclosive, it is withheld
+  for that. The help and the output checks' documentation now say so. Nothing the profiler
+  writes changes.
 
 ### Fixed
 

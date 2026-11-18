@@ -40,11 +40,12 @@ records below its witness and the records above it must each be at least
 of 3 would say that three records lie below the witness. None is allowed only where
 zeros are not disclosive, since it says no record lies between the witness and the
 end of the range. A published minimum or maximum says that no record lies beyond it,
-and the zero rule does not reach it (FLUX ADR 0012, amended 2026-11-18). So where
-zeros are disclosive, a quantile whose witness is the column's smallest value is
-withheld for its cell of no records below the witness, though a published minimum
-says the same, and so is one whose witness is the largest value, though a published
-maximum says the same.
+and no check withholds it for that (FLUX ADR 0012, amended 2026-11-18). This leaves
+the checks inconsistent at the ends of the range: where zeros are disclosive, a
+quantile whose witness is the column's smallest value is withheld because no record
+lies below the witness, though a published minimum already shows that, and one whose
+witness is the largest value is withheld because no record lies above it, though a
+published maximum already shows that.
 
 A verdict names the check that fired with an SDMX ``CL_CONF_STATUS`` 1.4 code:
 ``A`` for a small count (a zero cell, a cell below the threshold, or a value too
