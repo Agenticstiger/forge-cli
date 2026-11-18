@@ -1,0 +1,51 @@
+{
+  "version": "1.0",
+  "consumer_interface": {
+    "status": "unchanged",
+    "changes": [],
+    "consumers": {
+      "status": "known",
+      "reason": "readers outside the workspace, or in files not named contract.fluid.yaml, are not listed",
+      "items": [
+        {
+          "product_id": "finance.revenue",
+          "expose_ids": [
+            "orders"
+          ],
+          "source": "workspace",
+          "breaking_changes": []
+        }
+      ]
+    }
+  },
+  "governance_and_target": {
+    "status": "unchanged",
+    "broad_grant_added": false,
+    "grants": {
+      "added": [],
+      "removed": []
+    },
+    "targets": [],
+    "partitioning": [],
+    "policy": [],
+    "inputs": []
+  },
+  "resource_impact": {
+    "status": "known",
+    "reason": null,
+    "plan": {
+      "source": "no-op.tfplan.json",
+      "counts": {
+        "replace": 0,
+        "delete": 0,
+        "update": 0,
+        "create": 0,
+        "read": 0,
+        "forget": 0,
+        "no-op": 1
+      },
+      "resources": []
+    }
+  },
+  "documentation_only": true
+}

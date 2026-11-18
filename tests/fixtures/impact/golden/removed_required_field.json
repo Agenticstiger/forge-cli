@@ -1,0 +1,49 @@
+{
+  "version": "1.0",
+  "consumer_interface": {
+    "status": "breaking",
+    "changes": [
+      {
+        "path": "exposes[0].contract.schema.amount",
+        "kind": "column_removed",
+        "severity": "breaking",
+        "description": "column 'amount' removed from expose 'orders'",
+        "expose_id": "orders"
+      }
+    ],
+    "consumers": {
+      "status": "known",
+      "reason": "readers outside the workspace, or in files not named contract.fluid.yaml, are not listed",
+      "items": [
+        {
+          "product_id": "finance.revenue",
+          "expose_ids": [
+            "orders"
+          ],
+          "source": "workspace",
+          "breaking_changes": [
+            "exposes[0].contract.schema.amount"
+          ]
+        }
+      ]
+    }
+  },
+  "governance_and_target": {
+    "status": "unchanged",
+    "broad_grant_added": false,
+    "grants": {
+      "added": [],
+      "removed": []
+    },
+    "targets": [],
+    "partitioning": [],
+    "policy": [],
+    "inputs": []
+  },
+  "resource_impact": {
+    "status": "unknown",
+    "reason": "no plan given: pass --plan with the output of fluid plan --tofu",
+    "plan": null
+  },
+  "documentation_only": false
+}

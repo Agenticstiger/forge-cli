@@ -1,0 +1,89 @@
+{
+  "version": "1.0",
+  "consumer_interface": {
+    "status": "changed",
+    "changes": [
+      {
+        "path": "exposes[1]",
+        "kind": "expose_added",
+        "severity": "non_breaking",
+        "description": "expose 'orders_eu' added",
+        "expose_id": "orders_eu"
+      }
+    ],
+    "consumers": {
+      "status": "known",
+      "reason": "readers outside the workspace, or in files not named contract.fluid.yaml, are not listed",
+      "items": [
+        {
+          "product_id": "finance.revenue",
+          "expose_ids": [
+            "orders"
+          ],
+          "source": "workspace",
+          "breaking_changes": []
+        }
+      ]
+    }
+  },
+  "governance_and_target": {
+    "status": "changed",
+    "broad_grant_added": false,
+    "grants": {
+      "added": [],
+      "removed": []
+    },
+    "targets": [
+      {
+        "expose_id": "orders_eu",
+        "field": "format",
+        "before": null,
+        "after": "bigquery_table"
+      },
+      {
+        "expose_id": "orders_eu",
+        "field": "location.dataset",
+        "before": null,
+        "after": "sales"
+      },
+      {
+        "expose_id": "orders_eu",
+        "field": "location.project",
+        "before": null,
+        "after": "shop-eu"
+      },
+      {
+        "expose_id": "orders_eu",
+        "field": "location.table",
+        "before": null,
+        "after": "orders_eu"
+      },
+      {
+        "expose_id": "orders_eu",
+        "field": "platform",
+        "before": null,
+        "after": "gcp"
+      }
+    ],
+    "partitioning": [
+      {
+        "expose_id": "orders_eu",
+        "field": "location.partitionBy",
+        "before": null,
+        "after": [
+          "order_date"
+        ],
+        "provider_impact": "unknown",
+        "provider_reason": "no plan given: pass --plan with the output of fluid plan --tofu"
+      }
+    ],
+    "policy": [],
+    "inputs": []
+  },
+  "resource_impact": {
+    "status": "unknown",
+    "reason": "no plan given: pass --plan with the output of fluid plan --tofu",
+    "plan": null
+  },
+  "documentation_only": false
+}

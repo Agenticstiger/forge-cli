@@ -53,6 +53,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the same checkout path (the plan records it). The Databricks job emitter now uploads the same
   file selection.
 
+- **`fluid diff --baseline --impact` reports what a contract change reaches, for a pull
+  request.** Next to the changelog, an impact section in three parts: the consumer interface
+  (each change a reader sees, and the workspace products whose `consumes[]` read this one, or
+  the contract's own `consumers[]`, each marked breaking or not); governance and target (access
+  grants added or removed, a grant marked broad when it covers a domain, a public principal,
+  admin or manage, or every expose; each expose's platform, format and location; its
+  partitioning; and the policy and input changes the changelog found); and resource impact,
+  read from `--plan` (the plan.json of `fluid plan --tofu`, or `tofu show -json`), resource by
+  resource, with each replacement's reason and the paths that force it. What the report cannot
+  see reads `unknown` with the reason: no workspace to search, no plan, or a plan.json that
+  does not say what a provider replaces. A partition change is a replacement only when the
+  plan replaces that expose's table; a plan that does not name the table leaves it unknown. `--format markdown` adds an Impact section, and `--format json` and
+  `--out` add an `impact` block (`version: "1.0"`). No value from the plan is copied into it.
+  `--plan` implies `--impact`; without `--baseline` both are refused. Without the flags, the
+  version diff is unchanged.
+
 - **BigQuery holds the nested columns a contract declares.** A 0.7.7 column that declares its
   `element`, `fields`, or `key` and `value` was refused on BigQuery. It is now written as
   BigQuery holds it: an array as a REPEATED field of its element's type, a struct as a RECORD

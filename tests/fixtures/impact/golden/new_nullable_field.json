@@ -1,0 +1,38 @@
+{
+  "version": "1.0",
+  "consumer_interface": {
+    "status": "changed",
+    "changes": [
+      {
+        "path": "exposes[0].contract.schema.coupon_code",
+        "kind": "column_added",
+        "severity": "non_breaking",
+        "description": "column 'coupon_code' added to expose 'orders'",
+        "expose_id": "orders"
+      }
+    ],
+    "consumers": {
+      "status": "unknown",
+      "reason": "no fluid.workspace.yaml above ws/orders: products that read this one are not searched",
+      "items": []
+    }
+  },
+  "governance_and_target": {
+    "status": "unchanged",
+    "broad_grant_added": false,
+    "grants": {
+      "added": [],
+      "removed": []
+    },
+    "targets": [],
+    "partitioning": [],
+    "policy": [],
+    "inputs": []
+  },
+  "resource_impact": {
+    "status": "unknown",
+    "reason": "no plan given: pass --plan with the output of fluid plan --tofu",
+    "plan": null
+  },
+  "documentation_only": false
+}

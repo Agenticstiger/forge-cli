@@ -1,0 +1,12 @@
+{
+  "format_version": "1.2",
+  "resource_changes": [
+    {
+      "address": "google_bigquery_table.orders",
+      "mode": "managed",
+      "type": "google_bigquery_table",
+      "name": "orders",
+      "change": {"actions": ["update"], "before": {}, "after": {}}
+    }
+  ]
+}
