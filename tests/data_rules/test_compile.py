@@ -634,3 +634,108 @@ def test_a_non_finite_if_none_is_unsupported() -> None:
     contract["exposes"][0]["contract"]["invariants"][2]["aggregate"]["ifNone"] = float("nan")
     rule = _by_id(contract)["billed"]
     assert rule.status == UNSUPPORTED and rule.counts is None
+
+
+def test_a_refused_shared_attribute_is_reported_per_member() -> None:
+    contract = _segments()
+    contract["exposes"][1].pop("semantics")  # contracts no longer reach accounts
+    rules = [r for r in compile_rules(contract) if r.kind == "sharedAttribute"]
+    assert {r.id for r in rules} == {
+        "customer_segment.accounts.segment",
+        "customer_segment.invoices.customer_segment",
+    }
+    assert all(r.status == UNSUPPORTED and "no owner" in r.reason for r in rules)
+
+
+def test_a_percent_measure_is_divided_in_the_engines_double() -> None:
+    contract = _billing()
+    rule = _by_id(contract)["due_after_issue"]
+    assert 'CAST("violating" AS DOUBLE) * 100' in rule.measure(_table)
+    athena = {r.id: r for r in compile_rules(contract, dialect="athena")}["due_after_issue"]
+    assert "AS DOUBLE) * 100" in athena.measure(lambda e: fs.sql_name("athena", e))
+    postgres = {r.id: r for r in compile_rules(contract, dialect="postgres")}["due_after_issue"]
+    assert "AS NUMERIC) * 100" in postgres.measure(lambda e: fs.sql_name("postgres", e))
+
+
+def test_a_later_derive_is_refused_when_an_earlier_when_is_unreadable() -> None:
+    contract = _contract(
+        _expose(
+            "a",
+            [
+                {"name": "s", "type": "string"},
+                {"name": "d", "type": "integer"},
+                {"name": "base", "type": "integer"},
+            ],
+            contract={
+                "invariants": [
+                    {"id": "e1", "derive": "d", "expr": "base", "when": "s = = 'A'"},
+                    {"id": "e2", "derive": "d", "expr": "base + 1", "when": "s = 'B'"},
+                ]
+            },
+        )
+    )
+    rules = _by_id(contract)
+    assert rules["e1"].status == UNSUPPORTED
+    assert rules["e2"].status == UNSUPPORTED and "earlier derive" in rules["e2"].reason
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"id": "d1", "derive": "gross"},
+        {"id": "d2", "derive": "gross", "aggregate": {"function": "sum", "from": ["x"]}},
+        {"id": "d3", "derive": "gross", "aggregate": "sum"},
+        {"id": "d4", "check": 3},
+        {"id": "d5", "dependency": "net -> gross"},
+    ],
+)
+def test_a_malformed_declaration_is_unsupported_never_a_crash(entry: Dict[str, Any]) -> None:
+    contract = _billing()
+    contract["exposes"][0]["contract"]["invariants"].append(entry)
+    rule = _by_id(contract)[entry["id"]]
+    assert rule.status == UNSUPPORTED and rule.reason
+
+
+def _keys_chain() -> Dict[str, Any]:
+    return _contract(
+        _expose(
+            "c3",
+            [
+                {
+                    "name": "code",
+                    "type": "string",
+                    "identifierFormat": [{"prefixes": ["P"], "mask": "99999"}],
+                    "placeholders": {"values": ["TBD"]},
+                }
+            ],
+        ),
+        _expose(
+            "b2",
+            [{"name": "code", "type": "string"}],
+            semantics={"relationships": [_rel("to_c3", "c3", ["code"], ["code"])]},
+        ),
+        _expose(
+            "a1",
+            [
+                {
+                    "name": "code",
+                    "type": "string",
+                    "identifierFormat": [{"prefixes": ["P"], "mask": "99999"}],
+                }
+            ],
+            semantics={"relationships": [_rel("to_b2", "b2", ["code"], ["code"])]},
+        ),
+    )
+
+
+def test_a_foreign_key_inherits_the_format_and_placeholders_down_its_chain() -> None:
+    contract = _keys_chain()
+    assert not [f for f in lint_contract(contract) if f.severity == "error"]
+    formats = {r.expose: r for r in compile_rules(contract) if r.kind == "identifierFormat"}
+    expected = "^((P[0-9]{5})|TBD)$"
+    assert {e: r.pattern for e, r in formats.items()} == {
+        "c3": expected,
+        "b2": expected,
+        "a1": expected,
+    }
+    assert "copies" in formats["b2"].description

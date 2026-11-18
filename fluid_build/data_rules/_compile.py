@@ -98,9 +98,12 @@ class Rule:
         q = lambda name: fs.sql_name(self.dialect, name)  # noqa: E731
         inner = f"({self.counts(table_sql)}) AS {q('fluid_counts')}"
         if self.band is not None and self.band.unit == "percent":
+            # In the engine's double (PostgreSQL: unbounded NUMERIC): Trino divides two
+            # decimals at the larger operand scale, so 100.0 * 1 / 3 would be 33.3 there.
+            share = fs.exact_number_type(self.dialect, None)
             return (
                 f"SELECT CASE WHEN {q('covered')} = 0 THEN 0 "
-                f"ELSE 100.0 * {q('violating')} / {q('covered')} END FROM {inner}"
+                f"ELSE CAST({q('violating')} AS {share}) * 100 / {q('covered')} END FROM {inner}"
             )
         return f"SELECT {q('violating')} FROM {inner}"
 
@@ -173,6 +176,10 @@ def _literal(value: Any) -> str:
     return format(number, "f")
 
 
+#: An earlier derive's ``when`` that does not parse: the rows it covers are unknown.
+_UNREADABLE = object()
+
+
 class _Refused(Exception):
     """A declaration with no exact SQL: the message is the reason."""
 
@@ -230,6 +237,12 @@ class _Compiler:
                 refused = str(why)
             except (fs.FluidSqlError, _masks.MaskError, ValueError) as why:
                 refused = str(why) or type(why).__name__
+            except (KeyError, TypeError, AttributeError, IndexError) as why:
+                # A contract no one validated can hold any shape; the export must still finish.
+                refused = (
+                    f"the declaration is malformed ({type(why).__name__}: {why}); "
+                    "run fluid validate on the contract"
+                )
         self.rules.append(Rule(status=UNSUPPORTED, reason=refused, **fallback))
 
     def run(self) -> List[Rule]:
@@ -269,7 +282,10 @@ class _Compiler:
             if forms == ["derive"] and isinstance(inv.get("derive"), str):
                 target = nfc(inv["derive"])
                 earlier = list(derives.get(target, []))
-                when = _parse(inv["when"]) if isinstance(inv.get("when"), str) else None
+                when: Any = None
+                if "when" in inv:
+                    parsed = _parse(inv["when"]) if isinstance(inv["when"], str) else None
+                    when = _UNREADABLE if parsed is None else parsed
                 derives.setdefault(target, []).append(when)
             if len(forms) != 1:
                 self.rules.append(
@@ -310,6 +326,8 @@ class _Compiler:
             violated = f"(NOT {query.render(node, checked, predicate=True)})"
         elif kind == "derive":
             target = nfc(inv.get("derive"))
+            if not isinstance(inv.get("expr"), str):
+                raise _Refused("a derive takes an expr or an aggregate")
             value = fs.parse(inv["expr"])
             node = n.DistinctFrom(n.Column(target), value, negated=True)
             checked = fs.check(node, expose.model, fs.PREDICATE)
@@ -364,7 +382,10 @@ class _Compiler:
     def columns(self, expose: Expose) -> None:
         for name, (position, column) in expose.columns.items():
             base = ("exposes", expose.index, "contract", "schema", position)
-            if isinstance(column.get("identifierFormat"), list):
+            source = self.format_source(expose, name)
+            if source is not None:
+                owner, owner_column = source
+                inherited = owner is not expose
                 fallback = dict(
                     id=f"{name}.identifierFormat",
                     kind="identifierFormat",
@@ -372,10 +393,16 @@ class _Compiler:
                     column=name,
                     path=base + ("identifierFormat",),
                     dimension=CONFORMITY,
-                    description=f"Values of {name} have the column's identifier format",
+                    description=(
+                        f"Values of {name} have the identifier format of "
+                        f"{owner.expose_id}.{owner_column}, which it copies"
+                        if inherited
+                        else f"Values of {name} have the column's identifier format"
+                    ),
                 )
+                formats = owner.columns[owner_column][1]["identifierFormat"]
                 self.add(
-                    lambda c=column, f=fallback: self.identifier_format(expose, c, f), fallback
+                    lambda c=formats, f=fallback: self.identifier_format(expose, c, f), fallback
                 )
             if isinstance(column.get("placeholders"), Mapping):
                 block = column["placeholders"]
@@ -391,10 +418,37 @@ class _Compiler:
                 )
                 self.add(lambda f=fallback, b=block: self.placeholders(expose, f, b), fallback)
 
-    def identifier_format(
-        self, expose: Expose, column: Mapping[str, Any], fallback: Dict[str, Any]
-    ) -> Rule:
-        alternatives = [_masks.alternative(entry) for entry in column["identifierFormat"]]
+    def chain(self, expose: Expose, name: str) -> List[Tuple[Expose, str]]:
+        """The column, then the column each foreign key in turn copies (§3, Foreign keys):
+        the first relationship whose ``fromColumns`` hold it, until none does or a column
+        repeats."""
+        out: List[Tuple[Expose, str]] = []
+        here: Optional[Tuple[Expose, str]] = (expose, name)
+        while here is not None and here not in out:
+            out.append(here)
+            current, column = here
+            here = None
+            for rel in current.relationships.values():
+                target = self.by_id.get(rel.to)
+                pairs = zip(rel.from_columns, rel.to_columns, strict=False)
+                to = next((t for f, t in pairs if f == column), None)
+                if target is not None and to in target.columns:
+                    here = (target, to)
+                    break
+        return out
+
+    def format_source(self, expose: Expose, name: str) -> Optional[Tuple[Expose, str]]:
+        """The column whose ``identifierFormat`` this one has: its own, else the nearest one a
+        foreign key chain copies."""
+        for owner, column in self.chain(expose, name):
+            if isinstance(owner.columns[column][1].get("identifierFormat"), list):
+                return owner, column
+        return None
+
+    def identifier_format(self, expose: Expose, formats: Any, fallback: Dict[str, Any]) -> Rule:
+        if not isinstance(formats, list):
+            raise _Refused("identifierFormat is not a list")
+        alternatives = [_masks.alternative(entry) for entry in formats]
         values, prefixes = self.exemptions(expose, fallback["column"])
         exempt = [_masks.literal_regex(v) for v in values]
         exempt += [_masks.literal_regex(p) + ".*" for p in prefixes]
@@ -403,18 +457,14 @@ class _Compiler:
         return Rule(status=EXECUTABLE, pattern=pattern, **fallback)
 
     def exemptions(self, expose: Expose, name: str) -> Tuple[List[str], List[str]]:
-        """The placeholders a column's own checks exempt: its own, and those of the column a
-        foreign key copies (§3, Foreign keys)."""
-        own = expose.model.columns[name]
-        values, prefixes = list(own.placeholder_values), list(own.placeholder_prefixes)
-        for rel in expose.relationships.values():
-            target = self.by_id.get(rel.to)
-            for from_name, to_name in zip(rel.from_columns, rel.to_columns, strict=False):
-                if from_name != name or target is None or to_name not in target.model.columns:
-                    continue
-                theirs = target.model.columns[to_name]
-                values += [v for v in theirs.placeholder_values if v not in values]
-                prefixes += [p for p in theirs.placeholder_prefixes if p not in prefixes]
+        """The placeholders a column's own checks exempt: its own, and those of every column its
+        foreign key chain copies (§3, Foreign keys)."""
+        values: List[str] = []
+        prefixes: List[str] = []
+        for owner, column in self.chain(expose, name):
+            theirs = owner.model.columns[column]
+            values += [v for v in theirs.placeholder_values if v not in values]
+            prefixes += [p for p in theirs.placeholder_prefixes if p not in prefixes]
         return values, prefixes
 
     def placeholders(
@@ -477,6 +527,7 @@ class _Compiler:
         )
 
     def shared_attributes(self) -> None:
+        self.refused_attributes()
         for attribute, route in self.routes.items():
             owner_id, owner_column = route.owner
             for member_id, column, hops in route.members:
@@ -505,6 +556,39 @@ class _Compiler:
                         m, c, h, o, f
                     ),
                     fallback,
+                )
+
+    def refused_attributes(self) -> None:
+        """A rule per member of each shared attribute the lint refuses (no owner, two paths,
+        mixed types ...), so a refused group is reported like any other declaration."""
+        groups: Dict[str, List[Tuple[Expose, str, Tuple[Any, ...]]]] = {}
+        for expose in self.exposes:
+            for name, (position, column) in expose.columns.items():
+                attribute = column.get("sharedAttribute")
+                if isinstance(attribute, str) and expose.expose_id:
+                    path = ("exposes", expose.index, "contract", "schema", position)
+                    groups.setdefault(attribute, []).append(
+                        (expose, name, path + ("sharedAttribute",))
+                    )
+        for attribute, members in groups.items():
+            if attribute in self.routes:
+                continue
+            reasons = [self.refusal(path) for _, _, path in members]
+            reason = next((r for r in reasons if r), None)
+            if reason is None:
+                continue  # one member alone: nothing to compare it with
+            for expose, name, path in members:
+                self.rules.append(
+                    Rule(
+                        id=f"{attribute}.{expose.expose_id}.{name}",
+                        kind="sharedAttribute",
+                        expose=expose.expose_id,
+                        path=path,
+                        dimension=CONSISTENCY,
+                        description=f"{name} carries the attribute {attribute}",
+                        status=UNSUPPORTED,
+                        reason=reason,
+                    )
                 )
 
     def attribute(
@@ -689,6 +773,11 @@ class _RowQuery:
         column covers (first match, §1.3)."""
         parts = [] if own is None else [self.render(own[0], own[1], predicate=True)]
         for when in earlier:
+            if when is _UNREADABLE:
+                raise _Refused(
+                    "an earlier derive of the column has a when that is not FLUID SQL/1, so "
+                    "the rows this one covers are unknown"
+                )
             if when is None:
                 return "FALSE"  # an earlier derive covers every row
             checked = fs.check(when, self.expose.model, fs.PREDICATE)
@@ -699,7 +788,8 @@ class _RowQuery:
     def aggregate(self, target: str, agg: Mapping[str, Any]) -> str:
         """The violation of a summary over child rows (§1.2), joined as ``s``."""
         compiler, dialect, q = self.compiler, self.dialect, self.q
-        child = compiler.by_id.get(agg.get("from"))
+        source = agg.get("from")
+        child = compiler.by_id.get(source) if isinstance(source, str) else None
         rel = child.relationships.get(nfc(agg.get("via"))) if child else None
         if child is None or rel is None:
             raise _Refused("the summary names no child relationship")

@@ -30,7 +30,7 @@ pytestmark = pytest.mark.unit
 
 def _binding(platform: str, table: str) -> Dict[str, Any]:
     if platform == "local":
-        return {"platform": "local", "format": "parquet", "location": {"path": f"{table}.parquet"}}
+        return {"platform": "local", "format": "parquet", "location": {"table": table}}
     return {
         "platform": "snowflake",
         "format": "snowflake_table",
@@ -317,7 +317,7 @@ def test_the_queries_run_and_count_what_the_rules_say() -> None:
 
     def run(name: str) -> float:
         query = rules[name]["query"].replace("${table}", "invoices")
-        return float(db.execute(query.replace('"contracts"', "contracts")).fetchone()[0])
+        return float(db.execute(query).fetchone()[0])
 
     assert run("gross_from_net") == 1
     assert run("due_after_issue") == 50.0  # i2 is due early, i3 has no issue date
@@ -325,3 +325,48 @@ def test_the_queries_run_and_count_what_the_rules_say() -> None:
     assert run("date_by_contract") == 1  # c1 holds two issue dates
     assert run("contract.status") == 1  # i2 says B, its contract A
     assert run("product_code.placeholders") == 50.0
+
+
+def test_a_link_to_an_expose_with_no_table_is_a_text_rule(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    contract = _contract(platform="local")
+    contract["exposes"][1]["binding"]["location"] = {"path": "contracts.parquet"}
+    with caplog.at_level(logging.WARNING):
+        rules = _rules(_render(contract))
+    for name in ("fee_is_monthly", "contract.status"):
+        assert rules[name]["type"] == "text"
+        assert "names no table" in rules[name]["description"]
+    assert rules["gross_from_net"]["type"] == "sql"
+    warnings = [r.getMessage() for r in caplog.records if "text rules" in r.getMessage()]
+    assert len(warnings) == 1  # one warning per expose and reason, naming every rule
+    assert "fee_is_monthly" in warnings[0] and "contract.status" in warnings[0]
+    assert "fluid validate" in warnings[0] and "fluidExtras" in warnings[0]
+
+
+def test_the_warning_says_when_fluid_extras_is_off(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ODCS_FLUID_EXTRAS", "false")
+    contract = _contract()
+    contract["exposes"][0]["binding"] = {"platform": "kafka", "format": "kafka_topic"}
+    with caplog.at_level(logging.WARNING):
+        _render(contract)
+    warnings = [r.getMessage() for r in caplog.records if "text rules" in r.getMessage()]
+    assert len(warnings) == 1 and "ODCS_FLUID_EXTRAS=false" in warnings[0]
+
+
+def test_an_edit_after_import_reaches_the_next_export() -> None:
+    contract = _contract()
+    provider = OdcsProvider()
+    back = provider.import_contract(copy.deepcopy(_render(contract)))
+    back["exposes"].append(copy.deepcopy(contract["exposes"][1]))
+    invoices = back["exposes"][0]
+    columns = {c["name"]: c for c in invoices["contract"]["schema"]}
+    columns["product_code"]["identifierFormat"] = [{"prefixes": ["Q"], "mask": "999"}]
+    invoices["contract"]["invariants"][0]["expr"] = "ROUND(net * (2 + tax_rate), 2)"
+    odcs = provider.render(back, fmt=None, expose_id="invoices")
+    pattern = "^((Q[0-9]{3})|XXXXX|TBD_.*)$"
+    assert _property(odcs, "product_code")["logicalTypeOptions"]["pattern"] == pattern
+    assert _rules(odcs)["product_code.identifierFormat"]["arguments"]["pattern"] == pattern
+    assert _property(odcs, "gross")["transformLogic"] == "ROUND(net * (2 + tax_rate), 2)"

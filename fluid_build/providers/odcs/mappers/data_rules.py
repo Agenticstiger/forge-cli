@@ -34,7 +34,7 @@ ordinary rules.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .base import ExportCtx, get_expose_passthrough, get_field_passthrough
 
@@ -81,6 +81,14 @@ def _location_name(dialect: str, expose: Mapping[str, Any]) -> Optional[str]:
     return ".".join(fs.sql_name(dialect, part) for part in parts)
 
 
+def _exposes(contract: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
+    return {
+        e["exposeId"]: e
+        for e in contract.get("exposes") or []
+        if isinstance(e, Mapping) and isinstance(e.get("exposeId"), str)
+    }
+
+
 def export(ctx: ExportCtx, schema_objects: List[Any]) -> None:
     """Append the generated rules of every expose to its schema object."""
     from fluid_build.data_rules._compile import compile_rules
@@ -91,28 +99,54 @@ def export(ctx: ExportCtx, schema_objects: List[Any]) -> None:
     rules = compile_rules(contract)
     if not rules:
         return
-    exposes: Dict[str, Mapping[str, Any]] = {}
-    for expose in contract.get("exposes") or []:
-        if isinstance(expose, Mapping) and isinstance(expose.get("exposeId"), str):
-            exposes[expose["exposeId"]] = expose
+    exposes = _exposes(contract)
+    unsupported: Dict[Tuple[str, str], List[str]] = {}
     for obj in schema_objects:
         if not isinstance(obj, dict) or obj.get("name") not in exposes:
             continue
         own = [rule for rule in rules if rule.expose == obj["name"]]
         if own:
-            _attach(ctx, obj, exposes[obj["name"]], own, exposes, rules)
+            _attach(obj, exposes[obj["name"]], own, exposes, rules, unsupported)
+    from .extras import _enabled
+
+    kept = (
+        "The declarations ride along under customProperties.fluidExtras."
+        if _enabled()
+        else "ODCS_FLUID_EXTRAS=false, so only the text rules record them."
+    )
+    for (expose_id, reason), ids in unsupported.items():
+        ctx.logger.warning(
+            "%d declared rule(s) on expose %r are exported as ODCS text rules, not executable "
+            "quality rules (%s): %s. %s Run `fluid validate` on the contract, or bind the "
+            "expose to a platform forge writes SQL for, to get sql rules.",
+            len(ids),
+            expose_id,
+            ", ".join(ids),
+            reason,
+            kept,
+        )
+
+
+def _linked_without_table(rule: Any, exposes: Mapping[str, Mapping[str, Any]]) -> Optional[str]:
+    """The first expose ``rule`` reads whose binding names no table, if any: its query would
+    have to guess the name."""
+    for expose_id in rule.reads:
+        if (
+            expose_id != rule.expose
+            and _location_name(rule.dialect, exposes.get(expose_id) or {}) is None
+        ):
+            return expose_id
+    return None
 
 
 def _attach(
-    ctx: ExportCtx,
     obj: Dict[str, Any],
     expose: Mapping[str, Any],
     rules: List[Any],
     exposes: Mapping[str, Mapping[str, Any]],
     every: List[Any],
+    unsupported: Dict[Tuple[str, str], List[str]],
 ) -> None:
-    from fluid_build import fluid_sql as fs
-
     from .quality import _append_quality, _claim, _existing_ids, _stable_id
 
     taken: Set[str] = _existing_ids(obj)
@@ -121,11 +155,7 @@ def _attach(
         for p in obj.get("properties") or []
         if isinstance(p, dict) and isinstance(p.get("name"), str)
     }
-    fields = {
-        f["name"]: f
-        for f in (expose.get("contract") or {}).get("schema") or []
-        if isinstance(f, Mapping) and isinstance(f.get("name"), str)
-    }
+    fields = _fields(expose)
 
     for rule in rules:
         check: Dict[str, Any] = {
@@ -134,7 +164,16 @@ def _attach(
             "dimension": rule.dimension,
             "severity": rule.severity,
         }
-        if rule.status == "executable" and rule.pattern is not None:
+        status, reason = rule.status, rule.reason
+        if status == "executable" and rule.pattern is None:
+            unnamed = _linked_without_table(rule, exposes)
+            if unnamed is not None:
+                status = "unsupported"
+                reason = (
+                    f"it reads {unnamed}, whose binding.location names no table for the query "
+                    "to read"
+                )
+        if status == "executable" and rule.pattern is not None:
             check.update(
                 type="library",
                 metric="invalidValues",
@@ -142,60 +181,67 @@ def _attach(
                 arguments={"pattern": rule.pattern},
                 description=rule.description,
             )
-            _add_pattern(properties.get(rule.column), fields.get(rule.column), rule.pattern)
-        elif rule.status == "executable":
+            _add_pattern(properties.get(rule.column), rule.pattern)
+        elif status == "executable":
             check.update(type="sql", query=rule.measure(_table_sql(rule, exposes)))
             check[rule.band.operator] = rule.band.value
             check["unit"] = rule.band.unit
             check["description"] = rule.description
-        elif rule.status == "informational":
+        elif status == "informational":
             check.update(
                 type="text",
                 description=f"{rule.description}; declared, and no operator bounds it",
             )
         else:
-            ctx.logger.warning(
-                "%s %r on expose %r is not exported as an executable ODCS quality rule: %s. "
-                "It is written as a text rule, and the declaration rides along under "
-                "customProperties.fluidExtras.",
-                rule.kind,
-                rule.id,
-                rule.expose,
-                rule.reason,
-            )
+            unsupported.setdefault((rule.expose, reason), []).append(rule.id)
             check.update(
                 type="text",
-                description=f"{rule.description}. Not executable here: {rule.reason}",
+                description=f"{rule.description}. Not executable here: {reason}",
             )
         check["customProperties"] = [dict(_MARK)]
         target = properties.get(rule.column) if rule.column else None
         _append_quality(target if target is not None else obj, check)
 
-    _transform_logic(expose, properties, fields, every, exposes)
+    for column, (logic, sources) in derived_logic(expose, every, exposes).items():
+        prop, fld = properties.get(column), fields.get(column)
+        if prop is None or fld is None:
+            continue
+        pt = get_field_passthrough(fld)
+        if "transformLogic" not in prop and "transform_logic" not in pt:
+            prop["transformLogic"] = logic
+        if "transformSourceObjects" not in prop and "transform_source_objects" not in pt:
+            prop["transformSourceObjects"] = sources
+
+
+def _fields(expose: Mapping[str, Any]) -> Dict[str, Any]:
+    contract = expose.get("contract")
+    schema = contract.get("schema") if isinstance(contract, Mapping) else None
+    return {
+        f["name"]: f
+        for f in schema or []
+        if isinstance(f, Mapping) and isinstance(f.get("name"), str)
+    }
 
 
 def _table_sql(rule: Any, exposes: Mapping[str, Mapping[str, Any]]) -> Any:
     """How ``rule``'s query names a table: ``${table}`` for its own object, the quoted
-    binding location (else the quoted exposeId) for a linked one."""
-    from fluid_build import fluid_sql as fs
+    binding location for a linked one (:func:`_linked_without_table` refuses the rest)."""
 
     def table_sql(expose_id: str) -> str:
         if expose_id == rule.expose:
             return "${table}"
         located = _location_name(rule.dialect, exposes.get(expose_id) or {})
-        return located or fs.sql_name(rule.dialect, expose_id)
+        if located is None:  # pragma: no cover - refused before the query is built
+            raise ValueError(f"{expose_id} names no table")
+        return located
 
     return table_sql
 
 
-def _add_pattern(
-    prop: Optional[Dict[str, Any]], fld: Optional[Mapping[str, Any]], pattern: str
-) -> None:
-    """``logicalTypeOptions.pattern`` on a string property, unless the property carries its
-    own options verbatim (an imported column) or a pattern already."""
-    if prop is None or fld is None or prop.get("logicalType") != "string":
-        return
-    if "logical_type_options" in get_field_passthrough(fld):
+def _add_pattern(prop: Optional[Dict[str, Any]], pattern: str) -> None:
+    """``logicalTypeOptions.pattern`` on a string property that has no pattern yet. The
+    options are copied: an imported property's options are its pass-through bucket."""
+    if prop is None or prop.get("logicalType") != "string":
         return
     options = dict(prop.get("logicalTypeOptions") or {})
     if "pattern" in options:
@@ -204,64 +250,83 @@ def _add_pattern(
     prop["logicalTypeOptions"] = options
 
 
-def _transform_logic(
-    expose: Mapping[str, Any],
-    properties: Mapping[str, Dict[str, Any]],
-    fields: Mapping[str, Mapping[str, Any]],
-    rules: List[Any],
-    exposes: Mapping[str, Mapping[str, Any]],
-) -> None:
-    """A derived column's value as ``transformLogic``: its one ``expr``, or the first-match
-    ``CASE`` of several, in canonical FLUID SQL/1; and the objects it reads."""
+def derived_logic(
+    expose: Mapping[str, Any], rules: List[Any], exposes: Mapping[str, Mapping[str, Any]]
+) -> Dict[str, Tuple[str, List[str]]]:
+    """Each derived column's ``transformLogic`` and ``transformSourceObjects``: its one
+    ``expr``, or the first-match ``CASE`` of several, in canonical FLUID SQL/1, and the
+    objects it reads. A column with a summary, or a derive with no exact SQL, has none."""
     from fluid_build import fluid_sql as fs
 
+    contract = expose.get("contract")
     derived: Dict[str, List[Mapping[str, Any]]] = {}
-    for inv in (expose.get("contract") or {}).get("invariants") or []:
+    for inv in (contract.get("invariants") if isinstance(contract, Mapping) else None) or []:
         if isinstance(inv, Mapping) and isinstance(inv.get("derive"), str):
             derived.setdefault(inv["derive"], []).append(inv)
-    ok = {r.id for r in rules if r.expose == expose.get("exposeId") and r.status == "executable"}
+    own = expose.get("exposeId")
+    ok = {r.id: r for r in rules if r.expose == own and r.status == "executable"}
+    out: Dict[str, Tuple[str, List[str]]] = {}
     for column, invs in derived.items():
-        prop, fld = properties.get(column), fields.get(column)
-        if prop is None or fld is None:
-            continue
-        pt = get_field_passthrough(fld)
         if any(not isinstance(i.get("expr"), str) or i.get("id") not in ok for i in invs):
-            continue  # a summary, or a declaration with no exact SQL: no expression to show
+            continue
         try:
-            values = [(i.get("when"), fs.canonical(fs.parse(i["expr"]))) for i in invs]
-            whens = [None if w is None else fs.canonical(fs.parse(w)) for w, _ in values]
+            values = [fs.canonical(fs.parse(i["expr"])) for i in invs]
+            whens = [
+                fs.canonical(fs.parse(i["when"])) if isinstance(i.get("when"), str) else None
+                for i in invs
+            ]
         except fs.FluidSqlError:
             continue
         if len(values) == 1 and whens[0] is None:
-            logic = values[0][1]
+            logic = values[0]
         else:
             arms = " ".join(
                 f"WHEN {when or 'TRUE'} THEN {value}"
-                for when, (_, value) in zip(whens, values, strict=True)
+                for when, value in zip(whens, values, strict=True)
             )
             logic = f"CASE {arms} ELSE {fs.quote_name(column)} END"
-        if "transformLogic" not in prop and "transform_logic" not in pt:
-            prop["transformLogic"] = logic
-        if "transformSourceObjects" not in prop and "transform_source_objects" not in pt:
-            sources = [expose.get("exposeId")]
-            for rule in rules:
-                if rule.id in {i.get("id") for i in invs}:
-                    sources += [r for r in rule.reads if r in exposes]
-            prop["transformSourceObjects"] = [str(s) for s in dict.fromkeys(sources)]
+        sources = [own]
+        for inv in invs:
+            sources += [r for r in ok[inv["id"]].reads if r in exposes]
+        out[column] = (logic, [str(s) for s in dict.fromkeys(sources)])
+    return out
 
 
 def strip_imported(fluid: Mapping[str, Any]) -> None:
-    """Drop the generated rules from an import whose declarations ``fluidExtras`` restored:
-    each field's ``quality`` and each expose's pass-through object quality."""
+    """Drop what the export generated from an import whose declarations ``fluidExtras``
+    restored, so a re-export generates it again from the declarations as they are then:
+    the marked rules (each field's ``quality``, each expose's object quality), and a
+    ``logicalTypeOptions.pattern``, ``transformLogic`` or ``transformSourceObjects`` the
+    restored declarations generate exactly."""
+    from fluid_build.data_rules._compile import compile_rules
+
+    rules = compile_rules(fluid)
+    exposes = _exposes(fluid)
+    patterns = {(r.expose, r.column): r.pattern for r in rules if r.pattern is not None}
     for expose in fluid.get("exposes") or []:
         if not isinstance(expose, dict):
             continue
         pt = get_expose_passthrough(expose)
         if isinstance(pt.get("object_quality"), list):
             pt["object_quality"] = strip_generated(pt["object_quality"])
-        contract = expose.get("contract")
-        if not isinstance(contract, Mapping):
-            continue
-        for fld in contract.get("schema") or []:
+        logic = derived_logic(expose, rules, exposes) if rules else {}
+        for name, fld in _fields(expose).items():
             if isinstance(fld, dict) and isinstance(fld.get("quality"), list):
                 fld["quality"] = strip_generated(fld["quality"])
+            fpt = get_field_passthrough(fld)
+            if not isinstance(fpt, dict):
+                continue
+            options = fpt.get("logical_type_options")
+            pattern = patterns.get((expose.get("exposeId"), name))
+            if isinstance(options, dict) and pattern and options.get("pattern") == pattern:
+                options = {k: v for k, v in options.items() if k != "pattern"}
+                if options:
+                    fpt["logical_type_options"] = options
+                else:
+                    fpt.pop("logical_type_options")
+            if name in logic:
+                text, sources = logic[name]
+                if fpt.get("transform_logic") == text:
+                    fpt.pop("transform_logic")
+                if fpt.get("transform_source_objects") == sources:
+                    fpt.pop("transform_source_objects")
