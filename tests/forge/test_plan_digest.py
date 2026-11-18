@@ -659,11 +659,9 @@ class TestPacketDigest:
         bundleDigest still matches."""
         import tarfile
 
-        import fluid_build.forge.core.bundle as bundle_mod
-
         with tarfile.open(bundle, "r:gz") as tar:
             members = {m.name: tar.extractfile(m).read() for m in tar.getmembers() if m.isfile()}
-        monkeypatch.setattr(bundle_mod, "_DEFAULT_MTIME", 1_700_000_000)
+        monkeypatch.setattr("fluid_build.forge.core.bundle._DEFAULT_MTIME", 1_700_000_000)
         write_tgz(bundle, members)
 
     def test_inject_records_the_bundle_file_sha256(self, tmp_path: Path) -> None:

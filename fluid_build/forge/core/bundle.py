@@ -600,10 +600,10 @@ def _write_provenance(
     target = provenance_path(tgz_path)
     recorded = {key: (source or {}).get(key) for key in PROVENANCE_KEYS}
     if not any(recorded.values()):
-        try:
+        # No path to record: a file left by an earlier build at this name would
+        # describe other bytes. None there is the usual case.
+        with contextlib.suppress(FileNotFoundError):
             target.unlink()
-        except FileNotFoundError:
-            pass
         return
     document = {
         "version": PROVENANCE_VERSION,
