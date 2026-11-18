@@ -131,11 +131,15 @@ def aws_caller_account(env: Mapping[str, str], region: Optional[str]) -> Tuple[s
             aws_secret_access_key=env.get("AWS_SECRET_ACCESS_KEY") or None,
             aws_session_token=env.get("AWS_SESSION_TOKEN") or None,
             profile_name=env.get("AWS_PROFILE") or None,
-            # STS answers in every region; without one, botocore refuses to build the client.
-            region_name=region or "us-east-1",
+            region_name=region,
         )
         endpoint = env.get("AWS_ENDPOINT_URL_STS") or env.get("AWS_ENDPOINT_URL") or None
-        reply = session.client("sts", endpoint_url=endpoint).get_caller_identity()
+        # STS answers in every region; with none from the run or its profile, botocore
+        # refuses to build the client, so the commercial default is named.
+        fallback = None if getattr(session, "region_name", None) else "us-east-1"
+        reply = session.client(
+            "sts", endpoint_url=endpoint, region_name=fallback
+        ).get_caller_identity()
     except Exception as exc:  # noqa: BLE001 - every failure is a reason, named by type
         return "", f"sts GetCallerIdentity failed ({type(exc).__name__})"
     account = str(reply.get("Account") or "")

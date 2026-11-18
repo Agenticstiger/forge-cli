@@ -65,8 +65,10 @@ class TestAws:
             def __init__(self, **kwargs):
                 seen["session"] = kwargs
 
-            def client(self, name, endpoint_url=None):
-                seen["client"] = (name, endpoint_url)
+            region_name = "eu-west-1"
+
+            def client(self, name, endpoint_url=None, region_name=None):
+                seen["client"] = (name, endpoint_url, region_name)
                 return _Client()
 
         boto3 = types.ModuleType("boto3")
@@ -80,14 +82,16 @@ class TestAws:
         assert ti.aws_caller_account(env, "eu-west-1") == ("123456789012", "")
         assert seen["session"]["aws_access_key_id"] == "AKIAEXAMPLE"
         assert seen["session"]["region_name"] == "eu-west-1"
-        assert seen["client"] == ("sts", "http://localhost:4566")
+        assert seen["client"] == ("sts", "http://localhost:4566", None)
 
     def test_an_sts_failure_is_a_reason_named_by_type(self, monkeypatch):
         class _Session:
             def __init__(self, **kwargs):
                 pass
 
-            def client(self, name, endpoint_url=None):
+            region_name = None
+
+            def client(self, name, endpoint_url=None, region_name=None):
                 raise RuntimeError("secret detail that must not be printed")
 
         boto3 = types.ModuleType("boto3")
@@ -102,16 +106,21 @@ class TestAws:
 
         class _Session:
             def __init__(self, **kwargs):
-                seen.update(kwargs)
+                self.region_name = profile_region
 
-            def client(self, name, endpoint_url=None):
+            def client(self, name, endpoint_url=None, region_name=None):
+                seen["client_region"] = region_name
                 return types.SimpleNamespace(get_caller_identity=lambda: {"Account": "1"})
 
         boto3 = types.ModuleType("boto3")
         boto3.session = types.SimpleNamespace(Session=_Session)
         monkeypatch.setitem(sys.modules, "boto3", boto3)
+        profile_region = None
         assert ti.aws_caller_account({}, None) == ("1", "")
-        assert seen["region_name"] == "us-east-1"
+        assert seen["client_region"] == "us-east-1"
+        profile_region = "cn-north-1"  # the profile's own region is kept (another partition)
+        assert ti.aws_caller_account({}, None) == ("1", "")
+        assert seen["client_region"] is None
 
     def test_without_boto3_it_says_how_to_install_it(self, monkeypatch):
         monkeypatch.setitem(sys.modules, "boto3", None)

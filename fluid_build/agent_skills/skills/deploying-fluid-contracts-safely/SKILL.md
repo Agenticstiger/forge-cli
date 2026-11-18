@@ -70,7 +70,7 @@ Ask, in the chat, before any of these, and say what each one risks:
 | `apply_plan_digest_tofu_plan_target_mismatch` | the credentials or region reach another account, project or region than the plan's | use the plan's credentials and region, or plan again for this target |
 | `apply_plan_digest_tofu_plan_toolchain` | another OpenTofu or provider version than the plan's | apply with the plan's versions, or plan again here |
 | `apply_plan_digest_tofu_plan_target_unverified` | this run cannot read a target field the plan bound (no credentials or SDK) | give this run the plan's credentials and SDK; ask the user before `--no-verify-plan-binding` |
-| `apply_plan_digest_tofu_plan_target_missing` / `…_lock_missing` | the plan has no target record, or its lock file was not handed over | plan again, or hand over every file `fluid plan --tofu` wrote |
+| `apply_plan_digest_tofu_plan_target_missing` / `…_lock_missing` / `…_lock_mismatch` | the plan has no target record, or its lock file was not handed over or was changed | plan again, or hand over every file `fluid plan --tofu` wrote, unchanged |
 | `apply_plan_digest_tofu_plan_target` | another state backend than the plan's | apply with the plan's `--state-backend` |
 | `apply_plan_digest_tofu_plan_state_missing` | the plan was made on state this runner does not have (local state) | apply where it was planned, or use a remote state backend |
 | data-loss refusal | the change would drop data | stop and ask the user |

@@ -677,7 +677,13 @@ def _install_plan_lock(args, record: Mapping[str, Any], workdir: Path) -> None:
     name = record.get("lockFile")
     if name is None:
         return
-    if not isinstance(name, str) or Path(name).name != name or name in ("", ".", ".."):
+    if (
+        not isinstance(name, str)
+        or name in ("", ".", "..")
+        or Path(name).name != name
+        or "\\" in name
+        or "\x00" in name
+    ):
         raise _target_error(
             "tofu-plan-invalid",
             f"the saved plan's lockFile {name!r} is not a file name next to plan.json",

@@ -794,10 +794,11 @@ class TestTheLockTravels:
             )
         assert refused.value.event == event
 
-    def test_a_lock_file_name_that_is_a_path_is_refused(self, tmp_path):
+    @pytest.mark.parametrize("name", ["../x.hcl", "a\\b.hcl", "a\x00.hcl", "", 7])
+    def test_a_lock_file_name_that_is_not_a_bare_name_is_refused(self, tmp_path, name):
         with pytest.raises(CLIError) as refused:
             engine._install_plan_lock(
-                _args(str(tmp_path / "plan.json")), {"lockFile": "../x.hcl"}, tmp_path
+                _args(str(tmp_path / "plan.json")), {"lockFile": name}, tmp_path
             )
         assert refused.value.event == "apply_plan_digest_tofu_plan_invalid"
 
