@@ -75,6 +75,7 @@ enforces the boundary).
 
 from __future__ import annotations
 
+import datetime
 import re
 from dataclasses import dataclass, field
 from typing import Any, List, Mapping, Sequence
@@ -405,9 +406,13 @@ def _inert_jinja(value: Any) -> Any:
         return value
     if isinstance(value, Mapping):
         return {key: _inert_jinja(item) for key, item in value.items()}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple, set, frozenset)):
+        # YAML's !!pairs and !!omap load as tuples, and dbt renders the strings inside
+        # whatever list safe_dump makes of them.
         return [_inert_jinja(item) for item in value]
-    return value
+    if value is None or isinstance(value, (bool, int, float, datetime.date)):
+        return value
+    return _inert_jinja(str(value))  # any other type: its text, escaped like any text
 
 
 def _plain(value: Any) -> Any:

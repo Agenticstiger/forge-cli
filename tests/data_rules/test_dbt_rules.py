@@ -525,3 +525,18 @@ def test_contract_text_under_a_fluid_rule_key_is_still_a_literal() -> None:
     values = next(t for t in column["tests"] if "accepted_values" in t)["accepted_values"]["values"]
     smuggled = values[1]["fluid_rule"]
     assert smuggled != payload and jinja2.Template(smuggled).render() == payload
+
+
+@pytest.mark.parametrize("tag", ["!!pairs", "!!omap"])
+def test_yaml_pairs_in_an_enum_are_escaped_too(tag: str) -> None:
+    payload = "{{ exceptions.raise_compiler_error('x') }}"
+    pairs = yaml.safe_load(f'{tag} [{{"{payload}": 1}}]')  # what the contract loader yields
+    assert isinstance(pairs[0], tuple)
+    contract = _billing()
+    status = next(c for c in contract["exposes"][0]["contract"]["schema"] if c["name"] == "status")
+    status["enum"] = pairs
+    rendered = render_dbt_tests(contract)
+    doc = yaml.safe_load(rendered)
+    column = next(c for c in doc["models"][0]["columns"] if c["name"] == "status")
+    values = next(t for t in column["tests"] if "accepted_values" in t)["accepted_values"]["values"]
+    assert values[0][0] == _dbt.jinja_text(payload)
