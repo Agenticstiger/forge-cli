@@ -469,7 +469,7 @@ def sql_type(fluid_type: str, adapter: Optional[str] = None) -> str:
     is of the same family and can carry them: ``number(12,2)`` →
     ``number(12,2)`` on Snowflake, ``varchar(25)`` → ``varchar(25)``. Otherwise
     the declaration degrades to the bare type rather than emitting SQL the
-    warehouse rejects — ``array(4)`` → ``array``, ``bigint(20)`` → ``number``
+    warehouse rejects: ``array(4)`` → ``array``, ``bigint(20)`` → ``number``
     (:func:`_keeps_arguments`).
     """
     if not isinstance(fluid_type, str):
@@ -575,7 +575,7 @@ def precision_warnings(contract: Mapping[str, Any], build: Mapping[str, Any]) ->
             if args is not None:
                 continue  # author was explicit — nothing to warn about
             key = base.lower()
-            # An integer type legitimately means scale 0 — only the
+            # An integer type legitimately means scale 0; only the
             # decimal-capable spellings lose information.
             if key in _INTEGER_SPELLINGS:
                 continue
