@@ -467,7 +467,8 @@ def _stat_unless_missing(path: Path) -> None:
     try:
         os.stat(path)
     except (FileNotFoundError, NotADirectoryError):
-        pass
+        # Nothing is there: the caller reports the project as missing.
+        return
 
 
 def collect_bundle_projects(
