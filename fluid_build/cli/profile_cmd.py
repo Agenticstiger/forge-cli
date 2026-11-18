@@ -216,7 +216,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     try:
         expose_id = runner.resolve_expose_id(contract, args.expose_id)
         out = _out_path(args.out, expose_id, args.source)
-        block = bundle.read_bundle_block(bundle_dir, expose_id) if bundle_dir else None
+        block = bundle.read_bundle_block(bundle_dir, expose_id, backend) if bundle_dir else None
         result = runner.profile_expose(
             contract,
             expose_id,

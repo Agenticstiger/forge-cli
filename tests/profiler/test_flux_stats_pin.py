@@ -24,6 +24,10 @@ def _profile_flux_stats() -> list:
     return [r for r in requirements if g.requirement_name(r) == "flux-stats"]
 
 
+def test_the_requirement_names_the_yaml_extra_for_the_bundle_reader():
+    assert Requirement(_stats.FLUX_STATS_REQUIREMENT).extras == {"yaml"}
+
+
 def test_the_profile_extra_names_flux_stats_once():
     assert len(_profile_flux_stats()) == 1
 
@@ -36,11 +40,11 @@ def test_the_requirement_is_a_range_of_released_versions():
     requirement = Requirement(_stats.FLUX_STATS_REQUIREMENT)
     assert requirement.url is None  # PyPI refuses a URL in Requires-Dist
     assert requirement.marker is None  # flux-stats supports Python 3.10, the floor here
-    assert requirement.specifier.contains("0.6.2")
-    assert requirement.specifier.contains("0.6.9")
+    assert requirement.specifier.contains("0.7.0")
+    assert requirement.specifier.contains("0.7.9")
     assert not requirement.specifier.contains("0.0.1")  # the placeholder holds no code
-    assert not requirement.specifier.contains("0.6.1")  # no flux_stats.fidelity for --bundle
-    assert not requirement.specifier.contains("0.7.0")  # a 0.x minor may rename what is imported
+    assert not requirement.specifier.contains("0.6.2")  # no edge_counts, exact_yaml or quantile/2
+    assert not requirement.specifier.contains("0.8.0")  # a 0.x minor may rename what is imported
 
 
 def test_the_install_command_installs_the_extra_that_holds_flux_stats():

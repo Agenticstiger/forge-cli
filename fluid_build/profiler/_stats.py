@@ -52,6 +52,7 @@ from typing import (
 
 __all__ = [
     "BlockRefused",
+    "BundleTextRefused",
     "DeclaredBlock",
     "DeclaredStatistic",
     "DocumentRefused",
@@ -96,6 +97,18 @@ class BlockRefused(ValueError):
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(f"{code}: {message}")
+        self.code = code
+
+
+class BundleTextRefused(ValueError):
+    """The registry's exact-YAML reader or canonical form refused a bundle's text.
+
+    The message names the file and, where the registry gives one, the line and
+    column, with the registry's ``FLX-nnnn`` code. It never quotes a value.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{message} ({code})")
         self.code = code
 
 
@@ -303,6 +316,24 @@ class StatisticsBackend(Protocol):
     def quantile_ranks_ok(self, k: int, level: Fraction, below: int, at_or_below: int) -> bool:
         """Whether a witness with these ranks, over *k* records, is the *level* quantile."""
 
+    def read_budget(self) -> Any:
+        """A fresh budget for reading one bundle's documents, to share across its files."""
+
+    def read_documents(self, text: str, *, name: str, budget: Any) -> Tuple[Mapping[str, Any], ...]:
+        """Every mapping document in *text*, read as the FLUX engine reads a bundle.
+
+        A float is the decimal of its source text and a timestamp stays a string. The
+        read is bounded by *budget* (aliases, merge keys, digits, depth). Raises
+        :class:`BundleTextRefused` for text it refuses, naming *name*.
+        """
+
+    def canonicalise(self, value: Any, *, name: str) -> Any:
+        """*value* in the engine's canonical form (KERNEL-SPEC 2.1).
+
+        Every key is an NFC string, every string NFC, a decimal its string spelling.
+        Raises :class:`BundleTextRefused`, naming *name*, for a value with no canonical form.
+        """
+
 
 #: The most digits a number may need written out without an exponent: the
 #: engine's declared-number rule (flux-engine ``concordance/predicate.py``
@@ -387,7 +418,7 @@ class _FluxStatsBackend:
     def __init__(self) -> None:
         # The package first: when it is missing, this is the import that fails,
         # even with one of its submodules still in sys.modules.
-        from flux_stats import Parameters, definitions, metrics
+        from flux_stats import Parameters, canonical, definitions, exact_yaml, metrics
         from flux_stats.errors import FluxError
         from flux_stats.fixedpoint import Grid
         from flux_stats.profile import load_profile_text
@@ -401,6 +432,8 @@ class _FluxStatsBackend:
         self._category = category
         self._read_exact = read_exact
         self._value_domain = ValueDomain
+        self._exact_yaml = exact_yaml
+        self._canonical = canonical
         self._columns: Dict[Tuple[str, str], _Column] = {}
         self._grammar: Any = None
 
@@ -438,6 +471,25 @@ class _FluxStatsBackend:
             raise _read_refused(error, column, row_index) from None
         # A timestamp reads as a whole number of milliseconds since the epoch.
         return int(exact) if domain == "timestamp" else exact
+
+    def read_budget(self) -> Any:
+        return self._exact_yaml.ReadBudget()
+
+    def read_documents(self, text: str, *, name: str, budget: Any) -> Tuple[Mapping[str, Any], ...]:
+        try:
+            documents: Tuple[Mapping[str, Any], ...] = self._exact_yaml.load_documents(
+                text, name=name, budget=budget
+            )
+        except self._refused as error:
+            raise BundleTextRefused(error.code.code, error.detail or error.code.title) from None
+        return documents
+
+    def canonicalise(self, value: Any, *, name: str) -> Any:
+        try:
+            return self._canonical.canonicalise(value)
+        except self._refused as error:
+            detail = error.detail or error.code.title
+            raise BundleTextRefused(error.code.code, f"{name}: {detail}") from None
 
     def check_document(self, text: str) -> None:
         try:
@@ -652,7 +704,9 @@ def load_backend() -> StatisticsBackend:
 #: The flux-stats range ``[profile]`` names in ``pyproject.toml``. The CLI cannot read
 #: that file once installed, so the install message repeats it;
 #: ``tests/profiler/test_flux_stats_pin.py`` keeps the two equal.
-FLUX_STATS_REQUIREMENT = "flux-stats>=0.6.2,<0.7"
+#: TODO: the founder names the real version when flux-stats releases it; 0.7.0 is the
+#: first release that holds ``edge_counts``, ``exact_yaml`` and ``quantile/2``.
+FLUX_STATS_REQUIREMENT = "flux-stats[yaml]>=0.7.0,<0.8"
 #: The extra carries the range, and pip replaces a copy outside it (the 0.0.1
 #: placeholder, or a release newer than this module knows).
 FLUX_STATS_INSTALL_COMMAND = "pip install 'data-product-forge[profile]'"

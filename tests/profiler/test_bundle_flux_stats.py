@@ -147,7 +147,7 @@ def _profile(
 ):
     chosen = properties if properties is not None else PROPERTIES
     directory = _bundle(tmp_path, chosen, bits, market_null)
-    block = bundle.read_bundle_block(directory, EXPOSE)
+    block = bundle.read_bundle_block(directory, EXPOSE, _stats.load_backend())
     return profile_expose(
         CONTRACT,
         EXPOSE,
@@ -628,7 +628,7 @@ def test_a_value_outside_the_declared_range_is_refused(tmp_path):
 def test_a_block_the_grammar_refuses_is_refused_before_any_record_is_read(tmp_path):
     properties = [{"property": "mean", "column": "nope", "tolerance": _ABSOLUTE}]
     directory = _bundle(tmp_path, properties)
-    block = bundle.read_bundle_block(directory, EXPOSE)
+    block = bundle.read_bundle_block(directory, EXPOSE, _stats.load_backend())
     with pytest.raises(ProfileError) as refused:
         profile_expose(
             CONTRACT,
@@ -645,7 +645,7 @@ def test_a_declaration_over_the_wrong_domain_is_refused(tmp_path):
     contract = json.loads(json.dumps(CONTRACT))
     contract["exposes"][0]["contract"]["schema"][1]["type"] = "integer"  # market as a number
     directory = _bundle(tmp_path, [PROPERTIES[4]])
-    block = bundle.read_bundle_block(directory, EXPOSE)
+    block = bundle.read_bundle_block(directory, EXPOSE, _stats.load_backend())
     with pytest.raises(ProfileError) as refused:
         profile_expose(
             contract,
@@ -662,7 +662,7 @@ def test_a_declared_column_the_contract_types_unreadably_is_refused(tmp_path):
     contract = json.loads(json.dumps(CONTRACT))
     contract["exposes"][0]["contract"]["schema"][0]["type"] = "double"
     directory = _bundle(tmp_path, [PROPERTIES[0]])
-    block = bundle.read_bundle_block(directory, EXPOSE)
+    block = bundle.read_bundle_block(directory, EXPOSE, _stats.load_backend())
     with pytest.raises(ProfileError) as refused:
         profile_expose(
             contract,
@@ -677,7 +677,7 @@ def test_a_declared_column_the_contract_types_unreadably_is_refused(tmp_path):
 
 def test_the_seam_deduplicates_identical_properties(tmp_path):
     directory = _bundle(tmp_path, [PROPERTIES[0], PROPERTIES[0], PROPERTIES[6]])
-    block = bundle.read_bundle_block(directory, EXPOSE)
+    block = bundle.read_bundle_block(directory, EXPOSE, _stats.load_backend())
     declared = _stats.load_backend().read_block(block.raw, CONTRACT, EXPOSE)
     assert [s.description for s in declared.statistics] == ["mean/1 of 'amount'"]
     assert declared.columns == ("amount",)
@@ -777,7 +777,7 @@ def test_a_flux_stats_without_the_grammar_refuses_before_reading(tmp_path, monke
     assert rc == 1
     assert "profile_statistics_unavailable" in out
     assert "reads the fidelity block with flux-stats, and the installed flux-stats" in out
-    assert "lacks flux_stats.fidelity. It needs flux-stats>=0.6.2,<0.7" in out
+    assert "lacks flux_stats.fidelity. It needs flux-stats[yaml]>=0.7.0,<0.8" in out
     assert "next: pip install 'data-product-forge[profile]'" in out
 
 
@@ -790,7 +790,7 @@ def test_a_block_written_with_bare_null_keys_and_bare_floats_profiles_as_the_quo
     text = path.read_text(encoding="utf-8")
     assert "'null':" in text and "level: '0.5'" in text
     path.write_text(text.replace("'null':", "null:").replace("level: '0.5'", "level: 0.5"))
-    block = bundle.read_bundle_block(directory, EXPOSE)
+    block = bundle.read_bundle_block(directory, EXPOSE, _stats.load_backend())
     assert block.raw["columns"]["market"]["null"] == "fail"
     bare = profile_expose(
         CONTRACT,

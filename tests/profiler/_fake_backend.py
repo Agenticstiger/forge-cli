@@ -29,7 +29,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, List, Sequence, Tuple
 
-from fluid_build.profiler._stats import DocumentRefused, ReadRefused
+from fluid_build.profiler._stats import BundleTextRefused, DocumentRefused, ReadRefused
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SCHEMA_PATH = FIXTURES / "profile-1.schema.json"
@@ -212,3 +212,19 @@ class FakeBackend:
         )
         if errors:
             raise DocumentRefused("; ".join(error.message for error in errors[:3]))
+
+    def read_budget(self) -> object:
+        return object()
+
+    def read_documents(self, text: str, *, name: str, budget: object) -> Tuple[Dict[str, Any], ...]:
+        """Plain YAML: enough for a bundle's file listing, which the real reader tests cover."""
+        import yaml
+
+        try:
+            documents = list(yaml.safe_load_all(text))
+        except yaml.YAMLError:
+            raise BundleTextRefused("FLX-3105", f"{name}: unreadable YAML") from None
+        return tuple(document for document in documents if isinstance(document, dict))
+
+    def canonicalise(self, value: Any, *, name: str) -> Any:
+        return value
