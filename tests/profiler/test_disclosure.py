@@ -375,3 +375,131 @@ def test_a_sum_of_decimals_or_text_is_checked_as_the_same_fractions():
         == expected
     )
     assert check_sum([str(value) for value in fractions], ACRO_DEFAULT).status == expected
+
+
+# -- the groups of a declared statistic -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("k", "status"),
+    [(0, "A"), (1, "A"), (9, "A"), (10, "F"), (11, "F"), (120, "F")],
+)
+def test_a_groups_k_is_checked_as_a_count(k, status):
+    assert disclosure.check_group_count(k, ACRO_DEFAULT).status == status
+
+
+def test_a_k_that_rounds_to_zero_is_withheld_under_a_low_threshold():
+    rule = _rule(minimum_cell=1)
+    assert disclosure.check_group_count(2, rule).status == "A"  # 2 rounds to 0 at base 5
+    assert disclosure.check_group_count(3, rule).status == "F"
+
+
+def test_cells_are_checked_one_by_one_and_rounded():
+    cells = disclosure.publish_cells([0, 3, 12, 40], ACRO_DEFAULT)
+    assert cells.statuses == ("A", "A", "F", "F")
+    assert cells.counts == (None, None, 10, 40)
+    assert cells.any_withheld
+    assert cells.verdict.published
+
+
+def test_cells_that_all_pass_carry_no_withheld_cell():
+    cells = disclosure.publish_cells([10, 25, 31], ACRO_DEFAULT)
+    assert cells.statuses == ("F", "F", "F")
+    assert cells.counts == (10, 25, 30)
+    assert not cells.any_withheld
+
+
+def test_a_group_whose_every_cell_is_withheld_is_withheld_whole():
+    cells = disclosure.publish_cells([0, 4, 9], ACRO_DEFAULT)
+    assert cells.verdict.status == "A"
+    assert cells.counts == (None, None, None)
+
+
+def test_a_zero_cell_is_published_where_the_rule_holds_zeros_safe():
+    cells = disclosure.publish_cells([0, 20], _rule(zeros_disclosive=False))
+    assert cells.statuses == ("F", "F") and cells.counts == (0, 20)
+
+
+def test_a_positive_cell_that_rounds_to_zero_is_withheld():
+    cells = disclosure.publish_cells([2, 30], _rule(minimum_cell=1))
+    assert cells.statuses == ("A", "F")
+
+
+@pytest.mark.parametrize(
+    ("holders", "status"),
+    [((10, 12), "F"), ((10, 9), "A"), ((1,), "A"), ((), "F"), ((40, 0), "A")],
+)
+def test_a_support_needs_every_member_held_by_enough_records(holders, status):
+    assert disclosure.check_support(holders, ACRO_DEFAULT).status == status
+
+
+def _proves(k, below, at_or_below, level=Fraction(1, 2)):
+    index = -((-level.numerator * k) // level.denominator)
+    return below < index <= at_or_below
+
+
+def test_a_quantile_witness_needs_enough_holders_and_publishes_rounded_ranks():
+    verdict, below, at_or_below = disclosure.check_quantile(120, 48, 72, ACRO_DEFAULT, _proves)
+    assert verdict.status == "F" and (below, at_or_below) == (50, 70)
+    verdict, *_ = disclosure.check_quantile(120, 48, 57, ACRO_DEFAULT, _proves)
+    assert verdict.status == "A"  # nine records hold the witness
+    verdict, *_ = disclosure.check_quantile(120, 48, 58, ACRO_DEFAULT, _proves)
+    assert verdict.status == "F"  # ten do
+
+
+def test_a_quantile_whose_rounded_ranks_no_longer_prove_the_witness_is_withheld():
+    # 20 records, the median is the 10th. 7 below and 17 at or below prove it, and so
+    # do their rounded 5 and 15.
+    assert _proves(20, 7, 17)
+    verdict, below, at_or_below = disclosure.check_quantile(20, 7, 17, ACRO_DEFAULT, _proves)
+    assert (below, at_or_below) == (5, 15) and verdict.status == "F"
+    # 8 below and 18 at or below prove it with 10 holders, and round to 10 and 20:
+    # 10 records below no longer leaves the 10th record in the witness's place.
+    assert _proves(20, 8, 18)
+    verdict, below, at_or_below = disclosure.check_quantile(20, 8, 18, ACRO_DEFAULT, _proves)
+    assert (below, at_or_below) == (10, 20)
+    assert verdict.status == "A" and "no longer prove" in verdict.reason
+
+
+def test_a_quantile_rank_that_rounds_to_zero_withholds_the_group():
+    rule = _rule(minimum_cell=1)
+    verdict, *_ = disclosure.check_quantile(30, 2, 20, rule, lambda *_: True)
+    assert verdict.status == "A"
+    verdict, *_ = disclosure.check_quantile(30, 0, 20, rule, lambda *_: True)
+    assert verdict.status == "F"  # nothing below the witness is a zero rank, not a small one
+
+
+def _published():
+    return disclosure.PUBLISHED
+
+
+def _withheld(code="A"):
+    return disclosure.Verdict(code, "x")
+
+
+def test_secondary_suppression_withholds_the_groups_that_passed_with_d():
+    verdicts = [_published(), _withheld(), _published(), _withheld("C")]
+    result = disclosure.suppress_secondary(verdicts)
+    assert [v.status for v in result] == ["D", "A", "D", "C"]
+
+
+def test_secondary_suppression_leaves_a_statistic_alone_when_nothing_is_withheld():
+    verdicts = [_published(), _published()]
+    assert disclosure.suppress_secondary(verdicts) == tuple(verdicts)
+
+
+def test_secondary_suppression_leaves_a_statistic_alone_when_everything_is_withheld():
+    verdicts = [_withheld(), _withheld("O")]
+    assert [v.status for v in disclosure.suppress_secondary(verdicts)] == ["A", "O"]
+
+
+def test_secondary_suppression_has_a_code_of_its_own():
+    assert disclosure.SECONDARY == "D"
+    assert disclosure.SECONDARY not in {
+        disclosure.FREE,
+        disclosure.SMALL_COUNT,
+        disclosure.WITHHELD,
+        disclosure.DOMINANCE_BY_ONE,
+        disclosure.DOMINANCE_BY_TWO,
+        disclosure.CONCENTRATION,
+    }

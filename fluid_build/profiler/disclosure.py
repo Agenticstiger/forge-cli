@@ -39,8 +39,17 @@ published only when at least ``minimumCell`` records hold exactly that value
 A withheld value carries an SDMX ``CL_CONF_STATUS`` 1.4 code and no value: ``A``
 for a small count (a zero cell, a cell below the threshold, or a value too few
 records hold), ``O`` and ``T`` for dominance by one or two records, ``M`` for
-the p-ratio, another measure of concentration, and ``C`` for a sum whose records
-hold at most two values.
+the p-ratio, another measure of concentration, ``C`` for a sum whose records
+hold at most two values, and ``D`` for a group the sender withholds so that
+another cannot be recovered (secondary suppression, :func:`suppress_secondary`).
+
+The groups of a statistic the Simulation's fidelity block declares are checked
+group by group, each as a cell of a table of records (the ESSnet/DwB output
+checking guidelines' frequency-table and magnitude-table classes, which ACRO's
+``safe_threshold`` and ``safe_nk`` checks implement): :func:`check_group_count`
+for the group's record count, :func:`publish_cells` for a histogram's cells,
+:func:`check_support` for a support's members and :func:`check_quantile` for a
+quantile's witness.
 
 Where this differs from ACRO 1.1.0, on purpose:
 
@@ -73,7 +82,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Any, Dict, Iterable, List, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 __all__ = [
     "ACRO_DEFAULT",
@@ -83,19 +92,26 @@ __all__ = [
     "FREE",
     "MAX_COUNT",
     "PUBLISHED",
+    "SECONDARY",
     "SMALL_COUNT",
     "WITHHELD",
+    "Cells",
     "DisclosureRule",
     "Exact",
     "Verdict",
     "check_count",
+    "check_group_count",
     "check_magnitude",
     "check_mean",
     "check_order_statistic",
+    "check_quantile",
     "check_rounding",
     "check_sum",
+    "check_support",
+    "publish_cells",
     "round_count",
     "sample_size",
+    "suppress_secondary",
 ]
 
 # SDMX ``CL_CONF_STATUS`` 1.4 codes, with PROFILE-SPEC §3's paraphrase of each
@@ -113,6 +129,10 @@ DOMINANCE_BY_TWO = "T"
 CONCENTRATION = "M"
 #: Withheld statistical information.
 WITHHELD = "C"
+
+#: Secondary suppression set by the sender: a group that passed every check on its own
+#: and is withheld so that a withheld sibling cannot be recovered from it.
+SECONDARY = "D"
 
 #: The largest count a profile can carry: 2^53 - 1, as RFC 8785 serialises it.
 MAX_COUNT = 2**53 - 1
@@ -422,3 +442,131 @@ def check_order_statistic(holders: int, rule: DisclosureRule) -> Verdict:
     if holders >= rule.minimum_cell:
         return PUBLISHED
     return Verdict(SMALL_COUNT, f"fewer than {rule.minimum_cell} records hold the value")
+
+
+def check_group_count(k: int, rule: DisclosureRule) -> Verdict:
+    """Check the ``k`` of a group of a declared statistic: a count of records.
+
+    :func:`check_count`, then :func:`check_rounding`, the two checks a column's
+    ``count`` passes. A group that passes is published with ``k`` rounded
+    (:func:`round_count`), so what it says about the records is no more than
+    ``count`` says.
+    """
+    verdict = check_count(k, rule)
+    if verdict.published:
+        verdict = check_rounding(k, rule)
+    return verdict
+
+
+@dataclass(frozen=True)
+class Cells:
+    """A histogram group's cells after the checks.
+
+    ``verdict`` is :data:`PUBLISHED`, or ``A`` when every cell is withheld and the
+    group goes whole. ``statuses`` holds one code per cell and ``counts`` the
+    published count of each, rounded, or ``None`` where the cell is withheld
+    (PROFILE-SPEC §3: a cell is null exactly when its status is not ``F``).
+    """
+
+    verdict: Verdict
+    statuses: Tuple[str, ...]
+    counts: Tuple[Optional[int], ...]
+
+    @property
+    def any_withheld(self) -> bool:
+        return any(status != FREE for status in self.statuses)
+
+
+def publish_cells(counts: Sequence[int], rule: DisclosureRule) -> Cells:
+    """Check each cell of a histogram group as a count, and round the ones that pass.
+
+    A cell is a frequency-table cell: a zero is withheld when the rule holds zeros
+    disclosive, one below ``minimumCell`` is withheld, and so is a positive count
+    that rounds to zero (:func:`check_count`, then :func:`check_rounding`), each
+    with ``A``. A published cell is rounded to a multiple of the rounding base. A
+    group whose every cell is withheld says nothing, so it is withheld whole.
+    """
+    statuses: List[str] = []
+    shown: List[Optional[int]] = []
+    for count in counts:
+        verdict = check_group_count(count, rule)
+        statuses.append(verdict.status)
+        shown.append(round_count(count, rule) if verdict.published else None)
+    if statuses and all(status != FREE for status in statuses):
+        return Cells(Verdict(SMALL_COUNT, "every cell is withheld"), tuple(statuses), tuple(shown))
+    return Cells(PUBLISHED, tuple(statuses), tuple(shown))
+
+
+def check_support(holders: Sequence[int], rule: DisclosureRule) -> Verdict:
+    """Check a support: every member must be held by at least ``minimumCell`` records.
+
+    *holders* is the number of records holding each member. A support lists its
+    members, so a member one record holds would name that record's value. Each
+    member is checked as a minimum or a maximum is (:func:`check_order_statistic`,
+    the DwB/ESSnet guidelines' rule for extremes), and one member too few records
+    hold withholds the whole group with ``A``: a document cannot say which member
+    was left out.
+    """
+    for count in holders:
+        verdict = check_order_statistic(count, rule)
+        if not verdict.published:
+            return verdict
+    return PUBLISHED
+
+
+def check_quantile(
+    k: int,
+    below: int,
+    at_or_below: int,
+    rule: DisclosureRule,
+    proves: Callable[[int, int, int], bool],
+) -> Tuple[Verdict, int, int]:
+    """Check a quantile group's witness and its ranks; return the verdict and the rounded ranks.
+
+    *below* and *at_or_below* are the records strictly below the witness and at or
+    below it, so ``at_or_below - below`` records hold it. In order, the first that
+    fires decides, always with ``A``:
+
+    1. fewer than ``minimumCell`` records hold the witness
+       (:func:`check_order_statistic`, as a minimum or a maximum is checked);
+    2. a rank is positive and rounds to zero (:func:`check_rounding`);
+    3. the rounded ``k`` and ranks no longer prove the witness: *proves* is the
+       registry's rank check on them, because a published group is read back with
+       the rounded numbers, and a rank rounded across the witness's index would
+       publish a witness the numbers contradict.
+
+    The ranks are published rounded, as every count is. The returned ranks are
+    only meaningful when the verdict is published.
+    """
+    verdict = check_order_statistic(at_or_below - below, rule)
+    if verdict.published:
+        for rank in (below, at_or_below):
+            verdict = check_rounding(rank, rule)
+            if not verdict.published:
+                break
+    shown = (round_count(below, rule), round_count(at_or_below, rule))
+    if verdict.published and not proves(round_count(k, rule), shown[0], shown[1]):
+        verdict = Verdict(SMALL_COUNT, "the rounded ranks no longer prove the witness")
+    return verdict, shown[0], shown[1]
+
+
+def suppress_secondary(verdicts: Sequence[Verdict]) -> Tuple[Verdict, ...]:
+    """Withhold every published group of a statistic when any of its groups is withheld.
+
+    Secondary suppression, as the output-checking guidelines call it: a statistic
+    published for every group has a total in the column's own published metrics
+    (``count``, ``sum``), so one withheld group is given back by subtracting the
+    published groups from that total. When any group fails its checks, every
+    group that passed is withheld too with ``D`` (set by the sender); the groups
+    that failed keep their own code. A statistic whose groups all pass, or all
+    fail, is unchanged. It applies to a grouped ``mean/1`` and a grouped
+    ``support/1``, whose groups partition a total the profile publishes. It does
+    not apply to an ungrouped statistic, which has one group, or to a histogram
+    or a quantile, whose own cells and ranks are checked as counts.
+    """
+    if all(verdict.published for verdict in verdicts) or not any(
+        verdict.published for verdict in verdicts
+    ):
+        return tuple(verdicts)
+    withheld = Verdict(SECONDARY, "another group of the statistic is withheld")
+    return tuple(withheld if verdict.published else verdict for verdict in verdicts)
