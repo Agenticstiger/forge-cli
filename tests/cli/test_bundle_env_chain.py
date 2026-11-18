@@ -36,6 +36,7 @@ from fluid_build.cli import generate_artifacts as artifacts_cmd
 from fluid_build.cli import plan as plan_cmd
 from fluid_build.cli import validate as validate_cmd
 from fluid_build.cli._common import CLIError
+from fluid_build.forge.core.bundle import read_bundle_source
 
 LOG = logging.getLogger("test.bundle_env_chain")
 
@@ -153,23 +154,25 @@ def _bindings(out_dir: str) -> int:
 
 
 class TestBundleRecordsWhatItWasBuiltFrom:
-    def test_manifest_names_the_source_contract_env_and_overlay(self, ws: Path) -> None:
+    def test_the_bundle_records_the_source_contract_env_and_overlay(self, ws: Path) -> None:
         tgz = _bundle("runtime/bundle.tgz", env="aws")
-        source = _manifest(tgz).get("source")
-        assert source == {
+        # The env in the MANIFEST, the checkout paths beside it.
+        assert _manifest(tgz).get("source") == {"env": "aws"}
+        assert read_bundle_source(Path(tgz)) == {
             "contract": "../contracts/customer_subscriptions/contract.fluid.yaml",
             "env": "aws",
             "overlay": "overlays/aws.yaml",
         }
 
-    def test_the_digest_still_names_the_contract_alone(self, ws: Path) -> None:
-        # Provenance is metadata, outside the merkle root: the same contract
-        # bundled into two directories keeps one digest.
-        a = _manifest(_bundle("runtime/a.tgz", env="aws"))
+    def test_two_directories_give_one_digest_and_one_packet(self, ws: Path) -> None:
+        # Provenance is outside the archive: the same contract bundled into two
+        # directories keeps one digest and the same bytes.
+        a = _bundle("runtime/a.tgz", env="aws")
         (ws / "elsewhere" / "deeper").mkdir(parents=True)
-        b = _manifest(_bundle("elsewhere/deeper/b.tgz", env="aws"))
-        assert a["source"]["contract"] != b["source"]["contract"]
-        assert a["digest"] == b["digest"]
+        b = _bundle("elsewhere/deeper/b.tgz", env="aws")
+        assert read_bundle_source(Path(a))["contract"] != read_bundle_source(Path(b))["contract"]
+        assert _manifest(a)["digest"] == _manifest(b)["digest"]
+        assert Path(a).read_bytes() == Path(b).read_bytes()
 
 
 class TestPlanFromABundle:

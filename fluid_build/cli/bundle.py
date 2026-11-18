@@ -436,7 +436,13 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
     # ── tgz branch: canonical deterministic bundle (stage-1 pipeline output) ──
     if fmt == "tgz":
-        from fluid_build.forge.core.bundle import _slug, build_bundle_tgz, make_bundle_source
+        from fluid_build.forge.core.bundle import (
+            _slug,
+            build_bundle_tgz,
+            make_bundle_source,
+            packet_digest,
+            provenance_path,
+        )
 
         # Product-id defaulted output filename. Bundles travel outside the
         # product folder (CI artifact stores, S3, catalog publish). Naming
@@ -470,9 +476,10 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         # itself is the input) and which environment was applied (so
         # ``plan`` / ``apply`` / ``verify --env X`` can refuse a bundle built
         # for a different one), with the overlay warnings the merge raised (so
-        # ``fluid validate <bundle> --strict`` fails on them). Recorded in
-        # MANIFEST.json, outside the merkle root: the digest still names the
-        # contract alone.
+        # ``fluid validate <bundle> --strict`` fails on them). Outside the merkle
+        # root: the digest still names the contract alone. The env and warnings
+        # go into MANIFEST.json; the paths into <bundle>.provenance.json beside
+        # it, so the packet's bytes do not depend on --out or the checkout.
         source = make_bundle_source(
             Path(contract_path),
             Path(out),
@@ -496,8 +503,12 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             sys.stderr.write(f"❌ Bundle tgz build failed: {e}\n")
             return 1
 
+        packet = packet_digest(Path(out))
         sys.stderr.write(f"✅ Bundle written to {out}\n")
         sys.stderr.write(f"   digest: {digest}\n")
+        sys.stderr.write(f"   packet: {packet}\n")
+        if provenance_path(Path(out)).is_file():
+            sys.stderr.write(f"   provenance: {provenance_path(Path(out)).name}\n")
         sys.stderr.write(dbt_report)
         if env:
             applied = source.get("overlay") or "none (base contract)"
@@ -549,35 +560,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         # ── Optional: SLSA L2 in-toto attestation ─────────────────────
         # Emitted AFTER signing so a combined --sign --attest run
         # signs the bundle AND the attestation carries matching
-        # provenance. The attestation file is JSONL-on-disk; future
-        # work can add ``cosign attest-blob`` to embed the statement
-        # in Rekor's tlog.
+        # provenance.
         if getattr(args, "attest", False):
-            from ._attestation import write_attestation
-
-            try:
-                attest_result = write_attestation(
-                    out,
-                    bundle_digest=digest,
-                    contract_dir=str(contract_dir),
-                    extra_external_params={
-                        "format": "tgz",
-                        "env": env or "",
-                        "sign_mode": (
-                            "keyless"
-                            if (
-                                getattr(args, "sign", False) and not getattr(args, "sign_key", None)
-                            )
-                            else ("keyed" if getattr(args, "sign_key", None) else "none")
-                        ),
-                    },
-                )
-            except Exception as e:
-                sys.stderr.write(f"❌ Attestation write failed: {e}\n")
-                return 1
-            sys.stderr.write(
-                f"✅ Attestation written (SLSA Provenance v1)\n   intoto: {attest_result['path']}\n"
-            )
+            return _attest(args, out, packet, digest, source, env, contract_dir)
         return 0
 
     # ── yaml / json branch (legacy single-file output) ─────────────────────
@@ -591,4 +576,50 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         p.write_text(output, encoding="utf-8")
         sys.stderr.write(f"✅ Bundled contract written to {p}\n")
 
+    return 0
+
+
+def _attest(
+    args: argparse.Namespace,
+    out: str,
+    packet: str,
+    digest: str,
+    source: Dict[str, Any],
+    env: Optional[str],
+    contract_dir: Path,
+) -> int:
+    """``--attest``: write ``<bundle>.intoto.jsonl``; 0, or 1 when it cannot.
+
+    The subject is the packet file: its sha256, bare hex as in-toto's digest set
+    spells it. The merkle root and the checkout paths the archive no longer holds
+    are parameters of the build. The file is JSONL-on-disk; future work can add
+    ``cosign attest-blob`` to embed the statement in Rekor's tlog.
+    """
+    from ._attestation import write_attestation
+
+    sign_key = getattr(args, "sign_key", None)
+    if sign_key:
+        sign_mode = "keyed"
+    else:
+        sign_mode = "keyless" if getattr(args, "sign", False) else "none"
+    try:
+        attest_result = write_attestation(
+            out,
+            bundle_digest=packet.split(":", 1)[1],
+            contract_dir=str(contract_dir),
+            extra_external_params={
+                "format": "tgz",
+                "bundleDigest": digest,
+                "sourceContract": source.get("contract") or "",
+                "overlay": source.get("overlay") or "",
+                "env": env or "",
+                "sign_mode": sign_mode,
+            },
+        )
+    except Exception as e:
+        sys.stderr.write(f"❌ Attestation write failed: {e}\n")
+        return 1
+    sys.stderr.write(
+        f"✅ Attestation written (SLSA Provenance v1)\n   intoto: {attest_result['path']}\n"
+    )
     return 0
