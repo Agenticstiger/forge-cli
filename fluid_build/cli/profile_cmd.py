@@ -37,11 +37,12 @@ checks are ACRO 1.1.0's defaults, named "acro-default" in the document:
     and a quantile only when the records below it and above it are each none
     or at least 10;
   - a mean is published only when the column's count and sum are.
-A withheld value keeps its SDMX CL_CONF_STATUS code and no value: A (a small
-count), C (a sum over at most two values), O or T (dominated by one or two
-records), M (concentration) or D (secondary suppression). A histogram's withheld
-groups and cells are all written C, whatever withheld them, so their code says
-nothing of their size; the summary counts them by the check.
+A withheld value keeps an SDMX CL_CONF_STATUS code and no value: A (a small
+count), O or T (dominated by one or two records), M (concentration), D
+(secondary suppression) or C (withheld). C marks a sum over at most two values,
+and every withheld group and cell of a histogram, whatever withheld it, so a
+histogram's codes say nothing of a count's size. The summary counts each
+withheld value by the check that withheld it.
 
 For each number column the document also holds mean/1, the statistic the FLUX
 fidelity check compares a mean property with: the number of values and their
@@ -81,8 +82,10 @@ fluid profile contract.fluid.yaml --expose orders \\
 
 # Only aggregates leave: a count under 10 or a zero is withheld, counts are rounded
 # to 5, a sum 2 records dominate is withheld, and a min, max or quantile is shown only
-# when 10 records hold it (ACRO 1.1.0 defaults). Output-checking conventions only: no
-# privacy or anonymity guarantee. Pin the printed digest in the FLUX Simulation.
+# when 10 records hold it (ACRO 1.1.0 defaults), a quantile only when none or at least
+# 10 records lie below it and above it. A histogram's withheld groups and cells all
+# read C, whatever withheld them. Output-checking conventions only: no privacy or
+# anonymity guarantee. Pin the printed digest in the FLUX Simulation.
 # Each number column also gets mean/1, which FLUX compares a mean property with, on the
 # grid --fractional-bits names (16 unless given): the fidelity block must declare it.
 
@@ -451,10 +454,10 @@ def _report(say: Any, result: Any, out: Path, *, answered_block: bool = False) -
         f"{_plural(result.published, 'value')} published, {sum(withheld.values())} withheld."
     )
     if withheld:
-        say(f"Withheld, by CL_CONF_STATUS code: {_codes(withheld)}.")
+        say(f"Withheld, by the check (CL_CONF_STATUS code): {_codes(withheld)}.")
     cells: Dict[str, int] = dict(result.withheld_cells)
     if cells:
-        say(f"Withheld histogram cells, by CL_CONF_STATUS code: {_codes(cells)}.")
+        say(f"Withheld histogram cells, by the check (CL_CONF_STATUS code): {_codes(cells)}.")
     if cells or _histograms_withheld(result):
         say(
             "The document writes C for every withheld group and cell of a histogram, "

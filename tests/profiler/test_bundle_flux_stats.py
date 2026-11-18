@@ -567,7 +567,7 @@ def test_the_command_writes_the_document_and_names_what_it_answers(tmp_path, mon
     assert "Not answered: correlation of 'amount' and 'qty':" in out
     assert "a run that checks it is refused (FLX-5037)." in out
     # The DE level holds no record: its cell is withheld, written C, and counted by its check.
-    assert "Withheld histogram cells, by CL_CONF_STATUS code: A (small count) 1." in out
+    assert "Withheld histogram cells, by the check (CL_CONF_STATUS code): A (small count) 1." in out
     assert _ONE_CODE in out
     written = (tmp_path / "payment.profile.json").read_bytes()
     load_profile_text(written.decode("utf-8"))
@@ -741,6 +741,37 @@ def test_the_report_names_the_statistics_withheld_in_part(tmp_path, monkeypatch,
         "marginalHistogram/1 of 'amount' over bins 0, 50, 100 by 'market' (3 of 4 groups)." in out
     )
     assert _ONE_CODE in out and "Withheld histogram cells" not in out
+
+
+def test_a_histogram_withheld_whole_is_named_in_the_report(tmp_path, monkeypatch, capsys):
+    # Six records: the histogram's one group is withheld for its size, so no cell is
+    # counted, and the report still says the document writes C for it.
+    rows = [{"amount": "10", "market": "IE", "qty": "1"} for _ in range(6)]
+    directory = _bundle(tmp_path, [PROPERTIES[2]])
+    monkeypatch.chdir(tmp_path)
+    rc = main(
+        [
+            "profile",
+            str(directory / "payment.fluid.yml"),
+            "--source",
+            _slice(tmp_path, rows),
+            "--bundle",
+            str(directory),
+            "--out",
+            "payment.profile.json",
+        ]
+    )
+    out = " ".join(capsys.readouterr().out.split())
+    assert rc == 0, out
+    assert "marginalHistogram/1 of 'amount' over bins 0, 50, 100" in out.split("Withheld whole")[1]
+    assert _ONE_CODE in out and "Withheld histogram cells" not in out
+    written = json.loads((tmp_path / "payment.profile.json").read_bytes())
+    (histogram,) = [
+        entry
+        for entry in written["tables"][EXPOSE]["columns"]["amount"]["statistics"]
+        if entry["definition"] == "marginalHistogram/1"
+    ]
+    assert histogram["groups"] == [{"group": "", "status": "C"}]
 
 
 def test_a_report_with_no_withheld_histogram_value_says_nothing_of_c(tmp_path, monkeypatch, capsys):
