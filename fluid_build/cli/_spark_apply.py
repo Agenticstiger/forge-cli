@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from fluid_build.build_runners.spark._desired import ACTION, DesiredRun
 
@@ -129,22 +129,26 @@ def prepare(
     if not dry_run and any(r.local for r in selected):
         _check_local(selected, workspace)
     if not dry_run and any(r.long_running and not r.local for r in selected):
-        import importlib.util
-
-        try:
-            found = importlib.util.find_spec("boto3") is not None
-        except (ImportError, ValueError):
-            found = False
-        if not found:
-            raise _cli_error(
-                "apply_aws_sdk_missing",
-                {
-                    "error": "a streaming Spark build is started after tofu apply through boto3, "
-                    "which is not installed; nothing was applied",
-                    "hint": "pip install 'data-product-forge[aws]'",
-                },
-            )
+        _require_boto3()
     return selected
+
+
+def _require_boto3() -> None:
+    import importlib.util
+
+    try:
+        found = importlib.util.find_spec("boto3") is not None
+    except (ImportError, ValueError):
+        found = False
+    if not found:
+        raise _cli_error(
+            "apply_aws_sdk_missing",
+            {
+                "error": "a streaming Spark build is started after tofu apply through boto3, "
+                "which is not installed; nothing was applied",
+                "hint": "pip install 'data-product-forge[aws]'",
+            },
+        )
 
 
 def _check_local(runs: List[DesiredRun], workspace: Optional[Path] = None) -> None:
@@ -231,30 +235,17 @@ def reconcile_after_apply(
     from fluid_build.build_runners.spark._local import LocalHost
 
     host = LocalHost(Path(workspace)) if workspace is not None else None
-    stop_removed_of = None
-    if host is not None and contract is not None and not build_id and contract.get("id"):
-        stop_removed_of = (str(contract.get("id")), {r.build for r in runs if r.local})
-        if not runs and not _has_local_runs(host, stop_removed_of[0]):
-            stop_removed_of = None
+    stop_removed_of = _removed_of(host, runs, contract, build_id)
     if not runs and stop_removed_of is None:
         return 0
-    from fluid_build.build_runners.spark._reconcile import reconcile, stop_removed
+    if dry_run:
+        _say_planned(runs, host, stop_removed_of)
+        return 0
+    from fluid_build.build_runners.spark._reconcile import reconcile
     from fluid_build.cli.console import cprint
 
-    if dry_run:  # a dry run reads nothing from AWS: the application may not exist yet
-        for run in runs:
-            what = (
-                "started by a scheduler (fluid apply --mode amend-and-build)"
-                if run.scheduled
-                else f"would be reconciled to config {run.config_hash[:12]}"
-            )
-            cprint(f"Spark {run.build} ({run.runtime}): {what}", markup=False)
-        if stop_removed_of is not None:  # local files only
-            for out in stop_removed(*stop_removed_of, host, dry_run=True):
-                cprint(out.line(), markup=False)
-        return 0
     outcomes = reconcile(
-        runs, dry_run=dry_run, clients=clients, local_host=host, stop_removed_of=stop_removed_of
+        runs, dry_run=False, clients=clients, local_host=host, stop_removed_of=stop_removed_of
     )
     for out in outcomes:
         cprint(out.line(), markup=False)
@@ -262,7 +253,37 @@ def reconcile_after_apply(
     return 1 if any(o.error for o in outcomes) else 0
 
 
-def _has_local_runs(host: Any, product: str) -> bool:
+def _removed_of(
+    host: Any, runs: List[DesiredRun], contract: Optional[Mapping[str, Any]], build_id: Any
+) -> Optional[Tuple[str, set]]:
+    """``(product, builds it runs here)``: this machine's runs of the product's other builds
+    are stopped. Only for the whole contract (no ``build_id``), and only when the contract
+    runs builds here or this machine has runs of the product."""
+    if host is None or contract is None or build_id or not contract.get("id"):
+        return None
     from fluid_build.build_runners.spark._local import builds_with_runs
 
-    return bool(builds_with_runs(host, product))
+    product = str(contract.get("id"))
+    if not runs and not builds_with_runs(host, product):
+        return None
+    return product, {r.build for r in runs if r.local}
+
+
+def _say_planned(
+    runs: List[DesiredRun], host: Any, stop_removed_of: Optional[Tuple[str, set]]
+) -> None:
+    """A dry run's lines. It reads nothing from AWS (the application may not exist yet),
+    only this machine's run files."""
+    from fluid_build.build_runners.spark._reconcile import stop_removed
+    from fluid_build.cli.console import cprint
+
+    for run in runs:
+        what = (
+            "started by a scheduler (fluid apply --mode amend-and-build)"
+            if run.scheduled
+            else f"would be reconciled to config {run.config_hash[:12]}"
+        )
+        cprint(f"Spark {run.build} ({run.runtime}): {what}", markup=False)
+    if stop_removed_of is not None:
+        for out in stop_removed(*stop_removed_of, host, dry_run=True):
+            cprint(out.line(), markup=False)

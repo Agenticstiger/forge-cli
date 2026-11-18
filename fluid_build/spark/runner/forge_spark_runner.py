@@ -115,24 +115,34 @@ def parse_config(text: str) -> dict:
         raise JobConfigError("a streaming job reads a source and keeps a checkpoint")
     if config["mode"] == "batch" and config.get("source"):
         raise JobConfigError("a batch job runs SQL over catalog tables and reads no topic")
-    sink = config["sink"]
+    _check_sink(config["sink"])
+    if config.get("deadLetter") is not None:
+        _check_dead_letters(config, config["deadLetter"])
+    return config
+
+
+def _check_sink(sink) -> None:
     if not isinstance(sink, dict) or sink.get("type") not in ("glue", "rest"):
         raise JobConfigError("the sink must be a glue or rest catalog table")
     _check_create(sink.get("create"), "sink")
-    dead = config.get("deadLetter")
-    if dead is not None:
-        if config["mode"] != "streaming" or not (config["sql"] or {}).get("check"):
-            raise JobConfigError("deadLetter is a stream's, with the sql.check query")
-        if dead.get("sink") == "table" and not dead.get("table"):
-            raise JobConfigError("a deadLetter table sink names its table")
-        if dead.get("sink") == "topic" and not dead.get("topic"):
-            raise JobConfigError("a deadLetter topic sink names its topic")
-        if dead.get("sink") not in ("table", "topic") or not dead.get("checkpoint"):
-            raise JobConfigError("deadLetter needs a table or topic sink and a checkpoint")
-        if not isinstance(dead.get("maxRecordsBeforeAbort"), int):
-            raise JobConfigError("deadLetter.maxRecordsBeforeAbort must be a whole number")
-        _check_create(dead.get("create"), "deadLetter")
-    return config
+
+
+def _check_dead_letters(config: dict, dead) -> None:
+    if not isinstance(dead, dict):
+        raise JobConfigError("deadLetter must be an object")
+    if config["mode"] != "streaming" or not (config["sql"] or {}).get("check"):
+        raise JobConfigError("deadLetter is a stream's, with the sql.check query")
+    if dead.get("sink") == "table" and not dead.get("table"):
+        raise JobConfigError("a deadLetter table sink names its table")
+    if dead.get("sink") == "topic" and not dead.get("topic"):
+        raise JobConfigError("a deadLetter topic sink names its topic")
+    if dead.get("sink") not in ("table", "topic") or not dead.get("checkpoint"):
+        raise JobConfigError("deadLetter needs a table or topic sink and a checkpoint")
+    if isinstance(dead.get("maxRecordsBeforeAbort"), bool) or not isinstance(
+        dead.get("maxRecordsBeforeAbort"), int
+    ):
+        raise JobConfigError("deadLetter.maxRecordsBeforeAbort must be a whole number")
+    _check_create(dead.get("create"), "deadLetter")
 
 
 def _check_create(create, where: str) -> None:

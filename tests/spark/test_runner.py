@@ -178,7 +178,10 @@ def test_the_runner_never_formats_the_query_text():
         if "spark.sql(" in line and not line.strip().startswith("#")
     ]
     assert calls and all(
-        c.endswith('spark.sql(queries["source"])') or c.endswith('spark.sql(queries["select"])')
+        c.endswith('spark.sql(queries["source"])')
+        or c.endswith('spark.sql(queries["select"])')
+        # the dead letters' check, compiled by forge-cli like the other two
+        or c.endswith('spark.sql(queries["check"])')
         # the sink's own CREATE ... IF NOT EXISTS statements, compiled by forge-cli
         or c == "spark.sql(statement)"
         for c in calls
