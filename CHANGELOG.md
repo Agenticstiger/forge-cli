@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   these scripts write now use single quotes. The Glue script's SQL summary comment is one line, so
   multi-line SQL no longer spills out of it as code, and a column type or SQL that is not a string no
   longer stops generation.
+- **A FLUID SQL/1 expression can name an enum column whose quoted level holds a parenthesis.**
+  FLUID SQL/1 read a column type up to its first `)`, so a column typed `enum('a (b)', 'c')` had
+  no FLUID SQL/1 type, and `fluid validate` refused every invariant, derive or registry rule that
+  named it ("has no FLUID SQL/1 type, so no expression can name it"). It now finds the parameter
+  list the way the other type readers do, stepping over quoted text; only a type whose parameter
+  list holds a parenthesis inside quotes reads differently. The conformance vectors gain three
+  cases for a level holding a parenthesis, a comma and a doubled quote.
 
 ## [0.31.0] — 2026-11-17
 

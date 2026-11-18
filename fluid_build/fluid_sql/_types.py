@@ -15,6 +15,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
+from fluid_build.util.column_type import split_type_params
+
 BOOL, NUMBER, STRING, DATE, TIMESTAMP, TIMESTAMPTZ = (
     "bool",
     "number",
@@ -50,7 +52,9 @@ _TIMESTAMPTZ_TYPES = frozenset(
 #: The widest DECIMAL precision read (PostgreSQL's limit): a wider declaration has no FLUID
 #: SQL/1 type, so no contract can make a value of unbounded width (flux-expr/2 reads it so too).
 MAX_DECIMAL_PRECISION = 1000
-_DECLARED = re.compile(r"(?P<base>[a-z0-9_ ]+?)\s*(?:\((?P<params>[^()]*)\))?\Z")
+#: A type's base name. ``split_type_params`` finds where its parameter list ends, stepping
+#: over quoted text, so an enum level may hold a parenthesis: ``enum('a (b)')`` is a string.
+_BASE = re.compile(r"[a-z0-9_ ]+")
 _PRECISION_SCALE = re.compile(r"(?P<p>[0-9]+)(?:\s*,\s*(?P<s>[0-9]+))?\Z")
 
 
@@ -88,10 +92,9 @@ def column_type(declared: object) -> Optional[ColumnType]:
     if not isinstance(declared, str):
         return None
     text = " ".join(declared.strip().lower().split())
-    match = _DECLARED.match(text)
-    if not match:
+    base, params = split_type_params(text)
+    if not _BASE.fullmatch(base):
         return None
-    base, params = match.group("base").strip(), match.group("params")
     if base in _BOOL_TYPES and params is None:
         return ColumnType(SqlType(BOOL))
     if base == "bit" and (params is None or params.strip() == "1"):

@@ -378,6 +378,21 @@
      "type": "int"
     }
    }
+  },
+  "levels": {
+   "columns": {
+    "level_id": {
+     "type": "string"
+    },
+    "grade": {
+     "type": "enum('a (b)', 'c, d', 'O''Brien')",
+     "enum": [
+      "a (b)",
+      "c, d",
+      "O'Brien"
+     ]
+    }
+   }
   }
  },
  "vectors": [
@@ -14177,6 +14192,99 @@
    "text": "kind BETWEEN 'a' AND 'base_fee'",
    "site": "predicate",
    "model": "invoices",
+   "expect": {
+    "verdict": "refused",
+    "reason": "enum-literal"
+   }
+  },
+  {
+   "id": "enum-type-quoted-paren",
+   "text": "grade = 'a (b)'",
+   "site": "predicate",
+   "model": "levels",
+   "note": "RFC 2.3: a quoted enum level may hold a parenthesis, a comma or a doubled quote (FLUID 0.7.7); the column is still a string",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "compare",
+     "op": "=",
+     "left": {
+      "node": "column",
+      "name": "grade"
+     },
+     "right": {
+      "node": "string",
+      "value": "a (b)"
+     }
+    },
+    "canonical": "grade = 'a (b)'",
+    "type": "bool",
+    "eval": [
+     {
+      "row": {
+       "grade": "a (b)"
+      },
+      "result": true
+     },
+     {
+      "row": {
+       "grade": "c, d"
+      },
+      "result": false
+     }
+    ]
+   }
+  },
+  {
+   "id": "enum-type-quoted-comma-and-quote",
+   "text": "grade IN ('c, d', 'O''Brien')",
+   "site": "predicate",
+   "model": "levels",
+   "note": "RFC 2.3: a quoted enum level may hold a parenthesis, a comma or a doubled quote (FLUID 0.7.7); the column is still a string",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "in",
+     "left": {
+      "node": "column",
+      "name": "grade"
+     },
+     "items": [
+      {
+       "node": "string",
+       "value": "c, d"
+      },
+      {
+       "node": "string",
+       "value": "O'Brien"
+      }
+     ],
+     "negated": false
+    },
+    "canonical": "grade IN ('c, d', 'O''Brien')",
+    "type": "bool",
+    "eval": [
+     {
+      "row": {
+       "grade": "O'Brien"
+      },
+      "result": true
+     },
+     {
+      "row": {
+       "grade": "a (b)"
+      },
+      "result": false
+     }
+    ]
+   }
+  },
+  {
+   "id": "enum-type-quoted-level-typo",
+   "text": "grade = 'a(b)'",
+   "site": "predicate",
+   "model": "levels",
+   "note": "RFC 2.3: the closed-set rule holds for a level that holds a parenthesis",
    "expect": {
     "verdict": "refused",
     "reason": "enum-literal"
