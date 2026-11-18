@@ -161,9 +161,10 @@ class Adapter:
     runtime = ""
     service = ""
 
-    def __init__(self, run: DesiredRun, clients: ClientFactory) -> None:
+    def __init__(self, run: DesiredRun, clients: Optional[ClientFactory]) -> None:
         self.run = run
-        self.client = clients(self.service, run.region)
+        # A local run has no AWS client: its "client" is the machine (``Local.host``).
+        self.client = clients(self.service, run.region) if clients is not None else None
 
     def runs(self) -> List[RunInfo]:  # newest first
         raise NotImplementedError
@@ -593,8 +594,7 @@ class Local(Adapter):
         from fluid_build.build_runners.spark._local import LocalRuns, default_host, require_posix
 
         require_posix()
-        self.run = run
-        self.client = None
+        super().__init__(run, None)
         self.host = host if host is not None else default_host()
         self._runs = LocalRuns(self.host, run.product, run.build)
 

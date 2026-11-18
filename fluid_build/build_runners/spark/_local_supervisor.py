@@ -51,7 +51,7 @@ def _signal(child, signum, group):
         else:
             child.send_signal(signum)
     except OSError:
-        pass
+        pass  # the process has ended already: there is nothing left to signal
 
 
 def _wait(child, cancel_path, stopping, grace, status_path, status):

@@ -180,7 +180,7 @@ def started():
         try:
             runs_of.cancel(run_id, grace=2.0)
         except SparkRunError:
-            pass
+            continue  # a run this test already removed or never started: nothing to stop
 
 
 # --- the run as it is planned ----------------------------------------------------------

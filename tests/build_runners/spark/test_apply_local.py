@@ -291,7 +291,9 @@ def test_a_declined_apply_starts_no_local_run(tmp_path, monkeypatch):
     monkeypatch.setattr(apply_cli.os, "isatty", lambda fd: True)
     monkeypatch.setattr("builtins.input", lambda *a: "n")
     data = stream_contract()
-    assert main(["apply", str(write(tmp_path, data))]) == 0
+    path = write(tmp_path, data)
+    code = main(["apply", str(path)])
+    assert code == 0
     assert not (tmp_path / ".fluid" / "spark-artifacts").exists()
     assert not (tmp_path / ".fluid" / data["id"] / "runtime" / "spark").exists()
 
@@ -335,7 +337,9 @@ def test_a_contract_that_runs_builds_here_and_on_aws_is_refused(tmp_path, capsys
             dict(local["exposes"][0], exposeId="order_lines_here"),
         ],
     }
-    assert main(["apply", str(write(tmp_path, data)), "--yes", "--dry-run"]) == 1
+    path = write(tmp_path, data)
+    code = main(["apply", str(path), "--yes", "--dry-run"])
+    assert code == 1
     out = capsys.readouterr().out
     assert "apply_spark_needs_opentofu" in out and "ingest-orders" in out
     assert "ingest-here" not in out.split("error:")[1].split("hint:")[0]

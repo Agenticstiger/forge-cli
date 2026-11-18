@@ -138,12 +138,12 @@ def test_the_check_names_the_first_reason_decoding_first(contract):
     lines = [line.strip() for line in sql.splitlines() if line.strip().startswith("WHEN")]
     assert lines == [
         "WHEN `value`.`fluid_corrupt_record` IS NOT NULL THEN "
-        "'the value is not JSON of the declared fields and types'",
+        + "'the value is not JSON of the declared fields and types'",
         "WHEN `value`.`id` IS NULL THEN 'required field id is null'",
         "WHEN (`value`.`customer` IS NOT NULL AND `value`.`customer`.`email` IS NULL) THEN "
-        "'required field customer.email is null'",
+        + "'required field customer.email is null'",
         "WHEN coalesce(exists(`value`.`items`, `fluid_e0` -> (`fluid_e0` IS NOT NULL AND "
-        "`fluid_e0`.`sku` IS NULL)), false) THEN 'required field items[].sku is null'",
+        + "`fluid_e0`.`sku` IS NULL)), false) THEN 'required field items[].sku is null'",
     ]
     assert sql.endswith("FROM `kafka_records_decoded`")
 

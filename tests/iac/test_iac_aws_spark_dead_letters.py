@@ -95,11 +95,10 @@ def test_the_dead_letters_table_sits_beside_the_output_never_inside_it(contract)
         "arn:aws:s3:::commerce-lake/iceberg/commerce/order_lines__dead_letter/*",
         "arn:aws:s3:::commerce-lake/_checkpoints/commerce.orders-stream/ingest-orders/*",
     ]
+    glue = "arn:aws:glue:eu-west-1:${data.aws_caller_identity.fluid_lf_caller.account_id}"
     assert statement(access, "GlueTable")["resources"][-2:] == [
-        "arn:aws:glue:eu-west-1:${data.aws_caller_identity.fluid_lf_caller.account_id}"
-        ":table/commerce/order_lines",
-        "arn:aws:glue:eu-west-1:${data.aws_caller_identity.fluid_lf_caller.account_id}"
-        ":table/commerce/order_lines__dead_letter",
+        f"{glue}:table/commerce/order_lines",
+        f"{glue}:table/commerce/order_lines__dead_letter",
     ]
     # A table sink writes no topic.
     assert "MskDeadLetterTopic" not in {s.get("sid") for s in access["statement"]}

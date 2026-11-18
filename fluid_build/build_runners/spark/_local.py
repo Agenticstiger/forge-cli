@@ -476,7 +476,7 @@ def _replace(path: Path, body: bytes) -> None:
         try:
             os.unlink(tmp)
         except OSError:
-            pass
+            pass  # best effort: the write's own error, raised next, is the one that matters
         raise
 
 

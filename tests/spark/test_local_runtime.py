@@ -49,14 +49,18 @@ def test_a_local_sink_is_the_submitters_catalog_with_its_create_statements(contr
         "table": "commerce.order_lines",
         "create": [
             "CREATE NAMESPACE IF NOT EXISTS `fluid`.`commerce`",
-            "CREATE TABLE IF NOT EXISTS `fluid`.`commerce`.`order_lines` (\n"
-            "  `order_id` STRING NOT NULL,\n"
-            "  `customer_id` STRING,\n"
-            "  `email_hash` STRING,\n"
-            "  `sku` STRING,\n"
-            "  `qty` INT,\n"
-            "  `event_time` TIMESTAMP\n"
-            ") USING iceberg TBLPROPERTIES ('format-version' = '2')",
+            "\n".join(
+                [
+                    "CREATE TABLE IF NOT EXISTS `fluid`.`commerce`.`order_lines` (",
+                    "  `order_id` STRING NOT NULL,",
+                    "  `customer_id` STRING,",
+                    "  `email_hash` STRING,",
+                    "  `sku` STRING,",
+                    "  `qty` INT,",
+                    "  `event_time` TIMESTAMP",
+                    ") USING iceberg TBLPROPERTIES ('format-version' = '2')",
+                ]
+            ),
         ],
     }
     assert config["checkpoint"] == "s3://lake/_checkpoints/commerce.orders-stream/ingest-orders/"
