@@ -222,16 +222,21 @@ def test_validate_fails_closed_when_the_lint_itself_crashes(monkeypatch):
 
 # ── a host only fluid apply renders ─────────────────────────────────────────
 
+#: References whose names the secret scanner reads as keywords.
+PGPASSWORD_REF = "env://PGPASSWORD"  # pragma: allowlist secret
+AIRBYTE_REF = "env://AIRBYTE_TOKEN"  # pragma: allowlist secret
+
 
 @pytest.mark.unit
 def test_a_placeholder_host_is_left_to_apply_with_the_entry_apply_needs(monkeypatch):
-    """Seen live on 0.31.0: the lint judged ``{{ env.PGHOST }}`` as written and
+    """The lint once suggested an entry that could never match at apply.
 
-    suggested ``PGPASSWORD@{{ env.PGHOST }}``, an entry that passes the lint and
-    matches nothing at apply, which judges the host the placeholder renders to.
+    Seen live on 0.31.0: it judged ``{{ env.PGHOST }}`` as written and suggested
+    ``PGPASSWORD@{{ env.PGHOST }}``, an entry that passes the lint and matches
+    nothing at apply, which judges the host the placeholder renders to.
     """
     monkeypatch.setenv("PGHOST", "db.private-value.internal")
-    contract = _conn(secretRef="env://PGPASSWORD", host="{{ env.PGHOST }}")
+    contract = _conn(secretRef=PGPASSWORD_REF, host="{{ env.PGHOST }}")
     (finding,) = lint_secret_refs(contract, {})
     assert finding.ok
     assert finding.deferred is not None
@@ -243,7 +248,7 @@ def test_a_placeholder_host_is_left_to_apply_with_the_entry_apply_needs(monkeypa
 
 @pytest.mark.unit
 def test_an_entry_naming_the_placeholder_changes_nothing():
-    contract = _conn(secretRef="env://PGPASSWORD", host="{{ env.PGHOST }}")
+    contract = _conn(secretRef=PGPASSWORD_REF, host="{{ env.PGHOST }}")
     environ = {ALLOWLIST_ENV: "PGPASSWORD@{{ env.PGHOST }}"}
     (finding,) = lint_secret_refs(contract, environ)
     assert finding.ok and finding.deferred is not None
@@ -289,7 +294,7 @@ def test_only_a_placeholder_in_the_host_part_waits_for_apply(uri, waits):
 def test_an_airbyte_server_url_placeholder_is_left_to_apply():
     deployment = {
         "server_url": "https://{{ env.AIRBYTE_HOST }}/api",
-        "auth": {"secretRef": "env://AIRBYTE_TOKEN"},
+        "auth": {"secretRef": AIRBYTE_REF},
     }
     (finding,) = lint_secret_refs(_contract({"airbyte": {"deployment": deployment}}), {})
     assert finding.ok
@@ -303,7 +308,7 @@ def test_validate_reports_a_deferred_destination_as_a_warning():
 
     result = ValidationResult(is_valid=True, schema_version=None)
     validate_cmd._check_secret_refs(
-        result, _conn(secretRef="env://PGPASSWORD", host="{{ env.PGHOST }}")
+        result, _conn(secretRef=PGPASSWORD_REF, host="{{ env.PGHOST }}")
     )
     assert result.is_valid and not result.errors
     assert any("PGPASSWORD@<host>" in warning for warning in result.warnings)
@@ -313,8 +318,6 @@ def test_validate_reports_a_deferred_destination_as_a_warning():
 def test_secrets_check_shows_a_deferred_destination():
     from fluid_build.cli import secrets as secrets_cmd
 
-    rows = secrets_cmd._check_rows(
-        _conn(secretRef="env://PGPASSWORD", host="{{ env.PGHOST }}"), False
-    )
+    rows = secrets_cmd._check_rows(_conn(secretRef=PGPASSWORD_REF, host="{{ env.PGHOST }}"), False)
     assert rows[0]["ok"] is True
     assert "PGPASSWORD@<host>" in rows[0]["deferred"]
