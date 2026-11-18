@@ -421,6 +421,9 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
         NOT_A_CONTRACT,
         "a bundle's own resolved contract: composed when it was bundled",
         *_site("forge/core/bundle.py", "_bundled_contract_id"),
+        # fluid ship reads the ports (--require-artifacts) and the id and
+        # fluidVersion (--release-dir) of the contract stage 1 bundled.
+        *_site("cli/_ship_stages.py", "bundled_contract"),
     ),
     # ── the long tail the catalog accepts (SPEC_GAP, P3) ──
     **_register(
