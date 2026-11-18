@@ -1497,6 +1497,85 @@
             "latest"
           ],
           "description": "NEW in v0.7.7 (preview): Where a job with no checkpoint yet starts reading: earliest (all the topic retains) or latest (new records only). Absent: the engine's default, latest for a Spark stream. A job that has a checkpoint resumes from it."
+        },
+        "deadLetter": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "NEW in v0.7.7 (preview): What forge's Spark runner does with a record it cannot land: a value or key that is not the declared JSON, a field of another type, or a required field that is null (an Avro stream's dead letters are not supported yet). With deadLetter, each such record goes to a dead-letter sink, with its raw bytes, the reason, and its topic, partition and offset, and the stream keeps running; without it, or with enabled: false, the first such record fails the stream. The keys follow the acquisition lane's dlq (enabled, maxRecordsBeforeAbort, alertOn). A Spark stream only: managed Flink refuses the key.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "false: no dead letters; a record that cannot land fails the stream (an overlay can switch it off per environment)."
+            },
+            "sink": {
+              "enum": [
+                "table",
+                "topic"
+              ],
+              "default": "table",
+              "description": "table: an Iceberg table beside the output, in the output's catalog and database. topic: a Kafka topic on the cluster the stream reads, each record with Kafka Connect's error-context headers (__connect.errors.topic, .partition, .offset, .exception.message)."
+            },
+            "table": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,254}(?![\\s\\S])",
+              "description": "sink table only: the table's name in the output's database. Absent: <output table>__dead_letter, as late events go to <output table>__late_events."
+            },
+            "topic": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,249}(?![\\s\\S])",
+              "description": "sink topic only, and required there: the dead-letter topic, on the cluster the stream reads. It must exist; the job writes to it and creates nothing."
+            },
+            "maxRecordsBeforeAbort": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 10000,
+              "description": "The stream fails once it has sent more dead letters than this since it started (0: the first one fails it, after it has landed in the sink)."
+            },
+            "alertOn": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "schema_violation"
+                ]
+              },
+              "description": "The reasons the runner logs a dead_letter_alert line for, each micro-batch that sends any: schema_violation is every record the stream could not land."
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "sink": {
+                    "const": "topic"
+                  }
+                },
+                "required": [
+                  "sink"
+                ]
+              },
+              "then": {
+                "required": [
+                  "topic"
+                ],
+                "not": {
+                  "required": [
+                    "table"
+                  ]
+                },
+                "description": "a topic sink names its topic, and no table"
+              },
+              "else": {
+                "not": {
+                  "required": [
+                    "topic"
+                  ]
+                },
+                "description": "topic is for sink: topic; a table sink takes table"
+              }
+            }
+          ]
         }
       }
     },
