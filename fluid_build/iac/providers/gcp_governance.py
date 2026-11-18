@@ -72,6 +72,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
+from .. import column_types
 from ..access import normalize_access_grants
 from ..base import UnsupportedBindingError
 from ..column_access import authz_readers, column_masks, column_readers, restrictions_for
@@ -380,6 +381,16 @@ def retention_for(
     return BqRetention(period=str(period), days=days, field=field)
 
 
+def _declared_columns(exposure: Mapping[str, Any]) -> Dict[Any, Mapping[str, Any]]:
+    """The expose's top-level schema columns by name (a column without a string name is
+    the schema check's to report)."""
+    return {
+        c["name"]: c
+        for c in column_types.schema_of(exposure)
+        if isinstance(c, Mapping) and isinstance(c.get("name"), str)
+    }
+
+
 def partition_trigger_input(retention: BqRetention) -> Dict[str, str]:
     """What forces the table's replacement: the partitioning's shape, not its expiry.
 
@@ -522,6 +533,7 @@ def tag_groups(
             ),
         )
     by_column = column_readers(exposure, restrictions, resolve, readers, where=where)
+    _refuse_record_restrictions(exposure, by_column, where=where)
     masks = column_masks(exposure, restrictions, resolve, readers, where=where)
     # A tag's data policy masks every column the tag carries, so a masked column
     # shares a tag only with columns masked alike for the same principals.
@@ -547,6 +559,34 @@ def tag_groups(
             )
         )
     return groups
+
+
+def _refuse_record_restrictions(
+    exposure: Mapping[str, Any], columns: Mapping[str, Any], *, where: str
+) -> None:
+    """Refuse a restriction on a column BigQuery holds as a RECORD (a struct, an array
+    of structs, or a map). BigQuery attaches a policy tag to a leaf field only, and
+    refuses one on a RECORD at apply ("Policy tags can't be applied to columns that use
+    the STRUCT data type", BigQuery's data masking introduction)."""
+    from .gcp import _bq_field
+
+    declared = _declared_columns(exposure)
+    records = [
+        name
+        for name in columns
+        if name in declared and _bq_field(declared[name])["type"] == "RECORD"
+    ]
+    if records:
+        raise UnsupportedBindingError(
+            "column-restriction-record",
+            f"{where} restricts {', '.join(repr(name) for name in records)}, which BigQuery "
+            "holds as a RECORD; BigQuery attaches a policy tag only to a leaf field, never to "
+            "a RECORD column.",
+            (
+                "Restrict top-level columns that hold the sensitive values instead, or "
+                "declare the column json, which takes a policy tag.",
+            ),
+        )
 
 
 @dataclass(frozen=True)

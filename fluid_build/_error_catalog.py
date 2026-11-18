@@ -211,6 +211,17 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ["Validate the contract that uses the fragment: fluid validate contract.fluid.yaml"],
         None,
     ),
+    "diagnostics_scope_unsupported": (
+        [
+            (
+                "Validate one contract at a time: fluid validate <product>/contract.fluid.yaml "
+                "--format sarif"
+            ),
+            "Or drop --diagnostics / --format sarif to validate the workspace or bundle as a whole",
+            "Run --list-versions or --show-schema without --format sarif",
+        ],
+        "validate",
+    ),
     "schema_not_available": (
         ["Run 'fluid validate --list-versions' to see the versions this CLI has"],
         "schema-evolution",
@@ -792,6 +803,14 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "validate",
     ),
+    "contract_unrendered_build_step_ref": (
+        [
+            "Remove buildStepRef: it names a transformations[] step, no command runs a single "
+            + "step, and fluid generate schedule runs each build as one fluid apply --build-id task",
+            "To run a build after another, list that one in its builds[].dependencies",
+        ],
+        "validate",
+    ),
     # JSON-Schema findings, by the keyword that failed
     "contract_schema_required": (
         [
@@ -1129,6 +1148,9 @@ _EXAMPLES: Dict[str, str] = {
     "contract_sdp_consumes_products": (
         "metadata:\n  productType: ADP\n  layer: Silver\n"
         "consumes:\n- productId: sales.orders_raw\n  exposeId: orders_raw\n"
+    ),
+    "contract_unrendered_build_step_ref": (
+        "builds:\n- id: load\n  dependencies:\n  - buildId: extract\n    condition: success\n"
     ),
     "contract_schema_required": _CONTRACT,
     "contract_schema_unknown_field": _CONTRACT,

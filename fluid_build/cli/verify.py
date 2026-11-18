@@ -513,19 +513,18 @@ def verify_bigquery_table(
         expected_fields = {}
         for field in expected_schema:
             field_name = field.get("name")
-            field_type = field.get("type", "string").lower()
 
-            # The type the IaC emitted for this column, so verify checks the
-            # table against what apply created. The old local table had no
-            # varchar, so a Postgres-sourced contract always "mismatched".
-            from fluid_build.iac.providers.gcp import _bq_type
+            # The field the IaC emitted for this column, so verify checks the
+            # table against what apply created: its type, and REPEATED for an
+            # array or a map, which BigQuery reports by its element's type. The
+            # old local table had no varchar, so a Postgres-sourced contract
+            # always "mismatched".
+            from fluid_build.iac.providers.gcp import _bq_field
 
-            bq_type = _bq_canonical_type(_bq_type(field_type))
-            required = field.get("required", False)
-
+            emitted = _bq_field(field)
             expected_fields[field_name] = {
-                "type": bq_type,
-                "mode": "required" if required else "nullable",
+                "type": _bq_canonical_type(emitted["type"]),
+                "mode": str(emitted["mode"]).lower(),
             }
 
         # Dimension 1: Schema Structure (column names and counts)

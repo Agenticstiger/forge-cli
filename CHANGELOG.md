@@ -68,6 +68,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compiled, so a config another apply put there since never runs under the run's config hash.
   The artifact bucket's write access stays the boundary. A scheduler's role already reads both
   objects. The runner changed, so each running Spark stream restarts once on its next apply.
+- **BigQuery holds the nested columns a contract declares.** A 0.7.7 column that declares its
+  `element`, `fields`, or `key` and `value` was refused on BigQuery. It is now written as
+  BigQuery holds it: an array as a REPEATED field of its element's type, a struct as a RECORD
+  with its fields (up to the 15 levels BigQuery nests), an array of structs as a REPEATED
+  RECORD, and a map as a REPEATED RECORD of a `key` and a `value`, which is how BigQuery's own
+  Avro load holds a map. The shape is read by the parser the Glue emitter uses, so a
+  declaration is accepted or refused alike on both clouds, and the Glue output is unchanged.
+  What BigQuery holds differently makes `fluid validate` warn and `--strict` fail: a nullable
+  array (BigQuery stores a NULL array as an empty one), a nullable element (an array holds no
+  NULL) and a map (its keys are not kept unique). `required: true` on the array and on its
+  `element`, or an array of key/value structs, holds them exactly. An array of arrays, a leaf
+  BigQuery cannot hold and a column restriction on a RECORD column (BigQuery puts policy tags
+  on leaf fields only) are refused, naming the field. A bare `array`, `struct` or `map` is still
+  refused, and its fix now says to declare the shape. `fluid verify` compares a nested column
+  with the type and mode apply wrote, and `fluid diff` reads a map as it reads an array and
+  every spelling of a struct (`struct`, `record`, `row`) as the RECORD BigQuery reports.
+
+- **`fluid generate schedule` renders the build graph: `builds[].dependencies` and dataset
+  triggers.** Builds that `builds[].dependencies` link now run in one Airflow DAG, one
+  `fluid apply --build-id` task per build, each after the builds it names. A dependency's
+  `condition` is the task's trigger rule: `success` is `all_success`, `completion` is `all_done`,
+  and `always` is Airflow's `always`, which starts the task without waiting. The DAG runs on the
+  one trigger its builds declare, whichever build declares it, and is named after that build.
+  `trigger.type: dataset` runs a DAG when the datasets in `trigger.datasets` are updated (all of
+  them, or any one with `datasetsOperator: any`); `schedule_and_dataset` runs it on its cron and
+  on those updates. A dataset is an Airflow asset URI, or `{productId, exposeId}` of an expose of
+  the contract. Every task now declares the exposes its build writes as `outlets`, named by the
+  URI Airflow's own providers give the same storage (`s3://<bucket>/<path>`,
+  `bigquery://<project>/<dataset>/<table>`, `snowflake://<account>/<database>/<schema>/<table>`
+  and others), so a DAG scheduled on one runs when the task succeeds, in this product's Airflow
+  DAGs or another's. An existing one-build DAG gains only the `Asset` import and that `outlets=`
+  list. The files load on Airflow 2.6+ (a dataset `any` or `schedule_and_dataset` trigger needs
+  2.9) and on Airflow 3. A cycle, a reference to the build itself or to no build, two triggers
+  in one linked group, mixed conditions on one build, a dependency on a build another engine
+  runs, a DAG its own output would trigger, and a dataset Airflow would refuse each stop
+  generation with what to change. A dependency on a stream that `fluid apply` keeps running is
+  not waited for, and the DAG's documentation says so. A contract whose only builds are such
+  streams now gets "No build needs a DAG" from `fluid generate schedule`, not "No scheduler
+  engine specified", and `fluid scaffold-composer` agrees. With `--overwrite`, `fluid generate
+  schedule` removes the DAG files an earlier run wrote into the output directory for the same
+  product and env that the contract no longer makes (a build that now runs as a task of
+  another build's DAG would otherwise run twice). `fluid validate` warns about an Airflow
+  task's `buildStepRef`: no generated DAG runs one.
+
+- **`fluid validate --diagnostics` and `--format sarif` point each finding at the line its author
+  wrote.** A contract composed from `$ref` fragments and an `--env` overlay used to report most
+  findings as a path into the composed document. With `--diagnostics`, each finding carries the
+  file, line and column that wrote the value, the related place in the root contract (the key
+  whose `$ref` brought a fragment in, or the base value an overlay patched), and the product,
+  environment and expose or consume it sits under. Text prints `file:line:col: error CODE:
+  message` lines; `--format json` adds a `diagnostics` block, `{"version": "1.0", "items": [...]}`,
+  after the keys it always had. `--format sarif` writes a SARIF 2.1.0 log for code scanning, with
+  a rule per code, `%SRCROOT%`-relative locations and a fingerprint that does not move with its
+  line; a contract that cannot be loaded still gets a log, with that failure in it. A minor
+  version only adds fields, and `fluid_build.diagnostics.DiagnosticReport.from_dict` reads any
+  `1.x` document and ignores keys it does not know. No diagnostic carries a fix a tool could
+  apply, a source snippet or a credential. Without the flags the text and JSON output are
+  unchanged. A workspace or bundle run refuses the flags (`diagnostics_scope_unsupported`):
+  validate each contract. `--format sarif` also refuses `--list-versions` and `--show-schema`,
+  whose text would end the log.
+
+### Changed
+
+- **`fluid profile --bundle` writes `C` for every withheld group and cell of a histogram or a
+  quantile.** In 0.32.0 a `marginalHistogram/1`, `levelHistogram/1` or `quantile/1` value that an
+  output check withheld kept that check's code, `A` for a small count, and a code that names the
+  check tells a reader a range: cells of 10, 9, 9 and 10 records written `F`, `A`, `A` and `F`,
+  under a total the reader knows, give both withheld cells as 9. FLUX PROFILE-SPEC now asks a
+  profiler to write `C` (withheld statistical information) for every withheld group and cell of a
+  count table and of a `quantile/1`, whatever withheld it (FLUX ADR 0012). The summary still
+  counts each by the check that withheld it, and now says so:
+  `Withheld, by the check (CL_CONF_STATUS code): A (small count) 3.` A new line counts the
+  histogram cells withheld inside published groups. Every other statistic keeps the check's code,
+  and a profile 0.32.0 wrote still reads.
 
 ### Fixed
 
@@ -91,6 +165,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1 <= p <= 1000 and 0 <= s <= p)". Leading zeros still read by value, so `decimal(0012, 02)` is
   `decimal(12, 2)`. The conformance vectors gain 13 cases at the bounds, from `decimal(1)` and
   `decimal(1000, 1000)` to `decimal(0)` and `decimal(1000,1001)`.
+- **The ODCS export of a Databricks product names the Unity Catalog catalog its table is in.**
+  A Databricks binding names the catalog `location.database` (the emitter refuses
+  `location.catalog`, which selects an Iceberg catalog), but the ODCS exporter read only
+  `location.catalog`. Every contract `fluid apply` can deploy therefore exported
+  `catalog: ${DATABRICKS_CATALOG}`, and a consumer of the document (`datacontract test`, DQX, a
+  catalog) could not find the table. The `servers[]` entry now carries `location.database` as
+  `catalog`, with `location.catalog` as a fallback. The import maps a Databricks server's
+  `catalog` back to `location.database`, where it used to drop it, so an imported contract plans
+  and applies. The Entropy Data publish's companion ODCS contract now names the catalog the same
+  way, beside the keys it already wrote.
+
+### Security
+
+- **A quantile is published only when the records below and above it pass the threshold too.**
+  A `quantile/1` group was published when ten records held its witness, with its two ranks, so a
+  rank could say that 3 records lie below the witness, or that 2 lie above it. A group is now
+  published only when the records below its witness and those above it each number at least
+  `minimumCell`, on unrounded counts (the three cells of FLUX ADR 0012). None is allowed only
+  where the rule does not hold zeros disclosive: it says no record lies between the witness and
+  the end of the range. `fluid profile --help` names the rule.
+- **A quantile is withheld beside another statistic that counts at its column's edges.** Its
+  ranks count records at its witness, an edge no declaration fixes, so next to a histogram of its
+  column they could give a withheld cell back (ranks of 17 beside a published cell of 12 give a
+  withheld 5), and two quantiles of one column give back the records between their witnesses. A
+  quantile is now published only as its column's one histogram or quantile; beside another level,
+  a histogram, or the whole beside a groupBy, every group is withheld. A quantile checked there
+  needs bins, once forge-cli writes FLUX's binned quantile.
+- **A group withheld for its size withholds its siblings in a grouped histogram or quantile.**
+  Every grouped statistic publishes each group's size, so a group of 5 records was the column's
+  count less its siblings' sizes, which only a grouped mean or support withheld. Now, when a group
+  of a groupBy (or the rows a null key leaves out of every group) fails the size check, or those
+  rows cannot be read as the block reads them, every group of that groupBy's histograms and
+  quantiles on the same column is withheld too, counted as `D`. A group's size is its records
+  with a value in the column, so another column's groups are checked on their own sizes.
+- **These entries do not complete FLUX ADR 0012's rule on their own.** A reader can still
+  subtract one histogram's published counts from another's, or from a level histogram's group
+  size, and rebuild a withheld cell, a zero included. FLUX's `check_edge_counts` closes that, and
+  forge-cli calls it once a flux-stats release carries it. That change completes the rule and
+  lands before the next forge-cli release.
 
 ## [0.32.0] — 2026-11-18
 

@@ -1119,9 +1119,9 @@ class ContractOrigins:
         self.root = root
         self._entries: Dict[Pointer, List[Union[Origin, _Alias]]] = {}
         self._trees: Dict[Path, Any] = {}
-        # id(mapping node) -> {key: (line, value)}, built on first use: the trees
+        # id(mapping node) -> {key: (line, column, value)}, built on first use: the trees
         # keep every node alive, so an id is not reused while this table lives.
-        self._keys: Dict[int, Dict[str, Tuple[int, Any]]] = {}
+        self._keys: Dict[int, Dict[str, Tuple[int, int, Any]]] = {}
 
     def add(self, at: Sequence[Union[str, int]], origin: Origin) -> None:
         self._entries.setdefault(tuple(at), []).append(origin)
@@ -1155,10 +1155,33 @@ class ContractOrigins:
         the file that wrote the object at ``path`` is preferred over one that
         only merged keys into it: the place to add a key that is missing.
         """
+        found = self.locate_span(path, definition=definition)
+        return None if found is None else (found[0], found[1])
+
+    def locate_span(
+        self, path: Sequence[Union[str, int]], *, definition: bool = False
+    ) -> Optional[Tuple[Path, Optional[int], Optional[int]]]:
+        """:meth:`locate` with the column too: ``(file, line, column)``, both 1-based.
+
+        The column is where the key (or list item) starts on its line; both are
+        ``None`` when the file gives no line.
+        """
         key = tuple(path)
         if definition:
             return self._locate(key, 0, True) or self._locate(key, 0, False)
         return self._locate(key, 0, False)
+
+    def line_in(
+        self, file: Path, path: Sequence[Union[str, int]]
+    ) -> Optional[Tuple[Optional[int], Optional[int]]]:
+        """``(line, column)`` of ``path`` as written in ``file`` itself, whoever wrote
+        the composed value there; ``None`` when ``file`` does not hold ``path``.
+
+        The key whose ``$ref`` brought a fragment in, or the base value an overlay
+        replaced: the other half of a finding located in another file.
+        """
+        found, line, column = self._line(Path(file), tuple(path))
+        return (line, column) if found else None
 
     def describe(
         self, path: Sequence[Union[str, int]], *, definition: bool = False
@@ -1181,7 +1204,7 @@ class ContractOrigins:
 
     def _locate(
         self, path: Pointer, hops: int, definition: bool
-    ) -> Optional[Tuple[Path, Optional[int]]]:
+    ) -> Optional[Tuple[Path, Optional[int], Optional[int]]]:
         if hops > MAX_REF_DEPTH:
             return None
         for cut in range(len(path), -1, -1):
@@ -1195,7 +1218,7 @@ class ContractOrigins:
     def _from_entry(
         self, entry: Union[Origin, _Alias], rest: Pointer, hops: int, definition: bool
     ) -> Any:
-        """Where ``entry`` wrote ``rest`` (the path below it): ``(file, line)``,
+        """Where ``entry`` wrote ``rest`` (the path below it): ``(file, line, column)``,
         ``None`` for an alias that names nothing, or ``_EARLIER`` when ``entry``
         did not write it and an earlier record must answer."""
         if isinstance(entry, _Alias):
@@ -1208,26 +1231,26 @@ class ContractOrigins:
             # A patch wrote keys; the object itself was written elsewhere.
             return _EARLIER
         if entry.inner is None:
-            return _EARLIER if rest else (entry.file, None)
-        found, line = self._line(entry.file, (*entry.inner, *rest))
-        return (entry.file, line) if found else _EARLIER
+            return _EARLIER if rest else (entry.file, None, None)
+        found, line, column = self._line(entry.file, (*entry.inner, *rest))
+        return (entry.file, line, column) if found else _EARLIER
 
-    def _line(self, file: Path, inner: Pointer) -> Tuple[bool, Optional[int]]:
-        """Whether ``file`` holds ``inner``, and the 1-based line it is at."""
+    def _line(self, file: Path, inner: Pointer) -> Tuple[bool, Optional[int], Optional[int]]:
+        """Whether ``file`` holds ``inner``, and the 1-based line and column it is at."""
         if file not in self._trees:
             self._trees[file] = _compose_file(file)
         node = self._trees[file]
         if node is None:
-            return True, None
-        line = node.start_mark.line + 1
+            return True, None, None
+        line, column = node.start_mark.line + 1, node.start_mark.column + 1
         for token in inner:
             step = self._child(node, token)
             if step is None:
-                return False, None
-            line, node = step
-        return True, line
+                return False, None, None
+            line, column, node = step
+        return True, line, column
 
-    def _child(self, node: Any, token: Union[str, int]) -> Optional[Tuple[int, Any]]:
+    def _child(self, node: Any, token: Union[str, int]) -> Optional[Tuple[int, int, Any]]:
         """:func:`_node_child`, with a mapping's keys indexed once, so n errors in
         one mapping cost n lookups, not n scans of it. A key written twice is
         found where it was written last, the value the loader keeps."""
@@ -1238,7 +1261,7 @@ class ContractOrigins:
         keys = self._keys.get(id(node))
         if keys is None:
             keys = self._keys[id(node)] = {
-                key.value: (key.start_mark.line + 1, value)
+                key.value: (key.start_mark.line + 1, key.start_mark.column + 1, value)
                 for key, value in node.value
                 if isinstance(key, yaml.ScalarNode)
             }
@@ -1249,20 +1272,20 @@ class ContractOrigins:
 _EARLIER = object()
 
 
-def _node_child(node: Any, token: Union[str, int]) -> Optional[Tuple[int, Any]]:
-    """``(line, child)`` for ``token`` under a YAML node: a mapping's key, at the
-    key's line, or a sequence's item, at the item's line; ``None`` if absent."""
+def _node_child(node: Any, token: Union[str, int]) -> Optional[Tuple[int, int, Any]]:
+    """``(line, column, child)`` for ``token`` under a YAML node: a mapping's key, where
+    the key starts, or a sequence's item, where the item starts; ``None`` if absent."""
     import yaml
 
     if isinstance(node, yaml.MappingNode):
         for key, value in node.value:
             if isinstance(key, yaml.ScalarNode) and key.value == str(token):
-                return key.start_mark.line + 1, value
+                return key.start_mark.line + 1, key.start_mark.column + 1, value
         return None
     if isinstance(node, yaml.SequenceNode) and str(token).isdigit():
         if int(token) < len(node.value):
             item = node.value[int(token)]
-            return item.start_mark.line + 1, item
+            return item.start_mark.line + 1, item.start_mark.column + 1, item
     return None
 
 
