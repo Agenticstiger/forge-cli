@@ -95,8 +95,9 @@ class FakeHttpServer:
     :meth:`add_route` route whose method and whole path match, then a 404. Handlers
     run one at a time, under :attr:`lock`, so they may change shared state freely; take
     the lock yourself when a test changes state a handler reads. It answers DELETE, GET,
-    HEAD (the headers of the GET answer, no body), OPTIONS, PATCH, POST and PUT, and reads
-    a request body by its Content-Length or as chunked.
+    HEAD, OPTIONS, PATCH, POST and PUT, each to the routes of that method (a HEAD answer
+    has its headers and no body), and reads a request body by its Content-Length or as
+    chunked.
 
     Attributes (all public, all safe to read after the client call returned):
 
@@ -114,10 +115,12 @@ class FakeHttpServer:
     """
 
     def __init__(self, *, ssl_context: Optional[ssl.SSLContext] = None) -> None:
-        if ssl_context is not None and ssl_context.check_hostname:
+        if ssl_context is not None and (
+            ssl_context.check_hostname or ssl_context.protocol == ssl.PROTOCOL_TLS_CLIENT
+        ):
             raise ValueError(
                 "ssl_context must be a server-side context (ssl.PROTOCOL_TLS_SERVER with a "
-                "certificate chain); this one checks host names, as a client context does"
+                "certificate chain), not a client context"
             )
         self.routes: List[Route] = []
         self.failing_routes: List[Failure] = []
@@ -283,7 +286,9 @@ class _Handler(BaseHTTPRequestHandler):
                         pass
                     return bytes(body)
                 body += self.rfile.read(size)
-                self.rfile.readline(65537)  # the line break after the chunk
+                # each chunk ends at a line break
+                if self.rfile.readline(65537) not in (b"\r\n", b"\n"):
+                    raise ValueError("a chunk is longer or shorter than its size")
         length = max(0, int(self.headers.get("Content-Length") or 0))
         return self.rfile.read(length) if length else b""
 
@@ -292,7 +297,8 @@ class _Handler(BaseHTTPRequestHandler):
         parts = urlsplit(self.path)
         try:
             body = self._read_body()
-        except ValueError:  # a Content-Length that is not a number, or a broken chunk
+        except (ValueError, OverflowError):
+            # a length that is not a number or too big to read, or a broken chunk
             self.close_connection = True
             self.send_error(400, "Malformed request body")
             return

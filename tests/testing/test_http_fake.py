@@ -302,6 +302,9 @@ def test_chunk_extensions_and_trailers_are_skipped():
         b"Transfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n0\r\n\r\n",  # not a hex size
         b"Transfer-Encoding: chunked\r\n\r\n",  # the client hung up before a size
         b"Content-Length: many\r\n\r\n",  # not a number
+        b"Content-Length: 99999999999999999999999\r\n\r\n",  # too big to read
+        b"Transfer-Encoding: chunked\r\n\r\nffffffffffffffffffff\r\n",  # too big to read
+        b"Transfer-Encoding: chunked\r\n\r\n5\r\nHELLOWORLD\r\n0\r\n\r\n",  # longer than its size
     ],
 )
 def test_a_body_that_cannot_be_read_is_a_400_and_is_not_logged_as_a_request(head):
@@ -514,8 +517,12 @@ def _client_context(certificate: Tuple[Path, Path]) -> ssl.SSLContext:
 
 
 def test_a_client_side_context_is_refused_when_the_server_is_built():
-    with pytest.raises(ValueError, match="server-side"):
-        FakeHttpServer(ssl_context=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
+    unverified = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    unverified.check_hostname = False  # still a client context
+    unverified.verify_mode = ssl.CERT_NONE
+    for context in (ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT), unverified):
+        with pytest.raises(ValueError, match="server-side"):
+            FakeHttpServer(ssl_context=context)
 
 
 def test_a_caller_supplied_context_serves_https(certificate):

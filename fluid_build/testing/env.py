@@ -105,9 +105,8 @@ def isolated_env(
     finally:
         try:
             if saved_cwd is not None:
-                with suppress(
-                    OSError
-                ):  # the directory may be gone; the body's error must still show
+                # The directory may be gone; then the body's own error must still show.
+                with suppress(FileNotFoundError):
                     os.chdir(saved_cwd)
         finally:
             os.environ.clear()
