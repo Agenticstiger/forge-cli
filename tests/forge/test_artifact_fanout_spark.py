@@ -258,6 +258,54 @@ class TestTheBytesAreTheUploadedObject:
         assert text.replace(MSK_BROKERS_PLACEHOLDER, brokers) == _uploads(contract)["stream-raw"]
 
 
+def _uploads_as_generate_iac_reads(path: Path) -> Dict[str, str]:
+    """The uploads of the contract at ``path`` loaded as ``fluid generate iac`` loads it."""
+    from fluid_build.cli._common import (
+        load_contract_with_overlay,
+        resolve_env_templates_in_contract,
+    )
+
+    return _uploads(
+        resolve_env_templates_in_contract(load_contract_with_overlay(str(path), None, LOG))
+    )
+
+
+class TestTheContractIsReadAsApplyReadsIt:
+    def _same(self, tmp_path: Path, contract: Dict[str, Any]) -> None:
+        source = _write(tmp_path, contract)
+        out = tmp_path / "artifacts"
+        _fan_out(source, out)
+        uploads = _uploads_as_generate_iac_reads(source)
+        assert uploads
+        for build_id, content in uploads.items():
+            assert (out / "spark" / build_id / "job.json").read_text(encoding="utf-8") == content
+
+    def test_an_aliased_binding_format(self, tmp_path: Path, contract: Dict[str, Any]) -> None:
+        for expose in contract["exposes"]:
+            expose["binding"]["format"] = "iceberg_table"
+        self._same(tmp_path, contract)
+
+    def test_env_templates_are_resolved(
+        self, tmp_path: Path, contract: Dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("EVENTS_TOPIC", "source.events")
+        monkeypatch.setenv("RAW_SCHEMA", "raw")
+        contract["builds"][0]["properties"]["stream"]["topic"] = "{{ env.EVENTS_TOPIC }}"
+        sql = contract["builds"][1]["properties"]["sql"]
+        contract["builds"][1]["properties"]["sql"] = sql.replace(
+            "raw.events", "{{ env.RAW_SCHEMA }}.events"
+        )
+        self._same(tmp_path, contract)
+        text = (tmp_path / "artifacts" / "spark" / "daily-curated" / "job.json").read_text(
+            encoding="utf-8"
+        )
+        assert "{{" not in text
+
+    def test_a_singular_build_key(self, tmp_path: Path, contract: Dict[str, Any]) -> None:
+        contract["build"] = contract.pop("builds")[1]
+        self._same(tmp_path, contract)
+
+
 class TestTheEmitKey:
     def test_spark_is_in_the_default_set(self, tmp_path: Path, contract: Dict[str, Any]) -> None:
         assert "spark" in DEFAULT_EMIT
@@ -295,6 +343,41 @@ class TestTheEmitKey:
             _fan_out(_write(tmp_path, contract), tmp_path / "a")
         assert exc.value.key == "spark"
         assert str(exc.value).startswith("Spark build daily-curated: ")
+
+    def test_a_parameters_block_that_is_not_an_object_is_a_typed_error(
+        self, tmp_path: Path, contract: Dict[str, Any]
+    ) -> None:
+        contract["builds"][1]["properties"]["parameters"]["spark"] = "x"
+        with pytest.raises(FanoutError) as exc:
+            _fan_out(_write(tmp_path, contract), tmp_path / "a")
+        assert exc.value.key == "spark"
+
+    @pytest.mark.parametrize("second", ["stream-raw", "Stream-Raw", "stream_raw"])
+    def test_two_builds_that_would_write_one_file(
+        self, tmp_path: Path, contract: Dict[str, Any], second: str
+    ) -> None:
+        contract["builds"][1]["id"] = second
+        with pytest.raises(FanoutError, match="would write one job.json"):
+            _fan_out(_write(tmp_path, contract), tmp_path / "a")
+
+    def test_a_config_the_runner_refuses_is_not_written(
+        self, tmp_path: Path, contract: Dict[str, Any]
+    ) -> None:
+        props = contract["builds"][1]["properties"]
+        props["sql"] = props["sql"].replace("COUNT(*)", "COUNT('${x}')")
+        out = tmp_path / "a"
+        with pytest.raises(FanoutError, match="holds '\\$\\{'"):
+            _fan_out(_write(tmp_path, contract), out)
+        assert not (out / "spark").exists()
+
+    def test_a_spark_folder_of_the_project_s_own_is_kept(
+        self, tmp_path: Path, contract: Dict[str, Any]
+    ) -> None:
+        out = tmp_path / "project"
+        (out / "spark" / "jobs").mkdir(parents=True)
+        (out / "spark" / "jobs" / "etl.py").write_text("print(1)", encoding="utf-8")
+        _fan_out(_write(tmp_path, contract), out, emit_raw="odcs")
+        assert (out / "spark" / "jobs" / "etl.py").is_file()
 
     def test_a_stale_spark_directory_is_cleared(
         self, tmp_path: Path, contract: Dict[str, Any]

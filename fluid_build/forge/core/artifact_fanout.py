@@ -797,19 +797,28 @@ def _emit_policies(contract_path: Path, out_dir: Path, logger: logging.Logger) -
 SPARK_ACCOUNT_PLACEHOLDER = "<account>"
 
 
-def _emit_spark(contract_path: Path, out_dir: Path, logger: logging.Logger) -> List[Path]:
+def _emit_spark(source: Path, out_dir: Path, logger: logging.Logger) -> List[Path]:
     """Each forge Spark build's ``job.json`` at ``spark/<build id>/job.json``.
 
     The bytes are the compiler's (``spark/compiler.py::compile_job_config``,
-    ``SparkJob.text``): the object OpenTofu uploads to
-    ``_fluid/spark/<product>/<build>/job.json`` (``iac/providers/aws_ingest.py``),
-    so the MANIFEST hash is the hash of the deployed config. Two values only
-    ``tofu apply`` knows stay placeholders: :data:`SPARK_ACCOUNT_PLACEHOLDER`
-    for an account-bucket warehouse and the compiler's MSK broker placeholder
-    for a source named by its cluster ARN; each such build is logged. The
-    operator's policies ``fluid apply`` checks before the upload (contract SQL,
-    hosts) are not applied here: ``fluid validate`` reports them.
+    ``SparkJob.text``) for the contract as ``fluid generate iac`` and ``fluid
+    apply`` read it (aliases normalised, ``{{ env.* }}`` resolved): the object
+    OpenTofu uploads to ``_fluid/spark/<product>/<build>/job.json``
+    (``iac/providers/aws_ingest.py``), so the MANIFEST hash is the hash of the
+    deployed config. Two values only ``tofu apply`` knows stay placeholders:
+    :data:`SPARK_ACCOUNT_PLACEHOLDER` for an account-bucket warehouse and the
+    compiler's MSK broker placeholder for a source named by its cluster ARN; each
+    such build is logged. ``source`` is the fanout's input (a bundle or a
+    contract). What the OpenTofu module refuses to upload is refused here too: two
+    builds writing one file, and a config holding ``${``. The operator's upload
+    policies (contract SQL, hosts) are not applied: ``fluid validate`` reports
+    them and ``fluid apply`` enforces them.
     """
+    # The pair ``fluid generate iac`` loads its contract with, so the bytes are its own.
+    from fluid_build.cli._common import (
+        load_contract_with_overlay,
+        resolve_env_templates_in_contract,
+    )
     from fluid_build.spark.compiler import (
         MSK_BROKERS_PLACEHOLDER,
         compile_job_config,
@@ -818,11 +827,19 @@ def _emit_spark(contract_path: Path, out_dir: Path, logger: logging.Logger) -> L
     from fluid_build.spark.policy import SparkPolicyError
     from fluid_build.streaming.compiler import managed_lane_enabled
 
-    contract = _load_contract(contract_path)
-    if not managed_lane_enabled(contract):
-        return []
-    written: List[Path] = []
-    for build in spark_builds(contract):
+    try:
+        contract = resolve_env_templates_in_contract(
+            load_contract_with_overlay(str(source), None, logger)
+        )
+        if not managed_lane_enabled(contract):
+            return []
+        builds = spark_builds(contract)
+    except Exception as exc:  # noqa: BLE001 - every emitter reports a FanoutError
+        raise FanoutError(f"Spark builds of {source} could not be read: {exc}", key="spark")
+    jobs = []
+    seen: Dict[str, str] = {}
+    for build in builds:
+        bid = str(build.get("id"))
         try:
             job = compile_job_config(
                 contract,
@@ -831,10 +848,32 @@ def _emit_spark(contract_path: Path, out_dir: Path, logger: logging.Logger) -> L
                 contract_sql_gate=False,
                 host_gate=False,
             )
-        except (ValueError, SparkPolicyError) as exc:
-            raise FanoutError(f"Spark build {build.get('id')}: {exc}", key="spark") from exc
+        except (ValueError, KeyError, TypeError, SparkPolicyError) as exc:
+            message = str(exc)
+            if not message.startswith(f"Spark build {bid}"):
+                message = f"Spark build {bid}: {message}"
+            raise FanoutError(message, key="spark") from exc
+        # One file per build on any file system, as the module keys one object per build.
+        key = bid.casefold().replace("-", "_")
+        if key in seen:
+            raise FanoutError(
+                f"Spark builds {seen[key]!r} and {bid!r} would write one job.json (ids that "
+                "differ only in case or in '-' and '_' name one file); give each its own id",
+                key="spark",
+            )
+        seen[key] = bid
+        if "${" in job.text.replace(MSK_BROKERS_PLACEHOLDER, ""):
+            raise FanoutError(
+                f"Spark build {bid}: the job config holds '${{' from the contract, which the "
+                "forge Spark runner refuses as an unresolved interpolation, so fluid apply "
+                "uploads no config for it",
+                key="spark",
+            )
+        jobs.append((bid, job))
+    written: List[Path] = []
+    for bid, job in jobs:
         # compile_job_config accepts only an id of letters, digits, _ and -.
-        path = out_dir / str(build["id"]) / "job.json"
+        path = out_dir / bid / "job.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(job.text.encode("utf-8"))
         written.append(path)
@@ -849,9 +888,27 @@ def _emit_spark(contract_path: Path, out_dir: Path, logger: logging.Logger) -> L
         if deferred:
             logger.info(
                 "generate_artifacts_spark_apply_time_values",
-                extra={"build": build["id"], "values": deferred, "digest": job.digest},
+                extra={"build": bid, "values": deferred, "digest": job.digest},
             )
     return written
+
+
+def _clear_spark(directory: Path) -> None:
+    """Remove the ``<build id>/job.json`` files an earlier fanout wrote, and nothing else.
+
+    ``--out`` may name a directory that holds a ``spark/`` folder of its own (a
+    project's Spark sources): only files of the shape this key writes are removed,
+    then the directories left empty.
+    """
+    if not directory.is_dir() or directory.is_symlink():
+        return
+    for job in sorted(directory.glob("*/job.json")):
+        if job.is_file() and not job.is_symlink() and not job.parent.is_symlink():
+            job.unlink()
+            if not any(job.parent.iterdir()):
+                job.parent.rmdir()
+    if not any(directory.iterdir()):
+        directory.rmdir()
 
 
 _DISPATCH = {
@@ -944,10 +1001,11 @@ def run_fanout(
     # Clean slate — blow away pre-existing outputs so stale files don't
     # survive into the MANIFEST. The caller owns out_dir; we only remove
     # subdirs we generate into.
-    for sub in ("odps", "odps-bitol", "odcs", "opds", "schedule", "policy", "spark"):
+    for sub in ("odps", "odps-bitol", "odcs", "opds", "schedule", "policy"):
         target = out_dir / sub
         if target.exists():
             shutil.rmtree(target)
+    _clear_spark(out_dir / "spark")
 
     dag_contract_path = contract_path
     if dag_contract_path is None:
@@ -1003,6 +1061,9 @@ def run_fanout(
                     warn_no_env=_is_tgz_input(bundle_or_contract)
                     or _declares_overlays(bundle_or_contract),
                 )
+            elif key == "spark":
+                # The original input: the contract as generate iac and apply load it.
+                files = _emit_spark(bundle_or_contract, subdir, logger)
             else:
                 files = fn(resolved_contract, subdir, logger)
             written.extend(files)

@@ -40,16 +40,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   apply run in the same checkout path (the plan records it). The Databricks job emitter now
   uploads the same file selection.
 - **`fluid generate artifacts` writes each forge Spark build's `job.json`.** A new `spark` emit
-  key, on by default, writes `spark/<build id>/job.json` for every Spark build (`engine: spark`
-  with `parameters.spark`, schema 0.7.7): the runner config the compiler produces, the same bytes
-  `fluid apply` uploads to `_fluid/spark/<product>/<build>/job.json`, so the artifacts MANIFEST
-  carries the hash of the deployed config. Two values only `tofu apply` knows stay placeholders:
-  `<account>` in the warehouse of an output that names no bucket, and the compiler's MSK broker
-  placeholder for a source named by its cluster ARN; each such build is logged. The operator's
-  upload policies (contract SQL, hosts) are checked by `fluid apply`, as before; `fluid validate`
-  reports them. A contract without a Spark build writes nothing. `fluid validate-artifacts`
-  checks each `job.json` (JSON object, integer `configVersion`, `build` naming its directory,
-  `product`, `mode` and `sink` present).
+  key, on by default (the generated Jenkinsfile's `GENERATE_EMIT` default lists it), writes
+  `spark/<build id>/job.json` for every Spark build (`engine: spark` with `parameters.spark`,
+  schema 0.7.7): the runner config the compiler produces for the contract as `fluid generate
+  iac` reads it, the same bytes `fluid apply` uploads to `_fluid/spark/<product>/<build>/job.json`,
+  so the artifacts MANIFEST carries the hash of the deployed config. Two values only `tofu apply`
+  knows stay placeholders: `<account>` in the warehouse of an output that names no bucket, and the
+  compiler's MSK broker placeholder for a source named by its cluster ARN; each such build is
+  logged. What the upload refuses is refused here too: two builds whose ids name one file (equal
+  but for case or `-` and `_`), and a config holding `${`. The operator's upload policies
+  (contract SQL, hosts) stay with `fluid apply`; `fluid validate` reports them. A contract
+  without a Spark build writes nothing, and only files of this shape are cleared from
+  `<out>/spark/`. `fluid validate-artifacts` checks each `job.json` (JSON object, integer
+  `configVersion`, `build` naming its directory, `product`, `mode` and `sink` present).
 
 ### Fixed
 
