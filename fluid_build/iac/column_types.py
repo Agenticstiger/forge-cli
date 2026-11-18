@@ -20,9 +20,11 @@ Each emitter now classifies a type as one of:
   ``column-type``.
 
 The classification lives with each emitter's type table (``_hive_outcome`` in
-``providers/aws.py``, ``_bq_outcome`` in ``providers/gcp.py``). This module holds
-what both share, and :func:`column_type_findings` is the one function the emitter
-and the validate-time gate both call, so they cannot disagree.
+``providers/aws.py``, ``_bq_outcome`` in ``providers/gcp.py``), and a column that
+declares its nested types is judged whole (``_hive_column_outcome``,
+``_bq_column_outcome``). This module holds what both share, and
+:func:`column_type_findings` is the one function the emitter and the validate-time
+gate both call, so they cannot disagree.
 """
 
 from __future__ import annotations
@@ -51,11 +53,10 @@ class TypeOutcome(NamedTuple):
 #: only a type pattern).
 STRUCTURED = frozenset({"array", "struct", "map", "object", "record", "row"})
 
-#: The fix for a refused structured column: BigQuery for every one, and Glue for a
-#: declared one it cannot hold.
+#: The fix for a declared structured column a cloud cannot hold.
 NESTED_FIX = "Declare json or string instead."
 
-#: The fix for a bare structured column on Glue, which holds it once it is declared.
+#: The fix for a bare structured column, which Glue and BigQuery hold once it is declared.
 NESTED_FIX_DECLARE = (
     "Declare the type's fields, element, or key and value (contract 0.7.7 or later), "
     "or declare json or string."

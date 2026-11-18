@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **BigQuery holds the nested columns a contract declares.** A 0.7.7 column that declares its
+  `element`, `fields`, or `key` and `value` was refused on BigQuery. It is now written as
+  BigQuery holds it: an array as a REPEATED field of its element's type, a struct as a RECORD
+  with its fields (up to the 15 levels BigQuery nests), an array of structs as a REPEATED
+  RECORD, and a map as a REPEATED RECORD of a `key` and a `value`, which is how BigQuery's own
+  Avro load holds a map. The shape is read by the parser the Glue emitter uses, so a
+  declaration is accepted or refused alike on both clouds, and the Glue output is unchanged.
+  What BigQuery holds differently makes `fluid validate` warn and `--strict` fail: a nullable
+  array (BigQuery stores a NULL array as an empty one), a nullable element (an array holds no
+  NULL) and a map (its keys are not kept unique). `required: true` on the array and on its
+  `element`, or an array of key/value structs, holds them exactly. An array of arrays, a leaf
+  BigQuery cannot hold and a column restriction on a RECORD column (BigQuery puts policy tags
+  on leaf fields only) are refused, naming the field. A bare `array`, `struct` or `map` is still
+  refused, and its fix now says to declare the shape. `fluid verify` compares a nested column
+  with the type and mode apply wrote, and `fluid diff` reads a map as it reads an array and
+  every spelling of a struct (`struct`, `record`, `row`) as the RECORD BigQuery reports.
+
 - **`fluid generate schedule` renders the build graph: `builds[].dependencies` and dataset
   triggers.** Builds that `builds[].dependencies` link now run in one Airflow DAG, one
   `fluid apply --build-id` task per build, each after the builds it names. A dependency's
