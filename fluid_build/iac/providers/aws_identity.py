@@ -279,7 +279,8 @@ def identity_findings(
                 f"in {TARGET_ALLOWLIST_ENV} (as msk:{cluster})"
             )
     arn = cfg.get("executionRoleArn")
-    if arn is not None:
+    # A local run (runtime local) ignores the AWS role: it runs as its machine's user.
+    if arn is not None and cfg.get("runtime") != "local":
         if not (isinstance(arn, str) and _ROLE_ARN.fullmatch(arn)):
             errors.append(f"Spark build {bid}: parameters.spark.executionRoleArn: a role ARN")
         elif not role_listed(arn, environ):
@@ -338,8 +339,9 @@ def runtime_errors(build: Mapping[str, Any]) -> List[str]:
     props = build.get("properties")
     stream = props.get("stream") if isinstance(props, Mapping) else None
     batch = cfg.get("mode") == "batch" or (cfg.get("mode") is None and stream is None)
-    # On emr-ec2 a step runs as the cluster's own role, so there is no role to require.
-    if batch and not cfg.get("executionRoleArn") and cfg.get("runtime") != "emr-ec2":
+    # On emr-ec2 a step runs as the cluster's own role, and a local run as its machine's
+    # user, so there is no role to require.
+    if batch and not cfg.get("executionRoleArn") and cfg.get("runtime") not in ("emr-ec2", "local"):
         errors.append(
             f"Spark build {bid}: a batch job reads tables its SQL names, which forge cannot "
             "grant a role it derives; set parameters.spark.executionRoleArn to a role the "

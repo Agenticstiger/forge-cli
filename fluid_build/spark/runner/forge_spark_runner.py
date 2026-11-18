@@ -5,8 +5,8 @@
 
     spark-submit forge_spark_runner.py --config s3://bucket/path/job.json
 
-The same file runs on EMR Serverless, EMR on EC2, EMR on EKS and AWS Glue 5 (Spark
-3.5). It holds no contract logic: the config (``fluid_build.spark.compiler``) carries
+The same file runs on EMR Serverless, EMR on EC2, EMR on EKS, AWS Glue 5 and a local
+spark-submit (Spark 3.5). It holds no contract logic: the config (``fluid_build.spark.compiler``) carries
 the queries, already checked against the contract. forge-cli never imports this file,
 so forge has no pyspark dependency; it depends on pyspark and the standard library
 only (plus boto3, which every AWS Spark runtime has, for an ``aws-sm://`` registry
@@ -25,7 +25,9 @@ its AWS bundle (EMR: the release's Iceberg; Glue: ``--datalake-formats iceberg``
 with ``za.co.absa:abris_2.12:6.4.0`` (Confluent's Maven repository). A catalog the
 submitter declares (``spark.sql.catalog.<catalog>``) is used as declared; otherwise the
 runner derives the Glue catalog from the config, and any single setting the submitter
-passes (``spark.sql.catalog.<catalog>.glue.endpoint``, say) wins.
+passes (``spark.sql.catalog.<catalog>.glue.endpoint``, say) wins. A REST-catalog sink (a
+local run) is never derived: the submitter declares that catalog, credential included, and
+the job creates its table with the config's statements when nothing has.
 """
 
 from __future__ import annotations
@@ -62,6 +64,8 @@ _MSK_IAM = {
     ),
 }
 _REGISTRY_TIMEOUT_S = 30
+#: What a sink's own statements may do: create its namespace and table if missing.
+_CREATE_PREFIXES = ("CREATE NAMESPACE IF NOT EXISTS ", "CREATE TABLE IF NOT EXISTS ")
 
 
 class JobConfigError(ValueError):
@@ -92,6 +96,14 @@ def parse_config(text: str) -> dict:
         raise JobConfigError("a streaming job reads a source and keeps a checkpoint")
     if config["mode"] == "batch" and config.get("source"):
         raise JobConfigError("a batch job runs SQL over catalog tables and reads no topic")
+    sink = config["sink"]
+    if not isinstance(sink, dict) or sink.get("type") not in ("glue", "rest"):
+        raise JobConfigError("the sink must be a glue or rest catalog table")
+    create = sink.get("create") or []
+    if not isinstance(create, list) or not all(
+        isinstance(s, str) and s.startswith(_CREATE_PREFIXES) for s in create
+    ):
+        raise JobConfigError("sink.create holds CREATE ... IF NOT EXISTS statements only")
     return config
 
 
@@ -212,6 +224,40 @@ def configure_session(spark, config: dict) -> None:
         spark.conf.set(name, value)
     sink = config["sink"]
     prefix = f"spark.sql.catalog.{sink['catalog']}"
+    if sink["type"] == "rest":
+        _check_declared_catalog(spark, sink, prefix)
+    else:
+        _derive_glue_catalog(spark, sink, prefix)
+    spark.conf.set("spark.sql.defaultCatalog", sink["catalog"])
+    # forge checks nullability against the contract statically, and the source query
+    # fails on a required field that arrives null; Spark's own check would refuse every
+    # CASE expression as nullable.
+    spark.conf.set("spark.sql.iceberg.check-nullability", "false")
+
+
+def _check_declared_catalog(spark, sink: dict, prefix: str) -> None:
+    """A REST-catalog sink's catalog is the submitter's, whole: its URI, warehouse and
+    credential come from the Spark configuration the job is submitted with, never from the
+    config, so no contract can send the operator's catalog credential elsewhere. A URI or
+    warehouse the contract names must be the declared catalog's."""
+    if spark.conf.get(prefix, None) is None:
+        raise JobConfigError(
+            f"the output's {sink.get('kind') or 'REST'} catalog is declared by the "
+            f"submitter: set {prefix} (and its uri and warehouse) in the Spark configuration "
+            "the job is submitted with"
+        )
+    for key in ("uri", "warehouse"):
+        wanted = sink.get(key)
+        declared = spark.conf.get(f"{prefix}.{key}", None)
+        if wanted and declared and str(declared).rstrip("/") != str(wanted).rstrip("/"):
+            # The submitter's value is not shown: a URI there may carry a user and password.
+            raise JobConfigError(
+                f"the contract's output is in the catalog whose {key} is {wanted}, and the "
+                f"submitter's {prefix}.{key} names another; refused before writing"
+            )
+
+
+def _derive_glue_catalog(spark, sink: dict, prefix: str) -> None:
     derived = {
         prefix: "org.apache.iceberg.spark.SparkCatalog",
         f"{prefix}.catalog-impl": GLUE_CATALOG_IMPL,
@@ -226,11 +272,13 @@ def configure_session(spark, config: dict) -> None:
         for name, value in derived.items():
             if spark.conf.get(name, None) is None:
                 spark.conf.set(name, value)
-    spark.conf.set("spark.sql.defaultCatalog", sink["catalog"])
-    # forge checks nullability against the contract statically, and the source query
-    # fails on a required field that arrives null; Spark's own check would refuse every
-    # CASE expression as nullable.
-    spark.conf.set("spark.sql.iceberg.check-nullability", "false")
+
+
+def create_sink_table(spark, config: dict) -> None:
+    """Run the sink's own statements (``CREATE ... IF NOT EXISTS``, compiled by forge-cli)
+    before the job writes: on a local run nothing else creates the table."""
+    for statement in config["sink"].get("create") or []:
+        spark.sql(statement)
 
 
 def _same_type(decoded, declared) -> bool:
@@ -357,6 +405,7 @@ def run(spark, config: dict) -> None:
         if not mask.get("secretArn"):
             raise JobConfigError("maskAtIngest columns need maskKey.secretArn")
         register_mask(spark, load_mask_key(mask["secretArn"]))
+    create_sink_table(spark, config)
     output = build_output(spark, config)
     if config["mode"] == "batch":
         # A batch run replaces the partitions it computes; a stream appends what it reads.

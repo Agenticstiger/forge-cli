@@ -27,12 +27,13 @@ from fluid_build._console import cprint, success
 from fluid_build._console import error as console_error
 from fluid_build._contract_loader import CLIError, load_contract_with_overlay
 from fluid_build.util.binding_paths import ENV_PLACEHOLDER_RE
-from fluid_build.util.contract import (
+from fluid_build.util.contract import (  # noqa: F401 - is_spark_job_build is re-exported
     describe_externally_run_build,
     is_continuous_build,
     is_databricks_job_build,
     is_externally_run_build,
     is_lakeflow_build,
+    is_spark_job_build,
 )
 
 LOG = logging.getLogger("fluid.build_runners")
@@ -376,17 +377,6 @@ STREAMING_ACQUISITION_ENGINES = frozenset({"kafka-connect", "debezium"})
 PLATFORM_RUN_ENGINES = frozenset({"spark", "glue", "custom"})
 
 
-def is_spark_job_build(build: Dict[str, Any]) -> bool:
-    """True for a build forge's Spark runner runs (``build_runners/spark``): ``engine:
-    spark`` with ``properties.parameters.spark``, whatever else it declares (a batch job's
-    ``properties.sql`` is Spark SQL for its runtime, not inline SQL for DuckDB)."""
-    if build.get("engine") != "spark":  # the compiler's and the renderer's spelling
-        return False
-    props = build.get("properties")
-    parameters = props.get("parameters") if isinstance(props, dict) else None
-    return isinstance(parameters, dict) and "spark" in parameters
-
-
 def _spark_job_runner(build: Dict[str, Any]) -> Optional[Tuple[str, Optional[str]]]:
     """:func:`_batch_runner_for` of a Spark job: forge's Spark runner starts a run that ends
     (batch, availableNow) and waits for it; any other stream is kept running by fluid
@@ -580,20 +570,30 @@ def _report_continuous_outside_forge(build: Dict[str, Any], build_id: str, repor
 
 
 def _execute_spark_build(
-    contract: Dict[str, Any], build: Dict[str, Any], *, dry_run: bool
+    contract: Dict[str, Any],
+    build: Dict[str, Any],
+    *,
+    dry_run: bool,
+    workspace: Optional[Path] = None,
 ) -> Optional[int]:
     """Run a Spark job build on its runtime (``build_runners/spark``): 0 when its run
     succeeded, 1 when it failed or was refused, None for a stream ``fluid apply`` keeps
-    running."""
+    running. A local run (``runtime: local``) keeps its state in ``workspace``, the
+    source contract's directory."""
     from fluid_build._errors import FluidUserError
 
+    from .spark._local import LocalHost
     from .spark._reconcile import run_build
 
     build_id = build.get("id", "unknown")
     cprint(f"\n🚀 Build '{build_id}' - forge's Spark runner", markup=False)
     try:
         return run_build(
-            contract, build, dry_run=dry_run, say=lambda text: cprint(f"   {text}", markup=False)
+            contract,
+            build,
+            dry_run=dry_run,
+            say=lambda text: cprint(f"   {text}", markup=False),
+            local_host=LocalHost(Path(workspace)) if workspace is not None else None,
         )
     except FluidUserError as exc:
         _print_typed_error(exc)
@@ -619,8 +619,9 @@ def _refuse_spark_without_runner(build_id: str) -> int:
     cprint(
         f"\n❌ Build '{build_id}' - engine 'spark' with no runtime platform: forge-cli runs a "
         "Spark build only on forge's Spark runner, which needs properties.parameters.spark "
-        "(its runtime: emr-serverless, emr-ec2, emr-eks or glue). Declare it, or name the "
-        "platform that runs the job in execution.runtime.platform.",
+        "(its runtime: emr-serverless, emr-ec2, emr-eks, glue, or local for a spark-submit "
+        "on this machine). Declare it, or name the platform that runs the job in "
+        "execution.runtime.platform.",
         markup=False,
     )
     return 1
@@ -1693,7 +1694,9 @@ def run_builds_from_args(
             # forge's Spark runner, ahead of inline SQL (a Spark job's SQL is Spark's): one
             # run of a scheduled build, waited for. A stream is kept running by this apply's
             # spark.reconcile action, not run here.
-            spark_result = _execute_spark_build(contract, build, dry_run=args.dry_run)
+            spark_result = _execute_spark_build(
+                contract, build, dry_run=args.dry_run, workspace=contract_path.resolve().parent
+            )
             if spark_result is None:
                 _report_spark_stream(build_id, report)
                 total_external += 1

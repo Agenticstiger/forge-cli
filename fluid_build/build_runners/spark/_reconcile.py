@@ -24,6 +24,10 @@ its scheduler starts it through ``fluid apply --mode amend-and-build --build-id 
 build phase calls :func:`run_build` and so :func:`run_once`, which waits for the run to end
 and cancels it on Ctrl-C, SIGTERM or SIGHUP, as ``_databricks_job_run`` does.
 
+A local run (``runtime: local``, :mod:`._local`) follows the same rules on this machine,
+and a reconcile of the whole contract also stops the local runs of a build the contract no
+longer runs locally (:func:`stop_removed`).
+
 Polling follows the databricks-sdk run waiter already adapted in ``_databricks_job_run``: a
 poll a second longer each time, at most :data:`MAX_POLL_S`.
 """
@@ -34,9 +38,10 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build.build_runners.spark._adapters import (
+    CANCELLED,
     CANCELLING,
     FAILED,
     PENDING,
@@ -207,6 +212,9 @@ def _reconcile_one(
             "would fail the same way: fix the cause and change the build, and fluid apply "
             "starts the new config"
         )
+        hint = getattr(adapter, "retry_hint", None)
+        if callable(hint):
+            out.message += hint(last.run_id)
         return out
     if dry_run:
         out.action = "planned"
@@ -251,8 +259,10 @@ def reconcile(
     runs: Sequence[DesiredRun],
     *,
     clients: Optional[ClientFactory] = None,
+    local_host: Any = None,
     dry_run: bool = False,
     restart_failed: bool = False,
+    stop_removed_of: Optional[Tuple[str, Collection[str]]] = None,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
     env: Optional[Mapping[str, str]] = None,
@@ -260,6 +270,8 @@ def reconcile(
     """Reconcile every long-running build in ``runs``; scheduled builds are reported only.
 
     An AWS error on one build is that build's error outcome; the others still reconcile.
+    ``stop_removed_of`` (product id, the builds it runs locally) also stops this machine's
+    runs of any other build of that product (:func:`stop_removed`).
     """
     clock, budget = _Clock(sleep, now), wait_budget(env)
     outcomes = []
@@ -269,11 +281,10 @@ def reconcile(
             continue
         try:
             if run.scheduled:  # an availableNow stream: stop a job left from a continuous one
-                outcomes.append(
-                    _stop_continuous(run, adapter_for(run, clients), clock, budget, dry_run)
-                )
+                adapter = adapter_for(run, clients, local_host)
+                outcomes.append(_stop_continuous(run, adapter, clock, budget, dry_run))
                 continue
-            adapter = adapter_for(run, clients)
+            adapter = adapter_for(run, clients, local_host)
             outcomes.append(
                 _reconcile_one(
                     run,
@@ -286,6 +297,72 @@ def reconcile(
             )
         except Exception as exc:  # noqa: BLE001 - one build's AWS error is its outcome
             outcomes.append(_error_outcome(run, exc))
+    if stop_removed_of is not None:
+        product, kept = stop_removed_of
+        outcomes.extend(
+            stop_removed(product, kept, local_host, clock=clock, budget=budget, dry_run=dry_run)
+        )
+    return outcomes
+
+
+def stop_removed(
+    product: str,
+    kept: Collection[str],
+    local_host: Any,
+    *,
+    clock: Optional[_Clock] = None,
+    budget: Optional[float] = None,
+    dry_run: bool = False,
+) -> List[Outcome]:
+    """Stop this machine's runs of ``product``'s builds other than ``kept``: a build the
+    contract no longer declares, or no longer runs locally, must not keep writing.
+
+    Reads the run directories only (``.fluid/<product>/runtime/spark/``), so it runs on a
+    machine with no local run at all, and a dry run changes nothing."""
+    from fluid_build.build_runners.spark._local import (
+        LocalRuns,
+        builds_with_runs,
+        default_host,
+    )
+
+    host = local_host if local_host is not None else default_host()
+    clock = clock or _Clock(time.sleep, time.monotonic)
+    budget = wait_budget() if budget is None else budget
+    outcomes = []
+    for build in builds_with_runs(host, product):
+        if build in kept:
+            continue
+        local = LocalRuns(host, product, build)
+        out = Outcome(build, "local", "stopped", where=local.where())
+        try:
+            active = [h for h in local.runs() if h.active]
+            if not active:
+                continue
+            if dry_run:
+                out.action = "planned"
+                out.message = (
+                    f"would stop {', '.join(h.run_id for h in active)}: the contract no longer "
+                    "runs this build here"
+                )
+                outcomes.append(out)
+                continue
+            for h in active:
+                if h.state != CANCELLING:
+                    local.cancel(h.run_id)
+                out.cancelled.append(h.run_id)
+                ended = clock.until(
+                    lambda i=h.run_id: local.get(i), lambda i: i.state in TERMINAL, budget
+                )
+                if ended.state not in TERMINAL:
+                    out.action, out.error, out.run_id = "failed", True, h.run_id
+                    out.message = f"run {h.run_id} was cancelled but is still {ended.raw_state}"
+                    break
+            else:
+                out.run_id, out.state = out.cancelled[0], CANCELLED
+                out.message = "the contract no longer runs this build here"
+        except Exception as exc:  # noqa: BLE001 - one build's error is its outcome
+            out.action, out.error, out.message = "failed", True, _clean(exc)
+        outcomes.append(out)
     return outcomes
 
 
@@ -349,6 +426,7 @@ def run_once(
     run: DesiredRun,
     *,
     clients: Optional[ClientFactory] = None,
+    local_host: Any = None,
     timeout: float = DEFAULT_RUN_WAIT_S,
     say: Callable[[str], None] = print,
     sleep: Callable[[float], None] = time.sleep,
@@ -370,7 +448,7 @@ def run_once(
         )
     started: List[str] = []
     try:
-        adapter = adapter_for(run, clients)
+        adapter = adapter_for(run, clients, local_host)
         out = Outcome(run.build, run.runtime, "started", where=adapter.where())
 
         def cancel() -> None:
@@ -447,9 +525,10 @@ def run_build(
     dry_run: bool,
     say: Callable[[str], None] = print,
     clients: Optional[ClientFactory] = None,
+    local_host: Any = None,
 ) -> Optional[int]:
     """The build phase of ``fluid apply --mode amend-and-build`` for one Spark build: how its
-    scheduler runs it.
+    scheduler runs it. A local run lives in ``local_host`` (the contract's directory).
 
     A scheduled build (batch, or a stream triggered ``availableNow``) gets one run, waited for
     until it ends or ``execution.runtime.timeout`` (:data:`DEFAULT_RUN_WAIT_S` when unset)
@@ -492,7 +571,7 @@ def run_build(
             f"{int(timeout)} s for it to end"
         )
         return 0
-    outcome = run_once(run, clients=clients, timeout=timeout, say=say)
+    outcome = run_once(run, clients=clients, local_host=local_host, timeout=timeout, say=say)
     say(outcome.line())
     if outcome.action == "cancelled":
         raise KeyboardInterrupt  # the run was cancelled; stop the apply, as Ctrl-C does

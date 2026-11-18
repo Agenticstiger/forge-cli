@@ -1,0 +1,568 @@
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
+
+"""runtime: local: spark-submit on this machine, driven here by a stub spark-submit.
+
+The stub is a real executable the real supervisor starts in its own process group: it
+checks that the runner and the job config it is handed exist where the layout says, then
+ends at once for a batch job and runs until SIGTERM for a stream. So the run directories,
+the lock, the exit codes and the signals are the ones a real local run goes through.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from fluid_build.build_runners.spark import _local
+from fluid_build.build_runners.spark import _reconcile as rc
+from fluid_build.build_runners.spark._adapters import (
+    CANCELLED,
+    FAILED,
+    RUNNING,
+    SUCCEEDED,
+    SparkRunError,
+    adapter_for,
+)
+from fluid_build.build_runners.spark._desired import LOCAL_ROOT_TOKEN, desired_runs
+from fluid_build.build_runners.spark._local import (
+    LOCAL_ROOT_ENV,
+    PROPERTIES_FILE_ENV,
+    SUBMIT_EXECUTABLE_ENV,
+    LocalHost,
+    LocalRuns,
+    merge_conf,
+    parse_properties,
+    start_run,
+    submit_argv,
+    submitter,
+)
+from fluid_build.spark import runner_source
+from tests.spark.conftest import CONTRACT
+
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="local runs are POSIX only")
+
+STUB = f"""#!{sys.executable}
+import json, os, signal, sys, time
+argv = sys.argv[1:]
+out = os.environ.get("STUB_OUT")
+if out:
+    with open(os.path.join(out, "argv-%d.json" % os.getpid()), "w") as handle:
+        json.dump(argv, handle)
+config = argv[argv.index("--config") + 1]
+runner = argv[argv.index("--config") - 1]
+assert os.path.isfile(config) and os.path.isfile(runner), (config, runner)
+mode = json.load(open(config))["mode"]
+print("stub: started", mode, flush=True)
+if mode == "batch":
+    print("stub: Py4JJavaError: the batch failed" if os.environ.get("STUB_EXIT", "0") != "0"
+          else "stub: done", flush=True)
+    sys.exit(int(os.environ.get("STUB_EXIT", "0")))
+if os.environ.get("STUB_STREAM_EXIT"):
+    print("stub: the stream failed", flush=True)
+    sys.exit(int(os.environ["STUB_STREAM_EXIT"]))
+stop = []
+if os.environ.get("STUB_IGNORE_TERM"):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+else:
+    signal.signal(signal.SIGTERM, lambda *a: stop.append(1))
+while not stop:
+    time.sleep(0.05)
+print("stub: stopped", flush=True)
+sys.exit(143)
+"""
+
+
+def local_contract(**stream):
+    """The compiler tests' stream, on this machine: a Lakekeeper table in bucket ``lake``."""
+    contract = copy.deepcopy(CONTRACT)
+    build = contract["builds"][0]
+    cfg = build["properties"]["parameters"]["spark"]
+    cfg["runtime"] = "local"
+    cfg["source"] = {"bootstrapServers": "localhost:9092"}
+    cfg.pop("maskKeySecretArn")
+    for column in build["properties"]["mapping"]["columns"]:
+        column.pop("maskAtIngest", None)
+    build["properties"]["stream"].update(stream)
+    contract["exposes"][0]["binding"] = {
+        "platform": "local",
+        "format": "iceberg",
+        "location": {
+            "catalog": "lakekeeper",
+            "database": "commerce",
+            "table": "order_lines",
+            "bucket": "lake",
+        },
+    }
+    return contract
+
+
+def batch_contract():
+    contract = local_contract()
+    build = contract["builds"][0]
+    build["properties"] = {
+        "sql": "SELECT order_id, customer_id, email_hash, sku, qty, event_time FROM raw.o",
+        "parameters": {"spark": {"runtime": "local", "mode": "batch"}},
+    }
+    return contract
+
+
+@pytest.fixture
+def stub(tmp_path):
+    path = tmp_path / "bin" / "spark-submit"
+    path.parent.mkdir()
+    path.write_text(STUB, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+@pytest.fixture
+def host(tmp_path, stub, monkeypatch):
+    from fluid_build.spark.compiler import CONTRACT_SQL_ALLOWLIST_ENV
+
+    monkeypatch.setenv(CONTRACT_SQL_ALLOWLIST_ENV, CONTRACT["id"])
+    out = tmp_path / "argv"
+    out.mkdir()
+    env = {**os.environ, SUBMIT_EXECUTABLE_ENV: str(stub), "STUB_OUT": str(out)}
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    return LocalHost(workspace, env)
+
+
+def with_env(host, **env):
+    return LocalHost(host.workspace, {**host.env, **env})
+
+
+def the_run(contract):
+    (run,) = desired_runs(contract)
+    return run
+
+
+def wait_for(read, done, timeout=15.0):
+    deadline = time.monotonic() + timeout
+    info = read()
+    while not done(info) and time.monotonic() < deadline:
+        time.sleep(0.05)
+        info = read()
+    return info
+
+
+@pytest.fixture
+def started():
+    """Run ids to stop at the end, whatever the test did."""
+    runs = []
+    yield runs
+    for runs_of, run_id in runs:
+        try:
+            runs_of.cancel(run_id, grace=2.0)
+        except SparkRunError:
+            pass
+
+
+# --- the run as it is planned ----------------------------------------------------------
+
+
+def test_a_local_run_has_no_role_region_or_account_and_a_root_token():
+    run = the_run(local_contract())
+    assert (run.runtime, run.region, run.role_arn, run.target) == ("local", "", "", {})
+    assert run.local and run.needs_local_root and not run.needs_account
+    assert run.job_uri == (
+        f"{LOCAL_ROOT_TOKEN}/_fluid/spark/commerce.orders-stream/ingest-orders/job.json"
+    )
+    action = run.plan_action(1)
+    assert action["provider"] == "local" and action["payload"]["executionRoleArn"] is None
+
+
+def test_the_root_the_operator_names_never_changes_the_config_hash(tmp_path):
+    run = the_run(local_contract())
+    bound = run.bind(local_root=str(tmp_path))
+    assert bound.config_hash == run.config_hash
+    assert bound.job_uri == f"{tmp_path}/_fluid/spark/commerce.orders-stream/ingest-orders/job.json"
+
+
+def test_a_local_run_ignores_the_aws_runtimes_keys():
+    contract = local_contract()
+    cfg = contract["builds"][0]["properties"]["parameters"]["spark"]
+    plain = the_run(contract)
+    cfg.update(
+        clusterId="j-ABC123",
+        applicationId="00abc",
+        virtualClusterId="vc1",
+        releaseLabel="emr-7.5.0",
+        glueVersion="5.0",
+        executionRoleArn="arn:aws:iam::123456789012:role/r",
+    )
+    assert the_run(contract).config_hash == plain.config_hash
+
+
+def test_adapter_for_a_local_run_is_local_and_needs_no_aws(tmp_path):
+    adapter = adapter_for(the_run(local_contract()), local_host=LocalHost(tmp_path))
+    assert adapter.runtime == "local"
+    assert adapter.runs() == []
+    assert (
+        adapter.where()
+        == "this machine (.fluid/commerce.orders-stream/runtime/spark/ingest-orders)"
+    )
+
+
+# --- the operator's settings ----------------------------------------------------------
+
+
+def test_spark_submit_is_found_on_path_by_default(tmp_path, stub):
+    sub = submitter(LocalHost(tmp_path, {"PATH": str(stub.parent)}))
+    assert sub.executable == str(stub)
+    assert sub.root == str((tmp_path / ".fluid" / "spark-artifacts").resolve())
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        ({"PATH": "/nonexistent"}, "spark-submit is not on PATH"),
+        ({SUBMIT_EXECUTABLE_ENV: "bin/spark-submit"}, "not a relative path"),
+        ({SUBMIT_EXECUTABLE_ENV: "/nonexistent/spark-submit"}, "not an executable file"),
+        ({SUBMIT_EXECUTABLE_ENV: "SUBMIT", PROPERTIES_FILE_ENV: "spark.conf"}, "absolute path"),
+        ({SUBMIT_EXECUTABLE_ENV: "SUBMIT", PROPERTIES_FILE_ENV: "/nonexistent.conf"}, "not a file"),
+        ({SUBMIT_EXECUTABLE_ENV: "SUBMIT", LOCAL_ROOT_ENV: "s3://Lake/x"}, "s3://<bucket>"),
+        ({SUBMIT_EXECUTABLE_ENV: "SUBMIT", LOCAL_ROOT_ENV: "s3://lake/a/../b"}, "s3://<bucket>"),
+        ({SUBMIT_EXECUTABLE_ENV: "SUBMIT", LOCAL_ROOT_ENV: "relative/dir"}, "absolute path"),
+    ],
+)
+def test_an_unusable_operator_setting_is_refused_naming_it(tmp_path, stub, env, message):
+    env = {k: str(stub) if v == "SUBMIT" else v for k, v in env.items()}
+    with pytest.raises(SparkRunError, match=message):
+        submitter(LocalHost(tmp_path, env))
+
+
+def test_a_properties_file_error_names_the_line_never_the_value(tmp_path, stub):
+    conf = tmp_path / "spark.conf"
+    conf.write_text("spark.a 1\nspark.sql.catalog.fluid.credential id:s3cr3t\\uZZZZ\n")
+    env = {SUBMIT_EXECUTABLE_ENV: str(stub), PROPERTIES_FILE_ENV: str(conf)}
+    with pytest.raises(SparkRunError) as caught:
+        submitter(LocalHost(tmp_path, env))
+    assert "line 2" in str(caught.value) and "s3cr3t" not in str(caught.value)
+
+
+def test_properties_are_read_as_java_and_spark_read_them():
+    text = (
+        "# a comment\n"
+        "! another\n"
+        "spark.master local[2]\n"
+        "spark.a=1\n"
+        "spark.b : two words  \n"
+        "spark.c   \\\n"
+        "    continued,\\\n"
+        "    again\n"
+        "spark.d \\u00e9t\\u00e9\n"
+        "spark.e=\\\\path\\:x\n"
+        "spark.f\n"
+        "spark.a=later\n"
+        "   \n"
+    )
+    assert parse_properties(text) == {
+        "spark.master": "local[2]",
+        "spark.a": "later",
+        "spark.b": "two words",
+        "spark.c": "continued,again",
+        "spark.d": "été",
+        "spark.e": "\\path:x",
+        "spark.f": "",
+    }
+
+
+def test_merge_conf_unions_lists_and_lets_the_file_name_the_iceberg_runtime():
+    forge = {
+        "spark.jars": "/usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar",
+        "spark.jars.packages": "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1",
+        "spark.jars.repositories": "https://packages.confluent.io/maven/",
+        "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+        "spark.sql.shuffle.partitions": "8",
+    }
+    operator = {
+        "spark.jars": "",
+        "spark.jars.packages": "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.2,"
+        "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.7",
+        "spark.jars.repositories": "https://mirror.example/maven/",
+        "spark.sql.extensions": "com.example.Ext",
+    }
+    assert merge_conf(forge, operator) == {
+        "spark.jars.packages": "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.2,"
+        "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.7",
+        "spark.sql.extensions": "com.example.Ext,"
+        "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+        "spark.sql.shuffle.partitions": "8",
+    }
+    assert merge_conf(forge, {}) == forge
+
+
+def test_the_argv_is_client_mode_with_the_file_and_never_a_shell(tmp_path, stub):
+    conf = tmp_path / "spark.conf"
+    conf.write_text("spark.sql.catalog.fluid.credential id:secret\n")
+    sub = submitter(
+        LocalHost(tmp_path, {SUBMIT_EXECUTABLE_ENV: str(stub), PROPERTIES_FILE_ENV: str(conf)})
+    )
+    run = the_run(local_contract()).bind(local_root=sub.root)
+    argv = submit_argv(sub, run)
+    assert argv[:7] == [
+        str(stub),
+        "--name",
+        run.run_name,
+        "--deploy-mode",
+        "client",
+        "--properties-file",
+        str(conf),
+    ]
+    tail = [run.runner_uri, *run.entry_args()]
+    assert argv[-len(tail) :] == tail
+    assert not any("secret" in a for a in argv)
+
+
+# --- artifacts -------------------------------------------------------------------------
+
+
+def test_publish_writes_the_aws_layout_under_a_directory_root(tmp_path, stub):
+    sub = submitter(LocalHost(tmp_path, {SUBMIT_EXECUTABLE_ENV: str(stub)}))
+    run = the_run(local_contract()).bind(local_root=sub.root)
+    _local.publish(sub, run, runner_source())
+    base = Path(sub.root) / "_fluid/spark/commerce.orders-stream/ingest-orders"
+    assert (base / "job.json").read_text(encoding="utf-8") == run.job_text
+    runner = base / "runner" / run.runner_sha256[:16] / "forge_spark_runner.py"
+    assert runner.read_text(encoding="utf-8") == runner_source()
+    _local.publish(sub, run, runner_source())  # again: unchanged
+    with pytest.raises(SparkRunError, match="runner changed"):
+        _local.publish(sub, run, runner_source() + "# edited\n")
+
+
+def test_publish_to_s3_uploads_both_objects(tmp_path, stub):
+    import boto3
+    from moto import mock_aws
+
+    env = {SUBMIT_EXECUTABLE_ENV: str(stub), LOCAL_ROOT_ENV: "s3://lake/lab"}
+    with mock_aws():
+        boto3.client("s3", region_name="us-east-1").create_bucket(Bucket="lake")
+        sub = submitter(LocalHost(tmp_path, env))
+        run = the_run(local_contract()).bind(local_root=sub.root)
+        assert (
+            run.job_uri
+            == "s3://lake/lab/_fluid/spark/commerce.orders-stream/ingest-orders/job.json"
+        )
+        _local.publish(sub, run, runner_source())
+        s3 = boto3.client("s3", region_name="us-east-1")
+        key = run.job_uri.removeprefix("s3://lake/")
+        assert s3.get_object(Bucket="lake", Key=key)["Body"].read().decode() == run.job_text
+        runner_key = run.runner_uri.removeprefix("s3://lake/")
+        assert s3.head_object(Bucket="lake", Key=runner_key)["ContentLength"] > 0
+
+
+def test_an_s3_compatible_endpoint_gets_path_style_requests(tmp_path, stub, monkeypatch):
+    import boto3
+
+    seen = {}
+
+    class Client:
+        def put_object(self, **kwargs):
+            seen.setdefault("keys", []).append(kwargs["Key"])
+
+    def client(service, **kwargs):
+        seen.update(kwargs)
+        return Client()
+
+    monkeypatch.setattr(boto3, "client", client)
+    env = {
+        SUBMIT_EXECUTABLE_ENV: str(stub),
+        LOCAL_ROOT_ENV: "s3://lake",
+        "AWS_ENDPOINT_URL_S3": "http://seaweedfs:8333",
+    }
+    sub = submitter(LocalHost(tmp_path, env))
+    _local.publish(sub, the_run(local_contract()).bind(local_root=sub.root), runner_source())
+    assert seen["config"].s3 == {"addressing_style": "path"}
+    assert seen["region_name"] == "us-east-1" and len(seen["keys"]) == 2
+
+
+# --- runs ------------------------------------------------------------------------------
+
+
+def test_a_batch_run_goes_to_succeeded(host):
+    run = the_run(batch_contract())
+    said = []
+    out = rc.run_once(run, local_host=host, timeout=30, say=said.append)
+    assert (out.action, out.state, out.error) == ("succeeded", SUCCEEDED, False), out.message
+    assert said[0].startswith(f"Spark ingest-orders: started run {out.run_id} on this machine")
+
+
+def test_a_failed_batch_run_is_failed_with_its_log(host):
+    run = the_run(batch_contract())
+    out = rc.run_once(run, local_host=with_env(host, STUB_EXIT="3"), timeout=30, say=lambda _: 0)
+    assert (out.action, out.state, out.error) == ("failed", FAILED, True)
+    assert "ended FAILED (exit 3)" in out.message
+    assert "driver.log" in out.message and "the batch failed" in out.message
+
+
+def test_run_build_runs_a_local_batch_build_through_the_build_phase(host):
+    contract = batch_contract()
+    code = rc.run_build(
+        contract, contract["builds"][0], dry_run=False, say=lambda _: 0, local_host=host
+    )
+    assert code == 0
+
+
+def test_a_stream_is_started_left_alone_restarted_and_stopped(host, started):
+    first = the_run(local_contract())
+    (out,) = rc.reconcile([first], local_host=host)
+    assert (out.action, out.state, out.error) == ("started", RUNNING, False), out.message
+    runs = LocalRuns(host, first.product, first.build)
+    started.append((runs, out.run_id))
+
+    (again,) = rc.reconcile([first], local_host=host)
+    assert (again.action, again.run_id, again.cancelled) == ("unchanged", out.run_id, [])
+    log_path = runs.dir / "runs" / out.run_id / "driver.log"
+    wait_for(lambda: log_path.read_text(encoding="utf-8"), lambda t: "stub: started" in t)
+
+    changed = the_run(local_contract(trigger={"processingTime": "PT2M"}))
+    assert changed.config_hash != first.config_hash
+    assert changed.checkpoint == first.checkpoint
+    (restart,) = rc.reconcile([changed], local_host=host)
+    assert (restart.action, restart.cancelled, restart.error) == (
+        "restarted",
+        [out.run_id],
+        False,
+    ), restart.message
+    started.append((runs, restart.run_id))
+    assert runs.get(out.run_id).state == CANCELLED
+    assert runs.get(restart.run_id).state == RUNNING
+    assert "stub: stopped" in log_path.read_text(encoding="utf-8")  # SIGTERM, not SIGKILL
+
+    outcomes = rc.reconcile([], local_host=host, stop_removed_of=(first.product, set()))
+    assert [(o.build, o.action, o.cancelled, o.error) for o in outcomes] == [
+        ("ingest-orders", "stopped", [restart.run_id], False)
+    ]
+    assert f"stopped run {restart.run_id} CANCELLED on this machine" in outcomes[0].line()
+    assert runs.get(restart.run_id).state == CANCELLED
+    assert rc.reconcile([], local_host=host, stop_removed_of=(first.product, set())) == []
+
+
+def test_a_build_kept_locally_is_not_stopped(host, started):
+    run = the_run(local_contract())
+    (out,) = rc.reconcile([run], local_host=host)
+    started.append((LocalRuns(host, run.product, run.build), out.run_id))
+    assert rc.stop_removed(run.product, {run.build}, host) == []
+    (planned,) = rc.stop_removed(run.product, set(), host, dry_run=True)
+    assert planned.action == "planned" and out.run_id in planned.message
+    assert LocalRuns(host, run.product, run.build).get(out.run_id).state == RUNNING
+
+
+def test_a_second_start_of_the_same_config_adopts_the_first(host, started):
+    run = the_run(local_contract())
+    first = start_run(host, run, "a", runner_text=runner_source())
+    started.append((LocalRuns(host, run.product, run.build), first))
+    assert start_run(host, run, "b", runner_text=runner_source()) == first
+
+
+def test_a_run_whose_supervisor_dies_stays_running_until_spark_submit_ends(host, started):
+    run = the_run(local_contract())
+    run_id = start_run(host, run, "t", runner_text=runner_source())
+    runs = LocalRuns(host, run.product, run.build)
+    started.append((runs, run_id))
+    status = json.loads((runs.dir / "runs" / run_id / "status.json").read_text())
+    os.kill(status["supervisorPid"], signal.SIGKILL)
+    time.sleep(0.3)
+    assert runs.get(run_id).state == RUNNING  # spark-submit still holds the lock
+    os.kill(status["pid"], signal.SIGKILL)
+    info = wait_for(lambda: runs.get(run_id), lambda i: i.state == FAILED)
+    assert (info.state, info.raw_state) == (FAILED, "LOST")
+    assert "without recording how they ended" in info.details
+
+
+def test_a_run_that_ignores_sigterm_is_killed_after_the_grace(host, started):
+    run = the_run(local_contract())
+    run_id = start_run(with_env(host, STUB_IGNORE_TERM="1"), run, "t", runner_text=runner_source())
+    runs = LocalRuns(host, run.product, run.build)
+    started.append((runs, run_id))
+    begun = time.monotonic()
+    runs.cancel(run_id, grace=0.5)
+    assert time.monotonic() - begun < 10
+    assert runs.get(run_id).state == CANCELLED
+
+
+def test_a_run_cancelled_before_it_started_starts_nothing(tmp_path):
+    where = tmp_path / "run"
+    where.mkdir()
+    (where / "cancel").write_text("1\n")
+    lock = os.open(where / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                str(_local.SUPERVISOR),
+                "--run-dir",
+                str(where),
+                "--lock-fd",
+                str(lock),
+                "--",
+                "/nonexistent/spark-submit",
+            ],
+            pass_fds=(lock,),
+            check=True,
+            timeout=30,
+        )
+    finally:
+        os.close(lock)
+    status = json.loads((where / "status.json").read_text())
+    assert "ended" in status and status["exitCode"] is None and "pid" not in status
+
+
+def test_a_spark_submit_that_cannot_start_is_a_failed_run(host):
+    run = the_run(batch_contract())
+    broken = Path(host.workspace) / "not-a-program"
+    broken.write_text("not a program\n")
+    broken.chmod(0o755)
+    out = rc.run_once(
+        run,
+        local_host=with_env(host, **{SUBMIT_EXECUTABLE_ENV: str(broken)}),
+        timeout=30,
+        say=lambda _: 0,
+    )
+    assert (out.action, out.error) == ("failed", True)
+    assert "spark-submit did not start" in out.message
+
+
+def test_old_ended_runs_are_pruned(host, monkeypatch):
+    monkeypatch.setattr(_local, "KEEP_ENDED", 2)
+    run = the_run(batch_contract())
+    ids = []
+    for _ in range(4):
+        out = rc.run_once(run, local_host=host, timeout=30, say=lambda _: 0)
+        assert out.state == SUCCEEDED
+        ids.append(out.run_id)
+    left = {p.name for p in (LocalRuns(host, run.product, run.build).dir / "runs").iterdir()}
+    # Each start prunes the ended runs beyond the newest two: the first is gone by the fourth
+    # start, and the second too when the fourth batch had already ended by its own prune.
+    assert set(ids[2:]) <= left <= set(ids[1:])
+
+
+def test_a_run_id_that_is_not_one_is_refused(tmp_path):
+    runs = LocalRuns(LocalHost(tmp_path), "p", "b")
+    with pytest.raises(SparkRunError, match="not a local run id"):
+        runs.get("../../etc")
+
+
+def test_a_failed_stream_is_not_restarted_and_says_how_to_retry_it_here(host):
+    run = the_run(local_contract())
+    failing = with_env(host, STUB_STREAM_EXIT="1")
+    rc.reconcile([run], local_host=failing)
+    runs = LocalRuns(host, run.product, run.build)
+    (first,) = runs.runs()
+    wait_for(lambda: runs.get(first.run_id), lambda i: i.state == FAILED)
+    (again,) = rc.reconcile([run], local_host=host)
+    assert (again.action, again.error, again.run_id) == ("failed", True, first.run_id)
+    assert "the stream failed" in again.message
+    assert f"remove {runs.dir / 'runs' / first.run_id}" in again.message

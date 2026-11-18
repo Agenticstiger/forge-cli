@@ -4030,9 +4030,10 @@
             "emr-serverless",
             "emr-ec2",
             "emr-eks",
-            "glue"
+            "glue",
+            "local"
           ],
-          "description": "The AWS service that runs the job: EMR Serverless, EMR on EC2, EMR on EKS or an AWS Glue Spark job. One runner serves all four."
+          "description": "Where the job runs: EMR Serverless, EMR on EC2, EMR on EKS, an AWS Glue Spark job, or local, a spark-submit on the machine fluid apply runs on (a laptop, or a lab with an EMR 7.x image). One runner and one job config serve all five. A local run writes a table in an Iceberg REST catalog (location.catalog lakekeeper, rest or polaris) on platform local, which the operator's Spark configuration declares. local ignores the AWS runtimes' keys (applicationId, clusterId, virtualClusterId, releaseLabel, glueVersion, executionRoleArn), so a contract written for AWS switches to local with one overlay line."
         },
         "mode": {
           "enum": [
@@ -4044,34 +4045,34 @@
         "applicationId": {
           "type": "string",
           "pattern": "^[0-9a-z]{1,64}(?![\\s\\S])",
-          "description": "emr-serverless only: an existing EMR Serverless application. Absent: the forge-managed application shared by the product's domain."
+          "description": "emr-serverless only (runtime local ignores it): an existing EMR Serverless application. Absent: the forge-managed application shared by the product's domain."
         },
         "clusterId": {
           "type": "string",
           "pattern": "^j-[0-9A-Za-z]{1,254}(?![\\s\\S])",
-          "description": "emr-ec2 only: a running EMR cluster (j-...). Absent: a transient cluster that ends with the job."
+          "description": "emr-ec2 only (runtime local ignores it): a running EMR cluster (j-...). Absent: a transient cluster that ends with the job."
         },
         "virtualClusterId": {
           "type": "string",
           "pattern": "^[0-9a-z]{1,64}(?![\\s\\S])",
-          "description": "emr-eks only, and required there: the EMR on EKS virtual cluster."
+          "description": "emr-eks only, and required there (runtime local ignores it): the EMR on EKS virtual cluster."
         },
         "glueVersion": {
           "type": "string",
           "pattern": "^[0-9]+\\.[0-9]+(?![\\s\\S])",
           "default": "5.0",
-          "description": "glue only: the AWS Glue version of the job."
+          "description": "glue only (runtime local ignores it): the AWS Glue version of the job."
         },
         "releaseLabel": {
           "type": "string",
           "pattern": "^emr-[0-9]+\\.[0-9]+\\.[0-9]+(?![\\s\\S])",
           "default": "emr-7.12.0",
-          "description": "EMR runtimes only (emr-serverless, emr-ec2, emr-eks): the EMR release. 7.12 or later writes Iceberg with Lake Formation credentials."
+          "description": "EMR runtimes only (emr-serverless, emr-ec2, emr-eks; runtime local ignores it): the EMR release. 7.12 or later writes Iceberg with Lake Formation credentials."
         },
         "executionRoleArn": {
           "type": "string",
           "pattern": "^arn:aws[a-zA-Z0-9-]*:iam::[0-9]{12}:role/[A-Za-z0-9_+=,.@/-]{1,512}(?![\\s\\S])",
-          "description": "The IAM role the job runs as. Absent: a least-privilege role forge creates for the build."
+          "description": "The IAM role the job runs as (runtime local ignores it: a local job runs with the credentials of the machine it runs on). Absent: a least-privilege role forge creates for the build."
         },
         "maskKeySecretArn": {
           "type": "string",
@@ -4174,7 +4175,10 @@
             "not": {
               "properties": {
                 "runtime": {
-                  "const": "emr-serverless"
+                  "enum": [
+                    "emr-serverless",
+                    "local"
+                  ]
                 }
               }
             }
@@ -4193,7 +4197,10 @@
             "not": {
               "properties": {
                 "runtime": {
-                  "const": "emr-ec2"
+                  "enum": [
+                    "emr-ec2",
+                    "local"
+                  ]
                 }
               }
             }
@@ -4212,7 +4219,10 @@
             "not": {
               "properties": {
                 "runtime": {
-                  "const": "emr-eks"
+                  "enum": [
+                    "emr-eks",
+                    "local"
+                  ]
                 }
               }
             }
@@ -4244,14 +4254,54 @@
               ]
             },
             "description": "releaseLabel is an EMR release; a glue runtime takes glueVersion"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "runtime": {
+                "enum": [
+                  "emr-serverless",
+                  "emr-ec2",
+                  "emr-eks"
+                ]
+              }
+            },
+            "required": [
+              "runtime"
+            ]
           },
-          "else": {
+          "then": {
             "not": {
               "required": [
                 "glueVersion"
               ]
             },
             "description": "glueVersion is only valid with runtime: glue; EMR runtimes take releaseLabel"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "runtime": {
+                "const": "local"
+              }
+            },
+            "required": [
+              "runtime"
+            ]
+          },
+          "then": {
+            "properties": {
+              "source": {
+                "not": {
+                  "required": [
+                    "mskClusterArn"
+                  ]
+                },
+                "description": "a local run reads source.bootstrapServers: nothing resolves an MSK cluster's brokers for it"
+              }
+            }
           }
         }
       ]

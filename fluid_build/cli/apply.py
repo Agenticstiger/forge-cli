@@ -435,6 +435,19 @@ def _gate_spark_builds_for_apply(contract: Dict[str, Any], build_id: Optional[st
             )
 
 
+def _spark_workspace(args: Any, plan_data: Optional[Dict[str, Any]]) -> Path:
+    """The source contract's directory, where local Spark runs (runtime: local) keep their
+    state: the build phase anchors there too (``_contract_loader.source_contract_path``),
+    so a contract, a bundle and a plan of it find the same runs."""
+    from fluid_build._contract_loader import source_contract_path
+
+    try:
+        source = source_contract_path(args.contract, plan_data=plan_data)
+    except Exception:  # noqa: BLE001 - an unreadable bundle or plan: the input's directory
+        source = None
+    return (source or Path(args.contract).resolve()).parent
+
+
 def _gate_selected_build_for_apply(contract: Dict[str, Any], build_id: Optional[str]) -> None:
     """Refuse, before anything is applied, a ``--build-id`` that names no build.
 
@@ -2195,11 +2208,22 @@ def run(args, logger: logging.Logger) -> int:
     # keeps handing it the attested plan (``plan_kwargs``), which embeds it.
     build_kwargs: Dict[str, Any] = plan_kwargs or {"contract": source_contract}
 
-    if apply_engine != "opentofu":
-        # A Spark build's infrastructure and runs come with the OpenTofu engine only.
-        from fluid_build.cli._spark_apply import refuse_without_opentofu
+    # Spark job runs (``cli/_spark_apply.py``): compiled and checked against the bound plan
+    # before anything is applied, reconciled after. Local runs (runtime: local) live in the
+    # source contract's directory.
+    from fluid_build.cli import _spark_apply as _spark
 
-        refuse_without_opentofu(source_contract, apply_engine)
+    spark_workspace = _spark_workspace(args, verified_plan_data)
+    if apply_engine != "opentofu":
+        # A Spark build on AWS is provisioned and run by the OpenTofu engine only; a local
+        # one needs nothing provisioned, and this engine reconciles it the same way.
+        _spark.refuse_without_opentofu(source_contract, apply_engine)
+        local_spark_runs = _spark.prepare(
+            source_contract,
+            build_id=resolved_build_id,
+            verified_plan=verified_plan_data,
+            dry_run=effective_dry_run,
+        )
     if apply_engine == "opentofu":
         # Apply-time plugin hooks run on EVERY engine. They used to be
         # invoked only from the native path's YAML branch, several hundred
@@ -2214,10 +2238,6 @@ def run(args, logger: logging.Logger) -> int:
         if _hook_rc != 0:
             return _hook_rc
         engine_kwargs = _state_for_job_runs(source_contract, resolved_mode, resolved_build_id)
-        # Spark job runs: compiled and checked against the bound plan before tofu apply,
-        # reconciled after it (``cli/_spark_apply.py``).
-        from fluid_build.cli import _spark_apply as _spark
-
         spark_runs = _spark.prepare(
             source_contract,
             build_id=resolved_build_id,
@@ -2226,7 +2246,16 @@ def run(args, logger: logging.Logger) -> int:
         )
         rc = apply_via_opentofu(args, logger, contract=source_contract, **engine_kwargs)
         if rc == 0:
-            rc = _spark.reconcile_after_apply(spark_runs, logger, dry_run=effective_dry_run)
+            rc = _spark.reconcile_after_apply(
+                spark_runs,
+                logger,
+                dry_run=effective_dry_run,
+                workspace=spark_workspace,
+                # A contract that runs builds here also stops its removed local runs; an
+                # apply of AWS builds alone leaves this machine's runs to the local env.
+                contract=source_contract if any(r.local for r in spark_runs) else None,
+                build_id=resolved_build_id,
+            )
         # The OpenTofu engine provisions infrastructure only. Build-augmented
         # modes (amend-and-build / replace-and-build) still need their build
         # phase to run — mirror the native dispatch below so ``--build`` is
@@ -2254,6 +2283,18 @@ def run(args, logger: logging.Logger) -> int:
         #      the "no filter → run all builds" case cleanly.
         # force_run=True mirrors the historical ``_from_apply=True`` semantic.
         if needs_build(resolved_mode):
+            # Local Spark streams first, as the OpenTofu engine reconciles them before its
+            # build phase.
+            rc = _spark.reconcile_after_apply(
+                local_spark_runs,
+                logger,
+                dry_run=effective_dry_run,
+                workspace=spark_workspace,
+                contract=source_contract,
+                build_id=resolved_build_id,
+            )
+            if rc:
+                return rc
             # Forward the resolved build_id (may be None — that's fine,
             # the runner iterates all builds when unfiltered).
             args.build_id = resolved_build_id
@@ -2489,7 +2530,7 @@ def run(args, logger: logging.Logger) -> int:
 
         # Simple mode execution
         if use_simple_mode:
-            return _run_simple_apply(
+            rc = _run_simple_apply(
                 args=args,
                 contract=contract,
                 gated_contract=gated_contract,
@@ -2499,15 +2540,26 @@ def run(args, logger: logging.Logger) -> int:
                 logger=logger,
                 plan_data=verified_plan_data,
             )
-
-        # Complex orchestration mode — extracted to _run_orchestrated_apply().
-        return _run_orchestrated_apply(
-            args=args,
-            contract=contract,
-            plan=plan,
-            execution_id=execution_id,
-            start_time=start_time,
-            logger=logger,
+        else:
+            # Complex orchestration mode — extracted to _run_orchestrated_apply().
+            rc = _run_orchestrated_apply(
+                args=args,
+                contract=contract,
+                plan=plan,
+                execution_id=execution_id,
+                start_time=start_time,
+                logger=logger,
+            )
+        if rc:
+            return rc
+        # Local Spark streams, after the apply that succeeded, as after tofu apply.
+        return _spark.reconcile_after_apply(
+            local_spark_runs,
+            logger,
+            dry_run=effective_dry_run,
+            workspace=spark_workspace,
+            contract=source_contract,
+            build_id=resolved_build_id,
         )
 
     except CLIError:

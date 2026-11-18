@@ -18,7 +18,10 @@ says everything the job does, so the runner holds no contract logic:
   :data:`CONTRACT_SQL_ALLOWLIST_ENV`;
 - the trigger, watermark and checkpoint of a streaming job;
 - the sink: one Iceberg table in the Glue catalog, at the warehouse
-  :func:`fluid_build.providers.aws.util.warehouse.get_iceberg_warehouse` derives.
+  :func:`fluid_build.providers.aws.util.warehouse.get_iceberg_warehouse` derives; or, for
+  ``runtime: local``, one table in an Iceberg REST catalog the operator's Spark
+  configuration declares, with the statements that create it when nothing has (on AWS,
+  OpenTofu creates the table before the job runs).
 
 The text is canonical JSON (sorted keys, one trailing newline), so the same contract
 always gives the same bytes and digest. It holds no credential: a registry password
@@ -40,6 +43,7 @@ from urllib.parse import urlsplit
 
 from fluid_build.providers._iceberg_catalog import (
     FAMILY_GLUE,
+    FAMILY_REST,
     catalog_kind_info,
     resolve_iceberg_catalog,
 )
@@ -51,6 +55,7 @@ from fluid_build.streaming.mapping import (
     parse_stream,
     spark_schema,
     spark_source_select,
+    spark_type,
 )
 from fluid_build.streaming.types import parse_fields
 
@@ -71,7 +76,10 @@ TARGET_ALLOWLIST_ENV = "FLUID_SPARK_TARGET_ALLOWLIST"
 #: so contract SQL names a table as ``<database>.<table>``.
 CATALOG = "fluid"
 KAFKA_AUTH = ("msk-iam", "none")
-RUNTIMES = ("emr-serverless", "emr-ec2", "emr-eks", "glue")
+#: The runtime that runs the job with spark-submit on the machine ``fluid apply`` runs on.
+LOCAL_RUNTIME = "local"
+AWS_RUNTIMES = ("emr-serverless", "emr-ec2", "emr-eks", "glue")
+RUNTIMES = (*AWS_RUNTIMES, LOCAL_RUNTIME)
 MODES = ("streaming", "batch")
 #: The ``properties.stream`` keys only an engine reads; the rest describe the records.
 _ENGINE_KEYS = ("trigger", "watermark", "checkpoint", "startingOffsets", "registry")
@@ -509,6 +517,44 @@ def _contract_sql(sql: Any, bid: str) -> str:
     return sql
 
 
+def _rest_sink(resolved: Any, database: str, table: str, fields: Any) -> dict[str, Any]:
+    """A local run's sink: one table in the Iceberg REST catalog the submitter declares.
+
+    The catalog's connection (its URI, warehouse and credential) is the operator's, in the
+    Spark configuration the job is submitted with: derived from the contract, a catalog
+    credential the operator holds would go wherever the contract pointed it. A URI or
+    warehouse the binding names is kept, and the runner refuses a submitter catalog that
+    names others.
+
+    Nothing creates the table before a local job runs, as OpenTofu does on AWS, so the sink
+    carries the statements that create it: the contract's columns in an Iceberg v2 table,
+    unpartitioned, as the Glue table OpenTofu emits. ``IF NOT EXISTS``: a table that exists
+    is left as it is. The DDL follows the managed Flink lane's
+    (``fluid_build/streaming/compiler.py``) in Spark's syntax.
+    """
+    name = f"`{CATALOG}`.`{database}`"
+    columns = ",\n  ".join(
+        f"`{column}` {spark_type(dtype)}{' NOT NULL' if dtype.required else ''}"
+        for column, dtype in fields
+    )
+    sink: dict[str, Any] = {
+        "catalog": CATALOG,
+        "type": "rest",
+        "kind": resolved.kind,
+        "table": f"{database}.{table}",
+        "create": [
+            f"CREATE NAMESPACE IF NOT EXISTS {name}",
+            f"CREATE TABLE IF NOT EXISTS {name}.`{table}` (\n  {columns}\n) USING iceberg"
+            " TBLPROPERTIES ('format-version' = '2')",
+        ],
+    }
+    if resolved.uri:
+        sink["uri"] = str(resolved.uri)
+    if resolved.warehouse:
+        sink["warehouse"] = str(resolved.warehouse)
+    return sink
+
+
 def compile_job_config(
     contract: Mapping[str, Any],
     build: Mapping[str, Any],
@@ -574,14 +620,25 @@ def compile_job_config(
     if binding.get("format") != "iceberg":
         raise ValueError(f"{where}: the output's binding.format must be iceberg")
     loc = _object(binding.get("location"), f"exposes[{index}].binding.location")
-    if bucket_uses_fallback(loc) and not account_ref:
+    local = cfg.get("runtime") == LOCAL_RUNTIME
+    if not local and bucket_uses_fallback(loc) and not account_ref:
         raise ValueError(
             f"{where}: the output names no bucket, so its warehouse is the account's "
             "<account>-fluid-data bucket; pass the account"
         )
     resolved = resolve_iceberg_catalog(binding, account_ref=account_ref)
-    if catalog_kind_info(resolved.kind).family != FAMILY_GLUE:
-        raise ValueError(f"{where}: the forge Spark runner writes Glue-catalog Iceberg tables")
+    family = catalog_kind_info(resolved.kind).family
+    if local and (binding.get("platform") != "local" or family != FAMILY_REST):
+        raise ValueError(
+            f"{where}: runtime local writes a table in an Iceberg REST catalog on platform "
+            "local (binding.platform: local, location.catalog lakekeeper, rest or polaris); "
+            "a Glue table runs on an AWS runtime"
+        )
+    if not local and family != FAMILY_GLUE:
+        raise ValueError(
+            f"{where}: the forge Spark runner writes Glue-catalog Iceberg tables on an AWS "
+            "runtime; runtime local writes a table in an Iceberg REST catalog"
+        )
     parts = resolved.fq_table.split(".")
     if len(parts) != 2 or "None" in parts:
         raise ValueError(f"{where}: the output needs one database and table")
@@ -590,7 +647,12 @@ def compile_job_config(
         _object(expose.get("contract"), f"exposes[{index}].contract").get("schema"),
         path=f"exposes[{index}].contract.schema",
     )
-    bucket, _ = normalize_location(loc, account_ref=account_ref)
+    # A local output names its bucket (the S3 store its checkpoint lives in) or none.
+    bucket: Optional[str] = (
+        None
+        if local and bucket_uses_fallback(loc)
+        else normalize_location(loc, account_ref=account_ref)[0]
+    )
 
     source: Optional[dict[str, Any]] = None
     source_sql: Optional[str] = None
@@ -603,6 +665,12 @@ def compile_job_config(
         records = {k: v for k, v in stream_spec.items() if k not in _ENGINE_KEYS}
         stream = parse_stream(records, swhere)
         kafka = _kafka(cfg, where)
+        if local and kafka["mskClusterArn"] is not None:
+            raise ValueError(
+                f"{where}: parameters.spark.source: a local run reads bootstrapServers; "
+                "nothing resolves an MSK cluster's brokers for it (keep mskClusterArn in the "
+                "AWS environment's overlay)"
+            )
         registry = _registry(
             stream_spec.get("registry"), stream, swhere, environ, granted=host_gate
         )
@@ -629,6 +697,11 @@ def compile_job_config(
         # The default is built from the warehouse bucket, which may be the IaC emitter's
         # account token; only a declared checkpoint is the contract's text to check.
         checkpoint = stream_spec.get("checkpoint")
+        if checkpoint is None and bucket is None:
+            raise ValueError(
+                f"{swhere}.checkpoint: a local stream keeps its checkpoint in the S3 store its "
+                "output names; set the output's location.bucket or properties.stream.checkpoint"
+            )
         if checkpoint is None:
             checkpoint = f"s3://{bucket}/_checkpoints/{product}/{bid}/"
         elif not isinstance(checkpoint, str) or not _CHECKPOINT.fullmatch(checkpoint):
@@ -675,13 +748,17 @@ def compile_job_config(
         "source": source,
         "sql": {"source": source_sql, "select": select},
         **streaming,
-        "sink": {
-            "catalog": CATALOG,
-            "type": "glue",
-            "warehouse": resolved.warehouse,
-            "region": resolved.region,
-            "table": f"{database}.{table}",
-        },
+        "sink": (
+            _rest_sink(resolved, database, table, fields)
+            if local
+            else {
+                "catalog": CATALOG,
+                "type": "glue",
+                "warehouse": resolved.warehouse,
+                "region": resolved.region,
+                "table": f"{database}.{table}",
+            }
+        ),
         "maskedColumns": masked,
         # The secret's ARN, never its value: the runner reads the key with the job's role.
         "maskKey": {"secretArn": mask_key} if masked else None,

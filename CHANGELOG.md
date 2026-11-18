@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A Spark build runs on the machine `fluid apply` runs on: `parameters.spark.runtime: local`.**
+  A build of `runtime: local` runs forge's Spark runner and its compiled `job.json` with
+  `spark-submit` on a laptop or a lab host (an EMR 7.x image, or any Spark 3.5), the way EMR runs
+  them. `fluid apply` writes the job config and the content-addressed runner under
+  `_fluid/spark/<product>/<build>/` in `FLUID_SPARK_LOCAL_ROOT`: `s3://<bucket>[/<prefix>]`,
+  reached through the AWS SDK's own `AWS_ENDPOINT_URL_S3` (SeaweedFS, MinIO), or a directory,
+  by default `.fluid/spark-artifacts` beside the contract. spark-submit reads both from there.
+  A stream follows `spark.reconcile` as on AWS: it is left alone while its config hash is
+  unchanged, stopped and started again on the same checkpoint when the hash changes, and stopped
+  when the contract no longer runs the build locally. A batch or `availableNow` build runs once
+  under `fluid apply --mode amend-and-build --build-id <id>`, the command a generated DAG runs, and
+  reports SUCCEEDED or FAILED. Run state lives under `.fluid/<product>/runtime/spark/<build>/`.
+  The output is a table in an Iceberg REST catalog (`location.catalog` lakekeeper, rest or
+  polaris) on `platform: local`. The operator declares that catalog in
+  `FLUID_SPARK_SUBMIT_PROPERTIES_FILE`, passed as `--properties-file`, so its values never reach
+  the command line, and the job creates its table on the first write: Iceberg v2 with the
+  contract's columns, as OpenTofu creates it on AWS. `FLUID_SPARK_SUBMIT_EXECUTABLE` names the
+  spark-submit. A contract written for AWS switches with one keyed-overlay line, since
+  `runtime: local` ignores the AWS runtimes' keys (`applicationId`, `clusterId`,
+  `virtualClusterId`, `releaseLabel`, `glueVersion`, `executionRoleArn`). A project dotenv can
+  no longer set `SPARK_*`, `PYSPARK_*`, `HADOOP_*` or `YARN_*`, which choose what spark-submit
+  starts. The runner changed, so each running Spark stream restarts once on its next apply.
+
 ### Fixed
 
 - **A quoted enum list in `validationRules` reads as SQL writes it.** Every reader cut an enum

@@ -8,11 +8,16 @@ which ``planDigest`` covers. ``fluid apply`` compiles the runs before ``tofu app
 (:func:`prepare`), refusing a bound plan whose Spark actions differ from them and a missing
 boto3, so nothing is provisioned that could not then be started; after a ``tofu apply`` that
 succeeded it reconciles the streaming jobs (:func:`reconcile_after_apply`).
+
+A build of ``runtime: local`` runs on the machine ``fluid apply`` runs on, with nothing for
+OpenTofu to provision: the native engine (outputs on ``platform: local``) reconciles it the
+same way, and :func:`refuse_without_opentofu` refuses only the AWS runtimes there.
 """
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 from fluid_build.build_runners.spark._desired import ACTION, DesiredRun
@@ -119,7 +124,9 @@ def prepare(
                 },
             )
     selected = [r for r in runs if build_id is None or r.build == build_id]
-    if not dry_run and any(r.long_running for r in selected):
+    if not dry_run and any(r.local for r in selected):
+        _check_local(selected)
+    if not dry_run and any(r.long_running and not r.local for r in selected):
         import importlib.util
 
         try:
@@ -138,32 +145,98 @@ def prepare(
     return selected
 
 
+def _check_local(runs: List[DesiredRun]) -> None:
+    """Refuse local runs this machine cannot start, before anything is applied: no POSIX
+    lock, or an operator setting (spark-submit, its properties file, the artifact root)
+    that is unusable.
+
+    Raises:
+        CLIError: ``apply_spark_local_unavailable``.
+    """
+    from fluid_build.build_runners.spark._adapters import SparkRunError
+    from fluid_build.build_runners.spark._local import default_host, require_posix, submitter
+
+    try:
+        require_posix()
+        submitter(default_host())
+    except SparkRunError as exc:
+        builds = ", ".join(r.build for r in runs if r.local)
+        raise _cli_error(
+            "apply_spark_local_unavailable",
+            {
+                "error": f"Spark build(s) {builds} run on this machine (runtime local), and "
+                f"{exc}; nothing was applied",
+                "hint": "Set the operator's FLUID_SPARK_SUBMIT_EXECUTABLE, "
+                "FLUID_SPARK_SUBMIT_PROPERTIES_FILE and FLUID_SPARK_LOCAL_ROOT in the real "
+                "environment (a project .env cannot set them).",
+            },
+        ) from exc
+
+
 def refuse_without_opentofu(contract: Mapping[str, Any], engine: str) -> None:
-    """Refuse a contract with Spark builds on an engine that neither provisions nor runs them
-    (the native one, chosen when the contract names several providers): its plan lists a
-    ``spark.reconcile`` that would otherwise silently never happen.
+    """Refuse a contract with Spark builds on an AWS runtime on an engine that neither
+    provisions nor runs them (the native one, chosen when the contract names several
+    providers, or none on AWS): its plan lists a ``spark.reconcile`` that would otherwise
+    silently never happen. A build of ``runtime: local`` needs nothing provisioned and runs
+    on any engine.
 
     Raises:
         CLIError: ``apply_spark_needs_opentofu``.
     """
-    if _has_spark(contract):
+    if not _has_spark(contract):
+        return
+    from fluid_build.build_runners.spark._desired import spark_builds
+    from fluid_build.spark.compiler import LOCAL_RUNTIME, spark_parameters
+
+    try:
+        remote = [
+            str(b.get("id"))
+            for b in spark_builds(contract)
+            if (spark_parameters(b) or {}).get("runtime") != LOCAL_RUNTIME
+        ]
+    except ValueError:
+        remote = ["?"]  # a build that does not parse: refused here as before
+    if remote:
         raise _cli_error(
             "apply_spark_needs_opentofu",
             {
                 "error": f"the {engine} apply engine was chosen, and only the OpenTofu engine "
-                "provisions and runs Spark builds; nothing was applied",
-                "hint": "keep the Spark builds in a contract whose exposes are all on AWS",
+                f"provisions and runs a Spark build on AWS ({', '.join(remote)}); nothing was "
+                "applied",
+                "hint": "keep the AWS Spark builds in a contract whose exposes are all on AWS, "
+                "or run them with runtime: local on platform: local outputs",
             },
         )
 
 
 def reconcile_after_apply(
-    runs: List[DesiredRun], logger: logging.Logger, *, dry_run: bool, clients: Any = None
+    runs: List[DesiredRun],
+    logger: logging.Logger,
+    *,
+    dry_run: bool,
+    clients: Any = None,
+    workspace: Optional[Path] = None,
+    contract: Optional[Mapping[str, Any]] = None,
+    build_id: Optional[str] = None,
 ) -> int:
-    """Reconcile the streaming runs after ``tofu apply``; 1 when any build failed."""
-    if not runs:
+    """Reconcile the streaming runs after ``tofu apply`` (or the native apply, for local
+    runs); 1 when any build failed.
+
+    ``workspace`` is the contract's directory, which holds local runs. With ``contract``
+    and no ``build_id`` (the whole contract), this machine's runs of the product's builds
+    the contract no longer runs locally are stopped too, even when it has no Spark build
+    left."""
+    from fluid_build.build_runners.spark._local import LocalHost
+
+    host = LocalHost(Path(workspace)) if workspace is not None else None
+    stop_removed_of = None
+    if host is not None and contract is not None and not build_id and contract.get("id"):
+        stop_removed_of = (str(contract.get("id")), {r.build for r in runs if r.local})
+        if not runs and not _has_local_runs(host, stop_removed_of[0]):
+            stop_removed_of = None
+    if not runs and stop_removed_of is None:
         return 0
-    from fluid_build.build_runners.spark._reconcile import reconcile
+    from fluid_build.build_runners.spark._reconcile import reconcile, stop_removed
     from fluid_build.cli.console import cprint
 
     if dry_run:  # a dry run reads nothing from AWS: the application may not exist yet
@@ -174,9 +247,20 @@ def reconcile_after_apply(
                 else f"would be reconciled to config {run.config_hash[:12]}"
             )
             cprint(f"Spark {run.build} ({run.runtime}): {what}", markup=False)
+        if stop_removed_of is not None:  # local files only
+            for out in stop_removed(*stop_removed_of, host, dry_run=True):
+                cprint(out.line(), markup=False)
         return 0
-    outcomes = reconcile(runs, dry_run=dry_run, clients=clients)
+    outcomes = reconcile(
+        runs, dry_run=dry_run, clients=clients, local_host=host, stop_removed_of=stop_removed_of
+    )
     for out in outcomes:
         cprint(out.line(), markup=False)
         logger.info("spark_reconcile", extra={"spark": out.as_dict()})
     return 1 if any(o.error for o in outcomes) else 0
+
+
+def _has_local_runs(host: Any, product: str) -> bool:
+    from fluid_build.build_runners.spark._local import builds_with_runs
+
+    return bool(builds_with_runs(host, product))

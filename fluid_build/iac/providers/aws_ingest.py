@@ -192,13 +192,18 @@ def spark_blocks(contract: Mapping[str, Any], cid: str) -> SparkBlocks:
     (:func:`aws_identity.refuse_unless_identity_allowed`), then the compiler's broker,
     registry, secrets and contract-SQL policies.
     """
-    from fluid_build.spark.compiler import spark_builds
+    from fluid_build.spark.compiler import LOCAL_RUNTIME, spark_builds, spark_parameters
     from fluid_build.streaming.compiler import managed_lane_enabled
 
     blocks = SparkBlocks({}, {})
     if not managed_lane_enabled(contract):
         return blocks
-    builds = spark_builds(contract)
+    # A build of runtime local runs on the machine fluid apply runs on: nothing on AWS.
+    builds = [
+        b
+        for b in spark_builds(contract)
+        if (spark_parameters(b) or {}).get("runtime") != LOCAL_RUNTIME
+    ]
     if not builds:
         return blocks
     account_marker, brokers_marker = _markers(contract)

@@ -136,6 +136,18 @@ def is_lakeflow_build(build: Mapping[str, Any]) -> bool:
     return isinstance(engine, str) and engine.strip().lower() == LAKEFLOW_ENGINE
 
 
+def is_spark_job_build(build: Mapping[str, Any]) -> bool:
+    """True for a build forge's Spark runner runs (``build_runners/spark``): ``engine:
+    spark`` with ``properties.parameters.spark``, whatever else it declares (a batch job's
+    ``properties.sql`` is Spark SQL for its runtime, not inline SQL for DuckDB). The local
+    provider neither runs such a build nor lands its output."""
+    if build.get("engine") != "spark":  # the compiler's and the renderer's spelling
+        return False
+    props = build.get("properties")
+    parameters = props.get("parameters") if isinstance(props, Mapping) else None
+    return isinstance(parameters, Mapping) and "spark" in parameters
+
+
 def is_externally_run_build(build: Mapping[str, Any]) -> bool:
     """True when the build's job runs on a platform forge-cli does not drive:
     its engine is ``flink``, or its ``properties.language`` is ``flink_sql``."""
