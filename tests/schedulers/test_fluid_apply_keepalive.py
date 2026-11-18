@@ -3,9 +3,10 @@
 
 """An always-on Spark stream that declares ``execution.retries`` gets a keepalive DAG.
 
-Its one task runs the reconcile-only ``fluid apply`` (:data:`fluid_apply.KEEPALIVE_APPLY_ARGS`)
-for that stream every few minutes, so a stream a Spot interruption stopped starts again. One
-run at a time, no catch-up, no Airflow retries: the retry budget is the build's own.
+Its one task runs ``fluid apply --mode reconcile --build-id <stream>``
+(:data:`fluid_apply.KEEPALIVE_APPLY_ARGS`) every few minutes, so a stream a Spot interruption
+stopped starts again. One run at a time, no catch-up, no Airflow retries: the restart budget is
+the build's own ``execution.retries``.
 """
 
 from __future__ import annotations
@@ -60,7 +61,7 @@ def test_a_stream_with_retries_gets_a_keepalive_dag(monkeypatch, airflow3: bool)
     assert task["bash_command"] == "\n".join(fluid_apply.KEEPALIVE_SCRIPT_LINES)
 
 
-def test_each_run_is_the_reconcile_only_apply_of_that_stream(tmp_path: Path, monkeypatch):
+def test_each_run_reconciles_that_one_stream(tmp_path: Path, monkeypatch):
     project = tmp_path / "project"
     project.mkdir()
     (project / "native.fluid.yaml").write_text("id: x\n", encoding="utf-8")
@@ -78,18 +79,36 @@ def test_each_run_is_the_reconcile_only_apply_of_that_stream(tmp_path: Path, mon
     ]
 
 
-def test_the_reconcile_arguments_live_in_one_constant():
+def test_the_keepalive_runs_apply_in_reconcile_mode():
+    assert fluid_apply.KEEPALIVE_APPLY_ARGS == ("--mode", "reconcile")
     tail = [line for line in fluid_apply.KEEPALIVE_SCRIPT_LINES if "--build-id" in line]
-    assert tail == [
-        'set -- "$@" '
-        + " ".join(fluid_apply.KEEPALIVE_APPLY_ARGS)
-        + ' --build-id "$FLUID_DAG_BUILD_ID" --yes'
-    ]
+    assert tail == ['set -- "$@" --mode reconcile --build-id "$FLUID_DAG_BUILD_ID" --yes']
     # The keepalive script is the apply script but for that line, and holds no contract text.
     differ = set(fluid_apply.KEEPALIVE_SCRIPT_LINES) ^ set(fluid_apply.BASH_SCRIPT_LINES)
     assert len(differ) == 2
     for word in fluid_apply.KEEPALIVE_APPLY_ARGS:
         assert word.replace("-", "").isalnum(), word
+
+
+def test_apply_arguments_render_one_space_apart_even_when_there_are_none():
+    assert fluid_apply._apply_args((), '"$B"') == '--build-id "$B" --yes'
+    assert fluid_apply._apply_args(("--mode", "x"), '"$B"') == '--mode x --build-id "$B" --yes'
+    source = _files(_contract())["stream_raw_dag.py"]
+    assert "  --build-id" not in source and "reconcile  " not in source
+
+
+def test_fluid_apply_accepts_the_keepalive_argv():
+    """The DAG never runs an apply the CLI would refuse: the mode exists, and it takes --build-id."""
+    from fluid_build.cli import build_parser
+    from fluid_build.cli.apply import _check_build_id_mode
+    from fluid_build.forge.core.apply_modes import parse_mode
+
+    argv = ["apply", "native.fluid.yaml", "--env", "aws", *fluid_apply.KEEPALIVE_APPLY_ARGS]
+    args = build_parser().parse_args([*argv, "--build-id", "stream-raw", "--yes"])
+    assert (args.build_id, args.yes) == ("stream-raw", True)
+    mode = parse_mode(args.mode)
+    assert mode.value == "reconcile"
+    _check_build_id_mode(args.build_id, mode)
 
 
 def test_without_retries_a_stream_still_gets_no_dag():

@@ -118,12 +118,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A keepalive DAG for an always-on stream that declares `execution.retries`.** `fluid
   generate schedule` gives each forge Spark stream that is not `trigger.availableNow` and
-  declares `execution.retries` a small DAG whose one task runs the reconcile-only `fluid apply`
-  for that stream, so a stream a Spot interruption or a failed driver stopped starts again. It
-  runs every 5 minutes, or on the build's `execution.orchestration.airflow.dagConfig.schedule`,
-  one run at a time, with no catch-up and no Airflow retries: the build's own retries bound the
-  restarts. The task declares no outlets. A contract whose only builds are such streams now gets
-  this DAG instead of "No build needs a DAG".
+  declares `execution.retries` a small DAG whose one task runs
+  `fluid apply <contract> --mode reconcile --build-id <stream> --yes`, so a stream a Spot
+  interruption or a failed driver stopped starts again on its checkpoint. It runs every 5
+  minutes, or on the build's `execution.orchestration.airflow.dagConfig.schedule`, one run at a
+  time, with no catch-up and no Airflow retries: the build's `execution.retries` is the restart
+  budget, and a run fails when the stream drifted from the contract or the budget is spent. The
+  task declares no outlets. A contract whose only builds are such streams now gets this DAG
+  instead of "No build needs a DAG".
 
 - **`fluid generate schedule` renders the build graph: `builds[].dependencies` and dataset
   triggers.** Builds that `builds[].dependencies` link now run in one Airflow DAG, one

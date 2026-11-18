@@ -125,9 +125,10 @@ DEFAULT_ENGINE = "airflow"
 APPLY_MODE = "amend-and-build"
 
 #: What a keepalive DAG passes to ``fluid apply`` after the contract and ``--env``, before
-#: ``--build-id <stream> --yes``: reconcile that one stream, restarting it when it stopped, and
-#: change nothing else. The one place the reconcile-only apply is named. PLACEHOLDER: the
-#: reconcile-only apply path does not exist yet; set the real arguments here once it does.
+#: ``--build-id <stream> --yes``. ``--mode reconcile`` runs no ``tofu apply``: it starts that one
+#: stream again on its checkpoint when it stopped, within the restart budget the build's
+#: ``execution.retries`` sets, and exits non-zero when the stream drifted from the contract or
+#: the budget is spent. The one place a keepalive's apply arguments are named.
 KEEPALIVE_APPLY_ARGS: Tuple[str, ...] = ("--mode", "reconcile")
 
 #: How often a keepalive DAG reconciles its stream, unless the build's
@@ -1358,10 +1359,16 @@ _SCRIPT_END = (
 
 BASH_SCRIPT_LINES = _SCRIPT_HEAD + _APPLY_TAIL + _SCRIPT_END
 
+
+def _apply_args(args: Tuple[str, ...], build_ref: str) -> str:
+    """``args``, then ``--build-id <build_ref> --yes``: one space apart, however many ``args``."""
+    return " ".join((*args, "--build-id", build_ref, "--yes"))
+
+
 _KEEPALIVE_TAIL = (
     'set -- apply "$contract"',
     'if [ -n "$FLUID_DAG_ENV" ]; then set -- "$@" --env "$FLUID_DAG_ENV"; fi',
-    'set -- "$@" ' + " ".join(KEEPALIVE_APPLY_ARGS) + ' --build-id "$FLUID_DAG_BUILD_ID" --yes',
+    'set -- "$@" ' + _apply_args(KEEPALIVE_APPLY_ARGS, '"$FLUID_DAG_BUILD_ID"'),
 )
 
 #: The script of a keepalive DAG's task: :data:`BASH_SCRIPT_LINES` but for the apply arguments.
@@ -1412,12 +1419,13 @@ _KEEPALIVE_RUN = (
     "\n"
     '    cd "$FLUID_PROJECT_DIR"\n'
     '    fluid apply "$FLUID_PROJECT_DIR/$CONTRACT_PATH" --env "$FLUID_ENV_NAME" \\\\\n'
-    f'        {" ".join(KEEPALIVE_APPLY_ARGS)} --build-id "$BUILD_ID" --yes\n'
+    "        " + _apply_args(KEEPALIVE_APPLY_ARGS, '"$BUILD_ID"') + "\n"
     "\n"
-    "It starts the stream again when it stopped (a Spot interruption, a failed\n"
-    "driver) and changes nothing else; the build's execution.retries bound the\n"
-    "restarts, so the task itself never retries. It runs on SCHEDULE, one run\n"
-    "at a time, with no catch-up. The build's\n"
+    "It runs no tofu apply. It starts the stream again on its checkpoint when it\n"
+    "stopped (a Spot interruption, a failed driver), within the restart budget the\n"
+    "build's execution.retries sets, and fails the run when the stream drifted\n"
+    "from the contract or the budget is spent, so the task itself never retries.\n"
+    "It runs on SCHEDULE, one run at a time, with no catch-up. The build's\n"
     "execution.orchestration.airflow.dagConfig.schedule sets SCHEDULE.\n"
 )
 
