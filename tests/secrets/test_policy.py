@@ -20,10 +20,12 @@ from fluid_build.secrets.policy import (
     check_scheme,
     check_stage,
     connection_hosts,
+    deferred_destination_notice,
     enabled_schemes,
     locator_prefixes,
     prefix_matches,
     refuse_unless_allowed,
+    renders_at_apply,
     variable_allowed,
 )
 from fluid_build.secrets.ref import parse_secret_ref
@@ -479,3 +481,42 @@ def test_empty_destination_fields_are_not_none_to_judge(connection):
 def test_a_destination_field_that_is_not_a_string_cannot_be_cleared(uri):
     with pytest.raises(AcquisitionSecretPolicyError):
         refuse_unless_allowed("env://PG", connection={"uri": uri}, environ={})
+
+
+# ── a host only fluid apply renders ─────────────────────────────────────────
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "field_name, value, expected",
+    [
+        ("host", "{{ env.PGHOST }}", True),
+        ("host", "{{env.REGION}}.db.example.com", True),
+        ("uri", "postgresql://{{ env.PGHOST }}:5432/db", True),
+        ("uri", "{{ env.SCHEME }}://db.example.com/x", True),
+        ("uri", "postgresql://u@{{ env.PGHOST }}/db", True),
+        ("server", "{{ env.MSSQL }}:1433", True),
+        ("uri", "postgresql://db.example.com/{{ env.DB }}", False),
+        ("uri", "postgresql://{{ env.PGUSER }}@db.example.com/db", False),
+        ("uri", "postgresql://db.example.com/db?options={{ env.X }}", False),
+        ("host", "db.example.com", False),
+        ("host", "", False),
+        ("host", None, False),
+        ("host", 5432, False),
+    ],
+)
+def test_renders_at_apply_only_where_the_placeholder_decides_the_host(field_name, value, expected):
+    assert renders_at_apply(field_name, value) is expected
+
+
+@pytest.mark.unit
+def test_the_deferred_notice_names_the_entry_apply_needs_and_no_value(monkeypatch):
+    monkeypatch.setenv("PGHOST", "db.private-value.internal")
+    notice = deferred_destination_notice(
+        "vault://kv/acme/pg#password", {"connection.host": "{{ env.PGHOST }}"}
+    )
+    assert isinstance(notice, SecretPolicyError)
+    assert "connection.host ('{{ env.PGHOST }}')" in notice.what
+    assert f'{ALLOWLIST_ENV}="vault://kv/acme/pg#password@<host>"' in notice.fix
+    assert "{{ env.PGHOST }} set" in notice.fix
+    assert "db.private-value.internal" not in str(notice)

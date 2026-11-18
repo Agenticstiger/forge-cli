@@ -1499,6 +1499,8 @@ def _check_secret_refs(validation_result: ValidationResult, contract: Mapping[st
         for problem, add in (
             (finding.error, validation_result.add_error),
             (finding.warning, validation_result.add_warning),
+            # a host only fluid apply renders: judged there, named here
+            (finding.deferred, validation_result.add_warning),
         ):
             if problem is None:
                 continue

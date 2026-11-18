@@ -674,3 +674,76 @@ def refuse_unless_allowed(
         if target is None and connection is not None and _host_is_blank(connection):
             raise _blank_host_refusal(parsed)
         raise _destination_refusal(parsed, target)
+
+
+# ── destinations only fluid apply can read ───────────────────────────────────
+
+
+def renders_at_apply(field_name: str, value: Any) -> bool:
+    """Whether the host in ``value`` is a ``{{ env.NAME }}`` placeholder.
+
+    ``fluid apply`` renders every such placeholder from its own environment
+    before a runner asks for the secret (``build_runners/base.py``), and this
+    policy then judges the host it names. ``fluid validate`` sees the
+    placeholder, which no allowlist entry can match, so its lint leaves that
+    destination to apply. Only where the placeholder decides the host: anywhere
+    in ``host``, and in a URI's scheme or the host part of its authority, not in
+    its user name or path. The same rule as
+    ``kafka_connect.iceberg_sink_validation._rendered_at_run``; Terraform defers
+    a check on a value known only after apply the same way.
+    """
+    if not isinstance(value, str) or not _ENV_PLACEHOLDER.search(value):
+        return False
+    if field_name == "host":
+        return True
+    text = value.strip()
+    scheme, sep, rest = text.partition("://")
+    if sep and _ENV_PLACEHOLDER.search(scheme):
+        return True
+    authority = re.split(r"[/?#]", rest if sep else text, maxsplit=1)[0]
+    return _ENV_PLACEHOLDER.search(authority.rpartition("@")[2]) is not None
+
+
+def destinations_rendered_at_apply(connection: Mapping[str, Any]) -> List[str]:
+    """The destination fields of ``connection`` whose host :func:`renders_at_apply`."""
+    return [
+        field_name
+        for field_name in _HOST_FIELDS
+        if renders_at_apply(field_name, connection.get(field_name))
+    ]
+
+
+def deferred_destination_notice(
+    ref: Union[SecretRef, str], written: Mapping[str, str]
+) -> SecretPolicyError:
+    """What ``fluid validate`` says about a destination it leaves to ``fluid apply``.
+
+    ``written`` maps each such field, as the user knows it
+    (``connection.host``), to its value as written. Only the contract's own
+    text is quoted: the lint never reads the environment, so it never prints a
+    value a placeholder names.
+    """
+    parsed = parse_secret_ref(ref) if isinstance(ref, str) else ref
+    fields = ", ".join(f"{name} ({value!r})" for name, value in written.items())
+    variables = sorted(
+        {match.group(0) for value in written.values() for match in _ENV_PLACEHOLDER.finditer(value)}
+    )
+    return SecretPolicyError(
+        what=(
+            f"{parsed.canonical} is sent to the host {fields} renders to, which only "
+            "fluid apply knows"
+        ),
+        why=(
+            "fluid apply renders {{ env.NAME }} placeholders from the environment it runs "
+            "in, then judges the host they name against the destination allowlist. This "
+            "check does not read the environment, so it leaves that host to apply; an "
+            "allowlist entry naming the placeholder itself never matches."
+        ),
+        fix=(
+            "Unless it renders to a loopback host, allow it in the environment fluid apply "
+            f"runs in, in {_OPERATOR_ONLY}: "
+            f'{ALLOWLIST_ENV}="{_suggested_entry(parsed, "<host>")}", where <host> is the '
+            f"host it renders to there, with {', '.join(variables)} set, and without a port."
+        ),
+        doc=doc_url("secrets"),
+    )

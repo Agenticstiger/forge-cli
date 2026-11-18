@@ -18,6 +18,13 @@ The references a stage resolves, and where each value goes:
   ``deployment.server_url`` (the REST mode's token; an inline ``auth.token``
   wins, and then the reference is never read).
 
+A destination whose host is a ``{{ env.NAME }}`` placeholder is left to
+``fluid apply``, which renders it from its own environment and then judges
+the host it names: the lint does not read the environment, and no allowlist
+entry can match the placeholder. Such a finding carries ``deferred`` (a
+warning naming the entry apply needs) instead of an error; every destination
+written literally is still judged here.
+
 Any other ``secretRef`` string is linted for grammar, scheme and prefix only:
 no stage resolves it, so it is sent nowhere. That includes meltano's,
 kafka-connect's and debezium's ``deployment.auth`` and kafka-connect's
@@ -36,8 +43,12 @@ from .policy import (
     check_prefix,
     check_scheme,
     connection_host,
+    connection_hosts,
+    deferred_destination_notice,
+    destinations_rendered_at_apply,
     refuse_destination_overrides,
     refuse_unless_allowed,
+    renders_at_apply,
 )
 from .ref import SecretRef, parse_secret_ref
 from .registry import check_available
@@ -64,6 +75,10 @@ class RefFinding:
     ``warning`` says no resolver for the scheme is installed here: the machine
     that runs ``fluid apply`` needs one, but this one (a laptop, a CI lint job)
     may not, so it does not fail validation.
+
+    ``deferred`` says a destination's host is a ``{{ env.NAME }}`` placeholder,
+    judged only when ``fluid apply`` renders it; it names the allowlist entry
+    apply will need, and does not fail validation either.
     """
 
     site: RefSite
@@ -71,6 +86,7 @@ class RefFinding:
     error: Optional[SecretError] = None
     warning: Optional[SecretError] = None
     extras: Dict[str, Any] = field(default_factory=dict)
+    deferred: Optional[SecretError] = None
 
     @property
     def ok(self) -> bool:
@@ -144,18 +160,43 @@ def lint_site(site: RefSite, environ: Optional[Mapping[str, str]] = None) -> Ref
         check_available(ref.scheme)
     except SecretError as exc:
         warning = exc
+    deferred: Optional[SecretError] = None
     try:
         check_scheme(ref, environ)
         check_prefix(ref, environ)
         if site.sent:
-            if site.connection is not None:
-                refuse_unless_allowed(ref, connection=site.connection, environ=environ)
-            else:
-                host = connection_host({"uri": site.url}) if site.url else None
-                refuse_unless_allowed(ref, host=host, environ=environ)
+            deferred = _check_destinations(ref, site, environ)
     except SecretError as exc:
         return RefFinding(site=site, ref=ref, error=exc, warning=warning)
-    return RefFinding(site=site, ref=ref, warning=warning)
+    return RefFinding(site=site, ref=ref, warning=warning, deferred=deferred)
+
+
+def _check_destinations(
+    ref: SecretRef, site: RefSite, environ: Optional[Mapping[str, str]]
+) -> Optional[SecretError]:
+    """Judge every destination written literally; the notice for those apply renders.
+
+    A destination whose host is a ``{{ env.NAME }}`` placeholder is taken out
+    and left to apply (:func:`~fluid_build.secrets.policy.renders_at_apply`);
+    the rest of the connection is judged as ``fluid apply`` would, unless
+    nothing that names a destination is left.
+    """
+    if site.connection is None:
+        if site.url and renders_at_apply("uri", site.url):
+            return deferred_destination_notice(ref, {"deployment.server_url": site.url})
+        host = connection_host({"uri": site.url}) if site.url else None
+        refuse_unless_allowed(ref, host=host, environ=environ)
+        return None
+    waiting = destinations_rendered_at_apply(site.connection)
+    if not waiting:
+        refuse_unless_allowed(ref, connection=site.connection, environ=environ)
+        return None
+    literal = {key: value for key, value in site.connection.items() if key not in waiting}
+    if connection_hosts(literal):
+        refuse_unless_allowed(ref, connection=literal, environ=environ)
+    return deferred_destination_notice(
+        ref, {f"connection.{name}": str(site.connection[name]) for name in waiting}
+    )
 
 
 def _override_findings(contract: Mapping[str, Any]) -> Iterator[RefFinding]:
