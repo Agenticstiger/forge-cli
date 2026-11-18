@@ -377,7 +377,7 @@ class _GeneratedJinja(str):
     """Jinja this module built from literals (a placeholder ``where``): left as written."""
 
 
-def _inert_jinja(value: Any, *, generated: bool = False) -> Any:
+def _inert_jinja(value: Any) -> Any:
     """``value`` with every string that holds a Jinja delimiter written as a Jinja string
     literal of itself (:func:`fluid_build.data_rules._dbt.jinja_text`).
 
@@ -386,24 +386,34 @@ def _inert_jinja(value: Any, *, generated: bool = False) -> Any:
     ``dbt parse``, and so would a test argument that is a bare ``env_var(...)``-style call.
     Every other string is left as written, so the file for every other contract is
     unchanged; so is the ``relationships`` test's own ``ref('<model>')`` when the model is a
-    plain name (any other model name is a literal, and the test then names no model). The ``fluid_rule`` test's own arguments are already Jinja
-    built from literals, and are left alone.
+    plain name (any other model name is a literal, and the test then names no model).
+    The ``fluid_rule`` test bodies are already Jinja built from literals; they are known by
+    their type (``GeneratedTest``), never by a key name, which a contract could also write.
     """
     if isinstance(value, _GeneratedJinja):
         return str(value)
+    from ..data_rules._dbt import GeneratedTest
+
+    if isinstance(value, GeneratedTest):
+        return _plain(value)
     if isinstance(value, str):
         unsafe = any(d in value for d in _JINJA_DELIMITERS) or _LOOKS_LIKE_CALL.match(value)
-        if not generated and unsafe and not _OWN_REF.fullmatch(value):
+        if unsafe and not _OWN_REF.fullmatch(value):
             from ..data_rules._dbt import jinja_text
 
             return jinja_text(value)
         return value
     if isinstance(value, Mapping):
-        out = {}
-        for key, item in value.items():
-            inner = generated or key == "fluid_rule"
-            out[key] = _inert_jinja(item, generated=inner)
-        return out
+        return {key: _inert_jinja(item) for key, item in value.items()}
     if isinstance(value, list):
-        return [_inert_jinja(item, generated=generated) for item in value]
+        return [_inert_jinja(item) for item in value]
     return value
+
+
+def _plain(value: Any) -> Any:
+    """``value`` as plain dicts, lists and strings (yaml.safe_dump takes no subclass)."""
+    if isinstance(value, Mapping):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_plain(item) for item in value]
+    return str(value) if isinstance(value, str) else value

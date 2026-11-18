@@ -513,3 +513,15 @@ def test_out_through_a_symlinked_folder_finds_its_project(tmp_path: Path) -> Non
     (project / "models").symlink_to(tmp_path / "shared")
     assert _run_cli(tmp_path, project / "models" / "schema.yml", _billing()) == 0
     assert (project / "macros" / "fluid" / "fluid_rule.sql").exists()
+
+
+def test_contract_text_under_a_fluid_rule_key_is_still_a_literal() -> None:
+    contract = _billing()
+    status = next(c for c in contract["exposes"][0]["contract"]["schema"] if c["name"] == "status")
+    payload = "{{ exceptions.raise_compiler_error('x') }}"
+    status["enum"] = ["A", {"fluid_rule": payload}]
+    doc = yaml.safe_load(render_dbt_tests(contract))
+    column = next(c for c in doc["models"][0]["columns"] if c["name"] == "status")
+    values = next(t for t in column["tests"] if "accepted_values" in t)["accepted_values"]["values"]
+    smuggled = values[1]["fluid_rule"]
+    assert smuggled != payload and jinja2.Template(smuggled).render() == payload

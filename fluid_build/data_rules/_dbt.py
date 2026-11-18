@@ -94,6 +94,12 @@ _NUL = chr(0)
 _SENTINEL = re.compile(_NUL + "([0-9]+)" + _NUL)
 
 
+class GeneratedTest(dict):
+    """A ``fluid_rule`` test body this module built: its strings are already Jinja made
+    from literals. A caller that escapes contract text recognises it by type, never by a
+    key name a contract could also write."""
+
+
 @dataclass(frozen=True)
 class Skipped:
     """A rule no engine renders (``adapters`` empty), or one some adapters cannot run
@@ -242,15 +248,17 @@ def rule_tests(
             skipped.append(Skipped(first.id, first.expose, reason, tuple(missing)))
         tests.setdefault(model, []).append(
             {
-                TEST_NAME: {
-                    "name": test_name(first.id, taken),
-                    # dbt renders every string test argument as Jinja (and a bare
-                    # env_var(...) too): the id is contract text, so it is a literal.
-                    "rule": jinja_text(first.id),
-                    "sql": sql,
-                    "holds": holds,
-                    "config": {"severity": _SEVERITY.get(first.severity, "error")},
-                }
+                TEST_NAME: GeneratedTest(
+                    {
+                        "name": test_name(first.id, taken),
+                        # dbt renders every string test argument as Jinja (and a bare
+                        # env_var(...) too): the id is contract text, so it is a literal.
+                        "rule": jinja_text(first.id),
+                        "sql": sql,
+                        "holds": holds,
+                        "config": {"severity": _SEVERITY.get(first.severity, "error")},
+                    }
+                )
             }
         )
     return tests, skipped
