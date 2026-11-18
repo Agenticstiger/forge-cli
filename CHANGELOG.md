@@ -124,8 +124,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   minutes, or on the build's `execution.orchestration.airflow.dagConfig.schedule`, one run at a
   time, with no catch-up and no Airflow retries: the build's `execution.retries` is the restart
   budget, and a run fails when the stream drifted from the contract or the budget is spent. The
-  task declares no outlets. A contract whose only builds are such streams now gets this DAG
-  instead of "No build needs a DAG".
+  task declares no outlets, so a dataset trigger on what only the stream writes is refused, as
+  before. A contract whose only builds are such streams now gets this DAG on Airflow instead of
+  "No build needs a DAG"; on Prefect or Dagster, and in `fluid scaffold-composer`, it still has
+  nothing to schedule, and the message names the Airflow keepalive.
 
 - **`fluid generate schedule` renders the build graph: `builds[].dependencies` and dataset
   triggers.** Builds that `builds[].dependencies` link now run in one Airflow DAG, one

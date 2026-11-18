@@ -202,16 +202,23 @@ def _wrote_dag(dag_path: str, dag_id: str) -> bool:
     )
 
 
-def _report_nothing_to_schedule(dag_path: str, dag_id: str) -> None:
+def _report_nothing_to_schedule(dag_path: str, dag_id: str, *, keepalive: bool = False) -> None:
     """Say why no DAG is written, as ``fluid generate schedule`` does, and name
     a DAG this command wrote for the product before: left in place, it keeps
     scheduling the product wherever it was deployed. A file of the same name
-    that it did not write is someone else's, and is not mentioned."""
+    that it did not write is someone else's, and is not mentioned. With
+    ``keepalive``, a stream declares ``execution.retries``: say which command
+    writes the DAG that keeps it running."""
     cprint(
         "Every build runs outside forge-cli (a Flink job, for example), as a stream that fluid "
         "apply keeps running, or continuously (trigger.type: continuous), so there is nothing "
         "to schedule. No DAG written."
     )
+    if keepalive:
+        cprint(
+            "A stream that declares execution.retries gets a keepalive DAG from fluid generate "
+            "schedule, which restarts it when it stops."
+        )
     if _wrote_dag(dag_path, dag_id):
         # Printed as written: soft_wrap leaves wrapping to the terminal, so the
         # path is never broken by an inserted newline and copies whole, and no
@@ -241,15 +248,18 @@ def run(args, logger: logging.Logger) -> int:
         # apply keeps running, so a contract with no other build has nothing to
         # schedule and gets no DAG. The test is `fluid generate schedule`'s,
         # hand-declared orchestration tasks included, so the two commands agree
-        # on such a contract.
+        # on such a contract. A stream's keepalive DAG is generate schedule's
+        # alone: this command's validate, plan and apply DAG cannot keep a
+        # stream running, so here a stream with execution.retries is outside too.
         from fluid_build.schedulers.airflow.fluid_apply import (
             has_explicit_tasks,
             runs_only_outside_schedulers,
         )
 
-        if runs_only_outside_schedulers(c) and not has_explicit_tasks(c):
+        if runs_only_outside_schedulers(c, keepalive=False) and not has_explicit_tasks(c):
             dag_path = os.path.join(os.path.abspath(args.out_dir), f"{dag_id}.py")
-            _report_nothing_to_schedule(dag_path, dag_id)
+            kept_alive = not runs_only_outside_schedulers(c)
+            _report_nothing_to_schedule(dag_path, dag_id, keepalive=kept_alive)
             return 0
         cron = _validate_cron(_extract_cron(c))
         # SECURITY (shell + Python-literal injection): the contract path is

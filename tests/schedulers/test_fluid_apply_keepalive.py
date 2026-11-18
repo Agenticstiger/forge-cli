@@ -111,6 +111,29 @@ def test_fluid_apply_accepts_the_keepalive_argv():
     _check_build_id_mode(args.build_id, mode)
 
 
+def test_a_dataset_trigger_on_what_only_a_kept_alive_stream_writes_is_refused():
+    """A keepalive DAG declares no outlets, so a trigger on an expose only the stream writes
+    would never fire: it is refused, as it is for a stream with no keepalive."""
+    contract = _contract()
+    trigger = {
+        "type": "dataset",
+        "datasets": [{"productId": contract["id"], "exposeId": "events_raw"}],
+    }
+    contract["builds"].append(
+        {"id": "consumer", "engine": "dbt", "outputs": [], "execution": {"trigger": trigger}}
+    )
+    with pytest.raises(fluid_apply.ScheduleRenderError) as exc:
+        _files(contract)
+    message = str(exc.value)
+    assert "is written by 'stream-raw', whose keepalive DAG declares no outlets" in message
+    assert "the trigger would never fire" in message
+
+
+def test_a_stream_its_platform_keeps_running_gets_no_keepalive():
+    """trigger.type: continuous puts a build outside every scheduler, retries or not."""
+    assert sorted(_files(_contract(trigger={"type": "continuous"}))) == ["daily_curated_dag.py"]
+
+
 def test_without_retries_a_stream_still_gets_no_dag():
     assert sorted(_files(copy.deepcopy(SPARK_CONTRACT))) == ["daily_curated_dag.py"]
 

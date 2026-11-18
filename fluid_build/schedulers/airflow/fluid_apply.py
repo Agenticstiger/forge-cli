@@ -452,8 +452,10 @@ def _outside_why(build: Dict[str, Any], managed: bool) -> str:
 
 def _keeps_alive(build: Dict[str, Any], managed: bool) -> bool:
     """Whether a keepalive DAG watches the build: a forge Spark stream (one that is not
-    ``trigger.availableNow``) that declares ``execution.retries``, on Airflow's engine."""
-    if _spark_kind(build, managed) != "streaming":
+    ``trigger.availableNow``) that declares ``execution.retries``, on Airflow's engine. A build
+    another platform runs (:func:`is_unscheduled_build`: ``trigger.type: continuous``, a Flink
+    job) is that platform's to keep running, as :func:`_classify` has it."""
+    if is_unscheduled_build(build) or _spark_kind(build, managed) != "streaming":
         return False
     execution = build.get("execution")
     if not isinstance(execution, dict) or not isinstance(execution.get("retries"), dict):
@@ -532,15 +534,20 @@ def has_scheduled_builds(contract: Dict[str, Any]) -> bool:
     )
 
 
-def runs_only_outside_schedulers(contract: Dict[str, Any]) -> bool:
+def runs_only_outside_schedulers(contract: Dict[str, Any], *, keepalive: bool = True) -> bool:
     """True when the contract has builds and no scheduler starts any of them: each is a stream
-    ``fluid apply`` keeps running, runs continuously, or runs on its own platform."""
+    ``fluid apply`` keeps running, runs continuously, or runs on its own platform.
+
+    A stream that declares ``execution.retries`` has a keepalive DAG, so it counts as scheduled.
+    ``keepalive=False`` is for a renderer that has no keepalive DAG (``scaffold-composer``).
+    """
     builds = [b for b in get_builds(contract) if isinstance(b, dict)]
     if not builds:
         return False
     managed = _managed_lane(contract)
     return all(
-        _classify(b, managed)[0] == _OUTSIDE and not _keeps_alive(b, managed) for b in builds
+        _classify(b, managed)[0] == _OUTSIDE and not (keepalive and _keeps_alive(b, managed))
+        for b in builds
     )
 
 
@@ -1058,12 +1065,20 @@ class _BuildGraph:
 
     def check_expose_refs(self, dags: List[ScheduledDag]) -> None:
         """Refuse a dataset trigger on an expose of this contract that no task updates: every
-        build that writes it runs outside any DAG, so the trigger would never fire."""
-        tasked = {t.build_id for dag in dags for t in dag.tasks}
+        build that writes it runs outside any DAG, or only in a keepalive DAG, which declares no
+        outlets, so the trigger would never fire."""
+        tasked = {t.build_id for dag in dags if not dag.keepalive for t in dag.tasks}
         for where, expose_id, writers in self.expose_refs:
             if not writers or any(_expose_writer_id(b) in tasked for b in writers):
                 continue
             names = ", ".join(repr(b.get("id")) for b in writers)
+            if all(_keeps_alive(b, self.managed) for b in writers):
+                raise ScheduleRenderError(
+                    f"{where}: expose {expose_id!r} is written by {names}, whose keepalive DAG "
+                    "declares no outlets (a stream updates its tables all the time), so no task "
+                    "ever updates its asset and the trigger would never fire. Run this build on "
+                    "a schedule (trigger.type: schedule)"
+                )
             raise ScheduleRenderError(
                 f"{where}: expose {expose_id!r} is written by {names}, which no DAG runs "
                 f"({self._why_no_task(writers[0])}), so no task ever updates its asset and the "
