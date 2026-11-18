@@ -8,6 +8,7 @@ Pytest configuration and shared fixtures for FLUID tests.
 
 import argparse
 import logging
+import os
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -344,6 +345,66 @@ def _session_env_is_restored(monkeypatch):
             os.environ.pop(name, None)
         else:
             os.environ[name] = value
+
+
+#: The working directory each test started in, read back after its teardown.
+_STARTED_IN = pytest.StashKey[str]()
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item):
+    """Note the working directory before any fixture of the test runs."""
+    item.stash[_STARTED_IN] = os.getcwd()
+
+
+def _move_back(item) -> "str | None":
+    """Put the process back where ``item`` started; return where it was, if elsewhere."""
+    started = item.stash.get(_STARTED_IN, None)
+    if started is None:
+        return None
+    try:
+        now = os.getcwd()
+    except FileNotFoundError:
+        now = "a directory that no longer exists"
+    except OSError as error:
+        now = f"a directory it cannot read ({error.strerror})"
+    if now == started:
+        return None
+    os.chdir(started)
+    return now
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_teardown(item, nextitem):
+    """No test leaves the process in another working directory.
+
+    Code reads paths against the working directory (the MCP output port's
+    readable paths default to it), so a test that moved it and did not move it
+    back failed whichever unrelated test came next on that worker. This wraps the
+    whole teardown, so it runs after every fixture's, monkeypatch's included:
+    monkeypatch moves back to the directory it saw at its first ``chdir``, which
+    can be one an autouse fixture had moved to and has since left. The directory
+    is put back first, also when a teardown raised, so only that test fails.
+
+    The directory is noted before any fixture runs, so a fixture of module, class
+    or wider scope must not move it for its whole scope either (none does): that
+    move is reported at the first test that uses the fixture.
+    """
+    try:
+        result = yield
+    except BaseException:
+        _move_back(item)  # the teardown's own error is the report
+        raise
+    left = _move_back(item)
+    if left is not None:
+        pytest.fail(
+            f"{item.nodeid} left the working directory at {left}, not "
+            f"{item.stash[_STARTED_IN]} where it started. Move it with monkeypatch.chdir, or "
+            "inside pytest.MonkeyPatch.context() when an autouse fixture moves it too; a "
+            "fixture wider than a function must not move it.",
+            pytrace=False,
+        )
+    return result
 
 
 @pytest.fixture

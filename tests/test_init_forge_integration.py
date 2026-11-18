@@ -248,6 +248,8 @@ class TestInitTargetDir:
 
     def test_init_with_dir_creates_workspace_in_target(self, tmp_path, logger, monkeypatch):
         """--dir creates workspace in the specified directory."""
+        # run() moves into the target and stays there; monkeypatch moves back.
+        monkeypatch.chdir(tmp_path)
         target = tmp_path / "custom-dir"
         from fluid_build.cli.init import run
 
