@@ -573,6 +573,14 @@ def _shared_inputs(state: Path) -> List[Any]:
     ]
 
 
+def _rebind(out: Path, edit) -> None:
+    """Edit the saved-plan record and bind the plan again, as a re-signing editor would."""
+    plan = json.loads(out.read_text())
+    edit(plan[TOFU_PLAN_FIELD])
+    plan.pop("planDigest")
+    out.write_text(json.dumps(inject_digests(plan, force=True)))
+
+
 class TestAnotherRunner:
     def test_the_record_names_the_target(self, offline_tofu):
         out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
@@ -610,10 +618,13 @@ class TestAnotherRunner:
         assert _shared_inputs(state) == ["v1"]
 
     def test_local_state_does_not_travel_and_says_so(self, offline_tofu, monkeypatch):
-        applied = _plan(offline_tofu, {"id": "p1", "description": "v0"}, name="first.json")
-        assert engine.apply_via_opentofu(_args(str(applied)), _LOG) == 0
-        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
-        handed = _copy_to(offline_tofu / "elsewhere", out)
+        engine.apply_via_opentofu(
+            _args(str(_plan(offline_tofu, {"id": "p1", "description": "v0"}, name="v0.json"))),
+            _LOG,
+        )
+        handed = _copy_to(
+            offline_tofu / "elsewhere", _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        )
         monkeypatch.chdir(handed.parent)
         with pytest.raises(CLIError) as refused:
             engine.apply_via_opentofu(_args(str(handed)), _LOG)
@@ -680,21 +691,21 @@ class TestTargetBinding:
         assert refused.event == "apply_plan_digest_tofu_plan_toolchain"
         assert "registry.opentofu.org/x/y none -> 9.9.9" in refused.context["error"]
 
-    def test_another_backend_configuration_is_refused(self, offline_tofu):
+    @pytest.mark.parametrize(
+        "edit, event",
+        [
+            (
+                lambda r: r["target"].update(backend=sha256_bytes(b"another backend")),
+                "apply_plan_digest_tofu_plan_target",
+            ),
+            (lambda r: r.pop("target"), "apply_plan_digest_tofu_plan_target_missing"),
+        ],
+        ids=["another-backend", "no-target"],
+    )
+    def test_a_record_for_another_or_no_target_is_refused(self, offline_tofu, edit, event):
         out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
-        plan = json.loads(out.read_text())
-        plan[TOFU_PLAN_FIELD]["target"]["backend"] = sha256_bytes(b"another backend")
-        plan.pop("planDigest")
-        out.write_text(json.dumps(inject_digests(plan, force=True)))
-        assert self._refused(out).event == "apply_plan_digest_tofu_plan_target"
-
-    def test_a_plan_without_a_target_is_refused(self, offline_tofu):
-        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
-        plan = json.loads(out.read_text())
-        plan[TOFU_PLAN_FIELD].pop("target")
-        plan.pop("planDigest")
-        out.write_text(json.dumps(inject_digests(plan, force=True)))
-        assert self._refused(out).event == "apply_plan_digest_tofu_plan_target_missing"
+        _rebind(out, edit)
+        assert self._refused(out).event == event
 
     def test_an_edited_target_is_plan_tamper(self, offline_tofu):
         out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
