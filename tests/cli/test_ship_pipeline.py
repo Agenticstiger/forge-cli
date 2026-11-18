@@ -613,7 +613,7 @@ def test_stage_four_skips_with_a_reason_only_when_generation_is_off(
     assert ship_run(["--stage", "validate-artifacts", "--no-generate-artifacts"]) == 0
     assert fake.calls == []
     stage4 = json.loads((work / "runtime/ship-report.json").read_text())["stages"][3]
-    assert stage4["status"] == "skipped" and "dist/artifacts/" in stage4["skip_reason"]
+    assert stage4["status"] == "skipped-by-policy" and "dist/artifacts/" in stage4["reason"]
     # A reference-only contract generates too, so stage 4 alone needs stage 3's output.
     (work / "contract.fluid.yaml").write_text(
         "fluidVersion: '0.7.5'\nid: x.y\nbuilds:\n  - id: b\n    pattern: hybrid-reference\n"
@@ -637,7 +637,7 @@ def test_reports_accumulate_across_invocations_of_one_run(work: Path, fake: Fake
     report = json.loads((work / "runtime/ship-report.json").read_text())
     status = {s["number"]: s["status"] for s in report["stages"]}
     assert all(status[n] == "passed" for n in (1, 2, 3, 4, 5, 6, 7, 9)), status
-    assert status[8] == "skipped" and report["exit_code"] == 0
+    assert status[8] == "unsupported" and report["exit_code"] == 0
     suite = ET.parse(work / "runtime/ship-junit.xml").getroot()
     assert suite.get("failures") == "0" and len(suite.findall("testcase")) == 11
 
@@ -684,7 +684,7 @@ def test_ctrl_c_writes_reports_closes_the_fence_and_exits_130(
     assert f"::{token}::" in lines and "::endgroup::" in lines
     report = json.loads((work / "runtime/ship-report.json").read_text())
     by = {s["number"]: s for s in report["stages"]}
-    assert by[1]["status"] == "failed" and by[1]["failure_reason"] == "interrupted"
+    assert by[1]["status"] == "unknown" and by[1]["reason"] == "interrupted"
     assert by[1]["exit_code"] == 130 and by[2]["status"] == "not-run"
     assert report["exit_code"] == 130 and (work / "runtime/ship-junit.xml").is_file()
 
@@ -840,12 +840,9 @@ def test_reports_on_success(work: Path, fake: FakeRun) -> None:
     by_name = {s["name"]: s for s in stages}
     assert by_name["bundle"]["status"] == "passed" and by_name["bundle"]["exit_code"] == 0
     assert by_name["bundle"]["argv"][:2] == ["bundle", "contract.fluid.yaml"]
-    assert by_name["policy-apply"]["status"] == "skipped"
-    assert by_name["policy-apply"]["skip_reason"]
-    assert (
-        by_name["publish"]["status"] == "not-run"
-        and "--publish" in by_name["publish"]["skip_reason"]
-    )
+    assert by_name["policy-apply"]["status"] == "unsupported"
+    assert by_name["policy-apply"]["reason"]
+    assert by_name["publish"]["status"] == "not-run" and "--publish" in by_name["publish"]["reason"]
     assert all(isinstance(s["duration_seconds"], (int, float)) for s in stages)
 
     suite = ET.parse(work / "runtime/ship-junit.xml").getroot()
@@ -865,7 +862,7 @@ def test_reports_on_a_failed_stage(work: Path, monkeypatch: pytest.MonkeyPatch) 
     assert by_name["plan"]["status"] == "failed" and by_name["plan"]["exit_code"] == 9
     assert by_name["validate"]["status"] == "passed"
     assert by_name["apply"]["status"] == "not-run"
-    assert by_name["apply"]["skip_reason"] == "an earlier stage failed"
+    assert by_name["apply"]["reason"] == "an earlier stage failed"
 
     suite = ET.parse(work / "runtime/ship-junit.xml").getroot()
     assert suite.get("failures") == "1"
@@ -940,9 +937,9 @@ def test_ship_runs_the_real_pipeline_on_the_local_provider(hello: Path) -> None:
         assert (hello / rel).is_file(), rel
     report = json.loads((hello / "runtime/ship-report.json").read_text())
     for stage in report["stages"][:9]:
-        assert stage["status"] in ("passed", "skipped"), stage
-        if stage["status"] == "skipped":
-            assert stage["skip_reason"]
+        assert stage["status"] in ("passed", "skipped-by-policy", "unsupported"), stage
+        if stage["status"] != "passed":
+            assert stage["reason"]
     assert {s["name"]: s["status"] for s in report["stages"]}["apply"] == "passed"
 
 
@@ -1111,9 +1108,12 @@ def test_a_malformed_earlier_report_is_overwritten_not_trusted(
     assert ship_run(["--stage", "validate"]) == 0  # continues run-1: the old report is read
     report = _report(work)
     statuses = {s["number"]: s["status"] for s in report["stages"]}
-    # nothing of it was kept, not even its well-formed stage 1 record
-    assert statuses[2] == "passed" and statuses[1] == "not-run"
-    assert report["exit_code"] == 0
+    # nothing of it was kept, not even its well-formed stage 1 record: when the
+    # report is this run's, what its earlier steps did is unknown, never a pass
+    whole_file_unreadable = payload in ("not json",) or payload.startswith("[[")
+    assert statuses[2] == "passed"
+    assert statuses[1] == ("not-run" if whole_file_unreadable else "unknown")
+    assert report["exit_code"] == (0 if whole_file_unreadable else 1)
 
 
 def test_a_well_formed_earlier_report_of_the_run_is_kept(
@@ -1190,7 +1190,7 @@ def test_the_first_ctrl_c_lets_the_stage_stop_on_its_own(
     assert stages == ["bundle"]  # no stage after the interrupted one
     assert "ship stops when this stage ends" in capsys.readouterr().out
     by = {s["number"]: s for s in _report(work)["stages"]}
-    assert by[1]["failure_reason"] == "interrupted" and by[2]["status"] == "not-run"
+    assert by[1]["reason"] == "interrupted" and by[2]["status"] == "not-run"
 
 
 def test_a_second_ctrl_c_stops_waiting(work: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1308,7 +1308,7 @@ def test_a_retried_stage_range_never_shows_the_earlier_attempts_pass(
     assert by[6]["status"] == "passed"  # not selected this time: kept from the run
     assert by[7]["status"] == "failed"
     assert by[8]["status"] == by[9]["status"] == "not-run"
-    assert by[9]["skip_reason"] == "an earlier stage failed"
+    assert by[9]["reason"] == "an earlier stage failed"
     assert _report(work)["exit_code"] == 1
 
 
@@ -1513,7 +1513,7 @@ def test_merged_records_get_this_versions_names_and_text_reasons(
     )
     assert ship_run(["--stage", "validate"]) == 0
     stage1 = _report(work)["stages"][0]
-    assert stage1["name"] == "bundle" and stage1["skip_reason"] == "5"
+    assert stage1["name"] == "bundle" and stage1["reason"] == "5"
     ET.parse(work / "runtime/ship-junit.xml")  # well formed
 
 
@@ -1548,7 +1548,7 @@ def test_a_stage_switched_off_is_skipped_with_stage_too(
     monkeypatch.setenv("RUN_STAGE_5_DIFF", "false")
     assert ship_run(["--yes"]) == 0
     assert "diff" not in fake.stages and "plan" in fake.stages
-    assert _report(work)["stages"][4]["skip_reason"] == "RUN_STAGE_5_DIFF=false"
+    assert _report(work)["stages"][4]["reason"] == "RUN_STAGE_5_DIFF=false"
     fake.calls.clear()
     before = (work / "runtime/ship-report.json").read_text()
     capsys.readouterr()
@@ -1575,7 +1575,7 @@ def test_a_switched_off_stage_outside_stage_is_reported_as_switched_off(
     # that is off writes nothing: the first step records the switch.
     monkeypatch.setenv("RUN_STAGE_5_DIFF", "false")
     assert ship_run(["--stage", "bundle"]) == 0
-    assert _report(work)["stages"][4]["skip_reason"] == "RUN_STAGE_5_DIFF=false"
+    assert _report(work)["stages"][4]["reason"] == "RUN_STAGE_5_DIFF=false"
 
 
 def test_the_switch_for_stage_ten_or_eleven_turns_it_on_and_publish_beats_it(
@@ -1755,7 +1755,7 @@ def test_stage_three_switched_off_lets_stage_four_skip(
     monkeypatch.setenv("RUN_STAGE_3_GENERATE_ARTIFACTS", "false")
     assert ship_run(["--stage", "validate-artifacts"]) == 0
     stage4 = _report(work)["stages"][3]
-    assert stage4["status"] == "skipped" and "does not exist" in stage4["skip_reason"]
+    assert stage4["status"] == "skipped-by-policy" and "does not exist" in stage4["reason"]
     assert fake.calls == []
 
 

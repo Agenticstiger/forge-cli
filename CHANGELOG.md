@@ -24,6 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retention now plans a replacement, which `fluid apply` refuses without `--allow-data-loss`.
   Adding retention later on the same column is an in-place change.
 
+- **A bundle's bytes no longer depend on where it was written, and a plan is bound to those
+  bytes.** `MANIFEST.json` recorded the source contract's path relative to `--out`, so the same
+  checkout bundled to `out.tgz` and to `x/y/out.tgz` gave two different packets with one digest.
+  The checkout paths (`source.contract`, `source.overlay`) now go to `<bundle>.provenance.json`
+  beside the bundle, which names the packet's sha256 and is ignored when it names other bytes;
+  `MANIFEST.json` keeps the path-free `env` and overlay warnings. A bundle copied without the file
+  anchors relative paths at its own directory, as before when no source was recorded, and paths
+  inside an older bundle's MANIFEST are not read. `fluid bundle` prints the packet's sha256 next
+  to the merkle digest. `fluid plan` on a bundle records `packetDigest`, under `planDigest`, and
+  `fluid apply` refuses another file with the same contract (`apply_plan_digest_packet_mismatch`)
+  or a bound plan without one (`apply_plan_digest_packet_missing`): plan again. `fluid bundle
+  --attest` now names the bundle file's sha256 as the in-toto subject, in bare hex; it named the
+  merkle root with a `sha256:` prefix, which no verifier matches against the file. The merkle
+  root, the packet digest and the checkout paths are its external parameters.
+
 - **The bundle packs the dbt project a build runs, and `fluid apply` refuses a checkout whose dbt
   files changed.** A dbt build's models were read from the checkout at apply time, so a model
   edited after `fluid plan` ran unreviewed. `fluid bundle --format tgz` now packs the dbt project
@@ -52,6 +67,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (its ref pins it), a plan made from a contract file binds no dbt project, and plan and apply run
   in the same checkout path (the plan records it). The Databricks job emitter now uploads the same
   file selection.
+
+- **`fluid diff --baseline --impact` reports what a contract change reaches, for a pull
+  request.** Next to the changelog, an impact section in three parts: the consumer interface
+  (each change a reader sees, and the workspace products whose `consumes[]` read this one,
+  each marked breaking or not); governance and target (access
+  grants added or removed, a grant marked broad when it covers a domain, a public principal,
+  admin or manage, or every expose; each expose's platform, format and location; its
+  partitioning; and the policy and input changes the changelog found); and resource impact,
+  read from `--plan` (the plan.json of `fluid plan --tofu`, or `tofu show -json`), resource by
+  resource, with each replacement's reason and the paths that force it. What the report cannot
+  see reads `unknown` with the reason: no workspace to search, no plan, or a plan.json that
+  does not say what a provider replaces. A partition change is a replacement only when the
+  plan replaces that expose's table; a plan that does not name the table leaves it unknown. `--format markdown` adds an Impact section, and `--format json` and
+  `--out` add an `impact` block (`version: "1.0"`). No value from the plan is copied into it.
+  `--plan` implies `--impact`; without `--baseline` both are refused. Without the flags, the
+  version diff is unchanged.
+
+- **`fluid generate artifacts` writes each forge Spark build's `job.json`.** A new `spark` emit
+  key, on by default (the generated Jenkinsfile's `GENERATE_EMIT` default lists it), writes
+  `spark/<build id>/job.json` for every Spark build (`engine: spark` with `parameters.spark`,
+  schema 0.7.7): the runner config the compiler produces for the contract as `fluid generate
+  iac` reads it, the same bytes `fluid apply` uploads to `_fluid/spark/<product>/<build>/job.json`,
+  so the artifacts MANIFEST carries the hash of the deployed config. Two values only `tofu apply`
+  knows stay placeholders: `<account>` in the warehouse of an output that names no bucket, and the
+  compiler's MSK broker placeholder for a source named by its cluster ARN; each such build is
+  logged. What the upload refuses is refused here too: two builds whose ids name one file (equal
+  but for case or `-` and `_`), and a config holding `${`. The operator's upload policies
+  (contract SQL, hosts) stay with `fluid apply`; `fluid validate` reports them. A contract
+  without a Spark build writes nothing, and only files of this shape are cleared from
+  `<out>/spark/`. `fluid validate-artifacts` checks each `job.json` (JSON object, integer
+  `configVersion`, `build` naming its directory, `product`, `mode` and `sink` present).
 
 - **BigQuery holds the nested columns a contract declares.** A 0.7.7 column that declares its
   `element`, `fields`, or `key` and `value` was refused on BigQuery. It is now written as
@@ -149,7 +195,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validate each contract. `--format sarif` also refuses `--list-versions` and `--show-schema`,
   whose text would end the log.
 
+- **`fluid ship --release-dir DIR` publishes a run as a release once every stage it ran
+  passed.** The run stages into a new `DIR.partial-<run-id>-*` beside `DIR`. It copies the
+  bundle, the artifacts the artifacts MANIFEST lists (each checked against its digest), the
+  plan when stage 6 ran, and the reports there. It writes `release.json` last and renames the
+  directory to `DIR`. `release.json` keeps the release's `identity` apart from its
+  `provenance`. The identity holds the product id, environment, `fluidVersion`, Forge
+  version, exact emit set, bundle MANIFEST digest, archive sha256, artifacts MANIFEST digest
+  and the plan's digests, plus the apply mode when stage 7 ran (so a dry run never reads as
+  an apply); two clean runs of one checkout give the same identity and
+  `identity_digest`. The provenance holds the run id, the stage times, the CI run and the
+  report time. A run that fails, or is interrupted, publishes nothing: its reports stay in
+  `runtime/` and in the staging directory, and `ship-report.json` names the stage that
+  stopped it. A release run first removes the stage reports in `runtime/`, so only this run's
+  are published. `DIR` must not
+  exist, and stages 1-4 must run in the invocation; otherwise ship refuses with exit 2, and
+  `--explain` says why. A release run reads only local files: it opens no network connection
+  of its own.
+
 ### Changed
+
+- **`ship-report.json` is versioned: `"schema": "fluid-ship-report/2"`.** Every stage has one
+  of six statuses: `passed`, `failed`, `skipped-by-policy` (a flag, a `RUN_STAGE_*` switch or
+  a dry run turned it off), `unsupported` (nothing to act on: no policy bindings, no DAGs, no
+  scheduler), `not-run` (not selected, or after a failure) or `unknown`. It also has one
+  `reason`, which replaces `skip_reason` and `failure_reason`, and `started_at` /
+  `finished_at` in UTC. An interrupted stage is `unknown`, not `failed`: what it had done by
+  then is not known. In one-step-per-stage CI, an earlier step's report that is the run's but
+  cannot be read leaves the stages before this step `unknown`, and the run's `exit_code` is
+  not 0. A
+  version 1 record still merges, with `skipped` read as `skipped-by-policy`. The report gains
+  `written_at`, and a `release` block under `--release-dir`. JUnit counts `unknown` as a
+  failure and both kinds of skip as skipped.
 
 - **`fluid profile --bundle` writes `C` for every withheld group and cell of a histogram or a
   quantile.** In 0.32.0 a `marginalHistogram/1`, `levelHistogram/1` or `quantile/1` value that an
@@ -162,7 +239,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Withheld, by the check (CL_CONF_STATUS code): A (small count) 3.` A new line counts the
   histogram cells withheld inside published groups. Every other statistic keeps the check's code,
   and a profile 0.32.0 wrote still reads.
-
+- **`fluid profile --help` says what a published `min` or `max` leaves readable.** A `min` or
+  `max` shows that no record lies below or above it, a range of no records that no check
+  withholds (FLUX ADR 0012, amended 2026-11-18). A quantile whose value is the column's smallest
+  or largest shows the same, and under the defaults, which hold zeros disclosive, it is withheld
+  for that. The help and the output checks' documentation now say so. Nothing the profiler
+  writes changes.
 
 ### Fixed
 
@@ -189,6 +271,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `terraform_data` that records this, so that plan adds one more resource. After it, a new decimal
   column, a changed precision and a decimal made bare are planned in place, and BigQuery refuses
   at apply a change it cannot make in place.
+
+- **A Spark stream on AWS can read its own checkpoint.** The role forge creates for a Spark build
+  could read and write `<prefix>/*` and list `<prefix>/*`, but Hadoop's `getFileStatus` first asks
+  for the directory's own key (a HEAD of `_checkpoints/<product>/<build>`) and lists it by that
+  slashless name, which S3 refused with 403, so every stream failed within minutes of starting.
+  The role may now read that one key, which holds no data, and list the directory by its exact
+  name (no sibling `<build>-x` matches) as well as under it, for every prefix it is granted, on
+  every AWS runtime.
 
 - **`fluid ship` generates artifacts for a reference-only contract.** Stage 3 skipped every
   contract with a `hybrid-reference`, `reference` or `external-reference` build, even with

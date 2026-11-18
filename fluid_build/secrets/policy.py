@@ -124,7 +124,7 @@ _OBJECT_STORE_SCHEMES = frozenset({"s3", "s3a", "s3n", "gs", "gcs", "az", "azure
 _HOST_PORT = re.compile(r"(?:\[(?P<v6>[^\[\]]*)\]|(?P<name>[^\[\]:]*))(?::\d*)?")
 #: One ``{{ env.NAME }}`` placeholder, as ``build_runners.base`` renders it
 #: (``util.binding_paths.ENV_PLACEHOLDER_RE``): a name only, so it cannot hold a host.
-_ENV_PLACEHOLDER = re.compile(r"\{\{\s*env\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}")
+_ENV_PLACEHOLDER = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 
 
 @dataclass
@@ -229,7 +229,7 @@ def check_scheme(ref: SecretRef, environ: Optional[Mapping[str, str]] = None) ->
         return
     current = ",".join(sorted(schemes))
     raise _policy_error(
-        f"{ref.canonical}: the {ref.scheme}:// scheme is not enabled",
+        f"{ref.canonical} cannot resolve, because the {ref.scheme}:// scheme is not enabled",
         "The operator decides which secret stores a contract may read from.",
         f"Set it in the operator environment (a shell or CI variable, not a project .env): "
         f'{SCHEMES_ENV}="{current},{ref.scheme}".',
@@ -245,7 +245,8 @@ def check_prefix(ref: SecretRef, environ: Optional[Mapping[str, str]] = None) ->
         return
     listed = ", ".join(f"{ref.scheme}://{p}" for p in prefixes) or "none"
     raise _policy_error(
-        f"{ref.canonical}: the locator is outside the prefixes allowed for {ref.scheme}://",
+        f"{ref.canonical} cannot resolve, because its locator is outside the prefixes "
+        f"allowed for {ref.scheme}://",
         f"The operator allows {ref.scheme}:// references under: {listed}.",
         f"If this is intended, add a prefix in the operator environment: "
         f'{PREFIXES_ENV}="{ref.scheme}://<prefix>/" (comma-separated, one per entry).',
@@ -271,7 +272,8 @@ def check_stage(
     name = normalize_stage(stage)
     if name in NEVER_RESOLVE_STAGES:
         raise _policy_error(
-            f"{ref.canonical}: `fluid {name}` never fetches a secret value",
+            f"{ref.canonical} was not fetched, because `fluid {name}` never fetches a "
+            "secret value",
             f"{name} checks references against the policy and the grammar without "
             "reading them; only the stage that sends a value fetches it.",
             "Nothing to change here: the value is read when fluid apply runs.",
@@ -281,7 +283,7 @@ def check_stage(
         return
     current = ",".join(sorted(stages))
     raise _policy_error(
-        f"{ref.canonical}: the {name} stage may not fetch secret values",
+        f"{ref.canonical} was not fetched, because the {name} stage may not fetch secret values",
         f"The operator lets these stages fetch values: {current}.",
         f"If {name} must send this value, set it in the operator environment: "
         f'{STAGES_ENV}="{current},{name}".',
@@ -401,6 +403,16 @@ def _port_is_readable(port: Any) -> bool:
     return False
 
 
+def _blank(raw: Any) -> bool:
+    """``None``, or a string of whitespace only: a field that names nothing."""
+    return raw is None or (isinstance(raw, str) and not raw.strip())
+
+
+def _is_object_store_uri(text: str) -> bool:
+    """Whether ``text`` is an object-store URI, whose authority is a bucket, not a host."""
+    return "://" in text and text.partition("://")[0].strip().lower() in _OBJECT_STORE_SCHEMES
+
+
 def connection_hosts(connection: Mapping[str, Any]) -> List[Optional[str]]:
     """Every destination this connection block could send a credential to.
 
@@ -413,30 +425,41 @@ def connection_hosts(connection: Mapping[str, Any]) -> List[Optional[str]]:
     not one we can clear. An object-store URI (``s3://bucket/...``) is skipped
     rather than reported as a host: its authority is a bucket.
 
+    A ``host`` that is present but names no host (empty, ``null``, not a
+    string) is ``None`` too, not the absence of a destination: a database
+    client given no host picks one itself, and libpq reads ``PGHOST``, which a
+    project dotenv file may set (``credentials/protected_env.py`` pairs it only
+    with ``PGPASSWORD``). An unset ``{{ env.PGHOST }}`` renders to exactly that.
+    Any other destination field that is empty names nothing and is skipped.
+
     Every host of a host list counts (:func:`_authority_hosts`), and a ``port``
     that is not a port number adds a ``None`` (:func:`_port_is_readable`).
     """
     out: List[Optional[str]] = []
     for field_name in _HOST_FIELDS:
-        raw = connection.get(field_name)
-        if raw is None or not isinstance(raw, (str, bytes)) or str(raw).strip() == "":
-            continue
-        text = str(raw).strip()
-        if field_name == "host":
-            out.append(text)
-            continue
-        scheme = text.partition("://")[0].strip().lower() if "://" in text else ""
-        if scheme in _OBJECT_STORE_SCHEMES:
-            continue
-        try:
-            parsed = urlsplit(text if "//" in text else f"//{text}")
-        except ValueError:
-            out.append(None)
-            continue
-        out.extend(_authority_hosts(parsed.netloc))
+        if field_name in connection:
+            out.extend(_field_hosts(field_name, connection[field_name]))
     if not _port_is_readable(connection.get("port")):
         out.append(None)
     return out
+
+
+def _field_hosts(field_name: str, raw: Any) -> List[Optional[str]]:
+    """The destinations one present field names, as :func:`connection_hosts` counts them."""
+    if field_name == "host":
+        return [raw.strip() if isinstance(raw, str) and raw.strip() else None]
+    if _blank(raw):
+        return []
+    if not isinstance(raw, str):
+        return [None]
+    text = raw.strip()
+    if _is_object_store_uri(text):
+        return []
+    try:
+        parsed = urlsplit(text if "//" in text else f"//{text}")
+    except ValueError:
+        return [None]
+    return _authority_hosts(parsed.netloc)
 
 
 def connection_host(connection: Mapping[str, Any]) -> Optional[str]:
@@ -528,27 +551,79 @@ def _suggested_entry(ref: SecretRef, host: Optional[str]) -> str:
     return f"{ref.canonical}@{host}" if host else f"{ref.canonical}@*"
 
 
+def _names_an_object_store(connection: Mapping[str, Any]) -> bool:
+    """Whether a destination field of ``connection`` is an object-store URI."""
+    return any(
+        isinstance(connection.get(field_name), str)
+        and _is_object_store_uri(connection[field_name].strip())
+        for field_name in _HOST_FIELDS
+        if field_name != "host"
+    )
+
+
 def _destination_targets(
     connection: Optional[Mapping[str, Any]], host: Optional[str]
 ) -> Optional[List[Optional[str]]]:
-    """Every destination to judge, or ``None`` when the connection has none to judge."""
+    """Every destination to judge, or ``None`` when the connection has none to judge.
+
+    ``None`` only for a connection whose one destination is an object store (the
+    known gap :func:`refuse_unless_allowed` names). Fields that are present but
+    empty are not that: they leave the client to pick its host, so the result is
+    a destination this policy cannot clear, as for a connection naming none.
+    """
     targets: List[Optional[str]] = []
     if connection is not None:
         targets.extend(connection_hosts(connection))
-        if not targets and any(field_name in connection for field_name in _HOST_FIELDS):
+        if not targets and _names_an_object_store(connection):
             return None
     if host is not None or not targets:
         targets.append(host)
     return targets
 
 
+def _what_sent(parsed: SecretRef) -> str:
+    if parsed.scheme == "env":
+        return f"environment variable {parsed.locator!r}"
+    return f"secret {parsed.canonical}"
+
+
+#: Where an allowlist entry must be set, for the fix of every destination refusal.
+_OPERATOR_ONLY = (
+    "the OPERATOR environment (a shell or CI variable, not a project .env, which is "
+    "ignored for this setting)"
+)
+
+
+def _host_is_blank(connection: Mapping[str, Any]) -> bool:
+    """Whether ``connection`` has a ``host`` that is empty or ``null`` (not one left out)."""
+    return "host" in connection and _blank(connection["host"])
+
+
+def _blank_host_refusal(parsed: SecretRef) -> AcquisitionSecretPolicyError:
+    """The refusal for a connection whose ``host`` is present and names no host."""
+    return AcquisitionSecretPolicyError(
+        what=(
+            f"the contract would send {_what_sent(parsed)} as a credential to a host the "
+            "client picks itself, because connection.host is empty"
+        ),
+        why=(
+            "A database client given no host picks one on its own: libpq reads PGHOST, "
+            "which a project .env file may set. So this check cannot tell where the value "
+            "goes, and a destination it cannot read is not one it can clear."
+        ),
+        fix=(
+            "Name the host in connection.host. A placeholder such as {{ env.PGHOST }} "
+            "renders empty when the variable is not set where fluid apply runs, so set it "
+            f"there. To send the value to any host instead, set it in {_OPERATOR_ONLY}: "
+            f'{ALLOWLIST_ENV}="{_suggested_entry(parsed, None)}".'
+        ),
+        doc=doc_url("secrets"),
+    )
+
+
 def _destination_refusal(parsed: SecretRef, target: Optional[str]) -> AcquisitionSecretPolicyError:
     where = f"host {target!r}" if target else "a host that could not be determined"
-    what_sent = (
-        f"environment variable {parsed.locator!r}"
-        if parsed.scheme == "env"
-        else f"secret {parsed.canonical}"
-    )
+    what_sent = _what_sent(parsed)
     entry = _suggested_entry(parsed, target)
     any_host = _suggested_entry(parsed, None)
     return AcquisitionSecretPolicyError(
@@ -560,8 +635,7 @@ def _destination_refusal(parsed: SecretRef, target: Optional[str]) -> Acquisitio
             "destination that leaves this machine does."
         ),
         fix=(
-            "If this is intended, set it in the OPERATOR environment (a shell or CI "
-            f"variable, not a project .env, which is ignored for this setting): "
+            f"If this is intended, set it in {_OPERATOR_ONLY}: "
             f'{ALLOWLIST_ENV}="{entry}" for that host only, or '
             f'{ALLOWLIST_ENV}="{any_host}" for any host. A host written with a port '
             "never matches, so leave the port off."
@@ -585,9 +659,11 @@ def refuse_unless_allowed(
     ``connection`` is the preferred argument: EVERY destination it carries has
     to clear, so a decoy loopback field cannot mask a remote sibling. ``host``
     is for call sites that know their one destination directly (an
-    orchestrator URL). A connection whose every destination field names an
-    object store has no host to judge, and passes: that credential is not
-    covered here (a known gap).
+    orchestrator URL). A connection whose only destination is an object store
+    has no host to judge, and passes: that credential is not covered here (a
+    known gap). A ``host`` that is present but empty is judged as a host this
+    policy cannot read (:func:`connection_hosts`), so it passes only under an
+    entry for any host.
     """
     parsed = parse_secret_ref(ref) if isinstance(ref, str) else ref
     targets = _destination_targets(connection, host)
@@ -597,4 +673,169 @@ def refuse_unless_allowed(
     for target in targets:
         if is_loopback(target) or _grants_allow(parsed, target, grants):
             continue
+        if target is None and connection is not None and _host_is_blank(connection):
+            raise _blank_host_refusal(parsed)
         raise _destination_refusal(parsed, target)
+
+
+# ── destinations only fluid apply can read ───────────────────────────────────
+
+
+def renders_at_apply(field_name: str, value: Any) -> bool:
+    """Whether the host in ``value`` is a ``{{ env.NAME }}`` placeholder.
+
+    ``fluid apply`` renders every such placeholder from its own environment
+    before a runner asks for the secret (``build_runners/base.py``), and this
+    policy then judges the host it names. ``fluid validate`` sees the
+    placeholder, which no allowlist entry can match, so its lint leaves that
+    destination to apply. Only where the placeholder decides the host: anywhere
+    in ``host``, and in a URI's scheme or the host part of its authority, not in
+    its user name or path. The same rule as
+    ``kafka_connect.iceberg_sink_validation._rendered_at_run``; Terraform defers
+    a check on a value known only after apply the same way.
+
+    The field waits whole: a literal host beside a placeholder in one host list
+    (``h1,{{ env.H }}``) is judged by apply alone, which judges every host. An
+    object-store URI names a bucket, never a host, so it never waits, and nor
+    does text that does not read as a destination (:func:`_reads_as_destination`).
+    """
+    if not isinstance(value, str) or not _ENV_PLACEHOLDER.search(value):
+        return False
+    if field_name != "host" and _is_object_store_uri(value.strip()):
+        return False
+    scheme, host = _deciding_parts(field_name, value)
+    if not _reads_as_destination(scheme, host):
+        return False
+    return any(_ENV_PLACEHOLDER.search(part) for part in (scheme, host))
+
+
+#: A URI scheme (RFC 3986 section 3.1), once each placeholder in it stands for a word.
+_SCHEME_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*")
+#: A host list once its placeholders are taken out: names, IPv6 literals, ports, commas.
+_HOST_LIST_TEXT = re.compile(r"[A-Za-z0-9._%\-\[\]:,]*")
+
+
+def _reads_as_destination(scheme: str, host: str) -> bool:
+    """Whether ``scheme`` and ``host`` read as a URI scheme and a host list, placeholders aside.
+
+    A keyword string (``Server={{ env.H }};Database=d``) does not: apply reads
+    it whole as one host that no allowlist entry names, so the lint judges it
+    as written too, and never quotes it in a notice.
+    """
+    if scheme and not _SCHEME_TEXT.fullmatch(_ENV_PLACEHOLDER.sub("x", scheme)):
+        return False
+    return _HOST_LIST_TEXT.fullmatch(_ENV_PLACEHOLDER.sub("", host)) is not None
+
+
+def _deciding_parts(field_name: str, value: str) -> Tuple[str, str]:
+    """The scheme and the host part of a written destination, the parts that decide the host.
+
+    ``host`` is all host part. A URI's user name, password, path, query and
+    fragment never decide where it goes, so they are left out. A URI without a
+    scheme may start with ``//``, as :func:`_field_hosts` reads it.
+    """
+    scheme, authority, _rest = _authority_split(field_name, value)
+    return scheme, authority.rpartition("@")[2]
+
+
+def _authority_split(field_name: str, value: str) -> Tuple[str, str, str]:
+    """``value`` as its scheme, its authority and what follows; ``host`` is all authority."""
+    text = value.strip()
+    if field_name == "host":
+        return "", text, ""
+    scheme, sep, rest = text.partition("://")
+    if not sep:
+        scheme, rest = "", text[2:] if text.startswith("//") else text
+    authority, *after = re.split(r"(?=[/?#])", rest, maxsplit=1)
+    return scheme, authority, "".join(after)
+
+
+def _shown_destination(name: str, value: str) -> str:
+    """What the deferred notice quotes of ``value``: its :func:`_deciding_parts`, without a port.
+
+    The allowlist entry takes no port. A password written inline with an
+    unencoded ``/``, ``?`` or ``#`` ends the authority inside itself, and an
+    ``@`` then follows the authority: only the placeholders are quoted then.
+    """
+    field_name = name.rpartition(".")[2]
+    scheme, authority, rest = _authority_split(field_name, value)
+    host = authority.rpartition("@")[2]
+    if "@" in rest and "@" not in authority:
+        host = " ".join(match.group(0) for match in _ENV_PLACEHOLDER.finditer(host))
+    elif field_name != "host":
+        host = ",".join(_without_port(piece) for piece in host.split(","))
+    return f"{scheme}://{host}" if scheme else host
+
+
+def _without_port(host: str) -> str:
+    if host.startswith("[") and "]" in host:
+        return host.partition("]")[0] + "]"
+    return host.partition(":")[0]
+
+
+def allows_any_host(
+    ref: Union[SecretRef, str], environ: Optional[Mapping[str, str]] = None
+) -> bool:
+    """Whether the operator's allowlist lets ``ref`` go to any host.
+
+    ``<ref>@*``, or a bare variable name for an ``env://`` reference. A
+    destination the lint leaves to apply then needs no entry, whatever it
+    renders to, an empty host included.
+    """
+    parsed = parse_secret_ref(ref) if isinstance(ref, str) else ref
+    return _grants_allow(parsed, None, destination_grants(environ))
+
+
+def destinations_rendered_at_apply(connection: Mapping[str, Any]) -> List[str]:
+    """The destination fields of ``connection`` whose host :func:`renders_at_apply`."""
+    return [
+        field_name
+        for field_name in _HOST_FIELDS
+        if renders_at_apply(field_name, connection.get(field_name))
+    ]
+
+
+def deferred_destination_notice(
+    ref: Union[SecretRef, str], written: Mapping[str, str]
+) -> SecretPolicyError:
+    """What ``fluid validate`` says about a destination it leaves to ``fluid apply``.
+
+    ``written`` maps each such field, as the user knows it
+    (``connection.host``), to its value as written. Only the contract's own
+    text is quoted: the lint never reads the environment, so it never prints a
+    value a placeholder names. Of a URI it quotes the scheme and the host part
+    alone, without a port: not the path, nor a password written inline, even
+    one that holds an unencoded ``/``, ``?`` or ``#``.
+    """
+    parsed = parse_secret_ref(ref) if isinstance(ref, str) else ref
+    fields = ", ".join(
+        f"{name} ({_shown_destination(name, value)!r})" for name, value in written.items()
+    )
+    variables = sorted(
+        {
+            match.group(1)
+            for name, value in written.items()
+            for part in _deciding_parts(name.rpartition(".")[2], value)
+            for match in _ENV_PLACEHOLDER.finditer(part)
+        }
+    )
+    return SecretPolicyError(
+        what=(
+            f"{parsed.canonical} is sent to whatever host {fields} renders to, which only "
+            "fluid apply knows"
+        ),
+        why=(
+            "fluid apply renders {{ env.NAME }} placeholders from the environment it runs "
+            "in, then judges the host they name against the destination allowlist. This "
+            "check does not read the environment, so it leaves that host to apply; an "
+            "allowlist entry naming the placeholder itself never matches. A variable "
+            "unset there renders empty, and an empty host is refused."
+        ),
+        fix=(
+            f"Unless it renders to a loopback host, allow that host in {_OPERATOR_ONLY} "
+            f'where fluid apply runs: {ALLOWLIST_ENV}="{_suggested_entry(parsed, "<host>")}", '
+            f"with <host> the host it renders to there (with {', '.join(variables)} as set "
+            "there), without a port."
+        ),
+        doc=doc_url("secrets"),
+    )

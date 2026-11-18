@@ -332,13 +332,14 @@ class JenkinsTemplate(BasePipelineTemplate):
             ),
             toggle(
                 3,
-                "Stage 3: ODCS + ODPS-Bitol + schedule + policy fanout from the bundle. "
+                "Stage 3: ODCS + ODPS-Bitol + schedule + policy + Spark job config fanout "
+                "from the bundle. "
                 "Off for reference-only contracts.",
             ),
             _Param(
                 "GENERATE_EMIT",
                 "string",
-                "odcs,odps-bitol,schedule,policies",
+                "odcs,odps-bitol,schedule,policies,spark",
                 "Stage 3 --emit list (comma-separated). dbt excluded by design (execution artifact).",
             ),
             toggle(4, "Stage 4: re-verify MANIFEST SHA-256 + per-format schema validators."),
@@ -983,7 +984,7 @@ pipeline {{
 
         // ═════════════════════════════════════════════════════════════
         // Stage 3 — generate artifacts (structural)
-        // ODCS + ODPS-Bitol + schedule + policy fanout. dbt excluded.
+        // ODCS + ODPS-Bitol + schedule + policy + Spark job config fanout. dbt excluded.
         // Auto-skipped for hybrid-reference contracts.
         // ═════════════════════════════════════════════════════════════
         stage('3 - generate artifacts') {{

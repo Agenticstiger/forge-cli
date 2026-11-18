@@ -192,7 +192,7 @@ def test_stage_four_still_skips_when_generation_is_switched_off(
     _install(monkeypatch, FakeStages({}))
     assert _ship(["--until", "validate-artifacts", "--no-generate-artifacts"]) == 0
     stage4 = json.loads((work / "runtime/ship-report.json").read_text())["stages"][3]
-    assert stage4["status"] == "skipped" and "--no-generate-artifacts" in stage4["skip_reason"]
+    assert stage4["status"] == "skipped-by-policy" and "--no-generate-artifacts" in stage4["reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +223,7 @@ def test_a_port_without_its_odcs_fails_and_names_the_port(
     assert fake.stages == ["bundle", "validate", "artifacts"]  # stage 4 never runs
     stage3 = _stage3(work)
     assert stage3["status"] == "failed" and stage3["exit_code"] == 0
-    reason = str(stage3["failure_reason"])
+    reason = str(stage3["reason"])
     assert "port 'customers' has no ODCS" in reason and "'orders'" not in reason
     assert "required artifact missing: odcs: port 'customers'" in capsys.readouterr().out
     assert "it exited 0, but --require-artifacts was not met" in caplog.text
@@ -235,7 +235,7 @@ def test_a_missing_odps_product_fails(work: Path, monkeypatch: pytest.MonkeyPatc
     outputs = {k: v for k, v in _ALL_OUTPUTS.items() if not k.endswith(".odps.yaml")}
     _install(monkeypatch, FakeStages(outputs))
     assert _ship([*_REQUIRE, *_KEYS]) == 1
-    assert "odps-bitol: stage 3 wrote no ODPS product" in str(_stage3(work)["failure_reason"])
+    assert "odps-bitol: stage 3 wrote no ODPS product" in str(_stage3(work)["reason"])
 
 
 def test_a_file_the_manifest_does_not_list_does_not_count(
@@ -244,8 +244,8 @@ def test_a_file_the_manifest_does_not_list_does_not_count(
     listed = [k for k in _ALL_OUTPUTS if k != "odcs/product.odcs.orders.yaml"]
     _install(monkeypatch, FakeStages(dict(_ALL_OUTPUTS), listed=listed))
     assert _ship([*_REQUIRE, *_KEYS]) == 1
-    assert "port 'orders' has no ODCS" in str(_stage3(work)["failure_reason"])
-    assert "not in its MANIFEST" in str(_stage3(work)["failure_reason"])
+    assert "port 'orders' has no ODCS" in str(_stage3(work)["reason"])
+    assert "not in its MANIFEST" in str(_stage3(work)["reason"])
 
 
 def test_a_file_whose_digest_changed_does_not_count(
@@ -261,7 +261,7 @@ def test_a_file_whose_digest_changed_does_not_count(
 
     monkeypatch.setattr(ship.subprocess, "run", tampers)
     assert _ship([*_REQUIRE, *_KEYS]) == 1
-    assert "digest its MANIFEST does not list" in str(_stage3(work)["failure_reason"])
+    assert "digest its MANIFEST does not list" in str(_stage3(work)["reason"])
 
 
 def test_a_manifest_key_that_leads_out_of_dist_artifacts_does_not_count(work: Path) -> None:
@@ -291,7 +291,7 @@ def test_output_an_earlier_run_left_never_counts(
 
     monkeypatch.setattr(ship.subprocess, "run", writes_nothing)
     assert _ship([*_REQUIRE, *_KEYS]) == 1
-    assert "stage 3 wrote no dist/artifacts/MANIFEST.json" in str(_stage3(work)["failure_reason"])
+    assert "stage 3 wrote no dist/artifacts/MANIFEST.json" in str(_stage3(work)["reason"])
 
 
 def test_a_step_that_runs_stage_three_by_number_is_checked_too(
@@ -380,7 +380,7 @@ def test_every_use_of_the_flag_counts(work: Path, monkeypatch: pytest.MonkeyPatc
         )
         == 1
     )
-    assert "schedule: stage 3 wrote no schedule file" in str(_stage3(work)["failure_reason"])
+    assert "schedule: stage 3 wrote no schedule file" in str(_stage3(work)["reason"])
 
 
 def test_a_required_key_left_out_of_emit_is_refused(
