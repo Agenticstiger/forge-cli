@@ -59,6 +59,15 @@ FORM_KNOBS: Tuple[str, ...] = (
     "SCHEDULER",
     "SCHEDULE_SYNC_DRY_RUN",
 )
+#: The text a free-text input may hold, checked when the pipeline is created.
+#: Without it an input could hold ``$NAME``, which GitLab expands into the job
+#: variable it is mapped to: another variable's value, in a job log or an
+#: environment name. FLUID_ENV follows ship's environment grammar
+#: (:func:`._base.check_env_name`); PUBLISH_TARGETS is target names, space separated.
+INPUT_PATTERNS: Dict[str, str] = {
+    "FLUID_ENV": "^[A-Za-z][A-Za-z0-9_.-]{0,63}$",
+    "PUBLISH_TARGETS": "^[A-Za-z0-9_.-]*( [A-Za-z0-9_.-]+)*$",
+}
 #: Where the plan job publishes the release packet, on the default branch.
 RELEASE_DIR = "release"
 #: The job variable the plan job's rules set to :data:`RELEASE_DIR`.
@@ -184,6 +193,10 @@ class GitLabCITemplate(BasePipelineTemplate):
                 continue
             key = name.lower()
             inputs[key] = self._input(kind, default, description)
+            if name in INPUT_PATTERNS:
+                inputs[key]["regex"] = INPUT_PATTERNS[name]
+            if "options" not in inputs[key] and "regex" not in inputs[key]:
+                raise ValueError(f"input {key} takes any text: give it options or a regex")
             variables[name] = f"$[[ inputs.{key} ]]"
         if len(inputs) > MAX_INPUTS:
             raise ValueError(f"{len(inputs)} inputs: GitLab takes at most {MAX_INPUTS}")
@@ -371,15 +384,20 @@ class GitLabCITemplate(BasePipelineTemplate):
             "",
             "A merge request runs stages 1-6 (fluid-plan) and keeps runtime/ as an artifact;",
             "fluid-impact writes what the change reaches (fluid diff --impact against the",
-            "merge request's base) beside it. On the default branch, fluid-plan also",
-            "publishes the release packet in release/ (fluid ship --release-dir), only when",
-            "stages 1-4 ran and every stage passed, and fluid-apply runs stages 7-11 from",
-            "that job's artifacts when someone starts it, in the environment named after",
-            f"FLUID_ENV (default {env_default}). Protect that environment (Settings > CI/CD >",
-            "Protected environments) to choose who may. A merge request and any other ref",
-            "plan only. The default branch is the project's own ($CI_DEFAULT_BRANCH),",
-            "whatever --default-branch said. A fluid-plan that fails keeps its reports and",
-            "drops its bundle, plan and artifacts.",
+            "merge request's base) beside it. Its resource section reads unknown, with the",
+            "reason, while stage 6 saves no OpenTofu plan.",
+            "",
+            "On the default branch, fluid-plan also publishes the release packet in",
+            "release/ (fluid ship --release-dir) once every stage passed, and fluid-apply",
+            "runs stages 7-11 from that job's artifacts when someone starts it, in the",
+            f"environment named after FLUID_ENV (default {env_default}). Protect that",
+            "environment (Settings > CI/CD > Protected environments) to choose who may.",
+            "There, stages 1-4 must run and release/ must not be in the repository: ship",
+            "refuses a packet otherwise, and the plan fails with its reason (no packet, no",
+            "apply). A merge request and any other ref plan only, without a packet. The",
+            "default branch is the project's own ($CI_DEFAULT_BRANCH), whatever",
+            "--default-branch said. A fluid-plan that fails keeps its reports and drops its",
+            "bundle, plan and artifacts.",
             "",
             "The Run pipeline form is the spec:inputs below (GitLab 17.11 or later). An",
             "input sets the job variable of the same name in upper case; a project CI/CD",

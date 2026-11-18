@@ -19,11 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     that a project CI/CD variable sets, and the form needs no pipeline variables.
   - **Release packet:** on the default branch, `fluid-plan` runs `fluid ship --stage 1-6
     --release-dir release`. `fluid-apply` downloads that job's artifacts (`needs` and
-    `dependencies`) and does not start without `release/release.json`.
+    `dependencies`) and does not start without `release/release.json`. On the default
+    branch, stages 1-4 must run and `release/` must not be in the repository: otherwise ship
+    refuses the packet and the plan fails with its reason.
   - **Merge requests:** a merge request plans without a packet and never gets an apply job,
     and neither does any other ref. `fluid-impact` publishes `fluid diff --baseline --impact`
-    of the contract against the merge request's base, with the plan, as Markdown and JSON
-    (`expose_as: fluid impact`), beside ship's JUnit report.
+    of the contract against the merge request's base as Markdown and JSON (`expose_as: fluid
+    impact`), beside ship's JUnit report. Its resource section reads `unknown`, with the reason,
+    while ship's stage 6 saves no OpenTofu plan.
+  - **Free-text inputs:** `fluid_env` follows ship's environment grammar and `publish_targets`
+    takes target names only, so an input cannot name another variable for GitLab to expand.
   - **Failed plans:** a `fluid-plan` that fails keeps its reports and drops its bundle, plan,
     OpenTofu plan files and artifacts before they are uploaded, so nothing a failed run wrote
     reads as deployable.

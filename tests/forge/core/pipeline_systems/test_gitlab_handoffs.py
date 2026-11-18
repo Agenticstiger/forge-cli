@@ -268,3 +268,73 @@ def test_the_impact_job_reads_the_base_with_git(tmp_path: Path) -> None:
         check=True,
     ).stdout
     assert out == "id: old\n"
+
+
+# ── what an input can hold ─────────────────────────────────────────────────────
+
+
+def test_every_input_is_closed_by_options_or_a_regex() -> None:
+    for key, spec in _documents()[0]["spec"]["inputs"].items():
+        assert "options" in spec or "regex" in spec, key
+
+
+@pytest.mark.parametrize(
+    "key, good, bad",
+    [
+        ("fluid_env", ["dev", "prod", "eu.prod-2"], ["$CI_JOB_TOKEN", "../prod", "", "2prod"]),
+        (
+            "publish_targets",
+            ["datamesh-manager", "datahub openmetadata", ""],
+            ["$SECRET", "a;b", "a  b", "x\ny"],
+        ),
+    ],
+)
+def test_a_free_text_input_cannot_name_another_variable(
+    key: str, good: List[str], bad: List[str]
+) -> None:
+    pattern = _documents()[0]["spec"]["inputs"][key]["regex"]
+    for value in good:
+        assert re.search(pattern, value), (key, value)
+    for value in bad:
+        assert not re.search(pattern, value), (key, value)
+
+
+# ── what the impact job writes ─────────────────────────────────────────────────
+
+
+def test_the_impact_command_runs_and_names_why_the_resources_are_unknown(tmp_path: Path) -> None:
+    """The job's own lines, run against ship's plan.json (fluid actions, no OpenTofu
+    plan): the report is written, and its resource section says why it is unknown."""
+    import sys
+
+    import fluid_build
+
+    contract = Path(__file__).parents[3] / "fixtures" / "impact" / "base.fluid.yaml"
+    work, base, bin_dir = tmp_path / "work", tmp_path / "base", tmp_path / "bin"
+    for d in (work / "runtime", base, bin_dir):
+        d.mkdir(parents=True)
+    (work / "contract.fluid.yaml").write_text(contract.read_text("utf-8"), "utf-8")
+    (base / "contract.fluid.yaml").write_text(contract.read_text("utf-8"), "utf-8")
+    (work / "runtime" / "plan.json").write_text(json.dumps({"actions": []}), "utf-8")
+    shim = bin_dir / "fluid"
+    shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" -m fluid_build.cli "$@"\n', "utf-8")
+    shim.chmod(0o700)
+
+    lines = _documents()[1]["fluid-impact"]["script"]
+    run = [lines[0], *lines[-2:]]  # mkdir, the plan switch and fluid diff
+    subprocess.run(
+        ["sh", "-ec", f'base="{base}"\n' + "\n".join(run)],
+        cwd=work,
+        env={
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "PYTHONPATH": str(Path(fluid_build.__file__).parents[1]),
+            "HOME": str(tmp_path),
+        },
+        check=True,
+        capture_output=True,
+    )
+
+    document = json.loads((work / "runtime" / "impact" / "impact.json").read_text("utf-8"))
+    resources = document["impact"]["resource_impact"]
+    assert resources["status"] == "unknown" and "fluid plan --tofu" in resources["reason"]
+    assert "## Impact" in (work / "runtime" / "impact" / "impact.md").read_text("utf-8")
