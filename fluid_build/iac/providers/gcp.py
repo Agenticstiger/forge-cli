@@ -61,9 +61,9 @@ from . import gcp_governance as _gov
 
 # FLUID column type → BigQuery type, keyed on the lower-cased base name
 # (``varchar(255)`` is ``varchar``). Every entry is a type a BigQuery table schema
-# takes; ``_bq_outcome`` classifies the rest. A ``number`` or ``decimal`` is NUMERIC
-# whatever precision it declares (precision and scale are not emitted yet), and
-# ``_bq_outcome`` warns when the declared range is wider than a NUMERIC holds.
+# takes; ``_bq_outcome`` classifies the rest. A ``decimal(p,s)`` is a NUMERIC(P,S), or a
+# BIGNUMERIC(P,S) when a NUMERIC cannot hold its range (:func:`_bq_decimal`); a bare
+# ``number`` or ``decimal`` is a bare NUMERIC.
 _BQ_TYPES = column_types.expand(
     {
         "STRING": "string, str, text, varchar, varchar2, nvarchar, char, nchar, character, clob, "
@@ -85,10 +85,13 @@ _BQ_TYPES = column_types.expand(
     }
 )
 
-#: What a BigQuery NUMERIC holds, and the types that take a precision and scale: the
-#: scale is not emitted, so a declared range beyond it overflows at load.
+#: What BigQuery's parameterised decimals hold (its "Parameterized data types"):
+#: NUMERIC(P,S) takes 0 <= S <= 9 and max(1, S) <= P <= S + 29, BIGNUMERIC(P,S) takes
+#: 0 <= S <= 38 and max(1, S) <= P <= S + 38. A bare NUMERIC is NUMERIC(38,9).
 _BQ_NUMERIC_INTEGER_DIGITS = 29
 _BQ_NUMERIC_SCALE = 9
+_BQ_BIGNUMERIC_INTEGER_DIGITS = 38
+_BQ_BIGNUMERIC_SCALE = 38
 _BQ_DECIMAL_FAMILY = frozenset({"decimal", "numeric", "dec", "number"})
 _BQ_DECIMAL_ARGS_RE = re.compile(r"^\((\d+)(?:,(\d+))?\)$", re.ASCII)
 
@@ -177,22 +180,67 @@ def _bq_outcome(raw: Any) -> column_types.TypeOutcome:
             "Declare a FLUID column type such as string, integer, bigint, numeric, double, "
             "boolean, date, timestamp or json.",
         )
-    if base in _BQ_DECIMAL_FAMILY and rest:
+    if (base in _BQ_DECIMAL_FAMILY or base == "bignumeric") and rest:
+        decimal = _bq_decimal(raw)
+        if decimal is not None:
+            return column_types.exact(decimal[0])
         match = _BQ_DECIMAL_ARGS_RE.match(rest)
         if match is not None:
             precision, scale = int(match.group(1)), int(match.group(2) or 0)
-            if scale > _BQ_NUMERIC_SCALE or precision - scale > _BQ_NUMERIC_INTEGER_DIGITS:
-                return column_types.lossy(
-                    hit,
-                    f"whose range a BigQuery NUMERIC ({_BQ_NUMERIC_INTEGER_DIGITS} integer and "
-                    f"{_BQ_NUMERIC_SCALE} fractional digits) cannot hold",
-                    "Declare bignumeric if the values need that range.",
+            if precision < max(1, scale):
+                return column_types.refused(
+                    f"whose precision and scale {rest} are not a decimal's",
+                    "Declare decimal(p,s) with p of at least 1 and s no larger than p.",
                 )
+            return column_types.lossy(
+                "BIGNUMERIC",
+                f"whose range a BigQuery BIGNUMERIC ({_BQ_BIGNUMERIC_INTEGER_DIGITS} integer and "
+                f"{_BQ_BIGNUMERIC_SCALE} fractional digits) cannot hold",
+                "Declare a decimal within that range, or string if the values need more.",
+            )
     if base in _BQ_LOSSY:
         return column_types.lossy(
             hit, _BQ_LOSSY[base], "Declare geography if the coordinates are on the sphere."
         )
     return column_types.exact(hit)
+
+
+def _bq_decimal(raw: Any) -> Optional[Tuple[str, int, Optional[int]]]:
+    """``(type, precision, scale)`` of a decimal BigQuery holds as declared: a NUMERIC(P,S)
+    when its range fits one, else a BIGNUMERIC(P,S). ``None`` for a bare decimal, for a
+    range no BigQuery decimal holds, and for any other type. ``scale`` is ``None`` when
+    the declaration names none, and BigQuery's scale is then 0."""
+    base, rest = column_types.split_type(raw)
+    if not (base in _BQ_DECIMAL_FAMILY or base == "bignumeric") or not rest:
+        return None
+    match = _BQ_DECIMAL_ARGS_RE.fullmatch(rest)
+    if match is None:
+        return None
+    precision = int(match.group(1))
+    scale = None if match.group(2) is None else int(match.group(2))
+    digits = scale or 0
+    if precision < max(1, digits):
+        return None
+    if (
+        base != "bignumeric"
+        and digits <= _BQ_NUMERIC_SCALE
+        and precision <= digits + _BQ_NUMERIC_INTEGER_DIGITS
+    ):
+        return "NUMERIC", precision, scale
+    if digits <= _BQ_BIGNUMERIC_SCALE and precision <= digits + _BQ_BIGNUMERIC_INTEGER_DIGITS:
+        return "BIGNUMERIC", precision, scale
+    return None
+
+
+def _bq_parameters(raw: Any) -> Dict[str, str]:
+    """The schema field's ``precision`` and ``scale`` for a decimal BigQuery holds as
+    declared, as the strings the API returns (int64 in Google's JSON). A scale of 0 is
+    left out, as the API leaves it out when it reads the table back."""
+    decimal = _bq_decimal(raw)
+    if decimal is None:
+        return {}
+    _kind, precision, scale = decimal
+    return {"precision": str(precision), **({"scale": str(scale)} if scale else {})}
 
 
 def _bq_type(raw: Any) -> str:
@@ -377,6 +425,7 @@ class _NestedFields:
             "type": outcome.target,
             "mode": _bq_mode(shape.required),
             "description": _bq_text(spec.get("description", "")),
+            **_bq_parameters(declared),
         }
 
     def _may_be_null(self, shape: Any, path: str) -> None:
@@ -411,6 +460,7 @@ def _bq_field(column: Mapping[str, Any]) -> Dict[str, Any]:
         "type": _bq_type(column.get("type")),
         "mode": _bq_mode(column.get("required")),
         "description": _bq_text(column.get("description", "")),
+        **_bq_parameters(column.get("type")),
     }
 
 
@@ -1514,6 +1564,8 @@ def _emit_bigquery(
         body["encryption_configuration"] = {"kms_key_name": kms_key}
         body["depends_on"] = list(kms_deps)
     _lay_out_table(resources, body, tbl_name, gov)
+    if not is_view:
+        _decimal_parameters_marker(resources, body, cid, schema)
     resources.setdefault("google_bigquery_table", {})[tbl_name] = body
     _emit_row_policies(resources, gov.row_policies, ds_ref, tbl_name, loc.get("project"))
 
@@ -1579,11 +1631,59 @@ def _partition_table(
     if field:
         partitioning["field"] = field
     body["time_partitioning"] = partitioning
-    trigger = safe_ident(f"{tbl_name}_partitioning")
-    resources.setdefault("terraform_data", {})[trigger] = {
-        "input": _gov.partition_trigger_input(field)
+    _replace_when(
+        resources, body, safe_ident(f"{tbl_name}_partitioning"), _gov.partition_trigger_input(field)
+    )
+
+
+#: The value of the contract's decimal-parameters marker (:func:`_decimal_parameters_marker`).
+#: It never changes: what the marker records is that it exists.
+_DECIMAL_PARAMETERS_MARKER_INPUT = {"decimals": "parameterised"}
+
+
+def _decimal_parameters_marker(
+    resources: Dict[str, Any], body: Dict[str, Any], cid: str, schema: List[Any]
+) -> None:
+    """The contract's marker that its tables are written with decimal parameters.
+
+    Until decimals carried a precision and scale, each one was written as a bare
+    NUMERIC, which is NUMERIC(38,9). BigQuery cannot give an existing NUMERIC column a
+    narrower one, and the provider plans that change in place, so the plan would pass
+    the data-loss gate and the apply would fail. The marker is one ``terraform_data``
+    per contract with a table; a table that declares a parameterised decimal names it
+    in ``replace_triggered_by``. Created in a state written before it, the marker plans
+    the replacement of those tables, once, which the gate refuses without
+    ``--allow-data-loss``. Its value never changes, and a contract without decimals
+    has it too, so the first decimal column of a live table does not create it: once
+    applied, a new decimal column, a changed precision and a decimal made bare are
+    in-place updates, and BigQuery refuses at apply what it cannot change in place.
+    """
+    marker = safe_ident(f"{cid}_decimal_parameters")
+    resources.setdefault("terraform_data", {})[marker] = {
+        "input": dict(_DECIMAL_PARAMETERS_MARKER_INPUT)
     }
-    body["lifecycle"] = {"replace_triggered_by": [f"terraform_data.{trigger}"]}
+    if any(_has_decimal_parameters(field) for field in _bq_fields(schema)):
+        body.setdefault("lifecycle", {}).setdefault("replace_triggered_by", []).append(
+            f"terraform_data.{marker}"
+        )
+
+
+def _has_decimal_parameters(field: Mapping[str, Any]) -> bool:
+    return "precision" in field or any(
+        _has_decimal_parameters(sub) for sub in field.get("fields") or []
+    )
+
+
+def _replace_when(
+    resources: Dict[str, Any], body: Dict[str, Any], trigger: str, value: Mapping[str, str]
+) -> None:
+    """A ``terraform_data`` holding ``value`` as the table's ``replace_triggered_by``: the
+    OpenTofu documentation's pattern for a plain value. Created for a table that exists,
+    or changed, it plans the table's replacement."""
+    resources.setdefault("terraform_data", {})[trigger] = {"input": dict(value)}
+    body.setdefault("lifecycle", {}).setdefault("replace_triggered_by", []).append(
+        f"terraform_data.{trigger}"
+    )
 
 
 #: ``binding.format`` values marking an Iceberg-table expose. Matches the
