@@ -1594,6 +1594,17 @@ def _packaging_summary_lines(plan: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def _dbt_project_lines(plan: Dict[str, Any]) -> List[str]:
+    """One line per dbt project the plan binds: ``fluid apply`` refuses a checkout whose
+    files differ from these."""
+    lines = []
+    for build_id, bound in sorted((plan.get("dbtProjects") or {}).items()):
+        bound = bound if isinstance(bound, dict) else {}
+        files = bound.get("files") or {}
+        lines.append(f"dbt project bound: {build_id} ({len(files)} files, {bound.get('digest')})")
+    return lines
+
+
 def _display_plan_simple(plan: Dict[str, Any], logger: logging.Logger, output_path: str = None):
     """Display plan with simple text output."""
     version = plan.get("contract", {}).get("version", plan.get("format_version", "Unknown"))
@@ -1612,6 +1623,12 @@ def _display_plan_simple(plan: Dict[str, Any], logger: logging.Logger, output_pa
     if packaging_lines:
         for line in packaging_lines:
             cprint(line)
+        cprint()
+
+    dbt_lines = _dbt_project_lines(plan)
+    for line in dbt_lines:
+        cprint_literal(line)
+    if dbt_lines:
         cprint()
 
     if total > 0:
