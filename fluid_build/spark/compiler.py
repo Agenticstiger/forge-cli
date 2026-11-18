@@ -517,6 +517,31 @@ def _contract_sql(sql: Any, bid: str) -> str:
     return sql
 
 
+def _check_local_source(local: bool, kafka: Mapping[str, Any], where: str) -> None:
+    if local and kafka["mskClusterArn"] is not None:
+        raise ValueError(
+            f"{where}: parameters.spark.source: a local run reads bootstrapServers; "
+            "nothing resolves an MSK cluster's brokers for it (keep mskClusterArn in the "
+            "AWS environment's overlay)"
+        )
+
+
+def _checkpoint(declared: Any, bucket: Optional[str], product: str, bid: str, where: str) -> str:
+    """The stream's checkpoint, ending in ``/``. The default is built from the warehouse
+    bucket, which may be the IaC emitter's account token; only a declared checkpoint is
+    the contract's text to check."""
+    if declared is None:
+        if bucket is None:
+            raise ValueError(
+                f"{where}.checkpoint: a local stream keeps its checkpoint in the S3 store its "
+                "output names; set the output's location.bucket or properties.stream.checkpoint"
+            )
+        return f"s3://{bucket}/_checkpoints/{product}/{bid}/"
+    if not isinstance(declared, str) or not _CHECKPOINT.fullmatch(declared):
+        raise ValueError(f"{where}.checkpoint: expected an s3:// URI with a prefix")
+    return declared.rstrip("/") + "/"
+
+
 def _check_catalog(local: bool, binding: Mapping[str, Any], family: str, where: str) -> None:
     """Refuse an output the runtime cannot write: runtime local writes a table in an Iceberg
     REST catalog on platform local, an AWS runtime a Glue-catalog table."""
@@ -682,12 +707,7 @@ def compile_job_config(
         records = {k: v for k, v in stream_spec.items() if k not in _ENGINE_KEYS}
         stream = parse_stream(records, swhere)
         kafka = _kafka(cfg, where)
-        if local and kafka["mskClusterArn"] is not None:
-            raise ValueError(
-                f"{where}: parameters.spark.source: a local run reads bootstrapServers; "
-                "nothing resolves an MSK cluster's brokers for it (keep mskClusterArn in the "
-                "AWS environment's overlay)"
-            )
+        _check_local_source(local, kafka, where)
         registry = _registry(
             stream_spec.get("registry"), stream, swhere, environ, granted=host_gate
         )
@@ -711,22 +731,10 @@ def compile_job_config(
             **_decoders(stream, registry),
         }
         source_sql = spark_source_select(stream, swhere)
-        # The default is built from the warehouse bucket, which may be the IaC emitter's
-        # account token; only a declared checkpoint is the contract's text to check.
-        checkpoint = stream_spec.get("checkpoint")
-        if checkpoint is None and bucket is None:
-            raise ValueError(
-                f"{swhere}.checkpoint: a local stream keeps its checkpoint in the S3 store its "
-                "output names; set the output's location.bucket or properties.stream.checkpoint"
-            )
-        if checkpoint is None:
-            checkpoint = f"s3://{bucket}/_checkpoints/{product}/{bid}/"
-        elif not isinstance(checkpoint, str) or not _CHECKPOINT.fullmatch(checkpoint):
-            raise ValueError(f"{swhere}.checkpoint: expected an s3:// URI with a prefix")
         streaming = {
             "trigger": _trigger(stream_spec.get("trigger"), expose, swhere),
             "watermark": _watermark(stream_spec.get("watermark"), stream, swhere),
-            "checkpoint": checkpoint.rstrip("/") + "/",
+            "checkpoint": _checkpoint(stream_spec.get("checkpoint"), bucket, product, bid, swhere),
         }
         if sql is None:
             select = compile_select(

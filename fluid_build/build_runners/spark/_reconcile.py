@@ -180,6 +180,15 @@ def _failed_again(run: DesiredRun, last: Optional[RunInfo]) -> Optional[RunInfo]
     return last if last.config_hash == run.config_hash else None
 
 
+def _lost_note(last: Optional[RunInfo]) -> str:
+    if last is None or not last.lost:
+        return ""
+    return (
+        f"run {last.run_id} stopped without recording how it ended (its machine restarted, "
+        "or its processes were killed), so the same config started again"
+    )
+
+
 def _reconcile_one(
     run: DesiredRun,
     adapter: Adapter,
@@ -249,11 +258,7 @@ def _reconcile_one(
     started = clock.until(lambda: adapter.get(run_id), lambda i: i.state != PENDING, budget)
     out.action = "restarted" if out.cancelled else "started"
     out.run_id, out.state = run_id, started.state
-    if last is not None and last.lost and not active:
-        out.message = (
-            f"run {last.run_id} stopped without recording how it ended (its machine "
-            "restarted, or its processes were killed), so the same config started again"
-        )
+    out.message = _lost_note(None if active else last)
     if started.state in TERMINAL:
         # A long-running job that ends at once failed, whatever it reports.
         out.error = True
