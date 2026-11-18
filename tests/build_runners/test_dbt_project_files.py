@@ -374,6 +374,19 @@ class TestCollectBundleProjects:
         contract = {"builds": [{**DBT, "repository": repository}]}
         assert "is not a usable path" in _collect_refusal(contract, tmp_path)
 
+    def test_a_name_too_long_is_unusable_where_the_lookup_does_not_raise(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Python 3.14's Path.is_file returns False for a name too long, so the runner's
+        # lookup reports no project where earlier versions raised.
+        from fluid_build.build_runners.dbt import runner
+
+        monkeypatch.setattr(runner, "resolve_dbt_project_path", lambda *_args, **_kw: None)
+        contract = {"builds": [{**DBT, "repository": "a" * 5000}]}
+        assert "is not a usable path (OSError)" in _collect_refusal(contract, tmp_path)
+        missing = {"builds": [{**DBT, "repository": "absent"}]}
+        assert "no dbt_project.yml at" in _collect_refusal(missing, tmp_path)
+
     def test_two_builds_with_one_id(self, tmp_path: Path) -> None:
         _project(tmp_path)
         contract = {"builds": [{**DBT, "id": "a"}, {**DBT, "id": "a"}]}

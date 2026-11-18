@@ -462,6 +462,14 @@ def binds_dbt_project(build: Mapping[str, Any]) -> bool:
     return not ("://" in repository or repository.strip().startswith("git@"))
 
 
+def _stat_unless_missing(path: Path) -> None:
+    """``os.stat(path)``: nothing when no file is there, the error when it cannot be looked up."""
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+
+
 def collect_bundle_projects(
     contract: Mapping[str, Any], contract_path: Path
 ) -> Dict[str, Dict[str, bytes]]:
@@ -505,6 +513,11 @@ def collect_bundle_projects(
             )
         try:
             project = resolve_dbt_project_path(contract_path, dict(build))
+            if project is None:
+                # From Python 3.14 ``Path.is_file`` returns False for a name the file
+                # system refuses (too long, a loop) instead of raising: look it up, so
+                # such a path reads the same on every version.
+                _stat_unless_missing(contract_path.parent / repository)
         except (OSError, ValueError) as exc:
             raise DbtProjectFilesError(
                 f"build {build_id!r}: repository {repository[:80]!r} is not a usable path "
