@@ -169,6 +169,8 @@ def _check_row(finding, resolve: bool) -> dict:
     }
     if finding.warning is not None:
         row["warning"] = f"{finding.warning.what}. {finding.warning.fix}"
+    if finding.deferred is not None:
+        row["deferred"] = f"{finding.deferred.what}. {finding.deferred.fix}"
     if finding.error is not None:
         row.update(
             code=finding.error.code,
@@ -205,6 +207,8 @@ def _print_check_row(row: dict) -> None:
         cprint_literal(f"   {verdict}: {row['detail']}")
     if "warning" in row:
         cprint_literal(f"   ⚠️  {row['warning']}")
+    if "deferred" in row:
+        cprint_literal(f"   ⚠️  {row['deferred']}")
 
 
 def _do_check(args, logger: logging.Logger) -> int:
