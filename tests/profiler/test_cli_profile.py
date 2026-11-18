@@ -285,3 +285,70 @@ def test_profile_help_names_the_mean_and_its_grid(capsys):
     text = " ".join(capsys.readouterr().out.split())
     assert "mean/1" in text and "--fractional-bits" in text
     assert "encoding.fractionalBits" in text
+
+
+# -- --bundle ---------------------------------------------------------------------
+
+SIMULATION = """\
+kind: Simulation
+id: sim-orders
+extensions:
+  com.agentics.flux/1:
+    emits:
+      orders:
+        fidelity: {encoding: {fractionalBits: 8}}
+"""
+
+
+def test_a_missing_bundle_directory_is_refused_before_anything_is_read(workspace, registry, capsys):
+    rc = main(["profile", "contract.fluid.yaml", "--source", "x.ndjson", "--bundle", "nope"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "nope" in out
+    assert not (workspace / "orders.profile.json").exists()
+
+
+def test_a_bundle_that_is_a_file_is_refused(workspace, registry, capsys):
+    rc = main(
+        [
+            "profile",
+            "contract.fluid.yaml",
+            "--source",
+            "x.ndjson",
+            "--bundle",
+            "contract.fluid.yaml",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "profile_bundle_not_a_directory" in out
+
+
+def test_a_bundle_without_a_simulation_is_refused(workspace, registry, capsys):
+    (workspace / "bundle").mkdir()
+    rc = main(["profile", "contract.fluid.yaml", "--source", "orders.ndjson", "--bundle", "bundle"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "profile_bundle_no_simulation" in out
+    assert not (workspace / "orders.profile.json").exists()
+
+
+def test_a_simulation_without_a_block_for_the_expose_is_refused(workspace, registry, capsys):
+    (workspace / "bundle").mkdir()
+    (workspace / "bundle" / "sim.flux.yml").write_text(
+        SIMULATION.replace("orders:", "other:"), encoding="utf-8"
+    )
+    rc = main(["profile", "contract.fluid.yaml", "--source", "orders.ndjson", "--bundle", "bundle"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "profile_bundle_no_block" in out and "'orders'" in out
+    assert not (workspace / "orders.profile.json").exists()
+
+
+def test_the_help_names_the_bundle(capsys):
+    try:
+        main(["profile", "--help"])
+    except SystemExit:
+        pass
+    text = " ".join(capsys.readouterr().out.replace("#", " ").split())
+    assert "--bundle DIR" in text and "answer a Simulation's fidelity block" in text

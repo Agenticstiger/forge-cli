@@ -217,7 +217,7 @@ def test_a_number_column_carries_mean_1_on_the_documents_grid(tmp_path):
     ]
     # A timestamp or a category gets no statistic.
     assert [name for name, column in columns.items() if "statistics" in column] == ["amount"]
-    assert result.statistics == (("amount", "mean/1"),)
+    assert result.statistics == (("amount", "mean/1", None),)
     assert result.fractional_bits == 16
 
 

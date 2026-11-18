@@ -19,7 +19,7 @@ import argparse
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 COMMAND = "profile"
 
@@ -37,12 +37,22 @@ checks are ACRO 1.1.0's defaults, named "acro-default" in the document:
   - a mean is published only when the column's count and sum are.
 A withheld value keeps its SDMX CL_CONF_STATUS code and no value: A (a small
 count), C (a sum over at most two values), O or T (dominated by one or two
-records) or M (concentration).
+records), M (concentration) or D (secondary suppression).
 
 For each number column the document also holds mean/1, the statistic the FLUX
 fidelity check compares a mean property with: the number of values and their
 sum on a grid of 2^-N steps. N is --fractional-bits, 16 unless given, and the
 fidelity block's encoding.fractionalBits must be the same.
+
+With --bundle DIR the profile answers the Simulation's fidelity block instead:
+it reads the block of DIR's one Simulation (*.flux.yml) for the expose and
+writes the statistic each declared property is compared with (a mean, a
+histogram over its bins or levels, a support, a quantile; per group where the
+property has a groupBy), each group checked like the rest. The grid is the
+block's. A group of a mean or a support that is withheld also withholds its
+siblings, under D (secondary suppression), so it cannot be recovered from the
+column's published total. A correlation is not answered: its moments need the
+exact record count, which the output checks round.
 
 These are output-checking conventions only. No privacy or anonymity guarantee
 is made or implied: read the document before you share it.
@@ -63,6 +73,11 @@ fluid profile contract.fluid.yaml --expose orders \\
 # privacy or anonymity guarantee. Pin the printed digest in the FLUX Simulation.
 # Each number column also gets mean/1, which FLUX compares a mean property with, on the
 # grid --fractional-bits names (16 unless given): the fidelity block must declare it.
+
+# answer a Simulation's fidelity block: the bundle directory `fluxsim init` wrote holds
+# the Simulation and the contract; the grid is the block's, so leave --fractional-bits out
+fluid profile payment-bundle/payment.fluid.yml --expose payment --source ./slice.ndjson \\
+    --bundle payment-bundle --out payment.profile.json
 """
 
 
@@ -104,12 +119,21 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
     p.add_argument(
         "--fractional-bits",
         type=_fractional_bits,
-        default=_DEFAULT_FRACTIONAL_BITS,
+        default=None,
         metavar="N",
         help=(
             "the grid mean/1 is formed on, 2^-N steps: the fidelity block's "
-            f"encoding.fractionalBits (default: {_DEFAULT_FRACTIONAL_BITS}, FLUX's default; "
-            f"0 to {_MAX_FRACTIONAL_BITS})"
+            f"encoding.fractionalBits (default: {_DEFAULT_FRACTIONAL_BITS}, FLUX's default, "
+            f"or the block's with --bundle; 0 to {_MAX_FRACTIONAL_BITS})"
+        ),
+    )
+    p.add_argument(
+        "--bundle",
+        metavar="DIR",
+        help=(
+            "a FLUX bundle directory: answer the fidelity block its one Simulation "
+            "(*.flux.yml) declares for the expose, with the statistic each property "
+            "is compared with"
         ),
     )
     p.add_argument("--env", help="environment overlay to apply to the contract first")
@@ -148,7 +172,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     from fluid_build._console import cprint_literal
     from fluid_build._contract_loader import load_contract_with_overlay
     from fluid_build.cli.security import validate_cli_path
-    from fluid_build.profiler import _stats, runner, sources
+    from fluid_build.profiler import _stats, bundle, runner, sources
     from fluid_build.profiler.document import DocumentError
 
     try:
@@ -164,10 +188,12 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         ) from None
 
     contract_path = validate_cli_path(args.contract, mode="read", file_type="contract")
+    bundle_dir = _bundle_dir(args.bundle)
     contract = load_contract_with_overlay(str(contract_path), args.env, logger)
     try:
         expose_id = runner.resolve_expose_id(contract, args.expose_id)
         out = _out_path(args.out, expose_id, args.source)
+        block = bundle.read_bundle_block(bundle_dir, expose_id) if bundle_dir else None
         result = runner.profile_expose(
             contract,
             expose_id,
@@ -176,12 +202,16 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             cwd=Path.cwd(),
             backend=backend,
             fractional_bits=args.fractional_bits,
+            bundle=block,
         )
         _write(out, result.canonical)
     except (
         runner.ProfileError,
+        bundle.BundleError,
         sources.SourceError,
         _stats.ReadRefused,
+        _stats.MeasureRefused,
+        _stats.StatisticsUnavailable,
         DocumentError,
         _stats.DocumentRefused,
     ) as exc:
@@ -190,12 +220,43 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     return 0
 
 
+def _bundle_dir(given: Optional[str]) -> Optional[Path]:
+    """``--bundle``, checked as the contract is, and a directory that exists."""
+    from fluid_build.cli.security import validate_cli_path
+
+    if not given:
+        return None
+    path = validate_cli_path(given, mode="read", file_type="bundle")
+    if not path.is_dir():
+        raise _refusal(
+            "profile_bundle_not_a_directory",
+            f"{path.name} is not a directory",
+            {"next": "name the bundle directory `fluxsim init` wrote"},
+        ) from None
+    return path
+
+
 def _as_refusal(exc: Exception, source: str) -> Any:
     """The :class:`CLIError` for a refusal from the profiler; nothing has been written."""
-    from fluid_build.profiler import _stats, runner, sources
+    from fluid_build.profiler import _stats, bundle, runner, sources
 
-    if isinstance(exc, runner.ProfileError):
+    if isinstance(exc, (runner.ProfileError, bundle.BundleError)):
         return _refusal(exc.event, str(exc), exc.context)
+    if isinstance(exc, _stats.StatisticsUnavailable):
+        return _refusal(
+            "profile_statistics_unavailable",
+            str(exc),
+            {"read": "nothing: no record was read", "next": _stats.FLUX_STATS_INSTALL_COMMAND},
+        )
+    if isinstance(exc, _stats.MeasureRefused):
+        return _refusal(
+            "profile_bundle_record_refused",
+            str(exc),
+            {
+                "written": "nothing",
+                "next": "the data and the fidelity block disagree: fix either, then profile",
+            },
+        )
     if isinstance(exc, sources.SourceError):
         return _refusal(
             "profile_source_unreadable",
@@ -307,6 +368,7 @@ def _write(out: Path, data: bytes) -> None:
 _CODE_MEANING = {
     "A": "small count",
     "C": "a sum over at most two values",
+    "D": "secondary suppression",
     "M": "concentration",
     "O": "dominated by one record",
     "T": "dominated by two records",
@@ -331,18 +393,20 @@ def _report(say: Any, result: Any, out: Path) -> None:
             for code, count in withheld.items()
         )
         say(f"Withheld, by CL_CONF_STATUS code: {codes}.")
-    by_definition: Dict[str, List[str]] = {}
-    for column, identifier in result.statistics:
-        by_definition.setdefault(identifier, []).append(repr(column))
-    if by_definition:
-        published = "; ".join(
-            f"{identifier} of {', '.join(columns)}" for identifier, columns in by_definition.items()
+    named = list(
+        dict.fromkeys(
+            f"{identifier} of {column!r}" + (f" by {group_by!r}" if group_by else "")
+            for column, identifier, group_by in result.statistics
         )
+    )
+    if named:
         say(
-            f"Fidelity statistics: {published}, on fractionalBits {result.fractional_bits}"
+            f"Fidelity statistics: {'; '.join(named)}, on fractionalBits {result.fractional_bits}"
             " (the fidelity block must declare the same).",
             soft_wrap=True,
         )
+    for description, reason in result.left_out:
+        say(f"Not answered: {description}: {reason}.", soft_wrap=True)
     for name, reason in plan.skipped:
         say(f"Not profiled: column {name!r}: {reason}.")
     if not result.published:

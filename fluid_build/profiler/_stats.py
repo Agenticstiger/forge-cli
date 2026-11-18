@@ -30,13 +30,33 @@ writes the same bytes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
-from typing import Any, Callable, Dict, FrozenSet, Protocol, Sequence, Tuple, runtime_checkable
+from functools import partial
+from importlib import import_module
+from types import SimpleNamespace
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    runtime_checkable,
+)
 
 __all__ = [
+    "BlockRefused",
+    "DeclaredBlock",
+    "DeclaredStatistic",
     "DocumentRefused",
+    "MeasureRefused",
+    "MeasuredGroup",
     "MetricDefinition",
     "ReadRefused",
     "StatisticDefinition",
@@ -64,6 +84,100 @@ class DocumentRefused(ValueError):
     It means the two disagree about the format, so nothing is written. The
     message names where in the document, never a value.
     """
+
+
+class BlockRefused(ValueError):
+    """The registry's parser refused the fidelity block a Simulation declares.
+
+    ``code`` is the ``FLX-nnnn`` code and the message the registry's own words
+    for it, which never quote a record value (the block holds none).
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+
+
+class MeasureRefused(ValueError):
+    """The registry refused a record while forming a declared statistic.
+
+    A null under ``null: fail``, a value outside the declared range or support,
+    more distinct members than ``maxCardinality``, a column the table lacks. The
+    message names the column and the row, never the value.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+
+
+@dataclass(frozen=True)
+class DeclaredStatistic:
+    """One statistic the fidelity block asks the profile to carry.
+
+    ``shape`` holds the document keys that say which statistic it is beyond its
+    definition and column: ``{"bins": [...]}`` (the declared edges, as decimal
+    strings), ``{"levels": [...]}`` (the declared levels in cell order),
+    ``{"level": "0.5"}`` or nothing. ``columns`` is every column it reads, the
+    ``groupBy`` column included, and ``read_as`` the domain each is read in.
+    """
+
+    identifier: str
+    kind: str
+    column: str
+    group_by: Optional[str]
+    shape: Mapping[str, Any]
+    columns: Tuple[str, ...]
+    read_as: Mapping[str, str]
+    #: The registry's parsed declaration; only the registry's own seam reads it.
+    _declaration: Any = field(default=None, repr=False, compare=False)
+
+    @property
+    def description(self) -> str:
+        """The statistic as a person names it: ``mean/1 of 'amount' by 'market'``."""
+        by = f" by {self.group_by!r}" if self.group_by else ""
+        return f"{self.identifier} of {self.column!r}{by}"
+
+
+@dataclass(frozen=True)
+class DeclaredBlock:
+    """What the fidelity block asks of a profile, read by the registry's own parser.
+
+    ``left_out`` names each declared property that is not answered, with the
+    reason. The parsed block stays private to this seam, which measures with it.
+    """
+
+    fractional_bits: int
+    statistics: Tuple[DeclaredStatistic, ...]
+    left_out: Tuple[Tuple[str, str], ...] = ()
+    _block: Any = field(default=None, repr=False, compare=False)
+
+    @property
+    def columns(self) -> Tuple[str, ...]:
+        """Every column any declared statistic reads, sorted."""
+        return tuple(sorted({name for each in self.statistics for name in each.columns}))
+
+
+@dataclass(frozen=True)
+class MeasuredGroup:
+    """One group of a declared statistic, formed from its exact records.
+
+    ``document`` is the group as the registry spells it (``group``, ``k`` and the
+    statistic's quantities), with every count exact and no ``status``. The other
+    fields hold what the disclosure rules read: ``cells`` (a histogram's bin or
+    level counts), ``member_holders`` (the records each member of a support is
+    held by), ``quantile`` (witness, records strictly below it, records at or
+    below it) and, for a mean, the group's exact values and their grid points.
+    """
+
+    key: str
+    document: Dict[str, Any]
+    k: int
+    cells: Tuple[int, ...] = ()
+    member_holders: Tuple[int, ...] = ()
+    quantile: Optional[Tuple[Optional[int], int, int]] = None
+    values: Tuple[Fraction, ...] = ()
+    encoded: Tuple[int, ...] = ()
 
 
 @runtime_checkable
@@ -145,6 +259,29 @@ class StatisticsBackend(Protocol):
 
     def check_document(self, text: str) -> None:
         """Read *text* back as a profile document; raise :class:`DocumentRefused` if refused."""
+
+    def read_block(
+        self, raw_block: Any, contract_document: Mapping[str, Any], expose_id: str
+    ) -> DeclaredBlock:
+        """Parse a Simulation's fidelity block against the contract's expose.
+
+        Raises :class:`BlockRefused` for a block the grammar refuses, and
+        :class:`StatisticsUnavailable` when the registry has no grammar.
+        """
+
+    def measure(
+        self,
+        block: DeclaredBlock,
+        statistic: DeclaredStatistic,
+        rows: Sequence[Mapping[str, Any]],
+    ) -> Tuple[MeasuredGroup, ...]:
+        """Form *statistic* over *rows* (column to raw value), one group per key.
+
+        Raises :class:`MeasureRefused` for a record the block's declaration refuses.
+        """
+
+    def quantile_ranks_ok(self, k: int, level: Fraction, below: int, at_or_below: int) -> bool:
+        """Whether a witness with these ranks, over *k* records, is the *level* quantile."""
 
 
 #: The most digits a number may need written out without an exponent: the
@@ -245,6 +382,7 @@ class _FluxStatsBackend:
         self._read_exact = read_exact
         self._value_domain = ValueDomain
         self._columns: Dict[Tuple[str, str], _Column] = {}
+        self._grammar: Any = None
 
     def metrics(self) -> Tuple[MetricDefinition, ...]:
         registered: Tuple[MetricDefinition, ...] = tuple(self._metrics())
@@ -286,6 +424,174 @@ class _FluxStatsBackend:
             self._load_profile_text(text)
         except self._refused as error:
             raise DocumentRefused(str(error)) from None
+
+    def _fidelity(self) -> Any:
+        """The registry's fidelity grammar and the readers it measures with, loaded once.
+
+        ``flux_stats.fidelity`` is newer than the rest of the registry (flux-stats
+        0.6.1 and older lack it), so it is imported when a ``--bundle`` asks for it.
+        """
+        if self._grammar is None:
+            try:
+                # By name, so a flux-stats that lacks the module raises here.
+                fidelity = import_module("flux_stats.fidelity")
+                reading = import_module("flux_stats.reading")
+                from flux_stats.fixedpoint import quantile_rank_ok
+                from flux_stats.registry import definition_for_kind
+                from flux_stats.spelling import render_exact
+            except ImportError:
+                raise StatisticsUnavailable(
+                    "--bundle needs a flux-stats release that carries flux_stats.fidelity"
+                ) from None
+            self._grammar = SimpleNamespace(
+                fidelity=fidelity,
+                reading=reading,
+                quantile_rank_ok=quantile_rank_ok,
+                definition_for_kind=definition_for_kind,
+                render_exact=render_exact,
+            )
+        return self._grammar
+
+    def read_block(
+        self, raw_block: Any, contract_document: Mapping[str, Any], expose_id: str
+    ) -> DeclaredBlock:
+        grammar = self._fidelity()
+        try:
+            expose = grammar.fidelity.expose_from_contract(contract_document, expose_id)
+            parsed = grammar.fidelity.parse_fidelity_block(raw_block, expose=expose)
+        except self._refused as error:
+            raise BlockRefused(error.code.code, error.detail or error.code.title) from None
+        except (TypeError, ValueError, AttributeError) as error:
+            raise BlockRefused(
+                "FLX-5030",
+                f"the fidelity block is not in a form the grammar reads ({type(error).__name__})",
+            ) from None
+        statistics: List[DeclaredStatistic] = []
+        left_out: List[Tuple[str, str]] = []
+        seen = set()
+        for declaration in parsed.properties:
+            kind = declaration.kind.value
+            if kind == "correlation":
+                first, second = declaration.columns
+                left_out.append((f"correlation of {first!r} and {second!r}", _CORRELATION_LEFT_OUT))
+                continue
+            statistic = self._declared(grammar, parsed, declaration)
+            key = (
+                statistic.identifier,
+                statistic.column,
+                statistic.group_by,
+                repr(sorted(statistic.shape.items())),
+            )
+            if key not in seen:
+                seen.add(key)
+                statistics.append(statistic)
+        return DeclaredBlock(
+            fractional_bits=parsed.encoding.fractional_bits,
+            statistics=tuple(statistics),
+            left_out=tuple(left_out),
+            _block=parsed,
+        )
+
+    @staticmethod
+    def _declared(grammar: Any, parsed: Any, declaration: Any) -> DeclaredStatistic:
+        """One property of the parsed block as the statistic a profile carries for it."""
+        kind: str = declaration.kind.value
+        column: str = declaration.columns[0]
+        group_by: Optional[str] = declaration.group_by
+        shape: Dict[str, Any] = {}
+        categorical = kind in ("support", "levelHistogram")
+        if kind == "marginalHistogram":
+            shape["bins"] = [grammar.render_exact(edge) for edge in declaration.bins]
+        elif kind == "levelHistogram":
+            shape["levels"] = list(grammar.reading.level_cells(parsed.columns[column]))
+        elif kind == "quantile":
+            shape["level"] = grammar.render_exact(declaration.level)
+        names = (column,) if group_by is None else (column, group_by)
+        read_as = {column: "category" if categorical else parsed.columns[column].domain.value}
+        if group_by is not None:
+            read_as[group_by] = "category"
+        return DeclaredStatistic(
+            identifier=grammar.definition_for_kind(declaration.kind).identifier,
+            kind=kind,
+            column=column,
+            group_by=group_by,
+            shape=shape,
+            columns=names,
+            read_as=read_as,
+            _declaration=declaration,
+        )
+
+    def measure(
+        self,
+        block: DeclaredBlock,
+        statistic: DeclaredStatistic,
+        rows: Sequence[Mapping[str, Any]],
+    ) -> Tuple[MeasuredGroup, ...]:
+        grammar = self._fidelity()
+        parsed = block._block
+        declaration = statistic._declaration
+        try:
+            by = parsed.columns[statistic.group_by] if statistic.group_by else None
+            keys = grammar.reading.group_keys(
+                rows, by, declared_only=statistic.kind == "levelHistogram"
+            )
+            return tuple(
+                self._measured(grammar, parsed, declaration, statistic, rows, key, indices)
+                for key, indices in keys
+            )
+        except self._refused as error:
+            raise MeasureRefused(error.code.code, error.detail or error.code.title) from None
+
+    @staticmethod
+    def _measured(
+        grammar: Any,
+        parsed: Any,
+        declaration: Any,
+        statistic: DeclaredStatistic,
+        rows: Sequence[Mapping[str, Any]],
+        key: str,
+        indices: Sequence[int],
+    ) -> MeasuredGroup:
+        state = grammar.fidelity.measure_group(
+            rows, indices, key, declaration, parsed.columns, parsed.grid
+        )
+        kind = statistic.kind
+        spelled: Dict[str, Any] = state.to_document(kind)
+        group = MeasuredGroup(key=key, document=spelled, k=state.k)
+        if kind in ("marginalHistogram", "levelHistogram"):
+            return replace(group, cells=tuple(state.cell_counts(kind)))
+        if kind == "support":
+            return replace(group, member_holders=tuple(state.support_counts))
+        if kind == "quantile":
+            ranks = (state.quantile_witness, state.quantile_below, state.quantile_at_or_below)
+            return replace(group, quantile=ranks)
+        # A mean: the same indices, read as the block reads them, so the null policy
+        # and the range check are the block's.
+        column = parsed.columns[statistic.column]
+        reading = grammar.reading
+        values = reading.read_column(
+            rows, indices, column, partial(reading.read_exact, column=column)
+        )
+        encoded = reading.read_column(
+            rows, indices, column, partial(reading.encode_value, column=column, grid=parsed.grid)
+        )
+        return replace(group, values=tuple(values), encoded=tuple(encoded))
+
+    def quantile_ranks_ok(self, k: int, level: Fraction, below: int, at_or_below: int) -> bool:
+        grammar = self._fidelity()
+        try:
+            proved: bool = grammar.quantile_rank_ok(
+                count=k, level=level, count_strictly_below=below, count_at_or_below=at_or_below
+            )
+        except self._refused:
+            return False
+        return proved
+
+
+#: Why a correlation is not answered (founder decision, 2026-11-18).
+_CORRELATION_LEFT_OUT = (
+    "a correlation's moments need the exact record count, which the output checks round"
+)
 
 
 def load_backend() -> StatisticsBackend:
