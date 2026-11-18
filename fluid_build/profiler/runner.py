@@ -627,11 +627,14 @@ def _declare_statistics(
 
     The rows of each statistic are built from the one read of the table. A
     statistic no record forms a group of (a grouped one over an empty table) has
-    nothing to write, and is returned with the reason. *tallies* count the values
-    and the histogram cells the checks withhold, by the check.
+    nothing to write, and is returned with the reason. Every statistic is measured
+    before any is checked, since a quantile's and a grouped histogram's publication
+    depend on the column's other statistics (:func:`_withheld_beside`). *tallies*
+    count the values and the histogram cells the checks withhold, by the check.
     """
     rows: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
     left_out: List[Tuple[str, str]] = []
+    formed: List[Tuple[DeclaredStatistic, MeasuredStatistic]] = []
     for statistic in declared.statistics:
         if statistic.columns not in rows:
             names = statistic.columns
@@ -653,9 +656,80 @@ def _declare_statistics(
         if not measured.groups:
             left_out.append((statistic.description, "no record forms a group of it"))
             continue
-        entry = _declared_entry(statistic, measured, backend, rule, tallies, fractional_bits)
+        formed.append((statistic, measured))
+    beside = _beside(formed, rule)
+    for statistic, measured in formed:
+        entry = _declared_entry(
+            statistic, measured, backend, rule, tallies, fractional_bits, beside
+        )
         columns_doc[statistic.column].setdefault("statistics", []).append(entry)
     return left_out
+
+
+#: The declared statistics that count records between edges of their column (FLUX ADR
+#: 0012): a quantile is published only as the one of them on its column.
+_EDGE_COUNTS = frozenset({"marginalHistogram", "levelHistogram", "quantile"})
+
+
+@dataclass(frozen=True)
+class _Beside:
+    """What one statistic's groups give back with the column's others (FLUX ADR 0012).
+
+    ``crowded`` holds the columns with more than one statistic that counts at their
+    edges, where a quantile is withheld. ``small`` holds each (column, groupBy) with a
+    group the size check withholds, the rows no group holds included, whose
+    histograms and quantiles are then withheld whole.
+    """
+
+    crowded: FrozenSet[str]
+    small: FrozenSet[Tuple[str, str]]
+
+
+def _beside(
+    formed: Sequence[Tuple[DeclaredStatistic, MeasuredStatistic]],
+    rule: disclosure.DisclosureRule,
+) -> _Beside:
+    """The columns a quantile shares with another count at edges, and the small groupBys."""
+    counts = Counter(statistic.column for statistic, _ in formed if statistic.kind in _EDGE_COUNTS)
+    small = set()
+    for statistic, measured in formed:
+        if statistic.group_by is None:
+            continue
+        sizes = [group.k for group in measured.groups]
+        if measured.left_out is not None:
+            sizes.append(measured.left_out.k)
+        if measured.left_out_unread or any(
+            not disclosure.check_group_count(size, rule).published for size in sizes
+        ):
+            small.add((statistic.column, statistic.group_by))
+    return _Beside(
+        frozenset(column for column, count in counts.items() if count > 1), frozenset(small)
+    )
+
+
+def _withheld_beside(
+    statistic: DeclaredStatistic, verdicts: List[disclosure.Verdict], beside: _Beside
+) -> List[disclosure.Verdict]:
+    """A histogram's or a quantile's verdicts once the column's other statistics are seen.
+
+    A quantile counts at its witness, an edge no declaration fixes, so beside another
+    statistic that counts at its column's edges its ranks less theirs would give a
+    withheld count back. And a group the size check withholds is the column's count
+    less its siblings' sizes, so every group of its groupBy's histograms and quantiles
+    goes with it, as a grouped mean's or support's does
+    (:func:`disclosure.suppress_secondary`). The groups that passed are withheld with
+    ``D``, and written ``C``.
+    """
+    reason = None
+    if statistic.kind == "quantile" and statistic.column in beside.crowded:
+        reason = "another statistic counts at its column's edges"
+    elif statistic.kind in _EDGE_COUNTS and statistic.group_by is not None:
+        if (statistic.column, statistic.group_by) in beside.small:
+            reason = "a group of its groupBy is withheld for its size"
+    if reason is None:
+        return verdicts
+    withheld = disclosure.Verdict(disclosure.SECONDARY, reason)
+    return [withheld if verdict.published else verdict for verdict in verdicts]
 
 
 def _declared_entry(
@@ -665,11 +739,13 @@ def _declared_entry(
     rule: disclosure.DisclosureRule,
     tallies: Tuple["Counter[str]", "Counter[str]"],
     fractional_bits: int,
+    beside: _Beside,
 ) -> Dict[str, Any]:
     """One declared statistic as the document writes it: every group checked, none guessed at.
 
     Each status is written through :func:`disclosure.written_status`, so a histogram's
-    withheld groups and cells read ``C``; *tallies* count them by the check.
+    and a quantile's withheld groups and cells read ``C``; *tallies* count them by the
+    check.
     """
     tally, cell_tally = tallies
     groups = measured.groups
@@ -677,6 +753,7 @@ def _declared_entry(
     verdicts = [verdict for verdict, _ in checked]
     if statistic.group_by is not None and statistic.kind in _SECONDARY_SUPPRESSION:
         verdicts = _suppressed(statistic, verdicts, measured, backend, rule, fractional_bits)
+    verdicts = _withheld_beside(statistic, verdicts, beside)
     written: List[Dict[str, Any]] = []
     for group, verdict, (_, published) in zip(groups, verdicts, checked, strict=True):
         tally[verdict.status] += 1

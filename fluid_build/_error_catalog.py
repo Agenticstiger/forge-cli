@@ -211,6 +211,17 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ["Validate the contract that uses the fragment: fluid validate contract.fluid.yaml"],
         None,
     ),
+    "diagnostics_scope_unsupported": (
+        [
+            (
+                "Validate one contract at a time: fluid validate <product>/contract.fluid.yaml "
+                "--format sarif"
+            ),
+            "Or drop --diagnostics / --format sarif to validate the workspace or bundle as a whole",
+            "Run --list-versions or --show-schema without --format sarif",
+        ],
+        "validate",
+    ),
     "schema_not_available": (
         ["Run 'fluid validate --list-versions' to see the versions this CLI has"],
         "schema-evolution",

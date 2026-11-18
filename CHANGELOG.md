@@ -76,18 +76,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   join an enum's `validValues` and extend a regex rule's pattern, and an enum on a column with
   placeholder prefixes becomes a `sql` rule. `RFC-data-rules.md` describes the mapping.
 
+- **`fluid validate --diagnostics` and `--format sarif` point each finding at the line its author
+  wrote.** A contract composed from `$ref` fragments and an `--env` overlay used to report most
+  findings as a path into the composed document. With `--diagnostics`, each finding carries the
+  file, line and column that wrote the value, the related place in the root contract (the key
+  whose `$ref` brought a fragment in, or the base value an overlay patched), and the product,
+  environment and expose or consume it sits under. Text prints `file:line:col: error CODE:
+  message` lines; `--format json` adds a `diagnostics` block, `{"version": "1.0", "items": [...]}`,
+  after the keys it always had. `--format sarif` writes a SARIF 2.1.0 log for code scanning, with
+  a rule per code, `%SRCROOT%`-relative locations and a fingerprint that does not move with its
+  line; a contract that cannot be loaded still gets a log, with that failure in it. A minor
+  version only adds fields, and `fluid_build.diagnostics.DiagnosticReport.from_dict` reads any
+  `1.x` document and ignores keys it does not know. No diagnostic carries a fix a tool could
+  apply, a source snippet or a credential. Without the flags the text and JSON output are
+  unchanged. A workspace or bundle run refuses the flags (`diagnostics_scope_unsupported`):
+  validate each contract. `--format sarif` also refuses `--list-versions` and `--show-schema`,
+  whose text would end the log.
+
 ### Changed
 
-- **`fluid profile --bundle` writes `C` for every withheld group and cell of a histogram.** In
-  0.32.0 a `marginalHistogram/1` or `levelHistogram/1` value that an output check withheld kept
-  that check's code, `A` for a small count, and a code that names the check tells a reader a
-  range: cells of 10, 9, 9 and 10 records written `F`, `A`, `A` and `F`, under a total the reader
-  knows, give both withheld cells as 9. FLUX PROFILE-SPEC now asks a profiler to write `C`
-  (withheld statistical information) for every withheld group and cell of a count table, whatever
-  withheld it (FLUX ADR 0011). The summary still counts each by the check that withheld it, and
-  now says so: `Withheld, by the check (CL_CONF_STATUS code): A (small count) 3.` A new line
-  counts the histogram cells withheld inside published groups. Every other statistic keeps the
-  check's code, and a profile 0.32.0 wrote still reads.
+- **`fluid profile --bundle` writes `C` for every withheld group and cell of a histogram or a
+  quantile.** In 0.32.0 a `marginalHistogram/1`, `levelHistogram/1` or `quantile/1` value that an
+  output check withheld kept that check's code, `A` for a small count, and a code that names the
+  check tells a reader a range: cells of 10, 9, 9 and 10 records written `F`, `A`, `A` and `F`,
+  under a total the reader knows, give both withheld cells as 9. FLUX PROFILE-SPEC now asks a
+  profiler to write `C` (withheld statistical information) for every withheld group and cell of a
+  count table and of a `quantile/1`, whatever withheld it (FLUX ADR 0012). The summary still
+  counts each by the check that withheld it, and now says so:
+  `Withheld, by the check (CL_CONF_STATUS code): A (small count) 3.` A new line counts the
+  histogram cells withheld inside published groups. Every other statistic keeps the check's code,
+  and a profile 0.32.0 wrote still reads.
 
 
 ### Fixed
@@ -128,9 +146,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A quantile is published only when the records below and above it pass the threshold too.**
   A `quantile/1` group was published when ten records held its witness, with its two ranks, so a
   rank could say that 3 records lie below the witness, or that 2 lie above it. A group is now
-  published only when the records below its witness and those above it are each none or at least
-  `minimumCell`, on unrounded counts (the three cells of FLUX ADR 0011), and it is withheld with
-  `A` otherwise. `fluid profile --help` names the rule.
+  published only when the records below its witness and those above it each number at least
+  `minimumCell`, on unrounded counts (the three cells of FLUX ADR 0012). None is allowed only
+  where the rule does not hold zeros disclosive: it says no record lies between the witness and
+  the end of the range. `fluid profile --help` names the rule.
+- **A quantile is withheld beside another statistic that counts at its column's edges.** Its
+  ranks count records at its witness, an edge no declaration fixes, so next to a histogram of its
+  column they could give a withheld cell back (ranks of 17 beside a published cell of 12 give a
+  withheld 5), and two quantiles of one column give back the records between their witnesses. A
+  quantile is now published only as its column's one histogram or quantile; beside another level,
+  a histogram, or the whole beside a groupBy, every group is withheld. A quantile checked there
+  needs bins, once forge-cli writes FLUX's binned quantile.
+- **A group withheld for its size withholds its siblings in a grouped histogram or quantile.**
+  Every grouped statistic publishes each group's size, so a group of 5 records was the column's
+  count less its siblings' sizes, which only a grouped mean or support withheld. Now, when a group
+  of a groupBy (or the rows a null key leaves out of every group) fails the size check, or those
+  rows cannot be read as the block reads them, every group of that groupBy's histograms and
+  quantiles on the same column is withheld too, counted as `D`. A group's size is its records
+  with a value in the column, so another column's groups are checked on their own sizes.
+- **These entries do not complete FLUX ADR 0012's rule on their own.** A reader can still
+  subtract one histogram's published counts from another's, or from a level histogram's group
+  size, and rebuild a withheld cell, a zero included. FLUX's `check_edge_counts` closes that, and
+  forge-cli calls it once a flux-stats release carries it. That change completes the rule and
+  lands before the next forge-cli release.
 
 ## [0.32.0] — 2026-11-18
 
