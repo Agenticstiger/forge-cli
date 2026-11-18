@@ -370,3 +370,52 @@ def test_an_edit_after_import_reaches_the_next_export() -> None:
     assert _property(odcs, "product_code")["logicalTypeOptions"]["pattern"] == pattern
     assert _rules(odcs)["product_code.identifierFormat"]["arguments"]["pattern"] == pattern
     assert _property(odcs, "gross")["transformLogic"] == "ROUND(net * (2 + tax_rate), 2)"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda c: c["exposes"][0]["contract"].__setitem__("invariants", 5),
+        lambda c: c["exposes"][0]["contract"]["invariants"].append(
+            {"id": ["x"], "derive": "gross", "expr": "1"}
+        ),
+        lambda c: c["exposes"][1]["binding"]["location"].__setitem__("table", ""),
+        lambda c: c["exposes"][1]["binding"]["location"].__setitem__("table", "a\nb"),
+        lambda c: c["exposes"][0]["contract"]["schema"][9].update(
+            name="", placeholders={"prefixes": ["Z"]}
+        ),
+    ],
+)
+def test_a_malformed_contract_still_exports(mutate: Any) -> None:
+    contract = _contract()
+    mutate(contract)
+    odcs = _render(contract)
+    assert odcs["schema"][0]["name"] == "invoices"
+
+
+def test_an_unquotable_linked_table_is_a_text_rule() -> None:
+    contract = _contract()
+    contract["exposes"][1]["binding"]["location"]["table"] = "a\nb"
+    rule = _rules(_render(contract))["fee_is_monthly"]
+    assert rule["type"] == "text" and "can quote" in rule["description"]
+
+
+def test_every_port_of_a_contract_compiles_its_rules_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fluid_build.data_rules import _compile
+    from fluid_build.providers.odcs.mappers import data_rules
+
+    calls: List[int] = []
+    real = _compile.compile_rules
+
+    def counting(contract: Any, dialect: Any = None) -> Any:
+        calls.append(1)
+        return real(contract, dialect)
+
+    monkeypatch.setattr(_compile, "compile_rules", counting)
+    monkeypatch.setattr(data_rules, "_COMPILED", type(data_rules._COMPILED)())
+    contract = _contract()
+    for expose_id in ("invoices", "contracts"):
+        _render(contract, expose_id)
+    assert len(calls) == 1

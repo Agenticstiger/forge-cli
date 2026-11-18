@@ -33,6 +33,8 @@ ordinary rules.
 
 from __future__ import annotations
 
+import json
+from collections import OrderedDict
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -78,7 +80,10 @@ def _location_name(dialect: str, expose: Mapping[str, Any]) -> Optional[str]:
                 parts.append(location[key])
                 break
     parts.append(location["table"])
-    return ".".join(fs.sql_name(dialect, part) for part in parts)
+    try:
+        return ".".join(fs.sql_name(dialect, part) for part in parts)
+    except ValueError:  # an empty name, or a control character: no table to name
+        return None
 
 
 def _exposes(contract: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
@@ -89,6 +94,28 @@ def _exposes(contract: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
     }
 
 
+#: The rules of the last contracts compiled, by their canonical JSON: ``render_all_ports``
+#: renders one document per expose from one contract, and each would compile all of it.
+_COMPILED: "OrderedDict[str, List[Any]]" = OrderedDict()
+_COMPILED_SIZE = 4
+
+
+def _compiled(contract: Mapping[str, Any], compile_rules: Any) -> List[Any]:
+    try:
+        key = json.dumps(contract, sort_keys=True, default=str)
+    except (TypeError, ValueError):  # a shape JSON cannot hold: compile it every time
+        return compile_rules(contract)
+    rules = _COMPILED.get(key)
+    if rules is None:
+        rules = compile_rules(contract)
+        _COMPILED[key] = rules
+        while len(_COMPILED) > _COMPILED_SIZE:
+            _COMPILED.popitem(last=False)
+    else:
+        _COMPILED.move_to_end(key)
+    return rules
+
+
 def export(ctx: ExportCtx, schema_objects: List[Any]) -> None:
     """Append the generated rules of every expose to its schema object."""
     from fluid_build.data_rules._compile import compile_rules
@@ -96,7 +123,7 @@ def export(ctx: ExportCtx, schema_objects: List[Any]) -> None:
     # A per-expose export scopes the contract to one expose; a rule may read its siblings.
     whole = ctx.options.get("whole_contract")
     contract = whole if isinstance(whole, Mapping) else ctx.fluid
-    rules = compile_rules(contract)
+    rules = _compiled(contract, compile_rules)
     if not rules:
         return
     exposes = _exposes(contract)
@@ -170,8 +197,8 @@ def _attach(
             if unnamed is not None:
                 status = "unsupported"
                 reason = (
-                    f"it reads {unnamed}, whose binding.location names no table for the query "
-                    "to read"
+                    f"it reads {unnamed}, whose binding.location names no table the query "
+                    "can quote"
                 )
         if status == "executable" and rule.pattern is not None:
             check.update(
@@ -259,16 +286,22 @@ def derived_logic(
     from fluid_build import fluid_sql as fs
 
     contract = expose.get("contract")
+    invariants = contract.get("invariants") if isinstance(contract, Mapping) else None
     derived: Dict[str, List[Mapping[str, Any]]] = {}
-    for inv in (contract.get("invariants") if isinstance(contract, Mapping) else None) or []:
+    for inv in invariants if isinstance(invariants, list) else []:
         if isinstance(inv, Mapping) and isinstance(inv.get("derive"), str):
             derived.setdefault(inv["derive"], []).append(inv)
     own = expose.get("exposeId")
     ok = {r.id: r for r in rules if r.expose == own and r.status == "executable"}
     out: Dict[str, Tuple[str, List[str]]] = {}
     for column, invs in derived.items():
-        if any(not isinstance(i.get("expr"), str) or i.get("id") not in ok for i in invs):
-            continue
+        if any(
+            not isinstance(i.get("expr"), str)
+            or not isinstance(i.get("id"), str)
+            or i["id"] not in ok
+            for i in invs
+        ):
+            continue  # a summary, or a derive with no exact SQL: no expression to show
         try:
             values = [fs.canonical(fs.parse(i["expr"])) for i in invs]
             whens = [

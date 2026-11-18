@@ -804,7 +804,11 @@ def _enum_with_prefixes(
     from fluid_build import fluid_sql as fs
     from fluid_build.data_rules._compile import placeholder_sql
 
-    column = fs.sql_name(dialect, name)
+    try:
+        column = fs.sql_name(dialect, name)
+    except ValueError:
+        dialect = None  # a name no dialect can quote: report it as text, as without one
+        return _enum_with_prefixes(name, values, prefixes, message, dialect)
     listed = ", ".join(fs.sql_literal(dialect, v) for v in values) or "NULL"
     exempt = placeholder_sql(dialect, column, [], prefixes)
     return {
