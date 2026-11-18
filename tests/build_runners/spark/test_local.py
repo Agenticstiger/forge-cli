@@ -649,3 +649,52 @@ def test_a_lock_placed_as_a_link_is_no_run_s(tmp_path):
         assert _local._held(link) is False
     finally:
         os.close(fd)
+
+
+def test_a_linked_dot_fluid_is_refused(host, tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (Path(host.workspace) / ".fluid").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(SparkRunError, match="is a link"):
+        submitter(host)
+
+
+def test_publish_never_writes_through_a_link_under_the_default_root(host, tmp_path):
+    run = the_run(local_contract())
+    sub = submitter(host)
+    bound = run.bind(local_root=sub.root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    product_dir = Path(bound.job_uri).parents[1]
+    product_dir.parent.mkdir(parents=True)
+    product_dir.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(SparkRunError, match="outside"):
+        _local.publish(sub, bound, runner_source())
+    assert list(outside.iterdir()) == []
+
+
+def test_a_planted_temporary_file_name_is_never_written_through(host, tmp_path):
+    run = the_run(local_contract())
+    sub = submitter(host)
+    bound = run.bind(local_root=sub.root)
+    job = Path(bound.job_uri)
+    job.parent.mkdir(parents=True)
+    victim = tmp_path / "victim"
+    victim.write_text("untouched\n")
+    (job.parent / f".job.json.{os.getpid()}.tmp").symlink_to(victim)
+    _local.publish(sub, bound, runner_source())
+    assert victim.read_text() == "untouched\n"
+    assert job.read_text(encoding="utf-8") == bound.job_text
+
+
+def test_a_linked_run_directory_is_neither_listed_nor_pruned(host, tmp_path):
+    run = the_run(local_contract())
+    runs = LocalRuns(host, run.product, run.build)
+    (runs.dir / "runs").mkdir(parents=True)
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    (kept / "run.json").write_text('{"runId": "x"}')
+    (runs.dir / "runs" / "20261118T000000Z-0000abcd").symlink_to(kept, target_is_directory=True)
+    assert runs.runs() == []
+    runs.prune()
+    assert (kept / "run.json").is_file()

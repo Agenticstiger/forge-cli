@@ -77,7 +77,11 @@ SUBMIT_EXECUTABLE_ENV = "FLUID_SPARK_SUBMIT_EXECUTABLE"
 #: never go into the command line.
 PROPERTIES_FILE_ENV = "FLUID_SPARK_SUBMIT_PROPERTIES_FILE"
 #: Operator-only: where local runs' artifacts live, ``s3://<bucket>[/<prefix>]`` or an
-#: absolute directory. Unset: ``.fluid/spark-artifacts`` beside the contract.
+#: absolute directory. Unset: ``.fluid/spark-artifacts`` beside the contract. spark-submit
+#: and the runner read an ``s3://`` root through Hadoop: on a Spark other than an EMR image
+#: the properties file maps the scheme (``spark.hadoop.fs.s3.impl`` to S3A, with its
+#: endpoint), and spark-submit, which downloads the runner before ``--packages`` load, needs
+#: hadoop-aws on its own classpath (``spark.driver.extraClassPath``).
 LOCAL_ROOT_ENV = "FLUID_SPARK_LOCAL_ROOT"
 DEFAULT_ROOT = Path(".fluid") / "spark-artifacts"
 #: Ended runs kept per build, their logs included; older ones are removed.
@@ -121,7 +125,13 @@ def _confined(workspace: Path, path: Path) -> Path:
     Raises:
         SparkRunError: it resolves outside, through a link the project holds.
     """
-    base = (Path(workspace) / ".fluid").resolve()
+    fluid = Path(workspace) / ".fluid"
+    if fluid.is_symlink():
+        raise SparkRunError(
+            f"{fluid} is a link: local Spark runs keep their state in a .fluid directory of "
+            "the project's own; replace the link with a directory"
+        )
+    base = fluid.resolve()
     resolved = Path(path).resolve()
     if resolved != base and base not in resolved.parents:
         raise SparkRunError(
@@ -153,6 +163,9 @@ class Submitter:
     #: (spark-submit and the runner read a plain path as a local file).
     root: str
     env: Mapping[str, str] = field(default_factory=dict, repr=False)
+    #: The workspace whose ``.fluid`` holds the default root: every artifact written
+    #: there must resolve inside it. ``None`` for a root the operator names.
+    confine: Optional[Path] = None
 
     @property
     def on_s3(self) -> bool:
@@ -173,6 +186,7 @@ def submitter(host: LocalHost) -> Submitter:
         properties=_read_properties(path),
         root=_root(env, host.workspace),
         env=env,
+        confine=None if (env.get(LOCAL_ROOT_ENV) or "").strip() else Path(host.workspace),
     )
 
 
@@ -435,15 +449,35 @@ def publish(sub: Submitter, run: DesiredRun, runner_text: str) -> None:
         return
     for uri, body in files:
         path = Path(uri)
+        if sub.confine is not None:
+            _confined(sub.confine, path.parent)  # no link under the default root leads out
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            if path.is_file() and path.read_bytes() == body:
+            if sub.confine is not None:
+                _confined(sub.confine, path.parent)
+            if path.is_file() and not path.is_symlink() and path.read_bytes() == body:
                 continue
-            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-            tmp.write_bytes(body)
-            os.replace(tmp, path)
+            _replace(path, body)
         except OSError as exc:
             raise SparkRunError(f"{path} cannot be written: {exc.strerror}") from exc
+
+
+def _replace(path: Path, body: bytes) -> None:
+    """Write ``path`` whole through a temporary file nobody can have placed: a new name,
+    created exclusively and never through a link, then renamed over ``path`` (a rename
+    replaces a link at ``path`` itself, never its target)."""
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(body)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _put_s3(files: Any, env: Mapping[str, str]) -> None:
@@ -480,9 +514,7 @@ def _put_s3(files: Any, env: Mapping[str, str]) -> None:
 
 
 def _write_json(path: Path, data: Mapping[str, Any]) -> None:
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    _replace(path, (json.dumps(data, sort_keys=True, indent=2) + "\n").encode("utf-8"))
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -557,7 +589,9 @@ class LocalRuns:
         infos = [
             self.get(entry.name)
             for entry in base.iterdir()
-            if _RUN_ID.fullmatch(entry.name) and (entry / RUN_FILE).is_file()
+            if _RUN_ID.fullmatch(entry.name)
+            and not entry.is_symlink()
+            and (entry / RUN_FILE).is_file()
         ]
         return sorted(infos, key=lambda i: (i.created, i.run_id), reverse=True)
 
@@ -639,7 +673,9 @@ class LocalRuns:
         """Keep the active runs and the newest :data:`KEEP_ENDED` ended ones."""
         ended = [r for r in self.runs() if not r.active]
         for info in ended[KEEP_ENDED:]:
-            shutil.rmtree(self._run_dir(info.run_id), ignore_errors=True)
+            self._run_dir(info.run_id)  # inside .fluid
+            # The path as listed, not resolved: rmtree refuses a link there.
+            shutil.rmtree(self.dir / "runs" / info.run_id, ignore_errors=True)
 
 
 def builds_with_runs(host: LocalHost, product: str) -> List[str]:
