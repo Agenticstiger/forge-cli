@@ -396,6 +396,25 @@ def test_emu_bigquery_nested_columns_round_trip_rows():
     assert [tuple(r.values()) for r in rows] == [("o1", 2, "8000", 3, "web")]
 
 
+def test_emu_bigquery_partitioned_clustered_table_plan_clean(gcp_emulator_project):
+    """Emitter half: a partition column without retention and clustering plan against
+    the emulator: dataset, table and the partitioning's replacement trigger."""
+    contract = _nested_contract(f"emu_layout_{uuid.uuid4().hex[:8]}")
+    expose = contract["exposes"][0]
+    expose["contract"]["schema"] += [
+        {"name": "event_date", "type": "date", "required": True},
+        {"name": "region", "type": "string"},
+    ]
+    expose["binding"]["location"]["partitionBy"] = ["event_date"]
+    expose["binding"]["properties"] = {"cluster_by": ["region", "id"]}
+    gcp_emulator_project.emit(contract)
+    init = gcp_emulator_project.init()
+    assert init.ok, init.stderr or init.stdout
+    plan = gcp_emulator_project.plan()
+    assert plan.ok, plan.stderr or plan.stdout
+    assert runner.change_summary(plan)["add"] == 3
+
+
 def test_emu_gcs_sdk_create_read():
     """Emulator half: create a bucket via google-cloud-storage against
     the fake-gcs-server, read it back."""

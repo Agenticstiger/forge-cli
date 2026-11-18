@@ -1113,6 +1113,7 @@ class _BqGovernance:
     encryption: Optional[_gov.BqEncryption] = None
     tags: Tuple[_gov.TagGroup, ...] = ()
     row_policies: Tuple[_gov.RowPolicy, ...] = ()
+    layout: _gov.BqLayout = _gov.BqLayout()
 
 
 _NO_GOVERNANCE = _BqGovernance()
@@ -1158,6 +1159,7 @@ def _bigquery_governance(
                 _gov.row_policies(contract, exposure, cid, _bq_table_name(exposure, loc), index)
             )
         ),
+        layout=_gov.layout_for(exposure, index, is_view=is_view),
     )
 
 
@@ -1511,8 +1513,7 @@ def _emit_bigquery(
         # the data-loss gate refuses without --allow-data-loss.
         body["encryption_configuration"] = {"kms_key_name": kms_key}
         body["depends_on"] = list(kms_deps)
-    if gov.retention is not None:
-        _partition_table(resources, body, tbl_name, gov.retention)
+    _lay_out_table(resources, body, tbl_name, gov)
     resources.setdefault("google_bigquery_table", {})[tbl_name] = body
     _emit_row_policies(resources, gov.row_policies, ds_ref, tbl_name, loc.get("project"))
 
@@ -1542,29 +1543,45 @@ def _emit_bigquery(
     # ``fluid validate`` — see ``iac/access.py``.)
 
 
+def _lay_out_table(
+    resources: Dict[str, Any], body: Dict[str, Any], tbl_name: str, gov: _BqGovernance
+) -> None:
+    """The table's partitioning and clustering (``gcp_governance.layout_for``).
+
+    Clustering needs no replacement trigger: the provider updates it in place, and
+    BigQuery reclusters only the data written after the change.
+    """
+    if gov.retention is not None or gov.layout.partition_field:
+        _partition_table(resources, body, tbl_name, gov.layout.partition_field, gov.retention)
+    if gov.layout.clustering:
+        body["clustering"] = list(gov.layout.clustering)
+
+
 def _partition_table(
     resources: Dict[str, Any],
     body: Dict[str, Any],
     tbl_name: str,
-    retention: _gov.BqRetention,
+    field: Optional[str],
+    retention: Optional[_gov.BqRetention],
 ) -> None:
-    """Daily partitions expiring ``retention`` after their day, and the replace trigger.
+    """Daily partitions on ``field`` (ingestion time without one), and the replace trigger.
 
-    Partition expiration, not ``expiration_time``: a table TTL would delete the
-    product. See ``gcp_governance.partition_trigger_input`` for why the table's
-    replacement is triggered by a ``terraform_data`` (the OpenTofu documentation's
+    With ``retention`` each partition expires that long after its day: partition
+    expiration, not ``expiration_time``, since a table TTL would delete the product.
+    Without it ``expiration_ms`` is left out and the partitions never expire. See
+    ``gcp_governance.partition_trigger_input`` for why the table's replacement is
+    triggered by a ``terraform_data`` (the OpenTofu documentation's
     ``replace_triggered_by`` pattern for a plain value).
     """
-    partitioning: Dict[str, Any] = {
-        "type": _gov.PARTITION_TYPE,
-        "expiration_ms": retention.expiration_ms,
-    }
-    if retention.field:
-        partitioning["field"] = retention.field
+    partitioning: Dict[str, Any] = {"type": _gov.PARTITION_TYPE}
+    if retention is not None:
+        partitioning["expiration_ms"] = retention.expiration_ms
+    if field:
+        partitioning["field"] = field
     body["time_partitioning"] = partitioning
     trigger = safe_ident(f"{tbl_name}_partitioning")
     resources.setdefault("terraform_data", {})[trigger] = {
-        "input": _gov.partition_trigger_input(retention)
+        "input": _gov.partition_trigger_input(field)
     }
     body["lifecycle"] = {"replace_triggered_by": [f"terraform_data.{trigger}"]}
 
