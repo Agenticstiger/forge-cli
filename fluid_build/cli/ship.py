@@ -177,10 +177,8 @@ def _add_artifact_options(g: argparse._ArgumentGroup) -> None:
         default=None,
         metavar="LIST",
         help=(
-            "Stage 3 fails unless this run writes each of these, comma-separated: odcs (one "
-            "file per exposes[] port), odps-bitol (the product), opds, policies, schedule. "
-            "Files an earlier run left never count. Needs stage 3 in this invocation, with "
-            "every key in --emit. Repeatable."
+            "Stage 3 fails unless this run writes each (repeatable, comma-separated): odcs "
+            "(one per port), odps-bitol, opds, policies, schedule. Earlier runs' files never count."
         ),
     )
 
