@@ -74,6 +74,18 @@ _INTEGER_TAG = "tag:yaml.org,2002:int"
 _FLOAT_TAG = "tag:yaml.org,2002:float"
 _TIMESTAMP_TAG = "tag:yaml.org,2002:timestamp"
 
+#: The most digits a number in a block may need written out: the engine's rule for a
+#: declared number, flux-stats' ``MOST_DIGITS``, counted as its
+#: ``reading.digits_written_out`` counts (:func:`_digits_written_out`). It is checked
+#: before a decimal is written out, since writing ``1E+300000000`` out takes gigabytes.
+_MOST_NUMBER_DIGITS = 1000
+
+#: The most values, and the deepest nesting, a block may hold once written out. YAML
+#: reads an alias as a shared reference, so a kilobyte of aliases can stand for
+#: billions of values; a real block holds a few hundred, a few levels deep.
+_MOST_BLOCK_VALUES = 100_000
+_DEEPEST_BLOCK = 64
+
 
 class BundleError(Exception):
     """A bundle that cannot give a fidelity block. ``event`` is a stable code."""
@@ -106,7 +118,7 @@ def _documents(directory: Path) -> List[Path]:
     return [
         entry
         for entry in entries
-        if entry.name.lower().endswith(_SUFFIXES) and entry.is_file() and not entry.is_symlink()
+        if entry.name.endswith(_SUFFIXES) and entry.is_file() and not entry.is_symlink()
     ]
 
 
@@ -164,8 +176,26 @@ def _nfc(text: str) -> str:
     return unicodedata.normalize("NFC", text)
 
 
-def _render_decimal(value: Decimal) -> str:
+def _digits_written_out(value: Decimal) -> int:
+    """The digits *value* needs written out, as flux-stats' ``digits_written_out`` counts."""
+    digits = len(value.as_tuple().digits)
+    exponent = value.adjusted() - digits + 1
+    if not value:
+        return 1  # zero, however its exponent is spelled
+    if exponent >= 0:
+        return digits + exponent
+    return max(digits, -exponent)
+
+
+def _render_decimal(value: Decimal, name: str, where: str) -> str:
     """The declared scale is kept; negative zero is folded onto the positive spelling."""
+    if _digits_written_out(value) > _MOST_NUMBER_DIGITS:
+        raise BundleError(
+            "profile_bundle_unreadable",
+            f"{name}: {where} holds a number of more than {_MOST_NUMBER_DIGITS} digits "
+            "written out, which FLUX does not read",
+            {"next": "write a shorter number"},
+        )
     rendered = format(value, "f")
     if rendered.startswith("-") and value == 0:
         rendered = rendered[1:]
@@ -188,7 +218,7 @@ def _coerce_key(key: Any, name: str, where: str) -> str:
     if key is None:
         return "null"
     if isinstance(key, Decimal):
-        return _render_decimal(key)
+        return _render_decimal(key, name, where)
     raise BundleError(
         "profile_bundle_unreadable",
         f"{name}: {where} has a key of class {type(key).__name__!r}",
@@ -196,8 +226,41 @@ def _coerce_key(key: Any, name: str, where: str) -> str:
     )
 
 
-def _canonicalise(value: Any, name: str, where: str) -> Any:
-    """*value* as JSON-ready Python (KERNEL-SPEC 2.1), mirroring the engine's ``canonicalise``."""
+class _Budget:
+    """The values left to write one block out with."""
+
+    def __init__(self) -> None:
+        self.left = _MOST_BLOCK_VALUES
+
+    def spend(self, name: str, where: str, depth: int) -> None:
+        """Count one value at *depth*; refuse a block past either bound."""
+        self.left -= 1
+        if self.left < 0:
+            raise BundleError(
+                "profile_bundle_unreadable",
+                f"{name}: {where} holds more than {_MOST_BLOCK_VALUES} values once its "
+                "YAML aliases are written out",
+                {"next": "write the block without aliases, or name another bundle"},
+            )
+        if depth > _DEEPEST_BLOCK:
+            raise BundleError(
+                "profile_bundle_unreadable",
+                f"{name}: {where} nests deeper than {_DEEPEST_BLOCK} levels",
+                {"next": "write the block without aliases, or name another bundle"},
+            )
+
+
+def _canonicalise(
+    value: Any, name: str, where: str, budget: Optional[_Budget] = None, depth: int = 0
+) -> Any:
+    """*value* as JSON-ready Python (KERNEL-SPEC 2.1), mirroring the engine's ``canonicalise``.
+
+    Each value written out costs one of *budget*, so aliases cannot make the walk
+    write out more than :data:`_MOST_BLOCK_VALUES` values or go deeper than
+    :data:`_DEEPEST_BLOCK` levels.
+    """
+    budget = budget if budget is not None else _Budget()
+    budget.spend(name, where, depth)
     if isinstance(value, bool):
         return value
     if isinstance(value, int):
@@ -209,7 +272,7 @@ def _canonicalise(value: Any, name: str, where: str) -> Any:
             )
         return value
     if isinstance(value, Decimal):
-        return _render_decimal(value)
+        return _render_decimal(value, name, where)
     if isinstance(value, str):
         return _nfc(value)
     if value is None:
@@ -224,10 +287,10 @@ def _canonicalise(value: Any, name: str, where: str) -> Any:
                     f"{name}: {where} has two keys that both read as {key!r}",
                     {"next": "keep one of them"},
                 )
-            canonical[key] = _canonicalise(raw_value, name, f"{where}.{key}")
+            canonical[key] = _canonicalise(raw_value, name, f"{where}.{key}", budget, depth + 1)
         return {key: canonical[key] for key in sorted(canonical)}
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
-        return [_canonicalise(item, name, where) for item in value]
+        return [_canonicalise(item, name, where, budget, depth + 1) for item in value]
     raise BundleError(
         "profile_bundle_unreadable",
         f"{name}: {where} holds a value of class {type(value).__name__!r}",
@@ -235,8 +298,12 @@ def _canonicalise(value: Any, name: str, where: str) -> Any:
     )
 
 
-def _load(path: Path) -> Any:
-    """One document, or a :class:`BundleError` that names the file and the line."""
+def _load(path: Path) -> Tuple[Mapping[str, Any], ...]:
+    """Every mapping document in *path*, as the engine's ``load_documents_exact`` reads it.
+
+    A file may hold more than one ``---`` document; a :class:`BundleError` names the
+    file and the line of a document that cannot be read.
+    """
     import yaml
 
     try:
@@ -253,9 +320,15 @@ def _load(path: Path) -> Any:
             "profile_bundle_unreadable", f"{path.name} cannot be read: {reason}"
         ) from None
     try:
-        return yaml.load(
-            text, Loader=_exact_loader(path.name)
-        )  # nosec B506 - a SafeLoader subclass
+        documents = list(
+            yaml.load_all(text, Loader=_exact_loader(path.name))  # nosec B506 - SafeLoader subclass
+        )
+    except RecursionError:
+        raise BundleError(
+            "profile_bundle_unreadable",
+            f"{path.name} nests too deeply to read",
+            {"next": "fix the document, or name another bundle directory"},
+        ) from None
     except yaml.YAMLError as exc:
         mark = getattr(exc, "problem_mark", None)
         where = f" at line {mark.line + 1}" if mark is not None else ""
@@ -264,6 +337,7 @@ def _load(path: Path) -> Any:
             f"{path.name} is not valid YAML{where}",
             {"next": "fix the document, or name another bundle directory"},
         ) from None
+    return tuple(document for document in documents if isinstance(document, Mapping))
 
 
 def read_bundle_block(directory: Path, expose_id: str) -> BundleBlock:
@@ -275,9 +349,9 @@ def read_bundle_block(directory: Path, expose_id: str) -> BundleBlock:
     """
     simulations: List[Tuple[Path, Mapping[str, Any]]] = []
     for path in _documents(directory):
-        document = _load(path)
-        if isinstance(document, Mapping) and document.get("kind") == "Simulation":
-            simulations.append((path, document))
+        for document in _load(path):
+            if document.get("kind") == "Simulation":
+                simulations.append((path, document))
     if not simulations:
         raise BundleError(
             "profile_bundle_no_simulation",
@@ -298,7 +372,14 @@ def read_bundle_block(directory: Path, expose_id: str) -> BundleBlock:
     extensions = document.get("extensions")
     namespace = extensions.get(BUNDLE_NAMESPACE) if isinstance(extensions, Mapping) else None
     emits = namespace.get("emits") if isinstance(namespace, Mapping) else None
-    emit = emits.get(expose_id) if isinstance(emits, Mapping) else None
+    # Matched as the engine matches it (``seam/resolve.py`` ``extension_block``): an
+    # unquoted ``2024:`` is the integer 2024, which names the exposeId "2024".
+    wanted = _nfc(expose_id)
+    emit = (
+        next((emits[key] for key in emits if _nfc(str(key)) == wanted), None)
+        if isinstance(emits, Mapping)
+        else None
+    )
     block = emit.get("fidelity") if isinstance(emit, Mapping) else None
     if block is None:
         raise BundleError(

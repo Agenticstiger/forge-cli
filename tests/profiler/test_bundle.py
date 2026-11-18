@@ -42,9 +42,22 @@ def test_the_block_of_the_one_simulation_is_returned_unparsed(tmp_path):
     assert found.raw["encoding"] == {"fractionalBits": 8, "rounding": "floor"}
 
 
-def test_the_yaml_suffix_is_read_too_and_the_name_is_matched_without_case(tmp_path):
-    _write(tmp_path, "Simulation.FLUX.YAML", SIMULATION)
-    assert read_bundle_block(tmp_path, "orders").simulation == "Simulation.FLUX.YAML"
+def test_the_yaml_suffix_is_read_too_and_matched_as_the_engine_globs_it(tmp_path):
+    _write(tmp_path, "Simulation.flux.yaml", SIMULATION)
+    assert read_bundle_block(tmp_path, "orders").simulation == "Simulation.flux.yaml"
+    _write(tmp_path, "Other.FLUX.YML", SIMULATION)  # not a *.flux.yml name: not read
+    assert read_bundle_block(tmp_path, "orders").simulation == "Simulation.flux.yaml"
+
+
+def test_a_simulation_after_another_document_in_one_file_is_read(tmp_path):
+    _write(tmp_path, "s.flux.yml", "kind: Segment\nid: seg\n---\n" + SIMULATION)
+    assert read_bundle_block(tmp_path, "orders").simulation == "s.flux.yml"
+
+
+def test_an_integer_expose_key_names_the_expose_as_the_engine_reads_it(tmp_path):
+    _write(tmp_path, "s.flux.yml", SIMULATION.replace("      orders:", "      2024:"))
+    block = read_bundle_block(tmp_path, "2024").raw
+    assert block["encoding"] == {"fractionalBits": 8, "rounding": "floor"}
 
 
 def test_a_directory_with_no_simulation_is_refused(tmp_path):
@@ -198,6 +211,39 @@ def test_an_integer_too_long_to_form_is_refused_with_its_position(tmp_path):
     with pytest.raises(BundleError) as refused:
         read_bundle_block(tmp_path, "orders")
     assert "too long" in str(refused.value) and "line" in str(refused.value)
+
+
+def test_a_block_whose_aliases_write_out_too_many_values_is_refused(tmp_path):
+    lines = ['a: &a ["x", "x", "x", "x", "x", "x", "x", "x", "x", "x"]']
+    for name, previous in zip("bcdef", "abcde", strict=True):
+        lines.append(f"{name}: &{name} [{', '.join([f'*{previous}'] * 10)}]")
+    _write(tmp_path, "s.flux.yml", _simulation_with("\n".join(lines)))
+    with pytest.raises(BundleError) as refused:
+        read_bundle_block(tmp_path, "orders")
+    assert refused.value.event == "profile_bundle_unreadable"
+    assert "more than 100000 values" in str(refused.value)
+
+
+def test_a_block_that_holds_itself_through_an_alias_is_refused(tmp_path):
+    _write(tmp_path, "s.flux.yml", _simulation_with("r: &r [*r]"))
+    with pytest.raises(BundleError) as refused:
+        read_bundle_block(tmp_path, "orders")
+    assert "nests deeper than 64 levels" in str(refused.value)
+
+
+def test_a_number_too_long_to_write_out_is_refused(tmp_path):
+    _write(tmp_path, "s.flux.yml", _simulation_with("columns: {amount: {max: 1.0e+300000000}}"))
+    with pytest.raises(BundleError) as refused:
+        read_bundle_block(tmp_path, "orders")
+    assert "more than 1000 digits" in str(refused.value)
+
+
+def test_a_document_nested_too_deeply_to_read_is_refused(tmp_path):
+    _write(tmp_path, "deep.flux.yml", "kind: Simulation\nx: " + "[" * 5000 + "]" * 5000 + "\n")
+    with pytest.raises(BundleError) as refused:
+        read_bundle_block(tmp_path, "orders")
+    assert refused.value.event == "profile_bundle_unreadable"
+    assert "nests too deeply" in str(refused.value)
 
 
 def test_the_module_imports_no_registry():
