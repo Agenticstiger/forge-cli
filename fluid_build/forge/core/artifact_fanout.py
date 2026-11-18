@@ -72,7 +72,7 @@ import shutil
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Tuple
 
 import yaml
 
