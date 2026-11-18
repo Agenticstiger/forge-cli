@@ -445,10 +445,8 @@ def profile_expose(
 
     *fractional_bits* is the grid ``mean/1`` is formed on (16 unless given),
     checked before any record is read; the fidelity block must declare the same
-    (PROFILE-SPEC §7). With a *bundle*, the grid is the block's: a *fractional_bits*
-    that differs is refused (``profile_fractional_bits_conflict``), and so is a
-    block the registry's grammar refuses or one that reads a column this profile
-    cannot, before any record is read.
+    (PROFILE-SPEC §7). With a *bundle*, the profile also answers its fidelity
+    block, on the block's grid (:func:`_declared_block`).
     """
     if fractional_bits is not None:
         document.check_fractional_bits(fractional_bits)
@@ -459,46 +457,14 @@ def profile_expose(
             f"no column of exposes[{expose_id}] has a type fluid profile reads",
             {"not profiled": "; ".join(f"{name}: {reason}" for name, reason in plan.skipped)},
         )
-    declared: Optional[DeclaredBlock] = None
-    if bundle is not None:
-        try:
-            declared = backend.read_block(bundle.raw, contract, expose_id)
-        except BlockRefused as exc:
-            raise ProfileError(
-                "profile_bundle_block_refused",
-                f"the fidelity block in {bundle.simulation} is refused: {exc}",
-                {
-                    "read": "nothing: no record was read",
-                    "next": "fix the block as FLUX's fidelity grammar spells it, then profile",
-                },
-            ) from None
-        if fractional_bits is not None and fractional_bits != declared.fractional_bits:
-            raise ProfileError(
-                "profile_fractional_bits_conflict",
-                f"--fractional-bits {fractional_bits} differs from the {bundle.simulation} "
-                f"fidelity block's encoding.fractionalBits {declared.fractional_bits}",
-                {
-                    "read": "nothing: no record was read",
-                    "next": "drop --fractional-bits, or declare the same grid in the block",
-                },
-            )
-        fractional_bits = declared.fractional_bits
-        _check_declared_columns(declared, plan)
-    elif fractional_bits is None:
-        fractional_bits = DEFAULT_FRACTIONAL_BITS
+    declared, fractional_bits = _declared_block(
+        bundle, contract, expose_id, plan, backend, fractional_bits
+    )
     read = sources.read_columns(
         source, [column.name for column in plan.columns], table=table, cwd=cwd
     )
     tally: "Counter[str]" = Counter()
-    replaced = (
-        frozenset(
-            each.column
-            for each in declared.statistics
-            if each.kind == "mean" and each.group_by is None
-        )
-        if declared is not None
-        else frozenset()
-    )
+    replaced = _ungrouped_means(declared)
     columns_doc = {
         column.name: _column(
             column,
@@ -534,6 +500,7 @@ def profile_expose(
     canonical = document.canonical_bytes(built)
     backend.check_document(canonical.decode("utf-8"))
     published = tally.pop(disclosure.FREE, 0)
+    all_published, none_published, some_published = _statistic_summaries(columns_doc)
     return ProfileResult(
         document=built,
         canonical=canonical,
@@ -542,10 +509,62 @@ def profile_expose(
         published=published,
         withheld=dict(sorted(tally.items())),
         fractional_bits=fractional_bits,
-        statistics=_published_statistics(columns_doc),
-        withheld_statistics=_withheld_statistics(columns_doc),
-        partly_withheld_statistics=_partly_withheld_statistics(columns_doc),
+        statistics=all_published,
+        withheld_statistics=none_published,
+        partly_withheld_statistics=some_published,
         left_out=tuple(left_out),
+    )
+
+
+def _declared_block(
+    bundle: Optional[BundleBlock],
+    contract: Mapping[str, Any],
+    expose_id: str,
+    plan: ExposePlan,
+    backend: StatisticsBackend,
+    fractional_bits: Optional[int],
+) -> Tuple[Optional[DeclaredBlock], int]:
+    """The fidelity block *bundle* holds for the expose, and the grid the profile is formed on.
+
+    Without a bundle there is no block, and the grid is *fractional_bits*, 16 unless
+    given. With one, the registry's grammar reads the block and the grid is the
+    block's: a *fractional_bits* that differs is refused
+    (``profile_fractional_bits_conflict``), and so is a block the grammar refuses or
+    one that reads a column this profile cannot, before any record is read.
+    """
+    if bundle is None:
+        return None, DEFAULT_FRACTIONAL_BITS if fractional_bits is None else fractional_bits
+    try:
+        declared = backend.read_block(bundle.raw, contract, expose_id)
+    except BlockRefused as exc:
+        raise ProfileError(
+            "profile_bundle_block_refused",
+            f"the fidelity block in {bundle.simulation} is refused: {exc}",
+            {
+                "read": "nothing: no record was read",
+                "next": "fix the block as FLUX's fidelity grammar spells it, then profile",
+            },
+        ) from None
+    if fractional_bits is not None and fractional_bits != declared.fractional_bits:
+        raise ProfileError(
+            "profile_fractional_bits_conflict",
+            f"--fractional-bits {fractional_bits} differs from the {bundle.simulation} "
+            f"fidelity block's encoding.fractionalBits {declared.fractional_bits}",
+            {
+                "read": "nothing: no record was read",
+                "next": "drop --fractional-bits, or declare the same grid in the block",
+            },
+        )
+    _check_declared_columns(declared, plan)
+    return declared, declared.fractional_bits
+
+
+def _ungrouped_means(declared: Optional[DeclaredBlock]) -> FrozenSet[str]:
+    """The columns whose ungrouped mean the block declares: their fixed ``mean/1`` is the block's."""
+    if declared is None:
+        return frozenset()
+    return frozenset(
+        each.column for each in declared.statistics if each.kind == "mean" and each.group_by is None
     )
 
 
@@ -713,41 +732,30 @@ def _row_count(rows: int, rule: disclosure.DisclosureRule, tally: "Counter[str]"
     return disclosure.round_count(rows, rule) if verdict.published else None
 
 
-def _published_statistics(
-    columns: Mapping[str, Mapping[str, Any]],
-) -> Tuple[Tuple[str, str, Optional[str]], ...]:
-    """Each fidelity statistic whose every group was published: column, definition, groupBy."""
-    return tuple(
-        (name, statistic["definition"], statistic.get("groupBy"))
+def _statistic_summaries(columns: Mapping[str, Mapping[str, Any]]) -> Tuple[
+    Tuple[Tuple[str, str, Optional[str]], ...],
+    Tuple[Tuple[str, str, Optional[str]], ...],
+    Tuple[Tuple[str, str, Optional[str], int, int], ...],
+]:
+    """The fidelity statistics by how many of their groups were published.
+
+    Each is named by its column, definition and groupBy: first those whose every group
+    was published, then those with no published group, then those with some, which also
+    carry the number of groups published and the number of groups.
+    """
+    counted = [
+        (
+            name,
+            statistic["definition"],
+            statistic.get("groupBy"),
+            sum(1 for group in statistic["groups"] if group["status"] == disclosure.FREE),
+            len(statistic["groups"]),
+        )
         for name, column in columns.items()
         for statistic in column.get("statistics", ())
-        if all(group["status"] == disclosure.FREE for group in statistic["groups"])
+    ]
+    return (
+        tuple(each[:3] for each in counted if each[3] == each[4]),
+        tuple(each[:3] for each in counted if each[3] == 0),
+        tuple(each for each in counted if 0 < each[3] < each[4]),
     )
-
-
-def _withheld_statistics(
-    columns: Mapping[str, Mapping[str, Any]],
-) -> Tuple[Tuple[str, str, Optional[str]], ...]:
-    """Each fidelity statistic with no published group: column, definition, groupBy."""
-    return tuple(
-        (name, statistic["definition"], statistic.get("groupBy"))
-        for name, column in columns.items()
-        for statistic in column.get("statistics", ())
-        if not any(group["status"] == disclosure.FREE for group in statistic["groups"])
-    )
-
-
-def _partly_withheld_statistics(
-    columns: Mapping[str, Mapping[str, Any]],
-) -> Tuple[Tuple[str, str, Optional[str], int, int], ...]:
-    """Each fidelity statistic with some groups published: column, definition, groupBy, counts."""
-    found = []
-    for name, column in columns.items():
-        for statistic in column.get("statistics", ()):
-            groups = statistic["groups"]
-            shown = sum(1 for group in groups if group["status"] == disclosure.FREE)
-            if 0 < shown < len(groups):
-                found.append(
-                    (name, statistic["definition"], statistic.get("groupBy"), shown, len(groups))
-                )
-    return tuple(found)

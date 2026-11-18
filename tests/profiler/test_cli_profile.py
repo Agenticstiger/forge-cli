@@ -156,6 +156,7 @@ def test_profile_help_explains_what_leaves(capsys):
     text = " ".join(capsys.readouterr().out.replace("#", " ").split())
     assert "no privacy or anonymity guarantee" in text
     assert "--source" in text and "--table" in text
+    assert "--bundle DIR" in text and "answer a Simulation's fidelity block" in text
 
 
 def test_a_linked_profile_target_is_refused_and_its_target_untouched(workspace, registry, capsys):
@@ -300,55 +301,46 @@ extensions:
 """
 
 
-def test_a_missing_bundle_directory_is_refused_before_anything_is_read(workspace, registry, capsys):
-    rc = main(["profile", "contract.fluid.yaml", "--source", "x.ndjson", "--bundle", "nope"])
-    out = capsys.readouterr().out
-    assert rc == 1
-    assert "nope" in out
-    assert not (workspace / "orders.profile.json").exists()
+def _no_bundle(workspace):
+    """Leave the workspace as it is: the bundle named is not there, or is a file."""
 
 
-def test_a_bundle_that_is_a_file_is_refused(workspace, registry, capsys):
-    rc = main(
-        [
-            "profile",
-            "contract.fluid.yaml",
-            "--source",
-            "x.ndjson",
-            "--bundle",
-            "contract.fluid.yaml",
-        ]
-    )
-    out = capsys.readouterr().out
-    assert rc == 1
-    assert "profile_bundle_not_a_directory" in out
-
-
-def test_a_bundle_without_a_simulation_is_refused(workspace, registry, capsys):
+def _empty_bundle(workspace):
     (workspace / "bundle").mkdir()
-    rc = main(["profile", "contract.fluid.yaml", "--source", "orders.ndjson", "--bundle", "bundle"])
-    out = capsys.readouterr().out
-    assert rc == 1
-    assert "profile_bundle_no_simulation" in out
-    assert not (workspace / "orders.profile.json").exists()
 
 
-def test_a_simulation_without_a_block_for_the_expose_is_refused(workspace, registry, capsys):
+def _bundle_for_another_expose(workspace):
     (workspace / "bundle").mkdir()
     (workspace / "bundle" / "sim.flux.yml").write_text(
         SIMULATION.replace("orders:", "other:"), encoding="utf-8"
     )
-    rc = main(["profile", "contract.fluid.yaml", "--source", "orders.ndjson", "--bundle", "bundle"])
+
+
+@pytest.mark.parametrize(
+    ("prepare", "given", "said"),
+    [
+        pytest.param(_no_bundle, "nope", ("nope",), id="missing"),
+        pytest.param(
+            _no_bundle, "contract.fluid.yaml", ("profile_bundle_not_a_directory",), id="a-file"
+        ),
+        pytest.param(
+            _empty_bundle, "bundle", ("profile_bundle_no_simulation",), id="no-simulation"
+        ),
+        pytest.param(
+            _bundle_for_another_expose,
+            "bundle",
+            ("profile_bundle_no_block", "'orders'"),
+            id="no-block-for-the-expose",
+        ),
+    ],
+)
+def test_a_bundle_that_gives_no_block_is_refused_before_anything_is_read(
+    workspace, registry, capsys, prepare, given, said
+):
+    prepare(workspace)
+    rc = main(["profile", "contract.fluid.yaml", "--source", "orders.ndjson", "--bundle", given])
     out = capsys.readouterr().out
     assert rc == 1
-    assert "profile_bundle_no_block" in out and "'orders'" in out
+    for words in said:
+        assert words in out
     assert not (workspace / "orders.profile.json").exists()
-
-
-def test_the_help_names_the_bundle(capsys):
-    try:
-        main(["profile", "--help"])
-    except SystemExit:
-        pass
-    text = " ".join(capsys.readouterr().out.replace("#", " ").split())
-    assert "--bundle DIR" in text and "answer a Simulation's fidelity block" in text

@@ -36,6 +36,7 @@ from flux_stats.profile import load_profile_text  # noqa: E402
 from fluid_build.cli import main  # noqa: E402
 from fluid_build.profiler import _stats, bundle  # noqa: E402
 from fluid_build.profiler.runner import ProfileError, profile_expose  # noqa: E402
+from tests.profiler.test_flux_stats_backend import _slice  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -129,12 +130,6 @@ def _rows(count: int = 120) -> List[Dict[str, Any]]:
         {"amount": AMOUNTS[n % 5], "market": MARKETS[n % 3], "qty": str(n % 7)}
         for n in range(count)
     ]
-
-
-def _slice(tmp_path: Path, rows: List[Dict[str, Any]]) -> str:
-    path = tmp_path / "payment.ndjson"
-    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
-    return str(path)
 
 
 def _profile(tmp_path: Path, rows: List[Dict[str, Any]], properties=None, bits=None):
