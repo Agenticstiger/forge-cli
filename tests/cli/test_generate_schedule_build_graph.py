@@ -140,7 +140,10 @@ def test_regenerating_removes_a_dag_whose_build_now_runs_in_another(
     assert _generate(tmp_path, monkeypatch) == 0
     out = tmp_path / "out"
     assert (out / "daily_users_dag.py").exists()
-    other_env = fluid_apply_render(contract, "aws")["daily_users_dag.py"]
+    from fluid_build.schedulers.airflow import fluid_apply
+
+    rendered = fluid_apply.render_fluid_apply_dags(contract, env="aws", contract_path=CONTRACT)
+    other_env = rendered["daily_users_dag.py"]
     (out / "daily_users_other_env_dag.py").write_text(other_env, encoding="utf-8")
     (out / "not_ours_dag.py").write_text(
         '"""A DAG someone wrote."""\nPRODUCT_ID = "platform.events"\n'
@@ -158,9 +161,3 @@ def test_regenerating_removes_a_dag_whose_build_now_runs_in_another(
     assert "daily_users_dag.py: an earlier run wrote it for this product and env" in (
         " ".join(capsys.readouterr().out.split())
     )
-
-
-def fluid_apply_render(contract: dict, env: str) -> dict:
-    from fluid_build.schedulers.airflow import fluid_apply
-
-    return fluid_apply.render_fluid_apply_dags(contract, env=env, contract_path=CONTRACT)

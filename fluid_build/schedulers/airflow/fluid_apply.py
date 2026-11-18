@@ -110,6 +110,8 @@ from fluid_build.schedulers.airflow._assets import (
 )
 from fluid_build.util.contract import (
     builds_writing_expose,
+    get_builds,
+    get_exposes,
     is_continuous_build,
     is_databricks_job_build,
     is_unscheduled_build,
@@ -451,8 +453,7 @@ def has_scheduled_builds(contract: Dict[str, Any]) -> bool:
 def runs_only_outside_schedulers(contract: Dict[str, Any]) -> bool:
     """True when the contract has builds and no scheduler starts any of them: each is a stream
     ``fluid apply`` keeps running, runs continuously, or runs on its own platform."""
-    raw = contract.get("builds")
-    builds = [b for b in raw if isinstance(b, dict)] if isinstance(raw, list) else []
+    builds = [b for b in get_builds(contract) if isinstance(b, dict)]
     if not builds:
         return False
     managed = _managed_lane(contract)
@@ -1034,8 +1035,7 @@ def _expose_id(expose: Mapping[str, Any]) -> Any:
 
 
 def _exposes(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    raw = contract.get("exposes")
-    return [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+    return [e for e in get_exposes(contract) if isinstance(e, dict)]
 
 
 def scheduled_dags(contract: Dict[str, Any]) -> List[ScheduledDag]:
