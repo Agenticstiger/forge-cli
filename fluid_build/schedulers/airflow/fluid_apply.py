@@ -1,10 +1,9 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""Airflow DAGs that run a scheduled build through ``fluid apply``.
+"""Airflow DAGs that run a contract's builds through ``fluid apply``.
 
-A build that declares ``builds[].execution.trigger.schedule`` gets one DAG.
-Each DAG run executes, on the Airflow worker::
+Each task of a DAG executes one build, on the Airflow worker::
 
     cd "$FLUID_PROJECT_DIR"
     fluid apply "$FLUID_PROJECT_DIR/<contract path>" [--env <env>] \\
@@ -15,6 +14,36 @@ cloud target keeps one state (``FLUID_STATE_BACKEND``) whether the run came
 from CI or from the scheduler. The contract path and ``--env`` are fixed when
 the DAG is generated; the project directory is read on the worker at run
 time, because the checkout lives somewhere else there than it does in CI.
+
+Which builds share a DAG, and when it runs (:func:`scheduled_dags`):
+
+* Builds that ``builds[].dependencies`` link run in one DAG, one task per
+  build, each after the builds it names. The DAG runs on the one trigger its
+  builds declare, on whichever build declares it; a build with no trigger of
+  its own (or ``trigger.type: dependency``) runs in its upstream's DAG. The
+  DAG and its file are named after the build that carries the trigger. A
+  dependency's ``condition`` is the task's trigger rule
+  (:data:`TRIGGER_RULES`). Two different triggers in one linked group, a
+  cycle, a dependency on itself, on a build that does not exist or on one
+  another engine runs are refused, each with what to change.
+* A dependency on a build that no scheduler starts (a stream ``fluid apply``
+  keeps running, a Flink job, a Databricks job) is not waited for; the DAG's
+  documentation names it.
+* ``trigger.type: schedule`` is a cron (``SCHEDULE``). ``dataset`` runs when
+  the datasets in ``trigger.datasets`` are updated, all of them or any one
+  (``datasetsOperator``); ``schedule_and_dataset`` runs on the cron and on
+  those updates (``AssetOrTimeSchedule``). A dataset is an Airflow asset
+  URI, or ``{productId, exposeId}`` of an expose of this contract, named as
+  :mod:`fluid_build.schedulers.airflow._assets` names it.
+* Every task declares the assets of the exposes its build writes as
+  ``outlets``, so Airflow starts a DAG scheduled on one of them when the
+  task succeeds, in this contract or in another product's.
+
+Each build's node is written by :func:`render_build_task` into
+``tasks[<build id>]``, and the edges are written separately, so the one
+function decides what runs a build. A DAG with one task keeps the shape it
+has always had: ``task_id="fluid_apply"``, nothing but its schedule and
+outlets changes with the contract.
 
 A forge Spark build (``engine: spark`` with ``parameters.spark``, on EMR Serverless, Glue, EMR
 on EC2 or EMR on EKS) gets the same DAG: the build phase of that ``fluid apply`` starts one run
@@ -27,9 +56,11 @@ running, so it gets no DAG.
 Rendering rules:
 
 * Airflow 3 first: ``airflow.sdk.DAG``, ``BashOperator`` from
-  ``airflow.providers.standard``, ``schedule=``. Guarded imports keep the
-  file importable on Airflow 2.6+ (``schedule=`` needs 2.4,
-  ``skip_on_exit_code`` needs 2.6).
+  ``airflow.providers.standard``, ``Asset`` from ``airflow.sdk``,
+  ``schedule=``. Guarded imports keep the file importable on Airflow 2.6+
+  (``schedule=`` and ``Dataset`` need 2.4, ``skip_on_exit_code`` needs 2.6);
+  a ``datasetsOperator: any`` or a ``schedule_and_dataset`` trigger needs
+  2.9 (``DatasetAny``, ``DatasetOrTimeSchedule``).
 * The bash script is the same static text in every DAG. Contract-derived
   values (build id, env, contract path) reach it only as environment
   variables set through ``env=`` with ``append_env=True`` and are expanded
@@ -65,11 +96,26 @@ from __future__ import annotations
 import re
 import zoneinfo
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set, Tuple
+from graphlib import CycleError, TopologicalSorter
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from fluid_build.build_runners._ids import IdentifierViolation, validate_identifier
-from fluid_build.providers.common.codegen_utils import py_str_literal
-from fluid_build.util.contract import is_unscheduled_build
+from fluid_build.providers.common.codegen_utils import (
+    escape_for_docstring,
+    py_comment_text,
+    py_str_literal,
+)
+from fluid_build.schedulers.airflow._assets import (
+    NotAddressable,
+    expose_asset_uri,
+    normalize_dataset_uri,
+)
+from fluid_build.util.contract import (
+    builds_writing_expose,
+    is_continuous_build,
+    is_databricks_job_build,
+    is_unscheduled_build,
+)
 
 #: Engine used for a scheduled build when the contract names none.
 DEFAULT_ENGINE = "airflow"
@@ -244,6 +290,66 @@ class ScheduledBuild:
     task_timeout_s: Optional[int] = None
 
 
+#: The Airflow trigger rule of a task, from its ``builds[].dependencies[].condition``.
+#: ``always`` is Airflow's own: "No dependencies at all, run this task at any time", so the
+#: task starts without waiting for the builds it names. ``completion`` waits for them to
+#: finish, whatever their outcome. A dependency with no condition is ``success``.
+TRIGGER_RULES = {"success": "all_success", "completion": "all_done", "always": "always"}
+
+
+@dataclass(frozen=True)
+class DagSchedule:
+    """When a DAG runs: on a cron, when datasets update, or on either."""
+
+    #: The cron (or Airflow preset); ``None`` for a DAG that runs only on its datasets.
+    cron: Optional[str]
+    timezone: str
+    #: Asset URIs whose update starts a run; empty for a DAG on a cron alone.
+    datasets: Tuple[str, ...] = ()
+    #: ``all``: every dataset updated since the last run; ``any``: one of them.
+    operator: str = "all"
+
+
+@dataclass(frozen=True)
+class BuildTask:
+    """One build's node in a DAG: the task that runs ``fluid apply --build-id <id>``."""
+
+    build_id: str
+    retries: int
+    #: Seconds the task may run; ``None`` for the default three hours (see ``ScheduledBuild``).
+    task_timeout_s: Optional[int] = None
+    #: The builds this one runs after, in the DAG's run order.
+    upstream: Tuple[str, ...] = ()
+    #: The Airflow trigger rule its dependencies' condition gives; ``None`` with no upstream.
+    trigger_rule: Optional[str] = None
+    #: The asset URIs of the exposes the build writes, declared as the task's ``outlets``.
+    outlets: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ScheduledDag:
+    """One ``fluid apply`` DAG: the builds ``builds[].dependencies`` link, on their trigger."""
+
+    #: The build whose trigger runs the DAG; it names the DAG and its file.
+    build_id: str
+    schedule: DagSchedule
+    #: One per build, in run order: a build comes after every build it depends on.
+    tasks: Tuple[BuildTask, ...]
+    #: ``(build id, why)``: builds a task depends on that no DAG runs, so none waits for them.
+    unwaited: Tuple[Tuple[str, str], ...] = ()
+
+
+# Where a build stands in the schedule (:func:`_classify`).
+_OUTSIDE = "outside"  # no scheduler starts it: a stream, a Flink job, a Databricks job
+_ELSEWHERE = "elsewhere"  # execution.orchestration.engine names another engine, or none
+_NO_TRIGGER = "no trigger"  # runs in the DAG of the builds it depends on, if any
+_CRON = "schedule"
+_DATASET = "dataset"
+_CRON_OR_DATASET = "schedule_and_dataset"
+_UNRENDERED = "unrendered"  # manual, event, timetable: no fluid apply DAG
+_DAG_TRIGGERS = (_CRON, _DATASET, _CRON_OR_DATASET)
+
+
 # ---------------------------------------------------------------------------
 # Contract inspection
 # ---------------------------------------------------------------------------
@@ -284,44 +390,74 @@ def _spark_kind(build: Dict[str, Any], managed: bool = True) -> Optional[str]:
     return "scheduled" if runs_to_completion(build) else "streaming"
 
 
-def _trigger_schedule(build: Dict[str, Any], managed: bool = True) -> Optional[Dict[str, Any]]:
-    """The build's cron trigger, or ``None`` when Airflow should not schedule it."""
+def _classify(build: Dict[str, Any], managed: bool = True) -> Tuple[str, Dict[str, Any]]:
+    """Where the build stands in the schedule, and its trigger (``{}`` when it has none)."""
     # A Flink job runs on its own platform, and a dbt build on Databricks on its
     # job's own trigger: a DAG that runs ``fluid apply`` for either would run
     # nothing and pass. Nor does a continuous build need one.
     if is_unscheduled_build(build):
-        return None
+        return _OUTSIDE, {}
     # A stream keeps running and ``fluid apply`` reconciles it; a scheduler has nothing to start.
     if _spark_kind(build, managed) == "streaming":
-        return None
+        return _OUTSIDE, {}
     execution = build.get("execution")
-    if not isinstance(execution, dict):
-        return None
+    execution = execution if isinstance(execution, dict) else {}
     # A build may name its own engine (``execution.orchestration.engine``);
     # ``none`` opts it out and any other engine is not Airflow's to render.
     own = execution.get("orchestration")
     if isinstance(own, dict) and own.get("engine") not in (None, "", DEFAULT_ENGINE):
-        return None
+        return _ELSEWHERE, {}
     trigger = execution.get("trigger")
     if not isinstance(trigger, dict):
-        return None
-    # ``schedule_and_dataset`` / ``timetable`` / ``event`` carry semantics a
-    # plain cron DAG would silently drop, so only a plain schedule trigger
-    # (or one with no type, which the schema allows) is rendered.
-    if trigger.get("type") not in (None, "schedule"):
-        return None
-    if not (trigger.get("schedule") or trigger.get("cron")):
-        return None
-    return trigger
+        return _NO_TRIGGER, {}
+    kind = trigger.get("type")
+    if kind in (None, "schedule"):
+        has_cron = bool(trigger.get("schedule") or trigger.get("cron"))
+        return (_CRON if has_cron else _NO_TRIGGER), trigger
+    if kind == "dependency":
+        return _NO_TRIGGER, trigger
+    if kind in (_DATASET, _CRON_OR_DATASET):
+        return kind, trigger
+    # ``manual``, ``event`` and ``timetable`` carry semantics a fluid apply DAG
+    # would silently drop, so none of them gets one.
+    return _UNRENDERED, trigger
+
+
+def _outside_why(build: Dict[str, Any], managed: bool) -> str:
+    """Why no DAG runs a build :func:`_classify` puts outside every scheduler."""
+    if _spark_kind(build, managed) == "streaming":
+        return "a Spark stream that fluid apply keeps running"
+    if is_continuous_build(build):
+        return "a job its platform keeps running (trigger.type: continuous)"
+    if is_databricks_job_build(build):
+        return "a Databricks job that runs on its own trigger"
+    return "a job that runs on its own platform (a Flink job, for example)"
+
+
+def _trigger_schedule(build: Dict[str, Any], managed: bool = True) -> Optional[Dict[str, Any]]:
+    """The build's cron trigger, or ``None`` when it has none Airflow should run."""
+    kind, trigger = _classify(build, managed)
+    return trigger if kind == _CRON else None
 
 
 def has_scheduled_builds(contract: Dict[str, Any]) -> bool:
-    """True when at least one build declares a cron trigger (no validation)."""
+    """True when at least one build declares a trigger a DAG runs on (no validation): a cron,
+    datasets, or both."""
     builds = contract.get("builds")
     if not isinstance(builds, list):
         return False
     managed = _managed_lane(contract)
-    return any(isinstance(b, dict) and _trigger_schedule(b, managed) is not None for b in builds)
+    return any(isinstance(b, dict) and _classify(b, managed)[0] in _DAG_TRIGGERS for b in builds)
+
+
+def runs_only_outside_schedulers(contract: Dict[str, Any]) -> bool:
+    """True when the contract has builds and no scheduler starts any of them: each is a stream
+    ``fluid apply`` keeps running, runs continuously, or runs on its own platform."""
+    builds = [b for b in contract.get("builds") or [] if isinstance(b, dict)]
+    if not builds:
+        return False
+    managed = _managed_lane(contract)
+    return all(_classify(b, managed)[0] == _OUTSIDE for b in builds)
 
 
 def has_explicit_tasks(contract: Dict[str, Any]) -> bool:
@@ -486,45 +622,417 @@ def _task_timeout_s(build: Dict[str, Any], build_id: str) -> int:
     return APPLY_TASK_TIMEOUT_S + (wait or DEFAULT_SPARK_WAIT_S)
 
 
-def scheduled_builds(contract: Dict[str, Any]) -> List[ScheduledBuild]:
-    """Return every build with a cron trigger, validated for rendering.
+def _task_build_id(build: Dict[str, Any]) -> str:
+    raw_id: Any = build.get("id")
+    try:
+        return validate_id(raw_id, kind="build.id")
+    except ScheduleRenderError as exc:
+        raise ScheduleRenderError(
+            f"a scheduled build needs a valid id for --build-id: {exc}"
+        ) from exc
 
-    Raises :class:`ScheduleRenderError` when a scheduled build's id,
-    schedule or timezone cannot be rendered safely.
-    """
-    out: List[ScheduledBuild] = []
-    builds = contract.get("builds")
-    if not isinstance(builds, list):
-        return out
-    managed = _managed_lane(contract)
-    for build in builds:
-        if not isinstance(build, dict):
-            continue
-        trigger = _trigger_schedule(build, managed)
-        if trigger is None:
-            continue
-        raw_id: Any = build.get("id")
-        try:
-            build_id = validate_id(raw_id, kind="build.id")
-        except ScheduleRenderError as exc:
-            raise ScheduleRenderError(
-                f"a scheduled build needs a valid id for --build-id: {exc}"
-            ) from exc
-        spark = _spark_kind(build, managed) == "scheduled"
-        if spark:
-            _check_spark_ids(contract, build_id)
-        out.append(
-            ScheduledBuild(
-                build_id=build_id,
-                schedule=_validate_schedule(
-                    trigger.get("schedule") or trigger.get("cron"), build_id
-                ),
-                timezone=_validate_timezone(trigger.get("timezone"), build_id),
-                retries=_retries(build),
-                task_timeout_s=_task_timeout_s(build, build_id) if spark else None,
-            )
+
+def _dependencies(build: Dict[str, Any], build_id: Any) -> List[Tuple[str, str]]:
+    """``(upstream build id, condition)`` for each ``builds[].dependencies`` entry, deduplicated."""
+    raw = build.get("dependencies")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ScheduleRenderError(
+            f"build {build_id!r}: dependencies must be a list of {{buildId, condition}} entries"
         )
+    out: List[Tuple[str, str]] = []
+    for index, entry in enumerate(raw):
+        where = f"build {build_id!r}: dependencies[{index}]"
+        upstream = entry.get("buildId") if isinstance(entry, dict) else None
+        if not isinstance(upstream, str) or not upstream:
+            raise ScheduleRenderError(
+                f"{where} names no buildId; set it to the id of the build this one runs after"
+            )
+        condition = entry.get("condition") or "success"
+        if condition not in TRIGGER_RULES:
+            raise ScheduleRenderError(
+                f"{where}: condition {condition!r} is not one of success, completion, always"
+            )
+        if (upstream, condition) not in out:
+            out.append((upstream, condition))
     return out
+
+
+def _describe(schedule: Optional[DagSchedule], trigger: Mapping[str, Any]) -> str:
+    """A trigger as an error message names it."""
+    if schedule is None:
+        return f"trigger.type {trigger.get('type')}"
+    parts = []
+    if schedule.cron is not None:
+        parts.append(f"schedule {schedule.cron!r} ({schedule.timezone})")
+    if schedule.datasets:
+        parts.append(f"{schedule.operator} of datasets {', '.join(schedule.datasets)}")
+    return " and ".join(parts)
+
+
+def _check_trigger_shape(build_id: Any, kind: str, trigger: Mapping[str, Any]) -> None:
+    """Refuse a trigger whose fields contradict its ``type``, saying which field to change."""
+    cron_value = trigger.get("schedule") or trigger.get("cron")
+    datasets = trigger.get("datasets")
+    on_datasets = kind in (_DATASET, _CRON_OR_DATASET)
+    if datasets and not on_datasets:
+        raise ScheduleRenderError(
+            f"build {build_id!r}: trigger.datasets needs trigger.type dataset (run when they "
+            "update) or schedule_and_dataset (run on the schedule and when they update)"
+        )
+    if kind == _DATASET and cron_value:
+        raise ScheduleRenderError(
+            f"build {build_id!r}: trigger.type dataset runs when its datasets update and takes "
+            "no schedule; set trigger.type: schedule_and_dataset to run on both"
+        )
+    if kind == _CRON_OR_DATASET and not cron_value:
+        raise ScheduleRenderError(
+            f"build {build_id!r}: trigger.type schedule_and_dataset needs trigger.schedule, the "
+            "cron it runs on besides its datasets (or set trigger.type: dataset)"
+        )
+    if on_datasets and (not isinstance(datasets, list) or not datasets):
+        raise ScheduleRenderError(
+            f"build {build_id!r}: trigger.type {kind} needs trigger.datasets, the datasets whose "
+            "update starts a run"
+        )
+    if on_datasets and (trigger.get("datasetsOperator") or "all") not in ("all", "any"):
+        raise ScheduleRenderError(
+            f"build {build_id!r}: datasetsOperator {trigger.get('datasetsOperator')!r} is not all "
+            "or any"
+        )
+
+
+def _run_order(members: List[int], upstream: Dict[int, List[Tuple[int, str]]], name) -> List[int]:
+    """``members`` with every build after the builds it depends on; ties in ``builds[]`` order."""
+    graph = {i: [j for j, _ in upstream.get(i, [])] for i in members}
+    sorter: TopologicalSorter = TopologicalSorter(graph)
+    try:
+        sorter.prepare()
+    except CycleError as exc:
+        # Each node of the cycle is an upstream of the next: the order the builds would run in.
+        path = " -> ".join(repr(name(i)) for i in exc.args[1])
+        raise ScheduleRenderError(
+            f"builds[].dependencies form a cycle: {path} (each runs after the one before it), "
+            "so none of them could ever start. Remove one of these dependencies"
+        ) from None
+    order: List[int] = []
+    while sorter.is_active():
+        ready = sorted(sorter.get_ready())
+        order.extend(ready)
+        sorter.done(*ready)
+    return order
+
+
+def _check_asset_loops(dags: List[ScheduledDag]) -> None:
+    """Refuse DAGs that would start each other forever through the assets they write."""
+    writes = {d.build_id: {u for t in d.tasks for u in t.outlets} for d in dags}
+    started_by: Dict[str, List[str]] = {}
+    for dag in dags:
+        for other in dags:
+            shared = sorted(writes[other.build_id] & set(dag.schedule.datasets))
+            if shared and other.build_id == dag.build_id:
+                raise ScheduleRenderError(
+                    f"the DAG of build {dag.build_id!r} writes {shared[0]}, which is also one of "
+                    "its own trigger.datasets, so each run would start the next. Trigger it by "
+                    "another build's output, or on a schedule"
+                )
+            if shared:
+                started_by.setdefault(dag.build_id, []).append(other.build_id)
+    try:
+        TopologicalSorter(started_by).prepare()
+    except CycleError as exc:
+        path = " -> ".join(repr(b) for b in exc.args[1])
+        raise ScheduleRenderError(
+            f"the DAGs of builds {path} start each other in a loop through the assets they "
+            "write (each one's output is in the next one's trigger.datasets). Put one of them "
+            "on a schedule instead"
+        ) from None
+
+
+class _BuildGraph:
+    """The contract's builds as :func:`scheduled_dags` reads them: the dependencies between
+    the builds a DAG runs, and the builds a dependency names that no DAG runs."""
+
+    def __init__(self, contract: Dict[str, Any], builds: List[Dict[str, Any]]) -> None:
+        self.contract = contract
+        self.builds = builds
+        self.managed = _managed_lane(contract)
+        self.kinds = [_classify(b, self.managed) for b in builds]
+        self.in_dags = [i for i, (k, _) in enumerate(self.kinds) if k not in (_OUTSIDE, _ELSEWHERE)]
+        self.positions: Dict[str, List[int]] = {}
+        for i, build in enumerate(builds):
+            if isinstance(build.get("id"), str):
+                self.positions.setdefault(build["id"], []).append(i)
+        #: ``i -> [(j, condition)]``: build ``i`` runs after build ``j``.
+        self.upstream: Dict[int, List[Tuple[int, str]]] = {}
+        #: ``i -> [(build id, why)]``: what build ``i`` depends on that no DAG runs.
+        self.unwaited: Dict[int, List[Tuple[str, str]]] = {}
+        for i in self.in_dags:
+            self._link(i)
+
+    def name(self, i: int) -> Any:
+        return self.builds[i].get("id")
+
+    def _link(self, i: int) -> None:
+        # The id as written names the build in a message; only a build that gets a task needs
+        # one ``--build-id`` takes (:meth:`_task`), as before dependencies were read.
+        build, (kind, trigger) = self.builds[i], self.kinds[i]
+        label = self.name(i)
+        if trigger:
+            _check_trigger_shape(label, kind, trigger)
+        explicit = trigger.get("type") == "dependency"
+        if build.get("dependencies") is None and not explicit:
+            return
+        for upstream_id, condition in _dependencies(build, label):
+            j = self._upstream(label, upstream_id)
+            if self.kinds[j][0] == _OUTSIDE:
+                why = _outside_why(self.builds[j], self.managed)
+                self.unwaited.setdefault(i, []).append((upstream_id, why))
+            else:
+                self.upstream.setdefault(i, []).append((j, condition))
+        if explicit and not self.upstream.get(i):
+            raise ScheduleRenderError(
+                f"build {label!r}: trigger.type dependency runs it after the builds in its "
+                "dependencies, and no DAG runs any of them; give it a trigger of its own"
+            )
+
+    def _upstream(self, build_id: Any, upstream_id: str) -> int:
+        """The position of the build a dependency names, or what is wrong with the name."""
+        where = f"build {build_id!r}: dependency {upstream_id!r}"
+        if upstream_id == build_id:
+            raise ScheduleRenderError(
+                f"build {build_id!r} depends on itself; remove {build_id!r} from its dependencies"
+            )
+        found = self.positions.get(upstream_id, [])
+        if not found:
+            known = ", ".join(repr(b) for b in self.positions) or "none"
+            raise ScheduleRenderError(
+                f"{where} names no build in builds[] (build ids: {known}); use the id of the "
+                "build it runs after"
+            )
+        if len(found) > 1:
+            raise ScheduleRenderError(
+                f"{where} names {len(found)} builds that share that id; give each build its own id"
+            )
+        if self.kinds[found[0]][0] == _ELSEWHERE:
+            raise ScheduleRenderError(
+                f"{where}: {upstream_id!r} is not run by an Airflow DAG (its "
+                "execution.orchestration.engine names another engine, or none), so no task can "
+                f"wait for it. Run both on one engine, or give {build_id!r} a dataset trigger on "
+                f"what {upstream_id!r} writes"
+            )
+        return found[0]
+
+    def groups(self) -> List[List[int]]:
+        """The builds dependencies link, in either direction: one DAG's builds each."""
+        parent = {i: i for i in self.in_dags}
+
+        def root(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for i, ups in self.upstream.items():
+            for j, _ in ups:
+                a, b = root(i), root(j)
+                parent[max(a, b)] = min(a, b)
+        groups: Dict[int, List[int]] = {}
+        for i in self.in_dags:
+            groups.setdefault(root(i), []).append(i)
+        return list(groups.values())
+
+    def dag(self, members: List[int]) -> Optional[ScheduledDag]:
+        """The DAG of one linked group; ``None`` when nothing starts it."""
+        carriers = [i for i in members if self.kinds[i][0] != _NO_TRIGGER]
+        if not carriers:
+            return None  # no build of the group has a trigger
+        schedule = self._shared_schedule(carriers)
+        if schedule is None:
+            return None  # manual, event or timetable: no fluid apply DAG, as for one build
+        order = _run_order(members, self.upstream, self.name)
+        waits: List[Tuple[str, str]] = []
+        for i in order:
+            waits.extend(w for w in self.unwaited.get(i, []) if w not in waits)
+        return ScheduledDag(
+            build_id=_task_build_id(self.builds[carriers[0]]),
+            schedule=schedule,
+            tasks=tuple(self._task(i, order) for i in order),
+            unwaited=tuple(waits),
+        )
+
+    def _shared_schedule(self, carriers: List[int]) -> Optional[DagSchedule]:
+        """The one trigger the builds of a group declare, or what to do about two."""
+        schedules = {i: self._schedule(i) for i in carriers}
+
+        def same_as(i: int) -> Tuple[Any, ...]:
+            s = schedules[i]
+            if s is None:
+                return ("no dag", self.kinds[i][1].get("type"))
+            return (s.cron, s.timezone, frozenset(s.datasets), s.operator)
+
+        first = carriers[0]
+        for other in carriers[1:]:
+            if same_as(other) != same_as(first):
+                raise ScheduleRenderError(
+                    f"builds {self.name(first)!r} and {self.name(other)!r} are linked by "
+                    "builds[].dependencies, so they run in one DAG, but their triggers differ "
+                    f"({_describe(schedules[first], self.kinds[first][1])} vs "
+                    f"{_describe(schedules[other], self.kinds[other][1])}). One DAG runs on one "
+                    "trigger: keep it on one build and remove the other's, or drop the "
+                    f"dependency and give {self.name(other)!r} a dataset trigger on what "
+                    f"{self.name(first)!r} writes"
+                )
+        return schedules[first]
+
+    def _schedule(self, i: int) -> Optional[DagSchedule]:
+        """The validated schedule of build ``i``'s own trigger; ``None`` for one no DAG runs on."""
+        kind, trigger = self.kinds[i]
+        if kind not in _DAG_TRIGGERS:
+            return None
+        build_id = _task_build_id(self.builds[i])
+        timezone = _validate_timezone(trigger.get("timezone"), build_id)
+        cron_value = trigger.get("schedule") or trigger.get("cron")
+        cron = _validate_schedule(cron_value, build_id) if kind != _DATASET else None
+        if kind == _CRON:
+            return DagSchedule(cron=cron, timezone=timezone)
+        uris: List[str] = []
+        for index, item in enumerate(trigger["datasets"]):
+            uri = self._dataset_uri(f"build {build_id!r}: trigger.datasets[{index}]", item)
+            if uri not in uris:
+                uris.append(uri)
+        return DagSchedule(
+            cron=cron,
+            timezone=timezone,
+            datasets=tuple(uris),
+            operator=trigger.get("datasetsOperator") or "all",
+        )
+
+    def _dataset_uri(self, where: str, item: Any) -> str:
+        if isinstance(item, str):
+            try:
+                return normalize_dataset_uri(item)
+            except NotAddressable as exc:
+                raise ScheduleRenderError(f"{where}: {exc}") from None
+        if isinstance(item, dict):
+            return self._expose_ref_uri(where, item)
+        raise ScheduleRenderError(
+            f"{where} must be an asset URI or {{productId, exposeId}} of an expose"
+        )
+
+    def _expose_ref_uri(self, where: str, ref: Mapping[str, Any]) -> str:
+        """The asset URI of a ``{productId, exposeId}`` dataset: an expose of this contract."""
+        product, expose_id = ref.get("productId"), ref.get("exposeId")
+        if not (isinstance(product, str) and product and isinstance(expose_id, str) and expose_id):
+            raise ScheduleRenderError(f"{where} needs both productId and exposeId")
+        if product != self.contract.get("id"):
+            raise ScheduleRenderError(
+                f"{where} names {product}/{expose_id}, an expose of another product. A "
+                "{productId, exposeId} dataset names an expose of this contract; for another "
+                "product's, write its asset URI as a string (that product's fluid apply DAGs "
+                "declare it in outlets=; an aws expose's is s3://<bucket>/<path>)"
+            )
+        exposes = [e for e in self.contract.get("exposes") or [] if isinstance(e, dict)]
+        expose = next((e for e in exposes if _expose_id(e) == expose_id), None)
+        if expose is None:
+            declared = ", ".join(repr(_expose_id(e)) for e in exposes) or "none"
+            raise ScheduleRenderError(
+                f"{where} names expose {expose_id!r}, which this contract does not declare "
+                f"(exposes: {declared})"
+            )
+        uri, why = expose_asset_uri(expose)
+        if uri is None:
+            raise ScheduleRenderError(
+                f"{where}: expose {expose_id!r} names no Airflow asset: {why}. Write the asset "
+                "URI its data lands at as a string instead"
+            )
+        writers = builds_writing_expose(expose_id, self.builds)
+        if writers and all(_classify(b, self.managed)[0] == _OUTSIDE for b in writers):
+            names = ", ".join(repr(b.get("id")) for b in writers)
+            raise ScheduleRenderError(
+                f"{where}: expose {expose_id!r} is written by {names}, which no DAG runs "
+                f"({_outside_why(writers[0], self.managed)}), so no task ever updates its asset "
+                "and the trigger would never fire. Run this build on a schedule "
+                "(trigger.type: schedule) instead"
+            )
+        return uri
+
+    def _task(self, i: int, order: List[int]) -> BuildTask:
+        build = self.builds[i]
+        build_id = _task_build_id(build)
+        conditions = {condition for _, condition in self.upstream.get(i, [])}
+        if len(conditions) > 1:
+            raise ScheduleRenderError(
+                f"build {build_id!r} depends on builds with different conditions "
+                f"({', '.join(sorted(conditions))}); Airflow gives a task one trigger rule, so "
+                "give all of one build's dependencies the same condition"
+            )
+        spark = _spark_kind(build, self.managed) == "scheduled"
+        if spark:
+            _check_spark_ids(self.contract, build_id)
+        upstream_ids = {j for j, _ in self.upstream.get(i, [])}
+        return BuildTask(
+            build_id=build_id,
+            retries=_retries(build),
+            task_timeout_s=_task_timeout_s(build, build_id) if spark else None,
+            upstream=tuple(self.name(j) for j in order if j in upstream_ids),
+            trigger_rule=TRIGGER_RULES[conditions.pop()] if conditions else None,
+            outlets=self._outlets(build),
+        )
+
+    def _outlets(self, build: Dict[str, Any]) -> Tuple[str, ...]:
+        """The asset URIs of the exposes the build writes (``util.contract.builds_writing_expose``);
+        an expose that names no asset (:func:`expose_asset_uri`) is left out."""
+        uris: List[str] = []
+        for expose in self.contract.get("exposes") or []:
+            if not isinstance(expose, dict):
+                continue
+            if not any(w is build for w in builds_writing_expose(_expose_id(expose), self.builds)):
+                continue
+            uri, _ = expose_asset_uri(expose)
+            if uri and uri not in uris:
+                uris.append(uri)
+        return tuple(uris)
+
+
+def _expose_id(expose: Mapping[str, Any]) -> Any:
+    return expose.get("exposeId") or expose.get("id")
+
+
+def scheduled_dags(contract: Dict[str, Any]) -> List[ScheduledDag]:
+    """Every ``fluid apply`` DAG the contract's builds make, validated for rendering.
+
+    Raises :class:`ScheduleRenderError` when a build's id, trigger or dependencies cannot be
+    rendered safely, saying what to change.
+    """
+    raw_builds = contract.get("builds")
+    if not isinstance(raw_builds, list):
+        return []
+    graph = _BuildGraph(contract, [b for b in raw_builds if isinstance(b, dict)])
+    dags = [dag for members in graph.groups() if (dag := graph.dag(members)) is not None]
+    _check_asset_loops(dags)
+    return dags
+
+
+def scheduled_builds(contract: Dict[str, Any]) -> List[ScheduledBuild]:
+    """Every build that gets a task in a ``fluid apply`` DAG (:func:`scheduled_dags`), with the
+    cron and timezone of its DAG (no cron: ``""``).
+
+    Raises :class:`ScheduleRenderError` when a scheduled build's id, trigger or dependencies
+    cannot be rendered safely.
+    """
+    return [
+        ScheduledBuild(
+            build_id=task.build_id,
+            schedule=dag.schedule.cron or "",
+            timezone=dag.schedule.timezone,
+            retries=task.retries,
+            task_timeout_s=task.task_timeout_s,
+        )
+        for dag in scheduled_dags(contract)
+        for task in dag.tasks
+    ]
 
 
 def contract_env_names(contract: Any) -> List[str]:
@@ -699,16 +1207,7 @@ def _wrap(words: List[str], indent: str, width: int = 76) -> str:
     return "\n".join(lines)
 
 
-_DAG_DOC = (
-    '"""Scheduled fluid build, generated by fluid. Edit the contract, not this file.\n'
-    "\n"
-    "Every run executes this on the Airflow worker, with the constants below\n"
-    "filled in (`--env` is left out when FLUID_ENV_NAME is empty):\n"
-    "\n"
-    '    cd "$FLUID_PROJECT_DIR"\n'
-    '    fluid apply "$FLUID_PROJECT_DIR/$CONTRACT_PATH" --env "$FLUID_ENV_NAME" \\\\\n'
-    '        --mode amend-and-build --build-id "$BUILD_ID" --yes\n'
-    "\n"
+_DOC_REQUIREMENTS = (
     "Worker requirements:\n"
     "\n"
     "- FLUID_PROJECT_DIR names the directory that holds the product checkout,\n"
@@ -722,8 +1221,307 @@ _DAG_DOC = (
     "  the variables the contract reads (CONTRACT_ENV_NAMES), and any names\n"
     "  listed, space separated, in FLUID_DAG_ENV_PASSTHROUGH. fluid starts with\n"
     "  nothing else, and never with a variable whose name starts AIRFLOW.\n"
-    '"""'
 )
+
+_ONE_BUILD_RUN = (
+    "Every run executes this on the Airflow worker, with the constants below\n"
+    "filled in (`--env` is left out when FLUID_ENV_NAME is empty):\n"
+    "\n"
+    '    cd "$FLUID_PROJECT_DIR"\n'
+    '    fluid apply "$FLUID_PROJECT_DIR/$CONTRACT_PATH" --env "$FLUID_ENV_NAME" \\\\\n'
+    '        --mode amend-and-build --build-id "$BUILD_ID" --yes\n'
+)
+
+_BUILDS_RUN = (
+    "Each task runs one build on the Airflow worker, with the constants below\n"
+    "filled in (`--env` is left out when FLUID_ENV_NAME is empty) and the\n"
+    "task's own build, its task_id, as the build id:\n"
+    "\n"
+    '    cd "$FLUID_PROJECT_DIR"\n'
+    '    fluid apply "$FLUID_PROJECT_DIR/$CONTRACT_PATH" --env "$FLUID_ENV_NAME" \\\\\n'
+    "        --mode amend-and-build --build-id <task_id> --yes\n"
+)
+
+_TRIGGER_RULES_NOTE = (
+    "BUILD_ID is the build whose trigger runs this DAG. A build that depends on others, "
+    "as its contract's builds[].dependencies say, starts once they succeeded (trigger rule "
+    "all_success, condition: success), once they finished whatever their outcome (all_done, "
+    "condition: completion), or at once, without waiting for them (always, condition: "
+    "always)."
+)
+
+
+def _paragraph(text: str) -> str:
+    return _wrap(text.split(), "", 72)
+
+
+def _doc(title: str, run: str, notes: List[str]) -> str:
+    """The DAG file's docstring, also its ``doc_md``. Only fluid's own text and validated
+    ids go in it: a contract value that could close the triple quote never does."""
+    return (
+        f'"""{title}, generated by fluid. Edit the contract, not this file.\n'
+        "\n"
+        f"{run}"
+        "\n" + "".join(f"{_paragraph(note)}\n\n" for note in notes) + _DOC_REQUIREMENTS + '"""'
+    )
+
+
+_DAG_DOC = _doc("Scheduled fluid build", _ONE_BUILD_RUN, [])
+
+
+def _schedule_note(schedule: DagSchedule) -> Optional[str]:
+    if not schedule.datasets:
+        return None
+    if schedule.operator == "any":
+        update = "any asset in DATASETS is updated"
+    else:
+        update = "every asset in DATASETS has been updated since its last run"
+    when = "on SCHEDULE, and also when" if schedule.cron is not None else "when"
+    return (
+        f"This DAG runs {when} {update}. An asset is updated when a task that declares it in "
+        "its outlets succeeds, in any DAG of this Airflow."
+    )
+
+
+def _unwaited_note(unwaited: Tuple[Tuple[str, str], ...]) -> Optional[str]:
+    if not unwaited:
+        return None
+    names = "; ".join(
+        f"{escape_for_docstring(py_comment_text(build_id))} ({why})" for build_id, why in unwaited
+    )
+    return (
+        f"A build here depends on these, but no DAG runs them, so no task waits for them: {names}."
+    )
+
+
+def _timeout_expr(task_timeout_s: Optional[int]) -> str:
+    return f"timedelta(seconds={int(task_timeout_s)})" if task_timeout_s else "timedelta(hours=3)"
+
+
+def _asset_imports(schedule: DagSchedule) -> str:
+    """The ``Asset`` imports a DAG with outlets or datasets needs, Airflow 3 first."""
+    if schedule.datasets and schedule.cron is not None:
+        any_name = (
+            (", AssetAny", ", DatasetAny as AssetAny") if schedule.operator == "any" else ("", "")
+        )
+        return (
+            "from airflow.timetables.trigger import CronTriggerTimetable\n"
+            "\n"
+            "try:  # Airflow 3\n"
+            f"    from airflow.sdk import Asset{any_name[0]}\n"
+            "    from airflow.timetables.assets import AssetOrTimeSchedule\n"
+            "\n"
+            "    def asset_or_time_schedule(timetable, assets):\n"
+            "        return AssetOrTimeSchedule(timetable=timetable, assets=assets)\n"
+            "\n"
+            "except ImportError:  # Airflow 2.9+\n"
+            f"    from airflow.datasets import Dataset as Asset{any_name[1]}\n"
+            "    from airflow.timetables.datasets import DatasetOrTimeSchedule\n"
+            "\n"
+            "    def asset_or_time_schedule(timetable, assets):\n"
+            "        return DatasetOrTimeSchedule(timetable=timetable, datasets=assets)\n"
+            "\n"
+        )
+    if schedule.datasets and schedule.operator == "any":
+        return (
+            "try:  # Airflow 3\n"
+            "    from airflow.sdk import Asset, AssetAny\n"
+            "except ImportError:  # Airflow 2.9+\n"
+            "    from airflow.datasets import Dataset as Asset, DatasetAny as AssetAny\n"
+            "\n"
+        )
+    return (
+        "try:  # Airflow 3\n"
+        "    from airflow.sdk import Asset\n"
+        "except ImportError:  # Airflow 2.x\n"
+        "    from airflow.datasets import Dataset as Asset\n"
+        "\n"
+    )
+
+
+def _schedule_expr(schedule: DagSchedule) -> str:
+    if not schedule.datasets:
+        return "SCHEDULE"
+    if schedule.operator == "any":
+        assets = "AssetAny(*(Asset(uri) for uri in DATASETS))"
+    else:
+        assets = "[Asset(uri) for uri in DATASETS]"
+    if schedule.cron is None:
+        return assets
+    return (
+        "asset_or_time_schedule(\n"
+        "        CronTriggerTimetable(SCHEDULE, timezone=TIMEZONE),\n"
+        f"        {assets},\n"
+        "    )"
+    )
+
+
+def render_build_task(task: BuildTask, *, only: bool) -> str:
+    """The source of one build's node: a BashOperator that runs ``fluid apply --build-id``.
+
+    This is the one function that decides what runs a build; the DAG's schedule and its edges
+    are written around it. The node of a DAG with several builds is ``tasks[<build id>]``, and
+    the edges refer to it by that key alone, so anything that sets ``tasks[<build id>]`` (a task
+    group, for one) can stand in for the BashOperator. A DAG's ``only`` task is the
+    ``fluid_apply`` task the DAG of one build has always had, reading ``BUILD_ID``.
+    """
+    lit = py_str_literal
+    if only:
+        head, task_id, build_id = "    BashOperator(\n", '"fluid_apply"', "BUILD_ID"
+    else:
+        head = f"    tasks[{lit(task.build_id)}] = BashOperator(\n"
+        task_id = build_id = lit(task.build_id)
+    extra = ""
+    if not only:
+        extra += f"        retries={int(task.retries)},\n"
+        extra += f"        execution_timeout={_timeout_expr(task.task_timeout_s)},\n"
+        if task.trigger_rule:
+            extra += f"        trigger_rule={lit(task.trigger_rule)},\n"
+    if task.outlets:
+        extra += (
+            "        outlets=[\n"
+            + "".join(f"            Asset({lit(uri)}),\n" for uri in task.outlets)
+            + "        ],\n"
+        )
+    return (
+        f"{head}"
+        f"        task_id={task_id},\n"
+        "        bash_command=BASH_COMMAND,\n"
+        "        env={\n"
+        '            "FLUID_DAG_CONTRACT": CONTRACT_PATH,\n'
+        '            "FLUID_DAG_ENV": FLUID_ENV_NAME,\n'
+        f'            "FLUID_DAG_BUILD_ID": {build_id},\n'
+        '            "FLUID_DAG_CONTRACT_ENV": CONTRACT_ENV_NAMES,\n'
+        "        },\n"
+        "        append_env=True,\n"
+        "        skip_on_exit_code=None,\n"
+        f"{extra}"
+        "    )\n"
+    )
+
+
+def _edges(tasks: Tuple[BuildTask, ...]) -> str:
+    lit = py_str_literal
+    lines = []
+    for task in tasks:
+        if not task.upstream:
+            continue
+        nodes = [f"tasks[{lit(u)}]" for u in task.upstream]
+        left = nodes[0] if len(nodes) == 1 else "[" + ", ".join(nodes) + "]"
+        lines.append(f"    {left} >> tasks[{lit(task.build_id)}]\n")
+    return "".join(lines)
+
+
+_IMPORTS = (
+    "from datetime import timedelta\n"
+    "\n"
+    "import pendulum\n"
+    "\n"
+    "try:  # Airflow 3\n"
+    "    from airflow.sdk import DAG\n"
+    "except ImportError:  # Airflow 2.x\n"
+    "    from airflow import DAG\n"
+    "\n"
+    "try:  # Airflow 3, or Airflow 2 with apache-airflow-providers-standard\n"
+    "    from airflow.providers.standard.operators.bash import BashOperator\n"
+    "except ImportError:  # Airflow 2.x core operator\n"
+    "    from airflow.operators.bash import BashOperator\n"
+    "\n"
+)
+
+
+def _dag_doc(product_id: str, dag: ScheduledDag) -> Tuple[str, str]:
+    """The DAG file's docstring and the DAG's ``description``."""
+    only = len(dag.tasks) == 1
+    notes = [] if only else [_TRIGGER_RULES_NOTE]
+    notes += [n for n in (_schedule_note(dag.schedule), _unwaited_note(dag.unwaited)) if n]
+    if only:
+        return (
+            _doc("Scheduled fluid build", _ONE_BUILD_RUN, notes),
+            f"fluid apply {product_id} --build-id {dag.tasks[0].build_id}",
+        )
+    builds = ", ".join(t.build_id for t in dag.tasks)
+    return (
+        _doc("Scheduled fluid builds", _BUILDS_RUN, notes),
+        f"fluid apply {product_id} --build-id each of {builds}",
+    )
+
+
+def _schedule_constants(dag: ScheduledDag) -> str:
+    lit = py_str_literal
+    schedule = dag.schedule
+    out = f"SCHEDULE = {lit(schedule.cron)}\n" if schedule.cron is not None else ""
+    if schedule.datasets:
+        out += "DATASETS = [\n" + "".join(f"    {lit(uri)},\n" for uri in schedule.datasets) + "]\n"
+    out += f"TIMEZONE = {lit(schedule.timezone)}\n"
+    if len(dag.tasks) == 1:
+        out += f"RETRIES = {int(dag.tasks[0].retries)}\n"
+    return out
+
+
+def _dag_tasks(dag: ScheduledDag) -> Tuple[str, str]:
+    """The DAG's ``default_args`` entries and the source of its tasks and edges."""
+    if len(dag.tasks) == 1:
+        task = dag.tasks[0]
+        default_args = (
+            '        "owner": "fluid",\n'
+            '        "retries": RETRIES,\n'
+            '        "retry_delay": timedelta(minutes=5),\n'
+            f'        "execution_timeout": {_timeout_expr(task.task_timeout_s)},\n'
+        )
+        return default_args, render_build_task(task, only=True)
+    nodes = "".join(render_build_task(t, only=False) for t in dag.tasks)
+    default_args = '        "owner": "fluid",\n        "retry_delay": timedelta(minutes=5),\n'
+    return default_args, f"    tasks = {{}}\n{nodes}\n{_edges(dag.tasks)}"
+
+
+def render_scheduled_dag(
+    *,
+    product_id: str,
+    dag: ScheduledDag,
+    env: Optional[str],
+    contract_path: str,
+    env_names: List[str],
+) -> str:
+    """Render one DAG file (:func:`scheduled_dags`). Inputs must already be validated."""
+    lit = py_str_literal
+    doc, description = _dag_doc(product_id, dag)
+    default_args, body = _dag_tasks(dag)
+    uses_assets = bool(dag.schedule.datasets) or any(t.outlets for t in dag.tasks)
+    script = "".join(f"        {lit(line)},\n" for line in BASH_SCRIPT_LINES)
+    return (
+        f"{doc}\n"
+        "\n"
+        f"{_IMPORTS}"
+        f"{_asset_imports(dag.schedule) if uses_assets else ''}"
+        f"PRODUCT_ID = {lit(product_id)}\n"
+        f"BUILD_ID = {lit(dag.build_id)}\n"
+        f"CONTRACT_PATH = {lit(contract_path)}\n"
+        f"FLUID_ENV_NAME = {lit(env or '')}\n"
+        f"CONTRACT_ENV_NAMES = {lit(' '.join(env_names))}\n"
+        f"{_schedule_constants(dag)}"
+        "\n"
+        'BASH_COMMAND = "\\n".join(\n'
+        "    [\n"
+        f"{script}"
+        "    ]\n"
+        ")\n"
+        "\n"
+        "with DAG(\n"
+        f"    dag_id={lit(dag_id_for(product_id, dag.build_id, env))},\n"
+        f"    description={lit(description)},\n"
+        f"    schedule={_schedule_expr(dag.schedule)},\n"
+        "    start_date=pendulum.datetime(2026, 1, 1, tz=TIMEZONE),\n"
+        "    catchup=False,\n"
+        "    max_active_runs=1,\n"
+        "    default_args={\n"
+        f"{default_args}"
+        "    },\n"
+        '    tags=["fluid", PRODUCT_ID[:100]],\n'
+        "    doc_md=__doc__,\n"
+        ") as dag:\n"
+        f"{body}"
+    )
 
 
 def render_dag(
@@ -734,75 +1532,17 @@ def render_dag(
     contract_path: str,
     env_names: List[str],
 ) -> str:
-    """Render one DAG file. Inputs must already be validated."""
-    lit = py_str_literal
-    script = "".join(f"        {lit(line)},\n" for line in BASH_SCRIPT_LINES)
-    task_timeout = (
-        f"timedelta(seconds={int(build.task_timeout_s)})"
-        if build.task_timeout_s
-        else "timedelta(hours=3)"
-    )
-    description = f"fluid apply {product_id} --build-id {build.build_id}"
-    return (
-        f"{_DAG_DOC}\n"
-        "\n"
-        "from datetime import timedelta\n"
-        "\n"
-        "import pendulum\n"
-        "\n"
-        "try:  # Airflow 3\n"
-        "    from airflow.sdk import DAG\n"
-        "except ImportError:  # Airflow 2.x\n"
-        "    from airflow import DAG\n"
-        "\n"
-        "try:  # Airflow 3, or Airflow 2 with apache-airflow-providers-standard\n"
-        "    from airflow.providers.standard.operators.bash import BashOperator\n"
-        "except ImportError:  # Airflow 2.x core operator\n"
-        "    from airflow.operators.bash import BashOperator\n"
-        "\n"
-        f"PRODUCT_ID = {lit(product_id)}\n"
-        f"BUILD_ID = {lit(build.build_id)}\n"
-        f"CONTRACT_PATH = {lit(contract_path)}\n"
-        f"FLUID_ENV_NAME = {lit(env or '')}\n"
-        f"CONTRACT_ENV_NAMES = {lit(' '.join(env_names))}\n"
-        f"SCHEDULE = {lit(build.schedule)}\n"
-        f"TIMEZONE = {lit(build.timezone)}\n"
-        f"RETRIES = {int(build.retries)}\n"
-        "\n"
-        'BASH_COMMAND = "\\n".join(\n'
-        "    [\n"
-        f"{script}"
-        "    ]\n"
-        ")\n"
-        "\n"
-        "with DAG(\n"
-        f"    dag_id={lit(dag_id_for(product_id, build.build_id, env))},\n"
-        f"    description={lit(description)},\n"
-        "    schedule=SCHEDULE,\n"
-        "    start_date=pendulum.datetime(2026, 1, 1, tz=TIMEZONE),\n"
-        "    catchup=False,\n"
-        "    max_active_runs=1,\n"
-        "    default_args={\n"
-        '        "owner": "fluid",\n'
-        '        "retries": RETRIES,\n'
-        '        "retry_delay": timedelta(minutes=5),\n'
-        f'        "execution_timeout": {task_timeout},\n'
-        "    },\n"
-        '    tags=["fluid", PRODUCT_ID[:100]],\n'
-        "    doc_md=__doc__,\n"
-        ") as dag:\n"
-        "    BashOperator(\n"
-        '        task_id="fluid_apply",\n'
-        "        bash_command=BASH_COMMAND,\n"
-        "        env={\n"
-        '            "FLUID_DAG_CONTRACT": CONTRACT_PATH,\n'
-        '            "FLUID_DAG_ENV": FLUID_ENV_NAME,\n'
-        '            "FLUID_DAG_BUILD_ID": BUILD_ID,\n'
-        '            "FLUID_DAG_CONTRACT_ENV": CONTRACT_ENV_NAMES,\n'
-        "        },\n"
-        "        append_env=True,\n"
-        "        skip_on_exit_code=None,\n"
-        "    )\n"
+    """Render the one-task DAG of a build on a cron. Inputs must already be validated."""
+    return render_scheduled_dag(
+        product_id=product_id,
+        dag=ScheduledDag(
+            build_id=build.build_id,
+            schedule=DagSchedule(cron=build.schedule, timezone=build.timezone),
+            tasks=(BuildTask(build.build_id, build.retries, build.task_timeout_s),),
+        ),
+        env=env,
+        contract_path=contract_path,
+        env_names=env_names,
     )
 
 
@@ -812,7 +1552,7 @@ def render_fluid_apply_dags(
     env: Optional[str],
     contract_path: str,
 ) -> Dict[str, str]:
-    """Render one DAG per scheduled build: ``{filename: source}``.
+    """Render every DAG of :func:`scheduled_dags`: ``{filename: source}``.
 
     ``env`` is the overlay env every run passes to ``fluid apply --env``
     (``None`` or empty omits the flag). ``contract_path`` is the contract's
@@ -825,16 +1565,16 @@ def render_fluid_apply_dags(
     env_names = contract_env_names(contract)
 
     files: Dict[str, str] = {}
-    for build in scheduled_builds(contract):
-        name = dag_filename_for(build.build_id)
+    for dag in scheduled_dags(contract):
+        name = dag_filename_for(dag.build_id)
         if name in files:
             raise ScheduleRenderError(
-                f"builds {build.build_id!r} and another scheduled build map to the same "
+                f"builds {dag.build_id!r} and another scheduled build map to the same "
                 f"DAG file {name!r}; give them ids that differ in more than '.' or '-'"
             )
-        files[name] = render_dag(
+        files[name] = render_scheduled_dag(
             product_id=product_id,
-            build=build,
+            dag=dag,
             env=env_value,
             contract_path=rel_path,
             env_names=env_names,
@@ -850,17 +1590,25 @@ __all__ = [
     "PASSTHROUGH_NAMES",
     "PASSTHROUGH_PREFIXES",
     "PROJECT_DIR_ENV",
+    "TRIGGER_RULES",
+    "BuildTask",
+    "DagSchedule",
     "ScheduleRenderError",
     "ScheduledBuild",
+    "ScheduledDag",
     "contract_env_names",
     "dag_filename_for",
     "dag_id_for",
     "has_explicit_tasks",
     "has_scheduled_builds",
+    "render_build_task",
     "render_dag",
     "render_fluid_apply_dags",
+    "render_scheduled_dag",
+    "runs_only_outside_schedulers",
     "schedule_scope_for",
     "scheduled_builds",
+    "scheduled_dags",
     "uses_fluid_apply_dags",
     "validate_contract_path",
     "validate_env_name",

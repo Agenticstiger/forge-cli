@@ -7,14 +7,17 @@ Generates schedule/orchestration artifacts (Airflow DAGs, Dagster pipelines,
 Prefect flows) from a FLUID contract.  The scheduler engine is auto-detected
 from ``orchestration.engine`` in the contract.
 
-Builds that declare ``execution.trigger.schedule`` get one Airflow DAG each
-that runs the build through ``fluid apply --mode amend-and-build --build-id
-<id> --yes`` (see :mod:`fluid_build.schedulers.airflow.fluid_apply`). That
-is the rendering whenever the engine is Airflow and the contract declares no
-explicit ``orchestration.tasks``; with no ``orchestration.engine`` at all,
-such a contract defaults to Airflow. The DAG reads the project directory from
-``$FLUID_PROJECT_DIR`` on the worker and appends the contract's path relative
-to the current directory (or ``--contract-path``).
+Builds that declare a trigger (``execution.trigger``: a cron, datasets, or
+both) get Airflow DAGs whose every task runs one build through ``fluid apply
+--mode amend-and-build --build-id <id> --yes`` (see
+:mod:`fluid_build.schedulers.airflow.fluid_apply`). Builds that
+``builds[].dependencies`` link share one DAG, each task after the builds it
+depends on. That is the rendering whenever the engine is Airflow and the
+contract declares no explicit ``orchestration.tasks``; with no
+``orchestration.engine`` at all, such a contract defaults to Airflow. The DAG
+reads the project directory from ``$FLUID_PROJECT_DIR`` on the worker and
+appends the contract's path relative to the current directory (or
+``--contract-path``).
 
 Usage:
     fluid generate schedule                                    # discover contract + scheduler
@@ -47,9 +50,12 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
         description="""
         Generate schedule/orchestration artifacts from a FLUID contract.
         The scheduler engine is auto-detected from orchestration.engine.
-        Builds with execution.trigger.schedule and no explicit
-        orchestration.tasks get Airflow DAGs (the default engine) that run
-        each build through fluid apply --mode amend-and-build.
+        Builds with an execution.trigger (type schedule, dataset or
+        schedule_and_dataset) and no explicit orchestration.tasks get
+        Airflow DAGs (the default engine) that run each build through
+        fluid apply --mode amend-and-build. Builds that builds[].dependencies
+        link run in one DAG, in dependency order; each task declares the
+        assets its build writes as outlets.
 
         Supports Airflow (generates DAG files), Dagster (generates pipeline
         definitions), and Prefect (generates flow definitions).
@@ -149,28 +155,31 @@ def run(args: Any, logger: logging.Logger) -> int:
 
         # --- Resolve scheduler ---
         from fluid_build.schedulers.airflow import fluid_apply
-        from fluid_build.util.contract import has_only_unscheduled_builds
 
         scheduler_name = getattr(args, "scheduler", None)
         if not scheduler_name:
             orchestration = contract.get("orchestration", {})
             scheduler_name = orchestration.get("engine", "")
         if not scheduler_name and fluid_apply.has_scheduled_builds(contract):
-            # A build that declares a cron trigger has said WHEN it runs. The
+            # A build that declares a trigger has said WHEN it runs. The
             # artifact is inert until schedule-sync pushes it to a scheduler
             # the operator names, so defaulting WHO renders it commits nothing.
             scheduler_name = fluid_apply.DEFAULT_ENGINE
 
-        # A contract whose every build runs on its own platform (a Flink job, or
-        # a build whose trigger is continuous) has nothing to schedule, which is
-        # not an error: unless it hand-declares orchestration tasks, or names a
-        # scheduler that does not exist.
-        if has_only_unscheduled_builds(contract) and not fluid_apply.has_explicit_tasks(contract):
+        # A contract whose every build runs on its own platform (a Flink job, a
+        # stream fluid apply keeps running, or a build whose trigger is
+        # continuous) has nothing to schedule, which is not an error: unless it
+        # hand-declares orchestration tasks, or names a scheduler that does not
+        # exist.
+        if fluid_apply.runs_only_outside_schedulers(contract) and not (
+            fluid_apply.has_explicit_tasks(contract)
+        ):
             from fluid_build.schedulers import has_scheduler
 
             if not scheduler_name or has_scheduler(scheduler_name):
                 cprint(
-                    "Every build runs outside forge-cli (a Flink job, for example) or "
+                    "No build needs a DAG: every build runs outside forge-cli (a Flink "
+                    "job, for example), as a stream that fluid apply keeps running, or "
                     "continuously (trigger.type: continuous), so there is nothing to "
                     "schedule. No files written."
                 )

@@ -1,0 +1,111 @@
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
+
+"""``fluid generate schedule`` renders a contract's build graph: builds linked by
+``builds[].dependencies`` run in one DAG, and a dataset trigger runs a DAG when the assets
+another DAG's tasks write are updated.
+
+The graph a reference AWS product needs, from its contract alone: a raw Kafka stream that
+``fluid apply`` keeps running (no DAG), a daily Spark SQL batch and the build that runs after it
+(one DAG), and an hourly dbt build that also runs whenever the daily table updates.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+from pathlib import Path
+
+import pytest
+import yaml
+
+from fluid_build.cli import generate_schedule
+from tests.cli._schedule_dag_fixtures import StubAsset, load_dag, run_task
+from tests.schedulers.fluid_apply_fixtures import SPARK_CONTRACT, events_pipeline
+
+LOG = logging.getLogger("test.generate_schedule_build_graph")
+CONTRACT = "contracts/events/contract.fluid.yaml"
+
+
+def _project(root: Path, contract: dict) -> Path:
+    path = root / CONTRACT
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
+    return path
+
+
+def _generate(root: Path, monkeypatch: pytest.MonkeyPatch, *argv: str) -> int:
+    parser = argparse.ArgumentParser()
+    generate_schedule.register_subcommand(parser.add_subparsers())
+    monkeypatch.chdir(root)
+    return generate_schedule.run(parser.parse_args(["schedule", CONTRACT, "-o", "out", *argv]), LOG)
+
+
+def test_the_events_graph_renders_from_the_contract_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _project(tmp_path, events_pipeline())
+    assert _generate(tmp_path, monkeypatch, "--env", "aws") == 0
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == [
+        "daily_curated_dag.py",
+        "hourly_marts_dag.py",
+    ]
+    daily = load_dag((tmp_path / "out" / "daily_curated_dag.py").read_text(), monkeypatch)
+    assert daily.dag["dag_id"] == "platform.events__aws__daily-curated"
+    assert daily.edges == [("daily-curated", "daily-users")]
+    hourly = load_dag((tmp_path / "out" / "hourly_marts_dag.py").read_text(), monkeypatch)
+    assert hourly.dag["schedule"].assets == [
+        StubAsset("s3://lake/iceberg/curated/events_daily", "Asset")
+    ]
+    assert daily.tasks[0]["outlets"] == hourly.dag["schedule"].assets
+
+
+def test_each_task_runs_fluid_apply_for_its_own_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    contract = _project(tmp_path, events_pipeline())
+    assert _generate(tmp_path, monkeypatch) == 0
+    daily = load_dag((tmp_path / "out" / "daily_curated_dag.py").read_text(), monkeypatch)
+    for task, build in zip(daily.tasks, ("daily-curated", "daily-users"), strict=True):
+        run = run_task(task, tmp_path, {"FLUID_PROJECT_DIR": str(tmp_path)})
+        assert run.returncode == 0, run.stderr
+        assert run.argv is not None
+        assert os.path.realpath(run.argv[1]) == os.path.realpath(contract)
+        assert run.argv[2:] == ["--mode", "amend-and-build", "--build-id", build, "--yes"]
+
+
+def test_a_graph_fluid_cannot_render_fails_with_what_to_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    contract = events_pipeline()
+    contract["builds"][2]["execution"] = {"trigger": {"type": "schedule", "schedule": "@hourly"}}
+    _project(tmp_path, contract)
+    with caplog.at_level(logging.ERROR):
+        assert _generate(tmp_path, monkeypatch) == 2
+    text = " ".join(caplog.text.split())
+    assert "generate_schedule_invalid_schedule" in text
+    assert "builds 'daily-curated' and 'daily-users' are linked by builds[].dependencies" in text
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_contract_of_streams_alone_needs_no_dag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    contract = dict(SPARK_CONTRACT, builds=[SPARK_CONTRACT["builds"][0]])
+    _project(tmp_path, contract)
+    assert _generate(tmp_path, monkeypatch) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "No build needs a DAG" in out
+    assert "as a stream that fluid apply keeps running" in out
+    assert "No scheduler engine specified" not in out
+    assert not (tmp_path / "out").exists()
+
+
+def test_dag_id_and_schedule_overrides_stay_refused_for_a_build_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _project(tmp_path, events_pipeline())
+    with caplog.at_level(logging.ERROR):
+        assert _generate(tmp_path, monkeypatch, "--dag-id", "x") == 2
+    assert "generate_schedule_override_not_supported" in caplog.text
