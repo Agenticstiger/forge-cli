@@ -190,7 +190,7 @@ def test_emu_pubsub_topic_and_subscription_plan_clean(gcp_emulator_project):
 
 
 def test_emu_multi_exposure_plan_clean(gcp_emulator_project):
-    """Emitter half: a contract mixing BQ + GCS + Pub/Sub → plan = 4 adds.
+    """Emitter half: a contract mixing BQ + GCS + Pub/Sub → plan = 5 adds.
     Catches missing ``depends_on`` / cross-resource ordering bugs that
     single-format tests can't see."""
     contract = {

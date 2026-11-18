@@ -188,7 +188,8 @@ def _bq_outcome(raw: Any) -> column_types.TypeOutcome:
             return column_types.exact(decimal[0])
         match = _BQ_DECIMAL_ARGS_RE.match(rest)
         if match is not None:
-            precision, scale = int(match.group(1)), int(match.group(2) or 0)
+            precision = _bq_decimal_number(match.group(1))
+            scale = _bq_decimal_number(match.group(2) or "0")
             if precision < max(1, scale):
                 return column_types.refused(
                     f"whose precision and scale {rest} are not a decimal's",
@@ -218,8 +219,8 @@ def _bq_decimal(raw: Any) -> Optional[Tuple[str, int, Optional[int]]]:
     match = _BQ_DECIMAL_ARGS_RE.fullmatch(rest)
     if match is None:
         return None
-    precision = int(match.group(1))
-    scale = None if match.group(2) is None else int(match.group(2))
+    precision = _bq_decimal_number(match.group(1))
+    scale = None if match.group(2) is None else _bq_decimal_number(match.group(2))
     digits = scale or 0
     if precision < max(1, digits):
         return None
@@ -232,6 +233,14 @@ def _bq_decimal(raw: Any) -> Optional[Tuple[str, int, Optional[int]]]:
     if digits <= _BQ_BIGNUMERIC_SCALE and precision <= digits + _BQ_BIGNUMERIC_INTEGER_DIGITS:
         return "BIGNUMERIC", precision, scale
     return None
+
+
+def _bq_decimal_number(digits: str) -> int:
+    """A declared precision or scale; one of more than four digits is past any BigQuery
+    decimal (BIGNUMERIC goes to 76) and reads as 10000, never through ``int()``, which
+    refuses a string of more than 4300 digits."""
+    significant = digits.lstrip("0")
+    return int(significant or "0") if len(significant) <= 4 else 10_000
 
 
 def _bq_parameters(raw: Any) -> Dict[str, str]:

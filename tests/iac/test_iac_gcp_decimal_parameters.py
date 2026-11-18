@@ -23,6 +23,7 @@ import json
 import pytest
 
 from fluid_build.iac import build_module, get_iac_plugin
+from fluid_build.iac.providers import gcp
 from fluid_build.iac.providers.gcp import _bq_decimal, _bq_field, _bq_sql_type
 
 pytestmark = [pytest.mark.unit, pytest.mark.provider, pytest.mark.gcp]
@@ -88,6 +89,21 @@ def test_the_limits_are_bigquerys():
     assert _bq_decimal("decimal(2,5)") is None
     assert _bq_decimal("decimal") is None
     assert _bq_decimal("string(10)") is None
+
+
+@pytest.mark.parametrize(
+    "declared, status",
+    [("decimal(" + "9" * 5000 + ")", "lossy"), ("decimal(2," + "9" * 5000 + ")", "refused")],
+    ids=["huge-precision", "huge-scale"],
+)
+def test_a_precision_past_int_s_digit_limit_is_classified_not_raised(declared, status):
+    """``int()`` refuses a string of more than 4300 digits; such a decimal is out of any
+    BigQuery range, so validate warns or refuses it instead of failing with a ValueError."""
+    from fluid_build.engines.dbt import _types as dbt_types
+
+    assert gcp._bq_outcome(declared).status == status
+    assert "precision" not in _bq_field({"name": "amt", "type": declared})
+    assert dbt_types.sql_type(declared, "bigquery")
 
 
 def test_the_dbt_spelling_matches_the_table():
