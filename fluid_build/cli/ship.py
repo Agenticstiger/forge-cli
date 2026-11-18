@@ -40,6 +40,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from ..observability.tracing import traced_stage
 from . import _ci_output
+from . import _ship_release as release
 from . import _ship_report as report
 from . import _ship_stages as st
 from ._common import CLIError, auto_find_contract
@@ -278,7 +279,7 @@ def _add_selection_options(g: argparse._ArgumentGroup) -> None:
     g.add_argument(
         "--explain",
         action="store_true",
-        help="Print the resolved stage plan (argv and skip reasons), run nothing, exit 0.",
+        help="Print the resolved stage plan (argv, skip reasons) and run nothing.",
     )
 
 
@@ -295,8 +296,14 @@ def _add_output_options(g: argparse._ArgumentGroup) -> None:
         default=None,
         help=(
             "Where ship-report.json and ship-junit.xml go (default: runtime/ beside the "
-            "contract; a relative path is taken from the current directory)."
+            "contract; relative to the current directory)."
         ),
+    )
+    g.add_argument(
+        "--release-dir",
+        default=None,
+        metavar="DIR",
+        help="Publish a release in DIR (new) when all stages pass; needs stages 1-4.",
     )
 
 
@@ -317,13 +324,28 @@ def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
     # Taken from where the command was typed, before ship moves to the contract.
     given = getattr(args, "report_dir", None)
     report_dir = os.path.abspath(given) if given else DEFAULT_REPORT_DIR
+    wanted = getattr(args, "release_dir", None)
+    release_dir = Path(os.path.abspath(wanted)) if wanted else None
     opts, selected, not_selected, project_dir = _prepare(args)
     with _working_directory(project_dir):
         if args.explain:
-            return _explain(opts, selected, not_selected)
-        st.check_preconditions(selected, opts)
-        st.check_required_artifacts(selected, not_selected, opts)
-        return _run_selected(args, logger, opts, selected, not_selected, report_dir)
+            return _explain(opts, selected, not_selected, release_dir)
+        _check_run(selected, not_selected, opts, release_dir)
+        return _run_selected(args, logger, opts, selected, not_selected, report_dir, release_dir)
+
+
+def _check_run(
+    selected: List[int],
+    not_selected: Dict[int, str],
+    opts: st.ShipOptions,
+    release_dir: Optional[Path],
+) -> None:
+    """Every refusal a run makes once it knows its stages (exit 2, no report)."""
+    st.check_preconditions(selected, opts)
+    st.check_required_artifacts(selected, not_selected, opts)
+    problem = release.refusal(release_dir, selected, not_selected, opts)
+    if problem:
+        raise st.ShipUsageError(problem)
 
 
 @contextlib.contextmanager
@@ -348,11 +370,21 @@ def _run_selected(
     selected: List[int],
     not_selected: Dict[int, str],
     report_dir: str,
+    release_dir: Optional[Path] = None,
 ) -> int:
     # A run that bundles is a new run; one that starts later picks up where the
     # last run in this directory stopped (one CI step per stage).
     fresh = 1 in selected
     run_id = _run_id(fresh, logger)
+    staging = None
+    if release_dir is not None:
+        try:
+            staging = release.open_staging(release_dir, run_id)
+        except OSError as exc:
+            raise st.ShipUsageError(
+                f"--release-dir: cannot create a staging directory beside {release_dir}: "
+                f"{exc.strerror or exc}"
+            ) from None
     ctx = _Context(
         opts=opts,
         ci=_ci_output.CiOutput(_ci_output.detect(args.ci_output)),
@@ -363,21 +395,27 @@ def _run_selected(
         fresh=fresh,
         selected=selected,
         report_dir=report_dir,
+        release_dir=release_dir,
+        staging=staging,
     )
-    records = {
-        num: report.StageRecord(num, st.STAGE_NAMES[num], reason=not_selected.get(num))
-        for num in st.STAGE_NUMBERS
-    }
+    records = {num: _unselected_record(num, not_selected.get(num)) for num in st.STAGE_NUMBERS}
     rows: List[Tuple[int, str, str, float]] = []
     for num in selected:
         rec = records[num]
         _run_one(num, rec, ctx)
-        skipped = rec.status == report.SKIPPED
+        skipped = rec.status in report.SKIPPED
         rows.append((num, rec.name, rec.status, 0.0 if skipped else rec.duration_seconds))
-        if rec.status == report.FAILED:
+        if rec.status in report.STOPS:
             _report_abort(num, rec, ctx)
             break
     return _finish(records, rows, ctx)
+
+
+def _unselected_record(num: int, reason: Optional[str]) -> report.StageRecord:
+    """A stage's record before it runs: a stage this invocation left out is
+    skipped by policy when a flag or switch turned it off, else not run."""
+    status = report.SKIPPED_BY_POLICY if st.skipped_by_policy(reason) else report.NOT_RUN
+    return report.StageRecord(num, st.STAGE_NAMES[num], status=status, reason=reason)
 
 
 class _NothingToRun(Exception):
@@ -405,6 +443,8 @@ class _Context:
     fresh: bool  # this run bundles: it starts a new report, never merges an old one
     selected: List[int]  # this invocation's stages: their records are never merged in
     report_dir: str
+    release_dir: Optional[Path] = None  # --release-dir: published when every stage passed
+    staging: Optional[Path] = None  # its staging directory, beside it
 
 
 def _prepare(
@@ -466,8 +506,10 @@ def _prepare(
 
 
 def _run_one(num: int, rec: report.StageRecord, ctx: _Context) -> None:
-    """Run stage ``num`` into ``rec``: passed, failed (with its exit code) or skipped."""
+    """Run stage ``num`` into ``rec``: passed, failed (with its exit code), skipped
+    (by policy, or unsupported) or unknown (interrupted)."""
     started = time.monotonic()
+    rec.started_at = report.utc_now()
     ctx.ci.stage_start(num, rec.name)
     try:
         # The whole stage body is fenced, not only the child: building the stage
@@ -482,7 +524,10 @@ def _run_one(num: int, rec: report.StageRecord, ctx: _Context) -> None:
             rec.status = report.PASSED if rc == 0 and not unmet else report.FAILED
             if unmet:
                 rec.reason = unmet
+            if rec.reason == "interrupted":  # what the stage had done by then is not known
+                rec.status = report.UNKNOWN
     finally:  # closed even when ship itself fails, so its error is not folded away
+        rec.finished_at = report.utc_now()
         ctx.ci.stage_end(num, rec.name)
 
 
@@ -496,7 +541,8 @@ def _attempt(num: int, rec: report.StageRecord, ctx: _Context) -> Optional[int]:
     for note in action.notes:
         ctx.ci.info(f"stage {num} {rec.name}: {note}")
     if action.argv is None:
-        rec.status, rec.reason = report.SKIPPED, action.skip_reason
+        rec.status = report.UNSUPPORTED if action.unsupported else report.SKIPPED_BY_POLICY
+        rec.reason = action.skip_reason
         ctx.ci.info(f"stage {num} {rec.name}: skipped ({rec.reason})")
         return None
     rec.argv = _safe_argv(action.argv)
@@ -599,7 +645,15 @@ def _finish(
         )
         exit_code = report.exit_status(ordered, applies=applies, applied_earlier=applied_earlier)
         run_code = report.exit_status(merged, applies=applies)
-    _write_reports(ctx, merged, run_code)
+    identity: Optional[Dict[str, object]] = None
+    problem: Optional[str] = None
+    if ctx.staging is not None and exit_code == report.EXIT_OK:
+        identity, problem = _release_identity(ctx, ordered)
+        if problem:
+            exit_code = run_code = _failed_code(ordered, applies)
+    written_at = _write_reports(ctx, merged, run_code, _release_block(ctx, identity, problem))
+    if ctx.staging is not None:
+        exit_code = _close_release(ctx, ordered, identity, problem, written_at, exit_code, merged)
     ctx.ci.summary(rows)
     if exit_code == report.EXIT_PARTIAL:
         ctx.logger.error(
@@ -609,10 +663,98 @@ def _finish(
         )
     if exit_code == 0:
         passed = sum(1 for r in ordered if r.status == report.PASSED)
-        skipped = sum(1 for r in ordered if r.status == report.SKIPPED)
+        skipped = sum(1 for r in ordered if r.status in report.SKIPPED)
         ctx.ci.line(f"Ship complete: {passed} stage(s) passed, {skipped} skipped")
         _hint_after_until(ordered, ctx.ci)
     return exit_code
+
+
+def _failed_code(ordered: List[report.StageRecord], applies: bool) -> int:
+    """The status of a run whose stages passed but whose release could not be
+    published: a failure, partial when apply changed something."""
+    applied = applies and any(
+        r.number == st.APPLY_STAGE and r.status == report.PASSED for r in ordered
+    )
+    return report.EXIT_PARTIAL if applied else report.EXIT_FAILED
+
+
+def _plan_in_release(ordered: List[report.StageRecord]) -> bool:
+    return any(r.number == 6 and r.status == report.PASSED for r in ordered)
+
+
+def _release_identity(
+    ctx: _Context, ordered: List[report.StageRecord]
+) -> Tuple[Optional[Dict[str, object]], Optional[str]]:
+    """``(identity, None)``, or ``(None, why it cannot be built)``."""
+    try:
+        identity = release.build_identity(ctx.opts, Path.cwd(), with_plan=_plan_in_release(ordered))
+    except release.ReleaseError as exc:
+        return None, str(exc)
+    return identity, None
+
+
+def _release_block(
+    ctx: _Context, identity: Optional[Dict[str, object]], problem: Optional[str]
+) -> Optional[Dict[str, object]]:
+    """The report's ``release`` entry: whether this run publishes one, and why not."""
+    if ctx.release_dir is None:
+        return None
+    return {
+        "dir": str(ctx.release_dir),
+        "status": "published" if identity is not None else "not-published",
+        "identity_digest": None if identity is None else release.identity_digest(identity),
+        "reason": problem if identity is not None or problem else "a stage did not pass",
+    }
+
+
+def _close_release(
+    ctx: _Context,
+    ordered: List[report.StageRecord],
+    identity: Optional[Dict[str, object]],
+    problem: Optional[str],
+    written_at: Optional[str],
+    exit_code: int,
+    merged: List[report.StageRecord],
+) -> int:
+    """Copy the reports into the staging directory; then publish it, or leave it
+    beside DIR for a reader. Returns the exit status."""
+    assert ctx.staging is not None and ctx.release_dir is not None
+    passed = {r.number for r in ordered if r.status == report.PASSED}
+    with contextlib.suppress(OSError, release.ReleaseError):
+        release.copy_reports(ctx.staging, Path(ctx.report_dir), Path.cwd(), passed)
+    if identity is None:
+        _say_why_not(ctx, problem)
+        return exit_code
+    try:
+        release.publish(
+            ctx.staging,
+            ctx.release_dir,
+            root=Path.cwd(),
+            identity=identity,
+            gates=release.gates(ordered),
+            provenance=release.provenance(ordered, run_id=ctx.run_id, report_written_at=written_at),
+            with_plan=_plan_in_release(ordered),
+        )
+    except release.ReleaseError as exc:
+        failed = _failed_code(ordered, st.applies_changes(ctx.opts))
+        _write_reports(ctx, merged, failed, _release_block(ctx, None, str(exc)))
+        _say_why_not(ctx, str(exc))
+        return failed
+    ctx.ci.info(f"Release published: {ctx.release_dir} ({release.identity_digest(identity)})")
+    return exit_code
+
+
+def _say_why_not(ctx: _Context, problem: Optional[str]) -> None:
+    """No release: why (inside the fence, since the reason can quote the
+    checkout), and where this run's reports are kept."""
+    if problem:
+        with ctx.ci.fenced():
+            ctx.ci.info(f"fluid ship: release not published: {problem}")
+    ctx.logger.error(
+        "fluid ship: no release in %s; this run's reports are kept in %s",
+        ctx.release_dir,
+        ctx.staging,
+    )
 
 
 def _hint_after_until(ordered: List[report.StageRecord], ci: _ci_output.CiOutput) -> None:
@@ -629,27 +771,39 @@ def _hint_after_until(ordered: List[report.StageRecord], ci: _ci_output.CiOutput
     )
 
 
-def _explain(opts: st.ShipOptions, selected: List[int], not_selected: Dict[int, str]) -> int:
+def _explain(
+    opts: st.ShipOptions,
+    selected: List[int],
+    not_selected: Dict[int, str],
+    release_dir: Optional[Path] = None,
+) -> int:
     ws = st.Workspace()
     _out(
         f"fluid ship: {len(selected)} stage(s) selected "
         f"(env={opts.env}, mode={opts.mode}, contract={opts.contract})"
     )
-    problem = _precondition_problem(selected, opts, not_selected)
+    problem = _precondition_problem(selected, opts, not_selected, release_dir)
     for num in st.STAGE_NUMBERS:
         refused = _explain_stage(num, opts, ws, selected, not_selected)
         problem = problem or refused
+    if release_dir is not None and not problem:
+        _out(
+            f"release: published to {release_dir} once every selected stage passes "
+            f"(staged beside it in {release_dir.name}.partial-*)"
+        )
     if problem:
         _out(f"warning: a real run would stop: {problem}")
     return 0
 
 
 def _precondition_problem(
-    selected: List[int], opts: st.ShipOptions, not_selected: Dict[int, str]
+    selected: List[int],
+    opts: st.ShipOptions,
+    not_selected: Dict[int, str],
+    release_dir: Optional[Path] = None,
 ) -> Optional[str]:
     try:
-        st.check_preconditions(selected, opts)
-        st.check_required_artifacts(selected, not_selected, opts)
+        _check_run(selected, not_selected, opts, release_dir)
     except st.ShipUsageError as exc:
         return str(exc)
     return None
@@ -763,9 +917,14 @@ def _merged(ctx: _Context, ordered: List[report.StageRecord]) -> List[report.Sta
     )
 
 
-def _write_reports(ctx: _Context, merged: List[report.StageRecord], run_code: int) -> None:
-    """Write the run's report. Its ``exit_code`` is the run's status, which
-    per-stage CI steps spread over several invocations."""
+def _write_reports(
+    ctx: _Context,
+    merged: List[report.StageRecord],
+    run_code: int,
+    release_block: Optional[Dict[str, object]] = None,
+) -> Optional[str]:
+    """Write the run's report; return when it was written. Its ``exit_code`` is
+    the run's status, which per-stage CI steps spread over several invocations."""
     opts = ctx.opts
     try:
         body = report.build_report(
@@ -775,6 +934,7 @@ def _write_reports(ctx: _Context, merged: List[report.StageRecord], run_code: in
             mode=opts.mode,
             contract=opts.contract,
             exit_code=run_code,
+            release=release_block,
         )
         report.write_reports(Path(ctx.report_dir), body, merged)
     except (OSError, ValueError) as exc:
@@ -783,6 +943,8 @@ def _write_reports(ctx: _Context, merged: List[report.StageRecord], run_code: in
             ctx.report_dir,
             _ci_output.oneline(str(exc)),
         )
+        return None
+    return str(body["written_at"])
 
 
 def _resolve_fluid_bin() -> List[str]:

@@ -1,0 +1,502 @@
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
+
+"""``fluid ship --release-dir DIR`` and the version 2 run report.
+
+- A release is published only when every stage the run selected passed: it is
+  staged beside DIR and renamed to it, with ``release.json`` written last.
+- DIR must not exist, and stages 1-4 must run in the invocation; otherwise the
+  run is refused (exit 2) and ``--explain`` says why.
+- ``release.json``'s ``identity`` repeats across clean runs; times and the CI
+  run are in ``provenance``.
+- An offline release run opens no network connection and starts no process
+  but ship's own stages: no provider call, package install, publish or job run.
+- ``ship-report.json`` is ``fluid-ship-report/2``: six statuses, one reason,
+  start and end times.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence
+
+import pytest
+import yaml
+
+import fluid_build
+from fluid_build.cli import _ship_release as release
+from fluid_build.cli import _ship_report as report
+from fluid_build.cli import _ship_stages as st
+from fluid_build.cli import ship
+
+LOG = logging.getLogger("test_ship_release")
+REPO_ROOT = Path(fluid_build.__file__).resolve().parent.parent
+_PORTS = ("orders", "customers")
+
+
+def _contract() -> Dict[str, object]:
+    return {
+        "fluidVersion": "0.7.5",
+        "kind": "DataProduct",
+        "id": "example.release",
+        "name": "Release",
+        "domain": "example",
+        "metadata": {"layer": "Bronze", "owner": {"team": "data-platform"}},
+        "exposes": [
+            {
+                "exposeId": port,
+                "kind": "table",
+                "binding": {
+                    "platform": "local",
+                    "format": "csv",
+                    "location": {"path": f"out/{port}.csv"},
+                },
+                "contract": {"schema": [{"name": "id", "type": "string"}]},
+            }
+            for port in _PORTS
+        ],
+        "builds": [{"id": "external", "pattern": "hybrid-reference"}],
+    }
+
+
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("FLUID_ENV", "GENERATE_EMIT", "FLUID_RUN_ID", *st.STAGE_TOGGLES.values()):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
+def work(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (project / "contract.fluid.yaml").write_text(yaml.safe_dump(_contract(), sort_keys=False))
+    return project
+
+
+def _parse(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    ship.register(parser.add_subparsers(dest="command"))
+    return parser.parse_args(["ship", *argv])
+
+
+def _ship(argv: Sequence[str]) -> int:
+    return ship.run(_parse(argv), LOG)
+
+
+class FakeStages:
+    """``subprocess.run`` for the stages: ``bundle`` copies ``bundle`` (a real one,
+    since the release verifies it), ``generate artifacts`` writes one file and
+    its MANIFEST; ``fail`` names a stage that exits 1."""
+
+    def __init__(self, bundle: Optional[Path] = None, fail: str = "") -> None:
+        self.bundle = bundle
+        self.fail = fail
+        self.calls: List[List[str]] = []
+
+    def __call__(self, cmd: List[str], **_kw: object) -> subprocess.CompletedProcess:
+        argv = cmd[3:]
+        self.calls.append(argv)
+        stage = argv[1] if argv[0] == "generate" else argv[0]
+        if stage == "bundle":
+            Path("runtime").mkdir(exist_ok=True)
+            Path(st.BUNDLE_PATH).write_bytes(self.bundle.read_bytes() if self.bundle else b"x")
+        elif stage == "artifacts":
+            out = Path("dist/artifacts/odcs")
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "product.odcs.orders.yaml").write_text("x")
+            digest = release._sha256(out / "product.odcs.orders.yaml")
+            Path(st.ARTIFACTS_MANIFEST).write_text(
+                json.dumps(
+                    {"digest": "sha256:m", "files": {"odcs/product.odcs.orders.yaml": digest}}
+                )
+            )
+        elif stage == "validate":
+            Path(st.VALIDATE_REPORT).write_text("{}")
+        elif stage == "plan":
+            Path(st.PLAN_PATH).write_text("{}")
+        return subprocess.CompletedProcess(cmd, 1 if stage == self.fail else 0)
+
+
+@pytest.fixture
+def bundled(work: Path) -> Path:
+    """A real bundle of the contract, made once by ``fluid bundle``."""
+    done = _cli(work, "bundle", "contract.fluid.yaml", "--format", "tgz", "--out", "seed.tgz")
+    assert done.returncode == 0, done.stderr[-2000:]
+    return work / "seed.tgz"
+
+
+def _install(monkeypatch: pytest.MonkeyPatch, bundle: Path, fail: str = "") -> FakeStages:
+    fake = FakeStages(bundle, fail)
+    monkeypatch.setattr(ship.subprocess, "run", fake)
+    return fake
+
+
+_UNTIL_4 = ["--until", "validate-artifacts", "--ci-output", "plain"]
+
+
+# ---------------------------------------------------------------------------
+# Refusals
+# ---------------------------------------------------------------------------
+
+
+def test_an_existing_release_dir_is_refused(
+    work: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    (work / "rel").mkdir()
+    fake = FakeStages()
+    monkeypatch.setattr(ship.subprocess, "run", fake)
+    assert _ship([*_UNTIL_4, "--release-dir", "rel"]) == 2
+    assert fake.calls == [] and "already exists" in caplog.text
+    assert not list(work.glob("rel.partial-*"))
+
+
+@pytest.mark.parametrize(
+    "argv, why",
+    [
+        (["--until", "validate"], "stage 3 generate-artifacts does not run (after --until 2)"),
+        (["--stage", "3-6"], "stage 1 bundle does not run (not in --stage)"),
+        (["--skip-stage", "validate"], "stage 2 validate does not run (--skip-stage)"),
+        (["--no-generate-artifacts"], "stage 3 generate-artifacts does not run"),
+    ],
+)
+def test_a_run_without_stages_one_to_four_is_refused_and_explained(
+    work: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    argv: List[str],
+    why: str,
+) -> None:
+    fake = FakeStages()
+    monkeypatch.setattr(ship.subprocess, "run", fake)
+    Path("runtime").mkdir()
+    Path(st.BUNDLE_PATH).write_bytes(b"x")  # --stage 3-6 needs a bundle on disk first
+    Path("dist/artifacts").mkdir(parents=True)
+    assert _ship([*argv, "--release-dir", "rel"]) == 2
+    assert fake.calls == [] and why in caplog.text
+    capsys.readouterr()
+    assert _ship([*argv, "--release-dir", "rel", "--explain"]) == 0
+    assert "warning: a real run would stop: --release-dir needs stages 1-4" in (
+        capsys.readouterr().out
+    )
+    assert not (work / "rel").exists() and not list(work.glob("rel.partial-*"))
+
+
+def test_explain_names_where_the_release_goes(
+    work: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _ship([*_UNTIL_4, "--release-dir", "rel", "--explain"]) == 0
+    assert "release: published to " in capsys.readouterr().out
+    assert not (work / "rel").exists()
+
+
+# ---------------------------------------------------------------------------
+# Publishing
+# ---------------------------------------------------------------------------
+
+
+def test_a_passing_run_publishes_the_release(
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install(monkeypatch, bundled)
+    assert _ship([*_UNTIL_4, "--release-dir", "../rel"]) == 0
+    rel = work.parent / "rel"
+    assert not list(work.parent.glob("rel.partial-*"))
+    index = json.loads((rel / "release.json").read_text())
+    assert index["schema"] == release.RELEASE_SCHEMA
+    assert index["identity"]["product_id"] == "example.release"
+    assert index["identity"]["environment"] == "dev"
+    assert index["identity"]["fluid_version"] == "0.7.5"
+    assert index["identity"]["forge_version"] == fluid_build.__version__
+    assert index["identity"]["emit"] == list(release._emit_set(st.ShipOptions(contract="c")))
+    assert index["identity"]["artifacts"] == {"manifest_digest": "sha256:m"}
+    assert "plan" not in index["identity"]  # stage 6 did not run
+    assert index["identity_digest"] == release.identity_digest(index["identity"])
+    assert [g["status"] for g in index["gates"]][:5] == ["passed"] * 4 + ["not-run"]
+    assert set(index["provenance"]) >= {"run_id", "started_at", "ci", "stages"}
+    for rel_path, digest in index["files"].items():
+        assert release._sha256(rel / rel_path) == digest
+    assert (rel / "bundle.tgz").read_bytes() == bundled.read_bytes()
+    assert (rel / "artifacts/odcs/product.odcs.orders.yaml").read_text() == "x"
+    assert (rel / "reports/validate-report.json").is_file()
+    shipped = json.loads((rel / "reports/ship-report.json").read_text())
+    assert shipped["release"]["status"] == "published"
+    assert shipped["release"]["identity_digest"] == index["identity_digest"]
+
+
+def test_a_failing_run_publishes_nothing_and_keeps_its_reports(
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _install(monkeypatch, bundled, fail="validate-artifacts")
+    assert _ship([*_UNTIL_4, "--release-dir", "rel"]) == 1
+    assert not (work / "rel").exists()
+    (partial,) = work.glob("rel.partial-*")
+    assert not (partial / "release.json").exists()
+    assert (partial / "reports/ship-report.json").is_file()
+    body = json.loads((work / "runtime/ship-report.json").read_text())
+    assert body["release"]["status"] == "not-published"
+    assert body["release"]["reason"] == "a stage did not pass"
+    assert "no release in" in caplog.text
+
+
+def test_a_tampered_bundle_publishes_nothing(
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _install(monkeypatch, work / "tampered.tgz")
+    (work / "tampered.tgz").write_bytes(b"not a bundle")
+    assert _ship([*_UNTIL_4, "--release-dir", "rel"]) == 1
+    assert not (work / "rel").exists()
+    assert "release not published: runtime/bundle.tgz does not verify" in capsys.readouterr().out
+
+
+def test_an_artifact_that_no_longer_matches_its_manifest_publishes_nothing(
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _install(monkeypatch, bundled)
+
+    def edits_after(cmd: List[str], **kw: object) -> subprocess.CompletedProcess:
+        done = fake(cmd, **kw)
+        if cmd[3] == "validate-artifacts":
+            Path("dist/artifacts/odcs/product.odcs.orders.yaml").write_text("edited")
+        return done
+
+    monkeypatch.setattr(ship.subprocess, "run", edits_after)
+    assert _ship([*_UNTIL_4, "--release-dir", "rel"]) == 1
+    assert not (work / "rel").exists()
+    body = json.loads((work / "runtime/ship-report.json").read_text())
+    assert body["release"]["status"] == "not-published"
+    assert "digest its MANIFEST does not list" in body["release"]["reason"]
+
+
+# ---------------------------------------------------------------------------
+# The version 2 run report
+# ---------------------------------------------------------------------------
+
+
+def test_the_report_names_its_schema_and_times_every_stage_that_ran(
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install(monkeypatch, bundled)
+    assert _ship(["--until", "policy-apply", "--yes"]) == 0
+    body = json.loads((work / "runtime/ship-report.json").read_text())
+    assert body["schema"] == "fluid-ship-report/2" and body["written_at"].endswith("Z")
+    by = {s["number"]: s for s in body["stages"]}
+    assert by[1]["started_at"] <= by[1]["finished_at"]
+    assert by[8]["status"] == "unsupported" and "no policy bindings" in by[8]["reason"]
+    assert by[9]["status"] == "not-run" and by[9]["started_at"] is None
+    for stage in body["stages"]:
+        assert set(stage) == {
+            "number",
+            "name",
+            "status",
+            "reason",
+            "argv",
+            "exit_code",
+            "duration_seconds",
+            "started_at",
+            "finished_at",
+        }
+        assert stage["status"] in report.STATUSES
+
+
+def test_a_switch_or_skip_stage_is_skipped_by_policy(
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install(monkeypatch, bundled)
+    monkeypatch.setenv(st.STAGE_TOGGLES[5], "false")
+    assert _ship(["--until", "plan", "--skip-stage", "validate"]) == 0
+    by = {
+        s["number"]: s for s in json.loads(Path("runtime/ship-report.json").read_text())["stages"]
+    }
+    assert by[2]["status"] == "skipped-by-policy" and by[2]["reason"] == "--skip-stage"
+    assert by[5]["status"] == "skipped-by-policy"
+    assert by[7]["status"] == "not-run" and by[7]["reason"] == "after --until 6"
+
+
+def test_a_version_one_record_merges_as_its_version_two_equivalent(
+    work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FLUID_RUN_ID", "run-1")
+    Path("runtime").mkdir()
+    Path(st.BUNDLE_PATH).write_bytes(b"x")
+    old = {
+        "run_id": "run-1",
+        "env": "dev",
+        "mode": "amend",
+        "contract": "contract.fluid.yaml",
+        "exit_code": 0,
+        "stages": [
+            {"number": 1, "name": "bundle", "status": "passed", "argv": []},
+            {"number": 3, "name": "generate-artifacts", "status": "skipped", "skip_reason": "x"},
+        ],
+    }
+    Path("runtime/ship-report.json").write_text(json.dumps(old))
+    monkeypatch.setattr(ship.subprocess, "run", FakeStages())
+    assert _ship(["--stage", "validate"]) == 0
+    by = {
+        s["number"]: s for s in json.loads(Path("runtime/ship-report.json").read_text())["stages"]
+    }
+    assert by[1]["status"] == "passed"
+    assert by[3]["status"] == "skipped-by-policy" and by[3]["reason"] == "x"
+
+
+def test_junit_counts_unknown_as_a_failure_and_both_skips_as_skipped() -> None:
+    import xml.etree.ElementTree as ET
+
+    recs = [
+        report.StageRecord(1, "bundle", status=report.UNKNOWN, reason="interrupted"),
+        report.StageRecord(2, "validate", status=report.SKIPPED_BY_POLICY, reason="--skip-stage"),
+        report.StageRecord(8, "policy-apply", status=report.UNSUPPORTED, reason="none"),
+    ]
+    suite = ET.fromstring(report.junit_xml(recs))
+    assert suite.get("failures") == "1" and suite.get("skipped") == "2"
+    cases = suite.findall("testcase")
+    assert cases[0].find("failure").get("message") == "stage 1 bundle unknown"
+    assert cases[2].find("skipped").get("message") == "unsupported: none"
+
+
+# ---------------------------------------------------------------------------
+# End to end: the identity repeats, and the run stays offline
+# ---------------------------------------------------------------------------
+
+_RECORDER = textwrap.dedent(
+    '''
+    """Test hook: record every network connection and process this interpreter starts."""
+    import json, os, socket, subprocess
+
+    _LOG = os.environ["FLUID_TEST_SIDE_EFFECTS"]
+
+    def _note(kind, what):
+        with open(_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps([kind, what]) + "\\n")
+
+    _note("boot", os.getpid())  # one per interpreter: ship and every stage it starts
+    _connect = socket.socket.connect
+
+    def connect(self, address):
+        if self.family in (socket.AF_INET, socket.AF_INET6):
+            _note("net", repr(address))
+            raise OSError("network is off in this test")
+        return _connect(self, address)
+
+    socket.socket.connect = connect
+    socket.socket.connect_ex = lambda self, address: connect(self, address) or 0
+
+    def getaddrinfo(host, *args, **kwargs):
+        _note("dns", repr(host))
+        raise OSError("network is off in this test")
+
+    socket.getaddrinfo = getaddrinfo
+    _popen_init = subprocess.Popen.__init__
+
+    def popen_init(self, args, *rest, **kwargs):
+        _note("proc", [str(a) for a in args] if isinstance(args, (list, tuple)) else str(args))
+        return _popen_init(self, args, *rest, **kwargs)
+
+    subprocess.Popen.__init__ = popen_init
+    '''
+)
+
+
+def _cli(cwd: Path, *args: str, hook: Optional[Path] = None) -> subprocess.CompletedProcess:
+    env = {k: v for k, v in os.environ.items() if not k.endswith("_API_KEY")}
+    for name in ("FLUID_RUN_ID", "GENERATE_EMIT", *st.STAGE_TOGGLES.values()):
+        env.pop(name, None)
+    paths = [str(REPO_ROOT), env.get("PYTHONPATH", "")]
+    if hook is not None:
+        paths.insert(0, str(hook.parent))
+        env["FLUID_TEST_SIDE_EFFECTS"] = str(hook.parent / "side-effects.jsonl")
+    env["PYTHONPATH"] = os.pathsep.join(p for p in paths if p)
+    env["COLUMNS"] = "200"
+    return subprocess.run(
+        [sys.executable, "-m", "fluid_build.cli", *args],
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+
+def _release_run(project: Path, hook: Optional[Path] = None) -> subprocess.CompletedProcess:
+    return _cli(
+        project,
+        "ship",
+        "contract.fluid.yaml",
+        "--until",
+        "plan",
+        "--no-strict",
+        "--no-exit-on-drift",
+        "--ci-output",
+        "plain",
+        "--require-artifacts",
+        "odcs,odps-bitol",
+        "--release-dir",
+        "rel",
+        hook=hook,
+    )
+
+
+def _project(root: Path) -> Path:
+    root.mkdir(parents=True)
+    (root / "contract.fluid.yaml").write_text(yaml.safe_dump(_contract(), sort_keys=False))
+    return root
+
+
+@pytest.mark.integration
+def test_two_clean_runs_give_the_same_release_identity(tmp_path: Path) -> None:
+    """Two clean runs of one checkout. (The plan records the checkout's absolute
+    paths, so a checkout elsewhere has another plan digest.)"""
+    import shutil
+
+    project = _project(tmp_path / "project")
+    indexes = []
+    for _ in range(2):
+        for leftover in ("runtime", "dist", ".fluid", "rel"):
+            shutil.rmtree(project / leftover, ignore_errors=True)
+        done = _release_run(project)
+        assert done.returncode == 0, done.stdout[-3000:] + done.stderr[-3000:]
+        indexes.append(json.loads((project / "rel/release.json").read_text()))
+    first, second = indexes
+    assert first["identity"] == second["identity"]
+    assert first["identity_digest"] == second["identity_digest"]
+    assert first["gates"] == second["gates"]
+    assert set(first["identity"]["plan"]) == {"bundle_digest", "plan_digest"}
+    assert first["provenance"]["run_id"] != second["provenance"]["run_id"]
+
+
+@pytest.mark.integration
+def test_an_offline_release_run_calls_no_provider_installs_nothing_and_publishes_nothing(
+    tmp_path: Path,
+) -> None:
+    hook = tmp_path / "hook" / "sitecustomize.py"
+    hook.parent.mkdir()
+    hook.write_text(_RECORDER)
+    project = _project(tmp_path / "project")
+    done = _release_run(project, hook=hook)
+    assert done.returncode == 0, done.stdout[-3000:] + done.stderr[-3000:]
+    assert (project / "rel/release.json").is_file()
+    events = [
+        json.loads(line)
+        for line in (hook.parent / "side-effects.jsonl").read_text().splitlines()
+        if line
+    ]
+    # the hook ran in ship and in each of its six stages, so what they did is all here
+    assert len({e[1] for e in events if e[0] == "boot"}) >= 7
+    assert [e for e in events if e[0] in ("net", "dns")] == []  # no connection, no lookup
+    procs = [e[1] for e in events if e[0] == "proc"]
+    stages = [
+        p[3] if p[3] != "generate" else p[4] for p in procs if p[1:3] == ["-m", "fluid_build.cli"]
+    ]
+    assert stages == ["bundle", "validate", "artifacts", "validate-artifacts", "diff", "plan"]
+    others = [p for p in procs if p[1:3] != ["-m", "fluid_build.cli"]]
+    forbidden = ("pip", "uv", "tofu", "terraform", "dbt", "databricks", "docker", "curl", "git")
+    assert [p for p in others if any(Path(str(p[0])).name.startswith(f) for f in forbidden)] == []

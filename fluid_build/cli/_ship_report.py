@@ -18,10 +18,20 @@ from typing import Any, Collection, Dict, List, Optional
 
 from ._ci_output import oneline
 
+#: ``ship-report.json``'s schema. Version 2 gave every stage one of six
+#: statuses, a single ``reason`` and its start and end time.
+REPORT_SCHEMA = "fluid-ship-report/2"
+
 PASSED = "passed"
 FAILED = "failed"
-SKIPPED = "skipped"
-NOT_RUN = "not-run"
+SKIPPED_BY_POLICY = "skipped-by-policy"  # a flag, a RUN_STAGE switch or a dry run turned it off
+UNSUPPORTED = "unsupported"  # nothing for it to act on: no policy bindings, no DAGs, no scheduler
+NOT_RUN = "not-run"  # not selected, or an earlier stage failed
+UNKNOWN = "unknown"  # interrupted, or an earlier step's record could not be read
+STATUSES = (PASSED, FAILED, SKIPPED_BY_POLICY, UNSUPPORTED, NOT_RUN, UNKNOWN)
+SKIPPED = (SKIPPED_BY_POLICY, UNSUPPORTED)  # the stage was considered and did nothing
+#: A stage that did not pass: the run stops after it, and its outcome is not a pass.
+STOPS = (FAILED, UNKNOWN)
 
 REPORT_JSON = "ship-report.json"
 REPORT_JUNIT = "ship-junit.xml"
@@ -60,18 +70,28 @@ class StageRecord:
     argv: List[str] = field(default_factory=list)
     exit_code: Optional[int] = None
     duration_seconds: float = 0.0
+    started_at: Optional[str] = None  # UTC, ISO 8601; None for a stage that never started
+    finished_at: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "number": self.number,
             "name": self.name,
             "status": self.status,
-            "skip_reason": self.reason if self.status in (SKIPPED, NOT_RUN) else None,
-            "failure_reason": self.reason if self.status == FAILED else None,
+            "reason": self.reason,
             "argv": self.argv,
             "exit_code": self.exit_code,
             "duration_seconds": round(self.duration_seconds, 3),
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
         }
+
+
+def utc_now() -> str:
+    """Now, as the report writes a time: UTC, ISO 8601, to the millisecond."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def exit_status(records: List[StageRecord], *, applies: bool, applied_earlier: bool = False) -> int:
@@ -83,7 +103,7 @@ def exit_status(records: List[StageRecord], *, applies: bool, applied_earlier: b
     arguments (2) and Ctrl-C (130) are decided by the caller."""
     applied = applies and applied_earlier
     for rec in sorted(records, key=lambda r: r.number):
-        if rec.status == FAILED:
+        if rec.status in STOPS:  # an outcome nobody knows is not a pass
             return EXIT_PARTIAL if applied else EXIT_FAILED
         if rec.number == _APPLY_STAGE and rec.status == PASSED and applies:
             applied = True
@@ -91,15 +111,25 @@ def exit_status(records: List[StageRecord], *, applies: bool, applied_earlier: b
 
 
 def build_report(
-    records: List[StageRecord], *, run_id: str, env: str, mode: str, contract: str, exit_code: int
+    records: List[StageRecord],
+    *,
+    run_id: str,
+    env: str,
+    mode: str,
+    contract: str,
+    exit_code: int,
+    release: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     return {
+        "schema": REPORT_SCHEMA,
+        "written_at": utc_now(),
         "run_id": run_id,
         "env": env,
         "mode": mode,
         "contract": contract,
         "exit_code": exit_code,
         "stages": [r.as_dict() for r in records],
+        **({"release": release} if release is not None else {}),
     }
 
 
@@ -121,8 +151,8 @@ def _xml_safe(text: str) -> str:
 def junit_xml(records: List[StageRecord]) -> bytes:
     from xml.etree import ElementTree as ET
 
-    failures = sum(1 for r in records if r.status == FAILED)
-    skipped = sum(1 for r in records if r.status in (SKIPPED, NOT_RUN))
+    failures = sum(1 for r in records if r.status in STOPS)
+    skipped = sum(1 for r in records if r.status in (*SKIPPED, NOT_RUN))
     suite = ET.Element(
         "testsuite",
         {
@@ -144,16 +174,16 @@ def junit_xml(records: List[StageRecord]) -> bytes:
                 "time": f"{rec.duration_seconds:.3f}",
             },
         )
-        if rec.status == FAILED:
+        if rec.status in STOPS:
             failure = ET.SubElement(
-                case, "failure", {"message": f"stage {rec.number} {rec.name} failed"}
+                case, "failure", {"message": f"stage {rec.number} {rec.name} {rec.status}"}
             )
             detail = f"exit code {rec.exit_code}: fluid {' '.join(rec.argv)}"
             if rec.reason:  # a stage that exited 0 can fail ship's own check
                 detail = f"{rec.reason}\n{detail}"
             failure.text = _xml_safe(detail)
-        elif rec.status in (SKIPPED, NOT_RUN):
-            prefix = "" if rec.status == SKIPPED else "not run: "
+        elif rec.status in (*SKIPPED, NOT_RUN):
+            prefix = "" if rec.status == SKIPPED_BY_POLICY else f"{rec.status}: "
             message = _xml_safe(prefix + (rec.reason or rec.status))
             ET.SubElement(case, "skipped", {"message": message})
     root = ET.ElementTree(suite)
@@ -176,16 +206,21 @@ def write_reports(directory: Path, report: Dict[str, Any], records: List[StageRe
 def _from_dict(raw: Dict[str, Any]) -> StageRecord:
     """One record of an earlier report; ``ValueError`` when it is not one ship wrote
     (the file sits in the checkout, so its content is not trusted to be well formed).
-    Text fields are kept as text, and a duration must be a finite number."""
+    Text fields are kept as text, and a duration must be a finite number. A
+    version 1 record (``skipped``, ``skip_reason`` / ``failure_reason``) reads
+    as its version 2 equivalent."""
     status = str(raw["status"])
     number = int(raw["number"])
-    if status not in (PASSED, FAILED, SKIPPED, NOT_RUN) or not 1 <= number <= 11:
+    if status == "skipped":  # version 1 knew no other kind of skip
+        status = SKIPPED_BY_POLICY
+    if status not in STATUSES or not 1 <= number <= 11:
         raise ValueError(f"not a ship stage record: {number} {status}")
     exit_code = raw.get("exit_code")
-    reason = raw.get("skip_reason") if status in (SKIPPED, NOT_RUN) else raw.get("failure_reason")
+    reason = raw.get("reason", raw.get("skip_reason") or raw.get("failure_reason"))
     duration = float(raw.get("duration_seconds") or 0.0)
     if not math.isfinite(duration):
         raise ValueError(f"not a duration: {duration}")
+    started, finished = raw.get("started_at"), raw.get("finished_at")
     return StageRecord(
         number=number,
         name=str(raw["name"]),
@@ -194,6 +229,8 @@ def _from_dict(raw: Dict[str, Any]) -> StageRecord:
         argv=[str(a) for a in raw.get("argv") or []],
         exit_code=None if exit_code is None else int(exit_code),
         duration_seconds=duration,
+        started_at=None if started is None else str(started),
+        finished_at=None if finished is None else str(finished),
     )
 
 
@@ -221,9 +258,17 @@ def merge_with_previous(
         same_run = (previous.get("run_id"), previous.get("env"), previous.get("mode"))
         if same_run != (run_id, env, mode) or previous.get("contract") != contract:
             return current
+    except _UNREADABLE:  # not a report of this run, as far as anyone can tell
+        return current
+    try:
         old = {int(s["number"]): _from_dict(s) for s in previous["stages"]}
     except _UNREADABLE:
-        return current
+        # This run's report, but not one ship wrote: none of it is trusted, and
+        # what the earlier steps did is not known (never taken for a pass).
+        why = "this run's earlier report could not be read"
+        return [
+            r if r.number in selected else replace(r, status=UNKNOWN, reason=why) for r in current
+        ]
     # An earlier record keeps its outcome; the stage's name is always this version's.
     return [
         replace(old[r.number], name=r.name) if r.number in old and r.number not in selected else r
