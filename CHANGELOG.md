@@ -320,6 +320,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`fluid generate dbt-tests` writes no contract text that dbt would run as Jinja.** dbt
+  renders a schema.yml's names, descriptions and test arguments as Jinja, and evaluates a test
+  argument that looks like `env_var(...)`, `var(...)`, `ref(...)`, `source(...)` or `doc(...)`
+  even without braces. A column name, description, enum value or other string from a contract
+  that holds `{{`, `{%` or `{#`, or looks like such a call, is now written as a Jinja string
+  literal of itself, so `dbt parse` reads it back as text; a column named
+  `x{{ env_var('SECRET') }}` used to print the variable. Every other string is written as
+  before. The `relationships` test keeps its own `ref('<model>')`.
+
 - **A quantile is published only when the records below and above it pass the threshold too.**
   A `quantile/1` group was published when ten records held its witness, with its two ranks, so a
   rank could say that 3 records lie below the witness, or that 2 lie above it. A group is now
