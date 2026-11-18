@@ -10,7 +10,11 @@ import pytest
 from fluid_build.secrets import resolve
 from fluid_build.secrets.contract import lint_secret_refs, secret_ref_sites
 from fluid_build.secrets.errors import SecretRefError
-from fluid_build.secrets.policy import ALLOWLIST_ENV, AcquisitionSecretPolicyError
+from fluid_build.secrets.policy import (
+    ALLOWLIST_ENV,
+    SCHEMES_ENV,
+    AcquisitionSecretPolicyError,
+)
 
 REMOTE = "db.example.com"
 
@@ -225,6 +229,8 @@ def test_validate_fails_closed_when_the_lint_itself_crashes(monkeypatch):
 #: References whose names the secret scanner reads as keywords.
 PGPASSWORD_REF = "env://PGPASSWORD"  # pragma: allowlist secret
 AIRBYTE_REF = "env://AIRBYTE_TOKEN"  # pragma: allowlist secret
+#: A reference that ends in a word the log redactor reads as a credential key.
+VAULT_PASSWORD_REF = "vault://kv/orders/pg#password"  # pragma: allowlist secret
 
 
 @pytest.mark.unit
@@ -260,14 +266,14 @@ def test_an_entry_naming_the_placeholder_changes_nothing():
     [
         ({"secretRef": PGPASSWORD_REF, "host": "{{ env.PGHOST }}"}, "PGPASSWORD"),
         (
-            {"secretRef": "vault://kv/orders/pg#password", "uri": "postgres://{{ env.H }}/db"},
-            "vault://kv/orders/pg#password@*",
+            {"secretRef": VAULT_PASSWORD_REF, "uri": "postgres://{{ env.H }}/db"},
+            f"{VAULT_PASSWORD_REF}@*",
         ),
     ],
 )
 def test_an_entry_for_any_host_leaves_nothing_to_warn_about(connection, entry):
     """Apply clears whatever the placeholder renders to, so there is nothing to warn about."""
-    environ = {ALLOWLIST_ENV: entry, "FLUID_SECRET_SCHEMES": "env,vault"}
+    environ = {ALLOWLIST_ENV: entry, SCHEMES_ENV: "env,vault"}
     (finding,) = lint_secret_refs(_conn(**connection), environ)
     assert finding.ok and finding.deferred is None
 
@@ -356,10 +362,6 @@ def test_validate_reports_a_deferred_destination_as_a_warning():
     assert any("PGPASSWORD@<host>" in warning for warning in result.warnings)
 
 
-#: A reference that ends in a word the log redactor reads as a credential key.
-VAULT_PASSWORD_REF = "vault://kv/orders/pg#password"  # pragma: allowlist secret
-
-
 @pytest.mark.unit
 def test_validate_lines_survive_the_redactor_that_prints_them(monkeypatch):
     """validate prints ``<pointer>: <what>`` through the secret redactor.
@@ -372,7 +374,6 @@ def test_validate_lines_survive_the_redactor_that_prints_them(monkeypatch):
     from fluid_build.cli import validate as validate_cmd
     from fluid_build.observability import secret_redactor
     from fluid_build.schema_manager import ValidationResult
-    from fluid_build.secrets.policy import SCHEMES_ENV
 
     # Only the patterns: a value another test registered must not mask a word here.
     monkeypatch.setattr(secret_redactor, "_known_secrets", ())
