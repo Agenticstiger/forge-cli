@@ -30,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `decimal(12, 2)`. The conformance vectors gain 13 cases at the bounds, from `decimal(1)` and
   `decimal(1000, 1000)` to `decimal(0)` and `decimal(1000,1001)`.
 
+### Security
+
+- **A quantile is published only when the records below and above it pass the threshold too.**
+  A `quantile/1` group was published when ten records held its witness, with its two ranks, so a
+  rank could say that 3 records lie below the witness, or that 2 lie above it. A group is now
+  published only when the records below its witness and those above it are each none or at least
+  `minimumCell`, on unrounded counts (the three cells of FLUX ADR 0011), and it is withheld with
+  `A` otherwise. `fluid profile --help` names the rule.
+
 ## [0.32.0] — 2026-11-18
 
 ### Added

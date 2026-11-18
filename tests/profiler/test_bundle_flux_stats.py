@@ -290,6 +290,33 @@ def test_a_rare_support_member_withholds_the_group_and_siblings_of_a_grouped_mea
     load_profile_text(result.canonical.decode("utf-8"))
 
 
+@pytest.mark.parametrize(
+    ("low", "high", "level", "status"),
+    [
+        # 5 records of 1 below 115 of 50: the 6th of 120 is a 50 that 115 records hold,
+        # and its published ranks would say that 5 records lie below it.
+        pytest.param(5, 0, "0.05", "A", id="five-below"),
+        pytest.param(0, 5, "0.95", "A", id="five-above"),
+        pytest.param(10, 0, "0.1", "F", id="ten-below"),
+        pytest.param(0, 10, "0.9", "F", id="ten-above"),
+    ],
+)
+def test_a_quantile_needs_none_or_ten_records_below_and_above_its_witness(
+    tmp_path, low, high, level, status
+):
+    amounts = ["1"] * low + ["50"] * (120 - low - high) + ["99"] * high
+    rows = [
+        {"amount": amount, "market": MARKETS[n % 3], "qty": "1"} for n, amount in enumerate(amounts)
+    ]
+    result = _profile(tmp_path, rows, [{**PROPERTIES[5], "level": level}])
+    (group,) = _entry(result, "amount", "quantile/1")["groups"]
+    assert group["status"] == status
+    if status == "F":
+        assert group["quantileWitness"] == str(50 * 2**16)
+    else:
+        assert group == {"group": "", "status": "A"}  # not a count table: the code says why
+
+
 def test_a_quantile_whose_witness_too_few_records_hold_is_withheld(tmp_path):
     rows = [{"amount": f"{n % 100}.5", "market": MARKETS[n % 3], "qty": "1"} for n in range(120)]
     result = _profile(tmp_path, rows)

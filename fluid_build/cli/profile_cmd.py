@@ -33,7 +33,9 @@ checks are ACRO 1.1.0's defaults, named "acro-default" in the document:
   - every published count is rounded to a multiple of 5;
   - a sum is withheld when 2 records make up 90% of it, or when what is left
     after the 2 largest is below 10% of the largest;
-  - a min, max or quantile is published only when 10 records hold that value;
+  - a min, max or quantile is published only when 10 records hold that value,
+    and a quantile only when the records below it and above it are each none
+    or at least 10;
   - a mean is published only when the column's count and sum are.
 A withheld value keeps its SDMX CL_CONF_STATUS code and no value: A (a small
 count), C (a sum over at most two values), O or T (dominated by one or two

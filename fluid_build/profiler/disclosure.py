@@ -34,7 +34,10 @@ DwB/ESSnet "Guidelines for Output Checking" (class 3, maxima, minima and
 percentiles) do not release one by rule of thumb, and clear one when more than the
 threshold of units hold it. The profiler takes that reading: such a value is
 published only when at least ``minimumCell`` records hold exactly that value
-(founder decision, 2026-11-16).
+(founder decision, 2026-11-16). A quantile's two ranks are counts too, so the
+records below its witness and the records above it must each be none or at least
+``minimumCell`` (FLUX ADR 0011's three cells, founder decision 2026-11-18): a rank
+of 3 would say that three records lie below the witness.
 
 A withheld value carries an SDMX ``CL_CONF_STATUS`` 1.4 code and no value: ``A``
 for a small count (a zero cell, a cell below the threshold, or a value too few
@@ -538,13 +541,18 @@ def check_quantile(
     """Check a quantile group's witness and its ranks; return the verdict and the rounded ranks.
 
     *below* and *at_or_below* are the records strictly below the witness and at or
-    below it, so ``at_or_below - below`` records hold it. In order, the first that
-    fires decides, always with ``A``:
+    below it, so ``at_or_below - below`` records hold it and ``k - at_or_below``
+    lie above it. In order, the first that fires decides, always with ``A``:
 
     1. fewer than ``minimumCell`` records hold the witness
        (:func:`check_order_statistic`, as a minimum or a maximum is checked);
-    2. a rank is positive and rounds to zero (:func:`check_rounding`);
-    3. the rounded ``k`` and ranks no longer prove the witness: *proves* is the
+    2. the records below the witness, or above it, are fewer than ``minimumCell``
+       and not none: on unrounded counts, the three cells the ranks state each
+       hold none at an end of the column or at least ``minimumCell`` records
+       (FLUX ADR 0011's three cells), since a rank of 3 says that three records
+       lie below the witness, rounded or not;
+    3. a rank is positive and rounds to zero (:func:`check_rounding`);
+    4. the rounded ``k`` and ranks no longer prove the witness: *proves* is the
        registry's rank check on them, because a published group is read back with
        the rounded numbers, and a rank rounded across the witness's index would
        publish a witness the numbers contradict.
@@ -552,7 +560,13 @@ def check_quantile(
     The ranks are published rounded, as every count is. The returned ranks are
     only meaningful when the verdict is published.
     """
+    for count in (k, below, at_or_below):
+        _require_count(count)
+    if not below <= at_or_below <= k:
+        raise ValueError("a quantile's ranks lie from 0 to its k, the lower one first")
     verdict = check_order_statistic(at_or_below - below, rule)
+    if verdict.published:
+        verdict = _check_outer_cells(below, k - at_or_below, rule)
     if verdict.published:
         for rank in (below, at_or_below):
             verdict = check_rounding(rank, rule)
@@ -562,6 +576,16 @@ def check_quantile(
     if verdict.published and not proves(round_count(k, rule), shown[0], shown[1]):
         verdict = Verdict(SMALL_COUNT, "the rounded ranks no longer prove the witness")
     return verdict, shown[0], shown[1]
+
+
+def _check_outer_cells(below: int, above: int, rule: DisclosureRule) -> Verdict:
+    """The records below a quantile's witness and above it: each none, or enough."""
+    for count, side in ((below, "below"), (above, "above")):
+        if 0 < count < rule.minimum_cell:
+            return Verdict(
+                SMALL_COUNT, f"fewer than {rule.minimum_cell} records lie {side} the value"
+            )
+    return PUBLISHED
 
 
 def suppress_secondary(verdicts: Sequence[Verdict]) -> Tuple[Verdict, ...]:
