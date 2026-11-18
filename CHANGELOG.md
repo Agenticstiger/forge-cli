@@ -26,6 +26,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the type and mode apply wrote, and `fluid diff` reads a map as it reads an array and
   every spelling of a struct (`struct`, `record`, `row`) as the RECORD BigQuery reports.
 
+- **`fluid generate schedule` renders the build graph: `builds[].dependencies` and dataset
+  triggers.** Builds that `builds[].dependencies` link now run in one Airflow DAG, one
+  `fluid apply --build-id` task per build, each after the builds it names. A dependency's
+  `condition` is the task's trigger rule: `success` is `all_success`, `completion` is `all_done`,
+  and `always` is Airflow's `always`, which starts the task without waiting. The DAG runs on the
+  one trigger its builds declare, whichever build declares it, and is named after that build.
+  `trigger.type: dataset` runs a DAG when the datasets in `trigger.datasets` are updated (all of
+  them, or any one with `datasetsOperator: any`); `schedule_and_dataset` runs it on its cron and
+  on those updates. A dataset is an Airflow asset URI, or `{productId, exposeId}` of an expose of
+  the contract. Every task now declares the exposes its build writes as `outlets`, named by the
+  URI Airflow's own providers give the same storage (`s3://<bucket>/<path>`,
+  `bigquery://<project>/<dataset>/<table>`, `snowflake://<account>/<database>/<schema>/<table>`
+  and others), so a DAG scheduled on one runs when the task succeeds, in this product's Airflow
+  DAGs or another's. An existing one-build DAG gains only the `Asset` import and that `outlets=`
+  list. The files load on Airflow 2.6+ (a dataset `any` or `schedule_and_dataset` trigger needs
+  2.9) and on Airflow 3. A cycle, a reference to the build itself or to no build, two triggers
+  in one linked group, mixed conditions on one build, a dependency on a build another engine
+  runs, a DAG its own output would trigger, and a dataset Airflow would refuse each stop
+  generation with what to change. A dependency on a stream that `fluid apply` keeps running is
+  not waited for, and the DAG's documentation says so. A contract whose only builds are such
+  streams now gets "No build needs a DAG" from `fluid generate schedule`, not "No scheduler
+  engine specified", and `fluid scaffold-composer` agrees. With `--overwrite`, `fluid generate
+  schedule` removes the DAG files an earlier run wrote into the output directory for the same
+  product and env that the contract no longer makes (a build that now runs as a task of
+  another build's DAG would otherwise run twice). `fluid validate` warns about an Airflow
+  task's `buildStepRef`: no generated DAG runs one.
+
 ### Changed
 
 - **`fluid profile --bundle` writes `C` for every withheld group and cell of a histogram.** In
