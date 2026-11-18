@@ -305,6 +305,10 @@ class TestProvenanceFile:
         assert not provenance_path(tgz).exists()
         assert read_bundle_source(tgz) is None
 
+    def test_it_is_written_owner_only(self, layout: Path) -> None:
+        tgz = self._bundle(layout, "runtime/b.tgz")
+        assert provenance_path(tgz).stat().st_mode & 0o777 == 0o600
+
     def test_a_symlink_at_the_name_is_replaced_not_followed(self, layout: Path) -> None:
         tgz = layout / "runtime" / "b.tgz"
         victim = layout / "victim.txt"

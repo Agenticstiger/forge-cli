@@ -594,8 +594,8 @@ def _write_provenance(
 
     It names the packet it describes (``packetDigest``), so a file left beside
     other bytes (the bundle rebuilt without it, or copied over) is not read as
-    theirs. Written to a temporary file and renamed over, so a symlink planted at
-    the name is replaced, never followed.
+    theirs. Written owner-only (0600) to a temporary file and renamed over, so a
+    symlink planted at the name is replaced, never followed.
     """
     target = provenance_path(tgz_path)
     recorded = {key: (source or {}).get(key) for key in PROVENANCE_KEYS}
@@ -613,9 +613,9 @@ def _write_provenance(
     }
     fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.")
     try:
+        # mkstemp's owner-only mode stays: the file names paths on this machine.
         with os.fdopen(fd, "wb") as handle:
             handle.write(_canonicalize_json(document))
-        os.chmod(tmp, _FILE_MODE)
         os.replace(tmp, target)
     except BaseException:
         with contextlib.suppress(OSError):
