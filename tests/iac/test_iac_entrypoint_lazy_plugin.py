@@ -23,7 +23,6 @@ import logging
 import os
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -32,6 +31,7 @@ from fluid_build.cli import generate_iac
 from fluid_build.cli._common import CLIError
 from fluid_build.iac import cutover
 from fluid_build.iac import registry as R
+from fluid_build.testing.entry_points import IAC_GROUP, installed_plugin, write_dist
 
 pytestmark = [pytest.mark.unit, pytest.mark.provider]
 
@@ -85,37 +85,30 @@ class SlowPlugin(KubePlugin):
 
 
 def _make_dist(root: Path, group_lines: str, name: str = "fluid-testcloud") -> None:
-    (root / "lw8_plugin.py").write_text(_PLUGIN_SRC)
-    info = root / f"{name.replace('-', '_')}-1.0.dist-info"
-    info.mkdir()
-    (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n")
-    (info / "entry_points.txt").write_text(
-        f"[fluid_build.iac_providers]\n{textwrap.dedent(group_lines)}\n"
-    )
+    """Write the throwaway dist (the plugin module and its ``.dist-info``) for one entry
+    point, given as ``<name> = <module>:<attr>``. The kit writes it; the caller puts the
+    root on ``sys.path``."""
+    entry_point, _, target = group_lines.partition("=")
+    groups = {IAC_GROUP: {entry_point.strip(): target.strip()}}
+    write_dist(root, name, groups, {"lw8_plugin": _PLUGIN_SRC})
 
 
 @pytest.fixture
 def dist(tmp_path, monkeypatch):
     """Install a dist exposing ``kubernetes`` -> ``KubePlugin``; yield its marker file."""
     root = tmp_path / "site"
-    root.mkdir()
     marker = tmp_path / "loaded.txt"
-    _make_dist(root, "kubernetes = lw8_plugin:KubePlugin")
-    monkeypatch.syspath_prepend(str(root))
     monkeypatch.setenv("LW8_MARKER", str(marker))
     monkeypatch.delenv("FLUID_PLUGINS_ALLOWLIST", raising=False)
     monkeypatch.delenv("FLUID_PLUGINS_BLOCKLIST", raising=False)
     monkeypatch.delenv("FLUID_PLUGIN_STRICT_COMPAT", raising=False)
-    saved = dict(R.IAC_PLUGINS)
-    R.reset_iac_plugin_cache()
-    sys.modules.pop("lw8_plugin", None)
-    try:
+    # monkeypatch puts sys.path back wholesale at the end of the test. Making this the first
+    # path change it sees means a later monkeypatch.syspath_prepend (the helpers below add
+    # more dists) cannot restore this root after the kit has taken it off.
+    monkeypatch.syspath_prepend(str(root))
+    groups = {IAC_GROUP: {"kubernetes": "lw8_plugin:KubePlugin"}}
+    with installed_plugin(root, "fluid-testcloud", groups, {"lw8_plugin": _PLUGIN_SRC}):
         yield marker
-    finally:
-        R.reset_iac_plugin_cache()
-        R.IAC_PLUGINS.clear()
-        R.IAC_PLUGINS.update(saved)
-        sys.modules.pop("lw8_plugin", None)
 
 
 def _loaded(marker: Path) -> bool:

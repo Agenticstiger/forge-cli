@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`fluid_build.testing`, a test kit for packages that plug into `fluid`.** A plugin in its own
+  repository cannot import forge-cli's `tests/` tree, so the parts it needs now ship in the
+  wheel: `FakeHttpServer` (a loopback HTTP server with a route table, a request log, failure
+  injection and HTTPS from a certificate you make), `run_fluid` (the real CLI in process),
+  `isolated_env` (its own HOME, working directory and plugin-policy variables, restored
+  afterwards) and `installed_plugin` (a real `.dist-info` with entry points, with the plugin
+  registries reset on the way in and out). Standard library only, and nothing in the CLI imports
+  it, so `fluid --help` and `fluid providers` are unchanged. The Databricks test helpers and the
+  entry-point plugin tests now use it.
+
 ### Changed
 
 - **An `enum` level may hold any character (FLUID 0.7.7 preview).** Real data has levels such

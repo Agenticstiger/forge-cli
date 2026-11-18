@@ -14,6 +14,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import pytest
 import yaml
 
+from fluid_build.testing.cli import run_fluid as run_fluid_in_process
+from fluid_build.testing.env import isolated_environ
+
 COLUMNS: List[Tuple[str, str, bool]] = [
     ("id", "bigint", True),
     ("amount", "double", False),
@@ -30,22 +33,31 @@ def plugin_cache(tmp_path_factory: pytest.TempPathFactory) -> str:
 def isolate_workspace(
     monkeypatch, root: Path, *, host: str, warehouse_id: str, plugin_cache: str
 ) -> None:
-    """Make ``host`` the only workspace reachable: no profile, no real credential."""
-    for name in list(os.environ):
-        if name.startswith(("DATABRICKS_", "FLUID_STATE", "FLUID_PROVIDER")):
-            monkeypatch.delenv(name)
-    home = root / "home"
-    home.mkdir(exist_ok=True)
+    """Make ``host`` the only workspace reachable: no profile, no real credential.
+
+    The environment is the plugin-author kit's (``fluid_build.testing.env``): its own HOME,
+    the state, provider and plugin-policy variables dropped, telemetry and colour off. This
+    adds the workspace's variables, and applies the result through ``monkeypatch`` so pytest
+    undoes it when the test ends.
+    """
     empty_cfg = root / "databrickscfg"
     empty_cfg.write_text("")
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("DATABRICKS_HOST", host)
-    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-fake-token")  # pragma: allowlist secret
-    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(empty_cfg))
-    monkeypatch.setenv("DATABRICKS_WAREHOUSE_ID", warehouse_id)
-    monkeypatch.setenv("TF_PLUGIN_CACHE_DIR", plugin_cache)
-    monkeypatch.setenv("FLUID_NO_TELEMETRY", "1")
-    monkeypatch.setenv("NO_COLOR", "1")
+    env = isolated_environ(
+        root,
+        drop_prefixes=("DATABRICKS_",),
+        set_vars={
+            "DATABRICKS_HOST": host,
+            "DATABRICKS_TOKEN": "dapi-fake-token",  # pragma: allowlist secret
+            "DATABRICKS_CONFIG_FILE": str(empty_cfg),
+            "DATABRICKS_WAREHOUSE_ID": warehouse_id,
+            "TF_PLUGIN_CACHE_DIR": plugin_cache,
+        },
+    )
+    for name in set(os.environ) - set(env):
+        monkeypatch.delenv(name)
+    for name, value in env.items():
+        if os.environ.get(name) != value:
+            monkeypatch.setenv(name, value)
     monkeypatch.chdir(root)
 
 
@@ -121,13 +133,7 @@ def write_contract(root: Path, document: Dict[str, Any], name: str = "contract.f
 def run_fluid(capfd, *argv: str) -> Tuple[int, str]:
     """The real ``fluid`` entry point, in-process: its exit code, and everything it
     printed with whitespace collapsed (Rich wraps long lines at the terminal width)."""
-    from fluid_build.cli import main
-
-    try:
-        rc = main(list(argv))
-    except SystemExit as exc:  # argparse and a few commands exit directly
-        rc = exc.code if isinstance(exc.code, int) else 1
-    out, err = capfd.readouterr()
+    rc, out, err = run_fluid_in_process(capfd, *argv)
     return rc, " ".join((out + err).split())
 
 

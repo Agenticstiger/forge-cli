@@ -778,8 +778,22 @@ onprem = "my_pkg.iac:OnPremIacPlugin"
 - **State guard.** Before a destructive apply attributes a state to a cloud,
   every admitted installed plugin is loaded (`state_migration`), so another
   plugin cloud's resources are never mistaken for ambiguous ones.
-- **Tests.** `tests/iac/test_iac_entrypoint_lazy_plugin.py` builds a real
-  throwaway `.dist-info` and is the pattern to copy.
+- **Tests.** `fluid_build.testing` is the kit for testing a plugin from its own
+  repository (the forge-cli `tests/` tree is not in the wheel). It uses the
+  standard library only, imports no pytest, and nothing in the CLI imports it
+  (`tests/testing/test_cold_path.py` pins that). Four modules, each importable alone:
+  `http_fake.FakeHttpServer` (a loopback server: a route table where the first
+  match wins, `requests`, `unknown` for requests no route matched, `fail_route`,
+  `errors`, and HTTPS from an `ssl.SSLContext` you make; it creates no
+  certificates), `cli.run_fluid(capture, *argv)` (the real CLI in process, returning
+  `(exit code, stdout, stderr)`; `capture` is pytest's `capfd`, or anything with
+  `readouterr()`), `env.isolated_env(root, ...)` (its own HOME and working directory,
+  the state, provider and plugin-policy variables dropped, restored afterwards;
+  `isolated_environ` gives the same mapping for a subprocess) and
+  `entry_points.installed_plugin(root, dist, groups, modules)` (a real `.dist-info`
+  on `sys.path`, with the IaC and provider registries reset on the way in and out).
+  `tests/iac/test_iac_entrypoint_lazy_plugin.py` shows `installed_plugin` in use, and
+  `tests/iac/_databricks_cli.py` shows `run_fluid` and `isolated_environ`.
 
 ## `fluid test` on Databricks: results table and dashboard (2026-11-12)
 
