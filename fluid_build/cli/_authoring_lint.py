@@ -21,6 +21,11 @@ value the schema accepts but no real contract ships:
 * ``contract_sdp_joins``: a build of an SDP (Bronze) product that joins. An SDP
   reads one source as it is (``forge/product_types.py``), so a join makes it an
   ADP (Silver): a rule that follows from the contract's own classification.
+* ``contract_unrendered_build_step_ref``: an Airflow task's ``buildStepRef``
+  (``orchestration.airflow.tasks[]``, also in task groups and in a build's own
+  ``execution.orchestration``). It names a legacy ``transformations[]`` step, and
+  no command runs one step: ``fluid generate schedule`` runs each build as one
+  ``fluid apply --build-id`` task, in the order ``builds[].dependencies`` gives.
 
 All are warnings: ``fluid validate`` passes and ``--strict`` fails. Every message
 says what to write instead, for a person and for an agent, and never invites a
@@ -416,6 +421,34 @@ def _sdp_joins(contract: Mapping[str, Any]) -> Iterator[LintFinding]:
         )
 
 
+def _step_refs(node: Any, parts: Path, under_orchestration: bool) -> Iterator[Path]:
+    """The path of every ``buildStepRef`` an ``orchestration`` block holds, in document order."""
+    if isinstance(node, Mapping):
+        for key, value in node.items():
+            if key == "buildStepRef" and under_orchestration and value not in (None, ""):
+                yield (*parts, key)
+            elif isinstance(value, (Mapping, list)):
+                inside = under_orchestration or key == "orchestration"
+                yield from _step_refs(value, (*parts, key), inside)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from _step_refs(value, (*parts, index), under_orchestration)
+
+
+def _build_step_refs(contract: Mapping[str, Any]) -> Iterator[LintFinding]:
+    """``buildStepRef`` on an Airflow task: the schema accepts it, and no DAG runs it."""
+    for parts in _step_refs(contract, (), False):
+        yield _finding(
+            "contract_unrendered_build_step_ref",
+            parts,
+            f"{_dotted(parts)}: no generated DAG runs this. It names a transformations[] step, "
+            "no command runs a single step, and fluid generate schedule runs each build as "
+            "one fluid apply --build-id task.",
+            "Remove buildStepRef. To run a build after another, list that one in its "
+            "builds[].dependencies.",
+        )
+
+
 def lint_contract(contract: Any, locate: Optional[Any] = None) -> List[LintFinding]:
     """Every authoring-lint finding in ``contract``, rule by rule, in document order.
 
@@ -425,7 +458,13 @@ def lint_contract(contract: Any, locate: Optional[Any] = None) -> List[LintFindi
     if not isinstance(contract, Mapping):
         return []
     findings: List[LintFinding] = []
-    for rule in (_placeholder_emails, _template_residue, _placeholder_values, _sdp_joins):
+    for rule in (
+        _placeholder_emails,
+        _template_residue,
+        _placeholder_values,
+        _sdp_joins,
+        _build_step_refs,
+    ):
         findings.extend(rule(contract))
     return [_located(f, locate) for f in findings] if locate is not None else findings
 
