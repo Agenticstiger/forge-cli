@@ -467,7 +467,8 @@ def _replace(path: Path, body: bytes) -> None:
     created exclusively and never through a link, then renamed over ``path`` (a rename
     replaces a link at ``path`` itself, never its target)."""
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    # Owner-only: the run's processes are this user's, and nothing else reads these files.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(body)
