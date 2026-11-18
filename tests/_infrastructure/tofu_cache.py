@@ -26,7 +26,10 @@ Sharing. The cache sits beside the worker directories, ``<basetemp>/tofu-plugin-
 every xdist worker uses the same one (pytest-xdist's "making session-scoped fixtures
 execute only once": ``getbasetemp().parent`` is the directory the workers share).
 OpenTofu 1.10 and later lock the cache for concurrent use (a second ``init`` waits for the
-first to finish the download); the engine floor is 1.12 (``fluid_build/iac/versions.py``).
+first to finish the download). 1.12.0 and 1.12.1 could still refuse a contended lock ("unable
+to acquire file lock ... resource deadlock avoided"); 1.12.2 fixed that (opentofu#4166). CI
+runs 1.12.12 and 1.13.9, and five modules retry on that message for a machine on the older
+releases.
 
 An operator's own ``TF_PLUGIN_CACHE_DIR`` and flag are kept: CI sets one for the whole lane,
 and a developer can point a run at a cache that lives across runs. Without ``tofu`` on PATH
@@ -38,11 +41,12 @@ check: every test of that provider then fails with "Unrecognized remote plugin m
 (measured with ``hashicorp/aws``, killed at 170 MB of 765 MB). Delete the cache directory.
 
 Sources: OpenTofu, "Provider Plugin Cache" (opentofu.org/docs/cli/config/config-file) and
-the 1.10.0 changelog (cache locking); pytest-xdist how-to.
+its 1.10.0 and 1.12.2 changelogs (cache locking, EDEADLK); pytest-xdist how-to.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 from pathlib import Path
@@ -80,23 +84,19 @@ def cache_settings(
     return settings
 
 
-@pytest.fixture(scope="session", autouse=True)
-def tofu_plugin_cache(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Optional[Path]]:
-    """The run's one OpenTofu provider cache, exported to every ``tofu`` the tests start.
+@contextlib.contextmanager
+def provider_cache(factory: pytest.TempPathFactory) -> Iterator[Optional[Path]]:
+    """Export the run's provider cache to ``os.environ`` for the length of the ``with``.
 
-    Autouse and session-scoped, so ``os.environ`` carries it before any other fixture runs:
-    ``build_tofu_env()`` passes both variables through, and a test that calls ``tofu``
-    without an environment of its own inherits them. Yields the directory, or ``None`` when
-    there is no ``tofu`` on PATH or the directory cannot be made (the provider is then
-    installed per test directory, as before).
+    Yields the directory, or ``None`` (nothing set) when there is no ``tofu`` on PATH or the
+    directory cannot be made: the provider is then installed per test directory, as before.
+    ``factory`` is pytest's ``tmp_path_factory``.
     """
     if shutil.which("tofu") is None:
         yield None
         return
     settings = cache_settings(
-        os.environ,
-        tmp_path_factory.getbasetemp(),
-        worker=os.environ.get("PYTEST_XDIST_WORKER"),
+        os.environ, factory.getbasetemp(), worker=os.environ.get("PYTEST_XDIST_WORKER")
     )
     cache = Path(settings[CACHE_DIR_ENV])
     try:
@@ -107,4 +107,17 @@ def tofu_plugin_cache(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Opti
     with pytest.MonkeyPatch.context() as patch:
         for name, value in settings.items():
             patch.setenv(name, value)
+        yield cache
+
+
+@pytest.fixture(scope="session", autouse=True)
+def tofu_plugin_cache(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Optional[Path]]:
+    """The run's one OpenTofu provider cache, exported to every ``tofu`` the tests start.
+
+    Autouse and session-scoped, so ``os.environ`` carries it before any other fixture runs:
+    ``build_tofu_env()`` passes both variables through, and a test that calls ``tofu``
+    without an environment of its own inherits them. Yields the directory (``None`` when
+    :func:`provider_cache` sets nothing).
+    """
+    with provider_cache(tmp_path_factory) as cache:
         yield cache

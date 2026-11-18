@@ -1567,9 +1567,7 @@ def aws_account() -> Dict[str, str]:
 
 
 @pytest.fixture
-def aws_real_project(
-    aws_account: Dict[str, str], tofu_env: Dict[str, str], tmp_path: Path
-) -> Iterator[RealAwsProject]:
+def aws_real_project(aws_account: Dict[str, str], tmp_path: Path) -> Iterator[RealAwsProject]:
     """A :class:`RealAwsProject` bound to a fresh workdir.
 
     Teardown: best-effort ``tofu destroy`` so applied resources don't
@@ -1581,8 +1579,7 @@ def aws_real_project(
     ``AWS_PROFILE`` and the CI job's OIDC keys, so ``tofu`` would apply with
     another profile's region (or no credentials) while boto checks this one.
     """
-    env = build_tofu_env(get_iac_plugin("aws"))
-    env["TF_PLUGIN_CACHE_DIR"] = tofu_env["TF_PLUGIN_CACHE_DIR"]
+    env = build_tofu_env(get_iac_plugin("aws"))  # carries the run's provider cache
     project = RealAwsProject(tmp_path, env)
     try:
         yield project

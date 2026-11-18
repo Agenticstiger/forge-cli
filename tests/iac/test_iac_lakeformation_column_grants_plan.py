@@ -158,9 +158,9 @@ def _tofu(workdir: Path, env: Dict[str, str], *args: str) -> "subprocess.Complet
 
 
 def _init(workdir: Path, env: Dict[str, str]) -> None:
-    # A plugin cache shared by several pytest-xdist workers is not safe for
-    # concurrent installs: OpenTofu refuses the per-provider lock instead of
-    # waiting. That is contention, not a module error, so it is retried.
+    # OpenTofu 1.12.0 and 1.12.1 could refuse a contended cache lock ("unable to acquire
+    # file lock ... resource deadlock avoided") when xdist workers shared a cache;
+    # 1.12.2 fixed it (opentofu#4166). The retry covers a machine still on those releases.
     for attempt in range(4):
         done = _tofu(workdir, env, "init", "-backend=false", "-input=false", "-no-color")
         if done.returncode == 0 or "unable to acquire file lock" not in done.stdout + done.stderr:

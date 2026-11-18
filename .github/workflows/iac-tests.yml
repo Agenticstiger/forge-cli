@@ -276,8 +276,9 @@ jobs:
       # One provider download per lane. tests/_infrastructure/tofu_cache.py gives every
       # test the TF_PLUGIN_CACHE_DIR that is already set, and makes a cache of its own in
       # the run's basetemp when none is (and sets the lock-file flag in both cases).
-      # OpenTofu 1.10 and later lock the cache for concurrent use; the lanes run 1.12 and
-      # 1.13, so the xdist workers of one run can share it too.
+      # OpenTofu 1.10 and later lock the cache for concurrent use, and 1.12.2 fixed a false
+      # deadlock report when processes share it (opentofu#4166); the lanes run 1.12.12 and
+      # 1.13.9, so the xdist workers of one run can share it too.
       - name: Share one provider cache across the lane's modules
         run: |
           mkdir -p "$RUNNER_TEMP/tofu-plugin-cache"

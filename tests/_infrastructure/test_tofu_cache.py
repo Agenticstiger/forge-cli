@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -70,6 +71,66 @@ def test_the_cached_package_is_trusted_without_a_lock_file_unless_the_operator_d
     for decided in ("0", "true", "1"):
         settings = cache.cache_settings({cache.TRUST_CACHE_ENV: decided}, tmp_path, worker=None)
         assert cache.TRUST_CACHE_ENV not in settings
+
+
+class _Factory:
+    """What ``provider_cache`` asks of pytest's ``tmp_path_factory``."""
+
+    def __init__(self, basetemp: Path) -> None:
+        self._basetemp = basetemp
+
+    def getbasetemp(self) -> Path:
+        return self._basetemp
+
+
+@pytest.fixture
+def clean_tofu_environment(monkeypatch):
+    """A ``tofu`` on PATH and none of the variables the run sets."""
+    monkeypatch.setattr(cache.shutil, "which", lambda name: "/usr/local/bin/tofu")
+    for name in (cache.CACHE_DIR_ENV, cache.TRUST_CACHE_ENV, "PYTEST_XDIST_WORKER"):
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+def test_a_worker_exports_the_cache_every_worker_of_the_run_shares(
+    tmp_path, clean_tofu_environment
+):
+    # The call site, not only the helper: the fixture must hand cache_settings the xdist
+    # worker id, or each worker gets a cache of its own and a run installs the provider N times.
+    clean_tofu_environment.setenv("PYTEST_XDIST_WORKER", "gw2")
+    run = tmp_path / "pytest-7"
+    with cache.provider_cache(_Factory(run / "popen-gw2")) as directory:
+        assert directory == run / cache.CACHE_DIR_NAME
+        assert directory.is_dir()
+        assert os.environ[cache.CACHE_DIR_ENV] == str(directory)
+        assert os.environ[cache.TRUST_CACHE_ENV] == "true"
+    assert cache.CACHE_DIR_ENV not in os.environ  # put back when the session ends
+    assert cache.TRUST_CACHE_ENV not in os.environ
+
+
+def test_without_xdist_the_cache_is_in_the_runs_own_basetemp(tmp_path, clean_tofu_environment):
+    with cache.provider_cache(_Factory(tmp_path / "pytest-7")) as directory:
+        assert directory == tmp_path / "pytest-7" / cache.CACHE_DIR_NAME
+
+
+def test_without_tofu_nothing_is_set_or_made(tmp_path, clean_tofu_environment):
+    clean_tofu_environment.setattr(cache.shutil, "which", lambda name: None)
+    with cache.provider_cache(_Factory(tmp_path / "pytest-7")) as directory:
+        assert directory is None
+        assert cache.CACHE_DIR_ENV not in os.environ
+    assert not (tmp_path / "pytest-7").exists()
+
+
+def test_a_cache_directory_that_cannot_be_made_leaves_the_environment_alone(
+    tmp_path, clean_tofu_environment
+):
+    blocker = tmp_path / "a-file"
+    blocker.write_text("not a directory")
+    clean_tofu_environment.setenv(cache.CACHE_DIR_ENV, str(blocker / "cache"))
+    with cache.provider_cache(_Factory(tmp_path / "pytest-7")) as directory:
+        assert directory is None
+        assert os.environ[cache.CACHE_DIR_ENV] == str(blocker / "cache")  # the operator's, as set
+        assert cache.TRUST_CACHE_ENV not in os.environ
 
 
 def test_both_variables_pass_through_the_environment_tofu_is_given():
