@@ -248,14 +248,39 @@ def test_a_document_nested_too_deeply_to_read_is_refused(tmp_path):
 
 def test_a_merge_key_chain_that_writes_out_too_many_pairs_is_refused(tmp_path):
     # Any *.flux.yml is read, so the chain need not sit in the Simulation.
-    lines = ["kind: Segment", "a0: &a0 {k0: 1, k1: 2}"]
-    lines += [f"a{n}: &a{n} {{<<: [*a{n - 1}, *a{n - 1}]}}" for n in range(1, 30)]
-    _write(tmp_path, "bomb.flux.yml", "\n".join(lines) + "\n")
+    _write(tmp_path, "bomb.flux.yml", "\n".join(_merge_chain(29)) + "\n")
     _write(tmp_path, "s.flux.yml", SIMULATION)
     with pytest.raises(BundleError) as refused:
         read_bundle_block(tmp_path, "orders")
     assert refused.value.event == "profile_bundle_unreadable"
     assert "bomb.flux.yml" in str(refused.value) and "merge key" in str(refused.value)
+
+
+def _merge_chain(levels):
+    """A document whose mapping a{n} merges a{n-1} twice: 2^(n+1) pairs at level n."""
+    lines = ["kind: Segment", "a0: &a0 {k0: 1, k1: 2}"]
+    lines += [f"a{n}: &a{n} {{<<: [*a{n - 1}, *a{n - 1}]}}" for n in range(1, levels + 1)]
+    return lines
+
+
+def test_merges_that_each_stay_under_the_bound_are_counted_together(tmp_path):
+    # Each mapping below merges 2,048 pairs, far under the bound, and 50 of them pass it.
+    lines = _merge_chain(10) + ["b: [" + ", ".join(["{<<: [*a10]}"] * 50) + "]"]
+    _write(tmp_path, "wide.flux.yml", "\n".join(lines) + "\n")
+    _write(tmp_path, "s.flux.yml", SIMULATION)
+    with pytest.raises(BundleError) as refused:
+        read_bundle_block(tmp_path, "orders")
+    assert "wide.flux.yml" in str(refused.value) and "merge keys" in str(refused.value)
+
+
+def test_merges_in_different_documents_of_a_bundle_are_counted_together(tmp_path):
+    # 65,532 pairs a document: under the bound alone, past it in the second.
+    for name in ("one.flux.yml", "two.flux.yml"):
+        _write(tmp_path, name, "\n".join(_merge_chain(14)) + "\n")
+    _write(tmp_path, "s.flux.yml", SIMULATION)
+    with pytest.raises(BundleError) as refused:
+        read_bundle_block(tmp_path, "orders")
+    assert "two.flux.yml" in str(refused.value) and "merge keys" in str(refused.value)
 
 
 def test_a_merge_key_inside_the_bound_reads_as_the_engine_reads_it(tmp_path):

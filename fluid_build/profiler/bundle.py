@@ -126,9 +126,27 @@ def _documents(directory: Path) -> List[Path]:
     ]
 
 
-def _exact_loader(name: str) -> Any:
-    """The engine's ``ExactLoader``, built on first use so PyYAML stays off the cold path."""
+class _Merges:
+    """The pairs YAML merge keys may still copy while one bundle is read."""
+
+    def __init__(self) -> None:
+        self.left = _MOST_BLOCK_VALUES
+
+
+def _exact_loader(name: str, merges: _Merges) -> Any:
+    """The engine's ``ExactLoader``, built on first use so PyYAML stays off the cold path.
+
+    Its merge keys draw on *merges*, which every document of one bundle shares.
+    """
     import yaml
+
+    def merged_parts(value_node: Any) -> List[Any]:
+        """The mappings a merge key's value names: one mapping, or a list of them."""
+        if isinstance(value_node, yaml.MappingNode):
+            return [value_node]
+        if isinstance(value_node, yaml.SequenceNode):
+            return [part for part in value_node.value if isinstance(part, yaml.MappingNode)]
+        return []
 
     class ExactLoader(yaml.SafeLoader):
         """A float is its source text as a Decimal, a timestamp a string, a long int refused."""
@@ -136,22 +154,20 @@ def _exact_loader(name: str) -> Any:
         def flatten_mapping(self, node: Any) -> None:
             # A merge key (``<<``) copies its mappings' pairs while the document is
             # built, before _canonicalise counts a value, and a chain of merges doubles
-            # at each level; so the pairs a merge adds are counted first, and a merge
-            # past the block's bound is refused before its list is built.
-            merged = len(node.value)
+            # at each level. So every pair a merge copies, in any document of the
+            # bundle, is counted against one bound before the copy is made.
             for key_node, value_node in node.value:
                 if key_node.tag != _MERGE_TAG:
                     continue
-                parts = value_node.value if isinstance(value_node, yaml.SequenceNode) else []
-                for part in parts if parts else [value_node]:
-                    if isinstance(part, yaml.MappingNode):
-                        self.flatten_mapping(part)
-                        merged += len(part.value)
-                        if merged > _MOST_BLOCK_VALUES:
-                            raise refuse(
-                                node,
-                                f"a merge key (<<) writes out more than {_MOST_BLOCK_VALUES} pairs",
-                            )
+                for part in merged_parts(value_node):
+                    self.flatten_mapping(part)
+                    merges.left -= len(part.value)
+                    if merges.left < 0:
+                        raise refuse(
+                            node,
+                            f"merge keys (<<) copy more than {_MOST_BLOCK_VALUES} pairs "
+                            "in the bundle",
+                        )
             super().flatten_mapping(node)
 
     def refuse(node: Any, why: str) -> BundleError:
@@ -324,7 +340,7 @@ def _canonicalise(
     )
 
 
-def _load(path: Path) -> Tuple[Mapping[str, Any], ...]:
+def _load(path: Path, merges: _Merges) -> Tuple[Mapping[str, Any], ...]:
     """Every mapping document in *path*, as the engine's ``load_documents_exact`` reads it.
 
     A file may hold more than one ``---`` document; a :class:`BundleError` names the
@@ -347,7 +363,7 @@ def _load(path: Path) -> Tuple[Mapping[str, Any], ...]:
         ) from None
     try:
         documents = list(
-            yaml.load_all(text, Loader=_exact_loader(path.name))  # nosec B506 - SafeLoader subclass
+            yaml.load_all(text, Loader=_exact_loader(path.name, merges))  # nosec B506 - SafeLoader
         )
     except RecursionError:
         raise BundleError(
@@ -374,8 +390,9 @@ def read_bundle_block(directory: Path, expose_id: str) -> BundleBlock:
     not a mapping.
     """
     simulations: List[Tuple[Path, Mapping[str, Any]]] = []
+    merges = _Merges()  # one bound for every document of the bundle
     for path in _documents(directory):
-        for document in _load(path):
+        for document in _load(path, merges):
             if document.get("kind") == "Simulation":
                 simulations.append((path, document))
     if not simulations:
