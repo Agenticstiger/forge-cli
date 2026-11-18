@@ -196,7 +196,7 @@ def test_an_exposeid_that_is_not_a_plain_name_needs_out(workspace, registry, cap
 def test_the_summary_names_each_withheld_code(workspace, registry, capsys):
     assert main(["profile", "contract.fluid.yaml", "--source", "orders.ndjson"]) == 0
     out = capsys.readouterr().out
-    assert "Withheld, by CL_CONF_STATUS code: A (small count)" in out
+    assert "Withheld, by the check (CL_CONF_STATUS code): A (small count)" in out
     assert "2 columns" in out
 
 

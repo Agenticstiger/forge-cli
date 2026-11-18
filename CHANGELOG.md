@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`fluid profile --bundle` writes `C` for every withheld group and cell of a histogram.** In
+  0.32.0 a `marginalHistogram/1` or `levelHistogram/1` value that an output check withheld kept
+  that check's code, `A` for a small count, and a code that names the check tells a reader a
+  range: cells of 10, 9, 9 and 10 records written `F`, `A`, `A` and `F`, under a total the reader
+  knows, give both withheld cells as 9. FLUX PROFILE-SPEC now asks a profiler to write `C`
+  (withheld statistical information) for every withheld group and cell of a count table, whatever
+  withheld it (FLUX ADR 0011). The summary still counts each by the check that withheld it, and
+  now says so: `Withheld, by the check (CL_CONF_STATUS code): A (small count) 3.` A new line
+  counts the histogram cells withheld inside published groups. Every other statistic keeps the
+  check's code, and a profile 0.32.0 wrote still reads.
+
 ### Fixed
 
 - **A quoted enum list in `validationRules` reads as SQL writes it.** Every reader cut an enum
@@ -29,6 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1 <= p <= 1000 and 0 <= s <= p)". Leading zeros still read by value, so `decimal(0012, 02)` is
   `decimal(12, 2)`. The conformance vectors gain 13 cases at the bounds, from `decimal(1)` and
   `decimal(1000, 1000)` to `decimal(0)` and `decimal(1000,1001)`.
+
+### Security
+
+- **A quantile is published only when the records below and above it pass the threshold too.**
+  A `quantile/1` group was published when ten records held its witness, with its two ranks, so a
+  rank could say that 3 records lie below the witness, or that 2 lie above it. A group is now
+  published only when the records below its witness and those above it are each none or at least
+  `minimumCell`, on unrounded counts (the three cells of FLUX ADR 0011), and it is withheld with
+  `A` otherwise. `fluid profile --help` names the rule.
 
 ## [0.32.0] — 2026-11-18
 

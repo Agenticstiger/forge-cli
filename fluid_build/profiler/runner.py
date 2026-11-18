@@ -171,8 +171,13 @@ class ProfileResult:
     digest: str
     plan: ExposePlan
     published: int
-    #: Withheld values per ``CL_CONF_STATUS`` code.
+    #: Withheld values per ``CL_CONF_STATUS`` code of the check that withheld them: a
+    #: histogram's withheld groups are written ``C`` whatever the check
+    #: (:func:`disclosure.written_status`), and counted here by the check.
     withheld: Mapping[str, int] = field(default_factory=dict)
+    #: The histogram cells withheld inside published groups, per code of the check
+    #: that withheld them; the document writes each ``C``.
+    withheld_cells: Mapping[str, int] = field(default_factory=dict)
     #: The grid the document declares and its on-grid statistics were formed on.
     fractional_bits: int = DEFAULT_FRACTIONAL_BITS
     #: Each published fidelity statistic (:data:`NamedStatistic`).
@@ -471,6 +476,7 @@ def profile_expose(
         source, [column.name for column in plan.columns], table=table, cwd=cwd
     )
     tally: "Counter[str]" = Counter()
+    cell_tally: "Counter[str]" = Counter()
     replaced = _ungrouped_means(declared)
     columns_doc = {
         column.name: _column(
@@ -488,7 +494,9 @@ def profile_expose(
     left_out: List[Tuple[str, str]] = list(declared.left_out) if declared is not None else []
     if declared is not None:
         left_out.extend(
-            _declare_statistics(declared, read, columns_doc, backend, rule, tally, fractional_bits)
+            _declare_statistics(
+                declared, read, columns_doc, backend, rule, (tally, cell_tally), fractional_bits
+            )
         )
     table_doc: Dict[str, Any] = {"columns": columns_doc}
     row_count = _row_count(read.row_count, rule, tally)
@@ -515,6 +523,7 @@ def profile_expose(
         plan=plan,
         published=published,
         withheld=dict(sorted(tally.items())),
+        withheld_cells=dict(sorted(cell_tally.items())),
         fractional_bits=fractional_bits,
         statistics=all_published,
         withheld_statistics=none_published,
@@ -611,14 +620,15 @@ def _declare_statistics(
     columns_doc: Dict[str, Dict[str, Any]],
     backend: StatisticsBackend,
     rule: disclosure.DisclosureRule,
-    tally: "Counter[str]",
+    tallies: Tuple["Counter[str]", "Counter[str]"],
     fractional_bits: int,
 ) -> List[Tuple[str, str]]:
     """Form every declared statistic and add it to its column; return those left out.
 
     The rows of each statistic are built from the one read of the table. A
     statistic no record forms a group of (a grouped one over an empty table) has
-    nothing to write, and is returned with the reason.
+    nothing to write, and is returned with the reason. *tallies* count the values
+    and the histogram cells the checks withhold, by the check.
     """
     rows: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
     left_out: List[Tuple[str, str]] = []
@@ -643,7 +653,7 @@ def _declare_statistics(
         if not measured.groups:
             left_out.append((statistic.description, "no record forms a group of it"))
             continue
-        entry = _declared_entry(statistic, measured, backend, rule, tally, fractional_bits)
+        entry = _declared_entry(statistic, measured, backend, rule, tallies, fractional_bits)
         columns_doc[statistic.column].setdefault("statistics", []).append(entry)
     return left_out
 
@@ -653,10 +663,15 @@ def _declared_entry(
     measured: MeasuredStatistic,
     backend: StatisticsBackend,
     rule: disclosure.DisclosureRule,
-    tally: "Counter[str]",
+    tallies: Tuple["Counter[str]", "Counter[str]"],
     fractional_bits: int,
 ) -> Dict[str, Any]:
-    """One declared statistic as the document writes it: every group checked, none guessed at."""
+    """One declared statistic as the document writes it: every group checked, none guessed at.
+
+    Each status is written through :func:`disclosure.written_status`, so a histogram's
+    withheld groups and cells read ``C``; *tallies* count them by the check.
+    """
+    tally, cell_tally = tallies
     groups = measured.groups
     checked = [_check_group(statistic, group, backend, rule, fractional_bits) for group in groups]
     verdicts = [verdict for verdict, _ in checked]
@@ -666,9 +681,23 @@ def _declared_entry(
     for group, verdict, (_, published) in zip(groups, verdicts, checked, strict=True):
         tally[verdict.status] += 1
         if verdict.published:
+            if "cellStatus" in published:
+                checks = published["cellStatus"]
+                cell_tally.update(code for code in checks if code != disclosure.FREE)
+                published = {
+                    **published,
+                    "cellStatus": [
+                        disclosure.written_status(code, statistic.kind) for code in checks
+                    ],
+                }
             written.append({**published, "status": disclosure.FREE})
         else:
-            written.append({"group": group.key, "status": verdict.status})
+            written.append(
+                {
+                    "group": group.key,
+                    "status": disclosure.written_status(verdict.status, statistic.kind),
+                }
+            )
     entry: Dict[str, Any] = {
         "definition": statistic.identifier,
         "sampleSize": disclosure.sample_size(sum(group.k for group in groups), rule),
@@ -720,6 +749,8 @@ def _check_group(
 
     Every group first passes as a count of records (``k``), which is published
     rounded; then what its statistic adds is checked as that statistic's rule says.
+    A histogram's ``cellStatus`` still names the check that withheld each cell:
+    :func:`_declared_entry` writes it.
     """
     kind = statistic.kind
     published = dict(group.document)
