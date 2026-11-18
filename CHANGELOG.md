@@ -218,6 +218,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Spark build runs on EMR on EKS.** EMR on EKS names an image of a release,
+  `emr-X.Y.Z-latest` or `emr-X.Y.Z-YYYYMMDD`, and forge sent it the plain `emr-7.12.0` every
+  other EMR runtime takes, refusing the suffixed forms everywhere (the 0.7.7 schema, the IaC
+  checks). Each EMR runtime now takes its own form, and an `emr-eks` build without
+  `releaseLabel` runs on `emr-7.12.0-latest`; EMR Serverless and EMR on EC2 keep `emr-7.12.0`.
+
 - **`fluid ship` generates artifacts for a reference-only contract.** Stage 3 skipped every
   contract with a `hybrid-reference`, `reference` or `external-reference` build, even with
   `--emit`, so stage 4 skipped too and the run exited 0 with no `MANIFEST.json`. `fluid generate

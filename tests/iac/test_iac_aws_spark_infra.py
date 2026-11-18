@@ -1147,3 +1147,32 @@ def test_the_job_config_is_the_compilers_with_only_the_brokers_filled(contract, 
     ).config
     rendered = json.loads(text.replace(filled, MSK_BROKERS_PLACEHOLDER))
     assert rendered == compiled
+
+
+@pytest.mark.parametrize(
+    ("runtime", "label", "says"),
+    [
+        ("emr-eks", "emr-7.12.0", "emr-X.Y.Z-latest or emr-X.Y.Z-YYYYMMDD"),
+        ("emr-serverless", "emr-7.12.0-latest", "takes emr-X.Y.Z (e.g. emr-7.12.0)"),
+    ],
+)
+def test_a_release_label_in_another_runtime_s_form_is_refused(contract, runtime, label, says):
+    params = spark(contract)
+    params.update(runtime=runtime, releaseLabel=label)
+    if runtime == "emr-eks":
+        del params["applicationId"]
+        params["virtualClusterId"] = VIRTUAL_CLUSTER
+    (error,) = [e for e in aws_identity.runtime_errors(contract["builds"][0]) if "release" in e]
+    assert says in error
+    with pytest.raises(UnsupportedBindingError, match="releaseLabel"):
+        emit(contract)
+
+
+def test_emr_on_eks_emits_with_its_image_label(contract):
+    params = spark(contract)
+    del params["applicationId"]
+    params.update(runtime="emr-eks", virtualClusterId=VIRTUAL_CLUSTER)
+    assert aws_identity.runtime_errors(contract["builds"][0]) == []
+    params["releaseLabel"] = "emr-7.12.0-20251111"
+    assert aws_identity.runtime_errors(contract["builds"][0]) == []
+    emit(contract)
