@@ -1147,3 +1147,33 @@ def test_the_job_config_is_the_compilers_with_only_the_brokers_filled(contract, 
     ).config
     rendered = json.loads(text.replace(filled, MSK_BROKERS_PLACEHOLDER))
     assert rendered == compiled
+
+
+def test_hadoop_may_look_up_each_directory_it_is_given(contract):
+    """Hadoop's getFileStatus HEADs a directory's own key before ``<dir>/`` and lists it by
+    its slashless name: without both, S3 answers 403 and a stream dies on its checkpoint."""
+    _, data = emit(contract)
+    access = data["aws_iam_policy_document"][f"{KEY}_access"]
+    dirs = [
+        "iceberg/commerce/order_lines",
+        "_checkpoints/commerce.orders-stream/ingest-orders",
+        "_fluid/spark/commerce.orders-stream/ingest-orders",
+    ]
+    directory = statement(access, "Directory4")
+    assert directory["actions"] == ["s3:GetObject"]  # the one key, which holds no data
+    assert directory["resources"] == [f"arn:aws:s3:::commerce-lake/{d}" for d in dirs]
+    values = statement(access, "List2")["condition"][0]["values"]
+    # Exactly the directory (no sibling <dir>-x), and what is under it.
+    assert values == [*dirs, *(f"{d}/*" for d in dirs)]
+
+
+def test_a_bucketless_output_s_directories_keep_the_account_expression(contract):
+    loc = contract["exposes"][0]["binding"]["location"]
+    del loc["bucket"]
+    loc["path"] = "commerce.orders-stream/order_lines/"
+    _, data = emit(contract)
+    directory = statement(data["aws_iam_policy_document"][f"{KEY}_access"], "Directory4")
+    account_bucket = "${data.aws_caller_identity.fluid_lf_caller.account_id}-fluid-data"
+    assert directory["resources"][0] == (
+        f"arn:aws:s3:::{account_bucket}/commerce.orders-stream/order_lines"
+    )

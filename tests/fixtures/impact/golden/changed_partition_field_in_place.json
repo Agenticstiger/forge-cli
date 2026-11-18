@@ -1,0 +1,70 @@
+{
+  "version": "1.0",
+  "consumer_interface": {
+    "status": "unchanged",
+    "changes": [],
+    "readers": {
+      "status": "known",
+      "reason": "readers outside the workspace, or in files not named contract.fluid.yaml, are not listed",
+      "items": [
+        {
+          "product_id": "finance.revenue",
+          "expose_ids": [
+            "orders"
+          ],
+          "source": "workspace",
+          "breaking_changes": []
+        }
+      ]
+    }
+  },
+  "governance_and_target": {
+    "status": "changed",
+    "broad_grant_added": false,
+    "grants": {
+      "added": [],
+      "removed": []
+    },
+    "targets": [],
+    "partitioning": [
+      {
+        "expose_id": "orders",
+        "field": "location.partitionBy",
+        "before": [
+          "order_date"
+        ],
+        "after": [
+          "order_id"
+        ],
+        "provider_impact": "in_place",
+        "provider_reason": "the plan: update google_bigquery_table.orders"
+      }
+    ],
+    "policy": [],
+    "inputs": []
+  },
+  "resource_impact": {
+    "status": "known",
+    "reason": null,
+    "plan": {
+      "source": "update-orders.tfplan.json",
+      "counts": {
+        "replace": 0,
+        "delete": 0,
+        "update": 1,
+        "create": 0,
+        "read": 0,
+        "forget": 0,
+        "no-op": 0
+      },
+      "resources": [
+        {
+          "address": "google_bigquery_table.orders",
+          "type": "google_bigquery_table",
+          "action": "update"
+        }
+      ]
+    }
+  },
+  "documentation_only": false
+}

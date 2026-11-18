@@ -177,6 +177,24 @@ def register(subparsers: argparse._SubParsersAction):
         default="text",
         help="Version-diff mode only: stdout rendering format (default: text)",
     )
+    p.add_argument(
+        "--impact",
+        action="store_true",
+        help=(
+            "Version-diff mode only: add an impact report for a pull request, in three "
+            "sections: consumer interface (with the workspace products that read this one), "
+            "governance and target (grants, platform, location, partitioning), and resource "
+            "impact (from --plan). What cannot be seen reads 'unknown', with the reason"
+        ),
+    )
+    p.add_argument(
+        "--plan",
+        metavar="PLAN_JSON",
+        help=(
+            "Version-diff mode only (implies --impact): the plan.json of `fluid plan --tofu`, "
+            "or the `tofu show -json` of a saved plan, for the resource impact"
+        ),
+    )
     p.set_defaults(cmd=COMMAND, func=run)
 
 
@@ -214,6 +232,8 @@ def run(args, logger: logging.Logger) -> int:
             args.out = str(
                 validate_cli_path(args.out, mode="write", must_exist=False, file_type="output")
             )
+        if getattr(args, "plan", None):
+            args.plan = str(validate_cli_path(args.plan, mode="read", file_type="plan"))
 
         # Version-diff mode (contract-vs-contract). When ``--baseline`` is
         # supplied we bypass provider lookup entirely — the comparison is
@@ -221,6 +241,17 @@ def run(args, logger: logging.Logger) -> int:
         baseline_path = getattr(args, "baseline", None)
         if baseline_path:
             return _run_version_diff(args, logger)
+        if getattr(args, "impact", False) or getattr(args, "plan", None):
+            raise CLIError(
+                2,
+                "diff_modes_mutually_exclusive",
+                {
+                    "detail": (
+                        "--impact and --plan report what a contract change reaches, so they "
+                        "need --baseline (the contract before the change)."
+                    ),
+                },
+            )
 
         # Drift mode (contract-vs-live-warehouse) — the original behaviour.
         # Load contract and generate desired state
@@ -848,11 +879,19 @@ def _run_version_diff(args, logger: logging.Logger) -> int:
     # envelope to --out so CI runners that don't parse stdout still get a
     # machine-readable artifact. Both get the redacted report.
     safe = _safe_report(report)
-    _print_version_diff(safe, getattr(args, "format", "text") or "text")
+    impact = (
+        _impact(baseline, new, safe, new_path, args.plan)
+        if getattr(args, "impact", False) or getattr(args, "plan", None)
+        else None
+    )
+    _print_version_diff(safe, getattr(args, "format", "text") or "text", impact)
 
     from ._common import write_json
 
-    write_json(args.out, safe.to_dict())
+    document = safe.to_dict()
+    if impact is not None:
+        document["impact"] = impact
+    write_json(args.out, document)
 
     info(
         logger,
@@ -918,7 +957,43 @@ def _jsonable(value: Any) -> Any:
     return _redact_str(str(value))
 
 
-def _print_version_diff(report: ChangelogReport, fmt: str) -> None:
+def _impact(
+    baseline: Mapping[str, Any],
+    new: Mapping[str, Any],
+    safe: "ChangelogReport",
+    new_path: str,
+    plan_path: Optional[str],
+) -> Dict[str, Any]:
+    """The ``--impact`` document for ``safe`` (redacted), with every value redacted too."""
+    from fluid_build.observability.secret_redactor import redact_value
+
+    from ..api.impact import build_impact, find_consumers, read_plan
+
+    plan, plan_reason, plan_source = None, None, None
+    if plan_path:
+        plan_source = Path(plan_path).name
+        plan, plan_reason = read_plan(Path(plan_path))
+    product = new.get("id")
+    impact = build_impact(
+        baseline,
+        new,
+        safe,
+        consumers=find_consumers(
+            [str(i) for i in (product, baseline.get("id")) if isinstance(i, str)],
+            Path(new_path),
+            new,
+        ),
+        plan=plan,
+        plan_reason=plan_reason,
+        plan_source=plan_source,
+    )
+    safe_impact: Dict[str, Any] = _jsonable(redact_value(impact))
+    return safe_impact
+
+
+def _print_version_diff(
+    report: ChangelogReport, fmt: str, impact: Optional[Mapping[str, Any]] = None
+) -> None:
     """Print a version-diff ``report`` (already made safe) to stdout as ``fmt``.
 
     JSON and Markdown are documents a program reads, so they are written
@@ -935,15 +1010,23 @@ def _print_version_diff(report: ChangelogReport, fmt: str) -> None:
     from fluid_build.cli.console import cprint_literal
 
     from ..api.changelog import render_markdown, render_text
+    from ..api.impact import render_impact_markdown, render_impact_text
 
     if fmt == "json":
         import json as _json
 
-        sys.stdout.write(_json.dumps(report.to_dict(), indent=2) + "\n")
+        document = report.to_dict()
+        if impact is not None:
+            document["impact"] = impact
+        sys.stdout.write(_json.dumps(document, indent=2) + "\n")
     elif fmt == "markdown":
         sys.stdout.write(render_markdown(report) + "\n")
+        if impact is not None:
+            sys.stdout.write("\n" + render_impact_markdown(impact))
     else:
         cprint_literal(render_text(report), soft_wrap=True, highlight=False)
+        if impact is not None:
+            cprint_literal(render_impact_text(impact), soft_wrap=True, highlight=False)
 
 
 def _invalid_contracts_error(

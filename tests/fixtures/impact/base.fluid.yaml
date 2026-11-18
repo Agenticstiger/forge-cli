@@ -1,0 +1,38 @@
+fluidVersion: 0.7.7
+kind: DataProduct
+id: sales.orders
+name: Orders
+description: Orders placed in the web shop.
+domain: sales
+metadata:
+  layer: Silver
+  owner:
+    team: sales-data
+exposes:
+  - exposeId: orders
+    kind: table
+    version: 1.0.0
+    binding:
+      platform: gcp
+      format: bigquery_table
+      location:
+        project: shop-analytics
+        dataset: sales
+        table: orders
+        partitionBy:
+          - order_date
+    contract:
+      schema:
+        - name: order_id
+          type: string
+          required: true
+        - name: order_date
+          type: date
+          required: true
+        - name: amount
+          type: decimal(12,2)
+          required: true
+accessPolicy:
+  grants:
+    - principal: group:sales-analysts@example.com
+      permissions: [read]

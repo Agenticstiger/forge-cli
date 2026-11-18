@@ -1,0 +1,12 @@
+{
+  "format_version": "1.2",
+  "resource_changes": [
+    {
+      "address": "google_storage_bucket.other",
+      "mode": "managed",
+      "type": "google_storage_bucket",
+      "name": "other",
+      "change": {"actions": ["create", "delete"], "before": {}, "after": {}}
+    }
+  ]
+}

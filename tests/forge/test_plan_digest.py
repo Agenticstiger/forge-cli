@@ -30,8 +30,9 @@ from typing import Any, Dict
 
 import pytest
 
-from fluid_build.forge.core.bundle import build_bundle_tgz
+from fluid_build.forge.core.bundle import build_bundle_tgz, packet_digest, write_tgz
 from fluid_build.forge.core.plan_digest import (
+    PACKET_DIGEST_FIELD,
     PlanBindingError,
     compute_contract_digest,
     compute_plan_digest,
@@ -647,6 +648,74 @@ class TestVerifyPlanBinding:
         with pytest.raises(PlanBindingError) as exc_info:
             verify_plan_binding(plan, bundle_path=None)
         assert exc_info.value.kind == "binding-mode-mismatch"
+
+
+class TestPacketDigest:
+    """A bound plan names the bundle file's bytes, not only its contract."""
+
+    def _same_contract_other_bytes(self, bundle: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Rewrite the bundle with its members under another tar mtime (another
+        SOURCE_DATE_EPOCH): the MANIFEST and every member are unchanged, so
+        bundleDigest still matches."""
+        import tarfile
+
+        with tarfile.open(bundle, "r:gz") as tar:
+            members = {m.name: tar.extractfile(m).read() for m in tar.getmembers() if m.isfile()}
+        monkeypatch.setattr("fluid_build.forge.core.bundle._DEFAULT_MTIME", 1_700_000_000)
+        write_tgz(bundle, members)
+
+    def test_inject_records_the_bundle_file_sha256(self, tmp_path: Path) -> None:
+        bundle = _build_bundle(tmp_path)
+        plan = inject_digests(_minimal_plan(), bundle_path=bundle)
+        assert plan[PACKET_DIGEST_FIELD] == packet_digest(bundle)
+        assert plan[PACKET_DIGEST_FIELD] != plan["bundleDigest"]
+
+    def test_a_raw_plan_records_none(self) -> None:
+        assert PACKET_DIGEST_FIELD not in inject_digests(_minimal_plan(), bundle_path=None)
+
+    @staticmethod
+    def _refusal(plan: Dict[str, Any], bundle: Any) -> PlanBindingError:
+        with pytest.raises(PlanBindingError) as exc_info:
+            verify_plan_binding(plan, bundle_path=bundle)
+        return exc_info.value
+
+    def test_same_contract_other_bytes_is_packet_mismatch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bundle = _build_bundle(tmp_path)
+        plan = inject_digests(_minimal_plan(), bundle_path=bundle)
+        self._same_contract_other_bytes(bundle, monkeypatch)
+        assert read_bundle_digest(bundle) == plan["bundleDigest"]
+        refused = self._refusal(plan, bundle)
+        assert refused.kind == "packet-mismatch"
+        assert "re-run ``fluid plan``" in str(refused)
+
+    @pytest.mark.parametrize(
+        "edit, rehash, kind",
+        [
+            # An older fluid's plan: bound, digested, no packetDigest.
+            (lambda plan: plan.pop(PACKET_DIGEST_FIELD), True, "packet-missing"),
+            # An edited value is caught by planDigest first.
+            (
+                lambda plan: plan.update({PACKET_DIGEST_FIELD: "sha256:" + "0" * 64}),
+                False,
+                "plan-tamper",
+            ),
+        ],
+    )
+    def test_a_bound_plan_is_refused(self, tmp_path: Path, edit, rehash: bool, kind: str) -> None:
+        bundle = _build_bundle(tmp_path)
+        plan = inject_digests(_minimal_plan(), bundle_path=bundle)
+        edit(plan)
+        if rehash:
+            plan["planDigest"] = compute_plan_digest(plan)
+        assert self._refusal(plan, bundle).kind == kind
+
+    def test_a_raw_plan_carrying_one_is_binding_mode_mismatch(self) -> None:
+        plan = inject_digests(_minimal_plan(), bundle_path=None)
+        plan[PACKET_DIGEST_FIELD] = "sha256:" + "a" * 64
+        plan["planDigest"] = compute_plan_digest(plan)
+        assert self._refusal(plan, None).kind == "binding-mode-mismatch"
 
 
 # ---------------------------------------------------------------------------

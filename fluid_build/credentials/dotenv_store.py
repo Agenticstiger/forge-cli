@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Dict, FrozenSet, List, Mapping, Optional, Set, Tuple
 
 from .protected_env import (
+    VAULT_TOKEN_NAMES,
     EndpointGroup,
     EndpointRefusal,
     endpoint_group,
@@ -22,6 +23,7 @@ from .protected_env import (
     is_endpoint_of,
     is_protected_env_key,
     refused_project_authenticators,
+    refused_project_vault_tokens,
     unpaired_endpoints,
 )
 
@@ -366,6 +368,34 @@ def _warn_refused_authenticators(
         )
 
 
+def _warn_refused_vault_tokens(
+    refused: Dict[str, str], sources: Dict[str, Path], already_set: FrozenSet[str]
+) -> None:
+    """Report project Vault tokens dropped because the operator has one.
+
+    Names variables and files, never values. A name the operator set to a
+    value that is not blank is skipped: the project's value would not have
+    replaced it anyway.
+    """
+    new = sorted(
+        key
+        for key in refused
+        if key.upper() not in already_set and (key, str(sources[key])) not in _WARNED_PROTECTED_KEYS
+    )
+    if not new:
+        return
+    _WARNED_PROTECTED_KEYS.update((key, str(sources[key])) for key in new)
+    held = refused[new[0]]
+    theirs = held if held in VAULT_TOKEN_NAMES else f"the token file {held}"
+    logger.warning(
+        "Ignored %s from project dotenv files: you have an OpenBao/Vault token of your own "
+        "(%s), and the project's would be read in its place to reach your store. To use the "
+        "project's token instead, export it in your shell or CI environment.",
+        ", ".join(f"{key} ({sources[key].name})" for key in new),
+        theirs,
+    )
+
+
 def _warn_if_world_readable(path: Path) -> None:
     """Warn when a credential-bearing ``.env`` file is group/other-readable.
 
@@ -509,6 +539,12 @@ class DotEnvCredentialStore:
         refused_authenticators = refused_project_authenticators(combined, operator)
         for key in refused_authenticators:
             del combined[key]
+        # A reader takes the first OpenBao / Vault token that is set, so while
+        # the operator has one, a project file's BAO_TOKEN or VAULT_TOKEN would
+        # be read in its place. The operator's wins.
+        refused_tokens = refused_project_vault_tokens(combined, operator, _PROJECT_EXPORTS)
+        for key in refused_tokens:
+            del combined[key]
 
         # Export to ``os.environ`` for backward compatibility, but never
         # override an env var the operator set BEFORE this store ran. Previous
@@ -547,6 +583,7 @@ class DotEnvCredentialStore:
         _warn_refused_authenticators(
             refused_authenticators, sources, already_set=self._operator_set_keys
         )
+        _warn_refused_vault_tokens(refused_tokens, sources, already_set=self._operator_set_keys)
 
         self._cache = combined
         self._loaded = True
