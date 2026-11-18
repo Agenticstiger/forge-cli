@@ -69,6 +69,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--plan` implies `--impact`; without `--baseline` both are refused. Without the flags, the
   version diff is unchanged.
 
+- **`fluid generate artifacts` writes each forge Spark build's `job.json`.** A new `spark` emit
+  key, on by default (the generated Jenkinsfile's `GENERATE_EMIT` default lists it), writes
+  `spark/<build id>/job.json` for every Spark build (`engine: spark` with `parameters.spark`,
+  schema 0.7.7): the runner config the compiler produces for the contract as `fluid generate
+  iac` reads it, the same bytes `fluid apply` uploads to `_fluid/spark/<product>/<build>/job.json`,
+  so the artifacts MANIFEST carries the hash of the deployed config. Two values only `tofu apply`
+  knows stay placeholders: `<account>` in the warehouse of an output that names no bucket, and the
+  compiler's MSK broker placeholder for a source named by its cluster ARN; each such build is
+  logged. What the upload refuses is refused here too: two builds whose ids name one file (equal
+  but for case or `-` and `_`), and a config holding `${`. The operator's upload policies
+  (contract SQL, hosts) stay with `fluid apply`; `fluid validate` reports them. A contract
+  without a Spark build writes nothing, and only files of this shape are cleared from
+  `<out>/spark/`. `fluid validate-artifacts` checks each `job.json` (JSON object, integer
+  `configVersion`, `build` naming its directory, `product`, `mode` and `sink` present).
+
 - **BigQuery holds the nested columns a contract declares.** A 0.7.7 column that declares its
   `element`, `fields`, or `key` and `value` was refused on BigQuery. It is now written as
   BigQuery holds it: an array as a REPEATED field of its element's type, a struct as a RECORD
@@ -165,7 +180,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validate each contract. `--format sarif` also refuses `--list-versions` and `--show-schema`,
   whose text would end the log.
 
+- **`fluid ship --release-dir DIR` publishes a run as a release once every stage it ran
+  passed.** The run stages into a new `DIR.partial-<run-id>-*` beside `DIR`. It copies the
+  bundle, the artifacts the artifacts MANIFEST lists (each checked against its digest), the
+  plan when stage 6 ran, and the reports there. It writes `release.json` last and renames the
+  directory to `DIR`. `release.json` keeps the release's `identity` apart from its
+  `provenance`. The identity holds the product id, environment, `fluidVersion`, Forge
+  version, exact emit set, bundle MANIFEST digest, archive sha256, artifacts MANIFEST digest
+  and the plan's digests, plus the apply mode when stage 7 ran (so a dry run never reads as
+  an apply); two clean runs of one checkout give the same identity and
+  `identity_digest`. The provenance holds the run id, the stage times, the CI run and the
+  report time. A run that fails, or is interrupted, publishes nothing: its reports stay in
+  `runtime/` and in the staging directory, and `ship-report.json` names the stage that
+  stopped it. A release run first removes the stage reports in `runtime/`, so only this run's
+  are published. `DIR` must not
+  exist, and stages 1-4 must run in the invocation; otherwise ship refuses with exit 2, and
+  `--explain` says why. A release run reads only local files: it opens no network connection
+  of its own.
+
 ### Changed
+
+- **`ship-report.json` is versioned: `"schema": "fluid-ship-report/2"`.** Every stage has one
+  of six statuses: `passed`, `failed`, `skipped-by-policy` (a flag, a `RUN_STAGE_*` switch or
+  a dry run turned it off), `unsupported` (nothing to act on: no policy bindings, no DAGs, no
+  scheduler), `not-run` (not selected, or after a failure) or `unknown`. It also has one
+  `reason`, which replaces `skip_reason` and `failure_reason`, and `started_at` /
+  `finished_at` in UTC. An interrupted stage is `unknown`, not `failed`: what it had done by
+  then is not known. In one-step-per-stage CI, an earlier step's report that is the run's but
+  cannot be read leaves the stages before this step `unknown`, and the run's `exit_code` is
+  not 0. A
+  version 1 record still merges, with `skipped` read as `skipped-by-policy`. The report gains
+  `written_at`, and a `release` block under `--release-dir`. JUnit counts `unknown` as a
+  failure and both kinds of skip as skipped.
 
 - **`fluid profile --bundle` writes `C` for every withheld group and cell of a histogram or a
   quantile.** In 0.32.0 a `marginalHistogram/1`, `levelHistogram/1` or `quantile/1` value that an
