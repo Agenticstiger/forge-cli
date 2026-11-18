@@ -20,6 +20,13 @@ digest fields emitted into ``plan.json``:
 with a message pointing at the specific divergence ("bundle swap" vs
 "plan tamper").
 
+A plan made from a bundle also carries ``packetDigest``: the sha256 of the
+bundle file's bytes (:func:`~fluid_build.forge.core.bundle.packet_digest`).
+``bundleDigest`` names the resolved contract and its inputs; ``packetDigest``
+names the exact packet, MANIFEST fields included, so the plan applies only with
+the bytes it was reviewed against. It is part of the plan body, under
+``planDigest``.
+
 A plan made from a bundle that packs dbt projects also carries
 ``dbtProjects``: each build's project files and their merkle root, read from
 the bundle's MANIFEST (:func:`dbt_projects_record`). It is part of the plan
@@ -312,6 +319,10 @@ def is_bundle_path(path: str) -> bool:
 #: out of ``planDigest``.
 DBT_PROJECTS_FIELD = "dbtProjects"
 
+#: The ``plan.json`` field that binds the bundle file's bytes. Not masked out of
+#: ``planDigest``, so editing it is a plan tamper.
+PACKET_DIGEST_FIELD = "packetDigest"
+
 
 def dbt_projects_record(bundle_path: Path) -> Dict[str, Any]:
     """``{build id: {"digest": <merkle root>, "files": {path: sha256:<hex>}}}`` for a plan.
@@ -373,6 +384,12 @@ def inject_digests(
         )
     out = dict(plan)
     out["bundleDigest"] = read_bundle_digest(bundle_path) if bundle_path else ""
+    if bundle_path:
+        from fluid_build.forge.core.bundle import packet_digest
+
+        out[PACKET_DIGEST_FIELD] = packet_digest(bundle_path)
+    else:
+        out.pop(PACKET_DIGEST_FIELD, None)
     # The dbt projects the bundle packs, bound under planDigest. Read after
     # ``read_bundle_digest`` has verified the MANIFEST; only a bundle binds them,
     # so a raw plan carries no record.
@@ -469,7 +486,12 @@ def verify_plan_binding(
        ...)``. Missing or empty ``planDigest`` in the plan is treated as
        a tamper signal — legitimate plans always carry one.
 
-    3. A bound plan's ``dbtProjects`` must be the record of the dbt projects the
+    3. A bound plan's ``packetDigest`` must be the sha256 of the bundle file
+       supplied: ``"packet-missing"`` when the plan has none (an older fluid
+       made it, or it was stripped), ``"packet-mismatch"`` for other bytes. A raw
+       plan carrying one is a ``"binding-mode-mismatch"``.
+
+    4. A bound plan's ``dbtProjects`` must be the record of the dbt projects the
        bundle packs (none when it packs none), else ``"bundle-mismatch"``; a raw
        plan carrying one is a ``"binding-mode-mismatch"``. The checkout itself is
        compared by ``fluid apply`` (it needs the project on disk).
@@ -553,9 +575,44 @@ def verify_plan_binding(
             f"plan (emergency hotfix only; logged prominently).",
         )
 
-    # 3. The dbt projects, after the tamper check so an edited record reports
+    # 3. The packet's bytes, after the tamper check so an edited value reports
+    #    plan-tamper.
+    _verify_packet_digest(plan, bundle_path if expected_bundle else None)
+
+    # 4. The dbt projects, after the tamper check so an edited record reports
     #    plan-tamper.
     _verify_dbt_projects_record(plan, bundle_path if expected_bundle else None)
+
+
+def _verify_packet_digest(plan: Dict[str, Any], bundle_path: Optional[Path]) -> None:
+    """Refuse a bound plan applied with other bundle bytes than it was made from."""
+    expected = plan.get(PACKET_DIGEST_FIELD)
+    if bundle_path is None:
+        if expected:
+            raise PlanBindingError(
+                "binding-mode-mismatch",
+                "plan.json declares bindingMode='raw' but carries a packetDigest — "
+                "inconsistent binding. Re-run ``fluid plan``.",
+            )
+        return
+    if not expected:
+        raise PlanBindingError(
+            "packet-missing",
+            "plan.json is bound to a bundle but records no packetDigest, so the "
+            "packet it was reviewed against is unknown. It was made by an older "
+            "fluid or edited: re-run ``fluid plan`` on the bundle.",
+        )
+    from fluid_build.forge.core.bundle import packet_digest
+
+    actual = packet_digest(bundle_path)
+    if actual != expected:
+        raise PlanBindingError(
+            "packet-mismatch",
+            f"plan.json was made from the packet {expected} but {bundle_path} is "
+            f"{actual}. It holds the same contract (bundleDigest matches) in other "
+            "bytes, e.g. rebuilt with another --env or SOURCE_DATE_EPOCH. Apply "
+            "the packet the plan was made from, or re-run ``fluid plan`` on this one.",
+        )
 
 
 def _verify_dbt_projects_record(plan: Dict[str, Any], bundle_path: Optional[Path]) -> None:
