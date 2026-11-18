@@ -148,7 +148,10 @@ def junit_xml(records: List[StageRecord]) -> bytes:
             failure = ET.SubElement(
                 case, "failure", {"message": f"stage {rec.number} {rec.name} failed"}
             )
-            failure.text = _xml_safe(f"exit code {rec.exit_code}: fluid {' '.join(rec.argv)}")
+            detail = f"exit code {rec.exit_code}: fluid {' '.join(rec.argv)}"
+            if rec.reason:  # a stage that exited 0 can fail ship's own check
+                detail = f"{rec.reason}\n{detail}"
+            failure.text = _xml_safe(detail)
         elif rec.status in (SKIPPED, NOT_RUN):
             prefix = "" if rec.status == SKIPPED else "not run: "
             message = _xml_safe(prefix + (rec.reason or rec.status))

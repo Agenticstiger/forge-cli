@@ -17,6 +17,12 @@ re-verifies before reading a byte. Two guarantees:
    MANIFEST carries a merkle root over all files. Tamper any byte →
    :func:`validate_manifest` raises.
 
+3. **The dbt code a build runs.** The dbt project of each build that runs
+   one from disk is packed byte for byte under ``sources/dbt/<build id>/``
+   (the files dbt reads: ``build_runners/dbt/project_files.py``), so the
+   merkle root covers it, ``fluid plan`` binds it (``dbtProjects``) and
+   ``fluid apply`` refuses a checkout whose files differ.
+
 Layout inside the tgz::
 
     bundle.tgz
@@ -26,6 +32,7 @@ Layout inside the tgz::
     └── sources/
         ├── sql/{builds_N__id}.sql, {exposes_N__id}__view.sql
         ├── openapi/{exposes_N__id}.yaml
+        └── dbt/{build id}/dbt_project.yml, models/..., macros/..., ...
 
 Design decisions — see plan Part 5 Phase 2 and Part 8 (D1, D2, D5, D6).
 """
@@ -184,19 +191,27 @@ def build_manifest(
     for path in sorted(files.keys()):
         per_file[path] = "sha256:" + hashlib.sha256(files[path]).hexdigest()
 
-    merkle_input = "".join(f"{path}:{digest}\n" for path, digest in per_file.items())
-    merkle = "sha256:" + hashlib.sha256(merkle_input.encode("utf-8")).hexdigest()
-
     manifest: Dict[str, Any] = {
         "version": MANIFEST_VERSION,
         "generator": generator,
         "contractId": contract_id,
         "files": per_file,
-        "digest": merkle,
+        "digest": merkle_root(per_file),
     }
     if source is not None:
         manifest["source"] = dict(source)
     return manifest
+
+
+def merkle_root(per_file: Mapping[str, str]) -> str:
+    """SHA-256 over the sorted ``"<path>:<sha256:hex>\\n"`` lines of ``per_file``.
+
+    The one definition of the root a MANIFEST carries, also used for the digest
+    of one dbt project's files (``dbtProjects`` in a plan), with paths relative
+    to that project.
+    """
+    merkle_input = "".join(f"{path}:{per_file[path]}\n" for path in sorted(per_file))
+    return "sha256:" + hashlib.sha256(merkle_input.encode("utf-8")).hexdigest()
 
 
 def write_tgz(out_path: Path, files: Dict[str, bytes]) -> None:
@@ -324,8 +339,8 @@ def validate_manifest(tgz_path: Path) -> None:
         if extra:
             raise ValueError(f"{tgz_path} contains {sorted(extra)} not declared in MANIFEST")
 
-        # Per-file hash check + rebuild merkle input.
-        merkle_input = ""
+        # Per-file hash check, then the merkle root over the verified hashes.
+        verified: Dict[str, str] = {}
         for path in sorted(expected_paths):
             data = read_tar_member_bounded(tar, path)
             actual = "sha256:" + hashlib.sha256(data).hexdigest()
@@ -335,10 +350,10 @@ def validate_manifest(tgz_path: Path) -> None:
                     f"SHA-256 mismatch for {path!r} in {tgz_path}: "
                     f"expected {expected}, got {actual}"
                 )
-            merkle_input += f"{path}:{actual}\n"
+            verified[path] = actual
 
         expected_merkle = manifest.get("digest", "")
-        actual_merkle = "sha256:" + hashlib.sha256(merkle_input.encode("utf-8")).hexdigest()
+        actual_merkle = merkle_root(verified)
         if actual_merkle != expected_merkle:
             raise ValueError(
                 f"merkle root mismatch in {tgz_path}: "
@@ -352,12 +367,23 @@ def build_bundle_tgz(
     *,
     contract_id: str = "",
     source: Optional[Mapping[str, Any]] = None,
+    dbt_projects: Optional[Mapping[str, Mapping[str, bytes]]] = None,
 ) -> str:
     """Full pipeline: extract fragments, serialize, write deterministic tgz.
 
     Returns the merkle root digest (``sha256:...``) — the same value
     downstream stages compare against when verifying the bundle.
     ``source`` is recorded in ``MANIFEST.json`` (see :func:`build_manifest`).
+    ``dbt_projects`` maps a build id to its dbt project's files (path relative
+    to the project, raw bytes), packed under ``sources/dbt/<build id>/`` as they
+    are (``fluid bundle`` reads them with
+    ``build_runners.dbt.project_files.collect_bundle_projects``).
+
+    Raises :class:`ValueError` for a bundle the reader would refuse: a dbt
+    path that is not a plain relative path, more than
+    :data:`MAX_DBT_SOURCE_BYTES` of dbt files, a file over
+    :data:`MAX_BUNDLE_MEMBER_BYTES`, more than :data:`MAX_BUNDLE_MEMBERS`
+    entries, or a path the tar format cannot hold.
     """
     rewritten, sources = extract_fragments(resolved_contract)
 
@@ -370,6 +396,8 @@ def build_bundle_tgz(
         "contract.resolved.json": json_bytes,
         **sources,
     }
+    files.update(_dbt_source_files(dbt_projects or {}))
+    _check_readable(files)
 
     # MANIFEST carries the hash of every file above. Written last inside the
     # tar so it's the authoritative record.
@@ -379,6 +407,123 @@ def build_bundle_tgz(
 
     write_tgz(out_path, files)
     return str(manifest["digest"])
+
+
+# ---------------------------------------------------------------------------
+# dbt projects (``sources/dbt/<build id>/``)
+# ---------------------------------------------------------------------------
+
+#: Where a build's dbt project lives in a bundle: ``sources/dbt/<build id>/<path>``.
+DBT_SOURCES_PREFIX = "sources/dbt/"
+
+#: The most bytes of dbt project files one bundle carries, every build together.
+#: The same limit ``build_runners/dbt/project_files.py`` reads projects with.
+MAX_DBT_SOURCE_BYTES = 128 * 1024 * 1024
+
+
+#: The hidden files a packed dbt project may hold, at its root only: dbt reads
+#: ``.dbtignore`` to skip files (``build_runners/dbt/project_files.py``).
+_DBT_ROOT_DOTFILES = frozenset({".dbtignore"})
+
+
+def _plain_segments(path: str, *, allowed_root: frozenset = frozenset()) -> bool:
+    """True for a relative POSIX path of plain names: no ``..``, ``.``, empty or hidden
+    part (but a top-level name in ``allowed_root``), and no control character, which
+    would let one MANIFEST line pass for two."""
+    if not path or "\\" in path or path.startswith("/"):
+        return False
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in path):
+        return False
+    if path in allowed_root:
+        return True
+    return all(part and not part.startswith(".") for part in path.split("/"))
+
+
+def _dbt_source_files(projects: Mapping[str, Mapping[str, bytes]]) -> Dict[str, bytes]:
+    """``sources/dbt/<build id>/<path>`` → bytes, refusing any path that is not plain.
+
+    The caller checks the build id grammar (``build_runners/_ids.py``); this keeps
+    every entry a plain relative path whatever it is given, so a bundle never
+    holds a member that would land outside its directory when extracted.
+    """
+    out: Dict[str, bytes] = {}
+    total = 0
+    for build_id in sorted(projects):
+        if not _plain_segments(build_id) or "/" in build_id:
+            raise ValueError(f"dbt project build id {build_id!r} cannot be a bundle directory")
+        for rel in sorted(projects[build_id]):
+            if not _plain_segments(rel, allowed_root=_DBT_ROOT_DOTFILES):
+                raise ValueError(
+                    f"dbt project file {rel!r} of build {build_id!r} is not a plain relative path"
+                )
+            data = projects[build_id][rel]
+            total += len(data)
+            out[f"{DBT_SOURCES_PREFIX}{build_id}/{rel}"] = bytes(data)
+    if total > MAX_DBT_SOURCE_BYTES:
+        raise ValueError(
+            f"the dbt projects hold {total} bytes; a bundle carries {MAX_DBT_SOURCE_BYTES} "
+            "bytes of dbt project files at most"
+        )
+    return out
+
+
+def _check_readable(files: Mapping[str, bytes]) -> None:
+    """Refuse to write a bundle :func:`validate_manifest` would refuse to read back.
+
+    Counts the entries :func:`write_tgz` writes (each file and each parent
+    directory) and builds each one's USTAR header as it does, so a path the
+    format cannot hold is reported by name before anything is written.
+    """
+    dirs = set()
+    for path in files:
+        parts = path.split("/")
+        dirs.update("/".join(parts[:i]) for i in range(1, len(parts)))
+    # +1: MANIFEST.json, written after this check.
+    count = len(files) + len(dirs) + 1
+    if count > MAX_BUNDLE_MEMBERS:
+        raise ValueError(
+            f"the bundle would hold {count} entries (files and directories); a bundle "
+            f"holds {MAX_BUNDLE_MEMBERS} at most. Trim the dbt project the build packs"
+        )
+    for path, data in files.items():
+        if len(data) > MAX_BUNDLE_MEMBER_BYTES:
+            raise ValueError(
+                f"{path} is {len(data)} bytes; a bundle member holds "
+                f"{MAX_BUNDLE_MEMBER_BYTES} at most"
+            )
+    for name in sorted(set(files) | dirs):
+        info = tarfile.TarInfo(name=name)
+        if name in dirs:
+            info.type = tarfile.DIRTYPE
+        try:
+            info.tobuf(tarfile.USTAR_FORMAT, "utf-8", "surrogateescape")
+        except ValueError as exc:
+            raise ValueError(
+                f"{name} is too long a path for the bundle's tar format ({exc}); shorten "
+                "the build id or the project's file and directory names"
+            ) from exc
+
+
+def read_bundle_dbt_trees(tgz_path: Path) -> Dict[str, Dict[str, str]]:
+    """Each build's bundled dbt project as ``{build id: {path in the project: sha256:<hex>}}``.
+
+    Read from ``MANIFEST.json`` (bounded), whose per-file digests and merkle root
+    :func:`validate_manifest` proves; the caller runs that first. ``{}`` for a
+    bundle that packs no dbt project.
+    """
+    with tarfile.open(tgz_path, mode="r:gz") as tar:
+        if "MANIFEST.json" not in tar.getnames():
+            return {}
+        manifest = json.loads(read_tar_member_bounded(tar, "MANIFEST.json").decode("utf-8"))
+    declared = manifest.get("files") if isinstance(manifest, dict) else None
+    trees: Dict[str, Dict[str, str]] = {}
+    for path, digest in sorted((declared or {}).items()):
+        if not isinstance(path, str) or not path.startswith(DBT_SOURCES_PREFIX):
+            continue
+        build_id, _, rel = path[len(DBT_SOURCES_PREFIX) :].partition("/")
+        if build_id and rel:
+            trees.setdefault(build_id, {})[rel] = str(digest)
+    return trees
 
 
 # ---------------------------------------------------------------------------
@@ -717,6 +862,8 @@ def _slug(raw: str) -> str:
 
 # Re-export for tests + stage-2 validate.
 __all__ = [
+    "DBT_SOURCES_PREFIX",
+    "MAX_DBT_SOURCE_BYTES",
     "SOURCE_SENTINEL",
     "MANIFEST_VERSION",
     "ExactDumper",
@@ -727,6 +874,8 @@ __all__ = [
     "bundle_source_contract",
     "extract_fragments",
     "make_bundle_source",
+    "merkle_root",
+    "read_bundle_dbt_trees",
     "read_bundle_source",
     "resolve_bundle_source_contract",
     "validate_manifest",

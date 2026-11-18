@@ -24,6 +24,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retention now plans a replacement, which `fluid apply` refuses without `--allow-data-loss`.
   Adding retention later on the same column is an in-place change.
 
+- **The bundle packs the dbt project a build runs, and `fluid apply` refuses a checkout whose dbt
+  files changed.** A dbt build's models were read from the checkout at apply time, so a model
+  edited after `fluid plan` ran unreviewed. `fluid bundle --format tgz` now packs the dbt project
+  of each dbt build, found where the dbt runner reads it, under `sources/dbt/<build id>/`, byte for
+  byte: `dbt_project.yml`, `packages.yml`, `dependencies.yml`, `package-lock.yml`, `selectors.yml`,
+  `.dbtignore`, and every file under the directories the `*-paths` keys name, read as dbt-core
+  reads them (defaults models, macros, seeds, snapshots, tests, analyses and functions; a null key
+  takes its default; the deprecated `source-paths` and `data-paths`). It never packs
+  `profiles.yml`, `target/`, `logs/`, `dbt_packages/` (or what `target-path`, `log-path` and
+  `packages-install-path` name), or a file dbt never reads by its name (one starting with `.`, `#`
+  or `~`), and it refuses what it cannot bind: a symbolic link, a file dbt reads inside a hidden or
+  `__pycache__` directory (`.sql`, `.py`, `.csv`, `.md`, `.yml`, `.yaml`), an output directory
+  inside a read one, a `*-paths` entry outside the project, a `*-paths` or output entry written as
+  Jinja, a directory it cannot list, a missing or templated project, a file over 64 MiB and more
+  than 128 MiB of dbt files in one bundle. Each file is in the MANIFEST and under its merkle root,
+  so the same tree bundles to the same bytes. `fluid plan <bundle>` records each project's files as
+  `dbtProjects` under `planDigest`, and `fluid apply` compares the checkout with the bundle's copy
+  before anything runs; the dbt runner compares the directory it runs again, just before dbt
+  starts. A changed, added or removed file, and a dbt build the bundle packs no project for (as in
+  a bundle made before this change), fail with `apply_plan_digest_bundle_mismatch`, naming the
+  files; `--no-verify-plan-binding` skips the check, logged at WARNING. `fluid validate <bundle>`
+  reports one finding per packed project. Run `fluid generate dbt-tests` before `fluid bundle` and
+  the generated tests are bound with the models. Installed packages are not bound: dbt reads
+  whatever `packages-install-path` holds and `fluid apply` neither installs nor checks it, so
+  install them from `package-lock.yml` in the job that applies. A Git `repository` is not packed
+  (its ref pins it), a plan made from a contract file binds no dbt project, and plan and apply run
+  in the same checkout path (the plan records it). The Databricks job emitter now uploads the same
+  file selection.
+
 - **BigQuery holds the nested columns a contract declares.** A 0.7.7 column that declares its
   `element`, `fields`, or `key` and `value` was refused on BigQuery. It is now written as
   BigQuery holds it: an array as a REPEATED field of its element's type, a struct as a RECORD
@@ -68,20 +97,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another build's DAG would otherwise run twice). `fluid validate` warns about an Airflow
   task's `buildStepRef`: no generated DAG runs one.
 
+- **`fluid ship --require-artifacts KEYS` fails the run unless stage 3 writes what it promised.**
+  The keys are `generate artifacts`' emit keys: `odcs` needs one ODCS file per `exposes[]` port
+  of the bundled contract, `odps-bitol` the ODPS product, `opds` the OPDS document, `policies`
+  `policy/bindings.json` and `schedule` at least one schedule file. Ship removes the earlier
+  `dist/artifacts/MANIFEST.json` before stage 3 runs. A file counts only when the new MANIFEST
+  lists it and its digest on disk matches, so output left by an earlier run never passes. Stage 3
+  then fails with exit 1 and names every missing file (the port, for ODCS), in the log, in
+  `ship-report.json` and in the JUnit report. A run that cannot meet the requirement is refused
+  with exit 2 before stage 1, and `--explain` shows why: stage 3 does not run in this invocation
+  (`--stage`, `--until`, `--skip-stage`, `--no-generate-artifacts`, `RUN_STAGE_3_GENERATE_ARTIFACTS=false`),
+  or `--emit` / `GENERATE_EMIT` leaves a required key out.
+
+- **`fluid validate --diagnostics` and `--format sarif` point each finding at the line its author
+  wrote.** A contract composed from `$ref` fragments and an `--env` overlay used to report most
+  findings as a path into the composed document. With `--diagnostics`, each finding carries the
+  file, line and column that wrote the value, the related place in the root contract (the key
+  whose `$ref` brought a fragment in, or the base value an overlay patched), and the product,
+  environment and expose or consume it sits under. Text prints `file:line:col: error CODE:
+  message` lines; `--format json` adds a `diagnostics` block, `{"version": "1.0", "items": [...]}`,
+  after the keys it always had. `--format sarif` writes a SARIF 2.1.0 log for code scanning, with
+  a rule per code, `%SRCROOT%`-relative locations and a fingerprint that does not move with its
+  line; a contract that cannot be loaded still gets a log, with that failure in it. A minor
+  version only adds fields, and `fluid_build.diagnostics.DiagnosticReport.from_dict` reads any
+  `1.x` document and ignores keys it does not know. No diagnostic carries a fix a tool could
+  apply, a source snippet or a credential. Without the flags the text and JSON output are
+  unchanged. A workspace or bundle run refuses the flags (`diagnostics_scope_unsupported`):
+  validate each contract. `--format sarif` also refuses `--list-versions` and `--show-schema`,
+  whose text would end the log.
+
 ### Changed
 
-- **`fluid profile --bundle` writes `C` for every withheld group and cell of a histogram.** In
-  0.32.0 a `marginalHistogram/1` or `levelHistogram/1` value that an output check withheld kept
-  that check's code, `A` for a small count, and a code that names the check tells a reader a
-  range: cells of 10, 9, 9 and 10 records written `F`, `A`, `A` and `F`, under a total the reader
-  knows, give both withheld cells as 9. FLUX PROFILE-SPEC now asks a profiler to write `C`
-  (withheld statistical information) for every withheld group and cell of a count table, whatever
-  withheld it (FLUX ADR 0011). The summary still counts each by the check that withheld it, and
-  now says so: `Withheld, by the check (CL_CONF_STATUS code): A (small count) 3.` A new line
-  counts the histogram cells withheld inside published groups. Every other statistic keeps the
-  check's code, and a profile 0.32.0 wrote still reads.
+- **`fluid profile --bundle` writes `C` for every withheld group and cell of a histogram or a
+  quantile.** In 0.32.0 a `marginalHistogram/1`, `levelHistogram/1` or `quantile/1` value that an
+  output check withheld kept that check's code, `A` for a small count, and a code that names the
+  check tells a reader a range: cells of 10, 9, 9 and 10 records written `F`, `A`, `A` and `F`,
+  under a total the reader knows, give both withheld cells as 9. FLUX PROFILE-SPEC now asks a
+  profiler to write `C` (withheld statistical information) for every withheld group and cell of a
+  count table and of a `quantile/1`, whatever withheld it (FLUX ADR 0012). The summary still
+  counts each by the check that withheld it, and now says so:
+  `Withheld, by the check (CL_CONF_STATUS code): A (small count) 3.` A new line counts the
+  histogram cells withheld inside published groups. Every other statistic keeps the check's code,
+  and a profile 0.32.0 wrote still reads.
 
 ### Fixed
+
+- **`fluid ship` generates artifacts for a reference-only contract.** Stage 3 skipped every
+  contract with a `hybrid-reference`, `reference` or `external-reference` build, even with
+  `--emit`, so stage 4 skipped too and the run exited 0 with no `MANIFEST.json`. `fluid generate
+  artifacts` has written ODCS, ODPS and policy artifacts for such contracts since May: they do
+  not depend on where the transformation runs. Stage 3 now runs for them as well. Stage 4 fails,
+  instead of skipping, when stage 3 was to write `dist/artifacts/` and did not; it still skips
+  under `--no-generate-artifacts`. A CI file from `fluid generate ci` still switches stage 3 off
+  by default for a reference-only contract.
 
 - **A quoted enum list in `validationRules` reads as SQL writes it.** Every reader cut an enum
   rule's `constraint` at every comma, so `constraint: "'base_fee', 'usage', 'fee, late'"` listed
@@ -119,9 +187,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A quantile is published only when the records below and above it pass the threshold too.**
   A `quantile/1` group was published when ten records held its witness, with its two ranks, so a
   rank could say that 3 records lie below the witness, or that 2 lie above it. A group is now
-  published only when the records below its witness and those above it are each none or at least
-  `minimumCell`, on unrounded counts (the three cells of FLUX ADR 0011), and it is withheld with
-  `A` otherwise. `fluid profile --help` names the rule.
+  published only when the records below its witness and those above it each number at least
+  `minimumCell`, on unrounded counts (the three cells of FLUX ADR 0012). None is allowed only
+  where the rule does not hold zeros disclosive: it says no record lies between the witness and
+  the end of the range. `fluid profile --help` names the rule.
+- **A quantile is withheld beside another statistic that counts at its column's edges.** Its
+  ranks count records at its witness, an edge no declaration fixes, so next to a histogram of its
+  column they could give a withheld cell back (ranks of 17 beside a published cell of 12 give a
+  withheld 5), and two quantiles of one column give back the records between their witnesses. A
+  quantile is now published only as its column's one histogram or quantile; beside another level,
+  a histogram, or the whole beside a groupBy, every group is withheld. A quantile checked there
+  needs bins, once forge-cli writes FLUX's binned quantile.
+- **A group withheld for its size withholds its siblings in a grouped histogram or quantile.**
+  Every grouped statistic publishes each group's size, so a group of 5 records was the column's
+  count less its siblings' sizes, which only a grouped mean or support withheld. Now, when a group
+  of a groupBy (or the rows a null key leaves out of every group) fails the size check, or those
+  rows cannot be read as the block reads them, every group of that groupBy's histograms and
+  quantiles on the same column is withheld too, counted as `D`. A group's size is its records
+  with a value in the column, so another column's groups are checked on their own sizes.
+- **These entries do not complete FLUX ADR 0012's rule on their own.** A reader can still
+  subtract one histogram's published counts from another's, or from a level histogram's group
+  size, and rebuild a withheld cell, a zero included. FLUX's `check_edge_counts` closes that, and
+  forge-cli calls it once a flux-stats release carries it. That change completes the rule and
+  lands before the next forge-cli release.
 
 ## [0.32.0] — 2026-11-18
 
