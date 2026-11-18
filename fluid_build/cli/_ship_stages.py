@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -42,6 +43,7 @@ from ._ship_table import STAGE_NAMES, STAGE_NUMBERS, STAGE_TOGGLES, STAGES
 BUNDLE_PATH = "runtime/bundle.tgz"
 PLAN_PATH = "runtime/plan.json"
 ARTIFACTS_DIR = "dist/artifacts/"
+ARTIFACTS_MANIFEST = "dist/artifacts/MANIFEST.json"
 POLICY_BINDINGS = "dist/artifacts/policy/bindings.json"
 SCHEDULE_DIR = "dist/artifacts/schedule"
 
@@ -69,6 +71,10 @@ VALIDATE_REPORT = "runtime/validate-report.json"
 VALIDATE_ARTIFACTS_REPORT = "runtime/validate-artifacts-report.json"
 PLAN_HTML_PATH = "runtime/plan.html"
 SCHEDULE_SYNC_REPORT = "runtime/schedule-sync-report.json"
+
+#: The ``generate artifacts --emit`` keys ``--require-artifacts`` accepts, in
+#: that command's canonical order (``artifact_fanout.EMIT_KEYS``).
+REQUIRABLE_ARTIFACTS: Tuple[str, ...] = ("odps-bitol", "odcs", "opds", "schedule", "policies")
 
 
 class ShipUsageError(Exception):
@@ -108,6 +114,8 @@ class ShipOptions:
     diff_last_applied: str = ""  # stage 5 --last-applied: the plan the last apply ran
     plan_html: bool = False  # stage 6 --html runtime/plan.html
     policy_mode: str = "enforce"  # stage 8 --mode, unless stage 7 ran as a dry run
+    # --require-artifacts: stage 3 fails unless this run writes each key's files.
+    require_artifacts: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -275,7 +283,24 @@ def resolve_options(args: object, contract: str, env: Mapping[str, str]) -> Ship
         diff_last_applied=opt("last_applied", "DIFF_LAST_APPLIED"),
         plan_html=_off_unless_true(get("plan_html"), env, "PLAN_HTML"),
         policy_mode=_resolve_policy_mode(get("policy_mode"), env),
+        require_artifacts=_resolve_required_artifacts(get("require_artifacts")),
     )
+
+
+def _resolve_required_artifacts(flag: object) -> Tuple[str, ...]:
+    """``--require-artifacts odcs,odps-bitol`` -> the keys in canonical order."""
+    if flag is None:
+        return ()
+    keys = {part.strip() for part in str(flag).split(",") if part.strip()}
+    if not keys:
+        raise ShipUsageError("--require-artifacts names no artifact")
+    unknown = sorted(keys - set(REQUIRABLE_ARTIFACTS))
+    if unknown:
+        raise ShipUsageError(
+            f"--require-artifacts: unknown key(s) {', '.join(unknown)}: use "
+            + ", ".join(REQUIRABLE_ARTIFACTS)
+        )
+    return tuple(k for k in REQUIRABLE_ARTIFACTS if k in keys)
 
 
 def check_targets(targets: Sequence[str]) -> None:
@@ -467,7 +492,7 @@ def _skip_after_dry_run(opts: ShipOptions, what: str) -> Optional[str]:
 
 @contextlib.contextmanager
 def _quiet_probe() -> Iterator[None]:
-    """Ship's own look into the contract (is it reference-only? its one build?)
+    """Ship's own look into the contract (its one build? anything to schedule?)
     prints and logs nothing. Loading it warns about the overlays with their ids
     copied in verbatim (``overlay_entry_added``), and on GitHub Actions a line of
     the checkout's text is a workflow command; the stage children load the same
@@ -481,18 +506,13 @@ def _quiet_probe() -> Iterator[None]:
         logging.disable(previous)
 
 
-def _contract_reference_only(contract: str) -> bool:
-    from fluid_build.cli.generate_ci import _contract_is_reference_only
-
-    with _quiet_probe():
-        return bool(_contract_is_reference_only(contract))
-
-
 def emits(opts: ShipOptions, key: str) -> bool:
-    """Whether stage 3's ``--emit`` (blank: every emitter) includes ``key``."""
+    """Whether stage 3's ``--emit`` (blank: every emitter) includes ``key``.
+    ``odps`` is ``generate artifacts``' deprecated spelling of ``opds``."""
     if not opts.emit.strip():
         return True
-    return key in {part.strip() for part in opts.emit.split(",")}
+    parts = {part.strip() for part in opts.emit.split(",")}
+    return key in {"opds" if p == "odps" else p for p in parts}
 
 
 def schedules_expected(opts: ShipOptions) -> bool:
@@ -553,10 +573,11 @@ def _validate(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
 
 
 def _generate_artifacts(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
+    # A reference-only contract runs it too: the transformation lives elsewhere,
+    # but its ODCS, ODPS and policy artifacts do not depend on where it runs
+    # (``generate artifacts`` itself drops no key for one; schedule has its own gate).
     if not o.generate_artifacts:
         a.skip_reason = "--no-generate-artifacts"
-    elif _contract_reference_only(o.contract):
-        a.skip_reason = "reference-only contract: nothing to generate"
     else:
         a.argv = [
             "generate",
@@ -569,11 +590,23 @@ def _generate_artifacts(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
             ARTIFACTS_DIR,
             *(["--emit", o.emit] if o.emit else []),
         ]
+        if o.require_artifacts:
+            a.notes.append(
+                f"--require-artifacts {','.join(o.require_artifacts)}: this stage fails unless "
+                f"it writes each of them, listed in a new {ARTIFACTS_MANIFEST}"
+            )
 
 
 def _validate_artifacts(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
     if not ws.has_dir(ARTIFACTS_DIR):
-        a.skip_reason = f"{ARTIFACTS_DIR} does not exist (stage 3 wrote nothing)"
+        if o.generate_artifacts:
+            # Stage 3 was to write it: a missing directory is a failure, never
+            # a pass that validated nothing.
+            raise ShipUsageError(
+                f"{ARTIFACTS_DIR} does not exist, but stage 3 generate-artifacts was to write "
+                "it; pass --no-generate-artifacts when this pipeline generates no artifacts"
+            )
+        a.skip_reason = f"{ARTIFACTS_DIR} does not exist (--no-generate-artifacts)"
         return
     a.argv = [
         "validate-artifacts",
@@ -700,8 +733,8 @@ def _schedule_sync(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
         a.skip_reason = "SCHEDULER is blank: no scheduler to sync to"
     elif not ws.dir_has_entries(SCHEDULE_DIR):
         a.skip_reason = (
-            f"no {SCHEDULE_DIR}/ DAGs to sync (reference-only contract, stage 3 not run, "
-            "or no orchestration.engine configured)"
+            f"no {SCHEDULE_DIR}/ DAGs to sync (stage 3 not run, or the contract declares "
+            "no orchestration.engine and no scheduled build)"
         )
     else:
         argv = [
@@ -774,7 +807,7 @@ def check_preconditions(
         if message and not (num == 9 and dry_run_applied_nothing(opts)):
             # verify is skipped after a dry run, so it reads nothing
             raise ShipUsageError(message)
-        if num == 4 and not ws.has_dir(ARTIFACTS_DIR) and _generation_expected(opts):
+        if num == 4 and not ws.has_dir(ARTIFACTS_DIR) and opts.generate_artifacts:
             raise ShipUsageError(
                 f"stage 4 validate-artifacts needs {ARTIFACTS_DIR}: "
                 "run stage 3 (fluid ship --stage artifacts) first"
@@ -783,14 +816,166 @@ def check_preconditions(
             produced.add(BUNDLE_PATH)
         if num == 6:
             produced.add(PLAN_PATH)
-        if num == 3 and _generation_expected(opts):
+        if num == 3 and opts.generate_artifacts:
             produced.add(ARTIFACTS_DIR.rstrip("/"))
 
 
-def _generation_expected(opts: ShipOptions) -> bool:
-    """Stage 3 will write dist/artifacts/ (it is on and the contract is not
-    reference-only). When it is not, stage 4 skips with a reason instead."""
-    return opts.generate_artifacts and not _contract_reference_only(opts.contract)
+def check_required_artifacts(
+    selected: Sequence[int], not_selected: Mapping[int, str], opts: ShipOptions
+) -> None:
+    """Refuse ``--require-artifacts`` when this invocation cannot meet it: stage
+    3 does not run here, or its ``--emit`` leaves a required key out. Artifacts
+    an earlier run left in dist/artifacts/ never count."""
+    if not opts.require_artifacts:
+        return
+    keys = ",".join(opts.require_artifacts)
+    if 3 not in selected or not opts.generate_artifacts:
+        why = not_selected.get(3) or "--no-generate-artifacts"
+        raise ShipUsageError(
+            f"--require-artifacts {keys} needs stage 3 generate-artifacts in this invocation, "
+            f"and it does not run ({why})"
+        )
+    left_out = [k for k in opts.require_artifacts if not emits(opts, k)]
+    if left_out:
+        raise ShipUsageError(
+            f"--require-artifacts {','.join(left_out)} is not in --emit {opts.emit}: "
+            "stage 3 would not write it"
+        )
+
+
+# --------------------------------------------------------------------------
+# Required artifacts: checked after stage 3 passes
+# --------------------------------------------------------------------------
+
+
+def forget_artifacts_manifest(root: Path) -> None:
+    """Remove the MANIFEST an earlier run left, before stage 3 runs, so the one
+    read afterwards is this run's. ``generate artifacts`` removes the
+    subdirectories it writes itself; the MANIFEST it rewrites only at the end."""
+    with contextlib.suppress(FileNotFoundError):
+        (root / ARTIFACTS_MANIFEST).unlink()
+
+
+def _unwritten(root: Path, files: Mapping[str, object], rel: str) -> Optional[str]:
+    """Why ``rel`` (under dist/artifacts/) is not this run's output, or ``None``."""
+    from fluid_build.cli._attestation import _sha256_file
+
+    if rel not in files:
+        return "not in its MANIFEST"
+    path = root / ARTIFACTS_DIR / rel
+    try:
+        if path.is_symlink() or not path.is_file():
+            return "listed in its MANIFEST but not on disk"
+        if "sha256:" + _sha256_file(path) != files[rel]:
+            return "on disk with a digest its MANIFEST does not list"
+    except OSError as exc:
+        return f"unreadable ({exc.strerror or exc})"
+    return None
+
+
+def _bundle_ports(root: Path) -> List[str]:
+    """The ``exposes[]`` ids of the contract stage 1 bundled, as the ODCS
+    emitter names them (``exposeId``, else ``id``; an entry without either has
+    no file). ``ValueError`` when the bundle cannot be read."""
+    import tarfile
+
+    import yaml
+
+    from fluid_build.forge.core.bundle import read_tar_member_bounded
+
+    try:
+        with tarfile.open(root / BUNDLE_PATH, mode="r:gz") as tar:
+            text = read_tar_member_bounded(tar, "contract.resolved.yaml")
+        contract = yaml.safe_load(text.decode("utf-8"))
+    except (OSError, KeyError, tarfile.TarError, yaml.YAMLError, UnicodeDecodeError) as exc:
+        raise ValueError(f"cannot read the contract in {BUNDLE_PATH}: {exc}") from None
+    exposes = contract.get("exposes") if isinstance(contract, dict) else None
+    ports: List[str] = []
+    for expose in exposes if isinstance(exposes, list) else []:
+        if isinstance(expose, dict):
+            eid = expose.get("exposeId") or expose.get("id")
+            if eid:
+                ports.append(str(eid))
+    return ports
+
+
+def _odcs_problems(root: Path, files: Mapping[str, object]) -> List[str]:
+    from fluid_build.providers._path_safety import safe_filename_stem
+
+    try:
+        ports = _bundle_ports(root)
+    except ValueError as exc:
+        return [f"odcs: {exc}"]
+    if not ports:
+        return ["odcs: the contract declares no exposes[] port, so there is no ODCS file"]
+    problems = []
+    for port in ports:
+        # The name the ODCS writer gives the port's file (artifact_fanout._emit_odcs).
+        rel = f"odcs/{safe_filename_stem(f'product.odcs.{port}', 'product.odcs')}.yaml"
+        why = _unwritten(root, files, rel)
+        if why:
+            problems.append(f"odcs: port {port!r} has no ODCS ({ARTIFACTS_DIR}{rel} {why})")
+    return problems
+
+
+def _one_or_more(
+    root: Path, files: Mapping[str, object], key: str, what: str, match: Callable[[str], bool]
+) -> List[str]:
+    found = sorted(rel for rel in files if match(rel))
+    if not found:
+        return [f"{key}: stage 3 wrote no {what}"]
+    return [
+        f"{key}: {ARTIFACTS_DIR}{rel} {why}"
+        for rel, why in ((rel, _unwritten(root, files, rel)) for rel in found)
+        if why
+    ]
+
+
+def _top_level(subdir: str, suffix: str) -> Callable[[str], bool]:
+    def match(rel: str) -> bool:
+        head, _, name = rel.partition("/")
+        return head == subdir and "/" not in name and name.endswith(suffix)
+
+    return match
+
+
+def _key_problems(key: str, root: Path, files: Mapping[str, object]) -> List[str]:
+    if key == "odcs":
+        return _odcs_problems(root, files)
+    if key == "odps-bitol":
+        product = _top_level("odps-bitol", ".odps.yaml")
+        return _one_or_more(root, files, key, "ODPS product (odps-bitol/*.odps.yaml)", product)
+    if key == "opds":
+        return _one_or_more(
+            root, files, key, "OPDS document (opds/*.opds.json)", _top_level("opds", ".opds.json")
+        )
+    if key == "policies":
+        why = _unwritten(root, files, "policy/bindings.json")
+        return [f"policies: {POLICY_BINDINGS} {why}"] if why else []
+    what = "schedule file (the contract declares no orchestration.engine and no scheduled build)"
+    return _one_or_more(root, files, key, what, lambda rel: rel.startswith("schedule/"))
+
+
+def missing_required_artifacts(opts: ShipOptions, root: Optional[Path] = None) -> List[str]:
+    """Every ``--require-artifacts`` output this run's stage 3 did not write,
+    one line each; ``[]`` when all are there. An output counts only when the
+    MANIFEST stage 3 wrote lists it and the file on disk has the listed digest."""
+    root = root or Path.cwd()
+    if not opts.require_artifacts:
+        return []
+    try:
+        manifest = json.loads((root / ARTIFACTS_MANIFEST).read_text(encoding="utf-8"))
+        files = manifest["files"]
+        if not isinstance(files, dict):
+            raise TypeError("files is not a mapping")
+    except FileNotFoundError:
+        return [f"stage 3 wrote no {ARTIFACTS_MANIFEST}"]
+    except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
+        return [f"{ARTIFACTS_MANIFEST} is not one generate artifacts writes ({exc})"]
+    problems: List[str] = []
+    for key in opts.require_artifacts:
+        problems += _key_problems(key, root, files)
+    return problems
 
 
 def check_contract_path(path: str) -> None:

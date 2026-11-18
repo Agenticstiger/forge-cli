@@ -53,6 +53,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another build's DAG would otherwise run twice). `fluid validate` warns about an Airflow
   task's `buildStepRef`: no generated DAG runs one.
 
+- **`fluid ship --require-artifacts KEYS` fails the run unless stage 3 writes what it promised.**
+  The keys are `generate artifacts`' emit keys: `odcs` needs one ODCS file per `exposes[]` port
+  of the bundled contract, `odps-bitol` the ODPS product, `opds` the OPDS document, `policies`
+  `policy/bindings.json` and `schedule` at least one schedule file. Ship removes the earlier
+  `dist/artifacts/MANIFEST.json` before stage 3 runs. A file counts only when the new MANIFEST
+  lists it and its digest on disk matches, so output left by an earlier run never passes. Stage 3
+  then fails with exit 1 and names every missing file (the port, for ODCS), in the log, in
+  `ship-report.json` and in the JUnit report. A run that cannot meet the requirement is refused
+  with exit 2 before stage 1, and `--explain` shows why: stage 3 does not run in this invocation
+  (`--stage`, `--until`, `--skip-stage`, `--no-generate-artifacts`, `RUN_STAGE_3_GENERATE_ARTIFACTS=false`),
+  or `--emit` / `GENERATE_EMIT` leaves a required key out.
+
 ### Changed
 
 - **`fluid profile --bundle` writes `C` for every withheld group and cell of a histogram or a
@@ -68,6 +80,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a profile 0.32.0 wrote still reads.
 
 ### Fixed
+
+- **`fluid ship` generates artifacts for a reference-only contract.** Stage 3 skipped every
+  contract with a `hybrid-reference`, `reference` or `external-reference` build, even with
+  `--emit`, so stage 4 skipped too and the run exited 0 with no `MANIFEST.json`. `fluid generate
+  artifacts` has written ODCS, ODPS and policy artifacts for such contracts since May: they do
+  not depend on where the transformation runs. Stage 3 now runs for them as well. Stage 4 fails,
+  instead of skipping, when stage 3 was to write `dist/artifacts/` and did not; it still skips
+  under `--no-generate-artifacts`. A CI file from `fluid generate ci` still switches stage 3 off
+  by default for a reference-only contract.
 
 - **A quoted enum list in `validationRules` reads as SQL writes it.** Every reader cut an enum
   rule's `constraint` at every comma, so `constraint: "'base_fee', 'usage', 'fee, late'"` listed

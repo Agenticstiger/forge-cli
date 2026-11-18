@@ -160,8 +160,8 @@ def _add_apply_options(g: argparse._ArgumentGroup) -> None:
     )
 
 
-def _add_stage_options(g: argparse._ArgumentGroup) -> None:
-    """What single stages pass to their command."""
+def _add_artifact_options(g: argparse._ArgumentGroup) -> None:
+    """Stage 3: whether it runs, what it emits, what it must write."""
     g.add_argument(
         "--no-generate-artifacts", action="store_true", help="Skip stage 3 (generate artifacts)."
     )
@@ -171,6 +171,22 @@ def _add_stage_options(g: argparse._ArgumentGroup) -> None:
         metavar="LIST",
         help="Stage 3 --emit, comma-separated (default: $GENERATE_EMIT, else every emitter).",
     )
+    g.add_argument(
+        "--require-artifacts",
+        default=None,
+        metavar="LIST",
+        help=(
+            "Stage 3 fails unless this run writes each of these, comma-separated: odcs (one "
+            "file per exposes[] port), odps-bitol (the product), opds, policies, schedule. "
+            "Files an earlier run left never count. Needs stage 3 in this invocation, with "
+            "every key in --emit."
+        ),
+    )
+
+
+def _add_stage_options(g: argparse._ArgumentGroup) -> None:
+    """What single stages pass to their command."""
+    _add_artifact_options(g)
     g.add_argument(
         "--exit-on-drift",
         action=argparse.BooleanOptionalAction,
@@ -307,6 +323,7 @@ def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
         if args.explain:
             return _explain(opts, selected, not_selected)
         st.check_preconditions(selected, opts)
+        st.check_required_artifacts(selected, not_selected, opts)
         return _run_selected(args, logger, opts, selected, not_selected, report_dir)
 
 
@@ -453,14 +470,17 @@ def _run_one(num: int, rec: report.StageRecord, ctx: _Context) -> None:
     ctx.ci.stage_start(num, rec.name)
     try:
         # The whole stage body is fenced, not only the child: building the stage
-        # reads the contract in this process (its build id, whether it is
-        # reference-only), and that text is the checkout's, not ship's.
+        # reads the contract in this process (its build id, its ports for
+        # --require-artifacts), and that text is the checkout's, not ship's.
         with ctx.ci.fenced():
             rc = _attempt(num, rec, ctx)
+            unmet = _unmet_requirements(num, rc, ctx)
         if rc is not None:  # a skipped stage keeps no duration and no exit code
             rec.duration_seconds = time.monotonic() - started
             rec.exit_code = rc
-            rec.status = report.PASSED if rc == 0 else report.FAILED
+            rec.status = report.PASSED if rc == 0 and not unmet else report.FAILED
+            if unmet:
+                rec.reason = unmet
     finally:  # closed even when ship itself fails, so its error is not folded away
         ctx.ci.stage_end(num, rec.name)
 
@@ -490,6 +510,13 @@ def _attempt(num: int, rec: report.StageRecord, ctx: _Context) -> Optional[int]:
             rec.reason = f"cannot create runtime/: {exc.strerror or exc}"
             ctx.ci.info(f"stage {num} {rec.name}: {rec.reason}")
             return 1
+    if num == 3 and ctx.opts.require_artifacts:
+        try:
+            st.forget_artifacts_manifest(Path.cwd())
+        except OSError as exc:  # a directory named MANIFEST.json, a read-only checkout
+            rec.reason = f"cannot remove the earlier {st.ARTIFACTS_MANIFEST}: {exc.strerror or exc}"
+            ctx.ci.info(f"stage {num} {rec.name}: {rec.reason}")
+            return 1
     try:
         return _run_stage(
             ctx.fluid_bin, action.argv[0], action.argv[1:], ctx.logger, env=ctx.child_env, ci=ctx.ci
@@ -498,6 +525,23 @@ def _attempt(num: int, rec: report.StageRecord, ctx: _Context) -> Optional[int]:
         rec.reason = "interrupted"
         ctx.ci.info(f"stage {num} {rec.name}: interrupted")
         return 130
+
+
+def _unmet_requirements(num: int, rc: Optional[int], ctx: _Context) -> Optional[str]:
+    """After stage 3 passed, what ``--require-artifacts`` asked for and it did
+    not write, as the stage's failure reason (printed, one line each), or ``None``."""
+    if num != 3 or rc != 0 or not ctx.opts.require_artifacts:
+        return None
+    missing = st.missing_required_artifacts(ctx.opts)
+    if not missing:
+        ctx.ci.info(
+            f"stage 3 generate-artifacts: wrote every required artifact "
+            f"({','.join(ctx.opts.require_artifacts)})"
+        )
+        return None
+    for line in missing:
+        ctx.ci.info(f"stage 3 generate-artifacts: required artifact missing: {line}")
+    return f"--require-artifacts not met: {'; '.join(missing)}"
 
 
 def _report_abort(num: int, rec: report.StageRecord, ctx: _Context) -> None:
@@ -583,7 +627,7 @@ def _explain(opts: st.ShipOptions, selected: List[int], not_selected: Dict[int, 
         f"fluid ship: {len(selected)} stage(s) selected "
         f"(env={opts.env}, mode={opts.mode}, contract={opts.contract})"
     )
-    problem = _precondition_problem(selected, opts)
+    problem = _precondition_problem(selected, opts, not_selected)
     for num in st.STAGE_NUMBERS:
         refused = _explain_stage(num, opts, ws, selected, not_selected)
         problem = problem or refused
@@ -592,9 +636,12 @@ def _explain(opts: st.ShipOptions, selected: List[int], not_selected: Dict[int, 
     return 0
 
 
-def _precondition_problem(selected: List[int], opts: st.ShipOptions) -> Optional[str]:
+def _precondition_problem(
+    selected: List[int], opts: st.ShipOptions, not_selected: Dict[int, str]
+) -> Optional[str]:
     try:
         st.check_preconditions(selected, opts)
+        st.check_required_artifacts(selected, not_selected, opts)
     except st.ShipUsageError as exc:
         return str(exc)
     return None
