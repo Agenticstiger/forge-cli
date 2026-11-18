@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid doctor --contract` says whether an operation can run here, before CI starts.**
+  `fluid doctor --contract <file> [--operation validate|generate|plan|apply|ship] [--env NAME]
+  [--json]` reports the schema revision the contract resolves to (with the bundled file's
+  sha256), the Forge build, each extra against the pins this build declares, the plugins
+  installed through entry points, `tofu`, `dbt` and `spark-submit`, the dbt adapters and the
+  OpenTofu provider pins, and every capability in one of four classes: `exact`, `lossy`,
+  `unsupported` or `requires-live-proof`. Column types come from the emitters' own type
+  tables, and every other finding from the rules `fluid validate` runs, so a BigQuery column
+  `generate iac` refuses (a bare `array`) is `unsupported` here first. `validate`, `generate`
+  and the offline `plan` need no cloud, credential or tool, so a catalog-only contract on AWS
+  lists no AWS identity; `apply` and `ship` list each cloud's identity and the state backend as
+  `requires-live-proof`. It is offline: it fetches no schema, provider or tool and installs
+  nothing. `--live` adds read-only checks (STS `GetCallerIdentity`, a GCP token refresh, a
+  state-bucket read) and prints no identity. `fluid doctor --compare LEFT RIGHT` compares two
+  saved `--json` reports (format `fluid-preflight/1`) and names each version gap with what to
+  change. A report holds no environment value (no path, account, bucket or variable value) and
+  goes through both redaction layers. `--strict` also fails on `lossy`. `fluid doctor --env`
+  alone still lists the kill switches.
+
 - **A BigQuery table is partitioned and clustered as its binding declares.**
   `binding.location.partitionBy` was read only with `lifecycle.expire`, and
   `binding.properties.cluster_by` (honoured on Snowflake) was read by nobody on BigQuery. Both

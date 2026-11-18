@@ -413,10 +413,66 @@ and their current values.
     )
     p.add_argument(
         "--env",
-        action="store_true",
-        help="List recognised FLUID_* runtime kill switches with current values + defaults",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="NAME",
+        help=(
+            "Alone: list recognised FLUID_* runtime kill switches with current values + "
+            "defaults. With --contract: the environment overlay to apply (as on plan/apply)"
+        ),
     )
+    _add_preflight_arguments(p)
     p.set_defaults(cmd=COMMAND, func=run)
+
+
+def _add_preflight_arguments(p: argparse.ArgumentParser) -> None:
+    """The contract-aware preflight's flags (``cli/_preflight.py``): can this operation
+    run here? ``--env`` is shared: with ``--contract`` it names the overlay."""
+    p.add_argument(
+        "--contract",
+        metavar="FILE",
+        help=(
+            "Preflight a contract: schema revision, Forge build, extras, plugins, tools, "
+            "adapters, and each capability as exact, lossy, unsupported or "
+            "requires-live-proof. Offline; fetches and installs nothing"
+        ),
+    )
+    p.add_argument(
+        "--operation",
+        choices=["validate", "generate", "plan", "apply", "ship"],
+        default=None,
+        help="With --contract: the operation to preflight (default: plan, the offline plan)",
+    )
+    p.add_argument(
+        "--live",
+        action="store_true",
+        help="With --contract: also run read-only live checks of the identity and state backend",
+    )
+    p.add_argument(
+        "--compare",
+        nargs=2,
+        metavar=("LEFT", "RIGHT"),
+        help="Compare two saved --contract --json reports and name the version gaps",
+    )
+
+
+def _preflight_dispatch(args, logger: logging.Logger) -> Optional[int]:
+    """Run ``--contract`` / ``--compare``, refuse their flags without them, else ``None``."""
+    if isinstance(getattr(args, "contract", None), str) or isinstance(
+        getattr(args, "compare", None), (list, tuple)
+    ):
+        from fluid_build.cli._preflight import run_cli
+
+        return run_cli(args, logger)
+    for flag, given in (
+        ("--env NAME", isinstance(getattr(args, "env", None), str)),
+        ("--operation", isinstance(getattr(args, "operation", None), str)),
+        ("--live", getattr(args, "live", False) is True),
+    ):
+        if given:
+            raise CLIError(2, "doctor_preflight_failed", {"reason": f"{flag} needs --contract"})
+    return None
 
 
 def run(args, logger: logging.Logger) -> int:
@@ -429,6 +485,9 @@ def run(args, logger: logging.Logger) -> int:
     When ``--env`` is set, dispatches to the kill-switch catalog
     listing.
     """
+    preflight = _preflight_dispatch(args, logger)
+    if preflight is not None:
+        return preflight
     if getattr(args, "env", False):
         return _run_env_listing(args, logger)
 
