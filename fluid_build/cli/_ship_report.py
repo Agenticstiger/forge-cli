@@ -265,10 +265,11 @@ def merge_with_previous(
     except _UNREADABLE:
         # This run's report, but not one ship wrote: none of it is trusted, and
         # what the earlier steps did is not known (never taken for a pass).
+        # Only the stages before this step's first one: the steps that ran them
+        # came earlier, while a later stage has not run in any step yet.
         why = "this run's earlier report could not be read"
-        return [
-            r if r.number in selected else replace(r, status=UNKNOWN, reason=why) for r in current
-        ]
+        first = min(selected, default=0)
+        return [replace(r, status=UNKNOWN, reason=why) if r.number < first else r for r in current]
     # An earlier record keeps its outcome; the stage's name is always this version's.
     return [
         replace(old[r.number], name=r.name) if r.number in old and r.number not in selected else r

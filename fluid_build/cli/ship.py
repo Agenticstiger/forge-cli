@@ -36,7 +36,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from ..observability.tracing import traced_stage
 from . import _ci_output
@@ -379,10 +379,11 @@ def _run_selected(
     staging = None
     if release_dir is not None:
         try:
+            release.forget_stage_reports(Path.cwd())
             staging = release.open_staging(release_dir, run_id)
         except OSError as exc:
             raise st.ShipUsageError(
-                f"--release-dir: cannot create a staging directory beside {release_dir}: "
+                f"--release-dir: cannot prepare runtime/ or a staging directory beside {release_dir}: "
                 f"{exc.strerror or exc}"
             ) from None
     ctx = _Context(
@@ -651,7 +652,9 @@ def _finish(
         identity, problem = _release_identity(ctx, ordered)
         if problem:
             exit_code = run_code = _failed_code(ordered, applies)
-    written_at = _write_reports(ctx, merged, run_code, _release_block(ctx, identity, problem))
+    written_at = _write_reports(
+        ctx, merged, run_code, _release_block(ctx, identity, problem, ordered)
+    )
     if ctx.staging is not None:
         exit_code = _close_release(ctx, ordered, identity, problem, written_at, exit_code, merged)
     ctx.ci.summary(rows)
@@ -687,24 +690,44 @@ def _release_identity(
 ) -> Tuple[Optional[Dict[str, object]], Optional[str]]:
     """``(identity, None)``, or ``(None, why it cannot be built)``."""
     try:
-        identity = release.build_identity(ctx.opts, Path.cwd(), with_plan=_plan_in_release(ordered))
+        identity = release.build_identity(
+            ctx.opts,
+            Path.cwd(),
+            with_plan=_plan_in_release(ordered),
+            applied=any(r.number == st.APPLY_STAGE and r.status == report.PASSED for r in ordered),
+        )
     except release.ReleaseError as exc:
         return None, str(exc)
     return identity, None
 
 
 def _release_block(
-    ctx: _Context, identity: Optional[Dict[str, object]], problem: Optional[str]
+    ctx: _Context,
+    identity: Optional[Dict[str, object]],
+    problem: Optional[str],
+    ordered: Sequence[report.StageRecord] = (),
 ) -> Optional[Dict[str, object]]:
     """The report's ``release`` entry: whether this run publishes one, and why not."""
     if ctx.release_dir is None:
         return None
+    if identity is None and not problem:
+        problem = _first_stop(ordered)
     return {
         "dir": str(ctx.release_dir),
         "status": "published" if identity is not None else "not-published",
         "identity_digest": None if identity is None else release.identity_digest(identity),
-        "reason": problem if identity is not None or problem else "a stage did not pass",
+        "reason": problem,
     }
+
+
+def _first_stop(ordered: Sequence[report.StageRecord]) -> str:
+    """Why a run published nothing: the first stage that did not pass."""
+    for rec in ordered:
+        if rec.status in report.STOPS:
+            code = "" if rec.exit_code is None else f", exit {rec.exit_code}"
+            why = f", {rec.reason}" if rec.reason else ""
+            return f"stage {rec.number} {rec.name} {rec.status}{code}{why}"
+    return "a stage did not pass"
 
 
 def _close_release(
@@ -720,12 +743,14 @@ def _close_release(
     beside DIR for a reader. Returns the exit status."""
     assert ctx.staging is not None and ctx.release_dir is not None
     passed = {r.number for r in ordered if r.status == report.PASSED}
-    with contextlib.suppress(OSError, release.ReleaseError):
-        release.copy_reports(ctx.staging, Path(ctx.report_dir), Path.cwd(), passed)
     if identity is None:
+        _keep_reports(ctx, passed)
         _say_why_not(ctx, problem)
         return exit_code
     try:
+        if written_at is None:  # the report dir holds no report of this run
+            raise release.ReleaseError(f"the run report could not be written to {ctx.report_dir}")
+        release.copy_reports(ctx.staging, Path(ctx.report_dir), Path.cwd(), passed)
         release.publish(
             ctx.staging,
             ctx.release_dir,
@@ -735,13 +760,29 @@ def _close_release(
             provenance=release.provenance(ordered, run_id=ctx.run_id, report_written_at=written_at),
             with_plan=_plan_in_release(ordered),
         )
-    except release.ReleaseError as exc:
-        failed = _failed_code(ordered, st.applies_changes(ctx.opts))
-        _write_reports(ctx, merged, failed, _release_block(ctx, None, str(exc)))
-        _say_why_not(ctx, str(exc))
+    except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - any failure publishes nothing
+        interrupted = isinstance(exc, KeyboardInterrupt)
+        if interrupted:
+            why, failed = "interrupted while publishing", report.EXIT_INTERRUPTED
+        else:
+            why = str(exc) if isinstance(exc, release.ReleaseError) else f"{type(exc).__name__}"
+            failed = _failed_code(ordered, st.applies_changes(ctx.opts))
+        # Both copies of the report say so: runtime/ and the one kept in staging,
+        # which holds no release.json (it is no release).
+        release.unpublish(ctx.staging)
+        _write_reports(ctx, merged, failed, _release_block(ctx, None, why))
+        _keep_reports(ctx, passed)
+        _say_why_not(ctx, why)
         return failed
     ctx.ci.info(f"Release published: {ctx.release_dir} ({release.identity_digest(identity)})")
     return exit_code
+
+
+def _keep_reports(ctx: _Context, passed: Set[int]) -> None:
+    """Best effort: a run that publishes nothing keeps its reports in staging too."""
+    assert ctx.staging is not None
+    with contextlib.suppress(OSError, release.ReleaseError):
+        release.copy_reports(ctx.staging, Path(ctx.report_dir), Path.cwd(), passed)
 
 
 def _say_why_not(ctx: _Context, problem: Optional[str]) -> None:

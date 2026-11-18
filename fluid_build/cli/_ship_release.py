@@ -23,12 +23,13 @@ Standard library only at module scope (``fluid --help`` imports ``ship``).
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import tarfile
-import tempfile
 from pathlib import Path
 from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence
 
@@ -41,7 +42,8 @@ RELEASE_INDEX = "release.json"
 REQUIRED_STAGES = (1, 2, 3, 4)
 
 #: The report each stage writes, copied into the release when the stage passed in
-#: this run (an older file from another run is never copied).
+#: this run. A release run removes them all before stage 1 (:func:`forget_stage_reports`),
+#: so one that exists afterwards is this run's, never a file the checkout held.
 _STAGE_REPORTS: Dict[int, Sequence[str]] = {
     2: (st.VALIDATE_REPORT,),
     4: (st.VALIDATE_ARTIFACTS_REPORT,),
@@ -85,12 +87,34 @@ def refusal(
     return None
 
 
+def forget_stage_reports(root: Path) -> None:
+    """Remove the reports an earlier run (or the checkout) left in runtime/, before
+    stage 1 of a release run: a stage that passes without writing its report then
+    leaves nothing to copy, rather than an older file."""
+    for paths in _STAGE_REPORTS.values():
+        for rel in paths:
+            path = root / rel
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+
+
 def open_staging(release_dir: Path, run_id: str) -> Path:
     """A new, empty staging directory beside ``release_dir`` (same filesystem, so
     the final rename is atomic)."""
     parent = release_dir.parent
     parent.mkdir(parents=True, exist_ok=True)
-    return Path(tempfile.mkdtemp(prefix=f"{release_dir.name}.partial-{run_id}-", dir=parent))
+    # A run id is a name, never a path: anything but [A-Za-z0-9._-] becomes "_".
+    name = "".join(c if c.isascii() and (c.isalnum() or c in "._-") else "_" for c in run_id)
+    # os.mkdir, not tempfile.mkdtemp: the release is for others to read, so it
+    # takes the umask's mode, not mkdtemp's 0700.
+    for _ in range(100):
+        path = parent / f"{release_dir.name}.partial-{name[:64]}-{secrets.token_hex(4)}"
+        try:
+            path.mkdir()
+        except FileExistsError:
+            continue
+        return path
+    raise FileExistsError(f"no free staging name beside {release_dir}")
 
 
 def _sha256(path: Path) -> str:
@@ -158,9 +182,12 @@ def _plan_digests(root: Path) -> Dict[str, str]:
     return {k: str(v) for k, v in digests.items()}
 
 
-def build_identity(opts: st.ShipOptions, root: Path, *, with_plan: bool) -> Dict[str, Any]:
+def build_identity(
+    opts: st.ShipOptions, root: Path, *, with_plan: bool, applied: bool = False
+) -> Dict[str, Any]:
     """What identifies the release: the same for two clean runs of the same
-    contract, environment, emit set and Forge version. Reads only local files."""
+    contract, environment, emit set and Forge version. Reads only local files.
+    ``applied``: stage 7 ran, so its mode (a dry run, or a real apply) is part of it."""
     import fluid_build
 
     manifest = _bundle_manifest(root)
@@ -192,6 +219,8 @@ def build_identity(opts: st.ShipOptions, root: Path, *, with_plan: bool) -> Dict
                 f"({plan['bundle_digest']}, this run bundled {manifest['digest']})"
             )
         identity["plan"] = plan
+    if applied:
+        identity["apply_mode"] = opts.mode
     return identity
 
 
@@ -212,6 +241,8 @@ def _copy_artifacts(root: Path, staging: Path) -> None:
     if not isinstance(files, dict):
         raise ReleaseError(f"{st.ARTIFACTS_MANIFEST} lists no files")
     for rel in sorted(files):
+        if Path(rel).is_absolute() or ".." in Path(rel).parts or "\\" in rel:
+            raise ReleaseError(f"{st.ARTIFACTS_MANIFEST} lists {rel!r}, not a path inside it")
         problem = st.listed_file_problem(root, files, rel)
         if problem:
             raise ReleaseError(f"{st.ARTIFACTS_DIR}{rel} {problem}")
@@ -271,6 +302,12 @@ def publish(
         os.rename(staging, release_dir)
     except OSError as exc:
         raise ReleaseError(f"cannot publish {release_dir}: {exc.strerror or exc}") from None
+
+
+def unpublish(staging: Path) -> None:
+    """A staging directory that will not be renamed holds no release index."""
+    with contextlib.suppress(OSError):
+        (staging / RELEASE_INDEX).unlink()
 
 
 def gates(records: Sequence[report.StageRecord]) -> List[Dict[str, Any]]:

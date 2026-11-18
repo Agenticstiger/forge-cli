@@ -121,7 +121,9 @@ class FakeStages:
         elif stage == "validate":
             Path(st.VALIDATE_REPORT).write_text("{}")
         elif stage == "plan":
-            Path(st.PLAN_PATH).write_text("{}")
+            bundle_digest = release._bundle_manifest(Path.cwd())["digest"] if self.bundle else ""
+            plan = {"bundleDigest": bundle_digest, "planDigest": "sha256:p"}
+            Path(st.PLAN_PATH).write_text(json.dumps(plan))
         return subprocess.CompletedProcess(cmd, 1 if stage == self.fail else 0)
 
 
@@ -210,6 +212,9 @@ def test_a_passing_run_publishes_the_release(
     assert _ship([*_UNTIL_4, "--release-dir", "../rel"]) == 0
     rel = work.parent / "rel"
     assert not list(work.parent.glob("rel.partial-*"))
+    umask = os.umask(0)
+    os.umask(umask)
+    assert rel.stat().st_mode & 0o777 == 0o777 & ~umask  # readable as the umask allows
     index = json.loads((rel / "release.json").read_text())
     assert index["schema"] == release.RELEASE_SCHEMA
     assert index["identity"]["product_id"] == "example.release"
@@ -232,6 +237,28 @@ def test_a_passing_run_publishes_the_release(
     assert shipped["release"]["identity_digest"] == index["identity_digest"]
 
 
+def test_a_report_the_checkout_held_is_never_published(
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plan.html left in runtime/ (by an earlier run, or committed) is removed
+    before stage 1: stage 6 writes one only with --plan-html."""
+    _install(monkeypatch, bundled)
+    Path("runtime").mkdir()
+    Path(st.PLAN_HTML_PATH).write_text("<p>a plan nobody made</p>")
+    Path("runtime/verify-report.json").write_text("{}")
+    assert _ship(["--until", "plan", "--release-dir", "rel"]) == 0
+    assert not Path(st.PLAN_HTML_PATH).exists()
+    assert not (work / "rel/reports/plan.html").exists()
+    assert not (work / "rel/reports/verify-report.json").exists()
+
+
+def test_a_manifest_path_that_leads_outside_is_not_copied(work: Path) -> None:
+    Path("dist/artifacts").mkdir(parents=True)
+    Path(st.ARTIFACTS_MANIFEST).write_text(json.dumps({"files": {"../x": "sha256:0"}}))
+    with pytest.raises(release.ReleaseError, match="not a path inside it"):
+        release._copy_artifacts(work, work / "staging")
+
+
 def test_a_failing_run_publishes_nothing_and_keeps_its_reports(
     work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -243,7 +270,7 @@ def test_a_failing_run_publishes_nothing_and_keeps_its_reports(
     assert (partial / "reports/ship-report.json").is_file()
     body = json.loads((work / "runtime/ship-report.json").read_text())
     assert body["release"]["status"] == "not-published"
-    assert body["release"]["reason"] == "a stage did not pass"
+    assert body["release"]["reason"] == "stage 4 validate-artifacts failed, exit 1"
     assert "no release in" in caplog.text
 
 
@@ -274,6 +301,78 @@ def test_an_artifact_that_no_longer_matches_its_manifest_publishes_nothing(
     body = json.loads((work / "runtime/ship-report.json").read_text())
     assert body["release"]["status"] == "not-published"
     assert "digest its MANIFEST does not list" in body["release"]["reason"]
+    (partial,) = work.glob("rel.partial-*")  # the copy kept there says the same
+    kept = json.loads((partial / "reports/ship-report.json").read_text())
+    assert kept["release"] == body["release"] and kept["exit_code"] == 1
+
+
+def test_any_error_while_publishing_publishes_nothing_and_says_so(
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install(monkeypatch, bundled)
+
+    def boom(*_a: object, **_k: object) -> None:
+        raise ValueError("unexpected")
+
+    monkeypatch.setattr(release.os, "rename", boom)
+    assert _ship([*_UNTIL_4, "--release-dir", "rel"]) == 1
+    assert not (work / "rel").exists()
+    (partial,) = work.glob("rel.partial-*")
+    assert not (partial / "release.json").exists()  # a staging dir that is no release
+    for body in (
+        json.loads((work / "runtime/ship-report.json").read_text()),
+        json.loads((partial / "reports/ship-report.json").read_text()),
+    ):
+        assert body["exit_code"] == 1
+        assert body["release"]["status"] == "not-published"
+        assert body["release"]["reason"] == "ValueError"
+
+
+def test_a_report_that_cannot_be_written_publishes_nothing(
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older ship-report.json would otherwise be published as this run's."""
+    _install(monkeypatch, bundled)
+
+    def cannot_write(*_a: object, **_k: object) -> None:
+        raise OSError("read-only")
+
+    monkeypatch.setattr(report, "write_reports", cannot_write)
+    assert _ship([*_UNTIL_4, "--release-dir", "rel"]) == 1
+    assert not (work / "rel").exists()
+
+
+def test_a_release_whose_run_applied_names_the_apply_mode(
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dry run that applied nothing never reads as an apply."""
+    _install(monkeypatch, bundled)
+    assert _ship(["--until", "apply", "--dry-run", "--yes", "--release-dir", "dry"]) == 0
+    assert _ship(["--until", "apply", "--yes", "--release-dir", "amend"]) == 0
+    dry, amend = (json.loads((work / d / "release.json").read_text()) for d in ("dry", "amend"))
+    assert dry["identity"]["apply_mode"] == "dry-run"
+    assert amend["identity"]["apply_mode"] == "amend"
+    assert dry["identity_digest"] != amend["identity_digest"]
+    assert _ship([*_UNTIL_4, "--release-dir", "none"]) == 0
+    assert "apply_mode" not in json.loads((work / "none/release.json").read_text())["identity"]
+
+
+def test_an_unreadable_earlier_report_leaves_only_the_earlier_stages_unknown(
+    work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FLUID_RUN_ID", "run-1")
+    Path("runtime").mkdir()
+    Path(st.BUNDLE_PATH).write_bytes(b"x")
+    head = {"run_id": "run-1", "env": "dev", "mode": "amend", "contract": "contract.fluid.yaml"}
+    Path("runtime/ship-report.json").write_text(json.dumps({**head, "stages": [{"number": "x"}]}))
+    monkeypatch.setattr(ship.subprocess, "run", FakeStages())
+    assert _ship(["--stage", "diff"]) == 0
+    by = {
+        s["number"]: s["status"]
+        for s in json.loads(Path("runtime/ship-report.json").read_text())["stages"]
+    }
+    assert [by[n] for n in (1, 2, 3, 4)] == ["unknown"] * 4
+    assert by[5] == "passed" and by[6] == "not-run" and by[10] == "not-run"
 
 
 # ---------------------------------------------------------------------------
