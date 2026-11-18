@@ -28,7 +28,7 @@ from __future__ import annotations
 import contextlib
 import os
 import threading
-from typing import Iterator
+from typing import Iterator, Tuple
 
 # mysql_scanner was seen to send no password from an option file (~/.my.cnf,
 # ~/.mylogin.cnf, ~/my.cnf, /etc/my.cnf, /etc/mysql/my.cnf, $MYSQL_HOME/my.cnf),
@@ -51,6 +51,16 @@ HOST_CREDENTIAL_ENV = (
     "MYSQL_GROUP_SUFFIX",
 )
 
+# libpq's variables that choose WHERE it connects (PGHOSTADDR wins over a host
+# the DSN names). The acquisition ATTACH hides them as well: its DSN is the
+# contract's, the secret policy judged the host the contract names, and libpq
+# takes a host from PGHOST only when the DSN has none, so a connection that names
+# no host (or only a decoy uri, which this DSN ignores) would otherwise send the
+# password to whatever PGHOST a project .env set. With them hidden, a DSN without
+# a host reaches only libpq's default local socket. `fluid init --discover` keeps
+# them: there the operator, not a contract, names the server.
+ATTACH_HOST_ENV = ("PGHOST", "PGHOSTADDR")
+
 # libpq skips a client certificate whose file does not exist (ENOENT or
 # ENOTDIR). Pointing a pinned connection's certificate and key below os.devnull
 # means it never presents this host's ~/.postgresql/postgresql.crt to a server
@@ -66,8 +76,11 @@ HOST_CREDENTIAL_ENV_LOCK = threading.RLock()
 
 
 @contextlib.contextmanager
-def host_credential_env_suppressed() -> Iterator[None]:
+def host_credential_env_suppressed(also: Tuple[str, ...] = ()) -> Iterator[None]:
     """Hide this host's ambient DB credential env vars for a pinned ATTACH.
+
+    ``also`` names more variables to hide in the same window: the acquisition
+    ATTACH passes :data:`ATTACH_HOST_ENV`.
 
     The saved values are put back when the window closes, also when the attach
     raises. Windows opened through this function in different threads are
@@ -88,8 +101,9 @@ def host_credential_env_suppressed() -> Iterator[None]:
     * same-thread windows that do not close in LIFO order, where the first to
       close restores the variables inside the other.
     """
+    names = HOST_CREDENTIAL_ENV + tuple(also)
     with HOST_CREDENTIAL_ENV_LOCK:
-        saved = {k: os.environ.pop(k) for k in HOST_CREDENTIAL_ENV if k in os.environ}
+        saved = {k: os.environ.pop(k) for k in names if k in os.environ}
         try:
             yield
         finally:
