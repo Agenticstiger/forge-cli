@@ -452,8 +452,8 @@ def _add_preflight_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--compare",
         nargs=2,
-        metavar=("LEFT", "RIGHT"),
-        help="Compare two saved --contract --json reports and name the version gaps",
+        metavar="REPORT",
+        help="Compare two saved --contract --json reports (LEFT RIGHT) and name the version gaps",
     )
 
 

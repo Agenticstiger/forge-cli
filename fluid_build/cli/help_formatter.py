@@ -748,7 +748,10 @@ _COMMAND_ENRICHMENT: dict[str, tuple[str, str]] = {
             "  fluid doctor\n"
             "  fluid doctor --verbose\n"
             "  fluid doctor --extended\n"
-            "  fluid doctor --features-only"
+            "  fluid doctor --features-only\n"
+            "  fluid doctor --contract contract.fluid.yaml --operation apply --env prod\n"
+            "  fluid doctor --contract contract.fluid.yaml --json > preflight.json\n"
+            "  fluid doctor --compare laptop.json ci.json   # name the version gaps"
         ),
     ),
     "admin": (
