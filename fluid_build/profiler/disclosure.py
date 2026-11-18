@@ -29,23 +29,18 @@ publishes only where the column's ``sum`` would. Next to that exact sum, ``Sx``
 also gives the total of what the values lose below their grid points, so that
 total is checked as a sum as well (:func:`check_mean`).
 
-A minimum, a maximum or a quantile is one record's value in most data. The
-DwB/ESSnet "Guidelines for Output Checking" (class 3, maxima, minima and
-percentiles) do not release one by rule of thumb, and clear one when more than the
-threshold of units hold it. The profiler takes that reading: such a value is
-published only when at least ``minimumCell`` records hold exactly that value
-(founder decision, 2026-11-16). A quantile's two ranks are counts too, so the
-records below its witness and the records above it must each be at least
-``minimumCell`` (FLUX ADR 0012's three cells, founder decision 2026-11-18): a rank
-of 3 would say that three records lie below the witness. None is allowed only where
-zeros are not disclosive, since it says no record lies between the witness and the
-end of the range. A published minimum or maximum says that no record lies beyond it,
-and no check withholds it for that (FLUX ADR 0012, amended 2026-11-18). This leaves
-the checks inconsistent at the ends of the range: where zeros are disclosive, a
-quantile whose witness is the column's smallest value is withheld because no record
-lies below the witness, though a published minimum already shows that, and one whose
-witness is the largest value is withheld because no record lies above it, though a
-published maximum already shows that.
+A minimum, a maximum or a column's ``quantiles`` metric is one record's value in
+most data. The DwB/ESSnet "Guidelines for Output Checking" (class 3, maxima,
+minima and percentiles) do not release one by rule of thumb, and clear one when
+more than the threshold of units hold it. The profiler takes that reading: such a
+value is published only when at least ``minimumCell`` records hold exactly that
+value (founder decision, 2026-11-16). A published minimum or maximum says that no
+record lies beyond it, and no check withholds it for that (FLUX ADR 0012, amended
+2026-11-18). This leaves the checks inconsistent at the ends of the range: where
+zeros are disclosive, a quantile whose witness is the column's smallest value is
+withheld because no record lies below the witness, though a published minimum
+already shows that, and one whose witness is the largest value is withheld because
+no record lies above it, though a published maximum already shows that.
 
 A verdict names the check that fired with an SDMX ``CL_CONF_STATUS`` 1.4 code:
 ``A`` for a small count (a zero cell, a cell below the threshold, or a value too
@@ -55,20 +50,26 @@ hold at most two values, and ``D`` for a group the sender withholds so that
 another cannot be recovered (secondary suppression, :func:`suppress_secondary`).
 A withheld value is written with that code and no value, except in a count table
 or a quantile (:data:`ONE_CODE`, PROFILE-SPEC §3), whose withheld groups and cells
-are all written ``C``, whatever withheld them (:func:`written_status`, FLUX ADR
-0012): a code that named the check would tell a reader a range, ``A`` that a cell
-holds fewer than ``minimumCell`` records, and a total the reader knows can turn
-the range into the count. The profiler's summary still counts them by the check, as
-ACRO's outcome table keeps each suppressed cell's reasons apart from the table it
-releases.
+are all written ``C``, whatever withheld them: a code that named the check would
+tell a reader a range, ``A`` that a cell holds fewer than ``minimumCell`` records,
+and a total the reader knows can turn the range into the count. The profiler's
+summary still counts them by the check, as ACRO's outcome table keeps each
+suppressed cell's reasons apart from the table it releases.
 
-The groups of a statistic the Simulation's fidelity block declares are checked
-group by group, each as a cell of a table of records (the ESSnet/DwB output
+The groups of a mean or a support the Simulation's fidelity block declares are
+checked group by group, each as a cell of a table of records (the ESSnet/DwB output
 checking guidelines' frequency-table and magnitude-table classes, which ACRO's
 ``safe_threshold`` and ``safe_nk`` checks implement): :func:`check_group_count`
-for the group's record count, :func:`publish_cells` for a histogram's cells,
-:func:`check_support` for a support's members and :func:`check_quantile` for a
-quantile's witness.
+for the group's record count, :func:`check_support` for a support's members.
+
+The counts a histogram, a level histogram or a quantile publishes at the edges of
+its column are not checked here. FLUX ADR 0012 sets one rule for all of them, which
+flux-stats applies (``flux_stats.edge_counts.check_edge_counts``, called through
+:mod:`fluid_build.profiler._stats`): one declared partition, three cells for a
+quantile, a group's size, no small cell a reader can form by adding or subtracting
+published counts, and only then the rounding. What it leaves readable is its own to
+say. The profiler passes it every such statistic of a column in one call, with this
+module's :func:`round_count`.
 
 What the group checks leave readable, on purpose:
 
@@ -80,13 +81,6 @@ What the group checks leave readable, on purpose:
   it is withheld too, under ``D``, so the withheld one cannot be recovered by
   differencing against the ungrouped figures. The records a ``groupBy`` null
   leaves out of every group count as one more group there, never written.
-* A group withheld for its size withholds every group of its groupBy's
-  histograms and quantiles too (the runner's sibling rule, FLUX ADR 0012), and a
-  quantile is published only as the one histogram or quantile of its column.
-  A withheld cell of a histogram is not secondarily suppressed: the rounded
-  counts still bound it, somewhere inside 0 to 9 records and never above the
-  threshold, until forge-cli applies FLUX's ``check_edge_counts``, which a
-  flux-stats release has to carry first. Its ``C`` adds nothing to that bound.
 
 Where this differs from ACRO 1.1.0, on purpose:
 
@@ -133,7 +127,6 @@ __all__ = [
     "SECONDARY",
     "SMALL_COUNT",
     "WITHHELD",
-    "Cells",
     "DisclosureRule",
     "Exact",
     "Verdict",
@@ -142,15 +135,12 @@ __all__ = [
     "check_magnitude",
     "check_mean",
     "check_order_statistic",
-    "check_quantile",
     "check_rounding",
     "check_sum",
     "check_support",
-    "publish_cells",
     "round_count",
     "sample_size",
     "suppress_secondary",
-    "written_status",
 ]
 
 # SDMX ``CL_CONF_STATUS`` 1.4 codes, with PROFILE-SPEC §3's paraphrase of each
@@ -174,25 +164,10 @@ WITHHELD = "C"
 SECONDARY = "D"
 
 #: The declared statistics whose every withheld group and cell is written ``C``, whatever
-#: withheld it (:func:`written_status`; PROFILE-SPEC §3): the count tables, a histogram
-#: over bins and one over levels, and a quantile.
+#: withheld it (PROFILE-SPEC §3; the runner writes them from the decisions of flux-stats'
+#: ``check_edge_counts``): the count tables, a histogram over bins and one over levels,
+#: and a quantile.
 ONE_CODE = frozenset({"marginalHistogram", "levelHistogram", "quantile"})
-
-
-def written_status(status: str, kind: str) -> str:
-    """The status a document writes for a value that a check gave *status*.
-
-    *kind* is the declared property the value belongs to (``mean``, ``quantile``,
-    ``marginalHistogram`` and so on). A value of a count table or a quantile that
-    any check withholds is written ``C``, so its status says nothing about its
-    size (FLUX ADR 0012, PROFILE-SPEC §3): ``A`` would say that a cell holds fewer
-    than ``minimumCell`` records, and cells of 10, 9, 9 and 10 records written
-    ``F``, ``A``, ``A``, ``F`` give both withheld cells as 9 to a reader who knows
-    the total. Every other value keeps the code of the check that withheld it.
-    """
-    if status != FREE and kind in ONE_CODE:
-        return WITHHELD
-    return status
 
 
 #: The largest count a profile can carry: 2^53 - 1, as RFC 8785 serialises it.
@@ -519,46 +494,6 @@ def check_group_count(k: int, rule: DisclosureRule) -> Verdict:
     return verdict
 
 
-@dataclass(frozen=True)
-class Cells:
-    """A histogram group's cells after the checks.
-
-    ``verdict`` is :data:`PUBLISHED`, or ``A`` when every cell is withheld and the
-    group goes whole. ``statuses`` holds the code of the check that decided each
-    cell, which a document writes through :func:`written_status`, and ``counts``
-    the published count of each, rounded, or ``None`` where the cell is withheld
-    (PROFILE-SPEC §3: a cell is null exactly when its status is not ``F``).
-    """
-
-    verdict: Verdict
-    statuses: Tuple[str, ...]
-    counts: Tuple[Optional[int], ...]
-
-    @property
-    def any_withheld(self) -> bool:
-        return any(status != FREE for status in self.statuses)
-
-
-def publish_cells(counts: Sequence[int], rule: DisclosureRule) -> Cells:
-    """Check each cell of a histogram group as a count, and round the ones that pass.
-
-    A cell is a frequency-table cell: a zero is withheld when the rule holds zeros
-    disclosive, one below ``minimumCell`` is withheld, and so is a positive count
-    that rounds to zero (:func:`check_count`, then :func:`check_rounding`), each
-    with ``A``. A published cell is rounded to a multiple of the rounding base. A
-    group whose every cell is withheld says nothing, so it is withheld whole.
-    """
-    statuses: List[str] = []
-    shown: List[Optional[int]] = []
-    for count in counts:
-        verdict = check_group_count(count, rule)
-        statuses.append(verdict.status)
-        shown.append(round_count(count, rule) if verdict.published else None)
-    if statuses and all(status != FREE for status in statuses):
-        return Cells(Verdict(SMALL_COUNT, "every cell is withheld"), tuple(statuses), tuple(shown))
-    return Cells(PUBLISHED, tuple(statuses), tuple(shown))
-
-
 def check_support(holders: Sequence[int], rule: DisclosureRule) -> Verdict:
     """Check a support: every member must be held by at least ``minimumCell`` records.
 
@@ -573,72 +508,6 @@ def check_support(holders: Sequence[int], rule: DisclosureRule) -> Verdict:
         verdict = check_order_statistic(count, rule)
         if not verdict.published:
             return verdict
-    return PUBLISHED
-
-
-def check_quantile(
-    k: int,
-    below: int,
-    at_or_below: int,
-    rule: DisclosureRule,
-    proves: Callable[[int, int, int], bool],
-) -> Tuple[Verdict, int, int]:
-    """Check a quantile group's witness and its ranks; return the verdict and the rounded ranks.
-
-    *below* and *at_or_below* are the records strictly below the witness and at or
-    below it, so ``at_or_below - below`` records hold it and ``k - at_or_below``
-    lie above it. In order, the first that fires decides, always with ``A``:
-
-    1. fewer than ``minimumCell`` records hold the witness
-       (:func:`check_order_statistic`, as a minimum or a maximum is checked);
-    2. the records below the witness, or above it, are fewer than ``minimumCell``:
-       on unrounded counts, the three cells the ranks state each hold at least
-       ``minimumCell`` records (FLUX ADR 0012's three cells), since a rank of 3 says
-       that three records lie below the witness, rounded or not. None below or
-       above is allowed only where the rule does not hold zeros disclosive;
-    3. a rank is positive and rounds to zero (:func:`check_rounding`);
-    4. the rounded ``k`` and ranks no longer prove the witness: *proves* is the
-       registry's rank check on them, because a published group is read back with
-       the rounded numbers, and a rank rounded across the witness's index would
-       publish a witness the numbers contradict.
-
-    The ranks are published rounded, as every count is. The returned ranks are
-    only meaningful when the verdict is published.
-    """
-    for count in (k, below, at_or_below):
-        _require_count(count)
-    if not below <= at_or_below <= k:
-        raise ValueError("a quantile's ranks lie from 0 to its k, the lower one first")
-    verdict = check_order_statistic(at_or_below - below, rule)
-    if verdict.published:
-        verdict = _check_outer_cells(below, k - at_or_below, rule)
-    if verdict.published:
-        for rank in (below, at_or_below):
-            verdict = check_rounding(rank, rule)
-            if not verdict.published:
-                break
-    shown = (round_count(below, rule), round_count(at_or_below, rule))
-    if verdict.published and not proves(round_count(k, rule), shown[0], shown[1]):
-        verdict = Verdict(SMALL_COUNT, "the rounded ranks no longer prove the witness")
-    return verdict, shown[0], shown[1]
-
-
-def _check_outer_cells(below: int, above: int, rule: DisclosureRule) -> Verdict:
-    """The records below a quantile's witness and above it: each enough, or none where allowed.
-
-    None below or above says that no record lies between the witness and the end of
-    the range, a cell of no records, so it is allowed only where the rule does not hold
-    zeros disclosive (FLUX ADR 0012).
-    """
-    for count, side in ((below, "below"), (above, "above")):
-        if count == 0 and rule.zeros_disclosive:
-            return Verdict(
-                SMALL_COUNT, f"no record lies {side} the value, and the rule holds zeros disclosive"
-            )
-        if 0 < count < rule.minimum_cell:
-            return Verdict(
-                SMALL_COUNT, f"fewer than {rule.minimum_cell} records lie {side} the value"
-            )
     return PUBLISHED
 
 

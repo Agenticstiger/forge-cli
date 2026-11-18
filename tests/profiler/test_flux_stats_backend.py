@@ -285,3 +285,20 @@ def test_the_mean_a_profile_carries_is_the_one_the_check_compares(tmp_path, back
         assert entry.definition.compare(same, reference, check)
         higher = GroupStatistic(group="", k=reference.k, sum_x=reference.sum_x * 12 // 10)
         assert not entry.definition.compare(higher, reference, check)
+
+
+def test_the_rounding_status_is_the_registrys_word_for_it():
+    from flux_stats import edge_counts
+
+    from fluid_build.profiler._stats import WITHHELD_ROUNDING
+
+    assert WITHHELD_ROUNDING == edge_counts.ROUNDING
+
+
+def test_the_backend_reads_a_bundle_through_the_registrys_exact_reader():
+    backend = load_backend()
+    budget = backend.read_budget()
+    (document,) = backend.read_documents("rate: 0.50\nwhen: 2024-01-01\n", name="s", budget=budget)
+    assert document == {"rate": Decimal("0.50"), "when": "2024-01-01"}
+    assert backend.canonicalise(document, name="s") == {"rate": "0.50", "when": "2024-01-01"}
+

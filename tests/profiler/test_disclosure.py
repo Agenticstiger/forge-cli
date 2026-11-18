@@ -394,37 +394,6 @@ def test_a_k_that_rounds_to_zero_is_withheld_under_a_low_threshold():
     assert disclosure.check_group_count(3, rule).status == "F"
 
 
-def test_cells_are_checked_one_by_one_and_rounded():
-    cells = disclosure.publish_cells([0, 3, 12, 40], ACRO_DEFAULT)
-    assert cells.statuses == ("A", "A", "F", "F")
-    assert cells.counts == (None, None, 10, 40)
-    assert cells.any_withheld
-    assert cells.verdict.published
-
-
-def test_cells_that_all_pass_carry_no_withheld_cell():
-    cells = disclosure.publish_cells([10, 25, 31], ACRO_DEFAULT)
-    assert cells.statuses == ("F", "F", "F")
-    assert cells.counts == (10, 25, 30)
-    assert not cells.any_withheld
-
-
-def test_a_group_whose_every_cell_is_withheld_is_withheld_whole():
-    cells = disclosure.publish_cells([0, 4, 9], ACRO_DEFAULT)
-    assert cells.verdict.status == "A"
-    assert cells.counts == (None, None, None)
-
-
-def test_a_zero_cell_is_published_where_the_rule_holds_zeros_safe():
-    cells = disclosure.publish_cells([0, 20], _rule(zeros_disclosive=False))
-    assert cells.statuses == ("F", "F") and cells.counts == (0, 20)
-
-
-def test_a_positive_cell_that_rounds_to_zero_is_withheld():
-    cells = disclosure.publish_cells([2, 30], _rule(minimum_cell=1))
-    assert cells.statuses == ("A", "F")
-
-
 @pytest.mark.parametrize(
     ("holders", "status"),
     [((10, 12), "F"), ((10, 9), "A"), ((1,), "A"), ((), "F"), ((40, 0), "A")],
@@ -433,118 +402,9 @@ def test_a_support_needs_every_member_held_by_enough_records(holders, status):
     assert disclosure.check_support(holders, ACRO_DEFAULT).status == status
 
 
-def _proves(k, below, at_or_below, level=Fraction(1, 2)):
-    index = -((-level.numerator * k) // level.denominator)
-    return below < index <= at_or_below
-
-
-def test_a_quantile_witness_needs_enough_holders_and_publishes_rounded_ranks():
-    verdict, below, at_or_below = disclosure.check_quantile(120, 48, 72, ACRO_DEFAULT, _proves)
-    assert verdict.status == "F" and (below, at_or_below) == (50, 70)
-    verdict, *_ = disclosure.check_quantile(120, 48, 57, ACRO_DEFAULT, _proves)
-    assert verdict.status == "A"  # nine records hold the witness
-    verdict, *_ = disclosure.check_quantile(120, 48, 58, ACRO_DEFAULT, _proves)
-    assert verdict.status == "F"  # ten do
-
-
-def test_a_quantile_whose_rounded_ranks_no_longer_prove_the_witness_is_withheld():
-    # 40 records, the median is the 20th. 17 below and 27 at or below prove it, with
-    # 10 holders and 13 records above, and so do their rounded 15 and 25.
-    assert _proves(40, 17, 27)
-    verdict, below, at_or_below = disclosure.check_quantile(40, 17, 27, ACRO_DEFAULT, _proves)
-    assert (below, at_or_below) == (15, 25) and verdict.status == "F"
-    # 18 below and 28 at or below prove it too, and round to 20 and 30: 20 records
-    # below no longer leaves the 20th record in the witness's place.
-    assert _proves(40, 18, 28)
-    verdict, below, at_or_below = disclosure.check_quantile(40, 18, 28, ACRO_DEFAULT, _proves)
-    assert (below, at_or_below) == (20, 30)
-    assert verdict.status == "A" and "no longer prove" in verdict.reason
-
-
-@pytest.mark.parametrize(
-    ("k", "below", "at_or_below", "status", "side"),
-    [
-        # The records below the witness, holding it and above it: each at least
-        # minimumCell (FLUX ADR 0012's three cells). None is a zero, and ACRO's
-        # default holds zeros disclosive.
-        (120, 9, 30, "A", "below"),
-        (120, 1, 30, "A", "below"),
-        (120, 10, 30, "F", None),
-        (120, 0, 30, "A", "below"),  # the witness is the smallest value
-        (120, 50, 111, "A", "above"),
-        (120, 50, 119, "A", "above"),
-        (120, 50, 110, "F", None),
-        (120, 50, 120, "A", "above"),  # the witness is the largest value
-        (10, 0, 10, "A", "below"),  # every record holds it
-    ],
-)
-def test_a_quantile_needs_enough_records_below_and_above_its_witness(
-    k, below, at_or_below, status, side
-):
-    verdict, *_ = disclosure.check_quantile(k, below, at_or_below, ACRO_DEFAULT, lambda *_: True)
-    assert verdict.status == status
-    if side is not None:
-        assert f"{side} the value" in verdict.reason
-
-
-@pytest.mark.parametrize(("below", "at_or_below"), [(0, 30), (50, 120)])
-def test_a_quantile_at_an_end_is_published_where_zeros_are_not_disclosive(below, at_or_below):
-    rule = _rule(zeros_disclosive=False)
-    verdict, *_ = disclosure.check_quantile(120, below, at_or_below, rule, lambda *_: True)
-    assert verdict.status == "F"
-
-
-def test_the_outer_cells_are_checked_before_rounding():
-    # 3 records above would round to 5 and read as a cell the threshold cleared.
-    verdict, *_ = disclosure.check_quantile(60, 20, 57, ACRO_DEFAULT, lambda *_: True)
-    assert verdict.status == "A" and "above" in verdict.reason
-
-
-@pytest.mark.parametrize(
-    ("k", "below", "at_or_below"), [(120, 50, 40), (120, 50, 121), (120, -1, 30)]
-)
-def test_quantile_ranks_that_cannot_describe_the_group_are_refused(k, below, at_or_below):
-    with pytest.raises(ValueError):
-        disclosure.check_quantile(k, below, at_or_below, ACRO_DEFAULT, lambda *_: True)
-
-
-def test_a_quantile_rank_that_rounds_to_zero_withholds_the_group():
-    rule = _rule(minimum_cell=1, zeros_disclosive=False)
-    verdict, *_ = disclosure.check_quantile(30, 2, 20, rule, lambda *_: True)
-    assert verdict.status == "A"
-    verdict, *_ = disclosure.check_quantile(30, 0, 20, rule, lambda *_: True)
-    assert verdict.status == "F"  # nothing below the witness is a zero rank, not a small one
-
-
-@pytest.mark.parametrize(
-    ("status", "kind", "written"),
-    [
-        ("A", "marginalHistogram", "C"),
-        ("A", "levelHistogram", "C"),
-        ("D", "levelHistogram", "C"),
-        ("C", "marginalHistogram", "C"),
-        ("F", "marginalHistogram", "F"),
-        ("F", "levelHistogram", "F"),
-        ("A", "mean", "A"),
-        ("D", "mean", "D"),
-        ("A", "support", "A"),
-        ("A", "quantile", "C"),
-        ("D", "quantile", "C"),
-        ("O", "mean", "O"),
-    ],
-)
-def test_a_count_table_or_a_quantile_writes_c_for_whatever_withheld_a_value(status, kind, written):
-    assert disclosure.written_status(status, kind) == written
-
-
-def test_one_withheld_code_hides_the_size_a_total_gives_back():
-    # PROFILE-SPEC section 3: cells of 10, 9, 9 and 10 records, written F, A, A, F under a
-    # known total, give both withheld cells as 9; written F, C, C, F they read as a code
-    # that names no check.
-    cells = disclosure.publish_cells([10, 9, 9, 10], ACRO_DEFAULT)
-    assert cells.statuses == ("F", "A", "A", "F")
-    written = [disclosure.written_status(code, "levelHistogram") for code in cells.statuses]
-    assert written == ["F", "C", "C", "F"]
+def test_the_counts_a_check_for_edges_writes_are_the_ones_the_summary_names():
+    # PROFILE-SPEC section 3: a histogram's or a quantile's withheld groups and cells are all
+    # written C, so the report says so for exactly these definitions.
     assert disclosure.ONE_CODE == {"marginalHistogram", "levelHistogram", "quantile"}
 
 
