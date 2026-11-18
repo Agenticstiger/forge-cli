@@ -27,7 +27,7 @@ from fluid_build._console import cprint, success
 from fluid_build._console import error as console_error
 from fluid_build._contract_loader import CLIError, load_contract_with_overlay
 from fluid_build.util.binding_paths import ENV_PLACEHOLDER_RE
-from fluid_build.util.contract import (  # noqa: F401 - is_spark_job_build is re-exported
+from fluid_build.util.contract import (
     describe_externally_run_build,
     is_continuous_build,
     is_databricks_job_build,

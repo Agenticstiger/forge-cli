@@ -28,8 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contract's columns, as OpenTofu creates it on AWS. `FLUID_SPARK_SUBMIT_EXECUTABLE` names the
   spark-submit. A contract written for AWS switches with one keyed-overlay line, since
   `runtime: local` ignores the AWS runtimes' keys (`applicationId`, `clusterId`,
-  `virtualClusterId`, `releaseLabel`, `glueVersion`, `executionRoleArn`). A project dotenv can
-  no longer set `SPARK_*`, `PYSPARK_*`, `HADOOP_*` or `YARN_*`, which choose what spark-submit
+  `virtualClusterId`, `releaseLabel`, `glueVersion`, `executionRoleArn`). Each environment
+  keeps its own runs: an apply of AWS builds alone never stops this machine's local runs. With
+  an `s3://` root on a Spark other than an EMR image, the properties file maps `s3` to S3A
+  (`spark.hadoop.fs.s3.impl`, the endpoint) and puts hadoop-aws on `spark.driver.extraClassPath`,
+  as spark-submit downloads the runner before `--packages` load. A project dotenv can no
+  longer set `SPARK_*`, `PYSPARK_*`, `HADOOP_*` or `YARN_*`, which choose what spark-submit
   starts. The runner changed, so each running Spark stream restarts once on its next apply.
 
 ### Fixed

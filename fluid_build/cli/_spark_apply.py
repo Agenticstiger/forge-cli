@@ -84,8 +84,10 @@ def prepare(
     build_id: Optional[str],
     verified_plan: Optional[Mapping[str, Any]],
     dry_run: bool,
+    workspace: Optional[Path] = None,
 ) -> List[DesiredRun]:
-    """The runs ``fluid apply`` reconciles, checked before ``tofu apply``.
+    """The runs ``fluid apply`` reconciles, checked before ``tofu apply``. A local run's
+    settings are checked against ``workspace``, the contract's directory, which holds it.
 
     Raises:
         CLIError: ``apply_spark_invalid`` / ``apply_spark_refused`` (the build does not
@@ -125,7 +127,7 @@ def prepare(
             )
     selected = [r for r in runs if build_id is None or r.build == build_id]
     if not dry_run and any(r.local for r in selected):
-        _check_local(selected)
+        _check_local(selected, workspace)
     if not dry_run and any(r.long_running and not r.local for r in selected):
         import importlib.util
 
@@ -145,7 +147,7 @@ def prepare(
     return selected
 
 
-def _check_local(runs: List[DesiredRun]) -> None:
+def _check_local(runs: List[DesiredRun], workspace: Optional[Path] = None) -> None:
     """Refuse local runs this machine cannot start, before anything is applied: no POSIX
     lock, or an operator setting (spark-submit, its properties file, the artifact root)
     that is unusable.
@@ -158,7 +160,7 @@ def _check_local(runs: List[DesiredRun]) -> None:
 
     try:
         require_posix()
-        submitter(default_host())
+        submitter(default_host(workspace))
     except SparkRunError as exc:
         builds = ", ".join(r.build for r in runs if r.local)
         raise _cli_error(

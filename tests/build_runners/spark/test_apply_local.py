@@ -240,3 +240,73 @@ def test_both_redaction_layers_mask_a_rest_catalog_credential():
         assert "Zx9sEcretVaLue123" not in masked and masked.startswith(
             "spark.sql.catalog.fluid.credential="
         ), masked
+
+
+def stream_contract():
+    """The compiler tests' stream, on this machine (a Lakekeeper table in bucket lake)."""
+    from tests.build_runners.spark.test_local import local_contract
+
+    return local_contract()
+
+
+def test_fluid_apply_starts_leaves_alone_and_stops_a_local_stream(tmp_path, capsys):
+    from fluid_build.cli import main
+
+    data = stream_contract()
+    path = write(tmp_path, data)
+    try:
+        assert main(["apply", str(path), "--yes"]) == 0
+        assert "Spark ingest-orders (local): started run" in capsys.readouterr().out
+        assert main(["apply", str(path), "--yes"]) == 0
+        assert "Spark ingest-orders (local): unchanged run" in capsys.readouterr().out
+    finally:
+        data["builds"] = []
+        write(tmp_path, data)
+        assert main(["apply", str(path), "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "Spark ingest-orders (local): stopped run" in out and "CANCELLED" in out
+
+
+def test_an_aws_apply_leaves_this_machine_s_local_runs_alone(tmp_path, monkeypatch):
+    """Each environment keeps its own runs: the OpenTofu engine's apply of AWS builds
+    reconciles them, and stops none of this machine's local runs."""
+    from fluid_build.cli import _apply_opentofu_engine as engine
+    from fluid_build.cli import main
+    from tests.spark.conftest import CONTRACT
+
+    seen = {}
+
+    def reconcile(runs, logger, **kwargs):
+        seen.update(kwargs, builds=[r.build for r in runs])
+        return 0
+
+    monkeypatch.setattr(engine, "apply_via_opentofu", lambda *a, **k: 0)
+    monkeypatch.setattr(_apply, "reconcile_after_apply", reconcile)
+    path = write(tmp_path, CONTRACT)
+    assert main(["apply", str(path), "--yes", "--dry-run"]) == 0
+    assert seen["builds"] == ["ingest-orders"]
+    assert seen["contract"] is None and seen["workspace"] == tmp_path.resolve()
+
+
+def test_a_contract_that_runs_builds_here_and_on_aws_is_refused(tmp_path, capsys):
+    """Outputs on AWS and on this machine make the native engine the apply's, which runs
+    no AWS Spark build: the contract is refused, and the hint says to split it."""
+    from fluid_build.cli import main
+    from tests.spark.conftest import CONTRACT
+
+    local = stream_contract()
+    data = {
+        **CONTRACT,
+        "builds": [
+            *CONTRACT["builds"],
+            dict(local["builds"][0], id="ingest-here", outputs=["order_lines_here"]),
+        ],
+        "exposes": [
+            *CONTRACT["exposes"],
+            dict(local["exposes"][0], exposeId="order_lines_here"),
+        ],
+    }
+    assert main(["apply", str(write(tmp_path, data)), "--yes", "--dry-run"]) == 1
+    out = capsys.readouterr().out
+    assert "apply_spark_needs_opentofu" in out and "ingest-orders" in out
+    assert "ingest-here" not in out.split("error:")[1].split("hint:")[0]

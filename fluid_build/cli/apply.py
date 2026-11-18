@@ -2223,6 +2223,7 @@ def run(args, logger: logging.Logger) -> int:
             build_id=resolved_build_id,
             verified_plan=verified_plan_data,
             dry_run=effective_dry_run,
+            workspace=spark_workspace,
         )
     if apply_engine == "opentofu":
         # Apply-time plugin hooks run on EVERY engine. They used to be
@@ -2243,6 +2244,7 @@ def run(args, logger: logging.Logger) -> int:
             build_id=resolved_build_id,
             verified_plan=verified_plan_data,
             dry_run=effective_dry_run,
+            workspace=spark_workspace,
         )
         rc = apply_via_opentofu(args, logger, contract=source_contract, **engine_kwargs)
         if rc == 0:
