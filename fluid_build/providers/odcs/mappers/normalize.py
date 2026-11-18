@@ -40,6 +40,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 from .base import PASSTHROUGH_KEY
+from .servers import databricks_catalog_to_location
 from .types import (
     binding_format,
     odcs_to_fluid_status,
@@ -613,6 +614,7 @@ def _normalize_binding(
         for key in _LOCATION_KEYS:
             if key in server:
                 location[key] = server[key]
+        databricks_catalog_to_location(server, location)
     # ``warehouse`` is a Snowflake server field with no bindingLocation home.
     location.pop("warehouse", None)
     # ODCS ``physicalName`` names the object; it only belongs in ``table`` when

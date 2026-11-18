@@ -17,7 +17,7 @@ from ..providers.common.codegen_utils import (
     py_str_literal,
     sanitize_identifier,
 )
-from ..util.contract import has_only_unscheduled_builds, is_unscheduled_build
+from ..util.contract import is_unscheduled_build
 from ._acquisition_stage_ext import _validate_cron as _validate_cron_grammar
 from ._common import CLIError, load_contract_with_overlay
 from ._logging import info
@@ -208,8 +208,9 @@ def _report_nothing_to_schedule(dag_path: str, dag_id: str) -> None:
     scheduling the product wherever it was deployed. A file of the same name
     that it did not write is someone else's, and is not mentioned."""
     cprint(
-        "Every build runs outside forge-cli (a Flink job, for example) or continuously "
-        "(trigger.type: continuous), so there is nothing to schedule. No DAG written."
+        "Every build runs outside forge-cli (a Flink job, for example), as a stream that fluid "
+        "apply keeps running, or continuously (trigger.type: continuous), so there is nothing "
+        "to schedule. No DAG written."
     )
     if _wrote_dag(dag_path, dag_id):
         # Printed as written: soft_wrap leaves wrapping to the terminal, so the
@@ -236,13 +237,17 @@ def run(args, logger: logging.Logger) -> int:
         # to ``_`` and strips leading digits, yielding a single safe path
         # component that doubles as a valid Python ``dag_id``.
         dag_id = sanitize_identifier(c.get("id") or c.get("name") or "fluid_product")
-        # No scheduler starts a Flink job or a continuous build, so a contract
-        # with no other build has nothing to schedule and gets no DAG. The
-        # test is `fluid generate schedule`'s, hand-declared orchestration
-        # tasks included, so the two commands agree on such a contract.
-        from fluid_build.schedulers.airflow.fluid_apply import has_explicit_tasks
+        # No scheduler starts a Flink job, a continuous build or a stream fluid
+        # apply keeps running, so a contract with no other build has nothing to
+        # schedule and gets no DAG. The test is `fluid generate schedule`'s,
+        # hand-declared orchestration tasks included, so the two commands agree
+        # on such a contract.
+        from fluid_build.schedulers.airflow.fluid_apply import (
+            has_explicit_tasks,
+            runs_only_outside_schedulers,
+        )
 
-        if has_only_unscheduled_builds(c) and not has_explicit_tasks(c):
+        if runs_only_outside_schedulers(c) and not has_explicit_tasks(c):
             dag_path = os.path.join(os.path.abspath(args.out_dir), f"{dag_id}.py")
             _report_nothing_to_schedule(dag_path, dag_id)
             return 0
