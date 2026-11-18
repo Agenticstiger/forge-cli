@@ -32,6 +32,7 @@ Docs pages are relative to https://agenticstiger.github.io/forge_docs/
 | `ERR_FRAGMENT_KIND_UNKNOWN` | Use one of the kinds the error lists, for example: fluid validate --fragment expose <file>. | advanced/production-troubleshooting.html |
 | `ERR_FRAGMENT_ENV_UNSUPPORTED` | Validate the whole contract with the overlay: fluid validate contract.fluid.yaml --env <env>. | advanced/production-troubleshooting.html |
 | `ERR_FRAGMENT_HAS_POINTERS` | Validate the contract that uses the fragment: fluid validate contract.fluid.yaml. | advanced/production-troubleshooting.html |
+| `ERR_DIAGNOSTICS_SCOPE_UNSUPPORTED` | Validate one contract at a time: fluid validate <product>/contract.fluid.yaml --format sarif. Or drop --diagnostics / --format sarif to validate the workspace or bundle as a whole. Run --list-versions or --show-schema without --format sarif. | cli/validate.html |
 | `ERR_SCHEMA_NOT_AVAILABLE` | Run 'fluid validate --list-versions' to see the versions this CLI has. | advanced/typed-cli-errors.html#validation-schema |
 | `ERR_CONTRACT_VERSION_UNSUPPORTED` | Migrate the contract to the current 0.7.x schema. Pre-0.7 contracts (0.4.0 / 0.5.x) are no longer supported. | advanced/typed-cli-errors.html#validation-schema |
 | `ERR_INVALID_MIN_VERSION` | Give --min-version a version constraint, for example --min-version '>=0.7.0'. | advanced/typed-cli-errors.html#validation-schema |

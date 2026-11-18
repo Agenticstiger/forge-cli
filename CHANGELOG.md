@@ -53,6 +53,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another build's DAG would otherwise run twice). `fluid validate` warns about an Airflow
   task's `buildStepRef`: no generated DAG runs one.
 
+- **`fluid validate --diagnostics` and `--format sarif` point each finding at the line its author
+  wrote.** A contract composed from `$ref` fragments and an `--env` overlay used to report most
+  findings as a path into the composed document. With `--diagnostics`, each finding carries the
+  file, line and column that wrote the value, the related place in the root contract (the key
+  whose `$ref` brought a fragment in, or the base value an overlay patched), and the product,
+  environment and expose or consume it sits under. Text prints `file:line:col: error CODE:
+  message` lines; `--format json` adds a `diagnostics` block, `{"version": "1.0", "items": [...]}`,
+  after the keys it always had. `--format sarif` writes a SARIF 2.1.0 log for code scanning, with
+  a rule per code, `%SRCROOT%`-relative locations and a fingerprint that does not move with its
+  line; a contract that cannot be loaded still gets a log, with that failure in it. A minor
+  version only adds fields, and `fluid_build.diagnostics.DiagnosticReport.from_dict` reads any
+  `1.x` document and ignores keys it does not know. No diagnostic carries a fix a tool could
+  apply, a source snippet or a credential. Without the flags the text and JSON output are
+  unchanged. A workspace or bundle run refuses the flags (`diagnostics_scope_unsupported`):
+  validate each contract. `--format sarif` also refuses `--list-versions` and `--show-schema`,
+  whose text would end the log.
+
 ### Changed
 
 - **`fluid profile --bundle` writes `C` for every withheld group and cell of a histogram or a
