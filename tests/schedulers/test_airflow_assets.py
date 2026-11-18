@@ -88,6 +88,7 @@ def test_an_aws_table_lives_where_the_warehouse_writer_puts_it():
         (_expose("databricks", database="main", schema="s", table="t"), "it has no location.host"),
         (_expose("kafka", host="b1:9092", topic="bad topic"), "is not a Kafka topic name"),
         (_expose("local", path="./out/x.parquet"), "relative to the project directory"),
+        (_expose("local", path="/"), "names no file"),
         (_expose("azure", path="x"), "no Airflow provider names a 'azure' binding"),
         ({"binding": {}}, "its binding names no platform"),
     ],
@@ -111,6 +112,7 @@ def test_a_uri_longer_than_airflow_takes_names_nothing():
         ("x-team://anything/goes?here#too", "x-team://anything/goes?here#too"),
         ("orders_ready", "orders_ready"),
         ("kafka://b:9092/topic", "kafka://b:9092/topic"),
+        ("postgres://db:/d/s/t", "postgres://db:5432/d/s/t"),
     ],
 )
 def test_a_dataset_uri_is_normalised_as_airflow_does(raw, normalized):
@@ -127,6 +129,7 @@ def test_a_dataset_uri_is_normalised_as_airflow_does(raw, normalized):
         "snowflake://acct/db/schema",
         "databricks://h/c/s/t/extra",
         "postgres://db/d//t",
+        "postgres://db:abc/d/s/t",
         "kafka://b:9092",
         "file://",
         "airflow://x",

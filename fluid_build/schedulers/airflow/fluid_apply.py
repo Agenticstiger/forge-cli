@@ -93,10 +93,12 @@ Every contract-derived value in the generated Python goes through
 
 from __future__ import annotations
 
+import ast
 import re
 import zoneinfo
 from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from fluid_build.build_runners._ids import IdentifierViolation, validate_identifier
@@ -449,7 +451,8 @@ def has_scheduled_builds(contract: Dict[str, Any]) -> bool:
 def runs_only_outside_schedulers(contract: Dict[str, Any]) -> bool:
     """True when the contract has builds and no scheduler starts any of them: each is a stream
     ``fluid apply`` keeps running, runs continuously, or runs on its own platform."""
-    builds = [b for b in contract.get("builds") or [] if isinstance(b, dict)]
+    raw = contract.get("builds")
+    builds = [b for b in raw if isinstance(b, dict)] if isinstance(raw, list) else []
     if not builds:
         return False
     managed = _managed_lane(contract)
@@ -561,7 +564,8 @@ def _validate_timezone(value: Any, build_id: str) -> str:
         raise ScheduleRenderError(f"build {build_id!r}: trigger timezone {value!r} is not valid")
     try:
         zoneinfo.ZoneInfo(tz)
-    except ValueError as exc:  # ZoneInfoNotFoundError is a KeyError, not this
+    except (ValueError, OSError) as exc:  # ZoneInfoNotFoundError is a KeyError, not these
+        # ``America`` or ``Etc`` names a directory of the tz database, not a zone.
         raise ScheduleRenderError(
             f"build {build_id!r}: trigger timezone {tz!r} is not an IANA zone"
         ) from exc
@@ -647,7 +651,7 @@ def _dependencies(build: Dict[str, Any], build_id: Any) -> List[Tuple[str, str]]
                 f"{where} names no buildId; set it to the id of the build this one runs after"
             )
         condition = entry.get("condition") or "success"
-        if condition not in TRIGGER_RULES:
+        if not isinstance(condition, str) or condition not in TRIGGER_RULES:
             raise ScheduleRenderError(
                 f"{where}: condition {condition!r} is not one of success, completion, always"
             )
@@ -687,6 +691,13 @@ def _check_trigger_shape(build_id: Any, kind: str, trigger: Mapping[str, Any]) -
         raise ScheduleRenderError(
             f"build {build_id!r}: trigger.type schedule_and_dataset needs trigger.schedule, the "
             "cron it runs on besides its datasets (or set trigger.type: dataset)"
+        )
+    if kind == _CRON_OR_DATASET and str(cron_value).strip().lower() == "@once":
+        # Airflow runs ``@once`` with its own once-only timetable, which an asset-or-time
+        # schedule cannot hold: ``CronTriggerTimetable("@once")`` loads, then never runs.
+        raise ScheduleRenderError(
+            f"build {build_id!r}: trigger.type schedule_and_dataset runs on a recurring cron, "
+            "and @once is not one; give it a cron, or set trigger.type: dataset"
         )
     if on_datasets and (not isinstance(datasets, list) or not datasets):
         raise ScheduleRenderError(
@@ -732,7 +743,9 @@ def _check_asset_loops(dags: List[ScheduledDag]) -> None:
                 raise ScheduleRenderError(
                     f"the DAG of build {dag.build_id!r} writes {shared[0]}, which is also one of "
                     "its own trigger.datasets, so each run would start the next. Trigger it by "
-                    "another build's output, or on a schedule"
+                    "another build's output, or on a schedule. If its builds do not write that "
+                    "expose, list what each writes in builds[].outputs: a build with no outputs "
+                    "counts as writing every expose no build lists"
                 )
             if shared:
                 started_by.setdefault(dag.build_id, []).append(other.build_id)
@@ -765,6 +778,14 @@ class _BuildGraph:
         self.upstream: Dict[int, List[Tuple[int, str]]] = {}
         #: ``i -> [(build id, why)]``: what build ``i`` depends on that no DAG runs.
         self.unwaited: Dict[int, List[Tuple[str, str]]] = {}
+        #: ``(where, expose id, writers)`` of each ``{productId, exposeId}`` dataset of this
+        #: contract, checked once every DAG is known (:meth:`check_expose_refs`).
+        self.expose_refs: List[Tuple[str, Any, List[Dict[str, Any]]]] = []
+        #: Each expose's asset URI with the builds that write it, read once.
+        self.assets: List[Tuple[Optional[str], List[Dict[str, Any]]]] = [
+            (expose_asset_uri(e)[0], builds_writing_expose(_expose_id(e), builds))
+            for e in _exposes(contract)
+        ]
         for i in self.in_dags:
             self._link(i)
 
@@ -816,8 +837,8 @@ class _BuildGraph:
             raise ScheduleRenderError(
                 f"{where}: {upstream_id!r} is not run by an Airflow DAG (its "
                 "execution.orchestration.engine names another engine, or none), so no task can "
-                f"wait for it. Run both on one engine, or give {build_id!r} a dataset trigger on "
-                f"what {upstream_id!r} writes"
+                f"wait for it. Run both on one engine, or drop the dependency and give {build_id!r} "
+                "a schedule of its own"
             )
         return found[0]
 
@@ -867,7 +888,10 @@ class _BuildGraph:
             s = schedules[i]
             if s is None:
                 return ("no dag", self.kinds[i][1].get("type"))
-            return (s.cron, s.timezone, frozenset(s.datasets), s.operator)
+            # A cron reads its month and day names in any case, and a timezone matters only to
+            # a cron: a DAG on datasets alone takes it for its start date.
+            cron = s.cron.lower() if s.cron is not None else None
+            return (cron, s.timezone if cron else None, frozenset(s.datasets), s.operator)
 
         first = carriers[0]
         for other in carriers[1:]:
@@ -930,7 +954,7 @@ class _BuildGraph:
                 "product's, write its asset URI as a string (that product's fluid apply DAGs "
                 "declare it in outlets=; an aws expose's is s3://<bucket>/<path>)"
             )
-        exposes = [e for e in self.contract.get("exposes") or [] if isinstance(e, dict)]
+        exposes = _exposes(self.contract)
         expose = next((e for e in exposes if _expose_id(e) == expose_id), None)
         if expose is None:
             declared = ", ".join(repr(_expose_id(e)) for e in exposes) or "none"
@@ -944,16 +968,33 @@ class _BuildGraph:
                 f"{where}: expose {expose_id!r} names no Airflow asset: {why}. Write the asset "
                 "URI its data lands at as a string instead"
             )
-        writers = builds_writing_expose(expose_id, self.builds)
-        if writers and all(_classify(b, self.managed)[0] == _OUTSIDE for b in writers):
+        self.expose_refs.append((where, expose_id, builds_writing_expose(expose_id, self.builds)))
+        return uri
+
+    def check_expose_refs(self, dags: List[ScheduledDag]) -> None:
+        """Refuse a dataset trigger on an expose of this contract that no task updates: every
+        build that writes it runs outside any DAG, so the trigger would never fire."""
+        tasked = {t.build_id for dag in dags for t in dag.tasks}
+        for where, expose_id, writers in self.expose_refs:
+            if not writers or any(b.get("id") in tasked for b in writers):
+                continue
             names = ", ".join(repr(b.get("id")) for b in writers)
             raise ScheduleRenderError(
                 f"{where}: expose {expose_id!r} is written by {names}, which no DAG runs "
-                f"({_outside_why(writers[0], self.managed)}), so no task ever updates its asset "
-                "and the trigger would never fire. Run this build on a schedule "
-                "(trigger.type: schedule) instead"
+                f"({self._why_no_task(writers[0])}), so no task ever updates its asset and the "
+                "trigger would never fire. Give that build a trigger, or run this one on a "
+                "schedule (trigger.type: schedule)"
             )
-        return uri
+
+    def _why_no_task(self, build: Dict[str, Any]) -> str:
+        kind, trigger = _classify(build, self.managed)
+        if kind == _OUTSIDE:
+            return _outside_why(build, self.managed)
+        if kind == _ELSEWHERE:
+            return "execution.orchestration.engine names another engine, or none"
+        if kind == _UNRENDERED:
+            return f"its trigger.type is {trigger.get('type')}"
+        return "it has no trigger, and no build it depends on has one"
 
     def _task(self, i: int, order: List[int]) -> BuildTask:
         build = self.builds[i]
@@ -982,19 +1023,19 @@ class _BuildGraph:
         """The asset URIs of the exposes the build writes (``util.contract.builds_writing_expose``);
         an expose that names no asset (:func:`expose_asset_uri`) is left out."""
         uris: List[str] = []
-        for expose in self.contract.get("exposes") or []:
-            if not isinstance(expose, dict):
-                continue
-            if not any(w is build for w in builds_writing_expose(_expose_id(expose), self.builds)):
-                continue
-            uri, _ = expose_asset_uri(expose)
-            if uri and uri not in uris:
+        for uri, writers in self.assets:
+            if uri and uri not in uris and any(w is build for w in writers):
                 uris.append(uri)
         return tuple(uris)
 
 
 def _expose_id(expose: Mapping[str, Any]) -> Any:
     return expose.get("exposeId") or expose.get("id")
+
+
+def _exposes(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    raw = contract.get("exposes")
+    return [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
 
 
 def scheduled_dags(contract: Dict[str, Any]) -> List[ScheduledDag]:
@@ -1008,6 +1049,16 @@ def scheduled_dags(contract: Dict[str, Any]) -> List[ScheduledDag]:
         return []
     graph = _BuildGraph(contract, [b for b in raw_builds if isinstance(b, dict)])
     dags = [dag for members in graph.groups() if (dag := graph.dag(members)) is not None]
+    seen: Set[str] = set()
+    for task in (t for dag in dags for t in dag.tasks):
+        if task.build_id in seen:
+            raise ScheduleRenderError(
+                f"two builds share the id {task.build_id!r}: fluid apply --build-id "
+                f"{task.build_id} could not tell them apart, and Airflow refuses a DAG with two "
+                "tasks of one id. Give each build its own id"
+            )
+        seen.add(task.build_id)
+    graph.check_expose_refs(dags)
     _check_asset_loops(dags)
     return dags
 
@@ -1133,6 +1184,37 @@ def dag_filename_for(build_id: str) -> str:
     # A plain module name: dots in a file name make Airflow import the DAG
     # under a dotted module path.
     return re.sub(r"[^A-Za-z0-9_]", "_", build_id) + "_dag.py"
+
+
+def rendered_dag_of(path: Path) -> Optional[Tuple[str, str]]:
+    """``(PRODUCT_ID, FLUID_ENV_NAME)`` of a DAG file this module rendered, else ``None``.
+
+    Read from the file's syntax tree, never by importing it: its docstring opens as
+    :func:`render_scheduled_dag` writes one, and it assigns both names a string.
+    """
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 1_000_000:
+            return None
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError):
+        return None
+    doc = ast.get_docstring(tree, clean=False) or ""
+    if not doc.startswith(("Scheduled fluid build, ", "Scheduled fluid builds, ")):
+        return None
+    facts: Dict[str, str] = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in ("PRODUCT_ID", "FLUID_ENV_NAME")
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            facts[node.targets[0].id] = node.value.value
+    if set(facts) != {"PRODUCT_ID", "FLUID_ENV_NAME"}:
+        return None
+    return facts["PRODUCT_ID"], facts["FLUID_ENV_NAME"]
 
 
 # ---------------------------------------------------------------------------
@@ -1611,6 +1693,7 @@ __all__ = [
     "render_dag",
     "render_fluid_apply_dags",
     "render_scheduled_dag",
+    "rendered_dag_of",
     "runs_only_outside_schedulers",
     "schedule_scope_for",
     "scheduled_builds",

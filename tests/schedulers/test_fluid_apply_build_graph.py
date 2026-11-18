@@ -211,7 +211,7 @@ def test_a_dependency_on_a_build_another_engine_runs_is_refused():
     other["execution"]["orchestration"] = {"engine": "dagster"}
     message = _refused(other, _build("b", "elsewhere", trigger=CRON))
     assert "'elsewhere' is not run by an Airflow DAG" in message
-    assert "Run both on one engine, or give 'b' a dataset trigger" in message
+    assert "Run both on one engine, or drop the dependency and give 'b' a schedule" in message
 
 
 # --- what is refused, and what to change ---------------------------------------------------
@@ -386,3 +386,65 @@ def test_an_id_no_task_checks_never_reaches_the_dag_documentation():
     ).values()
     assert "<img" not in source and "onerror" not in source
     assert "a build whose id is not a plain identifier (a Spark stream" in " ".join(source.split())
+
+
+def test_two_builds_with_one_id_are_refused_before_airflow_sees_two_tasks():
+    message = _refused(_build("a", trigger=CRON), _build("x", "a"), _build("x", "a"))
+    assert "two builds share the id 'x'" in message
+    assert "Airflow refuses a DAG with two tasks of one id. Give each build its own id" in message
+
+
+@pytest.mark.parametrize("condition", [["success"], {"on": "success"}])
+def test_a_condition_that_is_not_a_word_is_refused(condition):
+    message = _refused(
+        _build("a", trigger=CRON), _build("b", {"buildId": "a", "condition": condition})
+    )
+    assert "is not one of success, completion, always" in message
+
+
+@pytest.mark.parametrize("tz", ["America", "Etc"])
+def test_a_tz_database_directory_is_no_timezone(tz):
+    assert "is not an IANA zone" in _refused(_build("a", trigger={**CRON, "timezone": tz}))
+
+
+def test_builds_that_are_not_a_list_run_nowhere():
+    assert fluid_apply.runs_only_outside_schedulers({"id": "p", "builds": 5}) is False
+    assert fluid_apply.scheduled_dags({"id": "p", "builds": 5}) == []
+
+
+def test_cron_names_read_in_any_case_and_a_dataset_dag_ignores_its_timezone():
+    (dag,) = _dags(
+        _build("a", trigger={"type": "schedule", "schedule": "0 2 * * MON"}),
+        _build("b", "a", trigger={"type": "schedule", "schedule": "0 2 * * mon"}),
+    )
+    assert [t.build_id for t in dag.tasks] == ["a", "b"]
+    datasets = {"type": "dataset", "datasets": ["s3://lake/raw"]}
+    (dag,) = _dags(
+        _build("c", trigger={**datasets, "timezone": "Europe/Paris"}),
+        _build("d", "c", trigger=datasets),
+    )
+    assert dag.build_id == "c" and dag.schedule.timezone == "Europe/Paris"
+
+
+def test_builds_writing_expose_runs_once_per_expose(monkeypatch):
+    """The outlets of N tasks come from one pass over the exposes, not one per task."""
+    calls = []
+    real = fluid_apply.builds_writing_expose
+
+    def counted(expose_id, builds):
+        calls.append(expose_id)
+        return real(expose_id, builds)
+
+    monkeypatch.setattr(fluid_apply, "builds_writing_expose", counted)
+    builds = [_build("b0", trigger=CRON, outputs=["e0"])]
+    builds += [_build(f"b{i}", f"b{i - 1}", outputs=[f"e{i}"]) for i in range(1, 30)]
+    exposes = [
+        {
+            "exposeId": f"e{i}",
+            "binding": {"platform": "aws", "location": {"bucket": "l", "path": f"p{i}"}},
+        }
+        for i in range(30)
+    ]
+    (dag,) = fluid_apply.scheduled_dags({**_contract(*builds), "exposes": exposes})
+    assert [t.outlets for t in dag.tasks][29] == ("s3://l/p29",)
+    assert len(calls) == 30

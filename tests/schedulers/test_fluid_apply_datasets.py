@@ -296,3 +296,67 @@ def test_a_dataset_given_twice_is_one_asset():
     )
     consumer = [d for d in fluid_apply.scheduled_dags(contract) if d.build_id == "consumer"]
     assert _uris(consumer) == [("consumer", (DAILY,), ((),))]
+
+
+def test_a_schedule_and_dataset_trigger_needs_a_recurring_cron():
+    message = _refused(
+        _with_consumer(
+            {"type": "schedule_and_dataset", "schedule": "@once", "datasets": ["s3://a/b"]}
+        )
+    )
+    assert "runs on a recurring cron, and @once is not one" in message
+
+
+@pytest.mark.parametrize(
+    "writer, why",
+    [
+        (
+            {"execution": {"orchestration": {"engine": "dagster"}, "trigger": {"cron": "@daily"}}},
+            "names another engine",
+        ),
+        ({"execution": {"trigger": {"type": "manual"}}}, "its trigger.type is manual"),
+        ({}, "it has no trigger, and no build it depends on has one"),
+    ],
+)
+def test_a_dataset_trigger_on_what_no_task_writes_is_refused(writer, why):
+    contract = copy.deepcopy(SPARK_CONTRACT)
+    contract["builds"] = [
+        {"id": "writer", "outputs": ["events_daily"], **writer},
+        {
+            "id": "consumer",
+            "outputs": [],
+            "execution": {
+                "trigger": {"type": "dataset", "datasets": [_expose_ref("events_daily")]}
+            },
+        },
+    ]
+    message = _refused(contract)
+    assert "is written by 'writer', which no DAG runs" in message and why in message
+
+
+def test_a_writer_that_runs_in_another_builds_dag_fires_the_trigger():
+    contract = copy.deepcopy(SPARK_CONTRACT)
+    contract["builds"] = [
+        {"id": "root", "outputs": [], "execution": {"trigger": {"cron": "@daily"}}},
+        {"id": "writer", "outputs": ["events_daily"], "dependencies": [{"buildId": "root"}]},
+        {
+            "id": "consumer",
+            "outputs": [],
+            "execution": {
+                "trigger": {"type": "dataset", "datasets": [_expose_ref("events_daily")]}
+            },
+        },
+    ]
+    assert sorted(_files(contract)) == ["consumer_dag.py", "root_dag.py"]
+
+
+def test_a_self_trigger_says_how_outputs_change_who_writes_what():
+    contract = copy.deepcopy(SPARK_CONTRACT)
+    contract["builds"][1]["execution"]["trigger"] = {
+        "type": "schedule_and_dataset",
+        "schedule": "@daily",
+        "datasets": [DAILY],
+    }
+    assert "a build with no outputs counts as writing every expose no build lists" in _refused(
+        contract
+    )

@@ -164,7 +164,10 @@ def _local(location: Mapping[str, Any]) -> str:
             f"its location.path {path!r} is relative to the project directory, which is "
             "somewhere else on each worker"
         )
-    return "file:///" + _key(path, "location.path")
+    key = _key(path, "location.path")
+    if not key:
+        raise NotAddressable("its location.path names no file")
+    return f"file:///{key}"
 
 
 #: ``binding.platform`` -> the URI of an expose there.
@@ -233,8 +236,14 @@ def _provider_netloc(raw: str, scheme: str, netloc: str, path: str) -> str:
         )
     if scheme in ("kafka", "file") and path == "/":
         raise NotAddressable(f"dataset URI {raw!r}: a {scheme}:// URI names a path")
-    if scheme == "postgres" and not netloc.rpartition(":")[2].isdigit():
-        return f"{netloc}:5432"
+    if scheme == "postgres":
+        # As the postgres provider's sanitizer reads it: no port is 5432, and a port that is
+        # not a number makes it raise.
+        try:
+            port = urlsplit(f"//{netloc}").port
+        except ValueError:
+            raise NotAddressable(f"dataset URI {raw!r}: its port is not a number") from None
+        return f"{netloc.rstrip(':')}:5432" if port is None else netloc
     return netloc
 
 

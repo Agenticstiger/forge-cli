@@ -108,3 +108,19 @@ def test_every_snapshot_is_python_that_binds_every_name_it_reads(case: str) -> N
             n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
         }
         assert loaded <= bound, (name, loaded - bound)
+
+
+@pytest.mark.parametrize("case", sorted(ALL_CASES))
+def test_every_snapshot_reads_back_as_the_products_dag(case: str, tmp_path: Path) -> None:
+    contract, env, path = ALL_CASES[case]
+    for name, source in _render(case).items():
+        (tmp_path / name).write_text(source, encoding="utf-8")
+        assert fluid_apply.rendered_dag_of(tmp_path / name) == (contract["id"], env or "")
+
+
+def test_a_file_fluid_did_not_render_reads_back_as_none(tmp_path: Path) -> None:
+    (tmp_path / "x.py").write_text('"""Mine."""\nPRODUCT_ID = "p"\nFLUID_ENV_NAME = ""\n')
+    (tmp_path / "broken.py").write_text("def (:\n")
+    (tmp_path / "link.py").symlink_to(tmp_path / "x.py")
+    for name in ("x.py", "broken.py", "link.py", "missing.py"):
+        assert fluid_apply.rendered_dag_of(tmp_path / name) is None
