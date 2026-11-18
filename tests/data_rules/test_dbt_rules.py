@@ -476,3 +476,40 @@ def test_a_placeholder_prefix_covers_text_with_a_line_break() -> None:
     db.execute("CREATE TABLE p (code VARCHAR)")
     db.execute("INSERT INTO p VALUES ('12'), ('TBD a' || chr(10) || 'b'), ('x')")
     assert db.execute(rule.counts(lambda e: f'"{e}"')).fetchone() == (3, 1)
+
+
+def test_a_bare_call_or_a_ref_breakout_from_a_contract_is_a_literal() -> None:
+    contract = _billing()
+    status = next(c for c in contract["exposes"][0]["contract"]["schema"] if c["name"] == "status")
+    status["validationRules"] = [
+        {"type": "enum", "constraint": "'A', 'env_var(''HOME'')'"},
+        {"type": "custom", "constraint": "references contracts.contract_id"},
+    ]
+    doc = yaml.safe_load(render_dbt_tests(contract))
+    column = next(c for c in doc["models"][0]["columns"] if c["name"] == "status")
+    values = next(t for t in column["tests"] if "accepted_values" in t)["accepted_values"]["values"]
+    assert values[1].startswith("{{ ") and jinja2.Template(values[1]).render() == "env_var('HOME')"
+    rel = next(t for t in column["tests"] if "relationships" in t)["relationships"]
+    assert rel["to"] == "ref('contracts')"  # the exporter's own ref stays a ref
+    status["validationRules"][1]["constraint"] = "references x') }}{{ y.contract_id"
+    doc = yaml.safe_load(render_dbt_tests(contract))
+    column = next(c for c in doc["models"][0]["columns"] if c["name"] == "status")
+    # The mapping reads only a plain model name from a reference, so none is written here.
+    assert not [t for t in column["tests"] if isinstance(t, dict) and "relationships" in t]
+
+
+def test_the_placeholder_where_reads_contract_text_in_nfc() -> None:
+    decomposed = "cafe" + chr(0x301)
+    where = _dbt.placeholder_where("k", [decomposed], [])
+    rendered = jinja2.Environment().from_string(where).render(target=SimpleNamespace(type="duckdb"))
+    assert "caf" + chr(0xE9) in rendered and decomposed not in rendered
+
+
+def test_out_through_a_symlinked_folder_finds_its_project(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    (tmp_path / "shared").mkdir()
+    project.mkdir()
+    (project / "dbt_project.yml").write_text("name: p\n")
+    (project / "models").symlink_to(tmp_path / "shared")
+    assert _run_cli(tmp_path, project / "models" / "schema.yml", _billing()) == 0
+    assert (project / "macros" / "fluid" / "fluid_rule.sql").exists()

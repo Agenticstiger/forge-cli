@@ -264,6 +264,11 @@ def placeholder_where(column: str, values: List[str], prefixes: List[str]) -> Op
     if not values and not prefixes:
         return None
     from ._compile import placeholder_sql
+    from ._model import nfc
+
+    # Contract texts are compared in NFC (RFC 2.3), as the compiled placeholder rule reads them.
+    column = nfc(column)
+    values, prefixes = [nfc(v) for v in values], [nfc(p) for p in prefixes]
 
     groups: Dict[str, List[str]] = {}
     for adapter, dialect in ADAPTERS.items():

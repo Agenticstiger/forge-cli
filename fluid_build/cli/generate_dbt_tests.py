@@ -177,7 +177,10 @@ def _macro_path(out_path: Path, macros_dir: str | None) -> Path:
 
     if macros_dir:
         return Path(macros_dir) / MACRO_FILE
-    for folder in [out_path.resolve().parent, *out_path.resolve().parents]:
+    # absolute(), not resolve(): --out inside the project through a symlinked folder still
+    # belongs to the project the path names.
+    out_abs = Path(os.path.abspath(out_path))
+    for folder in [out_abs.parent, *out_abs.parents]:
         project = folder / "dbt_project.yml"
         if project.is_file():
             return folder / _first_macro_path(project) / MACRO_FILE

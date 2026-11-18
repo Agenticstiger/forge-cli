@@ -75,6 +75,7 @@ enforces the boundary).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, List, Mapping, Sequence
 
@@ -364,6 +365,12 @@ def _exempt_placeholders(col: Mapping[str, Any], tests: list[Any]) -> list[Any]:
 
 
 _JINJA_DELIMITERS = ("{{", "{%", "{#")
+#: dbt also evaluates a test argument that looks like one of these calls, braces or not
+#: (``dbt.clients.jinja.add_rendered_test_kwargs``): an enum value ``env_var('SECRET')`` would
+#: read the variable.
+_LOOKS_LIKE_CALL = re.compile(r"^\s*(env_var|ref|var|source|doc)\s*\(.+\)\s*$", re.S)
+#: The ``relationships`` test's own ``ref('<model>')``, kept when the model is a plain name.
+_OWN_REF = re.compile(r"ref\('[A-Za-z0-9_]+'\)")
 
 
 class _GeneratedJinja(str):
@@ -376,14 +383,17 @@ def _inert_jinja(value: Any, *, generated: bool = False) -> Any:
 
     dbt renders a schema.yml's names, descriptions and test arguments as Jinja, so a column
     named ``x{{ env_var('SECRET') }}`` or an enum value holding ``{%`` would run during
-    ``dbt parse``. A string without a delimiter is left as written, so the file for every
-    other contract is unchanged. The ``fluid_rule`` test's own arguments are already Jinja
+    ``dbt parse``, and so would a test argument that is a bare ``env_var(...)``-style call.
+    Every other string is left as written, so the file for every other contract is
+    unchanged; so is the ``relationships`` test's own ``ref('<model>')`` when the model is a
+    plain name (any other model name is a literal, and the test then names no model). The ``fluid_rule`` test's own arguments are already Jinja
     built from literals, and are left alone.
     """
     if isinstance(value, _GeneratedJinja):
         return str(value)
     if isinstance(value, str):
-        if not generated and any(d in value for d in _JINJA_DELIMITERS):
+        unsafe = any(d in value for d in _JINJA_DELIMITERS) or _LOOKS_LIKE_CALL.match(value)
+        if not generated and unsafe and not _OWN_REF.fullmatch(value):
             from ..data_rules._dbt import jinja_text
 
             return jinja_text(value)
