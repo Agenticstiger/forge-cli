@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A quoted enum list in `validationRules` reads as SQL writes it.** Every reader cut an enum
+  rule's `constraint` at every comma, so `constraint: "'base_fee', 'usage', 'fee, late'"` listed
+  `'base_fee'`, `'usage'`, `'fee` and `late'`. The data-rules lint kept the quotes and refused
+  even `kind = 'base_fee'` in `fluid validate`, the dbt bridge wrote those four strings into an
+  `accepted_values` test, `fluid test` checked rows against them, and the ODCS exporter listed
+  `fee` and `late` as two values. A value may now be a quoted string, written as SQL writes one
+  and as FLUID 0.7.7 writes an `enum` type's levels: `'fee, late'` is one value and `'O''Brien'`
+  is `O'Brien`, for all four readers. A list in which no value opens with a quote reads exactly as
+  before, `O'Brien, D'Arcy` included. The ODCS exporter used to strip a quote from either end of
+  every value; it now keeps a quote that does not wrap a quoted string, so `'80s` stays `'80s`.
+  When a value holds a comma, the lint's refusal and the ODCS rule's description quote each value,
+  so the list they print reads one way. `RFC-data-rules.md` section 2.3 gives the grammar.
+- **`decimal(p,s)` has a FLUID SQL/1 type only within the SQL standard's bounds.** FLUID SQL/1
+  read `decimal(0)`, `decimal(0,2)` and `numeric(10,11)` as numbers of scale 0, 2 and 11, so
+  `fluid validate` accepted a rule naming such a column that the FLUX engine refuses. A
+  decimal-family column now has a type only when 1 <= p and 0 <= s <= p (and p is at most
+  1,000, as before), and the refusal says so: "(a decimal is decimal(p) or decimal(p, s), with
+  1 <= p <= 1000 and 0 <= s <= p)". Leading zeros still read by value, so `decimal(0012, 02)` is
+  `decimal(12, 2)`. The conformance vectors gain 13 cases at the bounds, from `decimal(1)` and
+  `decimal(1000, 1000)` to `decimal(0)` and `decimal(1000,1001)`.
+
 ## [0.32.0] — 2026-11-18
 
 ### Added
@@ -80,18 +103,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   these scripts write now use single quotes. The Glue script's SQL summary comment is one line, so
   multi-line SQL no longer spills out of it as code, and a column type or SQL that is not a string no
   longer stops generation.
-- **A quoted enum list in `validationRules` reads as SQL writes it.** Every reader cut an enum
-  rule's `constraint` at every comma, so `constraint: "'base_fee', 'usage', 'fee, late'"` listed
-  `'base_fee'`, `'usage'`, `'fee` and `late'`. The data-rules lint kept the quotes and refused
-  even `kind = 'base_fee'` in `fluid validate`, the dbt bridge wrote those four strings into an
-  `accepted_values` test, `fluid test` checked rows against them, and the ODCS exporter listed
-  `fee` and `late` as two values. A value may now be a quoted string, written as SQL writes one
-  and as FLUID 0.7.7 writes an `enum` type's levels: `'fee, late'` is one value and `'O''Brien'`
-  is `O'Brien`, for all four readers. A list in which no value opens with a quote reads exactly as
-  before, `O'Brien, D'Arcy` included. The ODCS exporter used to strip a quote from either end of
-  every value; it now keeps a quote that does not wrap a quoted string, so `'80s` stays `'80s`.
-  When a value holds a comma, the lint's refusal and the ODCS rule's description quote each value,
-  so the list they print reads one way. `RFC-data-rules.md` section 2.3 gives the grammar.
 - **A FLUID SQL/1 expression can name an enum column whose quoted level holds a parenthesis.**
   FLUID SQL/1 read a column type up to its first `)`, so a column typed `enum('a (b)', 'c')` had
   no FLUID SQL/1 type, and `fluid validate` refused every invariant, derive or registry rule that
@@ -99,14 +110,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list the way the other type readers do, stepping over quoted text; only a type whose parameter
   list holds a parenthesis inside quotes reads differently. The conformance vectors gain three
   cases for a level holding a parenthesis, a comma and a doubled quote.
-- **`decimal(p,s)` has a FLUID SQL/1 type only within the SQL standard's bounds.** FLUID SQL/1
-  read `decimal(0)`, `decimal(0,2)` and `numeric(10,11)` as numbers of scale 0, 2 and 11, so
-  `fluid validate` accepted a rule naming such a column that the FLUX engine refuses. A
-  decimal-family column now has a type only when 1 <= p and 0 <= s <= p (and p is at most
-  1,000, as before), and the refusal says so: "(a decimal is decimal(p) or decimal(p, s), with
-  1 <= p <= 1000 and 0 <= s <= p)". Leading zeros still read by value, so `decimal(0012, 02)` is
-  `decimal(12, 2)`. The conformance vectors gain 13 cases at the bounds, from `decimal(1)` and
-  `decimal(1000, 1000)` to `decimal(0)` and `decimal(1000,1001)`.
 - **The Snowflake provider's redaction helper masks a credential whose key is quoted.**
   `redact_string` returned the value in the clear for `{'client_secret': '…'}`,
   `{"<PREFIX>_TOKEN": "…"}`, `"id_token": "…"` and `{'private_key': '…'}`: only a key with its own
