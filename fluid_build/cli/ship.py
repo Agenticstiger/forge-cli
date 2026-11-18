@@ -556,12 +556,19 @@ def _report_abort(num: int, rec: report.StageRecord, ctx: _Context) -> None:
         if rest == ctx.selected
         else f"; to go on from that stage with this bundle, use --stage {st.compact_spec(rest)}"
     )
+    # Fixed words only: the reason can hold the checkout's text, and this line is
+    # printed outside the stop-commands fence (the reason is in the report).
+    if rec.reason == "interrupted":
+        why = f"exit {code}, interrupted"
+    elif rec.exit_code == 0:
+        why = "it exited 0, but --require-artifacts was not met"
+    else:
+        why = f"exit {code}"
     ctx.logger.error(
-        "Ship aborted at stage %d %s (exit %d%s). After the fix, run the same command again%s.",
+        "Ship aborted at stage %d %s (%s). After the fix, run the same command again%s.",
         num,
         rec.name,
-        code,
-        ", interrupted" if rec.reason == "interrupted" else "",
+        why,
         resume,
     )
 

@@ -211,7 +211,10 @@ def test_every_required_artifact_written_passes(
 
 
 def test_a_port_without_its_odcs_fails_and_names_the_port(
-    work: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    work: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     outputs = dict(_ALL_OUTPUTS)
     del outputs["odcs/product.odcs.customers.yaml"]
@@ -223,6 +226,7 @@ def test_a_port_without_its_odcs_fails_and_names_the_port(
     reason = str(stage3["failure_reason"])
     assert "port 'customers' has no ODCS" in reason and "'orders'" not in reason
     assert "required artifact missing: odcs: port 'customers'" in capsys.readouterr().out
+    assert "it exited 0, but --require-artifacts was not met" in caplog.text
     junit = (work / "runtime/ship-junit.xml").read_text()
     assert "port 'customers' has no ODCS" in junit
 
