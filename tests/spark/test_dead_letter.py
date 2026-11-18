@@ -295,3 +295,21 @@ def test_a_topic_sink_sends_and_an_alert_is_logged(runner, contract, monkeypatch
     sink(Batch(1), 0)
     assert landed == ["topic"]
     assert '"forge_spark_runner": "dead_letter_alert"' in capsys.readouterr().out
+
+
+def test_fluid_validate_reports_a_dead_letter_block_apply_would_refuse(contract, tmp_path):
+    import yaml
+
+    from fluid_build.cli import main
+    from fluid_build.spark.compiler import validation_errors
+
+    same = with_dead_letters(copy.deepcopy(contract), table="order_lines")
+    (error,) = validation_errors(same)
+    assert "a table of their own" in error
+    good = with_dead_letters(copy.deepcopy(contract), sink="topic", topic="commerce.orders.dlq")
+    assert validation_errors(good) == []
+    path = tmp_path / "contract.fluid.yaml"
+    path.write_text(yaml.safe_dump(same, sort_keys=False), encoding="utf-8")
+    assert main(["validate", str(path), "--offline"]) != 0
+    path.write_text(yaml.safe_dump(good, sort_keys=False), encoding="utf-8")
+    assert main(["validate", str(path), "--offline"]) == 0
