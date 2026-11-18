@@ -230,6 +230,15 @@ class FakeHttpServer:
 
 def _render(result: Any) -> Tuple[int, bytes, Dict[str, str]]:
     """Turn a handler result into ``(status, body bytes, headers)``."""
+    status, payload, headers = _unpack(result)
+    data, content_type = _encode(payload)
+    if content_type and not any(name.lower() == "content-type" for name in headers):
+        headers["Content-Type"] = content_type
+    return status, data, headers
+
+
+def _unpack(result: Any) -> Tuple[int, Any, Dict[str, str]]:
+    """The status, payload and headers of a handler result, each one checked."""
     if not isinstance(result, tuple) or len(result) not in (2, 3):
         raise TypeError(
             f"a handler returns (status, payload) or (status, payload, headers), not {result!r:.200}"
@@ -244,19 +253,19 @@ def _render(result: Any) -> Tuple[int, bytes, Dict[str, str]]:
         if any(ch in text for text in (name, value) for ch in "\r\n"):
             raise ValueError(f"header {name!r} holds a line break")
         (name + value).encode("latin-1")  # http.server writes headers as Latin-1
-    headers = {name: value for name, value in headers.items() if name.lower() != "content-length"}
-    content_type: Optional[str]
+    # The Content-Length is always the body's, which ``_Handler._serve`` sets.
+    return status, payload, {k: v for k, v in headers.items() if k.lower() != "content-length"}
+
+
+def _encode(payload: Any) -> Tuple[bytes, Optional[str]]:
+    """The body bytes of a handler payload, and the Content-Type that goes with them."""
     if payload is None:
-        data, content_type = b"", None
-    elif isinstance(payload, (bytes, bytearray)):
-        data, content_type = bytes(payload), "application/octet-stream"
-    elif isinstance(payload, str):
-        data, content_type = payload.encode("utf-8"), "text/plain; charset=utf-8"
-    else:
-        data, content_type = dumps(payload).encode("utf-8"), "application/json"
-    if content_type and not any(name.lower() == "content-type" for name in headers):
-        headers["Content-Type"] = content_type
-    return status, data, headers
+        return b"", None
+    if isinstance(payload, (bytes, bytearray)):
+        return bytes(payload), "application/octet-stream"
+    if isinstance(payload, str):
+        return payload.encode("utf-8"), "text/plain; charset=utf-8"
+    return dumps(payload).encode("utf-8"), "application/json"
 
 
 class _Handler(BaseHTTPRequestHandler):
