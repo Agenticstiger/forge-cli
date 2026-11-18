@@ -622,6 +622,17 @@ def test_live_identity_failure_is_unsupported(monkeypatch):
     assert pf.exit_code(report) == 1
 
 
+def test_a_failed_live_check_names_the_code_not_the_message():
+    class ClientError(Exception):
+        response = {"Error": {"Code": "403", "Message": "arn:aws:iam::123456789012:user/alice"}}
+
+    def _denied():
+        raise ClientError("User arn:aws:iam::123456789012:user/alice is not authorized")
+
+    row = pf._check("aws-identity", _denied)
+    assert row == {"check": "aws-identity", "status": "failed", "detail": "ClientError 403"}
+
+
 def test_live_without_the_sdk_is_skipped_and_stays_requires_live_proof(monkeypatch):
     monkeypatch.setitem(sys.modules, "boto3", None)
     report = _report(AWS, operation="apply", probe=FakeProbe(), live=True)

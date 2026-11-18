@@ -1010,8 +1010,17 @@ def _check(name: str, fn: Any) -> Dict[str, str]:
             "detail": f"{exc.name or 'its SDK'} is not installed",
         }
     except Exception as exc:  # noqa: BLE001 - the failure is the result
-        return {"check": name, "status": "failed", "detail": type(exc).__name__}
+        return {"check": name, "status": "failed", "detail": _failure(exc)}
     return {"check": name, "status": "ok", "detail": detail}
+
+
+def _failure(exc: BaseException) -> str:
+    """The exception's class and, for a cloud API error, its status code (``403``,
+    ``NoSuchBucket``): never its message, which can name the identity or the bucket."""
+    code = ((getattr(exc, "response", None) or {}).get("Error") or {}).get("Code")
+    if code is None and isinstance(exc, LookupError):
+        code = "not found"
+    return f"{type(exc).__name__} {_text(code)}".strip() if code else type(exc).__name__
 
 
 def _aws_identity() -> str:
@@ -1043,7 +1052,7 @@ def _backend_reachable(spec: str) -> str:
         from google.cloud import storage
 
         if not storage.Client().bucket(block["gcs"]["bucket"]).exists():
-            raise LookupError("bucket")
+            raise LookupError("not found")
         return "state bucket readable"
     return "local state"
 
