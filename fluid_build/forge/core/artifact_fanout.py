@@ -24,7 +24,8 @@ Output layout (full default emit set)::
     ├── schedule/<product-id>[__<env>]/    # one directory per product, so
     │   └── <build-id>_dag.py               #   schedule-sync never deletes
     │                                       #   another product's DAGs (Path A)
-    └── policy/bindings.json                # compiled IAM/GRANT bindings
+    ├── policy/bindings.json                # compiled IAM/GRANT bindings
+    └── spark/<build-id>/job.json           # forge Spark job config, as OpenTofu uploads it
 
 Note on terminology: **OPDS** is fluid's name for the Linux Foundation / ODPI
 Open Data Product *Specification* v4.1. Upstream abbreviates it *ODPS*, but that
@@ -93,6 +94,7 @@ EMIT_KEYS: Tuple[str, ...] = (
     "opds",
     "schedule",
     "policies",
+    "spark",
 )
 
 # Default emit set. Every schema-pinned emitter validates against its vendored
@@ -107,9 +109,11 @@ EMIT_KEYS: Tuple[str, ...] = (
 #                  default set once that validation went green.
 # - schedule     → DAG/flow files; shape is scheduler-specific not schema-pinned
 # - policies     → compiled IAM bindings; shape is internal
+# - spark        → each forge Spark build's job.json, the bytes OpenTofu uploads
+#                  (nothing for a contract without one)
 #
-# All five emit keys are on by default (the historical card's target set:
-# odcs + odps-bitol + opds + schedule + policies). Order matches ``EMIT_KEYS``
+# All six emit keys are on by default (odcs + odps-bitol + opds + schedule +
+# policies + spark). Order matches ``EMIT_KEYS``
 # because ``parse_emit_set`` canonicalises every resolved set into ``EMIT_KEYS``
 # order for a stable MANIFEST hash — so ``parse_emit_set(None) == DEFAULT_EMIT``.
 DEFAULT_EMIT: Tuple[str, ...] = (
@@ -118,6 +122,7 @@ DEFAULT_EMIT: Tuple[str, ...] = (
     "opds",
     "schedule",
     "policies",
+    "spark",
 )
 
 # Emit keys auto-skipped purely on the basis of the build *pattern*.
@@ -785,12 +790,77 @@ def _emit_policies(contract_path: Path, out_dir: Path, logger: logging.Logger) -
     return [out]
 
 
+#: What a job.json holds where its bucket is the account's shared one
+#: (``<account>-fluid-data``): OpenTofu writes the deploying account's id there at
+#: apply, as it writes the MSK broker list over the compiler's
+#: ``MSK_BROKERS_PLACEHOLDER``. The IaC emitter shows the account the same way.
+SPARK_ACCOUNT_PLACEHOLDER = "<account>"
+
+
+def _emit_spark(contract_path: Path, out_dir: Path, logger: logging.Logger) -> List[Path]:
+    """Each forge Spark build's ``job.json`` at ``spark/<build id>/job.json``.
+
+    The bytes are the compiler's (``spark/compiler.py::compile_job_config``,
+    ``SparkJob.text``): the object OpenTofu uploads to
+    ``_fluid/spark/<product>/<build>/job.json`` (``iac/providers/aws_ingest.py``),
+    so the MANIFEST hash is the hash of the deployed config. Two values only
+    ``tofu apply`` knows stay placeholders: :data:`SPARK_ACCOUNT_PLACEHOLDER`
+    for an account-bucket warehouse and the compiler's MSK broker placeholder
+    for a source named by its cluster ARN; each such build is logged. The
+    operator's policies ``fluid apply`` checks before the upload (contract SQL,
+    hosts) are not applied here: ``fluid validate`` reports them.
+    """
+    from fluid_build.spark.compiler import (
+        MSK_BROKERS_PLACEHOLDER,
+        compile_job_config,
+        spark_builds,
+    )
+    from fluid_build.spark.policy import SparkPolicyError
+    from fluid_build.streaming.compiler import managed_lane_enabled
+
+    contract = _load_contract(contract_path)
+    if not managed_lane_enabled(contract):
+        return []
+    written: List[Path] = []
+    for build in spark_builds(contract):
+        try:
+            job = compile_job_config(
+                contract,
+                build,
+                account_ref=SPARK_ACCOUNT_PLACEHOLDER,
+                contract_sql_gate=False,
+                host_gate=False,
+            )
+        except (ValueError, SparkPolicyError) as exc:
+            raise FanoutError(f"Spark build {build.get('id')}: {exc}", key="spark") from exc
+        # compile_job_config accepts only an id of letters, digits, _ and -.
+        path = out_dir / str(build["id"]) / "job.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(job.text.encode("utf-8"))
+        written.append(path)
+        deferred = [
+            label
+            for token, label in (
+                (SPARK_ACCOUNT_PLACEHOLDER, "the deploying account"),
+                (MSK_BROKERS_PLACEHOLDER, "the MSK broker list"),
+            )
+            if token in job.text
+        ]
+        if deferred:
+            logger.info(
+                "generate_artifacts_spark_apply_time_values",
+                extra={"build": build["id"], "values": deferred, "digest": job.digest},
+            )
+    return written
+
+
 _DISPATCH = {
     "odps-bitol": ("odps-bitol", _emit_odps_bitol),
     "odcs": ("odcs", _emit_odcs),
     "opds": ("opds", _emit_opds),
     "schedule": ("schedule", _emit_schedule),
     "policies": ("policy", _emit_policies),
+    "spark": ("spark", _emit_spark),
 }
 
 
@@ -874,7 +944,7 @@ def run_fanout(
     # Clean slate — blow away pre-existing outputs so stale files don't
     # survive into the MANIFEST. The caller owns out_dir; we only remove
     # subdirs we generate into.
-    for sub in ("odps", "odps-bitol", "odcs", "opds", "schedule", "policy"):
+    for sub in ("odps", "odps-bitol", "odcs", "opds", "schedule", "policy", "spark"):
         target = out_dir / sub
         if target.exists():
             shutil.rmtree(target)
