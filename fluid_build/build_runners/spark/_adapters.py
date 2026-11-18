@@ -167,14 +167,76 @@ def _submit_parameters(conf: Mapping[str, str]) -> str:
     return " ".join(shlex.quote(p) for p in _conf_params(conf))
 
 
+#: The most bytes an artifact read back before a start may hold (forge's are tens of KiB).
+MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
+
+
+def checked_run(r: DesiredRun, clients: ClientFactory) -> DesiredRun:
+    """The run, with the digest of the job config its runtime reads
+    (``--fluid-job-sha256``), once the config and the runner read back from S3 are the
+    ones this apply compiled: the runner then refuses any other config, so one another
+    apply put there since never runs under this run's config hash. The artifact
+    bucket's write access stays the boundary: a writer could replace the runner after
+    this read.
+
+    Raises:
+        SparkRunError: an artifact cannot be read, or is another one; nothing started.
+    """
+    import dataclasses
+    import hashlib
+    import unicodedata
+
+    from fluid_build.build_runners.spark._desired import config_digest
+    from fluid_build.spark import runner_source
+
+    config, runner = _artifact(r, clients, r.job_uri), _artifact(r, clients, r.runner_uri)
+    # OpenTofu writes text in NFC; the runner's is the one this forge-cli ships.
+    shipped = unicodedata.normalize("NFC", runner_source()).encode("utf-8")
+    if (
+        not r.config_matches(config)
+        or hashlib.sha256(runner).digest() != hashlib.sha256(shipped).digest()
+    ):
+        raise SparkRunError(
+            f"Spark build {r.build}: {r.job_uri} or its runner is not the one this apply "
+            "compiled (another apply has changed it since); nothing was started. Run fluid "
+            "apply again: it uploads them and starts the run on them"
+        )
+    return dataclasses.replace(r, job_sha256=config_digest(r.job_text))
+
+
+def _artifact(run: DesiredRun, clients: ClientFactory, uri: str) -> bytes:
+    """An artifact's bytes from S3, at most :data:`MAX_ARTIFACT_BYTES`."""
+    bucket, _, key = uri.removeprefix("s3://").partition("/")
+    try:
+        body = clients("s3", run.region).get_object(Bucket=bucket, Key=key)
+        data = body["Body"].read(MAX_ARTIFACT_BYTES + 1)
+    except Exception as exc:  # noqa: BLE001 - botocore's errors; named, then raised
+        code = str((getattr(exc, "response", None) or {}).get("Error", {}).get("Code") or "")
+        raise SparkRunError(
+            f"Spark build {run.build}: {uri} cannot be read to check it before the run "
+            f"starts ({code or type(exc).__name__}); nothing was started"
+        ) from exc
+    if len(data) > MAX_ARTIFACT_BYTES:
+        raise SparkRunError(
+            f"Spark build {run.build}: {uri} is larger than any artifact forge writes; "
+            "nothing was started"
+        )
+    return data
+
+
 class Adapter:
     runtime = ""
     service = ""
 
     def __init__(self, run: DesiredRun, clients: Optional[ClientFactory]) -> None:
         self.run = run
+        self.clients = clients
         # A local run has no AWS client: its "client" is the machine (``Local.host``).
         self.client = clients(self.service, run.region) if clients is not None else None
+
+    def checked(self) -> DesiredRun:
+        """:func:`checked_run` of this adapter's run."""
+        return checked_run(self.run, self.clients)
 
     def runs(self) -> List[RunInfo]:  # newest first
         raise NotImplementedError
@@ -320,7 +382,7 @@ class EmrServerless(Adapter):
         return self._info(job["jobRun"])
 
     def start(self, token: str) -> str:
-        r = self.run
+        r = self.checked()
         request: Dict[str, Any] = {
             "applicationId": self.application_id(),
             "clientToken": token,
@@ -396,7 +458,7 @@ class Glue(Adapter):
         return self._info(self.client.get_job_run(JobName=self.job_name, RunId=run_id)["JobRun"])
 
     def start(self, token: str) -> str:
-        r = self.run
+        r = self.checked()
         args = r.entry_args()
         arguments = {args[i]: args[i + 1] for i in range(0, len(args), 2)}
         if r.spark_conf:
@@ -430,10 +492,6 @@ _STEP = {
 class EmrEc2(Adapter):
     runtime, service = "emr-ec2", "emr"
     LOOKBACK_PAGES = 10
-
-    def __init__(self, run: DesiredRun, clients: ClientFactory) -> None:
-        super().__init__(run, clients)
-        self._clients = clients
 
     @property
     def cluster(self) -> str:
@@ -490,7 +548,7 @@ class EmrEc2(Adapter):
         try:
             cluster = self.client.describe_cluster(ClusterId=self.cluster)["Cluster"]
             profile = str((cluster.get("Ec2InstanceAttributes") or {}).get("IamInstanceProfile"))
-            iam = self._clients("iam", self.run.region)
+            iam = self.clients("iam", self.run.region)
             found = iam.get_instance_profile(InstanceProfileName=profile.rsplit("/", 1)[-1])
             roles: Dict[str, List[str]] = {}
             for role in found["InstanceProfile"].get("Roles") or []:
@@ -526,8 +584,8 @@ class EmrEc2(Adapter):
         )
 
     def start(self, token: str) -> str:
-        r = self.run
         self._refuse_unless_attached()
+        r = self.checked()
         args = [
             "spark-submit",
             # Client mode: the driver is the step's own process, so cancelling the step
@@ -610,7 +668,7 @@ class EmrEks(Adapter):
         return self._info(out["jobRun"])
 
     def start(self, token: str) -> str:
-        r = self.run
+        r = self.checked()
         request: Dict[str, Any] = {
             "name": r.run_name,
             "virtualClusterId": self.cluster,

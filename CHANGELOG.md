@@ -72,6 +72,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table is refused beside a bucket-root output, a location forge registers with Lake Formation,
   and an output whose lifecycle expires its objects; a topic takes their place. The managed Flink
   lane refuses the block.
+- **A Spark run starts only on the job config `fluid apply` compiled.** Every runtime, local
+  included, now passes the config's digest at submit (`--fluid-job-sha256`: the sha256 of its
+  canonical JSON, strings in NFC as OpenTofu writes them, the MSK brokers OpenTofu fills in left
+  out so a broker change does not stop a stream's retries), and forge's Spark runner refuses any
+  other config before it reads anything. On AWS, `fluid apply` first reads the config and the
+  runner OpenTofu uploaded back from S3 and starts nothing unless they are the ones this apply
+  compiled, so a config another apply put there since never runs under the run's config hash.
+  The artifact bucket's write access stays the boundary. A scheduler's role already reads both
+  objects. The runner changed, so each running Spark stream restarts once on its next apply.
+
 - **A Glue table is partitioned as its binding declares.** `binding.location.partitionBy`
   never reached the Glue table the AWS emitter wrote, and `binding.properties.cluster_by` was
   read by nobody on AWS; both passed `fluid validate --strict`. On a Hive table (Parquet, ORC,
