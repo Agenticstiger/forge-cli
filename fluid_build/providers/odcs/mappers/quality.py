@@ -58,6 +58,7 @@ through a real contract resolver and a real DQ engine.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 from collections.abc import Mapping, MutableMapping
@@ -71,6 +72,8 @@ from .base import (
     get_metadata_passthrough,
     metadata_passthrough,
 )
+
+LOG = logging.getLogger(__name__)
 
 # ODCS v3.1.0 ``$defs.StableId``: "^[A-Za-z0-9_-]+$" — "Stable technical
 # identifier for references. Must be unique within its containing array."
@@ -286,6 +289,11 @@ def _declared_quality_to_odcs(ctx: ExportCtx) -> None:
         if not isinstance(contract, Mapping):
             continue
         _attach_declared_quality(ctx, obj, contract, str(obj.get("name")))
+
+    # Declared invariants, identifier formats, placeholders and shared attributes (0.7.7).
+    from . import data_rules
+
+    data_rules.export(ctx, schema_objects)
 
 
 def _attach_declared_quality(
@@ -641,7 +649,9 @@ def _expression_to_quality(expr: Mapping[str, Any]) -> Dict[str, Any]:
 # ----- FLUID → ODCS (property level, called from schema mapper) -----------
 
 
-def to_odcs_property(fld: Mapping[str, Any]) -> Optional[List[Dict[str, Any]]]:
+def to_odcs_property(
+    fld: Mapping[str, Any], dialect: Optional[str] = None
+) -> Optional[List[Dict[str, Any]]]:
     """Return the ``quality[]`` array for an ODCS SchemaProperty.
 
     If ``field.quality`` is set (a list), it is replayed **verbatim** — this is
@@ -704,7 +714,7 @@ def to_odcs_property(fld: Mapping[str, Any]) -> Optional[List[Dict[str, Any]]]:
             )
 
     for validation in _validation_rules(fld):
-        check = _validation_rule_to_quality(validation, name)
+        check = _validation_rule_to_quality(validation, name, _placeholders(fld), dialect)
         if check is not None:
             add(check, validation.get("type") or "validationRule")
 
@@ -748,8 +758,72 @@ def _legacy_validations(fld: Mapping[str, Any]) -> List[Mapping[str, Any]]:
     return [v for v in validations if isinstance(v, Mapping)]
 
 
+def _placeholders(fld: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
+    """The column's placeholder values and prefixes (``RFC-data-rules.md`` §4)."""
+    block = fld.get("placeholders")
+    if not isinstance(block, Mapping):
+        return [], []
+
+    def texts(key: str) -> List[str]:
+        raw = block.get(key)
+        return [v for v in raw if isinstance(v, str) and v] if isinstance(raw, list) else []
+
+    return texts("values"), texts("prefixes")
+
+
+def _exempt_pattern(pattern: str, values: List[str], prefixes: List[str]) -> str:
+    """``pattern`` that also accepts the placeholders: each value whole, each prefix followed
+    by anything. Top-level alternation, so the author's own groups keep their numbers."""
+    from fluid_build.data_rules._masks import literal_regex
+
+    parts = [pattern]
+    if values:
+        parts.append("^(" + "|".join(map(literal_regex, values)) + ")$")
+    if prefixes:
+        parts.append("^(" + "|".join(map(literal_regex, prefixes)) + ").*")
+    return "|".join(parts)
+
+
+def _enum_with_prefixes(
+    name: str, values: List[str], prefixes: List[str], message: Any, dialect: Optional[str]
+) -> Dict[str, Any]:
+    """An enum whose column has placeholder prefixes: ``validValues`` cannot hold a prefix,
+    so the rule counts the rows outside the list that are no placeholder, in ``dialect``."""
+    description = message or f"Field '{name}' must be one of: {write_enum_list(values)}"
+    if dialect is None:
+        LOG.warning(
+            "the enum rule on %r cannot exempt its placeholder prefixes without a SQL dialect "
+            "for the expose's platform; it is exported as a text rule",
+            name,
+        )
+        return {
+            "type": "text",
+            "dimension": "conformity",
+            "description": f"{description} (placeholders excepted: {', '.join(prefixes)}...)",
+        }
+    from fluid_build import fluid_sql as fs
+    from fluid_build.data_rules._compile import placeholder_sql
+
+    column = fs.sql_name(dialect, name)
+    listed = ", ".join(fs.sql_literal(dialect, v) for v in values) or "NULL"
+    exempt = placeholder_sql(dialect, column, [], prefixes)
+    return {
+        "type": "sql",
+        "query": (
+            f"SELECT COUNT(*) FROM ${{table}} WHERE {column} IS NOT NULL "
+            f"AND NOT COALESCE({column} IN ({listed}), FALSE) AND NOT {exempt}"
+        ),
+        "mustBe": 0,
+        "dimension": "conformity",
+        "description": description,
+    }
+
+
 def _validation_rule_to_quality(
-    validation: Mapping[str, Any], name: str
+    validation: Mapping[str, Any],
+    name: str,
+    placeholders: Tuple[List[str], List[str]] = ([], []),
+    dialect: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """One ``field.validationRules`` entry as an ODCS quality rule.
 
@@ -769,12 +843,15 @@ def _validation_rule_to_quality(
     if not constraint:
         return None
 
+    exempt_values, exempt_prefixes = placeholders
     if val_type == "regex":
+        # A placeholder is exempt from the column's own value checks (RFC-data-rules.md 4).
+        pattern = _exempt_pattern(str(constraint), exempt_values, exempt_prefixes)
         return {
             "type": "library",
             "metric": "invalidValues",
             "mustBe": 0,
-            "arguments": {"pattern": constraint},
+            "arguments": {"pattern": pattern},
             "dimension": "conformity",
             "description": message or f"Field '{name}' must match pattern: {constraint}",
         }
@@ -782,11 +859,16 @@ def _validation_rule_to_quality(
         # The constraint is one string: values separated by commas, each a
         # quoted string as SQL writes one or plain text (RFC-data-rules.md 2.3).
         values = read_enum_list(constraint)
+        if exempt_prefixes:
+            return _enum_with_prefixes(
+                name, values + exempt_values, exempt_prefixes, message, dialect
+            )
+        valid = values + [v for v in exempt_values if v not in values]
         return {
             "type": "library",
             "metric": "invalidValues",
             "mustBe": 0,
-            "arguments": {"validValues": values},
+            "arguments": {"validValues": valid},
             "dimension": "conformity",
             "description": message or f"Field '{name}' must be one of: {write_enum_list(values)}",
         }

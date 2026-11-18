@@ -3,9 +3,9 @@
 
 """What the consumers do with the new fields in v1 of RFC-data-rules.md (Consumer impact matrix).
 
-This change ships the schema, the validator and FLUID SQL/1. The consumers that render the rules
-(the ODCS exporter's quality rules, the dbt bridge's ``fluid_rule`` test) are later steps, so here
-the contract is pinned for what each does today:
+The ODCS exporter's quality rules are pinned in ``tests/providers/odcs/test_odcs_data_rules.py``;
+the dbt bridge's ``fluid_rule`` test is a later step. Here the contract is pinned for what each
+consumer does today:
 
 * ODCS: the declarations round-trip through ``fluidExtras`` (FLUID -> ODCS -> FLUID loses no
   invariant, format, placeholder or shared attribute).

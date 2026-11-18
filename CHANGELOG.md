@@ -53,6 +53,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another build's DAG would otherwise run twice). `fluid validate` warns about an Airflow
   task's `buildStepRef`: no generated DAG runs one.
 
+- **Declared invariants become ODCS quality rules.** On a 0.7.7 contract, `fluid generate
+  standard --format odcs` now writes each `exposes[].contract.invariants[]` entry, each
+  identifier format and placeholder declaration, each `sharedColumns` entry and each member of a
+  `sharedAttribute` as an executable ODCS quality rule. A check, derived column, summary over
+  child rows, functional dependency (once per direction with `bothWays`) or shared attribute is a
+  `sql` rule on the schema object whose query returns the violating rows, or violating rows times
+  100 divided by covered rows with `unit: percent`, compared with the invariant's own operator and
+  unit. The query is printed from the parsed expression in the expose's platform dialect (DuckDB,
+  Snowflake, BigQuery, Databricks, PostgreSQL or Athena), names the rule's own object `${table}`
+  and a linked expose by its quoted binding location, and joins a link to the target rows whose
+  key occurs once, so a missing or ambiguous link reads as NULL and no row is counted twice. An
+  identifier format sets the property's `logicalTypeOptions.pattern` and adds an `invalidValues`
+  rule with `arguments.pattern`; bounded placeholders add a `sql` rule counting placeholder rows,
+  unbounded ones a `text` rule; a derived column gets `transformLogic` and
+  `transformSourceObjects` where it has none. A declaration with no exact SQL (a platform with no
+  dialect, a link to another platform, one `fluid validate` refuses) becomes a `text` rule that
+  says why, and a logged warning. Every generated rule carries `customProperties`
+  `{property: fluidGenerated, value: true}`; an import that restores the declarations from
+  `fluidExtras` drops those rules, so FLUID -> ODCS -> FLUID loses no declaration and a re-export
+  is unchanged. Placeholder values are now exempt from the existing `invalidValues` rules: they
+  join an enum's `validValues` and extend a regex rule's pattern, and an enum on a column with
+  placeholder prefixes becomes a `sql` rule. `RFC-data-rules.md` describes the mapping.
+
 ### Changed
 
 - **`fluid profile --bundle` writes `C` for every withheld group and cell of a histogram.** In
@@ -65,6 +88,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now says so: `Withheld, by the check (CL_CONF_STATUS code): A (small count) 3.` A new line
   counts the histogram cells withheld inside published groups. Every other statistic keeps the
   check's code, and a profile 0.32.0 wrote still reads.
+
 
 ### Fixed
 

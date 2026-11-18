@@ -258,6 +258,11 @@ def to_fluid(ctx: ImportCtx) -> None:
     _strip_from_passthrough(ctx.fluid)
     if not isinstance(extras, Mapping):
         return
+    # The declarations come back from the blob below, so the quality rules generated from
+    # them go: a re-export generates them again (RFC-data-rules.md, ODCS exporter).
+    from .data_rules import strip_imported
+
+    strip_imported(ctx.fluid)
 
     root = extras.get("root")
     if isinstance(root, Mapping):

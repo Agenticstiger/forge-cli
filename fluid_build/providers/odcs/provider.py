@@ -136,6 +136,8 @@ class OdcsProvider(BaseProvider):
                 "include_sla": self.include_sla,
                 "include_quality_checks": self.include_quality_checks,
                 "expose_id": expose_id,
+                # The rules about valid data read linked exposes, which the scope drops.
+                "whole_contract": src,
             },
         )
         for mapper in EXPORT_PIPELINE:
