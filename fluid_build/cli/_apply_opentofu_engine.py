@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import tempfile
 from contextlib import contextmanager, suppress
@@ -33,7 +34,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from fluid_build.cli.console import cprint, cprint_literal
-from fluid_build.iac import build_module, get_iac_plugin, runner
+from fluid_build.iac import build_module, get_iac_plugin, runner, target_identity
 from fluid_build.iac.backend import (
     STATE_BACKEND_ENV,
     backend_location,
@@ -599,6 +600,10 @@ def _plan_with_opentofu(
             "plan_tofu_show_failed",
             {"error": f"`tofu show -json {_WORKDIR_PLAN}` failed in {eng.workdir}"},
         )
+    target = _target_record(eng)
+    cprint_literal(f"  target:      {target_identity.describe(eng.provider, target['identity'])}")
+    for field_name, why in sorted(target["unread"].items()):
+        cprint_literal(f"               {field_name} not bound: {why}")
     stem = out.name[: -len(".json")] if out.name.endswith(".json") else out.name
     names = {
         "planFile": f"{stem}.tfplan",
@@ -624,7 +629,140 @@ def _plan_with_opentofu(
         **_state_version(eng),
         "changes": changes,
         "imports": sorted(block.to for block in adopted),
+        "target": target,
     }
+
+
+#: Where ``tofu init`` writes the providers it selected, in the workdir.
+_LOCK_FILE = ".terraform.lock.hcl"
+
+#: ``provider "<source>" {`` then, inside the block, ``version = "<version>"``.
+_LOCKED_PROVIDER_RE = re.compile(r'provider\s+"([^"]+)"\s*\{[^}]*?\bversion\s*=\s*"([^"]+)"', re.S)
+
+
+def _locked_providers(workdir: str) -> Dict[str, str]:
+    """``{source: version}`` from the workdir's dependency lock; ``{}`` when there is none."""
+    try:
+        text = (Path(workdir) / _LOCK_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    return dict(sorted(_LOCKED_PROVIDER_RE.findall(text)))
+
+
+def _target_record(eng: _Engine) -> Dict[str, Any]:
+    """What a saved plan is bound to besides its state: the cloud target as the provider
+    reads it (:mod:`fluid_build.iac.target_identity`), the backend block, the ``tofu``
+    version and the provider versions ``tofu init`` locked. Read after ``tofu init``,
+    on the plan's runner and again on the apply's, with the run's own environment."""
+    from fluid_build.forge.core.plan_digest import sha256_bytes
+
+    try:
+        module = json.loads(eng.module)  # the emitted module: its provider block is static
+    except ValueError:
+        module = {}
+    identity, unread = target_identity.target_identity(eng.provider, module, eng.env)
+    version = runner.tofu_version()
+    backend = eng.target.backend
+    return {
+        "identity": identity,
+        "unread": unread,
+        "backend": (
+            sha256_bytes(json.dumps(backend, sort_keys=True, separators=(",", ":")).encode())
+            if backend
+            else ""
+        ),
+        "tofu": ".".join(str(part) for part in version) if version else "",
+        "providers": _locked_providers(eng.workdir),
+    }
+
+
+def _refuse_another_target(
+    eng: _Engine, args, logger: logging.Logger, record: Mapping[str, Any]
+) -> None:
+    """Refuse a saved plan applied to another target than it was made for, before anything
+    runs: the cloud account, project, region or host, the backend, ``tofu`` or a provider.
+
+    OpenTofu applies a saved plan on whatever account the apply's credentials belong to;
+    this reads the target again here and compares it with the plan's. A field the plan
+    recorded and this run cannot read fails closed; one the plan could not read is not
+    compared, and this says so. ``--no-verify-plan-binding`` skips it, logged."""
+    if getattr(args, "no_verify_plan_binding", False):
+        warn(
+            logger,
+            "apply_tofu_plan_target_unverified_by_flag",
+            message="--no-verify-plan-binding: the saved plan's target (account, region, "
+            "backend, tofu and provider versions) was NOT compared with this apply's",
+        )
+        return
+    recorded = record.get("target")
+    if not isinstance(recorded, Mapping):
+        raise _target_error(
+            "tofu-plan-target-missing",
+            "the saved plan records no target (account, region, backend, tofu and provider "
+            "versions), so the target it was reviewed for is unknown",
+            "Re-run `fluid plan --tofu` and apply that plan.",
+        )
+    now = _target_record(eng)
+    toolchain: List[str] = []
+    if recorded.get("tofu") != now["tofu"]:
+        toolchain.append(f"tofu {recorded.get('tofu') or '?'} -> {now['tofu'] or '?'}")
+    planned = recorded.get("providers") if isinstance(recorded.get("providers"), Mapping) else {}
+    for source in sorted(set(planned) | set(now["providers"])):
+        if planned.get(source) != now["providers"].get(source):
+            toolchain.append(
+                f"{source} {planned.get(source, 'none')} -> {now['providers'].get(source, 'none')}"
+            )
+    if toolchain:
+        raise _target_error(
+            "tofu-plan-toolchain",
+            "the saved plan was made with another OpenTofu or provider version: "
+            + "; ".join(toolchain),
+            "Apply with the versions the plan was made with (the plan's dependency lock "
+            "and tofu), or re-run `fluid plan --tofu` here.",
+        )
+    if recorded.get("backend") != now["backend"]:
+        raise _target_error(
+            "tofu-plan-target",
+            "the saved plan was made for another state backend configuration than this " "apply's",
+            "Apply with the --state-backend (or FLUID_STATE_BACKEND) the plan was made "
+            "with, or re-run `fluid plan --tofu`.",
+        )
+    bound = recorded.get("identity") if isinstance(recorded.get("identity"), Mapping) else {}
+    changed, unverified = target_identity.compare(bound, now["identity"])
+    if changed:
+        raise _target_error(
+            "tofu-plan-target-mismatch",
+            f"the saved plan was made for {target_identity.describe(eng.provider, bound)}, "
+            f"but this apply's credentials and settings reach "
+            f"{target_identity.describe(eng.provider, now['identity'])} ("
+            + ", ".join(changed)
+            + " differ). OpenTofu would apply it there.",
+            "Apply with the credentials and region the plan was made for, or re-run "
+            "`fluid plan --tofu` for this target and review that plan.",
+        )
+    if unverified:
+        raise _target_error(
+            "tofu-plan-target-unverified",
+            "the saved plan is bound to "
+            + ", ".join(f"{k} {bound[k]}" for k in unverified)
+            + ", which this apply cannot read: "
+            + "; ".join(f"{k}: {now['unread'].get(k, 'not read')}" for k in unverified),
+            "Give this run what the plan's runner had (credentials, the SDK named above), "
+            "or pass --no-verify-plan-binding for an emergency apply (logged).",
+        )
+    unbound = sorted(set(now["identity"]) - set(bound))
+    if unbound:
+        cprint_literal(
+            "  ⚠️  target fields the plan could not read, so not compared: " + ", ".join(unbound)
+        )
+
+
+def _target_error(kind: str, error: str, remediation: str) -> CLIError:
+    return CLIError(
+        1,
+        "apply_plan_digest_" + kind.replace("-", "_"),
+        {"kind": kind, "error": error, "remediation": [remediation]},
+    )
 
 
 def _state_version(eng: _Engine) -> Dict[str, Any]:
@@ -730,6 +868,8 @@ def _apply_bound_plan(
     outside OpenTofu. OpenTofu itself refuses a plan whose state has changed since.
     """
     dry_run = bool(getattr(args, "dry_run", False))
+    # First: nothing (not even the state-key migration) runs against another target.
+    _refuse_another_target(eng, args, logger, record)
     if not dry_run:
         reconcile_state_key(eng.target, eng.provider, eng.env, logger, migrate=True)
     plan_path = Path(eng.workdir) / _WORKDIR_PLAN
@@ -799,11 +939,43 @@ def _refuse_stale_before_hooks(eng: _Engine, record: Mapping[str, Any]) -> None:
     if "stateSerial" not in record:
         return
     now = _state_version(eng)
+    if record.get("stateLineage") and now and not now["stateLineage"]:
+        raise _state_missing_error(eng, record)
     if now and (now["stateLineage"], now["stateSerial"]) != (
         record.get("stateLineage"),
         record.get("stateSerial"),
     ):
         raise _stale_plan_error(None)
+
+
+def _state_missing_error(eng: _Engine, record: Mapping[str, Any]) -> CLIError:
+    """The saved plan was made against a state this run does not have at all."""
+    local = not eng.target.backend
+    err = CLIError(
+        1,
+        "apply_plan_digest_tofu_plan_state_missing",
+        {
+            "kind": "tofu-plan-state-missing",
+            "error": f"the saved plan was made against existing state ({record.get('state')}), "
+            "and this run finds no state there"
+            + (
+                ": local state stays in the workspace that holds it, so a plan made on one "
+                "runner does not apply on another"
+                if local
+                else ""
+            )
+            + ". OpenTofu applied nothing.",
+        },
+    )
+    err.suggestions = [
+        (
+            "Apply in the workspace the plan was made in, or keep state in a backend both "
+            "runners reach (--state-backend s3://... or gcs://...)."
+            if local
+            else "Check the backend's credentials and key, or re-run `fluid plan --tofu`."
+        )
+    ]
+    return err
 
 
 def _saved_plan_stale(result: Any) -> bool:

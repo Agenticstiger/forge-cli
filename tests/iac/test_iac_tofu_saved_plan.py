@@ -35,7 +35,7 @@ from fluid_build.forge.core.plan_digest import (
     verify_plan_binding,
     verify_tofu_plan,
 )
-from fluid_build.iac import runner
+from fluid_build.iac import runner, target_identity
 
 pytestmark = [pytest.mark.unit, pytest.mark.provider]
 
@@ -257,6 +257,9 @@ class _StubPlugin:
     """Just enough of an IaC plugin for the engine: no imports, no hooks."""
 
     name = "aws"
+    # As the AWS plugin's: tofu, and the target read, see the AWS_* family.
+    credential_env_vars = ()
+    credential_env_prefixes = ("AWS_",)
 
     def discover_imports(self, contract, actions=()):
         return []
@@ -292,8 +295,14 @@ def offline_tofu(monkeypatch, tmp_path):
     monkeypatch.setattr(engine, "write_dependency_lock", lambda plugin, workdir: None)
     monkeypatch.setattr(engine, "credential_overlay", lambda plugin, env: {})
     monkeypatch.setattr(engine, "credential_report", lambda plugin, env: ([], []))
+    # The target the apply's credentials reach: one account, read without a network call.
+    monkeypatch.setenv("AWS_REGION", "eu-west-1")
+    monkeypatch.setattr(target_identity, "aws_caller_account", lambda env, region: (_ACCOUNT, ""))
     monkeypatch.chdir(tmp_path)
     return tmp_path
+
+
+_ACCOUNT = "111111111111"
 
 
 def _args(contract: str, **over: Any) -> argparse.Namespace:
@@ -526,3 +535,191 @@ class TestNoUnreviewedPlan:
         (plan_target, plan_module), (apply_target, apply_module) = emitted
         assert plan_target == apply_target
         assert plan_module == apply_module
+
+
+# ---------------------------------------------------------------------------
+# The saved plan applies on another runner, and only on the target it was made for
+# ---------------------------------------------------------------------------
+
+
+def _shared_backend(monkeypatch, state: Path) -> None:
+    """Both runners keep state in one place, as an s3:// or gcs:// backend would: OpenTofu's
+    ``local`` backend at an absolute path, so the proof runs offline."""
+    real = engine.resolve_state_target
+
+    def _resolve(args, contract, provider):
+        from dataclasses import replace
+
+        return replace(real(args, contract, provider), backend={"local": {"path": str(state)}})
+
+    monkeypatch.setattr(engine, "resolve_state_target", _resolve)
+
+
+def _copy_to(runner_dir: Path, plan: Path) -> Path:
+    """What a CI hand-off carries: plan.json and the saved plan it binds, nothing else."""
+    runner_dir.mkdir(parents=True)
+    record = json.loads(plan.read_text())[TOFU_PLAN_FIELD]
+    for name in (plan.name, record["planFile"]):
+        shutil.copy2(plan.parent / name, runner_dir / name)
+    return runner_dir / plan.name
+
+
+def _shared_inputs(state: Path) -> List[Any]:
+    doc = json.loads(state.read_text(encoding="utf-8"))
+    return [
+        inst["attributes"]["input"]["value"]
+        for res in doc.get("resources", [])
+        for inst in res.get("instances", [])
+    ]
+
+
+class TestAnotherRunner:
+    def test_the_record_names_the_target(self, offline_tofu):
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        target = json.loads(out.read_text())[TOFU_PLAN_FIELD]["target"]
+        assert target["identity"] == {"account": _ACCOUNT, "region": "eu-west-1"}
+        assert target["unread"] == {}
+        assert target["backend"] == ""  # local state
+        assert target["tofu"] == ".".join(str(p) for p in runner.tofu_version())
+
+    @pytest.mark.parametrize("existing", [False, True], ids=["greenfield", "brownfield"])
+    def test_a_plan_made_on_one_runner_applies_unchanged_on_another(
+        self, offline_tofu, monkeypatch, existing
+    ):
+        state = offline_tofu / "shared" / "terraform.tfstate"
+        state.parent.mkdir()
+        _shared_backend(monkeypatch, state)
+        runner_a = offline_tofu / "runner-a" / "checkout"
+        runner_a.mkdir(parents=True)
+        monkeypatch.chdir(runner_a)
+        if existing:
+            first = _plan(runner_a, {"id": "p1", "description": "v0"}, name="first.json")
+            assert engine.apply_via_opentofu(_args(str(first)), _LOG) == 0
+        out = _plan(runner_a, {"id": "p1", "description": "v1"})
+        # Runner B: another machine, another checkout path, only the hand-off files.
+        runner_b = offline_tofu / "runner-b" / "deep" / "other" / "checkout"
+        handed = _copy_to(runner_b, out)
+        monkeypatch.chdir(runner_b)
+        planned: List[str] = []
+        real_plan = runner.tofu_plan
+        monkeypatch.setattr(
+            runner, "tofu_plan", lambda *a, **k: planned.append("plan") or real_plan(*a, **k)
+        )
+        assert engine.apply_via_opentofu(_args(str(handed), allow_data_loss=existing), _LOG) == 0
+        assert planned == []  # applied unchanged: no plan of its own
+        assert _shared_inputs(state) == ["v1"]
+
+    def test_local_state_does_not_travel_and_says_so(self, offline_tofu, monkeypatch):
+        applied = _plan(offline_tofu, {"id": "p1", "description": "v0"}, name="first.json")
+        assert engine.apply_via_opentofu(_args(str(applied)), _LOG) == 0
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        handed = _copy_to(offline_tofu / "elsewhere", out)
+        monkeypatch.chdir(handed.parent)
+        with pytest.raises(CLIError) as refused:
+            engine.apply_via_opentofu(_args(str(handed)), _LOG)
+        assert refused.value.event == "apply_plan_digest_tofu_plan_state_missing"
+        assert "local state stays in the workspace" in refused.value.context["error"]
+        assert _state_inputs(offline_tofu) == ["v0"]
+
+
+class TestTargetBinding:
+    def _refused(self, out: Path, **over: Any) -> CLIError:
+        with pytest.raises(CLIError) as refused:
+            engine.apply_via_opentofu(_args(str(out), **over), _LOG)
+        return refused.value
+
+    def _nothing_ran(self, monkeypatch) -> List[str]:
+        ran: List[str] = []
+        for name in ("reconcile_state_key", "_enforce_access", "_prepare_destroys"):
+            monkeypatch.setattr(engine, name, lambda *a, _n=name, **k: ran.append(_n))
+        monkeypatch.setattr(runner, "tofu_apply", lambda *a, **k: ran.append("tofu apply"))
+        return ran
+
+    def test_another_account_is_refused_before_anything_runs(self, offline_tofu, monkeypatch):
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        monkeypatch.setattr(
+            target_identity, "aws_caller_account", lambda env, region: ("222222222222", "")
+        )
+        ran = self._nothing_ran(monkeypatch)
+        refused = self._refused(out)
+        assert refused.event == "apply_plan_digest_tofu_plan_target_mismatch"
+        assert "111111111111" in refused.context["error"]
+        assert "222222222222" in refused.context["error"]
+        assert ran == []
+        assert _state_inputs(offline_tofu) == []
+
+    def test_another_region_is_refused(self, offline_tofu, monkeypatch):
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        refused = self._refused(out)
+        assert refused.event == "apply_plan_digest_tofu_plan_target_mismatch"
+        assert "region" in refused.context["error"]
+
+    def test_an_account_this_run_cannot_read_fails_closed(self, offline_tofu, monkeypatch):
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        monkeypatch.setattr(
+            target_identity, "aws_caller_account", lambda env, region: ("", "no credentials")
+        )
+        refused = self._refused(out)
+        assert refused.event == "apply_plan_digest_tofu_plan_target_unverified"
+        assert "no credentials" in refused.context["error"]
+
+    def test_another_tofu_version_is_refused_before_tofu_sees_it(self, offline_tofu, monkeypatch):
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        real = runner.tofu_version()
+        monkeypatch.setattr(runner, "tofu_version", lambda: (real[0], real[1], real[2] + 1))
+        refused = self._refused(out)
+        assert refused.event == "apply_plan_digest_tofu_plan_toolchain"
+
+    def test_another_provider_version_is_refused(self, offline_tofu, monkeypatch):
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        monkeypatch.setattr(
+            engine, "_locked_providers", lambda workdir: {"registry.opentofu.org/x/y": "9.9.9"}
+        )
+        refused = self._refused(out)
+        assert refused.event == "apply_plan_digest_tofu_plan_toolchain"
+        assert "registry.opentofu.org/x/y none -> 9.9.9" in refused.context["error"]
+
+    def test_another_backend_configuration_is_refused(self, offline_tofu):
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        plan = json.loads(out.read_text())
+        plan[TOFU_PLAN_FIELD]["target"]["backend"] = sha256_bytes(b"another backend")
+        plan.pop("planDigest")
+        out.write_text(json.dumps(inject_digests(plan, force=True)))
+        assert self._refused(out).event == "apply_plan_digest_tofu_plan_target"
+
+    def test_a_plan_without_a_target_is_refused(self, offline_tofu):
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        plan = json.loads(out.read_text())
+        plan[TOFU_PLAN_FIELD].pop("target")
+        plan.pop("planDigest")
+        out.write_text(json.dumps(inject_digests(plan, force=True)))
+        assert self._refused(out).event == "apply_plan_digest_tofu_plan_target_missing"
+
+    def test_an_edited_target_is_plan_tamper(self, offline_tofu):
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        plan = json.loads(out.read_text())
+        plan[TOFU_PLAN_FIELD]["target"]["identity"]["account"] = "222222222222"
+        out.write_text(json.dumps(plan))
+        assert self._refused(out).event == "apply_plan_digest_plan_tamper"
+
+    def test_a_field_the_plan_could_not_read_is_not_compared(self, offline_tofu, monkeypatch):
+        monkeypatch.setattr(
+            target_identity, "aws_caller_account", lambda env, region: ("", "boto3 missing")
+        )
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        record = json.loads(out.read_text())[TOFU_PLAN_FIELD]["target"]
+        assert record["unread"] == {"account": "boto3 missing"}
+        monkeypatch.setattr(
+            target_identity, "aws_caller_account", lambda env, region: ("3" * 12, "")
+        )
+        assert engine.apply_via_opentofu(_args(str(out)), _LOG) == 0
+
+    def test_the_escape_hatch_skips_it_loudly(self, offline_tofu, monkeypatch, caplog):
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        monkeypatch.setattr(
+            target_identity, "aws_caller_account", lambda env, region: ("222222222222", "")
+        )
+        caplog.set_level(logging.WARNING)
+        assert engine.apply_via_opentofu(_args(str(out), no_verify_plan_binding=True), _LOG) == 0
+        assert "apply_tofu_plan_target_unverified_by_flag" in caplog.text

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A saved OpenTofu plan applies on another runner, and only on the target it was made for.**
+  `fluid plan --tofu` now records the plan's target in its `opentofuPlan` record (under
+  `planDigest`): the cloud account and region (AWS, from STS `GetCallerIdentity` and the provider's
+  region), the project and region (GCP, in the `hashicorp/google` provider's order of precedence),
+  the organization and account (Snowflake) or the workspace host (Databricks), plus the state
+  backend block, the `tofu` version and the provider versions `tofu init` locked; it prints
+  `target: aws account …, region …`. `fluid apply plan.json` reads the target again before
+  anything runs, the state-key migration and the plugin's hooks included, and refuses another one
+  (`apply_plan_digest_tofu_plan_target_mismatch`), a recorded field it cannot read
+  (`…_target_unverified`), another `tofu` or provider version (`…_tofu_plan_toolchain`), another
+  backend configuration (`…_tofu_plan_target`) or a plan without the record
+  (`…_target_missing`). A field the plan's runner could not read (no boto3, say) is named at plan
+  time and not compared. `--no-verify-plan-binding` skips the check, logged. With a state backend
+  both runners reach, a plan made on one runner applies unchanged on another at another checkout
+  path; a plan made on local state that the applying runner does not have is refused as
+  `apply_plan_digest_tofu_plan_state_missing` instead of "stale".
+
 - **A BigQuery table is partitioned and clustered as its binding declares.**
   `binding.location.partitionBy` was read only with `lifecycle.expire`, and
   `binding.properties.cluster_by` (honoured on Snowflake) was read by nobody on BigQuery. Both

@@ -67,4 +67,7 @@ Ask, in the chat, before any of these, and say what each one risks:
 | `apply_plan_digest_packet_mismatch` | the bundle holds the planned contract in other bytes (rebuilt) | apply the bundle the plan was made from, or plan again |
 | `apply_plan_digest_packet_missing` | the plan records no packet digest (an older fluid made it) | plan again on the bundle |
 | `apply_plan_digest_plan_tamper` | the plan file was edited | plan again; never edit `plan.json` |
+| `apply_plan_digest_tofu_plan_target_mismatch` | the credentials or region reach another account, project or region than the plan's | use the plan's credentials and region, or plan again for this target |
+| `apply_plan_digest_tofu_plan_toolchain` | another OpenTofu or provider version than the plan's | apply with the plan's versions, or plan again here |
+| `apply_plan_digest_tofu_plan_state_missing` | the plan was made on state this runner does not have (local state) | apply where it was planned, or use a remote state backend |
 | data-loss refusal | the change would drop data | stop and ask the user |
