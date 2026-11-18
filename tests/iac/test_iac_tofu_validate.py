@@ -687,6 +687,99 @@ def _assert_tofu_validates(workdir, module: str) -> None:
     assert validate.returncode == 0, validate.stderr or validate.stdout
 
 
+def _bigquery_nested_contract(*, restricted: bool) -> dict:
+    """A 0.7.7 BigQuery table with an array of strings, a struct, an array of structs
+    and a map; ``restricted`` adds a policy tag, which makes the schema a raw
+    expression."""
+    schema = [
+        {"name": "id", "type": "string", "required": True},
+        {
+            "name": "tags",
+            "type": "array",
+            "required": True,
+            "element": {"type": "string", "required": True},
+        },
+        {
+            "name": "address",
+            "type": "struct",
+            "description": "postal ${address}",
+            "fields": [
+                {"name": "street", "type": "string", "description": "line %{ one }"},
+                {"name": "zip", "type": "string"},
+            ],
+        },
+        {
+            "name": "items",
+            "type": "array",
+            "required": True,
+            "element": {
+                "type": "struct",
+                "required": True,
+                "fields": [{"name": "sku", "type": "string"}, {"name": "qty", "type": "integer"}],
+            },
+        },
+        {
+            "name": "attrs",
+            "type": "map",
+            "required": True,
+            "key": {"type": "string", "required": True},
+            "value": {"type": "string"},
+        },
+    ]
+    exposure = {
+        "exposeId": "orders",
+        "binding": {
+            "platform": "gcp",
+            "format": "bigquery_table",
+            "location": {
+                "project": "demo-project",
+                "dataset": "sales",
+                "table": "orders",
+                "region": "europe-west1",
+            },
+            "principals": {
+                "group:platform@demo.example": "group:platform@demo.com",
+                "group:analysts@demo.example": "group:analysts@demo.com",
+            },
+        },
+        "contract": {"schema": schema},
+    }
+    contract = {"fluidVersion": "0.7.7", "id": "demo.gcp.nested", "exposes": [exposure]}
+    if restricted:
+        contract["accessPolicy"] = {
+            "grants": [
+                {"principal": "group:platform@demo.example", "permissions": ["read"]},
+                {"principal": "group:analysts@demo.example", "permissions": ["read"]},
+            ]
+        }
+        exposure["policy"] = {
+            "authz": {
+                "columnRestrictions": [
+                    {
+                        "principal": "group:analysts@demo.example",
+                        "columns": ["tags"],
+                        "access": "deny",
+                    }
+                ]
+            }
+        }
+    return contract
+
+
+@pytest.mark.skipif(_TOFU is None, reason="tofu binary not installed")
+@pytest.mark.parametrize("restricted", [False, True], ids=["plain-schema", "policy-tagged-schema"])
+def test_bigquery_nested_columns_pass_tofu_validate(restricted, tmp_path):
+    """REPEATED and RECORD fields are accepted by the real provider schema, as a plain
+    JSON string and as the raw expression a policy tag needs."""
+    module = build_module(IAC_PLUGINS["gcp"], _bigquery_nested_contract(restricted=restricted))
+    document = json.loads(module)
+    [table] = document["resource"]["google_bigquery_table"].values()
+    assert ("google_data_catalog_policy_tag" in document["resource"]) == restricted
+    for mode in ('"REPEATED"', '"RECORD"'):
+        assert mode in table["schema"]
+    _assert_tofu_validates(tmp_path, module)
+
+
 def _lf_bucket_policy_contract(bucket_policy, packaging):
     """A same-account and a cross-account LF grantee on one bucket."""
     lake_formation = {
