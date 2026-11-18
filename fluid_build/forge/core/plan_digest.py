@@ -20,6 +20,13 @@ digest fields emitted into ``plan.json``:
 with a message pointing at the specific divergence ("bundle swap" vs
 "plan tamper").
 
+A plan made from a bundle that packs dbt projects also carries
+``dbtProjects``: each build's project files and their merkle root, read from
+the bundle's MANIFEST (:func:`dbt_projects_record`). It is part of the plan
+body, so ``planDigest`` binds the tree, and :func:`verify_plan_binding`
+refuses a record that is not the bundle's. ``fluid apply`` then compares the
+checkout with it before anything runs (``cli/apply.py``).
+
 Two design decisions baked into the digest algorithm:
 
 1. Sort keys + compact JSON separators when hashing. Deterministic across
@@ -301,6 +308,28 @@ def is_bundle_path(path: str) -> bool:
     return lowered.endswith(".tgz") or lowered.endswith(".tar.gz")
 
 
+#: The ``plan.json`` field that binds the dbt projects a bundle packs. Not masked
+#: out of ``planDigest``.
+DBT_PROJECTS_FIELD = "dbtProjects"
+
+
+def dbt_projects_record(bundle_path: Path) -> Dict[str, Any]:
+    """``{build id: {"digest": <merkle root>, "files": {path: sha256:<hex>}}}`` for a plan.
+
+    The dbt projects the bundle at ``bundle_path`` packs
+    (:func:`~fluid_build.forge.core.bundle.read_bundle_dbt_trees`), paths relative
+    to each project; ``{}`` when it packs none. The caller has verified the
+    bundle's MANIFEST.
+    """
+    from fluid_build.forge.core.bundle import merkle_root, read_bundle_dbt_trees
+
+    trees = read_bundle_dbt_trees(bundle_path)
+    return {
+        build_id: {"digest": merkle_root(files), "files": dict(sorted(files.items()))}
+        for build_id, files in sorted(trees.items())
+    }
+
+
 def inject_digests(
     plan: Dict[str, Any],
     *,
@@ -344,6 +373,14 @@ def inject_digests(
         )
     out = dict(plan)
     out["bundleDigest"] = read_bundle_digest(bundle_path) if bundle_path else ""
+    # The dbt projects the bundle packs, bound under planDigest. Read after
+    # ``read_bundle_digest`` has verified the MANIFEST; only a bundle binds them,
+    # so a raw plan carries no record.
+    record = dbt_projects_record(bundle_path) if bundle_path else {}
+    if record:
+        out[DBT_PROJECTS_FIELD] = record
+    else:
+        out.pop(DBT_PROJECTS_FIELD, None)
     # bindingMode (J6): make the raw-vs-bound decision explicit and
     # tamper-evident. It is NOT a digest field, so it IS folded into
     # planDigest below — an attacker who blanks ``bundleDigest`` to skip
@@ -368,7 +405,10 @@ class PlanBindingError(ValueError):
 
     - ``"bundle-mismatch"`` — plan's ``bundleDigest`` disagrees with the
       bundle on disk. Either the bundle was swapped after plan ran, or the
-      contract was re-bundled without re-running plan.
+      contract was re-bundled without re-running plan. Also raised when the
+      plan's ``dbtProjects`` are not the bundle's, and by ``fluid apply`` when
+      the checkout's dbt project of a build differs from the copy the bundle
+      packs (a model edited after ``fluid bundle``).
     - ``"bundle-missing"``  — plan carries a non-empty ``bundleDigest`` but
       no bundle was supplied to verify against. Fails closed rather than
       silently skipping the bundle half of the binding.
@@ -428,6 +468,11 @@ def verify_plan_binding(
        stored value. Mismatch → raise ``PlanBindingError("plan-tamper",
        ...)``. Missing or empty ``planDigest`` in the plan is treated as
        a tamper signal — legitimate plans always carry one.
+
+    3. A bound plan's ``dbtProjects`` must be the record of the dbt projects the
+       bundle packs (none when it packs none), else ``"bundle-mismatch"``; a raw
+       plan carrying one is a ``"binding-mode-mismatch"``. The checkout itself is
+       compared by ``fluid apply`` (it needs the project on disk).
 
     Called from ``cli/apply.py`` before any provider DDL.
     """
@@ -508,6 +553,31 @@ def verify_plan_binding(
             f"plan (emergency hotfix only; logged prominently).",
         )
 
+    # 3. The dbt projects, after the tamper check so an edited record reports
+    #    plan-tamper.
+    _verify_dbt_projects_record(plan, bundle_path if expected_bundle else None)
+
+
+def _verify_dbt_projects_record(plan: Dict[str, Any], bundle_path: Optional[Path]) -> None:
+    """A bound plan's ``dbtProjects`` is the record of its bundle's; a raw plan has none."""
+    recorded = plan.get(DBT_PROJECTS_FIELD) or {}
+    if bundle_path is None:
+        if recorded:
+            raise PlanBindingError(
+                "binding-mode-mismatch",
+                "plan.json is a raw plan (no bundleDigest) but carries dbtProjects; only a "
+                "plan made from a bundle binds dbt projects. Re-run ``fluid plan``.",
+            )
+        return
+    bundled = dbt_projects_record(bundle_path)
+    if recorded != bundled:
+        raise PlanBindingError(
+            "bundle-mismatch",
+            f"plan.json binds the dbt projects of builds {sorted(recorded)} but {bundle_path} "
+            f"packs {sorted(bundled)}, or other files for them. Re-run ``fluid plan`` "
+            f"against the current bundle before applying.",
+        )
+
 
 # ---------------------------------------------------------------------------
 # The saved OpenTofu plan (``fluid plan --tofu``)
@@ -577,8 +647,10 @@ def verify_tofu_plan(record: Mapping[str, Any], data: Optional[bytes]) -> None:
 
 
 __all__ = [
+    "DBT_PROJECTS_FIELD",
     "PlanBindingError",
     "TOFU_PLAN_FIELD",
+    "dbt_projects_record",
     "coerce_keys_to_str",
     "compute_contract_digest",
     "compute_plan_digest",
