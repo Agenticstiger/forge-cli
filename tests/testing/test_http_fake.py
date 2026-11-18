@@ -517,10 +517,9 @@ def _client_context(certificate: Tuple[Path, Path]) -> ssl.SSLContext:
 
 
 def test_a_client_side_context_is_refused_when_the_server_is_built():
-    unverified = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    unverified.check_hostname = False  # still a client context
-    unverified.verify_mode = ssl.CERT_NONE
-    for context in (ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT), unverified):
+    no_host_check = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    no_host_check.check_hostname = False  # still a client context
+    for context in (ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT), no_host_check):
         with pytest.raises(ValueError, match="server-side"):
             FakeHttpServer(ssl_context=context)
 
