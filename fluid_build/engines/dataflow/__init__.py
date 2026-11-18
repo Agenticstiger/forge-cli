@@ -59,24 +59,34 @@ def _generate_pipeline(
     *,
     transformation_intent: Optional[TransformationIntent] = None,
 ) -> str:
-    """Generate an Apache Beam pipeline script."""
+    """Generate an Apache Beam pipeline script; contract values reach it only as data."""
+    # Imported here: ``providers.common`` brings asyncio and ssl, which
+    # registering the engine does not need.
+    from fluid_build.providers.common.codegen_utils import (
+        escape_for_docstring,
+        py_comment_text,
+        py_str_literal,
+    )
+
     exposes = get_exposes(contract)
     expose_id = get_expose_id(exposes[0]) if exposes else "output"
     columns = _build_column_list(exposes)
     props = build.get("properties", {})
 
     # Use embedded SQL from build properties if available (embedded-logic pattern)
-    embedded_sql = props.get("sql", "")
+    embedded_sql = str(props.get("sql") or "")
 
     col_comments = ""
     if columns:
-        col_comments = "\n".join(f"#   - {c['name']} ({c['type']})" for c in columns)
+        col_comments = "\n".join(
+            f"#   - {py_comment_text(c['name'])} ({py_comment_text(c['type'])})" for c in columns
+        )
         col_comments = f"# Target columns:\n{col_comments}\n"
 
     lines = [
         _HEADER,
         '"""',
-        f"Apache Beam pipeline for '{expose_id}'.",
+        f"Apache Beam pipeline for '{escape_for_docstring(expose_id)}'.",
         "",
         "Run locally:",
         "    python pipeline.py --runner DirectRunner",
@@ -105,21 +115,20 @@ def _generate_pipeline(
         lines.append(col_comments)
         lines.append("OUTPUT_SCHEMA = {")
         for c in columns:
-            lines.append(f'    "{c["name"]}": "{c["type"]}",')
+            lines.append(f"    {py_str_literal(c['name'])}: {py_str_literal(c['type'])},")
         lines.append("}\n\n")
 
     # Transform DoFn
     lines.append("# ── Transform functions ───────────────────────────────────────────\n")
     lines.append("class TransformFn(beam.DoFn):")
-    lines.append(f'    """Transform input records for \'{expose_id}\'."""\n')
+    lines.append(f'    """Transform input records for \'{escape_for_docstring(expose_id)}\'."""\n')
     lines.append("    def process(self, element):")
     lines.append("        # TODO: Implement transformation logic")
     if columns:
         lines.append("        yield {")
         for c in columns:
-            lines.append(
-                f'            "{c["name"]}": element.get("{c["name"]}"),  # TODO: transform'
-            )
+            name = py_str_literal(c["name"])
+            lines.append(f"            {name}: element.get({name}),  # TODO: transform")
         lines.append("        }")
     else:
         lines.append("        yield element")
@@ -128,7 +137,7 @@ def _generate_pipeline(
     if embedded_sql:
         lines.append("# Embedded SQL from contract build properties (for reference):")
         for sql_line in embedded_sql.split("\n")[:20]:
-            lines.append(f"# {sql_line}")
+            lines.append(f"# {py_comment_text(sql_line)}")
         if embedded_sql.count("\n") > 20:
             lines.append("# ... (truncated)")
         lines.append("\n")
@@ -145,7 +154,7 @@ def _generate_pipeline(
     lines.append("    )")
     lines.append("    parser.add_argument(")
     lines.append('        "--output",')
-    lines.append(f'        default="gs://my-bucket/output/{expose_id}",')
+    lines.append(f"        default={py_str_literal(f'gs://my-bucket/output/{expose_id}')},")
     lines.append('        help="Output location (GCS path or BigQuery table)",')
     lines.append("    )")
     lines.append("    known_args, pipeline_args = parser.parse_known_args(argv)\n")

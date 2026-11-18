@@ -150,6 +150,46 @@ def py_str_literal(value: Any) -> str:
     return repr("" if value is None else str(value))
 
 
+#: Every control character and Unicode line separator. Python ends a comment
+#: (and a physical line) at LF, CR LF or a bare CR; the rest are kept out of
+#: generated source too, since a NUL makes the file unparseable.
+_CONTROL_OR_LINE_BREAK = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def py_comment_text(value: Any) -> str:
+    """Return ``value`` as one line of text for a ``#`` comment in generated source.
+
+    A comment ends at a CR as well as at an LF, so a value holding either would
+    end the comment and start a statement that runs when the file is imported.
+    datamodel-code-generator's comment escaping handled LF but not CR
+    (CVE-2026-54621). Every control character and line separator becomes a
+    space here; anything else is kept as written, so ``orders`` stays ``orders``.
+    """
+    return _CONTROL_OR_LINE_BREAK.sub(" ", "" if value is None else str(value))
+
+
+def unique_identifiers(names: Iterable[Any]) -> List[str]:
+    """One distinct Python identifier per name, in order.
+
+    Each name goes through :func:`sanitize_identifier`, which is not
+    injective, and a collision takes a ``_2``, ``_3``... suffix, as
+    :func:`unique_task_identifiers` does for task ids. Stages named ``a-b``
+    and ``a.b`` become ``stage_a_b`` and ``stage_a_b_2``, so neither generated
+    function replaces the other.
+    """
+    used: set = set()
+    identifiers: List[str] = []
+    for name in names:
+        base = sanitize_identifier(name)
+        candidate, suffix = base, 2
+        while candidate in used:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        used.add(candidate)
+        identifiers.append(candidate)
+    return identifiers
+
+
 def convert_schedule_to_cron(schedule: str) -> str:
     """
     Convert FLUID schedule notation to cron expression.
@@ -327,9 +367,11 @@ def escape_for_docstring(value: Any) -> str:
     blank rather than the literal text ``None``) — matching ``py_str_literal``'s
     ``None`` handling so the two codegen escapers behave consistently. This is
     the single source of truth shared by every provider's DAG-header builder
-    (the snowflake provider's former local copy delegated here).
+    (the snowflake provider's former local copy delegated here). A NUL becomes
+    the escape ``\\x00``: Python refuses a source file that holds one.
     """
-    return ("" if value is None else str(value)).replace("\\", "\\\\").replace('"', '\\"')
+    text = "" if value is None else str(value)
+    return text.replace("\\", "\\\\").replace('"', '\\"').replace("\x00", "\\x00")
 
 
 def generate_file_header(contract_id: str, contract_name: str, provider: str, **kwargs: Any) -> str:
@@ -391,6 +433,9 @@ def escape_sql_for_python(sql: str) -> str:
     escaped = escaped.replace('"', '\\"')
     # Escape triple quotes if present
     escaped = escaped.replace('"""', '\\"\\"\\""')
+    # A CR would reach the generated value as LF (Python reads a bare CR as a
+    # line end), and Python refuses a source file that holds a NUL.
+    escaped = escaped.replace("\r", "\\r").replace("\x00", "\\x00")
 
     return escaped
 
