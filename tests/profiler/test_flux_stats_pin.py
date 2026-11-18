@@ -36,9 +36,10 @@ def test_the_requirement_is_a_range_of_released_versions():
     requirement = Requirement(_stats.FLUX_STATS_REQUIREMENT)
     assert requirement.url is None  # PyPI refuses a URL in Requires-Dist
     assert requirement.marker is None  # flux-stats supports Python 3.10, the floor here
-    assert requirement.specifier.contains("0.6.0")
+    assert requirement.specifier.contains("0.6.2")
     assert requirement.specifier.contains("0.6.9")
     assert not requirement.specifier.contains("0.0.1")  # the placeholder holds no code
+    assert not requirement.specifier.contains("0.6.1")  # no flux_stats.fidelity for --bundle
     assert not requirement.specifier.contains("0.7.0")  # a 0.x minor may rename what is imported
 
 

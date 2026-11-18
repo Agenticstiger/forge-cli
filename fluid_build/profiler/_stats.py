@@ -441,7 +441,8 @@ class _FluxStatsBackend:
                 from flux_stats.spelling import render_exact
             except ImportError:
                 raise StatisticsUnavailable(
-                    "--bundle needs a flux-stats release that carries flux_stats.fidelity"
+                    "--bundle reads the fidelity block with flux_stats.fidelity, which the "
+                    f"installed flux-stats lacks. It needs {FLUX_STATS_REQUIREMENT}"
                 ) from None
             self._grammar = SimpleNamespace(
                 fidelity=fidelity,
@@ -609,7 +610,7 @@ def load_backend() -> StatisticsBackend:
 #: The flux-stats range ``[profile]`` names in ``pyproject.toml``. The CLI cannot read
 #: that file once installed, so the install message repeats it;
 #: ``tests/profiler/test_flux_stats_pin.py`` keeps the two equal.
-FLUX_STATS_REQUIREMENT = "flux-stats>=0.6.0,<0.7"
+FLUX_STATS_REQUIREMENT = "flux-stats>=0.6.2,<0.7"
 #: The extra carries the range, and pip replaces a copy outside it (the 0.0.1
 #: placeholder, or a release newer than this module knows).
 FLUX_STATS_INSTALL_COMMAND = "pip install 'data-product-forge[profile]'"

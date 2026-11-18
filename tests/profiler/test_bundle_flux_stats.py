@@ -501,7 +501,9 @@ def test_a_flux_stats_without_the_grammar_refuses_before_reading(tmp_path, monke
     out = " ".join(capsys.readouterr().out.split())
     assert rc == 1
     assert "profile_statistics_unavailable" in out
-    assert "needs a flux-stats release that carries flux_stats.fidelity" in out
+    assert "reads the fidelity block with flux_stats.fidelity, which the installed" in out
+    assert "flux-stats lacks. It needs flux-stats>=0.6.2,<0.7" in out
+    assert "next: pip install 'data-product-forge[profile]'" in out
 
 
 def test_a_block_written_with_bare_null_keys_and_bare_floats_profiles_as_the_quoted_one(tmp_path):

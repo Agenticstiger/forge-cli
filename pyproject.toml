@@ -404,15 +404,16 @@ lineage = [
 # does. It is standard-library only and supports Python 3.10, so it needs no
 # marker.
 #
-# flux-stats comes from PyPI. 0.6.0 is the first release that holds the record
-# reader the profiler uses (PyPI's 0.0.1 is a placeholder with no code). It is
+# flux-stats comes from PyPI. 0.6.2 is the first release that holds both the
+# record reader the profiler uses and the fidelity-block grammar --bundle reads
+# (flux_stats.fidelity); PyPI's 0.0.1 is a placeholder with no code. It is
 # versioned 0.x, where a minor release may change the names
 # fluid_build/profiler/_stats.py imports, so the range stops at the next minor.
 # That module repeats the requirement in its install message, and
 # tests/profiler/test_flux_stats_pin.py keeps the two equal.
 profile = [
   "duckdb>=1.5.0",
-  "flux-stats>=0.6.0,<0.7",
+  "flux-stats>=0.6.2,<0.7",
 ]
 
 # AI + MCP together: restores the pre-0.28.0 base behaviour (the
