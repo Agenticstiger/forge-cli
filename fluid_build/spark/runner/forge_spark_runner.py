@@ -14,7 +14,9 @@ credential).
 
 - streaming: Kafka -> decode (JSON, or Confluent Avro through ABRiS) -> the source
   query -> watermark -> the select -> append to the Iceberg table, with the config's
-  checkpoint and trigger.
+  checkpoint and trigger. With ``deadLetter``, a record that does not decode or lacks a
+  required field (the config's ``sql.check``) leaves the stream for a dead-letter table or
+  topic, in a second query over the same decoded records.
 - batch: the contract's own SELECT over catalog tables -> overwrite the partitions it
   computes. A topic is landed by a stream (``availableNow`` for a scheduled run), never
   by a batch read, which sees only what Kafka still retains.
@@ -45,6 +47,23 @@ import urllib.request
 CONFIG_VERSION = 1
 SOURCE_TABLE = "source_events"
 RECORDS_TABLE = "kafka_records"
+#: The decoded records with their raw bytes, which ``sql.check`` reads (dead letters).
+DECODED_TABLE = "kafka_records_decoded"
+RAW_VALUE, RAW_KEY, ERROR_COLUMN = "fluid_raw_value", "fluid_raw_key", "fluid_error"
+#: A dead letter's row, from the checked records.
+DEAD_LETTER_SELECT = (
+    f"`{ERROR_COLUMN}` AS `error`",
+    f"`{RAW_VALUE}` AS `raw_value`",
+    f"`{RAW_KEY}` AS `raw_key`",
+    "`topic` AS `kafka_topic`",
+    "`partition` AS `kafka_partition`",
+    "`offset` AS `kafka_offset`",
+    "`timestamp` AS `kafka_timestamp`",
+    "current_timestamp() AS `dead_lettered_at`",
+)
+#: Snapshot summary keys that make a dead-letter table append happen once per batch.
+_DL_CHECKPOINT_PROPERTY = "fluid.dead-letter.checkpoint"
+_DL_BATCH_PROPERTY = "fluid.dead-letter.batch"
 GLUE_CATALOG_IMPL = "org.apache.iceberg.aws.glue.GlueCatalog"
 S3_FILE_IO = "org.apache.iceberg.aws.s3.S3FileIO"
 #: Session settings the generated SQL relies on.
@@ -99,12 +118,29 @@ def parse_config(text: str) -> dict:
     sink = config["sink"]
     if not isinstance(sink, dict) or sink.get("type") not in ("glue", "rest"):
         raise JobConfigError("the sink must be a glue or rest catalog table")
-    create = sink.get("create") or []
+    _check_create(sink.get("create"), "sink")
+    dead = config.get("deadLetter")
+    if dead is not None:
+        if config["mode"] != "streaming" or not (config["sql"] or {}).get("check"):
+            raise JobConfigError("deadLetter is a stream's, with the sql.check query")
+        if dead.get("sink") == "table" and not dead.get("table"):
+            raise JobConfigError("a deadLetter table sink names its table")
+        if dead.get("sink") == "topic" and not dead.get("topic"):
+            raise JobConfigError("a deadLetter topic sink names its topic")
+        if dead.get("sink") not in ("table", "topic") or not dead.get("checkpoint"):
+            raise JobConfigError("deadLetter needs a table or topic sink and a checkpoint")
+        if not isinstance(dead.get("maxRecordsBeforeAbort"), int):
+            raise JobConfigError("deadLetter.maxRecordsBeforeAbort must be a whole number")
+        _check_create(dead.get("create"), "deadLetter")
+    return config
+
+
+def _check_create(create, where: str) -> None:
+    create = create or []
     if not isinstance(create, list) or not all(
         isinstance(s, str) and s.startswith(_CREATE_PREFIXES) for s in create
     ):
-        raise JobConfigError("sink.create holds CREATE ... IF NOT EXISTS statements only")
-    return config
+        raise JobConfigError(f"{where}.create holds CREATE ... IF NOT EXISTS statements only")
 
 
 def resolve_secret(ref: str) -> str:
@@ -147,6 +183,22 @@ def fetch_reader_schema(registry: dict, subject: str, version: object) -> str:
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise JobConfigError(f"the schema registry answered {code} with a redirect; refused")
+
+
+def with_decoded_mark(schema: str, mark) -> str:
+    """The reader schema with ``mark``, a boolean defaulting to true, appended to its
+    fields: schema resolution fills the default in for every record it decodes, so a
+    record that reads it as null is one the permissive handler replaced."""
+    if not mark:
+        return schema
+    parsed = json.loads(schema)
+    if not isinstance(parsed, dict) or parsed.get("type") != "record":
+        raise JobConfigError("dead letters read an Avro value that is a record")
+    fields = parsed.get("fields") or []
+    if any(f.get("name") == mark for f in fields if isinstance(f, dict)):
+        raise JobConfigError(f"the registry's schema already has a field named {mark}")
+    parsed["fields"] = [*fields, {"name": mark, "type": ["boolean", "null"], "default": True}]
+    return json.dumps(parsed)
 
 
 def registry_conf(registry: dict) -> dict:
@@ -276,8 +328,11 @@ def _derive_glue_catalog(spark, sink: dict, prefix: str) -> None:
 
 def create_sink_table(spark, config: dict) -> None:
     """Run the sink's own statements (``CREATE ... IF NOT EXISTS``, compiled by forge-cli)
-    before the job writes: on a local run nothing else creates the table."""
+    before the job writes: on a local run nothing else creates the table, nor the dead
+    letters' one."""
     for statement in config["sink"].get("create") or []:
+        spark.sql(statement)
+    for statement in (config.get("deadLetter") or {}).get("create") or []:
         spark.sql(statement)
 
 
@@ -330,6 +385,11 @@ def decode(spark, source: dict, column: str):
     if spec is None or spec["format"] == "raw":
         return col(column)
     if spec["format"] == "json":
+        if spec.get("corruptRecord"):
+            # Dead letters: a record that is not JSON, or holds a field of another type,
+            # decodes to nulls with its text in the corrupt-record field, for sql.check.
+            options = {"mode": "PERMISSIVE", "columnNameOfCorruptRecord": spec["corruptRecord"]}
+            return from_json(col(column).cast("string"), spec["schema"], options)
         # FAILFAST: a record that is not JSON, or holds a field of another type, fails
         # the batch instead of landing as nulls.
         return from_json(col(column).cast("string"), spec["schema"], {"mode": "FAILFAST"})
@@ -339,9 +399,19 @@ def decode(spark, source: dict, column: str):
     jvm = spark.sparkContext._jvm
     abris = (
         jvm.za.co.absa.abris.config.AbrisConfig.fromConfluentAvro()
-        .provideReaderSchema(fetch_reader_schema(registry, spec["subject"], spec["version"]))
+        .provideReaderSchema(
+            with_decoded_mark(
+                fetch_reader_schema(registry, spec["subject"], spec["version"]),
+                spec.get("decodedMark"),
+            )
+        )
         .usingSchemaRegistry(jvm.PythonUtils.toScalaMap(registry_conf(registry)))
     )
+    if spec.get("decodedMark"):
+        # Dead letters: a record ABRiS cannot read becomes a row of nulls, decoded mark
+        # included, for sql.check (ABRiS 6.4.0 PermissiveRecordExceptionHandler).
+        handler = jvm.za.co.absa.abris.avro.errors.PermissiveRecordExceptionHandler()
+        abris = abris.withExceptionHandler(handler)
     return Column(
         jvm.za.co.absa.abris.avro.functions.from_avro(_to_java_column(col(column)), abris)
     )
@@ -349,11 +419,20 @@ def decode(spark, source: dict, column: str):
 
 def read_records(spark, config: dict):
     """``kafka_records``: the Kafka source's columns, ``value`` and ``key`` decoded."""
+    from pyspark.sql.functions import col
+
     source = config["source"]
     if source.get("kind") != "kafka":
         raise JobConfigError("the source must be kafka")
     raw = spark.readStream.format("kafka").options(**kafka_options(source)).load()
+    # With dead letters, the bytes travel beside the decoded value and key.
+    kept = (
+        [col("value").alias(RAW_VALUE), col("key").alias(RAW_KEY)]
+        if config.get("deadLetter")
+        else []
+    )
     columns = [
+        *kept,
         decode(spark, source, "value").alias("value"),
         decode(spark, source, "key").alias("key"),
         "topic",
@@ -375,10 +454,19 @@ def read_records(spark, config: dict):
 
 
 def build_output(spark, config: dict):
-    """The output rows: the generated queries, run over the decoded records."""
+    """The output rows: the generated queries, run over the decoded records; with dead
+    letters, over those ``sql.check`` passes (:func:`dead_letters` takes the rest)."""
     queries = config["sql"]
     if config.get("source"):
-        read_records(spark, config).createOrReplaceTempView(RECORDS_TABLE)
+        records = read_records(spark, config)
+        if config.get("deadLetter"):
+            records.createOrReplaceTempView(DECODED_TABLE)
+            checked = spark.sql(queries["check"])
+            checked.createOrReplaceTempView("fluid_checked_records")
+            records = checked.where(f"`{ERROR_COLUMN}` IS NULL").drop(
+                ERROR_COLUMN, RAW_VALUE, RAW_KEY
+            )
+        records.createOrReplaceTempView(RECORDS_TABLE)
         events = spark.sql(queries["source"])
         watermark = config.get("watermark")
         if watermark:
@@ -425,8 +513,151 @@ def run(spark, config: dict) -> None:
         writer = writer.trigger(processingTime=trigger["processingTime"])
     query = writer.toTable(table)
     log("streaming", table=table, id=str(query.id))
-    query.awaitTermination()
+    queries = [query]
+    if config.get("deadLetter"):
+        queries.append(start_dead_letters(spark, config, trigger))
+    await_queries(spark, queries)
     log("done", table=table)
+
+
+def await_queries(spark, queries) -> None:
+    """Wait for every query; when one fails, stop the others and raise its error (an
+    availableNow run ends when all have ended)."""
+    try:
+        while any(q.isActive for q in queries):
+            spark.streams.awaitAnyTermination()
+            spark.streams.resetTerminated()
+    except BaseException:
+        for q in queries:
+            if q.isActive:
+                q.stop()
+        raise
+
+
+class DeadLetterAbort(RuntimeError):
+    """More dead letters than ``maxRecordsBeforeAbort`` since the stream started."""
+
+
+class DeadLetters:
+    """The dead letters' ``foreachBatch``: land each micro-batch's in its sink, count them,
+    and fail the stream past the threshold, once that batch has landed."""
+
+    def __init__(self, spark, config: dict) -> None:
+        self.spark, self.config = spark, config
+        self.spec = config["deadLetter"]
+        self.total = 0
+        self.checkpoint_id = hashlib.sha256(self.spec["checkpoint"].encode()).hexdigest()[:16]
+
+    def __call__(self, batch, batch_id: int) -> None:
+        batch = batch.persist()
+        try:
+            count = batch.count()
+            if count:
+                if self.spec["sink"] == "table":
+                    self.to_table(batch, batch_id)
+                else:
+                    self.to_topic(batch)
+                self.total += count
+                log("dead_letters", batch=batch_id, records=count, total=self.total)
+                if "schema_violation" in (self.spec.get("alertOn") or []):
+                    log("dead_letter_alert", reason="schema_violation", records=count)
+        finally:
+            batch.unpersist()
+        cap = self.spec["maxRecordsBeforeAbort"]
+        if self.total > cap:
+            raise DeadLetterAbort(
+                f"{self.total} records went to the dead letters since the stream started, "
+                f"past maxRecordsBeforeAbort {cap}; the stream is stopped"
+            )
+
+    def to_table(self, batch, batch_id: int) -> None:
+        """Append the batch once: a batch replayed after a failure finds its own snapshot,
+        which carries this query's checkpoint and the batch id (as Iceberg's streaming
+        sink skips an epoch it already committed)."""
+        from pyspark.sql.functions import col
+
+        table = f"{self.config['sink']['catalog']}.{self.spec['table']}"
+        summary = col("summary")
+        done = (
+            self.spark.table(f"{table}.snapshots")
+            .where(
+                (summary[_DL_CHECKPOINT_PROPERTY] == self.checkpoint_id)
+                & (summary[_DL_BATCH_PROPERTY] == str(int(batch_id)))
+            )
+            .limit(1)
+            .collect()
+        )
+        if done:
+            return
+        (
+            batch.writeTo(table)
+            .option(f"snapshot-property.{_DL_CHECKPOINT_PROPERTY}", self.checkpoint_id)
+            .option(f"snapshot-property.{_DL_BATCH_PROPERTY}", str(int(batch_id)))
+            .option("check-nullability", "false")
+            .append()
+        )
+
+    def to_topic(self, batch) -> None:
+        """Send the batch, at least once, with Kafka Connect's error-context headers."""
+        from pyspark.sql.functions import array, col, lit, struct, when
+
+        def header(name, value):
+            return struct(
+                lit(name).alias("key"), value.cast("string").cast("binary").alias("value")
+            )
+
+        stage = (
+            when(col("error").startswith("the value"), lit("VALUE_CONVERTER"))
+            .when(col("error").startswith("the key"), lit("KEY_CONVERTER"))
+            .otherwise(lit("TRANSFORMATION"))
+        )
+        connector = f"{self.config['product']}/{self.config['build']}"
+        headers = array(
+            header("__connect.errors.topic", col("kafka_topic")),
+            header("__connect.errors.partition", col("kafka_partition")),
+            header("__connect.errors.offset", col("kafka_offset")),
+            header("__connect.errors.connector.name", lit(connector)),
+            header("__connect.errors.stage", stage),
+            header("__connect.errors.exception.message", col("error")),
+        )
+        options = {
+            k: v for k, v in kafka_options(self.config["source"]).items() if k.startswith("kafka.")
+        }
+        (
+            batch.select(
+                col("raw_key").alias("key"),
+                col("raw_value").alias("value"),
+                headers.alias("headers"),
+            )
+            .write.format("kafka")
+            .options(**options)
+            .option("topic", self.spec["topic"])
+            .save()
+        )
+
+
+def start_dead_letters(spark, config: dict, trigger: dict):
+    """The dead letters' own query: the checked records ``sql.check`` refused, with their
+    own checkpoint inside the stream's and the stream's trigger."""
+    spec = config["deadLetter"]
+    rows = spark.table("fluid_checked_records").where(f"`{ERROR_COLUMN}` IS NOT NULL")
+    select = list(DEAD_LETTER_SELECT)
+    if spec.get("raw") is False:
+        # The build masks fields at ingest: a raw record would hold them in clear.
+        select[1:3] = ["CAST(NULL AS BINARY) AS `raw_value`", "CAST(NULL AS BINARY) AS `raw_key`"]
+    writer = (
+        rows.selectExpr(*select)
+        .writeStream.foreachBatch(DeadLetters(spark, config))
+        .option("checkpointLocation", spec["checkpoint"])
+    )
+    if trigger.get("availableNow"):
+        writer = writer.trigger(availableNow=True)
+    elif trigger.get("processingTime"):
+        writer = writer.trigger(processingTime=trigger["processingTime"])
+    query = writer.start()
+    target = spec.get("table") or spec.get("topic")
+    log("dead_letters_streaming", sink=spec["sink"], to=target, id=str(query.id))
+    return query
 
 
 def read_text(spark, path: str) -> str:

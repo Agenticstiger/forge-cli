@@ -324,6 +324,14 @@ class TestStreamFields:
             ("checkpoint", "s3://my-bucket"),
             ("startingOffsets", "earliest"),
             ("startingOffsets", "latest"),
+            ("deadLetter", {}),
+            ("deadLetter", {"enabled": False}),
+            ("deadLetter", {"sink": "table", "table": "orders_rejects"}),
+            (
+                "deadLetter",
+                {"sink": "topic", "topic": "orders.dlq", "alertOn": ["schema_violation"]},
+            ),
+            ("deadLetter", {"maxRecordsBeforeAbort": 0}),
         ],
     )
     def test_accepted(self, manager, name, value):
@@ -351,6 +359,14 @@ class TestStreamFields:
             ("checkpoint", "/local/path"),
             ("startingOffsets", "none"),
             ("startingOffsets", {"orders": {"0": 23}}),
+            ("deadLetter", {"sink": "topic"}),
+            ("deadLetter", {"sink": "topic", "topic": "t", "table": "x"}),
+            ("deadLetter", {"topic": "orders.dlq"}),
+            ("deadLetter", {"sink": "queue"}),
+            ("deadLetter", {"table": "bad name"}),
+            ("deadLetter", {"maxRecordsBeforeAbort": -1}),
+            ("deadLetter", {"alertOn": ["destination_write_failed"]}),
+            ("deadLetter", {"retries": 3}),
         ],
     )
     def test_rejected(self, manager, name, value):

@@ -16,7 +16,8 @@ says everything the job does, so the runner holds no contract logic:
   the output rows from it, compiled from ``properties.mapping`` in the Spark dialect,
   or the contract's own ``properties.sql`` when the operator lists the build in
   :data:`CONTRACT_SQL_ALLOWLIST_ENV`;
-- the trigger, watermark and checkpoint of a streaming job;
+- the trigger, watermark and checkpoint of a streaming job, and where the records it cannot
+  land go (``properties.stream.deadLetter``, :mod:`fluid_build.spark.dead_letter`);
 - the sink: one Iceberg table in the Glue catalog, at the warehouse
   :func:`fluid_build.providers.aws.util.warehouse.get_iceberg_warehouse` derives; or, for
   ``runtime: local``, one table in an Iceberg REST catalog the operator's Spark
@@ -49,6 +50,7 @@ from fluid_build.providers._iceberg_catalog import (
 )
 from fluid_build.providers._sql_safety import validate_ident
 from fluid_build.providers.aws.util.warehouse import bucket_uses_fallback, normalize_location
+from fluid_build.spark import dead_letter
 from fluid_build.streaming.mapping import (
     bind_by_name,
     compile_select,
@@ -82,7 +84,7 @@ AWS_RUNTIMES = ("emr-serverless", "emr-ec2", "emr-eks", "glue")
 RUNTIMES = (*AWS_RUNTIMES, LOCAL_RUNTIME)
 MODES = ("streaming", "batch")
 #: The ``properties.stream`` keys only an engine reads; the rest describe the records.
-_ENGINE_KEYS = ("trigger", "watermark", "checkpoint", "startingOffsets", "registry")
+_ENGINE_KEYS = ("trigger", "watermark", "checkpoint", "startingOffsets", "registry", "deadLetter")
 _PRODUCT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _BUILD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _BROKER = r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,252}[A-Za-z0-9])?:[0-9]{1,5}"
@@ -441,21 +443,34 @@ def _registry(
     return result
 
 
-def _decoders(stream: Any, registry: Optional[Mapping[str, Any]]) -> dict[str, Any]:
-    """How the runner decodes ``value`` and ``key``, by the stream's formats."""
+def _decoders(
+    stream: Any, registry: Optional[Mapping[str, Any]], *, dead_letters: bool = False
+) -> dict[str, Any]:
+    """How the runner decodes ``value`` and ``key``, by the stream's formats. With dead
+    letters, a record that does not decode is kept, its error visible to the check query:
+    JSON into Spark's corrupt-record column, Avro as a row of nulls without the decoded
+    mark (ABRiS's permissive handler; :data:`dead_letter.DECODED_MARK`)."""
+    from fluid_build.spark.dead_letter import CORRUPT_COLUMN, DECODED_MARK
 
     def decoder(fmt: str, fields: Any, subject: Optional[str]) -> dict[str, Any]:
         if fmt == "json":
-            return {"format": "json", "schema": spark_schema(fields)}
+            if not dead_letters:
+                return {"format": "json", "schema": spark_schema(fields)}
+            return {
+                "format": "json",
+                "schema": f"{spark_schema(fields)}, `{CORRUPT_COLUMN}` STRING",
+                "corruptRecord": CORRUPT_COLUMN,
+            }
         if fmt == "avro-confluent":
             version = registry["version"] if subject == registry["subject"] else "latest"
-            return {
+            spec = {
                 "format": "avro-confluent",
                 "subject": subject,
                 "version": version,
                 # The runner checks the decoded record against the declared fields.
                 "schema": spark_schema(fields),
             }
+            return {**spec, "decodedMark": DECODED_MARK} if dead_letters else spec
         return {"format": "raw"}
 
     key = None
@@ -656,6 +671,8 @@ def compile_job_config(
 
     source: Optional[dict[str, Any]] = None
     source_sql: Optional[str] = None
+    dead_letters: Optional[dict[str, Any]] = None
+    check_sql: Optional[str] = None
     streaming: dict[str, Any] = {"trigger": None, "watermark": None, "checkpoint": None}
     masked: list[str] = []
     if stream_spec is not None:
@@ -682,6 +699,10 @@ def compile_job_config(
         offsets = stream_spec.get("startingOffsets", "latest")
         if offsets not in ("earliest", "latest"):
             raise ValueError(f"{swhere}.startingOffsets: expected earliest or latest")
+        dead = dead_letter.parse(stream_spec.get("deadLetter"), swhere)
+        if dead is not None:
+            _refuse_corrupt_column_name(stream, swhere)
+        decoders = _decoders(stream, registry, dead_letters=dead is not None)
         source = {
             "kind": "kafka",
             **kafka,
@@ -691,7 +712,7 @@ def compile_job_config(
             "registry": (
                 None if registry is None else {"url": registry["url"], "auth": registry["auth"]}
             ),
-            **_decoders(stream, registry),
+            **decoders,
         }
         source_sql = spark_source_select(stream, swhere)
         # The default is built from the warehouse bucket, which may be the IaC emitter's
@@ -711,6 +732,11 @@ def compile_job_config(
             "watermark": _watermark(stream_spec.get("watermark"), stream, swhere),
             "checkpoint": checkpoint.rstrip("/") + "/",
         }
+        if dead is not None:
+            dead_letters = _dead_letter_block(
+                dead, database, table, streaming["checkpoint"], local, swhere
+            )
+            check_sql = dead_letter.check_select(stream, decoders)
         if sql is None:
             select = compile_select(
                 stream,
@@ -763,7 +789,54 @@ def compile_job_config(
         # The secret's ARN, never its value: the runner reads the key with the job's role.
         "maskKey": {"secretArn": mask_key} if masked else None,
     }
+    if dead_letters is not None:
+        # A build that masks fields at ingest sends no raw bytes: they hold those in clear.
+        dead_letters["raw"] = not masked
+        # Only then: a stream without dead letters keeps the job config, and the hash, it had.
+        config["deadLetter"] = dead_letters
+        config["sql"]["check"] = check_sql
     return SparkJob(config)
+
+
+def _refuse_corrupt_column_name(stream: Any, where: str) -> None:
+    from fluid_build.spark.dead_letter import CORRUPT_COLUMN, DECODED_MARK
+
+    names = {name.casefold() for name, _ in stream.value}
+    names |= {name[len(stream.key_prefix) :].casefold() for name, _ in stream.key}
+    for reserved in (CORRUPT_COLUMN, DECODED_MARK):
+        if reserved in names:
+            raise ValueError(
+                f"{where}.deadLetter: the stream declares a field named {reserved}, which "
+                "the runner keeps a record's decoding outcome in; rename it"
+            )
+
+
+def _dead_letter_block(
+    dead: Mapping[str, Any],
+    database: str,
+    table: str,
+    checkpoint: str,
+    local: bool,
+    where: str,
+) -> dict[str, Any]:
+    """The job config's ``deadLetter``: the sink, the abort threshold, the alerts, and the
+    checkpoint of the dead letters' own query, inside the stream's."""
+    block: dict[str, Any] = {
+        "sink": dead["sink"],
+        "checkpoint": f"{checkpoint}dead-letter/",
+        "maxRecordsBeforeAbort": dead["maxRecordsBeforeAbort"],
+        "alertOn": dead["alertOn"],
+    }
+    if dead["sink"] == "topic":
+        block["topic"] = dead["topic"]
+        return block
+    name = dead["table"] or dead_letter.table_name(table)
+    if name.casefold() == table.casefold():
+        raise ValueError(f"{where}.deadLetter.table: the dead letters need a table of their own")
+    block["table"] = f"{database}.{validate_ident(name)}"
+    if local:
+        block["create"] = dead_letter.create_statements(CATALOG, database, name)
+    return block
 
 
 def validation_errors(contract: Mapping[str, Any]) -> list[str]:
