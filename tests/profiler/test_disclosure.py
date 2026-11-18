@@ -465,7 +465,7 @@ def test_a_quantile_whose_rounded_ranks_no_longer_prove_the_witness_is_withheld(
     ("k", "below", "at_or_below", "status", "side"),
     [
         # The records below the witness, holding it and above it: each none at an end of
-        # the column, or at least minimumCell (FLUX ADR 0011's three cells).
+        # the column, or at least minimumCell (FLUX ADR 0012's three cells).
         (120, 9, 30, "A", "below"),
         (120, 1, 30, "A", "below"),
         (120, 10, 30, "F", None),

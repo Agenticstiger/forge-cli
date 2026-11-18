@@ -36,7 +36,7 @@ threshold of units hold it. The profiler takes that reading: such a value is
 published only when at least ``minimumCell`` records hold exactly that value
 (founder decision, 2026-11-16). A quantile's two ranks are counts too, so the
 records below its witness and the records above it must each be none or at least
-``minimumCell`` (FLUX ADR 0011's three cells, founder decision 2026-11-18): a rank
+``minimumCell`` (FLUX ADR 0012's three cells, founder decision 2026-11-18): a rank
 of 3 would say that three records lie below the witness.
 
 A verdict names the check that fired with an SDMX ``CL_CONF_STATUS`` 1.4 code:
@@ -47,7 +47,7 @@ hold at most two values, and ``D`` for a group the sender withholds so that
 another cannot be recovered (secondary suppression, :func:`suppress_secondary`).
 A withheld value is written with that code and no value, except in a count table
 (:data:`COUNT_TABLES`, PROFILE-SPEC §3), whose withheld groups and cells are all
-written ``C``, whatever withheld them (:func:`written_status`, FLUX ADR 0011): a
+written ``C``, whatever withheld them (:func:`written_status`, FLUX ADR 0012): a
 code that named the check would tell a reader a range, ``A`` that a cell holds
 fewer than ``minimumCell`` records, and a total the reader knows can turn the
 range into the count. The profiler's summary still counts them by the check, as
@@ -173,7 +173,7 @@ def written_status(status: str, kind: str) -> str:
     *kind* is the declared property the value belongs to (``mean``, ``quantile``,
     ``marginalHistogram`` and so on). A value of a count table that any check
     withholds is written ``C``, so its status says nothing about its size (FLUX
-    ADR 0011, PROFILE-SPEC §3): ``A`` would say that a cell holds fewer than
+    ADR 0012, PROFILE-SPEC §3): ``A`` would say that a cell holds fewer than
     ``minimumCell`` records, and cells of 10, 9, 9 and 10 records written ``F``,
     ``A``, ``A``, ``F`` give both withheld cells as 9 to a reader who knows the
     total. Every other value keeps the code of the check that withheld it.
@@ -582,7 +582,7 @@ def check_quantile(
     2. the records below the witness, or above it, are fewer than ``minimumCell``
        and not none: on unrounded counts, the three cells the ranks state each
        hold none at an end of the column or at least ``minimumCell`` records
-       (FLUX ADR 0011's three cells), since a rank of 3 says that three records
+       (FLUX ADR 0012's three cells), since a rank of 3 says that three records
        lie below the witness, rounded or not;
     3. a rank is positive and rounds to zero (:func:`check_rounding`);
     4. the rounded ``k`` and ranks no longer prove the witness: *proves* is the

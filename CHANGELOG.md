@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   range: cells of 10, 9, 9 and 10 records written `F`, `A`, `A` and `F`, under a total the reader
   knows, give both withheld cells as 9. FLUX PROFILE-SPEC now asks a profiler to write `C`
   (withheld statistical information) for every withheld group and cell of a count table, whatever
-  withheld it (FLUX ADR 0011). The summary still counts each by the check that withheld it, and
+  withheld it (FLUX ADR 0012). The summary still counts each by the check that withheld it, and
   now says so: `Withheld, by the check (CL_CONF_STATUS code): A (small count) 3.` A new line
   counts the histogram cells withheld inside published groups. Every other statistic keeps the
   check's code, and a profile 0.32.0 wrote still reads.
@@ -49,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A `quantile/1` group was published when ten records held its witness, with its two ranks, so a
   rank could say that 3 records lie below the witness, or that 2 lie above it. A group is now
   published only when the records below its witness and those above it are each none or at least
-  `minimumCell`, on unrounded counts (the three cells of FLUX ADR 0011), and it is withheld with
+  `minimumCell`, on unrounded counts (the three cells of FLUX ADR 0012), and it is withheld with
   `A` otherwise. `fluid profile --help` names the rule.
 
 ## [0.32.0] — 2026-11-18
