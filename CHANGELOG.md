@@ -35,6 +35,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A long column type no longer holds up `fluid validate`.** The column `type` pattern of every
+  bundled schema backtracked on runs of spaces. `decimal(` followed by 2,000 spaces and no closing
+  bracket took 2.4 seconds to refuse, and the time grew with the cube of the length, so a contract
+  with 10 KB of type text kept every command that validates it busy for minutes. `int`, a long run
+  of spaces and any other character took time that grew with the square of the length. The
+  validator now runs an equivalent pattern in linear time: 100,000 spaces take milliseconds. It
+  matches exactly the values the shipped pattern matches, by an argument over the pattern's parts
+  that the tests check for every code point and every short string, and against millions of
+  generated values. The released schema files, 0.7.1 to 0.7.6, keep their bytes, as other projects
+  copy them unchanged; the 0.7.7 preview file now holds the linear pattern, and a cached copy of
+  its earlier text runs the linear one too. Error messages are unchanged.
+
 - **The Glue, Dataflow and Spark job generators keep contract values as data.** `fluid generate
   transformation` wrote column names and types, the expose id, the contract name, stage names and
   embedded SQL into the generated script between hand-written quotes. A value holding a quote, a
