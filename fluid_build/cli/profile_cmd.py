@@ -33,11 +33,15 @@ checks are ACRO 1.1.0's defaults, named "acro-default" in the document:
   - every published count is rounded to a multiple of 5;
   - a sum is withheld when 2 records make up 90% of it, or when what is left
     after the 2 largest is below 10% of the largest;
-  - a min, max or quantile is published only when 10 records hold that value;
+  - a min, max or quantile is published only when 10 records hold that value,
+    and a quantile only when at least 10 records lie below it and 10 above it;
   - a mean is published only when the column's count and sum are.
-A withheld value keeps its SDMX CL_CONF_STATUS code and no value: A (a small
-count), C (a sum over at most two values), O or T (dominated by one or two
-records), M (concentration) or D (secondary suppression).
+A withheld value keeps an SDMX CL_CONF_STATUS code and no value: A (a small
+count), O or T (dominated by one or two records), M (concentration), D
+(secondary suppression) or C (withheld). C marks a sum over at most two values,
+and every withheld group and cell of a histogram or a quantile, whatever
+withheld it, so their codes say nothing of a count's size. The summary counts
+each withheld value by the check that withheld it.
 
 For each number column the document also holds mean/1, the statistic the FLUX
 fidelity check compares a mean property with: the number of values and their
@@ -58,8 +62,10 @@ need the exact record count, which the output checks round.
 What the checks leave readable: a grouped statistic lists every group the data
 forms, published or withheld. A key is always a level the bundle declares (a
 value outside the declared support is refused), so its presence says only that
-the level holds at least one record. A withheld cell or group of a histogram or
-a quantile is not secondarily suppressed: the rounded counts still bound it,
+the level holds at least one record. A group withheld for its size withholds
+every group of its groupBy's histograms and quantiles on its column too, and a
+quantile is published only as the one histogram or quantile of its column. A withheld cell of
+a histogram is not secondarily suppressed: the rounded counts still bound it,
 inside 0 to 9 records, and never above the threshold.
 
 These are output-checking conventions only. No privacy or anonymity guarantee
@@ -77,8 +83,12 @@ fluid profile contract.fluid.yaml --expose orders \\
 
 # Only aggregates leave: a count under 10 or a zero is withheld, counts are rounded
 # to 5, a sum 2 records dominate is withheld, and a min, max or quantile is shown only
-# when 10 records hold it (ACRO 1.1.0 defaults). Output-checking conventions only: no
-# privacy or anonymity guarantee. Pin the printed digest in the FLUX Simulation.
+# when 10 records hold it (ACRO 1.1.0 defaults), a quantile only when at least 10
+# records lie below it and 10 above it, and only as its column's one histogram or
+# quantile. A group of fewer than 10 records withholds every group of its groupBy's
+# histograms and quantiles on its column. A histogram's or a quantile's withheld values all read C,
+# whatever withheld them. Output-checking conventions only: no privacy or anonymity
+# guarantee. Pin the printed digest in the FLUX Simulation.
 # Each number column also gets mean/1, which FLUX compares a mean property with, on the
 # grid --fractional-bits names (16 unless given): the fidelity block must declare it.
 
@@ -391,6 +401,23 @@ _CODE_MEANING = {
 }
 
 
+def _codes(counts: Dict[str, int]) -> str:
+    """``A (small count) 3, D (secondary suppression) 1``."""
+    return ", ".join(
+        f"{code} ({_CODE_MEANING.get(code, 'withheld')}) {count}" for code, count in counts.items()
+    )
+
+
+def _one_code_withheld(result: Any) -> bool:
+    """Whether a histogram or a quantile, whose withheld values all read C, has one."""
+    from fluid_build.profiler.disclosure import ONE_CODE
+
+    return any(
+        each[1].partition("/")[0] in ONE_CODE
+        for each in (*result.withheld_statistics, *result.partly_withheld_statistics)
+    )
+
+
 def _plural(count: int, word: str) -> str:
     return f"{count} {word}" + ("" if count == 1 else "s")
 
@@ -430,11 +457,16 @@ def _report(say: Any, result: Any, out: Path, *, answered_block: bool = False) -
         f"{_plural(result.published, 'value')} published, {sum(withheld.values())} withheld."
     )
     if withheld:
-        codes = ", ".join(
-            f"{code} ({_CODE_MEANING.get(code, 'withheld')}) {count}"
-            for code, count in withheld.items()
+        say(f"Withheld, by the check (CL_CONF_STATUS code): {_codes(withheld)}.")
+    cells: Dict[str, int] = dict(result.withheld_cells)
+    if cells:
+        say(f"Withheld histogram cells, by the check (CL_CONF_STATUS code): {_codes(cells)}.")
+    if cells or _one_code_withheld(result):
+        say(
+            "The document writes C for every withheld group and cell of a histogram or "
+            "a quantile, whatever withheld it, so its code says nothing of its size.",
+            soft_wrap=True,
         )
-        say(f"Withheld, by CL_CONF_STATUS code: {codes}.")
     named = _named(result.statistics)
     whole = _named(result.withheld_statistics)
     if named:

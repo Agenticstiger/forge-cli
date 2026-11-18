@@ -165,7 +165,26 @@ Examples:
     p.add_argument(
         "--quiet", "-q", action="store_true", default=False, help="Minimal output (errors only)"
     )
-    p.add_argument("--format", choices=["text", "json"], default="text", help="Output format")
+    p.add_argument(
+        "--format",
+        choices=["text", "json", "sarif"],
+        default="text",
+        help=(
+            "Output format. sarif writes a SARIF 2.1.0 log for code scanning, "
+            "each finding at its file, line and column (implies --diagnostics)"
+        ),
+    )
+    p.add_argument(
+        "--diagnostics",
+        action="store_true",
+        default=False,
+        help=(
+            "Report each finding at the file, line and column it was written, after "
+            "$ref fragments and the --env overlay are composed, with the related place "
+            "in the root contract. Text prints file:line:col: lines; --format json adds "
+            "a versioned 'diagnostics' block. One contract or fragment file at a time"
+        ),
+    )
 
     # Schema information
     p.add_argument(
@@ -248,10 +267,13 @@ def run(args, logger: logging.Logger) -> int:
 
         schema_manager = _self.FluidSchemaManager(cache_dir=args.cache_dir, logger=logger)
 
+        # --format sarif: stdout holds the SARIF log and nothing else.
+        _refuse_sarif_with_schema_listing(args)
+
         # Handle cache clearing
         if args.clear_cache:
             removed = schema_manager.clear_cache()
-            if not args.quiet:
+            if not args.quiet and args.format != "sarif":
                 cprint(f"Cleared {removed} cached schema files")
             log_metric(logger, "schemas_cleared", removed, unit="files")
 
@@ -310,11 +332,12 @@ def run(args, logger: logging.Logger) -> int:
 
         contract_lower = str(contract_path).lower()
         if contract_lower.endswith(".tgz") or contract_lower.endswith(".tar.gz"):
+            _refuse_diagnostics_scope(args, "a .tgz bundle")
             return _run_bundle_validation(contract_path, args, schema_manager, logger, start_time)
 
         # Load contract with overlay
         try:
-            contract, overlay_warnings, locate = _load_with_overlay_warnings(
+            contract, overlay_warnings, locate, origins = _load_with_overlay_warnings(
                 args.contract, getattr(args, "env", None), logger
             )
         except Exception as e:
@@ -378,7 +401,9 @@ def run(args, logger: logging.Logger) -> int:
 
         # Output results
         _print_quiet_overlay_warnings(args, overlay_warnings)
-        exit_code = _output_results(validation_result, args, logger)
+        exit_code = _output_results(
+            validation_result, args, logger, diagnostics=(contract, origins, contract.get("id"))
+        )
 
         # Log operation result
         if exit_code == 0:
@@ -402,6 +427,8 @@ def run(args, logger: logging.Logger) -> int:
     except CLIError as e:
         duration = time.time() - start_time
         log_operation_failure(logger, "validate_contract", error=e.event, duration=duration)
+        if getattr(args, "format", None) == "sarif":
+            return _sarif_failure(e, args)
 
         # Handle specific CLI errors with user-friendly messages. ``console_error``
         # prints its text literally, so no value needs escaping first. ``--quiet`` is
@@ -455,12 +482,15 @@ def run(args, logger: logging.Logger) -> int:
 
         return e.exit_code
     except Exception as e:
-        raise CLIError(1, "cli_unhandled_exception", {"error": str(e)})
+        error = CLIError(1, "cli_unhandled_exception", {"error": str(e)})
+        if getattr(args, "format", None) == "sarif":
+            return _sarif_failure(error, args)
+        raise error
 
 
 def _load_with_overlay_warnings(
     contract_path: str, env: Optional[str], logger: logging.Logger
-) -> tuple[dict, list[str], Optional[Callable[..., Optional[str]]]]:
+) -> tuple[dict, list[str], Optional[Callable[..., Optional[str]]], Any]:
     """Load a contract with its ``--env`` overlay, the overlay warnings to report,
     and where each part of it was written.
 
@@ -469,14 +499,17 @@ def _load_with_overlay_warnings(
     :func:`fluid_build.loader.collect_overlay_warnings` hands it to validate
     instead, so it is reported as a warning and ``--strict`` fails on it.
     :func:`fluid_build.loader.collect_origins` hands over the composition's
-    origins, so an error in a fragment or the overlay names that file and line.
+    origins, so an error in a fragment or the overlay names that file and line;
+    the last value is those origins themselves (``None`` when none were recorded),
+    which ``--diagnostics`` reads for the line and column of every finding.
     """
     from fluid_build.loader import collect_origins, collect_overlay_warnings
 
     with collect_overlay_warnings() as overlay_warnings, collect_origins() as origins:
         contract = load_contract_with_overlay(contract_path, env, logger)
-    locate = origins[-1].describe if origins else None
-    return contract, [warning.message for warning in overlay_warnings], locate
+    last = origins[-1] if origins else None
+    locate = last.describe if last is not None else None
+    return contract, [warning.message for warning in overlay_warnings], locate, last
 
 
 def _fragment_kind(args: Any) -> Optional[str]:
@@ -637,7 +670,8 @@ def _run_fragment_validation(
     wrapper = {"$schema": schema.get("$schema"), "$defs": defs, "$ref": pointer}
     if not schema_manager._validate_with_jsonschema(document, wrapper, result, locate):
         result.is_valid = False
-    return _output_results(result, args, logger)
+    # A fragment's own ``id`` (a dqRule's, an invariant's) names no product.
+    return _output_results(result, args, logger, diagnostics=(document, origins, None))
 
 
 def _nearest_contract(fragment: Path) -> Optional[Path]:
@@ -1873,13 +1907,164 @@ def _run_role_validators(
             logger.debug("validator info finding: %s", msg)
 
 
-def _output_results(result: ValidationResult, args, logger: logging.Logger) -> int:
-    """Output validation results in the requested format."""
+def _output_results(
+    result: ValidationResult,
+    args,
+    logger: logging.Logger,
+    *,
+    diagnostics: Optional[Tuple[Any, Any, Any]] = None,
+) -> int:
+    """Output validation results in the requested format.
 
+    ``diagnostics`` is the composed document, its origins
+    (:class:`fluid_build.contract_refs.ContractOrigins`) and the product id
+    (``None`` for a fragment), which ``--diagnostics`` and ``--format sarif``
+    read for where each finding was written and what it belongs to.
+    """
+    report = None
+    if _diagnostics_wanted(args):
+        from fluid_build.diagnostics.build import build_report
+
+        document, origins, product = diagnostics if diagnostics is not None else ({}, None, None)
+        report = build_report(
+            result,
+            document,
+            origins,
+            product=product if isinstance(product, str) else None,
+            environment=getattr(args, "env", None) or None,
+        )
+    if args.format == "sarif":
+        return _output_sarif_results(result, args, report)
     if args.format == "json":
-        return _output_json_results(result, args)
-    else:
-        return _output_text_results(result, args, logger)
+        return _output_json_results(result, args, report)
+    if report is not None:
+        return _output_diagnostics_text(result, args, report)
+    return _output_text_results(result, args, logger)
+
+
+def _diagnostics_wanted(args: Any) -> bool:
+    """``--diagnostics``, or ``--format sarif``, which is nothing but diagnostics."""
+    return getattr(args, "diagnostics", False) is True or getattr(args, "format", None) == "sarif"
+
+
+def _sarif_failure(error: CLIError, args: Any) -> int:
+    """stdout is the SARIF log: the failure goes into it, and the human text to stderr."""
+    console_error(f"Validation error: {error.event}")
+    _cli_error_sarif(error, args)
+    return error.exit_code
+
+
+def _refuse_sarif_with_schema_listing(args: Any) -> None:
+    """``--list-versions`` and ``--show-schema`` print text, which would end the SARIF log."""
+    flags = [
+        flag
+        for flag, on in (
+            ("--list-versions", getattr(args, "list_versions", False)),
+            ("--show-schema", getattr(args, "show_schema", False)),
+        )
+        if on
+    ]
+    if getattr(args, "format", None) == "sarif" and flags:
+        raise CLIError(
+            1,
+            "diagnostics_scope_unsupported",
+            {
+                "error": (
+                    f"--format sarif writes only the SARIF log: run {' and '.join(flags)} "
+                    "without it"
+                )
+            },
+        )
+
+
+def _refuse_diagnostics_scope(args: Any, what: str) -> None:
+    """Diagnostics name files, lines and columns of one composition: one contract or fragment."""
+    if _diagnostics_wanted(args):
+        flag = "--format sarif" if getattr(args, "format", None) == "sarif" else "--diagnostics"
+        raise CLIError(
+            1,
+            "diagnostics_scope_unsupported",
+            {
+                "error": (
+                    f"{flag} reports one contract file at a time, and this run validates "
+                    f"{what}: run fluid validate <contract.fluid.yaml> {flag} for each contract"
+                )
+            },
+        )
+
+
+def _exit_code(result: ValidationResult, args: Any) -> int:
+    """1 for an error, or a warning under ``--strict``; else 0."""
+    return 0 if result.is_valid and (not args.strict or not result.warnings) else 1
+
+
+def _output_sarif_results(result: ValidationResult, args: Any, report: Any) -> int:
+    """The findings as one SARIF 2.1.0 log on stdout; the exit code as for text."""
+    from fluid_build import __version__
+    from fluid_build.diagnostics.render import to_sarif
+
+    _cprint_json(json.dumps(to_sarif(report, version=__version__), indent=2))
+    return _exit_code(result, args)
+
+
+def _output_diagnostics_text(result: ValidationResult, args: Any, report: Any) -> int:
+    """``--diagnostics`` text: ``file:line:col: severity CODE: message``, then related places.
+
+    ``--quiet`` keeps errors only, and the summary goes, as for the plain text output.
+    """
+    from fluid_build.diagnostics.render import text_lines
+
+    if not args.quiet:
+        cprint(result.get_summary())
+        cprint()
+    severities = {"error"} if args.quiet else None
+    if args.quiet and args.strict:
+        severities = {"error", "warning"}
+    for line in text_lines(report, severities=severities):
+        _cprint_literal(line)
+    if not args.quiet and report.diagnostics:
+        cprint()
+    code = _exit_code(result, args)
+    if code and args.strict and result.warnings and not result.errors and not args.quiet:
+        cprint("❌ Validation failed: warnings treated as errors (--strict)")
+    return code
+
+
+def _cli_error_sarif(error: CLIError, args: Any) -> None:
+    """A run that ended before validating still writes a SARIF log, with that failure in it.
+
+    So a code-scanning upload step after ``fluid validate --format sarif`` always
+    has a document to read. The message is the first line of the error only: a
+    YAML parser appends the offending source line, a contract value, below it.
+    """
+    from fluid_build import __version__
+    from fluid_build._error_catalog import docs_url_for, fix_for, is_catalogued, slug_for
+    from fluid_build.diagnostics.build import redacted, shown_path
+    from fluid_build.diagnostics.model import Diagnostic, DiagnosticReport, SourceLocation
+    from fluid_build.diagnostics.render import to_sarif
+
+    detail = str((error.context or {}).get("error") or (error.context or {}).get("message") or "")
+    detail = detail.strip().splitlines()[0] if detail.strip() else ""
+    contract = getattr(args, "contract", None)
+    location = None
+    if contract:
+        location = SourceLocation(shown_path(Path(contract).resolve(), Path.cwd()))
+        # The log is uploaded: name the file as the location does, not by its absolute path.
+        for spelled in {str(Path(contract).resolve()), str(contract)}:
+            detail = detail.replace(spelled, location.file)
+    message = f"{error.event}: {detail}" if detail else error.event
+    advice = error.event if is_catalogued(error.event) else "contract_finding"
+    item = Diagnostic(
+        code=getattr(error, "error_slug", None) or slug_for(error.event),
+        severity="error",
+        message=redacted(message),
+        path="",
+        location=location,
+        environment=getattr(args, "env", None) or None,
+        fix=fix_for(advice) or None,
+        docs_url=docs_url_for(advice),
+    )
+    _cprint_json(json.dumps(to_sarif(DiagnosticReport((item,)), version=__version__), indent=2))
 
 
 def _cprint_json(payload: str) -> None:
@@ -1920,8 +2105,9 @@ def _cprint_literal(line: str) -> None:
     cprint_literal(line, soft_wrap=True, highlight=False)
 
 
-def _output_json_results(result: ValidationResult, args) -> int:
-    """Output results in JSON format."""
+def _output_json_results(result: ValidationResult, args, report: Any = None) -> int:
+    """Output results in JSON format; with ``report`` (``--diagnostics``), its
+    ``diagnostics`` block too, after everything the document always had."""
     import json
 
     output: Dict[str, Any] = {"valid": result.is_valid}
@@ -1947,9 +2133,11 @@ def _output_json_results(result: ValidationResult, args) -> int:
         # is one, so a clean contract keeps the document it always had.
         output["issues"] = issues
     output["validation_time"] = result.validation_time
+    if report is not None:
+        output["diagnostics"] = report.to_dict()
 
     _cprint_json(json.dumps(output, indent=2))
-    return 0 if result.is_valid and (not args.strict or not result.warnings) else 1
+    return _exit_code(result, args)
 
 
 def _output_text_results(result: ValidationResult, args, logger: logging.Logger) -> int:
@@ -2139,6 +2327,7 @@ def _try_workspace_validate(
     products = discover_workspace_products(ws_root)
     if not products:
         return None
+    _refuse_diagnostics_scope(args, "a workspace of products")
 
     ws = load_workspace_config(ws_root)
     ws_name = ws.name or ws_root.name
@@ -2152,7 +2341,7 @@ def _try_workspace_validate(
     failed = 0
     for product in products:
         try:
-            contract, overlay_warnings, locate = _load_with_overlay_warnings(
+            contract, overlay_warnings, locate, _ = _load_with_overlay_warnings(
                 str(product.contract_path), getattr(args, "env", None), logger
             )
             result = schema_manager.validate_contract(

@@ -46,6 +46,7 @@ from ..access import (
 from ..base import UnsupportedBindingError
 from ..credentials import GCP_ENV_PREFIXES
 from ..importer import ImportBlock
+from ..module import _escape_tofu_literals
 from ..naming import TofuExpr, safe_ident, tofu_ref
 from ..packaging import (
     ContainerDecision,
@@ -146,13 +147,17 @@ _BQ_MULTIWORD_TYPES = {
 
 
 def _bq_outcome(raw: Any) -> column_types.TypeOutcome:
-    """What ``raw`` becomes in a BigQuery table schema: exact, lossy or refused."""
+    """What ``raw`` becomes in a BigQuery table schema: exact, lossy or refused.
+
+    A structured type is judged here only when the column declares nothing more; one
+    that declares its fields, element, or key and value is :func:`_bq_nested_column`'s.
+    """
     base, rest = column_types.split_type(raw)
     if base in column_types.STRUCTURED:
         return column_types.refused(
-            "which BigQuery holds only as a REPEATED column of an element type or a RECORD "
-            "with fields, and this emitter does not write either yet",
-            column_types.NESTED_FIX,
+            "which BigQuery holds only with its element or field types, and none is declared "
+            "(fields, element, or key and value need contract 0.7.7 or later)",
+            column_types.NESTED_FIX_DECLARE,
         )
     # An enum's parameters are its levels, which may hold any character;
     # BigQuery stores the column as STRING and never reads them.
@@ -200,10 +205,221 @@ def _bq_type(raw: Any) -> str:
     return str(raw).upper() if raw else "STRING"
 
 
+#: BigQuery nests RECORD columns at most this deep ("A schema cannot contain more than
+#: 15 levels of nested RECORD types": BigQuery's "Specify nested and repeated columns").
+_BQ_MAX_RECORD_DEPTH = 15
+
+
+class _Unholdable(ValueError):
+    """A declared nested type BigQuery has no form for; the message names where."""
+
+    def __init__(self, why: str, fix: str) -> None:
+        super().__init__(why)
+        self.fix = fix
+
+
+def _bq_mode(required: Any) -> str:
+    return "REQUIRED" if required else "NULLABLE"
+
+
+def _bq_text(value: Any) -> Any:
+    """A column's ``name`` or ``description`` as schema text: a string (or ``None``).
+
+    The schema can be a raw expression (:func:`_bq_schema_with_policy_tags`), in
+    which every contract string is escaped but a mapping key is not. A contract that
+    skipped validation could write a mapping here whose key is an interpolation; as a
+    string it is escaped like any other text.
+    """
+    return value if value is None or isinstance(value, str) else str(value)
+
+
+def _bq_nested_column(
+    column: Mapping[str, Any],
+) -> Optional[Tuple[Optional[Dict[str, Any]], column_types.TypeOutcome]]:
+    """``(field, outcome)`` for a column that declares its nested types, else ``None``.
+
+    The shape is read by the parser the Glue emitter reads it with
+    (``streaming.types.parse_type``), so a nested declaration is accepted or refused
+    alike on both clouds. Each leaf is typed by :func:`_bq_outcome`, the table the
+    top-level columns use, so a nested ``datetime`` is a DATETIME as a top-level one
+    is. An array is a REPEATED field of its element's type, a struct a RECORD with its
+    ``fields``, and a map a REPEATED RECORD of a ``key`` and a ``value``: how BigQuery's
+    Avro load holds an Avro map, and how Apache Beam's ``BigQueryUtils`` and
+    kafka-connect-bigquery hold one. ``field`` is ``None`` when the outcome is refused.
+
+    What BigQuery holds differently is lossy, so ``fluid validate`` warns and
+    ``--strict`` fails until the contract declares what BigQuery holds: a NULL array
+    is stored as an empty one, an array holds no NULL element (BigQuery's "Data types"
+    page, ARRAY), and a map held as records does not keep its keys unique.
+    """
+    if column_types.split_type(column.get("type"))[0] not in column_types.STRUCTURED:
+        return None
+    if not {"fields", "element", "key", "value"} & column.keys():
+        return None
+    from fluid_build.streaming.types import parse_type
+
+    path = str(column.get("name"))
+    walk = _NestedFields()
+    try:
+        field = walk.field(
+            _bq_text(column.get("name")), column, parse_type(column, path=path), path, 0
+        )
+    except _Unholdable as exc:
+        return None, column_types.refused(
+            f"whose nested types BigQuery cannot hold ({exc})", exc.fix
+        )
+    except ValueError as exc:
+        return None, column_types.refused(
+            f"whose nested types BigQuery cannot hold ({exc})", column_types.NESTED_FIX
+        )
+    target = f"REPEATED {field['type']}" if field["mode"] == "REPEATED" else field["type"]
+    if not walk.losses:
+        return field, column_types.exact(target)
+    return field, column_types.lossy(
+        target,
+        "where " + "; and ".join(why for why, _fix in walk.losses),
+        " ".join(dict.fromkeys(fix for _why, fix in walk.losses)),
+    )
+
+
+class _NestedFields:
+    """The BigQuery fields of one nested column, part by part.
+
+    ``losses`` collects a ``(why, fix)`` for each part BigQuery holds differently, and
+    a part it cannot hold raises :class:`_Unholdable`. ``path`` names a part as the
+    shared parser does (``items.element.sku``); ``depth`` counts the RECORDs around it.
+    """
+
+    def __init__(self) -> None:
+        self.losses: List[Tuple[str, str]] = []
+
+    def field(
+        self, name: Any, spec: Mapping[str, Any], shape: Any, path: str, depth: int
+    ) -> Dict[str, Any]:
+        """The field ``name`` for ``spec``, whose parsed shape is ``shape``."""
+        if shape.kind == "array":
+            return self._array(name, spec, shape, path, depth)
+        if shape.kind in ("struct", "map"):
+            return self._record(name, spec, shape, path, depth)
+        return self._leaf(name, spec, shape, path)
+
+    def _array(
+        self, name: Any, spec: Mapping[str, Any], shape: Any, path: str, depth: int
+    ) -> Dict[str, Any]:
+        """A REPEATED field of the element's type. BigQuery has no array of arrays."""
+        element = shape.element
+        if element.kind in ("array", "map"):
+            held = "an array" if element.kind == "array" else "a map, held as an array of records"
+            raise _Unholdable(
+                f"{path}.element is {held}, and a BigQuery array cannot hold an array",
+                "Declare the element as a struct with one array field, or declare json.",
+            )
+        self._may_be_null(shape, path)
+        if not element.required:
+            self.losses.append(
+                (
+                    f"an element of {path} may be NULL, which BigQuery cannot hold in an array",
+                    f"Set required: true on {path}.element if no element is NULL.",
+                )
+            )
+        field = self.field(name, spec["element"], element, f"{path}.element", depth)
+        return {**field, "mode": "REPEATED", "description": _bq_text(spec.get("description", ""))}
+
+    def _record(
+        self, name: Any, spec: Mapping[str, Any], shape: Any, path: str, depth: int
+    ) -> Dict[str, Any]:
+        """A RECORD of a struct's fields, or a REPEATED one of a map's key and value."""
+        if depth + 1 > _BQ_MAX_RECORD_DEPTH:
+            raise _Unholdable(
+                f"{path} is a RECORD {depth + 1} levels deep, and BigQuery nests at most "
+                f"{_BQ_MAX_RECORD_DEPTH}",
+                f"Nest at most {_BQ_MAX_RECORD_DEPTH} levels of struct, or declare json.",
+            )
+        if shape.kind == "struct":
+            parts = [
+                (part, sub, sub_shape)
+                for sub, (part, sub_shape) in zip(spec["fields"], shape.fields, strict=True)
+            ]
+            mode = _bq_mode(shape.required)
+        else:
+            self.losses.append(
+                (
+                    f"{path} is a map, held as an array of key and value records whose keys "
+                    "BigQuery does not keep unique",
+                    f"Declare {path} as an array of structs with key and value fields to hold "
+                    "it so on purpose.",
+                )
+            )
+            self._may_be_null(shape, path)
+            parts = [("key", spec["key"], shape.key), ("value", spec["value"], shape.value)]
+            mode = "REPEATED"
+        return {
+            "name": name,
+            "type": "RECORD",
+            "mode": mode,
+            "description": _bq_text(spec.get("description", "")),
+            "fields": [
+                self.field(part, sub, sub_shape, f"{path}.{part}", depth + 1)
+                for part, sub, sub_shape in parts
+            ],
+        }
+
+    def _leaf(self, name: Any, spec: Mapping[str, Any], shape: Any, path: str) -> Dict[str, Any]:
+        """A scalar field, typed as a top-level column of its type is."""
+        declared = spec.get("type")
+        outcome = _bq_outcome(declared)
+        if outcome.status == column_types.REFUSED:
+            raise _Unholdable(f"{path} is declared {declared!r}, {outcome.why}", outcome.fix)
+        if outcome.status == column_types.LOSSY:
+            self.losses.append((f"{path} is declared {declared!r}, {outcome.why}", outcome.fix))
+        return {
+            "name": name,
+            "type": outcome.target,
+            "mode": _bq_mode(shape.required),
+            "description": _bq_text(spec.get("description", "")),
+        }
+
+    def _may_be_null(self, shape: Any, path: str) -> None:
+        """A REPEATED field that may be NULL: BigQuery stores a NULL array as an empty one."""
+        if not shape.required:
+            self.losses.append(
+                (
+                    f"{path} may be NULL, which BigQuery stores as an empty array",
+                    f"Set required: true on {path} if it is never NULL.",
+                )
+            )
+
+
+def _bq_column_outcome(column: Mapping[str, Any]) -> Optional[column_types.TypeOutcome]:
+    """The outcome of a column that declares its nested types; ``None`` for any other,
+    which :func:`_bq_outcome` judges by its type name."""
+    nested = _bq_nested_column(column)
+    return None if nested is None else nested[1]
+
+
+def _bq_field(column: Mapping[str, Any]) -> Dict[str, Any]:
+    """One column's BigQuery schema field, nested when it declares its nested types.
+
+    Total, for ``fluid verify`` and the governance checks: a column the emitter refuses
+    reads as its flat type here, and is refused where the module is emitted.
+    """
+    nested = _bq_nested_column(column)
+    if nested is not None and nested[0] is not None:
+        return nested[0]
+    return {
+        "name": _bq_text(column.get("name")),
+        "type": _bq_type(column.get("type")),
+        "mode": _bq_mode(column.get("required")),
+        "description": _bq_text(column.get("description", "")),
+    }
+
+
 def _bq_column_type_findings(
     expose: str, schema: Iterable[Any]
 ) -> Tuple[Optional[UnsupportedBindingError], List[str]]:
-    return column_types.column_type_findings(expose, schema, _bq_outcome, "BigQuery")
+    return column_types.column_type_findings(
+        expose, schema, _bq_outcome, "BigQuery", column_outcome=_bq_column_outcome
+    )
 
 
 def _refuse_bq_column_types(expose: str, schema: Iterable[Any]) -> None:
@@ -237,15 +453,7 @@ def validate_bigquery_column_types(contract: Mapping[str, Any]) -> Tuple[List[st
 
 def _bq_fields(schema: List[Mapping[str, Any]]) -> List[Dict[str, Any]]:
     """FLUID contract schema → BigQuery schema fields."""
-    return [
-        {
-            "name": col.get("name"),
-            "type": _bq_type(col.get("type")),
-            "mode": "REQUIRED" if col.get("required") else "NULLABLE",
-            "description": col.get("description", ""),
-        }
-        for col in schema or []
-    ]
+    return [_bq_field(col) for col in schema or []]
 
 
 def _bq_schema(schema: List[Mapping[str, Any]]) -> str:
@@ -267,12 +475,12 @@ def _bq_schema_with_policy_tags(
 
     The tag's name is only known at apply, so it is an interpolation inside the
     JSON string, and the string must reach OpenTofu unescaped. Every string that
-    came from the contract is escaped here instead, exactly as the renderer would
-    escape the whole value, so a column description still cannot inject one.
+    came from the contract is escaped here instead, by the renderer's own escape, so
+    a column description still cannot inject one, nor can a nested field's.
     """
     fields = []
     for field in _bq_fields(schema):
-        escaped = {key: _literal(value) for key, value in field.items()}
+        escaped = _escape_tofu_literals(field)
         tag = tags.get(field.get("name") or "")
         if tag is not None:
             escaped["policyTags"] = {"names": [str(tag)]}
