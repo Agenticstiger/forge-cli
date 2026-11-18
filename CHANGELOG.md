@@ -234,6 +234,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Spark stream on AWS can read its own checkpoint.** The role forge creates for a Spark build
+  could read and write `<prefix>/*` and list `<prefix>/*`, but Hadoop's `getFileStatus` first asks
+  for the directory's own key (a HEAD of `_checkpoints/<product>/<build>`) and lists it by that
+  slashless name, which S3 refused with 403, so every stream failed within minutes of starting.
+  The role may now read that one key, which holds no data, and list the directory by its exact
+  name (no sibling `<build>-x` matches) as well as under it, for every prefix it is granted, on
+  every AWS runtime.
+
 - **`fluid ship` generates artifacts for a reference-only contract.** Stage 3 skipped every
   contract with a `hybrid-reference`, `reference` or `external-reference` build, even with
   `--emit`, so stage 4 skipped too and the run exited 0 with no `MANIFEST.json`. `fluid generate
