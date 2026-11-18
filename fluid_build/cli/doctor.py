@@ -182,8 +182,8 @@ ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
     (
         "FLUID_SPARK_LOCAL_ROOT",
         ".fluid/spark-artifacts beside the contract",
-        "Where local Spark runs read their job config and runner: s3://<bucket>[/<prefix>] "
-        "(through AWS_ENDPOINT_URL_S3) or an absolute directory",
+        "Where local Spark runs read their job config and runner: an s3:// bucket and "
+        "optional prefix (through AWS_ENDPOINT_URL_S3), or an absolute directory",
     ),
     # — Keyless coding-agent providers (claude-code / codex / cursor / kiro) —
     (
