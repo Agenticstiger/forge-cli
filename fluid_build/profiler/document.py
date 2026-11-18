@@ -1,7 +1,7 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""The profile document: PROFILE-SPEC format 1-0-0, its canonical bytes and digest.
+"""The profile document: PROFILE-SPEC formats 1-0-0 and 1-1-0, its canonical bytes and digest.
 
 flux-engine ``docs/spec/PROFILE-SPEC.md`` §1 fixes the shape: the OpenLineage
 facet envelope (``_producer``, ``_schemaURL``), the grid (``encoding``), the
@@ -14,6 +14,10 @@ the RFC 8785 canonical bytes. :func:`canonical_bytes` uses ``rfc8785``, the
 Trail of Bits implementation flux-engine digests with, so both sides compute one
 digest from one implementation. The file holds exactly those bytes, so its sha256
 is the digest a Simulation pins.
+
+A profile names format 1-0-0, unless it holds a ``quantile/2`` statistic, which only
+format 1-1-0 carries (:func:`schema_url_for`): a profile without one keeps the bytes it
+had.
 
 A document that breaks a rule is refused here, before anything is written. The
 refusal names where in the document the problem is, never a value.
@@ -33,15 +37,25 @@ __all__ = [
     "MAX_FRACTIONAL_BITS",
     "PRODUCER_REPOSITORY",
     "SCHEMA_URL",
+    "SCHEMA_URL_1_1_0",
     "build_document",
     "canonical_bytes",
     "check_fractional_bits",
     "digest_of",
     "producer_uri",
+    "schema_url_for",
 ]
 
-#: The format this module writes. A later format is a new URL (PROFILE-SPEC §8).
+#: The format a profile names unless it needs the next one. A later format is a new URL
+#: (PROFILE-SPEC §8).
 SCHEMA_URL = "https://agenticstiger.github.io/flux/engine/spec/profile/1-0-0/FluxProfile.json"
+
+#: Format 1-1-0 adds the ``quantile/2`` statistic and changes nothing 1-0-0 says
+#: (``flux_stats.profile.SCHEMA_URL_1_1_0``; a test keeps the two equal).
+SCHEMA_URL_1_1_0 = "https://agenticstiger.github.io/flux/engine/spec/profile/1-1-0/FluxProfile.json"
+
+#: The statistics only format 1-1-0 holds.
+_ADDED_IN_1_1_0 = frozenset({"quantile/2"})
 
 #: ``_producer`` names this repository, at the release that wrote the profile.
 PRODUCER_REPOSITORY = "https://github.com/Agenticstiger/forge-cli"
@@ -73,6 +87,16 @@ def producer_uri(version: str) -> str:
     return f"{PRODUCER_REPOSITORY}/tree/v{version}/fluid_build/profiler"
 
 
+def schema_url_for(tables: Mapping[str, Mapping[str, Any]]) -> str:
+    """The format *tables* need: 1-1-0 when any statistic is ``quantile/2``, else 1-0-0."""
+    for table in tables.values():
+        for column in table.get("columns", {}).values():
+            for statistic in column.get("statistics", ()):
+                if statistic.get("definition") in _ADDED_IN_1_1_0:
+                    return SCHEMA_URL_1_1_0
+    return SCHEMA_URL
+
+
 def build_document(
     *,
     producer: str,
@@ -80,13 +104,13 @@ def build_document(
     tables: Mapping[str, Mapping[str, Any]],
     fractional_bits: int = DEFAULT_FRACTIONAL_BITS,
 ) -> Dict[str, Any]:
-    """Assemble a format 1-0-0 document from tables already checked by *rule*."""
+    """Assemble a document from tables already checked by *rule*, in the format they need."""
     check_fractional_bits(fractional_bits)
     if not tables:
         raise DocumentError("tables holds at least one table")
     return {
         "_producer": producer,
-        "_schemaURL": SCHEMA_URL,
+        "_schemaURL": schema_url_for(tables),
         "encoding": {"fractionalBits": fractional_bits, "rounding": "floor"},
         "disclosureRules": {rule.name: rule.to_document()},
         "tables": {expose_id: dict(table) for expose_id, table in tables.items()},

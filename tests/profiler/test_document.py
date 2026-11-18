@@ -15,6 +15,7 @@ import rfc8785
 from fluid_build.profiler.disclosure import ACRO_DEFAULT
 from fluid_build.profiler.document import (
     SCHEMA_URL,
+    SCHEMA_URL_1_1_0,
     DocumentError,
     build_document,
     canonical_bytes,
@@ -77,6 +78,28 @@ def test_a_built_document_is_format_1_0_0():
     assert document["_schemaURL"] == SCHEMA_URL
     assert document["encoding"] == {"fractionalBits": 16, "rounding": "floor"}
     assert document["disclosureRules"] == {"acro-default": ACRO_DEFAULT.to_document()}
+
+
+def _with_statistic(definition):
+    table = _table()
+    table["columns"]["amount"]["statistics"] = [{"definition": definition, "groups": []}]
+    return table
+
+
+def test_a_quantile_with_bins_needs_format_1_1_0_and_nothing_else_does():
+    assert _document(tables={"orders": _with_statistic("quantile/2")})["_schemaURL"] == (
+        SCHEMA_URL_1_1_0
+    )
+    for definition in ("mean/1", "marginalHistogram/1", "levelHistogram/1", "quantile/1"):
+        document = _document(tables={"orders": _with_statistic(definition)})
+        assert document["_schemaURL"] == SCHEMA_URL
+    assert _document()["_schemaURL"] == SCHEMA_URL
+
+
+def test_the_formats_are_the_ones_flux_stats_reads():
+    profile = pytest.importorskip("flux_stats.profile")
+    assert SCHEMA_URL == profile.SCHEMA_URL
+    assert SCHEMA_URL_1_1_0 == profile.SCHEMA_URL_1_1_0
 
 
 def test_the_producer_names_this_repository_at_the_release():
