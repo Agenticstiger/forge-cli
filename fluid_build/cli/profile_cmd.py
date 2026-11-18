@@ -6,7 +6,8 @@
 The command reads the expose's records once, inside the environment that holds
 them, and writes a FLUX profile document (PROFILE-SPEC format 1-0-0, or 1-1-0
 when it holds a quantile with bins) of aggregates that passed the disclosure
-rules. A FLUX Simulation pins the document by the digest this prints. See :mod:`fluid_build.profiler` for the parts.
+rules. A FLUX Simulation pins the document by the digest this prints. See
+:mod:`fluid_build.profiler` for the parts.
 
 Registered lazily (``cli/bootstrap.py`` ``CORE_COMMANDS``), and only the standard library is
 imported at module scope, so neither ``fluid --help`` nor ``fluid profile
@@ -28,7 +29,8 @@ Write an output-checked profile of one expose's records, read where they live.
 
 The document follows FLUX PROFILE-SPEC (format 1-0-0, or 1-1-0 when it holds a
 quantile with bins) and holds only aggregates that passed the output checks: no
-record, no sample, no per-record value. The checks are ACRO 1.1.0's defaults, named "acro-default" in the document:
+record, no sample, no per-record value. The checks are ACRO 1.1.0's defaults, named
+"acro-default" in the document:
   - a count below 10 records is withheld, and so is a zero;
   - every published count is rounded to a multiple of 5;
   - a sum is withheld when 2 records make up 90% of it, or when what is left
