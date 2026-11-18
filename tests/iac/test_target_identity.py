@@ -97,6 +97,22 @@ class TestAws:
         assert account == ""
         assert why == "sts GetCallerIdentity failed (RuntimeError)"
 
+    def test_without_a_region_sts_still_gets_one(self, monkeypatch):
+        seen: Dict[str, Any] = {}
+
+        class _Session:
+            def __init__(self, **kwargs):
+                seen.update(kwargs)
+
+            def client(self, name, endpoint_url=None):
+                return types.SimpleNamespace(get_caller_identity=lambda: {"Account": "1"})
+
+        boto3 = types.ModuleType("boto3")
+        boto3.session = types.SimpleNamespace(Session=_Session)
+        monkeypatch.setitem(sys.modules, "boto3", boto3)
+        assert ti.aws_caller_account({}, None) == ("1", "")
+        assert seen["region_name"] == "us-east-1"
+
     def test_without_boto3_it_says_how_to_install_it(self, monkeypatch):
         monkeypatch.setitem(sys.modules, "boto3", None)
         account, why = ti.aws_caller_account({}, None)
@@ -114,25 +130,19 @@ class TestGcp:
         ],
         ids=["provider-block-wins", "GOOGLE_CLOUD_PROJECT", "GOOGLE_PROJECT-first", "CLOUDSDK"],
     )
-    def test_project_precedence(self, monkeypatch, module, env, project):
-        monkeypatch.setattr(ti, "gcp_default_project", lambda: pytest.fail("not needed"))
+    def test_project_precedence(self, module, env, project):
         assert ti.target_identity("gcp", module, env)[0]["project"] == project
 
-    def test_the_default_credentials_project_is_the_last_resort(self, monkeypatch):
-        auth = types.ModuleType("google.auth")
-        auth.default = lambda: (object(), "adc-project")
-        google = types.ModuleType("google")
-        google.auth = auth
-        monkeypatch.setitem(sys.modules, "google", google)
-        monkeypatch.setitem(sys.modules, "google.auth", auth)
-        identity, unread = ti.target_identity("gcp", {}, {"GOOGLE_REGION": "europe-west6"})
-        assert identity == {"project": "adc-project", "region": "europe-west6"}
-        assert unread == {}
+    def test_region(self):
+        identity, _ = ti.target_identity("gcp", {}, {"GOOGLE_PROJECT": "p", "GCLOUD_REGION": "r"})
+        assert identity == {"project": "p", "region": "r"}
 
-    def test_no_project_anywhere_is_a_reason(self, monkeypatch):
-        monkeypatch.setattr(ti, "gcp_default_project", lambda: ("", "no default credentials"))
+    def test_the_credentials_own_project_is_not_read(self, monkeypatch):
+        # The provider reads no such default, so binding it would bind the wrong project.
+        monkeypatch.setitem(sys.modules, "google.auth", None)
         identity, unread = ti.target_identity("gcp", {}, {})
-        assert identity == {} and unread == {"project": "no default credentials"}
+        assert identity == {}
+        assert unread["project"].startswith("no provider project and no GOOGLE_PROJECT")
 
 
 class TestOtherProviders:

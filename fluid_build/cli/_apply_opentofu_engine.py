@@ -308,6 +308,9 @@ def _open_engine(
     # The provider version and checksums `tofu init` must accept, for a plugin
     # that ships a committed lock (iac/module.py::dependency_lock).
     write_dependency_lock(plugin, workdir)
+    if bound is not None:
+        # A saved plan installs the providers it was made with, not today's newest.
+        _install_plan_lock(args, bound, workdir)
 
     env = _tofu_env(plugin, target)
     eng.env = env
@@ -617,12 +620,17 @@ def _plan_with_opentofu(
     _write_private(out.parent / names["showJson"], (json.dumps(shown) + "\n").encode())
     _write_private(out.parent / names["gitlabReport"], runner.gitlab_plan_report(shown).encode())
     # File names, not the directory: a long path wrapped mid-name in a terminal.
-    cprint_literal(
-        f"  saved plan:  {names['planFile']}, {names['showJson']}, {names['gitlabReport']} "
-        f"(owner-only, next to {out.name})"
-    )
+    # The provider versions and checksums this plan was made with travel with it: the
+    # apply's ``tofu init`` installs exactly these (OpenTofu honours a lock it finds),
+    # so another runner, days later, does not pick a newer provider release.
+    lock = _read_lock(eng.workdir)
+    if lock is not None:
+        names["lockFile"] = f"{stem}{_LOCK_FILE}"
+        _write_private(out.parent / names["lockFile"], lock)
+    cprint_literal(f"  saved plan:  {', '.join(names.values())} (owner-only, next to {out.name})")
     return {
         **names,
+        **({"lockSha256": sha256_bytes(lock)} if lock is not None else {}),
         "sha256": sha256_bytes(saved),
         "provider": eng.provider,
         "state": eng.target.location,
@@ -640,13 +648,59 @@ _LOCK_FILE = ".terraform.lock.hcl"
 _LOCKED_PROVIDER_RE = re.compile(r'provider\s+"([^"]+)"\s*\{[^}]*?\bversion\s*=\s*"([^"]+)"', re.S)
 
 
+def _read_lock(workdir: str) -> Optional[bytes]:
+    """The workdir's dependency lock, or ``None`` when ``tofu init`` wrote none (a module
+    using only built-in resources)."""
+    try:
+        return (Path(workdir) / _LOCK_FILE).read_bytes()
+    except OSError:
+        return None
+
+
 def _locked_providers(workdir: str) -> Dict[str, str]:
     """``{source: version}`` from the workdir's dependency lock; ``{}`` when there is none."""
-    try:
-        text = (Path(workdir) / _LOCK_FILE).read_text(encoding="utf-8")
-    except OSError:
+    lock = _read_lock(workdir)
+    if lock is None:
         return {}
-    return dict(sorted(_LOCKED_PROVIDER_RE.findall(text)))
+    return dict(sorted(_LOCKED_PROVIDER_RE.findall(lock.decode("utf-8", "replace"))))
+
+
+def _install_plan_lock(args, record: Mapping[str, Any], workdir: Path) -> None:
+    """Put the saved plan's dependency lock into the workdir before ``tofu init``.
+
+    The lock is read from next to ``plan.json`` and must be the bytes the plan's record
+    names (``lockSha256``, under ``planDigest``). A plan made without one installs none.
+    ``--no-verify-plan-binding`` skips the digest, not the file: without it there is no
+    reviewed provider set to install."""
+    from fluid_build.forge.core.plan_digest import sha256_bytes
+
+    name = record.get("lockFile")
+    if name is None:
+        return
+    if not isinstance(name, str) or Path(name).name != name or name in ("", ".", ".."):
+        raise _target_error(
+            "tofu-plan-invalid",
+            f"the saved plan's lockFile {name!r} is not a file name next to plan.json",
+            "Re-run `fluid plan --tofu`.",
+        )
+    try:
+        lock = (Path(str(args.contract)).parent / name).read_bytes()
+    except OSError:
+        raise _target_error(
+            "tofu-plan-lock-missing",
+            f"the saved plan's dependency lock {name} is not next to plan.json, so the "
+            "provider versions it was reviewed with cannot be installed",
+            f"Hand {name} over with plan.json and the saved plan, or re-run `fluid plan --tofu`.",
+        )
+    if not getattr(args, "no_verify_plan_binding", False) and sha256_bytes(lock) != record.get(
+        "lockSha256"
+    ):
+        raise _target_error(
+            "tofu-plan-lock-mismatch",
+            f"{name} is not the dependency lock the plan was made with (its sha256 differs)",
+            "Hand over the lock written with the plan, or re-run `fluid plan --tofu`.",
+        )
+    _write_private(workdir / _LOCK_FILE, lock)
 
 
 def _target_record(eng: _Engine) -> Dict[str, Any]:
@@ -727,7 +781,13 @@ def _refuse_another_target(
             "Apply with the --state-backend (or FLUID_STATE_BACKEND) the plan was made "
             "with, or re-run `fluid plan --tofu`.",
         )
-    bound = recorded.get("identity") if isinstance(recorded.get("identity"), Mapping) else {}
+    bound = recorded.get("identity")
+    if not isinstance(bound, Mapping):
+        raise _target_error(
+            "tofu-plan-target-missing",
+            "the saved plan's target record has no identity",
+            "Re-run `fluid plan --tofu` and apply that plan.",
+        )
     changed, unverified = target_identity.compare(bound, now["identity"])
     if changed:
         raise _target_error(
@@ -750,11 +810,10 @@ def _refuse_another_target(
             "Give this run what the plan's runner had (credentials, the SDK named above), "
             "or pass --no-verify-plan-binding for an emergency apply (logged).",
         )
-    unbound = sorted(set(now["identity"]) - set(bound))
-    if unbound:
-        cprint_literal(
-            "  ⚠️  target fields the plan could not read, so not compared: " + ", ".join(unbound)
-        )
+    planned_unread = recorded.get("unread") if isinstance(recorded.get("unread"), Mapping) else {}
+    for field_name in sorted(set(planned_unread) | (set(now["identity"]) - set(bound))):
+        why = planned_unread.get(field_name, "not read when the plan was made")
+        cprint_literal(f"  ⚠️  target {field_name} not bound by the plan, not compared: {why}")
 
 
 def _target_error(kind: str, error: str, remediation: str) -> CLIError:

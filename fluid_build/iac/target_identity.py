@@ -19,8 +19,8 @@ block, in each provider's own order of precedence:
   ``region`` from the module's ``provider.aws.region``, else ``AWS_REGION``,
   else ``AWS_DEFAULT_REGION``.
 - ``gcp``: ``project`` from ``provider.google.project``, else ``GOOGLE_PROJECT``,
-  ``GOOGLE_CLOUD_PROJECT``, ``GCLOUD_PROJECT``, ``CLOUDSDK_CORE_PROJECT``, else
-  the application-default credentials' project; ``region`` from
+  ``GOOGLE_CLOUD_PROJECT``, ``GCLOUD_PROJECT``, ``CLOUDSDK_CORE_PROJECT``, the only
+  defaults the provider reads (not the credentials' own project); ``region`` from
   ``provider.google.region``, else ``GOOGLE_REGION``, ``GCLOUD_REGION``,
   ``CLOUDSDK_COMPUTE_REGION`` (the ``hashicorp/google`` provider reference).
 - ``snowflake``: ``organization`` and ``account`` from
@@ -29,8 +29,8 @@ block, in each provider's own order of precedence:
 - ``databricks``: ``host`` from ``DATABRICKS_HOST``, lower-cased, without a
   trailing ``/``.
 
-Nothing here imports a cloud SDK at module scope: boto3 and google-auth are
-imported when a run asks, and their absence is a reason, not an error.
+Nothing here imports a cloud SDK at module scope: boto3 is imported when a run
+asks, and its absence is a reason, not an error.
 """
 
 from __future__ import annotations
@@ -131,7 +131,8 @@ def aws_caller_account(env: Mapping[str, str], region: Optional[str]) -> Tuple[s
             aws_secret_access_key=env.get("AWS_SECRET_ACCESS_KEY") or None,
             aws_session_token=env.get("AWS_SESSION_TOKEN") or None,
             profile_name=env.get("AWS_PROFILE") or None,
-            region_name=region,
+            # STS answers in every region; without one, botocore refuses to build the client.
+            region_name=region or "us-east-1",
         )
         endpoint = env.get("AWS_ENDPOINT_URL_STS") or env.get("AWS_ENDPOINT_URL") or None
         reply = session.client("sts", endpoint_url=endpoint).get_caller_identity()
@@ -145,32 +146,16 @@ def _gcp(block: Mapping[str, Any], env: Mapping[str, str]) -> Tuple[Identity, Re
     identity: Identity = {}
     unread: Reasons = {}
     project = _first(block, "project", env, _GCP_PROJECT_ENV)
-    if not project:
-        project, why = gcp_default_project()
-        if not project:
-            unread["project"] = why
     if project:
         identity["project"] = project
+    else:
+        # The provider reads no other default; a resource without its own project then
+        # fails to plan, and each one forge emits names the binding's project.
+        unread["project"] = "no provider project and no " + ", ".join(_GCP_PROJECT_ENV)
     region = _first(block, "region", env, _GCP_REGION_ENV)
     if region:
         identity["region"] = region
     return identity, unread
-
-
-def gcp_default_project() -> Tuple[str, str]:
-    """``(project, "")`` of the application-default credentials, or ``("", why)``. A seam."""
-    try:
-        import google.auth
-    except ImportError:
-        return "", (
-            "no project in the provider block or GOOGLE_PROJECT and google-auth is not "
-            "installed to read the default credentials' project"
-        )
-    try:
-        _credentials, project = google.auth.default()
-    except Exception as exc:  # noqa: BLE001 - every failure is a reason, named by type
-        return "", f"google.auth.default() failed ({type(exc).__name__})"
-    return (str(project), "") if project else ("", "the default credentials name no project")
 
 
 def _snowflake(block: Mapping[str, Any], env: Mapping[str, str]) -> Tuple[Identity, Reasons]:
@@ -212,4 +197,4 @@ def compare(recorded: Mapping[str, str], now: Mapping[str, str]) -> Tuple[List[s
     return changed, unverified
 
 
-__all__ = ["aws_caller_account", "compare", "describe", "gcp_default_project", "target_identity"]
+__all__ = ["aws_caller_account", "compare", "describe", "target_identity"]

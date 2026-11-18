@@ -734,3 +734,90 @@ class TestTargetBinding:
         caplog.set_level(logging.WARNING)
         assert engine.apply_via_opentofu(_args(str(out), no_verify_plan_binding=True), _LOG) == 0
         assert "apply_tofu_plan_target_unverified_by_flag" in caplog.text
+
+
+_FAKE_LOCK = b"""provider "registry.opentofu.org/hashicorp/aws" {
+  version = "6.73.0"
+  hashes = ["h1:abc="]
+}
+"""
+
+
+class TestTheLockTravels:
+    """The provider versions the plan was made with are installed where it is applied."""
+
+    def _plan_with_lock(self, tmp: Path, monkeypatch) -> Path:
+        # The plan's runner locked a provider (a builtin-only module writes no lock).
+        monkeypatch.setattr(engine, "_read_lock", lambda workdir: _FAKE_LOCK)
+        out = _plan(tmp, {"id": "p1", "description": "v1"})
+        return out
+
+    def test_the_plan_writes_and_binds_the_lock(self, offline_tofu, monkeypatch):
+        out = self._plan_with_lock(offline_tofu, monkeypatch)
+        record = json.loads(out.read_text())[TOFU_PLAN_FIELD]
+        assert record["lockFile"] == "plan.terraform.lock.hcl"
+        assert (offline_tofu / record["lockFile"]).read_bytes() == _FAKE_LOCK
+        assert record["lockSha256"] == sha256_bytes(_FAKE_LOCK)
+        assert stat.S_IMODE((offline_tofu / record["lockFile"]).stat().st_mode) == 0o600
+
+    def test_another_runner_installs_it_before_init(self, offline_tofu, monkeypatch, tmp_path):
+        record = json.loads(self._plan_with_lock(offline_tofu, monkeypatch).read_text())
+        record = record[TOFU_PLAN_FIELD]
+        workdir = tmp_path / "b" / ".fluid" / "iac" / "aws" / "p1"
+        workdir.mkdir(parents=True)
+        args = _args(str(offline_tofu / "plan.json"))
+        engine._install_plan_lock(args, record, workdir)
+        assert (workdir / ".terraform.lock.hcl").read_bytes() == _FAKE_LOCK
+
+    @pytest.mark.parametrize(
+        "edit, event",
+        [
+            (
+                lambda d: (d / "plan.terraform.lock.hcl").unlink(),
+                "apply_plan_digest_tofu_plan_lock_missing",
+            ),
+            (
+                lambda d: (d / "plan.terraform.lock.hcl").write_bytes(_FAKE_LOCK + b"# edited"),
+                "apply_plan_digest_tofu_plan_lock_mismatch",
+            ),
+        ],
+        ids=["missing", "edited"],
+    )
+    def test_a_lock_that_is_not_the_plans_is_refused(
+        self, offline_tofu, monkeypatch, tmp_path, edit, event
+    ):
+        record = json.loads(self._plan_with_lock(offline_tofu, monkeypatch).read_text())
+        edit(offline_tofu)
+        with pytest.raises(CLIError) as refused:
+            engine._install_plan_lock(
+                _args(str(offline_tofu / "plan.json")), record[TOFU_PLAN_FIELD], tmp_path
+            )
+        assert refused.value.event == event
+
+    def test_a_lock_file_name_that_is_a_path_is_refused(self, tmp_path):
+        with pytest.raises(CLIError) as refused:
+            engine._install_plan_lock(
+                _args(str(tmp_path / "plan.json")), {"lockFile": "../x.hcl"}, tmp_path
+            )
+        assert refused.value.event == "apply_plan_digest_tofu_plan_invalid"
+
+
+class TestUnboundFieldsAreNamed:
+    def test_apply_names_what_the_plan_could_not_bind(self, offline_tofu, monkeypatch, capsys):
+        monkeypatch.setattr(
+            target_identity, "aws_caller_account", lambda env, region: ("", "boto3 missing")
+        )
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        capsys.readouterr()
+        # The applying runner cannot read it either: the apply still says it was unbound.
+        assert engine.apply_via_opentofu(_args(str(out)), _LOG) == 0
+        assert "target account not bound by the plan, not compared: boto3 missing" in (
+            capsys.readouterr().out
+        )
+
+    def test_a_malformed_identity_fails_closed(self, offline_tofu):
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        _rebind(out, lambda r: r["target"].update(identity="aws:111111111111"))
+        with pytest.raises(CLIError) as refused:
+            engine.apply_via_opentofu(_args(str(out)), _LOG)
+        assert refused.value.event == "apply_plan_digest_tofu_plan_target_missing"

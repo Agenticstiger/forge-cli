@@ -240,9 +240,11 @@ transformations, access grants, and orchestration tasks.
         help=(
             "also run `tofu plan` as `fluid apply` would (OpenTofu-engine providers) "
             "and bind the saved plan into plan.json: `fluid apply plan.json` then "
-            "applies exactly that plan. Next to it, mode 0600: plan.tfplan, "
-            "plan.tfplan.json and the GitLab terraform report plan.gitlab-tofu.json "
-            "(named after --out)"
+            "applies exactly that plan, on the target (account, project, region) it was "
+            "made for. Next to it, mode 0600: plan.tfplan, plan.tfplan.json, the GitLab "
+            "terraform report plan.gitlab-tofu.json and the provider lock "
+            "plan.terraform.lock.hcl (named after --out); hand plan.json, the .tfplan and "
+            "the lock to the runner that applies"
         ),
     )
     p.add_argument(
