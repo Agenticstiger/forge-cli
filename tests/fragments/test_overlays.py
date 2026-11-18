@@ -33,6 +33,7 @@ import pytest
 import yaml
 
 from fluid_build import loader
+from fluid_build.forge.core.bundle import read_bundle_source
 from fluid_build.loader import RefConfinementError, RefResolutionError
 
 _CHECKOUT = Path(__file__).resolve().parents[2]
@@ -1501,8 +1502,8 @@ def test_f27_the_manifest_names_the_overlay_and_two_bundles_have_one_digest(
 
     assert (rc1, rc2) == (0, 0), (text1, text2)
     one, two = _manifest(first), _manifest(second)
-    assert one["source"]["overlay"] == "overlays/prod.yaml"
-    assert one["source"]["env"] == "prod"
+    assert read_bundle_source(first)["overlay"] == "overlays/prod.yaml"
+    assert one["source"] == {"env": "prod"}
     assert one["digest"] == two["digest"]
     assert one == two
     assert first.read_bytes() == second.read_bytes()

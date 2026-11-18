@@ -39,6 +39,7 @@ Design decisions — see plan Part 5 Phase 2 and Part 8 (D1, D2, D5, D6).
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import gzip
 import hashlib
@@ -47,6 +48,7 @@ import json
 import os
 import re
 import tarfile
+import tempfile
 import unicodedata
 from importlib import import_module
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -179,13 +181,14 @@ def build_manifest(
     ``"<path>:<hash>\\n"`` sequence — simple, deterministic, easy to
     reproduce with shell tools (``sha256sum | sort | sha256sum``).
 
-    ``source`` (optional) is the provenance block :func:`make_bundle_source`
-    builds: where the source contract lives relative to the bundle, which
-    environment overlay was applied, and the overlay warnings its merge raised.
-    It is metadata about the bundle, not bundle content, so it is deliberately
+    ``source`` (optional) is the MANIFEST ``source`` block: which environment
+    overlay was applied and the overlay warnings its merge raised. It must hold
+    no path: :func:`build_bundle_tgz` takes the paths of the record
+    :func:`make_bundle_source` builds (:data:`PROVENANCE_KEYS`) out before it
+    calls this, and writes them to the provenance file beside the bundle. It is
+    metadata about the bundle, not bundle content, so it is deliberately
     OUTSIDE the merkle root — the digest still identifies the resolved contract
-    alone, and two bundles of the same contract written to different
-    directories keep one digest.
+    alone.
     """
     per_file: Dict[str, str] = {}
     for path in sorted(files.keys()):
@@ -401,11 +404,20 @@ def build_bundle_tgz(
 
     # MANIFEST carries the hash of every file above. Written last inside the
     # tar so it's the authoritative record.
-    manifest = build_manifest(files, contract_id=contract_id, source=source)
+    # The paths in ``source`` are where this machine keeps the checkout: they go to
+    # the provenance file next to the bundle, so the archive's bytes are the same
+    # whatever ``--out`` and checkout it was built from.
+    manifest_source = (
+        None
+        if source is None
+        else {key: value for key, value in source.items() if key not in PROVENANCE_KEYS}
+    )
+    manifest = build_manifest(files, contract_id=contract_id, source=manifest_source)
     manifest_bytes = _canonicalize_json(manifest)
     files["MANIFEST.json"] = manifest_bytes
 
     write_tgz(out_path, files)
+    _write_provenance(Path(out_path), str(manifest["digest"]), source)
     return str(manifest["digest"])
 
 
@@ -527,12 +539,122 @@ def read_bundle_dbt_trees(tgz_path: Path) -> Dict[str, Dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# Source provenance (MANIFEST ``source`` block)
+# Source provenance (MANIFEST ``source`` block + the provenance file)
 # ---------------------------------------------------------------------------
 
 #: Suffixes a recorded source contract may carry. Anything else in a
-#: MANIFEST's ``source.contract`` is not a contract and is ignored.
+#: recorded ``source.contract`` is not a contract and is ignored.
 _SOURCE_CONTRACT_SUFFIXES = (".yaml", ".yml", ".json")
+
+#: The ``source`` keys that are paths on the machine that built the bundle. They
+#: are provenance, not content: written to the provenance file next to the bundle
+#: (:func:`provenance_path`), never into the archive, whose bytes would otherwise
+#: change with ``--out`` and the checkout. A MANIFEST that carries them anyway
+#: (a bundle from an older fluid) has them ignored.
+PROVENANCE_KEYS: Tuple[str, ...] = ("contract", "overlay")
+
+#: Appended to the bundle's file name, like ``.intoto.jsonl`` and ``.sig``. The
+#: pattern is Helm's ``<chart>.tgz.prov``: a file beside the archive that names
+#: the archive's sha256.
+PROVENANCE_SUFFIX = ".provenance.json"
+
+#: ``version`` of the provenance file's format.
+PROVENANCE_VERSION = "1"
+
+#: The most bytes of provenance file read. It holds two relative paths.
+MAX_PROVENANCE_BYTES = 64 * 1024
+
+
+def provenance_path(tgz_path: Path) -> Path:
+    """The provenance file that belongs next to the bundle at ``tgz_path``."""
+    path = Path(tgz_path)
+    return path.with_name(path.name + PROVENANCE_SUFFIX)
+
+
+def packet_digest(tgz_path: Path) -> str:
+    """``sha256:<hex>`` of the bundle file's bytes: the packet's identity.
+
+    The merkle ``digest`` in MANIFEST.json names the resolved contract and its
+    inputs, and two packets holding them can still differ in the MANIFEST's own
+    fields (the ``--env`` recorded, the overlay warnings). This names the exact
+    bytes, which is what a plan made from the packet is bound to.
+    """
+    hasher = hashlib.sha256()
+    with open(tgz_path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            hasher.update(chunk)
+    return "sha256:" + hasher.hexdigest()
+
+
+def _write_provenance(
+    tgz_path: Path, bundle_digest: str, source: Optional[Mapping[str, Any]]
+) -> None:
+    """Write the provenance file for the bundle just written to ``tgz_path``, or
+    remove a stale one when ``source`` records no path.
+
+    It names the packet it describes (``packetDigest``), so a file left beside
+    other bytes (the bundle rebuilt without it, or copied over) is not read as
+    theirs. Written owner-only (0600) to a temporary file and renamed over, so a
+    symlink planted at the name is replaced, never followed.
+    """
+    target = provenance_path(tgz_path)
+    recorded = {key: (source or {}).get(key) for key in PROVENANCE_KEYS}
+    if not any(recorded.values()):
+        # No path to record: a file left by an earlier build at this name would
+        # describe other bytes. None there is the usual case.
+        with contextlib.suppress(FileNotFoundError):
+            target.unlink()
+        return
+    document = {
+        "version": PROVENANCE_VERSION,
+        "bundleDigest": bundle_digest,
+        "packetDigest": packet_digest(tgz_path),
+        "source": recorded,
+    }
+    fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.")
+    try:
+        # mkstemp's owner-only mode stays: the file names paths on this machine.
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(_canonicalize_json(document))
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def read_bundle_provenance(tgz_path: Path) -> Optional[Dict[str, Optional[str]]]:
+    """``{"contract": ..., "overlay": ...}`` from the bundle's provenance file, or ``None``.
+
+    ``None`` when there is no such regular file, when it is over
+    :data:`MAX_PROVENANCE_BYTES`, is not the format this version writes, or names
+    another packet (its ``packetDigest`` is not the bundle's). A value that is not
+    a string reads as ``None``. Like the MANIFEST ``source`` block before it, the
+    file is outside every digest: its paths are hints the readers check
+    (:func:`resolve_bundle_source_contract`), never trusted.
+    """
+    path = provenance_path(tgz_path)
+    try:
+        if not path.is_file():
+            return None
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_PROVENANCE_BYTES + 1)
+        if len(raw) > MAX_PROVENANCE_BYTES:
+            return None
+        document = json.loads(raw.decode("utf-8"))
+        if not isinstance(document, dict) or document.get("version") != PROVENANCE_VERSION:
+            return None
+        if document.get("packetDigest") != packet_digest(tgz_path):
+            return None
+        recorded = document.get("source")
+    except (OSError, ValueError):
+        return None
+    if not isinstance(recorded, dict):
+        return None
+    return {
+        key: (recorded.get(key) if isinstance(recorded.get(key), str) else None)
+        for key in PROVENANCE_KEYS
+    }
 
 
 def make_bundle_source(
@@ -543,10 +665,15 @@ def make_bundle_source(
     overlay_path: Optional[Path] = None,
     overlay_warnings: Sequence[str] = (),
 ) -> Dict[str, Any]:
-    """Build the MANIFEST ``source`` block for a bundle written to ``out_path``.
+    """Build the ``source`` record for a bundle written to ``out_path``.
+
+    :func:`build_bundle_tgz` splits it: ``env`` and ``overlayWarnings`` go into
+    MANIFEST.json, and the paths (:data:`PROVENANCE_KEYS`) into the provenance
+    file beside the bundle (:func:`provenance_path`), so the archive's bytes do
+    not depend on where it was written. :func:`read_bundle_source` joins them.
 
     ``contract`` is the source contract's path RELATIVE to the directory the
-    bundle is written to (POSIX separators), so the block is the same on
+    bundle is written to (POSIX separators), so the record is the same on
     every checkout of the same tree and survives the workspace moving —
     an absolute path would differ per CI agent. ``env`` is the ``--env`` the
     bundle was built with (``None`` when none was given) and ``overlay`` the
@@ -567,7 +694,7 @@ def make_bundle_source(
         contract_rel: Optional[str] = Path(os.path.relpath(contract_abs, out_dir)).as_posix()
     except ValueError:
         # Different drives on Windows: no relative path exists. Recording an
-        # absolute one would make the MANIFEST machine-specific, so record
+        # absolute one would make the record machine-specific, so record
         # nothing and let readers fall back to the bundle's own directory.
         contract_rel = None
     overlay_rel: Optional[str] = None
@@ -585,19 +712,31 @@ def make_bundle_source(
 
 
 def read_bundle_source(tgz_path: Path) -> Optional[Dict[str, Any]]:
-    """Return the MANIFEST ``source`` block, or ``None`` for a bundle without one.
+    """The bundle's ``source`` record, or ``None`` for a bundle without one.
 
-    Bundles written before the block existed (and bundles built by callers
-    that pass no ``source``) return ``None``. Reads through the bounded
-    member reader; raises ``ValueError`` / ``tarfile.TarError`` on a bundle
-    that is not a readable tgz.
+    The MANIFEST ``source`` block (``env``, ``overlayWarnings``) joined with the
+    paths of the provenance file beside the bundle (:func:`read_bundle_provenance`);
+    a path with no usable provenance file reads as ``None``, so a bundle copied
+    without it is anchored at its own directory. Paths inside the MANIFEST are
+    never read. Bundles built by callers that pass no ``source`` return ``None``.
+    Reads through the bounded member reader; raises ``ValueError`` /
+    ``tarfile.TarError`` on a bundle that is not a readable tgz.
     """
     with tarfile.open(tgz_path, mode="r:gz") as tar:
         if "MANIFEST.json" not in tar.getnames():
             return None
         manifest = json.loads(read_tar_member_bounded(tar, "MANIFEST.json").decode("utf-8"))
-    source = manifest.get("source") if isinstance(manifest, dict) else None
-    return dict(source) if isinstance(source, dict) else None
+    block = manifest.get("source") if isinstance(manifest, dict) else None
+    recorded = read_bundle_provenance(tgz_path)
+    if not isinstance(block, dict) and recorded is None:
+        return None
+    source = {
+        key: value
+        for key, value in (block if isinstance(block, dict) else {}).items()
+        if key not in PROVENANCE_KEYS
+    }
+    source.update(recorded or dict.fromkeys(PROVENANCE_KEYS))
+    return source
 
 
 def bundle_overlay_warnings(source: Optional[Mapping[str, Any]]) -> List[str]:
@@ -667,7 +806,10 @@ def resolve_bundle_source_contract(
         source = read_bundle_source(tgz_path)
     rel = source.get("contract") if source else None
     if rel is None or rel == "":
-        return None, "does not record a source contract"
+        return None, (
+            f"does not record a source contract (no usable {provenance_path(tgz_path).name} "
+            "beside it)"
+        )
     if (
         not isinstance(rel, str)
         or "\x00" in rel
@@ -866,6 +1008,10 @@ __all__ = [
     "MAX_DBT_SOURCE_BYTES",
     "SOURCE_SENTINEL",
     "MANIFEST_VERSION",
+    "MAX_PROVENANCE_BYTES",
+    "PROVENANCE_KEYS",
+    "PROVENANCE_SUFFIX",
+    "PROVENANCE_VERSION",
     "ExactDumper",
     "ExactSafeDumper",
     "build_bundle_tgz",
@@ -875,7 +1021,10 @@ __all__ = [
     "extract_fragments",
     "make_bundle_source",
     "merkle_root",
+    "packet_digest",
+    "provenance_path",
     "read_bundle_dbt_trees",
+    "read_bundle_provenance",
     "read_bundle_source",
     "resolve_bundle_source_contract",
     "validate_manifest",

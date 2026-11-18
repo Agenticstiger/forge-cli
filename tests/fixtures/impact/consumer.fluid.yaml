@@ -1,0 +1,31 @@
+fluidVersion: 0.7.7
+kind: DataProduct
+id: finance.revenue
+name: Revenue
+domain: finance
+metadata:
+  layer: Gold
+  owner:
+    team: finance-data
+consumes:
+  - productId: sales.orders
+    exposeId: orders
+exposes:
+  - exposeId: daily_revenue
+    kind: table
+    version: 1.0.0
+    binding:
+      platform: gcp
+      format: bigquery_table
+      location:
+        project: shop-analytics
+        dataset: finance
+        table: daily_revenue
+    contract:
+      schema:
+        - name: day
+          type: date
+          required: true
+        - name: revenue
+          type: decimal(14,2)
+          required: true

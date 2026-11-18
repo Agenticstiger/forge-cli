@@ -536,6 +536,15 @@ def secret_resources(arn: Any) -> List[Any]:
     return [arn, _join(arn, "-??????")]
 
 
+def _slashless(prefix: Any) -> Any:
+    """A directory-style prefix without its trailing ``/`` (kept an expression when it is
+    one)."""
+    text = str(prefix)
+    if not text.endswith("/"):
+        return prefix
+    return type(prefix)(text[:-1])
+
+
 def _join(*parts: Any) -> Any:
     """Concatenate, keeping a ``TofuExpr`` part an expression (the others escaped)."""
     from ..naming import TofuExpr
@@ -593,7 +602,12 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
                     {
                         "test": "StringLike",
                         "variable": "s3:prefix",
-                        "values": [_join(p, "*") for p in prefixes],
+                        # A directory as Hadoop lists it: its own name, exactly (so no
+                        # sibling ``<dir>-x`` matches), and what is under it.
+                        "values": [
+                            *(_slashless(p) for p in prefixes),
+                            *(_join(p, "*") for p in prefixes),
+                        ],
                     }
                 ],
             }
@@ -604,6 +618,17 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
                 "effect": "Allow",
                 "actions": ["s3:GetBucketLocation"],
                 "resources": [bucket_arn],
+            }
+        )
+        # Hadoop's getFileStatus (a Spark checkpoint, a file Spark reads) asks for the
+        # directory's own key before ``<dir>/``: a HEAD of ``<bucket>/<dir>``, refused with
+        # 403 unless the role may read that one key, which holds no data.
+        statements.append(
+            {
+                "sid": f"Directory{len(statements)}",
+                "effect": "Allow",
+                "actions": ["s3:GetObject"],
+                "resources": [_join(bucket_arn, "/", _slashless(p)) for p in prefixes],
             }
         )
         # With an S3 Bucket Key the encryption context is the bucket's ARN; without one
