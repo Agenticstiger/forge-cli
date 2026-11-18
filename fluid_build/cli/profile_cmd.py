@@ -396,6 +396,17 @@ def _named(statistics: Any) -> List[str]:
     )
 
 
+def _named_partly(statistics: Any) -> List[str]:
+    """``levelHistogram/1 of 'market' by 'tier' (2 of 3 groups)`` for each statistic."""
+    return [
+        f"{name} ({shown} of {total} groups)"
+        for name, (shown, total) in dict(
+            (_named([(column, identifier, group_by)])[0], (shown, total))
+            for column, identifier, group_by, shown, total in statistics
+        ).items()
+    ]
+
+
 def _report(say: Any, result: Any, out: Path) -> None:
     """Tell the owner what the document holds, then print the pin."""
     plan = result.plan
@@ -421,6 +432,12 @@ def _report(say: Any, result: Any, out: Path) -> None:
     if whole:
         say(
             f"Withheld whole, so a run scores them censored: {'; '.join(whole)}.",
+            soft_wrap=True,
+        )
+    partly = _named_partly(result.partly_withheld_statistics)
+    if partly:
+        say(
+            f"Partly withheld, so a run scores only the published groups: {'; '.join(partly)}.",
             soft_wrap=True,
         )
     for description, reason in result.left_out:

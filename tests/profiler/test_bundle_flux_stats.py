@@ -554,3 +554,58 @@ def test_the_report_names_the_statistics_written_with_every_group_withheld(
     # A statistic with a published group stays on the published line only.
     published = out.split("Fidelity statistics: ")[1].split(", on fractionalBits")[0]
     assert "support/1" not in published
+
+
+def _partly_rows() -> List[Dict[str, Any]]:
+    rows = _rows()
+    for row in rows[:2]:
+        row["market"] = "DE"  # a group of two records: withheld, the large groups published
+    return rows
+
+
+_PARTLY_PROPERTIES = [
+    {
+        "property": "marginalHistogram",
+        "column": "amount",
+        "groupBy": "market",
+        "bins": ["0", "50", "100"],
+        "tolerance": _DISTANCE,
+    }
+]
+
+
+def test_a_statistic_with_some_groups_withheld_is_named_with_its_counts(tmp_path):
+    result = _profile(tmp_path, _partly_rows(), _PARTLY_PROPERTIES)
+    statuses = [
+        g["status"] for g in _entry(result, "amount", "marginalHistogram/1", "market")["groups"]
+    ]
+    published = statuses.count("F")
+    assert 0 < published < len(statuses)
+    assert result.partly_withheld_statistics == (
+        ("amount", "marginalHistogram/1", "market", published, len(statuses)),
+    )
+    assert ("amount", "marginalHistogram/1", "market") not in result.statistics
+    assert ("amount", "marginalHistogram/1", "market") not in result.withheld_statistics
+
+
+def test_the_report_names_the_statistics_withheld_in_part(tmp_path, monkeypatch, capsys):
+    directory = _bundle(tmp_path, _PARTLY_PROPERTIES)
+    monkeypatch.chdir(tmp_path)
+    rc = main(
+        [
+            "profile",
+            str(directory / "payment.fluid.yml"),
+            "--source",
+            _slice(tmp_path, _partly_rows()),
+            "--bundle",
+            str(directory),
+            "--out",
+            "payment.profile.json",
+        ]
+    )
+    out = " ".join(capsys.readouterr().out.split())
+    assert rc == 0, out
+    assert (
+        "Partly withheld, so a run scores only the published groups: "
+        "marginalHistogram/1 of 'amount' by 'market' (3 of 4 groups)." in out
+    )

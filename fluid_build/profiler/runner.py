@@ -172,6 +172,10 @@ class ProfileResult:
     #: Each fidelity statistic written with every group withheld, as
     #: ``(column, definition, groupBy)``: a run scores it censored.
     withheld_statistics: Tuple[Tuple[str, str, Optional[str]], ...] = ()
+    #: Each fidelity statistic with some groups published and some withheld, as
+    #: ``(column, definition, groupBy, published_groups, all_groups)``: a run scores
+    #: only the published groups.
+    partly_withheld_statistics: Tuple[Tuple[str, str, Optional[str], int, int], ...] = ()
     #: Each declared property the document does not answer, with the reason.
     left_out: Tuple[Tuple[str, str], ...] = ()
 
@@ -540,6 +544,7 @@ def profile_expose(
         fractional_bits=fractional_bits,
         statistics=_published_statistics(columns_doc),
         withheld_statistics=_withheld_statistics(columns_doc),
+        partly_withheld_statistics=_partly_withheld_statistics(columns_doc),
         left_out=tuple(left_out),
     )
 
@@ -730,3 +735,19 @@ def _withheld_statistics(
         for statistic in column.get("statistics", ())
         if not any(group["status"] == disclosure.FREE for group in statistic["groups"])
     )
+
+
+def _partly_withheld_statistics(
+    columns: Mapping[str, Mapping[str, Any]],
+) -> Tuple[Tuple[str, str, Optional[str], int, int], ...]:
+    """Each fidelity statistic with some groups published: column, definition, groupBy, counts."""
+    found = []
+    for name, column in columns.items():
+        for statistic in column.get("statistics", ()):
+            groups = statistic["groups"]
+            shown = sum(1 for group in groups if group["status"] == disclosure.FREE)
+            if 0 < shown < len(groups):
+                found.append(
+                    (name, statistic["definition"], statistic.get("groupBy"), shown, len(groups))
+                )
+    return tuple(found)
