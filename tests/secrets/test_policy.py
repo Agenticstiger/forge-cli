@@ -565,16 +565,21 @@ def test_the_deferred_notice_quotes_only_the_part_of_a_uri_that_decides_the_host
         ),
         (
             "{{ env.SCHEME }}://etl:pw-start?rest@db.example.com/orders",  # pragma: allowlist secret
-            "{{ env.SCHEME }}://etl",
+            "{{ env.SCHEME }}://",
+        ),
+        (
+            "postgres://{{ env.PGUSER }}:pw-start,pw-tail/x@db.example.com/orders",  # pragma: allowlist secret
+            "postgres://{{ env.PGUSER }}",
         ),
         ("postgres://db.example.com:{{ env.PGPORT }}/orders", "postgres://db.example.com"),
     ],
 )
-def test_the_deferred_notice_never_quotes_what_stands_where_a_port_would(uri, shown):
+def test_the_deferred_notice_never_quotes_a_login_the_authority_ends_inside(uri, shown):
     """An unencoded ``/``, ``?`` or ``#`` in an inline password ends the authority inside it."""
     notice = str(deferred_destination_notice("env://PGPASSWORD", {"connection.uri": uri}))
     assert f"connection.uri ({shown!r})" in notice
-    assert "pw-start" not in notice and "rest@" not in notice
+    for hidden in ("pw-start", "pw-tail", "etl", "rest@"):
+        assert hidden not in notice, hidden
     assert "(with  as set there)" not in notice
 
 

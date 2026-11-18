@@ -734,26 +734,35 @@ def _deciding_parts(field_name: str, value: str) -> Tuple[str, str]:
     fragment never decide where it goes, so they are left out. A URI without a
     scheme may start with ``//``, as :func:`_field_hosts` reads it.
     """
+    scheme, authority, _rest = _authority_split(field_name, value)
+    return scheme, authority.rpartition("@")[2]
+
+
+def _authority_split(field_name: str, value: str) -> Tuple[str, str, str]:
+    """``value`` as its scheme, its authority and what follows; ``host`` is all authority."""
     text = value.strip()
     if field_name == "host":
-        return "", text
+        return "", text, ""
     scheme, sep, rest = text.partition("://")
     if not sep:
         scheme, rest = "", text[2:] if text.startswith("//") else text
-    authority = re.split(r"[/?#]", rest, maxsplit=1)[0]
-    return scheme, authority.rpartition("@")[2]
+    authority, *after = re.split(r"(?=[/?#])", rest, maxsplit=1)
+    return scheme, authority, "".join(after)
 
 
 def _shown_destination(name: str, value: str) -> str:
     """What the deferred notice quotes of ``value``: its :func:`_deciding_parts`, without a port.
 
-    The allowlist entry takes no port. And a password written inline with an
-    unencoded ``/``, ``?`` or ``#`` ends the authority inside itself, so the
-    start of that password stands where a port would.
+    The allowlist entry takes no port. A password written inline with an
+    unencoded ``/``, ``?`` or ``#`` ends the authority inside itself, and an
+    ``@`` then follows the authority: only the placeholders are quoted then.
     """
     field_name = name.rpartition(".")[2]
-    scheme, host = _deciding_parts(field_name, value)
-    if field_name != "host":
+    scheme, authority, rest = _authority_split(field_name, value)
+    host = authority.rpartition("@")[2]
+    if "@" in rest and "@" not in authority:
+        host = " ".join(match.group(0) for match in _ENV_PLACEHOLDER.finditer(host))
+    elif field_name != "host":
         host = ",".join(_without_port(piece) for piece in host.split(","))
     return f"{scheme}://{host}" if scheme else host
 
