@@ -372,3 +372,17 @@ def test_scheduled_builds_lists_every_task_with_its_dags_schedule():
         ("a", "0 2 * * *", "UTC"),
         ("b", "0 2 * * *", "UTC"),
     ]
+
+
+def test_an_id_no_task_checks_never_reaches_the_dag_documentation():
+    """doc_md is Markdown the Airflow UI renders as HTML: only a plain identifier is echoed."""
+    stream = copy.deepcopy(SPARK_CONTRACT["builds"][0])
+    stream["id"] = '<img src=x onerror=alert(1)>"""'
+    contract = copy.deepcopy(SPARK_CONTRACT)
+    contract["builds"] = [stream, contract["builds"][1]]
+    contract["builds"][1]["dependencies"] = [{"buildId": stream["id"]}]
+    (source,) = fluid_apply.render_fluid_apply_dags(
+        contract, env=None, contract_path="contract.fluid.yaml"
+    ).values()
+    assert "<img" not in source and "onerror" not in source
+    assert "a build whose id is not a plain identifier (a Spark stream" in " ".join(source.split())

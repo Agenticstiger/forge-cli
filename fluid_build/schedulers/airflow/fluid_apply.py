@@ -100,11 +100,7 @@ from graphlib import CycleError, TopologicalSorter
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from fluid_build.build_runners._ids import IdentifierViolation, validate_identifier
-from fluid_build.providers.common.codegen_utils import (
-    escape_for_docstring,
-    py_comment_text,
-    py_str_literal,
-)
+from fluid_build.providers.common.codegen_utils import py_str_literal
 from fluid_build.schedulers.airflow._assets import (
     NotAddressable,
     expose_asset_uri,
@@ -471,7 +467,8 @@ def uses_fluid_apply_dags(contract: Dict[str, Any], *, engine: Optional[str]) ->
 
     Yes when the engine is Airflow (or unset), the contract declares no
     explicit ``orchestration.tasks`` (those keep their hand-declared
-    operators), and at least one build carries a cron trigger.
+    operators), and at least one build carries a trigger a DAG runs on
+    (:func:`has_scheduled_builds`).
     """
     return (
         (engine or DEFAULT_ENGINE) == DEFAULT_ENGINE
@@ -1283,12 +1280,21 @@ def _schedule_note(schedule: DagSchedule) -> Optional[str]:
     )
 
 
+def _plain_id(build_id: Any) -> str:
+    """``build_id`` for the DAG's documentation when it is a plain identifier, else a stand-in.
+
+    No task runs the builds this names, so their ids were never checked; ``doc_md`` is Markdown,
+    which Airflow's UI turns into HTML, and only the identifier grammar keeps markup out of it."""
+    try:
+        return validate_identifier(build_id, kind="build.id")
+    except IdentifierViolation:
+        return "a build whose id is not a plain identifier"
+
+
 def _unwaited_note(unwaited: Tuple[Tuple[str, str], ...]) -> Optional[str]:
     if not unwaited:
         return None
-    names = "; ".join(
-        f"{escape_for_docstring(py_comment_text(build_id))} ({why})" for build_id, why in unwaited
-    )
+    names = "; ".join(f"{_plain_id(build_id)} ({why})" for build_id, why in unwaited)
     return (
         f"A build here depends on these, but no DAG runs them, so no task waits for them: {names}."
     )
