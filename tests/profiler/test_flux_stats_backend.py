@@ -301,4 +301,3 @@ def test_the_backend_reads_a_bundle_through_the_registrys_exact_reader():
     (document,) = backend.read_documents("rate: 0.50\nwhen: 2024-01-01\n", name="s", budget=budget)
     assert document == {"rate": Decimal("0.50"), "when": "2024-01-01"}
     assert backend.canonicalise(document, name="s") == {"rate": "0.50", "when": "2024-01-01"}
-
