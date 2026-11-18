@@ -159,7 +159,7 @@ def render_project_tests(contract: Mapping[str, Any], *, tests_key: str | None =
             if "columns" in model:
                 model["columns"] = model.pop("columns")
 
-    doc: dict[str, Any] = {"version": 2, "models": models}
+    doc: dict[str, Any] = {"version": 2, "models": _inert_jinja(models)}
     body = yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)
     text = (
         f"{MANAGED_BY_SENTINEL}\n"
@@ -334,9 +334,9 @@ def _columns_with_tests(
         desc = col.get("description") or col.get("businessName")
         if desc:
             col_block["description"] = desc
-        col_tests = _tm.merge_tests(
-            list(tests_by_column.get(name) or []),
-            _exempt_placeholders(col, _tm.constraint_tests(col)),
+        col_tests = _exempt_placeholders(
+            col,
+            _tm.merge_tests(list(tests_by_column.get(name) or []), _tm.constraint_tests(col)),
         )
         if col_tests:
             col_block[tests_key] = col_tests
@@ -353,37 +353,47 @@ def _columns_with_tests(
     return out
 
 
-#: The tests a column's own ``validationRules`` and enum produce, from which a placeholder is
-#: exempt (``RFC-data-rules.md`` section 4).
-_PLACEHOLDER_EXEMPT_TESTS = frozenset({"accepted_values", _tm.RANGE_TEST_NAME})
-
-
 def _exempt_placeholders(col: Mapping[str, Any], tests: list[Any]) -> list[Any]:
-    """``tests`` with a ``where`` config that leaves the column's placeholder rows out of its
-    ``accepted_values`` and range tests; unchanged when the column declares no placeholders."""
-    block = col.get("placeholders")
-    if not isinstance(block, Mapping):
+    """The column's ``accepted_values`` and range tests leave its placeholder rows out
+    (:func:`fluid_build.data_rules._dbt.exempt_placeholders`)."""
+    if not isinstance(col.get("placeholders"), Mapping):
         return tests
+    from ..data_rules._dbt import exempt_placeholders
 
-    def texts(key: str) -> list[str]:
-        raw = block.get(key)
-        return [v for v in raw if isinstance(v, str) and v] if isinstance(raw, list) else []
+    return exempt_placeholders(col, tests, _GeneratedJinja)
 
-    from ..data_rules._dbt import placeholder_where
 
-    try:
-        where = placeholder_where(str(col.get("name")), texts("values"), texts("prefixes"))
-    except ValueError:  # a column name no dialect can quote: leave the test as it was
-        return tests
-    if where is None:
-        return tests
-    out: list[Any] = []
-    for test in tests:
-        if isinstance(test, Mapping) and len(test) == 1:
-            ((name, body),) = test.items()
-            if name in _PLACEHOLDER_EXEMPT_TESTS and isinstance(body, Mapping):
-                config = dict(body.get("config") or {})
-                config["where"] = where
-                test = {name: {**body, "config": config}}
-        out.append(test)
-    return out
+_JINJA_DELIMITERS = ("{{", "{%", "{#")
+
+
+class _GeneratedJinja(str):
+    """Jinja this module built from literals (a placeholder ``where``): left as written."""
+
+
+def _inert_jinja(value: Any, *, generated: bool = False) -> Any:
+    """``value`` with every string that holds a Jinja delimiter written as a Jinja string
+    literal of itself (:func:`fluid_build.data_rules._dbt.jinja_text`).
+
+    dbt renders a schema.yml's names, descriptions and test arguments as Jinja, so a column
+    named ``x{{ env_var('SECRET') }}`` or an enum value holding ``{%`` would run during
+    ``dbt parse``. A string without a delimiter is left as written, so the file for every
+    other contract is unchanged. The ``fluid_rule`` test's own arguments are already Jinja
+    built from literals, and are left alone.
+    """
+    if isinstance(value, _GeneratedJinja):
+        return str(value)
+    if isinstance(value, str):
+        if not generated and any(d in value for d in _JINJA_DELIMITERS):
+            from ..data_rules._dbt import jinja_text
+
+            return jinja_text(value)
+        return value
+    if isinstance(value, Mapping):
+        out = {}
+        for key, item in value.items():
+            inner = generated or key == "fluid_rule"
+            out[key] = _inert_jinja(item, generated=inner)
+        return out
+    if isinstance(value, list):
+        return [_inert_jinja(item, generated=generated) for item in value]
+    return value

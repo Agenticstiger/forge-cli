@@ -36,6 +36,11 @@ pytestmark = pytest.mark.unit
 duckdb = pytest.importorskip("duckdb")
 
 
+def _rule(entry: Dict[str, Any]) -> str:
+    """A generated test's rule id, read back from its Jinja literal."""
+    return jinja2.Environment().from_string(entry["fluid_rule"]["rule"]).render()
+
+
 def _billing() -> Dict[str, Any]:
     sys.path.insert(0, str(Path(__file__).parent))
     from test_compile import _billing as billing
@@ -125,7 +130,7 @@ def test_test_names_are_unique_and_safe() -> None:
 def test_each_rule_is_one_model_level_test_with_sql_per_adapter() -> None:
     tests, skipped = _dbt.rule_tests(_billing(), lambda e: e)
     assert skipped == []
-    names = [t["fluid_rule"]["rule"] for t in tests["invoices"]]
+    names = [_rule(t) for t in tests["invoices"]]
     assert names == [
         "gross_from_net",
         "due_after_issue",
@@ -147,7 +152,7 @@ def test_a_rule_no_engine_renders_is_skipped_with_its_reason() -> None:
     tests, skipped = _dbt.rule_tests(contract, lambda e: e)
     assert [s.id for s in skipped] == ["bad"]
     assert "validator refuses it" in skipped[0].reason
-    assert "bad" not in [t["fluid_rule"]["rule"] for t in tests["invoices"]]
+    assert "bad" not in [_rule(t) for t in tests["invoices"]]
 
 
 def test_a_contract_below_the_preview_renders_as_before() -> None:
@@ -227,8 +232,15 @@ def test_without_a_project_or_flag_the_cli_says_what_to_pass(tmp_path: Path) -> 
     assert _run_cli(tmp_path, tmp_path / "s.yml", contract) == 0  # no invariants: no macro
 
 
-def test_a_project_macro_path_outside_it_falls_back_to_macros(tmp_path: Path) -> None:
+def test_a_project_macro_path_outside_it_is_refused(tmp_path: Path) -> None:
+    from fluid_build.cli._common import CLIError
+
     (tmp_path / "dbt_project.yml").write_text("name: p\nmacro-paths: ['../elsewhere']\n")
+    with pytest.raises(CLIError) as refused:
+        _run_cli(tmp_path, tmp_path / "models" / "schema.yml", _billing())
+    assert "--macros-dir" in refused.value.context["detail"]
+    assert not (tmp_path / "models" / "schema.yml").exists()
+    (tmp_path / "dbt_project.yml").write_text("name: p\n")  # no macro-paths: dbt's macros/
     assert _run_cli(tmp_path, tmp_path / "models" / "schema.yml", _billing()) == 0
     assert (tmp_path / "macros" / "fluid" / "fluid_rule.sql").exists()
 
@@ -262,8 +274,14 @@ def _project_contract() -> Dict[str, Any]:
     contract = _billing()
     invoices = contract["exposes"][0]
     status = next(c for c in invoices["contract"]["schema"] if c["name"] == "status")
-    status["validationRules"] = [{"type": "enum", "constraint": "A, B"}]
+    status["validationRules"] = [
+        {
+            "type": "enum",
+            "constraint": "'A', 'B', '{{ exceptions.raise_compiler_error(1337 * 1000 + 42) }}'",
+        }
+    ]
     status["placeholders"] = {"values": ["?"]}
+    status["description"] = "{{ exceptions.raise_compiler_error(1337 * 1000 + 42) }}"
     invoices["contract"]["schema"].append({"name": ODD, "type": "string"})
     quoted = '"' + ODD.replace('"', '""') + '"'
     invoices["contract"]["invariants"] += [
@@ -274,6 +292,9 @@ def _project_contract() -> Dict[str, Any]:
             "mustBeLessOrEqualTo": 25,
             "unit": "percent",
         },
+        # Ids are contract text; dbt renders test arguments, even a bare env_var(...).
+        {"id": "{{ exceptions.raise_compiler_error(1337 * 1000 + 42) }}", "check": "net >= 0"},
+        {"id": "env_var('HOME')", "check": "net >= 0"},
     ]
     return contract
 
@@ -319,8 +340,8 @@ def dbt_results(tmp_path_factory: pytest.TempPathFactory) -> Dict[str, Any]:
     # One test whose adapter has no SQL, to pin the loud failure.
     schema = yaml.safe_load((root / "models" / "schema.yml").read_text())
     tests = schema["models"][0]["data_tests"]
-    orphan = copy.deepcopy(next(t for t in tests if t["fluid_rule"]["rule"] == "dep"))
-    orphan["fluid_rule"].update(name="fluid_no_duckdb", rule="no_duckdb")
+    orphan = copy.deepcopy(next(t for t in tests if _rule(t) == "dep"))
+    orphan["fluid_rule"].update(name="fluid_no_duckdb", rule=_dbt.jinja_text("no_duckdb"))
     orphan["fluid_rule"]["sql"].pop("duckdb")
     tests.append(orphan)
     (root / "models" / "schema.yml").write_text(yaml.safe_dump(schema, sort_keys=False))
@@ -385,3 +406,73 @@ def test_one_column_rule_id_on_two_exposes_gives_two_tests() -> None:
     assert len({b["name"] for b in bodies.values()}) == 3
     for model, body in bodies.items():
         assert f'ref("{model}")' in body["sql"]["duckdb"]
+
+
+def test_real_dbt_runs_no_contract_text_as_jinja(dbt_results: Dict[str, Any]) -> None:
+    # Run as Jinja, the text would print 1337042; as data it stays 1337 * 1000 + 42.
+    assert "1337042" not in dbt_results["log"]
+    names = dbt_results["by_name"]
+    assert names["fluid_exceptions_raise_compiler_error_1337_1000_42"]["status"] == "pass"
+    assert names["fluid_env_var_HOME"]["status"] == "pass"
+
+
+def test_a_dq_value_rule_on_a_placeholder_column_is_exempt_too() -> None:
+    contract = _billing()
+    invoices = contract["exposes"][0]
+    status = next(c for c in invoices["contract"]["schema"] if c["name"] == "status")
+    status["placeholders"] = {"values": ["?"]}
+    invoices["contract"]["dq"] = {
+        "rules": [{"id": "st", "type": "valid_values", "selector": "status", "values": ["A", "B"]}]
+    }
+    doc = yaml.safe_load(render_dbt_tests(contract))
+    column = next(c for c in doc["models"][0]["columns"] if c["name"] == "status")
+    accepted = [t for t in column["tests"] if isinstance(t, dict) and "accepted_values" in t]
+    assert accepted and all("where" in t["accepted_values"]["config"] for t in accepted)
+
+
+def test_the_engine_path_exempts_placeholders_as_the_exporter_does() -> None:
+    from fluid_build.engines.dbt.schema_yml import _tests_for_column
+
+    column = {
+        "name": "status",
+        "type": "string",
+        "validationRules": [{"type": "enum", "constraint": "A, B"}],
+        "placeholders": {"prefixes": ["TBD_"]},
+    }
+    tests = _tests_for_column(column, [])
+    accepted = next(t for t in tests if isinstance(t, dict) and "accepted_values" in t)
+    assert "SUBSTR" in accepted["accepted_values"]["config"]["where"]
+    column.pop("placeholders")
+    assert (
+        "config"
+        not in next(
+            t
+            for t in _tests_for_column(column, [])
+            if isinstance(t, dict) and "accepted_values" in t
+        )["accepted_values"]
+    )
+
+
+def test_a_placeholder_prefix_covers_text_with_a_line_break() -> None:
+    from test_compile import _contract, _expose
+
+    contract = _contract(
+        _expose(
+            "p",
+            [
+                {
+                    "name": "code",
+                    "type": "string",
+                    "identifierFormat": [{"mask": "99"}],
+                    "placeholders": {"prefixes": ["TBD"]},
+                }
+            ],
+        )
+    )
+    from fluid_build.data_rules._compile import compile_rules
+
+    rule = next(r for r in compile_rules(contract) if r.kind == "identifierFormat")
+    db = duckdb.connect()
+    db.execute("CREATE TABLE p (code VARCHAR)")
+    db.execute("INSERT INTO p VALUES ('12'), ('TBD a' || chr(10) || 'b'), ('x')")
+    assert db.execute(rule.counts(lambda e: f'"{e}"')).fetchone() == (3, 1)

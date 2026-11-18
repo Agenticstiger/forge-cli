@@ -67,7 +67,9 @@ MACRO = (
     this test, never the parse of the whole project. -#}
 {%- if execute -%}
 {{ exceptions.raise_compiler_error("fluid_rule " ~ rule ~ ": forge wrote no SQL for the "
-   ~ target.type ~ " adapter; it writes " ~ (sql.keys() | list | join(", "))) }}
+   ~ target.type ~ " adapter (it writes " ~ (sql.keys() | list | join(", ")) ~ "). "
+   ~ "`fluid generate dbt-tests` warned why; run this rule on one of those adapters, "
+   ~ "or restate it in FLUID SQL/1 that " ~ target.type ~ " can run.") }}
 {%- endif -%}
 select 1 as fluid_no_sql where false
 {%- else %}
@@ -94,11 +96,13 @@ _SENTINEL = re.compile(_NUL + "([0-9]+)" + _NUL)
 
 @dataclass(frozen=True)
 class Skipped:
-    """A rule no engine renders, and why."""
+    """A rule no engine renders (``adapters`` empty), or one some adapters cannot run
+    (``adapters`` names them), and why."""
 
     id: str
     expose: str
     reason: str
+    adapters: Tuple[str, ...] = ()
 
 
 def jinja_text(text: str) -> str:
@@ -218,24 +222,31 @@ def rule_tests(
         sql: Dict[str, str] = {}
         holds: Dict[str, str] = {}
         reasons: List[str] = []
+        missing: List[str] = []
         for adapter, dialect in ADAPTERS.items():
             rule = by_dialect[dialect].get((first.expose, first.id))
             if rule is None or rule.status != EXECUTABLE or rule.counts is None:
                 reasons.append(rule.reason if rule is not None else "")
+                missing.append(adapter)
                 continue
             try:
                 sql[adapter], holds[adapter] = _rendered(rule, dialect, model_of)
             except (_Refused, ValueError) as why:
                 reasons.append(str(why))
+                missing.append(adapter)
+        reason = next((r for r in reasons if r), "") or "its expose has no dbt model"
         if not sql or not model:
-            reason = next((r for r in reasons if r), "") or "its expose has no dbt model"
             skipped.append(Skipped(first.id, first.expose, reason))
             continue
+        if missing:
+            skipped.append(Skipped(first.id, first.expose, reason, tuple(missing)))
         tests.setdefault(model, []).append(
             {
                 TEST_NAME: {
                     "name": test_name(first.id, taken),
-                    "rule": first.id,
+                    # dbt renders every string test argument as Jinja (and a bare
+                    # env_var(...) too): the id is contract text, so it is a literal.
+                    "rule": jinja_text(first.id),
                     "sql": sql,
                     "holds": holds,
                     "config": {"severity": _SEVERITY.get(first.severity, "error")},
@@ -267,3 +278,42 @@ def placeholder_where(column: str, values: List[str], prefixes: List[str]) -> Op
     for i, (listed, sql) in enumerate(branches):
         text += ("{% if" if i == 0 else "{% elif") + f" target.type in [{listed}] %}}{sql}"
     return text + "{% else %}TRUE{% endif %}"
+
+
+#: The tests a column's own ``validationRules``, enum and dq value rules produce, from which a
+#: placeholder is exempt (RFC 4): dbt's ``accepted_values`` and dbt_expectations' range test.
+PLACEHOLDER_EXEMPT_TESTS = frozenset(
+    {"accepted_values", "dbt_expectations.expect_column_values_to_be_between"}
+)
+
+
+def exempt_placeholders(
+    col: Mapping[str, Any], tests: List[Any], mark: Callable[[str], str] = str
+) -> List[Any]:
+    """``tests`` with a ``where`` config that leaves the column's placeholder rows out of its
+    ``accepted_values`` and range tests; unchanged when it declares none. ``mark`` wraps the
+    ``where`` text (a caller that escapes contract text marks it as already Jinja)."""
+    block = col.get("placeholders")
+    if not isinstance(block, Mapping):
+        return tests
+
+    def texts(key: str) -> List[str]:
+        raw = block.get(key)
+        return [v for v in raw if isinstance(v, str) and v] if isinstance(raw, list) else []
+
+    try:
+        where = placeholder_where(str(col.get("name")), texts("values"), texts("prefixes"))
+    except ValueError:  # a column name no dialect can quote: leave the tests as they were
+        return tests
+    if where is None:
+        return tests
+    out: List[Any] = []
+    for test in tests:
+        if isinstance(test, Mapping) and len(test) == 1:
+            ((name, body),) = test.items()
+            if name in PLACEHOLDER_EXEMPT_TESTS and isinstance(body, Mapping):
+                config = dict(body.get("config") or {})
+                config["where"] = mark(where)
+                test = {name: {**body, "config": config}}
+        out.append(test)
+    return out
