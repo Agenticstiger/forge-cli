@@ -391,3 +391,12 @@ def test_the_airbyte_deployment_token_path_is_policed() -> None:
     assert (
         "resolve_secret(" in source and "host=connection_host(" in source
     ), "the deployment.auth.secretRef path is unpoliced"
+
+
+@pytest.mark.parametrize("host", ["", None])
+def test_an_empty_host_is_refused_before_the_secret_is_read(host: Any) -> None:
+    """Seen live on 0.32.0: the duckdb and dlt clients sent it to a project's PGHOST."""
+    with pytest.raises(AcquisitionSecretPolicyError) as info:
+        _resolve({"host": host, "user": "u", "secretRef": f"env://{VARIABLE}"})
+    assert "connection.host is empty" in info.value.what
+    assert SECRET not in str(info.value)
