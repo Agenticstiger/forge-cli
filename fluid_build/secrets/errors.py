@@ -23,7 +23,11 @@ class SecretError(FluidUserError):
     flattens the error into a one-line run failure still says how to fix it.
     None of the three ever holds a value. The what ends in a full stop, not a
     colon: the log redactor reads ``credential: A`` as an assignment and masks
-    the word after it.
+    the word after it. For the same reason no message puts ``: `` right after a
+    reference, which often ends in such a word (``#password``, ``.../token``):
+    ``vault://kv/pg#password: the vault:// scheme ...`` lost ``the``. A refusal
+    names the reference and goes on with ``cannot resolve, because`` or ``was
+    not fetched, because``.
     """
 
     code: str = "SecretError"

@@ -11,8 +11,12 @@ response handling follow hvac's ``secrets.kv.v2.read_secret_version`` (a
 soft-deleted version answers 404 with ``data.metadata.deletion_time``),
 ``read_secret_metadata``, ``auth.jwt.jwt_login`` and ``sys.unwrap``.
 
-Everything below comes from the operator's environment; each name is protected
-(``credentials/protected_env.py``), so a project dotenv file cannot set it.
+Everything below comes from the operator's environment. Each name but the two
+token variables is protected (``credentials/protected_env.py``), so a project
+dotenv file cannot set it. A project file's ``BAO_TOKEN`` or ``VAULT_TOKEN``
+loads only while the operator has no token of their own (neither variable, no
+``~/.vault-token``: ``protected_env.refused_project_vault_tokens``), so it
+never replaces the operator's.
 
 * Address: ``BAO_ADDR``, else ``VAULT_ADDR`` (OpenBao prefers ``BAO_`` and
   falls back to ``VAULT_``). ``https``, or ``http`` to a loopback address only:
