@@ -72,11 +72,11 @@ def moto_endpoint() -> Iterator[str]:
 
 
 @pytest.fixture(scope="module")
-def tofu_env(tmp_path_factory: pytest.TempPathFactory) -> Dict[str, str]:
-    """``tofu``'s environment: a shared plugin cache, and no way to reach a real
+def tofu_env() -> Dict[str, str]:
+    """``tofu``'s environment: the run's provider cache
+    (``tests/_infrastructure/tofu_cache.py``), and no way to reach a real
     account (every ``AWS_*`` variable dropped, moto endpoints, dummy keys)."""
     env = {k: v for k, v in build_tofu_env().items() if not k.startswith("AWS_")}
-    env.setdefault("TF_PLUGIN_CACHE_DIR", str(tmp_path_factory.mktemp("tofu-plugin-cache")))
     env["AWS_CONFIG_FILE"] = "/dev/null"
     env["AWS_SHARED_CREDENTIALS_FILE"] = "/dev/null"
     env["AWS_EC2_METADATA_DISABLED"] = "true"

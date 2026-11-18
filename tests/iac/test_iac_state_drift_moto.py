@@ -61,15 +61,12 @@ pytestmark.append(
 )
 
 
-@pytest.fixture(scope="module")
-def plugin_cache(tmp_path_factory: pytest.TempPathFactory) -> str:
-    """One provider download for the module, not one per workdir."""
-    return str(tmp_path_factory.mktemp("tofu-plugin-cache"))
-
-
 @pytest.fixture
-def moto(monkeypatch, tmp_path: Path, plugin_cache: str) -> Iterator[str]:
-    """A fresh moto server that both ``tofu`` and boto3 are pointed at."""
+def moto(monkeypatch, tmp_path: Path) -> Iterator[str]:
+    """A fresh moto server that both ``tofu`` and boto3 are pointed at.
+
+    ``tofu`` installs its provider from the run's cache, which every test inherits
+    (``TF_PLUGIN_CACHE_DIR``, ``tests/_infrastructure/tofu_cache.py``)."""
     import httpx
     from moto.server import ThreadedMotoServer
 
@@ -90,7 +87,6 @@ def moto(monkeypatch, tmp_path: Path, plugin_cache: str) -> Iterator[str]:
         monkeypatch.setenv("AWS_CONFIG_FILE", "/dev/null")
         monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", "/dev/null")
         monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
-        monkeypatch.setenv("TF_PLUGIN_CACHE_DIR", plugin_cache)
         monkeypatch.chdir(tmp_path)
         yield endpoint
     finally:

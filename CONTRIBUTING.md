@@ -213,6 +213,15 @@ coverage report --fail-under=80 \
   --omit="fluid_build/providers/*,fluid_build/cli/provider_action_executor.py"
 ```
 
+### Tests that run `tofu`
+
+Every test that runs `tofu init` shares one provider cache for the whole pytest run
+(`tests/_infrastructure/tofu_cache.py`). A test directory then holds a symlink to the provider,
+not its own 0.75 GB copy of `hashicorp/aws`. The cache lives in the run's basetemp and goes with
+it. To keep providers between runs, point `TF_PLUGIN_CACHE_DIR` at a directory that exists; it
+is used as given. A test that builds `tofu`'s environment with `build_tofu_env()` gets the cache
+from it, and one that starts `tofu` directly inherits it.
+
 ### Writing Good Tests
 
 **Test behaviour, not implementation.** A test should verify *what* a function produces, not *how* it does it internally. If a test breaks when you refactor without changing behaviour, the test is too tightly coupled.

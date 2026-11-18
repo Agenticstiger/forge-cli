@@ -665,18 +665,18 @@ def tofu_binary() -> str:
 
 
 @pytest.fixture(scope="session")
-def tofu_env(tmp_path_factory: pytest.TempPathFactory) -> Dict[str, str]:
+def tofu_env() -> Dict[str, str]:
     """The environment for ``tofu`` child processes.
 
     Carries the inherited environment (so the ``snowflakedb/snowflake``
     provider self-configures from ``SNOWFLAKE_*``), the plugin's
     ``credential_env`` overlay (the ``SNOWFLAKE_ACCOUNT`` → org/account
-    split), and a session-shared provider cache so the ~16 live tests do
-    not each re-download the provider.
+    split), and the run's provider cache, which ``build_tofu_env`` passes
+    through from the environment (``tests/_infrastructure/tofu_cache.py``), so
+    the ~16 live tests do not each re-download the provider.
     """
     env = build_tofu_env(snowflake_plugin())
     env.update(snowflake_plugin().credential_env(dict(os.environ)))
-    env["TF_PLUGIN_CACHE_DIR"] = str(tmp_path_factory.mktemp("tofu-plugin-cache"))
     return env
 
 
