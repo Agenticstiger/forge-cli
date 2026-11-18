@@ -193,6 +193,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Withheld, by the check (CL_CONF_STATUS code): A (small count) 3.` A new line counts the
   histogram cells withheld inside published groups. Every other statistic keeps the check's code,
   and a profile 0.32.0 wrote still reads.
+- **`fluid profile --help` says what a published `min` or `max` leaves readable.** A `min` or
+  `max` shows that no record lies below or above it, a range of no records that no check
+  withholds (FLUX ADR 0012, amended 2026-11-18). A quantile whose value is the column's smallest
+  or largest shows the same, and under the defaults, which hold zeros disclosive, it is withheld
+  for that. The help and the output checks' documentation now say so. Nothing the profiler
+  writes changes.
 
 
 ### Fixed

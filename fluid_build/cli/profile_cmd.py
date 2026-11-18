@@ -66,7 +66,10 @@ the level holds at least one record. A group withheld for its size withholds
 every group of its groupBy's histograms and quantiles on its column too, and a
 quantile is published only as the one histogram or quantile of its column. A withheld cell of
 a histogram is not secondarily suppressed: the rounded counts still bound it,
-inside 0 to 9 records, and never above the threshold.
+inside 0 to 9 records, and never above the threshold. A published min or max
+shows that no record lies below or above it. A quantile whose value is the
+column's smallest or largest shows the same, and is withheld for it, as a zero
+is.
 
 These are output-checking conventions only. No privacy or anonymity guarantee
 is made or implied: read the document before you share it.
@@ -87,7 +90,9 @@ fluid profile contract.fluid.yaml --expose orders \\
 # records lie below it and 10 above it, and only as its column's one histogram or
 # quantile. A group of fewer than 10 records withholds every group of its groupBy's
 # histograms and quantiles on its column. A histogram's or a quantile's withheld values all read C,
-# whatever withheld them. Output-checking conventions only: no privacy or anonymity
+# whatever withheld them. A min or max is published though it shows that no record lies
+# below or above it, and a quantile at the column's smallest or largest value is withheld
+# for showing the same. Output-checking conventions only: no privacy or anonymity
 # guarantee. Pin the printed digest in the FLUX Simulation.
 # Each number column also gets mean/1, which FLUX compares a mean property with, on the
 # grid --fractional-bits names (16 unless given): the fidelity block must declare it.
