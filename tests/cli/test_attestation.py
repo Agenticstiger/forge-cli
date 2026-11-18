@@ -286,7 +286,9 @@ class TestBuildAttestation:
         assert ext["sign_mode"] == "keyless"
         # Defaults are still there.
         assert ext["bundleOut"] == str(fake_bundle.resolve())
-        assert ext["bundleDigest"].startswith("sha256:")
+        assert (
+            ext["packetDigest"] == "sha256:" + hashlib.sha256(fake_bundle.read_bytes()).hexdigest()
+        )
 
     def test_github_metadata_flows_into_run_details(self, fake_bundle, clear_ci_env):
         clear_ci_env.setenv("GITHUB_RUN_ID", "12345")
