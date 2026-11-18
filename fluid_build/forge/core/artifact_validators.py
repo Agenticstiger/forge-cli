@@ -30,7 +30,7 @@ import logging
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -492,6 +492,45 @@ def validate_dag_python(path: str, content: bytes) -> List[ValidationIssue]:
         Path(tmp_path).unlink(missing_ok=True)
 
 
+def validate_spark_job_json(path: str, content: bytes) -> List[ValidationIssue]:
+    """Structural check on ``spark/<build id>/job.json``.
+
+    The forge Spark runner's config, as the compiler writes it
+    (``spark/compiler.py::SparkJob.text``): a JSON object with an integer
+    ``configVersion``, whose ``build`` is the directory it sits in, and the
+    ``product``, ``mode`` and ``sink`` the runner reads first.
+    """
+    problems: List[Tuple[str, str]] = []
+    parts = path.split("/")
+    doc: Any = None
+    if len(parts) != 3 or parts[2] != "job.json":
+        problems.append(("expected spark/<build id>/job.json", "SPARK-PATH"))
+    else:
+        try:
+            doc = json.loads(content.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            problems.append((f"parse failure: {exc}", "SPARK-PARSE"))
+    if not problems and not isinstance(doc, dict):
+        problems.append((f"expected object at root, got {type(doc).__name__}", "SPARK-SHAPE"))
+    if not problems:
+        version = doc.get("configVersion")
+        if not isinstance(version, int) or isinstance(version, bool):
+            problems.append(("configVersion must be an integer", "SPARK-SHAPE"))
+        if doc.get("build") != parts[1]:
+            problems.append(
+                (f"build is {doc.get('build')!r}, not its directory {parts[1]!r}", "SPARK-SHAPE")
+            )
+        problems.extend(
+            (f"missing required key: {key}", "SPARK-SHAPE")
+            for key in ("product", "mode", "sink")
+            if key not in doc
+        )
+    return [
+        ValidationIssue(file=path, validator="spark", severity="error", message=m, code=c)
+        for m, c in problems
+    ]
+
+
 def validate_bindings_json(path: str, content: bytes) -> List[ValidationIssue]:
     """Structural key-check on ``policy/bindings.json``.
 
@@ -811,6 +850,8 @@ def _dispatch_by_prefix(path: str, content: bytes) -> Callable[[str, bytes], Lis
         return validate_dag_python
     if path == "policy/bindings.json":
         return validate_bindings_json
+    if path.startswith("spark/"):
+        return validate_spark_job_json
     # Unknown — bind a no-op validator that flags it as a warning.
     return _flag_unexpected
 
@@ -932,4 +973,5 @@ __all__ = [
     "validate_odps_bitol",
     "validate_opa_conftest",
     "validate_opds",
+    "validate_spark_job_json",
 ]
