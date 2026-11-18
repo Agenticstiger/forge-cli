@@ -906,6 +906,14 @@ def test_origins_follow_siblings_pointers_and_text(tmp_path: Path) -> None:
     assert origins.locate(["column"], definition=True) == (shared, 1)
     assert origins.describe(["column", "type"]) == "shared.yaml:2"
     assert origins.describe(["column", "description"]) is None
+    # The column too, where the key starts, 1-based; a text file has neither.
+    assert origins.locate_span(["column", "description"]) == (root, 3, 3)
+    assert origins.locate_span(["column", "type"]) == (shared, 2, 1)
+    assert origins.locate_span(["sql"]) == (sql, None, None)
+    # What the root file itself holds there, whoever wrote the composed value.
+    assert origins.line_in(root, ["column", "type"]) is None
+    assert origins.line_in(root, ["column"]) == (1, 1)
+    assert origins.line_in(root, ["sql"]) == (4, 1)
 
 
 def test_the_api_tells_where_a_value_was_written(tmp_path: Path) -> None:
