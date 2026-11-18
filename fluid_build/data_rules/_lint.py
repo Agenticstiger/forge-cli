@@ -121,9 +121,25 @@ class Finding:
         return json_pointer(list(self.path))
 
 
+@dataclass(frozen=True)
+class AttributeRoutes:
+    """An accepted shared attribute: ``owner`` is ``(exposeId, column)``, and each member
+    other than the owner is ``(exposeId, column, route)``, its route the relationship names
+    that lead from it to the owner."""
+
+    owner: Tuple[str, str]
+    members: Tuple[Tuple[str, str, Tuple[str, ...]], ...]
+
+
 def lint(contract: Mapping[str, Any]) -> List[Finding]:
     """Every data-rules finding for ``contract``, in contract order."""
     return _Lint(contract).run()
+
+
+def analyze(contract: Mapping[str, Any]) -> Tuple[List[Finding], Dict[str, AttributeRoutes]]:
+    """The findings of :func:`lint`, and the routes of each shared attribute it accepts."""
+    run = _Lint(contract)
+    return run.run(), run.routes
 
 
 def _hint(name: Any, choices: Iterable[str]) -> str:
@@ -172,6 +188,8 @@ class _Lint:
         self.related: Set[Tuple[str, str, str]] = set()
         self.attribute_of: Dict[Node, str] = {}
         self.reach_cache: Dict[str, Set[str]] = {}
+        #: Each shared attribute the lint accepts: its owner and every other member's route.
+        self.routes: Dict[str, AttributeRoutes] = {}
 
     def run(self) -> List[Finding]:
         self.ids()
@@ -503,7 +521,14 @@ class _Lint:
             summary = column.type.type
             reads.add((child.expose_id, column.name))
         else:
-            return None  # the schema's enum reports it
+            # The schema's enum refuses it too, but an export may run on a contract no one
+            # validated: the lint says so itself, so every consumer refuses the summary.
+            self.error(
+                f"{label}.function",
+                path + ("function",),
+                f"{function!r} is not a summary function: count, sum, min or max",
+            )
+            return None
         if "filter" in agg:
             checked = self.text(
                 child, child.model, agg["filter"], fs.PREDICATE, label, path, "filter"
@@ -977,6 +1002,14 @@ class _Lint:
                     )
                     return
         owner_name = next(name for e, name in members if e.expose_id == owner)
+        self.routes[attribute] = AttributeRoutes(
+            owner=(owner, owner_name),
+            members=tuple(
+                (expose.expose_id, name, found[expose.expose_id][0])
+                for expose, name in members
+                if expose.expose_id != owner
+            ),
+        )
         for expose, name in members:
             self.attribute_of[(expose.expose_id, name)] = attribute
             if expose.expose_id != owner:

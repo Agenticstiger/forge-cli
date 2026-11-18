@@ -89,8 +89,13 @@ def quote_string_literal_for(dialect: str | None, value: str) -> str:
     return quote_string_literal(value, backslash_escapes=dialect_uses_backslash_escapes(dialect))
 
 
-#: Dialects whose quoted identifiers are ``"..."`` with ``""`` for a quote inside.
-_DOUBLE_QUOTE_IDENT_DIALECTS = frozenset({"ansi", "duckdb", "postgres", "postgresql", "snowflake"})
+#: Dialects whose quoted identifiers are ``"..."`` with ``""`` for a quote inside. Athena's
+#: queries run on Trino, which quotes this way (its DDL, run on Hive, takes backticks).
+_DOUBLE_QUOTE_IDENT_DIALECTS = frozenset(
+    {"ansi", "athena", "duckdb", "postgres", "postgresql", "snowflake", "trino"}
+)
+#: Dialects whose quoted identifiers are ```...``` with a doubled backtick inside (Spark SQL).
+_DOUBLED_BACKTICK_IDENT_DIALECTS = frozenset({"databricks", "spark"})
 
 
 def quote_identifier_for(dialect: str | None, name: str) -> str:
@@ -106,9 +111,16 @@ def quote_identifier_for(dialect: str | None, name: str) -> str:
         raise ValueError(f"Invalid SQL identifier: {name!r}")
     if _CONTROL_CHARS.search(name):
         raise ValueError(f"Invalid SQL identifier {name!r}: control characters are not permitted")
-    if (dialect or "").strip().lower() not in _DOUBLE_QUOTE_IDENT_DIALECTS:
-        raise ValueError(f"no identifier quoting for SQL dialect {dialect!r}")
-    return '"' + name.replace('"', '""') + '"'
+    key = (dialect or "").strip().lower()
+    if key in _DOUBLE_QUOTE_IDENT_DIALECTS:
+        return '"' + name.replace('"', '""') + '"'
+    if key in _DOUBLED_BACKTICK_IDENT_DIALECTS:
+        return "`" + name.replace("`", "``") + "`"
+    if key == "bigquery":
+        # BigQuery reads escape sequences inside a quoted identifier, as inside a string
+        # literal: the backslash is doubled first, then the backtick escaped.
+        return "`" + name.replace("\\", "\\\\").replace("`", "\\`") + "`"
+    raise ValueError(f"no identifier quoting for SQL dialect {dialect!r}")
 
 
 def quote_ansi_string_literal(value: str) -> str:
