@@ -519,7 +519,7 @@ def test_the_deferred_notice_names_the_entry_apply_needs_and_no_value(monkeypatc
     assert isinstance(notice, SecretPolicyError)
     assert "connection.host ('{{ env.PGHOST }}')" in notice.what
     assert f'{ALLOWLIST_ENV}="vault://kv/acme/pg#password@<host>"' in notice.fix
-    assert "{{ env.PGHOST }} set" in notice.fix
+    assert "(with PGHOST as set there)" in notice.fix
     assert "db.private-value.internal" not in str(notice)
 
 

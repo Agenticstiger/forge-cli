@@ -124,7 +124,7 @@ _OBJECT_STORE_SCHEMES = frozenset({"s3", "s3a", "s3n", "gs", "gcs", "az", "azure
 _HOST_PORT = re.compile(r"(?:\[(?P<v6>[^\[\]]*)\]|(?P<name>[^\[\]:]*))(?::\d*)?")
 #: One ``{{ env.NAME }}`` placeholder, as ``build_runners.base`` renders it
 #: (``util.binding_paths.ENV_PLACEHOLDER_RE``): a name only, so it cannot hold a host.
-_ENV_PLACEHOLDER = re.compile(r"\{\{\s*env\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}")
+_ENV_PLACEHOLDER = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 
 
 @dataclass
@@ -737,7 +737,7 @@ def deferred_destination_notice(
     parsed = parse_secret_ref(ref) if isinstance(ref, str) else ref
     fields = ", ".join(f"{name} ({value!r})" for name, value in written.items())
     variables = sorted(
-        {match.group(0) for value in written.values() for match in _ENV_PLACEHOLDER.finditer(value)}
+        {match.group(1) for value in written.values() for match in _ENV_PLACEHOLDER.finditer(value)}
     )
     return SecretPolicyError(
         what=(
@@ -751,10 +751,10 @@ def deferred_destination_notice(
             "allowlist entry naming the placeholder itself never matches."
         ),
         fix=(
-            "Unless it renders to a loopback host, allow it in the environment fluid apply "
-            f"runs in, in {_OPERATOR_ONLY}: "
-            f'{ALLOWLIST_ENV}="{_suggested_entry(parsed, "<host>")}", where <host> is the '
-            f"host it renders to there, with {', '.join(variables)} set, and without a port."
+            f"Unless it renders to a loopback host, allow that host in {_OPERATOR_ONLY} "
+            f'where fluid apply runs: {ALLOWLIST_ENV}="{_suggested_entry(parsed, "<host>")}", '
+            f"with <host> the host it renders to there (with {', '.join(variables)} as set "
+            "there), without a port."
         ),
         doc=doc_url("secrets"),
     )
