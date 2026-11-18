@@ -19,6 +19,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it, so `fluid --help` and `fluid providers` are unchanged. The Databricks test helpers and the
   entry-point plugin tests now use it.
 
+- **`fluid profile --bundle DIR` answers a FLUX Simulation's fidelity block.** A profile
+  carried only the column metrics and an ungrouped mean per number column, so a run checked
+  against it could score no other declared property. With `--bundle`, the command reads the
+  block of DIR's one Simulation (`*.flux.yml`) for the expose, as the FLUX engine reads it,
+  and parses it with flux-stats' own grammar (`flux_stats.fidelity`), so forge-cli holds no
+  parser of its own. It writes the statistic each declared property is compared with: a mean,
+  a histogram over the declared bins or levels, a support or a quantile, per group where the
+  property has a `groupBy`, on the block's grid. Each group and each cell is output-checked as
+  the rest of the profile is. A withheld group of a mean or a support also withholds its
+  siblings under `D` (secondary suppression), so it cannot be recovered from the column's
+  published total, and the records a null `groupBy` value leaves out of every group count as
+  one more group there. A grouped statistic lists every group the data forms, and each key is a
+  level the bundle declares (a record whose `groupBy` value the block does not declare is
+  refused), so a key says only that its level holds at least one record. A
+  correlation is not answered, because its moments need the exact record count, which the
+  checks round. The report names every statistic withheld whole or in part, since a run that
+  checks them scores them censored or over the published groups only, and every property
+  left out, which a run that checks it refuses with `FLX-5037`.
+  `[profile]` now needs flux-stats 0.6.2, the first release that carries `flux_stats.fidelity`.
+
 ### Changed
 
 - **An `enum` level may hold any character (FLUID 0.7.7 preview).** Real data has levels such

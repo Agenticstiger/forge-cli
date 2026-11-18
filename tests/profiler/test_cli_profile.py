@@ -102,7 +102,7 @@ def test_without_the_registry_nothing_is_read_and_nothing_written(workspace, cap
     assert rc == 1
     assert "profile_statistics_unavailable" in out
     assert "and flux-stats is not installed" in out
-    assert "It needs flux-stats>=0.6.0,<0.7" in out
+    assert "It needs flux-stats>=0.6.2,<0.7" in out
     assert "next: pip install 'data-product-forge[profile]'" in out
     assert "git+https" not in out
     assert not (workspace / "orders.profile.json").exists()
@@ -156,6 +156,7 @@ def test_profile_help_explains_what_leaves(capsys):
     text = " ".join(capsys.readouterr().out.replace("#", " ").split())
     assert "no privacy or anonymity guarantee" in text
     assert "--source" in text and "--table" in text
+    assert "--bundle DIR" in text and "answer a Simulation's fidelity block" in text
 
 
 def test_a_linked_profile_target_is_refused_and_its_target_untouched(workspace, registry, capsys):
@@ -233,6 +234,32 @@ def _run(argv):
         return exited.code
 
 
+def test_the_summary_names_each_statistic_once_with_its_columns_and_shape():
+    assert profile_cmd._named(
+        [
+            ("amount", "mean/1", None, None),
+            ("qty", "mean/1", None, None),
+            ("amount", "mean/1", "market", None),
+            ("amount", "quantile/1", None, "at level 0.5"),
+            ("amount", "quantile/1", None, "at level 0.99"),
+        ]
+    ) == [
+        "mean/1 of 'amount', 'qty'",
+        "mean/1 of 'amount' by 'market'",
+        "quantile/1 of 'amount' at level 0.5",
+        "quantile/1 of 'amount' at level 0.99",
+    ]
+    assert profile_cmd._named_partly(
+        [
+            ("amount", "quantile/1", "market", "at level 0.5", 3, 4),
+            ("amount", "quantile/1", "market", "at level 0.01", 1, 4),
+        ]
+    ) == [
+        "quantile/1 of 'amount' at level 0.5 by 'market' (3 of 4 groups)",
+        "quantile/1 of 'amount' at level 0.01 by 'market' (1 of 4 groups)",
+    ]
+
+
 def test_the_summary_names_the_fidelity_statistics_and_their_grid(workspace, registry, capsys):
     assert main(["profile", "contract.fluid.yaml", "--source", "orders.ndjson"]) == 0
     out = " ".join(capsys.readouterr().out.split())
@@ -285,3 +312,68 @@ def test_profile_help_names_the_mean_and_its_grid(capsys):
     text = " ".join(capsys.readouterr().out.split())
     assert "mean/1" in text and "--fractional-bits" in text
     assert "encoding.fractionalBits" in text
+
+
+# -- --bundle ---------------------------------------------------------------------
+
+SIMULATION = """\
+kind: Simulation
+id: sim-orders
+extensions:
+  com.agentics.flux/1:
+    emits:
+      orders:
+        fidelity: {encoding: {fractionalBits: 8}}
+"""
+
+
+def _no_bundle(workspace):
+    """Leave the workspace as it is: the bundle named is not there, or is a file."""
+
+
+def _empty_bundle(workspace):
+    (workspace / "bundle").mkdir()
+
+
+def _bundle_for_another_expose(workspace):
+    (workspace / "bundle").mkdir()
+    (workspace / "bundle" / "sim.flux.yml").write_text(
+        SIMULATION.replace("orders:", "other:"), encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    ("prepare", "given", "said"),
+    [
+        pytest.param(_no_bundle, "nope", ("nope",), id="missing"),
+        # An unset variable (--bundle "$BUNDLE") must not drop the block unnoticed.
+        pytest.param(
+            _no_bundle,
+            "",
+            ("profile_bundle_not_a_directory", "--bundle names no directory"),
+            id="empty",
+        ),
+        pytest.param(
+            _no_bundle, "contract.fluid.yaml", ("profile_bundle_not_a_directory",), id="a-file"
+        ),
+        pytest.param(
+            _empty_bundle, "bundle", ("profile_bundle_no_simulation",), id="no-simulation"
+        ),
+        pytest.param(
+            _bundle_for_another_expose,
+            "bundle",
+            ("profile_bundle_no_block", "'orders'"),
+            id="no-block-for-the-expose",
+        ),
+    ],
+)
+def test_a_bundle_that_gives_no_block_is_refused_before_anything_is_read(
+    workspace, registry, capsys, prepare, given, said
+):
+    prepare(workspace)
+    rc = main(["profile", "contract.fluid.yaml", "--source", "orders.ndjson", "--bundle", given])
+    out = capsys.readouterr().out
+    assert rc == 1
+    for words in said:
+        assert words in out
+    assert not (workspace / "orders.profile.json").exists()
