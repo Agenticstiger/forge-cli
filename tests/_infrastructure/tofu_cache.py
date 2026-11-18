@@ -32,6 +32,11 @@ An operator's own ``TF_PLUGIN_CACHE_DIR`` and flag are kept: CI sets one for the
 and a developer can point a run at a cache that lives across runs. Without ``tofu`` on PATH
 nothing is set, so the suites that never run it see no change.
 
+One failure to know. A ``tofu init`` killed in the middle of the first install of a provider
+leaves a partial package in the cache, and with the flag later ``init``s link it without a
+check: every test of that provider then fails with "Unrecognized remote plugin message"
+(measured with ``hashicorp/aws``, killed at 170 MB of 765 MB). Delete the cache directory.
+
 Sources: OpenTofu, "Provider Plugin Cache" (opentofu.org/docs/cli/config/config-file) and
 the 1.10.0 changelog (cache locking); pytest-xdist how-to.
 """

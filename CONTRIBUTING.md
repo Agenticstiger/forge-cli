@@ -215,7 +215,7 @@ coverage report --fail-under=80 \
 
 ### Tests that run `tofu`
 
-Every test that runs `tofu init` shares one provider cache for the whole pytest run
+Tests that run `tofu init` share one provider cache for the whole pytest run
 (`tests/_infrastructure/tofu_cache.py`). A test directory then holds a symlink to the provider,
 not its own 0.75 GB copy of `hashicorp/aws`. The cache lives in the run's basetemp and goes with
 it. To keep providers between runs, point `TF_PLUGIN_CACHE_DIR` at a directory that exists; it
