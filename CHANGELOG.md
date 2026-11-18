@@ -65,6 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count less its siblings' sizes, which only a grouped mean or support withheld. Now, when a group
   of a groupBy (or the rows a null key leaves out of every group) fails the size check, every
   group of that groupBy's histograms and quantiles on the column is withheld too, counted as `D`.
+- **These entries complete FLUX ADR 0012's rule only with the change that follows them.** A
+  reader can still subtract one histogram's published counts from another's, or from a level
+  histogram's group size, and rebuild a withheld cell, a zero included. FLUX's
+  `check_edge_counts` closes that, and forge-cli calls it once a flux-stats release carries it.
+  That change lands before the next forge-cli release.
 
 ## [0.32.0] — 2026-11-18
 
