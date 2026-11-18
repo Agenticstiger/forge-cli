@@ -46,6 +46,7 @@ from fluid_build.profiler._stats import (
     DeclaredBlock,
     DeclaredStatistic,
     MeasuredGroup,
+    MeasuredStatistic,
     MeasureRefused,
     MetricDefinition,
     StatisticDefinition,
@@ -156,6 +157,13 @@ class ExposePlan:
     skipped: Tuple[Tuple[str, str], ...] = ()
 
 
+#: A fidelity statistic as the report names it: column, definition, groupBy and shape
+#: (a quantile's level or a histogram's bins, which tell two of one column apart).
+NamedStatistic = Tuple[str, str, Optional[str], Optional[str]]
+#: One with some groups withheld: also the number of groups published, and of groups.
+PartlyNamedStatistic = Tuple[str, str, Optional[str], Optional[str], int, int]
+
+
 @dataclass(frozen=True)
 class ProfileResult:
     document: Dict[str, Any]
@@ -167,15 +175,14 @@ class ProfileResult:
     withheld: Mapping[str, int] = field(default_factory=dict)
     #: The grid the document declares and its on-grid statistics were formed on.
     fractional_bits: int = DEFAULT_FRACTIONAL_BITS
-    #: Each published fidelity statistic, as ``(column, definition, groupBy)``.
-    statistics: Tuple[Tuple[str, str, Optional[str]], ...] = ()
-    #: Each fidelity statistic written with every group withheld, as
-    #: ``(column, definition, groupBy)``: a run scores it censored.
-    withheld_statistics: Tuple[Tuple[str, str, Optional[str]], ...] = ()
-    #: Each fidelity statistic with some groups published and some withheld, as
-    #: ``(column, definition, groupBy, published_groups, all_groups)``: a run scores
-    #: only the published groups.
-    partly_withheld_statistics: Tuple[Tuple[str, str, Optional[str], int, int], ...] = ()
+    #: Each published fidelity statistic (:data:`NamedStatistic`).
+    statistics: Tuple[NamedStatistic, ...] = ()
+    #: Each fidelity statistic written with every group withheld: a run that checks
+    #: it scores it censored.
+    withheld_statistics: Tuple[NamedStatistic, ...] = ()
+    #: Each fidelity statistic with some groups published and some withheld: a run
+    #: that checks it scores only the published groups.
+    partly_withheld_statistics: Tuple[PartlyNamedStatistic, ...] = ()
     #: Each declared property the document does not answer, with the reason.
     left_out: Tuple[Tuple[str, str], ...] = ()
 
@@ -623,7 +630,7 @@ def _declare_statistics(
                 for record in zip(*(read.values[name] for name in names), strict=True)
             ]
         try:
-            groups = backend.measure(declared, statistic, rows[statistic.columns])
+            measured = backend.measure(declared, statistic, rows[statistic.columns])
         except MeasureRefused as exc:
             raise ProfileError(
                 "profile_bundle_record_refused",
@@ -633,27 +640,28 @@ def _declare_statistics(
                     "next": "the data and the fidelity block disagree: fix either, then profile",
                 },
             ) from None
-        if not groups:
+        if not measured.groups:
             left_out.append((statistic.description, "no record forms a group of it"))
             continue
-        entry = _declared_entry(statistic, groups, backend, rule, tally, fractional_bits)
+        entry = _declared_entry(statistic, measured, backend, rule, tally, fractional_bits)
         columns_doc[statistic.column].setdefault("statistics", []).append(entry)
     return left_out
 
 
 def _declared_entry(
     statistic: DeclaredStatistic,
-    groups: Sequence[MeasuredGroup],
+    measured: MeasuredStatistic,
     backend: StatisticsBackend,
     rule: disclosure.DisclosureRule,
     tally: "Counter[str]",
     fractional_bits: int,
 ) -> Dict[str, Any]:
     """One declared statistic as the document writes it: every group checked, none guessed at."""
+    groups = measured.groups
     checked = [_check_group(statistic, group, backend, rule, fractional_bits) for group in groups]
     verdicts = [verdict for verdict, _ in checked]
     if statistic.group_by is not None and statistic.kind in _SECONDARY_SUPPRESSION:
-        verdicts = list(disclosure.suppress_secondary(verdicts))
+        verdicts = _suppressed(statistic, verdicts, measured, backend, rule, fractional_bits)
     written: List[Dict[str, Any]] = []
     for group, verdict, (_, published) in zip(groups, verdicts, checked, strict=True):
         tally[verdict.status] += 1
@@ -676,6 +684,29 @@ def _declared_entry(
 #: The declared statistics whose groups partition a total the profile publishes, so one
 #: withheld group would be given back by the others (:func:`disclosure.suppress_secondary`).
 _SECONDARY_SUPPRESSION = frozenset({"mean", "support"})
+
+
+def _suppressed(
+    statistic: DeclaredStatistic,
+    verdicts: List[disclosure.Verdict],
+    measured: MeasuredStatistic,
+    backend: StatisticsBackend,
+    rule: disclosure.DisclosureRule,
+    fractional_bits: int,
+) -> List[disclosure.Verdict]:
+    """A grouped mean's or support's verdicts after secondary suppression.
+
+    The rows a ``groupBy`` null leaves out of every group are still in the column's
+    ungrouped figures, so the published groups would give their total back: they
+    count as one more group, checked and never written. When they fail, or cannot
+    be read as the block reads them, every group that passed is withheld with ``D``.
+    """
+    hidden: List[disclosure.Verdict] = []
+    if measured.left_out_unread:
+        hidden.append(disclosure.Verdict(disclosure.SMALL_COUNT, "rows no group holds"))
+    elif measured.left_out is not None:
+        hidden.append(_check_group(statistic, measured.left_out, backend, rule, fractional_bits)[0])
+    return list(disclosure.suppress_secondary([*verdicts, *hidden]))[: len(verdicts)]
 
 
 def _check_group(
@@ -732,22 +763,32 @@ def _row_count(rows: int, rule: disclosure.DisclosureRule, tally: "Counter[str]"
     return disclosure.round_count(rows, rule) if verdict.published else None
 
 
-def _statistic_summaries(columns: Mapping[str, Mapping[str, Any]]) -> Tuple[
-    Tuple[Tuple[str, str, Optional[str]], ...],
-    Tuple[Tuple[str, str, Optional[str]], ...],
-    Tuple[Tuple[str, str, Optional[str], int, int], ...],
+def _shape(statistic: Mapping[str, Any]) -> Optional[str]:
+    """What tells two statistics of one column and definition apart in the report."""
+    if "level" in statistic:
+        return f"at level {statistic['level']}"
+    if "bins" in statistic:
+        return f"over bins {', '.join(statistic['bins'])}"
+    return None
+
+
+def _statistic_summaries(
+    columns: Mapping[str, Mapping[str, Any]],
+) -> Tuple[
+    Tuple[NamedStatistic, ...], Tuple[NamedStatistic, ...], Tuple[PartlyNamedStatistic, ...]
 ]:
     """The fidelity statistics by how many of their groups were published.
 
-    Each is named by its column, definition and groupBy: first those whose every group
-    was published, then those with no published group, then those with some, which also
-    carry the number of groups published and the number of groups.
+    Each is named by its column, definition, groupBy and shape: first those whose every
+    group was published, then those with no published group, then those with some, which
+    also carry the number of groups published and the number of groups.
     """
-    counted = [
+    counted: List[PartlyNamedStatistic] = [
         (
             name,
             statistic["definition"],
             statistic.get("groupBy"),
+            _shape(statistic),
             sum(1 for group in statistic["groups"] if group["status"] == disclosure.FREE),
             len(statistic["groups"]),
         )
@@ -755,7 +796,7 @@ def _statistic_summaries(columns: Mapping[str, Mapping[str, Any]]) -> Tuple[
         for statistic in column.get("statistics", ())
     ]
     return (
-        tuple(each[:3] for each in counted if each[3] == each[4]),
-        tuple(each[:3] for each in counted if each[3] == 0),
-        tuple(each for each in counted if 0 < each[3] < each[4]),
+        tuple(each[:4] for each in counted if each[4] == each[5]),
+        tuple(each[:4] for each in counted if each[4] == 0),
+        tuple(each for each in counted if 0 < each[4] < each[5]),
     )

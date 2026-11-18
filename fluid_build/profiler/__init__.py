@@ -12,7 +12,7 @@ disclosure rules. Nothing else leaves: no record, no sample of records, and no
 per-record value. This package is that profiler, shipped as forge-cli's
 ``[profile]`` extra because forge-cli already holds the connectors.
 
-The package has five parts, each its own module:
+The package has six parts, each its own module:
 
 * :mod:`~fluid_build.profiler.sources` reads the columns of one table, through
   the DuckDB scanners ``fluid init --discover`` uses, or a newline-delimited
@@ -25,6 +25,9 @@ The package has five parts, each its own module:
   ACRO's output-checking defaults.
 * :mod:`~fluid_build.profiler.document` writes the canonical document and its
   digest.
+* :mod:`~fluid_build.profiler.bundle` finds the fidelity block a FLUX bundle's
+  Simulation declares for the expose, read the way the engine reads it, for
+  ``--bundle``.
 * :mod:`~fluid_build.profiler.runner` puts them in order for one expose.
 
 Nothing here is imported on the ``fluid --help`` path; ``cli/profile_cmd.py``

@@ -59,7 +59,8 @@ What the group checks leave readable, on purpose:
   one record.
 * When one group of a grouped mean or support is withheld, every other group of
   it is withheld too, under ``D``, so the withheld one cannot be recovered by
-  differencing against the ungrouped figures.
+  differencing against the ungrouped figures. The records a ``groupBy`` null
+  leaves out of every group count as one more group there, never written.
 * A withheld cell or group of a histogram or a quantile is not secondarily
   suppressed. The rounded counts still bound it: it holds somewhere inside 0 to 9
   records, and never above the threshold.
@@ -575,7 +576,9 @@ def suppress_secondary(verdicts: Sequence[Verdict]) -> Tuple[Verdict, ...]:
     fail, is unchanged. It applies to a grouped ``mean/1`` and a grouped
     ``support/1``, whose groups partition a total the profile publishes. It does
     not apply to an ungrouped statistic, which has one group, or to a histogram
-    or a quantile, whose own cells and ranks are checked as counts.
+    or a quantile, whose own cells and ranks are checked as counts. The caller
+    adds the records a ``groupBy`` null leaves out of every group as one more
+    group, never written, since the column's own totals hold them too.
     """
     if all(verdict.published for verdict in verdicts) or not any(
         verdict.published for verdict in verdicts

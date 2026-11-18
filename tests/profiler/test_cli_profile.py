@@ -234,6 +234,40 @@ def _run(argv):
         return exited.code
 
 
+def test_an_empty_bundle_value_is_refused_rather_than_dropped(workspace, registry, capsys):
+    rc = main(["profile", "contract.fluid.yaml", "--source", "orders.ndjson", "--bundle", ""])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "profile_bundle_not_a_directory" in out and "--bundle names no directory" in out
+    assert not (workspace / "orders.profile.json").exists()
+
+
+def test_the_summary_names_each_statistic_once_with_its_columns_and_shape():
+    assert profile_cmd._named(
+        [
+            ("amount", "mean/1", None, None),
+            ("qty", "mean/1", None, None),
+            ("amount", "mean/1", "market", None),
+            ("amount", "quantile/1", None, "at level 0.5"),
+            ("amount", "quantile/1", None, "at level 0.99"),
+        ]
+    ) == [
+        "mean/1 of 'amount', 'qty'",
+        "mean/1 of 'amount' by 'market'",
+        "quantile/1 of 'amount' at level 0.5",
+        "quantile/1 of 'amount' at level 0.99",
+    ]
+    assert profile_cmd._named_partly(
+        [
+            ("amount", "quantile/1", "market", "at level 0.5", 3, 4),
+            ("amount", "quantile/1", "market", "at level 0.01", 1, 4),
+        ]
+    ) == [
+        "quantile/1 of 'amount' at level 0.5 by 'market' (3 of 4 groups)",
+        "quantile/1 of 'amount' at level 0.01 by 'market' (1 of 4 groups)",
+    ]
+
+
 def test_the_summary_names_the_fidelity_statistics_and_their_grid(workspace, registry, capsys):
     assert main(["profile", "contract.fluid.yaml", "--source", "orders.ndjson"]) == 0
     out = " ".join(capsys.readouterr().out.split())

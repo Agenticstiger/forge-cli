@@ -85,7 +85,9 @@ PROPERTIES: List[Dict[str, Any]] = [
 ]
 
 
-def _block(properties: List[Dict[str, Any]], bits: Optional[int] = None) -> Dict[str, Any]:
+def _block(
+    properties: List[Dict[str, Any]], bits: Optional[int] = None, market_null: str = "fail"
+) -> Dict[str, Any]:
     block: Dict[str, Any] = {
         "records": {"min": 4, "max": 100000},
         "columns": {
@@ -94,7 +96,7 @@ def _block(properties: List[Dict[str, Any]], bits: Optional[int] = None) -> Dict
             "market": {
                 "support": {"values": ["IE", "GB", "FR", "DE"]},
                 "maxCardinality": 8,
-                "null": "fail",
+                "null": market_null,
             },
         },
         "properties": properties,
@@ -105,7 +107,12 @@ def _block(properties: List[Dict[str, Any]], bits: Optional[int] = None) -> Dict
     return block
 
 
-def _bundle(tmp_path: Path, properties: List[Dict[str, Any]], bits: Optional[int] = None) -> Path:
+def _bundle(
+    tmp_path: Path,
+    properties: List[Dict[str, Any]],
+    bits: Optional[int] = None,
+    market_null: str = "fail",
+) -> Path:
     directory = tmp_path / "payment-bundle"
     directory.mkdir()
     simulation = {
@@ -113,7 +120,9 @@ def _bundle(tmp_path: Path, properties: List[Dict[str, Any]], bits: Optional[int
         "kind": "Simulation",
         "id": "sim-payment",
         "extensions": {
-            "com.agentics.flux/1": {"emits": {EXPOSE: {"fidelity": _block(properties, bits)}}}
+            "com.agentics.flux/1": {
+                "emits": {EXPOSE: {"fidelity": _block(properties, bits, market_null)}}
+            }
         },
     }
     (directory / "simulation.flux.yml").write_text(yaml.safe_dump(simulation), encoding="utf-8")
@@ -132,8 +141,11 @@ def _rows(count: int = 120) -> List[Dict[str, Any]]:
     ]
 
 
-def _profile(tmp_path: Path, rows: List[Dict[str, Any]], properties=None, bits=None):
-    directory = _bundle(tmp_path, properties if properties is not None else PROPERTIES, bits)
+def _profile(
+    tmp_path: Path, rows: List[Dict[str, Any]], properties=None, bits=None, market_null="fail"
+):
+    chosen = properties if properties is not None else PROPERTIES
+    directory = _bundle(tmp_path, chosen, bits, market_null)
     block = bundle.read_bundle_block(directory, EXPOSE)
     return profile_expose(
         CONTRACT,
@@ -267,11 +279,11 @@ def test_a_rare_support_member_withholds_the_group_and_siblings_of_a_grouped_mea
     # The ungrouped mean needs no secondary suppression.
     assert _entry(result, "amount", "mean/1")["groups"][0]["status"] == "F"
     assert result.withheld["D"] == 3
-    assert ("amount", "mean/1", "market") not in result.statistics
-    assert ("amount", "mean/1", None) in result.statistics
-    assert ("market", "support/1", None) in result.withheld_statistics
-    assert ("amount", "mean/1", "market") in result.withheld_statistics
-    assert ("amount", "mean/1", None) not in result.withheld_statistics
+    assert ("amount", "mean/1", "market", None) not in result.statistics
+    assert ("amount", "mean/1", None, None) in result.statistics
+    assert ("market", "support/1", None, None) in result.withheld_statistics
+    assert ("amount", "mean/1", "market", None) in result.withheld_statistics
+    assert ("amount", "mean/1", None, None) not in result.withheld_statistics
     # The histogram's DE cell is a one: withheld by its cell, the group is published.
     (group,) = _entry(result, "market", "levelHistogram/1")["groups"]
     assert group["cellStatus"][0] == "A" and group["levelCounts"][0] is None
@@ -284,6 +296,52 @@ def test_a_quantile_whose_witness_too_few_records_hold_is_withheld(tmp_path):
     (group,) = _entry(result, "amount", "quantile/1")["groups"]
     # Every amount repeats at most twice: the witness is held by two records.
     assert group == {"group": "", "status": "A"}
+
+
+def _null_market_rows(count: int) -> List[Dict[str, Any]]:
+    rows = _rows()
+    for row in rows[:count]:
+        row["market"] = None
+    return rows
+
+
+def test_a_record_no_group_holds_withholds_the_groups_of_a_grouped_mean(tmp_path):
+    # Under null: exclude a null key leaves the record out of every group, while the
+    # column's ungrouped mean and sum still hold it: the groups would give it back.
+    rows = _rows()
+    rows[6]["market"] = None  # one record, amount 20
+    result = _profile(tmp_path, rows, PROPERTIES[:2], market_null="exclude")
+    by_market = _entry(result, "amount", "mean/1", "market")
+    assert [(g["group"], g["status"]) for g in by_market["groups"]] == [
+        ("FR", "D"),
+        ("GB", "D"),
+        ("IE", "D"),
+    ]
+    assert result.withheld["D"] == 3
+    assert _entry(result, "amount", "mean/1")["groups"][0]["status"] == "F"
+
+
+def test_records_no_group_holds_that_pass_the_checks_leave_the_groups_published(tmp_path):
+    result = _profile(tmp_path, _null_market_rows(15), PROPERTIES[:2], market_null="exclude")
+    by_market = _entry(result, "amount", "mean/1", "market")
+    assert {g["status"] for g in by_market["groups"]} == {"F"}
+
+
+def test_a_null_key_on_a_null_value_hides_nothing(tmp_path):
+    rows = _rows()
+    rows[6]["market"] = None
+    rows[6]["amount"] = None
+    result = _profile(tmp_path, rows, PROPERTIES[:2], market_null="exclude")
+    by_market = _entry(result, "amount", "mean/1", "market")
+    assert {g["status"] for g in by_market["groups"]} == {"F"}
+
+
+def test_two_quantiles_of_one_column_are_named_apart_by_level(tmp_path):
+    quantiles = [{**PROPERTIES[5], "level": "0.5"}, {**PROPERTIES[5], "level": "0.25"}]
+    result = _profile(tmp_path, _rows(), quantiles)
+    named = result.statistics + result.withheld_statistics
+    shapes = {each[3] for each in named if each[1] == "quantile/1"}
+    assert shapes == {"at level 0.5", "at level 0.25"}
 
 
 def test_a_zero_cell_is_withheld_and_the_group_published(tmp_path):
@@ -459,6 +517,7 @@ def test_the_command_writes_the_document_and_names_what_it_answers(tmp_path, mon
     assert "mean/1 of 'amount'" in out and "mean/1 of 'amount' by 'market'" in out
     assert "levelHistogram/1 of 'market'" in out and "quantile/1 of 'amount'" in out
     assert "Not answered: correlation of 'amount' and 'qty':" in out
+    assert "a run that checks it is refused (FLX-5037)." in out
     written = (tmp_path / "payment.profile.json").read_bytes()
     load_profile_text(written.decode("utf-8"))
 
@@ -518,8 +577,8 @@ def test_a_flux_stats_without_the_grammar_refuses_before_reading(tmp_path, monke
     out = " ".join(capsys.readouterr().out.split())
     assert rc == 1
     assert "profile_statistics_unavailable" in out
-    assert "reads the fidelity block with flux_stats.fidelity, which the installed" in out
-    assert "flux-stats lacks. It needs flux-stats>=0.6.2,<0.7" in out
+    assert "reads the fidelity block with flux-stats, and the installed flux-stats" in out
+    assert "lacks flux_stats.fidelity. It needs flux-stats>=0.6.2,<0.7" in out
     assert "next: pip install 'data-product-forge[profile]'" in out
 
 
@@ -566,13 +625,15 @@ def test_the_report_names_the_statistics_written_with_every_group_withheld(
     )
     out = " ".join(capsys.readouterr().out.split())
     assert rc == 0, out
-    assert "Withheld whole, so a run scores them censored: " in out
-    line = out.split("Withheld whole, so a run scores them censored: ")[1].split(". ")[0]
+    whole = "Withheld whole, so a run that checks them scores them censored: "
+    assert whole in out
+    line = out.split(whole)[1].split(". ")[0]
     assert "support/1 of 'market'" in line and "mean/1 of 'amount' by 'market'" in line
     assert "mean/1 of 'amount';" not in line and not line.endswith("mean/1 of 'amount'")
     # A statistic with a published group stays on the published line only.
-    published = out.split("Fidelity statistics: ")[1].split(", on fractionalBits")[0]
+    published = out.split("Fidelity statistics: ")[1].split(", on the fidelity block's")[0]
     assert "support/1" not in published
+    assert "on the fidelity block's fractionalBits 16." in out  # the grid is the block's
 
 
 def _partly_rows() -> List[Dict[str, Any]]:
@@ -600,11 +661,10 @@ def test_a_statistic_with_some_groups_withheld_is_named_with_its_counts(tmp_path
     ]
     published = statuses.count("F")
     assert 0 < published < len(statuses)
-    assert result.partly_withheld_statistics == (
-        ("amount", "marginalHistogram/1", "market", published, len(statuses)),
-    )
-    assert ("amount", "marginalHistogram/1", "market") not in result.statistics
-    assert ("amount", "marginalHistogram/1", "market") not in result.withheld_statistics
+    named = ("amount", "marginalHistogram/1", "market", "over bins 0, 50, 100")
+    assert result.partly_withheld_statistics == ((*named, published, len(statuses)),)
+    assert named not in result.statistics
+    assert named not in result.withheld_statistics
 
 
 def test_the_report_names_the_statistics_withheld_in_part(tmp_path, monkeypatch, capsys):
@@ -625,6 +685,6 @@ def test_the_report_names_the_statistics_withheld_in_part(tmp_path, monkeypatch,
     out = " ".join(capsys.readouterr().out.split())
     assert rc == 0, out
     assert (
-        "Partly withheld, so a run scores only the published groups: "
-        "marginalHistogram/1 of 'amount' by 'market' (3 of 4 groups)." in out
+        "Partly withheld, so a run that checks them scores only the published groups: "
+        "marginalHistogram/1 of 'amount' over bins 0, 50, 100 by 'market' (3 of 4 groups)." in out
     )

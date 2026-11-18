@@ -51,8 +51,9 @@ histogram over its bins or levels, a support, a quantile; per group where the
 property has a groupBy), each group checked like the rest. The grid is the
 block's. A group of a mean or a support that is withheld also withholds its
 siblings, under D (secondary suppression), so it cannot be recovered from the
-column's published total. A correlation is not answered: its moments need the
-exact record count, which the output checks round.
+column's published total; the records a null groupBy value leaves out of every
+group count as one more group there. A correlation is not answered: its moments
+need the exact record count, which the output checks round.
 
 What the checks leave readable: a grouped statistic lists every group the data
 forms, published or withheld. A key is always a level the bundle declares (a
@@ -223,7 +224,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         _stats.DocumentRefused,
     ) as exc:
         raise _as_refusal(exc, args.source) from None
-    _report(cprint_literal, result, out)
+    _report(cprint_literal, result, out, answered_block=block is not None)
     return 0
 
 
@@ -231,8 +232,16 @@ def _bundle_dir(given: Optional[str]) -> Optional[Path]:
     """``--bundle``, checked as the contract is, and a directory that exists."""
     from fluid_build.cli.security import validate_cli_path
 
-    if not given:
+    if given is None:
         return None
+    if not given.strip():
+        # An unset variable (`--bundle "$BUNDLE"`) must not drop the block unnoticed,
+        # nor name the working directory.
+        raise _refusal(
+            "profile_bundle_not_a_directory",
+            "--bundle names no directory",
+            {"next": "name the bundle directory `fluxsim init` wrote"},
+        ) from None
     path = validate_cli_path(given, mode="read", file_type="bundle")
     if not path.is_dir():
         raise _refusal(
@@ -387,27 +396,32 @@ def _plural(count: int, word: str) -> str:
 
 
 def _named(statistics: Any) -> List[str]:
-    """``mean/1 of 'amount' by 'market'`` for each statistic, once."""
-    return list(
-        dict.fromkeys(
-            f"{identifier} of {column!r}" + (f" by {group_by!r}" if group_by else "")
-            for column, identifier, group_by in statistics
-        )
-    )
+    """Name each statistic once, those of one definition, shape and groupBy together.
+
+    ``mean/1 of 'amount', 'qty'``, ``quantile/1 of 'amount' at level 0.5 by 'market'``.
+    """
+    columns: Dict[Any, List[str]] = {}
+    for column, identifier, group_by, shape in statistics:
+        named = columns.setdefault((identifier, shape, group_by), [])
+        if repr(column) not in named:
+            named.append(repr(column))
+    return [
+        f"{identifier} of {', '.join(names)}"
+        + (f" {shape}" if shape else "")
+        + (f" by {group_by!r}" if group_by else "")
+        for (identifier, shape, group_by), names in columns.items()
+    ]
 
 
 def _named_partly(statistics: Any) -> List[str]:
     """``levelHistogram/1 of 'market' by 'tier' (2 of 3 groups)`` for each statistic."""
     return [
-        f"{name} ({shown} of {total} groups)"
-        for name, (shown, total) in dict(
-            (_named([(column, identifier, group_by)])[0], (shown, total))
-            for column, identifier, group_by, shown, total in statistics
-        ).items()
+        f"{_named([(column, identifier, group_by, shape)])[0]} ({shown} of {total} groups)"
+        for column, identifier, group_by, shape, shown, total in statistics
     ]
 
 
-def _report(say: Any, result: Any, out: Path) -> None:
+def _report(say: Any, result: Any, out: Path, *, answered_block: bool = False) -> None:
     """Tell the owner what the document holds, then print the pin."""
     plan = result.plan
     withheld: Dict[str, int] = dict(result.withheld)
@@ -424,24 +438,32 @@ def _report(say: Any, result: Any, out: Path) -> None:
     named = _named(result.statistics)
     whole = _named(result.withheld_statistics)
     if named:
-        say(
-            f"Fidelity statistics: {'; '.join(named)}, on fractionalBits {result.fractional_bits}"
-            " (the fidelity block must declare the same).",
-            soft_wrap=True,
+        grid = (
+            f"on the fidelity block's fractionalBits {result.fractional_bits}"
+            if answered_block
+            else f"on fractionalBits {result.fractional_bits} "
+            "(the fidelity block must declare the same)"
         )
+        say(f"Fidelity statistics: {'; '.join(named)}, {grid}.", soft_wrap=True)
     if whole:
         say(
-            f"Withheld whole, so a run scores them censored: {'; '.join(whole)}.",
+            "Withheld whole, so a run that checks them scores them censored: "
+            f"{'; '.join(whole)}.",
             soft_wrap=True,
         )
     partly = _named_partly(result.partly_withheld_statistics)
     if partly:
         say(
-            f"Partly withheld, so a run scores only the published groups: {'; '.join(partly)}.",
+            "Partly withheld, so a run that checks them scores only the published groups: "
+            f"{'; '.join(partly)}.",
             soft_wrap=True,
         )
     for description, reason in result.left_out:
-        say(f"Not answered: {description}: {reason}.", soft_wrap=True)
+        say(
+            f"Not answered: {description}: {reason}; a run that checks it is refused "
+            "(FLX-5037).",
+            soft_wrap=True,
+        )
     for name, reason in plan.skipped:
         say(f"Not profiled: column {name!r}: {reason}.")
     if not result.published:

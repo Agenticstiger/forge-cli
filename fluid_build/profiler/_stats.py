@@ -57,6 +57,7 @@ __all__ = [
     "DocumentRefused",
     "MeasureRefused",
     "MeasuredGroup",
+    "MeasuredStatistic",
     "MetricDefinition",
     "ReadRefused",
     "StatisticDefinition",
@@ -180,6 +181,23 @@ class MeasuredGroup:
     encoded: Tuple[int, ...] = ()
 
 
+@dataclass(frozen=True)
+class MeasuredStatistic:
+    """A declared statistic over one table: its groups, and the rows no group holds.
+
+    A ``groupBy`` column read under ``null: exclude`` leaves a row whose key is null
+    out of every group, while the column's ungrouped figures (its ``count``, its
+    ``sum``, an ungrouped mean) still hold the row's value. ``left_out`` is those rows
+    measured as one more group, never written, and ``left_out_unread`` says they
+    could not be read as the block reads them. A grouped mean or support checks
+    them as a group, so its published groups cannot give them back.
+    """
+
+    groups: Tuple[MeasuredGroup, ...]
+    left_out: Optional[MeasuredGroup] = None
+    left_out_unread: bool = False
+
+
 @runtime_checkable
 class MetricDefinition(Protocol):
     """One registered column metric (``count/1`` ... ``quantiles/1``).
@@ -274,10 +292,12 @@ class StatisticsBackend(Protocol):
         block: DeclaredBlock,
         statistic: DeclaredStatistic,
         rows: Sequence[Mapping[str, Any]],
-    ) -> Tuple[MeasuredGroup, ...]:
+    ) -> MeasuredStatistic:
         """Form *statistic* over *rows* (column to raw value), one group per key.
 
-        Raises :class:`MeasureRefused` for a record the block's declaration refuses.
+        The rows a ``groupBy`` null leaves out of every group are measured too
+        (:attr:`MeasuredStatistic.left_out`). Raises :class:`MeasureRefused` for a
+        record the block's declaration refuses.
         """
 
     def quantile_ranks_ok(self, k: int, level: Fraction, below: int, at_or_below: int) -> bool:
@@ -439,10 +459,11 @@ class _FluxStatsBackend:
                 from flux_stats.fixedpoint import quantile_rank_ok
                 from flux_stats.registry import definition_for_kind
                 from flux_stats.spelling import render_exact
-            except ImportError:
+            except ImportError as error:
+                missing = error.name or "flux_stats.fidelity"
                 raise StatisticsUnavailable(
-                    "--bundle reads the fidelity block with flux_stats.fidelity, which the "
-                    f"installed flux-stats lacks. It needs {FLUX_STATS_REQUIREMENT}"
+                    "--bundle reads the fidelity block with flux-stats, and the installed "
+                    f"flux-stats lacks {missing}. It needs {FLUX_STATS_REQUIREMENT}"
                 ) from None
             self._grammar = SimpleNamespace(
                 fidelity=fidelity,
@@ -527,7 +548,7 @@ class _FluxStatsBackend:
         block: DeclaredBlock,
         statistic: DeclaredStatistic,
         rows: Sequence[Mapping[str, Any]],
-    ) -> Tuple[MeasuredGroup, ...]:
+    ) -> MeasuredStatistic:
         grammar = self._fidelity()
         parsed = block._block
         declaration = statistic._declaration
@@ -540,12 +561,29 @@ class _FluxStatsBackend:
             # the engine's synthetic rows hold declared levels alone, so a check loses
             # no group it could compare.
             keys = grammar.reading.group_keys(rows, by, declared_only=True)
-            return tuple(
+            groups = tuple(
                 self._measured(grammar, parsed, declaration, statistic, rows, key, indices)
                 for key, indices in keys
             )
         except self._refused as error:
             raise MeasureRefused(error.code.code, error.detail or error.code.title) from None
+        grouped = {index for _, indices in keys for index in indices}
+        # A row that holds a value of the statistic's column and is in no group: the
+        # column's ungrouped figures hold it, and the groups do not.
+        outside = [
+            index
+            for index, row in enumerate(rows)
+            if index not in grouped and row.get(statistic.column) is not None
+        ]
+        if not outside:
+            return MeasuredStatistic(groups)
+        try:
+            left_out = self._measured(grammar, parsed, declaration, statistic, rows, "", outside)
+        except self._refused:
+            # Never written, so not refused either: the profile cannot vouch for rows
+            # the block's reading refuses, and the caller withholds the groups.
+            return MeasuredStatistic(groups, left_out_unread=True)
+        return MeasuredStatistic(groups, left_out)
 
     @staticmethod
     def _measured(
