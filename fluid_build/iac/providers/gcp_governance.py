@@ -400,50 +400,45 @@ def _partition_column(exposure: Mapping[str, Any], where: str, *, retention: boo
     partition_by = loc.get("partitionBy") if isinstance(loc, Mapping) else None
     if not partition_by:
         return None
-    kind = "retention-partition-column" if retention else "partition-column"
+    if retention:
+        kind = "retention-partition-column"
+        one_fix = (
+            "Name one DATE, TIMESTAMP or DATETIME column, or drop partitionBy to partition by "
+            "ingestion time."
+        )
+        type_fix = (
+            "Name a date or timestamp column, or drop partitionBy to partition by ingestion time."
+        )
+    else:
+        kind = "partition-column"
+        one_fix = (
+            "Name one DATE, TIMESTAMP or DATETIME column, and cluster by the others "
+            "(binding.properties.cluster_by)."
+        )
+        type_fix = (
+            "Name a date or timestamp column, or cluster by this one instead "
+            "(binding.properties.cluster_by)."
+        )
     columns = list(partition_by) if isinstance(partition_by, (list, tuple)) else []
     if len(columns) != 1 or not isinstance(columns[0], str):
         raise UnsupportedBindingError(
             kind,
             f"{where}.binding.location.partitionBy is {partition_by!r}; a BigQuery table "
             "is partitioned by at most one column.",
-            (
-                (
-                    (
-                        "Name one DATE, TIMESTAMP or DATETIME column, or drop partitionBy to "
-                        "partition by ingestion time."
-                    )
-                    if retention
-                    else (
-                        "Name one DATE, TIMESTAMP or DATETIME column, and cluster by the others "
-                        "(binding.properties.cluster_by)."
-                    )
-                ),
-            ),
+            (one_fix,),
         )
     from .gcp import _bq_type
 
     declared = _declared_columns(exposure)
     column = declared.get(columns[0])
     if column is None or _bq_type(column.get("type")) not in _PARTITION_COLUMN_TYPES:
+        spelled = _spelled(declared, columns[0]) if column is None else ""
         raise UnsupportedBindingError(
             kind,
             f"{where}.binding.location.partitionBy names {columns[0]!r}, which is not a "
             "DATE, TIMESTAMP or DATETIME column of the expose's schema, so BigQuery "
-            f"cannot partition by it{_spelled(declared, columns[0]) if column is None else ''}.",
-            (
-                (
-                    (
-                        "Name a date or timestamp column, or drop partitionBy to partition by "
-                        "ingestion time."
-                    )
-                    if retention
-                    else (
-                        "Name a date or timestamp column, or cluster by this one instead "
-                        "(binding.properties.cluster_by)."
-                    )
-                ),
-            ),
+            f"cannot partition by it{spelled}.",
+            (type_fix,),
         )
     return columns[0]
 

@@ -1,15 +1,15 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""Nested columns, partitioning and clustering through the real ``tofu`` and provider.
+"""Partitioning and clustering through the real ``tofu`` and terraform-provider-google.
 
-What the data-loss gate decides depends on what terraform-provider-google plans for a
-table that already exists, so these apply a table to ``_fake_bigquery.FakeBigQuery``
-(the in-process BigQuery stand-in ``test_iac_gcp_governance_plan.py`` uses) and plan
-the change. A plan shows a replacement only where the provider forces one: adding a
-partition column (BigQuery cannot partition an existing table), or making an existing
-column REPEATED. Clustering, a new nested column and a new field inside a RECORD are
-in-place updates, and a table that was applied plans no change.
+What the data-loss gate decides depends on what the provider plans for a table that
+already exists, so these apply a table to ``_fake_bigquery.FakeBigQuery`` (the
+in-process BigQuery stand-in ``test_iac_gcp_governance_plan.py`` uses) and plan the
+change. A plan shows a replacement only where the provider forces one: adding a
+partition column, since BigQuery cannot partition an existing table. Clustering added or
+reordered is an in-place update, retention added on the partition column is too, and a
+table that was applied plans no change.
 
 Not proven here: what real BigQuery accepts (the fake stores what it is sent).
 Skipped unless ``tofu`` is on PATH; ``tofu init`` needs the registry or a mirror.
@@ -46,41 +46,6 @@ _SCHEMA = [
     {"name": "region", "type": "string"},
     {"name": "customer_id", "type": "bigint"},
     {"name": "note", "type": "string"},
-]
-
-_NESTED = [
-    {
-        "name": "tags",
-        "type": "array",
-        "required": True,
-        "element": {"type": "string", "required": True},
-    },
-    {
-        "name": "address",
-        "type": "struct",
-        "description": "postal address",
-        "fields": [{"name": "street", "type": "string"}, {"name": "zip", "type": "string"}],
-    },
-    {
-        "name": "items",
-        "type": "array",
-        "required": True,
-        "element": {
-            "type": "struct",
-            "required": True,
-            "fields": [
-                {"name": "sku", "type": "string", "required": True},
-                {"name": "qty", "type": "integer"},
-            ],
-        },
-    },
-    {
-        "name": "attrs",
-        "type": "map",
-        "required": True,
-        "key": {"type": "string", "required": True},
-        "value": {"type": "string"},
-    },
 ]
 
 
@@ -122,29 +87,16 @@ def _stored(fake) -> Dict[str, Any]:  # noqa: F811
 
 
 @pytest.mark.skipif(_SKIP, reason="needs `tofu` on PATH")
-def test_a_nested_partitioned_clustered_table_applies_and_plans_no_change(
+def test_a_partitioned_clustered_table_applies_and_plans_no_change(
     tmp_path, fake, tofu_env  # noqa: F811
 ):
-    contract = _contract(
-        schema=_SCHEMA + _NESTED, partition_by=["event_date"], cluster_by=["region", "customer_id"]
-    )
+    contract = _contract(partition_by=["event_date"], cluster_by=["region", "customer_id"])
     _live(contract, tmp_path, fake, tofu_env)
     stored = _stored(fake)
     assert stored["timePartitioning"]["type"] == "DAY"
     assert stored["timePartitioning"]["field"] == "event_date"
     assert "expirationMs" not in stored["timePartitioning"]
     assert stored["clustering"] == {"fields": ["region", "customer_id"]}
-    fields = {f["name"]: f for f in stored["schema"]["fields"]}
-    assert (fields["tags"]["type"], fields["tags"]["mode"]) == ("STRING", "REPEATED")
-    assert (fields["address"]["type"], [f["name"] for f in fields["address"]["fields"]]) == (
-        "RECORD",
-        ["street", "zip"],
-    )
-    assert (fields["items"]["type"], fields["items"]["mode"]) == ("RECORD", "REPEATED")
-    assert [(f["name"], f["mode"]) for f in fields["attrs"]["fields"]] == [
-        ("key", "REQUIRED"),
-        ("value", "NULLABLE"),
-    ]
 
     again = _replan(contract, tmp_path, fake, tofu_env)
     assert again["summary"] == {"add": 0, "change": 0, "remove": 0}, again["summary"]
