@@ -34,6 +34,8 @@ import difflib
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
+from fluid_build.util.column_type import write_enum_list
+
 from . import _nodes as n
 from ._canonical import canonical
 from ._errors import FluidSqlError
@@ -376,7 +378,7 @@ class _Checker:
             return
         if literal.value in column.enum or column.is_placeholder(literal.value):
             return
-        values = ", ".join(column.enum)
+        values = write_enum_list(column.enum)
         raise FluidSqlError(
             "enum-literal",
             f"'{literal.value}' is not one of {column.name}'s values ({values})"

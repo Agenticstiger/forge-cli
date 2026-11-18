@@ -589,6 +589,31 @@ def test_enum_literal_typo_in_check_uses_the_enum_of_the_pipe_form_too():
     assert _errors(contract) == []
 
 
+def test_a_quoted_enum_value_may_hold_a_comma_or_a_doubled_quote():
+    """RFC 2.3: an enum list's value may be a quoted string, written as SQL writes one."""
+    contract = _contract()
+    _column(contract, "invoice_lines", "kind")["validationRules"] = [
+        {"type": "enum", "constraint": "'base_fee', 'usage', 'fee, late', 'O''Brien'"}
+    ]
+    _invariant(contract, "invoices", "billed_base_fee_from_lines")["aggregate"][
+        "filter"
+    ] = "kind IN ('base_fee', 'fee, late', 'O''Brien')"
+    assert _errors(contract) == []
+
+
+def test_a_literal_outside_a_quoted_enum_list_names_each_value_once():
+    contract = _contract()
+    _column(contract, "invoice_lines", "kind")["validationRules"] = [
+        {"type": "enum", "constraint": "'base_fee', 'usage', 'fee, late'"}
+    ]
+    _invariant(contract, "invoices", "billed_base_fee_from_lines")["aggregate"][
+        "filter"
+    ] = "kind = 'fee,late'"
+    finding = _only(_lint(contract))
+    _expect(finding, "error", "/exposes/0/contract/invariants/2/aggregate/filter", "fee,late")
+    assert "kind's values ('base_fee', 'usage', 'fee, late')" in finding.text
+
+
 def test_null_literal_as_a_comparison_operand():
     contract = _contract()
     _invariant(contract, "invoices", "due_after_issue")["check"] = "NULL = NULL"
