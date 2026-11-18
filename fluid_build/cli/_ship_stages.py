@@ -878,8 +878,8 @@ def _unwritten(root: Path, files: Mapping[str, object], rel: str) -> Optional[st
             return "listed in its MANIFEST but not on disk"
         if "sha256:" + _sha256_file(path) != files[rel]:
             return "on disk with a digest its MANIFEST does not list"
-    except OSError as exc:
-        return f"unreadable ({exc.strerror or exc})"
+    except (OSError, RuntimeError) as exc:  # RuntimeError: a symlink loop before 3.13
+        return f"unreadable ({getattr(exc, 'strerror', None) or exc})"
     return None
 
 
