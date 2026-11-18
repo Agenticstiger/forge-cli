@@ -96,7 +96,11 @@ def parse_config(text: str) -> dict:
         raise JobConfigError("a streaming job reads a source and keeps a checkpoint")
     if config["mode"] == "batch" and config.get("source"):
         raise JobConfigError("a batch job runs SQL over catalog tables and reads no topic")
-    sink = config["sink"]
+    _check_sink(config["sink"])
+    return config
+
+
+def _check_sink(sink) -> None:
     if not isinstance(sink, dict) or sink.get("type") not in ("glue", "rest"):
         raise JobConfigError("the sink must be a glue or rest catalog table")
     create = sink.get("create") or []
@@ -104,7 +108,6 @@ def parse_config(text: str) -> dict:
         isinstance(s, str) and s.startswith(_CREATE_PREFIXES) for s in create
     ):
         raise JobConfigError("sink.create holds CREATE ... IF NOT EXISTS statements only")
-    return config
 
 
 def resolve_secret(ref: str) -> str:

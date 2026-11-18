@@ -172,6 +172,14 @@ def _refuse_new_source(run: DesiredRun, history: Sequence[RunInfo]) -> Optional[
     )
 
 
+def _failed_again(run: DesiredRun, last: Optional[RunInfo]) -> Optional[RunInfo]:
+    """The newest run when it failed with this config, which is not started again; a lost
+    run did not fail (its machine stopped), so it starts again."""
+    if last is None or last.lost or last.state != FAILED:
+        return None
+    return last if last.config_hash == run.config_hash else None
+
+
 def _reconcile_one(
     run: DesiredRun,
     adapter: Adapter,
@@ -199,23 +207,17 @@ def _reconcile_one(
         if current.attempt and current.attempt > 1:
             out.message = f"attempt {current.attempt}: the job has restarted after failures"
         return out
-    if (
-        not active
-        and last is not None
-        and last.config_hash == run.config_hash
-        and last.state == FAILED
-        and not last.lost
-        and not restart_failed
-    ):
-        out.action, out.error, out.run_id, out.state = "failed", True, last.run_id, last.state
+    failed = None if active or restart_failed else _failed_again(run, last)
+    if failed:
+        out.action, out.error, out.run_id, out.state = "failed", True, failed.run_id, failed.state
         out.message = (
-            f"{_failure_text(last)}. It is not started again with the same config, which "
+            f"{_failure_text(failed)}. It is not started again with the same config, which "
             "would fail the same way: fix the cause and change the build, and fluid apply "
             "starts the new config"
         )
         hint = getattr(adapter, "retry_hint", None)
         if callable(hint):
-            out.message += hint(last.run_id)
+            out.message += hint(failed.run_id)
         return out
     if dry_run:
         out.action = "planned"

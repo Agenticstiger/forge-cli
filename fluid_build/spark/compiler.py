@@ -517,6 +517,34 @@ def _contract_sql(sql: Any, bid: str) -> str:
     return sql
 
 
+def _check_catalog(local: bool, binding: Mapping[str, Any], family: str, where: str) -> None:
+    """Refuse an output the runtime cannot write: runtime local writes a table in an Iceberg
+    REST catalog on platform local, an AWS runtime a Glue-catalog table."""
+    if local and (binding.get("platform") != "local" or family != FAMILY_REST):
+        raise ValueError(
+            f"{where}: runtime local writes a table in an Iceberg REST catalog on platform "
+            "local (binding.platform: local, location.catalog lakekeeper, rest or polaris); "
+            "a Glue table runs on an AWS runtime"
+        )
+    if not local and family != FAMILY_GLUE:
+        raise ValueError(
+            f"{where}: the forge Spark runner writes Glue-catalog Iceberg tables on an AWS "
+            "runtime; runtime local writes a table in an Iceberg REST catalog"
+        )
+
+
+def _sink(local: bool, resolved: Any, database: str, table: str, fields: Any) -> dict[str, Any]:
+    if local:
+        return _rest_sink(resolved, database, table, fields)
+    return {
+        "catalog": CATALOG,
+        "type": "glue",
+        "warehouse": resolved.warehouse,
+        "region": resolved.region,
+        "table": f"{database}.{table}",
+    }
+
+
 def _rest_sink(resolved: Any, database: str, table: str, fields: Any) -> dict[str, Any]:
     """A local run's sink: one table in the Iceberg REST catalog the submitter declares.
 
@@ -627,18 +655,7 @@ def compile_job_config(
             "<account>-fluid-data bucket; pass the account"
         )
     resolved = resolve_iceberg_catalog(binding, account_ref=account_ref)
-    family = catalog_kind_info(resolved.kind).family
-    if local and (binding.get("platform") != "local" or family != FAMILY_REST):
-        raise ValueError(
-            f"{where}: runtime local writes a table in an Iceberg REST catalog on platform "
-            "local (binding.platform: local, location.catalog lakekeeper, rest or polaris); "
-            "a Glue table runs on an AWS runtime"
-        )
-    if not local and family != FAMILY_GLUE:
-        raise ValueError(
-            f"{where}: the forge Spark runner writes Glue-catalog Iceberg tables on an AWS "
-            "runtime; runtime local writes a table in an Iceberg REST catalog"
-        )
+    _check_catalog(local, binding, catalog_kind_info(resolved.kind).family, where)
     parts = resolved.fq_table.split(".")
     if len(parts) != 2 or "None" in parts:
         raise ValueError(f"{where}: the output needs one database and table")
@@ -748,17 +765,7 @@ def compile_job_config(
         "source": source,
         "sql": {"source": source_sql, "select": select},
         **streaming,
-        "sink": (
-            _rest_sink(resolved, database, table, fields)
-            if local
-            else {
-                "catalog": CATALOG,
-                "type": "glue",
-                "warehouse": resolved.warehouse,
-                "region": resolved.region,
-                "table": f"{database}.{table}",
-            }
-        ),
+        "sink": _sink(local, resolved, database, table, fields),
         "maskedColumns": masked,
         # The secret's ARN, never its value: the runner reads the key with the job's role.
         "maskKey": {"secretArn": mask_key} if masked else None,
