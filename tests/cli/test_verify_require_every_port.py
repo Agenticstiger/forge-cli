@@ -203,7 +203,12 @@ def test_a_duplicate_id_never_lets_one_expose_stand_for_two(
     _built(tmp_path, "ids")
     contract = _write(tmp_path, [_aws_parquet("ids"), _local_csv("ids")])
     assert _verify(contract, "--require-every-port") == 1
-    assert "ids (declared twice: only exposes[1] is checked)" in _printed(capsys)
+    assert "ids (declared 2 times: only exposes[1] is checked)" in _printed(capsys)
+    contract = _write(tmp_path, [_aws_parquet("ids"), _aws_parquet("ids"), _local_csv("ids")])
+    assert _verify(contract, "--require-every-port") == 1
+    text = _printed(capsys)
+    assert "ids (declared 3 times: only exposes[2] is checked)" in text
+    assert text.count(" times: only exposes[") == 1
 
 
 def test_a_contract_with_no_expose_verified_none(
@@ -227,3 +232,16 @@ def test_every_skipped_port_is_named_even_when_nothing_was_verified(
     assert "--require-every-port: 7 expose(s) were not verified" in text
     assert all(f"a{i} (no verifier for the binding)" in text for i in range(7))
     assert "nothing was verified" not in text
+
+
+def test_a_managed_streaming_contract_says_it_is_verified_as_a_whole(
+    mixed: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import fluid_build.cli.plan as plan
+    import fluid_build.streaming.runtime as runtime
+
+    monkeypatch.setattr(plan, "compile_managed_streaming", lambda *a, **k: ["streaming"])
+    evidence = [{"build": "b", "status": "RUNNING", "snapshotId": "s", "checkpointId": "c"}]
+    monkeypatch.setattr(runtime, "verify", lambda *a, **k: evidence)
+    assert _verify(mixed, "--require-every-port") == 0
+    assert "verified as a whole from checkpoint evidence" in _printed(capsys)

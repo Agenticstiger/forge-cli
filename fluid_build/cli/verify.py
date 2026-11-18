@@ -1582,6 +1582,14 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             )
         except (ValueError, OSError) as exc:
             raise CLIError(1, "verify_streaming_failed", {"error": str(exc)}) from exc
+        if getattr(args, "require_every_port", False):
+            # A managed streaming contract is verified as a whole, from each
+            # build's checkpoint evidence; it has no per-expose result to gate.
+            cprint(
+                "--require-every-port: a managed streaming contract is verified as a whole "
+                "from checkpoint evidence, not port by port",
+                markup=False,
+            )
         if getattr(args, "out", None):
             Path(args.out).write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
         for item in evidence:
@@ -1602,16 +1610,19 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     exposes_dict = {}
     uncheckable: List[str] = []
     if isinstance(exposes, list):
+        positions: Dict[Any, List[int]] = {}
         for index, expose in enumerate(exposes):
             expose_id = expose.get("exposeId") or expose.get("id")
             if not expose_id:
                 uncheckable.append(f"exposes[{index}] (no exposeId, so it is never checked)")
                 continue
-            if expose_id in exposes_dict:
-                uncheckable.append(
-                    f"{expose_id} (declared twice: only exposes[{index}] is checked)"
-                )
+            positions.setdefault(expose_id, []).append(index)
             exposes_dict[expose_id] = expose
+        uncheckable += [
+            f"{expose_id} (declared {len(at)} times: only exposes[{at[-1]}] is checked)"
+            for expose_id, at in positions.items()
+            if len(at) > 1
+        ]
     elif isinstance(exposes, dict):
         exposes_dict = exposes
 
