@@ -21,16 +21,18 @@ key is absent or null, :data:`PATH_KEYS`; the deprecated ``source-paths`` and
 ``data-paths`` where dbt still reads them). Never a ``profiles.yml`` (a
 generated one can hold a password, ``profiles.py``), ``__pycache__``, a
 symbolic link, or a directory dbt writes into (``target-path``, ``log-path``,
-``packages-install-path``), even one nested in a ``*-paths`` directory.
-``target/``, ``logs/`` and ``dbt_packages/`` at the project root sit outside
-every path key, so they are never walked. That is the set astronomer-cosmos
+``packages-install-path``): ``target/``, ``logs/`` and ``dbt_packages/`` at the
+project root sit outside every path key, so they are never walked. That is the set astronomer-cosmos
 leaves out when it stages a project for a run (``cosmos/dbt/project.py``: logs,
 target, profiles.yml, dbt_packages); the lock file stays in.
 
-Hidden names are skipped (``.git``, ``.DS_Store``), except where dbt would read
-them: a hidden file with an extension dbt parses (:data:`DBT_EXTENSIONS`), or a
-hidden directory holding one, is reported in :attr:`ProjectSelection.hidden`, so
-the bundle refuses it rather than bind a tree that leaves out code dbt runs.
+dbt never reads a file whose name starts with ``.``, ``#`` or ``~`` (its pattern is
+``[!.#~]*<ext>``, ``dbt/parser/search.py``), so those are skipped (``.DS_Store``,
+an editor's ``#orders.sql#``). It does read the files of a hidden directory, so a
+hidden directory holding a file dbt parses (:data:`DBT_EXTENSIONS`) is reported in
+:attr:`ProjectSelection.hidden`, and the bundle refuses it rather than bind a tree
+that leaves out code dbt runs. dbt also parses an output directory nested in a
+read one, so meeting one is refused, not skipped.
 
 The bytes are taken as they are on disk: no newline or Unicode normalisation,
 since dbt reads them as they are, and the binding compares the same raw bytes.
@@ -74,7 +76,7 @@ PATH_KEYS: Dict[str, Tuple[str, ...]] = {
 #: The deprecated spelling dbt still reads when the current key is absent.
 _DEPRECATED_KEYS: Dict[str, str] = {"model-paths": "source-paths", "seed-paths": "data-paths"}
 
-#: The directories dbt writes into, and their defaults: skipped wherever a walk meets one.
+#: The directories dbt writes into, and their defaults: refused wherever a walk meets one.
 _OUTPUT_KEYS: Dict[str, str] = {
     "target-path": "target",
     "log-path": "logs",
@@ -118,7 +120,7 @@ class ProjectSelection:
     #: ``(key, entry, problem)`` for each ``*-paths`` or output entry that is not a
     #: plain directory inside the project.
     bad_paths: List[Tuple[str, str, str]] = field(default_factory=list)
-    #: Hidden files dbt would read, relative to the project: not taken.
+    #: Files dbt would read inside a hidden directory, relative to the project: not taken.
     hidden: List[str] = field(default_factory=list)
     #: Directories the walk could not list, relative to the project.
     unlisted: List[str] = field(default_factory=list)
@@ -138,7 +140,7 @@ def select_project_files(project: Path, config: Mapping[str, Any]) -> ProjectSel
             selection.links.append(name)
         elif path.is_file():
             found[name] = path
-    skip, linked = _output_dirs(project, config, selection.bad_paths)
+    outputs = _output_dirs(project, config, selection.bad_paths)
     for key, default in PATH_KEYS.items():
         used, entries = _path_entries(config, key, default)
         if entries is None:
@@ -148,12 +150,12 @@ def select_project_files(project: Path, config: Mapping[str, Any]) -> ProjectSel
             rel = PurePosixPath(entry)
             problem = _JINJA if ("{{" in entry or "{%" in entry) else path_key_problem(project, rel)
             base_id = None if problem else _dir_id(project / rel)
-            if problem is None and base_id is not None and base_id in skip | linked:
+            if problem is None and base_id is not None and base_id in outputs:
                 problem = "the directory dbt writes its output into"
             if problem is not None:
                 selection.bad_paths.append((used, entry, problem))
                 continue
-            _walk(project, project / rel, found, selection, skip, linked)
+            _walk(project, project / rel, found, selection, outputs)
     selection.files = dict(sorted(found.items()))
     return selection
 
@@ -218,15 +220,14 @@ def _dir_id(path: Path) -> Optional[_DirId]:
 
 def _output_dirs(
     project: Path, config: Mapping[str, Any], bad: List[Tuple[str, str, str]]
-) -> Tuple[FrozenSet[_DirId], FrozenSet[_DirId]]:
-    """The directories dbt writes into, by identity: ``(real ones, ones reached by a link)``.
+) -> FrozenSet[_DirId]:
+    """The directories dbt writes into, by identity (through a link too).
 
-    A real one nested in a read directory is skipped; one a link points at is
-    refused where a walk meets it, since dbt writes into it through the link while
-    its files may be read under another name. An entry dbt cannot name literally
+    dbt parses whatever sits under a path it reads, its own output included, so
+    a walk refuses one wherever it meets it. An entry dbt cannot name literally
     (Jinja, not a string) is recorded in ``bad``.
     """
-    real, linked = set(), set()
+    found = set()
     for key, default in _OUTPUT_KEYS.items():
         value = config.get(key)
         value = default if value is None else value
@@ -236,15 +237,10 @@ def _output_dirs(
         if "{{" in value or "{%" in value:
             bad.append((key, value, _JINJA))
             continue
-        found = _dir_id(project / value)
-        if found is None:
-            continue
-        try:
-            is_link = (project / value).is_symlink()
-        except (OSError, ValueError):
-            is_link = False
-        (linked if is_link else real).add(found)
-    return frozenset(real), frozenset(linked)
+        identity = _dir_id(project / value)
+        if identity is not None:
+            found.add(identity)
+    return frozenset(found)
 
 
 def _walk(
@@ -252,10 +248,9 @@ def _walk(
     base: Path,
     found: Dict[str, Path],
     selection: ProjectSelection,
-    skip: FrozenSet[_DirId],
-    linked: FrozenSet[_DirId],
+    outputs: FrozenSet[_DirId],
 ) -> None:
-    """Add every regular file dbt reads under ``base``; record what it refuses.
+    """Add every regular file under ``base`` dbt may read; record what it refuses.
 
     A file is added only if it resolves inside the project, whatever the walk
     met on the way (:func:`path_key_problem` checks the entry itself first).
@@ -275,16 +270,12 @@ def _walk(
         here = Path(dirpath)
         # Sorted, so every file system walks alike and reports the same first link.
         dirnames[:] = [
-            n for n in sorted(dirnames) if _descend(project, here / n, selection, skip, linked)
+            n for n in sorted(dirnames) if _descend(project, here / n, selection, outputs)
         ]
         for name in sorted(filenames):
             path = here / name
             rel = path.relative_to(project).as_posix()
-            if name.lower() in _PROFILE_NAMES:
-                continue
-            if name.startswith("."):
-                if _dbt_reads(name):
-                    selection.hidden.append(rel)
+            if name.lower() in _PROFILE_NAMES or name[:1] in _NEVER_READ:
                 continue
             if path.is_symlink() or not path.resolve().is_relative_to(root):
                 selection.links.append(rel)
@@ -293,26 +284,20 @@ def _walk(
 
 
 def _descend(
-    project: Path,
-    child: Path,
-    selection: ProjectSelection,
-    skip: FrozenSet[_DirId],
-    linked: FrozenSet[_DirId],
+    project: Path, child: Path, selection: ProjectSelection, outputs: FrozenSet[_DirId]
 ) -> bool:
     """Whether the walk enters ``child``: not a cache, a link (recorded), a directory dbt
-    writes into, or hidden (a hidden one holding a file dbt reads is recorded)."""
+    writes into (refused: dbt parses it), or hidden (a hidden one holding a file dbt
+    reads is recorded)."""
     rel = child.relative_to(project).as_posix()
     if child.name == "__pycache__":
         return False
     if child.is_symlink():
         selection.links.append(rel)
         return False
-    identity = _dir_id(child)
-    if identity in skip:
-        return False
-    if identity in linked:
+    if _dir_id(child) in outputs:
         selection.bad_paths.append(
-            ("output", rel, "a directory dbt writes into through a symbolic link")
+            ("output", rel, "a directory dbt writes its output into, inside one it reads")
         )
         return False
     if child.name.startswith("."):
@@ -321,8 +306,12 @@ def _descend(
     return True
 
 
+#: First characters of a file name dbt never reads (``[!.#~]*<ext>``).
+_NEVER_READ = frozenset(".#~")
+
+
 def _dbt_reads(name: str) -> bool:
-    return Path(name).suffix.lower() in DBT_EXTENSIONS
+    return name[:1] not in _NEVER_READ and Path(name).suffix.lower() in DBT_EXTENSIONS
 
 
 def _dbt_files_under(project: Path, directory: Path, selection: ProjectSelection) -> List[str]:
@@ -359,9 +348,9 @@ def read_project_files(project: Path, *, budget: int = MAX_PROJECT_BYTES) -> Dic
 
     Raises :class:`DbtProjectFilesError` for a project that cannot be read as one
     tree: an unreadable ``dbt_project.yml``, a ``*-paths`` entry outside it or
-    written as Jinja, a symbolic link, a hidden file dbt would read, a directory
-    that cannot be listed, a file over :data:`MAX_FILE_BYTES`, or more than
-    ``budget`` bytes in all.
+    written as Jinja, an output directory inside a read one, a symbolic link, a
+    file dbt reads inside a hidden directory, a directory that cannot be listed, a
+    file over :data:`MAX_FILE_BYTES`, or more than ``budget`` bytes in all.
     """
     selection = select_project_files(project, load_project_config(project))
     _refuse(selection)
@@ -393,8 +382,8 @@ def _refuse(selection: ProjectSelection) -> None:
         )
     if selection.hidden:
         raise DbtProjectFilesError(
-            f"{selection.hidden[0]} is a hidden file dbt reads, which the bundle does not "
-            "pack; rename it, or delete it if it is a stray copy"
+            f"{selection.hidden[0]} is a file dbt reads inside a hidden directory, which "
+            "the bundle does not pack; move it out, or delete it if it is a stray copy"
         )
     if selection.unlisted:
         raise DbtProjectFilesError(

@@ -18,14 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directories the `*-paths` keys name, read as dbt-core reads them (defaults models, macros,
   seeds, snapshots, tests, analyses and functions; a null key takes its default; the deprecated
   `source-paths` and `data-paths`). It never packs `profiles.yml`, `target/`, `logs/`,
-  `dbt_packages/` (or what `target-path`, `log-path` and `packages-install-path` name) or a
-  hidden file dbt does not read, and it refuses what it cannot bind: a symbolic link, a hidden
-  file dbt reads (`.sql`, `.py`, `.csv`, `.md`, `.yml`, `.yaml`), a `*-paths` entry outside the
-  project or naming an output directory, a `*-paths` or output entry written as Jinja, a
-  directory it cannot list, a missing or templated project, a file over 64 MiB and more than
-  128 MiB of dbt files in one bundle.
-  Each file is in the MANIFEST and under its merkle root, so the same tree bundles to the same
-  bytes. `fluid plan <bundle>` records each project's files as `dbtProjects` under
+  `dbt_packages/` (or what `target-path`, `log-path` and `packages-install-path` name), or a
+  file dbt never reads by its name (one starting with `.`, `#` or `~`), and it refuses what it
+  cannot bind: a symbolic link, a file dbt reads inside a hidden directory (`.sql`, `.py`,
+  `.csv`, `.md`, `.yml`, `.yaml`), an output directory inside a read one, a `*-paths` entry
+  outside the project, a `*-paths` or output entry written as Jinja, a directory it cannot list,
+  a missing or templated project, a file over 64 MiB and more than 128 MiB of dbt files in one
+  bundle. Each file is in the MANIFEST and under its merkle root, so the same tree bundles to
+  the same bytes. `fluid plan <bundle>` records each project's files as `dbtProjects` under
   `planDigest`, and `fluid apply` compares the checkout with the bundle's copy before anything
   runs; the dbt runner compares the directory it runs again, just before dbt starts. A changed,
   added or removed file, and a dbt build the bundle packs no project for (as in a bundle made

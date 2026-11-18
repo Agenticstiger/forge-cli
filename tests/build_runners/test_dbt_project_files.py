@@ -106,14 +106,11 @@ class TestSelection:
         assert {"src/a.sql", "lib/b.sql", "macros/m.sql"} <= files
         assert not any(rel.startswith("models/") for rel in files)
 
-    def test_a_directory_dbt_writes_into_is_skipped_inside_a_read_one(self, tmp_path: Path) -> None:
-        project = _project(
-            tmp_path, "name: p\ntarget-path: models/compiled\npackages-install-path: models/pkg\n"
-        )
-        _write(project, {"models/compiled/x.sql": "x", "models/pkg/y.sql": "y"})
-        files = set(read_project_files(project))
-        assert "models/orders.sql" in files
-        assert not any(rel.startswith(("models/compiled/", "models/pkg/")) for rel in files)
+    def test_files_dbt_never_reads_by_their_name_are_left_out(self, tmp_path: Path) -> None:
+        # dbt's pattern is [!.#~]*<ext>: a dot, a hash or a tilde first is never read.
+        project = _project(tmp_path)
+        _write(project, {"models/.wip.sql": "x", "models/#m.sql#": "x", "seeds/~old.csv": "x"})
+        assert set(read_project_files(project)) == READ
 
     def test_an_output_directory_is_refused_whatever_its_case(self, tmp_path: Path) -> None:
         # Compared by identity, not by name: on a case-insensitive file system Target/ is
@@ -199,15 +196,30 @@ class TestRefusals:
     def test_an_output_directory_linked_to_a_read_one(self, tmp_path: Path) -> None:
         project = _project(tmp_path, "name: p\ntarget-path: out\n")
         _link(project / "models" / "staging", project / "out")
-        assert "writes into through a symbolic link" in _refusal(project)
+        assert "models/staging, a directory dbt writes its output into" in _refusal(project)
 
     @pytest.mark.parametrize(
-        "rel", ["models/.wip.sql", "seeds/.old.CSV", "models/.ipynb_checkpoints/m-checkpoint.py"]
+        "config",
+        [
+            "target-path: models/compiled",
+            "packages-install-path: models/pkg",
+            "packages-install-path: models/.pk",
+        ],
     )
-    def test_a_hidden_file_dbt_reads(self, tmp_path: Path, rel: str) -> None:
+    def test_an_output_directory_inside_a_read_one(self, tmp_path: Path, config: str) -> None:
+        # dbt parses its own output there: the bound tree would leave out code it runs.
+        out = config.split(": ")[1]
+        project = _project(tmp_path, f"name: p\n{config}\n")
+        _write(project, {f"{out}/x.sql": "select 1"})
+        assert f"{out}, a directory dbt writes its output into" in _refusal(project)
+
+    @pytest.mark.parametrize(
+        "rel", ["models/.ipynb_checkpoints/m-checkpoint.py", "seeds/.old/rates.CSV"]
+    )
+    def test_a_file_dbt_reads_inside_a_hidden_directory(self, tmp_path: Path, rel: str) -> None:
         project = _project(tmp_path)
         _write(project, {rel: "select 1"})
-        assert f"{rel} is a hidden file dbt reads" in _refusal(project)
+        assert f"{rel} is a file dbt reads inside a hidden directory" in _refusal(project)
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
     def test_a_directory_that_cannot_be_listed(self, tmp_path: Path) -> None:
@@ -356,13 +368,6 @@ class TestCollectBundleProjects:
     def test_a_repository_that_is_no_usable_path(self, tmp_path: Path, repository: str) -> None:
         contract = {"builds": [{**DBT, "repository": repository}]}
         assert "is not a usable path" in _collect_refusal(contract, tmp_path)
-
-    def test_a_hidden_output_directory_in_a_read_one_is_skipped(self, tmp_path: Path) -> None:
-        project = _project(tmp_path, "name: p\npackages-install-path: models/.pk\n")
-        _write(project, {"models/.pk/pkg/m.sql": "select 1"})
-        files = set(read_project_files(project))
-        assert "models/orders.sql" in files
-        assert not any(rel.startswith("models/.pk/") for rel in files)
 
     def test_two_builds_with_one_id(self, tmp_path: Path) -> None:
         _project(tmp_path)
