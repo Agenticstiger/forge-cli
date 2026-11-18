@@ -33,7 +33,7 @@ from fluid_build.build_runners.spark._adapters import (
     SparkRunError,
     adapter_for,
 )
-from fluid_build.build_runners.spark._desired import LOCAL_ROOT_TOKEN, desired_runs
+from fluid_build.build_runners.spark._desired import LOCAL_ROOT_TOKEN, config_digest, desired_runs
 from fluid_build.build_runners.spark._local import (
     LOCAL_ROOT_ENV,
     PROPERTIES_FILE_ENV,
@@ -434,8 +434,8 @@ def test_spark_submit_is_handed_the_sha256_of_the_config_it_reads(host):
     out = rc.run_once(run, local_host=host, timeout=30, say=lambda _: 0)
     assert out.state == SUCCEEDED
     argv = argv_of(host)["argv"]
-    config = Path(argv[argv.index("--config") + 1]).read_bytes()
-    assert argv[-2:] == ["--fluid-job-sha256", hashlib.sha256(config).hexdigest()]
+    config = Path(argv[argv.index("--config") + 1]).read_text(encoding="utf-8")
+    assert argv[-2:] == ["--fluid-job-sha256", config_digest(config)]
 
 
 def test_a_batch_run_goes_to_succeeded(host):

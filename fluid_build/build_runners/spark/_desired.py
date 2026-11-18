@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -144,6 +145,36 @@ _CONF_DENIED_PREFIXES = (
 )
 
 
+def config_digest(text: str) -> str:
+    """The sha256 a run's job config is started with (``--fluid-job-sha256``) and checked
+    by: its JSON in one canonical form (keys sorted, strings in NFC, as OpenTofu writes
+    them), the MSK brokers OpenTofu fills in for an ``mskClusterArn`` source left out, so a
+    broker list MSK changes does not stop a stream's retries. The same function is in
+    forge's Spark runner (``fluid_build/spark/runner/forge_spark_runner.py``).
+
+    Raises:
+        ValueError: the text is not a JSON object.
+    """
+    config = _nfc(json.loads(text))
+    if not isinstance(config, dict):
+        raise ValueError("the job config is not a JSON object")
+    source = config.get("source")
+    if isinstance(source, dict) and source.get("mskClusterArn"):
+        source["bootstrapServers"] = None
+    canonical = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _nfc(value):
+    if isinstance(value, str):
+        return unicodedata.normalize("NFC", value)
+    if isinstance(value, list):
+        return [_nfc(v) for v in value]
+    if isinstance(value, dict):
+        return {_nfc(k): _nfc(v) for k, v in value.items()}
+    return value
+
+
 def _sha(value: Any) -> str:
     text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -257,21 +288,12 @@ class DesiredRun:
 
     def config_matches(self, body: bytes) -> bool:
         """Whether ``body``, the job config read back from where the runtime reads it, is
-        the one this run was compiled to: the same JSON, the MSK brokers OpenTofu fills in
-        for ``MSK_BROKERS_PLACEHOLDER`` aside."""
-        from fluid_build.spark.compiler import MSK_BROKERS_PLACEHOLDER
-
+        the one this run was compiled to (:func:`config_digest`: the same JSON, the MSK
+        brokers OpenTofu fills in aside)."""
         try:
-            uploaded, planned = json.loads(body.decode("utf-8")), json.loads(self.job_text)
+            return config_digest(body.decode("utf-8")) == config_digest(self.job_text)
         except ValueError:  # UnicodeDecodeError included
             return False
-        if not isinstance(uploaded, dict) or not isinstance(planned, dict):
-            return False
-        source = uploaded.get("source")
-        filled = (planned.get("source") or {}).get("bootstrapServers") == MSK_BROKERS_PLACEHOLDER
-        if filled and isinstance(source, dict) and source.get("bootstrapServers"):
-            uploaded["source"] = {**source, "bootstrapServers": MSK_BROKERS_PLACEHOLDER}
-        return uploaded == planned
 
     def tags(self) -> Dict[str, str]:
         tags = {

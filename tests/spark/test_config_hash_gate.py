@@ -9,12 +9,11 @@ checks it first, the account and the MSK brokers OpenTofu fills in aside."""
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 
 import pytest
 
-from fluid_build.build_runners.spark._desired import desired_runs
+from fluid_build.build_runners.spark._desired import config_digest, desired_runs
 from fluid_build.iac import get_iac_plugin
 from tests.iac.test_iac_aws_spark_infra import (  # noqa: F401 - operator_policy is a fixture
     CONTRACT,
@@ -28,21 +27,44 @@ BROKERS = (
 )
 
 
-def sha(text):
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 def test_the_runner_takes_the_config_it_was_started_on(runner):
     text = '{"configVersion": 1}\n'
-    assert runner.checked_text(text, sha(text), "s3://b/job.json") == text
-    assert runner.checked_text(text, sha(text).upper(), "s3://b/job.json") == text
+    digest = config_digest(text)
+    assert runner.checked_text(text, digest, "s3://b/job.json") == text
+    assert runner.checked_text(text, digest.upper(), "s3://b/job.json") == text
     assert runner.checked_text(text, None, "s3://b/job.json") == text  # started by hand
 
 
 def test_the_runner_refuses_another_config_before_reading_anything(runner):
+    other = config_digest('{"configVersion": 2}')
     with pytest.raises(runner.JobConfigError, match="not the one fluid apply started") as caught:
-        runner.checked_text('{"configVersion": 1}\n', sha("{}"), "s3://b/job.json")
-    assert sha("{}") in str(caught.value) and "s3://b/job.json" in str(caught.value)
+        runner.checked_text('{"configVersion": 1}\n', other, "s3://b/job.json")
+    assert other in str(caught.value) and "s3://b/job.json" in str(caught.value)
+    with pytest.raises(runner.JobConfigError, match="not a JSON object"):
+        runner.checked_text("[]", other, "s3://b/job.json")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"b": 1, "a": "caf\u00e9"}',
+        '{"a": "cafe\u0301", "b": 1}',  # NFD: OpenTofu writes it in NFC
+        '{"source": {"mskClusterArn": "arn:x", "bootstrapServers": "b-1:9098"}, "n": 1.5}',
+        '{"source": {"bootstrapServers": "localhost:9092"}, "flag": true}',
+    ],
+)
+def test_forge_and_its_runner_compute_one_digest(runner, text):
+    assert runner.config_digest(text) == config_digest(text)
+
+
+def test_the_digest_leaves_out_only_what_opentofu_fills_in():
+    msk = '{"source": {"mskClusterArn": "arn:x", "bootstrapServers": "%s"}}'
+    assert config_digest(msk % "b-1:9098") == config_digest(msk % "b-9:9098")
+    named = '{"source": {"bootstrapServers": "%s"}}'
+    assert config_digest(named % "a:9092") != config_digest(named % "b:9092")
+    # NFC, as OpenTofu writes it; a type is part of the value.
+    assert config_digest('{"a": "cafe\u0301"}') == config_digest('{"a": "caf\u00e9"}')
+    assert len({config_digest('{"a": %s}' % v) for v in ("1", "1.0", "true")}) == 3
 
 
 def uploaded(contract):

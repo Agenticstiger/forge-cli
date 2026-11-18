@@ -33,6 +33,10 @@ def upload(run):
     s3 = boto3.client("s3", region_name=REGION)
     s3.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": REGION})
     s3.put_object(Bucket=bucket, Key=key, Body=run.job_text.encode("utf-8"))
+    from fluid_build.spark import runner_source
+
+    runner_key = run.runner_uri.removeprefix(f"s3://{bucket}/")
+    s3.put_object(Bucket=bucket, Key=runner_key, Body=runner_source().encode("utf-8"))
 
 
 def test_emr_serverless_runs_and_get_read_back_name_tags_and_arguments(run):

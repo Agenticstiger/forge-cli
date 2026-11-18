@@ -157,6 +157,10 @@ def _submit_parameters(conf: Mapping[str, str]) -> str:
     return " ".join(shlex.quote(p) for p in _conf_params(conf))
 
 
+#: The most bytes an artifact read back before a start may hold (forge's are tens of KiB).
+MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
+
+
 class Adapter:
     runtime = ""
     service = ""
@@ -167,34 +171,56 @@ class Adapter:
         self.client = clients(self.service, run.region)
 
     def checked(self) -> DesiredRun:
-        """The run, with the sha256 of the job config its runtime reads
-        (``--fluid-job-sha256``), once the config read back from S3 is the one this apply
-        compiled: the runner then refuses any other, so a config another apply or a hand
-        put there since never runs under this run's config hash.
+        """The run, with the digest of the job config its runtime reads
+        (``--fluid-job-sha256``), once the config and the runner read back from S3 are the
+        ones this apply compiled: the runner then refuses any other config, so one another
+        apply put there since never runs under this run's config hash. The artifact
+        bucket's write access stays the boundary: a writer could replace the runner after
+        this read.
 
         Raises:
-            SparkRunError: the config cannot be read, or is another one; nothing started.
+            SparkRunError: an artifact cannot be read, or is another one; nothing started.
         """
         import dataclasses
         import hashlib
+        import unicodedata
+
+        from fluid_build.build_runners.spark._desired import config_digest
+        from fluid_build.spark import runner_source
 
         r = self.run
-        bucket, _, key = r.job_uri.removeprefix("s3://").partition("/")
+        config, runner = self._artifact(r.job_uri), self._artifact(r.runner_uri)
+        # OpenTofu writes text in NFC; the runner's is the one this forge-cli ships.
+        shipped = unicodedata.normalize("NFC", runner_source()).encode("utf-8")
+        if (
+            not r.config_matches(config)
+            or hashlib.sha256(runner).digest() != hashlib.sha256(shipped).digest()
+        ):
+            raise SparkRunError(
+                f"Spark build {r.build}: {r.job_uri} or its runner is not the one this apply "
+                "compiled (another apply has changed it since); nothing was started. Run fluid "
+                "apply again: it uploads them and starts the run on them"
+            )
+        return dataclasses.replace(r, job_sha256=config_digest(r.job_text))
+
+    def _artifact(self, uri: str) -> bytes:
+        """An artifact's bytes from S3, at most :data:`MAX_ARTIFACT_BYTES`."""
+        bucket, _, key = uri.removeprefix("s3://").partition("/")
         try:
-            body = self.clients("s3", r.region).get_object(Bucket=bucket, Key=key)["Body"].read()
+            body = self.clients("s3", self.run.region).get_object(Bucket=bucket, Key=key)
+            data = body["Body"].read(MAX_ARTIFACT_BYTES + 1)
         except Exception as exc:  # noqa: BLE001 - botocore's errors; named, then raised
             code = str((getattr(exc, "response", None) or {}).get("Error", {}).get("Code") or "")
             raise SparkRunError(
-                f"Spark build {r.build}: {r.job_uri} cannot be read to check it before the run "
+                f"Spark build {self.run.build}: {uri} cannot be read to check it before the run "
                 f"starts ({code or type(exc).__name__}); nothing was started"
             ) from exc
-        if not r.config_matches(body):
+        if len(data) > MAX_ARTIFACT_BYTES:
             raise SparkRunError(
-                f"Spark build {r.build}: {r.job_uri} is not the job config this apply compiled "
-                "(another apply, or a hand, has changed it since); nothing was started. Run "
-                "fluid apply again: it uploads the config and starts the run on it"
+                f"Spark build {self.run.build}: {uri} is larger than any artifact forge writes; "
+                "nothing was started"
             )
-        return dataclasses.replace(r, job_sha256=hashlib.sha256(body).hexdigest())
+        return data
 
     def runs(self) -> List[RunInfo]:  # newest first
         raise NotImplementedError

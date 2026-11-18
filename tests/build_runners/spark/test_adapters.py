@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
-import hashlib
 import io
 
 import pytest
@@ -18,6 +17,9 @@ boto3 = pytest.importorskip("boto3")
 Stubber = pytest.importorskip("botocore.stub").Stubber
 
 from fluid_build.build_runners.spark import _adapters as ad
+from fluid_build.build_runners.spark._desired import config_digest
+from fluid_build.spark import runner_source
+from fluid_build.spark.names import RUNNER_FILE
 from tests.build_runners.spark.conftest import variant
 
 NOW = dt.datetime(2026, 11, 16, 12, 0, tzinfo=dt.timezone.utc)
@@ -34,27 +36,28 @@ def stubbed(service, region="eu-west-1"):
 
 
 class ConfigBucket:
-    """The S3 the job config is read back from before a start: it holds ``body``."""
+    """The S3 the artifacts are read back from before a start: the job config (``body``)
+    and the runner (``runner``)."""
 
-    def __init__(self, body):
-        self.body, self.read = body, []
+    def __init__(self, body, runner=None):
+        self.body, self.runner, self.read = body, runner, []
 
     def get_object(self, Bucket, Key):  # noqa: N803 - boto3's names
         self.read.append(f"s3://{Bucket}/{Key}")
+        if Key.endswith(RUNNER_FILE):
+            return {"Body": io.BytesIO(self.runner or runner_source().encode("utf-8"))}
         return {"Body": io.BytesIO(self.body)}
 
 
-def adapter_on(run, service, body=None):
+def adapter_on(run, service, body=None, runner=None):
     client, stub = stubbed(service, run.region)
-    bucket = ConfigBucket(run.job_text.encode("utf-8") if body is None else body)
+    bucket = ConfigBucket(run.job_text.encode("utf-8") if body is None else body, runner)
     return ad.adapter_for(run, lambda s, r: bucket if s == "s3" else client), stub
 
 
 def started(run):
-    """``run`` as an adapter starts it: with the sha256 of the job config it read back."""
-    return dataclasses.replace(
-        run, job_sha256=hashlib.sha256(run.job_text.encode("utf-8")).hexdigest()
-    )
+    """``run`` as an adapter starts it: with the digest of the job config it read back."""
+    return dataclasses.replace(run, job_sha256=config_digest(run.job_text))
 
 
 def identity_of(run):
@@ -607,9 +610,23 @@ def test_the_arguments_carry_the_config_s_identity_then_its_sha256(serverless):
 )
 def test_a_config_this_apply_did_not_compile_starts_nothing(serverless, body):
     adapter, stub = adapter_on(serverless, "emr-serverless", body=body)
-    with pytest.raises(ad.SparkRunError, match="not the job config this apply compiled"):
+    with pytest.raises(ad.SparkRunError, match="is not the one this apply compiled"):
         adapter.start("tok")
     stub.assert_no_pending_responses()  # nothing was sent to EMR
+
+
+def test_a_runner_this_forge_does_not_ship_starts_nothing(serverless):
+    adapter, stub = adapter_on(serverless, "emr-serverless", runner=b"import os  # not ours\n")
+    with pytest.raises(ad.SparkRunError, match="or its runner is not the one"):
+        adapter.start("tok")
+    stub.assert_no_pending_responses()
+
+
+def test_an_artifact_larger_than_forge_writes_starts_nothing(serverless, monkeypatch):
+    monkeypatch.setattr(ad, "MAX_ARTIFACT_BYTES", 8)
+    adapter, _ = adapter_on(serverless, "emr-serverless")
+    with pytest.raises(ad.SparkRunError, match="larger than any artifact forge writes"):
+        adapter.start("tok")
 
 
 def test_a_config_that_cannot_be_read_starts_nothing(serverless):
