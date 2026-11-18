@@ -63,6 +63,30 @@ COLUMNS = (
     ("kafka_timestamp", "TIMESTAMP", False),
     ("dead_lettered_at", "TIMESTAMP", True),
 )
+#: The same columns as contract schema fields, for the Glue table OpenTofu emits on AWS.
+SCHEMA = (
+    {
+        "name": "error",
+        "type": "string",
+        "required": True,
+        "description": "Why the record is a dead letter: the first check it failed",
+    },
+    {
+        "name": "raw_value",
+        "type": "binary",
+        "description": "The record's value as it was read; null for a build that masks fields",
+    },
+    {
+        "name": "raw_key",
+        "type": "binary",
+        "description": "The record's key as it was read; null for a build that masks fields",
+    },
+    {"name": "kafka_topic", "type": "string", "required": True},
+    {"name": "kafka_partition", "type": "integer", "required": True},
+    {"name": "kafka_offset", "type": "long", "required": True},
+    {"name": "kafka_timestamp", "type": "timestamp"},
+    {"name": "dead_lettered_at", "type": "timestamp", "required": True},
+)
 SINKS = ("table", "topic")
 ALERTS = ("schema_violation",)
 DEFAULT_MAX_RECORDS = 10_000

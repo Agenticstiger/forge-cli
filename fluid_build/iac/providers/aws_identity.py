@@ -514,6 +514,11 @@ class JobAccess:
     #: That connection's subnet ARN: the only subnet whose interfaces the role may tag
     #: and delete.
     glue_subnet_arn: Any = None
+    #: The table the stream's dead letters go to, in ``database``
+    #: (``properties.stream.deadLetter``, sink table).
+    dead_letter_table: Optional[str] = None
+    #: The topic on ``msk`` the stream's dead letters go to (sink topic).
+    dead_letter_topic: Optional[str] = None
 
 
 def secret_resources(arn: Any) -> List[Any]:
@@ -627,6 +632,11 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
                 _join(glue, "catalog"),
                 _join(glue, "database/", access.database),
                 _join(glue, "table/", access.database, "/", access.table),
+                *(
+                    [_join(glue, "table/", access.database, "/", access.dead_letter_table)]
+                    if access.dead_letter_table
+                    else []
+                ),
             ],
         }
     )
@@ -664,6 +674,28 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
                 },
             ]
         )
+        if access.dead_letter_topic:
+            # The dead letters are the records' own bytes: no registry is read or written.
+            # A Kafka producer is idempotent by default (KIP-679), and MSK authorizes that
+            # on the cluster, never on a topic.
+            statements.extend(
+                [
+                    {
+                        "sid": "MskDeadLetterTopic",
+                        "effect": "Allow",
+                        "actions": ["kafka-cluster:DescribeTopic", "kafka-cluster:WriteData"],
+                        "resources": [
+                            f"arn:aws:kafka:{scope}:topic/{tail}/{access.dead_letter_topic}"
+                        ],
+                    },
+                    {
+                        "sid": "MskIdempotentWrite",
+                        "effect": "Allow",
+                        "actions": ["kafka-cluster:WriteDataIdempotently"],
+                        "resources": [msk.arn],
+                    },
+                ]
+            )
     if access.secret_arns:
         secrets = [r for a in access.secret_arns for r in secret_resources(a)]
         statements.extend(

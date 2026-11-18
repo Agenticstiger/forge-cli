@@ -236,3 +236,62 @@ def test_managed_flink_refuses_dead_letters():
                 "deadLetter": {},
             }
         )
+
+
+# --- the runner's dead-letter batches --------------------------------------------------
+
+
+class Batch:
+    """A micro-batch of ``n`` dead letters, as foreachBatch hands one over."""
+
+    def __init__(self, n):
+        self.n, self.cached = n, False
+
+    def persist(self):
+        self.cached = True
+        return self
+
+    def count(self):
+        return self.n
+
+    def unpersist(self):
+        self.cached = False
+
+
+def dead_letters(runner, contract, monkeypatch, **spec):
+    config = runner.parse_config(runner_config(contract, **spec))
+    landed = []
+    sink = runner.DeadLetters(spark=None, config=config)
+    monkeypatch.setattr(sink, "to_table", lambda batch, batch_id: landed.append(batch_id))
+    monkeypatch.setattr(sink, "to_topic", lambda batch: landed.append("topic"))
+    return sink, landed
+
+
+def test_each_batch_lands_once_and_is_counted(runner, contract, monkeypatch):
+    sink, landed = dead_letters(runner, contract, monkeypatch)
+    sink(Batch(2), 0)
+    sink(Batch(0), 1)  # a batch with none writes nothing
+    sink(Batch(3), 2)
+    assert (landed, sink.total) == ([0, 2], 5)
+
+
+def test_past_the_threshold_the_stream_stops_after_the_batch_landed(runner, contract, monkeypatch):
+    sink, landed = dead_letters(runner, contract, monkeypatch, maxRecordsBeforeAbort=3)
+    sink(Batch(3), 0)  # at the threshold: going on
+    with pytest.raises(runner.DeadLetterAbort, match="past maxRecordsBeforeAbort 3"):
+        sink(Batch(1), 1)
+    assert landed == [0, 1]  # the batch that crossed it landed first
+
+
+def test_a_topic_sink_sends_and_an_alert_is_logged(runner, contract, monkeypatch, capsys):
+    sink, landed = dead_letters(
+        runner,
+        contract,
+        monkeypatch,
+        sink="topic",
+        topic="commerce.orders.dlq",
+        alertOn=["schema_violation"],
+    )
+    sink(Batch(1), 0)
+    assert landed == ["topic"]
+    assert '"forge_spark_runner": "dead_letter_alert"' in capsys.readouterr().out
