@@ -55,6 +55,10 @@ CALLER_ACTIONS: Dict[str, tuple] = {
         "elasticmapreduce:ListSteps",
         "elasticmapreduce:DescribeStep",
         "elasticmapreduce:CancelSteps",
+        # The cluster's Spot posture, warned at plan and apply (_posture.py).
+        "elasticmapreduce:DescribeCluster",
+        "elasticmapreduce:ListInstanceFleets",
+        "elasticmapreduce:ListInstanceGroups",
     ),
     "emr-eks": (
         "emr-containers:StartJobRun",
