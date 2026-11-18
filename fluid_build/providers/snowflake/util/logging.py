@@ -21,6 +21,16 @@ from fluid_build.observability.secret_redactor import (
     redact_known_values,
 )
 
+# The ``value`` group of the two bare-assignment patterns below: an optional quoted string up to
+# its closing quote (escape-aware, at most 2,048 characters, as the JAAS pattern's), then the
+# unquoted tail up to the first space, ``;``, ``&`` or ``,``. The tail alone is the long-shipped
+# value class. The quoted prefix only ever ADDS to what a match masks, so a quoted value that
+# holds a delimiter (a SAS token holds ``&``, and is ~300 characters long) is masked whole instead
+# of being cut at the first one.
+_ASSIGNED_VALUE = (
+    r"(?P<value>(?:\"(?:[^\"\\]|\\.){,2048}\"|'(?:[^'\\]|\\.){,2048}')?[^\s;&,]{,256})"
+)
+
 # Patterns for sensitive data that should be redacted
 #
 # SECURITY_REVIEW S-010: extended to cover common token shapes that were
@@ -29,6 +39,11 @@ from fluid_build.observability.secret_redactor import (
 # (``api_key``, ``client_secret`` lowercase, ``aws_access_key_id`` as the
 # actual AWS standard name).
 SENSITIVE_PATTERNS = [
+    # PEM private-key block (RSA / EC / OPENSSH / DSA / bare PKCS#8 ...), FIRST as in the
+    # global layer: a ``key=value`` pattern below would take ``-----BEGIN`` for the value and
+    # leave the key body behind. ``[^-]*`` so the algorithm word is optional; ``(?s)`` so
+    # ``.`` spans newlines.
+    re.compile(r"(?s)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----"),
     # Connection strings (protocol://user:password@host). SHARED with the global
     # SecretRedactingFilter via the imported _URL_USERINFO_RE so the two layers
     # mask the identical shape and cannot drift (CLAUDE.md "extend both"). The
@@ -71,6 +86,14 @@ SENSITIVE_PATTERNS = [
     # forms are caught by the assignment pattern below; the global layer's
     # assignment regex also handles the quoted-key form).
     re.compile(r'"databricks_(?:token|client_secret|password)":\s*"[^"]*"', re.IGNORECASE),
+    # AWS / Azure stage keys as JSON text, ABOVE the assignment pattern: its key list matches
+    # these keys too, and its bounded value would leave the tail of a long SAS token (~300
+    # characters, holds ``&``) in the clear. These match the whole quoted value.
+    re.compile(r'"aws_key_id":\s*"[^"]*"', re.IGNORECASE),
+    re.compile(r'"aws_access_key_id":\s*"[^"]*"', re.IGNORECASE),
+    re.compile(r'"aws_secret_key":\s*"[^"]*"', re.IGNORECASE),
+    re.compile(r'"aws_secret_access_key":\s*"[^"]*"', re.IGNORECASE),
+    re.compile(r'"azure_sas_token":\s*"[^"]*"', re.IGNORECASE),
     # Bare key:value / key=value assignments — both separators.
     # Named groups so ``redact_string`` keeps the key name + separator and
     # redacts only the value (``password=hunter2`` -> ``password=[REDACTED]``)
@@ -90,33 +113,27 @@ SENSITIVE_PATTERNS = [
         #   * ``private_key`` — covered by the ``"private_key":`` JSON pattern,
         #     the SENSITIVE_KEYS dict-key check, the PEM-block pattern, and (for
         #     a bare ``private_key=<non-PEM>`` value) the dedicated named-group
-        #     pattern placed AFTER the PEM block at the end of this list.
-        #     Including it HERE would run before the PEM-block pattern and
-        #     corrupt a ``private_key=<multiline PEM>`` header, leaking the body.
+        #     pattern at the end of this list. A PEM block is masked first, at
+        #     the head of this list, so no pattern here ever sees its header.
         r"(?i)\b(?P<key>(?:[A-Za-z0-9_]{,128}_)?(?:"
         r"api[_-]?key|authorization|secret[_.-]access[_.-]key|secret[_.-]key|client_secret|"
         r"oauth[_-]?token|password|session[_-]token|secret|token|passphrase"
         r"))"
-        r"(?P<sep>\s{,8}[:=]\s{,8})"
-        # Value terminator set kept in lock-step with the global twin
-        # (observability/secret_redactor.py ``_ASSIGNMENT_RE``) and
-        # deliberately UNCHANGED. No terminator set is leak-free — every
-        # candidate character is one a real password may contain — so a
-        # secret whose literal value is known must be masked by
-        # ``redact_known_values`` (run first, below), not by widening this.
-        # An earlier attempt to widen it here regressed quoted values
-        # followed by ``&`` or ``/`` into emitting the password verbatim.
-        r"(?P<value>[^\s;&,]{,256})"
+        # ``sep`` admits the quote that closes a key, as the global twin's does.
+        r"(?P<sep>['\"]?\s{,8}[:=]\s{,8})"
+        # The unquoted value's terminator set (``_ASSIGNED_VALUE``) is kept in
+        # lock-step with the global twin (observability/secret_redactor.py
+        # ``_ASSIGNMENT_RE``) and deliberately UNCHANGED. No terminator set is
+        # leak-free, so a secret whose literal value is known must be masked by
+        # ``redact_known_values`` (run first, below), not by widening this. An
+        # earlier attempt to widen it regressed quoted values followed by ``&``
+        # or ``/``; the quoted prefix cannot, as it only ever masks MORE.
+        + _ASSIGNED_VALUE
     ),
-    # AWS keys (for external stages)
-    re.compile(r'"aws_key_id":\s*"[^"]*"', re.IGNORECASE),
-    re.compile(r'"aws_access_key_id":\s*"[^"]*"', re.IGNORECASE),
-    re.compile(r'"aws_secret_key":\s*"[^"]*"', re.IGNORECASE),
-    re.compile(r'"aws_secret_access_key":\s*"[^"]*"', re.IGNORECASE),
+    # AWS keys (for external stages); their quoted-JSON forms are above the assignment pattern.
     re.compile(r"AWS_SECRET_ACCESS_KEY=[^\s;&]+", re.IGNORECASE),
     re.compile(r"AWS_ACCESS_KEY_ID=[^\s;&]+", re.IGNORECASE),
     # Azure keys (for external stages)
-    re.compile(r'"azure_sas_token":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r"AZURE_STORAGE_SAS_TOKEN=[^\s;&]+", re.IGNORECASE),
     # Third-party / provider token shapes (S-010). JWTs are not in this list:
     # redact_string() masks them with the global layer's redact_jose_tokens, the one
@@ -149,21 +166,16 @@ SENSITIVE_PATTERNS = [
     re.compile(r"dapi[a-fA-F0-9]{32}(?:-\d)?"),
     # Fernet token — URL-safe base64 with the fixed ``gAAAAA`` header.
     re.compile(r"\bgAAAAA[A-Za-z0-9_-]{20,}"),
-    # PEM private-key block (RSA / EC / OPENSSH / DSA / bare PKCS#8 ...).
-    # ``[^-]*`` so the algorithm word is optional and the bare
-    # ``-----BEGIN PRIVATE KEY-----`` PKCS#8 header is covered. ``(?s)``
-    # so ``.`` spans newlines and the whole multiline block is scrubbed.
-    re.compile(r"(?s)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----"),
     # Bare ``private_key=<non-PEM>`` assignment. Named groups so ``redact_string``
     # keeps the key + separator and redacts only the value (mirrors the global
     # ``secret_redactor._ASSIGNMENT_RE``, which covers ``private_key`` in its
-    # alternation). MUST be positioned AFTER the PEM-block pattern above: a
+    # alternation). MUST be positioned AFTER the PEM-block pattern at the head: a
     # ``private_key=<multiline PEM>`` header is scrubbed to ``private_key=[REDACTED]``
     # by the PEM pattern first, so this pattern only ever re-matches the already
     # redacted ``[REDACTED]`` token (idempotent) — it never bites into a PEM body.
-    # Value class ``[^\s;&,]{,256}`` matches the Snowflake bare-assignment
-    # convention above and is length-bounded (no catastrophic backtracking).
-    re.compile(r"(?i)(?P<key>\bprivate[_-]?key)(?P<sep>\s{,8}[:=]\s{,8})(?P<value>[^\s;&,]{,256})"),
+    # Value (``_ASSIGNED_VALUE``) and ``sep`` (a closing quote on the key) as in the
+    # bare-assignment pattern above; length-bounded (no catastrophic backtracking).
+    re.compile(r"(?i)(?P<key>\bprivate[_-]?key)(?P<sep>['\"]?\s{,8}[:=]\s{,8})" + _ASSIGNED_VALUE),
 ]
 
 # Keys that should be redacted in dictionaries.

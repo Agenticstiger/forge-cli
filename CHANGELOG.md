@@ -41,6 +41,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list the way the other type readers do, stepping over quoted text; only a type whose parameter
   list holds a parenthesis inside quotes reads differently. The conformance vectors gain three
   cases for a level holding a parenthesis, a comma and a doubled quote.
+- **The Snowflake provider's redaction helper masks a credential whose key is quoted.**
+  `redact_string` returned the value in the clear for `{'client_secret': '…'}`,
+  `{"<PREFIX>_TOKEN": "…"}`, `"id_token": "…"` and `{'private_key': '…'}`: only a key with its own
+  JSON pattern was masked in quoted form. A quoted value that holds a space, `;`, `&` or `,` is now
+  masked to its closing quote (an Azure SAS token holds `&` and runs to about 300 characters), and
+  a private-key block under `secret=`, `token:` or `password=` is masked whole instead of leaving
+  its body behind. The global log filter already did all of this, and no CLI command calls the
+  Snowflake helper yet, so no log line carried the leak. The symmetry tests now feed each way of
+  writing a client secret, a token and a bearer JWT through both layers.
 
 ## [0.31.0] — 2026-11-17
 
