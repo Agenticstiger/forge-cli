@@ -421,6 +421,10 @@ def _emit_build(
             "create transient EMR clusters yet.",
             ("Set parameters.spark.clusterId to the running cluster (j-...).",),
         )
+    blocks.resources["aws_cloudwatch_log_group"][b.key]["tags"] = {
+        **b.tags,
+        **_run_identity(b, application_id),
+    }
     database, table = config["sink"]["table"].split(".", 1)
     vpc = b.runtime == "glue" and cluster is not None
     jars = _glue_jars(blocks, b, bucket_ref) if b.runtime == "glue" else ()
@@ -475,6 +479,23 @@ def _emit_build(
         ),
         lookup_application=b.runtime == "emr-serverless" and not b.cfg.get("applicationId"),
     )
+
+
+def _run_identity(b: _Build, application_id: Any) -> Dict[str, Any]:
+    """Where the build's runs are, as tags on its log group (:data:`names.RUNTIME_TAG` and the
+    two beside it): a plan that destroys the build no longer has it in the contract, and
+    reads them from the state to stop its runs first (``aws_spark_destroys``)."""
+    key, ident = {
+        "emr-serverless": ("applicationId", application_id),
+        "glue": ("glueJobName", names.glue_job_name(b.ctx.product, b.build_id)),
+        "emr-ec2": ("clusterId", b.cfg.get("clusterId")),
+        "emr-eks": ("virtualClusterId", b.cfg.get("virtualClusterId")),
+    }[b.runtime]
+    return {
+        names.RUNTIME_TAG: b.runtime,
+        names.RUN_TARGET_TAG: aws_identity._join(f"{key}=", ident),
+        names.RUN_REGION_TAG: b.region,
+    }
 
 
 def _glue_jars(blocks: SparkBlocks, b: _Build, bucket_ref: Any) -> Tuple[TofuExpr, ...]:

@@ -329,6 +329,24 @@ class EmrServerless(Adapter):
     def cancel(self, run_id: str) -> None:
         self.client.cancel_job_run(applicationId=self.application_id(), jobRunId=run_id)
 
+    def application_runs(self) -> List[RunInfo]:
+        """Every active run in the application, whichever build started it: for an
+        application a destroy deletes, which can stop only once they have all ended."""
+        paginator = self.client.get_paginator("list_job_runs")
+        ids: List[str] = []
+        for page in paginator.paginate(
+            applicationId=self.application_id(), states=sorted(_SERVERLESS_ACTIVE)
+        ):
+            ids += [_required_id(j, "job run summary") for j in page.get("jobRuns") or []]
+        return [self.get(run_id) for run_id in ids]
+
+    def application_state(self) -> str:
+        found = self.client.get_application(applicationId=self.application_id())
+        return str((found.get("application") or {}).get("state") or "")
+
+    def stop_application(self) -> None:
+        self.client.stop_application(applicationId=self.application_id())
+
 
 # --- AWS Glue ------------------------------------------------------------------------
 

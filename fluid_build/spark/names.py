@@ -7,7 +7,9 @@
 config and the runner in S3, the EMR Serverless application, the job's role and the Glue
 job. Runs (``build_runners/spark``) find them by these names, never by reading OpenTofu
 state, so starting a run needs the contract alone. Both lanes import this one module, so the
-names cannot drift apart.
+names cannot drift apart. The one reader of the state is a destroy, which stops the runs of a
+build the contract no longer has: its log group's tags (:data:`RUNTIME_TAG` and the two
+beside it) say where they are.
 
 Product and build ids hold hyphens, so ``fluid-a-b-c`` alone could be product ``a-b``
 build ``c`` or product ``a`` build ``b-c``: every per-build name ends in 8 hex characters
@@ -28,6 +30,12 @@ CONFIG_FILE = "job.json"
 #: Tag keys on every Spark resource (the same keys as the Databricks jobs).
 PRODUCT_TAG = "fluid_product"
 BUILD_TAG = "fluid_build"
+#: Where a build's runs are, on its log group: its runtime, the target they are found on
+#: (``<key>=<id>``, one ``DesiredRun.target`` entry: ``applicationId``, ``glueJobName``,
+#: ``clusterId`` or ``virtualClusterId``) and their region.
+RUNTIME_TAG = "fluid_runtime"
+RUN_TARGET_TAG = "fluid_run_target"
+RUN_REGION_TAG = "fluid_run_region"
 
 
 def _bounded(name: str, limit: int) -> str:

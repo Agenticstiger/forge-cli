@@ -676,3 +676,32 @@ def desired_runs(
 def plan_actions(contract: Mapping[str, Any], **kwargs: Any) -> List[Dict[str, Any]]:
     """The ``spark.reconcile`` actions of the contract's Spark builds (steps from 1)."""
     return [run.plan_action(step) for step, run in enumerate(desired_runs(contract, **kwargs), 1)]
+
+
+def located_run(
+    product: str, build: str, runtime: str, region: str, target: Mapping[str, str]
+) -> DesiredRun:
+    """A build's run as a destroy finds it: by the build's run name on ``target``.
+
+    For a build the contract no longer has, whose runs must stop before the apply destroys
+    its role and artifacts; nothing else of it is known, and nothing is started from it."""
+    return DesiredRun(
+        product=product,
+        build=build,
+        runtime=runtime,
+        mode="",
+        scheduled=False,
+        region=region,
+        config_hash="",
+        job_digest="",
+        runner_sha256="",
+        job_uri="",
+        runner_uri="",
+        run_name=_names.run_name(product, build),
+        role_arn="",
+        target=dict(target),
+        release_label=None,
+        glue_version=None,
+        spark_conf={},
+        retry_attempts=None,
+    )

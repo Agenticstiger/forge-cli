@@ -218,6 +218,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Spark build that leaves the contract on AWS has its runs stopped before its role goes.**
+  `fluid apply` destroyed the build's role, artifacts and log group but left its stream running
+  until those were gone, and a product destroy failed part way: EMR Serverless deletes only a
+  stopped application, and IAM no policy that is still attached. Before `tofu apply`, the apply
+  now reads the plan's deletes and cancels every active run of a build that goes (found by its
+  run name where its log group's new `fluid_runtime`, `fluid_run_target` and `fluid_run_region`
+  tags say it runs), stops the runs of a Glue job that goes, and cancels the runs in the
+  product's own EMR Serverless application and stops it. An IAM policy the plan destroys that is
+  still attached (an EMR on EC2 build's job policy, the scheduler's caller policy) refuses the
+  apply first, with the `aws iam detach-*-policy` commands; nothing is stopped or destroyed. A
+  run still going after `FLUID_SPARK_WAIT_SECONDS` also refuses the apply before anything is
+  destroyed. `--dry-run` reads and says what it would cancel. The first apply after the upgrade
+  adds the three tags to each Spark build's log group in place.
+
 - **`fluid ship` generates artifacts for a reference-only contract.** Stage 3 skipped every
   contract with a `hybrid-reference`, `reference` or `external-reference` build, even with
   `--emit`, so stage 4 skipped too and the run exited 0 with no `MANIFEST.json`. `fluid generate
