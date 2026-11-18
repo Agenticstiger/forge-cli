@@ -175,6 +175,15 @@ def _nfc(value):
     return value
 
 
+def same_config(body: bytes, compiled: str) -> bool:
+    """Whether ``body`` is the ``compiled`` job config: the same JSON, the MSK brokers
+    OpenTofu fills in aside."""
+    try:
+        return config_digest(body.decode("utf-8")) == config_digest(compiled)
+    except ValueError:  # UnicodeDecodeError included
+        return False
+
+
 def _sha(value: Any) -> str:
     text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -288,12 +297,8 @@ class DesiredRun:
 
     def config_matches(self, body: bytes) -> bool:
         """Whether ``body``, the job config read back from where the runtime reads it, is
-        the one this run was compiled to (:func:`config_digest`: the same JSON, the MSK
-        brokers OpenTofu fills in aside)."""
-        try:
-            return config_digest(body.decode("utf-8")) == config_digest(self.job_text)
-        except ValueError:  # UnicodeDecodeError included
-            return False
+        the one this run was compiled to (:func:`config_digest`)."""
+        return same_config(body, self.job_text)
 
     def tags(self) -> Dict[str, str]:
         tags = {
