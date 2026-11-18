@@ -177,7 +177,13 @@ def test_the_document_answers_every_declared_property(tmp_path):
         "a correlation's moments need the exact record count, which the output checks round"
     ]
     assert result.left_out[0][0] == "correlation of 'amount' and 'qty'"
-    assert not [g for e in _entries(result, "amount") for g in e["groups"] if g["status"] != "F"]
+    assert not [
+        g
+        for e in _entries(result, "amount")
+        if e["definition"] != "quantile/1"
+        for g in e["groups"]
+        if g["status"] != "F"
+    ]
 
     amount = _entries(result, "amount")
     assert [(e["definition"], e.get("groupBy")) for e in amount] == [
@@ -199,12 +205,11 @@ def test_the_document_answers_every_declared_property(tmp_path):
     histogram = _entry(result, "amount", "marginalHistogram/1")
     assert histogram["bins"] == ["0", "50", "100"]
     assert histogram["groups"] == [{"group": "", "k": 120, "binCounts": [70, 50], "status": "F"}]
+    # The quantile beside the histogram of its column is withheld (FLUX ADR 0012): its
+    # ranks count at its witness, an edge the histogram's bins do not have.
     quantile = _entry(result, "amount", "quantile/1")
     assert quantile["level"] == "0.5"
-    (group,) = quantile["groups"]
-    assert group["k"] == 120 and group["status"] == "F"
-    assert group["quantileWitness"] == str(40 * 2**16)
-    assert group["quantileBelow"] == 50 and group["quantileAtOrBelow"] == 70
+    assert quantile["groups"] == [{"group": "", "status": "C"}]
 
     levels = _entry(result, "market", "levelHistogram/1")
     assert levels["levels"] == ["DE", "FR", "GB", "IE"]
@@ -280,7 +285,8 @@ def test_a_rare_support_member_withholds_the_group_and_siblings_of_a_grouped_mea
     assert all(set(g) == {"group", "status"} for g in by_market["groups"])
     # The ungrouped mean needs no secondary suppression.
     assert _entry(result, "amount", "mean/1")["groups"][0]["status"] == "F"
-    assert result.withheld["D"] == 3
+    # Three siblings of the mean, and the quantile beside the histogram of its column.
+    assert result.withheld["D"] == 4
     assert ("amount", "mean/1", "market", None) not in result.statistics
     assert ("amount", "mean/1", None, None) in result.statistics
     assert ("market", "support/1", None, None) in result.withheld_statistics
@@ -293,7 +299,7 @@ def test_a_rare_support_member_withholds_the_group_and_siblings_of_a_grouped_mea
 
 
 _ONE_CODE = (
-    "The document writes C for every withheld group and cell of a histogram, "
+    "The document writes C for every withheld group and cell of a histogram or a quantile, "
     "whatever withheld it, so its code says nothing of its size."
 )
 
@@ -301,12 +307,14 @@ _ONE_CODE = (
 @pytest.mark.parametrize(
     ("low", "high", "level", "status"),
     [
-        # 5 records of 1 below 115 of 50: the 6th of 120 is a 50 that 115 records hold,
+        # 5 records of 1 below 105 of 50: the 6th of 120 is a 50 that 105 records hold,
         # and its published ranks would say that 5 records lie below it.
-        pytest.param(5, 0, "0.05", "A", id="five-below"),
-        pytest.param(0, 5, "0.95", "A", id="five-above"),
-        pytest.param(10, 0, "0.1", "F", id="ten-below"),
-        pytest.param(0, 10, "0.9", "F", id="ten-above"),
+        pytest.param(5, 10, "0.05", "C", id="five-below"),
+        pytest.param(10, 5, "0.95", "C", id="five-above"),
+        pytest.param(10, 10, "0.1", "F", id="ten-below"),
+        pytest.param(10, 10, "0.9", "F", id="ten-above"),
+        # None below: no record lies under the witness, a zero ACRO's default withholds.
+        pytest.param(0, 10, "0.5", "C", id="none-below"),
     ],
 )
 def test_a_quantile_needs_none_or_ten_records_below_and_above_its_witness(
@@ -322,15 +330,73 @@ def test_a_quantile_needs_none_or_ten_records_below_and_above_its_witness(
     if status == "F":
         assert group["quantileWitness"] == str(50 * 2**16)
     else:
-        assert group == {"group": "", "status": "A"}  # not a count table: the code says why
+        assert group == {"group": "", "status": "C"}  # withheld for a small cell, written C
+
+
+def test_a_quantile_alone_on_its_column_is_published(tmp_path):
+    result = _profile(tmp_path, _rows(), [PROPERTIES[5]])
+    (group,) = _entry(result, "amount", "quantile/1")["groups"]
+    assert group["k"] == 120 and group["status"] == "F"
+    assert group["quantileWitness"] == str(40 * 2**16)
+    assert group["quantileBelow"] == 50 and group["quantileAtOrBelow"] == 70
+
+
+@pytest.mark.parametrize(
+    "properties",
+    [
+        pytest.param([PROPERTIES[2], PROPERTIES[5]], id="beside-a-histogram"),
+        pytest.param([PROPERTIES[5], {**PROPERTIES[5], "level": "0.25"}], id="beside-a-level"),
+        pytest.param(
+            [PROPERTIES[5], {**PROPERTIES[5], "groupBy": "market"}], id="beside-a-groupby"
+        ),
+    ],
+)
+def test_a_quantile_beside_another_count_at_its_columns_edges_is_withheld(tmp_path, properties):
+    result = _profile(tmp_path, _rows(), properties)
+    quantiles = [e for e in _entries(result, "amount") if e["definition"] == "quantile/1"]
+    assert quantiles and all(g["status"] == "C" for e in quantiles for g in e["groups"])
+    histograms = [e for e in _entries(result, "amount") if e["definition"] == "marginalHistogram/1"]
+    assert all(g["status"] == "F" for e in histograms for g in e["groups"])
+    # The ungrouped median passes its own checks, so it is counted as secondary
+    # suppression: withheld so that another count cannot be given back.
+    assert result.withheld["D"] >= 1
+
+
+def test_a_group_withheld_for_its_size_withholds_its_siblings_in_a_grouped_histogram(tmp_path):
+    rows = _rows()
+    for row in rows[:3]:
+        row["market"] = "DE"  # a group of three records: its size is the count less the rest
+    by_market = {**PROPERTIES[2], "groupBy": "market"}
+    result = _profile(tmp_path, rows, [PROPERTIES[2], by_market])
+    grouped = _entry(result, "amount", "marginalHistogram/1", "market")
+    assert [(g["group"], g["status"]) for g in grouped["groups"]] == [
+        ("DE", "C"),
+        ("FR", "C"),
+        ("GB", "C"),
+        ("IE", "C"),
+    ]
+    assert result.withheld["D"] == 3
+    # The column's own histogram is no group of the groupBy.
+    assert _entry(result, "amount", "marginalHistogram/1")["groups"][0]["status"] == "F"
+
+
+def test_few_rows_no_group_holds_withhold_a_grouped_histogram(tmp_path):
+    # Three rows with no market are in no group, and still the column's count less the groups'.
+    by_market = {**PROPERTIES[2], "groupBy": "market"}
+    result = _profile(tmp_path, _null_market_rows(3), [by_market], market_null="exclude")
+    grouped = _entry(result, "amount", "marginalHistogram/1", "market")
+    assert {g["status"] for g in grouped["groups"]} == {"C"}
+    assert result.withheld["D"] == len(grouped["groups"])
 
 
 def test_a_quantile_whose_witness_too_few_records_hold_is_withheld(tmp_path):
     rows = [{"amount": f"{n % 100}.5", "market": MARKETS[n % 3], "qty": "1"} for n in range(120)]
-    result = _profile(tmp_path, rows)
+    result = _profile(tmp_path, rows, [PROPERTIES[5]])
     (group,) = _entry(result, "amount", "quantile/1")["groups"]
-    # Every amount repeats at most twice: the witness is held by two records.
-    assert group == {"group": "", "status": "A"}
+    # Every amount repeats at most twice: the witness is held by two records. Written C,
+    # as every withheld quantile is, and counted as a small count.
+    assert group == {"group": "", "status": "C"}
+    assert result.withheld["A"] >= 1
 
 
 def _null_market_rows(count: int) -> List[Dict[str, Any]]:
@@ -689,8 +755,10 @@ def test_the_report_names_the_statistics_written_with_every_group_withheld(
 
 def _partly_rows() -> List[Dict[str, Any]]:
     rows = _rows()
-    for row in rows[:2]:
-        row["market"] = "DE"  # a group of two records: withheld, the large groups published
+    for row in rows[:12]:
+        # Twelve records, 8 and 4 in the two bins: every cell is small, so the group is
+        # withheld, and its size is not, so the other groups are published.
+        row["market"] = "DE"
     return rows
 
 
