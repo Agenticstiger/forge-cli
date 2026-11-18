@@ -120,7 +120,7 @@ class ProjectSelection:
     #: ``(key, entry, problem)`` for each ``*-paths`` or output entry that is not a
     #: plain directory inside the project.
     bad_paths: List[Tuple[str, str, str]] = field(default_factory=list)
-    #: Files dbt would read inside a hidden directory, relative to the project: not taken.
+    #: Files dbt would read inside a hidden or ``__pycache__`` directory: not taken.
     hidden: List[str] = field(default_factory=list)
     #: Directories the walk could not list, relative to the project.
     unlisted: List[str] = field(default_factory=list)
@@ -286,12 +286,10 @@ def _walk(
 def _descend(
     project: Path, child: Path, selection: ProjectSelection, outputs: FrozenSet[_DirId]
 ) -> bool:
-    """Whether the walk enters ``child``: not a cache, a link (recorded), a directory dbt
-    writes into (refused: dbt parses it), or hidden (a hidden one holding a file dbt
-    reads is recorded)."""
+    """Whether the walk enters ``child``: not a link (recorded), a directory dbt writes
+    into (refused: dbt parses it), or a hidden or ``__pycache__`` directory (one that
+    holds a file dbt reads is recorded: dbt walks it)."""
     rel = child.relative_to(project).as_posix()
-    if child.name == "__pycache__":
-        return False
     if child.is_symlink():
         selection.links.append(rel)
         return False
@@ -300,7 +298,7 @@ def _descend(
             ("output", rel, "a directory dbt writes its output into, inside one it reads")
         )
         return False
-    if child.name.startswith("."):
+    if child.name.startswith(".") or child.name == "__pycache__":
         selection.hidden.extend(_dbt_files_under(project, child, selection))
         return False
     return True
@@ -382,8 +380,9 @@ def _refuse(selection: ProjectSelection) -> None:
         )
     if selection.hidden:
         raise DbtProjectFilesError(
-            f"{selection.hidden[0]} is a file dbt reads inside a hidden directory, which "
-            "the bundle does not pack; move it out, or delete it if it is a stray copy"
+            f"{selection.hidden[0]} is a file dbt reads inside a hidden or __pycache__ "
+            "directory, which the bundle does not pack; move it out, or delete it if it is "
+            "a stray copy"
         )
     if selection.unlisted:
         raise DbtProjectFilesError(

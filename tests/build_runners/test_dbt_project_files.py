@@ -214,12 +214,17 @@ class TestRefusals:
         assert f"{out}, a directory dbt writes its output into" in _refusal(project)
 
     @pytest.mark.parametrize(
-        "rel", ["models/.ipynb_checkpoints/m-checkpoint.py", "seeds/.old/rates.CSV"]
+        "rel",
+        [
+            "models/.ipynb_checkpoints/m-checkpoint.py",
+            "seeds/.old/rates.CSV",
+            "models/__pycache__/x.sql",
+        ],
     )
-    def test_a_file_dbt_reads_inside_a_hidden_directory(self, tmp_path: Path, rel: str) -> None:
+    def test_a_file_dbt_reads_inside_a_skipped_directory(self, tmp_path: Path, rel: str) -> None:
         project = _project(tmp_path)
         _write(project, {rel: "select 1"})
-        assert f"{rel} is a file dbt reads inside a hidden directory" in _refusal(project)
+        assert f"{rel} is a file dbt reads inside a hidden or __pycache__" in _refusal(project)
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
     def test_a_directory_that_cannot_be_listed(self, tmp_path: Path) -> None:
