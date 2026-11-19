@@ -159,7 +159,7 @@ def test_a_destroyed_application_is_emptied_and_stopped_before_tofu_deletes_it(
     del gone["packaging"]
     _sidecar(tmp_path, moto_endpoint, moto_engine_name=False)
     _write_plan(plan, gone)
-    rc = engine.apply_via_opentofu(_apply_args(plan, tmp_path, allow_data_loss=True), _LOG)
+    rc = engine.apply_via_opentofu(_apply_args(plan, tmp_path), _LOG)
 
     assert rc == 0
     run = emr.get_job_run(applicationId=app["id"], jobRunId=job)["jobRun"]
