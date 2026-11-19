@@ -56,7 +56,9 @@ credentials, which is what they are for. They may not carry a setting that:
   ``OTEL_JAVAAGENT_*``);
 * chooses what program or library runs in this process or its subprocesses
   (``FLUID_DBT_MCP_COMMAND``/``_ARGS``/``_ENV``, ``FLUID_OPENTOFU_VERSION``,
-  ``DBT_EXECUTABLE``, ``PATH``, ``ComSpec``, ``SystemRoot``, ``PYTHONPATH``,
+  ``DBT_EXECUTABLE``, a local Spark run's ``FLUID_SPARK_SUBMIT_EXECUTABLE`` and
+  ``SPARK_*``/``PYSPARK_*``/``HADOOP_*``/``YARN_*``, ``PATH``, ``ComSpec``,
+  ``SystemRoot``, ``PYTHONPATH``,
   ``LD_*``, ``DYLD_*``,
   ``NODE_OPTIONS``, ``GIT_SSH_COMMAND``, ``GIT_CONFIG_*``, ``GIT_DIR``,
   ``GIT_TEMPLATE_DIR``, ``GIT_ALLOW_PROTOCOL``, ``GIT_EXTERNAL_DIFF``,
@@ -609,6 +611,16 @@ PROTECTED_ENV_PREFIXES: Tuple[str, ...] = (
     # the OpenTelemetry Java agent Debezium Server's run.sh can start: its
     # extensions load a jar, and its configuration file sets the exporter
     "OTEL_JAVAAGENT_",
+    # what a local Spark run (runtime: local) starts: spark-submit reads SPARK_HOME,
+    # SPARK_CONF_DIR (a spark-defaults.conf that loads jars and agents),
+    # SPARK_SUBMIT_OPTS and SPARK_DIST_CLASSPATH; PYSPARK_PYTHON and
+    # PYSPARK_DRIVER_PYTHON pick the program the driver runs; HADOOP_CONF_DIR and
+    # YARN_CONF_DIR the cluster and file systems it talks to
+    # (build_runners/spark/_local.py)
+    "SPARK_",
+    "PYSPARK_",
+    "HADOOP_",
+    "YARN_",
     # bash imports ``BASH_FUNC_<name>%%=() { ...; }`` from the environment as
     # the function ``<name>`` (the post-Shellshock export format, bash43-027),
     # which then shadows a command or even the ``exec`` builtin in every bash

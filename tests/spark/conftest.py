@@ -125,6 +125,7 @@ def operator_policy(monkeypatch):
     no test inherits an operator's list from the machine it runs on."""
     monkeypatch.delenv(CONTRACT_SQL_ALLOWLIST_ENV, raising=False)
     monkeypatch.delenv(SECRET_REF_ALLOWLIST_ENV, raising=False)
+    monkeypatch.delenv("FLUID_SPARK_LOCAL_NAMESPACE_ALLOWLIST", raising=False)
     monkeypatch.setenv(HOST_ALLOWLIST_ENV, "msk.example,example.internal")
 
 
