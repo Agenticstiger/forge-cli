@@ -644,14 +644,25 @@ class _Journaling:
             ctx.ci.info(f"stage {num} {rec.name}: {exc}; its outcome stays unknown there")
 
     def block(self) -> Optional[Dict[str, object]]:
-        """The report's ``journal`` entry."""
+        """The report's and the release's ``journal`` entry. No absolute path:
+        a published release would show the runner's layout and user name. The
+        directory is the project-relative default, a project-relative
+        ``--journal-dir`` or the label ``--journal-dir``; the file is named
+        relative to it."""
+        if self.anchor is not None:
+            where = journal.DEFAULT_JOURNAL_DIR
+        else:
+            try:
+                where = self.directory.relative_to(Path(os.path.abspath(os.curdir))).as_posix()
+            except ValueError:
+                where = "--journal-dir"
         if self.journal is None:
-            return {"dir": str(self.directory), "path": None, "digest": None}
-        return {
-            "dir": str(self.directory),
-            "path": str(self.journal.path),
-            "digest": self.journal.digest(),
-        }
+            return {"dir": where, "path": None, "digest": None}
+        try:
+            name = self.journal.path.relative_to(self.directory).as_posix()
+        except ValueError:  # pragma: no cover - the file is always under the directory
+            name = self.journal.path.name
+        return {"dir": where, "path": name, "digest": self.journal.digest()}
 
     def close(self) -> None:
         if self.journal is not None:

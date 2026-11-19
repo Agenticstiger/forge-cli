@@ -184,7 +184,8 @@ def test_every_stage_leaves_started_and_finished_with_receipts(
 def test_the_report_names_the_journal(work: Path, fake: FakeStages) -> None:
     assert _ship(*_TO_APPLY) == 0
     block = _report(work)["journal"]
-    assert block["path"] == str(_journal_file(work))
+    assert block["dir"] == "jr"  # inside the project: relative, never absolute
+    assert block["path"] == _journal_file(work).relative_to(work / "jr").as_posix()
     assert block["digest"] == (
         "sha256:" + hashlib.sha256(_journal_file(work).read_bytes()).hexdigest()
     )

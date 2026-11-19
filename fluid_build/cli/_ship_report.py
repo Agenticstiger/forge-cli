@@ -248,8 +248,12 @@ def _replace(path: Path, data: bytes) -> None:
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as fh:
+            # On the descriptor, not the name: nothing swapped in at ``tmp``
+            # since mkstemp is touched. Windows has no fchmod (mkstemp's 0600
+            # stays there).
+            if hasattr(os, "fchmod"):
+                os.fchmod(fh.fileno(), _created_mode())  # as an ordinary write makes it
             fh.write(data)
-        os.chmod(tmp, _created_mode())  # as an ordinary write would have made it
         os.replace(tmp, path)
     except BaseException:
         try:

@@ -23,7 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that did not pass is refused until stage 6 has planned again through ship and
   `runtime/plan.json` is that plan. A stage that changes nothing always runs, recorded when the
   journal can be opened, and nothing is rolled back. `--explain` shows the journal and what it
-  would refuse; the run report and the release's provenance name it. Without either flag
+  would refuse; the run report and the release's provenance name it, by a project-relative
+  path or the label `--journal-dir`, never an absolute one. Without either flag
   there is no journal. Keep DIR outside the checkout, on storage that outlives the runner, and out of
   reach of less trusted runs: the default in the checkout guards a working copy, and an
   ephemeral CI runner starts it empty. Ship follows no symbolic link below DIR (or below the

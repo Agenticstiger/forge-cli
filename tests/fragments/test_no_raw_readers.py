@@ -445,7 +445,8 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
     **_register(
         ACCEPTED,
         "fluid ship locks its stage journal's target by the raw root's id before stage 1 "
-        "bundles it; the bundled id must match, or no stage that changes the target runs",
+        "bundles it; when an overlay gives the bundle another id, ship holds that id's "
+        "target too and keeps the journal there",
         *_site("cli/ship.py", "_contract_id"),
     ),
     **_register(
