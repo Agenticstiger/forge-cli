@@ -459,6 +459,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An EMR on EC2 stream starts only once its cluster's role carries the build's policy.** A step
+  runs as the cluster's instance-profile role, which the cluster's owner holds, and forge creates
+  the build's least-privilege policy for that owner to attach. The first `fluid apply` started the
+  stream before anyone could, so the step failed at once, and a stream that failed is not started
+  again with the same config. A start now reads the cluster's instance profile and the policies
+  attached to its role, and refuses until the build's policy is there, with the
+  `aws iam attach-role-policy` command; nothing is started, so the apply after the attach starts
+  the stream. When the identity cannot read them (`elasticmapreduce:DescribeCluster`,
+  `iam:GetInstanceProfile`, `iam:ListAttachedRolePolicies`), the step starts as before. The
+  scheduler's caller policy gains those three reads.
+
 - **A decimal's arguments are a precision and scale its engine holds, or the column is refused.**
   A decimal kept whatever arguments it declared, so `decimal(1;drop table x)` went into the
   Snowflake table's DDL as `NUMBER(1;drop table x)` from `fluid generate iac`, and into the dbt
