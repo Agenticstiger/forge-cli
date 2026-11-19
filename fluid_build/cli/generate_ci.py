@@ -197,10 +197,15 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
             "                  in the workspace. Override it with the\n"
             "                  FLUID_PACKAGE_SPEC variable (a build parameter on\n"
             "                  Jenkins and Tekton).\n"
-            "  dev-source      lab / contributor only. Imports fluid from a\n"
-            "                  /forge-cli-src bind mount on the runner, and\n"
-            "                  fails if the mount is missing (no fallback to\n"
-            "                  PyPI)."
+            "  dev-source      lab / contributor only. Installs the forge-cli\n"
+            "                  checkout mounted at /forge-cli-src editable\n"
+            "                  (pip install -e), and fails if the mount is\n"
+            "                  missing (no fallback to PyPI). pip builds it, so\n"
+            "                  the runner needs a package index, or setuptools\n"
+            "                  and setuptools-scm installed with\n"
+            "                  PIP_NO_BUILD_ISOLATION=0 (pip reads it inverted).\n"
+            "                  Jenkins instead uses the agent's installed fluid\n"
+            "                  with PYTHONPATH=/forge-cli-src."
         ),
     )
     p.add_argument(

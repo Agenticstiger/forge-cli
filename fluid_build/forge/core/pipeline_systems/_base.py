@@ -627,7 +627,9 @@ class BasePipelineTemplate:
                 "  exit 2\n"
                 "fi\n"
                 "python -m pip install --quiet -e /forge-cli-src || "
-                "{ echo 'FATAL: pip install -e /forge-cli-src failed' >&2; exit 3; }\n"
+                "{ echo 'FATAL: pip install -e /forge-cli-src failed (it needs a package "
+                "index, or setuptools and setuptools-scm installed with "
+                "PIP_NO_BUILD_ISOLATION=0)' >&2; exit 3; }\n"
                 "fluid --version" + engine_install
             )
         # pypi mode — TestPyPI overrides + optional --pre. Each value is ONE
