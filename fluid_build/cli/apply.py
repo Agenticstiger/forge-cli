@@ -1077,8 +1077,13 @@ def _verify_plan_digests(
         if bundle_path is not None:
             # The dbt projects the bundle packs: the checkout must still hold them,
             # where the build runner will read them (its anchor for a plan).
-            from fluid_build._contract_loader import resolve_source_contract
+            from fluid_build._contract_loader import note_applied_bundle, resolve_source_contract
 
+            # The plan is bound to this bundle, so a plan whose recorded checkout
+            # paths are gone (planned in another job's checkout) anchors in the
+            # checkout that holds it, for this check and the rest of the run. Reset
+            # when the run returns (_scopes_dbt_binding).
+            note_applied_bundle(Path(bundle_path))
             _bind_dbt_projects(
                 plan_data.get("contract") or {},
                 Path(bundle_path),
@@ -1238,13 +1243,15 @@ def _verify_bundle_dbt_projects(args, contract: Dict[str, Any], logger: logging.
 def _scopes_dbt_binding(fn: Callable[..., int]) -> Callable[..., int]:
     """One binding scope per ``fluid apply``: its dbt runner re-checks what its own gate bound.
 
-    The bound files live in a context variable (``set_bound_projects``); this resets
-    it when the run returns, so a later apply in the same process starts unbound.
+    The bound files live in a context variable (``set_bound_projects``), and so does
+    the bundle the plan was verified against (``applied_bundle_scope``); this resets
+    both when the run returns, so a later apply in the same process starts unbound.
     """
     import functools
 
     @functools.wraps(fn)
     def _wrapper(args: argparse.Namespace, logger: logging.Logger) -> int:
+        from fluid_build._contract_loader import applied_bundle_scope
         from fluid_build.build_runners.dbt.project_files import (
             reset_bound_projects,
             set_bound_projects,
@@ -1252,7 +1259,8 @@ def _scopes_dbt_binding(fn: Callable[..., int]) -> Callable[..., int]:
 
         token = set_bound_projects(None)
         try:
-            return fn(args, logger)
+            with applied_bundle_scope():
+                return fn(args, logger)
         finally:
             reset_bound_projects(token)
 

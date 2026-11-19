@@ -31,6 +31,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[profile]` extra needs `flux-stats[yaml]>=0.7.0,<0.8`: 0.7.0 is the first flux-stats release
   that holds these readers and the check below.
 
+### Fixed
+
+- **A plan made from a `fluid ship --release-dir` release can be applied when the contract has a
+  dbt build.** The release copied `bundle.tgz` without the provenance file `fluid bundle` writes
+  beside it, which names the contract the bundle was built from. So a plan made from the release's
+  bundle recorded no source contract. `fluid apply` then could not find the dbt build's project in
+  the checkout to check it against the copy the bundle packs, and refused the plan with
+  `apply_plan_digest_bundle_mismatch` ("the checkout to check it against cannot be found").
+  - The release now holds `bundle.tgz.provenance.json`, written for the release's own place: the
+    same contract, relative to the release directory. A plan made from the release records that
+    contract, and apply checks the checkout's dbt files, as for a plan made from
+    `runtime/bundle.tgz`.
+  - `release.json` lists the file in `files` with its sha256. It stays out of `identity`, which is
+    unchanged.
+  - A bundle that names no source contract gets no provenance file in the release, as before, and
+    neither does a release on another drive. `fluid ship` now warns when that happens
+    (`release_provenance_missing`).
+  - The file names the contract relative to where the release was published. So keep the release
+    at the same place in the checkout, as CI artifacts restored into the same layout are.
+
+- **A plan can be applied in another checkout of the same tree, as a later CI job may run in
+  one.** A plan records the planning checkout's absolute paths (`source_contract`,
+  `source_path`). When the apply job checked the repository out at another path, those paths were
+  gone, and `fluid apply plan.json --bundle B` refused a contract with a dbt build: it could not
+  find the dbt project to check ("the plan records source_contract …, which no longer exists").
+  - The recorded paths still come first: they are covered by `planDigest`.
+  - When they are gone, apply anchors the plan at the contract that the bundle's provenance file
+    names, relative to the bundle. This bundle is the one apply has just verified the plan against.
+  - The anchor holds for the dbt check, the build runners, relative binding paths and the IaC
+    source.
+  - The provenance file is outside every digest. So the contract it names must declare the bundled
+    contract's id, and the dbt project's files there must still match the copy the bundle packs:
+    an edit is refused, naming the file.
+  - With `--no-verify-plan-binding`, nothing is verified, so there is no fallback.
+
 ### Security
 
 - **A histogram, a level histogram and a quantile of one column are checked together (FLUX ADR

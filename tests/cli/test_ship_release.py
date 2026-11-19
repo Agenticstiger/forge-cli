@@ -35,6 +35,7 @@ from fluid_build.cli import _ship_release as release
 from fluid_build.cli import _ship_report as report
 from fluid_build.cli import _ship_stages as st
 from fluid_build.cli import ship
+from fluid_build.forge.core import bundle as bundle_mod
 
 LOG = logging.getLogger("test_ship_release")
 REPO_ROOT = Path(fluid_build.__file__).resolve().parent.parent
@@ -235,10 +236,13 @@ def test_a_release_names_its_journal_without_an_absolute_path(
 
 
 def test_a_passing_run_publishes_the_release(
-    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     _install(monkeypatch, bundled)
-    assert _ship([*_UNTIL_4, "--release-dir", "../rel"]) == 0
+    with caplog.at_level(logging.WARNING, logger="fluid_build.cli._ship_release"):
+        assert _ship([*_UNTIL_4, "--release-dir", "../rel"]) == 0
+    # The fake bundle stage writes no provenance file, so the release cannot carry one and says so.
+    assert "release_provenance_missing: runtime/bundle.tgz does not record" in caplog.text
     rel = work.parent / "rel"
     assert not list(work.parent.glob("rel.partial-*"))
     umask = os.umask(0)
@@ -259,11 +263,47 @@ def test_a_passing_run_publishes_the_release(
     for rel_path, digest in index["files"].items():
         assert release._sha256(rel / rel_path) == digest
     assert (rel / "bundle.tgz").read_bytes() == bundled.read_bytes()
+    # The fake bundle stage writes no provenance file, so the release has none either.
+    assert not (rel / f"bundle.tgz{bundle_mod.PROVENANCE_SUFFIX}").exists()
     assert (rel / "artifacts/odcs/product.odcs.orders.yaml").read_text() == "x"
     assert (rel / "reports/validate-report.json").is_file()
     shipped = json.loads((rel / "reports/ship-report.json").read_text())
     assert shipped["release"]["status"] == "published"
     assert shipped["release"]["identity_digest"] == index["identity_digest"]
+
+
+def test_the_release_names_its_bundles_source_contract_from_where_it_sits(
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The provenance file beside runtime/bundle.tgz names the contract relative to
+    runtime/. The release gets its own, relative to the release directory, so a plan
+    made from the release's bundle anchors at the same contract. It is listed in
+    ``files`` and stays out of ``identity``."""
+    fake = _install(monkeypatch, bundled)
+
+    def bundles_with_provenance(cmd: List[str], **kw: object) -> subprocess.CompletedProcess:
+        done = fake(cmd, **kw)
+        if cmd[3] == "bundle":  # as fluid bundle --out runtime/bundle.tgz writes it
+            bundle_mod._write_provenance(
+                Path(st.BUNDLE_PATH),
+                release._bundle_manifest(Path.cwd())["digest"],
+                {"contract": "../contract.fluid.yaml", "overlay": None},
+            )
+        return done
+
+    monkeypatch.setattr(ship.subprocess, "run", bundles_with_provenance)
+    assert _ship([*_UNTIL_4, "--release-dir", "../rel"]) == 0
+    rel = work.parent / "rel"
+    name = f"bundle.tgz{bundle_mod.PROVENANCE_SUFFIX}"
+    index = json.loads((rel / "release.json").read_text())
+    assert index["files"][name] == release._sha256(rel / name)
+    assert bundle_mod.read_bundle_provenance(rel / "bundle.tgz") == {
+        "contract": "../project/contract.fluid.yaml",
+        "overlay": None,
+    }
+    contract, why = bundle_mod.resolve_bundle_source_contract(rel / "bundle.tgz")
+    assert (contract, why) == ((work / "contract.fluid.yaml").resolve(), "")
+    assert name not in json.dumps(index["identity"])
 
 
 def test_a_report_the_checkout_held_is_never_published(
@@ -628,3 +668,139 @@ def test_an_offline_release_run_calls_no_provider_installs_nothing_and_publishes
     others = [p for p in procs if p[1:3] != ["-m", "fluid_build.cli"]]
     forbidden = ("pip", "uv", "tofu", "terraform", "dbt", "databricks", "docker", "curl", "git")
     assert [p for p in others if any(Path(str(p[0])).name.startswith(f) for f in forbidden)] == []
+
+
+def _dbt_contract() -> Dict[str, object]:
+    """The release contract, its ``orders`` expose built by a dbt project the bundle packs."""
+    contract = _contract()
+    contract["builds"] = [
+        {
+            "id": "transform",
+            "pattern": "hybrid-reference",
+            "engine": "dbt-duckdb",
+            "repository": "./dbt",
+            "properties": {"model": "orders"},
+            "execution": {"trigger": {"type": "manual"}, "runtime": {"platform": "local"}},
+            "outputs": ["orders"],
+        }
+    ]
+    return contract
+
+
+def test_a_plan_from_a_checkout_that_is_gone_resolves_through_the_bundle_it_is_applied_with(
+    work: Path, bundled: Path
+) -> None:
+    """The plan's recorded paths (under ``planDigest``) win while they exist. When the
+    plan job's checkout is gone, the bundle this apply verified names the contract,
+    relative to itself, in this checkout. Nothing is set outside an apply."""
+    from fluid_build import _contract_loader as loader
+
+    elsewhere = work.parent / "elsewhere"
+    gone = {
+        "contract_metadata": {
+            "source_contract": str(elsewhere / "contract.fluid.yaml"),
+            "source_path": str(elsewhere / "runtime" / "bundle.tgz"),
+        }
+    }
+    found, why = loader.resolve_source_contract("plan.json", plan_data=gone)
+    assert found is None and "which no longer exists" in why
+    with loader.applied_bundle_scope():
+        loader.note_applied_bundle(bundled)
+        found, why = loader.resolve_source_contract("plan.json", plan_data=gone)
+        assert (found, why) == ((work / "contract.fluid.yaml").resolve(), "")
+        recorded = work / "recorded.fluid.yaml"
+        recorded.write_text(yaml.safe_dump(_contract(), sort_keys=False))
+        kept = {"contract_metadata": {"source_contract": str(recorded)}}
+        assert loader.resolve_source_contract("plan.json", plan_data=kept)[0] == recorded.resolve()
+    assert loader.resolve_source_contract("plan.json", plan_data=gone)[0] is None
+
+
+def test_apply_notes_the_bundle_it_verified_and_every_anchor_follows_it(
+    work: Path, bundled: Path
+) -> None:
+    """Once ``fluid apply`` has verified the plan against its bundle, a plan from a
+    checkout that is gone anchors through that bundle: the binding-path anchor, the
+    IaC source (which reads plan.json again) and the Spark workspace, as the dbt check
+    does. The run's scope then clears it."""
+    from fluid_build import _contract_loader as loader
+    from fluid_build.cli import apply as apply_mod
+    from fluid_build.forge.core.plan_digest import inject_digests
+    from fluid_build.iac.source import source_contract_file
+
+    elsewhere = work.parent / "elsewhere"
+    plan = inject_digests(
+        {
+            "contract": _contract(),
+            "contract_metadata": {
+                "source_contract": str(elsewhere / "contract.fluid.yaml"),
+                "source_path": str(elsewhere / "runtime" / "bundle.tgz"),
+            },
+            "actions": [],
+        },
+        bundle_path=bundled,
+    )
+    plan_path = work / "plan.json"
+    plan_path.write_text(json.dumps(plan))
+    args = argparse.Namespace(contract=str(plan_path), no_verify_plan_binding=False)
+    contract = (work / "contract.fluid.yaml").resolve()
+    with loader.applied_bundle_scope():
+        apply_mod._verify_plan_digests(plan, args, LOG, bundle_path=bundled)
+        assert loader.source_contract_dir(plan_path, plan_data=plan) == contract.parent
+        assert source_contract_file(plan_path) == contract
+        assert apply_mod._spark_workspace(args, plan) == contract.parent
+    assert source_contract_file(plan_path) is None
+
+
+@pytest.mark.integration
+def test_a_plan_made_from_the_release_applies_with_its_dbt_project(tmp_path: Path) -> None:
+    """A plan made from the release's bundle records the contract the bundle was
+    built from, so ``fluid apply`` finds the checkout's dbt project and checks it
+    against the packed copy: an unchanged one applies (dry run), an edited one is
+    refused by name. Before the release carried a provenance file, apply refused
+    both, as it could not find the checkout (``apply_plan_digest_bundle_mismatch``).
+    The same holds when the apply runs in another checkout of the tree, as a later
+    CI job may, and the plan job's checkout is gone."""
+    project = tmp_path / "project"
+    (project / "dbt" / "models").mkdir(parents=True)
+    (project / "dbt" / "dbt_project.yml").write_text(
+        "name: orders_dbt\nversion: '1.0.0'\nprofile: orders_dbt\n"
+    )
+    (project / "dbt" / "models" / "orders.sql").write_text("select 1 as id\n")
+    (project / "contract.fluid.yaml").write_text(yaml.safe_dump(_dbt_contract(), sort_keys=False))
+
+    def ok(done: subprocess.CompletedProcess) -> str:
+        assert done.returncode == 0, done.stdout[-3000:] + done.stderr[-3000:]
+        return done.stdout + done.stderr
+
+    ok(
+        _cli(
+            project,
+            "ship",
+            "contract.fluid.yaml",
+            "--until",
+            "validate-artifacts",
+            "--no-strict",
+            "--ci-output",
+            "plain",
+            "--release-dir",
+            "rel",
+        )
+    )
+    assert "dbt project bound: transform" in ok(
+        _cli(project, "plan", "rel/bundle.tgz", "--out", "plans/plan.json")
+    )
+    apply_argv = ("apply", "plans/plan.json", "--bundle", "rel/bundle.tgz", "--dry-run", "--yes")
+    ok(_cli(project, *apply_argv))
+
+    import shutil
+
+    # Another job's checkout: the same tree at another path, and the planning one gone.
+    moved = tmp_path / "another-job" / "project"
+    shutil.copytree(project, moved, symlinks=True)
+    project.rename(tmp_path / "planning-checkout-removed")
+    ok(_cli(moved, *apply_argv))
+
+    (moved / "dbt" / "models" / "orders.sql").write_text("select 2 as id\n")
+    edited = _cli(moved, *apply_argv)
+    assert edited.returncode == 1
+    assert "changed models/orders.sql" in edited.stdout + edited.stderr
