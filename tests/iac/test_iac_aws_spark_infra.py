@@ -786,9 +786,29 @@ def test_a_glue_job_in_a_vpc_can_create_its_network_interfaces(contract):
     assert "ec2:CreateNetworkInterface" in vpc["actions"]
 
 
-def test_a_streaming_build_gets_no_caller_policy(contract):
-    resources, _ = emit(contract)
-    assert "aws_iam_policy" not in resources
+def test_an_always_on_stream_gets_the_schedulers_policy_for_its_keepalive(contract):
+    """Its keepalive runs fluid apply --mode reconcile on the scheduler (MWAA): it reads the
+    job config the apply uploaded and starts the stream again when it died."""
+    resources, data = emit(contract)
+    assert "commerce_orders_stream_spark_caller" in resources["aws_iam_policy"]
+    document = data["aws_iam_policy_document"]["commerce_orders_stream_spark_caller"]
+    run = next(s for s in document["statement"] if s["sid"].startswith("Run"))
+    assert {"emr-serverless:StartJobRun", "emr-serverless:CancelJobRun"} <= set(run["actions"])
+    artifacts = next(s for s in document["statement"] if s["sid"].startswith("Artifacts"))
+    assert artifacts["actions"] == ["s3:GetObject"]
+    assert artifacts["resources"][0].endswith("/ingest-orders/job.json")
+
+
+def test_an_emr_on_ec2_stream_s_keepalive_may_read_its_cluster(contract):
+    """A stream does not restart on a cluster that ended: the keepalive reads its state."""
+    params = spark(contract)
+    params.update(runtime="emr-ec2", clusterId="j-1ABCDEF")
+    del params["applicationId"]
+    _, data = emit(contract)
+    document = data["aws_iam_policy_document"]["commerce_orders_stream_spark_caller"]
+    run = next(s for s in document["statement"] if s["sid"].startswith("Run"))
+    assert "elasticmapreduce:DescribeCluster" in run["actions"]
+    assert run["resources"][0].endswith(":cluster/j-1ABCDEF")
 
 
 def test_a_run_to_completion_build_gets_the_schedulers_policy(contract):
