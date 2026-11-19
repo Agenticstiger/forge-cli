@@ -18,6 +18,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import subprocess
 import tarfile
 from pathlib import Path
@@ -116,8 +117,13 @@ def _ship(*argv: str, journal_dir: Optional[str] = "jr") -> int:
 
 
 def _events(work: Path, seed: str = "one", env: str = "dev") -> List[dict]:
-    path = _journal_file(work, seed, env)
-    return [json.loads(line) for line in path.read_text().splitlines() if line.startswith("{")]
+    events = []
+    for line in _journal_file(work, seed, env).read_text().splitlines():
+        try:
+            events.append(json.loads(line))
+        except ValueError:  # a line a crash cut off
+            continue
+    return events
 
 
 def _journal_file(work: Path, seed: str = "one", env: str = "dev") -> Path:
@@ -234,7 +240,7 @@ def test_acknowledging_is_recorded_and_lets_the_apply_run(
     assert _ship(*_TO_APPLY, "--acknowledge-inspected", "apply") == 0
     acks = [e for e in _events(work) if e["event"] == "acknowledged"]
     assert len(acks) == 1 and acks[0]["stage"] == 7 and acks[0]["attempt"] == 1
-    assert "attempt 1 of stage 7 apply was inspected" in capsys.readouterr().out
+    assert "attempt 1 of stage 7 apply in this release was inspected" in capsys.readouterr().out
     # The acknowledgement is kept: the next run needs none.
     assert _ship(*_TO_APPLY) == 0
 
@@ -320,12 +326,50 @@ def test_a_failed_apply_reruns_only_after_a_new_plan(work: Path, fake: FakeStage
     assert fake.calls == ["plan", "apply"]
 
 
-def test_a_plan_with_another_digest_is_a_new_plan(work: Path, fake: FakeStages) -> None:
+def test_only_the_plan_ship_wrote_since_counts_as_new(work: Path, fake: FakeStages) -> None:
+    """A plan written outside ship, or an older plan put back after the new one,
+    is not a plan the journal saw made against the target as it is now."""
     fake.outcome["apply"] = 1
     assert _ship(*_TO_APPLY) == 1
     fake.outcome.clear()
     Path(st.PLAN_PATH).write_text(json.dumps({"planDigest": "sha256:other"}))
-    assert _ship("--stage", "apply") == 0
+    assert _ship("--stage", "apply") == 1
+    old = Path(st.PLAN_PATH).read_text()
+    assert _ship("--stage", "plan") == 0
+    Path(st.PLAN_PATH).write_text(old)
+    assert _ship("--stage", "apply") == 1
+    assert "runtime/plan.json is not the plan stage 6 wrote since" in (
+        _stage(_report(work), 7)["reason"]
+    )
+    assert _ship("--stage", "plan,apply") == 0
+
+
+def test_a_stage_killed_by_a_signal_has_an_unknown_outcome(
+    work: Path, fake: FakeStages, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake.outcome["publish"] = -9  # the OOM killer
+    assert _ship("--stage", "bundle,publish") == 1
+    rec = _stage(_report(work), 10)
+    assert rec["status"] == "unknown" and rec["reason"] == "killed by signal 9"
+    assert rec["exit_code"] == 1
+    assert "(exit 1, killed by signal)" in caplog.text
+    assert _events(work)[-1]["status"] == "unknown"
+    fake.outcome.clear()
+    fake.calls.clear()
+    assert _ship("--stage", "bundle,publish") == 1
+    assert fake.calls == ["bundle"]
+    assert _ship("--stage", "bundle,publish", "--acknowledge-inspected", "publish") == 0
+
+
+def test_the_journal_records_argv_with_credentials_masked(work: Path) -> None:
+    jr = _open(work)
+    try:
+        raw = ["schedule-sync", "--client-secret", "s3cr3t-value", "--dry-run"]
+        jr.started(11, raw, "r", work, shown=ship._safe_argv(raw))
+    finally:
+        jr.close()
+    text = _journal_file(work).read_text()
+    assert "s3cr3t-value" not in text and "--client-secret" in text
 
 
 def test_a_failed_publish_reruns(work: Path, fake: FakeStages) -> None:
@@ -364,19 +408,155 @@ def test_a_torn_last_line_is_ignored_and_the_next_event_starts_its_own(
     assert [a.outcome for a in _read(work).attempts[7]] == ["passed", "passed"]
 
 
-def test_one_run_at_a_time_holds_a_target(work: Path, fake: FakeStages) -> None:
+def test_one_run_at_a_time_holds_a_target(
+    work: Path, fake: FakeStages, caplog: pytest.LogCaptureFixture
+) -> None:
     assert _ship(*_TO_APPLY) == 0
     held = _open(work)
     try:
         with pytest.raises(journal.JournalError, match="another fluid ship run holds"):
             _open(work)
         fake.calls.clear()
-        assert _ship(*_TO_APPLY) == 1
-        assert fake.calls == ["bundle"]
-        assert "another fluid ship run holds" in _stage(_report(work), 1)["reason"]
+        assert _ship(*_TO_APPLY) == 2  # refused before stage 1 rebundles anything
+        assert fake.calls == []
+        assert "another fluid ship run holds" in caplog.text
     finally:
         held.close()
     assert _ship(*_TO_APPLY) == 0
+
+
+def test_a_journal_dir_that_cannot_be_made_is_refused_up_front(
+    work: Path, fake: FakeStages, caplog: pytest.LogCaptureFixture
+) -> None:
+    Path("jr").write_text("a file")
+    assert _ship(*_TO_APPLY) == 2
+    assert fake.calls == [] and "cannot create the stage journal directory" in caplog.text
+
+
+def test_no_link_below_the_journal_directory_is_followed(
+    work: Path, fake: FakeStages, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (work / "jr").mkdir()
+    (work / "jr" / PRODUCT).symlink_to(outside, target_is_directory=True)
+    assert _ship(*_TO_APPLY) == 2
+    assert "is not a directory (a symbolic link is never followed" in caplog.text
+    assert fake.calls == [] and list(outside.iterdir()) == []
+
+
+def test_the_default_journal_in_the_checkout_follows_no_link(
+    work: Path, fake: FakeStages, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    outside = tmp_path / "planted"
+    outside.mkdir()
+    (work / ".fluid").mkdir()
+    (work / ".fluid" / "ship-journal").symlink_to(outside, target_is_directory=True)
+    assert ship.run(_parse(["--release-dir", "rel", "--yes"]), LOG) == 2
+    assert "is not a directory" in caplog.text
+    assert fake.calls == [] and list(outside.iterdir()) == []
+
+
+def _refused_apply(work: Path) -> str:
+    """Stages 1 and 6 change nothing, so they run unrecorded; apply is refused."""
+    rec = _stage(_report(work), 7)
+    assert rec["status"] == "failed" and rec["exit_code"] == 2
+    return str(rec["reason"])
+
+
+def test_a_journal_file_that_is_a_link_is_refused(
+    work: Path, fake: FakeStages, tmp_path: Path
+) -> None:
+    victim = tmp_path / "victim_rc"  # a dangling link: it must not be created
+    _journal_file(work).parent.mkdir(parents=True)
+    _journal_file(work).symlink_to(victim)
+    assert _ship(*_TO_APPLY) == 1
+    assert fake.calls == ["bundle", "plan"]
+    assert "is a symbolic link" in _refused_apply(work)
+    assert not victim.exists()
+
+
+def test_a_hard_link_and_an_oversized_file_are_refused(
+    work: Path, fake: FakeStages, tmp_path: Path
+) -> None:
+    assert _ship(*_TO_APPLY) == 0
+    other = _journal_file(work, "two")
+    elsewhere = tmp_path / "elsewhere.jsonl"
+    elsewhere.write_text("")
+    os.link(elsewhere, other)
+    assert _ship(*_TO_APPLY) == 1
+    assert "is not a regular file ship wrote" in _refused_apply(work)
+    other.unlink()
+    with other.open("wb") as fh:
+        fh.truncate(journal.MAX_FILE_BYTES + 1)
+    assert _ship(*_TO_APPLY) == 1
+    assert "more than a stage journal ship writes" in _refused_apply(work)
+
+
+def test_a_stage_that_changes_nothing_runs_without_a_bundle(
+    work: Path, fake: FakeStages, capsys: pytest.CaptureFixture[str]
+) -> None:
+    Path(st.POLICY_BINDINGS).parent.mkdir(parents=True)
+    Path(st.POLICY_BINDINGS).write_text("{}")
+    assert _ship("--stage", "policy-apply", "--policy-mode", "check") == 0
+    assert fake.calls == ["policy-apply"]
+    assert "runs without a journal entry" in capsys.readouterr().out
+    assert _ship("--stage", "policy-apply") == 1  # enforce changes the target
+    assert fake.calls == ["policy-apply"]
+    assert "no readable runtime/bundle.tgz" in _stage(_report(work), 8)["reason"]
+
+
+def test_a_truncated_bundle_is_refused_without_a_traceback(
+    work: Path, fake: FakeStages, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _ship(*_TO_APPLY) == 0
+    data = Path(st.BUNDLE_PATH).read_bytes()
+    Path(st.BUNDLE_PATH).write_bytes(data[: len(data) // 2])
+    assert journal.bundle_digest(work) is None
+    assert _ship("--stage", "apply") == 1
+    assert "no readable runtime/bundle.tgz" in _refused_apply(work)
+    assert _ship("--stage", "apply", "--explain") == 0
+    assert "the release is named once stage 1 has bundled" in capsys.readouterr().out
+
+
+def test_a_bundle_of_another_product_than_the_contract_is_refused(
+    work: Path, fake: FakeStages
+) -> None:
+    body = yaml.safe_load(Path("contract.fluid.yaml").read_text())
+    body["id"] = "example.other"
+    Path("contract.fluid.yaml").write_text(yaml.safe_dump(body))
+    assert _ship(*_TO_APPLY) == 1
+    assert "is not the contract's" in _refused_apply(work)
+
+
+def test_an_acknowledgement_in_another_release_survives_its_torn_tail(
+    work: Path, fake: FakeStages, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake.outcome["apply"] = "interrupt"
+    assert _ship(*_TO_APPLY) == 130
+    fake.outcome.clear()
+    with _journal_file(work).open("ab") as fh:
+        fh.write(b'{"event": "fini')  # a crash mid-write in release one
+    fake.seed = "two"
+    capsys.readouterr()
+    assert _ship(*_TO_APPLY, "--acknowledge-inspected", "apply") == 0
+    assert f"in release {hashlib.sha256(b'one').hexdigest()[:12]} was inspected" in (
+        capsys.readouterr().out
+    )
+    assert any(e["event"] == "acknowledged" for e in _events(work, "one"))
+    assert _ship(*_TO_APPLY) == 0  # the acknowledgement was kept
+
+
+def test_the_run_report_replaces_a_planted_link(
+    work: Path, fake: FakeStages, tmp_path: Path
+) -> None:
+    victim = tmp_path / "victim.json"
+    victim.write_text("keep me")
+    Path("runtime").mkdir()
+    Path("runtime/ship-report.json").symlink_to(victim)
+    assert _ship(*_TO_APPLY, journal_dir=None) == 0
+    assert victim.read_text() == "keep me"
+    assert not Path("runtime/ship-report.json").is_symlink()
 
 
 def test_the_journal_file_is_private(work: Path, fake: FakeStages) -> None:
@@ -432,6 +612,32 @@ def test_explain_shows_the_journal_and_what_it_would_refuse(
     assert "refused by the stage journal: stage 7 apply started in this release" in out
     assert "warning: a real run would stop: stage journal:" in out
     assert _journal_file(work).read_bytes() == before  # explain writes nothing
+
+
+def test_explain_knows_stage_six_plans_again_before_apply(
+    work: Path, fake: FakeStages, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake.outcome["apply"] = 1
+    assert _ship(*_TO_APPLY) == 1
+    fake.outcome.clear()
+    capsys.readouterr()
+    assert _ship("--stage", "plan,apply", "--explain") == 0
+    assert "refused by the stage journal" not in capsys.readouterr().out
+    assert _ship("--stage", "apply", "--explain") == 0
+    assert "the plan it ran is stale" in capsys.readouterr().out
+    assert _ship("--stage", "plan,apply") == 0
+
+
+def test_the_abort_line_says_how_to_go_on_after_a_refusal(
+    work: Path, fake: FakeStages, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake.outcome["apply"] = "interrupt"
+    assert _ship(*_TO_APPLY) == 130
+    fake.outcome.clear()
+    caplog.clear()
+    assert _ship(*_TO_APPLY) == 1
+    assert "(exit 2, refused by the stage journal)" in caplog.text
+    assert "pass --acknowledge-inspected, or plan again), then run again" in caplog.text
 
 
 def test_a_release_keeps_its_journal_in_the_project(

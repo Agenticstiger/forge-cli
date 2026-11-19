@@ -281,9 +281,7 @@ def test_a_tampered_bundle_publishes_nothing(
     (work / "tampered.tgz").write_bytes(b"not a bundle")
     assert _ship([*_UNTIL_4, "--release-dir", "rel"]) == 1
     assert not (work / "rel").exists()
-    # The stage journal a release keeps is named by the bundle's digest, so a
-    # bundle with no readable MANIFEST stops the run at stage 1.
-    assert "no readable runtime/bundle.tgz to name the release" in capsys.readouterr().out
+    assert "release not published: runtime/bundle.tgz does not verify" in capsys.readouterr().out
 
 
 def test_an_artifact_that_no_longer_matches_its_manifest_publishes_nothing(

@@ -27,7 +27,7 @@ FAILED = "failed"
 SKIPPED_BY_POLICY = "skipped-by-policy"  # a flag, a RUN_STAGE switch or a dry run turned it off
 UNSUPPORTED = "unsupported"  # nothing for it to act on: no policy bindings, no DAGs, no scheduler
 NOT_RUN = "not-run"  # not selected, or an earlier stage failed
-UNKNOWN = "unknown"  # interrupted, or an earlier step's record could not be read
+UNKNOWN = "unknown"  # interrupted or killed, or an earlier step's record is unreadable
 STATUSES = (PASSED, FAILED, SKIPPED_BY_POLICY, UNSUPPORTED, NOT_RUN, UNKNOWN)
 SKIPPED = (SKIPPED_BY_POLICY, UNSUPPORTED)  # the stage was considered and did nothing
 #: A stage that did not pass: the run stops after it, and its outcome is not a pass.
@@ -198,11 +198,15 @@ def junit_xml(records: List[StageRecord]) -> bytes:
 
 
 def write_reports(directory: Path, report: Dict[str, Any], records: List[StageRecord]) -> None:
+    """Write both reports. Each replaces its file (a temporary file renamed over
+    it), so a link the checkout planted at either name is replaced, never
+    written through."""
+    from fluid_build.util.atomic_write import atomic_write_bytes
+
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / REPORT_JSON).write_text(
-        json.dumps(report, indent=2, sort_keys=False) + "\n", encoding="utf-8"
-    )
-    (directory / REPORT_JUNIT).write_bytes(junit_xml(records))
+    body = json.dumps(report, indent=2, sort_keys=False) + "\n"
+    atomic_write_bytes(directory / REPORT_JSON, body.encode("utf-8"), mode=0o644)
+    atomic_write_bytes(directory / REPORT_JUNIT, junit_xml(records), mode=0o644)
 
 
 def _from_dict(raw: Dict[str, Any]) -> StageRecord:
