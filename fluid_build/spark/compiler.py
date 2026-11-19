@@ -607,6 +607,16 @@ def _decoders(
     return {"value": decoder(stream.format, stream.value, value_subject), "key": key}
 
 
+def _max_offsets(spec: Any, where: str) -> dict[str, int]:
+    """``source.maxOffsetsPerTrigger``, absent unless set: a build without it keeps its job
+    config and its run."""
+    if spec is None:
+        return {}
+    if isinstance(spec, bool) or not isinstance(spec, int) or not 1 <= spec <= _MAX_OFFSETS:
+        raise ValueError(f"{where}.maxOffsetsPerTrigger: expected a whole number, at least 1")
+    return {"maxOffsetsPerTrigger": spec}
+
+
 def _trigger(spec: Any, expose: Mapping[str, Any], where: str) -> Optional[dict[str, Any]]:
     if spec is None:
         slo = (expose.get("qos") or {}).get("freshnessSLO")
@@ -884,13 +894,7 @@ def compile_job_config(
         offsets = stream_spec.get("startingOffsets", "latest")
         if offsets not in ("earliest", "latest"):
             raise ValueError(f"{swhere}.startingOffsets: expected earliest or latest")
-        per_batch = stream_spec.get("maxOffsetsPerTrigger")
-        if per_batch is not None and (
-            isinstance(per_batch, bool)
-            or not isinstance(per_batch, int)
-            or not 1 <= per_batch <= _MAX_OFFSETS
-        ):
-            raise ValueError(f"{swhere}.maxOffsetsPerTrigger: expected a whole number, at least 1")
+        rate_limit = _max_offsets(stream_spec.get("maxOffsetsPerTrigger"), swhere)
         dead = _parsed_dead_letters(stream_spec, stream, swhere)
         if dead is not None and dead["sink"] == "topic" and host_gate:
             _refuse_unless_dead_letter_topic_listed(bid, kafka, dead["topic"], environ)
@@ -900,8 +904,7 @@ def compile_job_config(
             **kafka,
             "topic": stream.topic,
             "startingOffsets": offsets,
-            # Absent unless set, so a build without it keeps its job config and its run.
-            **({} if per_batch is None else {"maxOffsetsPerTrigger": per_batch}),
+            **rate_limit,
             "includeHeaders": any(src == "headers" for _, src in stream.metadata),
             "registry": (
                 None if registry is None else {"url": registry["url"], "auth": registry["auth"]}
