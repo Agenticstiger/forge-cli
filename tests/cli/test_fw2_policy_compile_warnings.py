@@ -4,7 +4,9 @@
 """``fluid policy compile`` shows its warnings, and fails on a compiler crash.
 
 RT-707-3: a grant on an Iceberg table in a catalog the compiler cannot grant
-on (``catalog: lakekeeper`` on AWS) compiles to no table grant and a warning.
+on (``catalog: polaris`` on AWS; a Lakekeeper table is granted in Lakekeeper
+since, see ``tests/policy/test_lakekeeper_compile.py``) compiles to no table
+grant and a warning.
 The warning went only into ``bindings.json``; the console got an INFO count
 that is routed to DEBUG, so the command printed nothing and exited 0, and
 ``fluid policy apply`` never read the warnings either. A crash inside
@@ -32,7 +34,7 @@ pytestmark = pytest.mark.unit
 
 _REPO = Path(__file__).resolve().parents[2]
 
-_LAKEKEEPER_GRANT: Dict[str, Any] = {
+_POLARIS_GRANT: Dict[str, Any] = {
     "fluidVersion": "0.7.6",
     "kind": "DataProduct",
     "id": "analytics.pol",
@@ -49,8 +51,8 @@ _LAKEKEEPER_GRANT: Dict[str, Any] = {
                 "platform": "aws",
                 "format": "iceberg",
                 "location": {
-                    "catalog": "lakekeeper",
-                    "uri": "http://lakekeeper:8181/catalog",
+                    "catalog": "polaris",
+                    "uri": "https://polaris:8181/api/catalog",
                     "warehouse": "analytics",
                     "database": "streaming",
                     "table": "orders",
@@ -89,9 +91,7 @@ def _warning_events(caplog, name: str) -> List[Dict[str, Any]]:
 def test_compile_shows_each_warning_at_warning_level_and_exits_0(tmp_path, caplog):
     caplog.set_level(logging.DEBUG, logger="test.fw2.policy")
     out = tmp_path / "policy" / "bindings.json"
-    args = argparse.Namespace(
-        contract=str(_write_contract(tmp_path, _LAKEKEEPER_GRANT)), out=str(out)
-    )
+    args = argparse.Namespace(contract=str(_write_contract(tmp_path, _POLARIS_GRANT)), out=str(out))
 
     assert policy_compile.run(args, logging.getLogger("test.fw2.policy")) == 0
 
@@ -107,9 +107,7 @@ def test_a_compiler_crash_fails_and_writes_no_bindings(tmp_path, monkeypatch):
 
     monkeypatch.setattr("fluid_build.policy.compiler.compile_policy", _boom)
     out = tmp_path / "bindings.json"
-    args = argparse.Namespace(
-        contract=str(_write_contract(tmp_path, _LAKEKEEPER_GRANT)), out=str(out)
-    )
+    args = argparse.Namespace(contract=str(_write_contract(tmp_path, _POLARIS_GRANT)), out=str(out))
 
     with pytest.raises(CLIError) as excinfo:
         policy_compile.run(args, logging.getLogger("test.fw2.policy"))
@@ -128,9 +126,7 @@ def test_a_compiler_crash_leaves_an_earlier_bindings_file_as_it_was(tmp_path, mo
         raise RuntimeError("compiler bug")
 
     monkeypatch.setattr("fluid_build.policy.compiler.compile_policy", _boom)
-    args = argparse.Namespace(
-        contract=str(_write_contract(tmp_path, _LAKEKEEPER_GRANT)), out=str(out)
-    )
+    args = argparse.Namespace(contract=str(_write_contract(tmp_path, _POLARIS_GRANT)), out=str(out))
 
     with pytest.raises(CLIError):
         policy_compile.run(args, logging.getLogger("test.fw2.policy"))
@@ -142,7 +138,7 @@ def test_apply_echoes_the_stored_warnings(tmp_path, monkeypatch, caplog):
     the warnings are echoed before it."""
     monkeypatch.chdir(tmp_path)
     caplog.set_level(logging.DEBUG, logger="test.fw2.policy")
-    warning = "Iceberg expose 'orders' is cataloged in 'lakekeeper', not AWS Glue, " + (
+    warning = "Iceberg expose 'orders' is cataloged in 'polaris', not AWS Glue, " + (
         _NO_TABLE_GRANT
     )
     path = tmp_path / "bindings.json"
@@ -171,7 +167,7 @@ def _cli(tmp_path: Path, *argv: str) -> subprocess.CompletedProcess:
 def test_the_cli_prints_the_warning_on_stderr(tmp_path):
     """The real entry point, as the defect was measured: the warning reaches
     stderr (stdout stays the command's own output) and the exit stays 0."""
-    contract = _write_contract(tmp_path, _LAKEKEEPER_GRANT)
+    contract = _write_contract(tmp_path, _POLARIS_GRANT)
     result = _cli(tmp_path, "policy", "compile", contract.name, "--out", "out/b.json")
 
     assert result.returncode == 0, result.stderr
@@ -183,7 +179,7 @@ def test_the_cli_prints_the_warning_on_stderr(tmp_path):
 def test_the_cli_fails_on_a_compiler_crash(tmp_path):
     """A grant that is a bare string crashes ``compile_policy``; that used to
     write ``{"bindings": {"bindings": []}}`` and exit 0."""
-    doc = json.loads(json.dumps(_LAKEKEEPER_GRANT))
+    doc = json.loads(json.dumps(_POLARIS_GRANT))
     doc["accessPolicy"]["grants"] = ["group:analysts@example.com"]
     contract = _write_contract(tmp_path, doc)
     result = _cli(tmp_path, "policy", "compile", contract.name, "--out", "out/b.json")

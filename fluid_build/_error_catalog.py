@@ -61,6 +61,14 @@ def slug_for(event: str) -> str:
 # canonical troubleshooting page (``troubleshooting#err_<event>``), which is a
 # page that exists today; explicit topics point at other real doc sections.
 _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
+    # ── doctor ─────────────────────────────────────────────────────────────
+    "doctor_preflight_failed": (
+        [
+            "Run 'fluid doctor --contract contract.fluid.yaml --operation plan'",
+            "Compare two saved reports with 'fluid doctor --compare left.json right.json'",
+        ],
+        None,
+    ),
     # ── providers ──────────────────────────────────────────────────────────
     "provider_not_specified": (
         [

@@ -64,9 +64,14 @@ def compile_policy(contract: dict) -> Tuple[List[Dict[str, Any]], List[str]]:
     warnings = []
     grants = (contract.get("accessPolicy") or {}).get("grants", [])
 
+    # A Lakekeeper table is granted in Lakekeeper, from every surface that
+    # declares access to it (``exposes[].policy.authz`` too, which needs no
+    # accessPolicy), so it compiles on its own; see ``policy/lakekeeper.py``.
+    lakekeeper_bindings, lakekeeper_warnings = _compile_lakekeeper(contract)
+
     if not grants:
         warnings.append(NO_GRANTS)
-        return bindings, warnings
+        return lakekeeper_bindings, warnings + lakekeeper_warnings
 
     for g in grants:
         principal = g.get("principal")
@@ -99,10 +104,20 @@ def compile_policy(contract: dict) -> Tuple[List[Dict[str, Any]], List[str]]:
             else:
                 warnings.append(f"Unsupported platform/format: {platform}/{fmt}")
 
-    if not bindings:
+    if not bindings and not lakekeeper_bindings:
         warnings.append("No IAM bindings generated from contract")
 
-    return bindings, warnings
+    return bindings + lakekeeper_bindings, warnings + lakekeeper_warnings
+
+
+def _compile_lakekeeper(contract) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """The Lakekeeper bindings and warnings, ``([], [])`` without a Lakekeeper table."""
+    from .lakekeeper import compile_lakekeeper_bindings, is_lakekeeper_binding
+
+    exposes = [exp for exp in iter_exposes(contract) if is_lakekeeper_binding(exp.get("binding"))]
+    if not exposes:
+        return [], []
+    return compile_lakekeeper_bindings(contract, exposes)
 
 
 def _compile_gcp_bindings(bindings, fmt, loc, principal, permissions):
@@ -197,7 +212,9 @@ def _compile_catalog_managed_iceberg(bindings, warnings, exp, binding, principal
     elif cloud == "aws":
         _compile_aws_bindings(bindings, fmt, loc, principal, permissions, glue=False)
 
-    if snowflake_managed:
+    if snowflake_managed or kind == "lakekeeper":
+        # Lakekeeper's own grants are compiled by :func:`_compile_lakekeeper`,
+        # which warns for whatever it cannot grant there.
         return
     expose_id = exp.get("exposeId") or exp.get("id") or "?"
     perms = list(permissions)
