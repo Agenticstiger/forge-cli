@@ -416,3 +416,24 @@ def test_a_downstream_read_of_a_partitioned_upstream_globs_its_layout():
     assert _prefix_glob(binding, "s3://b/silver/orders/", "parquet") == (
         "s3://b/silver/orders/*.parquet"
     )
+
+
+def test_a_null_value_of_a_required_key_fails_the_stream(tmp_path):
+    """Athena projects a required key, and never reads ``__HIVE_DEFAULT_PARTITION__``."""
+    contract = _contract(tmp_path)
+    for column in contract["exposes"][0]["contract"]["schema"]:
+        if column["name"] == "region":
+            column["required"] = True
+    _source(tmp_path, rows=[("o1", "2024-01-05", "", "10")])
+    rc, record = _run(tmp_path, contract)
+    assert rc != 0
+    assert "rows with a null region, which the contract declares required" in json.dumps(record)
+
+
+def test_a_null_value_of_an_optional_key_lands(tmp_path):
+    contract = _contract(tmp_path)  # writes the default source first
+    _source(tmp_path, rows=[("o1", "2024-01-05", "", "10")])
+    assert _run(tmp_path, contract)[0] == 0
+    assert _files(tmp_path / "lake" / "orders") == [
+        "order_date=2024-01-05/region=__HIVE_DEFAULT_PARTITION__/orders_0.parquet"
+    ]

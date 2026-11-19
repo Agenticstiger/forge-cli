@@ -1801,6 +1801,7 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                             "Remove them, or run incremental_append."
                         )
                 copy_template = _build_copy_destination(out_path, sink_format, partitioned)
+                hidden_nulls = _required_null_keys(ctx, partitioned)
                 # ``replace`` on the first ``{select}``, not ``str.format``: the quoted
                 # path follows it and may hold braces (as ``LocalProvider`` fills it).
                 copy_sql = copy_template.replace("{select}", landed_sel, 1)
@@ -1811,6 +1812,8 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                 # changed since, and a table holding exactly what the COPY
                 # wrote then failed verify against the larger number.
                 written = first_row(con.execute(copy_sql))
+                if hidden_nulls:
+                    _refuse_null_partitions(con, out_path, partitioned, sink_format, hidden_nulls)
                 if written is not None and isinstance(written[0], int):
                     n = written[0]
                 else:
@@ -2108,10 +2111,8 @@ def _resolve_destination_path(
         return str(_bigquery_staging_path(ctx, bq, sink_format))
     if _is_databricks_binding(ctx):
         return str(_databricks_staging_path(ctx, stream, sink_format))
-    expose = _build_expose(ctx)
-    if expose is not None:
-        binding = expose.get("binding", {}) or {}
-        loc = binding.get("location", {}) or {}
+    binding, loc = _binding_and_location(ctx)
+    if binding:
         path = loc.get("path")
         if path and len(ctx.source.streams) <= 1:
             return _binding_landing(ctx, binding, loc, stream, sink_format)
@@ -2572,6 +2573,43 @@ def _refused_partitioned_destination(ctx: RunContext, streams: List[str]) -> str
             "another engine."
         )
     return ""
+
+
+def _required_null_keys(
+    ctx: RunContext, partitioned: Optional[PartitionedWrite]
+) -> Tuple[str, ...]:
+    """The partition keys the expose declares ``required``: Athena projects them, so a
+    null one written under ``__HIVE_DEFAULT_PARTITION__`` would never be read."""
+    if partitioned is None:
+        return ()
+    expose = _build_expose(ctx) or {}
+    contract = expose.get("contract") if isinstance(expose.get("contract"), dict) else {}
+    required = {
+        c.get("name")
+        for c in (contract.get("schema") or [])
+        if isinstance(c, dict) and c.get("required") is True
+    }
+    return tuple(key for key in partitioned.keys if key in required)
+
+
+def _refuse_null_partitions(
+    con: Any, out_path: str, partitioned: PartitionedWrite, fmt: str, keys: Sequence[str]
+) -> None:
+    """Fail the stream when it wrote a null value of a required key: the rows sit under
+    ``<key>=__HIVE_DEFAULT_PARTITION__/``, which Athena's projection never names."""
+    ext = "csv" if fmt == "csv" else "parquet"
+    pattern = quote_ansi_string_literal(_partition_glob(out_path, partitioned.keys, ext))
+    rows = con.execute(f"SELECT file FROM glob({pattern})").fetchall()
+    for key in keys:
+        marker = f"/{key}=__HIVE_DEFAULT_PARTITION__/"
+        hit = next((str(r[0]) for r in rows if marker in str(r[0])), None)
+        if hit is not None:
+            raise RuntimeError(
+                f"partitioned table: rows with a null {key}, which the contract declares "
+                f"required, landed under {hit}; Athena's partition projection never reads "
+                f"that partition. Fix the source rows, or declare {key} not required (the "
+                "table is then not projected)."
+            )
 
 
 def _partitioned_write(
