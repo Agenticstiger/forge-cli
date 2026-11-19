@@ -459,8 +459,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **The dbt engine writes no contract text that dbt would run as Jinja.** The schema.yml,
-  sources.yml and semantic_models.yml that `fluid generate transformation` writes for a dbt
+- **The dbt engine's schema.yml, sources.yml and semantic_models.yml write no contract text
+  that dbt would run as Jinja.** The ones `fluid generate transformation` writes for a dbt
   build now pass through the same escaping as `fluid generate dbt-tests` (one shared helper,
   `util/dbt_jinja.py`): a model or column name, description, enum value, expression or source
   field from a contract that holds `{{`, `{%` or `{#`, or looks like `env_var(...)`,
@@ -470,6 +470,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   placeholders a contract may use for a source location (`{{ env.X }}`, `${X}`, `$X`, and
   `{{ env_var('X') }}` in either quote, with a plain default or a `target.<attribute>` one)
   still render; any other text around a placeholder that holds a brace is a literal.
+  The model SQL the engine writes (`engines/dbt/models.py`) and a contract's own SQL still
+  render as dbt Jinja: treat contract authors as trusted when dbt builds their contract.
+
 - **A name or version dbt pastes into its own Jinja is refused.** dbt runs a model's tests
   against `ref('<exposeId>', version='<version>')`, a source table's against
   `source('<source>', '<consumes id>')`, and a semantic model's against

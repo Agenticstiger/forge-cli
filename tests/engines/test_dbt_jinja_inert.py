@@ -140,6 +140,9 @@ def test_a_name_dbt_pastes_into_its_own_jinja_is_refused(where: str) -> None:
     expose["exposeId"], expose["contract"]["version"] = "orders", "1.2.0"
     doc = yaml.safe_load(generate_schema_yml(contract)["models/marts/schema.yml"])
     assert doc["models"][0]["versions"] == [{"v": "1.2.0"}]
+    expose["contract"]["version"] = 2  # checked, and kept an integer
+    doc = yaml.safe_load(generate_schema_yml(contract)["models/marts/schema.yml"])
+    assert doc["models"][0]["latest_version"] == 2 and doc["models"][0]["versions"] == [{"v": 2}]
 
 
 def test_semantic_models_carry_contract_text_as_text() -> None:

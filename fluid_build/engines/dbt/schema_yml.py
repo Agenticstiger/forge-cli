@@ -302,7 +302,7 @@ def generate_schema_yml(
         # dbt uses this for model-version pinning in downstream refs.
         version = contract_section.get("version")
         if version:
-            version = dbt_name(version, f"exposes[{expose_id}].contract.version")
+            dbt_name(version, f"exposes[{expose_id}].contract.version")  # checked, kept as typed
             model_def["latest_version"] = version
             # dbt model-versions require a ``versions`` list too.
             model_def["versions"] = [{"v": version}]
