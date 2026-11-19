@@ -38,11 +38,16 @@ from typing import (
     Tuple,
 )
 
-from ._ship_table import STAGE_NAMES, STAGE_NUMBERS, STAGE_TOGGLES, STAGES
+from ._ship_table import (
+    ARTIFACTS_DIR,
+    BUNDLE_PATH,
+    PLAN_PATH,
+    STAGE_NAMES,
+    STAGE_NUMBERS,
+    STAGE_TOGGLES,
+    STAGES,
+)
 
-BUNDLE_PATH = "runtime/bundle.tgz"
-PLAN_PATH = "runtime/plan.json"
-ARTIFACTS_DIR = "dist/artifacts/"
 ARTIFACTS_MANIFEST = "dist/artifacts/MANIFEST.json"
 POLICY_BINDINGS = "dist/artifacts/policy/bindings.json"
 SCHEDULE_DIR = "dist/artifacts/schedule"

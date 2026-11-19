@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
@@ -39,13 +40,24 @@ WORKFLOW_USES_RE = re.compile(
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: urllib would send the Authorization header to the
+    new host, past the host check."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        raise urllib.error.HTTPError(newurl, code, f"refusing redirect: {msg}", headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _github_api_json(url: str) -> object:
     """Fetch JSON from the GitHub API after enforcing the expected origin."""
     parsed = urlparse(url)
     if parsed.scheme != "https" or parsed.netloc != GITHUB_API_HOST:
         raise ValueError(f"Refusing non-GitHub API URL: {url}")
     req = urllib.request.Request(url, headers=_gh_headers())
-    with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310
+    with _OPENER.open(req, timeout=15) as resp:  # nosec B310
         return json.loads(resp.read())
 
 
@@ -58,6 +70,82 @@ ENTRY_RE = re.compile(
     r"\s*,?\s*#\s*(?P<pinned_version>v[\S]+)",
     re.MULTILINE,
 )
+
+
+# A ``PINNED_IMAGES`` entry (single line, inside the dict):
+#   "name:tag": "name:tag@sha256:<64 hex>",  # resolved date
+IMAGE_ENTRY_RE = re.compile(
+    r'^\s*"(?P<name>[a-z0-9][a-z0-9._/-]*):(?P<tag>[A-Za-z0-9_][A-Za-z0-9_.-]*)"'
+    r"\s*:\s*"
+    r'"[^"@]+@sha256:(?P<digest>[0-9a-f]{64})"',
+    re.MULTILINE,
+)
+
+DOCKER_AUTH_HOST = "auth.docker.io"
+DOCKER_REGISTRY_HOST = "registry-1.docker.io"
+#: Accept the multi-arch index first: its digest is the one pinned.
+_MANIFEST_ACCEPT = ", ".join(
+    (
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    )
+)
+
+
+def _https(url: str, host: str, headers: dict, method: str = "GET"):
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.netloc != host:
+        raise ValueError(f"Refusing URL outside {host}: {url}")
+    req = urllib.request.Request(url, headers=headers, method=method)
+    return _OPENER.open(req, timeout=15)  # nosec B310
+
+
+def get_image_digest(name: str, tag: str) -> str | None:
+    """The digest Docker Hub serves for ``name:tag`` now, or None when the
+    image is not on Docker Hub or cannot be read. Anonymous pull token."""
+    first = name.split("/", 1)[0]
+    if "." in first or ":" in first:  # another registry: not checked here
+        return None
+    repo = name if "/" in name else f"library/{name}"
+    try:
+        token_url = (
+            f"https://{DOCKER_AUTH_HOST}/token?service=registry.docker.io"
+            f"&scope=repository:{repo}:pull"
+        )
+        with _https(token_url, DOCKER_AUTH_HOST, {}) as resp:
+            token = json.loads(resp.read())["token"]
+        manifest_url = f"https://{DOCKER_REGISTRY_HOST}/v2/{repo}/manifests/{tag}"
+        headers = {"Authorization": f"Bearer {token}", "Accept": _MANIFEST_ACCEPT}
+        with _https(manifest_url, DOCKER_REGISTRY_HOST, headers, method="HEAD") as resp:
+            digest = resp.headers.get("Docker-Content-Digest", "")
+    except Exception as e:  # noqa: BLE001 - reported as "could not check"
+        print(f"  WARNING: Could not resolve {name}:{tag}: {type(e).__name__}")
+        return None
+    return digest.removeprefix("sha256:") or None
+
+
+def check_image_pins(source: str) -> list[tuple[str, str, str]]:
+    """``(image, pinned, current)`` for every ``PINNED_IMAGES`` entry whose tag
+    now serves another digest."""
+    entries = IMAGE_ENTRY_RE.findall(source)
+    stale = []
+    if entries:
+        print(f"Checking {len(entries)} pinned images...\n")
+    for name, tag, pinned in entries:
+        display = f"{name}:{tag}"
+        current = get_image_digest(name, tag)
+        if current is None:
+            print(f"  ? {display:<55} (could not check)")
+        elif current == pinned:
+            print(f"  OK {display:<54} sha256:{pinned[:12]} (current)")
+        else:
+            stale.append((display, pinned, current))
+            print(f"  STALE {display:<51} pinned={pinned[:12]} current={current[:12]}")
+    if entries:
+        print()
+    return stale
 
 
 def _gh_headers() -> dict:
@@ -196,6 +284,14 @@ def main() -> int:
     else:
         print("All pinned actions are up to date.")
         stale_rc = 0
+
+    stale_images = check_image_pins(source)
+    if stale_images:
+        print(f"{len(stale_images)} image(s) moved:")
+        for display, _old, new_digest in stale_images:
+            print(f"  {display}: now sha256:{new_digest}")
+        print("\nUpdate PINNED_IMAGES in fluid_build/forge/core/pipeline_systems/_base.py")
+        stale_rc = max(stale_rc, 1 if strict else 0)
 
     # An unpinned workflow action is always a hard failure; template staleness
     # is only fatal under --strict. The worse of the two wins.
