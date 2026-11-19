@@ -822,11 +822,21 @@ def _refuse_unreadable_aws_credentials(
 
 def _container_env() -> Dict[str, str]:
     """What the container gets: the dbt environment, without the host-only AWS
-    settings and without pip's (a project .env must not choose the index)."""
+    settings, pip's (a project .env must not choose the index) or the
+    interpreter's. A ``PYTHON*`` name passes only when it is one forge sets
+    (``DBT_ENV_EXACT_KEYS``) or the operator forwards it (``FLUID_DBT_FORWARD_ENV``):
+    a project .env must not steer the Python that runs pip and dbt."""
+    forwarded = _user_configured_forward_env()
     return {
         key: value
         for key, value in _collect_dbt_container_env().items()
-        if key not in _HOST_ONLY_AWS_ENV and not key.startswith("PIP_")
+        if key not in _HOST_ONLY_AWS_ENV
+        and not key.startswith("PIP_")
+        and (
+            not key.startswith("PYTHON")
+            or key in DBT_ENV_EXACT_KEYS
+            or _env_is_user_forwarded(key, forwarded)
+        )
     }
 
 
@@ -868,10 +878,15 @@ def _build_containerized_dbt_command(
         cmd.extend([image, "dbt", *container_args])
         return cmd
 
-    # Wheels only: an sdist would run its build code at install time. ``--isolated``
-    # ignores every PIP_* setting and pip config, so the packages come from PyPI.
+    # Wheels only: an sdist would run its build code at install time. The working
+    # directory is the mounted project, so ``-I`` keeps it off sys.path (a project
+    # ``pip/`` or ``ssl.py`` would run first) and ignores PYTHON* settings.
+    # ``--isolated`` ignores the PIP_* variables and the user's config, but not
+    # PIP_CONFIG_FILE: no PIP_* name is passed in, and PIP_CONFIG_FILE=/dev/null
+    # loads no config file at all, so the packages come from PyPI.
     install_and_run = (
-        "python -m pip install --isolated --index-url https://pypi.org/simple "
+        "PIP_CONFIG_FILE=/dev/null python -I -m pip install --isolated "
+        "--index-url https://pypi.org/simple "
         "--quiet --no-cache-dir --disable-pip-version-check "
         "--only-binary=:all: {pkgs} && {dbt_cmd}"
     ).format(

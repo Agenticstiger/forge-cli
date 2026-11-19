@@ -224,6 +224,28 @@ class TestContainerCommand:
         script = shlex.split(cmd[-1].split("&&")[0])
         assert "--isolated" in script
         assert script[script.index("--index-url") + 1] == "https://pypi.org/simple"
+        # pip reads no config file, and the project directory is not on sys.path.
+        assert script[:5] == ["PIP_CONFIG_FILE=/dev/null", "python", "-I", "-m", "pip"]
+
+    def test_a_project_env_cannot_steer_the_python_in_the_container(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        exports = {
+            "PYTHONWARNINGS": "error",
+            "PYTHONBREAKPOINT": "x.y",
+            "PYTHONPYCACHEPREFIX": "/p",
+        }
+        monkeypatch.setattr(
+            "fluid_build.credentials.dotenv_store.project_exports", lambda *_a, **_k: exports
+        )
+        monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
+        monkeypatch.setenv("FLUID_DBT_FORWARD_ENV", "PYTHONHASHSEED")
+        monkeypatch.setenv("PYTHONHASHSEED", "0")
+        cmd = self._command(tmp_path, "athena")
+        passed = {cmd[i + 1] for i, part in enumerate(cmd) if part == "-e"}
+        assert not passed & set(exports)
+        # forge's own switch and what the operator forwards on purpose still pass.
+        assert {"PYTHON_DOTENV_DISABLED", "PYTHONHASHSEED"} <= passed
 
     def test_an_adapter_without_a_pin_is_refused(self, tmp_path: Path) -> None:
         with pytest.raises(RuntimeError, match="no pinned package for the dbt adapter 'glue'"):
