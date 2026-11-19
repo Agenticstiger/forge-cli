@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both runners reach, a plan made on one runner applies unchanged on another at another checkout
   path; a plan made on local state that the applying runner does not have is refused as
   `apply_plan_digest_tofu_plan_state_missing` instead of "stale".
+  A field the plan could not bind is also logged at WARNING at apply
+  (`apply_tofu_plan_target_field_unbound`, naming the provider, the field and why), and a
+  provider forge reads no target for (`confluent`, an entry-point plugin) is named at plan and
+  at apply (`plan_tofu_target_provider_unbound` / `apply_tofu_plan_target_provider_unbound`).
+  The AWS region falls back to the named profile's `region` in the shared config file, and the
+  profile is `AWS_PROFILE`, else `AWS_DEFAULT_PROFILE`, the order the `hashicorp/aws` provider
+  reads them in.
 - **`fluid plan` and `fluid apply` warn when an EMR on EC2 cluster can lose a Spark build to
   Spot.** For each `runtime: emr-ec2` build, forge reads its `clusterId` once
   (`DescribeCluster`, then `ListInstanceGroups` or `ListInstanceFleets`) and warns, never
