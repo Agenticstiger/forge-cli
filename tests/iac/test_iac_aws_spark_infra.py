@@ -1167,3 +1167,32 @@ def test_the_job_config_is_the_compilers_with_only_the_brokers_filled(contract, 
     ).config
     rendered = json.loads(text.replace(filled, MSK_BROKERS_PLACEHOLDER))
     assert rendered == compiled
+
+
+def test_the_schedulers_policy_names_each_action_once_per_runtime():
+    """A managed policy holds at most 6,144 characters: one statement per build reached it
+    at about six builds. Every build's target, role and artifacts are still named."""
+    import json
+
+    runs = [
+        aws_identity.CallerRun(
+            sid=f"B{i}",
+            runtime="emr-serverless",
+            target=f"app{i % 2}",
+            role_arn=f"arn:aws:iam::123456789012:role/fluid-p-b{i}-spark",
+            objects=(f"arn:aws:s3:::lake/_fluid/spark/p/b{i}/job.json",),
+        )
+        for i in range(8)
+    ] + [
+        aws_identity.CallerRun(
+            sid="E", runtime="emr-ec2", target="j-1ABCDEF", role_arn=None,
+            objects=("arn:aws:s3:::lake/_fluid/spark/p/e/job.json",),
+        )
+    ]  # fmt: skip
+    doc = aws_identity.caller_document(runs, account="123456789012", region="eu-west-1")
+    sids = [s["sid"] for s in doc["statement"]]
+    assert sids == ["RunEmrServerless", "PassRoleEmrServerless", "RunEmrEc2", "Artifacts"]
+    serverless = doc["statement"][0]["resources"]
+    assert len(serverless) == 4  # two applications, each named once with its job runs
+    assert len(doc["statement"][1]["resources"]) == 8 and len(doc["statement"][3]["resources"]) == 9
+    assert len(json.dumps(doc, separators=(",", ":"))) < 6144
