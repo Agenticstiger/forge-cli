@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A Glue table is partitioned as its binding declares.** `binding.location.partitionBy`
+  never reached the Glue table the AWS emitter wrote, and `binding.properties.cluster_by` was
+  read by nobody on AWS; both passed `fluid validate --strict`. On a Hive table (Parquet, ORC,
+  Avro, CSV or JSON files), the `partitionBy` columns now become the table's `partition_keys`,
+  in order, and leave its `columns`. Each must be a declared top-level column of a string,
+  integer, date or boolean type, named in lower case. Athena partition projection is written
+  when every key's values are known from the contract: an enum type or enum rule (path-safe
+  values), an integer `range` rule with both bounds, a boolean, or a date (by day, from
+  1970-01-01 to `NOW`). Otherwise `fluid validate` and `fluid apply` note that the partitions
+  need registering. A live table whose keys or projection change, or that is partitioned for the
+  first time, is replaced, and dropping the keys is gated as an in-place change; `fluid apply`
+  refuses both without `--allow-data-loss`. Lake Formation grants on a replaced table are
+  recreated with it. Refused at validate, naming the field: a key of another type, an undeclared
+  or upper-case key, a key named twice, every column as a key, `partitionBy` on an Iceberg or
+  Delta table in Glue (their partitioning lives in their own metadata, and the provider sets an
+  Iceberg spec only on create), and `cluster_by` on any Glue table. An Iceberg-on-Glue contract
+  that set `partitionBy` for its Kafka Connect or Debezium sink now fails validate: the sink's
+  default partitioning applies only to a table it creates, and `fluid apply` had already created
+  this one unpartitioned. Set the spec with an Iceberg engine instead. Partition-key columns
+  must be `required: true` to be projected, since null keys land under
+  `__HIVE_DEFAULT_PARTITION__`, which projection never reads. A duckdb build writes a
+  partitioned table in the Hive layout (`COPY ... PARTITION_BY`, the key columns kept in the
+  paths): a full refresh replaces the partitions it writes, as the Spark runner does, and
+  `incremental_append` adds files. It refuses, before writing, a late-arrival split, dedup or
+  merge mode, a json sink, streams that land outside the location, a file where the
+  partitions' directory goes, and a full refresh where files another run wrote would be read
+  beside the new ones; the embedded-SQL landing, which writes one file, refuses a partitioned
+  table. A product that consumes a partitioned table reads its `<key>=*/` layout, key columns
+  included. `fluid verify` holds a partitioned full refresh to at least the run's rows, and an
+  empty unprojected table's count says to run `MSCK REPAIR TABLE`.
 - **`fluid policy apply` grants a Lakekeeper table in Lakekeeper.** An Iceberg expose whose
   `binding.location.catalog` is `lakekeeper` used to compile to a warning ("enforce it in the
   catalog's own access control"). `fluid policy compile` now writes one `provider: lakekeeper`

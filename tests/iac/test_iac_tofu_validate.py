@@ -803,6 +803,33 @@ def test_bigquery_partitioning_and_clustering_pass_tofu_validate(tmp_path):
     _assert_tofu_validates(tmp_path, module)
 
 
+@pytest.mark.skipif(_TOFU is None, reason="tofu binary not installed")
+def test_glue_partition_keys_and_projection_pass_tofu_validate(tmp_path):
+    """``partition_keys``, the projection parameters, the ``terraform_data`` trigger and
+    the ``replace_triggered_by`` of the table and of its Lake Formation grants are
+    accepted by the real provider schema."""
+    contract = _lf_bucket_policy_contract(None, None)
+    exposure = contract["exposes"][0]
+    exposure["contract"]["schema"] += [
+        {"name": "order_date", "type": "date", "required": True},
+        {"name": "region", "type": "enum('eu', 'us')", "required": True},
+    ]
+    exposure["binding"]["location"]["partitionBy"] = ["order_date", "region"]
+    module = build_module(IAC_PLUGINS["aws"], contract)
+    document = json.loads(module)
+    [table] = document["resource"]["aws_glue_catalog_table"].values()
+    assert [key["name"] for key in table["partition_keys"]] == ["order_date", "region"]
+    assert table["parameters"]["projection.enabled"] == "true"
+    [trigger] = document["resource"]["terraform_data"]
+    assert table["lifecycle"]["replace_triggered_by"] == [f"terraform_data.{trigger}"]
+    grants = document["resource"]["aws_lakeformation_permissions"].values()
+    assert any(
+        grant.get("lifecycle", {}).get("replace_triggered_by") == [f"terraform_data.{trigger}"]
+        for grant in grants
+    )
+    _assert_tofu_validates(tmp_path, module)
+
+
 def _lf_bucket_policy_contract(bucket_policy, packaging):
     """A same-account and a cross-account LF grantee on one bucket."""
     lake_formation = {
