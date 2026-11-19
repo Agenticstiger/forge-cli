@@ -117,7 +117,10 @@ SENSITIVE_PATTERNS = [
         #     the head of this list, so no pattern here ever sees its header.
         r"(?i)\b(?P<key>(?:[A-Za-z0-9_]{,128}_)?(?:"
         r"api[_-]?key|authorization|secret[_.-]access[_.-]key|secret[_.-]key|client_secret|"
-        r"oauth[_-]?token|password|session[_-]token|secret|token|passphrase"
+        r"oauth[_-]?token|password|session[_-]token|secret|token|passphrase|"
+        # an Iceberg REST catalog's OAuth2 ``credential`` (``<client id>:<secret>``), as a
+        # local Spark run's configuration sets it (build_runners/spark/_local.py)
+        r"credentials?"
         r"))"
         # ``sep`` admits the quote that closes a key, as the global twin's does.
         r"(?P<sep>['\"]?\s{,8}[:=]\s{,8})"

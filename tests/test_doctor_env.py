@@ -51,6 +51,9 @@ class TestEnvJson:
             row[0] for row in doctor.ENV_KILL_SWITCHES
         }
 
+    def test_the_local_spark_namespace_allowlist_is_listed(self):
+        assert "FLUID_SPARK_LOCAL_NAMESPACE_ALLOWLIST" in {r[0] for r in doctor.ENV_KILL_SWITCHES}
+
     def test_the_removed_telemetry_switches_are_not_listed(self):
         names = {row[0] for row in doctor.ENV_KILL_SWITCHES}
         assert not names & {"FLUID_TELEMETRY", "DO_NOT_TRACK"}
