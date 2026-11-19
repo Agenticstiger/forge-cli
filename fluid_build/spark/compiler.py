@@ -96,7 +96,17 @@ AWS_RUNTIMES = ("emr-serverless", "emr-ec2", "emr-eks", "glue")
 RUNTIMES = (*AWS_RUNTIMES, LOCAL_RUNTIME)
 MODES = ("streaming", "batch")
 #: The ``properties.stream`` keys only an engine reads; the rest describe the records.
-_ENGINE_KEYS = ("trigger", "watermark", "checkpoint", "startingOffsets", "registry", "deadLetter")
+_ENGINE_KEYS = (
+    "trigger",
+    "watermark",
+    "checkpoint",
+    "startingOffsets",
+    "maxOffsetsPerTrigger",
+    "registry",
+    "deadLetter",
+)
+#: Spark reads maxOffsetsPerTrigger as a long.
+_MAX_OFFSETS = 2**63 - 1
 _PRODUCT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _BUILD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _BROKER = r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,252}[A-Za-z0-9])?:[0-9]{1,5}"
@@ -597,6 +607,16 @@ def _decoders(
     return {"value": decoder(stream.format, stream.value, value_subject), "key": key}
 
 
+def _max_offsets(spec: Any, where: str) -> dict[str, int]:
+    """``source.maxOffsetsPerTrigger``, absent unless set: a build without it keeps its job
+    config and its run."""
+    if spec is None:
+        return {}
+    if isinstance(spec, bool) or not isinstance(spec, int) or not 1 <= spec <= _MAX_OFFSETS:
+        raise ValueError(f"{where}.maxOffsetsPerTrigger: expected a whole number, at least 1")
+    return {"maxOffsetsPerTrigger": spec}
+
+
 def _trigger(spec: Any, expose: Mapping[str, Any], where: str) -> Optional[dict[str, Any]]:
     if spec is None:
         slo = (expose.get("qos") or {}).get("freshnessSLO")
@@ -874,6 +894,7 @@ def compile_job_config(
         offsets = stream_spec.get("startingOffsets", "latest")
         if offsets not in ("earliest", "latest"):
             raise ValueError(f"{swhere}.startingOffsets: expected earliest or latest")
+        rate_limit = _max_offsets(stream_spec.get("maxOffsetsPerTrigger"), swhere)
         dead = _parsed_dead_letters(stream_spec, stream, swhere)
         if dead is not None and dead["sink"] == "topic" and host_gate:
             _refuse_unless_dead_letter_topic_listed(bid, kafka, dead["topic"], environ)
@@ -883,6 +904,7 @@ def compile_job_config(
             **kafka,
             "topic": stream.topic,
             "startingOffsets": offsets,
+            **rate_limit,
             "includeHeaders": any(src == "headers" for _, src in stream.metadata),
             "registry": (
                 None if registry is None else {"url": registry["url"], "auth": registry["auth"]}

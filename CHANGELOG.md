@@ -48,7 +48,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once, with every build's target, role and artifacts, as one statement per build reached the
   6,144-character limit of a managed policy at about six builds.
 
+- **A Spark stream can bound what one batch reads, fails on lost offsets, and sends each dead
+  letter under the same key every time.** `properties.stream.maxOffsetsPerTrigger` (0.7.7
+  preview, optional, unset by default) is compiled into the job config and passed to Spark's
+  Kafka source: a micro-batch reads at most that many records, split across the topic's
+  partitions, so a stream that catches up after a stop, or starts from earliest, lands in
+  bounded batches, `trigger.availableNow` included. Unset, the job config has no key and a
+  running stream keeps its config. Managed Flink refuses the key. The runner now sets
+  `failOnDataLoss=true` on every Kafka source (Spark's default, pinned): offsets the topic no
+  longer holds, because retention passed them while the stream was stopped or the topic was
+  recreated, fail the stream instead of being skipped. A dead letter sent to a topic is keyed by
+  where it came from, `<topic>-<partition>@<offset>`, and keeps the record's own key in the
+  `fluid.dead-letter.raw-key` header: the Kafka sink is at least once, and a batch sent again
+  after a failure carries the same keys, so a consumer drops repeats by key.
+
 ### Fixed
+
+- **Removing a Spark build on AWS no longer needs `--allow-data-loss`.** The data-loss gate
+  counted every resource a removed build ran with as data: its runner and job config objects,
+  role and policies, log group and the key its logs are encrypted with, Glue job or connection,
+  and the product's own EMR Serverless application. None of them holds data, so dropping a Spark
+  build from a contract was refused unless the apply was allowed to destroy data, which also
+  let a real data loss in the same plan through. They are now listed as removed, not gated, as
+  a Databricks build's job and files are, and only what holds data (the build's table, a
+  bucket, a bucket's key) still needs the flag. The AWS plugin names them by type and by the
+  names forge gives them (`aws_ingest.spark_definition`).
 
 - **A Spark build that leaves the contract on AWS has its runs stopped before its role goes.**
   `fluid apply` destroyed the build's role, artifacts and log group but left its stream running
