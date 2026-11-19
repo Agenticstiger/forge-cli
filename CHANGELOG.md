@@ -59,8 +59,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dead letters are refused for now, as the decoder's permissive mode would also turn a schema
   registry outage into dead letters. On AWS, OpenTofu emits the table and grants the job's role
   what writing it takes (its S3 prefix, its Glue table, and Lake Formation's permissions when Lake
-  Formation governs the output), or what writing the topic takes on MSK with IAM, once the
-  operator lists it in `FLUID_SPARK_TARGET_ALLOWLIST` as `msk-write:<cluster ARN>/<topic>`. A
+  Formation governs the output), or what writing the topic takes on MSK with IAM. A topic is
+  written only once the operator lists it in `FLUID_SPARK_TARGET_ALLOWLIST`, on every runtime
+  and for a broker at a private address too: `msk-write:<cluster ARN>/<topic>`, or
+  `kafka-write:<host:port>/<topic>` for each broker a `bootstrapServers` cluster lists. A
   table is refused beside a bucket-root output, a location forge registers with Lake Formation,
   and an output whose lifecycle expires its objects; a topic takes their place. The managed Flink
   lane refuses the block.

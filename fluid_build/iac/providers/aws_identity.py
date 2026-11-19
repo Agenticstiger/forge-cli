@@ -71,7 +71,8 @@ SPARK_CONF_ALLOWLIST_ENV = "FLUID_SPARK_CONF_ALLOWLIST"
 #: Operator-only: the existing runtimes a contract may name, as ``<runtime>:<id>``
 #: (``emr-serverless:00f...``, ``emr-ec2:j-...``, ``emr-eks:<virtual cluster id>``), the
 #: MSK clusters it may read, as ``msk:<cluster ARN>``, and the topic a stream's dead
-#: letters may be written to, as ``msk-write:<cluster ARN>/<topic>``. The build's role
+#: letters may be written to, as ``msk-write:<cluster ARN>/<topic>`` (or
+#: ``kafka-write:<host:port>/<topic>`` per broker of a ``bootstrapServers`` cluster). The build's role
 #: trusts the runtime, reads the cluster and writes that topic, and the scheduler's policy
 #: may start, cancel and add steps there, so a contract naming another team's would reach
 #: it. Unset allows none; a
@@ -280,7 +281,7 @@ def identity_findings(
                 f"Spark build {bid}: parameters.spark.source.mskClusterArn {cluster} is not "
                 f"in {TARGET_ALLOWLIST_ENV} (as msk:{cluster})"
             )
-        missing += _unlisted_dead_letter_topic(build, cfg, cluster, environ)
+    missing += _unlisted_dead_letter_topic(build, cfg, environ)
     arn = cfg.get("executionRoleArn")
     # A local run (runtime local) ignores the AWS role: it runs as its machine's user.
     if arn is not None and cfg.get("runtime") != "local":
@@ -312,21 +313,23 @@ MSK_ARN = re.compile(
 def _unlisted_dead_letter_topic(
     build: Mapping[str, Any],
     cfg: Mapping[str, Any],
-    cluster: str,
     environ: Optional[Mapping[str, str]],
 ) -> List[str]:
-    """The dead letters' topic, when the role forge creates would write it unlisted: on MSK
-    with IAM (the compiler's default for a cluster ARN), the one auth it grants."""
+    """The dead letters' topic, when the operator has not listed writing it: on every
+    runtime, whatever role or auth the job runs with (``spark/compiler.py``'s rule:
+    ``msk-write:<ARN>/<topic>``, or ``kafka-write:<host:port>/<topic>`` per broker)."""
+    from fluid_build.spark.compiler import unlisted_dead_letter_writes
+
     topic = _dead_letter_topic(build)
-    source = cfg.get("source") if isinstance(cfg.get("source"), Mapping) else {}
-    if not topic or cfg.get("executionRoleArn") or source.get("auth", "msk-iam") != "msk-iam":
+    source = cfg.get("source")
+    if not topic or not isinstance(source, Mapping):
         return []
-    entry = f"msk-write:{cluster}/{topic}"
-    if entry in _entries(TARGET_ALLOWLIST_ENV, environ):
+    missing = unlisted_dead_letter_writes(source, topic, environ)
+    if not missing:
         return []
     return [
         f"Spark build {build.get('id')}: properties.stream.deadLetter.topic {topic} is not in "
-        f"{TARGET_ALLOWLIST_ENV} (as {entry}); the role forge creates would write it"
+        f"{TARGET_ALLOWLIST_ENV} (as {', '.join(missing)}); the job would write it"
     ]
 
 
@@ -425,6 +428,7 @@ def refuse_unless_identity_allowed(
             "role ARN or a path prefix ending in '/'; "
             f"{TARGET_ALLOWLIST_ENV} takes <runtime>:<id> of an existing application, "
             "cluster or virtual cluster, msk:<cluster ARN>, or msk-write:<cluster ARN>/<topic> "
+            "(kafka-write:<host:port>/<topic> per broker of a bootstrapServers cluster) "
             "for the topic a stream's dead letters go to; "
             f"{SPARK_CONF_ALLOWLIST_ENV} takes a key or a prefix ending in '*'. A key "
             "that loads code, sets credentials or moves the catalog or checkpoint cannot "

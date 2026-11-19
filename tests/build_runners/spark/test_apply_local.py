@@ -75,11 +75,11 @@ def daily(runtime="local", **spark):
 
 
 @pytest.fixture(autouse=True)
-def operator(monkeypatch, tmp_path):
+def operator(monkeypatch, tmp_path_factory):
     from fluid_build.spark.compiler import CONTRACT_SQL_ALLOWLIST_ENV
 
-    stub = tmp_path / "bin" / "spark-submit"
-    stub.parent.mkdir()
+    # Outside the project: forge refuses a spark-submit inside it.
+    stub = tmp_path_factory.mktemp("bin") / "spark-submit"
     stub.write_text(STUB, encoding="utf-8")
     stub.chmod(0o755)
     monkeypatch.setenv(CONTRACT_SQL_ALLOWLIST_ENV, PRODUCT)

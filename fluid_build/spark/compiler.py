@@ -70,10 +70,13 @@ CONFIG_VERSION = 1
 CONTRACT_SQL_ALLOWLIST_ENV = "FLUID_SPARK_CONTRACT_SQL_ALLOWLIST"
 #: Operator-only: the existing runtimes and MSK clusters a contract may name, as
 #: ``<runtime>:<id>`` or ``msk:<cluster ARN>``, and the topics a stream's dead letters may
-#: be written to, as ``msk-write:<cluster ARN>/<topic>``. A job reads whichever cluster its
-#: build names, with a role that may read it, so a contract naming another team's cluster
-#: would read that team's topics, and write the one its dead letters go to. Unset allows
-#: none. The IaC applies the same list (``iac/providers/aws_identity.py``).
+#: be written to, as ``msk-write:<cluster ARN>/<topic>`` or, for a cluster named by
+#: ``bootstrapServers``, ``kafka-write:<host:port>/<topic>`` for each broker. A job reads
+#: whichever cluster its build names, with a role that may read it, so a contract naming
+#: another team's cluster would read that team's topics, and write the one its dead
+#: letters go to. Unset allows none. A write needs its entry on every runtime, a broker
+#: at a private address included. The IaC applies the same list
+#: (``iac/providers/aws_identity.py``).
 TARGET_ALLOWLIST_ENV = "FLUID_SPARK_TARGET_ALLOWLIST"
 #: The Spark catalog the runner registers for the Glue catalog, and the default one,
 #: so contract SQL names a table as ``<database>.<table>``.
@@ -322,6 +325,58 @@ def cluster_listed(arn: str, environ: Any = None) -> bool:
     env = os.environ if environ is None else environ
     entries = {e.strip() for e in (env.get(TARGET_ALLOWLIST_ENV) or "").split(",")}
     return f"msk:{arn}" in entries
+
+
+def _target_entries(environ: Any) -> list[str]:
+    env = os.environ if environ is None else environ
+    return [e.strip() for e in (env.get(TARGET_ALLOWLIST_ENV) or "").split(",") if e.strip()]
+
+
+def dead_letter_write_entries(kafka: Mapping[str, Any], topic: str) -> list[str]:
+    """The operator entries a stream's dead-letter topic needs: ``msk-write:<ARN>/<topic>``
+    for a cluster named by ARN, else ``kafka-write:<host:port>/<topic>`` for each broker
+    the build lists (any of them may take the write)."""
+    if kafka.get("mskClusterArn"):
+        return [f"msk-write:{kafka['mskClusterArn']}/{topic}"]
+    servers = str(kafka.get("bootstrapServers") or "").split(",")
+    return list(dict.fromkeys(f"kafka-write:{s.strip()}/{topic}" for s in servers if s.strip()))
+
+
+def unlisted_dead_letter_writes(
+    kafka: Mapping[str, Any], topic: str, environ: Any = None
+) -> list[str]:
+    """The entries of :func:`dead_letter_write_entries` the operator has not listed."""
+    listed = set(_target_entries(environ))
+    return [e for e in dead_letter_write_entries(kafka, topic) if e not in listed]
+
+
+def _refuse_unless_dead_letter_topic_listed(
+    bid: Any, kafka: Mapping[str, Any], topic: str, environ: Any
+) -> None:
+    """A stream writes its dead letters to the topic its contract names, on the cluster it
+    reads: without the operator's entry, a contract could write into any topic there."""
+    from fluid_build._errors import doc_url
+    from fluid_build.spark.policy import SparkPolicyError
+
+    missing = unlisted_dead_letter_writes(kafka, topic, environ)
+    if not missing:
+        return
+    listed = ",".join([*_target_entries(environ), *missing])
+    raise SparkPolicyError(
+        what=f"Spark build {bid!r} writes dead letters to a topic the operator has not listed",
+        why=(
+            f"properties.stream.deadLetter.topic {topic} is not in {TARGET_ALLOWLIST_ENV} "
+            f"(as {', '.join(missing)}). The job writes the topic its contract names, on the "
+            "cluster it reads, so a contract could write into another team's topic there. "
+            "A write needs its entry on every runtime, a broker at a private address "
+            "included; an unset list allows none."
+        ),
+        fix=(
+            "If this topic is the product's, have the operator list it in the OPERATOR "
+            f'environment (not a project .env): export {TARGET_ALLOWLIST_ENV}="{listed}"'
+        ),
+        doc=doc_url(),
+    )
 
 
 def _refuse_unless_cluster_listed(product: Any, bid: Any, arn: str, environ: Any) -> None:
@@ -735,6 +790,8 @@ def compile_job_config(
         if offsets not in ("earliest", "latest"):
             raise ValueError(f"{swhere}.startingOffsets: expected earliest or latest")
         dead = _parsed_dead_letters(stream_spec, stream, swhere)
+        if dead is not None and dead["sink"] == "topic" and host_gate:
+            _refuse_unless_dead_letter_topic_listed(bid, kafka, dead["topic"], environ)
         decoders = _decoders(stream, registry, dead_letters=dead is not None)
         source = {
             "kind": "kafka",
