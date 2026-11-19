@@ -92,6 +92,17 @@ def _documents(files: Dict[str, str]) -> Iterator[Tuple[str, Any]]:
                 yield path, document
 
 
+def _gitlab_body(text: str) -> Dict[str, Any]:
+    """The pipeline document of a generated ``.gitlab-ci.yml``, after its ``spec`` header."""
+    header, body = yaml.safe_load_all(text)
+    assert set(header) == {"spec"}
+    return body
+
+
+def _gitlab_inputs(text: str) -> Dict[str, Any]:
+    return next(yaml.safe_load_all(text))["spec"]["inputs"]
+
+
 def _walk_shell(node: Any) -> Iterator[str]:
     """The strings a CI runner executes: ``run``, ``script``, ``bash``, ``command``,
     ``before_script`` and ``after_script`` values (a string, or a list of them)."""
@@ -151,11 +162,15 @@ def _ship_commands(snippets: List[str]) -> List["re.Match[str]"]:
 # ---------------------------------------------------------------------------
 
 
+#: GitLab's merge request pipeline also runs ``fluid diff --impact`` (fluid-impact).
+_IMPACT = {P.GITLAB_CI: {"diff"}}
+
+
 @every_system
 def test_every_fluid_command_is_fluid_ship(provider):
     words = _fluid_words(_snippets(provider, _files(provider)))
     assert words, "no fluid command found: the scanner read nothing"
-    assert set(words) <= {"ship", "--version"}, sorted(set(words))
+    assert set(words) <= {"ship", "--version", *_IMPACT.get(provider, ())}, sorted(set(words))
     assert "ship" in words
 
 
@@ -166,7 +181,8 @@ def test_with_every_add_on_the_only_other_commands_are_policy_check_and_verify(
 ):
     files = _files(provider, add_ons=ADD_ONS, install_mode=install_mode)
     words = set(_fluid_words(_snippets(provider, files)))
-    assert words <= {"ship", "--version", "policy-check", "verify"}, sorted(words)
+    allowed = {"ship", "--version", "policy-check", "verify", *_IMPACT.get(provider, ())}
+    assert words <= allowed, sorted(words)
     assert {"policy-check", "verify"} <= words
 
 
@@ -195,7 +211,8 @@ def _phase_ship_commands(provider: PipelineProvider, files: Dict[str, str]) -> D
             (plan if doc["metadata"]["name"] == "fluid-plan" else apply).append(entry)
     else:
         docs = [doc for _, doc in _documents(files)]
-        main = next(d for d in docs if isinstance(d, dict))
+        # A GitLab file starts with its spec:inputs header document.
+        main = next(d for d in docs if isinstance(d, dict) and "spec" not in d)
         if provider is P.GITHUB_ACTIONS:
             workflow = next(d for d in docs if d.get("name") == "fluid pipeline")
             for name, target in (("plan", plan), ("apply", apply)):
@@ -420,7 +437,7 @@ def test_the_workdir_is_honoured(provider):
                     for line in step["with"]["path"].strip().splitlines()
                 ), step
     elif provider is P.GITLAB_CI:
-        ci = yaml.safe_load(files[".gitlab-ci.yml"])
+        ci = _gitlab_body(files[".gitlab-ci.yml"])
         for job in ("fluid-plan", "fluid-apply", *(f"fluid-{a}" for a in ADD_ONS)):
             assert f'cd "{workdir}"' in ci[job]["before_script"], job
             assert all(p.startswith(f"{workdir}/") for p in ci[job]["artifacts"]["paths"]), job
@@ -467,7 +484,7 @@ def test_plan_and_apply_share_one_run_id(provider):
         workflow = yaml.safe_load(files[".github/workflows/fluid-pipeline.yml"])
         assert workflow["env"]["FLUID_RUN_ID"] == "${{ github.run_id }}-${{ github.run_attempt }}"
     if provider is P.GITLAB_CI:
-        assert yaml.safe_load(files[".gitlab-ci.yml"])["variables"]["FLUID_RUN_ID"] == (
+        assert _gitlab_body(files[".gitlab-ci.yml"])["variables"]["FLUID_RUN_ID"] == (
             "$CI_PIPELINE_ID"
         )
     if provider is P.CIRCLE_CI:
@@ -543,7 +560,7 @@ def test_github_banner_names_the_keyless_model_and_the_immutable_subject():
 
 
 def test_gitlab_both_phases_get_a_token_per_platform_when_a_cloud_is_bound():
-    ci = yaml.safe_load(_files(P.GITLAB_CI, cloud_auth=_ALL_CLOUDS)[".gitlab-ci.yml"])
+    ci = _gitlab_body(_files(P.GITLAB_CI, cloud_auth=_ALL_CLOUDS)[".gitlab-ci.yml"])
     for name in ("fluid-plan", "fluid-apply"):
         job = ci[name]
         assert job["id_tokens"]["AWS_OIDC_TOKEN"] == {"aud": "sts.amazonaws.com"}
@@ -558,7 +575,7 @@ def test_gitlab_both_phases_get_a_token_per_platform_when_a_cloud_is_bound():
 
 def test_gitlab_neither_phase_authenticates_with_no_cloud_bound():
     files = _files(P.GITLAB_CI)
-    ci = yaml.safe_load(files[".gitlab-ci.yml"])
+    ci = _gitlab_body(files[".gitlab-ci.yml"])
     for name in ("fluid-plan", "fluid-apply"):
         assert "id_tokens" not in ci[name] and "variables" not in ci[name]
         assert "mktemp" not in "\n".join(ci[name]["script"])
@@ -601,8 +618,12 @@ def _toggle_defaults(provider: PipelineProvider, files: Dict[str, str]) -> Dict[
             assert inputs[name.lower()]["default"] == "default", name
             found[name] = re.search(r"\|\| '(true|false)' \}\}$", workflow["env"][name]).group(1)
     elif provider is P.GITLAB_CI:
-        variables = yaml.safe_load(files[".gitlab-ci.yml"])["variables"]
-        found = {name: variables[name]["value"] for name in names}
+        # The switches are Run pipeline form inputs, each mapped to its variable.
+        inputs = _gitlab_inputs(files[".gitlab-ci.yml"])
+        variables = _gitlab_body(files[".gitlab-ci.yml"])["variables"]
+        for name in names:
+            assert variables[name] == f"$[[ inputs.{name.lower()} ]]", name
+        found = {name: inputs[name.lower()]["default"] for name in names}
     elif provider is P.AZURE_DEVOPS:
         parameters = {
             p["name"]: p for p in yaml.safe_load(files["azure-pipelines.yml"])["parameters"]
@@ -689,7 +710,7 @@ def _has_add_on(provider: PipelineProvider, files: Dict[str, str], add_on: str) 
     if provider is P.GITHUB_ACTIONS:
         return f".github/workflows/fluid-{add_on}.yml" in files
     if provider is P.GITLAB_CI:
-        return f"fluid-{add_on}" in yaml.safe_load(files[".gitlab-ci.yml"])
+        return f"fluid-{add_on}" in _gitlab_body(files[".gitlab-ci.yml"])
     if provider is P.JENKINS:
         return f"stage('{ADD_ON_TITLES[add_on]}')" in files["Jenkinsfile"]
     if provider is P.AZURE_DEVOPS:
@@ -770,7 +791,7 @@ def test_github_compliance_and_gitlab_compliance_stay_off_pull_requests():
         _files(P.GITHUB_ACTIONS, add_ons=("compliance",))[".github/workflows/fluid-compliance.yml"]
     )
     assert set(workflow.get("on", workflow.get(True))) == {"schedule", "workflow_dispatch"}
-    rules = yaml.safe_load(_files(P.GITLAB_CI, add_ons=("compliance",))[".gitlab-ci.yml"])[
+    rules = _gitlab_body(_files(P.GITLAB_CI, add_ons=("compliance",))[".gitlab-ci.yml"])[
         "fluid-compliance"
     ]["rules"]
     assert all("merge_request_event" not in rule["if"] for rule in rules)
@@ -809,7 +830,7 @@ def _schema_errors(schema_file: str, document: Any) -> List[str]:
 
 @pytest.mark.parametrize("config", sorted(_GATE_CONFIGS))
 def test_gitlab_validates_against_the_vendored_schema(config):
-    document = yaml.safe_load(_files(P.GITLAB_CI, **_GATE_CONFIGS[config])[".gitlab-ci.yml"])
+    document = _gitlab_body(_files(P.GITLAB_CI, **_GATE_CONFIGS[config])[".gitlab-ci.yml"])
     assert _schema_errors("gitlab-ci.json", document) == []
 
 
@@ -1349,9 +1370,7 @@ def test_github_and_gitlab_never_ask_a_run_for_the_install_knobs(config: str) ->
     for name in _thin.INSTALL_VARIABLES:
         assert name.lower() not in inputs
         assert github["env"][name].startswith("${{ vars." + name)
-    gitlab = yaml.safe_load(
-        _files(PipelineProvider.GITLAB_CI, **_CONFIGS[config])[".gitlab-ci.yml"]
-    )
+    gitlab = _gitlab_body(_files(PipelineProvider.GITLAB_CI, **_CONFIGS[config])[".gitlab-ci.yml"])
     for name in _thin.INSTALL_VARIABLES:
         # A plain default: not on the Run pipeline form.
         assert isinstance(gitlab["variables"][name], str), name
@@ -1420,7 +1439,7 @@ def test_only_the_default_branch_applies_a_manual_run_included() -> None:
     condition = workflow["jobs"]["apply"]["if"]
     assert condition.startswith("github.ref == 'refs/heads/release/1.x' && (")
     assert "'push'" in condition and "'workflow_dispatch'" in condition
-    rules = yaml.safe_load(_files(P.GITLAB_CI)[".gitlab-ci.yml"])["fluid-apply"]["rules"]
+    rules = _gitlab_body(_files(P.GITLAB_CI)[".gitlab-ci.yml"])["fluid-apply"]["rules"]
     assert [rule for rule in rules if rule.get("when") != "never"] == [
         {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH", "when": "manual"}
     ]

@@ -11,7 +11,22 @@ from __future__ import annotations
 
 from typing import Dict, Tuple
 
-__all__ = ["SHIP_VARIABLES", "STAGES", "STAGE_NAMES", "STAGE_NUMBERS", "STAGE_TOGGLES"]
+__all__ = [
+    "ARTIFACTS_DIR",
+    "BUNDLE_PATH",
+    "PLAN_PATH",
+    "SHIP_VARIABLES",
+    "STAGES",
+    "STAGE_NAMES",
+    "STAGE_NUMBERS",
+    "STAGE_TOGGLES",
+]
+
+#: Where the stages leave the frozen bundle, the reviewed plan and the
+#: generated artifacts, relative to the project directory.
+BUNDLE_PATH = "runtime/bundle.tgz"
+PLAN_PATH = "runtime/plan.json"
+ARTIFACTS_DIR = "dist/artifacts/"
 
 #: (number, name, aliases). The names are what ``--stage`` / ``--until`` /
 #: ``--skip-stage`` accept next to the number.

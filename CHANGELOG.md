@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid plan` and `fluid apply` warn when an EMR on EC2 cluster can lose a Spark build to
+  Spot.** For each `runtime: emr-ec2` build, forge reads its `clusterId` once
+  (`DescribeCluster`, then `ListInstanceGroups` or `ListInstanceFleets`) and warns, never
+  refuses, in three cases, each with its fix: the primary node runs on Spot (the build's driver
+  runs there, in client mode); core nodes run on Spot; or core or task nodes run on Spot and the
+  cluster's yarn-site does not keep YARN application masters on On-Demand nodes
+  (`yarn.node-labels.enabled=true` with `yarn.node-labels.am.default-node-label-expression`
+  `ON_DEMAND` on EMR 7.x, or `CORE` while the core nodes are all On-Demand; EMR 5.19 to 5.x
+  keep masters on `CORE` by default). The fix names `ON_DEMAND` from EMR 7.2, where managed
+  scaling places masters by it, and `CORE` before. The yarn-site read is the cluster's,
+  overridden by the primary instance group's applied configurations or the primary fleet's
+  instance types. A cluster that cannot be read (no
+  permission, no credentials, unreachable, ended) and `fluid apply --dry-run` print nothing;
+  each read waits at most 3 s to connect and 10 s to answer, twice. The warnings are not in
+  `plan.json`. The caller policy forge emits for scheduled emr-ec2 builds now also grants
+  `elasticmapreduce:DescribeCluster`, `ListInstanceFleets` and `ListInstanceGroups` on the
+  cluster.
+- **The generated GitLab pipeline hands each job exactly what the last one produced.**
+  `fluid generate ci --system gitlab` now writes:
+  - **Run pipeline form:** the form is `spec:inputs` (GitLab 17.11 or later). It holds the 11
+    stage switches and nine knobs: `FLUID_ENV`, `APPLY_MODE`, `ALLOW_DATA_LOSS`,
+    `NO_VERIFY_DIGEST`, the two strict switches, `PUBLISH_TARGETS`, `SCHEDULER` and
+    `SCHEDULE_SYNC_DRY_RUN`. That is GitLab's limit of 20. Each input sets the job variable of
+    the same name and is never pasted into a script. Every other value is a plain default
+    that a project CI/CD variable sets, and the form needs no pipeline variables.
+  - **Release packet:** on the default branch, `fluid-plan` runs `fluid ship --stage 1-6
+    --release-dir release`. `fluid-apply` downloads that job's artifacts (`needs` and
+    `dependencies`) and does not start without `release/release.json`. On the default
+    branch, stages 1-4 must run and `release/` must not be in the repository: otherwise ship
+    refuses the packet and the plan fails with its reason.
+  - **Merge requests:** a merge request plans without a packet and never gets an apply job,
+    and neither does any other ref. `fluid-impact` publishes `fluid diff --baseline --impact`
+    of the contract against the merge request's base as Markdown and JSON (`expose_as: fluid
+    impact`), beside ship's JUnit report. Its resource section reads `unknown`, with the reason,
+    while ship's stage 6 saves no OpenTofu plan.
+  - **Free-text inputs:** `fluid_env` follows ship's environment grammar and `publish_targets`
+    takes target names only, so an input cannot name another variable for GitLab to expand.
+  - **Failed plans:** a `fluid-plan` that fails keeps its reports and drops its bundle, plan,
+    OpenTofu plan files and artifacts before they are uploaded, so nothing a failed run wrote
+    reads as deployable.
+
 - **A BigQuery table is partitioned and clustered as its binding declares.**
   `binding.location.partitionBy` was read only with `lifecycle.expire`, and
   `binding.properties.cluster_by` (honoured on Snowflake) was read by nobody on BigQuery. Both
