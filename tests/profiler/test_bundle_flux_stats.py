@@ -174,10 +174,10 @@ def _entry(result, column: str, definition: str, group_by: Optional[str] = None)
 def test_the_document_answers_every_declared_property(tmp_path):
     result = _profile(tmp_path, _rows())
     assert result.fractional_bits == 16
-    assert [reason for _, reason in result.left_out] == [
+    assert [reason for _, reason in result.tables[0].left_out] == [
         "a correlation's moments need the exact record count, which the output checks round"
     ]
-    assert result.left_out[0][0] == "correlation of 'amount' and 'qty'"
+    assert result.tables[0].left_out[0][0] == "correlation of 'amount' and 'qty'"
     assert not [
         g
         for e in _entries(result, "amount")
@@ -290,11 +290,11 @@ def test_a_rare_support_member_withholds_the_group_and_siblings_of_a_grouped_mea
     assert _entry(result, "amount", "mean/1")["groups"][0]["status"] == "F"
     # Three siblings of the mean, and the quantile beside the histogram of its column.
     assert result.withheld["D"] == 4 + 1  # + the groupBy column's distinctCount
-    assert ("amount", "mean/1", "market", None) not in result.statistics
-    assert ("amount", "mean/1", None, None) in result.statistics
-    assert ("market", "support/1", None, None) in result.withheld_statistics
-    assert ("amount", "mean/1", "market", None) in result.withheld_statistics
-    assert ("amount", "mean/1", None, None) not in result.withheld_statistics
+    assert ("amount", "mean/1", "market", None) not in result.tables[0].statistics
+    assert ("amount", "mean/1", None, None) in result.tables[0].statistics
+    assert ("market", "support/1", None, None) in result.tables[0].withheld_statistics
+    assert ("amount", "mean/1", "market", None) in result.tables[0].withheld_statistics
+    assert ("amount", "mean/1", None, None) not in result.tables[0].withheld_statistics
     # The histogram's DE cell is a one: withheld by its cell, the group is published.
     (group,) = _entry(result, "market", "levelHistogram/1")["groups"]
     assert group["cellStatus"][0] == "C" and group["levelCounts"][0] is None
@@ -533,7 +533,7 @@ def test_a_quantile_with_bins_is_written_as_quantile_2(tmp_path):
     (group,) = read.groups
     assert group.published and group.statistic.quantile_bin == 0
     assert (group.statistic.bin_below, group.statistic.bin_through) == (0, 70)
-    assert result.statistics.count(
+    assert result.tables[0].statistics.count(
         ("amount", "quantile/2", None, "at level 0.5 over bins 0, 50, 100")
     )
 
@@ -715,7 +715,7 @@ def test_a_null_key_on_a_null_value_hides_nothing(tmp_path):
 def test_two_quantiles_of_one_column_are_named_apart_by_level(tmp_path):
     quantiles = [{**PROPERTIES[5], "level": "0.5"}, {**PROPERTIES[5], "level": "0.25"}]
     result = _profile(tmp_path, _rows(), quantiles)
-    named = result.statistics + result.withheld_statistics
+    named = result.tables[0].statistics + result.tables[0].withheld_statistics
     shapes = {each[3] for each in named if each[1] == "quantile/1"}
     assert shapes == {"at level 0.5", "at level 0.25"}
 
@@ -1045,9 +1045,9 @@ def test_a_statistic_with_some_groups_withheld_is_named_with_its_counts(tmp_path
     assert 0 < published < len(statuses)
     assert set(statuses) == {"F", "C"}
     named = ("amount", "quantile/2", "market", "at level 0.5 over bins 0, 50, 100")
-    assert result.partly_withheld_statistics == ((*named, published, len(statuses)),)
-    assert named not in result.statistics
-    assert named not in result.withheld_statistics
+    assert result.tables[0].partly_withheld_statistics == ((*named, published, len(statuses)),)
+    assert named not in result.tables[0].statistics
+    assert named not in result.tables[0].withheld_statistics
 
 
 def test_the_report_names_the_statistics_withheld_in_part(tmp_path, monkeypatch, capsys):
@@ -1173,7 +1173,11 @@ def test_a_histogram_group_with_no_cell_left_is_withheld_whole(tmp_path):
     groups = {group["group"]: group for group in entry["groups"]}
     assert groups["DE"] == {"group": "DE", "status": "C"}
     assert {key for key, group in groups.items() if group["status"] == "F"} == {"FR", "GB", "IE"}
-    (named,) = [one for one in result.partly_withheld_statistics if one[1] == "marginalHistogram/1"]
+    (named,) = [
+        one
+        for one in result.tables[0].partly_withheld_statistics
+        if one[1] == "marginalHistogram/1"
+    ]
     assert named[-2:] == (3, 4)
     load_profile_text(result.canonical.decode("utf-8"))
 

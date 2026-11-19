@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`fluid profile` counts children per parent for each declared relationship.** When one call
+  profiles both exposes of a `semantics.relationships` entry, without `--bundle`, the
+  document's `relationships[]` (PROFILE-SPEC §5, format unchanged) carries a
+  `marginalHistogram/1` with the parent as unit: each parent row counts once, by its number of
+  child rows, on the bins 0, 1, 2, 3 to 4, 5 to 9, 10 to 19, and 20 or more. The last bin ends
+  at 2^53 - 1, the largest count a profile holds, so no count is cut to fit. Keys are matched
+  as the registry reads them, and a null key matches none. The histogram goes through
+  `check_edge_counts` in a call of its own, as flux-stats documents for a relationship's count
+  of children. The child's foreign-key columns withhold their `distinctCount`, `sum`, `min`,
+  `max` and `quantiles` under `D` and form no `mean/1`: the parents that have a child, beside
+  the parents' row count, would give those with none, and the key's own values describe each
+  parent's children key by key. A relationship whose target is not profiled in the call,
+  declares a validity window, or whose keys are read in different domains is named in the
+  summary and left out. The key columns
+  of a counted relationship take no default statistic of their own: a key's level histogram,
+  histogram or quantiles count each key's rows, and the child key's rows are each parent's
+  children. The check sees the parents' cells and their total, while a reader can know more:
+  other tables over the same parents (an `enum` column's level histogram, another
+  relationship's cells) bound their number, and the children's own counts bound what they
+  hold, each child row having at most one parent and each parent between its bin's edges.
+  So each withheld cell is audited against the strongest reader, who knows the number of
+  parents, of children and of parents whose key is null exactly, besides the published
+  bands and the check's own rule: a withheld cell stands only where two tables that reader
+  can hold true differ in it. While one cannot be shown to, the published cell of the
+  highest edge is withheld too, down to the whole histogram, which is where parents with
+  few children often land. Audited world by world with children unbounded and none an
+  orphan: under ACRO's rule no split of a band of children over a band of parents pins a
+  count (up to 144,962 worlds), and up to 7 parents keyed by their exact numbers pin none
+  under every scaled rule, exact counts included.
+
 ## [0.36.0] — 2026-11-19
 
 ### Added

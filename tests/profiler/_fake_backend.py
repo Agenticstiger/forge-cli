@@ -19,7 +19,8 @@ CI lane, so this double cannot drift from it unnoticed.
 The fidelity grammar has no stand-in: it is flux-stats' own (ADR 0009), and the
 profile every run answers without ``--bundle`` is a fidelity block the profiler
 declares from the contract (``fluid_build/profiler/defaults.py``). So ``read_block``,
-``measure``, ``check_edge_counts`` and ``enum_levels`` hand the work to flux-stats.
+``measure``, ``check_edge_counts``, ``count_histogram`` and ``enum_levels`` hand the work
+to flux-stats.
 """
 
 from __future__ import annotations
@@ -206,6 +207,9 @@ class FakeBackend:
 
     def check_edge_counts(self, statistics: Any, **checks: Any) -> Any:
         return self._real().check_edge_counts(statistics, **checks)
+
+    def count_histogram(self, counts: Any, edges: Any, fractional_bits: int) -> Any:
+        return self._real().count_histogram(counts, edges, fractional_bits)
 
     def metrics(self) -> Tuple[FakeMetric, ...]:
         return METRICS

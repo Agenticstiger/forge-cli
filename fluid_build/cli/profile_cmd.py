@@ -68,7 +68,14 @@ fidelity block FLUX's grammar reads (so `fluxsim init` can start from them):
     date or a timestamp);
   - for each categorical semantics.dimensions entry on an enum column, the
     other enum columns' histograms per level of it, every declared level a
-    group, up to 10,000 cells for one column's groupings.
+    group, up to 10,000 cells for one column's groupings;
+  - for each semantics.relationships entry between two exposes of the call,
+    children per parent: how many child rows each parent row has, counted on
+    the bins 0, 1, 2, 3-4, 5-9, 10-19 and 20 or more, with the parent as the
+    unit; the child's foreign key then withholds its distinctCount, sum,
+    min, max and quantiles, its key columns take no statistic of their own,
+    and a cell a reader who knows the numbers of parents and children
+    exactly could work out is withheld too.
 A record outside what the contract declares (a level its type does not list, a
 value outside its type or its declared range) refuses the profile.
 
@@ -734,6 +741,20 @@ def _report(say: Any, result: Any, out: Path, *, answered_block: bool = False) -
     )
     for table in tables:
         _report_table(say, table, f"exposes[{table.plan.expose_id}]: " if several else "", grid)
+    for counted in result.relationships:
+        link = counted.relationship
+        shown = (
+            f"{counted.published} of {counted.cells} cells published"
+            if counted.published
+            else "withheld whole"
+        )
+        say(
+            f"Children per parent of exposes[{link.parent}] in exposes[{link.child}] "
+            f"({link.name}): {shown}.",
+            soft_wrap=True,
+        )
+    for child, name, reason in result.relationships_left_out:
+        say(f"No children per parent for exposes[{child}] {name!r}: {reason}.", soft_wrap=True)
     if not result.published:
         say("Every value was withheld: the document says nothing about the records.")
     say(f"Wrote {out} (readable by you alone; read it before you share it).", soft_wrap=True)

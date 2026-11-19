@@ -396,6 +396,15 @@ class StatisticsBackend(Protocol):
         record the block's declaration refuses.
         """
 
+    def count_histogram(
+        self, counts: Sequence[int], edges: Sequence[int], fractional_bits: int
+    ) -> MeasuredGroup:
+        """``marginalHistogram/1`` over whole numbers, one per unit: the ungrouped group.
+
+        *counts* are one value per unit (a parent's number of children), and *edges* the
+        bins' whole-number edges, placed on the grid as the registry places any edge.
+        """
+
     def check_edge_counts(
         self,
         statistics: Sequence[EdgeStatistic],
@@ -522,6 +531,7 @@ class _FluxStatsBackend:
         from flux_stats.reading import ValueDomain, category, read_exact
 
         self._metrics = metrics
+        self._parameters = Parameters
         self._statistics = tuple(_Statistic(each, Parameters()) for each in definitions())
         self._grid = Grid
         self._refused = FluxError
@@ -822,6 +832,27 @@ class _FluxStatsBackend:
             rows, indices, column, partial(reading.encode_value, column=column, grid=parsed.grid)
         )
         return replace(group, values=tuple(values), encoded=tuple(encoded))
+
+    def count_histogram(
+        self, counts: Sequence[int], edges: Sequence[int], fractional_bits: int
+    ) -> MeasuredGroup:
+        grammar = self._fidelity()
+        grid = self._grid(fractional_bits)
+        histogram = grammar.definition_named("marginalHistogram/1")
+        encoded = tuple(grid.quantise(Fraction(edge), subject="bin edge") for edge in edges)
+        state = histogram.measure(
+            "",
+            [grid.quantise(Fraction(count), subject="count") for count in counts],
+            self._parameters(edges=encoded),
+        )
+        spelled: Dict[str, Any] = state.to_document(histogram)
+        return MeasuredGroup(
+            key="",
+            document=spelled,
+            k=state.k,
+            statistic=state,
+            cells=tuple(state.cell_counts("marginalHistogram")),
+        )
 
     def check_edge_counts(
         self,

@@ -113,7 +113,19 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 __all__ = [
     "ACRO_DEFAULT",
@@ -138,6 +150,7 @@ __all__ = [
     "check_rounding",
     "check_sum",
     "check_support",
+    "pinned_children_cells",
     "round_count",
     "sample_size",
     "suppress_secondary",
@@ -533,3 +546,114 @@ def suppress_secondary(verdicts: Sequence[Verdict]) -> Tuple[Verdict, ...]:
         return tuple(verdicts)
     withheld = Verdict(SECONDARY, "another group of the statistic is withheld")
     return tuple(withheld if verdict.published else verdict for verdict in verdicts)
+
+
+def pinned_children_cells(
+    lower_edges: Sequence[int],
+    cells: Sequence[int],
+    published: Sequence[bool],
+    children: int,
+    rule: DisclosureRule,
+    childless: int = 0,
+) -> FrozenSet[int]:
+    """The withheld cells of a children-per-parent table a reader may work out exactly.
+
+    The table counts parents by their number of children, on bins whose lower edges are
+    *lower_edges* (the first 0; each bin ends below the next, the last has no top). The
+    reader is the strongest a profile can meet: it knows the exact number of parents,
+    the exact number of children they hold together (*children*), how many parents hold
+    none because their key is null (*childless*), each published cell's band, and the
+    output check's own rule, so that where a cell is published the withheld cells
+    together are not a small count, nor a zero where zeros are disclosive. Any table it
+    can hold true has nonnegative cells with the parents' sum, ``lower * c <= children
+    <= upper * c`` (a parent holds between its bin's edges), at least *childless* parents
+    in the first cell, and each published cell in its band.
+
+    A withheld cell is safe when two such tables differ in it. The true table (*cells*)
+    is one; the other is searched for among the tables one or two parents' moves away.
+    A cell with no such pair is returned, so the search errs toward withholding: a
+    returned cell may be one no reader could pin after all.
+    """
+    count = len(cells)
+    tops: List[Optional[int]] = [edge - 1 for edge in lower_edges[1:]] + [None]
+    bands = [
+        sample_size(value, rule) if shown else None
+        for value, shown in zip(cells, published, strict=True)
+    ]
+    any_published = any(published)
+
+    def holds(table: Sequence[int]) -> bool:
+        if min(table) < 0 or table[0] < childless:
+            return False
+        for value, band in zip(table, bands, strict=True):
+            if band is not None and not band["min"] <= value <= band["max"]:
+                return False
+        if any_published:
+            rest = sum(value for value, shown in zip(table, published, strict=True) if not shown)
+            if not check_count(rest, rule).published:
+                return False
+        if sum(edge * value for edge, value in zip(lower_edges, table, strict=True)) > children:
+            return False
+        if tops[-1] is None and table[-1] > 0:
+            return True
+        return sum((top or 0) * value for top, value in zip(tops, table, strict=True)) >= children
+
+    withheld = [index for index, shown in enumerate(published) if not shown]
+    if not holds(cells):
+        return frozenset(withheld)  # the reader's model misses these records: no claim
+    moves = [
+        (source, target) for source in range(count) for target in range(count) if source != target
+    ]
+
+    def repairs(table: Sequence[int], source: int, target: int) -> Set[int]:
+        """One parent, or as many moved *source* to *target* as the children's bounds need."""
+        many = {1}
+        low = sum(edge * value for edge, value in zip(lower_edges, table, strict=True))
+        if low > children and lower_edges[source] > lower_edges[target]:
+            gap = lower_edges[source] - lower_edges[target]
+            many.add(-(-(low - children) // gap))
+        unbounded = tops[-1] is None and table[-1] > 0
+        if not unbounded:
+            high = sum((top or 0) * value for top, value in zip(tops, table, strict=True))
+            if high < children and tops[target] is None:
+                many.add(1)
+            elif high < children and (tops[target] or 0) > (tops[source] or 0):
+                gap = (tops[target] or 0) - (tops[source] or 0)
+                many.add(-(-(children - high) // gap))
+        return {each for each in many if 1 <= each <= table[source]}
+
+    pinned: Set[int] = set()
+    for index in withheld:
+        if not _two_tables(cells, index, moves, holds, repairs):
+            pinned.add(index)
+    return frozenset(pinned)
+
+
+def _two_tables(
+    cells: Sequence[int],
+    index: int,
+    moves: Sequence[Tuple[int, int]],
+    holds: Callable[[Sequence[int]], bool],
+    repairs: Callable[[Sequence[int], int, int], Set[int]],
+) -> bool:
+    """Whether a table two moves from *cells* holds and differs at *index*.
+
+    The first move takes one parent into or out of *index*; the second moves one parent,
+    or as many as the children's bounds then need (*repairs*), between any two cells.
+    """
+    for source, target in moves:
+        if index not in (source, target):
+            continue
+        first = list(cells)
+        first[source] -= 1
+        first[target] += 1
+        if first[index] != cells[index] and holds(first):
+            return True
+        for again_source, again_target in moves:
+            for many in repairs(first, again_source, again_target):
+                second = list(first)
+                second[again_source] -= many
+                second[again_target] += many
+                if second[index] != cells[index] and holds(second):
+                    return True
+    return False
