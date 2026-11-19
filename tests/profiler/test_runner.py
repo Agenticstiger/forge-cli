@@ -228,7 +228,7 @@ def test_a_number_column_carries_mean_1_on_the_documents_grid(tmp_path):
         "placed_at": ["quantile/2"],
         "note": [],
     }
-    assert ("amount", "mean/1", None, None) in result.statistics
+    assert ("amount", "mean/1", None, None) in result.tables[0].statistics
     assert result.fractional_bits == 16
 
 
@@ -365,7 +365,7 @@ def test_a_mean_is_withheld_where_the_sum_is(tmp_path, values, status):
     statistic, group = _mean(result)
     assert group == {"group": "", "status": status}
     assert statistic["sampleSize"] == {"min": 38, "max": 42}
-    assert not [each for each in result.statistics if each[1] == "mean/1"]
+    assert not [each for each in result.tables[0].statistics if each[1] == "mean/1"]
     assert "1234567" not in result.canonical.decode("utf-8")  # no edge of the ladder either
 
 
@@ -524,8 +524,6 @@ def test_several_exposes_go_into_one_document_each_from_its_own_source(tmp_path)
     assert tables["org"]["rowCount"] == 10 and tables["account"]["rowCount"] == 20
     assert [table.plan.expose_id for table in result.tables] == ["account", "org"]
     assert result.digest == digest_of(result.canonical)
-    with pytest.raises(ValueError, match="one result per expose"):
-        result.plan  # noqa: B018 - a profile of two exposes has no one plan
 
 
 def test_an_expose_named_twice_is_refused_before_any_read(tmp_path):
@@ -546,7 +544,7 @@ def test_one_expose_profiles_as_it_always_did(tmp_path):
         ORDERS, [runner.ExposeSource("orders", _slice(tmp_path, rows))], backend=FakeBackend()
     )
     assert one.canonical == many.canonical
-    assert one.plan == many.plan
+    assert one.tables == many.tables
 
 
 # -- a column the contract types date -----------------------------------------------------

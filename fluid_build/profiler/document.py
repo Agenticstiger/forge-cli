@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import unicodedata
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Sequence
 
 from fluid_build.profiler.disclosure import MAX_COUNT, DisclosureRule
 
@@ -103,18 +103,26 @@ def build_document(
     rule: DisclosureRule,
     tables: Mapping[str, Mapping[str, Any]],
     fractional_bits: int = DEFAULT_FRACTIONAL_BITS,
+    relationships: Sequence[Mapping[str, Any]] = (),
 ) -> Dict[str, Any]:
-    """Assemble a document from tables already checked by *rule*, in the format they need."""
+    """Assemble a document from tables already checked by *rule*, in the format they need.
+
+    *relationships* are PROFILE-SPEC §5's children per parent, also checked by *rule*;
+    a document without any has no ``relationships`` key, as before there were any.
+    """
     check_fractional_bits(fractional_bits)
     if not tables:
         raise DocumentError("tables holds at least one table")
-    return {
+    built: Dict[str, Any] = {
         "_producer": producer,
         "_schemaURL": schema_url_for(tables),
         "encoding": {"fractionalBits": fractional_bits, "rounding": "floor"},
         "disclosureRules": {rule.name: rule.to_document()},
         "tables": {expose_id: dict(table) for expose_id, table in tables.items()},
     }
+    if relationships:
+        built["relationships"] = [dict(each) for each in relationships]
+    return built
 
 
 def _check(value: Any, where: List[str]) -> None:

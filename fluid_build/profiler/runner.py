@@ -39,7 +39,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fluid_build.policy._common import iter_exposes
 from fluid_build.profiler import defaults, disclosure, document, sources
@@ -64,9 +64,12 @@ __all__ = [
     "DEFAULT_QUANTILE_LEVELS",
     "ColumnPlan",
     "ExposePlan",
+    "CHILDREN_EDGES",
     "ExposeSource",
     "ProfileError",
     "ProfileResult",
+    "Relationship",
+    "RelationshipResult",
     "TableResult",
     "column_domain",
     "expose_ids",
@@ -204,6 +207,33 @@ class TableResult:
     uncovered: Tuple[Tuple[str, str], ...] = ()
 
 
+#: The bins a parent's number of children is counted in: 0, 1, 2, 3 to 4, 5 to 9, 10 to 19,
+#: and 20 or more. The last bin ends at the largest count a profile holds, 2^53 - 1, so it
+#: holds every parent with 20 children or more and no count is cut to fit.
+CHILDREN_EDGES: Tuple[int, ...] = (0, 1, 2, 3, 5, 10, 20, disclosure.MAX_COUNT)
+
+
+@dataclass(frozen=True)
+class Relationship:
+    """A declared relationship whose two exposes one profile reads: a child's foreign key."""
+
+    child: str
+    name: str
+    parent: str
+    child_columns: Tuple[str, ...]
+    parent_columns: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RelationshipResult:
+    """What the profile says about one relationship's children per parent, for the summary."""
+
+    relationship: Relationship
+    #: The cells published, of the histogram's cells; 0 when it is withheld whole.
+    published: int
+    cells: int
+
+
 @dataclass(frozen=True)
 class ProfileResult:
     document: Dict[str, Any]
@@ -221,33 +251,10 @@ class ProfileResult:
     withheld_cells: Mapping[str, int] = field(default_factory=dict)
     #: The grid the document declares and its on-grid statistics were formed on.
     fractional_bits: int = DEFAULT_FRACTIONAL_BITS
-
-    def _only(self) -> TableResult:
-        if len(self.tables) != 1:
-            raise ValueError("a profile of several exposes has one result per expose: read .tables")
-        return self.tables[0]
-
-    # The one expose of a profile of one expose, as these were before several could be read.
-
-    @property
-    def plan(self) -> ExposePlan:
-        return self._only().plan
-
-    @property
-    def statistics(self) -> Tuple[NamedStatistic, ...]:
-        return self._only().statistics
-
-    @property
-    def withheld_statistics(self) -> Tuple[NamedStatistic, ...]:
-        return self._only().withheld_statistics
-
-    @property
-    def partly_withheld_statistics(self) -> Tuple[PartlyNamedStatistic, ...]:
-        return self._only().partly_withheld_statistics
-
-    @property
-    def left_out(self) -> Tuple[Tuple[str, str], ...]:
-        return self._only().left_out
+    #: Each relationship counted, children per parent.
+    relationships: Tuple[RelationshipResult, ...] = ()
+    #: Each declared relationship not counted: the child, the relationship, and why.
+    relationships_left_out: Tuple[Tuple[str, str, str], ...] = ()
 
 
 def _base_type(type_name: Any) -> str:
@@ -587,11 +594,20 @@ def profile_exposes(
             grids[plan.expose_id] = grid
     fractional_bits = _one_grid(grids, blocks, fractional_bits)
     uncovered: List[Tuple[Tuple[str, str], ...]] = [() for _ in plans]
+    relationships, relationships_left_out = _declared_relationships(contract, plans, blocks)
+    held = _relationship_keys(relationships)
     for position, plan in enumerate(plans):
         if plan.expose_id not in blocks:
             declared[position], uncovered[position] = _default_block(
-                contract, plan, backend, fractional_bits
+                contract, plan, backend, fractional_bits, held.get(plan.expose_id, frozenset())
             )
+    edges = {
+        plan.expose_id: _edge_counted(found) for plan, found in zip(plans, declared, strict=True)
+    }
+    relationships, relationships_left_out = _keys_not_counted_at_edges(
+        relationships, relationships_left_out, edges
+    )
+    keys = _key_columns(relationships)
     reads = [
         _dates_read(
             plan,
@@ -613,9 +629,15 @@ def profile_exposes(
             rule,
             tallies,
             fractional_bits,
+            keys.get(plan.expose_id, frozenset()),
         )
         tables_doc[plan.expose_id] = table_doc
         results.append(replace(result, uncovered=missing))
+    by_expose = {plan.expose_id: (plan, read) for plan, read in zip(plans, reads, strict=True)}
+    counted = [
+        _children_per_parent(each, by_expose, backend, rule, tallies, fractional_bits)
+        for each in relationships
+    ]
     if producer is None:
         from fluid_build import __version__
 
@@ -625,6 +647,7 @@ def profile_exposes(
         rule=rule,
         tables=tables_doc,
         fractional_bits=fractional_bits,
+        relationships=[entry for entry, _ in counted],
     )
     canonical = document.canonical_bytes(built)
     backend.check_document(canonical.decode("utf-8"))
@@ -639,6 +662,8 @@ def profile_exposes(
         withheld=dict(sorted(tally.items())),
         withheld_cells=dict(sorted(cell_tally.items())),
         fractional_bits=fractional_bits,
+        relationships=tuple(result for _, result in counted),
+        relationships_left_out=tuple(relationships_left_out),
     )
 
 
@@ -676,20 +701,303 @@ def _as_day(value: Any) -> Any:
     return value
 
 
+def _declared_relationships(
+    contract: Mapping[str, Any],
+    plans: Sequence[ExposePlan],
+    blocks: Mapping[str, BundleBlock],
+) -> Tuple[List[Relationship], List[Tuple[str, str, str]]]:
+    """The ``semantics.relationships`` this profile counts children per parent for.
+
+    A relationship is counted when the profile reads both its exposes, without a bundle
+    (a bundle's profile answers its block alone), and both keys are columns it reads in
+    one domain each, pair by pair. One whose target declares a validity window is not:
+    a parent there has a row per version. Every other is returned with why, never
+    guessed at. Both come in the contract's order, whatever order the call names the
+    exposes in, so the document's bytes do not depend on it.
+    """
+    from fluid_build.data_rules._model import declares_validity_window
+
+    exposes = {
+        str(item.get("exposeId")): item
+        for item in iter_exposes(dict(contract))
+        if item.get("exposeId")
+    }
+    planned = {plan.expose_id: plan for plan in plans}
+    counted: List[Relationship] = []
+    left_out: List[Tuple[str, str, str]] = []
+    for plan in (planned[expose_id] for expose_id in exposes if expose_id in planned):
+        semantics = exposes[plan.expose_id].get("semantics")
+        declared = semantics.get("relationships") if isinstance(semantics, Mapping) else None
+        for raw in declared if isinstance(declared, list) else ():
+            if not isinstance(raw, Mapping):
+                continue
+            name, target = str(raw.get("name") or "?"), raw.get("to")
+            child_columns = _column_names(raw.get("fromColumns"))
+            parent_columns = _column_names(raw.get("toColumns"))
+            reason: Optional[str] = None
+            if not isinstance(target, str) or target not in planned:
+                reason = "its target is not profiled in this call: profile both exposes together"
+            elif plan.expose_id in blocks or target in blocks:
+                reason = "a profile that answers a bundle answers its fidelity block alone"
+            elif declares_validity_window(exposes[target]):
+                reason = "its target declares a validity window, so a parent has a row per version"
+            elif not child_columns or len(child_columns) != len(parent_columns):
+                reason = "its fromColumns and toColumns are not two lists of one length"
+            else:
+                reason = _keys_unread(plan, planned[target], child_columns, parent_columns)
+            if reason is not None:
+                left_out.append((plan.expose_id, name, reason))
+            else:
+                counted.append(
+                    Relationship(plan.expose_id, name, str(target), child_columns, parent_columns)
+                )
+    return counted, left_out
+
+
+def _column_names(value: Any) -> Tuple[str, ...]:
+    """The column names a relationship lists; none unless *value* is a list."""
+    return tuple(str(each) for each in value) if isinstance(value, list) else ()
+
+
+def _keys_unread(
+    child: ExposePlan,
+    parent: ExposePlan,
+    child_columns: Sequence[str],
+    parent_columns: Sequence[str],
+) -> Optional[str]:
+    """Why two keys cannot be matched as read, or ``None`` when every pair can be."""
+    child_domains = {column.name: column.domain for column in child.columns}
+    parent_domains = {column.name: column.domain for column in parent.columns}
+    for mine, theirs in zip(child_columns, parent_columns, strict=True):
+        if mine not in child_domains or theirs not in parent_domains:
+            return f"key column {mine!r} or {theirs!r} is not one fluid profile reads"
+        if child_domains[mine] != parent_domains[theirs]:
+            return f"key columns {mine!r} and {theirs!r} are read in different domains"
+    return None
+
+
+def _key_columns(relationships: Sequence[Relationship]) -> Dict[str, FrozenSet[str]]:
+    """The foreign-key columns of each child: their ``distinctCount`` is withheld.
+
+    A foreign key's distinct values are the parents that have a child, so beside the
+    parent's row count it would give the parents with none, a cell of the histogram.
+    """
+    found: Dict[str, Set[str]] = {}
+    for each in relationships:
+        found.setdefault(each.child, set()).update(each.child_columns)
+    return {child: frozenset(columns) for child, columns in found.items()}
+
+
+def _relationship_keys(relationships: Sequence[Relationship]) -> Dict[str, FrozenSet[str]]:
+    """The key columns of every counted relationship, both sides, by expose.
+
+    They take no default statistic: a key's own histogram or quantile counts each key's
+    rows, and the child key's rows are each parent's children, so beside children per
+    parent it would give a parent's count back. Their children per parent describe them.
+    """
+    found: Dict[str, Set[str]] = {}
+    for each in relationships:
+        found.setdefault(each.child, set()).update(each.child_columns)
+        found.setdefault(each.parent, set()).update(each.parent_columns)
+    return {expose: frozenset(columns) for expose, columns in found.items()}
+
+
+def _edge_counted(declared: Optional[DeclaredBlock]) -> FrozenSet[str]:
+    """The columns a statistic counts records at the edges of, or groups by."""
+    if declared is None:
+        return frozenset()
+    found = set()
+    for statistic in declared.statistics:
+        if statistic.kind in _EDGE_KINDS:
+            found.add(statistic.column)
+        if statistic.group_by is not None:
+            found.add(statistic.group_by)
+    return frozenset(found)
+
+
+def _keys_not_counted_at_edges(
+    relationships: Sequence[Relationship],
+    left_out: Sequence[Tuple[str, str, str]],
+    edges: Mapping[str, FrozenSet[str]],
+) -> Tuple[List[Relationship], List[Tuple[str, str, str]]]:
+    """*relationships* less any whose key a statistic still counts at its edges.
+
+    The default blocks leave every key out, so none should be; one that is would give
+    each parent's children beside the histogram, and is named and left out instead.
+    """
+    kept: List[Relationship] = []
+    out = list(left_out)
+    for each in relationships:
+        if set(each.child_columns) & edges.get(each.child, frozenset()) or set(
+            each.parent_columns
+        ) & edges.get(each.parent, frozenset()):
+            out.append((each.child, each.name, "a key column is counted at its edges"))
+        else:
+            kept.append(each)
+    return kept, out
+
+
+def _children_per_parent(
+    relationship: Relationship,
+    tables: Mapping[str, Tuple[ExposePlan, sources.SourceColumns]],
+    backend: StatisticsBackend,
+    rule: disclosure.DisclosureRule,
+    tallies: Tuple["Counter[str]", "Counter[str]"],
+    fractional_bits: int,
+) -> Tuple[Dict[str, Any], RelationshipResult]:
+    """The ``relationships[]`` entry of one relationship: a histogram with the parent as unit.
+
+    Each parent row counts once, by the child rows whose key equals its own, compared as
+    the registry reads both (a parent whose key is null, like a child's null key, matches
+    none). The counts go through the output check for counts at edges in a call of their
+    own, as ``check_edge_counts`` documents for a relationship's count of children, and
+    are spelled as a column's histogram is.
+    """
+    parents = _keys(tables[relationship.parent], relationship.parent_columns, backend)
+    children = Counter(
+        key
+        for key in _keys(tables[relationship.child], relationship.child_columns, backend)
+        if None not in key
+    )
+    counts = [0 if None in key else children.get(key, 0) for key in parents]
+    encode = backend.encoder(fractional_bits)
+    statistic = DeclaredStatistic(
+        identifier="marginalHistogram/1",
+        kind="marginalHistogram",
+        column=f"{relationship.child}.{relationship.name}",
+        group_by=None,
+        shape={"bins": [str(edge) for edge in CHILDREN_EDGES]},
+        columns=(),
+        read_as={},
+        edges=tuple(encode(Fraction(edge)) for edge in CHILDREN_EDGES),
+    )
+    measured = MeasuredStatistic(
+        groups=(backend.count_histogram(counts, CHILDREN_EDGES, fractional_bits),)
+    )
+    try:
+        (decision,) = backend.check_edge_counts(
+            [_edge_statistic(statistic, measured, rule)],
+            total=_column_total(statistic, measured),
+            minimum_cell=rule.minimum_cell,
+            zeros_disclosive=rule.zeros_disclosive,
+            round_count=lambda count: disclosure.round_count(count, rule),
+        )
+    except ValueError as exc:
+        raise ProfileError(
+            "profile_edge_counts_refused",
+            f"the children per parent of {statistic.column} cannot describe one set of "
+            f"parents: {exc}",
+            {"written": "nothing", "next": "report this: the output check refused its input"},
+        ) from None
+    childless = sum(1 for key in parents if None in key)
+    decision = _audited_children(decision, measured.groups[0], sum(counts), childless, rule)
+    entry = _declared_entry(statistic, measured, rule, tallies, fractional_bits, decision)
+    (group,) = entry["groups"]
+    published = (
+        sum(1 for count in group["binCounts"] if count is not None)
+        if group["status"] == disclosure.FREE
+        else 0
+    )
+    document_entry = {
+        "parent": {"table": relationship.parent, "columns": list(relationship.parent_columns)},
+        "child": {"table": relationship.child, "columns": list(relationship.child_columns)},
+        "statistics": [entry],
+    }
+    return document_entry, RelationshipResult(
+        relationship, published=published, cells=len(CHILDREN_EDGES) - 1
+    )
+
+
+#: Why the audit of children per parent withholds a cell the output check let through.
+_CHILDREN_PINNED = "the parents' and the children's counts would give a withheld cell back"
+
+
+def _audited_children(
+    decision: EdgeDecision,
+    group: MeasuredGroup,
+    children: int,
+    childless: int,
+    rule: disclosure.DisclosureRule,
+) -> EdgeDecision:
+    """*decision*, with more cells withheld until no withheld cell can be worked out.
+
+    ``check_edge_counts`` sees the parents' cells and their total. A reader can know more:
+    the other tables over the same parents (an enum's level histogram, another
+    relationship's cells) bound their number, and the children's own counts bound the
+    children they hold, each child row having at most one parent. So the audit takes the
+    strongest reader, who knows the parents' number, their *children* and the *childless*
+    ones whose key is null exactly (:func:`disclosure.pinned_children_cells`). While it
+    can pin a withheld cell, the published cell of the highest lower edge is withheld
+    too, down to every cell, which withholds the histogram whole. It reads counts the
+    profiler formed, never a record's value, and writes only which cells are withheld.
+    """
+    if decision.group_status[group.key] != disclosure.FREE:
+        return decision
+    lower = CHILDREN_EDGES[:-1]
+    statuses = list(decision.cell_status[group.key])
+    reasons = list(decision.cell_reason[group.key])
+    while any(status == disclosure.FREE for status in statuses):
+        published = [status == disclosure.FREE for status in statuses]
+        if not disclosure.pinned_children_cells(
+            lower, group.cells, published, children, rule, childless
+        ):
+            break
+        heaviest = max(
+            (index for index, shown in enumerate(published) if shown),
+            key=lambda index: lower[index],
+        )
+        statuses[heaviest] = disclosure.WITHHELD
+        reasons[heaviest] = _CHILDREN_PINNED
+    return replace(
+        decision,
+        cell_status={**decision.cell_status, group.key: tuple(statuses)},
+        cell_reason={**decision.cell_reason, group.key: tuple(reasons)},
+    )
+
+
+def _keys(
+    table: Tuple[ExposePlan, sources.SourceColumns],
+    names: Sequence[str],
+    backend: StatisticsBackend,
+) -> List[Tuple[Any, ...]]:
+    """Each row's key over *names*, every part read as the registry reads its column."""
+    plan, read = table
+    domains = {column.name: column.domain for column in plan.columns}
+    columns = [
+        [
+            backend.read_value(domains[name], value, column=name, row_index=index)
+            for index, value in enumerate(read.values[name])
+        ]
+        for name in names
+    ]
+    return list(zip(*columns, strict=True)) if columns else []
+
+
 def _default_block(
-    contract: Mapping[str, Any], plan: ExposePlan, backend: StatisticsBackend, fractional_bits: int
+    contract: Mapping[str, Any],
+    plan: ExposePlan,
+    backend: StatisticsBackend,
+    fractional_bits: int,
+    keys: FrozenSet[str] = frozenset(),
 ) -> Tuple[Optional[DeclaredBlock], Tuple[Tuple[str, str], ...]]:
     """The block the profiler declares for *plan* from the contract alone, read by the registry.
 
     ``(None, ...)`` when the contract declares nothing to answer. The block is the
-    profiler's own, so a grammar refusal of it is a defect, and says so.
+    profiler's own, so a grammar refusal of it is a defect, and says so. The *keys* of
+    counted relationships take no statistic in it (:func:`_relationship_keys`).
     """
     expose = next(
         item for item in iter_exposes(dict(contract)) if item.get("exposeId") == plan.expose_id
     )
-    planned = defaults.default_plan(expose, plan.columns, backend.enum_levels, fractional_bits)
+    columns = [column for column in plan.columns if column.name not in keys]
+    held = tuple(
+        (column.name, "a key of a counted relationship, which its children per parent describe")
+        for column in plan.columns
+        if column.name in keys
+    )
+    planned = defaults.default_plan(expose, columns, backend.enum_levels, fractional_bits)
     if planned.block is None:
-        return None, planned.uncovered
+        return None, planned.uncovered + held
     try:
         declared = backend.read_block(planned.block, contract, plan.expose_id)
     except BlockRefused as exc:
@@ -704,7 +1012,7 @@ def _default_block(
         ) from None
     _check_declared_columns(declared, plan)
     block = replace(declared, every_declared_group=True, declared_ranges=planned.ranges)
-    return block, planned.uncovered
+    return block, planned.uncovered + held
 
 
 def _refuse_repeated(exposes: Sequence[ExposeSource]) -> None:
@@ -765,12 +1073,18 @@ def _profile_table(
     rule: disclosure.DisclosureRule,
     tallies: Tuple["Counter[str]", "Counter[str]"],
     fractional_bits: int,
+    keys: FrozenSet[str] = frozenset(),
 ) -> Tuple[Dict[str, Any], TableResult]:
-    """One table of the document, from one read of its records, and its summary."""
+    """One table of the document, from one read of its records, and its summary.
+
+    *keys* are the table's foreign-key columns whose children per parent are counted.
+    """
     tally, cell_tally = tallies
-    binned = _binned_numbers(declared, plan)
+    # A foreign key's own values are each parent's children, key by key: its sum, extremes
+    # and quantiles describe them as a binned number's do its bins, so it withholds them too.
+    binned = _binned_numbers(declared, plan) | keys
     replaced = _ungrouped_means(declared) | binned
-    counted = _counted_levels(declared)
+    counted = _counted_levels(declared) | keys
     columns_doc = {
         column.name: _column(
             column,

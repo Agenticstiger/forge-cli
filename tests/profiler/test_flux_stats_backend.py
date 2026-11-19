@@ -234,7 +234,7 @@ def test_a_boolean_column_is_left_out_as_flux_stats_reads_none(tmp_path, backend
     }
     rows = [{"attempts": n % 4, "paid": n % 2 == 0} for n in range(40)]
     result = profile_expose(contract, "payment", source=_slice(tmp_path, rows), backend=backend)
-    assert [name for name, _ in result.plan.skipped] == ["paid"]
+    assert [name for name, _ in result.tables[0].plan.skipped] == ["paid"]
     load_profile_text(result.canonical.decode("utf-8"))
 
 
