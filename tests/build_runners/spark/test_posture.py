@@ -533,14 +533,10 @@ def test_fluid_plan_warns_and_keeps_the_warning_out_of_plan_json(
     quiet = tmp_path / "quiet.json"
     assert plan_cli.run(argparse.Namespace(**{**vars(args), "out": str(quiet)}), LOG) == 0
     assert len(said) == 1
-    assert _stable(json.loads(out.read_text(encoding="utf-8"))) == _stable(
-        json.loads(quiet.read_text(encoding="utf-8"))
-    )
-
-
-def _stable(plan):
-    """A plan without its time and the digest that covers it."""
-    return {k: v for k, v in plan.items() if k not in ("generated_at", "planDigest")}
+    plans = [json.loads(path.read_text(encoding="utf-8")) for path in (out, quiet)]
+    for plan in plans:  # the time, and the digest that covers it
+        del plan["generated_at"], plan["planDigest"]
+    assert plans[0] == plans[1]
 
 
 @aws
