@@ -317,6 +317,80 @@ def test_main_returns_one_on_stale_dict_entry_only_under_strict(tmp_path, monkey
     assert rc == 1
 
 
+# ---------------------------------------------------------------------------
+# PINNED_IMAGES: digest pins of the generated pipelines' container images
+# ---------------------------------------------------------------------------
+
+_IMAGE_SOURCE = (
+    "PINNED_ACTIONS = {\n"
+    '    "x/y@v1": "x/y@' + "0" * 40 + '",  # v1.0.0\n'
+    "}\n"
+    "PINNED_IMAGES = {\n"
+    '    "python:3.12-slim": "python:3.12-slim@sha256:' + "a" * 64 + '",  # 2026-11-19\n'
+    "}\n"
+)
+
+
+def test_image_entry_re_parses_the_real_pins():
+    mod = _load_module()
+    repo_root = Path(__file__).resolve().parents[2]
+    text = (repo_root / "fluid_build/forge/core/pipeline_systems/_base.py").read_text()
+    entries = mod.IMAGE_ENTRY_RE.findall(text)
+    assert ("python", "3.12-slim") in [(n, t) for n, t, _d in entries]
+
+
+def test_a_moved_image_tag_fails_only_under_strict(tmp_path, monkeypatch):
+    mod = _load_module()
+    (tmp_path / "wf").mkdir()
+    monkeypatch.setattr(mod, "WORKFLOWS_DIR", tmp_path / "wf")
+    monkeypatch.setattr(mod, "TEMPLATES_PATH", tmp_path / "fake_templates.py")
+    (tmp_path / "fake_templates.py").write_text(_IMAGE_SOURCE, encoding="utf-8")
+    monkeypatch.setattr(
+        mod, "get_latest_release_sha", lambda o, r, t: {"tag": "v1.0.0", "sha": "0" * 40}
+    )
+    seen = []
+    monkeypatch.setattr(mod, "get_image_digest", lambda n, t: seen.append((n, t)) or "b" * 64)
+
+    monkeypatch.setattr(sys, "argv", ["check_pinned_actions.py"])
+    assert mod.main() == 0
+    monkeypatch.setattr(sys, "argv", ["check_pinned_actions.py", "--strict"])
+    assert mod.main() == 1
+    assert seen[0] == ("python", "3.12-slim")
+
+
+def test_a_current_image_pin_passes_strict(tmp_path, monkeypatch):
+    mod = _load_module()
+    (tmp_path / "wf").mkdir()
+    monkeypatch.setattr(mod, "WORKFLOWS_DIR", tmp_path / "wf")
+    monkeypatch.setattr(mod, "TEMPLATES_PATH", tmp_path / "fake_templates.py")
+    (tmp_path / "fake_templates.py").write_text(_IMAGE_SOURCE, encoding="utf-8")
+    monkeypatch.setattr(
+        mod, "get_latest_release_sha", lambda o, r, t: {"tag": "v1.0.0", "sha": "0" * 40}
+    )
+    monkeypatch.setattr(mod, "get_image_digest", lambda n, t: "a" * 64)
+    monkeypatch.setattr(sys, "argv", ["check_pinned_actions.py", "--strict"])
+    assert mod.main() == 0
+
+
+def test_an_image_on_another_registry_is_not_checked():
+    mod = _load_module()
+    assert mod.get_image_digest("ghcr.io/org/img", "v1") is None
+    assert mod.get_image_digest("localhost:5000/img", "v1") is None
+
+
+def test_a_redirect_is_refused_so_no_token_follows_it():
+    import urllib.error
+    import urllib.request
+
+    mod = _load_module()
+    handler = mod._NoRedirect()
+    req = urllib.request.Request(
+        "https://registry-1.docker.io/v2/x", headers={"Authorization": "t"}
+    )
+    with pytest.raises(urllib.error.HTTPError):
+        handler.redirect_request(req, None, 307, "Temporary Redirect", {}, "https://evil.test/")
+
+
 if __name__ == "__main__":
     # Allow running this file directly: `python tests/scripts/test_check_pinned_actions.py`
     import subprocess

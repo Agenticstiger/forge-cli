@@ -68,6 +68,12 @@ _CONFIGS: Dict[str, Dict[str, Any]] = {
     "workdir+cloud": {"workdir": "sub/dir", "cloud_auth": _ALL_CLOUDS},
     "all-add-ons": {"add_ons": ADD_ONS},
 }
+#: What the validator gates also run on: the dev-source install is a different
+#: script on every system.
+_GATE_CONFIGS: Dict[str, Dict[str, Any]] = {
+    **_CONFIGS,
+    "dev-source": {"install_mode": "dev-source", "add_ons": ADD_ONS},
+}
 
 
 def _files(provider: PipelineProvider, **kwargs: Any) -> Dict[str, str]:
@@ -382,10 +388,18 @@ def test_the_dev_source_install_mounts_the_checkout(provider):
         if not line.strip().startswith("#")  # a comment may explain what is not done
     )
     assert "/forge-cli-src" in text
-    assert "PYTHONPATH" in text or "PYTHONPATH" in files.get("Jenkinsfile", "")
     assert "fluid --version" in text
-    # No pip install of the package (an engine's own extras may still be installed),
-    # and never an uninstall: that deletes the `fluid` command itself.
+    if provider is P.JENKINS:
+        # The Jenkins agent image already has the console script; PYTHONPATH,
+        # set for the whole pipeline, points its imports at the checkout.
+        assert "PYTHONPATH = '/forge-cli-src'" in files["Jenkinsfile"]
+    else:
+        # Everywhere else nothing is installed: the editable install puts
+        # `fluid` on PATH. A PYTHONPATH export dies with its step or subshell.
+        assert "python -m pip install --quiet -e /forge-cli-src" in text
+        assert "PYTHONPATH" not in text
+    # Never the published package, and never an uninstall: that deletes the
+    # `fluid` command itself.
     assert "data-product-forge" not in text
     assert "pip uninstall" not in text
 
@@ -814,15 +828,15 @@ def _schema_errors(schema_file: str, document: Any) -> List[str]:
     ]
 
 
-@pytest.mark.parametrize("config", sorted(_CONFIGS))
+@pytest.mark.parametrize("config", sorted(_GATE_CONFIGS))
 def test_gitlab_validates_against_the_vendored_schema(config):
-    document = _gitlab_body(_files(P.GITLAB_CI, **_CONFIGS[config])[".gitlab-ci.yml"])
+    document = _gitlab_body(_files(P.GITLAB_CI, **_GATE_CONFIGS[config])[".gitlab-ci.yml"])
     assert _schema_errors("gitlab-ci.json", document) == []
 
 
-@pytest.mark.parametrize("config", sorted(_CONFIGS))
+@pytest.mark.parametrize("config", sorted(_GATE_CONFIGS))
 def test_circleci_validates_against_the_vendored_schema(config):
-    document = yaml.safe_load(_files(P.CIRCLE_CI, **_CONFIGS[config])[".circleci/config.yml"])
+    document = yaml.safe_load(_files(P.CIRCLE_CI, **_GATE_CONFIGS[config])[".circleci/config.yml"])
     assert _schema_errors("circleci.json", document) == []
 
 
@@ -842,7 +856,7 @@ def test_the_vendored_schemas_are_documented():
 
 
 def _write_workflows(root: Path, config: str) -> Path:
-    files = _files(P.GITHUB_ACTIONS, **_CONFIGS[config])
+    files = _files(P.GITHUB_ACTIONS, **_GATE_CONFIGS[config])
     for path, text in files.items():
         target = root / path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -850,7 +864,7 @@ def _write_workflows(root: Path, config: str) -> Path:
     return root
 
 
-@pytest.mark.parametrize("config", sorted(_CONFIGS))
+@pytest.mark.parametrize("config", sorted(_GATE_CONFIGS))
 def test_github_files_pass_actionlint(tmp_path, config):
     actionlint = shutil.which("actionlint")
     if actionlint is None:
@@ -877,7 +891,7 @@ def _zizmor_command() -> Optional[List[str]]:
     return None
 
 
-@pytest.mark.parametrize("config", sorted(_CONFIGS))
+@pytest.mark.parametrize("config", sorted(_GATE_CONFIGS))
 def test_github_files_pass_zizmor_offline(tmp_path, config):
     command = _zizmor_command()
     if command is None:
@@ -895,9 +909,9 @@ def test_github_files_pass_zizmor_offline(tmp_path, config):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("config", sorted(_CONFIGS))
+@pytest.mark.parametrize("config", sorted(_GATE_CONFIGS))
 def test_azure_structure(config):
-    files = _files(P.AZURE_DEVOPS, **_CONFIGS[config])
+    files = _files(P.AZURE_DEVOPS, **_GATE_CONFIGS[config])
     document = yaml.safe_load(files["azure-pipelines.yml"])
     assert {"trigger", "pr", "parameters", "variables", "stages"} <= set(document)
     for entry in document["parameters"]:
@@ -918,9 +932,9 @@ def test_azure_structure(config):
             assert "job" in job or "deployment" in job
 
 
-@pytest.mark.parametrize("config", sorted(_CONFIGS))
+@pytest.mark.parametrize("config", sorted(_GATE_CONFIGS))
 def test_bitbucket_structure(config):
-    files = _files(P.BITBUCKET, **_CONFIGS[config])
+    files = _files(P.BITBUCKET, **_GATE_CONFIGS[config])
     document = yaml.safe_load(files["bitbucket-pipelines.yml"])
     assert {"image", "pipelines"} <= set(document)
     pipelines = document["pipelines"]
@@ -951,9 +965,35 @@ def test_bitbucket_structure(config):
     assert pipelines["custom"]["fluid"][0]["variables"]
 
 
-@pytest.mark.parametrize("config", sorted(_CONFIGS))
+@pytest.mark.parametrize("config", sorted(_GATE_CONFIGS))
+def test_tekton_step_scripts_pass_shellcheck(tmp_path, config):
+    shellcheck = shutil.which("shellcheck")
+    if shellcheck is None:
+        pytest.skip("shellcheck is not on PATH; the Tekton script gate did not run")
+    files = _files(P.TEKTON, **_GATE_CONFIGS[config])
+    scripts = [
+        step["script"]
+        for _, doc in _documents(files)
+        if doc["kind"] == "Task"
+        for step in doc["spec"]["steps"]
+    ]
+    assert scripts
+    for n, script in enumerate(scripts):
+        # $(params.x) is Tekton's, substituted before the shell runs.
+        path = tmp_path / f"step{n}.sh"
+        path.write_text(re.sub(r"\$\((params|workspaces)\.[\w.-]+\)", "X", script))
+        result = subprocess.run(
+            [shellcheck, "--shell=sh", "--severity=warning", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("config", sorted(_GATE_CONFIGS))
 def test_tekton_structure(config):
-    files = _files(P.TEKTON, **_CONFIGS[config])
+    files = _files(P.TEKTON, **_GATE_CONFIGS[config])
     assert sorted(files) == ["tekton/pipeline.yaml", "tekton/tasks.yaml"]
     documents = [doc for _, doc in _documents(files)]
     assert documents

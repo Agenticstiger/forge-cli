@@ -23,14 +23,21 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple
 
 from . import _keyless, _thin
-from ._base import BasePipelineTemplate, PipelineConfig, check_pipeline_workdir
+from ._base import (
+    BasePipelineTemplate,
+    PipelineConfig,
+    _pin_image,
+    check_image_ref,
+    check_pipeline_workdir,
+)
 
 PIPELINE_PATH = "tekton/pipeline.yaml"
 TASKS_PATH = "tekton/tasks.yaml"
 API_VERSION = "tekton.dev/v1"
 TASK_NAME = "fluid-ship"
 WORKSPACE = "source"
-IMAGE = "python:3.12-slim"
+#: The default step image, pinned by digest (``PINNED_IMAGES``).
+IMAGE = _pin_image("python:3.12-slim")
 #: The stage knobs ship reads, each with its own default when blank.
 STAGE_KNOBS: Tuple[str, ...] = (
     "VALIDATE_STRICT",
@@ -45,6 +52,11 @@ STAGE_KNOBS: Tuple[str, ...] = (
 STAGE_PARAM = "ship-stage"
 YES_PARAM = "ship-yes"
 RUN_ID = "FLUID_RUN_ID"
+
+
+def _image(config: PipelineConfig) -> str:
+    """The step image: ``--image``, else the pinned default."""
+    return IMAGE if config.image is None else check_image_ref(config.image)
 
 
 class TektonTemplate(BasePipelineTemplate):
@@ -165,7 +177,7 @@ class TektonTemplate(BasePipelineTemplate):
                 "steps": [
                     {
                         "name": "ship",
-                        "image": IMAGE,
+                        "image": _image(config),
                         "workingDir": f"$(workspaces.{WORKSPACE}.path)",
                         "env": env,
                         "script": _keyless.LiteralStr(script),
@@ -208,7 +220,7 @@ class TektonTemplate(BasePipelineTemplate):
                 "steps": [
                     {
                         "name": add_on,
-                        "image": IMAGE,
+                        "image": _image(config),
                         "workingDir": f"$(workspaces.{WORKSPACE}.path)",
                         "env": env,
                         "script": _keyless.LiteralStr(script),

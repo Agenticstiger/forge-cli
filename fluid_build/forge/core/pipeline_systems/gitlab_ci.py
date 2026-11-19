@@ -38,12 +38,12 @@ import shlex
 from typing import Any, Dict, List, Tuple
 
 from . import _keyless, _thin
-from ._base import BasePipelineTemplate, PipelineConfig, check_pipeline_workdir
+from ._base import BasePipelineTemplate, PipelineConfig, _pin_image, check_pipeline_workdir
 
 PIPELINE_PATH = ".gitlab-ci.yml"
-IMAGE = "python:3.12-slim"
+IMAGE = _pin_image("python:3.12-slim")
 #: ``fluid-impact`` reads the merge request's base with git, which the slim image lacks.
-IMPACT_IMAGE = "python:3.12"
+IMPACT_IMAGE = _pin_image("python:3.12")
 #: GitLab takes at most 20 inputs for a pipeline.
 MAX_INPUTS = 20
 #: The knobs on the Run pipeline form beside the 11 stage switches; every other
