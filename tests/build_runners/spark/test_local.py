@@ -131,6 +131,14 @@ def batch_contract():
     return contract
 
 
+@pytest.fixture(autouse=True)
+def listed_namespace(monkeypatch):
+    """The operator lets local runs write the examples' namespace."""
+    from fluid_build.spark.compiler import LOCAL_NAMESPACE_ALLOWLIST_ENV
+
+    monkeypatch.setenv(LOCAL_NAMESPACE_ALLOWLIST_ENV, "fluid/commerce")
+
+
 @pytest.fixture
 def stub(tmp_path_factory):
     # Outside every test's project (tmp_path): forge refuses a spark-submit inside it.

@@ -83,6 +83,7 @@ def operator(monkeypatch, tmp_path_factory):
     stub.write_text(STUB, encoding="utf-8")
     stub.chmod(0o755)
     monkeypatch.setenv(CONTRACT_SQL_ALLOWLIST_ENV, PRODUCT)
+    monkeypatch.setenv("FLUID_SPARK_LOCAL_NAMESPACE_ALLOWLIST", "fluid/curated,fluid/commerce")
     monkeypatch.setenv(SUBMIT_EXECUTABLE_ENV, str(stub))
     monkeypatch.delenv("FLUID_SPARK_LOCAL_ROOT", raising=False)
     monkeypatch.delenv("FLUID_SPARK_SUBMIT_PROPERTIES_FILE", raising=False)

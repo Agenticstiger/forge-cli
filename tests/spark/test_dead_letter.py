@@ -176,9 +176,10 @@ def test_an_avro_stream_s_dead_letters_are_refused_for_now(contract):
         compile_job_config(contract, contract["builds"][0], host_gate=False)
 
 
-def test_a_local_stream_creates_its_dead_letter_table(contract):
+def test_a_local_stream_creates_its_dead_letter_table(contract, monkeypatch):
     from tests.build_runners.spark.test_local import local_contract
 
+    monkeypatch.setenv("FLUID_SPARK_LOCAL_NAMESPACE_ALLOWLIST", "fluid/commerce")
     config = config_of(with_dead_letters(local_contract()))
     create = config["deadLetter"]["create"]
     assert create[0] == "CREATE NAMESPACE IF NOT EXISTS `fluid`.`commerce`"

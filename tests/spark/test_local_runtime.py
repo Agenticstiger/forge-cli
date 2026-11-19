@@ -11,7 +11,18 @@ import json
 
 import pytest
 
-from fluid_build.spark.compiler import compile_job_config, validation_errors
+from fluid_build.spark.compiler import (
+    LOCAL_NAMESPACE_ALLOWLIST_ENV,
+    compile_job_config,
+    validation_errors,
+    validation_warnings,
+)
+
+
+@pytest.fixture(autouse=True)
+def listed_namespace(monkeypatch, operator_policy):
+    """The operator lets local runs write the examples' namespace, in either catalog."""
+    monkeypatch.setenv(LOCAL_NAMESPACE_ALLOWLIST_ENV, "fluid/commerce,lab/commerce")
 
 
 def local(contract, **location):
@@ -233,3 +244,74 @@ def test_the_compiler_s_contract_is_not_changed_by_local(contract):
     before = copy.deepcopy(contract)
     local(copy.deepcopy(contract))
     assert contract == before
+
+
+def test_a_local_run_writes_only_a_namespace_the_operator_lists(contract, monkeypatch):
+    from fluid_build.spark.policy import SparkPolicyError
+
+    monkeypatch.delenv(LOCAL_NAMESPACE_ALLOWLIST_ENV)
+    with pytest.raises(SparkPolicyError) as caught:
+        config_of(local(copy.deepcopy(contract)))
+    assert "commerce.order_lines" in caught.value.why
+    assert f'export {LOCAL_NAMESPACE_ALLOWLIST_ENV}="fluid/commerce"' in caught.value.fix
+    monkeypatch.setenv(LOCAL_NAMESPACE_ALLOWLIST_ENV, "other/commerce,fluid/billing")
+    with pytest.raises(SparkPolicyError) as caught:
+        config_of(local(copy.deepcopy(contract), warehouse="lab"))
+    assert (
+        f'export {LOCAL_NAMESPACE_ALLOWLIST_ENV}="other/commerce,fluid/billing,lab/commerce"'
+        in caught.value.fix
+    )
+
+
+@pytest.mark.parametrize(
+    ("entries", "listed"),
+    [
+        ("fluid/commerce", True),
+        ("fluid/commerce.eu", False),  # a deeper prefix does not cover its parent
+        ("fluid/comm", False),  # whole levels only
+        ("lab/commerce", False),  # another warehouse
+        ("fluid/", False),
+        ("commerce", False),
+        (" fluid/commerce , x/y", True),
+    ],
+)
+def test_a_namespace_entry_matches_whole_levels_of_one_warehouse(entries, listed):
+    from fluid_build.spark.compiler import local_namespace_listed
+
+    env = {LOCAL_NAMESPACE_ALLOWLIST_ENV: entries}
+    assert local_namespace_listed("fluid", "commerce", env) is listed
+    assert local_namespace_listed(
+        "fluid", "commerce.eu", {LOCAL_NAMESPACE_ALLOWLIST_ENV: "fluid/commerce"}
+    )
+
+
+def test_the_dead_letter_table_is_named_in_the_refusal(contract, monkeypatch):
+    from fluid_build.spark.policy import SparkPolicyError
+
+    monkeypatch.delenv(LOCAL_NAMESPACE_ALLOWLIST_ENV)
+    spec = local(contract)
+    spec["builds"][0]["properties"]["stream"]["deadLetter"] = {}
+    with pytest.raises(SparkPolicyError) as caught:
+        config_of(spec)
+    assert "commerce.order_lines__dead_letter" in caught.value.why
+
+
+def test_an_aws_run_needs_no_namespace_entry(contract, monkeypatch):
+    monkeypatch.delenv(LOCAL_NAMESPACE_ALLOWLIST_ENV)
+    assert config_of(contract)["sink"]["type"] == "glue"
+
+
+def test_fluid_validate_warns_about_an_unlisted_namespace_and_compiles(contract, monkeypatch):
+    monkeypatch.delenv(LOCAL_NAMESPACE_ALLOWLIST_ENV)
+    spec = local(contract)
+    assert validation_errors(spec) == []
+    assert any(
+        LOCAL_NAMESPACE_ALLOWLIST_ENV in w and "fluid/commerce" in w
+        for w in validation_warnings(spec)
+    )
+
+
+def test_the_namespace_allowlist_is_the_operator_s_alone():
+    from fluid_build.credentials.protected_env import is_protected_env_key
+
+    assert is_protected_env_key(LOCAL_NAMESPACE_ALLOWLIST_ENV)

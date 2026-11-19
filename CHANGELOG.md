@@ -28,7 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   polaris) on `platform: local`. The operator declares that catalog in
   `FLUID_SPARK_SUBMIT_PROPERTIES_FILE`, passed as `--properties-file`, so its values never reach
   the command line, and the job creates its table on the first write: Iceberg v2 with the
-  contract's columns, as OpenTofu creates it on AWS. `FLUID_SPARK_SUBMIT_EXECUTABLE` names the
+  contract's columns, as OpenTofu creates it on AWS. As a table that exists is written as it
+  is, a local run writes, its dead letters' table included, only in a namespace the operator
+  lists in `FLUID_SPARK_LOCAL_NAMESPACE_ALLOWLIST` as `<warehouse>/<namespace prefix>`
+  (`fluid/<namespace>` when the binding names no warehouse; whole levels match); unset allows
+  none, and `fluid validate` warns. `FLUID_SPARK_SUBMIT_EXECUTABLE` names the
   spark-submit. A contract written for AWS switches with one keyed-overlay line, since
   `runtime: local` ignores the AWS runtimes' keys (`applicationId`, `clusterId`,
   `virtualClusterId`, `releaseLabel`, `glueVersion`, `executionRoleArn`). Each environment

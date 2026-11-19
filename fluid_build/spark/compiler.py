@@ -78,6 +78,14 @@ CONTRACT_SQL_ALLOWLIST_ENV = "FLUID_SPARK_CONTRACT_SQL_ALLOWLIST"
 #: at a private address included. The IaC applies the same list
 #: (``iac/providers/aws_identity.py``).
 TARGET_ALLOWLIST_ENV = "FLUID_SPARK_TARGET_ALLOWLIST"
+#: Operator-only: where a local run (``runtime: local``) may create or write tables in the
+#: operator's Iceberg REST catalog, as ``<warehouse>/<namespace prefix>``, comma-separated.
+#: ``<warehouse>`` is the binding's ``location.warehouse``, or ``fluid`` (the Spark catalog
+#: the operator's properties file declares) when it names none; a prefix matches whole
+#: namespace levels (``sales`` covers ``sales`` and ``sales.eu``, never ``salesforce``).
+#: The job creates its tables ``IF NOT EXISTS``, so without the list a contract could name
+#: another team's table and append to it. Unset allows none. On AWS the IaC owns the table.
+LOCAL_NAMESPACE_ALLOWLIST_ENV = "FLUID_SPARK_LOCAL_NAMESPACE_ALLOWLIST"
 #: The Spark catalog the runner registers for the Glue catalog, and the default one,
 #: so contract SQL names a table as ``<database>.<table>``.
 CATALOG = "fluid"
@@ -374,6 +382,58 @@ def _refuse_unless_dead_letter_topic_listed(
         fix=(
             "If this topic is the product's, have the operator list it in the OPERATOR "
             f'environment (not a project .env): export {TARGET_ALLOWLIST_ENV}="{listed}"'
+        ),
+        doc=doc_url(),
+    )
+
+
+def local_namespace_scope(resolved: Any) -> str:
+    """The warehouse part of a local output's namespace entry (:data:`LOCAL_NAMESPACE_ALLOWLIST_ENV`)."""
+    return str(resolved.warehouse or CATALOG)
+
+
+def local_namespace_listed(scope: str, namespace: str, environ: Any = None) -> bool:
+    """Whether the operator lets a local run write tables in ``scope``'s ``namespace``."""
+    env = os.environ if environ is None else environ
+    levels = namespace.split(".")
+    for entry in (env.get(LOCAL_NAMESPACE_ALLOWLIST_ENV) or "").split(","):
+        where, _, prefix = entry.strip().partition("/")
+        wanted = prefix.split(".") if prefix else []
+        if where == scope and wanted and all(wanted) and levels[: len(wanted)] == wanted:
+            return True
+    return False
+
+
+def _refuse_unless_namespace_listed(
+    bid: Any, scope: str, namespace: str, tables: list[str], environ: Any
+) -> None:
+    """A local run creates its tables ``IF NOT EXISTS`` in the operator's catalog, so a
+    table that exists is adopted and appended to: the namespace must be the operator's
+    choice, never the contract's (a product-id table property would be the contract's)."""
+    from fluid_build._errors import doc_url
+    from fluid_build.spark.policy import SparkPolicyError
+
+    if local_namespace_listed(scope, namespace, environ):
+        return
+    env = os.environ if environ is None else environ
+    listed = ",".join(
+        [
+            *(e.strip() for e in (env.get(LOCAL_NAMESPACE_ALLOWLIST_ENV) or "").split(",")),
+            f"{scope}/{namespace}",
+        ]
+    ).lstrip(",")
+    raise SparkPolicyError(
+        what=f"Spark build {bid!r} writes a namespace the operator has not listed",
+        why=(
+            f"A local run writes {', '.join(tables)} in namespace {namespace} of "
+            f"{scope}, which {LOCAL_NAMESPACE_ALLOWLIST_ENV} does not list (as "
+            f"{scope}/{namespace}). It creates its tables IF NOT EXISTS, so a table that "
+            "exists, another team's included, would be adopted and appended to. An unset "
+            "list allows none."
+        ),
+        fix=(
+            "If this namespace is the product's, have the operator list it in the OPERATOR "
+            f'environment (not a project .env): export {LOCAL_NAMESPACE_ALLOWLIST_ENV}="{listed}"'
         ),
         doc=doc_url(),
     )
@@ -859,6 +919,13 @@ def compile_job_config(
     }
     if dead_letters is not None:
         _add_dead_letters(config, dead_letters, masked=bool(masked))
+    if local and host_gate:
+        tables = [f"{database}.{table}"]
+        if dead_letters is not None and dead_letters.get("table"):
+            tables.append(str(dead_letters["table"]))
+        _refuse_unless_namespace_listed(
+            bid, local_namespace_scope(resolved), database, tables, environ
+        )
     return SparkJob(config)
 
 
@@ -973,6 +1040,29 @@ def validation_errors(contract: Mapping[str, Any]) -> list[str]:
     return errors
 
 
+def _local_namespace(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Optional[tuple]:
+    """``(scope, namespace)`` a ``runtime: local`` build writes, or None (another runtime,
+    or an output :func:`validation_errors` reports)."""
+    if (spark_parameters(build) or {}).get("runtime") != LOCAL_RUNTIME:
+        return None
+    outputs = build.get("outputs")
+    targets = [
+        e
+        for e in contract.get("exposes") or []
+        if isinstance(e, Mapping) and isinstance(outputs, list) and e.get("exposeId") in outputs
+    ]
+    if len(targets) != 1 or not isinstance(targets[0].get("binding"), Mapping):
+        return None
+    try:
+        resolved = resolve_iceberg_catalog(targets[0]["binding"])
+    except (ValueError, KeyError, TypeError):
+        return None
+    parts = str(resolved.fq_table).split(".")
+    if len(parts) != 2:
+        return None
+    return local_namespace_scope(resolved), parts[0]
+
+
 def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
     """The operator entries a Spark build lacks, which ``fluid validate`` warns about.
 
@@ -997,6 +1087,13 @@ def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
         sql_warning = contract_sql_warning(CONTRACT_SQL_ALLOWLIST_ENV, contract, build)
         if sql_warning:
             warnings.append(sql_warning)
+        namespace = _local_namespace(contract, build)
+        if namespace is not None and not local_namespace_listed(*namespace):
+            warnings.append(
+                f"Build {build.get('id')}: not in {LOCAL_NAMESPACE_ALLOWLIST_ENV}: "
+                f"{namespace[0]}/{namespace[1]}; the local run is refused until the operator "
+                "lists it"
+            )
         stream = props.get("stream")
         if not isinstance(stream, Mapping):
             continue
