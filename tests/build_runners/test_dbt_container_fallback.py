@@ -133,6 +133,23 @@ class TestAdapterName:
         # "core" and "latest" are Core: lines, not plugins.
         assert _dbt_command_supports_adapter("/venv/bin/dbt", "latest") is False
 
+    @pytest.mark.parametrize(
+        "build, plugin",
+        [
+            (
+                {"engine": "dbt-core", "execution": {"runtime": {"platform": "snowflake"}}},
+                "snowflake",
+            ),
+            ({"engine": "dbt-core"}, None),
+            ({"engine": "dbt", "execution": {"runtime": {"platform": "aws-athena"}}}, "athena"),
+            ({"engine": "dbt", "execution": {"runtime": {"platform": "glue"}}}, "glue"),
+            ({"engine": "dbt", "execution": {"runtime": {"platform": "postgresql"}}}, "postgres"),
+            ({"engine": "dbt", "execution": "aws"}, None),
+        ],
+    )
+    def test_an_engine_without_an_adapter_reads_the_platform(self, build, plugin) -> None:
+        assert _infer_dbt_adapter(build) == plugin
+
     def test_a_local_dbt_with_the_plugin_runs_the_build(self, tmp_path: Path, monkeypatch) -> None:
         _local_dbt(monkeypatch, CORE_WITH_ATHENA)
         project = _project(tmp_path, _athena_output(aws_profile_name="fluid-demo"))
@@ -182,11 +199,31 @@ class TestContainerCommand:
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "example-secret-never-in-argv")
         monkeypatch.setenv("AWS_PROFILE", "fluid-demo")
         monkeypatch.setenv("AWS_CONFIG_FILE", "/Users/someone/.aws/config")
+        monkeypatch.setenv("AWS_CA_BUNDLE", "/etc/ssl/corp.pem")
+        monkeypatch.setenv("AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/token")
         cmd = self._command(tmp_path, "athena")
         passed = {cmd[i + 1] for i, part in enumerate(cmd) if part == "-e"}
         assert {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} <= passed
-        assert not passed & {"AWS_PROFILE", "AWS_CONFIG_FILE"}
+        host_only = {
+            "AWS_PROFILE",
+            "AWS_CONFIG_FILE",
+            "AWS_CA_BUNDLE",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+        }
+        assert not passed & host_only
         assert "example-secret-never-in-argv" not in " ".join(cmd)
+
+    def test_pip_reads_no_setting_a_project_could_choose(self, tmp_path, monkeypatch) -> None:
+        exports = {"PIP_INDEX_URL": "https://index.example/simple", "PIP_EXTRA_INDEX_URL": "x"}
+        monkeypatch.setattr(
+            "fluid_build.credentials.dotenv_store.project_exports", lambda *_a, **_k: exports
+        )
+        cmd = self._command(tmp_path, "athena")
+        passed = {cmd[i + 1] for i, part in enumerate(cmd) if part == "-e"}
+        assert not [name for name in passed if name.startswith("PIP_")]
+        script = shlex.split(cmd[-1].split("&&")[0])
+        assert "--isolated" in script
+        assert script[script.index("--index-url") + 1] == "https://pypi.org/simple"
 
     def test_an_adapter_without_a_pin_is_refused(self, tmp_path: Path) -> None:
         with pytest.raises(RuntimeError, match="no pinned package for the dbt adapter 'glue'"):
@@ -255,15 +292,60 @@ class TestAwsCredentials:
         with pytest.raises(RuntimeError) as exc:
             build_dbt_command({"engine": "dbt-athena-community"}, project)
         text = str(exc.value)
-        assert "names the AWS profile 'fluid-demo'" in text
+        assert "names an AWS profile (aws_profile_name)" in text
         assert "pip install 'dbt-athena-community==1.11.1'" in text
-        assert "aws configure export-credentials" in text
+        assert "aws configure export-credentials --profile <that profile> --format env" in text
+        assert "unset AWS_PROFILE" in text
+        # The value may be a template resolved from the environment: never printed.
+        assert "fluid-demo" not in text
 
     def test_no_keys_is_refused(self, tmp_path, monkeypatch) -> None:
         self._container(monkeypatch)
         project = _project(tmp_path, _athena_output())
-        with pytest.raises(RuntimeError, match="no AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"):
+        with pytest.raises(RuntimeError, match="neither the environment nor the dbt profile"):
             build_dbt_command({"engine": "dbt-athena-community"}, project)
+
+    @pytest.mark.parametrize(
+        "output, env",
+        [
+            ({"aws_access_key_id": "AKIAEXAMPLEKEYID0000", "aws_secret_access_key": "x"}, {}),
+            ({}, {"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/run"}),
+            ({"aws_profile_name": "{{ env_var('LAKE_PROFILE', '') }}"}, {"KEYS": "1"}),
+            ({"aws_profile_name": "{{ 'x' if false }}"}, {"KEYS": "1"}),
+        ],
+        ids=["keys-in-profile", "ecs-endpoint", "env-var-unset", "other-template"],
+    )
+    def test_credentials_the_container_has_are_enough(self, tmp_path, monkeypatch, output, env):
+        self._container(monkeypatch)
+        for name, value in env.items():
+            if name == "KEYS":
+                monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEKEYID0000")
+                monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "example")
+            else:
+                monkeypatch.setenv(name, value)
+        project = _project(tmp_path, _athena_output(**output))
+        assert build_dbt_command({"engine": "dbt-athena-community"}, project)[0] == "docker"
+
+    def test_keys_from_the_project_env_file_reach_the_container(self, tmp_path, monkeypatch):
+        self._container(monkeypatch)
+        exports = {"AWS_ACCESS_KEY_ID": "AKIAEXAMPLEKEYID0000", "AWS_SECRET_ACCESS_KEY": "x"}
+        monkeypatch.setattr(
+            "fluid_build.credentials.dotenv_store.project_exports", lambda *_a, **_k: exports
+        )
+        project = _project(tmp_path, _athena_output())
+        assert build_dbt_command({"engine": "dbt-athena-community"}, project)[0] == "docker"
+
+    def test_a_rendered_env_var_profile_is_refused(self, tmp_path, monkeypatch) -> None:
+        self._container(monkeypatch)
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEKEYID0000")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "example")
+        monkeypatch.setenv("LAKE_PROFILE", "secret-looking-name")
+        output = _athena_output(aws_profile_name="{{ env_var('LAKE_PROFILE') }}")
+        project = _project(tmp_path, output)
+        with pytest.raises(RuntimeError) as exc:
+            build_dbt_command({"engine": "dbt-athena-community"}, project)
+        assert "names an AWS profile (aws_profile_name)" in str(exc.value)
+        assert "secret-looking-name" not in str(exc.value)
 
     def test_keys_in_the_environment_run_in_the_container(self, tmp_path, monkeypatch) -> None:
         self._container(monkeypatch)
@@ -283,7 +365,7 @@ class TestAwsCredentials:
         (project / "profiles.yml").write_text(yaml.safe_dump(profiles), "utf-8")
         assert build_dbt_command({"engine": "dbt-athena-community"}, project)[0] == "docker"
         monkeypatch.setenv("DBT_TARGET", "laptop")
-        with pytest.raises(RuntimeError, match="names the AWS profile 'mine'"):
+        with pytest.raises(RuntimeError, match=r"names an AWS profile \(aws_profile_name\)"):
             build_dbt_command({"engine": "dbt-athena-community"}, project)
 
     def test_redshift_with_a_password_needs_no_keys(self, tmp_path, monkeypatch) -> None:
@@ -294,8 +376,12 @@ class TestAwsCredentials:
     @pytest.mark.parametrize(
         "output, match",
         [
-            ({"method": "iam"}, "no AWS_ACCESS_KEY_ID"),
-            ({"method": "iam", "iam_profile": "warehouse"}, "names the AWS profile 'warehouse'"),
+            ({"method": "iam"}, "neither the environment"),
+            ({"method": "iam_role"}, "neither the environment"),
+            (
+                {"method": "iam", "iam_profile": "warehouse"},
+                r"names an AWS profile \(iam_profile\)",
+            ),
         ],
     )
     def test_redshift_iam_is_refused_without_keys(self, tmp_path, monkeypatch, output, match):
@@ -308,3 +394,23 @@ class TestAwsCredentials:
         _local_dbt(monkeypatch, CORE_WITH_ATHENA)
         project = _project(tmp_path, {"type": "snowflake", "account": "a"})
         assert build_dbt_command({"engine": "dbt-snowflake"}, project)[0] == "docker"
+
+
+class TestProfileRead:
+    @pytest.mark.parametrize(
+        "document",
+        [
+            {"lake": {"target": ["dev"], "outputs": {"dev": {"type": "athena"}}}},
+            {"lake": {"target": {"a": 1}, "outputs": {"dev": {"type": "athena"}}}},
+            {"lake": {"target": "dev", "outputs": ["dev"]}},
+            ["lake"],
+        ],
+    )
+    def test_a_profile_of_another_shape_is_unknown(self, tmp_path: Path, document) -> None:
+        (tmp_path / "profiles.yml").write_text(yaml.safe_dump(document), "utf-8")
+        assert runner._profile_output(tmp_path, "lake", None) == {}
+        assert runner._profile_output(tmp_path, ["lake"], ["dev"]) == {}  # type: ignore[arg-type]
+
+    def test_a_deeply_nested_profile_is_unknown(self, tmp_path: Path) -> None:
+        (tmp_path / "profiles.yml").write_text("[" * 5000 + "]" * 5000, "utf-8")
+        assert runner._profile_output(tmp_path, "lake", None) == {}

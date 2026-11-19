@@ -524,6 +524,22 @@ def continuous_trigger_warnings(contract: Dict[str, Any]) -> List[str]:
     return warnings
 
 
+def leave_to_its_scheduler(build_id: Any, trigger_type: str, cron: Any) -> int:
+    """Say a build is left to what starts it (a scheduler or an event); return 0.
+
+    Only a caller that did not ask to run it gets here: ``fluid apply`` runs a
+    build of every :data:`SCHEDULER_TRIGGER_TYPES` type once.
+    """
+    if cron:
+        cprint(f"   Cron: {cron}")
+    cprint(
+        f"   ⏭️  Not run here: a scheduler or an event starts a trigger.type {trigger_type} "
+        f"build; fluid apply --build-id {build_id} runs it now."
+    )
+    cprint(f"{'=' * 80}")
+    return 0
+
+
 def unknown_trigger(trigger_type: str) -> int:
     """Say a batch runner does not know ``trigger.type``; return exit code 1.
 

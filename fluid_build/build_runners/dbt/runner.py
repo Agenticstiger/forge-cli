@@ -45,6 +45,7 @@ from ..base import (
     SENSITIVE_ENV_KEY_RE,
     _print_typed_error,
     _resolve_env_placeholders,
+    leave_to_its_scheduler,
     refuse_continuous_trigger,
     unknown_trigger,
 )
@@ -287,24 +288,39 @@ def build_selectors(build: Dict[str, Any]) -> List[str]:
 _ADAPTER_PLUGIN_NAMES = {"athena-community": "athena"}
 
 
+#: The adapter each ``execution.runtime.platform`` gets a profile for
+#: (``profiles.py``), for an engine that names no adapter (``dbt``, ``dbt-core``).
+_PLATFORM_ADAPTERS = {
+    "snowflake": "snowflake",
+    "bigquery": "bigquery",
+    "gcp": "bigquery",
+    "duckdb": "duckdb",
+    "redshift": "redshift",
+    "aws": "redshift",
+    "postgres": "postgres",
+    "postgresql": "postgres",
+    "spark": "spark",
+    "athena": "athena",
+    "aws-athena": "athena",
+    "glue": "glue",
+    "aws-glue": "glue",
+    "databricks": "databricks",
+}
+
+
 def _infer_dbt_adapter(build: Dict[str, Any]) -> Optional[str]:
     """The dbt plugin name a build needs (``athena`` for ``dbt-athena-community``)."""
     engine = str(build.get("engine") or "").strip().lower()
-    if engine.startswith("dbt-") and len(engine) > 4:
+    # ``dbt-core`` names dbt itself, not an adapter: its platform says which.
+    if engine.startswith("dbt-") and len(engine) > 4 and engine != "dbt-core":
         name = engine[4:]
         # An import package spells a distribution's ``-`` as ``_``.
         return _ADAPTER_PLUGIN_NAMES.get(name, name.replace("-", "_"))
 
-    execution = build.get("execution") or {}
-    runtime = execution.get("runtime") or {}
-    platform = str(runtime.get("platform") or "").strip().lower()
-    if platform in {"snowflake", "bigquery", "duckdb", "redshift", "postgres", "spark"}:
-        return platform
-    if platform == "gcp":
-        return "bigquery"
-    if platform == "aws":
-        return "redshift"
-    return None
+    execution = build.get("execution")
+    runtime = execution.get("runtime") if isinstance(execution, dict) else None
+    platform = runtime.get("platform") if isinstance(runtime, dict) else None
+    return _PLATFORM_ADAPTERS.get(str(platform or "").strip().lower())
 
 
 # ── dbt engine detection (Python dbt-core v1 vs Fusion / dbt Core v2) ─────
@@ -585,8 +601,9 @@ _IMAGE_REF = r"[a-z0-9][a-z0-9._/:-]*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?"
 #: The same, pinned by digest: ``...@sha256:<digest>``.
 _DIGEST_IMAGE_RE = re.compile(_IMAGE_REF + r"@sha256:[0-9a-f]{64}")
 
-#: What the fallback installs, pinned exactly: dbt-core and one adapter per plugin
-#: name. Resolved on pypi.org on 2026-11-19: each adapter's dbt-core, dbt-adapters
+#: The top-level packages the fallback installs, pinned exactly: dbt-core and one
+#: adapter per plugin name (their dependencies resolve within these packages' own
+#: ranges; nothing is hash-locked). Resolved on pypi.org on 2026-11-19: each adapter's dbt-core, dbt-adapters
 #: and dbt-common ranges hold dbt-core 1.11.17, and every set resolves from wheels
 #: alone for CPython 3.12 on Linux x86_64 and aarch64 (dbt-core 1.12 needs
 #: dbt-core-experimental-parser, published as an sdist only). dbt-athena-community
@@ -616,9 +633,32 @@ _EXACT_PIN_RE = re.compile(
 _AWS_ADAPTERS = frozenset({"athena", "glue", "redshift"})
 
 #: Host AWS settings that name a profile or a file the container does not have.
-#: Forwarded, they make boto3 in the container look for that profile and fail.
+#: Forwarded, they make boto3 in the container look for that profile or file and fail.
 _HOST_ONLY_AWS_ENV = frozenset(
-    {"AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE"}
+    {
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_CA_BUNDLE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    }
+)
+
+#: The AWS settings that give boto3 in the container credentials it can use: keys,
+#: or the container credentials endpoint (ECS), which it reaches over the network.
+_CONTAINER_AWS_CREDENTIALS = (
+    ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"),
+    ("AWS_CONTAINER_CREDENTIALS_FULL_URI",),
+    ("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",),
+)
+
+#: ``{{ env_var('NAME') }}`` or ``{{ env_var('NAME', 'default') }}``, the one template
+#: an AWS profile name is commonly written as.
+_ENV_VAR_TEMPLATE_RE = re.compile(
+    r"\{\{\s*env_var\(\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*"
+    r"(?:,\s*['\"]([^'\"]*)['\"]\s*)?\)\s*\}\}"
 )
 
 
@@ -651,7 +691,7 @@ def _container_packages(adapter: str) -> List[str]:
     ``DBT_ADAPTER_PACKAGE`` replaces the adapter's pin: one or more exact
     requirements (``dbt-glue==1.12.4``), with :data:`DBT_CORE_PIN` added unless
     it names dbt-core itself. An adapter without a pin is refused, as is an
-    override that is not an exact pin, so nothing the container runs floats.
+    override that is not an exact pin, so no top-level package floats.
     """
     override = os.getenv("DBT_ADAPTER_PACKAGE")
     if override:
@@ -688,58 +728,105 @@ def _profile_output(
     ``{}`` when it cannot be told (the run then decides)."""
     try:
         document = yaml.safe_load((profiles_dir / "profiles.yml").read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, RecursionError):
         return {}
     if not isinstance(document, dict):
         return {}
     profiles = [k for k in document if k != "config"]
-    name = profile_name or (profiles[0] if len(profiles) == 1 else None)
+    name = profile_name if isinstance(profile_name, str) else None
+    name = name or (profiles[0] if len(profiles) == 1 and isinstance(profiles[0], str) else None)
     profile = document.get(name) if name else None
     outputs = profile.get("outputs") if isinstance(profile, dict) else None
     if not isinstance(outputs, dict):
         return {}
-    target = requested_target if requested_target in outputs else profile.get("target")
-    output = outputs.get(target)
+    requested = requested_target if isinstance(requested_target, str) else None
+    target = requested if requested in outputs else profile.get("target")
+    output = outputs.get(target) if isinstance(target, str) else None
     return output if isinstance(output, dict) else {}
 
 
-def _refuse_unreadable_aws_credentials(adapter: str, output: Dict[str, Any]) -> None:
+def _profile_name_value(value: Any) -> Optional[str]:
+    """The AWS profile a dbt profile's ``aws_profile_name`` / ``iam_profile`` names.
+
+    A literal is itself, and ``{{ env_var('NAME'[, 'default']) }}`` is read as dbt
+    renders it. Any other template is dbt's to render: ``None``, the run decides.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if "{{" not in text and "{%" not in text:
+        return text
+    match = _ENV_VAR_TEMPLATE_RE.fullmatch(text)
+    if match is None:
+        return None
+    return os.getenv(match.group(1), match.group(2) or "").strip() or None
+
+
+def _refuse_unreadable_aws_credentials(
+    adapter: str, output: Dict[str, Any], container_env: Dict[str, str]
+) -> None:
     """Refuse a container run of an AWS adapter that would find no credentials.
 
-    The container reads AWS keys from its environment only: a dbt profile that
-    names an AWS profile (``aws_profile_name``, ``iam_profile``) names one the
-    container does not have, and without ``AWS_ACCESS_KEY_ID`` and
-    ``AWS_SECRET_ACCESS_KEY`` boto3 there has nothing (the host's
-    ``credential_process``, SSO or ``~/.aws`` never reach it). Refused before
-    ``docker`` starts, with the two ways out.
+    boto3 in the container has only what reaches it: the keys or the container
+    credentials endpoint in ``container_env`` (what ``docker run -e`` passes),
+    and keys written in the dbt profile itself. A dbt profile that names an AWS
+    profile (``aws_profile_name``, ``iam_profile``) names one the container does
+    not have, and the host's ``credential_process``, SSO, instance role or
+    ``~/.aws`` never reach it. Refused before ``docker`` starts, with the two ways
+    out; the message names the profile's field, never its value.
     """
     if adapter not in _AWS_ADAPTERS:
         return
-    named = next(
+    field = next(
         (
-            str(output[key])
+            key
             for key in ("aws_profile_name", "iam_profile")
-            if isinstance(output.get(key), str) and output[key].strip()
+            if _profile_name_value(output.get(key))
         ),
         None,
     )
-    needs_keys = adapter != "redshift" or str(output.get("method", "")).lower() == "iam"
-    has_keys = bool(os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"))
-    if named is None and (has_keys or not needs_keys):
-        return
-    reason = (
-        f"the dbt profile names the AWS profile {named!r}, which a container cannot read"
-        if named is not None
-        else "no AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set, and a container "
-        "cannot read the host's AWS profiles"
+    method = str(output.get("method", "")).lower()
+    needs_keys = adapter != "redshift" or method.startswith("iam")
+    has_keys = any(
+        all(container_env.get(name) for name in names) for names in _CONTAINER_AWS_CREDENTIALS
     )
+    has_keys = has_keys or any(
+        output.get(key_id) and output.get(secret)
+        for key_id, secret in (
+            ("aws_access_key_id", "aws_secret_access_key"),
+            ("access_key_id", "secret_access_key"),
+        )
+    )
+    if field is None and (has_keys or not needs_keys):
+        return
     package = CONTAINER_ADAPTER_PINS.get(adapter, f"dbt-{adapter}")
+    if field is not None:
+        reason = f"the dbt profile names an AWS profile ({field}), which a container cannot read"
+        keys = (
+            "export that profile's short-lived keys (eval \"$(aws configure export-credentials "
+            '--profile <that profile> --format env)") and run without naming a profile '
+            f"(unset AWS_PROFILE, or drop {field} from the dbt profile)"
+        )
+    else:
+        reason = (
+            "neither the environment nor the dbt profile holds AWS keys, and a container "
+            "cannot read the host's AWS profiles"
+        )
+        keys = 'export short-lived keys (eval "$(aws configure export-credentials --format env)")'
     raise RuntimeError(
         f"the local dbt has no {adapter!r} plugin, so this build would run in a container, "
-        f"and {reason}. Install the adapter next to dbt (pip install '{package}'), or "
-        'export short-lived keys for the run (eval "$(aws configure export-credentials '
-        '--format env)") and unset AWS_PROFILE'
+        f"and {reason}. Install the adapter next to dbt (pip install '{package}'), or {keys}"
     )
+
+
+def _container_env() -> Dict[str, str]:
+    """What the container gets: the dbt environment, without the host-only AWS
+    settings and without pip's (a project .env must not choose the index)."""
+    return {
+        key: value
+        for key, value in _collect_dbt_container_env().items()
+        if key not in _HOST_ONLY_AWS_ENV and not key.startswith("PIP_")
+    }
 
 
 def _build_containerized_dbt_command(
@@ -759,7 +846,7 @@ def _build_containerized_dbt_command(
     # ``-e KEY`` (no ``=value``) tells docker to inherit the value from the current
     # process env. That keeps secrets out of argv (visible via ``ps``) and out of
     # the command-log line printed by ``cprint``.
-    env_keys = sorted(key for key in _collect_dbt_container_env() if key not in _HOST_ONLY_AWS_ENV)
+    env_keys = sorted(_container_env())
     container_args = _rewrite_dbt_args_for_container(args, project_dir, profiles_dir)
 
     cmd = [
@@ -780,9 +867,11 @@ def _build_containerized_dbt_command(
         cmd.extend([image, "dbt", *container_args])
         return cmd
 
-    # Wheels only: an sdist would run its build code at install time.
+    # Wheels only: an sdist would run its build code at install time. ``--isolated``
+    # ignores every PIP_* setting and pip config, so the packages come from PyPI.
     install_and_run = (
-        "python -m pip install --quiet --no-cache-dir --disable-pip-version-check "
+        "python -m pip install --isolated --index-url https://pypi.org/simple "
+        "--quiet --no-cache-dir --disable-pip-version-check "
         "--only-binary=:all: {pkgs} && {dbt_cmd}"
     ).format(
         pkgs=" ".join(shlex.quote(pkg) for pkg in packages),
@@ -881,6 +970,7 @@ def build_dbt_command(
         _refuse_unreadable_aws_credentials(
             adapter,
             _profile_output(profiles_dir or project_dir, profile_name, requested_target),
+            _container_env(),
         )
         # ``--no-partial-parse`` is safe for containers (no persistent parse cache
         # across runs) and avoids stale-cache surprises. Kept off the local path
@@ -1184,8 +1274,10 @@ def execute_dbt_build(
     models to rebuild from scratch).
     """
     build_id = build.get("id", "unknown")
-    execution = build.get("execution", {})
-    trigger = execution.get("trigger", {})
+    execution = build.get("execution")
+    execution = execution if isinstance(execution, dict) else {}
+    trigger = execution.get("trigger")
+    trigger = trigger if isinstance(trigger, dict) else {}
     trigger_type = trigger_type_of(build)
     # A scheduler decides when such a build runs; fluid apply runs it once.
     scheduled = trigger_type in SCHEDULER_TRIGGER_TYPES
@@ -1202,6 +1294,9 @@ def execute_dbt_build(
     # running, and a dbt run ends: refused before a profile is prepared.
     if is_continuous_build(build):
         return refuse_continuous_trigger("dbt builds as batch runs, which end")
+    # Left to its scheduler: nothing to prepare, and nothing to refuse.
+    if scheduled and not force_run:
+        return leave_to_its_scheduler(build_id, trigger_type, trigger.get("cron"))
 
     _check_bound_project(str(build_id), project_dir)
 
@@ -1327,15 +1422,5 @@ def execute_dbt_build(
         finally:
             if temp_profiles_dir:
                 temp_profiles_dir.cleanup()
-
-    if scheduled:
-        if trigger.get("cron"):
-            cprint(f"   Cron: {trigger.get('cron')}")
-        cprint(
-            f"   ⏭️  Not run here: trigger.type {trigger_type} means a scheduler starts "
-            "this build (fluid generate schedule renders its DAG), and fluid apply runs it."
-        )
-        cprint(f"{'=' * 80}")
-        return 0
 
     return unknown_trigger(trigger_type)

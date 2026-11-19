@@ -30,7 +30,7 @@ from fluid_build.util.contract import (
 )
 
 from .._path_safety import confine_to_workspace, resolve_workspace_root
-from ..base import refuse_continuous_trigger, unknown_trigger
+from ..base import leave_to_its_scheduler, refuse_continuous_trigger, unknown_trigger
 
 LOG = logging.getLogger("fluid.build_runners.python")
 
@@ -82,8 +82,10 @@ def execute_build(
 ) -> int:
     """Execute a single build"""
     build_id = build.get("id", "unknown")
-    execution = build.get("execution", {})
-    trigger = execution.get("trigger", {})
+    execution = build.get("execution")
+    execution = execution if isinstance(execution, dict) else {}
+    trigger = execution.get("trigger")
+    trigger = trigger if isinstance(trigger, dict) else {}
     trigger_type = trigger_type_of(build)
     # A scheduler decides when such a build runs; fluid apply runs it once.
     scheduled = trigger_type in SCHEDULER_TRIGGER_TYPES
@@ -186,14 +188,7 @@ def execute_build(
         return 0 if failed_runs == 0 else 1
 
     elif scheduled:
-        if trigger.get("cron"):
-            cprint(f"   Cron: {trigger.get('cron')}")
-        cprint(
-            f"   ⏭️  Not run here: trigger.type {trigger_type} means a scheduler starts "
-            "this build (fluid generate schedule renders its DAG), and fluid apply runs it."
-        )
-        cprint(f"{'=' * 80}")
-        return 0
+        return leave_to_its_scheduler(build_id, trigger_type, trigger.get("cron"))
 
     else:
         return unknown_trigger(trigger_type)

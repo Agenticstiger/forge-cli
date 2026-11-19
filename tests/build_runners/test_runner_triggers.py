@@ -3,12 +3,13 @@
 
 """``fluid apply`` runs a build whatever its ``execution.trigger.type``.
 
-``fluid generate schedule`` renders a DAG whose task is ``fluid apply
---build-id <id>`` for every type a scheduler or an event starts (schema 0.7.7),
-so the dbt and python runners run such a build once when apply asks
-(``force_run``), and leave it to its scheduler otherwise. ``manual`` keeps its
-iterations; ``continuous`` stays refused; a type the schema does not name is an
-error naming the ones it does.
+``fluid generate schedule`` renders a DAG whose task is ``fluid apply --build-id
+<id>`` for ``schedule``, ``dataset`` and ``schedule_and_dataset`` builds, and an
+event or another scheduler starts the other types the schema allows. The dbt and
+python runners run a build of every such type once when apply asks
+(``force_run``), and leave it to what starts it otherwise, preparing nothing.
+``manual`` keeps its iterations; ``continuous`` stays refused; a type the schema
+does not name, a non-string one included, is an error naming the ones it does.
 """
 
 from __future__ import annotations
@@ -70,7 +71,14 @@ def test_the_set_is_every_schema_type_but_manual_and_continuous() -> None:
 
 @pytest.mark.parametrize(
     "trigger, expected",
-    [({}, "manual"), ({"type": " Dataset "}, "dataset"), ({"type": None}, "manual")],
+    [
+        ({}, "manual"),
+        ({"type": " Dataset "}, "dataset"),
+        ({"type": None}, "manual"),
+        ({"type": 5}, "5"),
+        ({"type": ["schedule"]}, "['schedule']"),
+        ({"type": ""}, ""),
+    ],
 )
 def test_the_type_is_read_lower_cased(trigger: Dict[str, Any], expected: str) -> None:
     assert trigger_type_of({"execution": {"trigger": trigger}}) == expected
@@ -98,7 +106,37 @@ class TestDbtRunner:
         rc = dbt_runner.execute_dbt_build(_build({"type": kind}), tmp_path, tmp_path, delay=0)
         assert rc == 0
         assert dbt_runs == []
-        assert f"trigger.type {kind} means a scheduler starts this build" in _out(capsys)
+        assert f"a scheduler or an event starts a trigger.type {kind} build" in _out(capsys)
+
+    def test_a_build_left_to_its_scheduler_is_not_prepared(
+        self, tmp_path: Path, dbt_runs: List[List[str]], monkeypatch
+    ) -> None:
+        def _not_prepared(*_args: Any) -> Any:
+            raise AssertionError("a build left to its scheduler needs no profile")
+
+        monkeypatch.setattr(dbt_runner, "resolve_dbt_profiles_dir", _not_prepared)
+        rc = dbt_runner.execute_dbt_build(_build({"type": "dataset"}), tmp_path, tmp_path)
+        assert rc == 0
+        assert dbt_runs == []
+
+    @pytest.mark.parametrize("kind", [5, ["schedule"], ""])
+    def test_a_type_that_is_no_name_is_refused(
+        self, kind: Any, tmp_path: Path, dbt_runs: List[List[str]], capsys
+    ) -> None:
+        rc = dbt_runner.execute_dbt_build(
+            _build({"type": kind}), tmp_path, tmp_path, force_run=True
+        )
+        assert rc == 1
+        assert dbt_runs == []
+        assert "Unknown trigger type" in _out(capsys)
+
+    @pytest.mark.parametrize("trigger", [None, "manual"])
+    def test_a_trigger_that_is_no_mapping_runs_as_manual(
+        self, trigger: Any, tmp_path: Path, dbt_runs: List[List[str]]
+    ) -> None:
+        build = {"id": "b", "engine": "dbt-duckdb", "execution": {"trigger": trigger}}
+        assert dbt_runner.execute_dbt_build(build, tmp_path, tmp_path, delay=0) == 0
+        assert dbt_runs == [["dbt", "build"]]
 
     def test_manual_keeps_its_iterations(self, tmp_path: Path, dbt_runs: List[List[str]]) -> None:
         build = _build({"type": "manual", "iterations": 2, "delaySeconds": 0})
@@ -145,4 +183,4 @@ class TestPythonRunner:
         monkeypatch.setattr(python_runner.subprocess, "run", _not_run)
         build = {"id": "py", "execution": {"trigger": {"type": "event"}}}
         assert python_runner.execute_build(build, script, tmp_path) == 0
-        assert "trigger.type event means a scheduler starts this build" in _out(capsys)
+        assert "a scheduler or an event starts a trigger.type event build" in _out(capsys)
