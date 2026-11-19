@@ -215,7 +215,12 @@ def _last_end(history: Sequence[RunInfo]) -> Optional[RunInfo]:
     started while the next older run of its config was still going (a second copy forge
     cancelled, or one cancelled by hand), so a death of that older run after it is not read
     as a cancel. A cancelled restart of that older run (``restart_of``) started after it
-    ended: its cancel is the stream's end."""
+    ended: its cancel is the stream's end.
+
+    Every run forge starts after another one of its config ended carries ``restart_of``,
+    except a start after a cancel (the older run is then a cancel too). A run of this config
+    started outside forge after the older one ended, then cancelled, is passed over as well:
+    runs carry no end time here to tell it apart."""
     for index, info in enumerate(history):
         if info.state == CANCELLED:
             older = next(
@@ -617,7 +622,7 @@ def _start(
         out.error = True
         out.message = (
             f"{start.message + '; ' if start.message else ''}run {run_id} was started, but "
-            f"reading it failed: {_error_text(exc)}. It is left going, and the next "
+            f"checking on it failed: {_error_text(exc)}. It is left going, and the next "
             "reconcile reports it"
         )
         return out
@@ -626,7 +631,7 @@ def _start(
     if started.state in TERMINAL:
         # A long-running job that ends at once failed, whatever it reports.
         out.error = True
-        out.message = _failure_text(started)
+        out.message = f"{start.message + '; ' if start.message else ''}{_failure_text(started)}"
     elif started.state == PENDING:
         out.message = (
             f"{start.message + '; ' if start.message else ''}still starting after "

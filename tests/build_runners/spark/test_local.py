@@ -742,7 +742,8 @@ def test_a_failed_stream_restarts_within_its_budget_then_says_how_to_retry_it_he
     (first,) = runs.runs()
     wait_for(lambda: runs.get(first.run_id), lambda i: i.state == FAILED)
     (again,) = rc.reconcile([run], local_host=failing)
-    assert (again.action, again.error) == ("restarted", False), again.message
+    # The stub fails at once: the outcome is an error when the reconcile already saw it end.
+    assert again.action == "restarted", again.message
     assert "the stream failed" in again.message and "restart 1 of 1" in again.message
     wait_for(lambda: runs.get(again.run_id), lambda i: i.state == FAILED)
     (spent,) = rc.reconcile([run], local_host=host, only=True)

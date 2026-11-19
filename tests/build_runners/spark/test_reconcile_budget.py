@@ -412,7 +412,7 @@ def test_a_read_that_fails_after_the_start_still_names_the_run_that_is_going(ec2
     use(fake)
     out = go(ec2, clock)
     assert (out.action, out.run_id, out.error) == ("restarted", "new", True)
-    assert "run new was started, but reading it failed: ThrottlingException" in out.message
+    assert "run new was started, but checking on it failed: ThrottlingException" in out.message
     assert "It is left going" in out.message
 
 
@@ -434,3 +434,11 @@ def test_a_cancel_that_fails_names_what_was_already_cancelled(ec2, clock, use):
     out = go(ec2, clock)
     assert (out.action, out.error, fake.calls) == ("failed", True, ["cancel s-3"])
     assert "cancelled s-3 before it, and started nothing" in out.message
+
+
+def test_a_restart_that_fails_at_once_keeps_its_restart_count_in_the_outcome(ec2, clock, use):
+    fake = FakeAdapter([died(ec2)], start_states=("FAILED",), start_details="bad conf")
+    use(fake)
+    out = go(ec2, clock)
+    assert (out.action, out.error, out.run_id) == ("restarted", True, "new")
+    assert "restart 1 of 5 allowed per rolling hour" in out.message and "bad conf" in out.message
