@@ -22,6 +22,7 @@ from fluid_build.forge.core.apply_modes import (
     full_refresh_required,
     is_destructive,
     is_dry_run,
+    is_reconcile,
     needs_build,
     parse_mode,
 )
@@ -32,15 +33,16 @@ from fluid_build.forge.core.apply_modes import (
 
 
 class TestApplyMode:
-    def test_six_canonical_modes(self):
-        """Plan Part 1 specifies exactly six modes. Regression guard — if
-        someone adds a seventh without updating the matrix docstring, this
-        test fires first."""
-        assert len(list(ApplyMode)) == 6
+    def test_six_deploy_modes_and_reconcile(self):
+        """Plan Part 1 specifies exactly six deploy modes, and ``reconcile``
+        deploys nothing. Regression guard — if someone adds another without
+        updating the matrix docstring, this test fires first."""
+        assert len(list(ApplyMode)) == 7
 
     def test_canonical_choices_order(self):
         """Order is least-destructive → most-destructive, matching the
-        argparse ``choices=`` list operators see in ``--help``."""
+        argparse ``choices=`` list operators see in ``--help``, then
+        ``reconcile``, which deploys nothing."""
         assert CANONICAL_CHOICES == [
             "dry-run",
             "create-only",
@@ -48,7 +50,17 @@ class TestApplyMode:
             "amend-and-build",
             "replace",
             "replace-and-build",
+            "reconcile",
         ]
+
+    def test_reconcile_deploys_nothing(self):
+        """``reconcile`` is neither destructive nor a build mode nor a dry
+        run: it only restarts streams that died (cli/_spark_apply.py)."""
+        assert is_reconcile(ApplyMode.RECONCILE)
+        assert not is_destructive(ApplyMode.RECONCILE)
+        assert not needs_build(ApplyMode.RECONCILE)
+        assert not is_dry_run(ApplyMode.RECONCILE)
+        assert not any(is_reconcile(m) for m in ApplyMode if m is not ApplyMode.RECONCILE)
 
     def test_default_is_amend(self):
         """Default mode is ``amend`` — additive schema evolution, data

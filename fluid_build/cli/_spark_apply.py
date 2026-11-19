@@ -9,6 +9,9 @@ which ``planDigest`` covers. ``fluid apply`` compiles the runs before ``tofu app
 boto3, so nothing is provisioned that could not then be started; after a ``tofu apply`` that
 succeeded it reconciles the streaming jobs (:func:`reconcile_after_apply`).
 
+``fluid apply --mode reconcile`` reconciles the streams alone (:func:`reconcile_only`): no
+``tofu``, no plan, and a stream starts again only with the config the last apply deployed.
+
 A build of ``runtime: local`` runs on the machine ``fluid apply`` runs on, with nothing for
 OpenTofu to provision: the native engine (outputs on ``platform: local``) reconciles it the
 same way, and :func:`refuse_without_opentofu` refuses only the AWS runtimes there.
@@ -246,6 +249,78 @@ def reconcile_after_apply(
 
     outcomes = reconcile(
         runs, dry_run=False, clients=clients, local_host=host, stop_removed_of=stop_removed_of
+    )
+    for out in outcomes:
+        cprint(out.line(), markup=False)
+        logger.info("spark_reconcile", extra={"spark": out.as_dict()})
+    return 1 if any(o.error for o in outcomes) else 0
+
+
+def reconcile_only(
+    contract: Mapping[str, Any],
+    logger: logging.Logger,
+    *,
+    build_id: Optional[str],
+    dry_run: bool,
+    workspace: Optional[Path] = None,
+    confirm: Any = None,
+    clients: Any = None,
+) -> int:
+    """``fluid apply --mode reconcile``: keep the always-on Spark streams running (with
+    ``build_id``, that one stream); 1 when any build is an error.
+
+    A stream that died is started again on its checkpoint, within its restart budget, when
+    what the last apply deployed is what the contract compiles to; anything else (drift, a
+    spent budget, nothing deployed) starts nothing and is an error naming what to run. It
+    runs no ``tofu``, cancels only a second copy of a running config, and never stops a
+    removed build (a full ``fluid apply`` does). ``dry_run`` reads the same state and
+    starts nothing.
+
+    Raises:
+        CLIError: ``apply_reconcile_not_a_stream`` (``build_id`` is not an always-on forge
+            Spark stream), ``apply_spark_invalid`` / ``apply_spark_refused``,
+            ``apply_spark_local_unavailable``, ``apply_aws_sdk_missing``.
+    """
+    from fluid_build.build_runners.spark._local import LocalHost
+    from fluid_build.build_runners.spark._reconcile import reconcile
+    from fluid_build.cli.console import cprint
+
+    runs = _desired(contract, "apply_spark", build_id=build_id) if _has_spark(contract) else []
+    if build_id and not runs:
+        raise _cli_error(
+            "apply_reconcile_not_a_stream",
+            {
+                "build_id": build_id,
+                "error": f"build {build_id} is not a forge Spark build (engine: spark with "
+                "properties.parameters.spark, fluidVersion 0.7.7 or later), and --mode "
+                "reconcile keeps those streams running; nothing was started",
+                "hint": "Name an always-on Spark stream, or run fluid apply for the rest.",
+            },
+        )
+    if build_id and runs[0].scheduled:
+        raise _cli_error(
+            "apply_reconcile_not_a_stream",
+            {
+                "build_id": build_id,
+                "error": f"Spark build {build_id} runs to completion (a batch, or a stream "
+                "triggered availableNow): its scheduler runs it with fluid apply --mode "
+                f"amend-and-build --build-id {build_id}, and --mode reconcile keeps only "
+                "always-on streams running; nothing was started",
+                "hint": "Regenerate the schedule (fluid generate schedule) so no keepalive "
+                "runs for it.",
+            },
+        )
+    runs = [r for r in runs if not r.scheduled]
+    if not runs:
+        cprint("No always-on Spark stream in the contract: nothing to reconcile.", markup=False)
+        return 0
+    if any(r.local for r in runs) and not dry_run:
+        _check_local(runs, workspace)
+    if any(not r.local for r in runs):
+        _require_boto3()  # a dry run reads the runs and the deployed job config too
+    host = LocalHost(Path(workspace)) if workspace is not None else None
+    outcomes = reconcile(
+        runs, dry_run=dry_run, only=True, confirm=confirm, clients=clients, local_host=host
     )
     for out in outcomes:
         cprint(out.line(), markup=False)

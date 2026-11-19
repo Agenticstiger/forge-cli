@@ -3,8 +3,9 @@
 
 """Apply-mode matrix for ``fluid apply --mode``.
 
-Six modes express every realistic deploy decision a team makes. Per the
-plan (Part 1):
+Six modes express every realistic deploy decision a team makes, and a
+seventh, ``reconcile``, deploys nothing (below the table). Per the plan
+(Part 1):
 
     ┌──────────────────────┬───────────────────────┬────────────┬───────────────────┐
     │ Mode                 │ DDL                   │ DML        │ Existing data     │
@@ -23,6 +24,12 @@ plan (Part 1):
     │                      │                       │ --full     │ rebuilt           │
     └──────────────────────┴───────────────────────┴────────────┴───────────────────┘
 
+``reconcile`` runs no DDL, no ``tofu`` and no build, and takes no plan: it
+keeps the contract's always-on Spark streams running with the config the
+last apply deployed, starting a stream that died again on its checkpoint
+within its restart budget (``build_runners/spark/_reconcile.py``). It is what
+a keepalive DAG runs, with ``--build-id <stream>``.
+
 Destructive modes (``replace*``) require ``--allow-data-loss`` when the
 environment is not dev OR the target has rows. ``create-only`` hard-fails
 when the target already exists. ``dry-run`` renders DDL but makes zero
@@ -40,8 +47,9 @@ from typing import Optional
 
 
 class ApplyMode(str, Enum):
-    """Six canonical apply modes. Order matches ``--mode`` flag's choice list
-    (least-destructive → most-destructive, then build-augmented variants).
+    """The canonical apply modes. Order matches ``--mode`` flag's choice list
+    (least-destructive → most-destructive, then build-augmented variants),
+    then ``reconcile``, which deploys nothing.
     """
 
     DRY_RUN = "dry-run"
@@ -50,6 +58,7 @@ class ApplyMode(str, Enum):
     AMEND_AND_BUILD = "amend-and-build"
     REPLACE = "replace"
     REPLACE_AND_BUILD = "replace-and-build"
+    RECONCILE = "reconcile"
 
     @classmethod
     def default(cls) -> "ApplyMode":
@@ -84,6 +93,12 @@ def is_dry_run(mode: ApplyMode) -> bool:
     generic ``--dry-run`` flag so ``--mode dry-run`` is unambiguous about
     what's being previewed (DDL only, no DML/build)."""
     return mode is ApplyMode.DRY_RUN
+
+
+def is_reconcile(mode: ApplyMode) -> bool:
+    """``reconcile`` deploys nothing: it restarts the contract's Spark streams that died,
+    with the config the last apply deployed."""
+    return mode is ApplyMode.RECONCILE
 
 
 def full_refresh_required(mode: ApplyMode) -> bool:
@@ -228,6 +243,7 @@ __all__ = [
     "full_refresh_required",
     "is_destructive",
     "is_dry_run",
+    "is_reconcile",
     "needs_build",
     "parse_mode",
 ]

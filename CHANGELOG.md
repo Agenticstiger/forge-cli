@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A Spark stream that died starts again on its checkpoint within a restart budget, and
+  `fluid apply --mode reconcile` keeps the streams running without deploying anything.** The
+  budget is `execution.retries.maxAttempts` restarts per rolling hour (5 when unset, at most 10:
+  the numbers EMR Serverless applies to its own streaming retries). On EMR on EC2 and
+  `runtime: local`, which no service retries, forge starts a stream again when the last run with
+  the deployed config ended FAILED or INTERRUPTED (a step that died with its node), LOST, or
+  stopped by a signal from outside forge (a local run killed or shut down with its machine). Each
+  restart carries `--fluid-restart-of <run id>` in its arguments, and the budget is counted from
+  the runtime's own run history (EMR's ListSteps reaches back an hour), so forge keeps no state.
+  A spent budget starts nothing and fails, naming the budget, the restarts and when the next one
+  is allowed. A plain `fluid apply` follows the same rule; it no longer stops at the first
+  failure of an unchanged config. A run cancelled through the runtime (CancelSteps,
+  CancelJobRun, BatchStopJobRun, or forge's own cancel of a local run) was stopped on purpose:
+  `--mode reconcile` leaves it stopped, and a plain `fluid apply` starts it again. EMR
+  Serverless, EMR on EKS and Glue retry a failed run themselves from `execution.retries`, so a
+  run that ended FAILED there has spent those retries and forge starts nothing on top of them;
+  a stream there that stopped without failing restarts within the budget. A stream whose EMR
+  cluster ended (TERMINATED, TERMINATED_WITH_ERRORS) cannot start there again, and the error
+  names the cluster's state and reason. `fluid apply <contract> [--env <env>] --mode reconcile
+  --build-id <stream> --yes` is what a keepalive DAG runs: it runs no `tofu` and takes no plan
+  (a `plan.json` is refused); it reads the job config the last apply uploaded and the config
+  hash the runs carry, and when the contract compiles to something else it starts nothing and
+  exits 1, telling the operator to run `fluid apply`. A healthy stream is a no-op (exit 0).
+  Without `--build-id` it reconciles every always-on Spark stream of the contract; a
+  `--build-id` of a batch, `availableNow` or non-Spark build is refused. It never replaces a
+  config and never stops a removed build, and it cancels only a younger second copy of the
+  running config. Two reconciles that start the same stream at once keep the older run (the
+  younger cancels its own start), and of two copies of one config the older is kept, no longer
+  the newer. The product's scheduler policy (`fluid-<product>-spark-caller`) now covers
+  always-on streams too (start, watch and stop their runs, read their job config), so a
+  keepalive can run on MWAA; on EMR on EC2 it adds `elasticmapreduce:DescribeCluster`.
+  `execution.retries` is no longer part of an EMR on EC2 run's config hash, as EMR on EC2 takes
+  no retry setting: a new budget restarts nothing there, and an EMR on EC2 stream that declares
+  retries restarts once on its next apply.
 - **A Spark build runs on the machine `fluid apply` runs on: `parameters.spark.runtime: local`.**
   A build of `runtime: local` runs forge's Spark runner and its compiled `job.json` with
   `spark-submit` on a laptop or a lab host (an EMR 7.x image, or any Spark 3.5), the way EMR runs
@@ -19,8 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A stream follows `spark.reconcile` as on AWS: it is left alone while its config hash is
   unchanged, stopped and started again on the same checkpoint when the hash changes, and stopped
   when the contract no longer runs the build locally. A stream stopped from outside forge (its
-  machine shut down or restarted, a kill) starts again on the next apply, as one cancelled by hand
-  on AWS does; one that failed does not until its config changes. A batch or `availableNow` build
+  machine shut down or restarted, a kill) or that failed starts again on its checkpoint within
+  its restart budget (the entry above). A batch or `availableNow` build
   runs once
   under `fluid apply --mode amend-and-build --build-id <id>`, the command a generated DAG runs, and
   reports SUCCEEDED or FAILED. Run state lives under `.fluid/<product>/runtime/spark/<build>/`.

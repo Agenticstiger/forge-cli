@@ -343,3 +343,168 @@ def test_a_contract_that_runs_builds_here_and_on_aws_is_refused(tmp_path, capsys
     out = capsys.readouterr().out
     assert "apply_spark_needs_opentofu" in out and "ingest-orders" in out
     assert "ingest-here" not in out.split("error:")[1].split("hint:")[0]
+
+
+# --- fluid apply --mode reconcile ------------------------------------------------------
+
+
+def _reconcile(path, *extra):
+    from fluid_build.cli import main
+
+    return main(["apply", str(path), "--mode", "reconcile", "--yes", *extra])
+
+
+def _said(capsys):
+    """What the command printed, as one line: the console wraps long lines."""
+    return " ".join(capsys.readouterr().out.split())
+
+
+def _parsed(argv):
+    import argparse
+
+    from fluid_build.cli.apply import register
+
+    parser = argparse.ArgumentParser(prog="fluid")
+    register(parser.add_subparsers(dest="cmd"))
+    return parser.parse_args(argv)
+
+
+def _runs(tmp_path, data):
+    from fluid_build.build_runners.spark._local import LocalHost, LocalRuns
+
+    return LocalRuns(LocalHost(tmp_path), data["id"], data["builds"][0]["id"])
+
+
+def _kill(runs, run_id):
+    """SIGKILL to the run's process group, as when its machine is lost: no end recorded."""
+    import json
+    import os
+    import signal
+
+    from tests.build_runners.spark.test_local import wait_for
+
+    status = json.loads((runs.dir / "runs" / run_id / "status.json").read_text())
+    os.killpg(status["supervisorPid"], signal.SIGKILL)
+    return wait_for(lambda: runs.get(run_id), lambda i: not i.active)
+
+
+def test_reconcile_restarts_a_dead_local_stream_and_leaves_a_cancelled_one(tmp_path, capsys):
+    from fluid_build.cli import main
+
+    data = stream_contract()
+    path = write(tmp_path, data)
+    runs = _runs(tmp_path, data)
+    try:
+        assert main(["apply", str(path), "--yes"]) == 0
+        (first,) = runs.runs()
+        assert _reconcile(path, "--build-id", "ingest-orders") == 0
+        assert "Spark ingest-orders (local): unchanged run" in _said(capsys)
+        assert _kill(runs, first.run_id).raw_state == "LOST"
+        assert _reconcile(path, "--build-id", "ingest-orders") == 0
+        out = _said(capsys)
+        assert "Spark ingest-orders (local): restarted run" in out
+        assert f"run {first.run_id} ended LOST" in out and "restart 1 of 5" in out
+        again = runs.runs()[0]
+        assert (again.restart_of, again.state) == (first.run_id, "RUNNING")
+        runs.cancel(again.run_id)  # forge's own cancel: stopped on purpose
+        assert _reconcile(path) == 0  # without --build-id: every always-on stream
+        out = _said(capsys)
+        assert "left-stopped" in out and "leaves a cancelled stream stopped" in out
+        assert len(runs.runs()) == 2
+    finally:
+        data["builds"] = []
+        write(tmp_path, data)
+        assert main(["apply", str(path), "--yes"]) == 0
+
+
+def test_reconcile_refuses_a_changed_stream_and_starts_nothing(tmp_path, capsys):
+    from fluid_build.cli import main
+
+    data = stream_contract()
+    path = write(tmp_path, data)
+    runs = _runs(tmp_path, data)
+    try:
+        assert main(["apply", str(path), "--yes"]) == 0
+        (first,) = runs.runs()
+        _kill(runs, first.run_id)
+        data["builds"][0]["properties"]["stream"]["trigger"] = {"processingTime": "PT2M"}
+        write(tmp_path, data)
+        assert _reconcile(path, "--build-id", "ingest-orders") == 1
+        out = _said(capsys)
+        assert "refused" in out and "run fluid apply" in out
+        assert len(runs.runs()) == 1  # nothing started
+    finally:
+        data["builds"] = []
+        write(tmp_path, data)
+        assert main(["apply", str(path), "--yes"]) == 0
+
+
+def test_reconcile_dry_run_says_what_it_would_restart(tmp_path, capsys):
+    from fluid_build.cli import main
+
+    data = stream_contract()
+    path = write(tmp_path, data)
+    runs = _runs(tmp_path, data)
+    try:
+        assert main(["apply", str(path), "--yes"]) == 0
+        (first,) = runs.runs()
+        _kill(runs, first.run_id)
+        assert _reconcile(path, "--dry-run") == 0
+        assert "would start it again" in _said(capsys)
+        assert len(runs.runs()) == 1
+    finally:
+        data["builds"] = []
+        write(tmp_path, data)
+        assert main(["apply", str(path), "--yes"]) == 0
+
+
+def test_reconcile_refuses_a_plan(tmp_path):
+    from fluid_build.cli.apply import run
+
+    plan = tmp_path / "plan.json"
+    plan.write_text("{}", encoding="utf-8")
+    with pytest.raises(CLIError) as raised:
+        run(_parsed(["apply", str(plan), "--mode", "reconcile", "--yes"]), LOG)
+    assert raised.value.event == "apply_reconcile_needs_contract"
+
+
+@pytest.mark.parametrize(
+    "builds, build_id, says",
+    [
+        ([daily()], "daily-curated", "runs to completion"),
+        # engine spark without properties.parameters.spark: not one forge's runner runs
+        (
+            [{**daily(), "properties": {"sql": daily()["properties"]["sql"]}}],
+            "daily-curated",
+            "not a forge Spark",
+        ),
+    ],
+)
+def test_reconcile_refuses_a_build_that_is_no_always_on_stream(tmp_path, builds, build_id, says):
+    from fluid_build.cli.apply import run
+
+    path = write(tmp_path, contract(*builds))
+    args = _parsed(["apply", str(path), "--mode", "reconcile", "--build-id", build_id, "--yes"])
+    with pytest.raises(CLIError) as raised:
+        run(args, LOG)
+    assert raised.value.event == "apply_reconcile_not_a_stream"
+    assert says in raised.value.context["error"]
+
+
+def test_reconcile_of_a_contract_without_a_stream_changes_nothing(tmp_path, capsys):
+    path = write(tmp_path, contract(daily()))
+    assert _reconcile(path) == 0
+    assert "nothing to reconcile" in _said(capsys)
+    assert not (tmp_path / ".fluid").exists()
+
+
+def test_reconcile_runs_no_tofu_and_no_provider_apply(tmp_path, monkeypatch, capsys):
+    """Whatever the contract's engine, --mode reconcile provisions nothing."""
+    from fluid_build.cli import _apply_opentofu_engine, apply
+
+    monkeypatch.setattr(
+        _apply_opentofu_engine, "apply_via_opentofu", lambda *a, **k: pytest.fail("ran tofu")
+    )
+    monkeypatch.setattr(apply, "_run_simple_apply", lambda **k: pytest.fail("applied"))
+    path = write(tmp_path, contract(daily()))
+    assert _reconcile(path) == 0
