@@ -519,14 +519,54 @@ def test_a_truncated_bundle_is_refused_without_a_traceback(
     assert "the release is named once stage 1 has bundled" in capsys.readouterr().out
 
 
-def test_a_bundle_of_another_product_than_the_contract_is_refused(
+def test_an_overlay_that_renames_the_product_journals_under_the_bundled_id(
     work: Path, fake: FakeStages
 ) -> None:
+    """The contract's file says one id and the bundle (with its env overlay)
+    another: the run holds both targets and journals where the bundle says."""
     body = yaml.safe_load(Path("contract.fluid.yaml").read_text())
-    body["id"] = "example.other"
+    body["id"] = "example.base"
     Path("contract.fluid.yaml").write_text(yaml.safe_dump(body))
+    fake.outcome["apply"] = "interrupt"
+    assert _ship(*_TO_APPLY) == 130
+    fake.outcome.clear()
+    assert _journal_file(work).is_file()  # under the bundled id
+    assert (work / "jr" / "example.base" / "dev" / journal.LOCK_NAME).is_file()
+    fake.calls.clear()
+    assert _ship(*_TO_APPLY) == 1  # the unknown apply is found again
+    assert "apply" not in fake.calls
+    assert _ship(*_TO_APPLY, "--acknowledge-inspected", "apply") == 0
+
+
+def test_a_contract_id_ship_cannot_read_holds_the_shared_target(work: Path) -> None:
+    Path("bad.yaml").write_text("id: x\ncreated: 2026-02-30\n")  # not a date
+    assert ship._contract_id("bad.yaml") == "product"
+    Path("tree.yaml").write_text("id: {a: 1}\n")
+    assert ship._contract_id("tree.yaml") == "product"
+    assert ship._contract_id("contract.fluid.yaml") == PRODUCT
+
+
+def test_a_child_that_exits_as_a_signal_would_has_an_unknown_outcome(
+    work: Path, fake: FakeStages
+) -> None:
+    """``fluid apply`` turns Ctrl-C into exit 130."""
+    fake.outcome["apply"] = 130
     assert _ship(*_TO_APPLY) == 1
-    assert "is not the contract's" in _refused_apply(work)
+    rec = _stage(_report(work), 7)
+    assert rec["status"] == "unknown" and rec["reason"] == "killed by signal 2 (it exited 130)"
+    fake.outcome.clear()
+    fake.calls.clear()
+    assert _ship(*_TO_APPLY) == 1
+    assert "apply" not in fake.calls
+
+
+def test_a_planted_temporary_name_cannot_keep_an_old_report(work: Path, fake: FakeStages) -> None:
+    Path("runtime").mkdir()
+    Path("runtime/ship-report.json").write_text('{"planted": true}')
+    for pid in range(os.getpid() - 2, os.getpid() + 3):
+        Path(f"runtime/.ship-report.json.{pid}.tmp").write_text("x")
+    assert _ship(*_TO_APPLY, journal_dir=None) == 0
+    assert "planted" not in _report(work)
 
 
 def test_an_acknowledgement_in_another_release_survives_its_torn_tail(

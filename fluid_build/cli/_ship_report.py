@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Collection, Dict, List, Optional
@@ -201,12 +202,48 @@ def write_reports(directory: Path, report: Dict[str, Any], records: List[StageRe
     """Write both reports. Each replaces its file (a temporary file renamed over
     it), so a link the checkout planted at either name is replaced, never
     written through."""
-    from fluid_build.util.atomic_write import atomic_write_bytes
-
     directory.mkdir(parents=True, exist_ok=True)
     body = json.dumps(report, indent=2, sort_keys=False) + "\n"
-    atomic_write_bytes(directory / REPORT_JSON, body.encode("utf-8"), mode=0o644)
-    atomic_write_bytes(directory / REPORT_JUNIT, junit_xml(records), mode=0o644)
+    try:
+        _replace(directory / REPORT_JSON, body.encode("utf-8"))
+        _replace(directory / REPORT_JUNIT, junit_xml(records))
+    except BaseException:
+        # No report from an earlier run (or one the checkout committed) may
+        # stand in for this run's.
+        for name in (REPORT_JSON, REPORT_JUNIT):
+            try:
+                os.unlink(directory / name)
+            except OSError:
+                pass
+        raise
+
+
+def _created_mode() -> int:
+    """The mode ``open()`` gives a new file under the process umask (mkstemp's
+    is 0600, which would hide the reports from a reader the umask lets in)."""
+    mask = os.umask(0)
+    os.umask(mask)
+    return 0o666 & ~mask
+
+
+def _replace(path: Path, data: bytes) -> None:
+    """Write ``data`` to a new, randomly named file beside ``path`` and rename
+    it over ``path``: a link at ``path`` is replaced, and no name the checkout
+    can plant in advance is opened."""
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.chmod(tmp, _created_mode())  # as an ordinary write would have made it
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _from_dict(raw: Dict[str, Any]) -> StageRecord:

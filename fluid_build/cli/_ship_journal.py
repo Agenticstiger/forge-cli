@@ -89,6 +89,7 @@ _STAGE_FILES: Dict[int, Sequence[str]] = {
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_BINARY = getattr(os, "O_BINARY", 0)  # Windows: no newline translation
 #: Directory descriptors (POSIX): every name below DIR is opened relative to
 #: its parent's descriptor, so no component can be swapped for a link.
 _DIR_FD = os.open in os.supports_dir_fd and os.mkdir in os.supports_dir_fd and bool(_DIRECTORY)
@@ -332,7 +333,7 @@ class _TargetDir:
             current = base
             for part in parts:
                 current = current / part
-                if current.is_symlink():
+                if current.is_symlink() or getattr(current, "is_junction", lambda: False)():
                     raise JournalError(f"{current} is a symbolic link, not a journal directory")
                 if create:
                     current.mkdir(mode=0o700, exist_ok=True)
@@ -365,12 +366,15 @@ class _TargetDir:
     def open(self, name: str, flags: int, mode: int = 0o600) -> int:
         """Open ``name`` in the target, never through a link, and only when it
         is a regular file with one link."""
-        flags |= _NOFOLLOW
+        flags |= _NOFOLLOW | _BINARY
         try:
             if self.fd is not None:
                 fd = os.open(name, flags, mode, dir_fd=self.fd)
-            else:  # pragma: no cover - Windows
-                fd = os.open(self.path / name, flags, mode)
+            else:  # pragma: no cover - Windows: no O_NOFOLLOW, so look first
+                path = self.path / name
+                if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+                    raise JournalError(f"{path} is a symbolic link")
+                fd = os.open(path, flags, mode)
         except OSError as exc:
             if exc.errno is not None and exc.errno == getattr(errno, "ELOOP", None):
                 raise JournalError(f"{self.path / name} is a symbolic link") from None
@@ -402,10 +406,15 @@ class _TargetDir:
 def _read_fd(fd: int, path: Path, budget: int = MAX_FILE_BYTES) -> bytes:
     """The whole file behind ``fd`` (at most ``budget`` bytes, else refused)."""
     size = os.fstat(fd).st_size
-    if size > min(budget, MAX_FILE_BYTES):
+    if size > MAX_FILE_BYTES:
         raise JournalError(
             f"{path} is {size} bytes, more than a stage journal ship writes; "
             "move it aside to start the target's journal again"
+        )
+    if size > budget:
+        raise JournalError(
+            f"the release files of {path.parent} together pass {MAX_TARGET_BYTES} bytes; "
+            "move the files of releases you no longer need aside (a run reads them all)"
         )
     os.lseek(fd, 0, os.SEEK_SET)
     chunks: List[bytes] = []
@@ -425,6 +434,11 @@ def _stem(raw: str, fallback: str) -> str:
     from fluid_build.providers._path_safety import safe_filename_stem
 
     return safe_filename_stem(raw, fallback)
+
+
+def target_stem(product_id: str) -> str:
+    """The directory name a product's target has in the journal."""
+    return _stem(product_id, "product")
 
 
 def _parts(
