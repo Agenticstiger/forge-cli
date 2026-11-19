@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] — 2026-11-19
+
 ### Added
 
 - **A Spark stream that died starts again on its checkpoint within a restart budget, and
@@ -77,6 +79,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose only builds are such streams now gets this DAG on Airflow instead of "No build needs a
   DAG"; on Prefect or Dagster, and in `fluid scaffold-composer`, it still has nothing to
   schedule, and the message names the Airflow keepalive.
+
+### Changed
+
+- **A Spark run starts only on the job config `fluid apply` compiled.** Every runtime, local
+  included, now passes the config's digest at submit (`--fluid-job-sha256`: the sha256 of its
+  canonical JSON, strings in NFC as OpenTofu writes them, the MSK brokers OpenTofu fills in left
+  out so a broker change does not stop a stream's retries), and forge's Spark runner refuses any
+  other config before it reads anything. On AWS, `fluid apply` first reads the config and the
+  runner OpenTofu uploaded back from S3 and starts nothing unless they are the ones this apply
+  compiled, so a config another apply put there since never runs under the run's config hash.
+  The artifact bucket's write access stays the boundary. A scheduler's role already reads both
+  objects. The runner changed, so each running Spark stream restarts once on its next apply.
+
+- **An Iceberg table on Glue plans no change after an engine commits to it.** forge emitted the
+  table's location with a trailing slash; Iceberg keeps it without one and writes it back into
+  Glue on every commit. So each `fluid apply` after a commit (every scheduled run beside a
+  stream) planned `~1` per written table and sent an `UpdateTable` while the stream kept
+  committing, with `previous_metadata_location` from the plan's refresh. The location is now
+  emitted as Iceberg keeps it. The first apply after the upgrade updates each existing Iceberg
+  table's location once, in place; Hive-format tables keep their trailing slash.
 
 ### Fixed
 
@@ -161,26 +183,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   config before that read, so a start the deployed artifacts refused left the stream stopped
   until the next apply. It now reads them first: a refusal cancels nothing, the old run keeps
   going, and `fluid apply` exits 1.
-
-### Changed
-
-- **A Spark run starts only on the job config `fluid apply` compiled.** Every runtime, local
-  included, now passes the config's digest at submit (`--fluid-job-sha256`: the sha256 of its
-  canonical JSON, strings in NFC as OpenTofu writes them, the MSK brokers OpenTofu fills in left
-  out so a broker change does not stop a stream's retries), and forge's Spark runner refuses any
-  other config before it reads anything. On AWS, `fluid apply` first reads the config and the
-  runner OpenTofu uploaded back from S3 and starts nothing unless they are the ones this apply
-  compiled, so a config another apply put there since never runs under the run's config hash.
-  The artifact bucket's write access stays the boundary. A scheduler's role already reads both
-  objects. The runner changed, so each running Spark stream restarts once on its next apply.
-
-- **An Iceberg table on Glue plans no change after an engine commits to it.** forge emitted the
-  table's location with a trailing slash; Iceberg keeps it without one and writes it back into
-  Glue on every commit. So each `fluid apply` after a commit (every scheduled run beside a
-  stream) planned `~1` per written table and sent an `UpdateTable` while the stream kept
-  committing, with `previous_metadata_location` from the plan's refresh. The location is now
-  emitted as Iceberg keeps it. The first apply after the upgrade updates each existing Iceberg
-  table's location once, in place; Hive-format tables keep their trailing slash.
 
 ## [0.33.0] — 2026-11-19
 
