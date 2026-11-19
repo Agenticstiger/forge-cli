@@ -160,7 +160,7 @@ def test_a_full_refresh_copy_rewrites_each_partition_under_one_name():
     assert _build_copy_destination(
         "s3://b/p", "parquet", PartitionedWrite(("order_date", "region"), file_stem="orders")
     ).replace("{select}", "S", 1) == (
-        "COPY (S) TO 's3://b/p' (FORMAT 'parquet', PARTITION_BY (order_date, region), "
+        "COPY (S) TO 's3://b/p' (FORMAT 'parquet', PARTITION_BY (\"order_date\", \"region\"), "
         "OVERWRITE_OR_IGNORE, FILENAME_PATTERN 'orders_{i}')"
     )
 
@@ -168,7 +168,7 @@ def test_a_full_refresh_copy_rewrites_each_partition_under_one_name():
 def test_an_append_copy_gives_each_file_a_new_name():
     assert _build_copy_destination(
         "s3://b/p", "csv", PartitionedWrite(("region",), append=True)
-    ) == ("COPY ({select}) TO 's3://b/p' (FORMAT 'csv', HEADER, PARTITION_BY (region), APPEND)")
+    ) == ("COPY ({select}) TO 's3://b/p' (FORMAT 'csv', HEADER, PARTITION_BY (\"region\"), APPEND)")
 
 
 def test_braces_in_the_path_reach_the_copy_as_written(tmp_path):
@@ -186,6 +186,22 @@ def test_braces_in_the_path_reach_the_copy_as_written(tmp_path):
     assert (tmp_path / "lake" / "{orders}" / "region=eu" / "orders_0.parquet").is_file()
 
 
+def test_a_key_named_like_a_sql_keyword_lands(tmp_path):
+    location = {
+        "path": "./lake/orders",
+        "database": "sales",
+        "table": "orders",
+        "partitionBy": ["order"],
+    }
+    contract = _contract(tmp_path, location=location)
+    contract["exposes"][0]["contract"]["schema"].append({"name": "order", "type": "string"})
+    source = tmp_path / "orders.csv"
+    source.write_text("id,order\no1,first\n", encoding="utf-8")
+    contract["builds"][0]["properties"]["source"]["connection"]["uri"] = str(source)
+    assert execute_duckdb_build(contract["builds"][0], contract, tmp_path) == 0
+    assert (tmp_path / "lake" / "orders" / "order=first" / "orders_0.parquet").is_file()
+
+
 def test_a_partition_key_that_is_not_an_identifier_is_refused():
     with pytest.raises(ValueError):
         _build_copy_destination("s3://b/p", "parquet", PartitionedWrite(("region; DROP",)))
@@ -193,7 +209,7 @@ def test_a_partition_key_that_is_not_an_identifier_is_refused():
 
 def test_the_landed_relation_reads_the_partition_paths_back():
     assert _landed_relation("s3://b/p/", "read_parquet", ("region",)) == (
-        "read_parquet('s3://b/p/**/*', hive_partitioning = true)"
+        "read_parquet('s3://b/p/region=*/*.parquet', hive_partitioning = true)"
     )
     assert _landed_relation("/x/o.parquet", "read_parquet", ()) == "read_parquet('/x/o.parquet')"
 
@@ -314,3 +330,89 @@ def test_the_hive_layout_lands_on_s3(tmp_path, moto_s3):
     ]
     assert _run(tmp_path, contract)[0] == 0  # a second run overwrites, on S3 too
     assert len(s3.list_objects_v2(Bucket="orders-partition-lake")["Contents"]) == 3
+
+
+# ── Shapes found by the review ──────────────────────────────────────────
+
+
+def test_a_file_where_the_partition_directory_goes_is_refused(tmp_path):
+    (tmp_path / "lake").mkdir()
+    (tmp_path / "lake" / "orders").write_text("an unpartitioned run's file", encoding="utf-8")
+    rc, record = _run(tmp_path, _contract(tmp_path))
+    assert rc != 0
+    assert "is a file (an unpartitioned run's)" in json.dumps(record)
+
+
+def test_a_json_sink_is_refused_before_it_writes(tmp_path):
+    contract = _contract(tmp_path)
+    contract["builds"][0]["properties"]["sink"]["format"] = "json"
+    rc, record = _run(tmp_path, contract)
+    assert rc != 0
+    assert "sink format is json, which DuckDB does not write partitioned" in json.dumps(record)
+    assert not (tmp_path / "lake").exists()
+
+
+@pytest.mark.parametrize("raw", [[1], ["region", ""], {"region": True}])
+def test_a_malformed_partition_by_is_refused_as_validate_refuses_it(tmp_path, raw):
+    location = {"path": "./lake/orders", "database": "sales", "table": "orders", "partitionBy": raw}
+    rc, record = _run(tmp_path, _contract(tmp_path, location=location))
+    assert rc != 0
+    assert "it must name the columns to partition by" in json.dumps(record)
+
+
+def test_a_full_refresh_is_refused_where_another_run_left_partition_files(tmp_path):
+    """An append run's uuid files would be read beside the refreshed ones."""
+    append = _contract(tmp_path, mode="incremental_append", source_extra={"cursor_field": "amount"})
+    assert _run(tmp_path, append)[0] == 0
+    rc, record = _run(tmp_path, _contract(tmp_path))
+    assert rc != 0
+    assert "a full refresh would leave 3 file(s) another run wrote" in json.dumps(record)
+    assert len(_rows(tmp_path / "lake" / "orders")) == 3
+
+
+def test_a_marker_file_does_not_break_the_cursor_read_back(tmp_path):
+    contract = _contract(
+        tmp_path, mode="incremental_append", source_extra={"cursor_field": "amount"}
+    )
+    (tmp_path / "lake" / "orders").mkdir(parents=True)
+    (tmp_path / "lake" / "orders" / "_SUCCESS").write_text("", encoding="utf-8")
+    rc, record = _run(tmp_path, contract)
+    assert rc == 0, record
+
+
+def test_a_partitioned_landing_outside_the_contract_directory_lands(tmp_path, monkeypatch):
+    """The sandbox grants the partition directory itself, not only its contents."""
+    outside = tmp_path / "data"
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("FLUID_DUCKDB_ALLOWED_DIRS", str(outside))
+    location = {
+        "path": str(outside / "lake" / "orders"),
+        "database": "sales",
+        "table": "orders",
+        "partitionBy": ["region"],
+    }
+    rc, record = _run(project, _contract(project, location=location))
+    assert rc == 0, record
+    assert (outside / "lake" / "orders" / "region=eu" / "orders_0.parquet").is_file()
+
+
+def test_a_downstream_read_of_a_partitioned_upstream_globs_its_layout():
+    from fluid_build.build_runners._embedded_sql_io import _prefix_glob
+
+    binding = {
+        "platform": "aws",
+        "format": "parquet",
+        "location": {
+            "database": "sales",
+            "table": "orders",
+            "partitionBy": ["order_date", "region"],
+        },
+    }
+    assert _prefix_glob(binding, "s3://b/silver/orders/", "parquet") == (
+        "s3://b/silver/orders/order_date=*/region=*/*.parquet"
+    )
+    del binding["location"]["partitionBy"]
+    assert _prefix_glob(binding, "s3://b/silver/orders/", "parquet") == (
+        "s3://b/silver/orders/*.parquet"
+    )

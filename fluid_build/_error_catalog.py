@@ -1004,6 +1004,14 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "validate",
     ),
+    "contract_storage_layout": (
+        [
+            "Fix the binding.location.partitionBy or binding.properties.cluster_by field the "
+            + "message names; for a note, register the table's partitions or declare the key "
+            + "values Athena projects",
+        ],
+        "validate",
+    ),
     "contract_governance": (
         [
             "Change the governance or access-policy field the message names, or bind the "
@@ -1192,6 +1200,10 @@ _EXAMPLES: Dict[str, str] = {
         "  project: acme-analytics\n  dataset: sales_raw\n  table: orders\n"
     ),
     "contract_governance": _VERBOSE,
+    "contract_storage_layout": (
+        "# exposes[].binding\nplatform: aws\nformat: parquet\nlocation:\n"
+        "  database: sales\n  table: orders\n  partitionBy: [order_date]\n"
+    ),
     "contract_vector_binding": _VERBOSE,
     "contract_continuous_trigger": _BUILD,
     "contract_build_id": "id: sales.orders_raw\n",

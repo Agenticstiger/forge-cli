@@ -158,6 +158,9 @@ _FINAL_STATES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED"})
 RULE_EQUAL = "equal"
 RULE_AT_LEAST_CUMULATIVE = "at_least_cumulative"
 RULE_REPORTED = "reported"
+#: A full refresh into a partitioned Glue table replaces only the partitions it writes
+#: (the duckdb runner's partitioned write), so its rows are a floor, not the count.
+RULE_AT_LEAST_RUN = "at_least_run"
 
 #: Run records read for one comparison, newest first. An append history longer
 #: than this is summed over its newest runs only, which still bounds the table
@@ -978,11 +981,14 @@ def _row_count_dimension(
     *,
     reference_only: bool = False,
     engine: str = "Athena",
+    unregistered: bool = False,
 ) -> Dict[str, Any]:
     """``status`` is ``pass``, ``fail`` (CRITICAL) or ``info`` (reported, never gated).
 
     ``engine`` names what counted the rows in the messages (``BigQuery`` for
     ``_verify_bigquery``, which holds a table to its runs by the same rules).
+    ``unregistered``: the table is partitioned without Athena partition projection,
+    so Athena reads only the partitions registered in Glue; an empty count says so.
     """
     run = _runs_phrase(info)
     rule = info.get("rule")
@@ -998,7 +1004,24 @@ def _row_count_dimension(
         message = f"{engine} counted 0 rows in {table_id}"
         if landed is not None:
             message += f"; {run} landed {landed:,}"
+        if unregistered:
+            message += (
+                "; the table is partitioned without Athena partition projection, so "
+                f"Athena reads only registered partitions: run MSCK REPAIR TABLE {table_id}"
+            )
         status = "fail"
+    elif landed is not None and rule == RULE_AT_LEAST_RUN and count < landed:
+        message = (
+            f"{engine} counted {count:,} rows in {table_id}; {run} landed {landed:,}, and a "
+            "full refresh of a partitioned table keeps every row it wrote"
+        )
+        status = "fail"
+    elif landed is not None and rule == RULE_AT_LEAST_RUN:
+        message = (
+            f"{count:,} rows, at least the {landed:,} that {run} landed (a full refresh of "
+            "a partitioned table replaces only the partitions it writes)"
+        )
+        status = "pass"
     elif landed is not None and rule == RULE_EQUAL and count != landed:
         message = (
             f"{engine} counted {count:,} rows in {table_id}; {run} landed {landed:,} "
@@ -1322,6 +1345,24 @@ def _error(message: str, *, target: str, exists: Optional[bool], **extra: Any) -
     return result
 
 
+def _partition_layout(
+    expose_id: str, expose: Mapping[str, Any], contract: Mapping[str, Any]
+) -> Tuple[bool, bool]:
+    """``(partitioned, unregistered)`` for the expose's Glue table: whether it has
+    partition keys, and whether Athena then reads only registered partitions."""
+    from fluid_build.iac.base import UnsupportedBindingError
+    from fluid_build.iac.providers.aws_layout import glue_layout
+
+    exposes = [e for e in contract.get("exposes") or [] if isinstance(e, Mapping)]
+    index = next((i for i, e in enumerate(exposes) if e.get("exposeId") == expose_id), 0)
+    binding = expose.get("binding")
+    try:
+        layout = glue_layout(expose, index, binding if isinstance(binding, Mapping) else {})
+    except UnsupportedBindingError:
+        return False, False
+    return bool(layout.keys), bool(layout.keys) and not layout.projection
+
+
 def verify_athena_expose(
     expose_id: str,
     expose: Mapping[str, Any],
@@ -1439,7 +1480,12 @@ def verify_athena_expose(
     except Exception as exc:  # noqa: BLE001 — an unreadable record is not a count
         LOG.warning("verify_athena_run_record_unreadable error=%s", type(exc).__name__)
         landed, info = None, {"source": "none", "note": "the run record could not be read"}
-    row_count = _row_count_dimension(count, landed, info, table_id, reference_only=reference_only)
+    partitioned, unregistered = _partition_layout(expose_id, expose, contract)
+    if partitioned and info.get("rule") == RULE_EQUAL:
+        info = {**info, "rule": RULE_AT_LEAST_RUN}
+    row_count = _row_count_dimension(
+        count, landed, info, table_id, reference_only=reference_only, unregistered=unregistered
+    )
     dimensions["row_count"] = row_count
     masking = finish_masking(masking_values)
     if masking is not None:

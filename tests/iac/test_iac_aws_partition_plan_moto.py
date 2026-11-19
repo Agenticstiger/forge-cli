@@ -69,10 +69,11 @@ def _contract(partition_by: Optional[List[str]], *, regions: str = "eu | us") ->
         location["partitionBy"] = partition_by
     schema = [
         {"name": "id", "type": "string"},
-        {"name": "order_date", "type": "date"},
+        {"name": "order_date", "type": "date", "required": True},
         {
             "name": "region",
             "type": "string",
+            "required": True,
             "validationRules": [{"type": "enum", "constraint": regions}],
         },
     ]

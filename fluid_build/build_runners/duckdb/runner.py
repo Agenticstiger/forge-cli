@@ -609,7 +609,8 @@ def _build_copy_destination(
     else:
         raise ValueError(f"unsupported sink format: {fmt}")
     if partitioned is not None and partitioned.keys:
-        keys = ", ".join(validate_ident(key) for key in partitioned.keys)
+        # Quoted: a key may be a word DuckDB reserves (``order``, ``group``).
+        keys = ", ".join(f'"{validate_ident(key)}"' for key in partitioned.keys)
         options += f", PARTITION_BY ({keys})"
         if partitioned.append:
             options += ", APPEND"
@@ -620,13 +621,37 @@ def _build_copy_destination(
     return f"COPY ({{select}}) TO {quoted_path} ({options})"
 
 
+#: The file extension DuckDB gives a partition's files, by reader.
+_READER_EXT = {"read_parquet": "parquet", "read_csv_auto": "csv", "read_json_auto": "json"}
+
+
+def _partition_glob(out_path: str, keys: Sequence[str], ext: str) -> str:
+    """The files of the table's layout: ``<dir>/<k1>=*/.../*.<ext>``. A marker such as
+    ``_SUCCESS``, a file left at the root, or another layout's directories are not in it."""
+    segments = "/".join(f"{validate_ident(key)}=*" for key in keys)
+    return f"{out_path.rstrip('/')}/{segments}/*.{ext}"
+
+
 def _landed_relation(out_path: str, reader: str, partition_by: Sequence[str]) -> str:
-    """``reader(...)`` over what a stream landed: the file, or every file of the
-    partition directory with the partition columns read back from its paths."""
+    """``reader(...)`` over what a stream landed: the file, or the partition files of
+    the table's layout, with the partition columns read back from their paths."""
     if not partition_by:
         return f"{reader}({quote_ansi_string_literal(out_path)})"
-    files = quote_ansi_string_literal(f"{out_path.rstrip('/')}/**/*")
-    return f"{reader}({files}, hive_partitioning = true)"
+    files = _partition_glob(out_path, partition_by, _READER_EXT.get(reader, "parquet"))
+    return f"{reader}({quote_ansi_string_literal(files)}, hive_partitioning = true)"
+
+
+def _foreign_partition_files(
+    con: Any, out_path: str, partitioned: PartitionedWrite, fmt: str
+) -> List[str]:
+    """Partition files a full refresh would not overwrite: written under another name (an
+    ``incremental_append`` run, another writer, another ``location.table``). Their rows
+    would be read beside the new ones, so the stream is refused while any is there."""
+    ext = "csv" if fmt == "csv" else "parquet"
+    pattern = quote_ansi_string_literal(_partition_glob(out_path, partitioned.keys, ext))
+    own = f"/{partitioned.file_stem}_0.{ext}"
+    rows = con.execute(f"SELECT file FROM glob({pattern})").fetchall()
+    return sorted(str(row[0]) for row in rows if not str(row[0]).endswith(own))
 
 
 # ── Extension loading ────────────────────────────────────────────────────
@@ -752,11 +777,12 @@ def _grant_destination(
     for stream in streams:
         dest = _resolve_destination_path(ctx, stream, sink_format, out_dir)
         if partitioned:
-            # The partition directory itself, not its parent.
+            # The partition directory, not its parent: its contents, and the directory
+            # path itself, which DuckDB opens before it writes a partition under it.
             if _is_remote_uri(dest):
                 allow = allow.with_locations(dest.rstrip("/") + "/")
             else:
-                allow = allow.with_declared(dest, within=within)
+                allow = allow.with_declared(dest, within=within).with_paths(dest)
             continue
         if _is_remote_uri(dest):
             allow = allow.with_locations(dest)
@@ -1764,9 +1790,17 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
 
                 # Resolve binding location if present, else write under workdir.
                 out_path = _resolve_destination_path(ctx, stream, sink_format, out_dir)
-                copy_template = _build_copy_destination(
-                    out_path, sink_format, _partitioned_write(ctx, stream, partition_by)
-                )
+                partitioned = _partitioned_write(ctx, stream, partition_by)
+                if partitioned is not None and not partitioned.append:
+                    foreign = _foreign_partition_files(con, out_path, partitioned, sink_format)
+                    if foreign:
+                        raise RuntimeError(
+                            f"partitioned table: a full refresh would leave {len(foreign)} "
+                            f"file(s) another run wrote under {out_path} (first: "
+                            f"{foreign[0]}), and their rows would be read with the new ones. "
+                            "Remove them, or run incremental_append."
+                        )
+                copy_template = _build_copy_destination(out_path, sink_format, partitioned)
                 # ``replace`` on the first ``{select}``, not ``str.format``: the quoted
                 # path follows it and may hold braces (as ``LocalProvider`` fills it).
                 copy_sql = copy_template.replace("{select}", landed_sel, 1)
@@ -2452,16 +2486,27 @@ def _partition_columns(ctx: RunContext) -> Tuple[str, ...]:
     Only where the stream lands at the binding's location (one stream, a
     ``location.path``): that is the table's location, and Glue reads its rows
     only under ``<key>=<value>/`` there."""
+    from fluid_build.iac.base import UnsupportedBindingError
     from fluid_build.iac.providers.aws_layout import partitioned_hive_table
 
     if _bigquery_target(ctx) is not None or _is_databricks_binding(ctx):
         return ()
-    expose = _build_expose(ctx)
-    binding = (expose or {}).get("binding") or {}
-    loc = binding.get("location") or {}
+    binding, loc = _binding_and_location(ctx)
     if not loc.get("path") or len(ctx.source.streams) > 1:
         return ()
-    return partitioned_hive_table(binding)
+    try:
+        return partitioned_hive_table(binding)
+    except UnsupportedBindingError:
+        return ()  # refused before the run (_refused_partitioned_destination)
+
+
+def _binding_and_location(ctx: RunContext) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """The build's expose binding and its location, ``{}`` for one that is not a mapping."""
+    expose = _build_expose(ctx)
+    binding = (expose or {}).get("binding") if isinstance(expose, dict) else None
+    binding = binding if isinstance(binding, dict) else {}
+    loc = binding.get("location")
+    return binding, loc if isinstance(loc, dict) else {}
 
 
 def _refused_partitioned_destination(ctx: RunContext, streams: List[str]) -> str:
@@ -2472,6 +2517,7 @@ def _refused_partitioned_destination(ctx: RunContext, streams: List[str]) -> str
     together rather than the split skipped. So is a table at a location no stream
     lands in: rows written elsewhere would be in no partition.
     """
+    from fluid_build.iac.base import UnsupportedBindingError
     from fluid_build.iac.providers.aws_layout import (
         SINGLE_FILE_FIX,
         partitioned_hive_table,
@@ -2479,17 +2525,34 @@ def _refused_partitioned_destination(ctx: RunContext, streams: List[str]) -> str
 
     from .._late_arrival import extract_late_arrival_policy
 
-    expose = _build_expose(ctx)
-    binding = (expose or {}).get("binding") or {}
-    keys = partitioned_hive_table(binding)
+    expose = _build_expose(ctx) or {}
+    binding, loc = _binding_and_location(ctx)
+    try:
+        keys = partitioned_hive_table(binding)
+    except UnsupportedBindingError as exc:
+        return f"partitioned table: {exc} {' '.join(exc.remediation)}"
     if not keys:
         return ""
     where = (
-        f"partitioned table: expose {(expose or {}).get('exposeId')!r} is a Glue table "
+        f"partitioned table: expose {expose.get('exposeId')!r} is a Glue table "
         f"partitioned by ({', '.join(keys)})"
     )
-    loc = binding.get("location") or {}
-    if not loc.get("path") or len(ctx.source.streams) > 1:
+    sink_format = (ctx.sink.format or "parquet").lower()
+    if sink_format not in ("parquet", "csv"):
+        return (
+            f"{where}, and the build's sink format is {sink_format}, which DuckDB does not "
+            "write partitioned. Land it as parquet or csv."
+        )
+    path = loc.get("path")
+    if path and not _is_remote_uri(str(path)) and not loc.get("bucket"):
+        local = Path(str(path))
+        local = local if local.is_absolute() else Path(ctx.workdir) / local
+        if local.exists() and not local.is_dir():
+            return (
+                f"{where}, and {local} is a file (an unpartitioned run's), where the "
+                "partitions' directory goes. Move or remove it, then run again."
+            )
+    if not path or len(ctx.source.streams) > 1:
         return (
             f"{where}, and the build lands its {len(streams)} stream(s) outside its "
             "location (a single stream lands at location.path), so no partition would "

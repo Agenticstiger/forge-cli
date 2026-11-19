@@ -24,12 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recreated with it. Refused at validate, naming the field: a key of another type, an undeclared
   or upper-case key, a key named twice, every column as a key, `partitionBy` on an Iceberg or
   Delta table in Glue (their partitioning lives in their own metadata, and the provider sets an
-  Iceberg spec only on create), and `cluster_by` on any Glue table. A duckdb build writes a
+  Iceberg spec only on create), and `cluster_by` on any Glue table. An Iceberg-on-Glue contract
+  that set `partitionBy` for its Kafka Connect or Debezium sink now fails validate: the sink's
+  default partitioning applies only to a table it creates, and `fluid apply` had already created
+  this one unpartitioned. Set the spec with an Iceberg engine instead. Partition-key columns
+  must be `required: true` to be projected, since null keys land under
+  `__HIVE_DEFAULT_PARTITION__`, which projection never reads. A duckdb build writes a
   partitioned table in the Hive layout (`COPY ... PARTITION_BY`, the key columns kept in the
   paths): a full refresh replaces the partitions it writes, as the Spark runner does, and
   `incremental_append` adds files. It refuses, before writing, a late-arrival split, dedup or
-  merge mode, or streams that land outside the location; the embedded-SQL landing, which
-  writes one file, refuses a partitioned table.
+  merge mode, a json sink, streams that land outside the location, a file where the
+  partitions' directory goes, and a full refresh where files another run wrote would be read
+  beside the new ones; the embedded-SQL landing, which writes one file, refuses a partitioned
+  table. A product that consumes a partitioned table reads its `<key>=*/` layout, key columns
+  included. `fluid verify` holds a partitioned full refresh to at least the run's rows, and an
+  empty unprojected table's count says to run `MSCK REPAIR TABLE`.
 
 - **A BigQuery table is partitioned and clustered as its binding declares.**
   `binding.location.partitionBy` was read only with `lifecycle.expire`, and

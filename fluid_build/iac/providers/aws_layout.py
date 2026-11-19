@@ -185,11 +185,13 @@ def _table_format_refusal(where: str, fmt: str) -> UnsupportedBindingError:
             "catalog. Iceberg keeps its partition spec in its own metadata, not in Glue "
             "partition keys, and hashicorp/aws sets the spec only on create "
             "(open_table_format_input, which it never reads back), so forge would create "
-            "the table unpartitioned and never change it.",
+            "the table unpartitioned and never change it. An Iceberg sink's "
+            "default-partition-by does not help: it applies only to a table the sink creates, "
+            "and fluid apply creates this one first.",
             (
                 "Drop partitionBy here, and set the spec with an Iceberg engine once the table "
                 "exists, for example Spark: ALTER TABLE <database>.<table> ADD PARTITION "
-                "FIELD <column>.",
+                "FIELD <column>. A sink then writes through that spec.",
             ),
         )
     if fmt == "delta":
@@ -290,7 +292,12 @@ def _projection(
 
 
 def _key_projection(key: PartitionKey, column: Mapping[str, Any]) -> Any:
-    """One key's projection properties, or the reason it has none (a ``str``)."""
+    """One key's projection properties, or the reason it has none (a ``str``).
+
+    A key that may be null is not projected: writers put its null rows under
+    ``<key>=__HIVE_DEFAULT_PARTITION__/``, which no projected value names."""
+    if column.get("required") is not True:
+        return f"{key.name} may be null (declare required: true)"
     if key.hive_type == "date":
         return {
             "type": "date",
@@ -315,6 +322,7 @@ def _key_projection(key: PartitionKey, column: Mapping[str, Any]) -> Any:
             f"{key.name} declares no values (an enum(...) type or validationRules "
             "[{type: enum, constraint: 'a | b'}])"
         )
+    values = list(dict.fromkeys(values))  # a level named twice is projected once
     unsafe = [value for value in values if not _PATH_SAFE_RE.match(value)]
     if unsafe:
         return (
@@ -386,20 +394,31 @@ def validate_aws_layout(contract: Mapping[str, Any]) -> Tuple[List[str], List[st
 
 
 def partition_registration_notes(contract: Mapping[str, Any]) -> List[str]:
-    """One line per partitioned Glue table without projection: its partitions need
-    registering before Athena, Redshift Spectrum or Spark read them."""
+    """One line per partitioned Glue table: without projection its partitions need
+    registering before Athena, Redshift Spectrum or Spark read them; with a projected
+    date key, Athena reads its partitions up to today only."""
     notes: List[str] = []
     for index, exposure, found in _glue_layouts(contract):
-        if isinstance(found, UnsupportedBindingError) or not found.keys or found.projection:
+        if isinstance(found, UnsupportedBindingError) or not found.keys:
             continue
         loc = (exposure.get("binding") or {}).get("location") or {}
+        if found.projection:
+            dated = [k.name for k in found.keys if k.hive_type == "date"]
+            if dated:
+                notes.append(
+                    f"{_where(exposure, index)}: Athena projects the partitions of "
+                    f"{', '.join(dated)} from {DATE_PROJECTION_START} to today (UTC), so a "
+                    "row dated later is not read until its day comes."
+                )
+            continue
         notes.append(
             f"{_where(exposure, index)}: Glue table {loc.get('database')}.{loc.get('table')} "
             f"is partitioned by ({', '.join(found.names)}) without Athena partition "
             f"projection, because {'; '.join(found.unprojected)}. Its partitions need "
             "registering: Athena INSERT INTO and CTAS and Spark's saveAsTable/insertInto "
-            "register theirs; for files written another way run MSCK REPAIR TABLE or ALTER "
-            "TABLE ADD PARTITION, or declare the values to have Athena project them."
+            "register theirs, and a duckdb build registers none; after files written another "
+            "way run MSCK REPAIR TABLE or ALTER TABLE ADD PARTITION, or declare the values to "
+            "have Athena project them."
         )
     return notes
 
@@ -407,7 +426,12 @@ def partition_registration_notes(contract: Mapping[str, Any]) -> List[str]:
 def partitioned_hive_table(binding: Mapping[str, Any]) -> Tuple[str, ...]:
     """The partition columns of the Glue Hive table ``binding`` writes into, ``()`` for
     any other binding. A writer lays out ``<key>=<value>/`` under the location for
-    them (the duckdb runner), or refuses the table (the embedded-SQL landing)."""
+    them (the duckdb runner), or refuses the table (the embedded-SQL landing).
+
+    Raises:
+        UnsupportedBindingError: ``partitionBy`` is not a list of column names, which
+            ``fluid validate`` refuses too.
+    """
     from .aws import _glue_table_declared
 
     if not isinstance(binding, Mapping) or not is_cloud(binding, "aws"):
@@ -417,9 +441,9 @@ def partitioned_hive_table(binding: Mapping[str, Any]) -> Tuple[str, ...]:
         return ()
     loc = binding.get("location") or {}
     names = loc.get("partitionBy") if isinstance(loc, Mapping) else None
-    if not isinstance(names, (list, tuple)):
+    if not _declared(names):
         return ()
-    return tuple(str(name) for name in names if isinstance(name, str) and name)
+    return tuple(_key_names(names, "the expose"))
 
 
 #: Why a writer that writes one file under ``location`` cannot land a partitioned table.

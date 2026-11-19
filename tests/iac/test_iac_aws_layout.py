@@ -40,14 +40,20 @@ TRIGGER = f"{TABLE_KEY}_partitioning"
 
 _SCHEMA = [
     {"name": "id", "type": "string", "required": True},
-    {"name": "order_date", "type": "date", "description": "Day of the order (UTC)"},
+    {
+        "name": "order_date",
+        "type": "date",
+        "required": True,
+        "description": "Day of the order (UTC)",
+    },
     {"name": "occurred_at", "type": "timestamp"},
     {"name": "region", "type": "string"},
-    {"name": "channel", "type": "enum('web', 'store')"},
-    {"name": "is_test", "type": "boolean"},
+    {"name": "channel", "type": "enum('web', 'store')", "required": True},
+    {"name": "is_test", "type": "boolean", "required": True},
     {
         "name": "shard",
         "type": "int",
+        "required": True,
         "validationRules": [{"type": "range", "constraint": "between 0 and 15"}],
     },
     {"name": "customer_id", "type": "bigint"},
@@ -215,11 +221,22 @@ def test_an_enum_validation_rule_gives_the_values():
         {
             "name": "region",
             "type": "string",
-            "validationRules": [{"type": "enum", "constraint": "eu | us"}],
+            "required": True,
+            "validationRules": [{"type": "enum", "constraint": "eu | us | eu"}],
         },
     ]
     projection = _projection(_table(_contract(partition_by=["region"], schema=schema)))
-    assert projection["projection.region.values"] == "eu,us"
+    assert projection["projection.region.values"] == "eu,us"  # a level named twice: once
+
+
+def test_a_key_that_may_be_null_is_not_projected():
+    """Its null rows sit under ``__HIVE_DEFAULT_PARTITION__``, which no value names."""
+    schema = [{"name": "id", "type": "string"}, {"name": "kind", "type": "enum('a', 'b')"}]
+    contract = _contract(partition_by=["kind"], schema=schema)
+    assert not _projection(_table(contract))
+    assert "because kind may be null (declare required: true)" in (
+        partition_registration_notes(contract)[0]
+    )
 
 
 @pytest.mark.parametrize(
@@ -239,6 +256,7 @@ def test_an_integer_key_is_projected_only_from_a_range_with_both_whole_bounds(co
         {
             "name": "bucket",
             "type": "int",
+            "required": True,
             "validationRules": [{"type": "range", "constraint": constraint}],
         },
     ]
@@ -252,7 +270,7 @@ def test_one_key_without_known_values_leaves_the_table_unprojected_and_says_so()
     (note,) = partition_registration_notes(contract)
     assert note.startswith(
         "exposes[orders]: Glue table sales.orders is partitioned by (order_date, region) "
-        "without Athena partition projection, because region declares no values"
+        "without Athena partition projection, because region may be null"
     )
     assert "MSCK REPAIR TABLE" in note
     assert validate_aws_layout(contract) == ([], [note])
@@ -260,14 +278,22 @@ def test_one_key_without_known_values_leaves_the_table_unprojected_and_says_so()
 
 
 def test_values_a_writer_escapes_in_a_path_are_not_projected():
-    schema = [{"name": "id", "type": "string"}, {"name": "kind", "type": "enum('a b', 'c')"}]
+    schema = [
+        {"name": "id", "type": "string"},
+        {"name": "kind", "type": "enum('a b', 'c')", "required": True},
+    ]
     contract = _contract(partition_by=["kind"], schema=schema)
     assert not _projection(_table(contract))
     assert "'a b'" in partition_registration_notes(contract)[0]
 
 
-def test_a_projected_table_needs_no_registration_note():
-    assert partition_registration_notes(_contract(partition_by=["order_date"])) == []
+def test_a_projected_table_needs_no_registration_and_its_date_cutoff_is_noted():
+    assert partition_registration_notes(_contract(partition_by=["channel"])) == []
+    (note,) = partition_registration_notes(_contract(partition_by=["order_date", "channel"]))
+    assert note == (
+        "exposes[orders]: Athena projects the partitions of order_date from 1970-01-01 to "
+        "today (UTC), so a row dated later is not read until its day comes."
+    )
 
 
 # ── Refusals ────────────────────────────────────────────────────────────────
@@ -487,3 +513,30 @@ def test_generate_iac_writes_the_keys_deterministically(tmp_path):
     assert module["resource"]["terraform_data"][TRIGGER]
     plugin = get_iac_plugin("aws")
     assert build_module(plugin, contract) == build_module(plugin, contract)
+
+
+# ── fluid verify ────────────────────────────────────────────────────────────
+
+
+def test_verify_names_registration_for_an_empty_unprojected_table():
+    from fluid_build.cli._verify_athena import RULE_EQUAL, _row_count_dimension
+
+    found = _row_count_dimension(0, 3, {"rule": RULE_EQUAL}, "sales.orders", unregistered=True)
+    assert found["status"] == "fail"
+    assert "run MSCK REPAIR TABLE sales.orders" in found["message"]
+
+
+def test_verify_holds_a_partitioned_full_refresh_to_at_least_its_rows():
+    from fluid_build.cli._verify_athena import (
+        RULE_AT_LEAST_RUN,
+        _partition_layout,
+        _row_count_dimension,
+    )
+
+    contract = _contract(partition_by=["order_date"])
+    expose = contract["exposes"][0]
+    assert _partition_layout("orders", expose, contract) == (True, False)
+    assert _partition_layout("orders", _contract()["exposes"][0], _contract()) == (False, False)
+    info = {"rule": RULE_AT_LEAST_RUN}
+    assert _row_count_dimension(5, 3, info, "sales.orders")["status"] == "pass"
+    assert _row_count_dimension(2, 3, info, "sales.orders")["status"] == "fail"

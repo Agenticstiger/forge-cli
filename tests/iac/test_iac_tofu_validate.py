@@ -811,8 +811,8 @@ def test_glue_partition_keys_and_projection_pass_tofu_validate(tmp_path):
     contract = _lf_bucket_policy_contract(None, None)
     exposure = contract["exposes"][0]
     exposure["contract"]["schema"] += [
-        {"name": "order_date", "type": "date"},
-        {"name": "region", "type": "enum('eu', 'us')"},
+        {"name": "order_date", "type": "date", "required": True},
+        {"name": "region", "type": "enum('eu', 'us')", "required": True},
     ]
     exposure["binding"]["location"]["partitionBy"] = ["order_date", "region"]
     module = build_module(IAC_PLUGINS["aws"], contract)
