@@ -362,8 +362,8 @@ def test_publish_writes_the_aws_layout_under_a_directory_root(tmp_path, stub):
 
 
 def test_publish_to_s3_uploads_both_objects(tmp_path, stub):
-    import boto3
-    from moto import mock_aws
+    boto3 = pytest.importorskip("boto3")
+    mock_aws = pytest.importorskip("moto").mock_aws
 
     env = {SUBMIT_EXECUTABLE_ENV: str(stub), LOCAL_ROOT_ENV: "s3://lake/lab"}
     with mock_aws():
@@ -383,7 +383,7 @@ def test_publish_to_s3_uploads_both_objects(tmp_path, stub):
 
 
 def test_an_s3_compatible_endpoint_gets_path_style_requests(tmp_path, stub, monkeypatch):
-    import boto3
+    boto3 = pytest.importorskip("boto3")
 
     seen = {}
 
@@ -411,7 +411,7 @@ def test_an_s3_compatible_endpoint_gets_path_style_requests(tmp_path, stub, monk
 
 
 def test_an_s3_client_that_cannot_be_made_is_a_named_error(tmp_path, stub, monkeypatch):
-    import boto3
+    boto3 = pytest.importorskip("boto3")
 
     def client(service, **kwargs):
         raise ValueError("Invalid endpoint: not-a-url")
