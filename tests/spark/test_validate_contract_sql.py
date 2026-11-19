@@ -26,7 +26,7 @@ from fluid_build.spark.compiler import (
     validation_warnings,
 )
 from fluid_build.spark.policy import SparkPolicyError, refuse_unless_contract_sql_allowed
-from fluid_build.streaming.policy import contract_sql_entry
+from fluid_build.streaming.contract_sql import contract_sql_entry
 from tests.spark.conftest import CONTRACT
 from tests.spark.test_compiler import _sql_build
 

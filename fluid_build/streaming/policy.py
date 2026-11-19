@@ -63,11 +63,7 @@ from fluid_build.secrets.policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST_ENV
 from fluid_build.secrets.policy import allowlist as secret_ref_allowlist
 from fluid_build.secrets.policy import is_loopback, variable_allowed
 from fluid_build.streaming.compiler import CONTRACT_SQL_ALLOWLIST_ENV
-from fluid_build.streaming.contract_sql import (  # noqa: F401 - re-exported
-    contract_sql_entry,
-    contract_sql_refusal,
-    listed_sql_refusal,
-)
+from fluid_build.streaming.contract_sql import listed_sql_refusal
 from fluid_build.streaming.contract_sql import operator_entries as _entries
 
 CONTEXT_ALLOWLIST_ENV = "FLUID_FLINK_KUBE_CONTEXT_ALLOWLIST"

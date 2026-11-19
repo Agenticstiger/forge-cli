@@ -15,10 +15,10 @@ import copy
 import pytest
 
 from fluid_build.streaming.compiler import validation_errors, validation_warnings
+from fluid_build.streaming.contract_sql import contract_sql_entry
 from fluid_build.streaming.policy import (
     CONTRACT_SQL_ALLOWLIST_ENV,
     FlinkPolicyError,
-    contract_sql_entry,
     refuse_unless_contract_sql_allowed,
 )
 from fluid_build.streaming.runtime import reconcile
