@@ -35,7 +35,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 import yaml
 
@@ -135,16 +135,27 @@ def _sf_table_binding(binding: Mapping[str, Any]) -> bool:
     return bool(loc.get("database") and loc.get("schema") and (loc.get("table") or loc.get("view")))
 
 
+def snowflake_tables(contract: Mapping[str, Any]) -> Iterator[Tuple[str, List[Any]]]:
+    """``(expose id, columns)`` for each Snowflake table :func:`_emit_snowflake` writes
+    typed columns for: the tables :func:`validate_snowflake_column_types` judges."""
+    for exposure in column_types.exposes_of(contract):
+        binding = exposure.get("binding") if isinstance(exposure, Mapping) else None
+        if not isinstance(binding, Mapping) or not is_cloud(binding, "snowflake"):
+            continue
+        if _sf_table_binding(binding):
+            yield _expose_id(exposure) or "?", column_types.schema_of(exposure)
+
+
 def validate_snowflake_column_types(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
     """``(errors, warnings)`` for the column types of the contract's Snowflake tables:
     the refusal :func:`_emit_snowflake` raises. ``fluid validate`` runs this, so
     ``generate iac`` finds nothing new."""
-    return column_types.table_type_findings(
-        contract,
-        lambda binding: is_cloud(binding, "snowflake") and _sf_table_binding(binding),
-        _sf_column_type_findings,
-        lambda exposure, _index: _expose_id(exposure) or "?",
-    )
+    errors: List[str] = []
+    for expose, schema in snowflake_tables(contract):
+        refusal, _lossy = _sf_column_type_findings(expose, schema)
+        if refusal is not None:
+            errors.append(f"{refusal} {' '.join(refusal.remediation)}".strip())
+    return errors, []
 
 
 @dataclass(frozen=True)

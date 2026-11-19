@@ -33,7 +33,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from ...util.column_type import param_number
 from .. import column_types
@@ -504,17 +504,36 @@ def _refuse_bq_column_types(expose: str, schema: Iterable[Any]) -> None:
         raise refusal
 
 
+def bigquery_tables(contract: Mapping[str, Any]) -> Iterator[Tuple[str, List[Any]]]:
+    """``(expose id, columns)`` for each BigQuery table :func:`_emit_bigquery` writes (a
+    view carries no schema): the tables :func:`validate_bigquery_column_types` and
+    ``fluid doctor --contract`` judge."""
+    for exposure in column_types.exposes_of(contract):
+        binding = exposure.get("binding") if isinstance(exposure, Mapping) else None
+        if not isinstance(binding, Mapping) or not _gov.gcp_owned(binding):
+            continue
+        if resolve_gcp_target(binding) == BIGQUERY_TABLE:
+            yield _expose_id(exposure) or "?", column_types.schema_of(exposure)
+
+
+def bigquery_column_outcome(column: Mapping[str, Any]) -> column_types.TypeOutcome:
+    """What one column becomes in a BigQuery table schema: exact, lossy or refused."""
+    return column_types.outcome_of(column, _bq_outcome, _bq_column_outcome)
+
+
 def validate_bigquery_column_types(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
     """``(errors, warnings)`` for the column types of the contract's BigQuery tables:
     the refusal :func:`_emit_bigquery` raises, and a warning for each type it writes as
     a different one. A view carries no schema. ``fluid validate`` runs this, so
     ``generate iac`` finds nothing new."""
-    return column_types.table_type_findings(
-        contract,
-        lambda binding: _gov.gcp_owned(binding) and resolve_gcp_target(binding) == BIGQUERY_TABLE,
-        _bq_column_type_findings,
-        lambda exposure, _index: _expose_id(exposure) or "?",
-    )
+    errors: List[str] = []
+    warnings: List[str] = []
+    for expose, schema in bigquery_tables(contract):
+        refusal, lossy = _bq_column_type_findings(expose, schema)
+        if refusal is not None:
+            errors.append(f"{refusal} {' '.join(refusal.remediation)}".strip())
+        warnings.extend(lossy)
+    return errors, warnings
 
 
 def _bq_fields(schema: List[Mapping[str, Any]]) -> List[Dict[str, Any]]:
