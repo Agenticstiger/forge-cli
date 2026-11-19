@@ -80,6 +80,13 @@ def get_iceberg_warehouse(loc: Mapping[str, Any], *, account_ref: str) -> str:
     return f"s3://{bucket}/{path}"
 
 
+def iceberg_table_location(loc: Mapping[str, Any], *, account_ref: str) -> str:
+    """An Iceberg table's location as Iceberg keeps it: :func:`get_iceberg_warehouse`
+    without its trailing slash (``LocationUtil.stripTrailingSlash``), which is what every
+    engine's commit writes back into the Glue table (``GlueTableOperations``)."""
+    return get_iceberg_warehouse(loc, account_ref=account_ref).rstrip("/")
+
+
 def bucket_uses_fallback(loc: Mapping[str, Any]) -> bool:
     """True when the bucket is absent / an unresolved ``{{ env.* }}`` template,
     so the warehouse falls back to the ``{account_ref}-fluid-data`` bucket.

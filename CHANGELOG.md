@@ -147,6 +147,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The artifact bucket's write access stays the boundary. A scheduler's role already reads both
   objects. The runner changed, so each running Spark stream restarts once on its next apply.
 
+- **An Iceberg table on Glue plans no change after an engine commits to it.** forge emitted the
+  table's location with a trailing slash; Iceberg keeps it without one and writes it back into
+  Glue on every commit. So each `fluid apply` after a commit (every scheduled run beside a
+  stream) planned `~1` per written table and sent an `UpdateTable` while the stream kept
+  committing, with `previous_metadata_location` from the plan's refresh. The location is now
+  emitted as Iceberg keeps it. The first apply after the upgrade updates each existing Iceberg
+  table's location once, in place; Hive-format tables keep their trailing slash.
+
 ## [0.33.0] — 2026-11-19
 
 ### Added

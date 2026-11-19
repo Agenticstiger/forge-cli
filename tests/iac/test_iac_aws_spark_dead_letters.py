@@ -68,7 +68,13 @@ def test_the_dead_letters_table_sits_beside_the_output_never_inside_it(contract)
     table = resources["aws_glue_catalog_table"][TABLE_KEY]
     assert table["name"] == "order_lines__dead_letter"
     storage = table["storage_descriptor"]
-    assert storage["location"] == "s3://commerce-lake/iceberg/commerce/order_lines__dead_letter/"
+    # As Iceberg keeps a table's location: no trailing slash (the S3 grant below has its own).
+    assert storage["location"] == "s3://commerce-lake/iceberg/commerce/order_lines__dead_letter"
+    # Beside, never inside, by whole path segments (``order_lines__dead_letter`` starts with
+    # ``order_lines`` as a string, not as a directory).
+    output = resources["aws_glue_catalog_table"]["commerce_orders_stream_commerce_order_lines"]
+    outside = output["storage_descriptor"]["location"].rstrip("/") + "/"
+    assert not (storage["location"].rstrip("/") + "/").startswith(outside)
     assert {c["name"]: c["type"] for c in storage["columns"]} == {
         "error": "string",
         "raw_value": "binary",
@@ -107,7 +113,7 @@ def test_the_dead_letters_table_sits_beside_the_output_never_inside_it(contract)
 def test_a_named_dead_letters_table_is_the_one_emitted_and_granted(contract):
     resources, data = emit(with_dead_letters(contract, table="order_rejects"))
     table = resources["aws_glue_catalog_table"]["commerce_orders_stream_commerce_order_rejects"]
-    assert table["storage_descriptor"]["location"].endswith("/iceberg/commerce/order_rejects/")
+    assert table["storage_descriptor"]["location"].endswith("/iceberg/commerce/order_rejects")
     glue = statement(data["aws_iam_policy_document"][f"{KEY}_access"], "GlueTable")
     assert glue["resources"][-1].endswith(":table/commerce/order_rejects")
 
