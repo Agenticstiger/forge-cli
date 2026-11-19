@@ -91,7 +91,7 @@ from ..engines.dbt import _test_mapping as _tm
 from ..engines.dbt.schema_yml import TESTS_KEY_LEGACY, normalize_tests_key
 
 # Contract text reaches dbt as text, never as Jinja it would run (one helper, every path).
-from ..util.dbt_jinja import GeneratedJinja, inert
+from ..util.dbt_jinja import GeneratedJinja, dbt_name, inert
 
 # Block sentinel — the runner uses this to detect a managed file and refuse
 # to clobber a hand-edited one.
@@ -204,7 +204,8 @@ def _expose_to_model(
     description = expose.get("description") or expose.get("title") or ""
 
     model: dict[str, Any] = {
-        "name": name,
+        # dbt runs the tests against ref('<name>'), so the name may not end the string.
+        "name": dbt_name(name, "exposeId"),
         "description": description,
     }
 

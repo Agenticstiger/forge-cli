@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, 
 
 import yaml
 
-from fluid_build.util.dbt_jinja import GeneratedJinja, inert, jinja_text
+from fluid_build.util.dbt_jinja import GeneratedJinja, dbt_name, inert, jinja_text, unsafe
 from fluid_build.util.freshness import iso_duration_to_freshness_unit
 from fluid_build.util.upstream_discovery import discover_upstream_products
 
@@ -76,15 +76,15 @@ except ImportError:  # pragma: no cover
         ]
 
 
-# Matches ``{{ env.FOO }}`` / ``{{env.FOO}}`` (FLUID contract placeholder).
-_FLUID_ENV_RE = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
-# Matches ``${FOO}`` (shell-style placeholder) and ``$FOO``.
-_SHELL_ENV_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
-#: Either placeholder shape, in one pass (FLUID's first, as before).
+#: A placeholder a contract may write for a location, in one pass: FLUID's ``{{ env.FOO }}``,
+#: the shell's ``${FOO}`` and ``$FOO``, and dbt's own ``{{ env_var('FOO') }}`` with a
+#: plain default in either quote or ``target.<attribute>``. Each is written back as
+#: ``env_var(...)`` built from the parts matched here, never from the text itself.
 _PLACEHOLDER_RE = re.compile(
     r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}|\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"
-    # dbt's own form, which a contract may already use: a name, and a plain default.
-    r"|\{\{\s*env_var\(\s*'([A-Za-z_][A-Za-z0-9_]*)'(?:\s*,\s*'([A-Za-z0-9_.\-/ ]*)')?\s*\)\s*\}\}"
+    r"|\{\{\s*env_var\(\s*(['\"])([A-Za-z_][A-Za-z0-9_]*)\3"
+    r"(?:\s*,\s*(?:(['\"])([A-Za-z0-9_.\-/ ]*)\5|target\.([A-Za-z_][A-Za-z0-9_]*)))?"
+    r"\s*\)\s*\}\}"
 )
 
 
@@ -216,8 +216,10 @@ def generate_sources(
             grouped[key] = []
             order.append(key)
 
+        # dbt runs a source table's tests against source('<source>', '<table>'), Jinja it
+        # builds by pasting the name in, so the name may not end the quoted string.
         table_entry: Dict[str, Any] = {
-            "name": port["id"],
+            "name": dbt_name(port["id"], "consumes[].id"),
         }
         if resolved["identifier"] and resolved["identifier"] != port["id"]:
             table_entry["identifier"] = resolved["identifier"]
@@ -298,7 +300,7 @@ def generate_sources_from_logical_model(logical_model: Mapping[str, Any]) -> Opt
         name = str(dataset.get("source") or dataset.get("name") or "").strip()
         if not name:
             continue
-        entry: Dict[str, Any] = {"name": name}
+        entry: Dict[str, Any] = {"name": dbt_name(name, "logical model dataset")}
         fields = dataset.get("fields") or []
         columns = []
         for field in fields:
@@ -424,13 +426,14 @@ def _normalize_placeholder(value: Any) -> Optional[str]:
     last = 0
     for match in _PLACEHOLDER_RE.finditer(text):
         parts.append(_literal_piece(text[last : match.start()]))
-        name = match.group(1) or match.group(2) or match.group(3)
-        default = match.group(4)
-        parts.append(
-            f"{{{{ env_var('{name}', '{default}') }}}}"
-            if default is not None
-            else f"{{{{ env_var('{name}') }}}}"
-        )
+        name = match.group(1) or match.group(2) or match.group(4)
+        if match.group(6) is not None:
+            default = f", '{match.group(6)}'"
+        elif match.group(7) is not None:
+            default = f", target.{match.group(7)}"
+        else:
+            default = ""
+        parts.append(f"{{{{ env_var('{name}'{default}) }}}}")
         last = match.end()
     parts.append(_literal_piece(text[last:]))
     return GeneratedJinja("".join(parts))
@@ -438,8 +441,10 @@ def _normalize_placeholder(value: Any) -> Optional[str]:
 
 def _literal_piece(text: str) -> str:
     """Contract text between placeholders: as written, or a Jinja literal of itself where
-    it holds a brace or a percent sign dbt could read as Jinja."""
-    if not text or not any(c in text for c in "{}%#"):
+    dbt could read it as Jinja. A brace alone counts, because next to a placeholder it can
+    complete a delimiter (``{`` before ``{{ env_var(...) }}``); ``%`` and ``#`` open one
+    only after a brace."""
+    if not text or not ("{" in text or "}" in text or unsafe(text)):
         return text
     return jinja_text(text)
 

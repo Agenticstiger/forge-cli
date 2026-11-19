@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 import yaml
 
-from fluid_build.util.dbt_jinja import GeneratedJinja, inert
+from fluid_build.util.dbt_jinja import GeneratedJinja, dbt_name, inert
 
 from ..base import GenerationResult
 
@@ -257,7 +257,9 @@ def generate_schema_yml(
             schema_cols, dq_rules, tests_key=resolved_tests_key, capabilities=capabilities
         )
 
-        model_def: Dict[str, Any] = {"name": expose_id}
+        # dbt runs a model's tests against ref('<name>', version='<v>'), Jinja it builds by
+        # pasting both in, so neither may end the quoted string.
+        model_def: Dict[str, Any] = {"name": dbt_name(expose_id, "exposeId")}
 
         desc = expose.get("description")
         if desc:
@@ -300,6 +302,7 @@ def generate_schema_yml(
         # dbt uses this for model-version pinning in downstream refs.
         version = contract_section.get("version")
         if version:
+            version = dbt_name(version, f"exposes[{expose_id}].contract.version")
             model_def["latest_version"] = version
             # dbt model-versions require a ``versions`` list too.
             model_def["versions"] = [{"v": version}]

@@ -40,11 +40,21 @@ def test_a_quoted_value_becomes_a_literal_per_adapter() -> None:
     def rendered(value: str, adapter: str) -> str:
         return env.from_string(value).render(target=SimpleNamespace(type=adapter))
 
+    assert test["values"][0] == "'A'"  # the same literal on every engine: written once
     assert rendered(test["values"][1], "duckdb") == "'O''Brien'"
     assert rendered(test["values"][1], "bigquery") == "'O\\'Brien'"
     assert rendered(test["values"][2], "databricks") == "'x\\\\y'"
     assert rendered(test["values"][2], "postgres") == "'x\\y'"
     assert rendered(test["values"][2], "redshift") == "'x\\\\y'"  # unknown: doubled too
+
+
+def test_a_mixed_list_keeps_each_value_s_text() -> None:
+    values = tm.accepted_values_test([1, "O'Neil", True])["accepted_values"]["values"]
+    rendered = [
+        jinja2.Environment().from_string(v).render(target=SimpleNamespace(type="snowflake"))
+        for v in values
+    ]
+    assert rendered == ["'1'", "'O''Neil'", "'True'"]
 
 
 def _dbt() -> str:
@@ -58,11 +68,8 @@ def _dbt() -> str:
     return binary
 
 
-def test_real_dbt_runs_the_quoted_values(tmp_path: Path) -> None:
-    binary = _dbt()
-    from fluid_build.exporters.dbt_tests import render_dbt_tests
-
-    contract = {
+def _contract() -> dict:
+    return {
         "fluidVersion": "0.7.6",
         "kind": "DataProduct",
         "id": "p",
@@ -85,6 +92,11 @@ def test_real_dbt_runs_the_quoted_values(tmp_path: Path) -> None:
             }
         ],
     }
+
+
+def _build(tmp_path: Path, schema_yml: str) -> list:
+    """``dbt build`` a one-model project with ``schema_yml``: the tests' (status, failures)."""
+    binary = _dbt()
     (tmp_path / "models").mkdir()
     (tmp_path / "dbt_project.yml").write_text(
         'name: q\nversion: "1.0"\nprofile: q\nconfig-version: 2\n'
@@ -96,9 +108,7 @@ def test_real_dbt_runs_the_quoted_values(tmp_path: Path) -> None:
     (tmp_path / "models" / "people.sql").write_text(
         "select * from (values ('O''Brien'), ('x\\y'), ('Lee'), ('Smith')) as t(surname)"
     )
-    (tmp_path / "models" / "schema.yml").write_text(render_dbt_tests(contract))
-    schema = yaml.safe_load((tmp_path / "models" / "schema.yml").read_text())
-    assert schema["models"][0]["columns"][0]["tests"][0]["accepted_values"]["quote"] is False
+    (tmp_path / "models" / "schema.yml").write_text(schema_yml)
     env = {
         **os.environ,
         "DBT_PROFILES_DIR": str(tmp_path),
@@ -109,4 +119,29 @@ def test_real_dbt_runs_the_quoted_values(tmp_path: Path) -> None:
     )
     results = json.loads((tmp_path / "target" / "run_results.json").read_text())
     tests = [r for r in results["results"] if r["unique_id"].startswith("test.")]
-    assert [(r["status"], r["failures"]) for r in tests] == [("fail", 1)], done.stdout[-2000:]
+    assert tests, done.stdout[-2000:]
+    return [(r["status"], r["failures"]) for r in tests]
+
+
+def test_real_dbt_runs_the_quoted_values(tmp_path: Path) -> None:
+    from fluid_build.exporters.dbt_tests import render_dbt_tests
+
+    text = render_dbt_tests(_contract())
+    schema = yaml.safe_load(text)
+    assert schema["models"][0]["columns"][0]["tests"][0]["accepted_values"]["quote"] is False
+    assert _build(tmp_path, text) == [("fail", 1)]
+
+
+def test_real_dbt_runs_the_engine_s_quoted_values(tmp_path: Path) -> None:
+    """The engine's schema.yml, with dbt 1.10's ``arguments:`` nesting: ``quote`` is an
+    argument there too, and the one row outside the list (Smith) fails the test."""
+    from fluid_build.engines.dbt._capabilities import MODERN
+    from fluid_build.engines.dbt.schema_yml import generate_schema_yml
+
+    text = generate_schema_yml(_contract(), tests_key="data_tests", capabilities=MODERN)[
+        "models/marts/schema.yml"
+    ]
+    (column,) = yaml.safe_load(text)["models"][0]["columns"]
+    (test,) = [t for t in column["data_tests"] if "accepted_values" in t]
+    assert test["accepted_values"]["arguments"]["quote"] is False
+    assert _build(tmp_path, text) == [("fail", 1)]

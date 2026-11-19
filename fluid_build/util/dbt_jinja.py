@@ -38,6 +38,28 @@ _LOOKS_LIKE_CALL = re.compile(r"^\s*(env_var|ref|var|source|doc)\s*\(.+\)\s*$", 
 _OWN_REF = re.compile(r"ref\('[A-Za-z0-9_]+'\)")
 
 
+#: What ends, escapes or opens a string in code dbt builds itself from a name: a node's
+#: test runs against ``ref('<name>', version='<v>')`` or ``source('<source>', '<table>')``,
+#: which dbt renders after splicing the name in, so no literal of the name helps there.
+_NAME_BREAKERS = re.compile(r"['\\{}\x00-\x1f\x7f]")
+
+
+class UnsafeDbtName(ValueError):
+    """A contract name or version dbt would splice into code it renders as Jinja."""
+
+
+def dbt_name(value: Any, what: str) -> str:
+    """``value`` as a dbt node name or version, refused (:class:`UnsafeDbtName`) when it
+    holds a quote, a backslash, a brace or a control character."""
+    text = str(value)
+    if _NAME_BREAKERS.search(text):
+        raise UnsafeDbtName(
+            f"{what} {text!r} cannot name a dbt node: dbt writes it into Jinja it runs, so "
+            "it must hold no quote, backslash, brace or control character"
+        )
+    return text
+
+
 class GeneratedJinja(str):
     """Jinja forge built from literals: :func:`inert` leaves it as written."""
 
@@ -121,6 +143,8 @@ def plain(value: Any) -> Any:
 __all__ = [
     "GeneratedJinja",
     "GeneratedMapping",
+    "UnsafeDbtName",
+    "dbt_name",
     "inert",
     "jinja_literal",
     "jinja_text",
