@@ -398,20 +398,12 @@ def validate_aws_column_types(contract: Mapping[str, Any]) -> Tuple[List[str], L
     """``(errors, warnings)`` for the column types of the contract's Glue tables: the
     refusal :func:`_emit_glue` raises, and a warning for each type it writes as a
     fallback. ``fluid validate`` runs this so ``generate iac`` finds nothing new."""
-    errors: List[str] = []
-    warnings: List[str] = []
-    for index, exposure in enumerate(column_types.exposes_of(contract)):
-        binding = exposure.get("binding") if isinstance(exposure, Mapping) else None
-        if not isinstance(binding, Mapping) or not is_cloud(binding, "aws"):
-            continue
-        if not _glue_table_declared(binding):
-            continue
-        schema = column_types.schema_of(exposure)
-        refusal, lossy = _glue_column_type_findings(_expose_id(exposure) or str(index), schema)
-        if refusal is not None:
-            errors.append(f"{refusal} {' '.join(refusal.remediation)}".strip())
-        warnings.extend(lossy)
-    return errors, warnings
+    return column_types.table_type_findings(
+        contract,
+        lambda binding: is_cloud(binding, "aws") and _glue_table_declared(binding),
+        _glue_column_type_findings,
+        lambda exposure, index: _expose_id(exposure) or str(index),
+    )
 
 
 def _plan_glue_columns(state: Any) -> Dict[str, str]:

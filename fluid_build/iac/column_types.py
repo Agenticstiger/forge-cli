@@ -155,3 +155,31 @@ def column_type_findings(
         ),
     )
     return refusal, warnings
+
+
+#: An emitter's own check of one expose's columns (:func:`column_type_findings` bound
+#: to its type table): ``(refusal, lossy warnings)``.
+Findings = Callable[[str, Iterable[Any]], Tuple[Optional[UnsupportedBindingError], List[str]]]
+
+
+def table_type_findings(
+    contract: Any,
+    holds_table: Callable[[Mapping[str, Any]], bool],
+    findings: Findings,
+    expose_name: Callable[[Mapping[str, Any], int], str],
+) -> Tuple[List[str], List[str]]:
+    """``(errors, warnings)`` for the column types of the contract's tables on one
+    target, as ``fluid validate`` reports them: ``holds_table(binding)`` picks the
+    bindings the emitter writes a table with typed columns for, and ``findings`` is the
+    check that emitter refuses with, so ``generate iac`` finds nothing new."""
+    errors: List[str] = []
+    warnings: List[str] = []
+    for index, exposure in enumerate(exposes_of(contract)):
+        binding = exposure.get("binding") if isinstance(exposure, Mapping) else None
+        if not isinstance(binding, Mapping) or not holds_table(binding):
+            continue
+        refusal, lossy = findings(expose_name(exposure, index), schema_of(exposure))
+        if refusal is not None:
+            errors.append(f"{refusal} {' '.join(refusal.remediation)}".strip())
+        warnings.extend(lossy)
+    return errors, warnings

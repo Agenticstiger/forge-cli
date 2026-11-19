@@ -35,6 +35,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from ...util.column_type import param_number
 from .. import column_types
 from ..access import (
     GROUP,
@@ -95,7 +96,7 @@ _BQ_NUMERIC_SCALE = 9
 _BQ_BIGNUMERIC_INTEGER_DIGITS = 38
 _BQ_BIGNUMERIC_SCALE = 38
 _BQ_DECIMAL_FAMILY = frozenset({"decimal", "numeric", "dec", "number"})
-_BQ_DECIMAL_ARGS_RE = re.compile(r"^\((\d+)(?:,(\d+))?\)$", re.ASCII)
+_BQ_DECIMAL_ARGS_RE = re.compile(r"\((\d+)(?:,(\d+))?\)", re.ASCII)
 
 #: Types whose BigQuery type holds a different thing. ``GEOMETRY`` is planar and
 #: ``GEOGRAPHY`` is a sphere, so the same coordinates mean other shapes and distances.
@@ -182,25 +183,31 @@ def _bq_outcome(raw: Any) -> column_types.TypeOutcome:
             "Declare a FLUID column type such as string, integer, bigint, numeric, double, "
             "boolean, date, timestamp or json.",
         )
-    if (base in _BQ_DECIMAL_FAMILY or base == "bignumeric") and rest:
+    if (base in _BQ_DECIMAL_FAMILY or base == "bignumeric") and rest not in ("", "()"):
+        # A precision and an optional scale in digits, and nothing else: the dbt engine
+        # writes a decimal's arguments into SQL (engines/dbt/_types.py reads this rule).
+        match = _BQ_DECIMAL_ARGS_RE.fullmatch(rest)
+        if match is None:
+            return column_types.refused(
+                "whose arguments are not a precision and an optional scale in digits",
+                "Declare decimal(p) or decimal(p,s) in digits, for example decimal(18,4).",
+            )
         decimal = _bq_decimal(raw)
         if decimal is not None:
             return column_types.exact(decimal[0])
-        match = _BQ_DECIMAL_ARGS_RE.match(rest)
-        if match is not None:
-            precision = _bq_decimal_number(match.group(1))
-            scale = _bq_decimal_number(match.group(2) or "0")
-            if precision < max(1, scale):
-                return column_types.refused(
-                    f"whose precision and scale {rest} are not a decimal's",
-                    "Declare decimal(p,s) with p of at least 1 and s no larger than p.",
-                )
-            return column_types.lossy(
-                "BIGNUMERIC",
-                f"whose range a BigQuery BIGNUMERIC ({_BQ_BIGNUMERIC_INTEGER_DIGITS} integer and "
-                f"{_BQ_BIGNUMERIC_SCALE} fractional digits) cannot hold",
-                "Declare a decimal within that range, or string if the values need more.",
+        precision = param_number(match.group(1))
+        scale = param_number(match.group(2) or "0")
+        if precision < max(1, scale):
+            return column_types.refused(
+                "whose precision and scale are not a decimal's",
+                "Declare decimal(p,s) with p of at least 1 and s no larger than p.",
             )
+        return column_types.lossy(
+            "BIGNUMERIC",
+            f"whose range a BigQuery BIGNUMERIC ({_BQ_BIGNUMERIC_INTEGER_DIGITS} integer and "
+            f"{_BQ_BIGNUMERIC_SCALE} fractional digits) cannot hold",
+            "Declare a decimal within that range, or string if the values need more.",
+        )
     if base in _BQ_LOSSY:
         return column_types.lossy(
             hit, _BQ_LOSSY[base], "Declare geography if the coordinates are on the sphere."
@@ -219,8 +226,8 @@ def _bq_decimal(raw: Any) -> Optional[Tuple[str, int, Optional[int]]]:
     match = _BQ_DECIMAL_ARGS_RE.fullmatch(rest)
     if match is None:
         return None
-    precision = _bq_decimal_number(match.group(1))
-    scale = None if match.group(2) is None else _bq_decimal_number(match.group(2))
+    precision = param_number(match.group(1))
+    scale = None if match.group(2) is None else param_number(match.group(2))
     digits = scale or 0
     if precision < max(1, digits):
         return None
@@ -233,14 +240,6 @@ def _bq_decimal(raw: Any) -> Optional[Tuple[str, int, Optional[int]]]:
     if digits <= _BQ_BIGNUMERIC_SCALE and precision <= digits + _BQ_BIGNUMERIC_INTEGER_DIGITS:
         return "BIGNUMERIC", precision, scale
     return None
-
-
-def _bq_decimal_number(digits: str) -> int:
-    """A declared precision or scale; one of more than four digits is past any BigQuery
-    decimal (BIGNUMERIC goes to 76) and reads as 10000, never through ``int()``, which
-    refuses a string of more than 4300 digits."""
-    significant = digits.lstrip("0")
-    return int(significant or "0") if len(significant) <= 4 else 10_000
 
 
 def _bq_parameters(raw: Any) -> Dict[str, str]:
@@ -510,20 +509,12 @@ def validate_bigquery_column_types(contract: Mapping[str, Any]) -> Tuple[List[st
     the refusal :func:`_emit_bigquery` raises, and a warning for each type it writes as
     a different one. A view carries no schema. ``fluid validate`` runs this, so
     ``generate iac`` finds nothing new."""
-    errors: List[str] = []
-    warnings: List[str] = []
-    for exposure in column_types.exposes_of(contract):
-        binding = exposure.get("binding") if isinstance(exposure, Mapping) else None
-        if not isinstance(binding, Mapping) or not _gov.gcp_owned(binding):
-            continue
-        if resolve_gcp_target(binding) != BIGQUERY_TABLE:
-            continue
-        schema = column_types.schema_of(exposure)
-        refusal, lossy = _bq_column_type_findings(_expose_id(exposure) or "?", schema)
-        if refusal is not None:
-            errors.append(f"{refusal} {' '.join(refusal.remediation)}".strip())
-        warnings.extend(lossy)
-    return errors, warnings
+    return column_types.table_type_findings(
+        contract,
+        lambda binding: _gov.gcp_owned(binding) and resolve_gcp_target(binding) == BIGQUERY_TABLE,
+        _bq_column_type_findings,
+        lambda exposure, _index: _expose_id(exposure) or "?",
+    )
 
 
 def _bq_fields(schema: List[Mapping[str, Any]]) -> List[Dict[str, Any]]:

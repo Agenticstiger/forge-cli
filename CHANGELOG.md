@@ -271,6 +271,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A decimal's arguments are a precision and scale its engine holds, or the column is refused.**
+  A decimal kept whatever arguments it declared, so `decimal(1;drop table x)` went into the
+  Snowflake table's DDL as `NUMBER(1;drop table x)` from `fluid generate iac`, and into the dbt
+  SQL, and `decimal(40,20)` became a NUMBER Snowflake rejects at apply. The arguments are now a
+  precision and an optional scale in digits, the precision at least 1 and the scale no larger,
+  within the engine's limits (Snowflake NUMBER and Redshift DECIMAL: precision to 38, scale to
+  37; Databricks and DuckDB DECIMAL: precision to 38; BigQuery's NUMERIC and BIGNUMERIC as
+  before). `fluid validate` refuses the rest on Snowflake, as it does on Databricks and
+  BigQuery, `fluid generate iac` refuses it, and `fluid generate transformation` refuses it
+  where it writes the column's type for the build's dbt adapter (a skeleton model's casts, a
+  model contract's `data_type`). On BigQuery, arguments that are not digits are refused
+  instead of read as a bare NUMERIC. The dbt BigQuery types no longer keep arguments the
+  emitter refuses (`decimal(2,5)` was `numeric(2,5)`). A type that takes no precision on the
+  engine, such as `bignumeric` on Snowflake or `money`, drops its arguments as before.
 - **The dbt engine and the IaC emitters type a column alike on BigQuery and Snowflake, and a
   BigQuery decimal keeps its precision and scale.** A dbt model builds into the table `fluid
   apply` creates, and the two wrote many types differently, so each dbt rebuild and each apply

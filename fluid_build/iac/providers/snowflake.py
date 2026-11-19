@@ -49,6 +49,8 @@ from ...providers._iceberg_catalog import (
     iceberg_external_volume_name,
 )
 from ...providers._sql_safety import validate_ident
+from .. import column_types
+from ..base import UnsupportedBindingError
 from ..importer import ImportBlock
 from ..naming import safe_ident, tofu_ref
 from ..packaging import ContainerDecision, PackagingResolution, resolve_packaging
@@ -104,6 +106,45 @@ def _sf_type(raw: Any) -> str:
     if base in _SF_DECIMALS:
         return f"NUMBER({args})" if args else "NUMBER(38,0)"
     return f"{base}({args})" if args else base
+
+
+def _sf_outcome(raw: Any) -> column_types.TypeOutcome:
+    """What ``raw`` becomes in a Snowflake table: refused when it is a decimal whose
+    arguments a NUMBER cannot take (``decimal(40,20)``, ``decimal(1;x)``), which would
+    otherwise go into the table's DDL; otherwise exactly :func:`_sf_type`."""
+    from ...engines.dbt import _types as dbt_types
+
+    problem = dbt_types.decimal_argument_problem(str(raw or "string"), "snowflake")
+    if problem is not None:
+        return column_types.refused(*problem)
+    return column_types.exact(_sf_type(raw))
+
+
+def _sf_column_type_findings(
+    expose: str, schema: Iterable[Any]
+) -> Tuple[Optional[UnsupportedBindingError], List[str]]:
+    return column_types.column_type_findings(expose, schema, _sf_outcome, "Snowflake")
+
+
+def _sf_table_binding(binding: Mapping[str, Any]) -> bool:
+    """Whether :func:`_emit_snowflake` writes a table, with typed columns, for the
+    binding: a database, a schema and a table, and not a ``snowflake_view``."""
+    loc = binding.get("location") or {}
+    if not isinstance(loc, Mapping) or binding.get("format") == "snowflake_view":
+        return False
+    return bool(loc.get("database") and loc.get("schema") and (loc.get("table") or loc.get("view")))
+
+
+def validate_snowflake_column_types(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
+    """``(errors, warnings)`` for the column types of the contract's Snowflake tables:
+    the refusal :func:`_emit_snowflake` raises. ``fluid validate`` runs this, so
+    ``generate iac`` finds nothing new."""
+    return column_types.table_type_findings(
+        contract,
+        lambda binding: is_cloud(binding, "snowflake") and _sf_table_binding(binding),
+        _sf_column_type_findings,
+        lambda exposure, _index: _expose_id(exposure) or "?",
+    )
 
 
 @dataclass(frozen=True)
@@ -241,6 +282,7 @@ class SnowflakeIacPlugin:
                 contract=contract,
                 placement=placement,
                 properties=binding.get("properties") or {},
+                expose_id=_expose_id(exposure) or "?",
             )
             _emit_warehouse(resources, loc, cid, placement=placement)
             _emit_iceberg_prereqs(resources, contract, binding, loc, fmt, cid)
@@ -593,6 +635,7 @@ def _emit_snowflake(
     contract: Mapping[str, Any] = None,  # type: ignore[assignment]
     placement: _Placement = _LEGACY_PLACEMENT,
     properties: Mapping[str, Any] = MappingProxyType({}),
+    expose_id: str = "?",
 ) -> None:
     """Emit a Snowflake exposure — its database, schema, and table (or view).
 
@@ -687,6 +730,11 @@ def _emit_snowflake(
             view_body["comment"] = table_comment
         resources.setdefault("snowflake_view", {})[tbl_res] = view_body
         return
+
+    # The same refusal ``fluid validate`` reports (:func:`validate_snowflake_column_types`).
+    refusal, _lossy = _sf_column_type_findings(expose_id, schema_cols)
+    if refusal is not None:
+        raise refusal
 
     table_body: Dict[str, Any] = {
         "name": table,

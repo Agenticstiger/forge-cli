@@ -106,6 +106,25 @@ def test_a_precision_past_int_s_digit_limit_is_classified_not_raised(declared, s
     assert dbt_types.sql_type(declared, "bigquery")
 
 
+@pytest.mark.parametrize(
+    "declared",
+    ["decimal(1;drop table x)", "decimal(18;4)", "numeric(18,4,2)", "bignumeric(a)"],
+)
+def test_arguments_that_are_no_precision_and_scale_are_refused(declared):
+    """They were read as a bare NUMERIC, and dbt's BigQuery types are this table's, so a
+    typo such as ``decimal(18;4)`` lost its scale without a word on both sides."""
+    outcome = gcp._bq_outcome(declared)
+    assert outcome.target is None
+    assert outcome.why == "whose arguments are not a precision and an optional scale in digits"
+    assert _bq_sql_type(declared) is None
+
+
+@pytest.mark.parametrize("declared", ["decimal()", "money(19,4)", "money(1;x)"])
+def test_empty_arguments_and_moneys_digits_stay_a_bare_numeric(declared):
+    assert gcp._bq_outcome(declared).target == "NUMERIC"
+    assert _bq_sql_type(declared) == "numeric"
+
+
 def test_the_dbt_spelling_matches_the_table():
     assert _bq_sql_type("decimal(18,4)") == "numeric(18,4)"
     assert _bq_sql_type("decimal(10)") == "numeric(10)"

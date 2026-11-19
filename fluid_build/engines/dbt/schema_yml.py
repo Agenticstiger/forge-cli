@@ -396,6 +396,9 @@ def _apply_model_contract(
     # nothing downstream re-reads it.
     _merge_model_config(model_def, {"contract": {"enforced": True}})
 
+    _types.refuse_decimal_arguments(
+        model_def.get("name", "?"), [schema_by_name[entry["name"]] for entry in columns], adapter
+    )
     for entry in columns:
         col = schema_by_name[entry["name"]]
 
