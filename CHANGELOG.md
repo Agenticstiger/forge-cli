@@ -39,6 +39,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table. A product that consumes a partitioned table reads its `<key>=*/` layout, key columns
   included. `fluid verify` holds a partitioned full refresh to at least the run's rows, and an
   empty unprojected table's count says to run `MSCK REPAIR TABLE`.
+- **`fluid policy apply` grants a Lakekeeper table in Lakekeeper.** An Iceberg expose whose
+  `binding.location.catalog` is `lakekeeper` used to compile to a warning ("enforce it in the
+  catalog's own access control"). `fluid policy compile` now writes one `provider: lakekeeper`
+  binding per table and principal, from `accessPolicy.grants` (scoped by `resources`), the
+  deprecated `metadata.policies` and the expose's `policy.authz` readers (`select`) and writers
+  (`modify`). `read`, `select` and `query` become `select`; `write`, `insert`, `update`, `delete`,
+  `manage` and `admin` become `modify`; `create`, which Lakekeeper grants only on a namespace or
+  warehouse, is reported. `binding.principals` maps a logical principal to a Lakekeeper `user:`
+  (its id `oidc~<subject>`, name or e-mail), `serviceAccount:` or `role:`. A `group:` names the
+  Lakekeeper role of that name, since Lakekeeper with OpenFGA reads no group from the identity
+  provider. Stage 8 reads each table's direct grants through Lakekeeper's management API and
+  sends only the difference, in one request per table. It grants what the contract declares,
+  revokes any other `describe`, `select` or `modify` on that table, and never touches ownership
+  or grant management. `--mode check` makes the same reads and changes nothing. A table its
+  writer has not created yet (the build, or a sink at its first commit) is reported as pending
+  in both modes, and nothing is granted on it until a later run. It fails closed: a principal
+  Lakekeeper does not know, or one that does not map to a Lakekeeper identity at compile time,
+  leaves its table's grants as they are, since granting the others alone would revoke it, and a
+  grant whose `resources` cannot be evaluated leaves every Lakekeeper table as it is. The contract
+  names the tables, so the operator lists the namespaces a run may change in
+  `FLUID_LAKEKEEPER_NAMESPACE_ALLOWLIST`: comma-separated `<warehouse>/<namespace prefix>` entries,
+  matched on whole dotted levels. Unset allows none. Enforce mode refuses a table outside it before
+  sending any request for it, and names the entry to export; check mode still reads and reports
+  the tables it would refuse. Give stage 8 an identity that manages only the product's own
+  namespaces: on OpenFGA the identity that creates a namespace owns it, which is enough. A user
+  principal with an `@` is matched by e-mail only, any other by exact name only; neither is
+  spoof-proof where the identity provider lets a user set their own name or e-mail, so compile
+  warns, and a person is best mapped by id (`user:oidc~<subject>`). The operator signs forge in
+  with `FLUID_LAKEKEEPER_CREDENTIAL_REF`, a secret reference to `client_id:client_secret`, plus
+  `FLUID_LAKEKEEPER_OAUTH2_SERVER_URI` and `FLUID_LAKEKEEPER_SCOPE`, or with
+  `FLUID_LAKEKEEPER_TOKEN_REF`. These names are operator-only. The reference must be allowed for
+  the catalog's host in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, both URLs must be https, and
+  redirects are not followed. That entry pins the host only, so the contract still picks the port
+  and path: give Lakekeeper a host of its own, and allow the reference for that host (`NAME@host`),
+  not for any host. A private CA works through `REQUESTS_CA_BUNDLE` or `SSL_CERT_FILE`. A
+  Lakekeeper exposure in a file that also holds cloud bindings goes to Lakekeeper, and the rest to
+  the provider, as before.
+
 - **`fluid doctor --contract` says whether an operation can run here, before CI starts.**
   `fluid doctor --contract <file> [--operation validate|generate|plan|apply|ship] [--env NAME]
   [--provider P] [--state-backend SPEC] [--json]` (a `.tgz` bundle too) reports the schema revision the contract resolves to (with the bundled file's

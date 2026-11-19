@@ -95,17 +95,37 @@ AWS_IAM_ALLOWED_PRINCIPALS = "IAM_ALLOWED_PRINCIPALS"
 #: validates as it will emit.
 _ENV_TEMPLATE_RE = re.compile(r"\{\{\s*env\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}")
 
-#: Platforms this module resolves identities for.
+#: Platforms this module resolves identities for. ``LAKEKEEPER`` is a catalog, not
+#: a cloud: an Iceberg table cataloged in Lakekeeper is granted there, whatever the
+#: binding's platform (``fluid policy apply``, ``policy/lakekeeper.py``).
 GCP = "gcp"
 AWS = "aws"
 DATABRICKS = "databricks"
+LAKEKEEPER = "lakekeeper"
 
 #: An example identity per platform, for the unmapped-principal remediation.
 _EXAMPLE_IDENTITY = {
     GCP: "group:data-platform@yourcompany.com",
     AWS: "arn:aws:iam::<account>:role/<name>",
     DATABRICKS: "data-platform",
+    LAKEKEEPER: "role:data-platform",
 }
+
+#: Lakekeeper principal prefixes, lower-cased, to their one spelling. Lakekeeper
+#: has users and roles only. A ``group:`` principal names the Lakekeeper role of
+#: that name: with OpenFGA, Lakekeeper keeps its own roles and reads no group
+#: from the identity provider (Lakekeeper docs, configuration.md, "OpenFGA does
+#: not use role providers"). A service account is a user to Lakekeeper.
+_LAKEKEEPER_PREFIXES = {
+    "user": "user",
+    "serviceaccount": "serviceAccount",
+    "group": "group",
+    "role": "role",
+}
+
+#: A control character (a tab or line break among them): no Lakekeeper id, name or
+#: e-mail holds one. A space can be there: a user's name is a display name.
+_LAKEKEEPER_BAD_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 PrincipalMap = Dict[str, Tuple[str, ...]]
 
@@ -291,6 +311,45 @@ def _databricks_identity(identity: str, *, raw: str, where: str, mapped: bool = 
     return name
 
 
+def _lakekeeper_identity(identity: str, *, raw: str, where: str, mapped: bool = True) -> str:
+    """A Lakekeeper principal: ``user:``, ``serviceAccount:``, ``role:`` or ``group:``.
+
+    A user is its Lakekeeper id (``oidc~<subject>``), its name or its e-mail; a role
+    is its name or its id. Which one exists is checked against the catalog by
+    ``fluid policy apply``, which reads only. ``domain:`` has no Lakekeeper
+    counterpart, and a reserved-TLD address is a placeholder no identity has.
+    """
+    head, sep, rest = identity.partition(":")
+    prefix = _LAKEKEEPER_PREFIXES.get(head.strip().lower()) if sep else None
+    name = rest.strip()
+    if prefix is None or not name or _LAKEKEEPER_BAD_CHARS.search(name):
+        state = "maps to" if mapped else "is"
+        raise UnsupportedBindingError(
+            "principal-invalid" if mapped else "principal-unmapped",
+            f"{where}: principal {raw!r} {state} {identity!r}, which is not a Lakekeeper "
+            "principal (user:, serviceAccount:, role: or group:, then an id, name or e-mail).",
+            (
+                "Map it in binding.principals to the Lakekeeper user or role it stands for, "
+                "e.g. principals: {'" + raw + "': 'role:data-platform'} or "
+                "{'" + raw + "': 'user:oidc~<subject>'}.",
+                "Map it to [] if it has no identity in Lakekeeper; nothing is granted to it.",
+            ),
+        )
+    tld = _reserved_tld(f"{prefix}:{name}") if "@" in name else None
+    if tld:
+        raise UnsupportedBindingError(
+            "principal-placeholder",
+            f"{where}: principal {raw!r} resolves to {identity!r}, a placeholder: .{tld} is a "
+            "reserved top-level domain (RFC 2606), so no Lakekeeper user has that e-mail.",
+            (
+                "Map it in this environment's binding.principals to the real Lakekeeper user "
+                "or role, e.g. principals: {'" + raw + "': 'role:data-platform'}.",
+                "Map it to [] if it has no identity in Lakekeeper; nothing is granted to it.",
+            ),
+        )
+    return f"{prefix}:{name}"
+
+
 def resolve_principal(
     raw: Any,
     mapping: Optional[PrincipalMap],
@@ -333,7 +392,12 @@ def resolve_principal(
         identities = (f"{split[1]}:{split[0]}",) if split else (key,)
     else:
         identities = (key,)
-    check = {GCP: _gcp_identity, AWS: _aws_identity, DATABRICKS: _databricks_identity}[platform]
+    check = {
+        GCP: _gcp_identity,
+        AWS: _aws_identity,
+        DATABRICKS: _databricks_identity,
+        LAKEKEEPER: _lakekeeper_identity,
+    }[platform]
     mapped = mapping is not None
     return tuple(
         check(identity, raw=key, where=where, mapped=mapped or platform == AWS)
@@ -434,6 +498,7 @@ __all__ = [
     "AWS_IAM_ALLOWED_PRINCIPALS",
     "DATABRICKS",
     "GCP",
+    "LAKEKEEPER",
     "RESERVED_TLDS",
     "aws_principal_account",
     "aws_principal_key",

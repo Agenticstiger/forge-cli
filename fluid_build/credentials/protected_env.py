@@ -38,7 +38,8 @@ credentials, which is what they are for. They may not carry a setting that:
 * changes where data or credentials are sent: the Command Center, catalog,
   lineage, telemetry, webhook, registry, LLM and agent-tool endpoints and
   selectors (``FLUID_COMMAND_CENTER_URL``/``_ENABLED``, ``FLUID_API_URL``,
-  ``FLUID_CC_ENDPOINT``, ``FLUID_CATALOG_*_URL``, ``FLUID_OPENLINEAGE_URL``,
+  ``FLUID_CC_ENDPOINT``, ``FLUID_CATALOG_*_URL``, ``FLUID_LAKEKEEPER_*``,
+  ``FLUID_OPENLINEAGE_URL``,
   ``FLUID_LLM_ENDPOINT``, ``FLUID_LLM_PROVIDER``/``_MODEL``,
   ``FLUID_RUNNER_HOST_OVERRIDE``, ``FLUID_PUBLIC_REGISTRY``,
   ``FLUID_*_MCP`` opt-ins, ``DMM_API_URL``, ``DATAHUB_GMS_HOST``,
@@ -557,6 +558,10 @@ PROTECTED_ENV_PREFIXES: Tuple[str, ...] = (
     # role, mount and token, or a runner's response-wrapped token
     # (secrets/_vault.py)
     "FLUID_VAULT_",
+    # the credential references, token endpoint and scope ``fluid policy apply``
+    # signs in to Lakekeeper with to change its grants (policy/lakekeeper_apply.py):
+    # a project file must not choose which credential is sent, or where
+    "FLUID_LAKEKEEPER_",
     "FLUID_MCP_JWT_",
     "FLUID_LLM_DEFAULT_MODEL_",
     # credentials the Debezium runner itself sets: it writes each credential
