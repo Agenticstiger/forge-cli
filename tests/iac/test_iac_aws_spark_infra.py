@@ -1172,7 +1172,6 @@ def test_the_job_config_is_the_compilers_with_only_the_brokers_filled(contract, 
 def test_the_schedulers_policy_names_each_action_once_per_runtime():
     """A managed policy holds at most 6,144 characters: one statement per build reached it
     at about six builds. Every build's target, role and artifacts are still named."""
-    import json
 
     runs = [
         aws_identity.CallerRun(
