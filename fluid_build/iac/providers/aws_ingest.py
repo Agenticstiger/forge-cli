@@ -228,9 +228,7 @@ def spark_blocks(contract: Mapping[str, Any], cid: str) -> SparkBlocks:
                 ("Give the builds ids that differ in a letter or digit.",),
             )
         keys[key] = bid
-        run = _emit_build(blocks, contract, build, ctx, product_tags, applications)
-        if run is not None:
-            runs.append(run)
+        runs.append(_emit_build(blocks, contract, build, ctx, product_tags, applications))
     _emit_log_key(blocks, ctx, product_tags)
     if runs:
         _emit_caller_policy(blocks, ctx, runs, product_tags)
@@ -403,9 +401,11 @@ def _emit_build(
     ctx: _Ctx,
     product_tags: Mapping[str, str],
     applications: Dict[str, Any],
-) -> Optional[aws_identity.CallerRun]:
-    """Emit one build; return what a scheduler needs to start its runs, for a build that
-    runs to completion (batch, or a stream triggered availableNow)."""
+) -> aws_identity.CallerRun:
+    """Emit one build; return what a scheduler needs to start, watch and stop its runs: a
+    build that runs to completion (batch, or a stream triggered availableNow) through
+    ``--mode amend-and-build``, an always-on stream through a keepalive's
+    ``--mode reconcile`` (a scheduler task that runs it every few minutes)."""
     from fluid_build.spark import runner_source
     from fluid_build.spark.compiler import compile_job_config, spark_parameters
 
@@ -516,8 +516,6 @@ def _emit_build(
         target = b.cfg["clusterId"]
     elif b.runtime == "emr-eks":
         target = b.cfg["virtualClusterId"]
-    if not (overwrites or (config.get("trigger") or {}).get("availableNow")):
-        return None
     bucket_arn = aws_identity._join("arn:aws:s3:::", ctx.x(bucket))
     return aws_identity.CallerRun(
         sid=safe_ident(bid).replace("_", "").capitalize() + names.build_key(ctx.product, bid),
@@ -1330,11 +1328,13 @@ def _emit_caller_policy(
     """A managed policy that lets a scheduler start, watch and stop the product's runs.
 
     A build that runs to completion is started by its scheduler through ``fluid apply
-    --mode amend-and-build`` (an MWAA worker, as the environment's execution role), which
-    the platform owns: the policy is the product's, for the platform to attach to that role.
-    It covers the run only: the worker runs the whole apply, ``tofu`` included, so that role
-    also needs what the apply provisions with and the state backend, as for any scheduled
-    build.
+    --mode amend-and-build`` (an MWAA worker, as the environment's execution role), and an
+    always-on stream is kept running by a keepalive, a scheduler task that runs ``fluid
+    apply --mode reconcile``, which reads the job config the apply uploaded and starts the stream again
+    when it died. The platform owns that role: the policy is the product's, for the platform
+    to attach to it. It covers the runs only: a scheduled build's worker runs the whole
+    apply, ``tofu`` included, so that role also needs what the apply provisions with and the
+    state backend; the keepalive runs no ``tofu`` and needs nothing more.
     """
     key = safe_ident(f"{ctx.cid}_spark_caller")
     blocks.data.setdefault("aws_iam_policy_document", {})[key] = aws_identity.caller_document(

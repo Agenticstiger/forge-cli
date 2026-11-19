@@ -689,25 +689,6 @@ def test_nothing_of_a_stopped_run_outlives_it(host, started, monkeypatch):
     assert wait_for(lambda: runs.get(run_id), lambda i: i.state == CANCELLED).state == CANCELLED
 
 
-def test_a_stop_signal_from_outside_forge_is_a_stop_not_a_failure(host, started):
-    """The machine shutting down sends every process SIGTERM: the stream stopped, it did
-    not fail, so the next apply starts it again, as for a job run cancelled by hand on AWS."""
-    run = the_run(local_contract())
-    (first,) = rc.reconcile([run], local_host=host)
-    runs = LocalRuns(host, run.product, run.build)
-    started.append((runs, first.run_id))
-    status = json.loads((runs.dir / "runs" / first.run_id / "status.json").read_text())
-    os.kill(status["supervisorPid"], signal.SIGTERM)
-    stopped = wait_for(lambda: runs.get(first.run_id), lambda i: i.state == CANCELLED)
-    assert (stopped.state, stopped.raw_state) == (
-        CANCELLED,
-        f"STOPPED (signal {int(signal.SIGTERM)})",
-    )
-    (again,) = rc.reconcile([run], local_host=host)
-    started.append((runs, again.run_id))
-    assert (again.action, again.error) == ("started", False) and again.run_id != first.run_id
-
-
 def test_a_cancel_finds_a_run_whose_process_group_was_never_recorded(host, started):
     run = the_run(local_contract())
     run_id = start_run(host, run, "t", runner_text=runner_source())
@@ -766,21 +747,45 @@ def test_an_end_recorded_while_the_run_is_read_is_its_end(tmp_path, monkeypatch)
     assert runs.get(run_id).state == SUCCEEDED
 
 
-def test_a_lost_stream_starts_again(host, started):
-    """Killed with its machine (no end recorded): it did not fail, so fluid apply starts
-    the same config again on its checkpoint, as a retry policy restarts one on AWS."""
+@pytest.mark.parametrize(
+    "kill, raw, says",
+    [
+        # The machine shutting down sends every process SIGTERM: a stop from outside forge.
+        (
+            lambda pid: os.kill(pid, signal.SIGTERM),
+            f"STOPPED (signal {int(signal.SIGTERM)})",
+            "a signal from outside forge stopped it",
+        ),
+        # Killed with its machine: no end recorded.
+        (
+            lambda pid: os.killpg(pid, signal.SIGKILL),
+            "LOST",
+            "stopped without recording how they ended",
+        ),
+    ],
+    ids=["stopped", "lost"],
+)
+def test_a_stream_that_died_with_its_machine_starts_again_as_a_restart(
+    host, started, kill, raw, says
+):
+    """Only forge's cancel mark is a cancel: a stream stopped or killed with its machine
+    died, so the next reconcile, a keepalive's included, starts it again on its checkpoint,
+    marked as a restart of the run it replaces."""
     run = the_run(local_contract())
     (first,) = rc.reconcile([run], local_host=host)
     runs = LocalRuns(host, run.product, run.build)
     started.append((runs, first.run_id))
     status = json.loads((runs.dir / "runs" / first.run_id / "status.json").read_text())
-    os.killpg(status["supervisorPid"], signal.SIGKILL)
-    lost = wait_for(lambda: runs.get(first.run_id), lambda i: i.state == FAILED)
-    assert (lost.raw_state, lost.lost) == ("LOST", True)
-    (again,) = rc.reconcile([run], local_host=host)
+    kill(status["supervisorPid"])
+    died = wait_for(lambda: runs.get(first.run_id), lambda i: not i.active)
+    assert (died.state, died.raw_state, died.lost) == (FAILED, raw, True)
+    (again,) = rc.reconcile([run], local_host=host, only=True)
     started.append((runs, again.run_id))
-    assert (again.action, again.error) == ("started", False) and again.run_id != first.run_id
-    assert "stopped without recording how it ended" in again.message
+    assert (again.action, again.error) == ("restarted", False) and again.run_id != first.run_id
+    assert says in again.message and "restart 1 of 5 allowed per rolling hour" in again.message
+    assert runs.get(again.run_id).restart_of == first.run_id
+    record = json.loads((runs.dir / "runs" / again.run_id / "run.json").read_text())
+    assert record["argv"][-2:] == ["--fluid-restart-of", first.run_id]
 
 
 def test_a_spark_submit_that_cannot_start_is_a_failed_run(host, stub):
@@ -818,17 +823,29 @@ def test_a_run_id_that_is_not_one_is_refused(tmp_path):
         runs.get("../../etc")
 
 
-def test_a_failed_stream_is_not_restarted_and_says_how_to_retry_it_here(host):
-    run = the_run(local_contract())
+def test_a_failed_stream_restarts_within_its_budget_then_says_how_to_retry_it_here(host):
+    """execution.retries.maxAttempts 1: one restart per rolling hour. The second failure
+    within the hour is an error naming the budget, and the run history to remove when the
+    cause was this machine's."""
+    contract = local_contract()
+    contract["builds"][0].setdefault("execution", {})["retries"] = {"maxAttempts": 1}
+    run = the_run(contract)
+    assert run.restarts_per_hour == 1
     failing = with_env(host, STUB_STREAM_EXIT="1")
     rc.reconcile([run], local_host=failing)
     runs = LocalRuns(host, run.product, run.build)
     (first,) = runs.runs()
     wait_for(lambda: runs.get(first.run_id), lambda i: i.state == FAILED)
-    (again,) = rc.reconcile([run], local_host=host)
-    assert (again.action, again.error, again.run_id) == ("failed", True, first.run_id)
-    assert "the stream failed" in again.message
-    assert f"remove {runs.dir / 'runs' / first.run_id}" in again.message
+    (again,) = rc.reconcile([run], local_host=failing)
+    # The stub fails at once: the outcome is an error when the reconcile already saw it end.
+    assert again.action == "restarted", again.message
+    assert "the stream failed" in again.message and "restart 1 of 1" in again.message
+    wait_for(lambda: runs.get(again.run_id), lambda i: i.state == FAILED)
+    (spent,) = rc.reconcile([run], local_host=host, only=True)
+    assert (spent.action, spent.error, spent.run_id) == ("failed", True, again.run_id)
+    assert "budget of 1 restarts per rolling hour" in spent.message
+    assert f"remove {runs.dir / 'runs'} (the build's run history here)" in spent.message
+    assert len(runs.runs()) == 2  # nothing new started
 
 
 def test_a_module_placed_beside_the_published_runner_is_never_imported(host):
@@ -949,6 +966,25 @@ def test_a_linked_run_directory_is_neither_listed_nor_pruned(host, tmp_path):
     assert runs.runs() == []
     runs.prune()
     assert (kept / "run.json").is_file()
+
+
+def test_prune_keeps_the_restarts_a_restart_budget_still_counts(tmp_path):
+    """Past the newest KEEP_ENDED ended runs, the restarts under an hour old stay."""
+    runs = LocalRuns(LocalHost(tmp_path), "p", "b")
+    now = time.time()
+    created = [now - 60 * i for i in range(12)] + [now - 7200 - i for i in range(3)]
+    for i, when in enumerate(created):
+        run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(when)) + f"-{i:08x}"
+        where = runs.dir / "runs" / run_id
+        where.mkdir(parents=True)
+        record = {"configHash": "h", "created": when, "restartOf": "20261118T000000Z-00000000"}
+        (where / "run.json").write_text(json.dumps(record))
+        (where / "status.json").write_text(
+            json.dumps({"started": when, "ended": when, "exitCode": 1})
+        )
+    runs.prune()
+    kept = runs.runs()
+    assert len(kept) == 12 and all(i.created >= now - 3600 for i in kept)
 
 
 BASH_STUB = """#!/bin/bash

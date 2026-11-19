@@ -1034,61 +1034,72 @@ class CallerRun:
     lookup_application: bool = False
 
 
+def _caller_targets(run: CallerRun, *, account: Any, region: Any) -> List[Any]:
+    scope = (region, ":", account, ":")
+    if run.runtime == "emr-serverless":
+        base = _join("arn:aws:emr-serverless:", *scope, "/applications/", run.target)
+        return [base, _join(base, "/jobruns/*")]
+    if run.runtime == "glue":
+        return [_join("arn:aws:glue:", *scope, "job/", run.target)]
+    if run.runtime == "emr-ec2":
+        return [_join("arn:aws:elasticmapreduce:", *scope, "cluster/", run.target)]
+    base = _join("arn:aws:emr-containers:", *scope, "/virtualclusters/", run.target)
+    return [base, _join(base, "/jobruns/*")]
+
+
+def _unique(items: Sequence[Any]) -> List[Any]:
+    """``items`` in order, each once (two builds on one application name it once)."""
+    seen: List[Any] = []
+    for item in items:
+        if item not in seen:
+            seen.append(item)
+    return seen
+
+
 def caller_document(runs: Sequence[CallerRun], *, account: Any, region: Any) -> Dict[str, Any]:
-    """The least-privilege ``aws_iam_policy_document`` of whatever starts the runs."""
+    """The least-privilege ``aws_iam_policy_document`` of whatever starts the runs.
+
+    One statement per runtime (its actions once, on every target of the product's builds on
+    that runtime), one PassRole per runtime, and one for the artifacts: a managed policy
+    holds at most 6,144 characters, and a statement per build reached it at about six
+    builds. Each build's role and target is still named, so nothing else is granted."""
     statements: List[Dict[str, Any]] = []
-    for run in runs:
-        scope = (region, ":", account, ":")
-        if run.runtime == "emr-serverless":
-            base = _join("arn:aws:emr-serverless:", *scope, "/applications/", run.target)
-            targets = [base, _join(base, "/jobruns/*")]
-        elif run.runtime == "glue":
-            targets = [_join("arn:aws:glue:", *scope, "job/", run.target)]
-        elif run.runtime == "emr-ec2":
-            targets = [_join("arn:aws:elasticmapreduce:", *scope, "cluster/", run.target)]
-        else:
-            base = _join("arn:aws:emr-containers:", *scope, "/virtualclusters/", run.target)
-            targets = [base, _join(base, "/jobruns/*")]
+    runtimes = _unique([run.runtime for run in runs])
+    for runtime in runtimes:
+        group = [run for run in runs if run.runtime == runtime]
+        sid = "".join(part.capitalize() for part in runtime.split("-"))
+        targets = [t for run in group for t in _caller_targets(run, account=account, region=region)]
         statements.append(
             {
-                "sid": f"Run{run.sid}",
+                "sid": f"Run{sid}",
                 "effect": "Allow",
-                "actions": caller_actions(run.runtime),
-                "resources": targets,
+                "actions": caller_actions(runtime),
+                "resources": _unique(targets),
             }
         )
-        if run.lookup_application:
+        roles = _unique([run.role_arn for run in group if run.role_arn is not None])
+        if passes_role(runtime) and roles:
             statements.append(
                 {
-                    # No resource-level form: how a run finds an application by its name.
-                    "sid": f"FindApplication{run.sid}",
-                    "effect": "Allow",
-                    "actions": [_FIND_APPLICATION],
-                    "resources": ["*"],
-                }
-            )
-        if passes_role(run.runtime) and run.role_arn is not None:
-            statements.append(
-                {
-                    "sid": f"PassRole{run.sid}",
+                    "sid": f"PassRole{sid}",
                     "effect": "Allow",
                     "actions": ["iam:PassRole"],
-                    "resources": [run.role_arn],
+                    "resources": roles,
                     "condition": [
                         {
                             "test": "StringEquals",
                             "variable": "iam:PassedToService",
-                            "values": [PASSED_TO[run.runtime]],
+                            "values": [PASSED_TO[runtime]],
                         }
                     ],
                 }
             )
-        if run.runtime == "emr-ec2":
+        if runtime == "emr-ec2":
             statements.append(
                 {
                     # The role a step runs as is the cluster owner's: a start checks that the
                     # build's policy is attached to it (_adapters.EmrEc2.start).
-                    "sid": f"StepRole{run.sid}",
+                    "sid": "StepRoleEmrEc2",
                     "effect": "Allow",
                     "actions": list(_ec2_role_reads()),
                     "resources": [
@@ -1097,14 +1108,24 @@ def caller_document(runs: Sequence[CallerRun], *, account: Any, region: Any) -> 
                     ],
                 }
             )
+    if any(run.lookup_application for run in runs):
         statements.append(
             {
-                "sid": f"Artifacts{run.sid}",
+                # No resource-level form: how a run finds an application by its name.
+                "sid": "FindApplication",
                 "effect": "Allow",
-                "actions": ["s3:GetObject"],
-                "resources": list(run.objects),
+                "actions": [_FIND_APPLICATION],
+                "resources": ["*"],
             }
         )
+    statements.append(
+        {
+            "sid": "Artifacts",
+            "effect": "Allow",
+            "actions": ["s3:GetObject"],
+            "resources": _unique([obj for run in runs for obj in run.objects]),
+        }
+    )
     return {"statement": statements}
 
 

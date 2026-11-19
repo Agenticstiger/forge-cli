@@ -14,10 +14,31 @@ run match the contract, idempotently:
    holds the offsets of one topic on one cluster, so a new source on the old checkpoint is
    refused before anything is cancelled; moving ``properties.stream.checkpoint`` to a new
    prefix is how a stream changes source.
-4. No running job: start one, unless the last run with this hash failed. On EMR Serverless a
-   streaming job retries by itself until it fails more often than ``maxFailedAttemptsPerHour``
-   in an hour, and then stops: starting it again would fail the same way, so that run is an
-   error, with its id and reason, until the build changes.
+4. No running job: start one. When the newest run of this config ended, how it ended
+   decides (:func:`_after_end`):
+
+   - cancelled through the runtime (forge's cancel mark on this machine): stopped on
+     purpose. A plain ``fluid apply`` starts it again; ``--mode reconcile`` leaves it.
+   - FAILED on a runtime that retries runs itself (EMR Serverless, EMR on EKS, Glue, from
+     ``execution.retries``): the service's retries are spent, and starting it again on top
+     of them would fail the same way, so that run is an error until the build changes.
+   - any other end (failed, interrupted, lost with its machine, node or cluster): it died,
+     and it is started again on the same checkpoint while fewer than
+     ``restarts_per_hour`` of its restarts are under an hour old (EMR on EC2 and local
+     runs, which no service retries). Each restart carries ``--fluid-restart-of <run>``,
+     so the budget is counted from the runtime's own run history, with no state of forge's.
+     Borrowed: Apache Flink's failure-rate restart strategy (at most N failures per
+     interval) and systemd's ``Restart=on-failure`` with ``StartLimitBurst`` /
+     ``StartLimitIntervalSec`` (a clean stop is never restarted). Unlike both, a spent
+     budget is not final: a restart is allowed again once the oldest is an hour old.
+
+``fluid apply --mode reconcile`` (``only``) runs no ``tofu`` and applies no plan: it starts a
+stream again only when what the last apply deployed (the job config it uploaded, and the
+config hash its runs carry) is what the contract compiles to, and otherwise starts nothing
+and tells the operator to run ``fluid apply`` (:func:`_not_as_deployed`).
+
+Two reconciles that start the same stream at once keep the older run: the younger one
+cancels its own start (:func:`_oldest`), so one writer stays on the checkpoint.
 
 A scheduled build (batch, or a stream with ``trigger.availableNow``) is never reconciled:
 its scheduler starts it through ``fluid apply --mode amend-and-build --build-id <id>``, whose
@@ -35,6 +56,7 @@ poll a second longer each time, at most :data:`MAX_POLL_S`.
 from __future__ import annotations
 
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -45,6 +67,7 @@ from fluid_build.build_runners.spark._adapters import (
     CANCELLING,
     FAILED,
     PENDING,
+    SERVICE_RETRIES,
     SUCCEEDED,
     TERMINAL,
     Adapter,
@@ -53,7 +76,7 @@ from fluid_build.build_runners.spark._adapters import (
     SparkRunError,
     adapter_for,
 )
-from fluid_build.build_runners.spark._desired import DesiredRun
+from fluid_build.build_runners.spark._desired import RESTART_WINDOW_S, DesiredRun
 
 MAX_POLL_S = 15.0
 #: Failed reads in a row before a wait gives up (the run is never cancelled for them).
@@ -73,7 +96,9 @@ class Outcome:
 
     build: str
     runtime: str
-    action: str  # unchanged | started | restarted | scheduled | refused | failed | planned
+    # unchanged | started | restarted | scheduled | refused | failed | planned | declined
+    # | left-stopped (``--mode reconcile``: cancelled or stopping, so nothing starts)
+    action: str
     where: str = ""
     run_id: Optional[str] = None
     state: Optional[str] = None
@@ -102,10 +127,15 @@ class Outcome:
         }
 
 
+#: C0 and C1 control characters other than whitespace: a runtime's failure text (a step's
+#: message, a local driver log) never reaches the terminal with escape sequences in it.
+_CONTROL = re.compile(r"[\x00-\x08\x0e-\x1f\x7f-\x9f]")
+
+
 def _clean(text: Any) -> str:
     from fluid_build.observability.secret_redactor import redact_secret_text
 
-    return redact_secret_text(" ".join(str(text or "").split()))[:400]
+    return redact_secret_text(" ".join(_CONTROL.sub("", str(text or "")).split()))[:400]
 
 
 def wait_budget(env: Optional[Mapping[str, str]] = None) -> float:
@@ -151,9 +181,11 @@ def _token(run: DesiredRun) -> str:
     return f"fluid-{run.config_hash[:16]}-{uuid.uuid4().hex[:20]}"
 
 
-def _failure_text(info: RunInfo) -> str:
+def _failure_text(info: RunInfo, limit: int = 400) -> str:
     attempts = f" after {info.attempt} attempts" if info.attempt and info.attempt > 1 else ""
-    reason = f": {_clean(info.details)}" if info.details else ""
+    # A details text can end in "log <file>: " when the log is empty.
+    details = _clean(info.details)[:limit].rstrip(": ")
+    reason = f": {details}" if details else ""
     return f"run {info.run_id} ended {info.raw_state or info.state}{attempts}{reason}"
 
 
@@ -172,32 +204,225 @@ def _refuse_new_source(run: DesiredRun, history: Sequence[RunInfo]) -> Optional[
     )
 
 
-def _failed_again(
-    run: DesiredRun, last: Optional[RunInfo], active: Sequence[RunInfo], restart_failed: bool
-) -> Optional[RunInfo]:
-    """The newest run when none is active and it failed with this config, which is not
-    started again; a lost run did not fail (its machine stopped), so it starts again."""
-    if active or restart_failed or last is None or last.lost or last.state != FAILED:
-        return None
-    return last if last.config_hash == run.config_hash else None
+def _oldest(runs: Sequence[RunInfo]) -> List[RunInfo]:
+    """The one run kept of several copies of a config: the oldest (ties: the lowest id). It
+    does not depend on when a reconcile looked, so two that raced keep the same one."""
+    return sorted(runs, key=lambda h: (h.created, h.run_id))[:1]
 
 
-def _failed_again_text(failed: RunInfo, adapter: Adapter) -> str:
+def _is_copy(index: int, history: Sequence[RunInfo]) -> bool:
+    """Whether the cancelled run ``history[index]`` was a second copy of an older run: one
+    of its config started from the same run (the same ``restart_of``, or none for a first
+    start), with no run of another config started between them. Two applies that restart a
+    stream at once start such a pair, and the younger cancels itself."""
+    info = history[index]
+    for older in history[index + 1 :]:
+        if older.config_hash != info.config_hash:
+            return False
+        if older.restart_of == info.restart_of:
+            return True
+    return False
+
+
+def _last_end(history: Sequence[RunInfo]) -> Optional[RunInfo]:
+    """The run whose end is the stream's: the newest, passing over a cancelled second copy
+    (:func:`_is_copy`), so a death of the run it copied, after it, is not read as a cancel.
+    Any other cancelled run is the stream's end, an operator's stop: a cancelled restart
+    (another copy may sit between it and the run it restarted), or a run started after
+    another config's.
+
+    A run of this config started outside forge with the same restart mark (or none) as an
+    older run, then cancelled, is passed over as a copy too: runs carry no end time here."""
+    for index, info in enumerate(history):
+        if info.state == CANCELLED and _is_copy(index, history):
+            continue
+        return info
+    return None
+
+
+def _utc(epoch: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def _restarts(run: DesiredRun, history: Sequence[RunInfo], now: float) -> List[RunInfo]:
+    """This config's restarts of the last :data:`RESTART_WINDOW_S`, oldest first: the runs
+    forge started again after one died (``restart_of``). One that was cancelled (the copy a
+    concurrent restart cancelled, or an operator's cancel) does not count."""
+    since = now - RESTART_WINDOW_S
+    found = [
+        h
+        for h in history
+        if h.restart_of
+        and h.config_hash == run.config_hash
+        and h.created >= since
+        and h.state not in (CANCELLED, CANCELLING)
+    ]
+    return sorted(found, key=lambda h: h.created)
+
+
+def _spent_text(run: DesiredRun, last: RunInfo, history: Sequence[RunInfo], counted) -> str:
+    earlier = [
+        h
+        for h in history
+        if h.config_hash == run.config_hash and h.state in (FAILED, SUCCEEDED) and h is not last
+    ][:3]
+    restarted = ", ".join(f"{h.run_id} at {_utc(h.created)}" for h in counted[-5:])
+    # The next restart is allowed once fewer than the budget are under an hour old: when
+    # the budget was lowered (it is not in every config hash), more than it may still count.
+    oldest = counted[max(len(counted) - max(run.restarts_per_hour, 1), 0)]
     text = (
-        f"{_failure_text(failed)}. It is not started again with the same config, which "
-        "would fail the same way: fix the cause and change the build, and fluid apply "
-        "starts the new config"
+        f"{_failure_text(last)}. Not started again: its budget of {run.restarts_per_hour} "
+        "restarts per rolling hour (execution.retries.maxAttempts, 5 when unset) is spent: "
+        f"{restarted}. It can restart from {_utc(oldest.created + RESTART_WINDOW_S)}, when "
+        f"fewer than {run.restarts_per_hour} of them are under an hour old; to start it "
+        "sooner, fix the cause and change the build, and fluid apply starts the new config"
     )
-    hint = getattr(adapter, "retry_hint", None)
-    return text + hint(failed.run_id) if callable(hint) else text
+    if earlier:
+        text += ". Earlier: " + "; ".join(_failure_text(h, 160) for h in earlier)
+    return text
 
 
-def _lost_note(last: Optional[RunInfo], active: Sequence[RunInfo]) -> str:
-    if active or last is None or not last.lost:
-        return ""
+def _retried_text(run: DesiredRun, last: RunInfo) -> str:
+    fix = "fix the cause and change the build, and fluid apply starts the new config"
+    if not run.retry_attempts:
+        return (
+            f"{_failure_text(last)}. {SERVICE_RETRIES[run.runtime]} only as often as "
+            "execution.retries says, and this build sets none, so it was not retried: forge "
+            f"does not start a failed run there again. Set execution.retries, or {fix}"
+        )
     return (
-        f"run {last.run_id} stopped without recording how it ended (its machine restarted, "
-        "or its processes were killed), so the same config started again"
+        f"{_failure_text(last)}. {SERVICE_RETRIES[run.runtime]} from execution.retries "
+        f"({run.retry_attempts}), and it stopped retrying: forge does not start it again on "
+        f"top of the service's own retries, which would fail the same way; {fix}"
+    )
+
+
+def _job_differs(run: DesiredRun, deployed: bytes) -> bool:
+    """Whether the uploaded job config is another job than the one ``run`` (bound to its
+    account) compiles to: :meth:`DesiredRun.config_matches`, which puts aside the MSK
+    brokers OpenTofu fills in. A stream named by its MSK cluster whose uploaded config names
+    no broker at all is another job too: OpenTofu always writes them."""
+    import json
+
+    from fluid_build.spark.compiler import MSK_BROKERS_PLACEHOLDER
+
+    if not run.config_matches(deployed):
+        return True
+    if MSK_BROKERS_PLACEHOLDER not in run.job_text:
+        return False
+    try:
+        source = json.loads(deployed.decode("utf-8")).get("source")
+    except (ValueError, AttributeError):
+        return True
+    servers = source.get("bootstrapServers") if isinstance(source, dict) else None
+    return not (isinstance(servers, str) and servers.strip())
+
+
+def _not_as_deployed(
+    run: DesiredRun,
+    adapter: Adapter,
+    history: Sequence[RunInfo],
+    stale: Sequence[RunInfo],
+    last: Optional[RunInfo],
+) -> Optional[str]:
+    """Why ``--mode reconcile`` starts nothing for ``run``: what the last apply deployed (the
+    job config it uploaded, the config its runs ran) is not what the contract compiles to,
+    or there is nothing deployed. None when it is."""
+    apply_hint = "--mode reconcile changes no config: run fluid apply"
+    other = [a for a in stale if a.config_hash != run.config_hash]
+    if other:
+        return (
+            f"run {other[0].run_id} of another config ({_clean(other[0].config_hash)[:12] or '?'}) "
+            f"is going, and the contract compiles to {run.config_hash[:12]}. {apply_hint}, "
+            "which replaces it on the same checkpoint"
+        )
+    if adapter.uploads_job:
+        deployed = adapter.deployed_job()
+        uri = adapter.run.job_uri
+        if deployed is None:
+            return f"no job config at {uri}: the build is not deployed. Run fluid apply"
+        if _job_differs(adapter.run, deployed):
+            return (
+                f"the job config at {uri} is not the one the contract compiles to (another "
+                f"apply uploaded it, or it was edited), and a restart would run it. {apply_hint}"
+            )
+    if not history:
+        return (
+            f"no run of the build is recorded on {adapter.where()}: --mode reconcile restarts "
+            "a stream fluid apply started. Run fluid apply to start it"
+        )
+    if last is not None and last.config_hash != run.config_hash:
+        return (
+            f"the last run {last.run_id} ran config {_clean(last.config_hash)[:12] or '?'}, and the "
+            f"contract compiles to {run.config_hash[:12]}. {apply_hint} to start the new config"
+        )
+    return None
+
+
+@dataclass
+class _Start:
+    """What starts after an ended run: a restart of ``restart_of``, which ``ended`` says how,
+    the ``count`` th of the stream's budget; or, with none of them, the config again."""
+
+    restart_of: Optional[str] = None
+    ended: str = ""
+    count: str = ""
+
+    @property
+    def message(self) -> str:
+        if not self.restart_of:
+            return ""
+        return f"{self.ended}; started again on the same checkpoint ({self.count})"
+
+
+def _after_end(
+    run: DesiredRun,
+    last: RunInfo,
+    history: Sequence[RunInfo],
+    now: float,
+    out: Outcome,
+    *,
+    only: bool,
+    hint: str = "",
+) -> Optional[_Start]:
+    """The newest run of this config has ended and none is going: what starts now, or None
+    when nothing does (``out`` then says why).
+
+    - Cancelled (the runtime's cancel; on this machine, forge's cancel mark): an operator
+      stopped it on purpose. ``--mode reconcile`` leaves it stopped; a plain ``fluid apply``
+      starts it again, as the operator who applies asks.
+    - Failed on a runtime that retries runs itself (:data:`SERVICE_RETRIES`): those retries
+      are spent, so nothing starts.
+    - Any other end (failed, interrupted, lost with its machine or node, or a stream that
+      stopped by itself): it died, and it is started again on the same checkpoint while
+      fewer than ``restarts_per_hour`` restarts of it are under an hour old.
+    """
+    if last.state == CANCELLED:
+        if not only:
+            return _Start()
+        out.action, out.run_id, out.state = "left-stopped", last.run_id, last.state
+        out.message = (
+            f"run {last.run_id} was cancelled ({last.raw_state}): --mode reconcile leaves a "
+            "cancelled stream stopped, and fluid apply starts it again"
+        )
+        return None
+    if last.state == FAILED and run.runtime in SERVICE_RETRIES:
+        out.action, out.error, out.run_id, out.state = "failed", True, last.run_id, last.state
+        out.message = _retried_text(run, last)
+        return None
+    counted = _restarts(run, history, now)
+    if len(counted) >= run.restarts_per_hour:
+        out.action, out.error, out.run_id, out.state = "failed", True, last.run_id, last.state
+        out.message = (
+            _spent_text(run, last, history, counted)
+            if counted
+            else f"{_failure_text(last)}. Not started again: the build allows no restart"
+        ) + hint
+        return None
+    return _Start(
+        restart_of=last.run_id,
+        ended=_failure_text(last),
+        count=f"restart {len(counted) + 1} of {run.restarts_per_hour} allowed per rolling hour",
     )
 
 
@@ -208,46 +433,152 @@ def _reconcile_one(
     clock: _Clock,
     budget: float,
     dry_run: bool,
-    restart_failed: bool,
+    only: bool = False,
+    wall: Callable[[], float] = time.time,
+    confirm: Optional[Callable[[str], bool]] = None,
 ) -> Outcome:
     out = Outcome(run.build, run.runtime, "unchanged", where=adapter.where())
-    history = adapter.runs()
-    active = [h for h in history if h.active]
-    last = active[0] if active else (history[0] if history else None)
+    now = wall()
+    since = now - RESTART_WINDOW_S
+    history = adapter.runs(since=since)
     refusal = _refuse_new_source(adapter.run, history)  # bound: its checkpoint names the bucket
     if refusal:
         out.action, out.error, out.message = "refused", True, refusal
         return out
-    # The newest run with this config is kept; any other active run (an old config, or a
+    active = [h for h in history if h.active]
+    # The oldest run with this config is kept; any other active run (an old config, or a
     # second copy two concurrent applies started) is a second writer on the checkpoint.
-    matching = [a for a in active if a.config_hash == run.config_hash and a.state != CANCELLING][:1]
+    matching = _oldest(
+        [a for a in active if a.config_hash == run.config_hash and a.state != CANCELLING]
+    )
     stale = [a for a in active if a not in matching]
+    last = None if active else _last_end(history)
+    if only and _stops_reconcile_only(run, adapter, history, stale, matching, last, out):
+        return out
     if matching and not stale:
         current = matching[0]
         out.run_id, out.state = current.run_id, current.state
         if current.attempt and current.attempt > 1:
             out.message = f"attempt {current.attempt}: the job has restarted after failures"
         return out
-    failed = _failed_again(run, last, active, restart_failed)
-    if failed:
-        out.action, out.error, out.run_id, out.state = "failed", True, failed.run_id, failed.state
-        out.message = _failed_again_text(failed, adapter)
-        return out
+    start = _Start()
+    if last is not None and last.config_hash == run.config_hash:
+        if only and last.state == CANCELLED:
+            # A cluster that ended cancels the steps still pending on it: a stream there is
+            # reported as the cluster's, not left stopped as an operator's.
+            adapter.check_target()
+        hint = getattr(adapter, "retry_hint", None)
+        decided = _after_end(
+            run, last, history, now, out, only=only,
+            hint=hint() if callable(hint) else "",
+        )  # fmt: skip
+        if decided is None:
+            return out
+        start = decided
     if dry_run:
-        out.action = "planned"
-        out.message = (
-            f"would cancel {', '.join(s.run_id for s in stale)}"
-            + ("" if matching else " and start the new config")
-            if stale
-            else "would start the job"
-        )
+        return _planned(out, stale, matching, start)
+    if only and confirm is not None and not confirm(_question(run, out, stale, matching, start)):
+        out.action, out.message = "declined", _declined_text(stale, start)
         return out
-    for old in stale:
-        if old.state != CANCELLING:
-            adapter.cancel(old.run_id)
-        out.cancelled.append(old.run_id)
-    for old_id in out.cancelled:
-        ended = clock.until(lambda i=old_id: adapter.get(i), lambda i: i.state in TERMINAL, budget)
+    if not _cancel_and_wait(adapter, stale, out, clock, budget):
+        return out
+    if matching:  # the new config already runs; the stale runs were extra
+        out.run_id, out.state = matching[0].run_id, matching[0].state
+        return out
+    return _start(run, adapter, start, out, clock=clock, budget=budget, since=since)
+
+
+def _stops_reconcile_only(
+    run: DesiredRun,
+    adapter: Adapter,
+    history: Sequence[RunInfo],
+    stale: Sequence[RunInfo],
+    matching: Sequence[RunInfo],
+    last: Optional[RunInfo],
+    out: Outcome,
+) -> bool:
+    """Whether ``--mode reconcile`` does nothing more for ``run`` (``out`` then says why):
+    the deployment is not the contract (:func:`_not_as_deployed`), or this config's run is
+    being stopped and is left to stop."""
+    problem = _not_as_deployed(run, adapter, history, stale, last)
+    if problem:
+        out.action, out.error, out.message = "refused", True, problem
+        return True
+    if stale and not matching:
+        out.action, out.run_id, out.state = "left-stopped", stale[0].run_id, stale[0].state
+        out.message = (
+            f"run {stale[0].run_id} is being stopped ({stale[0].raw_state}): --mode "
+            "reconcile starts nothing while it stops, and looks again next time"
+        )
+        return True
+    return False
+
+
+def _planned(
+    out: Outcome, stale: Sequence[RunInfo], matching: Sequence[RunInfo], start: _Start
+) -> Outcome:
+    out.action = "planned"
+    if stale:
+        out.message = f"would cancel {', '.join(s.run_id for s in stale)}" + (
+            "" if matching else " and start the new config"
+        )
+    elif start.restart_of:
+        out.message = f"would start it again on the same checkpoint: {start.ended} ({start.count})"
+    else:
+        out.message = "would start the job"
+    return out
+
+
+def _declined_text(stale: Sequence[RunInfo], start: _Start) -> str:
+    if stale:
+        return f"declined: {', '.join(s.run_id for s in stale)} not cancelled, nothing started"
+    return f"declined: not restarted, the stream stays stopped ({start.ended})"
+
+
+def _question(
+    run: DesiredRun,
+    out: Outcome,
+    stale: Sequence[RunInfo],
+    matching: Sequence[RunInfo],
+    start: _Start,
+) -> str:
+    if stale:
+        what = (
+            f"cancel {', '.join(s.run_id for s in stale)}, a second copy of run "
+            f"{matching[0].run_id}"
+        )
+    else:
+        what = f"{start.ended}. Start it again on its checkpoint ({start.count})"
+    return f"Spark {run.build} ({run.runtime}) on {out.where}: {what}?"
+
+
+def _cancel_and_wait(
+    adapter: Adapter, stale: Sequence[RunInfo], out: Outcome, clock: _Clock, budget: float
+) -> bool:
+    """Cancel ``stale`` and wait until each has stopped; False (``out`` failed) when one is
+    still going after ``budget``, or a cancel or a read failed (``out`` names what was
+    cancelled before it)."""
+    try:
+        for old in stale:
+            if old.state != CANCELLING:
+                adapter.cancel(old.run_id)
+            out.cancelled.append(old.run_id)
+        waited = [
+            (
+                old_id,
+                clock.until(lambda i=old_id: adapter.get(i), lambda i: i.state in TERMINAL, budget),
+            )
+            for old_id in out.cancelled
+        ]
+    except Exception as exc:  # noqa: BLE001 - the AWS error is the outcome, with what it did
+        out.action, out.error = "failed", True
+        out.message = _error_text(exc) + (
+            f"; cancelled {', '.join(out.cancelled)} before it, and started nothing"
+            if out.cancelled
+            else ""
+        )
+        return False
+    for old_id, ended in waited:
         if ended.state not in TERMINAL:
             out.action, out.error, out.run_id, out.state = "failed", True, old_id, ended.state
             out.message = (
@@ -255,21 +586,65 @@ def _reconcile_one(
                 f"{int(budget)} s ({WAIT_ENV}); nothing new was started, and fluid apply "
                 "starts it once the old run has stopped"
             )
+            return False
+    return True
+
+
+def _start(
+    run: DesiredRun,
+    adapter: Adapter,
+    start: _Start,
+    out: Outcome,
+    *,
+    clock: _Clock,
+    budget: float,
+    since: float,
+) -> Outcome:
+    """Start the run (``start`` says whether it is a restart) and wait until it has left its
+    pending states."""
+    adapter.check_target()
+    run_id = adapter.start(_token(run), restart_of=start.restart_of)
+    out.action = "restarted" if out.cancelled or start.restart_of else "started"
+    out.run_id = run_id
+    try:
+        # Two reconciles that found the stream dead at once both started it: the younger
+        # run stops itself, so one writer stays on the checkpoint (both keep the oldest).
+        first = _oldest(
+            [
+                h
+                for h in adapter.runs(since=since)
+                if h.active and h.config_hash == run.config_hash and h.state != CANCELLING
+            ]
+        )
+        if first and first[0].run_id != run_id:
+            adapter.cancel(run_id)
+            out.cancelled.append(run_id)
+            out.action, out.run_id, out.state = "unchanged", first[0].run_id, first[0].state
+            out.message = (
+                f"run {first[0].run_id} of this config started first (another fluid apply at "
+                f"the same time); run {run_id}, which this one started, was cancelled"
+            )
             return out
-    if matching:  # the new config already runs; the stale runs were extra
-        out.run_id, out.state = matching[0].run_id, matching[0].state
+        started = clock.until(lambda: adapter.get(run_id), lambda i: i.state != PENDING, budget)
+    except Exception as exc:  # noqa: BLE001 - the run is going: say so with the error
+        out.error = True
+        out.message = (
+            f"{start.message + '; ' if start.message else ''}run {run_id} was started, but "
+            f"checking on it failed: {_error_text(exc)}. It is left going, and the next "
+            "reconcile reports it"
+        )
         return out
-    run_id = adapter.start(_token(run))
-    started = clock.until(lambda: adapter.get(run_id), lambda i: i.state != PENDING, budget)
-    out.action = "restarted" if out.cancelled else "started"
     out.run_id, out.state = run_id, started.state
-    out.message = _lost_note(last, active)
+    out.message = start.message
     if started.state in TERMINAL:
         # A long-running job that ends at once failed, whatever it reports.
         out.error = True
-        out.message = _failure_text(started)
+        out.message = f"{start.message + '; ' if start.message else ''}{_failure_text(started)}"
     elif started.state == PENDING:
-        out.message = f"still starting after {int(budget)} s; the next fluid apply reports it"
+        out.message = (
+            f"{start.message + '; ' if start.message else ''}still starting after "
+            f"{int(budget)} s; the next fluid apply reports it"
+        )
     return out
 
 
@@ -279,22 +654,29 @@ def reconcile(
     clients: Optional[ClientFactory] = None,
     local_host: Any = None,
     dry_run: bool = False,
-    restart_failed: bool = False,
+    only: bool = False,
+    confirm: Optional[Callable[[str], bool]] = None,
     stop_removed_of: Optional[Tuple[str, Collection[str]]] = None,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
+    wall: Callable[[], float] = time.time,
     env: Optional[Mapping[str, str]] = None,
 ) -> List[Outcome]:
     """Reconcile every long-running build in ``runs``; scheduled builds are reported only.
 
+    ``only`` is ``fluid apply --mode reconcile``: it starts a stream again only when what
+    the last apply deployed is what the contract compiles to (:func:`_not_as_deployed`),
+    never replaces a config, never touches a scheduled build, and leaves a cancelled stream
+    stopped; ``confirm`` is asked before it starts or cancels anything.
+
     An AWS error on one build is that build's error outcome; the others still reconcile.
     ``stop_removed_of`` (product id, the builds it runs locally) also stops this machine's
-    runs of any other build of that product (:func:`stop_removed`).
+    runs of any other build of that product (:func:`stop_removed`); never with ``only``.
     """
     clock, budget = _Clock(sleep, now), wait_budget(env)
     outcomes = []
     for run in runs:
-        if run.scheduled and not run.checkpoint:
+        if run.scheduled and (only or not run.checkpoint):
             outcomes.append(_scheduled(run))
             continue
         try:
@@ -310,12 +692,14 @@ def reconcile(
                     clock=clock,
                     budget=budget,
                     dry_run=dry_run,
-                    restart_failed=restart_failed,
+                    only=only,
+                    wall=wall,
+                    confirm=confirm,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - one build's AWS error is its outcome
             outcomes.append(_error_outcome(run, exc))
-    if stop_removed_of is not None:
+    if stop_removed_of is not None and not only:
         product, kept = stop_removed_of
         outcomes.extend(
             stop_removed(product, kept, local_host, clock=clock, budget=budget, dry_run=dry_run)
@@ -425,19 +809,18 @@ def _stop_continuous(
     return out
 
 
-def _error_outcome(run: DesiredRun, exc: BaseException) -> Outcome:
+def _error_text(exc: BaseException) -> str:
+    """An error's text for an outcome: its AWS error code first, redacted."""
     code = ""
     response = getattr(exc, "response", None)
     if isinstance(response, Mapping):
         code = str((response.get("Error") or {}).get("Code") or "")
     text = _clean(exc) if isinstance(exc, SparkRunError) else f"{type(exc).__name__}: {_clean(exc)}"
-    return Outcome(
-        run.build,
-        run.runtime,
-        "failed",
-        message=f"{code + ': ' if code and code not in text else ''}{text}",
-        error=True,
-    )
+    return f"{code + ': ' if code and code not in text else ''}{text}"
+
+
+def _error_outcome(run: DesiredRun, exc: BaseException) -> Outcome:
+    return Outcome(run.build, run.runtime, "failed", message=_error_text(exc), error=True)
 
 
 def run_once(

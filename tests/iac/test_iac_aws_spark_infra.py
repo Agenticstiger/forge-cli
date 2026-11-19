@@ -786,9 +786,29 @@ def test_a_glue_job_in_a_vpc_can_create_its_network_interfaces(contract):
     assert "ec2:CreateNetworkInterface" in vpc["actions"]
 
 
-def test_a_streaming_build_gets_no_caller_policy(contract):
-    resources, _ = emit(contract)
-    assert "aws_iam_policy" not in resources
+def test_an_always_on_stream_gets_the_schedulers_policy_for_its_keepalive(contract):
+    """Its keepalive runs fluid apply --mode reconcile on the scheduler (MWAA): it reads the
+    job config the apply uploaded and starts the stream again when it died."""
+    resources, data = emit(contract)
+    assert "commerce_orders_stream_spark_caller" in resources["aws_iam_policy"]
+    document = data["aws_iam_policy_document"]["commerce_orders_stream_spark_caller"]
+    run = next(s for s in document["statement"] if s["sid"].startswith("Run"))
+    assert {"emr-serverless:StartJobRun", "emr-serverless:CancelJobRun"} <= set(run["actions"])
+    artifacts = next(s for s in document["statement"] if s["sid"].startswith("Artifacts"))
+    assert artifacts["actions"] == ["s3:GetObject"]
+    assert artifacts["resources"][0].endswith("/ingest-orders/job.json")
+
+
+def test_an_emr_on_ec2_stream_s_keepalive_may_read_its_cluster(contract):
+    """A stream does not restart on a cluster that ended: the keepalive reads its state."""
+    params = spark(contract)
+    params.update(runtime="emr-ec2", clusterId="j-1ABCDEF")
+    del params["applicationId"]
+    _, data = emit(contract)
+    document = data["aws_iam_policy_document"]["commerce_orders_stream_spark_caller"]
+    run = next(s for s in document["statement"] if s["sid"].startswith("Run"))
+    assert "elasticmapreduce:DescribeCluster" in run["actions"]
+    assert run["resources"][0].endswith(":cluster/j-1ABCDEF")
 
 
 def test_a_run_to_completion_build_gets_the_schedulers_policy(contract):
@@ -1147,6 +1167,42 @@ def test_the_job_config_is_the_compilers_with_only_the_brokers_filled(contract, 
     ).config
     rendered = json.loads(text.replace(filled, MSK_BROKERS_PLACEHOLDER))
     assert rendered == compiled
+
+
+def test_the_schedulers_policy_names_each_action_once_per_runtime():
+    """A managed policy holds at most 6,144 characters: one statement per build reached it
+    at about six builds. Every build's target, role and artifacts are still named."""
+
+    runs = [
+        aws_identity.CallerRun(
+            sid=f"B{i}",
+            runtime="emr-serverless",
+            target=f"app{i % 2}",
+            role_arn=f"arn:aws:iam::123456789012:role/fluid-p-b{i}-spark",
+            objects=(f"arn:aws:s3:::lake/_fluid/spark/p/b{i}/job.json",),
+        )
+        for i in range(8)
+    ] + [
+        aws_identity.CallerRun(
+            sid="E", runtime="emr-ec2", target="j-1ABCDEF", role_arn=None,
+            objects=("arn:aws:s3:::lake/_fluid/spark/p/e/job.json",),
+        )
+    ]  # fmt: skip
+    doc = aws_identity.caller_document(runs, account="123456789012", region="eu-west-1")
+    sids = [s["sid"] for s in doc["statement"]]
+    assert sids == [
+        "RunEmrServerless",
+        "PassRoleEmrServerless",
+        "RunEmrEc2",
+        "StepRoleEmrEc2",
+        "Artifacts",
+    ]
+    by_sid = {s["sid"]: s for s in doc["statement"]}
+    serverless = by_sid["RunEmrServerless"]["resources"]
+    assert len(serverless) == 4  # two applications, each named once with its job runs
+    assert len(by_sid["PassRoleEmrServerless"]["resources"]) == 8
+    assert len(by_sid["Artifacts"]["resources"]) == 9
+    assert len(json.dumps(doc, separators=(",", ":"))) < 6144
 
 
 @pytest.mark.parametrize(
