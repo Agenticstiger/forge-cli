@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A Spark stream can bound what one batch reads, fails on lost offsets, and sends each dead
+  letter under the same key every time.** `properties.stream.maxOffsetsPerTrigger` (0.7.7
+  preview, optional, unset by default) is compiled into the job config and passed to Spark's
+  Kafka source: a micro-batch reads at most that many records, split across the topic's
+  partitions, so a stream that catches up after a stop, or starts from earliest, lands in
+  bounded batches, `trigger.availableNow` included. Unset, the job config has no key and a
+  running stream keeps its config. Managed Flink refuses the key. The runner now sets
+  `failOnDataLoss=true` on every Kafka source (Spark's default, pinned): offsets the topic no
+  longer holds, because retention passed them while the stream was stopped or the topic was
+  recreated, fail the stream instead of being skipped. A dead letter sent to a topic is keyed by
+  where it came from, `<topic>-<partition>@<offset>`, and keeps the record's own key in the
+  `fluid.dead-letter.raw-key` header: the Kafka sink is at least once, and a batch sent again
+  after a failure carries the same keys, so a consumer drops repeats by key.
+
 - **A Spark build runs on the machine `fluid apply` runs on: `parameters.spark.runtime: local`.**
   A build of `runtime: local` runs forge's Spark runner and its compiled `job.json` with
   `spark-submit` on a laptop or a lab host (an EMR 7.x image, or any Spark 3.5), the way EMR runs

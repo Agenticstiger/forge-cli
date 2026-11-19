@@ -96,7 +96,17 @@ AWS_RUNTIMES = ("emr-serverless", "emr-ec2", "emr-eks", "glue")
 RUNTIMES = (*AWS_RUNTIMES, LOCAL_RUNTIME)
 MODES = ("streaming", "batch")
 #: The ``properties.stream`` keys only an engine reads; the rest describe the records.
-_ENGINE_KEYS = ("trigger", "watermark", "checkpoint", "startingOffsets", "registry", "deadLetter")
+_ENGINE_KEYS = (
+    "trigger",
+    "watermark",
+    "checkpoint",
+    "startingOffsets",
+    "maxOffsetsPerTrigger",
+    "registry",
+    "deadLetter",
+)
+#: Spark reads maxOffsetsPerTrigger as a long.
+_MAX_OFFSETS = 2**63 - 1
 _PRODUCT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _BUILD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _BROKER = r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,252}[A-Za-z0-9])?:[0-9]{1,5}"
@@ -874,6 +884,13 @@ def compile_job_config(
         offsets = stream_spec.get("startingOffsets", "latest")
         if offsets not in ("earliest", "latest"):
             raise ValueError(f"{swhere}.startingOffsets: expected earliest or latest")
+        per_batch = stream_spec.get("maxOffsetsPerTrigger")
+        if per_batch is not None and (
+            isinstance(per_batch, bool)
+            or not isinstance(per_batch, int)
+            or not 1 <= per_batch <= _MAX_OFFSETS
+        ):
+            raise ValueError(f"{swhere}.maxOffsetsPerTrigger: expected a whole number, at least 1")
         dead = _parsed_dead_letters(stream_spec, stream, swhere)
         if dead is not None and dead["sink"] == "topic" and host_gate:
             _refuse_unless_dead_letter_topic_listed(bid, kafka, dead["topic"], environ)
@@ -883,6 +900,8 @@ def compile_job_config(
             **kafka,
             "topic": stream.topic,
             "startingOffsets": offsets,
+            # Absent unless set, so a build without it keeps its job config and its run.
+            **({} if per_batch is None else {"maxOffsetsPerTrigger": per_batch}),
             "includeHeaders": any(src == "headers" for _, src in stream.metadata),
             "registry": (
                 None if registry is None else {"url": registry["url"], "auth": registry["auth"]}
