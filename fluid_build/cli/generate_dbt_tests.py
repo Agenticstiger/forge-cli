@@ -154,8 +154,13 @@ def run(args, logger: logging.Logger) -> int:
         raise CLIError(1, "contract_not_found", {"path": str(contract_path)})
 
     contract = load_contract_with_overlay(str(contract_path), getattr(args, "env", None), logger)
+    from ..util.dbt_jinja import UnsafeDbtName
+
     _check_coverage(contract, args, logger)
-    rendered = render_project_tests(contract, tests_key=_resolve_dbt_tests_key(args, logger))
+    try:
+        rendered = render_project_tests(contract, tests_key=_resolve_dbt_tests_key(args, logger))
+    except UnsafeDbtName as unsafe:
+        raise CLIError(1, "dbt_tests_unsafe_name", {"detail": str(unsafe)}) from None
     yaml_text = rendered.yaml
 
     out_path = Path(args.out)
