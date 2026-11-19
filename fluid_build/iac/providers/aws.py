@@ -1002,6 +1002,12 @@ class AwsIacPlugin:
         registering (``aws_layout.partition_registration_notes``)."""
         return aws_layout.partition_registration_notes(contract)
 
+    def retired_definitions(self, removals: Iterable[Tuple[str, str]]) -> List[str]:
+        """The removals that hold no data, which the data-loss gate does not count: what a
+        forge Spark build ran with (``aws_ingest.spark_definition``), destroyed when the build
+        leaves the contract or the product goes."""
+        return [addr for addr, kind in removals if aws_ingest.spark_definition(addr, kind)]
+
     def prepare_destroys(
         self,
         contract: Mapping[str, Any],

@@ -414,7 +414,7 @@ def _review_plan(
     """
     # Revoking a grant destroys a member resource and loses no data: only the
     # removals of data-bearing resources reach the data-loss gate.
-    data_changes, revoked = _data_bearing_changes(changes, removals)
+    data_changes, revoked = _data_bearing_changes(changes, removals, eng.plugin)
     if revoked:
         cprint(
             f"  {len(revoked)} access grant(s), policy tag(s) or tag assignment(s) removed "
@@ -426,6 +426,13 @@ def _review_plan(
             f"  {len(retired)} job(s), workspace file(s), folder(s) or data quality "
             "monitor(s) removed (no table data lost; not gated; a job's run history and "
             "what a monitor has learned go with them): " + ", ".join(retired)
+        )
+    built = _build_definitions(eng.plugin, changes, removals)
+    if built:
+        cprint(
+            f"  {len(built)} resource(s) a removed build ran with (its artifacts, role, log "
+            "group and job; no table data lost; not gated; its logs go with them): "
+            + ", ".join(built)
         )
     _report_plan_notices(eng.plugin, eng.contract, logger)
     # In-place updates that delete data — a dropped column — which the destroy
@@ -2519,21 +2526,42 @@ RUN_DEFINITION_RESOURCE_TYPES = frozenset(
 
 
 def _data_bearing_changes(
-    changes: Mapping[str, int], removals: List[Tuple[str, str]]
+    changes: Mapping[str, int], removals: List[Tuple[str, str]], plugin: Any = None
 ) -> Tuple[Dict[str, int], List[str]]:
     """``(changes with only data-bearing removals, addresses of access-only removals)``.
 
-    Neither access-only removals nor run definitions
-    (:func:`_retired_definitions`) count. Fails closed: when the plan's
-    per-resource events do not account for every removal in its summary (an
-    older ``tofu``, a truncated stream), every removal counts, as before.
+    Neither access-only removals, run definitions (:func:`_retired_definitions`) nor what a
+    build ran with (:func:`_build_definitions`) count. Fails closed: when the plan's
+    per-resource events do not account for every removal in its summary (an older
+    ``tofu``, a truncated stream), every removal counts, as before.
     """
     counted = {key: int(changes.get(key, 0)) for key in ("add", "change", "remove")}
     if len(removals) != counted["remove"]:
         return counted, []
     revoked = [addr for addr, kind in removals if kind in ACCESS_ONLY_RESOURCE_TYPES]
-    counted["remove"] -= len(revoked) + len(_retired_definitions(changes, removals))
+    counted["remove"] -= (
+        len(revoked)
+        + len(_retired_definitions(changes, removals))
+        + len(_build_definitions(plugin, changes, removals))
+    )
     return counted, revoked
+
+
+def _build_definitions(
+    plugin: Any, changes: Mapping[str, int], removals: List[Tuple[str, str]]
+) -> List[str]:
+    """Addresses of removed resources the provider plugin says hold no data: its optional
+    ``retired_definitions(removals)`` (on AWS, what a forge Spark build ran with: its
+    artifacts, role, log group and job). Only addresses the plan removes, none the other
+    exemptions already count, and ``[]`` when the plan's events do not account for every
+    removal (fail closed)."""
+    hook = getattr(plugin, "retired_definitions", None)
+    if not callable(hook) or len(removals) != int(changes.get("remove", 0)):
+        return []
+    exempt = ACCESS_ONLY_RESOURCE_TYPES | RUN_DEFINITION_RESOURCE_TYPES
+    removed = {addr for addr, kind in removals if kind not in exempt}
+    named = [str(addr) for addr in hook(list(removals))]
+    return [addr for addr in dict.fromkeys(named) if addr in removed]
 
 
 def _retired_definitions(changes: Mapping[str, int], removals: List[Tuple[str, str]]) -> List[str]:
