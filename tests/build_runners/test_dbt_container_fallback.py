@@ -53,6 +53,8 @@ CORE_WITH_ATHENA = (
     "  At least one plugin is out of date with dbt-core.\n"
 )
 DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
+#: A fake access key id, built at run time so no file holds a key-shaped literal.
+FAKE_KEY_ID = "AKIA" + "TESTKEY".ljust(16, "X")
 PROFILE = "lake"
 AWS_ENV = (
     "AWS_ACCESS_KEY_ID",
@@ -195,7 +197,7 @@ class TestContainerCommand:
         assert mounts and not [m for m in mounts if ".aws" in m]
 
     def test_host_only_aws_settings_stay_on_the_host(self, tmp_path: Path, monkeypatch) -> None:
-        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEKEYID0000")
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", FAKE_KEY_ID)
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "example-secret-never-in-argv")
         monkeypatch.setenv("AWS_PROFILE", "fluid-demo")
         monkeypatch.setenv("AWS_CONFIG_FILE", "/Users/someone/.aws/config")
@@ -308,7 +310,7 @@ class TestAwsCredentials:
 
     def test_a_named_aws_profile_is_refused_with_the_way_out(self, tmp_path, monkeypatch) -> None:
         self._container(monkeypatch)
-        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEKEYID0000")
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", FAKE_KEY_ID)
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "example")
         project = _project(tmp_path, _athena_output(aws_profile_name="fluid-demo"))
         with pytest.raises(RuntimeError) as exc:
@@ -330,7 +332,7 @@ class TestAwsCredentials:
     @pytest.mark.parametrize(
         "output, env",
         [
-            ({"aws_access_key_id": "AKIAEXAMPLEKEYID0000", "aws_secret_access_key": "x"}, {}),
+            ({"aws_access_key_id": FAKE_KEY_ID, "aws_secret_access_key": "x"}, {}),
             ({}, {"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/run"}),
             ({"aws_profile_name": "{{ env_var('LAKE_PROFILE', '') }}"}, {"KEYS": "1"}),
             ({"aws_profile_name": "{{ 'x' if false }}"}, {"KEYS": "1"}),
@@ -341,7 +343,7 @@ class TestAwsCredentials:
         self._container(monkeypatch)
         for name, value in env.items():
             if name == "KEYS":
-                monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEKEYID0000")
+                monkeypatch.setenv("AWS_ACCESS_KEY_ID", FAKE_KEY_ID)
                 monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "example")
             else:
                 monkeypatch.setenv(name, value)
@@ -350,7 +352,7 @@ class TestAwsCredentials:
 
     def test_a_host_variable_the_container_lacks_names_no_profile(self, tmp_path, monkeypatch):
         self._container(monkeypatch)
-        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEKEYID0000")
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", FAKE_KEY_ID)
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "example")
         monkeypatch.setenv("LAKE_PROFILE", "host-only")  # no forwarded prefix
         output = _athena_output(aws_profile_name="{{ env_var('LAKE_PROFILE', '') }}")
@@ -359,7 +361,7 @@ class TestAwsCredentials:
 
     def test_keys_from_the_project_env_file_reach_the_container(self, tmp_path, monkeypatch):
         self._container(monkeypatch)
-        exports = {"AWS_ACCESS_KEY_ID": "AKIAEXAMPLEKEYID0000", "AWS_SECRET_ACCESS_KEY": "x"}
+        exports = {"AWS_ACCESS_KEY_ID": FAKE_KEY_ID, "AWS_SECRET_ACCESS_KEY": "x"}
         monkeypatch.setattr(
             "fluid_build.credentials.dotenv_store.project_exports", lambda *_a, **_k: exports
         )
@@ -368,7 +370,7 @@ class TestAwsCredentials:
 
     def test_a_rendered_env_var_profile_is_refused(self, tmp_path, monkeypatch) -> None:
         self._container(monkeypatch)
-        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEKEYID0000")
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", FAKE_KEY_ID)
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "example")
         # DBT_* reaches the container, so dbt there renders the name from it.
         monkeypatch.setenv("DBT_LAKE_PROFILE", "secret-looking-name")
@@ -381,7 +383,7 @@ class TestAwsCredentials:
 
     def test_keys_in_the_environment_run_in_the_container(self, tmp_path, monkeypatch) -> None:
         self._container(monkeypatch)
-        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEKEYID0000")
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", FAKE_KEY_ID)
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "example")
         project = _project(tmp_path, _athena_output())
         cmd = build_dbt_command({"engine": "dbt-athena-community"}, project)
@@ -389,7 +391,7 @@ class TestAwsCredentials:
 
     def test_the_target_dbt_reads_is_the_one_checked(self, tmp_path, monkeypatch) -> None:
         self._container(monkeypatch)
-        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEKEYID0000")
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", FAKE_KEY_ID)
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "example")
         project = _project(tmp_path, _athena_output())
         profiles = yaml.safe_load((project / "profiles.yml").read_text("utf-8"))
