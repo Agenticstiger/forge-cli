@@ -140,8 +140,9 @@ _UPGRADE = {
 
 @pytest.mark.integration
 @pytest.mark.skipif(_TOFU is None, reason="tofu not on PATH")
-def test_a_table_created_before_metadata_plans_no_change(tmp_path):
-    """No ForceNew replace, so the data-loss gate has nothing to stop."""
+def test_a_table_created_before_metadata_is_updated_in_place_not_replaced(tmp_path):
+    """No ForceNew replace, so the data-loss gate has nothing to stop. The one change is the
+    location, which loses its trailing slash as Iceberg keeps it, in place."""
     from tests.iac.test_iac_tofu_validate import _tofu_init_or_skip
 
     plugin = get_iac_plugin("aws")
@@ -179,6 +180,17 @@ def test_a_table_created_before_metadata_plans_no_change(tmp_path):
     table_address = (
         "aws_glue_catalog_table.lane_sparkinfra_ice_upgrade_sparkinfra_ice_upgrade_events"
     )
-    assert actions[table_address] == ["no-op"], actions
-    assert all(a == ["no-op"] for a in actions.values()), actions
+    assert actions[table_address] == ["update"], actions
+    change = next(rc["change"] for rc in plan["resource_changes"] if rc["address"] == table_address)
+    before = change["before"]["storage_descriptor"][0]
+    after = change["after"]["storage_descriptor"][0]
+    assert (before["location"], after["location"]) == (
+        after["location"] + "/",
+        before["location"].rstrip("/"),
+    )
+    assert {k: v for k, v in before.items() if k != "location"} == {
+        k: v for k, v in after.items() if k != "location"
+    }
+    others = {address: a for address, a in actions.items() if address != table_address}
+    assert all(a == ["no-op"] for a in others.values()), actions
     assert plugin.plan_data_changes(plan) == []
