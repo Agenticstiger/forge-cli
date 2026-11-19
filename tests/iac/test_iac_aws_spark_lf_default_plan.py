@@ -34,6 +34,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.aws, pytest.mark.provider]
 
 CID = "shop.orders"
 GRANT = f"aws_lakeformation_permissions.{safe_ident(CID)}_lf_spark_writer_lines_0"
+DEAD_LETTERS = f"aws_lakeformation_permissions.{safe_ident(CID)}_lf_spark_dead_letters_ingest"
 SCHEMA = [{"name": "order_id", "type": "string", "required": True}]
 CONTRACT = {
     "fluidVersion": "0.7.7",
@@ -55,6 +56,7 @@ CONTRACT = {
                     "format": "json",
                     "schema": SCHEMA,
                     "trigger": {"processingTime": "PT1M"},
+                    "deadLetter": {},  # the records it cannot land, to a table beside it
                 },
                 "mapping": {"columns": [{"name": "order_id", "from": "order_id"}]},
                 "parameters": {
@@ -91,7 +93,7 @@ IAM_ALLOWED = [{"Principal": {"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCI
 @pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
 @pytest.mark.parametrize(
     ("table_defaults", "planned"),
-    [(IAM_ALLOWED, []), ([], [f"{GRANT}[0]"])],
+    [(IAM_ALLOWED, []), ([], [f"{DEAD_LETTERS}[0]", f"{GRANT}[0]"])],
     ids=["iam-allowed-principals", "lake-formation-governs"],
 )
 def test_the_plan_grants_the_job_role_only_where_lake_formation_governs(
@@ -114,5 +116,5 @@ def test_the_plan_grants_the_job_role_only_where_lake_formation_governs(
         }
     )
     changes = _planned_changes(copy.deepcopy(CONTRACT), tmp_path, moto_endpoint, tofu_env)
-    grants = [c["address"] for c in changes if c["type"] == "aws_lakeformation_permissions"]
+    grants = sorted(c["address"] for c in changes if c["type"] == "aws_lakeformation_permissions")
     assert grants == planned
