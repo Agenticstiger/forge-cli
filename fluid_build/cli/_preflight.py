@@ -1250,8 +1250,21 @@ def _check(name: str, fn: Any) -> Dict[str, str]:
 
 def _failure(exc: BaseException) -> str:
     """The exception's class and, for a cloud API error, its status code (``403``,
-    ``NoSuchBucket``): never its message, which can name the identity or the bucket."""
-    code = ((getattr(exc, "response", None) or {}).get("Error") or {}).get("Code")
+    ``NoSuchBucket``): never its message, which can name the identity or the bucket.
+
+    botocore's ``ClientError.response`` is a dict; google-api-core's
+    ``GoogleAPICallError.response`` is a ``requests.Response`` and its HTTP status is
+    ``.code``. Anything else names the class alone."""
+    code: Any = None
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error = response.get("Error")
+        if isinstance(error, dict):
+            code = error.get("Code")
+    if code is None:
+        status = getattr(exc, "code", None)
+        if isinstance(status, int) and not isinstance(status, bool):
+            code = int(status)
     if code is None and isinstance(exc, LookupError):
         code = "not found"
     return f"{type(exc).__name__} {_text(code)}".strip() if code else type(exc).__name__
@@ -1269,7 +1282,9 @@ def _aws_client(service: str) -> Any:
     config = Config(
         connect_timeout=_LIVE_TIMEOUT_S,
         read_timeout=_LIVE_TIMEOUT_S,
-        retries={"max_attempts": 1},
+        # One attempt in every retry mode: legacy mode reads ``max_attempts`` as
+        # retries after the first try, so ``max_attempts: 1`` would send twice.
+        retries={"total_max_attempts": 1},
     )
     return boto3.client(service, config=config)
 
@@ -1304,7 +1319,9 @@ def _backend_reachable(spec: str) -> str:
     if "gcs" in block:
         from google.cloud import storage
 
-        if not storage.Client().bucket(block["gcs"]["bucket"]).exists(timeout=_LIVE_TIMEOUT_S):
+        bucket = storage.Client().bucket(block["gcs"]["bucket"])
+        # retry=None: the default Retry keeps trying a connection error for 120 s.
+        if not bucket.exists(timeout=_LIVE_TIMEOUT_S, retry=None):
             raise LookupError("not found")
         return "state bucket readable"
     return "local state"

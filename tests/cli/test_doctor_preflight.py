@@ -25,6 +25,7 @@ import socket
 import subprocess
 import sys
 import types
+from http import HTTPStatus
 from pathlib import Path
 
 import pytest
@@ -667,7 +668,7 @@ def _fake_boto3(monkeypatch, fail=False):
 
     def _client(service, config=None, **kw):
         # Every live client answers fast or fails: no SDK retry storm on a cut-off runner.
-        assert config is not None and config.kwargs["retries"] == {"max_attempts": 1}
+        assert config is not None and config.kwargs["retries"] == {"total_max_attempts": 1}
         assert config.kwargs["connect_timeout"] == config.kwargs["read_timeout"] == 10
         return _Client(service)
 
@@ -723,6 +724,74 @@ def test_a_failed_live_check_names_the_code_not_the_message():
 
     row = pf._check("aws-identity", _denied)
     assert row == {"check": "aws-identity", "status": "failed", "detail": "ClientError 403"}
+
+
+def test_a_failed_google_check_names_the_http_status_not_the_message():
+    """google-api-core errors carry a requests.Response, not a dict: no AttributeError."""
+
+    class _Response:
+        def __bool__(self):  # truthy, so a dict-only reader would call .get on it
+            return True
+
+    class Forbidden(Exception):
+        response = _Response()
+        code = HTTPStatus.FORBIDDEN
+
+    def _denied():
+        raise Forbidden("alice@example.iam.gserviceaccount.com lacks storage.buckets.get")
+
+    row = pf._check("state-backend", _denied)
+    assert row == {"check": "state-backend", "status": "failed", "detail": "Forbidden 403"}
+
+
+def test_a_failed_check_with_an_odd_response_names_the_class():
+    class Odd(Exception):
+        response = ["not", "a", "dict"]
+        code = True  # a bool is not a status
+
+    def _odd():
+        raise Odd("x")
+
+    row = pf._check("aws-identity", _odd)
+    assert row["detail"] == "Odd"
+
+
+def _fake_gcs(monkeypatch, exists=True):
+    calls = []
+
+    class _Bucket:
+        def exists(self, **kwargs):
+            calls.append(kwargs)
+            return exists
+
+    class _Client:
+        def bucket(self, name):
+            calls.append(name)
+            return _Bucket()
+
+    google = types.ModuleType("google")
+    cloud = types.ModuleType("google.cloud")
+    storage = types.ModuleType("google.cloud.storage")
+    storage.Client = _Client
+    cloud.storage = storage
+    google.cloud = cloud
+    monkeypatch.setitem(sys.modules, "google", google)
+    monkeypatch.setitem(sys.modules, "google.cloud", cloud)
+    monkeypatch.setitem(sys.modules, "google.cloud.storage", storage)
+    return calls
+
+
+def test_live_gcs_backend_check_does_not_retry(monkeypatch):
+    calls = _fake_gcs(monkeypatch)
+    assert pf._backend_reachable("gcs://state-bucket/p") == "state bucket readable"
+    # One bounded request: the default Retry would keep a dead route open for 120 s.
+    assert calls == ["state-bucket", {"timeout": 10, "retry": None}]
+
+
+def test_live_gcs_backend_absent_is_not_found(monkeypatch):
+    _fake_gcs(monkeypatch, exists=False)
+    row = pf._check("state-backend", lambda: pf._backend_reachable("gcs://gone/p"))
+    assert row == {"check": "state-backend", "status": "failed", "detail": "LookupError not found"}
 
 
 def test_live_without_the_sdk_is_skipped_and_stays_requires_live_proof(monkeypatch):
