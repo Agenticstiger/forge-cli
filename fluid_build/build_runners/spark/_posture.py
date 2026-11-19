@@ -93,13 +93,14 @@ class Finding:
 
 
 def posture_clients(service: str, region: str) -> Any:
-    """A boto3 client from the credential chain the Spark adapters use
-    (``_adapters.default_clients``: the default chain, ``AWS_ENDPOINT_URL`` included), with
-    every call bounded by :data:`CLIENT_LIMITS`."""
-    import boto3
+    """The Spark adapters' client (``_adapters.default_clients``: the default credential
+    chain, ``AWS_ENDPOINT_URL`` included), with every call bounded by :data:`CLIENT_LIMITS`.
+    boto3 stays the adapters' one lazy import (``.importlinter-external``)."""
     from botocore.config import Config
 
-    return boto3.client(service, region_name=region, config=Config(**CLIENT_LIMITS))
+    from fluid_build.build_runners.spark import _adapters
+
+    return _adapters.default_clients(service, region, config=Config(**CLIENT_LIMITS))
 
 
 def _release(label: Any) -> Release:
