@@ -37,6 +37,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status; and `runtime/ship-report.json` and `ship-junit.xml` are renamed into place, so a
   symbolic link the checkout left at either name is replaced instead of written through.
 
+- **A Spark build runs on the machine `fluid apply` runs on: `parameters.spark.runtime: local`.**
+  A build of `runtime: local` runs forge's Spark runner and its compiled `job.json` with
+  `spark-submit` on a laptop or a lab host (an EMR 7.x image, or any Spark 3.5), the way EMR runs
+  them. `fluid apply` writes the job config and the content-addressed runner under
+  `_fluid/spark/<product>/<build>/` in `FLUID_SPARK_LOCAL_ROOT`: `s3://<bucket>[/<prefix>]`,
+  reached through the AWS SDK's own `AWS_ENDPOINT_URL_S3` (SeaweedFS, MinIO), or a directory,
+  by default `.fluid/spark-artifacts` beside the contract. spark-submit reads both from there.
+  A stream follows `spark.reconcile` as on AWS: it is left alone while its config hash is
+  unchanged, stopped and started again on the same checkpoint when the hash changes, and stopped
+  when the contract no longer runs the build locally. A stream stopped from outside forge (its
+  machine shut down or restarted, a kill) starts again on the next apply, as one cancelled by hand
+  on AWS does; one that failed does not until its config changes. A batch or `availableNow` build
+  runs once
+  under `fluid apply --mode amend-and-build --build-id <id>`, the command a generated DAG runs, and
+  reports SUCCEEDED or FAILED. Run state lives under `.fluid/<product>/runtime/spark/<build>/`.
+  The output is a table in an Iceberg REST catalog (`location.catalog` lakekeeper, rest or
+  polaris) on `platform: local`. The operator declares that catalog in
+  `FLUID_SPARK_SUBMIT_PROPERTIES_FILE`, passed as `--properties-file`, so its values never reach
+  the command line, and the job creates its table on the first write: Iceberg v2 with the
+  contract's columns, as OpenTofu creates it on AWS. As a table that exists is written as it
+  is, a local run writes, its dead letters' table included, only in a namespace the operator
+  lists in `FLUID_SPARK_LOCAL_NAMESPACE_ALLOWLIST` as `<warehouse>/<namespace prefix>`
+  (`fluid/<namespace>` when the binding names no warehouse; whole levels match); unset allows
+  none, and `fluid validate` warns. A stream's declared checkpoint stays under
+  `_checkpoints/<product>/`, in the output's bucket when it names one, as on AWS.
+  `FLUID_SPARK_SUBMIT_EXECUTABLE` names the
+  spark-submit. A contract written for AWS switches with one keyed-overlay line, since
+  `runtime: local` ignores the AWS runtimes' keys (`applicationId`, `clusterId`,
+  `virtualClusterId`, `releaseLabel`, `glueVersion`, `executionRoleArn`). Each environment
+  keeps its own runs: an apply of AWS builds alone never stops this machine's local runs. With
+  an `s3://` root on a Spark other than an EMR image, the properties file maps `s3` to S3A
+  (`spark.hadoop.fs.s3.impl`, the endpoint) and puts hadoop-aws on `spark.driver.extraClassPath`,
+  as spark-submit downloads the runner before `--packages` load. A project dotenv can no
+  longer set `SPARK_*`, `PYSPARK_*`, `HADOOP_*` or `YARN_*`, which choose what spark-submit
+  starts, and a run's environment keeps only names a shell could set, without bash's
+  exported functions (`BASH_FUNC_*`) or startup settings (`BASH_ENV`, `ENV`, `SHELLOPTS`,
+  `BASHOPTS`, `PS4`, `BASH_XTRACEFD`). The spark-submit must be an absolute path outside the
+  project, a run's directory, `status.json` and `driver.log` are owner-only, and forge passes
+  Spark 3.5's `spark.redaction.regex` (which names `credential`) unless the properties file sets
+  its own. The runner changed, so each running Spark stream restarts once on its next apply.
+- **A Spark stream sends the records it cannot land elsewhere: `properties.stream.deadLetter`
+  (0.7.7 preview).** A record whose value or key is not the declared JSON, or that lacks a
+  required field, no longer fails the stream. It goes to a dead-letter table beside the output
+  (`<table>__dead_letter` by default, Iceberg v2: the reason, the raw value and key, and the
+  record's topic, partition, offset and timestamp), or with `sink: topic` to a topic on the cluster
+  the stream reads (never the stream's own), with Kafka Connect's `__connect.errors.*` headers. The
+  output keeps its own exactly-once query. The dead letters are a second query over the same
+  records, with its own checkpoint inside the stream's: a new one starts where the output
+  resumes, so dead letters added to a stream a record had stopped take that record too. Each of
+  its batches is committed to the table once. Past `maxRecordsBeforeAbort` dead letters (10000 by
+  default) since the job started, the stream stops once the batch that crossed it has landed, and
+  starts again when the build changes. `alertOn: [schema_violation]` logs an alert for each batch
+  that has dead letters. A build that masks fields at ingest keeps no raw bytes. An Avro stream's
+  dead letters are refused for now, as the decoder's permissive mode would also turn a schema
+  registry outage into dead letters. On AWS, OpenTofu emits the table and grants the job's role
+  what writing it takes (its S3 prefix, its Glue table, and Lake Formation's permissions when Lake
+  Formation governs the output), or what writing the topic takes on MSK with IAM. A topic is
+  written only once the operator lists it in `FLUID_SPARK_TARGET_ALLOWLIST`, on every runtime
+  and for a broker at a private address too: `msk-write:<cluster ARN>/<topic>`, or
+  `kafka-write:<host:port>/<topic>` for each broker a `bootstrapServers` cluster lists. A
+  table is refused beside a bucket-root output, a location forge registers with Lake Formation,
+  and an output whose lifecycle expires its objects; a topic takes their place. The managed Flink
+  lane refuses the block.
 - **A Glue table is partitioned as its binding declares.** `binding.location.partitionBy`
   never reached the Glue table the AWS emitter wrote, and `binding.properties.cluster_by` was
   read by nobody on AWS; both passed `fluid validate --strict`. On a Hive table (Parquet, ORC,
