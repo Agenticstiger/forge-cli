@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.0] — 2026-11-19
+
 ### Added
+
+- **`fluid ship` keeps a stage journal, and a rerun never repeats a change nobody can account
+  for.** With `--journal-dir DIR` (and always with `--release-dir`, in `.fluid/ship-journal`),
+  each stage leaves a `started` event, fsynced before it runs, and a `finished` event with its
+  status, exit code and receipts: the digest of each report it wrote, the plan's digests, and
+  the lineage and serial of each local OpenTofu state. One append-only file per release (the
+  bundle's digest) under `DIR/<product>/<env>/`; a line cut off by a crash is ignored. One run
+  at a time holds a target, locked before stage 1, so a second run is refused (exit 2) before it
+  rebundles. Before apply, enforcing policy-apply, publish or schedule-sync runs again, ship reads
+  it: an attempt in any release of the target that started and has no known outcome
+  (interrupted, killed, a CI timeout) refuses the stage until `--acknowledge-inspected STAGE`,
+  which the journal records; an unknown apply blocks the stages after it the same way. An apply
+  that did not pass is refused until stage 6 has planned again through ship and
+  `runtime/plan.json` is that plan. A stage that changes nothing always runs, recorded when the
+  journal can be opened, and nothing is rolled back. `--explain` shows the journal and what it
+  would refuse; the run report and the release's provenance name it, by a project-relative
+  path or the label `--journal-dir`, never an absolute one. Without either flag
+  there is no journal. Keep DIR outside the checkout, on storage that outlives the runner, and out of
+  reach of less trusted runs: the default in the checkout guards a working copy, and an
+  ephemeral CI runner starts it empty. Ship follows no symbolic link below DIR (or below the
+  project, for the default), reads only regular files with one link, and refuses a journal file
+  over 8 MiB, or one whose directory entry it cannot fsync (storage that cannot fsync a
+  directory at all gets the warning `ship_journal_dir_fsync_unsupported` instead). Two changes reach every run: a stage killed by a signal (the OOM killer) is
+  recorded `unknown`, not `failed`, with the reason `killed by signal N` and the same exit
+  status; and `runtime/ship-report.json` and `ship-junit.xml` are renamed into place, so a
+  symbolic link the checkout left at either name is replaced instead of written through.
 
 - **A Glue table is partitioned as its binding declares.** `binding.location.partitionBy`
   never reached the Glue table the AWS emitter wrote, and `binding.properties.cluster_by` was
@@ -459,6 +487,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An `enum` value holding a quote or a backslash no longer breaks dbt's `accepted_values`
+  test.** dbt pastes each value between single quotes unescaped, so `O'Brien` ended the string
+  and the rest ran as SQL. Such a column's values are now written with `quote: false`, each as
+  the SQL string literal of the adapter that runs it (DuckDB, Snowflake, BigQuery, Databricks
+  and Spark, Postgres, Athena and Trino, with a standard literal for any other adapter), and
+  the column's other values as `'<value>'`, in both `fluid generate dbt-tests` and the dbt
+  engine. Columns whose values hold neither are written as before.
+
 - **A decimal's arguments are a precision and scale its engine holds, or the column is refused.**
   A decimal kept whatever arguments it declared, so `decimal(1;drop table x)` went into the
   Snowflake table's DDL as `NUMBER(1;drop table x)` from `fluid generate iac`, and into the dbt
@@ -582,6 +618,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   way, beside the keys it already wrote.
 
 ### Security
+
+- **The dbt engine's schema.yml, sources.yml and semantic_models.yml write no contract text
+  that dbt would run as Jinja.** The ones `fluid generate transformation` writes for a dbt
+  build now pass through the same escaping as `fluid generate dbt-tests` (one shared helper,
+  `util/dbt_jinja.py`): a model or column name, description, enum value, expression or source
+  field from a contract that holds `{{`, `{%` or `{#`, or looks like `env_var(...)`,
+  `var(...)`, `ref(...)`, `source(...)` or `doc(...)`, is written as a Jinja string literal
+  of itself. The engine's own `ref(...)` and `env_var(...)` expressions, a metric's `filter`
+  (dbt never renders it; MetricFlow reads its `Dimension(...)` template itself) and the
+  placeholders a contract may use for a source location (`{{ env.X }}`, `${X}`, `$X`, and
+  `{{ env_var('X') }}` in either quote, with a plain default or a `target.<attribute>` one)
+  still render; any other text around a placeholder that holds a brace is a literal.
+  The model SQL the engine writes (`engines/dbt/models.py`) and a contract's own SQL still
+  render as dbt Jinja: treat contract authors as trusted when dbt builds their contract.
+
+- **A name or version dbt pastes into its own Jinja is refused.** dbt runs a model's tests
+  against `ref('<exposeId>', version='<version>')`, a source table's against
+  `source('<source>', '<consumes id>')`, and a semantic model's against
+  `ref('<exposeId>')`, rendering each after pasting the name in, so a quote there ran
+  `env_var(...)` at `dbt parse`. `fluid generate transformation` and `fluid generate
+  dbt-tests` now stop with an error naming the value when one of these holds a quote, a
+  backslash, a brace or a control character. An id that matches the schema's identifier
+  grammar holds none of them.
 
 - **A project `.env` can no longer set bash function imports or shell start-up settings.**
   Bash reads an environment variable named `BASH_FUNC_<name>%%` as the definition of the
