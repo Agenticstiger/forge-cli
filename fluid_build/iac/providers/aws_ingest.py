@@ -527,6 +527,7 @@ def _emit_build(
             aws_identity._join(bucket_arn, "/", b.runner_key),
         ),
         lookup_application=b.runtime == "emr-serverless" and not b.cfg.get("applicationId"),
+        bucket=bucket_arn,
     )
 
 
