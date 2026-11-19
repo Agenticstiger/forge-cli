@@ -260,7 +260,7 @@ class TestRetention:
             "field": "created_at",
             "expiration_ms": 7 * 365 * 86_400_000,
         }
-        (trigger,) = res["terraform_data"].values()
+        trigger = res["terraform_data"][f"{CID}_retention_candidates_partitioning"]
         assert trigger["input"] == {"type": "DAY", "field": "created_at"}
 
     def test_the_trigger_holds_the_shape_not_the_period(self):
@@ -284,7 +284,7 @@ class TestRetention:
         res = _resources(_contract(principals=MAPPING, lifecycle={"retention": "P90D"}))
         table = res["google_bigquery_table"][f"{CID}_retention_candidates"]
         assert "time_partitioning" not in table and "lifecycle" not in table
-        assert "terraform_data" not in res
+        assert f"{CID}_retention_candidates_partitioning" not in res.get("terraform_data", {})
 
     @pytest.mark.parametrize(
         "partition_by, why",
@@ -552,7 +552,11 @@ def test_a_contract_declaring_none_of_it_emits_what_it_did_minus_the_acl():
         "google_bigquery_dataset",
         "google_bigquery_dataset_iam_member",
         "google_bigquery_table",
+        "terraform_data",
     }
+    # The decimal-parameters marker every contract with a table carries; no table
+    # here names it.
+    assert list(res["terraform_data"]) == [f"{CID}_decimal_parameters"]
     table = res["google_bigquery_table"][f"{CID}_retention_candidates"]
     assert set(table) == {
         "dataset_id",

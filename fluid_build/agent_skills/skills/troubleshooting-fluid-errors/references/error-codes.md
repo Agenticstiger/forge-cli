@@ -12,6 +12,7 @@ Docs pages are relative to https://agenticstiger.github.io/forge_docs/
 
 | Code | What to do | Docs page |
 |---|---|---|
+| `ERR_DOCTOR_PREFLIGHT_FAILED` | Run 'fluid doctor --contract contract.fluid.yaml --operation plan'. Compare two saved reports with 'fluid doctor --compare left.json right.json'. | advanced/production-troubleshooting.html |
 | `ERR_PROVIDER_NOT_SPECIFIED` | Pass a provider: --provider aws\|databricks\|gcp\|local\|snowflake. Or set the FLUID_PROVIDER environment variable. Run 'fluid providers' to list the available providers. | cli/providers.html |
 | `ERR_PROVIDER_NOT_FOUND` | Run 'fluid providers' to see the available providers. Check the provider name spelling. Install the provider extra, e.g. pip install 'data-product-forge[gcp]'. | cli/providers.html |
 | `ERR_PROVIDER_UNKNOWN` | Run 'fluid providers' to see the available providers. Valid built-ins: aws, databricks, gcp, local, snowflake. | cli/providers.html |
@@ -137,6 +138,7 @@ Docs pages are relative to https://agenticstiger.github.io/forge_docs/
 | `ERR_CONTRACT_DATABRICKS_BINDING` | Fix the Databricks binding or setting the message names (a SQL warehouse in DATABRICKS_WAREHOUSE_ID, no workspace host in the contract). | cli/validate.html |
 | `ERR_CONTRACT_ICEBERG_BINDING` | Fix the Iceberg binding field the message names: a catalog kind FLUID knows, and one storage location per external volume. | cli/validate.html |
 | `ERR_CONTRACT_GCP_BINDING` | Fix the GCP binding field the message names; its remediation is part of the message. | cli/validate.html |
+| `ERR_CONTRACT_STORAGE_LAYOUT` | Fix the binding.location.partitionBy or binding.properties.cluster_by field the message names; for a note, register the table's partitions or declare the key values Athena projects. | cli/validate.html |
 | `ERR_CONTRACT_GOVERNANCE` | Change the governance or access-policy field the message names, or bind the expose to a platform that enforces it. | cli/validate.html |
 | `ERR_CONTRACT_VECTOR_BINDING` | Fix the pgvector binding field the message names (binding.vectorConfig and the columns it reads). | cli/validate.html |
 | `ERR_CONTRACT_CONTINUOUS_TRIGGER` | Give a batch build a schedule trigger (type: schedule and a cron), or use an engine that runs continuously. | cli/validate.html |

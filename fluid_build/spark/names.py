@@ -86,8 +86,9 @@ def job_config_key(product: str, build: str) -> str:
     return artifact_prefix(product, build) + CONFIG_FILE
 
 
-def job_config_uri(bucket: str, product: str, build: str) -> str:
-    return f"s3://{bucket}/{job_config_key(product, build)}"
+def job_config_uri(root: str, product: str, build: str) -> str:
+    """``root``: ``s3://<bucket>`` on AWS, or where a local run's artifacts live."""
+    return f"{root}/{job_config_key(product, build)}"
 
 
 def runner_sha256(source: str) -> str:
@@ -101,8 +102,8 @@ def runner_key(product: str, build: str, sha256: str) -> str:
     return f"{artifact_prefix(product, build)}runner/{sha256[:16]}/{RUNNER_FILE}"
 
 
-def runner_uri(bucket: str, product: str, build: str, sha256: str) -> str:
-    return f"s3://{bucket}/{runner_key(product, build, sha256)}"
+def runner_uri(root: str, product: str, build: str, sha256: str) -> str:
+    return f"{root}/{runner_key(product, build, sha256)}"
 
 
 def run_name(product: str, build: str) -> str:

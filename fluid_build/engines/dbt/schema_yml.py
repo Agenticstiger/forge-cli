@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 import yaml
 
+from fluid_build.util.dbt_jinja import GeneratedJinja, dbt_name, inert
+
 from ..base import GenerationResult
 
 # The single shared contract → dbt-test mapping. Reached via module attribute
@@ -255,7 +257,9 @@ def generate_schema_yml(
             schema_cols, dq_rules, tests_key=resolved_tests_key, capabilities=capabilities
         )
 
-        model_def: Dict[str, Any] = {"name": expose_id}
+        # dbt runs a model's tests against ref('<name>', version='<v>'), Jinja it builds by
+        # pasting both in, so neither may end the quoted string.
+        model_def: Dict[str, Any] = {"name": dbt_name(expose_id, "exposeId")}
 
         desc = expose.get("description")
         if desc:
@@ -298,6 +302,7 @@ def generate_schema_yml(
         # dbt uses this for model-version pinning in downstream refs.
         version = contract_section.get("version")
         if version:
+            dbt_name(version, f"exposes[{expose_id}].contract.version")  # checked, kept as typed
             model_def["latest_version"] = version
             # dbt model-versions require a ``versions`` list too.
             model_def["versions"] = [{"v": version}]
@@ -309,7 +314,8 @@ def generate_schema_yml(
 
     out: GenerationResult = {}
     if model_defs:
-        data = {"version": 2, "models": model_defs}
+        # Contract text is written as text dbt never runs (fluid_build/util/dbt_jinja.py).
+        data = {"version": 2, "models": inert(model_defs)}
         content = _HEADER + yaml.dump(
             data, default_flow_style=False, sort_keys=False, allow_unicode=True
         )
@@ -332,7 +338,7 @@ def _mesh_only_output(mesh_hub: str) -> GenerationResult:
     dbt environment — typically by adding it as a package or installing
     it via ``dbt deps``. This file just declares the participation.
     """
-    data = {"projects": [{"name": mesh_hub}]}
+    data = {"projects": [{"name": inert(mesh_hub)}]}
     content = _HEADER + yaml.dump(
         data, default_flow_style=False, sort_keys=False, allow_unicode=True
     )
@@ -396,6 +402,9 @@ def _apply_model_contract(
     # nothing downstream re-reads it.
     _merge_model_config(model_def, {"contract": {"enforced": True}})
 
+    _types.refuse_decimal_arguments(
+        model_def.get("name", "?"), [schema_by_name[entry["name"]] for entry in columns], adapter
+    )
     for entry in columns:
         col = schema_by_name[entry["name"]]
 
@@ -486,5 +495,5 @@ def _tests_for_column(
         # A placeholder is exempt from the column's own value checks (RFC-data-rules.md 4).
         from fluid_build.data_rules._dbt import exempt_placeholders
 
-        tests = exempt_placeholders(col_def, tests)
+        tests = exempt_placeholders(col_def, tests, GeneratedJinja)
     return tests

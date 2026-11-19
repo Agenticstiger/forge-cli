@@ -167,6 +167,30 @@ ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
         "Override the dbt binary or wrapper (e.g. `poetry run dbt`) used by "
         "the dbt build runner and the --dbt-validate parse gate",
     ),
+    # — Spark builds of runtime: local (spark-submit on this machine) —
+    (
+        "FLUID_SPARK_SUBMIT_EXECUTABLE",
+        "spark-submit on PATH",
+        "The spark-submit a local Spark run starts (an absolute path or a name on PATH)",
+    ),
+    (
+        "FLUID_SPARK_SUBMIT_PROPERTIES_FILE",
+        "none",
+        "Spark properties file passed to every local Spark run as --properties-file: "
+        "its catalog (spark.sql.catalog.fluid.*), S3 store, credentials and master",
+    ),
+    (
+        "FLUID_SPARK_LOCAL_ROOT",
+        ".fluid/spark-artifacts beside the contract",
+        "Where local Spark runs read their job config and runner: an s3:// bucket and "
+        "optional prefix (through AWS_ENDPOINT_URL_S3), or an absolute directory",
+    ),
+    (
+        "FLUID_SPARK_LOCAL_NAMESPACE_ALLOWLIST",
+        "none (no local run may write a table)",
+        "Where local Spark runs may create and write tables: <warehouse>/<namespace "
+        "prefix>, comma-separated (fluid/<namespace> when the binding names no warehouse)",
+    ),
     # — Keyless coding-agent providers (claude-code / codex / cursor / kiro) —
     (
         "FLUID_FORGE_AGENT",
@@ -408,15 +432,109 @@ and their current values.
         help=(
             "Exit 1 when the summary is 'Action needed' (any built-in check not ready, "
             "including copilot readiness); by default only a failed feature check does. "
-            "Ignored with --features-only, which reports feature checks alone"
+            "Ignored with --features-only, which reports feature checks alone. With "
+            "--contract: also exit 1 when a capability is lossy"
         ),
     )
     p.add_argument(
         "--env",
-        action="store_true",
-        help="List recognised FLUID_* runtime kill switches with current values + defaults",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="NAME",
+        help=(
+            "Alone: list recognised FLUID_* runtime kill switches with current values + "
+            "defaults. With --contract: the environment overlay to apply (as on plan/apply)"
+        ),
     )
+    _add_preflight_arguments(p)
     p.set_defaults(cmd=COMMAND, func=run)
+
+
+def _add_preflight_arguments(p: argparse.ArgumentParser) -> None:
+    """The contract-aware preflight's flags (``cli/_preflight.py``): can this operation
+    run here? ``--env`` is shared: with ``--contract`` it names the overlay."""
+    p.add_argument(
+        "--contract",
+        metavar="FILE",
+        help=(
+            "Preflight a contract: schema revision, Forge build, extras, plugins, tools, "
+            "adapters, and each capability as exact, lossy, unsupported or "
+            "requires-live-proof. Offline; fetches and installs nothing"
+        ),
+    )
+    p.add_argument(
+        "--operation",
+        choices=["validate", "generate", "plan", "apply", "ship"],
+        default=None,
+        help="With --contract: the operation to preflight (default: plan, the offline plan)",
+    )
+    p.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "With --contract: also run read-only live checks of the identity and state "
+            "backend (apply and ship; the other operations need no cloud)"
+        ),
+    )
+    p.add_argument(
+        "--provider",
+        # Its own dest: the global ``fluid --provider`` sets ``provider``, and a subparser
+        # default would overwrite it.
+        dest="preflight_provider",
+        default=None,
+        help="With --contract: the cloud apply provisions, as apply takes it (a contract on "
+        "several clouds needs one)",
+    )
+    p.add_argument(
+        "--state-backend",
+        default=None,
+        metavar="SPEC",
+        help="With --contract: the OpenTofu state apply uses (s3://... or gcs://...), as apply "
+        "takes it; else FLUID_STATE_BACKEND",
+    )
+    p.add_argument(
+        "--compare",
+        nargs=2,
+        metavar="REPORT",
+        help="Compare two saved --contract --json reports (LEFT RIGHT) and name the version gaps",
+    )
+
+
+def _preflight_dispatch(args, logger: logging.Logger) -> Optional[int]:
+    """Run ``--contract`` / ``--compare``, refuse their flags without them, else ``None``."""
+    contract = isinstance(getattr(args, "contract", None), str)
+    compare = isinstance(getattr(args, "compare", None), (list, tuple))
+    if contract or compare:
+        given = "--compare" if compare else "--contract"
+        others = [("--contract", contract and compare)] + [
+            (flag, getattr(args, attr, None) is True or isinstance(getattr(args, attr, None), str))
+            for flag, attr in (
+                ("--scope", "scope"),
+                ("--extended", "extended"),
+                ("--features-only", "features_only"),
+            )
+        ]
+        clash = [flag for flag, set_ in others if set_]
+        if clash:
+            raise CLIError(
+                2,
+                "doctor_preflight_failed",
+                {"reason": f"{given} runs on its own; drop {', '.join(clash)}"},
+            )
+        from fluid_build.cli._preflight import run_cli
+
+        return run_cli(args, logger)
+    for flag, given in (
+        ("--env NAME", isinstance(getattr(args, "env", None), str)),
+        ("--operation", isinstance(getattr(args, "operation", None), str)),
+        ("--live", getattr(args, "live", False) is True),
+        ("--provider", isinstance(getattr(args, "preflight_provider", None), str)),
+        ("--state-backend", isinstance(getattr(args, "state_backend", None), str)),
+    ):
+        if given:
+            raise CLIError(2, "doctor_preflight_failed", {"reason": f"{flag} needs --contract"})
+    return None
 
 
 def run(args, logger: logging.Logger) -> int:
@@ -429,6 +547,9 @@ def run(args, logger: logging.Logger) -> int:
     When ``--env`` is set, dispatches to the kill-switch catalog
     listing.
     """
+    preflight = _preflight_dispatch(args, logger)
+    if preflight is not None:
+        return preflight
     if getattr(args, "env", False):
         return _run_env_listing(args, logger)
 

@@ -22,7 +22,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build.spark import names as _names
 
@@ -34,6 +34,9 @@ ACCOUNT_TOKEN = "${aws_account_id}"
 #: The region (and its partition) of a build whose output declares none, likewise.
 REGION_TOKEN = "${aws_region}"
 PARTITION_TOKEN = "${aws_partition}"
+#: Where a local run's artifacts live (``FLUID_SPARK_LOCAL_ROOT``, read when the run is
+#: started), likewise: a plan made on one machine matches the apply on another.
+LOCAL_ROOT_TOKEN = "${fluid_spark_local_root}"
 #: ``maxFailedAttemptsPerHour`` of an EMR Serverless streaming job when the build sets no
 #: ``execution.retries.maxAttempts``: AWS's own default. AWS allows 1 to 10.
 DEFAULT_STREAMING_ATTEMPTS_PER_HOUR = 5
@@ -189,9 +192,24 @@ class DesiredRun:
     def needs_region(self) -> bool:
         return self.region == REGION_TOKEN
 
-    def bind(self, account: Optional[str] = None, region: Optional[str] = None) -> "DesiredRun":
-        """This run with the account and region its names hold (:data:`ACCOUNT_TOKEN`,
-        :data:`REGION_TOKEN`); the hash stays."""
+    @property
+    def local(self) -> bool:
+        """A run of ``runtime: local``: spark-submit on the machine ``fluid apply`` runs on."""
+        return self.runtime == "local"
+
+    @property
+    def needs_local_root(self) -> bool:
+        return LOCAL_ROOT_TOKEN in self.job_uri  # the runner's URI has the same root
+
+    def bind(
+        self,
+        account: Optional[str] = None,
+        region: Optional[str] = None,
+        local_root: Optional[str] = None,
+    ) -> "DesiredRun":
+        """This run with the account, region and local artifact root its names hold
+        (:data:`ACCOUNT_TOKEN`, :data:`REGION_TOKEN`, :data:`LOCAL_ROOT_TOKEN`); the hash
+        stays."""
         import dataclasses
 
         def sub(value: str) -> str:
@@ -199,6 +217,8 @@ class DesiredRun:
                 value = value.replace(ACCOUNT_TOKEN, account)
             if region:
                 value = value.replace(PARTITION_TOKEN, _names.partition(region))
+            if local_root:
+                value = value.replace(LOCAL_ROOT_TOKEN, local_root.rstrip("/"))
             return value
 
         return dataclasses.replace(
@@ -242,7 +262,7 @@ class DesiredRun:
         return {
             "step": step,
             "action_id": f"spark_{self.build}",
-            "provider": "aws",
+            "provider": "local" if self.local else "aws",
             "depends_on": [],
             "op": ACTION,
             "action_type": ACTION,
@@ -255,7 +275,7 @@ class DesiredRun:
                 "scheduled": self.scheduled,
                 "region": self.region,
                 "target": dict(self.target),
-                "executionRoleArn": self.role_arn,
+                "executionRoleArn": self.role_arn or None,
                 "artifacts": {"jobConfig": self.job_uri, "runner": self.runner_uri},
                 "jobConfigDigest": self.job_digest,
                 "runnerSha256": self.runner_sha256,
@@ -522,6 +542,55 @@ def spark_builds(contract: Mapping[str, Any], build_id: Optional[str] = None) ->
     return [b for b in _builds(contract) if build_id is None or b.get("id") == build_id]
 
 
+def _placement(
+    cfg: Mapping[str, Any], runtime: str, product: str, bid: str, loc: Mapping[str, Any]
+) -> Tuple[str, str, Dict[str, str]]:
+    """Where a run of the build runs: its region, the role it runs as, and its target (the
+    application, cluster, virtual cluster or Glue job). A local run has none of them: it
+    runs with the credentials of the machine it runs on."""
+    if runtime == "local":
+        return "", "", {}
+    # An undeclared region is the credentials' when the run starts (REGION_TOKEN), so a
+    # plan and its apply agree whatever region each shell has.
+    region = str(loc.get("region") or REGION_TOKEN)
+    partition = PARTITION_TOKEN if region == REGION_TOKEN else _names.partition(region)
+    role = str(
+        cfg.get("executionRoleArn")
+        or f"arn:{partition}:iam::{ACCOUNT_TOKEN}:role/{_names.execution_role_name(product, bid)}"
+    )
+    target: Dict[str, str] = {}
+    if runtime == "emr-serverless":
+        if cfg.get("applicationId"):
+            target["applicationId"] = str(cfg["applicationId"])
+        else:
+            target["applicationName"] = _names.application_name(product)
+    elif runtime == "emr-ec2":
+        if not cfg.get("clusterId"):
+            raise ValueError(
+                f"Spark build {bid}: runtime emr-ec2 runs on a cluster that is running; "
+                "set parameters.spark.clusterId (a transient cluster is not supported yet)"
+            )
+        target["clusterId"] = str(cfg["clusterId"])
+    elif runtime == "emr-eks":
+        target["virtualClusterId"] = str(cfg["virtualClusterId"])
+    elif runtime == "glue":
+        target["glueJobName"] = _names.glue_job_name(product, bid)
+    return region, role, target
+
+
+def _attempts(build: Mapping[str, Any], runtime: str, scheduled: bool) -> Optional[int]:
+    """The run's retry policy. A local run has none: fluid apply starts a stream stopped
+    from outside forge again, and reports one that failed until the build changes."""
+    if runtime == "local":
+        return None
+    attempts = _retry_attempts(build)
+    if not scheduled and runtime == "emr-serverless":
+        attempts = min(
+            attempts or DEFAULT_STREAMING_ATTEMPTS_PER_HOUR, _MAX_STREAMING_ATTEMPTS_PER_HOUR
+        )
+    return attempts
+
+
 def desired_runs(
     contract: Mapping[str, Any],
     *,
@@ -541,7 +610,7 @@ def desired_runs(
         FluidUserError: the operator's policy refuses a build (``fluid_build.spark.policy``).
     """
     from fluid_build.spark import runner_source
-    from fluid_build.spark.compiler import compile_job_config, spark_parameters
+    from fluid_build.spark.compiler import LOCAL_RUNTIME, compile_job_config, spark_parameters
 
     builds = spark_builds(contract, build_id)
     ids = [b.get("id") for b in builds]
@@ -563,9 +632,9 @@ def desired_runs(
             normalize_location,
         )
 
-        # An undeclared region is the credentials' when the run starts (REGION_TOKEN), so a
-        # plan and its apply agree whatever region each shell has.
-        region = str(loc.get("region") or REGION_TOKEN)
+        runtime = str(cfg.get("runtime"))
+        local = runtime == LOCAL_RUNTIME
+        region, role, target = _placement(cfg, runtime, product, bid, loc)
         acct = ACCOUNT_TOKEN
         job = compile_job_config(
             contract,
@@ -577,41 +646,20 @@ def desired_runs(
         )
         config = job.config
         bucket, _ = normalize_location(loc, account_ref=acct)
-        runtime = str(cfg["runtime"])
         trigger = config.get("trigger") or {}
         scheduled = config["mode"] == "batch" or bool(trigger.get("availableNow"))
-        role = cfg.get("executionRoleArn") or (
-            f"arn:{PARTITION_TOKEN if region == REGION_TOKEN else _names.partition(region)}"
-            f":iam::{acct}:role/"
-            f"{_names.execution_role_name(product, bid)}"
-        )
-        target: Dict[str, str] = {}
-        if runtime == "emr-serverless":
-            if cfg.get("applicationId"):
-                target["applicationId"] = str(cfg["applicationId"])
-            else:
-                target["applicationName"] = _names.application_name(product)
-        elif runtime == "emr-ec2":
-            if not cfg.get("clusterId"):
-                raise ValueError(
-                    f"Spark build {bid}: runtime emr-ec2 runs on a cluster that is running; "
-                    "set parameters.spark.clusterId (a transient cluster is not supported yet)"
-                )
-            target["clusterId"] = str(cfg["clusterId"])
-        elif runtime == "emr-eks":
-            target["virtualClusterId"] = str(cfg["virtualClusterId"])
-        else:
-            target["glueJobName"] = _names.glue_job_name(product, bid)
-        attempts = _retry_attempts(build)
-        if not scheduled and runtime == "emr-serverless":
-            attempts = min(
-                attempts or DEFAULT_STREAMING_ATTEMPTS_PER_HOUR, _MAX_STREAMING_ATTEMPTS_PER_HOUR
-            )
+        attempts = _attempts(build, runtime, scheduled)
         spark_conf = _submit_conf(
             runtime, config, cfg.get("sparkConf") or {}, f"Spark build {bid}", env, policy
         )
         release = (
-            str(cfg["releaseLabel"]) if cfg.get("releaseLabel") else _names.default_release(runtime)
+            None
+            if runtime == LOCAL_RUNTIME
+            else (
+                str(cfg["releaseLabel"])
+                if cfg.get("releaseLabel")
+                else _names.default_release(runtime)
+            )
         )
         glue_version = str(cfg.get("glueVersion") or "5.0") if runtime == "glue" else None
         source, checkpoint = config.get("source"), config.get("checkpoint")
@@ -645,6 +693,9 @@ def desired_runs(
             jars = glue_jars_fingerprint(config, env)
             if jars is not None:
                 settings["glueJars"] = jars
+        # A local run reads its artifacts where the operator keeps them, in the same layout
+        # as the S3 objects OpenTofu uploads on AWS (fluid_build/spark/names.py).
+        root = LOCAL_ROOT_TOKEN if local else f"s3://{bucket}"
         runs.append(
             DesiredRun(
                 product=product,
@@ -656,8 +707,8 @@ def desired_runs(
                 config_hash=_sha({"job": job.digest, "runner": runner_sha, "settings": settings}),
                 job_digest=job.digest,
                 runner_sha256=runner_sha,
-                job_uri=_names.job_config_uri(bucket, product, bid),
-                runner_uri=_names.runner_uri(bucket, product, bid, runner_sha),
+                job_uri=_names.job_config_uri(root, product, bid),
+                runner_uri=_names.runner_uri(root, product, bid, runner_sha),
                 run_name=_names.run_name(product, bid),
                 role_arn=role,
                 target=target,

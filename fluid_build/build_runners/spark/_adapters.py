@@ -1,7 +1,7 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""One adapter per AWS Spark runtime: find a build's runs, start one, read one, cancel one.
+"""One adapter per Spark runtime: find a build's runs, start one, read one, cancel one.
 
 | runtime | start | find | cancel |
 |---|---|---|---|
@@ -9,6 +9,7 @@
 | glue | ``StartJobRun`` on the build's Glue job, with run ``Arguments`` | ``GetJobRuns`` | ``BatchStopJobRun`` |
 | emr-ec2 | ``AddJobFlowSteps`` (``command-runner.jar spark-submit``) on ``clusterId`` | ``ListSteps`` by name | ``CancelSteps`` (``SEND_INTERRUPT``) |
 | emr-eks | emr-containers ``StartJobRun`` on ``virtualClusterId`` | ``ListJobRuns`` by name | ``CancelJobRun`` |
+| local | ``spark-submit`` on this machine, under a detached supervisor (:mod:`._local`) | the build's run directories under ``.fluid/<product>/runtime/spark/`` | SIGTERM, then SIGKILL, to the run's process group |
 
 Every run carries its build's identity in the runner's arguments
 (:meth:`DesiredRun.identity_args`), and in tags where the API takes them, so one rule finds
@@ -27,6 +28,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from fluid_build.build_runners.spark._desired import DesiredRun
+from fluid_build.spark import names as _names
 
 PENDING, RUNNING, CANCELLING = "PENDING", "RUNNING", "CANCELLING"
 SUCCEEDED, FAILED, CANCELLED = "SUCCEEDED", "FAILED", "CANCELLED"
@@ -55,7 +57,8 @@ CALLER_ACTIONS: Dict[str, tuple] = {
         "elasticmapreduce:ListSteps",
         "elasticmapreduce:DescribeStep",
         "elasticmapreduce:CancelSteps",
-        # The cluster's Spot posture, warned at plan and apply (_posture.py).
+        # The cluster's Spot posture, warned at plan and apply (_posture.py), and the role
+        # its steps run as, checked before a step starts (EmrEc2.start).
         "elasticmapreduce:DescribeCluster",
         "elasticmapreduce:ListInstanceFleets",
         "elasticmapreduce:ListInstanceGroups",
@@ -69,6 +72,9 @@ CALLER_ACTIONS: Dict[str, tuple] = {
     ),
 }
 PASS_ROLE = frozenset({"emr-serverless", "emr-eks"})
+#: What starting an EMR on EC2 step also reads: the cluster's instance-profile role and the
+#: policies attached to it (:meth:`EmrEc2.start`).
+EC2_ROLE_READS = ("iam:GetInstanceProfile", "iam:ListAttachedRolePolicies")
 
 #: ``(service, region) -> boto3 client``
 ClientFactory = Callable[[str, str], Any]
@@ -89,6 +95,9 @@ class RunInfo:
     attempt: Optional[int] = None
     details: str = ""
     created: float = 0.0
+    #: The run's processes stopped without recording how it ended (a local run whose
+    #: machine restarted, or that was killed): it did not fail, so its config starts again.
+    lost: bool = False
 
     @property
     def active(self) -> bool:
@@ -162,9 +171,10 @@ class Adapter:
     runtime = ""
     service = ""
 
-    def __init__(self, run: DesiredRun, clients: ClientFactory) -> None:
+    def __init__(self, run: DesiredRun, clients: Optional[ClientFactory]) -> None:
         self.run = run
-        self.client = clients(self.service, run.region)
+        # A local run has no AWS client: its "client" is the machine (``Local.host``).
+        self.client = clients(self.service, run.region) if clients is not None else None
 
     def runs(self) -> List[RunInfo]:  # newest first
         raise NotImplementedError
@@ -421,6 +431,10 @@ class EmrEc2(Adapter):
     runtime, service = "emr-ec2", "emr"
     LOOKBACK_PAGES = 10
 
+    def __init__(self, run: DesiredRun, clients: ClientFactory) -> None:
+        super().__init__(run, clients)
+        self._clients = clients
+
     @property
     def cluster(self) -> str:
         return self.run.target["clusterId"]
@@ -470,8 +484,50 @@ class EmrEc2(Adapter):
     def get(self, run_id: str) -> RunInfo:
         return self._info(self.client.describe_step(ClusterId=self.cluster, StepId=run_id)["Step"])
 
+    def _role_policies(self) -> Optional[Dict[str, List[str]]]:
+        """The roles the cluster's instance profile holds, each with the names of the
+        policies attached to it; None when this identity cannot read them."""
+        try:
+            cluster = self.client.describe_cluster(ClusterId=self.cluster)["Cluster"]
+            profile = str((cluster.get("Ec2InstanceAttributes") or {}).get("IamInstanceProfile"))
+            iam = self._clients("iam", self.run.region)
+            found = iam.get_instance_profile(InstanceProfileName=profile.rsplit("/", 1)[-1])
+            roles: Dict[str, List[str]] = {}
+            for role in found["InstanceProfile"].get("Roles") or []:
+                pages = iam.get_paginator("list_attached_role_policies")
+                roles[role["RoleName"]] = [
+                    p["PolicyName"]
+                    for page in pages.paginate(RoleName=role["RoleName"])
+                    for p in page.get("AttachedPolicies") or []
+                ]
+            return roles
+        except Exception:  # noqa: BLE001 - unreadable: the step starts as it always did
+            return None
+
+    def _refuse_unless_attached(self) -> None:
+        """A step runs as the cluster's instance-profile role, which the cluster's owner
+        holds: the build's least-privilege policy, which ``fluid apply`` creates, must be
+        attached to it before a step can read and write what the build does. A step started
+        without it fails at once, and a stream that failed is not started again with the same
+        config, so the start is refused until it is attached. A build that names its own
+        ``executionRoleArn`` has no forge policy to check."""
+        policy = _names.execution_role_name(self.run.product, self.run.build)
+        if not self.run.role_arn.endswith(f":role/{policy}"):
+            return
+        roles = self._role_policies()
+        if roles is None or any(policy in names for names in roles.values()):
+            return
+        role = next(iter(roles), "<the instance-profile role>")
+        arn = self.run.role_arn.replace(":role/", ":policy/")
+        raise SparkRunError(
+            f"not started: policy {policy} is not attached to {role}, the role its steps run "
+            f"as on {self.cluster}. Attach it, then apply again: aws iam attach-role-policy "
+            f"--role-name {role} --policy-arn {arn}"
+        )
+
     def start(self, token: str) -> str:
         r = self.run
+        self._refuse_unless_attached()
         args = [
             "spark-submit",
             # Client mode: the driver is the step's own process, so cancelling the step
@@ -578,11 +634,65 @@ class EmrEks(Adapter):
         self.client.cancel_job_run(id=run_id, virtualClusterId=self.cluster)
 
 
-ADAPTERS = {a.runtime: a for a in (EmrServerless, Glue, EmrEc2, EmrEks)}
+# --- local -----------------------------------------------------------------------------
 
 
-def adapter_for(run: DesiredRun, clients: Optional[ClientFactory] = None) -> Adapter:
-    """The run's adapter, with the account its names need resolved from the credentials."""
+class Local(Adapter):
+    """``runtime: local``: spark-submit on the machine ``fluid apply`` runs on.
+
+    Its "client" is the :class:`~._local.LocalHost`: the contract's directory, which holds
+    the runs' state, and the operator's environment, which names spark-submit, its
+    properties file and the artifact root."""
+
+    runtime, service = "local", ""
+
+    def __init__(self, run: DesiredRun, host: Any) -> None:
+        from fluid_build.build_runners.spark._local import LocalRuns, default_host, require_posix
+
+        require_posix()
+        super().__init__(run, None)
+        self.host = host if host is not None else default_host()
+        self._runs = LocalRuns(self.host, run.product, run.build)
+
+    def where(self) -> str:
+        return self._runs.where()
+
+    def runs(self) -> List[RunInfo]:
+        return self._runs.runs()
+
+    def get(self, run_id: str) -> RunInfo:
+        return self._runs.get(run_id)
+
+    def start(self, token: str) -> str:
+        from fluid_build.build_runners.spark._local import start_run
+        from fluid_build.spark import runner_source
+
+        return start_run(self.host, self.run, token, runner_text=runner_source())
+
+    def cancel(self, run_id: str) -> None:
+        self._runs.cancel(run_id)
+
+    def retry_hint(self, run_id: str) -> str:
+        """How to retry a failed run whose cause was this machine's, not the contract's: the
+        operator's spark-submit or properties file are not in the config hash."""
+        return (
+            "; when the cause was this machine's (spark-submit, its properties file), remove "
+            f"{self._runs.dir / 'runs' / run_id} and fluid apply starts it again"
+        )
+
+
+ADAPTERS = {a.runtime: a for a in (EmrServerless, Glue, EmrEc2, EmrEks, Local)}
+
+
+def adapter_for(
+    run: DesiredRun, clients: Optional[ClientFactory] = None, local_host: Any = None
+) -> Adapter:
+    """The run's adapter, with the account its names need resolved from the credentials.
+
+    ``local_host`` (a :class:`~._local.LocalHost`) is where a local run lives; unset, the
+    working directory."""
+    if run.local:
+        return Local(run, local_host)
     if run.needs_region or run.needs_account:
         from fluid_build.build_runners.spark._desired import resolve_account, resolve_region
 

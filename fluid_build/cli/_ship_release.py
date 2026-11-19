@@ -319,7 +319,11 @@ def gates(records: Sequence[report.StageRecord]) -> List[Dict[str, Any]]:
 
 
 def provenance(
-    records: Sequence[report.StageRecord], *, run_id: str, report_written_at: Optional[str]
+    records: Sequence[report.StageRecord],
+    *,
+    run_id: str,
+    report_written_at: Optional[str],
+    journal: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """What describes this run and not the release: times, the CI run, report times."""
     from fluid_build.cli._attestation import _collect_run_metadata
@@ -340,4 +344,7 @@ def provenance(
         ],
         "ci": _collect_run_metadata(),  # environment variables only: no process, no network
         "report_written_at": report_written_at,
+        # The stage journal of the release and target, as it was when the run
+        # ended: where it is and its digest (the file keeps growing).
+        **({"journal": journal} if journal is not None else {}),
     }

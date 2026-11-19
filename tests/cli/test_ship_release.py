@@ -205,6 +205,35 @@ def test_explain_names_where_the_release_goes(
 # ---------------------------------------------------------------------------
 
 
+def _strings(value: object) -> List[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in _strings(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in _strings(v)]
+    return []
+
+
+@pytest.mark.parametrize("outside", [False, True], ids=["default-journal", "journal-dir"])
+def test_a_release_names_its_journal_without_an_absolute_path(
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outside: bool
+) -> None:
+    # A published release must not show the runner's layout or user name.
+    _install(monkeypatch, bundled)
+    flags = ["--journal-dir", str(tmp_path / "journals")] if outside else []
+    assert _ship([*_UNTIL_4, "--release-dir", "../rel", *flags]) == 0
+    rel = work.parent / "rel"
+    index = json.loads((rel / "release.json").read_text())
+    shown = json.loads((rel / "reports" / "ship-report.json").read_text())
+    for block in (index["provenance"]["journal"], shown["journal"]):
+        assert block["dir"] == ("--journal-dir" if outside else ".fluid/ship-journal")
+        assert block["path"].endswith(".jsonl") and block["digest"].startswith("sha256:")
+    for text in _strings(index["provenance"]) + _strings(shown.get("journal")):
+        assert not Path(text).is_absolute(), text
+        assert str(tmp_path) not in text, text
+
+
 def test_a_passing_run_publishes_the_release(
     work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

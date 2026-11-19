@@ -9,6 +9,158 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A Spark build runs on the machine `fluid apply` runs on: `parameters.spark.runtime: local`.**
+  A build of `runtime: local` runs forge's Spark runner and its compiled `job.json` with
+  `spark-submit` on a laptop or a lab host (an EMR 7.x image, or any Spark 3.5), the way EMR runs
+  them. `fluid apply` writes the job config and the content-addressed runner under
+  `_fluid/spark/<product>/<build>/` in `FLUID_SPARK_LOCAL_ROOT`: `s3://<bucket>[/<prefix>]`,
+  reached through the AWS SDK's own `AWS_ENDPOINT_URL_S3` (SeaweedFS, MinIO), or a directory,
+  by default `.fluid/spark-artifacts` beside the contract. spark-submit reads both from there.
+  A stream follows `spark.reconcile` as on AWS: it is left alone while its config hash is
+  unchanged, stopped and started again on the same checkpoint when the hash changes, and stopped
+  when the contract no longer runs the build locally. A stream stopped from outside forge (its
+  machine shut down or restarted, a kill) starts again on the next apply, as one cancelled by hand
+  on AWS does; one that failed does not until its config changes. A batch or `availableNow` build
+  runs once
+  under `fluid apply --mode amend-and-build --build-id <id>`, the command a generated DAG runs, and
+  reports SUCCEEDED or FAILED. Run state lives under `.fluid/<product>/runtime/spark/<build>/`.
+  The output is a table in an Iceberg REST catalog (`location.catalog` lakekeeper, rest or
+  polaris) on `platform: local`. The operator declares that catalog in
+  `FLUID_SPARK_SUBMIT_PROPERTIES_FILE`, passed as `--properties-file`, so its values never reach
+  the command line, and the job creates its table on the first write: Iceberg v2 with the
+  contract's columns, as OpenTofu creates it on AWS. As a table that exists is written as it
+  is, a local run writes, its dead letters' table included, only in a namespace the operator
+  lists in `FLUID_SPARK_LOCAL_NAMESPACE_ALLOWLIST` as `<warehouse>/<namespace prefix>`
+  (`fluid/<namespace>` when the binding names no warehouse; whole levels match); unset allows
+  none, and `fluid validate` warns. A stream's declared checkpoint stays under
+  `_checkpoints/<product>/`, in the output's bucket when it names one, as on AWS.
+  `FLUID_SPARK_SUBMIT_EXECUTABLE` names the
+  spark-submit. A contract written for AWS switches with one keyed-overlay line, since
+  `runtime: local` ignores the AWS runtimes' keys (`applicationId`, `clusterId`,
+  `virtualClusterId`, `releaseLabel`, `glueVersion`, `executionRoleArn`). Each environment
+  keeps its own runs: an apply of AWS builds alone never stops this machine's local runs. With
+  an `s3://` root on a Spark other than an EMR image, the properties file maps `s3` to S3A
+  (`spark.hadoop.fs.s3.impl`, the endpoint) and puts hadoop-aws on `spark.driver.extraClassPath`,
+  as spark-submit downloads the runner before `--packages` load. A project dotenv can no
+  longer set `SPARK_*`, `PYSPARK_*`, `HADOOP_*` or `YARN_*`, which choose what spark-submit
+  starts, and a run's environment keeps only names a shell could set, without bash's
+  exported functions (`BASH_FUNC_*`) or startup settings (`BASH_ENV`, `ENV`, `SHELLOPTS`,
+  `BASHOPTS`, `PS4`, `BASH_XTRACEFD`). The spark-submit must be an absolute path outside the
+  project, a run's directory, `status.json` and `driver.log` are owner-only, and forge passes
+  Spark 3.5's `spark.redaction.regex` (which names `credential`) unless the properties file sets
+  its own. The runner changed, so each running Spark stream restarts once on its next apply.
+- **A Spark stream sends the records it cannot land elsewhere: `properties.stream.deadLetter`
+  (0.7.7 preview).** A record whose value or key is not the declared JSON, or that lacks a
+  required field, no longer fails the stream. It goes to a dead-letter table beside the output
+  (`<table>__dead_letter` by default, Iceberg v2: the reason, the raw value and key, and the
+  record's topic, partition, offset and timestamp), or with `sink: topic` to a topic on the cluster
+  the stream reads (never the stream's own), with Kafka Connect's `__connect.errors.*` headers. The
+  output keeps its own exactly-once query. The dead letters are a second query over the same
+  records, with its own checkpoint inside the stream's: a new one starts where the output
+  resumes, so dead letters added to a stream a record had stopped take that record too. Each of
+  its batches is committed to the table once. Past `maxRecordsBeforeAbort` dead letters (10000 by
+  default) since the job started, the stream stops once the batch that crossed it has landed, and
+  starts again when the build changes. `alertOn: [schema_violation]` logs an alert for each batch
+  that has dead letters. A build that masks fields at ingest keeps no raw bytes. An Avro stream's
+  dead letters are refused for now, as the decoder's permissive mode would also turn a schema
+  registry outage into dead letters. On AWS, OpenTofu emits the table and grants the job's role
+  what writing it takes (its S3 prefix, its Glue table, and Lake Formation's permissions when Lake
+  Formation governs the output), or what writing the topic takes on MSK with IAM. A topic is
+  written only once the operator lists it in `FLUID_SPARK_TARGET_ALLOWLIST`, on every runtime
+  and for a broker at a private address too: `msk-write:<cluster ARN>/<topic>`, or
+  `kafka-write:<host:port>/<topic>` for each broker a `bootstrapServers` cluster lists. A
+  table is refused beside a bucket-root output, a location forge registers with Lake Formation,
+  and an output whose lifecycle expires its objects; a topic takes their place. The managed Flink
+  lane refuses the block.
+- **A Glue table is partitioned as its binding declares.** `binding.location.partitionBy`
+  never reached the Glue table the AWS emitter wrote, and `binding.properties.cluster_by` was
+  read by nobody on AWS; both passed `fluid validate --strict`. On a Hive table (Parquet, ORC,
+  Avro, CSV or JSON files), the `partitionBy` columns now become the table's `partition_keys`,
+  in order, and leave its `columns`. Each must be a declared top-level column of a string,
+  integer, date or boolean type, named in lower case. Athena partition projection is written
+  when every key's values are known from the contract: an enum type or enum rule (path-safe
+  values), an integer `range` rule with both bounds, a boolean, or a date (by day, from
+  1970-01-01 to `NOW`). Otherwise `fluid validate` and `fluid apply` note that the partitions
+  need registering. A live table whose keys or projection change, or that is partitioned for the
+  first time, is replaced, and dropping the keys is gated as an in-place change; `fluid apply`
+  refuses both without `--allow-data-loss`. Lake Formation grants on a replaced table are
+  recreated with it. Refused at validate, naming the field: a key of another type, an undeclared
+  or upper-case key, a key named twice, every column as a key, `partitionBy` on an Iceberg or
+  Delta table in Glue (their partitioning lives in their own metadata, and the provider sets an
+  Iceberg spec only on create), and `cluster_by` on any Glue table. An Iceberg-on-Glue contract
+  that set `partitionBy` for its Kafka Connect or Debezium sink now fails validate: the sink's
+  default partitioning applies only to a table it creates, and `fluid apply` had already created
+  this one unpartitioned. Set the spec with an Iceberg engine instead. Partition-key columns
+  must be `required: true` to be projected, since null keys land under
+  `__HIVE_DEFAULT_PARTITION__`, which projection never reads. A duckdb build writes a
+  partitioned table in the Hive layout (`COPY ... PARTITION_BY`, the key columns kept in the
+  paths): a full refresh replaces the partitions it writes, as the Spark runner does, and
+  `incremental_append` adds files. It refuses, before writing, a late-arrival split, dedup or
+  merge mode, a json sink, streams that land outside the location, a file where the
+  partitions' directory goes, and a full refresh where files another run wrote would be read
+  beside the new ones; the embedded-SQL landing, which writes one file, refuses a partitioned
+  table. A product that consumes a partitioned table reads its `<key>=*/` layout, key columns
+  included. `fluid verify` holds a partitioned full refresh to at least the run's rows, and an
+  empty unprojected table's count says to run `MSCK REPAIR TABLE`.
+- **`fluid policy apply` grants a Lakekeeper table in Lakekeeper.** An Iceberg expose whose
+  `binding.location.catalog` is `lakekeeper` used to compile to a warning ("enforce it in the
+  catalog's own access control"). `fluid policy compile` now writes one `provider: lakekeeper`
+  binding per table and principal, from `accessPolicy.grants` (scoped by `resources`), the
+  deprecated `metadata.policies` and the expose's `policy.authz` readers (`select`) and writers
+  (`modify`). `read`, `select` and `query` become `select`; `write`, `insert`, `update`, `delete`,
+  `manage` and `admin` become `modify`; `create`, which Lakekeeper grants only on a namespace or
+  warehouse, is reported. `binding.principals` maps a logical principal to a Lakekeeper `user:`
+  (its id `oidc~<subject>`, name or e-mail), `serviceAccount:` or `role:`. A `group:` names the
+  Lakekeeper role of that name, since Lakekeeper with OpenFGA reads no group from the identity
+  provider. Stage 8 reads each table's direct grants through Lakekeeper's management API and
+  sends only the difference, in one request per table. It grants what the contract declares,
+  revokes any other `describe`, `select` or `modify` on that table, and never touches ownership
+  or grant management. `--mode check` makes the same reads and changes nothing. A table its
+  writer has not created yet (the build, or a sink at its first commit) is reported as pending
+  in both modes, and nothing is granted on it until a later run. It fails closed: a principal
+  Lakekeeper does not know, or one that does not map to a Lakekeeper identity at compile time,
+  leaves its table's grants as they are, since granting the others alone would revoke it, and a
+  grant whose `resources` cannot be evaluated leaves every Lakekeeper table as it is. The contract
+  names the tables, so the operator lists the namespaces a run may change in
+  `FLUID_LAKEKEEPER_NAMESPACE_ALLOWLIST`: comma-separated `<warehouse>/<namespace prefix>` entries,
+  matched on whole dotted levels. Unset allows none. Enforce mode refuses a table outside it before
+  sending any request for it, and names the entry to export; check mode still reads and reports
+  the tables it would refuse. Give stage 8 an identity that manages only the product's own
+  namespaces: on OpenFGA the identity that creates a namespace owns it, which is enough. A user
+  principal with an `@` is matched by e-mail only, any other by exact name only; neither is
+  spoof-proof where the identity provider lets a user set their own name or e-mail, so compile
+  warns, and a person is best mapped by id (`user:oidc~<subject>`). The operator signs forge in
+  with `FLUID_LAKEKEEPER_CREDENTIAL_REF`, a secret reference to `client_id:client_secret`, plus
+  `FLUID_LAKEKEEPER_OAUTH2_SERVER_URI` and `FLUID_LAKEKEEPER_SCOPE`, or with
+  `FLUID_LAKEKEEPER_TOKEN_REF`. These names are operator-only. The reference must be allowed for
+  the catalog's host in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, both URLs must be https, and
+  redirects are not followed. That entry pins the host only, so the contract still picks the port
+  and path: give Lakekeeper a host of its own, and allow the reference for that host (`NAME@host`),
+  not for any host. A private CA works through `REQUESTS_CA_BUNDLE` or `SSL_CERT_FILE`. A
+  Lakekeeper exposure in a file that also holds cloud bindings goes to Lakekeeper, and the rest to
+  the provider, as before.
+
+- **`fluid doctor --contract` says whether an operation can run here, before CI starts.**
+  `fluid doctor --contract <file> [--operation validate|generate|plan|apply|ship] [--env NAME]
+  [--provider P] [--state-backend SPEC] [--json]` (a `.tgz` bundle too) reports the schema revision the contract resolves to (with the bundled file's
+  sha256), the Forge build, each extra against the pins this build declares, the plugins
+  installed through entry points, `tofu`, `dbt` and `spark-submit`, the dbt adapters and the
+  OpenTofu provider pins, and every capability in one of four classes: `exact`, `lossy`,
+  `unsupported` or `requires-live-proof`. Column types come from the emitters' own type
+  tables, and every other finding from the rules and installed validators `fluid validate`
+  runs, so a BigQuery column
+  `generate iac` refuses (a bare `array`) is `unsupported` here first. `validate`, `generate`
+  and the offline `plan` need no cloud, credential or tool, so a catalog-only contract on AWS
+  lists no AWS identity; `apply` and `ship` list the cloud's identity and the state backend as
+  `requires-live-proof`, resolve the cloud and the state backend as `apply` does (a contract on
+  several clouds needs `--provider`), and find dbt as the dbt runner does. It is offline: it fetches no schema, provider or tool and installs
+  nothing. `--live` adds read-only checks (STS `GetCallerIdentity`, a GCP token refresh, a
+  state-bucket read) and prints no identity. `fluid doctor --compare LEFT RIGHT` compares two
+  saved `--json` reports (format `fluid-preflight/1`) and names each version gap the operation
+  cares about with what to change. A report holds no environment value (no path, account, bucket or variable value) and
+  goes through both redaction layers. `--strict` also fails on `lossy`. `fluid doctor --env`
+  alone still lists the kill switches.
+
 - **A saved OpenTofu plan applies on another runner, and only on the target it was made for.**
   `fluid plan --tofu` now records the plan's target in its `opentofuPlan` record (under
   `planDigest`): the cloud account and region (AWS, from STS `GetCallerIdentity` and the provider's
@@ -384,6 +536,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An EMR on EC2 stream starts only once its cluster's role carries the build's policy.** A step
+  runs as the cluster's instance-profile role, which the cluster's owner holds, and forge creates
+  the build's least-privilege policy for that owner to attach. The first `fluid apply` started the
+  stream before anyone could, so the step failed at once, and a stream that failed is not started
+  again with the same config. A start now reads the cluster's instance profile and the policies
+  attached to its role, and refuses until the build's policy is there, with the
+  `aws iam attach-role-policy` command; nothing is started, so the apply after the attach starts
+  the stream. When the identity cannot read them (`elasticmapreduce:DescribeCluster`,
+  `iam:GetInstanceProfile`, `iam:ListAttachedRolePolicies`), the step starts as before. The
+  scheduler's caller policy gains those three reads.
+
+- **A decimal's arguments are a precision and scale its engine holds, or the column is refused.**
+  A decimal kept whatever arguments it declared, so `decimal(1;drop table x)` went into the
+  Snowflake table's DDL as `NUMBER(1;drop table x)` from `fluid generate iac`, and into the dbt
+  SQL, and `decimal(40,20)` became a NUMBER Snowflake rejects at apply. The arguments are now a
+  precision and an optional scale in digits, the precision at least 1 and the scale no larger,
+  within the engine's limits (Snowflake NUMBER and Redshift DECIMAL: precision to 38, scale to
+  37; Databricks and DuckDB DECIMAL: precision to 38; BigQuery's NUMERIC and BIGNUMERIC as
+  before). `fluid validate` refuses the rest on Snowflake, as it does on Databricks and
+  BigQuery, `fluid generate iac` refuses it, and `fluid generate transformation` refuses it
+  where it writes the column's type for the build's dbt adapter (a skeleton model's casts, a
+  model contract's `data_type`). On BigQuery, arguments that are not digits are refused
+  instead of read as a bare NUMERIC. The dbt BigQuery types no longer keep arguments the
+  emitter refuses (`decimal(2,5)` was `numeric(2,5)`). A type that takes no precision on the
+  engine, such as `bignumeric` on Snowflake or `money`, drops its arguments as before.
+- **The dbt engine and the IaC emitters type a column alike on BigQuery and Snowflake, and a
+  BigQuery decimal keeps its precision and scale.** A dbt model builds into the table `fluid
+  apply` creates, and the two wrote many types differently, so each dbt rebuild and each apply
+  changed the other's column back. On BigQuery, dbt wrote `string` for `int16`, `int64`,
+  `float32`, `float64`, `binary`, `geometry` and other types the emitter writes as INT64, FLOAT64,
+  BYTES or GEOGRAPHY, and `timestamp` for a `timestamp_ntz` the emitter writes as DATETIME. On
+  Snowflake, the emitter wrote VARCHAR for `smallint`, `json`, `geography`, `timestamp_ntz`,
+  `timestamptz` and others, while dbt wrote `varchar` for `int64`, `float64` and `bytes`. Each
+  adapter now has one table: dbt's BigQuery types come from the emitter's, and the Snowflake
+  emitter types through dbt's, as Databricks already did; on BigQuery dbt's contract drops a
+  `varchar(n)` length, as the emitter writes STRING. On Snowflake a `json` column is VARIANT,
+  which holds any JSON value (OBJECT holds only an object), `money` is NUMBER(19,4) (a bare NUMBER
+  is NUMBER(38,0) and drops the cents), and `timestamptz` is TIMESTAMP_TZ. A declared type keeps
+  its arguments only in a type of the same family: `varchar(max)` is a bare VARCHAR except on
+  Redshift, a `tinyint(1)` display width no longer becomes NUMBER(1), and `timestamp(12)` is a
+  bare TIMESTAMP_NTZ. A Snowflake table applied before this change keeps the types the emitter
+  wrote then, and Snowflake cannot change a live column to another type (its `ALTER COLUMN` only
+  lengthens text or changes a NUMBER), so a column whose type changes here needs its table
+  migrated; a table a dbt build replaces already has dbt's types. A BigQuery `decimal(p,s)` was a
+  bare NUMERIC, which is NUMERIC(38,9), while dbt wrote `numeric(p,s)`; it is now NUMERIC(P,S), or
+  BIGNUMERIC(P,S) where only BIGNUMERIC holds the range. A decimal wider than a BIGNUMERIC still
+  warns, and one with a precision of 0 or a scale above its precision is now refused at validate.
+  BigQuery cannot give an existing NUMERIC column a precision, so the first plan after this change
+  replaces each live table that declares a decimal with a precision, once, which `fluid apply`
+  refuses without `--allow-data-loss`; declare the column `decimal` to keep the table as it is. A
+  table adopted into an empty state is replaced the same way, as a partitioned table already is.
+  Each contract with a BigQuery table gains one `terraform_data` that records this, so that plan
+  adds one more resource. After it, a new decimal column, a changed precision and a decimal made
+  bare are planned in place, and BigQuery refuses at apply a change it cannot make in place.
 - **`fluid generate ci` runs stage 3 for a contract with reference builds.** It turned
   `RUN_STAGE_3_GENERATE_ARTIFACTS` off when any build was `hybrid-reference`, `reference` or
   `external-reference`, so a contract with Spark builds beside one reference dbt build skipped
@@ -464,6 +670,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   way, beside the keys it already wrote.
 
 ### Security
+
+- **A project `.env` can no longer set bash function imports or shell start-up settings.**
+  Bash reads an environment variable named `BASH_FUNC_<name>%%` as the definition of the
+  function `<name>`, so a project `.env` could replace a command, or the `exec` builtin, inside
+  every bash script the CLI starts (spark-submit and other wrappers, Debezium's `run.sh`), with
+  the operator's environment and credentials in scope. Project dotenv files now refuse any name
+  that is not a shell identifier (`[A-Za-z_][A-Za-z0-9_]*`) and every `BASH_FUNC_` name, and
+  also `BASH_XTRACEFD`, `ZDOTDIR`, `FPATH`, `NULLCMD` and `READNULLCMD`, next to the
+  `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `PS4`, `IFS`, `CDPATH` and `GLOBIGNORE` they
+  already refused. These names are skipped with the usual warning; set them in the shell or CI
+  environment if they are really needed. Ordinary keys load as before.
 
 - **`fluid generate dbt-tests` writes no contract text that dbt would run as Jinja.** dbt
   renders a schema.yml's names, descriptions and test arguments as Jinja, and evaluates a test
