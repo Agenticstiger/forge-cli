@@ -90,6 +90,12 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
             "the nearest dbt_project.yml above --out (macros/ when it names none)."
         ),
     )
+    _add_coverage_arguments(p)
+    p.set_defaults(generate_sub=SUBCOMMAND, func=run)
+
+
+def _add_coverage_arguments(p: argparse.ArgumentParser) -> None:
+    """The coverage report and required-rule flags."""
     p.add_argument(
         "--coverage",
         action="store_true",
@@ -130,7 +136,6 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
             "adapters of the platforms the contract's exposes bind to."
         ),
     )
-    p.set_defaults(generate_sub=SUBCOMMAND, func=run)
 
 
 def run(args, logger: logging.Logger) -> int:

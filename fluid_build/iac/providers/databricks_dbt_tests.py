@@ -128,11 +128,7 @@ def compile_tests(
     if not has_rules(exposures) and not invariants:
         return out
     rules = read_rules(contract, exposures)
-    written = {_expose_key(table) for table in tables}
-    for rule in invariants:
-        refused = _invariant_refusal(rule, written, where)
-        if refused is not None:
-            out.refusals.append(refused)
+    out.refusals.extend(_invariant_refusals(invariants, tables, where))
     monitored = _monitored(exposures)
     for refused in rules.refusals:
         if refused.rule_type == "anomaly_detection" and refused.needs_history:
@@ -167,8 +163,7 @@ def compile_tests(
         return out
     project = _Project(files)
     checked = {check.expose_id for check in rules.checks}
-    for rule in invariants:
-        checked |= {rule.expose, *rule.reads}
+    checked |= {expose for rule in invariants for expose in (rule.expose, *rule.reads)}
     single = len(tables) == 1
     models = {
         _expose_key(table): _model(build, table, project, where, out.refusals, single=single)
@@ -185,8 +180,7 @@ def compile_tests(
     for check in rules.checks:
         _add_test(out, check, str(models[check.expose_id]), folder, project, where)
     taken = {check.name.casefold() for check in rules.checks}
-    for rule in invariants:
-        _add_invariant(out, rule, models, folder, project, where, taken)
+    _add_invariants(out, invariants, models, folder, project, where, taken)
     if out.refusals:
         out.files, out.tests = [], []
     return out
@@ -358,6 +352,15 @@ def _invariant_rules(contract: Mapping[str, Any], exposures: Sequence[Any]) -> L
     ]
 
 
+def _invariant_refusals(
+    invariants: Sequence[Any], tables: Sequence[Any], where: str
+) -> List[UnsupportedBindingError]:
+    """Why each of ``invariants`` cannot run in this build's job (none when all can)."""
+    written = {_expose_key(table) for table in tables}
+    found = (_invariant_refusal(rule, written, where) for rule in invariants)
+    return [refusal for refusal in found if refusal is not None]
+
+
 def _invariant_refusal(rule: Any, written: set, where: str) -> Optional[UnsupportedBindingError]:
     """Why ``rule`` cannot run as a test in this build's job, or ``None``."""
     if rule.status != "executable" or rule.counts is None:
@@ -391,6 +394,12 @@ def _invariant_check(rule: Any, name: str) -> InvariantCheck:
         severity=_INVARIANT_SEVERITY.get(rule.severity, "error"),
         description=rule.description,
     )
+
+
+def _add_invariants(out: CompiledTests, invariants: Sequence[Any], *where_to: Any) -> None:
+    """The test file of each declared rule into ``out`` (:func:`_add_invariant`)."""
+    for rule in invariants:
+        _add_invariant(out, rule, *where_to)
 
 
 def _add_invariant(
@@ -465,13 +474,21 @@ def expected_tests(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Lis
         if any(b is build for b in builds_writing_expose(exposure.get("exposeId"), builds)):
             exposures.append(exposure)
     checks: List[Any] = list(read_rules(contract, exposures).checks)
+    return checks + _invariant_checks(contract, exposures, checks)
+
+
+def _invariant_checks(
+    contract: Mapping[str, Any], exposures: Sequence[Any], checks: Sequence[Any]
+) -> List[InvariantCheck]:
+    """The declared rules the job tests, named as :func:`_add_invariant` names their files."""
     from ...data_rules._dbt import test_name
 
     taken = {check.name.casefold() for check in checks}
-    for rule in _invariant_rules(contract, exposures):
-        if rule.status == "executable" and rule.counts is not None:
-            checks.append(_invariant_check(rule, test_name(rule.id, taken).lower()))
-    return checks
+    return [
+        _invariant_check(rule, test_name(rule.id, taken).lower())
+        for rule in _invariant_rules(contract, exposures)
+        if rule.status == "executable" and rule.counts is not None
+    ]
 
 
 # ── project ──────────────────────────────────────────────────────────────────
