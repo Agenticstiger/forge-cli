@@ -11,9 +11,11 @@ It runs no tofu apply. When the stream died (a Spot interruption, a failed
 driver), it starts again on its checkpoint, within the restart budget the
 build's execution.retries sets, so the task itself never retries. The run
 fails when the stream cannot be kept running: it drifted from the contract,
-nothing is deployed, its cluster ended, or the restarts are spent. A run
-cancelled on purpose stays stopped until fluid apply starts it. It runs on
-SCHEDULE, one run at a time, with no catch-up. The build's
+nothing is deployed, the job config the last apply deployed cannot be read,
+its cluster ended, or the restarts are spent. It can also fail when this
+worker's FLUID_SPARK_* settings or forge release differ from the CI apply's.
+A run cancelled on purpose stays stopped until fluid apply starts it. It
+runs on SCHEDULE, one run at a time, with no catch-up. The build's
 execution.orchestration.airflow.dagConfig.schedule sets SCHEDULE.
 
 Worker requirements:

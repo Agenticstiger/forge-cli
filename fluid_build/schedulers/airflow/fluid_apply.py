@@ -1445,9 +1445,11 @@ _KEEPALIVE_RUN = (
     "driver), it starts again on its checkpoint, within the restart budget the\n"
     "build's execution.retries sets, so the task itself never retries. The run\n"
     "fails when the stream cannot be kept running: it drifted from the contract,\n"
-    "nothing is deployed, its cluster ended, or the restarts are spent. A run\n"
-    "cancelled on purpose stays stopped until fluid apply starts it. It runs on\n"
-    "SCHEDULE, one run at a time, with no catch-up. The build's\n"
+    "nothing is deployed, the job config the last apply deployed cannot be read,\n"
+    "its cluster ended, or the restarts are spent. It can also fail when this\n"
+    "worker's FLUID_SPARK_* settings or forge release differ from the CI apply's.\n"
+    "A run cancelled on purpose stays stopped until fluid apply starts it. It\n"
+    "runs on SCHEDULE, one run at a time, with no catch-up. The build's\n"
     "execution.orchestration.airflow.dagConfig.schedule sets SCHEDULE.\n"
 )
 
