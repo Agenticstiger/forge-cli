@@ -104,6 +104,19 @@ _UNION_KEYS = ("spark.jars.packages", "spark.sql.extensions")
 #: forge's settings the file's value replaces: the image's Iceberg runtime, a mirror.
 _FILE_KEYS = ("spark.jars", "spark.jars.repositories")
 _RUN_ID = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}")
+#: The names a run's environment keeps: a POSIX shell variable's. spark-submit is a bash
+#: script, so a name bash would read as an exported function (``BASH_FUNC_<name>%%``) or
+#: any name no shell could have set is dropped before it reaches bash.
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+#: What makes bash run code or trace itself as it starts: a script to source
+#: (``BASH_ENV``, ``ENV``), options (``SHELLOPTS``, ``BASHOPTS``: xtrace among them) and
+#: the trace's prompt and descriptor (``PS4`` expands command substitutions).
+_SHELL_STARTUP_ENV = frozenset({"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "PS4", "BASH_XTRACEFD"})
+#: Spark's redaction pattern (``spark.redaction.regex``) as of Spark 3.5 and 4.0
+#: (``core/.../internal/config/package.scala``): Spark 3.4 and earlier lack
+#: ``credential``, which an Iceberg REST catalog's ``spark.sql.catalog.<c>.credential``
+#: names, so forge passes it unless the operator's file sets its own.
+REDACTION_REGEX = "(?i)secret|password|token|access[.]?key|credential"
 _S3_ROOT = re.compile(r"s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9](?:/[A-Za-z0-9._=/-]*)?")
 
 
@@ -181,7 +194,7 @@ def submitter(host: LocalHost) -> Submitter:
     env = host.env
     path = _properties_path(env)
     return Submitter(
-        executable=_executable(env),
+        executable=_executable(env, Path(host.workspace)),
         properties_file=path,
         properties=_read_properties(path),
         root=_root(env, host.workspace),
@@ -190,14 +203,15 @@ def submitter(host: LocalHost) -> Submitter:
     )
 
 
-def _executable(env: Mapping[str, str]) -> str:
+def _executable(env: Mapping[str, str], workspace: Path) -> str:
     """The spark-submit to run: an absolute path to an executable file, or a name on
     ``PATH``, as ``DBT_EXECUTABLE`` is resolved for the dbt runner. One program, never a
-    command line, and never a relative path (it would resolve in the project)."""
+    command line, never a relative path, and never one inside the project (the project
+    would choose what runs): the path, links followed, must be outside ``workspace``."""
     configured = (env.get(SUBMIT_EXECUTABLE_ENV) or "").strip() or "spark-submit"
     if os.path.isabs(configured):
         if os.path.isfile(configured) and os.access(configured, os.X_OK):
-            return configured
+            return _outside(configured, workspace)
         raise SparkRunError(
             f"{SUBMIT_EXECUTABLE_ENV} names {configured}, which is not an executable file"
         )
@@ -212,7 +226,24 @@ def _executable(env: Mapping[str, str]) -> str:
             f"{configured} is not on PATH: install Spark 3.5 (or use an EMR 7.x image) and "
             f"put spark-submit on PATH, or set {SUBMIT_EXECUTABLE_ENV} to its absolute path"
         )
-    return found
+    if not os.path.isabs(found):
+        raise SparkRunError(
+            f"{configured} was found through a relative PATH entry ({found}); set "
+            f"{SUBMIT_EXECUTABLE_ENV} to its absolute path"
+        )
+    return _outside(found, workspace)
+
+
+def _outside(executable: str, workspace: Path) -> str:
+    """``executable`` unless it resolves inside the project, links followed."""
+    resolved, project = Path(executable).resolve(), Path(workspace).resolve()
+    if resolved == project or project in resolved.parents:
+        raise SparkRunError(
+            f"the spark-submit to run ({executable}) is inside the project ({project}), "
+            f"which would choose the program forge starts; set {SUBMIT_EXECUTABLE_ENV} to "
+            "a spark-submit outside it"
+        )
+    return executable
 
 
 def _properties_path(env: Mapping[str, str]) -> Optional[Path]:
@@ -397,6 +428,8 @@ def submit_argv(sub: Submitter, run: DesiredRun, runner: Optional[str] = None) -
     if sub.properties_file is not None:
         argv += ["--properties-file", str(sub.properties_file)]
     conf = merge_conf(run.spark_conf, sub.properties)
+    if "spark.redaction.regex" not in sub.properties:
+        conf["spark.redaction.regex"] = REDACTION_REGEX
     for name in sorted(conf):
         argv += ["--conf", f"{name}={conf[name]}"]
     return [*argv, runner or run.runner_uri, *run.entry_args()]
@@ -765,7 +798,7 @@ def start_run(host: LocalHost, run: DesiredRun, token: str, *, runner_text: str)
         created = time.time()
         run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(created)) + "-" + uuid.uuid4().hex[:8]
         where = runs.dir / "runs" / run_id
-        where.mkdir(parents=True)
+        where.mkdir(parents=True, mode=0o700)  # owner-only, as the supervisor's files
         argv = submit_argv(sub, bound, pull_runner(sub, bound, where))
         record = {
             "runId": run_id,
@@ -809,7 +842,7 @@ def start_run(host: LocalHost, run: DesiredRun, token: str, *, runner_text: str)
                     start_new_session=True,
                     cwd=str(where),
                     # The driver puts no script directory on sys.path (Python 3.11+).
-                    env={**host.env, "PYTHONSAFEPATH": "1"},
+                    env={**run_env(host.env), "PYTHONSAFEPATH": "1"},
                 )
             except OSError as exc:
                 shutil.rmtree(where, ignore_errors=True)  # it never ran: nothing to report
@@ -831,6 +864,19 @@ def start_run(host: LocalHost, run: DesiredRun, token: str, *, runner_text: str)
     return run_id
 
 
+def run_env(env: Mapping[str, str]) -> Dict[str, str]:
+    """The environment a local run starts with: ``env`` without what would make the bash
+    of spark-submit run code it was not given (:data:`_ENV_NAME`,
+    :data:`_SHELL_STARTUP_ENV`). A defence beside the dotenv loader's own refusal."""
+    return {
+        name: value
+        for name, value in env.items()
+        if _ENV_NAME.fullmatch(name)
+        and not name.startswith("BASH_FUNC_")
+        and name not in _SHELL_STARTUP_ENV
+    }
+
+
 def _wait_started(where: Path, process: "subprocess.Popen[bytes]") -> None:
     """Wait until the supervisor has started spark-submit (or ended), so the first read of
     the run sees it going."""
@@ -849,6 +895,7 @@ def default_host(workspace: Optional[Path] = None) -> LocalHost:
 __all__ = [
     "LOCAL_ROOT_ENV",
     "PROPERTIES_FILE_ENV",
+    "REDACTION_REGEX",
     "SUBMIT_EXECUTABLE_ENV",
     "LocalHost",
     "LocalRuns",
@@ -859,6 +906,7 @@ __all__ = [
     "parse_properties",
     "publish",
     "require_posix",
+    "run_env",
     "start_run",
     "submit_argv",
     "submitter",

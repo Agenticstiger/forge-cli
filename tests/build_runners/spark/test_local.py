@@ -132,9 +132,9 @@ def batch_contract():
 
 
 @pytest.fixture
-def stub(tmp_path):
-    path = tmp_path / "bin" / "spark-submit"
-    path.parent.mkdir()
+def stub(tmp_path_factory):
+    # Outside every test's project (tmp_path): forge refuses a spark-submit inside it.
+    path = tmp_path_factory.mktemp("bin") / "spark-submit"
     path.write_text(STUB, encoding="utf-8")
     path.chmod(0o755)
     return path
@@ -342,7 +342,71 @@ def test_the_argv_is_client_mode_with_the_file_and_never_a_shell(tmp_path, stub)
     ]
     tail = [run.runner_uri, *run.entry_args()]
     assert argv[-len(tail) :] == tail
-    assert not any("secret" in a for a in argv)
+    assert not any("id:secret" in a for a in argv)
+    assert f"spark.redaction.regex={_local.REDACTION_REGEX}" in argv
+
+
+def test_spark_s_redaction_pattern_names_credentials_unless_the_file_sets_its_own(tmp_path, stub):
+    # Spark 3.5's default (core/.../internal/config/package.scala); 3.4 lacks credential.
+    assert _local.REDACTION_REGEX == "(?i)secret|password|token|access[.]?key|credential"
+    conf = tmp_path / "spark.conf"
+    conf.write_text("spark.redaction.regex (?i)secret|credential|apikey\n")
+    sub = submitter(
+        LocalHost(tmp_path, {SUBMIT_EXECUTABLE_ENV: str(stub), PROPERTIES_FILE_ENV: str(conf)})
+    )
+    argv = submit_argv(sub, the_run(local_contract()).bind(local_root=sub.root))
+    assert not any(a.startswith("spark.redaction.regex=") for a in argv)
+
+
+def test_a_spark_submit_inside_the_project_is_refused(tmp_path):
+    inside = tmp_path / "tools" / "spark-submit"
+    inside.parent.mkdir()
+    inside.write_text(STUB, encoding="utf-8")
+    inside.chmod(0o755)
+    for env in ({SUBMIT_EXECUTABLE_ENV: str(inside)}, {"PATH": str(inside.parent)}):
+        with pytest.raises(SparkRunError, match="inside the project"):
+            submitter(LocalHost(tmp_path, env))
+
+
+def test_a_spark_submit_linked_from_outside_into_the_project_is_refused(tmp_path, stub):
+    inside = tmp_path / "spark-submit"
+    inside.write_text(STUB, encoding="utf-8")
+    inside.chmod(0o755)
+    link = stub.parent / "linked-spark-submit"
+    link.symlink_to(inside)
+    with pytest.raises(SparkRunError, match="inside the project"):
+        submitter(LocalHost(tmp_path, {SUBMIT_EXECUTABLE_ENV: str(link)}))
+
+
+def test_a_spark_submit_found_through_a_relative_path_entry_is_refused(tmp_path, stub):
+    os.symlink(stub.parent, tmp_path / "rel")
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        with pytest.raises(SparkRunError, match="relative PATH entry"):
+            submitter(LocalHost(tmp_path / "ws", {"PATH": "rel"}))
+    finally:
+        os.chdir(cwd)
+
+
+def test_the_run_environment_keeps_only_names_a_shell_could_set():
+    env = {
+        "PATH": "/usr/bin",
+        "AWS_REGION": "eu-west-1",
+        "_x1": "kept",
+        "BASH_FUNC_spark-submit%%": "() { touch /tmp/pwned; }",
+        "BASH_FUNC_x": "() { :; }",
+        "BASH_ENV": "/tmp/evil.sh",
+        "ENV": "/tmp/evil.sh",
+        "SHELLOPTS": "xtrace",
+        "BASHOPTS": "extdebug",
+        "PS4": "$(touch /tmp/pwned)",
+        "BASH_XTRACEFD": "1",
+        "1BAD": "x",
+        "A-B": "x",
+        "A=B": "x",
+    }
+    assert _local.run_env(env) == {"PATH": "/usr/bin", "AWS_REGION": "eu-west-1", "_x1": "kept"}
 
 
 # --- artifacts -------------------------------------------------------------------------
@@ -688,9 +752,9 @@ def test_a_lost_stream_starts_again(host, started):
     assert "stopped without recording how it ended" in again.message
 
 
-def test_a_spark_submit_that_cannot_start_is_a_failed_run(host):
+def test_a_spark_submit_that_cannot_start_is_a_failed_run(host, stub):
     run = the_run(batch_contract())
-    broken = Path(host.workspace) / "not-a-program"
+    broken = stub.parent / "not-a-program"
     broken.write_text("not a program\n")
     broken.chmod(0o755)
     out = rc.run_once(
@@ -854,3 +918,51 @@ def test_a_linked_run_directory_is_neither_listed_nor_pruned(host, tmp_path):
     assert runs.runs() == []
     runs.prune()
     assert (kept / "run.json").is_file()
+
+
+BASH_STUB = """#!/bin/bash
+# A bash spark-submit, as Spark's own is: it records what bash was handed, then runs the
+# stub. An exported function or a startup file would have run before this line.
+env > "$STUB_OUT/bash-env.txt"
+if declare -F stub_hook >/dev/null; then echo function > "$STUB_OUT/bash-function"; fi
+exec "{python}" "{stub}" "$@"
+"""
+
+
+@pytest.mark.skipif(not Path("/bin/bash").exists(), reason="needs bash")
+def test_a_bash_spark_submit_runs_no_function_or_startup_file_from_the_environment(
+    host, tmp_path, stub
+):
+    out = Path(host.env["STUB_OUT"])
+    pwned = tmp_path / "pwned"
+    startup = tmp_path / "startup.sh"
+    startup.write_text(f"touch {pwned}\n", encoding="utf-8")
+    wrapper = stub.parent / "bash-spark-submit"
+    wrapper.write_text(BASH_STUB.format(python=sys.executable, stub=stub), encoding="utf-8")
+    wrapper.chmod(0o755)
+    hostile = with_env(
+        host,
+        **{
+            SUBMIT_EXECUTABLE_ENV: str(wrapper),
+            "BASH_FUNC_stub_hook%%": f"() {{ touch {pwned}; }}",
+            "BASH_ENV": str(startup),
+            "ENV": str(startup),
+            "SHELLOPTS": "xtrace",
+            "PS4": f"$(touch {pwned})",
+        },
+    )
+    out_ = rc.run_once(the_run(batch_contract()), local_host=hostile, timeout=30, say=lambda _: 0)
+    assert out_.state == SUCCEEDED, out_.message
+    seen = (out / "bash-env.txt").read_text(encoding="utf-8")
+    assert "BASH_FUNC_" not in seen and "BASH_ENV=" not in seen and "PS4=" not in seen
+    assert "SHELLOPTS=xtrace" not in seen
+    assert not (out / "bash-function").exists() and not pwned.exists()
+
+
+def test_a_run_s_directory_status_and_log_are_owner_only(host):
+    run = the_run(batch_contract())
+    out = rc.run_once(run, local_host=host, timeout=30, say=lambda _: 0)
+    assert out.state == SUCCEEDED, out.message
+    where = LocalRuns(host, run.product, run.build).dir / "runs" / out.run_id
+    for path in (where, where / "status.json", where / "driver.log"):
+        assert path.stat().st_mode & 0o077 == 0, (path, oct(path.stat().st_mode))

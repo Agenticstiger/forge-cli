@@ -37,7 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`spark.hadoop.fs.s3.impl`, the endpoint) and puts hadoop-aws on `spark.driver.extraClassPath`,
   as spark-submit downloads the runner before `--packages` load. A project dotenv can no
   longer set `SPARK_*`, `PYSPARK_*`, `HADOOP_*` or `YARN_*`, which choose what spark-submit
-  starts. The runner changed, so each running Spark stream restarts once on its next apply.
+  starts, and a run's environment keeps only names a shell could set, without bash's
+  exported functions (`BASH_FUNC_*`) or startup settings (`BASH_ENV`, `ENV`, `SHELLOPTS`,
+  `BASHOPTS`, `PS4`, `BASH_XTRACEFD`). The spark-submit must be an absolute path outside the
+  project, a run's directory, `status.json` and `driver.log` are owner-only, and forge passes
+  Spark 3.5's `spark.redaction.regex` (which names `credential`) unless the properties file sets
+  its own. The runner changed, so each running Spark stream restarts once on its next apply.
 - **A Spark stream sends the records it cannot land elsewhere: `properties.stream.deadLetter`
   (0.7.7 preview).** A record whose value or key is not the declared JSON, or that lacks a
   required field, no longer fails the stream. It goes to a dead-letter table beside the output
