@@ -295,14 +295,15 @@ def _refuse_inert_rules(contract: Any) -> None:
         declared = declared or any("sharedColumns" in r for r in links)
     if declared:
         shown = contract.get("fluidVersion") or "none"
+        first = ".".join(str(part) for part in FIRST_VERSION)
         raise CLIError(
             1,
             "dbt_tests_rules_need_preview",
             {
                 "detail": (
                     f"the contract declares rules about valid data, which exist from "
-                    f"fluidVersion 0.7.7, and it declares {shown}: none of them runs, so no "
-                    "requirement can be met. Declare fluidVersion: 0.7.7."
+                    f"fluidVersion {first}, and it declares {shown}: none of them runs, so no "
+                    f"requirement can be met. Declare fluidVersion {first} or later."
                 )
             },
         )
