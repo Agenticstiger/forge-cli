@@ -41,9 +41,7 @@ ignores a value that one of the project's own dotenv files tries to set.
 
 from __future__ import annotations
 
-import hashlib
 import ipaddress
-import os
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple
@@ -65,6 +63,12 @@ from fluid_build.secrets.policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST_ENV
 from fluid_build.secrets.policy import allowlist as secret_ref_allowlist
 from fluid_build.secrets.policy import is_loopback, variable_allowed
 from fluid_build.streaming.compiler import CONTRACT_SQL_ALLOWLIST_ENV
+from fluid_build.streaming.contract_sql import (  # noqa: F401 - re-exported
+    contract_sql_entry,
+    contract_sql_refusal,
+    listed_sql_refusal,
+)
+from fluid_build.streaming.contract_sql import operator_entries as _entries
 
 CONTEXT_ALLOWLIST_ENV = "FLUID_FLINK_KUBE_CONTEXT_ALLOWLIST"
 NAMESPACE_ALLOWLIST_ENV = "FLUID_FLINK_NAMESPACE_ALLOWLIST"
@@ -87,11 +91,6 @@ class FlinkPolicyError(FluidUserError):
     """
 
     code: str = "FlinkPolicyError"
-
-
-def _entries(name: str, environ: Optional[Mapping[str, str]]) -> List[str]:
-    env = os.environ if environ is None else environ
-    return [e.strip() for e in (env.get(name, "") or "").split(",") if e.strip()]
 
 
 def _image_repository(image: str) -> str:
@@ -461,30 +460,6 @@ def refuse_unless_source_hosts_allowed(
         refuse_unless_catalog_host_allowed(registry, role="Schema Registry", environ=environ)
 
 
-def contract_sql_entry(product_id: Any, build: Mapping[str, Any]) -> str:
-    """The allowlist entry that approves exactly this build's SQL: ``product/build@sha256:..``."""
-    sql = (build.get("properties") or {}).get("sql")
-    digest = hashlib.sha256(str(sql).strip().encode("utf-8")).hexdigest()
-    return f"{product_id}/{build.get('id')}@sha256:{digest}"
-
-
-def contract_sql_refusal(
-    product_id: Any, build: Mapping[str, Any], entries: List[str]
-) -> Optional[Tuple[bool, str]]:
-    """None when ``entries`` approve the build's SQL; otherwise whether an entry pins other
-    SQL for the build (it changed after review), and the list to export with it pinned.
-
-    The managed Flink lane and the Spark runner share this rule, each with its variable.
-    """
-    build_id = build.get("id")
-    pinned = contract_sql_entry(product_id, build)
-    if {str(product_id), f"{product_id}/{build_id}", pinned} & set(entries):
-        return None
-    mine = f"{product_id}/{build_id}@"
-    stale = any(e.startswith(mine) for e in entries)
-    return stale, ",".join([*(e for e in entries if not e.startswith(mine)), pinned])
-
-
 def refuse_unless_contract_sql_allowed(
     product_id: Any, build: Mapping[str, Any], environ: Optional[Mapping[str, str]] = None
 ) -> None:
@@ -501,13 +476,10 @@ def refuse_unless_contract_sql_allowed(
     - ``<product id>/<build id>``, which approves the build's SQL as it changes;
     - ``<product id>``, which approves every build of the product.
     """
-    props = build.get("properties")
-    if not isinstance(props, Mapping) or props.get("sql") is None:
-        return
-    build_id = build.get("id")
-    refusal = contract_sql_refusal(product_id, build, _entries(CONTRACT_SQL_ALLOWLIST_ENV, environ))
+    refusal = listed_sql_refusal(CONTRACT_SQL_ALLOWLIST_ENV, product_id, build, environ)
     if refusal is None:
         return
+    build_id = build.get("id")
     stale, listed = refusal
     raise FlinkPolicyError(
         what=f"managed Flink build {build_id!r} runs SQL written in the contract",

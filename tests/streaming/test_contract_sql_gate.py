@@ -28,10 +28,26 @@ def _props(contract):
     return contract["builds"][0]["properties"]
 
 
-def test_contract_sql_is_warned_about(contract):
+def test_contract_sql_is_warned_about(contract, monkeypatch):
+    monkeypatch.delenv(CONTRACT_SQL_ALLOWLIST_ENV, raising=False)
     _props(contract)["sql"] = "SELECT * FROM source_events"
     (warning,) = validation_warnings(contract)
     assert CONTRACT_SQL_ALLOWLIST_ENV in warning and "commerce.nested-events" in warning
+    assert "approves other SQL" not in warning
+
+
+def test_the_warning_goes_once_the_operator_lists_the_build(contract, monkeypatch):
+    """validate asks apply's rule: a listed build is quiet, so --strict passes it."""
+    _props(contract)["sql"] = "SELECT * FROM source_events"
+    build = contract["builds"][0]
+    pinned = contract_sql_entry(contract["id"], build)
+    for entry in (pinned, f"{contract['id']}/{build['id']}", contract["id"]):
+        monkeypatch.setenv(CONTRACT_SQL_ALLOWLIST_ENV, f"other.product,{entry}")
+        assert validation_warnings(contract) == []
+    _props(contract)["sql"] = "SELECT * FROM source_events UNION ALL SELECT * FROM lake.hr.pay"
+    monkeypatch.setenv(CONTRACT_SQL_ALLOWLIST_ENV, pinned)
+    (warning,) = validation_warnings(contract)
+    assert "the entry listed for it approves other SQL (it changed after review)" in warning
 
 
 def test_apply_refuses_contract_sql_the_operator_did_not_list(contract, monkeypatch):
