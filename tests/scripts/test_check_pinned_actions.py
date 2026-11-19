@@ -378,6 +378,19 @@ def test_an_image_on_another_registry_is_not_checked():
     assert mod.get_image_digest("localhost:5000/img", "v1") is None
 
 
+def test_a_redirect_is_refused_so_no_token_follows_it():
+    import urllib.error
+    import urllib.request
+
+    mod = _load_module()
+    handler = mod._NoRedirect()
+    req = urllib.request.Request(
+        "https://registry-1.docker.io/v2/x", headers={"Authorization": "t"}
+    )
+    with pytest.raises(urllib.error.HTTPError):
+        handler.redirect_request(req, None, 307, "Temporary Redirect", {}, "https://evil.test/")
+
+
 if __name__ == "__main__":
     # Allow running this file directly: `python tests/scripts/test_check_pinned_actions.py`
     import subprocess

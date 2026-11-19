@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
@@ -39,13 +40,24 @@ WORKFLOW_USES_RE = re.compile(
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: urllib would send the Authorization header to the
+    new host, past the host check."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        raise urllib.error.HTTPError(newurl, code, f"refusing redirect: {msg}", headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _github_api_json(url: str) -> object:
     """Fetch JSON from the GitHub API after enforcing the expected origin."""
     parsed = urlparse(url)
     if parsed.scheme != "https" or parsed.netloc != GITHUB_API_HOST:
         raise ValueError(f"Refusing non-GitHub API URL: {url}")
     req = urllib.request.Request(url, headers=_gh_headers())
-    with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310
+    with _OPENER.open(req, timeout=15) as resp:  # nosec B310
         return json.loads(resp.read())
 
 
@@ -87,7 +99,7 @@ def _https(url: str, host: str, headers: dict, method: str = "GET"):
     if parsed.scheme != "https" or parsed.netloc != host:
         raise ValueError(f"Refusing URL outside {host}: {url}")
     req = urllib.request.Request(url, headers=headers, method=method)
-    return urllib.request.urlopen(req, timeout=15)  # nosec B310
+    return _OPENER.open(req, timeout=15)  # nosec B310
 
 
 def get_image_digest(name: str, tag: str) -> str | None:
