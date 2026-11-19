@@ -48,6 +48,7 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     Mapping,
     NamedTuple,
@@ -394,20 +395,30 @@ def _glue_table_declared(binding: Mapping[str, Any]) -> bool:
     return bool(loc.get("database") and loc.get("table") and _glue_cataloged(binding, fmt))
 
 
+def glue_tables(contract: Mapping[str, Any]) -> Iterator[Tuple[str, List[Any]]]:
+    """``(expose id, columns)`` for each Glue table :func:`_emit_glue` writes: the tables
+    :func:`validate_aws_column_types` and ``fluid doctor --contract`` judge."""
+    for index, exposure in enumerate(column_types.exposes_of(contract)):
+        binding = exposure.get("binding") if isinstance(exposure, Mapping) else None
+        if not isinstance(binding, Mapping) or not is_cloud(binding, "aws"):
+            continue
+        if _glue_table_declared(binding):
+            yield _expose_id(exposure) or str(index), column_types.schema_of(exposure)
+
+
+def glue_column_outcome(column: Mapping[str, Any]) -> column_types.TypeOutcome:
+    """What one column becomes in a Glue table: exact, lossy or refused."""
+    return column_types.outcome_of(column, _hive_outcome, _hive_column_outcome)
+
+
 def validate_aws_column_types(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
     """``(errors, warnings)`` for the column types of the contract's Glue tables: the
     refusal :func:`_emit_glue` raises, and a warning for each type it writes as a
     fallback. ``fluid validate`` runs this so ``generate iac`` finds nothing new."""
     errors: List[str] = []
     warnings: List[str] = []
-    for index, exposure in enumerate(column_types.exposes_of(contract)):
-        binding = exposure.get("binding") if isinstance(exposure, Mapping) else None
-        if not isinstance(binding, Mapping) or not is_cloud(binding, "aws"):
-            continue
-        if not _glue_table_declared(binding):
-            continue
-        schema = column_types.schema_of(exposure)
-        refusal, lossy = _glue_column_type_findings(_expose_id(exposure) or str(index), schema)
+    for expose, schema in glue_tables(contract):
+        refusal, lossy = _glue_column_type_findings(expose, schema)
         if refusal is not None:
             errors.append(f"{refusal} {' '.join(refusal.remediation)}".strip())
         warnings.extend(lossy)

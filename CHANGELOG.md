@@ -47,6 +47,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Lakekeeper exposure in a file that also holds cloud bindings goes to Lakekeeper, and the rest to
   the provider, as before.
 
+- **`fluid doctor --contract` says whether an operation can run here, before CI starts.**
+  `fluid doctor --contract <file> [--operation validate|generate|plan|apply|ship] [--env NAME]
+  [--provider P] [--state-backend SPEC] [--json]` (a `.tgz` bundle too) reports the schema revision the contract resolves to (with the bundled file's
+  sha256), the Forge build, each extra against the pins this build declares, the plugins
+  installed through entry points, `tofu`, `dbt` and `spark-submit`, the dbt adapters and the
+  OpenTofu provider pins, and every capability in one of four classes: `exact`, `lossy`,
+  `unsupported` or `requires-live-proof`. Column types come from the emitters' own type
+  tables, and every other finding from the rules and installed validators `fluid validate`
+  runs, so a BigQuery column
+  `generate iac` refuses (a bare `array`) is `unsupported` here first. `validate`, `generate`
+  and the offline `plan` need no cloud, credential or tool, so a catalog-only contract on AWS
+  lists no AWS identity; `apply` and `ship` list the cloud's identity and the state backend as
+  `requires-live-proof`, resolve the cloud and the state backend as `apply` does (a contract on
+  several clouds needs `--provider`), and find dbt as the dbt runner does. It is offline: it fetches no schema, provider or tool and installs
+  nothing. `--live` adds read-only checks (STS `GetCallerIdentity`, a GCP token refresh, a
+  state-bucket read) and prints no identity. `fluid doctor --compare LEFT RIGHT` compares two
+  saved `--json` reports (format `fluid-preflight/1`) and names each version gap the operation
+  cares about with what to change. A report holds no environment value (no path, account, bucket or variable value) and
+  goes through both redaction layers. `--strict` also fails on `lossy`. `fluid doctor --env`
+  alone still lists the kill switches.
+
 - **A saved OpenTofu plan applies on another runner, and only on the target it was made for.**
   `fluid plan --tofu` now records the plan's target in its `opentofuPlan` record (under
   `planDigest`): the cloud account and region (AWS, from STS `GetCallerIdentity` and the provider's
