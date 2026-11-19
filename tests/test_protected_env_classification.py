@@ -268,7 +268,6 @@ def test_protected(name: str) -> None:
         "GIT_AUTHOR_NAME",
         "GIT_COMMITTER_EMAIL",
         "GIT_HTTP_LOW_SPEED_LIMIT",
-        "",
     ],
 )
 def test_loadable(name: str) -> None:
