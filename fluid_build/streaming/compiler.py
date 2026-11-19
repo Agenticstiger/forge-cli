@@ -679,12 +679,16 @@ def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
             builds = managed_builds(contract)
         except (ValueError, KeyError, TypeError):
             return []  # validation_errors reports it
+        from fluid_build.streaming.contract_sql import contract_sql_warning
+
+        # Apply's rule under this environment: a build the operator lists is quiet.
         warnings = [
-            f"Build {build.get('id')}: properties.sql is run only if the operator lists "
-            f"{contract.get('id')} in {CONTRACT_SQL_ALLOWLIST_ENV}; properties.mapping is "
-            "checked against the output before deploy and reads nothing but the stream"
-            for build in builds
-            if (build.get("properties") or {}).get("sql") is not None
+            warning
+            for warning in (
+                contract_sql_warning(CONTRACT_SQL_ALLOWLIST_ENV, contract, build)
+                for build in builds
+            )
+            if warning
         ]
         for build in contract.get("builds") or []:
             props = build.get("properties") if isinstance(build, Mapping) else None

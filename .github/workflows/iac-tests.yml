@@ -142,7 +142,7 @@ jobs:
       # The state-encryption canary runs the apply engine's pieces against this
       # tofu with OpenTofu's built-in terraform_data: no provider, no network.
       - name: Stage 1 — tofu validate and state encryption (creds-free)
-        run: .venv/bin/python -m pytest tests/iac/test_iac_tofu_validate.py tests/iac/test_iac_state_encryption_tofu.py -q
+        run: .venv/bin/python -m pytest tests/iac/test_iac_tofu_validate.py tests/iac/test_iac_state_encryption_tofu.py tests/iac/test_iac_tofu_plugin_cache.py -q
 
   # The tofu lanes are independent (each runs its own files against moto or an
   # in-process stand-in, and asserts its own junit), so each is its own job:
@@ -273,10 +273,12 @@ jobs:
           .venv/bin/pip install --quiet --upgrade pip
           .venv/bin/pip install --quiet -e '.[dev,test-emulators]'
 
-      # One provider download per lane: the tests use TF_PLUGIN_CACHE_DIR when
-      # it is set (env.setdefault) and a fresh temporary cache per module when
-      # it is not. A lane runs one pytest process, so nothing writes the cache
-      # concurrently (OpenTofu's plugin cache is not safe for that).
+      # One provider download per lane. tests/_infrastructure/tofu_cache.py gives every
+      # test the TF_PLUGIN_CACHE_DIR that is already set, and makes a cache of its own in
+      # the run's basetemp when none is (and sets the lock-file flag in both cases).
+      # OpenTofu 1.10 and later lock the cache for concurrent use, and 1.12.2 fixed a false
+      # deadlock report when processes share it (opentofu#4166); the lanes run 1.12.12 and
+      # 1.13.9, so the xdist workers of one run can share it too.
       - name: Share one provider cache across the lane's modules
         run: |
           mkdir -p "$RUNNER_TEMP/tofu-plugin-cache"
