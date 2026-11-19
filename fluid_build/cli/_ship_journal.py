@@ -47,6 +47,7 @@ Standard library only at module scope (``fluid --help`` imports ``ship``).
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import json
@@ -357,12 +358,10 @@ class _TargetDir:
         try:
             for depth, part in enumerate(parts, start=1):
                 if create:
-                    try:
+                    # Whatever is there already is checked next: it opens only
+                    # as a real directory, never through a link.
+                    with contextlib.suppress(FileExistsError):
                         os.mkdir(part, 0o700, dir_fd=fd)
-                    except FileExistsError:
-                        # Whatever is there is checked next: it opens only as
-                        # a real directory, never through a link.
-                        pass
                 try:
                     child = os.open(part, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=fd)
                 except OSError as exc:

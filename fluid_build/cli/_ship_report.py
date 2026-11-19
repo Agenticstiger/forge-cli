@@ -217,9 +217,9 @@ def write_reports(directory: Path, report: Dict[str, Any], records: List[StageRe
         for name in (REPORT_JSON, REPORT_JUNIT):
             try:
                 os.unlink(directory / name)
-            except FileNotFoundError:
-                pass  # no old report to stand in for this run's
             except OSError as exc:
+                if isinstance(exc, FileNotFoundError):
+                    continue  # no old report to stand in for this run's
                 # The run fails with the write's own error below; say which
                 # old report is still there, so nobody reads it as this run's.
                 warn(
@@ -254,10 +254,9 @@ def _replace(path: Path, data: bytes) -> None:
     except BaseException:
         try:
             os.unlink(tmp)
-        except FileNotFoundError:
-            pass  # already renamed into place or never made
         except OSError as exc:
-            warn(_LOG, "ship_report_temp_left", path=tmp, error=str(exc))
+            if not isinstance(exc, FileNotFoundError):  # gone: renamed into place
+                warn(_LOG, "ship_report_temp_left", path=tmp, error=str(exc))
         raise
 
 
