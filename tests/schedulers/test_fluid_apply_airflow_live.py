@@ -48,6 +48,7 @@ for dag_id, dag in bag.dags.items():
         "edges": sorted([t.task_id, d] for t in dag.tasks for d in t.downstream_task_ids),
         "rules": {t.task_id: getattr(t.trigger_rule, "value", t.trigger_rule) for t in dag.tasks},
         "outlets": {t.task_id: [o.uri for o in t.outlets] for t in dag.tasks},
+        "retries": {t.task_id: t.retries for t in dag.tasks},
         "timetable": type(dag.timetable).__name__,
     }
 print(json.dumps(out))
@@ -63,7 +64,8 @@ _OR_TIME = {"2": "DatasetOrTimeSchedule", "3": "AssetOrTimeSchedule"}
 
 def _expected(dag: fluid_apply.ScheduledDag, major: str) -> Dict[str, Any]:
     only = len(dag.tasks) == 1
-    task_id = {t.build_id: ("fluid_apply" if only else t.build_id) for t in dag.tasks}
+    single = "fluid_keepalive" if dag.keepalive else "fluid_apply"
+    task_id = {t.build_id: (single if only else t.build_id) for t in dag.tasks}
     if dag.schedule.datasets and dag.schedule.cron is not None:
         timetable = _OR_TIME[major]
     else:
@@ -73,6 +75,7 @@ def _expected(dag: fluid_apply.ScheduledDag, major: str) -> Dict[str, Any]:
         "edges": sorted([task_id[u], task_id[t.build_id]] for t in dag.tasks for u in t.upstream),
         "rules": {task_id[t.build_id]: t.trigger_rule or "all_success" for t in dag.tasks},
         "outlets": {task_id[t.build_id]: list(t.outlets) for t in dag.tasks},
+        "retries": {task_id[t.build_id]: t.retries for t in dag.tasks},
         "timetable": timetable,
     }
 

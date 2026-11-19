@@ -62,6 +62,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fluid.dead-letter.raw-key` header: the Kafka sink is at least once, and a batch sent again
   after a failure carries the same keys, so a consumer drops repeats by key.
 
+- **A keepalive DAG for an always-on stream that declares `execution.retries`.** `fluid
+  generate schedule` gives each forge Spark stream that is not `trigger.availableNow` and
+  declares `execution.retries` a small DAG whose one task runs
+  `fluid apply <contract> --mode reconcile --build-id <stream> --yes`, so a stream a Spot
+  interruption or a failed driver stopped starts again on its checkpoint. It runs every 5
+  minutes, or on the build's `execution.orchestration.airflow.dagConfig.schedule`, one run at a
+  time, with no catch-up and no Airflow retries: the build's `execution.retries` is the restart
+  budget, and a run fails when the stream cannot be kept running (it drifted from the contract,
+  nothing is deployed, its job config cannot be read, its cluster ended, or the restarts are
+  spent). The worker needs the `FLUID_SPARK_*` settings and the forge release the CI apply has,
+  or a run can fail too. A run cancelled on purpose stays stopped. The task declares no
+  outlets, so a dataset trigger on what only the stream writes is refused, as before. A contract
+  whose only builds are such streams now gets this DAG on Airflow instead of "No build needs a
+  DAG"; on Prefect or Dagster, and in `fluid scaffold-composer`, it still has nothing to
+  schedule, and the message names the Airflow keepalive.
+
 ### Fixed
 
 - **`fluid apply` runs a dbt build whatever its trigger, finds the dbt that has its adapter, and

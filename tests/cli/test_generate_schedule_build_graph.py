@@ -16,11 +16,14 @@ import argparse
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from fluid_build.cli import generate_schedule
+from fluid_build.cli.scaffold_composer import run as scaffold_composer
+from fluid_build.schedulers.airflow import fluid_apply
 from tests.cli._schedule_dag_fixtures import StubAsset, load_dag, run_task
 from tests.schedulers.fluid_apply_fixtures import SPARK_CONTRACT, events_pipeline
 
@@ -102,6 +105,30 @@ def test_a_contract_of_streams_alone_needs_no_dag(
     assert not (tmp_path / "out").exists()
 
 
+def test_a_kept_alive_stream_gets_its_keepalive_dag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stream = dict(SPARK_CONTRACT["builds"][0], execution={"retries": {"maxAttempts": 5}})
+    _project(tmp_path, dict(SPARK_CONTRACT, builds=[stream]))
+    assert _generate(tmp_path, monkeypatch) == 0
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["stream_raw_dag.py"]
+
+
+@pytest.mark.parametrize("scheduler", ["prefect", "dagster"])
+def test_a_scheduler_with_no_keepalive_has_nothing_to_schedule_for_a_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, scheduler: str
+) -> None:
+    """Only the Airflow DAGs keep a stream running: another scheduler writes nothing for it,
+    and is told where the keepalive DAG comes from."""
+    stream = dict(SPARK_CONTRACT["builds"][0], execution={"retries": {"maxAttempts": 5}})
+    _project(tmp_path, dict(SPARK_CONTRACT, builds=[stream]))
+    assert _generate(tmp_path, monkeypatch, "--scheduler", scheduler) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "No build needs a DAG" in out
+    assert "gets a keepalive DAG on Airflow: fluid generate schedule --scheduler airflow" in out
+    assert not (tmp_path / "out").exists()
+
+
 def test_dag_id_and_schedule_overrides_stay_refused_for_a_build_graph(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -114,10 +141,6 @@ def test_dag_id_and_schedule_overrides_stay_refused_for_a_build_graph(
 def test_the_composer_scaffold_agrees_that_streams_need_no_dag(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
-    from types import SimpleNamespace
-
-    from fluid_build.cli.scaffold_composer import run as scaffold_composer
-
     contract = tmp_path / "contract.fluid.yaml"
     stream = dict(SPARK_CONTRACT["builds"][0], execution={"trigger": {"cron": "@daily"}})
     contract.write_text(yaml.safe_dump(dict(SPARK_CONTRACT, builds=[stream])), "utf-8")
@@ -125,6 +148,24 @@ def test_the_composer_scaffold_agrees_that_streams_need_no_dag(
     assert scaffold_composer(args, LOG) == 0
     out = " ".join(capsys.readouterr().out.split())
     assert "as a stream that fluid apply keeps running" in out and "No DAG written." in out
+    assert not (tmp_path / "dags").exists()
+
+
+def test_the_composer_scaffold_leaves_a_kept_alive_stream_to_generate_schedule(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Its validate, plan and apply DAG cannot keep a stream running: it writes none, and says
+    which command writes the stream's keepalive DAG."""
+    contract = tmp_path / "contract.fluid.yaml"
+    stream = dict(SPARK_CONTRACT["builds"][0], execution={"retries": {"maxAttempts": 5}})
+    data = dict(SPARK_CONTRACT, builds=[stream])
+    assert fluid_apply.has_scheduled_builds(data)  # generate schedule writes its keepalive DAG
+    contract.write_text(yaml.safe_dump(data), "utf-8")
+    args = SimpleNamespace(contract=str(contract), env=None, out_dir=str(tmp_path / "dags"))
+    assert scaffold_composer(args, LOG) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "No DAG written." in out
+    assert "gets a keepalive DAG from fluid generate schedule" in out
     assert not (tmp_path / "dags").exists()
 
 
@@ -140,8 +181,6 @@ def test_regenerating_removes_a_dag_whose_build_now_runs_in_another(
     assert _generate(tmp_path, monkeypatch) == 0
     out = tmp_path / "out"
     assert (out / "daily_users_dag.py").exists()
-    from fluid_build.schedulers.airflow import fluid_apply
-
     rendered = fluid_apply.render_fluid_apply_dags(contract, env="aws", contract_path=CONTRACT)
     other_env = rendered["daily_users_dag.py"]
     (out / "daily_users_other_env_dag.py").write_text(other_env, encoding="utf-8")

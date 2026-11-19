@@ -170,8 +170,11 @@ def run(args: Any, logger: logging.Logger) -> int:
         # stream fluid apply keeps running, or a build whose trigger is
         # continuous) has nothing to schedule, which is not an error: unless it
         # hand-declares orchestration tasks, or names a scheduler that does not
-        # exist.
-        if fluid_apply.runs_only_outside_schedulers(contract) and not (
+        # exist. Only the Airflow DAGs keep a stream running (its keepalive DAG),
+        # so on another scheduler a stream that declares execution.retries has
+        # nothing to schedule either.
+        keepalive = (scheduler_name or fluid_apply.DEFAULT_ENGINE) == fluid_apply.DEFAULT_ENGINE
+        if fluid_apply.runs_only_outside_schedulers(contract, keepalive=keepalive) and not (
             fluid_apply.has_explicit_tasks(contract)
         ):
             from fluid_build.schedulers import has_scheduler
@@ -183,6 +186,11 @@ def run(args: Any, logger: logging.Logger) -> int:
                     "continuously (trigger.type: continuous), so there is nothing to "
                     "schedule. No files written."
                 )
+                if not fluid_apply.runs_only_outside_schedulers(contract):
+                    cprint(
+                        "A stream that declares execution.retries gets a keepalive DAG on "
+                        "Airflow: fluid generate schedule --scheduler airflow."
+                    )
                 return 0
 
         if not scheduler_name:
