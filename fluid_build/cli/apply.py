@@ -626,12 +626,8 @@ def register(subparsers: argparse._SubParsersAction):
         choices=_MODE_CHOICES,
         default=None,  # resolved by parse_mode; None = amend
         help=(
-            "DDL/DML strategy: dry-run | create-only | amend (default) | "
-            "amend-and-build | replace | replace-and-build | reconcile. reconcile "
-            "deploys nothing: it restarts the contract's always-on Spark streams that "
-            "died (with --build-id: that stream), with the config the last apply "
-            "deployed and within each stream's restart budget, and runs no tofu and "
-            "no plan. See docs/apply.md."
+            "dry-run | create-only | amend (default) | amend-and-build | replace | "
+            "replace-and-build | reconcile (deploys nothing). See docs/apply.md."
         ),
     )
     mode_group.add_argument(
