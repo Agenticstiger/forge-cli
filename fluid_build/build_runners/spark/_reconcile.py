@@ -210,26 +210,34 @@ def _oldest(runs: Sequence[RunInfo]) -> List[RunInfo]:
     return sorted(runs, key=lambda h: (h.created, h.run_id))[:1]
 
 
-def _last_end(history: Sequence[RunInfo]) -> Optional[RunInfo]:
-    """The run whose end is the stream's: the newest, passing over a cancelled run that was
-    started while the next older run of its config was still going (a second copy forge
-    cancelled, or one cancelled by hand), so a death of that older run after it is not read
-    as a cancel. A cancelled restart of that older run (``restart_of``) started after it
-    ended: its cancel is the stream's end.
+def _is_copy(index: int, history: Sequence[RunInfo]) -> bool:
+    """Whether the cancelled run ``history[index]`` was a second copy of an older run: one
+    of its config started from the same run (the same ``restart_of``, or none for a first
+    start), with no run of another config started between them. Two applies that restart a
+    stream at once start such a pair, and the younger cancels itself."""
+    info = history[index]
+    for older in history[index + 1 :]:
+        if older.config_hash != info.config_hash:
+            return False
+        if older.restart_of == info.restart_of:
+            return True
+    return False
 
-    Every run forge starts after another one of its config ended carries ``restart_of``,
-    except a start after a cancel (the older run is then a cancel too). A run of this config
-    started outside forge after the older one ended, then cancelled, is passed over as well:
-    runs carry no end time here to tell it apart."""
+
+def _last_end(history: Sequence[RunInfo]) -> Optional[RunInfo]:
+    """The run whose end is the stream's: the newest, passing over a cancelled second copy
+    (:func:`_is_copy`), so a death of the run it copied, after it, is not read as a cancel.
+    Any other cancelled run is the stream's end, an operator's stop: a cancelled restart
+    (another copy may sit between it and the run it restarted), or a run started after
+    another config's.
+
+    A run of this config started outside forge with the same restart mark (or none) as an
+    older run, then cancelled, is passed over as a copy too: runs carry no end time here."""
     for index, info in enumerate(history):
-        if info.state == CANCELLED:
-            older = next(
-                (o for o in history[index + 1 :] if o.config_hash == info.config_hash), None
-            )
-            if older is not None and info.restart_of != older.run_id:
-                continue
+        if info.state == CANCELLED and _is_copy(index, history):
+            continue
         return info
-    return history[0] if history else None
+    return None
 
 
 def _utc(epoch: float) -> str:
@@ -259,12 +267,15 @@ def _spent_text(run: DesiredRun, last: RunInfo, history: Sequence[RunInfo], coun
         if h.config_hash == run.config_hash and h.state in (FAILED, SUCCEEDED) and h is not last
     ][:3]
     restarted = ", ".join(f"{h.run_id} at {_utc(h.created)}" for h in counted[-5:])
+    # The next restart is allowed once fewer than the budget are under an hour old: when
+    # the budget was lowered (it is not in every config hash), more than it may still count.
+    oldest = counted[max(len(counted) - max(run.restarts_per_hour, 1), 0)]
     text = (
         f"{_failure_text(last)}. Not started again: its budget of {run.restarts_per_hour} "
         "restarts per rolling hour (execution.retries.maxAttempts, 5 when unset) is spent: "
-        f"{restarted}. It can restart from {_utc(counted[0].created + RESTART_WINDOW_S)}, "
-        "when the oldest of them is an hour old; to start it sooner, fix the cause and "
-        "change the build, and fluid apply starts the new config"
+        f"{restarted}. It can restart from {_utc(oldest.created + RESTART_WINDOW_S)}, when "
+        f"fewer than {run.restarts_per_hour} of them are under an hour old; to start it "
+        "sooner, fix the cause and change the build, and fluid apply starts the new config"
     )
     if earlier:
         text += ". Earlier: " + "; ".join(_failure_text(h, 160) for h in earlier)
@@ -465,6 +476,10 @@ def _reconcile_one(
         return out
     start = _Start()
     if last is not None and last.config_hash == run.config_hash:
+        if only and last.state == CANCELLED:
+            # A cluster that ended cancels the steps still pending on it: a stream there is
+            # reported as the cluster's, not left stopped as an operator's.
+            adapter.check_target()
         hint = getattr(adapter, "retry_hint", None)
         decided = _after_end(
             run, last, history, now, out, only=only,
@@ -476,7 +491,7 @@ def _reconcile_one(
     if dry_run:
         return _planned(out, stale, matching, start)
     if only and confirm is not None and not confirm(_question(run, out, stale, matching, start)):
-        out.action, out.message = "declined", "nothing was started or cancelled"
+        out.action, out.message = "declined", _declined_text(stale, start)
         return out
     if not _cancel_and_wait(adapter, stale, out, clock, budget):
         return out
@@ -525,6 +540,12 @@ def _planned(
     else:
         out.message = "would start the job"
     return out
+
+
+def _declined_text(stale: Sequence[RunInfo], start: _Start) -> str:
+    if stale:
+        return f"declined: {', '.join(s.run_id for s in stale)} not cancelled, nothing started"
+    return f"declined: not restarted, the stream stays stopped ({start.ended})"
 
 
 def _question(

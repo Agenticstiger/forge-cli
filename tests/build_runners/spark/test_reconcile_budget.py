@@ -100,6 +100,20 @@ def test_a_spent_budget_starts_nothing_and_says_when_it_frees(ec2, clock, use, o
     assert "Earlier: run s-r3 ended FAILED" in out.message
 
 
+def test_a_lowered_budget_frees_when_fewer_than_it_are_under_an_hour_old(ec2, clock, use):
+    """execution.retries is not in an EMR on EC2 run's config hash: four restarts of the last
+    hour can count against a budget lowered to two. The next restart is allowed once only
+    one of them is under an hour old: at the third oldest's hour, not the oldest's."""
+    lowered = dataclasses.replace(ec2, restarts_per_hour=2)
+    fake = FakeAdapter(restarts(lowered, 4), job=uploaded(lowered))
+    use(fake)
+    out = go(lowered, clock)
+    assert (out.action, out.error, fake.calls) == ("failed", True, [])
+    assert f"It can restart from {rc._utc(WALL - 3000 + 2 * 60 + HOUR)}, when fewer than 2" in (
+        out.message
+    )
+
+
 def test_restarts_older_than_an_hour_no_longer_count(ec2, clock, use):
     # s-r0 and s-r1 are more than an hour old; s-r2 is exactly an hour old and still counts.
     fake = FakeAdapter(restarts(ec2, 5, start=WALL - HOUR - 120))
@@ -258,6 +272,10 @@ def test_reconcile_asks_before_it_restarts_and_a_no_starts_nothing(ec2, clock, u
     out = go(ec2, clock, only=True, confirm=lambda q: asked.append(q) or False)
     assert (out.action, out.error, fake.calls) == ("declined", False, [])
     assert "run s-dead ended FAILED: driver exited 1. Start it again on its checkpoint" in asked[0]
+    assert out.message == (
+        "declined: not restarted, the stream stays stopped (run s-dead ended FAILED: driver "
+        "exited 1)"
+    )
     out = go(ec2, clock, only=True, confirm=lambda q: True)
     assert (out.action, fake.calls) == ("restarted", ["start"])
 
@@ -388,6 +406,51 @@ def test_a_cancelled_restart_is_the_stream_s_end(ec2, clock, use):
     use(fake)
     out = go(ec2, clock, only=True)
     assert (out.action, out.error, fake.calls) == ("left-stopped", False, [])
+
+
+def test_an_operator_s_cancel_of_a_restart_is_the_end_past_a_cancelled_copy(ec2, clock, use):
+    """s-z died; two applies restarted it at once (s-o kept, s-y cancelled itself); s-o died
+    and was restarted as s-b, which an operator cancelled. s-y, between s-b and the run it
+    restarted, is a copy of s-o: it does not hide the operator's stop."""
+    history = [
+        info("s-b", "CANCELLED", hash_=ec2.config_hash, created=WALL - 50, restart_of="s-o"),
+        info("s-y", "CANCELLED", hash_=ec2.config_hash, created=WALL - 590, restart_of="s-z"),
+        died(ec2, "s-o", created=WALL - 600, restart_of="s-z"),
+        died(ec2, "s-z", created=WALL - 900),
+    ]
+    fake = FakeAdapter(history, job=uploaded(ec2))
+    use(fake)
+    out = go(ec2, clock, only=True)
+    assert (out.action, out.error, out.run_id, fake.calls) == ("left-stopped", False, "s-b", [])
+
+
+def test_an_operator_s_cancel_of_a_start_after_another_config_is_the_end(ec2, clock, use):
+    """Config X, then Y, then X again: s-a, started with no restart mark because another
+    config ran before it, was cancelled by an operator. It is no copy of s-z: Y ran between."""
+    history = [
+        info("s-a", "CANCELLED", hash_=ec2.config_hash, created=WALL - 50),
+        info("s-y", "CANCELLED", hash_="other", created=WALL - 300),
+        died(ec2, "s-z", created=WALL - 900),
+    ]
+    fake = FakeAdapter(history, job=uploaded(ec2))
+    use(fake)
+    out = go(ec2, clock, only=True)
+    assert (out.action, out.error, out.run_id, fake.calls) == ("left-stopped", False, "s-a", [])
+
+
+def test_a_cancelled_step_on_a_cluster_that_ended_is_the_cluster_s_error(ec2, clock, use):
+    """A cluster that terminates cancels the steps still pending on it: that is no
+    operator's stop, and the reconcile says the cluster ended."""
+    ended = "EMR cluster j-ABC is TERMINATED_WITH_ERRORS (INSTANCE_FAILURE) and takes no new step"
+    history = [
+        info("s-p", "CANCELLED", hash_=ec2.config_hash, created=WALL - 50, restart_of="s-o"),
+        died(ec2, "s-o", created=WALL - 900),
+    ]
+    fake = FakeAdapter(history, job=uploaded(ec2), target_error=ended)
+    use(fake)
+    out = go(ec2, clock, only=True)
+    assert (out.action, out.error, fake.calls) == ("failed", True, [])
+    assert ended in out.message
 
 
 def test_a_cancelled_copy_started_by_hand_does_not_hide_a_death(ec2, clock, use):
