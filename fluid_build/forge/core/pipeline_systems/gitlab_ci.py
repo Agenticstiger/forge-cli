@@ -272,7 +272,8 @@ class GitLabCITemplate(BasePipelineTemplate):
     def _evidence_only(self, config: PipelineConfig) -> List[str]:
         """``after_script``: a job that did not pass keeps its reports and drops
         what could be deployed, before its artifacts are uploaded."""
-        from fluid_build.cli._ship_stages import ARTIFACTS_DIR, BUNDLE_PATH, PLAN_PATH
+        # The leaf table, not _ship_stages: generating a file must not import ship.
+        from fluid_build.cli._ship_table import ARTIFACTS_DIR, BUNDLE_PATH, PLAN_PATH
 
         stem = PLAN_PATH.rsplit(".", 1)[0]
         deployable = [
