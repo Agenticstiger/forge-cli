@@ -543,6 +543,12 @@ def run(args, logger: logging.Logger) -> int:
         else:
             _display_plan_simple(plan, logger, output_path=args.out)
 
+        # A Spark build's EMR on EC2 cluster where Spot can take its driver or application
+        # master: warned, never refused, and not in plan.json (the cluster is its owner's).
+        from fluid_build.cli._spark_apply import plan_posture
+
+        plan_posture(contract, logger)
+
         # --- Advanced hook: cost estimation ---
         if getattr(args, "estimate_cost", False) and hook_provider:
             from fluid_build.cli.hooks import run_estimate_cost
