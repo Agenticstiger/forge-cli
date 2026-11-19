@@ -20,6 +20,7 @@ locality explicit.
 
 from .pipeline_systems import (  # noqa: F401  (re-export)
     PINNED_ACTIONS,
+    PINNED_IMAGES,
     AzureDevOpsTemplate,
     BasePipelineTemplate,
     BitbucketTemplate,
@@ -38,6 +39,7 @@ from .pipeline_systems import (  # noqa: F401  (re-export)
 __all__ = [
     "BasePipelineTemplate",
     "PINNED_ACTIONS",
+    "PINNED_IMAGES",
     "PipelineConfig",
     "PipelineProvider",
     "PipelineTemplateGenerator",
