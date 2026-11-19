@@ -524,12 +524,16 @@ class TestParameterizedAndAliasTypes:
     MATRIX = [
         ("number(12,2)", "number(12,2)", "numeric(12,2)", "numeric(12,2)", "numeric(12,2)"),
         ("decimal(18,4)", "decimal(18,4)", "numeric(18,4)", "decimal(18,4)", "decimal(18,4)"),
-        ("varchar(25)", "varchar(25)", "string(25)", "varchar(25)", "varchar(25)"),
-        ("NUMBER(38,0)", "number(38,0)", "numeric(38,0)", "numeric(38,0)", "numeric(38,0)"),
+        # BigQuery: the type the BigQuery IaC emitter writes, which carries a
+        # precision on a decimal only (tests/iac/test_iac_type_table_drift.py).
+        ("varchar(25)", "varchar(25)", "string", "varchar(25)", "varchar(25)"),
+        # 38 integer digits are a BIGNUMERIC on BigQuery (a NUMERIC holds 29).
+        ("NUMBER(38,0)", "number(38,0)", "bignumeric(38,0)", "numeric(38,0)", "numeric(38,0)"),
         ("bigint", "number", "int64", "bigint", "bigint"),
         ("text", "varchar", "string", "varchar", "varchar"),
         ("double", "float", "float64", "double precision", "numeric"),
-        ("timestamp_ntz", "timestamp_ntz", "timestamp", "timestamp", "timestamp"),
+        # A zone-less timestamp is BigQuery DATETIME.
+        ("timestamp_ntz", "timestamp_ntz", "datetime", "timestamp", "timestamp"),
         ("variant", "variant", "json", "super", "varchar"),
         ("decimal", "decimal", "numeric", "decimal", "decimal"),
     ]

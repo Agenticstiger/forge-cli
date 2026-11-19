@@ -421,6 +421,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A decimal's arguments are a precision and scale its engine holds, or the column is refused.**
+  A decimal kept whatever arguments it declared, so `decimal(1;drop table x)` went into the
+  Snowflake table's DDL as `NUMBER(1;drop table x)` from `fluid generate iac`, and into the dbt
+  SQL, and `decimal(40,20)` became a NUMBER Snowflake rejects at apply. The arguments are now a
+  precision and an optional scale in digits, the precision at least 1 and the scale no larger,
+  within the engine's limits (Snowflake NUMBER and Redshift DECIMAL: precision to 38, scale to
+  37; Databricks and DuckDB DECIMAL: precision to 38; BigQuery's NUMERIC and BIGNUMERIC as
+  before). `fluid validate` refuses the rest on Snowflake, as it does on Databricks and
+  BigQuery, `fluid generate iac` refuses it, and `fluid generate transformation` refuses it
+  where it writes the column's type for the build's dbt adapter (a skeleton model's casts, a
+  model contract's `data_type`). On BigQuery, arguments that are not digits are refused
+  instead of read as a bare NUMERIC. The dbt BigQuery types no longer keep arguments the
+  emitter refuses (`decimal(2,5)` was `numeric(2,5)`). A type that takes no precision on the
+  engine, such as `bignumeric` on Snowflake or `money`, drops its arguments as before.
+- **The dbt engine and the IaC emitters type a column alike on BigQuery and Snowflake, and a
+  BigQuery decimal keeps its precision and scale.** A dbt model builds into the table `fluid
+  apply` creates, and the two wrote many types differently, so each dbt rebuild and each apply
+  changed the other's column back. On BigQuery, dbt wrote `string` for `int16`, `int64`,
+  `float32`, `float64`, `binary`, `geometry` and other types the emitter writes as INT64, FLOAT64,
+  BYTES or GEOGRAPHY, and `timestamp` for a `timestamp_ntz` the emitter writes as DATETIME. On
+  Snowflake, the emitter wrote VARCHAR for `smallint`, `json`, `geography`, `timestamp_ntz`,
+  `timestamptz` and others, while dbt wrote `varchar` for `int64`, `float64` and `bytes`. Each
+  adapter now has one table: dbt's BigQuery types come from the emitter's, and the Snowflake
+  emitter types through dbt's, as Databricks already did; on BigQuery dbt's contract drops a
+  `varchar(n)` length, as the emitter writes STRING. On Snowflake a `json` column is VARIANT,
+  which holds any JSON value (OBJECT holds only an object), `money` is NUMBER(19,4) (a bare NUMBER
+  is NUMBER(38,0) and drops the cents), and `timestamptz` is TIMESTAMP_TZ. A declared type keeps
+  its arguments only in a type of the same family: `varchar(max)` is a bare VARCHAR except on
+  Redshift, a `tinyint(1)` display width no longer becomes NUMBER(1), and `timestamp(12)` is a
+  bare TIMESTAMP_NTZ. A Snowflake table applied before this change keeps the types the emitter
+  wrote then, and Snowflake cannot change a live column to another type (its `ALTER COLUMN` only
+  lengthens text or changes a NUMBER), so a column whose type changes here needs its table
+  migrated; a table a dbt build replaces already has dbt's types. A BigQuery `decimal(p,s)` was a
+  bare NUMERIC, which is NUMERIC(38,9), while dbt wrote `numeric(p,s)`; it is now NUMERIC(P,S), or
+  BIGNUMERIC(P,S) where only BIGNUMERIC holds the range. A decimal wider than a BIGNUMERIC still
+  warns, and one with a precision of 0 or a scale above its precision is now refused at validate.
+  BigQuery cannot give an existing NUMERIC column a precision, so the first plan after this change
+  replaces each live table that declares a decimal with a precision, once, which `fluid apply`
+  refuses without `--allow-data-loss`; declare the column `decimal` to keep the table as it is. A
+  table adopted into an empty state is replaced the same way, as a partitioned table already is.
+  Each contract with a BigQuery table gains one `terraform_data` that records this, so that plan
+  adds one more resource. After it, a new decimal column, a changed precision and a decimal made
+  bare are planned in place, and BigQuery refuses at apply a change it cannot make in place.
 - **`fluid generate ci` runs stage 3 for a contract with reference builds.** It turned
   `RUN_STAGE_3_GENERATE_ARTIFACTS` off when any build was `hybrid-reference`, `reference` or
   `external-reference`, so a contract with Spark builds beside one reference dbt build skipped

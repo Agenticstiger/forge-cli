@@ -493,12 +493,24 @@ def test_non_ascii_digits_in_a_type_are_refused_on_both_clouds(fluid_type):
 @pytest.mark.parametrize(
     "fluid_type", ["decimal(38,0)", "decimal(40,10)", "numeric(38,10)", "number(30)"]
 )
-def test_a_decimal_wider_than_numeric_is_warned_on_bigquery(fluid_type):
+def test_a_decimal_wider_than_numeric_is_an_exact_bignumeric_on_bigquery(fluid_type):
+    """BigQuery holds it as declared, as a parameterised BIGNUMERIC."""
+    assert _bq_outcome(fluid_type) == (("BIGNUMERIC", EXACT, "", ""))
+    assert validate_gcp_binding(_contract("gcp", [("amt", fluid_type)])) == ([], [])
+
+
+@pytest.mark.parametrize("fluid_type", ["decimal(60,2)", "number(80)", "decimal(50,45)"])
+def test_a_decimal_wider_than_bignumeric_is_warned_on_bigquery(fluid_type):
     outcome = _bq_outcome(fluid_type)
-    assert (outcome.target, outcome.status) == ("NUMERIC", LOSSY)
-    assert "bignumeric" in outcome.fix.lower()
+    assert (outcome.target, outcome.status) == ("BIGNUMERIC", LOSSY)
+    assert "BIGNUMERIC (38 integer and 38 fractional digits)" in outcome.why
     errors, warnings = validate_gcp_binding(_contract("gcp", [("amt", fluid_type)]))
-    assert errors == [] and len(warnings) == 1 and "bignumeric" in warnings[0]
+    assert errors == [] and len(warnings) == 1 and "cannot hold" in warnings[0]
+
+
+@pytest.mark.parametrize("fluid_type", ["decimal(2,5)", "numeric(0)"])
+def test_a_decimal_whose_scale_exceeds_its_precision_is_refused_on_bigquery(fluid_type):
+    assert _bq_outcome(fluid_type).status == REFUSED
 
 
 @pytest.mark.parametrize(
