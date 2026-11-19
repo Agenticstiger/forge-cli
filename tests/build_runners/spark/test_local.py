@@ -12,7 +12,6 @@ the lock, the exit codes and the signals are the ones a real local run goes thro
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import os
 import signal
