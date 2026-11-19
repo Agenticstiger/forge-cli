@@ -1111,6 +1111,36 @@ def _emit_caller_policy(
     }
 
 
+#: What a forge Spark build runs with, by resource type and the end of its name in the module
+#: (the keys the emitters above write: ``<contract>_<build>_spark`` and what hangs off it, the
+#: product's ``<contract>_spark`` application, ``_spark_caller`` policy and ``_spark_logs``
+#: key, and the ``_lf_writer_<8 hex>`` registration role). None holds data: a destroy deletes
+#: runners, job configs, roles, policies, jobs, an application, and the build's log group with
+#: the key its logs are encrypted with. A bucket's own key ends in ``_kms`` and stays gated.
+_SPARK_DEFINITIONS: Dict[str, "re.Pattern[str]"] = {
+    "aws_s3_object": re.compile(r"_spark_(runner|config)$"),
+    "aws_s3_object_copy": re.compile(r"_spark_jar_[0-9]+$"),
+    "aws_cloudwatch_log_group": re.compile(r"_spark$"),
+    "aws_kms_key": re.compile(r"_spark_logs$"),
+    "aws_iam_role": re.compile(r"(_spark|_lf_writer_[0-9a-f]{8})$"),
+    "aws_iam_role_policy": re.compile(r"(_spark|_lf_writer_[0-9a-f]{8})$"),
+    "aws_iam_policy": re.compile(r"_spark(_caller)?$"),
+    "aws_glue_job": re.compile(r"_spark$"),
+    "aws_glue_connection": re.compile(r"_spark$"),
+    "aws_emrserverless_application": re.compile(r"_spark$"),
+}
+
+
+def spark_definition(address: str, kind: str) -> bool:
+    """``address`` (of type ``kind``, in the module's root) is something a Spark build runs
+    with, which holds no data (:data:`_SPARK_DEFINITIONS`)."""
+    pattern = _SPARK_DEFINITIONS.get(kind)
+    prefix = f"{kind}."
+    if pattern is None or not address.startswith(prefix):
+        return False
+    return bool(pattern.search(address[len(prefix) :]))
+
+
 def merge(into: Dict[str, Dict[str, Any]], blocks: Mapping[str, Mapping[str, Any]]) -> None:
     """Add ``blocks`` to a ``resource`` or ``data`` map, refusing an address two emitters
     claim with different bodies."""

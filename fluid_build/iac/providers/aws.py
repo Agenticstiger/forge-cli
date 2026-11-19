@@ -1000,6 +1000,12 @@ class AwsIacPlugin:
         ``--allow-data-loss``. See :func:`glue_column_type_changes`."""
         return glue_column_type_changes(plan)
 
+    def retired_definitions(self, removals: Iterable[Tuple[str, str]]) -> List[str]:
+        """The removals that hold no data, which the data-loss gate does not count: what a
+        forge Spark build ran with (``aws_ingest.spark_definition``), destroyed when the build
+        leaves the contract or the product goes."""
+        return [addr for addr, kind in removals if aws_ingest.spark_definition(addr, kind)]
+
     def provider_block_for(self, contract: Mapping[str, Any]) -> Dict[str, Any]:
         """``provider_block``, plus the region the contract's AWS bindings name.
 

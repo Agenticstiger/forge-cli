@@ -429,6 +429,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Removing a Spark build on AWS no longer needs `--allow-data-loss`.** The data-loss gate
+  counted every resource a removed build ran with as data: its runner and job config objects,
+  role and policies, log group and the key its logs are encrypted with, Glue job or connection,
+  and the product's own EMR Serverless application. None of them holds data, so dropping a Spark
+  build from a contract was refused unless the apply was allowed to destroy data, which also
+  let a real data loss in the same plan through. They are now listed as removed, not gated, as
+  a Databricks build's job and files are, and only what holds data (the build's table, a
+  bucket, a bucket's key) still needs the flag. The AWS plugin names them by type and by the
+  names forge gives them (`aws_ingest.spark_definition`).
+
 - **A decimal's arguments are a precision and scale its engine holds, or the column is refused.**
   A decimal kept whatever arguments it declared, so `decimal(1;drop table x)` went into the
   Snowflake table's DDL as `NUMBER(1;drop table x)` from `fluid generate iac`, and into the dbt
