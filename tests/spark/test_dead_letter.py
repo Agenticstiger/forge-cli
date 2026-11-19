@@ -293,6 +293,24 @@ def test_a_topic_sink_sends_and_an_alert_is_logged(runner, contract, monkeypatch
     assert '"forge_spark_runner": "dead_letter_alert"' in capsys.readouterr().out
 
 
+def test_a_topic_dead_letter_is_keyed_by_where_its_record_was_read(runner):
+    """``<topic>/<partition>/<offset>``: one key per source record, so the copies an
+    at-least-once replay sends share it, also when a masking build keeps no raw key. Checked
+    on Spark 3.5 too: two copies of orders/3/1041 got one key, the record's own key went to
+    the ``__fluid.raw.key`` header, and a record without one was keyed orders/0/7."""
+    import sqlglot
+
+    parsed = sqlglot.parse_one(runner.DEAD_LETTER_KEY, read="spark")
+    assert parsed.sql(dialect="spark") == (
+        "CONCAT_WS('/', kafka_topic, CAST(kafka_partition AS STRING), "
+        "CAST(kafka_offset AS STRING))"
+    )
+    # Those are the columns every dead-letter row carries (DEAD_LETTER_SELECT).
+    selected = " ".join(runner.DEAD_LETTER_SELECT)
+    for name in ("kafka_topic", "kafka_partition", "kafka_offset"):
+        assert f"AS `{name}`" in selected
+
+
 def test_fluid_validate_reports_a_dead_letter_block_apply_would_refuse(contract, tmp_path):
     import yaml
 

@@ -51,6 +51,11 @@ RECORDS_TABLE = "kafka_records"
 #: The decoded records with their raw bytes, which ``sql.check`` reads (dead letters).
 DECODED_TABLE = "kafka_records_decoded"
 RAW_VALUE, RAW_KEY, ERROR_COLUMN = "fluid_raw_value", "fluid_raw_key", "fluid_error"
+#: A topic dead letter's Kafka key: ``<topic>/<partition>/<offset>`` of the record it holds,
+#: one per source record, so the copies an at-least-once replay sends share it. Spark SQL.
+DEAD_LETTER_KEY = (
+    "concat_ws('/', kafka_topic, CAST(kafka_partition AS STRING), CAST(kafka_offset AS STRING))"
+)
 #: A dead letter's row, from the checked records.
 DEAD_LETTER_SELECT = (
     f"`{ERROR_COLUMN}` AS `error`",
@@ -603,8 +608,11 @@ class DeadLetters:
         )
 
     def to_topic(self, batch) -> None:
-        """Send the batch, at least once, with Kafka Connect's error-context headers."""
-        from pyspark.sql.functions import array, col, lit, struct, when
+        """Send the batch, at least once, with Kafka Connect's error-context headers. Each
+        record is keyed by where it was read (:data:`DEAD_LETTER_KEY`), so a consumer can drop
+        the copies a replayed batch sends; its own key, when the build keeps raw bytes, is the
+        ``__fluid.raw.key`` header."""
+        from pyspark.sql.functions import array, col, expr, lit, struct, when
 
         def header(name, value):
             return struct(
@@ -624,13 +632,14 @@ class DeadLetters:
             header("__connect.errors.connector.name", lit(connector)),
             header("__connect.errors.stage", stage),
             header("__connect.errors.exception.message", col("error")),
+            struct(lit("__fluid.raw.key").alias("key"), col("raw_key").alias("value")),
         )
         options = {
             k: v for k, v in kafka_options(self.config["source"]).items() if k.startswith("kafka.")
         }
         (
             batch.select(
-                col("raw_key").alias("key"),
+                expr(DEAD_LETTER_KEY).cast("binary").alias("key"),
                 col("raw_value").alias("value"),
                 headers.alias("headers"),
             )

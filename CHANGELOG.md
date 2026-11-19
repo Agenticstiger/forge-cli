@@ -54,8 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   required field, no longer fails the stream. It goes to a dead-letter table beside the output
   (`<table>__dead_letter` by default, Iceberg v2: the reason, the raw value and key, and the
   record's topic, partition, offset and timestamp), or with `sink: topic` to a topic on the cluster
-  the stream reads (never the stream's own), with Kafka Connect's `__connect.errors.*` headers. The
-  output keeps its own exactly-once query. The dead letters are a second query over the same
+  the stream reads (never the stream's own), with Kafka Connect's `__connect.errors.*` headers,
+  keyed by where the record was read (`<topic>/<partition>/<offset>`, so the copies an
+  at-least-once replay sends share one key; the record's own key is the `__fluid.raw.key`
+  header). The output keeps its own exactly-once query. The dead letters are a second query over the same
   records, with its own checkpoint inside the stream's: a new one starts where the output
   resumes, so dead letters added to a stream a record had stopped take that record too. Each of
   its batches is committed to the table once. Past `maxRecordsBeforeAbort` dead letters (10000 by
