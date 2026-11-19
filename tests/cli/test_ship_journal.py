@@ -687,6 +687,12 @@ def test_a_release_keeps_its_journal_in_the_project(
     assert f"stage journal: {work / journal.DEFAULT_JOURNAL_DIR}" in capsys.readouterr().out
 
 
+def test_ids_that_differ_only_in_case_have_their_own_targets() -> None:
+    assert journal.target_stem("orders") == "orders"
+    upper = journal.target_stem("Orders")
+    assert upper.startswith("Orders-") and upper.lower() != "orders"
+
+
 def test_side_effects_by_stage_and_mode() -> None:
     se = journal.side_effects
     assert se(7, ["apply", "p", "--mode", "amend"]) and not se(7, ["apply", "--mode", "dry-run"])

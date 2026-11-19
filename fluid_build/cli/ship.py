@@ -1194,7 +1194,7 @@ def _explain_journal(
     try:
         jr = journal.Journal.read(
             keep.directory,
-            product_id=str(product or "product"),
+            product_id=product if isinstance(product, str) and product else "product",
             environment=opts.env,
             digest=digest,
             anchor=keep.anchor,

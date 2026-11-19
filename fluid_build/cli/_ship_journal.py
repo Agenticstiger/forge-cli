@@ -436,14 +436,19 @@ def _stem(raw: str, fallback: str) -> str:
 
 
 def target_stem(product_id: str) -> str:
-    """The directory name a product's target has in the journal."""
-    return _stem(product_id, "product")
+    """The directory name a product's target has in the journal. An id with
+    upper-case letters gets a digest of itself, so ``Orders`` and ``orders``
+    never share a target on a case-insensitive filesystem."""
+    stem = _stem(product_id, "product")
+    if stem != stem.lower():
+        stem = f"{stem}-{hashlib.sha256(product_id.encode('utf-8')).hexdigest()[:8]}"
+    return stem
 
 
 def _parts(
     directory: Path, anchor: Optional[Path], product_id: str, environment: str
 ) -> Tuple[Path, List[str]]:
-    tail = [_stem(product_id, "product"), _stem(environment, "env")]
+    tail = [target_stem(product_id), _stem(environment, "env")]
     if anchor is None:
         return directory, tail
     return anchor, [*directory.relative_to(anchor).parts, *tail]
@@ -588,7 +593,7 @@ class Journal:
         """Open (creating) this release's file in a held target and read every
         release's. ``JournalError`` when the bundle names another product than
         the one held, or the journal cannot be read or written."""
-        if _stem(product_id, "product") != hold.product_stem:
+        if target_stem(product_id) != hold.product_stem:
             raise JournalError(
                 f"the bundle's product id {product_id!r} is not the contract's, whose stage "
                 f"journal this run holds ({hold.target.path})"
