@@ -675,8 +675,8 @@ class TestRunnerRefusal:
 
         script = tmp_path / "ingest.py"
         script.write_text("print('ran')\n", "utf-8")
-        assert runner.execute_build(_build("python", trigger="event"), script, tmp_path) == 1
-        assert "Unknown trigger type: event" in capsys.readouterr().out
+        assert runner.execute_build(_build("python", trigger="nightly"), script, tmp_path) == 1
+        assert "Unknown trigger type: nightly" in capsys.readouterr().out
 
 
 # ── scaffold-composer: a DAG only for builds a scheduler starts ──────────────

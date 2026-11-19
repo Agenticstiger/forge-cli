@@ -185,15 +185,36 @@ def describe_externally_run_build(build: Mapping[str, Any]) -> str:
     return f"language '{props.get('language') if isinstance(props, Mapping) else None}'"
 
 
+#: The ``execution.trigger.type`` values a scheduler or an event starts (schema
+#: 0.7.7): every type but ``manual`` and ``continuous``. ``fluid generate
+#: schedule`` renders an Airflow DAG for ``schedule``, ``dataset`` and
+#: ``schedule_and_dataset`` (a ``dependency`` build runs in its upstream builds'
+#: DAG), whose task is ``fluid apply --build-id``; ``fluid apply`` runs a build of
+#: any of these types once when asked: the scheduler decides when, apply runs it.
+SCHEDULER_TRIGGER_TYPES = frozenset(
+    {"schedule", "event", "dependency", "dataset", "schedule_and_dataset", "timetable"}
+)
+
+
+def trigger_type_of(build: Mapping[str, Any]) -> str:
+    """The build's ``execution.trigger.type``, lower-cased; ``manual`` when unset.
+
+    A value that is not a string comes back as its text, so a runner refuses it
+    as an unknown type rather than running it as ``manual``."""
+    execution = build.get("execution")
+    trigger = execution.get("trigger") if isinstance(execution, Mapping) else None
+    kind = trigger.get("type") if isinstance(trigger, Mapping) else None
+    if kind is None:
+        return "manual"
+    return kind.strip().lower() if isinstance(kind, str) else str(kind)
+
+
 def is_continuous_build(build: Mapping[str, Any]) -> bool:
     """True when the build's ``execution.trigger.type`` is ``continuous`` (new in
     schema 0.7.6): its platform keeps the job running, so no scheduler starts
     its runs. Named after Databricks Jobs' continuous trigger, not Airflow's
     ``@continuous``, which starts batch runs back to back."""
-    execution = build.get("execution")
-    trigger = execution.get("trigger") if isinstance(execution, Mapping) else None
-    kind = trigger.get("type") if isinstance(trigger, Mapping) else None
-    return isinstance(kind, str) and kind.strip().lower() == "continuous"
+    return trigger_type_of(build) == "continuous"
 
 
 def is_databricks_job_build(build: Mapping[str, Any]) -> bool:
