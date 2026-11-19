@@ -204,6 +204,16 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
         ),
     )
     p.add_argument(
+        "--image",
+        default=None,
+        metavar="IMAGE",
+        help=(
+            "Container image the Tekton Task steps run (tekton only). Default:\n"
+            "python:3.12-slim, pinned by digest. Pin yours by digest too\n"
+            "(name:tag@sha256:<digest>): a tag can move."
+        ),
+    )
+    p.add_argument(
         "--default-publish-target",
         default=None,
         metavar="TARGET",
@@ -850,6 +860,13 @@ def run(args, logger: logging.Logger) -> int:
                 "generate_ci_package_spec_invalid",
                 {"hint": "--fluid-package-spec takes a pip requirement, not blank or an option"},
             )
+        image = getattr(args, "image", None)
+        if image is not None and canonical != "tekton":
+            raise CLIError(
+                1,
+                "generate_ci_image_unsupported",
+                {"system": system, "hint": "--image sets the Tekton Task image (--system tekton)"},
+            )
         schedule_sync_default_arg = getattr(args, "schedule_sync_default", None)
         fluid_env_default = _check_fluid_env_default(getattr(args, "fluid_env_default", None))
 
@@ -870,6 +887,7 @@ def run(args, logger: logging.Logger) -> int:
             diff_last_applied=bool(getattr(args, "diff_last_applied", None)),
             fluid_env_default=fluid_env_default,
             generates_artifacts=generates_artifacts,
+            image=image,
             install_mode=install_mode,
             default_publish_target=default_publish_target,
             engine=engine_context.get("engine"),

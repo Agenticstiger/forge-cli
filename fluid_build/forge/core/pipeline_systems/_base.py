@@ -54,6 +54,38 @@ def _pin_action(action_ref: str) -> str:
     return PINNED_ACTIONS.get(action_ref, action_ref)
 
 
+# Digest-pinned container images, for the same reason: a tag moves. Each entry
+# maps image:tag to image:tag@sha256:<digest of the multi-arch index>, with the
+# day it was resolved. scripts/check_pinned_actions.py checks them with the
+# action pins. Update these when the image is refreshed.
+PINNED_IMAGES = {
+    "python:3.12-slim": "python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b",  # 2026-11-19
+}
+
+#: An image reference: ``[registry[:port]/]name[:tag][@sha256:<digest>]``.
+_IMAGE_REF_RE = re.compile(
+    r"(?:[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]{1,5})?/)?"
+    r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?"
+    r"(?:@sha256:[0-9a-f]{64})?"
+)
+
+
+def _pin_image(image_ref: str) -> str:
+    """Pin a container image reference to its digest for supply chain security."""
+    return PINNED_IMAGES.get(image_ref, image_ref)
+
+
+def check_image_ref(image_ref: str) -> str:
+    """``image_ref`` when it is an image reference; ``ValueError`` otherwise."""
+    if not isinstance(image_ref, str) or not _IMAGE_REF_RE.fullmatch(image_ref):
+        raise ValueError(
+            f"image {image_ref!r} is not an image reference "
+            "([registry/]name[:tag][@sha256:<digest>])"
+        )
+    return image_ref
+
+
 #: The six ``fluid apply --mode`` values, in the order the pipelines list them.
 APPLY_MODES: Tuple[str, ...] = (
     "dry-run",
@@ -195,6 +227,8 @@ class PipelineConfig:
     # Whether stage 3 (`fluid generate artifacts`) runs by default. False only
     # with ``fluid generate ci --no-generate-artifacts``.
     generates_artifacts: bool = True
+    # The container image the Tekton Task steps run. None: the pinned default.
+    image: Optional[str] = None
     # Install mode for the ``fluid`` CLI inside the Jenkins container.
     # Two values, picked explicitly at generation time — the generated
     # Jenkinsfile carries ONLY the install logic for the selected mode
