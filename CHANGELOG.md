@@ -87,6 +87,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destroyed. `--dry-run` reads and says what it would cancel. The first apply after the upgrade
   adds the three tags in place to each Spark build's log group and EMR on EC2 job policy.
 
+- **A destroy waits for an EMR Serverless application that is still being created or started.**
+  One still `CREATING` was refused at once as "still CREATING after 900 s", though nothing had
+  waited. A `CREATING` or `STARTING` application is now waited for until it settles: a created
+  one is deleted as it is, a started one is stopped first, and one still moving after
+  `FLUID_SPARK_WAIT_SECONDS` refuses the apply, as before. The refusal's hint now names
+  `iam:ListEntitiesForPolicy`, `emr-serverless:GetApplication` and
+  `emr-serverless:StopApplication`, which the identity running the destroy needs beyond the
+  runtime's list and cancel actions.
+
 ### Changed
 
 - **A Spark run starts only on the job config `fluid apply` compiled.** Every runtime, local
