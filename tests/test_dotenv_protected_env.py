@@ -792,3 +792,120 @@ def test_a_project_dotenv_cannot_configure_the_debezium_server(
         assert name not in os.environ, name
     assert os.environ.get("PROTECTED_ENV_TEST_API_KEY") == _TEST_API_KEY
     assert any("DEBEZIUM_SINK_ICEBERG_URI" in r.getMessage() for r in _warnings(caplog))
+
+
+# ── shell function imports and start-up settings ────────────────────────────
+
+#: What a project ``.env`` would set to run code in every bash script a runner
+#: starts (spark-submit, the EMR and Homebrew wrappers, Debezium's run.sh):
+#: bash imports ``BASH_FUNC_<name>%%`` as the function ``<name>``, and
+#: ``SHELLOPTS=xtrace`` expands ``PS4`` (a command substitution) on every line.
+_SHELL_INJECTION_DOTENV = (
+    "BASH_FUNC_exec%%=() { echo PWNED; }\n"
+    'BASH_FUNC_dirname%%="() { echo PWNED; }"\n'
+    "SHELLOPTS=xtrace\n"
+    "PS4='$(echo PWNED >&2)'\n"
+    "BASH_ENV={bash_env}\n"
+    f"PROTECTED_ENV_TEST_API_KEY={_TEST_API_KEY}\n"
+)
+_SHELL_INJECTION_NAMES = (
+    "BASH_FUNC_exec%%",
+    "BASH_FUNC_dirname%%",
+    "SHELLOPTS",
+    "PS4",
+    "BASH_ENV",
+)
+_BASH = "/bin/bash"
+
+
+def _run_bash(env: Dict[str, str]) -> str:
+    import subprocess
+
+    result = subprocess.run(
+        [_BASH, "-c", "dirname /a/b; exec true"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    return result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "BASH_FUNC_exec%%",
+        "BASH_FUNC_dirname%%",
+        "BASH_FUNC_dirname()",
+        "bash_func_ls%%",
+        "BASH_FUNC_X",
+        "%%",
+        "a.b",
+        "A-B",
+        "1ABC",
+        "",
+        " PROTECTED_ENV_TEST_API_KEY",
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PS4",
+        "BASH_XTRACEFD",
+        "IFS",
+        "CDPATH",
+        "GLOBIGNORE",
+        "ZDOTDIR",
+        "FPATH",
+        "NULLCMD",
+        "READNULLCMD",
+    ],
+)
+def test_shell_function_imports_and_startup_settings_are_operator_only(name: str) -> None:
+    from fluid_build.credentials.protected_env import is_protected_env_key
+
+    assert is_protected_env_key(name)
+
+
+@pytest.mark.parametrize(
+    "name", ["PROTECTED_ENV_TEST_API_KEY", "_PRIVATE_TOKEN", "a1", "DESTINATION__X__PASSWORD"]
+)
+def test_an_ordinary_identifier_is_not_caught_by_the_shell_rules(name: str) -> None:
+    from fluid_build.credentials.protected_env import is_protected_env_key
+
+    assert not is_protected_env_key(name)
+
+
+@pytest.mark.skipif(not Path(_BASH).is_file(), reason="needs /bin/bash")
+def test_a_project_dotenv_cannot_inject_code_into_a_bash_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    for name in _SHELL_INJECTION_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    for name in list(os.environ):
+        if name.startswith("BASH_FUNC_"):
+            monkeypatch.delenv(name, raising=False)
+    bash_env = tmp_path / "startup.sh"
+    bash_env.write_text("echo PWNED\n")
+    dotenv = _SHELL_INJECTION_DOTENV.replace("{bash_env}", str(bash_env))
+    (tmp_path / ".env").write_text(dotenv)
+
+    # The attack is real on this host: the same values in the environment
+    # of a bash script run attacker code.
+    from dotenv import dotenv_values
+
+    planted = {k: v for k, v in dotenv_values(tmp_path / ".env", interpolate=False).items() if v}
+    assert "PWNED" in _run_bash({**os.environ, **planted})
+
+    with caplog.at_level(logging.WARNING):
+        hydrate_dotenv(tmp_path)
+
+    for name in _SHELL_INJECTION_NAMES:
+        assert name not in os.environ, name
+    assert not [n for n in os.environ if n.upper().startswith("BASH_FUNC_")]
+    # An ordinary credential still loads.
+    assert os.environ.get("PROTECTED_ENV_TEST_API_KEY") == _TEST_API_KEY
+    assert "PWNED" not in _run_bash(dict(os.environ))
+    message = " ".join(r.getMessage() for r in _warnings(caplog))
+    assert "BASH_FUNC_exec%%" in message
+    assert "PWNED" not in message, "names only, never values"

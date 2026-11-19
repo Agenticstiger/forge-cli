@@ -429,13 +429,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **An `enum` value holding a quote or a backslash no longer breaks dbt's `accepted_values`
-  test.** dbt pastes each value between single quotes unescaped, so `O'Brien` ended the string
-  and the rest ran as SQL. Such a column's values are now written with `quote: false`, each as
-  the SQL string literal of the adapter that runs it (DuckDB, Snowflake, BigQuery, Databricks
-  and Spark, Postgres, Athena and Trino, with a standard literal for any other adapter), and
-  the column's other values as `'<value>'`, in both `fluid generate dbt-tests` and the dbt
-  engine. Columns whose values hold neither are written as before.
 - **A decimal's arguments are a precision and scale its engine holds, or the column is refused.**
   A decimal kept whatever arguments it declared, so `decimal(1;drop table x)` went into the
   Snowflake table's DDL as `NUMBER(1;drop table x)` from `fluid generate iac`, and into the dbt
@@ -560,28 +553,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **The dbt engine's schema.yml, sources.yml and semantic_models.yml write no contract text
-  that dbt would run as Jinja.** The ones `fluid generate transformation` writes for a dbt
-  build now pass through the same escaping as `fluid generate dbt-tests` (one shared helper,
-  `util/dbt_jinja.py`): a model or column name, description, enum value, expression or source
-  field from a contract that holds `{{`, `{%` or `{#`, or looks like `env_var(...)`,
-  `var(...)`, `ref(...)`, `source(...)` or `doc(...)`, is written as a Jinja string literal
-  of itself. The engine's own `ref(...)` and `env_var(...)` expressions, a metric's `filter`
-  (dbt never renders it; MetricFlow reads its `Dimension(...)` template itself) and the
-  placeholders a contract may use for a source location (`{{ env.X }}`, `${X}`, `$X`, and
-  `{{ env_var('X') }}` in either quote, with a plain default or a `target.<attribute>` one)
-  still render; any other text around a placeholder that holds a brace is a literal.
-  The model SQL the engine writes (`engines/dbt/models.py`) and a contract's own SQL still
-  render as dbt Jinja: treat contract authors as trusted when dbt builds their contract.
-
-- **A name or version dbt pastes into its own Jinja is refused.** dbt runs a model's tests
-  against `ref('<exposeId>', version='<version>')`, a source table's against
-  `source('<source>', '<consumes id>')`, and a semantic model's against
-  `ref('<exposeId>')`, rendering each after pasting the name in, so a quote there ran
-  `env_var(...)` at `dbt parse`. `fluid generate transformation` and `fluid generate
-  dbt-tests` now stop with an error naming the value when one of these holds a quote, a
-  backslash, a brace or a control character. An id that matches the schema's identifier
-  grammar holds none of them.
+- **A project `.env` can no longer set bash function imports or shell start-up settings.**
+  Bash reads an environment variable named `BASH_FUNC_<name>%%` as the definition of the
+  function `<name>`, so a project `.env` could replace a command, or the `exec` builtin, inside
+  every bash script the CLI starts (spark-submit and other wrappers, Debezium's `run.sh`), with
+  the operator's environment and credentials in scope. Project dotenv files now refuse any name
+  that is not a shell identifier (`[A-Za-z_][A-Za-z0-9_]*`) and every `BASH_FUNC_` name, and
+  also `BASH_XTRACEFD`, `ZDOTDIR`, `FPATH`, `NULLCMD` and `READNULLCMD`, next to the
+  `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `PS4`, `IFS`, `CDPATH` and `GLOBIGNORE` they
+  already refused. These names are skipped with the usual warning; set them in the shell or CI
+  environment if they are really needed. Ordinary keys load as before.
 
 - **`fluid generate dbt-tests` writes no contract text that dbt would run as Jinja.** dbt
   renders a schema.yml's names, descriptions and test arguments as Jinja, and evaluates a test
