@@ -26,7 +26,8 @@ COLUMNS: List[Tuple[str, str, bool]] = [
 
 @pytest.fixture(scope="module")
 def plugin_cache(tmp_path_factory: pytest.TempPathFactory) -> str:
-    """One provider download per test module, not one per workdir."""
+    """The provider cache the workdirs share: the run's (``TF_PLUGIN_CACHE_DIR``, set by
+    ``tests/_infrastructure/tofu_cache.py`` whenever ``tofu`` is on PATH), else a module's own."""
     return os.environ.get("TF_PLUGIN_CACHE_DIR") or str(tmp_path_factory.mktemp("tofu-cache"))
 
 

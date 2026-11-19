@@ -473,7 +473,7 @@ def test_placeholders_are_counted_and_exempt_from_formats() -> None:
     )
     rules = _by_id(contract)
     fmt = rules["code.identifierFormat"]
-    assert fmt.pattern == "^((P[0-9]{5})|XXXXX|TBD_%.*)$"
+    assert fmt.pattern == "^((P[0-9]{5})|XXXXX|TBD_%[\\s\\S]*)$"
     # A foreign key inherits the placeholders of the column it copies (RFC §3).
     sales = [r for r in compile_rules(contract) if r.expose == "sales"][0]
     assert sales.pattern == fmt.pattern
@@ -486,9 +486,17 @@ def test_placeholders_are_counted_and_exempt_from_formats() -> None:
                 "INSERT INTO products VALUES ('P00001',''),('XXXXX',''),('TBD_%1',''),('TBD_x',''),"
                 + "(NULL,'')"
             ),
+            "CREATE TABLE sales (code VARCHAR)",
+            "INSERT INTO sales VALUES ('P00002'),('TBD_%9'),('p00003'),(NULL)",
         ]
     )
-    assert _run(db, contract)["code.placeholders"] == (5, 2, 40.0)
+    counts = _run(db, contract)
+    assert counts["code.placeholders"] == (5, 2, 40.0)
+    # The format: NULL is no value; TBD_x is neither the mask nor a placeholder.
+    formats = {r.expose: r for r in compile_rules(contract) if r.kind == "identifierFormat"}
+    assert db.execute(formats["products"].counts(_table)).fetchone() == (4, 1)
+    covered, violating = db.execute(formats["sales"].counts(_table)).fetchone()
+    assert (covered, violating) == (3, 1)  # lower-case p fails; the inherited TBD_% is exempt
 
 
 def test_percent_with_no_covered_row_is_zero() -> None:

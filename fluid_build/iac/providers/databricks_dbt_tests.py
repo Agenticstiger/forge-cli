@@ -124,9 +124,11 @@ def compile_tests(
     """
     out = CompiledTests()
     exposures = [table.exposure for table in tables]
-    if not has_rules(exposures):
+    invariants = _invariant_rules(contract, exposures)
+    if not has_rules(exposures) and not invariants:
         return out
     rules = read_rules(contract, exposures)
+    out.refusals.extend(_invariant_refusals(invariants, tables, where))
     monitored = _monitored(exposures)
     for refused in rules.refusals:
         if refused.rule_type == "anomaly_detection" and refused.needs_history:
@@ -161,6 +163,7 @@ def compile_tests(
         return out
     project = _Project(files)
     checked = {check.expose_id for check in rules.checks}
+    checked |= {expose for rule in invariants for expose in (rule.expose, *rule.reads)}
     single = len(tables) == 1
     models = {
         _expose_key(table): _model(build, table, project, where, out.refusals, single=single)
@@ -176,6 +179,8 @@ def compile_tests(
         return out
     for check in rules.checks:
         _add_test(out, check, str(models[check.expose_id]), folder, project, where)
+    taken = {check.name.casefold() for check in rules.checks}
+    _add_invariants(out, invariants, models, folder, project, where, taken)
     if out.refusals:
         out.files, out.tests = [], []
     return out
@@ -322,6 +327,146 @@ def _add_test(
     out.tests.append(DqTest(check=check, model=model, path=path))
 
 
+@dataclass(frozen=True)
+class InvariantCheck:
+    """A declared invariant the job runs as a singular dbt test (``RFC-data-rules.md``): what
+    :func:`report` names it by, and says of it."""
+
+    name: str
+    rule_id: str
+    expose_id: str
+    severity: str
+    description: str
+
+
+def _invariant_rules(contract: Mapping[str, Any], exposures: Sequence[Any]) -> List[Any]:
+    """The declared rules (invariants, formats, bounded placeholders, shared attributes) on
+    ``exposures``, compiled for Databricks; a rule with nothing to test is left out."""
+    from ...data_rules._compile import compile_rules
+
+    ids = {str(e.get("exposeId") or "") for e in exposures if isinstance(e, Mapping)}
+    return [
+        rule
+        for rule in compile_rules(contract, dialect="databricks")
+        if rule.expose in ids and rule.band is not None
+    ]
+
+
+def _invariant_refusals(
+    invariants: Sequence[Any], tables: Sequence[Any], where: str
+) -> List[UnsupportedBindingError]:
+    """Why each of ``invariants`` cannot run in this build's job (none when all can)."""
+    written = {_expose_key(table) for table in tables}
+    found = (_invariant_refusal(rule, written, where) for rule in invariants)
+    return [refusal for refusal in found if refusal is not None]
+
+
+def _invariant_refusal(rule: Any, written: set, where: str) -> Optional[UnsupportedBindingError]:
+    """Why ``rule`` cannot run as a test in this build's job, or ``None``."""
+    if rule.status != "executable" or rule.counts is None:
+        return _refusal(
+            "rule",
+            f"{where} expose {rule.expose!r}: the declared rule {rule.id!r} has no exact "
+            f"Databricks SQL ({rule.reason}), so the job cannot test it.",
+            "Restate it in FLUID SQL/1 that Databricks runs, or remove it.",
+        )
+    outside = [e for e in rule.reads if e not in written]
+    if outside:
+        return _refusal(
+            "rule",
+            f"{where} expose {rule.expose!r}: the declared rule {rule.id!r} reads "
+            f"{', '.join(repr(e) for e in outside)}, which this build does not write, so its "
+            "dbt project has no model for it.",
+            "Write those exposes in the same build, or test the rule with "
+            "`fluid generate dbt-tests` in a project that holds every model it reads.",
+        )
+    return None
+
+
+_INVARIANT_SEVERITY = {"error": "error", "warning": "warn", "info": "warn"}
+
+
+def _job_test_name(rule_id: str, taken: set) -> str:
+    """``fluid_dq_<id>``, lower case: distinct from ``fluid generate dbt-tests``' generic
+    ``fluid_<id>`` tests, which may sit in the same project (dbt names a test once)."""
+    from ...data_rules._dbt import test_name
+
+    return "fluid_dq_" + test_name(rule_id, taken).lower()[len("fluid_") :]
+
+
+def _invariant_check(rule: Any, name: str) -> InvariantCheck:
+    return InvariantCheck(
+        name=name,
+        rule_id=rule.id,
+        expose_id=rule.expose,
+        severity=_INVARIANT_SEVERITY.get(rule.severity, "error"),
+        description=rule.description,
+    )
+
+
+def _add_invariants(out: CompiledTests, invariants: Sequence[Any], *where_to: Any) -> None:
+    """The test file of each declared rule into ``out`` (:func:`_add_invariant`)."""
+    for rule in invariants:
+        _add_invariant(out, rule, *where_to)
+
+
+def _add_invariant(
+    out: CompiledTests,
+    rule: Any,
+    models: Mapping[str, Any],
+    folder: PurePosixPath,
+    project: _Project,
+    where: str,
+    taken: set,
+) -> None:
+    """The singular test file for one declared rule, or its refusal."""
+    from ...data_rules._compile import _Refused
+    from ...data_rules._dbt import _rendered
+
+    model = models.get(rule.expose)
+    if not model or model == _DEFERRED:
+        return
+    name = _job_test_name(rule.id, taken)
+    try:
+        counts, holds = _rendered(rule, "databricks", lambda e: str(models.get(e) or "") or None)
+    except (_Refused, ValueError) as why:
+        out.refusals.append(
+            _refusal(
+                "rule",
+                f"{where} expose {rule.expose!r}: the declared rule {rule.id!r} has no "
+                f"Databricks SQL ({why}).",
+                "Restate it in FLUID SQL/1 that Databricks runs, or remove it.",
+            )
+        )
+        return
+    check = _invariant_check(rule, name)
+    config = (
+        f"{{{{ config(severity={_jinja_str(check.severity)}, enabled=true, "
+        f"tags=[{_jinja_str(TAG)}], meta={{'fluid_rule_id': {_jinja_str(rule.id)}, "
+        f"'fluid_expose_id': {_jinja_str(rule.expose)}}}) }}}}"
+    )
+    text = (
+        f"-- Declared rule {name}: written by fluid apply from the contract. Change the "
+        "contract, not this file.\n"
+        + config
+        + f"\nselect fluid_counts.*\nfrom ({counts}) as fluid_counts\nwhere not ({holds})\n"
+    )
+    path = str(folder / str(model) / f"{name}.sql")
+    owned = project.singular_tests().get(name)
+    if (owned is not None and owned != path) or path in project.present:
+        out.refusals.append(
+            _refusal(
+                "name",
+                f"{where} the test of the declared rule {rule.id!r} is {path}, and the dbt "
+                "project already has a test of that name or a file at that path.",
+                "Rename the rule id, or the project's test.",
+            )
+        )
+        return
+    out.files.append((path, text.encode("utf-8", "backslashreplace")))
+    out.tests.append(DqTest(check=check, model=str(model), path=path))  # type: ignore[arg-type]
+
+
 def expected_tests(contract: Mapping[str, Any], build: Mapping[str, Any]) -> List[DqCheck]:
     """The checks a build's job tests, from the contract alone: what :func:`report` looks for
     in a run's output. The rules on each Databricks expose the build writes."""
@@ -336,7 +481,20 @@ def expected_tests(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Lis
             continue
         if any(b is build for b in builds_writing_expose(exposure.get("exposeId"), builds)):
             exposures.append(exposure)
-    return read_rules(contract, exposures).checks
+    checks: List[Any] = list(read_rules(contract, exposures).checks)
+    return checks + _invariant_checks(contract, exposures, checks)
+
+
+def _invariant_checks(
+    contract: Mapping[str, Any], exposures: Sequence[Any], checks: Sequence[Any]
+) -> List[InvariantCheck]:
+    """The declared rules the job tests, named as :func:`_add_invariant` names their files."""
+    taken = {check.name.casefold() for check in checks}
+    return [
+        _invariant_check(rule, _job_test_name(rule.id, taken))
+        for rule in _invariant_rules(contract, exposures)
+        if rule.status == "executable" and rule.counts is not None
+    ]
 
 
 # ── project ──────────────────────────────────────────────────────────────────
@@ -755,8 +913,9 @@ def report(logs: str, checks: Sequence[DqCheck], *, truncated: bool = False) -> 
         key = status or "MISSING"
         tally[key] = tally.get(key, 0) + 1
         outcome = _outcome(status, failures, truncated)
+        what = check.description if isinstance(check, InvariantCheck) else describe(check)
         lines.append(
-            f"     {marks.get(key, '?')} {check.name}: {outcome} - {describe(check)}, "
+            f"     {marks.get(key, '?')} {check.name}: {outcome} - {what}, "
             f"severity {check.severity}"
         )
     order = ("PASS", "WARN", "FAIL", "ERROR", "SKIP", "MISSING")
@@ -767,6 +926,7 @@ def report(logs: str, checks: Sequence[DqCheck], *, truncated: bool = False) -> 
 
 __all__ = [
     "CompiledTests",
+    "InvariantCheck",
     "DqTest",
     "TAG",
     "TEST_DIR",

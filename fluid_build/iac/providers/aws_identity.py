@@ -297,13 +297,26 @@ _RUNTIME_FIELDS = {
     "clusterId": re.compile(r"j-[0-9A-Za-z]{1,254}"),
     "virtualClusterId": re.compile(r"[0-9a-z]{1,64}"),
     "glueVersion": re.compile(r"[0-9]+\.[0-9]+"),
-    "releaseLabel": re.compile(r"emr-[0-9]+\.[0-9]+\.[0-9]+"),
 }
 #: An MSK cluster ARN with the name and id the topic and group ARNs are built from.
 MSK_ARN = re.compile(
     r"arn:aws[a-z-]*:kafka:(?P<region>[a-z0-9-]+):(?P<account>[0-9]{12}):cluster/"
     r"(?P<name>[A-Za-z0-9_.-]{1,64})/(?P<uuid>[A-Za-z0-9-]{1,128})"
 )
+
+
+def _release_label_errors(bid: Any, cfg: Mapping[str, Any]) -> List[str]:
+    """``releaseLabel`` in the form its runtime takes (``spark/names.RELEASE_LABELS``)."""
+    from fluid_build.spark import names
+
+    runtime, label = str(cfg.get("runtime")), cfg.get("releaseLabel")
+    grammar = names.RELEASE_LABELS.get(runtime)
+    if label is None or grammar is None or (isinstance(label, str) and grammar.fullmatch(label)):
+        return []
+    return [
+        f"Spark build {bid}: parameters.spark.releaseLabel: runtime {runtime} takes "
+        f"{names.release_label_form(runtime)}"
+    ]
 
 
 def runtime_errors(build: Mapping[str, Any]) -> List[str]:
@@ -326,6 +339,7 @@ def runtime_errors(build: Mapping[str, Any]) -> List[str]:
         value = cfg.get(name)
         if value is not None and not (isinstance(value, str) and pattern.fullmatch(value)):
             errors.append(f"Spark build {bid}: parameters.spark.{name}: expected {pattern.pattern}")
+    errors += _release_label_errors(bid, cfg)
     if cfg.get("runtime") == "emr-eks" and not cfg.get("virtualClusterId"):
         errors.append(f"Spark build {bid}: runtime emr-eks needs parameters.spark.virtualClusterId")
     source = cfg.get("source")
@@ -921,6 +935,12 @@ def caller_actions(runtime: str) -> List[str]:
     return sorted(a for a in CALLER_ACTIONS[runtime] if a != _FIND_APPLICATION)
 
 
+def _ec2_role_reads() -> tuple:
+    from fluid_build.build_runners.spark._adapters import EC2_ROLE_READS
+
+    return EC2_ROLE_READS
+
+
 def passes_role(runtime: str) -> bool:
     from fluid_build.build_runners.spark._adapters import PASS_ROLE
 
@@ -986,6 +1006,20 @@ def caller_document(runs: Sequence[CallerRun], *, account: Any, region: Any) -> 
                             "variable": "iam:PassedToService",
                             "values": [PASSED_TO[run.runtime]],
                         }
+                    ],
+                }
+            )
+        if run.runtime == "emr-ec2":
+            statements.append(
+                {
+                    # The role a step runs as is the cluster owner's: a start checks that the
+                    # build's policy is attached to it (_adapters.EmrEc2.start).
+                    "sid": f"StepRole{run.sid}",
+                    "effect": "Allow",
+                    "actions": list(_ec2_role_reads()),
+                    "resources": [
+                        _join("arn:aws:iam::", account, ":instance-profile/*"),
+                        _join("arn:aws:iam::", account, ":role/*"),
                     ],
                 }
             )

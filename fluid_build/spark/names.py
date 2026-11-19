@@ -19,7 +19,8 @@ of ``<product>/<build>``. Pure functions, no imports beyond the standard library
 from __future__ import annotations
 
 import hashlib
-from typing import Dict
+import re
+from typing import Dict, Optional
 
 #: The S3 prefix under the output's bucket that holds forge's Spark artifacts.
 ARTIFACT_PREFIX = "_fluid/spark"
@@ -54,6 +55,34 @@ def build_key(product: str, build: str) -> str:
 def _named(product: str, build: str, suffix: str, limit: int) -> str:
     tail = f"-{build_key(product, build)}{suffix}"
     return _bounded(f"fluid-{product}-{build}", limit - len(tail)) + tail
+
+
+#: An EMR release label as each EMR runtime takes it. EMR Serverless and an EMR on EC2
+#: cluster name the release (``emr-7.12.0``); EMR on EKS names an image of it, its newest
+#: (``emr-7.12.0-latest``) or a dated one (``emr-7.12.0-20251111``), after an optional
+#: variant (``emr-7.12.0-java11-latest``), and refuses the plain form.
+RELEASE_LABELS = {
+    "emr-serverless": re.compile(r"emr-[0-9]+\.[0-9]+\.[0-9]+"),
+    "emr-ec2": re.compile(r"emr-[0-9]+\.[0-9]+\.[0-9]+"),
+    "emr-eks": re.compile(r"emr-[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9]+)*-(?:latest|[0-9]{8})"),
+}
+DEFAULT_RELEASE = "emr-7.12.0"
+#: EMR on EKS's label of :data:`DEFAULT_RELEASE`: its newest image of that release.
+DEFAULT_EKS_RELEASE = "emr-7.12.0-latest"
+
+
+def default_release(runtime: str) -> Optional[str]:
+    """The release label a build of ``runtime`` runs on when it names none; Glue none."""
+    if runtime not in RELEASE_LABELS:
+        return None
+    return DEFAULT_EKS_RELEASE if runtime == "emr-eks" else DEFAULT_RELEASE
+
+
+def release_label_form(runtime: str) -> str:
+    """How ``runtime`` writes a release label, for a message."""
+    if runtime == "emr-eks":
+        return f"emr-X.Y.Z-latest or emr-X.Y.Z-YYYYMMDD (e.g. {DEFAULT_EKS_RELEASE})"
+    return f"emr-X.Y.Z (e.g. {DEFAULT_RELEASE})"
 
 
 def artifact_prefix(product: str, build: str) -> str:

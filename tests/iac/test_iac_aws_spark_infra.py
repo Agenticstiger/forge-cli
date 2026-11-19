@@ -1149,6 +1149,35 @@ def test_the_job_config_is_the_compilers_with_only_the_brokers_filled(contract, 
     assert rendered == compiled
 
 
+@pytest.mark.parametrize(
+    ("runtime", "label", "says"),
+    [
+        ("emr-eks", "emr-7.12.0", "emr-X.Y.Z-latest or emr-X.Y.Z-YYYYMMDD"),
+        ("emr-serverless", "emr-7.12.0-latest", "takes emr-X.Y.Z (e.g. emr-7.12.0)"),
+    ],
+)
+def test_a_release_label_in_another_runtime_s_form_is_refused(contract, runtime, label, says):
+    params = spark(contract)
+    params.update(runtime=runtime, releaseLabel=label)
+    if runtime == "emr-eks":
+        del params["applicationId"]
+        params["virtualClusterId"] = VIRTUAL_CLUSTER
+    (error,) = [e for e in aws_identity.runtime_errors(contract["builds"][0]) if "release" in e]
+    assert says in error
+    with pytest.raises(UnsupportedBindingError, match="releaseLabel"):
+        emit(contract)
+
+
+def test_emr_on_eks_emits_with_its_image_label(contract):
+    params = spark(contract)
+    del params["applicationId"]
+    params.update(runtime="emr-eks", virtualClusterId=VIRTUAL_CLUSTER)
+    assert aws_identity.runtime_errors(contract["builds"][0]) == []
+    params["releaseLabel"] = "emr-7.12.0-20251111"
+    assert aws_identity.runtime_errors(contract["builds"][0]) == []
+    emit(contract)
+
+
 def test_hadoop_may_look_up_each_directory_it_is_given(contract):
     """Hadoop's getFileStatus HEADs a directory's own key before ``<dir>/`` and lists it by
     its slashless name: without both, S3 answers 403 and a stream dies on its checkpoint."""
@@ -1177,3 +1206,19 @@ def test_a_bucketless_output_s_directories_keep_the_account_expression(contract)
     assert directory["resources"][0] == (
         f"arn:aws:s3:::{account_bucket}/commerce.orders-stream/order_lines"
     )
+
+
+def test_the_scheduler_may_read_which_role_an_emr_on_ec2_step_runs_as(contract):
+    """A start checks that the build's policy is on the cluster's instance-profile role."""
+    contract["builds"][0]["properties"]["stream"]["trigger"] = {"availableNow": True}
+    _, data = emit(_runtime(contract, "emr-ec2"))
+    document = data["aws_iam_policy_document"]["commerce_orders_stream_spark_caller"]
+    run = next(s for s in document["statement"] if s["sid"].startswith("Run"))
+    assert "elasticmapreduce:DescribeCluster" in run["actions"]
+    role = next(s for s in document["statement"] if s["sid"].startswith("StepRole"))
+    assert role["actions"] == ["iam:GetInstanceProfile", "iam:ListAttachedRolePolicies"]
+    account = "${data.aws_caller_identity.fluid_lf_caller.account_id}"
+    assert role["resources"] == [
+        f"arn:aws:iam::{account}:instance-profile/*",
+        f"arn:aws:iam::{account}:role/*",
+    ]

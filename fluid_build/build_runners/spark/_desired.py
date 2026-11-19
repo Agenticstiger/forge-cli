@@ -610,7 +610,9 @@ def desired_runs(
         spark_conf = _submit_conf(
             runtime, config, cfg.get("sparkConf") or {}, f"Spark build {bid}", env, policy
         )
-        release = None if runtime == "glue" else str(cfg.get("releaseLabel") or "emr-7.12.0")
+        release = (
+            str(cfg["releaseLabel"]) if cfg.get("releaseLabel") else _names.default_release(runtime)
+        )
         glue_version = str(cfg.get("glueVersion") or "5.0") if runtime == "glue" else None
         source, checkpoint = config.get("source"), config.get("checkpoint")
         source_id = (

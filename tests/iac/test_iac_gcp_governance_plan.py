@@ -66,7 +66,6 @@ def tofu_env(tmp_path_factory: pytest.TempPathFactory) -> Dict[str, str]:
         if not k.startswith(("GOOGLE_", "CLOUDSDK_", "GCLOUD_"))
     }
     env["CLOUDSDK_CONFIG"] = str(tmp_path_factory.mktemp("no-gcloud"))
-    env.setdefault("TF_PLUGIN_CACHE_DIR", str(tmp_path_factory.mktemp("tofu-plugin-cache")))
     return env
 
 

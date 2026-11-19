@@ -178,10 +178,11 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
         "--no-generate-artifacts",
         action="store_true",
         help=(
-            "Skip the `fluid generate transformation` and `fluid generate schedule` "
-            "stages. Use for reference-only contracts (hybrid-reference dbt, "
-            "external Airflow) where artifacts are owned outside fluid. "
-            "Auto-detected for contracts whose builds[].pattern is hybrid-reference."
+            "Turn stage 3 (`fluid generate artifacts`) off by default in the "
+            "generated pipeline. Stage 4 then has nothing to check, and stages 8 "
+            "and 11 run without the policy bindings and schedule it writes, so "
+            "use it only when those come from elsewhere. Never inferred: a "
+            "contract of reference builds still runs stage 3."
         ),
     )
     p.add_argument(
@@ -196,10 +197,25 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
             "                  in the workspace. Override it with the\n"
             "                  FLUID_PACKAGE_SPEC variable (a build parameter on\n"
             "                  Jenkins and Tekton).\n"
-            "  dev-source      lab / contributor only. Imports fluid from a\n"
-            "                  /forge-cli-src bind mount on the runner, and\n"
-            "                  fails if the mount is missing (no fallback to\n"
-            "                  PyPI)."
+            "  dev-source      lab / contributor only. Installs the forge-cli\n"
+            "                  checkout mounted at /forge-cli-src editable\n"
+            "                  (pip install -e), and fails if the mount is\n"
+            "                  missing (no fallback to PyPI). pip builds it, so\n"
+            "                  the runner needs a package index, or setuptools\n"
+            "                  and setuptools-scm installed with\n"
+            "                  PIP_NO_BUILD_ISOLATION=0 (pip reads it inverted).\n"
+            "                  Jenkins instead uses the agent's installed fluid\n"
+            "                  with PYTHONPATH=/forge-cli-src."
+        ),
+    )
+    p.add_argument(
+        "--image",
+        default=None,
+        metavar="IMAGE",
+        help=(
+            "Container image the Tekton Task steps run (tekton only). Default:\n"
+            "python:3.12-slim, pinned by digest. Pin yours by digest too\n"
+            "(name:tag@sha256:<digest>): a tag can move."
         ),
     )
     p.add_argument(
@@ -415,27 +431,6 @@ def _composed_contract(contract_path: str) -> Dict[str, Any]:
     except Exception:  # noqa: BLE001 - unreadable: the legacy, engine-agnostic default
         return {}
     return contract if isinstance(contract, dict) else {}
-
-
-def _contract_is_reference_only(contract_path: str) -> bool:
-    """Detect whether a contract is reference-only (no artifact generation).
-
-    Returns True when any build uses ``pattern: hybrid-reference`` — these
-    contracts point at externally-owned dbt projects / Airflow DAGs, so
-    asking fluid to generate transformations or schedules is a no-op that
-    only surfaces spurious pipeline failures. Returns False on any read or
-    parse error so we err on the side of keeping the generate stages
-    (the legacy behavior).
-    """
-    contract = _composed_contract(contract_path)
-    builds = contract.get("builds") or []
-    if not isinstance(builds, list):
-        return False
-    reference_patterns = {"hybrid-reference", "reference", "external-reference"}
-    for build in builds:
-        if isinstance(build, dict) and build.get("pattern") in reference_patterns:
-            return True
-    return False
 
 
 def _extract_engine_context(contract_path: str) -> dict:
@@ -822,8 +817,11 @@ def run(args, logger: logging.Logger) -> int:
 
         contract_path = getattr(args, "contract", None) or "contract.fluid.yaml"
         workdir, pipeline_contract = _pipeline_location(contract_path)
-        no_generate_flag = bool(getattr(args, "no_generate_artifacts", False))
-        generates_artifacts = not (no_generate_flag or _contract_is_reference_only(contract_path))
+        # Stage 3 runs unless the operator turns it off. It is not inferred
+        # from builds[].pattern: `fluid generate artifacts` succeeds on a
+        # contract whose every build is a reference build and still writes the
+        # policy bindings and schedule that stages 4, 8 and 11 read.
+        generates_artifacts = not getattr(args, "no_generate_artifacts", False)
 
         install_mode = getattr(args, "install_mode", "pypi") or "pypi"
         # ``--default-publish-target`` is opt-in: None/empty → emit the
@@ -867,6 +865,13 @@ def run(args, logger: logging.Logger) -> int:
                 "generate_ci_package_spec_invalid",
                 {"hint": "--fluid-package-spec takes a pip requirement, not blank or an option"},
             )
+        image = getattr(args, "image", None)
+        if image is not None and canonical != "tekton":
+            raise CLIError(
+                1,
+                "generate_ci_image_unsupported",
+                {"system": system, "hint": "--image sets the Tekton Task image (--system tekton)"},
+            )
         schedule_sync_default_arg = getattr(args, "schedule_sync_default", None)
         fluid_env_default = _check_fluid_env_default(getattr(args, "fluid_env_default", None))
 
@@ -887,6 +892,7 @@ def run(args, logger: logging.Logger) -> int:
             diff_last_applied=bool(getattr(args, "diff_last_applied", None)),
             fluid_env_default=fluid_env_default,
             generates_artifacts=generates_artifacts,
+            image=image,
             install_mode=install_mode,
             default_publish_target=default_publish_target,
             engine=engine_context.get("engine"),

@@ -242,19 +242,25 @@ def _refuse_two_rules_for_a_column(restrictions: Sequence[Restriction], where: s
                 )
 
 
+def authz_principals(exposure: Mapping[str, Any], key: str) -> Tuple[str, ...]:
+    """``exposes[].policy.authz.<key>`` (``readers`` or ``writers``), logical principals."""
+    policy = exposure.get("policy") if isinstance(exposure, Mapping) else None
+    authz = policy.get("authz") if isinstance(policy, Mapping) else None
+    raw = authz.get(key) if isinstance(authz, Mapping) else None
+    if not isinstance(raw, list):
+        return ()
+    return tuple(r.strip() for r in raw if isinstance(r, str) and r.strip())
+
+
 def authz_readers(exposure: Mapping[str, Any]) -> Tuple[str, ...]:
     """``exposes[].policy.authz.readers``: the expose's own readers, logical principals.
 
     Readers a column restriction narrows, alongside the ``accessPolicy`` read grants.
-    No emitter grants them anything: their access to the table is managed elsewhere,
-    and a restriction must not take a column away from them unless it names them.
+    No IaC emitter grants them anything: their access to the table is managed
+    elsewhere (on a Lakekeeper table, by ``fluid policy apply``), and a restriction
+    must not take a column away from them unless it names them.
     """
-    policy = exposure.get("policy") if isinstance(exposure, Mapping) else None
-    authz = policy.get("authz") if isinstance(policy, Mapping) else None
-    raw = authz.get("readers") if isinstance(authz, Mapping) else None
-    if not isinstance(raw, list):
-        return ()
-    return tuple(r.strip() for r in raw if isinstance(r, str) and r.strip())
+    return authz_principals(exposure, "readers")
 
 
 def restricted_columns(

@@ -38,6 +38,7 @@ owns. See the section at the end of this module and ``aws_storage.py``.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -48,6 +49,7 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     Mapping,
     NamedTuple,
@@ -91,7 +93,7 @@ from ..principals import (
 from ..provider_match import is_cloud
 from ..row_access import RowFilter, row_filters_for
 from ..versions import required_providers
-from . import aws_ingest, aws_storage
+from . import aws_ingest, aws_layout, aws_storage
 from .aws_schema_registry import emit_schema_registry, emit_schema_registry_data
 from .aws_storage import Retention
 
@@ -394,20 +396,30 @@ def _glue_table_declared(binding: Mapping[str, Any]) -> bool:
     return bool(loc.get("database") and loc.get("table") and _glue_cataloged(binding, fmt))
 
 
+def glue_tables(contract: Mapping[str, Any]) -> Iterator[Tuple[str, List[Any]]]:
+    """``(expose id, columns)`` for each Glue table :func:`_emit_glue` writes: the tables
+    :func:`validate_aws_column_types` and ``fluid doctor --contract`` judge."""
+    for index, exposure in enumerate(column_types.exposes_of(contract)):
+        binding = exposure.get("binding") if isinstance(exposure, Mapping) else None
+        if not isinstance(binding, Mapping) or not is_cloud(binding, "aws"):
+            continue
+        if _glue_table_declared(binding):
+            yield _expose_id(exposure) or str(index), column_types.schema_of(exposure)
+
+
+def glue_column_outcome(column: Mapping[str, Any]) -> column_types.TypeOutcome:
+    """What one column becomes in a Glue table: exact, lossy or refused."""
+    return column_types.outcome_of(column, _hive_outcome, _hive_column_outcome)
+
+
 def validate_aws_column_types(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
     """``(errors, warnings)`` for the column types of the contract's Glue tables: the
     refusal :func:`_emit_glue` raises, and a warning for each type it writes as a
     fallback. ``fluid validate`` runs this so ``generate iac`` finds nothing new."""
     errors: List[str] = []
     warnings: List[str] = []
-    for index, exposure in enumerate(column_types.exposes_of(contract)):
-        binding = exposure.get("binding") if isinstance(exposure, Mapping) else None
-        if not isinstance(binding, Mapping) or not is_cloud(binding, "aws"):
-            continue
-        if not _glue_table_declared(binding):
-            continue
-        schema = column_types.schema_of(exposure)
-        refusal, lossy = _glue_column_type_findings(_expose_id(exposure) or str(index), schema)
+    for expose, schema in glue_tables(contract):
+        refusal, lossy = _glue_column_type_findings(expose, schema)
         if refusal is not None:
             errors.append(f"{refusal} {' '.join(refusal.remediation)}".strip())
         warnings.extend(lossy)
@@ -443,13 +455,7 @@ def glue_column_type_changes(plan: Mapping[str, Any]) -> List[str]:
     Created and removed tables, and updates that keep every column's type, give none.
     """
     lines: List[str] = []
-    for change in plan.get("resource_changes") or []:
-        if not isinstance(change, Mapping) or change.get("type") != "aws_glue_catalog_table":
-            continue
-        detail = change.get("change")
-        if not isinstance(detail, Mapping) or list(detail.get("actions") or []) != ["update"]:
-            continue
-        before, after = detail.get("before"), detail.get("after")
+    for table, before, after in aws_layout.glue_table_updates(plan):
         old, new = _plan_glue_columns(before), _plan_glue_columns(after)
         changed = [
             f"{name}: {old[name]} -> {new[name]}"
@@ -458,11 +464,6 @@ def glue_column_type_changes(plan: Mapping[str, Any]) -> List[str]:
         ]
         if not changed:
             continue
-        table = ".".join(
-            str(before.get(key) or "")
-            for key in ("database_name", "name")
-            if isinstance(before, Mapping)
-        )
         lines.append(
             f"Glue table {table}: column types change in place ({'; '.join(changed)}); files "
             "written under the old type may stop reading until they are rewritten, and "
@@ -475,9 +476,14 @@ def _unspaced(glue_type: str) -> str:
     return "".join(glue_type.split())
 
 
-def _columns(schema: List[Mapping[str, Any]]) -> List[Dict[str, str]]:
+def _columns(
+    schema: List[Mapping[str, Any]], leave_out: Sequence[str] = ()
+) -> List[Dict[str, str]]:
+    """The Glue ``columns`` of ``schema``, without the partition keys ``leave_out``."""
     columns: List[Dict[str, str]] = []
     for col in schema or []:
+        if col.get("name") in leave_out:
+            continue
         physical_type = _hive_column_type(col)
         entry: Dict[str, str] = {"name": col.get("name"), "type": physical_type}
         if col.get("description"):
@@ -702,8 +708,6 @@ class AwsIacPlugin:
             tags = _tags_for({**gov_labels, **base_tags}, placement)
             _emit_glue(
                 resources,
-                loc,
-                fmt,
                 schema,
                 cid,
                 tags,
@@ -712,6 +716,7 @@ class AwsIacPlugin:
                 placement=placement,
                 labels=gov_labels,
                 expose=_expose_id(exposure) or str(index),
+                layout=functools.partial(aws_layout.glue_layout, exposure, index, binding),
             )
             _emit_s3(resources, loc, cid, tags, placement=placement)
             _emit_kinesis(resources, loc, cid, tags)
@@ -752,6 +757,8 @@ class AwsIacPlugin:
         # the planner's build & orchestration ops.
         _emit_from_actions(resources, actions, cid, contract)
         aws_ingest.merge(resources, spark.resources)
+        # Lake Formation grants on a table its layout trigger replaces go with it.
+        _replace_grants_with_partitioned_tables(resources)
         # Second pass — wire ordering edges that the literal-string fields
         # on Redshift external schemas / planned-action resources don't
         # carry by value. See :func:`_wire_aws_deps`.
@@ -985,9 +992,15 @@ class AwsIacPlugin:
         return recorded_regions(resources)
 
     def plan_data_changes(self, plan: Mapping[str, Any]) -> List[str]:
-        """The Glue tables the saved plan gives other column types in place; each needs
-        ``--allow-data-loss``. See :func:`glue_column_type_changes`."""
-        return glue_column_type_changes(plan)
+        """The Glue tables the saved plan gives other column types or partition keys in
+        place; each needs ``--allow-data-loss``. See :func:`glue_column_type_changes` and
+        ``aws_layout.glue_partition_key_changes``."""
+        return glue_column_type_changes(plan) + aws_layout.glue_partition_key_changes(plan)
+
+    def plan_notices(self, contract: Mapping[str, Any]) -> List[str]:
+        """The partitioned Glue tables Athena does not project, whose partitions need
+        registering (``aws_layout.partition_registration_notes``)."""
+        return aws_layout.partition_registration_notes(contract)
 
     def prepare_destroys(
         self,
@@ -1216,8 +1229,6 @@ def _emit_referenced_containers(
 
 def _emit_glue(
     resources: Dict[str, Any],
-    loc: Mapping[str, Any],
-    fmt: str,
     schema: List[Mapping[str, Any]],
     cid: str,
     tags: Dict[str, str],
@@ -1227,7 +1238,13 @@ def _emit_glue(
     placement: _Placement = _LEGACY_PLACEMENT,
     labels: Optional[Mapping[str, str]] = None,
     expose: str = "?",
+    layout: Callable[[], "aws_layout.GlueLayout"] = aws_layout.GlueLayout,
 ) -> None:
+    """The binding's Glue database and table. ``layout`` derives the table's
+    partitioning (``aws_layout.glue_layout``), called once the table is known to be
+    written and its column types pass."""
+    loc = binding.get("location") or {}
+    fmt = binding.get("format") or "parquet"
     database = loc.get("database")
     if not database:
         return
@@ -1267,7 +1284,9 @@ def _emit_glue(
     refusal, _lossy = _glue_column_type_findings(expose, schema)
     if refusal is not None:
         raise refusal
-    storage: Dict[str, Any] = {"columns": _columns(schema)}
+    # Partition keys leave ``columns``: Hive and Glue refuse a column in both.
+    table_layout = layout()
+    storage: Dict[str, Any] = {"columns": _columns(schema, leave_out=table_layout.names)}
     # Athena reads a Glue table through the Hive input format and SerDe the
     # table declares. Without them every query failed with HIVE_UNSUPPORTED_FORMAT
     # "Unable to create input format", measured against real Athena, while the
@@ -1381,9 +1400,72 @@ def _emit_glue(
         _add_iceberg_metadata(table_body, loc, cid, placement)
     table_body.update(_emulator_catalog_id())
 
-    resources.setdefault("aws_glue_catalog_table", {})[
-        safe_ident(f"{cid}_{database}_{table}")
-    ] = table_body
+    table_key = safe_ident(f"{cid}_{database}_{table}")
+    if table_layout.keys:
+        _partition_table(resources, table_body, table_key, table_layout)
+    resources.setdefault("aws_glue_catalog_table", {})[table_key] = table_body
+
+
+def _partition_table(
+    resources: Dict[str, Any], table_body: Dict[str, Any], table_key: str, layout: Any
+) -> None:
+    """The table's partition keys, Athena's projection parameters, and the replace trigger.
+
+    ``partition_keys`` is not ForceNew in ``hashicorp/aws`` and the projection sits in
+    ``parameters``, which ``ignore_changes`` keeps, so neither would reach a live table
+    as declared. A ``terraform_data`` holding both (the OpenTofu documentation's
+    ``replace_triggered_by`` pattern for a plain value, as the BigQuery emitter's
+    ``_partition_table``) replaces the table when they change; the data-loss gate
+    counts the removal. An unpartitioned table emits neither, so its module is
+    unchanged.
+    """
+    table_body["partition_keys"] = [key.as_glue() for key in layout.keys]
+    table_body["parameters"].update(layout.projection)
+    trigger = _partition_trigger(table_key)
+    resources.setdefault("terraform_data", {})[trigger] = {"input": layout.trigger_input()}
+    table_body["lifecycle"] = {
+        **table_body["lifecycle"],
+        "replace_triggered_by": [f"terraform_data.{trigger}"],
+    }
+
+
+def _partition_trigger(table_key: str) -> str:
+    return safe_ident(f"{table_key}_partitioning")
+
+
+def _replace_grants_with_partitioned_tables(resources: Dict[str, Any]) -> None:
+    """Recreate the Lake Formation resources on a table its layout trigger replaces.
+
+    Deleting a Glue table revokes the Lake Formation permissions, LF-tag
+    associations and data cells filters on it, and the table that replaces it starts
+    with none. ``tofu`` cannot see that: each names the table by ``name`` and
+    ``database_name``, the same strings before and after, so it planned them as
+    unchanged and the new table stood ungoverned until the next apply. The same
+    trigger replaces them with the table.
+    """
+    tables = resources.get("aws_glue_catalog_table") or {}
+    triggers = {
+        key: _partition_trigger(key)
+        for key, body in tables.items()
+        if isinstance(body, Mapping) and body.get("partition_keys")
+    }
+    if not triggers:
+        return
+    for kind, blocks in resources.items():
+        if not kind.startswith("aws_lakeformation_") or not isinstance(blocks, dict):
+            continue
+        for body in blocks.values():
+            text = json.dumps(body, default=str)
+            fired = [
+                f"terraform_data.{trigger}"
+                for key, trigger in triggers.items()
+                if f"aws_glue_catalog_table.{key}." in text
+            ]
+            if fired:
+                lifecycle = body.setdefault("lifecycle", {})
+                lifecycle["replace_triggered_by"] = sorted(
+                    set(lifecycle.get("replace_triggered_by") or []) | set(fired)
+                )
 
 
 def _add_iceberg_metadata(

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from fluid_build.build_runners.spark._desired import DesiredRun
+from fluid_build.spark import names as _names
 
 PENDING, RUNNING, CANCELLING = "PENDING", "RUNNING", "CANCELLING"
 SUCCEEDED, FAILED, CANCELLED = "SUCCEEDED", "FAILED", "CANCELLED"
@@ -55,6 +56,11 @@ CALLER_ACTIONS: Dict[str, tuple] = {
         "elasticmapreduce:ListSteps",
         "elasticmapreduce:DescribeStep",
         "elasticmapreduce:CancelSteps",
+        # The cluster's Spot posture, warned at plan and apply (_posture.py), and the role
+        # its steps run as, checked before a step starts (EmrEc2.start).
+        "elasticmapreduce:DescribeCluster",
+        "elasticmapreduce:ListInstanceFleets",
+        "elasticmapreduce:ListInstanceGroups",
     ),
     "emr-eks": (
         "emr-containers:StartJobRun",
@@ -65,6 +71,9 @@ CALLER_ACTIONS: Dict[str, tuple] = {
     ),
 }
 PASS_ROLE = frozenset({"emr-serverless", "emr-eks"})
+#: What starting an EMR on EC2 step also reads: the cluster's instance-profile role and the
+#: policies attached to it (:meth:`EmrEc2.start`).
+EC2_ROLE_READS = ("iam:GetInstanceProfile", "iam:ListAttachedRolePolicies")
 
 #: ``(service, region) -> boto3 client``
 ClientFactory = Callable[[str, str], Any]
@@ -101,15 +110,16 @@ class RunInfo:
         }
 
 
-def default_clients(service: str, region: str) -> Any:
-    """A boto3 client, from the default credential chain (``AWS_ENDPOINT_URL`` included)."""
+def default_clients(service: str, region: str, *, config: Any = None) -> Any:
+    """A boto3 client, from the default credential chain (``AWS_ENDPOINT_URL`` included);
+    ``config``, a ``botocore.config.Config``, bounds its calls (the posture check's)."""
     try:
         import boto3
     except ImportError as exc:  # pragma: no cover - the [aws] extra is missing
         raise SparkRunError(
             "Spark job runs need boto3: pip install 'data-product-forge[aws]'"
         ) from exc
-    return boto3.client(service, region_name=region)
+    return boto3.client(service, region_name=region, config=config)
 
 
 def _ts(value: Any) -> float:
@@ -434,6 +444,10 @@ class EmrEc2(Adapter):
     runtime, service = "emr-ec2", "emr"
     LOOKBACK_PAGES = 10
 
+    def __init__(self, run: DesiredRun, clients: ClientFactory) -> None:
+        super().__init__(run, clients)
+        self._clients = clients
+
     @property
     def cluster(self) -> str:
         return self.run.target["clusterId"]
@@ -483,8 +497,50 @@ class EmrEc2(Adapter):
     def get(self, run_id: str) -> RunInfo:
         return self._info(self.client.describe_step(ClusterId=self.cluster, StepId=run_id)["Step"])
 
+    def _role_policies(self) -> Optional[Dict[str, List[str]]]:
+        """The roles the cluster's instance profile holds, each with the names of the
+        policies attached to it; None when this identity cannot read them."""
+        try:
+            cluster = self.client.describe_cluster(ClusterId=self.cluster)["Cluster"]
+            profile = str((cluster.get("Ec2InstanceAttributes") or {}).get("IamInstanceProfile"))
+            iam = self._clients("iam", self.run.region)
+            found = iam.get_instance_profile(InstanceProfileName=profile.rsplit("/", 1)[-1])
+            roles: Dict[str, List[str]] = {}
+            for role in found["InstanceProfile"].get("Roles") or []:
+                pages = iam.get_paginator("list_attached_role_policies")
+                roles[role["RoleName"]] = [
+                    p["PolicyName"]
+                    for page in pages.paginate(RoleName=role["RoleName"])
+                    for p in page.get("AttachedPolicies") or []
+                ]
+            return roles
+        except Exception:  # noqa: BLE001 - unreadable: the step starts as it always did
+            return None
+
+    def _refuse_unless_attached(self) -> None:
+        """A step runs as the cluster's instance-profile role, which the cluster's owner
+        holds: the build's least-privilege policy, which ``fluid apply`` creates, must be
+        attached to it before a step can read and write what the build does. A step started
+        without it fails at once, and a stream that failed is not started again with the same
+        config, so the start is refused until it is attached. A build that names its own
+        ``executionRoleArn`` has no forge policy to check."""
+        policy = _names.execution_role_name(self.run.product, self.run.build)
+        if not self.run.role_arn.endswith(f":role/{policy}"):
+            return
+        roles = self._role_policies()
+        if roles is None or any(policy in names for names in roles.values()):
+            return
+        role = next(iter(roles), "<the instance-profile role>")
+        arn = self.run.role_arn.replace(":role/", ":policy/")
+        raise SparkRunError(
+            f"not started: policy {policy} is not attached to {role}, the role its steps run "
+            f"as on {self.cluster}. Attach it, then apply again: aws iam attach-role-policy "
+            f"--role-name {role} --policy-arn {arn}"
+        )
+
     def start(self, token: str) -> str:
         r = self.run
+        self._refuse_unless_attached()
         args = [
             "spark-submit",
             # Client mode: the driver is the step's own process, so cancelling the step
