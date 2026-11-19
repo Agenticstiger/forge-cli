@@ -30,6 +30,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   goes through both redaction layers. `--strict` also fails on `lossy`. `fluid doctor --env`
   alone still lists the kill switches.
 
+- **A saved OpenTofu plan applies on another runner, and only on the target it was made for.**
+  `fluid plan --tofu` now records the plan's target in its `opentofuPlan` record (under
+  `planDigest`): the cloud account and region (AWS, from STS `GetCallerIdentity` and the provider's
+  region), the project and region (GCP, from the defaults the `hashicorp/google` provider reads),
+  the organization and account (Snowflake) or the workspace host (Databricks), plus the state
+  backend block, the `tofu` version and the provider versions `tofu init` locked; it prints
+  `target: aws account …, region …`. `fluid apply plan.json` reads the target again before
+  anything runs, the state-key migration and the plugin's hooks included, and refuses another one
+  (`apply_plan_digest_tofu_plan_target_mismatch`), a recorded field it cannot read
+  (`…_target_unverified`), another `tofu` or provider version (`…_tofu_plan_toolchain`), another
+  backend configuration (`…_tofu_plan_target`) or a plan without the record
+  (`…_target_missing`). A field the plan's runner could not read (no boto3, say) is named at plan
+  time and named again at apply, and not compared. The provider lock travels with the plan as
+  `<stem>.terraform.lock.hcl` (sha256 under `planDigest`) and is installed before the apply's
+  `tofu init`, so another runner days later installs the providers the plan was reviewed with; a
+  missing or altered lock is refused (`…_tofu_plan_lock_missing` / `…_lock_mismatch`).
+  `--no-verify-plan-binding` skips the check, logged. With a state backend
+  both runners reach, a plan made on one runner applies unchanged on another at another checkout
+  path; a plan made on local state that the applying runner does not have is refused as
+  `apply_plan_digest_tofu_plan_state_missing` instead of "stale".
 - **`fluid plan` and `fluid apply` warn when an EMR on EC2 cluster can lose a Spark build to
   Spot.** For each `runtime: emr-ec2` build, forge reads its `clusterId` once
   (`DescribeCluster`, then `ListInstanceGroups` or `ListInstanceFleets`) and warns, never
@@ -47,6 +67,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `plan.json`. The caller policy forge emits for scheduled emr-ec2 builds now also grants
   `elasticmapreduce:DescribeCluster`, `ListInstanceFleets` and `ListInstanceGroups` on the
   cluster.
+- **The generated GitLab pipeline hands each job exactly what the last one produced.**
+  `fluid generate ci --system gitlab` now writes:
+  - **Run pipeline form:** the form is `spec:inputs` (GitLab 17.11 or later). It holds the 11
+    stage switches and nine knobs: `FLUID_ENV`, `APPLY_MODE`, `ALLOW_DATA_LOSS`,
+    `NO_VERIFY_DIGEST`, the two strict switches, `PUBLISH_TARGETS`, `SCHEDULER` and
+    `SCHEDULE_SYNC_DRY_RUN`. That is GitLab's limit of 20. Each input sets the job variable of
+    the same name and is never pasted into a script. Every other value is a plain default
+    that a project CI/CD variable sets, and the form needs no pipeline variables.
+  - **Release packet:** on the default branch, `fluid-plan` runs `fluid ship --stage 1-6
+    --release-dir release`. `fluid-apply` downloads that job's artifacts (`needs` and
+    `dependencies`) and does not start without `release/release.json`. On the default
+    branch, stages 1-4 must run and `release/` must not be in the repository: otherwise ship
+    refuses the packet and the plan fails with its reason.
+  - **Merge requests:** a merge request plans without a packet and never gets an apply job,
+    and neither does any other ref. `fluid-impact` publishes `fluid diff --baseline --impact`
+    of the contract against the merge request's base as Markdown and JSON (`expose_as: fluid
+    impact`), beside ship's JUnit report. Its resource section reads `unknown`, with the reason,
+    while ship's stage 6 saves no OpenTofu plan.
+  - **Free-text inputs:** `fluid_env` follows ship's environment grammar and `publish_targets`
+    takes target names only, so an input cannot name another variable for GitLab to expand.
+  - **Failed plans:** a `fluid-plan` that fails keeps its reports and drops its bundle, plan,
+    OpenTofu plan files and artifacts before they are uploaded, so nothing a failed run wrote
+    reads as deployable.
 
 - **A BigQuery table is partitioned and clustered as its binding declares.**
   `binding.location.partitionBy` was read only with `lifecycle.expire`, and
