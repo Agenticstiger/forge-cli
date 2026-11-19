@@ -81,7 +81,6 @@ _STAGE_FILES: Dict[int, Sequence[str]] = {
     5: ("runtime/diff-report.json",),
     6: (st.PLAN_PATH, st.PLAN_HTML_PATH),
     7: ("runtime/apply-report.html",),
-    8: (st.POLICY_BINDINGS,),
     9: ("runtime/verify-report.json",),
     11: (st.SCHEDULE_SYNC_REPORT,),
 }
