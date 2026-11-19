@@ -41,6 +41,7 @@ from fluid_build.util.contract import (
     get_exposes,
     get_primary_build,
     is_externally_run_build,
+    is_spark_job_build,
 )
 
 
@@ -203,6 +204,10 @@ def plan_actions(
             log.debug(
                 "local planner: build '%s' (engine=%s) runs outside forge-cli", build_id, engine
             )
+            continue
+
+        if is_spark_job_build(build):  # its SQL is Spark's, run by forge's Spark runner
+            log.debug("local planner: build '%s' runs on forge's Spark runner", build_id)
             continue
 
         # Extract SQL from various formats
@@ -498,8 +503,8 @@ def _extract_input_tables(
 
 
 def _produced_outside_forge(expose_id: Any, builds: List[Dict[str, Any]], log: Any) -> bool:
-    """True when forge-cli must not land ``expose_id``: a job that runs outside
-    forge-cli (a Flink job) writes it, or may.
+    """True when this planner must not land ``expose_id``: a job it does not run
+    writes it, or may (a Flink job outside forge-cli, or forge's Spark runner).
 
     The builds that write it are the ones whose ``outputs`` name it; when none
     does, the ones that declare no ``outputs`` (a build that declares them has
@@ -509,12 +514,12 @@ def _produced_outside_forge(expose_id: Any, builds: List[Dict[str, Any]], log: A
     not landed and the warning asks for ``outputs``.
     """
     producers = builds_writing_expose(expose_id, builds)
-    outside = [b for b in producers if is_externally_run_build(b)]
+    outside = [b for b in producers if is_externally_run_build(b) or is_spark_job_build(b)]
     if not outside:
         return False
     if len(outside) == len(producers):
         log.info(
-            "local planner: expose '%s' is written by a job that runs outside forge-cli; "
+            "local planner: expose '%s' is written by a job this planner does not run; "
             "nothing to land",
             expose_id,
         )

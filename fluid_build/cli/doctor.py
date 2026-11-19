@@ -167,6 +167,30 @@ ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
         "Override the dbt binary or wrapper (e.g. `poetry run dbt`) used by "
         "the dbt build runner and the --dbt-validate parse gate",
     ),
+    # — Spark builds of runtime: local (spark-submit on this machine) —
+    (
+        "FLUID_SPARK_SUBMIT_EXECUTABLE",
+        "spark-submit on PATH",
+        "The spark-submit a local Spark run starts (an absolute path or a name on PATH)",
+    ),
+    (
+        "FLUID_SPARK_SUBMIT_PROPERTIES_FILE",
+        "none",
+        "Spark properties file passed to every local Spark run as --properties-file: "
+        "its catalog (spark.sql.catalog.fluid.*), S3 store, credentials and master",
+    ),
+    (
+        "FLUID_SPARK_LOCAL_ROOT",
+        ".fluid/spark-artifacts beside the contract",
+        "Where local Spark runs read their job config and runner: an s3:// bucket and "
+        "optional prefix (through AWS_ENDPOINT_URL_S3), or an absolute directory",
+    ),
+    (
+        "FLUID_SPARK_LOCAL_NAMESPACE_ALLOWLIST",
+        "none (no local run may write a table)",
+        "Where local Spark runs may create and write tables: <warehouse>/<namespace "
+        "prefix>, comma-separated (fluid/<namespace> when the binding names no warehouse)",
+    ),
     # — Keyless coding-agent providers (claude-code / codex / cursor / kiro) —
     (
         "FLUID_FORGE_AGENT",
