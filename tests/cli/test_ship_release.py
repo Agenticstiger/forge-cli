@@ -236,10 +236,13 @@ def test_a_release_names_its_journal_without_an_absolute_path(
 
 
 def test_a_passing_run_publishes_the_release(
-    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     _install(monkeypatch, bundled)
-    assert _ship([*_UNTIL_4, "--release-dir", "../rel"]) == 0
+    with caplog.at_level(logging.WARNING, logger="fluid_build.cli._ship_release"):
+        assert _ship([*_UNTIL_4, "--release-dir", "../rel"]) == 0
+    # The fake bundle stage writes no provenance file, so the release cannot carry one and says so.
+    assert "release_provenance_missing: runtime/bundle.tgz does not record" in caplog.text
     rel = work.parent / "rel"
     assert not list(work.parent.glob("rel.partial-*"))
     umask = os.umask(0)
@@ -710,6 +713,42 @@ def test_a_plan_from_a_checkout_that_is_gone_resolves_through_the_bundle_it_is_a
         kept = {"contract_metadata": {"source_contract": str(recorded)}}
         assert loader.resolve_source_contract("plan.json", plan_data=kept)[0] == recorded.resolve()
     assert loader.resolve_source_contract("plan.json", plan_data=gone)[0] is None
+
+
+def test_apply_notes_the_bundle_it_verified_and_every_anchor_follows_it(
+    work: Path, bundled: Path
+) -> None:
+    """Once ``fluid apply`` has verified the plan against its bundle, a plan from a
+    checkout that is gone anchors through that bundle: the binding-path anchor, the
+    IaC source (which reads plan.json again) and the Spark workspace, as the dbt check
+    does. The run's scope then clears it."""
+    from fluid_build import _contract_loader as loader
+    from fluid_build.cli import apply as apply_mod
+    from fluid_build.forge.core.plan_digest import inject_digests
+    from fluid_build.iac.source import source_contract_file
+
+    elsewhere = work.parent / "elsewhere"
+    plan = inject_digests(
+        {
+            "contract": _contract(),
+            "contract_metadata": {
+                "source_contract": str(elsewhere / "contract.fluid.yaml"),
+                "source_path": str(elsewhere / "runtime" / "bundle.tgz"),
+            },
+            "actions": [],
+        },
+        bundle_path=bundled,
+    )
+    plan_path = work / "plan.json"
+    plan_path.write_text(json.dumps(plan))
+    args = argparse.Namespace(contract=str(plan_path), no_verify_plan_binding=False)
+    contract = (work / "contract.fluid.yaml").resolve()
+    with loader.applied_bundle_scope():
+        apply_mod._verify_plan_digests(plan, args, LOG, bundle_path=bundled)
+        assert loader.source_contract_dir(plan_path, plan_data=plan) == contract.parent
+        assert source_contract_file(plan_path) == contract
+        assert apply_mod._spark_workspace(args, plan) == contract.parent
+    assert source_contract_file(plan_path) is None
 
 
 @pytest.mark.integration

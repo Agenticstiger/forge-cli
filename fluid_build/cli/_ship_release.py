@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import secrets
 import shutil
@@ -35,6 +36,8 @@ from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence
 
 from . import _ship_report as report
 from . import _ship_stages as st
+
+LOG = logging.getLogger(__name__)
 
 RELEASE_SCHEMA = "fluid-release/1"
 RELEASE_INDEX = "release.json"
@@ -161,8 +164,6 @@ def _bundle_manifest(root: Path) -> Dict[str, Any]:
 
 def _emit_set(opts: st.ShipOptions) -> List[str]:
     """The emit keys stage 3 resolved, in ``generate artifacts``' canonical order."""
-    import logging
-
     from fluid_build.forge.core.artifact_fanout import FanoutError, parse_emit_set
 
     with st._quiet_probe():
@@ -288,19 +289,31 @@ def _write_bundle_provenance(
     from fluid_build.forge.core import bundle as bundle_mod
 
     built = root / st.BUNDLE_PATH
-    contract, _why = bundle_mod.resolve_bundle_source_contract(built)
+    contract, why = bundle_mod.resolve_bundle_source_contract(built)
     if contract is None:
+        _say_no_provenance(f"{st.BUNDLE_PATH} {why}")
         return
     recorded = bundle_mod.read_bundle_provenance(built) or {}
     place = Path(release_dir).parent.resolve() / Path(release_dir).name
     try:
         contract_rel = Path(os.path.relpath(contract, place)).as_posix()
     except ValueError:  # another drive on Windows: no relative path exists
+        _say_no_provenance(f"{release_dir} is on another drive than its source contract {contract}")
         return
     bundle_mod._write_provenance(
         staging / "bundle.tgz",
         bundle_digest,
         {"contract": contract_rel, "overlay": recorded.get("overlay")},
+    )
+
+
+def _say_no_provenance(why: str) -> None:
+    """Warn where the release is made: without the file, an apply refuses it later."""
+    LOG.warning(
+        "release_provenance_missing: %s. The release holds no bundle.tgz.provenance.json, so "
+        "a plan made from its bundle records no source contract, and fluid apply refuses it "
+        "for a contract with a dbt build.",
+        why,
     )
 
 

@@ -46,7 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `release.json` lists the file in `files` with its sha256. It stays out of `identity`, which is
     unchanged.
   - A bundle that names no source contract gets no provenance file in the release, as before, and
-    neither does a release on another drive.
+    neither does a release on another drive. `fluid ship` now warns when that happens
+    (`release_provenance_missing`).
+  - The file names the contract relative to where the release was published. So keep the release
+    at the same place in the checkout, as CI artifacts restored into the same layout are.
 
 - **A plan can be applied in another checkout of the same tree, as a later CI job may run in
   one.** A plan records the planning checkout's absolute paths (`source_contract`,
@@ -62,8 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     contract's id, and the dbt project's files there must still match the copy the bundle packs:
     an edit is refused, naming the file.
   - With `--no-verify-plan-binding`, nothing is verified, so there is no fallback.
-  - GitLab's default checkout path holds the runner and a concurrency slot, so two jobs of one
-    pipeline can land at different paths; `GIT_CLONE_PATH` is no longer needed for this.
 
 ### Security
 
