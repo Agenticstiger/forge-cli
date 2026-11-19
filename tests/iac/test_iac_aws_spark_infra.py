@@ -1177,3 +1177,19 @@ def test_a_bucketless_output_s_directories_keep_the_account_expression(contract)
     assert directory["resources"][0] == (
         f"arn:aws:s3:::{account_bucket}/commerce.orders-stream/order_lines"
     )
+
+
+def test_the_scheduler_may_read_which_role_an_emr_on_ec2_step_runs_as(contract):
+    """A start checks that the build's policy is on the cluster's instance-profile role."""
+    contract["builds"][0]["properties"]["stream"]["trigger"] = {"availableNow": True}
+    _, data = emit(_runtime(contract, "emr-ec2"))
+    document = data["aws_iam_policy_document"]["commerce_orders_stream_spark_caller"]
+    run = next(s for s in document["statement"] if s["sid"].startswith("Run"))
+    assert "elasticmapreduce:DescribeCluster" in run["actions"]
+    role = next(s for s in document["statement"] if s["sid"].startswith("StepRole"))
+    assert role["actions"] == ["iam:GetInstanceProfile", "iam:ListAttachedRolePolicies"]
+    account = "${data.aws_caller_identity.fluid_lf_caller.account_id}"
+    assert role["resources"] == [
+        f"arn:aws:iam::{account}:instance-profile/*",
+        f"arn:aws:iam::{account}:role/*",
+    ]
