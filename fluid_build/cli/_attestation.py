@@ -43,7 +43,6 @@ sane fallbacks.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -71,16 +70,14 @@ _FLUID_BUILD_TYPE_V1 = "https://fluid-build.io/bundle-provenance/v1"
 def _sha256_file(path: Path) -> str:
     """Return the hex SHA-256 of a file's bytes.
 
-    Chunked read so large bundles don't blow up memory. The digest
-    here is the one embedded in the attestation's
-    ``subject[0].digest.sha256``; verifiers re-compute this to bind
-    the attestation to this specific bundle and reject tampering.
+    The digest embedded in the attestation's ``subject[0].digest.sha256``;
+    verifiers re-compute it to bind the attestation to this specific bundle
+    and reject tampering. The packet digest ``fluid plan`` binds, without
+    its ``sha256:`` prefix.
     """
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    from fluid_build.forge.core.bundle import packet_digest
+
+    return packet_digest(path).split(":", 1)[1]
 
 
 def _git_head_sha(contract_dir: Path) -> Optional[str]:
@@ -258,10 +255,10 @@ def build_attestation(
     Arguments:
       bundle_path: Path to the bundle being attested. Must exist and
         be a regular file.
-      bundle_digest: Pre-computed SHA-256 hex digest of the bundle.
-        If omitted, recomputed here. Pass-in saves the second read
-        when the caller already computed the digest during
-        ``build_bundle_tgz``.
+      bundle_digest: Pre-computed SHA-256 of the bundle file's bytes,
+        bare lowercase hex (in-toto's digest set takes no ``sha256:``
+        prefix). Not the MANIFEST merkle root, which names the contract
+        rather than the file. If omitted, recomputed here.
       contract_dir: Path to the contract repo root (for git SHA /
         remote URL discovery). Defaults to the bundle's parent dir.
       extra_external_params: Caller-supplied additions to
@@ -307,7 +304,7 @@ def build_attestation(
 
     external_params = {
         "bundleOut": str(bundle),
-        "bundleDigest": f"sha256:{digest}",
+        "packetDigest": f"sha256:{digest}",
     }
     if extra_external_params:
         # Caller-supplied values win — they're more specific (format
