@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.0] — 2026-11-19
+
 ### Added
 
 - **`fluid profile --bundle` publishes a quantile with bins as its bin.** A `quantile` property
