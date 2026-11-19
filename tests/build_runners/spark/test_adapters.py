@@ -800,6 +800,13 @@ def test_a_config_this_apply_did_not_compile_starts_nothing(serverless, body):
     stub.assert_no_pending_responses()  # nothing was sent to EMR
 
 
+def test_the_check_before_a_cancel_and_the_start_read_the_artifacts_once(serverless):
+    adapter, _ = adapter_on(serverless, "emr-serverless")
+    bucket = adapter.clients("s3", serverless.region)
+    assert adapter.checked() is adapter.checked()
+    assert bucket.read == [serverless.job_uri, serverless.runner_uri]
+
+
 def test_a_runner_this_forge_does_not_ship_starts_nothing(serverless):
     adapter, stub = adapter_on(serverless, "emr-serverless", runner=b"import os  # not ours\n")
     with pytest.raises(ad.SparkRunError, match="or its runner is not the one"):

@@ -13,7 +13,8 @@ run match the contract, idempotently:
    one on the SAME checkpoint, so it resumes where the old one stopped. Spark's checkpoint
    holds the offsets of one topic on one cluster, so a new source on the old checkpoint is
    refused before anything is cancelled; moving ``properties.stream.checkpoint`` to a new
-   prefix is how a stream changes source.
+   prefix is how a stream changes source. A start the deployed job config or runner would
+   refuse (``_adapters.checked_run``) is refused before anything is cancelled too.
 4. No running job: start one. When the newest run of this config ended, how it ended
    decides (:func:`_after_end`):
 
@@ -480,6 +481,8 @@ def _reconcile_one(
     if only and confirm is not None and not confirm(_question(run, out, stale, matching, start)):
         out.action, out.message = "declined", _declined_text(stale, start)
         return out
+    if stale and not matching and not _checked_first(adapter, stale, out):
+        return out
     if not _cancel_and_wait(adapter, stale, out, clock, budget):
         return out
     if matching:  # the new config already runs; the stale runs were extra
@@ -550,6 +553,21 @@ def _question(
     else:
         what = f"{start.ended}. Start it again on its checkpoint ({start.count})"
     return f"Spark {run.build} ({run.runtime}) on {out.where}: {what}?"
+
+
+def _checked_first(adapter: Adapter, stale: Sequence[RunInfo], out: Outcome) -> bool:
+    """Read back the job config and runner the new run will start on
+    (:meth:`Adapter.checked`) before ``stale``, the runs of another config, are cancelled;
+    False (``out`` refused) when another apply has changed them: the old runs keep going."""
+    try:
+        adapter.checked()
+    except SparkRunError as exc:
+        ids = ", ".join(s.run_id for s in stale)
+        they = f"run {ids} was" if len(stale) == 1 else f"runs {ids} were"
+        out.action, out.error = "refused", True
+        out.message = f"{_clean(exc)}; {they} left running"
+        return False
+    return True
 
 
 def _cancel_and_wait(
