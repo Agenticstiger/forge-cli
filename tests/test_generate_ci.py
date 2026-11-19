@@ -841,94 +841,73 @@ class TestFluidEnvDefaultAcrossSystems:
 
 
 # ---------------------------------------------------------------------------
-# Reference-only contract detection + git-prefix workdir resolution
+# Stage 3 is never inferred from builds[].pattern
 # ---------------------------------------------------------------------------
 
 
-class TestContractIsReferenceOnly:
-    """`_contract_is_reference_only` gates whether `fluid generate ci` emits the
-    Generate Artifacts stage. A contract with any ``builds[].pattern`` in
-    ``{hybrid-reference, reference, external-reference}`` is owned externally
-    (team's own dbt project / Airflow DAG), so asking fluid to regenerate those
-    artifacts surfaces only spurious failures. Edge cases are the point.
-    """
+def _stage_3_default(system: str, root: Path) -> str:
+    """The generated default of ``RUN_STAGE_3_GENERATE_ARTIFACTS``."""
+    if system == "github":
+        workflow = yaml.safe_load((root / ".github/workflows/fluid-pipeline.yml").read_text())
+        value = workflow["env"]["RUN_STAGE_3_GENERATE_ARTIFACTS"]
+        return re.search(r"\|\| '(true|false)' \}\}$", value).group(1)
+    for doc in yaml.safe_load_all((root / "tekton/tasks.yaml").read_text()):
+        if doc and doc["kind"] == "Task" and doc["metadata"]["name"] == "fluid-ship":
+            return {p["name"]: p.get("default") for p in doc["spec"]["params"]}[
+                "RUN_STAGE_3_GENERATE_ARTIFACTS"
+            ]
+    raise AssertionError("no fluid-ship Task")
 
-    def _write(self, tmp_path: Path, yaml_content: str) -> Path:
-        p = tmp_path / "contract.fluid.yaml"
-        p.write_text(yaml_content)
-        return p
 
-    def test_missing_file_returns_false(self, tmp_path):
-        from fluid_build.cli.generate_ci import _contract_is_reference_only
+_SPARK = {"id": "spark_{n}", "engine": "spark", "properties": {"model": "m"}}
+_REFERENCE = {"id": "dbt_ref", "engine": "dbt", "pattern": "hybrid-reference"}
 
-        missing = tmp_path / "nope.yaml"
-        assert _contract_is_reference_only(str(missing)) is False
 
-    def test_broken_yaml_returns_false(self, tmp_path):
-        from fluid_build.cli.generate_ci import _contract_is_reference_only
+class TestStageThreeIsNotInferred:
+    """Stage 3 writes the policy bindings and the schedule that stages 4, 8 and
+    11 read, and ``fluid generate artifacts`` writes them for reference builds
+    too, so only ``--no-generate-artifacts`` turns it off. It used to be off for
+    a contract with any reference build, which left a mixed contract's stages
+    4, 8 and 11 without their inputs."""
 
-        p = self._write(tmp_path, "not: valid: yaml: [\n")
-        # Defensive: parse failure must not crash; returns False so the
-        # generate-artifacts stage stays on by default.
-        assert _contract_is_reference_only(str(p)) is False
+    def _generate(self, tmp_path, monkeypatch, system, builds, **extra) -> str:
+        contract = {
+            "fluidVersion": "0.7.5",
+            "kind": "DataProduct",
+            "id": "gold.mixed",
+            "name": "mixed",
+            "builds": builds,
+        }
+        (tmp_path / "contract.fluid.yaml").write_text(yaml.safe_dump(contract))
+        monkeypatch.chdir(tmp_path)
+        assert generate_ci_run(_make_args(system=system, **extra), _logger) == 0
+        return _stage_3_default(system, tmp_path)
 
-    def test_no_builds_key_returns_false(self, tmp_path):
-        from fluid_build.cli.generate_ci import _contract_is_reference_only
-
-        p = self._write(tmp_path, "dataProduct:\n  name: foo\n")
-        assert _contract_is_reference_only(str(p)) is False
-
-    def test_builds_is_dict_not_list_returns_false(self, tmp_path):
-        from fluid_build.cli.generate_ci import _contract_is_reference_only
-
-        p = self._write(tmp_path, "builds:\n  not_a_list: true\n")
-        assert _contract_is_reference_only(str(p)) is False
-
-    def test_build_without_pattern_returns_false(self, tmp_path):
-        from fluid_build.cli.generate_ci import _contract_is_reference_only
-
-        p = self._write(tmp_path, "builds:\n  - id: foo\n    engine: python\n")
-        assert _contract_is_reference_only(str(p)) is False
+    @pytest.mark.parametrize("system", ["github", "tekton"])
+    def test_a_mixed_contract_runs_stage_3(self, tmp_path, monkeypatch, system):
+        builds = [
+            {**_SPARK, "id": "spark_1"},
+            {**_SPARK, "id": "spark_2"},
+            _REFERENCE,
+        ]
+        assert self._generate(tmp_path, monkeypatch, system, builds) == "true"
 
     @pytest.mark.parametrize("pattern", ["hybrid-reference", "reference", "external-reference"])
-    def test_recognised_reference_patterns_return_true(self, tmp_path, pattern):
-        from fluid_build.cli.generate_ci import _contract_is_reference_only
+    def test_a_contract_of_reference_builds_runs_stage_3(self, tmp_path, monkeypatch, pattern):
+        builds = [{**_REFERENCE, "pattern": pattern}]
+        assert self._generate(tmp_path, monkeypatch, "github", builds) == "true"
 
-        p = self._write(tmp_path, f"builds:\n  - id: foo\n    pattern: {pattern}\n")
-        assert _contract_is_reference_only(str(p)) is True
-
-    def test_unrecognised_pattern_returns_false(self, tmp_path):
-        from fluid_build.cli.generate_ci import _contract_is_reference_only
-
-        p = self._write(tmp_path, "builds:\n  - id: foo\n    pattern: something-else\n")
-        assert _contract_is_reference_only(str(p)) is False
-
-    def test_any_build_with_reference_pattern_wins(self, tmp_path):
-        """Mixed contracts (one normal build, one reference build) must be
-        treated as reference-only — the reference build's external ownership
-        still blocks fluid from regenerating anything for that build."""
-        from fluid_build.cli.generate_ci import _contract_is_reference_only
-
-        p = self._write(
-            tmp_path,
-            "builds:\n"
-            "  - id: normal\n"
-            "    pattern: declarative\n"
-            "  - id: ref\n"
-            "    pattern: hybrid-reference\n",
+    @pytest.mark.parametrize("system", ["github", "tekton"])
+    def test_the_flag_turns_stage_3_off(self, tmp_path, monkeypatch, system):
+        default = self._generate(
+            tmp_path, monkeypatch, system, [_REFERENCE], no_generate_artifacts=True
         )
-        assert _contract_is_reference_only(str(p)) is True
+        assert default == "false"
 
-    def test_non_dict_build_entry_skipped(self, tmp_path):
-        from fluid_build.cli.generate_ci import _contract_is_reference_only
+    def test_the_detector_is_gone(self):
+        from fluid_build.cli import generate_ci
 
-        p = self._write(
-            tmp_path,
-            "builds:\n  - just a string\n  - id: foo\n    pattern: reference\n",
-        )
-        # Must not raise on the bare-string entry; must still detect the
-        # dict entry's reference pattern.
-        assert _contract_is_reference_only(str(p)) is True
+        assert not hasattr(generate_ci, "_contract_is_reference_only")
 
 
 class TestGitPrefix:
@@ -977,9 +956,8 @@ class TestGitPrefix:
 class TestNoGenerateArtifactsFlag:
     """`--no-generate-artifacts` on `fluid generate ci` must propagate to
     ``PipelineConfig.generates_artifacts=False`` so the Generate Artifacts
-    stage is omitted from the emitted pipeline. Auto-detection (via
-    ``_contract_is_reference_only``) must achieve the same result without
-    the flag.
+    stage is off by default in the emitted pipeline. Nothing else turns it
+    off (``TestStageThreeIsNotInferred``).
     """
 
     # CRITICAL: every test here must `monkeypatch.chdir(tmp_path)` because
@@ -987,11 +965,10 @@ class TestNoGenerateArtifactsFlag:
     # regardless of whether the PipelineTemplateGenerator is mocked. Without
     # chdir, the test clobbers the repo's real Jenkinsfile at the repo root.
 
-    @patch("fluid_build.cli.generate_ci._contract_is_reference_only", return_value=False)
     @patch("fluid_build.cli.generate_ci._git_prefix", return_value=None)
     @patch("fluid_build.forge.core.pipeline_templates.PipelineTemplateGenerator")
     def test_flag_forces_generates_artifacts_false(
-        self, mock_gen, _mock_prefix, _mock_ref_only, tmp_path, monkeypatch
+        self, mock_gen, _mock_prefix, tmp_path, monkeypatch
     ):
         monkeypatch.chdir(tmp_path)
         from fluid_build.cli.generate_ci import run as generate_ci_run
@@ -1010,36 +987,9 @@ class TestNoGenerateArtifactsFlag:
         cfg = mock_gen.return_value.generate_pipeline.call_args[0][0]
         assert cfg.generates_artifacts is False
 
-    @patch("fluid_build.cli.generate_ci._contract_is_reference_only", return_value=True)
-    @patch("fluid_build.cli.generate_ci._git_prefix", return_value=None)
-    @patch("fluid_build.forge.core.pipeline_templates.PipelineTemplateGenerator")
-    def test_reference_only_contract_auto_disables_generate(
-        self, mock_gen, _mock_prefix, _mock_ref_only, tmp_path, monkeypatch
-    ):
-        monkeypatch.chdir(tmp_path)
-        from fluid_build.cli.generate_ci import run as generate_ci_run
-
-        mock_gen.return_value.generate_pipeline.return_value = {"Jenkinsfile": "pipeline {}\n"}
-
-        args = argparse.Namespace(
-            system="jenkins",
-            out=None,
-            contract="contract.fluid.yaml",
-            no_generate_artifacts=False,  # flag NOT set
-            provider=None,
-        )
-
-        generate_ci_run(args, _logger)
-        cfg = mock_gen.return_value.generate_pipeline.call_args[0][0]
-        # Auto-detection wins even without the flag.
-        assert cfg.generates_artifacts is False
-
-    @patch("fluid_build.cli.generate_ci._contract_is_reference_only", return_value=False)
     @patch("fluid_build.cli.generate_ci._git_prefix", return_value="examples/demo")
     @patch("fluid_build.forge.core.pipeline_templates.PipelineTemplateGenerator")
-    def test_git_prefix_propagates_to_workdir(
-        self, mock_gen, _mock_prefix, _mock_ref_only, tmp_path, monkeypatch
-    ):
+    def test_git_prefix_propagates_to_workdir(self, mock_gen, _mock_prefix, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         from fluid_build.cli.generate_ci import run as generate_ci_run
 

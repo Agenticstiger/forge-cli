@@ -192,11 +192,8 @@ class PipelineConfig:
     # generated pipeline can cd into that folder before running fluid commands.
     # None or "" => no cd wrapper (steps run at checkout root).
     workdir: Optional[str] = None
-    # Whether the pipeline should run `fluid generate transformation/schedule`
-    # in a dedicated "Generate Artifacts" stage. False for reference-only
-    # contracts (e.g. hybrid-reference dbt) where the transformation and
-    # schedule artifacts already exist externally and fluid shouldn't be
-    # asked to generate new ones.
+    # Whether stage 3 (`fluid generate artifacts`) runs by default. False only
+    # with ``fluid generate ci --no-generate-artifacts``.
     generates_artifacts: bool = True
     # Install mode for the ``fluid`` CLI inside the Jenkins container.
     # Two values, picked explicitly at generation time — the generated
@@ -539,8 +536,8 @@ class BasePipelineTemplate:
     @staticmethod
     def _stage_toggle_default(num: int, config: "PipelineConfig") -> bool:
         """Whether stage ``num`` runs by default: every stage but the opt-in
-        10 and 11, except stage 3 for a reference-only contract (fluid owns
-        no artifacts there). ``fluid generate ci`` sets 10 and 11 on request."""
+        10 and 11, except stage 3 under ``--no-generate-artifacts``.
+        ``fluid generate ci`` sets 10 and 11 on request."""
         if num == 3:
             return bool(config.generates_artifacts)
         if num == 10:

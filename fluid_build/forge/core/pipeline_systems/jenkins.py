@@ -241,11 +241,9 @@ class JenkinsTemplate(BasePipelineTemplate):
     runs a job's first build, and its first after it lost its parameter
     definitions, with no parameters in the environment.
 
-    Back-compat: the legacy ``generates_artifacts: False`` (reference-only
-    contracts) and ``workdir: "..."`` (subfolder checkout) config flags
-    still work — stage 3 is skipped when the contract declares itself
-    reference-only, and every sh block is wrapped with ``cd "<workdir>"``
-    when workdir is set.
+    ``generates_artifacts: False`` (``--no-generate-artifacts``) turns stage 3
+    off by default, and with ``workdir: "..."`` (subfolder checkout) every sh
+    block is wrapped with ``cd "<workdir>"``.
     """
 
     system_apply_mode_default = "dry-run"
@@ -334,7 +332,7 @@ class JenkinsTemplate(BasePipelineTemplate):
                 3,
                 "Stage 3: ODCS + ODPS-Bitol + schedule + policy + Spark job config fanout "
                 "from the bundle. "
-                "Off for reference-only contracts.",
+                "Off by default under fluid generate ci --no-generate-artifacts.",
             ),
             _Param(
                 "GENERATE_EMIT",
@@ -985,7 +983,7 @@ pipeline {{
         // ═════════════════════════════════════════════════════════════
         // Stage 3 — generate artifacts (structural)
         // ODCS + ODPS-Bitol + schedule + policy + Spark job config fanout. dbt excluded.
-        // Auto-skipped for hybrid-reference contracts.
+        // Off by default under fluid generate ci --no-generate-artifacts.
         // ═════════════════════════════════════════════════════════════
         stage('3 - generate artifacts') {{
 {stage3_when}
@@ -1003,7 +1001,7 @@ pipeline {{
         stage('4 - validate artifacts') {{
             // Self-gate: stage 4 re-verifies the output of stage 3
             // (generate artifacts). When stage 3 was skipped — either
-            // because the contract is reference-only (RUN_STAGE_3_*
+            // because --no-generate-artifacts turned it off (RUN_STAGE_3_*
             // default False) or because the operator unchecked it —
             // ``dist/artifacts/`` won't exist and this stage would
             // hard-fail with ``validate_artifacts_input_missing``,
