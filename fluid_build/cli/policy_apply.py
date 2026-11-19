@@ -99,79 +99,109 @@ def run(args, logger: logging.Logger) -> int:
             info(logger, "policy_apply_result", status="noop", note="no bindings to apply")
             return 0
 
-        # Provider and project come from the bindings file (set by policy-compile
-        # from the contract schema).  CLI flags and env vars are overrides only.
-        bindings_provider, bindings_project = _resolve_from_bindings(data)
+        # A table cataloged in Lakekeeper is granted in Lakekeeper itself, through
+        # its management API; every other binding goes to the provider, as before.
+        # The provider first: when it cannot be built it raises, as before, and
+        # nothing has been changed in Lakekeeper yet.
+        lakekeeper, others = _split_lakekeeper(data["bindings"])
+        results = []
+        if others:
+            results.append(_apply_with_provider(args, {**data, "bindings": others}, logger))
+        if lakekeeper:
+            from fluid_build.policy.lakekeeper_apply import apply_lakekeeper_bindings
 
-        provider_name = (
-            getattr(args, "provider", None)
-            or bindings_provider
-            or os.getenv("FLUID_PROVIDER")
-            or ""
-        )
-        project_name = getattr(args, "project", None) or bindings_project or None
+            lakekeeper_result = apply_lakekeeper_bindings(lakekeeper, mode=args.mode)
+            info(logger, "policy_apply_lakekeeper_result", **lakekeeper_result)
+            results.append(lakekeeper_result)
 
-        if provider_name:
-            source = "contract" if provider_name == bindings_provider else "flag/env"
-            logger.info(f"Provider: {provider_name} (from {source})")
+        _register_acquisition_policies(data, logger)
 
-        provider = build_provider(
-            provider_name or None, project_name, getattr(args, "region", None), logger
-        )
-
-        if hasattr(provider, "apply_policy"):
-            res = provider.apply_policy(data, mode=args.mode)
-        else:
-            res = {"status": "noop", "note": "provider has no policy applier"}
-            # Make the no-op visible: otherwise the operator sees exit 0 and
-            # assumes the GRANT/IAM bindings were enforced. For cloud providers
-            # the policies are emitted + applied during `fluid apply` (stage 7),
-            # so a standalone `policy-apply` is genuinely a no-op here — say so
-            # rather than exiting silently green.
-            cprint(
-                f"\n⚠️  No policy bindings were enforced — the "
-                f"'{provider_name or 'configured'}' provider has no standalone "
-                f"policy applier. For cloud providers, IAM/GRANT, masking and "
-                f"row-access policies are emitted and applied during "
-                f"`fluid apply` (stage 7), so `fluid policy-apply` is a no-op "
-                f"for this provider."
-            )
-        info(logger, "policy_apply_result", **res)
-
-        # ── Acquisition pattern: register retention + alert + cost policies ─
-        # Bronze acquisition contracts emit retention sweeper schedules,
-        # alerter-channel config, PII-masking actions for classified
-        # columns, and cost-budget guards. These land under
-        # ``.fluid/policies/<contract-id>/`` and are picked up at next
-        # apply by the acquisition runtime.
-        try:
-            contract = data.get("contract") or {}
-            if contract:
-                from pathlib import Path as _Path
-
-                from fluid_build.cli._acquisition_stage_ext import (
-                    is_acquisition_contract,
-                    policy_apply_acquisition,
-                )
-
-                if is_acquisition_contract(contract):
-                    acq_results = policy_apply_acquisition(contract, _Path.cwd())
-                    for r in acq_results:
-                        info(
-                            logger,
-                            "policy_apply_acquisition",
-                            product_id=r.product_id,
-                            build_id=r.build_id,
-                            actions_applied=r.actions_applied,
-                            skipped=r.skipped,
-                        )
-        except Exception as acq_exc:  # noqa: BLE001
-            logger.warning(f"acquisition policy registration skipped: {acq_exc}")
-
-        return 0 if res.get("status") in ("ok", "noop") else 1
+        return 0 if all(r.get("status") in ("ok", "noop") for r in results) else 1
     except CLIError:
         raise
     except Exception as e:
         logger.error(f"Policy apply error: {str(e)}")
         logger.error(traceback.format_exc())
         raise CLIError(1, "policy_apply_failed", {"error": str(e)})
+
+
+def _split_lakekeeper(bindings: list) -> tuple[list, list]:
+    """``(Lakekeeper grants, every other binding)``, each in file order."""
+    from fluid_build.policy.lakekeeper import PROVIDER
+
+    lakekeeper = [b for b in bindings if isinstance(b, dict) and b.get("provider") == PROVIDER]
+    others = [b for b in bindings if not (isinstance(b, dict) and b.get("provider") == PROVIDER)]
+    return lakekeeper, others
+
+
+def _apply_with_provider(args, data: dict, logger: logging.Logger) -> dict:
+    """Hand the bindings to the provider the file names; the provider's result."""
+    # Provider and project come from the bindings file (set by policy-compile
+    # from the contract schema).  CLI flags and env vars are overrides only.
+    bindings_provider, bindings_project = _resolve_from_bindings(data)
+
+    provider_name = (
+        getattr(args, "provider", None) or bindings_provider or os.getenv("FLUID_PROVIDER") or ""
+    )
+    project_name = getattr(args, "project", None) or bindings_project or None
+
+    if provider_name:
+        source = "contract" if provider_name == bindings_provider else "flag/env"
+        logger.info(f"Provider: {provider_name} (from {source})")
+
+    provider = build_provider(
+        provider_name or None, project_name, getattr(args, "region", None), logger
+    )
+
+    if hasattr(provider, "apply_policy"):
+        res = provider.apply_policy(data, mode=args.mode)
+    else:
+        res = {"status": "noop", "note": "provider has no policy applier"}
+        # Make the no-op visible: otherwise the operator sees exit 0 and
+        # assumes the GRANT/IAM bindings were enforced. For cloud providers
+        # the policies are emitted + applied during `fluid apply` (stage 7),
+        # so a standalone `policy-apply` is genuinely a no-op here — say so
+        # rather than exiting silently green.
+        cprint(
+            f"\n⚠️  No policy bindings were enforced — the "
+            f"'{provider_name or 'configured'}' provider has no standalone "
+            f"policy applier. For cloud providers, IAM/GRANT, masking and "
+            f"row-access policies are emitted and applied during "
+            f"`fluid apply` (stage 7), so `fluid policy-apply` is a no-op "
+            f"for this provider."
+        )
+    info(logger, "policy_apply_result", **res)
+    return res
+
+
+def _register_acquisition_policies(data: dict, logger: logging.Logger) -> None:
+    """Acquisition pattern: register retention + alert + cost policies.
+
+    Bronze acquisition contracts emit retention sweeper schedules,
+    alerter-channel config, PII-masking actions for classified columns, and
+    cost-budget guards. These land under ``.fluid/policies/<contract-id>/``
+    and are picked up at next apply by the acquisition runtime.
+    """
+    try:
+        contract = data.get("contract") or {}
+        if contract:
+            from pathlib import Path as _Path
+
+            from fluid_build.cli._acquisition_stage_ext import (
+                is_acquisition_contract,
+                policy_apply_acquisition,
+            )
+
+            if is_acquisition_contract(contract):
+                acq_results = policy_apply_acquisition(contract, _Path.cwd())
+                for r in acq_results:
+                    info(
+                        logger,
+                        "policy_apply_acquisition",
+                        product_id=r.product_id,
+                        build_id=r.build_id,
+                        actions_applied=r.actions_applied,
+                        skipped=r.skipped,
+                    )
+    except Exception as acq_exc:  # noqa: BLE001
+        logger.warning(f"acquisition policy registration skipped: {acq_exc}")

@@ -107,6 +107,15 @@ def split_param_list(params: str) -> List[str]:
     return parts
 
 
+def param_number(digits: str) -> int:
+    """A type parameter's digits (a precision, a scale) as a number. One of more than
+    four significant digits is past every warehouse's limit (BigQuery's BIGNUMERIC goes
+    to 76) and reads as 10000, never through ``int()``, which refuses a string of more
+    than 4300 digits."""
+    significant = digits.lstrip("0")
+    return int(significant or "0") if len(significant) <= 4 else 10_000
+
+
 def _skip_spaces(text: str, i: int) -> int:
     while i < len(text) and text[i].isspace():
         i += 1

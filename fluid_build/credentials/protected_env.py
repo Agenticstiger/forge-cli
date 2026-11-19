@@ -38,7 +38,8 @@ credentials, which is what they are for. They may not carry a setting that:
 * changes where data or credentials are sent: the Command Center, catalog,
   lineage, telemetry, webhook, registry, LLM and agent-tool endpoints and
   selectors (``FLUID_COMMAND_CENTER_URL``/``_ENABLED``, ``FLUID_API_URL``,
-  ``FLUID_CC_ENDPOINT``, ``FLUID_CATALOG_*_URL``, ``FLUID_OPENLINEAGE_URL``,
+  ``FLUID_CC_ENDPOINT``, ``FLUID_CATALOG_*_URL``, ``FLUID_LAKEKEEPER_*``,
+  ``FLUID_OPENLINEAGE_URL``,
   ``FLUID_LLM_ENDPOINT``, ``FLUID_LLM_PROVIDER``/``_MODEL``,
   ``FLUID_RUNNER_HOST_OVERRIDE``, ``FLUID_PUBLIC_REGISTRY``,
   ``FLUID_*_MCP`` opt-ins, ``DMM_API_URL``, ``DATAHUB_GMS_HOST``,
@@ -63,7 +64,13 @@ credentials, which is what they are for. They may not carry a setting that:
   program or an endpoint: ``AWS_CONFIG_FILE``,
   ``AWS_SHARED_CREDENTIALS_FILE``, ``KUBECONFIG``, ``CLOUDSDK_CONFIG``,
   ``DOCKER_CONFIG``, ``DOCKER_HOST``,
-  ``GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES`` ...);
+  ``GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES`` ...), and what a shell script
+  the CLI starts runs before or around its own commands: bash function
+  imports (``BASH_FUNC_<name>%%``, and any other name that is not a shell
+  identifier), and the start-up and trace settings (``BASH_ENV``, ``ENV``,
+  ``SHELLOPTS``, ``BASHOPTS``, ``PS4``, ``BASH_XTRACEFD``, ``IFS``,
+  ``CDPATH``, ``GLOBIGNORE``, ``ZDOTDIR``, ``FPATH``, ``NULLCMD``,
+  ``READNULLCMD``);
 * lets a tool re-read the project's dotenv files without this filter
   (``PYTHON_DOTENV_DISABLED``, ``LITELLM_MODE``): dbt loads the nearest
   ``.env`` when it starts and litellm loads one when it is imported, so once
@@ -479,6 +486,16 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         # decides whether litellm does.
         "PYTHON_DOTENV_DISABLED",
         "LITELLM_MODE",
+        # Shell start-up and trace settings that run code in a non-interactive
+        # shell (every bash or sh script a runner starts: spark-submit, the
+        # EMR and Homebrew wrappers, Debezium's run.sh). sudo's
+        # ``initial_badenv_table`` lists the same names. ``SHELLOPTS=xtrace``
+        # with a command substitution in ``PS4`` runs it on every line;
+        # ``BASH_XTRACEFD`` points that trace at a descriptor; zsh reads
+        # ``$ZDOTDIR/.zshenv`` in every shell, ksh and zsh autoload functions
+        # from ``FPATH``, and zsh runs ``NULLCMD`` / ``READNULLCMD`` for a bare
+        # redirection. Bash function imports (``BASH_FUNC_<name>%%``) are
+        # refused by name shape in :func:`is_protected_env_key`.
         "IFS",
         "CDPATH",
         "ENV",
@@ -486,7 +503,12 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         "BASHOPTS",
         "SHELLOPTS",
         "PS4",
+        "BASH_XTRACEFD",
         "GLOBIGNORE",
+        "ZDOTDIR",
+        "FPATH",
+        "NULLCMD",
+        "READNULLCMD",
         "PYTHONPATH",
         "PYTHONHOME",
         "PYTHONSTARTUP",
@@ -557,6 +579,10 @@ PROTECTED_ENV_PREFIXES: Tuple[str, ...] = (
     # role, mount and token, or a runner's response-wrapped token
     # (secrets/_vault.py)
     "FLUID_VAULT_",
+    # the credential references, token endpoint and scope ``fluid policy apply``
+    # signs in to Lakekeeper with to change its grants (policy/lakekeeper_apply.py):
+    # a project file must not choose which credential is sent, or where
+    "FLUID_LAKEKEEPER_",
     "FLUID_MCP_JWT_",
     "FLUID_LLM_DEFAULT_MODEL_",
     # credentials the Debezium runner itself sets: it writes each credential
@@ -583,7 +609,19 @@ PROTECTED_ENV_PREFIXES: Tuple[str, ...] = (
     # the OpenTelemetry Java agent Debezium Server's run.sh can start: its
     # extensions load a jar, and its configuration file sets the exporter
     "OTEL_JAVAAGENT_",
+    # bash imports ``BASH_FUNC_<name>%%=() { ...; }`` from the environment as
+    # the function ``<name>`` (the post-Shellshock export format, bash43-027),
+    # which then shadows a command or even the ``exec`` builtin in every bash
+    # script a runner starts. The name is not an identifier, so the shape rule
+    # in :func:`is_protected_env_key` refuses it as well.
+    "BASH_FUNC_",
 )
+
+#: A name every POSIX shell can hold as a variable (systemd's
+#: ``env_name_is_valid``, bash's own rule). Anything else in a project file
+#: (``BASH_FUNC_exec%%``, ``%PROD_X``, ``a.b``) is refused: a shell cannot read
+#: it as a variable, and bash reads some such names as function definitions.
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 #: The configuration namespaces of the embedded Debezium Server: Debezium's own
 #: properties, Quarkus, SmallRye Config and MicroProfile Config (a profile, or
@@ -815,11 +853,12 @@ def is_protected_env_key(key: str) -> bool:
 
     Compared upper-cased: on Windows ``fluid_ref_root`` and ``FLUID_REF_ROOT``
     are the same variable (the GitHub runner compares its blocklist the same
-    way).
+    way). A name that is not a shell identifier is always refused (see
+    :data:`_ENV_NAME`).
     """
-    name = key.strip().upper()
-    if not name:
-        return False
+    if not _ENV_NAME.fullmatch(key):
+        return True
+    name = key.upper()
     if name in PROTECTED_ENV_KEYS or name.startswith(PROTECTED_ENV_PREFIXES):
         return True
     if _is_server_config_name(name):

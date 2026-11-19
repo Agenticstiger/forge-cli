@@ -1234,6 +1234,8 @@ def _run_contract_rules(
             if args.verbose:
                 info(logger, f"Governance binding check skipped: {exc}")
 
+        _check_glue_layout(validation_result, contract, args, logger)
+
         # --- pgvector vector output-port binding checks ---------------------
         # A pgvector-bound expose (binding.platform: pgvector) needs a vector
         # dimension and non-colliding embeddings-table names — surface a clean
@@ -1519,6 +1521,28 @@ def _drop_schema_errors_at(validation_result: ValidationResult, pointer: str) ->
         if at == pointer and event.startswith("contract_schema_"):
             validation_result.errors.remove(message)
             validation_result.issue_meta.pop(message, None)
+
+
+def _check_glue_layout(
+    validation_result: ValidationResult, contract: Mapping[str, Any], args: Any, logger: Any
+) -> None:
+    """The partition keys and projection `fluid generate iac` writes on a Glue table, what
+    it refuses, and a note for each partitioned table whose partitions need registering."""
+    try:
+        from fluid_build.iac.providers.aws_layout import validate_aws_layout
+
+        errors, notes = validate_aws_layout(contract)
+        _add_findings(
+            validation_result,
+            contract,
+            "contract_storage_layout",
+            errors,
+            notes=notes,
+            anchor="exposes",
+        )
+    except Exception as exc:  # pragma: no cover — defensive
+        if args.verbose:
+            info(logger, f"Glue table layout check skipped: {exc}")
 
 
 def _add_findings(

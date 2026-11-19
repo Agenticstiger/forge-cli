@@ -82,7 +82,8 @@ pytestmark = [
 
 def test_emu_bigquery_dataset_and_table_plan_clean(gcp_emulator_project):
     """Emitter half: a BQ dataset+table contract → emit → tofu init/plan.
-    Plan must succeed and propose exactly 2 adds (dataset + table)."""
+    Plan must succeed and propose exactly 3 adds (dataset, table and the contract's
+    decimal-parameters marker)."""
     contract = {
         "id": "emu.bq.basic",
         "name": "BQ basic",
@@ -109,7 +110,7 @@ def test_emu_bigquery_dataset_and_table_plan_clean(gcp_emulator_project):
     plan = gcp_emulator_project.plan()
     assert plan.ok, plan.stderr or plan.stdout
     summary = runner.change_summary(plan)
-    assert summary["add"] == 2, summary
+    assert summary["add"] == 3, summary
 
 
 def test_emu_bigquery_view_plan_clean(gcp_emulator_project):
@@ -189,7 +190,7 @@ def test_emu_pubsub_topic_and_subscription_plan_clean(gcp_emulator_project):
 
 
 def test_emu_multi_exposure_plan_clean(gcp_emulator_project):
-    """Emitter half: a contract mixing BQ + GCS + Pub/Sub → plan = 4 adds.
+    """Emitter half: a contract mixing BQ + GCS + Pub/Sub → plan = 5 adds.
     Catches missing ``depends_on`` / cross-resource ordering bugs that
     single-format tests can't see."""
     contract = {
@@ -227,8 +228,8 @@ def test_emu_multi_exposure_plan_clean(gcp_emulator_project):
     assert gcp_emulator_project.init().ok
     plan = gcp_emulator_project.plan()
     assert plan.ok, plan.stderr
-    # dataset + table + bucket + topic = 4
-    assert runner.change_summary(plan)["add"] == 4
+    # dataset + table + decimal-parameters marker + bucket + topic = 5
+    assert runner.change_summary(plan)["add"] == 5
 
 
 # ---------------------------------------------------------------------------
@@ -329,30 +330,34 @@ def _nested_contract(dataset: str) -> Dict[str, Any]:
     }
 
 
-def test_emu_bigquery_nested_table_plan_clean(gcp_emulator_project):
-    """Emitter half: REPEATED and RECORD fields plan against the emulator: dataset and
-    table."""
-    contract = _nested_contract(f"emu_nested_{uuid.uuid4().hex[:8]}")
+def _planned_adds(gcp_emulator_project, contract: Dict[str, Any]) -> int:
+    """Emit, init and plan ``contract`` against the emulator: the resources it adds."""
     gcp_emulator_project.emit(contract)
     init = gcp_emulator_project.init()
     assert init.ok, init.stderr or init.stdout
     plan = gcp_emulator_project.plan()
     assert plan.ok, plan.stderr or plan.stdout
-    assert runner.change_summary(plan)["add"] == 2
+    return runner.change_summary(plan)["add"]
 
 
-def test_emu_bigquery_nested_columns_round_trip_rows():
-    """Emulator half: the emitted schema, read as the BigQuery API's own field JSON,
-    makes a table the emulator stores and queries: arrays, records and a map as
-    key and value records."""
+def test_emu_bigquery_nested_table_plan_clean(gcp_emulator_project):
+    """Emitter half: REPEATED and RECORD fields plan against the emulator: dataset,
+    table and the contract's decimal-parameters marker."""
+    contract = _nested_contract(f"emu_nested_{uuid.uuid4().hex[:8]}")
+    assert _planned_adds(gcp_emulator_project, contract) == 3
+
+
+def _emulator_table(contract: Dict[str, Any], prefix: str):
+    """The emitted table, made on the emulator from the BigQuery API's own field JSON:
+    the client, the table's reference, its dataset id, and its fields read back by name."""
     import json
 
     from google.cloud import bigquery
 
     from fluid_build.iac import build_module, get_iac_plugin
 
-    dataset_id = f"{GCP_EMULATOR_PROJECT}.emu_nested_rows_{uuid.uuid4().hex[:8]}"
-    module = json.loads(build_module(get_iac_plugin("gcp"), _nested_contract("unused")))
+    dataset_id = f"{GCP_EMULATOR_PROJECT}.{prefix}_{uuid.uuid4().hex[:8]}"
+    module = json.loads(build_module(get_iac_plugin("gcp"), contract))
     [table_body] = module["resource"]["google_bigquery_table"].values()
     schema = [bigquery.SchemaField.from_api_repr(f) for f in json.loads(table_body["schema"])]
 
@@ -362,8 +367,14 @@ def test_emu_bigquery_nested_columns_round_trip_rows():
     bq.create_dataset(dataset, exists_ok=True)
     table = bigquery.Table(f"{dataset_id}.orders", schema=schema)
     bq.create_table(table)
-
     got = {f.name: f for f in bq.get_table(table.reference).schema}
+    return bq, table.reference, dataset_id, got
+
+
+def test_emu_bigquery_nested_columns_round_trip_rows():
+    """Emulator half: the emitted schema makes a table the emulator stores and queries:
+    arrays, records and a map as key and value records."""
+    bq, table, dataset_id, got = _emulator_table(_nested_contract("unused"), "emu_nested_rows")
     assert (got["tags"].field_type, got["tags"].mode) == ("STRING", "REPEATED")
     assert (got["address"].field_type, [f.name for f in got["address"].fields]) == (
         "RECORD",
@@ -373,7 +384,7 @@ def test_emu_bigquery_nested_columns_round_trip_rows():
     assert [f.name for f in got["attrs"].fields] == ["key", "value"]
 
     errors = bq.insert_rows_json(
-        table.reference,
+        table,
         [
             {
                 "id": "o1",
@@ -398,7 +409,8 @@ def test_emu_bigquery_nested_columns_round_trip_rows():
 
 def test_emu_bigquery_partitioned_clustered_table_plan_clean(gcp_emulator_project):
     """Emitter half: a partition column without retention and clustering plan against
-    the emulator: dataset, table and the partitioning's replacement trigger."""
+    the emulator: dataset, table, the partitioning's replacement trigger and the
+    contract's decimal-parameters marker."""
     contract = _nested_contract(f"emu_layout_{uuid.uuid4().hex[:8]}")
     expose = contract["exposes"][0]
     expose["contract"]["schema"] += [
@@ -407,12 +419,58 @@ def test_emu_bigquery_partitioned_clustered_table_plan_clean(gcp_emulator_projec
     ]
     expose["binding"]["location"]["partitionBy"] = ["event_date"]
     expose["binding"]["properties"] = {"cluster_by": ["region", "id"]}
-    gcp_emulator_project.emit(contract)
-    init = gcp_emulator_project.init()
-    assert init.ok, init.stderr or init.stdout
-    plan = gcp_emulator_project.plan()
-    assert plan.ok, plan.stderr or plan.stdout
-    assert runner.change_summary(plan)["add"] == 3
+    assert _planned_adds(gcp_emulator_project, contract) == 4
+
+
+def _decimal_contract(dataset: str) -> Dict[str, Any]:
+    """The nested table's binding with a NUMERIC(P,S), a BIGNUMERIC(P,S) and a decimal in
+    a record."""
+    contract = _nested_contract(dataset)
+    contract["id"], contract["name"] = "emu.bq.decimals", "BQ decimals"
+    contract["exposes"][0]["contract"]["schema"] = [
+        {"name": "id", "type": "string", "required": True},
+        {"name": "amount", "type": "decimal(18,4)"},
+        {"name": "wide", "type": "decimal(40,20)"},
+        {"name": "fee", "type": "struct", "fields": [{"name": "value", "type": "decimal(12,2)"}]},
+    ]
+    return contract
+
+
+def test_emu_bigquery_decimal_parameters_plan_clean(gcp_emulator_project):
+    """Emitter half: parameterised decimals plan against the emulator: dataset, table
+    and the contract's decimal-parameters marker."""
+    contract = _decimal_contract(f"emu_decimals_{uuid.uuid4().hex[:8]}")
+    assert _planned_adds(gcp_emulator_project, contract) == 3
+
+
+def test_emu_bigquery_decimal_parameters_round_trip_rows():
+    """Emulator half: the emitted schema makes a table the emulator stores with each
+    precision and scale, and queries."""
+    from decimal import Decimal
+
+    bq, table, dataset_id, got = _emulator_table(_decimal_contract("unused"), "emu_decimal_rows")
+    assert (got["amount"].field_type, got["amount"].precision, got["amount"].scale) == (
+        "NUMERIC",
+        18,
+        4,
+    )
+    assert (got["wide"].field_type, got["wide"].precision, got["wide"].scale) == (
+        "BIGNUMERIC",
+        40,
+        20,
+    )
+    assert (got["fee"].fields[0].precision, got["fee"].fields[0].scale) == (12, 2)
+
+    errors = bq.insert_rows_json(
+        table, [{"id": "o1", "amount": "12.3456", "wide": "1.5", "fee": {"value": "9.99"}}]
+    )
+    assert errors == []
+    rows = list(
+        bq.query(f"SELECT id, amount, wide, fee.value AS fee FROM `{dataset_id}.orders`").result()
+    )
+    assert [tuple(r.values()) for r in rows] == [
+        ("o1", Decimal("12.3456"), Decimal("1.5"), Decimal("9.99"))
+    ]
 
 
 def test_emu_gcs_sdk_create_read():
