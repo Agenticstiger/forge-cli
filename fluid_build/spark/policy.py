@@ -10,13 +10,12 @@ can, so a contract's own ``properties.sql`` runs only for a build the operator l
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
 from fluid_build._errors import FluidUserError, doc_url
 from fluid_build.spark.compiler import CONTRACT_SQL_ALLOWLIST_ENV
-from fluid_build.streaming.policy import contract_sql_refusal
+from fluid_build.streaming.contract_sql import listed_sql_refusal
 
 
 @dataclass
@@ -39,14 +38,7 @@ def refuse_unless_contract_sql_allowed(
     SQL only, recommended), ``<product>/<build>`` or ``<product>``. An unset list
     allows nothing.
     """
-    props = build.get("properties")
-    if not isinstance(props, Mapping) or props.get("sql") is None:
-        return
-    env = os.environ if environ is None else environ
-    raw = env.get(CONTRACT_SQL_ALLOWLIST_ENV) or ""
-    refusal = contract_sql_refusal(
-        product_id, build, [e.strip() for e in raw.split(",") if e.strip()]
-    )
+    refusal = listed_sql_refusal(CONTRACT_SQL_ALLOWLIST_ENV, product_id, build, environ)
     if refusal is None:
         return
     stale, listed = refusal

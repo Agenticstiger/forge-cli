@@ -259,6 +259,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid validate` stops warning about a Spark or managed Flink build's own SQL once the
+  operator lists it.** The warning that `properties.sql` runs only if the operator lists the
+  build was printed for every build with SQL, whatever `FLUID_SPARK_CONTRACT_SQL_ALLOWLIST`
+  (or `FLUID_FLINK_CONTRACT_SQL_ALLOWLIST`) held, so `fluid validate --strict`, and with it
+  stage 2 of `fluid ship`, failed every Spark SQL batch even after the operator listed it.
+  Validate now asks the rule apply uses, under the same environment: the warning stays while
+  the build is not listed, and says so when the entry listed for it pins other SQL (the SQL
+  changed after review); a build listed by product, by build or pinned to its SQL is quiet.
+
 - **A Spark build runs on EMR on EKS.** EMR on EKS names an image of a release,
   `emr-X.Y.Z-latest` or `emr-X.Y.Z-YYYYMMDD`, and forge sent it the plain `emr-7.12.0` every
   other EMR runtime takes, refusing the suffixed forms everywhere (the 0.7.7 schema, the IaC
