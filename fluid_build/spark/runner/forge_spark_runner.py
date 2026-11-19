@@ -42,6 +42,7 @@ import json
 import os
 import sys
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 
@@ -62,6 +63,8 @@ DEAD_LETTER_SELECT = (
     "`timestamp` AS `kafka_timestamp`",
     "current_timestamp() AS `dead_lettered_at`",
 )
+#: The header a topic dead letter keeps the record's own key in (its key says where it came from).
+RAW_KEY_HEADER = "fluid.dead-letter.raw-key"
 #: Snapshot summary keys that make a dead-letter table append happen once per batch.
 _DL_QUERY_PROPERTY = "fluid.dead-letter.query"
 _DL_BATCH_PROPERTY = "fluid.dead-letter.batch"
@@ -116,6 +119,11 @@ def parse_config(text: str) -> dict:
         raise JobConfigError("a streaming job reads a source and keeps a checkpoint")
     if config["mode"] == "batch" and config.get("source"):
         raise JobConfigError("a batch job runs SQL over catalog tables and reads no topic")
+    per_batch = (config.get("source") or {}).get("maxOffsetsPerTrigger")
+    if per_batch is not None and (
+        isinstance(per_batch, bool) or not isinstance(per_batch, int) or per_batch < 1
+    ):
+        raise JobConfigError("source.maxOffsetsPerTrigger must be a whole number, at least 1")
     _check_sink(config["sink"])
     if config.get("deadLetter") is not None:
         _check_dead_letters(config, config["deadLetter"])
@@ -210,7 +218,13 @@ def kafka_options(source: dict) -> dict:
         "subscribe": source["topic"],
         "startingOffsets": source["startingOffsets"],
         "includeHeaders": "true" if source.get("includeHeaders") else "false",
+        # Offsets the topic no longer holds (retention passed them while the stream was
+        # stopped, or the topic was recreated) fail the stream instead of being skipped.
+        # Spark's default, pinned so the runner never depends on it.
+        "failOnDataLoss": "true",
     }
+    if source.get("maxOffsetsPerTrigger"):
+        options["maxOffsetsPerTrigger"] = str(int(source["maxOffsetsPerTrigger"]))
     if source.get("groupIdPrefix"):
         options["groupIdPrefix"] = source["groupIdPrefix"]
     if source["auth"] == "msk-iam":
@@ -603,8 +617,13 @@ class DeadLetters:
         )
 
     def to_topic(self, batch) -> None:
-        """Send the batch, at least once, with Kafka Connect's error-context headers."""
-        from pyspark.sql.functions import array, col, lit, struct, when
+        """Send the batch, at least once, with Kafka Connect's error-context headers.
+
+        Each dead letter is keyed by where it came from, ``<topic>-<partition>@<offset>``, and
+        keeps its own key in the ``fluid.dead-letter.raw-key`` header: a batch sent again
+        after a failure (the Kafka sink is not transactional) carries the same keys, so a
+        consumer drops repeats by key, and a compacted topic keeps one of each."""
+        from pyspark.sql.functions import array, col, format_string, lit, struct, when
 
         def header(name, value):
             return struct(
@@ -624,13 +643,17 @@ class DeadLetters:
             header("__connect.errors.connector.name", lit(connector)),
             header("__connect.errors.stage", stage),
             header("__connect.errors.exception.message", col("error")),
+            struct(lit(RAW_KEY_HEADER).alias("key"), col("raw_key").alias("value")),
+        )
+        source = format_string(
+            "%s-%d@%d", col("kafka_topic"), col("kafka_partition"), col("kafka_offset")
         )
         options = {
             k: v for k, v in kafka_options(self.config["source"]).items() if k.startswith("kafka.")
         }
         (
             batch.select(
-                col("raw_key").alias("key"),
+                source.cast("binary").alias("key"),
                 col("raw_value").alias("value"),
                 headers.alias("headers"),
             )
@@ -807,13 +830,67 @@ def main(argv: list[str] | None = None) -> int:
         description="Run one forge Spark job config.", allow_abbrev=False
     )
     parser.add_argument("--config", required=True, help="the job.json, a path or s3:// URI")
+    parser.add_argument(
+        "--fluid-job-sha256", help="the sha256 of the job config fluid apply started the run on"
+    )
     # Glue passes its own --JOB_NAME and friends; they are not this runner's.
     args, _ = parser.parse_known_args(argv)
     from pyspark.sql import SparkSession
 
     spark = SparkSession.builder.getOrCreate()
-    run(spark, parse_config(read_text(spark, args.config)))
+    text = checked_text(read_text(spark, args.config), args.fluid_job_sha256, args.config)
+    run(spark, parse_config(text))
     return 0
+
+
+def checked_text(text: str, expected: str | None, where: str) -> str:
+    """The job config's text, refused before the job reads anything unless it is the one
+    ``fluid apply`` started the run on (``--fluid-job-sha256``, which every runtime passes;
+    :func:`config_digest`): a config another apply put there since would run under this
+    run's hash."""
+    if expected is None:
+        return text
+    try:
+        found = config_digest(text)
+    except ValueError:
+        raise JobConfigError(f"the job config at {where} is not a JSON object") from None
+    if found != expected.lower():
+        raise JobConfigError(
+            f"the job config at {where} is not the one fluid apply started this run on (its "
+            f"digest is {found}; the run's is {expected}); nothing was read. Run fluid apply "
+            "again: it starts a run on the config it uploads"
+        )
+    return text
+
+
+def config_digest(text: str) -> str:
+    """The sha256 a run's job config is started with (``--fluid-job-sha256``) and checked
+    by: its JSON in one canonical form (keys sorted, strings in NFC, as OpenTofu writes
+    them), the MSK brokers OpenTofu fills in for an ``mskClusterArn`` source left out, so a
+    broker list MSK changes does not stop a stream's retries. The same function is in
+    ``fluid_build/build_runners/spark/_desired.py``.
+
+    Raises:
+        ValueError: the text is not a JSON object.
+    """
+    config = _nfc(json.loads(text))
+    if not isinstance(config, dict):
+        raise ValueError("the job config is not a JSON object")
+    source = config.get("source")
+    if isinstance(source, dict) and source.get("mskClusterArn"):
+        source["bootstrapServers"] = None
+    canonical = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _nfc(value):
+    if isinstance(value, str):
+        return unicodedata.normalize("NFC", value)
+    if isinstance(value, list):
+        return [_nfc(v) for v in value]
+    if isinstance(value, dict):
+        return {_nfc(k): _nfc(v) for k, v in value.items()}
+    return value
 
 
 if __name__ == "__main__":
