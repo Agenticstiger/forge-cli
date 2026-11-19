@@ -306,7 +306,7 @@ def _not_as_deployed(
     other = [a for a in stale if a.config_hash != run.config_hash]
     if other:
         return (
-            f"run {other[0].run_id} of another config ({(other[0].config_hash or '?')[:12]}) "
+            f"run {other[0].run_id} of another config ({_clean(other[0].config_hash)[:12] or '?'}) "
             f"is going, and the contract compiles to {run.config_hash[:12]}. {apply_hint}, "
             "which replaces it on the same checkpoint"
         )
@@ -328,7 +328,7 @@ def _not_as_deployed(
         )
     if last is not None and last.config_hash != run.config_hash:
         return (
-            f"the last run {last.run_id} ran config {(last.config_hash or '?')[:12]}, and the "
+            f"the last run {last.run_id} ran config {_clean(last.config_hash)[:12] or '?'}, and the "
             f"contract compiles to {run.config_hash[:12]}. {apply_hint} to start the new config"
         )
     return None
