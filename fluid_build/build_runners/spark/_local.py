@@ -484,15 +484,20 @@ def _replace(path: Path, body: bytes) -> None:
 def _put_s3(files: Any, env: Mapping[str, str]) -> None:
     """Upload with boto3 (the ``[aws]`` extra): its own endpoint settings
     (``AWS_ENDPOINT_URL_S3``, ``AWS_ENDPOINT_URL``) reach SeaweedFS or MinIO, which want
-    path-style requests, and ignore the region the SDK insists on."""
+    path-style requests, and ignore the region the SDK insists on. The client is the Spark
+    adapters' (``_adapters.default_clients``), so boto3 stays their one lazy import
+    (``.importlinter-external``)."""
+    missing = (
+        f"{LOCAL_ROOT_ENV} is an s3:// root, and uploading to it needs boto3: "
+        "pip install 'data-product-forge[aws]'"
+    )
     try:
-        import boto3
         from botocore.config import Config
     except ImportError as exc:
-        raise SparkRunError(
-            f"{LOCAL_ROOT_ENV} is an s3:// root, and uploading to it needs boto3: "
-            "pip install 'data-product-forge[aws]'"
-        ) from exc
+        raise SparkRunError(missing) from exc
+
+    from fluid_build.build_runners.spark import _adapters
+
     custom = any(env.get(v) for v in ("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"))
     region = env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or "us-east-1"
     # Bounded: an endpoint that is down fails the apply in seconds, not after botocore's
@@ -504,7 +509,9 @@ def _put_s3(files: Any, env: Mapping[str, str]) -> None:
         **({"s3": {"addressing_style": "path"}} if custom else {}),
     )
     try:
-        client = boto3.client("s3", region_name=region, config=config)
+        client = _adapters.default_clients("s3", region, config=config)
+    except SparkRunError as exc:  # boto3 itself is missing
+        raise SparkRunError(missing) from exc
     except Exception as exc:  # noqa: BLE001 - botocore's errors; named, then raised
         raise SparkRunError(
             f"{LOCAL_ROOT_ENV} is an s3:// root, and no S3 client could be made for it: "
