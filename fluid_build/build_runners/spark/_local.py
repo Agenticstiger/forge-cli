@@ -235,9 +235,13 @@ def _executable(env: Mapping[str, str], workspace: Path) -> str:
 
 
 def _outside(executable: str, workspace: Path) -> str:
-    """``executable`` unless it resolves inside the project, links followed."""
-    resolved, project = Path(executable).resolve(), Path(workspace).resolve()
-    if resolved == project or project in resolved.parents:
+    """``executable`` unless it is inside the project: its path as named, or as resolved
+    with links followed. A link the project holds (``proj/bin/spark-submit -> /bin/sh``)
+    is the project's choice, wherever it points."""
+    named, project = Path(executable).absolute(), Path(workspace).resolve()
+    resolved = named.resolve()
+    through = any(p.resolve() == project for p in (named, *named.parents))
+    if through or resolved == project or project in resolved.parents:
         raise SparkRunError(
             f"the spark-submit to run ({executable}) is inside the project ({project}), "
             f"which would choose the program forge starts; set {SUBMIT_EXECUTABLE_ENV} to "
