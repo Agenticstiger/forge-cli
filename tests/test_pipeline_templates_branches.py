@@ -239,7 +239,14 @@ class TestGitlabOidcCredentialHygiene:
         """Smoke test: with no cloud bound, none of the credential-file
         plumbing appears in the output."""
         yaml_out = self._generate_gitlab_yaml(cloud_auth=())
-        assert "mktemp" not in yaml_out
+        # fluid-impact makes a temporary directory for the merge request's
+        # base, not for a credential: every other job must make none.
+        import yaml
+
+        _header, body = yaml.safe_load_all(yaml_out)
+        for name, job in body.items():
+            if isinstance(job, dict) and "script" in job and name != "fluid-impact":
+                assert "mktemp" not in str(job), name
         assert "id_tokens" not in yaml_out
         assert "OIDC_TOKEN" not in yaml_out
 

@@ -35,6 +35,9 @@ ignore_imports =
     # try/except ImportError, and runs only once an AWS code path is taken.
     fluid_build.secrets._aws_sm -> boto3
     fluid_build.iac.providers.aws -> boto3
+    # iac/target_identity.py: aws_caller_account imports boto3 inside the function
+    # (try/except ImportError), only when a saved plan's AWS account is read.
+    fluid_build.iac.target_identity -> boto3
     fluid_build.credentials.adapters -> boto3
     # providers/aws: the three modules below import boto3 inside functions
     # (try/except ImportError); listed one by one so a new eager import

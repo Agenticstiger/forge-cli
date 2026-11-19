@@ -185,6 +185,8 @@ class TestSavedPlanUnreadable:
         import logging
 
         monkeypatch.setattr(runner, "tofu_show_plan", lambda *a, **k: None)
+        # The target check runs first and is pinned in test_iac_tofu_saved_plan.py.
+        monkeypatch.setattr(engine, "_refuse_another_target", lambda *a, **k: None)
         eng = engine._Engine(
             contract=dict(CONTRACT),
             provider="aws",
