@@ -33,6 +33,8 @@ from fluid_build.build_runners import _masking as m  # noqa: E402
 from fluid_build.build_runners._lineage import BufferedLineageEmitter, encode_event  # noqa: E402
 from fluid_build.build_runners.duckdb.runner import execute_duckdb_build  # noqa: E402
 
+from . import _duckdb_moto  # noqa: E402
+
 pytestmark = pytest.mark.unit
 
 PRODUCT = "bronze.subs"
@@ -484,48 +486,9 @@ def test_an_s3_destination_gets_the_same_treated_rows(tmp_path, monkeypatch):
     assert record["facets"]["landed"]["destinations"] == {"subs": S3_OBJECT}
 
 
-def _httpfs_available() -> bool:
-    con = duckdb.connect()
-    try:
-        con.execute("INSTALL httpfs")
-        con.execute("LOAD httpfs")
-        return True
-    except Exception:  # noqa: BLE001 — offline, or no extension repository
-        return False
-    finally:
-        con.close()
-
-
 @pytest.fixture
 def moto_s3(monkeypatch):
-    try:
-        import boto3
-        from moto.server import ThreadedMotoServer
-    except Exception:  # noqa: BLE001 — the test-emulators extra is absent
-        pytest.skip("needs moto[server] and boto3 (pip install -e '.[test-emulators]')")
-    if not _httpfs_available():
-        pytest.skip("DuckDB's httpfs extension cannot be installed here")
-    for var in ("AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("AWS_CONFIG_FILE", "/dev/null")
-    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", "/dev/null")
-    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
-    server = ThreadedMotoServer(port=0, verbose=False)
-    server.start()
-    try:
-        _, port = server.get_host_and_port()
-        endpoint = f"127.0.0.1:{port}"
-        s3 = boto3.client(
-            "s3",
-            endpoint_url=f"http://{endpoint}",
-            region_name="us-east-1",
-            aws_access_key_id="testing",
-            aws_secret_access_key="testing",  # pragma: allowlist secret — moto dummy
-        )
-        s3.create_bucket(Bucket="northwind-demo-lake")
-        yield endpoint, s3
-    finally:
-        server.stop()
+    yield from _duckdb_moto.moto_s3(monkeypatch, "northwind-demo-lake")
 
 
 @pytest.mark.emulated
@@ -533,16 +496,11 @@ def test_the_object_written_to_s3_holds_treated_values(tmp_path, moto_s3):
     endpoint, s3 = moto_s3
     binding = json.loads(json.dumps(AWS_BINDING))
     binding["location"]["region"] = "us-east-1"
-    moto_secret = {
-        "endpoint": endpoint,
-        "url_style": "path",
-        "use_ssl": False,
-        "region": "us-east-1",
-        "key_id": "testing",
-        "secret": "testing",  # pragma: allowlist secret — moto dummy
-    }
     contract = _contract(
-        tmp_path, DEFAULT_RULES, binding=binding, connection_extra={"s3": moto_secret}
+        tmp_path,
+        DEFAULT_RULES,
+        binding=binding,
+        connection_extra={"s3": _duckdb_moto.duckdb_secret(endpoint)},
     )
 
     rc, record = _run(tmp_path, contract)
