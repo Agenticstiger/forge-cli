@@ -24,6 +24,12 @@ rendering is exact where FLUID SQL/1 and the engine agree:
 - ``DAYS_BETWEEN`` is each engine's day difference; ``MONTHS_BETWEEN`` and
   ``YEARS_BETWEEN`` are DuckDB's ``date_sub`` (whole units) and elsewhere the
   ``EXTRACT`` form of §2.8, never an engine's ``DATEDIFF`` (unit boundaries crossed);
+- ``ADD_DAYS``, ``ADD_MONTHS`` and ``ADD_YEARS`` are the engine's date plus a count of
+  days, months or years, which clamps to a shorter month's last day (Snowflake's own
+  ``ADD_MONTHS`` keeps month ends, so it is ``DATEADD``). The count is first made NULL when
+  the result would leave 0001-01-01..9999-12-31 (an inner ``CASE`` that only selects), so
+  the engine never adds a count that overflows, even when it evaluates ``CASE`` branches
+  eagerly or the count is far beyond its integer type;
 - a string compared with ``<``, ``<=``, ``>`` or ``>=`` gets ``COLLATE "C"`` on
   PostgreSQL, so text orders by code point as in the other engines.
 
@@ -287,6 +293,8 @@ class _Renderer:
             return self.round(node)
         if isinstance(node, n.DateDiff):
             return self.date_diff(node)
+        if isinstance(node, n.DateAdd):
+            return self.date_add(node)
         raise TypeError(f"not a FLUID SQL/1 node: {node!r}")  # pragma: no cover
 
     def branches(self, node: n.Node, values: List[n.Node]) -> List[str]:
@@ -340,17 +348,21 @@ class _Renderer:
 
     # -- date differences --------------------------------------------------------------
 
+    def days(self, a: str, b: str) -> str:
+        """The whole days from ``a`` to ``b`` (both rendered dates)."""
+        return {
+            "duckdb": f"date_sub('day', {a}, {b})",
+            "snowflake": f"DATEDIFF(day, {a}, {b})",
+            "bigquery": f"DATE_DIFF({b}, {a}, DAY)",
+            "databricks": f"datediff({b}, {a})",
+            "postgres": f"({b} - {a})",
+            "athena": f"date_diff('day', {a}, {b})",
+        }[self.dialect]
+
     def date_diff(self, node: n.DateDiff) -> str:
         a, b = self.value(node.from_), self.value(node.to)
         if node.unit == "day":
-            return {
-                "duckdb": f"date_sub('day', {a}, {b})",
-                "snowflake": f"DATEDIFF(day, {a}, {b})",
-                "bigquery": f"DATE_DIFF({b}, {a}, DAY)",
-                "databricks": f"datediff({b}, {a})",
-                "postgres": f"({b} - {a})",
-                "athena": f"date_diff('day', {a}, {b})",
-            }[self.dialect]
+            return self.days(a, b)
         if self.whole_units:
             return f"date_sub('{node.unit}', {a}, {b})"
         months = self.whole_months
@@ -390,3 +402,53 @@ class _Renderer:
             "postgres": f"DIV({months}, 12)",
             "athena": f"({months} / 12)",
         }[self.dialect]
+
+    # -- date additions ----------------------------------------------------------------
+
+    def date_add(self, node: n.DateAdd) -> str:
+        d, k = self.value(node.date), self.value(node.count)
+        guard = self.in_range(node.unit, d, k)
+        # Trino adds a BIGINT, and coerces no DECIMAL count (a decimal(10,0) column) to one.
+        cast = {"bigquery": "INT64", "databricks": "INT", "athena": "BIGINT"}.get(
+            self.dialect, "INTEGER"
+        )
+        whole = f"CAST({guard} AS {cast})"
+        unit = node.unit
+        if self.dialect == "duckdb":
+            if unit == "day":
+                return f"({d} + {whole})"
+            return f"CAST({d} + to_{unit}s({whole}) AS DATE)"
+        if self.dialect == "postgres":
+            if unit == "day":
+                return f"({d} + {whole})"
+            return f"CAST({d} + {whole} * INTERVAL '1 {unit}' AS DATE)"
+        if self.dialect == "snowflake":
+            return f"DATEADD({unit}, {guard}, {d})"
+        if self.dialect == "bigquery":
+            return f"DATE_ADD({d}, INTERVAL {whole} {unit.upper()})"
+        if self.dialect == "databricks":
+            if unit == "day":
+                return f"date_add({d}, {whole})"
+            return f"add_months({d}, {whole}{' * 12' if unit == 'year' else ''})"
+        if unit == "day":  # athena (Trino)
+            return f"date_add('day', {whole}, {d})"
+        return f"({d} + {whole} * INTERVAL '1' {unit.upper()})"
+
+    def in_range(self, unit: str, d: str, k: str) -> str:
+        """``k``, or NULL when ``d`` moved by ``k`` units leaves 0001-01-01..9999-12-31.
+
+        Each bound is compared with ``k`` alone, never with a sum: ``k`` may be far beyond
+        any integer type, and a sum would overflow before the comparison."""
+        year = f"EXTRACT(YEAR FROM {d})"
+        if unit == "day":
+            low = self.days(d, self.date_literal("0001-01-01"))
+            high = self.days(d, self.date_literal("9999-12-31"))
+        elif unit == "month":
+            index = f"({year} * 12 + EXTRACT(MONTH FROM {d}) - 1)"
+            low, high = f"(12 - {index})", f"(119999 - {index})"
+        else:
+            low, high = f"(1 - {year})", f"(9999 - {year})"
+        return f"(CASE WHEN {k} BETWEEN {low} AND {high} THEN {k} END)"
+
+    def date_literal(self, text: str) -> str:
+        return f"DATE {sql_literal(self.dialect, text)}"

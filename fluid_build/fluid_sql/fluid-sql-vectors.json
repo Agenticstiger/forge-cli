@@ -1,5 +1,5 @@
 {
- "vectorsVersion": "1.0.0",
+ "vectorsVersion": "1.1.0",
  "language": "FLUID SQL/1",
  "description": "FLUID SQL/1 conformance vectors (forge-cli RFC-data-rules.md section 2.9). They define the language: every implementation (forge-cli's validator, flux-expr/2) parses, checks and evaluates every vector and reaches its verdict, tree, canonical text, type, scale and values. Each vector names a model, one expose: models[name] = {columns: {name: {type, enum?, placeholders?: {values?, prefixes?}}}, relationships?: {name: {to: <model>}}, validityWindow?: true}, where type is the FLUID column type as a contract writes it and validityWindow says the expose declares a validity window, so no path may reach it through a relationship. A vector also names a site: predicate (check, when, aggregate.filter: the text must be a bool, and a NULL result counts as FALSE) or value (expr). With derive, the text is the expr of a derive on that column and must fit it. A refused vector gives one reason from reasonCodes and has exactly one defect. An accepted vector gives its tree (one node per construct; see nodes), its canonical text, its type and, for a number, its static scale (an integer, or unbounded), and eval cases: a row (column -> value), the links (relationship -> the row it reaches, or null for none; a relationship left out reaches none) and the result. A column left out of a row is NULL.",
  "encoding": "No JSON number appears anywhere in this file: numbers, scales and limits are strings. A number is a decimal string; a result of static scale s is written with exactly s digits after the point, and one of unbounded scale as its shortest decimal, or as p/q in lowest terms when no decimal is exact (1/3). Compare numbers by value. A bool is true or false, a string is itself (compared by code points, never normalized), a date is YYYY-MM-DD, a timestamp is ISO 8601 without an offset, a timestamp with time zone ISO 8601 with one (compare instants), and NULL is null. A float column's value is the shortest decimal that converts back to the double.",
@@ -27,7 +27,10 @@
   "COALESCE",
   "DAYS_BETWEEN",
   "MONTHS_BETWEEN",
-  "YEARS_BETWEEN"
+  "YEARS_BETWEEN",
+  "ADD_DAYS",
+  "ADD_MONTHS",
+  "ADD_YEARS"
  ],
  "limits": {
   "maxCodePoints": "4096",
@@ -48,7 +51,7 @@
   "validity-window": "a path through a relationship whose target declares a validity window",
   "untyped-column": "a column whose type has no FLUID SQL/1 type",
   "type-mismatch": "operands or arguments of the wrong type, or a predicate position given something other than a bool",
-  "null-literal": "the NULL literal where nothing gives it a type: an IN item, an operand of a comparison or BETWEEN, or every operand of a construct",
+  "null-literal": "the NULL literal where nothing gives it a type: an IN item, an operand of a comparison or BETWEEN, an argument of a date move, or every operand of a construct",
   "enum-literal": "a string literal compared with a column whose enum does not list it",
   "derive-target": "a derive target with no FLUID SQL/1 type, a float, or a number without a declared scale",
   "derive-type": "a derived value whose type differs from its target's",
@@ -74,7 +77,8 @@
   "case": "whens: [{when, then}], else when written",
   "coalesce": "args",
   "round": "arg, scale (its digits, a string), mode (HALF_AWAY_FROM_ZERO when none is written, or HALF_TO_EVEN)",
-  "date_diff": "unit (day, month, year), from, to"
+  "date_diff": "unit (day, month, year), from, to",
+  "date_add": "unit (day, month, year), date, count"
  },
  "models": {
   "invoices": {
@@ -190,6 +194,9 @@
     },
     "too_wide": {
      "type": "decimal(1001, 2)"
+    },
+    "add_days": {
+     "type": "int"
     }
    },
    "relationships": {
@@ -5718,6 +5725,1528 @@
       "result": "-1"
      }
     ]
+   }
+  },
+  {
+   "id": "add-months-jan31-common-year",
+   "text": "ADD_MONTHS(DATE '2001-01-31', 1)",
+   "site": "value",
+   "model": "invoices",
+   "note": "EXPR-SPEC-3: the day is clamped to the target month's last day",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "month",
+     "date": {
+      "node": "date",
+      "value": "2001-01-31"
+     },
+     "count": {
+      "node": "number",
+      "value": "1"
+     }
+    },
+    "canonical": "ADD_MONTHS(DATE '2001-01-31', 1)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": "2001-02-28"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-months-jan31-leap-year",
+   "text": "ADD_MONTHS(DATE '2004-01-31', 1)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "month",
+     "date": {
+      "node": "date",
+      "value": "2004-01-31"
+     },
+     "count": {
+      "node": "number",
+      "value": "1"
+     }
+    },
+    "canonical": "ADD_MONTHS(DATE '2004-01-31', 1)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": "2004-02-29"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-months-feb28-keeps-the-day",
+   "text": "ADD_MONTHS(DATE '2001-02-28', 1)",
+   "site": "value",
+   "model": "invoices",
+   "note": "no month-end preservation: the 28th stays the 28th",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "month",
+     "date": {
+      "node": "date",
+      "value": "2001-02-28"
+     },
+     "count": {
+      "node": "number",
+      "value": "1"
+     }
+    },
+    "canonical": "ADD_MONTHS(DATE '2001-02-28', 1)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": "2001-03-28"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-months-mar31-back-one",
+   "text": "ADD_MONTHS(DATE '2001-03-31', -1)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "month",
+     "date": {
+      "node": "date",
+      "value": "2001-03-31"
+     },
+     "count": {
+      "node": "neg",
+      "operand": {
+       "node": "number",
+       "value": "1"
+      }
+     }
+    },
+    "canonical": "ADD_MONTHS(DATE '2001-03-31', -1)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": "2001-02-28"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-months-apr30-forward-one",
+   "text": "ADD_MONTHS(DATE '2001-04-30', 1)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "month",
+     "date": {
+      "node": "date",
+      "value": "2001-04-30"
+     },
+     "count": {
+      "node": "number",
+      "value": "1"
+     }
+    },
+    "canonical": "ADD_MONTHS(DATE '2001-04-30', 1)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": "2001-05-30"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-months-thirteen",
+   "text": "ADD_MONTHS(DATE '2000-01-31', 13)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "month",
+     "date": {
+      "node": "date",
+      "value": "2000-01-31"
+     },
+     "count": {
+      "node": "number",
+      "value": "13"
+     }
+    },
+    "canonical": "ADD_MONTHS(DATE '2000-01-31', 13)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": "2001-02-28"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-months-count-column",
+   "text": "ADD_MONTHS(issue_date, lines)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "month",
+     "date": {
+      "node": "column",
+      "name": "issue_date"
+     },
+     "count": {
+      "node": "column",
+      "name": "lines"
+     }
+    },
+    "canonical": "ADD_MONTHS(issue_date, lines)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {
+       "issue_date": "2026-01-31",
+       "lines": "1"
+      },
+      "result": "2026-02-28"
+     },
+     {
+      "row": {
+       "issue_date": "2026-01-31",
+       "lines": "0"
+      },
+      "result": "2026-01-31"
+     },
+     {
+      "row": {
+       "issue_date": "2026-01-31",
+       "lines": "-2"
+      },
+      "result": "2025-11-30"
+     },
+     {
+      "row": {
+       "issue_date": "2026-01-31",
+       "lines": "12"
+      },
+      "result": "2027-01-31"
+     },
+     {
+      "row": {
+       "issue_date": "2026-01-31",
+       "lines": "-13"
+      },
+      "result": "2024-12-31"
+     },
+     {
+      "row": {
+       "issue_date": "2026-01-31"
+      },
+      "result": null
+     },
+     {
+      "row": {
+       "lines": "1"
+      },
+      "result": null
+     },
+     {
+      "row": {},
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-years-feb29",
+   "text": "ADD_YEARS(issue_date, lines)",
+   "site": "value",
+   "model": "invoices",
+   "note": "ADD_YEARS(d, n) is ADD_MONTHS(d, 12 * n); 2100 is not a leap year, 2400 is",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "year",
+     "date": {
+      "node": "column",
+      "name": "issue_date"
+     },
+     "count": {
+      "node": "column",
+      "name": "lines"
+     }
+    },
+    "canonical": "ADD_YEARS(issue_date, lines)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {
+       "issue_date": "2000-02-29",
+       "lines": "-1"
+      },
+      "result": "1999-02-28"
+     },
+     {
+      "row": {
+       "issue_date": "2000-02-29",
+       "lines": "1"
+      },
+      "result": "2001-02-28"
+     },
+     {
+      "row": {
+       "issue_date": "2000-02-29",
+       "lines": "4"
+      },
+      "result": "2004-02-29"
+     },
+     {
+      "row": {
+       "issue_date": "2000-02-29",
+       "lines": "100"
+      },
+      "result": "2100-02-28"
+     },
+     {
+      "row": {
+       "issue_date": "2000-02-29",
+       "lines": "400"
+      },
+      "result": "2400-02-29"
+     },
+     {
+      "row": {
+       "issue_date": "2000-02-29",
+       "lines": "0"
+      },
+      "result": "2000-02-29"
+     },
+     {
+      "row": {
+       "issue_date": "2000-02-29",
+       "lines": null
+      },
+      "result": null
+     },
+     {
+      "row": {
+       "issue_date": null,
+       "lines": "1"
+      },
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-month-ends",
+   "text": "ADD_DAYS(issue_date, days_late)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "day",
+     "date": {
+      "node": "column",
+      "name": "issue_date"
+     },
+     "count": {
+      "node": "column",
+      "name": "days_late"
+     }
+    },
+    "canonical": "ADD_DAYS(issue_date, days_late)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {
+       "issue_date": "2026-01-31",
+       "days_late": "30"
+      },
+      "result": "2026-03-02"
+     },
+     {
+      "row": {
+       "issue_date": "2026-03-01",
+       "days_late": "-1"
+      },
+      "result": "2026-02-28"
+     },
+     {
+      "row": {
+       "issue_date": "2024-03-01",
+       "days_late": "-1"
+      },
+      "result": "2024-02-29"
+     },
+     {
+      "row": {
+       "issue_date": "2026-12-31",
+       "days_late": "1"
+      },
+      "result": "2027-01-01"
+     },
+     {
+      "row": {
+       "issue_date": "2026-11-16",
+       "days_late": "0"
+      },
+      "result": "2026-11-16"
+     },
+     {
+      "row": {
+       "issue_date": "2026-11-16",
+       "days_late": null
+      },
+      "result": null
+     },
+     {
+      "row": {
+       "issue_date": null,
+       "days_late": "5"
+      },
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-last-day-in-range",
+   "text": "ADD_DAYS(DATE '2000-01-01', 2921939)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "day",
+     "date": {
+      "node": "date",
+      "value": "2000-01-01"
+     },
+     "count": {
+      "node": "number",
+      "value": "2921939"
+     }
+    },
+    "canonical": "ADD_DAYS(DATE '2000-01-01', 2921939)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": "9999-12-31"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-one-past-the-last-day",
+   "text": "ADD_DAYS(DATE '2000-01-01', 2921940)",
+   "site": "value",
+   "model": "invoices",
+   "note": "a result past 9999-12-31 is NULL, never an error",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "day",
+     "date": {
+      "node": "date",
+      "value": "2000-01-01"
+     },
+     "count": {
+      "node": "number",
+      "value": "2921940"
+     }
+    },
+    "canonical": "ADD_DAYS(DATE '2000-01-01', 2921940)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-first-day-in-range",
+   "text": "ADD_DAYS(DATE '2000-01-01', -730119)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "day",
+     "date": {
+      "node": "date",
+      "value": "2000-01-01"
+     },
+     "count": {
+      "node": "neg",
+      "operand": {
+       "node": "number",
+       "value": "730119"
+      }
+     }
+    },
+    "canonical": "ADD_DAYS(DATE '2000-01-01', -730119)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": "0001-01-01"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-before-the-first-day",
+   "text": "ADD_DAYS(DATE '2000-01-01', -730120)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "day",
+     "date": {
+      "node": "date",
+      "value": "2000-01-01"
+     },
+     "count": {
+      "node": "neg",
+      "operand": {
+       "node": "number",
+       "value": "730120"
+      }
+     }
+    },
+    "canonical": "ADD_DAYS(DATE '2000-01-01', -730120)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-huge-count",
+   "text": "ADD_DAYS(issue_date, 1000000000000000000000000000000)",
+   "site": "value",
+   "model": "invoices",
+   "note": "any count, however large, gives NULL when the result leaves the range",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "day",
+     "date": {
+      "node": "column",
+      "name": "issue_date"
+     },
+     "count": {
+      "node": "number",
+      "value": "1000000000000000000000000000000"
+     }
+    },
+    "canonical": "ADD_DAYS(issue_date, 1000000000000000000000000000000)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {
+       "issue_date": "2026-11-16"
+      },
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-huge-negative-count",
+   "text": "ADD_DAYS(issue_date, -1000000000000000000000000000000)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "day",
+     "date": {
+      "node": "column",
+      "name": "issue_date"
+     },
+     "count": {
+      "node": "neg",
+      "operand": {
+       "node": "number",
+       "value": "1000000000000000000000000000000"
+      }
+     }
+    },
+    "canonical": "ADD_DAYS(issue_date, -1000000000000000000000000000000)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {
+       "issue_date": "2026-11-16"
+      },
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-months-last-month-in-range",
+   "text": "ADD_MONTHS(DATE '9999-11-30', 1)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "month",
+     "date": {
+      "node": "date",
+      "value": "9999-11-30"
+     },
+     "count": {
+      "node": "number",
+      "value": "1"
+     }
+    },
+    "canonical": "ADD_MONTHS(DATE '9999-11-30', 1)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": "9999-12-30"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-months-past-9999",
+   "text": "ADD_MONTHS(DATE '9999-12-31', 1)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "month",
+     "date": {
+      "node": "date",
+      "value": "9999-12-31"
+     },
+     "count": {
+      "node": "number",
+      "value": "1"
+     }
+    },
+    "canonical": "ADD_MONTHS(DATE '9999-12-31', 1)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-months-back-from-9999",
+   "text": "ADD_MONTHS(DATE '9999-12-31', -1)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "month",
+     "date": {
+      "node": "date",
+      "value": "9999-12-31"
+     },
+     "count": {
+      "node": "neg",
+      "operand": {
+       "node": "number",
+       "value": "1"
+      }
+     }
+    },
+    "canonical": "ADD_MONTHS(DATE '9999-12-31', -1)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": "9999-11-30"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-months-before-year-one",
+   "text": "ADD_MONTHS(DATE '0001-01-01', -1)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "month",
+     "date": {
+      "node": "date",
+      "value": "0001-01-01"
+     },
+     "count": {
+      "node": "neg",
+      "operand": {
+       "node": "number",
+       "value": "1"
+      }
+     }
+    },
+    "canonical": "ADD_MONTHS(DATE '0001-01-01', -1)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-months-first-month-in-range",
+   "text": "ADD_MONTHS(DATE '0001-12-31', -11)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "month",
+     "date": {
+      "node": "date",
+      "value": "0001-12-31"
+     },
+     "count": {
+      "node": "neg",
+      "operand": {
+       "node": "number",
+       "value": "11"
+      }
+     }
+    },
+    "canonical": "ADD_MONTHS(DATE '0001-12-31', -11)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": "0001-01-31"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-months-huge-count",
+   "text": "ADD_MONTHS(issue_date, 1000000000000000000000000000000)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "month",
+     "date": {
+      "node": "column",
+      "name": "issue_date"
+     },
+     "count": {
+      "node": "number",
+      "value": "1000000000000000000000000000000"
+     }
+    },
+    "canonical": "ADD_MONTHS(issue_date, 1000000000000000000000000000000)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {
+       "issue_date": "2026-11-16"
+      },
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-years-past-9999",
+   "text": "ADD_YEARS(DATE '9999-12-31', 1)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "year",
+     "date": {
+      "node": "date",
+      "value": "9999-12-31"
+     },
+     "count": {
+      "node": "number",
+      "value": "1"
+     }
+    },
+    "canonical": "ADD_YEARS(DATE '9999-12-31', 1)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-years-to-9999",
+   "text": "ADD_YEARS(DATE '0001-01-01', 9998)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "year",
+     "date": {
+      "node": "date",
+      "value": "0001-01-01"
+     },
+     "count": {
+      "node": "number",
+      "value": "9998"
+     }
+    },
+    "canonical": "ADD_YEARS(DATE '0001-01-01', 9998)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": "9999-01-01"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-years-before-year-one",
+   "text": "ADD_YEARS(DATE '0001-01-01', -1)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "year",
+     "date": {
+      "node": "date",
+      "value": "0001-01-01"
+     },
+     "count": {
+      "node": "neg",
+      "operand": {
+       "node": "number",
+       "value": "1"
+      }
+     }
+    },
+    "canonical": "ADD_YEARS(DATE '0001-01-01', -1)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {},
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-years-huge-count",
+   "text": "ADD_YEARS(issue_date, -1000000000000000000000000000000)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "year",
+     "date": {
+      "node": "column",
+      "name": "issue_date"
+     },
+     "count": {
+      "node": "neg",
+      "operand": {
+       "node": "number",
+       "value": "1000000000000000000000000000000"
+      }
+     }
+    },
+    "canonical": "ADD_YEARS(issue_date, -1000000000000000000000000000000)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {
+       "issue_date": "2026-11-16"
+      },
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-rounded-count",
+   "text": "ADD_DAYS(issue_date, ROUND(net, 0))",
+   "site": "value",
+   "model": "invoices",
+   "note": "ROUND(x, 0) has scale 0, so it is a count",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "day",
+     "date": {
+      "node": "column",
+      "name": "issue_date"
+     },
+     "count": {
+      "node": "round",
+      "arg": {
+       "node": "column",
+       "name": "net"
+      },
+      "scale": "0",
+      "mode": "HALF_AWAY_FROM_ZERO"
+     }
+    },
+    "canonical": "ADD_DAYS(issue_date, ROUND(net, 0))",
+    "type": "date",
+    "eval": [
+     {
+      "row": {
+       "issue_date": "2026-11-16",
+       "net": "10.50"
+      },
+      "result": "2026-11-27"
+     },
+     {
+      "row": {
+       "issue_date": "2026-11-16",
+       "net": "10.49"
+      },
+      "result": "2026-11-26"
+     },
+     {
+      "row": {
+       "issue_date": "2026-11-16",
+       "net": null
+      },
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-counted-by-a-difference",
+   "text": "ADD_DAYS(issue_date, DAYS_BETWEEN(issue_date, due_date))",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "day",
+     "date": {
+      "node": "column",
+      "name": "issue_date"
+     },
+     "count": {
+      "node": "date_diff",
+      "unit": "day",
+      "from": {
+       "node": "column",
+       "name": "issue_date"
+      },
+      "to": {
+       "node": "column",
+       "name": "due_date"
+      }
+     }
+    },
+    "canonical": "ADD_DAYS(issue_date, DAYS_BETWEEN(issue_date, due_date))",
+    "type": "date",
+    "eval": [
+     {
+      "row": {
+       "issue_date": "2026-11-01",
+       "due_date": "2026-11-30"
+      },
+      "result": "2026-11-30"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-count-arithmetic",
+   "text": "ADD_DAYS(issue_date, lines * 2 - 1)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "day",
+     "date": {
+      "node": "column",
+      "name": "issue_date"
+     },
+     "count": {
+      "node": "arith",
+      "op": "-",
+      "left": {
+       "node": "arith",
+       "op": "*",
+       "left": {
+        "node": "column",
+        "name": "lines"
+       },
+       "right": {
+        "node": "number",
+        "value": "2"
+       }
+      },
+      "right": {
+       "node": "number",
+       "value": "1"
+      }
+     }
+    },
+    "canonical": "ADD_DAYS(issue_date, lines * 2 - 1)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {
+       "issue_date": "2026-11-16",
+       "lines": "3"
+      },
+      "result": "2026-11-21"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-negative-literal",
+   "text": "ADD_DAYS(issue_date, -1)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "day",
+     "date": {
+      "node": "column",
+      "name": "issue_date"
+     },
+     "count": {
+      "node": "neg",
+      "operand": {
+       "node": "number",
+       "value": "1"
+      }
+     }
+    },
+    "canonical": "ADD_DAYS(issue_date, -1)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {
+       "issue_date": "2026-11-16"
+      },
+      "result": "2026-11-15"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-nested",
+   "text": "ADD_DAYS(ADD_MONTHS(issue_date, 1), 1)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "day",
+     "date": {
+      "node": "date_add",
+      "unit": "month",
+      "date": {
+       "node": "column",
+       "name": "issue_date"
+      },
+      "count": {
+       "node": "number",
+       "value": "1"
+      }
+     },
+     "count": {
+      "node": "number",
+      "value": "1"
+     }
+    },
+    "canonical": "ADD_DAYS(ADD_MONTHS(issue_date, 1), 1)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {
+       "issue_date": "2026-01-31"
+      },
+      "result": "2026-03-01"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-predicate-use",
+   "text": "due_date = ADD_DAYS(issue_date, 30)",
+   "site": "predicate",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "compare",
+     "op": "=",
+     "left": {
+      "node": "column",
+      "name": "due_date"
+     },
+     "right": {
+      "node": "date_add",
+      "unit": "day",
+      "date": {
+       "node": "column",
+       "name": "issue_date"
+      },
+      "count": {
+       "node": "number",
+       "value": "30"
+      }
+     }
+    },
+    "canonical": "due_date = ADD_DAYS(issue_date, 30)",
+    "type": "bool",
+    "eval": [
+     {
+      "row": {
+       "issue_date": "2026-11-01",
+       "due_date": "2026-12-01"
+      },
+      "result": true
+     },
+     {
+      "row": {
+       "issue_date": "2026-11-01",
+       "due_date": "2026-12-02"
+      },
+      "result": false
+     },
+     {
+      "row": {
+       "issue_date": "2026-11-01"
+      },
+      "result": false
+     },
+     {
+      "row": {
+       "due_date": "2026-12-01"
+      },
+      "result": false
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-derive-date",
+   "text": "ADD_DAYS(issue_date, 30)",
+   "site": "value",
+   "model": "invoices",
+   "derive": "due_date",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "day",
+     "date": {
+      "node": "column",
+      "name": "issue_date"
+     },
+     "count": {
+      "node": "number",
+      "value": "30"
+     }
+    },
+    "canonical": "ADD_DAYS(issue_date, 30)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {
+       "issue_date": "2026-11-01"
+      },
+      "result": "2026-12-01"
+     },
+     {
+      "row": {
+       "issue_date": null
+      },
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-months-then-months-between",
+   "text": "MONTHS_BETWEEN(issue_date, ADD_MONTHS(issue_date, lines))",
+   "site": "value",
+   "model": "invoices",
+   "note": "the inverse holds whenever the result is in range",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_diff",
+     "unit": "month",
+     "from": {
+      "node": "column",
+      "name": "issue_date"
+     },
+     "to": {
+      "node": "date_add",
+      "unit": "month",
+      "date": {
+       "node": "column",
+       "name": "issue_date"
+      },
+      "count": {
+       "node": "column",
+       "name": "lines"
+      }
+     }
+    },
+    "canonical": "MONTHS_BETWEEN(issue_date, ADD_MONTHS(issue_date, lines))",
+    "type": "number",
+    "scale": "0",
+    "eval": [
+     {
+      "row": {
+       "issue_date": "2026-01-31",
+       "lines": "1"
+      },
+      "result": "1"
+     },
+     {
+      "row": {
+       "issue_date": "2026-01-31",
+       "lines": "-13"
+      },
+      "result": "-13"
+     },
+     {
+      "row": {
+       "issue_date": "2000-02-29",
+       "lines": "12"
+      },
+      "result": "12"
+     },
+     {
+      "row": {
+       "issue_date": "2026-03-31",
+       "lines": "-1"
+      },
+      "result": "-1"
+     },
+     {
+      "row": {
+       "issue_date": "9999-12-31",
+       "lines": "1"
+      },
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-lower-case",
+   "text": "add_days(issue_date, 1)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "date_add",
+     "unit": "day",
+     "date": {
+      "node": "column",
+      "name": "issue_date"
+     },
+     "count": {
+      "node": "number",
+      "value": "1"
+     }
+    },
+    "canonical": "ADD_DAYS(issue_date, 1)",
+    "type": "date",
+    "eval": [
+     {
+      "row": {
+       "issue_date": "2026-11-16"
+      },
+      "result": "2026-11-17"
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-as-a-column-name",
+   "text": "add_days > 1",
+   "site": "predicate",
+   "model": "invoices",
+   "note": "a function name is not a keyword: without a '(' it is a column",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "compare",
+     "op": ">",
+     "left": {
+      "node": "column",
+      "name": "add_days"
+     },
+     "right": {
+      "node": "number",
+      "value": "1"
+     }
+    },
+    "canonical": "add_days > 1",
+    "type": "bool",
+    "eval": [
+     {
+      "row": {
+       "add_days": "2"
+      },
+      "result": true
+     },
+     {
+      "row": {
+       "add_days": "1"
+      },
+      "result": false
+     }
+    ]
+   }
+  },
+  {
+   "id": "add-days-count-fraction-literal",
+   "text": "ADD_DAYS(issue_date, 1.5)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "refused",
+    "reason": "type-mismatch"
+   }
+  },
+  {
+   "id": "add-days-count-scale-two",
+   "text": "ADD_DAYS(issue_date, net)",
+   "site": "value",
+   "model": "invoices",
+   "note": "net is decimal(12,2): a count has scale 0",
+   "expect": {
+    "verdict": "refused",
+    "reason": "type-mismatch"
+   }
+  },
+  {
+   "id": "add-months-count-scale-two",
+   "text": "ADD_MONTHS(issue_date, net)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "refused",
+    "reason": "type-mismatch"
+   }
+  },
+  {
+   "id": "add-days-count-float",
+   "text": "ADD_DAYS(issue_date, fx_rate)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "refused",
+    "reason": "type-mismatch"
+   }
+  },
+  {
+   "id": "add-years-count-float",
+   "text": "ADD_YEARS(issue_date, fx_rate)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "refused",
+    "reason": "type-mismatch"
+   }
+  },
+  {
+   "id": "add-days-count-unscaled-decimal",
+   "text": "ADD_DAYS(issue_date, amount_any)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "refused",
+    "reason": "type-mismatch"
+   }
+  },
+  {
+   "id": "add-days-count-quotient",
+   "text": "ADD_DAYS(issue_date, lines / 2)",
+   "site": "value",
+   "model": "invoices",
+   "note": "a division has no static scale",
+   "expect": {
+    "verdict": "refused",
+    "reason": "type-mismatch"
+   }
+  },
+  {
+   "id": "add-days-count-string",
+   "text": "ADD_DAYS(issue_date, invoice_id)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "refused",
+    "reason": "type-mismatch"
+   }
+  },
+  {
+   "id": "add-days-date-is-timestamp",
+   "text": "ADD_DAYS(issued_at, 1)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "refused",
+    "reason": "type-mismatch"
+   }
+  },
+  {
+   "id": "add-days-date-is-string",
+   "text": "ADD_DAYS(invoice_id, 1)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "refused",
+    "reason": "type-mismatch"
+   }
+  },
+  {
+   "id": "add-days-null-date",
+   "text": "ADD_DAYS(NULL, 1)",
+   "site": "value",
+   "model": "invoices",
+   "note": "unlike the date differences, the NULL literal takes no type from the other argument",
+   "expect": {
+    "verdict": "refused",
+    "reason": "null-literal"
+   }
+  },
+  {
+   "id": "add-days-null-count",
+   "text": "ADD_DAYS(issue_date, NULL)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "refused",
+    "reason": "null-literal"
+   }
+  },
+  {
+   "id": "add-days-one-argument",
+   "text": "ADD_DAYS(issue_date)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "refused",
+    "reason": "syntax"
+   }
+  },
+  {
+   "id": "add-days-three-arguments",
+   "text": "ADD_DAYS(issue_date, 1, 2)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "refused",
+    "reason": "syntax"
+   }
+  },
+  {
+   "id": "add-days-as-a-predicate",
+   "text": "ADD_DAYS(issue_date, 1)",
+   "site": "predicate",
+   "model": "invoices",
+   "expect": {
+    "verdict": "refused",
+    "reason": "type-mismatch"
+   }
+  },
+  {
+   "id": "add-days-derived-into-int",
+   "text": "ADD_DAYS(issue_date, 1)",
+   "site": "value",
+   "model": "invoices",
+   "derive": "lines",
+   "expect": {
+    "verdict": "refused",
+    "reason": "derive-type"
    }
   },
   {

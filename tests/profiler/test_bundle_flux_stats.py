@@ -289,7 +289,7 @@ def test_a_rare_support_member_withholds_the_group_and_siblings_of_a_grouped_mea
     # The ungrouped mean needs no secondary suppression.
     assert _entry(result, "amount", "mean/1")["groups"][0]["status"] == "F"
     # Three siblings of the mean, and the quantile beside the histogram of its column.
-    assert result.withheld["D"] == 4
+    assert result.withheld["D"] == 4 + 1  # + the groupBy column's distinctCount
     assert ("amount", "mean/1", "market", None) not in result.statistics
     assert ("amount", "mean/1", None, None) in result.statistics
     assert ("market", "support/1", None, None) in result.withheld_statistics
@@ -378,7 +378,7 @@ def test_a_group_withheld_for_its_size_withholds_its_siblings_in_a_grouped_histo
         ("GB", "C"),
         ("IE", "C"),
     ]
-    assert result.withheld["D"] == 3
+    assert result.withheld["D"] == 3 + 1  # + the groupBy column's distinctCount
     # The column's own histogram is no group of the groupBy.
     assert _entry(result, "amount", "marginalHistogram/1")["groups"][0]["status"] == "F"
 
@@ -399,7 +399,7 @@ def test_a_group_withheld_for_its_size_withholds_its_siblings_in_a_grouped_quant
     grouped = _entry(result, "amount", "quantile/1", "market")
     # Every other market's median passes its own checks, and goes with the small one.
     assert {g["status"] for g in grouped["groups"]} == {"C"}
-    assert result.withheld["D"] == 3
+    assert result.withheld["D"] == 3 + 1  # + the groupBy column's distinctCount
 
 
 @pytest.mark.parametrize(
@@ -637,7 +637,9 @@ def test_rows_no_group_holds_that_the_block_refuses_withhold_a_grouped_histogram
     result = _profile(tmp_path, rows, [by_market], market_null="exclude")
     grouped = _entry(result, "amount", "marginalHistogram/1", "market")
     assert {g["status"] for g in grouped["groups"]} == {"C"}
-    assert result.withheld["D"] == len(grouped["groups"])
+    assert (
+        result.withheld["D"] == len(grouped["groups"]) + 1
+    )  # + the groupBy column's distinctCount
 
 
 def test_few_rows_no_group_holds_withhold_a_grouped_histogram(tmp_path):
@@ -646,7 +648,9 @@ def test_few_rows_no_group_holds_withhold_a_grouped_histogram(tmp_path):
     result = _profile(tmp_path, _null_market_rows(3), [by_market], market_null="exclude")
     grouped = _entry(result, "amount", "marginalHistogram/1", "market")
     assert {g["status"] for g in grouped["groups"]} == {"C"}
-    assert result.withheld["D"] == len(grouped["groups"])
+    assert (
+        result.withheld["D"] == len(grouped["groups"]) + 1
+    )  # + the groupBy column's distinctCount
 
 
 def test_a_quantile_whose_witness_too_few_records_hold_is_withheld(tmp_path):
@@ -678,7 +682,7 @@ def test_a_record_no_group_holds_withholds_the_groups_of_a_grouped_mean(tmp_path
         ("GB", "D"),
         ("IE", "D"),
     ]
-    assert result.withheld["D"] == 3
+    assert result.withheld["D"] == 3 + 1  # + the groupBy column's distinctCount
     assert _entry(result, "amount", "mean/1")["groups"][0]["status"] == "F"
 
 

@@ -115,6 +115,239 @@ def test_an_unknown_expose_is_named_with_the_ones_there_are(workspace, registry,
     assert "profile_expose_not_found" in out and "orders" in out
 
 
+TWO_EXPOSES = """\
+fluidVersion: "0.7.7"
+kind: DataProduct
+id: crm.accounts
+name: Accounts
+exposes:
+  - exposeId: org
+    kind: table
+    binding: {platform: local, format: csv, location: {path: out/org.csv}}
+    contract:
+      schema:
+        - {name: org_id, type: int}
+  - exposeId: account
+    kind: table
+    binding: {platform: local, format: csv, location: {path: out/account.csv}}
+    contract:
+      schema:
+        - {name: account_id, type: int}
+        - {name: org_id, type: int}
+"""
+
+
+def test_several_exposes_without_paired_sources_are_refused_before_any_read(
+    workspace, registry, capsys
+):
+    # argparse used to keep the last --expose, so org.csv was profiled as account. Several
+    # --expose flags now need one --source <exposeId>=<location> each.
+    (workspace / "two.fluid.yaml").write_text(TWO_EXPOSES, encoding="utf-8")
+    (workspace / "org.csv").write_text("org_id\n1\n", encoding="utf-8")
+    rc = main(
+        [
+            "profile",
+            "two.fluid.yaml",
+            "--expose",
+            "org",
+            "--expose",
+            "account",
+            "--source",
+            "org.csv",
+        ]
+    )
+    out = " ".join(capsys.readouterr().out.split())  # the console may wrap
+    assert rc == 1
+    assert "profile_source_unpaired" in out
+    assert "--expose is given 2 times (org, account)" in out
+    assert "--source <exposeId>=<location>" in out
+    assert "no record was read" in out
+    assert registry.checked == []
+    assert not list(workspace.glob("*.profile.json"))
+
+
+def _two_sources(workspace):
+    (workspace / "two.fluid.yaml").write_text(TWO_EXPOSES, encoding="utf-8")
+    (workspace / "org.ndjson").write_text(
+        "".join(json.dumps({"org_id": str(n)}) + "\n" for n in range(1, 13)), encoding="utf-8"
+    )
+    (workspace / "account.ndjson").write_text(
+        "".join(
+            json.dumps({"account_id": str(n), "org_id": str(1 + n % 12)}) + "\n" for n in range(40)
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_the_whole_product_is_profiled_into_one_document(workspace, registry, capsys):
+    _two_sources(workspace)
+    rc = main(
+        [
+            "profile",
+            "two.fluid.yaml",
+            "--source",
+            "account=account.ndjson",
+            "--source",
+            "org=org.ndjson",
+        ]
+    )
+    out = " ".join(capsys.readouterr().out.split())
+    assert rc == 0, out
+    written = workspace / "crm.accounts.profile.json"  # the contract's id names it
+    document = json.loads(written.read_bytes())
+    assert list(document["tables"]) == ["account", "org"]
+    assert document["tables"]["org"]["rowCount"] == 10  # 12, rounded to 5
+    assert document["tables"]["account"]["rowCount"] == 40
+    assert "Profiled 2 exposes (org, account): 3 columns" in out  # the contract's order
+    assert registry.checked == [written.read_text(encoding="utf-8")]
+
+
+def test_repeated_exposes_take_their_order_and_their_own_sources(workspace, registry, capsys):
+    _two_sources(workspace)
+    rc = main(
+        [
+            "profile",
+            "two.fluid.yaml",
+            "--expose",
+            "account",
+            "--expose",
+            "org",
+            "--source",
+            "org=org.ndjson",
+            "--source",
+            "account=account.ndjson",
+            "--out",
+            "both.json",
+        ]
+    )
+    out = " ".join(capsys.readouterr().out.split())
+    assert rc == 0, out
+    assert "Profiled 2 exposes (account, org)" in out
+    document = json.loads((workspace / "both.json").read_bytes())
+    assert set(document["tables"]["org"]["columns"]) == {"org_id"}
+    assert set(document["tables"]["account"]["columns"]) == {"account_id", "org_id"}
+
+
+@pytest.mark.parametrize(
+    "arguments, event, words",
+    [
+        (
+            ["--expose", "org", "--expose", "account", "--source", "org=org.ndjson"],
+            "profile_source_missing",
+            "exposes[account] has no --source account=<location>",
+        ),
+        (
+            ["--expose", "org", "--source", "org=org.ndjson", "--source", "account=account.ndjson"],
+            "profile_source_unused",
+            "--source names exposes[account], which no --expose names",
+        ),
+        (
+            ["--source", "org=org.ndjson", "--source", "account.ndjson"],
+            "profile_source_unpaired",
+            "--source account.ndjson names no expose",
+        ),
+        (
+            ["--source", "org=org.ndjson", "--source", "org=account.ndjson"],
+            "profile_source_repeated",
+            "exposes[org] is given more than one --source",
+        ),
+        (
+            ["--expose", "org", "--expose", "org", "--source", "org=org.ndjson"],
+            "profile_expose_repeated",
+            "--expose names 'org' twice",
+        ),
+        (
+            ["--source", "org.ndjson", "--source", "account.ndjson"],
+            "profile_source_unpaired",
+            "--source is given 2 times",
+        ),
+        (
+            [
+                "--source",
+                "org=org.ndjson",
+                "--source",
+                "account=account.ndjson",
+                "--table",
+                "accounts",
+            ],
+            "profile_table_unpaired",
+            "--table names no expose",
+        ),
+    ],
+)
+def test_sources_that_do_not_pair_with_exposes_are_refused_before_any_read(
+    workspace, registry, capsys, arguments, event, words
+):
+    _two_sources(workspace)
+    rc = main(["profile", "two.fluid.yaml", *arguments])
+    out = " ".join(capsys.readouterr().out.split())
+    assert rc == 1
+    assert event in out and words in out, out
+    assert registry.checked == []
+    assert not list(workspace.glob("*.profile.json"))
+
+
+def test_a_paired_database_source_never_shows_its_password(workspace, registry, capsys):
+    pytest.importorskip("duckdb")
+    _two_sources(workspace)
+    secret = "pw-41871"  # pragma: allowlist secret
+    rc = main(
+        [
+            "profile",
+            "two.fluid.yaml",
+            "--source",
+            "org=org.ndjson",
+            "--source",
+            f"account=postgresql://reader:{secret}@127.0.0.1:9/crm",
+            "--table",
+            "account=public.account",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "profile_source_unreadable" in out
+    assert secret not in out
+
+
+def test_the_document_cannot_replace_any_of_its_sources(workspace, registry, capsys):
+    _two_sources(workspace)
+    rc = main(
+        [
+            "profile",
+            "two.fluid.yaml",
+            "--source",
+            "org=org.ndjson",
+            "--source",
+            "account=account.ndjson",
+            "--out",
+            "account.ndjson",
+        ]
+    )
+    assert rc == 1
+    assert "profile_out_is_the_source" in capsys.readouterr().out
+
+
+def test_a_mistyped_exposeid_before_a_database_uri_never_shows_its_password(
+    workspace, registry, capsys
+):
+    _two_sources(workspace)
+    secret = "pw-55210"  # pragma: allowlist secret
+    rc = main(
+        [
+            "profile",
+            "two.fluid.yaml",
+            "--source",
+            "org=org.ndjson",
+            "--source",
+            f"acount=postgresql://reader:{secret}@127.0.0.1:9/crm",
+        ]
+    )
+    out = " ".join(capsys.readouterr().out.split())
+    assert rc == 1
+    assert "profile_source_unpaired" in out and "acount=postgresql://reader" in out
+    assert secret not in out
+
+
 def test_an_unreadable_source_is_reported_with_its_password_masked(workspace, registry, capsys):
     # The read itself is the [profile] extra's (DuckDB): without it the command stops
     # earlier, at "needs duckdb", as a lane without the extra (iac Stage 1) shows.
@@ -263,13 +496,15 @@ def test_the_summary_names_each_statistic_once_with_its_columns_and_shape():
 def test_the_summary_names_the_fidelity_statistics_and_their_grid(workspace, registry, capsys):
     assert main(["profile", "contract.fluid.yaml", "--source", "orders.ndjson"]) == 0
     out = " ".join(capsys.readouterr().out.split())
-    assert (
-        "Fidelity statistics: mean/1 of 'amount', on fractionalBits 16 "
-        "(the fidelity block must declare the same)." in out
-    )
+    assert "Fidelity statistics: mean/1 of 'amount'" in out
+    assert "on fractionalBits 16 (the fidelity block must declare the same)." in out
     written = json.loads((workspace / "orders.profile.json").read_bytes())
     assert written["encoding"] == {"fractionalBits": 16, "rounding": "floor"}
-    (statistic,) = written["tables"]["orders"]["columns"]["amount"]["statistics"]
+    (statistic,) = [
+        each
+        for each in written["tables"]["orders"]["columns"]["amount"]["statistics"]
+        if each["definition"] == "mean/1"
+    ]
     assert statistic["groups"] == [{"group": "", "k": 40, "Sx": str(620 * 2**16), "status": "F"}]
 
 
@@ -286,7 +521,11 @@ def test_fractional_bits_names_the_grid(workspace, registry, capsys):
     assert "on fractionalBits 20 " in " ".join(capsys.readouterr().out.split())
     written = json.loads((workspace / "orders.profile.json").read_bytes())
     assert written["encoding"]["fractionalBits"] == 20
-    (statistic,) = written["tables"]["orders"]["columns"]["amount"]["statistics"]
+    (statistic,) = [
+        each
+        for each in written["tables"]["orders"]["columns"]["amount"]["statistics"]
+        if each["definition"] == "mean/1"
+    ]
     assert statistic["groups"][0]["Sx"] == str(620 * 2**20)
 
 

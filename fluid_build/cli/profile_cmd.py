@@ -1,10 +1,10 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""``fluid profile``: an output-checked profile of one expose, read where its records live.
+"""``fluid profile``: an output-checked profile of a data product, read where its records live.
 
-The command reads the expose's records once, inside the environment that holds
-them, and writes a FLUX profile document (PROFILE-SPEC format 1-0-0, or 1-1-0
+The command reads each expose's records once, inside the environment that holds
+them, and writes one FLUX profile document (PROFILE-SPEC format 1-0-0, or 1-1-0
 when it holds a quantile with bins) of aggregates that passed the disclosure
 rules. A FLUX Simulation pins the document by the digest this prints. See
 :mod:`fluid_build.profiler` for the parts.
@@ -20,12 +20,15 @@ import argparse
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 COMMAND = "profile"
 
 _DESCRIPTION = """\
-Write an output-checked profile of one expose's records, read where they live.
+Write an output-checked profile of an expose's records, read where they live.
+Several exposes of the data product go into one document: give each one its
+records as --source <exposeId>=<location> (and a database's table as --table
+<exposeId>=<table>); the document is then named after the contract's id.
 
 The document follows FLUX PROFILE-SPEC (format 1-0-0, or 1-1-0 when it holds a
 quantile with bins) and holds only aggregates that passed the output checks: no
@@ -49,6 +52,26 @@ fidelity check compares a mean property with: the number of values and their
 sum on a grid of 2^-N steps. N is --fractional-bits, 16 unless given, and the
 fidelity block's encoding.fractionalBits must be the same.
 
+Without --bundle, the document also carries the statistics the contract's own
+declarations give, declared from the contract and never from the records, as the
+fidelity block FLUX's grammar reads (so `fluxsim init` can start from them):
+  - for each enum(...) column, a levelHistogram over every declared level; a
+    level no record holds is a withheld cell, and the column's distinctCount
+    is withheld (D);
+  - for a number whose validationRules declare both ends of a range inside
+    its type, a marginalHistogram over about ten bins of it; its sum, min,
+    max, quantiles and distinctCount are then withheld (D), and it has no
+    mean/1;
+  - for any other number of a bounded type, and each date and timestamp,
+    quantile/2 at 0.25, 0.5 and 0.75 on a ladder fixed by the type (0, 1, 2,
+    5, 10, 20, 50 ... for a number, one bin per year from 1900 to 2100 for a
+    date or a timestamp);
+  - for each categorical semantics.dimensions entry on an enum column, the
+    other enum columns' histograms per level of it, every declared level a
+    group, up to 10,000 cells for one column's groupings.
+A record outside what the contract declares (a level its type does not list, a
+value outside its type or its declared range) refuses the profile.
+
 With --bundle DIR the profile answers the Simulation's fidelity block instead:
 it reads the block of DIR's one Simulation (*.flux.yml) for the expose and
 writes the statistic each declared property is compared with (a mean, a
@@ -60,10 +83,11 @@ column's published total; the records a null groupBy value leaves out of every
 group count as one more group there. A correlation is not answered: its moments
 need the exact record count, which the output checks round.
 
-What the checks leave readable: a grouped statistic lists every group the data
-forms, published or withheld. A key is always a level the bundle declares (a
-value outside the declared support is refused), so its presence says only that
-the level holds at least one record.
+What the checks leave readable: under --bundle, a grouped statistic lists every
+group the data forms, published or withheld. A key is always a level the bundle
+declares (a value outside the declared support is refused), so its presence says
+only that the level holds at least one record. Without --bundle, every declared
+level is a group, whatever the records hold.
 
 The counts a histogram, a level histogram or a quantile publishes at the edges
 of one column are checked together, as FLUX ADR 0012 sets, by flux-stats'
@@ -79,9 +103,9 @@ of one column, no small cell, a zero included where zeros are disclosive, can be
 formed by adding or subtracting what they publish, so more is withheld (D in
 the summary). Only then are counts rounded. The check does not see a column's
 support, which lists the levels that hold records, or the group sizes of a
-statistic grouped by the column, which repeat its level counts; and a declared
-level that holds no record is absent from a grouped statistic, which shows its
-zero. A published min or
+statistic grouped by the column, which repeat its level counts; and under
+--bundle a declared level that holds no record is absent from a grouped
+statistic, which shows its zero. A published min or
 max shows that no record lies below or above it. A quantile whose value is the
 column's smallest or largest shows the same, and is withheld for it, as a zero
 is.
@@ -98,10 +122,13 @@ fluid profile contract.fluid.yaml --expose orders --source ./slice.ndjson \\
 # a database table (the URI's password is never printed)
 fluid profile contract.fluid.yaml --expose orders \\
     --source postgresql://db.internal:5432/sales --table public.orders
+# the whole data product in one document: one --source <exposeId>=<location> each
+fluid profile contract.fluid.yaml --source customers=./customers.csv \\
+    --source orders=./orders.parquet --out product.profile.json
 
 # Only aggregates leave: a count under 10 or a zero is withheld, counts are rounded
 # to 5, a sum 2 records dominate is withheld, and a min, max or quantile is shown only
-# when 10 records hold it (ACRO 1.1.0 defaults). With --bundle, a column's histograms and
+# when 10 records hold it (ACRO 1.1.0 defaults). A column's histograms and
 # quantiles are checked together (FLUX ADR 0012): on one partition, a quantile with bins
 # only with at least 10 records below its bin, in it and above it, and no small cell,
 # a zero included, left to be formed by adding or subtracting what is published. A group
@@ -125,7 +152,7 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
     """Wire ``fluid profile`` into the CLI."""
     p = subparsers.add_parser(
         COMMAND,
-        help="Profile an expose's records where they live (aggregates only, output-checked)",
+        help="Profile a data product's records where they live (aggregates only, output-checked)",
         description=_DESCRIPTION,
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -138,23 +165,39 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         "--expose",
         "--expose-id",
         dest="expose_id",
-        help="exposeId to profile (default: the contract's only expose)",
+        # Collected, not overwritten: argparse would keep the last of two and read the
+        # first expose's source as the second one.
+        action="append",
+        help=(
+            "exposeId to profile; repeat it to profile several exposes into one document, "
+            "each with its own --source <exposeId>=<location> (default: the contract's only "
+            "expose, or every expose a --source names)"
+        ),
     )
     p.add_argument(
         "--source",
         required=True,
+        action="append",
         help=(
             "where the records live: a .ndjson, .jsonl, .csv or .parquet file (a path "
-            "or a file:// URL), or a postgres://, mysql:// or sqlite:/// database URI"
+            "or a file:// URL), or a postgres://, mysql:// or sqlite:/// database URI; "
+            "for several exposes, one --source <exposeId>=<location> each"
         ),
     )
     p.add_argument(
         "--table",
-        help="the table of a database --source, as name or schema.name",
+        action="append",
+        help=(
+            "the table of a database --source, as name or schema.name; for several "
+            "exposes, --table <exposeId>=<table>"
+        ),
     )
     p.add_argument(
         "--out",
-        help="where to write the profile (default: <exposeId>.profile.json here)",
+        help=(
+            "where to write the profile (default: <exposeId>.profile.json here, or "
+            "<contract id>.profile.json for several exposes)"
+        ),
     )
     p.add_argument(
         "--fractional-bits",
@@ -231,18 +274,25 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     bundle_dir = _bundle_dir(args.bundle)
     contract = load_contract_with_overlay(str(contract_path), args.env, logger)
     try:
-        expose_id = runner.resolve_expose_id(contract, args.expose_id)
-        out = _out_path(args.out, expose_id, args.source)
-        block = bundle.read_bundle_block(bundle_dir, expose_id, backend) if bundle_dir else None
-        result = runner.profile_expose(
+        exposes = _expose_sources(contract, args.expose_id, args.source, args.table)
+        out = _out_path(
+            args.out, _document_name(contract, exposes), [each.source for each in exposes]
+        )
+        blocks = (
+            {
+                each.expose_id: bundle.read_bundle_block(bundle_dir, each.expose_id, backend)
+                for each in exposes
+            }
+            if bundle_dir
+            else None
+        )
+        result = runner.profile_exposes(
             contract,
-            expose_id,
-            source=args.source,
-            table=args.table,
+            exposes,
             cwd=Path.cwd(),
             backend=backend,
             fractional_bits=args.fractional_bits,
-            bundle=block,
+            bundles=blocks,
         )
         _write(out, result.canonical)
     except (
@@ -256,8 +306,162 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         _stats.DocumentRefused,
     ) as exc:
         raise _as_refusal(exc, args.source) from None
-    _report(cprint_literal, result, out, answered_block=block is not None)
+    _report(cprint_literal, result, out, answered_block=blocks is not None)
     return 0
+
+
+def _paired(contract_ids: Sequence[str], value: str) -> Tuple[Optional[str], str]:
+    """``(exposeId, rest)`` for ``<exposeId>=<rest>``, else ``(None, value)``.
+
+    A value is paired only when the text before its first ``=`` is an exposeId of the
+    contract, so a database URI's query (``?sslmode=require``) or a path holding ``=``
+    stays whole; ``./orders=2024.csv`` reads a file named ``orders=2024.csv``.
+    """
+    head, sep, rest = value.partition("=")
+    if sep and head in contract_ids:
+        return head, rest
+    return None, value
+
+
+def _expose_sources(
+    contract: Any,
+    exposes: Optional[List[str]],
+    given_sources: List[str],
+    given_tables: Optional[List[str]],
+) -> List[Any]:
+    """Pair each expose to profile with its ``--source`` (and ``--table``), before any read.
+
+    One expose takes a bare ``--source``: the one ``--expose``, or the contract's only
+    expose. Several take one ``--source <exposeId>=<location>`` each, and are the
+    ``--expose`` flags given, in that order, or else every expose a source names, in the
+    contract's order. Every refusal names a database source with its password masked.
+    """
+    from fluid_build.profiler import runner
+    from fluid_build.profiler.sources import describe_source
+
+    ids = runner.expose_ids(contract)
+    named = list(exposes or [])
+    for position, requested in enumerate(named):
+        if requested in named[:position]:
+            raise runner.ProfileError(
+                "profile_expose_repeated",
+                f"--expose names {requested!r} twice",
+                {"read": "nothing: no record was read", "next": "name each expose once"},
+            )
+        if requested not in ids:
+            runner.resolve_expose_id(contract, requested)  # profile_expose_not_found
+    pairs = [_paired(ids, value) for value in given_sources]
+    tables = [_paired(ids, value) for value in given_tables or []]
+    if all(expose_id is None for expose_id, _ in pairs):
+        if len(pairs) > 1 or len(named) > 1:
+            raise runner.ProfileError(
+                "profile_source_unpaired",
+                (
+                    f"--source is given {len(pairs)} times"
+                    if len(pairs) > 1
+                    else f"--expose is given {len(named)} times ({', '.join(named)})"
+                )
+                + ", and no --source names its expose",
+                {
+                    "read": "nothing: no record was read",
+                    "next": "give each expose its records as --source <exposeId>=<location>",
+                },
+            )
+        only = runner.resolve_expose_id(contract, named[0] if named else None)
+        return [runner.ExposeSource(only, pairs[0][1], _one_table(tables, [only]))]
+    for paired, location in pairs:
+        if paired is None:
+            raise runner.ProfileError(
+                "profile_source_unpaired",
+                f"--source {describe_source(location)} names no expose of the contract",
+                {
+                    "read": "nothing: no record was read",
+                    "exposes": ", ".join(ids),
+                    "next": "with several sources, write each as --source <exposeId>=<location>",
+                },
+            )
+    by_expose: Dict[str, str] = {}
+    for paired, location in pairs:
+        if str(paired) in by_expose:
+            raise runner.ProfileError(
+                "profile_source_repeated",
+                f"exposes[{paired}] is given more than one --source",
+                {"read": "nothing: no record was read", "next": "give each expose one source"},
+            )
+        by_expose[str(paired)] = location
+    if named:
+        missing = [expose_id for expose_id in named if expose_id not in by_expose]
+        if missing:
+            raise runner.ProfileError(
+                "profile_source_missing",
+                f"exposes[{missing[0]}] has no --source {missing[0]}=<location>",
+                {"read": "nothing: no record was read", "next": "give every --expose its source"},
+            )
+        unused = [expose_id for expose_id in by_expose if expose_id not in named]
+        if unused:
+            raise runner.ProfileError(
+                "profile_source_unused",
+                f"--source names exposes[{unused[0]}], which no --expose names",
+                {
+                    "read": "nothing: no record was read",
+                    "next": f"add --expose {unused[0]}, or leave its --source out",
+                },
+            )
+        order = named
+    else:
+        order = [expose_id for expose_id in ids if expose_id in by_expose]
+    chosen = _tables_by_expose(tables, order)
+    return [
+        runner.ExposeSource(expose_id, by_expose[expose_id], chosen.get(expose_id))
+        for expose_id in order
+    ]
+
+
+def _one_table(tables: List[Tuple[Optional[str], str]], exposes: List[str]) -> Optional[str]:
+    """The ``--table`` of a profile of one expose: bare, or paired with that expose."""
+    if not tables:
+        return None
+    return _tables_by_expose(tables, exposes, bare=True).get(exposes[0])
+
+
+def _tables_by_expose(
+    tables: List[Tuple[Optional[str], str]], exposes: List[str], *, bare: bool = False
+) -> Dict[str, str]:
+    """Each ``--table`` by the expose it names; a bare one only where *bare* allows one."""
+    from fluid_build.profiler.runner import ProfileError
+
+    found: Dict[str, str] = {}
+    for expose_id, table in tables:
+        if expose_id is None:
+            if not bare or len(tables) > 1:
+                raise ProfileError(
+                    "profile_table_unpaired",
+                    "--table names no expose, and several tables or exposes are given",
+                    {"next": "write each as --table <exposeId>=<table>"},
+                )
+            expose_id = exposes[0]
+        if expose_id not in exposes:
+            raise ProfileError(
+                "profile_table_unused",
+                f"--table names exposes[{expose_id}], which this profile does not read",
+                {"next": "name a table for an expose that is profiled"},
+            )
+        if expose_id in found:
+            raise ProfileError(
+                "profile_table_repeated",
+                f"exposes[{expose_id}] is given more than one --table",
+                {"next": "give each expose one table"},
+            )
+        found[expose_id] = table
+    return found
+
+
+def _document_name(contract: Any, exposes: List[Any]) -> str:
+    """The default document name: the expose's id, or for several the contract's ``id``."""
+    if len(exposes) == 1:
+        return str(exposes[0].expose_id)
+    product = contract.get("id") if hasattr(contract, "get") else None
+    return str(product) if isinstance(product, str) else ""
 
 
 def _bundle_dir(given: Optional[str]) -> Optional[Path]:
@@ -284,7 +488,18 @@ def _bundle_dir(given: Optional[str]) -> Optional[Path]:
     return path
 
 
-def _as_refusal(exc: Exception, source: str) -> Any:
+def _described(given_sources: Sequence[str]) -> str:
+    """Every ``--source`` as it may be shown: each database URI with its password masked.
+
+    :func:`~fluid_build.profiler.sources.describe_source` masks a URI after its
+    ``<exposeId>=`` too, a mistyped exposeId included.
+    """
+    from fluid_build.profiler.sources import describe_source
+
+    return ", ".join(describe_source(value) for value in given_sources)
+
+
+def _as_refusal(exc: Exception, given_sources: Sequence[str]) -> Any:
     """The :class:`CLIError` for a refusal from the profiler; nothing has been written."""
     from fluid_build.profiler import _stats, bundle, runner, sources
 
@@ -309,7 +524,7 @@ def _as_refusal(exc: Exception, source: str) -> Any:
         return _refusal(
             "profile_source_unreadable",
             str(exc),
-            {"source": sources.describe_source(source), "written": "nothing"},
+            {"source": _described(given_sources), "written": "nothing"},
         )
     if isinstance(exc, _stats.ReadRefused):
         return _refusal(
@@ -336,8 +551,10 @@ def _as_refusal(exc: Exception, source: str) -> Any:
 _PLAIN_NAME = re.compile(r"[A-Za-z0-9_.-]+\Z")
 
 
-def _out_path(given: Optional[str], expose_id: str, source: str) -> Path:
-    """Where the document goes: ``--out``, or ``<exposeId>.profile.json`` here.
+def _out_path(given: Optional[str], name: str, given_sources: Sequence[str]) -> Path:
+    """Where the document goes: ``--out``, or ``<name>.profile.json`` here.
+
+    *name* is the one expose's id, or for several exposes the contract's ``id``.
 
     Checked before any record is read, and without touching the file system: no
     directory is made and nothing is written until the profile is formed
@@ -349,16 +566,15 @@ def _out_path(given: Optional[str], expose_id: str, source: str) -> Path:
     replaced by their own profile.
     """
     from fluid_build.profiler.runner import ProfileError
-    from fluid_build.profiler.sources import local_file
 
     if given:
         target = Path(given)
-    elif _PLAIN_NAME.match(expose_id) and expose_id not in (".", ".."):
-        target = Path(f"{expose_id}.profile.json")
+    elif _PLAIN_NAME.match(name) and name not in (".", ".."):
+        target = Path(f"{name}.profile.json")
     else:
         raise ProfileError(
             "profile_out_required",
-            f"exposeId {expose_id!r} cannot name a file",
+            f"{name!r} cannot name a file" if name else "the contract has no id to name it by",
             {"next": "name the document with --out"},
         )
     unresolved = target if target.is_absolute() else Path.cwd() / target
@@ -369,20 +585,30 @@ def _out_path(given: Optional[str], expose_id: str, source: str) -> Path:
                 f"{unresolved} is a symbolic link",
                 {"next": "remove the link, or name another file with --out"},
             )
-        read_from = local_file(source)
-        if read_from is not None and read_from.exists() and unresolved.exists():
-            if unresolved.samefile(read_from):
-                raise ProfileError(
-                    "profile_out_is_the_source",
-                    f"{unresolved} is the file the records are read from",
-                    {"next": "name another file with --out"},
-                )
+        _refuse_a_source(unresolved, given_sources)
     except OSError as exc:
         raise ProfileError(
             "profile_out_unusable",
             f"{unresolved} cannot be used: {exc.strerror or type(exc).__name__}",
         ) from None
     return unresolved
+
+
+def _refuse_a_source(target: Path, given_sources: Sequence[str]) -> None:
+    """Refuse a document target that is a file the records are read from."""
+    from fluid_build.profiler.runner import ProfileError
+    from fluid_build.profiler.sources import local_file
+
+    if not target.exists():
+        return
+    for source in given_sources:
+        read_from = local_file(source)
+        if read_from is not None and read_from.exists() and target.samefile(read_from):
+            raise ProfileError(
+                "profile_out_is_the_source",
+                f"{target} is the file the records are read from",
+                {"next": "name another file with --out"},
+            )
 
 
 def _write(out: Path, data: bytes) -> None:
@@ -430,13 +656,13 @@ def _codes(counts: Dict[str, int]) -> str:
     )
 
 
-def _one_code_withheld(result: Any) -> bool:
-    """Whether a histogram or a quantile, whose withheld values all read C, has one."""
+def _one_code_withheld(table: Any) -> bool:
+    """Whether a table's histogram or quantile, whose withheld values all read C, has one."""
     from fluid_build.profiler.disclosure import ONE_CODE
 
     return any(
         each[1].partition("/")[0] in ONE_CODE
-        for each in (*result.withheld_statistics, *result.partly_withheld_statistics)
+        for each in (*table.withheld_statistics, *table.partly_withheld_statistics)
     )
 
 
@@ -471,58 +697,80 @@ def _named_partly(statistics: Any) -> List[str]:
 
 
 def _report(say: Any, result: Any, out: Path, *, answered_block: bool = False) -> None:
-    """Tell the owner what the document holds, then print the pin."""
-    plan = result.plan
+    """Tell the owner what the document holds, then print the pin.
+
+    A profile of several exposes names each line about a table by its expose.
+    """
+    tables = result.tables
+    several = len(tables) > 1
     withheld: Dict[str, int] = dict(result.withheld)
-    say(
-        f"Profiled exposes[{plan.expose_id}]: {_plural(len(plan.columns), 'column')}, "
-        f"{_plural(result.published, 'value')} published, {sum(withheld.values())} withheld."
-    )
+    counts = f"{_plural(result.published, 'value')} published, {sum(withheld.values())} withheld."
+    if several:
+        columns = sum(len(table.plan.columns) for table in tables)
+        names = ", ".join(table.plan.expose_id for table in tables)
+        say(
+            f"Profiled {len(tables)} exposes ({names}): {_plural(columns, 'column')}, {counts}",
+            soft_wrap=True,
+        )
+    else:
+        plan = tables[0].plan
+        say(f"Profiled exposes[{plan.expose_id}]: {_plural(len(plan.columns), 'column')}, {counts}")
     if withheld:
         say(f"Withheld, by the check (CL_CONF_STATUS code): {_codes(withheld)}.")
     cells: Dict[str, int] = dict(result.withheld_cells)
     if cells:
         say(f"Withheld histogram cells, by the check (CL_CONF_STATUS code): {_codes(cells)}.")
-    if cells or _one_code_withheld(result):
+    if cells or any(_one_code_withheld(table) for table in tables):
         say(
             "The document writes C for every withheld group and cell of a histogram or "
             "a quantile, whatever withheld it, so its code says nothing of its size.",
             soft_wrap=True,
         )
-    named = _named(result.statistics)
-    whole = _named(result.withheld_statistics)
-    if named:
-        grid = (
-            f"on the fidelity block's fractionalBits {result.fractional_bits}"
-            if answered_block
-            else f"on fractionalBits {result.fractional_bits} "
-            "(the fidelity block must declare the same)"
-        )
-        say(f"Fidelity statistics: {'; '.join(named)}, {grid}.", soft_wrap=True)
-    if whole:
-        say(
-            "Withheld whole, so a run that checks them scores them censored: "
-            f"{'; '.join(whole)}.",
-            soft_wrap=True,
-        )
-    partly = _named_partly(result.partly_withheld_statistics)
-    if partly:
-        say(
-            "Partly withheld, so a run that checks them scores only the published groups: "
-            f"{'; '.join(partly)}.",
-            soft_wrap=True,
-        )
-    for description, reason in result.left_out:
-        say(
-            f"Not answered: {description}: {reason}; a run that checks it is refused "
-            "(FLX-5037).",
-            soft_wrap=True,
-        )
-    for name, reason in plan.skipped:
-        say(f"Not profiled: column {name!r}: {reason}.")
+    grid = (
+        f"on the fidelity block's fractionalBits {result.fractional_bits}"
+        if answered_block
+        else f"on fractionalBits {result.fractional_bits} "
+        "(the fidelity block must declare the same)"
+    )
+    for table in tables:
+        _report_table(say, table, f"exposes[{table.plan.expose_id}]: " if several else "", grid)
     if not result.published:
         say("Every value was withheld: the document says nothing about the records.")
     say(f"Wrote {out} (readable by you alone; read it before you share it).", soft_wrap=True)
     say("Pin it in the FLUX Simulation:")
     # One line, never wrapped: it is copied as it stands.
     say(f"  profile: {{digest: {result.digest}}}", soft_wrap=True)
+
+
+def _report_table(say: Any, table: Any, prefix: str, grid: str) -> None:
+    """The summary lines about one table, each led by *prefix* (its expose, or nothing)."""
+    named = _named(table.statistics)
+    whole = _named(table.withheld_statistics)
+    if named:
+        say(f"{prefix}Fidelity statistics: {'; '.join(named)}, {grid}.", soft_wrap=True)
+    if whole:
+        say(
+            f"{prefix}Withheld whole, so a run that checks them scores them censored: "
+            f"{'; '.join(whole)}.",
+            soft_wrap=True,
+        )
+    partly = _named_partly(table.partly_withheld_statistics)
+    if partly:
+        say(
+            f"{prefix}Partly withheld, so a run that checks them scores only the published "
+            f"groups: {'; '.join(partly)}.",
+            soft_wrap=True,
+        )
+    for description, reason in table.left_out:
+        say(
+            f"{prefix}Not answered: {description}: {reason}; a run that checks it is refused "
+            "(FLX-5037).",
+            soft_wrap=True,
+        )
+    for name, reason in table.plan.skipped:
+        say(f"{prefix}Not profiled: column {name!r}: {reason}.")
+    for name, reason in table.uncovered:
+        say(
+            f"{prefix}Left out of the default statistics: column {name!r}: {reason}.",
+            soft_wrap=True,
+        )

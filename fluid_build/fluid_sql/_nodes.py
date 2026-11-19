@@ -29,6 +29,7 @@ flux-expr/2 reproduces node for node, so its shape is part of the language:
 ``round``          ``arg``, ``scale`` (its digits, a string), ``mode``
                    (``HALF_AWAY_FROM_ZERO`` or ``HALF_TO_EVEN``)
 ``date_diff``      ``unit`` (``day``, ``month`` or ``year``), ``from``, ``to``
+``date_add``       ``unit`` (``day``, ``month`` or ``year``), ``date``, ``count``
 =================  =====================================================
 
 Parentheses leave no node. Positions (``pos``, an index into the NFC text) and
@@ -242,6 +243,21 @@ class DateDiff(Node):
 DATE_DIFF_FUNCTIONS = {"day": "DAYS_BETWEEN", "month": "MONTHS_BETWEEN", "year": "YEARS_BETWEEN"}
 
 
+@dataclass(frozen=True)
+class DateAdd(Node):
+    unit: str  # "day", "month" or "year"
+    date: Node
+    count: Node
+
+    def children(self) -> Iterator[Node]:
+        yield self.date
+        yield self.count
+
+
+#: The function name of each date addition, by unit.
+DATE_ADD_FUNCTIONS = {"day": "ADD_DAYS", "month": "ADD_MONTHS", "year": "ADD_YEARS"}
+
+
 def walk(node: Node) -> Iterator[Node]:
     """``node`` and every node inside it, parents first, in text order."""
     stack = [node]
@@ -340,6 +356,13 @@ def to_json(node: Node) -> Dict[str, Any]:
             "from": to_json(node.from_),
             "to": to_json(node.to),
         }
+    if isinstance(node, DateAdd):
+        return {
+            "node": "date_add",
+            "unit": node.unit,
+            "date": to_json(node.date),
+            "count": to_json(node.count),
+        }
     raise TypeError(f"not a FLUID SQL/1 node: {node!r}")
 
 
@@ -378,6 +401,7 @@ def from_json(data: Any) -> Node:
         "coalesce": lambda d: Coalesce(tuple(from_json(a) for a in d["args"])),
         "round": lambda d: Round(from_json(d["arg"]), int(d["scale"]), d["mode"]),
         "date_diff": lambda d: DateDiff(d["unit"], from_json(d["from"]), from_json(d["to"])),
+        "date_add": lambda d: DateAdd(d["unit"], from_json(d["date"]), from_json(d["count"])),
     }
     if kind not in builders:
         raise ValueError(f"unknown FLUID SQL/1 node {kind!r}")

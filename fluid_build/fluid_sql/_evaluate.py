@@ -17,6 +17,12 @@ must agree with:
   forward by months keeps the day of the month or lands on a shorter month's
   last day; from a later date to an earlier one the result is negative.
 
+- ``ADD_DAYS(d, n)`` moves ``d`` by ``n`` days and ``ADD_MONTHS(d, n)`` by ``n`` months,
+  keeping the day of the month or clamping it to a shorter month's last day (no
+  month-end preservation: 2001-02-28 plus a month is 2001-03-28); ``ADD_YEARS(d, n)`` is
+  ``ADD_MONTHS(d, 12 * n)``. A result before 0001-01-01 or after 9999-12-31 is NULL, for
+  every ``n``, however large (EXPR-SPEC-3).
+
 A row maps column names to Python values (``None``, ``bool``, ``Fraction``,
 ``str``, ``datetime.date``, ``datetime.datetime``); ``links`` maps each
 relationship to the row it reaches, or ``None`` when it reaches none.
@@ -178,7 +184,39 @@ class _Evaluator:
             if node.unit == "month":
                 return Fraction(months_between(start, end))
             return Fraction(years_between(start, end))
+        if isinstance(node, n.DateAdd):
+            return self.date_add(node)
         raise TypeError(f"not a FLUID SQL/1 node: {node!r}")  # pragma: no cover
+
+    def date_add(self, node: n.DateAdd) -> Optional[datetime.date]:
+        """``ADD_DAYS``, ``ADD_MONTHS`` or ``ADD_YEARS``: NULL in, NULL out."""
+        date, count = self.value(node.date), self.value(node.count)
+        if date is None or count is None:
+            return None
+        return add_to_date(date, node.unit, count)
+
+
+def add_to_date(date: datetime.date, unit: str, count: Any) -> Optional[datetime.date]:
+    """``date`` moved by ``count`` days, months or years (``unit``), or ``None``.
+
+    Total: a result outside ``date.min``..``date.max`` is ``None``, and so is a count that
+    is not a whole number (the checker only lets scale 0 through).
+    """
+    count = Fraction(count)
+    if count.denominator != 1:
+        return None
+    k = count.numerator
+    if unit == "day":
+        # Bound k first: a huge k would overflow timedelta before the range check.
+        if not (date.min - date).days <= k <= (date.max - date).days:
+            return None
+        return date + datetime.timedelta(days=k)
+    months = k * 12 if unit == "year" else k
+    # Bound the month index first: a huge k would make add_months build a year past 9999.
+    index = date.year * 12 + date.month - 1 + months
+    if not 12 <= index <= 9999 * 12 + 11:
+        return None
+    return add_months(date, months)
 
 
 def _compare(op: str, left: Any, right: Any) -> bool:

@@ -188,9 +188,11 @@ def test_a_profile_publishes_what_passes_and_withholds_the_rest(tmp_path):
 
     # The four nullCounts (three zeros and a 4), and the distinctCount of market and
     # placed_at (2 values each, which round to 0).
-    assert result.withheld == {"A": 6}
-    # rowCount, amount's mean/1, and every published metric.
-    assert result.published == 1 + 1 + sum(
+    # The quantiles at 0.25 and 0.75 of amount, and all three of placed_at, have a cell of
+    # no records below or above their bin, so they are withheld beside the six metrics.
+    assert result.withheld == {"A": 11}
+    # rowCount, amount's mean/1 and its median's bin, and every published metric.
+    assert result.published == 1 + 1 + 1 + sum(
         1
         for col in table["columns"].values()
         for m in col["metrics"].values()
@@ -207,7 +209,7 @@ def test_a_number_column_carries_mean_1_on_the_documents_grid(tmp_path):
     columns = result.document["tables"]["orders"]["columns"]
     assert result.document["encoding"] == {"fractionalBits": 16, "rounding": "floor"}
     # k is rounded as count is; Sx is the sum of the values on the grid.
-    assert columns["amount"]["statistics"] == [
+    assert [s for s in columns["amount"]["statistics"] if s["definition"] == "mean/1"] == [
         {
             "definition": "mean/1",
             "sampleSize": {"min": 38, "max": 42},
@@ -215,9 +217,18 @@ def test_a_number_column_carries_mean_1_on_the_documents_grid(tmp_path):
             "groups": [{"group": "", "k": 40, "Sx": str(620 * 2**16), "status": "F"}],
         }
     ]
-    # A timestamp or a category gets no statistic.
-    assert [name for name, column in columns.items() if "statistics" in column] == ["amount"]
-    assert result.statistics == (("amount", "mean/1", None, None),)
+    # A timestamp gets only the default quantiles, and a string without levels nothing.
+    definitions = {
+        name: sorted({s["definition"] for s in column.get("statistics", ())})
+        for name, column in columns.items()
+    }
+    assert definitions == {
+        "amount": ["mean/1", "quantile/2"],
+        "market": [],
+        "placed_at": ["quantile/2"],
+        "note": [],
+    }
+    assert ("amount", "mean/1", None, None) in result.statistics
     assert result.fractional_bits == 16
 
 
@@ -235,10 +246,10 @@ def test_an_order_statistic_too_few_records_hold_is_withheld(tmp_path):
 
 def test_a_sum_one_record_dominates_is_withheld(tmp_path):
     rows = _rows()
-    rows[0]["amount"] = "1000000.00"
+    rows[0]["amount"] = "1234567.00"  # not an edge of the ladder its quantiles are binned on
     result = profile_expose(ORDERS, "orders", source=_slice(tmp_path, rows), backend=FakeBackend())
     assert _metrics(result, "amount")["sum"]["status"] == "O"
-    assert "1000000" not in result.canonical.decode("utf-8")
+    assert "1234567" not in result.canonical.decode("utf-8")
 
 
 def test_a_small_table_publishes_nothing_but_stays_a_valid_profile(tmp_path):
@@ -320,7 +331,11 @@ def test_a_constant_column_withholds_its_sum_and_publishes_its_value(tmp_path):
 
 
 def _mean(result, column="amount"):
-    (statistic,) = result.document["tables"]["orders"]["columns"][column]["statistics"]
+    (statistic,) = [
+        each
+        for each in result.document["tables"]["orders"]["columns"][column]["statistics"]
+        if each["definition"] == "mean/1"
+    ]
     assert statistic["definition"] == "mean/1"
     (group,) = statistic["groups"]
     return statistic, group
@@ -336,7 +351,7 @@ def _amounts(values):
 @pytest.mark.parametrize(
     ("values", "status"),
     [
-        (["1000000.00"] + ["1.00", "2.00", "3.00"] * 13, "O"),  # one record dominates the sum
+        (["1234567.00"] + ["1.00", "2.00", "3.00"] * 13, "O"),  # one record dominates the sum
         (["1"] * 3 + ["0"] * 37, "A"),  # 3 records contribute: a sum of 0s and 1s is a count
         (["7.00"] * 40, "C"),  # one value: the sum is a count of it
         (["1.00", "2.00"] * 20, "C"),  # two values, both published as min and max
@@ -350,8 +365,8 @@ def test_a_mean_is_withheld_where_the_sum_is(tmp_path, values, status):
     statistic, group = _mean(result)
     assert group == {"group": "", "status": status}
     assert statistic["sampleSize"] == {"min": 38, "max": 42}
-    assert result.statistics == ()
-    assert "1000000" not in result.canonical.decode("utf-8")
+    assert not [each for each in result.statistics if each[1] == "mean/1"]
+    assert "1234567" not in result.canonical.decode("utf-8")  # no edge of the ladder either
 
 
 def test_a_small_table_withholds_its_mean_as_a_small_count(tmp_path):
@@ -437,7 +452,8 @@ def test_a_column_with_no_value_has_no_mean_where_zeros_publish(tmp_path):
     published = profile_expose(
         ORDERS, "orders", source=source, backend=FakeBackend(), rule=zeros_publish
     )
-    assert "statistics" not in published.document["tables"]["orders"]["columns"]["amount"]
+    statistics = published.document["tables"]["orders"]["columns"]["amount"]["statistics"]
+    assert "mean/1" not in {each["definition"] for each in statistics}
 
 
 @pytest.mark.parametrize("fractional_bits", [-1, 129, True, "16"])
@@ -470,3 +486,121 @@ def test_prices_that_all_end_in_99_withhold_the_mean_but_not_the_sum(tmp_path):
     )
     assert _metrics(result, "amount")["sum"]["status"] == "F"
     assert _mean(result)[1] == {"group": "", "status": "C"}
+
+
+# -- several exposes, one document -----------------------------------------------------
+
+
+def _two_tables():
+    return {
+        "fluidVersion": "0.7.7",
+        "kind": "DataProduct",
+        "id": "p",
+        "exposes": [
+            {"exposeId": "org", "contract": {"schema": [{"name": "name", "type": "string"}]}},
+            {
+                "exposeId": "account",
+                "contract": {"schema": [{"name": "plan", "type": "string"}]},
+            },
+        ],
+    }
+
+
+def _ndjson(path: Path, rows) -> str:
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return str(path)
+
+
+def test_several_exposes_go_into_one_document_each_from_its_own_source(tmp_path):
+    org = _ndjson(tmp_path / "org.ndjson", [{"name": f"o{n % 3}"} for n in range(12)])
+    account = _ndjson(tmp_path / "acct.ndjson", [{"plan": "basic"} for _ in range(20)])
+    result = runner.profile_exposes(
+        _two_tables(),
+        [runner.ExposeSource("account", account), runner.ExposeSource("org", org)],
+        backend=FakeBackend(),
+    )
+    tables = result.document["tables"]
+    assert list(tables) == ["account", "org"]
+    assert tables["org"]["rowCount"] == 10 and tables["account"]["rowCount"] == 20
+    assert [table.plan.expose_id for table in result.tables] == ["account", "org"]
+    assert result.digest == digest_of(result.canonical)
+    with pytest.raises(ValueError, match="one result per expose"):
+        result.plan  # noqa: B018 - a profile of two exposes has no one plan
+
+
+def test_an_expose_named_twice_is_refused_before_any_read(tmp_path):
+    source = _ndjson(tmp_path / "org.ndjson", [{"name": "x"}])
+    with pytest.raises(ProfileError) as refused:
+        runner.profile_exposes(
+            _two_tables(),
+            [runner.ExposeSource("org", source), runner.ExposeSource("org", "missing.ndjson")],
+            backend=FakeBackend(),
+        )
+    assert refused.value.event == "profile_expose_repeated"
+
+
+def test_one_expose_profiles_as_it_always_did(tmp_path):
+    rows = _rows()
+    one = profile_expose(ORDERS, "orders", source=_slice(tmp_path, rows), backend=FakeBackend())
+    many = runner.profile_exposes(
+        ORDERS, [runner.ExposeSource("orders", _slice(tmp_path, rows))], backend=FakeBackend()
+    )
+    assert one.canonical == many.canonical
+    assert one.plan == many.plan
+
+
+# -- a column the contract types date -----------------------------------------------------
+
+_DATED = _contract(("signed_on", "date"), ("seen_at", "timestamp"), expose_id="contracts")
+
+
+def test_a_date_written_yyyy_mm_dd_is_read_as_that_day(tmp_path):
+    rows = [{"signed_on": "2026-01-31", "seen_at": "2026-01-31T00:00:00.000Z"} for _ in range(12)]
+    result = profile_expose(
+        _DATED, "contracts", source=_ndjson(tmp_path / "c.ndjson", rows), backend=FakeBackend()
+    )
+    columns = result.document["tables"]["contracts"]["columns"]
+    # The day's midnight in UTC, in milliseconds since the epoch, as a Parquet date reads.
+    assert columns["signed_on"]["metrics"]["min"]["value"] == "1769817600000"
+    assert columns["signed_on"]["metrics"] == columns["seen_at"]["metrics"]
+
+
+@pytest.mark.parametrize("text", ["2026-02-30", "31/01/2026", "2026-1-31", "2026-01-31 10:00"])
+def test_a_date_not_written_as_a_calendar_day_is_refused(tmp_path, text):
+    rows = [{"signed_on": text, "seen_at": None}]
+    with pytest.raises(ReadRefused, match=r"column 'signed_on' row 0") as refused:
+        profile_expose(
+            _DATED, "contracts", source=_ndjson(tmp_path / "c.ndjson", rows), backend=FakeBackend()
+        )
+    assert text not in str(refused.value)
+
+
+def test_a_timestamp_column_still_needs_rfc_3339(tmp_path):
+    rows = [{"signed_on": None, "seen_at": "2026-01-31"}]
+    with pytest.raises(ReadRefused, match=r"column 'seen_at' row 0"):
+        profile_expose(
+            _DATED, "contracts", source=_ndjson(tmp_path / "c.ndjson", rows), backend=FakeBackend()
+        )
+
+
+def test_a_csv_date_column_profiles_as_the_same_parquet_column_does(tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    backend = load_backend()
+    days = [f"2026-0{1 + n % 3}-{10 + n % 7:02d}" for n in range(60)]
+    csv = tmp_path / "c.csv"
+    csv.write_text("signed_on,seen_at\n" + "".join(f"{d},\n" for d in days), encoding="utf-8")
+    parquet = tmp_path / "c.parquet"
+    con = duckdb.connect()
+    try:
+        con.execute(
+            "COPY (SELECT CAST(signed_on AS DATE) AS signed_on, "
+            "CAST(NULL AS TIMESTAMPTZ) AS seen_at "
+            f"FROM read_csv('{csv}', all_varchar = true)) TO '{parquet}' (FORMAT parquet)"
+        )
+    finally:
+        con.close()
+    from_csv = profile_expose(_DATED, "contracts", source=str(csv), backend=backend)
+    from_parquet = profile_expose(_DATED, "contracts", source=str(parquet), backend=backend)
+    signed = from_csv.document["tables"]["contracts"]["columns"]["signed_on"]
+    assert signed["domain"] == "timestamp"
+    assert signed == from_parquet.document["tables"]["contracts"]["columns"]["signed_on"]

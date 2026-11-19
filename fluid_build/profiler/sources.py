@@ -16,7 +16,8 @@
 * a CSV or Parquet file, through DuckDB, inside the sandbox ``fluid init
   --discover`` reads with (:mod:`fluid_build.providers._duckdb_sandbox`), allowed
   that one file and nothing else. A CSV is read with every column as text
-  (``all_varchar``), so a decimal arrives as the digits the file holds.
+  (``all_varchar``), so a decimal arrives as the digits the file holds, and a date
+  as its text, which the runner reads as the contract's ``date`` type says.
 * a ``postgres://``, ``mysql://`` or ``sqlite:///`` database, attached by
   :func:`fluid_build.cli.discover._jdbc_introspect.attach_jdbc_source`, the one
   place ``fluid init --discover`` opens such a source.
@@ -57,6 +58,7 @@ __all__ = [
     "SourceError",
     "describe_source",
     "local_file",
+    "midnight_utc",
     "read_columns",
 ]
 
@@ -108,11 +110,19 @@ def _scheme(source: str) -> str:
 
 
 def describe_source(source: str) -> str:
-    """*source* as it may be shown: a database URI with its password masked."""
+    """*source* as it may be shown: a database URI with its password masked.
+
+    A URI after a leading ``<name>=`` is masked too, so a ``--source`` paired with an
+    exposeId, or with a mistyped one, never shows its password. A URI's own ``=`` (its
+    query) sits after ``://``.
+    """
     if _scheme(source) in DATABASE_SCHEMES:
         from fluid_build.cli.discover._jdbc_introspect import _masked_uri
 
         return _masked_uri(source)
+    head, sep, rest = source.partition("=")
+    if sep and "://" not in head and "://" in rest:
+        return f"{head}={describe_source(rest)}"
     return source
 
 
@@ -219,11 +229,16 @@ def _rfc3339(moment: datetime) -> str:
     )
 
 
+def midnight_utc(day: date) -> str:
+    """A date as the registry reads it: that day's midnight in UTC, in RFC 3339."""
+    return f"{day.year:04d}-{day.month:02d}-{day.day:02d}T00:00:00.000Z"
+
+
 def _wire(value: Any) -> Any:
     if isinstance(value, datetime):
         return _rfc3339(value)
     if isinstance(value, date):
-        return f"{value.year:04d}-{value.month:02d}-{value.day:02d}T00:00:00.000Z"
+        return midnight_utc(value)
     if isinstance(value, uuid.UUID):
         return str(value)
     return value

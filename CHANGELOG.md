@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`fluid profile` publishes the statistics `fluxsim init` reads, without a bundle.** With no
+  `--bundle`, the profiler declares a fidelity block from the contract alone, never from the
+  records, and answers it through the same path as a Simulation's block, so flux-stats parses
+  and checks every statistic (`check_edge_counts`, ADR 0012, and the ACRO rules):
+  - every `enum(...)` column gets `levelHistogram/1` over every declared level; a level that
+    no record holds is listed, its cell withheld as `C`, so `fluxsim init` no longer drops a
+    histogram that lacked it;
+  - a number whose `validationRules` declare both ends of a range, each inside its type, gets
+    `marginalHistogram/1` over about ten bins of one width, exact at both ends (an integer range
+    ends half a unit past its top, a whole unit at `--fractional-bits 0`, so each value has a
+    bin of its own);
+  - any other number of a bounded type (a range of one side, or with a side at the type's own
+    bound, included), and every date and timestamp, gets `quantile/2` at 0.25, 0.5 and 0.75 on
+    a ladder fixed by the type: 0, ±1, ±2, ±5, ±10 ... within the type's bounds for a number,
+    one bin per year from 1900 to 2100 for a date or a timestamp;
+  - each categorical `semantics.dimensions` entry on an `enum` column groups the other `enum`
+    columns' level histograms by its levels, every declared level a group, one that no record
+    holds included; one column's groupings hold at most 10,000 cells together, and a grouping
+    past that is left out and named, since checking them costs about the cube of the levels.
+  A number with neither a range of two ends nor a bounded type (a `decimal` without `(p,s)`)
+  gets no such statistic, and the summary says so. A record outside what the contract declares
+  (a level its type does not list, a value outside its type or its declared range, a strict
+  bound included) now refuses the profile with `profile_record_outside_declared_domain`, naming
+  the column and the row, never the value. A profile that holds a `quantile/2` names format
+  `1-1-0`, which flux-stats reads from 0.7, so a profile without `--bundle` of a contract with a
+  bounded number, a date or a timestamp is now a `1-1-0` document, with new bytes and digest.
+- **Every new count table is audited for differencing, world by world.** A test profiles every
+  world of up to seven records for each kind of table under scaled-down ACRO rules, groups the
+  worlds by the document they publish, and fails on a count of one record or of none that the
+  new statistics pin. Run on larger universes under the ACRO defaults (up to 45 records, 46,376
+  worlds for a grouping), it found three channels, which the profiler now closes:
+  - a column's `distinctCount` says how many withheld cells hold no record, so a column a
+    level histogram counts, or that a grouped statistic groups by, withholds it under `D`,
+    with or without `--bundle`;
+  - a number's exact `sum`, and its `min`, `max`, `quantiles` and `distinctCount`, give a
+    withheld bin of a declared range back, so a number with a default histogram withholds them
+    under `D` and has no `mean/1`;
+  - a histogram and quantiles on the same bins, checked together, let a reader who knows the
+    check's choices tell worlds apart, so a column gets one or the other.
+  With these, the audit finds no such pin under the ACRO defaults.
+- **`fluid profile` profiles a whole data product in one call.** `--expose` repeats, and each
+  expose takes its records as `--source <exposeId>=<location>` (and a database's table as
+  `--table <exposeId>=<table>`); with no `--expose`, every expose a source names is profiled,
+  in the contract's order. The result is one profile document whose `tables` hold every expose,
+  written to `<contract id>.profile.json` unless `--out` names it, and read back whole before it
+  is written. One `--expose` with one bare `--source` works as before. A source that pairs with
+  no expose, an expose without a source, a source no `--expose` names and a second source for
+  one expose are refused before any record is read, and a database source's password is masked
+  in every refusal. With `--bundle`, each expose answers its own block, and the blocks must
+  declare one grid.
+- **FLUID SQL/1 moves a date by whole days, months and years.** `ADD_DAYS(d, n)`,
+  `ADD_MONTHS(d, n)` and `ADD_YEARS(d, n)` take a date and a count of scale 0 and give a date,
+  with flux-expr/3's meaning (`RFC-data-rules.md` §2.6, amended): a month or year move keeps the
+  day of the month or clamps it to the last day of a shorter month (31 January plus one month is
+  28 or 29 February, and 28 February plus one month is 28 March), a NULL argument gives NULL,
+  and a result outside 0001-01-01 to 9999-12-31 is NULL, never an error, however large the
+  count. Every dialect renders them with a guarded count, so no engine adds an out-of-range
+  count (§2.8), and Snowflake gets `DATEADD`, never its own `ADD_MONTHS`, which keeps month
+  ends. The conformance vectors are version 1.1.0, with 51 new vectors at the month ends, at
+  the edges of the range and for each refusal.
+
+### Fixed
+
+- **`fluid profile` reads a CSV date column.** A column the contract types `date` reads a
+  `YYYY-MM-DD` text as that day's midnight in UTC, as a Parquet date always read, from any
+  source. A CSV date column used to be refused (FLX-5022). The text is read strictly: anything
+  but a calendar day written `YYYY-MM-DD` goes to the reader as before, which refuses it, and
+  DuckDB's own date reader is not used, because it reads `infinity` and `epoch` as dates and
+  drops a time of day.
+- **`fluid profile` no longer reads one expose's records as another's.** argparse kept the last
+  of two `--expose` flags, so `--expose org --expose account --source org.csv` profiled
+  `org.csv` as the `account` expose. Several `--expose` flags now take one
+  `--source <exposeId>=<location>` each, and are refused before any record is read without
+  them (`profile_source_unpaired`); an expose named twice is `profile_expose_repeated`.
+- **A grouped statistic's `sampleSize` no longer gives back the records a null `groupBy` key
+  leaves out.** It banded the records its groups hold. Beside the column's own `count`, the
+  `groupBy` column's and the row count, that band pinned how many records hold a value and a
+  null key, a small count, under rules that round and under exact counts alike (the disclosure
+  audit found it once both columns held nulls; `--bundle` profiles had it too). It now bands the
+  column's non-null records, as the column's ungrouped statistics do.
+
 ## [0.35.0] — 2026-11-19
 
 ### Added

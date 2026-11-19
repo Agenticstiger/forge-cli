@@ -18,6 +18,10 @@ Names (§2.2), types (§2.3) and static scales (§2.4) of ``RFC-data-rules.md``:
   a comparison or ``BETWEEN``, ``IS [NOT] NULL``, unary minus, ``ROUND``'s
   argument, a predicate position, a whole value) it is refused, and so is a
   construct whose operands are all NULL literals.
+- ``ADD_DAYS``, ``ADD_MONTHS`` and ``ADD_YEARS`` take a date and a number of scale
+  0 (a float, a decimal without ``(p,s)`` and a ``/`` have no static scale), and
+  neither argument may be the NULL literal: it would give the call no type to
+  check the other against, and the count's scale could not be known.
 - A string literal compared with a column that declares an enum is one of its
   values, or one of the column's placeholders.
 - Scales: a literal has its written scale and a column its declared one; ``+``
@@ -353,7 +357,30 @@ class _Checker:
                 if t.kind is not None:
                     self._need(t, DATE, arg, name)
             return _T(NUMBER, 0)
+        if isinstance(node, n.DateAdd):
+            return self._date_add(node)
         raise TypeError(f"not a FLUID SQL/1 node: {node!r}")  # pragma: no cover
+
+    def _date_add(self, node: n.DateAdd) -> _T:
+        """``ADD_DAYS``, ``ADD_MONTHS`` or ``ADD_YEARS``: a date and a count of scale 0."""
+        name = n.DATE_ADD_FUNCTIONS[node.unit]
+        date, count = self.typed(node.date), self.typed(node.count)
+        for t, arg in ((date, node.date), (count, node.count)):
+            if t.kind is None:
+                raise FluidSqlError(
+                    "null-literal", f"{name} takes a value, not the NULL literal", arg.pos
+                )
+        self._need(date, DATE, node.date, name)
+        self._need(count, NUMBER, node.count, name)
+        if count.scale != 0:
+            raise FluidSqlError(
+                "type-mismatch",
+                f"{name} takes a count of scale 0, but {_short(node.count)} has "
+                + ("no static scale" if count.scale is None else f"scale {count.scale}")
+                + " (ROUND(x, 0) makes a whole count)",
+                node.count.pos,
+            )
+        return _T(DATE)
 
     def _need(self, t: _T, kind: str, node: n.Node, construct: str) -> None:
         if t.kind != kind:

@@ -35,13 +35,14 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import date
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build.policy._common import iter_exposes
-from fluid_build.profiler import disclosure, document, sources
+from fluid_build.profiler import defaults, disclosure, document, sources
 from fluid_build.profiler._stats import (
     WITHHELD_ROUNDING,
     BlockRefused,
@@ -63,11 +64,15 @@ __all__ = [
     "DEFAULT_QUANTILE_LEVELS",
     "ColumnPlan",
     "ExposePlan",
+    "ExposeSource",
     "ProfileError",
     "ProfileResult",
+    "TableResult",
     "column_domain",
+    "expose_ids",
     "plan_expose",
     "profile_expose",
+    "profile_exposes",
     "resolve_expose_id",
 ]
 
@@ -151,6 +156,8 @@ class ProfileError(Exception):
 class ColumnPlan:
     name: str
     domain: str
+    #: The contract types the column ``date``: a ``YYYY-MM-DD`` text in it is that day.
+    date: bool = False
 
 
 @dataclass(frozen=True)
@@ -169,21 +176,19 @@ PartlyNamedStatistic = Tuple[str, str, Optional[str], Optional[str], int, int]
 
 
 @dataclass(frozen=True)
-class ProfileResult:
-    document: Dict[str, Any]
-    canonical: bytes
-    digest: str
+class ExposeSource:
+    """One expose a profile reads, and where its records live (``--source``, ``--table``)."""
+
+    expose_id: str
+    source: str
+    table: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TableResult:
+    """What the profile says about one expose, for the owner's summary."""
+
     plan: ExposePlan
-    published: int
-    #: Withheld values per ``CL_CONF_STATUS`` code of the check that withheld them: a
-    #: histogram's or a quantile's withheld groups are written ``C`` whatever the check, and
-    #: counted here by the check (:func:`_code`).
-    withheld: Mapping[str, int] = field(default_factory=dict)
-    #: The histogram cells withheld inside published groups, per code of the check
-    #: that withheld them; the document writes each ``C``.
-    withheld_cells: Mapping[str, int] = field(default_factory=dict)
-    #: The grid the document declares and its on-grid statistics were formed on.
-    fractional_bits: int = DEFAULT_FRACTIONAL_BITS
     #: Each published fidelity statistic (:data:`NamedStatistic`).
     statistics: Tuple[NamedStatistic, ...] = ()
     #: Each fidelity statistic written with every group withheld: a run that checks
@@ -194,12 +199,66 @@ class ProfileResult:
     partly_withheld_statistics: Tuple[PartlyNamedStatistic, ...] = ()
     #: Each declared property the document does not answer, with the reason.
     left_out: Tuple[Tuple[str, str], ...] = ()
+    #: Each number, date or timestamp column the contract gives no default statistic,
+    #: with why (:mod:`fluid_build.profiler.defaults`).
+    uncovered: Tuple[Tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class ProfileResult:
+    document: Dict[str, Any]
+    canonical: bytes
+    digest: str
+    #: One result per expose, in the order they were profiled.
+    tables: Tuple[TableResult, ...]
+    published: int
+    #: Withheld values per ``CL_CONF_STATUS`` code of the check that withheld them: a
+    #: histogram's or a quantile's withheld groups are written ``C`` whatever the check, and
+    #: counted here by the check (:func:`_code`).
+    withheld: Mapping[str, int] = field(default_factory=dict)
+    #: The histogram cells withheld inside published groups, per code of the check
+    #: that withheld them; the document writes each ``C``.
+    withheld_cells: Mapping[str, int] = field(default_factory=dict)
+    #: The grid the document declares and its on-grid statistics were formed on.
+    fractional_bits: int = DEFAULT_FRACTIONAL_BITS
+
+    def _only(self) -> TableResult:
+        if len(self.tables) != 1:
+            raise ValueError("a profile of several exposes has one result per expose: read .tables")
+        return self.tables[0]
+
+    # The one expose of a profile of one expose, as these were before several could be read.
+
+    @property
+    def plan(self) -> ExposePlan:
+        return self._only().plan
+
+    @property
+    def statistics(self) -> Tuple[NamedStatistic, ...]:
+        return self._only().statistics
+
+    @property
+    def withheld_statistics(self) -> Tuple[NamedStatistic, ...]:
+        return self._only().withheld_statistics
+
+    @property
+    def partly_withheld_statistics(self) -> Tuple[PartlyNamedStatistic, ...]:
+        return self._only().partly_withheld_statistics
+
+    @property
+    def left_out(self) -> Tuple[Tuple[str, str], ...]:
+        return self._only().left_out
+
+
+def _base_type(type_name: Any) -> str:
+    """A FLUID column type in lower case, without its parameters: ``decimal(10,2)`` is ``decimal``."""
+    text = re.sub(r"\s+", " ", str(type_name or "").strip().lower())
+    return re.sub(r"\s*\(.*\)$", "", text)
 
 
 def column_domain(type_name: Any) -> Tuple[Optional[str], Optional[str]]:
     """The profile domain a FLUID column type is read in, or ``None`` and the reason."""
-    text = re.sub(r"\s+", " ", str(type_name or "").strip().lower())
-    base = re.sub(r"\s*\(.*\)$", "", text)
+    base = _base_type(type_name)
     if base in _CATEGORY_TYPES:
         return CATEGORY, None
     if base in _NUMBER_TYPES:
@@ -211,9 +270,14 @@ def column_domain(type_name: Any) -> Tuple[Optional[str], Optional[str]]:
     return None, "the type is not one fluid profile reads"
 
 
+def expose_ids(contract: Mapping[str, Any]) -> List[str]:
+    """The contract's exposeIds, in the order it declares them."""
+    return [str(item["exposeId"]) for item in iter_exposes(dict(contract)) if item.get("exposeId")]
+
+
 def resolve_expose_id(contract: Mapping[str, Any], requested: Optional[str]) -> str:
     """The expose to profile: *requested*, or the contract's only expose."""
-    ids = [str(item["exposeId"]) for item in iter_exposes(dict(contract)) if item.get("exposeId")]
+    ids = expose_ids(contract)
     if requested:
         if requested in ids:
             return requested
@@ -265,7 +329,8 @@ def plan_expose(contract: Mapping[str, Any], expose_id: str) -> ExposePlan:
         if domain is None:
             skipped.append((name, reason or ""))
         else:
-            columns.append(ColumnPlan(name=name, domain=domain))
+            is_date = _base_type(entry.get("type")) == "date"
+            columns.append(ColumnPlan(name=name, domain=domain, date=is_date))
     return ExposePlan(expose_id=expose_id, columns=tuple(columns), skipped=tuple(skipped))
 
 
@@ -282,11 +347,13 @@ def _column(
     tally: "Counter[str]",
     fractional_bits: int,
     declares_mean: bool = False,
+    withhold: FrozenSet[str] = frozenset(),
 ) -> Dict[str, Any]:
     """One column of the table: its domain, then its checked metrics and statistics.
 
     *declares_mean* says the fidelity block declares an ungrouped ``mean`` of this
     column: that statistic replaces the fixed ``mean/1``, which is not formed.
+    *withhold* names the metrics withheld whatever their value (:func:`_counted_levels`).
     """
     read = [
         backend.read_value(column.domain, value, column=column.name, row_index=index)
@@ -294,7 +361,7 @@ def _column(
     ]
     entry: Dict[str, Any] = {
         "domain": column.domain,
-        "metrics": _column_metrics(column, read, row_count, backend, rule, tally),
+        "metrics": _column_metrics(column, read, row_count, backend, rule, tally, withhold),
     }
     statistics = (
         []
@@ -313,8 +380,13 @@ def _column_metrics(
     backend: StatisticsBackend,
     rule: disclosure.DisclosureRule,
     tally: "Counter[str]",
+    withhold: FrozenSet[str] = frozenset(),
 ) -> Dict[str, Any]:
-    """The checked ``metrics`` object of one column, from its values as read."""
+    """The checked ``metrics`` object of one column, from its values as read.
+
+    A metric *withhold* names is withheld under ``D`` whatever its value and its own
+    check, so its status says nothing about the records either.
+    """
     present = [value for value in read if value is not None]
     holders = Counter(present)
     counted = disclosure.check_count(len(present), rule)
@@ -341,6 +413,8 @@ def _column_metrics(
             verdict, shown = counted, value
             if counted.published:
                 verdict, shown = _check_described(name, value, present, holders, rule)
+        if name in withhold:
+            verdict = disclosure.Verdict(disclosure.SECONDARY, "counts what a histogram withholds")
         entry: Dict[str, Any] = {
             "definition": metric.identifier,
             "status": verdict.status,
@@ -459,13 +533,195 @@ def profile_expose(
 ) -> ProfileResult:
     """Profile *expose_id* of *contract* from the records *source* names.
 
+    :func:`profile_exposes` of this one expose: *bundle* is the fidelity block it answers.
+    """
+    return profile_exposes(
+        contract,
+        [ExposeSource(expose_id, source, table)],
+        backend=backend,
+        cwd=cwd,
+        rule=rule,
+        producer=producer,
+        fractional_bits=fractional_bits,
+        bundles=None if bundle is None else {expose_id: bundle},
+    )
+
+
+def profile_exposes(
+    contract: Mapping[str, Any],
+    exposes: Sequence[ExposeSource],
+    *,
+    backend: StatisticsBackend,
+    cwd: Optional[Path] = None,
+    rule: disclosure.DisclosureRule = disclosure.ACRO_DEFAULT,
+    producer: Optional[str] = None,
+    fractional_bits: Optional[int] = None,
+    bundles: Optional[Mapping[str, BundleBlock]] = None,
+) -> ProfileResult:
+    """Profile each of *exposes* of *contract*, each from its own source, into one document.
+
     *fractional_bits* is the grid ``mean/1`` is formed on (16 unless given),
     checked before any record is read; the fidelity block must declare the same
-    (PROFILE-SPEC §7). With a *bundle*, the profile also answers its fidelity
-    block, on the block's grid (:func:`_declared_block`).
+    (PROFILE-SPEC §7). An expose *bundles* holds a block for also answers that
+    block, on the block's grid (:func:`_declared_block`), and the blocks of one
+    document declare one grid. Every expose's plan and block is checked before any
+    record is read, and each expose's records are read once.
     """
     if fractional_bits is not None:
         document.check_fractional_bits(fractional_bits)
+    if not exposes:
+        raise ProfileError(
+            "profile_expose_required", "no expose to profile", {"next": "name one with --expose"}
+        )
+    _refuse_repeated(exposes)
+    plans = [_plan_with_columns(contract, each.expose_id) for each in exposes]
+    blocks = bundles or {}
+    declared: List[Optional[DeclaredBlock]] = []
+    grids: Dict[str, int] = {}
+    for plan in plans:
+        found, grid = _declared_block(
+            blocks.get(plan.expose_id), contract, plan.expose_id, plan, backend, fractional_bits
+        )
+        declared.append(found)
+        if found is not None:
+            grids[plan.expose_id] = grid
+    fractional_bits = _one_grid(grids, blocks, fractional_bits)
+    uncovered: List[Tuple[Tuple[str, str], ...]] = [() for _ in plans]
+    for position, plan in enumerate(plans):
+        if plan.expose_id not in blocks:
+            declared[position], uncovered[position] = _default_block(
+                contract, plan, backend, fractional_bits
+            )
+    reads = [
+        _dates_read(
+            plan,
+            sources.read_columns(
+                each.source, [column.name for column in plan.columns], table=each.table, cwd=cwd
+            ),
+        )
+        for each, plan in zip(exposes, plans, strict=True)
+    ]
+    tallies: Tuple["Counter[str]", "Counter[str]"] = (Counter(), Counter())
+    tables_doc: Dict[str, Dict[str, Any]] = {}
+    results: List[TableResult] = []
+    for plan, read, found, missing in zip(plans, reads, declared, uncovered, strict=True):
+        table_doc, result = _profile_table(
+            plan,
+            read,
+            found,
+            backend,
+            rule,
+            tallies,
+            fractional_bits,
+        )
+        tables_doc[plan.expose_id] = table_doc
+        results.append(replace(result, uncovered=missing))
+    if producer is None:
+        from fluid_build import __version__
+
+        producer = document.producer_uri(__version__)
+    built = document.build_document(
+        producer=producer,
+        rule=rule,
+        tables=tables_doc,
+        fractional_bits=fractional_bits,
+    )
+    canonical = document.canonical_bytes(built)
+    backend.check_document(canonical.decode("utf-8"))
+    tally, cell_tally = tallies
+    published = tally.pop(disclosure.FREE, 0)
+    return ProfileResult(
+        document=built,
+        canonical=canonical,
+        digest=document.digest_of(canonical),
+        tables=tuple(results),
+        published=published,
+        withheld=dict(sorted(tally.items())),
+        withheld_cells=dict(sorted(cell_tally.items())),
+        fractional_bits=fractional_bits,
+    )
+
+
+#: A date as a CSV, a JSON slice or a text column writes one: exactly ``YYYY-MM-DD``.
+_DATE_TEXT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
+
+
+def _dates_read(plan: ExposePlan, read: sources.SourceColumns) -> sources.SourceColumns:
+    """*read*, with each ``YYYY-MM-DD`` text of a column the contract types ``date`` as that day.
+
+    A CSV holds every value as text, and the registry reads a timestamp only from
+    RFC 3339 with an offset (FLX-5022), so a ``date`` column read from a CSV was refused
+    where Parquet's, which arrives as a date, was read. The text is read strictly, as
+    the contract's type says: exactly ``YYYY-MM-DD`` and a real calendar day becomes that
+    day's midnight in UTC, as a date from a Parquet file or a database does
+    (:func:`sources.midnight_utc`). Any other value goes on as it came, for the reader to
+    read or refuse: DuckDB's own date reader is not used, because it reads ``infinity``
+    and ``epoch`` as dates and drops a time of day.
+    """
+    days = [column.name for column in plan.columns if column.date]
+    if not days:
+        return read
+    values = dict(read.values)
+    for name in days:
+        values[name] = [_as_day(value) for value in read.values[name]]
+    return replace(read, values=values)
+
+
+def _as_day(value: Any) -> Any:
+    if isinstance(value, str) and _DATE_TEXT.match(value):
+        try:
+            return sources.midnight_utc(date.fromisoformat(value))
+        except ValueError:  # not a calendar day: the reader refuses it as written
+            return value
+    return value
+
+
+def _default_block(
+    contract: Mapping[str, Any], plan: ExposePlan, backend: StatisticsBackend, fractional_bits: int
+) -> Tuple[Optional[DeclaredBlock], Tuple[Tuple[str, str], ...]]:
+    """The block the profiler declares for *plan* from the contract alone, read by the registry.
+
+    ``(None, ...)`` when the contract declares nothing to answer. The block is the
+    profiler's own, so a grammar refusal of it is a defect, and says so.
+    """
+    expose = next(
+        item for item in iter_exposes(dict(contract)) if item.get("exposeId") == plan.expose_id
+    )
+    planned = defaults.default_plan(expose, plan.columns, backend.enum_levels, fractional_bits)
+    if planned.block is None:
+        return None, planned.uncovered
+    try:
+        declared = backend.read_block(planned.block, contract, plan.expose_id)
+    except BlockRefused as exc:
+        raise ProfileError(
+            "profile_default_block_refused",
+            f"the statistics fluid profile declares for exposes[{plan.expose_id}] are refused "
+            f"by flux-stats' fidelity grammar: {exc}",
+            {
+                "read": "nothing: no record was read",
+                "next": "report this with your forge-cli and flux-stats versions",
+            },
+        ) from None
+    _check_declared_columns(declared, plan)
+    block = replace(declared, every_declared_group=True, declared_ranges=planned.ranges)
+    return block, planned.uncovered
+
+
+def _refuse_repeated(exposes: Sequence[ExposeSource]) -> None:
+    """Refuse an expose named twice: one document holds each table once."""
+    seen = set()
+    for each in exposes:
+        if each.expose_id in seen:
+            raise ProfileError(
+                "profile_expose_repeated",
+                f"exposes[{each.expose_id}] is named more than once",
+                {"read": "nothing: no record was read", "next": "name each expose once"},
+            )
+        seen.add(each.expose_id)
+
+
+def _plan_with_columns(contract: Mapping[str, Any], expose_id: str) -> ExposePlan:
+    """:func:`plan_expose`, refused when it leaves no column to profile."""
     plan = plan_expose(contract, expose_id)
     if not plan.columns:
         raise ProfileError(
@@ -473,15 +729,48 @@ def profile_expose(
             f"no column of exposes[{expose_id}] has a type fluid profile reads",
             {"not profiled": "; ".join(f"{name}: {reason}" for name, reason in plan.skipped)},
         )
-    declared, fractional_bits = _declared_block(
-        bundle, contract, expose_id, plan, backend, fractional_bits
-    )
-    read = sources.read_columns(
-        source, [column.name for column in plan.columns], table=table, cwd=cwd
-    )
-    tally: "Counter[str]" = Counter()
-    cell_tally: "Counter[str]" = Counter()
-    replaced = _ungrouped_means(declared)
+    return plan
+
+
+def _one_grid(
+    grids: Mapping[str, int], blocks: Mapping[str, BundleBlock], requested: Optional[int]
+) -> int:
+    """The one grid of the document: the blocks' (they must agree), else *requested* or 16.
+
+    :func:`_declared_block` has already refused a *requested* grid a block disagrees with.
+    """
+    if not grids:
+        return DEFAULT_FRACTIONAL_BITS if requested is None else requested
+    first, *others = grids.items()
+    for expose_id, grid in others:
+        if grid != first[1]:
+            raise ProfileError(
+                "profile_fractional_bits_conflict",
+                f"the fidelity blocks of exposes[{first[0]}] ({blocks[first[0]].simulation}) "
+                f"and exposes[{expose_id}] ({blocks[expose_id].simulation}) declare "
+                f"encoding.fractionalBits {first[1]} and {grid}",
+                {
+                    "read": "nothing: no record was read",
+                    "next": "one profile document has one grid: declare the same in both blocks",
+                },
+            )
+    return first[1]
+
+
+def _profile_table(
+    plan: ExposePlan,
+    read: sources.SourceColumns,
+    declared: Optional[DeclaredBlock],
+    backend: StatisticsBackend,
+    rule: disclosure.DisclosureRule,
+    tallies: Tuple["Counter[str]", "Counter[str]"],
+    fractional_bits: int,
+) -> Tuple[Dict[str, Any], TableResult]:
+    """One table of the document, from one read of its records, and its summary."""
+    tally, cell_tally = tallies
+    binned = _binned_numbers(declared, plan)
+    replaced = _ungrouped_means(declared) | binned
+    counted = _counted_levels(declared)
     columns_doc = {
         column.name: _column(
             column,
@@ -492,6 +781,8 @@ def profile_expose(
             tally,
             fractional_bits,
             column.name in replaced,
+            (frozenset({"distinctCount"}) if column.name in counted else frozenset())
+            | (_BINNED_WITHHELD if column.name in binned else frozenset()),
         )
         for column in plan.columns
     }
@@ -506,29 +797,9 @@ def profile_expose(
     row_count = _row_count(read.row_count, rule, tally)
     if row_count is not None:
         table_doc["rowCount"] = row_count
-    if producer is None:
-        from fluid_build import __version__
-
-        producer = document.producer_uri(__version__)
-    built = document.build_document(
-        producer=producer,
-        rule=rule,
-        tables={expose_id: table_doc},
-        fractional_bits=fractional_bits,
-    )
-    canonical = document.canonical_bytes(built)
-    backend.check_document(canonical.decode("utf-8"))
-    published = tally.pop(disclosure.FREE, 0)
     all_published, none_published, some_published = _statistic_summaries(columns_doc)
-    return ProfileResult(
-        document=built,
-        canonical=canonical,
-        digest=document.digest_of(canonical),
+    return table_doc, TableResult(
         plan=plan,
-        published=published,
-        withheld=dict(sorted(tally.items())),
-        withheld_cells=dict(sorted(cell_tally.items())),
-        fractional_bits=fractional_bits,
         statistics=all_published,
         withheld_statistics=none_published,
         partly_withheld_statistics=some_published,
@@ -577,6 +848,51 @@ def _declared_block(
         )
     _check_declared_columns(declared, plan)
     return declared, declared.fractional_bits
+
+
+#: The metrics withheld beside a histogram the contract's own block declares on a number
+#: column's declared range (``_binned_numbers``), whatever their values.
+_BINNED_WITHHELD = frozenset({"sum", "min", "max", "quantiles", "distinctCount"})
+
+
+def _binned_numbers(declared: Optional[DeclaredBlock], plan: ExposePlan) -> FrozenSet[str]:
+    """The number columns the contract's own block gives a histogram over a declared range.
+
+    The bins of a declared range are narrow, often one value each, so an exact ``sum`` is
+    the bins' counts weighed by their values, and a published ``min``, ``max``,
+    ``quantiles`` value or ``distinctCount`` places records in them: beside the cells the
+    check publishes, each gives a withheld one back. So those metrics are withheld under
+    ``D`` and no ``mean/1`` (the sum on the grid) is formed. ``tests/profiler/
+    test_disclosure_oracle.py`` found it, and a quantile on a type's ladder, whose bins are
+    wide, keeps them all.
+    """
+    if declared is None or not declared.every_declared_group:
+        return frozenset()
+    numbers = {column.name for column in plan.columns if column.domain == NUMBER}
+    return frozenset(
+        each.column
+        for each in declared.statistics
+        if each.column in numbers and each.kind == "marginalHistogram"
+    )
+
+
+def _counted_levels(declared: Optional[DeclaredBlock]) -> FrozenSet[str]:
+    """The columns whose levels a level histogram counts, or a grouped statistic groups by.
+
+    Their ``distinctCount`` is withheld: the number of levels that hold a record says how
+    many of the histogram's withheld cells, or of its groups, hold none, and beside the
+    cells the check lets through it can pin a cell of one record or of none (found by
+    ``tests/profiler/test_disclosure_oracle.py``).
+    """
+    if declared is None:
+        return frozenset()
+    found = set()
+    for statistic in declared.statistics:
+        if statistic.kind == "levelHistogram":
+            found.add(statistic.column)
+        if statistic.group_by is not None:
+            found.add(statistic.group_by)
+    return frozenset(found)
 
 
 def _ungrouped_means(declared: Optional[DeclaredBlock]) -> FrozenSet[str]:
@@ -636,6 +952,7 @@ def _declare_statistics(
     the column's other statistics (:func:`_edge_decisions`). *tallies*
     count the values and the histogram cells the checks withhold, by the check.
     """
+    _check_declared_ranges(declared, read, backend)
     rows: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
     left_out: List[Tuple[str, str]] = []
     formed: List[Tuple[DeclaredStatistic, MeasuredStatistic]] = []
@@ -649,6 +966,12 @@ def _declare_statistics(
         try:
             measured = backend.measure(declared, statistic, rows[statistic.columns])
         except MeasureRefused as exc:
+            if declared.every_declared_group:  # the block the contract's declarations give
+                raise ProfileError(
+                    "profile_record_outside_declared_domain",
+                    f"{statistic.description}: {exc}",
+                    {"written": "nothing", "next": _OUTSIDE_DECLARED_DOMAIN},
+                ) from None
             raise ProfileError(
                 "profile_bundle_record_refused",
                 f"{statistic.description}: {exc}",
@@ -663,11 +986,48 @@ def _declare_statistics(
         formed.append((statistic, measured))
     decided = _edge_decisions(formed, backend, rule)
     for position, (statistic, measured) in enumerate(formed):
+        records = None
+        if statistic.group_by is not None:
+            records = sum(1 for value in read.values[statistic.column] if value is not None)
         entry = _declared_entry(
-            statistic, measured, rule, tallies, fractional_bits, decided.get(position)
+            statistic,
+            measured,
+            rule,
+            tallies,
+            fractional_bits,
+            decided.get(position),
+            records=records,
         )
         columns_doc[statistic.column].setdefault("statistics", []).append(entry)
     return left_out
+
+
+#: What to do about a record outside what the contract declares for its column.
+_OUTSIDE_DECLARED_DOMAIN = (
+    "the records and the contract disagree: fix the records, or the contract's column "
+    "type, enum levels or validationRules range, then profile"
+)
+
+
+def _check_declared_ranges(
+    declared: DeclaredBlock, read: sources.SourceColumns, backend: StatisticsBackend
+) -> None:
+    """Refuse a value outside the range its column's validationRules declare, exactly.
+
+    A histogram's bins over the range are rounded outward to the grid, which can be
+    coarser than the column's own scale, so the registry, which checks a value against
+    the bins, would count one just past a bound in an end bin. The value is never shown.
+    """
+    for name, declared_range in declared.declared_ranges.items():
+        for index, value in enumerate(read.values[name]):
+            exact = backend.read_value("number", value, column=name, row_index=index)
+            if exact is not None and not declared_range.holds(exact):
+                raise ProfileError(
+                    "profile_record_outside_declared_domain",
+                    f"column {name!r} row {index}: value outside the range its "
+                    "validationRules declare",
+                    {"written": "nothing", "next": _OUTSIDE_DECLARED_DOMAIN},
+                )
 
 
 #: The declared statistics that count records between edges of their column (FLUX ADR
@@ -802,21 +1162,27 @@ def _declared_entry(
     tallies: Tuple["Counter[str]", "Counter[str]"],
     fractional_bits: int,
     decision: Optional[EdgeDecision],
+    records: Optional[int] = None,
 ) -> Dict[str, Any]:
     """One declared statistic as the document writes it: every group checked, none guessed at.
 
     A histogram's or a quantile's groups come from the *decision* of the output check on
     its column, and a mean's and a support's from their own checks. *tallies* count the
-    groups and the histogram cells that are withheld, by the check.
+    groups and the histogram cells that are withheld, by the check. The ``sampleSize``
+    band is of *records* where given, else of the records the groups hold. A grouped
+    statistic is given its column's non-null records, as its column's ungrouped figures
+    count them: its groups leave out each record whose ``groupBy`` key is null, so their
+    band, beside the column's own counts, would give the number of those back.
     """
     groups = measured.groups
     if decision is not None:
         written = _edge_checked_groups(statistic, measured, rule, tallies, decision)
     else:
         written = _own_checked_groups(statistic, measured, rule, tallies[0], fractional_bits)
+    held = sum(group.k for group in groups) if records is None else records
     entry: Dict[str, Any] = {
         "definition": statistic.identifier,
-        "sampleSize": disclosure.sample_size(sum(group.k for group in groups), rule),
+        "sampleSize": disclosure.sample_size(held, rule),
         "disclosure": rule.name,
         **statistic.shape,
         "groups": written,
@@ -994,7 +1360,10 @@ def _shape(statistic: Mapping[str, Any]) -> Optional[str]:
     if "level" in statistic:
         parts.append(f"at level {statistic['level']}")
     if "bins" in statistic:
-        parts.append(f"over bins {', '.join(statistic['bins'])}")
+        bins = statistic["bins"]
+        # A ladder has scores of edges: their number says which statistic it is.
+        shown = ", ".join(bins) if len(bins) <= 12 else f"{len(bins) - 1} bins"
+        parts.append(f"over bins {shown}" if len(bins) <= 12 else f"over {shown}")
     return " ".join(parts) or None
 
 

@@ -513,7 +513,8 @@ CORE_COMMANDS: Tuple[CoreCommand, ...] = (
         (
             _cmd(
                 "profile",
-                "Profile an expose's records where they live (aggregates only, output-checked)",
+                "Profile a data product's records where they live "
+                "(aggregates only, output-checked)",
             ),
         ),
     ),

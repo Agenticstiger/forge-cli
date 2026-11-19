@@ -147,3 +147,68 @@ def test_the_fill_script_has_nothing_to_fill(capsys: pytest.CaptureFixture[str])
 
 def test_vectors_round_trip_through_json() -> None:
     assert json.loads(json.dumps(DOCUMENT)) == DOCUMENT
+
+
+# -- ADD_DAYS, ADD_MONTHS, ADD_YEARS (EXPR-SPEC-3) ----------------------------------------
+
+_BIG = 10**30
+
+
+@pytest.mark.parametrize("unit", ["day", "month", "year"])
+@pytest.mark.parametrize("count", [_BIG, -_BIG, 2**63, -(2**63) - 1, 10**9, -(10**9)])
+def test_a_huge_count_gives_null_never_an_error(unit: str, count: int) -> None:
+    import datetime
+    from fractions import Fraction
+
+    for day in (datetime.date(2000, 2, 29), datetime.date.min, datetime.date.max):
+        tree = _nodes.DateAdd(unit, _nodes.Column("d"), _nodes.Column("k"))
+        assert fs.evaluate(tree, {"d": day, "k": Fraction(count)}) is None
+
+
+@pytest.mark.parametrize(
+    "unit, day, count, want",
+    [
+        ("day", "2000-01-01", 2921939, "9999-12-31"),
+        ("day", "2000-01-01", 2921940, None),
+        ("day", "2000-01-01", -730119, "0001-01-01"),
+        ("day", "2000-01-01", -730120, None),
+        ("month", "9999-12-31", 0, "9999-12-31"),
+        ("month", "9999-12-31", 1, None),
+        ("month", "0001-01-31", -1, None),
+        ("month", "0001-01-31", 1, "0001-02-28"),
+        ("month", "2001-02-28", 1, "2001-03-28"),
+        ("year", "2000-02-29", 100, "2100-02-28"),
+        ("year", "2000-02-29", 400, "2400-02-29"),
+        ("year", "0001-02-28", 9998, "9999-02-28"),
+        ("year", "0001-02-28", 9999, None),
+    ],
+)
+def test_date_addition_edges(unit: str, day: str, count: int, want: Any) -> None:
+    import datetime
+    from fractions import Fraction
+
+    tree = _nodes.DateAdd(unit, _nodes.Column("d"), _nodes.Column("k"))
+    got = fs.evaluate(tree, {"d": datetime.date.fromisoformat(day), "k": Fraction(count)})
+    assert got == (None if want is None else datetime.date.fromisoformat(want))
+
+
+def test_the_date_addition_names_and_hints() -> None:
+    assert _nodes.DATE_ADD_FUNCTIONS == {
+        "day": "ADD_DAYS",
+        "month": "ADD_MONTHS",
+        "year": "ADD_YEARS",
+    }
+    assert fs.FUNCTIONS[-3:] == ("ADD_DAYS", "ADD_MONTHS", "ADD_YEARS")
+    for text in ("INTERVAL(1)", "DATEADD(day, 1, d)", "DATE_ADD(d, 1)", "TIMESTAMPADD(d, 1)"):
+        with pytest.raises(fs.FluidSqlError) as caught:
+            fs.parse(text)
+        assert "ADD_DAYS(d, n), ADD_MONTHS(d, n) or ADD_YEARS(d, n)" in caught.value.detail
+    with pytest.raises(fs.FluidSqlError) as caught:
+        fs.parse("DATE_SUB(a, b)")
+    assert "DAYS_BETWEEN" in caught.value.detail
+
+
+def test_a_date_addition_prints_its_canonical_text() -> None:
+    tree = fs.parse("add_months( issue_date ,1+1 )")
+    assert fs.canonical(tree) == "ADD_MONTHS(issue_date, 1 + 1)"
+    assert [type(c).__name__ for c in tree.children()] == ["Column", "Arith"]
