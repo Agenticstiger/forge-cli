@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid profile` profiles a whole data product in one call.** `--expose` repeats, and each
+  expose takes its records as `--source <exposeId>=<location>` (and a database's table as
+  `--table <exposeId>=<table>`); with no `--expose`, every expose a source names is profiled,
+  in the contract's order. The result is one profile document whose `tables` hold every expose,
+  written to `<contract id>.profile.json` unless `--out` names it, and read back whole before it
+  is written. One `--expose` with one bare `--source` works as before. A source that pairs with
+  no expose, an expose without a source, a source no `--expose` names and a second source for
+  one expose are refused before any record is read, and a database source's password is masked
+  in every refusal. With `--bundle`, each expose answers its own block, and the blocks must
+  declare one grid.
 - **FLUID SQL/1 moves a date by whole days, months and years.** `ADD_DAYS(d, n)`,
   `ADD_MONTHS(d, n)` and `ADD_YEARS(d, n)` take a date and a count of scale 0 and give a date,
   with flux-expr/3's meaning (`RFC-data-rules.md` §2.6, amended): a month or year move keeps the
@@ -22,10 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`fluid profile` refuses a repeated `--expose`.** argparse kept the last of two `--expose`
-  flags, so `--expose org --expose account --source org.csv` profiled `org.csv` as the
-  `account` expose. A second `--expose` is now refused with `profile_expose_repeated` before
-  any record is read.
+- **`fluid profile` no longer reads one expose's records as another's.** argparse kept the last
+  of two `--expose` flags, so `--expose org --expose account --source org.csv` profiled
+  `org.csv` as the `account` expose. Several `--expose` flags now take one
+  `--source <exposeId>=<location>` each, and are refused before any record is read without
+  them (`profile_source_unpaired`); an expose named twice is `profile_expose_repeated`.
 
 ## [0.35.0] — 2026-11-19
 

@@ -63,11 +63,15 @@ __all__ = [
     "DEFAULT_QUANTILE_LEVELS",
     "ColumnPlan",
     "ExposePlan",
+    "ExposeSource",
     "ProfileError",
     "ProfileResult",
+    "TableResult",
     "column_domain",
+    "expose_ids",
     "plan_expose",
     "profile_expose",
+    "profile_exposes",
     "resolve_expose_id",
 ]
 
@@ -169,21 +173,19 @@ PartlyNamedStatistic = Tuple[str, str, Optional[str], Optional[str], int, int]
 
 
 @dataclass(frozen=True)
-class ProfileResult:
-    document: Dict[str, Any]
-    canonical: bytes
-    digest: str
+class ExposeSource:
+    """One expose a profile reads, and where its records live (``--source``, ``--table``)."""
+
+    expose_id: str
+    source: str
+    table: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TableResult:
+    """What the profile says about one expose, for the owner's summary."""
+
     plan: ExposePlan
-    published: int
-    #: Withheld values per ``CL_CONF_STATUS`` code of the check that withheld them: a
-    #: histogram's or a quantile's withheld groups are written ``C`` whatever the check, and
-    #: counted here by the check (:func:`_code`).
-    withheld: Mapping[str, int] = field(default_factory=dict)
-    #: The histogram cells withheld inside published groups, per code of the check
-    #: that withheld them; the document writes each ``C``.
-    withheld_cells: Mapping[str, int] = field(default_factory=dict)
-    #: The grid the document declares and its on-grid statistics were formed on.
-    fractional_bits: int = DEFAULT_FRACTIONAL_BITS
     #: Each published fidelity statistic (:data:`NamedStatistic`).
     statistics: Tuple[NamedStatistic, ...] = ()
     #: Each fidelity statistic written with every group withheld: a run that checks
@@ -194,6 +196,52 @@ class ProfileResult:
     partly_withheld_statistics: Tuple[PartlyNamedStatistic, ...] = ()
     #: Each declared property the document does not answer, with the reason.
     left_out: Tuple[Tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class ProfileResult:
+    document: Dict[str, Any]
+    canonical: bytes
+    digest: str
+    #: One result per expose, in the order they were profiled.
+    tables: Tuple[TableResult, ...]
+    published: int
+    #: Withheld values per ``CL_CONF_STATUS`` code of the check that withheld them: a
+    #: histogram's or a quantile's withheld groups are written ``C`` whatever the check, and
+    #: counted here by the check (:func:`_code`).
+    withheld: Mapping[str, int] = field(default_factory=dict)
+    #: The histogram cells withheld inside published groups, per code of the check
+    #: that withheld them; the document writes each ``C``.
+    withheld_cells: Mapping[str, int] = field(default_factory=dict)
+    #: The grid the document declares and its on-grid statistics were formed on.
+    fractional_bits: int = DEFAULT_FRACTIONAL_BITS
+
+    def _only(self) -> TableResult:
+        if len(self.tables) != 1:
+            raise ValueError("a profile of several exposes has one result per expose: read .tables")
+        return self.tables[0]
+
+    # The one expose of a profile of one expose, as these were before several could be read.
+
+    @property
+    def plan(self) -> ExposePlan:
+        return self._only().plan
+
+    @property
+    def statistics(self) -> Tuple[NamedStatistic, ...]:
+        return self._only().statistics
+
+    @property
+    def withheld_statistics(self) -> Tuple[NamedStatistic, ...]:
+        return self._only().withheld_statistics
+
+    @property
+    def partly_withheld_statistics(self) -> Tuple[PartlyNamedStatistic, ...]:
+        return self._only().partly_withheld_statistics
+
+    @property
+    def left_out(self) -> Tuple[Tuple[str, str], ...]:
+        return self._only().left_out
 
 
 def column_domain(type_name: Any) -> Tuple[Optional[str], Optional[str]]:
@@ -211,9 +259,14 @@ def column_domain(type_name: Any) -> Tuple[Optional[str], Optional[str]]:
     return None, "the type is not one fluid profile reads"
 
 
+def expose_ids(contract: Mapping[str, Any]) -> List[str]:
+    """The contract's exposeIds, in the order it declares them."""
+    return [str(item["exposeId"]) for item in iter_exposes(dict(contract)) if item.get("exposeId")]
+
+
 def resolve_expose_id(contract: Mapping[str, Any], requested: Optional[str]) -> str:
     """The expose to profile: *requested*, or the contract's only expose."""
-    ids = [str(item["exposeId"]) for item in iter_exposes(dict(contract)) if item.get("exposeId")]
+    ids = expose_ids(contract)
     if requested:
         if requested in ids:
             return requested
@@ -459,13 +512,115 @@ def profile_expose(
 ) -> ProfileResult:
     """Profile *expose_id* of *contract* from the records *source* names.
 
+    :func:`profile_exposes` of this one expose: *bundle* is the fidelity block it answers.
+    """
+    return profile_exposes(
+        contract,
+        [ExposeSource(expose_id, source, table)],
+        backend=backend,
+        cwd=cwd,
+        rule=rule,
+        producer=producer,
+        fractional_bits=fractional_bits,
+        bundles=None if bundle is None else {expose_id: bundle},
+    )
+
+
+def profile_exposes(
+    contract: Mapping[str, Any],
+    exposes: Sequence[ExposeSource],
+    *,
+    backend: StatisticsBackend,
+    cwd: Optional[Path] = None,
+    rule: disclosure.DisclosureRule = disclosure.ACRO_DEFAULT,
+    producer: Optional[str] = None,
+    fractional_bits: Optional[int] = None,
+    bundles: Optional[Mapping[str, BundleBlock]] = None,
+) -> ProfileResult:
+    """Profile each of *exposes* of *contract*, each from its own source, into one document.
+
     *fractional_bits* is the grid ``mean/1`` is formed on (16 unless given),
     checked before any record is read; the fidelity block must declare the same
-    (PROFILE-SPEC §7). With a *bundle*, the profile also answers its fidelity
-    block, on the block's grid (:func:`_declared_block`).
+    (PROFILE-SPEC §7). An expose *bundles* holds a block for also answers that
+    block, on the block's grid (:func:`_declared_block`), and the blocks of one
+    document declare one grid. Every expose's plan and block is checked before any
+    record is read, and each expose's records are read once.
     """
     if fractional_bits is not None:
         document.check_fractional_bits(fractional_bits)
+    if not exposes:
+        raise ProfileError(
+            "profile_expose_required", "no expose to profile", {"next": "name one with --expose"}
+        )
+    _refuse_repeated(exposes)
+    plans = [_plan_with_columns(contract, each.expose_id) for each in exposes]
+    blocks = bundles or {}
+    declared: List[Optional[DeclaredBlock]] = []
+    grids: Dict[str, int] = {}
+    for plan in plans:
+        found, grid = _declared_block(
+            blocks.get(plan.expose_id), contract, plan.expose_id, plan, backend, fractional_bits
+        )
+        declared.append(found)
+        if found is not None:
+            grids[plan.expose_id] = grid
+    fractional_bits = _one_grid(grids, blocks, fractional_bits)
+    reads = [
+        sources.read_columns(
+            each.source, [column.name for column in plan.columns], table=each.table, cwd=cwd
+        )
+        for each, plan in zip(exposes, plans, strict=True)
+    ]
+    tallies: Tuple["Counter[str]", "Counter[str]"] = (Counter(), Counter())
+    tables_doc: Dict[str, Dict[str, Any]] = {}
+    results: List[TableResult] = []
+    for plan, read, found in zip(plans, reads, declared, strict=True):
+        table_doc, result = _profile_table(
+            plan, read, found, backend, rule, tallies, fractional_bits
+        )
+        tables_doc[plan.expose_id] = table_doc
+        results.append(result)
+    if producer is None:
+        from fluid_build import __version__
+
+        producer = document.producer_uri(__version__)
+    built = document.build_document(
+        producer=producer,
+        rule=rule,
+        tables=tables_doc,
+        fractional_bits=fractional_bits,
+    )
+    canonical = document.canonical_bytes(built)
+    backend.check_document(canonical.decode("utf-8"))
+    tally, cell_tally = tallies
+    published = tally.pop(disclosure.FREE, 0)
+    return ProfileResult(
+        document=built,
+        canonical=canonical,
+        digest=document.digest_of(canonical),
+        tables=tuple(results),
+        published=published,
+        withheld=dict(sorted(tally.items())),
+        withheld_cells=dict(sorted(cell_tally.items())),
+        fractional_bits=fractional_bits,
+    )
+
+
+def _refuse_repeated(exposes: Sequence[ExposeSource]) -> None:
+    """Refuse an expose named twice: one document holds each table once."""
+    seen = set()
+    for each in exposes:
+        if each.expose_id in seen:
+            raise ProfileError(
+                "profile_expose_repeated",
+                f"exposes[{each.expose_id}] is named more than once",
+                {"read": "nothing: no record was read", "next": "name each expose once"},
+            )
+        seen.add(each.expose_id)
+
+
+def _plan_with_columns(contract: Mapping[str, Any], expose_id: str) -> ExposePlan:
+    """:func:`plan_expose`, refused when it leaves no column to profile."""
     plan = plan_expose(contract, expose_id)
     if not plan.columns:
         raise ProfileError(
@@ -473,14 +628,45 @@ def profile_expose(
             f"no column of exposes[{expose_id}] has a type fluid profile reads",
             {"not profiled": "; ".join(f"{name}: {reason}" for name, reason in plan.skipped)},
         )
-    declared, fractional_bits = _declared_block(
-        bundle, contract, expose_id, plan, backend, fractional_bits
-    )
-    read = sources.read_columns(
-        source, [column.name for column in plan.columns], table=table, cwd=cwd
-    )
-    tally: "Counter[str]" = Counter()
-    cell_tally: "Counter[str]" = Counter()
+    return plan
+
+
+def _one_grid(
+    grids: Mapping[str, int], blocks: Mapping[str, BundleBlock], requested: Optional[int]
+) -> int:
+    """The one grid of the document: the blocks' (they must agree), else *requested* or 16.
+
+    :func:`_declared_block` has already refused a *requested* grid a block disagrees with.
+    """
+    if not grids:
+        return DEFAULT_FRACTIONAL_BITS if requested is None else requested
+    first, *others = grids.items()
+    for expose_id, grid in others:
+        if grid != first[1]:
+            raise ProfileError(
+                "profile_fractional_bits_conflict",
+                f"the fidelity blocks of exposes[{first[0]}] ({blocks[first[0]].simulation}) "
+                f"and exposes[{expose_id}] ({blocks[expose_id].simulation}) declare "
+                f"encoding.fractionalBits {first[1]} and {grid}",
+                {
+                    "read": "nothing: no record was read",
+                    "next": "one profile document has one grid: declare the same in both blocks",
+                },
+            )
+    return first[1]
+
+
+def _profile_table(
+    plan: ExposePlan,
+    read: sources.SourceColumns,
+    declared: Optional[DeclaredBlock],
+    backend: StatisticsBackend,
+    rule: disclosure.DisclosureRule,
+    tallies: Tuple["Counter[str]", "Counter[str]"],
+    fractional_bits: int,
+) -> Tuple[Dict[str, Any], TableResult]:
+    """One table of the document, from one read of its records, and its summary."""
+    tally, cell_tally = tallies
     replaced = _ungrouped_means(declared)
     columns_doc = {
         column.name: _column(
@@ -506,29 +692,9 @@ def profile_expose(
     row_count = _row_count(read.row_count, rule, tally)
     if row_count is not None:
         table_doc["rowCount"] = row_count
-    if producer is None:
-        from fluid_build import __version__
-
-        producer = document.producer_uri(__version__)
-    built = document.build_document(
-        producer=producer,
-        rule=rule,
-        tables={expose_id: table_doc},
-        fractional_bits=fractional_bits,
-    )
-    canonical = document.canonical_bytes(built)
-    backend.check_document(canonical.decode("utf-8"))
-    published = tally.pop(disclosure.FREE, 0)
     all_published, none_published, some_published = _statistic_summaries(columns_doc)
-    return ProfileResult(
-        document=built,
-        canonical=canonical,
-        digest=document.digest_of(canonical),
+    return table_doc, TableResult(
         plan=plan,
-        published=published,
-        withheld=dict(sorted(tally.items())),
-        withheld_cells=dict(sorted(cell_tally.items())),
-        fractional_bits=fractional_bits,
         statistics=all_published,
         withheld_statistics=none_published,
         partly_withheld_statistics=some_published,

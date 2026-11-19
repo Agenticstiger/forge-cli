@@ -470,3 +470,64 @@ def test_prices_that_all_end_in_99_withhold_the_mean_but_not_the_sum(tmp_path):
     )
     assert _metrics(result, "amount")["sum"]["status"] == "F"
     assert _mean(result)[1] == {"group": "", "status": "C"}
+
+
+# -- several exposes, one document -----------------------------------------------------
+
+
+def _two_tables():
+    return {
+        "fluidVersion": "0.7.7",
+        "kind": "DataProduct",
+        "id": "p",
+        "exposes": [
+            {"exposeId": "org", "contract": {"schema": [{"name": "name", "type": "string"}]}},
+            {
+                "exposeId": "account",
+                "contract": {"schema": [{"name": "plan", "type": "string"}]},
+            },
+        ],
+    }
+
+
+def _ndjson(path: Path, rows) -> str:
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return str(path)
+
+
+def test_several_exposes_go_into_one_document_each_from_its_own_source(tmp_path):
+    org = _ndjson(tmp_path / "org.ndjson", [{"name": f"o{n % 3}"} for n in range(12)])
+    account = _ndjson(tmp_path / "acct.ndjson", [{"plan": "basic"} for _ in range(20)])
+    result = runner.profile_exposes(
+        _two_tables(),
+        [runner.ExposeSource("account", account), runner.ExposeSource("org", org)],
+        backend=FakeBackend(),
+    )
+    tables = result.document["tables"]
+    assert list(tables) == ["account", "org"]
+    assert tables["org"]["rowCount"] == 10 and tables["account"]["rowCount"] == 20
+    assert [table.plan.expose_id for table in result.tables] == ["account", "org"]
+    assert result.digest == digest_of(result.canonical)
+    with pytest.raises(ValueError, match="one result per expose"):
+        result.plan  # noqa: B018 - a profile of two exposes has no one plan
+
+
+def test_an_expose_named_twice_is_refused_before_any_read(tmp_path):
+    source = _ndjson(tmp_path / "org.ndjson", [{"name": "x"}])
+    with pytest.raises(ProfileError) as refused:
+        runner.profile_exposes(
+            _two_tables(),
+            [runner.ExposeSource("org", source), runner.ExposeSource("org", "missing.ndjson")],
+            backend=FakeBackend(),
+        )
+    assert refused.value.event == "profile_expose_repeated"
+
+
+def test_one_expose_profiles_as_it_always_did(tmp_path):
+    rows = _rows()
+    one = profile_expose(ORDERS, "orders", source=_slice(tmp_path, rows), backend=FakeBackend())
+    many = runner.profile_exposes(
+        ORDERS, [runner.ExposeSource("orders", _slice(tmp_path, rows))], backend=FakeBackend()
+    )
+    assert one.canonical == many.canonical
+    assert one.plan == many.plan

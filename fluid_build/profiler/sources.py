@@ -108,11 +108,19 @@ def _scheme(source: str) -> str:
 
 
 def describe_source(source: str) -> str:
-    """*source* as it may be shown: a database URI with its password masked."""
+    """*source* as it may be shown: a database URI with its password masked.
+
+    A URI after a leading ``<name>=`` is masked too, so a ``--source`` paired with an
+    exposeId, or with a mistyped one, never shows its password. A URI's own ``=`` (its
+    query) sits after ``://``.
+    """
     if _scheme(source) in DATABASE_SCHEMES:
         from fluid_build.cli.discover._jdbc_introspect import _masked_uri
 
         return _masked_uri(source)
+    head, sep, rest = source.partition("=")
+    if sep and "://" not in head and "://" in rest:
+        return f"{head}={describe_source(rest)}"
     return source
 
 

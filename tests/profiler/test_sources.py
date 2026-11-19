@@ -218,6 +218,16 @@ def test_a_database_uri_is_shown_with_its_password_masked():
     assert SECRET not in shown and "reader" in shown
 
 
+@pytest.mark.parametrize("name", ["orders", "ordres"])  # an exposeId, or a mistyped one
+def test_a_database_uri_after_a_name_is_masked_too(name):
+    shown = describe_source(f"{name}=postgresql://reader:{SECRET}@db.internal/sales?ssl=on")
+    assert SECRET not in shown and shown.startswith(f"{name}=postgresql://reader")
+
+
+def test_a_path_holding_an_equals_sign_is_shown_as_given():
+    assert describe_source("./orders=2024.csv") == "./orders=2024.csv"
+
+
 def test_a_connect_failure_masks_the_password():
     with pytest.raises(SourceError) as raised:
         read_columns(
