@@ -17,14 +17,16 @@
 - **Where it goes.** ``sink: table``: an Iceberg table beside the output,
   ``<output>__dead_letter`` by default, as late events go to ``<output>__late_events``
   (``build_runners/_late_arrival.py``). ``sink: topic``: a Kafka topic on the cluster the
-  stream reads, each record with Kafka Connect's error-context headers
-  (``__connect.errors.*``, KIP-298).
+  stream reads, each record keyed by where it came from (``<topic>-<partition>@<offset>``),
+  its own key in the ``fluid.dead-letter.raw-key`` header, with Kafka Connect's
+  error-context headers (``__connect.errors.*``, KIP-298).
 - **How it is landed.** The output keeps its own query and Iceberg's streaming sink, so
   it stays exactly-once; the dead letters are a second query over the same records, with
   its own checkpoint inside the stream's, which starts where the output resumes when it is
   new (dead letters added to a running stream, perhaps one a record stopped). Each of its
   micro-batches is committed to the table at most once (the query id and batch id go into
-  the snapshot's summary), and sent to a topic at least once.
+  the snapshot's summary, as Iceberg's streaming sink keeps ``spark.sql.streaming.queryId``
+  and ``epochId``), and sent to a topic at least once, with the same keys each time.
 - **What it keeps.** The raw value and key bytes, the reason, the record's topic, partition,
   offset and timestamp. A build that masks fields at ingest (``maskAtIngest``) keeps no raw
   bytes, which would hold those fields in clear; its topic, partition and offset still find

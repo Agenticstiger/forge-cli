@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A Spark stream can bound what one batch reads, fails on lost offsets, and sends each dead
+  letter under the same key every time.** `properties.stream.maxOffsetsPerTrigger` (0.7.7
+  preview, optional, unset by default) is compiled into the job config and passed to Spark's
+  Kafka source: a micro-batch reads at most that many records, split across the topic's
+  partitions, so a stream that catches up after a stop, or starts from earliest, lands in
+  bounded batches, `trigger.availableNow` included. Unset, the job config has no key and a
+  running stream keeps its config. Managed Flink refuses the key. The runner now sets
+  `failOnDataLoss=true` on every Kafka source (Spark's default, pinned): offsets the topic no
+  longer holds, because retention passed them while the stream was stopped or the topic was
+  recreated, fail the stream instead of being skipped. A dead letter sent to a topic is keyed by
+  where it came from, `<topic>-<partition>@<offset>`, and keeps the record's own key in the
+  `fluid.dead-letter.raw-key` header: the Kafka sink is at least once, and a batch sent again
+  after a failure carries the same keys, so a consumer drops repeats by key.
+
+### Fixed
+
+- **Removing a Spark build on AWS no longer needs `--allow-data-loss`.** The data-loss gate
+  counted every resource a removed build ran with as data: its runner and job config objects,
+  role and policies, log group and the key its logs are encrypted with, Glue job or connection,
+  and the product's own EMR Serverless application. None of them holds data, so dropping a Spark
+  build from a contract was refused unless the apply was allowed to destroy data, which also
+  let a real data loss in the same plan through. They are now listed as removed, not gated, as
+  a Databricks build's job and files are, and only what holds data (the build's table, a
+  bucket, a bucket's key) still needs the flag. The AWS plugin names them by type and by the
+  names forge gives them (`aws_ingest.spark_definition`).
+
+- **A Spark build that leaves the contract on AWS has its runs stopped before its role goes.**
+  `fluid apply` destroyed the build's role, artifacts and log group but left its stream running
+  until those were gone, and a product destroy failed part way: EMR Serverless deletes only a
+  stopped application, and IAM no policy that is still attached. Before `tofu apply`, the apply
+  now reads the plan's deletes and cancels every active run of a build that goes (found by its
+  run name where its log group's new `fluid_runtime`, `fluid_run_target` and `fluid_run_region`
+  tags say it runs), stops the steps of a build moved off EMR on EC2 (its job policy carries the
+  same tags), stops the runs of a Glue job that goes, and cancels the runs in the product's own
+  EMR Serverless application and stops it. An IAM policy the plan destroys that is still
+  attached (an EMR on EC2 build's job policy, the scheduler's caller policy) refuses the apply
+  first, with the `aws iam detach-*-policy` commands; nothing is stopped or destroyed. A run
+  still going after `FLUID_SPARK_WAIT_SECONDS` also refuses the apply before anything is
+  destroyed. `--dry-run` reads and says what it would cancel. The first apply after the upgrade
+  adds the three tags in place to each Spark build's log group and EMR on EC2 job policy.
+
+### Changed
+
+- **A Spark run starts only on the job config `fluid apply` compiled.** Every runtime, local
+  included, now passes the config's digest at submit (`--fluid-job-sha256`: the sha256 of its
+  canonical JSON, strings in NFC as OpenTofu writes them, the MSK brokers OpenTofu fills in left
+  out so a broker change does not stop a stream's retries), and forge's Spark runner refuses any
+  other config before it reads anything. On AWS, `fluid apply` first reads the config and the
+  runner OpenTofu uploaded back from S3 and starts nothing unless they are the ones this apply
+  compiled, so a config another apply put there since never runs under the run's config hash.
+  The artifact bucket's write access stays the boundary. A scheduler's role already reads both
+  objects. The runner changed, so each running Spark stream restarts once on its next apply.
+
+- **An Iceberg table on Glue plans no change after an engine commits to it.** forge emitted the
+  table's location with a trailing slash; Iceberg keeps it without one and writes it back into
+  Glue on every commit. So each `fluid apply` after a commit (every scheduled run beside a
+  stream) planned `~1` per written table and sent an `UpdateTable` while the stream kept
+  committing, with `previous_metadata_location` from the plan's refresh. The location is now
+  emitted as Iceberg keeps it. The first apply after the upgrade updates each existing Iceberg
+  table's location once, in place; Hive-format tables keep their trailing slash.
+
 ## [0.33.0] — 2026-11-19
 
 ### Added
@@ -549,14 +612,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes changes.
 
 ### Fixed
-
-- **An Iceberg table on Glue plans no change after an engine commits to it.** forge emitted the
-  table's location with a trailing slash; Iceberg keeps it without one and writes it back into
-  Glue on every commit. So each `fluid apply` after a commit (every scheduled run beside a
-  stream) planned `~1` per written table and sent an `UpdateTable` while the stream kept
-  committing, with `previous_metadata_location` from the plan's refresh. The location is now
-  emitted as Iceberg keeps it. The first apply after the upgrade updates each existing Iceberg
-  table's location once, in place; Hive-format tables keep their trailing slash.
 
 - **An `enum` value holding a quote or a backslash no longer breaks dbt's `accepted_values`
   test.** dbt pastes each value between single quotes unescaped, so `O'Brien` ended the string

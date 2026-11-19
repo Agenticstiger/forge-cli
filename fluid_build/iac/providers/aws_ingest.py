@@ -426,6 +426,10 @@ def _emit_build(
             "create transient EMR clusters yet.",
             ("Set parameters.spark.clusterId to the running cluster (j-...).",),
         )
+    blocks.resources["aws_cloudwatch_log_group"][b.key]["tags"] = {
+        **b.tags,
+        **_run_identity(b, application_id),
+    }
     database, table = config["sink"]["table"].split(".", 1)
     vpc = b.runtime == "glue" and cluster is not None
     jars = _glue_jars(blocks, b, bucket_ref) if b.runtime == "glue" else ()
@@ -492,6 +496,24 @@ def _emit_build(
         ),
         lookup_application=b.runtime == "emr-serverless" and not b.cfg.get("applicationId"),
     )
+
+
+def _run_identity(b: _Build, application_id: Any) -> Dict[str, Any]:
+    """Where the build's runs are, as tags on its log group and an EMR on EC2 build's job
+    policy (:data:`names.RUNTIME_TAG` and the two beside it): a plan that destroys them no
+    longer has the build in the contract, or not on that runtime, and reads them from the
+    state to stop its runs first (``aws_spark_destroys``)."""
+    key, ident = {
+        "emr-serverless": ("applicationId", application_id),
+        "glue": ("glueJobName", names.glue_job_name(b.ctx.product, b.build_id)),
+        "emr-ec2": ("clusterId", b.cfg.get("clusterId")),
+        "emr-eks": ("virtualClusterId", b.cfg.get("virtualClusterId")),
+    }[b.runtime]
+    return {
+        names.RUNTIME_TAG: b.runtime,
+        names.RUN_TARGET_TAG: aws_identity._join(f"{key}=", ident),
+        names.RUN_REGION_TAG: b.region,
+    }
 
 
 def _glue_jars(blocks: SparkBlocks, b: _Build, bucket_ref: Any) -> Tuple[TofuExpr, ...]:
@@ -676,7 +698,9 @@ def _emit_role(
                 "to the EMR cluster's instance-profile role or a step runtime role"
             ),
             "policy": policy,
-            "tags": b.tags,
+            # Its steps' cluster too: the policy goes when the build moves to another
+            # runtime, while its log group stays (``aws_spark_destroys``).
+            "tags": {**b.tags, **_run_identity(b, None)},
         }
         return None
     documents[f"{b.key}_trust"] = _trust(blocks, b, name, application_id)
@@ -1282,6 +1306,36 @@ def _emit_caller_policy(
         "policy": tofu_ref(f"data.aws_iam_policy_document.{key}.json"),
         "tags": {**tags, names.PRODUCT_TAG: ctx.product},
     }
+
+
+#: What a forge Spark build runs with, by resource type and the end of its name in the module
+#: (the keys the emitters above write: ``<contract>_<build>_spark`` and what hangs off it, the
+#: product's ``<contract>_spark`` application, ``_spark_caller`` policy and ``_spark_logs``
+#: key, and the ``_lf_writer_<8 hex>`` registration role). None holds data: a destroy deletes
+#: runners, job configs, roles, policies, jobs, an application, and the build's log group with
+#: the key its logs are encrypted with. A bucket's own key ends in ``_kms`` and stays gated.
+_SPARK_DEFINITIONS: Dict[str, "re.Pattern[str]"] = {
+    "aws_s3_object": re.compile(r"_spark_(runner|config)$"),
+    "aws_s3_object_copy": re.compile(r"_spark_jar_[0-9]+$"),
+    "aws_cloudwatch_log_group": re.compile(r"_spark$"),
+    "aws_kms_key": re.compile(r"_spark_logs$"),
+    "aws_iam_role": re.compile(r"(_spark|_lf_writer_[0-9a-f]{8})$"),
+    "aws_iam_role_policy": re.compile(r"(_spark|_lf_writer_[0-9a-f]{8})$"),
+    "aws_iam_policy": re.compile(r"_spark(_caller)?$"),
+    "aws_glue_job": re.compile(r"_spark$"),
+    "aws_glue_connection": re.compile(r"_spark$"),
+    "aws_emrserverless_application": re.compile(r"_spark$"),
+}
+
+
+def spark_definition(address: str, kind: str) -> bool:
+    """``address`` (of type ``kind``, in the module's root) is something a Spark build runs
+    with, which holds no data (:data:`_SPARK_DEFINITIONS`)."""
+    pattern = _SPARK_DEFINITIONS.get(kind)
+    prefix = f"{kind}."
+    if pattern is None or not address.startswith(prefix):
+        return False
+    return bool(pattern.search(address[len(prefix) :]))
 
 
 def merge(into: Dict[str, Dict[str, Any]], blocks: Mapping[str, Mapping[str, Any]]) -> None:
