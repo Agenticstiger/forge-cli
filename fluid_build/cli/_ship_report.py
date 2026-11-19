@@ -11,12 +11,17 @@ Standard library only (``xml.etree`` is imported where used).
 from __future__ import annotations
 
 import json
+import logging
 import math
+import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Collection, Dict, List, Optional
 
 from ._ci_output import oneline
+from ._logging import warn
+
+_LOG = logging.getLogger(__name__)
 
 #: ``ship-report.json``'s schema. Version 2 gave every stage one of six
 #: statuses, a single ``reason`` and its start and end time.
@@ -27,7 +32,7 @@ FAILED = "failed"
 SKIPPED_BY_POLICY = "skipped-by-policy"  # a flag, a RUN_STAGE switch or a dry run turned it off
 UNSUPPORTED = "unsupported"  # nothing for it to act on: no policy bindings, no DAGs, no scheduler
 NOT_RUN = "not-run"  # not selected, or an earlier stage failed
-UNKNOWN = "unknown"  # interrupted, or an earlier step's record could not be read
+UNKNOWN = "unknown"  # interrupted or killed, or an earlier step's record is unreadable
 STATUSES = (PASSED, FAILED, SKIPPED_BY_POLICY, UNSUPPORTED, NOT_RUN, UNKNOWN)
 SKIPPED = (SKIPPED_BY_POLICY, UNSUPPORTED)  # the stage was considered and did nothing
 #: A stage that did not pass: the run stops after it, and its outcome is not a pass.
@@ -119,6 +124,7 @@ def build_report(
     contract: str,
     exit_code: int,
     release: Optional[Dict[str, Any]] = None,
+    journal: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     return {
         "schema": REPORT_SCHEMA,
@@ -130,6 +136,7 @@ def build_report(
         "exit_code": exit_code,
         "stages": [r.as_dict() for r in records],
         **({"release": release} if release is not None else {}),
+        **({"journal": journal} if journal is not None else {}),
     }
 
 
@@ -196,11 +203,65 @@ def junit_xml(records: List[StageRecord]) -> bytes:
 
 
 def write_reports(directory: Path, report: Dict[str, Any], records: List[StageRecord]) -> None:
+    """Write both reports. Each replaces its file (a temporary file renamed over
+    it), so a link the checkout planted at either name is replaced, never
+    written through."""
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / REPORT_JSON).write_text(
-        json.dumps(report, indent=2, sort_keys=False) + "\n", encoding="utf-8"
-    )
-    (directory / REPORT_JUNIT).write_bytes(junit_xml(records))
+    body = json.dumps(report, indent=2, sort_keys=False) + "\n"
+    try:
+        _replace(directory / REPORT_JSON, body.encode("utf-8"))
+        _replace(directory / REPORT_JUNIT, junit_xml(records))
+    except BaseException:
+        # No report from an earlier run (or one the checkout committed) may
+        # stand in for this run's.
+        for name in (REPORT_JSON, REPORT_JUNIT):
+            try:
+                os.unlink(directory / name)
+            except OSError as exc:
+                if isinstance(exc, FileNotFoundError):
+                    continue  # no old report to stand in for this run's
+                # The run fails with the write's own error below; say which
+                # old report is still there, so nobody reads it as this run's.
+                warn(
+                    _LOG,
+                    "ship_report_stale_left",
+                    path=str(directory / name),
+                    error=str(exc),
+                )
+        raise
+
+
+def _created_mode() -> int:
+    """The mode ``open()`` gives a new file under the process umask (mkstemp's
+    is 0600, which would hide the reports from a reader the umask lets in)."""
+    mask = os.umask(0)
+    os.umask(mask)
+    return 0o666 & ~mask
+
+
+def _replace(path: Path, data: bytes) -> None:
+    """Write ``data`` to a new, randomly named file beside ``path`` and rename
+    it over ``path``: a link at ``path`` is replaced, and no name the checkout
+    can plant in advance is opened."""
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            # On the descriptor, not the name: nothing swapped in at ``tmp``
+            # since mkstemp is touched. Windows has no fchmod (mkstemp's 0600
+            # stays there).
+            if hasattr(os, "fchmod"):
+                os.fchmod(fh.fileno(), _created_mode())  # as an ordinary write makes it
+            fh.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError as exc:
+            if not isinstance(exc, FileNotFoundError):  # gone: renamed into place
+                warn(_LOG, "ship_report_temp_left", path=tmp, error=str(exc))
+        raise
 
 
 def _from_dict(raw: Dict[str, Any]) -> StageRecord:
