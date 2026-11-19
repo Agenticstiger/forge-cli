@@ -32,6 +32,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AWS_DEFAULT_PROFILE`, `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, `AWS_CA_BUNDLE` and the
   token-file paths) are not passed in.
 
+- **Removing a Spark build on AWS no longer needs `--allow-data-loss`.** The data-loss gate
+  counted every resource a removed build ran with as data: its runner and job config objects,
+  role and policies, log group and the key its logs are encrypted with, Glue job or connection,
+  and the product's own EMR Serverless application. None of them holds data, so dropping a Spark
+  build from a contract was refused unless the apply was allowed to destroy data, which also
+  let a real data loss in the same plan through. They are now listed as removed, not gated, as
+  a Databricks build's job and files are, and only what holds data (the build's table, a
+  bucket, a bucket's key) still needs the flag. The AWS plugin names them by type and by the
+  names forge gives them (`aws_ingest.spark_definition`).
+
+- **A Spark build that leaves the contract on AWS has its runs stopped before its role goes.**
+  `fluid apply` destroyed the build's role, artifacts and log group but left its stream running
+  until those were gone, and a product destroy failed part way: EMR Serverless deletes only a
+  stopped application, and IAM no policy that is still attached. Before `tofu apply`, the apply
+  now reads the plan's deletes and cancels every active run of a build that goes (found by its
+  run name where its log group's new `fluid_runtime`, `fluid_run_target` and `fluid_run_region`
+  tags say it runs), stops the steps of a build moved off EMR on EC2 (its job policy carries the
+  same tags), stops the runs of a Glue job that goes, and cancels the runs in the product's own
+  EMR Serverless application and stops it. An IAM policy the plan destroys that is still
+  attached (an EMR on EC2 build's job policy, the scheduler's caller policy) refuses the apply
+  first, with the `aws iam detach-*-policy` commands; nothing is stopped or destroyed. A run
+  still going after `FLUID_SPARK_WAIT_SECONDS` also refuses the apply before anything is
+  destroyed. `--dry-run` reads and says what it would cancel. The first apply after the upgrade
+  adds the three tags in place to each Spark build's log group and EMR on EC2 job policy.
+
 ## [0.33.0] — 2026-11-19
 
 ### Added
@@ -637,7 +662,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Each contract with a BigQuery table gains one `terraform_data` that records this, so that plan
   adds one more resource. After it, a new decimal column, a changed precision and a decimal made
   bare are planned in place, and BigQuery refuses at apply a change it cannot make in place.
-
 - **`fluid generate ci` runs stage 3 for a contract with reference builds.** It turned
   `RUN_STAGE_3_GENERATE_ARTIFACTS` off when any build was `hybrid-reference`, `reference` or
   `external-reference`, so a contract with Spark builds beside one reference dbt build skipped
