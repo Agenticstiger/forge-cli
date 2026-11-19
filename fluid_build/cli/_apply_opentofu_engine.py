@@ -607,6 +607,7 @@ def _plan_with_opentofu(
     cprint_literal(f"  target:      {target_identity.describe(eng.provider, target['identity'])}")
     for field_name, why in sorted(target["unread"].items()):
         cprint_literal(f"               {field_name} not bound: {why}")
+    _say_provider_unbound(eng, logger, "plan_tofu_target_provider_unbound")
     stem = out.name[: -len(".json")] if out.name.endswith(".json") else out.name
     names = {
         "planFile": f"{stem}.tfplan",
@@ -816,10 +817,30 @@ def _refuse_another_target(
             "Give this run what the plan's runner had (credentials, the SDK named above), "
             "or pass --no-verify-plan-binding for an emergency apply (logged).",
         )
+    _say_provider_unbound(eng, logger, "apply_tofu_plan_target_provider_unbound")
     planned_unread = recorded.get("unread") if isinstance(recorded.get("unread"), Mapping) else {}
     for field_name in sorted(set(planned_unread) | (set(now["identity"]) - set(bound))):
-        why = planned_unread.get(field_name, "not read when the plan was made")
+        why = str(planned_unread.get(field_name, "not read when the plan was made"))
         cprint_literal(f"  ⚠️  target {field_name} not bound by the plan, not compared: {why}")
+        warn(
+            logger,
+            "apply_tofu_plan_target_field_unbound",
+            provider=eng.provider,
+            field=str(field_name),
+            reason=why,
+        )
+
+
+def _say_provider_unbound(eng: _Engine, logger: logging.Logger, event: str) -> None:
+    """Name a provider whose target forge cannot read: its plan binds no account,
+    project or host, so nothing stops it being applied to another one."""
+    if target_identity.has_reader(eng.provider):
+        return
+    cprint_literal(
+        f"  ⚠️  target: forge reads no account, project or host for {eng.provider}, "
+        "so the saved plan is not bound to one"
+    )
+    warn(logger, event, provider=eng.provider)
 
 
 def _target_error(kind: str, error: str, remediation: str) -> CLIError:

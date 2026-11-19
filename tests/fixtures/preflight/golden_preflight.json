@@ -1,0 +1,221 @@
+{
+  "adapters": {
+    "dbt": [],
+    "opentofu_providers": [
+      {
+        "cloud": "gcp",
+        "pin": "~> 6.0",
+        "source": "hashicorp/google"
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "area": "column-type",
+      "class": "unsupported",
+      "detail": "declared 'array', which BigQuery holds only with its element or field types, and none is declared (fields, element, or key and value need contract 0.7.7 or later)",
+      "fix": "Declare the type's fields, element, or key and value (contract 0.7.7 or later), or declare json or string.",
+      "subject": "exposes[events].genres",
+      "target": "bigquery"
+    },
+    {
+      "area": "extra",
+      "class": "unsupported",
+      "detail": "dbt-bigquery not installed (needs <2,>=1.7); google-auth not installed (needs >=2.29)",
+      "fix": "pip install 'data-product-forge[gcp]'",
+      "subject": "gcp",
+      "target": "forge"
+    },
+    {
+      "area": "column-type",
+      "class": "lossy",
+      "detail": "declared 'map', where attributes is a map, held as an array of key and value records whose keys BigQuery does not keep unique; and attributes may be NULL, which BigQuery stores as an empty array; written as 'REPEATED RECORD'",
+      "fix": "Declare attributes as an array of structs with key and value fields to hold it so on purpose. Set required: true on attributes if it is never NULL.",
+      "subject": "exposes[events].attributes",
+      "target": "bigquery"
+    },
+    {
+      "area": "state-backend",
+      "class": "lossy",
+      "detail": "apply keeps OpenTofu state on this machine, so another runner cannot see it",
+      "fix": "Pass --state-backend (or set FLUID_STATE_BACKEND) to s3:// or gcs://, as apply takes it.",
+      "subject": "local",
+      "target": "opentofu"
+    },
+    {
+      "area": "identity",
+      "class": "requires-live-proof",
+      "detail": "apply calls gcp as the identity its provider resolves. An offline preflight cannot prove it",
+      "fix": "Run fluid doctor --contract ... --live for a read-only check.",
+      "subject": "gcp identity",
+      "target": "gcp"
+    },
+    {
+      "area": "opentofu-provider",
+      "class": "requires-live-proof",
+      "detail": "pinned ~> 6.0; tofu init downloads it unless a provider mirror holds it, and an offline preflight does not",
+      "fix": "Run tofu init once with network, or configure a filesystem_mirror.",
+      "subject": "hashicorp/google",
+      "target": "gcp"
+    },
+    {
+      "area": "column-type",
+      "class": "exact",
+      "detail": "string -> STRING",
+      "fix": "",
+      "subject": "exposes[events].id",
+      "target": "bigquery"
+    },
+    {
+      "area": "column-type",
+      "class": "exact",
+      "detail": "array -> REPEATED STRING",
+      "fix": "",
+      "subject": "exposes[events].tags",
+      "target": "bigquery"
+    },
+    {
+      "area": "tool",
+      "class": "exact",
+      "detail": "1.12.1",
+      "fix": "",
+      "subject": "tofu",
+      "target": "tofu"
+    }
+  ],
+  "contract": {
+    "clouds": [
+      "gcp"
+    ],
+    "fluidVersion": "0.7.7",
+    "id": "demo.tv_nested"
+  },
+  "env": null,
+  "extras": [
+    {
+      "name": "aws",
+      "needed": false,
+      "requirements": [
+        {
+          "installed": null,
+          "name": "boto3",
+          "satisfied": false,
+          "specifier": ">=1.34"
+        },
+        {
+          "installed": null,
+          "name": "botocore",
+          "satisfied": false,
+          "specifier": ">=1.34"
+        }
+      ],
+      "status": "missing"
+    },
+    {
+      "name": "gcp",
+      "needed": true,
+      "requirements": [
+        {
+          "installed": null,
+          "name": "dbt-bigquery",
+          "satisfied": false,
+          "specifier": "<2,>=1.7"
+        },
+        {
+          "installed": null,
+          "name": "google-auth",
+          "satisfied": false,
+          "specifier": ">=2.29"
+        },
+        {
+          "installed": "3.25.0",
+          "name": "google-cloud-bigquery",
+          "satisfied": true,
+          "specifier": ">=3.20"
+        }
+      ],
+      "status": "partial"
+    },
+    {
+      "name": "local",
+      "needed": false,
+      "requirements": [
+        {
+          "installed": null,
+          "name": "duckdb",
+          "satisfied": false,
+          "specifier": ">=1.5.0"
+        }
+      ],
+      "status": "missing"
+    }
+  ],
+  "forge": {
+    "editable": false,
+    "platform": "linux-x86_64",
+    "python": "3.12.4",
+    "version": "0.32.0"
+  },
+  "mode": "offline",
+  "needs": {
+    "clouds": [
+      "gcp"
+    ],
+    "extras": [
+      "gcp"
+    ],
+    "tools": [
+      "tofu"
+    ]
+  },
+  "operation": "apply",
+  "plugins": [
+    {
+      "dist": "acme-fluid-plugin",
+      "group": "fluid_build.providers",
+      "name": "acme",
+      "version": "1.2.0"
+    }
+  ],
+  "schema_revision": {
+    "declared": "0.7.7",
+    "latest_stable": "<latest stable>",
+    "preview": true,
+    "resolved": "0.7.7",
+    "sha256": "<sha256 of the bundled schema>",
+    "source": "bundled"
+  },
+  "state_backend": {
+    "needed": true,
+    "origin": "default",
+    "scheme": "local",
+    "valid": true
+  },
+  "summary": {
+    "counts": {
+      "exact": 3,
+      "lossy": 2,
+      "requires-live-proof": 2,
+      "unsupported": 2
+    },
+    "verdict": "not-ready"
+  },
+  "tools": [
+    {
+      "flavor": null,
+      "found": true,
+      "name": "tofu",
+      "needed": true,
+      "requirement": ">=1.12",
+      "satisfied": true,
+      "version": "1.12.1"
+    }
+  ],
+  "validation": {
+    "errors": 1,
+    "schema_version": "0.7.7",
+    "valid": false,
+    "warnings": 1
+  },
+  "version": "fluid-preflight/1"
+}

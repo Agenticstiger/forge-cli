@@ -108,6 +108,17 @@ def schema_of(exposure: Mapping[str, Any]) -> List[Any]:
     return schema if isinstance(schema, list) else []
 
 
+def outcome_of(
+    column: Mapping[str, Any],
+    outcome_for: Callable[[Any], TypeOutcome],
+    column_outcome: Optional[Callable[[Mapping[str, Any]], Optional[TypeOutcome]]] = None,
+) -> TypeOutcome:
+    """One column's outcome: ``column_outcome`` judges a column that declares its nested
+    types, and ``outcome_for`` the type name of any other. :func:`column_type_findings`
+    and ``fluid doctor --contract`` both read a column through this."""
+    return (column_outcome(column) if column_outcome else None) or outcome_for(column.get("type"))
+
+
 def column_type_findings(
     expose: str,
     schema: Iterable[Any],
@@ -131,9 +142,7 @@ def column_type_findings(
             continue
         name = column.get("name")
         declared = str(column.get("type") if column.get("type") is not None else "string")
-        outcome = (column_outcome(column) if column_outcome else None) or outcome_for(
-            column.get("type")
-        )
+        outcome = outcome_of(column, outcome_for, column_outcome)
         if outcome.status == REFUSED:
             parts.append(f"{name!r} is declared {declared!r}, {outcome.why}")
             fixes.setdefault(outcome.fix, []).append(repr(name))

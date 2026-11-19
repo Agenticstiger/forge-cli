@@ -12,6 +12,7 @@ Docs pages are relative to https://agenticstiger.github.io/forge_docs/
 
 | Code | What to do | Docs page |
 |---|---|---|
+| `ERR_DOCTOR_PREFLIGHT_FAILED` | Run 'fluid doctor --contract contract.fluid.yaml --operation plan'. Compare two saved reports with 'fluid doctor --compare left.json right.json'. | advanced/production-troubleshooting.html |
 | `ERR_PROVIDER_NOT_SPECIFIED` | Pass a provider: --provider aws\|databricks\|gcp\|local\|snowflake. Or set the FLUID_PROVIDER environment variable. Run 'fluid providers' to list the available providers. | cli/providers.html |
 | `ERR_PROVIDER_NOT_FOUND` | Run 'fluid providers' to see the available providers. Check the provider name spelling. Install the provider extra, e.g. pip install 'data-product-forge[gcp]'. | cli/providers.html |
 | `ERR_PROVIDER_UNKNOWN` | Run 'fluid providers' to see the available providers. Valid built-ins: aws, databricks, gcp, local, snowflake. | cli/providers.html |

@@ -17,7 +17,11 @@ block, in each provider's own order of precedence:
 
 - ``aws``: ``account`` from STS ``GetCallerIdentity`` (needs no IAM permission),
   ``region`` from the module's ``provider.aws.region``, else ``AWS_REGION``,
-  else ``AWS_DEFAULT_REGION``.
+  else ``AWS_DEFAULT_REGION``, else the named profile's ``region`` in the shared
+  config file. The profile is ``AWS_PROFILE``, else ``AWS_DEFAULT_PROFILE``: the
+  order of the Go SDK the ``hashicorp/aws`` provider is built on
+  (``aws-sdk-go-v2/config/env_config.go``), passed to boto3 by name because
+  botocore reads the two the other way round.
 - ``gcp``: ``project`` from ``provider.google.project``, else ``GOOGLE_PROJECT``,
   ``GOOGLE_CLOUD_PROJECT``, ``GCLOUD_PROJECT``, ``CLOUDSDK_CORE_PROJECT``, the only
   defaults the provider reads (not the credentials' own project); ``region`` from
@@ -64,12 +68,18 @@ def target_identity(
 
     ``identity`` maps each field read to its value; ``unread`` maps each field
     that could not be read to why. A provider this module does not know has
-    neither: nothing is bound for it.
+    neither: nothing is bound for it (see :func:`has_reader`).
     """
     reader = _READERS.get(provider)
     if reader is None:
         return {}, {}
     return reader(_provider_block(module, provider), env)
+
+
+def has_reader(provider: str) -> bool:
+    """Whether this module reads a target for ``provider``. One it does not (an
+    entry-point plugin, ``confluent``) binds no account, project or host at all."""
+    return provider in _READERS
 
 
 def describe(provider: str, identity: Mapping[str, str]) -> str:
@@ -106,10 +116,13 @@ def _aws(block: Mapping[str, Any], env: Mapping[str, str]) -> Tuple[Identity, Re
     identity: Identity = {}
     unread: Reasons = {}
     region = _first(block, "region", env, ("AWS_REGION", "AWS_DEFAULT_REGION"))
+    region = region or aws_profile_region(env)
     if region:
         identity["region"] = region
     else:
-        unread["region"] = "no provider region, AWS_REGION or AWS_DEFAULT_REGION"
+        unread["region"] = (
+            "no provider region, AWS_REGION, AWS_DEFAULT_REGION or region in the profile"
+        )
     account, why = aws_caller_account(env, region or None)
     if account:
         identity["account"] = account
@@ -126,13 +139,7 @@ def aws_caller_account(env: Mapping[str, str], region: Optional[str]) -> Tuple[s
     except ImportError:
         return "", "boto3 is not installed (pip install 'data-product-forge[aws]')"
     try:
-        session = boto3.session.Session(
-            aws_access_key_id=env.get("AWS_ACCESS_KEY_ID") or None,
-            aws_secret_access_key=env.get("AWS_SECRET_ACCESS_KEY") or None,
-            aws_session_token=env.get("AWS_SESSION_TOKEN") or None,
-            profile_name=env.get("AWS_PROFILE") or None,
-            region_name=region,
-        )
+        session = _session(boto3, env, region)
         endpoint = env.get("AWS_ENDPOINT_URL_STS") or env.get("AWS_ENDPOINT_URL") or None
         # STS answers in every region; with none from the run or its profile, botocore
         # refuses to build the client, so the commercial default is named.
@@ -144,6 +151,34 @@ def aws_caller_account(env: Mapping[str, str], region: Optional[str]) -> Tuple[s
         return "", f"sts GetCallerIdentity failed ({type(exc).__name__})"
     account = str(reply.get("Account") or "")
     return (account, "") if account else ("", "sts GetCallerIdentity returned no account")
+
+
+def _profile(env: Mapping[str, str]) -> Optional[str]:
+    """The named profile ``tofu`` uses: ``AWS_PROFILE``, else ``AWS_DEFAULT_PROFILE``."""
+    return env.get("AWS_PROFILE") or env.get("AWS_DEFAULT_PROFILE") or None
+
+
+def _session(boto3: Any, env: Mapping[str, str], region: Optional[str]) -> Any:
+    return boto3.session.Session(
+        aws_access_key_id=env.get("AWS_ACCESS_KEY_ID") or None,
+        aws_secret_access_key=env.get("AWS_SECRET_ACCESS_KEY") or None,
+        aws_session_token=env.get("AWS_SESSION_TOKEN") or None,
+        profile_name=_profile(env),
+        region_name=region,
+    )
+
+
+def aws_profile_region(env: Mapping[str, str]) -> str:
+    """The ``region`` the run's named profile sets in the shared config file, or ``""``.
+    Reads local files only, no network. A seam: tests replace it."""
+    try:
+        import boto3
+    except ImportError:
+        return ""
+    try:
+        return str(_session(boto3, env, None).region_name or "")
+    except Exception:  # noqa: BLE001 - an unreadable profile is an unread region
+        return ""
 
 
 def _gcp(block: Mapping[str, Any], env: Mapping[str, str]) -> Tuple[Identity, Reasons]:
@@ -201,4 +236,11 @@ def compare(recorded: Mapping[str, str], now: Mapping[str, str]) -> Tuple[List[s
     return changed, unverified
 
 
-__all__ = ["aws_caller_account", "compare", "describe", "target_identity"]
+__all__ = [
+    "aws_caller_account",
+    "aws_profile_region",
+    "compare",
+    "describe",
+    "has_reader",
+    "target_identity",
+]
