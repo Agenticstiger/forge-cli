@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional, Tuple
 import yaml
 
 from .project_yml import _sanitize_project_name
-from .sources import _normalize_placeholder
+from .sources import rewrite_placeholders
 
 _logger = logging.getLogger(__name__)
 
@@ -170,7 +170,7 @@ def _contract_expr(value: Any) -> Optional[str]:
     text = str(value).strip() if value is not None else ""
     if not text:
         return None
-    emitted = _normalize_placeholder(text) or ""
+    emitted = rewrite_placeholders(text) or ""
     if any(marker in _ENV_VAR_JINJA_RE.sub("", emitted) for marker in _JINJA_MARKERS):
         _logger.warning("profiles.yml: a contract value carries Jinja; not used")
         return None
