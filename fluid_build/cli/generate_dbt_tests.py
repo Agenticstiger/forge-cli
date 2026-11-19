@@ -15,7 +15,9 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 from pathlib import Path
+from typing import Any
 
 from ._common import CLIError, load_contract_with_overlay
 from ._logging import info
@@ -88,7 +90,54 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
             "the nearest dbt_project.yml above --out (macros/ when it names none)."
         ),
     )
+    _add_coverage_arguments(p)
     p.set_defaults(generate_sub=SUBCOMMAND, func=run)
+
+
+def _add_coverage_arguments(p: argparse.ArgumentParser) -> None:
+    """The coverage report and required-rule flags."""
+    p.add_argument(
+        "--coverage",
+        action="store_true",
+        help=(
+            "Print which declared rules each engine can run (duckdb, snowflake, bigquery, "
+            "databricks, postgres, athena), and why not where it cannot."
+        ),
+    )
+    p.add_argument(
+        "--coverage-out",
+        default=None,
+        metavar="PATH",
+        help="Write the same coverage report as JSON to PATH.",
+    )
+    p.add_argument(
+        "--require-rule",
+        action="append",
+        default=[],
+        metavar="ID",
+        help=(
+            "A declared rule that must run (repeatable): generation fails, writing no tests, "
+            "when a selected adapter cannot run it, or when nothing tests it (a placeholder "
+            "declaration with no bound)."
+        ),
+    )
+    p.add_argument(
+        "--require-all-rules",
+        action="store_true",
+        help="Every declared rule must run on the selected adapters (as --require-rule for each).",
+    )
+    p.add_argument(
+        "--adapter",
+        action="append",
+        default=[],
+        metavar="TYPE",
+        help=(
+            "A dbt adapter type the required rules must run on (repeatable): duckdb, "
+            "snowflake, bigquery, databricks, spark, postgres, athena or trino. Default: the "
+            "adapters of the platforms the contract's exposes bind to, or every adapter when "
+            "none of them maps to one."
+        ),
+    )
 
 
 def run(args, logger: logging.Logger) -> int:
@@ -107,6 +156,7 @@ def run(args, logger: logging.Logger) -> int:
     contract = load_contract_with_overlay(str(contract_path), getattr(args, "env", None), logger)
     from ..util.dbt_jinja import UnsafeDbtName
 
+    _check_coverage(contract, args, logger)
     try:
         rendered = render_project_tests(contract, tests_key=_resolve_dbt_tests_key(args, logger))
     except UnsafeDbtName as unsafe:
@@ -169,6 +219,127 @@ def run(args, logger: logging.Logger) -> int:
         )
     _emit_packages_yml(out_path, yaml_text, logger)
     return 0
+
+
+def _check_coverage(contract: Any, args: Any, logger: logging.Logger) -> None:
+    """Print or write the coverage report when asked, and refuse, before anything is
+    written, when a required rule cannot run on a selected adapter."""
+    show = bool(getattr(args, "coverage", False))
+    out = getattr(args, "coverage_out", None)
+    required = list(getattr(args, "require_rule", None) or [])
+    if getattr(args, "require_all_rules", False):
+        required.append("*")
+    if not (show or out or required):
+        return
+    from ..data_rules._coverage import as_json, coverage, render_table, unmet
+
+    rows = coverage(contract)
+    if show:
+        sys.stdout.write(render_table(rows) + "\n")
+    if out:
+        import json
+
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        Path(out).write_text(json.dumps(as_json(rows), indent=2) + "\n", encoding="utf-8")
+        info(logger, "dbt_tests_coverage_written", out=str(out))
+    if not required:
+        return
+    _refuse_inert_rules(contract)
+    known = {row.id for row in rows}
+    unknown = sorted(r for r in required if r != "*" and r not in known)
+    if unknown:
+        raise CLIError(
+            1,
+            "dbt_tests_unknown_required_rule",
+            {
+                "rules": unknown,
+                "detail": (
+                    f"--require-rule names {', '.join(unknown)}, which the contract does not "
+                    f"declare. Declared: {', '.join(sorted(known)) or 'none'}."
+                ),
+            },
+        )
+    adapters = _selected_adapters(contract, getattr(args, "adapter", None) or [])
+    missed = unmet(rows, required, adapters)
+    if missed:
+        lines = [f"{row.id} on {adapter}: {verdict.reason}" for row, adapter, verdict in missed]
+        raise CLIError(
+            1,
+            "dbt_tests_required_rule_unsupported",
+            {
+                "rules": sorted({row.id for row, _, _ in missed}),
+                "detail": (
+                    "required rules cannot run on the selected adapter(s): "
+                    + "; ".join(lines)
+                    + ". Restate them in FLUID SQL/1 the adapter can run, select another "
+                    "--adapter, or drop them from --require-rule."
+                ),
+            },
+        )
+
+
+def _refuse_inert_rules(contract: Any) -> None:
+    """A requirement on a contract that declares rules below 0.7.7, where they do not exist
+    (and run nowhere), fails rather than pass with nothing tested."""
+    from ..data_rules import FIRST_VERSION, _version
+
+    version = _version(contract) if isinstance(contract, dict) else ()
+    if version and version >= FIRST_VERSION:
+        return
+    keys = ("identifierFormat", "placeholders", "sharedAttribute")
+    declared = False
+    for expose in contract.get("exposes") or [] if isinstance(contract, dict) else []:
+        if not isinstance(expose, dict):
+            continue
+        spec = expose.get("contract") if isinstance(expose.get("contract"), dict) else {}
+        columns = [c for c in spec.get("schema") or [] if isinstance(c, dict)]
+        semantics = expose.get("semantics") if isinstance(expose.get("semantics"), dict) else {}
+        links = [r for r in semantics.get("relationships") or [] if isinstance(r, dict)]
+        declared = declared or bool(spec.get("invariants"))
+        declared = declared or any(k in c for c in columns for k in keys)
+        declared = declared or any("sharedColumns" in r for r in links)
+    if declared:
+        shown = contract.get("fluidVersion") or "none"
+        first = ".".join(str(part) for part in FIRST_VERSION)
+        raise CLIError(
+            1,
+            "dbt_tests_rules_need_preview",
+            {
+                "detail": (
+                    f"the contract declares rules about valid data, which exist from "
+                    f"fluidVersion {first}, and it declares {shown}: none of them runs, so no "
+                    f"requirement can be met. Declare fluidVersion {first} or later."
+                )
+            },
+        )
+
+
+def _selected_adapters(contract: Any, named: list) -> dict:
+    """adapter type -> FLUID SQL/1 dialect: those named, else the adapters of the platforms
+    the contract's exposes bind to, else every adapter forge writes SQL for."""
+    from ..data_rules._compile import platform_dialect
+    from ..data_rules._dbt import ADAPTERS
+
+    if named:
+        bad = [a for a in named if a not in ADAPTERS]
+        if bad:
+            raise CLIError(
+                1,
+                "dbt_tests_unknown_adapter",
+                {
+                    "adapters": bad,
+                    "detail": (
+                        f"--adapter {', '.join(bad)}: forge writes fluid_rule SQL for "
+                        f"{', '.join(ADAPTERS)}."
+                    ),
+                },
+            )
+        return {a: ADAPTERS[a] for a in named}
+    dialects = {
+        platform_dialect(e)[0] for e in (contract.get("exposes") or []) if isinstance(e, dict)
+    } - {None}
+    chosen = {a: d for a, d in ADAPTERS.items() if d in dialects and a not in ("spark", "trino")}
+    return chosen or dict(ADAPTERS)
 
 
 def _macro_path(out_path: Path, macros_dir: str | None) -> Path:
