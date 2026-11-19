@@ -58,6 +58,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bucket, a bucket's key) still needs the flag. The AWS plugin names them by type and by the
   names forge gives them (`aws_ingest.spark_definition`).
 
+- **A Spark job on AWS can write its own table where Lake Formation governs new tables.**
+  forge granted a job's role Lake Formation access to the table it writes only when the output's
+  binding declared a non-empty `governance.lakeFormation`, so in an account that removed the
+  `IAM_ALLOWED_PRINCIPALS` default for new tables (Lake Formation's own advice), a stream without
+  that block could not see its own table. The grant (`INSERT`, `ALTER`, `DESCRIBE`, `SELECT`, and
+  `DELETE` for a batch job) is now emitted for such outputs, and for a stream's dead-letter table
+  beside them, with a `count` the plan decides from the account's settings
+  (`data.aws_lakeformation_data_lake_settings`): 1 where Lake Formation governs new tables, 0 where
+  IAM alone decides. The module is the same text in every account, and an account that keeps the
+  default creates nothing new. The identity that runs `fluid plan` and `fluid apply` needs
+  `lakeformation:GetDataLakeSettings`. An output with a `governance.lakeFormation` block keeps its
+  grants as they are; an EMR on EC2 job runs as the cluster's role, which forge does not know, and
+  gets none.
+
 - **A Spark build that leaves the contract on AWS has its runs stopped before its role goes.**
   `fluid apply` destroyed the build's role, artifacts and log group but left its stream running
   until those were gone, and a product destroy failed part way: EMR Serverless deletes only a

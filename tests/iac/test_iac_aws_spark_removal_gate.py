@@ -3,7 +3,7 @@
 
 """Removing a Spark build is not data loss: what it ran with (its runner and job config, role,
 policies, log group and the key its logs are encrypted with, its Glue job or EMR Serverless
-application) holds no data, so the data-loss gate does not count it (``aws_ingest.
+application, its job role's own Lake Formation grants) holds no data, so the data-loss gate does not count it (``aws_ingest.
 spark_definition``, ``AwsIacPlugin.retired_definitions``). The table it wrote stays gated."""
 
 from __future__ import annotations
@@ -56,8 +56,9 @@ def test_the_lake_formation_writer_role_and_the_caller_policy_are_definitions(co
     without.pop("builds")
     added = _addresses(with_build) - _addresses(emit(without)[0])
     gated = sorted(a for a in added if not spark_definition(a, a.split(".", 1)[0]))
-    # The writer's Lake Formation grant is access only, which the gate already skips.
-    assert all(a.startswith("aws_lakeformation_permissions.") for a in gated), gated
+    # The job role's grant under the block is the build's own too (and access only either way).
+    assert gated == [], gated
+    assert any("_lf_spark_writer_" in a for a in added)
     assert any("_lf_writer_" in a for a in added)
     assert any(a.endswith("_spark_caller") for a in added)
 
@@ -100,6 +101,35 @@ def test_a_removed_build_alone_does_not_reach_the_gate():
     # Without the plugin's word, every removal counts, as before.
     counted, _ = engine._data_bearing_changes(_summary(len(REMOVED)), REMOVED)
     assert counted["remove"] == len(REMOVED)
+
+
+LF = "aws_lakeformation_permissions"
+#: A removed build's own grants where Lake Formation governs new tables: counted, so the plan
+#: names them with their index.
+DEFAULT_GRANTS = [
+    (f"{LF}.shop_orders_lf_spark_writer_order_lines_0[0]", LF),
+    (f"{LF}.shop_orders_lf_spark_dead_letters_ingest_orders[0]", LF),
+]
+
+
+def test_a_removed_build_with_its_default_grants_does_not_reach_the_gate():
+    plugin = get_iac_plugin("aws")
+    removed = [*REMOVED, *DEFAULT_GRANTS]
+    counted, revoked = engine._data_bearing_changes(_summary(len(removed)), removed, plugin)
+    assert counted["remove"] == 0  # each grant counted out once, as access only
+    assert revoked == [a for a, _ in DEFAULT_GRANTS]
+    for address, kind in DEFAULT_GRANTS:
+        assert spark_definition(address, kind)
+        assert spark_definition(address.removesuffix("[0]"), kind)  # as the module names it
+
+
+def test_a_grant_the_binding_declares_is_not_the_builds():
+    for name in (
+        "shop_orders_lf_grant_order_lines_0",
+        "shop_orders_lf_grant_shop_0",
+        "shop_orders_lf_tag_pii",
+    ):
+        assert not spark_definition(f"{LF}.{name}", LF), name
 
 
 def test_its_table_still_reaches_the_gate():
