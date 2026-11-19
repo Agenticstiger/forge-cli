@@ -204,6 +204,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another build's DAG would otherwise run twice). `fluid validate` warns about an Airflow
   task's `buildStepRef`: no generated DAG runs one.
 
+- **Which declared rules each engine can run, and rules that must run.** `fluid generate
+  dbt-tests --coverage` prints, for every declared invariant, identifier format, placeholder
+  declaration and shared attribute, whether DuckDB, Snowflake, BigQuery, Databricks, PostgreSQL
+  and Athena can run it, and the reason where one cannot (the validator refuses it, a construct
+  has no exact SQL, a link crosses platforms); `--coverage-out PATH` writes the same as JSON.
+  `--require-rule ID` (repeatable) or `--require-all-rules` makes generation fail, writing
+  no tests, when a selected adapter cannot run a required rule, when nothing tests a rule named
+  by id, or when the contract declares rules below 0.7.7, where they do not run; `--adapter TYPE` selects the
+  adapters (default: those of the platforms the contract's exposes bind to).
+- **A Databricks dbt job tests the declared rules too.** `fluid apply` adds each declared rule on
+  an expose the build writes to the uploaded project as a singular test,
+  `<test path>/fluid_dq/<model>/fluid_dq_<id>.sql`, in Databricks SQL printed from the parsed
+  expression, and the run report names it with what dbt found. A rule with no exact Databricks
+  SQL, or one that reads an expose the build does not write, is refused at plan, like any other
+  contract rule the job cannot run.
+
 - **`fluid generate dbt-tests` runs declared invariants as dbt tests.** On a 0.7.7 contract each
   declared invariant, identifier format, bounded placeholder declaration, shared column and
   shared attribute becomes one `fluid_rule` generic test on its model, and the `fluid_rule`
