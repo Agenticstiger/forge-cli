@@ -4064,9 +4064,9 @@
         },
         "releaseLabel": {
           "type": "string",
-          "pattern": "^emr-[0-9]+\\.[0-9]+\\.[0-9]+(?![\\s\\S])",
+          "pattern": "^emr-[0-9]+\\.[0-9]+\\.[0-9]+((-[a-z0-9]+)*-(latest|[0-9]{8}))?(?![\\s\\S])",
           "default": "emr-7.12.0",
-          "description": "EMR runtimes only (emr-serverless, emr-ec2, emr-eks): the EMR release. 7.12 or later writes Iceberg with Lake Formation credentials."
+          "description": "EMR runtimes only (emr-serverless, emr-ec2, emr-eks): the EMR release, in the form the runtime takes. emr-serverless and emr-ec2 name the release (emr-7.12.0, the default); emr-eks names an image of it, emr-X.Y.Z-latest or emr-X.Y.Z-YYYYMMDD (default emr-7.12.0-latest). 7.12 or later writes Iceberg with Lake Formation credentials."
         },
         "executionRoleArn": {
           "type": "string",
@@ -4252,6 +4252,49 @@
               ]
             },
             "description": "glueVersion is only valid with runtime: glue; EMR runtimes take releaseLabel"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "runtime": {
+                "const": "emr-eks"
+              }
+            },
+            "required": [
+              "runtime"
+            ]
+          },
+          "then": {
+            "properties": {
+              "releaseLabel": {
+                "pattern": "^emr-[0-9]+\\.[0-9]+\\.[0-9]+(-[a-z0-9]+)*-(latest|[0-9]{8})(?![\\s\\S])"
+              }
+            },
+            "description": "EMR on EKS names an image of the release: emr-X.Y.Z-latest or emr-X.Y.Z-YYYYMMDD"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "runtime": {
+                "enum": [
+                  "emr-serverless",
+                  "emr-ec2"
+                ]
+              }
+            },
+            "required": [
+              "runtime"
+            ]
+          },
+          "then": {
+            "properties": {
+              "releaseLabel": {
+                "pattern": "^emr-[0-9]+\\.[0-9]+\\.[0-9]+(?![\\s\\S])"
+              }
+            },
+            "description": "EMR Serverless and EMR on EC2 name the release itself: emr-X.Y.Z"
           }
         }
       ]
