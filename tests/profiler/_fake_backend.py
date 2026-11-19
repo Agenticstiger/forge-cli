@@ -15,6 +15,11 @@ vendored ``profile-1.schema.json``.
 ``tests/profiler/test_flux_stats_backend.py`` runs the same profiles through the
 real registry wherever flux-stats is installed, and ``[dev]`` installs it in every
 CI lane, so this double cannot drift from it unnoticed.
+
+The fidelity grammar has no stand-in: it is flux-stats' own (ADR 0009), and the
+profile every run answers without ``--bundle`` is a fidelity block the profiler
+declares from the contract (``fluid_build/profiler/defaults.py``). So ``read_block``,
+``measure``, ``check_edge_counts`` and ``enum_levels`` hand the work to flux-stats.
 """
 
 from __future__ import annotations
@@ -178,6 +183,29 @@ class FakeBackend:
 
     def __init__(self) -> None:
         self.checked: List[str] = []
+        self._registry: Any = None
+
+    def _real(self) -> Any:
+        if self._registry is None:
+            # Built directly: a test that puts this double in place of load_backend would
+            # otherwise get this double back.
+            from fluid_build.profiler._stats import _FluxStatsBackend
+
+            self._registry = _FluxStatsBackend()
+        return self._registry
+
+    def enum_levels(self, declared_type: str) -> Tuple[str, ...]:
+        levels: Tuple[str, ...] = self._real().enum_levels(declared_type)
+        return levels
+
+    def read_block(self, raw_block: Any, contract_document: Any, expose_id: str) -> Any:
+        return self._real().read_block(raw_block, contract_document, expose_id)
+
+    def measure(self, block: Any, statistic: Any, rows: Any) -> Any:
+        return self._real().measure(block, statistic, rows)
+
+    def check_edge_counts(self, statistics: Any, **checks: Any) -> Any:
+        return self._real().check_edge_counts(statistics, **checks)
 
     def metrics(self) -> Tuple[FakeMetric, ...]:
         return METRICS
@@ -206,12 +234,17 @@ class FakeBackend:
         self.checked.append(text)
         document = json.loads(text, parse_float=_refuse_float)
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
-        errors = sorted(
-            jsonschema.Draft202012Validator(schema).iter_errors(document),
-            key=lambda error: list(error.absolute_path),
-        )
-        if errors:
-            raise DocumentRefused("; ".join(error.message for error in errors[:3]))
+        if document.get("_schemaURL") == schema["$id"]:  # format 1-0-0: the vendored schema
+            errors = sorted(
+                jsonschema.Draft202012Validator(schema).iter_errors(document),
+                key=lambda error: list(error.absolute_path),
+            )
+            if errors:
+                raise DocumentRefused("; ".join(error.message for error in errors[:3]))
+        # Every document is also read back by the registry's own reader: a schema does not
+        # hold its rules (levels sorted, a null cell only where withheld, groups in order),
+        # and 1-1-0 (a quantile/2) has no vendored schema here.
+        self._real().check_document(text)
 
     def read_budget(self) -> object:
         return object()

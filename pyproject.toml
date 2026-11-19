@@ -947,6 +947,7 @@ module = [
     # Any is a silent leak.
     "fluid_build.profiler._stats",
     "fluid_build.profiler.bundle",
+    "fluid_build.profiler.defaults",
     "fluid_build.profiler.disclosure",
     "fluid_build.profiler.document",
     "fluid_build.profiler.runner",

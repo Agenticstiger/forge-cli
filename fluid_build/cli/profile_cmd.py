@@ -52,6 +52,26 @@ fidelity check compares a mean property with: the number of values and their
 sum on a grid of 2^-N steps. N is --fractional-bits, 16 unless given, and the
 fidelity block's encoding.fractionalBits must be the same.
 
+Without --bundle, the document also carries the statistics the contract's own
+declarations give, declared from the contract and never from the records, as the
+fidelity block FLUX's grammar reads (so `fluxsim init` can start from them):
+  - for each enum(...) column, a levelHistogram over every declared level; a
+    level no record holds is a withheld cell, and the column's distinctCount
+    is withheld (D);
+  - for a number whose validationRules declare both ends of a range inside
+    its type, a marginalHistogram over about ten bins of it; its sum, min,
+    max, quantiles and distinctCount are then withheld (D), and it has no
+    mean/1;
+  - for any other number of a bounded type, and each date and timestamp,
+    quantile/2 at 0.25, 0.5 and 0.75 on a ladder fixed by the type (0, 1, 2,
+    5, 10, 20, 50 ... for a number, one bin per year from 1900 to 2100 for a
+    date or a timestamp);
+  - for each categorical semantics.dimensions entry on an enum column, the
+    other enum columns' histograms per level of it, every declared level a
+    group, up to 10,000 cells for one column's groupings.
+A record outside what the contract declares (a level its type does not list, a
+value outside its type or its declared range) refuses the profile.
+
 With --bundle DIR the profile answers the Simulation's fidelity block instead:
 it reads the block of DIR's one Simulation (*.flux.yml) for the expose and
 writes the statistic each declared property is compared with (a mean, a
@@ -63,10 +83,11 @@ column's published total; the records a null groupBy value leaves out of every
 group count as one more group there. A correlation is not answered: its moments
 need the exact record count, which the output checks round.
 
-What the checks leave readable: a grouped statistic lists every group the data
-forms, published or withheld. A key is always a level the bundle declares (a
-value outside the declared support is refused), so its presence says only that
-the level holds at least one record.
+What the checks leave readable: under --bundle, a grouped statistic lists every
+group the data forms, published or withheld. A key is always a level the bundle
+declares (a value outside the declared support is refused), so its presence says
+only that the level holds at least one record. Without --bundle, every declared
+level is a group, whatever the records hold.
 
 The counts a histogram, a level histogram or a quantile publishes at the edges
 of one column are checked together, as FLUX ADR 0012 sets, by flux-stats'
@@ -82,9 +103,9 @@ of one column, no small cell, a zero included where zeros are disclosive, can be
 formed by adding or subtracting what they publish, so more is withheld (D in
 the summary). Only then are counts rounded. The check does not see a column's
 support, which lists the levels that hold records, or the group sizes of a
-statistic grouped by the column, which repeat its level counts; and a declared
-level that holds no record is absent from a grouped statistic, which shows its
-zero. A published min or
+statistic grouped by the column, which repeat its level counts; and under
+--bundle a declared level that holds no record is absent from a grouped
+statistic, which shows its zero. A published min or
 max shows that no record lies below or above it. A quantile whose value is the
 column's smallest or largest shows the same, and is withheld for it, as a zero
 is.
@@ -107,7 +128,7 @@ fluid profile contract.fluid.yaml --source customers=./customers.csv \\
 
 # Only aggregates leave: a count under 10 or a zero is withheld, counts are rounded
 # to 5, a sum 2 records dominate is withheld, and a min, max or quantile is shown only
-# when 10 records hold it (ACRO 1.1.0 defaults). With --bundle, a column's histograms and
+# when 10 records hold it (ACRO 1.1.0 defaults). A column's histograms and
 # quantiles are checked together (FLUX ADR 0012): on one partition, a quantile with bins
 # only with at least 10 records below its bin, in it and above it, and no small cell,
 # a zero included, left to be formed by adding or subtracting what is published. A group
@@ -748,3 +769,8 @@ def _report_table(say: Any, table: Any, prefix: str, grid: str) -> None:
         )
     for name, reason in table.plan.skipped:
         say(f"{prefix}Not profiled: column {name!r}: {reason}.")
+    for name, reason in table.uncovered:
+        say(
+            f"{prefix}Left out of the default statistics: column {name!r}: {reason}.",
+            soft_wrap=True,
+        )

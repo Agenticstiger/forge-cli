@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build.policy._common import iter_exposes
-from fluid_build.profiler import disclosure, document, sources
+from fluid_build.profiler import defaults, disclosure, document, sources
 from fluid_build.profiler._stats import (
     WITHHELD_ROUNDING,
     BlockRefused,
@@ -199,6 +199,9 @@ class TableResult:
     partly_withheld_statistics: Tuple[PartlyNamedStatistic, ...] = ()
     #: Each declared property the document does not answer, with the reason.
     left_out: Tuple[Tuple[str, str], ...] = ()
+    #: Each number, date or timestamp column the contract gives no default statistic,
+    #: with why (:mod:`fluid_build.profiler.defaults`).
+    uncovered: Tuple[Tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -344,11 +347,13 @@ def _column(
     tally: "Counter[str]",
     fractional_bits: int,
     declares_mean: bool = False,
+    withhold: FrozenSet[str] = frozenset(),
 ) -> Dict[str, Any]:
     """One column of the table: its domain, then its checked metrics and statistics.
 
     *declares_mean* says the fidelity block declares an ungrouped ``mean`` of this
     column: that statistic replaces the fixed ``mean/1``, which is not formed.
+    *withhold* names the metrics withheld whatever their value (:func:`_counted_levels`).
     """
     read = [
         backend.read_value(column.domain, value, column=column.name, row_index=index)
@@ -356,7 +361,7 @@ def _column(
     ]
     entry: Dict[str, Any] = {
         "domain": column.domain,
-        "metrics": _column_metrics(column, read, row_count, backend, rule, tally),
+        "metrics": _column_metrics(column, read, row_count, backend, rule, tally, withhold),
     }
     statistics = (
         []
@@ -375,8 +380,13 @@ def _column_metrics(
     backend: StatisticsBackend,
     rule: disclosure.DisclosureRule,
     tally: "Counter[str]",
+    withhold: FrozenSet[str] = frozenset(),
 ) -> Dict[str, Any]:
-    """The checked ``metrics`` object of one column, from its values as read."""
+    """The checked ``metrics`` object of one column, from its values as read.
+
+    A metric *withhold* names is withheld under ``D`` whatever its value and its own
+    check, so its status says nothing about the records either.
+    """
     present = [value for value in read if value is not None]
     holders = Counter(present)
     counted = disclosure.check_count(len(present), rule)
@@ -403,6 +413,8 @@ def _column_metrics(
             verdict, shown = counted, value
             if counted.published:
                 verdict, shown = _check_described(name, value, present, holders, rule)
+        if name in withhold:
+            verdict = disclosure.Verdict(disclosure.SECONDARY, "counts what a histogram withholds")
         entry: Dict[str, Any] = {
             "definition": metric.identifier,
             "status": verdict.status,
@@ -574,6 +586,12 @@ def profile_exposes(
         if found is not None:
             grids[plan.expose_id] = grid
     fractional_bits = _one_grid(grids, blocks, fractional_bits)
+    uncovered: List[Tuple[Tuple[str, str], ...]] = [() for _ in plans]
+    for position, plan in enumerate(plans):
+        if plan.expose_id not in blocks:
+            declared[position], uncovered[position] = _default_block(
+                contract, plan, backend, fractional_bits
+            )
     reads = [
         _dates_read(
             plan,
@@ -586,12 +604,18 @@ def profile_exposes(
     tallies: Tuple["Counter[str]", "Counter[str]"] = (Counter(), Counter())
     tables_doc: Dict[str, Dict[str, Any]] = {}
     results: List[TableResult] = []
-    for plan, read, found in zip(plans, reads, declared, strict=True):
+    for plan, read, found, missing in zip(plans, reads, declared, uncovered, strict=True):
         table_doc, result = _profile_table(
-            plan, read, found, backend, rule, tallies, fractional_bits
+            plan,
+            read,
+            found,
+            backend,
+            rule,
+            tallies,
+            fractional_bits,
         )
         tables_doc[plan.expose_id] = table_doc
-        results.append(result)
+        results.append(replace(result, uncovered=missing))
     if producer is None:
         from fluid_build import __version__
 
@@ -650,6 +674,37 @@ def _as_day(value: Any) -> Any:
         except ValueError:  # not a calendar day: the reader refuses it as written
             return value
     return value
+
+
+def _default_block(
+    contract: Mapping[str, Any], plan: ExposePlan, backend: StatisticsBackend, fractional_bits: int
+) -> Tuple[Optional[DeclaredBlock], Tuple[Tuple[str, str], ...]]:
+    """The block the profiler declares for *plan* from the contract alone, read by the registry.
+
+    ``(None, ...)`` when the contract declares nothing to answer. The block is the
+    profiler's own, so a grammar refusal of it is a defect, and says so.
+    """
+    expose = next(
+        item for item in iter_exposes(dict(contract)) if item.get("exposeId") == plan.expose_id
+    )
+    planned = defaults.default_plan(expose, plan.columns, backend.enum_levels, fractional_bits)
+    if planned.block is None:
+        return None, planned.uncovered
+    try:
+        declared = backend.read_block(planned.block, contract, plan.expose_id)
+    except BlockRefused as exc:
+        raise ProfileError(
+            "profile_default_block_refused",
+            f"the statistics fluid profile declares for exposes[{plan.expose_id}] are refused "
+            f"by flux-stats' fidelity grammar: {exc}",
+            {
+                "read": "nothing: no record was read",
+                "next": "report this with your forge-cli and flux-stats versions",
+            },
+        ) from None
+    _check_declared_columns(declared, plan)
+    block = replace(declared, every_declared_group=True, declared_ranges=planned.ranges)
+    return block, planned.uncovered
 
 
 def _refuse_repeated(exposes: Sequence[ExposeSource]) -> None:
@@ -713,7 +768,9 @@ def _profile_table(
 ) -> Tuple[Dict[str, Any], TableResult]:
     """One table of the document, from one read of its records, and its summary."""
     tally, cell_tally = tallies
-    replaced = _ungrouped_means(declared)
+    binned = _binned_numbers(declared, plan)
+    replaced = _ungrouped_means(declared) | binned
+    counted = _counted_levels(declared)
     columns_doc = {
         column.name: _column(
             column,
@@ -724,6 +781,8 @@ def _profile_table(
             tally,
             fractional_bits,
             column.name in replaced,
+            (frozenset({"distinctCount"}) if column.name in counted else frozenset())
+            | (_BINNED_WITHHELD if column.name in binned else frozenset()),
         )
         for column in plan.columns
     }
@@ -791,6 +850,51 @@ def _declared_block(
     return declared, declared.fractional_bits
 
 
+#: The metrics withheld beside a histogram the contract's own block declares on a number
+#: column's declared range (``_binned_numbers``), whatever their values.
+_BINNED_WITHHELD = frozenset({"sum", "min", "max", "quantiles", "distinctCount"})
+
+
+def _binned_numbers(declared: Optional[DeclaredBlock], plan: ExposePlan) -> FrozenSet[str]:
+    """The number columns the contract's own block gives a histogram over a declared range.
+
+    The bins of a declared range are narrow, often one value each, so an exact ``sum`` is
+    the bins' counts weighed by their values, and a published ``min``, ``max``,
+    ``quantiles`` value or ``distinctCount`` places records in them: beside the cells the
+    check publishes, each gives a withheld one back. So those metrics are withheld under
+    ``D`` and no ``mean/1`` (the sum on the grid) is formed. ``tests/profiler/
+    test_disclosure_oracle.py`` found it, and a quantile on a type's ladder, whose bins are
+    wide, keeps them all.
+    """
+    if declared is None or not declared.every_declared_group:
+        return frozenset()
+    numbers = {column.name for column in plan.columns if column.domain == NUMBER}
+    return frozenset(
+        each.column
+        for each in declared.statistics
+        if each.column in numbers and each.kind == "marginalHistogram"
+    )
+
+
+def _counted_levels(declared: Optional[DeclaredBlock]) -> FrozenSet[str]:
+    """The columns whose levels a level histogram counts, or a grouped statistic groups by.
+
+    Their ``distinctCount`` is withheld: the number of levels that hold a record says how
+    many of the histogram's withheld cells, or of its groups, hold none, and beside the
+    cells the check lets through it can pin a cell of one record or of none (found by
+    ``tests/profiler/test_disclosure_oracle.py``).
+    """
+    if declared is None:
+        return frozenset()
+    found = set()
+    for statistic in declared.statistics:
+        if statistic.kind == "levelHistogram":
+            found.add(statistic.column)
+        if statistic.group_by is not None:
+            found.add(statistic.group_by)
+    return frozenset(found)
+
+
 def _ungrouped_means(declared: Optional[DeclaredBlock]) -> FrozenSet[str]:
     """The columns whose ungrouped mean the block declares: their fixed ``mean/1`` is the block's."""
     if declared is None:
@@ -848,6 +952,7 @@ def _declare_statistics(
     the column's other statistics (:func:`_edge_decisions`). *tallies*
     count the values and the histogram cells the checks withhold, by the check.
     """
+    _check_declared_ranges(declared, read, backend)
     rows: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
     left_out: List[Tuple[str, str]] = []
     formed: List[Tuple[DeclaredStatistic, MeasuredStatistic]] = []
@@ -861,6 +966,12 @@ def _declare_statistics(
         try:
             measured = backend.measure(declared, statistic, rows[statistic.columns])
         except MeasureRefused as exc:
+            if declared.every_declared_group:  # the block the contract's declarations give
+                raise ProfileError(
+                    "profile_record_outside_declared_domain",
+                    f"{statistic.description}: {exc}",
+                    {"written": "nothing", "next": _OUTSIDE_DECLARED_DOMAIN},
+                ) from None
             raise ProfileError(
                 "profile_bundle_record_refused",
                 f"{statistic.description}: {exc}",
@@ -875,11 +986,48 @@ def _declare_statistics(
         formed.append((statistic, measured))
     decided = _edge_decisions(formed, backend, rule)
     for position, (statistic, measured) in enumerate(formed):
+        records = None
+        if statistic.group_by is not None:
+            records = sum(1 for value in read.values[statistic.column] if value is not None)
         entry = _declared_entry(
-            statistic, measured, rule, tallies, fractional_bits, decided.get(position)
+            statistic,
+            measured,
+            rule,
+            tallies,
+            fractional_bits,
+            decided.get(position),
+            records=records,
         )
         columns_doc[statistic.column].setdefault("statistics", []).append(entry)
     return left_out
+
+
+#: What to do about a record outside what the contract declares for its column.
+_OUTSIDE_DECLARED_DOMAIN = (
+    "the records and the contract disagree: fix the records, or the contract's column "
+    "type, enum levels or validationRules range, then profile"
+)
+
+
+def _check_declared_ranges(
+    declared: DeclaredBlock, read: sources.SourceColumns, backend: StatisticsBackend
+) -> None:
+    """Refuse a value outside the range its column's validationRules declare, exactly.
+
+    A histogram's bins over the range are rounded outward to the grid, which can be
+    coarser than the column's own scale, so the registry, which checks a value against
+    the bins, would count one just past a bound in an end bin. The value is never shown.
+    """
+    for name, declared_range in declared.declared_ranges.items():
+        for index, value in enumerate(read.values[name]):
+            exact = backend.read_value("number", value, column=name, row_index=index)
+            if exact is not None and not declared_range.holds(exact):
+                raise ProfileError(
+                    "profile_record_outside_declared_domain",
+                    f"column {name!r} row {index}: value outside the range its "
+                    "validationRules declare",
+                    {"written": "nothing", "next": _OUTSIDE_DECLARED_DOMAIN},
+                )
 
 
 #: The declared statistics that count records between edges of their column (FLUX ADR
@@ -1014,21 +1162,27 @@ def _declared_entry(
     tallies: Tuple["Counter[str]", "Counter[str]"],
     fractional_bits: int,
     decision: Optional[EdgeDecision],
+    records: Optional[int] = None,
 ) -> Dict[str, Any]:
     """One declared statistic as the document writes it: every group checked, none guessed at.
 
     A histogram's or a quantile's groups come from the *decision* of the output check on
     its column, and a mean's and a support's from their own checks. *tallies* count the
-    groups and the histogram cells that are withheld, by the check.
+    groups and the histogram cells that are withheld, by the check. The ``sampleSize``
+    band is of *records* where given, else of the records the groups hold. A grouped
+    statistic is given its column's non-null records, as its column's ungrouped figures
+    count them: its groups leave out each record whose ``groupBy`` key is null, so their
+    band, beside the column's own counts, would give the number of those back.
     """
     groups = measured.groups
     if decision is not None:
         written = _edge_checked_groups(statistic, measured, rule, tallies, decision)
     else:
         written = _own_checked_groups(statistic, measured, rule, tallies[0], fractional_bits)
+    held = sum(group.k for group in groups) if records is None else records
     entry: Dict[str, Any] = {
         "definition": statistic.identifier,
-        "sampleSize": disclosure.sample_size(sum(group.k for group in groups), rule),
+        "sampleSize": disclosure.sample_size(held, rule),
         "disclosure": rule.name,
         **statistic.shape,
         "groups": written,
@@ -1206,7 +1360,10 @@ def _shape(statistic: Mapping[str, Any]) -> Optional[str]:
     if "level" in statistic:
         parts.append(f"at level {statistic['level']}")
     if "bins" in statistic:
-        parts.append(f"over bins {', '.join(statistic['bins'])}")
+        bins = statistic["bins"]
+        # A ladder has scores of edges: their number says which statistic it is.
+        shown = ", ".join(bins) if len(bins) <= 12 else f"{len(bins) - 1} bins"
+        parts.append(f"over bins {shown}" if len(bins) <= 12 else f"over {shown}")
     return " ".join(parts) or None
 
 

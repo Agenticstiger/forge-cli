@@ -496,13 +496,15 @@ def test_the_summary_names_each_statistic_once_with_its_columns_and_shape():
 def test_the_summary_names_the_fidelity_statistics_and_their_grid(workspace, registry, capsys):
     assert main(["profile", "contract.fluid.yaml", "--source", "orders.ndjson"]) == 0
     out = " ".join(capsys.readouterr().out.split())
-    assert (
-        "Fidelity statistics: mean/1 of 'amount', on fractionalBits 16 "
-        "(the fidelity block must declare the same)." in out
-    )
+    assert "Fidelity statistics: mean/1 of 'amount'" in out
+    assert "on fractionalBits 16 (the fidelity block must declare the same)." in out
     written = json.loads((workspace / "orders.profile.json").read_bytes())
     assert written["encoding"] == {"fractionalBits": 16, "rounding": "floor"}
-    (statistic,) = written["tables"]["orders"]["columns"]["amount"]["statistics"]
+    (statistic,) = [
+        each
+        for each in written["tables"]["orders"]["columns"]["amount"]["statistics"]
+        if each["definition"] == "mean/1"
+    ]
     assert statistic["groups"] == [{"group": "", "k": 40, "Sx": str(620 * 2**16), "status": "F"}]
 
 
@@ -519,7 +521,11 @@ def test_fractional_bits_names_the_grid(workspace, registry, capsys):
     assert "on fractionalBits 20 " in " ".join(capsys.readouterr().out.split())
     written = json.loads((workspace / "orders.profile.json").read_bytes())
     assert written["encoding"]["fractionalBits"] == 20
-    (statistic,) = written["tables"]["orders"]["columns"]["amount"]["statistics"]
+    (statistic,) = [
+        each
+        for each in written["tables"]["orders"]["columns"]["amount"]["statistics"]
+        if each["definition"] == "mean/1"
+    ]
     assert statistic["groups"][0]["Sx"] == str(620 * 2**20)
 
 

@@ -37,6 +37,7 @@ from functools import partial
 from importlib import import_module
 from types import SimpleNamespace
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -49,6 +50,9 @@ from typing import (
     Tuple,
     runtime_checkable,
 )
+
+if TYPE_CHECKING:
+    from fluid_build.profiler.defaults import DeclaredRange
 
 __all__ = [
     "BlockRefused",
@@ -168,12 +172,21 @@ class DeclaredBlock:
     """What the fidelity block asks of a profile, read by the registry's own parser.
 
     ``left_out`` names each declared property that is not answered, with the
-    reason. The parsed block stays private to this seam, which measures with it.
+    reason. ``every_declared_group`` is set for the block the profiler declares
+    from the contract (:mod:`fluid_build.profiler.defaults`): a grouped statistic
+    then lists every level its ``groupBy`` declares as a group, one no record holds
+    included, so the groups a document lists never depend on the records. That block's
+    ``declared_ranges`` are the ranges its histograms cover, as the contract's
+    validationRules declare them: each value is checked against its range exactly before
+    it is counted, since the bins are rounded outward to the grid. The parsed block
+    stays private to this seam, which measures with it.
     """
 
     fractional_bits: int
     statistics: Tuple[DeclaredStatistic, ...]
     left_out: Tuple[Tuple[str, str], ...] = ()
+    every_declared_group: bool = False
+    declared_ranges: Mapping[str, "DeclaredRange"] = field(default_factory=dict, compare=False)
     _block: Any = field(default=None, repr=False, compare=False)
 
     @property
@@ -361,6 +374,13 @@ class StatisticsBackend(Protocol):
 
         Raises :class:`BlockRefused` for a block the grammar refuses, and
         :class:`StatisticsUnavailable` when the registry has no grammar.
+        """
+
+    def enum_levels(self, declared_type: str) -> Tuple[str, ...]:
+        """The levels a FLUID ``enum(...)`` column type declares, as the registry reads them.
+
+        ``()`` for any other type. Raises :class:`BlockRefused` for a level list the
+        registry's grammar refuses (``FLX-3001``).
         """
 
     def measure(
@@ -610,6 +630,14 @@ class _FluxStatsBackend:
             )
         return self._grammar
 
+    def enum_levels(self, declared_type: str) -> Tuple[str, ...]:
+        grammar = self._fidelity()
+        try:
+            levels: Tuple[str, ...] = grammar.fidelity.declared_enum_values(declared_type)
+        except self._refused as error:
+            raise BlockRefused(error.code.code, error.detail or error.code.title) from None
+        return levels
+
     def read_block(
         self, raw_block: Any, contract_document: Mapping[str, Any], expose_id: str
     ) -> DeclaredBlock:
@@ -723,6 +751,14 @@ class _FluxStatsBackend:
             # the engine's synthetic rows hold declared levels alone, so a check loses
             # no group it could compare.
             keys = grammar.reading.group_keys(rows, by, declared_only=True)
+            if block.every_declared_group and by is not None:
+                # A declared level no record holds is a group of none, so the groups listed
+                # are the declared levels whatever the records hold; the check for counts
+                # at edges withholds such a group with its siblings.
+                present = {key for key, _ in keys}
+                keys = sorted(
+                    [*keys, *((level, []) for level in by.support_values if level not in present)]
+                )
             groups = tuple(
                 self._measured(grammar, parsed, declaration, statistic, rows, key, indices)
                 for key, indices in keys

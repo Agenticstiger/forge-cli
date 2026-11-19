@@ -20,6 +20,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fluid_build.providers._sql_safety import quote_string_literal_for
@@ -135,23 +136,46 @@ _RANGE_BOUND = re.compile(rf"^\s*(>=|<=|>|<)\s*({_NUMBER})\s*$")
 _RANGE_AND = re.compile(r"\s+and\s+", re.IGNORECASE)
 
 
-def parse_range(constraint: Any) -> List[Tuple[str, float]]:
-    """The bounds of a ``range`` validationRule: ``">= 0"``, ``">= 0 and <= 100"``
-    or ``"between 0 and 100"`` (``[]`` for anything else)."""
+#: The longest number an exact range bound is read from: a longer text is not a bound
+#: anyone wrote, and ``Fraction`` refuses an integer past 4,300 digits.
+_MOST_RANGE_DIGITS = 1000
+
+
+def _range_parts(constraint: Any) -> List[Tuple[str, str]]:
+    """A ``range`` validationRule as ``(operator, number text)`` pairs; ``[]`` for anything else."""
     if not isinstance(constraint, str):
         return []
     m = _RANGE_BETWEEN.match(constraint)
     if m:
-        bounds = [(">=", float(m.group(1))), ("<=", float(m.group(2)))]
-    else:
-        bounds = []
-        for part in _RANGE_AND.split(constraint.strip()):
-            m = _RANGE_BOUND.match(part)
-            if not m:
-                return []
-            bounds.append((m.group(1), float(m.group(2))))
+        return [(">=", m.group(1)), ("<=", m.group(2))]
+    parts = []
+    for part in _RANGE_AND.split(constraint.strip()):
+        m = _RANGE_BOUND.match(part)
+        if not m:
+            return []
+        parts.append((m.group(1), m.group(2)))
+    return parts
+
+
+def parse_range(constraint: Any) -> List[Tuple[str, float]]:
+    """The bounds of a ``range`` validationRule: ``">= 0"``, ``">= 0 and <= 100"``
+    or ``"between 0 and 100"`` (``[]`` for anything else)."""
+    bounds = [(operator, float(text)) for operator, text in _range_parts(constraint)]
     # A bound too large for a float would reach SQL as ``inf``: not a number.
     return bounds if all(math.isfinite(n) for _, n in bounds) else []
+
+
+def parse_range_exact(constraint: Any) -> List[Tuple[str, Fraction]]:
+    """:func:`parse_range`'s bounds as exact numbers, for a reader that must not round them.
+
+    ``fluid profile`` cuts a declared range into bins (``profiler/defaults.py``), and a
+    float would move an edge. ``[]`` for anything :func:`parse_range` does not read, and
+    for a number longer than :data:`_MOST_RANGE_DIGITS`.
+    """
+    parts = _range_parts(constraint)
+    if any(len(text) > _MOST_RANGE_DIGITS for _, text in parts):
+        return []
+    return [(operator, Fraction(text)) for operator, text in parts]
 
 
 @dataclass(frozen=True)

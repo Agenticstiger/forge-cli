@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid profile` publishes the statistics `fluxsim init` reads, without a bundle.** With no
+  `--bundle`, the profiler declares a fidelity block from the contract alone, never from the
+  records, and answers it through the same path as a Simulation's block, so flux-stats parses
+  and checks every statistic (`check_edge_counts`, ADR 0012, and the ACRO rules):
+  - every `enum(...)` column gets `levelHistogram/1` over every declared level; a level that
+    no record holds is listed, its cell withheld as `C`, so `fluxsim init` no longer drops a
+    histogram that lacked it;
+  - a number whose `validationRules` declare both ends of a range, each inside its type, gets
+    `marginalHistogram/1` over about ten bins of one width, exact at both ends (an integer range
+    ends half a unit past its top, a whole unit at `--fractional-bits 0`, so each value has a
+    bin of its own);
+  - any other number of a bounded type (a range of one side, or with a side at the type's own
+    bound, included), and every date and timestamp, gets `quantile/2` at 0.25, 0.5 and 0.75 on
+    a ladder fixed by the type: 0, ±1, ±2, ±5, ±10 ... within the type's bounds for a number,
+    one bin per year from 1900 to 2100 for a date or a timestamp;
+  - each categorical `semantics.dimensions` entry on an `enum` column groups the other `enum`
+    columns' level histograms by its levels, every declared level a group, one that no record
+    holds included; one column's groupings hold at most 10,000 cells together, and a grouping
+    past that is left out and named, since checking them costs about the cube of the levels.
+  A number with neither a range of two ends nor a bounded type (a `decimal` without `(p,s)`)
+  gets no such statistic, and the summary says so. A record outside what the contract declares
+  (a level its type does not list, a value outside its type or its declared range, a strict
+  bound included) now refuses the profile with `profile_record_outside_declared_domain`, naming
+  the column and the row, never the value. A profile that holds a `quantile/2` names format
+  `1-1-0`, which flux-stats reads from 0.7, so a profile without `--bundle` of a contract with a
+  bounded number, a date or a timestamp is now a `1-1-0` document, with new bytes and digest.
+- **Every new count table is audited for differencing, world by world.** A test profiles every
+  world of up to seven records for each kind of table under scaled-down ACRO rules, groups the
+  worlds by the document they publish, and fails on a count of one record or of none that the
+  new statistics pin. Run on larger universes under the ACRO defaults (up to 45 records, 46,376
+  worlds for a grouping), it found three channels, which the profiler now closes:
+  - a column's `distinctCount` says how many withheld cells hold no record, so a column a
+    level histogram counts, or that a grouped statistic groups by, withholds it under `D`,
+    with or without `--bundle`;
+  - a number's exact `sum`, and its `min`, `max`, `quantiles` and `distinctCount`, give a
+    withheld bin of a declared range back, so a number with a default histogram withholds them
+    under `D` and has no `mean/1`;
+  - a histogram and quantiles on the same bins, checked together, let a reader who knows the
+    check's choices tell worlds apart, so a column gets one or the other.
+  With these, the audit finds no such pin under the ACRO defaults.
 - **`fluid profile` profiles a whole data product in one call.** `--expose` repeats, and each
   expose takes its records as `--source <exposeId>=<location>` (and a database's table as
   `--table <exposeId>=<table>`); with no `--expose`, every expose a source names is profiled,
@@ -43,6 +83,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `org.csv` as the `account` expose. Several `--expose` flags now take one
   `--source <exposeId>=<location>` each, and are refused before any record is read without
   them (`profile_source_unpaired`); an expose named twice is `profile_expose_repeated`.
+- **A grouped statistic's `sampleSize` no longer gives back the records a null `groupBy` key
+  leaves out.** It banded the records its groups hold. Beside the column's own `count`, the
+  `groupBy` column's and the row count, that band pinned how many records hold a value and a
+  null key, a small count, under rules that round and under exact counts alike (the disclosure
+  audit found it once both columns held nulls; `--bundle` profiles had it too). It now bands the
+  column's non-null records, as the column's ungrouped statistics do.
 
 ## [0.35.0] — 2026-11-19
 

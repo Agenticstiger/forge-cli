@@ -358,6 +358,7 @@ from fluid_build.providers.quality_engine import (  # noqa: E402
     ValueDomain,
     execute_quality_checks,
     parse_range,
+    parse_range_exact,
     value_domain,
 )
 
@@ -376,6 +377,21 @@ from fluid_build.providers.quality_engine import (  # noqa: E402
 )
 def test_parse_range(constraint, bounds):
     assert parse_range(constraint) == bounds
+
+
+def test_parse_range_exact_reads_the_same_grammar_without_rounding():
+    from fractions import Fraction
+
+    assert parse_range_exact("between -1.5 and 0.1") == [
+        (">=", Fraction(-3, 2)),
+        ("<=", Fraction(1, 10)),  # exactly one tenth, which no float holds
+    ]
+    for constraint in (">= 0", ">= 0 and <= 100", "> 0 AND < 1", "0..100", ">= zero", None):
+        exact = parse_range_exact(constraint)
+        assert [(op, float(value)) for op, value in exact] == parse_range(constraint)
+    # A bound past what anyone writes is no bound, as parse_range reads an infinite one.
+    assert parse_range_exact(">= " + "9" * 1001) == []
+    assert parse_range(">= " + "9" * 400) == []
 
 
 ENERGY = [

@@ -203,7 +203,8 @@ def test_a_sum_longer_than_flux_stats_spells_is_refused_with_the_document(tmp_pa
     # Four distinct 1000-digit values, ten records each: every value is in bound and
     # published, and their sum (1002 digits) is past what flux-stats spells.
     contract = {
-        "exposes": [{"exposeId": "a", "contract": {"schema": [{"name": "n", "type": "integer"}]}}]
+        # A decimal with no (p,s) has no bound, so no quantile reads these values first.
+        "exposes": [{"exposeId": "a", "contract": {"schema": [{"name": "n", "type": "decimal"}]}}]
     }
     rows = [{"n": 10**999 * (5 + i % 4)} for i in range(40)]
     path = tmp_path / "a.ndjson"
@@ -268,7 +269,11 @@ def test_the_mean_a_profile_carries_is_the_one_the_check_compares(tmp_path, back
     profile, _ = load_profile_text(result.canonical.decode("utf-8"))
     assert profile.fractional_bits == 16
     for column in ("amount", "attempts"):
-        (entry,) = profile.column_statistics("payment", column)
+        (entry,) = [
+            each
+            for each in profile.column_statistics("payment", column)
+            if each.identifier == "mean/1"
+        ]
         assert entry.identifier == "mean/1" and entry.group_by is None
         (group,) = entry.groups
         assert group.published and group.key == ""
