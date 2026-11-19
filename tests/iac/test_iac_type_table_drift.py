@@ -85,6 +85,14 @@ def _bigquery_iac(fluid_type: str) -> Optional[str]:
     return f"{field['type']}({field['precision']}{scale})"
 
 
+def _snowflake_iac(fluid_type: str) -> Optional[str]:
+    """What the emitter writes, or ``None`` for a type it refuses. ``_sf_type`` is looked
+    up on each call, so a test that patches it reaches the check."""
+    if snowflake._sf_outcome(fluid_type).status == column_types.REFUSED:
+        return None
+    return snowflake._sf_type(fluid_type)
+
+
 def _snowflake_canonical(sql: str) -> str:
     """NUMBER for DECIMAL and NUMERIC (one type in Snowflake), NUMBER(38,0) when bare."""
     base, args = _split(sql)
@@ -106,7 +114,7 @@ def _databricks_canonical(sql: str) -> str:
 #: adapter -> (what the IaC emitter writes or None when it refuses, canonical form)
 _ADAPTERS: Dict[str, Tuple[Callable[[str], Optional[str]], Callable[[str], str]]] = {
     "bigquery": (_bigquery_iac, _bigquery_canonical),
-    "snowflake": (lambda fluid_type: snowflake._sf_type(fluid_type), _snowflake_canonical),
+    "snowflake": (_snowflake_iac, _snowflake_canonical),
     "databricks": (_databricks_iac, _databricks_canonical),
 }
 
