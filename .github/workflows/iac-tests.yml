@@ -75,10 +75,11 @@ on:
           - stage3-all
           - databricks-minilake
 
-permissions:
-  contents: read
-  # Required for OIDC keyless auth to AWS + GCP.
-  id-token: write
+# Nothing at the workflow level: each job grants what it uses (zizmor's
+# excessive-permissions audit). Only the two Stage 3 jobs request an OIDC token, for
+# keyless auth to AWS and GCP; the jobs that run a pull request's test code get
+# contents: read and nothing else. tests/test_ci_iac_workflow_permissions.py holds this.
+permissions: {}
 
 jobs:
   # -------------------------------------------------------------------
@@ -87,6 +88,8 @@ jobs:
   stage1-unit:
     name: "Stage 1 — unit + tofu validate (tofu ${{ matrix.tofu.version }})"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: github.event_name != 'schedule'
     # Stage 1 and Stage 2 run once per OpenTofu release line this repository
     # supports: 1.12, the engine floor, and the newest stable
@@ -152,6 +155,8 @@ jobs:
   stage1-lanes:
     name: "Stage 1 — ${{ matrix.lane.name }} (tofu ${{ matrix.tofu.version }})"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
@@ -324,6 +329,8 @@ jobs:
   stage2-emulator:
     name: "Stage 2 — docker emulators (tofu ${{ matrix.tofu.version }})"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: github.event_name != 'schedule'
     # The same versions and checksums as stage1-unit.
     strategy:
@@ -457,6 +464,8 @@ jobs:
   nightly-databricks-minilake:
     name: "Nightly — Databricks vs minilake (non-gating)"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: >-
       github.event_name == 'schedule'
       || (github.event_name == 'workflow_dispatch' && inputs.stage == 'databricks-minilake')
@@ -516,6 +525,10 @@ jobs:
   stage3-aws:
     name: "Stage 3 — real AWS"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # OIDC keyless auth to AWS (aws-actions/configure-aws-credentials).
+      id-token: write
     if: >
       vars.IAC_STAGE3_ARMED == 'true' && (
         github.event_name == 'schedule' ||
@@ -575,6 +588,10 @@ jobs:
   stage3-gcp:
     name: "Stage 3 — real GCP"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # OIDC keyless auth to GCP (google-github-actions/auth).
+      id-token: write
     if: >
       vars.IAC_STAGE3_ARMED == 'true' && (
         github.event_name == 'schedule' ||
