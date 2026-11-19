@@ -300,6 +300,11 @@ class _Cel:
                 f"it uses {n.DATE_DIFF_FUNCTIONS[node.unit]}, and a CEL rule has no exact date "
                 "arithmetic"
             )
+        if isinstance(node, n.DateAdd):
+            raise CelUntranslatable(
+                f"it uses {n.DATE_ADD_FUNCTIONS[node.unit]}, and a CEL rule has no exact date "
+                "arithmetic"
+            )
         if isinstance(node, n.Date):
             raise CelUntranslatable("it holds a DATE literal, which a CEL rule cannot compare")
         raise TypeError(f"not a FLUID SQL/1 node: {node!r}")  # pragma: no cover
@@ -419,7 +424,7 @@ class _Cel:
             return self.case(node, want)
         if isinstance(node, n.Coalesce):
             return self.coalesce(node, want)
-        self.cls(node)  # Round, DateDiff, Date: refused with the reason
+        self.cls(node)  # Round, DateDiff, DateAdd, Date: refused with the reason
         raise TypeError(f"not a FLUID SQL/1 node: {node!r}")  # pragma: no cover
 
     def branch_class(self, nodes: List[n.Node], outer: Optional[str]) -> str:

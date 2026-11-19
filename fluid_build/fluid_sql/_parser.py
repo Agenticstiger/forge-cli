@@ -75,6 +75,9 @@ _HINTS = {
     "DATE_DIFF": "write DAYS_BETWEEN, MONTHS_BETWEEN or YEARS_BETWEEN (whole units)",
     "DATE_SUB": "write DAYS_BETWEEN, MONTHS_BETWEEN or YEARS_BETWEEN (whole units)",
     "TIMESTAMPDIFF": "write DAYS_BETWEEN, MONTHS_BETWEEN or YEARS_BETWEEN (whole units)",
+    "DATEADD": "write ADD_DAYS(d, n), ADD_MONTHS(d, n) or ADD_YEARS(d, n)",
+    "DATE_ADD": "write ADD_DAYS(d, n), ADD_MONTHS(d, n) or ADD_YEARS(d, n)",
+    "TIMESTAMPADD": "write ADD_DAYS(d, n), ADD_MONTHS(d, n) or ADD_YEARS(d, n)",
     "CURRENT_DATE": "FLUID SQL/1 never reads the clock: use a column or a DATE literal",
     "CURRENT_TIMESTAMP": "FLUID SQL/1 never reads the clock: use a column or a DATE literal",
     "NOW": "FLUID SQL/1 never reads the clock: use a column or a DATE literal",
@@ -84,7 +87,8 @@ _HINTS = {
     "SELECT": "FLUID SQL/1 has no subqueries",
     "EXISTS": "FLUID SQL/1 has no subqueries",
     "TIMESTAMP": "FLUID SQL/1 has no timestamp literals",
-    "INTERVAL": "FLUID SQL/1 has no interval literals or date arithmetic",
+    "INTERVAL": "FLUID SQL/1 has no interval literals: write ADD_DAYS(d, n), ADD_MONTHS(d, n) "
+    "or ADD_YEARS(d, n)",
     "LIKE": "FLUID SQL/1 has no pattern matching",
     "ILIKE": "FLUID SQL/1 has no pattern matching",
     "RLIKE": "FLUID SQL/1 has no pattern matching",
@@ -461,6 +465,12 @@ class _Parser:
                 args.append(self.expr())
             self.expect_op(")", "',' or ')' in COALESCE")
             node = self.make(n.Coalesce(tuple(args), pos=token.pos))
+        elif name in _DATE_ADD_UNITS:
+            date = self.value()
+            self.expect_op(",", f"',' and the count of {name}: {name}(d, n)")
+            count = self.value()
+            self.expect_op(")", f"')': {name} takes a date and a count")
+            node = self.make(n.DateAdd(_DATE_ADD_UNITS[name], date, count, pos=token.pos))
         else:
             unit = {"DAYS_BETWEEN": "day", "MONTHS_BETWEEN": "month", "YEARS_BETWEEN": "year"}
             start = self.value()
@@ -546,6 +556,9 @@ def _check_date(text: str, pos: int) -> None:
             "9999-12-31",
             pos,
         )
+
+
+_DATE_ADD_UNITS = {"ADD_DAYS": "day", "ADD_MONTHS": "month", "ADD_YEARS": "year"}
 
 
 def _function_message(name: str) -> str:

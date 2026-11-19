@@ -30,7 +30,7 @@ REASONS: Dict[str, str] = {
     "type-mismatch": "operands or arguments of the wrong type, or a predicate position "
     "given something other than a bool",
     "null-literal": "the NULL literal where nothing gives it a type: an IN item, an operand "
-    "of a comparison or BETWEEN, or every operand of a construct",
+    "of a comparison or BETWEEN, an argument of a date move, or every operand of a construct",
     "enum-literal": "a string literal compared with a column whose enum does not list it",
     "derive-target": "a derive target with no FLUID SQL/1 type, a float, or a number "
     "without a declared scale",

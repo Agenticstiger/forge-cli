@@ -508,6 +508,104 @@ def test_month_and_year_difference_spelling_per_dialect() -> None:
         assert months.count("CASE WHEN") >= 3
 
 
+def _guard(unit: str, d: str, k: str, dialect: str) -> str:
+    """The count made NULL when the result would leave 0001-01-01..9999-12-31."""
+    year = f"EXTRACT(YEAR FROM {d})"
+    if unit == "day":
+        days = {
+            "duckdb": lambda a, b: f"date_sub('day', {a}, {b})",
+            "snowflake": lambda a, b: f"DATEDIFF(day, {a}, {b})",
+            "bigquery": lambda a, b: f"DATE_DIFF({b}, {a}, DAY)",
+            "databricks": lambda a, b: f"datediff({b}, {a})",
+            "postgres": lambda a, b: f"({b} - {a})",
+            "athena": lambda a, b: f"date_diff('day', {a}, {b})",
+        }[dialect]
+        low, high = days(d, "DATE '0001-01-01'"), days(d, "DATE '9999-12-31'")
+    elif unit == "month":
+        index = f"({year} * 12 + EXTRACT(MONTH FROM {d}) - 1)"
+        low, high = f"(12 - {index})", f"(119999 - {index})"
+    else:
+        low, high = f"(1 - {year})", f"(9999 - {year})"
+    return f"(CASE WHEN {k} BETWEEN {low} AND {high} THEN {k} END)"
+
+
+def test_date_addition_spelling_per_dialect() -> None:
+    cols = {"a": "date", "k": "int"}
+    for dialect in fs.DIALECTS:
+        q = fs.column_reader(dialect, "t")
+        d, k = q(None, "a"), q(None, "k")
+        for unit, name in n.DATE_ADD_FUNCTIONS.items():
+            guard = _guard(unit, d, k, dialect)
+            whole = {
+                "bigquery": f"CAST({guard} AS INT64)",
+                "databricks": f"CAST({guard} AS INT)",
+                "athena": f"CAST({guard} AS BIGINT)",
+            }
+            whole_sql = whole.get(dialect, f"CAST({guard} AS INTEGER)")
+            upper = unit.upper()
+            want = {
+                "duckdb": {
+                    "day": f"({d} + {whole_sql})",
+                    "month": f"CAST({d} + to_months({whole_sql}) AS DATE)",
+                    "year": f"CAST({d} + to_years({whole_sql}) AS DATE)",
+                },
+                "postgres": {
+                    "day": f"({d} + {whole_sql})",
+                    "month": f"CAST({d} + {whole_sql} * INTERVAL '1 month' AS DATE)",
+                    "year": f"CAST({d} + {whole_sql} * INTERVAL '1 year' AS DATE)",
+                },
+                "snowflake": {u: f"DATEADD({u}, {guard}, {d})" for u in n.DATE_ADD_FUNCTIONS},
+                "bigquery": {
+                    u: f"DATE_ADD({d}, INTERVAL {whole_sql} {u.upper()})"
+                    for u in n.DATE_ADD_FUNCTIONS
+                },
+                "databricks": {
+                    "day": f"date_add({d}, {whole_sql})",
+                    "month": f"add_months({d}, {whole_sql})",
+                    "year": f"add_months({d}, {whole_sql} * 12)",
+                },
+                "athena": {
+                    "day": f"date_add('day', {whole_sql}, {d})",
+                    "month": f"({d} + {whole_sql} * INTERVAL '1' MONTH)",
+                    "year": f"({d} + {whole_sql} * INTERVAL '1' YEAR)",
+                },
+            }[dialect][unit]
+            sql = render(f"{name}(a, k)", cols, dialect)
+            assert sql == want, (dialect, name, upper)
+            parses(sql, dialect)
+    # Snowflake's own ADD_MONTHS keeps month ends, which FLUID SQL/1 does not.
+    assert "ADD_MONTHS" not in render("ADD_MONTHS(a, k)", cols, "snowflake")
+
+
+def test_a_deeply_nested_date_addition_hits_the_cap_not_a_hang() -> None:
+    text = "a"
+    for _ in range(30):
+        text = f"ADD_DAYS({text}, 1)"  # every level prints the one below it three times
+    assert len(text) <= fs.MAX_CODE_POINTS
+    start = time.perf_counter()
+    with pytest.raises(fs.RenderTooLarge):
+        render(text, {"a": "date"}, "postgres")
+    assert time.perf_counter() - start < 5.0  # linear work; slack for a loaded runner
+
+
+@pytest.mark.parametrize("unit", ["DAYS", "MONTHS", "YEARS"])
+@pytest.mark.parametrize("sign", ["", "-"])
+def test_duckdb_gives_null_for_a_count_far_beyond_its_integer_type(unit: str, sign: str) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    cols = {"a": "date", "k": "decimal(38,0)"}
+    sql = render(f"ADD_{unit}(a, k)", cols, "duckdb")
+    con = duckdb.connect()
+    try:
+        for day in ("2026-11-16", "0001-01-01", "9999-12-31"):
+            query = (
+                f"SELECT {sql} FROM (SELECT CAST('{day}' AS DATE) AS a, "
+                f"CAST('{sign}1' || repeat('0', 30) AS DECIMAL(38,0)) AS k) AS t"
+            )
+            assert con.execute(query.replace('"t".', "")).fetchone()[0] is None
+    finally:
+        con.close()
+
+
 def test_an_unknown_dialect_is_refused() -> None:
     tree, checked = compile_text("1 + 1", {})
     with pytest.raises(ValueError):

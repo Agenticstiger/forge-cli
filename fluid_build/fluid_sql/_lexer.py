@@ -63,7 +63,16 @@ KEYWORDS = frozenset(
 )
 
 #: The functions of FLUID SQL/1. Not keywords: a column may be called ``round``.
-FUNCTIONS = ("ROUND", "COALESCE", "DAYS_BETWEEN", "MONTHS_BETWEEN", "YEARS_BETWEEN")
+FUNCTIONS = (
+    "ROUND",
+    "COALESCE",
+    "DAYS_BETWEEN",
+    "MONTHS_BETWEEN",
+    "YEARS_BETWEEN",
+    "ADD_DAYS",
+    "ADD_MONTHS",
+    "ADD_YEARS",
+)
 
 _WHITESPACE = frozenset(" \t\n")
 _WORD_START = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_")

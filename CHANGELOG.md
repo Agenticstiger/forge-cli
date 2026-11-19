@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **FLUID SQL/1 moves a date by whole days, months and years.** `ADD_DAYS(d, n)`,
+  `ADD_MONTHS(d, n)` and `ADD_YEARS(d, n)` take a date and a count of scale 0 and give a date,
+  with flux-expr/3's meaning (`RFC-data-rules.md` §2.6, amended): a month or year move keeps the
+  day of the month or clamps it to the last day of a shorter month (31 January plus one month is
+  28 or 29 February, and 28 February plus one month is 28 March), a NULL argument gives NULL,
+  and a result outside 0001-01-01 to 9999-12-31 is NULL, never an error, however large the
+  count. Every dialect renders them with a guarded count, so no engine adds an out-of-range
+  count (§2.8), and Snowflake gets `DATEADD`, never its own `ADD_MONTHS`, which keeps month
+  ends. The conformance vectors are version 1.1.0, with 51 new vectors at the month ends, at
+  the edges of the range and for each refusal.
+
 ### Fixed
 
 - **`fluid profile` refuses a repeated `--expose`.** argparse kept the last of two `--expose`

@@ -123,4 +123,7 @@ def _bare(node: n.Node) -> str:
     if isinstance(node, n.DateDiff):
         name = n.DATE_DIFF_FUNCTIONS[node.unit]
         return f"{name}({_text(node.from_, _ADD)}, {_text(node.to, _ADD)})"
+    if isinstance(node, n.DateAdd):
+        name = n.DATE_ADD_FUNCTIONS[node.unit]
+        return f"{name}({_text(node.date, _ADD)}, {_text(node.count, _ADD)})"
     raise TypeError(f"not a FLUID SQL/1 node: {node!r}")
