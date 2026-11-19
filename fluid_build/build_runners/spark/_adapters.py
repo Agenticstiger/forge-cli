@@ -55,6 +55,10 @@ CALLER_ACTIONS: Dict[str, tuple] = {
         "elasticmapreduce:ListSteps",
         "elasticmapreduce:DescribeStep",
         "elasticmapreduce:CancelSteps",
+        # The cluster's Spot posture, warned at plan and apply (_posture.py).
+        "elasticmapreduce:DescribeCluster",
+        "elasticmapreduce:ListInstanceFleets",
+        "elasticmapreduce:ListInstanceGroups",
     ),
     "emr-eks": (
         "emr-containers:StartJobRun",
@@ -101,15 +105,16 @@ class RunInfo:
         }
 
 
-def default_clients(service: str, region: str) -> Any:
-    """A boto3 client, from the default credential chain (``AWS_ENDPOINT_URL`` included)."""
+def default_clients(service: str, region: str, *, config: Any = None) -> Any:
+    """A boto3 client, from the default credential chain (``AWS_ENDPOINT_URL`` included);
+    ``config``, a ``botocore.config.Config``, bounds its calls (the posture check's)."""
     try:
         import boto3
     except ImportError as exc:  # pragma: no cover - the [aws] extra is missing
         raise SparkRunError(
             "Spark job runs need boto3: pip install 'data-product-forge[aws]'"
         ) from exc
-    return boto3.client(service, region_name=region)
+    return boto3.client(service, region_name=region, config=config)
 
 
 def _ts(value: Any) -> float:
