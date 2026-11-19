@@ -403,6 +403,7 @@ def _add_invariant(
     taken: set,
 ) -> None:
     """The singular test file for one declared rule, or its refusal."""
+    from ...data_rules._compile import _Refused
     from ...data_rules._dbt import _rendered, test_name
 
     model = models.get(rule.expose)
@@ -411,7 +412,7 @@ def _add_invariant(
     name = test_name(rule.id, taken).lower()
     try:
         counts, holds = _rendered(rule, "databricks", lambda e: str(models.get(e) or "") or None)
-    except ValueError as why:
+    except (_Refused, ValueError) as why:
         out.refusals.append(
             _refusal(
                 "rule",

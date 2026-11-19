@@ -88,13 +88,18 @@ def as_json(rows: Sequence[RuleCoverage]) -> Dict[str, Any]:
 _MARKS = {EXECUTABLE_STATUS: "yes", UNSUPPORTED_STATUS: "no", SKIPPED_STATUS: "-"}
 
 
+def _verdict(row: RuleCoverage, dialect: str) -> Verdict:
+    return row.engines.get(dialect) or Verdict(UNSUPPORTED_STATUS, "not compiled for it")
+
+
 def render_table(rows: Sequence[RuleCoverage]) -> str:
     """A plain-text table: one row per rule, one column per engine, then each reason once."""
     if not rows:
         return "No declared rules about valid data (exposes[].contract.invariants[] and friends)."
     header = ["rule", "expose", *fs.DIALECTS]
     body = [
-        [row.id, row.expose, *(_MARKS[row.engines[d].status] for d in fs.DIALECTS)] for row in rows
+        [row.id, row.expose, *(_MARKS[_verdict(row, d).status] for d in fs.DIALECTS)]
+        for row in rows
     ]
     widths = [max(len(str(line[i])) for line in [header, *body]) for i in range(len(header))]
     lines = [
@@ -106,7 +111,7 @@ def render_table(rows: Sequence[RuleCoverage]) -> str:
     for row in rows:
         reasons: Dict[str, List[str]] = {}
         for dialect in fs.DIALECTS:
-            verdict = row.engines[dialect]
+            verdict = _verdict(row, dialect)
             if verdict.status != EXECUTABLE_STATUS:
                 reasons.setdefault(verdict.reason, []).append(dialect)
         for reason, dialects in reasons.items():
