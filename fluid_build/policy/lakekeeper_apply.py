@@ -76,7 +76,6 @@ manage: give stage 8 an identity that manages only the product's own namespaces.
 
 from __future__ import annotations
 
-import logging
 import re
 import uuid
 from collections import OrderedDict
@@ -85,8 +84,6 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, 
 from urllib.parse import SplitResult, quote, urlsplit, urlunsplit
 
 from .lakekeeper import MANAGED_RELATIONS, PROVIDER, Assignment, plan_changes
-
-LOG = logging.getLogger("fluid.policy.lakekeeper")
 
 CREDENTIAL_REF_ENV = "FLUID_LAKEKEEPER_CREDENTIAL_REF"
 TOKEN_URI_ENV = "FLUID_LAKEKEEPER_OAUTH2_SERVER_URI"
