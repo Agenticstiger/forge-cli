@@ -332,7 +332,7 @@ class JenkinsTemplate(BasePipelineTemplate):
                 3,
                 "Stage 3: ODCS + ODPS-Bitol + schedule + policy + Spark job config fanout "
                 "from the bundle. "
-                "Off by default under fluid generate ci --no-generate-artifacts.",
+                "Off by default when the file was generated with --no-generate-artifacts.",
             ),
             _Param(
                 "GENERATE_EMIT",
@@ -983,7 +983,7 @@ pipeline {{
         // ═════════════════════════════════════════════════════════════
         // Stage 3 — generate artifacts (structural)
         // ODCS + ODPS-Bitol + schedule + policy + Spark job config fanout. dbt excluded.
-        // Off by default under fluid generate ci --no-generate-artifacts.
+        // Off by default when the file was generated with --no-generate-artifacts.
         // ═════════════════════════════════════════════════════════════
         stage('3 - generate artifacts') {{
 {stage3_when}
