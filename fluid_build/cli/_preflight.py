@@ -424,8 +424,14 @@ def _path_roots(contract_path: Optional[str]) -> List[Tuple[str, str]]:
 
 
 def _unrooted(text: str, roots: Sequence[Tuple[str, str]]) -> str:
+    """``text`` with each root that starts a path replaced: the root must begin the
+    path (not follow a word, ``/`` or ``.``) and end at a separator or the end of
+    the path, so ``gs://b/opt/x`` and ``/optional`` keep their ``/opt``."""
+    import re
+
     for root, placeholder in roots:
-        text = text.replace(root, placeholder)
+        pattern = r"(?<![\w/.])" + re.escape(root) + r"(?=[/\\]|$|[\s'\"(),;])"
+        text = re.sub(pattern, lambda _m, p=placeholder: p, text)
     return text
 
 
@@ -440,7 +446,7 @@ def _absolute_paths() -> Any:
         tops = []
     alternatives = [rf"/{re.escape(t)}(?:/[^\s'\"(),;]*|(?![\w.-]))" for t in tops]
     alternatives.append(r"\b[A-Za-z]:\\[^\s'\"(),;]*")
-    return re.compile(r"(?<![\w:/.])(?:" + "|".join(alternatives) + r")")
+    return re.compile(r"(?<![\w/.])(?:" + "|".join(alternatives) + r")")
 
 
 def _path_scrubber(contract_path: Optional[str]) -> Any:

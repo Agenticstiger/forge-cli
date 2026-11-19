@@ -1002,3 +1002,25 @@ def test_a_bundle_is_preflighted_like_its_contract(tmp_path, capsys):
     bundled = json.loads(text)
     _rc, text = _run_cli(["--contract", str(AWS), "--operation", "validate", "--json"], capsys)
     assert bundled["capabilities"] == json.loads(text)["capabilities"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["gs://bkt/opt/x", "s3://b/optimized/k", "/optional", "/optx/y", "word/opt/z", "a.opt"],
+)
+def test_a_root_is_replaced_only_where_it_starts_a_path(text):
+    assert pf._unrooted(text, [("/opt", "<cwd>")]) == text
+
+
+def test_a_root_that_starts_a_path_is_replaced():
+    roots = [("/opt", "<cwd>")]
+    assert pf._unrooted("/opt", roots) == "<cwd>"
+    assert pf._unrooted("see /opt/x and (/opt)", roots) == "see <cwd>/x and (<cwd>)"
+
+
+def test_a_path_after_a_colon_or_equals_is_still_scrubbed():
+    scrub = pf._path_scrubber("/nowhere/contract.fluid.yaml")
+    home = os.path.expanduser("~")
+    cap = pf.Capability(pf.LOSSY, "x", "t", "/", f"dir:{home}/p path={home}/q", "")
+    detail = scrub(cap).detail
+    assert home not in detail and detail == "dir:~/p path=~/q"
