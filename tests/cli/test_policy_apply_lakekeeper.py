@@ -84,7 +84,7 @@ def server(monkeypatch) -> fake.FakeLakekeeper:
         "FLUID_LAKEKEEPER_CREDENTIAL_REF": "env://LK_CRED",
         "FLUID_LAKEKEEPER_OAUTH2_SERVER_URI": fake.TOKEN_URL,
         "FLUID_LAKEKEEPER_SCOPE": "lakekeeper",
-        "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST": "LK_CRED@lakekeeper.test",
+        "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST": "LK_CRED@lakekeeper.test",  # pragma: allowlist secret
     }.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("FLUID_LAKEKEEPER_TOKEN_REF", raising=False)

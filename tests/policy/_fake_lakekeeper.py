@@ -123,7 +123,7 @@ class FakeLakekeeper:
         if path == "/catalog/v1/config":
             if query.get("warehouse") != WAREHOUSE:
                 return _error(404, "WarehouseNotFound", "no warehouse")
-            # v0.14.0 sends the prefix in ``defaults`` (seen live on the lab, 2026-11-18).
+            # v0.14.0 sends the prefix in ``defaults`` (seen live on v0.14.0).
             return httpx.Response(
                 200,
                 json={
@@ -140,7 +140,7 @@ class FakeLakekeeper:
             table_id = path.split("/table/", 1)[1].rsplit("/assignments", 1)[0]
             return self._assignments(request.method, table_id, body)
         if path == "/management/v1/search/user":
-            # Fuzzy: on the lab, searching "service-account-trino" returned every
+            # Fuzzy: on a live v0.14.0, searching "service-account-trino" returned every
             # service account and no trino at all. Every user is the worst case.
             return httpx.Response(200, json={"users": list(self.users)})
         if path.startswith("/management/v1/user/"):

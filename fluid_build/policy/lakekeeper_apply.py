@@ -25,14 +25,14 @@ rest-catalog-open-api.yaml at that tag):
   ``/role/{id}`` -- a principal's id from its name, or that its id exists:
   Lakekeeper does not check a user id it is given a grant for, so a mistyped id
   would be granted silently and help no one. The search is fuzzy (it answered
-  every service account for ``service-account-trino`` on the lab), so only an
+  every service account for ``service-account-trino`` on a live v0.14.0), so only an
   exact name or e-mail is taken;
 * ``GET  /management/v1/whoami`` -- who forge signed in as, for the report.
 
 The OpenFGA assignments API (tag ``permissions-openfga``) is the one used: v0.14.0
 marks the authorizer-independent ``/grants`` API Preview ("may change in a
-backward-incompatible way"), and the fluid-fabric-lab bootstrap proved these
-assignment calls live on v0.14.0. OpenFGA tuples are never written directly;
+backward-incompatible way"), while these assignment calls were proven live on
+v0.14.0. OpenFGA tuples are never written directly;
 Lakekeeper writes them, with the structural edges it keeps beside them. The
 diff-then-one-request shape is the one Lakekeeper's own Terraform provider
 documents for its assignment resources (lakekeeper/terraform-provider-lakekeeper,
@@ -59,7 +59,7 @@ exact-value redactor.
 
 The identity needs ``manage_grants`` on the tables. On OpenFGA the identity that
 creates a namespace owns it and so has ``manage_grants`` there (unless managed
-access is on), which is enough: on the lab, a client allowed only to create
+access is on), which is enough: on a live v0.14.0, a client allowed only to create
 namespaces granted on the tables of the namespace it had created, and could
 list warehouses and search and read users. Grants are table by table, and the
 contract names the tables, so a contract can claim any table its identity may

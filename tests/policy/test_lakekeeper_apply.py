@@ -25,6 +25,8 @@ pytestmark = pytest.mark.unit
 
 TABLE_ID = "0190c5b4-0000-7000-8000-0000000000b1"
 ROLE_ID = "0190c5b4-0000-7000-8000-0000000000c1"
+#: A catalog uri with a user:password part, which stage 8 refuses.
+_USERINFO_URI = "https://user:pw@lakekeeper.test/catalog"  # pragma: allowlist secret
 
 
 @pytest.fixture
@@ -46,7 +48,7 @@ def operator_env(monkeypatch) -> Dict[str, str]:
         "FLUID_LAKEKEEPER_CREDENTIAL_REF": "env://LK_CRED",
         "FLUID_LAKEKEEPER_OAUTH2_SERVER_URI": fake.TOKEN_URL,
         "FLUID_LAKEKEEPER_SCOPE": "lakekeeper",
-        "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST": "LK_CRED@lakekeeper.test",
+        "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST": "LK_CRED@lakekeeper.test",  # pragma: allowlist secret
     }
     for name in ("FLUID_LAKEKEEPER_TOKEN_REF", "FLUID_SECRETS_FILE", "FLUID_SECRET_SCHEMES"):
         monkeypatch.delenv(name, raising=False)
@@ -281,9 +283,7 @@ class TestFailures:
     def test_a_refused_client_is_named_and_its_secret_is_not(
         self, server, operator_env, monkeypatch
     ):
-        monkeypatch.setenv(
-            "LK_CRED", f"{fake.CLIENT_ID}:wrong-fake-value"
-        )  # pragma: allowlist secret
+        monkeypatch.setenv("LK_CRED", f"{fake.CLIENT_ID}:wrong-fake-value")
         result = _run(server, [_binding("role:analysts", "select")])
         (error,) = result["errors"]
         assert "refused client 'fluid-apply-sales'" in error
@@ -352,7 +352,7 @@ class TestCredentialRules:
         "uri, message",
         [
             ("http://lakekeeper.test/catalog", "must be an https:// URL"),
-            ("https://user:pw@lakekeeper.test/catalog", "user:password@"),
+            (_USERINFO_URI, "user:password@"),
             ("https://{{ env.LK }}/catalog", "unrendered template"),
         ],
     )
