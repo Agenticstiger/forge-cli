@@ -365,10 +365,18 @@ def test_the_dev_source_install_mounts_the_checkout(provider):
         if not line.strip().startswith("#")  # a comment may explain what is not done
     )
     assert "/forge-cli-src" in text
-    assert "PYTHONPATH" in text or "PYTHONPATH" in files.get("Jenkinsfile", "")
     assert "fluid --version" in text
-    # No pip install of the package (an engine's own extras may still be installed),
-    # and never an uninstall: that deletes the `fluid` command itself.
+    if provider is P.JENKINS:
+        # The Jenkins agent image already has the console script; PYTHONPATH,
+        # set for the whole pipeline, points its imports at the checkout.
+        assert "PYTHONPATH = '/forge-cli-src'" in files["Jenkinsfile"]
+    else:
+        # Everywhere else nothing is installed: the editable install puts
+        # `fluid` on PATH. A PYTHONPATH export dies with its step or subshell.
+        assert "python -m pip install --quiet -e /forge-cli-src" in text
+        assert "PYTHONPATH" not in text
+    # Never the published package, and never an uninstall: that deletes the
+    # `fluid` command itself.
     assert "data-product-forge" not in text
     assert "pip uninstall" not in text
 

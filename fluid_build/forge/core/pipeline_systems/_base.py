@@ -559,9 +559,9 @@ class BasePipelineTemplate:
           semantics so operators can pilot TestPyPI releases without
           editing Groovy or YAML).
         - ``dev-source`` mode: expects ``/forge-cli-src`` bind mount
-          with the forge-cli checkout; exports ``PYTHONPATH=/forge-cli-src``.
-          Fails loud with an actionable message if the mount is
-          missing. Only supported on systems that run self-hosted
+          with the forge-cli checkout and installs it editable
+          (``pip install -e``), which puts ``fluid`` on PATH. Fails loud
+          with an actionable message if the mount is missing. Only supported on systems that run self-hosted
           runners (GitHub Actions, GitLab, Azure DevOps, Tekton).
           Bitbucket / CircleCI pass this check with a warning because
           they're hosted-only; operators who need dev-source there
@@ -577,16 +577,21 @@ class BasePipelineTemplate:
         engine_pip = self._engine_pip_install_command(config)
         engine_install = f"\n{engine_pip}" if engine_pip else ""
         if mode == "dev-source":
+            # An editable install: it puts the ``fluid`` command on PATH and the
+            # checkout's dependencies in the interpreter, and imports resolve
+            # from the mount, so nothing has to outlive this script. A
+            # PYTHONPATH export did not: it died with the step (GitHub) or the
+            # ( ... ) subshell (Tekton, GitLab, Azure, Bitbucket, CircleCI), and
+            # it never provided the command.
             return (
                 "set -eu\n"
-                'if [ ! -d "/forge-cli-src" ]; then\n'
-                "  echo 'FATAL: dev-source install mode requires "
-                "/forge-cli-src bind mount' >&2\n"
+                "if [ ! -f /forge-cli-src/pyproject.toml ]; then\n"
+                "  echo 'FATAL: dev-source install mode requires the forge-cli "
+                "checkout mounted at /forge-cli-src' >&2\n"
                 "  exit 2\n"
                 "fi\n"
-                'export PYTHONPATH="/forge-cli-src:${PYTHONPATH:-}"\n'
-                'python -c "import fluid_build" || (echo \'FATAL: '
-                "fluid_build import failed; check /forge-cli-src' >&2 && exit 3)\n"
+                "python -m pip install --quiet -e /forge-cli-src || "
+                "{ echo 'FATAL: pip install -e /forge-cli-src failed' >&2; exit 3; }\n"
                 "fluid --version" + engine_install
             )
         # pypi mode — TestPyPI overrides + optional --pre. Each value is ONE
