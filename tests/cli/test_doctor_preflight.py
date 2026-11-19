@@ -665,9 +665,27 @@ def _fake_boto3(monkeypatch, fail=False):
         def __getattr__(self, name):
             raise AssertionError(f"--live called {self.service}.{name}")
 
+    def _client(service, config=None, **kw):
+        # Every live client answers fast or fails: no SDK retry storm on a cut-off runner.
+        assert config is not None and config.kwargs["retries"] == {"max_attempts": 1}
+        assert config.kwargs["connect_timeout"] == config.kwargs["read_timeout"] == 10
+        return _Client(service)
+
+    class _Config:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    # The whole SDK the live checks import, so the test runs where boto3 and
+    # botocore are not installed (a CI job without the aws extra).
     module = types.ModuleType("boto3")
-    module.client = lambda service, **kw: _Client(service)
+    module.client = _client
+    botocore = types.ModuleType("botocore")
+    config = types.ModuleType("botocore.config")
+    config.Config = _Config
+    botocore.config = config
     monkeypatch.setitem(sys.modules, "boto3", module)
+    monkeypatch.setitem(sys.modules, "botocore", botocore)
+    monkeypatch.setitem(sys.modules, "botocore.config", config)
     return calls
 
 
