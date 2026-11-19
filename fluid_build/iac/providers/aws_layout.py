@@ -59,10 +59,10 @@ PARTITION_KEY_TYPES = frozenset(
 _INTEGER_TYPES = frozenset({"tinyint", "smallint", "int", "bigint"})
 
 #: Hive keeps partition column names in lower case; Athena looks for ``<name>=<value>/``.
-_KEY_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$", re.ASCII)
+_KEY_NAME_RE = re.compile(r"[a-z_][a-z0-9_]*", re.ASCII)
 #: A projected value is a path segment: Hive escapes ``/``, ``=``, ``%``, spaces and
 #: more, so a value outside this set may sit under another path than Athena projects.
-_PATH_SAFE_RE = re.compile(r"^[A-Za-z0-9_.-]+$", re.ASCII)
+_PATH_SAFE_RE = re.compile(r"[A-Za-z0-9_.-]+", re.ASCII)
 
 #: The first day a ``date`` key is projected from. The contract declares no earlier
 #: bound, and Athena reads no partition outside the range.
@@ -235,7 +235,7 @@ def _partition_key(name: str, columns: Mapping[str, Mapping[str, Any]], where: s
             f"schema{hint}.",
             ("Name a declared top-level column.",),
         )
-    if not _KEY_NAME_RE.match(name):
+    if not _KEY_NAME_RE.fullmatch(name):
         raise UnsupportedBindingError(
             "partition-by",
             f"{field_path} names {name!r}. Hive keeps a partition column's name in lower case "
@@ -323,7 +323,7 @@ def _key_projection(key: PartitionKey, column: Mapping[str, Any]) -> Any:
             "[{type: enum, constraint: 'a | b'}])"
         )
     values = list(dict.fromkeys(values))  # a level named twice is projected once
-    unsafe = [value for value in values if not _PATH_SAFE_RE.match(value)]
+    unsafe = [value for value in values if not _PATH_SAFE_RE.fullmatch(value)]
     if unsafe:
         return (
             f"{key.name} has values a writer escapes in a path ({unsafe[0]!r}); only letters, "

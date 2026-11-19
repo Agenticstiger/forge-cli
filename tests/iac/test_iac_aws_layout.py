@@ -327,6 +327,30 @@ def test_a_key_named_in_upper_case_is_refused():
     assert "Hive keeps a partition column's name in lower case" in str(refused)
 
 
+def test_a_key_name_ending_in_a_newline_is_refused():
+    """``$`` matches before a final newline, so the name check must take the whole name."""
+    schema = [
+        {"name": "id", "type": "string"},
+        {"name": "region\n", "type": "string", "required": True},
+    ]
+    refused = _refusal(_contract(partition_by=["region\n"], schema=schema))
+    assert "Hive keeps a partition column's name in lower case" in str(refused)
+
+
+def test_an_enum_value_ending_in_a_newline_is_not_projected(monkeypatch):
+    """A value with a final newline is not one path segment Athena can project."""
+    monkeypatch.setattr(aws_layout, "_enum_values", lambda column: ["eu", "us\n"])
+    schema = [
+        {"name": "id", "type": "string"},
+        {"name": "region", "type": "string", "required": True},
+    ]
+    contract = _contract(partition_by=["region"], schema=schema)
+    assert not _projection(_table(contract))
+    assert "region has values a writer escapes in a path ('us\\n')" in (
+        partition_registration_notes(contract)[0]
+    )
+
+
 def test_a_key_named_twice_is_refused():
     assert "names 'region' twice" in str(_refusal(_contract(partition_by=["region", "region"])))
 
