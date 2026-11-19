@@ -30,6 +30,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   goes through both redaction layers. `--strict` also fails on `lossy`. `fluid doctor --env`
   alone still lists the kill switches.
 
+- **`fluid plan` and `fluid apply` warn when an EMR on EC2 cluster can lose a Spark build to
+  Spot.** For each `runtime: emr-ec2` build, forge reads its `clusterId` once
+  (`DescribeCluster`, then `ListInstanceGroups` or `ListInstanceFleets`) and warns, never
+  refuses, in three cases, each with its fix: the primary node runs on Spot (the build's driver
+  runs there, in client mode); core nodes run on Spot; or core or task nodes run on Spot and the
+  cluster's yarn-site does not keep YARN application masters on On-Demand nodes
+  (`yarn.node-labels.enabled=true` with `yarn.node-labels.am.default-node-label-expression`
+  `ON_DEMAND` on EMR 7.x, or `CORE` while the core nodes are all On-Demand; EMR 5.19 to 5.x
+  keep masters on `CORE` by default). The fix names `ON_DEMAND` from EMR 7.2, where managed
+  scaling places masters by it, and `CORE` before. The yarn-site read is the cluster's,
+  overridden by the primary instance group's applied configurations or the primary fleet's
+  instance types. A cluster that cannot be read (no
+  permission, no credentials, unreachable, ended) and `fluid apply --dry-run` print nothing;
+  each read waits at most 3 s to connect and 10 s to answer, twice. The warnings are not in
+  `plan.json`. The caller policy forge emits for scheduled emr-ec2 builds now also grants
+  `elasticmapreduce:DescribeCluster`, `ListInstanceFleets` and `ListInstanceGroups` on the
+  cluster.
+
 - **A BigQuery table is partitioned and clustered as its binding declares.**
   `binding.location.partitionBy` was read only with `lifecycle.expire`, and
   `binding.properties.cluster_by` (honoured on Snowflake) was read by nobody on BigQuery. Both
@@ -407,7 +425,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subtract one histogram's published counts from another's, or from a level histogram's group
   size, and rebuild a withheld cell, a zero included. FLUX's `check_edge_counts` closes that, and
   forge-cli calls it once a flux-stats release carries it. That change completes the rule and
-  lands before the next forge-cli release.
+  lands in a later forge-cli release.
 
 ## [0.32.0] — 2026-11-18
 
