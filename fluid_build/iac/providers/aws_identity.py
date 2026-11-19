@@ -69,10 +69,13 @@ EXECUTION_ROLE_ALLOWLIST_ENV = "FLUID_SPARK_EXECUTION_ROLE_ALLOWLIST"
 #: or a prefix that ends in ``*``. It never admits a key in :data:`DENIED_SPARK_CONF`.
 SPARK_CONF_ALLOWLIST_ENV = "FLUID_SPARK_CONF_ALLOWLIST"
 #: Operator-only: the existing runtimes a contract may name, as ``<runtime>:<id>``
-#: (``emr-serverless:00f...``, ``emr-ec2:j-...``, ``emr-eks:<virtual cluster id>``), and
-#: the MSK clusters it may read, as ``msk:<cluster ARN>``. The build's role trusts the
-#: runtime and reads the cluster, and the scheduler's policy may start, cancel and add
-#: steps there, so a contract naming another team's would reach it. Unset allows none; a
+#: (``emr-serverless:00f...``, ``emr-ec2:j-...``, ``emr-eks:<virtual cluster id>``), the
+#: MSK clusters it may read, as ``msk:<cluster ARN>``, and the topic a stream's dead
+#: letters may be written to, as ``msk-write:<cluster ARN>/<topic>`` (or
+#: ``kafka-write:<host:port>/<topic>`` per broker of a ``bootstrapServers`` cluster). The build's role
+#: trusts the runtime, reads the cluster and writes that topic, and the scheduler's policy
+#: may start, cancel and add steps there, so a contract naming another team's would reach
+#: it. Unset allows none; a
 #: product's own isolated EMR Serverless application needs no entry. One list with the
 #: Spark compiler, which applies the MSK entries too.
 TARGET_ALLOWLIST_ENV = _TARGET_ALLOWLIST_ENV
@@ -278,8 +281,10 @@ def identity_findings(
                 f"Spark build {bid}: parameters.spark.source.mskClusterArn {cluster} is not "
                 f"in {TARGET_ALLOWLIST_ENV} (as msk:{cluster})"
             )
+    missing += _unlisted_dead_letter_topic(build, cfg, environ)
     arn = cfg.get("executionRoleArn")
-    if arn is not None:
+    # A local run (runtime local) ignores the AWS role: it runs as its machine's user.
+    if arn is not None and cfg.get("runtime") != "local":
         if not (isinstance(arn, str) and _ROLE_ARN.fullmatch(arn)):
             errors.append(f"Spark build {bid}: parameters.spark.executionRoleArn: a role ARN")
         elif not role_listed(arn, environ):
@@ -303,6 +308,39 @@ MSK_ARN = re.compile(
     r"arn:aws[a-z-]*:kafka:(?P<region>[a-z0-9-]+):(?P<account>[0-9]{12}):cluster/"
     r"(?P<name>[A-Za-z0-9_.-]{1,64})/(?P<uuid>[A-Za-z0-9-]{1,128})"
 )
+
+
+def _unlisted_dead_letter_topic(
+    build: Mapping[str, Any],
+    cfg: Mapping[str, Any],
+    environ: Optional[Mapping[str, str]],
+) -> List[str]:
+    """The dead letters' topic, when the operator has not listed writing it: on every
+    runtime, whatever role or auth the job runs with (``spark/compiler.py``'s rule:
+    ``msk-write:<ARN>/<topic>``, or ``kafka-write:<host:port>/<topic>`` per broker)."""
+    from fluid_build.spark.compiler import unlisted_dead_letter_writes
+
+    topic = _dead_letter_topic(build)
+    source = cfg.get("source")
+    if not topic or not isinstance(source, Mapping):
+        return []
+    missing = unlisted_dead_letter_writes(source, topic, environ)
+    if not missing:
+        return []
+    return [
+        f"Spark build {build.get('id')}: properties.stream.deadLetter.topic {topic} is not in "
+        f"{TARGET_ALLOWLIST_ENV} (as {', '.join(missing)}); the job would write it"
+    ]
+
+
+def _dead_letter_topic(build: Mapping[str, Any]) -> Optional[str]:
+    """The topic a stream's dead letters go to (``sink: topic``), or None."""
+    stream = (build.get("properties") or {}).get("stream")
+    spec = stream.get("deadLetter") if isinstance(stream, Mapping) else None
+    if not isinstance(spec, Mapping) or spec.get("enabled", True) is False:
+        return None
+    topic = spec.get("topic") if spec.get("sink") == "topic" else None
+    return topic if isinstance(topic, str) and topic else None
 
 
 def _release_label_errors(bid: Any, cfg: Mapping[str, Any]) -> List[str]:
@@ -352,8 +390,9 @@ def runtime_errors(build: Mapping[str, Any]) -> List[str]:
     props = build.get("properties")
     stream = props.get("stream") if isinstance(props, Mapping) else None
     batch = cfg.get("mode") == "batch" or (cfg.get("mode") is None and stream is None)
-    # On emr-ec2 a step runs as the cluster's own role, so there is no role to require.
-    if batch and not cfg.get("executionRoleArn") and cfg.get("runtime") != "emr-ec2":
+    # On emr-ec2 a step runs as the cluster's own role, and a local run as its machine's
+    # user, so there is no role to require.
+    if batch and not cfg.get("executionRoleArn") and cfg.get("runtime") not in ("emr-ec2", "local"):
         errors.append(
             f"Spark build {bid}: a batch job reads tables its SQL names, which forge cannot "
             "grant a role it derives; set parameters.spark.executionRoleArn to a role the "
@@ -388,7 +427,9 @@ def refuse_unless_identity_allowed(
             f"operator list them {_OPERATOR_ONLY}: {EXECUTION_ROLE_ALLOWLIST_ENV} takes a "
             "role ARN or a path prefix ending in '/'; "
             f"{TARGET_ALLOWLIST_ENV} takes <runtime>:<id> of an existing application, "
-            "cluster or virtual cluster, or msk:<cluster ARN>; "
+            "cluster or virtual cluster, msk:<cluster ARN>, or msk-write:<cluster ARN>/<topic> "
+            "(kafka-write:<host:port>/<topic> per broker of a bootstrapServers cluster) "
+            "for the topic a stream's dead letters go to; "
             f"{SPARK_CONF_ALLOWLIST_ENV} takes a key or a prefix ending in '*'. A key "
             "that loads code, sets credentials or moves the catalog or checkpoint cannot "
             "be listed."
@@ -526,6 +567,32 @@ class JobAccess:
     #: That connection's subnet ARN: the only subnet whose interfaces the role may tag
     #: and delete.
     glue_subnet_arn: Any = None
+    #: The table the stream's dead letters go to, in ``database``
+    #: (``properties.stream.deadLetter``, sink table).
+    dead_letter_table: Optional[str] = None
+    #: The topic on ``msk`` the stream's dead letters go to (sink topic).
+    dead_letter_topic: Optional[str] = None
+
+
+def _dead_letter_topic_statements(msk: MskSource, topic: str) -> List[Dict[str, Any]]:
+    """Writing the dead letters' topic. They are the records' own bytes: no registry is read
+    or written. A Kafka producer is idempotent by default (KIP-679), and MSK authorizes that
+    on the cluster, never on a topic."""
+    scope, tail = f"{msk.region}:{msk.account}", f"{msk.name}/{msk.uuid}"
+    return [
+        {
+            "sid": "MskDeadLetterTopic",
+            "effect": "Allow",
+            "actions": ["kafka-cluster:DescribeTopic", "kafka-cluster:WriteData"],
+            "resources": [f"arn:aws:kafka:{scope}:topic/{tail}/{topic}"],
+        },
+        {
+            "sid": "MskIdempotentWrite",
+            "effect": "Allow",
+            "actions": ["kafka-cluster:WriteDataIdempotently"],
+            "resources": [msk.arn],
+        },
+    ]
 
 
 def secret_resources(arn: Any) -> List[Any]:
@@ -664,6 +731,11 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
                 _join(glue, "catalog"),
                 _join(glue, "database/", access.database),
                 _join(glue, "table/", access.database, "/", access.table),
+                *(
+                    [_join(glue, "table/", access.database, "/", access.dead_letter_table)]
+                    if access.dead_letter_table
+                    else []
+                ),
             ],
         }
     )
@@ -701,6 +773,8 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
                 },
             ]
         )
+        if access.dead_letter_topic:
+            statements.extend(_dead_letter_topic_statements(msk, access.dead_letter_topic))
     if access.secret_arns:
         secrets = [r for a in access.secret_arns for r in secret_resources(a)]
         statements.extend(

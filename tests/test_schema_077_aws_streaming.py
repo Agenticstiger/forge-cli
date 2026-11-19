@@ -324,6 +324,14 @@ class TestStreamFields:
             ("checkpoint", "s3://my-bucket"),
             ("startingOffsets", "earliest"),
             ("startingOffsets", "latest"),
+            ("deadLetter", {}),
+            ("deadLetter", {"enabled": False}),
+            ("deadLetter", {"sink": "table", "table": "orders_rejects"}),
+            (
+                "deadLetter",
+                {"sink": "topic", "topic": "orders.dlq", "alertOn": ["schema_violation"]},
+            ),
+            ("deadLetter", {"maxRecordsBeforeAbort": 0}),
         ],
     )
     def test_accepted(self, manager, name, value):
@@ -351,6 +359,14 @@ class TestStreamFields:
             ("checkpoint", "/local/path"),
             ("startingOffsets", "none"),
             ("startingOffsets", {"orders": {"0": 23}}),
+            ("deadLetter", {"sink": "topic"}),
+            ("deadLetter", {"sink": "topic", "topic": "t", "table": "x"}),
+            ("deadLetter", {"topic": "orders.dlq"}),
+            ("deadLetter", {"sink": "queue"}),
+            ("deadLetter", {"table": "bad name"}),
+            ("deadLetter", {"maxRecordsBeforeAbort": -1}),
+            ("deadLetter", {"alertOn": ["destination_write_failed"]}),
+            ("deadLetter", {"retries": 3}),
         ],
     )
     def test_rejected(self, manager, name, value):
@@ -464,6 +480,18 @@ class TestSparkParameters:
                 "runtime": "emr-serverless",
                 "source": {"bootstrapServers": "b-1:9092,b-2:9092", "auth": "none"},
             },
+            {"runtime": "local"},
+            {"runtime": "local", "mode": "batch", "source": {"bootstrapServers": "localhost:9092"}},
+            # local ignores the AWS runtimes' keys: one overlay line switches a contract.
+            {
+                "runtime": "local",
+                "applicationId": "00f1abcdexample",
+                "clusterId": "j-3TS0OIYO4NFN",
+                "virtualClusterId": "abcdefghij0123456789klmno",  # pragma: allowlist secret
+                "releaseLabel": "emr-7.12.0",
+                "glueVersion": "5.0",
+                "executionRoleArn": "arn:aws:iam::123456789012:role/team/spark-job",
+            },
             {
                 "runtime": "emr-eks",
                 "virtualClusterId": "abcdefghij0123456789klmno",  # pragma: allowlist secret
@@ -491,6 +519,12 @@ class TestSparkParameters:
             {"runtime": "emr-serverless", "virtualClusterId": "abc"},
             {"runtime": "glue", "releaseLabel": "emr-7.12.0"},
             {"runtime": "emr-serverless", "glueVersion": "5.0"},
+            {"runtime": "emr-eks", "virtualClusterId": "abc", "glueVersion": "5.0"},
+            {"runtime": "local", "clusterId": "cluster-1"},
+            {
+                "runtime": "local",
+                "source": {"mskClusterArn": "arn:aws:kafka:eu-west-1:123456789012:cluster/c/u"},
+            },
             {"runtime": "emr-serverless", "applicationId": "UPPER"},
             {"runtime": "emr-ec2", "clusterId": "cluster-1"},
             {"runtime": "emr-serverless", "releaseLabel": "7.12.0"},
@@ -554,6 +588,13 @@ class TestSparkParameters:
             ),
             ({"runtime": "glue", "releaseLabel": "emr-7.12.0"}, "glue runtime takes glueVersion"),
             ({"runtime": "emr-ec2", "glueVersion": "5.0"}, "glueVersion is only valid with"),
+            (
+                {
+                    "runtime": "local",
+                    "source": {"mskClusterArn": "arn:aws:kafka:eu-west-1:123456789012:cluster/c/u"},
+                },
+                "a local run reads source.bootstrapServers",
+            ),
         ],
     )
     def test_a_field_of_another_runtime_is_named(self, manager, spark, says):
@@ -585,7 +626,7 @@ class TestSparkParameters:
         spark = manager._bundled_schemas["0.7.7"]["$defs"]["sparkParameters"]
         props = spark["properties"]
         assert spark["required"] == ["runtime"]
-        assert props["runtime"]["enum"] == ["emr-serverless", "emr-ec2", "emr-eks", "glue"]
+        assert props["runtime"]["enum"] == ["emr-serverless", "emr-ec2", "emr-eks", "glue", "local"]
         assert props["mode"]["enum"] == ["streaming", "batch"]
         assert props["glueVersion"]["default"] == "5.0"
         assert props["releaseLabel"]["default"] == "emr-7.12.0"

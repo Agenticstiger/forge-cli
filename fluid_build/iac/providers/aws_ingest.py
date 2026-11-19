@@ -192,13 +192,18 @@ def spark_blocks(contract: Mapping[str, Any], cid: str) -> SparkBlocks:
     (:func:`aws_identity.refuse_unless_identity_allowed`), then the compiler's broker,
     registry, secrets and contract-SQL policies.
     """
-    from fluid_build.spark.compiler import spark_builds
+    from fluid_build.spark.compiler import LOCAL_RUNTIME, spark_builds, spark_parameters
     from fluid_build.streaming.compiler import managed_lane_enabled
 
     blocks = SparkBlocks({}, {})
     if not managed_lane_enabled(contract):
         return blocks
-    builds = spark_builds(contract)
+    # A build of runtime local runs on the machine fluid apply runs on: nothing on AWS.
+    builds = [
+        b
+        for b in spark_builds(contract)
+        if (spark_parameters(b) or {}).get("runtime") != LOCAL_RUNTIME
+    ]
     if not builds:
         return blocks
     account_marker, brokers_marker = _markers(contract)
@@ -428,10 +433,17 @@ def _emit_build(
     database, table = config["sink"]["table"].split(".", 1)
     vpc = b.runtime == "glue" and cluster is not None
     jars = _glue_jars(blocks, b, bucket_ref) if b.runtime == "glue" else ()
+    dead_table, dead_prefix, dead_topic = _dead_letters(b, contract, expose, data_prefix, iam)
     access = aws_identity.JobAccess(
         region=b.region,
         account=ctx.account,
-        s3=_s3_grants(b, bucket, data_prefix, shared=_shared_bucket(contract, expose, loc)),
+        s3=_s3_grants(
+            b,
+            bucket,
+            data_prefix,
+            shared=_shared_bucket(contract, expose, loc),
+            dead_letters=dead_prefix,
+        ),
         database=database,
         table=table,
         log_group_arn=tofu_ref(f"aws_cloudwatch_log_group.{b.key}.arn"),
@@ -439,8 +451,13 @@ def _emit_build(
         secret_arns=_secret_arns(config, b.region, ctx),
         glue_vpc=vpc,
         glue_subnet_arn=tofu_ref(f"data.aws_subnet.{b.key}.arn") if vpc else None,
+        dead_letter_table=dead_table,
+        dead_letter_topic=dead_topic,
     )
     role_arn = _emit_role(blocks, b, access, application_id)
+    if dead_table and dead_prefix:
+        principal = None if b.runtime == "emr-ec2" else role_arn
+        _emit_dead_letter_table(blocks, contract, expose, b, dead_table, dead_prefix, principal)
     overwrites = job.config["mode"] == "batch"
     # On emr-ec2 the cluster's own role writes, which forge does not know.
     principal = None if b.runtime == "emr-ec2" else role_arn
@@ -799,9 +816,15 @@ def _refuse_unless_products_prefix(where: str, ctx: _Ctx, bucket: str, prefix: s
 
 
 def _s3_grants(
-    b: _Build, bucket: str, data_prefix: str, *, shared: bool = False
+    b: _Build,
+    bucket: str,
+    data_prefix: str,
+    *,
+    shared: bool = False,
+    dead_letters: Optional[str] = None,
 ) -> Tuple[aws_identity.S3Grant, ...]:
-    """The prefixes the job writes (data, checkpoint, Glue's TempDir) and reads (artifacts).
+    """The prefixes the job writes (data, checkpoint, Glue's TempDir, the dead letters'
+    table) and reads (artifacts).
 
     For a role forge creates, every prefix is checked to be one place (:func:`_scoped`),
     and a declared checkpoint must be the product's: under ``_checkpoints/<product>/`` in
@@ -814,6 +837,8 @@ def _s3_grants(
         if shared:
             _refuse_unless_products_prefix(b.where, b.ctx, bucket, data_prefix)
     by_bucket: Dict[str, Tuple[List[str], List[str]]] = {bucket: ([data_prefix], [b.artifacts])}
+    if dead_letters is not None:
+        by_bucket[bucket][0].append(_dead_letter_grant(b, bucket, dead_letters, owned, shared))
     checkpoint = str(b.config.get("checkpoint") or "")
     if checkpoint:
         ck_bucket, ck_prefix = _split_s3(checkpoint)
@@ -847,6 +872,154 @@ def _s3_grants(
         )
         for name, (write, read) in by_bucket.items()
     )
+
+
+def _dead_letters(
+    b: _Build, contract: Mapping[str, Any], expose: Mapping[str, Any], data_prefix: str, iam: bool
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """The stream's dead letters on AWS: ``(table, its prefix, topic)``. The topic only on
+    MSK with IAM, where the role needs a grant to write it."""
+    dead = b.config.get("deadLetter") or {}
+    if dead.get("sink") == "topic":
+        return None, None, (dead.get("topic") if iam else None)
+    if dead.get("sink") != "table":
+        return None, None, None
+    table = dead["table"].split(".", 1)[1]
+    _refuse_unsupported_dead_letter_table(b, contract, expose, data_prefix)
+    return table, _dead_letter_prefix(data_prefix, table), None
+
+
+def _dead_letter_grant(b: _Build, bucket: str, prefix: str, owned: bool, shared: bool) -> str:
+    """The dead letters' prefix a role forge creates writes, checked as the output's is."""
+    if not owned:
+        return prefix
+    prefix = _scoped(b, bucket, prefix, "the dead letters' location")
+    if shared:
+        _refuse_unless_products_prefix(b.where, b.ctx, bucket, prefix)
+    return prefix
+
+
+def _dead_letter_prefix(data_prefix: str, dead_table: str) -> str:
+    """The dead letters' table location: beside the output's, never inside it (a table's
+    orphan-file cleanup would delete another table's files under its location)."""
+    parent = data_prefix.rstrip("/").rpartition("/")[0]
+    return f"{parent}/{dead_table}/" if parent else f"{dead_table}/"
+
+
+def _refuse_unsupported_dead_letter_table(
+    b: _Build, contract: Mapping[str, Any], expose: Mapping[str, Any], data_prefix: str
+) -> None:
+    """Refuse a dead-letter table forge cannot place or govern as it does the output: beside
+    a bucket-root output (it would sit inside its location), beside a location forge
+    registers with Lake Formation (it would need a registration of its own), or beside an
+    output whose lifecycle expires its objects (the rule would not reach the dead letters,
+    which hold the records' raw bytes)."""
+    from . import aws as _aws  # imported here: aws imports this module
+
+    binding = expose.get("binding") or {}
+    gov = (binding.get("governance") or {}).get("lakeFormation") or {}
+    lifecycle = expose.get("lifecycle")
+    problem = None
+    if not data_prefix.strip("/"):
+        problem = (
+            "the output's location is its bucket's root, and a table of the dead letters' own "
+            "would sit inside it"
+        )
+    elif isinstance(gov, Mapping) and gov.get("registerLocation"):
+        placement = _aws._placement(resolve_packaging(contract), expose)
+        if _aws._lf_location(binding.get("location") or {}, placement)[0]:
+            problem = (
+                "forge registers the output's location with Lake Formation "
+                "(registerLocation), and the dead letters' location would need a "
+                "registration of its own, which forge does not emit yet"
+            )
+    elif isinstance(lifecycle, Mapping) and lifecycle.get("expire") is True:
+        problem = (
+            "the output's lifecycle expires its objects, and the rule would not reach the dead "
+            "letters' table, which holds the records' raw bytes"
+        )
+    if problem:
+        raise UnsupportedBindingError(
+            "spark-dead-letters-table-unsupported",
+            f"{b.where}: properties.stream.deadLetter writes a table of its own beside the "
+            f"output, and {problem}.",
+            (
+                "Send the dead letters to a topic (deadLetter.sink: topic), whose retention is "
+                "the topic's.",
+            ),
+        )
+
+
+def _emit_dead_letter_table(
+    blocks: SparkBlocks,
+    contract: Mapping[str, Any],
+    expose: Mapping[str, Any],
+    b: _Build,
+    dead_table: str,
+    dead_prefix: str,
+    principal: Any,
+) -> None:
+    """The dead letters' Iceberg table, emitted as :mod:`aws` emits the output's (Glue writes
+    its first metadata), beside it; and, when Lake Formation governs the output, the
+    job's grant to commit to it, as for the output (``_emit_lakeformation``)."""
+    from fluid_build.iac.governance_labels import governance_labels
+    from fluid_build.spark.dead_letter import SCHEMA
+
+    from . import aws as _aws  # imported here: aws imports this module
+
+    binding = expose.get("binding") or {}
+    loc = dict(binding.get("location") or {})
+    database = str(loc.get("database"))
+    placement = _aws._placement(resolve_packaging(contract), expose)
+    labels = governance_labels(contract, expose)
+    tags = _aws._tags_for({**labels, "managed_by": "fluid", "fluid_contract": b.ctx.cid}, placement)
+    emitted: Dict[str, Dict[str, Any]] = {}
+    _aws._emit_glue(
+        emitted,
+        [dict(column) for column in SCHEMA],
+        b.ctx.cid,
+        tags,
+        # The output's binding, at the dead letters' own table and prefix; unpartitioned
+        # (the default layout), whatever the output's partitionBy says.
+        binding={
+            **binding,
+            "format": "iceberg",
+            "location": {**loc, "table": dead_table, "path": dead_prefix},
+        },
+        contract=contract,
+        placement=placement,
+        labels=labels,
+        expose=f"{expose.get('exposeId')} (dead letters)",
+    )
+    key = safe_ident(f"{b.ctx.cid}_{database}_{dead_table}")
+    body = emitted["aws_glue_catalog_table"][key]
+    body["description"] = (
+        f"The records the forge Spark build {b.build_id} could not land in "
+        f"{database}.{loc.get('table')}, with why and where they were read"
+    )
+    tables = blocks.resources.setdefault("aws_glue_catalog_table", {})
+    if key in tables:
+        raise UnsupportedBindingError(
+            "spark-address-conflict",
+            f"{b.where}: properties.stream.deadLetter.table {database}.{dead_table} is another "
+            "Spark build's dead-letter table.",
+            ("Give each build's dead letters a table of their own.",),
+        )
+    tables[key] = body
+    gov = (binding.get("governance") or {}).get("lakeFormation")
+    if gov and principal is not None:
+        blocks.resources.setdefault("aws_lakeformation_permissions", {})[
+            safe_ident(f"{b.ctx.cid}_lf_spark_dead_letters_{b.build_id}")
+        ] = {
+            "principal": principal,
+            "permissions": ["ALTER", "DESCRIBE", "INSERT", "SELECT"],
+            "table": [
+                {
+                    "database_name": tofu_ref(f"aws_glue_catalog_table.{key}.database_name"),
+                    "name": tofu_ref(f"aws_glue_catalog_table.{key}.name"),
+                }
+            ],
+        }
 
 
 def _secret_arns(config: Mapping[str, Any], region: Any, ctx: _Ctx) -> Tuple[Any, ...]:
