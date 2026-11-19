@@ -7,21 +7,34 @@ Two jobs. ``fluid-plan`` runs stages 1-6 with one ``fluid ship --stage 1-6``
 (ship prints a collapsible section per stage) on a merge request, on the
 default branch and on a manual run, and keeps ``runtime/`` and
 ``dist/artifacts/`` as artifacts, with ship's JUnit report as the pipeline's
-test report. ``fluid-apply`` runs ``fluid ship --stage 7-11 --yes`` on the
-default branch only (``$CI_DEFAULT_BRANCH``, the project's own setting; a manual
-run on another branch plans only): a manual job in the environment named after
-``FLUID_ENV``, one at a time per environment (``resource_group``). The shape
-follows GitLab's OpenTofu CI/CD component: plan on merge requests, apply by
-hand on the default branch.
+test report. On the default branch it also publishes the release packet
+(``fluid ship --release-dir release``): the bundle, the artifacts, the plan and
+the reports, with ``release.json`` written last, only when every stage passed.
+``fluid-apply`` runs ``fluid ship --stage 7-11 --yes`` on the default branch only
+(``$CI_DEFAULT_BRANCH``, the project's own setting; a merge request and any
+other ref plan only): a manual job in the environment named after
+``FLUID_ENV``, one at a time per environment (``resource_group``), that
+downloads that job's artifacts and refuses to start without its packet. The
+shape follows GitLab's OpenTofu CI/CD component: plan on merge requests, apply
+by hand on the default branch.
 
-Every value is a CI/CD variable that ship reads from the job environment:
-the defaults below, which a project variable or the Run pipeline form
-overrides. ``RUN_STAGE_<N>_<NAME>`` switches a stage off (or 10 and 11 on);
-ship skips a switched-off stage inside the job.
+A merge request also gets ``fluid-impact``: ``fluid diff --baseline --impact``
+of the contract against the merge request's base, with the plan, as Markdown
+and JSON beside the plan (``expose_as``). A plan job that fails keeps its
+reports as evidence and drops what could be deployed (the bundle, the plan,
+the artifacts), so nothing a failed run wrote reads as a release.
+
+The Run pipeline form is ``spec:inputs`` (GitLab 17.11 or later): the stage
+switches and the most-used knobs, at most :data:`MAX_INPUTS`. Each input goes
+into a job variable, never into a script, so a value stays data. Every other
+value ship reads is a variable default here, which a project CI/CD variable
+overrides (and overrides an input of the same name too).
 """
 
 from __future__ import annotations
 
+import re
+import shlex
 from typing import Any, Dict, List, Tuple
 
 from . import _keyless, _thin
@@ -29,6 +42,37 @@ from ._base import BasePipelineTemplate, PipelineConfig, check_pipeline_workdir
 
 PIPELINE_PATH = ".gitlab-ci.yml"
 IMAGE = "python:3.12-slim"
+#: ``fluid-impact`` reads the merge request's base with git, which the slim image lacks.
+IMPACT_IMAGE = "python:3.12"
+#: GitLab takes at most 20 inputs for a pipeline.
+MAX_INPUTS = 20
+#: The knobs on the Run pipeline form beside the 11 stage switches; every other
+#: value is a variable default a project CI/CD variable sets.
+FORM_KNOBS: Tuple[str, ...] = (
+    "FLUID_ENV",
+    "APPLY_MODE",
+    "ALLOW_DATA_LOSS",
+    "NO_VERIFY_DIGEST",
+    "VALIDATE_STRICT",
+    "VERIFY_STRICT",
+    "PUBLISH_TARGETS",
+    "SCHEDULER",
+    "SCHEDULE_SYNC_DRY_RUN",
+)
+#: The text a free-text input may hold, checked when the pipeline is created.
+#: Without it an input could hold ``$NAME``, which GitLab expands into the job
+#: variable it is mapped to: another variable's value, in a job log or an
+#: environment name. FLUID_ENV follows ship's environment grammar
+#: (:func:`._base.check_env_name`); PUBLISH_TARGETS is target names, space separated.
+INPUT_PATTERNS: Dict[str, str] = {
+    "FLUID_ENV": "^[A-Za-z][A-Za-z0-9_.-]{0,63}$",
+    "PUBLISH_TARGETS": "^[A-Za-z0-9_.-]*( [A-Za-z0-9_.-]+)*$",
+}
+#: Where the plan job publishes the release packet, on the default branch.
+RELEASE_DIR = "release"
+#: The job variable the plan job's rules set to :data:`RELEASE_DIR`.
+RELEASE_VARIABLE = "FLUID_RELEASE_DIR"
+IMPACT_DIR = "runtime/impact/"
 #: The stage knobs ship reads, each with its own default when blank.
 STAGE_KNOBS: Tuple[str, ...] = (
     "VALIDATE_STRICT",
@@ -50,9 +94,12 @@ class GitLabCITemplate(BasePipelineTemplate):
         self.file_extensions = [".yml"]
 
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
-        return {PIPELINE_PATH: self._header(config) + _thin.render_yaml(self._pipeline(config))}
+        inputs, variables = self._form(config)
+        header = _thin.render_yaml({"spec": {"inputs": inputs}})
+        body = _thin.render_yaml(self._pipeline(config, variables))
+        return {PIPELINE_PATH: self._header(config) + header + "---\n" + body}
 
-    def _pipeline(self, config: PipelineConfig) -> Dict[str, Any]:
+    def _pipeline(self, config: PipelineConfig, variables: Dict[str, Any]) -> Dict[str, Any]:
         add_ons = _thin.check_add_ons(config.add_ons)
         rules: List[Dict[str, str]] = [
             {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'},
@@ -66,9 +113,10 @@ class GitLabCITemplate(BasePipelineTemplate):
             rules.append({"if": '$CI_PIPELINE_SOURCE == "schedule"'})
         pipeline: Dict[str, Any] = {
             "workflow": {"rules": rules},
-            "variables": self._variables(config),
+            "variables": variables,
             "stages": ["plan", "apply"],
             "fluid-plan": self._plan_job(config),
+            "fluid-impact": self._impact_job(config),
             "fluid-apply": self._apply_job(config),
         }
         for add_on in add_ons:
@@ -112,40 +160,63 @@ class GitLabCITemplate(BasePipelineTemplate):
         }
         return job
 
-    def _variables(self, config: PipelineConfig) -> Dict[str, Any]:
-        """The defaults, each with what the Run pipeline form shows."""
+    def _form(self, config: PipelineConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """The ``spec:inputs`` of the Run pipeline form, and the global variables.
+
+        An input on the form reaches ship as the job variable it is mapped to
+        (``FLUID_ENV: $[[ inputs.fluid_env ]]``); a value is never pasted into
+        a script. Every other value is a plain default.
+        """
+        from fluid_build.cli._ship_table import STAGE_TOGGLES
+
+        on_form = set(STAGE_TOGGLES.values()) | set(FORM_KNOBS)
+        inputs: Dict[str, Any] = {}
         variables: Dict[str, Any] = {
-            # One run id for both jobs, so their stages share one ship report.
+            # One run id for every job, so their stages share one ship report.
             "FLUID_RUN_ID": "$CI_PIPELINE_ID",
         }
-        for name, kind, default, description in self._eleven_stage_parameters(config):
-            if name == "CONTRACT":
-                continue  # written into the ship commands
-            if name in _thin.INSTALL_VARIABLES:
-                # A plain default, not on the Run pipeline form: what pip
-                # installs is set as a project CI/CD variable, never per run.
+        parameters = [p for p in self._eleven_stage_parameters(config) if p[0] != "CONTRACT"]
+        parameters += [
+            (
+                knob,
+                "choice:,true,false" if knob in ("VALIDATE_STRICT", "VERIFY_STRICT") else "string",
+                "",
+                f"Passed to fluid ship (see fluid ship --help); blank keeps ship's default "
+                f"for {knob}.",
+            )
+            for knob in STAGE_KNOBS
+        ]
+        for name, kind, default, description in parameters:
+            if name in _thin.INSTALL_VARIABLES or name not in on_form:
+                # What pip installs is a project CI/CD variable, never per run.
                 variables[name] = default
                 continue
-            entry: Dict[str, Any] = {"value": default, "description": description}
-            if kind == "boolean":
-                entry["options"] = ["true", "false"]
-            elif kind.startswith("choice:"):
-                options = kind.split(":", 1)[1].split(",")
-                if "" in options:  # blank is a value (SCHEDULER: none): free text
-                    entry["description"] = (
-                        f"{description} One of: {', '.join(o for o in options if o)}, or blank."
-                    )
-                else:
-                    entry["options"] = options
-            variables[name] = entry
-        for knob in STAGE_KNOBS:
-            variables[knob] = {
-                "value": "",
-                "description": f"Passed to fluid ship (see fluid ship --help); blank keeps "
-                f"ship's default for {knob}.",
-            }
+            key = name.lower()
+            inputs[key] = self._input(kind, default, description)
+            if name in INPUT_PATTERNS:
+                inputs[key]["regex"] = INPUT_PATTERNS[name]
+            if "options" not in inputs[key] and "regex" not in inputs[key]:
+                raise ValueError(f"input {key} takes any text: give it options or a regex")
+            variables[name] = f"$[[ inputs.{key} ]]"
+        if len(inputs) > MAX_INPUTS:
+            raise ValueError(f"{len(inputs)} inputs: GitLab takes at most {MAX_INPUTS}")
         variables.update(self._engine_runtime_env_vars(config))
-        return variables
+        return inputs, variables
+
+    @staticmethod
+    def _input(kind: str, default: str, description: str) -> Dict[str, Any]:
+        entry: Dict[str, Any] = {"type": "string", "default": default, "description": description}
+        if kind == "boolean":
+            entry["options"] = ["true", "false"]
+        elif kind.startswith("choice:"):
+            options = kind.split(":", 1)[1].split(",")
+            if "" in options:  # blank is a value (SCHEDULER: none), which options cannot hold
+                named = [o for o in options if o]
+                entry["regex"] = "^(" + "|".join(re.escape(o) for o in named) + ")?$"
+                entry["description"] = f"{description} One of: {', '.join(named)}, or blank."
+            else:
+                entry["options"] = options
+        return entry
 
     def _job(self, config: PipelineConfig, stage: str, command: str) -> Dict[str, Any]:
         before: List[str] = []
@@ -178,13 +249,85 @@ class GitLabCITemplate(BasePipelineTemplate):
         command = _thin.ship_command(
             f"{_thin.PLAN_STAGES[0]}-{_thin.PLAN_STAGES[-1]}", contract=self._contract(config)
         )
+        # The release packet, where the rules below name a directory for it.
+        command += f' ${{{RELEASE_VARIABLE}:+--release-dir "${RELEASE_VARIABLE}"}}'
         job = self._job(config, "plan", command)
+        job["artifacts"]["paths"].append(self._in_workdir(config, f"{RELEASE_DIR}/"))
         job["artifacts"]["expose_as"] = "fluid plan"
-        # A scheduled pipeline runs the add-ons only.
+        job["after_script"] = self._evidence_only(config)
         job["rules"] = [
+            # A scheduled pipeline runs the add-ons only.
             {"if": '$CI_PIPELINE_SOURCE == "schedule"', "when": "never"},
+            # The packet apply downloads: published on the default branch only,
+            # where apply runs. A merge request plans without one, so a stage
+            # switched off there still plans.
+            {
+                "if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH",
+                "variables": {RELEASE_VARIABLE: RELEASE_DIR},
+            },
             {"when": "on_success"},
         ]
+        return job
+
+    def _evidence_only(self, config: PipelineConfig) -> List[str]:
+        """``after_script``: a job that did not pass keeps its reports and drops
+        what could be deployed, before its artifacts are uploaded."""
+        # The leaf table, not _ship_stages: generating a file must not import ship.
+        from fluid_build.cli._ship_table import ARTIFACTS_DIR, BUNDLE_PATH, PLAN_PATH
+
+        stem = PLAN_PATH.rsplit(".", 1)[0]
+        deployable = [
+            BUNDLE_PATH,
+            PLAN_PATH,
+            f"{stem}.tfplan",
+            f"{stem}.tfplan.json",
+            f"{stem}.gitlab-tofu.json",
+            ARTIFACTS_DIR,
+            f"{RELEASE_DIR}/",
+        ]
+        lines: List[str] = []
+        if config.workdir:
+            # after_script starts in the project directory again.
+            lines.append(f'cd "{check_pipeline_workdir(config.workdir)}"')
+        lines.append(
+            'if [ "$CI_JOB_STATUS" != "success" ]; then '
+            f"rm -rf {' '.join(shlex.quote(p) for p in deployable)}; "
+            "echo 'fluid-plan did not pass: its reports are kept, its bundle, plan and "
+            "artifacts are not'; fi"
+        )
+        return lines
+
+    def _impact_job(self, config: PipelineConfig) -> Dict[str, Any]:
+        """On a merge request, what the change reaches: ``fluid diff --impact``
+        against the contract at the merge request's base, with the plan."""
+        contract = _thin.quoted_contract(self._contract(config))
+        out = IMPACT_DIR
+        job = self._job(config, "plan", "")
+        job.pop("id_tokens", None)
+        job.pop("variables", None)
+        job["image"] = IMPACT_IMAGE
+        job["script"] = [
+            f"mkdir -p {out}",
+            'base="$(mktemp -d)"',
+            # A shallow clone may not hold the base commit.
+            'git fetch --quiet --depth 1 origin "$CI_MERGE_REQUEST_DIFF_BASE_SHA"',
+            'git archive --format=tar "$CI_MERGE_REQUEST_DIFF_BASE_SHA:./" | tar -x -C "$base"',
+            f'if [ ! -f "$base"/{contract} ]; then echo "The contract is new in this merge '
+            f'request: nothing to compare it with." > {out}impact.md; exit 0; fi',
+            "plan=''; if [ -f runtime/plan.json ]; then plan='--plan runtime/plan.json'; fi",
+            f'fluid diff {contract} --baseline "$base"/{contract} --impact $plan '
+            f"--format markdown --out {out}impact.json > {out}impact.md",
+        ]
+        job["needs"] = [{"job": "fluid-plan", "artifacts": True}]
+        job["rules"] = [{"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'}]
+        # The report informs a review; it never blocks the merge request.
+        job["allow_failure"] = True
+        job["artifacts"] = {
+            "when": "always",
+            "expire_in": "30 days",
+            "paths": [self._in_workdir(config, out)],
+            "expose_as": "fluid impact",
+        }
         return job
 
     def _apply_job(self, config: PipelineConfig) -> Dict[str, Any]:
@@ -194,9 +337,18 @@ class GitLabCITemplate(BasePipelineTemplate):
             yes=True,
         )
         job = self._job(config, "apply", command)
+        # Apply what fluid-plan published, from its own artifacts, or nothing.
+        job["script"].insert(
+            -1,
+            f"test -f {RELEASE_DIR}/release.json || {{ echo 'fluid-plan published no release "
+            "packet: nothing to apply'; exit 1; }",
+        )
         job.update(
             {
+                # Exactly the plan job's artifacts, of this pipeline: no other
+                # job's, and no branch's latest.
                 "needs": [{"job": "fluid-plan", "artifacts": True}],
+                "dependencies": ["fluid-plan"],
                 # A person starts apply; until then the pipeline is blocked,
                 # not passed. Protect the environment to choose who may.
                 "rules": [
@@ -231,20 +383,33 @@ class GitLabCITemplate(BasePipelineTemplate):
             "Each job runs `fluid ship --stage ...` (see `fluid ship --help`), one",
             "collapsible section per stage.",
             "",
-            "A merge request runs stages 1-6 (fluid-plan) and keeps runtime/ as an artifact.",
-            "On the default branch, fluid-apply runs stages 7-11 when someone starts it, in",
-            f"the environment named after FLUID_ENV (default {env_default}). Protect that",
-            "environment (Settings > CI/CD > Protected environments) to choose who may.",
-            "A pipeline run by hand on another branch plans only. The default branch is",
-            "the project's own ($CI_DEFAULT_BRANCH), whatever --default-branch said.",
+            "A merge request runs stages 1-6 (fluid-plan) and keeps runtime/ as an artifact;",
+            "fluid-impact writes what the change reaches (fluid diff --impact against the",
+            "merge request's base) beside it. Its resource section reads unknown, with the",
+            "reason, while stage 6 saves no OpenTofu plan.",
             "",
-            "Every value below is a default: a project CI/CD variable or the Run pipeline",
-            "form overrides it. RUN_STAGE_<N>_<NAME>=false switches a stage off.",
+            "On the default branch, fluid-plan also publishes the release packet in",
+            "release/ (fluid ship --release-dir) once every stage passed, and fluid-apply",
+            "runs stages 7-11 from that job's artifacts when someone starts it, in the",
+            f"environment named after FLUID_ENV (default {env_default}). Protect that",
+            "environment (Settings > CI/CD > Protected environments) to choose who may.",
+            "There, stages 1-4 must run and release/ must not be in the repository: ship",
+            "refuses a packet otherwise, and the plan fails with its reason (no packet, no",
+            "apply). A merge request and any other ref plan only, without a packet. The",
+            "default branch is the project's own ($CI_DEFAULT_BRANCH), whatever",
+            "--default-branch said. A fluid-plan that fails keeps its reports and drops its",
+            "bundle, plan and artifacts.",
+            "",
+            "The Run pipeline form is the spec:inputs below (GitLab 17.11 or later). An",
+            "input sets the job variable of the same name in upper case; a project CI/CD",
+            "variable of that name overrides it. Every other value is a variable default a",
+            "project CI/CD variable sets. RUN_STAGE_<N>_<NAME>=false switches a stage off.",
             "",
             "Set FLUID_PACKAGE_SPEC and the FLUID_PIP_* install variables as project",
-            "CI/CD variables, and keep Settings > CI/CD > Variables > Minimum role to use",
-            "pipeline variables at Maintainer or No one allowed: whoever may set pipeline",
-            "variables can pass FLUID_PACKAGE_SPEC to a run and choose what apply installs.",
+            "CI/CD variables, and set Settings > CI/CD > Variables > Minimum role to use",
+            "pipeline variables to No one allowed (the form needs none): whoever may set",
+            "pipeline variables can pass FLUID_PACKAGE_SPEC to a run and choose what apply",
+            "installs.",
         ]
         header = "".join(f"# {line}".rstrip() + "\n" for line in lines) + "\n"
         banner = self._credential_banner(
