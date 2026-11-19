@@ -14,7 +14,7 @@ On 2026-11-16 the founder decided where these rules live:
 
 - **Decision 12.** Rules about what valid data looks like belong in the FLUID contract. There, dbt, ODCS and catalog consumers reuse them, and FLUX reads them instead of restating them. Distributions, behavior and run settings stay in FLUX documents. Measured statistics stay in separate profile documents (`RFC-data-profile-port.md`).
 - **Decision 13.** Invariants are written in a SQL expression subset that this RFC defines. flux-expr/2 implements exactly that subset.
-- **Decision 14.** Date arithmetic is whole-unit differences (`YEARS_BETWEEN`, `MONTHS_BETWEEN`, `DAYS_BETWEEN`) with an explicit as-of date. The results are exact integers.
+- **Decision 14.** Date arithmetic is whole-unit differences (`YEARS_BETWEEN`, `MONTHS_BETWEEN`, `DAYS_BETWEEN`) with an explicit as-of date. The results are exact integers. *Amended 2026-11-19 by the maintainers:* a date also moves by whole units (`ADD_DAYS`, `ADD_MONTHS`, `ADD_YEARS`, §2.6), with the meaning flux-expr/3 gives them (flux-engine ADR 0013), so a rule such as "a term ends 12 months after it starts" is written in the contract. This reverses the first version's choice to leave date addition out.
 
 The 0.7.7 schema cannot say any of this today:
 
@@ -203,7 +203,7 @@ An invariant's share is a threshold on the number of covered rows that violate i
 - The numbers are exact decimals: a consumer reads `0.5` as one half, from its text, never as the nearest binary double. They have at most 15 significant digits, so the text survives a round trip through a double (FLUX decision Q4).
 - "Holds on about 98 % of real rows" is `mustBeBetween: [1.5, 2.5], unit: percent`.
 
-The band is a rule; the measured share is a statistic. `fluid profile` (decision 11) measures each declared invariant on the real data and writes the result to a profile document. Because zero violations are disclosive, it reports "at least X %" (decision Q9). The contract never holds a measured number. FLUX will choose where in the band a run generates (a FLUX setting, which may come from a profile), inject the violations, and check the run against the band. FLUX will check a run against the band itself, as every consumer does (§2.9, change 7), and generate from a `percent` band by choosing a target strictly inside it. Three bands cannot be met in expectation: a zero-width `percent` band above 0 (`mustBe: 2`), a `rows` band other than zero violations (a count does not scale to a run of another size), and a dependency band that allows no holding share above one half, so that every value it allows is at least 50 % of violating rows (EXPR-SPEC-2 §9 generates a dependency only above that). FLUX will check such a band, generate no violation for it, and, under strictness, refuse one that zero violations would fail.
+The band is a rule; the measured share is a statistic. `fluid profile` (decision 11) is planned to measure each declared invariant on the real data and write the result to a profile document; it does not measure invariants yet, and today's profile holds column statistics only. Because zero violations are disclosive, it reports "at least X %" (decision Q9). The contract never holds a measured number. FLUX will choose where in the band a run generates (a FLUX setting, which may come from a profile), inject the violations, and check the run against the band. FLUX will check a run against the band itself, as every consumer does (§2.9, change 7), and generate from a `percent` band by choosing a target strictly inside it. Three bands cannot be met in expectation: a zero-width `percent` band above 0 (`mustBe: 2`), a `rows` band other than zero violations (a count does not scale to a run of another size), and a dependency band that allows no holding share above one half, so that every value it allows is at least 50 % of violating rows (EXPR-SPEC-2 §9 generates a dependency only above that). FLUX will check such a band, generate no violation for it, and, under strictness, refuse one that zero violations would fail.
 
 ### 1.5 What a check counts
 
@@ -237,7 +237,7 @@ FLUX will refuse, with an FLX code, an invariant it cannot generate as declared:
 
 ## 2. FLUID SQL/1, the expression subset
 
-FLUID SQL/1 is the language of `check`, `expr`, `when` and `aggregate.filter`. It is a closed subset of SQL: a text the grammar does not derive is a validation error, never an extension point. Growth goes to FLUID SQL/2 in a later schema version. There is no per-expression language key, because the contract's `fluidVersion` names the version: 0.7.7 carries FLUID SQL/1.
+FLUID SQL/1 is the language of `check`, `expr`, `when` and `aggregate.filter`. It is a closed subset of SQL: a text the grammar does not derive is a validation error, never an extension point. Growth goes to FLUID SQL/2 in a later schema version. One addition was made in place while 0.7.7 is a preview: the three date moves of §2.6 (2026-11-19, decision 14 as amended). It is additive, and it fails closed: a reader that predates it refuses a text that uses one as an unknown function, so it never computes another value. Conformance vectors 1.1.0 hold them, and 1.0.0 did not. There is no per-expression language key, because the contract's `fluidVersion` names the version: 0.7.7 carries FLUID SQL/1.
 
 ### 2.1 Grammar
 
@@ -258,8 +258,10 @@ factor      = [ "-" ] , primary ;
 primary     = literal | column_ref | call | case_expr | "(" , expr , ")" ;
 call        = "ROUND" , "(" , value , "," , integer , [ "," , round_mode ] , ")"
             | "COALESCE" , "(" , expr , "," , expr , { "," , expr } , ")"
-            | date_diff , "(" , value , "," , value , ")" ;
+            | date_diff , "(" , value , "," , value , ")"
+            | date_add , "(" , value , "," , value , ")" ;
 date_diff   = "DAYS_BETWEEN" | "MONTHS_BETWEEN" | "YEARS_BETWEEN" ;
+date_add    = "ADD_DAYS" | "ADD_MONTHS" | "ADD_YEARS" ;
 round_mode  = "'HALF_AWAY_FROM_ZERO'" | "'HALF_TO_EVEN'" ;
 case_expr   = "CASE" , "WHEN" , expr , "THEN" , expr ,
               { "WHEN" , expr , "THEN" , expr } , [ "ELSE" , expr ] , "END" ;
@@ -309,9 +311,9 @@ Type rules:
 
 - `=`, `<>`, `!=`, `IS [NOT] DISTINCT FROM` and `IN` take operands of one type. Numbers of different scales compare by value.
 - `<`, `<=`, `>`, `>=` and `BETWEEN` take numbers, strings, dates or timestamps, one type throughout. Strings compare by the code points of the text as stored; only the contract's own texts (names, literals, placeholder values and prefixes) are NFC-normalized. A date never meets a timestamp, and a timestamp never meets a timestamp with time zone, because FLUID SQL/1 has no `CAST` and the two readings of a zoneless value differ by engine.
-- `+`, `-`, `*`, `/` and unary `-` take numbers. There is no date or string arithmetic beyond the date differences.
+- `+`, `-`, `*`, `/` and unary `-` take numbers. There is no date or string arithmetic beyond the date differences and the date moves. A date move takes a date and a count, a number of static scale 0 (§2.4): a count such as `1.5`, a `decimal(12,2)` column, a float column or a quotient is refused, and `ROUND(x, 0)` is accepted.
 - The value branches of `CASE` and `COALESCE` share one type. The `NULL` literal may stand for any of them, but not for all of them.
-- More generally, the `NULL` literal takes its type from a typed operand beside it: an arithmetic operand, a date difference's argument, an `IS [NOT] DISTINCT FROM` operand, a `CASE` or `COALESCE` branch. Anywhere else (an `IN` item, an operand of a comparison or `BETWEEN`, `IS [NOT] NULL`, unary minus, `ROUND`'s argument, a predicate position, a whole value) it is refused, and so is a construct whose operands are all `NULL` literals.
+- More generally, the `NULL` literal takes its type from a typed operand beside it: an arithmetic operand, a date difference's argument, an `IS [NOT] DISTINCT FROM` operand, a `CASE` or `COALESCE` branch. Anywhere else (an `IN` item, an operand of a comparison or `BETWEEN`, `IS [NOT] NULL`, unary minus, `ROUND`'s argument, either argument of a date move, a predicate position, a whole value) it is refused, and so is a construct whose operands are all `NULL` literals.
 - A predicate position takes a bool: `check`, `when`, `aggregate.filter`, `CASE WHEN` and the operands of `AND`, `OR` and `NOT`.
 - A string literal compared with a column whose `validationRules` declare an `enum` must be one of its values. This is flux-expr/1's closed-set rule, and it turns a typo such as `kind = 'base_fe'` into a validation error.
 
@@ -354,19 +356,24 @@ Why two-valued: a row whose predicate is not TRUE does not satisfy it. Deequ's `
 | `CASE WHEN c THEN a ... [ELSE b] END` | as in SQL; without `ELSE`, NULL |
 | `DAYS_BETWEEN(a, b)` | the whole days from date a to date b |
 | `MONTHS_BETWEEN(a, b)`, `YEARS_BETWEEN(a, b)` | the whole months or years from date a to date b |
+| `ADD_DAYS(d, n)` | date d moved n days forward, or back when n is negative |
+| `ADD_MONTHS(d, n)`, `ADD_YEARS(d, n)` | date d moved n months or years, the day of the month kept, or clamped to the last day of a shorter month |
 | `DATE 'YYYY-MM-DD'` | a date literal: a valid calendar date from 0001-01-01 to 9999-12-31 |
 
 The date differences use EXPR-SPEC-2 §6's definition (decision 14). For b on or after a, the result is the largest k such that a moved forward by k units is not after b. Moving forward by months or years keeps the day of the month, or lands on the month's last day when that month is shorter: 31 January 2026 plus one month is 28 February 2026, and 29 February 2000 plus 26 years is 28 February 2026. For b before a, the result is minus the result from b to a. Both arguments are dates, and a NULL argument gives NULL. Age is `YEARS_BETWEEN(birth_date, snapshot_date)`.
 
-Two warnings for SQL readers:
+The date moves are flux-expr/3's (flux-engine ADR 0013, EXPR-SPEC-3 §4), so FLUX reads them with the same meaning. `n` is a whole number. A move by months keeps the day of the month, or lands on the last day of the target month when that month is shorter: 31 January 2001 plus one month is 28 February 2001, and 31 January 2004 plus one month is 29 February 2004. The month end is not kept: 28 February 2001 plus one month is 28 March 2001. `ADD_YEARS(d, n)` is `ADD_MONTHS(d, 12 * n)`, so 29 February 2000 minus one year is 28 February 1999, and plus four years is 29 February 2004. A NULL argument gives NULL, and a result outside 0001-01-01 to 9999-12-31 is NULL, never an error, however large `n` is. The moves invert the differences: `MONTHS_BETWEEN(d, ADD_MONTHS(d, n))` is `n` whenever the result is in range, and so for days and years.
+
+Three warnings for SQL readers:
 
 - These are not `DATEDIFF`, `DATE_DIFF` or DuckDB's `date_diff`, which count the unit boundaries crossed. `DATEDIFF(month, '2026-01-31', '2026-02-01')` is 1, while `MONTHS_BETWEEN(DATE '2026-01-31', DATE '2026-02-01')` is 0. They equal DuckDB's `date_sub`.
 - Oracle, Snowflake and Spark have a `MONTHS_BETWEEN(d1, d2)` of their own. It returns a fraction, d1 minus d2, so its arguments run the other way. No consumer passes FLUID's `MONTHS_BETWEEN` to an engine by name (§2.8).
+- Oracle, Db2 and Snowflake have an `ADD_MONTHS(d, n)` of their own that keeps the month end: there, 28 February 2001 plus one month is 31 March 2001. No consumer passes FLUID's `ADD_MONTHS` to an engine by name either (§2.8).
 
 ### 2.7 Not in FLUID SQL/1
 
 - String functions and `LIKE`, regular expressions, `CAST`, timestamp literals and functions over timestamps;
-- date arithmetic other than the differences, `ABS`, `LEAST`, `GREATEST`, `NULLIF`, parameters, user functions and the clock;
+- date arithmetic other than the differences and the moves by whole days, months and years (no interval type, `DATE_TRUNC` or `LAST_DAY`), `ABS`, `LEAST`, `GREATEST`, `NULLIF`, parameters, user functions and the clock;
 - aggregates and windows inside expressions, subqueries, paths over several links, and the previous version of an entity.
 
 Windows, aggregates over children, `previous` and multi-link paths are flux-expr/2 extensions that a FLUX bundle may use. The rest waits for FLUID SQL/2.
@@ -387,9 +394,20 @@ Consumers render SQL from the parsed expression, never from the raw text (see Se
 | `ROUND(x, s, 'HALF_TO_EVEN')` | Snowflake `ROUND(x, s, 'HALF_TO_EVEN')`, Databricks `bround(x, s)`, elsewhere the `CASE` form below | DuckDB's `round_even` returns `DOUBLE`, so it is not used for `DECIMAL` |
 | `DAYS_BETWEEN(a, b)` | `b - a` (PostgreSQL), `DATEDIFF(day, a, b)` (Snowflake), `DATE_DIFF(b, a, DAY)` (BigQuery), `datediff(b, a)` (Databricks), `date_sub('day', a, b)` (DuckDB) | both are dates, so day boundaries and whole days agree |
 | `MONTHS_BETWEEN(a, b)`, `YEARS_BETWEEN(a, b)` | DuckDB `date_sub('month', a, b)` or `date_sub('year', a, b)`, elsewhere the `EXTRACT` form below | never `DATEDIFF`, `DATE_DIFF`, `date_diff` or an engine's own `MONTHS_BETWEEN` |
+| `ADD_DAYS(d, n)` | DuckDB and PostgreSQL `d + CAST(k AS INTEGER)`, Snowflake `DATEADD(day, k, d)`, BigQuery `DATE_ADD(d, INTERVAL CAST(k AS INT64) DAY)`, Databricks `date_add(d, CAST(k AS INT))`, Athena (Trino) `date_add('day', k, d)`; `k` is the guarded count below | every engine adds whole days to a date |
+| `ADD_MONTHS(d, n)` | DuckDB `CAST(d + to_months(CAST(k AS INTEGER)) AS DATE)` (`d + INTERVAL n MONTH`, back to a date), PostgreSQL `CAST(d + CAST(k AS INTEGER) * INTERVAL '1 month' AS DATE)`, Snowflake `DATEADD(month, k, d)`, BigQuery `DATE_ADD(d, INTERVAL CAST(k AS INT64) MONTH)`, Databricks `add_months(d, CAST(k AS INT))`, Athena `d + k * INTERVAL '1' MONTH` | these clamp the day as §2.6 does; never Snowflake's `ADD_MONTHS` (it keeps the month end) |
+| `ADD_YEARS(d, n)` | as `ADD_MONTHS`, with `to_years`, `INTERVAL '1 year'`, `DATEADD(year, ...)`, `INTERVAL ... YEAR`, `add_months(d, CAST(k AS INT) * 12)` and `INTERVAL '1' YEAR` | 29 February clamps to 28 February |
 | a string compared with `<`, `<=`, `>` or `>=` | as written | PostgreSQL adds `COLLATE "C"`, so text orders by code point, as in Snowflake, BigQuery and DuckDB |
 | `rel.col` | `LEFT JOIN <target> AS rel ON <fromColumns = toColumns>` | a left join whatever the relationship's `joinType`, so a missing row reads as NULL |
 | `DATE 'YYYY-MM-DD'` | as written | SQL's typed literal |
+
+The guarded count of a date move. Engines raise, or return a date past 9999, where FLUID SQL/1 gives NULL (§2.6). So the count is made NULL first, by a `CASE` that only selects, and the engine then adds what it selected: an engine that evaluates every branch of a `CASE` still never adds an out-of-range count. With `m = EXTRACT(YEAR FROM d) * 12 + EXTRACT(MONTH FROM d) - 1` and `y = EXTRACT(YEAR FROM d)`:
+
+- `ADD_DAYS`: `k = CASE WHEN n BETWEEN <days from d to DATE '0001-01-01'> AND <days from d to DATE '9999-12-31'> THEN n END`, the days counted with the engine's day difference above;
+- `ADD_MONTHS`: `k = CASE WHEN n BETWEEN 12 - m AND 119999 - m THEN n END`;
+- `ADD_YEARS`: `k = CASE WHEN n BETWEEN 1 - y AND 9999 - y THEN n END`.
+
+The bounds are computed from `d`, never from `n`, so a huge count overflows nothing. Three engines outside the rendered dialects need care. SQL Server's `DATEADD(month, k, d)` clamps, and raises outside its range, so it takes the guarded count too. Oracle's and Db2's `ADD_MONTHS` keep the month end, so neither is used: Db2 writes `d + k MONTHS` (a labeled duration, which clamps), and Oracle `LEAST(ADD_MONTHS(TRUNC(d, 'MM'), k) + (EXTRACT(DAY FROM d) - 1), LAST_DAY(ADD_MONTHS(TRUNC(d, 'MM'), k)))`, which moves the first of the month and clamps the day itself. A consumer that cannot write one of these forms refuses the text. sqlglot is not a way around this: 30.33 rewrites Oracle's and Snowflake's `ADD_MONTHS` faithfully only into DuckDB, and passes it to every other dialect by name, with the month end kept.
 
 The `CASE` form of half-to-even, with `y = x * 10^s` in fixed point:
 `CASE WHEN ABS(y - TRUNC(y)) = 0.5 THEN TRUNC(y) + CASE WHEN MOD(TRUNC(y), 2) = 0 THEN 0 ELSE SIGN(y) END ELSE ROUND(y) END / 10^s`.
@@ -423,6 +441,7 @@ flux-expr/2 is spelled in SQL (maintainers' decision, 2026-11-16, in Agenticstig
 | `ROUND(x, s, 'HALF_TO_EVEN')` | #38's half-even `round(x, s)` |
 | `ROUND(x, s)` | rounding to s places with ties away from zero (change 2) |
 | `DAYS_BETWEEN`, `MONTHS_BETWEEN`, `YEARS_BETWEEN` | `days_between`, `months_between`, `years_between` |
+| `ADD_DAYS`, `ADD_MONTHS`, `ADD_YEARS` | flux-expr/3's `ADD_DAYS`, `ADD_MONTHS` and `ADD_YEARS` (EXPR-SPEC-3 §4), the same three calls; ADR 0013 makes them core once FLUID SQL has them |
 | `DATE '2026-11-16'` | `date('2026-11-16')` |
 | a column name `c` | the explicit path `row.c`, so a column named `row`, `link`, `previous` or `children`, or one that shares a relationship's name, needs no rule of its own; a quoted name that flux-expr/2's identifiers cannot spell is a FLUX refusal until flux-expr/2 can quote it |
 | `rel.col` | `link.<rel>.col`, always through the `link` root (EXPR-SPEC-2 §5), so a relationship named `row`, `link`, `previous` or `children`, or one that shares a column's name, still reads the linked row |
@@ -668,6 +687,7 @@ Each step is its own PR:
 - dbt constraints and data tests: docs.getdbt.com/reference/resource-properties/constraints, /reference/data-test-configs; dbt_utils `expression_is_true`; dbt-expectations, maintained at github.com/metaplane/dbt-expectations
 - Snowflake `ROUND`, `MONTHS_BETWEEN`, `DATEDIFF`, `IS [NOT] DISTINCT FROM`, `EQUAL_NULL` and semantic view validation rules: docs.snowflake.com/en/sql-reference/functions/, /user-guide/views-semantic/validation-rules
 - BigQuery date functions and rounding modes: docs.cloud.google.com/bigquery/docs/reference/standard-sql/date_functions; DuckDB date functions: duckdb.org/docs/2.0/sql/functions/date.html
+- Month arithmetic at the month end (§2.6, §2.8): PostgreSQL postgresql.org/docs/current/functions-datetime.html; Snowflake docs.snowflake.com/en/sql-reference/functions/dateadd and /add_months; Spark spark.apache.org/docs/latest/api/sql/ and its 3.0 migration guide (`add_months` stopped keeping the month end); Trino trino.io/docs/current/functions/datetime.html; SQL Server learn.microsoft.com/en-us/sql/t-sql/functions/dateadd-transact-sql; Oracle docs.oracle.com/en/database/oracle/oracle-database/19/sqlrf/ADD_MONTHS.html; Db2 ibm.com/docs/en/db2/11.5?topic=functions-add-months and its date arithmetic (labeled durations); flux-engine ADR 0013 and EXPR-SPEC-3
 - Apache Ossie core spec: github.com/apache/ossie
 - Deequ `satisfies` and `Compliance`: github.com/awslabs/deequ
 - J. Kivinen and H. Mannila, "Approximate inference of functional dependencies from relations", Theoretical Computer Science 149(1), 1995; Y. Huhtala et al., "TANE", The Computer Journal 42(2), 1999
