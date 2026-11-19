@@ -684,13 +684,43 @@ def _dbt_contract() -> Dict[str, object]:
     return contract
 
 
+def test_a_plan_from_a_checkout_that_is_gone_resolves_through_the_bundle_it_is_applied_with(
+    work: Path, bundled: Path
+) -> None:
+    """The plan's recorded paths (under ``planDigest``) win while they exist. When the
+    plan job's checkout is gone, the bundle this apply verified names the contract,
+    relative to itself, in this checkout. Nothing is set outside an apply."""
+    from fluid_build import _contract_loader as loader
+
+    elsewhere = work.parent / "elsewhere"
+    gone = {
+        "contract_metadata": {
+            "source_contract": str(elsewhere / "contract.fluid.yaml"),
+            "source_path": str(elsewhere / "runtime" / "bundle.tgz"),
+        }
+    }
+    found, why = loader.resolve_source_contract("plan.json", plan_data=gone)
+    assert found is None and "which no longer exists" in why
+    with loader.applied_bundle_scope():
+        loader.note_applied_bundle(bundled)
+        found, why = loader.resolve_source_contract("plan.json", plan_data=gone)
+        assert (found, why) == ((work / "contract.fluid.yaml").resolve(), "")
+        recorded = work / "recorded.fluid.yaml"
+        recorded.write_text(yaml.safe_dump(_contract(), sort_keys=False))
+        kept = {"contract_metadata": {"source_contract": str(recorded)}}
+        assert loader.resolve_source_contract("plan.json", plan_data=kept)[0] == recorded.resolve()
+    assert loader.resolve_source_contract("plan.json", plan_data=gone)[0] is None
+
+
 @pytest.mark.integration
 def test_a_plan_made_from_the_release_applies_with_its_dbt_project(tmp_path: Path) -> None:
     """A plan made from the release's bundle records the contract the bundle was
     built from, so ``fluid apply`` finds the checkout's dbt project and checks it
     against the packed copy: an unchanged one applies (dry run), an edited one is
     refused by name. Before the release carried a provenance file, apply refused
-    both, as it could not find the checkout (``apply_plan_digest_bundle_mismatch``)."""
+    both, as it could not find the checkout (``apply_plan_digest_bundle_mismatch``).
+    The same holds when the apply runs in another checkout of the tree, as a later
+    CI job may, and the plan job's checkout is gone."""
     project = tmp_path / "project"
     (project / "dbt" / "models").mkdir(parents=True)
     (project / "dbt" / "dbt_project.yml").write_text(
@@ -723,7 +753,15 @@ def test_a_plan_made_from_the_release_applies_with_its_dbt_project(tmp_path: Pat
     apply_argv = ("apply", "plans/plan.json", "--bundle", "rel/bundle.tgz", "--dry-run", "--yes")
     ok(_cli(project, *apply_argv))
 
-    (project / "dbt" / "models" / "orders.sql").write_text("select 2 as id\n")
-    edited = _cli(project, *apply_argv)
+    import shutil
+
+    # Another job's checkout: the same tree at another path, and the planning one gone.
+    moved = tmp_path / "another-job" / "project"
+    shutil.copytree(project, moved, symlinks=True)
+    project.rename(tmp_path / "planning-checkout-removed")
+    ok(_cli(moved, *apply_argv))
+
+    (moved / "dbt" / "models" / "orders.sql").write_text("select 2 as id\n")
+    edited = _cli(moved, *apply_argv)
     assert edited.returncode == 1
     assert "changed models/orders.sql" in edited.stdout + edited.stderr

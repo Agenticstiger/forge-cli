@@ -48,6 +48,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A bundle that names no source contract gets no provenance file in the release, as before, and
     neither does a release on another drive.
 
+- **A plan can be applied in another checkout of the same tree, as a later CI job may run in
+  one.** A plan records the planning checkout's absolute paths (`source_contract`,
+  `source_path`). When the apply job checked the repository out at another path, those paths were
+  gone, and `fluid apply plan.json --bundle B` refused a contract with a dbt build: it could not
+  find the dbt project to check ("the plan records source_contract …, which no longer exists").
+  - The recorded paths still come first: they are covered by `planDigest`.
+  - When they are gone, apply anchors the plan at the contract that the bundle's provenance file
+    names, relative to the bundle. This bundle is the one apply has just verified the plan against.
+  - The anchor holds for the dbt check, the build runners, relative binding paths and the IaC
+    source.
+  - The provenance file is outside every digest. So the contract it names must declare the bundled
+    contract's id, and the dbt project's files there must still match the copy the bundle packs:
+    an edit is refused, naming the file.
+  - With `--no-verify-plan-binding`, nothing is verified, so there is no fallback.
+  - GitLab's default checkout path holds the runner and a concurrency slot, so two jobs of one
+    pipeline can land at different paths; `GIT_CLONE_PATH` is no longer needed for this.
+
 ### Security
 
 - **A histogram, a level histogram and a quantile of one column are checked together (FLUX ADR

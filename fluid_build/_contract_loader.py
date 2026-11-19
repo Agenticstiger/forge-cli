@@ -35,12 +35,38 @@ stay stable.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 import os
 import re
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+#: The bundle the running ``fluid apply plan.json --bundle B`` verified its plan
+#: against (the plan's bundle and packet digests matched it), or ``None``. A plan
+#: whose recorded checkout paths are gone resolves its source contract through it
+#: (:func:`_resolve_plan_source_contract`). Set by :func:`note_applied_bundle`, only
+#: inside :func:`applied_bundle_scope`.
+_APPLIED_BUNDLE: contextvars.ContextVar[Optional[Path]] = contextvars.ContextVar(
+    "fluid_applied_bundle", default=None
+)
+
+
+@contextlib.contextmanager
+def applied_bundle_scope() -> Iterator[None]:
+    """One ``fluid apply`` run: no verified bundle at its start, none after it returns."""
+    token = _APPLIED_BUNDLE.set(None)
+    try:
+        yield
+    finally:
+        _APPLIED_BUNDLE.reset(token)
+
+
+def note_applied_bundle(bundle: Path) -> None:
+    """The bundle this apply has just verified its plan against."""
+    _APPLIED_BUNDLE.set(Path(bundle))
 
 
 class CLIError(Exception):
@@ -391,7 +417,17 @@ def resolve_source_contract(
 def _resolve_plan_source_contract(plan_data: Dict[str, Any]) -> Tuple[Optional[Path], str]:
     """:func:`resolve_source_contract` for a plan: ``contract_metadata.source_contract``
     (recorded for plans made from a bundle), else ``source_path``, followed
-    through the bundle when it names one."""
+    through the bundle when it names one, else the bundle this apply verified the
+    plan against (:data:`_APPLIED_BUNDLE`).
+
+    The recorded paths are the plan job's checkout, under ``planDigest``, so they
+    win whenever they still exist. They are gone when the apply job checked the
+    repository out at another path, as one CI job after another may. Then the
+    verified bundle names its source contract relative to itself, through its
+    provenance file. That file is outside every digest, so it gets the checks
+    :func:`resolve_source_contract` gives a bundle (a relative path to a file that
+    declares the bundled contract's id), and a dbt build's files there are still
+    compared with the copy the bundle packs."""
     meta = plan_data.get("contract_metadata") if isinstance(plan_data, dict) else None
     if not isinstance(meta, dict):
         return None, "records no contract_metadata"
@@ -409,7 +445,22 @@ def _resolve_plan_source_contract(plan_data: Dict[str, Any]) -> Tuple[Optional[P
         if resolved is not None:
             return resolved, ""
         reasons.append(f"records {key} {recorded}, a bundle that {why}")
+    through_bundle = _applied_bundle_source(reasons)
+    if through_bundle is not None:
+        return through_bundle, ""
     return None, "; ".join(reasons) or "does not record a source contract"
+
+
+def _applied_bundle_source(reasons: List[str]) -> Optional[Path]:
+    """The source contract the bundle this apply verified names, or ``None``, with why
+    appended to ``reasons`` when there is such a bundle."""
+    applied = _APPLIED_BUNDLE.get()
+    if applied is None:
+        return None
+    resolved, why = resolve_source_contract(applied)
+    if resolved is None:
+        reasons.append(f"is applied with the bundle {applied}, which {why}")
+    return resolved
 
 
 def source_contract_dir(
