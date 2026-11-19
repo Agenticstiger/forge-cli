@@ -81,7 +81,7 @@ class _Destroys:
         self.runs: Dict[Tuple[Any, ...], Any] = {}  # DesiredRun, by where its runs are
         self.applications: List[Tuple[str, Any]] = []  # (name, DesiredRun)
         self.policies: List[Tuple[str, str, bool]] = []  # (name, arn, a build's)
-        self.untagged: List[Tuple[str, str]] = []  # (product, build)
+        self.untagged: Dict[Tuple[str, str], None] = {}  # (product, build), in order
 
     def add_run(self, run: Any) -> None:
         where = (run.runtime, run.region, tuple(sorted(run.target.items())), run.run_name)
@@ -98,6 +98,22 @@ class _Destroys:
         ]
 
 
+def _tagged_run(
+    found: _Destroys, product: str, build: str, tags: Mapping[str, Any], region: Any
+) -> None:
+    """The run a build's identity tags say it has; the build is ``untagged`` when they are
+    missing (written by an earlier forge)."""
+    from fluid_build.build_runners.spark._desired import located_run
+
+    runtime = str(tags.get(names.RUNTIME_TAG) or "")
+    key, _, ident = str(tags.get(names.RUN_TARGET_TAG) or "").partition("=")
+    where = tags.get(names.RUN_REGION_TAG) or region
+    if not (runtime and key and ident and where):
+        found.untagged[(product, build)] = None
+        return
+    found.add_run(located_run(product, build, runtime, str(where), {key: ident}))
+
+
 def _read(destroyed: Iterable[Mapping[str, Any]]) -> _Destroys:
     from fluid_build.build_runners.spark._desired import located_run
 
@@ -111,18 +127,15 @@ def _read(destroyed: Iterable[Mapping[str, Any]]) -> _Destroys:
         region = _region(before)
         if kind == "aws_iam_policy" and before.get("arn"):
             found.policies.append((str(before.get("name") or ""), str(before["arn"]), bool(build)))
+            if product and build:
+                # An EMR on EC2 build's job policy goes with the build, or when the build
+                # moves to another runtime and keeps its log group: its steps stop too.
+                _tagged_run(found, str(product), str(build), tags, None)
         elif not (product and region):
             continue
         elif kind == "aws_cloudwatch_log_group" and build:
-            if not str(before.get("name") or "").startswith(_LOG_GROUPS):
-                continue
-            runtime = str(tags.get(names.RUNTIME_TAG) or "")
-            key, _, ident = str(tags.get(names.RUN_TARGET_TAG) or "").partition("=")
-            if not (runtime and key and ident):
-                found.untagged.append((str(product), str(build)))
-                continue
-            where = str(tags.get(names.RUN_REGION_TAG) or region)
-            found.add_run(located_run(str(product), str(build), runtime, where, {key: ident}))
+            if str(before.get("name") or "").startswith(_LOG_GROUPS):
+                _tagged_run(found, str(product), str(build), tags, region)
         elif kind == "aws_glue_job" and build and before.get("name"):
             target = {"glueJobName": str(before["name"])}
             found.add_run(located_run(str(product), str(build), "glue", region, target))
@@ -219,10 +232,13 @@ def prepare(
 
     clients = clients or default_clients
     _refuse_attached(found.policies, clients, say)
+    located = {(r.product, r.build) for r in found.runs.values()}
     for product, build in found.untagged:
+        if (product, build) in located:
+            continue  # another of its resources says where it runs
         say(
-            f"  note: Spark build {build} goes, but its log group does not say where it runs "
-            "(an apply by an earlier forge): stop its run "
+            f"  note: Spark build {build} goes, but nothing it is destroyed with says where it "
+            "runs (an apply by an earlier forge): stop its run "
             f"{names.run_name(product, build)} yourself if one is going."
         )
     timing: Dict[str, Any] = {"sleep": sleep, "now": now, "env": env}

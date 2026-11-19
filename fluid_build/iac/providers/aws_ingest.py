@@ -482,9 +482,10 @@ def _emit_build(
 
 
 def _run_identity(b: _Build, application_id: Any) -> Dict[str, Any]:
-    """Where the build's runs are, as tags on its log group (:data:`names.RUNTIME_TAG` and the
-    two beside it): a plan that destroys the build no longer has it in the contract, and
-    reads them from the state to stop its runs first (``aws_spark_destroys``)."""
+    """Where the build's runs are, as tags on its log group and an EMR on EC2 build's job
+    policy (:data:`names.RUNTIME_TAG` and the two beside it): a plan that destroys them no
+    longer has the build in the contract, or not on that runtime, and reads them from the
+    state to stop its runs first (``aws_spark_destroys``)."""
     key, ident = {
         "emr-serverless": ("applicationId", application_id),
         "glue": ("glueJobName", names.glue_job_name(b.ctx.product, b.build_id)),
@@ -680,7 +681,9 @@ def _emit_role(
                 "to the EMR cluster's instance-profile role or a step runtime role"
             ),
             "policy": policy,
-            "tags": b.tags,
+            # Its steps' cluster too: the policy goes when the build moves to another
+            # runtime, while its log group stays (``aws_spark_destroys``).
+            "tags": {**b.tags, **_run_identity(b, None)},
         }
         return None
     documents[f"{b.key}_trust"] = _trust(blocks, b, name, application_id)

@@ -236,7 +236,43 @@ def test_an_emr_on_ec2_build_that_goes_has_its_step_cancelled_first():
     emr.add_response(
         "describe_step", {"Step": _step("CANCELLED")}, {"ClusterId": "j-1ABCDEF", "StepId": "s-1"}
     )
+    # The policy an earlier forge wrote carries no target: the log group's is enough.
     said = run([log_group("emr-ec2", "clusterId=j-1ABCDEF"), job_policy()], clients)
+    clients.done()
+    assert said == [
+        f"  Spark {BUILD} (emr-ec2): stopped on EMR cluster j-1ABCDEF. cancelled s-1 before "
+        "the apply destroys what it runs with"
+    ]
+
+
+IDENTITY = {
+    names.RUNTIME_TAG: "emr-ec2",
+    names.RUN_TARGET_TAG: "clusterId=j-1ABCDEF",
+    names.RUN_REGION_TAG: REGION,
+}
+
+
+def test_the_job_policy_says_where_its_steps_run(contract):
+    resources, _ = emit(_runtime(contract, "emr-ec2"))
+    tags = resources["aws_iam_policy"][KEY]["tags"]
+    assert {k: tags[k] for k in IDENTITY} == IDENTITY
+
+
+def test_a_build_moved_off_emr_on_ec2_has_its_steps_cancelled_though_its_log_group_stays():
+    """Its job policy is what goes; the log group stays, and its tags now name the new
+    runtime."""
+    clients = Clients()
+    no_holders(clients)
+    emr = _ec2_running(clients)
+    emr.add_response(
+        "cancel_steps",
+        {"CancelStepsInfoList": [{"StepId": "s-1", "Status": "SUBMITTED"}]},
+        {"ClusterId": "j-1ABCDEF", "StepIds": ["s-1"], "StepCancellationOption": "SEND_INTERRUPT"},
+    )
+    emr.add_response(
+        "describe_step", {"Step": _step("CANCELLED")}, {"ClusterId": "j-1ABCDEF", "StepId": "s-1"}
+    )
+    said = run([job_policy(**IDENTITY)], clients)
     clients.done()
     assert said == [
         f"  Spark {BUILD} (emr-ec2): stopped on EMR cluster j-1ABCDEF. cancelled s-1 before "
@@ -437,6 +473,8 @@ def test_the_products_application_is_emptied_and_stopped_so_it_can_be_deleted():
     emr.add_response("get_application", _application("STARTED"), APP_ID)
     emr.add_response("cancel_job_run", {**APP_ID, "jobRunId": "jr1"}, {**APP_ID, "jobRunId": "jr1"})
     emr.add_response("get_job_run", _job_run("CANCELLED"), {**APP_ID, "jobRunId": "jr1"})
+    # Read again after the wait, which may have been long.
+    emr.add_response("get_application", _application("STARTED"), APP_ID)
     emr.add_response("stop_application", {}, APP_ID)
     emr.add_response("get_application", _application("STOPPED"), APP_ID)
     # The build's own runs are in that application: they go with it, not by name first.
@@ -542,17 +580,38 @@ def test_a_target_that_is_gone_holds_no_run():
     clients.done()
 
 
-def test_a_log_group_an_earlier_forge_wrote_is_a_note_naming_the_run():
-    tags = build_tags()  # no runtime: written before the log group said where runs are
+def test_a_build_an_earlier_forge_applied_is_one_note_naming_the_run():
+    tags = build_tags()  # no runtime: written before its resources said where runs are
     name = names.log_group_name(PRODUCT, BUILD)
     group = deleted("aws_cloudwatch_log_group", KEY, {"name": name, "region": REGION, "tags": tags})
     clients = Clients()
-    said = run([group], clients)
+    no_holders(clients)
+    said = run([group, job_policy()], clients)
     assert said == [
-        f"  note: Spark build {BUILD} goes, but its log group does not say where it runs (an "
-        f"apply by an earlier forge): stop its run {RUN_NAME} yourself if one is going."
+        f"  note: Spark build {BUILD} goes, but nothing it is destroyed with says where it runs "
+        f"(an apply by an earlier forge): stop its run {RUN_NAME} yourself if one is going."
     ]
-    assert clients.made == {}
+    assert set(clients.made) == {"iam"}  # the policy is checked; no run is looked up
+    clients.done()
+
+
+def test_only_the_removed_builds_runs_stop_in_an_application_that_stays():
+    """A domain's shared EMR Serverless application: the other runs in it go on."""
+    ours = {**_summary(), "id": "jr1", "name": RUN_NAME}
+    theirs = {**_summary(), "id": "jr9", "name": "fluid-other.product-load-1a2b3c4d"}
+    clients = Clients()
+    emr = clients.stub("emr-serverless")
+    emr.add_response("list_job_runs", {"jobRuns": [ours, theirs]}, {**APP_ID, "states": ACTIVE})
+    emr.add_response("list_job_runs", {"jobRuns": [ours, theirs]}, APP_ID)
+    emr.add_response("get_job_run", _job_run("RUNNING"), {**APP_ID, "jobRunId": "jr1"})
+    emr.add_response("cancel_job_run", {**APP_ID, "jobRunId": "jr1"}, {**APP_ID, "jobRunId": "jr1"})
+    emr.add_response("get_job_run", _job_run("CANCELLED"), {**APP_ID, "jobRunId": "jr1"})
+    said = run([log_group("emr-serverless", f"applicationId={APP}")], clients)
+    clients.done()  # jr9 was never cancelled: no call for it was stubbed
+    assert said == [
+        f"  Spark {BUILD} (emr-serverless): stopped on EMR Serverless application {APP}. "
+        "cancelled jr1 before the apply destroys what it runs with"
+    ]
 
 
 def test_a_plan_without_spark_destroys_asks_aws_nothing():

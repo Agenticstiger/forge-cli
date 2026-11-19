@@ -153,14 +153,18 @@ def stop_application(
                 out.message = f"would {runs}stop the application ({state})"
             return out
         _cancel_all(adapter, active, out, clock, budget)
-        if out.error or state in APPLICATION_IDLE:
+        if out.error:
+            return out
+        if active:  # read again: the wait was long enough for the application to move
+            state = adapter.application_state()
+        if state in APPLICATION_IDLE:
             return out
         out.state = _stopped(adapter, state, clock, budget)
         if out.state not in APPLICATION_IDLE:
             out.action, out.error = "failed", True
             out.message = (
-                f"the application was stopped but is still {out.state} after {int(budget)} s "
-                f"({WAIT_ENV})"
+                f"the application is still {out.state} after {int(budget)} s ({WAIT_ENV}), "
+                "and EMR Serverless deletes only a stopped or created one"
             )
         else:
             out.message = (out.message + "; " if out.message else "") + "stopped the application"

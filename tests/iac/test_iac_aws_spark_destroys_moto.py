@@ -162,9 +162,10 @@ def test_a_destroyed_application_is_emptied_and_stopped_before_tofu_deletes_it(
     rc = engine.apply_via_opentofu(_apply_args(plan, tmp_path, allow_data_loss=True), _LOG)
 
     assert rc == 0
-    out = capsys.readouterr().out
-    assert f"cancelled {job} before the apply destroys what it runs with" in out
-    assert "stopped the application" in out
     run = emr.get_job_run(applicationId=app["id"], jobRunId=job)["jobRun"]
     assert run["state"] == "CANCELLED"
     assert emr.get_application(applicationId=app["id"])["application"]["state"] == "TERMINATED"
+    # The console wraps its lines at the terminal's width.
+    out = " ".join(capsys.readouterr().out.split())
+    assert f"cancelled {job} before the apply destroys what it runs with" in out
+    assert "stopped the application" in out
