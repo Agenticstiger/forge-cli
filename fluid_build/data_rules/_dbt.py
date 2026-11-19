@@ -277,6 +277,11 @@ def placeholder_where(column: str, values: List[str], prefixes: List[str]) -> Op
     # Contract texts are compared in NFC (RFC 2.3), as the compiled placeholder rule reads them.
     column = nfc(column)
     values, prefixes = [nfc(v) for v in values], [nfc(p) for p in prefixes]
+    if any("\\" in text for text in [column, *values, *prefixes]):
+        # dbt rebuilds a test's config as code, config(where="<rendered text>"), escaping
+        # only the double quote: a backslash would end that string early. Leave the
+        # placeholders unexempted (stricter, never looser) rather than write one.
+        raise ValueError("a backslash in a placeholder or column name; no where is written")
 
     groups: Dict[str, List[str]] = {}
     for adapter, dialect in ADAPTERS.items():

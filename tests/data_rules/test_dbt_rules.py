@@ -540,3 +540,16 @@ def test_yaml_pairs_in_an_enum_are_escaped_too(tag: str) -> None:
     column = next(c for c in doc["models"][0]["columns"] if c["name"] == "status")
     values = next(t for t in column["tests"] if "accepted_values" in t)["accepted_values"]["values"]
     assert values[0][0] == _dbt.jinja_text(payload)
+
+
+def test_a_backslash_in_a_placeholder_writes_no_where() -> None:
+    contract = _billing()
+    status = next(c for c in contract["exposes"][0]["contract"]["schema"] if c["name"] == "status")
+    status["validationRules"] = [{"type": "enum", "constraint": "A, B"}]
+    status["placeholders"] = {
+        "values": ['\\") }}{{ exceptions.raise_compiler_error(env_var(dict(X=1)|first)) }}']
+    }
+    doc = yaml.safe_load(render_dbt_tests(contract))
+    column = next(c for c in doc["models"][0]["columns"] if c["name"] == "status")
+    accepted = next(t for t in column["tests"] if "accepted_values" in t)["accepted_values"]
+    assert "config" not in accepted  # no where: the placeholder is simply not exempt
