@@ -1354,9 +1354,14 @@ def _emit_caller_policy(
 #: What a forge Spark build runs with, by resource type and the end of its name in the module
 #: (the keys the emitters above write: ``<contract>_<build>_spark`` and what hangs off it, the
 #: product's ``<contract>_spark`` application, ``_spark_caller`` policy and ``_spark_logs``
-#: key, and the ``_lf_writer_<8 hex>`` registration role). None holds data: a destroy deletes
-#: runners, job configs, roles, policies, jobs, an application, and the build's log group with
-#: the key its logs are encrypted with. A bucket's own key ends in ``_kms`` and stays gated.
+#: key, the ``_lf_writer_<8 hex>`` registration role, and the job role's own Lake Formation
+#: grants: ``_lf_spark_writer_<table>_<n>`` on the table it writes and
+#: ``_lf_spark_dead_letters_<build>`` on its stream's dead-letter table, counted at plan where
+#: the account's settings decide them, so a plan names them ``...[0]``). None holds data: a
+#: destroy deletes runners, job configs, roles, policies, jobs, an application, grants, and the
+#: build's log group with the key its logs are encrypted with. A bucket's own key ends in
+#: ``_kms`` and stays gated, and a grant the binding's ``governance.lakeFormation`` declares
+#: (``_lf_grant_*``) is not the build's.
 _SPARK_DEFINITIONS: Dict[str, "re.Pattern[str]"] = {
     "aws_s3_object": re.compile(r"_spark_(runner|config)$"),
     "aws_s3_object_copy": re.compile(r"_spark_jar_[0-9]+$"),
@@ -1368,6 +1373,9 @@ _SPARK_DEFINITIONS: Dict[str, "re.Pattern[str]"] = {
     "aws_glue_job": re.compile(r"_spark$"),
     "aws_glue_connection": re.compile(r"_spark$"),
     "aws_emrserverless_application": re.compile(r"_spark$"),
+    "aws_lakeformation_permissions": re.compile(
+        r"_lf_spark_(writer_\w+_[0-9]+|dead_letters_\w+)(\[0\])?$"
+    ),
 }
 
 
