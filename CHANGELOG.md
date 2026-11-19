@@ -64,6 +64,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid apply` runs a dbt build whatever its trigger, finds the dbt that has its adapter, and
+  pins its container's image and packages.** A `dataset` or `schedule_and_dataset` build, which
+  `fluid generate schedule` renders a DAG for, failed under that DAG's `fluid apply --build-id`
+  with "Unknown trigger type", and so did `event`, `dependency` and `timetable`; the dbt and python
+  runners now run a build of every type a scheduler or an event starts once when apply asks (the
+  scheduler decides when), keep `manual` iterations, still refuse `continuous`, and refuse a
+  `trigger.type` that is not a name. An engine named after its PyPI distribution, such as
+  `dbt-athena-community`, was looked for as `athena-community`, so a local dbt with the athena
+  plugin was never used; the runner now asks for dbt's plugin name (`athena`), reads the adapter of
+  an engine without one (`dbt`, `dbt-core`) from every platform a profile is generated for, and
+  matches the `Plugins:` list of `dbt --version` exactly. When no local dbt has the adapter, the
+  container fallback runs `python:3.12-slim` pinned by digest and installs `dbt-core==1.11.17` and
+  an exact adapter pin from wheels only, run as `python -I -m pip --isolated` against PyPI, with no
+  pip config file and no `PIP_*` or project `PYTHON*` setting passed in (their dependencies resolve
+  within those packages' ranges); an adapter without a pin, a `DBT_ADAPTER_PACKAGE` that is not
+  exact pins, and a `DBT_DOCKER_IMAGE` or `DBT_BOOTSTRAP_IMAGE` without a digest are refused. For
+  athena, glue and redshift IAM, a dbt profile that names an AWS profile, or a run with no AWS keys
+  in the container's environment or the dbt profile and no container credentials endpoint, is
+  refused before `docker` starts, with the command that installs the adapter locally or exports
+  short-lived keys; `~/.aws` is never mounted, and the host-only AWS settings (`AWS_PROFILE`,
+  `AWS_DEFAULT_PROFILE`, `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, `AWS_CA_BUNDLE` and the
+  token-file paths) are not passed in.
+
 - **Removing a Spark build on AWS no longer needs `--allow-data-loss`.** The data-loss gate
   counted every resource a removed build ran with as data: its runner and job config objects,
   role and policies, log group and the key its logs are encrypted with, Glue job or connection,

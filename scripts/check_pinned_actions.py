@@ -290,7 +290,10 @@ def main() -> int:
         print(f"{len(stale_images)} image(s) moved:")
         for display, _old, new_digest in stale_images:
             print(f"  {display}: now sha256:{new_digest}")
-        print("\nUpdate PINNED_IMAGES in fluid_build/forge/core/pipeline_systems/_base.py")
+        print(
+            "\nUpdate PINNED_IMAGES in fluid_build/forge/core/pipeline_systems/_base.py "
+            "(python:3.12-slim also in BOOTSTRAP_IMAGE, fluid_build/build_runners/dbt/runner.py)"
+        )
         stale_rc = max(stale_rc, 1 if strict else 0)
 
     # An unpinned workflow action is always a hard failure; template staleness

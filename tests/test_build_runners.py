@@ -1048,11 +1048,13 @@ class TestContainerizedDbtCommand:
             profiles_dir,
         )
 
+        from fluid_build.forge.core.pipeline_systems._base import PINNED_IMAGES
+
         assert cmd[:3] == ["docker", "run", "--rm"]
         assert any("/workspace/project" in part for part in cmd)
         assert any("/workspace/profiles" in part for part in cmd)
-        assert "python:3.12-slim" in cmd
-        assert any("dbt-snowflake" in part for part in cmd)
+        assert PINNED_IMAGES["python:3.12-slim"] in cmd
+        assert "dbt-snowflake==" in cmd[-1]
 
     def test_env_forwarding_uses_key_only_form(self, tmp_path, monkeypatch):
         # `-e KEY` (no `=value`) keeps secrets out of argv (visible via `ps`).
@@ -1077,7 +1079,8 @@ class TestContainerizedDbtCommand:
     def test_uses_configured_docker_image_when_set(self, tmp_path, monkeypatch):
         project_dir = tmp_path / "project"
         project_dir.mkdir()
-        monkeypatch.setenv("DBT_DOCKER_IMAGE", "example/dbt-snowflake:custom")
+        image = "example/dbt-snowflake:custom@sha256:" + "0" * 64
+        monkeypatch.setenv("DBT_DOCKER_IMAGE", image)
 
         cmd = _build_containerized_dbt_command(
             "snowflake",
@@ -1086,60 +1089,31 @@ class TestContainerizedDbtCommand:
             None,
         )
 
-        assert "example/dbt-snowflake:custom" in cmd
-        assert "python:3.12-slim" not in cmd
+        assert image in cmd
+        assert not [part for part in cmd if part.startswith("python:3.12-slim")]
 
-    def test_adapter_with_shell_metacharacters_is_shell_quoted(self, tmp_path, monkeypatch):
-        """E2 regression: a contract-derived ``adapter`` is interpolated
-        into the ``sh -lc`` bootstrap string as ``pip install dbt-<adapter>``.
-
-        The bootstrap string is executed by a shell, so an ``adapter``
-        carrying ``;`` / backticks / ``$()`` must be ``shlex.quote``d —
-        otherwise a malicious contract could smuggle arbitrary commands
-        into the dbt container. Assert the metacharacters survive only
-        inside a single-quoted token (the ``shlex.quote`` form) and are
-        never left bare in the command string.
-        """
+    def test_adapter_with_shell_metacharacters_is_refused(self, tmp_path, monkeypatch):
+        """E2 regression: a contract-derived ``adapter`` used to reach the ``sh -lc``
+        bootstrap string as ``pip install dbt-<adapter>``. The fallback now
+        installs only pinned packages, so an adapter it has no pin for is refused
+        before any command is built, ``;`` / backticks / ``$()`` included."""
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         # Ensure the bootstrap (sh -lc) path is taken, not a pre-baked image.
         monkeypatch.delenv("DBT_DOCKER_IMAGE", raising=False)
         monkeypatch.delenv("DBT_ADAPTER_PACKAGE", raising=False)
 
-        hostile_adapter = "snowflake; rm -rf / #"
-        cmd = _build_containerized_dbt_command(
-            hostile_adapter,
-            ["build", "--project-dir", str(project_dir)],
-            project_dir,
-            None,
-        )
+        for hostile in ("snowflake; rm -rf / #", "duckdb`id`", "duckdb$(id)"):
+            with pytest.raises(RuntimeError, match="no pinned package"):
+                _build_containerized_dbt_command(
+                    hostile,
+                    ["build", "--project-dir", str(project_dir)],
+                    project_dir,
+                    None,
+                )
 
-        # The bootstrap path ends with ["...", "sh", "-lc", <script>].
-        assert cmd[-3:-1] == ["sh", "-lc"]
-        script = cmd[-1]
-
-        # The package name reaches the script as ``dbt-<hostile_adapter>``,
-        # and shlex.quote wraps any string with metacharacters in single
-        # quotes. The dangerous payload must be contained inside that
-        # single-quoted token — never appear as an unquoted shell command.
-        import shlex as _shlex
-
-        # forge appends a `<2` cap to the adapter spec, so assert the
-        # security property -- the payload stays one inert token -- rather
-        # than an exact package string that a legitimate pin change breaks.
-        expected_pkg = f"dbt-{hostile_adapter}<2"
-        assert _shlex.quote(expected_pkg) in script
-        # A bare (unquoted) ``rm -rf`` would mean shell injection. The only
-        # legitimate occurrence is inside the single-quoted package token.
-        assert "; rm -rf / #" not in script.replace(_shlex.quote(expected_pkg), "")
-
-        # Re-parsing the script with the shell lexer must yield the package
-        # as ONE token — proof the metacharacters did not split it.
-        assert expected_pkg in _shlex.split(script)
-
-    def test_backtick_and_dollar_paren_adapter_is_quoted(self, tmp_path, monkeypatch):
-        """E2: backtick and ``$()`` command-substitution forms are also
-        neutralised by the ``shlex.quote`` on the adapter package."""
+    def test_pinned_packages_reach_the_shell_quoted(self, tmp_path, monkeypatch):
+        """E2: what the script installs is shell-quoted, one token per pin."""
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         monkeypatch.delenv("DBT_DOCKER_IMAGE", raising=False)
@@ -1147,18 +1121,15 @@ class TestContainerizedDbtCommand:
 
         import shlex as _shlex
 
-        for hostile in ("duckdb`id`", "duckdb$(id)"):
-            cmd = _build_containerized_dbt_command(
-                hostile,
-                ["build", "--project-dir", str(project_dir)],
-                project_dir,
-                None,
-            )
-            script = cmd[-1]
-            expected_pkg = f"dbt-{hostile}<2"
-            # Single-quoting makes ``$`` and backticks literal to the shell.
-            assert _shlex.quote(expected_pkg) in script
-            assert expected_pkg in _shlex.split(script)
+        cmd = _build_containerized_dbt_command(
+            "duckdb",
+            ["build", "--project-dir", str(project_dir)],
+            project_dir,
+            None,
+        )
+        tokens = _shlex.split(cmd[-1])
+        assert "dbt-duckdb==1.11.1" in tokens
+        assert tokens[tokens.index("&&") + 1] == "dbt"
 
 
 class TestConfiguredDbtCommandPrefix:
