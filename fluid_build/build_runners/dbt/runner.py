@@ -745,11 +745,12 @@ def _profile_output(
     return output if isinstance(output, dict) else {}
 
 
-def _profile_name_value(value: Any) -> Optional[str]:
+def _profile_name_value(value: Any, env: Dict[str, str]) -> Optional[str]:
     """The AWS profile a dbt profile's ``aws_profile_name`` / ``iam_profile`` names.
 
     A literal is itself, and ``{{ env_var('NAME'[, 'default']) }}`` is read as dbt
-    renders it. Any other template is dbt's to render: ``None``, the run decides.
+    in the container renders it, from ``env`` (what the container gets). Any other
+    template is dbt's to render: ``None``, the run decides.
     """
     if not isinstance(value, str) or not value.strip():
         return None
@@ -759,7 +760,7 @@ def _profile_name_value(value: Any) -> Optional[str]:
     match = _ENV_VAR_TEMPLATE_RE.fullmatch(text)
     if match is None:
         return None
-    return os.getenv(match.group(1), match.group(2) or "").strip() or None
+    return (env.get(match.group(1)) or match.group(2) or "").strip() or None
 
 
 def _refuse_unreadable_aws_credentials(
@@ -781,7 +782,7 @@ def _refuse_unreadable_aws_credentials(
         (
             key
             for key in ("aws_profile_name", "iam_profile")
-            if _profile_name_value(output.get(key))
+            if _profile_name_value(output.get(key), container_env)
         ),
         None,
     )

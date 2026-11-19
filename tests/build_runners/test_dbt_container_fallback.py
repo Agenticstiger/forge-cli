@@ -326,6 +326,15 @@ class TestAwsCredentials:
         project = _project(tmp_path, _athena_output(**output))
         assert build_dbt_command({"engine": "dbt-athena-community"}, project)[0] == "docker"
 
+    def test_a_host_variable_the_container_lacks_names_no_profile(self, tmp_path, monkeypatch):
+        self._container(monkeypatch)
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEKEYID0000")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "example")
+        monkeypatch.setenv("LAKE_PROFILE", "host-only")  # no forwarded prefix
+        output = _athena_output(aws_profile_name="{{ env_var('LAKE_PROFILE', '') }}")
+        project = _project(tmp_path, output)
+        assert build_dbt_command({"engine": "dbt-athena-community"}, project)[0] == "docker"
+
     def test_keys_from_the_project_env_file_reach_the_container(self, tmp_path, monkeypatch):
         self._container(monkeypatch)
         exports = {"AWS_ACCESS_KEY_ID": "AKIAEXAMPLEKEYID0000", "AWS_SECRET_ACCESS_KEY": "x"}
@@ -339,8 +348,9 @@ class TestAwsCredentials:
         self._container(monkeypatch)
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEKEYID0000")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "example")
-        monkeypatch.setenv("LAKE_PROFILE", "secret-looking-name")
-        output = _athena_output(aws_profile_name="{{ env_var('LAKE_PROFILE') }}")
+        # DBT_* reaches the container, so dbt there renders the name from it.
+        monkeypatch.setenv("DBT_LAKE_PROFILE", "secret-looking-name")
+        output = _athena_output(aws_profile_name="{{ env_var('DBT_LAKE_PROFILE') }}")
         project = _project(tmp_path, output)
         with pytest.raises(RuntimeError) as exc:
             build_dbt_command({"engine": "dbt-athena-community"}, project)
