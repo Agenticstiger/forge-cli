@@ -54,6 +54,40 @@ def _pin_action(action_ref: str) -> str:
     return PINNED_ACTIONS.get(action_ref, action_ref)
 
 
+# Digest-pinned container images, for the same reason: a tag moves. Each entry
+# maps image:tag to image:tag@sha256:<digest of the multi-arch index>, with the
+# day it was resolved. scripts/check_pinned_actions.py checks them with the
+# action pins. Update these when the image is refreshed.
+PINNED_IMAGES = {
+    "python:3.12-slim": "python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b",  # 2026-11-19
+    "python:3.12": "python:3.12@sha256:5411fa1b302c43f510324381162b5f5d0d93b9ee2af538f09d944f0d290ee3cb",  # 2026-11-19
+    "cimg/python:3.12": "cimg/python:3.12@sha256:a78dfb790fe48e58b792c6499495de0630d33edb377a92840e726d40320a33ea",  # 2026-11-19
+}
+
+#: An image reference: ``[registry[:port]/]name[:tag][@sha256:<digest>]``.
+_IMAGE_REF_RE = re.compile(
+    r"(?:[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]{1,5})?/)?"
+    r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?"
+    r"(?:@sha256:[0-9a-f]{64})?"
+)
+
+
+def _pin_image(image_ref: str) -> str:
+    """Pin a container image reference to its digest for supply chain security."""
+    return PINNED_IMAGES.get(image_ref, image_ref)
+
+
+def check_image_ref(image_ref: str) -> str:
+    """``image_ref`` when it is an image reference; ``ValueError`` otherwise."""
+    if not isinstance(image_ref, str) or not _IMAGE_REF_RE.fullmatch(image_ref):
+        raise ValueError(
+            f"image {image_ref!r} is not an image reference "
+            "([registry/]name[:tag][@sha256:<digest>])"
+        )
+    return image_ref
+
+
 #: The six ``fluid apply --mode`` values, in the order the pipelines list them.
 APPLY_MODES: Tuple[str, ...] = (
     "dry-run",
@@ -192,12 +226,11 @@ class PipelineConfig:
     # generated pipeline can cd into that folder before running fluid commands.
     # None or "" => no cd wrapper (steps run at checkout root).
     workdir: Optional[str] = None
-    # Whether the pipeline should run `fluid generate transformation/schedule`
-    # in a dedicated "Generate Artifacts" stage. False for reference-only
-    # contracts (e.g. hybrid-reference dbt) where the transformation and
-    # schedule artifacts already exist externally and fluid shouldn't be
-    # asked to generate new ones.
+    # Whether stage 3 (`fluid generate artifacts`) runs by default. False only
+    # with ``fluid generate ci --no-generate-artifacts``.
     generates_artifacts: bool = True
+    # The container image the Tekton Task steps run. None: the pinned default.
+    image: Optional[str] = None
     # Install mode for the ``fluid`` CLI inside the Jenkins container.
     # Two values, picked explicitly at generation time — the generated
     # Jenkinsfile carries ONLY the install logic for the selected mode
@@ -539,8 +572,8 @@ class BasePipelineTemplate:
     @staticmethod
     def _stage_toggle_default(num: int, config: "PipelineConfig") -> bool:
         """Whether stage ``num`` runs by default: every stage but the opt-in
-        10 and 11, except stage 3 for a reference-only contract (fluid owns
-        no artifacts there). ``fluid generate ci`` sets 10 and 11 on request."""
+        10 and 11, except stage 3 under ``--no-generate-artifacts``.
+        ``fluid generate ci`` sets 10 and 11 on request."""
         if num == 3:
             return bool(config.generates_artifacts)
         if num == 10:
@@ -562,9 +595,9 @@ class BasePipelineTemplate:
           semantics so operators can pilot TestPyPI releases without
           editing Groovy or YAML).
         - ``dev-source`` mode: expects ``/forge-cli-src`` bind mount
-          with the forge-cli checkout; exports ``PYTHONPATH=/forge-cli-src``.
-          Fails loud with an actionable message if the mount is
-          missing. Only supported on systems that run self-hosted
+          with the forge-cli checkout and installs it editable
+          (``pip install -e``), which puts ``fluid`` on PATH. Fails loud
+          with an actionable message if the mount is missing. Only supported on systems that run self-hosted
           runners (GitHub Actions, GitLab, Azure DevOps, Tekton).
           Bitbucket / CircleCI pass this check with a warning because
           they're hosted-only; operators who need dev-source there
@@ -580,16 +613,23 @@ class BasePipelineTemplate:
         engine_pip = self._engine_pip_install_command(config)
         engine_install = f"\n{engine_pip}" if engine_pip else ""
         if mode == "dev-source":
+            # An editable install: it puts the ``fluid`` command on PATH and the
+            # checkout's dependencies in the interpreter, and imports resolve
+            # from the mount, so nothing has to outlive this script. A
+            # PYTHONPATH export did not: it died with the step (GitHub) or the
+            # ( ... ) subshell (Tekton, GitLab, Azure, Bitbucket, CircleCI), and
+            # it never provided the command.
             return (
                 "set -eu\n"
-                'if [ ! -d "/forge-cli-src" ]; then\n'
-                "  echo 'FATAL: dev-source install mode requires "
-                "/forge-cli-src bind mount' >&2\n"
+                "if [ ! -f /forge-cli-src/pyproject.toml ]; then\n"
+                "  echo 'FATAL: dev-source install mode requires the forge-cli "
+                "checkout mounted at /forge-cli-src' >&2\n"
                 "  exit 2\n"
                 "fi\n"
-                'export PYTHONPATH="/forge-cli-src:${PYTHONPATH:-}"\n'
-                'python -c "import fluid_build" || (echo \'FATAL: '
-                "fluid_build import failed; check /forge-cli-src' >&2 && exit 3)\n"
+                "python -m pip install --quiet -e /forge-cli-src || "
+                "{ echo 'FATAL: pip install -e /forge-cli-src failed (it needs a package "
+                "index, or setuptools and setuptools-scm installed with "
+                "PIP_NO_BUILD_ISOLATION=0)' >&2; exit 3; }\n"
                 "fluid --version" + engine_install
             )
         # pypi mode — TestPyPI overrides + optional --pre. Each value is ONE

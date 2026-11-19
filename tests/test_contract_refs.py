@@ -1047,7 +1047,6 @@ def test_generate_ci_reads_a_split_contract_whole(tmp_path: Path) -> None:
     )
     path = _write(tmp_path / "contract.fluid.yaml", yaml.safe_dump(contract, sort_keys=False))
 
-    assert generate_ci._contract_is_reference_only(str(path)) is True
     assert generate_ci._extract_engine_context(str(path))["engine"] == "dbt"
 
 

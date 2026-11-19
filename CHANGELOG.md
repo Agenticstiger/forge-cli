@@ -371,6 +371,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid generate ci` runs stage 3 for a contract with reference builds.** It turned
+  `RUN_STAGE_3_GENERATE_ARTIFACTS` off when any build was `hybrid-reference`, `reference` or
+  `external-reference`, so a contract with Spark builds beside one reference dbt build skipped
+  stage 4 and ran stages 8 and 11 without `dist/artifacts/policy/bindings.json` and
+  `dist/artifacts/schedule/`. `fluid generate artifacts` writes both for reference builds too,
+  so only `--no-generate-artifacts` turns stage 3 off now.
+- **`--install-mode dev-source` puts `fluid` on PATH.** On GitHub, GitLab, Azure DevOps,
+  Bitbucket, CircleCI and Tekton the install step exported `PYTHONPATH=/forge-cli-src`, which
+  ended with the step or subshell and never provided the command, so every `fluid ship` step
+  failed with "command not found". It now runs `pip install -e /forge-cli-src`, and a missing
+  mount or a failed install stops the job. Jenkins is unchanged.
+- **Generated pipelines pin their container images by digest.** Tekton, GitLab (both images),
+  Bitbucket and CircleCI named `python:3.12-slim`, `python:3.12` and `cimg/python:3.12` by tag;
+  each is now `<tag>@sha256:<index digest>`, kept beside the GitHub action pins and checked by
+  the same monthly job. `fluid generate ci --system tekton --image IMAGE` sets the Task image.
+
 - **`fluid validate` stops warning about a Spark or managed Flink build's own SQL once the
   operator lists it.** The warning that `properties.sql` runs only if the operator lists the
   build was printed for every build with SQL, whatever `FLUID_SPARK_CONTRACT_SQL_ALLOWLIST`
