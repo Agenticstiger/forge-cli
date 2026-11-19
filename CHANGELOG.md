@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid ship` keeps a stage journal, and a rerun never repeats a change nobody can account
+  for.** With `--journal-dir DIR` (and always with `--release-dir`, in `.fluid/ship-journal`),
+  each stage leaves a `started` event, fsynced before it runs, and a `finished` event with its
+  status, exit code and receipts: the digest of each report it wrote, the plan's digests, and
+  the lineage and serial of each local OpenTofu state. One append-only file per release (the
+  bundle's digest) under `DIR/<product>/<env>/`; a line cut off by a crash is ignored, and one
+  run at a time holds a target. Before apply, enforcing policy-apply, publish or schedule-sync
+  runs again, ship reads it: an attempt in any release of the target that started and has no
+  known outcome (interrupted, killed, a CI timeout) refuses the stage until
+  `--acknowledge-inspected STAGE`, which the journal records; an unknown apply blocks the
+  stages after it the same way. An apply that did not pass is refused until stage 6 has
+  planned again. Read-only stages always rerun, and nothing is rolled back. `--explain` shows
+  the journal and what it would refuse; the run report and the release's provenance name it.
+  Without either flag nothing changes.
+
 - **A BigQuery table is partitioned and clustered as its binding declares.**
   `binding.location.partitionBy` was read only with `lifecycle.expire`, and
   `binding.properties.cluster_by` (honoured on Snowflake) was read by nobody on BigQuery. Both

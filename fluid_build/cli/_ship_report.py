@@ -119,6 +119,7 @@ def build_report(
     contract: str,
     exit_code: int,
     release: Optional[Dict[str, Any]] = None,
+    journal: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     return {
         "schema": REPORT_SCHEMA,
@@ -130,6 +131,7 @@ def build_report(
         "exit_code": exit_code,
         "stages": [r.as_dict() for r in records],
         **({"release": release} if release is not None else {}),
+        **({"journal": journal} if journal is not None else {}),
     }
 
 
