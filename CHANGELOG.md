@@ -213,7 +213,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--explain` says why. A release run reads only local files: it opens no network connection
   of its own.
 
+- **`fluid verify --require-every-port` fails unless every expose was verified.** `--strict`
+  fails only a run that verified nothing, so a run that verified one port passed while its
+  others were skipped. With the flag, each skipped expose fails the run (exit 1) and is named
+  with why: no verifier for the binding, a reference-only table not built yet, an entry with
+  no `exposeId` (never checked), or an id declared twice. A contract with no expose fails too.
+  A managed streaming contract keeps its whole-contract check from checkpoint evidence, and
+  the run says so.
+  The run's message names every one of them. It needs no
+  `--strict`, `--warn-only` does not downgrade it, and `--expose` beside it is refused (exit
+  2). The `--out` report lists the unverified exposes under `require_every_port`. `fluid ship
+  --release-dir` passes it to stage 9, so a release never stands for a port nobody verified.
+
 ### Changed
+
+- **A test run installs each OpenTofu provider once, and passing tests clean up after
+  themselves.** The tests that run `tofu init` put a copy of the provider into every test's
+  own directory (0.75 GB for `hashicorp/aws`, downloaded each time), so one run of `tests/iac`
+  wrote 15-31 GB into pytest's basetemp. A run now shares one provider cache between all its
+  workers (`tests/_infrastructure/tofu_cache.py`): a test directory holds a symlink, and
+  `TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE` is set because without a lock file OpenTofu
+  downloads a cached provider again on every `init`. A `TF_PLUGIN_CACHE_DIR` you set is used as
+  given, which keeps providers between runs. `tmp_path_retention_policy = "failed"` removes a
+  passing test's directory when the test ends; a failed test keeps its own. Test
+  infrastructure only: the product is unchanged.
 
 - **`ship-report.json` is versioned: `"schema": "fluid-ship-report/2"`.** Every stage has one
   of six statuses: `passed`, `failed`, `skipped-by-policy` (a flag, a `RUN_STAGE_*` switch or
@@ -277,6 +300,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Each contract with a BigQuery table gains one `terraform_data` that records this, so that plan
   adds one more resource. After it, a new decimal column, a changed precision and a decimal made
   bare are planned in place, and BigQuery refuses at apply a change it cannot make in place.
+
+- **`fluid validate` stops warning about a Spark or managed Flink build's own SQL once the
+  operator lists it.** The warning that `properties.sql` runs only if the operator lists the
+  build was printed for every build with SQL, whatever `FLUID_SPARK_CONTRACT_SQL_ALLOWLIST`
+  (or `FLUID_FLINK_CONTRACT_SQL_ALLOWLIST`) held, so `fluid validate --strict`, and with it
+  stage 2 of `fluid ship`, failed every Spark SQL batch even after the operator listed it.
+  Validate now asks the rule apply uses, under the same environment: the warning stays while
+  the build is not listed, and says so when the entry listed for it pins other SQL (the SQL
+  changed after review); a build listed by product, by build or pinned to its SQL is quiet.
+
+- **A Spark build runs on EMR on EKS.** EMR on EKS names an image of a release,
+  `emr-X.Y.Z-latest` or `emr-X.Y.Z-YYYYMMDD`, and forge sent it the plain `emr-7.12.0` every
+  other EMR runtime takes, refusing the suffixed forms everywhere (the 0.7.7 schema, the IaC
+  checks). Each EMR runtime now takes its own form, and an `emr-eks` build without
+  `releaseLabel` runs on `emr-7.12.0-latest`; EMR Serverless and EMR on EC2 keep `emr-7.12.0`.
 
 - **A Spark stream on AWS can read its own checkpoint.** The role forge creates for a Spark build
   could read and write `<prefix>/*` and list `<prefix>/*`, but Hadoop's `getFileStatus` first asks
