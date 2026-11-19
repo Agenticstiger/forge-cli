@@ -75,8 +75,6 @@ enforces the boundary).
 
 from __future__ import annotations
 
-import datetime
-import re
 from dataclasses import dataclass, field
 from typing import Any, List, Mapping, Sequence
 
@@ -91,6 +89,9 @@ from ..engines.dbt import _test_mapping as _tm
 # Fusion requires the modern spelling). Single source of truth so this
 # exporter and the engine emitters cannot drift.
 from ..engines.dbt.schema_yml import TESTS_KEY_LEGACY, normalize_tests_key
+
+# Contract text reaches dbt as text, never as Jinja it would run (one helper, every path).
+from ..util.dbt_jinja import GeneratedJinja, inert
 
 # Block sentinel — the runner uses this to detect a managed file and refuse
 # to clobber a hand-edited one.
@@ -161,7 +162,7 @@ def render_project_tests(contract: Mapping[str, Any], *, tests_key: str | None =
             if "columns" in model:
                 model["columns"] = model.pop("columns")
 
-    doc: dict[str, Any] = {"version": 2, "models": _inert_jinja(models)}
+    doc: dict[str, Any] = {"version": 2, "models": inert(models)}
     body = yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)
     text = (
         f"{MANAGED_BY_SENTINEL}\n"
@@ -362,63 +363,4 @@ def _exempt_placeholders(col: Mapping[str, Any], tests: list[Any]) -> list[Any]:
         return tests
     from ..data_rules._dbt import exempt_placeholders
 
-    return exempt_placeholders(col, tests, _GeneratedJinja)
-
-
-_JINJA_DELIMITERS = ("{{", "{%", "{#")
-#: dbt also evaluates a test argument that looks like one of these calls, braces or not
-#: (``dbt.clients.jinja.add_rendered_test_kwargs``): an enum value ``env_var('SECRET')`` would
-#: read the variable.
-_LOOKS_LIKE_CALL = re.compile(r"^\s*(env_var|ref|var|source|doc)\s*\(.+\)\s*$", re.S)
-#: The ``relationships`` test's own ``ref('<model>')``, kept when the model is a plain name.
-_OWN_REF = re.compile(r"ref\('[A-Za-z0-9_]+'\)")
-
-
-class _GeneratedJinja(str):
-    """Jinja this module built from literals (a placeholder ``where``): left as written."""
-
-
-def _inert_jinja(value: Any) -> Any:
-    """``value`` with every string that holds a Jinja delimiter written as a Jinja string
-    literal of itself (:func:`fluid_build.data_rules._dbt.jinja_text`).
-
-    dbt renders a schema.yml's names, descriptions and test arguments as Jinja, so a column
-    named ``x{{ env_var('SECRET') }}`` or an enum value holding ``{%`` would run during
-    ``dbt parse``, and so would a test argument that is a bare ``env_var(...)``-style call.
-    Every other string is left as written, so the file for every other contract is
-    unchanged; so is the ``relationships`` test's own ``ref('<model>')`` when the model is a
-    plain name (any other model name is a literal, and the test then names no model).
-    The ``fluid_rule`` test bodies are already Jinja built from literals; they are known by
-    their type (``GeneratedTest``), never by a key name, which a contract could also write.
-    """
-    if isinstance(value, _GeneratedJinja):
-        return str(value)
-    from ..data_rules._dbt import GeneratedTest
-
-    if isinstance(value, GeneratedTest):
-        return _plain(value)
-    if isinstance(value, str):
-        unsafe = any(d in value for d in _JINJA_DELIMITERS) or _LOOKS_LIKE_CALL.match(value)
-        if unsafe and not _OWN_REF.fullmatch(value):
-            from ..data_rules._dbt import jinja_text
-
-            return jinja_text(value)
-        return value
-    if isinstance(value, Mapping):
-        return {key: _inert_jinja(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set, frozenset)):
-        # YAML's !!pairs and !!omap load as tuples, and dbt renders the strings inside
-        # whatever list safe_dump makes of them.
-        return [_inert_jinja(item) for item in value]
-    if value is None or isinstance(value, (bool, int, float, datetime.date)):
-        return value
-    return _inert_jinja(str(value))  # any other type: its text, escaped like any text
-
-
-def _plain(value: Any) -> Any:
-    """``value`` as plain dicts, lists and strings (yaml.safe_dump takes no subclass)."""
-    if isinstance(value, Mapping):
-        return {str(key): _plain(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_plain(item) for item in value]
-    return str(value) if isinstance(value, str) else value
+    return exempt_placeholders(col, tests, GeneratedJinja)

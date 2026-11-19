@@ -348,6 +348,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An `enum` value holding a quote or a backslash no longer breaks dbt's `accepted_values`
+  test.** dbt pastes each value between single quotes unescaped, so `O'Brien` ended the string
+  and the rest ran as SQL. Such a column's values are now written with `quote: false`, each as
+  the SQL string literal of the adapter that runs it (DuckDB, Snowflake, BigQuery, Databricks,
+  Postgres, Athena and Trino, with a standard literal for any other adapter), in both
+  `fluid generate dbt-tests` and the dbt engine. Columns whose values hold neither are written
+  as before.
+
 - **`fluid validate` stops warning about a Spark or managed Flink build's own SQL once the
   operator lists it.** The warning that `properties.sql` runs only if the operator lists the
   build was printed for every build with SQL, whatever `FLUID_SPARK_CONTRACT_SQL_ALLOWLIST`
@@ -412,6 +420,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   way, beside the keys it already wrote.
 
 ### Security
+
+- **The dbt engine writes no contract text that dbt would run as Jinja.** The schema.yml and
+  sources.yml that `fluid generate transformation` writes for a dbt build now pass through the same
+  escaping as `fluid generate dbt-tests` (one shared helper, `util/dbt_jinja.py`): a model or
+  column name, description, enum value or source field from a contract that holds `{{`,
+  `{%` or `{#`, or looks like `env_var(...)`, `var(...)`, `ref(...)`, `source(...)` or
+  `doc(...)`, is written as a Jinja string literal of itself. The engine's own `ref(...)`,
+  `env_var(...)` database and schema expressions and the placeholders a contract may use for
+  them (`{{ env.X }}`, `${X}`, `{{ env_var('X') }}`) still render; any other text around a
+  placeholder is a literal.
 
 - **`fluid generate dbt-tests` writes no contract text that dbt would run as Jinja.** dbt
   renders a schema.yml's names, descriptions and test arguments as Jinja, and evaluates a test

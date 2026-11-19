@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 import yaml
 
+from fluid_build.util.dbt_jinja import GeneratedJinja, inert
+
 from ..base import GenerationResult
 
 # The single shared contract → dbt-test mapping. Reached via module attribute
@@ -309,7 +311,8 @@ def generate_schema_yml(
 
     out: GenerationResult = {}
     if model_defs:
-        data = {"version": 2, "models": model_defs}
+        # Contract text is written as text dbt never runs (fluid_build/util/dbt_jinja.py).
+        data = {"version": 2, "models": inert(model_defs)}
         content = _HEADER + yaml.dump(
             data, default_flow_style=False, sort_keys=False, allow_unicode=True
         )
@@ -332,7 +335,7 @@ def _mesh_only_output(mesh_hub: str) -> GenerationResult:
     dbt environment — typically by adding it as a package or installing
     it via ``dbt deps``. This file just declares the participation.
     """
-    data = {"projects": [{"name": mesh_hub}]}
+    data = {"projects": [{"name": inert(mesh_hub)}]}
     content = _HEADER + yaml.dump(
         data, default_flow_style=False, sort_keys=False, allow_unicode=True
     )
@@ -486,5 +489,5 @@ def _tests_for_column(
         # A placeholder is exempt from the column's own value checks (RFC-data-rules.md 4).
         from fluid_build.data_rules._dbt import exempt_placeholders
 
-        tests = exempt_placeholders(col_def, tests)
+        tests = exempt_placeholders(col_def, tests, GeneratedJinja)
     return tests

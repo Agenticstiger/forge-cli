@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, 
 
 import yaml
 
+from fluid_build.util.dbt_jinja import GeneratedJinja, inert, jinja_text
 from fluid_build.util.freshness import iso_duration_to_freshness_unit
 from fluid_build.util.upstream_discovery import discover_upstream_products
 
@@ -79,6 +80,12 @@ except ImportError:  # pragma: no cover
 _FLUID_ENV_RE = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 # Matches ``${FOO}`` (shell-style placeholder) and ``$FOO``.
 _SHELL_ENV_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+#: Either placeholder shape, in one pass (FLUID's first, as before).
+_PLACEHOLDER_RE = re.compile(
+    r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}|\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"
+    # dbt's own form, which a contract may already use: a name, and a plain default.
+    r"|\{\{\s*env_var\(\s*'([A-Za-z_][A-Za-z0-9_]*)'(?:\s*,\s*'([A-Za-z0-9_.\-/ ]*)')?\s*\)\s*\}\}"
+)
 
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -147,8 +154,8 @@ def _unresolved_upstream_placeholders(
         else "{{ env_var('FLUID_SOURCE_SCHEMA', target.schema) }}"
     )
     return {
-        "database_expr": db,
-        "schema_expr": schema,
+        "database_expr": GeneratedJinja(db),
+        "schema_expr": GeneratedJinja(schema),
         # Only Snowflake upper-cases unquoted identifiers; BigQuery and DuckDB
         # are case-sensitive, so upper-casing there breaks the reference.
         "identifier": (
@@ -266,7 +273,7 @@ def generate_sources(
     }
 
     return _HEADER + yaml.dump(
-        source_def, default_flow_style=False, sort_keys=False, allow_unicode=True
+        inert(source_def), default_flow_style=False, sort_keys=False, allow_unicode=True
     )
 
 
@@ -309,13 +316,16 @@ def generate_sources_from_logical_model(logical_model: Mapping[str, Any]) -> Opt
             {
                 "name": "raw",
                 "description": "Source tables inferred from the forged DDL sidecar",
-                "schema": "{{ env_var('FLUID_SOURCE_SCHEMA', env_var('SNOWFLAKE_STAGE_SCHEMA', target.schema)) }}",
+                "schema": GeneratedJinja(
+                    "{{ env_var('FLUID_SOURCE_SCHEMA', env_var('SNOWFLAKE_STAGE_SCHEMA', "
+                    "target.schema)) }}"
+                ),
                 "tables": tables,
             }
         ],
     }
     return _HEADER + yaml.dump(
-        source_def, default_flow_style=False, sort_keys=False, allow_unicode=True
+        inert(source_def), default_flow_style=False, sort_keys=False, allow_unicode=True
     )
 
 
@@ -407,9 +417,31 @@ def _normalize_placeholder(value: Any) -> Optional[str]:
     if not text:
         return None
 
-    text = _FLUID_ENV_RE.sub(lambda m: f"{{{{ env_var('{m.group(1)}') }}}}", text)
-    text = _SHELL_ENV_RE.sub(lambda m: f"{{{{ env_var('{m.group(1)}') }}}}", text)
-    return text
+    # Each placeholder becomes env_var('<NAME>') (the name matches [A-Za-z_][A-Za-z0-9_]*);
+    # the text around it is contract text, so where dbt would read it as Jinja it becomes a
+    # Jinja literal of itself (fluid_build/util/dbt_jinja.py). Plain text stays as written.
+    parts: List[str] = []
+    last = 0
+    for match in _PLACEHOLDER_RE.finditer(text):
+        parts.append(_literal_piece(text[last : match.start()]))
+        name = match.group(1) or match.group(2) or match.group(3)
+        default = match.group(4)
+        parts.append(
+            f"{{{{ env_var('{name}', '{default}') }}}}"
+            if default is not None
+            else f"{{{{ env_var('{name}') }}}}"
+        )
+        last = match.end()
+    parts.append(_literal_piece(text[last:]))
+    return GeneratedJinja("".join(parts))
+
+
+def _literal_piece(text: str) -> str:
+    """Contract text between placeholders: as written, or a Jinja literal of itself where
+    it holds a brace or a percent sign dbt could read as Jinja."""
+    if not text or not any(c in text for c in "{}%#"):
+        return text
+    return jinja_text(text)
 
 
 # ---------------------------------------------------------------------------

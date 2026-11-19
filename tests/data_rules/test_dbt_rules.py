@@ -490,8 +490,14 @@ def test_a_bare_call_or_a_ref_breakout_from_a_contract_is_a_literal() -> None:
     ]
     doc = yaml.safe_load(render_dbt_tests(contract))
     column = next(c for c in doc["models"][0]["columns"] if c["name"] == "status")
-    values = next(t for t in column["tests"] if "accepted_values" in t)["accepted_values"]["values"]
-    assert values[1].startswith("{{ ") and jinja2.Template(values[1]).render() == "env_var('HOME')"
+    accepted = next(t for t in column["tests"] if "accepted_values" in t)["accepted_values"]
+    # A value holding a quote is written as an adapter's SQL literal, so dbt splices it as is.
+    assert accepted["quote"] is False
+    env = jinja2.Environment()
+    for adapter in ("duckdb", "snowflake", "postgres"):
+        target = SimpleNamespace(type=adapter)
+        rendered = [env.from_string(v).render(target=target) for v in accepted["values"]]
+        assert rendered == ["'A'", "'env_var(''HOME'')'"]
     rel = next(t for t in column["tests"] if "relationships" in t)["relationships"]
     assert rel["to"] == "ref('contracts')"  # the exporter's own ref stays a ref
     status["validationRules"][1]["constraint"] = "references x') }}{{ y.contract_id"
