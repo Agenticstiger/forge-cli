@@ -83,6 +83,7 @@ from fluid_build.forge_datamodel.semantics_builder import (
     metricflow_name,
     validity_window,
 )
+from fluid_build.util.dbt_jinja import GeneratedJinja, dbt_name, inert
 
 from ..base import GenerationResult
 from . import _test_mapping as _tm
@@ -647,7 +648,9 @@ def _build_metrics(
             metric["description"] = str(raw["description"])
         metric["type_params"] = type_params
         if raw.get("filter"):
-            metric["filter"] = str(raw["filter"])
+            # dbt never renders a metric's filter (SchemaYamlRenderer skips it): MetricFlow
+            # reads its {{ Dimension(...) }} template itself, in a sandbox.
+            metric["filter"] = GeneratedJinja(str(raw["filter"]))
         if raw.get("owner"):
             # Contract governance surfaces in dbt as config.meta — accepted
             # by dbt parse (verified 1.11) and round-tripped by the manifest
@@ -865,7 +868,9 @@ def generate_semantic_models(
 
         model_def: Dict[str, Any] = {
             "name": model_name,
-            "model": f"ref('{expose_id}')",
+            # dbt renders ``{{ <model> }}``, so the exposeId must not be able to end the
+            # quoted name (fluid_build/util/dbt_jinja.py).
+            "model": GeneratedJinja(f"ref('{dbt_name(expose_id, 'exposeId')}')"),
         }
         description = semantics.get("description") or expose.get("description")
         if description:
@@ -911,9 +916,10 @@ def generate_semantic_models(
 
     all_metrics.extend(_resolve_deferred_metrics(deferred_metrics, emitted_metric_names))
 
-    data: Dict[str, Any] = {"semantic_models": semantic_models}
+    # Contract text is written as text dbt never runs (fluid_build/util/dbt_jinja.py).
+    data: Dict[str, Any] = {"semantic_models": inert(semantic_models)}
     if all_metrics:
-        data["metrics"] = all_metrics
+        data["metrics"] = inert(all_metrics)
     # MetricFlow refuses to parse a project with semantic models but no
     # day-grain (or smaller) time spine. Ship one + its YAML config.
     data["models"] = [_TIME_SPINE_MODEL_DEF]

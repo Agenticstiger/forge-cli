@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 from fluid_build import fluid_sql as fs
 
+from ..util.dbt_jinja import GeneratedMapping, jinja_literal, jinja_text
 from ._compile import EXECUTABLE, Band, Rule, _literal, _Refused, compile_rules
 
 #: dbt adapter type (``target.type``) -> the FLUID SQL/1 dialect its SQL is written in.
@@ -94,7 +95,7 @@ _NUL = chr(0)
 _SENTINEL = re.compile(_NUL + "([0-9]+)" + _NUL)
 
 
-class GeneratedTest(dict):
+class GeneratedTest(GeneratedMapping):
     """A ``fluid_rule`` test body this module built: its strings are already Jinja made
     from literals. A caller that escapes contract text recognises it by type, never by a
     key name a contract could also write."""
@@ -109,30 +110,6 @@ class Skipped:
     expose: str
     reason: str
     adapters: Tuple[str, ...] = ()
-
-
-def jinja_text(text: str) -> str:
-    r"""``text`` as one Jinja expression that renders exactly ``text``: a double-quoted
-    string literal with ``\`` and ``"`` escaped and every character outside printable ASCII
-    written as a ``\u`` or ``\U`` escape (Jinja decodes a literal with ``unicode-escape``),
-    so no ``{{``, ``{%`` or ``{#`` from a contract reaches Jinja as syntax."""
-    return "{{ " + _jinja_literal(text) + " }}"
-
-
-def _jinja_literal(text: str) -> str:
-    out = []
-    for char in text:
-        if char == "\\":
-            out.append("\\\\")
-        elif char == '"':
-            out.append('\\"')
-        elif " " <= char <= "~":
-            out.append(char)
-        elif ord(char) < 0x10000:
-            out.append(f"\\u{ord(char):04x}")
-        else:
-            out.append(f"\\U{ord(char):08x}")
-    return '"' + "".join(out) + '"'
 
 
 def holds_sql(dialect: str, band: Band) -> str:
@@ -170,7 +147,7 @@ def _jinja_sql(sql: str, refs: List[str]) -> str:
     for match in _SENTINEL.finditer(sql):
         if match.start() > last:
             parts.append(jinja_text(sql[last : match.start()]))
-        parts.append("{{ ref(" + _jinja_literal(refs[int(match.group(1))]) + ") }}")
+        parts.append("{{ ref(" + jinja_literal(refs[int(match.group(1))]) + ") }}")
         last = match.end()
     if last < len(sql):
         parts.append(jinja_text(sql[last:]))
@@ -290,7 +267,7 @@ def placeholder_where(column: str, values: List[str], prefixes: List[str]) -> Op
     for dialect, adapters in groups.items():
         name = fs.sql_name(dialect, column)
         sql = f"NOT {placeholder_sql(dialect, name, values, prefixes)}"
-        listed = ", ".join(_jinja_literal(a) for a in adapters)
+        listed = ", ".join(jinja_literal(a) for a in adapters)
         branches.append((listed, jinja_text(sql)))
     text = ""
     for i, (listed, sql) in enumerate(branches):
