@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import logging
 
 import pytest
@@ -144,6 +145,14 @@ def test_unknown_primary_settings_give_no_masters_verdict(caplog):
     with caplog.at_level(logging.DEBUG, logger=po.LOG.name):
         assert codes(p) == [CORE_SPOT]
     assert "spark_cluster_posture_am_unknown" in caplog.text
+
+
+def test_a_value_read_from_the_cluster_is_quoted_when_it_holds_a_control_character():
+    p = posture(spot={"TASK"}, yarn={po.ENABLED: "true", po.AM_LABEL: "GPU\x1b[2J"})
+    problem, _ = text_of(p, AM_UNPINNED)
+    assert "\x1b" not in problem and "'GPU\\x1b[2J'" in problem
+    p = posture(spot={"TASK"}, yarn={po.ENABLED: "no\x07"})
+    assert "'no\\x07'" in text_of(p, AM_UNPINNED)[0]
 
 
 @pytest.mark.parametrize(
@@ -367,6 +376,21 @@ def test_the_credentials_region_places_a_run_whose_output_names_none(ec2, monkey
 
 
 @aws
+def test_a_region_lookup_that_fails_any_way_reads_nothing(ec2, monkeypatch, caplog):
+    """A named profile that does not exist raises botocore's own error, not ValueError."""
+    from botocore.exceptions import ProfileNotFound
+
+    def missing_profile():
+        raise ProfileNotFound(profile="nope")
+
+    monkeypatch.setattr("fluid_build.build_runners.spark._desired.resolve_region", missing_profile)
+    unplaced = dataclasses.replace(ec2, region=REGION_TOKEN)
+    with caplog.at_level(logging.DEBUG, logger=po.LOG.name):
+        assert po.cluster_findings([unplaced], clients=forbidden) == []
+    assert "error=ProfileNotFound" in caplog.text
+
+
+@aws
 def test_the_reads_are_bounded():
     config = po.posture_clients("emr", "eu-west-1").meta.config
     assert (config.connect_timeout, config.read_timeout) == (3, 10)
@@ -443,6 +467,24 @@ def test_each_finding_is_one_warning_and_one_log_event(ec2, said, monkeypatch, c
     assert record.spark["code"] == PRIMARY_SPOT
 
 
+def test_a_posture_check_that_fails_never_fails_plan_or_apply(
+    ec2, contract, said, monkeypatch, caplog
+):
+    def broken(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(po, "cluster_findings", broken)
+    with caplog.at_level(logging.DEBUG, logger=LOG.name):
+        _apply.warn_cluster_posture([ec2], LOG, dry_run=False)
+        monkeypatch.setattr(_apply, "_desired", broken)
+        _apply.plan_posture(_ec2_contract(contract), LOG)
+        monkeypatch.setattr(_apply, "_has_spark", broken)
+        _apply.plan_posture(contract, LOG)
+    assert said == []
+    assert "spark_cluster_posture_failed error=RuntimeError" in caplog.text
+    assert caplog.text.count("spark_cluster_posture_skipped reason=uncompiled") == 2
+
+
 def _ec2_contract(contract):
     spark_cfg(contract).update(runtime="emr-ec2", clusterId="j-ABC")
     return contract
@@ -486,7 +528,19 @@ def test_fluid_plan_warns_and_keeps_the_warning_out_of_plan_json(
     assert [line.split(":")[0] for line in said] == [
         "EMR cluster j-ABC (Spark build ingest-orders)"
     ]
-    assert "Spot" not in out.read_text(encoding="utf-8")
+    # The same plan from a cluster with nothing to warn about: one plan.json.
+    monkeypatch.setattr(po, "cluster_findings", lambda runs, clients=None: [])
+    quiet = tmp_path / "quiet.json"
+    assert plan_cli.run(argparse.Namespace(**{**vars(args), "out": str(quiet)}), LOG) == 0
+    assert len(said) == 1
+    assert _stable(json.loads(out.read_text(encoding="utf-8"))) == _stable(
+        json.loads(quiet.read_text(encoding="utf-8"))
+    )
+
+
+def _stable(plan):
+    """A plan without its time and the digest that covers it."""
+    return {k: v for k, v in plan.items() if k not in ("generated_at", "planDigest")}
 
 
 @aws

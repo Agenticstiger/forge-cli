@@ -13,7 +13,8 @@
 | ``core-spot`` | core nodes run on Spot: their HDFS blocks and containers go with an interruption |
 | ``am-unpinned`` | core or task nodes run on Spot, and the yarn-site lets application masters use them |
 
-YARN node labels keep application masters off Spot. Both settings are in ``yarn-site``:
+An application master has to live as long as its job (Amazon EMR's reason for keeping masters
+off Spot task nodes). YARN node labels keep application masters off Spot. Both settings are in ``yarn-site``:
 ``yarn.node-labels.enabled`` ``true``, and ``yarn.node-labels.am.default-node-label-expression``
 ``ON_DEMAND`` (EMR labels each node by its market from release 7.0, and managed scaling places
 masters by that label from 7.2) or ``CORE`` (any release, safe while the core nodes are all
@@ -196,6 +197,11 @@ def _label_defaults(release: Release) -> Tuple[str, str]:
     return "false", ""
 
 
+def _shown(value: str) -> str:
+    """A value read from the cluster, as printed: quoted when it holds a control character."""
+    return value if value.isprintable() else repr(value)
+
+
 def _am_risk(posture: Posture) -> Optional[str]:
     """Why application masters can land on Spot, or None when they cannot."""
     yarn = posture.yarn_site or {}
@@ -203,7 +209,7 @@ def _am_risk(posture: Posture) -> Optional[str]:
     enabled = yarn.get(ENABLED, default_on).strip()
     label = yarn.get(AM_LABEL, default_label).strip()
     if enabled.lower() != "true":
-        return f"{ENABLED} is {enabled if ENABLED in yarn and enabled else 'unset'}"
+        return f"{ENABLED} is {_shown(enabled) if ENABLED in yarn and enabled else 'unset'}"
     if not label:
         return f"{AM_LABEL} is unset"
     if label == "ON_DEMAND":
@@ -212,7 +218,7 @@ def _am_risk(posture: Posture) -> Optional[str]:
         return f"{AM_LABEL} is ON_DEMAND, a label EMR assigns from release 7.0 only"
     if label == "CORE":
         return f"{AM_LABEL} is CORE, and core nodes run on Spot" if "CORE" in posture.spot else None
-    return f"{AM_LABEL} is {label}, which forge does not know to be On-Demand"
+    return f"{AM_LABEL} is {_shown(label)}, which forge does not know to be On-Demand"
 
 
 def _primary_rule(posture: Posture) -> Optional[Rule]:
@@ -266,9 +272,9 @@ def _masters_rule(posture: Posture) -> Optional[Rule]:
     where = "fleet" if posture.fleets else "instance group"
     return (
         AM_UNPINNED,
-        f"YARN can place the build's application master on a Spot node ({why}). Each "
-        "interruption of that node uses one of the application's attempts, and the step fails "
-        "when they run out.",
+        f"YARN can place the build's application master on a Spot node ({why}). A master "
+        "has to live as long as its job, so a Spot interruption of that node interrupts the "
+        "job.",
         f"set yarn-site {ENABLED}=true and {AM_LABEL}={label}{also}, when the cluster is "
         f"created or by reconfiguring its primary {where}.",
     )
@@ -299,8 +305,9 @@ def _clusters(runs: Sequence[DesiredRun]) -> Dict[Tuple[str, str], List[str]]:
             continue
         try:
             region = resolve_region() if run.needs_region else run.region
-        except ValueError:
-            LOG.debug("spark_cluster_posture_unread cluster=%s error=NoRegion", cluster)
+        except Exception as exc:  # noqa: BLE001 - no region, or a profile botocore cannot read
+            error = "NoRegion" if isinstance(exc, ValueError) else _unread(exc)
+            LOG.debug("spark_cluster_posture_unread cluster=%s error=%s", cluster, error)
             continue
         builds.setdefault((region, str(cluster)), []).append(run.build)
     return builds

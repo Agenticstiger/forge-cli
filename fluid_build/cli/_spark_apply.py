@@ -176,9 +176,12 @@ def warn_cluster_posture(
     from fluid_build.build_runners.spark._posture import cluster_findings
     from fluid_build.cli.console import warning
 
-    for finding in cluster_findings(runs, clients=clients):
-        warning(escape(finding.line()))
-        logger.info("spark_cluster_posture", extra={"spark": finding.as_dict()})
+    try:
+        for finding in cluster_findings(runs, clients=clients):
+            warning(escape(finding.line()))
+            logger.info("spark_cluster_posture", extra={"spark": finding.as_dict()})
+    except Exception as exc:  # noqa: BLE001 - a warning never fails plan or apply
+        logger.debug("spark_cluster_posture_failed error=%s", type(exc).__name__)
 
 
 def plan_posture(contract: Mapping[str, Any], logger: logging.Logger, clients: Any = None) -> None:
