@@ -74,3 +74,6 @@ Ask, in the chat, before any of these, and say what each one risks:
 | `apply_plan_digest_tofu_plan_target` | another state backend than the plan's | apply with the plan's `--state-backend` |
 | `apply_plan_digest_tofu_plan_state_missing` | the plan was made on state this runner does not have (local state) | apply where it was planned, or use a remote state backend |
 | data-loss refusal | the change would drop data | stop and ask the user |
+
+A `…target_field_unbound` or `…target_provider_unbound` warning is not a failure: the plan is
+not bound to that account, project, region or host. Tell the user which one before you apply.
