@@ -7,7 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Spark build that leaves the contract on AWS has its runs stopped before its role goes.**
+  `fluid apply` destroyed the build's role, artifacts and log group but left its stream running
+  until those were gone, and a product destroy failed part way: EMR Serverless deletes only a
+  stopped application, and IAM no policy that is still attached. Before `tofu apply`, the apply
+  now reads the plan's deletes and cancels every active run of a build that goes (found by its
+  run name where its log group's new `fluid_runtime`, `fluid_run_target` and `fluid_run_region`
+  tags say it runs), stops the steps of a build moved off EMR on EC2 (its job policy carries the
+  same tags), stops the runs of a Glue job that goes, and cancels the runs in the product's own
+  EMR Serverless application and stops it. An IAM policy the plan destroys that is still
+  attached (an EMR on EC2 build's job policy, the scheduler's caller policy) refuses the apply
+  first, with the `aws iam detach-*-policy` commands; nothing is stopped or destroyed. A run
+  still going after `FLUID_SPARK_WAIT_SECONDS` also refuses the apply before anything is
+  destroyed. `--dry-run` reads and says what it would cancel. The first apply after the upgrade
+  adds the three tags in place to each Spark build's log group and EMR on EC2 job policy.
+
+### Changed
+
+- **A Spark run starts only on the job config `fluid apply` compiled.** Every runtime, local
+  included, now passes the config's digest at submit (`--fluid-job-sha256`: the sha256 of its
+  canonical JSON, strings in NFC as OpenTofu writes them, the MSK brokers OpenTofu fills in left
+  out so a broker change does not stop a stream's retries), and forge's Spark runner refuses any
+  other config before it reads anything. On AWS, `fluid apply` first reads the config and the
+  runner OpenTofu uploaded back from S3 and starts nothing unless they are the ones this apply
+  compiled, so a config another apply put there since never runs under the run's config hash.
+  The artifact bucket's write access stays the boundary. A scheduler's role already reads both
+  objects. The runner changed, so each running Spark stream restarts once on its next apply.
+
+## [0.33.0] — 2026-11-19
+
 ### Added
+
+- **`fluid ship` keeps a stage journal, and a rerun never repeats a change nobody can account
+  for.** With `--journal-dir DIR` (and always with `--release-dir`, in `.fluid/ship-journal`),
+  each stage leaves a `started` event, fsynced before it runs, and a `finished` event with its
+  status, exit code and receipts: the digest of each report it wrote, the plan's digests, and
+  the lineage and serial of each local OpenTofu state. One append-only file per release (the
+  bundle's digest) under `DIR/<product>/<env>/`; a line cut off by a crash is ignored. One run
+  at a time holds a target, locked before stage 1, so a second run is refused (exit 2) before it
+  rebundles. Before apply, enforcing policy-apply, publish or schedule-sync runs again, ship reads
+  it: an attempt in any release of the target that started and has no known outcome
+  (interrupted, killed, a CI timeout) refuses the stage until `--acknowledge-inspected STAGE`,
+  which the journal records; an unknown apply blocks the stages after it the same way. An apply
+  that did not pass is refused until stage 6 has planned again through ship and
+  `runtime/plan.json` is that plan. A stage that changes nothing always runs, recorded when the
+  journal can be opened, and nothing is rolled back. `--explain` shows the journal and what it
+  would refuse; the run report and the release's provenance name it, by a project-relative
+  path or the label `--journal-dir`, never an absolute one. Without either flag
+  there is no journal. Keep DIR outside the checkout, on storage that outlives the runner, and out of
+  reach of less trusted runs: the default in the checkout guards a working copy, and an
+  ephemeral CI runner starts it empty. Ship follows no symbolic link below DIR (or below the
+  project, for the default), reads only regular files with one link, and refuses a journal file
+  over 8 MiB, or one whose directory entry it cannot fsync (storage that cannot fsync a
+  directory at all gets the warning `ship_journal_dir_fsync_unsupported` instead). Two changes reach every run: a stage killed by a signal (the OOM killer) is
+  recorded `unknown`, not `failed`, with the reason `killed by signal N` and the same exit
+  status; and `runtime/ship-report.json` and `ship-junit.xml` are renamed into place, so a
+  symbolic link the checkout left at either name is replaced instead of written through.
 
 - **A Spark build runs on the machine `fluid apply` runs on: `parameters.spark.runtime: local`.**
   A build of `runtime: local` runs forge's Spark runner and its compiled `job.json` with
@@ -72,16 +129,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table is refused beside a bucket-root output, a location forge registers with Lake Formation,
   and an output whose lifecycle expires its objects; a topic takes their place. The managed Flink
   lane refuses the block.
-- **A Spark run starts only on the job config `fluid apply` compiled.** Every runtime, local
-  included, now passes the config's digest at submit (`--fluid-job-sha256`: the sha256 of its
-  canonical JSON, strings in NFC as OpenTofu writes them, the MSK brokers OpenTofu fills in left
-  out so a broker change does not stop a stream's retries), and forge's Spark runner refuses any
-  other config before it reads anything. On AWS, `fluid apply` first reads the config and the
-  runner OpenTofu uploaded back from S3 and starts nothing unless they are the ones this apply
-  compiled, so a config another apply put there since never runs under the run's config hash.
-  The artifact bucket's write access stays the boundary. A scheduler's role already reads both
-  objects. The runner changed, so each running Spark stream restarts once on its next apply.
-
 - **A Glue table is partitioned as its binding declares.** `binding.location.partitionBy`
   never reached the Glue table the AWS emitter wrote, and `binding.properties.cluster_by` was
   read by nobody on AWS; both passed `fluid validate --strict`. On a Hive table (Parquet, ORC,
@@ -532,6 +579,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An `enum` value holding a quote or a backslash no longer breaks dbt's `accepted_values`
+  test.** dbt pastes each value between single quotes unescaped, so `O'Brien` ended the string
+  and the rest ran as SQL. Such a column's values are now written with `quote: false`, each as
+  the SQL string literal of the adapter that runs it (DuckDB, Snowflake, BigQuery, Databricks
+  and Spark, Postgres, Athena and Trino, with a standard literal for any other adapter), and
+  the column's other values as `'<value>'`, in both `fluid generate dbt-tests` and the dbt
+  engine. Columns whose values hold neither are written as before.
+
 - **An EMR on EC2 stream starts only once its cluster's role carries the build's policy.** A step
   runs as the cluster's instance-profile role, which the cluster's owner holds, and forge creates
   the build's least-privilege policy for that owner to attach. The first `fluid apply` started the
@@ -666,6 +721,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   way, beside the keys it already wrote.
 
 ### Security
+
+- **The dbt engine's schema.yml, sources.yml and semantic_models.yml write no contract text
+  that dbt would run as Jinja.** The ones `fluid generate transformation` writes for a dbt
+  build now pass through the same escaping as `fluid generate dbt-tests` (one shared helper,
+  `util/dbt_jinja.py`): a model or column name, description, enum value, expression or source
+  field from a contract that holds `{{`, `{%` or `{#`, or looks like `env_var(...)`,
+  `var(...)`, `ref(...)`, `source(...)` or `doc(...)`, is written as a Jinja string literal
+  of itself. The engine's own `ref(...)` and `env_var(...)` expressions, a metric's `filter`
+  (dbt never renders it; MetricFlow reads its `Dimension(...)` template itself) and the
+  placeholders a contract may use for a source location (`{{ env.X }}`, `${X}`, `$X`, and
+  `{{ env_var('X') }}` in either quote, with a plain default or a `target.<attribute>` one)
+  still render; any other text around a placeholder that holds a brace is a literal.
+  The model SQL the engine writes (`engines/dbt/models.py`) and a contract's own SQL still
+  render as dbt Jinja: treat contract authors as trusted when dbt builds their contract.
+
+- **A name or version dbt pastes into its own Jinja is refused.** dbt runs a model's tests
+  against `ref('<exposeId>', version='<version>')`, a source table's against
+  `source('<source>', '<consumes id>')`, and a semantic model's against
+  `ref('<exposeId>')`, rendering each after pasting the name in, so a quote there ran
+  `env_var(...)` at `dbt parse`. `fluid generate transformation` and `fluid generate
+  dbt-tests` now stop with an error naming the value when one of these holds a quote, a
+  backslash, a brace or a control character. An id that matches the schema's identifier
+  grammar holds none of them.
 
 - **A project `.env` can no longer set bash function imports or shell start-up settings.**
   Bash reads an environment variable named `BASH_FUNC_<name>%%` as the definition of the
