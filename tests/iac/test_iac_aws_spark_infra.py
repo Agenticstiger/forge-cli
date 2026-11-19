@@ -829,6 +829,58 @@ def test_a_run_to_completion_build_gets_the_schedulers_policy(contract):
     assert not any(s.startswith("FindApplication") for s in sids)
 
 
+def test_the_scheduler_may_decrypt_the_artifacts_it_reads_back_through_s3_only(contract):
+    """A start reads job.json and the runner back (``_adapters.checked_run``); an SSE-KMS
+    artifact bucket refuses that read without ``kms:Decrypt``."""
+    contract["builds"][0]["properties"]["stream"]["trigger"] = {"availableNow": True}
+    _, data = emit(contract)
+    document = data["aws_iam_policy_document"]["commerce_orders_stream_spark_caller"]
+    kms = statement(document, "S3Kms")
+    assert kms["actions"] == ["kms:Decrypt"]
+    assert kms["resources"] == ["*"]
+    via, context = kms["condition"]
+    assert (via["test"], via["variable"]) == ("StringEquals", "kms:ViaService")
+    assert via["values"] == [
+        f"s3.${{data.aws_region.{aws_ingest.REGION_DATA}.region}}.amazonaws.com"
+    ]
+    assert (context["test"], context["variable"]) == (
+        "StringLike",
+        "kms:EncryptionContext:aws:s3:arn",
+    )
+    artifacts = next(s for s in document["statement"] if s["sid"].startswith("Artifacts"))
+    # Under an S3 Bucket Key the context is the bucket's ARN; without one, the object's.
+    assert context["values"] == ["arn:aws:s3:::commerce-lake", *artifacts["resources"]]
+
+
+def _iam_policy_chars(document):
+    """The policy as IAM counts it: its JSON without whitespace (OpenTofu expressions are
+    counted as written, longer than the account ids and regions they resolve to)."""
+    statements = []
+    for s in document["statement"]:
+        rendered = {
+            "Sid": s["sid"],
+            "Effect": s["effect"],
+            "Action": s["actions"],
+            "Resource": s["resources"],
+        }
+        for c in s.get("condition") or []:
+            rendered.setdefault("Condition", {}).setdefault(c["test"], {})[c["variable"]] = c[
+                "values"
+            ]
+        statements.append(rendered)
+    policy = {"Version": "2012-10-17", "Statement": statements}
+    return len(json.dumps(policy, separators=(",", ":")))
+
+
+@pytest.mark.parametrize("runtime", ["emr-serverless", "glue", "emr-eks", "emr-ec2"])
+def test_the_schedulers_policy_fits_a_managed_policy_on_every_runtime(contract, runtime):
+    contract["builds"][0]["properties"]["stream"]["trigger"] = {"availableNow": True}
+    _, data = emit(_runtime(contract, runtime))
+    document = data["aws_iam_policy_document"]["commerce_orders_stream_spark_caller"]
+    assert statement(document, "S3Kms")
+    assert _iam_policy_chars(document) < 6144  # IAM's limit for a managed policy
+
+
 # --- Lake Formation writes (item 4) ---------------------------------------------------
 
 
@@ -1196,12 +1248,14 @@ def test_the_schedulers_policy_names_each_action_once_per_runtime():
         "RunEmrEc2",
         "StepRoleEmrEc2",
         "Artifacts",
+        "S3Kms",
     ]
     by_sid = {s["sid"]: s for s in doc["statement"]}
     serverless = by_sid["RunEmrServerless"]["resources"]
     assert len(serverless) == 4  # two applications, each named once with its job runs
     assert len(by_sid["PassRoleEmrServerless"]["resources"]) == 8
     assert len(by_sid["Artifacts"]["resources"]) == 9
+    assert by_sid["S3Kms"]["condition"][1]["values"] == by_sid["Artifacts"]["resources"]
     assert len(json.dumps(doc, separators=(",", ":"))) < 6144
 
 

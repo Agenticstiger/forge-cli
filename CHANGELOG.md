@@ -151,6 +151,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `emr-serverless:StopApplication`, which the identity running the destroy needs beyond the
   runtime's list and cancel actions.
 
+- **A scheduled Spark start reads its job config from an SSE-KMS bucket, and a start that is
+  refused leaves a stream's old run going.** A start reads `job.json` and the runner back from
+  S3 before it runs, as the scheduler's identity for a scheduled build, and the scheduler's
+  policy granted `s3:GetObject` on them and no `kms:Decrypt`: with a customer-managed key as the
+  artifact bucket's default encryption, every scheduled start failed with AccessDenied. The
+  policy now grants `kms:Decrypt` through S3 only (`kms:ViaService`), for those two objects, or
+  their bucket under an S3 Bucket Key. `fluid apply` also cancelled a stream's run of another
+  config before that read, so a start the deployed artifacts refused left the stream stopped
+  until the next apply. It now reads them first: a refusal cancels nothing, the old run keeps
+  going, and `fluid apply` exits 1.
+
 ### Changed
 
 - **A Spark run starts only on the job config `fluid apply` compiled.** Every runtime, local

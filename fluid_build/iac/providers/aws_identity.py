@@ -1032,6 +1032,9 @@ class CallerRun:
     objects: Tuple[Any, ...]
     #: An isolated EMR Serverless application is found by name: ListApplications.
     lookup_application: bool = False
+    #: The ARN of the bucket ``objects`` are in: under an S3 Bucket Key, the encryption
+    #: context of their keys.
+    bucket: Any = None
 
 
 def _caller_targets(run: CallerRun, *, account: Any, region: Any) -> List[Any]:
@@ -1062,7 +1065,11 @@ def caller_document(runs: Sequence[CallerRun], *, account: Any, region: Any) -> 
     One statement per runtime (its actions once, on every target of the product's builds on
     that runtime), one PassRole per runtime, and one for the artifacts: a managed policy
     holds at most 6,144 characters, and a statement per build reached it at about six
-    builds. Each build's role and target is still named, so nothing else is granted."""
+    builds. Each build's role and target is still named, so nothing else is granted.
+
+    A start reads the job config and the runner back (``checked_run`` in
+    build_runners/spark/_adapters.py), so the artifacts get ``s3:GetObject`` and, through S3
+    only, ``kms:Decrypt``: an SSE-KMS artifact bucket would refuse the read without it."""
     statements: List[Dict[str, Any]] = []
     runtimes = _unique([run.runtime for run in runs])
     for runtime in runtimes:
@@ -1126,6 +1133,37 @@ def caller_document(runs: Sequence[CallerRun], *, account: Any, region: Any) -> 
             "resources": _unique([obj for run in runs for obj in run.objects]),
         }
     )
+    # With an S3 Bucket Key the encryption context is the bucket's ARN; without one it is
+    # the object's.
+    contexts = _unique(
+        [
+            context
+            for run in runs
+            for context in [*([run.bucket] if run.bucket is not None else []), *run.objects]
+        ]
+    )
+    if contexts:
+        statements.append(
+            {
+                # As the job role's own S3Kms: whatever key the bucket encrypts them with.
+                "sid": "S3Kms",
+                "effect": "Allow",
+                "actions": ["kms:Decrypt"],
+                "resources": ["*"],
+                "condition": [
+                    {
+                        "test": "StringEquals",
+                        "variable": "kms:ViaService",
+                        "values": [_join("s3.", region, ".amazonaws.com")],
+                    },
+                    {
+                        "test": "StringLike",
+                        "variable": "kms:EncryptionContext:aws:s3:arn",
+                        "values": contexts,
+                    },
+                ],
+            }
+        )
     return {"statement": statements}
 
 

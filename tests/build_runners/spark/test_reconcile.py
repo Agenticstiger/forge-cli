@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import dataclasses
+import io
+import logging
 
 import pytest
 
@@ -13,7 +15,8 @@ import pytest
 ClientError = pytest.importorskip("botocore.exceptions").ClientError
 
 from fluid_build.build_runners.spark import _reconcile as rc
-from fluid_build.build_runners.spark._adapters import RunInfo, SparkRunError
+from fluid_build.build_runners.spark._adapters import RunInfo, SparkRunError, checked_run
+from fluid_build.cli import _spark_apply
 
 ENV = {rc.WAIT_ENV: "5"}
 
@@ -69,6 +72,9 @@ class FakeAdapter:
 
     def where(self):
         return "fake cluster"
+
+    def checked(self):
+        return self.run
 
     def runs(self, since=None):
         self.since.append(since)
@@ -141,6 +147,37 @@ def test_another_config_is_cancelled_waited_for_and_replaced(run, clock, use):
         False,
     )
     assert fake.calls == ["cancel old1", "start"]
+
+
+class DeployedConfig:
+    """The artifact bucket after another apply: its job.json is not the one this apply
+    compiled."""
+
+    def get_object(self, Bucket, Key):  # noqa: N803 - boto3's names
+        return {"Body": io.BytesIO(b'{"mode": "stream", "another": "config"}')}
+
+
+def refusing(fake):
+    """``fake`` with the adapters' real check of the deployed artifacts."""
+    fake.checked = lambda: checked_run(fake.run, lambda service, region: DeployedConfig())
+    return fake
+
+
+def test_a_start_the_deployed_config_refuses_leaves_the_old_run_going(run, clock, use):
+    fake = refusing(FakeAdapter([info("old1", "RUNNING", hash_="stale")]))
+    use(fake)
+    out = go(run, clock)
+    assert (out.action, out.error, out.cancelled, fake.calls) == ("refused", True, [], [])
+    assert "is not the one this apply compiled" in out.message
+    assert out.message.endswith("; run old1 was left running")
+
+
+def test_fluid_apply_fails_when_the_deployed_config_refuses_the_start(run, use):
+    fake = refusing(FakeAdapter([info("old1", "RUNNING", hash_="stale")]))
+    use(fake)
+    log = logging.getLogger("test.spark.refused")
+    assert _spark_apply.reconcile_after_apply([run], log, dry_run=False) == 1
+    assert fake.calls == []  # nothing cancelled, nothing started
 
 
 def test_a_new_topic_on_the_same_checkpoint_is_refused_before_anything_is_cancelled(

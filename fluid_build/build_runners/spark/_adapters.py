@@ -265,10 +265,15 @@ class Adapter:
         self.clients = clients
         # A local run has no AWS client: its "client" is the machine (``Local.host``).
         self.client = clients(self.service, run.region) if clients is not None else None
+        self._checked: Optional[DesiredRun] = None
 
     def checked(self) -> DesiredRun:
-        """:func:`checked_run` of this adapter's run."""
-        return checked_run(self.run, self.clients)
+        """:func:`checked_run` of this adapter's run, read once: a reconcile checks before it
+        cancels the run of another config (a refusal leaves that run going), and the start
+        then uses the run it checked."""
+        if self._checked is None:
+            self._checked = checked_run(self.run, self.clients)
+        return self._checked
 
     def runs(self, since: Optional[float] = None) -> List[RunInfo]:
         """The build's runs, newest first: every active one and the most recent ended ones,
@@ -871,6 +876,10 @@ class Local(Adapter):
 
     def get(self, run_id: str) -> RunInfo:
         return self._runs.get(run_id)
+
+    def checked(self) -> DesiredRun:
+        """Nothing is read back: each start writes this run's artifacts itself."""
+        return self.run
 
     def start(self, token: str, restart_of: Optional[str] = None) -> str:
         from fluid_build.build_runners.spark._local import start_run
