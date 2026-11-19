@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fluid profile` refuses a repeated `--expose`.** argparse kept the last of two `--expose`
+  flags, so `--expose org --expose account --source org.csv` profiled `org.csv` as the
+  `account` expose. A second `--expose` is now refused with `profile_expose_repeated` before
+  any record is read.
+
 ## [0.35.0] — 2026-11-19
 
 ### Added

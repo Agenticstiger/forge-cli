@@ -138,6 +138,9 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         "--expose",
         "--expose-id",
         dest="expose_id",
+        # Collected, not overwritten: argparse would keep the last of two and read the
+        # first expose's source as the second one.
+        action="append",
         help="exposeId to profile (default: the contract's only expose)",
     )
     p.add_argument(
@@ -215,6 +218,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     from fluid_build.profiler import _stats, bundle, runner, sources
     from fluid_build.profiler.document import DocumentError
 
+    requested = _one_expose(args.expose_id)
     try:
         backend = _stats.load_backend()
     except _stats.StatisticsUnavailable as exc:
@@ -231,7 +235,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     bundle_dir = _bundle_dir(args.bundle)
     contract = load_contract_with_overlay(str(contract_path), args.env, logger)
     try:
-        expose_id = runner.resolve_expose_id(contract, args.expose_id)
+        expose_id = runner.resolve_expose_id(contract, requested)
         out = _out_path(args.out, expose_id, args.source)
         block = bundle.read_bundle_block(bundle_dir, expose_id, backend) if bundle_dir else None
         result = runner.profile_expose(
@@ -258,6 +262,27 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         raise _as_refusal(exc, args.source) from None
     _report(cprint_literal, result, out, answered_block=block is not None)
     return 0
+
+
+def _one_expose(given: Optional[List[str]]) -> Optional[str]:
+    """The one ``--expose``, or ``None``; a repeated one is refused before anything is read.
+
+    One call profiles one expose's records from one ``--source``, so a second
+    ``--expose`` has no source of its own to read.
+    """
+    if not given:
+        return None
+    if len(given) > 1:
+        raise _refusal(
+            "profile_expose_repeated",
+            f"--expose is given {len(given)} times ({', '.join(given)}); one call profiles "
+            "one expose, from its one --source",
+            {
+                "read": "nothing: no record was read",
+                "next": "run fluid profile once per expose, each with its own --source",
+            },
+        )
+    return given[0]
 
 
 def _bundle_dir(given: Optional[str]) -> Optional[Path]:

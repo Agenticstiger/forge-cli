@@ -115,6 +115,53 @@ def test_an_unknown_expose_is_named_with_the_ones_there_are(workspace, registry,
     assert "profile_expose_not_found" in out and "orders" in out
 
 
+TWO_EXPOSES = """\
+fluidVersion: "0.7.7"
+kind: DataProduct
+id: crm.accounts
+name: Accounts
+exposes:
+  - exposeId: org
+    kind: table
+    binding: {platform: local, format: csv, location: {path: out/org.csv}}
+    contract:
+      schema:
+        - {name: org_id, type: int}
+  - exposeId: account
+    kind: table
+    binding: {platform: local, format: csv, location: {path: out/account.csv}}
+    contract:
+      schema:
+        - {name: account_id, type: int}
+        - {name: org_id, type: int}
+"""
+
+
+def test_a_repeated_expose_is_refused_before_any_record_is_read(workspace, registry, capsys):
+    # argparse used to keep the last --expose, so org.csv was profiled as account.
+    (workspace / "two.fluid.yaml").write_text(TWO_EXPOSES, encoding="utf-8")
+    (workspace / "org.csv").write_text("org_id\n1\n", encoding="utf-8")
+    rc = main(
+        [
+            "profile",
+            "two.fluid.yaml",
+            "--expose",
+            "org",
+            "--expose",
+            "account",
+            "--source",
+            "org.csv",
+        ]
+    )
+    out = " ".join(capsys.readouterr().out.split())  # the console may wrap
+    assert rc == 1
+    assert "profile_expose_repeated" in out
+    assert "--expose is given 2 times (org, account)" in out
+    assert "no record was read" in out
+    assert registry.checked == []
+    assert not list(workspace.glob("*.profile.json"))
+
+
 def test_an_unreadable_source_is_reported_with_its_password_masked(workspace, registry, capsys):
     # The read itself is the [profile] extra's (DuckDB): without it the command stops
     # earlier, at "needs duckdb", as a lane without the extra (iac Stage 1) shows.
