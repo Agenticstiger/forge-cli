@@ -567,3 +567,16 @@ def test_a_malformed_glue_jars_prefix_is_invalid(contract, monkeypatch):
     monkeypatch.setenv(JARS_URL_ENV, "https://not-s3/")
     with pytest.raises(ValueError, match=JARS_URL_ENV):
         runs_of(_glue(contract, True, monkeypatch))
+
+
+def test_each_emr_runtime_gets_its_own_default_release(contract):
+    """EMR on EKS refuses a plain release: its default is the newest image of it."""
+    spark_cfg(contract).pop("releaseLabel", None)
+    spark_cfg(contract).pop("applicationId", None)
+    spark_cfg(contract).update(runtime="emr-eks", virtualClusterId="vc1")
+    (run,) = runs_of(contract)
+    assert run.release_label == _names.DEFAULT_EKS_RELEASE == "emr-7.12.0-latest"
+    spark_cfg(contract).update(runtime="emr-serverless")
+    spark_cfg(contract).pop("virtualClusterId")
+    (run,) = runs_of(contract)
+    assert run.release_label == _names.DEFAULT_RELEASE == "emr-7.12.0"

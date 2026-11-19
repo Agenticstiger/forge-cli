@@ -121,6 +121,8 @@ class ShipOptions:
     policy_mode: str = "enforce"  # stage 8 --mode, unless stage 7 ran as a dry run
     # --require-artifacts: stage 3 fails unless this run writes each key's files.
     require_artifacts: Tuple[str, ...] = ()
+    # --release-dir: stage 9 verifies every port (verify --require-every-port).
+    verify_every_port: bool = False
 
 
 @dataclass
@@ -292,6 +294,7 @@ def resolve_options(args: object, contract: str, env: Mapping[str, str]) -> Ship
         plan_html=_off_unless_true(get("plan_html"), env, "PLAN_HTML"),
         policy_mode=_resolve_policy_mode(get("policy_mode"), env),
         require_artifacts=_resolve_required_artifacts(get("require_artifacts")),
+        verify_every_port=bool(get("release_dir")),
     )
 
 
@@ -723,6 +726,8 @@ def _verify(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
         "verify",
         BUNDLE_PATH,
         *([] if o.no_verify_strict else ["--strict"]),
+        # A release stands for every port it holds, so no port may go unverified.
+        *(["--require-every-port"] if o.verify_every_port else []),
         *_env_args(o),
         "--out",
         "runtime/verify-report.json",
