@@ -370,6 +370,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid apply` runs a dbt build whatever its trigger, finds the dbt that has its adapter, and
+  pins what its container installs.** A build whose `execution.trigger.type` is `dataset`,
+  `schedule_and_dataset`, `event`, `dependency` or `timetable` failed with "Unknown trigger type",
+  although `fluid generate schedule` renders a DAG that runs it with `fluid apply --build-id`; the
+  dbt and python runners now run every type a scheduler or an event starts once when apply asks
+  (the scheduler decides when), keep `manual` iterations, and still refuse `continuous`. An engine
+  named after its PyPI distribution, such as `dbt-athena-community`, was looked for as
+  `athena-community`, so a local dbt with the athena plugin was never used; the runner now asks for
+  dbt's plugin name (`athena`) and matches the `Plugins:` list of `dbt --version` exactly. When no
+  local dbt has the adapter, the container fallback runs `python:3.12-slim` pinned by digest and
+  installs `dbt-core==1.11.17` and an exact adapter pin from wheels only; an adapter without a pin,
+  a `DBT_ADAPTER_PACKAGE` that is not an exact pin, and a `DBT_DOCKER_IMAGE` or
+  `DBT_BOOTSTRAP_IMAGE` without a digest are refused. For athena, glue and redshift with IAM, a dbt
+  profile that names an AWS profile, or a run without `AWS_ACCESS_KEY_ID` and
+  `AWS_SECRET_ACCESS_KEY`, is refused before `docker` starts, with the command that installs the
+  adapter locally or exports short-lived keys; `~/.aws` is never mounted, and `AWS_PROFILE`,
+  `AWS_DEFAULT_PROFILE`, `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` stay on the host.
+
 - **`fluid generate ci` runs stage 3 for a contract with reference builds.** It turned
   `RUN_STAGE_3_GENERATE_ARTIFACTS` off when any build was `hybrid-reference`, `reference` or
   `external-reference`, so a contract with Spark builds beside one reference dbt build skipped

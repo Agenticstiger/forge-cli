@@ -28,6 +28,7 @@ from fluid_build._console import error as console_error
 from fluid_build._contract_loader import CLIError, load_contract_with_overlay
 from fluid_build.util.binding_paths import ENV_PLACEHOLDER_RE
 from fluid_build.util.contract import (
+    SCHEDULER_TRIGGER_TYPES,
     describe_externally_run_build,
     is_continuous_build,
     is_databricks_job_build,
@@ -521,6 +522,19 @@ def continuous_trigger_warnings(contract: Dict[str, Any]) -> List[str]:
             f"which end{outcome}. {remedy}"
         )
     return warnings
+
+
+def unknown_trigger(trigger_type: str) -> int:
+    """Say a batch runner does not know ``trigger.type``; return exit code 1.
+
+    ``fluid validate`` refuses a type the schema does not name, so this is for a
+    contract that skipped it. ``continuous`` has its own refusal
+    (:func:`refuse_continuous_trigger`).
+    """
+    cprint(f"   ❌ Unknown trigger type: {trigger_type}")
+    cprint(f"   Supported types: manual, {', '.join(sorted(SCHEDULER_TRIGGER_TYPES))}")
+    cprint(f"{'=' * 80}")
+    return 1
 
 
 def refuse_continuous_trigger(runs: str) -> int:

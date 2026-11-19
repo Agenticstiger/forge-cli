@@ -173,6 +173,23 @@ def describe_externally_run_build(build: Mapping[str, Any]) -> str:
     return f"language '{props.get('language') if isinstance(props, Mapping) else None}'"
 
 
+#: The ``execution.trigger.type`` values a scheduler or an event starts (schema
+#: 0.7.7): every type but ``manual`` and ``continuous``. ``fluid generate
+#: schedule`` renders the DAG that starts such a build, and ``fluid apply`` runs it
+#: once when asked: the scheduler decides when, apply runs it.
+SCHEDULER_TRIGGER_TYPES = frozenset(
+    {"schedule", "event", "dependency", "dataset", "schedule_and_dataset", "timetable"}
+)
+
+
+def trigger_type_of(build: Mapping[str, Any]) -> str:
+    """The build's ``execution.trigger.type``, lower-cased; ``manual`` when unset."""
+    execution = build.get("execution")
+    trigger = execution.get("trigger") if isinstance(execution, Mapping) else None
+    kind = trigger.get("type") if isinstance(trigger, Mapping) else None
+    return kind.strip().lower() if isinstance(kind, str) and kind.strip() else "manual"
+
+
 def is_continuous_build(build: Mapping[str, Any]) -> bool:
     """True when the build's ``execution.trigger.type`` is ``continuous`` (new in
     schema 0.7.6): its platform keeps the job running, so no scheduler starts

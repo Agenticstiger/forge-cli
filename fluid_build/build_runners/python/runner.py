@@ -23,10 +23,14 @@ from typing import Any, Dict, Optional
 from fluid_build._console import cprint, success
 from fluid_build._console import error as console_error
 from fluid_build.credentials.dotenv_store import environment_for_project_code
-from fluid_build.util.contract import is_continuous_build
+from fluid_build.util.contract import (
+    SCHEDULER_TRIGGER_TYPES,
+    is_continuous_build,
+    trigger_type_of,
+)
 
 from .._path_safety import confine_to_workspace, resolve_workspace_root
-from ..base import refuse_continuous_trigger
+from ..base import refuse_continuous_trigger, unknown_trigger
 
 LOG = logging.getLogger("fluid.build_runners.python")
 
@@ -80,14 +84,16 @@ def execute_build(
     build_id = build.get("id", "unknown")
     execution = build.get("execution", {})
     trigger = execution.get("trigger", {})
-    trigger_type = trigger.get("type", "manual")
+    trigger_type = trigger_type_of(build)
+    # A scheduler decides when such a build runs; fluid apply runs it once.
+    scheduled = trigger_type in SCHEDULER_TRIGGER_TYPES
 
     cprint(f"\n{'=' * 80}")
     cprint(f"📋 Build: {build_id}")
     cprint(f"   Script: {script_path}")
     trigger_label = trigger_type
-    if trigger_type == "schedule" and force_run:
-        trigger_label = "schedule (manual apply override)"
+    if scheduled and force_run:
+        trigger_label = f"{trigger_type} (manual apply override)"
     cprint(f"   Trigger: {trigger_label}")
 
     # trigger.type continuous (schema 0.7.6) says the job's platform keeps it
@@ -95,8 +101,8 @@ def execute_build(
     if is_continuous_build(build):
         return refuse_continuous_trigger("a build's Python script as a batch run, which ends")
 
-    if trigger_type == "manual" or (trigger_type == "schedule" and force_run):
-        iterations = 1 if trigger_type == "schedule" and force_run else trigger.get("iterations", 1)
+    if trigger_type == "manual" or (scheduled and force_run):
+        iterations = 1 if scheduled else trigger.get("iterations", 1)
         delay_from_contract = trigger.get("delaySeconds")
         if delay_from_contract is not None:
             delay = delay_from_contract
@@ -179,16 +185,15 @@ def execute_build(
 
         return 0 if failed_runs == 0 else 1
 
-    elif trigger_type == "schedule":
-        cron = trigger.get("cron", "")
-        cprint(f"   Cron: {cron}")
-        cprint("   ⚠️  Scheduled execution requires Cloud Composer/Scheduler (paid tier)")
-        cprint("   💡 For free tier, use trigger.type: manual with iterations")
+    elif scheduled:
+        if trigger.get("cron"):
+            cprint(f"   Cron: {trigger.get('cron')}")
+        cprint(
+            f"   ⏭️  Not run here: trigger.type {trigger_type} means a scheduler starts "
+            "this build (fluid generate schedule renders its DAG), and fluid apply runs it."
+        )
         cprint(f"{'=' * 80}")
         return 0
 
     else:
-        cprint(f"   ❌ Unknown trigger type: {trigger_type}")
-        cprint("   Supported types: manual, schedule")
-        cprint(f"{'=' * 80}")
-        return 1
+        return unknown_trigger(trigger_type)
