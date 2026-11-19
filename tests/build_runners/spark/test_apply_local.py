@@ -508,3 +508,22 @@ def test_reconcile_runs_no_tofu_and_no_provider_apply(tmp_path, monkeypatch, cap
     monkeypatch.setattr(apply, "_run_simple_apply", lambda **k: pytest.fail("applied"))
     path = write(tmp_path, contract(daily()))
     assert _reconcile(path) == 0
+
+
+def test_the_reconcile_prompt_takes_a_no_on_a_closed_input_and_stops_on_ctrl_c(monkeypatch):
+    from fluid_build.cli import apply
+
+    class Console:
+        def __init__(self, raises):
+            self.raises = raises
+
+        def input(self, prompt):
+            assert "[y/N]" in prompt and "[bold]" in prompt  # markup is shown, not applied
+            raise self.raises
+
+    monkeypatch.setattr(apply, "RICH_AVAILABLE", True)
+    monkeypatch.setattr(apply, "Console", lambda: Console(EOFError()), raising=False)
+    assert apply._confirm_reconcile("Spark b: [bold]x[/bold]?") is False
+    monkeypatch.setattr(apply, "Console", lambda: Console(KeyboardInterrupt()), raising=False)
+    with pytest.raises(KeyboardInterrupt):
+        apply._confirm_reconcile("Spark b: [bold]x[/bold]?")

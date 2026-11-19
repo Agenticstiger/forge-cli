@@ -69,12 +69,12 @@ CALLER_ACTIONS: Dict[str, tuple] = {
 PASS_ROLE = frozenset({"emr-serverless", "emr-eks"})
 #: The runtimes that retry a failed run themselves, with the setting ``execution.retries``
 #: becomes there: a run that ended FAILED on one has spent those retries, and forge does not
-#: start it again on top of them. EMR on EC2 and local runs have none: forge's reconcile
-#: restarts them (:attr:`DesiredRun.restarts_per_hour`).
+#: start it again on top of them. EMR on EC2, Glue (its job is emitted with MaxRetries 0)
+#: and local runs have none: forge's reconcile restarts them
+#: (:attr:`DesiredRun.restarts_per_hour`).
 SERVICE_RETRIES: Dict[str, str] = {
     "emr-serverless": "EMR Serverless retries a failed stream (retryPolicy.maxFailedAttemptsPerHour)",
     "emr-eks": "EMR on EKS retries a failed driver (retryPolicyConfiguration.maxAttempts)",
-    "glue": "Glue retries a failed run (the job's MaxRetries)",
 }
 
 #: ``(service, region) -> boto3 client``
@@ -217,9 +217,15 @@ class Adapter:
             code = str(error.get("Code") or type(exc).__name__)
             if code in ("NoSuchKey", "404", "NotFound"):
                 return None
+            denied = (
+                " (without s3:ListBucket on the bucket, a missing object reads as AccessDenied "
+                "too, and with SSE-KMS the identity also needs kms:Decrypt on its key)"
+                if code in ("AccessDenied", "403", "Forbidden")
+                else ""
+            )
             raise SparkRunError(
                 f"the job config the last fluid apply uploaded ({self.run.job_uri}) cannot "
-                f"be read: {code}; the identity that reconciles needs s3:GetObject on it"
+                f"be read: {code}; the identity that reconciles needs s3:GetObject on it{denied}"
             ) from exc
         if len(body) > MAX_JOB_BYTES:
             raise SparkRunError(
@@ -344,8 +350,8 @@ class EmrServerless(Adapter):
     def runs(self, since: Optional[float] = None) -> List[RunInfo]:
         """Every active run of this build (all pages, filtered by state: a long-running job
         in a shared application is older than its newest runs), then its most recent ended
-        ones from :data:`LOOKBACK_PAGES` pages. Both modes: a stream moved to availableNow
-        still finds its old continuous job."""
+        ones from :data:`LOOKBACK_PAGES` pages, each one back to ``since`` among them. Both
+        modes: a stream moved to availableNow still finds its old continuous job."""
         app = self.application_id()
         paginator = self.client.get_paginator("list_job_runs")
         found: Dict[str, Mapping[str, Any]] = {}
@@ -365,8 +371,12 @@ class EmrServerless(Adapter):
             if number + 1 >= self.LOOKBACK_PAGES:
                 break
         ordered = sorted(found.items(), key=lambda kv: _ts(kv[1].get("createdAt")), reverse=True)
-        ended = [rid for rid, _ in ordered if rid not in active][:5]
-        return [self.get(rid) for rid, _ in ordered if rid in active or rid in ended]
+        ended = [rid for rid, _ in ordered if rid not in active]
+        # The last few, and every one back to ``since``: a restart budget counts them all.
+        kept = set(ended[:5]) | {
+            rid for rid in ended if since is not None and _ts(found[rid].get("createdAt")) >= since
+        }
+        return [self.get(rid) for rid, _ in ordered if rid in active or rid in kept]
 
     def _mine(self, summary: Mapping[str, Any]) -> bool:
         return summary.get("name") == self.run.run_name
@@ -459,7 +469,7 @@ class Glue(Adapter):
             # Glue takes Spark settings as one --conf argument: "a=b --conf c=d".
             pairs = [f"{k}={r.spark_conf[k]}" for k in sorted(r.spark_conf)]
             arguments["--conf"] = " --conf ".join(pairs)
-        # Retries are the Glue job's MaxRetries (the infra emit), not a run setting.
+        # The Glue job is emitted with MaxRetries 0: forge's reconcile restarts a stream.
         out = self.client.start_job_run(JobName=self.job_name, Arguments=arguments)
         return str(out["JobRunId"])
 
@@ -527,6 +537,7 @@ class EmrEc2(Adapter):
         for page in pages:
             steps.update({str(s.get("Id")): s for s in page.get("Steps") or []})
         active = set(steps)
+        going = any(s.get("Name") == self.run.run_name for s in steps.values())
         # Ended steps, newest first, until this build's last one (a busy shared cluster's
         # newer steps would otherwise hide a failed run, and every apply would restart it).
         recent = self.client.get_paginator("list_steps").paginate(ClusterId=self.cluster)
@@ -542,7 +553,8 @@ class EmrEc2(Adapter):
             # A restart budget counts the build's steps of the last hour: the page that
             # reaches back past ``since`` holds the oldest of them.
             reached = since is None or any(_created(s) < since for s in page_steps)
-            if number + 1 >= self.LOOKBACK_PAGES or (found_ended and reached):
+            # A build with a step going needs no older end than the window.
+            if number + 1 >= self.LOOKBACK_PAGES or ((found_ended or going) and reached):
                 break
         mine = [s for s in steps.values() if s.get("Name") == self.run.run_name]
         return sorted((self._info(s) for s in mine), key=lambda i: i.created, reverse=True)

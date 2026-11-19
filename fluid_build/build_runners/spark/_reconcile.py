@@ -210,6 +210,23 @@ def _oldest(runs: Sequence[RunInfo]) -> List[RunInfo]:
     return sorted(runs, key=lambda h: (h.created, h.run_id))[:1]
 
 
+def _last_end(history: Sequence[RunInfo]) -> Optional[RunInfo]:
+    """The run whose end is the stream's: the newest, passing over a cancelled run that was
+    started while the next older run of its config was still going (a second copy forge
+    cancelled, or one cancelled by hand), so a death of that older run after it is not read
+    as a cancel. A cancelled restart of that older run (``restart_of``) started after it
+    ended: its cancel is the stream's end."""
+    for index, info in enumerate(history):
+        if info.state == CANCELLED:
+            older = next(
+                (o for o in history[index + 1 :] if o.config_hash == info.config_hash), None
+            )
+            if older is not None and info.restart_of != older.run_id:
+                continue
+        return info
+    return history[0] if history else None
+
+
 def _utc(epoch: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
@@ -269,7 +286,10 @@ def _job_differs(run: DesiredRun, deployed: str, account: Optional[str]) -> bool
 
     OpenTofu uploads the compiled config with the account it runs in and, for a source
     named by its MSK cluster, that cluster's brokers in place of the placeholder
-    (``iac/providers/aws_ingest.py::_job_content``); both are put back before comparing."""
+    (``iac/providers/aws_ingest.py::_job_content``); both are put back before comparing.
+    The brokers come from the cluster the contract names (compared with the rest), and a
+    cluster's broker list changes with the cluster, so any non-empty list is taken; reading
+    them back from MSK would take another permission."""
     import json
 
     from fluid_build.spark.compiler import MSK_BROKERS_PLACEHOLDER
@@ -287,6 +307,8 @@ def _job_differs(run: DesiredRun, deployed: str, account: Optional[str]) -> bool
         and source.get("bootstrapServers") == MSK_BROKERS_PLACEHOLDER
         and isinstance(got, dict)
         and isinstance(got.get("source"), dict)
+        and isinstance(got["source"].get("bootstrapServers"), str)
+        and got["source"]["bootstrapServers"].strip()
     ):
         got = {**got, "source": {**got["source"], "bootstrapServers": MSK_BROKERS_PLACEHOLDER}}
     return bool(got != want)
@@ -427,7 +449,7 @@ def _reconcile_one(
         [a for a in active if a.config_hash == run.config_hash and a.state != CANCELLING]
     )
     stale = [a for a in active if a not in matching]
-    last = None if active else (history[0] if history else None)
+    last = None if active else _last_end(history)
     if only and _stops_reconcile_only(run, adapter, history, stale, matching, last, out):
         return out
     if matching and not stale:
@@ -521,13 +543,29 @@ def _cancel_and_wait(
     adapter: Adapter, stale: Sequence[RunInfo], out: Outcome, clock: _Clock, budget: float
 ) -> bool:
     """Cancel ``stale`` and wait until each has stopped; False (``out`` failed) when one is
-    still going after ``budget``."""
-    for old in stale:
-        if old.state != CANCELLING:
-            adapter.cancel(old.run_id)
-        out.cancelled.append(old.run_id)
-    for old_id in out.cancelled:
-        ended = clock.until(lambda i=old_id: adapter.get(i), lambda i: i.state in TERMINAL, budget)
+    still going after ``budget``, or a cancel or a read failed (``out`` names what was
+    cancelled before it)."""
+    try:
+        for old in stale:
+            if old.state != CANCELLING:
+                adapter.cancel(old.run_id)
+            out.cancelled.append(old.run_id)
+        waited = [
+            (
+                old_id,
+                clock.until(lambda i=old_id: adapter.get(i), lambda i: i.state in TERMINAL, budget),
+            )
+            for old_id in out.cancelled
+        ]
+    except Exception as exc:  # noqa: BLE001 - the AWS error is the outcome, with what it did
+        out.action, out.error = "failed", True
+        out.message = _error_text(exc) + (
+            f"; cancelled {', '.join(out.cancelled)} before it, and started nothing"
+            if out.cancelled
+            else ""
+        )
+        return False
+    for old_id, ended in waited:
         if ended.state not in TERMINAL:
             out.action, out.error, out.run_id, out.state = "failed", True, old_id, ended.state
             out.message = (
@@ -553,26 +591,36 @@ def _start(
     pending states."""
     adapter.check_target()
     run_id = adapter.start(_token(run), restart_of=start.restart_of)
-    # Two reconciles that found the stream dead at once both started it: the younger run
-    # stops itself, so one writer stays on the checkpoint (both keep the oldest).
-    first = _oldest(
-        [
-            h
-            for h in adapter.runs(since=since)
-            if h.active and h.config_hash == run.config_hash and h.state != CANCELLING
-        ]
-    )
-    if first and first[0].run_id != run_id:
-        adapter.cancel(run_id)
-        out.cancelled.append(run_id)
-        out.run_id, out.state = first[0].run_id, first[0].state
+    out.action = "restarted" if out.cancelled or start.restart_of else "started"
+    out.run_id = run_id
+    try:
+        # Two reconciles that found the stream dead at once both started it: the younger
+        # run stops itself, so one writer stays on the checkpoint (both keep the oldest).
+        first = _oldest(
+            [
+                h
+                for h in adapter.runs(since=since)
+                if h.active and h.config_hash == run.config_hash and h.state != CANCELLING
+            ]
+        )
+        if first and first[0].run_id != run_id:
+            adapter.cancel(run_id)
+            out.cancelled.append(run_id)
+            out.action, out.run_id, out.state = "unchanged", first[0].run_id, first[0].state
+            out.message = (
+                f"run {first[0].run_id} of this config started first (another fluid apply at "
+                f"the same time); run {run_id}, which this one started, was cancelled"
+            )
+            return out
+        started = clock.until(lambda: adapter.get(run_id), lambda i: i.state != PENDING, budget)
+    except Exception as exc:  # noqa: BLE001 - the run is going: say so with the error
+        out.error = True
         out.message = (
-            f"run {first[0].run_id} of this config started first (another fluid apply at the "
-            f"same time); run {run_id}, which this one started, was cancelled"
+            f"{start.message + '; ' if start.message else ''}run {run_id} was started, but "
+            f"reading it failed: {_error_text(exc)}. It is left going, and the next "
+            "reconcile reports it"
         )
         return out
-    started = clock.until(lambda: adapter.get(run_id), lambda i: i.state != PENDING, budget)
-    out.action = "restarted" if out.cancelled or start.restart_of else "started"
     out.run_id, out.state = run_id, started.state
     out.message = start.message
     if started.state in TERMINAL:
@@ -748,19 +796,18 @@ def _stop_continuous(
     return out
 
 
-def _error_outcome(run: DesiredRun, exc: BaseException) -> Outcome:
+def _error_text(exc: BaseException) -> str:
+    """An error's text for an outcome: its AWS error code first, redacted."""
     code = ""
     response = getattr(exc, "response", None)
     if isinstance(response, Mapping):
         code = str((response.get("Error") or {}).get("Code") or "")
     text = _clean(exc) if isinstance(exc, SparkRunError) else f"{type(exc).__name__}: {_clean(exc)}"
-    return Outcome(
-        run.build,
-        run.runtime,
-        "failed",
-        message=f"{code + ': ' if code and code not in text else ''}{text}",
-        error=True,
-    )
+    return f"{code + ': ' if code and code not in text else ''}{text}"
+
+
+def _error_outcome(run: DesiredRun, exc: BaseException) -> Outcome:
+    return Outcome(run.build, run.runtime, "failed", message=_error_text(exc), error=True)
 
 
 def run_once(

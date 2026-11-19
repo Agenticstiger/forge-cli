@@ -13,7 +13,7 @@ import json
 import pytest
 
 from fluid_build.build_runners.spark import _reconcile as rc
-from fluid_build.build_runners.spark._adapters import SERVICE_RETRIES
+from fluid_build.build_runners.spark._adapters import SERVICE_RETRIES, SparkRunError
 from fluid_build.build_runners.spark._desired import ACCOUNT_TOKEN, RESTART_WINDOW_S
 from fluid_build.spark.compiler import MSK_BROKERS_PLACEHOLDER
 from tests.build_runners.spark.conftest import variant
@@ -155,7 +155,6 @@ def test_a_new_budget_on_emr_ec2_restarts_nothing(contract):
     [
         ("emr-serverless", None),
         ("emr-eks", {"virtualClusterId": "vc1"}),
-        ("glue", {"glueJobName": "fluid-job"}),
     ],
 )
 def test_a_failed_run_on_a_runtime_that_retries_runs_is_not_started_again(
@@ -173,6 +172,15 @@ def test_a_failed_run_on_a_runtime_that_retries_runs_is_not_started_again(
     assert (out.action, out.error) == ("failed", True)
     assert "this build sets none, so it was not retried" in out.message
     assert "Set execution.retries" in out.message
+
+
+def test_a_failed_glue_stream_restarts_as_glue_retries_nothing(run, clock, use):
+    """forge emits the Glue job with MaxRetries 0: its reconcile is the one that retries."""
+    glue = variant(run, "glue", {"glueJobName": "fluid-job"})
+    fake = FakeAdapter([died(glue, attempt=1, details="boom")])
+    use(fake)
+    out = go(glue, clock)
+    assert (out.action, out.error, fake.restart_of) == ("restarted", False, ["s-dead"])
 
 
 def test_a_stream_that_ended_by_itself_where_the_service_retries_failures_restarts(run, clock, use):
@@ -341,6 +349,8 @@ def test_the_uploaded_job_is_compared_with_its_account_and_msk_brokers_put_back(
     assert rc._job_differs(run, json.dumps(deployed), ACCOUNT)
     assert rc._job_differs(run, "not json", ACCOUNT)
     assert rc._job_differs(run, uploaded(run), "210987654321")  # another account's
+    deployed["source"].update(topic="orders", bootstrapServers="")
+    assert rc._job_differs(run, json.dumps(deployed), ACCOUNT)  # brokers the apply never wrote
 
 
 def test_a_failure_text_never_carries_terminal_escape_sequences(ec2, clock, use):
@@ -350,3 +360,77 @@ def test_a_failure_text_never_carries_terminal_escape_sequences(ec2, clock, use)
     out = go(ec2, clock)
     assert "\x1b" not in out.message and "\x07" not in out.message and "\x9b" not in out.message
     assert "boom [2J]0;owned end31m" in out.message
+
+
+def test_a_cancelled_younger_copy_does_not_hide_the_death_of_the_run_it_copied(ec2, clock, use):
+    """Two reconciles restarted run s-d at once; the younger copy s-y cancelled itself. When
+    s-o, the one kept, dies, its death is the stream's end, not the copy's cancel."""
+    history = [
+        info("s-y", "CANCELLED", hash_=ec2.config_hash, created=WALL - 50, restart_of="s-d"),
+        died(ec2, "s-o", created=WALL - 60, restart_of="s-d"),
+        died(ec2, "s-d", created=WALL - 900),
+    ]
+    fake = FakeAdapter(history, job=uploaded(ec2))
+    use(fake)
+    out = go(ec2, clock, only=True)
+    assert (out.action, out.error, fake.restart_of) == ("restarted", False, ["s-o"])
+    assert "restart 2 of 5" in out.message  # s-o was a restart too; the cancelled copy is not
+
+
+def test_a_cancelled_restart_is_the_stream_s_end(ec2, clock, use):
+    """A restart started after the run it replaces ended, then cancelled by an operator: the
+    stream was stopped on purpose."""
+    history = [
+        info("s-r", "CANCELLED", hash_=ec2.config_hash, created=WALL - 50, restart_of="s-o"),
+        died(ec2, "s-o", created=WALL - 900),
+    ]
+    fake = FakeAdapter(history, job=uploaded(ec2))
+    use(fake)
+    out = go(ec2, clock, only=True)
+    assert (out.action, out.error, fake.calls) == ("left-stopped", False, [])
+
+
+def test_a_cancelled_copy_started_by_hand_does_not_hide_a_death(ec2, clock, use):
+    history = [
+        info("s-copy", "CANCELLED", hash_=ec2.config_hash, created=WALL - 50),
+        died(ec2, "s-o", created=WALL - 900),
+    ]
+    fake = FakeAdapter(history)
+    use(fake)
+    out = go(ec2, clock)
+    assert (out.action, fake.restart_of) == ("restarted", ["s-o"])
+
+
+def test_a_read_that_fails_after_the_start_still_names_the_run_that_is_going(ec2, clock, use):
+    class Throttled(FakeAdapter):
+        def runs(self, since=None):
+            if "start" in self.calls:
+                raise SparkRunError("ThrottlingException: Rate exceeded")
+            return super().runs(since)
+
+    fake = Throttled([died(ec2)])
+    use(fake)
+    out = go(ec2, clock)
+    assert (out.action, out.run_id, out.error) == ("restarted", "new", True)
+    assert "run new was started, but reading it failed: ThrottlingException" in out.message
+    assert "It is left going" in out.message
+
+
+def test_a_cancel_that_fails_names_what_was_already_cancelled(ec2, clock, use):
+    class Refusing(FakeAdapter):
+        def cancel(self, run_id):
+            if run_id == "s-2":
+                raise SparkRunError("step s-2 on j-ABC was not cancelled: gone")
+            super().cancel(run_id)
+
+    fake = Refusing(
+        [
+            info("s-3", "RUNNING", hash_=ec2.config_hash, created=WALL - 5),
+            info("s-2", "RUNNING", hash_=ec2.config_hash, created=WALL - 10),
+            info("s-1", "RUNNING", hash_=ec2.config_hash, created=WALL - 500),
+        ]
+    )
+    use(fake)
+    out = go(ec2, clock)
+    assert (out.action, out.error, fake.calls) == ("failed", True, ["cancel s-3"])
+    assert "cancelled s-3 before it, and started nothing" in out.message

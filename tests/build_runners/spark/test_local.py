@@ -870,3 +870,22 @@ def test_a_linked_run_directory_is_neither_listed_nor_pruned(host, tmp_path):
     assert runs.runs() == []
     runs.prune()
     assert (kept / "run.json").is_file()
+
+
+def test_prune_keeps_the_restarts_a_restart_budget_still_counts(tmp_path):
+    """Past the newest KEEP_ENDED ended runs, the restarts under an hour old stay."""
+    runs = LocalRuns(LocalHost(tmp_path), "p", "b")
+    now = time.time()
+    created = [now - 60 * i for i in range(12)] + [now - 7200 - i for i in range(3)]
+    for i, when in enumerate(created):
+        run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(when)) + f"-{i:08x}"
+        where = runs.dir / "runs" / run_id
+        where.mkdir(parents=True)
+        record = {"configHash": "h", "created": when, "restartOf": "20261118T000000Z-00000000"}
+        (where / "run.json").write_text(json.dumps(record))
+        (where / "status.json").write_text(
+            json.dumps({"started": when, "ended": when, "exitCode": 1})
+        )
+    runs.prune()
+    kept = runs.runs()
+    assert len(kept) == 12 and all(i.created >= now - 3600 for i in kept)

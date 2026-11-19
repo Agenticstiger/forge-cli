@@ -691,3 +691,59 @@ def test_the_uploaded_job_config_is_read_back(ec2_run):
     )
     with pytest.raises(ad.SparkRunError, match="more than forge ever uploads"):
         adapter.deployed_job()
+
+
+def test_serverless_history_keeps_every_run_back_to_the_restart_window(serverless):
+    """Past the last five ended runs, the ones of the last hour still come back: a restart
+    budget of up to 10 counts them all."""
+    adapter, stub = adapter_on(serverless, "emr-serverless")
+
+    def summary(run_id, created):
+        return {
+            "applicationId": "app1", "id": run_id, "arn": ARN, "createdBy": USER,
+            "createdAt": created, "updatedAt": created, "executionRole": USER,
+            "state": "SUCCESS", "name": serverless.run_name, "type": "SPARK",
+            "stateDetails": "done", "releaseLabel": "emr-7.12.0",
+        }  # fmt: skip
+
+    active = ["CANCELLING", "PENDING", "QUEUED", "RUNNING", "SCHEDULED", "SUBMITTED"]
+    stub.add_response("list_job_runs", {"jobRuns": []}, {"applicationId": "app1", "states": active})
+    recent = [(f"jr{i}", NOW - dt.timedelta(minutes=5 * i)) for i in range(8)]  # 0-35 min old
+    old = [(f"jr-old{i}", NOW - dt.timedelta(hours=3, minutes=i)) for i in range(3)]
+    stub.add_response(
+        "list_job_runs",
+        {"jobRuns": [summary(r, c) for r, c in recent + old]},
+        {"applicationId": "app1"},
+    )
+    for run_id, created in recent:
+        stub.add_response(
+            "get_job_run",
+            _job_run(serverless, "SUCCESS", run_id, created=created),
+            {"applicationId": "app1", "jobRunId": run_id},
+        )
+    since = (NOW - dt.timedelta(hours=1)).timestamp()
+    assert [r.run_id for r in adapter.runs(since=since)] == [r for r, _ in recent]
+    stub.assert_no_pending_responses()
+
+
+def test_ec2_history_of_a_going_stream_stops_at_the_restart_window(ec2_run):
+    """A build with a step going needs no older end than the window: one page, not ten."""
+    adapter, stub = adapter_on(ec2_run, "emr")
+    active = {"ClusterId": "j-ABC", "StepStates": ["PENDING", "RUNNING", "CANCEL_PENDING"]}
+    stub.add_response("list_steps", {"Steps": [_step(ec2_run, "s-9", "RUNNING", NOW)]}, active)
+    others = [
+        _step(ec2_run, "s-x", "COMPLETED", NOW - dt.timedelta(hours=2), name="unrelated"),
+    ]
+    stub.add_response("list_steps", {"Steps": others, "Marker": "m"}, {"ClusterId": "j-ABC"})
+    since = (NOW - dt.timedelta(hours=1)).timestamp()
+    assert [r.run_id for r in adapter.runs(since=since)] == ["s-9"]
+    stub.assert_no_pending_responses()
+
+
+def test_an_unreadable_job_config_says_what_access_denied_can_also_mean(ec2_run):
+    s3, stub = stubbed("s3", ec2_run.region)
+    emr = boto3.client("emr", region_name=ec2_run.region)
+    adapter = ad.adapter_for(ec2_run, lambda service, region: s3 if service == "s3" else emr)
+    stub.add_client_error("get_object", "AccessDenied", "no", 403)
+    with pytest.raises(ad.SparkRunError, match="without s3:ListBucket on the bucket"):
+        adapter.deployed_job()

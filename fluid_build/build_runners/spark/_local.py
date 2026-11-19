@@ -65,7 +65,7 @@ from fluid_build.build_runners.spark._adapters import (
     RunInfo,
     SparkRunError,
 )
-from fluid_build.build_runners.spark._desired import DesiredRun
+from fluid_build.build_runners.spark._desired import RESTART_WINDOW_S, DesiredRun
 from fluid_build.spark.names import RUNNER_FILE
 
 #: Operator-only: the spark-submit to run, an absolute path or a name on ``PATH``.
@@ -700,9 +700,13 @@ class LocalRuns:
             deadline = now() + 5.0
 
     def prune(self) -> None:
-        """Keep the active runs and the newest :data:`KEEP_ENDED` ended ones."""
+        """Keep the active runs, the newest :data:`KEEP_ENDED` ended ones, and every restart
+        under an hour old, which a restart budget still counts (``RESTART_WINDOW_S``)."""
         ended = [r for r in self.runs() if not r.active]
+        since = time.time() - RESTART_WINDOW_S
         for info in ended[KEEP_ENDED:]:
+            if info.restart_of and info.created >= since:
+                continue
             self._run_dir(info.run_id)  # inside .fluid
             # The path as listed, not resolved: rmtree refuses a link there.
             shutil.rmtree(self.dir / "runs" / info.run_id, ignore_errors=True)

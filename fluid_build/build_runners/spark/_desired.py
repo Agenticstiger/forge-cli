@@ -327,12 +327,13 @@ def restart_budget(build: Mapping[str, Any], scheduled: bool = False) -> int:
 
 
 def _started_with_retry(runtime: str, attempts: Optional[int]) -> Optional[int]:
-    """The retry setting a run is started with, as the config hash covers it: EMR on EC2 and
-    local runs take none (``execution.retries`` is their restart budget, a reconcile
-    setting), so a new budget restarts nothing there."""
+    """The retry setting a run is started with, as the config hash covers it: EMR on EC2,
+    Glue (its job is emitted with MaxRetries 0) and local runs take none
+    (``execution.retries`` is their restart budget, a reconcile setting), so a new budget
+    restarts nothing there."""
     from fluid_build.spark.compiler import LOCAL_RUNTIME
 
-    return None if runtime in ("emr-ec2", LOCAL_RUNTIME) else attempts
+    return None if runtime in ("emr-ec2", "glue", LOCAL_RUNTIME) else attempts
 
 
 def _submit_conf(
