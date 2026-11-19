@@ -15,7 +15,19 @@ from fluid_build.spark import dead_letter
 from fluid_build.spark.compiler import compile_job_config
 from fluid_build.streaming.mapping import parse_stream
 
-from .conftest import CONTRACT
+from .conftest import BROKERS, CONTRACT
+
+DLQ = "commerce.orders.dlq"
+
+
+@pytest.fixture(autouse=True)
+def listed_topic(monkeypatch, operator_policy):
+    """The operator lists writing the examples' dead-letter topic, on each broker."""
+    from fluid_build.spark.compiler import TARGET_ALLOWLIST_ENV
+
+    monkeypatch.setenv(
+        TARGET_ALLOWLIST_ENV, ",".join(f"kafka-write:{b}/{DLQ}" for b in BROKERS.split(","))
+    )
 
 
 def with_dead_letters(contract, **spec):
@@ -164,9 +176,10 @@ def test_an_avro_stream_s_dead_letters_are_refused_for_now(contract):
         compile_job_config(contract, contract["builds"][0], host_gate=False)
 
 
-def test_a_local_stream_creates_its_dead_letter_table(contract):
+def test_a_local_stream_creates_its_dead_letter_table(contract, monkeypatch):
     from tests.build_runners.spark.test_local import local_contract
 
+    monkeypatch.setenv("FLUID_SPARK_LOCAL_NAMESPACE_ALLOWLIST", "fluid/commerce")
     config = config_of(with_dead_letters(local_contract()))
     create = config["deadLetter"]["create"]
     assert create[0] == "CREATE NAMESPACE IF NOT EXISTS `fluid`.`commerce`"
@@ -418,3 +431,86 @@ def test_a_seed_names_every_partition_the_topic_has_now(runner):
         '{"source.events": {"0": 9, "1": 3, "2": -2}}'
     )
     assert runner.with_every_partition(seed, None) == seed  # unknown: as read
+
+
+def test_a_dead_letter_topic_the_operator_has_not_listed_is_refused_with_the_export_line(
+    contract, monkeypatch
+):
+    from fluid_build.spark.compiler import TARGET_ALLOWLIST_ENV
+    from fluid_build.spark.policy import SparkPolicyError
+
+    monkeypatch.setenv(TARGET_ALLOWLIST_ENV, f"kafka-write:b-1.msk.example:9098/{DLQ}")
+    with pytest.raises(SparkPolicyError) as caught:
+        config_of(with_dead_letters(contract, sink="topic", topic="payments.commands"))
+    listed = ",".join(
+        [f"kafka-write:b-1.msk.example:9098/{DLQ}"]
+        + [f"kafka-write:{b}/payments.commands" for b in BROKERS.split(",")]
+    )
+    assert f'export {TARGET_ALLOWLIST_ENV}="{listed}"' in caught.value.fix
+    # Listing one broker is not listing the cluster: any of them may take the write.
+    monkeypatch.setenv(TARGET_ALLOWLIST_ENV, f"kafka-write:b-1.msk.example:9098/{DLQ}")
+    with pytest.raises(SparkPolicyError) as caught:
+        config_of(with_dead_letters(copy.deepcopy(CONTRACT), sink="topic", topic=DLQ))
+    assert f"kafka-write:b-2.msk.example:9098/{DLQ}" in caught.value.why
+
+
+@pytest.mark.parametrize("runtime", ["local", "emr-serverless"])
+def test_a_dead_letter_topic_on_a_private_broker_needs_its_entry_on_every_runtime(
+    contract, monkeypatch, runtime
+):
+    from fluid_build.spark.compiler import TARGET_ALLOWLIST_ENV
+    from fluid_build.spark.policy import SparkPolicyError
+
+    build = contract["builds"][0]
+    cfg = build["properties"]["parameters"]["spark"]
+    cfg["source"] = {"bootstrapServers": "10.0.0.5:9092"}
+    if runtime == "local":
+        cfg["runtime"] = "local"
+        cfg.pop("maskKeySecretArn")
+        for column in build["properties"]["mapping"]["columns"]:
+            column.pop("maskAtIngest", None)
+        contract["exposes"][0]["binding"] = {
+            "platform": "local",
+            "format": "iceberg",
+            "location": {
+                "catalog": "lakekeeper",
+                "database": "commerce",
+                "table": "order_lines",
+                "bucket": "lake",
+            },
+        }
+        monkeypatch.setenv("FLUID_SPARK_LOCAL_NAMESPACE_ALLOWLIST", "fluid/commerce")
+    spec = {"sink": "topic", "topic": DLQ}
+    with pytest.raises(SparkPolicyError) as caught:
+        config_of(with_dead_letters(copy.deepcopy(contract), **spec))
+    assert f"kafka-write:10.0.0.5:9092/{DLQ}" in caught.value.why
+    monkeypatch.setenv(TARGET_ALLOWLIST_ENV, f"kafka-write:10.0.0.5:9092/{DLQ}")
+    assert config_of(with_dead_letters(contract, **spec))["deadLetter"]["topic"] == DLQ
+
+
+def test_an_msk_cluster_s_dead_letter_topic_takes_an_msk_write_entry(contract, monkeypatch):
+    from fluid_build.spark.compiler import (
+        TARGET_ALLOWLIST_ENV,
+        dead_letter_write_entries,
+        unlisted_dead_letter_writes,
+    )
+
+    arn = "arn:aws:kafka:eu-west-1:123456789012:cluster/orders/0a1b2c3d-4e5f"
+    kafka = {"mskClusterArn": arn, "bootstrapServers": "${msk}"}
+    assert dead_letter_write_entries(kafka, DLQ) == [f"msk-write:{arn}/{DLQ}"]
+    monkeypatch.setenv(TARGET_ALLOWLIST_ENV, f"msk:{arn},msk-write:{arn}/{DLQ}")
+    assert unlisted_dead_letter_writes(kafka, DLQ) == []
+    assert unlisted_dead_letter_writes(kafka, "other") == [f"msk-write:{arn}/other"]
+
+
+def test_fluid_validate_compiles_an_unlisted_dead_letter_topic_and_identity_warns(
+    contract, monkeypatch
+):
+    from fluid_build.iac.providers.aws_identity import identity_findings
+    from fluid_build.spark.compiler import TARGET_ALLOWLIST_ENV, validation_errors
+
+    monkeypatch.delenv(TARGET_ALLOWLIST_ENV)
+    spec = with_dead_letters(contract, sink="topic", topic=DLQ)
+    assert validation_errors(spec) == []  # a missing entry is a warning at validate
+    _, missing = identity_findings(spec["builds"][0])
+    assert any(f"kafka-write:b-2.msk.example:9098/{DLQ}" in m for m in missing)

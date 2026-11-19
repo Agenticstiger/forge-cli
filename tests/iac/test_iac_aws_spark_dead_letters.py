@@ -240,10 +240,18 @@ def test_two_builds_never_share_a_dead_letters_table(contract):
     assert caught.value.kind == "spark-address-conflict"
 
 
-def test_a_tls_source_needs_no_write_entry_and_gets_no_grant(contract):
+def test_a_tls_source_needs_the_write_entry_and_gets_no_grant(contract, monkeypatch):
     """Without MSK IAM the cluster's own ACLs decide who writes the topic: forge grants
-    nothing, so the operator lists nothing."""
+    nothing, but the operator still lists the write, as on every runtime."""
+    from fluid_build.iac.providers.aws_identity import TARGET_ALLOWLIST_ENV
+    from fluid_build.spark.policy import SparkPolicyError
+
     contract["builds"][0]["properties"]["parameters"]["spark"]["source"]["auth"] = "none"
-    _, data = emit(with_dead_letters(contract, sink="topic", topic="commerce.orders.dlq"))
+    spec = with_dead_letters(contract, sink="topic", topic="commerce.orders.dlq")
+    with pytest.raises(SparkPolicyError):
+        emit(copy.deepcopy(spec))
+    entries = os.environ[TARGET_ALLOWLIST_ENV]
+    monkeypatch.setenv(TARGET_ALLOWLIST_ENV, f"{entries},msk-write:{MSK_ARN}/commerce.orders.dlq")
+    _, data = emit(spec)
     sids = {s.get("sid") for s in data["aws_iam_policy_document"][f"{KEY}_access"]["statement"]}
     assert not sids & {"MskDeadLetterTopic", "MskIdempotentWrite"}

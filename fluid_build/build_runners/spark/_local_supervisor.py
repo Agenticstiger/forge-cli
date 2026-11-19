@@ -81,6 +81,9 @@ def main(argv=None):
     parser.add_argument("--grace", type=float, default=60.0)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    # Owner-only: status.json, driver.log and whatever the run writes here are this
+    # user's, and the log can hold what a job prints.
+    os.umask(0o077)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     status_path = os.path.join(args.run_dir, "status.json")
     cancel_path = os.path.join(args.run_dir, "cancel")

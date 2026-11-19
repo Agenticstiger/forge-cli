@@ -1,7 +1,8 @@
 # Check Pinned Actions — detect stale SHA pins in generated CI templates
 #
 # Runs monthly and on manual dispatch. Opens a GitHub issue when
-# PINNED_ACTIONS in pipeline_templates.py falls behind upstream releases.
+# PINNED_ACTIONS falls behind upstream releases or a PINNED_IMAGES tag moves
+# (both in fluid_build/forge/core/pipeline_systems/_base.py).
 
 name: Check Pinned Actions
 
