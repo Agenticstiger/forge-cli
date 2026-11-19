@@ -88,7 +88,8 @@ def use(monkeypatch):
     def install(fake):
         def adapter_for(run, clients=None, local_host=None):
             built.append(run)
-            fake.run = run  # a real adapter holds its (account-bound) run
+            # A real adapter holds its run bound to the account (``adapter_for``).
+            fake.run = run.bind(account="123456789012") if run.needs_account else run
             return fake
 
         monkeypatch.setattr(rc, "adapter_for", adapter_for)

@@ -19,6 +19,7 @@ from fluid_build.build_runners.spark import _adapters as ad
 from fluid_build.build_runners.spark import _reconcile
 from fluid_build.spark import names
 from tests.build_runners.spark.conftest import variant
+from tests.build_runners.spark.test_adapters import ConfigBucket, started
 
 CLUSTER = "j-1ABCDEF"
 PROFILE = "EMR_EC2_DefaultRole"
@@ -27,12 +28,15 @@ NOW = dt.datetime(2026, 11, 19, 6, 0, tzinfo=dt.timezone.utc)
 
 
 class Clients:
-    """One stubbed boto3 client per service, created when the code asks for it."""
+    """One stubbed boto3 client per service, created when the code asks for it; S3 is the
+    bucket a start reads the artifacts back from (``ConfigBucket``)."""
 
-    def __init__(self):
-        self.made = {}
+    def __init__(self, s3=None):
+        self.made, self.s3 = {}, s3
 
     def __call__(self, service, region):
+        if service == "s3" and self.s3 is not None:
+            return self.s3
         if service not in self.made:
             client = boto3.client(service, region_name=region)
             stub = Stubber(client)
@@ -111,7 +115,7 @@ def _role_reads(clients, run, attached):
 
 def _step_added(emr, run):
     args = ["spark-submit", "--deploy-mode", "client", *ad._conf_params(run.spark_conf)]
-    args += [run.runner_uri, *run.entry_args()]
+    args += [run.runner_uri, *started(run).entry_args()]
     emr.add_response(
         "add_job_flow_steps",
         {"StepIds": ["s-1"]},
@@ -128,8 +132,12 @@ def _step_added(emr, run):
     )
 
 
+def artifacts(run):
+    return ConfigBucket(run.job_text.encode("utf-8"))
+
+
 def test_a_step_starts_once_its_policy_is_on_the_clusters_role(ec2_run):
-    clients = Clients()
+    clients = Clients(artifacts(ec2_run))
     emr = _role_reads(clients, ec2_run, ["AmazonElasticMapReduceforEC2Role", policy_name(ec2_run)])
     _step_added(emr, ec2_run)
     assert ad.adapter_for(ec2_run, clients).start("tok") == "s-1"
@@ -152,7 +160,7 @@ def test_no_step_starts_before_its_policy_is_attached(ec2_run):
 
 
 def test_a_step_starts_as_before_when_the_role_cannot_be_read(ec2_run):
-    clients = Clients()
+    clients = Clients(artifacts(ec2_run))
     emr = clients.stub("emr")
     emr.add_client_error("describe_cluster", service_error_code="AccessDeniedException")
     _step_added(emr, ec2_run)
@@ -162,7 +170,7 @@ def test_a_step_starts_as_before_when_the_role_cannot_be_read(ec2_run):
 
 def test_a_named_role_has_no_forge_policy_to_check(ec2_run):
     named = dataclasses.replace(ec2_run, role_arn="arn:aws:iam::123456789012:role/data/steps")
-    clients = Clients()
+    clients = Clients(artifacts(named))
     _step_added(clients.stub("emr"), named)
     assert ad.adapter_for(named, clients).start("tok") == "s-1"
     clients.done()  # no describe_cluster, no IAM read

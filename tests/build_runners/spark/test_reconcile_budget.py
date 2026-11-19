@@ -20,7 +20,7 @@ from tests.build_runners.spark.conftest import variant
 from tests.build_runners.spark.test_reconcile import WALL, FakeAdapter, go, info
 
 HOUR = RESTART_WINDOW_S
-ACCOUNT = "123456789012"  # FakeAdapter.account()
+ACCOUNT = "123456789012"  # the account the use fixture binds a fake's run to
 
 
 @pytest.fixture
@@ -352,23 +352,29 @@ def test_reconcile_never_stops_a_removed_build(run, clock, use, monkeypatch):
 
 
 def test_the_uploaded_job_is_compared_with_its_account_and_msk_brokers_put_back(ec2):
+    arn = f"arn:aws:kafka:eu-west-1:{ACCOUNT_TOKEN}:cluster/lake/abc"
     text = json.dumps(
         {
             "mode": "streaming",
             "sink": {"bucket": f"fluid-{ACCOUNT_TOKEN}-lake"},
-            "source": {"bootstrapServers": MSK_BROKERS_PLACEHOLDER, "topic": "orders"},
+            "source": {
+                "bootstrapServers": MSK_BROKERS_PLACEHOLDER,
+                "mskClusterArn": arn,
+                "topic": "orders",
+            },
         }
     )
-    run = dataclasses.replace(ec2, job_text=text)
+    run = dataclasses.replace(ec2, job_text=text).bind(account=ACCOUNT)
     deployed = json.loads(uploaded(run))
     assert deployed["sink"]["bucket"] == f"fluid-{ACCOUNT}-lake"
-    assert not rc._job_differs(run, json.dumps(deployed, indent=2), ACCOUNT)
+    assert not rc._job_differs(run, json.dumps(deployed, indent=2).encode())
     deployed["source"]["topic"] = "payments"
-    assert rc._job_differs(run, json.dumps(deployed), ACCOUNT)
-    assert rc._job_differs(run, "not json", ACCOUNT)
-    assert rc._job_differs(run, uploaded(run), "210987654321")  # another account's
+    assert rc._job_differs(run, json.dumps(deployed).encode())
+    assert rc._job_differs(run, b"not json")
+    other = dataclasses.replace(ec2, job_text=text).bind(account="210987654321")
+    assert rc._job_differs(other, uploaded(run).encode())  # another account's
     deployed["source"].update(topic="orders", bootstrapServers="")
-    assert rc._job_differs(run, json.dumps(deployed), ACCOUNT)  # brokers the apply never wrote
+    assert rc._job_differs(run, json.dumps(deployed).encode())  # brokers the apply never wrote
 
 
 def test_a_failure_text_never_carries_terminal_escape_sequences(ec2, clock, use):

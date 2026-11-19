@@ -40,6 +40,7 @@ which follow ``java.util.Properties.load``, as spark-submit reads ``--properties
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -65,7 +66,7 @@ from fluid_build.build_runners.spark._adapters import (
     RunInfo,
     SparkRunError,
 )
-from fluid_build.build_runners.spark._desired import RESTART_WINDOW_S, DesiredRun
+from fluid_build.build_runners.spark._desired import RESTART_WINDOW_S, DesiredRun, config_digest
 from fluid_build.spark.names import RUNNER_FILE
 
 #: Operator-only: the spark-submit to run, an absolute path or a name on ``PATH``.
@@ -809,6 +810,8 @@ def start_run(
     sub = submitter(host)
     bound = run.bind(local_root=sub.root)
     publish(sub, bound, runner_text)
+    # What publish wrote, which the runner checks before it reads anything.
+    bound = dataclasses.replace(bound, job_sha256=config_digest(bound.job_text))
     runs = LocalRuns(host, run.product, run.build)
     _confined(host.workspace, runs.dir)  # before anything is created through a link
     with _locked(runs.dir / "start.lock"):

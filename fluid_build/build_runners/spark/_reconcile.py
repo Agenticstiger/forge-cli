@@ -76,7 +76,7 @@ from fluid_build.build_runners.spark._adapters import (
     SparkRunError,
     adapter_for,
 )
-from fluid_build.build_runners.spark._desired import ACCOUNT_TOKEN, RESTART_WINDOW_S, DesiredRun
+from fluid_build.build_runners.spark._desired import RESTART_WINDOW_S, DesiredRun
 
 MAX_POLL_S = 15.0
 #: Failed reads in a row before a wait gives up (the run is never cancelled for them).
@@ -297,37 +297,25 @@ def _retried_text(run: DesiredRun, last: RunInfo) -> str:
     )
 
 
-def _job_differs(run: DesiredRun, deployed: str, account: Optional[str]) -> bool:
-    """Whether the uploaded job config is another job than the one ``run`` compiles to.
-
-    OpenTofu uploads the compiled config with the account it runs in and, for a source
-    named by its MSK cluster, that cluster's brokers in place of the placeholder
-    (``iac/providers/aws_ingest.py::_job_content``); both are put back before comparing.
-    The brokers come from the cluster the contract names (compared with the rest), and a
-    cluster's broker list changes with the cluster, so any non-empty list is taken; reading
-    them back from MSK would take another permission."""
+def _job_differs(run: DesiredRun, deployed: bytes) -> bool:
+    """Whether the uploaded job config is another job than the one ``run`` (bound to its
+    account) compiles to: :meth:`DesiredRun.config_matches`, which puts aside the MSK
+    brokers OpenTofu fills in. A stream named by its MSK cluster whose uploaded config names
+    no broker at all is another job too: OpenTofu always writes them."""
     import json
 
     from fluid_build.spark.compiler import MSK_BROKERS_PLACEHOLDER
 
-    text = run.job_text
-    if account and ACCOUNT_TOKEN in text:
-        text = text.replace(ACCOUNT_TOKEN, account)
-    try:
-        want, got = json.loads(text), json.loads(deployed)
-    except ValueError:
+    if not run.config_matches(deployed):
         return True
-    source = want.get("source") if isinstance(want, dict) else None
-    if (
-        isinstance(source, dict)
-        and source.get("bootstrapServers") == MSK_BROKERS_PLACEHOLDER
-        and isinstance(got, dict)
-        and isinstance(got.get("source"), dict)
-        and isinstance(got["source"].get("bootstrapServers"), str)
-        and got["source"]["bootstrapServers"].strip()
-    ):
-        got = {**got, "source": {**got["source"], "bootstrapServers": MSK_BROKERS_PLACEHOLDER}}
-    return bool(got != want)
+    if MSK_BROKERS_PLACEHOLDER not in run.job_text:
+        return False
+    try:
+        source = json.loads(deployed.decode("utf-8")).get("source")
+    except (ValueError, AttributeError):
+        return True
+    servers = source.get("bootstrapServers") if isinstance(source, dict) else None
+    return not (isinstance(servers, str) and servers.strip())
 
 
 def _not_as_deployed(
@@ -353,8 +341,7 @@ def _not_as_deployed(
         uri = adapter.run.job_uri
         if deployed is None:
             return f"no job config at {uri}: the build is not deployed. Run fluid apply"
-        account = adapter.account() if ACCOUNT_TOKEN in run.job_text else None
-        if _job_differs(run, deployed, account):
+        if _job_differs(adapter.run, deployed):
             return (
                 f"the job config at {uri} is not the one the contract compiles to (another "
                 f"apply uploaded it, or it was edited), and a restart would run it. {apply_hint}"

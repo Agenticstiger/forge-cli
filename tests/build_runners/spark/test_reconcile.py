@@ -87,10 +87,7 @@ class FakeAdapter:
             raise SparkRunError(self.target_error)
 
     def deployed_job(self):
-        return self.job
-
-    def account(self):
-        return "123456789012"
+        return self.job.encode("utf-8") if isinstance(self.job, str) else self.job
 
     def cancel(self, run_id):
         self.calls.append(f"cancel {run_id}")

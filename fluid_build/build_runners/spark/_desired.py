@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -148,6 +149,45 @@ _CONF_DENIED_PREFIXES = (
 )
 
 
+def config_digest(text: str) -> str:
+    """The sha256 a run's job config is started with (``--fluid-job-sha256``) and checked
+    by: its JSON in one canonical form (keys sorted, strings in NFC, as OpenTofu writes
+    them), the MSK brokers OpenTofu fills in for an ``mskClusterArn`` source left out, so a
+    broker list MSK changes does not stop a stream's retries. The same function is in
+    forge's Spark runner (``fluid_build/spark/runner/forge_spark_runner.py``).
+
+    Raises:
+        ValueError: the text is not a JSON object.
+    """
+    config = _nfc(json.loads(text))
+    if not isinstance(config, dict):
+        raise ValueError("the job config is not a JSON object")
+    source = config.get("source")
+    if isinstance(source, dict) and source.get("mskClusterArn"):
+        source["bootstrapServers"] = None
+    canonical = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _nfc(value):
+    if isinstance(value, str):
+        return unicodedata.normalize("NFC", value)
+    if isinstance(value, list):
+        return [_nfc(v) for v in value]
+    if isinstance(value, dict):
+        return {_nfc(k): _nfc(v) for k, v in value.items()}
+    return value
+
+
+def same_config(body: bytes, compiled: str) -> bool:
+    """Whether ``body`` is the ``compiled`` job config: the same JSON, the MSK brokers
+    OpenTofu fills in aside."""
+    try:
+        return config_digest(body.decode("utf-8")) == config_digest(compiled)
+    except ValueError:  # UnicodeDecodeError included
+        return False
+
+
 def _sha(value: Any) -> str:
     text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -189,6 +229,9 @@ class DesiredRun:
     #: in the config hash.
     restarts_per_hour: int = 0
     job_text: str = field(default="", repr=False, compare=False)
+    #: The sha256 of the job config the run's runtime reads, once ``fluid apply`` has read
+    #: it back (or written it, for a local run): the runner refuses any other config.
+    job_sha256: Optional[str] = field(default=None, compare=False)
 
     @property
     def long_running(self) -> bool:
@@ -196,7 +239,10 @@ class DesiredRun:
 
     @property
     def needs_account(self) -> bool:
-        return any(ACCOUNT_TOKEN in v for v in (self.job_uri, self.runner_uri, self.role_arn))
+        return any(
+            ACCOUNT_TOKEN in v
+            for v in (self.job_uri, self.runner_uri, self.role_arn, self.job_text)
+        )
 
     @property
     def needs_region(self) -> bool:
@@ -236,6 +282,8 @@ class DesiredRun:
             region=region if region and self.needs_region else self.region,
             job_uri=sub(self.job_uri),
             runner_uri=sub(self.runner_uri),
+            # The config as OpenTofu uploads it (its account filled in), to check it against.
+            job_text=sub(self.job_text),
             role_arn=sub(self.role_arn),
             checkpoint=sub(self.checkpoint) if self.checkpoint else self.checkpoint,
         )
@@ -254,8 +302,17 @@ class DesiredRun:
     def entry_args(self, restart_of: Optional[str] = None) -> List[str]:
         """The runner's arguments. ``restart_of`` marks a run started again after the run it
         names died: the reconcile counts those marks against :attr:`restarts_per_hour`."""
-        mark = [RESTART_FLAG, restart_of] if restart_of else []
-        return ["--config", self.job_uri, *self.identity_args(), *mark]
+        args = ["--config", self.job_uri, *self.identity_args()]
+        if self.job_sha256:
+            args += ["--fluid-job-sha256", self.job_sha256]
+        if restart_of:
+            args += [RESTART_FLAG, restart_of]
+        return args
+
+    def config_matches(self, body: bytes) -> bool:
+        """Whether ``body``, the job config read back from where the runtime reads it, is
+        the one this run was compiled to (:func:`config_digest`)."""
+        return same_config(body, self.job_text)
 
     def tags(self) -> Dict[str, str]:
         tags = {
@@ -767,3 +824,32 @@ def desired_runs(
 def plan_actions(contract: Mapping[str, Any], **kwargs: Any) -> List[Dict[str, Any]]:
     """The ``spark.reconcile`` actions of the contract's Spark builds (steps from 1)."""
     return [run.plan_action(step) for step, run in enumerate(desired_runs(contract, **kwargs), 1)]
+
+
+def located_run(
+    product: str, build: str, runtime: str, region: str, target: Mapping[str, str]
+) -> DesiredRun:
+    """A build's run as a destroy finds it: by the build's run name on ``target``.
+
+    For a build the contract no longer has, whose runs must stop before the apply destroys
+    its role and artifacts; nothing else of it is known, and nothing is started from it."""
+    return DesiredRun(
+        product=product,
+        build=build,
+        runtime=runtime,
+        mode="",
+        scheduled=False,
+        region=region,
+        config_hash="",
+        job_digest="",
+        runner_sha256="",
+        job_uri="",
+        runner_uri="",
+        run_name=_names.run_name(product, build),
+        role_arn="",
+        target=dict(target),
+        release_label=None,
+        glue_version=None,
+        spark_conf={},
+        retry_attempts=None,
+    )

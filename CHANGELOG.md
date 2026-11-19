@@ -48,6 +48,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once, with every build's target, role and artifacts, as one statement per build reached the
   6,144-character limit of a managed policy at about six builds.
 
+### Fixed
+
+- **A Spark build that leaves the contract on AWS has its runs stopped before its role goes.**
+  `fluid apply` destroyed the build's role, artifacts and log group but left its stream running
+  until those were gone, and a product destroy failed part way: EMR Serverless deletes only a
+  stopped application, and IAM no policy that is still attached. Before `tofu apply`, the apply
+  now reads the plan's deletes and cancels every active run of a build that goes (found by its
+  run name where its log group's new `fluid_runtime`, `fluid_run_target` and `fluid_run_region`
+  tags say it runs), stops the steps of a build moved off EMR on EC2 (its job policy carries the
+  same tags), stops the runs of a Glue job that goes, and cancels the runs in the product's own
+  EMR Serverless application and stops it. An IAM policy the plan destroys that is still
+  attached (an EMR on EC2 build's job policy, the scheduler's caller policy) refuses the apply
+  first, with the `aws iam detach-*-policy` commands; nothing is stopped or destroyed. A run
+  still going after `FLUID_SPARK_WAIT_SECONDS` also refuses the apply before anything is
+  destroyed. `--dry-run` reads and says what it would cancel. The first apply after the upgrade
+  adds the three tags in place to each Spark build's log group and EMR on EC2 job policy.
+
+### Changed
+
+- **A Spark run starts only on the job config `fluid apply` compiled.** Every runtime, local
+  included, now passes the config's digest at submit (`--fluid-job-sha256`: the sha256 of its
+  canonical JSON, strings in NFC as OpenTofu writes them, the MSK brokers OpenTofu fills in left
+  out so a broker change does not stop a stream's retries), and forge's Spark runner refuses any
+  other config before it reads anything. On AWS, `fluid apply` first reads the config and the
+  runner OpenTofu uploaded back from S3 and starts nothing unless they are the ones this apply
+  compiled, so a config another apply put there since never runs under the run's config hash.
+  The artifact bucket's write access stays the boundary. A scheduler's role already reads both
+  objects. The runner changed, so each running Spark stream restarts once on its next apply.
+
 ## [0.33.0] — 2026-11-19
 
 ### Added
