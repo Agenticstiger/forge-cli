@@ -9,6 +9,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid policy apply` grants a Lakekeeper table in Lakekeeper.** An Iceberg expose whose
+  `binding.location.catalog` is `lakekeeper` used to compile to a warning ("enforce it in the
+  catalog's own access control"). `fluid policy compile` now writes one `provider: lakekeeper`
+  binding per table and principal, from `accessPolicy.grants` (scoped by `resources`), the
+  deprecated `metadata.policies` and the expose's `policy.authz` readers (`select`) and writers
+  (`modify`). `read`, `select` and `query` become `select`; `write`, `insert`, `update`, `delete`,
+  `manage` and `admin` become `modify`; `create`, which Lakekeeper grants only on a namespace or
+  warehouse, is reported. `binding.principals` maps a logical principal to a Lakekeeper `user:`
+  (its id `oidc~<subject>`, name or e-mail), `serviceAccount:` or `role:`. A `group:` names the
+  Lakekeeper role of that name, since Lakekeeper with OpenFGA reads no group from the identity
+  provider. Stage 8 reads each table's direct grants through Lakekeeper's management API and
+  sends only the difference, in one request per table. It grants what the contract declares,
+  revokes any other `describe`, `select` or `modify` on that table, and never touches ownership
+  or grant management. `--mode check` makes the same reads and changes nothing. A table its
+  writer has not created yet (the build, or a sink at its first commit) is reported as pending
+  in both modes, and nothing is granted on it until a later run. It fails closed: a principal
+  Lakekeeper does not know, or one that does not map to a Lakekeeper identity at compile time,
+  leaves its table's grants as they are, since granting the others alone would revoke it, and a
+  grant whose `resources` cannot be evaluated leaves every Lakekeeper table as it is. The contract
+  names the tables, so the operator lists the namespaces a run may change in
+  `FLUID_LAKEKEEPER_NAMESPACE_ALLOWLIST`: comma-separated `<warehouse>/<namespace prefix>` entries,
+  matched on whole dotted levels. Unset allows none. Enforce mode refuses a table outside it before
+  sending any request for it, and names the entry to export; check mode still reads and reports
+  the tables it would refuse. Give stage 8 an identity that manages only the product's own
+  namespaces: on OpenFGA the identity that creates a namespace owns it, which is enough. A user
+  principal with an `@` is matched by e-mail only, any other by exact name only; neither is
+  spoof-proof where the identity provider lets a user set their own name or e-mail, so compile
+  warns, and a person is best mapped by id (`user:oidc~<subject>`). The operator signs forge in
+  with `FLUID_LAKEKEEPER_CREDENTIAL_REF`, a secret reference to `client_id:client_secret`, plus
+  `FLUID_LAKEKEEPER_OAUTH2_SERVER_URI` and `FLUID_LAKEKEEPER_SCOPE`, or with
+  `FLUID_LAKEKEEPER_TOKEN_REF`. These names are operator-only. The reference must be allowed for
+  the catalog's host in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, both URLs must be https, and
+  redirects are not followed. That entry pins the host only, so the contract still picks the port
+  and path: give Lakekeeper a host of its own, and allow the reference for that host (`NAME@host`),
+  not for any host. A private CA works through `REQUESTS_CA_BUNDLE` or `SSL_CERT_FILE`. A
+  Lakekeeper exposure in a file that also holds cloud bindings goes to Lakekeeper, and the rest to
+  the provider, as before.
+
+- **`fluid doctor --contract` says whether an operation can run here, before CI starts.**
+  `fluid doctor --contract <file> [--operation validate|generate|plan|apply|ship] [--env NAME]
+  [--provider P] [--state-backend SPEC] [--json]` (a `.tgz` bundle too) reports the schema revision the contract resolves to (with the bundled file's
+  sha256), the Forge build, each extra against the pins this build declares, the plugins
+  installed through entry points, `tofu`, `dbt` and `spark-submit`, the dbt adapters and the
+  OpenTofu provider pins, and every capability in one of four classes: `exact`, `lossy`,
+  `unsupported` or `requires-live-proof`. Column types come from the emitters' own type
+  tables, and every other finding from the rules and installed validators `fluid validate`
+  runs, so a BigQuery column
+  `generate iac` refuses (a bare `array`) is `unsupported` here first. `validate`, `generate`
+  and the offline `plan` need no cloud, credential or tool, so a catalog-only contract on AWS
+  lists no AWS identity; `apply` and `ship` list the cloud's identity and the state backend as
+  `requires-live-proof`, resolve the cloud and the state backend as `apply` does (a contract on
+  several clouds needs `--provider`), and find dbt as the dbt runner does. It is offline: it fetches no schema, provider or tool and installs
+  nothing. `--live` adds read-only checks (STS `GetCallerIdentity`, a GCP token refresh, a
+  state-bucket read) and prints no identity. `fluid doctor --compare LEFT RIGHT` compares two
+  saved `--json` reports (format `fluid-preflight/1`) and names each version gap the operation
+  cares about with what to change. A report holds no environment value (no path, account, bucket or variable value) and
+  goes through both redaction layers. `--strict` also fails on `lossy`. `fluid doctor --env`
+  alone still lists the kill switches.
+
+- **A saved OpenTofu plan applies on another runner, and only on the target it was made for.**
+  `fluid plan --tofu` now records the plan's target in its `opentofuPlan` record (under
+  `planDigest`): the cloud account and region (AWS, from STS `GetCallerIdentity` and the provider's
+  region), the project and region (GCP, from the defaults the `hashicorp/google` provider reads),
+  the organization and account (Snowflake) or the workspace host (Databricks), plus the state
+  backend block, the `tofu` version and the provider versions `tofu init` locked; it prints
+  `target: aws account …, region …`. `fluid apply plan.json` reads the target again before
+  anything runs, the state-key migration and the plugin's hooks included, and refuses another one
+  (`apply_plan_digest_tofu_plan_target_mismatch`), a recorded field it cannot read
+  (`…_target_unverified`), another `tofu` or provider version (`…_tofu_plan_toolchain`), another
+  backend configuration (`…_tofu_plan_target`) or a plan without the record
+  (`…_target_missing`). A field the plan's runner could not read (no boto3, say) is named at plan
+  time and named again at apply, and not compared. The provider lock travels with the plan as
+  `<stem>.terraform.lock.hcl` (sha256 under `planDigest`) and is installed before the apply's
+  `tofu init`, so another runner days later installs the providers the plan was reviewed with; a
+  missing or altered lock is refused (`…_tofu_plan_lock_missing` / `…_lock_mismatch`).
+  `--no-verify-plan-binding` skips the check, logged. With a state backend
+  both runners reach, a plan made on one runner applies unchanged on another at another checkout
+  path; a plan made on local state that the applying runner does not have is refused as
+  `apply_plan_digest_tofu_plan_state_missing` instead of "stale".
+  A field the plan could not bind is also logged at WARNING at apply
+  (`apply_tofu_plan_target_field_unbound`, naming the provider, the field and why), and a
+  provider forge reads no target for (`confluent`, an entry-point plugin) is named at plan and
+  at apply (`plan_tofu_target_provider_unbound` / `apply_tofu_plan_target_provider_unbound`).
+  The AWS region falls back to the named profile's `region` in the shared config file, and the
+  profile is `AWS_PROFILE`, else `AWS_DEFAULT_PROFILE`, the order the `hashicorp/aws` provider
+  reads them in.
+- **`fluid plan` and `fluid apply` warn when an EMR on EC2 cluster can lose a Spark build to
+  Spot.** For each `runtime: emr-ec2` build, forge reads its `clusterId` once
+  (`DescribeCluster`, then `ListInstanceGroups` or `ListInstanceFleets`) and warns, never
+  refuses, in three cases, each with its fix: the primary node runs on Spot (the build's driver
+  runs there, in client mode); core nodes run on Spot; or core or task nodes run on Spot and the
+  cluster's yarn-site does not keep YARN application masters on On-Demand nodes
+  (`yarn.node-labels.enabled=true` with `yarn.node-labels.am.default-node-label-expression`
+  `ON_DEMAND` on EMR 7.x, or `CORE` while the core nodes are all On-Demand; EMR 5.19 to 5.x
+  keep masters on `CORE` by default). The fix names `ON_DEMAND` from EMR 7.2, where managed
+  scaling places masters by it, and `CORE` before. The yarn-site read is the cluster's,
+  overridden by the primary instance group's applied configurations or the primary fleet's
+  instance types. A cluster that cannot be read (no
+  permission, no credentials, unreachable, ended) and `fluid apply --dry-run` print nothing;
+  each read waits at most 3 s to connect and 10 s to answer, twice. The warnings are not in
+  `plan.json`. The caller policy forge emits for scheduled emr-ec2 builds now also grants
+  `elasticmapreduce:DescribeCluster`, `ListInstanceFleets` and `ListInstanceGroups` on the
+  cluster.
+- **The generated GitLab pipeline hands each job exactly what the last one produced.**
+  `fluid generate ci --system gitlab` now writes:
+  - **Run pipeline form:** the form is `spec:inputs` (GitLab 17.11 or later). It holds the 11
+    stage switches and nine knobs: `FLUID_ENV`, `APPLY_MODE`, `ALLOW_DATA_LOSS`,
+    `NO_VERIFY_DIGEST`, the two strict switches, `PUBLISH_TARGETS`, `SCHEDULER` and
+    `SCHEDULE_SYNC_DRY_RUN`. That is GitLab's limit of 20. Each input sets the job variable of
+    the same name and is never pasted into a script. Every other value is a plain default
+    that a project CI/CD variable sets, and the form needs no pipeline variables.
+  - **Release packet:** on the default branch, `fluid-plan` runs `fluid ship --stage 1-6
+    --release-dir release`. `fluid-apply` downloads that job's artifacts (`needs` and
+    `dependencies`) and does not start without `release/release.json`. On the default
+    branch, stages 1-4 must run and `release/` must not be in the repository: otherwise ship
+    refuses the packet and the plan fails with its reason.
+  - **Merge requests:** a merge request plans without a packet and never gets an apply job,
+    and neither does any other ref. `fluid-impact` publishes `fluid diff --baseline --impact`
+    of the contract against the merge request's base as Markdown and JSON (`expose_as: fluid
+    impact`), beside ship's JUnit report. Its resource section reads `unknown`, with the reason,
+    while ship's stage 6 saves no OpenTofu plan.
+  - **Free-text inputs:** `fluid_env` follows ship's environment grammar and `publish_targets`
+    takes target names only, so an input cannot name another variable for GitLab to expand.
+  - **Failed plans:** a `fluid-plan` that fails keeps its reports and drops its bundle, plan,
+    OpenTofu plan files and artifacts before they are uploaded, so nothing a failed run wrote
+    reads as deployable.
+
 - **A BigQuery table is partitioned and clustered as its binding declares.**
   `binding.location.partitionBy` was read only with `lifecycle.expire`, and
   `binding.properties.cluster_by` (honoured on Snowflake) was read by nobody on BigQuery. Both
@@ -143,6 +270,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another build's DAG would otherwise run twice). `fluid validate` warns about an Airflow
   task's `buildStepRef`: no generated DAG runs one.
 
+- **Which declared rules each engine can run, and rules that must run.** `fluid generate
+  dbt-tests --coverage` prints, for every declared invariant, identifier format, placeholder
+  declaration and shared attribute, whether DuckDB, Snowflake, BigQuery, Databricks, PostgreSQL
+  and Athena can run it, and the reason where one cannot (the validator refuses it, a construct
+  has no exact SQL, a link crosses platforms); `--coverage-out PATH` writes the same as JSON.
+  `--require-rule ID` (repeatable) or `--require-all-rules` makes generation fail, writing
+  no tests, when a selected adapter cannot run a required rule, when nothing tests a rule named
+  by id, or when the contract declares rules below 0.7.7, where they do not run; `--adapter TYPE` selects the
+  adapters (default: those of the platforms the contract's exposes bind to).
+- **A Databricks dbt job tests the declared rules too.** `fluid apply` adds each declared rule on
+  an expose the build writes to the uploaded project as a singular test,
+  `<test path>/fluid_dq/<model>/fluid_dq_<id>.sql`, in Databricks SQL printed from the parsed
+  expression, and the run report names it with what dbt found. A rule with no exact Databricks
+  SQL, or one that reads an expose the build does not write, is refused at plan, like any other
+  contract rule the job cannot run.
+
+- **`fluid generate dbt-tests` runs declared invariants as dbt tests.** On a 0.7.7 contract each
+  declared invariant, identifier format, bounded placeholder declaration, shared column and
+  shared attribute becomes one `fluid_rule` generic test on its model, and the `fluid_rule`
+  macro is written to `<project>/<first macro-paths entry>/fluid/fluid_rule.sql` (the nearest
+  `dbt_project.yml` above `--out`; the new `--macros-dir` overrides it, and a file fluid did not
+  write is never overwritten). Each test carries its SQL for every engine forge renders, and the
+  macro picks by `target.type` (DuckDB, Snowflake, BigQuery, Databricks or Spark, PostgreSQL,
+  Athena or Trino), so one project runs on DuckDB locally and on Athena live; an adapter with no
+  rendering fails that test with a message naming the rule. The SQL is printed from the parsed
+  expression and joins linked models with `ref()`; the band is compared exactly, in rows or as
+  `100 * violating` against `value * covered`; `severity: warning` and `info` warn. Every piece
+  of contract text reaches dbt as a Jinja string literal, so `{{` in a name or literal stays
+  data. A rule no engine can run is logged with its reason and not tested. A column's
+  placeholder values and prefixes are now exempt from its own `accepted_values` and range tests,
+  through a `where` config per adapter.
+
 - **Declared invariants become ODCS quality rules.** On a 0.7.7 contract, `fluid generate
   standard --format odcs` now writes each `exposes[].contract.invariants[]` entry, each
   identifier format and placeholder declaration, each `sharedColumns` entry and each member of a
@@ -213,7 +372,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--explain` says why. A release run reads only local files: it opens no network connection
   of its own.
 
+- **`fluid verify --require-every-port` fails unless every expose was verified.** `--strict`
+  fails only a run that verified nothing, so a run that verified one port passed while its
+  others were skipped. With the flag, each skipped expose fails the run (exit 1) and is named
+  with why: no verifier for the binding, a reference-only table not built yet, an entry with
+  no `exposeId` (never checked), or an id declared twice. A contract with no expose fails too.
+  A managed streaming contract keeps its whole-contract check from checkpoint evidence, and
+  the run says so.
+  The run's message names every one of them. It needs no
+  `--strict`, `--warn-only` does not downgrade it, and `--expose` beside it is refused (exit
+  2). The `--out` report lists the unverified exposes under `require_every_port`. `fluid ship
+  --release-dir` passes it to stage 9, so a release never stands for a port nobody verified.
+
 ### Changed
+
+- **A test run installs each OpenTofu provider once.** The tests that run `tofu init` put a
+  copy of the provider into every test's own directory (0.75 GB for `hashicorp/aws`,
+  downloaded each time), so one run of `tests/iac` wrote 15-31 GB into pytest's basetemp
+  (27.6 GiB measured). A run now shares one provider cache between all its workers
+  (`tests/_infrastructure/tofu_cache.py`): a test directory holds a symlink, the whole basetemp
+  is 1 GiB, and `TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE` is set because without a lock
+  file OpenTofu downloads a cached provider again on every `init`. A `TF_PLUGIN_CACHE_DIR` you
+  set is used as given, which keeps providers between runs. Test infrastructure only: the
+  product is unchanged.
 
 - **`ship-report.json` is versioned: `"schema": "fluid-ship-report/2"`.** Every stage has one
   of six statuses: `passed`, `failed`, `skipped-by-policy` (a flag, a `RUN_STAGE_*` switch or
@@ -258,6 +439,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the stream. When the identity cannot read them (`elasticmapreduce:DescribeCluster`,
   `iam:GetInstanceProfile`, `iam:ListAttachedRolePolicies`), the step starts as before. The
   scheduler's caller policy gains those three reads.
+
+- **A decimal's arguments are a precision and scale its engine holds, or the column is refused.**
+  A decimal kept whatever arguments it declared, so `decimal(1;drop table x)` went into the
+  Snowflake table's DDL as `NUMBER(1;drop table x)` from `fluid generate iac`, and into the dbt
+  SQL, and `decimal(40,20)` became a NUMBER Snowflake rejects at apply. The arguments are now a
+  precision and an optional scale in digits, the precision at least 1 and the scale no larger,
+  within the engine's limits (Snowflake NUMBER and Redshift DECIMAL: precision to 38, scale to
+  37; Databricks and DuckDB DECIMAL: precision to 38; BigQuery's NUMERIC and BIGNUMERIC as
+  before). `fluid validate` refuses the rest on Snowflake, as it does on Databricks and
+  BigQuery, `fluid generate iac` refuses it, and `fluid generate transformation` refuses it
+  where it writes the column's type for the build's dbt adapter (a skeleton model's casts, a
+  model contract's `data_type`). On BigQuery, arguments that are not digits are refused
+  instead of read as a bare NUMERIC. The dbt BigQuery types no longer keep arguments the
+  emitter refuses (`decimal(2,5)` was `numeric(2,5)`). A type that takes no precision on the
+  engine, such as `bignumeric` on Snowflake or `money`, drops its arguments as before.
+- **The dbt engine and the IaC emitters type a column alike on BigQuery and Snowflake, and a
+  BigQuery decimal keeps its precision and scale.** A dbt model builds into the table `fluid
+  apply` creates, and the two wrote many types differently, so each dbt rebuild and each apply
+  changed the other's column back. On BigQuery, dbt wrote `string` for `int16`, `int64`,
+  `float32`, `float64`, `binary`, `geometry` and other types the emitter writes as INT64, FLOAT64,
+  BYTES or GEOGRAPHY, and `timestamp` for a `timestamp_ntz` the emitter writes as DATETIME. On
+  Snowflake, the emitter wrote VARCHAR for `smallint`, `json`, `geography`, `timestamp_ntz`,
+  `timestamptz` and others, while dbt wrote `varchar` for `int64`, `float64` and `bytes`. Each
+  adapter now has one table: dbt's BigQuery types come from the emitter's, and the Snowflake
+  emitter types through dbt's, as Databricks already did; on BigQuery dbt's contract drops a
+  `varchar(n)` length, as the emitter writes STRING. On Snowflake a `json` column is VARIANT,
+  which holds any JSON value (OBJECT holds only an object), `money` is NUMBER(19,4) (a bare NUMBER
+  is NUMBER(38,0) and drops the cents), and `timestamptz` is TIMESTAMP_TZ. A declared type keeps
+  its arguments only in a type of the same family: `varchar(max)` is a bare VARCHAR except on
+  Redshift, a `tinyint(1)` display width no longer becomes NUMBER(1), and `timestamp(12)` is a
+  bare TIMESTAMP_NTZ. A Snowflake table applied before this change keeps the types the emitter
+  wrote then, and Snowflake cannot change a live column to another type (its `ALTER COLUMN` only
+  lengthens text or changes a NUMBER), so a column whose type changes here needs its table
+  migrated; a table a dbt build replaces already has dbt's types. A BigQuery `decimal(p,s)` was a
+  bare NUMERIC, which is NUMERIC(38,9), while dbt wrote `numeric(p,s)`; it is now NUMERIC(P,S), or
+  BIGNUMERIC(P,S) where only BIGNUMERIC holds the range. A decimal wider than a BIGNUMERIC still
+  warns, and one with a precision of 0 or a scale above its precision is now refused at validate.
+  BigQuery cannot give an existing NUMERIC column a precision, so the first plan after this change
+  replaces each live table that declares a decimal with a precision, once, which `fluid apply`
+  refuses without `--allow-data-loss`; declare the column `decimal` to keep the table as it is. A
+  table adopted into an empty state is replaced the same way, as a partitioned table already is.
+  Each contract with a BigQuery table gains one `terraform_data` that records this, so that plan
+  adds one more resource. After it, a new decimal column, a changed precision and a decimal made
+  bare are planned in place, and BigQuery refuses at apply a change it cannot make in place.
+- **`fluid generate ci` runs stage 3 for a contract with reference builds.** It turned
+  `RUN_STAGE_3_GENERATE_ARTIFACTS` off when any build was `hybrid-reference`, `reference` or
+  `external-reference`, so a contract with Spark builds beside one reference dbt build skipped
+  stage 4 and ran stages 8 and 11 without `dist/artifacts/policy/bindings.json` and
+  `dist/artifacts/schedule/`. `fluid generate artifacts` writes both for reference builds too,
+  so only `--no-generate-artifacts` turns stage 3 off now.
+- **`--install-mode dev-source` puts `fluid` on PATH.** On GitHub, GitLab, Azure DevOps,
+  Bitbucket, CircleCI and Tekton the install step exported `PYTHONPATH=/forge-cli-src`, which
+  ended with the step or subshell and never provided the command, so every `fluid ship` step
+  failed with "command not found". It now runs `pip install -e /forge-cli-src`, and a missing
+  mount or a failed install stops the job. Jenkins is unchanged.
+- **Generated pipelines pin their container images by digest.** Tekton, GitLab (both images),
+  Bitbucket and CircleCI named `python:3.12-slim`, `python:3.12` and `cimg/python:3.12` by tag;
+  each is now `<tag>@sha256:<index digest>`, kept beside the GitHub action pins and checked by
+  the same monthly job. `fluid generate ci --system tekton --image IMAGE` sets the Task image.
+
+- **`fluid validate` stops warning about a Spark or managed Flink build's own SQL once the
+  operator lists it.** The warning that `properties.sql` runs only if the operator lists the
+  build was printed for every build with SQL, whatever `FLUID_SPARK_CONTRACT_SQL_ALLOWLIST`
+  (or `FLUID_FLINK_CONTRACT_SQL_ALLOWLIST`) held, so `fluid validate --strict`, and with it
+  stage 2 of `fluid ship`, failed every Spark SQL batch even after the operator listed it.
+  Validate now asks the rule apply uses, under the same environment: the warning stays while
+  the build is not listed, and says so when the entry listed for it pins other SQL (the SQL
+  changed after review); a build listed by product, by build or pinned to its SQL is quiet.
+
+- **A Spark build runs on EMR on EKS.** EMR on EKS names an image of a release,
+  `emr-X.Y.Z-latest` or `emr-X.Y.Z-YYYYMMDD`, and forge sent it the plain `emr-7.12.0` every
+  other EMR runtime takes, refusing the suffixed forms everywhere (the 0.7.7 schema, the IaC
+  checks). Each EMR runtime now takes its own form, and an `emr-eks` build without
+  `releaseLabel` runs on `emr-7.12.0-latest`; EMR Serverless and EMR on EC2 keep `emr-7.12.0`.
 
 - **A Spark stream on AWS can read its own checkpoint.** The role forge creates for a Spark build
   could read and write `<prefix>/*` and list `<prefix>/*`, but Hadoop's `getFileStatus` first asks
@@ -309,6 +564,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`fluid generate dbt-tests` writes no contract text that dbt would run as Jinja.** dbt
+  renders a schema.yml's names, descriptions and test arguments as Jinja, and evaluates a test
+  argument that looks like `env_var(...)`, `var(...)`, `ref(...)`, `source(...)` or `doc(...)`
+  even without braces. A column name, description, enum value or other string from a contract
+  that holds `{{`, `{%` or `{#`, or looks like such a call, is now written as a Jinja string
+  literal of itself, so `dbt parse` reads it back as text; a column named
+  `x{{ env_var('SECRET') }}` used to print the variable. Every other string is written as
+  before. The `relationships` test keeps its own `ref('<model>')`.
+
 - **A quantile is published only when the records below and above it pass the threshold too.**
   A `quantile/1` group was published when ten records held its witness, with its two ranks, so a
   rank could say that 3 records lie below the witness, or that 2 lie above it. A group is now
@@ -334,7 +598,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subtract one histogram's published counts from another's, or from a level histogram's group
   size, and rebuild a withheld cell, a zero included. FLUX's `check_edge_counts` closes that, and
   forge-cli calls it once a flux-stats release carries it. That change completes the rule and
-  lands before the next forge-cli release.
+  lands in a later forge-cli release.
 
 ## [0.32.0] — 2026-11-18
 

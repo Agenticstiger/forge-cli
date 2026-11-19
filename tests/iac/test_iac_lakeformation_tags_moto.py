@@ -109,11 +109,11 @@ def moto_endpoint() -> Iterator[str]:
 
 
 @pytest.fixture(scope="module")
-def tofu_env(tmp_path_factory: pytest.TempPathFactory) -> Dict[str, str]:
+def tofu_env() -> Dict[str, str]:
     """No way to reach a real account: every ``AWS_*`` variable is dropped, the
-    endpoints are moto's and the keys are dummies; a shared plugin cache."""
+    endpoints are moto's and the keys are dummies; the run's provider cache
+    (tests/_infrastructure/tofu_cache.py) arrives with ``build_tofu_env()``."""
     env = {k: v for k, v in build_tofu_env().items() if not k.startswith("AWS_")}
-    env.setdefault("TF_PLUGIN_CACHE_DIR", str(tmp_path_factory.mktemp("tofu-plugin-cache")))
     env["AWS_CONFIG_FILE"] = "/dev/null"
     env["AWS_SHARED_CREDENTIALS_FILE"] = "/dev/null"
     env["AWS_EC2_METADATA_DISABLED"] = "true"
@@ -219,8 +219,9 @@ def _tofu(workdir: Path, env: Dict[str, str], *args: str) -> "subprocess.Complet
 
 
 def _init(workdir: Path, env: Dict[str, str]) -> None:
-    # A plugin cache shared by pytest-xdist workers is not safe for concurrent
-    # installs; OpenTofu refuses the lock instead of waiting, so that is retried.
+    # OpenTofu 1.12.0 and 1.12.1 could refuse a contended cache lock ("unable to acquire
+    # file lock ... resource deadlock avoided") when xdist workers shared a cache;
+    # 1.12.2 fixed it (opentofu#4166). The retry covers a machine still on those releases.
     for attempt in range(4):
         done = _tofu(workdir, env, "init", "-backend=false", "-input=false", "-no-color")
         if done.returncode == 0 or "unable to acquire file lock" not in done.stdout + done.stderr:

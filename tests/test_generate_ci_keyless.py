@@ -385,7 +385,8 @@ def test_a_local_only_contract_gets_no_oidc(tmp_path, monkeypatch):
 
 def _gitlab(tmp_path, monkeypatch, add_ons=()):
     files = _cloud_files(tmp_path, monkeypatch, "gitlab", add_ons)
-    return files, yaml.safe_load(files[".gitlab-ci.yml"])
+    _header, body = yaml.safe_load_all(files[".gitlab-ci.yml"])
+    return files, body
 
 
 def test_gitlab_both_phases_get_id_tokens_per_platform(tmp_path, monkeypatch):

@@ -738,6 +738,7 @@ def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
     (``secrets/policy.py``); repeating them here would print each twice.
     """
     from fluid_build.streaming.compiler import managed_lane_enabled
+    from fluid_build.streaming.contract_sql import contract_sql_warning
     from fluid_build.streaming.policy import HOST_ALLOWLIST_ENV
 
     if not managed_lane_enabled(contract):
@@ -749,12 +750,10 @@ def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
         return []  # validation_errors reports it
     for build in builds:
         props = build.get("properties") or {}
-        if props.get("sql") is not None:
-            warnings.append(
-                f"Build {build.get('id')}: properties.sql is run only if the operator lists "
-                f"{contract.get('id')} in {CONTRACT_SQL_ALLOWLIST_ENV}; properties.mapping is "
-                "checked against the output before deploy and reads nothing but the stream"
-            )
+        # Apply's rule (spark/policy.py) under this environment: a listed build is quiet.
+        sql_warning = contract_sql_warning(CONTRACT_SQL_ALLOWLIST_ENV, contract, build)
+        if sql_warning:
+            warnings.append(sql_warning)
         stream = props.get("stream")
         if not isinstance(stream, Mapping):
             continue

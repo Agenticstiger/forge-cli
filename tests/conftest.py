@@ -565,6 +565,11 @@ try:  # pragma: no cover
 except ImportError:
     pass
 
+# One OpenTofu provider cache for the whole run (autouse, session-scoped): every
+# tofu-backed test links its provider from it instead of installing a copy of its
+# own. See tests/_infrastructure/tofu_cache.py.
+from tests._infrastructure.tofu_cache import tofu_plugin_cache  # noqa: E402, F401
+
 # Keyless emulator fixtures (moto / fakesnow) for the `emulated`-marked
 # provider integration tests. Optional dependency: the `test-emulators`
 # extra. Absent it, the import is skipped and the emulator tests skip.

@@ -75,10 +75,11 @@ on:
           - stage3-all
           - databricks-minilake
 
-permissions:
-  contents: read
-  # Required for OIDC keyless auth to AWS + GCP.
-  id-token: write
+# Nothing at the workflow level: each job grants what it uses (zizmor's
+# excessive-permissions audit). Only the two Stage 3 jobs request an OIDC token, for
+# keyless auth to AWS and GCP; the jobs that run a pull request's test code get
+# contents: read and nothing else. tests/test_ci_iac_workflow_permissions.py holds this.
+permissions: {}
 
 jobs:
   # -------------------------------------------------------------------
@@ -87,6 +88,8 @@ jobs:
   stage1-unit:
     name: "Stage 1 — unit + tofu validate (tofu ${{ matrix.tofu.version }})"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: github.event_name != 'schedule'
     # Stage 1 and Stage 2 run once per OpenTofu release line this repository
     # supports: 1.12, the engine floor, and the newest stable
@@ -142,7 +145,7 @@ jobs:
       # The state-encryption canary runs the apply engine's pieces against this
       # tofu with OpenTofu's built-in terraform_data: no provider, no network.
       - name: Stage 1 — tofu validate and state encryption (creds-free)
-        run: .venv/bin/python -m pytest tests/iac/test_iac_tofu_validate.py tests/iac/test_iac_state_encryption_tofu.py -q
+        run: .venv/bin/python -m pytest tests/iac/test_iac_tofu_validate.py tests/iac/test_iac_state_encryption_tofu.py tests/iac/test_iac_tofu_plugin_cache.py -q
 
   # The tofu lanes are independent (each runs its own files against moto or an
   # in-process stand-in, and asserts its own junit), so each is its own job:
@@ -152,6 +155,8 @@ jobs:
   stage1-lanes:
     name: "Stage 1 — ${{ matrix.lane.name }} (tofu ${{ matrix.tofu.version }})"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
@@ -230,6 +235,24 @@ jobs:
               GCP governance plan=tests/iac/test_iac_gcp_governance_plan.py
               AWS column restrictions=tests/iac/test_iac_aws_column_restrictions.py
               GCP governance validate=tests/iac/test_iac_gcp_governance.py
+          # BigQuery table shapes (partitioning, clustering, nested columns,
+          # decimal precision and scale): a real plan and apply with
+          # terraform-provider-google against the same BigQuery stand-in.
+          # Whether a change to a live table is planned in place or as a
+          # replacement the data-loss gate refuses is the provider's call, so
+          # only a real plan proves it. Without tofu these tests skip, so no
+          # other job runs them.
+          - name: "BigQuery table shapes (tofu vs BigQuery stand-in, creds-free)"
+            tests: >-
+              tests/iac/test_iac_gcp_layout_plan.py
+              tests/iac/test_iac_gcp_nested_columns_plan.py
+              tests/iac/test_iac_gcp_decimal_parameters_plan.py
+            pytest-args: "-p no:randomly"
+            junit: bigquery-table-shapes.xml
+            require: |
+              GCP layout plan=tests/iac/test_iac_gcp_layout_plan.py
+              GCP nested columns plan=tests/iac/test_iac_gcp_nested_columns_plan.py
+              GCP decimal parameters plan=tests/iac/test_iac_gcp_decimal_parameters_plan.py
           # Databricks: the real `fluid` CLI, `tofu` and the databricks/databricks
           # provider against an in-process Unity Catalog stand-in. What the
           # data-loss gate decides depends on what the provider plans for a live
@@ -273,10 +296,12 @@ jobs:
           .venv/bin/pip install --quiet --upgrade pip
           .venv/bin/pip install --quiet -e '.[dev,test-emulators]'
 
-      # One provider download per lane: the tests use TF_PLUGIN_CACHE_DIR when
-      # it is set (env.setdefault) and a fresh temporary cache per module when
-      # it is not. A lane runs one pytest process, so nothing writes the cache
-      # concurrently (OpenTofu's plugin cache is not safe for that).
+      # One provider download per lane. tests/_infrastructure/tofu_cache.py gives every
+      # test the TF_PLUGIN_CACHE_DIR that is already set, and makes a cache of its own in
+      # the run's basetemp when none is (and sets the lock-file flag in both cases).
+      # OpenTofu 1.10 and later lock the cache for concurrent use, and 1.12.2 fixed a false
+      # deadlock report when processes share it (opentofu#4166); the lanes run 1.12.12 and
+      # 1.13.9, so the xdist workers of one run can share it too.
       - name: Share one provider cache across the lane's modules
         run: |
           mkdir -p "$RUNNER_TEMP/tofu-plugin-cache"
@@ -304,6 +329,8 @@ jobs:
   stage2-emulator:
     name: "Stage 2 — docker emulators (tofu ${{ matrix.tofu.version }})"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: github.event_name != 'schedule'
     # The same versions and checksums as stage1-unit.
     strategy:
@@ -437,6 +464,8 @@ jobs:
   nightly-databricks-minilake:
     name: "Nightly — Databricks vs minilake (non-gating)"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: >-
       github.event_name == 'schedule'
       || (github.event_name == 'workflow_dispatch' && inputs.stage == 'databricks-minilake')
@@ -496,6 +525,10 @@ jobs:
   stage3-aws:
     name: "Stage 3 — real AWS"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # OIDC keyless auth to AWS (aws-actions/configure-aws-credentials).
+      id-token: write
     if: >
       vars.IAC_STAGE3_ARMED == 'true' && (
         github.event_name == 'schedule' ||
@@ -555,6 +588,10 @@ jobs:
   stage3-gcp:
     name: "Stage 3 — real GCP"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # OIDC keyless auth to GCP (google-github-actions/auth).
+      id-token: write
     if: >
       vars.IAC_STAGE3_ARMED == 'true' && (
         github.event_name == 'schedule' ||

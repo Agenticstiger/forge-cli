@@ -72,7 +72,7 @@ LOG_RETENTION_DAYS = 30
 APPLICATION_MAX_CPU = "16 vCPU"
 APPLICATION_MAX_MEMORY = "64 GB"
 APPLICATION_IDLE_MINUTES = 15
-DEFAULT_RELEASE = "emr-7.12.0"
+DEFAULT_RELEASE = names.DEFAULT_RELEASE
 DEFAULT_GLUE_VERSION = "5.0"
 #: Spark's Kafka source names its consumer groups ``spark-kafka-source-...`` unless the
 #: build sets groupIdPrefix.

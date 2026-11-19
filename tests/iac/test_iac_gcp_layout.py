@@ -132,7 +132,8 @@ def test_no_partition_column_and_no_retention_writes_no_partitioning():
     resources = _resources(_contract())
     table = next(iter(resources["google_bigquery_table"].values()))
     assert "time_partitioning" not in table and "lifecycle" not in table
-    assert "terraform_data" not in resources and "clustering" not in table
+    assert "clustering" not in table
+    assert not [name for name in resources.get("terraform_data", {}) if "partitioning" in name]
 
 
 @pytest.mark.parametrize(

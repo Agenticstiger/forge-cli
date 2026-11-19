@@ -183,7 +183,7 @@ def test_each_declaration_becomes_a_marked_rule() -> None:
     assert '"BILLING"."CDP"."CONTRACTS"' in rules["fee_is_monthly"]["query"]
     fmt = rules["product_code.identifierFormat"]
     assert fmt["type"] == "library" and fmt["metric"] == "invalidValues"
-    assert fmt["arguments"] == {"pattern": "^((P[0-9]{5})|XXXXX|TBD_.*)$"}
+    assert fmt["arguments"] == {"pattern": "^((P[0-9]{5})|XXXXX|TBD_[\\s\\S]*)$"}
     assert fmt["dimension"] == "conformity"
     assert rules["product_code.placeholders"]["dimension"] == "completeness"
     unbounded = rules["channel.placeholders"]
@@ -197,7 +197,7 @@ def test_each_declaration_becomes_a_marked_rule() -> None:
 def test_properties_carry_the_pattern_and_the_derivation() -> None:
     odcs = _render(_contract())
     assert _property(odcs, "product_code")["logicalTypeOptions"] == {
-        "pattern": "^((P[0-9]{5})|XXXXX|TBD_.*)$"
+        "pattern": "^((P[0-9]{5})|XXXXX|TBD_[\\s\\S]*)$"
     }
     gross = _property(odcs, "gross")
     assert gross["transformLogic"] == "ROUND(net * (1 + tax_rate), 2)"
@@ -207,7 +207,7 @@ def test_properties_carry_the_pattern_and_the_derivation() -> None:
 def test_placeholders_are_exempt_from_the_existing_value_rules() -> None:
     rules = _rules(_render(_contract()))
     regex = rules["product_code-regex"]
-    assert regex["arguments"]["pattern"] == "^P|^(XXXXX)$|^(TBD_).*"
+    assert regex["arguments"]["pattern"] == "^P|^(XXXXX)$|^(TBD_)[\\s\\S]*"
     enum = rules["channel-enum"]
     assert enum["arguments"]["validValues"] == ["web", "shop", "?"]
 
@@ -366,7 +366,7 @@ def test_an_edit_after_import_reaches_the_next_export() -> None:
     columns["product_code"]["identifierFormat"] = [{"prefixes": ["Q"], "mask": "999"}]
     invoices["contract"]["invariants"][0]["expr"] = "ROUND(net * (2 + tax_rate), 2)"
     odcs = provider.render(back, fmt=None, expose_id="invoices")
-    pattern = "^((Q[0-9]{3})|XXXXX|TBD_.*)$"
+    pattern = "^((Q[0-9]{3})|XXXXX|TBD_[\\s\\S]*)$"
     assert _property(odcs, "product_code")["logicalTypeOptions"]["pattern"] == pattern
     assert _rules(odcs)["product_code.identifierFormat"]["arguments"]["pattern"] == pattern
     assert _property(odcs, "gross")["transformLogic"] == "ROUND(net * (2 + tax_rate), 2)"

@@ -504,26 +504,28 @@ def _column_type(raw: Any, where: str, refusals: List[UnsupportedBindingError]) 
 
     declared = str(raw or "string")
     resolved = dbt_types.sql_type(declared, "databricks")
-    if not dbt_types.known_type(declared, "databricks"):
+    fix = (
+        "Declare a FLUID type such as string, integer, bigint, decimal(12,2), double, "
+        "boolean, date, timestamp, array or object."
+    )
+    # A decimal Databricks cannot hold as declared (``decimal(40,2)``, ``decimal(1,x)``):
+    # ``sql_type`` writes such a declaration as a bare DECIMAL, which would narrow it.
+    decimal = dbt_types.decimal_argument_problem(declared, "databricks")
+    if decimal is not None:
+        problem, fix = decimal
+    elif not dbt_types.known_type(declared, "databricks"):
         problem = f"which the Databricks emitter does not map: it would become {resolved!r}"
     else:
         problem = _type_problem(resolved, dbt_types.split_parameterized(resolved))
     if problem is None:
         return _canonical_type(resolved)
-    refusals.append(
-        _refusal(
-            "column-type",
-            f"{where} has type {declared!r}, {problem}.",
-            "Declare a FLUID type such as string, integer, bigint, decimal(12,2), double, "
-            "boolean, date, timestamp, array or object.",
-        )
-    )
+    refusals.append(_refusal("column-type", f"{where} has type {declared!r}, {problem}.", fix))
     return None
 
 
 def _type_problem(resolved: str, parts: Tuple[str, Optional[str]]) -> Optional[str]:
     """Why ``resolved`` is no Databricks column type, or ``None`` when it is one."""
-    base, args = parts
+    _base, args = parts
     try:
         if args is not None:
             validate_sql_type_param_payload(args)
@@ -531,11 +533,8 @@ def _type_problem(resolved: str, parts: Tuple[str, Optional[str]]) -> Optional[s
             raise ValueError(resolved)
     except ValueError:
         return f"which does not render to a Databricks column type (got {resolved!r})"
-    if base == "decimal" and args:
-        precision, _, scale = args.partition(",")
-        # Databricks rejects these at CREATE TABLE, after the schema was created.
-        if not 1 <= int(precision) <= 38 or int(scale or 0) > int(precision):
-            return "but a Databricks DECIMAL takes a precision of 1 to 38 and no larger scale"
+    # A decimal's precision and scale are checked on the declaration, before this
+    # (``dbt_types.decimal_argument_problem``): ``resolved`` keeps only ones in range.
     return None
 
 
@@ -563,6 +562,8 @@ def _scale_zero_warnings(tables: Sequence[_Table]) -> List[str]:
             str(column.get("name"))
             for column in schema
             if isinstance(column, Mapping)
+            # A decimal refused as declared is written bare, and is no scale warning.
+            and dbt_types.decimal_argument_problem(str(column.get("type")), "databricks") is None
             and _SCALE_ZERO_RE.match(dbt_types.sql_type(str(column.get("type")), "databricks"))
         ]
         if bare:
