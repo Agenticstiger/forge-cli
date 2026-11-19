@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid plan` and `fluid apply` warn when an EMR on EC2 cluster can lose a Spark build to
+  Spot.** For each `runtime: emr-ec2` build, forge reads its `clusterId` once
+  (`DescribeCluster`, then `ListInstanceGroups` or `ListInstanceFleets`) and warns, never
+  refuses, in three cases, each with its fix: the primary node runs on Spot (the build's driver
+  runs there, in client mode); core nodes run on Spot; or core or task nodes run on Spot and the
+  cluster's yarn-site does not keep YARN application masters on On-Demand nodes
+  (`yarn.node-labels.enabled=true` with `yarn.node-labels.am.default-node-label-expression`
+  `ON_DEMAND` on EMR 7.x, or `CORE` while the core nodes are all On-Demand; EMR 5.19 to 5.x
+  keep masters on `CORE` by default). The fix names `ON_DEMAND` from EMR 7.2, where managed
+  scaling places masters by it, and `CORE` before. The yarn-site read is the cluster's,
+  overridden by the primary instance group's applied configurations or the primary fleet's
+  instance types. A cluster that cannot be read (no
+  permission, no credentials, unreachable, ended) and `fluid apply --dry-run` print nothing;
+  each read waits at most 3 s to connect and 10 s to answer, twice. The warnings are not in
+  `plan.json`. The caller policy forge emits for scheduled emr-ec2 builds now also grants
+  `elasticmapreduce:DescribeCluster`, `ListInstanceFleets` and `ListInstanceGroups` on the
+  cluster.
 - **The generated GitLab pipeline hands each job exactly what the last one produced.**
   `fluid generate ci --system gitlab` now writes:
   - **Run pipeline form:** the form is `spec:inputs` (GitLab 17.11 or later). It holds the 11
