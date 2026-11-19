@@ -180,7 +180,8 @@ class Settings:
                 not sep
                 or not warehouse.strip()
                 or not all(levels)
-                or any(level in (".", "..") for level in levels)
+                or any(level in (".", "..") or "/" in level for level in levels)
+                or _CONTROL_CHARS.search(item)
             ):
                 bad.append(item)
                 continue
@@ -654,7 +655,11 @@ class _Lakekeeper:
                     "this needs a Lakekeeper that answers it (v0.14.0 does)."
                 )
             for ident, table_uuid in zip(idents, uuids, strict=True):
-                name = ident.get("name") if isinstance(ident, dict) else None
+                if not isinstance(ident, dict) or ident.get("namespace") != list(namespace):
+                    # Only a table of the namespace asked for: a proxy that decodes and
+                    # normalises the path could have answered for another one.
+                    continue
+                name = ident.get("name")
                 if isinstance(name, str) and _id(table_uuid):
                     found.setdefault(name, table_uuid)
             token = doc.get("next-page-token")
@@ -886,6 +891,12 @@ def _malformed(bindings: List[Mapping[str, Any]]) -> Optional[str]:
             return f"the binding for {who!r} does not name its warehouse, namespace and table"
         if any(str(level).strip() in (".", "..") for level in levels):
             return f"the binding for {who!r} names a namespace level . or .."
+        if any("/" in str(level) or _CONTROL_CHARS.search(str(level)) for level in levels):
+            # A level travels in the URL path, joined with \x1f: a / or a control
+            # character there would let a proxy that decodes the path reach elsewhere.
+            return (
+                f"the binding for {who!r} names a namespace level with a / or a control character"
+            )
         if any("{{" in str(n) or "${" in str(n) for n in names):
             return (
                 "its warehouse, namespace or table holds an unrendered template; write the "

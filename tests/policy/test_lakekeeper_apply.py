@@ -751,3 +751,42 @@ def test_paged_assignments_are_refused_not_planned_from_one_page(server, operato
     result = _run(server, [_binding("role:analysts", "select")])
     assert "in pages" in result["errors"][0]
     assert server.posts_to_assignments() == []
+
+
+@pytest.mark.parametrize("level", ["x/../evil", "a\x1fb", "line\nbreak"])
+def test_a_namespace_level_that_could_travel_elsewhere_is_refused(
+    server, operator_env, monkeypatch, level
+):
+    binding = dict(_binding("role:analysts", "select"), namespace=["curated", level])
+    result = _run(server, [binding])
+    assert "names a namespace level with a / or a control character" in result["errors"][0]
+    assert server.requests == []
+
+
+def test_a_table_of_another_namespace_in_the_listing_is_not_taken(server, operator_env):
+    """A proxy that normalised the path could answer for another namespace."""
+
+    def elsewhere(method, path, body):
+        if method == "GET" and path.endswith("/tables"):
+            return _json(
+                200,
+                {
+                    "identifiers": [{"namespace": ["evil"], "name": "events_daily"}],
+                    "table-uuids": [TABLE_ID],
+                },
+            )
+        return None
+
+    server.hook = elsewhere
+    result = _run(server, [_binding("role:analysts", "select")])
+    assert result["pending"] == ["sales-wh/curated.events_daily"]
+    assert server.posts_to_assignments() == []
+
+
+@pytest.mark.parametrize("listed", ["sales-wh/cur/ated", "sales-wh/cur\x1fated"])
+def test_an_allowlist_entry_with_a_slash_or_control_character_is_refused(
+    server, operator_env, monkeypatch, listed
+):
+    monkeypatch.setenv("FLUID_LAKEKEEPER_NAMESPACE_ALLOWLIST", listed)
+    result = _run(server, [_binding("role:analysts", "select")])
+    assert "not <warehouse>/<namespace>" in result["errors"][0]
