@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A Glue table is partitioned as its binding declares.** `binding.location.partitionBy`
+  never reached the Glue table the AWS emitter wrote, and `binding.properties.cluster_by` was
+  read by nobody on AWS; both passed `fluid validate --strict`. On a Hive table (Parquet, ORC,
+  Avro, CSV or JSON files), the `partitionBy` columns now become the table's `partition_keys`,
+  in order, and leave its `columns`. Each must be a declared top-level column of a string,
+  integer, date or boolean type, named in lower case. Athena partition projection is written
+  when every key's values are known from the contract: an enum type or enum rule (path-safe
+  values), an integer `range` rule with both bounds, a boolean, or a date (by day, from
+  1970-01-01 to `NOW`). Otherwise `fluid validate` and `fluid apply` note that the partitions
+  need registering. A live table whose keys or projection change, or that is partitioned for the
+  first time, is replaced, and dropping the keys is gated as an in-place change; `fluid apply`
+  refuses both without `--allow-data-loss`. Lake Formation grants on a replaced table are
+  recreated with it. Refused at validate, naming the field: a key of another type, an undeclared
+  or upper-case key, a key named twice, every column as a key, `partitionBy` on an Iceberg or
+  Delta table in Glue (their partitioning lives in their own metadata, and the provider sets an
+  Iceberg spec only on create), and `cluster_by` on any Glue table. A duckdb build writes a
+  partitioned table in the Hive layout (`COPY ... PARTITION_BY`, the key columns kept in the
+  paths): a full refresh replaces the partitions it writes, as the Spark runner does, and
+  `incremental_append` adds files. It refuses, before writing, a late-arrival split, dedup or
+  merge mode, or streams that land outside the location; the embedded-SQL landing, which
+  writes one file, refuses a partitioned table.
+
 - **A BigQuery table is partitioned and clustered as its binding declares.**
   `binding.location.partitionBy` was read only with `lifecycle.expire`, and
   `binding.properties.cluster_by` (honoured on Snowflake) was read by nobody on BigQuery. Both
