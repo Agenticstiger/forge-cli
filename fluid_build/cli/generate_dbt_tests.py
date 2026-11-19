@@ -201,13 +201,16 @@ def _macro_path(out_path: Path, macros_dir: str | None) -> Path:
 def _first_macro_path(project: Path) -> str:
     """The project's first ``macro-paths`` entry (dbt's default: ``macros``), kept inside
     the project folder."""
-    import yaml
+    # The one reader of dbt_project.yml (build_runners/dbt/project_files.py), as a bundle uses.
+    from ..build_runners.dbt.project_files import DbtProjectFilesError, load_project_config
 
     try:
-        doc = yaml.safe_load(project.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError):
-        doc = {}
-    paths = doc.get("macro-paths") if isinstance(doc, dict) else None
+        doc = load_project_config(project.parent)
+    except DbtProjectFilesError as unreadable:
+        raise CLIError(
+            1, "dbt_tests_no_macro_dir", {"path": str(project), "detail": str(unreadable)}
+        ) from unreadable
+    paths = doc.get("macro-paths")
     first = paths[0] if isinstance(paths, list) and paths and isinstance(paths[0], str) else None
     if not first:
         return "macros"

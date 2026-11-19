@@ -33,6 +33,9 @@ from fluid_build.exporters.dbt_tests import render_dbt_tests, render_project_tes
 
 pytestmark = pytest.mark.unit
 
+# The fixtures live in test_compile.py beside this file (imported by name below).
+sys.path.insert(0, str(Path(__file__).parent))
+
 duckdb = pytest.importorskip("duckdb")
 
 
