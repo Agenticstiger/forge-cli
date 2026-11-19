@@ -553,15 +553,33 @@ def _require_bigquery_reader(where: str) -> None:
         )
 
 
-def _read_uri(path: str, platform: str, fmt: str, where: str) -> Tuple[str, str, str]:
-    """A binding whose ``location.path`` is already a URI: only ``s3://`` reads."""
-    from .duckdb.runner import _FILE_FORMAT_EXT
+def _prefix_glob(binding: Mapping[str, Any], prefix: str, fmt: str) -> str:
+    """The files under an S3 prefix the upstream's writer laid out: ``<prefix>*.<ext>``,
+    or a partitioned Glue table's ``<prefix><key>=*/.../*.<ext>``, whose key columns
+    DuckDB reads back from the paths (it detects the Hive layout)."""
+    from fluid_build.iac.base import UnsupportedBindingError
+    from fluid_build.iac.providers.aws_layout import partitioned_hive_table
 
+    from .duckdb.runner import _FILE_FORMAT_EXT, _partition_glob
+
+    try:
+        keys = partitioned_hive_table(binding)
+    except UnsupportedBindingError:
+        keys = ()
+    if keys:
+        return _partition_glob(prefix, keys, _FILE_FORMAT_EXT[fmt])
+    return f"{prefix}*.{_FILE_FORMAT_EXT[fmt]}"
+
+
+def _read_uri(
+    path: str, platform: str, fmt: str, where: str, binding: Mapping[str, Any]
+) -> Tuple[str, str, str]:
+    """A binding whose ``location.path`` is already a URI: only ``s3://`` reads."""
     scheme = path.split("://", 1)[0].lower()
     fmt = fmt or _format_from_suffix(path) or "parquet"
     if scheme != "s3" or fmt not in FILE_FORMATS:
         raise _unreadable(where, platform or scheme, fmt, f"{scheme}:// location")
-    uri = f"{path}*.{_FILE_FORMAT_EXT[fmt]}" if path.endswith("/") else path
+    uri = _prefix_glob(binding, path, fmt) if path.endswith("/") else path
     return uri, fmt, "aws"
 
 
@@ -620,7 +638,7 @@ def _read_s3_prefix(
     where: str,
 ) -> Tuple[str, str, str]:
     """An AWS bucket binding: the prefix the duckdb runner writes into, as a glob."""
-    from .duckdb.runner import _FILE_FORMAT_EXT, _object_store_uri
+    from .duckdb.runner import _object_store_uri
 
     # The IaC emitter's default: a binding with no format is emitted as parquet.
     fmt = fmt or "parquet"
@@ -635,7 +653,7 @@ def _read_s3_prefix(
     prefix = _object_store_uri({**dict(binding), "platform": "aws"}, resolved_loc, path)
     if prefix is None:  # pragma: no cover - a resolved bucket always composes
         raise _unreadable(where, "aws", fmt, "location.bucket did not resolve")
-    return f"{prefix}*.{_FILE_FORMAT_EXT[fmt]}", fmt, "aws"
+    return _prefix_glob(binding, prefix, fmt), fmt, "aws"
 
 
 #: The dataset location ``iac/providers/gcp.py::_emit_bigquery`` gives a
@@ -702,7 +720,7 @@ def _read_location(
     region = _resolve_env(loc.get("region"), field_name="location.region", where=where)
 
     if path and is_remote_uri(path):
-        return (*_read_uri(path, platform, fmt, where), region)
+        return (*_read_uri(path, platform, fmt, where, binding), region)
     if platform in _LOCAL_PLATFORMS:
         return (
             *_read_local(path, fmt, upstream_path, where, local_provider=local_provider),
@@ -1071,6 +1089,7 @@ def _refuse_unlandable(binding: Mapping[str, Any], path: Any, platform: str, whe
     with nothing where the contract said it would be.
     """
     fmt = _normalize_format(binding.get("format")) or "unset"
+    _refuse_partitioned_table(binding, where)
     text = str(path or "")
     scheme = text.split("://", 1)[0].lower() if is_remote_uri(text) else ""
     if scheme and scheme != "s3":
@@ -1100,6 +1119,32 @@ def _refuse_unlandable(binding: Mapping[str, Any], path: Any, platform: str, whe
             fix=("Bind the expose as one of those, or land it with an engine for that platform."),
             doc=doc_url(),
             extras={"platform": platform, "format": fmt},
+        )
+
+
+def _refuse_partitioned_table(binding: Mapping[str, Any], where: str) -> None:
+    """Refuse a landing in a partitioned Glue Hive table: this path writes one file."""
+    from fluid_build.iac.base import UnsupportedBindingError
+    from fluid_build.iac.providers.aws_layout import (
+        SINGLE_FILE_FIX,
+        SINGLE_FILE_WHY,
+        partitioned_hive_table,
+    )
+
+    try:
+        keys = partitioned_hive_table(binding)
+    except UnsupportedBindingError:  # a malformed partitionBy: refused here like any other
+        keys = ("location.partitionBy",)
+    if keys:
+        raise EmbeddedSqlLandingError(
+            what=(
+                f"{where}: the embedded-SQL path cannot land a Glue table partitioned by "
+                f"({', '.join(keys)})"
+            ),
+            why=SINGLE_FILE_WHY,
+            fix=SINGLE_FILE_FIX,
+            doc=doc_url(),
+            extras={"partitionBy": list(keys)},
         )
 
 
