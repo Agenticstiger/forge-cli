@@ -1,8 +1,8 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""The Tekton Task image: pinned by digest, as the GitHub actions are by SHA,
-and set with ``fluid generate ci --image``."""
+"""Container images in generated pipelines: pinned by digest, as the GitHub
+actions are by SHA; the Tekton Task image is set with ``fluid generate ci --image``."""
 
 from __future__ import annotations
 
@@ -18,13 +18,19 @@ import yaml
 from fluid_build.cli import build_parser
 from fluid_build.cli._common import CLIError
 from fluid_build.cli.generate_ci import run as generate_ci_run
-from fluid_build.forge.core.pipeline_systems import PINNED_IMAGES
+from fluid_build.forge.core.pipeline_systems import (
+    PINNED_IMAGES,
+    PipelineConfig,
+    PipelineProvider,
+    PipelineTemplateGenerator,
+)
 from fluid_build.forge.core.pipeline_systems._base import check_image_ref
+from fluid_build.forge.core.pipeline_systems._thin import ADD_ONS
 from fluid_build.forge.core.pipeline_systems.tekton import IMAGE
 
 pytestmark = [pytest.mark.unit]
 
-_LOG = logging.getLogger("test_tekton_image")
+_LOG = logging.getLogger("test_container_images")
 DIGEST = re.compile(r"[^@\s]+:[^@\s]+@sha256:[0-9a-f]{64}")
 
 
@@ -114,3 +120,41 @@ def test_the_parser_takes_the_flag():
     )
     assert args.image == "python:3.12-slim"
     assert build_parser().parse_args(["generate", "ci", "--system", "tekton"]).image is None
+
+
+def _image_values(node) -> List[str]:
+    """Every string under an ``image`` key (Azure's ``vmImage`` names a VM pool)."""
+    found: List[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "image" and isinstance(value, str):
+                found.append(value)
+            else:
+                found += _image_values(value)
+    elif isinstance(node, list):
+        for item in node:
+            found += _image_values(item)
+    return found
+
+
+@pytest.mark.parametrize("provider", list(PipelineProvider))
+def test_every_generated_container_image_is_pinned_by_digest(provider):
+    config = PipelineConfig(provider=provider, add_ons=ADD_ONS)
+    files = PipelineTemplateGenerator().generate_pipeline(config)
+    images = [
+        image
+        for path, text in files.items()
+        if path != "Jenkinsfile"
+        for doc in yaml.safe_load_all(text)
+        for image in _image_values(doc)
+    ]
+    for image in images:
+        assert DIGEST.fullmatch(image), (provider, image)
+        assert image in PINNED_IMAGES.values(), (provider, image)
+    if provider in (
+        PipelineProvider.TEKTON,
+        PipelineProvider.GITLAB_CI,
+        PipelineProvider.BITBUCKET,
+        PipelineProvider.CIRCLE_CI,
+    ):
+        assert images, provider

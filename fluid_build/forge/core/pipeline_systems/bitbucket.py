@@ -28,12 +28,13 @@ from . import _keyless, _thin
 from ._base import (
     BasePipelineTemplate,
     PipelineConfig,
+    _pin_image,
     check_pipeline_literal,
     check_pipeline_workdir,
 )
 
 PIPELINE_PATH = "bitbucket-pipelines.yml"
-IMAGE = "python:3.12-slim"
+IMAGE = _pin_image("python:3.12-slim")
 CUSTOM_PIPELINE = "fluid"
 #: The stage knobs ship reads, each with its own default when blank.
 STAGE_KNOBS: Tuple[str, ...] = (

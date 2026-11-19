@@ -339,9 +339,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ended with the step or subshell and never provided the command, so every `fluid ship` step
   failed with "command not found". It now runs `pip install -e /forge-cli-src`, and a missing
   mount or a failed install stops the job. Jenkins is unchanged.
-- **The Tekton Task image is pinned by digest.** `python:3.12-slim` is now
-  `python:3.12-slim@sha256:5e2bdb1b...`, kept beside the GitHub action pins and checked by the
-  same monthly job. `fluid generate ci --system tekton --image IMAGE` sets another image.
+- **Generated pipelines pin their container images by digest.** Tekton, GitLab (both images),
+  Bitbucket and CircleCI named `python:3.12-slim`, `python:3.12` and `cimg/python:3.12` by tag;
+  each is now `<tag>@sha256:<index digest>`, kept beside the GitHub action pins and checked by
+  the same monthly job. `fluid generate ci --system tekton --image IMAGE` sets the Task image.
 
 - **`fluid validate` stops warning about a Spark or managed Flink build's own SQL once the
   operator lists it.** The warning that `properties.sql` runs only if the operator lists the

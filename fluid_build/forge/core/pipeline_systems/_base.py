@@ -60,6 +60,8 @@ def _pin_action(action_ref: str) -> str:
 # action pins. Update these when the image is refreshed.
 PINNED_IMAGES = {
     "python:3.12-slim": "python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b",  # 2026-11-19
+    "python:3.12": "python:3.12@sha256:5411fa1b302c43f510324381162b5f5d0d93b9ee2af538f09d944f0d290ee3cb",  # 2026-11-19
+    "cimg/python:3.12": "cimg/python:3.12@sha256:a78dfb790fe48e58b792c6499495de0630d33edb377a92840e726d40320a33ea",  # 2026-11-19
 }
 
 #: An image reference: ``[registry[:port]/]name[:tag][@sha256:<digest>]``.
