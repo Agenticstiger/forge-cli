@@ -32,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid profile` reads a CSV date column.** A column the contract types `date` reads a
+  `YYYY-MM-DD` text as that day's midnight in UTC, as a Parquet date always read, from any
+  source. A CSV date column used to be refused (FLX-5022). The text is read strictly: anything
+  but a calendar day written `YYYY-MM-DD` goes to the reader as before, which refuses it, and
+  DuckDB's own date reader is not used, because it reads `infinity` and `epoch` as dates and
+  drops a time of day.
 - **`fluid profile` no longer reads one expose's records as another's.** argparse kept the last
   of two `--expose` flags, so `--expose org --expose account --source org.csv` profiled
   `org.csv` as the `account` expose. Several `--expose` flags now take one

@@ -531,3 +531,60 @@ def test_one_expose_profiles_as_it_always_did(tmp_path):
     )
     assert one.canonical == many.canonical
     assert one.plan == many.plan
+
+
+# -- a column the contract types date -----------------------------------------------------
+
+_DATED = _contract(("signed_on", "date"), ("seen_at", "timestamp"), expose_id="contracts")
+
+
+def test_a_date_written_yyyy_mm_dd_is_read_as_that_day(tmp_path):
+    rows = [{"signed_on": "2026-01-31", "seen_at": "2026-01-31T00:00:00.000Z"} for _ in range(12)]
+    result = profile_expose(
+        _DATED, "contracts", source=_ndjson(tmp_path / "c.ndjson", rows), backend=FakeBackend()
+    )
+    columns = result.document["tables"]["contracts"]["columns"]
+    # The day's midnight in UTC, in milliseconds since the epoch, as a Parquet date reads.
+    assert columns["signed_on"]["metrics"]["min"]["value"] == "1769817600000"
+    assert columns["signed_on"]["metrics"] == columns["seen_at"]["metrics"]
+
+
+@pytest.mark.parametrize("text", ["2026-02-30", "31/01/2026", "2026-1-31", "2026-01-31 10:00"])
+def test_a_date_not_written_as_a_calendar_day_is_refused(tmp_path, text):
+    rows = [{"signed_on": text, "seen_at": None}]
+    with pytest.raises(ReadRefused, match=r"column 'signed_on' row 0") as refused:
+        profile_expose(
+            _DATED, "contracts", source=_ndjson(tmp_path / "c.ndjson", rows), backend=FakeBackend()
+        )
+    assert text not in str(refused.value)
+
+
+def test_a_timestamp_column_still_needs_rfc_3339(tmp_path):
+    rows = [{"signed_on": None, "seen_at": "2026-01-31"}]
+    with pytest.raises(ReadRefused, match=r"column 'seen_at' row 0"):
+        profile_expose(
+            _DATED, "contracts", source=_ndjson(tmp_path / "c.ndjson", rows), backend=FakeBackend()
+        )
+
+
+def test_a_csv_date_column_profiles_as_the_same_parquet_column_does(tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    backend = load_backend()
+    days = [f"2026-0{1 + n % 3}-{10 + n % 7:02d}" for n in range(60)]
+    csv = tmp_path / "c.csv"
+    csv.write_text("signed_on,seen_at\n" + "".join(f"{d},\n" for d in days), encoding="utf-8")
+    parquet = tmp_path / "c.parquet"
+    con = duckdb.connect()
+    try:
+        con.execute(
+            "COPY (SELECT CAST(signed_on AS DATE) AS signed_on, "
+            "CAST(NULL AS TIMESTAMPTZ) AS seen_at "
+            f"FROM read_csv('{csv}', all_varchar = true)) TO '{parquet}' (FORMAT parquet)"
+        )
+    finally:
+        con.close()
+    from_csv = profile_expose(_DATED, "contracts", source=str(csv), backend=backend)
+    from_parquet = profile_expose(_DATED, "contracts", source=str(parquet), backend=backend)
+    signed = from_csv.document["tables"]["contracts"]["columns"]["signed_on"]
+    assert signed["domain"] == "timestamp"
+    assert signed == from_parquet.document["tables"]["contracts"]["columns"]["signed_on"]

@@ -35,7 +35,8 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import date
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
@@ -155,6 +156,8 @@ class ProfileError(Exception):
 class ColumnPlan:
     name: str
     domain: str
+    #: The contract types the column ``date``: a ``YYYY-MM-DD`` text in it is that day.
+    date: bool = False
 
 
 @dataclass(frozen=True)
@@ -244,10 +247,15 @@ class ProfileResult:
         return self._only().left_out
 
 
+def _base_type(type_name: Any) -> str:
+    """A FLUID column type in lower case, without its parameters: ``decimal(10,2)`` is ``decimal``."""
+    text = re.sub(r"\s+", " ", str(type_name or "").strip().lower())
+    return re.sub(r"\s*\(.*\)$", "", text)
+
+
 def column_domain(type_name: Any) -> Tuple[Optional[str], Optional[str]]:
     """The profile domain a FLUID column type is read in, or ``None`` and the reason."""
-    text = re.sub(r"\s+", " ", str(type_name or "").strip().lower())
-    base = re.sub(r"\s*\(.*\)$", "", text)
+    base = _base_type(type_name)
     if base in _CATEGORY_TYPES:
         return CATEGORY, None
     if base in _NUMBER_TYPES:
@@ -318,7 +326,8 @@ def plan_expose(contract: Mapping[str, Any], expose_id: str) -> ExposePlan:
         if domain is None:
             skipped.append((name, reason or ""))
         else:
-            columns.append(ColumnPlan(name=name, domain=domain))
+            is_date = _base_type(entry.get("type")) == "date"
+            columns.append(ColumnPlan(name=name, domain=domain, date=is_date))
     return ExposePlan(expose_id=expose_id, columns=tuple(columns), skipped=tuple(skipped))
 
 
@@ -566,8 +575,11 @@ def profile_exposes(
             grids[plan.expose_id] = grid
     fractional_bits = _one_grid(grids, blocks, fractional_bits)
     reads = [
-        sources.read_columns(
-            each.source, [column.name for column in plan.columns], table=each.table, cwd=cwd
+        _dates_read(
+            plan,
+            sources.read_columns(
+                each.source, [column.name for column in plan.columns], table=each.table, cwd=cwd
+            ),
         )
         for each, plan in zip(exposes, plans, strict=True)
     ]
@@ -604,6 +616,40 @@ def profile_exposes(
         withheld_cells=dict(sorted(cell_tally.items())),
         fractional_bits=fractional_bits,
     )
+
+
+#: A date as a CSV, a JSON slice or a text column writes one: exactly ``YYYY-MM-DD``.
+_DATE_TEXT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
+
+
+def _dates_read(plan: ExposePlan, read: sources.SourceColumns) -> sources.SourceColumns:
+    """*read*, with each ``YYYY-MM-DD`` text of a column the contract types ``date`` as that day.
+
+    A CSV holds every value as text, and the registry reads a timestamp only from
+    RFC 3339 with an offset (FLX-5022), so a ``date`` column read from a CSV was refused
+    where Parquet's, which arrives as a date, was read. The text is read strictly, as
+    the contract's type says: exactly ``YYYY-MM-DD`` and a real calendar day becomes that
+    day's midnight in UTC, as a date from a Parquet file or a database does
+    (:func:`sources.midnight_utc`). Any other value goes on as it came, for the reader to
+    read or refuse: DuckDB's own date reader is not used, because it reads ``infinity``
+    and ``epoch`` as dates and drops a time of day.
+    """
+    days = [column.name for column in plan.columns if column.date]
+    if not days:
+        return read
+    values = dict(read.values)
+    for name in days:
+        values[name] = [_as_day(value) for value in read.values[name]]
+    return replace(read, values=values)
+
+
+def _as_day(value: Any) -> Any:
+    if isinstance(value, str) and _DATE_TEXT.match(value):
+        try:
+            return sources.midnight_utc(date.fromisoformat(value))
+        except ValueError:  # not a calendar day: the reader refuses it as written
+            return value
+    return value
 
 
 def _refuse_repeated(exposes: Sequence[ExposeSource]) -> None:

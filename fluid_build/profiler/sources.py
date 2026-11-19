@@ -16,7 +16,8 @@
 * a CSV or Parquet file, through DuckDB, inside the sandbox ``fluid init
   --discover`` reads with (:mod:`fluid_build.providers._duckdb_sandbox`), allowed
   that one file and nothing else. A CSV is read with every column as text
-  (``all_varchar``), so a decimal arrives as the digits the file holds.
+  (``all_varchar``), so a decimal arrives as the digits the file holds, and a date
+  as its text, which the runner reads as the contract's ``date`` type says.
 * a ``postgres://``, ``mysql://`` or ``sqlite:///`` database, attached by
   :func:`fluid_build.cli.discover._jdbc_introspect.attach_jdbc_source`, the one
   place ``fluid init --discover`` opens such a source.
@@ -57,6 +58,7 @@ __all__ = [
     "SourceError",
     "describe_source",
     "local_file",
+    "midnight_utc",
     "read_columns",
 ]
 
@@ -227,11 +229,16 @@ def _rfc3339(moment: datetime) -> str:
     )
 
 
+def midnight_utc(day: date) -> str:
+    """A date as the registry reads it: that day's midnight in UTC, in RFC 3339."""
+    return f"{day.year:04d}-{day.month:02d}-{day.day:02d}T00:00:00.000Z"
+
+
 def _wire(value: Any) -> Any:
     if isinstance(value, datetime):
         return _rfc3339(value)
     if isinstance(value, date):
-        return f"{value.year:04d}-{value.month:02d}-{value.day:02d}T00:00:00.000Z"
+        return midnight_utc(value)
     if isinstance(value, uuid.UUID):
         return str(value)
     return value
