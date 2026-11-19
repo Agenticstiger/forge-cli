@@ -341,3 +341,12 @@ def test_the_uploaded_job_is_compared_with_its_account_and_msk_brokers_put_back(
     assert rc._job_differs(run, json.dumps(deployed), ACCOUNT)
     assert rc._job_differs(run, "not json", ACCOUNT)
     assert rc._job_differs(run, uploaded(run), "210987654321")  # another account's
+
+
+def test_a_failure_text_never_carries_terminal_escape_sequences(ec2, clock, use):
+    """A runtime's failure text reaches the console and the reconcile prompt: no ESC."""
+    fake = FakeAdapter([died(ec2, details="boom \x1b[2J\x1b]0;owned\x07 end\x9b31m")])
+    use(fake)
+    out = go(ec2, clock)
+    assert "\x1b" not in out.message and "\x07" not in out.message and "\x9b" not in out.message
+    assert "boom [2J]0;owned end31m" in out.message

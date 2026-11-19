@@ -56,6 +56,7 @@ poll a second longer each time, at most :data:`MAX_POLL_S`.
 from __future__ import annotations
 
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -126,10 +127,15 @@ class Outcome:
         }
 
 
+#: C0 and C1 control characters other than whitespace: a runtime's failure text (a step's
+#: message, a local driver log) never reaches the terminal with escape sequences in it.
+_CONTROL = re.compile(r"[\x00-\x08\x0e-\x1f\x7f-\x9f]")
+
+
 def _clean(text: Any) -> str:
     from fluid_build.observability.secret_redactor import redact_secret_text
 
-    return redact_secret_text(" ".join(str(text or "").split()))[:400]
+    return redact_secret_text(" ".join(_CONTROL.sub("", str(text or "")).split()))[:400]
 
 
 def wait_budget(env: Optional[Mapping[str, str]] = None) -> float:
