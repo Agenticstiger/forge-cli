@@ -921,6 +921,12 @@ def caller_actions(runtime: str) -> List[str]:
     return sorted(a for a in CALLER_ACTIONS[runtime] if a != _FIND_APPLICATION)
 
 
+def _ec2_role_reads() -> tuple:
+    from fluid_build.build_runners.spark._adapters import EC2_ROLE_READS
+
+    return EC2_ROLE_READS
+
+
 def passes_role(runtime: str) -> bool:
     from fluid_build.build_runners.spark._adapters import PASS_ROLE
 
@@ -986,6 +992,20 @@ def caller_document(runs: Sequence[CallerRun], *, account: Any, region: Any) -> 
                             "variable": "iam:PassedToService",
                             "values": [PASSED_TO[run.runtime]],
                         }
+                    ],
+                }
+            )
+        if run.runtime == "emr-ec2":
+            statements.append(
+                {
+                    # The role a step runs as is the cluster owner's: a start checks that the
+                    # build's policy is attached to it (_adapters.EmrEc2.start).
+                    "sid": f"StepRole{run.sid}",
+                    "effect": "Allow",
+                    "actions": list(_ec2_role_reads()),
+                    "resources": [
+                        _join("arn:aws:iam::", account, ":instance-profile/*"),
+                        _join("arn:aws:iam::", account, ":role/*"),
                     ],
                 }
             )
