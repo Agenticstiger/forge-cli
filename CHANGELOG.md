@@ -616,6 +616,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A project `.env` can no longer set bash function imports or shell start-up settings.**
+  Bash reads an environment variable named `BASH_FUNC_<name>%%` as the definition of the
+  function `<name>`, so a project `.env` could replace a command, or the `exec` builtin, inside
+  every bash script the CLI starts (spark-submit and other wrappers, Debezium's `run.sh`), with
+  the operator's environment and credentials in scope. Project dotenv files now refuse any name
+  that is not a shell identifier (`[A-Za-z_][A-Za-z0-9_]*`) and every `BASH_FUNC_` name, and
+  also `BASH_XTRACEFD`, `ZDOTDIR`, `FPATH`, `NULLCMD` and `READNULLCMD`, next to the
+  `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `PS4`, `IFS`, `CDPATH` and `GLOBIGNORE` they
+  already refused. These names are skipped with the usual warning; set them in the shell or CI
+  environment if they are really needed. Ordinary keys load as before.
+
 - **`fluid generate dbt-tests` writes no contract text that dbt would run as Jinja.** dbt
   renders a schema.yml's names, descriptions and test arguments as Jinja, and evaluates a test
   argument that looks like `env_var(...)`, `var(...)`, `ref(...)`, `source(...)` or `doc(...)`
