@@ -809,29 +809,11 @@ def _declared_entry(
     its column, and a mean's and a support's from their own checks. *tallies* count the
     groups and the histogram cells that are withheld, by the check.
     """
-    tally, cell_tally = tallies
     groups = measured.groups
-    written: List[Dict[str, Any]] = []
     if decision is not None:
-        for group in groups:
-            if decision.group_status[group.key] == disclosure.FREE:
-                tally[disclosure.FREE] += 1
-                published = _published_edge_group(statistic, group, decision, rule, cell_tally)
-                written.append({**published, "status": disclosure.FREE})
-            else:
-                tally[_code(decision.group_reason[group.key])] += 1
-                written.append({"group": group.key, "status": disclosure.WITHHELD})
+        written = _edge_checked_groups(statistic, measured, rule, tallies, decision)
     else:
-        checked = [_check_group(statistic, group, rule, fractional_bits) for group in groups]
-        verdicts = [verdict for verdict, _ in checked]
-        if statistic.group_by is not None:
-            verdicts = _suppressed(statistic, verdicts, measured, rule, fractional_bits)
-        for group, verdict, (_, published) in zip(groups, verdicts, checked, strict=True):
-            tally[verdict.status] += 1
-            if verdict.published:
-                written.append({**published, "status": disclosure.FREE})
-            else:
-                written.append({"group": group.key, "status": verdict.status})
+        written = _own_checked_groups(statistic, measured, rule, tallies[0], fractional_bits)
     entry: Dict[str, Any] = {
         "definition": statistic.identifier,
         "sampleSize": disclosure.sample_size(sum(group.k for group in groups), rule),
@@ -842,6 +824,50 @@ def _declared_entry(
     if statistic.group_by is not None:
         entry["groupBy"] = statistic.group_by
     return entry
+
+
+def _edge_checked_groups(
+    statistic: DeclaredStatistic,
+    measured: MeasuredStatistic,
+    rule: disclosure.DisclosureRule,
+    tallies: Tuple["Counter[str]", "Counter[str]"],
+    decision: EdgeDecision,
+) -> List[Dict[str, Any]]:
+    """A histogram's or a quantile's groups, as the output check on its column decided them."""
+    tally, cell_tally = tallies
+    written: List[Dict[str, Any]] = []
+    for group in measured.groups:
+        if decision.group_status[group.key] == disclosure.FREE:
+            tally[disclosure.FREE] += 1
+            published = _published_edge_group(statistic, group, decision, rule, cell_tally)
+            written.append({**published, "status": disclosure.FREE})
+        else:
+            tally[_code(decision.group_reason[group.key])] += 1
+            written.append({"group": group.key, "status": disclosure.WITHHELD})
+    return written
+
+
+def _own_checked_groups(
+    statistic: DeclaredStatistic,
+    measured: MeasuredStatistic,
+    rule: disclosure.DisclosureRule,
+    tally: "Counter[str]",
+    fractional_bits: int,
+) -> List[Dict[str, Any]]:
+    """A mean's or a support's groups, each by its own check, siblings withheld with a small one."""
+    groups = measured.groups
+    checked = [_check_group(statistic, group, rule, fractional_bits) for group in groups]
+    verdicts = [verdict for verdict, _ in checked]
+    if statistic.group_by is not None:
+        verdicts = _suppressed(statistic, verdicts, measured, rule, fractional_bits)
+    written: List[Dict[str, Any]] = []
+    for group, verdict, (_, published) in zip(groups, verdicts, checked, strict=True):
+        tally[verdict.status] += 1
+        if verdict.published:
+            written.append({**published, "status": disclosure.FREE})
+        else:
+            written.append({"group": group.key, "status": verdict.status})
+    return written
 
 
 def _published_edge_group(
