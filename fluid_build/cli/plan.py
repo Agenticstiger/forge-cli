@@ -240,9 +240,11 @@ transformations, access grants, and orchestration tasks.
         help=(
             "also run `tofu plan` as `fluid apply` would (OpenTofu-engine providers) "
             "and bind the saved plan into plan.json: `fluid apply plan.json` then "
-            "applies exactly that plan. Next to it, mode 0600: plan.tfplan, "
-            "plan.tfplan.json and the GitLab terraform report plan.gitlab-tofu.json "
-            "(named after --out)"
+            "applies exactly that plan, on the target (account, project, region) it was "
+            "made for. Next to it, mode 0600: plan.tfplan, plan.tfplan.json, the GitLab "
+            "terraform report plan.gitlab-tofu.json and the provider lock "
+            "plan.terraform.lock.hcl (named after --out); hand plan.json, the .tfplan and "
+            "the lock to the runner that applies"
         ),
     )
     p.add_argument(
@@ -540,6 +542,12 @@ def run(args, logger: logging.Logger) -> int:
             _display_plan_rich(plan, contract)
         else:
             _display_plan_simple(plan, logger, output_path=args.out)
+
+        # A Spark build's EMR on EC2 cluster where Spot can take its driver or application
+        # master: warned, never refused, and not in plan.json (the cluster is its owner's).
+        from fluid_build.cli._spark_apply import plan_posture
+
+        plan_posture(contract, logger)
 
         # --- Advanced hook: cost estimation ---
         if getattr(args, "estimate_cost", False) and hook_provider:

@@ -33,6 +33,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status; and `runtime/ship-report.json` and `ship-junit.xml` are renamed into place, so a
   symbolic link the checkout left at either name is replaced instead of written through.
 
+- **A saved OpenTofu plan applies on another runner, and only on the target it was made for.**
+  `fluid plan --tofu` now records the plan's target in its `opentofuPlan` record (under
+  `planDigest`): the cloud account and region (AWS, from STS `GetCallerIdentity` and the provider's
+  region), the project and region (GCP, from the defaults the `hashicorp/google` provider reads),
+  the organization and account (Snowflake) or the workspace host (Databricks), plus the state
+  backend block, the `tofu` version and the provider versions `tofu init` locked; it prints
+  `target: aws account …, region …`. `fluid apply plan.json` reads the target again before
+  anything runs, the state-key migration and the plugin's hooks included, and refuses another one
+  (`apply_plan_digest_tofu_plan_target_mismatch`), a recorded field it cannot read
+  (`…_target_unverified`), another `tofu` or provider version (`…_tofu_plan_toolchain`), another
+  backend configuration (`…_tofu_plan_target`) or a plan without the record
+  (`…_target_missing`). A field the plan's runner could not read (no boto3, say) is named at plan
+  time and named again at apply, and not compared. The provider lock travels with the plan as
+  `<stem>.terraform.lock.hcl` (sha256 under `planDigest`) and is installed before the apply's
+  `tofu init`, so another runner days later installs the providers the plan was reviewed with; a
+  missing or altered lock is refused (`…_tofu_plan_lock_missing` / `…_lock_mismatch`).
+  `--no-verify-plan-binding` skips the check, logged. With a state backend
+  both runners reach, a plan made on one runner applies unchanged on another at another checkout
+  path; a plan made on local state that the applying runner does not have is refused as
+  `apply_plan_digest_tofu_plan_state_missing` instead of "stale".
+- **`fluid plan` and `fluid apply` warn when an EMR on EC2 cluster can lose a Spark build to
+  Spot.** For each `runtime: emr-ec2` build, forge reads its `clusterId` once
+  (`DescribeCluster`, then `ListInstanceGroups` or `ListInstanceFleets`) and warns, never
+  refuses, in three cases, each with its fix: the primary node runs on Spot (the build's driver
+  runs there, in client mode); core nodes run on Spot; or core or task nodes run on Spot and the
+  cluster's yarn-site does not keep YARN application masters on On-Demand nodes
+  (`yarn.node-labels.enabled=true` with `yarn.node-labels.am.default-node-label-expression`
+  `ON_DEMAND` on EMR 7.x, or `CORE` while the core nodes are all On-Demand; EMR 5.19 to 5.x
+  keep masters on `CORE` by default). The fix names `ON_DEMAND` from EMR 7.2, where managed
+  scaling places masters by it, and `CORE` before. The yarn-site read is the cluster's,
+  overridden by the primary instance group's applied configurations or the primary fleet's
+  instance types. A cluster that cannot be read (no
+  permission, no credentials, unreachable, ended) and `fluid apply --dry-run` print nothing;
+  each read waits at most 3 s to connect and 10 s to answer, twice. The warnings are not in
+  `plan.json`. The caller policy forge emits for scheduled emr-ec2 builds now also grants
+  `elasticmapreduce:DescribeCluster`, `ListInstanceFleets` and `ListInstanceGroups` on the
+  cluster.
+- **The generated GitLab pipeline hands each job exactly what the last one produced.**
+  `fluid generate ci --system gitlab` now writes:
+  - **Run pipeline form:** the form is `spec:inputs` (GitLab 17.11 or later). It holds the 11
+    stage switches and nine knobs: `FLUID_ENV`, `APPLY_MODE`, `ALLOW_DATA_LOSS`,
+    `NO_VERIFY_DIGEST`, the two strict switches, `PUBLISH_TARGETS`, `SCHEDULER` and
+    `SCHEDULE_SYNC_DRY_RUN`. That is GitLab's limit of 20. Each input sets the job variable of
+    the same name and is never pasted into a script. Every other value is a plain default
+    that a project CI/CD variable sets, and the form needs no pipeline variables.
+  - **Release packet:** on the default branch, `fluid-plan` runs `fluid ship --stage 1-6
+    --release-dir release`. `fluid-apply` downloads that job's artifacts (`needs` and
+    `dependencies`) and does not start without `release/release.json`. On the default
+    branch, stages 1-4 must run and `release/` must not be in the repository: otherwise ship
+    refuses the packet and the plan fails with its reason.
+  - **Merge requests:** a merge request plans without a packet and never gets an apply job,
+    and neither does any other ref. `fluid-impact` publishes `fluid diff --baseline --impact`
+    of the contract against the merge request's base as Markdown and JSON (`expose_as: fluid
+    impact`), beside ship's JUnit report. Its resource section reads `unknown`, with the reason,
+    while ship's stage 6 saves no OpenTofu plan.
+  - **Free-text inputs:** `fluid_env` follows ship's environment grammar and `publish_targets`
+    takes target names only, so an input cannot name another variable for GitLab to expand.
+  - **Failed plans:** a `fluid-plan` that fails keeps its reports and drops its bundle, plan,
+    OpenTofu plan files and artifacts before they are uploaded, so nothing a failed run wrote
+    reads as deployable.
+
 - **A BigQuery table is partitioned and clustered as its binding declares.**
   `binding.location.partitionBy` was read only with `lifecycle.expire`, and
   `binding.properties.cluster_by` (honoured on Snowflake) was read by nobody on BigQuery. Both
@@ -166,6 +227,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   product and env that the contract no longer makes (a build that now runs as a task of
   another build's DAG would otherwise run twice). `fluid validate` warns about an Airflow
   task's `buildStepRef`: no generated DAG runs one.
+
+- **`fluid generate dbt-tests` runs declared invariants as dbt tests.** On a 0.7.7 contract each
+  declared invariant, identifier format, bounded placeholder declaration, shared column and
+  shared attribute becomes one `fluid_rule` generic test on its model, and the `fluid_rule`
+  macro is written to `<project>/<first macro-paths entry>/fluid/fluid_rule.sql` (the nearest
+  `dbt_project.yml` above `--out`; the new `--macros-dir` overrides it, and a file fluid did not
+  write is never overwritten). Each test carries its SQL for every engine forge renders, and the
+  macro picks by `target.type` (DuckDB, Snowflake, BigQuery, Databricks or Spark, PostgreSQL,
+  Athena or Trino), so one project runs on DuckDB locally and on Athena live; an adapter with no
+  rendering fails that test with a message naming the rule. The SQL is printed from the parsed
+  expression and joins linked models with `ref()`; the band is compared exactly, in rows or as
+  `100 * violating` against `value * covered`; `severity: warning` and `info` warn. Every piece
+  of contract text reaches dbt as a Jinja string literal, so `{{` in a name or literal stays
+  data. A rule no engine can run is logged with its reason and not tested. A column's
+  placeholder values and prefixes are now exempt from its own `accepted_values` and range tests,
+  through a `where` config per adapter.
 
 - **Declared invariants become ODCS quality rules.** On a 0.7.7 contract, `fluid generate
   standard --format odcs` now writes each `exposes[].contract.invariants[]` entry, each
@@ -360,6 +437,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`fluid generate dbt-tests` writes no contract text that dbt would run as Jinja.** dbt
+  renders a schema.yml's names, descriptions and test arguments as Jinja, and evaluates a test
+  argument that looks like `env_var(...)`, `var(...)`, `ref(...)`, `source(...)` or `doc(...)`
+  even without braces. A column name, description, enum value or other string from a contract
+  that holds `{{`, `{%` or `{#`, or looks like such a call, is now written as a Jinja string
+  literal of itself, so `dbt parse` reads it back as text; a column named
+  `x{{ env_var('SECRET') }}` used to print the variable. Every other string is written as
+  before. The `relationships` test keeps its own `ref('<model>')`.
+
 - **A quantile is published only when the records below and above it pass the threshold too.**
   A `quantile/1` group was published when ten records held its witness, with its two ranks, so a
   rank could say that 3 records lie below the witness, or that 2 lie above it. A group is now
@@ -385,7 +471,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subtract one histogram's published counts from another's, or from a level histogram's group
   size, and rebuild a withheld cell, a zero included. FLUX's `check_edge_counts` closes that, and
   forge-cli calls it once a flux-stats release carries it. That change completes the rule and
-  lands before the next forge-cli release.
+  lands in a later forge-cli release.
 
 ## [0.32.0] — 2026-11-18
 
