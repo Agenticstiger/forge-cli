@@ -300,7 +300,10 @@ def catalog_key(catalog_uri: str) -> str:
     except (LakekeeperError, ValueError):
         return catalog_uri.strip()
     shown_port = f":{port}" if port and port != 443 else ""
-    return f"https://{parts.hostname}{shown_port}{parts.path}"
+    host = parts.hostname or ""
+    if ":" in host:  # an IPv6 literal keeps its brackets: [::1]:8443 is not [::1:8443]
+        host = f"[{host}]"
+    return f"https://{host}{shown_port}{parts.path}"
 
 
 def _new_client() -> Any:
@@ -801,7 +804,11 @@ def _malformed(bindings: List[Mapping[str, Any]]) -> Optional[str]:
         identities = binding.get("identities")
         relations = binding.get("relations")
         who = _clean(binding.get("principal"), 120)
-        names = [binding.get("warehouse"), binding.get("table"), *(binding.get("namespace") or ())]
+        namespace = binding.get("namespace")
+        levels = namespace if isinstance(namespace, list) else []
+        names = [binding.get("warehouse"), binding.get("table"), *levels]
+        if not levels or not all(isinstance(n, str) and n.strip() for n in names):
+            return f"the binding for {who!r} does not name its warehouse, namespace and table"
         if any("{{" in str(n) or "${" in str(n) for n in names):
             return (
                 "its warehouse, namespace or table holds an unrendered template; write the "

@@ -29,7 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaves its table's grants as they are, since granting the others alone would revoke it, and a
   grant whose `resources` cannot be evaluated leaves every Lakekeeper table as it is. The contract
   names the tables, so give stage 8 an identity that manages only the product's own namespaces:
-  on OpenFGA the identity that creates a namespace owns it, which is enough. The operator signs forge in with
+  on OpenFGA the identity that creates a namespace owns it, which is enough. A user found by name
+  is the one Lakekeeper user of that exact name; map a person by id (`user:oidc~<subject>`) or
+  e-mail, since an identity provider may let anyone choose a display name. The operator signs forge in with
   `FLUID_LAKEKEEPER_CREDENTIAL_REF`, a secret reference to `client_id:client_secret`, plus
   `FLUID_LAKEKEEPER_OAUTH2_SERVER_URI` and `FLUID_LAKEKEEPER_SCOPE`, or with
   `FLUID_LAKEKEEPER_TOKEN_REF`. These names are operator-only. The reference must be allowed for

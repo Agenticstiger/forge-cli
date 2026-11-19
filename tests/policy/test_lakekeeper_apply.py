@@ -595,3 +595,23 @@ class TestRefusedHost:
         assert "the operator has not allowed to go to lakekeeper.test" in error
         assert "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST" in error
         assert "the contract would send" not in error
+
+
+@pytest.mark.parametrize(
+    "a, b, same",
+    [
+        ("https://[::1]:8443/catalog", "https://[::1:8443]/catalog", False),
+        ("https://LK.test/catalog/", "https://lk.test:443/catalog", True),
+        ("https://lk.test:8443/catalog", "https://lk.test/catalog", False),
+    ],
+)
+def test_catalog_key_names_one_server_one_way(a, b, same):
+    from fluid_build.policy.lakekeeper_apply import catalog_key
+
+    assert (catalog_key(a) == catalog_key(b)) is same
+
+
+def test_a_namespace_that_is_not_a_list_is_refused_not_a_crash(server, operator_env):
+    result = _run(server, [dict(_binding("role:analysts", "select"), namespace=5)])
+    assert result["status"] == "error"
+    assert server.posts_to_assignments() == []

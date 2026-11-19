@@ -422,3 +422,15 @@ class TestOnACloudPlatform:
             "warehouse": "wh",
         }
         assert self._compile("snowflake", loc) == (["lakekeeper.table", "snowflake.table"], [])
+
+
+def test_two_exposes_on_one_table_fail_closed_together():
+    """One expose that cannot compile keeps the table unmanaged, whatever another says."""
+    good = _expose("orders")
+    bad = _expose("orders", principals={"group:analysts": "domain:x"})
+    bad["exposeId"] = "orders_again"
+    bindings, warnings = compile_policy(
+        _contract({"principal": "group:analysts", "permissions": ["read"]}, exposes=[good, bad])
+    )
+    assert _lakekeeper(bindings) == []
+    assert any("another expose naming it could not be compiled" in w for w in warnings)

@@ -207,6 +207,8 @@ def compile_lakekeeper_bindings(
             )
         return bindings, warnings
 
+    #: Tables an expose could not compile for: no expose may grant on them then.
+    blocked: Set[Tuple[str, str, Tuple[str, ...], str]] = set()
     for expose in exposes:
         expose_id = str(expose.get("exposeId") or expose.get("id") or "?")
         binding = expose.get("binding") or {}
@@ -256,6 +258,7 @@ def compile_lakekeeper_bindings(
             mapping = principal_map(binding)
         except UnsupportedBindingError as exc:
             warnings.append(f"Lakekeeper expose '{expose_id}': {exc} No grant was compiled.")
+            blocked.add(_target_key(target))
             continue
 
         merged: Dict[str, Tuple[Tuple[str, ...], Set[str]]] = {}
@@ -285,6 +288,7 @@ def compile_lakekeeper_bindings(
                 "policy-apply leaves the table's grants as they are until every principal maps; "
                 "granting the others alone would revoke the unmapped ones."
             )
+            blocked.add(_target_key(target))
             continue
 
         table_name = ".".join([*target["namespace"], target["table"]])
@@ -302,7 +306,25 @@ def compile_lakekeeper_bindings(
                     "relations": [r for r in MANAGED_RELATIONS if r in held],
                 }
             )
-    return bindings, warnings
+    kept = [b for b in bindings if _target_key(b) not in blocked]
+    for table in sorted({b["resource_id"] for b in bindings if _target_key(b) in blocked}):
+        warnings.append(
+            f"Lakekeeper table {table}: another expose naming it could not be compiled, so "
+            "none of its grants were; policy-apply leaves its grants as they are."
+        )
+    return kept, warnings
+
+
+def _target_key(target: Mapping[str, Any]) -> Tuple[str, str, Tuple[str, ...], str]:
+    """The table a target or binding names, as policy-apply groups it."""
+    from .lakekeeper_apply import catalog_key
+
+    return (
+        catalog_key(str(target.get("catalog_uri") or "")),
+        str(target.get("warehouse") or ""),
+        tuple(target.get("namespace") or ()),
+        str(target.get("table") or ""),
+    )
 
 
 def plan_changes(
