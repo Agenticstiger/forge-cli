@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from fluid_build.engines.base import Severity, ValidationIssue
+from fluid_build.schedulers import registry
 from fluid_build.schedulers.base import ScheduleEngine, ScheduleGenerationResult, ScheduleIntent
 from fluid_build.schedulers.registry import (
     _reset_registry,
@@ -28,11 +29,14 @@ from fluid_build.schedulers.registry import (
 
 
 @pytest.fixture(autouse=True)
-def _clean_registry():
-    """Reset the scheduler registry before and after each test."""
-    _reset_registry()
-    yield
-    _reset_registry()
+def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give each test an empty scheduler registry, and put the shared one back after it.
+
+    The built-in schedulers register once, when ``fluid_build.schedulers`` is first
+    imported. Emptying the shared registry would hide them from every later test in the
+    same process, and the test order is random.
+    """
+    monkeypatch.setattr(registry, "_SCHEDULERS", {})
 
 
 class _DummyScheduler(ScheduleEngine):
