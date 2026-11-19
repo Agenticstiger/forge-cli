@@ -5,9 +5,9 @@
 it ran has passed.
 
 The run stages into a sibling ``DIR.partial-<run-id>-*`` directory. When every
-selected stage passed, it copies the bundle, the artifacts its MANIFEST lists,
-the plan and the reports there, writes ``release.json`` last and renames the
-directory to ``DIR``. A run that fails, or is interrupted, publishes nothing: its
+selected stage passed, it copies the bundle (with a provenance file that names its
+source contract from ``DIR``), the artifacts its MANIFEST lists, the plan and the
+reports there, writes ``release.json`` last and renames the directory to ``DIR``. A run that fails, or is interrupted, publishes nothing: its
 reports stay in ``runtime/``, and a copy in the staging directory, for a reader
 to inspect. ``DIR`` must not exist, so a release is never changed in place.
 
@@ -269,6 +269,41 @@ def _files(staging: Path) -> Dict[str, str]:
     }
 
 
+def _write_bundle_provenance(
+    root: Path, staging: Path, release_dir: Path, bundle_digest: str
+) -> None:
+    """The provenance file beside the release's ``bundle.tgz``, written for where the
+    release will sit.
+
+    The one ``fluid bundle`` wrote beside ``runtime/bundle.tgz`` names the source
+    contract relative to ``runtime/``, so a copy would point elsewhere, and a plan made
+    from the release's bundle would record no source contract: ``fluid apply`` could
+    then not find a dbt build's project in the checkout to check it against the packed
+    copy, and refused. The same contract is recorded relative to ``release_dir``,
+    resolved as its readers resolve the bundle's directory. Like the original, the file
+    is outside every digest and outside ``identity``, as it depends on where the
+    release sits; ``release.json`` lists it with the other files. A bundle that names
+    no usable source contract gets none, and so does a release on another drive.
+    """
+    from fluid_build.forge.core import bundle as bundle_mod
+
+    built = root / st.BUNDLE_PATH
+    contract, _why = bundle_mod.resolve_bundle_source_contract(built)
+    if contract is None:
+        return
+    recorded = bundle_mod.read_bundle_provenance(built) or {}
+    place = Path(release_dir).parent.resolve() / Path(release_dir).name
+    try:
+        contract_rel = Path(os.path.relpath(contract, place)).as_posix()
+    except ValueError:  # another drive on Windows: no relative path exists
+        return
+    bundle_mod._write_provenance(
+        staging / "bundle.tgz",
+        bundle_digest,
+        {"contract": contract_rel, "overlay": recorded.get("overlay")},
+    )
+
+
 def publish(
     staging: Path,
     release_dir: Path,
@@ -283,6 +318,7 @@ def publish(
     rename it to ``release_dir``. On any error nothing is renamed."""
     try:
         _copy(root / st.BUNDLE_PATH, staging / "bundle.tgz")
+        _write_bundle_provenance(root, staging, release_dir, identity["bundle"]["manifest_digest"])
         _copy_artifacts(root, staging)
         if with_plan:
             _copy(root / st.PLAN_PATH, staging / "plan.json")
