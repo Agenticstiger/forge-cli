@@ -98,6 +98,9 @@ class SparkBlocks:
     writers: Dict[str, List[Writer]] = field(default_factory=dict)
     #: expose id -> the key of the role Lake Formation registers its location with.
     registration_roles: Dict[str, str] = field(default_factory=dict)
+    #: The ``aws_lakeformation_data_lake_settings`` data source that decides, at plan, whether
+    #: a job role is granted its own table where the binding declares no lakeFormation block.
+    lf_settings: Optional[str] = None
 
 
 def _escape(text: str) -> str:
@@ -229,7 +232,33 @@ def spark_blocks(contract: Mapping[str, Any], cid: str) -> SparkBlocks:
     for expose in contract.get("exposes") or []:
         if isinstance(expose, Mapping) and str(expose.get("exposeId")) in blocks.writers:
             _emit_registration_role(blocks, contract, ctx, expose, product_tags)
+    _emit_lake_formation_settings(blocks, contract, cid)
     return blocks
+
+
+def _emit_lake_formation_settings(
+    blocks: SparkBlocks, contract: Mapping[str, Any], cid: str
+) -> None:
+    """The account's Lake Formation settings, read at plan, when a job role writes an output
+    whose binding declares no ``governance.lakeFormation``: where Lake Formation governs new
+    tables, the role is granted its table (``aws._emit_default_spark_writer_grants``), or it
+    could not see it."""
+    from . import aws as _aws  # imported here: aws imports this module
+
+    for expose in contract.get("exposes") or []:
+        if not isinstance(expose, Mapping):
+            continue
+        writers = blocks.writers.get(str(expose.get("exposeId"))) or []
+        binding = expose.get("binding") or {}
+        governed = ((binding.get("governance") or {}).get("lakeFormation")) or {}
+        fmt = binding.get("format") or "parquet"  # as the emitter resolves it
+        if governed or not _aws._glue_cataloged(binding, fmt):
+            continue
+        if any(w.principal is not None for w in writers):
+            key = safe_ident(f"{cid}_lf_settings")
+            blocks.data.setdefault("aws_lakeformation_data_lake_settings", {})[key] = {}
+            blocks.lf_settings = key
+            return
 
 
 def _emit_registration_role(

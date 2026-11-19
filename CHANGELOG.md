@@ -429,6 +429,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Spark job on AWS can write its own table where Lake Formation governs new tables.**
+  forge granted a job's role Lake Formation access to the table it writes only when the output's
+  binding declared a non-empty `governance.lakeFormation`, so in an account that removed the
+  `IAM_ALLOWED_PRINCIPALS` default for new tables (Lake Formation's own advice), a stream
+  without that block could not see its own table. The grant (`INSERT`, `ALTER`, `DESCRIBE`,
+  `SELECT`, and `DELETE` for a batch job) is now emitted for such outputs too, with a `count` the
+  plan decides from the account's settings (`data.aws_lakeformation_data_lake_settings`): 1
+  where Lake Formation governs new tables, 0 where IAM alone decides. The module is the same text
+  in every account, and an account that keeps the default creates nothing new. The identity that
+  runs `fluid plan` and `fluid apply` needs `lakeformation:GetDataLakeSettings`. An output with a
+  `governance.lakeFormation` block keeps its grants as they are; an EMR on EC2 job runs as the
+  cluster's role, which forge does not know, and gets none.
+
 - **A decimal's arguments are a precision and scale its engine holds, or the column is refused.**
   A decimal kept whatever arguments it declared, so `decimal(1;drop table x)` went into the
   Snowflake table's DDL as `NUMBER(1;drop table x)` from `fluid generate iac`, and into the dbt
