@@ -38,7 +38,7 @@ pytestmark = [pytest.mark.unit]
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "preflight"
 BQ = FIXTURES / "bigquery_nested.fluid.yaml"
 AWS = FIXTURES / "aws_catalog.fluid.yaml"
-GOLDEN = FIXTURES / "golden_bigquery_apply.json"
+GOLDEN = FIXTURES / "golden_preflight.json"  # not *_apply.json: .gitignore drops those
 
 _REQUIRES = [
     "click>=8.1",
@@ -55,7 +55,13 @@ class FakeProbe(pf.Probe):
     """A machine with fixed versions: the report must not depend on the host."""
 
     def __init__(
-        self, dists=None, tofu=(True, "1.12.1"), which=(), environ=None, requires=_REQUIRES
+        self,
+        dists=None,
+        tofu=(True, "1.12.1"),
+        which=(),
+        environ=None,
+        requires=_REQUIRES,
+        dbt=(False, None, None),
     ):
         self.dists = dict(
             {"click": "8.1.7", "google-cloud-bigquery": "3.25.0", "google-auth": "2.30.0"}
@@ -66,6 +72,7 @@ class FakeProbe(pf.Probe):
         self._which = set(which)
         self._environ = environ if environ is not None else {}
         self._requires = requires
+        self._dbt = dbt
 
     def forge_version(self):
         return "0.32.0"
@@ -93,6 +100,10 @@ class FakeProbe(pf.Probe):
 
     def which(self, name):
         return name in self._which
+
+    def dbt(self, detect):
+        found, flavor, version = self._dbt
+        return (found, flavor, version) if detect else (found, None, None)
 
     def environ(self):
         return self._environ
@@ -453,7 +464,9 @@ def test_plugins_come_from_entry_point_metadata():
 def test_dbt_builds_need_dbt_and_the_platform_adapter():
     contract = _load(BQ)
     contract["builds"] = [{"id": "transform", "engine": "dbt", "pattern": "embedded-logic"}]
-    report = pf.build_report(contract, operation="apply", probe=FakeProbe(which={"dbt"}))
+    report = pf.build_report(
+        contract, operation="apply", probe=FakeProbe(dbt=(True, "core", "1.9.4"))
+    )
     assert "dbt" in report["needs"]["tools"]
     adapter = {r["name"]: r for r in report["adapters"]["dbt"]}
     assert adapter["dbt-bigquery"]["needed"] is True
@@ -529,6 +542,67 @@ def test_reports_and_their_comparison_hold_no_environment_value():
     # The variable names the provider reads may be named; their values never are.
     identity = _caps(laptop, area="identity")[0]
     assert "AWS_ACCESS_KEY_ID" in identity["detail"]
+
+
+def test_a_rule_message_naming_a_path_reaches_the_report_without_it(tmp_path, capsys):
+    """A Databricks dbt build whose repository is missing is refused with the directory
+    it was resolved from; the report names the refusal, not the directory."""
+    home = tmp_path / "secretuser-home" / "proj"
+    home.mkdir(parents=True)
+    contract = {
+        "fluidVersion": "0.7.7",
+        "kind": "DataProduct",
+        "id": "demo.dbx",
+        "name": "dbx",
+        "description": "a dbt build on Databricks",
+        "domain": "demo",
+        "metadata": {"layer": "Silver", "owner": {"team": "data"}},
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "kind": "table",
+                "binding": {
+                    "platform": "databricks",
+                    "format": "delta",
+                    "location": {"catalog": "main", "schema": "demo", "table": "orders"},
+                },
+                "contract": {"schema": [{"name": "id", "type": "string"}]},
+            }
+        ],
+        "builds": [
+            {
+                "id": "transform",
+                "engine": "dbt",
+                "pattern": "embedded-logic",
+                "repository": "./nowhere",
+                "execution": {"runtime": {"platform": "databricks"}},
+            }
+        ],
+    }
+    path = home / "contract.fluid.yaml"
+    path.write_text(yaml.safe_dump(contract), encoding="utf-8")
+    rc, out = _run_cli(["--contract", str(path), "--json"], capsys)
+    _rc, text = _run_cli(["--contract", str(path)], capsys)
+    for output in (out, text):
+        assert "secretuser-home" not in output
+        assert str(tmp_path) not in output
+        assert os.path.realpath(str(tmp_path)) not in output
+
+
+def test_the_path_scrubber_keeps_pointers_and_urls():
+    scrub = pf._path_scrubber("/nowhere/contract.fluid.yaml")
+    cap = pf.Capability(
+        pf.LOSSY,
+        "x",
+        "t",
+        "/exposes/0",
+        f"see {os.path.expanduser('~')}/x and /nowhere/y; exposes[0] at s3://b/k",
+        "",
+    )
+    out = scrub(cap)
+    assert out.subject == "/exposes/0"
+    assert "~/x" in out.detail and "<contract-dir>/y" in out.detail
+    assert "s3://b/k" in out.detail and "exposes[0]" in out.detail
 
 
 def test_output_goes_through_both_redaction_layers(monkeypatch):
@@ -704,3 +778,227 @@ def test_env_alone_still_lists_the_kill_switches(capsys):
     assert args.env is True and args.contract is None
     args = build_parser().parse_args(["doctor"])
     assert args.env is False
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: dbt resolution, extras, secret refs, compare keys, flag clashes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("engine", ["dbt-bigquery", "DBT-BigQuery"])
+def test_an_adapter_qualified_dbt_engine_is_a_dbt_build(engine):
+    contract = _load(BQ)
+    contract["builds"] = [{"id": "t", "engine": engine, "pattern": "embedded-logic"}]
+    report = pf.build_report(contract, operation="apply", probe=FakeProbe())
+    assert "dbt" in report["needs"]["tools"]
+    unsupported = {(c["area"], c["subject"]) for c in _caps(report, pf.UNSUPPORTED)}
+    assert ("tool", "dbt") in unsupported
+    assert ("adapter", "dbt-bigquery") in unsupported
+
+
+def test_the_dbt_the_runner_resolves_is_the_one_reported(monkeypatch, tmp_path):
+    """$DBT_EXECUTABLE counts, as it does for the runner; its path is never printed."""
+    fake = tmp_path / "dbt"
+    fake.write_text("#!/bin/sh\necho 'Core: 1.9.4'\n", encoding="utf-8")
+    fake.chmod(0o700)
+    monkeypatch.setenv("DBT_EXECUTABLE", str(fake))
+    monkeypatch.setenv("PATH", "/nonexistent")
+    found, flavor, version = pf.Probe().dbt(detect=False)
+    assert (found, flavor, version) == (True, None, None)
+    contract = _load(BQ)
+    contract["builds"] = [{"id": "t", "engine": "dbt", "pattern": "embedded-logic"}]
+    report = pf.build_report(
+        contract, operation="apply", probe=FakeProbe(dbt=(True, "core", "1.9.4"))
+    )
+    tool = next(t for t in report["tools"] if t["name"] == "dbt")
+    assert (tool["found"], tool["flavor"], tool["version"]) == (True, "core", "1.9.4")
+    assert str(tmp_path) not in pf.dumps(report)
+
+
+def test_dbt_fusion_needs_no_python_adapter():
+    contract = _load(BQ)
+    contract["builds"] = [{"id": "t", "engine": "dbt-bigquery", "pattern": "embedded-logic"}]
+    report = pf.build_report(
+        contract, operation="apply", probe=FakeProbe(dbt=(True, "fusion", "2.0.0"))
+    )
+    assert not [c for c in _caps(report, pf.UNSUPPORTED) if c["area"] in ("adapter", "tool")]
+
+
+def test_a_databricks_job_build_needs_no_local_dbt():
+    contract = _load(BQ)
+    contract["builds"] = [
+        {
+            "id": "t",
+            "engine": "dbt",
+            "pattern": "embedded-logic",
+            "execution": {"runtime": {"platform": "databricks"}},
+        }
+    ]
+    report = pf.build_report(contract, operation="apply", probe=FakeProbe())
+    assert "dbt" not in report["needs"]["tools"]
+
+
+def test_an_extra_that_includes_others_is_judged_by_them():
+    requires = [
+        "boto3>=1.34; extra == 'aws'",
+        "duckdb>=1.5.0; extra == 'local'",
+        "data-product-forge[aws,local]; extra == 'all'",
+    ]
+    report = _report(AWS, probe=FakeProbe(dists={"boto3": "1.35.0"}, requires=requires))
+    every = next(e for e in report["extras"] if e["name"] == "all")
+    assert {r["name"] for r in every["requirements"]} == {"boto3", "duckdb"}
+    assert every["status"] == "partial"
+
+
+def test_a_secret_reference_warning_needs_live_proof(monkeypatch):
+    """validate's secret-ref warnings (no resolver here, a host judged at apply) are
+    what only the run decides."""
+    from fluid_build.cli import validate as v
+
+    real = v._run_contract_rules
+
+    def rules(contract, version, result, args, logger, locate=None):
+        real(contract, version, result, args, logger, locate=locate)
+        result.add_warning(
+            "exposes[orders]: no resolver for azure-kv:// is installed",
+            event="contract_secret_ref",
+            pointer="/exposes/0",
+        )
+
+    monkeypatch.setattr(v, "_run_contract_rules", rules)
+    caps = _caps(_report(AWS), pf.LIVE, "secret-ref")
+    assert [c["subject"] for c in caps] == ["/exposes/0"]
+
+
+def test_compare_counts_capabilities_that_share_a_key():
+    """Five schema errors at one pointer against four: the one more is a gap."""
+    left = _report(AWS, operation="validate")
+    right = json.loads(pf.dumps(left))
+    right["capabilities"].append(dict(right["capabilities"][0], detail="one more"))
+    gaps = pf.compare_reports(left, right)
+    assert [(g["area"], g["left"]) for g in gaps] == [("capability", "absent")]
+
+
+def test_compare_ignores_extras_neither_side_needs():
+    both = {"boto3": "1.35.0", "botocore": "1.35.0"}
+    laptop = _report(AWS, operation="apply", probe=FakeProbe(dists={**both, "duckdb": "1.5.1"}))
+    ci = _report(AWS, operation="apply", probe=FakeProbe(dists=both))
+    assert not [g for g in pf.compare_reports(laptop, ci) if "local" in g["name"]]
+
+
+@pytest.mark.parametrize(
+    "extra, clash",
+    [
+        (["--scope", "infra"], "--scope"),
+        (["--extended"], "--extended"),
+        (["--features-only"], "--features-only"),
+    ],
+)
+def test_cli_refuses_doctor_modes_with_contract(extra, clash, capsys):
+    from fluid_build.cli._common import CLIError
+
+    with pytest.raises(CLIError) as err:
+        _run_cli(["--contract", str(AWS), *extra], capsys)
+    assert clash in err.value.context["reason"]
+
+
+def test_cli_refuses_contract_with_compare(tmp_path, capsys):
+    from fluid_build.cli._common import CLIError
+
+    report = tmp_path / "r.json"
+    report.write_text(pf.dumps(_report()), encoding="utf-8")
+    with pytest.raises(CLIError) as err:
+        _run_cli(["--compare", str(report), str(report), "--contract", str(AWS)], capsys)
+    assert "--contract" in err.value.context["reason"]
+
+
+def test_live_on_an_offline_operation_says_so(capsys):
+    _rc, out = _run_cli(["--contract", str(AWS), "--live"], capsys)
+    assert "no live check applies to plan" in out
+
+
+def _two_clouds():
+    contract = _load(AWS)
+    contract["exposes"].append(_load(BQ)["exposes"][0])
+    return contract
+
+
+def test_apply_on_two_clouds_needs_a_provider():
+    report = pf.build_report(_two_clouds(), operation="apply", probe=FakeProbe())
+    refusal = _caps(report, pf.UNSUPPORTED, "provider")
+    assert refusal and "--provider" in refusal[0]["fix"]
+    assert report["needs"]["clouds"] == []
+
+
+def test_provider_scopes_what_apply_needs():
+    report = pf.build_report(_two_clouds(), operation="apply", provider="aws", probe=FakeProbe())
+    assert report["needs"]["clouds"] == ["aws"]
+    assert [c["target"] for c in _caps(report, area="identity")] == ["aws"]
+    assert not _caps(report, pf.UNSUPPORTED, "provider")
+
+
+def test_a_provider_the_contract_does_not_declare_is_unsupported():
+    report = pf.build_report(_load(AWS), operation="apply", provider="gcp", probe=FakeProbe())
+    assert _caps(report, pf.UNSUPPORTED, "provider")
+
+
+def test_the_state_backend_flag_beats_the_environment():
+    probe = FakeProbe(environ={"FLUID_STATE_BACKEND": "s3://env-bucket/k"})
+    report = _report(AWS, operation="apply", probe=probe, state_backend="gcs://flag-bucket/p")
+    assert report["state_backend"]["origin"] == "--state-backend"
+    assert report["state_backend"]["scheme"] == "gcs"
+    local = _report(AWS, operation="apply", probe=probe, state_backend="")
+    assert local["state_backend"]["scheme"] == "local"
+
+
+@pytest.mark.parametrize("version", [5, 0.7, True, "latest"])
+def test_an_unreadable_fluid_version_is_a_report_not_a_crash(version):
+    report = pf.build_report({"fluidVersion": version, "id": "x"}, probe=FakeProbe())
+    assert report["summary"]["verdict"] == "not-ready"
+    assert _caps(report, pf.UNSUPPORTED, "schema")
+
+
+@pytest.mark.parametrize("text", ["- a\n", "hello\n", "a: [unclosed\n"])
+def test_a_malformed_contract_is_a_clean_error(text, tmp_path, capsys):
+    from fluid_build.cli._common import CLIError
+
+    path = tmp_path / "c.fluid.yaml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(CLIError) as err:
+        _run_cli(["--contract", str(path)], capsys)
+    assert err.value.event == "doctor_preflight_failed"
+    assert str(tmp_path) not in err.value.context["reason"]
+
+
+def test_a_deeply_nested_report_is_refused(tmp_path):
+    path = tmp_path / "deep.json"
+    path.write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
+    with pytest.raises(pf.PreflightError):
+        pf.load_report(str(path))
+
+
+def test_the_installed_validators_run_as_validate_runs_them(monkeypatch):
+    from fluid_build.cli import validate as v
+
+    def extension(contract, result, logger, locate=None):
+        result.add_error("extensions.acme: refused by acme", event="contract_extension")
+
+    monkeypatch.setattr(v, "_run_extension_validators", extension)
+    caps = _caps(_report(AWS), pf.UNSUPPORTED, "extension")
+    assert [c["detail"] for c in caps] == ["extensions.acme: refused by acme"]
+
+
+def test_no_schema_cache_is_read_or_written_under_home(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    _report(AWS)
+    assert not (tmp_path / ".fluid").exists()
+
+
+def test_a_bundle_is_preflighted_like_its_contract(tmp_path, capsys):
+    out = tmp_path / "b.tgz"
+    args = build_parser().parse_args(["bundle", str(AWS), "--format", "tgz", "--out", str(out)])
+    assert args.func(args, logging.getLogger("test")) == 0
+    _rc, text = _run_cli(["--contract", str(out), "--operation", "validate", "--json"], capsys)
+    bundled = json.loads(text)
+    _rc, text = _run_cli(["--contract", str(AWS), "--operation", "validate", "--json"], capsys)
+    assert bundled["capabilities"] == json.loads(text)["capabilities"]

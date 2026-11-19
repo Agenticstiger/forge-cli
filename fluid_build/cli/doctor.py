@@ -408,7 +408,8 @@ and their current values.
         help=(
             "Exit 1 when the summary is 'Action needed' (any built-in check not ready, "
             "including copilot readiness); by default only a failed feature check does. "
-            "Ignored with --features-only, which reports feature checks alone"
+            "Ignored with --features-only, which reports feature checks alone. With "
+            "--contract: also exit 1 when a capability is lossy"
         ),
     )
     p.add_argument(
@@ -447,7 +448,23 @@ def _add_preflight_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--live",
         action="store_true",
-        help="With --contract: also run read-only live checks of the identity and state backend",
+        help=(
+            "With --contract: also run read-only live checks of the identity and state "
+            "backend (apply and ship; the other operations need no cloud)"
+        ),
+    )
+    p.add_argument(
+        "--provider",
+        default=None,
+        help="With --contract: the cloud apply provisions, as apply takes it (a contract on "
+        "several clouds needs one)",
+    )
+    p.add_argument(
+        "--state-backend",
+        default=None,
+        metavar="SPEC",
+        help="With --contract: the OpenTofu state apply uses (s3://... or gcs://...), as apply "
+        "takes it; else FLUID_STATE_BACKEND",
     )
     p.add_argument(
         "--compare",
@@ -459,9 +476,25 @@ def _add_preflight_arguments(p: argparse.ArgumentParser) -> None:
 
 def _preflight_dispatch(args, logger: logging.Logger) -> Optional[int]:
     """Run ``--contract`` / ``--compare``, refuse their flags without them, else ``None``."""
-    if isinstance(getattr(args, "contract", None), str) or isinstance(
-        getattr(args, "compare", None), (list, tuple)
-    ):
+    contract = isinstance(getattr(args, "contract", None), str)
+    compare = isinstance(getattr(args, "compare", None), (list, tuple))
+    if contract or compare:
+        given = "--compare" if compare else "--contract"
+        others = [("--contract", contract and compare)] + [
+            (flag, getattr(args, attr, None) is True or isinstance(getattr(args, attr, None), str))
+            for flag, attr in (
+                ("--scope", "scope"),
+                ("--extended", "extended"),
+                ("--features-only", "features_only"),
+            )
+        ]
+        clash = [flag for flag, set_ in others if set_]
+        if clash:
+            raise CLIError(
+                2,
+                "doctor_preflight_failed",
+                {"reason": f"{given} runs on its own; drop {', '.join(clash)}"},
+            )
         from fluid_build.cli._preflight import run_cli
 
         return run_cli(args, logger)
@@ -469,6 +502,8 @@ def _preflight_dispatch(args, logger: logging.Logger) -> Optional[int]:
         ("--env NAME", isinstance(getattr(args, "env", None), str)),
         ("--operation", isinstance(getattr(args, "operation", None), str)),
         ("--live", getattr(args, "live", False) is True),
+        ("--provider", isinstance(getattr(args, "provider", None), str)),
+        ("--state-backend", isinstance(getattr(args, "state_backend", None), str)),
     ):
         if given:
             raise CLIError(2, "doctor_preflight_failed", {"reason": f"{flag} needs --contract"})

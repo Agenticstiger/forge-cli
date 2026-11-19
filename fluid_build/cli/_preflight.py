@@ -95,6 +95,10 @@ _LOSSY_EVENTS = frozenset(
     }
 )
 
+#: Warnings that name what only the live run decides: a secret reference whose
+#: resolver is not installed here, or whose host is judged only at apply.
+_LIVE_EVENTS = frozenset({"contract_secret_ref"})
+
 #: Cloud -> the extra that installs its SDKs.
 _CLOUD_EXTRAS = {
     "aws": "aws",
@@ -218,6 +222,23 @@ class Probe:
         version = runner.tofu_version()
         return True, ".".join(str(p) for p in version) if version else None
 
+    def dbt(self, detect: bool) -> Tuple[bool, Optional[str], Optional[str]]:
+        """``(found, flavor, version)`` of the dbt the runner would run
+        (``$DBT_EXECUTABLE``, PATH, the venv's own). Its version (``dbt --version``)
+        is read only when the operation runs dbt."""
+        from fluid_build.build_runners.dbt.runner import (
+            _detect_dbt_engine,
+            _resolve_dbt_executable,
+        )
+
+        executable = _resolve_dbt_executable()
+        if executable is None:
+            return False, None, None
+        if not detect:
+            return True, None, None
+        flavor, version = _detect_dbt_engine(executable)
+        return True, (None if flavor == "unknown" else flavor), version or None
+
     def which(self, name: str) -> bool:
         return shutil.which(name) is not None
 
@@ -245,37 +266,49 @@ def build_report(
     env: Optional[str] = None,
     contract_path: Optional[str] = None,
     live: bool = False,
+    provider: Optional[str] = None,
+    state_backend: Optional[str] = None,
+    overlay_warnings: Sequence[str] = (),
     probe: Optional[Probe] = None,
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Any]:
     """The preflight report for ``operation`` on ``contract`` (already loaded, with
     ``env``'s overlay applied). ``contract_path`` is only used to resolve files the
-    contract names; it is never written into the report."""
+    contract names; it is never written into the report. ``provider`` and
+    ``state_backend`` are ``apply``'s ``--provider`` and ``--state-backend``."""
     if operation not in OPERATIONS:
         raise PreflightError(f"unknown operation {operation!r}: use one of {', '.join(OPERATIONS)}")
     probe = probe or Probe()
     log = logger or logging.getLogger(__name__)
     clouds = _clouds(contract)
-    needs = _needs(contract, operation, clouds)
-
     capabilities: List[Capability] = []
+    scope = clouds
+    if operation in _LIVE_OPERATIONS and [c for c in clouds if c != "local"]:
+        resolved, refusal = _resolve_cloud(contract, provider)
+        scope = [resolved] if resolved else [c for c in clouds if c == "local"]
+        capabilities += [refusal] if refusal else []
+    needs = _needs(contract, operation, scope)
+
     schema_revision, schema_caps = _schema_revision(contract)
     capabilities += schema_caps
-    validation, rule_caps = _contract_rules(contract, env, contract_path, log)
+    validation, rule_caps = _contract_rules(contract, env, contract_path, log, overlay_warnings)
     capabilities += rule_caps
     capabilities += _column_capabilities(contract)
     extras = _extras(probe, needs.extras)
     capabilities += _extra_capabilities(extras)
     tools = _tools(probe, needs.tools)
     capabilities += _tool_capabilities(tools)
-    adapters = _adapters(probe, needs, clouds)
+    adapters = _adapters(probe, needs, clouds, tools)
     capabilities += _adapter_capabilities(adapters)
-    state_backend = _state_backend(probe, contract, operation, clouds)
-    capabilities += _live_capabilities(probe, operation, needs.clouds, state_backend)
-    live_checks = run_live_checks(needs.clouds, state_backend, probe) if live else None
+    backend, backend_spec = _state_backend(
+        probe, contract, operation, needs.clouds, state_backend, provider
+    )
+    capabilities += _live_capabilities(probe, operation, needs.clouds, backend)
+    live_checks = run_live_checks(needs.clouds, backend, backend_spec) if live else None
     if live_checks is not None:
         capabilities = _apply_live_checks(capabilities, live_checks)
 
+    scrub = _path_scrubber(contract_path)
     report: Dict[str, Any] = {
         "version": REPORT_FORMAT,
         "operation": operation,
@@ -303,13 +336,32 @@ def build_report(
         "plugins": _plugins(probe),
         "tools": tools,
         "adapters": adapters,
-        "state_backend": state_backend,
-        "capabilities": [c.as_dict() for c in _sorted(capabilities)],
+        "state_backend": backend,
+        "capabilities": [scrub(c).as_dict() for c in _sorted(capabilities)],
     }
     if live_checks is not None:
         report["live_checks"] = live_checks
     report["summary"] = _summary(report)
-    return redact_report(report)
+    return redact_report(report, contract_path=contract_path)
+
+
+def _resolve_cloud(
+    contract: Mapping[str, Any], provider: Optional[str]
+) -> Tuple[Optional[str], Optional[Capability]]:
+    """The one cloud ``apply`` provisions, chosen as ``apply`` chooses it
+    (``generate_iac._resolve_provider``): ``--provider``, else the only cloud the
+    contract declares. A contract on several clouds needs ``--provider``."""
+    from ._common import CLIError
+    from .generate_iac import _resolve_provider
+
+    try:
+        return str(_resolve_provider(dict(contract), provider or "auto")), None
+    except CLIError as exc:
+        reason = _text((exc.context or {}).get("error") or exc.event)
+        fix = "Pass --provider with the cloud to provision, as apply takes it."
+        return None, Capability(
+            UNSUPPORTED, "provider", "contract", "binding.platform", reason, fix
+        )
 
 
 def exit_code(report: Mapping[str, Any], *, strict: bool = False) -> int:
@@ -344,6 +396,68 @@ def _sorted(caps: Iterable[Capability]) -> List[Capability]:
     )
 
 
+def _path_roots(contract_path: Optional[str]) -> List[Tuple[str, str]]:
+    """``(root, placeholder)`` for the directories a message can name on this machine,
+    longest first, each also in its resolved form (``/tmp`` is ``/private/tmp`` on
+    macOS). The contract's own directory reads ``<contract-dir>``, the home ``~``."""
+    import tempfile
+    from pathlib import Path
+
+    named: List[Tuple[Optional[str], str]] = []
+    if contract_path:
+        named.append((str(Path(contract_path).parent), "<contract-dir>"))
+    named += [
+        (os.getcwd(), "<cwd>"),
+        (str(Path.home()), "~"),
+        (sys.prefix, "<python>"),
+        (sys.base_prefix, "<python>"),
+        (tempfile.gettempdir(), "<tmp>"),
+    ]
+    roots: Dict[str, str] = {}
+    for root, placeholder in named:
+        if not root or len(root) < 2:
+            continue
+        for form in {root, os.path.realpath(root)}:
+            if len(form) > 1:
+                roots.setdefault(form.rstrip("/\\"), placeholder)
+    return sorted(roots.items(), key=lambda item: -len(item[0]))
+
+
+def _unrooted(text: str, roots: Sequence[Tuple[str, str]]) -> str:
+    for root, placeholder in roots:
+        text = text.replace(root, placeholder)
+    return text
+
+
+def _absolute_paths() -> Any:
+    """A path under one of this machine's top-level directories (``/Users/...``,
+    ``/home/...``, ``/builds/...``), or a Windows drive path."""
+    import re
+
+    try:
+        tops = sorted(e for e in os.listdir(os.sep) if e and not e.startswith("."))
+    except OSError:
+        tops = []
+    alternatives = [rf"/{re.escape(t)}(?:/[^\s'\"(),;]*|(?![\w.-]))" for t in tops]
+    alternatives.append(r"\b[A-Za-z]:\\[^\s'\"(),;]*")
+    return re.compile(r"(?<![\w:/.])(?:" + "|".join(alternatives) + r")")
+
+
+def _path_scrubber(contract_path: Optional[str]) -> Any:
+    """A function that takes every filesystem path out of a capability's detail and fix.
+    A contract rule's message can name one (a dbt project resolved from the contract's
+    directory): known roots become placeholders, any other absolute path ``<path>``."""
+    roots = _path_roots(contract_path)
+    pattern = _absolute_paths()
+
+    def scrub(cap: Capability) -> Capability:
+        detail = pattern.sub("<path>", _unrooted(cap.detail, roots))
+        fix = pattern.sub("<path>", _unrooted(cap.fix, roots))
+        return Capability(cap.cls, cap.area, cap.target, cap.subject, detail, fix)
+
+    return scrub
+
+
 def _text(value: Any) -> str:
     text = str(value if value is not None else "")
     return text if len(text) <= _MAX_TEXT else text[: _MAX_TEXT - 1] + "…"
@@ -364,14 +478,33 @@ def _clouds(contract: Mapping[str, Any]) -> List[str]:
 
 
 def _runs_builds(contract: Mapping[str, Any]) -> List[Mapping[str, Any]]:
-    """The builds forge runs: a reference build's transformation lives elsewhere."""
+    """The builds forge runs on this machine. A reference build's transformation lives
+    elsewhere; a Databricks job, a Flink job and other externally run builds run on
+    their platform, which ``apply`` provisions but does not run here."""
+    from fluid_build.util.contract import is_databricks_job_build, is_externally_run_build
+
     builds = contract.get("builds") if isinstance(contract, Mapping) else None
     reference = {"hybrid-reference", "reference", "external-reference"}
     return [
         b
         for b in (builds if isinstance(builds, list) else [])
-        if isinstance(b, Mapping) and b.get("pattern") not in reference
+        if isinstance(b, Mapping)
+        and b.get("pattern") not in reference
+        and not is_databricks_job_build(b)
+        and not is_externally_run_build(b)
     ]
+
+
+def _dbt_adapters(build: Mapping[str, Any], clouds: Sequence[str]) -> List[str]:
+    """The dbt adapter distribution a dbt build loads: the engine's suffix
+    (``dbt-bigquery``) or its runtime platform, as the dbt runner reads them, else the
+    adapters of the clouds the contract binds."""
+    from fluid_build.build_runners.dbt.runner import _infer_dbt_adapter
+
+    adapter = _infer_dbt_adapter(dict(build))
+    if adapter:
+        return [f"dbt-{adapter}"]
+    return sorted({_DBT_ADAPTERS[c] for c in clouds if c in _DBT_ADAPTERS})
 
 
 def _needs(contract: Mapping[str, Any], operation: str, clouds: Sequence[str]) -> _Needs:
@@ -388,10 +521,14 @@ def _needs(contract: Mapping[str, Any], operation: str, clouds: Sequence[str]) -
     tools = set()
     if any(default_engine(c) == "opentofu" for c in needs.clouds):
         tools.add("tofu")
-    engines = {str(b.get("engine") or "").strip().lower() for b in _runs_builds(contract)}
-    if "dbt" in engines:
+    from fluid_build.build_runners.base import is_dbt_build
+
+    builds = _runs_builds(contract)
+    engines = {str(b.get("engine") or "").strip().lower() for b in builds}
+    dbt_builds = [b for b in builds if is_dbt_build(dict(b))]
+    if dbt_builds:
         tools.add("dbt")
-        needs.adapters = sorted({_DBT_ADAPTERS[c] for c in clouds if c in _DBT_ADAPTERS})
+        needs.adapters = sorted({a for b in dbt_builds for a in _dbt_adapters(b, clouds)})
     # A Spark build on a cloud is submitted there (EMR, Databricks, Dataproc); only a
     # local one needs spark-submit here.
     if "spark" in engines and not needs.clouds:
@@ -459,6 +596,7 @@ def _contract_rules(
     env: Optional[str],
     contract_path: Optional[str],
     logger: logging.Logger,
+    overlay_warnings: Sequence[str] = (),
 ) -> Tuple[Dict[str, Any], List[Capability]]:
     """``fluid validate``'s schema check and contract rules, offline, as capabilities.
 
@@ -466,22 +604,56 @@ def _contract_rules(
     warning from a binding check is ``lossy``. Column-type findings are left to
     :func:`_column_capabilities`, which judges each column.
     """
+    import tempfile
+    from pathlib import Path
+
     from fluid_build.cli import validate as _validate
     from fluid_build.iac.providers.aws import validate_aws_column_types
     from fluid_build.iac.providers.gcp import validate_bigquery_column_types
 
-    manager = _validate.FluidSchemaManager(logger=logger)
-    result = manager.validate_contract(dict(contract), offline_only=True)
+    # An empty schema cache: the bundled schemas only, as the report says, and nothing
+    # written under the home directory.
+    with tempfile.TemporaryDirectory(prefix="fluid-preflight-") as cache:
+        manager = _validate.FluidSchemaManager(cache_dir=Path(cache), logger=logger)
+        try:
+            result = manager.validate_contract(dict(contract), offline_only=True)
+        except Exception as exc:  # noqa: BLE001 - an unreadable fluidVersion, say
+            from fluid_build.schema_manager import ValidationResult
+
+            result = ValidationResult(is_valid=False)
+            result.add_error(
+                f"the schema check could not run ({type(exc).__name__}: {exc})",
+                event="validation_error",
+            )
+    for warning in overlay_warnings:
+        result.add_warning(warning, event="contract_overlay")
     args = SimpleNamespace(
         quiet=True, verbose=False, offline=True, strict=False, contract=contract_path, env=env
     )
-    try:
-        _validate._run_contract_rules(dict(contract), result.schema_version, result, args, logger)
-    except Exception as exc:  # noqa: BLE001 - reported, never swallowed
-        result.add_error(
-            f"the contract rules could not run ({type(exc).__name__})",
-            event="contract_check_failed",
-        )
+    # What ``fluid validate`` runs after the schema: the contract rules, then the
+    # installed extension and role validators.
+    for name, call in (
+        (
+            "the contract rules",
+            lambda: _validate._run_contract_rules(
+                dict(contract), result.schema_version, result, args, logger
+            ),
+        ),
+        (
+            "the extension validators",
+            lambda: _validate._run_extension_validators(dict(contract), result, logger),
+        ),
+        (
+            "the role validators",
+            lambda: _validate._run_role_validators(dict(contract), result, logger),
+        ),
+    ):
+        try:
+            call()
+        except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+            result.add_error(
+                f"{name} could not run ({type(exc).__name__})", event="contract_check_failed"
+            )
     per_column = set()
     for check in (validate_aws_column_types, validate_bigquery_column_types):
         try:
@@ -506,7 +678,9 @@ def _contract_rules(
         if message in per_column:
             continue
         event, pointer = _meta(result, message)
-        if event in _LOSSY_EVENTS:
+        if event in _LIVE_EVENTS:
+            caps.append(Capability(LIVE, _area(event), "contract", pointer or "/", _text(message)))
+        elif event in _LOSSY_EVENTS:
             caps.append(Capability(LOSSY, _area(event), "contract", pointer or "/", _text(message)))
     validation = {
         "valid": bool(result.is_valid),
@@ -597,7 +771,8 @@ def _extras(probe: Probe, needed: Sequence[str]) -> List[Dict[str, Any]]:
             for name in needed
         ]
     by_extra: Dict[str, List[Dict[str, Any]]] = {}
-    base_env = dict(default_environment())
+    includes: Dict[str, set] = {}
+    base_env: Dict[str, str] = dict(default_environment())
     for line in lines:
         try:
             req = Requirement(line)
@@ -607,9 +782,14 @@ def _extras(probe: Probe, needed: Sequence[str]) -> List[Dict[str, Any]]:
             continue
         for extra in _marker_extras(str(req.marker)):
             try:
-                if not req.marker.evaluate(dict(base_env, extra=extra)):
+                if not req.marker.evaluate({**base_env, "extra": extra}):
                     continue
             except Exception:  # noqa: BLE001 - an unevaluable marker pins nothing here
+                continue
+            if _canonical(req.name) == _canonical(DIST):
+                # ``all = ["data-product-forge[aws,gcp]"]``: the extras it names.
+                includes.setdefault(extra, set()).update(req.extras)
+                by_extra.setdefault(extra, [])
                 continue
             installed = probe.dist_version(req.name)
             by_extra.setdefault(extra, []).append(
@@ -624,7 +804,8 @@ def _extras(probe: Probe, needed: Sequence[str]) -> List[Dict[str, Any]]:
         by_extra.setdefault(name, [])
     rows = []
     for name in sorted(by_extra):
-        reqs = sorted(by_extra[name], key=lambda r: r["name"])
+        merged = {r["name"]: r for r in _with_included(name, by_extra, includes, set())}
+        reqs = sorted(merged.values(), key=lambda r: r["name"])
         ok = [r for r in reqs if r["satisfied"]]
         if not reqs:
             status = "unknown"
@@ -637,6 +818,28 @@ def _extras(probe: Probe, needed: Sequence[str]) -> List[Dict[str, Any]]:
         rows.append(
             {"name": name, "needed": name in needed, "status": status, "requirements": reqs}
         )
+    return rows
+
+
+def _canonical(name: str) -> str:
+    from packaging.utils import canonicalize_name
+
+    return str(canonicalize_name(name))
+
+
+def _with_included(
+    extra: str,
+    by_extra: Mapping[str, List[Dict[str, Any]]],
+    includes: Mapping[str, set],
+    seen: set,
+) -> List[Dict[str, Any]]:
+    """An extra's requirements, with those of the extras it includes."""
+    if extra in seen:
+        return []
+    seen.add(extra)
+    rows = list(by_extra.get(extra, []))
+    for included in sorted(includes.get(extra, ())):
+        rows += _with_included(included, by_extra, includes, seen)
     return rows
 
 
@@ -708,32 +911,27 @@ def _tools(probe: Probe, needed: Sequence[str]) -> List[Dict[str, Any]]:
     """The external tools the operation runs. Only their presence and version: never
     their path."""
     rows = []
-    found, version = probe.tofu()
-    if "tofu" in needed or found:
-        requirement = _tofu_requirement()
-        rows.append(
-            {
-                "name": "tofu",
-                "needed": "tofu" in needed,
-                "found": found,
-                "version": version,
-                "requirement": requirement,
-                "satisfied": found and (version is None or _satisfies_text(requirement, version)),
-            }
-        )
-    for name in ("dbt", "spark-submit"):
-        found = probe.which(name)
+
+    def row(name: str, found: bool, version: Optional[str], flavor: Optional[str], req: str):
         if name in needed or found:
+            satisfied = found and (not req or version is None or _satisfies_text(req, version))
             rows.append(
                 {
                     "name": name,
                     "needed": name in needed,
                     "found": found,
-                    "version": None,
-                    "requirement": "",
-                    "satisfied": found,
+                    "version": version,
+                    "flavor": flavor,
+                    "requirement": req,
+                    "satisfied": satisfied,
                 }
             )
+
+    found, version = probe.tofu()
+    row("tofu", found, version, None, _tofu_requirement())
+    found, flavor, version = probe.dbt(detect="dbt" in needed)
+    row("dbt", found, version, flavor, "")
+    row("spark-submit", probe.which("spark-submit"), None, None, "")
     return rows
 
 
@@ -751,7 +949,8 @@ def _tool_capabilities(tools: Sequence[Mapping[str, Any]]) -> List[Capability]:
     fixes = {
         "tofu": "Install OpenTofu (https://opentofu.org/docs/intro/install/), or pass "
         "--ensure-opentofu to apply.",
-        "dbt": "pip install dbt-core and the platform's adapter, or set DBT_EXECUTABLE.",
+        "dbt": "Install dbt (dbt-core and the platform's adapter, or dbt Fusion), or set "
+        "DBT_EXECUTABLE.",
         "spark-submit": "Install Apache Spark and put spark-submit on PATH.",
     }
     for tool in tools:
@@ -760,9 +959,7 @@ def _tool_capabilities(tools: Sequence[Mapping[str, Any]]) -> List[Capability]:
         name = tool["name"]
         if not tool["found"]:
             caps.append(
-                Capability(
-                    UNSUPPORTED, "tool", name, name, "not found on PATH", fixes.get(name, "")
-                )
+                Capability(UNSUPPORTED, "tool", name, name, "not found", fixes.get(name, ""))
             )
         elif not tool["satisfied"]:
             caps.append(
@@ -780,12 +977,19 @@ def _tool_capabilities(tools: Sequence[Mapping[str, Any]]) -> List[Capability]:
     return caps
 
 
-def _adapters(probe: Probe, needs: _Needs, clouds: Sequence[str]) -> Dict[str, Any]:
+def _adapters(
+    probe: Probe, needs: _Needs, clouds: Sequence[str], tools: Sequence[Mapping[str, Any]] = ()
+) -> Dict[str, Any]:
     """dbt and its adapters (installed version against the extra's pin), and the
     OpenTofu provider pins of the clouds the operation changes."""
     from fluid_build.iac.versions import PROVIDER_PINS
 
     dbt = []
+    # dbt Fusion is one binary with its adapters built in: no Python distribution to check.
+    fusion = any(t.get("name") == "dbt" and t.get("flavor") == "fusion" for t in tools)
+    needs = _Needs(needs.clouds, needs.extras, needs.tools, [] if fusion else needs.adapters)
+    if fusion:
+        needs.tools = [t for t in needs.tools if t != "dbt"]
     names = sorted({"dbt-core", *needs.adapters})
     for name in names:
         installed = probe.dist_version(name)
@@ -867,27 +1071,42 @@ def _iac_plugin(cloud: str) -> Any:
 
 
 def _state_backend(
-    probe: Probe, contract: Mapping[str, Any], operation: str, clouds: Sequence[str]
-) -> Dict[str, Any]:
-    """Where ``apply`` keeps OpenTofu state: the scheme and where it was set, never the
-    bucket or key."""
-    from fluid_build.iac.backend import STATE_BACKEND_ENV, parse_backend
+    probe: Probe,
+    contract: Mapping[str, Any],
+    operation: str,
+    clouds: Sequence[str],
+    flag: Optional[str],
+    provider: Optional[str],
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Where ``apply`` keeps OpenTofu state, resolved as ``apply`` resolves it
+    (``--state-backend``, then ``FLUID_STATE_BACKEND``, then local): ``(row, spec)``. The
+    row names the scheme and where it was set, never the bucket or key."""
+    from fluid_build.iac.backend import (
+        STATE_BACKEND_ENV,
+        parse_backend,
+        resolve_state_backend_spec,
+    )
 
-    spec = (probe.environ().get(STATE_BACKEND_ENV) or "").strip()
+    spec, origin = resolve_state_backend_spec(flag, probe.environ())
     row: Dict[str, Any] = {
         "needed": operation in _LIVE_OPERATIONS and bool([c for c in clouds if c != "local"]),
-        "origin": STATE_BACKEND_ENV if spec else "default",
+        "origin": origin,
         "scheme": "local",
         "valid": True,
     }
     if spec:
         try:
-            block = parse_backend(spec, contract)
+            block = parse_backend(
+                spec,
+                contract,
+                per_contract_default=origin == STATE_BACKEND_ENV,
+                provider=provider or (clouds[0] if clouds else None),
+            )
         except ValueError:
             row.update(scheme="unknown", valid=False)
         else:
             row["scheme"] = next(iter(block)) if block else "local"
-    return row
+    return row, spec
 
 
 def _live_capabilities(
@@ -933,7 +1152,8 @@ def _live_capabilities(
                     "local",
                     f"{operation} keeps OpenTofu state on this machine, so another runner "
                     "cannot see it",
-                    "Set FLUID_STATE_BACKEND (or pass --state-backend) to s3:// or gcs://.",
+                    "Pass --state-backend (or set FLUID_STATE_BACKEND) to s3:// or gcs://, "
+                    "as apply takes it.",
                 )
             )
         else:
@@ -951,7 +1171,7 @@ def _live_capabilities(
 
 
 def run_live_checks(
-    clouds: Sequence[str], state_backend: Mapping[str, Any], probe: Probe
+    clouds: Sequence[str], state_backend: Mapping[str, Any], spec: Optional[str]
 ) -> List[Dict[str, str]]:
     """Read-only live checks. Each says ok, failed or skipped, and why, never the
     identity or bucket it found."""
@@ -970,8 +1190,7 @@ def run_live_checks(
                 }
             )
     if state_backend.get("needed") and state_backend.get("scheme") in ("s3", "gcs"):
-        spec = (probe.environ().get("FLUID_STATE_BACKEND") or "").strip()
-        rows.append(_check("state-backend", lambda: _backend_reachable(spec)))
+        rows.append(_check("state-backend", lambda: _backend_reachable(spec or "")))
     return rows
 
 
@@ -1023,10 +1242,25 @@ def _failure(exc: BaseException) -> str:
     return f"{type(exc).__name__} {_text(code)}".strip() if code else type(exc).__name__
 
 
-def _aws_identity() -> str:
-    import boto3
+#: A live check answers within this, or fails: a runner with no route out must not
+#: hang on SDK retries.
+_LIVE_TIMEOUT_S = 10
 
-    boto3.client("sts").get_caller_identity()
+
+def _aws_client(service: str) -> Any:
+    import boto3
+    from botocore.config import Config
+
+    config = Config(
+        connect_timeout=_LIVE_TIMEOUT_S,
+        read_timeout=_LIVE_TIMEOUT_S,
+        retries={"max_attempts": 1},
+    )
+    return boto3.client(service, config=config)
+
+
+def _aws_identity() -> str:
+    _aws_client("sts").get_caller_identity()
     return "STS GetCallerIdentity answered"
 
 
@@ -1035,7 +1269,13 @@ def _gcp_identity() -> str:
     from google.auth.transport.requests import Request
 
     credentials, _project = google.auth.default()
-    credentials.refresh(Request())
+    transport = Request()
+
+    def request(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("timeout", _LIVE_TIMEOUT_S)
+        return transport(*args, **kwargs)
+
+    credentials.refresh(request)
     return "application default credentials refreshed"
 
 
@@ -1044,14 +1284,12 @@ def _backend_reachable(spec: str) -> str:
 
     block = parse_backend(spec) or {}
     if "s3" in block:
-        import boto3
-
-        boto3.client("s3").head_bucket(Bucket=block["s3"]["bucket"])
+        _aws_client("s3").head_bucket(Bucket=block["s3"]["bucket"])
         return "state bucket readable"
     if "gcs" in block:
         from google.cloud import storage
 
-        if not storage.Client().bucket(block["gcs"]["bucket"]).exists():
+        if not storage.Client().bucket(block["gcs"]["bucket"]).exists(timeout=_LIVE_TIMEOUT_S):
             raise LookupError("not found")
         return "state bucket readable"
     return "local state"
@@ -1062,14 +1300,26 @@ def _backend_reachable(spec: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def redact_report(report: Any) -> Any:
+def redact_report(report: Any, *, contract_path: Optional[str] = None) -> Any:
     """``report`` through both redaction layers: the global secret redactor, and the
     Snowflake provider's twin, so a credential-shaped value in a message never reaches
-    stdout or a saved report."""
+    stdout or a saved report. Any string naming this machine's working, home, Python or
+    temporary directory (or the contract's) names a placeholder instead."""
     from fluid_build.observability.secret_redactor import redact_value
     from fluid_build.providers.snowflake.util.logging import redact_dict, redact_list
 
-    scrubbed = redact_value(report)
+    roots = _path_roots(contract_path)
+
+    def _walk(value: Any) -> Any:
+        if isinstance(value, str):
+            return _unrooted(value, roots)
+        if isinstance(value, dict):
+            return {k: _walk(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_walk(v) for v in value]
+        return value
+
+    scrubbed = redact_value(_walk(report))
     if isinstance(scrubbed, dict):
         return redact_dict(scrubbed)
     if isinstance(scrubbed, list):
@@ -1084,8 +1334,8 @@ def load_report(path: str) -> Dict[str, Any]:
             raise PreflightError("a preflight report is never this large; refusing to read it")
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
-    except (OSError, ValueError) as exc:
-        raise PreflightError(f"cannot read a preflight report ({type(exc).__name__})") from exc
+    except (OSError, ValueError, RecursionError) as exc:
+        raise PreflightError(f"cannot read a preflight report ({type(exc).__name__})") from None
     if not isinstance(data, dict) or data.get("version") != REPORT_FORMAT:
         raise PreflightError(f"not a {REPORT_FORMAT} report (from fluid doctor --contract --json)")
     return data
@@ -1132,7 +1382,7 @@ def compare_reports(left: Mapping[str, Any], right: Mapping[str, Any]) -> List[D
         if read == "minor":
             a, b = _minor(a), _minor(b)
         gap(area, name, a, b, action)
-    for name, a, b in _pair(left.get("extras"), right.get("extras"), "name"):
+    for name, a, b in _needed(_pair(left.get("extras"), right.get("extras"), "name")):
         gap(
             "extra",
             name,
@@ -1149,7 +1399,7 @@ def compare_reports(left: Mapping[str, Any], right: Mapping[str, Any]) -> List[D
                 _get(rb, "installed"),
                 f"Install the same {req} version on both (this build pins {spec}).",
             )
-    for name, a, b in _pair(left.get("tools"), right.get("tools"), "name"):
+    for name, a, b in _needed(_pair(left.get("tools"), right.get("tools"), "name")):
         need = _get(a or b, "requirement")
         tail = f" (this build needs {need})." if need else "."
         gap(
@@ -1159,9 +1409,8 @@ def compare_reports(left: Mapping[str, Any], right: Mapping[str, Any]) -> List[D
             _tool_state(b),
             f"Install the same {name} version on both{tail}",
         )
-    for name, a, b in _pair(
-        _at(left, ("adapters", "dbt")), _at(right, ("adapters", "dbt")), "name"
-    ):
+    dbt = _pair(_at(left, ("adapters", "dbt")), _at(right, ("adapters", "dbt")), "name")
+    for name, a, b in _needed(dbt):
         gap(
             "adapter",
             name,
@@ -1177,7 +1426,14 @@ def compare_reports(left: Mapping[str, Any], right: Mapping[str, Any]) -> List[D
     ):
         action = "Resolve the version gaps above; the class follows the installed versions."
         gap("capability", name, _get(a, "class"), _get(b, "class"), action)
-    return redact_report(gaps)
+    redacted: List[Dict[str, str]] = redact_report(gaps)
+    return redacted
+
+
+def _needed(rows: Sequence[Tuple[str, Any, Any]]) -> List[Tuple[str, Any, Any]]:
+    """Rows the operation needs on either side: an extra or tool neither run needs is
+    not a gap worth a CI failure (a laptop with every extra against a lean CI image)."""
+    return [(n, a, b) for n, a, b in rows if _get(a, "needed") or _get(b, "needed")]
 
 
 def _at(report: Any, path: Sequence[str]) -> Any:
@@ -1221,10 +1477,15 @@ def _pair(
     """Rows of two lists matched on ``keys``; the name is the keys joined."""
 
     def index(rows: Any) -> Dict[str, Mapping[str, Any]]:
-        out = {}
+        out: Dict[str, Mapping[str, Any]] = {}
+        seen: Dict[str, int] = {}
         for row in rows if isinstance(rows, list) else []:
             if isinstance(row, Mapping):
-                out[":".join(_text(row.get(k)) for k in reversed(keys))] = row
+                key = ":".join(_text(row.get(k)) for k in reversed(keys))
+                # Rows sharing a key (several schema errors at one pointer) are told
+                # apart by their order, so one more on either side is a gap.
+                seen[key] = seen.get(key, 0) + 1
+                out[key if seen[key] == 1 else f"{key}#{seen[key]}"] = row
         return out
 
     a, b = index(left), index(right)
@@ -1276,6 +1537,11 @@ def render_text(report: Mapping[str, Any]) -> List[str]:
                 lines.append(f"      fix: {cap['fix']}")
     for check in report.get("live_checks") or []:
         lines.append(f"  live {check['check']}: {check['status']} ({check['detail']})")
+    if report.get("mode") == "live" and not report.get("live_checks"):
+        lines.append(
+            f"  live: no live check applies to {report['operation']}, which needs no cloud; "
+            "use --operation apply or ship"
+        )
     counts = summary["counts"]
     lines.append(
         f"{summary['verdict']}: exact {counts[EXACT]} · lossy {counts[LOSSY]} · "
@@ -1329,6 +1595,25 @@ def _run_compare(paths: Sequence[str], as_json: bool) -> int:
     return 1 if gaps else 0
 
 
+def _load_contract(
+    path: str, env: Optional[str], logger: logging.Logger
+) -> Tuple[Any, List[str], str]:
+    """``(contract, overlay warnings, the path its files are anchored at)``, loaded as
+    ``fluid validate`` loads it. A bundle carries its resolved contract; files it names
+    are anchored at the source contract it records, as validate and apply anchor them."""
+    from fluid_build._contract_loader import _is_bundle_path, source_contract_path
+
+    from ._common import load_contract_with_overlay
+
+    if _is_bundle_path(path):
+        source = source_contract_path(path)
+        return load_contract_with_overlay(path, env, logger), [], str(source) if source else path
+    from .validate import _load_with_overlay_warnings
+
+    contract, warnings, _locate, _origins = _load_with_overlay_warnings(path, env, logger)
+    return contract, list(warnings), path
+
+
 def run_cli(args: Any, logger: logging.Logger) -> int:
     """``fluid doctor --contract`` and ``fluid doctor --compare``."""
     from fluid_build.cli.console import cprint_literal
@@ -1342,18 +1627,24 @@ def run_cli(args: Any, logger: logging.Logger) -> int:
         raise _fail("--env needs an overlay name with --contract (e.g. --env prod)")
     if env is False:
         env = None
-    from ._common import load_contract_with_overlay
-    from .security import validate_input_file
+    from .security import validate_cli_path
 
-    path = str(validate_input_file(args.contract, "contract"))
-    contract = load_contract_with_overlay(path, env, logger)
+    path = str(validate_cli_path(args.contract, mode="read", file_type="contract"))
+    try:
+        contract, overlay_warnings, rules_path = _load_contract(path, env, logger)
+    except (RuntimeError, ValueError, OSError, UnicodeError) as exc:
+        # The class only: the loader's message names the file's path.
+        raise _fail(f"cannot load the contract ({type(exc).__name__})", 1) from None
     try:
         report = build_report(
             contract if isinstance(contract, Mapping) else {},
             operation=getattr(args, "operation", None) or DEFAULT_OPERATION,
             env=env,
-            contract_path=path,
+            contract_path=rules_path,
             live=bool(getattr(args, "live", False)),
+            provider=getattr(args, "provider", None) or None,
+            state_backend=getattr(args, "state_backend", None),
+            overlay_warnings=overlay_warnings,
             logger=logger,
         )
     except PreflightError as exc:
