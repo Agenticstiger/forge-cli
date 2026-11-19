@@ -28,17 +28,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Lakekeeper does not know, or one that does not map to a Lakekeeper identity at compile time,
   leaves its table's grants as they are, since granting the others alone would revoke it, and a
   grant whose `resources` cannot be evaluated leaves every Lakekeeper table as it is. The contract
-  names the tables, so give stage 8 an identity that manages only the product's own namespaces:
-  on OpenFGA the identity that creates a namespace owns it, which is enough. A user found by name
-  is the one Lakekeeper user of that exact name; map a person by id (`user:oidc~<subject>`) or
-  e-mail, since an identity provider may let anyone choose a display name. The operator signs forge in with
-  `FLUID_LAKEKEEPER_CREDENTIAL_REF`, a secret reference to `client_id:client_secret`, plus
+  names the tables, so the operator lists the namespaces a run may change in
+  `FLUID_LAKEKEEPER_NAMESPACE_ALLOWLIST`: comma-separated `<warehouse>/<namespace prefix>` entries,
+  matched on whole dotted levels. Unset allows none. Enforce mode refuses a table outside it before
+  sending any request for it, and names the entry to export; check mode still reads and reports
+  the tables it would refuse. Give stage 8 an identity that manages only the product's own
+  namespaces: on OpenFGA the identity that creates a namespace owns it, which is enough. A user
+  principal with an `@` is matched by e-mail only, any other by exact name only; neither is
+  spoof-proof where the identity provider lets a user set their own name or e-mail, so compile
+  warns, and a person is best mapped by id (`user:oidc~<subject>`). The operator signs forge in
+  with `FLUID_LAKEKEEPER_CREDENTIAL_REF`, a secret reference to `client_id:client_secret`, plus
   `FLUID_LAKEKEEPER_OAUTH2_SERVER_URI` and `FLUID_LAKEKEEPER_SCOPE`, or with
   `FLUID_LAKEKEEPER_TOKEN_REF`. These names are operator-only. The reference must be allowed for
   the catalog's host in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, both URLs must be https, and
-  redirects are not followed. A private CA works through `REQUESTS_CA_BUNDLE` or
-  `SSL_CERT_FILE`. A Lakekeeper exposure in a file that also holds cloud bindings goes to
-  Lakekeeper, and the rest to the provider, as before.
+  redirects are not followed. That entry pins the host only, so the contract still picks the port
+  and path: give Lakekeeper a host of its own, and allow the reference for that host (`NAME@host`),
+  not for any host. A private CA works through `REQUESTS_CA_BUNDLE` or `SSL_CERT_FILE`. A
+  Lakekeeper exposure in a file that also holds cloud bindings goes to Lakekeeper, and the rest to
+  the provider, as before.
 
 - **A BigQuery table is partitioned and clustered as its binding declares.**
   `binding.location.partitionBy` was read only with `lifecycle.expire`, and

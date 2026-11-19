@@ -49,6 +49,7 @@ def operator_env(monkeypatch) -> Dict[str, str]:
         "FLUID_LAKEKEEPER_OAUTH2_SERVER_URI": fake.TOKEN_URL,
         "FLUID_LAKEKEEPER_SCOPE": "lakekeeper",
         "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST": "LK_CRED@lakekeeper.test",  # pragma: allowlist secret
+        "FLUID_LAKEKEEPER_NAMESPACE_ALLOWLIST": "sales-wh/curated",
     }
     for name in ("FLUID_LAKEKEEPER_TOKEN_REF", "FLUID_SECRETS_FILE", "FLUID_SECRET_SCHEMES"):
         monkeypatch.delenv(name, raising=False)
@@ -258,13 +259,28 @@ class TestFailures:
         assert result["status"] == "error"
         assert server.posts_to_assignments() == []
         assert server.held(TABLE_ID) == {("select", "user", "oidc~nobody-knows")}
-        assert "no Lakekeeper user is named 'ghost'" in result["errors"][0]
+        assert "no Lakekeeper user has the name 'ghost'" in result["errors"][0]
         assert "service-account-<client-id>" in result["errors"][0]
 
     def test_an_ambiguous_user_names_the_candidates(self, server, operator_env):
-        server.add_user("oidc~alice2", "alice@corp.com")
+        server.add_user("oidc~alice2", "Alice Two", "ALICE@corp.com")
         result = _run(server, [_binding("user:alice@corp.com", "select")])
         assert "oidc~alice" in result["errors"][0] and "oidc~alice2" in result["errors"][0]
+
+    def test_a_display_name_that_looks_like_an_e_mail_is_not_that_e_mail(
+        self, server, operator_env
+    ):
+        """A user may set their own display name: it must not stand in for an e-mail."""
+        server.add_user("oidc~attacker", "jane@corp.example", "mallory@corp.example")
+        result = _run(server, [_binding("user:jane@corp.example", "select")])
+        assert "no Lakekeeper user has the e-mail 'jane@corp.example'" in result["errors"][0]
+        assert server.posts_to_assignments() == []
+        assert server.held(TABLE_ID) == set()
+
+    def test_a_name_matches_names_only(self, server, operator_env):
+        server.add_user("oidc~bob", "Bob", "service-account-trino@corp.example")
+        _run(server, [_binding("serviceAccount:service-account-trino", "select")])
+        assert server.held(TABLE_ID) == {("select", "user", "oidc~trino")}
 
     def test_a_user_id_lakekeeper_does_not_know_is_refused(self, server, operator_env):
         result = _run(server, [_binding("u", "select", identity="user:oidc~typo")])
@@ -614,4 +630,124 @@ def test_catalog_key_names_one_server_one_way(a, b, same):
 def test_a_namespace_that_is_not_a_list_is_refused_not_a_crash(server, operator_env):
     result = _run(server, [dict(_binding("role:analysts", "select"), namespace=5)])
     assert result["status"] == "error"
+    assert server.posts_to_assignments() == []
+
+
+class TestNamespaceAllowlist:
+    """Stage 8 is authoritative on the tables a contract names; the operator says which
+    namespaces a run may change, so a contract cannot claim any table its identity manages."""
+
+    def test_unset_allows_no_write_and_signs_in_nowhere(self, server, operator_env, monkeypatch):
+        monkeypatch.delenv("FLUID_LAKEKEEPER_NAMESPACE_ALLOWLIST")
+        result = _run(server, [_binding("role:analysts", "select")])
+        assert result["status"] == "error"
+        error = result["errors"][0]
+        assert "not in FLUID_LAKEKEEPER_NAMESPACE_ALLOWLIST" in error
+        assert 'export FLUID_LAKEKEEPER_NAMESPACE_ALLOWLIST="sales-wh/curated"' in error
+        assert server.requests == []
+
+    def test_check_mode_reads_and_says_what_enforce_would_refuse(
+        self, server, operator_env, monkeypatch
+    ):
+        monkeypatch.delenv("FLUID_LAKEKEEPER_NAMESPACE_ALLOWLIST")
+        result = _run(server, [_binding("role:analysts", "select")], mode="check")
+        assert len(result["grants"]) == 1  # the plan is still read and shown
+        assert any(p.endswith("/assignments") for _, p, _ in server.requests)
+        assert "enforce mode would refuse it" in result["errors"][0]
+        assert server.posts_to_assignments() == []
+
+    @pytest.mark.parametrize(
+        "listed, allowed",
+        [
+            ("sales-wh/curated", True),
+            ("other-wh/x, sales-wh/curated", True),
+            ("sales-wh/cur", False),
+            ("sales-wh/curated.eu", False),
+            ("other-wh/curated", False),
+        ],
+    )
+    def test_entries_match_whole_levels_of_one_warehouse(
+        self, server, operator_env, monkeypatch, listed, allowed
+    ):
+        monkeypatch.setenv("FLUID_LAKEKEEPER_NAMESPACE_ALLOWLIST", listed)
+        result = _run(server, [_binding("role:analysts", "select")])
+        assert (result["status"] == "ok") is allowed
+        assert bool(server.posts_to_assignments()) is allowed
+
+    def test_a_prefix_allows_the_namespaces_under_it(self, server, operator_env, monkeypatch):
+        server.add_table(("curated", "eu"), "orders", "0190c5b4-0000-7000-8000-0000000000b3")
+        binding = dict(
+            _binding("role:analysts", "select", table="orders"), namespace=["curated", "eu"]
+        )
+        result = _run(server, [binding])
+        assert result["status"] == "ok"
+        assert server.held("0190c5b4-0000-7000-8000-0000000000b3") == {("select", "role", ROLE_ID)}
+
+    def test_one_table_refused_another_applied(self, server, operator_env, monkeypatch):
+        server.add_table(("raw",), "events", "0190c5b4-0000-7000-8000-0000000000b4")
+        outside = dict(_binding("role:analysts", "select", table="events"), namespace=["raw"])
+        result = _run(server, [_binding("role:analysts", "select"), outside])
+        assert server.held(TABLE_ID) == {("select", "role", ROLE_ID)}
+        assert server.held("0190c5b4-0000-7000-8000-0000000000b4") == set()
+        (error,) = result["errors"]
+        assert error.startswith("sales-wh/raw.events:")
+        assert (
+            'export FLUID_LAKEKEEPER_NAMESPACE_ALLOWLIST="sales-wh/curated,sales-wh/raw"' in error
+        )
+
+    @pytest.mark.parametrize("listed", ["curated", "sales-wh/", "sales-wh/a..b", "/curated"])
+    def test_an_entry_that_is_not_warehouse_slash_namespace_is_refused(
+        self, server, operator_env, monkeypatch, listed
+    ):
+        monkeypatch.setenv("FLUID_LAKEKEEPER_NAMESPACE_ALLOWLIST", listed)
+        result = _run(server, [_binding("role:analysts", "select")])
+        assert "not <warehouse>/<namespace>" in result["errors"][0]
+        assert server.requests == []
+
+
+class TestSecretHygiene:
+    def test_a_token_with_a_line_break_is_refused_and_not_shown(self, server, operator_env):
+        bad = "fake-token\r\nX-Injected: yes"
+        server.hook = lambda m, p, b: (
+            _json(200, {"access_token": bad}) if p.endswith("/token") else None
+        )
+        result = _run(server, [_binding("role:analysts", "select")])
+        assert "control or non-ASCII character (the value is not shown)" in result["errors"][0]
+        assert "X-Injected" not in repr(result)
+
+    def test_a_credential_with_a_trailing_line_break_is_used_stripped(
+        self, server, operator_env, monkeypatch
+    ):
+        monkeypatch.setenv("LK_CRED", f"{fake.CLIENT_ID}:{fake.CLIENT_SECRET}\n")
+        result = _run(server, [_binding("role:analysts", "select")])
+        assert result["status"] == "ok"
+
+    def test_a_request_httpx_refuses_to_build_shows_only_its_type(self, operator_env):
+        def refuse(request):
+            raise httpx.LocalProtocolError("Illegal header value b'Bearer secret-ish'")
+
+        client = httpx.Client(transport=httpx.MockTransport(refuse))
+        result = apply_lakekeeper_bindings(
+            [_binding("role:analysts", "select")], mode="enforce", client=client, say=lambda _: None
+        )
+        assert "(LocalProtocolError)" in result["errors"][0]
+        assert "secret-ish" not in result["errors"][0]
+
+
+def test_a_dot_dot_namespace_level_is_refused(server, operator_env, monkeypatch):
+    monkeypatch.setenv("FLUID_LAKEKEEPER_NAMESPACE_ALLOWLIST", "sales-wh/..")
+    result = _run(server, [dict(_binding("role:analysts", "select"), namespace=[".."])])
+    assert result["status"] == "error"
+    assert not any(".." in p for _, p, _ in server.requests)
+
+
+def test_paged_assignments_are_refused_not_planned_from_one_page(server, operator_env):
+    server.assignments[TABLE_ID] = {("select", "user", "oidc~probe")}
+    server.hook = lambda m, p, b: (
+        _json(200, {"assignments": [], "next-page-token": "2"})
+        if m == "GET" and p.endswith("/assignments")
+        else None
+    )
+    result = _run(server, [_binding("role:analysts", "select")])
+    assert "in pages" in result["errors"][0]
     assert server.posts_to_assignments() == []

@@ -55,7 +55,15 @@ exact-value redactor.
   token from ``FLUID_LAKEKEEPER_OAUTH2_SERVER_URI`` with ``FLUID_LAKEKEEPER_SCOPE``
   (a Keycloak-fronted Lakekeeper: the scope whose audience mapper names
   Lakekeeper, ``lakekeeper`` in its examples);
-* or ``FLUID_LAKEKEEPER_TOKEN_REF`` -- a bearer token, used as it is.
+* or ``FLUID_LAKEKEEPER_TOKEN_REF`` -- a bearer token, used as it is;
+* and ``FLUID_LAKEKEEPER_NAMESPACE_ALLOWLIST`` -- the namespaces whose tables stage 8
+  may change, ``<warehouse>/<namespace prefix>`` entries matched on whole levels.
+  Unset allows none: enforce mode refuses every table, before any request for it,
+  and check mode reports the tables it would refuse.
+
+The destination policy pins the catalog HOST only, so the contract still picks
+the port and path there: give Lakekeeper a host of its own, and allow the
+reference for that host (``NAME@host``), not for any host.
 
 The identity needs ``manage_grants`` on the tables. On OpenFGA the identity that
 creates a namespace owns it and so has ``manage_grants`` there (unless managed
@@ -84,6 +92,12 @@ CREDENTIAL_REF_ENV = "FLUID_LAKEKEEPER_CREDENTIAL_REF"
 TOKEN_URI_ENV = "FLUID_LAKEKEEPER_OAUTH2_SERVER_URI"
 SCOPE_ENV = "FLUID_LAKEKEEPER_SCOPE"
 TOKEN_REF_ENV = "FLUID_LAKEKEEPER_TOKEN_REF"
+#: Operator-only: comma-separated ``<warehouse>/<namespace prefix>`` entries, the
+#: namespaces whose tables stage 8 may change. Unset allows no writes.
+NAMESPACE_ALLOWLIST_ENV = "FLUID_LAKEKEEPER_NAMESPACE_ALLOWLIST"
+
+#: One allowlist entry: a warehouse name, and namespace levels a table's must start with.
+AllowEntry = Tuple[str, Tuple[str, ...]]
 
 #: Lakekeeper serves the Iceberg REST catalog under ``/catalog`` and its
 #: management API under ``/management`` of the same base URL.
@@ -133,6 +147,7 @@ class Settings:
     token_uri: str = ""
     scope: str = ""
     token_ref: str = ""
+    namespace_allowlist: str = ""
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> "Settings":
@@ -144,7 +159,33 @@ class Settings:
             token_uri=get(TOKEN_URI_ENV),
             scope=get(SCOPE_ENV),
             token_ref=get(TOKEN_REF_ENV),
+            namespace_allowlist=get(NAMESPACE_ALLOWLIST_ENV),
         )
+
+    def allowed_namespaces(self) -> Tuple[List[AllowEntry], List[str]]:
+        """``(entries, entries that are not <warehouse>/<namespace prefix>)``.
+
+        A prefix is dotted namespace levels; ``sales/curated`` allows ``curated``
+        and ``curated.eu`` in warehouse ``sales``, and not ``curated_old``.
+        """
+        entries: List[AllowEntry] = []
+        bad: List[str] = []
+        for raw in self.namespace_allowlist.split(","):
+            item = raw.strip()
+            if not item:
+                continue
+            warehouse, sep, prefix = item.partition("/")
+            levels = tuple(level.strip() for level in prefix.split("."))
+            if (
+                not sep
+                or not warehouse.strip()
+                or not all(levels)
+                or any(level in (".", "..") for level in levels)
+            ):
+                bad.append(item)
+                continue
+            entries.append((warehouse.strip(), levels))
+        return entries, bad
 
     @property
     def configured(self) -> bool:
@@ -160,6 +201,10 @@ class Settings:
             ]
             if missing:
                 return f"{CREDENTIAL_REF_ENV} needs {' and '.join(missing)} as well"
+        bad = self.allowed_namespaces()[1]
+        if bad:
+            shown = [_clean(b, 80) for b in bad]
+            return f"{NAMESPACE_ALLOWLIST_ENV} holds entries that are not <warehouse>/<namespace>: {shown}"
         return None
 
 
@@ -344,8 +389,11 @@ def _send(client: Any, method: str, url: str, *, what: str, **kw: Any) -> Any:
         return client.request(method, url, **kw)
     except (httpx.HTTPError, httpx.InvalidURL) as exc:
         host = _shown_host(url)
+        # A request httpx refuses to build names the offending header value, and
+        # the Authorization header holds the token: its type alone is shown.
+        detail = "" if isinstance(exc, httpx.LocalProtocolError) else f": {_clean(exc, 200)}"
         raise LakekeeperError(
-            f"{what}: could not reach {host} ({type(exc).__name__}: {_clean(exc, 200)}).",
+            f"{what}: could not reach {host} ({type(exc).__name__}{detail}).",
             "Check the URL and the network; for a private CA set REQUESTS_CA_BUNDLE or "
             "SSL_CERT_FILE to its bundle.",
         ) from None
@@ -404,10 +452,24 @@ def _resolve_ref(ref: str, name: str, host: str, environ: Mapping[str, str]) -> 
         value = str(resolve_credential(ref, environ=environ).get_secret_value() or "")
     except SecretError as exc:
         raise LakekeeperError(f"{name} did not resolve. {exc}") from None
-    if not value:
-        raise LakekeeperError(f"{name} resolved to an empty value.")
+    _register(value)
+    value = _plain_secret(value, f"{name} resolved to")
     _register(value)
     return value
+
+
+def _plain_secret(value: str, what: str) -> str:
+    """``value`` without surrounding whitespace; refused when empty, or when it holds a
+    control or non-ASCII character, which an HTTP header cannot carry and an error
+    could show (the value is never shown)."""
+    plain = value.strip()
+    if not plain:
+        raise LakekeeperError(f"{what} an empty value.")
+    if _CONTROL_CHARS.search(plain) or not plain.isascii():
+        raise LakekeeperError(
+            f"{what} a value with a control or non-ASCII character (the value is not shown)."
+        )
+    return plain
 
 
 def _sign_in(client: Any, settings: Settings, catalog_host: str, environ: Mapping[str, str]) -> str:
@@ -447,6 +509,8 @@ def _sign_in(client: Any, settings: Settings, catalog_host: str, environ: Mappin
         raise LakekeeperError(
             f"the token endpoint ({token_parts.hostname}) answered without an access_token."
         )
+    _register(token)
+    token = _plain_secret(token, f"the token endpoint ({token_parts.hostname}) answered")
     _register(token)
     return token
 
@@ -615,8 +679,15 @@ class _Lakekeeper:
         resp = self._call("GET", self._assignments_path(warehouse_id, table_id), what=what)
         if resp.status_code != 200:
             raise self._refused(resp, what, _GRANT_RIGHTS)
+        doc = _object(resp, what)
+        if doc.get("next-page-token"):
+            raise LakekeeperError(
+                f"{what}: Lakekeeper answered the table's assignments in pages, which "
+                "policy-apply does not read; nothing was changed, since a plan from one page "
+                "would revoke too little."
+            )
         out: List[Assignment] = []
-        for item in _dicts(_object(resp, what).get("assignments"), what, "assignments"):
+        for item in _dicts(doc.get("assignments"), what, "assignments"):
             relation = _id(item.get("type"))
             for kind in ("user", "role"):
                 principal_id = _id(item.get(kind))
@@ -698,27 +769,31 @@ class _Lakekeeper:
         if resp.status_code != 200:
             raise self._refused(resp, what, "permission to search users (or map it to user:<id>)")
         users = _dicts(_object(resp, what).get("users"), what, "users")
-        email = value.casefold()
+        # A value with an @ is an e-mail and matches e-mails only; anything else is a
+        # name and matches names only. A user may set their own display name, so a
+        # name that looks like someone's e-mail must not stand in for that e-mail.
+        by_email = "@" in value
+        field = "e-mail" if by_email else "name"
+        wanted = value.casefold() if by_email else value
         exact = [
             u
             for u in users
             if _id(u.get("id"))
-            and (u.get("name") == value or str(u.get("email") or "").casefold() == email)
+            and (str(u.get("email") or "").casefold() if by_email else u.get("name")) == wanted
         ]
         if len(exact) > 1:
             ids = sorted(_clean(u["id"], 120) for u in exact)
             raise LakekeeperError(
-                f"{len(exact)} Lakekeeper users are named {_clean(value, 120)!r} or have that "
-                f"e-mail: {ids}.",
+                f"{len(exact)} Lakekeeper users have the {field} {_clean(value, 120)!r}: {ids}.",
                 "Map the principal to one of them by id (user:<id>) in binding.principals.",
             )
         if not exact:
             raise LakekeeperError(
-                f"no Lakekeeper user is named {_clean(value, 120)!r} or has that e-mail. A user "
-                "appears in Lakekeeper once it has signed in; a Keycloak client's service "
-                "account is named service-account-<client-id>.",
-                "Map the principal in binding.principals to the user's name or id "
-                "(user:oidc~<subject>).",
+                f"no Lakekeeper user has the {field} {_clean(value, 120)!r}. A user appears in "
+                "Lakekeeper once it has signed in; a Keycloak client's service account is "
+                "named service-account-<client-id>.",
+                "Map the principal in binding.principals to the user's id "
+                "(user:oidc~<subject>), the one spelling no user can choose.",
             )
         user_id = _id(exact[0]["id"])
         self._names[("user", user_id)] = _clean(exact[0].get("name"), 80)
@@ -809,6 +884,8 @@ def _malformed(bindings: List[Mapping[str, Any]]) -> Optional[str]:
         names = [binding.get("warehouse"), binding.get("table"), *levels]
         if not levels or not all(isinstance(n, str) and n.strip() for n in names):
             return f"the binding for {who!r} does not name its warehouse, namespace and table"
+        if any(str(level).strip() in (".", "..") for level in levels):
+            return f"the binding for {who!r} names a namespace level . or .."
         if any("{{" in str(n) or "${" in str(n) for n in names):
             return (
                 "its warehouse, namespace or table holds an unrendered template; write the "
@@ -883,9 +960,10 @@ def apply_lakekeeper_bindings(
         return report.result()
     problem = settings.problem()
     if problem:
-        report.errors.append(f"Lakekeeper credential settings: {problem}.")
+        report.errors.append(f"Lakekeeper settings: {problem}.")
         emit(report.errors[-1])
         return report.result()
+    allowed = settings.allowed_namespaces()[0]
 
     by_catalog: "OrderedDict[str, List[TableKey]]" = OrderedDict()
     for key in tables:
@@ -901,6 +979,34 @@ def apply_lakekeeper_bindings(
     try:
         for catalog, keys in by_catalog.items():
             uri = uris[catalog]
+            # A binding that is not a table's desired grants is its own error, before the
+            # allowlist is asked about a name it may not even hold.
+            for key in keys:
+                problem = _malformed(tables[key])
+                if problem is not None:
+                    message = (
+                        f"nothing was changed on this table: {problem}. Recompile the bindings "
+                        "with fluid policy compile (or fluid generate artifacts)."
+                    )
+                    report.errors.append(f"{_table_name(key)}: {message}")
+                    emit(f"  x {_table_name(key)}: {message}")
+            keys = [key for key in keys if _malformed(tables[key]) is None]
+            refusals = {
+                key: _outside_allowlist(key, allowed, settings.namespace_allowlist) for key in keys
+            }
+            if not keys:
+                continue
+            if mode == "enforce":
+                # Refused before any request for the table, sign-in included when
+                # no table of this catalog is left: nothing is read, minted or sent.
+                for key in keys:
+                    refusal = refusals[key]
+                    if refusal is not None:
+                        report.errors.append(f"{_table_name(key)}: {refusal}")
+                        emit(f"  x {_table_name(key)}: {refusal}")
+                keys = [key for key in keys if refusals[key] is None]
+                if not keys:
+                    continue
             try:
                 base = service_base(uri)
                 host = urlsplit(base).hostname or ""
@@ -914,12 +1020,38 @@ def apply_lakekeeper_bindings(
             emit(f"Lakekeeper {base}" + (f": signed in as {who}" if who else ""))
             for key in keys:
                 _apply_table(server, key, tables[key], report, emit)
+                refusal = refusals[key]
+                if refusal is not None:  # check mode: the reads and the plan are shown
+                    note = f"enforce mode would refuse it: {refusal}"
+                    report.errors.append(f"{_table_name(key)}: {note}")
+                    emit(f"  x {_table_name(key)}: {note}")
     finally:
         if own_client:
             http.close()
 
     _summarise(report, emit)
     return report.result()
+
+
+def _outside_allowlist(key: TableKey, allowed: List[AllowEntry], listed: str) -> Optional[str]:
+    """Why the operator's namespace allowlist refuses this table, or ``None``.
+
+    The contract names its tables, so without the list a contract could make stage 8
+    authoritative on any table its identity manages, revoking everyone else's
+    access there. An entry ``<warehouse>/<namespace prefix>`` allows the namespace
+    and the namespaces under it, matched on whole levels.
+    """
+    warehouse, namespace = key[1], key[2]
+    for entry_warehouse, levels in allowed:
+        if entry_warehouse == warehouse and tuple(namespace[: len(levels)]) == levels:
+            return None
+    entry = f"{warehouse}/{'.'.join(namespace)}"
+    value = f"{listed},{entry}" if listed else entry
+    return (
+        f"its namespace is not in {NAMESPACE_ALLOWLIST_ENV} (unset allows none), so "
+        "policy-apply changes no grant on it. If this product may manage that namespace, "
+        f'allow it in the operator environment: export {NAMESPACE_ALLOWLIST_ENV}="{_clean(value)}"'
+    )
 
 
 def _apply_table(
@@ -936,13 +1068,7 @@ def _apply_table(
     desired: Set[Assignment] = set()
     writes: List[Assignment] = []
     deletes: List[Assignment] = []
-    try:
-        problem = _malformed(bindings)
-        if problem:
-            raise LakekeeperError(
-                f"nothing was changed on this table: {problem}.",
-                "Recompile the bindings with fluid policy compile (or fluid generate artifacts).",
-            )
+    try:  # the caller refused malformed bindings (_malformed) and allowlisted the table
         warehouse_id, prefix = server.warehouse(key[1])
         listed = server.tables(prefix, list(key[2]))
         table_id = listed.get(key[3]) if listed is not None else None
@@ -1059,6 +1185,7 @@ def _summarise(report: _Report, say: Callable[[str], None]) -> None:
 __all__ = [
     "CREDENTIAL_REF_ENV",
     "LakekeeperError",
+    "NAMESPACE_ALLOWLIST_ENV",
     "SCOPE_ENV",
     "Settings",
     "TOKEN_REF_ENV",

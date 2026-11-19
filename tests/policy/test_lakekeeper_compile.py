@@ -54,8 +54,9 @@ _NOTHING = "No IAM bindings generated from contract"
 
 
 def _own(warnings: List[str]) -> List[str]:
-    """The warnings besides the generic ones every platform gets."""
-    return [w for w in warnings if w not in (_NOTHING, NO_GRANTS)]
+    """The warnings besides the generic ones every platform gets, and the note that a
+    user found by name or e-mail is not spoof-proof (``test_the_spoof_note``)."""
+    return [w for w in warnings if w not in (_NOTHING, NO_GRANTS) and "spoof-proof" not in w]
 
 
 class TestTheBinding:
@@ -63,7 +64,7 @@ class TestTheBinding:
         bindings, warnings = compile_policy(
             _contract({"principal": "serviceAccount:trino", "permissions": ["read"]})
         )
-        assert warnings == []
+        assert _own(warnings) == []
         assert bindings == [
             {
                 "provider": "lakekeeper",
@@ -223,7 +224,7 @@ class TestExposeLevelAuthz:
             ("group:analysts", ["select"]),
             ("serviceAccount:spark", ["modify"]),
         ]
-        assert warnings == [NO_GRANTS]
+        assert NO_GRANTS in warnings and _own(warnings) == []
 
     def test_a_reader_also_granted_by_the_access_policy_is_one_binding(self):
         expose = _expose()
@@ -323,7 +324,7 @@ class TestPrincipals:
         bindings, warnings = compile_policy(
             _contract({"principal": principal, "permissions": ["read"]})
         )
-        assert warnings == []
+        assert _own(warnings) == []
         assert bindings[0]["identities"] == [principal]
 
     @pytest.mark.parametrize(
@@ -434,3 +435,20 @@ def test_two_exposes_on_one_table_fail_closed_together():
     )
     assert _lakekeeper(bindings) == []
     assert any("another expose naming it could not be compiled" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    "principal, noted",
+    [
+        ("user:jane@corp.com", True),
+        ("serviceAccount:service-account-trino", True),
+        ("user:oidc~4f2c", False),
+        ("role:analysts", False),
+    ],
+)
+def test_the_spoof_note_names_users_found_by_name_or_e_mail(principal, noted):
+    _, warnings = compile_policy(_contract({"principal": principal, "permissions": ["read"]}))
+    notes = [w for w in warnings if "spoof-proof" in w]
+    assert bool(notes) is noted
+    if noted:
+        assert principal in notes[0] and "user:oidc~<subject>" in notes[0]

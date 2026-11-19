@@ -312,6 +312,21 @@ def compile_lakekeeper_bindings(
             f"Lakekeeper table {table}: another expose naming it could not be compiled, so "
             "none of its grants were; policy-apply leaves its grants as they are."
         )
+    named = sorted(
+        {
+            identity
+            for b in kept
+            for identity in b["identities"]
+            if identity.partition(":")[0] in ("user", "serviceAccount") and "~" not in identity
+        }
+    )
+    if named:
+        warnings.append(
+            f"Lakekeeper: {named} are found at apply time by e-mail (a value with @) or else "
+            "by exact name, among the users Lakekeeper holds. Only user:oidc~<subject> is "
+            "spoof-proof: an identity provider may let a user set their own name or e-mail, so "
+            "map people by id in binding.principals."
+        )
     return kept, warnings
 
 
