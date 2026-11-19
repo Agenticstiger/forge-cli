@@ -160,7 +160,16 @@ class Probe:
         try:
             from importlib import metadata
 
-            text = metadata.distribution(DIST).read_text("direct_url.json")
+            records = metadata.distribution(DIST).files or []
+            # PEP 610's direct_url.json, read as UTF-8 like every text file here.
+            text = next(
+                (
+                    f.read_text(encoding="utf-8")
+                    for f in records
+                    if f.name == "direct_url.json" and f.parent.name.endswith(".dist-info")
+                ),
+                "",
+            )
         except Exception:  # noqa: BLE001 - no metadata: not known
             return None
         if not text:
@@ -1648,7 +1657,7 @@ def run_cli(args: Any, logger: logging.Logger) -> int:
             env=env,
             contract_path=rules_path,
             live=bool(getattr(args, "live", False)),
-            provider=getattr(args, "provider", None) or None,
+            provider=getattr(args, "preflight_provider", None) or None,
             state_backend=getattr(args, "state_backend", None),
             overlay_warnings=overlay_warnings,
             logger=logger,

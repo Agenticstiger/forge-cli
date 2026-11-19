@@ -455,6 +455,9 @@ def _add_preflight_arguments(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--provider",
+        # Its own dest: the global ``fluid --provider`` sets ``provider``, and a subparser
+        # default would overwrite it.
+        dest="preflight_provider",
         default=None,
         help="With --contract: the cloud apply provisions, as apply takes it (a contract on "
         "several clouds needs one)",
@@ -502,7 +505,7 @@ def _preflight_dispatch(args, logger: logging.Logger) -> Optional[int]:
         ("--env NAME", isinstance(getattr(args, "env", None), str)),
         ("--operation", isinstance(getattr(args, "operation", None), str)),
         ("--live", getattr(args, "live", False) is True),
-        ("--provider", isinstance(getattr(args, "provider", None), str)),
+        ("--provider", isinstance(getattr(args, "preflight_provider", None), str)),
         ("--state-backend", isinstance(getattr(args, "state_backend", None), str)),
     ):
         if given:

@@ -1024,3 +1024,13 @@ def test_a_path_after_a_colon_or_equals_is_still_scrubbed():
     cap = pf.Capability(pf.LOSSY, "x", "t", "/", f"dir:{home}/p path={home}/q", "")
     detail = scrub(cap).detail
     assert home not in detail and detail == "dir:~/p path=~/q"
+
+
+def test_cli_provider_scopes_apply_and_leaves_the_global_flag_alone(tmp_path, capsys):
+    path = tmp_path / "two.fluid.yaml"
+    path.write_text(yaml.safe_dump(_two_clouds()), encoding="utf-8")
+    argv = ["--contract", str(path), "--operation", "apply", "--provider", "aws", "--json"]
+    _rc, out = _run_cli(argv, capsys)
+    assert json.loads(out)["needs"]["clouds"] == ["aws"]
+    args = build_parser().parse_args(["--provider", "gcp", "doctor"])
+    assert (args.provider, args.preflight_provider) == ("gcp", None)
