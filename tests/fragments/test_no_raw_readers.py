@@ -370,6 +370,8 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
         "state, run records, replay markers, dbt and dlt project files",
         *_site("build_runners/_replay.py", "list_dirty_products"),
         *_site("build_runners/_state.py", "_read_json"),
+        # A local Spark run's own record and status (run.json, status.json) under .fluid.
+        *_site("build_runners/spark/_local.py", "_read_json"),
         *_site("build_runners/base.py", "_report_build", "run_builds_from_args"),
         *_site("build_runners/dbt/artifacts.py", "parse_run_results"),
         *_site(
@@ -443,6 +445,13 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
         *_site("cli/product_add.py", "run"),
         *_site("cli/contract.py", "_load_contract"),
         *_site("cli/_init_modes.py", "demo_mode", "_finalise_template_product"),
+    ),
+    **_register(
+        ACCEPTED,
+        "fluid ship locks its stage journal's target by the raw root's id before stage 1 "
+        "bundles it; when an overlay gives the bundle another id, ship holds that id's "
+        "target too and keeps the journal there",
+        *_site("cli/ship.py", "_contract_id"),
     ),
     **_register(
         ACCEPTED,

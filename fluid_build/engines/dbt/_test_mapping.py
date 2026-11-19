@@ -161,8 +161,55 @@ def nest_test_arguments(entry: Any) -> Any:
 
 
 def accepted_values_test(values: Sequence[Any]) -> dict[str, Any]:
-    """dbt built-in ``accepted_values`` with the declared value list."""
-    return {"accepted_values": {"values": list(values)}}
+    """dbt built-in ``accepted_values`` with the declared value list.
+
+    dbt's macro writes each value as ``'{{ value }}'`` and escapes nothing, so a value
+    holding a quote (``O'Brien``) breaks the test's SQL, or adds to it. Such a list is
+    written with ``quote: false``: a value holding a quote or a backslash as the SQL string
+    literal of its text for the adapter that runs it (:func:`_adapter_literal`), every other
+    value as ``'<text>'``, the literal it is on every engine. Any other list is written as
+    before.
+    """
+    listed = list(values)
+    if not any(_needs_escaping(v) for v in listed):
+        return {"accepted_values": {"values": listed}}
+    return {
+        "accepted_values": {
+            "values": [
+                _adapter_literal(str(v)) if _needs_escaping(v) else f"'{v}'" for v in listed
+            ],
+            "quote": False,
+        }
+    }
+
+
+def _needs_escaping(value: Any) -> bool:
+    """Whether dbt's ``'{{ value }}'`` would end the string early or read an escape."""
+    text = str(value)
+    return "'" in text or "\\" in text
+
+
+def _adapter_literal(text: str) -> Any:
+    """``text`` as a SQL string literal for the adapter dbt runs (``target.type``): each
+    engine's own escaping (fluid_build/providers/_sql_safety.py), backslashes too where
+    the engine reads them; an adapter forge writes no SQL for gets the quote and the
+    backslash doubled, which no engine reads as a way out of the literal (at worst a
+    stricter test). Jinja built from literals only (fluid_build/util/dbt_jinja.py)."""
+    from fluid_build import fluid_sql as fs
+    from fluid_build.data_rules._dbt import ADAPTERS
+    from fluid_build.providers._sql_safety import quote_string_literal
+    from fluid_build.util.dbt_jinja import GeneratedJinja, jinja_literal, jinja_text
+
+    groups: dict[str, list[str]] = {}
+    for adapter, dialect in ADAPTERS.items():
+        groups.setdefault(dialect, []).append(adapter)
+    out = ""
+    for i, (dialect, adapters) in enumerate(groups.items()):
+        listed = ", ".join(jinja_literal(a) for a in adapters)
+        literal = jinja_text(fs.sql_literal(dialect, text))
+        out += ("{% if" if i == 0 else "{% elif") + f" target.type in [{listed}] %}}{literal}"
+    standard = jinja_text(quote_string_literal(text, backslash_escapes=True))
+    return GeneratedJinja(out + "{% else %}" + standard + "{% endif %}")
 
 
 def relationships_test(to: str, field: str) -> dict[str, Any]:

@@ -7,8 +7,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fluid apply` runs a dbt build whatever its trigger, finds the dbt that has its adapter, and
+  pins its container's image and packages.** A `dataset` or `schedule_and_dataset` build, which
+  `fluid generate schedule` renders a DAG for, failed under that DAG's `fluid apply --build-id`
+  with "Unknown trigger type", and so did `event`, `dependency` and `timetable`; the dbt and python
+  runners now run a build of every type a scheduler or an event starts once when apply asks (the
+  scheduler decides when), keep `manual` iterations, still refuse `continuous`, and refuse a
+  `trigger.type` that is not a name. An engine named after its PyPI distribution, such as
+  `dbt-athena-community`, was looked for as `athena-community`, so a local dbt with the athena
+  plugin was never used; the runner now asks for dbt's plugin name (`athena`), reads the adapter of
+  an engine without one (`dbt`, `dbt-core`) from every platform a profile is generated for, and
+  matches the `Plugins:` list of `dbt --version` exactly. When no local dbt has the adapter, the
+  container fallback runs `python:3.12-slim` pinned by digest and installs `dbt-core==1.11.17` and
+  an exact adapter pin from wheels only, run as `python -I -m pip --isolated` against PyPI, with no
+  pip config file and no `PIP_*` or project `PYTHON*` setting passed in (their dependencies resolve
+  within those packages' ranges); an adapter without a pin, a `DBT_ADAPTER_PACKAGE` that is not
+  exact pins, and a `DBT_DOCKER_IMAGE` or `DBT_BOOTSTRAP_IMAGE` without a digest are refused. For
+  athena, glue and redshift IAM, a dbt profile that names an AWS profile, or a run with no AWS keys
+  in the container's environment or the dbt profile and no container credentials endpoint, is
+  refused before `docker` starts, with the command that installs the adapter locally or exports
+  short-lived keys; `~/.aws` is never mounted, and the host-only AWS settings (`AWS_PROFILE`,
+  `AWS_DEFAULT_PROFILE`, `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, `AWS_CA_BUNDLE` and the
+  token-file paths) are not passed in.
+
+## [0.33.0] — 2026-11-19
+
 ### Added
 
+- **`fluid ship` keeps a stage journal, and a rerun never repeats a change nobody can account
+  for.** With `--journal-dir DIR` (and always with `--release-dir`, in `.fluid/ship-journal`),
+  each stage leaves a `started` event, fsynced before it runs, and a `finished` event with its
+  status, exit code and receipts: the digest of each report it wrote, the plan's digests, and
+  the lineage and serial of each local OpenTofu state. One append-only file per release (the
+  bundle's digest) under `DIR/<product>/<env>/`; a line cut off by a crash is ignored. One run
+  at a time holds a target, locked before stage 1, so a second run is refused (exit 2) before it
+  rebundles. Before apply, enforcing policy-apply, publish or schedule-sync runs again, ship reads
+  it: an attempt in any release of the target that started and has no known outcome
+  (interrupted, killed, a CI timeout) refuses the stage until `--acknowledge-inspected STAGE`,
+  which the journal records; an unknown apply blocks the stages after it the same way. An apply
+  that did not pass is refused until stage 6 has planned again through ship and
+  `runtime/plan.json` is that plan. A stage that changes nothing always runs, recorded when the
+  journal can be opened, and nothing is rolled back. `--explain` shows the journal and what it
+  would refuse; the run report and the release's provenance name it, by a project-relative
+  path or the label `--journal-dir`, never an absolute one. Without either flag
+  there is no journal. Keep DIR outside the checkout, on storage that outlives the runner, and out of
+  reach of less trusted runs: the default in the checkout guards a working copy, and an
+  ephemeral CI runner starts it empty. Ship follows no symbolic link below DIR (or below the
+  project, for the default), reads only regular files with one link, and refuses a journal file
+  over 8 MiB, or one whose directory entry it cannot fsync (storage that cannot fsync a
+  directory at all gets the warning `ship_journal_dir_fsync_unsupported` instead). Two changes reach every run: a stage killed by a signal (the OOM killer) is
+  recorded `unknown`, not `failed`, with the reason `killed by signal N` and the same exit
+  status; and `runtime/ship-report.json` and `ship-junit.xml` are renamed into place, so a
+  symbolic link the checkout left at either name is replaced instead of written through.
+
+- **A Spark build runs on the machine `fluid apply` runs on: `parameters.spark.runtime: local`.**
+  A build of `runtime: local` runs forge's Spark runner and its compiled `job.json` with
+  `spark-submit` on a laptop or a lab host (an EMR 7.x image, or any Spark 3.5), the way EMR runs
+  them. `fluid apply` writes the job config and the content-addressed runner under
+  `_fluid/spark/<product>/<build>/` in `FLUID_SPARK_LOCAL_ROOT`: `s3://<bucket>[/<prefix>]`,
+  reached through the AWS SDK's own `AWS_ENDPOINT_URL_S3` (SeaweedFS, MinIO), or a directory,
+  by default `.fluid/spark-artifacts` beside the contract. spark-submit reads both from there.
+  A stream follows `spark.reconcile` as on AWS: it is left alone while its config hash is
+  unchanged, stopped and started again on the same checkpoint when the hash changes, and stopped
+  when the contract no longer runs the build locally. A stream stopped from outside forge (its
+  machine shut down or restarted, a kill) starts again on the next apply, as one cancelled by hand
+  on AWS does; one that failed does not until its config changes. A batch or `availableNow` build
+  runs once
+  under `fluid apply --mode amend-and-build --build-id <id>`, the command a generated DAG runs, and
+  reports SUCCEEDED or FAILED. Run state lives under `.fluid/<product>/runtime/spark/<build>/`.
+  The output is a table in an Iceberg REST catalog (`location.catalog` lakekeeper, rest or
+  polaris) on `platform: local`. The operator declares that catalog in
+  `FLUID_SPARK_SUBMIT_PROPERTIES_FILE`, passed as `--properties-file`, so its values never reach
+  the command line, and the job creates its table on the first write: Iceberg v2 with the
+  contract's columns, as OpenTofu creates it on AWS. As a table that exists is written as it
+  is, a local run writes, its dead letters' table included, only in a namespace the operator
+  lists in `FLUID_SPARK_LOCAL_NAMESPACE_ALLOWLIST` as `<warehouse>/<namespace prefix>`
+  (`fluid/<namespace>` when the binding names no warehouse; whole levels match); unset allows
+  none, and `fluid validate` warns. A stream's declared checkpoint stays under
+  `_checkpoints/<product>/`, in the output's bucket when it names one, as on AWS.
+  `FLUID_SPARK_SUBMIT_EXECUTABLE` names the
+  spark-submit. A contract written for AWS switches with one keyed-overlay line, since
+  `runtime: local` ignores the AWS runtimes' keys (`applicationId`, `clusterId`,
+  `virtualClusterId`, `releaseLabel`, `glueVersion`, `executionRoleArn`). Each environment
+  keeps its own runs: an apply of AWS builds alone never stops this machine's local runs. With
+  an `s3://` root on a Spark other than an EMR image, the properties file maps `s3` to S3A
+  (`spark.hadoop.fs.s3.impl`, the endpoint) and puts hadoop-aws on `spark.driver.extraClassPath`,
+  as spark-submit downloads the runner before `--packages` load. A project dotenv can no
+  longer set `SPARK_*`, `PYSPARK_*`, `HADOOP_*` or `YARN_*`, which choose what spark-submit
+  starts, and a run's environment keeps only names a shell could set, without bash's
+  exported functions (`BASH_FUNC_*`) or startup settings (`BASH_ENV`, `ENV`, `SHELLOPTS`,
+  `BASHOPTS`, `PS4`, `BASH_XTRACEFD`). The spark-submit must be an absolute path outside the
+  project, a run's directory, `status.json` and `driver.log` are owner-only, and forge passes
+  Spark 3.5's `spark.redaction.regex` (which names `credential`) unless the properties file sets
+  its own. The runner changed, so each running Spark stream restarts once on its next apply.
+- **A Spark stream sends the records it cannot land elsewhere: `properties.stream.deadLetter`
+  (0.7.7 preview).** A record whose value or key is not the declared JSON, or that lacks a
+  required field, no longer fails the stream. It goes to a dead-letter table beside the output
+  (`<table>__dead_letter` by default, Iceberg v2: the reason, the raw value and key, and the
+  record's topic, partition, offset and timestamp), or with `sink: topic` to a topic on the cluster
+  the stream reads (never the stream's own), with Kafka Connect's `__connect.errors.*` headers. The
+  output keeps its own exactly-once query. The dead letters are a second query over the same
+  records, with its own checkpoint inside the stream's: a new one starts where the output
+  resumes, so dead letters added to a stream a record had stopped take that record too. Each of
+  its batches is committed to the table once. Past `maxRecordsBeforeAbort` dead letters (10000 by
+  default) since the job started, the stream stops once the batch that crossed it has landed, and
+  starts again when the build changes. `alertOn: [schema_violation]` logs an alert for each batch
+  that has dead letters. A build that masks fields at ingest keeps no raw bytes. An Avro stream's
+  dead letters are refused for now, as the decoder's permissive mode would also turn a schema
+  registry outage into dead letters. On AWS, OpenTofu emits the table and grants the job's role
+  what writing it takes (its S3 prefix, its Glue table, and Lake Formation's permissions when Lake
+  Formation governs the output), or what writing the topic takes on MSK with IAM. A topic is
+  written only once the operator lists it in `FLUID_SPARK_TARGET_ALLOWLIST`, on every runtime
+  and for a broker at a private address too: `msk-write:<cluster ARN>/<topic>`, or
+  `kafka-write:<host:port>/<topic>` for each broker a `bootstrapServers` cluster lists. A
+  table is refused beside a bucket-root output, a location forge registers with Lake Formation,
+  and an output whose lifecycle expires its objects; a topic takes their place. The managed Flink
+  lane refuses the block.
 - **A Glue table is partitioned as its binding declares.** `binding.location.partitionBy`
   never reached the Glue table the AWS emitter wrote, and `binding.properties.cluster_by` was
   read by nobody on AWS; both passed `fluid validate --strict`. On a Hive table (Parquet, ORC,
@@ -459,28 +575,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`fluid apply` runs a dbt build whatever its trigger, finds the dbt that has its adapter, and
-  pins its container's image and packages.** A `dataset` or `schedule_and_dataset` build, which
-  `fluid generate schedule` renders a DAG for, failed under that DAG's `fluid apply --build-id`
-  with "Unknown trigger type", and so did `event`, `dependency` and `timetable`; the dbt and python
-  runners now run a build of every type a scheduler or an event starts once when apply asks (the
-  scheduler decides when), keep `manual` iterations, still refuse `continuous`, and refuse a
-  `trigger.type` that is not a name. An engine named after its PyPI distribution, such as
-  `dbt-athena-community`, was looked for as `athena-community`, so a local dbt with the athena
-  plugin was never used; the runner now asks for dbt's plugin name (`athena`), reads the adapter of
-  an engine without one (`dbt`, `dbt-core`) from every platform a profile is generated for, and
-  matches the `Plugins:` list of `dbt --version` exactly. When no local dbt has the adapter, the
-  container fallback runs `python:3.12-slim` pinned by digest and installs `dbt-core==1.11.17` and
-  an exact adapter pin from wheels only, run as `python -I -m pip --isolated` against PyPI, with no
-  pip config file and no `PIP_*` or project `PYTHON*` setting passed in (their dependencies resolve
-  within those packages' ranges); an adapter without a pin, a `DBT_ADAPTER_PACKAGE` that is not
-  exact pins, and a `DBT_DOCKER_IMAGE` or `DBT_BOOTSTRAP_IMAGE` without a digest are refused. For
-  athena, glue and redshift IAM, a dbt profile that names an AWS profile, or a run with no AWS keys
-  in the container's environment or the dbt profile and no container credentials endpoint, is
-  refused before `docker` starts, with the command that installs the adapter locally or exports
-  short-lived keys; `~/.aws` is never mounted, and the host-only AWS settings (`AWS_PROFILE`,
-  `AWS_DEFAULT_PROFILE`, `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, `AWS_CA_BUNDLE` and the
-  token-file paths) are not passed in.
+- **An `enum` value holding a quote or a backslash no longer breaks dbt's `accepted_values`
+  test.** dbt pastes each value between single quotes unescaped, so `O'Brien` ended the string
+  and the rest ran as SQL. Such a column's values are now written with `quote: false`, each as
+  the SQL string literal of the adapter that runs it (DuckDB, Snowflake, BigQuery, Databricks
+  and Spark, Postgres, Athena and Trino, with a standard literal for any other adapter), and
+  the column's other values as `'<value>'`, in both `fluid generate dbt-tests` and the dbt
+  engine. Columns whose values hold neither are written as before.
 
 - **An EMR on EC2 stream starts only once its cluster's role carries the build's policy.** A step
   runs as the cluster's instance-profile role, which the cluster's owner holds, and forge creates
@@ -617,6 +718,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   way, beside the keys it already wrote.
 
 ### Security
+
+- **The dbt engine's schema.yml, sources.yml and semantic_models.yml write no contract text
+  that dbt would run as Jinja.** The ones `fluid generate transformation` writes for a dbt
+  build now pass through the same escaping as `fluid generate dbt-tests` (one shared helper,
+  `util/dbt_jinja.py`): a model or column name, description, enum value, expression or source
+  field from a contract that holds `{{`, `{%` or `{#`, or looks like `env_var(...)`,
+  `var(...)`, `ref(...)`, `source(...)` or `doc(...)`, is written as a Jinja string literal
+  of itself. The engine's own `ref(...)` and `env_var(...)` expressions, a metric's `filter`
+  (dbt never renders it; MetricFlow reads its `Dimension(...)` template itself) and the
+  placeholders a contract may use for a source location (`{{ env.X }}`, `${X}`, `$X`, and
+  `{{ env_var('X') }}` in either quote, with a plain default or a `target.<attribute>` one)
+  still render; any other text around a placeholder that holds a brace is a literal.
+  The model SQL the engine writes (`engines/dbt/models.py`) and a contract's own SQL still
+  render as dbt Jinja: treat contract authors as trusted when dbt builds their contract.
+
+- **A name or version dbt pastes into its own Jinja is refused.** dbt runs a model's tests
+  against `ref('<exposeId>', version='<version>')`, a source table's against
+  `source('<source>', '<consumes id>')`, and a semantic model's against
+  `ref('<exposeId>')`, rendering each after pasting the name in, so a quote there ran
+  `env_var(...)` at `dbt parse`. `fluid generate transformation` and `fluid generate
+  dbt-tests` now stop with an error naming the value when one of these holds a quote, a
+  backslash, a brace or a control character. An id that matches the schema's identifier
+  grammar holds none of them.
 
 - **A project `.env` can no longer set bash function imports or shell start-up settings.**
   Bash reads an environment variable named `BASH_FUNC_<name>%%` as the definition of the

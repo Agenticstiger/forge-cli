@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, 
 
 import yaml
 
+from fluid_build.util.dbt_jinja import GeneratedJinja, dbt_name, inert, jinja_text, unsafe
 from fluid_build.util.freshness import iso_duration_to_freshness_unit
 from fluid_build.util.upstream_discovery import discover_upstream_products
 
@@ -75,10 +76,16 @@ except ImportError:  # pragma: no cover
         ]
 
 
-# Matches ``{{ env.FOO }}`` / ``{{env.FOO}}`` (FLUID contract placeholder).
-_FLUID_ENV_RE = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
-# Matches ``${FOO}`` (shell-style placeholder) and ``$FOO``.
-_SHELL_ENV_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+#: A placeholder a contract may write for a location, in one pass: FLUID's ``{{ env.FOO }}``,
+#: the shell's ``${FOO}`` and ``$FOO``, and dbt's own ``{{ env_var('FOO') }}`` with a
+#: plain default in either quote or ``target.<attribute>``. Each is written back as
+#: ``env_var(...)`` built from the parts matched here, never from the text itself.
+_PLACEHOLDER_RE = re.compile(
+    r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}|\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"
+    r"|\{\{\s*env_var\(\s*(['\"])([A-Za-z_][A-Za-z0-9_]*)\3"
+    r"(?:\s*,\s*(?:(['\"])([A-Za-z0-9_.\-/ ]*)\5|target\.([A-Za-z_][A-Za-z0-9_]*)))?"
+    r"\s*\)\s*\}\}"
+)
 
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -147,8 +154,8 @@ def _unresolved_upstream_placeholders(
         else "{{ env_var('FLUID_SOURCE_SCHEMA', target.schema) }}"
     )
     return {
-        "database_expr": db,
-        "schema_expr": schema,
+        "database_expr": GeneratedJinja(db),
+        "schema_expr": GeneratedJinja(schema),
         # Only Snowflake upper-cases unquoted identifiers; BigQuery and DuckDB
         # are case-sensitive, so upper-casing there breaks the reference.
         "identifier": (
@@ -209,8 +216,10 @@ def generate_sources(
             grouped[key] = []
             order.append(key)
 
+        # dbt runs a source table's tests against source('<source>', '<table>'), Jinja it
+        # builds by pasting the name in, so the name may not end the quoted string.
         table_entry: Dict[str, Any] = {
-            "name": port["id"],
+            "name": dbt_name(port["id"], "consumes[].id"),
         }
         if resolved["identifier"] and resolved["identifier"] != port["id"]:
             table_entry["identifier"] = resolved["identifier"]
@@ -266,7 +275,7 @@ def generate_sources(
     }
 
     return _HEADER + yaml.dump(
-        source_def, default_flow_style=False, sort_keys=False, allow_unicode=True
+        inert(source_def), default_flow_style=False, sort_keys=False, allow_unicode=True
     )
 
 
@@ -291,7 +300,7 @@ def generate_sources_from_logical_model(logical_model: Mapping[str, Any]) -> Opt
         name = str(dataset.get("source") or dataset.get("name") or "").strip()
         if not name:
             continue
-        entry: Dict[str, Any] = {"name": name}
+        entry: Dict[str, Any] = {"name": dbt_name(name, "logical model dataset")}
         fields = dataset.get("fields") or []
         columns = []
         for field in fields:
@@ -309,13 +318,16 @@ def generate_sources_from_logical_model(logical_model: Mapping[str, Any]) -> Opt
             {
                 "name": "raw",
                 "description": "Source tables inferred from the forged DDL sidecar",
-                "schema": "{{ env_var('FLUID_SOURCE_SCHEMA', env_var('SNOWFLAKE_STAGE_SCHEMA', target.schema)) }}",
+                "schema": GeneratedJinja(
+                    "{{ env_var('FLUID_SOURCE_SCHEMA', env_var('SNOWFLAKE_STAGE_SCHEMA', "
+                    "target.schema)) }}"
+                ),
                 "tables": tables,
             }
         ],
     }
     return _HEADER + yaml.dump(
-        source_def, default_flow_style=False, sort_keys=False, allow_unicode=True
+        inert(source_def), default_flow_style=False, sort_keys=False, allow_unicode=True
     )
 
 
@@ -391,6 +403,32 @@ def _identifier_from_location(
     return None
 
 
+# Matches ``{{ env.FOO }}`` / ``{{env.FOO}}`` (FLUID contract placeholder).
+_FLUID_ENV_RE = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+# Matches ``${FOO}`` (shell-style placeholder) and ``$FOO``.
+_SHELL_ENV_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+
+
+def rewrite_placeholders(value: Any) -> Optional[str]:
+    """``value`` with each FLUID/shell placeholder rewritten to ``{{ env_var('FOO') }}`` and
+    every other character as written: for text that is dbt Jinja on purpose, a model's SQL
+    (``{{ ref(...) }}``, ``{{ source(...) }}``) and the profiles.yml values
+    ``profiles._contract_expr`` checks after the rewrite. A YAML value from a contract goes
+    through :func:`_normalize_placeholder` instead, which keeps the rest of it text.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return str(value)
+    text = value.strip()
+    if not text:
+        return None
+
+    text = _FLUID_ENV_RE.sub(lambda m: f"{{{{ env_var('{m.group(1)}') }}}}", text)
+    text = _SHELL_ENV_RE.sub(lambda m: f"{{{{ env_var('{m.group(1)}') }}}}", text)
+    return text
+
+
 def _normalize_placeholder(value: Any) -> Optional[str]:
     """Rewrite FLUID/shell env-style placeholders to dbt ``env_var(...)``.
 
@@ -407,9 +445,34 @@ def _normalize_placeholder(value: Any) -> Optional[str]:
     if not text:
         return None
 
-    text = _FLUID_ENV_RE.sub(lambda m: f"{{{{ env_var('{m.group(1)}') }}}}", text)
-    text = _SHELL_ENV_RE.sub(lambda m: f"{{{{ env_var('{m.group(1)}') }}}}", text)
-    return text
+    # Each placeholder becomes env_var('<NAME>') (the name matches [A-Za-z_][A-Za-z0-9_]*);
+    # the text around it is contract text, so where dbt would read it as Jinja it becomes a
+    # Jinja literal of itself (fluid_build/util/dbt_jinja.py). Plain text stays as written.
+    parts: List[str] = []
+    last = 0
+    for match in _PLACEHOLDER_RE.finditer(text):
+        parts.append(_literal_piece(text[last : match.start()]))
+        name = match.group(1) or match.group(2) or match.group(4)
+        if match.group(6) is not None:
+            default = f", '{match.group(6)}'"
+        elif match.group(7) is not None:
+            default = f", target.{match.group(7)}"
+        else:
+            default = ""
+        parts.append(f"{{{{ env_var('{name}'{default}) }}}}")
+        last = match.end()
+    parts.append(_literal_piece(text[last:]))
+    return GeneratedJinja("".join(parts))
+
+
+def _literal_piece(text: str) -> str:
+    """Contract text between placeholders: as written, or a Jinja literal of itself where
+    dbt could read it as Jinja. A brace alone counts, because next to a placeholder it can
+    complete a delimiter (``{`` before ``{{ env_var(...) }}``); ``%`` and ``#`` open one
+    only after a brace."""
+    if not text or not ("{" in text or "}" in text or unsafe(text)):
+        return text
+    return jinja_text(text)
 
 
 # ---------------------------------------------------------------------------

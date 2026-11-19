@@ -1497,6 +1497,85 @@
             "latest"
           ],
           "description": "NEW in v0.7.7 (preview): Where a job with no checkpoint yet starts reading: earliest (all the topic retains) or latest (new records only). Absent: the engine's default, latest for a Spark stream. A job that has a checkpoint resumes from it."
+        },
+        "deadLetter": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "NEW in v0.7.7 (preview): What forge's Spark runner does with a record it cannot land: a value or key that is not the declared JSON, a field of another type, or a required field that is null (an Avro stream's dead letters are not supported yet). With deadLetter, each such record goes to a dead-letter sink, with its raw bytes, the reason, and its topic, partition and offset, and the stream keeps running; without it, or with enabled: false, the first such record fails the stream. The keys follow the acquisition lane's dlq (enabled, maxRecordsBeforeAbort, alertOn). A Spark stream only: managed Flink refuses the key.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "false: no dead letters; a record that cannot land fails the stream (an overlay can switch it off per environment)."
+            },
+            "sink": {
+              "enum": [
+                "table",
+                "topic"
+              ],
+              "default": "table",
+              "description": "table: an Iceberg table beside the output, in the output's catalog and database. topic: a Kafka topic on the cluster the stream reads, each record with Kafka Connect's error-context headers (__connect.errors.topic, .partition, .offset, .exception.message)."
+            },
+            "table": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,254}(?![\\s\\S])",
+              "description": "sink table only: the table's name in the output's database. Absent: <output table>__dead_letter, as late events go to <output table>__late_events."
+            },
+            "topic": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,249}(?![\\s\\S])",
+              "description": "sink topic only, and required there: the dead-letter topic, on the cluster the stream reads. It must exist; the job writes to it and creates nothing."
+            },
+            "maxRecordsBeforeAbort": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 10000,
+              "description": "The stream fails once it has sent more dead letters than this since it started (0: the first one fails it, after it has landed in the sink)."
+            },
+            "alertOn": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "schema_violation"
+                ]
+              },
+              "description": "The reasons the runner logs a dead_letter_alert line for, each micro-batch that sends any: schema_violation is every record the stream could not land."
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "sink": {
+                    "const": "topic"
+                  }
+                },
+                "required": [
+                  "sink"
+                ]
+              },
+              "then": {
+                "required": [
+                  "topic"
+                ],
+                "not": {
+                  "required": [
+                    "table"
+                  ]
+                },
+                "description": "a topic sink names its topic, and no table"
+              },
+              "else": {
+                "not": {
+                  "required": [
+                    "topic"
+                  ]
+                },
+                "description": "topic is for sink: topic; a table sink takes table"
+              }
+            }
+          ]
         }
       }
     },
@@ -4030,9 +4109,10 @@
             "emr-serverless",
             "emr-ec2",
             "emr-eks",
-            "glue"
+            "glue",
+            "local"
           ],
-          "description": "The AWS service that runs the job: EMR Serverless, EMR on EC2, EMR on EKS or an AWS Glue Spark job. One runner serves all four."
+          "description": "Where the job runs: EMR Serverless, EMR on EC2, EMR on EKS, an AWS Glue Spark job, or local, a spark-submit on the machine fluid apply runs on (a laptop, or a lab with an EMR 7.x image). One runner and one job config serve all five. A local run writes a table in an Iceberg REST catalog (location.catalog lakekeeper, rest or polaris) on platform local, which the operator's Spark configuration declares. local ignores the AWS runtimes' keys (applicationId, clusterId, virtualClusterId, releaseLabel, glueVersion, executionRoleArn), so a contract written for AWS switches to local with one overlay line."
         },
         "mode": {
           "enum": [
@@ -4044,34 +4124,34 @@
         "applicationId": {
           "type": "string",
           "pattern": "^[0-9a-z]{1,64}(?![\\s\\S])",
-          "description": "emr-serverless only: an existing EMR Serverless application. Absent: the forge-managed application shared by the product's domain."
+          "description": "emr-serverless only (runtime local ignores it): an existing EMR Serverless application. Absent: the forge-managed application shared by the product's domain."
         },
         "clusterId": {
           "type": "string",
           "pattern": "^j-[0-9A-Za-z]{1,254}(?![\\s\\S])",
-          "description": "emr-ec2 only: a running EMR cluster (j-...). Absent: a transient cluster that ends with the job."
+          "description": "emr-ec2 only (runtime local ignores it): a running EMR cluster (j-...). Absent: a transient cluster that ends with the job."
         },
         "virtualClusterId": {
           "type": "string",
           "pattern": "^[0-9a-z]{1,64}(?![\\s\\S])",
-          "description": "emr-eks only, and required there: the EMR on EKS virtual cluster."
+          "description": "emr-eks only, and required there (runtime local ignores it): the EMR on EKS virtual cluster."
         },
         "glueVersion": {
           "type": "string",
           "pattern": "^[0-9]+\\.[0-9]+(?![\\s\\S])",
           "default": "5.0",
-          "description": "glue only: the AWS Glue version of the job."
+          "description": "glue only (runtime local ignores it): the AWS Glue version of the job."
         },
         "releaseLabel": {
           "type": "string",
           "pattern": "^emr-[0-9]+\\.[0-9]+\\.[0-9]+((-[a-z0-9]+)*-(latest|[0-9]{8}))?(?![\\s\\S])",
           "default": "emr-7.12.0",
-          "description": "EMR runtimes only (emr-serverless, emr-ec2, emr-eks): the EMR release, in the form the runtime takes. emr-serverless and emr-ec2 name the release (emr-7.12.0, the default); emr-eks names an image of it, emr-X.Y.Z-latest or emr-X.Y.Z-YYYYMMDD (default emr-7.12.0-latest). 7.12 or later writes Iceberg with Lake Formation credentials."
+          "description": "EMR runtimes only (emr-serverless, emr-ec2, emr-eks; runtime local ignores it): the EMR release, in the form the runtime takes. emr-serverless and emr-ec2 name the release (emr-7.12.0, the default); emr-eks names an image of it, emr-X.Y.Z-latest or emr-X.Y.Z-YYYYMMDD (default emr-7.12.0-latest). 7.12 or later writes Iceberg with Lake Formation credentials."
         },
         "executionRoleArn": {
           "type": "string",
           "pattern": "^arn:aws[a-zA-Z0-9-]*:iam::[0-9]{12}:role/[A-Za-z0-9_+=,.@/-]{1,512}(?![\\s\\S])",
-          "description": "The IAM role the job runs as. Absent: a least-privilege role forge creates for the build."
+          "description": "The IAM role the job runs as (runtime local ignores it: a local job runs with the credentials of the machine it runs on). Absent: a least-privilege role forge creates for the build."
         },
         "maskKeySecretArn": {
           "type": "string",
@@ -4174,7 +4254,10 @@
             "not": {
               "properties": {
                 "runtime": {
-                  "const": "emr-serverless"
+                  "enum": [
+                    "emr-serverless",
+                    "local"
+                  ]
                 }
               }
             }
@@ -4193,7 +4276,10 @@
             "not": {
               "properties": {
                 "runtime": {
-                  "const": "emr-ec2"
+                  "enum": [
+                    "emr-ec2",
+                    "local"
+                  ]
                 }
               }
             }
@@ -4212,7 +4298,10 @@
             "not": {
               "properties": {
                 "runtime": {
-                  "const": "emr-eks"
+                  "enum": [
+                    "emr-eks",
+                    "local"
+                  ]
                 }
               }
             }
@@ -4244,14 +4333,54 @@
               ]
             },
             "description": "releaseLabel is an EMR release; a glue runtime takes glueVersion"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "runtime": {
+                "enum": [
+                  "emr-serverless",
+                  "emr-ec2",
+                  "emr-eks"
+                ]
+              }
+            },
+            "required": [
+              "runtime"
+            ]
           },
-          "else": {
+          "then": {
             "not": {
               "required": [
                 "glueVersion"
               ]
             },
             "description": "glueVersion is only valid with runtime: glue; EMR runtimes take releaseLabel"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "runtime": {
+                "const": "local"
+              }
+            },
+            "required": [
+              "runtime"
+            ]
+          },
+          "then": {
+            "properties": {
+              "source": {
+                "not": {
+                  "required": [
+                    "mskClusterArn"
+                  ]
+                },
+                "description": "a local run reads source.bootstrapServers: nothing resolves an MSK cluster's brokers for it"
+              }
+            }
           }
         },
         {
