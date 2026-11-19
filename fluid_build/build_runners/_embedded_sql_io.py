@@ -1071,6 +1071,7 @@ def _refuse_unlandable(binding: Mapping[str, Any], path: Any, platform: str, whe
     with nothing where the contract said it would be.
     """
     fmt = _normalize_format(binding.get("format")) or "unset"
+    _refuse_partitioned_table(binding, where)
     text = str(path or "")
     scheme = text.split("://", 1)[0].lower() if is_remote_uri(text) else ""
     if scheme and scheme != "s3":
@@ -1100,6 +1101,28 @@ def _refuse_unlandable(binding: Mapping[str, Any], path: Any, platform: str, whe
             fix=("Bind the expose as one of those, or land it with an engine for that platform."),
             doc=doc_url(),
             extras={"platform": platform, "format": fmt},
+        )
+
+
+def _refuse_partitioned_table(binding: Mapping[str, Any], where: str) -> None:
+    """Refuse a landing in a partitioned Glue Hive table: this path writes one file."""
+    from fluid_build.iac.providers.aws_layout import (
+        SINGLE_FILE_FIX,
+        SINGLE_FILE_WHY,
+        partitioned_hive_table,
+    )
+
+    keys = partitioned_hive_table(binding)
+    if keys:
+        raise EmbeddedSqlLandingError(
+            what=(
+                f"{where}: the embedded-SQL path cannot land a Glue table partitioned by "
+                f"({', '.join(keys)})"
+            ),
+            why=SINGLE_FILE_WHY,
+            fix=SINGLE_FILE_FIX,
+            doc=doc_url(),
+            extras={"partitionBy": list(keys)},
         )
 
 
