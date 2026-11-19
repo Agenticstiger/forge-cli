@@ -230,6 +230,24 @@ jobs:
               GCP governance plan=tests/iac/test_iac_gcp_governance_plan.py
               AWS column restrictions=tests/iac/test_iac_aws_column_restrictions.py
               GCP governance validate=tests/iac/test_iac_gcp_governance.py
+          # BigQuery table shapes (partitioning, clustering, nested columns,
+          # decimal precision and scale): a real plan and apply with
+          # terraform-provider-google against the same BigQuery stand-in.
+          # Whether a change to a live table is planned in place or as a
+          # replacement the data-loss gate refuses is the provider's call, so
+          # only a real plan proves it. Without tofu these tests skip, so no
+          # other job runs them.
+          - name: "BigQuery table shapes (tofu vs BigQuery stand-in, creds-free)"
+            tests: >-
+              tests/iac/test_iac_gcp_layout_plan.py
+              tests/iac/test_iac_gcp_nested_columns_plan.py
+              tests/iac/test_iac_gcp_decimal_parameters_plan.py
+            pytest-args: "-p no:randomly"
+            junit: bigquery-table-shapes.xml
+            require: |
+              GCP layout plan=tests/iac/test_iac_gcp_layout_plan.py
+              GCP nested columns plan=tests/iac/test_iac_gcp_nested_columns_plan.py
+              GCP decimal parameters plan=tests/iac/test_iac_gcp_decimal_parameters_plan.py
           # Databricks: the real `fluid` CLI, `tofu` and the databricks/databricks
           # provider against an in-process Unity Catalog stand-in. What the
           # data-loss gate decides depends on what the provider plans for a live
