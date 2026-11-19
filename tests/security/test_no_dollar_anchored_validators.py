@@ -1320,11 +1320,6 @@ _ACCEPTED: Dict[Tuple[str, str, str], str] = {
         r"^\((\d+)(?:,(\d+))?\)$",
     ): "the only caller passes column_types.split_type() output, which holds no whitespace",
     (
-        "fluid_build/iac/providers/gcp.py",
-        "_bq_outcome",
-        r"^\((\d+)(?:,(\d+))?\)$",
-    ): "the value is column_types.split_type() output, which holds no whitespace",
-    (
         "fluid_build/iac/providers/databricks.py",
         "_scale_zero_warnings",
         r"^decimal(\([0-9]+\))?$",

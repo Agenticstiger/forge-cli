@@ -142,6 +142,7 @@ def _mart_skeleton(
     adapter: Optional[str] = None,
 ) -> str:
     """Generate a mart model skeleton."""
+    _types.refuse_decimal_arguments(expose_id, schema_cols, adapter)
     lines = [_HEADER, "{{ config(materialized='table') }}\n\n"]
 
     if schema_cols:
