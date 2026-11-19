@@ -413,8 +413,7 @@ lineage = [
 # fluid_build/profiler/_stats.py imports, so the range stops at the next minor.
 # That module repeats the requirement in its install message, and
 # tests/profiler/test_flux_stats_pin.py keeps the two equal.
-# TODO: the founder names the real flux-stats version when it is released; 0.7.0 is
-# the first release that holds these modules.
+# 0.7.0 is the first flux-stats release that holds these modules.
 profile = [
   "duckdb>=1.5.0",
   "flux-stats[yaml]>=0.7.0,<0.8",

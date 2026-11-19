@@ -856,8 +856,8 @@ def load_backend() -> StatisticsBackend:
 #: The flux-stats range ``[profile]`` names in ``pyproject.toml``. The CLI cannot read
 #: that file once installed, so the install message repeats it;
 #: ``tests/profiler/test_flux_stats_pin.py`` keeps the two equal.
-#: TODO: the founder names the real version when flux-stats releases it; 0.7.0 is the
-#: first release that holds ``edge_counts``, ``exact_yaml`` and ``quantile/2``.
+#: 0.7.0 is the first flux-stats release that holds ``edge_counts``, ``exact_yaml`` and
+#: ``quantile/2``.
 FLUX_STATS_REQUIREMENT = "flux-stats[yaml]>=0.7.0,<0.8"
 #: The extra carries the range, and pip replaces a copy outside it (the 0.0.1
 #: placeholder, or a release newer than this module knows).
