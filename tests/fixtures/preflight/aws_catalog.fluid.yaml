@@ -1,0 +1,33 @@
+# The catalog-only sibling: one Glue-catalogued table on S3, no build forge runs.
+# Its offline stages (validate, generate, plan) need no AWS credentials.
+fluidVersion: "0.7.7"
+kind: DataProduct
+id: demo.aws_catalog
+name: AWS catalog demo
+description: a Glue catalog table for the preflight fixture
+domain: demo
+metadata:
+  layer: Bronze
+  owner:
+    team: data
+exposes:
+  - exposeId: orders
+    version: "1.0.0"
+    kind: table
+    binding:
+      platform: aws
+      format: parquet
+      location:
+        bucket: acme-demo
+        path: orders/
+        database: demo
+        table: orders
+    contract:
+      schema:
+        - name: id
+          type: string
+          required: true
+        - name: amount
+          type: decimal(12,2)
+        - name: payload
+          type: json

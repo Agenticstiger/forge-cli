@@ -1,0 +1,44 @@
+# A BigQuery table whose columns the emitter holds exactly, one it holds lossily
+# (a map, as REPEATED RECORD of key and value) and one it refuses (a bare array
+# with no declared element).
+fluidVersion: "0.7.7"
+kind: DataProduct
+id: demo.tv_nested
+name: TV nested demo
+description: nested BigQuery columns for the preflight fixture
+domain: demo
+metadata:
+  layer: Silver
+  owner:
+    team: data
+exposes:
+  - exposeId: events
+    version: "1.0.0"
+    kind: table
+    binding:
+      platform: gcp
+      format: bigquery_table
+      location:
+        project: acme
+        dataset: demo
+        table: events
+    contract:
+      schema:
+        - name: id
+          type: string
+          required: true
+        - name: tags
+          type: array
+          required: true
+          element:
+            type: string
+            required: true
+        - name: attributes
+          type: map
+          key:
+            type: string
+            required: true
+          value:
+            type: string
+        - name: genres
+          type: array
