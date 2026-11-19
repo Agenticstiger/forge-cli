@@ -28,6 +28,7 @@ from fractions import Fraction
 import pytest
 
 from fluid_build.profiler._stats import (
+    BundleTextRefused,
     DocumentRefused,
     ReadRefused,
     StatisticsBackend,
@@ -301,3 +302,16 @@ def test_the_backend_reads_a_bundle_through_the_registrys_exact_reader():
     (document,) = backend.read_documents("rate: 0.50\nwhen: 2024-01-01\n", name="s", budget=budget)
     assert document == {"rate": Decimal("0.50"), "when": "2024-01-01"}
     assert backend.canonicalise(document, name="s") == {"rate": "0.50", "when": "2024-01-01"}
+
+
+def test_two_keys_that_read_as_one_are_refused_without_naming_the_key():
+    # A bundle key may hold anything, so the refusal of two source keys that read as one
+    # canonical key (FLX-1007) says the code's title, not the key.
+    backend = load_backend()
+    composed, decomposed = chr(0xE9), "e" + chr(0x301)  # one key once normalised
+    with pytest.raises(BundleTextRefused) as refused:
+        backend.canonicalise(
+            {f"{composed}-hunter2": 1, f"{decomposed}-hunter2": 2}, name="simulation.flux.yml"
+        )
+    said = str(refused.value)
+    assert "FLX-1007" in said and "simulation.flux.yml" in said and "hunter2" not in said

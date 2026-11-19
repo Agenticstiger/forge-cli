@@ -73,10 +73,15 @@ that holds its order statistic and the records below that bin and through it,
 and the profile then names format 1-1-0; its three cells (below, in and above
 the bin) each hold at least 10 records, or none at the ends of the range. A
 quantile without bins is published only as the one such statistic of its column.
-A group of fewer than 10 records withholds every group of its groupBy. No small
-cell, a zero included where zeros are disclosive, can be formed by adding or
-subtracting what is published, so more is withheld (D in the summary). Only
-then are counts rounded. A published min or
+A group of fewer than 10 records withholds every group of its groupBy, and a
+group whose every cell is withheld is withheld whole. Across those statistics
+of one column, no small cell, a zero included where zeros are disclosive, can be
+formed by adding or subtracting what they publish, so more is withheld (D in
+the summary). Only then are counts rounded. The check does not see a column's
+support, which lists the levels that hold records, or the group sizes of a
+statistic grouped by the column, which repeat its level counts; and a declared
+level that holds no record is absent from a grouped statistic, which shows its
+zero. A published min or
 max shows that no record lies below or above it. A quantile whose value is the
 column's smallest or largest shows the same, and is withheld for it, as a zero
 is.

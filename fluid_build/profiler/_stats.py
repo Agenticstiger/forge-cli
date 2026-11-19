@@ -91,6 +91,10 @@ class DocumentRefused(ValueError):
     """
 
 
+#: The canonical form's refusal of two source keys that read as one key.
+_KEY_COLLISION = "FLX-1007"
+
+
 class BlockRefused(ValueError):
     """The registry's parser refused the fidelity block a Simulation declares.
 
@@ -562,7 +566,13 @@ class _FluxStatsBackend:
         try:
             return self._canonical.canonicalise(value)
         except self._refused as error:
-            detail = error.detail or error.code.title
+            # FLX-1007 names the key two source keys read as, and a bundle key may
+            # hold anything, so only the code's title is said for it.
+            detail = (
+                error.code.title
+                if error.code.code == _KEY_COLLISION
+                else (error.detail or error.code.title)
+            )
             raise BundleTextRefused(error.code.code, f"{name}: {detail}") from None
 
     def check_document(self, text: str) -> None:
@@ -582,6 +592,7 @@ class _FluxStatsBackend:
                 # By name, so a flux-stats that lacks the module raises here.
                 fidelity = import_module("flux_stats.fidelity")
                 reading = import_module("flux_stats.reading")
+                fixedpoint = import_module("flux_stats.fixedpoint")
                 from flux_stats.registry import definition as definition_named
                 from flux_stats.spelling import render_exact
             except ImportError as error:
@@ -593,6 +604,7 @@ class _FluxStatsBackend:
             self._grammar = SimpleNamespace(
                 fidelity=fidelity,
                 reading=reading,
+                fixedpoint=fixedpoint,
                 definition_named=definition_named,
                 render_exact=render_exact,
             )
@@ -615,8 +627,10 @@ class _FluxStatsBackend:
         statistics: List[DeclaredStatistic] = []
         left_out: List[Tuple[str, str]] = []
         seen = set()
-        for declaration in parsed.properties:
+        for index, declaration in enumerate(parsed.properties):
             kind = declaration.kind.value
+            if declaration.bins:
+                self._refuse_off_grid_bins(grammar, parsed, index, declaration.bins)
             if kind == "correlation":
                 first, second = declaration.columns
                 left_out.append((f"correlation of {first!r} and {second!r}", _CORRELATION_LEFT_OUT))
@@ -637,6 +651,21 @@ class _FluxStatsBackend:
             left_out=tuple(left_out),
             _block=parsed,
         )
+
+    def _refuse_off_grid_bins(self, grammar: Any, parsed: Any, index: int, bins: Any) -> None:
+        """Refuse bins the fidelity check could not compare, before a record is read.
+
+        The check bins a record exactly only where every edge is a grid point and the
+        edges strictly increase, and refuses any other (``FLX-5004``), so the profile
+        applies the registry's own rule. Edges that fall to one grid point would also
+        leave the output check over a column with no partition to read. The message
+        names the property and the edge's place, never a value.
+        """
+        try:
+            grammar.fixedpoint.epsilon_marginal_histogram(parsed.grid, bins)
+        except self._refused as error:
+            detail = error.detail or error.code.title
+            raise BlockRefused(error.code.code, f"properties[{index}]: {detail}") from None
 
     @staticmethod
     def _declared(grammar: Any, parsed: Any, declaration: Any) -> DeclaredStatistic:
@@ -790,13 +819,17 @@ class _FluxStatsBackend:
                     cell_status=dict(each.cell_status),
                 )
             )
-        decisions = edges.check_edge_counts(
-            asked,
-            total=total,
-            minimum_cell=minimum_cell,
-            zeros_disclosive=zeros_disclosive,
-            round_count=round_count,
-        )
+        try:
+            decisions = edges.check_edge_counts(
+                asked,
+                total=total,
+                minimum_cell=minimum_cell,
+                zeros_disclosive=zeros_disclosive,
+                round_count=round_count,
+            )
+        except self._refused as error:
+            # The registry's words may give counts; its code alone says what it refused.
+            raise ValueError(error.code.code) from None
         return tuple(
             self._decided(grammar, each, decision)
             for each, decision in zip(statistics, decisions, strict=True)

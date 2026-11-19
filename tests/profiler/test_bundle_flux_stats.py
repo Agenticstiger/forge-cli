@@ -447,7 +447,9 @@ def test_a_histogram_and_a_coarser_one_of_a_column_give_no_withheld_cell_back(tm
     coarse = _histogram(["0", "50", "100"])
     result = _profile(tmp_path, rows, [fine, coarse])
     fine_group, coarse_group = (histogram["groups"][0] for histogram in _histograms(result))
-    fine_cells, coarse_cells = fine_group["binCounts"], coarse_group["binCounts"]
+    # A group whose every cell is withheld is withheld whole, with no cells written.
+    fine_cells = fine_group.get("binCounts", [None] * 4)
+    coarse_cells = coarse_group.get("binCounts", [None] * 2)
     assert fine_cells[1] is None  # the 5 itself
     for cell, inside in ((0, fine_cells[:2]), (1, fine_cells[2:])):
         if coarse_cells[cell] is not None:
@@ -605,6 +607,8 @@ def test_a_quantile_beside_a_histogram_of_another_column_is_published(tmp_path):
 
 def test_a_small_group_of_one_column_leaves_another_columns_groups_published(tmp_path):
     rows = _rows()
+    for index, row in enumerate(rows):
+        row["qty"] = "60" if index % 2 else "10"  # each group of qty fills both bins
     for index, row in enumerate(rows[:15]):
         row["market"] = "DE"
         if index < 12:
@@ -617,7 +621,10 @@ def test_a_small_group_of_one_column_leaves_another_columns_groups_published(tmp
     amount = _entry(result, "amount", "marginalHistogram/1", "market")
     assert {g["status"] for g in amount["groups"]} == {"C"}
     qty = _entry(result, "qty", "marginalHistogram/1", "market")
-    assert {g["status"] for g in qty["groups"]} == {"F"}
+    statuses = {g["group"]: g["status"] for g in qty["groups"]}
+    # DE's 15 records split 8 and 7, so both its cells are small and it is withheld whole;
+    # the other markets' groups of qty are published, whatever amount's small group did.
+    assert statuses == {"DE": "C", "FR": "F", "GB": "F", "IE": "F"}
 
 
 def test_rows_no_group_holds_that_the_block_refuses_withhold_a_grouped_histogram(tmp_path):
@@ -721,9 +728,11 @@ def test_a_zero_cell_is_withheld_with_the_cell_that_gives_it_back(tmp_path):
     ]
     result = _profile(tmp_path, rows, properties)
     (group,) = _entry(result, "amount", "marginalHistogram/1")["groups"]
-    # The zero cell is withheld, and the 120 beside it would give it back: it goes too.
-    assert group["binCounts"] == [None, None] and group["cellStatus"] == ["C", "C"]
-    assert result.withheld_cells == {"A": 1, "D": 1}
+    # The zero cell is withheld, and the 120 beside it would give it back: it goes too,
+    # and a group with no cell left says nothing, so it is withheld whole, as small.
+    assert group == {"group": "", "status": "C"}
+    assert result.withheld_cells == {}  # no cell of it is written
+    assert result.withheld["A"] >= 1  # the group, among the profile's withheld values
 
 
 def test_a_small_table_withholds_the_histogram_whole(tmp_path):
@@ -1112,3 +1121,69 @@ def test_a_report_with_no_withheld_histogram_value_says_nothing_of_c(tmp_path, m
     out = " ".join(capsys.readouterr().out.split())
     assert rc == 0, out
     assert _ONE_CODE not in out and "Withheld histogram cells" not in out
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        {
+            "property": "marginalHistogram",
+            "bins": ["0", "0.4", "0.6", "100"],
+            "tolerance": _DISTANCE,
+        },
+        {"property": "quantile", "level": "0.5", "bins": ["0", "0.4", "0.6", "100"]},
+    ],
+    ids=["histogram", "quantile"],
+)
+def test_bins_that_are_no_grid_points_are_refused_before_any_record_is_read(tmp_path, declared):
+    # At fractionalBits 0 the edges 0.4 and 0.6 are no grid points, and both fall to the
+    # grid point 0: the fidelity check could not bin a record on them (FLX-5004), and the
+    # output check would have no partition to read. The block is refused as the check
+    # refuses it, naming the property and the edge, never a value.
+    prop = {"column": "amount", "tolerance": _ABSOLUTE, **declared}
+    directory = _bundle(tmp_path, [prop], bits=0)
+    block = bundle.read_bundle_block(directory, EXPOSE, _stats.load_backend())
+    with pytest.raises(ProfileError) as refused:
+        profile_expose(
+            CONTRACT,
+            EXPOSE,
+            source=str(tmp_path / "missing.ndjson"),  # never read
+            backend=_stats.load_backend(),
+            cwd=tmp_path,
+            bundle=block,
+        )
+    assert refused.value.event == "profile_bundle_block_refused"
+    said = str(refused.value)
+    assert "FLX-5004" in said and "properties[0]" in said and "bins[1]" in said
+    assert "0.4" not in said
+
+
+def test_a_histogram_group_with_no_cell_left_is_withheld_whole(tmp_path):
+    # DE's 12 records fall 8 and 4 in the two bins, so both its cells are small. A group
+    # with no cell left says nothing but its size, so it is withheld whole, as a group
+    # whose every cell is withheld always was, and the histogram is named as withheld in
+    # part, not as answered.
+    histogram = _histogram(["0", "50", "100"], groupBy="market")
+    result = _profile(tmp_path, _partly_rows(), [histogram])
+    entry = _entry(result, "amount", "marginalHistogram/1", "market")
+    groups = {group["group"]: group for group in entry["groups"]}
+    assert groups["DE"] == {"group": "DE", "status": "C"}
+    assert {key for key, group in groups.items() if group["status"] == "F"} == {"FR", "GB", "IE"}
+    (named,) = [one for one in result.partly_withheld_statistics if one[1] == "marginalHistogram/1"]
+    assert named[-2:] == (3, 4)
+    load_profile_text(result.canonical.decode("utf-8"))
+
+
+def test_a_refusal_inside_the_output_check_names_only_its_code(tmp_path, monkeypatch):
+    # The registry's words for a refusal may give counts, so the profile says its code.
+    from flux_stats import edge_counts, fixedpoint
+    from flux_stats.errors import FluxError
+
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise FluxError(fixedpoint.FLX_5004, "witness ranks 3/7 are not a sub-count of 9")
+
+    monkeypatch.setattr(edge_counts, "check_edge_counts", refuse)
+    with pytest.raises(ProfileError) as refused:
+        _profile(tmp_path, _rows(), [_histogram(["0", "50", "100"])])
+    said = str(refused.value)
+    assert "FLX-5004" in said and "3/7" not in said and "9" not in said.split("FLX-5004")[-1]

@@ -837,14 +837,43 @@ def _edge_checked_groups(
     tally, cell_tally = tallies
     written: List[Dict[str, Any]] = []
     for group in measured.groups:
-        if decision.group_status[group.key] == disclosure.FREE:
+        if decision.group_status[group.key] == disclosure.FREE and not _every_cell_withheld(
+            statistic, decision, group.key
+        ):
             tally[disclosure.FREE] += 1
             published = _published_edge_group(statistic, group, decision, rule, cell_tally)
             written.append({**published, "status": disclosure.FREE})
         else:
-            tally[_code(decision.group_reason[group.key])] += 1
+            tally[_withheld_code(statistic, decision, group.key)] += 1
             written.append({"group": group.key, "status": disclosure.WITHHELD})
     return written
+
+
+def _every_cell_withheld(statistic: DeclaredStatistic, decision: EdgeDecision, key: str) -> bool:
+    """Whether a histogram group the check lets through holds no published cell.
+
+    Such a group says nothing but its size, so it is withheld whole, as a group whose
+    every cell is withheld always was. A quantile's group has no cells.
+    """
+    if statistic.kind == "quantile":
+        return False
+    return all(status != disclosure.FREE for status in decision.cell_status[key])
+
+
+def _withheld_code(statistic: DeclaredStatistic, decision: EdgeDecision, key: str) -> str:
+    """The code a withheld edge group is tallied under: its own reason, else its cells'.
+
+    A group withheld whole because every cell is withheld counts as small (``A``) where
+    one of its cells was withheld for its own size, and as secondary (``D``) otherwise.
+    """
+    if decision.group_status[key] != disclosure.FREE:
+        return _code(decision.group_reason[key])
+    codes = {
+        _code(reason)
+        for reason, status in zip(decision.cell_reason[key], decision.cell_status[key], strict=True)
+        if status != disclosure.FREE
+    }
+    return disclosure.SMALL_COUNT if disclosure.SMALL_COUNT in codes else disclosure.SECONDARY
 
 
 def _own_checked_groups(
