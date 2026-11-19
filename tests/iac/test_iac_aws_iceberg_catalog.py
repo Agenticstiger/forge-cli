@@ -177,7 +177,8 @@ ABSENT_CATALOG_GOLDEN: Dict[str, Any] = {
             "parameters": {"classification": "iceberg", "managed_by": "fluid"},
             "storage_descriptor": {
                 "columns": [{"name": "order_id", "type": "string"}, {"name": "qty", "type": "int"}],
-                "location": "s3://lake/orders/",
+                # Iceberg keeps its location without the trailing slash.
+                "location": "s3://lake/orders",
             },
             "open_table_format_input": {
                 "iceberg_input": {"metadata_operation": "CREATE", "version": "2"}

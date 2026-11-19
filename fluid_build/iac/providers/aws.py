@@ -1293,6 +1293,12 @@ def _emit_glue(
     # the renderer escapes at render time. Fallback is decided on the raw input
     # (``bucket_uses_fallback``), which a contract cannot spoof.
     bucket, path = _warehouse.normalize_location(loc, account_ref=_CALLER_ACCOUNT_TOKEN)
+    if is_iceberg_format(fmt):
+        # Iceberg keeps a table's location without the trailing slash
+        # (``LocationUtil.stripTrailingSlash``), and every commit writes it back into Glue
+        # (``GlueTableOperations``). With the slash here, each plan after a commit updated
+        # the table to put it back: an ``UpdateTable`` beside a running stream's commits.
+        path = path.rstrip("/")
     if _warehouse.bucket_uses_fallback(loc):
         storage["location"] = TofuExpr(f"s3://{bucket}/{_literal(path)}")
     else:

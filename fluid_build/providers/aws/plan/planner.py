@@ -631,7 +631,9 @@ def _plan_exposures(
                             "database": database,
                             "table": table,
                             "columns": glue_columns,
-                            "location": s3_location,
+                            "location": _warehouse.iceberg_table_location(
+                                location, account_ref=account_id
+                            ),
                             "icebergConfig": iceberg_config,
                             "description": exposure.get("description"),
                         }

@@ -459,6 +459,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An Iceberg table on Glue plans no change after an engine commits to it.** forge emitted the
+  table's location with a trailing slash; Iceberg keeps it without one and writes it back into
+  Glue on every commit. So each `fluid apply` after a commit (every scheduled run beside a
+  stream) planned `~1` per written table and sent an `UpdateTable` while the stream kept
+  committing, with `previous_metadata_location` from the plan's refresh. The location is now
+  emitted as Iceberg keeps it. The first apply after the upgrade updates each existing Iceberg
+  table's location once, in place; Hive-format tables keep their trailing slash.
+
 - **An EMR on EC2 stream starts only once its cluster's role carries the build's policy.** A step
   runs as the cluster's instance-profile role, which the cluster's owner holds, and forge creates
   the build's least-privilege policy for that owner to attach. The first `fluid apply` started the

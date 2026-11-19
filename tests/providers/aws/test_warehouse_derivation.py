@@ -147,7 +147,7 @@ def test_explicit_bucket_byte_stable_no_extra_data_source():
     plugin = get_iac_plugin("aws")
     tbl = next(iter(plugin.emit(contract)["aws_glue_catalog_table"].values()))
     loc = tbl["storage_descriptor"]["location"]
-    assert loc == "s3://lake/sales/orders/"
+    assert loc == "s3://lake/sales/orders"  # as Iceberg keeps it: no trailing slash
     assert not isinstance(loc, TofuExpr)
     assert "aws_caller_identity" not in plugin.emit_data(contract)
 
