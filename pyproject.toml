@@ -968,12 +968,6 @@ addopts = "-v --tb=short --strict-markers --disable-warnings -m 'not live_llm an
 # pure safety net; the gated live/heavy provider suites keep ample room.
 timeout = 600
 timeout_method = "thread"
-# A passing test's tmp_path is removed when the test ends; a failed test keeps its own for
-# debugging. A green run that was given no --basetemp removes the whole basetemp at the end.
-# The default, "all", keeps every directory until pytest prunes the run (the newest 3 are
-# kept, and a killed run holds a .lock that keeps its basetemp for 3 days): across ten
-# parallel runs of tests/iac that filled a disk (221 GB, 2026-11-18).
-tmp_path_retention_policy = "failed"
 markers = [
     "unit: Unit tests (fast, no I/O)",
     "integration: Integration tests (may need network/files)",

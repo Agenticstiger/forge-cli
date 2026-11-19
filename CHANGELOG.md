@@ -47,6 +47,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Lakekeeper exposure in a file that also holds cloud bindings goes to Lakekeeper, and the rest to
   the provider, as before.
 
+- **A saved OpenTofu plan applies on another runner, and only on the target it was made for.**
+  `fluid plan --tofu` now records the plan's target in its `opentofuPlan` record (under
+  `planDigest`): the cloud account and region (AWS, from STS `GetCallerIdentity` and the provider's
+  region), the project and region (GCP, from the defaults the `hashicorp/google` provider reads),
+  the organization and account (Snowflake) or the workspace host (Databricks), plus the state
+  backend block, the `tofu` version and the provider versions `tofu init` locked; it prints
+  `target: aws account …, region …`. `fluid apply plan.json` reads the target again before
+  anything runs, the state-key migration and the plugin's hooks included, and refuses another one
+  (`apply_plan_digest_tofu_plan_target_mismatch`), a recorded field it cannot read
+  (`…_target_unverified`), another `tofu` or provider version (`…_tofu_plan_toolchain`), another
+  backend configuration (`…_tofu_plan_target`) or a plan without the record
+  (`…_target_missing`). A field the plan's runner could not read (no boto3, say) is named at plan
+  time and named again at apply, and not compared. The provider lock travels with the plan as
+  `<stem>.terraform.lock.hcl` (sha256 under `planDigest`) and is installed before the apply's
+  `tofu init`, so another runner days later installs the providers the plan was reviewed with; a
+  missing or altered lock is refused (`…_tofu_plan_lock_missing` / `…_lock_mismatch`).
+  `--no-verify-plan-binding` skips the check, logged. With a state backend
+  both runners reach, a plan made on one runner applies unchanged on another at another checkout
+  path; a plan made on local state that the applying runner does not have is refused as
+  `apply_plan_digest_tofu_plan_state_missing` instead of "stale".
+  A field the plan could not bind is also logged at WARNING at apply
+  (`apply_tofu_plan_target_field_unbound`, naming the provider, the field and why), and a
+  provider forge reads no target for (`confluent`, an entry-point plugin) is named at plan and
+  at apply (`plan_tofu_target_provider_unbound` / `apply_tofu_plan_target_provider_unbound`).
+  The AWS region falls back to the named profile's `region` in the shared config file, and the
+  profile is `AWS_PROFILE`, else `AWS_DEFAULT_PROFILE`, the order the `hashicorp/aws` provider
+  reads them in.
 - **`fluid plan` and `fluid apply` warn when an EMR on EC2 cluster can lose a Spark build to
   Spot.** For each `runtime: emr-ec2` build, forge reads its `clusterId` once
   (`DescribeCluster`, then `ListInstanceGroups` or `ListInstanceFleets`) and warns, never
@@ -64,6 +91,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `plan.json`. The caller policy forge emits for scheduled emr-ec2 builds now also grants
   `elasticmapreduce:DescribeCluster`, `ListInstanceFleets` and `ListInstanceGroups` on the
   cluster.
+- **The generated GitLab pipeline hands each job exactly what the last one produced.**
+  `fluid generate ci --system gitlab` now writes:
+  - **Run pipeline form:** the form is `spec:inputs` (GitLab 17.11 or later). It holds the 11
+    stage switches and nine knobs: `FLUID_ENV`, `APPLY_MODE`, `ALLOW_DATA_LOSS`,
+    `NO_VERIFY_DIGEST`, the two strict switches, `PUBLISH_TARGETS`, `SCHEDULER` and
+    `SCHEDULE_SYNC_DRY_RUN`. That is GitLab's limit of 20. Each input sets the job variable of
+    the same name and is never pasted into a script. Every other value is a plain default
+    that a project CI/CD variable sets, and the form needs no pipeline variables.
+  - **Release packet:** on the default branch, `fluid-plan` runs `fluid ship --stage 1-6
+    --release-dir release`. `fluid-apply` downloads that job's artifacts (`needs` and
+    `dependencies`) and does not start without `release/release.json`. On the default
+    branch, stages 1-4 must run and `release/` must not be in the repository: otherwise ship
+    refuses the packet and the plan fails with its reason.
+  - **Merge requests:** a merge request plans without a packet and never gets an apply job,
+    and neither does any other ref. `fluid-impact` publishes `fluid diff --baseline --impact`
+    of the contract against the merge request's base as Markdown and JSON (`expose_as: fluid
+    impact`), beside ship's JUnit report. Its resource section reads `unknown`, with the reason,
+    while ship's stage 6 saves no OpenTofu plan.
+  - **Free-text inputs:** `fluid_env` follows ship's environment grammar and `publish_targets`
+    takes target names only, so an input cannot name another variable for GitLab to expand.
+  - **Failed plans:** a `fluid-plan` that fails keeps its reports and drops its bundle, plan,
+    OpenTofu plan files and artifacts before they are uploaded, so nothing a failed run wrote
+    reads as deployable.
 
 - **A BigQuery table is partitioned and clustered as its binding declares.**
   `binding.location.partitionBy` was read only with `lifecycle.expire`, and
@@ -199,6 +249,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another build's DAG would otherwise run twice). `fluid validate` warns about an Airflow
   task's `buildStepRef`: no generated DAG runs one.
 
+- **Which declared rules each engine can run, and rules that must run.** `fluid generate
+  dbt-tests --coverage` prints, for every declared invariant, identifier format, placeholder
+  declaration and shared attribute, whether DuckDB, Snowflake, BigQuery, Databricks, PostgreSQL
+  and Athena can run it, and the reason where one cannot (the validator refuses it, a construct
+  has no exact SQL, a link crosses platforms); `--coverage-out PATH` writes the same as JSON.
+  `--require-rule ID` (repeatable) or `--require-all-rules` makes generation fail, writing
+  no tests, when a selected adapter cannot run a required rule, when nothing tests a rule named
+  by id, or when the contract declares rules below 0.7.7, where they do not run; `--adapter TYPE` selects the
+  adapters (default: those of the platforms the contract's exposes bind to).
+- **A Databricks dbt job tests the declared rules too.** `fluid apply` adds each declared rule on
+  an expose the build writes to the uploaded project as a singular test,
+  `<test path>/fluid_dq/<model>/fluid_dq_<id>.sql`, in Databricks SQL printed from the parsed
+  expression, and the run report names it with what dbt found. A rule with no exact Databricks
+  SQL, or one that reads an expose the build does not write, is refused at plan, like any other
+  contract rule the job cannot run.
+
 - **`fluid generate dbt-tests` runs declared invariants as dbt tests.** On a 0.7.7 contract each
   declared invariant, identifier format, bounded placeholder declaration, shared column and
   shared attribute becomes one `fluid_rule` generic test on its model, and the `fluid_rule`
@@ -299,16 +365,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **A test run installs each OpenTofu provider once, and passing tests clean up after
-  themselves.** The tests that run `tofu init` put a copy of the provider into every test's
-  own directory (0.75 GB for `hashicorp/aws`, downloaded each time), so one run of `tests/iac`
-  wrote 15-31 GB into pytest's basetemp. A run now shares one provider cache between all its
-  workers (`tests/_infrastructure/tofu_cache.py`): a test directory holds a symlink, and
-  `TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE` is set because without a lock file OpenTofu
-  downloads a cached provider again on every `init`. A `TF_PLUGIN_CACHE_DIR` you set is used as
-  given, which keeps providers between runs. `tmp_path_retention_policy = "failed"` removes a
-  passing test's directory when the test ends; a failed test keeps its own. Test
-  infrastructure only: the product is unchanged.
+- **A test run installs each OpenTofu provider once.** The tests that run `tofu init` put a
+  copy of the provider into every test's own directory (0.75 GB for `hashicorp/aws`,
+  downloaded each time), so one run of `tests/iac` wrote 15-31 GB into pytest's basetemp
+  (27.6 GiB measured). A run now shares one provider cache between all its workers
+  (`tests/_infrastructure/tofu_cache.py`): a test directory holds a symlink, the whole basetemp
+  is 1 GiB, and `TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE` is set because without a lock
+  file OpenTofu downloads a cached provider again on every `init`. A `TF_PLUGIN_CACHE_DIR` you
+  set is used as given, which keeps providers between runs. Test infrastructure only: the
+  product is unchanged.
 
 - **`ship-report.json` is versioned: `"schema": "fluid-ship-report/2"`.** Every stage has one
   of six statuses: `passed`, `failed`, `skipped-by-policy` (a flag, a `RUN_STAGE_*` switch or
@@ -342,6 +407,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes changes.
 
 ### Fixed
+
+- **`fluid generate ci` runs stage 3 for a contract with reference builds.** It turned
+  `RUN_STAGE_3_GENERATE_ARTIFACTS` off when any build was `hybrid-reference`, `reference` or
+  `external-reference`, so a contract with Spark builds beside one reference dbt build skipped
+  stage 4 and ran stages 8 and 11 without `dist/artifacts/policy/bindings.json` and
+  `dist/artifacts/schedule/`. `fluid generate artifacts` writes both for reference builds too,
+  so only `--no-generate-artifacts` turns stage 3 off now.
+- **`--install-mode dev-source` puts `fluid` on PATH.** On GitHub, GitLab, Azure DevOps,
+  Bitbucket, CircleCI and Tekton the install step exported `PYTHONPATH=/forge-cli-src`, which
+  ended with the step or subshell and never provided the command, so every `fluid ship` step
+  failed with "command not found". It now runs `pip install -e /forge-cli-src`, and a missing
+  mount or a failed install stops the job. Jenkins is unchanged.
+- **Generated pipelines pin their container images by digest.** Tekton, GitLab (both images),
+  Bitbucket and CircleCI named `python:3.12-slim`, `python:3.12` and `cimg/python:3.12` by tag;
+  each is now `<tag>@sha256:<index digest>`, kept beside the GitHub action pins and checked by
+  the same monthly job. `fluid generate ci --system tekton --image IMAGE` sets the Task image.
 
 - **`fluid validate` stops warning about a Spark or managed Flink build's own SQL once the
   operator lists it.** The warning that `properties.sql` runs only if the operator lists the

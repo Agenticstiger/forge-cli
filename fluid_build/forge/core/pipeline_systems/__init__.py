@@ -18,6 +18,7 @@ from typing import Dict, Tuple
 
 from ._base import (
     PINNED_ACTIONS,
+    PINNED_IMAGES,
     BasePipelineTemplate,
     PipelineConfig,
     PipelineProvider,
@@ -56,6 +57,7 @@ def generate_pipeline_template(
 __all__ = [
     "BasePipelineTemplate",
     "PINNED_ACTIONS",
+    "PINNED_IMAGES",
     "PipelineConfig",
     "PipelineProvider",
     "PipelineTemplateGenerator",
