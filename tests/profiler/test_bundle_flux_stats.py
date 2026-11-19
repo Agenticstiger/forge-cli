@@ -34,7 +34,7 @@ from flux_stats.fidelity import expose_from_contract, parse_fidelity_block  # no
 from flux_stats.profile import load_profile_text  # noqa: E402
 
 from fluid_build.cli import main  # noqa: E402
-from fluid_build.profiler import _stats, bundle, disclosure, runner  # noqa: E402
+from fluid_build.profiler import _stats, bundle, disclosure, document  # noqa: E402
 from fluid_build.profiler._stats import DeclaredStatistic  # noqa: E402
 from fluid_build.profiler.runner import ProfileError, profile_expose  # noqa: E402
 from tests.profiler.test_flux_stats_backend import _slice  # noqa: E402
@@ -147,7 +147,7 @@ def _profile(
 ):
     chosen = properties if properties is not None else PROPERTIES
     directory = _bundle(tmp_path, chosen, bits, market_null)
-    block = bundle.read_bundle_block(directory, EXPOSE)
+    block = bundle.read_bundle_block(directory, EXPOSE, _stats.load_backend())
     return profile_expose(
         CONTRACT,
         EXPOSE,
@@ -215,11 +215,13 @@ def test_the_document_answers_every_declared_property(tmp_path):
     levels = _entry(result, "market", "levelHistogram/1")
     assert levels["levels"] == ["DE", "FR", "GB", "IE"]
     (level_group,) = levels["groups"]
-    # DE is declared and no record holds it: a zero cell is withheld, the rest are published.
-    # A histogram's withheld cell is written C, whatever withheld it; the result keeps why.
-    assert level_group["levelCounts"] == [None, 40, 40, 40]
-    assert level_group["cellStatus"] == ["C", "F", "F", "F"]
-    assert result.withheld_cells == {"A": 1}
+    # DE is declared and no record holds it: a zero cell is withheld, and with the column's
+    # count known, the three others would give it back, so FR is withheld with it (a formed
+    # zero is protected). A histogram's withheld cell is written C, whatever withheld it;
+    # the result keeps why: DE is small, FR is secondary.
+    assert level_group["levelCounts"] == [None, None, 40, 40]
+    assert level_group["cellStatus"] == ["C", "C", "F", "F"]
+    assert result.withheld_cells == {"A": 1, "D": 1}
     assert _entry(result, "market", "support/1")["groups"][0]["support"] == ["FR", "GB", "IE"]
 
 
@@ -400,29 +402,200 @@ def test_a_group_withheld_for_its_size_withholds_its_siblings_in_a_grouped_quant
     assert result.withheld["D"] == 3
 
 
-@pytest.mark.parametrize("kind", ["marginalHistogram", "levelHistogram", "quantile"])
-def test_the_sibling_rule_reaches_every_histogram_and_quantile_of_the_column(kind):
-    # A level histogram needs a second categorical column to be grouped by, which this
-    # module's contract lacks, so the rule is checked on its own.
-    passed = disclosure.PUBLISHED
-    beside = runner._Beside(crowded=frozenset(), small=frozenset({("market", "tier")}))
+@pytest.mark.parametrize(
+    "grouped",
+    [
+        pytest.param({**PROPERTIES[2], "groupBy": "market"}, id="marginalHistogram"),
+        pytest.param(
+            {**PROPERTIES[5], "groupBy": "market", "bins": ["0", "50", "100"]}, id="quantile-2"
+        ),
+    ],
+)
+def test_a_small_group_withholds_every_group_of_its_groupby_in_each_statistic(tmp_path, grouped):
+    rows = _rows()
+    for row in rows[:3]:
+        row["market"] = "DE"  # a group of three records
+    result = _profile(tmp_path, rows, [grouped])
+    (entry,) = [e for e in _entries(result, "amount") if e.get("groupBy") == "market"]
+    assert {g["status"] for g in entry["groups"]} == {"C"}
+    assert all(set(g) == {"group", "status"} for g in entry["groups"])
 
-    def declared(kind: str, column: str) -> DeclaredStatistic:
-        return DeclaredStatistic(
-            identifier=f"{kind}/1",
-            kind=kind,
-            column=column,
-            group_by="tier",
-            shape={},
-            columns=(column, "tier"),
-            read_as={},
-        )
 
-    withheld = runner._withheld_beside(declared(kind, "market"), [passed, passed], beside)
-    assert [verdict.status for verdict in withheld] == ["D", "D"]
-    # The same groupBy on another column, and a mean, are left to their own checks.
-    assert runner._withheld_beside(declared(kind, "channel"), [passed], beside) == [passed]
-    assert runner._withheld_beside(declared("mean", "market"), [passed], beside) == [passed]
+def _row(amount: str, market: str = "IE") -> Dict[str, Any]:
+    return {"amount": amount, "market": market, "qty": "1"}
+
+
+def _histogram(bins: List[str], column: str = "amount", **more: Any) -> Dict[str, Any]:
+    return {
+        "property": "marginalHistogram",
+        "column": column,
+        "bins": bins,
+        "tolerance": _DISTANCE,
+        **more,
+    }
+
+
+def _histograms(result, column: str = "amount") -> List[Dict[str, Any]]:
+    return [e for e in _entries(result, column) if e["definition"] == "marginalHistogram/1"]
+
+
+def test_a_histogram_and_a_coarser_one_of_a_column_give_no_withheld_cell_back(tmp_path):
+    # Fine cells of 30, 5, 40 and 45 records: the 5 is small, and the coarse cell of 35 beside
+    # the 30 would give it back by subtraction. Neither histogram is checked alone.
+    rows = [_row("10")] * 30 + [_row("30")] * 5 + [_row("60")] * 40 + [_row("80")] * 45
+    fine = _histogram(["0", "25", "50", "75", "100"])
+    coarse = _histogram(["0", "50", "100"])
+    result = _profile(tmp_path, rows, [fine, coarse])
+    fine_group, coarse_group = (histogram["groups"][0] for histogram in _histograms(result))
+    # A group whose every cell is withheld is withheld whole, with no cells written.
+    fine_cells = fine_group.get("binCounts", [None] * 4)
+    coarse_cells = coarse_group.get("binCounts", [None] * 2)
+    assert fine_cells[1] is None  # the 5 itself
+    for cell, inside in ((0, fine_cells[:2]), (1, fine_cells[2:])):
+        if coarse_cells[cell] is not None:
+            # A published coarse cell with exactly one withheld cell inside it gives that cell back.
+            assert sum(count is None for count in inside) != 1
+    published = [count for count in fine_cells + coarse_cells if count is not None]
+    assert 5 not in published and 35 not in published
+    withheld = [count is None for count in fine_cells]
+    assert sum(withheld) >= 2  # a single withheld cell is the total less the published ones
+    assert result.withheld_cells["D"] >= 1  # more than the small cell itself was withheld
+    load_profile_text(result.canonical.decode("utf-8"))
+
+
+def test_a_level_histogram_with_one_small_level_withholds_a_neighbour(tmp_path):
+    # Levels DE, FR, GB, IE hold 5, 25, 40 and 50 records. The 5 is small, and the column's
+    # count less the three published levels is exactly that 5: another level goes with it.
+    rows = (
+        [_row("10", "IE")] * 50
+        + [_row("10", "GB")] * 40
+        + [_row("10", "FR")] * 25
+        + [_row("10", "DE")] * 5
+    )
+    result = _profile(tmp_path, rows, [PROPERTIES[3]])
+    (group,) = _entry(result, "market", "levelHistogram/1")["groups"]
+    assert group["cellStatus"][0] == "C"  # DE, the small level
+    assert group["cellStatus"].count("C") == 2
+    assert group["levelCounts"][0] is None and None in group["levelCounts"][1:]
+    assert result.withheld_cells == {"A": 1, "D": 1}
+
+
+def test_a_formed_zero_is_protected_under_the_default_rule(tmp_path):
+    # Cells of 12, 0 and 12 records: the zero is withheld (ACRO's default holds zeros
+    # disclosive), and the column's 24 less the two published 12s would give it back.
+    rows = [_row("5")] * 12 + [_row("25")] * 12
+    result = _profile(tmp_path, rows, [_histogram(["0", "10", "20", "100"])])
+    (group,) = _histograms(result)[0]["groups"]
+    assert group["cellStatus"][1] == "C" and group["binCounts"][1] is None
+    assert group["cellStatus"].count("C") == 2
+    assert group["binCounts"][0] == 10 or group["binCounts"][2] == 10  # the 12 left, rounded
+    assert result.withheld_cells == {"A": 1, "D": 1}
+
+
+def test_a_formed_zero_is_published_where_the_rule_holds_zeros_safe(tmp_path):
+    from dataclasses import replace
+
+    rule = replace(disclosure.ACRO_DEFAULT, name="zeros-safe", zeros_disclosive=False)
+    directory = _bundle(tmp_path, [_histogram(["0", "10", "20", "100"])])
+    block = bundle.read_bundle_block(directory, EXPOSE, _stats.load_backend())
+    rows = [_row("5")] * 12 + [_row("25")] * 12
+    result = profile_expose(
+        CONTRACT,
+        EXPOSE,
+        source=_slice(tmp_path, rows),
+        backend=_stats.load_backend(),
+        cwd=tmp_path,
+        bundle=block,
+        rule=rule,
+    )
+    (group,) = _histograms(result)[0]["groups"]
+    assert group["binCounts"] == [10, 0, 10] and "cellStatus" not in group
+
+
+def test_a_quantile_with_bins_is_written_as_quantile_2(tmp_path):
+    binned = {**PROPERTIES[5], "bins": ["0", "50", "100"]}
+    result = _profile(tmp_path, _rows(), [binned])
+    entry = _entry(result, "amount", "quantile/2")
+    assert entry["level"] == "0.5" and entry["bins"] == ["0", "50", "100"]
+    # 120 records, the median is the 60th, a 40: in the first bin, with 72 records through it
+    # (rounded to 70), none below it, and 48 above it.
+    assert entry["groups"] == [
+        {"group": "", "k": 120, "quantileBin": 0, "binBelow": 0, "binThrough": 70, "status": "F"}
+    ]
+    assert "quantileWitness" not in json.dumps(entry)
+    assert result.document["_schemaURL"] == document.SCHEMA_URL_1_1_0
+    profile, _ = load_profile_text(result.canonical.decode("utf-8"))
+    (read,) = [
+        e for e in profile.column_statistics(EXPOSE, "amount") if e.identifier == "quantile/2"
+    ]
+    assert read.bins == (Fraction(0), Fraction(50), Fraction(100))
+    assert read.level == Fraction(1, 2)
+    (group,) = read.groups
+    assert group.published and group.statistic.quantile_bin == 0
+    assert (group.statistic.bin_below, group.statistic.bin_through) == (0, 70)
+    assert result.statistics.count(
+        ("amount", "quantile/2", None, "at level 0.5 over bins 0, 50, 100")
+    )
+
+
+def test_the_engines_matcher_finds_a_quantile_with_bins(tmp_path):
+    binned = {**PROPERTIES[5], "bins": ["0", "50", "100"]}
+    result = _profile(tmp_path, _rows(), [binned])
+    profile, _ = load_profile_text(result.canonical.decode("utf-8"))
+    expose = expose_from_contract(CONTRACT, EXPOSE)
+    parsed = parse_fidelity_block(_block([binned]), expose=expose)
+    from flux_stats.fidelity import definition_for_property
+
+    (declaration,) = parsed.properties
+    found = [
+        entry
+        for entry in profile.column_statistics(EXPOSE, "amount")
+        if entry.identifier == definition_for_property(declaration).identifier
+        and entry.bins == declaration.bins
+        and entry.level == declaration.level
+    ]
+    assert len(found) == 1
+
+
+def test_a_profile_without_a_quantile_with_bins_keeps_format_1_0_0(tmp_path):
+    result = _profile(tmp_path, _rows())
+    assert result.document["_schemaURL"] == document.SCHEMA_URL
+    assert "quantile/2" not in result.canonical.decode("utf-8")
+
+
+def test_a_quantile_with_bins_beside_a_histogram_on_its_partition_is_published(tmp_path):
+    # The bins of the quantile are the histogram's: one partition, so it is not withheld
+    # for standing beside another count at the column's edges, as a quantile/1 is.
+    binned = {**PROPERTIES[5], "bins": ["0", "50", "100"]}
+    result = _profile(tmp_path, _rows(), [PROPERTIES[2], binned])
+    (group,) = _entry(result, "amount", "quantile/2")["groups"]
+    assert group["status"] == "F"
+    assert _histograms(result)[0]["groups"][0]["status"] == "F"
+
+
+def test_rows_no_group_holds_are_one_more_group_the_check_counts_and_never_writes(tmp_path):
+    rows = _rows()
+    for row in rows[:15]:
+        row["market"] = None  # fifteen records in no group, and in the column's count
+    by_market = {**PROPERTIES[2], "groupBy": "market"}
+    result = _profile(tmp_path, rows, [by_market], market_null="exclude")
+    grouped = _entry(result, "amount", "marginalHistogram/1", "market")
+    assert [g["group"] for g in grouped["groups"]] == ["FR", "GB", "IE"]
+    assert {g["status"] for g in grouped["groups"]} == {"F"}
+    assert b"\\u0000" not in result.canonical and b"\x00" not in result.canonical
+
+
+def test_a_refusal_of_the_counts_by_the_output_check_stops_the_profile_naming_no_value(
+    tmp_path, monkeypatch
+):
+    def refuse(self, statistics, **_kwargs):
+        raise ValueError("the groups of 'market' do not add up to the column's total")
+
+    monkeypatch.setattr(_stats._FluxStatsBackend, "check_edge_counts", refuse)
+    with pytest.raises(ProfileError) as refused:
+        _profile(tmp_path, _rows(), [PROPERTIES[2]])
+    assert refused.value.event == "profile_edge_counts_refused"
+    assert "column 'amount'" in str(refused.value)
 
 
 def test_a_quantile_beside_a_histogram_of_another_column_is_published(tmp_path):
@@ -434,6 +607,8 @@ def test_a_quantile_beside_a_histogram_of_another_column_is_published(tmp_path):
 
 def test_a_small_group_of_one_column_leaves_another_columns_groups_published(tmp_path):
     rows = _rows()
+    for index, row in enumerate(rows):
+        row["qty"] = "60" if index % 2 else "10"  # each group of qty fills both bins
     for index, row in enumerate(rows[:15]):
         row["market"] = "DE"
         if index < 12:
@@ -446,7 +621,10 @@ def test_a_small_group_of_one_column_leaves_another_columns_groups_published(tmp
     amount = _entry(result, "amount", "marginalHistogram/1", "market")
     assert {g["status"] for g in amount["groups"]} == {"C"}
     qty = _entry(result, "qty", "marginalHistogram/1", "market")
-    assert {g["status"] for g in qty["groups"]} == {"F"}
+    statuses = {g["group"]: g["status"] for g in qty["groups"]}
+    # DE's 15 records split 8 and 7, so both its cells are small and it is withheld whole;
+    # the other markets' groups of qty are published, whatever amount's small group did.
+    assert statuses == {"DE": "C", "FR": "F", "GB": "F", "IE": "F"}
 
 
 def test_rows_no_group_holds_that_the_block_refuses_withhold_a_grouped_histogram(tmp_path):
@@ -538,7 +716,7 @@ def test_two_quantiles_of_one_column_are_named_apart_by_level(tmp_path):
     assert shapes == {"at level 0.5", "at level 0.25"}
 
 
-def test_a_zero_cell_is_withheld_and_the_group_published(tmp_path):
+def test_a_zero_cell_is_withheld_with_the_cell_that_gives_it_back(tmp_path):
     rows = [{"amount": "10", "market": "IE", "qty": "1"} for _ in range(120)]
     properties = [
         {
@@ -550,8 +728,11 @@ def test_a_zero_cell_is_withheld_and_the_group_published(tmp_path):
     ]
     result = _profile(tmp_path, rows, properties)
     (group,) = _entry(result, "amount", "marginalHistogram/1")["groups"]
-    assert group["binCounts"] == [None, 120] and group["cellStatus"] == ["C", "F"]
-    assert result.withheld_cells == {"A": 1}
+    # The zero cell is withheld, and the 120 beside it would give it back: it goes too,
+    # and a group with no cell left says nothing, so it is withheld whole, as small.
+    assert group == {"group": "", "status": "C"}
+    assert result.withheld_cells == {}  # no cell of it is written
+    assert result.withheld["A"] >= 1  # the group, among the profile's withheld values
 
 
 def test_a_small_table_withholds_the_histogram_whole(tmp_path):
@@ -628,7 +809,7 @@ def test_a_value_outside_the_declared_range_is_refused(tmp_path):
 def test_a_block_the_grammar_refuses_is_refused_before_any_record_is_read(tmp_path):
     properties = [{"property": "mean", "column": "nope", "tolerance": _ABSOLUTE}]
     directory = _bundle(tmp_path, properties)
-    block = bundle.read_bundle_block(directory, EXPOSE)
+    block = bundle.read_bundle_block(directory, EXPOSE, _stats.load_backend())
     with pytest.raises(ProfileError) as refused:
         profile_expose(
             CONTRACT,
@@ -645,7 +826,7 @@ def test_a_declaration_over_the_wrong_domain_is_refused(tmp_path):
     contract = json.loads(json.dumps(CONTRACT))
     contract["exposes"][0]["contract"]["schema"][1]["type"] = "integer"  # market as a number
     directory = _bundle(tmp_path, [PROPERTIES[4]])
-    block = bundle.read_bundle_block(directory, EXPOSE)
+    block = bundle.read_bundle_block(directory, EXPOSE, _stats.load_backend())
     with pytest.raises(ProfileError) as refused:
         profile_expose(
             contract,
@@ -662,7 +843,7 @@ def test_a_declared_column_the_contract_types_unreadably_is_refused(tmp_path):
     contract = json.loads(json.dumps(CONTRACT))
     contract["exposes"][0]["contract"]["schema"][0]["type"] = "double"
     directory = _bundle(tmp_path, [PROPERTIES[0]])
-    block = bundle.read_bundle_block(directory, EXPOSE)
+    block = bundle.read_bundle_block(directory, EXPOSE, _stats.load_backend())
     with pytest.raises(ProfileError) as refused:
         profile_expose(
             contract,
@@ -677,19 +858,11 @@ def test_a_declared_column_the_contract_types_unreadably_is_refused(tmp_path):
 
 def test_the_seam_deduplicates_identical_properties(tmp_path):
     directory = _bundle(tmp_path, [PROPERTIES[0], PROPERTIES[0], PROPERTIES[6]])
-    block = bundle.read_bundle_block(directory, EXPOSE)
+    block = bundle.read_bundle_block(directory, EXPOSE, _stats.load_backend())
     declared = _stats.load_backend().read_block(block.raw, CONTRACT, EXPOSE)
     assert [s.description for s in declared.statistics] == ["mean/1 of 'amount'"]
     assert declared.columns == ("amount",)
     assert [name for name, _ in declared.left_out] == ["correlation of 'amount' and 'qty'"]
-
-
-def test_quantile_ranks_are_proved_by_the_registry(tmp_path):
-    backend = _stats.load_backend()
-    # 120 records, the median is the 60th: 48 strictly below, 72 at or below proves it.
-    assert backend.quantile_ranks_ok(120, Fraction(1, 2), 48, 72)
-    assert not backend.quantile_ranks_ok(120, Fraction(1, 2), 60, 70)
-    assert not backend.quantile_ranks_ok(120, Fraction(1, 2), 70, 45)  # not a sub-count
 
 
 def test_the_command_writes_the_document_and_names_what_it_answers(tmp_path, monkeypatch, capsys):
@@ -714,8 +887,12 @@ def test_the_command_writes_the_document_and_names_what_it_answers(tmp_path, mon
     assert "levelHistogram/1 of 'market'" in out and "quantile/1 of 'amount'" in out
     assert "Not answered: correlation of 'amount' and 'qty':" in out
     assert "a run that checks it is refused (FLX-5037)." in out
-    # The DE level holds no record: its cell is withheld, written C, and counted by its check.
-    assert "Withheld histogram cells, by the check (CL_CONF_STATUS code): A (small count) 1." in out
+    # The DE level holds no record: its cell is withheld, written C, and counted by its check,
+    # and FR goes with it so that the count cannot be given back.
+    assert (
+        "Withheld histogram cells, by the check (CL_CONF_STATUS code): "
+        "A (small count) 1, D (secondary suppression) 1." in out
+    )
     assert _ONE_CODE in out
     written = (tmp_path / "payment.profile.json").read_bytes()
     load_profile_text(written.decode("utf-8"))
@@ -777,7 +954,7 @@ def test_a_flux_stats_without_the_grammar_refuses_before_reading(tmp_path, monke
     assert rc == 1
     assert "profile_statistics_unavailable" in out
     assert "reads the fidelity block with flux-stats, and the installed flux-stats" in out
-    assert "lacks flux_stats.fidelity. It needs flux-stats>=0.6.2,<0.7" in out
+    assert "lacks flux_stats.fidelity. It needs flux-stats[yaml]>=0.7.0,<0.8" in out
     assert "next: pip install 'data-product-forge[profile]'" in out
 
 
@@ -790,7 +967,7 @@ def test_a_block_written_with_bare_null_keys_and_bare_floats_profiles_as_the_quo
     text = path.read_text(encoding="utf-8")
     assert "'null':" in text and "level: '0.5'" in text
     path.write_text(text.replace("'null':", "null:").replace("level: '0.5'", "level: 0.5"))
-    block = bundle.read_bundle_block(directory, EXPOSE)
+    block = bundle.read_bundle_block(directory, EXPOSE, _stats.load_backend())
     assert block.raw["columns"]["market"]["null"] == "fail"
     bare = profile_expose(
         CONTRACT,
@@ -838,32 +1015,32 @@ def test_the_report_names_the_statistics_written_with_every_group_withheld(
 def _partly_rows() -> List[Dict[str, Any]]:
     rows = _rows()
     for row in rows[:12]:
-        # Twelve records, 8 and 4 in the two bins: every cell is small, so the group is
-        # withheld, and its size is not, so the other groups are published.
+        # Twelve records in one group, 8 and 4 in the two bins: the cell that holds the
+        # median is small, so that group is withheld, and its size is not, so the other
+        # groups are published.
         row["market"] = "DE"
     return rows
 
 
 _PARTLY_PROPERTIES = [
     {
-        "property": "marginalHistogram",
+        "property": "quantile",
         "column": "amount",
         "groupBy": "market",
+        "level": "0.5",
         "bins": ["0", "50", "100"],
-        "tolerance": _DISTANCE,
+        "tolerance": _ABSOLUTE,
     }
 ]
 
 
 def test_a_statistic_with_some_groups_withheld_is_named_with_its_counts(tmp_path):
     result = _profile(tmp_path, _partly_rows(), _PARTLY_PROPERTIES)
-    statuses = [
-        g["status"] for g in _entry(result, "amount", "marginalHistogram/1", "market")["groups"]
-    ]
+    statuses = [g["status"] for g in _entry(result, "amount", "quantile/2", "market")["groups"]]
     published = statuses.count("F")
     assert 0 < published < len(statuses)
     assert set(statuses) == {"F", "C"}
-    named = ("amount", "marginalHistogram/1", "market", "over bins 0, 50, 100")
+    named = ("amount", "quantile/2", "market", "at level 0.5 over bins 0, 50, 100")
     assert result.partly_withheld_statistics == ((*named, published, len(statuses)),)
     assert named not in result.statistics
     assert named not in result.withheld_statistics
@@ -888,7 +1065,8 @@ def test_the_report_names_the_statistics_withheld_in_part(tmp_path, monkeypatch,
     assert rc == 0, out
     assert (
         "Partly withheld, so a run that checks them scores only the published groups: "
-        "marginalHistogram/1 of 'amount' over bins 0, 50, 100 by 'market' (3 of 4 groups)." in out
+        "quantile/2 of 'amount' at level 0.5 over bins 0, 50, 100 by 'market' "
+        "(3 of 4 groups)." in out
     )
     assert _ONE_CODE in out and "Withheld histogram cells" not in out
 
@@ -943,3 +1121,69 @@ def test_a_report_with_no_withheld_histogram_value_says_nothing_of_c(tmp_path, m
     out = " ".join(capsys.readouterr().out.split())
     assert rc == 0, out
     assert _ONE_CODE not in out and "Withheld histogram cells" not in out
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        {
+            "property": "marginalHistogram",
+            "bins": ["0", "0.4", "0.6", "100"],
+            "tolerance": _DISTANCE,
+        },
+        {"property": "quantile", "level": "0.5", "bins": ["0", "0.4", "0.6", "100"]},
+    ],
+    ids=["histogram", "quantile"],
+)
+def test_bins_that_are_no_grid_points_are_refused_before_any_record_is_read(tmp_path, declared):
+    # At fractionalBits 0 the edges 0.4 and 0.6 are no grid points, and both fall to the
+    # grid point 0: the fidelity check could not bin a record on them (FLX-5004), and the
+    # output check would have no partition to read. The block is refused as the check
+    # refuses it, naming the property and the edge, never a value.
+    prop = {"column": "amount", "tolerance": _ABSOLUTE, **declared}
+    directory = _bundle(tmp_path, [prop], bits=0)
+    block = bundle.read_bundle_block(directory, EXPOSE, _stats.load_backend())
+    with pytest.raises(ProfileError) as refused:
+        profile_expose(
+            CONTRACT,
+            EXPOSE,
+            source=str(tmp_path / "missing.ndjson"),  # never read
+            backend=_stats.load_backend(),
+            cwd=tmp_path,
+            bundle=block,
+        )
+    assert refused.value.event == "profile_bundle_block_refused"
+    said = str(refused.value)
+    assert "FLX-5004" in said and "properties[0]" in said and "bins[1]" in said
+    assert "0.4" not in said
+
+
+def test_a_histogram_group_with_no_cell_left_is_withheld_whole(tmp_path):
+    # DE's 12 records fall 8 and 4 in the two bins, so both its cells are small. A group
+    # with no cell left says nothing but its size, so it is withheld whole, as a group
+    # whose every cell is withheld always was, and the histogram is named as withheld in
+    # part, not as answered.
+    histogram = _histogram(["0", "50", "100"], groupBy="market")
+    result = _profile(tmp_path, _partly_rows(), [histogram])
+    entry = _entry(result, "amount", "marginalHistogram/1", "market")
+    groups = {group["group"]: group for group in entry["groups"]}
+    assert groups["DE"] == {"group": "DE", "status": "C"}
+    assert {key for key, group in groups.items() if group["status"] == "F"} == {"FR", "GB", "IE"}
+    (named,) = [one for one in result.partly_withheld_statistics if one[1] == "marginalHistogram/1"]
+    assert named[-2:] == (3, 4)
+    load_profile_text(result.canonical.decode("utf-8"))
+
+
+def test_a_refusal_inside_the_output_check_names_only_its_code(tmp_path, monkeypatch):
+    # The registry's words for a refusal may give counts, so the profile says its code.
+    from flux_stats import edge_counts, fixedpoint
+    from flux_stats.errors import FluxError
+
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise FluxError(fixedpoint.FLX_5004, "witness ranks 3/7 are not a sub-count of 9")
+
+    monkeypatch.setattr(edge_counts, "check_edge_counts", refuse)
+    with pytest.raises(ProfileError) as refused:
+        _profile(tmp_path, _rows(), [_histogram(["0", "50", "100"])])
+    said = str(refused.value)
+    assert "FLX-5004" in said and "3/7" not in said and "9" not in said.split("FLX-5004")[-1]

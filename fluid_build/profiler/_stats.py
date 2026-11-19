@@ -52,9 +52,12 @@ from typing import (
 
 __all__ = [
     "BlockRefused",
+    "BundleTextRefused",
     "DeclaredBlock",
     "DeclaredStatistic",
     "DocumentRefused",
+    "EdgeDecision",
+    "EdgeStatistic",
     "MeasureRefused",
     "MeasuredGroup",
     "MeasuredStatistic",
@@ -63,6 +66,7 @@ __all__ = [
     "StatisticDefinition",
     "StatisticsBackend",
     "StatisticsUnavailable",
+    "WITHHELD_ROUNDING",
     "load_backend",
 ]
 
@@ -87,6 +91,10 @@ class DocumentRefused(ValueError):
     """
 
 
+#: The canonical form's refusal of two source keys that read as one key.
+_KEY_COLLISION = "FLX-1007"
+
+
 class BlockRefused(ValueError):
     """The registry's parser refused the fidelity block a Simulation declares.
 
@@ -96,6 +104,18 @@ class BlockRefused(ValueError):
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(f"{code}: {message}")
+        self.code = code
+
+
+class BundleTextRefused(ValueError):
+    """The registry's exact-YAML reader or canonical form refused a bundle's text.
+
+    The message names the file and, where the registry gives one, the line and
+    column, with the registry's ``FLX-nnnn`` code. It never quotes a value.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{message} ({code})")
         self.code = code
 
 
@@ -119,8 +139,10 @@ class DeclaredStatistic:
     ``shape`` holds the document keys that say which statistic it is beyond its
     definition and column: ``{"bins": [...]}`` (the declared edges, as decimal
     strings), ``{"levels": [...]}`` (the declared levels in cell order),
-    ``{"level": "0.5"}`` or nothing. ``columns`` is every column it reads, the
-    ``groupBy`` column included, and ``read_as`` the domain each is read in.
+    ``{"level": "0.5"}`` (and ``bins`` too, for a ``quantile/2``) or nothing.
+    ``columns`` is every column it reads, the ``groupBy`` column included, and
+    ``read_as`` the domain each is read in. ``edges`` are the declared bins
+    placed on the grid, for a histogram and a ``quantile/2``.
     """
 
     identifier: str
@@ -130,6 +152,7 @@ class DeclaredStatistic:
     shape: Mapping[str, Any]
     columns: Tuple[str, ...]
     read_as: Mapping[str, str]
+    edges: Tuple[int, ...] = ()
     #: The registry's parsed declaration; only the registry's own seam reads it.
     _declaration: Any = field(default=None, repr=False, compare=False)
 
@@ -167,13 +190,16 @@ class MeasuredGroup:
     statistic's quantities), with every count exact and no ``status``. The other
     fields hold what the disclosure rules read: ``cells`` (a histogram's bin or
     level counts), ``member_holders`` (the records each member of a support is
-    held by), ``quantile`` (witness, records strictly below it, records at or
-    below it) and, for a mean, the group's exact values and their grid points.
+    held by), ``quantile`` (a ``quantile/1``'s witness, records strictly below
+    it, records at or below it) and, for a mean, the group's exact values and
+    their grid points. ``statistic`` is the registry's measured group, which the
+    check for counts at edges (:meth:`StatisticsBackend.check_edge_counts`) reads.
     """
 
     key: str
     document: Dict[str, Any]
     k: int
+    statistic: Any = field(default=None, repr=False, compare=False)
     cells: Tuple[int, ...] = ()
     member_holders: Tuple[int, ...] = ()
     quantile: Optional[Tuple[Optional[int], int, int]] = None
@@ -196,6 +222,56 @@ class MeasuredStatistic:
     groups: Tuple[MeasuredGroup, ...]
     left_out: Optional[MeasuredGroup] = None
     left_out_unread: bool = False
+
+
+#: Why a count is withheld for its rounding, in the registry's own word
+#: (``flux_stats.edge_counts.ROUNDING``; a test keeps the two equal). A caller
+#: gives it as the status of a group or cell the profiler's own rounding withheld.
+WITHHELD_ROUNDING = "rounding"
+
+
+@dataclass(frozen=True)
+class EdgeStatistic:
+    """One statistic of a column that counts records between edges, as measured.
+
+    ``identifier`` is the definition's (``marginalHistogram/1``, ``levelHistogram/1``,
+    ``quantile/1`` or ``quantile/2``). ``edges`` are the encoded bin edges of a
+    histogram or a ``quantile/2``, ``levels`` a level histogram's declared levels,
+    ``groups`` the registry's measured groups (:attr:`MeasuredGroup.statistic`) and
+    ``left_out`` the rows a ``groupBy`` null leaves out of every group, measured as one
+    more group that is checked and never written. ``group_status`` and ``cell_status``
+    hold what the profiler's own checks already withheld, by group key and per cell:
+    ``F`` or :data:`WITHHELD_ROUNDING`.
+    """
+
+    identifier: str
+    edges: Tuple[int, ...]
+    levels: Tuple[str, ...]
+    groups: Tuple[Any, ...]
+    group_by: Optional[str] = None
+    level: Optional[Fraction] = None
+    left_out: Any = None
+    group_status: Mapping[str, str] = field(default_factory=dict)
+    cell_status: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EdgeDecision:
+    """What the check for counts at edges decided about one :class:`EdgeStatistic`.
+
+    ``group_status`` is ``F`` or ``C`` for each group key (the row left out is not
+    among them) and ``cell_status`` the same per cell of each published histogram
+    group. ``group_reason`` and ``cell_reason`` say why each withheld value is
+    withheld, in the registry's words, and are for the profiler's report alone.
+    ``rounded`` holds each published quantile group spelled as the profile writes
+    it, its counts already rounded.
+    """
+
+    group_status: Mapping[str, str]
+    cell_status: Mapping[str, Tuple[str, ...]]
+    group_reason: Mapping[str, str]
+    cell_reason: Mapping[str, Tuple[str, ...]]
+    rounded: Mapping[str, Dict[str, Any]]
 
 
 @runtime_checkable
@@ -300,8 +376,40 @@ class StatisticsBackend(Protocol):
         record the block's declaration refuses.
         """
 
-    def quantile_ranks_ok(self, k: int, level: Fraction, below: int, at_or_below: int) -> bool:
-        """Whether a witness with these ranks, over *k* records, is the *level* quantile."""
+    def check_edge_counts(
+        self,
+        statistics: Sequence[EdgeStatistic],
+        *,
+        total: int,
+        minimum_cell: int,
+        zeros_disclosive: bool,
+        round_count: Callable[[int], int],
+    ) -> Tuple[EdgeDecision, ...]:
+        """Apply the output check for counts at a column's edges to all its statistics at once.
+
+        *statistics* are every histogram and quantile of one column, in declaration
+        order, and *total* the column's non-null record count. The result holds one
+        decision for each. Raises :class:`ValueError` for counts that cannot describe
+        one set of records.
+        """
+
+    def read_budget(self) -> Any:
+        """A fresh budget for reading one bundle's documents, to share across its files."""
+
+    def read_documents(self, text: str, *, name: str, budget: Any) -> Tuple[Mapping[str, Any], ...]:
+        """Every mapping document in *text*, read as the FLUX engine reads a bundle.
+
+        A float is the decimal of its source text and a timestamp stays a string. The
+        read is bounded by *budget* (aliases, merge keys, digits, depth). Raises
+        :class:`BundleTextRefused` for text it refuses, naming *name*.
+        """
+
+    def canonicalise(self, value: Any, *, name: str) -> Any:
+        """*value* in the engine's canonical form (KERNEL-SPEC 2.1).
+
+        Every key is an NFC string, every string NFC, a decimal its string spelling.
+        Raises :class:`BundleTextRefused`, naming *name*, for a value with no canonical form.
+        """
 
 
 #: The most digits a number may need written out without an exponent: the
@@ -387,7 +495,7 @@ class _FluxStatsBackend:
     def __init__(self) -> None:
         # The package first: when it is missing, this is the import that fails,
         # even with one of its submodules still in sys.modules.
-        from flux_stats import Parameters, definitions, metrics
+        from flux_stats import Parameters, canonical, definitions, edge_counts, exact_yaml, metrics
         from flux_stats.errors import FluxError
         from flux_stats.fixedpoint import Grid
         from flux_stats.profile import load_profile_text
@@ -401,6 +509,9 @@ class _FluxStatsBackend:
         self._category = category
         self._read_exact = read_exact
         self._value_domain = ValueDomain
+        self._edge_counts = edge_counts
+        self._exact_yaml = exact_yaml
+        self._canonical = canonical
         self._columns: Dict[Tuple[str, str], _Column] = {}
         self._grammar: Any = None
 
@@ -439,6 +550,31 @@ class _FluxStatsBackend:
         # A timestamp reads as a whole number of milliseconds since the epoch.
         return int(exact) if domain == "timestamp" else exact
 
+    def read_budget(self) -> Any:
+        return self._exact_yaml.ReadBudget()
+
+    def read_documents(self, text: str, *, name: str, budget: Any) -> Tuple[Mapping[str, Any], ...]:
+        try:
+            documents: Tuple[Mapping[str, Any], ...] = self._exact_yaml.load_documents(
+                text, name=name, budget=budget
+            )
+        except self._refused as error:
+            raise BundleTextRefused(error.code.code, error.detail or error.code.title) from None
+        return documents
+
+    def canonicalise(self, value: Any, *, name: str) -> Any:
+        try:
+            return self._canonical.canonicalise(value)
+        except self._refused as error:
+            # FLX-1007 names the key two source keys read as, and a bundle key may
+            # hold anything, so only the code's title is said for it.
+            detail = (
+                error.code.title
+                if error.code.code == _KEY_COLLISION
+                else (error.detail or error.code.title)
+            )
+            raise BundleTextRefused(error.code.code, f"{name}: {detail}") from None
+
     def check_document(self, text: str) -> None:
         try:
             self._load_profile_text(text)
@@ -456,8 +592,8 @@ class _FluxStatsBackend:
                 # By name, so a flux-stats that lacks the module raises here.
                 fidelity = import_module("flux_stats.fidelity")
                 reading = import_module("flux_stats.reading")
-                from flux_stats.fixedpoint import quantile_rank_ok
-                from flux_stats.registry import definition_for_kind
+                fixedpoint = import_module("flux_stats.fixedpoint")
+                from flux_stats.registry import definition as definition_named
                 from flux_stats.spelling import render_exact
             except ImportError as error:
                 missing = error.name or "flux_stats.fidelity"
@@ -468,8 +604,8 @@ class _FluxStatsBackend:
             self._grammar = SimpleNamespace(
                 fidelity=fidelity,
                 reading=reading,
-                quantile_rank_ok=quantile_rank_ok,
-                definition_for_kind=definition_for_kind,
+                fixedpoint=fixedpoint,
+                definition_named=definition_named,
                 render_exact=render_exact,
             )
         return self._grammar
@@ -491,8 +627,10 @@ class _FluxStatsBackend:
         statistics: List[DeclaredStatistic] = []
         left_out: List[Tuple[str, str]] = []
         seen = set()
-        for declaration in parsed.properties:
+        for index, declaration in enumerate(parsed.properties):
             kind = declaration.kind.value
+            if declaration.bins:
+                self._refuse_off_grid_bins(grammar, parsed, index, declaration.bins)
             if kind == "correlation":
                 first, second = declaration.columns
                 left_out.append((f"correlation of {first!r} and {second!r}", _CORRELATION_LEFT_OUT))
@@ -514,6 +652,21 @@ class _FluxStatsBackend:
             _block=parsed,
         )
 
+    def _refuse_off_grid_bins(self, grammar: Any, parsed: Any, index: int, bins: Any) -> None:
+        """Refuse bins the fidelity check could not compare, before a record is read.
+
+        The check bins a record exactly only where every edge is a grid point and the
+        edges strictly increase, and refuses any other (``FLX-5004``), so the profile
+        applies the registry's own rule. Edges that fall to one grid point would also
+        leave the output check over a column with no partition to read. The message
+        names the property and the edge's place, never a value.
+        """
+        try:
+            grammar.fixedpoint.epsilon_marginal_histogram(parsed.grid, bins)
+        except self._refused as error:
+            detail = error.detail or error.code.title
+            raise BlockRefused(error.code.code, f"properties[{index}]: {detail}") from None
+
     @staticmethod
     def _declared(grammar: Any, parsed: Any, declaration: Any) -> DeclaredStatistic:
         """One property of the parsed block as the statistic a profile carries for it."""
@@ -521,6 +674,7 @@ class _FluxStatsBackend:
         column: str = declaration.columns[0]
         group_by: Optional[str] = declaration.group_by
         shape: Dict[str, Any] = {}
+        edges: Tuple[int, ...] = ()
         categorical = kind in ("support", "levelHistogram")
         if kind == "marginalHistogram":
             shape["bins"] = [grammar.render_exact(edge) for edge in declaration.bins]
@@ -528,18 +682,26 @@ class _FluxStatsBackend:
             shape["levels"] = list(grammar.reading.level_cells(parsed.columns[column]))
         elif kind == "quantile":
             shape["level"] = grammar.render_exact(declaration.level)
+            if declaration.bins:  # a quantile that declares bins is quantile/2
+                shape["bins"] = [grammar.render_exact(edge) for edge in declaration.bins]
+        if declaration.bins and kind in ("marginalHistogram", "quantile"):
+            # As the fidelity check places them: it forms a group on these edges.
+            edges = tuple(
+                parsed.grid.quantise(edge, subject="bin edge") for edge in declaration.bins
+            )
         names = (column,) if group_by is None else (column, group_by)
         read_as = {column: "category" if categorical else parsed.columns[column].domain.value}
         if group_by is not None:
             read_as[group_by] = "category"
         return DeclaredStatistic(
-            identifier=grammar.definition_for_kind(declaration.kind).identifier,
+            identifier=grammar.fidelity.definition_for_property(declaration).identifier,
             kind=kind,
             column=column,
             group_by=group_by,
             shape=shape,
             columns=names,
             read_as=read_as,
+            edges=edges,
             _declaration=declaration,
         )
 
@@ -599,13 +761,18 @@ class _FluxStatsBackend:
             rows, indices, key, declaration, parsed.columns, parsed.grid
         )
         kind = statistic.kind
-        spelled: Dict[str, Any] = state.to_document(kind)
-        group = MeasuredGroup(key=key, document=spelled, k=state.k)
+        # By definition, not by kind: a kind spells a quantile as quantile/1, and
+        # refuses a group a quantile/2 formed.
+        definition = grammar.fidelity.definition_for_property(declaration)
+        spelled: Dict[str, Any] = state.to_document(definition)
+        group = MeasuredGroup(key=key, document=spelled, k=state.k, statistic=state)
         if kind in ("marginalHistogram", "levelHistogram"):
             return replace(group, cells=tuple(state.cell_counts(kind)))
         if kind == "support":
             return replace(group, member_holders=tuple(state.support_counts))
         if kind == "quantile":
+            if definition.binned:
+                return group
             ranks = (state.quantile_witness, state.quantile_below, state.quantile_at_or_below)
             return replace(group, quantile=ranks)
         # A mean: the same indices, read as the block reads them, so the null policy
@@ -620,15 +787,85 @@ class _FluxStatsBackend:
         )
         return replace(group, values=tuple(values), encoded=tuple(encoded))
 
-    def quantile_ranks_ok(self, k: int, level: Fraction, below: int, at_or_below: int) -> bool:
+    def check_edge_counts(
+        self,
+        statistics: Sequence[EdgeStatistic],
+        *,
+        total: int,
+        minimum_cell: int,
+        zeros_disclosive: bool,
+        round_count: Callable[[int], int],
+    ) -> Tuple[EdgeDecision, ...]:
+        edges = self._edge_counts
         grammar = self._fidelity()
-        try:
-            proved: bool = grammar.quantile_rank_ok(
-                count=k, level=level, count_strictly_below=below, count_at_or_below=at_or_below
+        asked = []
+        for each in statistics:
+            groups = tuple(each.groups)
+            group_status = dict(each.group_status)
+            if each.left_out is not None:
+                # The row a groupBy null leaves out: counted, never published, and under a
+                # key no declared level can be.
+                groups += (replace(each.left_out, group=_LEFT_OUT_KEY),)
+                group_status[_LEFT_OUT_KEY] = _LEFT_OUT_STATUS
+            asked.append(
+                edges.EdgeStatistic(
+                    identifier=each.identifier,
+                    edges=each.edges,
+                    levels=each.levels,
+                    groups=groups,
+                    group_by=each.group_by,
+                    level=each.level,
+                    group_status=group_status,
+                    cell_status=dict(each.cell_status),
+                )
             )
-        except self._refused:
-            return False
-        return proved
+        try:
+            decisions = edges.check_edge_counts(
+                asked,
+                total=total,
+                minimum_cell=minimum_cell,
+                zeros_disclosive=zeros_disclosive,
+                round_count=round_count,
+            )
+        except self._refused as error:
+            # The registry's words may give counts; its code alone says what it refused.
+            raise ValueError(error.code.code) from None
+        return tuple(
+            self._decided(grammar, each, decision)
+            for each, decision in zip(statistics, decisions, strict=True)
+        )
+
+    @staticmethod
+    def _decided(grammar: Any, each: EdgeStatistic, decision: Any) -> EdgeDecision:
+        """The registry's decision without the row left out, with each quantile group spelled."""
+        definition = grammar.definition_named(each.identifier)
+
+        def kept(values: Mapping[str, Any]) -> Dict[str, Any]:
+            return {key: value for key, value in values.items() if key != _LEFT_OUT_KEY}
+
+        return EdgeDecision(
+            group_status=kept(decision.group_status),
+            cell_status=kept(decision.cell_status),
+            group_reason=kept(decision.group_reason),
+            cell_reason=kept(decision.cell_reason),
+            rounded={
+                key: _spelled(group, definition)
+                for key, group in decision.rounded.items()
+                if key != _LEFT_OUT_KEY
+            },
+        )
+
+
+#: The key and status the row a ``groupBy`` null leaves out is checked under: no
+#: declared level can start with a NUL, and the status is never ``F``.
+_LEFT_OUT_KEY = "\x00left out"
+_LEFT_OUT_STATUS = "left out"
+
+
+def _spelled(group: Any, definition: Any) -> Dict[str, Any]:
+    """A rounded quantile group as the profile writes it."""
+    document: Dict[str, Any] = group.to_document(definition)
+    return document
 
 
 #: Why a correlation is not answered (founder decision, 2026-11-18).
@@ -652,7 +889,9 @@ def load_backend() -> StatisticsBackend:
 #: The flux-stats range ``[profile]`` names in ``pyproject.toml``. The CLI cannot read
 #: that file once installed, so the install message repeats it;
 #: ``tests/profiler/test_flux_stats_pin.py`` keeps the two equal.
-FLUX_STATS_REQUIREMENT = "flux-stats>=0.6.2,<0.7"
+#: 0.7.0 is the first flux-stats release that holds ``edge_counts``, ``exact_yaml`` and
+#: ``quantile/2``.
+FLUX_STATS_REQUIREMENT = "flux-stats[yaml]>=0.7.0,<0.8"
 #: The extra carries the range, and pip replaces a copy outside it (the 0.0.1
 #: placeholder, or a release newer than this module knows).
 FLUX_STATS_INSTALL_COMMAND = "pip install 'data-product-forge[profile]'"

@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`fluid profile --bundle` publishes a quantile with bins as its bin.** A `quantile` property
+  that declares `bins` is now answered with `quantile/2`: the group states the declared bin that
+  holds the order statistic at its level, and the records below that bin and through it, and no
+  witness. A reader checks that the rounded counts still put the order statistic in that bin,
+  and a group whose rounded counts do not is withheld. A profile that holds one names format
+  `1-1-0`; every other profile keeps `1-0-0` and its bytes. A quantile with bins is published
+  beside a histogram that shares its bins, where a `quantile/1` is withheld.
+
+### Changed
+
+- **`fluid profile --bundle` reads a bundle with flux-stats.** The bundle's YAML is read by
+  flux-stats' exact reader and its block put in the canonical form by flux-stats, instead of a
+  copy of the engine's code in forge-cli. The bounds hold as before (aliases, merge keys, digits
+  written out, nesting depth, document size, one budget across a bundle's files), and a refusal
+  still names the file, and the line where the reader reports one, never a value. Its words
+  differ in places: a YAML error names the line and column where the reader found it, the most
+  values a document may write out through its aliases is now 1,000,000, and the characters it
+  writes out are bounded too. A block whose bins are not strictly increasing grid points is
+  refused before any record is read (`FLX-5004`), as the fidelity check refuses it. The
+  `[profile]` extra needs `flux-stats[yaml]>=0.7.0,<0.8`: 0.7.0 is the first flux-stats release
+  that holds these readers and the check below.
+
+### Security
+
+- **A histogram, a level histogram and a quantile of one column are checked together (FLUX ADR
+  0012).** 0.33.0's group-size, quantile and sibling checks were each one part of a rule, and a
+  reader could still subtract one histogram's published counts from another's, or from a level
+  histogram's group size, and rebuild a withheld cell, a zero included. `fluid profile` now
+  passes every histogram, level histogram and quantile of a column to flux-stats'
+  `check_edge_counts` in one call, and publishes what it lets through. More is withheld:
+  - differencing between histograms: a histogram and a coarser one of one column, or a published
+    cell and the column's count, no longer give a withheld cell back by subtraction, and a cell
+    that does goes with it, counted as `D`;
+  - a level histogram is checked over its levels as it is over bins, so one small level
+    withholds a neighbour;
+  - a zero cell a reader can form, where zeros are disclosive: cells of 12, 0 and 12 records
+    withhold one of the 12s with the zero;
+  - a histogram that does not sit on the column's one partition of bins, and a group whose
+    rounded counts no longer prove its quantile;
+  - a group that is withheld whole beside rows no group holds that the block cannot read.
+
+  The summary counts a cell or group withheld for its size or rounding as `A`, and one withheld
+  so that another cannot be recovered as `D`. A group whose every cell is withheld is still
+  withheld whole. The check does not see a column's `support/1`, which lists the levels that hold
+  records, the group sizes of a statistic grouped by the column, which repeat its level counts,
+  or a declared level that holds no record, which is absent from a grouped statistic; `fluid
+  profile --help` says so.
+
 ## [0.34.0] — 2026-11-19
 
 ### Added

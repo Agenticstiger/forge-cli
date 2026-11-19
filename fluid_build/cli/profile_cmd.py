@@ -4,9 +4,10 @@
 """``fluid profile``: an output-checked profile of one expose, read where its records live.
 
 The command reads the expose's records once, inside the environment that holds
-them, and writes a FLUX profile document (PROFILE-SPEC format 1-0-0) of
-aggregates that passed the disclosure rules. A FLUX Simulation pins the document
-by the digest this prints. See :mod:`fluid_build.profiler` for the parts.
+them, and writes a FLUX profile document (PROFILE-SPEC format 1-0-0, or 1-1-0
+when it holds a quantile with bins) of aggregates that passed the disclosure
+rules. A FLUX Simulation pins the document by the digest this prints. See
+:mod:`fluid_build.profiler` for the parts.
 
 Registered lazily (``cli/bootstrap.py`` ``CORE_COMMANDS``), and only the standard library is
 imported at module scope, so neither ``fluid --help`` nor ``fluid profile
@@ -26,15 +27,15 @@ COMMAND = "profile"
 _DESCRIPTION = """\
 Write an output-checked profile of one expose's records, read where they live.
 
-The document follows FLUX PROFILE-SPEC (format 1-0-0) and holds only aggregates
-that passed the output checks: no record, no sample, no per-record value. The
-checks are ACRO 1.1.0's defaults, named "acro-default" in the document:
+The document follows FLUX PROFILE-SPEC (format 1-0-0, or 1-1-0 when it holds a
+quantile with bins) and holds only aggregates that passed the output checks: no
+record, no sample, no per-record value. The checks are ACRO 1.1.0's defaults, named
+"acro-default" in the document:
   - a count below 10 records is withheld, and so is a zero;
   - every published count is rounded to a multiple of 5;
   - a sum is withheld when 2 records make up 90% of it, or when what is left
     after the 2 largest is below 10% of the largest;
-  - a min, max or quantile is published only when 10 records hold that value,
-    and a quantile only when at least 10 records lie below it and 10 above it;
+  - a min, max or quantile is published only when 10 records hold that value;
   - a mean is published only when the column's count and sum are.
 A withheld value keeps an SDMX CL_CONF_STATUS code and no value: A (a small
 count), O or T (dominated by one or two records), M (concentration), D
@@ -62,12 +63,26 @@ need the exact record count, which the output checks round.
 What the checks leave readable: a grouped statistic lists every group the data
 forms, published or withheld. A key is always a level the bundle declares (a
 value outside the declared support is refused), so its presence says only that
-the level holds at least one record. A group withheld for its size withholds
-every group of its groupBy's histograms and quantiles on its column too, and a
-quantile is published only as the one histogram or quantile of its column. A withheld cell of
-a histogram is not secondarily suppressed: the rounded counts still bound it,
-inside 0 to 9 records, and never above the threshold. A published min or max
-shows that no record lies below or above it. A quantile whose value is the
+the level holds at least one record.
+
+The counts a histogram, a level histogram or a quantile publishes at the edges
+of one column are checked together, as FLUX ADR 0012 sets, by flux-stats'
+check_edge_counts. They sit on one partition (the column's bins, or its
+levels). A quantile that declares bins is written as quantile/2, with the bin
+that holds its order statistic and the records below that bin and through it,
+and the profile then names format 1-1-0; its three cells (below, in and above
+the bin) each hold at least 10 records, or none at the ends of the range. A
+quantile without bins is published only as the one such statistic of its column.
+A group of fewer than 10 records withholds every group of its groupBy, and a
+group whose every cell is withheld is withheld whole. Across those statistics
+of one column, no small cell, a zero included where zeros are disclosive, can be
+formed by adding or subtracting what they publish, so more is withheld (D in
+the summary). Only then are counts rounded. The check does not see a column's
+support, which lists the levels that hold records, or the group sizes of a
+statistic grouped by the column, which repeat its level counts; and a declared
+level that holds no record is absent from a grouped statistic, which shows its
+zero. A published min or
+max shows that no record lies below or above it. A quantile whose value is the
 column's smallest or largest shows the same, and is withheld for it, as a zero
 is.
 
@@ -86,14 +101,16 @@ fluid profile contract.fluid.yaml --expose orders \\
 
 # Only aggregates leave: a count under 10 or a zero is withheld, counts are rounded
 # to 5, a sum 2 records dominate is withheld, and a min, max or quantile is shown only
-# when 10 records hold it (ACRO 1.1.0 defaults), a quantile only when at least 10
-# records lie below it and 10 above it, and only as its column's one histogram or
-# quantile. A group of fewer than 10 records withholds every group of its groupBy's
-# histograms and quantiles on its column. A histogram's or a quantile's withheld values all read C,
-# whatever withheld them. A min or max is published though it shows that no record lies
-# below or above it, and a quantile at the column's smallest or largest value is withheld
-# for showing the same. Output-checking conventions only: no privacy or anonymity
-# guarantee. Pin the printed digest in the FLUX Simulation.
+# when 10 records hold it (ACRO 1.1.0 defaults). With --bundle, a column's histograms and
+# quantiles are checked together (FLUX ADR 0012): on one partition, a quantile with bins
+# only with at least 10 records below its bin, in it and above it, and no small cell,
+# a zero included, left to be formed by adding or subtracting what is published. A group
+# of fewer than 10 records withholds every group of its groupBy. A histogram's or a
+# quantile's withheld values all read C, whatever withheld them. A min or max is published
+# though it shows that no record lies below or above it, and a quantile at the column's
+# smallest or largest value is withheld for showing the same. Output-checking
+# conventions only: no privacy or anonymity guarantee. Pin the printed digest in the
+# FLUX Simulation.
 # Each number column also gets mean/1, which FLUX compares a mean property with, on the
 # grid --fractional-bits names (16 unless given): the fidelity block must declare it.
 
@@ -216,7 +233,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     try:
         expose_id = runner.resolve_expose_id(contract, args.expose_id)
         out = _out_path(args.out, expose_id, args.source)
-        block = bundle.read_bundle_block(bundle_dir, expose_id) if bundle_dir else None
+        block = bundle.read_bundle_block(bundle_dir, expose_id, backend) if bundle_dir else None
         result = runner.profile_expose(
             contract,
             expose_id,

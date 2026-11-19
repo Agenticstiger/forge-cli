@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import pytest
 
-from fluid_build.profiler import bundle
-from fluid_build.profiler.bundle import BundleError, read_bundle_block
+from fluid_build.profiler import _stats, bundle
+from fluid_build.profiler.bundle import BundleError
+
+flux_stats = pytest.importorskip("flux_stats")
 
 pytestmark = pytest.mark.unit
 
@@ -26,6 +28,11 @@ extensions:
           columns: {amount: {range: {min: "0", max: "100"}}}
       refunds: {rows: 10}
 """
+
+
+def read_bundle_block(directory, expose_id):
+    """The bundle's block, read through flux-stats' exact-YAML reader as the CLI reads it."""
+    return bundle.read_bundle_block(directory, expose_id, _stats.load_backend())
 
 
 def _write(directory, name, text):
@@ -108,7 +115,7 @@ def test_an_unreadable_document_names_the_file_and_the_line_and_quotes_nothing(t
     with pytest.raises(BundleError) as refused:
         read_bundle_block(tmp_path, "orders")
     assert refused.value.event == "profile_bundle_unreadable"
-    assert "simulation.flux.yml" in str(refused.value) and "line" in str(refused.value)
+    assert "simulation.flux.yml" in str(refused.value) and "unreadable YAML" in str(refused.value)
     assert "value-77" not in str(refused.value)
 
 
@@ -192,10 +199,10 @@ def test_a_bare_float_key_is_its_decimal_spelling_as_the_engine_reads_it(tmp_pat
 
 def test_a_binary_float_key_is_refused_and_names_the_file():
     # The loader never builds a float, so this is the canonical form's own guard.
-    with pytest.raises(BundleError) as refused:
-        bundle._canonicalise({0.5: "x"}, "s.flux.yml", "fidelity")
-    assert refused.value.event == "profile_bundle_unreadable"
-    assert "s.flux.yml" in str(refused.value) and "float key" in str(refused.value)
+    with pytest.raises(_stats.BundleTextRefused) as refused:
+        _stats.load_backend().canonicalise({0.5: "x"}, name="s.flux.yml: fidelity")
+    assert "s.flux.yml" in str(refused.value) and "float" in str(refused.value)
+    assert refused.value.code == "FLX-1001"
 
 
 def test_an_integer_outside_the_safe_range_is_refused(tmp_path):
@@ -221,21 +228,21 @@ def test_a_block_whose_aliases_write_out_too_many_values_is_refused(tmp_path):
     with pytest.raises(BundleError) as refused:
         read_bundle_block(tmp_path, "orders")
     assert refused.value.event == "profile_bundle_unreadable"
-    assert "more than 100000 values" in str(refused.value)
+    assert "more than 1000000 values" in str(refused.value)
 
 
 def test_a_block_that_holds_itself_through_an_alias_is_refused(tmp_path):
     _write(tmp_path, "s.flux.yml", _simulation_with("r: &r [*r]"))
     with pytest.raises(BundleError) as refused:
         read_bundle_block(tmp_path, "orders")
-    assert "nests deeper than 64 levels" in str(refused.value)
+    assert "holds itself through an alias" in str(refused.value)
 
 
 def test_a_number_too_long_to_write_out_is_refused(tmp_path):
     _write(tmp_path, "s.flux.yml", _simulation_with("columns: {amount: {max: 1.0e+300000000}}"))
     with pytest.raises(BundleError) as refused:
         read_bundle_block(tmp_path, "orders")
-    assert "more than 1000 digits" in str(refused.value)
+    assert "more than 1000 digits" in str(refused.value) and "line" in str(refused.value)
 
 
 def test_a_document_nested_too_deeply_to_read_is_refused(tmp_path):

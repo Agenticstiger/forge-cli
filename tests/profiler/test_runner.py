@@ -296,7 +296,7 @@ def test_without_an_importable_flux_stats_nothing_is_read(monkeypatch, installed
     with pytest.raises(StatisticsUnavailable) as caught:
         load_backend()
     message = str(caught.value)
-    assert f"and flux-stats {state}. It needs flux-stats>=0.6.2,<0.7;" in message
+    assert f"and flux-stats {state}. It needs flux-stats[yaml]>=0.7.0,<0.8;" in message
     assert "install it with: pip install 'data-product-forge[profile]'" in message
 
 
