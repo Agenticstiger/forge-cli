@@ -502,6 +502,53 @@ def test_an_idle_started_application_is_stopped_and_a_stopped_one_left_alone():
     clients.done()
 
 
+def test_an_application_still_being_created_is_waited_for_and_then_left_alone():
+    clients = Clients()
+    emr = clients.stub("emr-serverless")
+    emr.add_response("list_job_runs", {"jobRuns": []}, {**APP_ID, "states": ACTIVE})
+    emr.add_response("get_application", _application("CREATING"), APP_ID)
+    emr.add_response("get_application", _application("CREATING"), APP_ID)
+    emr.add_response("get_application", _application("CREATED"), APP_ID)
+    assert run([application_goes()], clients) == []  # a created one is deleted as it is
+    clients.done()
+
+
+def test_an_application_still_starting_is_stopped_once_it_has_started():
+    clients = Clients()
+    emr = clients.stub("emr-serverless")
+    emr.add_response("list_job_runs", {"jobRuns": []}, {**APP_ID, "states": ACTIVE})
+    emr.add_response("get_application", _application("STARTING"), APP_ID)
+    emr.add_response("get_application", _application("STARTED"), APP_ID)
+    emr.add_response("stop_application", {}, APP_ID)
+    emr.add_response("get_application", _application("STOPPED"), APP_ID)
+    said = run([application_goes()], clients)
+    clients.done()
+    assert said == [
+        f"  EMR Serverless application fluid-commerce.orders-stream-spark ({APP}): stopped "
+        "the application."
+    ]
+
+
+def test_an_application_still_creating_after_the_wait_refuses_the_apply():
+    clients = Clients()
+    emr = clients.stub("emr-serverless")
+    emr.add_response("list_job_runs", {"jobRuns": []}, {**APP_ID, "states": ACTIVE})
+    for _ in range(4):  # the first read, then at 0 s, 1 s and 3 s of a 3 s wait
+        emr.add_response("get_application", _application("CREATING"), APP_ID)
+    with pytest.raises(UnsupportedBindingError) as caught:
+        run([application_goes()], clients, env={"FLUID_SPARK_WAIT_SECONDS": "3"})
+    clients.done()  # nothing was stopped
+    assert caught.value.kind == "spark-destroy-runs-going"
+    assert "the application is still CREATING after 3 s" in str(caught.value)
+    hints = " ".join(caught.value.remediation)
+    for action in (
+        "emr-serverless:GetApplication",
+        "emr-serverless:StopApplication",
+        "iam:ListEntitiesForPolicy",
+    ):
+        assert action in hints
+
+
 # --- dry runs, errors, timeouts --------------------------------------------------------
 
 

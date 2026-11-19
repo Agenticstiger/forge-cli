@@ -13,39 +13,81 @@ import pytest
 ClientError = pytest.importorskip("botocore.exceptions").ClientError
 
 from fluid_build.build_runners.spark import _reconcile as rc
-from fluid_build.build_runners.spark._adapters import RunInfo
+from fluid_build.build_runners.spark._adapters import RunInfo, SparkRunError
 
 ENV = {rc.WAIT_ENV: "5"}
 
 
-def info(run_id, state, *, hash_=None, source=None, checkpoint=None, attempt=None, details=""):
+#: The wall clock of a reconcile (epoch seconds): a run ``created`` at 0 is days old.
+WALL = 1_000_000.0
+
+
+def info(
+    run_id,
+    state,
+    *,
+    hash_=None,
+    source=None,
+    checkpoint=None,
+    attempt=None,
+    details="",
+    created=0.0,
+    restart_of=None,
+    raw=None,
+    lost=False,
+):
     return RunInfo(
-        run_id, state, state, config_hash=hash_, source_id=source, checkpoint_id=checkpoint,
-        attempt=attempt, details=details,
+        run_id, state, raw or state, config_hash=hash_, source_id=source,
+        checkpoint_id=checkpoint, attempt=attempt, details=details, created=created,
+        restart_of=restart_of, lost=lost,
     )  # fmt: skip
 
 
 class FakeAdapter:
     """History is newest first; ``scripts`` maps a run id to the states its reads return
-    (the last one repeats); ``start_states`` scripts the run ``start`` creates ("new")."""
+    (the last one repeats); ``start_states`` scripts the run ``start`` creates ("new").
+    ``later`` is the history ``runs`` returns after a start; ``job`` the job config the last
+    apply uploaded (an AWS runtime's), ``target_error`` what ``check_target`` raises."""
 
-    def __init__(self, history=(), start_states=("RUNNING",), start_details=""):
+    uploads_job = False
+
+    def __init__(
+        self, history=(), start_states=("RUNNING",), start_details="", *, later=None, job=None,
+        uploads=None, target_error=None,
+    ):  # fmt: skip
         self.history = list(history)
-        self.scripts = {h.run_id: [h.state] for h in history}
+        self.later = later
+        self.scripts = {h.run_id: [h.state] for h in [*history, *(later or ())]}
         self.start_states = list(start_states)
         self.start_details = start_details
+        self.job = job
+        self.uploads_job = job is not None if uploads is None else uploads
+        self.target_error = target_error
         self.calls = []
+        self.restart_of = []
+        self.since = []
 
     def where(self):
         return "fake cluster"
 
-    def runs(self):
+    def runs(self, since=None):
+        self.since.append(since)
+        if self.later is not None and "start" in self.calls:
+            return list(self.later)
         return list(self.history)
 
-    def start(self, token):
+    def start(self, token, restart_of=None):
         self.calls.append("start")
+        self.restart_of.append(restart_of)
         self.scripts["new"] = list(self.start_states)
         return "new"
+
+    def check_target(self):
+        if self.target_error:
+            raise SparkRunError(self.target_error)
+
+    def deployed_job(self):
+        return self.job.encode("utf-8") if isinstance(self.job, str) else self.job
 
     def cancel(self, run_id):
         self.calls.append(f"cancel {run_id}")
@@ -58,42 +100,8 @@ class FakeAdapter:
         return info(run_id, state, details=self.start_details if run_id == "new" else "")
 
 
-class Clock:
-    def __init__(self):
-        self.t = 0.0
-        self.slept = []
-
-    def now(self):
-        return self.t
-
-    def sleep(self, seconds):
-        self.slept.append(seconds)
-        self.t += seconds
-
-
-@pytest.fixture
-def clock():
-    return Clock()
-
-
-@pytest.fixture
-def use(monkeypatch):
-    """Make ``adapter_for`` return the fake (and count how often it is built)."""
-    built = []
-
-    def install(fake):
-        def adapter_for(run, clients=None, local_host=None):
-            built.append(run)
-            fake.run = run  # a real adapter holds its (account-bound) run
-            return fake
-
-        monkeypatch.setattr(rc, "adapter_for", adapter_for)
-        return built
-
-    return install
-
-
 def go(run, clock, **kw):
+    kw.setdefault("wall", lambda: WALL)
     return rc.reconcile([run], sleep=clock.sleep, now=clock.now, env=ENV, **kw)[0]
 
 
@@ -167,13 +175,9 @@ def test_a_failed_last_run_with_this_config_is_an_error_not_a_restart(run, clock
     assert (out.action, out.error, fake.calls) == ("failed", True, [])
     assert "jr9" in out.message and "OOM in driver" in out.message
     assert "fix the cause and change the build" in out.message
-
-
-def test_restart_failed_starts_it_anyway(run, clock, use):
-    fake = FakeAdapter([info("jr9", "FAILED", hash_=run.config_hash)])
-    use(fake)
-    out = go(run, clock, restart_failed=True)
-    assert (out.action, out.error, fake.calls) == ("started", False, ["start"])
+    assert "EMR Serverless retries a failed stream (retryPolicy.maxFailedAttemptsPerHour)" in (
+        out.message
+    )
 
 
 def test_a_failed_run_of_an_older_config_does_not_block_a_new_one(run, clock, use):
@@ -495,14 +499,18 @@ def test_a_new_source_on_a_checkpoint_an_older_run_used_is_refused(run, clock, u
     assert (out.action, out.error, fake.calls) == ("refused", True, [])
 
 
-def test_a_second_copy_of_the_current_config_is_cancelled(run, clock, use):
+def test_a_second_copy_of_the_current_config_is_cancelled_and_the_oldest_kept(run, clock, use):
+    """Whichever reconcile looks, the same copy stays: the oldest, which has run longest."""
     fake = FakeAdapter(
-        [info("a2", "RUNNING", hash_=run.config_hash), info("a1", "RUNNING", hash_=run.config_hash)]
+        [
+            info("a2", "RUNNING", hash_=run.config_hash, created=20.0),
+            info("a1", "RUNNING", hash_=run.config_hash, created=10.0),
+        ]
     )
-    fake.scripts["a1"] = ["RUNNING", "CANCELLED"]
+    fake.scripts["a2"] = ["RUNNING", "CANCELLED"]
     use(fake)
     out = go(run, clock)
-    assert (out.run_id, out.cancelled, out.error) == ("a2", ["a1"], False)
+    assert (out.run_id, out.cancelled, out.error) == ("a1", ["a2"], False)
     assert "start" not in fake.calls
 
 

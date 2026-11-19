@@ -40,6 +40,8 @@ from fluid_build.build_runners.spark._reconcile import (
 
 #: The states EMR Serverless deletes an application in, and the one it is gone in.
 APPLICATION_IDLE = frozenset({"CREATED", "STOPPED", "TERMINATED"})
+#: The states an application leaves by itself, waited out before it is stopped.
+_APPLICATION_MOVING = frozenset({"CREATING", "STARTING"})
 #: The error codes of a target that no longer exists (EMR Serverless, EMR on EKS, Glue).
 _GONE = frozenset({"ResourceNotFoundException", "EntityNotFoundException"})
 
@@ -136,7 +138,8 @@ def stop_application(
 ) -> Outcome:
     """Every active run in ``run``'s EMR Serverless application (``target`` its
     ``applicationId``) cancelled and waited for, then the application stopped and waited
-    for, so the destroy can delete it. ``dry_run`` reads and changes nothing."""
+    for, so the destroy can delete it; one still CREATING or STARTING is waited for first.
+    ``dry_run`` reads and changes nothing."""
     clock, budget = _Clock(sleep, now), wait_budget(env)
     out = Outcome(run.build, run.runtime, "stopped")
     try:
@@ -157,6 +160,8 @@ def stop_application(
             return out
         if active:  # read again: the wait was long enough for the application to move
             state = adapter.application_state()
+        if state in _APPLICATION_MOVING:  # CREATING or STARTING: it settles by itself
+            state = clock.until(partial(_application, adapter), _settled, budget).raw_state
         if state in APPLICATION_IDLE:
             return out
         out.state = _stopped(adapter, state, clock, budget)
@@ -174,18 +179,26 @@ def stop_application(
     return out
 
 
+def _application(adapter: EmrServerless) -> RunInfo:
+    """The application's state, read as a run's so the run waiter polls it."""
+    raw = adapter.application_state()
+    return RunInfo(adapter.application_id(), raw, raw)
+
+
+def _settled(info: RunInfo) -> bool:
+    return info.raw_state not in _APPLICATION_MOVING
+
+
+def _idle(info: RunInfo) -> bool:
+    return info.raw_state in APPLICATION_IDLE
+
+
 def _stopped(adapter: EmrServerless, state: str, clock: _Clock, budget: float) -> str:
-    """Stop the application from ``state`` and wait until it has stopped: its last state."""
-
-    def read() -> RunInfo:
-        # The application's state, read as a run's so the run waiter polls it.
-        raw = adapter.application_state()
-        return RunInfo(adapter.application_id(), raw, raw)
-
-    if state == "STARTING":  # stopped once it has started
-        state = clock.until(read, lambda i: i.raw_state != "STARTING", budget).raw_state
+    """Stop the application from ``state`` and wait until it has stopped: its last state.
+    One in a state it cannot be stopped from (still CREATING or STARTING after the wait)
+    is left as it is."""
     if state == "STARTED":
         adapter.stop_application()
     elif state != "STOPPING":
         return state
-    return clock.until(read, lambda i: i.raw_state in APPLICATION_IDLE, budget).raw_state
+    return clock.until(partial(_application, adapter), _idle, budget).raw_state

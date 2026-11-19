@@ -266,7 +266,9 @@ def prepare(
         f"{text}. The plan destroys what these runs run with, so nothing was destroyed.",
         (
             "Run fluid apply again once the runs have stopped, or stop them yourself.",
-            "The identity running fluid apply needs the runtime's list and cancel actions "
-            "(as for starting runs).",
+            "The identity running fluid apply needs the runtime's list and cancel actions (as "
+            "for starting runs), iam:ListEntitiesForPolicy for a policy it destroys, and "
+            "emr-serverless:GetApplication and emr-serverless:StopApplication for the "
+            "product's own EMR Serverless application.",
         ),
     )

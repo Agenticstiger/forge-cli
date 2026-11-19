@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A Spark stream that died starts again on its checkpoint within a restart budget, and
+  `fluid apply --mode reconcile` keeps the streams running without deploying anything.** The
+  budget is `execution.retries.maxAttempts` restarts per rolling hour (5 when unset, at most 10:
+  the numbers EMR Serverless applies to its own streaming retries). On EMR on EC2 and
+  `runtime: local`, which no service retries, forge starts a stream again when the last run with
+  the deployed config ended FAILED or INTERRUPTED (a step that died with its node), LOST, or
+  stopped by a signal from outside forge (a local run killed or shut down with its machine); Glue
+  too, whose job forge emits with MaxRetries 0. Each
+  restart carries `--fluid-restart-of <run id>` in its arguments, and the budget is counted from
+  the runtime's own run history (EMR's ListSteps reaches back an hour), so forge keeps no state.
+  A spent budget starts nothing and fails, naming the budget, the restarts and when the next one
+  is allowed. A plain `fluid apply` follows the same rule; it no longer stops at the first
+  failure of an unchanged config. A run cancelled through the runtime (CancelSteps,
+  CancelJobRun, BatchStopJobRun, or forge's own cancel of a local run) was stopped on purpose:
+  `--mode reconcile` leaves it stopped, and a plain `fluid apply` starts it again. EMR
+  Serverless and EMR on EKS retry a failed run themselves from `execution.retries`, so a run
+  that ended FAILED there has spent those retries and forge starts nothing on top of them; a
+  stream there that stopped without failing restarts within the budget. A stream whose EMR
+  cluster ended (TERMINATED, TERMINATED_WITH_ERRORS) cannot start there again, and the error
+  names the cluster's state and reason. `fluid apply <contract> [--env <env>] --mode reconcile
+  --build-id <stream> --yes` is what a keepalive (a scheduler task every few minutes) runs: it
+  runs no `tofu` and takes no plan
+  (a `plan.json` is refused); it reads the job config the last apply uploaded and the config
+  hash the runs carry, and when the contract compiles to something else it starts nothing and
+  exits 1, telling the operator to run `fluid apply`. A healthy stream is a no-op (exit 0).
+  Without `--build-id` it reconciles every always-on Spark stream of the contract; a
+  `--build-id` of a batch, `availableNow` or non-Spark build is refused. It never replaces a
+  config and never stops a removed build, and it cancels only a younger second copy of the
+  running config. Two reconciles that start the same stream at once keep the older run (the
+  younger cancels its own start), and of two copies of one config the older is kept, no longer
+  the newer. The product's scheduler policy (`fluid-<product>-spark-caller`) now covers
+  always-on streams too (start, watch and stop their runs, read their job config), so a
+  keepalive can run on MWAA, with the reads an EMR on EC2 start makes of its cluster and role.
+  `execution.retries` is no longer part of an EMR on EC2 or Glue run's config hash, as neither
+  takes a retry setting: a new budget restarts nothing there, and such a stream that declares
+  retries restarts once on its next apply. The scheduler policy names each runtime's actions
+  once, with every build's target, role and artifacts, as one statement per build reached the
+  6,144-character limit of a managed policy at about six builds.
+
 - **A Spark stream can bound what one batch reads, fails on lost offsets, and sends each dead
   letter under the same key every time.** `properties.stream.maxOffsetsPerTrigger` (0.7.7
   preview, optional, unset by default) is compiled into the job config and passed to Spark's
@@ -102,6 +141,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still going after `FLUID_SPARK_WAIT_SECONDS` also refuses the apply before anything is
   destroyed. `--dry-run` reads and says what it would cancel. The first apply after the upgrade
   adds the three tags in place to each Spark build's log group and EMR on EC2 job policy.
+
+- **A destroy waits for an EMR Serverless application that is still being created or started.**
+  One still `CREATING` was refused at once as "still CREATING after 900 s", though nothing had
+  waited. A `CREATING` or `STARTING` application is now waited for until it settles: a created
+  one is deleted as it is, a started one is stopped first, and one still moving after
+  `FLUID_SPARK_WAIT_SECONDS` refuses the apply, as before. The refusal's hint now names
+  `iam:ListEntitiesForPolicy`, `emr-serverless:GetApplication` and
+  `emr-serverless:StopApplication`, which the identity running the destroy needs beyond the
+  runtime's list and cancel actions.
 
 ### Changed
 

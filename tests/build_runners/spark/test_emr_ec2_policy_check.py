@@ -178,7 +178,8 @@ def test_a_named_role_has_no_forge_policy_to_check(ec2_run):
 
 def test_the_reconcile_starts_nothing_and_says_how_to_attach(ec2_run):
     """The refusal is the build's error outcome; no run was started, so once the policy is
-    attached the next apply starts the stream (a failed run would not start again)."""
+    attached the next apply starts the stream (a run that failed would spend a restart). The
+    ended-cluster check and the role check share one DescribeCluster."""
     clients = Clients()
     emr = clients.stub("emr")
     active = {"ClusterId": CLUSTER, "StepStates": ["PENDING", "RUNNING", "CANCEL_PENDING"]}

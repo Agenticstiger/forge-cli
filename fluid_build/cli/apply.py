@@ -626,8 +626,8 @@ def register(subparsers: argparse._SubParsersAction):
         choices=_MODE_CHOICES,
         default=None,  # resolved by parse_mode; None = amend
         help=(
-            "DDL/DML strategy: dry-run | create-only | amend (default) | "
-            "amend-and-build | replace | replace-and-build. See docs/apply.md."
+            "dry-run | create-only | amend (default) | amend-and-build | replace | "
+            "replace-and-build | reconcile (deploys nothing). See docs/apply.md."
         ),
     )
     mode_group.add_argument(
@@ -1341,18 +1341,24 @@ def _load_verified_plan(args, resolved_mode, logger: logging.Logger) -> Dict[str
 
 
 def _check_build_id_mode(build_id: Optional[str], resolved_mode) -> None:
-    """``--build-id`` filters the build phase, so it needs a mode that has one.
+    """``--build-id`` filters the build phase, so it needs a mode that has one, or
+    ``reconcile``, where it names the stream to keep running.
 
     With ``amend`` / ``replace`` / ``create-only`` / ``dry-run`` there is no
     build to filter: the flag used to be accepted and silently dropped, so an
     operator who asked for one build got a DDL-only apply and exit 0. Refuse
     it instead of guessing, and never let it change the mode.
     """
-    from fluid_build.forge.core.apply_modes import needs_build
+    from fluid_build.forge.core.apply_modes import is_reconcile, needs_build
 
     # argparse hands over ``str`` or ``None``; anything else is not an
     # operator-supplied id (``parse_mode`` treats non-strings the same way).
-    if isinstance(build_id, str) and build_id and not needs_build(resolved_mode):
+    if (
+        isinstance(build_id, str)
+        and build_id
+        and not needs_build(resolved_mode)
+        and not is_reconcile(resolved_mode)
+    ):
         raise CLIError(
             1,
             "apply_build_id_requires_build_mode",
@@ -1362,10 +1368,83 @@ def _check_build_id_mode(build_id: Optional[str], resolved_mode) -> None:
                 "hint": (
                     "--build-id selects which build runs, and --mode "
                     f"{resolved_mode.value} runs no build. Pass --mode amend-and-build "
-                    "(or replace-and-build) to run that build, or drop --build-id."
+                    "(or replace-and-build) to run that build, --mode reconcile to keep "
+                    "that stream running, or drop --build-id."
                 ),
             },
         )
+
+
+def _run_reconcile_mode(
+    args: argparse.Namespace,
+    logger: logging.Logger,
+    *,
+    start_time: float,
+    build_id: Optional[str],
+    dry_run: bool,
+) -> int:
+    """``fluid apply --mode reconcile``: keep the contract's always-on Spark streams running
+    with the config the last apply deployed (``cli/_spark_apply.py::reconcile_only``).
+
+    It runs no ``tofu``, no DDL and no build, and takes no plan: a ``plan.json`` is refused,
+    and the contract goes through the same schema gate, ``--build-id`` check and apply-time
+    hooks as any apply before a stream is looked at.
+
+    Raises:
+        CLIError: ``apply_reconcile_needs_contract``, or a gate's error.
+    """
+    if str(args.contract or "").endswith(".json"):
+        raise CLIError(
+            1,
+            "apply_reconcile_needs_contract",
+            {
+                "path": str(args.contract),
+                "hint": (
+                    "--mode reconcile applies no plan: it reads the contract, what the last "
+                    "fluid apply deployed and how the runs are doing. Pass the contract "
+                    "(contract.fluid.yaml)."
+                ),
+            },
+        )
+    try:
+        contract = _load_apply_source(args, None, logger)
+        _gate_contract_for_apply(contract, logger)
+        _gate_selected_build_for_apply(contract, build_id)
+    except CLIError as exc:
+        _log_apply_failure(logger, start_time, exc)
+        raise
+    hook_rc = _run_apply_hooks_for_source(args, contract, logger)
+    if hook_rc:
+        return hook_rc
+    from fluid_build.cli import _spark_apply as _spark
+
+    ask = None if args.yes or dry_run or not os.isatty(0) else _confirm_reconcile
+    return _spark.reconcile_only(
+        contract,
+        logger,
+        build_id=build_id,
+        dry_run=dry_run,
+        workspace=_spark_workspace(args, None),
+        confirm=ask,
+    )
+
+
+def _confirm_reconcile(question: str) -> bool:
+    """Ask on the terminal before ``--mode reconcile`` starts or cancels a run (``--yes``
+    skips it, as it skips apply's own prompt). An empty or closed input is a no; Ctrl-C
+    stops the command, as it stops any apply."""
+    prompt = f"{question} [y/N]: "
+    try:
+        if RICH_AVAILABLE:
+            from rich.markup import escape
+
+            # The question quotes a run's failure, which the runtime reports: never markup.
+            answer = Console().input(escape(prompt))
+        else:
+            answer = input(prompt)
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
 
 
 def _render_apply_result(
@@ -2243,6 +2322,17 @@ def run(args, logger: logging.Logger) -> int:
         dry_run=effective_dry_run,
         mode=resolved_mode.value,
     )
+
+    from fluid_build.forge.core.apply_modes import is_reconcile
+
+    if is_reconcile(resolved_mode):
+        return _run_reconcile_mode(
+            args,
+            logger,
+            start_time=start_time,
+            build_id=resolved_build_id,
+            dry_run=effective_dry_run,
+        )
 
     # --- Plan gates (11-stage pipeline stage 7) ---
     # A ``plan.json`` input is digest-verified and mode-checked HERE, ahead

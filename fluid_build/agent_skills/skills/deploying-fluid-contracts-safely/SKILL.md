@@ -47,6 +47,7 @@ fluid verify contract.fluid.yaml --strict --env dev
 | `amend` (default) | kept; new columns are added |
 | `amend-and-build` | kept; transforms run again |
 | `replace`, `replace-and-build` | dropped and rebuilt |
+| `reconcile` | untouched; restarts Spark streams that died, deploys nothing |
 
 ## Never without the user's explicit yes for this run
 

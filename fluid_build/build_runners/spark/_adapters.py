@@ -27,7 +27,7 @@ import datetime as _dt
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
-from fluid_build.build_runners.spark._desired import DesiredRun
+from fluid_build.build_runners.spark._desired import RESTART_FLAG, DesiredRun
 from fluid_build.spark import names as _names
 
 PENDING, RUNNING, CANCELLING = "PENDING", "RUNNING", "CANCELLING"
@@ -57,8 +57,9 @@ CALLER_ACTIONS: Dict[str, tuple] = {
         "elasticmapreduce:ListSteps",
         "elasticmapreduce:DescribeStep",
         "elasticmapreduce:CancelSteps",
-        # The cluster's Spot posture, warned at plan and apply (_posture.py), and the role
-        # its steps run as, checked before a step starts (EmrEc2.start).
+        # The cluster's state (a stream does not restart on an ended cluster), its Spot
+        # posture, warned at plan and apply (_posture.py), and the role its steps run as,
+        # checked before a step starts (EmrEc2.start).
         "elasticmapreduce:DescribeCluster",
         "elasticmapreduce:ListInstanceFleets",
         "elasticmapreduce:ListInstanceGroups",
@@ -72,6 +73,15 @@ CALLER_ACTIONS: Dict[str, tuple] = {
     ),
 }
 PASS_ROLE = frozenset({"emr-serverless", "emr-eks"})
+#: The runtimes that retry a failed run themselves, with the setting ``execution.retries``
+#: becomes there: a run that ended FAILED on one has spent those retries, and forge does not
+#: start it again on top of them. EMR on EC2, Glue (its job is emitted with MaxRetries 0)
+#: and local runs have none: forge's reconcile restarts them
+#: (:attr:`DesiredRun.restarts_per_hour`).
+SERVICE_RETRIES: Dict[str, str] = {
+    "emr-serverless": "EMR Serverless retries a failed stream (retryPolicy.maxFailedAttemptsPerHour)",
+    "emr-eks": "EMR on EKS retries a failed driver (retryPolicyConfiguration.maxAttempts)",
+}
 #: What starting an EMR on EC2 step also reads: the cluster's instance-profile role and the
 #: policies attached to it (:meth:`EmrEc2.start`).
 EC2_ROLE_READS = ("iam:GetInstanceProfile", "iam:ListAttachedRolePolicies")
@@ -95,9 +105,12 @@ class RunInfo:
     attempt: Optional[int] = None
     details: str = ""
     created: float = 0.0
-    #: The run's processes stopped without recording how it ended (a local run whose
-    #: machine restarted, or that was killed): it did not fail, so its config starts again.
+    #: The run's processes stopped without recording how it ended, or a signal from outside
+    #: forge stopped them (a local run whose machine shut down, or that was killed).
     lost: bool = False
+    #: The run this one was started again after (``--fluid-restart-of``): a restart, which
+    #: counts against the stream's budget.
+    restart_of: Optional[str] = None
 
     @property
     def active(self) -> bool:
@@ -140,6 +153,7 @@ def _identity(args: Sequence[Any], tags: Optional[Mapping[str, Any]] = None) -> 
         ("--fluid-config-hash", "config_hash"),
         ("--fluid-source", "source_id"),
         ("--fluid-checkpoint", "checkpoint_id"),
+        (RESTART_FLAG, "restart_of"),
     ):
         if flag in items[:-1]:
             found[key] = items[items.index(flag) + 1]
@@ -204,14 +218,29 @@ def checked_run(r: DesiredRun, clients: ClientFactory) -> DesiredRun:
     return dataclasses.replace(r, job_sha256=config_digest(r.job_text))
 
 
+def _read_back(clients: ClientFactory, region: str, uri: str) -> bytes:
+    """An object's bytes from S3, at most one more than :data:`MAX_ARTIFACT_BYTES` (more
+    is no artifact forge wrote). Raises what boto3 raises."""
+    bucket, _, key = uri.removeprefix("s3://").partition("/")
+    data: bytes = (
+        clients("s3", region)
+        .get_object(Bucket=bucket, Key=key)["Body"]
+        .read(MAX_ARTIFACT_BYTES + 1)
+    )
+    return data
+
+
+def _error_code(exc: BaseException) -> str:
+    """The S3 error code botocore's error carries, or ""."""
+    return str((getattr(exc, "response", None) or {}).get("Error", {}).get("Code") or "")
+
+
 def _artifact(run: DesiredRun, clients: ClientFactory, uri: str) -> bytes:
     """An artifact's bytes from S3, at most :data:`MAX_ARTIFACT_BYTES`."""
-    bucket, _, key = uri.removeprefix("s3://").partition("/")
     try:
-        body = clients("s3", run.region).get_object(Bucket=bucket, Key=key)
-        data = body["Body"].read(MAX_ARTIFACT_BYTES + 1)
+        data = _read_back(clients, run.region, uri)
     except Exception as exc:  # noqa: BLE001 - botocore's errors; named, then raised
-        code = str((getattr(exc, "response", None) or {}).get("Error", {}).get("Code") or "")
+        code = _error_code(exc)
         raise SparkRunError(
             f"Spark build {run.build}: {uri} cannot be read to check it before the run "
             f"starts ({code or type(exc).__name__}); nothing was started"
@@ -227,6 +256,9 @@ def _artifact(run: DesiredRun, clients: ClientFactory, uri: str) -> bytes:
 class Adapter:
     runtime = ""
     service = ""
+    #: ``fluid apply`` uploads the run's job config ahead of it (OpenTofu, on AWS), which
+    #: ``--mode reconcile`` reads back (:meth:`deployed_job`).
+    uploads_job = True
 
     def __init__(self, run: DesiredRun, clients: Optional[ClientFactory]) -> None:
         self.run = run
@@ -238,11 +270,50 @@ class Adapter:
         """:func:`checked_run` of this adapter's run."""
         return checked_run(self.run, self.clients)
 
-    def runs(self) -> List[RunInfo]:  # newest first
+    def runs(self, since: Optional[float] = None) -> List[RunInfo]:
+        """The build's runs, newest first: every active one and the most recent ended ones,
+        reaching back to ``since`` (epoch seconds) where the runtime lists by page."""
         raise NotImplementedError
 
-    def start(self, token: str) -> str:
+    def start(self, token: str, restart_of: Optional[str] = None) -> str:
+        """Start the run; ``restart_of`` names the run that died, which it is started again
+        after (:meth:`DesiredRun.entry_args`)."""
         raise NotImplementedError
+
+    def check_target(self) -> None:
+        """Raise :class:`SparkRunError` when the run's target can take no new run (an EMR
+        cluster that ended); nothing where the runtime has no such state."""
+
+    def deployed_job(self) -> Optional[bytes]:
+        """The job config the last ``fluid apply`` uploaded (``job.json`` at the run's job
+        URI), or None when there is none.
+
+        Raises:
+            SparkRunError: it cannot be read (the message names the object and the code).
+        """
+        uri = self.run.job_uri
+        try:
+            body = _read_back(self.clients or default_clients, self.run.region, uri)
+        except Exception as exc:  # noqa: BLE001 - botocore is the [aws] extra
+            code = _error_code(exc) or type(exc).__name__
+            if code in ("NoSuchKey", "404", "NotFound"):
+                return None
+            denied = (
+                " (without s3:ListBucket on the bucket, a missing object reads as AccessDenied "
+                "too, and with SSE-KMS the identity also needs kms:Decrypt on its key)"
+                if code in ("AccessDenied", "403", "Forbidden")
+                else ""
+            )
+            raise SparkRunError(
+                f"the job config the last fluid apply uploaded ({uri}) cannot be read: "
+                f"{code}; the identity that reconciles needs s3:GetObject on it{denied}"
+            ) from exc
+        if len(body) > MAX_ARTIFACT_BYTES:
+            raise SparkRunError(
+                f"the job config at {uri} is over {MAX_ARTIFACT_BYTES} bytes, more than forge "
+                "ever uploads, so it is not the one fluid apply wrote; run fluid apply"
+            )
+        return body
 
     def get(self, run_id: str) -> RunInfo:
         raise NotImplementedError
@@ -347,11 +418,11 @@ class EmrServerless(Adapter):
             **ident,
         )
 
-    def runs(self) -> List[RunInfo]:
+    def runs(self, since: Optional[float] = None) -> List[RunInfo]:
         """Every active run of this build (all pages, filtered by state: a long-running job
         in a shared application is older than its newest runs), then its most recent ended
-        ones from :data:`LOOKBACK_PAGES` pages. Both modes: a stream moved to availableNow
-        still finds its old continuous job."""
+        ones from :data:`LOOKBACK_PAGES` pages, each one back to ``since`` among them. Both
+        modes: a stream moved to availableNow still finds its old continuous job."""
         app = self.application_id()
         paginator = self.client.get_paginator("list_job_runs")
         found: Dict[str, Mapping[str, Any]] = {}
@@ -371,8 +442,12 @@ class EmrServerless(Adapter):
             if number + 1 >= self.LOOKBACK_PAGES:
                 break
         ordered = sorted(found.items(), key=lambda kv: _ts(kv[1].get("createdAt")), reverse=True)
-        ended = [rid for rid, _ in ordered if rid not in active][:5]
-        return [self.get(rid) for rid, _ in ordered if rid in active or rid in ended]
+        ended = [rid for rid, _ in ordered if rid not in active]
+        # The last few, and every one back to ``since``: a restart budget counts them all.
+        kept = set(ended[:5]) | {
+            rid for rid in ended if since is not None and _ts(found[rid].get("createdAt")) >= since
+        }
+        return [self.get(rid) for rid, _ in ordered if rid in active or rid in kept]
 
     def _mine(self, summary: Mapping[str, Any]) -> bool:
         return summary.get("name") == self.run.run_name
@@ -381,7 +456,7 @@ class EmrServerless(Adapter):
         job = self.client.get_job_run(applicationId=self.application_id(), jobRunId=run_id)
         return self._info(job["jobRun"])
 
-    def start(self, token: str) -> str:
+    def start(self, token: str, restart_of: Optional[str] = None) -> str:
         r = self.checked()
         request: Dict[str, Any] = {
             "applicationId": self.application_id(),
@@ -392,7 +467,7 @@ class EmrServerless(Adapter):
             "jobDriver": {
                 "sparkSubmit": {
                     "entryPoint": r.runner_uri,
-                    "entryPointArguments": r.entry_args(),
+                    "entryPointArguments": r.entry_args(restart_of),
                     "sparkSubmitParameters": _submit_parameters(r.spark_conf),
                 }
             },
@@ -467,7 +542,7 @@ class Glue(Adapter):
             **_identity(flat),
         )
 
-    def runs(self) -> List[RunInfo]:
+    def runs(self, since: Optional[float] = None) -> List[RunInfo]:
         page = self.client.get_job_runs(JobName=self.job_name, MaxResults=25)
         runs = [self._info(j) for j in page.get("JobRuns") or []]
         return sorted(runs, key=lambda i: i.created, reverse=True)
@@ -475,15 +550,15 @@ class Glue(Adapter):
     def get(self, run_id: str) -> RunInfo:
         return self._info(self.client.get_job_run(JobName=self.job_name, RunId=run_id)["JobRun"])
 
-    def start(self, token: str) -> str:
+    def start(self, token: str, restart_of: Optional[str] = None) -> str:
         r = self.checked()
-        args = r.entry_args()
+        args = r.entry_args(restart_of)
         arguments = {args[i]: args[i + 1] for i in range(0, len(args), 2)}
         if r.spark_conf:
             # Glue takes Spark settings as one --conf argument: "a=b --conf c=d".
             pairs = [f"{k}={r.spark_conf[k]}" for k in sorted(r.spark_conf)]
             arguments["--conf"] = " --conf ".join(pairs)
-        # Retries are the Glue job's MaxRetries (the infra emit), not a run setting.
+        # The Glue job is emitted with MaxRetries 0: forge's reconcile restarts a stream.
         out = self.client.start_job_run(JobName=self.job_name, Arguments=arguments)
         return str(out["JobRunId"])
 
@@ -495,6 +570,14 @@ class Glue(Adapter):
 
 
 # --- EMR on EC2 ----------------------------------------------------------------------
+
+#: The cluster states AddJobFlowSteps takes a step in.
+_LIVE_CLUSTER = frozenset({"STARTING", "BOOTSTRAPPING", "RUNNING", "WAITING"})
+
+
+def _created(step: Mapping[str, Any]) -> float:
+    return _ts(((step.get("Status") or {}).get("Timeline") or {}).get("CreationDateTime"))
+
 
 _STEP = {
     "PENDING": PENDING,
@@ -528,13 +611,14 @@ class EmrEc2(Adapter):
             state=_STEP.get(raw, PENDING),
             raw_state=raw,
             details=str(failure.get("Message") or reason.get("Message") or ""),
-            created=_ts((status.get("Timeline") or {}).get("CreationDateTime")),
+            created=_created(step),
             **_identity((step.get("Config") or {}).get("Args") or []),
         )
 
-    def runs(self) -> List[RunInfo]:
+    def runs(self, since: Optional[float] = None) -> List[RunInfo]:
         """Every active step of this build (all pages: a shared cluster's newer steps can push
-        a long-running one off the first), then its most recent ended ones (one page)."""
+        a long-running one off the first), then its ended ones back to its last one, and back
+        to ``since`` (ListSteps lists newest first), at most :data:`LOOKBACK_PAGES` pages."""
         steps: Dict[str, Mapping[str, Any]] = {}
         pages = self.client.get_paginator("list_steps").paginate(
             ClusterId=self.cluster, StepStates=["PENDING", "RUNNING", "CANCEL_PENDING"]
@@ -542,17 +626,24 @@ class EmrEc2(Adapter):
         for page in pages:
             steps.update({str(s.get("Id")): s for s in page.get("Steps") or []})
         active = set(steps)
+        going = any(s.get("Name") == self.run.run_name for s in steps.values())
         # Ended steps, newest first, until this build's last one (a busy shared cluster's
         # newer steps would otherwise hide a failed run, and every apply would restart it).
         recent = self.client.get_paginator("list_steps").paginate(ClusterId=self.cluster)
+        found_ended = False
         for number, page in enumerate(recent):
             page_steps = page.get("Steps") or []
             for step in page_steps:
                 steps.setdefault(str(step.get("Id")), step)
-            if number + 1 >= self.LOOKBACK_PAGES or any(
+            found_ended = found_ended or any(
                 s.get("Name") == self.run.run_name and str(s.get("Id")) not in active
                 for s in page_steps
-            ):
+            )
+            # A restart budget counts the build's steps of the last hour: the page that
+            # reaches back past ``since`` holds the oldest of them.
+            reached = since is None or any(_created(s) < since for s in page_steps)
+            # A build with a step going needs no older end than the window.
+            if number + 1 >= self.LOOKBACK_PAGES or ((found_ended or going) and reached):
                 break
         mine = [s for s in steps.values() if s.get("Name") == self.run.run_name]
         return sorted((self._info(s) for s in mine), key=lambda i: i.created, reverse=True)
@@ -560,11 +651,49 @@ class EmrEc2(Adapter):
     def get(self, run_id: str) -> RunInfo:
         return self._info(self.client.describe_step(ClusterId=self.cluster, StepId=run_id)["Step"])
 
+    #: The cluster as DescribeCluster returned it for the next start (``(None,)`` when it
+    #: could not be read): the ended-cluster check and the role check share one read.
+    _cluster_read: Optional[tuple] = None
+
+    def _described(self) -> Optional[Mapping[str, Any]]:
+        """The cluster, read once for the next start; None when this identity cannot."""
+        if self._cluster_read is None:
+            try:
+                found = self.client.describe_cluster(ClusterId=self.cluster)["Cluster"]
+            except Exception:  # noqa: BLE001 - unreadable: the start reports what EMR says
+                found = None
+            self._cluster_read = (found,)
+        cluster: Optional[Mapping[str, Any]] = self._cluster_read[0]
+        return cluster
+
+    def check_target(self) -> None:
+        """Refuse a cluster that takes no new step: AddJobFlowSteps accepts only a cluster
+        that is STARTING, BOOTSTRAPPING, RUNNING or WAITING, so a stream whose cluster ended
+        (terminated, or with errors: its primary node lost) cannot start there again. A
+        cluster this identity cannot read is left to AddJobFlowSteps to report."""
+        cluster = self._described()
+        if cluster is None:
+            return
+        status = cluster.get("Status") or {}
+        state = str(status.get("State") or "")
+        if not state or state in _LIVE_CLUSTER:
+            return
+        reason = status.get("StateChangeReason") or {}
+        why = ": ".join(str(p) for p in (reason.get("Code"), reason.get("Message")) if p)
+        raise SparkRunError(
+            f"EMR cluster {self.cluster} is {state}{f' ({why})' if why else ''} and takes no "
+            "new step, so the stream cannot start there again. Point "
+            "parameters.spark.clusterId at a running cluster and run fluid apply: the stream "
+            "resumes from its checkpoint"
+        )
+
     def _role_policies(self) -> Optional[Dict[str, List[str]]]:
         """The roles the cluster's instance profile holds, each with the names of the
         policies attached to it; None when this identity cannot read them."""
+        cluster = self._described()
+        if cluster is None:
+            return None
         try:
-            cluster = self.client.describe_cluster(ClusterId=self.cluster)["Cluster"]
             profile = str((cluster.get("Ec2InstanceAttributes") or {}).get("IamInstanceProfile"))
             iam = self.clients("iam", self.run.region)
             found = iam.get_instance_profile(InstanceProfileName=profile.rsplit("/", 1)[-1])
@@ -584,8 +713,8 @@ class EmrEc2(Adapter):
         """A step runs as the cluster's instance-profile role, which the cluster's owner
         holds: the build's least-privilege policy, which ``fluid apply`` creates, must be
         attached to it before a step can read and write what the build does. A step started
-        without it fails at once, and a stream that failed is not started again with the same
-        config, so the start is refused until it is attached. A build that names its own
+        without it fails at once, and each such failure would spend a stream's restart
+        budget, so the start is refused until it is attached. A build that names its own
         ``executionRoleArn`` has no forge policy to check."""
         policy = _names.execution_role_name(self.run.product, self.run.build)
         if not self.run.role_arn.endswith(f":role/{policy}"):
@@ -601,8 +730,11 @@ class EmrEc2(Adapter):
             f"--role-name {role} --policy-arn {arn}"
         )
 
-    def start(self, token: str) -> str:
-        self._refuse_unless_attached()
+    def start(self, token: str, restart_of: Optional[str] = None) -> str:
+        try:
+            self._refuse_unless_attached()
+        finally:
+            self._cluster_read = None  # a later start reads the cluster again
         r = self.checked()
         args = [
             "spark-submit",
@@ -613,7 +745,7 @@ class EmrEc2(Adapter):
             "client",
             *_conf_params(r.spark_conf),
             r.runner_uri,
-            *r.entry_args(),
+            *r.entry_args(restart_of),
         ]
         out = self.client.add_job_flow_steps(
             JobFlowId=self.cluster,
@@ -676,7 +808,7 @@ class EmrEks(Adapter):
             **_identity(driver.get("entryPointArguments") or [], job.get("tags")),
         )
 
-    def runs(self) -> List[RunInfo]:
+    def runs(self, since: Optional[float] = None) -> List[RunInfo]:
         page = self.client.list_job_runs(virtualClusterId=self.cluster, name=self.run.run_name)
         runs = [self._info(j) for j in page.get("jobRuns") or []]
         return sorted(runs, key=lambda i: i.created, reverse=True)
@@ -685,7 +817,7 @@ class EmrEks(Adapter):
         out = self.client.describe_job_run(id=run_id, virtualClusterId=self.cluster)
         return self._info(out["jobRun"])
 
-    def start(self, token: str) -> str:
+    def start(self, token: str, restart_of: Optional[str] = None) -> str:
         r = self.checked()
         request: Dict[str, Any] = {
             "name": r.run_name,
@@ -696,7 +828,7 @@ class EmrEks(Adapter):
             "jobDriver": {
                 "sparkSubmitJobDriver": {
                     "entryPoint": r.runner_uri,
-                    "entryPointArguments": r.entry_args(),
+                    "entryPointArguments": r.entry_args(restart_of),
                     "sparkSubmitParameters": _submit_parameters(r.spark_conf),
                 }
             },
@@ -721,6 +853,7 @@ class Local(Adapter):
     properties file and the artifact root."""
 
     runtime, service = "local", ""
+    uploads_job = False
 
     def __init__(self, run: DesiredRun, host: Any) -> None:
         from fluid_build.build_runners.spark._local import LocalRuns, default_host, require_posix
@@ -733,27 +866,36 @@ class Local(Adapter):
     def where(self) -> str:
         return self._runs.where()
 
-    def runs(self) -> List[RunInfo]:
+    def runs(self, since: Optional[float] = None) -> List[RunInfo]:
         return self._runs.runs()
 
     def get(self, run_id: str) -> RunInfo:
         return self._runs.get(run_id)
 
-    def start(self, token: str) -> str:
+    def start(self, token: str, restart_of: Optional[str] = None) -> str:
         from fluid_build.build_runners.spark._local import start_run
         from fluid_build.spark import runner_source
 
-        return start_run(self.host, self.run, token, runner_text=runner_source())
+        return start_run(
+            self.host, self.run, token, runner_text=runner_source(), restart_of=restart_of
+        )
+
+    def deployed_job(self) -> Optional[bytes]:
+        """None: nothing uploads a local run's job config ahead of it; each start writes the
+        one the contract compiles to (:func:`~._local.publish`)."""
+        return None
 
     def cancel(self, run_id: str) -> None:
         self._runs.cancel(run_id)
 
-    def retry_hint(self, run_id: str) -> str:
-        """How to retry a failed run whose cause was this machine's, not the contract's: the
-        operator's spark-submit or properties file are not in the config hash."""
+    def retry_hint(self) -> str:
+        """How to start a stream whose restarts are spent sooner, when the cause was this
+        machine's, not the contract's (the operator's spark-submit or properties file are not
+        in the config hash): its run history here is its budget's record."""
         return (
             "; when the cause was this machine's (spark-submit, its properties file), remove "
-            f"{self._runs.dir / 'runs' / run_id} and fluid apply starts it again"
+            f"{self._runs.dir / 'runs'} (the build's run history here) and fluid apply starts "
+            "it again"
         )
 
 

@@ -355,7 +355,7 @@ inside a pipeline any more than they can by hand. `fluid generate ci --system` t
 parameterises every stage, the apply mode and the publish targets so an operator picks them from a
 dialog instead of editing Groovy. The
 [pipeline walkthrough](https://agenticstiger.github.io/forge_docs/walkthrough/11-stage-pipeline.html)
-covers every stage and the six apply modes.
+covers every stage and the apply modes.
 
 Where to go next in the documentation, depending on what you are trying to do:
 
