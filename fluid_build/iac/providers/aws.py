@@ -1008,6 +1008,21 @@ class AwsIacPlugin:
         leaves the contract or the product goes."""
         return [addr for addr, kind in removals if aws_ingest.spark_definition(addr, kind)]
 
+    def prepare_destroys(
+        self,
+        contract: Mapping[str, Any],
+        destroyed: Iterable[Mapping[str, Any]],
+        say: Optional[Callable[[str], None]] = None,
+        dry_run: bool = False,
+        client_factory: Optional[Callable[[str, str], Any]] = None,
+    ) -> None:
+        """Before ``tofu apply``: refuse an IAM policy the plan destroys that is still
+        attached, then stop the forge Spark runs going on with what it destroys
+        (``aws_spark_destroys``). ``dry_run`` reads and changes nothing."""
+        from .aws_spark_destroys import prepare
+
+        prepare(destroyed, say or print, dry_run=dry_run, clients=client_factory)
+
     def provider_block_for(self, contract: Mapping[str, Any]) -> Dict[str, Any]:
         """``provider_block``, plus the region the contract's AWS bindings name.
 
