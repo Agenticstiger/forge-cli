@@ -568,3 +568,126 @@ def test_ec2_history_pages_until_this_builds_last_step(ec2_run):
     )
     assert [(r.run_id, r.state) for r in adapter.runs()] == [("s-mine", "FAILED")]
     stub.assert_no_pending_responses()
+
+
+# --- restarts, the restart window, the cluster's state, the uploaded job config ---------
+
+
+def test_a_restart_carries_the_run_it_restarts_and_reads_back_as_one(ec2_run):
+    adapter, stub = adapter_on(ec2_run, "emr")
+    args = ["spark-submit", "--deploy-mode", "client", *ad._conf_params(ec2_run.spark_conf)]
+    args += [ec2_run.runner_uri, *ec2_run.entry_args(), "--fluid-restart-of", "s-dead"]
+    stub.add_response(
+        "add_job_flow_steps",
+        {"StepIds": ["s-2"]},
+        {"JobFlowId": "j-ABC", "Steps": [{
+            "Name": ec2_run.run_name,
+            "ActionOnFailure": "CONTINUE",
+            "HadoopJarStep": {"Jar": "command-runner.jar", "Args": args},
+        }]},
+    )  # fmt: skip
+    assert adapter.start("tok", restart_of="s-dead") == "s-2"
+    step = _step(ec2_run, "s-2", "RUNNING", NOW)
+    step["Config"]["Args"] = args
+    stub.add_response("describe_step", {"Step": step}, {"ClusterId": "j-ABC", "StepId": "s-2"})
+    restarted = adapter.get("s-2")
+    assert (restarted.restart_of, restarted.config_hash) == ("s-dead", ec2_run.config_hash)
+
+
+def test_serverless_restart_marks_its_arguments(serverless):
+    adapter, stub = adapter_on(serverless, "emr-serverless")
+    request = _serverless_start(serverless)
+    request["jobDriver"]["sparkSubmit"]["entryPointArguments"] += ["--fluid-restart-of", "jr0"]
+    request["retryPolicy"] = {"maxFailedAttemptsPerHour": 5}
+    stub.add_response(
+        "start_job_run", {"applicationId": "app1", "jobRunId": "jr1", "arn": ARN}, request
+    )
+    assert adapter.start("tok", restart_of="jr0") == "jr1"
+
+
+def test_ec2_history_pages_back_to_the_restart_window(ec2_run):
+    """This build's last step is on page one, but a budget counts its steps of the last
+    hour: ListSteps lists newest first, so it pages until a step is older than ``since``."""
+    adapter, stub = adapter_on(ec2_run, "emr")
+    active = {"ClusterId": "j-ABC", "StepStates": ["PENDING", "RUNNING", "CANCEL_PENDING"]}
+    stub.add_response("list_steps", {"Steps": []}, active)
+    stub.add_response(
+        "list_steps",
+        {"Steps": [_step(ec2_run, "s-3", "FAILED", NOW)], "Marker": "m"},
+        {"ClusterId": "j-ABC"},
+    )
+    stub.add_response(
+        "list_steps",
+        {"Steps": [
+            _step(ec2_run, "s-2", "FAILED", NOW - dt.timedelta(minutes=30)),
+            _step(ec2_run, "s-1", "FAILED", NOW - dt.timedelta(minutes=90)),
+        ], "Marker": "m2"},
+        {"ClusterId": "j-ABC", "Marker": "m"},
+    )  # fmt: skip
+    since = (NOW - dt.timedelta(hours=1)).timestamp()
+    assert [r.run_id for r in adapter.runs(since=since)] == ["s-3", "s-2", "s-1"]
+    stub.assert_no_pending_responses()  # not the page after the one that reached ``since``
+
+
+def _cluster(state, code=None, message=None):
+    reason = {k: v for k, v in (("Code", code), ("Message", message)) if v}
+    return {"Cluster": {"Id": "j-ABC", "Status": {"State": state, "StateChangeReason": reason}}}
+
+
+@pytest.mark.parametrize("state", ["STARTING", "BOOTSTRAPPING", "RUNNING", "WAITING"])
+def test_a_cluster_that_takes_steps_passes_the_check(ec2_run, state):
+    adapter, stub = adapter_on(ec2_run, "emr")
+    stub.add_response("describe_cluster", _cluster(state), {"ClusterId": "j-ABC"})
+    adapter.check_target()
+
+
+def test_a_cluster_that_ended_is_refused_with_its_reason(ec2_run):
+    adapter, stub = adapter_on(ec2_run, "emr")
+    stub.add_response(
+        "describe_cluster",
+        _cluster("TERMINATED_WITH_ERRORS", "INSTANCE_FAILURE", "Primary node lost"),
+        {"ClusterId": "j-ABC"},
+    )
+    with pytest.raises(ad.SparkRunError) as raised:
+        adapter.check_target()
+    assert "j-ABC is TERMINATED_WITH_ERRORS (INSTANCE_FAILURE: Primary node lost)" in str(
+        raised.value
+    )
+    assert "Point parameters.spark.clusterId at a running cluster" in str(raised.value)
+
+
+def test_a_cluster_this_identity_cannot_read_is_left_to_the_start(ec2_run):
+    adapter, stub = adapter_on(ec2_run, "emr")
+    stub.add_client_error("describe_cluster", "AccessDeniedException", "not allowed")
+    adapter.check_target()  # AddJobFlowSteps reports what EMR says
+
+
+def test_the_uploaded_job_config_is_read_back(ec2_run):
+    s3, stub = stubbed("s3", ec2_run.region)
+    emr = boto3.client("emr", region_name=ec2_run.region)
+    adapter = ad.adapter_for(ec2_run, lambda service, region: s3 if service == "s3" else emr)
+    bucket, _, key = ec2_run.job_uri[len("s3://") :].partition("/")
+    import io
+
+    from botocore.response import StreamingBody
+
+    body = b'{"mode": "streaming"}\n'
+    stub.add_response(
+        "get_object",
+        {"Body": StreamingBody(io.BytesIO(body), len(body))},
+        {"Bucket": bucket, "Key": key},
+    )
+    assert adapter.deployed_job() == body.decode()
+    stub.add_client_error("get_object", "NoSuchKey", "gone", 404)
+    assert adapter.deployed_job() is None
+    stub.add_client_error("get_object", "AccessDenied", "no", 403)
+    with pytest.raises(ad.SparkRunError, match="needs s3:GetObject on it"):
+        adapter.deployed_job()
+    huge = b" " * (ad.MAX_JOB_BYTES + 10)
+    stub.add_response(
+        "get_object",
+        {"Body": StreamingBody(io.BytesIO(huge), len(huge))},
+        {"Bucket": bucket, "Key": key},
+    )
+    with pytest.raises(ad.SparkRunError, match="more than forge ever uploads"):
+        adapter.deployed_job()

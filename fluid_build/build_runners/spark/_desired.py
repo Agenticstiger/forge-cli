@@ -41,6 +41,10 @@ LOCAL_ROOT_TOKEN = "${fluid_spark_local_root}"
 #: ``execution.retries.maxAttempts``: AWS's own default. AWS allows 1 to 10.
 DEFAULT_STREAMING_ATTEMPTS_PER_HOUR = 5
 _MAX_STREAMING_ATTEMPTS_PER_HOUR = 10
+#: The window a stream's restarts are counted in (:attr:`DesiredRun.restarts_per_hour`).
+RESTART_WINDOW_S = 3600.0
+#: The runner argument that marks a run started again after another one died.
+RESTART_FLAG = "--fluid-restart-of"
 
 # EMR 7.x paths and the Maven coordinates the runner's docstring lists (Spark 3.5).
 _EMR_ICEBERG_JAR = "/usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar"
@@ -178,6 +182,12 @@ class DesiredRun:
     checkpoint_id: Optional[str] = None
     checkpoint: Optional[str] = None
     topic: Optional[str] = None
+    #: How many times forge's reconcile starts a stream that died again in any rolling hour
+    #: (:data:`RESTART_WINDOW_S`, :func:`restart_budget`); a run that ended FAILED where the
+    #: service retries runs itself is never started again (``_adapters.SERVICE_RETRIES``).
+    #: 0 for a run that ends on its own. A reconcile setting, never sent to the runtime: not
+    #: in the config hash.
+    restarts_per_hour: int = 0
     job_text: str = field(default="", repr=False, compare=False)
 
     @property
@@ -241,8 +251,11 @@ class DesiredRun:
             args += ["--fluid-checkpoint", self.checkpoint_id]
         return args
 
-    def entry_args(self) -> List[str]:
-        return ["--config", self.job_uri, *self.identity_args()]
+    def entry_args(self, restart_of: Optional[str] = None) -> List[str]:
+        """The runner's arguments. ``restart_of`` marks a run started again after the run it
+        names died: the reconcile counts those marks against :attr:`restarts_per_hour`."""
+        mark = [RESTART_FLAG, restart_of] if restart_of else []
+        return ["--config", self.job_uri, *self.identity_args(), *mark]
 
     def tags(self) -> Dict[str, str]:
         tags = {
@@ -297,6 +310,29 @@ def _retry_attempts(build: Mapping[str, Any]) -> Optional[int]:
     retries = (build.get("execution") or {}).get("retries")
     attempts = retries.get("maxAttempts") if isinstance(retries, Mapping) else None
     return attempts if isinstance(attempts, int) and attempts >= 1 else None
+
+
+def restart_budget(build: Mapping[str, Any], scheduled: bool = False) -> int:
+    """How many restarts a stream gets per rolling hour: ``execution.retries.maxAttempts``,
+    else :data:`DEFAULT_STREAMING_ATTEMPTS_PER_HOUR`, at most
+    :data:`_MAX_STREAMING_ATTEMPTS_PER_HOUR`: the numbers EMR Serverless applies to its own
+    streaming retries (``maxFailedAttemptsPerHour``), so a stream restarts as often on
+    every runtime. A run that ends on its own (``scheduled``) is never restarted: 0."""
+    if scheduled:
+        return 0
+    return min(
+        _retry_attempts(build) or DEFAULT_STREAMING_ATTEMPTS_PER_HOUR,
+        _MAX_STREAMING_ATTEMPTS_PER_HOUR,
+    )
+
+
+def _started_with_retry(runtime: str, attempts: Optional[int]) -> Optional[int]:
+    """The retry setting a run is started with, as the config hash covers it: EMR on EC2 and
+    local runs take none (``execution.retries`` is their restart budget, a reconcile
+    setting), so a new budget restarts nothing there."""
+    from fluid_build.spark.compiler import LOCAL_RUNTIME
+
+    return None if runtime in ("emr-ec2", LOCAL_RUNTIME) else attempts
 
 
 def _submit_conf(
@@ -678,7 +714,7 @@ def desired_runs(
             "release": release,
             "glueVersion": glue_version,
             "sparkConf": spark_conf,
-            "retry": attempts,
+            "retry": _started_with_retry(runtime, attempts),
         }
         if runtime == "glue":
             # The pinned jars the Glue job loads (--extra-jars), from the same function and
@@ -716,6 +752,7 @@ def desired_runs(
                 checkpoint_id=_sha(checkpoint)[:16] if checkpoint else None,
                 checkpoint=checkpoint,
                 topic=source.get("topic") if isinstance(source, Mapping) else None,
+                restarts_per_hour=restart_budget(build, scheduled),
                 job_text=job.text,
             )
         )

@@ -388,18 +388,21 @@ def _union(first: str, second: str, *, by_artifact: bool) -> str:
     return ",".join(items)
 
 
-def submit_argv(sub: Submitter, run: DesiredRun, runner: Optional[str] = None) -> List[str]:
+def submit_argv(
+    sub: Submitter, run: DesiredRun, runner: Optional[str] = None, restart_of: Optional[str] = None
+) -> List[str]:
     """spark-submit's argv for ``run`` (bound to the artifact root): client mode, so the
     driver is the run's own process and stopping the run stops the job, as the EMR on EC2
     adapter submits a step. ``runner`` is the runner spark-submit runs (:func:`pull_runner`),
-    else the one at the artifact root."""
+    else the one at the artifact root; ``restart_of`` marks a restart
+    (:meth:`DesiredRun.entry_args`)."""
     argv = [sub.executable, "--name", run.run_name, "--deploy-mode", "client"]
     if sub.properties_file is not None:
         argv += ["--properties-file", str(sub.properties_file)]
     conf = merge_conf(run.spark_conf, sub.properties)
     for name in sorted(conf):
         argv += ["--conf", f"{name}={conf[name]}"]
-    return [*argv, runner or run.runner_uri, *run.entry_args()]
+    return [*argv, runner or run.runner_uri, *run.entry_args(restart_of)]
 
 
 def pull_runner(sub: Submitter, run: DesiredRun, where: Path) -> Optional[str]:
@@ -627,9 +630,9 @@ class LocalRuns:
         elif cancelled:
             state, raw = CANCELLED, "CANCELLED"
         elif signalled:
-            # Stopped from outside forge (its machine shut down, a kill), as a job run
-            # cancelled by hand on AWS: it did not fail, and its config starts again.
-            state, raw = CANCELLED, f"STOPPED (signal {signalled})"
+            # Stopped from outside forge (its machine shut down, a kill): it died, as a run
+            # whose node is lost does on a cluster. Only forge's cancel mark is a cancel.
+            state, raw, lost = FAILED, f"STOPPED (signal {signalled})", True
             details = "a signal from outside forge stopped it (its machine shut down, or a kill)"
         elif "ended" in status:
             code = status.get("exitCode")
@@ -651,6 +654,7 @@ class LocalRuns:
             details=details,
             created=float(record.get("created") or 0),
             lost=lost,
+            restart_of=record.get("restartOf") or None,
         )
 
     def cancel(
@@ -731,8 +735,16 @@ def _locked(path: Path) -> Iterator[None]:
         os.close(fd)
 
 
-def start_run(host: LocalHost, run: DesiredRun, token: str, *, runner_text: str) -> str:
-    """Start ``run`` on this machine and return its id once spark-submit has started.
+def start_run(
+    host: LocalHost,
+    run: DesiredRun,
+    token: str,
+    *,
+    runner_text: str,
+    restart_of: Optional[str] = None,
+) -> str:
+    """Start ``run`` on this machine and return its id once spark-submit has started;
+    ``restart_of`` names the run that died, which it is started again after.
 
     Writes the artifacts, then a run directory with the run's record, then starts the
     supervisor detached (its own session, so a terminal's Ctrl-C does not reach a stream)
@@ -759,7 +771,7 @@ def start_run(host: LocalHost, run: DesiredRun, token: str, *, runner_text: str)
         run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(created)) + "-" + uuid.uuid4().hex[:8]
         where = runs.dir / "runs" / run_id
         where.mkdir(parents=True)
-        argv = submit_argv(sub, bound, pull_runner(sub, bound, where))
+        argv = submit_argv(sub, bound, pull_runner(sub, bound, where), restart_of)
         record = {
             "runId": run_id,
             "product": run.product,
@@ -773,6 +785,8 @@ def start_run(host: LocalHost, run: DesiredRun, token: str, *, runner_text: str)
             "created": created,
             "argv": argv,
         }
+        if restart_of:
+            record["restartOf"] = restart_of
         fd = os.open(where / LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             # Taken before the supervisor exists and handed to it: the run is never seen

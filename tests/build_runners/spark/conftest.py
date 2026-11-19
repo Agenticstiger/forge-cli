@@ -56,3 +56,42 @@ def run(contract) -> DesiredRun:
 def variant(run: DesiredRun, runtime: str, target: dict, **changes) -> DesiredRun:
     """``run`` moved to another runtime: adapters read only the run's fields."""
     return dataclasses.replace(run, runtime=runtime, target=target, **changes)
+
+
+class Clock:
+    """A fake monotonic clock: ``sleep`` moves it on."""
+
+    def __init__(self):
+        self.t = 0.0
+        self.slept = []
+
+    def now(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.t += seconds
+
+
+@pytest.fixture
+def clock():
+    return Clock()
+
+
+@pytest.fixture
+def use(monkeypatch):
+    """Make the reconcile's ``adapter_for`` return the fake (and count how often it is built)."""
+    from fluid_build.build_runners.spark import _reconcile as rc
+
+    built = []
+
+    def install(fake):
+        def adapter_for(run, clients=None, local_host=None):
+            built.append(run)
+            fake.run = run  # a real adapter holds its (account-bound) run
+            return fake
+
+        monkeypatch.setattr(rc, "adapter_for", adapter_for)
+        return built
+
+    return install
