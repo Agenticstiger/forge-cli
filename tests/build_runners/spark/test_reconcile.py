@@ -82,7 +82,7 @@ def use(monkeypatch):
     built = []
 
     def install(fake):
-        def adapter_for(run, clients=None):
+        def adapter_for(run, clients=None, local_host=None):
             built.append(run)
             fake.run = run  # a real adapter holds its (account-bound) run
             return fake
@@ -230,7 +230,7 @@ def test_an_aws_error_is_that_builds_outcome_and_the_others_still_reconcile(
     good = FakeAdapter()
     good.run = second
 
-    def build(r, clients=None):
+    def build(r, clients=None, local_host=None):
         if r.build == "ingest-orders":
             raise ClientError(
                 {"Error": {"Code": "AccessDeniedException", "Message": "no"}}, "ListJobRuns"
@@ -333,7 +333,7 @@ def test_run_once_has_no_run_to_start_for_a_stream(run, clock, use):
 
 
 def test_run_once_turns_an_aws_error_into_an_outcome(scheduled, clock, monkeypatch):
-    def boom(run, clients=None):
+    def boom(run, clients=None, local_host=None):
         raise rc.SparkRunError("no application")
 
     monkeypatch.setattr(rc, "adapter_for", boom)

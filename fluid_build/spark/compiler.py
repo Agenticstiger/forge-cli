@@ -16,9 +16,13 @@ says everything the job does, so the runner holds no contract logic:
   the output rows from it, compiled from ``properties.mapping`` in the Spark dialect,
   or the contract's own ``properties.sql`` when the operator lists the build in
   :data:`CONTRACT_SQL_ALLOWLIST_ENV`;
-- the trigger, watermark and checkpoint of a streaming job;
+- the trigger, watermark and checkpoint of a streaming job, and where the records it cannot
+  land go (``properties.stream.deadLetter``, :mod:`fluid_build.spark.dead_letter`);
 - the sink: one Iceberg table in the Glue catalog, at the warehouse
-  :func:`fluid_build.providers.aws.util.warehouse.get_iceberg_warehouse` derives.
+  :func:`fluid_build.providers.aws.util.warehouse.get_iceberg_warehouse` derives; or, for
+  ``runtime: local``, one table in an Iceberg REST catalog the operator's Spark
+  configuration declares, with the statements that create it when nothing has (on AWS,
+  OpenTofu creates the table before the job runs).
 
 The text is canonical JSON (sorted keys, one trailing newline), so the same contract
 always gives the same bytes and digest. It holds no credential: a registry password
@@ -40,17 +44,20 @@ from urllib.parse import urlsplit
 
 from fluid_build.providers._iceberg_catalog import (
     FAMILY_GLUE,
+    FAMILY_REST,
     catalog_kind_info,
     resolve_iceberg_catalog,
 )
 from fluid_build.providers._sql_safety import validate_ident
 from fluid_build.providers.aws.util.warehouse import bucket_uses_fallback, normalize_location
+from fluid_build.spark import dead_letter
 from fluid_build.streaming.mapping import (
     bind_by_name,
     compile_select,
     parse_stream,
     spark_schema,
     spark_source_select,
+    spark_type,
 )
 from fluid_build.streaming.types import parse_fields
 
@@ -62,19 +69,34 @@ CONFIG_VERSION = 1
 #: streaming.policy), which a tier-0 leaf importing this module must not.
 CONTRACT_SQL_ALLOWLIST_ENV = "FLUID_SPARK_CONTRACT_SQL_ALLOWLIST"
 #: Operator-only: the existing runtimes and MSK clusters a contract may name, as
-#: ``<runtime>:<id>`` or ``msk:<cluster ARN>``. A job reads whichever cluster its build
-#: names, with a role that may read it, so a contract naming another team's cluster would
-#: read that team's topics. Unset allows none. The IaC applies the same list
+#: ``<runtime>:<id>`` or ``msk:<cluster ARN>``, and the topics a stream's dead letters may
+#: be written to, as ``msk-write:<cluster ARN>/<topic>`` or, for a cluster named by
+#: ``bootstrapServers``, ``kafka-write:<host:port>/<topic>`` for each broker. A job reads
+#: whichever cluster its build names, with a role that may read it, so a contract naming
+#: another team's cluster would read that team's topics, and write the one its dead
+#: letters go to. Unset allows none. A write needs its entry on every runtime, a broker
+#: at a private address included. The IaC applies the same list
 #: (``iac/providers/aws_identity.py``).
 TARGET_ALLOWLIST_ENV = "FLUID_SPARK_TARGET_ALLOWLIST"
+#: Operator-only: where a local run (``runtime: local``) may create or write tables in the
+#: operator's Iceberg REST catalog, as ``<warehouse>/<namespace prefix>``, comma-separated.
+#: ``<warehouse>`` is the binding's ``location.warehouse``, or ``fluid`` (the Spark catalog
+#: the operator's properties file declares) when it names none; a prefix matches whole
+#: namespace levels (``sales`` covers ``sales`` and ``sales.eu``, never ``salesforce``).
+#: The job creates its tables ``IF NOT EXISTS``, so without the list a contract could name
+#: another team's table and append to it. Unset allows none. On AWS the IaC owns the table.
+LOCAL_NAMESPACE_ALLOWLIST_ENV = "FLUID_SPARK_LOCAL_NAMESPACE_ALLOWLIST"
 #: The Spark catalog the runner registers for the Glue catalog, and the default one,
 #: so contract SQL names a table as ``<database>.<table>``.
 CATALOG = "fluid"
 KAFKA_AUTH = ("msk-iam", "none")
-RUNTIMES = ("emr-serverless", "emr-ec2", "emr-eks", "glue")
+#: The runtime that runs the job with spark-submit on the machine ``fluid apply`` runs on.
+LOCAL_RUNTIME = "local"
+AWS_RUNTIMES = ("emr-serverless", "emr-ec2", "emr-eks", "glue")
+RUNTIMES = (*AWS_RUNTIMES, LOCAL_RUNTIME)
 MODES = ("streaming", "batch")
 #: The ``properties.stream`` keys only an engine reads; the rest describe the records.
-_ENGINE_KEYS = ("trigger", "watermark", "checkpoint", "startingOffsets", "registry")
+_ENGINE_KEYS = ("trigger", "watermark", "checkpoint", "startingOffsets", "registry", "deadLetter")
 _PRODUCT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _BUILD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _BROKER = r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,252}[A-Za-z0-9])?:[0-9]{1,5}"
@@ -313,6 +335,111 @@ def cluster_listed(arn: str, environ: Any = None) -> bool:
     return f"msk:{arn}" in entries
 
 
+def _target_entries(environ: Any) -> list[str]:
+    env = os.environ if environ is None else environ
+    return [e.strip() for e in (env.get(TARGET_ALLOWLIST_ENV) or "").split(",") if e.strip()]
+
+
+def dead_letter_write_entries(kafka: Mapping[str, Any], topic: str) -> list[str]:
+    """The operator entries a stream's dead-letter topic needs: ``msk-write:<ARN>/<topic>``
+    for a cluster named by ARN, else ``kafka-write:<host:port>/<topic>`` for each broker
+    the build lists (any of them may take the write)."""
+    if kafka.get("mskClusterArn"):
+        return [f"msk-write:{kafka['mskClusterArn']}/{topic}"]
+    servers = str(kafka.get("bootstrapServers") or "").split(",")
+    return list(dict.fromkeys(f"kafka-write:{s.strip()}/{topic}" for s in servers if s.strip()))
+
+
+def unlisted_dead_letter_writes(
+    kafka: Mapping[str, Any], topic: str, environ: Any = None
+) -> list[str]:
+    """The entries of :func:`dead_letter_write_entries` the operator has not listed."""
+    listed = set(_target_entries(environ))
+    return [e for e in dead_letter_write_entries(kafka, topic) if e not in listed]
+
+
+def _refuse_unless_dead_letter_topic_listed(
+    bid: Any, kafka: Mapping[str, Any], topic: str, environ: Any
+) -> None:
+    """A stream writes its dead letters to the topic its contract names, on the cluster it
+    reads: without the operator's entry, a contract could write into any topic there."""
+    from fluid_build._errors import doc_url
+    from fluid_build.spark.policy import SparkPolicyError
+
+    missing = unlisted_dead_letter_writes(kafka, topic, environ)
+    if not missing:
+        return
+    listed = ",".join([*_target_entries(environ), *missing])
+    raise SparkPolicyError(
+        what=f"Spark build {bid!r} writes dead letters to a topic the operator has not listed",
+        why=(
+            f"properties.stream.deadLetter.topic {topic} is not in {TARGET_ALLOWLIST_ENV} "
+            f"(as {', '.join(missing)}). The job writes the topic its contract names, on the "
+            "cluster it reads, so a contract could write into another team's topic there. "
+            "A write needs its entry on every runtime, a broker at a private address "
+            "included; an unset list allows none."
+        ),
+        fix=(
+            "If this topic is the product's, have the operator list it in the OPERATOR "
+            f'environment (not a project .env): export {TARGET_ALLOWLIST_ENV}="{listed}"'
+        ),
+        doc=doc_url(),
+    )
+
+
+def local_namespace_scope(resolved: Any) -> str:
+    """The warehouse part of a local output's namespace entry (:data:`LOCAL_NAMESPACE_ALLOWLIST_ENV`)."""
+    return str(resolved.warehouse or CATALOG)
+
+
+def local_namespace_listed(scope: str, namespace: str, environ: Any = None) -> bool:
+    """Whether the operator lets a local run write tables in ``scope``'s ``namespace``."""
+    env = os.environ if environ is None else environ
+    levels = namespace.split(".")
+    for entry in (env.get(LOCAL_NAMESPACE_ALLOWLIST_ENV) or "").split(","):
+        # The last "/": a warehouse may hold one (s3://b/wh, team/wh), a namespace never.
+        where, _, prefix = entry.strip().rpartition("/")
+        wanted = prefix.split(".") if prefix else []
+        if where == scope and wanted and all(wanted) and levels[: len(wanted)] == wanted:
+            return True
+    return False
+
+
+def _refuse_unless_namespace_listed(
+    bid: Any, scope: str, namespace: str, tables: list[str], environ: Any
+) -> None:
+    """A local run creates its tables ``IF NOT EXISTS`` in the operator's catalog, so a
+    table that exists is adopted and appended to: the namespace must be the operator's
+    choice, never the contract's (a product-id table property would be the contract's)."""
+    from fluid_build._errors import doc_url
+    from fluid_build.spark.policy import SparkPolicyError
+
+    if local_namespace_listed(scope, namespace, environ):
+        return
+    env = os.environ if environ is None else environ
+    listed = ",".join(
+        [
+            *(e.strip() for e in (env.get(LOCAL_NAMESPACE_ALLOWLIST_ENV) or "").split(",")),
+            f"{scope}/{namespace}",
+        ]
+    ).lstrip(",")
+    raise SparkPolicyError(
+        what=f"Spark build {bid!r} writes a namespace the operator has not listed",
+        why=(
+            f"A local run writes {', '.join(tables)} in namespace {namespace} of "
+            f"{scope}, which {LOCAL_NAMESPACE_ALLOWLIST_ENV} does not list (as "
+            f"{scope}/{namespace}). It creates its tables IF NOT EXISTS, so a table that "
+            "exists, another team's included, would be adopted and appended to. An unset "
+            "list allows none."
+        ),
+        fix=(
+            "If this namespace is the product's, have the operator list it in the OPERATOR "
+            f'environment (not a project .env): export {LOCAL_NAMESPACE_ALLOWLIST_ENV}="{listed}"'
+        ),
+        doc=doc_url(),
+    )
+
+
 def _refuse_unless_cluster_listed(product: Any, bid: Any, arn: str, environ: Any) -> None:
     """The MSK cluster an ARN source names needs the operator's entry: its brokers come
     from AWS, so the host allowlist never sees them (``fluid validate`` warns instead)."""
@@ -433,12 +560,23 @@ def _registry(
     return result
 
 
-def _decoders(stream: Any, registry: Optional[Mapping[str, Any]]) -> dict[str, Any]:
-    """How the runner decodes ``value`` and ``key``, by the stream's formats."""
+def _decoders(
+    stream: Any, registry: Optional[Mapping[str, Any]], *, dead_letters: bool = False
+) -> dict[str, Any]:
+    """How the runner decodes ``value`` and ``key``, by the stream's formats. With dead
+    letters, a JSON record that does not decode is kept, its text in Spark's corrupt-record
+    column for the check query."""
+    from fluid_build.spark.dead_letter import CORRUPT_COLUMN
 
     def decoder(fmt: str, fields: Any, subject: Optional[str]) -> dict[str, Any]:
         if fmt == "json":
-            return {"format": "json", "schema": spark_schema(fields)}
+            if not dead_letters:
+                return {"format": "json", "schema": spark_schema(fields)}
+            return {
+                "format": "json",
+                "schema": f"{spark_schema(fields)}, `{CORRUPT_COLUMN}` STRING",
+                "corruptRecord": CORRUPT_COLUMN,
+            }
         if fmt == "avro-confluent":
             version = registry["version"] if subject == registry["subject"] else "latest"
             return {
@@ -509,6 +647,121 @@ def _contract_sql(sql: Any, bid: str) -> str:
     return sql
 
 
+def _check_local_source(local: bool, kafka: Mapping[str, Any], where: str) -> None:
+    if local and kafka["mskClusterArn"] is not None:
+        raise ValueError(
+            f"{where}: parameters.spark.source: a local run reads bootstrapServers; "
+            "nothing resolves an MSK cluster's brokers for it (keep mskClusterArn in the "
+            "AWS environment's overlay)"
+        )
+
+
+def _checkpoint(declared: Any, bucket: Optional[str], product: str, bid: str, where: str) -> str:
+    """The stream's checkpoint, ending in ``/``. The default is built from the warehouse
+    bucket, which may be the IaC emitter's account token; only a declared checkpoint is
+    the contract's text to check."""
+    if declared is None:
+        if bucket is None:
+            raise ValueError(
+                f"{where}.checkpoint: a local stream keeps its checkpoint in the S3 store its "
+                "output names; set the output's location.bucket or properties.stream.checkpoint"
+            )
+        return f"s3://{bucket}/_checkpoints/{product}/{bid}/"
+    if not isinstance(declared, str) or not _CHECKPOINT.fullmatch(declared):
+        raise ValueError(f"{where}.checkpoint: expected an s3:// URI with a prefix")
+    return declared.rstrip("/") + "/"
+
+
+def _check_local_checkpoint(
+    checkpoint: str, bucket: Optional[str], product: str, where: str
+) -> None:
+    """A local stream's declared checkpoint is the product's: under
+    ``_checkpoints/<product>/``, in the output's bucket when it names one, as the IaC
+    scopes the role forge creates on AWS (``iac/providers/aws_ingest._s3_grants``). The
+    run writes it with the operator's S3 credentials, so a checkpoint elsewhere would be
+    written wherever the contract pointed it."""
+    ck_bucket, _, prefix = checkpoint[len("s3://") :].partition("/")
+    home = f"_checkpoints/{product}/"
+    segments = prefix.rstrip("/").split("/")
+    if (
+        (bucket is not None and ck_bucket != bucket)
+        or not prefix.startswith(home)
+        or any(part in ("", ".", "..") for part in segments)
+    ):
+        shown = bucket or ck_bucket
+        raise ValueError(
+            f"{where}.checkpoint: a local stream keeps its checkpoint under the product's "
+            f"checkpoints, s3://{shown}/{home}; leave it out for "
+            f"s3://{shown}/{home}<build>/, or put it under that prefix"
+        )
+
+
+def _check_catalog(local: bool, binding: Mapping[str, Any], family: str, where: str) -> None:
+    """Refuse an output the runtime cannot write: runtime local writes a table in an Iceberg
+    REST catalog on platform local, an AWS runtime a Glue-catalog table."""
+    if local and (binding.get("platform") != "local" or family != FAMILY_REST):
+        raise ValueError(
+            f"{where}: runtime local writes a table in an Iceberg REST catalog on platform "
+            "local (binding.platform: local, location.catalog lakekeeper, rest or polaris); "
+            "a Glue table runs on an AWS runtime"
+        )
+    if not local and family != FAMILY_GLUE:
+        raise ValueError(
+            f"{where}: the forge Spark runner writes Glue-catalog Iceberg tables on an AWS "
+            "runtime; runtime local writes a table in an Iceberg REST catalog"
+        )
+
+
+def _sink(local: bool, resolved: Any, database: str, table: str, fields: Any) -> dict[str, Any]:
+    if local:
+        return _rest_sink(resolved, database, table, fields)
+    return {
+        "catalog": CATALOG,
+        "type": "glue",
+        "warehouse": resolved.warehouse,
+        "region": resolved.region,
+        "table": f"{database}.{table}",
+    }
+
+
+def _rest_sink(resolved: Any, database: str, table: str, fields: Any) -> dict[str, Any]:
+    """A local run's sink: one table in the Iceberg REST catalog the submitter declares.
+
+    The catalog's connection (its URI, warehouse and credential) is the operator's, in the
+    Spark configuration the job is submitted with: derived from the contract, a catalog
+    credential the operator holds would go wherever the contract pointed it. A URI or
+    warehouse the binding names is kept, and the runner refuses a submitter catalog that
+    names others.
+
+    Nothing creates the table before a local job runs, as OpenTofu does on AWS, so the sink
+    carries the statements that create it: the contract's columns in an Iceberg v2 table,
+    unpartitioned, as the Glue table OpenTofu emits. ``IF NOT EXISTS``: a table that exists
+    is left as it is. The DDL follows the managed Flink lane's
+    (``fluid_build/streaming/compiler.py``) in Spark's syntax.
+    """
+    name = f"`{CATALOG}`.`{database}`"
+    columns = ",\n  ".join(
+        f"`{column}` {spark_type(dtype)}{' NOT NULL' if dtype.required else ''}"
+        for column, dtype in fields
+    )
+    sink: dict[str, Any] = {
+        "catalog": CATALOG,
+        "type": "rest",
+        "kind": resolved.kind,
+        "table": f"{database}.{table}",
+        "create": [
+            f"CREATE NAMESPACE IF NOT EXISTS {name}",
+            f"CREATE TABLE IF NOT EXISTS {name}.`{table}` (\n  {columns}\n) USING iceberg"
+            " TBLPROPERTIES ('format-version' = '2')",
+        ],
+    }
+    if resolved.uri:
+        sink["uri"] = str(resolved.uri)
+    if resolved.warehouse:
+        sink["warehouse"] = str(resolved.warehouse)
+    return sink
+
+
 def compile_job_config(
     contract: Mapping[str, Any],
     build: Mapping[str, Any],
@@ -574,14 +827,14 @@ def compile_job_config(
     if binding.get("format") != "iceberg":
         raise ValueError(f"{where}: the output's binding.format must be iceberg")
     loc = _object(binding.get("location"), f"exposes[{index}].binding.location")
-    if bucket_uses_fallback(loc) and not account_ref:
+    local = cfg.get("runtime") == LOCAL_RUNTIME
+    if not local and bucket_uses_fallback(loc) and not account_ref:
         raise ValueError(
             f"{where}: the output names no bucket, so its warehouse is the account's "
             "<account>-fluid-data bucket; pass the account"
         )
     resolved = resolve_iceberg_catalog(binding, account_ref=account_ref)
-    if catalog_kind_info(resolved.kind).family != FAMILY_GLUE:
-        raise ValueError(f"{where}: the forge Spark runner writes Glue-catalog Iceberg tables")
+    _check_catalog(local, binding, catalog_kind_info(resolved.kind).family, where)
     parts = resolved.fq_table.split(".")
     if len(parts) != 2 or "None" in parts:
         raise ValueError(f"{where}: the output needs one database and table")
@@ -590,10 +843,16 @@ def compile_job_config(
         _object(expose.get("contract"), f"exposes[{index}].contract").get("schema"),
         path=f"exposes[{index}].contract.schema",
     )
-    bucket, _ = normalize_location(loc, account_ref=account_ref)
+    # A local output names its bucket (the S3 store its checkpoint lives in) or none.
+    bucket: Optional[str] = (
+        None
+        if local and bucket_uses_fallback(loc)
+        else normalize_location(loc, account_ref=account_ref)[0]
+    )
 
     source: Optional[dict[str, Any]] = None
     source_sql: Optional[str] = None
+    dead_letters: Optional[dict[str, Any]] = None
     streaming: dict[str, Any] = {"trigger": None, "watermark": None, "checkpoint": None}
     masked: list[str] = []
     if stream_spec is not None:
@@ -603,6 +862,7 @@ def compile_job_config(
         records = {k: v for k, v in stream_spec.items() if k not in _ENGINE_KEYS}
         stream = parse_stream(records, swhere)
         kafka = _kafka(cfg, where)
+        _check_local_source(local, kafka, where)
         registry = _registry(
             stream_spec.get("registry"), stream, swhere, environ, granted=host_gate
         )
@@ -614,6 +874,10 @@ def compile_job_config(
         offsets = stream_spec.get("startingOffsets", "latest")
         if offsets not in ("earliest", "latest"):
             raise ValueError(f"{swhere}.startingOffsets: expected earliest or latest")
+        dead = _parsed_dead_letters(stream_spec, stream, swhere)
+        if dead is not None and dead["sink"] == "topic" and host_gate:
+            _refuse_unless_dead_letter_topic_listed(bid, kafka, dead["topic"], environ)
+        decoders = _decoders(stream, registry, dead_letters=dead is not None)
         source = {
             "kind": "kafka",
             **kafka,
@@ -623,21 +887,21 @@ def compile_job_config(
             "registry": (
                 None if registry is None else {"url": registry["url"], "auth": registry["auth"]}
             ),
-            **_decoders(stream, registry),
+            **decoders,
         }
         source_sql = spark_source_select(stream, swhere)
-        # The default is built from the warehouse bucket, which may be the IaC emitter's
-        # account token; only a declared checkpoint is the contract's text to check.
-        checkpoint = stream_spec.get("checkpoint")
-        if checkpoint is None:
-            checkpoint = f"s3://{bucket}/_checkpoints/{product}/{bid}/"
-        elif not isinstance(checkpoint, str) or not _CHECKPOINT.fullmatch(checkpoint):
-            raise ValueError(f"{swhere}.checkpoint: expected an s3:// URI with a prefix")
         streaming = {
             "trigger": _trigger(stream_spec.get("trigger"), expose, swhere),
             "watermark": _watermark(stream_spec.get("watermark"), stream, swhere),
-            "checkpoint": checkpoint.rstrip("/") + "/",
+            "checkpoint": _checkpoint(stream_spec.get("checkpoint"), bucket, product, bid, swhere),
         }
+        if local and stream_spec.get("checkpoint") is not None:
+            _check_local_checkpoint(streaming["checkpoint"], bucket, product, swhere)
+        if dead is not None:
+            dead_letters = _dead_letter_block(
+                dead, database, table, streaming["checkpoint"], local, swhere
+            )
+            dead_letters["check"] = dead_letter.check_select(stream, decoders)
         if sql is None:
             select = compile_select(
                 stream,
@@ -675,18 +939,91 @@ def compile_job_config(
         "source": source,
         "sql": {"source": source_sql, "select": select},
         **streaming,
-        "sink": {
-            "catalog": CATALOG,
-            "type": "glue",
-            "warehouse": resolved.warehouse,
-            "region": resolved.region,
-            "table": f"{database}.{table}",
-        },
+        "sink": _sink(local, resolved, database, table, fields),
         "maskedColumns": masked,
         # The secret's ARN, never its value: the runner reads the key with the job's role.
         "maskKey": {"secretArn": mask_key} if masked else None,
     }
+    if dead_letters is not None:
+        _add_dead_letters(config, dead_letters, masked=bool(masked))
+    if local and host_gate:
+        tables = [f"{database}.{table}"]
+        if dead_letters is not None and dead_letters.get("table"):
+            tables.append(str(dead_letters["table"]))
+        _refuse_unless_namespace_listed(
+            bid, local_namespace_scope(resolved), database, tables, environ
+        )
     return SparkJob(config)
+
+
+def _parsed_dead_letters(stream_spec: Mapping[str, Any], stream: Any, where: str) -> Any:
+    """``properties.stream.deadLetter``, checked against the stream it routes; None when
+    the stream has none."""
+    dead = dead_letter.parse(stream_spec.get("deadLetter"), where)
+    if dead is None:
+        return None
+    _refuse_corrupt_column_name(stream, where)
+    if "avro-confluent" in (stream.format, stream.key_format):
+        raise ValueError(
+            f"{where}.deadLetter: an Avro stream's dead letters are not supported yet: the "
+            "decoder's permissive mode would also turn a schema registry outage into dead "
+            "letters"
+        )
+    if dead["topic"] is not None and dead["topic"] == stream_spec.get("topic"):
+        raise ValueError(
+            f"{where}.deadLetter.topic: the stream's own topic; the stream would read its dead "
+            "letters again"
+        )
+    return dead
+
+
+def _add_dead_letters(config: dict[str, Any], block: dict[str, Any], *, masked: bool) -> None:
+    """The ``deadLetter`` block and its ``sql.check``, only for a stream that has them: one
+    without keeps the job config, and the hash, it had."""
+    # A build that masks fields at ingest sends no raw bytes: they hold those in clear.
+    block["raw"] = not masked
+    config["sql"]["check"] = block.pop("check")
+    config["deadLetter"] = block
+
+
+def _refuse_corrupt_column_name(stream: Any, where: str) -> None:
+    from fluid_build.spark.dead_letter import CORRUPT_COLUMN
+
+    names = {name.casefold() for name, _ in stream.value}
+    names |= {name[len(stream.key_prefix) :].casefold() for name, _ in stream.key}
+    if CORRUPT_COLUMN in names:
+        raise ValueError(
+            f"{where}.deadLetter: the stream declares a field named {CORRUPT_COLUMN}, which "
+            "the runner keeps a record's undecoded text in; rename it"
+        )
+
+
+def _dead_letter_block(
+    dead: Mapping[str, Any],
+    database: str,
+    table: str,
+    checkpoint: str,
+    local: bool,
+    where: str,
+) -> dict[str, Any]:
+    """The job config's ``deadLetter``: the sink, the abort threshold, the alerts, and the
+    checkpoint of the dead letters' own query, inside the stream's."""
+    block: dict[str, Any] = {
+        "sink": dead["sink"],
+        "checkpoint": f"{checkpoint}dead-letter/",
+        "maxRecordsBeforeAbort": dead["maxRecordsBeforeAbort"],
+        "alertOn": dead["alertOn"],
+    }
+    if dead["sink"] == "topic":
+        block["topic"] = dead["topic"]
+        return block
+    name = dead["table"] or dead_letter.table_name(table)
+    if name.casefold() == table.casefold():
+        raise ValueError(f"{where}.deadLetter.table: the dead letters need a table of their own")
+    block["table"] = f"{database}.{validate_ident(name)}"
+    if local:
+        block["create"] = dead_letter.create_statements(CATALOG, database, name)
+    return block
 
 
 def validation_errors(contract: Mapping[str, Any]) -> list[str]:
@@ -730,6 +1067,29 @@ def validation_errors(contract: Mapping[str, Any]) -> list[str]:
     return errors
 
 
+def _local_namespace(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Optional[tuple]:
+    """``(scope, namespace)`` a ``runtime: local`` build writes, or None (another runtime,
+    or an output :func:`validation_errors` reports)."""
+    if (spark_parameters(build) or {}).get("runtime") != LOCAL_RUNTIME:
+        return None
+    outputs = build.get("outputs")
+    targets = [
+        e
+        for e in contract.get("exposes") or []
+        if isinstance(e, Mapping) and isinstance(outputs, list) and e.get("exposeId") in outputs
+    ]
+    if len(targets) != 1 or not isinstance(targets[0].get("binding"), Mapping):
+        return None
+    try:
+        resolved = resolve_iceberg_catalog(targets[0]["binding"])
+    except (ValueError, KeyError, TypeError):
+        return None
+    parts = str(resolved.fq_table).split(".")
+    if len(parts) != 2:
+        return None
+    return local_namespace_scope(resolved), parts[0]
+
+
 def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
     """The operator entries a Spark build lacks, which ``fluid validate`` warns about.
 
@@ -754,6 +1114,13 @@ def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
         sql_warning = contract_sql_warning(CONTRACT_SQL_ALLOWLIST_ENV, contract, build)
         if sql_warning:
             warnings.append(sql_warning)
+        namespace = _local_namespace(contract, build)
+        if namespace is not None and not local_namespace_listed(*namespace):
+            warnings.append(
+                f"Build {build.get('id')}: not in {LOCAL_NAMESPACE_ALLOWLIST_ENV}: "
+                f"{namespace[0]}/{namespace[1]}; the local run is refused until the operator "
+                "lists it"
+            )
         stream = props.get("stream")
         if not isinstance(stream, Mapping):
             continue
