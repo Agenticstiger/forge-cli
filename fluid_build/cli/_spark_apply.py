@@ -7,7 +7,9 @@
 which ``planDigest`` covers. ``fluid apply`` compiles the runs before ``tofu apply``
 (:func:`prepare`), refusing a bound plan whose Spark actions differ from them and a missing
 boto3, so nothing is provisioned that could not then be started; after a ``tofu apply`` that
-succeeded it reconciles the streaming jobs (:func:`reconcile_after_apply`).
+succeeded it reconciles the streaming jobs (:func:`reconcile_after_apply`). Both warn about
+an EMR on EC2 cluster that runs a build's driver or application master where Spot can take
+it (:func:`plan_posture`, :func:`warn_cluster_posture`).
 
 ``fluid apply --mode reconcile`` reconciles the streams alone (:func:`reconcile_only`): no
 ``tofu``, no plan, and a stream starts again only with the config the last apply deployed.
@@ -216,6 +218,42 @@ def refuse_without_opentofu(contract: Mapping[str, Any], engine: str) -> None:
                 "or run them with runtime: local on platform: local outputs",
             },
         )
+
+
+def warn_cluster_posture(
+    runs: List[DesiredRun], logger: logging.Logger, *, dry_run: bool, clients: Any = None
+) -> None:
+    """Warn about each EMR on EC2 cluster that can lose a build's driver or application
+    master to Spot (``build_runners/spark/_posture.py``), with the fix. Never refuses and
+    never raises; a dry run reads nothing, and a cluster that cannot be read gets a debug line.
+    """
+    if not any(r.runtime == "emr-ec2" for r in runs):
+        return
+    if dry_run:
+        logger.debug("spark_cluster_posture_skipped reason=dry-run")
+        return
+    from rich.markup import escape
+
+    from fluid_build.build_runners.spark._posture import cluster_findings
+    from fluid_build.cli.console import warning
+
+    try:
+        for finding in cluster_findings(runs, clients=clients):
+            warning(escape(finding.line()))
+            logger.info("spark_cluster_posture", extra={"spark": finding.as_dict()})
+    except Exception as exc:  # noqa: BLE001 - a warning never fails plan or apply
+        logger.debug("spark_cluster_posture_failed error=%s", type(exc).__name__)
+
+
+def plan_posture(contract: Mapping[str, Any], logger: logging.Logger, clients: Any = None) -> None:
+    """``fluid plan``'s :func:`warn_cluster_posture`, for the runs the plan lists. The
+    warnings are not in plan.json: the cluster is its owner's, not the contract's."""
+    try:
+        runs = _desired(contract, "plan_spark", policy=False) if _has_spark(contract) else []
+    except Exception:  # noqa: BLE001 - planned_actions reports a build that does not compile
+        logger.debug("spark_cluster_posture_skipped reason=uncompiled")
+        return
+    warn_cluster_posture(runs, logger, dry_run=False, clients=clients)
 
 
 def reconcile_after_apply(

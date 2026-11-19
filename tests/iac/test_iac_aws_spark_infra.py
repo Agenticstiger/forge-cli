@@ -1196,3 +1196,62 @@ def test_the_schedulers_policy_names_each_action_once_per_runtime():
     assert len(serverless) == 4  # two applications, each named once with its job runs
     assert len(doc["statement"][1]["resources"]) == 8 and len(doc["statement"][3]["resources"]) == 9
     assert len(json.dumps(doc, separators=(",", ":"))) < 6144
+
+
+@pytest.mark.parametrize(
+    ("runtime", "label", "says"),
+    [
+        ("emr-eks", "emr-7.12.0", "emr-X.Y.Z-latest or emr-X.Y.Z-YYYYMMDD"),
+        ("emr-serverless", "emr-7.12.0-latest", "takes emr-X.Y.Z (e.g. emr-7.12.0)"),
+    ],
+)
+def test_a_release_label_in_another_runtime_s_form_is_refused(contract, runtime, label, says):
+    params = spark(contract)
+    params.update(runtime=runtime, releaseLabel=label)
+    if runtime == "emr-eks":
+        del params["applicationId"]
+        params["virtualClusterId"] = VIRTUAL_CLUSTER
+    (error,) = [e for e in aws_identity.runtime_errors(contract["builds"][0]) if "release" in e]
+    assert says in error
+    with pytest.raises(UnsupportedBindingError, match="releaseLabel"):
+        emit(contract)
+
+
+def test_emr_on_eks_emits_with_its_image_label(contract):
+    params = spark(contract)
+    del params["applicationId"]
+    params.update(runtime="emr-eks", virtualClusterId=VIRTUAL_CLUSTER)
+    assert aws_identity.runtime_errors(contract["builds"][0]) == []
+    params["releaseLabel"] = "emr-7.12.0-20251111"
+    assert aws_identity.runtime_errors(contract["builds"][0]) == []
+    emit(contract)
+
+
+def test_hadoop_may_look_up_each_directory_it_is_given(contract):
+    """Hadoop's getFileStatus HEADs a directory's own key before ``<dir>/`` and lists it by
+    its slashless name: without both, S3 answers 403 and a stream dies on its checkpoint."""
+    _, data = emit(contract)
+    access = data["aws_iam_policy_document"][f"{KEY}_access"]
+    dirs = [
+        "iceberg/commerce/order_lines",
+        "_checkpoints/commerce.orders-stream/ingest-orders",
+        "_fluid/spark/commerce.orders-stream/ingest-orders",
+    ]
+    directory = statement(access, "Directory4")
+    assert directory["actions"] == ["s3:GetObject"]  # the one key, which holds no data
+    assert directory["resources"] == [f"arn:aws:s3:::commerce-lake/{d}" for d in dirs]
+    values = statement(access, "List2")["condition"][0]["values"]
+    # Exactly the directory (no sibling <dir>-x), and what is under it.
+    assert values == [*dirs, *(f"{d}/*" for d in dirs)]
+
+
+def test_a_bucketless_output_s_directories_keep_the_account_expression(contract):
+    loc = contract["exposes"][0]["binding"]["location"]
+    del loc["bucket"]
+    loc["path"] = "commerce.orders-stream/order_lines/"
+    _, data = emit(contract)
+    directory = statement(data["aws_iam_policy_document"][f"{KEY}_access"], "Directory4")
+    account_bucket = "${data.aws_caller_identity.fluid_lf_caller.account_id}-fluid-data"
+    assert directory["resources"][0] == (
+        f"arn:aws:s3:::{account_bucket}/commerce.orders-stream/order_lines"
+    )

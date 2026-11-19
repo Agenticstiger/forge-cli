@@ -602,6 +602,26 @@ class TestSparkParameters:
         assert any(says in m for m in messages), messages
         assert not any("should not be valid" in m for m in messages), messages
 
+    @pytest.mark.parametrize(
+        ("runtime", "label", "valid"),
+        [
+            ("emr-eks", "emr-7.12.0-latest", True),
+            ("emr-eks", "emr-7.12.0-20251111", True),
+            ("emr-eks", "emr-7.12.0-java11-latest", True),
+            ("emr-eks", "emr-7.12.0", False),  # EMR on EKS names an image of the release
+            ("emr-eks", "emr-7.12.0-20251", False),
+            ("emr-serverless", "emr-7.12.0", True),
+            ("emr-serverless", "emr-7.12.0-latest", False),
+            ("emr-ec2", "emr-7.12.0-20251111", False),
+        ],
+    )
+    def test_each_emr_runtime_takes_its_own_release_label(self, manager, runtime, label, valid):
+        spark = {"runtime": runtime, "releaseLabel": label}
+        if runtime == "emr-eks":
+            spark["virtualClusterId"] = "abcdefghij0123456789klmno"  # pragma: allowlist secret
+        result = _validate(manager, _spark_params(**spark))
+        assert result.is_valid is valid, _messages(result)
+
     def test_defaults_and_the_split_with_execution_are_documented(self, manager):
         spark = manager._bundled_schemas["0.7.7"]["$defs"]["sparkParameters"]
         props = spark["properties"]

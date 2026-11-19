@@ -481,4 +481,10 @@ def _tests_for_column(
     this path previously did not surface.
     """
     # dq-rule tests win over the generic constraint-derived form on collision.
-    return _tm.merge_tests(list(rule_tests), _tm.constraint_tests(col_def))
+    tests = _tm.merge_tests(list(rule_tests), _tm.constraint_tests(col_def))
+    if isinstance(col_def.get("placeholders"), dict):
+        # A placeholder is exempt from the column's own value checks (RFC-data-rules.md 4).
+        from fluid_build.data_rules._dbt import exempt_placeholders
+
+        tests = exempt_placeholders(col_def, tests)
+    return tests

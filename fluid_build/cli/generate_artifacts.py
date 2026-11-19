@@ -34,11 +34,15 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
     """Register as a subcommand of ``fluid generate``."""
     p = subparsers.add_parser(
         "artifacts",
-        help="Fanout bundle → catalog artifacts (ODCS, OPDS LF/ODPI, ODPS-Bitol, schedule, policies)",
+        help=(
+            "Fanout bundle → catalog artifacts (ODCS, OPDS LF/ODPI, ODPS-Bitol, schedule, "
+            "policies, Spark job configs)"
+        ),
         description=(
             "Stage-3 of the 11-stage pipeline. Reads a Phase-2 bundle and emits "
-            "ODCS per-port, ODPS-Bitol, OPDS v4.1 (LF/ODPI), schedule DAGs, and "
-            "compiled policy bindings into <out>/, with a unified MANIFEST.json "
+            "ODCS per-port, ODPS-Bitol, OPDS v4.1 (LF/ODPI), schedule DAGs, "
+            "compiled policy bindings, and each forge Spark build's job.json (the "
+            "bytes OpenTofu uploads) into <out>/, with a unified MANIFEST.json "
             "hashed over every emitted file. ``opds`` is the LF/ODPI Open Data "
             "Product Specification key; the bare ``odps`` emit key is a deprecated "
             "alias that resolves to ``opds``."
@@ -75,8 +79,9 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
         default=None,
         help=(
             "Comma-separated emit selector. Valid: opds, odps-bitol, odcs, schedule, "
-            "policies. ``odps`` is accepted as a deprecated alias of ``opds`` (the "
-            "LF/ODPI Open Data Product Specification v4.1 target). Default: all five. "
+            "policies, spark. ``spark`` writes spark/<build id>/job.json for each "
+            "forge Spark build. ``odps`` is accepted as a deprecated alias of ``opds`` "
+            "(the LF/ODPI Open Data Product Specification v4.1 target). Default: all six. "
             "``dbt`` is NOT a valid emit key — dbt projects are execution artifacts "
             "(see `fluid generate speed-transformation`)."
         ),

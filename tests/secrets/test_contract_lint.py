@@ -10,7 +10,11 @@ import pytest
 from fluid_build.secrets import resolve
 from fluid_build.secrets.contract import lint_secret_refs, secret_ref_sites
 from fluid_build.secrets.errors import SecretRefError
-from fluid_build.secrets.policy import ALLOWLIST_ENV, AcquisitionSecretPolicyError
+from fluid_build.secrets.policy import (
+    ALLOWLIST_ENV,
+    SCHEMES_ENV,
+    AcquisitionSecretPolicyError,
+)
 
 REMOTE = "db.example.com"
 
@@ -218,3 +222,185 @@ def test_validate_fails_closed_when_the_lint_itself_crashes(monkeypatch):
     validate_cmd._check_secret_refs(result, {})
     assert result.is_valid is False
     assert any("NOT checked" in error for error in result.errors)
+
+
+# ── a host only fluid apply renders ─────────────────────────────────────────
+
+#: References whose names the secret scanner reads as keywords.
+PGPASSWORD_REF = "env://PGPASSWORD"  # pragma: allowlist secret
+AIRBYTE_REF = "env://AIRBYTE_TOKEN"  # pragma: allowlist secret
+#: A reference that ends in a word the log redactor reads as a credential key.
+VAULT_PASSWORD_REF = "vault://kv/orders/pg#password"  # pragma: allowlist secret
+
+
+@pytest.mark.unit
+def test_a_placeholder_host_is_left_to_apply_with_the_entry_apply_needs(monkeypatch):
+    """The lint once suggested an entry that could never match at apply.
+
+    Seen live on 0.31.0: it judged ``{{ env.PGHOST }}`` as written and suggested
+    ``PGPASSWORD@{{ env.PGHOST }}``, an entry that passes the lint and matches
+    nothing at apply, which judges the host the placeholder renders to.
+    """
+    monkeypatch.setenv("PGHOST", "db.private-value.internal")
+    contract = _conn(secretRef=PGPASSWORD_REF, host="{{ env.PGHOST }}")
+    (finding,) = lint_secret_refs(contract, {})
+    assert finding.ok
+    assert finding.deferred is not None
+    assert "{{ env.PGHOST }}" in finding.deferred.what
+    assert f'{ALLOWLIST_ENV}="PGPASSWORD@<host>"' in finding.deferred.fix
+    # the lint never reads the environment, so it never prints what PGHOST holds
+    assert "db.private-value.internal" not in str(finding.deferred)
+
+
+@pytest.mark.unit
+def test_an_entry_naming_the_placeholder_changes_nothing():
+    contract = _conn(secretRef=PGPASSWORD_REF, host="{{ env.PGHOST }}")
+    environ = {ALLOWLIST_ENV: "PGPASSWORD@{{ env.PGHOST }}"}
+    (finding,) = lint_secret_refs(contract, environ)
+    assert finding.ok and finding.deferred is not None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "connection, entry",
+    [
+        ({"secretRef": PGPASSWORD_REF, "host": "{{ env.PGHOST }}"}, "PGPASSWORD"),
+        (
+            {"secretRef": VAULT_PASSWORD_REF, "uri": "postgres://{{ env.H }}/db"},
+            f"{VAULT_PASSWORD_REF}@*",
+        ),
+    ],
+)
+def test_an_entry_for_any_host_leaves_nothing_to_warn_about(connection, entry):
+    """Apply clears whatever the placeholder renders to, so there is nothing to warn about."""
+    environ = {ALLOWLIST_ENV: entry, SCHEMES_ENV: "env,vault"}
+    (finding,) = lint_secret_refs(_conn(**connection), environ)
+    assert finding.ok and finding.deferred is None
+
+
+@pytest.mark.unit
+def test_validate_strict_stays_green_under_an_entry_for_any_host(monkeypatch):
+    from fluid_build.cli import validate as validate_cmd
+    from fluid_build.schema_manager import ValidationResult
+
+    monkeypatch.setenv(ALLOWLIST_ENV, "PGPASSWORD")
+    result = ValidationResult(is_valid=True, schema_version=None)
+    validate_cmd._check_secret_refs(
+        result, _conn(secretRef=PGPASSWORD_REF, host="{{ env.PGHOST }}")
+    )
+    assert result.is_valid and not result.errors and not result.warnings
+
+
+@pytest.mark.unit
+def test_a_keyword_string_with_a_placeholder_is_judged_as_written():
+    """Apply reads ``Server=...;Database=...`` whole as one host no entry names."""
+    contract = _conn(
+        secretRef=PGPASSWORD_REF, connection_string="Server={{ env.PGHOST }};Database=d"
+    )
+    (finding,) = lint_secret_refs(contract, {})
+    assert isinstance(finding.error, AcquisitionSecretPolicyError)
+    assert finding.deferred is None
+
+
+@pytest.mark.unit
+def test_a_literal_destination_beside_a_placeholder_is_still_judged():
+    contract = _conn(secretRef="env://PG", host="{{ env.PGHOST }}", uri=f"postgres://{REMOTE}/db")
+    (finding,) = lint_secret_refs(contract, {})
+    assert isinstance(finding.error, AcquisitionSecretPolicyError)
+    assert REMOTE in finding.error.what
+    (finding,) = lint_secret_refs(contract, {ALLOWLIST_ENV: f"PG@{REMOTE}"})
+    assert finding.ok and finding.deferred is not None
+
+
+@pytest.mark.unit
+def test_a_blank_host_is_refused_at_validate_as_at_apply():
+    (finding,) = lint_secret_refs(_conn(secretRef="env://PG", host=""), {})
+    assert isinstance(finding.error, AcquisitionSecretPolicyError)
+    assert "connection.host is empty" in finding.error.what
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "uri, waits",
+    [
+        ("postgresql://{{ env.PGHOST }}:5432/db", True),
+        ("postgresql://u@{{ env.PGHOST }}/db", True),
+        (f"postgresql://{REMOTE}/{{{{ env.DB }}}}", False),
+        (f"postgresql://{{{{ env.PGUSER }}}}@{REMOTE}/db", False),
+    ],
+)
+def test_only_a_placeholder_in_the_host_part_waits_for_apply(uri, waits):
+    (finding,) = lint_secret_refs(_conn(secretRef="env://PG", uri=uri), {})
+    if waits:
+        assert finding.ok and finding.deferred is not None
+    else:
+        assert isinstance(finding.error, AcquisitionSecretPolicyError)
+        assert REMOTE in finding.error.what
+
+
+@pytest.mark.unit
+def test_an_airbyte_server_url_placeholder_is_left_to_apply():
+    deployment = {
+        "server_url": "https://{{ env.AIRBYTE_HOST }}/api",
+        "auth": {"secretRef": AIRBYTE_REF},
+    }
+    (finding,) = lint_secret_refs(_contract({"airbyte": {"deployment": deployment}}), {})
+    assert finding.ok
+    assert "deployment.server_url" in finding.deferred.what
+
+
+@pytest.mark.unit
+def test_validate_reports_a_deferred_destination_as_a_warning():
+    from fluid_build.cli import validate as validate_cmd
+    from fluid_build.schema_manager import ValidationResult
+
+    result = ValidationResult(is_valid=True, schema_version=None)
+    validate_cmd._check_secret_refs(
+        result, _conn(secretRef=PGPASSWORD_REF, host="{{ env.PGHOST }}")
+    )
+    assert result.is_valid and not result.errors
+    assert any("PGPASSWORD@<host>" in warning for warning in result.warnings)
+
+
+@pytest.mark.unit
+def test_validate_lines_survive_the_redactor_that_prints_them(monkeypatch):
+    """validate prints ``<pointer>: <what>`` through the secret redactor.
+
+    Every pointer ends in ``secretRef``, which the redactor's ``key: value``
+    rule leaves alone. A pointer that ended in ``password`` would mask the
+    reference after it, as ``<ref>: ...`` once masked the word after a
+    reference.
+    """
+    from fluid_build.cli import validate as validate_cmd
+    from fluid_build.observability import secret_redactor
+    from fluid_build.schema_manager import ValidationResult
+
+    # Only the patterns: a value another test registered must not mask a word here.
+    monkeypatch.setattr(secret_redactor, "_known_secrets", ())
+    monkeypatch.setattr(secret_redactor, "_known_secret_set", set())
+    monkeypatch.setenv(SCHEMES_ENV, "env")
+    contract = {
+        "builds": [
+            {"properties": {"source": {"connection": {"secretRef": ref, "host": host}}}}
+            for ref, host in (
+                (VAULT_PASSWORD_REF, REMOTE),
+                (PGPASSWORD_REF, "{{ env.PGHOST }}"),
+                (PGPASSWORD_REF, ""),
+            )
+        ],
+        "exposes": [{"binding": {"auth": {"secretRef": VAULT_PASSWORD_REF}}}],
+    }
+    result = ValidationResult(is_valid=True, schema_version=None)
+    validate_cmd._check_secret_refs(result, contract)
+    assert len(result.errors) == 3 and len(result.warnings) == 1
+    for line in result.errors + result.warnings:
+        assert secret_redactor.redact_secret_text(line) == line, line
+
+
+@pytest.mark.unit
+def test_secrets_check_shows_a_deferred_destination():
+    from fluid_build.cli import secrets as secrets_cmd
+
+    rows = secrets_cmd._check_rows(_conn(secretRef=PGPASSWORD_REF, host="{{ env.PGHOST }}"), False)
+    assert rows[0]["ok"] is True
+    assert "PGPASSWORD@<host>" in rows[0]["deferred"]

@@ -65,5 +65,7 @@ Ask, in the chat, before any of these, and say what each one risks:
 |---|---|---|
 | `apply_plan_mode_mismatch` | the plan was made for another mode | plan again with the mode you will apply |
 | `apply_plan_digest_bundle_mismatch` | the bundle changed after the plan | bundle and plan again; never bypass |
+| `apply_plan_digest_packet_mismatch` | the bundle holds the planned contract in other bytes (rebuilt) | apply the bundle the plan was made from, or plan again |
+| `apply_plan_digest_packet_missing` | the plan records no packet digest (an older fluid made it) | plan again on the bundle |
 | `apply_plan_digest_plan_tamper` | the plan file was edited | plan again; never edit `plan.json` |
 | data-loss refusal | the change would drop data | stop and ask the user |

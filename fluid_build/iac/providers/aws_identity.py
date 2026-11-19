@@ -301,7 +301,6 @@ _RUNTIME_FIELDS = {
     "clusterId": re.compile(r"j-[0-9A-Za-z]{1,254}"),
     "virtualClusterId": re.compile(r"[0-9a-z]{1,64}"),
     "glueVersion": re.compile(r"[0-9]+\.[0-9]+"),
-    "releaseLabel": re.compile(r"emr-[0-9]+\.[0-9]+\.[0-9]+"),
 }
 #: An MSK cluster ARN with the name and id the topic and group ARNs are built from.
 MSK_ARN = re.compile(
@@ -341,6 +340,20 @@ def _dead_letter_topic(build: Mapping[str, Any]) -> Optional[str]:
     return topic if isinstance(topic, str) and topic else None
 
 
+def _release_label_errors(bid: Any, cfg: Mapping[str, Any]) -> List[str]:
+    """``releaseLabel`` in the form its runtime takes (``spark/names.RELEASE_LABELS``)."""
+    from fluid_build.spark import names
+
+    runtime, label = str(cfg.get("runtime")), cfg.get("releaseLabel")
+    grammar = names.RELEASE_LABELS.get(runtime)
+    if label is None or grammar is None or (isinstance(label, str) and grammar.fullmatch(label)):
+        return []
+    return [
+        f"Spark build {bid}: parameters.spark.releaseLabel: runtime {runtime} takes "
+        f"{names.release_label_form(runtime)}"
+    ]
+
+
 def runtime_errors(build: Mapping[str, Any]) -> List[str]:
     """What keeps the IaC from naming the build's runtime: a field of the wrong shape, a
     runtime without the cluster it needs, an MSK ARN without its cluster id, or a batch
@@ -361,6 +374,7 @@ def runtime_errors(build: Mapping[str, Any]) -> List[str]:
         value = cfg.get(name)
         if value is not None and not (isinstance(value, str) and pattern.fullmatch(value)):
             errors.append(f"Spark build {bid}: parameters.spark.{name}: expected {pattern.pattern}")
+    errors += _release_label_errors(bid, cfg)
     if cfg.get("runtime") == "emr-eks" and not cfg.get("virtualClusterId"):
         errors.append(f"Spark build {bid}: runtime emr-eks needs parameters.spark.virtualClusterId")
     source = cfg.get("source")
@@ -585,6 +599,15 @@ def secret_resources(arn: Any) -> List[Any]:
     return [arn, _join(arn, "-??????")]
 
 
+def _slashless(prefix: Any) -> Any:
+    """A directory-style prefix without its trailing ``/`` (kept an expression when it is
+    one)."""
+    text = str(prefix)
+    if not text.endswith("/"):
+        return prefix
+    return type(prefix)(text[:-1])
+
+
 def _join(*parts: Any) -> Any:
     """Concatenate, keeping a ``TofuExpr`` part an expression (the others escaped)."""
     from ..naming import TofuExpr
@@ -642,7 +665,12 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
                     {
                         "test": "StringLike",
                         "variable": "s3:prefix",
-                        "values": [_join(p, "*") for p in prefixes],
+                        # A directory as Hadoop lists it: its own name, exactly (so no
+                        # sibling ``<dir>-x`` matches), and what is under it.
+                        "values": [
+                            *(_slashless(p) for p in prefixes),
+                            *(_join(p, "*") for p in prefixes),
+                        ],
                     }
                 ],
             }
@@ -653,6 +681,17 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
                 "effect": "Allow",
                 "actions": ["s3:GetBucketLocation"],
                 "resources": [bucket_arn],
+            }
+        )
+        # Hadoop's getFileStatus (a Spark checkpoint, a file Spark reads) asks for the
+        # directory's own key before ``<dir>/``: a HEAD of ``<bucket>/<dir>``, refused with
+        # 403 unless the role may read that one key, which holds no data.
+        statements.append(
+            {
+                "sid": f"Directory{len(statements)}",
+                "effect": "Allow",
+                "actions": ["s3:GetObject"],
+                "resources": [_join(bucket_arn, "/", _slashless(p)) for p in prefixes],
             }
         )
         # With an S3 Bucket Key the encryption context is the bucket's ARN; without one

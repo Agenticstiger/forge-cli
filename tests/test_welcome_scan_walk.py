@@ -170,7 +170,8 @@ def test_an_unreadable_directory_is_skipped(tmp_path, monkeypatch):
     real = os.scandir
 
     def scandir(path="."):
-        if Path(path) == locked:
+        # pytest removes tmp_path at teardown with shutil.rmtree, which lists by file descriptor.
+        if isinstance(path, (str, os.PathLike)) and Path(path) == locked:
             raise PermissionError(13, "Permission denied", str(path))
         return real(path)
 
