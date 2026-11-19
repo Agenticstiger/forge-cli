@@ -25,6 +25,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid apply` runs a dbt build whatever its trigger, finds the dbt that has its adapter, and
+  pins its container's image and packages.** A `dataset` or `schedule_and_dataset` build, which
+  `fluid generate schedule` renders a DAG for, failed under that DAG's `fluid apply --build-id`
+  with "Unknown trigger type", and so did `event`, `dependency` and `timetable`; the dbt and python
+  runners now run a build of every type a scheduler or an event starts once when apply asks (the
+  scheduler decides when), keep `manual` iterations, still refuse `continuous`, and refuse a
+  `trigger.type` that is not a name. An engine named after its PyPI distribution, such as
+  `dbt-athena-community`, was looked for as `athena-community`, so a local dbt with the athena
+  plugin was never used; the runner now asks for dbt's plugin name (`athena`), reads the adapter of
+  an engine without one (`dbt`, `dbt-core`) from every platform a profile is generated for, and
+  matches the `Plugins:` list of `dbt --version` exactly. When no local dbt has the adapter, the
+  container fallback runs `python:3.12-slim` pinned by digest and installs `dbt-core==1.11.17` and
+  an exact adapter pin from wheels only, run as `python -I -m pip --isolated` against PyPI, with no
+  pip config file and no `PIP_*` or project `PYTHON*` setting passed in (their dependencies resolve
+  within those packages' ranges); an adapter without a pin, a `DBT_ADAPTER_PACKAGE` that is not
+  exact pins, and a `DBT_DOCKER_IMAGE` or `DBT_BOOTSTRAP_IMAGE` without a digest are refused. For
+  athena, glue and redshift IAM, a dbt profile that names an AWS profile, or a run with no AWS keys
+  in the container's environment or the dbt profile and no container credentials endpoint, is
+  refused before `docker` starts, with the command that installs the adapter locally or exports
+  short-lived keys; `~/.aws` is never mounted, and the host-only AWS settings (`AWS_PROFILE`,
+  `AWS_DEFAULT_PROFILE`, `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, `AWS_CA_BUNDLE` and the
+  token-file paths) are not passed in.
+
 - **Removing a Spark build on AWS no longer needs `--allow-data-loss`.** The data-loss gate
   counted every resource a removed build ran with as data: its runner and job config objects,
   role and policies, log group and the key its logs are encrypted with, Glue job or connection,
@@ -34,6 +57,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a Databricks build's job and files are, and only what holds data (the build's table, a
   bucket, a bucket's key) still needs the flag. The AWS plugin names them by type and by the
   names forge gives them (`aws_ingest.spark_definition`).
+
+- **A Spark job on AWS can write its own table where Lake Formation governs new tables.**
+  forge granted a job's role Lake Formation access to the table it writes only when the output's
+  binding declared a non-empty `governance.lakeFormation`, so in an account that removed the
+  `IAM_ALLOWED_PRINCIPALS` default for new tables (Lake Formation's own advice), a stream without
+  that block could not see its own table. The grant (`INSERT`, `ALTER`, `DESCRIBE`, `SELECT`, and
+  `DELETE` for a batch job) is now emitted for such outputs, and for a stream's dead-letter table
+  beside them, with a `count` the plan decides from the account's settings
+  (`data.aws_lakeformation_data_lake_settings`): 1 where Lake Formation governs new tables, 0 where
+  IAM alone decides. The module is the same text in every account, and an account that keeps the
+  default creates nothing new. The identity that runs `fluid plan` and `fluid apply` needs
+  `lakeformation:GetDataLakeSettings`. An output with a `governance.lakeFormation` block keeps its
+  grants as they are; an EMR on EC2 job runs as the cluster's role, which forge does not know, and
+  gets none.
 
 - **A Spark build that leaves the contract on AWS has its runs stopped before its role goes.**
   `fluid apply` destroyed the build's role, artifacts and log group but left its stream running

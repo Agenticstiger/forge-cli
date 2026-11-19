@@ -98,6 +98,9 @@ class SparkBlocks:
     writers: Dict[str, List[Writer]] = field(default_factory=dict)
     #: expose id -> the key of the role Lake Formation registers its location with.
     registration_roles: Dict[str, str] = field(default_factory=dict)
+    #: The ``aws_lakeformation_data_lake_settings`` data source that decides, at plan, whether
+    #: a job role is granted its own table where the binding declares no lakeFormation block.
+    lf_settings: Optional[str] = None
 
 
 def _escape(text: str) -> str:
@@ -234,7 +237,38 @@ def spark_blocks(contract: Mapping[str, Any], cid: str) -> SparkBlocks:
     for expose in contract.get("exposes") or []:
         if isinstance(expose, Mapping) and str(expose.get("exposeId")) in blocks.writers:
             _emit_registration_role(blocks, contract, ctx, expose, product_tags)
+    _emit_lake_formation_settings(blocks, contract, cid)
     return blocks
+
+
+def _lake_formation_default(binding: Mapping[str, Any]) -> bool:
+    """A Glue table this binding names gets its writer's grant by default: it declares no
+    ``governance.lakeFormation`` (one that does lists its own grants)."""
+    from . import aws as _aws  # imported here: aws imports this module
+
+    if ((binding.get("governance") or {}).get("lakeFormation")) or {}:
+        return False
+    return _aws._glue_cataloged(binding, binding.get("format") or "parquet")
+
+
+def _emit_lake_formation_settings(
+    blocks: SparkBlocks, contract: Mapping[str, Any], cid: str
+) -> None:
+    """The account's Lake Formation settings, read at plan, when a job role writes an output
+    whose binding declares no ``governance.lakeFormation``: where Lake Formation governs new
+    tables, the role is granted its table (``aws._emit_default_spark_writer_grants``), or it
+    could not see it."""
+    for expose in contract.get("exposes") or []:
+        if not isinstance(expose, Mapping):
+            continue
+        writers = blocks.writers.get(str(expose.get("exposeId"))) or []
+        if not _lake_formation_default(expose.get("binding") or {}):
+            continue
+        if any(w.principal is not None for w in writers):
+            key = safe_ident(f"{cid}_lf_settings")
+            blocks.data.setdefault("aws_lakeformation_data_lake_settings", {})[key] = {}
+            blocks.lf_settings = key
+            return
 
 
 def _emit_registration_role(
@@ -960,8 +994,9 @@ def _emit_dead_letter_table(
     principal: Any,
 ) -> None:
     """The dead letters' Iceberg table, emitted as :mod:`aws` emits the output's (Glue writes
-    its first metadata), beside it; and, when Lake Formation governs the output, the
-    job's grant to commit to it, as for the output (``_emit_lakeformation``)."""
+    its first metadata), beside it; and the job's grant to commit to it, as for the output:
+    always under the output's ``governance.lakeFormation``, and without one where the
+    account's Lake Formation settings govern new tables (``_lake_formation_default``)."""
     from fluid_build.iac.governance_labels import governance_labels
     from fluid_build.spark.dead_letter import SCHEMA
 
@@ -1006,20 +1041,28 @@ def _emit_dead_letter_table(
             ("Give each build's dead letters a table of their own.",),
         )
     tables[key] = body
-    gov = (binding.get("governance") or {}).get("lakeFormation")
-    if gov and principal is not None:
-        blocks.resources.setdefault("aws_lakeformation_permissions", {})[
-            safe_ident(f"{b.ctx.cid}_lf_spark_dead_letters_{b.build_id}")
-        ] = {
-            "principal": principal,
-            "permissions": ["ALTER", "DESCRIBE", "INSERT", "SELECT"],
-            "table": [
-                {
-                    "database_name": tofu_ref(f"aws_glue_catalog_table.{key}.database_name"),
-                    "name": tofu_ref(f"aws_glue_catalog_table.{key}.name"),
-                }
-            ],
-        }
+    if principal is None:
+        return
+    grant: Dict[str, Any] = {
+        "principal": principal,
+        "permissions": ["ALTER", "DESCRIBE", "INSERT", "SELECT"],
+        "table": [
+            {
+                "database_name": tofu_ref(f"aws_glue_catalog_table.{key}.database_name"),
+                "name": tofu_ref(f"aws_glue_catalog_table.{key}.name"),
+            }
+        ],
+    }
+    if not (binding.get("governance") or {}).get("lakeFormation"):
+        # As for the output (``aws._emit_default_spark_writer_grants``): granted where the
+        # account's Lake Formation settings govern new tables, decided at plan.
+        if not _lake_formation_default(binding):
+            return
+        settings = safe_ident(f"{b.ctx.cid}_lf_settings")
+        grant = {"count": _aws._where_lake_formation_governs(settings), **grant}
+    blocks.resources.setdefault("aws_lakeformation_permissions", {})[
+        safe_ident(f"{b.ctx.cid}_lf_spark_dead_letters_{b.build_id}")
+    ] = grant
 
 
 def _secret_arns(config: Mapping[str, Any], region: Any, ctx: _Ctx) -> Tuple[Any, ...]:
@@ -1311,9 +1354,14 @@ def _emit_caller_policy(
 #: What a forge Spark build runs with, by resource type and the end of its name in the module
 #: (the keys the emitters above write: ``<contract>_<build>_spark`` and what hangs off it, the
 #: product's ``<contract>_spark`` application, ``_spark_caller`` policy and ``_spark_logs``
-#: key, and the ``_lf_writer_<8 hex>`` registration role). None holds data: a destroy deletes
-#: runners, job configs, roles, policies, jobs, an application, and the build's log group with
-#: the key its logs are encrypted with. A bucket's own key ends in ``_kms`` and stays gated.
+#: key, the ``_lf_writer_<8 hex>`` registration role, and the job role's own Lake Formation
+#: grants: ``_lf_spark_writer_<table>_<n>`` on the table it writes and
+#: ``_lf_spark_dead_letters_<build>`` on its stream's dead-letter table, counted at plan where
+#: the account's settings decide them, so a plan names them ``...[0]``). None holds data: a
+#: destroy deletes runners, job configs, roles, policies, jobs, an application, grants, and the
+#: build's log group with the key its logs are encrypted with. A bucket's own key ends in
+#: ``_kms`` and stays gated, and a grant the binding's ``governance.lakeFormation`` declares
+#: (``_lf_grant_*``) is not the build's.
 _SPARK_DEFINITIONS: Dict[str, "re.Pattern[str]"] = {
     "aws_s3_object": re.compile(r"_spark_(runner|config)$"),
     "aws_s3_object_copy": re.compile(r"_spark_jar_[0-9]+$"),
@@ -1325,6 +1373,9 @@ _SPARK_DEFINITIONS: Dict[str, "re.Pattern[str]"] = {
     "aws_glue_job": re.compile(r"_spark$"),
     "aws_glue_connection": re.compile(r"_spark$"),
     "aws_emrserverless_application": re.compile(r"_spark$"),
+    "aws_lakeformation_permissions": re.compile(
+        r"_lf_spark_(writer_\w+_[0-9]+|dead_letters_\w+)(\[0\])?$"
+    ),
 }
 
 

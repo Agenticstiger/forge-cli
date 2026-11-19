@@ -725,8 +725,9 @@ class AwsIacPlugin:
             _check_lf_grant_columns(binding, loc, fmt, schema, exclusions or {})
             # Per-exposure Lake Formation: location registration,
             # principal grants, LF-tag associations, row/column filters.
-            # Only fires when the binding carries a governance.lakeFormation
-            # block — every existing AWS contract is unaffected.
+            # Fires when the binding carries a governance.lakeFormation block,
+            # and for a forge Spark job's own grants where Lake Formation
+            # governs new tables (decided at plan).
             _emit_lakeformation(
                 resources,
                 binding,
@@ -741,6 +742,7 @@ class AwsIacPlugin:
                 lf_tags=lf_tags,
                 spark_writers=spark.writers.get(str(_expose_id(exposure))) or (),
                 spark_registration_role=spark.registration_roles.get(str(_expose_id(exposure))),
+                spark_lf_settings=spark.lf_settings,
             )
         # Produced Kafka subjects on the Glue Schema Registry (aws_schema_registry.py).
         emit_schema_registry(resources, contract, cid, base_tags)
@@ -3492,6 +3494,83 @@ def _refuse_grants_left_no_column(
         )
 
 
+def _emit_spark_writer_grants(
+    resources: Dict[str, Any],
+    cid: str,
+    table: Any,
+    table_key: str,
+    writers: Sequence["aws_ingest.Writer"],
+    count: Any = None,
+) -> None:
+    """Each forge Spark job that writes the table gets ``INSERT``, ``ALTER``, ``DESCRIBE``
+    and ``SELECT`` on it (and ``DELETE`` for a batch job, which overwrites): what an Iceberg
+    commit through Lake Formation takes. ``count``, when given, decides at plan whether the
+    grant exists (:func:`_where_lake_formation_governs`)."""
+    for idx, writer in enumerate(writers):
+        if writer.principal is None:
+            continue  # emr-ec2: the cluster's own role, which forge does not know
+        permissions = ["ALTER", "DESCRIBE", "INSERT", "SELECT"]
+        if writer.overwrites:
+            permissions.append("DELETE")
+        body: Dict[str, Any] = {
+            "principal": writer.principal,
+            "permissions": sorted(permissions),
+            "table": [
+                {
+                    "database_name": tofu_ref(f"aws_glue_catalog_table.{table_key}.database_name"),
+                    "name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
+                }
+            ],
+        }
+        if count is not None:
+            body = {"count": count, **body}
+        resources.setdefault("aws_lakeformation_permissions", {})[
+            safe_ident(f"{cid}_lf_spark_writer_{table}_{idx}")
+        ] = body
+
+
+def _where_lake_formation_governs(settings_key: str) -> TofuExpr:
+    """1 where the account's Lake Formation settings govern new tables, else 0.
+
+    An account that keeps the ``IAM_ALLOWED_PRINCIPALS`` default lets IAM alone decide who
+    reads and writes a new table; one that removed it (Lake Formation's own advice) lets no
+    principal at all until Lake Formation grants it. Read at plan from
+    ``data.aws_lakeformation_data_lake_settings``, so the module is the same text in both."""
+    defaults = (
+        f"data.aws_lakeformation_data_lake_settings.{settings_key}"
+        ".create_table_default_permissions"
+    )
+    return TofuExpr(
+        f'${{length([for d in {defaults} : d if d.principal == "IAM_ALLOWED_PRINCIPALS"]) '
+        "== 0 ? 1 : 0}"
+    )
+
+
+def _emit_default_spark_writer_grants(
+    resources: Dict[str, Any],
+    binding: Mapping[str, Any],
+    loc: Mapping[str, Any],
+    fmt: str,
+    cid: str,
+    writers: Sequence["aws_ingest.Writer"],
+    settings_key: Optional[str],
+) -> None:
+    """The grants a forge Spark job needs to write its own table through Lake Formation,
+    for an output whose binding declares no ``governance.lakeFormation``: emitted where
+    the account's settings say Lake Formation governs new tables, and nowhere else."""
+    database, table = loc.get("database"), loc.get("table")
+    if not (settings_key and writers and database and table and _glue_cataloged(binding, fmt)):
+        return
+    _emit_spark_writer_grants(
+        resources,
+        cid,
+        table,
+        safe_ident(f"{cid}_{database}_{table}"),
+        writers,
+        count=_where_lake_formation_governs(settings_key),
+    )
+
+
 def _emit_lakeformation(
     resources: Dict[str, Any],
     binding: Mapping[str, Any],
@@ -3507,9 +3586,11 @@ def _emit_lakeformation(
     lf_tags: Sequence[Mapping[str, str]] = (),
     spark_writers: Sequence["aws_ingest.Writer"] = (),
     spark_registration_role: Optional[str] = None,
+    spark_lf_settings: Optional[str] = None,
 ) -> None:
-    """Emit per-exposure LF resources. No-op when the binding has no
-    ``governance.lakeFormation`` block.
+    """Emit per-exposure LF resources. Without a ``governance.lakeFormation`` block, only
+    the forge Spark jobs' own grants, where Lake Formation governs new tables
+    (:func:`_emit_default_spark_writer_grants`, ``spark_lf_settings``).
 
     ``spark_writers`` are the forge Spark jobs that write this table
     (:mod:`aws_ingest`): each job role gets ``INSERT``, ``ALTER``, ``DESCRIBE`` and
@@ -3542,6 +3623,9 @@ def _emit_lakeformation(
     """
     gov = (binding.get("governance") or {}).get("lakeFormation") or {}
     if not gov:
+        _emit_default_spark_writer_grants(
+            resources, binding, loc, fmt, cid, spark_writers, spark_lf_settings
+        )
         return
     # LF only meaningfully manages access to Glue-catalog-backed formats
     # (file formats on S3). Redshift/Kinesis bindings have their own
@@ -3682,26 +3766,7 @@ def _emit_lakeformation(
 
     # 2a. The forge Spark jobs that write the table, through Lake Formation.
     if table_key:
-        for idx, writer in enumerate(spark_writers):
-            if writer.principal is None:
-                continue  # emr-ec2: the cluster's own role, which forge does not know
-            permissions = ["ALTER", "DESCRIBE", "INSERT", "SELECT"]
-            if writer.overwrites:
-                permissions.append("DELETE")
-            resources.setdefault("aws_lakeformation_permissions", {})[
-                safe_ident(f"{cid}_lf_spark_writer_{table}_{idx}")
-            ] = {
-                "principal": writer.principal,
-                "permissions": sorted(permissions),
-                "table": [
-                    {
-                        "database_name": tofu_ref(
-                            f"aws_glue_catalog_table.{table_key}.database_name"
-                        ),
-                        "name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
-                    }
-                ],
-            }
+        _emit_spark_writer_grants(resources, cid, table, table_key, spark_writers)
 
     # 2b. The S3 bucket policy for the grantees above (by default only those in
     #     another AWS account) is emitted once per bucket, over every exposure

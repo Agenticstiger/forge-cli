@@ -130,9 +130,13 @@ def test_lake_formation_lets_the_job_commit_to_its_dead_letters(contract):
             "name": f"${{aws_glue_catalog_table.{TABLE_KEY}.name}}",
         }
     ]
-    # Without Lake Formation, the role's own grants are all it needs.
+    assert "count" not in grant
+    # Without a lakeFormation block the grant is there too, decided at plan by the account's
+    # settings: 1 where Lake Formation governs new tables (test_iac_aws_spark_lf_default*).
     resources, _ = emit(with_dead_letters(copy.deepcopy(CONTRACT)))
-    assert GRANT_KEY not in resources.get("aws_lakeformation_permissions", {})
+    counted = resources["aws_lakeformation_permissions"][GRANT_KEY]
+    assert counted["count"].startswith("${length([for d in data.aws_lakeformation_data_lake_set")
+    assert {k: v for k, v in counted.items() if k != "count"} == grant
 
 
 def test_a_location_forge_registers_refuses_a_dead_letters_table(contract, listed_topic):
