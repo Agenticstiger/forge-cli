@@ -665,18 +665,18 @@ def tofu_binary() -> str:
 
 
 @pytest.fixture(scope="session")
-def tofu_env(tmp_path_factory: pytest.TempPathFactory) -> Dict[str, str]:
+def tofu_env() -> Dict[str, str]:
     """The environment for ``tofu`` child processes.
 
     Carries the inherited environment (so the ``snowflakedb/snowflake``
     provider self-configures from ``SNOWFLAKE_*``), the plugin's
     ``credential_env`` overlay (the ``SNOWFLAKE_ACCOUNT`` → org/account
-    split), and a session-shared provider cache so the ~16 live tests do
-    not each re-download the provider.
+    split), and the run's provider cache, which ``build_tofu_env`` passes
+    through from the environment (``tests/_infrastructure/tofu_cache.py``), so
+    the ~16 live tests do not each re-download the provider.
     """
     env = build_tofu_env(snowflake_plugin())
     env.update(snowflake_plugin().credential_env(dict(os.environ)))
-    env["TF_PLUGIN_CACHE_DIR"] = str(tmp_path_factory.mktemp("tofu-plugin-cache"))
     return env
 
 
@@ -1567,9 +1567,7 @@ def aws_account() -> Dict[str, str]:
 
 
 @pytest.fixture
-def aws_real_project(
-    aws_account: Dict[str, str], tofu_env: Dict[str, str], tmp_path: Path
-) -> Iterator[RealAwsProject]:
+def aws_real_project(aws_account: Dict[str, str], tmp_path: Path) -> Iterator[RealAwsProject]:
     """A :class:`RealAwsProject` bound to a fresh workdir.
 
     Teardown: best-effort ``tofu destroy`` so applied resources don't
@@ -1581,8 +1579,7 @@ def aws_real_project(
     ``AWS_PROFILE`` and the CI job's OIDC keys, so ``tofu`` would apply with
     another profile's region (or no credentials) while boto checks this one.
     """
-    env = build_tofu_env(get_iac_plugin("aws"))
-    env["TF_PLUGIN_CACHE_DIR"] = tofu_env["TF_PLUGIN_CACHE_DIR"]
+    env = build_tofu_env(get_iac_plugin("aws"))  # carries the run's provider cache
     project = RealAwsProject(tmp_path, env)
     try:
         yield project

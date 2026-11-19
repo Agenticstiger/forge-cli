@@ -63,6 +63,11 @@ expose; column-targeting rules attach under the matching
 ``columns[].tests`` entry, ``"*"``-targeting rules attach at the
 model level.
 
+On a 0.7.7 contract each declared invariant, identifier format, bounded placeholder
+declaration and shared attribute also becomes one model-level ``fluid_rule`` test
+(:mod:`fluid_build.data_rules._dbt`), and a column's placeholders are exempt from its own
+``accepted_values`` and range tests through a ``where`` config.
+
 The sentinel ``# managed-by: fluid`` header lets re-runs detect and
 overwrite without clobbering hand-edits outside that block (the runner
 enforces the boundary).
@@ -70,7 +75,10 @@ enforces the boundary).
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+import datetime
+import re
+from dataclasses import dataclass, field
+from typing import Any, List, Mapping, Sequence
 
 # The single shared contract → dbt-test mapping. Reached via module attribute
 # access (``_tm.<fn>``) so a ``patch("...engines.dbt._test_mapping.<fn>")``
@@ -89,7 +97,23 @@ from ..engines.dbt.schema_yml import TESTS_KEY_LEGACY, normalize_tests_key
 MANAGED_BY_SENTINEL = "# managed-by: fluid"
 
 
+@dataclass(frozen=True)
+class DbtTests:
+    """What :func:`render_project_tests` writes: the schema.yml text, whether it calls the
+    ``fluid_rule`` macro (which the project must then carry), and the declared rules it
+    could not render, each with its reason."""
+
+    yaml: str
+    uses_fluid_rule: bool
+    skipped: List[Any] = field(default_factory=list)
+
+
 def render_dbt_tests(contract: Mapping[str, Any], *, tests_key: str | None = None) -> str:
+    """:func:`render_project_tests`'s schema.yml text."""
+    return render_project_tests(contract, tests_key=tests_key).yaml
+
+
+def render_project_tests(contract: Mapping[str, Any], *, tests_key: str | None = None) -> DbtTests:
     """Render a parsed FLUID contract as a dbt schema.yml string.
 
     The returned text is a single multi-doc YAML stream. Callers should
@@ -127,13 +151,41 @@ def render_dbt_tests(contract: Mapping[str, Any], *, tests_key: str | None = Non
         if model_block is not None:
             models.append(model_block)
 
-    doc: dict[str, Any] = {"version": 2, "models": models}
+    # Declared invariants (0.7.7): one ``fluid_rule`` test each, at model level.
+    rule_tests, skipped = _rule_tests(contract)
+    for model in models:
+        extra = rule_tests.get(model["name"])
+        if extra:
+            model[resolved_tests_key] = list(model.get(resolved_tests_key) or []) + extra
+            # dbt reads a model's keys in any order; keep columns last, as before.
+            if "columns" in model:
+                model["columns"] = model.pop("columns")
+
+    doc: dict[str, Any] = {"version": 2, "models": _inert_jinja(models)}
     body = yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)
-    return (
+    text = (
         f"{MANAGED_BY_SENTINEL}\n"
         "# Generated from fluid contract — do not edit between the sentinels.\n"
         f"{body}"
     )
+    return DbtTests(text, any(rule_tests.values()), skipped)
+
+
+def _rule_tests(contract: Mapping[str, Any]) -> tuple[dict[str, list[Any]], list[Any]]:
+    """The ``fluid_rule`` tests by model name, and the rules skipped (``data_rules._dbt``)."""
+    from ..data_rules import FIRST_VERSION, _version
+
+    version = _version(contract)
+    if not version or version < FIRST_VERSION:
+        return {}, []
+    from ..data_rules._dbt import rule_tests
+
+    names = {
+        e.get("exposeId"): _model_name(e)
+        for e in contract.get("exposes") or []
+        if isinstance(e, Mapping) and isinstance(e.get("exposeId"), str)
+    }
+    return rule_tests(contract, names.get)
 
 
 def _expose_to_model(
@@ -284,9 +336,9 @@ def _columns_with_tests(
         desc = col.get("description") or col.get("businessName")
         if desc:
             col_block["description"] = desc
-        col_tests = _tm.merge_tests(
-            list(tests_by_column.get(name) or []),
-            _tm.constraint_tests(col),
+        col_tests = _exempt_placeholders(
+            col,
+            _tm.merge_tests(list(tests_by_column.get(name) or []), _tm.constraint_tests(col)),
         )
         if col_tests:
             col_block[tests_key] = col_tests
@@ -301,3 +353,72 @@ def _columns_with_tests(
         out.append({"name": col_name, tests_key: col_tests})
 
     return out
+
+
+def _exempt_placeholders(col: Mapping[str, Any], tests: list[Any]) -> list[Any]:
+    """The column's ``accepted_values`` and range tests leave its placeholder rows out
+    (:func:`fluid_build.data_rules._dbt.exempt_placeholders`)."""
+    if not isinstance(col.get("placeholders"), Mapping):
+        return tests
+    from ..data_rules._dbt import exempt_placeholders
+
+    return exempt_placeholders(col, tests, _GeneratedJinja)
+
+
+_JINJA_DELIMITERS = ("{{", "{%", "{#")
+#: dbt also evaluates a test argument that looks like one of these calls, braces or not
+#: (``dbt.clients.jinja.add_rendered_test_kwargs``): an enum value ``env_var('SECRET')`` would
+#: read the variable.
+_LOOKS_LIKE_CALL = re.compile(r"^\s*(env_var|ref|var|source|doc)\s*\(.+\)\s*$", re.S)
+#: The ``relationships`` test's own ``ref('<model>')``, kept when the model is a plain name.
+_OWN_REF = re.compile(r"ref\('[A-Za-z0-9_]+'\)")
+
+
+class _GeneratedJinja(str):
+    """Jinja this module built from literals (a placeholder ``where``): left as written."""
+
+
+def _inert_jinja(value: Any) -> Any:
+    """``value`` with every string that holds a Jinja delimiter written as a Jinja string
+    literal of itself (:func:`fluid_build.data_rules._dbt.jinja_text`).
+
+    dbt renders a schema.yml's names, descriptions and test arguments as Jinja, so a column
+    named ``x{{ env_var('SECRET') }}`` or an enum value holding ``{%`` would run during
+    ``dbt parse``, and so would a test argument that is a bare ``env_var(...)``-style call.
+    Every other string is left as written, so the file for every other contract is
+    unchanged; so is the ``relationships`` test's own ``ref('<model>')`` when the model is a
+    plain name (any other model name is a literal, and the test then names no model).
+    The ``fluid_rule`` test bodies are already Jinja built from literals; they are known by
+    their type (``GeneratedTest``), never by a key name, which a contract could also write.
+    """
+    if isinstance(value, _GeneratedJinja):
+        return str(value)
+    from ..data_rules._dbt import GeneratedTest
+
+    if isinstance(value, GeneratedTest):
+        return _plain(value)
+    if isinstance(value, str):
+        unsafe = any(d in value for d in _JINJA_DELIMITERS) or _LOOKS_LIKE_CALL.match(value)
+        if unsafe and not _OWN_REF.fullmatch(value):
+            from ..data_rules._dbt import jinja_text
+
+            return jinja_text(value)
+        return value
+    if isinstance(value, Mapping):
+        return {key: _inert_jinja(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        # YAML's !!pairs and !!omap load as tuples, and dbt renders the strings inside
+        # whatever list safe_dump makes of them.
+        return [_inert_jinja(item) for item in value]
+    if value is None or isinstance(value, (bool, int, float, datetime.date)):
+        return value
+    return _inert_jinja(str(value))  # any other type: its text, escaped like any text
+
+
+def _plain(value: Any) -> Any:
+    """``value`` as plain dicts, lists and strings (yaml.safe_dump takes no subclass)."""
+    if isinstance(value, Mapping):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_plain(item) for item in value]
+    return str(value) if isinstance(value, str) else value

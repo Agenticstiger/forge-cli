@@ -7,7 +7,7 @@ import pytest
 
 from fluid_build.spark.compiler import CONTRACT_SQL_ALLOWLIST_ENV
 from fluid_build.spark.policy import SparkPolicyError, refuse_unless_contract_sql_allowed
-from fluid_build.streaming.policy import contract_sql_entry
+from fluid_build.streaming.contract_sql import contract_sql_entry
 
 BUILD = {"id": "compact", "properties": {"sql": "  SELECT 1 AS x  "}}
 

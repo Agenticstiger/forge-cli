@@ -174,6 +174,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another build's DAG would otherwise run twice). `fluid validate` warns about an Airflow
   task's `buildStepRef`: no generated DAG runs one.
 
+- **`fluid generate dbt-tests` runs declared invariants as dbt tests.** On a 0.7.7 contract each
+  declared invariant, identifier format, bounded placeholder declaration, shared column and
+  shared attribute becomes one `fluid_rule` generic test on its model, and the `fluid_rule`
+  macro is written to `<project>/<first macro-paths entry>/fluid/fluid_rule.sql` (the nearest
+  `dbt_project.yml` above `--out`; the new `--macros-dir` overrides it, and a file fluid did not
+  write is never overwritten). Each test carries its SQL for every engine forge renders, and the
+  macro picks by `target.type` (DuckDB, Snowflake, BigQuery, Databricks or Spark, PostgreSQL,
+  Athena or Trino), so one project runs on DuckDB locally and on Athena live; an adapter with no
+  rendering fails that test with a message naming the rule. The SQL is printed from the parsed
+  expression and joins linked models with `ref()`; the band is compared exactly, in rows or as
+  `100 * violating` against `value * covered`; `severity: warning` and `info` warn. Every piece
+  of contract text reaches dbt as a Jinja string literal, so `{{` in a name or literal stays
+  data. A rule no engine can run is logged with its reason and not tested. A column's
+  placeholder values and prefixes are now exempt from its own `accepted_values` and range tests,
+  through a `where` config per adapter.
+
 - **Declared invariants become ODCS quality rules.** On a 0.7.7 contract, `fluid generate
   standard --format odcs` now writes each `exposes[].contract.invariants[]` entry, each
   identifier format and placeholder declaration, each `sharedColumns` entry and each member of a
@@ -244,7 +260,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--explain` says why. A release run reads only local files: it opens no network connection
   of its own.
 
+- **`fluid verify --require-every-port` fails unless every expose was verified.** `--strict`
+  fails only a run that verified nothing, so a run that verified one port passed while its
+  others were skipped. With the flag, each skipped expose fails the run (exit 1) and is named
+  with why: no verifier for the binding, a reference-only table not built yet, an entry with
+  no `exposeId` (never checked), or an id declared twice. A contract with no expose fails too.
+  A managed streaming contract keeps its whole-contract check from checkpoint evidence, and
+  the run says so.
+  The run's message names every one of them. It needs no
+  `--strict`, `--warn-only` does not downgrade it, and `--expose` beside it is refused (exit
+  2). The `--out` report lists the unverified exposes under `require_every_port`. `fluid ship
+  --release-dir` passes it to stage 9, so a release never stands for a port nobody verified.
+
 ### Changed
+
+- **A test run installs each OpenTofu provider once, and passing tests clean up after
+  themselves.** The tests that run `tofu init` put a copy of the provider into every test's
+  own directory (0.75 GB for `hashicorp/aws`, downloaded each time), so one run of `tests/iac`
+  wrote 15-31 GB into pytest's basetemp. A run now shares one provider cache between all its
+  workers (`tests/_infrastructure/tofu_cache.py`): a test directory holds a symlink, and
+  `TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE` is set because without a lock file OpenTofu
+  downloads a cached provider again on every `init`. A `TF_PLUGIN_CACHE_DIR` you set is used as
+  given, which keeps providers between runs. `tmp_path_retention_policy = "failed"` removes a
+  passing test's directory when the test ends; a failed test keeps its own. Test
+  infrastructure only: the product is unchanged.
 
 - **`ship-report.json` is versioned: `"schema": "fluid-ship-report/2"`.** Every stage has one
   of six statuses: `passed`, `failed`, `skipped-by-policy` (a flag, a `RUN_STAGE_*` switch or
@@ -278,6 +317,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes changes.
 
 ### Fixed
+
+- **`fluid validate` stops warning about a Spark or managed Flink build's own SQL once the
+  operator lists it.** The warning that `properties.sql` runs only if the operator lists the
+  build was printed for every build with SQL, whatever `FLUID_SPARK_CONTRACT_SQL_ALLOWLIST`
+  (or `FLUID_FLINK_CONTRACT_SQL_ALLOWLIST`) held, so `fluid validate --strict`, and with it
+  stage 2 of `fluid ship`, failed every Spark SQL batch even after the operator listed it.
+  Validate now asks the rule apply uses, under the same environment: the warning stays while
+  the build is not listed, and says so when the entry listed for it pins other SQL (the SQL
+  changed after review); a build listed by product, by build or pinned to its SQL is quiet.
+
+- **A Spark build runs on EMR on EKS.** EMR on EKS names an image of a release,
+  `emr-X.Y.Z-latest` or `emr-X.Y.Z-YYYYMMDD`, and forge sent it the plain `emr-7.12.0` every
+  other EMR runtime takes, refusing the suffixed forms everywhere (the 0.7.7 schema, the IaC
+  checks). Each EMR runtime now takes its own form, and an `emr-eks` build without
+  `releaseLabel` runs on `emr-7.12.0-latest`; EMR Serverless and EMR on EC2 keep `emr-7.12.0`.
 
 - **A Spark stream on AWS can read its own checkpoint.** The role forge creates for a Spark build
   could read and write `<prefix>/*` and list `<prefix>/*`, but Hadoop's `getFileStatus` first asks
@@ -329,6 +383,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`fluid generate dbt-tests` writes no contract text that dbt would run as Jinja.** dbt
+  renders a schema.yml's names, descriptions and test arguments as Jinja, and evaluates a test
+  argument that looks like `env_var(...)`, `var(...)`, `ref(...)`, `source(...)` or `doc(...)`
+  even without braces. A column name, description, enum value or other string from a contract
+  that holds `{{`, `{%` or `{#`, or looks like such a call, is now written as a Jinja string
+  literal of itself, so `dbt parse` reads it back as text; a column named
+  `x{{ env_var('SECRET') }}` used to print the variable. Every other string is written as
+  before. The `relationships` test keeps its own `ref('<model>')`.
+
 - **A quantile is published only when the records below and above it pass the threshold too.**
   A `quantile/1` group was published when ten records held its witness, with its two ranks, so a
   rank could say that 3 records lie below the witness, or that 2 lie above it. A group is now
@@ -354,7 +417,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subtract one histogram's published counts from another's, or from a level histogram's group
   size, and rebuild a withheld cell, a zero included. FLUX's `check_edge_counts` closes that, and
   forge-cli calls it once a flux-stats release carries it. That change completes the rule and
-  lands before the next forge-cli release.
+  lands in a later forge-cli release.
 
 ## [0.32.0] — 2026-11-18
 
