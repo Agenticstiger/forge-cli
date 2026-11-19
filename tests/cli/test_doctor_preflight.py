@@ -416,10 +416,11 @@ def test_every_capability_is_one_of_the_four_classes():
 def test_the_resolved_schema_carries_its_hash():
     import hashlib
 
-    import fluid_build.schema_manager as sm
+    from fluid_build.schema_manager import FluidSchemaManager
 
     rev = _report()["schema_revision"]
-    path = Path(sm.__file__).parent / "schemas" / f"fluid-schema-{rev['resolved']}.json"
+    schemas = FluidSchemaManager.latest_schema_path().parent
+    path = schemas / f"fluid-schema-{rev['resolved']}.json"
     assert rev["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
     assert rev["source"] == "bundled"
 
@@ -664,7 +665,7 @@ def _fake_boto3(monkeypatch, fail=False):
             return {}
 
         def __getattr__(self, name):
-            raise AssertionError(f"--live called {self.service}.{name}")
+            raise AttributeError(f"--live called {self.service}.{name}")
 
     def _client(service, config=None, **kw):
         # Every live client answers fast or fails: no SDK retry storm on a cut-off runner.
@@ -1022,6 +1023,20 @@ def test_provider_scopes_what_apply_needs():
     assert report["needs"]["clouds"] == ["aws"]
     assert [c["target"] for c in _caps(report, area="identity")] == ["aws"]
     assert not _caps(report, pf.UNSUPPORTED, "provider")
+
+
+def test_identity_fix_offers_live_only_where_a_live_check_exists():
+    contract = _load(AWS)
+    contract["exposes"][0]["binding"] = {
+        "platform": "snowflake",
+        "location": {"database": "DEMO", "schema": "RAW", "table": "ORDERS"},
+    }
+    snowflake = pf.build_report(contract, operation="apply", probe=FakeProbe())
+    aws = pf.build_report(_load(AWS), operation="apply", probe=FakeProbe())
+    assert [c["target"] for c in _caps(snowflake, area="identity")] == ["snowflake"]
+    assert "no read-only snowflake check" in _caps(snowflake, area="identity")[0]["fix"]
+    assert "--live" in _caps(aws, area="identity")[0]["fix"]
+    assert "no read-only" not in _caps(aws, area="identity")[0]["fix"]
 
 
 def test_a_provider_the_contract_does_not_declare_is_unsupported():

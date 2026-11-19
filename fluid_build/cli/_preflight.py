@@ -576,11 +576,7 @@ def _schema_revision(contract: Mapping[str, Any]) -> Tuple[Dict[str, Any], List[
     }
     caps: List[Capability] = []
     if bundled:
-        from pathlib import Path
-
-        import fluid_build.schema_manager as _sm
-
-        path = Path(_sm.__file__).parent / "schemas" / f"fluid-schema-{resolved}.json"
+        path = FluidSchemaManager.latest_schema_path().with_name(f"fluid-schema-{resolved}.json")
         try:
             revision["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
         except OSError:
@@ -1143,7 +1139,12 @@ def _live_capabilities(
                 f"{cloud} identity",
                 f"{operation} calls {cloud} as the identity its provider resolves"
                 f"{where}. An offline preflight cannot prove it",
-                "Run fluid doctor --contract ... --live for a read-only check.",
+                (
+                    "Run fluid doctor --contract ... --live for a read-only check."
+                    if cloud in _LIVE_IDENTITY
+                    else f"--live has no read-only {cloud} check yet; prove it with a "
+                    f"{operation} against a test target."
+                ),
             )
         )
     if state_backend.get("needed"):
