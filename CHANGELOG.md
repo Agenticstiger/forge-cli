@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both runners reach, a plan made on one runner applies unchanged on another at another checkout
   path; a plan made on local state that the applying runner does not have is refused as
   `apply_plan_digest_tofu_plan_state_missing` instead of "stale".
+  A field the plan could not bind is also logged at WARNING at apply
+  (`apply_tofu_plan_target_field_unbound`, naming the provider, the field and why), and a
+  provider forge reads no target for (`confluent`, an entry-point plugin) is named at plan and
+  at apply (`plan_tofu_target_provider_unbound` / `apply_tofu_plan_target_provider_unbound`).
+  The AWS region falls back to the named profile's `region` in the shared config file, and the
+  profile is `AWS_PROFILE`, else `AWS_DEFAULT_PROFILE`, the order the `hashicorp/aws` provider
+  reads them in.
 - **`fluid plan` and `fluid apply` warn when an EMR on EC2 cluster can lose a Spark build to
   Spot.** For each `runtime: emr-ec2` build, forge reads its `clusterId` once
   (`DescribeCluster`, then `ListInstanceGroups` or `ListInstanceFleets`) and warns, never
@@ -320,16 +327,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **A test run installs each OpenTofu provider once, and passing tests clean up after
-  themselves.** The tests that run `tofu init` put a copy of the provider into every test's
-  own directory (0.75 GB for `hashicorp/aws`, downloaded each time), so one run of `tests/iac`
-  wrote 15-31 GB into pytest's basetemp. A run now shares one provider cache between all its
-  workers (`tests/_infrastructure/tofu_cache.py`): a test directory holds a symlink, and
-  `TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE` is set because without a lock file OpenTofu
-  downloads a cached provider again on every `init`. A `TF_PLUGIN_CACHE_DIR` you set is used as
-  given, which keeps providers between runs. `tmp_path_retention_policy = "failed"` removes a
-  passing test's directory when the test ends; a failed test keeps its own. Test
-  infrastructure only: the product is unchanged.
+- **A test run installs each OpenTofu provider once.** The tests that run `tofu init` put a
+  copy of the provider into every test's own directory (0.75 GB for `hashicorp/aws`,
+  downloaded each time), so one run of `tests/iac` wrote 15-31 GB into pytest's basetemp
+  (27.6 GiB measured). A run now shares one provider cache between all its workers
+  (`tests/_infrastructure/tofu_cache.py`): a test directory holds a symlink, the whole basetemp
+  is 1 GiB, and `TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE` is set because without a lock
+  file OpenTofu downloads a cached provider again on every `init`. A `TF_PLUGIN_CACHE_DIR` you
+  set is used as given, which keeps providers between runs. Test infrastructure only: the
+  product is unchanged.
 
 - **`ship-report.json` is versioned: `"schema": "fluid-ship-report/2"`.** Every stage has one
   of six statuses: `passed`, `failed`, `skipped-by-policy` (a flag, a `RUN_STAGE_*` switch or
@@ -371,6 +377,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and Spark, Postgres, Athena and Trino, with a standard literal for any other adapter), and
   the column's other values as `'<value>'`, in both `fluid generate dbt-tests` and the dbt
   engine. Columns whose values hold neither are written as before.
+
+- **`fluid generate ci` runs stage 3 for a contract with reference builds.** It turned
+  `RUN_STAGE_3_GENERATE_ARTIFACTS` off when any build was `hybrid-reference`, `reference` or
+  `external-reference`, so a contract with Spark builds beside one reference dbt build skipped
+  stage 4 and ran stages 8 and 11 without `dist/artifacts/policy/bindings.json` and
+  `dist/artifacts/schedule/`. `fluid generate artifacts` writes both for reference builds too,
+  so only `--no-generate-artifacts` turns stage 3 off now.
+- **`--install-mode dev-source` puts `fluid` on PATH.** On GitHub, GitLab, Azure DevOps,
+  Bitbucket, CircleCI and Tekton the install step exported `PYTHONPATH=/forge-cli-src`, which
+  ended with the step or subshell and never provided the command, so every `fluid ship` step
+  failed with "command not found". It now runs `pip install -e /forge-cli-src`, and a missing
+  mount or a failed install stops the job. Jenkins is unchanged.
+- **Generated pipelines pin their container images by digest.** Tekton, GitLab (both images),
+  Bitbucket and CircleCI named `python:3.12-slim`, `python:3.12` and `cimg/python:3.12` by tag;
+  each is now `<tag>@sha256:<index digest>`, kept beside the GitHub action pins and checked by
+  the same monthly job. `fluid generate ci --system tekton --image IMAGE` sets the Task image.
 
 - **`fluid validate` stops warning about a Spark or managed Flink build's own SQL once the
   operator lists it.** The warning that `properties.sql` runs only if the operator lists the

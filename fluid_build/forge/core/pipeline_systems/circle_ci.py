@@ -24,13 +24,14 @@ from . import _keyless, _thin
 from ._base import (
     BasePipelineTemplate,
     PipelineConfig,
+    _pin_image,
     check_pipeline_workdir,
 )
 
 RUN_COMPLIANCE = "run_compliance"
 SCHEDULED = "<< pipeline.trigger_source >>"
 CONFIG_PATH = ".circleci/config.yml"
-IMAGE = "cimg/python:3.12"
+IMAGE = _pin_image("cimg/python:3.12")
 PROJECT_DIR = "~/project"
 #: The stage knobs ship reads, each with its own default when blank.
 STAGE_KNOBS: Tuple[str, ...] = (

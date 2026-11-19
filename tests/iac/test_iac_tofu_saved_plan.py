@@ -804,17 +804,60 @@ class TestTheLockTravels:
 
 
 class TestUnboundFieldsAreNamed:
-    def test_apply_names_what_the_plan_could_not_bind(self, offline_tofu, monkeypatch, capsys):
+    def test_apply_names_what_the_plan_could_not_bind(
+        self, offline_tofu, monkeypatch, capsys, caplog
+    ):
         monkeypatch.setattr(
             target_identity, "aws_caller_account", lambda env, region: ("", "boto3 missing")
         )
         out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
         capsys.readouterr()
+        caplog.set_level(logging.WARNING)
         # The applying runner cannot read it either: the apply still says it was unbound.
         assert engine.apply_via_opentofu(_args(str(out)), _LOG) == 0
         assert "target account not bound by the plan, not compared: boto3 missing" in (
             capsys.readouterr().out
         )
+        # ... and logs it at WARNING under a stable event, for CI logs and audit trails.
+        events = [
+            json.loads(r.getMessage())
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "target_field_unbound" in r.getMessage()
+        ]
+        assert events == [
+            {
+                **{k: events[0][k] for k in ("time", "level", "name")},
+                "message": "apply_tofu_plan_target_field_unbound",
+                "provider": "aws",
+                "field": "account",
+                "reason": "boto3 missing",
+            }
+        ]
+
+    def test_a_provider_without_a_target_reader_is_named(
+        self, offline_tofu, monkeypatch, capsys, caplog
+    ):
+        # An entry-point plugin, or confluent: forge reads no account, project or host.
+        monkeypatch.delitem(target_identity._READERS, "aws")
+        caplog.set_level(logging.WARNING)
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        assert "forge reads no account, project or host for aws" in capsys.readouterr().out
+        assert engine.apply_via_opentofu(_args(str(out)), _LOG) == 0
+        assert "forge reads no account, project or host for aws" in capsys.readouterr().out
+        warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        for event in (
+            "plan_tofu_target_provider_unbound",
+            "apply_tofu_plan_target_provider_unbound",
+        ):
+            assert [json.loads(m)["provider"] for m in warned if event in m] == ["aws"]
+
+    def test_a_provider_with_a_reader_says_nothing_extra(self, offline_tofu, capsys, caplog):
+        caplog.set_level(logging.WARNING)
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        assert engine.apply_via_opentofu(_args(str(out)), _LOG) == 0
+        assert "forge reads no account" not in capsys.readouterr().out
+        assert "target_provider_unbound" not in caplog.text
+        assert "target_field_unbound" not in caplog.text
 
     def test_a_malformed_identity_fails_closed(self, offline_tofu):
         out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
