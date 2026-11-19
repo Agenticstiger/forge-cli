@@ -279,12 +279,33 @@ def test_a_nullable_struct_and_its_nullable_fields_are_exact():
     assert _bq_column_outcome(column).status == EXACT
 
 
-def test_a_lossy_leaf_makes_its_column_lossy_and_names_the_leaf():
-    column = _column("money", type="struct", fields=[{"name": "amount", "type": "decimal(38,10)"}])
+def test_a_nested_decimal_carries_its_precision_and_scale():
+    column = _column(
+        "money",
+        type="struct",
+        fields=[
+            {"name": "amount", "type": "decimal(38,10)"},
+            {"name": "rate", "type": "decimal(10,2)"},
+            {"name": "whole", "type": "decimal(10,0)"},
+        ],
+    )
+    assert _bq_column_outcome(column).status == EXACT
+    amount, rate, whole = _bq_field(column)["fields"]
+    assert (amount["type"], amount["precision"], amount["scale"]) == ("BIGNUMERIC", "38", "10")
+    assert (rate["type"], rate["precision"], rate["scale"]) == ("NUMERIC", "10", "2")
+    assert (whole["type"], whole["precision"], "scale" in whole) == ("NUMERIC", "10", False)
+
+
+def test_a_lossy_leaf_makes_its_column_lossy_and_names_the_leaf(monkeypatch):
+    """No leaf the shared parser takes is lossy on BigQuery today; one that is makes its
+    whole column lossy, naming the leaf."""
+    from fluid_build.iac.providers import gcp
+
+    monkeypatch.setitem(gcp._BQ_LOSSY, "float", "which this test marks lossy")
+    column = _column("money", type="struct", fields=[{"name": "amount", "type": "float"}])
     outcome = _bq_column_outcome(column)
     assert (outcome.status, outcome.target) == (LOSSY, "RECORD")
-    assert "money.amount is declared 'decimal(38,10)'" in outcome.why
-    assert "bignumeric" in outcome.fix
+    assert "money.amount is declared 'float', which this test marks lossy" in outcome.why
 
 
 def test_every_loss_is_one_warning_per_column_at_validate():

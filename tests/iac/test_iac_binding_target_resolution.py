@@ -313,9 +313,13 @@ class TestEmitAndImportsAgree:
     def test_every_emitted_resource_has_an_import_block(self, binding):
         contract = _contract([_expose(binding, expose_id="daily")])
         plugin = get_iac_plugin("gcp")
+        # A ``terraform_data`` (a replace trigger, the decimal-parameters marker) lives
+        # only in state: there is nothing in the cloud to adopt, and its create never
+        # collides with an existing object.
         emitted = {
             f"{kind}.{name}"
             for kind, bodies in plugin.emit(contract, []).items()
+            if kind != "terraform_data"
             for name in bodies
         }
         imported = {block.to for block in plugin.discover_imports(contract, [])}

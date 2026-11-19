@@ -43,9 +43,9 @@ admits *SQL alias* spellings (``decimal``, ``bigint``, ``text``,
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-from fluid_build.util.column_type import split_param_list, split_type_params
+from fluid_build.util.column_type import param_number, split_param_list, split_type_params
 
 # The pre-existing generic mapping — must stay byte-for-byte identical to the
 # historical ``models._sql_type`` table (skeleton-cast behavior is pinned).
@@ -73,6 +73,12 @@ _GENERIC: Dict[str, str] = {
 # datacontract-cli's sql_type_converter per-adapter choices where FLUID has an
 # equivalent type; semi-structured fallbacks use each platform's native
 # JSON-ish type instead of the generic ``varchar``.
+#
+# BigQuery's types come from the BigQuery IaC emitter's table
+# (``iac/providers/gcp.py::_bq_sql_type``, through :func:`_bigquery_type`), so a dbt
+# model and the table ``fluid apply`` creates agree. This table types only what that
+# emitter refuses (a bare ``array`` or ``struct``). Snowflake and Databricks go the
+# other way: their IaC emitters type through this module.
 _BIGQUERY: Dict[str, str] = {
     "string": "string",  # BigQuery rejects varchar
     "integer": "int64",
@@ -119,6 +125,24 @@ _SNOWFLAKE: Dict[str, str] = {
     "varbinary": "varbinary",
     "geography": "geography",
     "geometry": "geometry",
+    # Spellings the alias fold leaves to the varchar fallback. The Snowflake IaC
+    # emitter, which types through this table, wrote the first three as these types.
+    "int64": "number",
+    "float64": "float",
+    "bytes": "binary",
+    "int32": "number",
+    "int16": "number",
+    "float32": "float",
+    # A zoned timestamp keeps its zone (the fold would make it TIMESTAMP_NTZ).
+    "timestamptz": "timestamp_tz",
+    "timestamp with time zone": "timestamp_tz",
+    # A JSON value may be an array or a scalar: VARIANT holds any, OBJECT (where the fold
+    # puts ``json``) only a key-value map.
+    "json": "variant",
+    "jsonb": "variant",
+    # Snowflake has no MONEY, and a bare NUMBER is NUMBER(38,0), which drops the cents.
+    # NUMBER(19,4) is SQL Server's MONEY.
+    "money": "number(19,4)",
 }
 
 _REDSHIFT: Dict[str, str] = {
@@ -314,6 +338,176 @@ _PARAMETRIC: Dict[str, frozenset] = {
     "": frozenset({"varchar", "char", "decimal", "numeric", "timestamp"}),
 }
 
+# What a declaration's arguments mean, by the family of the type that declares them: a
+# length, a precision and scale, or fractional-second digits. They carry over only to a
+# type of the same family and only when well formed for it (:func:`_keeps_arguments`), so
+# a ``bigint(20)`` display width is never a NUMBER precision and a ``bignumeric(40,20)``
+# held as VARCHAR keeps none of its precision.
+_LENGTH_TYPES = frozenset(
+    {
+        "string",
+        "str",
+        "text",
+        "varchar",
+        "varchar2",
+        "nvarchar",
+        "nvarchar2",
+        "char",
+        "nchar",
+        "character",
+        "character varying",
+        "clob",
+        "binary",
+        "varbinary",
+        "bytes",
+        "blob",
+        "bytea",
+        "raw",
+    }
+)
+_DECIMAL_TYPES = frozenset({"number", "decimal", "dec", "numeric", "bignumeric", "money"})
+_TIME_TYPES = frozenset(
+    {
+        "time",
+        "timestamp",
+        "timestamp_ntz",
+        "timestamp_tz",
+        "timestamp_ltz",
+        "timestamptz",
+        "datetime",
+        "datetime2",
+        "timestamp with time zone",
+        "timestamp without time zone",
+    }
+)
+_ARGUMENT_FAMILIES = (
+    ("length", _LENGTH_TYPES),
+    ("decimal", _DECIMAL_TYPES),
+    ("time", _TIME_TYPES),
+)
+# Adapters whose character types take ``MAX`` for a length (Redshift's VARCHAR(MAX)).
+# Elsewhere ``varchar(max)`` is the bare type, which already holds the longest value.
+_MAX_LENGTH_ADAPTERS = frozenset({"redshift"})
+_DIGITS_RE = re.compile(r"[0-9]+", re.ASCII)
+
+# A decimal's arguments: a precision and an optional scale, in digits and nothing else,
+# since they are written into DDL and SQL as declared (``NUMBER(18,4)``,
+# ``cast(null as numeric(18,4))``).
+_DECIMAL_ARGS_RE = re.compile(r"([0-9]+)(?:,([0-9]+))?", re.ASCII)
+# What each adapter's decimal holds past the rule every engine shares (a precision of
+# at least 1 and a scale no larger than it), from the vendors' data type pages:
+# Snowflake's NUMBER and Redshift's DECIMAL take a precision to 38 and a scale to 37,
+# Databricks' and DuckDB's DECIMAL a precision to 38. BigQuery's rule is its emitter's
+# (``fluid_build.iac.providers.gcp._bq_outcome``); an adapter-less skeleton checks the
+# shared rule alone.
+_DECIMAL_LIMITS: Dict[str, Tuple[str, int, int]] = {
+    "snowflake": ("Snowflake NUMBER", 38, 37),
+    "redshift": ("Redshift DECIMAL", 38, 37),
+    "databricks": ("Databricks DECIMAL", 38, 38),
+    "duckdb": ("DuckDB DECIMAL", 38, 38),
+}
+_DECIMAL_DIGITS_FIX = "Declare decimal(p) or decimal(p,s) in digits, for example decimal(18,4)."
+
+
+def _argument_family(name: str) -> Optional[str]:
+    key = name.lower()
+    return next((family for family, names in _ARGUMENT_FAMILIES if key in names), None)
+
+
+def decimal_argument_problem(
+    fluid_type: Any, adapter: Optional[str] = None
+) -> Optional[Tuple[str, str]]:
+    """``(why, fix)`` when ``fluid_type`` is a decimal whose arguments ``adapter``'s
+    decimal cannot take, else ``None`` (a decimal it holds as declared, a bare decimal,
+    or another type).
+
+    Only a declaration whose arguments the adapter's type would carry is judged: one
+    that resolves to a type taking no precision (``bignumeric`` as text on Snowflake,
+    ``money`` as NUMBER(19,4)) drops them, as any other type does. ``why`` completes a
+    sentence such as "column 'amount' is declared 'decimal(40,20)', ...", as
+    :func:`fluid_build.iac.column_types.column_type_findings` writes it. The dbt engine
+    refuses these where it writes a column's type, the Snowflake and Databricks
+    emitters at validate and emit, and :func:`sql_type` never writes their arguments.
+    """
+    if not isinstance(fluid_type, str):
+        return None
+    base, args = split_parameterized(fluid_type)
+    if args is None or base.lower() not in _DECIMAL_TYPES:
+        return None
+    adapter_key = (adapter or "").lower()
+    if adapter_key != "bigquery":  # the emitter's rule knows which of its types carry them
+        resolved, adapter_key = _resolve(base, adapter_key)
+        if not _carries_arguments(base, resolved, adapter_key):
+            return None
+    return _decimal_problem(base, args, adapter_key)
+
+
+def _decimal_problem(base: str, args: str, adapter_key: str) -> Optional[Tuple[str, str]]:
+    if adapter_key == "bigquery":
+        # The emitter's rule, so a dbt model and the table it builds into agree; this
+        # module's BigQuery types are the emitter's (:func:`_bigquery_type`).
+        from fluid_build.iac.providers.gcp import _bq_outcome
+
+        outcome = _bq_outcome(f"{base}({args})")
+        return None if outcome.target is not None else (outcome.why, outcome.fix)
+    match = _DECIMAL_ARGS_RE.fullmatch(args)
+    if match is None:
+        return (
+            "whose arguments are not a precision and an optional scale in digits",
+            _DECIMAL_DIGITS_FIX,
+        )
+    precision = param_number(match.group(1))
+    scale = param_number(match.group(2) or "0")
+    if precision < 1 or scale > precision:
+        return (
+            "whose precision and scale are not a decimal's",
+            "Declare decimal(p,s) with p of at least 1 and s no larger than p.",
+        )
+    limits = _DECIMAL_LIMITS.get(adapter_key)
+    if limits is not None:
+        name, max_precision, max_scale = limits
+        if precision > max_precision or scale > max_scale:
+            return (
+                f"whose precision and scale a {name} cannot hold",
+                f"Declare decimal(p,s) with p from 1 to {max_precision} and s from 0 to "
+                f"{max_scale}, no larger than p.",
+            )
+    return None
+
+
+def _carries_arguments(base: str, resolved: str, adapter_key: str) -> bool:
+    """Whether ``resolved`` takes the kind of arguments ``base`` declares on the adapter:
+    both are of one family (a length, a precision and scale, fractional seconds), and
+    ``resolved`` takes arguments there."""
+    family = _argument_family(base)
+    return (
+        family is not None
+        and family == _argument_family(resolved)
+        and resolved in _PARAMETRIC[adapter_key]
+    )
+
+
+def _keeps_arguments(args: str, base: str, resolved: str, adapter_key: str) -> bool:
+    """Whether ``base(args)`` keeps its arguments as ``resolved(args)`` on the adapter.
+
+    Only within a family. A length keeps one integer of at least 1 (``MAX`` where the
+    adapter has it) and a time at most 9 fractional-second digits; anything else gives
+    the bare type, which holds the same values (``varchar(0)``, ``string(1,2)``,
+    ``timestamp(12)``). A decimal keeps a precision and scale its adapter holds
+    (:func:`decimal_argument_problem`), and nothing else reaches the SQL: the dbt engine
+    and the emitters refuse the rest, so none is narrowed without a word.
+    """
+    if not _carries_arguments(base, resolved, adapter_key):
+        return False
+    family = _argument_family(base)
+    if family == "decimal":
+        return _decimal_problem(base, args, adapter_key) is None
+    if not _DIGITS_RE.fullmatch(args):
+        return family == "length" and args.lower() == "max" and adapter_key in _MAX_LENGTH_ADAPTERS
+    digits = args.lstrip("0")
+    return digits != "" if family == "length" else len(digits) <= 1
+
+
 # ``base(args)`` — one level of parentheses, no nesting (no FLUID scalar
 # maps to a constructed type such as ``struct<...>``). The base is checked
 # here; :func:`split_type_params` steps over quoted ``enum`` levels.
@@ -350,6 +544,18 @@ def _lookup(table: Mapping[str, str], base: str, fallback: str) -> str:
     return fallback
 
 
+def _resolve(base: str, adapter_key: str) -> Tuple[str, str]:
+    """``(resolved, adapter key)``: the type ``base`` (without arguments) resolves to in
+    the adapter's table, or in the generic table, keyed ``""``, for an unknown adapter."""
+    table = _ADAPTER_TABLES.get(adapter_key)
+    if table is None:
+        # Exact-match first so the historical case-sensitive keys
+        # (``STRING`` as well as ``string``) resolve byte-identically.
+        resolved = _GENERIC.get(base)
+        return (resolved if resolved is not None else _lookup(_GENERIC, base, "varchar")), ""
+    return _lookup(table, base, _ADAPTER_FALLBACK[adapter_key]), adapter_key
+
+
 def sql_type(fluid_type: str, adapter: Optional[str] = None) -> str:
     """Map a FLUID column type to a SQL type string.
 
@@ -360,11 +566,12 @@ def sql_type(fluid_type: str, adapter: Optional[str] = None) -> str:
     of one generated project must agree) for the skeleton casts in
     ``models.py``; unknown adapters fall back to generic.
 
-    Parameterized declarations keep their arguments whenever the resolved
-    type can carry them: ``number(12,2)`` → ``number(12,2)`` on Snowflake,
-    ``varchar(25)`` → ``varchar(25)``. When the resolved type takes no
-    arguments the declaration degrades to the bare type rather than
-    emitting SQL the warehouse rejects — ``array(4)`` → ``array``.
+    Parameterized declarations keep their arguments when the resolved type
+    is of the same family and can carry them: ``number(12,2)`` →
+    ``number(12,2)`` on Snowflake, ``varchar(25)`` → ``varchar(25)``. Otherwise
+    the declaration degrades to the bare type rather than emitting SQL the
+    warehouse rejects: ``array(4)`` → ``array``, ``bigint(20)`` → ``number``
+    (:func:`_keeps_arguments`).
     """
     if not isinstance(fluid_type, str):
         return "varchar"
@@ -372,22 +579,27 @@ def sql_type(fluid_type: str, adapter: Optional[str] = None) -> str:
     base, args = split_parameterized(fluid_type)
 
     adapter_key = adapter.lower() if adapter else ""
-    table = _ADAPTER_TABLES.get(adapter_key)
-    if table is None:
-        adapter_key = ""
-        # Exact-match first so the historical case-sensitive keys
-        # (``STRING`` as well as ``string``) resolve byte-identically.
-        resolved = _GENERIC.get(base)
-        if resolved is None:
-            resolved = _lookup(_GENERIC, base, "varchar")
-    else:
-        resolved = _lookup(table, base, _ADAPTER_FALLBACK[adapter_key])
+    if adapter_key == "bigquery":
+        emitted = _bigquery_type(fluid_type)
+        if emitted is not None:
+            return emitted
+    resolved, adapter_key = _resolve(base, adapter_key)
 
-    # An enum's parameters are its levels, never a length or a precision, so
-    # the string type that holds the column takes none of them.
-    if args and resolved in _PARAMETRIC[adapter_key] and base.lower() != "enum":
+    # An enum's parameters are its levels, never a length or a precision, and a type
+    # the table does not know keeps none of its arguments: neither is in a family.
+    if args and _keeps_arguments(args, base, resolved, adapter_key):
         return f"{resolved}({args})"
     return resolved
+
+
+def _bigquery_type(fluid_type: str) -> Optional[str]:
+    """The type the BigQuery IaC emitter writes for ``fluid_type``, spelled for SQL
+    (``int64``, ``numeric(18,4)``); ``None`` for a type that emitter refuses. Imported
+    here, not at module scope: the IaC package is the emitter's, and loading the dbt
+    engine must not load it."""
+    from fluid_build.iac.providers.gcp import _bq_sql_type
+
+    return _bq_sql_type(fluid_type)
 
 
 def known_type(fluid_type: str, adapter: str) -> bool:
@@ -397,6 +609,12 @@ def known_type(fluid_type: str, adapter: str) -> bool:
     key = split_parameterized(fluid_type)[0].lower()
     return table is not None and (key in table or _ALIASES.get(key) in table)
 
+
+# Every spelling of an integer, which legitimately has scale 0 (:func:`precision_warnings`).
+_INTEGER_SPELLINGS = frozenset(
+    {"integer", "int16", "int32", "int64", "mediumint", "longint", "bigserial"}
+    | {name for name, canonical in _ALIASES.items() if canonical == "integer"}
+)
 
 # Types whose *unparameterized* spelling silently defaults to scale 0 on an
 # adapter, so a monetary value declared with them loses its cents. Keyed by
@@ -449,9 +667,9 @@ def precision_warnings(contract: Mapping[str, Any], build: Mapping[str, Any]) ->
             if args is not None:
                 continue  # author was explicit — nothing to warn about
             key = base.lower()
-            # ``integer`` (and its aliases) legitimately means scale 0 —
-            # only the decimal-capable spellings lose information.
-            if key == "integer" or _ALIASES.get(key) == "integer":
+            # An integer type legitimately means scale 0; only the
+            # decimal-capable spellings lose information.
+            if key in _INTEGER_SPELLINGS:
                 continue
             default = at_risk.get(sql_type(declared, adapter))
             if default is None:
@@ -462,6 +680,33 @@ def precision_warnings(contract: Mapping[str, Any], build: Mapping[str, Any]) ->
                 f"e.g. type: {base.lower()}(12,2)."
             )
     return out
+
+
+def refuse_decimal_arguments(
+    expose_id: Any, columns: Iterable[Any], adapter: Optional[str]
+) -> None:
+    """Raise ``ValueError`` naming each of an expose's columns that is a decimal whose
+    arguments ``adapter`` cannot take (:func:`decimal_argument_problem`). The dbt engine
+    calls this where it writes the columns' types into the SQL (a skeleton model's
+    casts, a model contract's ``data_type``), so a build that writes none is not held
+    to it."""
+    problems: List[str] = []
+    for col in columns:
+        if not isinstance(col, Mapping) or not col.get("name"):
+            continue
+        declared = str(col.get("type", "string"))
+        problem = decimal_argument_problem(declared, adapter)
+        if problem is not None:
+            problems.append(
+                f"column {col['name']!r} is declared {declared!r}, {problem[0]}. {problem[1]}"
+            )
+    if problems:
+        count = f"{len(problems)} column{'' if len(problems) == 1 else 's'}"
+        target = f" on {adapter}" if adapter else ""
+        raise ValueError(
+            f"dbt cannot type {count} of expose '{expose_id}'{target} as declared:\n  "
+            + "\n  ".join(problems)
+        )
 
 
 def build_platform(build: Mapping[str, Any], contract: Optional[Mapping[str, Any]] = None) -> str:

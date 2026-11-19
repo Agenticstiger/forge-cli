@@ -195,7 +195,7 @@ class TestIcebergCatalogRouting:
         assert self._types(bindings) == ["glue.table", "s3.bucket"]
         assert self._catalog_warnings(warnings) == []
 
-    @pytest.mark.parametrize("catalog", ["lakekeeper", "Lakekeeper", "iceberg_rest", "polaris"])
+    @pytest.mark.parametrize("catalog", ["iceberg_rest", "polaris", "unity"])
     def test_rest_catalog_on_aws_gets_no_glue_grant(self, catalog):
         loc = dict(self._LOC, catalog=catalog)
         bindings, warnings = compile_policy(_contract("aws", "iceberg", loc))
@@ -226,7 +226,7 @@ class TestIcebergCatalogRouting:
         assert self._catalog_warnings(warnings) == []
 
     def test_external_catalog_on_snowflake_warns_grant_covers_snowflake_only(self):
-        loc = {"database": "DB", "schema": "SCH", "table": "T", "catalog": "lakekeeper"}
+        loc = {"database": "DB", "schema": "SCH", "table": "T", "catalog": "polaris"}
         bindings, warnings = compile_policy(_contract("snowflake", "iceberg", loc))
         assert self._types(bindings) == ["snowflake.table"]
         (warning,) = self._catalog_warnings(warnings)
@@ -243,7 +243,7 @@ class TestIcebergCatalogRouting:
             {"principal": "a@b.com", "permissions": ["read"]},
             {"principal": "c@d.com", "permissions": ["write"]},
         ]
-        loc = dict(self._LOC, catalog="lakekeeper")
+        loc = dict(self._LOC, catalog="polaris")
         _, warnings = compile_policy(_contract("aws", "iceberg", loc, grants=grants))
         catalog_warnings = self._catalog_warnings(warnings)
         assert len(catalog_warnings) == 2

@@ -908,6 +908,11 @@ module = [
     # The agentPolicy gate: it decides whether an agent may read production
     # data, so a silent Any is a silent allow.
     "fluid_build.policy.decision",
+    # Stage 8 onto Lakekeeper: which grants a contract declares and which a run
+    # sends or revokes, signed in with the operator's catalog credential, so a
+    # silent Any is a silent grant or a silent leak.
+    "fluid_build.policy.lakekeeper",
+    "fluid_build.policy.lakekeeper_apply",
     # sink.catalogAuth: decides what a streaming sink's catalog credential
     # becomes in the config forge-cli pushes, so a silent Any is a silent leak.
     "fluid_build.providers._iceberg_catalog_auth",
