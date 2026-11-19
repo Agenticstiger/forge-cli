@@ -11,6 +11,7 @@ Standard library only (``xml.etree`` is imported where used).
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 from dataclasses import dataclass, field, replace
@@ -18,6 +19,9 @@ from pathlib import Path
 from typing import Any, Collection, Dict, List, Optional
 
 from ._ci_output import oneline
+from ._logging import warn
+
+_LOG = logging.getLogger(__name__)
 
 #: ``ship-report.json``'s schema. Version 2 gave every stage one of six
 #: statuses, a single ``reason`` and its start and end time.
@@ -213,8 +217,17 @@ def write_reports(directory: Path, report: Dict[str, Any], records: List[StageRe
         for name in (REPORT_JSON, REPORT_JUNIT):
             try:
                 os.unlink(directory / name)
-            except OSError:
-                pass
+            except FileNotFoundError:
+                pass  # no old report to stand in for this run's
+            except OSError as exc:
+                # The run fails with the write's own error below; say which
+                # old report is still there, so nobody reads it as this run's.
+                warn(
+                    _LOG,
+                    "ship_report_stale_left",
+                    path=str(directory / name),
+                    error=str(exc),
+                )
         raise
 
 
@@ -241,8 +254,10 @@ def _replace(path: Path, data: bytes) -> None:
     except BaseException:
         try:
             os.unlink(tmp)
-        except OSError:
-            pass
+        except FileNotFoundError:
+            pass  # already renamed into place or never made
+        except OSError as exc:
+            warn(_LOG, "ship_report_temp_left", path=tmp, error=str(exc))
         raise
 
 

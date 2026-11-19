@@ -417,9 +417,6 @@ def _run_selected(
     release_dir: Optional[Path] = None,
     keep: Optional["_Journaling"] = None,
 ) -> int:
-    # A run that bundles is a new run; one that starts later picks up where the
-    # last run in this directory stopped (one CI step per stage).
-    fresh = 1 in selected
     try:
         if keep is not None:  # before any stage: one run at a time holds the target
             keep.hold(opts)
@@ -439,6 +436,8 @@ def _run_held(
     release_dir: Optional[Path],
     keep: Optional["_Journaling"],
 ) -> int:
+    # A run that bundles is a new run; one that starts later picks up where the
+    # last run in this directory stopped (one CI step per stage).
     fresh = 1 in selected
     run_id = _run_id(fresh, logger)
     staging = None

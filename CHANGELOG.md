@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reach of less trusted runs: the default in the checkout guards a working copy, and an
   ephemeral CI runner starts it empty. Ship follows no symbolic link below DIR (or below the
   project, for the default), reads only regular files with one link, and refuses a journal file
-  over 8 MiB. Two changes reach every run: a stage killed by a signal (the OOM killer) is
+  over 8 MiB, or one whose directory entry it cannot fsync (storage that cannot fsync a
+  directory at all gets the warning `ship_journal_dir_fsync_unsupported` instead). Two changes reach every run: a stage killed by a signal (the OOM killer) is
   recorded `unknown`, not `failed`, with the reason `killed by signal N` and the same exit
   status; and `runtime/ship-report.json` and `ship-junit.xml` are renamed into place, so a
   symbolic link the checkout left at either name is replaced instead of written through.

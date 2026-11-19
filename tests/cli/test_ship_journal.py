@@ -14,11 +14,13 @@ journal, the gate and the reports are the real code.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import io
 import json
 import logging
 import os
+import stat
 import subprocess
 import tarfile
 from pathlib import Path
@@ -602,6 +604,83 @@ def test_the_run_report_replaces_a_planted_link(
 def test_the_journal_file_is_private(work: Path, fake: FakeStages) -> None:
     assert _ship(*_TO_APPLY) == 0
     assert _journal_file(work).stat().st_mode & 0o077 == 0
+
+
+def _failing_dir_fsync(monkeypatch: pytest.MonkeyPatch, code: int) -> None:
+    """``os.fsync`` that fails with ``code`` on a directory and works on files."""
+    real = os.fsync
+
+    def fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(code, os.strerror(code))
+        real(fd)
+
+    monkeypatch.setattr(journal.os, "fsync", fsync)
+
+
+def test_a_journal_whose_new_entry_cannot_be_made_durable_is_refused(
+    work: Path, fake: FakeStages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A crash could lose the entry, and with it the attempt a rerun must see.
+    _failing_dir_fsync(monkeypatch, errno.EIO)
+    assert _ship(*_TO_APPLY) == 1
+    assert fake.calls == ["bundle", "plan"]
+    assert "cannot write the stage journal" in _refused_apply(work)
+
+
+def test_storage_that_cannot_fsync_a_directory_is_named_not_refused(
+    work: Path,
+    fake: FakeStages,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _failing_dir_fsync(monkeypatch, errno.EINVAL)
+    with caplog.at_level(logging.WARNING):
+        assert _ship(*_TO_APPLY) == 0
+    assert "ship_journal_dir_fsync_unsupported" in caplog.text
+    assert [e["event"] for e in _events(work)][:2] == ["opened", "started"]
+
+
+def test_a_journal_that_cannot_be_closed_or_read_back_says_so(
+    work: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kept = _open(work)
+    with caplog.at_level(logging.WARNING):
+        monkeypatch.setattr(
+            journal, "_read_fd", lambda *_a: (_ for _ in ()).throw(journal.JournalError("cut"))
+        )
+        assert kept.digest() is None
+        assert "ship_journal_digest_unreadable" in caplog.text
+        assert kept._fd is not None
+        os.close(kept._fd)  # its descriptor is gone before ship closes it
+        kept.close()
+    assert "ship_journal_close_failed" in caplog.text
+    assert kept._fd is None and kept._hold is None
+
+
+def test_an_old_report_that_cannot_be_removed_is_named_and_the_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from fluid_build.cli import _ship_report as report
+
+    (tmp_path / report.REPORT_JSON).write_text('{"old": true}')
+
+    def fail_junit(path: Path, data: bytes) -> None:
+        if path.name == report.REPORT_JUNIT:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+    real_unlink = os.unlink
+
+    def unlink(path: object, *args: object, **kwargs: object) -> None:
+        if Path(str(path)).name in (report.REPORT_JSON, report.REPORT_JUNIT):
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(report, "_replace", fail_junit)
+    monkeypatch.setattr(report.os, "unlink", unlink)
+    with caplog.at_level(logging.WARNING), pytest.raises(OSError, match="No space left"):
+        report.write_reports(tmp_path, {"stages": []}, [])
+    assert caplog.text.count("ship_report_stale_left") == 2
 
 
 def _read(work: Path, seed: str = "one") -> journal.Journal:

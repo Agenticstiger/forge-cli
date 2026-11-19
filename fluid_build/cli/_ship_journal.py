@@ -50,6 +50,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import logging
 import os
 import stat
 from dataclasses import dataclass, field
@@ -57,6 +58,9 @@ from pathlib import Path
 from typing import Any, Collection, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from . import _ship_stages as st
+from ._logging import warn
+
+_LOG = logging.getLogger(__name__)
 
 JOURNAL_SCHEMA = "fluid-ship-journal/1"
 DEFAULT_JOURNAL_DIR = ".fluid/ship-journal"
@@ -92,6 +96,17 @@ _BINARY = getattr(os, "O_BINARY", 0)  # Windows: no newline translation
 #: Directory descriptors (POSIX): every name below DIR is opened relative to
 #: its parent's descriptor, so no component can be swapped for a link.
 _DIR_FD = os.open in os.supports_dir_fd and os.mkdir in os.supports_dir_fd and bool(_DIRECTORY)
+#: ``fsync`` on a directory: errnos that mean the filesystem cannot do it
+#: (some network and FUSE filesystems), not that the write was lost.
+_NO_DIR_FSYNC = frozenset(
+    code
+    for code in (
+        getattr(errno, "EINVAL", None),
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+    )
+    if code is not None
+)
 
 #: Stages that can change the target (see :func:`side_effects` for when).
 TARGET_STAGES = frozenset({st.APPLY_STAGE, 8, 10, 11})
@@ -345,6 +360,8 @@ class _TargetDir:
                     try:
                         os.mkdir(part, 0o700, dir_fd=fd)
                     except FileExistsError:
+                        # Whatever is there is checked next: it opens only as
+                        # a real directory, never through a link.
                         pass
                 try:
                     child = os.open(part, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=fd)
@@ -388,13 +405,26 @@ class _TargetDir:
         return sorted(os.listdir(self.fd if self.fd is not None else self.path))
 
     def fsync(self) -> None:
-        """Make a new file's directory entry durable (best effort)."""
+        """Make a new file's directory entry durable.
+
+        A journal whose entry a crash can lose would let a rerun find no
+        unknown attempt, so a failed fsync fails closed (``OSError``, which
+        the caller reports as the journal not opening). Only storage that
+        cannot fsync a directory at all is let through, with a warning.
+        """
         if self.fd is None:  # pragma: no cover - Windows
             return
         try:
             os.fsync(self.fd)
-        except OSError:
-            pass
+        except OSError as exc:
+            if exc.errno not in _NO_DIR_FSYNC:
+                raise
+            warn(
+                _LOG,
+                "ship_journal_dir_fsync_unsupported",
+                path=str(self.path),
+                error=exc.strerror or str(exc),
+            )
 
     def close(self) -> None:
         if self.fd is not None:
@@ -469,8 +499,10 @@ class Hold:
             fd, self.lock_fd = self.lock_fd, None
             try:
                 os.close(fd)  # the lock goes with its descriptor
-            except OSError:
-                pass
+            except OSError as exc:
+                # The lock is released when the process exits either way;
+                # nothing is written through this descriptor.
+                warn(_LOG, "ship_journal_close_failed", what="lock", error=str(exc))
         self.target.close()
 
 
@@ -619,10 +651,12 @@ class Journal:
         try:
             self._fd = self._dir.open(self.name, flags | os.O_CREAT | os.O_EXCL)
             new = True
-            self._dir.fsync()
         except FileExistsError:
             self._fd = self._dir.open(self.name, flags | _NONBLOCK)
             new = False
+        # On every open, not only the first: a file whose entry an earlier
+        # open could not make durable is no more durable now.
+        self._dir.fsync()
         data = _read_fd(self._fd, self.path)
         if data and not data.endswith(b"\n"):
             # End the line a crash cut off, so the next event starts its own
@@ -865,7 +899,9 @@ class Journal:
             return None
         try:
             return "sha256:" + hashlib.sha256(_read_fd(self._fd, self.path)).hexdigest()
-        except (OSError, JournalError):
+        except (OSError, JournalError) as exc:
+            # The report then names no digest, and the warning says why.
+            warn(_LOG, "ship_journal_digest_unreadable", path=str(self.path), error=str(exc))
             return None
 
     def close(self) -> None:
@@ -873,8 +909,15 @@ class Journal:
             fd, self._fd = self._fd, None
             try:
                 os.close(fd)
-            except OSError:
-                pass
+            except OSError as exc:
+                # Every event was fsynced when it was written, so a failed
+                # close loses nothing; say so instead of hiding it.
+                warn(
+                    _LOG,
+                    "ship_journal_close_failed",
+                    what=str(self.path),
+                    error=str(exc),
+                )
         self._dir = None  # the hold's: closed with it
         if self._hold is not None:
             hold, self._hold = self._hold, None
