@@ -827,6 +827,17 @@ def test_a_bare_decimal_warns_that_it_keeps_no_fraction():
     assert "DECIMAL(10,0)" in warnings[0] and "rate" not in warnings[0]
 
 
+@pytest.mark.parametrize("declared", ["decimal(1;drop table x)", "decimal(40,2)", "decimal(10,12)"])
+def test_a_decimal_databricks_cannot_hold_is_refused_not_warned(declared):
+    """``sql_type`` writes such a declaration as a bare DECIMAL, so it would otherwise
+    pass as DECIMAL(10,0), with only the no-scale warning."""
+    errors, warnings = dbx.validate_databricks_binding(
+        _contract(**{"exposes.0.contract.schema": [{"name": "amount", "type": declared}]})
+    )
+    assert len(errors) == 1 and f"has type {declared!r}, whose " in errors[0]
+    assert warnings == []
+
+
 @pytest.mark.parametrize(
     "declared,emitted",
     [
