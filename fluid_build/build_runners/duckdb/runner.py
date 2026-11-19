@@ -614,10 +614,9 @@ def _build_copy_destination(
         if partitioned.append:
             options += ", APPEND"
         else:
-            # ``{i}`` doubled: the runner fills ``{select}`` with ``str.format``. The stem
-            # is letters, digits, ``_``, ``.`` and ``-`` (``_partitioned_write``).
+            # The stem is letters, digits, ``_``, ``.`` and ``-``; ``{i}`` is DuckDB's.
             stem = re.sub(r"[^A-Za-z0-9_.-]", "_", partitioned.file_stem) or "data"
-            options += f", OVERWRITE_OR_IGNORE, FILENAME_PATTERN '{stem}_{{{{i}}}}'"
+            options += f", OVERWRITE_OR_IGNORE, FILENAME_PATTERN '{stem}_{{i}}'"
     return f"COPY ({{select}}) TO {quoted_path} ({options})"
 
 
@@ -1768,7 +1767,9 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                 copy_template = _build_copy_destination(
                     out_path, sink_format, _partitioned_write(ctx, stream, partition_by)
                 )
-                copy_sql = copy_template.format(select=landed_sel)
+                # ``replace`` on the first ``{select}``, not ``str.format``: the quoted
+                # path follows it and may hold braces (as ``LocalProvider`` fills it).
+                copy_sql = copy_template.replace("{select}", landed_sel, 1)
                 LOG.info("duckdb.run stream=%s sql_chars=%d", stream, len(copy_sql))
                 # ``COPY ... TO`` answers with the rows it wrote (its ``Count``
                 # column). That is what landed. A second ``COUNT(*)`` over the

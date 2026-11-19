@@ -159,7 +159,7 @@ def test_an_unpartitioned_copy_is_written_as_before():
 def test_a_full_refresh_copy_rewrites_each_partition_under_one_name():
     assert _build_copy_destination(
         "s3://b/p", "parquet", PartitionedWrite(("order_date", "region"), file_stem="orders")
-    ).format(select="S") == (
+    ).replace("{select}", "S", 1) == (
         "COPY (S) TO 's3://b/p' (FORMAT 'parquet', PARTITION_BY (order_date, region), "
         "OVERWRITE_OR_IGNORE, FILENAME_PATTERN 'orders_{i}')"
     )
@@ -169,6 +169,21 @@ def test_an_append_copy_gives_each_file_a_new_name():
     assert _build_copy_destination(
         "s3://b/p", "csv", PartitionedWrite(("region",), append=True)
     ) == ("COPY ({select}) TO 's3://b/p' (FORMAT 'csv', HEADER, PARTITION_BY (region), APPEND)")
+
+
+def test_braces_in_the_path_reach_the_copy_as_written(tmp_path):
+    """The select is put in with ``replace``: a ``{`` in the path is not a format field."""
+    path = tmp_path / "lake" / "a{b}"
+    assert f"TO '{path}'" in _build_copy_destination(str(path), "parquet")
+    location = {
+        "path": "./lake/{orders}",
+        "database": "sales",
+        "table": "orders",
+        "partitionBy": ["region"],
+    }
+    rc, record = _run(tmp_path, _contract(tmp_path, location=location))
+    assert rc == 0, record
+    assert (tmp_path / "lake" / "{orders}" / "region=eu" / "orders_0.parquet").is_file()
 
 
 def test_a_partition_key_that_is_not_an_identifier_is_refused():
