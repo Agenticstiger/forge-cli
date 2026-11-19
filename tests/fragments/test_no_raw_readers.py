@@ -382,6 +382,8 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
         # and a bundle packs (one selection, build_runners/dbt/project_files.py).
         *_site("iac/providers/databricks_jobs.py", "_project_source"),
         *_site("build_runners/dbt/project_files.py", "load_project_config"),
+        # The dbt profiles.yml a container run would read, for the AWS profile it names.
+        *_site("build_runners/dbt/runner.py", "_profile_output"),
     ),
     **_register(
         NOT_A_CONTRACT,

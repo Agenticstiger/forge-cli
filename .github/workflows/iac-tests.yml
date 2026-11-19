@@ -172,14 +172,16 @@ jobs:
           # plan` reads the caller identity, so it is proven by a real plan
           # against moto's STS. The column-grant file rides the same lane:
           # `tofu validate` passes a table_with_columns block the provider
-          # refuses at plan, so only a plan proves it.
+          # refuses at plan, so only a plan proves it. So does a Spark job's own
+          # grant, which the plan decides from the account's Lake Formation settings.
           - name: "Lake Formation bucket-policy + column-grant plans (tofu plan vs moto, creds-free)"
-            tests: tests/iac/test_iac_lakeformation_bucket_policy_plan.py tests/iac/test_iac_lakeformation_column_grants_plan.py
+            tests: tests/iac/test_iac_lakeformation_bucket_policy_plan.py tests/iac/test_iac_lakeformation_column_grants_plan.py tests/iac/test_iac_aws_spark_lf_default_plan.py
             pytest-args: ""
             junit: lf-bucket-policy-plan.xml
             require: |
               LF bucket-policy plan=tests/iac/test_iac_lakeformation_bucket_policy_plan.py
               LF column-grant plan=tests/iac/test_iac_lakeformation_column_grants_plan.py
+              LF Spark writer default plan=tests/iac/test_iac_aws_spark_lf_default_plan.py
           # Retention and encryption at rest: the key policy is only evaluated
           # at plan time, and the lifecycle rule, default SSE-KMS, key rotation
           # and the key's scheduled deletion only exist after a real apply /
@@ -190,6 +192,16 @@ jobs:
             junit: retention-kms-moto.xml
             require: |
               retention + KMS moto=tests/iac/test_iac_aws_retention_encryption_moto.py
+          # A Spark product destroyed while its stream runs: the apply cancels the run and
+          # stops the EMR Serverless application before `tofu` deletes it, which AWS (and
+          # moto) refuses for a started application. Only a real plan's deletes, read back
+          # by `tofu show -json`, carry the ids and tags the apply finds them by.
+          - name: "Spark destroys stop the runs first (tofu vs moto, creds-free)"
+            tests: tests/iac/test_iac_aws_spark_destroys_moto.py
+            pytest-args: "-p no:randomly"
+            junit: spark-destroys-moto.xml
+            require: |
+              Spark destroys moto=tests/iac/test_iac_aws_spark_destroys_moto.py
           # A Glue table's partition keys and Athena projection: whether a changed
           # layout replaces a live table, and dropping the keys updates it in place,
           # depends on how `replace_triggered_by` meets the trigger's create, update

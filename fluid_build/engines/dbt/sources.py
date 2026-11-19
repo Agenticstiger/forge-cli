@@ -403,6 +403,32 @@ def _identifier_from_location(
     return None
 
 
+# Matches ``{{ env.FOO }}`` / ``{{env.FOO}}`` (FLUID contract placeholder).
+_FLUID_ENV_RE = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+# Matches ``${FOO}`` (shell-style placeholder) and ``$FOO``.
+_SHELL_ENV_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+
+
+def rewrite_placeholders(value: Any) -> Optional[str]:
+    """``value`` with each FLUID/shell placeholder rewritten to ``{{ env_var('FOO') }}`` and
+    every other character as written: for text that is dbt Jinja on purpose, a model's SQL
+    (``{{ ref(...) }}``, ``{{ source(...) }}``) and the profiles.yml values
+    ``profiles._contract_expr`` checks after the rewrite. A YAML value from a contract goes
+    through :func:`_normalize_placeholder` instead, which keeps the rest of it text.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return str(value)
+    text = value.strip()
+    if not text:
+        return None
+
+    text = _FLUID_ENV_RE.sub(lambda m: f"{{{{ env_var('{m.group(1)}') }}}}", text)
+    text = _SHELL_ENV_RE.sub(lambda m: f"{{{{ env_var('{m.group(1)}') }}}}", text)
+    return text
+
+
 def _normalize_placeholder(value: Any) -> Optional[str]:
     """Rewrite FLUID/shell env-style placeholders to dbt ``env_var(...)``.
 

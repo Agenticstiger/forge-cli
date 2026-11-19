@@ -1498,6 +1498,12 @@
           ],
           "description": "NEW in v0.7.7 (preview): Where a job with no checkpoint yet starts reading: earliest (all the topic retains) or latest (new records only). Absent: the engine's default, latest for a Spark stream. A job that has a checkpoint resumes from it."
         },
+        "maxOffsetsPerTrigger": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807,
+          "description": "NEW in v0.7.7 (preview): The most Kafka records one micro-batch reads, split across the topic's partitions by their backlog (Spark's maxOffsetsPerTrigger). It bounds a batch's size and memory when a stream catches up: after a stop, or from earliest. Absent: no limit, so one batch reads everything waiting. A Spark stream only: managed Flink refuses the key."
+        },
         "deadLetter": {
           "type": "object",
           "additionalProperties": false,
@@ -1514,7 +1520,7 @@
                 "topic"
               ],
               "default": "table",
-              "description": "table: an Iceberg table beside the output, in the output's catalog and database. topic: a Kafka topic on the cluster the stream reads, each record with Kafka Connect's error-context headers (__connect.errors.topic, .partition, .offset, .exception.message)."
+              "description": "table: an Iceberg table beside the output, in the output's catalog and database. topic: a Kafka topic on the cluster the stream reads, each record keyed by where it came from (<topic>-<partition>@<offset>), its own key in the fluid.dead-letter.raw-key header, and Kafka Connect's error-context headers (__connect.errors.topic, .partition, .offset, .exception.message). Sent at least once: a batch sent again after a failure carries the same keys, so a consumer can drop repeats by key."
             },
             "table": {
               "type": "string",
