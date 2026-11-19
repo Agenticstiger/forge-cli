@@ -47,12 +47,34 @@ class TestAws:
 
     def test_what_cannot_be_read_says_why(self, monkeypatch):
         monkeypatch.setattr(ti, "aws_caller_account", lambda env, region: ("", "no creds"))
+        monkeypatch.setattr(ti, "aws_profile_region", lambda env: "")
         identity, unread = ti.target_identity("aws", {}, {})
         assert identity == {}
         assert unread == {
             "account": "no creds",
-            "region": "no provider region, AWS_REGION or AWS_DEFAULT_REGION",
+            "region": "no provider region, AWS_REGION, AWS_DEFAULT_REGION or region in the profile",
         }
+
+    def test_a_region_set_only_in_the_profile_is_bound(self, monkeypatch):
+        # tofu reads the profile's region from the shared config file too.
+        seen: Dict[str, Any] = {}
+
+        def account(env, region):
+            seen["region"] = region
+            return "1", ""
+
+        monkeypatch.setattr(ti, "aws_caller_account", account)
+        monkeypatch.setattr(ti, "aws_profile_region", lambda env: "ap-south-1")
+        identity, unread = ti.target_identity("aws", {}, {"AWS_PROFILE": "p"})
+        assert identity == {"account": "1", "region": "ap-south-1"} and unread == {}
+        assert seen["region"] == "ap-south-1"
+
+    def test_the_env_region_wins_over_the_profile(self, monkeypatch):
+        monkeypatch.setattr(ti, "aws_caller_account", lambda env, region: ("1", ""))
+        monkeypatch.setattr(ti, "aws_profile_region", lambda env: pytest.fail("not read"))
+        assert ti.target_identity("aws", {}, {"AWS_REGION": "eu-west-1"})[0]["region"] == (
+            "eu-west-1"
+        )
 
     def test_sts_gets_the_runs_own_credentials(self, monkeypatch):
         seen: Dict[str, Any] = {}
@@ -122,6 +144,50 @@ class TestAws:
         assert ti.aws_caller_account({}, None) == ("1", "")
         assert seen["client_region"] is None
 
+    @pytest.mark.parametrize(
+        "env, profile",
+        [
+            ({"AWS_PROFILE": "a", "AWS_DEFAULT_PROFILE": "b"}, "a"),
+            ({"AWS_DEFAULT_PROFILE": "b"}, "b"),
+            ({}, None),
+        ],
+        ids=["AWS_PROFILE-first", "AWS_DEFAULT_PROFILE", "none"],
+    )
+    def test_the_profile_is_the_one_tofu_uses(self, monkeypatch, env, profile):
+        # The Go SDK reads AWS_PROFILE, then AWS_DEFAULT_PROFILE; botocore the other way
+        # round, so the name is passed.
+        seen: Dict[str, Any] = {}
+
+        class _Session:
+            def __init__(self, **kwargs):
+                seen.update(kwargs)
+
+            region_name = "ap-south-1"
+
+            def client(self, name, endpoint_url=None, region_name=None):
+                return types.SimpleNamespace(get_caller_identity=lambda: {"Account": "1"})
+
+        boto3 = types.ModuleType("boto3")
+        boto3.session = types.SimpleNamespace(Session=_Session)
+        monkeypatch.setitem(sys.modules, "boto3", boto3)
+        assert ti.aws_caller_account(env, None) == ("1", "")
+        assert seen["profile_name"] == profile
+        seen.clear()
+        assert ti.aws_profile_region(env) == "ap-south-1"
+        assert seen["profile_name"] == profile and seen["region_name"] is None
+
+    def test_an_unreadable_profile_is_no_region(self, monkeypatch):
+        class _Session:
+            def __init__(self, **kwargs):
+                raise RuntimeError("ProfileNotFound")
+
+        boto3 = types.ModuleType("boto3")
+        boto3.session = types.SimpleNamespace(Session=_Session)
+        monkeypatch.setitem(sys.modules, "boto3", boto3)
+        assert ti.aws_profile_region({"AWS_PROFILE": "gone"}) == ""
+        monkeypatch.setitem(sys.modules, "boto3", None)
+        assert ti.aws_profile_region({}) == ""
+
     def test_without_boto3_it_says_how_to_install_it(self, monkeypatch):
         monkeypatch.setitem(sys.modules, "boto3", None)
         account, why = ti.aws_caller_account({}, None)
@@ -172,6 +238,8 @@ class TestOtherProviders:
 
     def test_an_unknown_provider_binds_nothing(self):
         assert ti.target_identity("local", {}, {"AWS_REGION": "x"}) == ({}, {})
+        assert not ti.has_reader("confluent") and not ti.has_reader("local")
+        assert all(ti.has_reader(p) for p in ("aws", "gcp", "snowflake", "databricks"))
 
 
 class TestCompareAndDescribe:
