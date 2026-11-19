@@ -123,8 +123,9 @@ _LAKEKEEPER_PREFIXES = {
     "role": "role",
 }
 
-#: Whitespace or a control character: no Lakekeeper id, name or e-mail holds one.
-_LAKEKEEPER_BAD_CHARS = re.compile(r"[\s\x00-\x1f\x7f]")
+#: A control character (a tab or line break among them): no Lakekeeper id, name or
+#: e-mail holds one. A space can be there: a user's name is a display name.
+_LAKEKEEPER_BAD_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 PrincipalMap = Dict[str, Tuple[str, ...]]
 

@@ -101,16 +101,18 @@ def run(args, logger: logging.Logger) -> int:
 
         # A table cataloged in Lakekeeper is granted in Lakekeeper itself, through
         # its management API; every other binding goes to the provider, as before.
+        # The provider first: when it cannot be built it raises, as before, and
+        # nothing has been changed in Lakekeeper yet.
         lakekeeper, others = _split_lakekeeper(data["bindings"])
         results = []
+        if others:
+            results.append(_apply_with_provider(args, {**data, "bindings": others}, logger))
         if lakekeeper:
             from fluid_build.policy.lakekeeper_apply import apply_lakekeeper_bindings
 
             lakekeeper_result = apply_lakekeeper_bindings(lakekeeper, mode=args.mode)
             info(logger, "policy_apply_lakekeeper_result", **lakekeeper_result)
             results.append(lakekeeper_result)
-        if others:
-            results.append(_apply_with_provider(args, {**data, "bindings": others}, logger))
 
         _register_acquisition_policies(data, logger)
 

@@ -22,9 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. Stage 8 reads each table's direct grants through Lakekeeper's management API and
   sends only the difference, in one request per table. It grants what the contract declares,
   revokes any other `describe`, `select` or `modify` on that table, and never touches ownership
-  or grant management. `--mode check` makes the same reads and changes nothing. A table not
-  created yet is reported as pending in check mode and fails in enforce mode. A principal
-  Lakekeeper does not know stops the changes on its table. The operator signs forge in with
+  or grant management. `--mode check` makes the same reads and changes nothing. A table its
+  writer has not created yet (the build, or a sink at its first commit) is reported as pending
+  in both modes, and nothing is granted on it until a later run. It fails closed: a principal
+  Lakekeeper does not know, or one that does not map to a Lakekeeper identity at compile time,
+  leaves its table's grants as they are, since granting the others alone would revoke it, and a
+  grant whose `resources` cannot be evaluated leaves every Lakekeeper table as it is. The contract
+  names the tables, so give stage 8 an identity that manages only the product's own namespaces:
+  on OpenFGA the identity that creates a namespace owns it, which is enough. The operator signs forge in with
   `FLUID_LAKEKEEPER_CREDENTIAL_REF`, a secret reference to `client_id:client_secret`, plus
   `FLUID_LAKEKEEPER_OAUTH2_SERVER_URI` and `FLUID_LAKEKEEPER_SCOPE`, or with
   `FLUID_LAKEKEEPER_TOKEN_REF`. These names are operator-only. The reference must be allowed for

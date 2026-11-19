@@ -233,11 +233,20 @@ class TestFailures:
         assert result["status"] == "error"
         assert "no grant was applied" in result["errors"][0]
 
-    def test_a_missing_table_fails_in_enforce_mode(self, server, operator_env):
+    def test_a_missing_table_is_pending_in_enforce_mode_too(self, server, operator_env):
+        """Its writer creates it, not fluid apply: a first deploy reaches stage 8 first."""
         result = _run(server, [_binding("role:analysts", "select", table="later")])
-        assert result["status"] == "error"
-        assert "does not exist in Lakekeeper" in result["errors"][0]
-        assert "fluid apply" in result["errors"][0]
+        assert result["status"] == "ok"
+        assert result["pending"] == ["sales-wh/curated.later"]
+        assert server.posts_to_assignments() == []
+        lines = "\n".join(result["_lines"])
+        assert "run policy-apply again then" in lines and "fluid apply creates" not in lines
+
+    def test_an_unrendered_template_in_the_names_is_refused(self, server, operator_env):
+        binding = dict(_binding("role:analysts", "select"), warehouse="{{ env.LK_WH }}")
+        result = _run(server, [binding])
+        assert "unrendered template" in result["errors"][0]
+        assert server.posts_to_assignments() == []
 
     def test_an_unknown_principal_changes_nothing_on_its_table(self, server, operator_env):
         server.assignments[TABLE_ID] = {("select", "user", "oidc~nobody-knows")}
@@ -407,3 +416,182 @@ class TestCredentialRules:
 )
 def test_the_service_base_is_the_catalog_uri_without_catalog(uri, base):
     assert service_base(uri) == base
+
+
+def _json(status: int, doc: Any) -> httpx.Response:
+    return httpx.Response(status, json=doc)
+
+
+class TestOddAnswers:
+    """A body of the wrong shape (a gateway, a captive portal, another server) is said
+    as an error on its table, never an exception that stops the run."""
+
+    @pytest.mark.parametrize(
+        "path, doc",
+        [
+            ("/management/v1/warehouse", [1]),
+            ("/management/v1/warehouse", {"warehouses": 5}),
+            ("/catalog/v1/config", [1]),
+            ("/catalog/v1/config", {"overrides": "x", "defaults": "y"}),
+            ("/tables", [1]),
+            ("/tables", {"identifiers": 5}),
+            ("/assignments", [1]),
+            ("/assignments", {"assignments": 5}),
+            ("/management/v1/search/role", [1]),
+            ("/management/v1/search/role", {"roles": "x"}),
+        ],
+    )
+    def test_a_wrong_shape_is_an_error_not_a_crash(self, server, operator_env, path, doc):
+        def odd(method, request_path, body):
+            if (
+                request_path.endswith(path)
+                and method == "GET"
+                or (request_path == path and method == "POST")
+            ):
+                return _json(200, doc)
+            return None
+
+        server.hook = odd
+        result = _run(server, [_binding("role:analysts", "select")])
+        assert result["status"] == "error"
+        assert any("Lakekeeper" in e for e in result["errors"])
+        assert server.posts_to_assignments() == []
+
+    def test_a_404_without_lakekeeper_body_is_not_a_missing_table(self, server, operator_env):
+        server.hook = lambda m, p, b: (
+            httpx.Response(404, text="no route") if p.endswith("/tables") else None
+        )
+        result = _run(server, [_binding("role:analysts", "select")], mode="check")
+        assert result["pending"] == []
+        assert "did not come from Lakekeeper" in result["errors"][0]
+
+    def test_a_repeated_page_token_ends_the_listing(self, server, operator_env):
+        def loop(method, path, body):
+            if path.endswith("/tables"):
+                return _json(200, {"identifiers": [], "table-uuids": [], "next-page-token": "same"})
+            return None
+
+        server.hook = loop
+        result = _run(server, [_binding("role:analysts", "select")])
+        assert "repeated a page token" in result["errors"][0]
+        assert sum(1 for _, p, _ in server.requests if p.endswith("/tables")) == 2
+
+    def test_a_port_that_is_not_a_number_is_refused_before_any_request(self, server, operator_env):
+        binding = dict(
+            _binding("role:analysts", "select"), catalog_uri="https://lakekeeper.test:abc/catalog"
+        )
+        result = _run(server, [binding])
+        assert "not a URL policy-apply can read" in result["errors"][0]
+        assert server.requests == []
+
+    def test_a_name_lookup_that_fails_after_a_revoke_keeps_the_report(self, server, operator_env):
+        server.assignments[TABLE_ID] = {("select", "user", "oidc~probe")}
+        server.hook = lambda m, p, b: (
+            _json(200, [1]) if p == "/management/v1/user/oidc~probe" else None
+        )
+        result = _run(server, [_binding("role:analysts", "select")])
+        assert result["status"] == "ok"
+        assert [r["id"] for r in result["revokes"]] == ["oidc~probe"]
+
+
+class TestOncePerRun:
+    def test_a_namespace_is_listed_once_for_all_its_tables(self, server, operator_env):
+        other = server.add_table(
+            ("curated",), "events_hourly", "0190c5b4-0000-7000-8000-0000000000b2"
+        )
+        _run(
+            server,
+            [
+                _binding("role:analysts", "select"),
+                _binding("role:analysts", "select", table="events_hourly"),
+            ],
+        )
+        assert sum(1 for _, p, _ in server.requests if p.endswith("/tables")) == 1
+        assert server.held(other) == {("select", "role", ROLE_ID)}
+
+    def test_a_warehouse_that_fails_is_asked_once(self, server, operator_env):
+        server.add_table(("curated",), "events_hourly", "0190c5b4-0000-7000-8000-0000000000b2")
+        server.hook = lambda m, p, b: (
+            _json(503, {"error": {"type": "Unavailable", "message": "x"}})
+            if p == "/management/v1/warehouse"
+            else None
+        )
+        result = _run(
+            server,
+            [
+                _binding("role:analysts", "select"),
+                _binding("role:analysts", "select", table="events_hourly"),
+            ],
+        )
+        assert len(result["errors"]) == 2
+        assert sum(1 for _, p, _ in server.requests if p.endswith("/management/v1/warehouse")) == 1
+
+    def test_one_table_spelled_two_ways_is_one_table(self, server, operator_env):
+        a = _binding("user:oidc~trino", "select")
+        b = dict(
+            _binding("user:oidc~trino", "modify"),
+            catalog_uri="https://LAKEKEEPER.test:443/catalog/",
+        )
+        result = _run(server, [a, b])
+        assert result["tables"] == 1
+        assert server.held(TABLE_ID) == {
+            ("select", "user", "oidc~trino"),
+            ("modify", "user", "oidc~trino"),
+        }
+        assert result["revokes"] == []
+
+
+class TestCanonicalIds:
+    def test_a_role_id_in_another_case_is_lakekeepers_spelling(self, server, operator_env):
+        bindings = [_binding("r", "select", identity=f"role:{ROLE_ID.upper()}")]
+        _run(server, bindings)
+        assert server.held(TABLE_ID) == {("select", "role", ROLE_ID)}
+        second = _run(server, bindings)
+        assert second["grants"] == [] and second["revokes"] == []
+        assert len(server.posts_to_assignments()) == 1
+
+    def test_a_user_id_that_cannot_be_checked_changes_nothing(self, server, operator_env):
+        server.assignments[TABLE_ID] = {("select", "user", "oidc~trino")}
+        server.hook = lambda m, p, b: (
+            _json(403, {"error": {"type": "Forbidden", "message": "no"}})
+            if p.startswith("/management/v1/user/")
+            else None
+        )
+        result = _run(server, [_binding("t", "select", identity="user:oidc~trinno")])
+        assert "permission to read users" in result["errors"][0]
+        assert server.posts_to_assignments() == []
+        assert server.held(TABLE_ID) == {("select", "user", "oidc~trino")}
+
+
+class TestPartialApply:
+    def test_changes_that_landed_before_a_failure_are_reported(self, server, operator_env):
+        for i in range(120):
+            server.add_user(f"oidc~u{i:03d}", f"user-{i:03d}")
+        posts = []
+
+        def second_fails(method, path, body):
+            if method == "POST" and path.endswith("/assignments"):
+                posts.append(body)
+                if len(posts) == 2:
+                    return _json(500, {"error": {"type": "Internal", "message": "boom"}})
+            return None
+
+        server.hook = second_fails
+        bindings = [_binding(f"user:user-{i:03d}", "select") for i in range(120)]
+        result = _run(server, bindings)
+        assert result["status"] == "error"
+        assert len(result["grants"]) == 100
+        assert "100 change(s) were applied before that" in result["errors"][0]
+        assert len(server.held(TABLE_ID)) == 100
+
+
+class TestRefusedHost:
+    def test_the_message_says_the_operator_named_the_credential(
+        self, server, operator_env, monkeypatch
+    ):
+        monkeypatch.setenv("FLUID_ACQUISITION_SECRET_REF_ALLOWLIST", "LK_CRED@other.test")
+        result = _run(server, [_binding("role:analysts", "select")])
+        error = result["errors"][0]
+        assert "the operator has not allowed to go to lakekeeper.test" in error
+        assert "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST" in error
+        assert "the contract would send" not in error

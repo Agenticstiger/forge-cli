@@ -169,12 +169,20 @@ class TestScope:
         bindings, _ = compile_policy(_contract(grant, exposes=exposes))
         assert [b["table"] for b in bindings] == ["refunds"]
 
-    def test_an_unevaluable_scope_is_reported_once_and_granted_nowhere(self):
+    def test_an_unevaluable_scope_compiles_no_lakekeeper_grant_at_all(self):
+        """It could cover any table: granting the others would revoke its principal."""
         exposes = [_expose("orders"), _expose("refunds")]
-        grant = {"principal": "group:a", "permissions": ["read"], "resources": ["$.exposes[0]"]}
-        bindings, warnings = compile_policy(_contract(grant, exposes=exposes))
+        grants = [
+            {"principal": "group:a", "permissions": ["read"], "resources": ["$.exposes[0]"]},
+            {"principal": "group:b", "permissions": ["read"], "resources": ["$.exposes[0]"]},
+            {"principal": "group:c", "permissions": ["read"]},
+        ]
+        bindings, warnings = compile_policy(_contract(*grants, exposes=exposes))
         assert _lakekeeper(bindings) == []
-        assert len([w for w in warnings if "$.exposes[0]" in w]) == 1
+        named = [w for w in warnings if "$.exposes[0]" in w]
+        assert len(named) == 2  # one per grant, not one per resources text
+        assert "group:a" in named[0] and "group:b" in named[1]
+        assert all("leaves every Lakekeeper table's grants as they are" in w for w in named)
 
     def test_a_table_no_one_is_granted_on_gets_no_binding(self):
         """Stage 8 leaves a table alone that the contract declares no access for."""
@@ -264,7 +272,43 @@ class TestPrincipals:
             _contract({"principal": "group:analysts", "permissions": ["read"]}, exposes=[expose])
         )
         assert _lakekeeper(bindings) == []
-        assert any("does not map it" in w and "not granted" in w for w in warnings)
+        assert any("does not map it" in w for w in warnings)
+
+    def test_one_principal_that_cannot_map_keeps_the_whole_table_unmanaged(self):
+        """With the others alone, stage 8 would revoke the unmapped principal's grants."""
+        expose = _expose(principals={"group:analysts": "role:analysts", "group:eng": "domain:x"})
+        grants = [
+            {"principal": "group:analysts", "permissions": ["read"]},
+            {"principal": "group:eng", "permissions": ["read"]},
+        ]
+        bindings, warnings = compile_policy(_contract(*grants, exposes=[expose]))
+        assert _lakekeeper(bindings) == []
+        (closed,) = [w for w in warnings if "no grant was compiled, because" in w]
+        assert "['group:eng']" in closed and "leaves the table's grants as they are" in closed
+
+    def test_another_table_still_compiles_when_one_cannot(self):
+        good = _expose("orders")
+        bad = _expose("refunds", principals={"group:analysts": "domain:x"})
+        bindings, _ = compile_policy(
+            _contract({"principal": "group:analysts", "permissions": ["read"]}, exposes=[good, bad])
+        )
+        assert [b["table"] for b in bindings] == ["orders"]
+
+    @pytest.mark.parametrize("principal", ["user:Alice Smith", "role:Data Analysts"])
+    def test_a_display_name_with_spaces_is_a_lakekeeper_name(self, principal):
+        bindings, warnings = compile_policy(
+            _contract({"principal": principal, "permissions": ["read"]})
+        )
+        assert _own(warnings) == []
+        assert bindings[0]["identities"] == [principal]
+
+    def test_a_group_named_like_a_role_stays_a_group(self):
+        """``group:role:x`` is the group ``role:x``; only ``role:x`` written so is a role."""
+        bindings, _ = compile_policy(
+            _contract({"principal": "group:role:x", "permissions": ["read"]})
+        )
+        assert bindings[0]["principal"] == "group:role:x"
+        assert bindings[0]["identities"] == ["group:role:x"]
 
     @pytest.mark.parametrize(
         "principal",
@@ -336,3 +380,45 @@ class TestPlanChanges:
 
     def test_relations_for_orders_and_reports(self):
         assert relations_for(["write", "read", "create"]) == (("select", "modify"), ("create",))
+
+
+class TestOnACloudPlatform:
+    """A Lakekeeper table on aws or snowflake: the cloud grant the compiler always
+    emitted stays (the bucket is still the table's storage), and Lakekeeper gets its
+    own grant instead of the old "enforce it in the catalog" warning."""
+
+    _LOC = {"bucket": "bkt", "database": "mydb", "table": "tbl", "region": "eu-west-1"}
+
+    @staticmethod
+    def _compile(platform: str, location: Dict[str, Any]):
+        expose = {"binding": {"platform": platform, "format": "iceberg", "location": location}}
+        grant = {"principal": "user@example.com", "permissions": ["read"]}
+        bindings, warnings = compile_policy(
+            {"accessPolicy": {"grants": [grant]}, "exposes": [expose]}
+        )
+        return sorted(b["resource_type"] for b in bindings), [
+            w for w in warnings if "cataloged in" in w
+        ]
+
+    @pytest.mark.parametrize("catalog", ["lakekeeper", "Lakekeeper"])
+    def test_without_its_uri_the_warning_says_what_is_missing(self, catalog):
+        types, (warning,) = self._compile("aws", dict(self._LOC, catalog=catalog))
+        assert types == ["s3.bucket"]
+        assert "user:user@example.com" in warning
+        assert "location.uri, location.warehouse" in warning
+        assert "not AWS Glue" not in warning
+
+    def test_on_aws_the_bucket_and_a_lakekeeper_grant(self):
+        loc = dict(self._LOC, catalog="lakekeeper", uri="https://lk/catalog", warehouse="wh")
+        assert self._compile("aws", loc) == (["lakekeeper.table", "s3.bucket"], [])
+
+    def test_on_snowflake_a_snowflake_grant_and_a_lakekeeper_grant(self):
+        loc = {
+            "database": "DB",
+            "schema": "SCH",
+            "table": "T",
+            "catalog": "lakekeeper",
+            "uri": "https://lk/catalog",
+            "warehouse": "wh",
+        }
+        assert self._compile("snowflake", loc) == (["lakekeeper.table", "snowflake.table"], [])

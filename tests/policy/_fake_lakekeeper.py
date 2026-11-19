@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, unquote
 
 import httpx
@@ -46,6 +46,8 @@ class FakeLakekeeper:
     redirect_whoami: bool = False
     #: Lakekeeper refuses every token (an audience or issuer it does not trust).
     refuse_tokens: bool = False
+    #: ``hook(method, path, body)``: a response to send instead, or ``None`` to serve.
+    hook: Optional[Callable[[str, str, Any], Optional[httpx.Response]]] = None
 
     # ── setup ────────────────────────────────────────────────────────────
 
@@ -92,6 +94,10 @@ class FakeLakekeeper:
             else:
                 body = {k: v[0] for k, v in parse_qs(request.content.decode()).items()}
         self.requests.append((request.method, f"{url.scheme}://{url.host}{path}", body))
+        if self.hook is not None:
+            answer = self.hook(request.method, path, body)
+            if answer is not None:
+                return answer
 
         if str(url).startswith(TOKEN_URL):
             return self._token(body or {})
@@ -147,8 +153,8 @@ class FakeLakekeeper:
             return httpx.Response(200, json={"roles": list(self.roles)})
         if path.startswith("/management/v1/role/"):
             role_id = path[len("/management/v1/role/") :]
-            for role in self.roles:
-                if role["id"] == role_id:
+            for role in self.roles:  # a uuid in any case names the role; the answer is canonical
+                if role["id"].lower() == role_id.lower():
                     return httpx.Response(200, json=role)
             return _error(404, "RoleNotFound", "no such role")
         return _error(404, "NotFound", f"no route {path}")

@@ -205,24 +205,6 @@ class TestIcebergCatalogRouting:
         assert "user@example.com" in warning and "['read']" in warning
         assert "not AWS Glue" in warning
 
-    @pytest.mark.parametrize("catalog", ["lakekeeper", "Lakekeeper"])
-    def test_lakekeeper_on_aws_without_its_uri_says_what_is_missing(self, catalog):
-        """Lakekeeper is granted in Lakekeeper (``policy/lakekeeper.py``): without the
-        catalog uri and warehouse there is no table to grant on, and the warning says so."""
-        loc = dict(self._LOC, catalog=catalog)
-        bindings, warnings = compile_policy(_contract("aws", "iceberg", loc))
-        assert self._types(bindings) == ["s3.bucket"]
-        (warning,) = self._catalog_warnings(warnings)
-        assert "user:user@example.com" in warning
-        assert "location.uri, location.warehouse" in warning
-        assert "not AWS Glue" not in warning
-
-    def test_lakekeeper_on_aws_compiles_the_bucket_and_a_lakekeeper_grant(self):
-        loc = dict(self._LOC, catalog="lakekeeper", uri="https://lk/catalog", warehouse="wh")
-        bindings, warnings = compile_policy(_contract("aws", "iceberg", loc))
-        assert self._types(bindings) == ["lakekeeper.table", "s3.bucket"]
-        assert self._catalog_warnings(warnings) == []
-
     def test_rest_catalog_warning_names_the_canonical_kind(self):
         loc = dict(self._LOC, catalog="LakeKeeper")
         _, warnings = compile_policy(_contract("aws", "iceberg", loc))
@@ -249,20 +231,6 @@ class TestIcebergCatalogRouting:
         assert self._types(bindings) == ["snowflake.table"]
         (warning,) = self._catalog_warnings(warnings)
         assert "Snowflake readers only" in warning
-
-    def test_lakekeeper_on_snowflake_grants_in_snowflake_and_in_lakekeeper(self):
-        """Every other engine reads through Lakekeeper, which now gets its own grant."""
-        loc = {
-            "database": "DB",
-            "schema": "SCH",
-            "table": "T",
-            "catalog": "lakekeeper",
-            "uri": "https://lk/catalog",
-            "warehouse": "wh",
-        }
-        bindings, warnings = compile_policy(_contract("snowflake", "iceberg", loc))
-        assert self._types(bindings) == ["lakekeeper.table", "snowflake.table"]
-        assert self._catalog_warnings(warnings) == []
 
     @pytest.mark.parametrize("platform", ["local", "azure"])
     def test_non_aws_platform_gets_no_aws_grant(self, platform):

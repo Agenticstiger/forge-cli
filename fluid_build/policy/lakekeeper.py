@@ -36,7 +36,10 @@ Ownership and grant management stay with the table's owner.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+
+if TYPE_CHECKING:
+    from ..iac.access import AccessGrant
 
 #: ``bindings[].provider`` of a Lakekeeper grant; ``policy-apply`` dispatches on it.
 PROVIDER = "lakekeeper"
@@ -115,16 +118,6 @@ def relations_for(permissions: Iterable[str]) -> Tuple[Tuple[str, ...], Tuple[st
     return ordered, tuple(unmapped)
 
 
-def _authz_principals(expose: Mapping[str, Any], key: str) -> Tuple[str, ...]:
-    """``exposes[].policy.authz.<key>`` (``readers`` / ``writers``), as written."""
-    policy = expose.get("policy")
-    authz = policy.get("authz") if isinstance(policy, Mapping) else None
-    raw = authz.get(key) if isinstance(authz, Mapping) else None
-    if not isinstance(raw, list):
-        return ()
-    return tuple(p.strip() for p in raw if isinstance(p, str) and p.strip())
-
-
 def _unenforced_policy(expose: Mapping[str, Any]) -> List[str]:
     """The expose policy blocks Lakekeeper has no permission for: column-level
     restrictions, masking and row filters. Lakekeeper (OpenFGA) grants whole
@@ -142,15 +135,37 @@ def _unenforced_policy(expose: Mapping[str, Any]) -> List[str]:
     return found
 
 
-def _logical(grant: Any) -> str:
-    """A grant's logical principal. ``role:<name>`` is kept as written: ``iac/access.py``
-    keeps a prefix it does not know whole and types it ``group``, which would read
-    ``role:analysts`` as the group ``role:analysts``; in Lakekeeper it is a role."""
+def _written_roles(contract: Mapping[str, Any]) -> Set[str]:
+    """The principals the contract itself writes as ``role:<name>``, as written.
+
+    ``iac/access.py`` keeps a prefix it does not know whole and types it ``group``,
+    so ``role:analysts`` and ``group:role:analysts`` both reach here as the group
+    ``role:analysts``. Only the first, the one the contract spelled with ``role:``,
+    is a Lakekeeper role.
+    """
+    written: List[Any] = []
+    policy = contract.get("accessPolicy")
+    for entry in (policy.get("grants") or ()) if isinstance(policy, Mapping) else ():
+        if isinstance(entry, Mapping):
+            written.append(entry.get("principal"))
+    legacy = (contract.get("metadata") or {}).get("policies")
+    for config in legacy.values() if isinstance(legacy, Mapping) else ():
+        if isinstance(config, Mapping):
+            written.extend(config.get("principals") or ())
+    return {
+        p.strip()
+        for p in written
+        if isinstance(p, str) and p.strip().partition(":")[0].strip().lower() == "role"
+    }
+
+
+def _logical(grant: "AccessGrant", written_roles: Set[str]) -> str:
+    """A grant's logical principal: ``role:<name>`` for one the contract wrote as a
+    role (:func:`_written_roles`), else its typed key (``group:...``, ``user:...``)."""
     from ..iac.principals import grant_key
 
-    head, sep, rest = grant.principal.partition(":")
-    if sep and rest.strip() and head.strip().lower() == "role":
-        return f"role:{rest.strip()}"
+    if grant.principal in written_roles:
+        return "role:" + grant.principal.partition(":")[2].strip()
     return grant_key(grant)
 
 
@@ -163,15 +178,34 @@ def compile_lakekeeper_bindings(
     leaves it alone. A principal mapped to ``[]`` in ``binding.principals`` is
     granted nothing. Anything this cannot express is a warning that names the
     expose, the principal and the fix, never a silent drop.
+
+    It fails closed. Stage 8 is authoritative on a table it has bindings for, so
+    a table where one declared principal cannot be compiled gets no binding at
+    all: with the others alone, stage 8 would revoke that principal's grants. A
+    grant whose ``resources`` cannot be evaluated could cover any table, so then
+    no Lakekeeper table gets a binding.
     """
     from ..iac.access import normalize_access_grants
     from ..iac.base import UnsupportedBindingError
+    from ..iac.column_access import authz_principals
     from ..iac.principals import LAKEKEEPER, principal_map, resolve_principal
 
     grants = normalize_access_grants(contract)
+    written_roles = _written_roles(contract)
     bindings: List[Dict[str, Any]] = []
     warnings: List[str] = []
-    unevaluable_seen: Set[Tuple[str, ...]] = set()
+
+    unevaluable = [g for g in grants if g.scope.unevaluable]
+    if unevaluable:
+        for grant in unevaluable:
+            warnings.append(
+                f"Lakekeeper: the grant to {_logical(grant, written_roles)} names resources "
+                f"{list(grant.scope.unevaluable)}, which are not $.exposes[*] or "
+                "$.exposes[?(@.exposeId=='<id>')]. It could cover any table, so no Lakekeeper "
+                "grant was compiled, and policy-apply leaves every Lakekeeper table's grants as "
+                "they are. Scope the grant to exposes by id."
+            )
+        return bindings, warnings
 
     for expose in exposes:
         expose_id = str(expose.get("exposeId") or expose.get("id") or "?")
@@ -179,31 +213,20 @@ def compile_lakekeeper_bindings(
         # (logical principal, relations, the grant's bare spelling to look it up by)
         declared: List[Tuple[str, Tuple[str, ...], Optional[str]]] = []
         for grant in grants:
-            scope = grant.scope
-            if scope.unevaluable:
-                if grant.resources not in unevaluable_seen:
-                    unevaluable_seen.add(grant.resources)
-                    warnings.append(
-                        f"Lakekeeper: the grant to {_logical(grant)} names resources "
-                        f"{list(scope.unevaluable)}, which are not $.exposes[*] or "
-                        "$.exposes[?(@.exposeId=='<id>')], so it was not compiled for any "
-                        "Lakekeeper table. Scope it to exposes by id."
-                    )
-                continue
-            if not scope.covers(expose_id):
+            if not grant.scope.covers(expose_id):
                 continue
             relations, unmapped = relations_for(grant.permissions)
             if unmapped:
                 warnings.append(
-                    f"Lakekeeper expose '{expose_id}': {_logical(grant)} permission(s) "
-                    f"{list(unmapped)} have no table relation in Lakekeeper (create is a "
-                    "namespace or warehouse permission), so they were not granted. Grant them "
-                    "on the namespace in Lakekeeper itself."
+                    f"Lakekeeper expose '{expose_id}': {_logical(grant, written_roles)} "
+                    f"permission(s) {list(unmapped)} have no table relation in Lakekeeper "
+                    "(create is a namespace or warehouse permission), so they were not granted. "
+                    "Grant them on the namespace in Lakekeeper itself."
                 )
             if relations:
-                declared.append((_logical(grant), relations, grant.principal))
+                declared.append((_logical(grant, written_roles), relations, grant.principal))
         for key, relation in (("readers", "select"), ("writers", "modify")):
-            for principal in _authz_principals(expose, key):
+            for principal in authz_principals(expose, key):
                 declared.append((principal, (relation,), None))
         if not declared:
             continue
@@ -212,8 +235,10 @@ def compile_lakekeeper_bindings(
         if unenforced:
             warnings.append(
                 f"Lakekeeper expose '{expose_id}': {', '.join(unenforced)} cannot be enforced "
-                "by Lakekeeper, which grants whole tables. Stage 8 grants table access only; "
-                "enforce the column and row rules in the query engine (Trino's OPA plugin)."
+                "by Lakekeeper, which grants whole tables: a principal granted select here reads "
+                "every column and row with any engine. Grant this table to the identity of a "
+                "query engine that enforces those rules (Trino's OPA plugin), not to the readers "
+                "the rules restrict."
             )
 
         target, missing = _table_target(binding)
@@ -234,6 +259,7 @@ def compile_lakekeeper_bindings(
             continue
 
         merged: Dict[str, Tuple[Tuple[str, ...], Set[str]]] = {}
+        failed: List[str] = []
         for key, relations, fallback in declared:
             try:
                 identities = resolve_principal(
@@ -245,12 +271,21 @@ def compile_lakekeeper_bindings(
                 )
             except UnsupportedBindingError as exc:
                 fix = f" {exc.remediation[0]}" if exc.remediation else ""
-                warnings.append(f"{exc} It was not granted.{fix}")
+                warnings.append(f"{exc}{fix}")
+                failed.append(key)
                 continue
             if not identities:
                 continue  # mapped to []: no identity in Lakekeeper
             known, held = merged.get(key, ((), set()))
             merged[key] = (known or identities, held | set(relations))
+        if failed:
+            warnings.append(
+                f"Lakekeeper expose '{expose_id}': no grant was compiled, because "
+                f"{sorted(set(failed))} could not be mapped to a Lakekeeper principal. "
+                "policy-apply leaves the table's grants as they are until every principal maps; "
+                "granting the others alone would revoke the unmapped ones."
+            )
+            continue
 
         table_name = ".".join([*target["namespace"], target["table"]])
         for key in sorted(merged):

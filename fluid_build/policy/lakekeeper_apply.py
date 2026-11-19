@@ -14,15 +14,19 @@ Lakekeeper's HTTP API, v0.14.0 (docs/docs/api/management-open-api.yaml and
 rest-catalog-open-api.yaml at that tag):
 
 * ``GET  /management/v1/warehouse`` -- the warehouse id for its name;
-* ``GET  /catalog/v1/config?warehouse=<name>`` -- the catalog prefix;
+* ``GET  /catalog/v1/config?warehouse=<name>`` -- the catalog prefix (v0.14.0
+  sends it in ``defaults``);
 * ``GET  /catalog/v1/{prefix}/namespaces/{ns}/tables?returnUuids=true`` -- the
-  table id (paginated; ``table-uuids`` runs parallel to ``identifiers``);
+  table ids, read once per namespace (paginated; ``table-uuids`` runs parallel to
+  ``identifiers``; a table's id is its Iceberg ``table-uuid``, seen live);
 * ``GET|POST /management/v1/permissions/warehouse/{wid}/table/{tid}/assignments``
   -- the table's direct assignments, and ``{"writes": [...], "deletes": [...]}``;
 * ``POST /management/v1/search/user`` / ``search/role``, ``GET /user/{id}`` /
   ``/role/{id}`` -- a principal's id from its name, or that its id exists:
   Lakekeeper does not check a user id it is given a grant for, so a mistyped id
-  would be granted silently and help no one;
+  would be granted silently and help no one. The search is fuzzy (it answered
+  every service account for ``service-account-trino`` on the lab), so only an
+  exact name or e-mail is taken;
 * ``GET  /management/v1/whoami`` -- who forge signed in as, for the report.
 
 The OpenFGA assignments API (tag ``permissions-openfga``) is the one used: v0.14.0
@@ -41,9 +45,10 @@ each holds a secret REFERENCE (``env://``, ``file://``, ``vault://``,
 The contract does name where the token goes (``binding.location.uri``), so the
 reference must be allowed for that host by the destination policy
 (``FLUID_ACQUISITION_SECRET_REF_ALLOWLIST``, ``secrets/policy.py``) before it is
-read; a loopback host needs no entry. Both URLs must be https, a loopback one
-too, as for ``sink.catalogAuth``. Redirects are not followed. The resolved
-secret and the access token are registered with the exact-value redactor.
+read; a loopback host needs no entry, as everywhere in that policy. Both URLs
+must be https, a loopback one too, as for ``sink.catalogAuth``. Redirects are
+not followed. The resolved secret and the access token are registered with the
+exact-value redactor.
 
 * ``FLUID_LAKEKEEPER_CREDENTIAL_REF`` -- ``client_id:client_secret``, the shape of
   Iceberg's ``credential`` catalog property, for an OAuth2 client-credentials
@@ -52,9 +57,13 @@ secret and the access token are registered with the exact-value redactor.
   Lakekeeper, ``lakekeeper`` in its examples);
 * or ``FLUID_LAKEKEEPER_TOKEN_REF`` -- a bearer token, used as it is.
 
-The identity needs ``manage_grants`` on the tables (Lakekeeper gives it to a
-warehouse or namespace owner, and to a project's ``security_admin``), and the
-right to list the namespaces' tables and search users and roles.
+The identity needs ``manage_grants`` on the tables. On OpenFGA the identity that
+creates a namespace owns it and so has ``manage_grants`` there (unless managed
+access is on), which is enough: on the lab, a client allowed only to create
+namespaces granted on the tables of the namespace it had created, and could
+list warehouses and search and read users. Grants are table by table, and the
+contract names the tables, so a contract can claim any table its identity may
+manage: give stage 8 an identity that manages only the product's own namespaces.
 """
 
 from __future__ import annotations
@@ -64,7 +73,7 @@ import re
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Union
 from urllib.parse import SplitResult, quote, urlsplit, urlunsplit
 
 from .lakekeeper import MANAGED_RELATIONS, PROVIDER, Assignment, plan_changes
@@ -92,6 +101,12 @@ _MAX_PAGES = 1000
 
 _TIMEOUT_SECONDS = 30.0
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+#: (normalized catalog base, warehouse, namespace levels, table): one table.
+TableKey = Tuple[str, str, Tuple[str, ...], str]
+
+#: A change as sent: ``("writes" | "deletes", assignment)``.
+Change = Tuple[str, Assignment]
 
 
 class LakekeeperError(Exception):
@@ -135,10 +150,6 @@ class Settings:
     def configured(self) -> bool:
         return bool(self.credential_ref or self.token_ref)
 
-    @property
-    def ref(self) -> str:
-        return self.token_ref or self.credential_ref
-
     def problem(self) -> Optional[str]:
         """Why these settings cannot sign in, or ``None``."""
         if self.credential_ref and self.token_ref:
@@ -157,7 +168,6 @@ class _Report:
     """What one run did or would do, for the console and the result event."""
 
     mode: str
-    lines: List[str] = field(default_factory=list)
     grants: List[Dict[str, str]] = field(default_factory=list)
     revokes: List[Dict[str, str]] = field(default_factory=list)
     pending: List[str] = field(default_factory=list)
@@ -182,9 +192,29 @@ class _Report:
 
 
 def _clean(text: Any, limit: int = 300) -> str:
-    """A server's text, safe to show: control characters spelled as ``?``, bounded."""
+    """A server's or contract's text, safe to show: control characters as ``?``, bounded."""
     shown = _CONTROL_CHARS.sub("?", str(text or "")).strip()
     return shown if len(shown) <= limit else shown[: limit - 3] + "..."
+
+
+def _body(resp: Any) -> Any:
+    """The parsed JSON body, or ``None`` when there is none."""
+    try:
+        return resp.json()
+    except Exception:  # not JSON
+        return None
+
+
+def _error_type(resp: Any) -> str:
+    """Lakekeeper's ``error.type`` (``NoSuchNamespaceException``...), or ``""``.
+
+    An error a gateway answered in Lakekeeper's place has no such body, so a 404
+    without one is not "the table does not exist".
+    """
+    doc = _body(resp)
+    err = doc.get("error") if isinstance(doc, dict) else None
+    kind = err.get("type") if isinstance(err, dict) else None
+    return kind if isinstance(kind, str) else ""
 
 
 def _error_text(resp: Any) -> str:
@@ -193,10 +223,7 @@ def _error_text(resp: Any) -> str:
     Only the error's type and message are shown, never the raw body or a stack.
     """
     status = f"HTTP {resp.status_code}"
-    try:
-        doc = resp.json()
-    except Exception:  # not JSON: the status says enough
-        return status
+    doc = _body(resp)
     if not isinstance(doc, dict):
         return status
     err = doc.get("error")
@@ -219,13 +246,21 @@ def _https(url: str, source: str) -> SplitResult:
             "that would receive the token cannot be checked.",
             "Write the URL itself, in the environment's overlay.",
         )
+    if _CONTROL_CHARS.search(url):
+        raise LakekeeperError(f"{source} holds a control character (the value is not shown).")
     parts: Optional[SplitResult]
     try:
         parts = urlsplit(url)
         host = parts.hostname or ""
+        parts.port  # noqa: B018 - raises ValueError for a port that is not a number
     except ValueError:
         parts, host = None, ""
-    if parts is None or parts.scheme != "https":
+    if parts is None:
+        raise LakekeeperError(
+            f"{source} is not a URL policy-apply can read (the value is not shown).",
+            "Write it as https://<host>[:<port>]/<path>.",
+        )
+    if parts.scheme != "https":
         raise LakekeeperError(
             f"{source} must be an https:// URL: policy-apply sends a bearer token there, and "
             "http would carry it in clear text (a loopback host too).",
@@ -249,6 +284,23 @@ def service_base(catalog_uri: str) -> str:
     if path.endswith(_CATALOG_SUFFIX):
         path = path[: -len(_CATALOG_SUFFIX)]
     return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def catalog_key(catalog_uri: str) -> str:
+    """One spelling of a Lakekeeper server, to group its tables by.
+
+    ``https://LK.example/catalog/`` and ``https://lk.example:443/catalog`` name one
+    server; were they two keys, one table would be planned twice in one run, and
+    each authoritative plan would undo the other's grants. A uri this cannot read
+    is kept as written, and reported when its tables are applied.
+    """
+    try:
+        parts = urlsplit(service_base(catalog_uri))
+        port = parts.port
+    except (LakekeeperError, ValueError):
+        return catalog_uri.strip()
+    shown_port = f":{port}" if port and port != 443 else ""
+    return f"https://{parts.hostname}{shown_port}{parts.path}"
 
 
 def _new_client() -> Any:
@@ -287,8 +339,8 @@ def _send(client: Any, method: str, url: str, *, what: str, **kw: Any) -> Any:
 
     try:
         return client.request(method, url, **kw)
-    except httpx.HTTPError as exc:
-        host = urlsplit(url).hostname or "?"
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
+        host = _shown_host(url)
         raise LakekeeperError(
             f"{what}: could not reach {host} ({type(exc).__name__}: {_clean(exc, 200)}).",
             "Check the URL and the network; for a private CA set REQUESTS_CA_BUNDLE or "
@@ -296,19 +348,59 @@ def _send(client: Any, method: str, url: str, *, what: str, **kw: Any) -> Any:
         ) from None
 
 
+def _object(resp: Any, what: str) -> Dict[str, Any]:
+    """The response's JSON object, or :class:`LakekeeperError` for any other body."""
+    doc = _body(resp)
+    if not isinstance(doc, dict):
+        raise LakekeeperError(
+            f"{what}: Lakekeeper answered HTTP {resp.status_code} with a body that is not a "
+            "JSON object."
+        )
+    return doc
+
+
+def _dicts(value: Any, what: str, name: str) -> List[Dict[str, Any]]:
+    """A response field that must be a list of objects: ``None`` is empty, a non-list an error."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise LakekeeperError(f"{what}: Lakekeeper's {name!r} is not a list.")
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _id(value: Any) -> str:
+    """An id from a server answer, or ``""`` for anything but a non-empty string."""
+    return value if isinstance(value, str) and value else ""
+
+
 def _resolve_ref(ref: str, name: str, host: str, environ: Mapping[str, str]) -> str:
     """The value behind the operator's reference, once ``host`` may receive it.
 
     The destination policy runs first, so a refused reference is never read.
     """
-    from fluid_build.secrets import SecretError, refuse_unless_allowed, resolve_credential
+    from fluid_build.secrets import (
+        SecretError,
+        SecretPolicyError,
+        refuse_unless_allowed,
+        resolve_credential,
+    )
 
     try:
         refuse_unless_allowed(ref, host=host, environ=environ)
-        value = resolve_credential(ref, environ=environ).get_secret_value()
+    except SecretPolicyError as exc:
+        # The policy's own words speak of a contract naming both halves; here the
+        # operator named the credential and the contract only the host.
+        raise LakekeeperError(
+            f"{name} names a credential the operator has not allowed to go to {host}, the "
+            "Lakekeeper host binding.location.uri names, so it was not read.",
+            f"Fix: {exc.fix}" if getattr(exc, "fix", "") else "",
+        ) from None
     except SecretError as exc:
-        raise LakekeeperError(f"{name}: {exc}") from None
-    value = str(value or "")
+        raise LakekeeperError(f"{name} is refused. {exc}") from None
+    try:
+        value = str(resolve_credential(ref, environ=environ).get_secret_value() or "")
+    except SecretError as exc:
+        raise LakekeeperError(f"{name} did not resolve. {exc}") from None
     if not value:
         raise LakekeeperError(f"{name} resolved to an empty value.")
     _register(value)
@@ -342,20 +434,24 @@ def _sign_in(client: Any, settings: Settings, catalog_host: str, environ: Mappin
     )
     if resp.status_code != 200:
         raise LakekeeperError(
-            f"the token endpoint ({token_parts.hostname}) refused client {client_id!r}: "
+            f"the token endpoint ({token_parts.hostname}) refused client {_clean(client_id)!r}, "
             f"{_error_text(resp)}.",
             f"Check the client's secret and that it may request scope {settings.scope!r}.",
         )
-    try:
-        token = resp.json().get("access_token")
-    except Exception:
-        token = None
+    doc = _body(resp)
+    token = doc.get("access_token") if isinstance(doc, dict) else None
     if not isinstance(token, str) or not token:
         raise LakekeeperError(
             f"the token endpoint ({token_parts.hostname}) answered without an access_token."
         )
     _register(token)
     return token
+
+
+_GRANT_RIGHTS = (
+    "manage_grants on the table, its namespace or its warehouse (an owner has it unless "
+    "managed access is on), or security_admin on the project"
+)
 
 
 class _Lakekeeper:
@@ -365,8 +461,9 @@ class _Lakekeeper:
         self._client = client
         self.base = base
         self._auth = {"Authorization": f"Bearer {token}"}
-        self._warehouses: Dict[str, Tuple[str, str]] = {}
-        self._principals: Dict[str, Tuple[str, str, str]] = {}
+        self._warehouses: Dict[str, Union[Tuple[str, str], LakekeeperError]] = {}
+        self._tables: Dict[Tuple[str, Tuple[str, ...]], Optional[Dict[str, str]]] = {}
+        self._principals: Dict[str, Tuple[str, str]] = {}
         self._names: Dict[Tuple[str, str], str] = {}
 
     # ── transport ────────────────────────────────────────────────────────
@@ -387,21 +484,18 @@ class _Lakekeeper:
             )
         return resp
 
-    def _json(self, resp: Any, what: str) -> Any:
-        try:
-            return resp.json()
-        except Exception:
-            raise LakekeeperError(
-                f"{what}: Lakekeeper answered HTTP {resp.status_code} "
-                "with a body that is not JSON."
-            ) from None
-
     def _refused(self, resp: Any, what: str, needs: str) -> LakekeeperError:
         if resp.status_code == 403:
             return LakekeeperError(
                 f"{what}: Lakekeeper refused the identity forge signed in as "
                 f"({_error_text(resp)}).",
                 f"It needs {needs}.",
+            )
+        if resp.status_code == 404 and not _error_type(resp):
+            return LakekeeperError(
+                f"{what}: HTTP 404 without Lakekeeper's error body, so it did not come from "
+                "Lakekeeper.",
+                "Check that binding.location.uri is Lakekeeper's own /catalog URL.",
             )
         return LakekeeperError(f"{what}: {_error_text(resp)}.")
 
@@ -410,71 +504,98 @@ class _Lakekeeper:
     def whoami(self) -> str:
         """``name (id)`` of the identity forge signed in as; ``""`` if Lakekeeper will not say."""
         resp = self._call("GET", "/management/v1/whoami", what="whoami")
-        if resp.status_code != 200:
-            return ""
-        doc = self._json(resp, "whoami")
-        if not isinstance(doc, dict) or not doc.get("id"):
+        doc = _body(resp) if resp.status_code == 200 else None
+        if not isinstance(doc, dict) or not _id(doc.get("id")):
             return ""
         return f"{_clean(doc.get('name') or '?', 80)} ({_clean(doc['id'], 120)})"
 
     # ── where ────────────────────────────────────────────────────────────
 
     def warehouse(self, name: str) -> Tuple[str, str]:
-        """``(warehouse id, catalog prefix)`` for a warehouse name."""
-        if name in self._warehouses:
-            return self._warehouses[name]
+        """``(warehouse id, catalog prefix)`` for a warehouse name; a failure is kept too,
+        so a run with many tables in one warehouse asks once."""
+        cached = self._warehouses.get(name)
+        if isinstance(cached, LakekeeperError):
+            raise cached
+        if cached is not None:
+            return cached
+        try:
+            found = self._find_warehouse(name)
+        except LakekeeperError as exc:
+            self._warehouses[name] = exc
+            raise
+        self._warehouses[name] = found
+        return found
+
+    def _find_warehouse(self, name: str) -> Tuple[str, str]:
         what = f"warehouse {name!r}"
         resp = self._call("GET", "/management/v1/warehouse", what=what)
         if resp.status_code != 200:
             raise self._refused(resp, what, "permission to list the project's warehouses")
-        listed = (self._json(resp, what) or {}).get("warehouses") or []
-        found = [w for w in listed if isinstance(w, dict) and w.get("name") == name]
+        listed = _dicts(_object(resp, what).get("warehouses"), what, "warehouses")
+        found = [w for w in listed if w.get("name") == name]
         if not found:
             raise LakekeeperError(
                 f"Lakekeeper has no warehouse {name!r} that the identity forge signed in as "
                 "can see (Lakekeeper hides one a caller may not see).",
                 "Check binding.location.warehouse, and the identity's access to the warehouse.",
             )
-        warehouse_id = str(found[0].get("warehouse-id") or found[0].get("id") or "")
+        warehouse_id = _id(found[0].get("warehouse-id")) or _id(found[0].get("id"))
         resp = self._call("GET", "/catalog/v1/config", what=what, params={"warehouse": name})
         if resp.status_code != 200:
             raise self._refused(resp, f"{what} catalog config", "access to the warehouse")
-        doc = self._json(resp, what) or {}
-        prefix = (doc.get("overrides") or {}).get("prefix") or (doc.get("defaults") or {}).get(
-            "prefix"
+        doc = _object(resp, what)
+        overrides, defaults = doc.get("overrides"), doc.get("defaults")
+        prefix = (_id(overrides.get("prefix")) if isinstance(overrides, dict) else "") or (
+            _id(defaults.get("prefix")) if isinstance(defaults, dict) else ""
         )
         if not warehouse_id or not prefix:
             raise LakekeeperError(f"{what}: Lakekeeper returned no warehouse id or prefix.")
-        self._warehouses[name] = (warehouse_id, str(prefix))
-        return self._warehouses[name]
+        return warehouse_id, prefix
 
-    def table_id(self, prefix: str, namespace: List[str], table: str) -> Optional[str]:
-        """The table's Lakekeeper id, or ``None`` when the table (or namespace) is not there."""
+    def tables(self, prefix: str, namespace: List[str]) -> Optional[Dict[str, str]]:
+        """``{table name: id}`` of a namespace, read once per run; ``None`` when the
+        namespace does not exist (or is hidden from the identity)."""
+        key = (prefix, tuple(namespace))
+        if key not in self._tables:
+            self._tables[key] = self._list_tables(prefix, namespace)
+        return self._tables[key]
+
+    def _list_tables(self, prefix: str, namespace: List[str]) -> Optional[Dict[str, str]]:
         ns = quote("\x1f".join(namespace), safe="")
         path = f"/catalog/v1/{quote(prefix, safe='')}/namespaces/{ns}/tables"
         what = f"tables of namespace {'.'.join(namespace)!r}"
         params: Dict[str, str] = {"returnUuids": "true"}
+        found: Dict[str, str] = {}
+        tokens: Set[str] = set()
         for _ in range(_MAX_PAGES):
             resp = self._call("GET", path, what=what, params=params)
-            if resp.status_code == 404:
+            if resp.status_code == 404 and "namespace" in _error_type(resp).lower():
                 return None
             if resp.status_code != 200:
                 raise self._refused(resp, what, "permission to list the namespace's tables")
-            doc = self._json(resp, what) or {}
+            doc = _object(resp, what)
             idents = doc.get("identifiers") or []
-            raw_uuids = doc.get("table-uuids")
-            uuids: List[Any] = raw_uuids if isinstance(raw_uuids, list) else []
-            if len(uuids) != len(idents):
+            uuids = doc.get("table-uuids") or []
+            if (
+                not isinstance(idents, list)
+                or not isinstance(uuids, list)
+                or (len(uuids) != len(idents))
+            ):
                 raise LakekeeperError(
-                    f"{what}: Lakekeeper returned no table ids (returnUuids); this needs a "
-                    "Lakekeeper that answers it (v0.14.0 does)."
+                    f"{what}: Lakekeeper returned no table ids beside the names (returnUuids); "
+                    "this needs a Lakekeeper that answers it (v0.14.0 does)."
                 )
             for ident, table_uuid in zip(idents, uuids, strict=True):
-                if isinstance(ident, dict) and ident.get("name") == table:
-                    return str(table_uuid)
+                name = ident.get("name") if isinstance(ident, dict) else None
+                if isinstance(name, str) and _id(table_uuid):
+                    found.setdefault(name, table_uuid)
             token = doc.get("next-page-token")
             if not token:
-                return None
+                return found
+            if str(token) in tokens:
+                raise LakekeeperError(f"{what}: Lakekeeper repeated a page token.")
+            tokens.add(str(token))
             params = {"returnUuids": "true", "pageToken": str(token)}
         raise LakekeeperError(f"{what}: more than {_MAX_PAGES} pages of tables.")
 
@@ -492,12 +613,12 @@ class _Lakekeeper:
         if resp.status_code != 200:
             raise self._refused(resp, what, _GRANT_RIGHTS)
         out: List[Assignment] = []
-        for item in (self._json(resp, what) or {}).get("assignments") or []:
-            if not isinstance(item, dict) or not item.get("type"):
-                continue
+        for item in _dicts(_object(resp, what).get("assignments"), what, "assignments"):
+            relation = _id(item.get("type"))
             for kind in ("user", "role"):
-                if item.get(kind):
-                    out.append((str(item["type"]), kind, str(item[kind])))
+                principal_id = _id(item.get(kind))
+                if relation and principal_id:
+                    out.append((relation, kind, principal_id))
         return out
 
     def update(
@@ -507,19 +628,20 @@ class _Lakekeeper:
         writes: List[Assignment],
         deletes: List[Assignment],
         what: str,
+        sent: List[Change],
     ) -> None:
-        """Send the changes: grants before revokes, at most 100 per request.
+        """Send the changes, grants before revokes, at most 100 per request; each
+        accepted request's changes are added to ``sent``.
 
         A table's changes fit one request (atomic in Lakekeeper) unless they pass
         100; then the grants go first, so a principal whose relation changes is
-        never left with none.
+        never left with none, and ``sent`` says what landed if a later one fails.
         """
-        changes = [("writes", a) for a in writes] + [("deletes", a) for a in deletes]
+        changes: List[Change] = [("writes", a) for a in writes] + [("deletes", a) for a in deletes]
         for start in range(0, len(changes), _MAX_CHANGES_PER_REQUEST):
+            chunk = changes[start : start + _MAX_CHANGES_PER_REQUEST]
             body: Dict[str, List[Dict[str, str]]] = {"writes": [], "deletes": []}
-            for key, (relation, kind, principal_id) in changes[
-                start : start + _MAX_CHANGES_PER_REQUEST
-            ]:
+            for key, (relation, kind, principal_id) in chunk:
                 body[key].append({"type": relation, kind: principal_id})
             resp = self._call(
                 "POST", self._assignments_path(warehouse_id, table_id), what=what, json=body
@@ -528,11 +650,13 @@ class _Lakekeeper:
                 raise _Conflict()
             if resp.status_code not in (200, 204):
                 raise self._refused(resp, what, _GRANT_RIGHTS)
+            sent.extend(chunk)
 
     # ── principals ───────────────────────────────────────────────────────
 
-    def principal(self, identity: str) -> Tuple[str, str, str]:
-        """``(kind, id, note)`` for a Lakekeeper identity (``user:``/``role:``...)."""
+    def principal(self, identity: str) -> Tuple[str, str]:
+        """``(kind, id)`` for a Lakekeeper identity (``user:``/``role:``...), the id as
+        Lakekeeper spells it."""
         if identity not in self._principals:
             prefix, _, value = identity.partition(":")
             if prefix in ("user", "serviceAccount"):
@@ -540,114 +664,126 @@ class _Lakekeeper:
             elif prefix in ("role", "group"):
                 self._principals[identity] = self._role(value)
             else:
-                raise LakekeeperError(f"{identity!r} is not a Lakekeeper principal.")
+                raise LakekeeperError(f"{_clean(identity)!r} is not a Lakekeeper principal.")
         return self._principals[identity]
 
-    def _user(self, value: str) -> Tuple[str, str, str]:
+    def _user(self, value: str) -> Tuple[str, str]:
+        what = f"user {_clean(value, 120)!r}"
         if "~" in value:  # a Lakekeeper user id: oidc~<subject>, kubernetes~<uid>, ...
-            what = f"user {value!r}"
             resp = self._call("GET", f"/management/v1/user/{quote(value, safe='')}", what=what)
-            if resp.status_code == 200:
-                doc = self._json(resp, what) or {}
-                self._names[("user", value)] = _clean(doc.get("name") or "", 80)
-                return "user", value, ""
-            if resp.status_code == 404:
+            if resp.status_code == 404 and _error_type(resp):
                 raise LakekeeperError(
-                    f"Lakekeeper has no user {value!r}: a user exists there once it has signed "
-                    "in, and a grant to an id it does not know would reach no one.",
+                    f"Lakekeeper has no user {_clean(value, 120)!r}: a user exists there once it "
+                    "has signed in, and a grant to an id it does not know would reach no one.",
                     "Sign in once with that identity, or map the principal to the right id.",
                 )
-            return "user", value, f"not verified: {_error_text(resp)}"
-        what = f"user {value!r}"
+            if resp.status_code != 200:
+                # Fail closed: an id that cannot be checked could be a typo, and the plan
+                # would revoke the real principal's grants in its favour.
+                raise self._refused(
+                    resp, what, "permission to read users (or map the principal by name)"
+                )
+            doc = _object(resp, what)
+            user_id = _id(doc.get("id"))
+            if not user_id:
+                raise LakekeeperError(f"{what}: Lakekeeper answered without the user's id.")
+            self._names[("user", user_id)] = _clean(doc.get("name"), 80)
+            return "user", user_id
         resp = self._call(
             "POST", "/management/v1/search/user", what=what, json={"search": value[:64]}
         )
         if resp.status_code != 200:
             raise self._refused(resp, what, "permission to search users (or map it to user:<id>)")
-        users = (self._json(resp, what) or {}).get("users") or []
+        users = _dicts(_object(resp, what).get("users"), what, "users")
+        email = value.casefold()
         exact = [
             u
             for u in users
-            if isinstance(u, dict)
-            and u.get("id")
-            and (u.get("name") == value or str(u.get("email") or "").casefold() == value.casefold())
+            if _id(u.get("id"))
+            and (u.get("name") == value or str(u.get("email") or "").casefold() == email)
         ]
         if len(exact) > 1:
-            ids = sorted(str(u["id"]) for u in exact)
+            ids = sorted(_clean(u["id"], 120) for u in exact)
             raise LakekeeperError(
-                f"{len(exact)} Lakekeeper users are named {value!r} or have that e-mail: {ids}.",
+                f"{len(exact)} Lakekeeper users are named {_clean(value, 120)!r} or have that "
+                f"e-mail: {ids}.",
                 "Map the principal to one of them by id (user:<id>) in binding.principals.",
             )
         if not exact:
             raise LakekeeperError(
-                f"no Lakekeeper user is named {value!r} or has that e-mail. A user appears in "
-                "Lakekeeper once it has signed in; a Keycloak client's service account is "
-                "named service-account-<client-id>.",
+                f"no Lakekeeper user is named {_clean(value, 120)!r} or has that e-mail. A user "
+                "appears in Lakekeeper once it has signed in; a Keycloak client's service "
+                "account is named service-account-<client-id>.",
                 "Map the principal in binding.principals to the user's name or id "
                 "(user:oidc~<subject>).",
             )
-        user_id = str(exact[0]["id"])
-        self._names[("user", user_id)] = _clean(exact[0].get("name") or "", 80)
-        return "user", user_id, ""
+        user_id = _id(exact[0]["id"])
+        self._names[("user", user_id)] = _clean(exact[0].get("name"), 80)
+        return "user", user_id
 
-    def _role(self, value: str) -> Tuple[str, str, str]:
-        what = f"role {value!r}"
+    def _role(self, value: str) -> Tuple[str, str]:
+        what = f"role {_clean(value, 120)!r}"
         if _is_uuid(value):
-            resp = self._call("GET", f"/management/v1/role/{value}", what=what)
-            if resp.status_code == 200:
-                self._names[("role", value)] = _clean(
-                    (self._json(resp, what) or {}).get("name"), 80
-                )
-                return "role", value, ""
-            if resp.status_code == 404:
-                raise LakekeeperError(f"Lakekeeper has no role with id {value!r}.")
-            raise self._refused(resp, what, "permission to read roles")
+            resp = self._call("GET", f"/management/v1/role/{quote(value, safe='')}", what=what)
+            if resp.status_code == 404 and _error_type(resp):
+                raise LakekeeperError(f"Lakekeeper has no role with id {_clean(value, 120)!r}.")
+            if resp.status_code != 200:
+                raise self._refused(resp, what, "permission to read roles")
+            doc = _object(resp, what)
+            role_id = _id(doc.get("id"))
+            if not role_id:
+                raise LakekeeperError(f"{what}: Lakekeeper answered without the role's id.")
+            self._names[("role", role_id)] = _clean(doc.get("name"), 80)
+            return "role", role_id
         resp = self._call(
             "POST", "/management/v1/search/role", what=what, json={"search": value[:64]}
         )
         if resp.status_code != 200:
             raise self._refused(resp, what, "permission to search roles (or map it to role:<id>)")
-        roles = (self._json(resp, what) or {}).get("roles") or []
-        exact = [r for r in roles if isinstance(r, dict) and r.get("id") and r.get("name") == value]
+        roles = _dicts(_object(resp, what).get("roles"), what, "roles")
+        exact = [r for r in roles if _id(r.get("id")) and r.get("name") == value]
         if len(exact) > 1:
-            ids = sorted(str(r["id"]) for r in exact)
+            ids = sorted(_clean(r["id"], 120) for r in exact)
             raise LakekeeperError(
-                f"{len(exact)} Lakekeeper roles are named {value!r}: {ids}.",
+                f"{len(exact)} Lakekeeper roles are named {_clean(value, 120)!r}: {ids}.",
                 "Map the principal to one of them by id (role:<id>) in binding.principals.",
             )
         if not exact:
             raise LakekeeperError(
-                f"Lakekeeper has no role named {value!r}. With OpenFGA, Lakekeeper keeps its "
-                "own roles and reads no group from the identity provider.",
+                f"Lakekeeper has no role named {_clean(value, 120)!r}. With OpenFGA, "
+                "Lakekeeper keeps its own roles and reads no group from the identity provider.",
                 "Create the role in Lakekeeper and add its members, or map the principal in "
                 "binding.principals.",
             )
-        role_id = str(exact[0]["id"])
-        self._names[("role", role_id)] = value
-        return "role", role_id, ""
+        role_id = _id(exact[0]["id"])
+        self._names[("role", role_id)] = _clean(value, 80)
+        return "role", role_id
 
     def name_of(self, kind: str, principal_id: str) -> str:
-        """The principal's Lakekeeper name, for a revoke the contract does not name."""
+        """The principal's Lakekeeper name, for a revoke the contract does not name;
+        ``""`` when Lakekeeper will not say. Never raises: a change may already be sent."""
         key = (kind, principal_id)
         if key not in self._names:
             path = f"/management/v1/{kind}/{quote(principal_id, safe='')}"
             try:
-                resp = self._call("GET", path, what=f"{kind} {principal_id}")
-                doc = self._json(resp, kind) if resp.status_code == 200 else {}
+                resp = self._call("GET", path, what=f"{kind} {_clean(principal_id, 120)}")
+                doc = _body(resp) if resp.status_code == 200 else None
             except LakekeeperError:
-                doc = {}
-            self._names[key] = _clean((doc or {}).get("name") or "", 80)
+                doc = None
+            self._names[key] = _clean(doc.get("name"), 80) if isinstance(doc, dict) else ""
         return self._names[key]
 
 
-_GRANT_RIGHTS = (
-    "manage_grants on the table, its namespace or its warehouse (an owner has it unless "
-    "managed access is on), or security_admin on the project"
-)
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _shown_host(uri: str) -> str:
-    """The host of a contract's catalog uri, for a message: never its userinfo or path."""
+    """The host of a URL, for a message: never its userinfo or path."""
     try:
         host = urlsplit(uri).hostname
     except ValueError:
@@ -664,35 +800,37 @@ def _malformed(bindings: List[Mapping[str, Any]]) -> Optional[str]:
     for binding in bindings:
         identities = binding.get("identities")
         relations = binding.get("relations")
+        who = _clean(binding.get("principal"), 120)
+        names = [binding.get("warehouse"), binding.get("table"), *(binding.get("namespace") or ())]
+        if any("{{" in str(n) or "${" in str(n) for n in names):
+            return (
+                "its warehouse, namespace or table holds an unrendered template; write the "
+                "names themselves in the environment's overlay"
+            )
         if not isinstance(identities, list) or not identities:
-            return f"the binding for {binding.get('principal')!r} names no identities"
+            return f"the binding for {who!r} names no identities"
+        if not all(isinstance(i, str) and i for i in identities):
+            return f"the binding for {who!r} names an identity that is not text"
         if not isinstance(relations, list) or not relations:
-            return f"the binding for {binding.get('principal')!r} names no relations"
+            return f"the binding for {who!r} names no relations"
         unknown = [r for r in relations if r not in MANAGED_RELATIONS]
         if unknown:
-            return f"the binding for {binding.get('principal')!r} names relations {unknown}"
+            return f"the binding for {who!r} names relations {[_clean(r) for r in unknown]}"
     return None
 
 
-def _is_uuid(value: str) -> bool:
-    try:
-        uuid.UUID(value)
-    except ValueError:
-        return False
-    return True
-
-
-def _table_key(binding: Mapping[str, Any]) -> Tuple[str, str, Tuple[str, ...], str]:
+def _table_key(binding: Mapping[str, Any]) -> TableKey:
+    namespace = binding.get("namespace")
     return (
-        str(binding.get("catalog_uri") or ""),
+        catalog_key(str(binding.get("catalog_uri") or "")),
         str(binding.get("warehouse") or ""),
-        tuple(str(n) for n in binding.get("namespace") or ()),
+        tuple(str(n) for n in namespace) if isinstance(namespace, list) else (),
         str(binding.get("table") or ""),
     )
 
 
-def _table_name(key: Tuple[str, str, Tuple[str, ...], str]) -> str:
-    return f"{key[1]}/{'.'.join([*key[2], key[3]])}"
+def _table_name(key: TableKey) -> str:
+    return _clean(f"{key[1]}/{'.'.join([*key[2], key[3]])}", 400)
 
 
 def apply_lakekeeper_bindings(
@@ -714,10 +852,12 @@ def apply_lakekeeper_bindings(
     environ = os.environ if environ is None else environ
     report = _Report(mode=mode)
 
-    tables: "OrderedDict[Tuple[str, str, Tuple[str, ...], str], List[Mapping[str, Any]]]"
-    tables = OrderedDict()
+    tables: "OrderedDict[TableKey, List[Mapping[str, Any]]]" = OrderedDict()
+    uris: Dict[str, str] = {}
     for binding in bindings:
-        tables.setdefault(_table_key(binding), []).append(binding)
+        key = _table_key(binding)
+        tables.setdefault(key, []).append(binding)
+        uris.setdefault(key[0], str(binding.get("catalog_uri") or ""))
     report.tables = len(tables)
 
     settings = Settings.from_env(environ)
@@ -740,7 +880,7 @@ def apply_lakekeeper_bindings(
         emit(report.errors[-1])
         return report.result()
 
-    by_catalog: "OrderedDict[str, List[Any]]" = OrderedDict()
+    by_catalog: "OrderedDict[str, List[TableKey]]" = OrderedDict()
     for key in tables:
         by_catalog.setdefault(key[0], []).append(key)
 
@@ -752,16 +892,17 @@ def apply_lakekeeper_bindings(
         emit(report.errors[-1])
         return report.result()
     try:
-        for catalog_uri, keys in by_catalog.items():
+        for catalog, keys in by_catalog.items():
+            uri = uris[catalog]
             try:
-                base = service_base(catalog_uri)
+                base = service_base(uri)
                 host = urlsplit(base).hostname or ""
                 server = _Lakekeeper(http, base, _sign_in(http, settings, host, environ))
                 who = server.whoami()
             except LakekeeperError as exc:
                 for key in keys:
                     report.errors.append(f"{_table_name(key)}: {exc}")
-                emit(f"Lakekeeper {_shown_host(catalog_uri)}: {exc}")
+                emit(f"Lakekeeper {_shown_host(uri)}: {exc}")
                 continue
             emit(f"Lakekeeper {base}" + (f": signed in as {who}" if who else ""))
             for key in keys:
@@ -776,13 +917,18 @@ def apply_lakekeeper_bindings(
 
 def _apply_table(
     server: _Lakekeeper,
-    key: Tuple[str, str, Tuple[str, ...], str],
+    key: TableKey,
     bindings: List[Mapping[str, Any]],
     report: _Report,
     say: Callable[[str], None],
 ) -> None:
     name = _table_name(key)
     enforce = report.mode == "enforce"
+    labels: Dict[Tuple[str, str], str] = {}
+    sent: List[Change] = []
+    desired: Set[Assignment] = set()
+    writes: List[Assignment] = []
+    deletes: List[Assignment] = []
     try:
         problem = _malformed(bindings)
         if problem:
@@ -791,35 +937,34 @@ def _apply_table(
                 "Recompile the bindings with fluid policy compile (or fluid generate artifacts).",
             )
         warehouse_id, prefix = server.warehouse(key[1])
-        table_id = server.table_id(prefix, list(key[2]), key[3])
+        listed = server.tables(prefix, list(key[2]))
+        table_id = listed.get(key[3]) if listed is not None else None
         if table_id is None:
+            # Not an error, in either mode: a Lakekeeper table is created by its
+            # writer (the build, or a sink at its first commit), not by fluid apply,
+            # so a first deploy reaches stage 8 before it. Nobody reads a table that
+            # is not there, and its creator alone owns it once it is.
             count = sum(len(b.get("relations") or ()) for b in bindings)
-            if not enforce:
-                report.pending.append(name)
-                say(
-                    f"  ? {name} does not exist in Lakekeeper yet: its {count} grant(s) are "
-                    "applied once it does (fluid apply creates it)."
-                )
-                return
-            raise LakekeeperError(
-                f"the table does not exist in Lakekeeper, so its {count} grant(s) cannot be "
-                "applied.",
-                "Run fluid apply first (it creates the table), then policy-apply again.",
+            report.pending.append(name)
+            say(
+                f"  ? {name} does not exist in Lakekeeper yet (or the identity forge signed in "
+                f"as cannot see it): its {count} grant(s) were not applied. Its writer creates "
+                "it (the build, or the sink at its first commit); run policy-apply again then."
             )
-        desired: List[Assignment] = []
-        labels: Dict[Tuple[str, str], str] = {}
+            return
         unresolved: List[str] = []
         for binding in bindings:
             for identity in binding.get("identities") or ():
                 try:
-                    kind, principal_id, note = server.principal(str(identity))
+                    kind, principal_id = server.principal(str(identity))
                 except LakekeeperError as exc:
-                    unresolved.append(f"{binding.get('principal')}: {exc}")
+                    unresolved.append(f"{_clean(binding.get('principal'), 120)}: {exc}")
                     continue
-                label = f"{binding.get('principal')} ({kind} {principal_id})"
-                labels[(kind, principal_id)] = label + (f", {note}" if note else "")
+                labels[(kind, principal_id)] = (
+                    f"{_clean(binding.get('principal'), 120)} ({kind} {_clean(principal_id, 120)})"
+                )
                 for relation in binding.get("relations") or ():
-                    desired.append((str(relation), kind, principal_id))
+                    desired.add((str(relation), kind, principal_id))
         if unresolved:
             # The plan would revoke whatever the unresolved principal holds: change nothing.
             raise LakekeeperError(
@@ -833,7 +978,7 @@ def _apply_table(
             if not enforce or not (writes or deletes):
                 break
             try:
-                server.update(warehouse_id, table_id, writes, deletes, what)
+                server.update(warehouse_id, table_id, writes, deletes, what, sent)
                 break
             except _Conflict:
                 continue
@@ -843,31 +988,49 @@ def _apply_table(
                 "Run policy-apply again.",
             )
     except LakekeeperError as exc:
-        report.errors.append(f"{name}: {exc}")
-        say(f"  x {name}: {exc}")
+        if sent:  # an earlier request of this table landed: say what it changed
+            _record(server, name, report, say, labels, sent, enforce=True)
+        landed = f" {len(sent)} change(s) were applied before that, listed above." if sent else ""
+        report.errors.append(f"{name}: {exc}{landed}")
+        say(f"  x {name}: {exc}{landed}")
         return
 
-    verb_grant, verb_revoke = ("grant", "revoke") if enforce else ("would grant", "would revoke")
-    for relation, kind, principal_id in writes:
-        label = labels.get((kind, principal_id), f"{kind} {principal_id}")
-        report.grants.append(
-            {"table": name, "relation": relation, "kind": kind, "id": principal_id}
-        )
-        say(f"  + {name}: {verb_grant} {relation} to {label}")
-    for relation, kind, principal_id in deletes:
-        known = labels.get((kind, principal_id))
-        if known is None:
-            shown = server.name_of(kind, principal_id)
-            known = f"{kind} {principal_id}" + (f" ({shown})" if shown else "")
-        label = known
-        report.revokes.append(
-            {"table": name, "relation": relation, "kind": kind, "id": principal_id}
-        )
-        say(f"  - {name}: {verb_revoke} {relation} from {label}")
-    kept = len(set(desired)) - len(writes)
+    changes: List[Change] = (
+        sent if enforce else [("writes", a) for a in writes] + [("deletes", a) for a in deletes]
+    )
+    _record(server, name, report, say, labels, changes, enforce=enforce)
+    granted = {a for k, a in changes if k == "writes"}
+    kept = len(desired - granted)
     report.unchanged += kept
-    if not writes and not deletes:
+    if not changes:
         say(f"  = {name}: {kept} grant(s) already in place")
+
+
+def _record(
+    server: _Lakekeeper,
+    name: str,
+    report: _Report,
+    say: Callable[[str], None],
+    labels: Mapping[Tuple[str, str], str],
+    changes: List[Change],
+    *,
+    enforce: bool,
+) -> None:
+    """Report each grant and revoke: on the console, and in the result event."""
+    verb_grant, verb_revoke = ("grant", "revoke") if enforce else ("would grant", "would revoke")
+    for kind_of_change, (relation, kind, principal_id) in changes:
+        shown_id = _clean(principal_id, 120)
+        entry = {"table": name, "relation": _clean(relation), "kind": kind, "id": shown_id}
+        label = labels.get((kind, principal_id))
+        if kind_of_change == "writes":
+            report.grants.append(entry)
+            say(f"  + {name}: {verb_grant} {entry['relation']} to {label or f'{kind} {shown_id}'}")
+            continue
+        if label is None:
+            shown = server.name_of(kind, principal_id)
+            label = f"{kind} {shown_id}" + (f" ({shown})" if shown else "")
+        report.revokes.append(entry)
+        say(f"  - {name}: {verb_revoke} {entry['relation']} from {label}")
 
 
 def _summarise(report: _Report, say: Callable[[str], None]) -> None:
@@ -894,5 +1057,6 @@ __all__ = [
     "TOKEN_REF_ENV",
     "TOKEN_URI_ENV",
     "apply_lakekeeper_bindings",
+    "catalog_key",
     "service_base",
 ]
