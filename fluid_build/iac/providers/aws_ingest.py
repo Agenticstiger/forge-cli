@@ -370,8 +370,8 @@ def _emit_build(
 ) -> aws_identity.CallerRun:
     """Emit one build; return what a scheduler needs to start, watch and stop its runs: a
     build that runs to completion (batch, or a stream triggered availableNow) through
-    ``--mode amend-and-build``, an always-on stream through the keepalive's
-    ``--mode reconcile``."""
+    ``--mode amend-and-build``, an always-on stream through a keepalive's
+    ``--mode reconcile`` (a scheduler task that runs it every few minutes)."""
     from fluid_build.spark import runner_source
     from fluid_build.spark.compiler import compile_job_config, spark_parameters
 
@@ -1258,8 +1258,8 @@ def _emit_caller_policy(
 
     A build that runs to completion is started by its scheduler through ``fluid apply
     --mode amend-and-build`` (an MWAA worker, as the environment's execution role), and an
-    always-on stream is kept running by its keepalive through ``fluid apply --mode
-    reconcile``, which reads the job config the apply uploaded and starts the stream again
+    always-on stream is kept running by a keepalive, a scheduler task that runs ``fluid
+    apply --mode reconcile``, which reads the job config the apply uploaded and starts the stream again
     when it died. The platform owns that role: the policy is the product's, for the platform
     to attach to it. It covers the runs only: a scheduled build's worker runs the whole
     apply, ``tofu`` included, so that role also needs what the apply provisions with and the

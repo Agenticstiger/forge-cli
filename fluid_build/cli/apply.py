@@ -1435,13 +1435,20 @@ def _run_reconcile_mode(
 
 def _confirm_reconcile(question: str) -> bool:
     """Ask on the terminal before ``--mode reconcile`` starts or cancels a run (``--yes``
-    skips it, as it skips apply's own prompt)."""
-    if RICH_AVAILABLE:
-        from rich.markup import escape
+    skips it, as it skips apply's own prompt). An empty or closed input is a no; Ctrl-C
+    stops the command, as it stops any apply."""
+    prompt = f"{question} [y/N]: "
+    try:
+        if RICH_AVAILABLE:
+            from rich.markup import escape
 
-        # The question quotes a run's failure, which the runtime reports: never markup.
-        return bool(confirm_action(escape(question), default=False, console=Console()))
-    return input(f"{question} [y/N]: ").strip().lower() in ("y", "yes")
+            # The question quotes a run's failure, which the runtime reports: never markup.
+            answer = Console().input(escape(prompt))
+        else:
+            answer = input(prompt)
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
 
 
 def _render_apply_result(

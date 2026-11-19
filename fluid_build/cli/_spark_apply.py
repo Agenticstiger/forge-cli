@@ -306,8 +306,8 @@ def reconcile_only(
                 "triggered availableNow): its scheduler runs it with fluid apply --mode "
                 f"amend-and-build --build-id {build_id}, and --mode reconcile keeps only "
                 "always-on streams running; nothing was started",
-                "hint": "Regenerate the schedule (fluid generate schedule) so no keepalive "
-                "runs for it.",
+                "hint": f"Run it with fluid apply --mode amend-and-build --build-id {build_id}, "
+                "as its schedule does.",
             },
         )
     runs = [r for r in runs if not r.scheduled]

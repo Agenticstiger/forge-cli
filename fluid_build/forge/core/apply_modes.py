@@ -27,8 +27,9 @@ seventh, ``reconcile``, deploys nothing (below the table). Per the plan
 ``reconcile`` runs no DDL, no ``tofu`` and no build, and takes no plan: it
 keeps the contract's always-on Spark streams running with the config the
 last apply deployed, starting a stream that died again on its checkpoint
-within its restart budget (``build_runners/spark/_reconcile.py``). It is what
-a keepalive DAG runs, with ``--build-id <stream>``.
+within its restart budget (``build_runners/spark/_reconcile.py``). A
+keepalive, a scheduler task every few minutes, runs it with
+``--build-id <stream>``.
 
 Destructive modes (``replace*``) require ``--allow-data-loss`` when the
 environment is not dev OR the target has rows. ``create-only`` hard-fails
