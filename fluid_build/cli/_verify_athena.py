@@ -973,6 +973,30 @@ def _since_phrase(info: Mapping[str, Any]) -> str:
     )
 
 
+def _registration_hint(table_id: str) -> str:
+    """Why a partitioned table Athena does not project counts nothing yet."""
+    return (
+        "; the table is partitioned without Athena partition projection, so Athena reads "
+        f"only registered partitions: run MSCK REPAIR TABLE {table_id}"
+    )
+
+
+def _at_least_run(count: int, landed: int, run: str, table_id: str, engine: str) -> Tuple[str, str]:
+    """``(message, status)`` for a full refresh of a partitioned table: it replaces only
+    the partitions it writes, so the run's rows are a floor."""
+    if count < landed:
+        return (
+            f"{engine} counted {count:,} rows in {table_id}; {run} landed {landed:,}, and a "
+            "full refresh of a partitioned table keeps every row it wrote",
+            "fail",
+        )
+    return (
+        f"{count:,} rows, at least the {landed:,} that {run} landed (a full refresh of a "
+        "partitioned table replaces only the partitions it writes)",
+        "pass",
+    )
+
+
 def _row_count_dimension(
     count: int,
     landed: Optional[int],
@@ -1004,24 +1028,10 @@ def _row_count_dimension(
         message = f"{engine} counted 0 rows in {table_id}"
         if landed is not None:
             message += f"; {run} landed {landed:,}"
-        if unregistered:
-            message += (
-                "; the table is partitioned without Athena partition projection, so "
-                f"Athena reads only registered partitions: run MSCK REPAIR TABLE {table_id}"
-            )
-        status = "fail"
-    elif landed is not None and rule == RULE_AT_LEAST_RUN and count < landed:
-        message = (
-            f"{engine} counted {count:,} rows in {table_id}; {run} landed {landed:,}, and a "
-            "full refresh of a partitioned table keeps every row it wrote"
-        )
+        message += _registration_hint(table_id) if unregistered else ""
         status = "fail"
     elif landed is not None and rule == RULE_AT_LEAST_RUN:
-        message = (
-            f"{count:,} rows, at least the {landed:,} that {run} landed (a full refresh of "
-            "a partitioned table replaces only the partitions it writes)"
-        )
-        status = "pass"
+        message, status = _at_least_run(count, landed, run, table_id, engine)
     elif landed is not None and rule == RULE_EQUAL and count != landed:
         message = (
             f"{engine} counted {count:,} rows in {table_id}; {run} landed {landed:,} "

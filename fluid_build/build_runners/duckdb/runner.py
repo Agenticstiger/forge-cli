@@ -1790,18 +1790,10 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
 
                 # Resolve binding location if present, else write under workdir.
                 out_path = _resolve_destination_path(ctx, stream, sink_format, out_dir)
-                partitioned = _partitioned_write(ctx, stream, partition_by)
-                if partitioned is not None and not partitioned.append:
-                    foreign = _foreign_partition_files(con, out_path, partitioned, sink_format)
-                    if foreign:
-                        raise RuntimeError(
-                            f"partitioned table: a full refresh would leave {len(foreign)} "
-                            f"file(s) another run wrote under {out_path} (first: "
-                            f"{foreign[0]}), and their rows would be read with the new ones. "
-                            "Remove them, or run incremental_append."
-                        )
+                partitioned = _checked_partitioned_write(
+                    con, ctx, stream, out_path, sink_format, partition_by
+                )
                 copy_template = _build_copy_destination(out_path, sink_format, partitioned)
-                hidden_nulls = _required_null_keys(ctx, partitioned)
                 # ``replace`` on the first ``{select}``, not ``str.format``: the quoted
                 # path follows it and may hold braces (as ``LocalProvider`` fills it).
                 copy_sql = copy_template.replace("{select}", landed_sel, 1)
@@ -1812,8 +1804,8 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                 # changed since, and a table holding exactly what the COPY
                 # wrote then failed verify against the larger number.
                 written = first_row(con.execute(copy_sql))
-                if hidden_nulls:
-                    _refuse_null_partitions(con, out_path, partitioned, sink_format, hidden_nulls)
+                if partitioned is not None:
+                    _refuse_null_partitions(con, ctx, out_path, partitioned, sink_format)
                 if written is not None and isinstance(written[0], int):
                     n = written[0]
                 else:
@@ -2592,11 +2584,32 @@ def _required_null_keys(
     return tuple(key for key in partitioned.keys if key in required)
 
 
+def _checked_partitioned_write(
+    con: Any, ctx: RunContext, stream: str, out_path: str, fmt: str, keys: Tuple[str, ...]
+) -> Optional[PartitionedWrite]:
+    """The stream's partitioned write (``None`` for one file), refused before the COPY
+    when a full refresh would leave files another run wrote beside the new ones."""
+    partitioned = _partitioned_write(ctx, stream, keys)
+    if partitioned is None or partitioned.append:
+        return partitioned
+    foreign = _foreign_partition_files(con, out_path, partitioned, fmt)
+    if foreign:
+        raise RuntimeError(
+            f"partitioned table: a full refresh would leave {len(foreign)} file(s) another "
+            f"run wrote under {out_path} (first: {foreign[0]}), and their rows would be read "
+            "with the new ones. Remove them, or run incremental_append."
+        )
+    return partitioned
+
+
 def _refuse_null_partitions(
-    con: Any, out_path: str, partitioned: PartitionedWrite, fmt: str, keys: Sequence[str]
+    con: Any, ctx: RunContext, out_path: str, partitioned: PartitionedWrite, fmt: str
 ) -> None:
     """Fail the stream when it wrote a null value of a required key: the rows sit under
     ``<key>=__HIVE_DEFAULT_PARTITION__/``, which Athena's projection never names."""
+    keys = _required_null_keys(ctx, partitioned)
+    if not keys:
+        return
     ext = "csv" if fmt == "csv" else "parquet"
     pattern = quote_ansi_string_literal(_partition_glob(out_path, partitioned.keys, ext))
     rows = con.execute(f"SELECT file FROM glob({pattern})").fetchall()

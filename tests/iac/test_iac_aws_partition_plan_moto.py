@@ -55,7 +55,7 @@ def moto_endpoint() -> Iterator[str]:
 
 @pytest.fixture(scope="module")
 def tofu_env(tmp_path_factory: pytest.TempPathFactory) -> Dict[str, str]:
-    return _tofu_moto.isolated_env(tmp_path_factory.mktemp("tofu-plugin-cache"))
+    return _tofu_moto.moto_tofu_env(tmp_path_factory.mktemp("tofu-plugin-cache"))
 
 
 def _contract(partition_by: Optional[List[str]], *, regions: str = "eu | us") -> Dict[str, Any]:

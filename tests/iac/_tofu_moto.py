@@ -4,7 +4,7 @@
 """Real ``tofu`` against an in-process moto server, for the creds-free Stage 1 lanes.
 
 :func:`moto_endpoint` starts a ``ThreadedMotoServer`` (reset first: moto's records
-are process-wide), :func:`isolated_env` drops every ``AWS_*`` variable so nothing
+are process-wide), :func:`moto_tofu_env` drops every ``AWS_*`` variable so nothing
 reaches a real account, and :func:`tofu` / :func:`init` run the binary, ``init``
 retrying the plugin-cache lock pytest-xdist workers contend for.
 """
@@ -47,7 +47,7 @@ def moto_endpoint() -> Iterator[str]:
         server.stop()
 
 
-def isolated_env(plugin_cache: Path) -> Dict[str, str]:
+def moto_tofu_env(plugin_cache: Path) -> Dict[str, str]:
     """The tofu environment with no way to reach a real account."""
     env = {k: v for k, v in build_tofu_env().items() if not k.startswith("AWS_")}
     env.setdefault("TF_PLUGIN_CACHE_DIR", str(plugin_cache))

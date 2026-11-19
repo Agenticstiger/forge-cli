@@ -465,9 +465,14 @@ def _unspaced(glue_type: str) -> str:
     return "".join(glue_type.split())
 
 
-def _columns(schema: List[Mapping[str, Any]]) -> List[Dict[str, str]]:
+def _columns(
+    schema: List[Mapping[str, Any]], leave_out: Sequence[str] = ()
+) -> List[Dict[str, str]]:
+    """The Glue ``columns`` of ``schema``, without the partition keys ``leave_out``."""
     columns: List[Dict[str, str]] = []
     for col in schema or []:
+        if col.get("name") in leave_out:
+            continue
         physical_type = _hive_column_type(col)
         entry: Dict[str, str] = {"name": col.get("name"), "type": physical_type}
         if col.get("description"):
@@ -1255,9 +1260,7 @@ def _emit_glue(
         raise refusal
     # Partition keys leave ``columns``: Hive and Glue refuse a column in both.
     table_layout = layout()
-    storage: Dict[str, Any] = {
-        "columns": [c for c in _columns(schema) if c["name"] not in table_layout.names]
-    }
+    storage: Dict[str, Any] = {"columns": _columns(schema, leave_out=table_layout.names)}
     # Athena reads a Glue table through the Hive input format and SerDe the
     # table declares. Without them every query failed with HIVE_UNSUPPORTED_FORMAT
     # "Unable to create input format", measured against real Athena, while the
