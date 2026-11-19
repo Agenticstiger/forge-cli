@@ -42,6 +42,7 @@ import json
 import os
 import sys
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 
@@ -829,13 +830,67 @@ def main(argv: list[str] | None = None) -> int:
         description="Run one forge Spark job config.", allow_abbrev=False
     )
     parser.add_argument("--config", required=True, help="the job.json, a path or s3:// URI")
+    parser.add_argument(
+        "--fluid-job-sha256", help="the sha256 of the job config fluid apply started the run on"
+    )
     # Glue passes its own --JOB_NAME and friends; they are not this runner's.
     args, _ = parser.parse_known_args(argv)
     from pyspark.sql import SparkSession
 
     spark = SparkSession.builder.getOrCreate()
-    run(spark, parse_config(read_text(spark, args.config)))
+    text = checked_text(read_text(spark, args.config), args.fluid_job_sha256, args.config)
+    run(spark, parse_config(text))
     return 0
+
+
+def checked_text(text: str, expected: str | None, where: str) -> str:
+    """The job config's text, refused before the job reads anything unless it is the one
+    ``fluid apply`` started the run on (``--fluid-job-sha256``, which every runtime passes;
+    :func:`config_digest`): a config another apply put there since would run under this
+    run's hash."""
+    if expected is None:
+        return text
+    try:
+        found = config_digest(text)
+    except ValueError:
+        raise JobConfigError(f"the job config at {where} is not a JSON object") from None
+    if found != expected.lower():
+        raise JobConfigError(
+            f"the job config at {where} is not the one fluid apply started this run on (its "
+            f"digest is {found}; the run's is {expected}); nothing was read. Run fluid apply "
+            "again: it starts a run on the config it uploads"
+        )
+    return text
+
+
+def config_digest(text: str) -> str:
+    """The sha256 a run's job config is started with (``--fluid-job-sha256``) and checked
+    by: its JSON in one canonical form (keys sorted, strings in NFC, as OpenTofu writes
+    them), the MSK brokers OpenTofu fills in for an ``mskClusterArn`` source left out, so a
+    broker list MSK changes does not stop a stream's retries. The same function is in
+    ``fluid_build/build_runners/spark/_desired.py``.
+
+    Raises:
+        ValueError: the text is not a JSON object.
+    """
+    config = _nfc(json.loads(text))
+    if not isinstance(config, dict):
+        raise ValueError("the job config is not a JSON object")
+    source = config.get("source")
+    if isinstance(source, dict) and source.get("mskClusterArn"):
+        source["bootstrapServers"] = None
+    canonical = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _nfc(value):
+    if isinstance(value, str):
+        return unicodedata.normalize("NFC", value)
+    if isinstance(value, list):
+        return [_nfc(v) for v in value]
+    if isinstance(value, dict):
+        return {_nfc(k): _nfc(v) for k, v in value.items()}
+    return value
 
 
 if __name__ == "__main__":
