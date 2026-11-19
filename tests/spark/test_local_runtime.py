@@ -118,8 +118,36 @@ def test_a_local_build_the_runner_cannot_run_is_refused(contract, change, says):
 def test_a_local_stream_with_its_own_checkpoint_needs_no_bucket(contract):
     contract = local(contract)
     contract["exposes"][0]["binding"]["location"].pop("bucket")
-    contract["builds"][0]["properties"]["stream"]["checkpoint"] = "s3://lab-state/c/orders/"
-    assert config_of(contract)["checkpoint"] == "s3://lab-state/c/orders/"
+    declared = "s3://lab-state/_checkpoints/commerce.orders-stream/orders/"
+    contract["builds"][0]["properties"]["stream"]["checkpoint"] = declared
+    assert config_of(contract)["checkpoint"] == declared
+
+
+@pytest.mark.parametrize(
+    ("declared", "bucket"),
+    [
+        ("s3://lab-state/c/orders/", None),
+        ("s3://lab-state/_checkpoints/other.product/orders/", None),
+        ("s3://lab-state/_checkpoints/commerce.orders-stream/../../x/", None),
+        ("s3://lab-state/_checkpoints/commerce.orders-stream//x/", None),
+        ("s3://other/_checkpoints/commerce.orders-stream/orders/", "lake"),
+        ("s3://lake/_checkpoints/commerce.orders-streamx/a/", "lake"),
+    ],
+)
+def test_a_local_checkpoint_stays_under_the_product_s_checkpoints(contract, declared, bucket):
+    contract = local(contract)
+    if bucket is None:
+        contract["exposes"][0]["binding"]["location"].pop("bucket")
+    contract["builds"][0]["properties"]["stream"]["checkpoint"] = declared
+    with pytest.raises(ValueError, match="under the product's checkpoints"):
+        config_of(contract)
+
+
+def test_a_local_checkpoint_under_the_product_s_prefix_in_its_bucket_is_kept(contract):
+    contract = local(contract)
+    declared = "s3://lake/_checkpoints/commerce.orders-stream/orders-v2/"
+    contract["builds"][0]["properties"]["stream"]["checkpoint"] = declared
+    assert config_of(contract)["checkpoint"] == declared
 
 
 def test_an_aws_runtime_still_refuses_a_rest_catalog(contract):

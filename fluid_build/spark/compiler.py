@@ -671,6 +671,30 @@ def _checkpoint(declared: Any, bucket: Optional[str], product: str, bid: str, wh
     return declared.rstrip("/") + "/"
 
 
+def _check_local_checkpoint(
+    checkpoint: str, bucket: Optional[str], product: str, where: str
+) -> None:
+    """A local stream's declared checkpoint is the product's: under
+    ``_checkpoints/<product>/``, in the output's bucket when it names one, as the IaC
+    scopes the role forge creates on AWS (``iac/providers/aws_ingest._s3_grants``). The
+    run writes it with the operator's S3 credentials, so a checkpoint elsewhere would be
+    written wherever the contract pointed it."""
+    ck_bucket, _, prefix = checkpoint[len("s3://") :].partition("/")
+    home = f"_checkpoints/{product}/"
+    segments = prefix.rstrip("/").split("/")
+    if (
+        (bucket is not None and ck_bucket != bucket)
+        or not prefix.startswith(home)
+        or any(part in ("", ".", "..") for part in segments)
+    ):
+        shown = bucket or ck_bucket
+        raise ValueError(
+            f"{where}.checkpoint: a local stream keeps its checkpoint under the product's "
+            f"checkpoints, s3://{shown}/{home}; leave it out for "
+            f"s3://{shown}/{home}<build>/, or put it under that prefix"
+        )
+
+
 def _check_catalog(local: bool, binding: Mapping[str, Any], family: str, where: str) -> None:
     """Refuse an output the runtime cannot write: runtime local writes a table in an Iceberg
     REST catalog on platform local, an AWS runtime a Glue-catalog table."""
@@ -870,6 +894,8 @@ def compile_job_config(
             "watermark": _watermark(stream_spec.get("watermark"), stream, swhere),
             "checkpoint": _checkpoint(stream_spec.get("checkpoint"), bucket, product, bid, swhere),
         }
+        if local and stream_spec.get("checkpoint") is not None:
+            _check_local_checkpoint(streaming["checkpoint"], bucket, product, swhere)
         if dead is not None:
             dead_letters = _dead_letter_block(
                 dead, database, table, streaming["checkpoint"], local, swhere
