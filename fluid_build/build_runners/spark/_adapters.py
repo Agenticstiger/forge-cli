@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from fluid_build.build_runners.spark._desired import RESTART_FLAG, DesiredRun
+from fluid_build.spark import names as _names
 
 PENDING, RUNNING, CANCELLING = "PENDING", "RUNNING", "CANCELLING"
 SUCCEEDED, FAILED, CANCELLED = "SUCCEEDED", "FAILED", "CANCELLED"
@@ -56,8 +57,9 @@ CALLER_ACTIONS: Dict[str, tuple] = {
         "elasticmapreduce:ListSteps",
         "elasticmapreduce:DescribeStep",
         "elasticmapreduce:CancelSteps",
-        # The cluster's state (a stream does not restart on an ended cluster) and its Spot
-        # posture, warned at plan and apply (_posture.py).
+        # The cluster's state (a stream does not restart on an ended cluster), its Spot
+        # posture, warned at plan and apply (_posture.py), and the role its steps run as,
+        # checked before a step starts (EmrEc2.start).
         "elasticmapreduce:DescribeCluster",
         "elasticmapreduce:ListInstanceFleets",
         "elasticmapreduce:ListInstanceGroups",
@@ -80,6 +82,9 @@ SERVICE_RETRIES: Dict[str, str] = {
     "emr-serverless": "EMR Serverless retries a failed stream (retryPolicy.maxFailedAttemptsPerHour)",
     "emr-eks": "EMR on EKS retries a failed driver (retryPolicyConfiguration.maxAttempts)",
 }
+#: What starting an EMR on EC2 step also reads: the cluster's instance-profile role and the
+#: policies attached to it (:meth:`EmrEc2.start`).
+EC2_ROLE_READS = ("iam:GetInstanceProfile", "iam:ListAttachedRolePolicies")
 
 #: ``(service, region) -> boto3 client``
 ClientFactory = Callable[[str, str], Any]
@@ -510,6 +515,10 @@ class EmrEc2(Adapter):
     runtime, service = "emr-ec2", "emr"
     LOOKBACK_PAGES = 10
 
+    def __init__(self, run: DesiredRun, clients: ClientFactory) -> None:
+        super().__init__(run, clients)
+        self._clients = clients
+
     @property
     def cluster(self) -> str:
         return self.run.target["clusterId"]
@@ -567,14 +576,28 @@ class EmrEc2(Adapter):
     def get(self, run_id: str) -> RunInfo:
         return self._info(self.client.describe_step(ClusterId=self.cluster, StepId=run_id)["Step"])
 
+    #: The cluster as DescribeCluster returned it for the next start (``(None,)`` when it
+    #: could not be read): the ended-cluster check and the role check share one read.
+    _cluster_read: Optional[tuple] = None
+
+    def _described(self) -> Optional[Mapping[str, Any]]:
+        """The cluster, read once for the next start; None when this identity cannot."""
+        if self._cluster_read is None:
+            try:
+                found = self.client.describe_cluster(ClusterId=self.cluster)["Cluster"]
+            except Exception:  # noqa: BLE001 - unreadable: the start reports what EMR says
+                found = None
+            self._cluster_read = (found,)
+        cluster: Optional[Mapping[str, Any]] = self._cluster_read[0]
+        return cluster
+
     def check_target(self) -> None:
         """Refuse a cluster that takes no new step: AddJobFlowSteps accepts only a cluster
         that is STARTING, BOOTSTRAPPING, RUNNING or WAITING, so a stream whose cluster ended
         (terminated, or with errors: its primary node lost) cannot start there again. A
         cluster this identity cannot read is left to AddJobFlowSteps to report."""
-        try:
-            cluster = self.client.describe_cluster(ClusterId=self.cluster)["Cluster"]
-        except Exception:  # noqa: BLE001 - unreadable: the start reports what EMR says
+        cluster = self._described()
+        if cluster is None:
             return
         status = cluster.get("Status") or {}
         state = str(status.get("State") or "")
@@ -589,8 +612,55 @@ class EmrEc2(Adapter):
             "resumes from its checkpoint"
         )
 
+    def _role_policies(self) -> Optional[Dict[str, List[str]]]:
+        """The roles the cluster's instance profile holds, each with the names of the
+        policies attached to it; None when this identity cannot read them."""
+        cluster = self._described()
+        if cluster is None:
+            return None
+        try:
+            profile = str((cluster.get("Ec2InstanceAttributes") or {}).get("IamInstanceProfile"))
+            iam = self._clients("iam", self.run.region)
+            found = iam.get_instance_profile(InstanceProfileName=profile.rsplit("/", 1)[-1])
+            roles: Dict[str, List[str]] = {}
+            for role in found["InstanceProfile"].get("Roles") or []:
+                pages = iam.get_paginator("list_attached_role_policies")
+                roles[role["RoleName"]] = [
+                    p["PolicyName"]
+                    for page in pages.paginate(RoleName=role["RoleName"])
+                    for p in page.get("AttachedPolicies") or []
+                ]
+            return roles
+        except Exception:  # noqa: BLE001 - unreadable: the step starts as it always did
+            return None
+
+    def _refuse_unless_attached(self) -> None:
+        """A step runs as the cluster's instance-profile role, which the cluster's owner
+        holds: the build's least-privilege policy, which ``fluid apply`` creates, must be
+        attached to it before a step can read and write what the build does. A step started
+        without it fails at once, and each such failure would spend a stream's restart
+        budget, so the start is refused until it is attached. A build that names its own
+        ``executionRoleArn`` has no forge policy to check."""
+        policy = _names.execution_role_name(self.run.product, self.run.build)
+        if not self.run.role_arn.endswith(f":role/{policy}"):
+            return
+        roles = self._role_policies()
+        if roles is None or any(policy in names for names in roles.values()):
+            return
+        role = next(iter(roles), "<the instance-profile role>")
+        arn = self.run.role_arn.replace(":role/", ":policy/")
+        raise SparkRunError(
+            f"not started: policy {policy} is not attached to {role}, the role its steps run "
+            f"as on {self.cluster}. Attach it, then apply again: aws iam attach-role-policy "
+            f"--role-name {role} --policy-arn {arn}"
+        )
+
     def start(self, token: str, restart_of: Optional[str] = None) -> str:
         r = self.run
+        try:
+            self._refuse_unless_attached()
+        finally:
+            self._cluster_read = None  # a later start reads the cluster again
         args = [
             "spark-submit",
             # Client mode: the driver is the step's own process, so cancelling the step

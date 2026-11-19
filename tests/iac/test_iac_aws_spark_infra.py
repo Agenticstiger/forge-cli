@@ -1191,10 +1191,18 @@ def test_the_schedulers_policy_names_each_action_once_per_runtime():
     ]  # fmt: skip
     doc = aws_identity.caller_document(runs, account="123456789012", region="eu-west-1")
     sids = [s["sid"] for s in doc["statement"]]
-    assert sids == ["RunEmrServerless", "PassRoleEmrServerless", "RunEmrEc2", "Artifacts"]
-    serverless = doc["statement"][0]["resources"]
+    assert sids == [
+        "RunEmrServerless",
+        "PassRoleEmrServerless",
+        "RunEmrEc2",
+        "StepRoleEmrEc2",
+        "Artifacts",
+    ]
+    by_sid = {s["sid"]: s for s in doc["statement"]}
+    serverless = by_sid["RunEmrServerless"]["resources"]
     assert len(serverless) == 4  # two applications, each named once with its job runs
-    assert len(doc["statement"][1]["resources"]) == 8 and len(doc["statement"][3]["resources"]) == 9
+    assert len(by_sid["PassRoleEmrServerless"]["resources"]) == 8
+    assert len(by_sid["Artifacts"]["resources"]) == 9
     assert len(json.dumps(doc, separators=(",", ":"))) < 6144
 
 
@@ -1255,3 +1263,19 @@ def test_a_bucketless_output_s_directories_keep_the_account_expression(contract)
     assert directory["resources"][0] == (
         f"arn:aws:s3:::{account_bucket}/commerce.orders-stream/order_lines"
     )
+
+
+def test_the_scheduler_may_read_which_role_an_emr_on_ec2_step_runs_as(contract):
+    """A start checks that the build's policy is on the cluster's instance-profile role."""
+    contract["builds"][0]["properties"]["stream"]["trigger"] = {"availableNow": True}
+    _, data = emit(_runtime(contract, "emr-ec2"))
+    document = data["aws_iam_policy_document"]["commerce_orders_stream_spark_caller"]
+    run = next(s for s in document["statement"] if s["sid"].startswith("Run"))
+    assert "elasticmapreduce:DescribeCluster" in run["actions"]
+    role = next(s for s in document["statement"] if s["sid"].startswith("StepRole"))
+    assert role["actions"] == ["iam:GetInstanceProfile", "iam:ListAttachedRolePolicies"]
+    account = "${data.aws_caller_identity.fluid_lf_caller.account_id}"
+    assert role["resources"] == [
+        f"arn:aws:iam::{account}:instance-profile/*",
+        f"arn:aws:iam::{account}:role/*",
+    ]

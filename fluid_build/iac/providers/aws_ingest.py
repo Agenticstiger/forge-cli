@@ -950,12 +950,16 @@ def _emit_dead_letter_table(
     emitted: Dict[str, Dict[str, Any]] = {}
     _aws._emit_glue(
         emitted,
-        {**loc, "table": dead_table, "path": dead_prefix},
-        "iceberg",
         [dict(column) for column in SCHEMA],
         b.ctx.cid,
         tags,
-        binding=binding,
+        # The output's binding, at the dead letters' own table and prefix; unpartitioned
+        # (the default layout), whatever the output's partitionBy says.
+        binding={
+            **binding,
+            "format": "iceberg",
+            "location": {**loc, "table": dead_table, "path": dead_prefix},
+        },
         contract=contract,
         placement=placement,
         labels=labels,
