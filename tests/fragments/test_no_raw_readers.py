@@ -446,6 +446,13 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
     ),
     **_register(
         ACCEPTED,
+        "fluid ship locks its stage journal's target by the raw root's id before stage 1 "
+        "bundles it; when an overlay gives the bundle another id, ship holds that id's "
+        "target too and keeps the journal there",
+        *_site("cli/ship.py", "_contract_id"),
+    ),
+    **_register(
+        ACCEPTED,
         "`fluid contract digest` hashes the raw root file (SG-24)",
         *_site("cli/contract.py", "_run_digest"),
     ),

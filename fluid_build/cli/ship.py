@@ -40,6 +40,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Sequence, Set, Tupl
 
 from ..observability.tracing import traced_stage
 from . import _ci_output
+from . import _ship_journal as journal
 from . import _ship_release as release
 from . import _ship_report as report
 from . import _ship_stages as st
@@ -78,7 +79,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "GENERATE_EMIT, DIFF_EXIT_ON_DRIFT, DIFF_LAST_APPLIED, PLAN_HTML, POLICY_APPLY_MODE, "
             "and RUN_STAGE_<N>_<NAME>: false switches a stage off, even one --stage names "
             "(a run with nothing left says so and exits 0); true switches on 10 or 11 when "
-            "--stage is not given."
+            "--stage is not given.\n\n"
+            "Stage journal (--journal-dir, or with --release-dir): a stage that changes the "
+            "target is refused after an attempt with no known outcome until "
+            "--acknowledge-inspected names it."
             "\n\n"
             "Examples:\n"
             "  fluid ship --explain                      # show the plan, run nothing\n"
@@ -126,7 +130,7 @@ def _add_run_options(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--skip-bundle",
         action="store_true",
-        help="Ignored (kept for old callers): ship always bundles, so no stage runs a stale bundle.",
+        help="Ignored: ship always bundles, so no stage runs a stale bundle.",
     )
     p.add_argument(
         "--skip-plan",
@@ -147,8 +151,8 @@ def _add_apply_options(g: argparse._ArgumentGroup) -> None:
         "--build-id",
         default=None,
         help=(
-            "Build id for amend-and-build / replace-and-build (default: $APPLY_BUILD_ID, else "
-            "the contract's only build). An empty value means no build id."
+            "Build id of the -and-build modes (default: $APPLY_BUILD_ID, else the contract's "
+            "only build; empty: none)."
         ),
     )
     g.add_argument(
@@ -170,7 +174,7 @@ def _add_artifact_options(g: argparse._ArgumentGroup) -> None:
         "--emit",
         default=None,
         metavar="LIST",
-        help="Stage 3 --emit, comma-separated (default: $GENERATE_EMIT, else every emitter).",
+        help="Stage 3 --emit, comma-separated (default: $GENERATE_EMIT, all).",
     )
     g.add_argument(
         "--require-artifacts",
@@ -200,16 +204,13 @@ def _add_stage_options(g: argparse._ArgumentGroup) -> None:
         "--last-applied",
         default=None,
         metavar="PLAN",
-        help=(
-            "Stage 5 compares with the plan the last apply ran, so a change the contract makes "
-            "is pending, not drift (default: $DIFF_LAST_APPLIED)."
-        ),
+        help="Stage 5 diffs against the last applied plan ($DIFF_LAST_APPLIED).",
     )
     g.add_argument(
         "--plan-html",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Stage 6 also writes runtime/plan.html (default: off unless $PLAN_HTML is true).",
+        help="Stage 6 also writes runtime/plan.html (default: $PLAN_HTML, off).",
     )
     g.add_argument(
         "--policy-mode",
@@ -241,7 +242,7 @@ def _add_publish_options(g: argparse._ArgumentGroup) -> None:
         action="append",
         default=None,
         metavar="CATALOG",
-        help="Catalog to publish to; repeatable (default: $PUBLISH_TARGETS, datamesh-manager).",
+        help="Catalog; repeatable (default: $PUBLISH_TARGETS, datamesh-manager).",
     )
     g.add_argument(
         "--schedule-sync",
@@ -294,16 +295,26 @@ def _add_output_options(g: argparse._ArgumentGroup) -> None:
     g.add_argument(
         "--report-dir",
         default=None,
-        help=(
-            "Where ship-report.json and ship-junit.xml go (default: runtime/ beside the "
-            "contract; relative to the current directory)."
-        ),
+        help="Where ship-report.json and ship-junit.xml go (default: runtime/).",
     )
     g.add_argument(
         "--release-dir",
         default=None,
         metavar="DIR",
-        help="Publish a release in DIR (new) when all stages pass; needs stages 1-4.",
+        help="Publish a release in DIR (new) when all stages pass (needs 1-4).",
+    )
+    g.add_argument(
+        "--journal-dir",
+        default=None,
+        metavar="DIR",
+        help="Keep a stage journal in DIR (see below).",
+    )
+    g.add_argument(
+        "--acknowledge-inspected",
+        action="append",
+        default=None,
+        metavar="STAGE",
+        help="Rerun STAGE whose unknown outcome you inspected.",
     )
 
 
@@ -326,12 +337,45 @@ def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
     report_dir = os.path.abspath(given) if given else DEFAULT_REPORT_DIR
     wanted = getattr(args, "release_dir", None)
     release_dir = Path(os.path.abspath(wanted)) if wanted else None
+    journal_flag = getattr(args, "journal_dir", None)
+    journal_dir = Path(os.path.abspath(journal_flag)) if journal_flag else None
+    acknowledged = _acknowledged(args, journal_dir or release_dir)
     opts, selected, not_selected, project_dir = _prepare(args)
     with _working_directory(project_dir):
+        anchor = None  # an explicit --journal-dir is the operator's, links and all
+        if journal_dir is None and release_dir is not None:
+            # In the checkout: no link below the project is followed.
+            anchor = Path(os.path.abspath(os.curdir))
+            journal_dir = anchor / journal.DEFAULT_JOURNAL_DIR
+        keep = None if journal_dir is None else _Journaling(journal_dir, acknowledged, anchor)
         if args.explain:
-            return _explain(opts, selected, not_selected, release_dir)
+            return _explain(opts, selected, not_selected, release_dir, keep)
         _check_run(selected, not_selected, opts, release_dir)
-        return _run_selected(args, logger, opts, selected, not_selected, report_dir, release_dir)
+        return _run_selected(
+            args, logger, opts, selected, not_selected, report_dir, release_dir, keep
+        )
+
+
+def _acknowledged(args: argparse.Namespace, journal_on: Optional[Path]) -> Set[int]:
+    """The stages ``--acknowledge-inspected`` names (exit 2 for a stage that
+    changes nothing, or without a journal to record it in)."""
+    given = getattr(args, "acknowledge_inspected", None) or []
+    stages = {st.resolve_stage(t) for v in given for t in str(v).split(",") if t.strip()}
+    if not stages:
+        return set()
+    if journal_on is None:
+        raise st.ShipUsageError(
+            "--acknowledge-inspected needs a stage journal to record it in "
+            "(--journal-dir or --release-dir)"
+        )
+    inert = sorted(stages - journal.TARGET_STAGES)
+    if inert:
+        names = ", ".join(f"{n} {st.STAGE_NAMES[n]}" for n in inert)
+        raise st.ShipUsageError(
+            f"--acknowledge-inspected: {names} changes nothing in the target, so no outcome "
+            "of it needs inspecting (apply, policy-apply, publish and schedule-sync do)"
+        )
+    return stages
 
 
 def _check_run(
@@ -371,6 +415,26 @@ def _run_selected(
     not_selected: Dict[int, str],
     report_dir: str,
     release_dir: Optional[Path] = None,
+    keep: Optional["_Journaling"] = None,
+) -> int:
+    try:
+        if keep is not None:  # before any stage: one run at a time holds the target
+            keep.hold(opts)
+        return _run_held(args, logger, opts, selected, not_selected, report_dir, release_dir, keep)
+    finally:
+        if keep is not None:
+            keep.close()
+
+
+def _run_held(
+    args: argparse.Namespace,
+    logger: logging.Logger,
+    opts: st.ShipOptions,
+    selected: List[int],
+    not_selected: Dict[int, str],
+    report_dir: str,
+    release_dir: Optional[Path],
+    keep: Optional["_Journaling"],
 ) -> int:
     # A run that bundles is a new run; one that starts later picks up where the
     # last run in this directory stopped (one CI step per stage).
@@ -398,6 +462,7 @@ def _run_selected(
         report_dir=report_dir,
         release_dir=release_dir,
         staging=staging,
+        keep=keep,
     )
     records = {num: _unselected_record(num, not_selected.get(num)) for num in st.STAGE_NUMBERS}
     rows: List[Tuple[int, str, str, float]] = []
@@ -446,6 +511,181 @@ class _Context:
     report_dir: str
     release_dir: Optional[Path] = None  # --release-dir: published when every stage passed
     staging: Optional[Path] = None  # its staging directory, beside it
+    keep: Optional["_Journaling"] = None  # the stage journal, when one is kept
+
+
+class _Journaling:
+    """The stage journal of one run: opened once the bundle names the release,
+    and which stage this run has opened an attempt of."""
+
+    def __init__(
+        self, directory: Path, acknowledged: Set[int], anchor: Optional[Path] = None
+    ) -> None:
+        self.directory = directory
+        self.acknowledged = acknowledged
+        self.anchor = anchor
+        self.journal: Optional[journal.Journal] = None
+        self.held: Optional[journal.Hold] = None  # the contract's target, before stage 1
+        self.bundled: Optional[journal.Hold] = None  # another the bundle names (an overlay id)
+        self.open_attempt: Optional[int] = None  # the stage started and not yet finished
+        self.before: journal.Snapshot = {}  # its report files before it ran
+
+    def hold(self, opts: st.ShipOptions) -> None:
+        """Hold the contract's target before stage 1 (exit 2 when another run
+        holds it or the journal directory cannot be created)."""
+        try:
+            self.held = journal.hold_target(
+                self.directory,
+                product_id=_contract_id(opts.contract),
+                environment=opts.env,
+                anchor=self.anchor,
+            )
+        except journal.JournalError as exc:
+            raise st.ShipUsageError(f"stage journal: {exc}") from None
+
+    def ensure_open(self, ctx: "_Context") -> journal.Journal:
+        """The journal of the release the bundle names (``JournalError`` when
+        there is no readable bundle or the journal cannot be written). The
+        acknowledgements this run was given are recorded first."""
+        if self.journal is not None:
+            return self.journal
+        root = Path.cwd()
+        digest = journal.bundle_digest(root)
+        if digest is None:
+            raise journal.JournalError(
+                f"no readable {st.BUNDLE_PATH} to name the release in the stage journal"
+            )
+        try:
+            product = st.bundled_contract(root).get("id")
+        except Exception as exc:  # noqa: BLE001 - an archive the checkout made
+            raise journal.JournalError(f"cannot read {st.BUNDLE_PATH}: {exc}") from None
+        jr = journal.Journal.open_in(
+            self._hold_for(product if isinstance(product, str) and product else "product", ctx),
+            product_id=product if isinstance(product, str) and product else "product",
+            digest=digest,
+            run_id=ctx.run_id,
+        )
+        try:  # an acknowledgement is recorded before any stage it waives runs
+            for num in sorted(self.acknowledged):
+                for where, number in jr.acknowledge(num, ctx.run_id):
+                    ctx.ci.info(
+                        f"stage journal: recorded that attempt {number} of stage {num} "
+                        f"{st.STAGE_NAMES[num]} in {where} was inspected (--acknowledge-inspected)"
+                    )
+        except BaseException:
+            jr.close()
+            raise
+        self.journal = jr
+        return jr
+
+    def _hold_for(self, product_id: str, ctx: "_Context") -> journal.Hold:
+        """The held target of ``product_id``: the contract's, or, when the
+        bundle names another product (an env overlay sets ``id``), that one,
+        held now as well."""
+        if self.held is None:
+            raise journal.JournalError("the stage journal's target is not held")
+        if journal.target_stem(product_id) == self.held.product_stem:
+            return self.held
+        if self.bundled is None or self.bundled.product_stem != journal.target_stem(product_id):
+            if self.bundled is not None:
+                self.bundled.close()
+                self.bundled = None
+            self.bundled = journal.hold_target(
+                self.directory, product_id=product_id, environment=ctx.opts.env, anchor=self.anchor
+            )
+        return self.bundled
+
+    def start(self, num: int, argv: List[str], ctx: "_Context") -> Optional[str]:
+        """Open stage ``num``'s attempt, or say why it must not run. A stage
+        that changes nothing in the target runs even when the journal cannot be
+        opened (no bundle yet names the release), unrecorded."""
+        try:
+            jr = self.ensure_open(ctx)
+        except journal.JournalError as exc:
+            if journal.side_effects(num, argv):
+                return f"stage journal: {exc}"
+            ctx.ci.info(
+                f"stage {num} {st.STAGE_NAMES[num]}: stage journal: {exc}; this stage changes "
+                "nothing in the target, so it runs without a journal entry"
+            )
+            return None
+        refused = jr.refusal(num, argv, Path.cwd(), self.acknowledged)
+        if refused:
+            return f"stage journal: {refused}"
+        try:
+            jr.started(num, argv, ctx.run_id, Path.cwd(), shown=_safe_argv(argv))
+        except journal.JournalError as exc:
+            if journal.side_effects(num, argv):
+                return f"stage journal: {exc}"
+            ctx.ci.info(
+                f"stage {num} {st.STAGE_NAMES[num]}: stage journal: {exc}; this stage changes "
+                "nothing in the target, so it runs without a journal entry"
+            )
+            return None
+        self.open_attempt = num
+        return None
+
+    def finish(self, num: int, rec: report.StageRecord, ctx: "_Context") -> None:
+        """Close the attempt this run opened, with its receipts. A journal that
+        cannot be written leaves the attempt without an outcome, which the next
+        run treats as unknown."""
+        if self.journal is None or self.open_attempt != num:
+            return
+        self.open_attempt = None
+        try:
+            self.journal.finished(
+                num,
+                status=rec.status,
+                exit_code=rec.exit_code,
+                reason=rec.reason,
+                receipts=journal.receipts(num, Path.cwd(), self.before),
+            )
+        except journal.JournalError as exc:
+            ctx.ci.info(f"stage {num} {rec.name}: {exc}; its outcome stays unknown there")
+
+    def block(self) -> Optional[Dict[str, object]]:
+        """The report's and the release's ``journal`` entry. No absolute path:
+        a published release would show the runner's layout and user name. The
+        directory is the project-relative default, a project-relative
+        ``--journal-dir`` or the label ``--journal-dir``; the file is named
+        relative to it."""
+        if self.anchor is not None:
+            where = journal.DEFAULT_JOURNAL_DIR
+        else:
+            try:
+                where = self.directory.relative_to(Path(os.path.abspath(os.curdir))).as_posix()
+            except ValueError:
+                where = "--journal-dir"
+        if self.journal is None:
+            return {"dir": where, "path": None, "digest": None}
+        try:
+            name = self.journal.path.relative_to(self.directory).as_posix()
+        except ValueError:  # pragma: no cover - the file is always under the directory
+            name = self.journal.path.name
+        return {"dir": where, "path": name, "digest": self.journal.digest()}
+
+    def close(self) -> None:
+        if self.journal is not None:
+            self.journal.close()
+        for name in ("bundled", "held"):
+            hold = getattr(self, name)
+            if hold is not None:
+                setattr(self, name, None)
+                hold.close()
+
+
+def _contract_id(contract: str) -> str:
+    """The contract's ``id`` (the target is held by it before stage 1 bundles
+    it), or ``product`` when it has none."""
+    import yaml
+
+    try:
+        with open(contract, "rb") as fh:
+            body = yaml.safe_load(fh.read(4 << 20))
+    except Exception:  # noqa: BLE001 - the checkout's text; stage 1 reports what is wrong
+        return "product"
+    raw = body.get("id") if isinstance(body, dict) else None
+    return raw if isinstance(raw, str) and raw else "product"  # never str() of a tree
 
 
 def _prepare(
@@ -508,7 +748,7 @@ def _prepare(
 
 def _run_one(num: int, rec: report.StageRecord, ctx: _Context) -> None:
     """Run stage ``num`` into ``rec``: passed, failed (with its exit code), skipped
-    (by policy, or unsupported) or unknown (interrupted)."""
+    (by policy, or unsupported) or unknown (interrupted, or killed by a signal)."""
     started = time.monotonic()
     rec.started_at = report.utc_now()
     ctx.ci.stage_start(num, rec.name)
@@ -525,11 +765,22 @@ def _run_one(num: int, rec: report.StageRecord, ctx: _Context) -> None:
             rec.status = report.PASSED if rc == 0 and not unmet else report.FAILED
             if unmet:
                 rec.reason = unmet
-            if rec.reason == "interrupted":  # what the stage had done by then is not known
-                rec.status = report.UNKNOWN
+            if rec.reason == "interrupted" or (rec.reason or "").startswith(_KILLED):
+                rec.status = report.UNKNOWN  # what the stage had done by then is not known
+        if ctx.keep is not None:
+            with ctx.ci.fenced():
+                _journal_stage(num, rec, ctx, ctx.keep)
     finally:  # closed even when ship itself fails, so its error is not folded away
         rec.finished_at = report.utc_now()
         ctx.ci.stage_end(num, rec.name)
+
+
+def _journal_stage(num: int, rec: report.StageRecord, ctx: _Context, keep: "_Journaling") -> None:
+    """Close stage ``num``'s attempt in the journal. Stage 1 is recorded once it
+    has passed: its bundle is what names the release."""
+    if num == 1 and rec.status == report.PASSED and rec.argv is not None:
+        keep.start(1, rec.argv, ctx)  # bundle changes nothing: unrecorded at worst
+    keep.finish(num, rec, ctx)
 
 
 def _attempt(num: int, rec: report.StageRecord, ctx: _Context) -> Optional[int]:
@@ -551,6 +802,12 @@ def _attempt(num: int, rec: report.StageRecord, ctx: _Context) -> Optional[int]:
     if missing:
         ctx.ci.info(missing)
         return 2
+    if ctx.keep is not None and num != 1:
+        refused = ctx.keep.start(num, action.argv, ctx)
+        if refused:
+            rec.reason = refused
+            ctx.ci.info(f"stage {num} {rec.name}: {refused}")
+            return 2
     if num in (1, 10):
         try:
             Path("runtime").mkdir(parents=True, exist_ok=True)
@@ -565,14 +822,33 @@ def _attempt(num: int, rec: report.StageRecord, ctx: _Context) -> Optional[int]:
             rec.reason = f"cannot remove the earlier {st.ARTIFACTS_MANIFEST}: {exc.strerror or exc}"
             ctx.ci.info(f"stage {num} {rec.name}: {rec.reason}")
             return 1
+    if ctx.keep is not None:
+        ctx.keep.before = journal.snapshot(num, Path.cwd())
+    killed: List[int] = []
     try:
-        return _run_stage(
-            ctx.fluid_bin, action.argv[0], action.argv[1:], ctx.logger, env=ctx.child_env, ci=ctx.ci
+        rc = _run_stage(
+            ctx.fluid_bin,
+            action.argv[0],
+            action.argv[1:],
+            ctx.logger,
+            env=ctx.child_env,
+            ci=ctx.ci,
+            killed=killed,
         )
     except KeyboardInterrupt:
         rec.reason = "interrupted"
         ctx.ci.info(f"stage {num} {rec.name}: interrupted")
         return 130
+    if killed:
+        rec.reason = f"{_KILLED} {killed[0]}"
+    elif 128 < rc < 160:  # the child turned a signal into its exit (fluid apply's 130)
+        rec.reason = f"{_KILLED} {rc - 128} (it exited {rc})"
+    if killed or 128 < rc < 160:
+        ctx.ci.info(f"stage {num} {rec.name}: {rec.reason}, so what it did is not known")
+    return rc
+
+
+_KILLED = "killed by signal"
 
 
 def _unmet_requirements(num: int, rc: Optional[int], ctx: _Context) -> Optional[str]:
@@ -608,15 +884,26 @@ def _report_abort(num: int, rec: report.StageRecord, ctx: _Context) -> None:
     # printed outside the stop-commands fence (the reason is in the report).
     if rec.reason == "interrupted":
         why = f"exit {code}, interrupted"
+    elif (rec.reason or "").startswith(_KILLED):
+        why = f"exit {code}, {_KILLED}"
+    elif (rec.reason or "").startswith("stage journal"):
+        why = f"exit {code}, refused by the stage journal"
     elif rec.exit_code == 0:
         why = "it exited 0, but --require-artifacts was not met"
     else:
         why = f"exit {code}"
+    then = (
+        "Do what the stage journal's reason above says (inspect the target and pass "
+        "--acknowledge-inspected, or plan again), then run again"
+        if (rec.reason or "").startswith("stage journal")
+        else "After the fix, run the same command again"
+    )
     ctx.logger.error(
-        "Ship aborted at stage %d %s (%s). After the fix, run the same command again%s.",
+        "Ship aborted at stage %d %s (%s). %s%s.",
         num,
         rec.name,
         why,
+        then,
         resume,
     )
 
@@ -757,7 +1044,12 @@ def _close_release(
             root=Path.cwd(),
             identity=identity,
             gates=release.gates(ordered),
-            provenance=release.provenance(ordered, run_id=ctx.run_id, report_written_at=written_at),
+            provenance=release.provenance(
+                ordered,
+                run_id=ctx.run_id,
+                report_written_at=written_at,
+                journal=None if ctx.keep is None else ctx.keep.block(),
+            ),
             with_plan=_plan_in_release(ordered),
         )
     except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - any failure publishes nothing
@@ -817,15 +1109,17 @@ def _explain(
     selected: List[int],
     not_selected: Dict[int, str],
     release_dir: Optional[Path] = None,
+    keep: Optional[_Journaling] = None,
 ) -> int:
     ws = st.Workspace()
+    jr = _explain_journal(opts, selected, keep)
     _out(
         f"fluid ship: {len(selected)} stage(s) selected "
         f"(env={opts.env}, mode={opts.mode}, contract={opts.contract})"
     )
     problem = _precondition_problem(selected, opts, not_selected, release_dir)
     for num in st.STAGE_NUMBERS:
-        refused = _explain_stage(num, opts, ws, selected, not_selected)
+        refused = _explain_stage(num, opts, ws, selected, not_selected, jr, keep)
         problem = problem or refused
     if release_dir is not None and not problem:
         _out(
@@ -856,6 +1150,8 @@ def _explain_stage(
     ws: st.Workspace,
     selected: List[int],
     not_selected: Dict[int, str],
+    jr: Optional[journal.Journal] = None,
+    keep: Optional[_Journaling] = None,
 ) -> Optional[str]:
     """Print stage ``num``'s line of the plan; return why a real run would refuse it."""
     head = f"  {num:>2} {st.STAGE_NAMES[num]:<19}"
@@ -874,7 +1170,52 @@ def _explain_stage(
     for note in action.notes:
         _out(f"     {'':<19} note: {note}")
     _assume_outputs(num, action, ws, opts)
+    if jr is not None and keep is not None and action.argv is not None:
+        refused = jr.refusal(
+            num,
+            action.argv,
+            Path.cwd(),
+            keep.acknowledged,
+            replans_first=num == st.APPLY_STAGE and 6 in selected,
+        )
+        if refused:
+            _out(f"     {'':<19} refused by the stage journal: {refused}")
+            return f"stage journal: {refused}"
     return None
+
+
+def _explain_journal(
+    opts: st.ShipOptions, selected: List[int], keep: Optional[_Journaling]
+) -> Optional[journal.Journal]:
+    """Say where the stage journal is and read it, without creating or
+    locking anything. A run that bundles names its release only after stage 1,
+    so the journal read is that of the bundle on disk now."""
+    if keep is None:
+        return None
+    root = Path.cwd()
+    digest = journal.bundle_digest(root)
+    if digest is None:
+        _out(f"stage journal: {keep.directory} (the release is named once stage 1 has bundled)")
+        return None
+    try:
+        product = st.bundled_contract(root).get("id")
+    except ValueError:
+        product = None
+    try:
+        jr = journal.Journal.read(
+            keep.directory,
+            product_id=product if isinstance(product, str) and product else "product",
+            environment=opts.env,
+            digest=digest,
+            anchor=keep.anchor,
+        )
+    except journal.JournalError as exc:
+        _out(f"stage journal: {exc}")
+        return None
+    rebundles = " (stage 1 bundles again first)" if 1 in selected else ""
+    tried = sum(len(v) for v in jr.attempts.values())
+    _out(f"stage journal: {jr.path}, {tried} attempt(s) of this release{rebundles}")
+    return jr
 
 
 def _assume_outputs(
@@ -976,6 +1317,7 @@ def _write_reports(
             contract=opts.contract,
             exit_code=run_code,
             release=release_block,
+            journal=None if ctx.keep is None else ctx.keep.block(),
         )
         report.write_reports(Path(ctx.report_dir), body, merged)
     except (OSError, ValueError) as exc:
@@ -1005,10 +1347,12 @@ def _run_stage(
     logger: logging.Logger,
     env: Optional[Dict[str, str]] = None,
     ci: Optional[_ci_output.CiOutput] = None,
+    killed: Optional[List[int]] = None,
 ) -> int:
     """Subprocess one stage; return its exit code. Stream output through.
 
-    A negative return code (killed by a signal) is reported as 1.
+    A negative return code (killed by a signal) is reported as 1, and the
+    signal is appended to ``killed`` when it is given.
     """
     cmd = fluid_bin + [stage] + argv
     # Sanitise argv before logging: a stage may carry credential-bearing
@@ -1042,6 +1386,8 @@ def _run_stage(
             ci.after_child()
     if interrupts:
         raise KeyboardInterrupt  # the stage has ended; stop the run after it
+    if rc < 0 and killed is not None:
+        killed.append(-rc)
     return 1 if rc < 0 else rc
 
 
