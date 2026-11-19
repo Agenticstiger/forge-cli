@@ -386,6 +386,14 @@ def _invariant_refusal(rule: Any, written: set, where: str) -> Optional[Unsuppor
 _INVARIANT_SEVERITY = {"error": "error", "warning": "warn", "info": "warn"}
 
 
+def _job_test_name(rule_id: str, taken: set) -> str:
+    """``fluid_dq_<id>``, lower case: distinct from ``fluid generate dbt-tests``' generic
+    ``fluid_<id>`` tests, which may sit in the same project (dbt names a test once)."""
+    from ...data_rules._dbt import test_name
+
+    return "fluid_dq_" + test_name(rule_id, taken).lower()[len("fluid_") :]
+
+
 def _invariant_check(rule: Any, name: str) -> InvariantCheck:
     return InvariantCheck(
         name=name,
@@ -413,12 +421,12 @@ def _add_invariant(
 ) -> None:
     """The singular test file for one declared rule, or its refusal."""
     from ...data_rules._compile import _Refused
-    from ...data_rules._dbt import _rendered, test_name
+    from ...data_rules._dbt import _rendered
 
     model = models.get(rule.expose)
     if not model or model == _DEFERRED:
         return
-    name = test_name(rule.id, taken).lower()
+    name = _job_test_name(rule.id, taken)
     try:
         counts, holds = _rendered(rule, "databricks", lambda e: str(models.get(e) or "") or None)
     except (_Refused, ValueError) as why:
@@ -481,11 +489,9 @@ def _invariant_checks(
     contract: Mapping[str, Any], exposures: Sequence[Any], checks: Sequence[Any]
 ) -> List[InvariantCheck]:
     """The declared rules the job tests, named as :func:`_add_invariant` names their files."""
-    from ...data_rules._dbt import test_name
-
     taken = {check.name.casefold() for check in checks}
     return [
-        _invariant_check(rule, test_name(rule.id, taken).lower())
+        _invariant_check(rule, _job_test_name(rule.id, taken))
         for rule in _invariant_rules(contract, exposures)
         if rule.status == "executable" and rule.counts is not None
     ]

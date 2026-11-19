@@ -125,14 +125,17 @@ def unmet(
     rows: Sequence[RuleCoverage], required: Iterable[str], adapters: Mapping[str, str]
 ) -> List[Tuple[RuleCoverage, str, Verdict]]:
     """``(rule, adapter, verdict)`` for each required rule (by id; ``*`` is every rule) that a
-    selected adapter (adapter -> dialect) cannot run. A skipped rule is never unmet."""
+    selected adapter (adapter -> dialect) cannot run. A rule named by its id must also be
+    tested: one declared with no bound (skipped) is unmet too. ``*`` passes over those, which
+    declare values rather than a rule to run."""
     wanted = set(required)
     out: List[Tuple[RuleCoverage, str, Verdict]] = []
     for row in rows:
-        if "*" not in wanted and row.id not in wanted:
+        named = row.id in wanted
+        if "*" not in wanted and not named:
             continue
         for adapter, dialect in adapters.items():
             verdict = row.engines.get(dialect, Verdict(UNSUPPORTED_STATUS, "not compiled"))
-            if verdict.status == UNSUPPORTED_STATUS:
+            if verdict.status == UNSUPPORTED_STATUS or (named and verdict.status == SKIPPED_STATUS):
                 out.append((row, adapter, verdict))
     return out

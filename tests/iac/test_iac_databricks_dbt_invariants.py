@@ -52,23 +52,23 @@ def test_each_declared_rule_is_a_test_file_of_the_job(tmp_path: Path) -> None:
     uploaded = base._uploaded(compiled)
     tests = sorted(p for p in uploaded if p.startswith("tests/fluid_dq/orders/"))
     assert tests == [
-        "tests/fluid_dq/orders/fluid_amount_positive.sql",
-        "tests/fluid_dq/orders/fluid_status_known.sql",
+        "tests/fluid_dq/orders/fluid_dq_amount_positive.sql",
+        "tests/fluid_dq/orders/fluid_dq_status_known.sql",
     ]
-    sql, configs, _ = base._render(uploaded["tests/fluid_dq/orders/fluid_status_known.sql"])
+    sql, configs, _ = base._render(uploaded["tests/fluid_dq/orders/fluid_dq_status_known.sql"])
     assert configs["severity"] == "warn" and configs["tags"] == [dq.TAG]
     assert configs["meta"] == {"fluid_rule_id": "status_known", "fluid_expose_id": "orders"}
     assert "`main`.`sales`.`orders`" in sql  # the model, through ref()
     sqlglot = pytest.importorskip("sqlglot")
     sqlglot.parse_one(sql.split("\n", 2)[-1] if sql.startswith("\n") else sql, read="databricks")
     (job,) = compiled.jobs
-    assert set(job.tests) == {"fluid_amount_positive", "fluid_status_known"}
+    assert set(job.tests) == {"fluid_dq_amount_positive", "fluid_dq_status_known"}
 
 
 def test_the_percent_band_is_exact_in_the_test(tmp_path: Path) -> None:
     base._project(tmp_path)
     uploaded = base._uploaded(base._compile(_contract(), tmp_path))
-    sql, _, _ = base._render(uploaded["tests/fluid_dq/orders/fluid_amount_positive.sql"])
+    sql, _, _ = base._render(uploaded["tests/fluid_dq/orders/fluid_dq_amount_positive.sql"])
     assert "100 * `violating` <= 5 * `covered`" in sql
 
 
@@ -122,8 +122,8 @@ def test_expected_tests_and_the_report_name_the_declared_rules() -> None:
     contract = _contract()
     checks = dq.expected_tests(contract, contract["builds"][0])
     names = [c.name for c in checks]
-    assert names == ["fluid_amount_positive", "fluid_status_known"]
-    logs = "12:00:01  1 of 2 PASS fluid_amount_positive [PASS]\n12:00:02  2 of 2 WARN 3 fluid_status_known [WARN 3]\n"
+    assert names == ["fluid_dq_amount_positive", "fluid_dq_status_known"]
+    logs = "12:00:01  1 of 2 PASS fluid_dq_amount_positive [PASS]\n12:00:02  2 of 2 WARN 3 fluid_dq_status_known [WARN 3]\n"
     lines = dq.report(logs, checks)
     assert lines[0] == "   contract rules as dbt tests: 1 pass, 1 warn"
     assert "status IN ('NEW', 'SHIPPED') holds" in lines[2] and "severity warn" in lines[2]

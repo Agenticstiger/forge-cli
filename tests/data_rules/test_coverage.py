@@ -63,7 +63,10 @@ def test_unmet_lists_required_rules_an_adapter_cannot_run() -> None:
     rows = coverage(_contract())
     missed = unmet(rows, ["bad", "gross_from_net"], {"duckdb": "duckdb"})
     assert [(r.id, a) for r, a, _ in missed] == [("bad", "duckdb")]
-    assert unmet(rows, ["status.placeholders"], {"duckdb": "duckdb"}) == []  # skipped
+    # A rule named by id must be tested; a placeholder declaration with no bound is not.
+    assert [a for _, a, _ in unmet(rows, ["status.placeholders"], {"duckdb": "duckdb"})] == [
+        "duckdb"
+    ]
     assert len(unmet(rows, ["*"], {"duckdb": "duckdb", "athena": "athena"})) == 2
 
 
@@ -151,3 +154,18 @@ def test_the_flags_are_on_the_command() -> None:
     assert args.coverage and args.coverage_out == "c.json"
     assert args.require_rule == ["a", "b"] and args.require_all_rules
     assert args.adapter == ["duckdb"]
+
+
+def test_a_requirement_on_rules_below_the_preview_fails(tmp_path: Path) -> None:
+    contract = _contract()
+    contract["fluidVersion"] = "0.7.6"
+    with pytest.raises(CLIError) as refused:
+        _run(tmp_path, contract, require_all_rules=True)
+    assert refused.value.event == "dbt_tests_rules_need_preview"
+    assert "0.7.7" in refused.value.context["detail"]
+    for expose in contract["exposes"]:
+        expose["contract"].pop("invariants", None)
+        expose.pop("semantics", None)
+        for column in expose["contract"]["schema"]:
+            column.pop("placeholders", None)
+    assert _run(tmp_path, contract, require_all_rules=True) == 0  # nothing declared: met

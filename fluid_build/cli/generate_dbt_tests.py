@@ -116,8 +116,9 @@ def _add_coverage_arguments(p: argparse.ArgumentParser) -> None:
         default=[],
         metavar="ID",
         help=(
-            "A declared rule that must run (repeatable): generation fails, writing nothing, "
-            "when a selected adapter cannot run it."
+            "A declared rule that must run (repeatable): generation fails, writing no tests, "
+            "when a selected adapter cannot run it, or when nothing tests it (a placeholder "
+            "declaration with no bound)."
         ),
     )
     p.add_argument(
@@ -133,7 +134,8 @@ def _add_coverage_arguments(p: argparse.ArgumentParser) -> None:
         help=(
             "A dbt adapter type the required rules must run on (repeatable): duckdb, "
             "snowflake, bigquery, databricks, spark, postgres, athena or trino. Default: the "
-            "adapters of the platforms the contract's exposes bind to."
+            "adapters of the platforms the contract's exposes bind to, or every adapter when "
+            "none of them maps to one."
         ),
     )
 
@@ -237,6 +239,7 @@ def _check_coverage(contract: Any, args: Any, logger: logging.Logger) -> None:
         info(logger, "dbt_tests_coverage_written", out=str(out))
     if not required:
         return
+    _refuse_inert_rules(contract)
     known = {row.id for row in rows}
     unknown = sorted(r for r in required if r != "*" and r not in known)
     if unknown:
@@ -266,6 +269,41 @@ def _check_coverage(contract: Any, args: Any, logger: logging.Logger) -> None:
                     + ". Restate them in FLUID SQL/1 the adapter can run, select another "
                     "--adapter, or drop them from --require-rule."
                 ),
+            },
+        )
+
+
+def _refuse_inert_rules(contract: Any) -> None:
+    """A requirement on a contract that declares rules below 0.7.7, where they do not exist
+    (and run nowhere), fails rather than pass with nothing tested."""
+    from ..data_rules import FIRST_VERSION, _version
+
+    version = _version(contract) if isinstance(contract, dict) else ()
+    if version and version >= FIRST_VERSION:
+        return
+    keys = ("identifierFormat", "placeholders", "sharedAttribute")
+    declared = False
+    for expose in contract.get("exposes") or [] if isinstance(contract, dict) else []:
+        if not isinstance(expose, dict):
+            continue
+        spec = expose.get("contract") if isinstance(expose.get("contract"), dict) else {}
+        columns = [c for c in spec.get("schema") or [] if isinstance(c, dict)]
+        semantics = expose.get("semantics") if isinstance(expose.get("semantics"), dict) else {}
+        links = [r for r in semantics.get("relationships") or [] if isinstance(r, dict)]
+        declared = declared or bool(spec.get("invariants"))
+        declared = declared or any(k in c for c in columns for k in keys)
+        declared = declared or any("sharedColumns" in r for r in links)
+    if declared:
+        shown = contract.get("fluidVersion") or "none"
+        raise CLIError(
+            1,
+            "dbt_tests_rules_need_preview",
+            {
+                "detail": (
+                    f"the contract declares rules about valid data, which exist from "
+                    f"fluidVersion 0.7.7, and it declares {shown}: none of them runs, so no "
+                    "requirement can be met. Declare fluidVersion: 0.7.7."
+                )
             },
         )
 
