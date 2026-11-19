@@ -123,7 +123,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interruption or a failed driver stopped starts again on its checkpoint. It runs every 5
   minutes, or on the build's `execution.orchestration.airflow.dagConfig.schedule`, one run at a
   time, with no catch-up and no Airflow retries: the build's `execution.retries` is the restart
-  budget, and a run fails when the stream drifted from the contract or the budget is spent. The
+  budget, and a run fails when the stream cannot be kept running (it drifted from the contract,
+  nothing is deployed, or the restarts are spent). A run cancelled on purpose stays stopped. The
   task declares no outlets, so a dataset trigger on what only the stream writes is refused, as
   before. A contract whose only builds are such streams now gets this DAG on Airflow instead of
   "No build needs a DAG"; on Prefect or Dagster, and in `fluid scaffold-composer`, it still has

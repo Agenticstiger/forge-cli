@@ -126,9 +126,10 @@ APPLY_MODE = "amend-and-build"
 
 #: What a keepalive DAG passes to ``fluid apply`` after the contract and ``--env``, before
 #: ``--build-id <stream> --yes``. ``--mode reconcile`` runs no ``tofu apply``: it starts that one
-#: stream again on its checkpoint when it stopped, within the restart budget the build's
-#: ``execution.retries`` sets, and exits non-zero when the stream drifted from the contract or
-#: the budget is spent. The one place a keepalive's apply arguments are named.
+#: stream again on its checkpoint when it died, within the restart budget the build's
+#: ``execution.retries`` sets, and leaves a run cancelled on purpose stopped. It exits non-zero
+#: when it cannot keep the stream running (drift from the contract, nothing deployed, the
+#: restarts spent). The one place a keepalive's apply arguments are named.
 KEEPALIVE_APPLY_ARGS: Tuple[str, ...] = ("--mode", "reconcile")
 
 #: How often a keepalive DAG reconciles its stream, unless the build's
@@ -1440,11 +1441,13 @@ _KEEPALIVE_RUN = (
     '    fluid apply "$FLUID_PROJECT_DIR/$CONTRACT_PATH" --env "$FLUID_ENV_NAME" \\\\\n'
     "        " + _apply_args(KEEPALIVE_APPLY_ARGS, '"$BUILD_ID"') + "\n"
     "\n"
-    "It runs no tofu apply. It starts the stream again on its checkpoint when it\n"
-    "stopped (a Spot interruption, a failed driver), within the restart budget the\n"
-    "build's execution.retries sets, and fails the run when the stream drifted\n"
-    "from the contract or the budget is spent, so the task itself never retries.\n"
-    "It runs on SCHEDULE, one run at a time, with no catch-up. The build's\n"
+    "It runs no tofu apply. When the stream died (a Spot interruption, a failed\n"
+    "driver), it starts again on its checkpoint, within the restart budget the\n"
+    "build's execution.retries sets, so the task itself never retries. The run\n"
+    "fails when the stream cannot be kept running: it drifted from the contract,\n"
+    "nothing is deployed, its cluster ended, or the restarts are spent. A run\n"
+    "cancelled on purpose stays stopped until fluid apply starts it. It runs on\n"
+    "SCHEDULE, one run at a time, with no catch-up. The build's\n"
     "execution.orchestration.airflow.dagConfig.schedule sets SCHEDULE.\n"
 )
 

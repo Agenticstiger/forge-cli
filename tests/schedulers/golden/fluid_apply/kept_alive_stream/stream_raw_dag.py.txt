@@ -7,11 +7,13 @@ constants below filled in (`--env` is left out when FLUID_ENV_NAME is empty):
     fluid apply "$FLUID_PROJECT_DIR/$CONTRACT_PATH" --env "$FLUID_ENV_NAME" \\
         --mode reconcile --build-id "$BUILD_ID" --yes
 
-It runs no tofu apply. It starts the stream again on its checkpoint when it
-stopped (a Spot interruption, a failed driver), within the restart budget the
-build's execution.retries sets, and fails the run when the stream drifted
-from the contract or the budget is spent, so the task itself never retries.
-It runs on SCHEDULE, one run at a time, with no catch-up. The build's
+It runs no tofu apply. When the stream died (a Spot interruption, a failed
+driver), it starts again on its checkpoint, within the restart budget the
+build's execution.retries sets, so the task itself never retries. The run
+fails when the stream cannot be kept running: it drifted from the contract,
+nothing is deployed, its cluster ended, or the restarts are spent. A run
+cancelled on purpose stays stopped until fluid apply starts it. It runs on
+SCHEDULE, one run at a time, with no catch-up. The build's
 execution.orchestration.airflow.dagConfig.schedule sets SCHEDULE.
 
 Worker requirements:
