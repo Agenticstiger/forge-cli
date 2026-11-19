@@ -397,7 +397,8 @@ def local_namespace_listed(scope: str, namespace: str, environ: Any = None) -> b
     env = os.environ if environ is None else environ
     levels = namespace.split(".")
     for entry in (env.get(LOCAL_NAMESPACE_ALLOWLIST_ENV) or "").split(","):
-        where, _, prefix = entry.strip().partition("/")
+        # The last "/": a warehouse may hold one (s3://b/wh, team/wh), a namespace never.
+        where, _, prefix = entry.strip().rpartition("/")
         wanted = prefix.split(".") if prefix else []
         if where == scope and wanted and all(wanted) and levels[: len(wanted)] == wanted:
             return True

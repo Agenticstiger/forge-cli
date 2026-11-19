@@ -313,6 +313,23 @@ def test_a_namespace_entry_matches_whole_levels_of_one_warehouse(entries, listed
     )
 
 
+@pytest.mark.parametrize("warehouse", ["s3://lake/wh", "team/wh"])
+def test_a_warehouse_with_a_slash_can_be_listed(contract, monkeypatch, warehouse):
+    from fluid_build.spark.compiler import local_namespace_listed
+    from fluid_build.spark.policy import SparkPolicyError
+
+    env = {LOCAL_NAMESPACE_ALLOWLIST_ENV: f"{warehouse}/commerce"}
+    assert local_namespace_listed(warehouse, "commerce", env)
+    assert not local_namespace_listed(warehouse.rpartition("/")[0], "wh/commerce", env)
+    monkeypatch.setenv(LOCAL_NAMESPACE_ALLOWLIST_ENV, f"{warehouse}/commerce")
+    sink = config_of(local(copy.deepcopy(contract), warehouse=warehouse))["sink"]
+    assert sink["warehouse"] == warehouse
+    monkeypatch.delenv(LOCAL_NAMESPACE_ALLOWLIST_ENV)
+    with pytest.raises(SparkPolicyError) as caught:
+        config_of(local(contract, warehouse=warehouse))
+    assert f'="{warehouse}/commerce"' in caught.value.fix
+
+
 def test_the_dead_letter_table_is_named_in_the_refusal(contract, monkeypatch):
     from fluid_build.spark.policy import SparkPolicyError
 

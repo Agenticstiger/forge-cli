@@ -376,6 +376,20 @@ def test_a_spark_submit_inside_the_project_is_refused(tmp_path):
             submitter(LocalHost(tmp_path, env))
 
 
+@pytest.mark.parametrize("named", ["absolute", "path"])
+def test_a_link_in_the_project_to_a_program_outside_it_is_refused(tmp_path, stub, named):
+    link = tmp_path / "lnk" / "spark-submit"
+    link.parent.mkdir()
+    link.symlink_to(stub)  # the program is outside; the link that names it is the project's
+    env = {SUBMIT_EXECUTABLE_ENV: str(link)} if named == "absolute" else {"PATH": str(link.parent)}
+    with pytest.raises(SparkRunError, match="inside the project"):
+        submitter(LocalHost(tmp_path, env))
+    linked_dir = tmp_path / "bin"
+    linked_dir.symlink_to(stub.parent)  # a directory of the project's that leads out
+    with pytest.raises(SparkRunError, match="inside the project"):
+        submitter(LocalHost(tmp_path, {SUBMIT_EXECUTABLE_ENV: str(linked_dir / stub.name)}))
+
+
 def test_a_spark_submit_linked_from_outside_into_the_project_is_refused(tmp_path, stub):
     inside = tmp_path / "spark-submit"
     inside.write_text(STUB, encoding="utf-8")

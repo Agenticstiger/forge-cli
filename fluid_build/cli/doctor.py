@@ -185,6 +185,12 @@ ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
         "Where local Spark runs read their job config and runner: an s3:// bucket and "
         "optional prefix (through AWS_ENDPOINT_URL_S3), or an absolute directory",
     ),
+    (
+        "FLUID_SPARK_LOCAL_NAMESPACE_ALLOWLIST",
+        "none (no local run may write a table)",
+        "Where local Spark runs may create and write tables: <warehouse>/<namespace "
+        "prefix>, comma-separated (fluid/<namespace> when the binding names no warehouse)",
+    ),
     # — Keyless coding-agent providers (claude-code / codex / cursor / kiro) —
     (
         "FLUID_FORGE_AGENT",
