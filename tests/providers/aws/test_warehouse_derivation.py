@@ -152,6 +152,12 @@ def test_explicit_bucket_byte_stable_no_extra_data_source():
     assert "aws_caller_identity" not in plugin.emit_data(contract)
 
 
+def test_an_iceberg_table_at_a_bucket_root_has_no_trailing_slash_either():
+    location = {"database": "sales", "table": "orders", "bucket": "lake", "path": ""}
+    assert _iac_location(location) == "s3://lake"
+    assert _planner_location(location) == "s3://lake"
+
+
 def test_same_warehouse_logical_equality():
     from fluid_build.providers.aws.util.warehouse import same_warehouse
 

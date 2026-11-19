@@ -70,6 +70,11 @@ def test_the_dead_letters_table_sits_beside_the_output_never_inside_it(contract)
     storage = table["storage_descriptor"]
     # As Iceberg keeps a table's location: no trailing slash (the S3 grant below has its own).
     assert storage["location"] == "s3://commerce-lake/iceberg/commerce/order_lines__dead_letter"
+    # Beside, never inside, by whole path segments (``order_lines__dead_letter`` starts with
+    # ``order_lines`` as a string, not as a directory).
+    output = resources["aws_glue_catalog_table"]["commerce_orders_stream_commerce_order_lines"]
+    outside = output["storage_descriptor"]["location"].rstrip("/") + "/"
+    assert not (storage["location"].rstrip("/") + "/").startswith(outside)
     assert {c["name"]: c["type"] for c in storage["columns"]} == {
         "error": "string",
         "raw_value": "binary",

@@ -1299,10 +1299,12 @@ def _emit_glue(
         # (``GlueTableOperations``). With the slash here, each plan after a commit updated
         # the table to put it back: an ``UpdateTable`` beside a running stream's commits.
         path = path.rstrip("/")
+    # ``s3://bucket`` for an Iceberg table at a bucket's root, as Iceberg keeps that too.
+    sep = "/" if path or not is_iceberg_format(fmt) else ""
     if _warehouse.bucket_uses_fallback(loc):
-        storage["location"] = TofuExpr(f"s3://{bucket}/{_literal(path)}")
+        storage["location"] = TofuExpr(f"s3://{bucket}{sep}{_literal(path)}")
     else:
-        storage["location"] = f"s3://{bucket}/{path}"
+        storage["location"] = f"s3://{bucket}{sep}{path}"
     parameters: Dict[str, str] = {"classification": fmt, "managed_by": "fluid"}
     if "iceberg" in str(fmt).lower():
         # AWS Glue / Athena identify an Iceberg table via this parameter. For a Glue-
