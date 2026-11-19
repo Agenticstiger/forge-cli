@@ -386,7 +386,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subtract one histogram's published counts from another's, or from a level histogram's group
   size, and rebuild a withheld cell, a zero included. FLUX's `check_edge_counts` closes that, and
   forge-cli calls it once a flux-stats release carries it. That change completes the rule and
-  lands before the next forge-cli release.
+  lands in a later forge-cli release.
 
 ## [0.32.0] — 2026-11-18
 
