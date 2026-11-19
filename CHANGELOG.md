@@ -9,32 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`fluid ship` keeps a stage journal, and a rerun never repeats a change nobody can account
-  for.** With `--journal-dir DIR` (and always with `--release-dir`, in `.fluid/ship-journal`),
-  each stage leaves a `started` event, fsynced before it runs, and a `finished` event with its
-  status, exit code and receipts: the digest of each report it wrote, the plan's digests, and
-  the lineage and serial of each local OpenTofu state. One append-only file per release (the
-  bundle's digest) under `DIR/<product>/<env>/`; a line cut off by a crash is ignored. One run
-  at a time holds a target, locked before stage 1, so a second run is refused (exit 2) before it
-  rebundles. Before apply, enforcing policy-apply, publish or schedule-sync runs again, ship reads
-  it: an attempt in any release of the target that started and has no known outcome
-  (interrupted, killed, a CI timeout) refuses the stage until `--acknowledge-inspected STAGE`,
-  which the journal records; an unknown apply blocks the stages after it the same way. An apply
-  that did not pass is refused until stage 6 has planned again through ship and
-  `runtime/plan.json` is that plan. A stage that changes nothing always runs, recorded when the
-  journal can be opened, and nothing is rolled back. `--explain` shows the journal and what it
-  would refuse; the run report and the release's provenance name it, by a project-relative
-  path or the label `--journal-dir`, never an absolute one. Without either flag
-  there is no journal. Keep DIR outside the checkout, on storage that outlives the runner, and out of
-  reach of less trusted runs: the default in the checkout guards a working copy, and an
-  ephemeral CI runner starts it empty. Ship follows no symbolic link below DIR (or below the
-  project, for the default), reads only regular files with one link, and refuses a journal file
-  over 8 MiB, or one whose directory entry it cannot fsync (storage that cannot fsync a
-  directory at all gets the warning `ship_journal_dir_fsync_unsupported` instead). Two changes reach every run: a stage killed by a signal (the OOM killer) is
-  recorded `unknown`, not `failed`, with the reason `killed by signal N` and the same exit
-  status; and `runtime/ship-report.json` and `ship-junit.xml` are renamed into place, so a
-  symbolic link the checkout left at either name is replaced instead of written through.
-
 - **`fluid policy apply` grants a Lakekeeper table in Lakekeeper.** An Iceberg expose whose
   `binding.location.catalog` is `lakekeeper` used to compile to a warning ("enforce it in the
   catalog's own access control"). `fluid policy compile` now writes one `provider: lakekeeper`
