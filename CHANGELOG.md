@@ -277,6 +277,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `variant`, as DuckDB's `UNION` already does, and the schema-drift gate reads the two as one
   type family, so a contract written that way does not fail at apply.
 
+### Security
+
+- An address with an IPv6 zone id, such as `::1%lo0`, is no longer read as this machine. The
+  secret destination policy judges it like any other host, the MCP HTTP server needs
+  authentication to listen on it, and an OpenBao or Vault address on it needs https.
+
 ## [0.36.0] — 2026-11-19
 
 ### Added
