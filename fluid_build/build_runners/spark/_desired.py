@@ -232,6 +232,13 @@ class DesiredRun:
     #: The sha256 of the job config the run's runtime reads, once ``fluid apply`` has read
     #: it back (or written it, for a local run): the runner refuses any other config.
     job_sha256: Optional[str] = field(default=None, compare=False)
+    #: A prebuilt package build's (``properties.package``): where the team published it,
+    #: its sha256 and entry point, and forge's copy beside the job config, the one the
+    #: runner reads (OpenTofu copies it on AWS; :func:`._local.publish` on a local run).
+    package_source: Optional[str] = None
+    package_sha256: Optional[str] = None
+    package_entry_point: Optional[str] = None
+    package_uri: Optional[str] = None
 
     @property
     def long_running(self) -> bool:
@@ -286,6 +293,7 @@ class DesiredRun:
             job_text=sub(self.job_text),
             role_arn=sub(self.role_arn),
             checkpoint=sub(self.checkpoint) if self.checkpoint else self.checkpoint,
+            package_uri=sub(self.package_uri) if self.package_uri else self.package_uri,
         )
 
     def identity_args(self) -> List[str]:
@@ -328,7 +336,21 @@ class DesiredRun:
 
     def plan_action(self, step: int) -> Dict[str, Any]:
         """The plan's ``spark.reconcile`` action, with ``op`` and ``action_type`` both set:
-        apply's dispatcher reads ``op``, display reads ``action_type``."""
+        apply's dispatcher reads ``op``, display reads ``action_type``. A package build's
+        names the package it runs and where its copy comes from, so the bound plan holds
+        both."""
+        action = self._plan_action(step)
+        if self.package_sha256:
+            payload = action["payload"]
+            payload["artifacts"]["package"] = self.package_uri
+            payload["package"] = {
+                "source": self.package_source,
+                "sha256": self.package_sha256,
+                "entryPoint": self.package_entry_point,
+            }
+        return action
+
+    def _plan_action(self, step: int) -> Dict[str, Any]:
         return {
             "step": step,
             "action_id": f"spark_{self.build}",
@@ -790,6 +812,16 @@ def desired_runs(
         # A local run reads its artifacts where the operator keeps them, in the same layout
         # as the S3 objects OpenTofu uploads on AWS (fluid_build/spark/names.py).
         root = LOCAL_ROOT_TOKEN if local else f"s3://{bucket}"
+        package = config.get("package")
+        package_fields: Dict[str, Any] = {}
+        if package:
+            package_fields = {
+                # The compiled config says what runs; where it comes from is the build's.
+                "package_source": str((build.get("properties") or {})["package"]["uri"]),
+                "package_sha256": str(package["sha256"]),
+                "package_entry_point": str(package["entryPoint"]),
+                "package_uri": _names.package_uri(root, product, bid, str(package["sha256"])),
+            }
         runs.append(
             DesiredRun(
                 product=product,
@@ -816,6 +848,7 @@ def desired_runs(
                 topic=source.get("topic") if isinstance(source, Mapping) else None,
                 restarts_per_hour=restart_budget(build, scheduled),
                 job_text=job.text,
+                **package_fields,
             )
         )
     return [run.bind(account) for run in runs] if account else runs

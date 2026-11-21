@@ -125,9 +125,10 @@ def prepare(
                 "apply_spark_artifact_mismatch",
                 {
                     "error": "the Spark runs compiled now differ from the bound plan's "
-                    "spark.reconcile actions (job config, runner or run settings, which "
-                    "include FLUID_SPARK_MAVEN_REPOSITORY and FLUID_SPARK_GLUE_JARS_URL); "
-                    "regenerate it with the same environment as apply"
+                    "spark.reconcile actions (job config, runner, a prebuilt package's source "
+                    "or run settings, which include FLUID_SPARK_MAVEN_REPOSITORY and "
+                    "FLUID_SPARK_GLUE_JARS_URL); regenerate it with the same environment as "
+                    "apply"
                 },
             )
     selected = [r for r in runs if build_id is None or r.build == build_id]
