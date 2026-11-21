@@ -299,6 +299,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fluid apply`, where `{{ env.NAME }}` placeholders are rendered, a refusal quotes a host only
   when the contract wrote it as it stands, and names the placeholder of one it rendered. A
   keyword connection string (`Server=...;Database=...`) shows its host part only.
+- In `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, `NAME@*` now sends `env://NAME` to any host, as
+  a bare `NAME` and `env://NAME@*` already did. It used to name a literal host `*`, which no
+  destination matches. A refusal's fix names both forms.
 
 ## [0.36.0] — 2026-11-19
 

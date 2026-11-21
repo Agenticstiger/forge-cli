@@ -38,7 +38,7 @@ repository could grant itself the policy meant to constrain it.
 
   - ``NAME`` / ``NAME@host`` -- environment variable ``NAME`` (``env://NAME``)
     to any host / to that host. The original form, chosen by the founder on
-    2026-10-26 for ``env://``.
+    2026-10-26 for ``env://``. ``NAME@*`` is any host too.
   - ``<reference>@<host>`` / ``<reference>@*`` -- that reference, any scheme,
     to that host / any host, for example ``vault://kv/acme/pg#password@db.acme.internal``.
     The ``@<host>`` part is required in this form, because a Secrets Manager
@@ -423,7 +423,8 @@ def _grant(entry: str) -> Optional[DestinationGrant]:
             target = host.strip().lower().rstrip(".")
             if not target:
                 return None  # `NAME@` grants nothing, not everything
-            return DestinationGrant(reference=f"env://{name}", prefix=None, host=target)
+            # `NAME@*` is any host, as `env://NAME@*` and a bare `NAME` are.
+            return DestinationGrant(reference=f"env://{name}", prefix=None, host=_host_part(target))
         return DestinationGrant(reference=f"env://{name}", prefix=None, host=None)
     left, sep, host = entry.rpartition("@")
     if not sep or not left.strip() or not host.strip():
@@ -868,7 +869,7 @@ def _blank_host_refusal(parsed: SecretRef) -> AcquisitionSecretPolicyError:
             "Name the host in connection.host. A placeholder such as {{ env.PGHOST }} "
             "renders empty when the variable is not set where fluid apply runs, so set it "
             f"there. To send the value to any host instead, set it in {_OPERATOR_ONLY}: "
-            f'{ALLOWLIST_ENV}="{_suggested_entry(parsed, None)}".'
+            f"{_any_host_fix(parsed)}."
         ),
         doc=doc_url("secrets"),
     )
@@ -880,7 +881,13 @@ def _field_label(target: _Target) -> str:
 
 
 def _any_host_fix(parsed: SecretRef) -> str:
-    """The allowlist entry that sends ``parsed`` to any host, for a refusal's fix."""
+    """The allowlist entries that send ``parsed`` to any host, for a refusal's fix.
+
+    For ``env://NAME`` that is a bare ``NAME`` or ``NAME@*``; for any other
+    reference, ``<reference>@*``.
+    """
+    if parsed.scheme == "env":
+        return f'{ALLOWLIST_ENV}="{parsed.locator}" or {ALLOWLIST_ENV}="{parsed.locator}@*"'
     return f'{ALLOWLIST_ENV}="{_suggested_entry(parsed, None)}"'
 
 
