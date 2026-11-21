@@ -104,7 +104,7 @@ _PLACEHOLDER = re.compile(
 )
 
 
-_IDENTIFIER_CALL = re.compile(r"(?i)" + chr(92) + "bIDENTIFIER" + chr(92) + "s*" + chr(92) + "(")
+_IDENTIFIER_CALL = re.compile(r"(?i)\bIDENTIFIER\s*\(")
 
 
 def _closing_paren(text: str, open_at: int) -> int:
@@ -116,7 +116,7 @@ def _closing_paren(text: str, open_at: int) -> int:
         if quote:
             if char == quote:
                 quote = ""
-        elif char in "'" + chr(34) + "`":
+        elif char in "'\"`":
             quote = char
         elif char == "(":
             depth += 1
