@@ -165,8 +165,9 @@ def test_the_runner_imports_nothing_but_the_standard_library_at_module_level():
         elif isinstance(node, ast.ImportFrom):
             names.add(node.module.split(".")[0])
     assert names <= {
-        "__future__", "argparse", "base64", "hashlib", "hmac", "json", "os", "sys", "time",
-        "unicodedata", "urllib",
+        "__future__", "argparse", "base64", "functools", "hashlib", "hmac", "importlib",
+        "inspect", "json", "os", "re", "sys", "tempfile", "time", "types", "unicodedata",
+        "urllib", "zipfile",
     }  # fmt: skip
 
 

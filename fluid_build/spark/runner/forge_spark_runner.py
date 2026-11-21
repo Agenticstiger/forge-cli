@@ -20,6 +20,9 @@ credential).
 - batch: the contract's own SELECT over catalog tables -> overwrite the partitions it
   computes. A topic is landed by a stream (``availableNow`` for a scheduled run), never
   by a batch read, which sees only what Kafka still retains.
+- a prebuilt package (``package``): the team's own PySpark, by digest. The runner imports
+  the pinned bytes, calls the entry point, checks the DataFrame it returns, and writes it
+  as a batch run does; the package computes rows and never writes (:func:`run_package`).
 
 The submitter puts on the classpath what the job uses: the Iceberg Spark runtime and
 its AWS bundle (EMR: the release's Iceberg; Glue: ``--datalake-formats iceberg``),
@@ -36,15 +39,22 @@ from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import hashlib
 import hmac
+import importlib
+import inspect
 import json
 import os
+import re
 import sys
+import tempfile
 import time
+import types
 import unicodedata
 import urllib.parse
 import urllib.request
+import zipfile
 
 CONFIG_VERSION = 1
 SOURCE_TABLE = "source_events"
@@ -125,6 +135,8 @@ def parse_config(text: str) -> dict:
     ):
         raise JobConfigError("source.maxOffsetsPerTrigger must be a whole number, at least 1")
     _check_sink(config["sink"])
+    if config.get("package") is not None:
+        _check_package(config)
     if config.get("deadLetter") is not None:
         _check_dead_letters(config, config["deadLetter"])
     return config
@@ -839,7 +851,12 @@ def main(argv: list[str] | None = None) -> int:
 
     spark = SparkSession.builder.getOrCreate()
     text = checked_text(read_text(spark, args.config), args.fluid_job_sha256, args.config)
-    run(spark, parse_config(text))
+    config = parse_config(text)
+    if config.get("package"):
+        # The package's copy sits beside the job config: found from where it was read.
+        run_package(spark, config, args.config)
+    else:
+        run(spark, config)
     return 0
 
 
@@ -891,6 +908,774 @@ def _nfc(value):
     if isinstance(value, dict):
         return {_nfc(k): _nfc(v) for k, v in value.items()}
     return value
+
+
+# --- prebuilt packages ------------------------------------------------------------------
+#
+# A build with ``package`` runs the team's own PySpark, by digest. fluid apply puts the
+# package beside the job config, keyed by its sha256 (fluid_build/spark/names.py::
+# package_key). The runner reads that copy, refuses any bytes but the pinned ones, imports
+# the entry point from its own copy of them, calls it as fn(spark, context), and writes the
+# DataFrame it returns: the columns and types must be the contract's, a row whose required
+# value is null goes to the dead letters (``sql.check`` says why), and the rest replace
+# the partitions they hold. While the function runs, PySpark's writes are refused and
+# spark.sql runs reads only (WriteGuard); a commit to the output or its dead letters that
+# the runner did not make fails the run (table_marker). Code in the same process can
+# reach the JVM itself, so these stop a write the package makes through PySpark and catch
+# one it makes around it; the job's role is what keeps it from other tables.
+
+#: Where fluid apply puts a package beside the job config (``names.PACKAGE_DIR`` and
+#: ``names.PACKAGE_FILE``): a ``.zip`` name, as PySpark puts only a ``.zip`` on the path.
+PACKAGE_DIR, PACKAGE_FILE = "package", "package.zip"
+#: The largest package the runner reads (``fluid_build/spark/package.py``).
+MAX_PACKAGE_BYTES = 256 * 1024 * 1024
+#: The view the package's output is checked under: ``sql.check`` reads it.
+PACKAGE_VIEW = "package_output"
+#: Snapshot summary keys: the package whose rows a commit holds, and the run whose dead
+#: letters a dead-letter commit holds, so a re-attempt of the run lands them once.
+PACKAGE_SHA_PROPERTY = "fluid.package.sha256"
+_PACKAGE_RUN_PROPERTY = "fluid.dead-letter.run"
+#: Compiled extension modules, which Python never imports from a zip.
+_EXTENSION_SUFFIXES = (".so", ".pyd", ".dylib")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+_ENTRY_POINT = re.compile(rf"{_NAME}(?:\.{_NAME})*:{_NAME}(?:\.{_NAME})*")
+_CHUNK = 1024 * 1024
+
+
+class PackageError(RuntimeError):
+    """The package, or what its entry point did or returned, is refused: the runner writes
+    nothing to the output."""
+
+
+def _check_package(config: dict) -> None:
+    package = config["package"]
+    if not isinstance(package, dict):
+        raise JobConfigError("package must be an object")
+    if config["mode"] != "batch" or config.get("source"):
+        raise JobConfigError("a package runs in a batch job, which reads no topic")
+    if config.get("deadLetter") is not None:
+        raise JobConfigError("a package build's dead letters are package.deadLetter")
+    if not isinstance((config["sql"] or {}).get("check"), str):
+        raise JobConfigError("a package build carries sql.check, the query its rows are checked by")
+    if not (isinstance(package.get("sha256"), str) and _SHA256.fullmatch(package["sha256"])):
+        raise JobConfigError("package.sha256 must be 64 lowercase hex characters")
+    entry = package.get("entryPoint")
+    if not (isinstance(entry, str) and _ENTRY_POINT.fullmatch(entry)):
+        raise JobConfigError("package.entryPoint must be <module>:<attribute>")
+    arguments = package.get("arguments")
+    if not isinstance(arguments, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in arguments.items()
+    ):
+        raise JobConfigError("package.arguments must map names to strings")
+    if not (isinstance(package.get("schema"), str) and package["schema"]):
+        raise JobConfigError("package.schema must hold the output's declared columns")
+    dead = package.get("deadLetter")
+    if dead is None:
+        return
+    cap = dead.get("maxRecordsBeforeAbort") if isinstance(dead, dict) else None
+    if (
+        not isinstance(dead, dict)
+        or not (isinstance(dead.get("table"), str) and dead["table"])
+        or isinstance(cap, bool)
+        or not isinstance(cap, int)
+        or cap < 0
+    ):
+        raise JobConfigError(
+            "package.deadLetter names its table and a whole maxRecordsBeforeAbort from 0"
+        )
+    _check_create(dead.get("create"), "package.deadLetter")
+
+
+def package_location(config_uri: str, sha256: str) -> str:
+    """The package's copy beside the job config read from ``config_uri`` (an ``s3://`` or
+    ``file://`` URI, or a path), as fluid apply puts it."""
+    base, sep, _ = config_uri.rpartition("/")
+    return f"{base if sep else '.'}/{PACKAGE_DIR}/{sha256[:16]}/{PACKAGE_FILE}"
+
+
+def fetch_package(spark, location: str, sha256: str) -> str:
+    """A copy of the package at ``location`` of the runner's own (owner-only, in a new
+    directory nobody else can enter), once its bytes are the pinned ones and it is a zip
+    Python can import from; its path."""
+    target = os.path.join(tempfile.mkdtemp(prefix="fluid-package-"), f"{sha256[:16]}.zip")
+    if "://" not in location or location.startswith("file://"):
+        _copy_local(location.removeprefix("file://"), target)
+    else:
+        _copy_remote(spark, location, target)
+    found = _file_sha256(target)
+    if found != sha256:
+        os.unlink(target)
+        raise PackageError(
+            f"the package at {location} is not the one the job config pins (its sha256 is "
+            f"{found}, the pin {sha256}); nothing was imported. Run fluid apply again: it "
+            "copies the pinned package"
+        )
+    _check_archive(target, location)
+    log("package_verified", sha256=sha256, bytes=os.path.getsize(target))
+    return target
+
+
+def _refuse_oversized(size: int, where: str) -> None:
+    if size > MAX_PACKAGE_BYTES:
+        raise PackageError(
+            f"the package at {where} is larger than {MAX_PACKAGE_BYTES} bytes; keep "
+            "dependencies in the runtime's image or environment"
+        )
+
+
+def _copy_local(source: str, target: str) -> None:
+    try:
+        handle = open(source, "rb")
+    except OSError as exc:
+        raise PackageError(
+            f"the package at {source} cannot be read ({exc.strerror}); run fluid apply, which "
+            "puts it beside the job config"
+        ) from None
+    with handle:
+        _refuse_oversized(os.fstat(handle.fileno()).st_size, source)
+        # Owner-only: the package is the job's alone (and O_EXCL: a name nobody placed).
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(target, flags, 0o600), "wb") as out:
+            copied = 0
+            while True:
+                chunk = handle.read(_CHUNK)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                _refuse_oversized(copied, source)
+                out.write(chunk)
+
+
+def _copy_remote(spark, uri: str, target: str) -> None:
+    """Through Hadoop's file system, with the job's own credentials (EMRFS or S3A)."""
+    jvm = spark.sparkContext._jvm
+    path = jvm.org.apache.hadoop.fs.Path(uri)
+    fs = path.getFileSystem(spark.sparkContext._jsc.hadoopConfiguration())
+    try:
+        size = int(fs.getFileStatus(path).getLen())
+    except Exception as exc:  # noqa: BLE001 - Py4J's error, a missing object among them
+        raise PackageError(
+            f"the package at {uri} cannot be read ({type(exc).__name__}); run fluid apply, "
+            "which copies it beside the job config"
+        ) from None
+    _refuse_oversized(size, uri)
+    # useRawLocalFileSystem: no .crc file beside the copy.
+    fs.copyToLocalFile(False, path, jvm.org.apache.hadoop.fs.Path(target), True)
+    _refuse_oversized(os.path.getsize(target), uri)
+
+
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(_CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _check_archive(path: str, where: str) -> None:
+    if not zipfile.is_zipfile(path):
+        raise PackageError(f"the package at {where} is not a wheel or a zip")
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+    compiled = sorted(
+        name
+        for name in names
+        if name.lower().endswith(_EXTENSION_SUFFIXES) or ".so." in name.rsplit("/", 1)[-1].lower()
+    )
+    if compiled:
+        shown = ", ".join(ascii(name) for name in compiled[:3])
+        raise PackageError(
+            f"the package holds compiled extension modules ({shown}"
+            f"{', ...' if len(compiled) > 3 else ''}), which Python does not import from a "
+            "zip; put the dependency that has them in the runtime's image or environment, and "
+            "keep the package pure Python"
+        )
+
+
+def _origin(module) -> str | None:
+    spec = getattr(module, "__spec__", None)
+    return getattr(spec, "origin", None) or getattr(module, "__file__", None)
+
+
+def _inside(origin: str | None, zips) -> bool:
+    """Whether a module's origin is a file inside one of ``zips`` (zipimport names it
+    ``<zip>/<path in the zip>``)."""
+    if not origin:
+        return False
+    roots = {os.path.realpath(z) for z in zips} | {os.path.abspath(z) for z in zips}
+    return any(origin.startswith(root + os.sep) for root in roots)
+
+
+def import_entry_point(entry_point: str, zips):
+    """The function ``entry_point`` names, imported from the package: from one of ``zips``
+    (the runner's copy and Spark's, which addPyFile put on the path), never from a module of
+    that name already loaded or earlier on the path. Resolved as the packaging spec's
+    entry-point object reference (``import_module``, then each attribute)."""
+    module_name, _, qualname = entry_point.partition(":")
+    parts = module_name.split(".")
+    chain = [".".join(parts[: i + 1]) for i in range(len(parts))]
+    for name in chain:
+        loaded = sys.modules.get(name)
+        if loaded is not None and not _inside(_origin(loaded), zips):
+            where = _origin(loaded)
+            raise PackageError(
+                f"{name} was imported before the package was{f', from {where}' if where else ''}"
+                "; a module of that name is on the runtime's Python path: take it out of the "
+                "image, or rename the package's"
+            )
+    importlib.invalidate_caches()
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as exc:  # noqa: BLE001 - the package's own import, whatever it raised
+        raise PackageError(
+            f"importing {module_name} from the package failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    for name in chain:
+        origin = _origin(sys.modules.get(name))
+        if (origin is not None or name == module_name) and not _inside(origin, zips):
+            raise PackageError(
+                f"{name} was imported from {origin}, not from the package: a module of that "
+                "name comes first on the runtime's Python path; take it out of the image, or "
+                "rename the package's"
+            )
+    function = module
+    for attribute in qualname.split("."):
+        try:
+            function = getattr(function, attribute)
+        except AttributeError:
+            raise PackageError(f"{module_name} has no {qualname}") from None
+    if not callable(function):
+        raise PackageError(f"{entry_point} is not a function")
+    try:
+        signature = inspect.signature(function)
+    except (TypeError, ValueError):
+        return function  # nothing to read the parameters from: the call says
+    try:
+        signature.bind(None, None)
+    except TypeError:
+        raise PackageError(
+            f"{entry_point} takes {signature}; a package's entry point takes (spark, context)"
+        ) from None
+    return function
+
+
+class PackageContext:
+    """What a package's entry point gets beside the session, read-only: ``arguments`` (the
+    contract's strings), ``product``, ``build``, ``output`` (the table the runner writes,
+    which the function may read), ``run_id`` (Spark's application id) and
+    ``package_sha256``."""
+
+    __slots__ = ("arguments", "product", "build", "output", "run_id", "package_sha256")
+
+    def __init__(self, **values) -> None:
+        for name in self.__slots__:
+            object.__setattr__(self, name, values[name])
+
+    def __setattr__(self, name, value) -> None:
+        raise AttributeError("the package context is read-only")
+
+
+#: The PySpark calls that write, create a table or put more code on the cluster, refused
+#: while a package's entry point runs: ``(module, class, methods)``.
+_WRITE_CALLS = (
+    (
+        "pyspark.sql.readwriter",
+        "DataFrameWriter",
+        ("save", "saveAsTable", "insertInto", "json", "parquet", "orc", "text", "csv", "jdbc"),
+    ),
+    (
+        "pyspark.sql.readwriter",
+        "DataFrameWriterV2",
+        ("create", "replace", "createOrReplace", "append", "overwrite", "overwritePartitions"),
+    ),
+    ("pyspark.sql.streaming.readwriter", "DataStreamWriter", ("start", "toTable")),
+    ("pyspark.sql.dataframe", "DataFrame", ("foreach", "foreachPartition")),
+    (
+        "pyspark.rdd",
+        "RDD",
+        (
+            "foreach",
+            "foreachPartition",
+            "saveAsTextFile",
+            "saveAsPickleFile",
+            "saveAsSequenceFile",
+            "saveAsHadoopFile",
+            "saveAsNewAPIHadoopFile",
+            "saveAsHadoopDataset",
+            "saveAsNewAPIHadoopDataset",
+        ),
+    ),
+    ("pyspark.sql.catalog", "Catalog", ("createTable", "createExternalTable", "recoverPartitions")),
+    ("pyspark.context", "SparkContext", ("addFile", "addPyFile", "addArchive", "addJar")),
+    ("pyspark.sql.session", "SparkSession", ("addArtifact", "addArtifacts")),
+)
+
+
+class WriteGuard:
+    """While a package's entry point runs, PySpark's writes are refused and ``spark.sql``
+    runs reads only (:func:`sql_write`). What it refused stays in ``refused``: the run
+    fails on it even when the package caught the error."""
+
+    def __init__(self) -> None:
+        self.refused: list = []
+        self._patches: list = []
+
+    def __enter__(self):
+        missing = []
+        for module_name, class_name, methods in _WRITE_CALLS:
+            try:
+                cls = getattr(importlib.import_module(module_name), class_name)
+            except (ImportError, AttributeError):
+                missing.append(f"{module_name}.{class_name}")
+                continue
+            for name in methods:
+                if name in vars(cls):
+                    self._patch(cls, name, self._refusal(f"{class_name}.{name}"))
+        session = importlib.import_module("pyspark.sql.session").SparkSession
+        self._patch(session, "sql", self._sql(vars(session)["sql"]))
+        if missing:
+            log("package_guard_partial", missing=missing)
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        while self._patches:
+            cls, name, original = self._patches.pop()
+            setattr(cls, name, original)
+        return False
+
+    def _patch(self, cls, name: str, replacement) -> None:
+        self._patches.append((cls, name, vars(cls)[name]))
+        setattr(cls, name, replacement)
+
+    def _refusal(self, what: str):
+        def refused(*args, **kwargs):
+            self.refused.append(what)
+            raise PackageError(
+                f"{what} is refused while the package runs: a package returns its DataFrame, "
+                "and the runner writes it"
+            )
+
+        return refused
+
+    def _sql(self, original):
+        @functools.wraps(original)
+        def sql(session, sqlQuery, *args, **kwargs):
+            verb = sql_write(sqlQuery)
+            if verb is not None:
+                self.refused.append(f"spark.sql {verb}")
+                raise PackageError(
+                    f"a {verb} statement is refused while the package runs: through the "
+                    "session a package reads and sets up, and the runner writes the output"
+                )
+            return original(session, sqlQuery, *args, **kwargs)
+
+        return sql
+
+
+#: Statements that only read or set up the session.
+_SQL_READS = frozenset(
+    {
+        "SELECT",
+        "VALUES",
+        "TABLE",
+        "SHOW",
+        "DESCRIBE",
+        "DESC",
+        "EXPLAIN",
+        "SET",
+        "RESET",
+        "USE",
+        "CACHE",
+        "UNCACHE",
+        "CLEAR",
+        "REFRESH",
+        "LIST",
+    }
+)
+#: A read with a prefix (``WITH ... AS (...)``, ``FROM t``, a parenthesis) that a write can
+#: follow, as in ``WITH a AS (...) INSERT INTO ...``: refused when one does, at the top level.
+_SQL_PREFIXES = frozenset({"WITH", "FROM", "("})
+_SQL_PREFIXED_WRITES = frozenset({"INSERT", "MERGE", "UPDATE", "DELETE"})
+
+
+def sql_write(text) -> str | None:
+    """None when ``text`` only reads or sets up the session (a temporary view among it), else
+    what makes it a write: its verb, or why the runner cannot read it. Comments, quoted
+    strings and quoted names are skipped as Spark's parser skips them; a statement that does
+    not start as a read is refused, so a verb nobody listed is refused too."""
+    if not isinstance(text, str):
+        return None  # spark.sql refuses it itself
+    try:
+        tokens = _sql_tokens(text)
+    except ValueError:
+        return "SQL the runner cannot read (a quote or comment that does not end)"
+    if not tokens:
+        return "no statement"
+    head = tokens[0]
+    if head in _SQL_READS:
+        return None
+    if head == "CREATE":
+        rest = [t for t in tokens[1:6] if t not in "()"]
+        at = 2 if rest[:2] == ["OR", "REPLACE"] else 0
+        at += 1 if rest[at : at + 1] == ["GLOBAL"] else 0
+        if rest[at : at + 1] in (["TEMP"], ["TEMPORARY"]) and rest[at + 1 : at + 2] == ["VIEW"]:
+            return None
+        return "CREATE"
+    if head in _SQL_PREFIXES:
+        depth = 0
+        for token in tokens:
+            if token == "(":
+                depth += 1
+            elif token == ")":
+                depth -= 1
+            elif depth == 0 and token in _SQL_PREFIXED_WRITES:
+                return token
+        return None
+    return head
+
+
+def _sql_tokens(text: str) -> list:
+    """``text``'s words (upper case) and parentheses, without comments, strings and quoted
+    names. Raises ValueError for a string, a quoted name or a comment that does not end."""
+    tokens: list = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith("--", i):
+            end = text.find("\n", i)
+            i = n if end < 0 else end + 1
+        elif text.startswith("/*", i):
+            depth, i = 1, i + 2
+            while depth:
+                if i >= n:
+                    raise ValueError("comment")
+                if text.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif text.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        elif c in "'\"":
+            i = _end_of_string(text, i, raw=False)
+        elif c == "`":
+            end = i + 1
+            while True:
+                end = text.find("`", end)
+                if end < 0:
+                    raise ValueError("name")
+                if text.startswith("``", end):
+                    end += 2
+                    continue
+                break
+            i = end + 1
+        elif c in "()":
+            tokens.append(c)
+            i += 1
+        elif c.isascii() and (c.isalpha() or c == "_"):
+            start = i
+            while i < n and text[i].isascii() and (text[i].isalnum() or text[i] == "_"):
+                i += 1
+            word = text[start:i].upper()
+            if word == "R" and i < n and text[i] in "'\"":
+                i = _end_of_string(text, i, raw=True)  # r'...': a backslash is just itself
+            else:
+                tokens.append(word)
+        else:
+            i += 1
+    return tokens
+
+
+def _end_of_string(text: str, start: int, *, raw: bool) -> int:
+    quote, i = text[start], start + 1
+    while i < len(text):
+        if text[i] == "\\" and not raw:
+            i += 2
+            continue
+        if text[i] == quote:
+            return i + 1
+        i += 1
+    raise ValueError("string")
+
+
+def _type_text(kind) -> str:
+    """A ``DataType.jsonValue()`` as Spark's simpleString writes it."""
+    if not isinstance(kind, dict):
+        return str(kind)
+    if kind.get("type") == "struct":
+        fields = ",".join(f"{f['name']}:{_type_text(f['type'])}" for f in kind.get("fields", []))
+        return f"struct<{fields}>"
+    if kind.get("type") == "array":
+        return f"array<{_type_text(kind.get('elementType'))}>"
+    if kind.get("type") == "map":
+        return f"map<{_type_text(kind.get('keyType'))},{_type_text(kind.get('valueType'))}>"
+    return json.dumps(kind, sort_keys=True)
+
+
+def _same_json_type(actual, declared) -> bool:
+    """Whether ``actual`` is ``declared`` exactly (both ``DataType.jsonValue()``): structs by
+    field name, arrays and maps by their element types; nullability is the row checks'."""
+    if not (isinstance(actual, dict) and isinstance(declared, dict)):
+        return actual == declared
+    kind = declared.get("type")
+    if actual.get("type") != kind:
+        return False
+    if kind == "struct":
+        mine = [(f["name"], f["type"]) for f in actual.get("fields", [])]
+        theirs = {f["name"]: f["type"] for f in declared.get("fields", [])}
+        return (
+            len(mine) == len(theirs)
+            and {name for name, _ in mine} == set(theirs)
+            and all(_same_json_type(t, theirs[name]) for name, t in mine)
+        )
+    if kind == "array":
+        return _same_json_type(actual.get("elementType"), declared.get("elementType"))
+    if kind == "map":
+        return _same_json_type(actual.get("keyType"), declared.get("keyType")) and _same_json_type(
+            actual.get("valueType"), declared.get("valueType")
+        )
+    return actual == declared
+
+
+def _shown(name: str) -> str:
+    return name if name.isprintable() and name.isascii() else ascii(name)
+
+
+def conformance_problems(actual: dict, declared: dict) -> list:
+    """What keeps a DataFrame of schema ``actual`` from being the output ``declared`` (both
+    ``StructType.jsonValue()``): the same column names, exactly, in any order, each of the
+    declared type; empty when it is the output."""
+    names = [f["name"] for f in actual.get("fields", [])]
+    have = {f["name"]: f["type"] for f in actual.get("fields", [])}
+    wanted = [(f["name"], f["type"]) for f in declared.get("fields", [])]
+    folded = {name.casefold() for name, _ in wanted}
+    problems = [
+        f"{_shown(name)} appears {names.count(name)} times"
+        for name in sorted({n for n in names if names.count(n) > 1})
+    ]
+    for name, kind in wanted:
+        if name not in have:
+            close = [n for n in names if n.casefold() == name.casefold()]
+            problems.append(
+                f"{name} is missing"
+                + (
+                    f" (the package returns {_shown(close[0])}; names are case-sensitive)"
+                    if close
+                    else ""
+                )
+            )
+        elif not _same_json_type(have[name], kind):
+            problems.append(f"{name} is {_type_text(have[name])}, declared {_type_text(kind)}")
+    problems += [
+        f"{_shown(name)} is not declared"
+        for name in dict.fromkeys(names)
+        if name.casefold() not in folded
+    ]
+    return problems
+
+
+def package_outcome(failed: int, dead) -> tuple:
+    """``(land the dead letters, write the output)`` for a run whose output has ``failed``
+    rows that fail the checks: without dead letters any such row stops the run; past
+    ``maxRecordsBeforeAbort`` they land and the output is not written."""
+    if not failed:
+        return False, True
+    if dead is None:
+        return False, False
+    return True, failed <= dead["maxRecordsBeforeAbort"]
+
+
+def table_marker(spark, table: str) -> tuple:
+    """What a commit to ``table`` changes: how many snapshots it has, the newest one's
+    time, and the snapshot its main branch is at (a rollback moves only that)."""
+    from pyspark.sql import functions as F
+
+    # The catalog keeps loaded tables a while; REFRESH drops its copy, so a commit made
+    # through another catalog object is seen too. The name is the compiled sink's.
+    statement = f"REFRESH TABLE {table}"
+    spark.sql(statement)
+    snapshots = spark.table(f"{table}.snapshots")
+    count, last = snapshots.agg(F.count(F.lit(1)), F.max("committed_at")).first()
+    refs = spark.table(f"{table}.refs").where(F.col("name") == "main")
+    main = refs.select("snapshot_id").first()
+    return int(count), str(last), None if main is None else int(main[0])
+
+
+def _load_package(spark, location: str, package: dict):
+    """The entry point, imported from the verified bytes, which addPyFile also hands to
+    every executor (from the driver: no executor reads the store)."""
+    from pyspark import SparkFiles
+
+    sha = package["sha256"]
+    path = fetch_package(spark, location, sha)
+    spark.sparkContext.addPyFile(path)
+    # addPyFile copies the file into Spark's own directory and puts that copy on the path.
+    copy = os.path.join(SparkFiles.getRootDirectory(), os.path.basename(path))
+    if os.path.exists(copy) and _file_sha256(copy) != sha:
+        raise PackageError(
+            "Spark's copy of the package is not the pinned one; nothing was imported"
+        )
+    function = import_entry_point(package["entryPoint"], [path, copy])
+    log("package_loaded", entry_point=package["entryPoint"], sha256=sha)
+    return function
+
+
+def _conformed_columns(spark, output, ddl: str) -> list:
+    """The declared columns, in the contract's order, once ``output`` is the output."""
+    from pyspark.sql import DataFrame
+    from pyspark.sql.functions import col
+
+    if not isinstance(output, DataFrame):
+        raise PackageError(
+            f"the entry point returned {type(output).__name__}, not a pyspark DataFrame"
+        )
+    if output.isStreaming:
+        raise PackageError(
+            "the entry point returned a streaming DataFrame; a package build is batch"
+        )
+    # PySpark has no StructType.fromDDL; an empty frame of the DDL is its public parser.
+    declared = spark.createDataFrame([], ddl).schema
+    problems = conformance_problems(output.schema.jsonValue(), declared.jsonValue())
+    if problems:
+        raise PackageError(
+            "the package's output is not the output the contract declares: "
+            + "; ".join(problems)
+            + ". Nothing was written"
+        )
+    return [col(f"`{field.name}`") for field in declared.fields]
+
+
+def _reasons(failures: dict) -> str:
+    return "; ".join(f"{reason}: {count}" for reason, count in sorted(failures.items()))
+
+
+def write_package_dead_letters(spark, checked, table: str, columns, run_id: str, sha: str) -> None:
+    """Append the rows the checks refused, once per run: a re-attempt of the run finds its
+    own snapshot, which carries the run's id, as a stream's dead letters keep their batch."""
+    from pyspark.sql.functions import col, current_timestamp, lit, struct, to_json
+
+    done = (
+        spark.table(f"{table}.snapshots")
+        .where(col("summary")[_PACKAGE_RUN_PROPERTY] == run_id)
+        .limit(1)
+        .collect()
+    )
+    if done:
+        return
+    (
+        checked.where(f"`{ERROR_COLUMN}` IS NOT NULL")
+        .select(
+            col(f"`{ERROR_COLUMN}`").alias("error"),
+            to_json(struct(*columns)).alias("row_json"),
+            lit(run_id).alias("run_id"),
+            lit(sha).alias("package_sha256"),
+            current_timestamp().alias("dead_lettered_at"),
+        )
+        .writeTo(table)
+        .option(f"snapshot-property.{_PACKAGE_RUN_PROPERTY}", run_id)
+        .option(f"snapshot-property.{PACKAGE_SHA_PROPERTY}", sha)
+        .option("check-nullability", "false")
+        .append()
+    )
+
+
+def write_package_output(checked, table: str, columns, sha: str) -> None:
+    """Replace the partitions the passing rows hold, as a batch run does, stamped with the
+    package's digest."""
+    (
+        checked.where(f"`{ERROR_COLUMN}` IS NULL")
+        .select(*columns)
+        .writeTo(table)
+        .option("check-nullability", "false")
+        .option(f"snapshot-property.{PACKAGE_SHA_PROPERTY}", sha)
+        .overwritePartitions()
+    )
+
+
+def run_package(spark, config: dict, config_uri: str) -> None:
+    """Run a prebuilt package's entry point by digest and write what it returns (see this
+    section's comment). Raises PackageError when the runner writes no output."""
+    from pyspark import StorageLevel
+
+    configure_session(spark, config)
+    package, sink = config["package"], config["sink"]
+    table = f"{sink['catalog']}.{sink['table']}"
+    dead = package.get("deadLetter")
+    dead_table = f"{sink['catalog']}.{dead['table']}" if dead else None
+    log(
+        "start",
+        product=config["product"],
+        build=config["build"],
+        mode="batch",
+        table=table,
+        package_sha256=package["sha256"],
+        entry_point=package["entryPoint"],
+    )
+    create_sink_table(spark, config)
+    for statement in (dead or {}).get("create") or []:
+        spark.sql(statement)
+    function = _load_package(spark, package_location(config_uri, package["sha256"]), package)
+    run_id = str(spark.sparkContext.applicationId)
+    watched = [t for t in (table, dead_table) if t]
+    before = {t: table_marker(spark, t) for t in watched}
+    context = PackageContext(
+        arguments=types.MappingProxyType(dict(package["arguments"])),
+        product=config["product"],
+        build=config["build"],
+        output=table,
+        run_id=run_id,
+        package_sha256=package["sha256"],
+    )
+    guard = WriteGuard()
+    with guard:
+        output = function(spark, context)
+    if guard.refused:
+        raise PackageError(
+            f"the package tried to write while it ran ({', '.join(guard.refused)}); a package "
+            "returns its DataFrame, and the runner writes it. Nothing was written"
+        )
+    columns = _conformed_columns(spark, output, package["schema"])
+    output.select(*columns).createOrReplaceTempView(PACKAGE_VIEW)
+    queries = config["sql"]
+    checked = spark.sql(queries["check"])
+    # Computed once for both writes: Spark recomputes a lost block from the package's
+    # plan, so a package's output should be deterministic.
+    checked = checked.persist(StorageLevel.MEMORY_AND_DISK)
+    try:
+        counts = {row[0]: int(row[1]) for row in checked.groupBy(ERROR_COLUMN).count().collect()}
+        failures = {reason: n for reason, n in counts.items() if reason is not None}
+        failed = sum(failures.values())
+        changed = [t for t in watched if table_marker(spark, t) != before[t]]
+        if changed:
+            raise PackageError(
+                f"{', '.join(changed)} changed while the package ran: a commit the runner did "
+                "not make. The runner wrote nothing; read the table's snapshots and roll back "
+                "what the package wrote"
+            )
+        land, write = package_outcome(failed, dead)
+        if land:
+            write_package_dead_letters(
+                spark, checked, dead_table, columns, run_id, package["sha256"]
+            )
+            log("dead_letters", table=dead_table, records=failed, reasons=failures)
+        if not write:
+            raise PackageError(
+                (
+                    f"{failed} rows of the package's output fail the contract's checks "
+                    f"({_reasons(failures)}) and the build has no dead letters: nothing was "
+                    "written. Fix the package, or add properties.package.deadLetter"
+                )
+                if dead is None
+                else (
+                    f"{failed} rows went to the dead letters ({_reasons(failures)}), past "
+                    f"maxRecordsBeforeAbort {dead['maxRecordsBeforeAbort']}: the output was "
+                    "not written"
+                )
+            )
+        write_package_output(checked, table, columns, package["sha256"])
+        log("done", table=table, rows=sum(counts.values()) - failed, dead_letters=failed)
+    finally:
+        checked.unpersist()
 
 
 if __name__ == "__main__":
