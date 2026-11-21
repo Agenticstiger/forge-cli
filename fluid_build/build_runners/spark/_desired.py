@@ -812,16 +812,6 @@ def desired_runs(
         # A local run reads its artifacts where the operator keeps them, in the same layout
         # as the S3 objects OpenTofu uploads on AWS (fluid_build/spark/names.py).
         root = LOCAL_ROOT_TOKEN if local else f"s3://{bucket}"
-        package = config.get("package")
-        package_fields: Dict[str, Any] = {}
-        if package:
-            package_fields = {
-                # The compiled config says what runs; where it comes from is the build's.
-                "package_source": str((build.get("properties") or {})["package"]["uri"]),
-                "package_sha256": str(package["sha256"]),
-                "package_entry_point": str(package["entryPoint"]),
-                "package_uri": _names.package_uri(root, product, bid, str(package["sha256"])),
-            }
         runs.append(
             DesiredRun(
                 product=product,
@@ -848,10 +838,27 @@ def desired_runs(
                 topic=source.get("topic") if isinstance(source, Mapping) else None,
                 restarts_per_hour=restart_budget(build, scheduled),
                 job_text=job.text,
-                **package_fields,
+                **_package_fields(build, config, root, product, bid),
             )
         )
     return [run.bind(account) for run in runs] if account else runs
+
+
+def _package_fields(
+    build: Mapping[str, Any], config: Mapping[str, Any], root: str, product: str, bid: str
+) -> Dict[str, Any]:
+    """A prebuilt package build's :class:`DesiredRun` fields, none for any other build: the
+    compiled config says what runs, the build where it comes from."""
+    package = config.get("package")
+    if not package:
+        return {}
+    sha = str(package["sha256"])
+    return {
+        "package_source": str((build.get("properties") or {})["package"]["uri"]),
+        "package_sha256": sha,
+        "package_entry_point": str(package["entryPoint"]),
+        "package_uri": _names.package_uri(root, product, bid, sha),
+    }
 
 
 def plan_actions(contract: Mapping[str, Any], **kwargs: Any) -> List[Dict[str, Any]]:

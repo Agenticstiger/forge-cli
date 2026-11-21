@@ -393,12 +393,10 @@ def runtime_errors(build: Mapping[str, Any]) -> List[str]:
     # On emr-ec2 a step runs as the cluster's own role, and a local run as its machine's
     # user, so there is no role to require.
     if batch and not cfg.get("executionRoleArn") and cfg.get("runtime") not in ("emr-ec2", "local"):
-        # A prebuilt package reads what its own code names, as SQL does.
-        reader = "its package" if isinstance(props, Mapping) and props.get("package") else "its SQL"
         errors.append(
-            f"Spark build {bid}: a batch job reads tables {reader} names, which forge cannot "
-            "grant a role it derives; set parameters.spark.executionRoleArn to a role the "
-            "operator scoped to those tables"
+            f"Spark build {bid}: a batch job reads tables its SQL or package names, which forge "
+            "cannot grant a role it derives; set parameters.spark.executionRoleArn to a role "
+            "the operator scoped to those tables"
         )
     return errors
 

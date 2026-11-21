@@ -954,14 +954,15 @@ def compile_job_config(
     queries: dict[str, Any]
     package_block: Optional[dict[str, Any]] = None
     if package_spec is not None:
+        # The code the contract brings, as its own SQL is: the operator's to approve.
         package_block = _package_block(
-            package_spec, cfg["runtime"], fields, database, table, local, where
+            package_spec,
+            cfg["runtime"],
+            fields,
+            (database, table, local),
+            where,
+            gate=(product, bid, environ) if contract_sql_gate else None,
         )
-        if contract_sql_gate:
-            # The code the contract brings, as its own SQL is: the operator's to approve.
-            from fluid_build.spark.policy import refuse_unless_package_allowed
-
-            refuse_unless_package_allowed(product, bid, package_spec["uri"], environ)
         queries = {"check": package_block.pop("check")}
     else:
         if sql is not None:
@@ -988,15 +989,18 @@ def compile_job_config(
     if dead_letters is not None:
         _add_dead_letters(config, dead_letters, masked=bool(masked))
     if local and host_gate:
-        tables = [f"{database}.{table}"]
-        if dead_letters is not None and dead_letters.get("table"):
-            tables.append(str(dead_letters["table"]))
-        if package_block is not None and package_block["deadLetter"]:
-            tables.append(str(package_block["deadLetter"]["table"]))
+        tables = [f"{database}.{table}", *_dead_letter_tables(config)]
         _refuse_unless_namespace_listed(
             bid, local_namespace_scope(resolved), database, tables, environ
         )
     return SparkJob(config)
+
+
+def _dead_letter_tables(config: Mapping[str, Any]) -> list[str]:
+    """The dead-letter tables a job writes beside its output: a stream's (``deadLetter``) or
+    a package build's (``package.deadLetter``)."""
+    blocks = (config.get("deadLetter"), (config.get("package") or {}).get("deadLetter"))
+    return [str(b["table"]) for b in blocks if isinstance(b, Mapping) and b.get("table")]
 
 
 def _parsed_dead_letters(stream_spec: Mapping[str, Any], stream: Any, where: str) -> Any:
@@ -1091,19 +1095,28 @@ def _package_block(
     spec: Any,
     runtime: Any,
     fields: Any,
-    database: str,
-    table: str,
-    local: bool,
+    output: tuple[str, str, bool],
     where: str,
+    *,
+    gate: Optional[tuple[Any, Any, Optional[Mapping[str, str]]]],
 ) -> dict[str, Any]:
     """The job config's ``package``: the digest the runner checks the copy beside the job
     config against, the entry point and its arguments, the output's declared columns and
     types, and the dead letters' table; plus ``check``, the query that gives each row its
     dead-letter reason, which goes into ``sql``. Where the team published the package is not
-    in it: the runner reads forge's copy only."""
+    in it: the runner reads forge's copy only.
+
+    ``output`` is ``(database, table, local)``; ``gate``, ``(product, build, environ)`` to
+    apply the operator's package list (``spark/policy.py``), or None to leave it to the
+    caller."""
     from fluid_build.spark import package as _package
 
+    database, table, local = output
     parsed = _package.parse_package(spec, runtime, where)
+    if gate is not None:
+        from fluid_build.spark.policy import refuse_unless_package_allowed
+
+        refuse_unless_package_allowed(gate[0], gate[1], parsed.uri, gate[2])
     if any(name.casefold() == dead_letter.ERROR_COLUMN for name, _ in fields):
         raise ValueError(
             f"{where}: the output declares a column named {dead_letter.ERROR_COLUMN}, which the "

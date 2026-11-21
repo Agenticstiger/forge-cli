@@ -118,7 +118,7 @@ def test_the_job_role_reads_its_own_prefix_and_never_the_store(contract):
 def test_a_role_forge_derives_cannot_read_what_a_package_reads(contract, monkeypatch):
     params = serverless(contract, monkeypatch)["builds"][0]["properties"]["parameters"]["spark"]
     params.pop("executionRoleArn")
-    with pytest.raises(UnsupportedBindingError, match="tables its package names"):
+    with pytest.raises(UnsupportedBindingError, match="tables its SQL or package names"):
         emit(contract)
 
 

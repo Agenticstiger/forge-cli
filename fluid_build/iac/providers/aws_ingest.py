@@ -1036,23 +1036,55 @@ def _refuse_unsupported_dead_letter_table(
             "letters' table, which holds the records' raw bytes"
         )
     if problem:
-        package = bool(b.config.get("package"))
+        shape = _dead_letter_shape(b)
         raise UnsupportedBindingError(
             "spark-dead-letters-table-unsupported",
-            f"{b.where}: properties.{'package' if package else 'stream'}.deadLetter writes a "
-            f"table of its own beside the output, and {problem}.",
-            (
-                (
-                    "Set properties.package.deadLetter.enabled: false: a row that fails the "
-                    "checks then fails the run, and nothing is written.",
-                )
-                if package
-                else (
-                    "Send the dead letters to a topic (deadLetter.sink: topic), whose retention "
-                    "is the topic's.",
-                )
+            f"{b.where}: {shape.field} writes a table of its own beside the output, and "
+            f"{problem}.",
+            (shape.fix,),
+        )
+
+
+@dataclass(frozen=True)
+class _DeadLetterShape:
+    """A build's dead letters as the emitters below name and hold them."""
+
+    field: str
+    schema: Tuple[Mapping[str, Any], ...]
+    fix: str
+    description: str
+
+
+def _dead_letter_shape(b: _Build) -> _DeadLetterShape:
+    """A stream's dead letters (records with their topic and offset), or a package build's
+    (rows of its output: ``properties.package.deadLetter``)."""
+    from fluid_build.spark.dead_letter import BATCH_SCHEMA, SCHEMA
+
+    if b.config.get("package"):
+        return _DeadLetterShape(
+            field="properties.package.deadLetter",
+            schema=BATCH_SCHEMA,
+            fix=(
+                "Set properties.package.deadLetter.enabled: false: a row that fails the checks "
+                "then fails the run, and nothing is written."
+            ),
+            description=(
+                f"The rows of the forge Spark build {b.build_id}'s package that failed the "
+                "checks for {table}, with why, the run and the package's sha256"
             ),
         )
+    return _DeadLetterShape(
+        field="properties.stream.deadLetter",
+        schema=SCHEMA,
+        fix=(
+            "Send the dead letters to a topic (deadLetter.sink: topic), whose retention is the "
+            "topic's."
+        ),
+        description=(
+            f"The records the forge Spark build {b.build_id} could not land in {{table}}, with "
+            "why and where they were read"
+        ),
+    )
 
 
 def _emit_dead_letter_table(
@@ -1069,14 +1101,11 @@ def _emit_dead_letter_table(
     always under the output's ``governance.lakeFormation``, and without one where the
     account's Lake Formation settings govern new tables (``_lake_formation_default``)."""
     from fluid_build.iac.governance_labels import governance_labels
-    from fluid_build.spark.dead_letter import BATCH_SCHEMA, SCHEMA
 
     from . import aws as _aws  # imported here: aws imports this module
 
     # A package build's dead letters are rows of its output, with no topic or offset.
-    package = bool(b.config.get("package"))
-    schema = BATCH_SCHEMA if package else SCHEMA
-    field = "properties.package.deadLetter" if package else "properties.stream.deadLetter"
+    shape = _dead_letter_shape(b)
     binding = expose.get("binding") or {}
     loc = dict(binding.get("location") or {})
     database = str(loc.get("database"))
@@ -1086,7 +1115,7 @@ def _emit_dead_letter_table(
     emitted: Dict[str, Dict[str, Any]] = {}
     _aws._emit_glue(
         emitted,
-        [dict(column) for column in schema],
+        [dict(column) for column in shape.schema],
         b.ctx.cid,
         tags,
         # The output's binding, at the dead letters' own table and prefix; unpartitioned
@@ -1103,18 +1132,12 @@ def _emit_dead_letter_table(
     )
     key = safe_ident(f"{b.ctx.cid}_{database}_{dead_table}")
     body = emitted["aws_glue_catalog_table"][key]
-    body["description"] = (
-        f"The rows of the forge Spark build {b.build_id}'s package that failed the checks for "
-        f"{database}.{loc.get('table')}, with why, the run and the package's sha256"
-        if package
-        else f"The records the forge Spark build {b.build_id} could not land in "
-        f"{database}.{loc.get('table')}, with why and where they were read"
-    )
+    body["description"] = shape.description.format(table=f"{database}.{loc.get('table')}")
     tables = blocks.resources.setdefault("aws_glue_catalog_table", {})
     if key in tables:
         raise UnsupportedBindingError(
             "spark-address-conflict",
-            f"{b.where}: {field}.table {database}.{dead_table} is another "
+            f"{b.where}: {shape.field}.table {database}.{dead_table} is another "
             "Spark build's dead-letter table.",
             ("Give each build's dead letters a table of their own.",),
         )
