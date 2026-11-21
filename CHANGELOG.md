@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid datamesh-manager publish` takes a folder, and `fluid datamesh-manager promote` moves
+  drafts to active.** `publish` accepts contract files, glob patterns and folders (a folder is
+  searched for `*.fluid.yaml` at any depth, the way `fluid genie apply` already searches one; the
+  expansion is now one shared helper). A folder, a glob or several contracts publish as one
+  batch, each product after the products it consumes (`consumes[].productId`, a standard-library
+  topological sort in a stable order); one file named outright is the single publish it always
+  was. A loop of products that consume each other, two files declaring one product id, and a
+  folder with no contract are refused before anything is sent, each with a stable error code.
+  The product list is read once for the batch, and the access-agreement pre-flight reuses it
+  instead of listing every product again. A product that fails (or fails `--validation-mode
+  strict`) blocks only the products that consume it, the others go on, and a re-run resumes.
+  `--status draft|active` manages the lifecycle, and a status only moves forward: `draft` never
+  demotes a product Entropy already holds as active, a deprecated product keeps its status, and a
+  retired product is skipped in a batch (an error for one file), because Entropy keeps it
+  retired. A product Entropy cannot be read for is an error, never guessed at. `--dry-run` reads
+  the product list and says what the real run would skip or keep. `--format json` prints one
+  report. `promote` moves draft products to active, named by contract or with `--id`;
+  `--verify-report` (a `fluid verify --out` file, or a folder of them) promotes only the products
+  whose newest report is clean (no error or mismatch, no port left unverified under
+  `--require-every-port`, at least one port checked, every output port the contract declares
+  covered, and no drift or failed refresh in the reconcile, state-drift or lineage sections) and
+  exits 1 for the rest. A publish without `--status` behaves as before. One change on the single-publish path: a
+  contract the loader cannot read now shows the CLI's typed error (code, next steps) instead of
+  `Error: <event>`, with that error's own exit code.
+
 - **`fluid profile` counts children per parent for each declared relationship.** When one call
   profiles both exposes of a `semantics.relationships` entry, without `--bundle`, the
   document's `relationships[]` (PROFILE-SPEC §5, format unchanged) carries a

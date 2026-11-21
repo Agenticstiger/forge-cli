@@ -10,6 +10,8 @@ Usage:
   fluid datamesh-manager publish contract.fluid.yaml
   fluid datamesh-manager publish contract.fluid.yaml --dry-run
   fluid datamesh-manager publish contract.fluid.yaml --with-contract
+  fluid datamesh-manager publish products/ --status draft     # a folder, upstream products first
+  fluid datamesh-manager promote products/ --verify-report reports/   # draft -> active
   fluid datamesh-manager list
   fluid datamesh-manager get <product-id>
   fluid datamesh-manager delete <product-id>
@@ -36,6 +38,7 @@ except ImportError:
 
 from typing import TYPE_CHECKING
 
+from fluid_build._contract_loader import CLIError
 from fluid_build.cli.bootstrap import load_contract_with_overlay
 from fluid_build.providers.base import ProviderError
 
@@ -80,8 +83,17 @@ def add_parser(subparsers):
     dmm_sub = parser.add_subparsers(dest="dmm_command")
 
     # --- publish -----------------------------------------------------------
-    pub = dmm_sub.add_parser("publish", help="Publish data product to Entropy Data")
-    pub.add_argument("contract", help="Path to FLUID contract file")
+    pub = dmm_sub.add_parser("publish", help="Publish data product(s) to Entropy Data")
+    pub.add_argument(
+        "contract",
+        nargs="+",
+        metavar="CONTRACT",
+        help=(
+            "FLUID contract file, glob pattern or folder (a folder is searched for "
+            "*.fluid.yaml at any depth). A folder, a glob or several contracts publish as one "
+            "batch, each product after the products it consumes; one file is a single publish."
+        ),
+    )
     pub.add_argument("-o", "--overlay", help="Path to overlay file")
     pub.add_argument("--team-id", help="Team ID (default: from contract owner)")
     pub.add_argument("--dry-run", action="store_true", help="Preview without publishing")
@@ -161,6 +173,27 @@ def add_parser(subparsers):
         help="Return non-zero exit code if any ODCS contract publish fails.",
     )
     pub.add_argument(
+        "--status",
+        choices=["draft", "active"],
+        help=(
+            "Manage the lifecycle: send this status instead of the contract's own. A status "
+            "only moves forward: 'draft' never demotes a product Entropy already holds as "
+            "active, a deprecated product keeps its status, and a retired product is skipped "
+            "(Entropy keeps it retired; one contract named outright is an error instead). "
+            "Promote drafts later with 'fluid datamesh-manager promote'."
+        ),
+    )
+    pub.add_argument(
+        "--format",
+        "-f",
+        choices=["text", "json"],
+        default="text",
+        help=(
+            "Output format (default: text). json prints one machine-readable report: the batch "
+            "report for a folder, a glob or several contracts, the provider's result for one file."
+        ),
+    )
+    pub.add_argument(
         "--api-key",
         help="Entropy Data API key (or set DMM_API_KEY env var)",
     )
@@ -169,6 +202,61 @@ def add_parser(subparsers):
         help="API base URL (default: https://api.entropy-data.com)",
     )
     pub.set_defaults(func=_cmd_publish)
+
+    # --- promote -----------------------------------------------------------
+    pm = dmm_sub.add_parser(
+        "promote",
+        help="Promote draft data products to active (optionally only those that passed verify)",
+        description=(
+            "Move draft data products to active. Name the products by contract (file, glob or "
+            "folder) and/or with --id. With --verify-report, a product is promoted only when "
+            "the newest 'fluid verify --out' report for it is clean; the rest are held back and "
+            "the command exits 1. An active product is left as it is; a deprecated or retired "
+            "one is never promoted."
+        ),
+    )
+    pm.add_argument(
+        "contract",
+        nargs="*",
+        metavar="CONTRACT",
+        help="contract file, glob pattern or folder whose products to promote",
+    )
+    pm.add_argument(
+        "-o",
+        "--overlay",
+        help="Environment overlay the contracts are read with (as 'fluid verify --env' reads them)",
+    )
+    pm.add_argument(
+        "--id",
+        dest="product_ids",
+        action="append",
+        default=[],
+        metavar="PRODUCT_ID",
+        help="a data product id in Entropy Data (repeatable)",
+    )
+    pm.add_argument(
+        "--verify-report",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "a 'fluid verify --out' report, or a folder of them (repeatable). Gates the "
+            "promotion on a clean report for each product."
+        ),
+    )
+    pm.add_argument(
+        "--dry-run", action="store_true", help="Read each product and say what would be promoted"
+    )
+    pm.add_argument(
+        "--format",
+        "-f",
+        choices=["text", "json"],
+        default="text",
+        help="Output format (default: text)",
+    )
+    pm.add_argument("--api-key", help="Entropy Data API key (or set DMM_API_KEY env var)")
+    pm.add_argument("--api-url", help="API base URL (default: https://api.entropy-data.com)")
+    pm.set_defaults(func=_cmd_promote)
 
     # --- list --------------------------------------------------------------
     ls = dmm_sub.add_parser("list", help="List all data products")
@@ -338,11 +426,45 @@ def _validate_fluid_contract(contract: dict, validation_mode: str, logger: loggi
     return 0
 
 
+def _publish_kwargs(args) -> dict:
+    """The ``provider.apply`` keyword arguments a publish takes from the CLI arguments
+    (everything but ``dry_run``, ``status`` and ``held_product_ids``, which the caller owns)."""
+    return {
+        "team_id": getattr(args, "team_id", None),
+        "create_team": not getattr(args, "no_create_team", False),
+        "publish_contract": getattr(args, "with_contract", False),
+        "contract_format": getattr(args, "contract_format", "odcs"),
+        "data_product_specification": getattr(args, "data_product_spec", None),
+        "provider_hint": getattr(args, "provider", None),
+        "validate_generated_contracts": getattr(args, "validate_generated_contracts", False),
+        "validation_mode": getattr(args, "validation_mode", "warn"),
+        "odps_lineage_mode": getattr(args, "odps_lineage_mode", None),
+        "auto_approve_access": getattr(args, "auto_approve_access", False),
+    }
+
+
 def _cmd_publish(args, logger=None):
-    """Execute publish command."""
+    """Execute publish command: one contract as before, several as an upstream-first batch."""
     log = logger or logging.getLogger(__name__)
     try:
-        contract = load_contract_with_overlay(args.contract, getattr(args, "overlay", None), log)
+        from fluid_build.cli._dmm_batch import (
+            needs_expansion,
+            resolve_contract_paths,
+            run_publish,
+            stdout_to_stderr,
+        )
+
+        requested = [args.contract] if isinstance(args.contract, str) else list(args.contract)
+        paths = resolve_contract_paths(requested)
+        # A folder or a glob is a batch whatever it holds today, so the output and the exit
+        # codes do not change when the folder grows from one contract to two; one file named
+        # outright is the single publish.
+        if len(paths) > 1 or needs_expansion(requested):
+            return run_publish(args, paths, log)
+
+        machine = getattr(args, "format", "text") == "json"
+        with stdout_to_stderr(machine):
+            contract = load_contract_with_overlay(paths[0], getattr(args, "overlay", None), log)
 
         # Enforce the CLI's role as master coordinator: the loaded FLUID
         # contract must conform to ``fluid-schema-0.7.2.json`` (or whatever
@@ -352,29 +474,23 @@ def _cmd_publish(args, logger=None):
         # Gated by ``--validation-mode`` (strict aborts on errors; warn logs
         # and continues, preserving backward compatibility).
         validation_mode = getattr(args, "validation_mode", "warn")
-        rc = _validate_fluid_contract(contract, validation_mode, log)
+        with stdout_to_stderr(machine):
+            rc = _validate_fluid_contract(contract, validation_mode, log)
         if rc != 0:
             return rc
 
         provider = _make_provider(args)
 
-        data_product_spec = getattr(args, "data_product_spec", None)
-        provider_hint = getattr(args, "provider", None)
-
         result = provider.apply(
             contract,
             dry_run=args.dry_run,
-            team_id=getattr(args, "team_id", None),
-            create_team=not getattr(args, "no_create_team", False),
-            publish_contract=getattr(args, "with_contract", False),
-            contract_format=getattr(args, "contract_format", "odcs"),
-            data_product_specification=data_product_spec,
-            provider_hint=provider_hint,
-            validate_generated_contracts=getattr(args, "validate_generated_contracts", False),
-            validation_mode=getattr(args, "validation_mode", "warn"),
-            odps_lineage_mode=getattr(args, "odps_lineage_mode", None),
-            auto_approve_access=getattr(args, "auto_approve_access", False),
+            status=getattr(args, "status", None),
+            **_publish_kwargs(args),
         )
+
+        if machine:
+            cprint_json(json.dumps(result, indent=2, default=str))
+            return 0 if args.dry_run else _publish_exit_code(result, args)
 
         if args.dry_run:
             _print_dry_run(result)
@@ -383,10 +499,29 @@ def _cmd_publish(args, logger=None):
         _print_publish_result(result)
         return _publish_exit_code(result, args)
 
+    except CLIError:
+        raise  # typed: the CLI's top-level handler shows its slug and what to do
     except ProviderError as exc:
         console_error(f"Error: {exc}")
         return 1
     except Exception as exc:
+        console_error(f"Error: {exc}")
+        return 1
+
+
+def _cmd_promote(args, logger=None):
+    """Promote draft data products to active, optionally gated on ``fluid verify`` reports."""
+    log = logger or logging.getLogger(__name__)
+    try:
+        from fluid_build.cli._dmm_promote import run_promote
+
+        return run_promote(args, log)
+    except CLIError:
+        raise
+    except ProviderError as exc:
+        console_error(f"Error: {exc}")
+        return 1
+    except Exception as exc:  # a contract the loader cannot read, as in publish
         console_error(f"Error: {exc}")
         return 1
 

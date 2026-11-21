@@ -179,6 +179,46 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         None,
     ),
+    "dmm_batch_no_contracts": (
+        [
+            "A folder is searched for files named *.fluid.yaml, *.fluid.yml or *.fluid.json at any depth",
+            "Check the folder path, or name the contract files or a glob pattern instead",
+        ],
+        None,
+    ),
+    "dmm_batch_duplicate_product": (
+        [
+            "Give each contract its own product id, or leave the extra copy out of the run",
+            "Run 'fluid validate <contract>' on each file named above",
+        ],
+        None,
+    ),
+    "dmm_batch_dependency_cycle": (
+        [
+            "Remove one consumes[] entry from the loop: a product cannot consume a product that consumes it",
+            "Run 'fluid dmm publish <folder> --dry-run' again to check the order",
+        ],
+        None,
+    ),
+    "dmm_verify_report_unreadable": (
+        [
+            "Pass a report written by 'fluid verify <contract> --out report.json'",
+            "Or pass the folder that holds the reports: files in it that are not verify reports are skipped",
+        ],
+        None,
+    ),
+    "dmm_promote_nothing_named": (
+        [
+            "Name the products to promote: 'fluid dmm promote products/' or 'fluid dmm promote --id <product-id>'",
+        ],
+        None,
+    ),
+    "dmm_promote_contract_without_id": (
+        [
+            "A contract needs a top-level id to name its product; run 'fluid validate <contract>'",
+        ],
+        None,
+    ),
     # ── schema / version ───────────────────────────────────────────────────
     "invalid_schema_version": (
         [
