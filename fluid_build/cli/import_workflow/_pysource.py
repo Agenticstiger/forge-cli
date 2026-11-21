@@ -42,6 +42,10 @@ MAX_BRACES = 50_000
 #: Source one scan reads in all, and the most syntax-tree nodes kept parsed at once (about
 #: 280 MB: a node of a dense file costs up to 1.4 KB, parent links included).
 MAX_TOTAL_BYTES = 64 * 1024 * 1024
+#: Characters of SQL one import parses in all (a statement is parsed once per file, whatever the
+#: number of calls that pass it): the parser takes about 4 ms per kilobyte, so this is some twelve
+#: seconds at the most.
+MAX_TOTAL_SQL_CHARS = 1_500_000
 MAX_CACHED_NODES = 200_000
 #: Most Python files one walk keeps, and directory entries it reads, and levels it descends.
 MAX_FILES = 5_000
@@ -168,6 +172,17 @@ class SourceBudget:
     left: int = MAX_TOTAL_BYTES
     #: Files not read because the budget was spent.
     skipped: int = 0
+    #: Characters of SQL still to parse (:data:`MAX_TOTAL_SQL_CHARS`), and statements left alone.
+    sql_left: int = MAX_TOTAL_SQL_CHARS
+    sql_skipped: int = 0
+
+    def take_sql(self, size: int) -> bool:
+        """Charge a statement of ``size`` characters; ``False`` when the SQL budget is spent."""
+        if size > self.sql_left:
+            self.sql_skipped += 1
+            return False
+        self.sql_left -= size
+        return True
 
     def take(self, size: int) -> bool:
         if size > self.left:

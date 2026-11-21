@@ -207,7 +207,7 @@ def run_import(
         linked, unlinked = link_tasks(dag_scan.dags, scans, conv, project_root=None)
 
     _scan_report(tool, scans, dag_scan, linked, unlinked, report)
-    budget_note(budget.skipped, report.notes)
+    budget_note(budget.skipped, report.notes, budget.sql_skipped)
     jobs = [job for scan in scans for job in scan.jobs]
     if not jobs and not any(scan.other_files for scan in scans) and tool == "pyspark":
         raise refusal(

@@ -33,6 +33,7 @@ from ._conventions import Conventions
 from ._fold import ModuleIndex
 from ._pysource import (
     MAX_TOTAL_BYTES,
+    MAX_TOTAL_SQL_CHARS,
     SourceBudget,
     SourceUnreadable,
     clean_chars,
@@ -105,12 +106,18 @@ def _display(path: Path, rel: str) -> str:
 MAX_REFS_PER_SCAN = 200_000
 
 
-def budget_note(skipped: int, notes: List[str]) -> None:
-    """Say how many files the source budget left unread (nothing when it left none)."""
+def budget_note(skipped: int, notes: List[str], sql_skipped: int = 0) -> None:
+    """Say how many files the source budget left unread, and how many SQL statements the SQL
+    budget left alone (nothing when it left none)."""
     if skipped:
         notes.append(
             f"stopped reading after {MAX_TOTAL_BYTES // (1024 * 1024)} MB of source: {skipped} "
             "file(s) not read"
+        )
+    if sql_skipped:
+        notes.append(
+            f"stopped parsing SQL after {MAX_TOTAL_SQL_CHARS:,} characters: {sql_skipped} "
+            "statement(s) not read"
         )
 
 
@@ -167,7 +174,7 @@ def scan_jobs(
             # a helper's note (a name from a parameter) still matters to the person reading
             scan.notes.extend(facts.notes)
     if budget is None:
-        budget_note(index.budget.skipped, scan.notes)
+        budget_note(index.budget.skipped, scan.notes, index.budget.sql_skipped)
     return scan
 
 
@@ -208,7 +215,7 @@ def scan_dags(
         scan.notes.extend(found.notes)
     scan.dags.sort(key=lambda d: (d.file, d.line))
     if budget is None:
-        budget_note(index.budget.skipped, scan.notes)
+        budget_note(index.budget.skipped, scan.notes, index.budget.sql_skipped)
     return scan
 
 

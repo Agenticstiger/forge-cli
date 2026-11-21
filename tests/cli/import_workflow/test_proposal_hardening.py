@@ -603,6 +603,44 @@ def test_no_credential_in_a_path_reaches_an_id_a_file_name_or_a_binding(tmp_path
 # ── what the fan-out of a job's reads costs ───────────────────────────
 
 
+def test_one_import_parses_a_bounded_amount_of_sql_and_says_what_it_left(tmp_path, monkeypatch):
+    from fluid_build.cli.import_workflow import _pipeline
+    from fluid_build.cli.import_workflow._pysource import SourceBudget
+
+    monkeypatch.chdir(tmp_path)
+    pad = ", ".join(f"c{i}" for i in range(100))  # about 500 characters a statement
+    calls = "\n".join(
+        f'spark.sql("insert into out.t{i} select {pad} from db.t{i}")' for i in range(6)
+    )
+    write(tmp_path, {"jobs/sql.py": "spark = SparkSession.builder.getOrCreate()\n" + calls + "\n"})
+    monkeypatch.setattr(_pipeline, "SourceBudget", lambda: SourceBudget(sql_left=2000))
+    contracts, report = propose(tmp_path)
+    assert (
+        len(contracts) == 3
+    )  # three statements (about 640 characters each) fit in 2,000; three were left
+    said = [n for n in report.notes if "stopped parsing SQL after" in n]
+    assert len(said) == 1 and "1,500,000 characters" in said[0] and "3 statement(s)" in said[0]
+
+
+def test_the_same_sql_text_is_charged_once(tmp_path, monkeypatch):
+    from fluid_build.cli.import_workflow import _pipeline
+    from fluid_build.cli.import_workflow._pysource import SourceBudget
+
+    monkeypatch.chdir(tmp_path)
+    call = 'spark.sql("insert into out.t select a, b, c from db.t")'
+    write(
+        tmp_path,
+        {
+            "jobs/sql.py": "spark = SparkSession.builder.getOrCreate()\n"
+            + "\n".join([call] * 50)
+            + "\n"
+        },
+    )
+    monkeypatch.setattr(_pipeline, "SourceBudget", lambda: SourceBudget(sql_left=100))
+    contracts, report = propose(tmp_path)
+    assert len(contracts) == 1 and not [n for n in report.notes if "SQL" in n and "not read" in n]
+
+
 def test_a_job_with_many_outputs_and_reads_is_refused_before_it_is_listed_everywhere(
     tmp_path, monkeypatch
 ):

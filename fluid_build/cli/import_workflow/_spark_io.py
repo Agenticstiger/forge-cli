@@ -49,7 +49,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 
 from . import _spark_sql
 from ._fold import FoldedDict, Folder, Unresolved
-from ._pysource import Module, clean_chars, qualified_name, snippet
+from ._pysource import MAX_TOTAL_SQL_CHARS, Module, clean_chars, qualified_name, snippet
 from ._redact import scrub_host, scrub_path
 
 #: Receivers whose ``.table(...)`` and ``.sql(...)`` are Spark's. The conventions add names; a
@@ -652,7 +652,7 @@ class _Reader:
         key = (prepared, tuple(sorted(holes.items())))
         sql = self._sql_cache.get(key)
         if sql is None:
-            sql = self._sql_cache[key] = _spark_sql.analyze(prepared, holes)
+            sql = self._sql_cache[key] = self._analyze_sql(prepared, holes)
         self.temp_views.update(sql.temp_views)
         for note in sql.notes:
             self.facts.notes.append(f"{self.file}:{call.lineno} {note}")
@@ -662,6 +662,20 @@ class _Reader:
         for write in sql.writes:
             ref = self._from_sql_name(write.name, call)
             self._add_write(ref, mode=write.mode)
+
+    def _analyze_sql(self, prepared: str, holes: Dict[str, str]) -> _spark_sql.SqlFacts:
+        """What the parser finds in a statement, unless this import has parsed all the SQL it
+        parses (a text too long to parse costs nothing and is not charged)."""
+        index = self.folder.index
+        charged = index is not None and len(prepared) <= _spark_sql.MAX_SQL_CHARS
+        if charged and not index.budget.take_sql(len(prepared)):  # type: ignore[union-attr]
+            skipped = _spark_sql.SqlFacts()
+            skipped.notes.append(
+                f"SQL was not read: one import parses at most {MAX_TOTAL_SQL_CHARS:,} characters "
+                "of SQL in all"
+            )
+            return skipped
+        return _spark_sql.analyze(prepared, holes)
 
     def _from_sql_name(self, name: _spark_sql.SqlName, call: ast.Call) -> Ref:
         rel, line = self.file, call.lineno
