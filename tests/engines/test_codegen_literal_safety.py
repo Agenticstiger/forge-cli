@@ -145,6 +145,19 @@ def test_comment_text_is_one_line_and_keeps_plain_text():
     assert py_comment_text(None) == ""
 
 
+def test_comment_text_cannot_declare_an_encoding():
+    import io
+    import tokenize
+
+    assert py_comment_text("coding: utf-7") == "coding : utf-7"
+    assert py_comment_text("a coding=latin-1 b") == "a coding =latin-1 b"
+    assert py_comment_text("fileencoding=utf-7") == "fileencoding =utf-7"
+    assert py_comment_text("encoding utf-8, decoding") == "encoding utf-8, decoding"
+    # The interpreter's own reader finds no declaration in a comment built from it.
+    line = f"# {py_comment_text('vim: set fileencoding=utf-7 coding: utf-7 coding=utf-7')}\n"
+    assert tokenize.detect_encoding(io.BytesIO(line.encode()).readline)[0] == "utf-8"
+
+
 def test_unique_identifiers_suffix_a_collision_in_order():
     assert unique_identifiers(["stage_a-b", "stage_a.b", "stage_a_b", "stage_c"]) == [
         "stage_a_b",
