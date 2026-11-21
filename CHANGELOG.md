@@ -29,18 +29,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the organisation's layout as data (script prefixes, data path prefixes, helper function names,
   config modules, environment names, owners, layers, what to ignore, the product id rule); it is
   read strictly and no code in it runs. `--registry` reads a written topic's columns through the
-  existing schema-registry importer, only when asked. Every proposal is validated against the
-  schema before anything is written, credentials in command lines and argument lists are masked
+  existing schema-registry importer, only when asked. Every proposal is checked by `fluid
+  validate`'s own rules (the schema and every contract rule) before anything is written, so what
+  the command writes is what `fluid validate` reads back without an error. A table in a Spark
+  catalog (`glue_catalog.raw.orders`) gets `binding.location.catalog` only when its kind is
+  known: the alias is a kind FLUID knows, a conventions rule maps it, or the scanned code sets
+  `spark.sql.catalog.<alias>.type` or a `catalog-impl` (Glue, REST, Hive, Nessie, Hadoop) in
+  `builder.config`, `conf.set`, a dict or a `--conf`; otherwise the binding has none and the
+  report says to set it, because an alias is no kind and `fluid validate` refuses it.
+  Credentials in command lines and argument lists are masked
   word by word, with the command's lines, comments and quoting kept (`NAME=value`, `--password`,
   `-uUSER:PASS`, `mysql -pSECRET`, a header or a cookie, a JSON value, a `sig=`, `key=` or `code=`
-  in a URL, `bash -c`), the user information of a data path or a host (an AWS secret with a slash
+  in a URL, `bash -c`, the password of an Oracle JDBC URL), the user information of a data path or a host (an AWS secret with a slash
   included) never reaches an id, a file name or a binding, and a second import never replaces a
   file that differs from what it would write unless `--force` is given. The reading is bounded: a
   file over 300 KB, or with more than 50,000 `{` characters (in the encoding Python reads it in:
   CPython parses a long f-string in time that grows with the square of its fields), is not
   parsed; one import reads at most 64 MB of source, keeps at most 200,000 syntax-tree nodes parsed
   at once and spends at most 2 MB on reading dropped modules again; the work spent folding a name,
-  the text a module's memo keeps and the size of a string are capped; one import parses at most
+  the text a module's memo keeps and the size of a string are capped (4,096 characters, 262,144
+  for the statement a `spark.sql` takes, and what a module builds in all); one import parses at most
   1,500,000 characters of SQL (a statement once per file); a table or path name over 512
   characters is not kept; a job records at most 1,000 of its tasks, a command keeps its first 20
   submits and a task lists at most 100 arguments; one proposal holds at most 50,000 outputs and
@@ -219,6 +227,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--impact` report.
 
 ### Fixed
+
+- **The redactor masks the password of an Oracle JDBC URL, a Slack incoming webhook, and a
+  Google API key that follows a word character.** `jdbc:oracle:thin:user/password@host` (also
+  `@//host`, `oci`, `oci8` and `kprb`, in any case, with a password that holds an `@`, quoted
+  or not) has no `://` and no `:` before the password, so neither the URL user-information rule
+  nor the `user:password` one saw it, and it was logged and written as it stood while the
+  PostgreSQL form was masked. A Slack webhook URL is a secret by itself and is masked whole, and
+  `GOOGLE_AIza...` and `%3DAIza...` leaked because the key rule wanted a word boundary before it.
+  The global redactor and the Snowflake provider's own share the Oracle rule's one regex.
 
 - **Entropy Data's product list is read whole or not at all.** A page after the first that was
   not a list (a rate-limit answer, say) used to hand back the pages before it as if they were
