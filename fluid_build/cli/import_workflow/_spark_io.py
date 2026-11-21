@@ -48,7 +48,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from . import _spark_sql
-from ._fold import FoldedDict, Folder, Unresolved
+from ._fold import MAX_SQL_STRING, FoldedDict, Folder, Unresolved
 from ._pysource import MAX_TOTAL_SQL_CHARS, Module, clean_chars, qualified_name, snippet
 from ._redact import scrub_host, scrub_path
 
@@ -644,7 +644,7 @@ class _Reader:
         node = self._arg(call, 0, "sqlQuery")
         if node is None:
             return
-        value, holes = self.folder.fold_sql(node)
+        value, holes = self.folder.fold_sql(node, limit=MAX_SQL_STRING)
         if isinstance(value, Unresolved):
             if _PARAMETER in value.why:
                 self.parameter_named += 1

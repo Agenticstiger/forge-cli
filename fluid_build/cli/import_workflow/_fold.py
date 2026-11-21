@@ -16,7 +16,8 @@ What it folds, and nothing else:
 * f-strings with plain fields, ``+``, ``"%s" % x`` and ``"{}".format(x)`` with plain fields,
   and a few pure ``str`` methods. These run on this module's own code, never on ``str.format``
   or ``%`` of the project's text, so a hostile format string (``{:>999999999}``) cannot spend
-  memory, and results over :data:`MAX_STRING` characters are refused;
+  memory, and results over :data:`MAX_STRING` characters (:data:`MAX_SQL_STRING` for SQL, read
+  with :meth:`Folder.fold_sql`) are refused;
 * a name assigned ONCE in its scope (a function, then the module), a class attribute of a
   class in the same module, and a constant of another module of the scanned tree (see
   :class:`ModuleIndex`); a name assigned twice, a parameter, a loop variable or a name from a
@@ -52,6 +53,16 @@ from ._pysource import (
 #: Deepest expression :meth:`Folder.fold` follows, and the longest string it builds.
 MAX_FOLD_DEPTH = 40
 MAX_STRING = 4096
+#: The longest string :meth:`Folder.fold_sql` builds: SQL is a long literal (a page of a
+#: report, a view) far more often than any other text the folder reads. It stays inside the
+#: size of a file the scan reads, and the SQL parser has its own, lower limit
+#: (``_spark_sql.MAX_SQL_CHARS``) that says so when it is passed.
+MAX_SQL_STRING = 262_144
+#: Characters of string one module may have its folds build (an f-string, a ``+``, a
+#: ``.format``, a join): a long string built over and over from a long literal is as costly as
+#: it is long, and this is the bound that keeps SQL, which may be long, as cheap as any other
+#: text. A module that builds more is told so, as one that takes too many steps is.
+MAX_STRING_WORK = 64_000_000
 #: Most containers elements folded in one literal.
 MAX_ITEMS = 2_000
 #: Most nodes one top-level :meth:`Folder.fold` call may visit, and one module in all: the work a
@@ -572,9 +583,9 @@ _FIELD = re.compile(r"\{(?P<name>[A-Za-z_][A-Za-z0-9_]*|\d*)\}")
 _PERCENT = re.compile(r"%(?:\((?P<key>[^)]*)\))?(?P<conv>[sdr%])")
 
 
-def _too_long(text: str) -> Optional[Unresolved]:
-    if len(text) > MAX_STRING:
-        return Unresolved(f"it is longer than {MAX_STRING} characters", text[:60] + "...")
+def _too_long(text: str, limit: int = MAX_STRING) -> Optional[Unresolved]:
+    if len(text) > limit:
+        return Unresolved(f"it is longer than {limit} characters", text[:60] + "...")
     return None
 
 
@@ -583,6 +594,7 @@ def format_template(
     args: Sequence[Any],
     kwargs: Mapping[str, Any],
     hole: Optional[Callable[[Union[int, str]], str]] = None,
+    limit: int = MAX_STRING,
 ) -> Union[str, Unresolved]:
     """``fmt.format(*args, **kwargs)`` for plain ``{}``, ``{0}`` and ``{name}`` fields only.
 
@@ -628,8 +640,8 @@ def format_template(
             else:
                 piece = str(value)
                 size += len(piece)
-                if size > MAX_STRING:
-                    return Unresolved(f"it is longer than {MAX_STRING} characters", "")
+                if size > limit:
+                    return Unresolved(f"it is longer than {limit} characters", "")
                 out.append(piece)
             i = match.end()
         elif char == "}":
@@ -644,11 +656,14 @@ def format_template(
     text = "".join(out)
     if unresolved is not None:
         return Unresolved(unresolved, text)
-    return _too_long(text) or text
+    return _too_long(text, limit) or text
 
 
 def percent_template(
-    fmt: str, operand: Any, hole: Optional[Callable[[Union[int, str]], str]] = None
+    fmt: str,
+    operand: Any,
+    hole: Optional[Callable[[Union[int, str]], str]] = None,
+    limit: int = MAX_STRING,
 ) -> Union[str, Unresolved]:
     """``fmt % operand`` for ``%s``, ``%d``, ``%r``, ``%%`` and ``%(key)s`` only. A ``%s``
     whose value is unresolved becomes the token ``hole(key)`` returns, when given (``key`` is
@@ -699,13 +714,13 @@ def percent_template(
         else:
             piece = str(value)
         size += len(piece)
-        if size > MAX_STRING:
-            return Unresolved(f"it is longer than {MAX_STRING} characters", "")
+        if size > limit:
+            return Unresolved(f"it is longer than {limit} characters", "")
         out.append(piece)
     if not keyed and pos != len(positional):
         return Unresolved("the percent format and its operands do not match", fmt)
     text = "".join(out)
-    return _too_long(text) or text
+    return _too_long(text, limit) or text
 
 
 # ── the module index ──────────────────────────────────────────────────
@@ -885,6 +900,12 @@ class Folder:
         #: While folding text that must stay parseable (SQL), an unresolved field is replaced
         #: by a token and recorded here: ``{token: what it stood for}``.
         self._holes: Optional[Dict[str, str]] = None
+        #: The longest string a fold may build: :data:`MAX_STRING`, or what :meth:`fold_sql` is
+        #: given. A fold under a longer limit remembers nothing, so a longer string never reaches
+        #: a fold that has the shorter one.
+        self._limit = MAX_STRING
+        #: Characters of string the folds of this module have built (:data:`MAX_STRING_WORK`).
+        self._work = 0
         self._module_scope = self._scope(module.tree, None)
         #: Folded values by ``(node, scope)``: an expression that many names refer to is folded
         #: once, so a chain of names each built from the one before costs one pass, not a tree.
@@ -946,7 +967,7 @@ class Folder:
         if key in self._active:
             return Unresolved("it refers to itself", snippet(node))
         memo_key = (key, id(scope))
-        remember = self._holes is None
+        remember = self._holes is None and self._limit == MAX_STRING
         if remember and memo_key in self._memo:
             return self._memo[memo_key]
         self._active.add(key)
@@ -960,6 +981,11 @@ class Folder:
         finally:
             self._active.discard(key)
             self._nesting -= 1
+        if isinstance(value, str) and isinstance(node, (ast.JoinedStr, ast.BinOp, ast.Call)):
+            self._work += len(value)  # a string this fold built, not one it found
+            if self._work > MAX_STRING_WORK:
+                self.exhausted = True
+                value = Unresolved("it takes too much work to fold", snippet(node), transient=True)
         if remember and not (isinstance(value, Unresolved) and value.transient):
             weight = _text_size(value)
             if self._memo_chars + weight <= MAX_MEMO_CHARS:
@@ -968,18 +994,21 @@ class Folder:
         return value
 
     def fold_sql(
-        self, node: ast.AST, scope: Optional[Scope] = None
+        self, node: ast.AST, scope: Optional[Scope] = None, limit: int = MAX_STRING
     ) -> Tuple[Union[str, Unresolved], Dict[str, str]]:
         """:meth:`fold` for text that must stay parseable, SQL: a field of an f-string, a
         ``.format``, a ``%`` or a ``+`` that does not fold becomes a token (``__fluidhole0__``)
         instead of making the whole text unresolved. Returns the text and ``{token: what it
-        stood for}``; text with no hole is exactly what :meth:`fold` gives."""
+        stood for}``; text with no hole is exactly what :meth:`fold` gives. ``limit`` is the
+        longest string it builds (:data:`MAX_SQL_STRING` for a ``spark.sql`` statement, which
+        may be long; the default for any other text that must stay parseable, a command line)."""
         holes: Dict[str, str] = {}
         previous, self._holes = self._holes, holes
+        previous_limit, self._limit = self._limit, limit
         try:
             value = self.fold(node, scope)
         finally:
-            self._holes = previous
+            self._holes, self._limit = previous, previous_limit
         if isinstance(value, str) or isinstance(value, Unresolved):
             return value, holes
         return Unresolved("it is not a string", snippet(node)), holes
@@ -998,6 +1027,9 @@ class Folder:
             return self._hole(snippet(node, 40) if node is not None else str(key))
 
         return hole
+
+    def _too_long(self, text: str) -> Optional[Unresolved]:
+        return _too_long(text, self._limit)
 
     def _hole(self, described: str) -> str:
         assert self._holes is not None
@@ -1018,7 +1050,7 @@ class Folder:
         value = node.value
         if is_scalar(value):
             if isinstance(value, str):
-                return _too_long(value) or value
+                return self._too_long(value) or value
             return value
         return Unresolved("a value that is not text or a number", snippet(node))
 
@@ -1101,8 +1133,8 @@ class Folder:
                     unresolved = unresolved or why
                     piece = "{" + snippet(part.value, 40) + "}"
             size += len(piece)
-            if size > MAX_STRING:
-                return Unresolved(f"it is longer than {MAX_STRING} characters", "")
+            if size > self._limit:
+                return Unresolved(f"it is longer than {self._limit} characters", "")
             parts.append(piece)
         text = "".join(parts)
         if unresolved is not None:
@@ -1119,7 +1151,7 @@ class Folder:
                 if isinstance(right, Unresolved):
                     right = self._hole(right.text or snippet(node.right, 40))
             if isinstance(left, str) and isinstance(right, str):
-                return _too_long(left + right) or left + right
+                return self._too_long(left + right) or left + right
             if isinstance(left, list) and isinstance(right, list):
                 if len(left) + len(right) > MAX_ITEMS:
                     return Unresolved("a list with too many items", snippet(node, 60))
@@ -1152,7 +1184,10 @@ class Folder:
                 if isinstance(key, ast.Constant) and isinstance(key.value, str)
             }
             return percent_template(
-                left, self.fold(right, scope, depth), self._hole_for(positional, keyed)
+                left,
+                self.fold(right, scope, depth),
+                self._hole_for(positional, keyed),
+                self._limit,
             )
         return Unresolved("an arithmetic expression", snippet(node))
 
@@ -1236,7 +1271,11 @@ class Folder:
             return Unresolved(found, snippet(origin))
         module, chain = found
         other = self.index.folder(module)
-        return other.attribute_chain(chain, depth, origin)
+        previous, other._limit = other._limit, self._limit  # SQL in another file is SQL too
+        try:
+            return other.attribute_chain(chain, depth, origin)
+        finally:
+            other._limit = previous
 
     def attribute_chain(self, chain: Sequence[str], depth: int, origin: ast.AST) -> Any:
         """Fold ``chain[0]`` in this module, then (when more is named) a class attribute."""
@@ -1331,7 +1370,7 @@ class Folder:
             parts = [self.fold(arg, scope, depth) for arg in node.args]
             if all(isinstance(p, str) for p in parts):
                 joined = posixpath.join(*parts)
-                return _too_long(joined) or joined
+                return self._too_long(joined) or joined
             why = next((p.why for p in parts if isinstance(p, Unresolved)), "not text")
             return Unresolved(why, snippet(node))
         if qualified == "str" and len(node.args) == 1 and not node.keywords:
@@ -1361,7 +1400,7 @@ class Folder:
                 kwargs[keyword.arg] = self.fold(keyword.value, scope, depth)
             keyed_nodes = {kw.arg: kw.value for kw in node.keywords if kw.arg}
             return format_template(
-                receiver, args, kwargs, self._hole_for(list(node.args), keyed_nodes)
+                receiver, args, kwargs, self._hole_for(list(node.args), keyed_nodes), self._limit
             )
         if node.keywords:
             return Unresolved(f"a call to str.{method} with keywords", snippet(node))
@@ -1369,24 +1408,24 @@ class Folder:
             if all(isinstance(item, str) for item in args[0]) and getattr(
                 args[0], "complete", True
             ):
-                if sum(len(item) for item in args[0]) + len(receiver) * len(args[0]) > MAX_STRING:
-                    return Unresolved(f"it is longer than {MAX_STRING} characters", "")
+                if sum(len(item) for item in args[0]) + len(receiver) * len(args[0]) > self._limit:
+                    return Unresolved(f"it is longer than {self._limit} characters", "")
                 joined = receiver.join(args[0])
-                return _too_long(joined) or joined
+                return self._too_long(joined) or joined
             return Unresolved("a join of values that are not all text", snippet(node))
         if method in _STR_METHODS and all(isinstance(arg, str) for arg in args):
             if method in {"lower", "upper"} and not args:
                 changed = getattr(receiver, method)()  # a case change can lengthen a string
-                return _too_long(changed) or changed
+                return self._too_long(changed) or changed
             if method in {"strip", "lstrip", "rstrip"} and len(args) <= 1:
                 return getattr(receiver, method)(*args)
             if method == "replace" and len(args) == 2:
                 old, new = args
                 times = receiver.count(old) if old else len(receiver) + 1
-                if len(receiver) + times * (len(new) - len(old)) > MAX_STRING:
-                    return Unresolved(f"it is longer than {MAX_STRING} characters", "")
+                if len(receiver) + times * (len(new) - len(old)) > self._limit:
+                    return Unresolved(f"it is longer than {self._limit} characters", "")
                 replaced = receiver.replace(old, new)
-                return _too_long(replaced) or replaced
+                return self._too_long(replaced) or replaced
             if method in {"removeprefix", "removesuffix"} and len(args) == 1:
                 return getattr(receiver, method)(args[0])
         return Unresolved(f"a call to str.{method}", snippet(node))
