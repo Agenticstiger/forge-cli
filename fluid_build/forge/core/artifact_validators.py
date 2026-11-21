@@ -17,6 +17,7 @@ validators:
     policy/bindings.json   → key-check + OPA conftest (optional)
     spark/<build-id>/job.json → structural check of the forge Spark job config
     pyspark-schema/*_schema.py → the PySpark schema module allowlist
+    custom-scaffold/**     → MANIFEST only; fluid-scaffold.lock must be YAML
     <dir>/dbt/             → dbt parse (optional, for speed-transformation output)
 
 Reuses ``ValidationIssue`` / ``BundleValidationReport`` from Phase 3's
@@ -594,6 +595,35 @@ def validate_pyspark_schema_module(path: str, content: bytes) -> List[Validation
     ]
 
 
+#: The file the custom-scaffold engine records what generated a scaffold in.
+_SCAFFOLD_LOCK = "fluid-scaffold.lock"
+
+
+def validate_custom_scaffold_file(path: str, content: bytes) -> List[ValidationIssue]:
+    """A ``custom-scaffold/`` file: its bytes are the bundle's, in any format, so the
+    MANIFEST digest is the check; the engine's ``fluid-scaffold.lock`` must parse as a YAML
+    mapping."""
+    if path != f"custom-scaffold/{_SCAFFOLD_LOCK}":
+        return []
+    try:
+        doc = yaml.safe_load(content.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        doc, why = None, f"parse failure: {exc}"
+    else:
+        why = f"expected a mapping at root, got {type(doc).__name__}"
+    if isinstance(doc, dict):
+        return []
+    return [
+        ValidationIssue(
+            file=path,
+            validator="custom-scaffold",
+            severity="error",
+            message=why,
+            code="CUSTOM-SCAFFOLD-LOCK",
+        )
+    ]
+
+
 def validate_bindings_json(path: str, content: bytes) -> List[ValidationIssue]:
     """Structural key-check on ``policy/bindings.json``.
 
@@ -917,6 +947,8 @@ def _dispatch_by_prefix(path: str, content: bytes) -> Callable[[str, bytes], Lis
         return validate_spark_job_json
     if path.startswith("pyspark-schema/"):
         return validate_pyspark_schema_module
+    if path.startswith("custom-scaffold/"):
+        return validate_custom_scaffold_file
     # Unknown — bind a no-op validator that flags it as a warning.
     return _flag_unexpected
 
@@ -1038,6 +1070,7 @@ __all__ = [
     "validate_odps_bitol",
     "validate_opa_conftest",
     "validate_opds",
+    "validate_custom_scaffold_file",
     "validate_pyspark_schema_module",
     "validate_spark_job_json",
 ]

@@ -556,6 +556,75 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         None,
     ),
     # ── plan / apply / generate ────────────────────────────────────────────
+    # ``fluid generate artifacts`` emit key custom-scaffold
+    # (forge/core/custom_scaffold_artifacts.py): the optional engine and its refusals.
+    "custom_scaffold_engine_missing": (
+        [
+            "Install the engine: pip install 'data-product-forge[custom-scaffold]'",
+            "Or leave custom-scaffold out of --emit to generate the other artifacts",
+        ],
+        None,
+    ),
+    "custom_scaffold_engine_too_old": (
+        ["Upgrade the engine: pip install --upgrade 'data-product-forge[custom-scaffold]'"],
+        None,
+    ),
+    "custom_scaffold_contract_invalid": (
+        [
+            "Run 'fluid validate <contract>' to list every problem in extensions.customScaffold",
+            "Every pattern's use: must name a library the block declares (<library id>:<pattern>)",
+        ],
+        None,
+    ),
+    "custom_scaffold_plugin_blocked": (
+        [
+            "An entrypoint bundle is an installed plugin: the operator allows it in "
+            "FLUID_PLUGINS_ALLOWLIST and must not list it in FLUID_PLUGINS_BLOCKLIST",
+            "Or name the bundle by a path or git source instead",
+        ],
+        None,
+    ),
+    "custom_scaffold_bundle_failed": (
+        [
+            "Check the library's source: a relative path: source is read from the contract's "
+            "directory",
+            "A git source with auth needs its host in FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS and a "
+            "secret_ref that starts with FLUID_SCAFFOLD_, both set where the command runs",
+        ],
+        None,
+    ),
+    "custom_scaffold_plan_failed": (
+        [
+            "A pattern failed to render: check the variables it passes and the contract "
+            "fields its templates read",
+        ],
+        None,
+    ),
+    "custom_scaffold_unsafe_path": (
+        [
+            "A template's to: path must stay inside the output: no absolute path, no '..'",
+            "The scaffold may write regular files only: no links",
+        ],
+        None,
+    ),
+    "custom_scaffold_apply_failed": (
+        ["Check that --out is a directory this user can write to"],
+        None,
+    ),
+    "custom_scaffold_output_failed": (
+        [
+            "The engine reported files that differ from what it wrote: re-run; if it repeats, "
+            "the bundle's plugin writes outside its plan",
+        ],
+        None,
+    ),
+    "custom_scaffold_failed": (
+        [
+            "Run 'fluid validate <contract>' first to rule out a contract problem",
+            "Re-run with --log-level DEBUG to see the engine's own log",
+        ],
+        None,
+    ),
     "generate_pyspark_schema_failed": (
         [
             "Run 'fluid validate <contract>' first to rule out a contract problem",

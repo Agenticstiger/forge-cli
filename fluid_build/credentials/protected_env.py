@@ -586,6 +586,13 @@ PROTECTED_ENV_PREFIXES: Tuple[str, ...] = (
     # a project file must not choose which credential is sent, or where
     "FLUID_LAKEKEEPER_",
     "FLUID_MCP_JWT_",
+    # the custom-scaffold engine's operator settings, which ``fluid generate artifacts``
+    # runs it under (forge/core/custom_scaffold_artifacts.py): the hosts a bundle
+    # credential may be sent to (``_AUTH_HOSTS``), the variable prefixes a contract's
+    # ``secret_ref`` may name besides ``FLUID_SCAFFOLD_`` (``_SECRET_PREFIXES``) and
+    # where cloned bundles are cached (``_CACHE``). The ``FLUID_SCAFFOLD_*`` credentials
+    # themselves stay loadable.
+    "FLUID_CUSTOM_SCAFFOLD_",
     "FLUID_LLM_DEFAULT_MODEL_",
     # credentials the Debezium runner itself sets: it writes each credential
     # property of Debezium Server's application.properties as

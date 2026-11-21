@@ -86,6 +86,7 @@ REQUIRABLE_ARTIFACTS: Tuple[str, ...] = (
     "schedule",
     "policies",
     "pyspark-schema",
+    "custom-scaffold",
 )
 
 
@@ -1008,6 +1009,13 @@ def _key_problems(key: str, root: Path, files: Mapping[str, object]) -> List[str
     if key == "pyspark-schema":
         module = _top_level("pyspark-schema", "_schema.py")
         return _one_or_more(root, files, key, "PySpark schema module (pyspark-schema/*.py)", module)
+    if key == "custom-scaffold":
+        what = (
+            "custom-scaffold file (the contract declares no extensions.customScaffold, or the "
+            "custom-scaffold engine is not installed: pip install "
+            "'data-product-forge[custom-scaffold]')"
+        )
+        return _one_or_more(root, files, key, what, lambda rel: rel.startswith("custom-scaffold/"))
     what = (
         "schedule file (orchestration.engine is none, or it is unset and no build has a "
         "schedule trigger)"

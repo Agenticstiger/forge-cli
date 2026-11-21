@@ -186,8 +186,8 @@ def _add_artifact_options(g: argparse._ArgumentGroup) -> None:
         metavar="LIST",
         help=(
             "Stage 3 fails unless this run writes each (repeatable, comma-separated): odcs "
-            "(one per port), odps-bitol, opds, policies, schedule, pyspark-schema. "
-            "Earlier runs' files never count."
+            "(one per port), odps-bitol, opds, policies, schedule, pyspark-schema, "
+            "custom-scaffold. Earlier runs' files never count."
         ),
     )
 

@@ -263,6 +263,27 @@ def test_pyspark_schema_is_not_in_the_default_emit_set_so_requiring_it_is_refuse
     )
 
 
+def test_a_required_custom_scaffold_written_passes(
+    work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outputs = {**_ALL_OUTPUTS, "custom-scaffold/.gitlab-ci.yml": b"stages: []\n"}
+    _install(monkeypatch, FakeStages(outputs))
+    keys = ["--require-artifacts", "custom-scaffold"]
+    assert _ship(["--until", "validate-artifacts", *keys]) == 0
+    assert _stage3(work)["status"] == "passed"
+
+
+def test_a_required_custom_scaffold_stage_three_did_not_write_fails_and_says_why(
+    work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install(monkeypatch, FakeStages(dict(_ALL_OUTPUTS)))
+    keys = ["--require-artifacts", "custom-scaffold"]
+    assert _ship(["--until", "validate-artifacts", *keys]) == 1
+    reason = str(_stage3(work)["reason"])
+    assert "custom-scaffold: stage 3 wrote no custom-scaffold file" in reason
+    assert "data-product-forge[custom-scaffold]" in reason
+
+
 def test_blank_emit_means_the_default_set() -> None:
     from fluid_build.forge.core.artifact_fanout import DEFAULT_EMIT, EMIT_KEYS
 

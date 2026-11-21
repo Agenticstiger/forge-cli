@@ -26,7 +26,8 @@ Output layout (full default emit set)::
     │                                       #   another product's DAGs (Path A)
     ├── policy/bindings.json                # compiled IAM/GRANT bindings
     ├── spark/<build-id>/job.json           # forge Spark job config, as OpenTofu uploads it
-    └── pyspark-schema/<port>_schema.py     # --emit pyspark-schema: StructType per port
+    ├── pyspark-schema/<port>_schema.py     # --emit pyspark-schema: StructType per port
+    └── custom-scaffold/...                 # extensions.customScaffold, through its engine
 
 Note on terminology: **OPDS** is fluid's name for the Linux Foundation / ODPI
 Open Data Product *Specification* v4.1. Upstream abbreviates it *ODPS*, but that
@@ -101,6 +102,7 @@ EMIT_KEYS: Tuple[str, ...] = (
     "policies",
     "spark",
     "pyspark-schema",
+    "custom-scaffold",
 )
 
 # Default emit set. Every schema-pinned emitter validates against its vendored
@@ -117,8 +119,12 @@ EMIT_KEYS: Tuple[str, ...] = (
 # - policies     → compiled IAM bindings; shape is internal
 # - spark        → each forge Spark build's job.json, the bytes OpenTofu uploads
 #                  (nothing for a contract without one)
+# - custom-scaffold → the files the contract's ``extensions.customScaffold`` block
+#                  generates, through the optional custom-scaffold engine (nothing for
+#                  a contract without the block; skipped with a warning when the
+#                  engine is not installed)
 #
-# Six of the seven emit keys are on by default. ``pyspark-schema`` (a PySpark
+# Seven of the eight emit keys are on by default. ``pyspark-schema`` (a PySpark
 # ``StructType`` module per output port, ``fluid generate pyspark-schema``'s) is
 # requested by name: on by default it would fail stage 3 for every contract with a
 # column Spark has no type for, whether or not a Spark job reads the product. Order
@@ -131,6 +137,7 @@ DEFAULT_EMIT: Tuple[str, ...] = (
     "schedule",
     "policies",
     "spark",
+    "custom-scaffold",
 )
 
 # Emit keys auto-skipped purely on the basis of the build *pattern*.
@@ -1042,6 +1049,58 @@ def _clear_pyspark_schema(directory: Path) -> None:
         directory.rmdir()
 
 
+def _scaffold_contract_dir(
+    bundle_or_contract: Path,
+    source_path: Optional[Path],
+    contract_path: Optional[str],
+) -> Tuple[Optional[Path], str]:
+    """The directory the engine anchors a relative ``path:`` source at, or ``(None, why)``.
+
+    The contract's own directory: a raw contract's, the raw contract a temporary ``--env``
+    bundle was made from, a bundle's recorded source contract (``fluid bundle`` records
+    it), else the ``--contract-path`` file when it exists here. ``None`` leaves the
+    engine's default, the current directory.
+    """
+    if source_path is not None:
+        return Path(source_path).resolve().parent, ""
+    if not _is_tgz_input(bundle_or_contract):
+        return Path(bundle_or_contract).resolve().parent, ""
+    from fluid_build._contract_loader import resolve_source_contract
+
+    recorded, why = resolve_source_contract(bundle_or_contract)
+    if recorded is not None:
+        return recorded.parent, ""
+    if contract_path and Path(contract_path).is_file():
+        return Path(contract_path).resolve().parent, ""
+    return None, f"{bundle_or_contract} {why}" if why else str(bundle_or_contract)
+
+
+def _emit_custom_scaffold(
+    contract_path: Path,
+    out_dir: Path,
+    logger: logging.Logger,
+    *,
+    required: bool,
+    contract_dir: Optional[Path],
+    contract_dir_note: str = "",
+) -> List[Path]:
+    """The files ``extensions.customScaffold`` generates, under ``custom-scaffold/``.
+
+    Delegates to :mod:`fluid_build.forge.core.custom_scaffold_artifacts`, which runs the
+    optional engine; this module only decides where the output and the contract are.
+    """
+    from fluid_build.forge.core import custom_scaffold_artifacts
+
+    return custom_scaffold_artifacts.emit(
+        _load_contract(contract_path),
+        out_dir,
+        logger,
+        required=required,
+        contract_dir=contract_dir,
+        contract_dir_note=contract_dir_note,
+    )
+
+
 _DISPATCH = {
     "odps-bitol": ("odps-bitol", _emit_odps_bitol),
     "odcs": ("odcs", _emit_odcs),
@@ -1050,6 +1109,7 @@ _DISPATCH = {
     "policies": ("policy", _emit_policies),
     "spark": ("spark", _emit_spark),
     "pyspark-schema": ("pyspark-schema", _emit_pyspark_schema),
+    "custom-scaffold": ("custom-scaffold", _emit_custom_scaffold),
 }
 
 
@@ -1139,6 +1199,9 @@ def run_fanout(
             shutil.rmtree(target)
     _clear_spark(out_dir / "spark")
     _clear_pyspark_schema(out_dir / "pyspark-schema")
+    from fluid_build.forge.core import custom_scaffold_artifacts
+
+    custom_scaffold_artifacts.clear(out_dir)
 
     dag_contract_path = contract_path
     if dag_contract_path is None:
@@ -1201,6 +1264,19 @@ def run_fanout(
                 # The original input too: the contract as `generate pyspark-schema` loads it.
                 files = _emit_pyspark_schema(
                     bundle_or_contract, subdir, logger, overlay_env=overlay_env
+                )
+            elif key == "custom-scaffold":
+                anchor, anchor_note = _scaffold_contract_dir(
+                    bundle_or_contract, source_path, contract_path
+                )
+                files = _emit_custom_scaffold(
+                    resolved_contract,
+                    subdir,
+                    logger,
+                    # Named in --emit: a missing engine is an error, not a skip.
+                    required=bool(emit_raw and emit_raw.strip()),
+                    contract_dir=anchor,
+                    contract_dir_note=anchor_note,
                 )
             else:
                 files = fn(resolved_contract, subdir, logger)

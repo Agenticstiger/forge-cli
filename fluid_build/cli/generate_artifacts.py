@@ -5,7 +5,8 @@
 
 Fanout wrapper that takes a stage-1 bundle (.tgz) and emits catalog-ready
 artifacts (ODCS, ODPS-Bitol, OPDS v4.1 LF/ODPI, schedule DAGs, policy
-bindings, Spark job configs, PySpark schema modules) into a single directory with a unified MANIFEST.json. ``opds`` is
+bindings, Spark job configs, PySpark schema modules, the contract's custom
+scaffold) into a single directory with a unified MANIFEST.json. ``opds`` is
 the canonical LF/ODPI Open Data Product Specification key; the bare ``odps``
 emit key is a deprecated alias that resolves to ``opds``. Delegates all
 emission to existing per-format commands; orchestration lives in
@@ -36,16 +37,17 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
         "artifacts",
         help=(
             "Fanout bundle → catalog artifacts (ODCS, OPDS LF/ODPI, ODPS-Bitol, schedule, "
-            "policies, Spark job configs, PySpark schemas)"
+            "policies, Spark job configs, PySpark schemas, custom scaffold)"
         ),
         description=(
             "Stage-3 of the 11-stage pipeline. Reads a Phase-2 bundle and emits "
             "ODCS per-port, ODPS-Bitol, OPDS v4.1 (LF/ODPI), schedule DAGs, "
-            "compiled policy bindings, and each forge Spark build's job.json (the "
-            "bytes OpenTofu uploads) into <out>/, with a unified MANIFEST.json "
-            "hashed over every emitted file. ``opds`` is the LF/ODPI Open Data "
-            "Product Specification key; the bare ``odps`` emit key is a deprecated "
-            "alias that resolves to ``opds``."
+            "compiled policy bindings, each forge Spark build's job.json (the "
+            "bytes OpenTofu uploads) and the files the contract's "
+            "extensions.customScaffold block generates into <out>/, with a unified "
+            "MANIFEST.json hashed over every emitted file. ``opds`` is the LF/ODPI "
+            "Open Data Product Specification key; the bare ``odps`` emit key is a "
+            "deprecated alias that resolves to ``opds``."
         ),
         epilog=(
             "Examples:\n"
@@ -58,6 +60,12 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
             "      --contract-path contracts/orders/contract.fluid.yaml\n\n"
             "  # PySpark StructType modules too (pyspark-schema/<port>_schema.py)\n"
             "  fluid generate artifacts bundle.tgz --emit odcs,pyspark-schema\n\n"
+            "custom-scaffold runs the custom-scaffold engine, an optional extra:\n"
+            "  pip install 'data-product-forge[custom-scaffold]'\n"
+            "Without it the default run skips the scaffold with a warning, and\n"
+            "--emit custom-scaffold is an error. A git bundle that authenticates needs its\n"
+            "host in FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS and a secret_ref that starts with the\n"
+            "prefix FLUID_SCAFFOLD_, both set where the command runs, never in the contract.\n\n"
             "Note: --emit dbt is NOT supported. dbt projects are execution artifacts;\n"
             "use `fluid generate speed-transformation` instead.\n"
         ),
@@ -81,11 +89,13 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
         default=None,
         help=(
             "Comma-separated emit selector. Valid: opds, odps-bitol, odcs, schedule, "
-            "policies, spark, pyspark-schema. ``spark`` writes "
+            "policies, spark, pyspark-schema, custom-scaffold. ``spark`` writes "
             "spark/<build id>/job.json for each forge Spark build; ``pyspark-schema`` "
             "writes pyspark-schema/<port>_schema.py, the module `fluid generate "
-            "pyspark-schema` writes, for each output port with columns. "
-            "``odps`` is accepted as a deprecated "
+            "pyspark-schema` writes, for each output port with columns; "
+            "``custom-scaffold`` writes custom-scaffold/, the files the contract's "
+            "extensions.customScaffold block generates (needs "
+            "data-product-forge[custom-scaffold]). ``odps`` is accepted as a deprecated "
             "alias of ``opds`` (the LF/ODPI Open Data Product Specification v4.1 target). "
             "Default: every key but pyspark-schema. "
             "``dbt`` is NOT a valid emit key — dbt projects are execution artifacts "
