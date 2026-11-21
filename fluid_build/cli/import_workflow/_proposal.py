@@ -37,7 +37,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import re
-import shlex
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath

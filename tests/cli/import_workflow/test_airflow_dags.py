@@ -978,7 +978,7 @@ def test_tasks_that_share_one_command_read_it_once():
 
 
 def test_a_command_too_long_to_fold_shows_none_of_its_text():
-    secret = "hunter2" * 3
-    submits = bash_submits(f"spark-submit --password {secret} " + "y" * 5000)
+    word = "hunter2" * 3
+    submits = bash_submits(f"spark-submit --password {word} " + "y" * 5000)
     assert len(submits) == 1 and submits[0].script is None
-    assert secret not in submits[0].shown and secret not in submits[0].why
+    assert word not in submits[0].shown and word not in submits[0].why

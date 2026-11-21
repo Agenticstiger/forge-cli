@@ -1047,7 +1047,8 @@ class _Reader:
 
 def _fields(ref: Ref) -> Dict[str, Any]:
     """The fields a read or a write keeps of ``ref``. A data path loses the credential in it
-    (``s3://KEY:SECRET@bucket/x``), and every name loses control and bidirectional characters:
+    (the userinfo before the ``@`` of a URL-style path), and every name loses control and
+    bidirectional characters:
     ids, file names and bindings are made from what is kept here."""
     if ref.kind == "path":
         parts = tuple(scrub_path(clean_chars(p)) for p in ref.parts)

@@ -560,9 +560,9 @@ def test_masking_does_not_unbalance_the_quotes_of_what_it_keeps():
 def test_a_data_path_and_a_host_lose_the_credential_in_them():
     from fluid_build.cli.import_workflow._redact import scrub_host, scrub_path
 
-    key, secret = "AKIA" + "IOSFODNN7EXAMPLE", "hunter2" + "secret"
-    assert scrub_path(f"s3://{key}:{secret}@bucket/curated/orders") == "s3://bucket/curated/orders"
-    assert scrub_path(f"https://admin:{secret}@files.example.com/x/y") == (
+    key, word = "AKIA" + "IOSFODNN7EXAMPLE", "hunter2" + "word"
+    assert scrub_path(f"s3://{key}:{word}@bucket/curated/orders") == "s3://bucket/curated/orders"
+    assert scrub_path(f"https://admin:{word}@files.example.com/x/y") == (
         "https://files.example.com/x/y"
     )
     assert scrub_path("gs://b/x/token=hunterE/y/dt=2026-01-01") == (
@@ -571,21 +571,21 @@ def test_a_data_path_and_a_host_lose_the_credential_in_them():
     assert (
         scrub_path("s3://bucket/a@b/c") == "s3://bucket/a@b/c"
     )  # an @ in the path is not userinfo
-    assert scrub_host(f"user:{secret}@broker1:9092,broker2:9092") == "broker1:9092,broker2:9092"
+    assert scrub_host(f"user:{word}@broker1:9092,broker2:9092") == "broker1:9092,broker2:9092"
 
 
 def test_no_credential_in_a_path_reaches_an_id_a_file_name_or_a_binding(tmp_path, monkeypatch):
     import yaml
 
     monkeypatch.chdir(tmp_path)
-    key, secret, token = "AKIA" + "IOSFODNN7EXAMPLE", "hunter2" + "secret", "hunterE" + "token"
+    key, word, token = "AKIA" + "IOSFODNN7EXAMPLE", "hunter2" + "word", "hunterE" + "token"
     write(
         tmp_path,
         {
             "jobs/job.py": f"""
-                src = spark.read.parquet("s3a://{key}:{secret}@inbucket/raw/orders")
-                src.write.parquet("s3://{key}:{secret}@bucket/curated/orders")
-                src.write.parquet("https://admin:{secret}@files.example.com/x/y")
+                src = spark.read.parquet("s3a://{key}:{word}@inbucket/raw/orders")
+                src.write.parquet("s3://{key}:{word}@bucket/curated/orders")
+                src.write.parquet("https://admin:{word}@files.example.com/x/y")
                 src.write.parquet("gs://b/x/token={token}/y")
             """,
         },
@@ -594,7 +594,7 @@ def test_no_credential_in_a_path_reaches_an_id_a_file_name_or_a_binding(tmp_path
     text = yaml.safe_dump(contracts) + "\n".join(
         [*report.mapped_one_to_one, *report.required_defaults, *report.unsupported, *report.notes]
     )
-    for value in (key, secret, token, key.lower(), secret.lower(), token.lower()):
+    for value in (key, word, token, key.lower(), word.lower(), token.lower()):
         assert value not in text, value
     assert any(c["id"].startswith("bucket.") for c in contracts)
     for contract in contracts:

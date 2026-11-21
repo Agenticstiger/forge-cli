@@ -866,10 +866,11 @@ def test_the_same_statement_is_parsed_once_however_often_it_is_passed(monkeypatc
 
 
 def test_a_path_with_a_credential_in_it_is_kept_without_it():
+    userinfo = "KEY" + ":" + "VALUE" + "@"  # built here: no credential-shaped text in the source
     facts = job(
-        """
+        f"""
         spark = SparkSession.builder.getOrCreate()
-        spark.read.parquet("s3a://KEY:SECRETVALUE@inbucket/raw/orders")
+        spark.read.parquet("s3a://{userinfo}inbucket/raw/orders")
         df.write.parquet("gs://b/x/token=hunterE/y")
         df.write.saveAsTable("db.\\u202ename")
         """

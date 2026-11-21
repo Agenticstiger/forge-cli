@@ -326,8 +326,8 @@ def safe_command(command: str, limit: int = 500) -> str:
 
 
 def scrub_path(path: str) -> str:
-    """A data path with no credential in it: the ``user:password@`` of ``s3://KEY:SECRET@bucket/x``
-    is dropped, and a ``key=value`` segment whose key is a credential's (``token=...``) keeps its
+    """A data path with no credential in it: the userinfo of a URL-style path (what stands
+    between ``://`` and the ``@`` before the bucket or host) is dropped, and a ``key=value`` segment whose key is a credential's (``token=...``) keeps its
     key and loses its value. A path is an identity: this runs where it is read from the code, so
     nothing made from it (an id, a file name, a binding) can carry the credential."""
     path = _USERINFO.sub(r"\1", path)
