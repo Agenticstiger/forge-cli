@@ -366,8 +366,12 @@ class _BudgetedLoader(yaml.SafeLoader):
     so grow ninefold a level inside the loader, and :func:`without_aliases`
     only sees the few keys left once the duplicates collapse. Here each node
     the file writes is one decode, each pair a merge key copies is one more,
-    and an alias decode when what it copies is reached through an alias or was
-    copied before; the budget is checked before the pairs are copied.
+    and an alias decode unless it is a pair its mapping wrote itself and the
+    mapping is copied for the first time through no alias; the budget is
+    checked before the pairs are copied. That keeps what go-yaml's rule
+    assumes: decodes that are not alias decodes stay within the text of the
+    file, so the work a document can force is bounded by a multiple of its
+    size, however its merges are nested.
 
     The copy is made here, not by ``SafeConstructor.flatten_mapping``, because
     PyYAML decides what a merge copies and has changed it. Up to 6.0.3 it
@@ -386,6 +390,8 @@ class _BudgetedLoader(yaml.SafeLoader):
         self.budget = _AliasBudget(origin)
         self.aliased: Set[yaml.Node] = set()  # the nodes an alias in the file refers to
         self.copied: Set[yaml.Node] = set()  # the mappings a merge key has copied from
+        # the pairs a mapping wrote itself, not through a merge key, counted before it is flattened
+        self.own_pairs: Dict[yaml.Node, int] = {}
 
     def compose_node(self, parent: Optional[yaml.Node], index: Any) -> Any:
         if self.check_event(yaml.AliasEvent):
@@ -396,6 +402,10 @@ class _BudgetedLoader(yaml.SafeLoader):
         return super().compose_node(parent, index)
 
     def flatten_mapping(self, node: yaml.MappingNode) -> None:
+        if node not in self.own_pairs:  # the first call sees the pairs as the file wrote them
+            self.own_pairs[node] = sum(
+                1 for key_node, _ in node.value if key_node.tag != _MERGE_TAG
+            )
         merge: List[Tuple[yaml.Node, yaml.Node]] = []
         index = 0
         while index < len(node.value):
@@ -419,10 +429,15 @@ class _BudgetedLoader(yaml.SafeLoader):
 
         Each one is flattened in the order the file lists it, and the budget is
         spent on the pairs it will copy right then, before any pair is copied.
-        The pairs are alias decodes when the merge key names an alias (also an
-        alias to a list of mappings), when the mapping is listed through an
+        All its pairs are alias decodes when the merge key names an alias (also
+        an alias to a list of mappings), when the mapping is listed through an
         alias, and when it was copied before: a second copy is a repeated
-        occurrence, which is what an alias is.
+        occurrence, which is what an alias is. Copied the first time through no
+        alias, only the pairs it wrote itself are plain decodes, and the rest
+        are alias decodes: they came into it through merges, so this copy only
+        repeats them. Counting them as plain let a chain of inline mappings,
+        each merging the one inside it, launder an aliased fan-out into plain
+        decodes and keep the alias share under the ratio that refuses it.
 
         A list is copied last to first, so that a key in a mapping listed
         earlier overrides the same key in one listed later; the mapping's own
@@ -452,10 +467,13 @@ class _BudgetedLoader(yaml.SafeLoader):
                     subnode.start_mark,
                 )
             self.flatten_mapping(subnode)
-            self.budget.spend(
-                len(subnode.value),
-                aliased=via_alias or subnode in self.aliased or subnode in self.copied,
-            )
+            repeated = via_alias or subnode in self.aliased or subnode in self.copied
+            pairs = len(subnode.value)
+            written = 0 if repeated else self.own_pairs[subnode]
+            if written:
+                self.budget.spend(written, aliased=False)
+            if pairs > written:
+                self.budget.spend(pairs - written, aliased=True)
             self.copied.add(subnode)
             sources.append(subnode)
         sources.reverse()

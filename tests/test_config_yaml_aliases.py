@@ -356,6 +356,21 @@ def _sequence_merge_laughs(depth: int, width: int = 9) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _wrapped_merge_laughs(levels: int, fanout: int, wrappers: int) -> str:
+    """``levels`` anchored mappings, each merging the one before it ``fanout`` times through
+    ``wrappers`` inline mappings nested with ``<<``. The aliased fan-out is copied up through
+    every wrapper, and a copy of an inline mapping used to count as plain decodes, which kept
+    the share of alias decodes under the ratio that refuses a document: about 2 KB then
+    expanded to 12 million copies, and 2.9 KB to 600 million (5 GB)."""
+    lines = ["x-laughs:", "  m1: &m1 {k: 1}"]
+    for level in range(2, levels + 1):
+        inner = "[" + ",".join([f"*m{level - 1}"] * fanout) + "]"
+        lines.append(
+            f"  m{level}: &m{level} {{<<: " + "{<<: " * wrappers + inner + "}" * (wrappers + 1)
+        )
+    return "\n".join(lines) + "\n"
+
+
 # Each of these completes in well under a second on a loader without a budget,
 # so a refusal is what tells them apart.
 _BOMBS = {
@@ -363,6 +378,7 @@ _BOMBS = {
     "merge-keys": _merge_laughs(6),
     "narrow-merge-keys": _merge_laughs(16, width=2),
     "sequence-merge-keys": _sequence_merge_laughs(6),
+    "wrapped-merge-keys": _wrapped_merge_laughs(10, 4, 33),
 }
 
 
@@ -443,13 +459,29 @@ def test_a_depth_nine_alias_bomb_is_refused_within_seconds(checkout, loader, nam
     # few hundred bytes. Run in a child process under a timeout (and, where the
     # platform allows, a memory cap), so that a regression fails this test
     # instead of hanging the run.
+    _a_child_refuses(checkout, loader, name, bomb(9), max_bytes=1024)
+
+
+@pytest.mark.parametrize(
+    ("loader", "name"),
+    [("config", "fluid.config.yaml"), ("market", "market.yaml")],
+    ids=["project-config", "checkout-market-file"],
+)
+def test_a_wrapped_merge_bomb_is_refused_within_seconds(checkout, loader, name):
+    # 2.8 KB: a loader that charged a copy of an inline mapping as plain decodes never refuses
+    # it (about 0.5 GB and a second here, gigabytes for a few hundred bytes more). Same child
+    # process, timeout and memory cap.
+    _a_child_refuses(checkout, loader, name, _wrapped_merge_laughs(11, 4, 40), max_bytes=4096)
+
+
+def _a_child_refuses(checkout, loader, name, text, *, max_bytes):
     import os
     import re
     import subprocess
     import sys
 
-    path = _write(checkout / name, bomb(9))
-    assert len(path.read_bytes()) < 1024
+    path = _write(checkout / name, text)
+    assert len(path.read_bytes()) < max_bytes
 
     child = subprocess.run(
         [sys.executable, "-c", _CHILD, loader],
@@ -689,7 +721,9 @@ def test_merge_keys_mean_what_the_merge_type_says_whichever_pyyaml_copies_them(p
     assert loaded["blocks"]["b7"]["timeout"] == 30 and loaded["blocks"]["b7"]["own"] == 7
 
 
-@pytest.mark.parametrize("bomb", ["merge-keys", "narrow-merge-keys", "sequence-merge-keys"])
+@pytest.mark.parametrize(
+    "bomb", ["merge-keys", "narrow-merge-keys", "sequence-merge-keys", "wrapped-merge-keys"]
+)
 def test_merge_key_bombs_are_refused_whichever_pyyaml_copies_the_merge(pyyaml, bomb):
     import yaml
 
@@ -721,6 +755,14 @@ def test_a_deep_merge_bomb_is_refused_on_pyyaml_6_0_4s_merge_copy(monkeypatch, b
     with pytest.raises(yaml.YAMLError, match="excessive aliasing"):
         load_config_file(bomb, "f.yaml")
     assert time.monotonic() - start < 5
+
+
+def test_inline_merges_nested_a_few_levels_deep_still_load_and_read_right():
+    from fluid_build.config_manager import load_config_file
+
+    text = "r:\n  <<: {<<: {<<: {a: 1, b: 1}, b: 2, c: 2}, c: 3, d: 3}\n  d: 4\n"
+    assert load_config_file(text, "f.yaml")["r"] == {"a": 1, "b": 2, "c": 3, "d": 4}
+    assert load_config_file(text, "f.yaml") == _yaml_1_1_load(text)
 
 
 def test_a_merge_the_file_lists_inline_and_once_is_not_an_alias_decode():

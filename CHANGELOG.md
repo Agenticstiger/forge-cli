@@ -55,7 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   older gap in the same guard: a merge key whose value is an alias to a list of mappings
   (`<<: *l1` over `l1: [{...}]`, repeated in one mapping, which PyYAML accepts) was never
   counted as an alias decode, so a document of a few hundred bytes expanded ninefold a level
-  inside the loader and was not refused. `pyyaml` is now `>=6.0,!=6.0.4` (also in
+  inside the loader and was not refused; nor was a chain of inline mappings that each merge
+  the one inside it (`{<<: {<<: ... {<<: [*m, *m]}}}`), which counted the copies it made as
+  plain decodes and so kept the share of alias decodes under the ratio that refuses a
+  document: 2 KB expanded to 12 million copies and 3 KB to 5 GB. Only the pairs a mapping wrote
+  itself, copied for the first time through no alias, are plain decodes now, so the work a
+  config can force is bounded by a multiple of its size. `pyyaml` is now `>=6.0,!=6.0.4` (also in
   `Dockerfile.verify`), so a fresh install never picks the release: the other YAML that `fluid`
   reads through `yaml.safe_load` (contracts, for one) would otherwise read a list of merges the
   6.0.4 way. Drop the exclusion once PyYAML fixes #953.
