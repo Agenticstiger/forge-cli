@@ -21,9 +21,9 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+import fluid_build.cli.datamesh_manager as dmm
 from fluid_build._contract_loader import CLIError
 from fluid_build.cli._dmm_promote import load_verdicts, report_verdict
-from fluid_build.cli.datamesh_manager import add_parser
 from fluid_build.providers.base import ProviderError
 
 # ── fixtures ──────────────────────────────────────────────────────────────
@@ -130,7 +130,7 @@ class FakeProvider:
 
 def _run(argv: Sequence[str], provider: FakeProvider, capsys) -> tuple:
     parser = argparse.ArgumentParser()
-    add_parser(parser.add_subparsers())
+    dmm.add_parser(parser.add_subparsers())
     args = parser.parse_args(["dmm", *argv])
     with patch("fluid_build.cli.datamesh_manager.DataMeshManagerProvider", return_value=provider):
         code = args.func(args, logging.getLogger("test"))
@@ -476,8 +476,6 @@ class TestPromoteCommand:
 
     def test_a_contract_is_read_with_the_overlay_given(self, tmp_path, capsys):
         # --overlay reaches the loader, as it does for publish (and `fluid verify --env`).
-        import fluid_build.cli.datamesh_manager as dmm
-
         _contract(tmp_path, "silver.orders")
         seen = []
         real_load = dmm.load_contract_with_overlay
@@ -496,7 +494,7 @@ class TestPromoteCommand:
 
     def test_the_parser_reads_ids_and_reports(self):
         parser = argparse.ArgumentParser()
-        add_parser(parser.add_subparsers())
+        dmm.add_parser(parser.add_subparsers())
         args = parser.parse_args(
             [
                 "dmm",

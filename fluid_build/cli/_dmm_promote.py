@@ -32,9 +32,6 @@ def _say(text: str) -> None:
     cprint_literal(text, soft_wrap=True)
 
 
-PROMOTED = "promoted"
-WOULD_PROMOTE = "would-promote"
-SKIPPED = "skipped"
 HELD_BACK = "held-back"
 FAILED = "failed"
 

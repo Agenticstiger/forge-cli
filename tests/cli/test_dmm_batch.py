@@ -21,6 +21,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+import fluid_build.cli.datamesh_manager as dmm
 from fluid_build._contract_loader import CLIError
 from fluid_build.cli._dmm_batch import (
     BatchItem,
@@ -29,7 +30,6 @@ from fluid_build.cli._dmm_batch import (
     resolve_contract_paths,
     upstream_first,
 )
-from fluid_build.cli.datamesh_manager import add_parser
 from fluid_build.providers.base import ProviderError
 from fluid_build.providers.datamesh_manager._ids import dmm_product_id
 from fluid_build.providers.datamesh_manager._lifecycle import ProductRetiredError, status_to_send
@@ -138,7 +138,7 @@ class FakeProvider:
 
 def _run_full(argv: Sequence[str], provider: FakeProvider, capsys, **patches: Any) -> tuple:
     parser = argparse.ArgumentParser()
-    add_parser(parser.add_subparsers())
+    dmm.add_parser(parser.add_subparsers())
     args = parser.parse_args(["dmm", *argv])
     with patch("fluid_build.cli.datamesh_manager.DataMeshManagerProvider", return_value=provider):
         code = args.func(args, logging.getLogger("test"))
@@ -528,8 +528,6 @@ class TestBatchLoadFailures:
     def test_a_contract_the_loader_refuses_blocks_its_consumers_by_the_id_it_declares(
         self, tmp_path, capsys
     ):
-        import fluid_build.cli.datamesh_manager as dmm
-
         real_load = dmm.load_contract_with_overlay
 
         def loader(path, env, log):
@@ -674,7 +672,7 @@ class TestSingleAndParser:
 
     def test_publish_takes_several_contracts_a_status_and_a_format(self):
         parser = argparse.ArgumentParser()
-        add_parser(parser.add_subparsers())
+        dmm.add_parser(parser.add_subparsers())
         args = parser.parse_args(["dmm", "publish", "a", "b/", "c*", "--status", "draft"])
         assert args.contract == ["a", "b/", "c*"]
         assert args.status == "draft"
