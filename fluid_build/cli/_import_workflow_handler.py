@@ -116,34 +116,42 @@ def check_import_flags(args, tool: Optional[str]) -> None:
         )
 
 
-def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Optional[str]) -> int:
-    if not source:
-        raise SchemaValidationError(
-            what=f"`fluid import {tool}` requires a positional source argument",
-            why=(
-                f"The {tool} importer needs to know what to convert "
-                f"(project dir / workspace id / pipeline name / tap config / "
-                f"dbt manifest)."
-            ),
-            fix=(
-                f"`fluid import {tool} <project-dir | workspace-id | "
-                f"pipeline-name | tap-config.json | manifest.json>`"
-            ),
-            doc="https://agenticstiger.github.io/forge_docs/cli/import.html",
-            extras={"tool": tool},
-        )
+def _require_source(tool: str, source: Optional[str]) -> str:
+    if source:
+        return source
+    raise SchemaValidationError(
+        what=f"`fluid import {tool}` requires a positional source argument",
+        why=(
+            f"The {tool} importer needs to know what to convert "
+            f"(project dir / workspace id / pipeline name / tap config / "
+            f"dbt manifest)."
+        ),
+        fix=(
+            f"`fluid import {tool} <project-dir | workspace-id | "
+            f"pipeline-name | tap-config.json | manifest.json>`"
+        ),
+        doc="https://agenticstiger.github.io/forge_docs/cli/import.html",
+        extras={"tool": tool},
+    )
 
+
+def _importer_for(tool: str):
     importer = get_importer(tool)
-    if importer is None:
-        known = importer_names()
-        raise SchemaValidationError(
-            what=f"unknown importer tool: {tool}",
-            why=f"`{tool}` is not in the registered importer set.",
-            fix=f"Use one of: {' | '.join(known)}.",
-            doc="https://agenticstiger.github.io/forge_docs/cli/import.html",
-            extras={"tool": tool, "supported": known},
-        )
+    if importer is not None:
+        return importer
+    known = importer_names()
+    raise SchemaValidationError(
+        what=f"unknown importer tool: {tool}",
+        why=f"`{tool}` is not in the registered importer set.",
+        fix=f"Use one of: {' | '.join(known)}.",
+        doc="https://agenticstiger.github.io/forge_docs/cli/import.html",
+        extras={"tool": tool, "supported": known},
+    )
 
+
+def _importer_options(args, tool: str) -> dict:
+    """What the importer is given: the boundary, the conventions and DAGs directory when the
+    user named them, the Airbyte endpoint, and the registry flags for the tools that read one."""
     # The boundary: the importers that propose products choose their own default (one product
     # per output); every other tool keeps `project`, the default it always had.
     chosen_split = getattr(args, "split_by", None)
@@ -168,8 +176,11 @@ def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Opt
                 continue
             if getattr(args, dest, None) is not None:
                 options[dest] = getattr(args, dest)
+    return options
 
-    cprint(f"📥 Importing {tool} configuration from {source}…")
+
+def _run_importer(importer, tool: str, source: str, options: dict) -> tuple:
+    """``(contracts, report)`` from the importer, or a typed refusal."""
     try:
         # Split-capable importers (dbt) expose a plural API; the rest keep the
         # single-contract Protocol shape.
@@ -182,7 +193,7 @@ def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Opt
         # any object with the report's four lists.
         if not isinstance(contracts, list) or not all(isinstance(c, dict) for c in contracts):
             raise TypeError("an importer returns a contract mapping, or a list of them")
-        report = coerce_report(report)
+        return contracts, coerce_report(report)
     except FluidUserError:
         # Already a typed refusal in the house shape, and its `fix` is the
         # specific one — "set --server-url or FLUID_IMPORT_AIRBYTE_URL", say.
@@ -202,6 +213,27 @@ def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Opt
             extras={"tool": tool, "source": source},
         ) from exc
 
+
+def _write_planned(planned: list) -> list[Path]:
+    """Write every planned file that is not already what it should be; the paths written."""
+    written: list[Path] = []
+    for path, text, state in planned:
+        if state == "unchanged":
+            _line(f"= Unchanged {path}")
+            continue
+        _write_file(path, text, state)
+        written.append(path)
+        _line(f"✓ Wrote {path}")
+    return written
+
+
+def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Optional[str]) -> int:
+    source = _require_source(tool, source)
+    importer = _importer_for(tool)
+    options = _importer_options(args, tool)
+    cprint(f"📥 Importing {tool} configuration from {source}…")
+    contracts, report = _run_importer(importer, tool, source, options)
+
     # An importer that proposes contracts for a person to complete (it sets `guards_overwrite`)
     # never replaces a file that differs from what it would write; the others overwrite, as they
     # always have.
@@ -215,21 +247,12 @@ def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Opt
         return 0
     _refuse_overwrites(planned, force=force)
 
-    written: list[Path] = []
-    for path, text, state in planned:
-        if state == "unchanged":
-            cprint(f"= Unchanged {clean_chars(str(path))}")
-            continue
-        _write_file(path, text, state)
-        written.append(path)
-        cprint_literal(f"✓ Wrote {clean_chars(str(path))}", soft_wrap=True)
+    written = _write_planned(planned)
     _print_report(report)
     if written:
-        cprint(
-            "\nNext: `fluid validate {0}` and review before applying.".format(
-                written[0] if len(written) == 1 else "<each written contract>"
-            )
-        )
+        cprint("")
+        target = written[0] if len(written) == 1 else "<each written contract>"
+        _line(f"Next: `fluid validate {target}` and review before applying.")
     return 0
 
 

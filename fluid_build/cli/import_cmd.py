@@ -88,6 +88,61 @@ def _positive_int(text: str) -> int:
     return value
 
 
+def _add_code_importer_arguments(parser: argparse.ArgumentParser) -> None:
+    """The arguments of ``fluid import airflow|pyspark``, and of ``--dry-run`` and ``--force``,
+    which every importer takes."""
+    parser.add_argument(
+        "--split-by",
+        dest="split_by",
+        choices=["project", "folder", "group", "table", "job", "dag"],
+        default=None,
+        help=(
+            "Product boundary. dbt: one contract per project (default), per top-level "
+            "models/ subfolder (folder), or per dbt group (group; cross-split refs become "
+            "cross-product consumes[]). airflow and pyspark: one product per output table or "
+            "topic (table, the default), per job file (job), per Airflow DAG (dag), per top-level "
+            "folder (folder) or one for everything (project)"
+        ),
+    )
+    parser.add_argument(
+        "--dags",
+        dest="dags",
+        default=None,
+        metavar="DIR",
+        help=(
+            "DAGs directory for `fluid import pyspark`: each DAG task is joined to the script "
+            "it submits, which adds the schedule, the owner and the dependencies"
+        ),
+    )
+    parser.add_argument(
+        "--conventions",
+        dest="conventions",
+        default=None,
+        metavar="FILE",
+        help=(
+            "The organisation's layout as data, for `fluid import airflow|pyspark`: where "
+            "scripts and data live (S3 prefixes), helper function names, config modules, "
+            "environment names, owners, layers and what to ignore"
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="Print the proposal and the report; write nothing",
+    )
+    parser.add_argument(
+        "--force",
+        dest="force",
+        action="store_true",
+        help=(
+            "Overwrite a contract file that already exists and differs from what the import "
+            "writes. airflow and pyspark never replace such a file without it; the other "
+            "importers always overwrite"
+        ),
+    )
+
+
 def register(subparsers: argparse._SubParsersAction) -> None:
     """Register the ``fluid import`` command.
 
@@ -157,56 +212,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "with --split-by producing multiple products, the output DIRECTORY"
         ),
     )
-    parser.add_argument(
-        "--split-by",
-        dest="split_by",
-        choices=["project", "folder", "group", "table", "job", "dag"],
-        default=None,
-        help=(
-            "Product boundary. dbt: one contract per project (default), per top-level "
-            "models/ subfolder (folder), or per dbt group (group; cross-split refs become "
-            "cross-product consumes[]). airflow and pyspark: one product per output table or "
-            "topic (table, the default), per job file (job), per Airflow DAG (dag), per top-level "
-            "folder (folder) or one for everything (project)"
-        ),
-    )
-    parser.add_argument(
-        "--dags",
-        dest="dags",
-        default=None,
-        metavar="DIR",
-        help=(
-            "DAGs directory for `fluid import pyspark`: each DAG task is joined to the script "
-            "it submits, which adds the schedule, the owner and the dependencies"
-        ),
-    )
-    parser.add_argument(
-        "--conventions",
-        dest="conventions",
-        default=None,
-        metavar="FILE",
-        help=(
-            "The organisation's layout as data, for `fluid import airflow|pyspark`: where "
-            "scripts and data live (S3 prefixes), helper function names, config modules, "
-            "environment names, owners, layers and what to ignore"
-        ),
-    )
-    parser.add_argument(
-        "--dry-run",
-        dest="dry_run",
-        action="store_true",
-        help="Print the proposal and the report; write nothing",
-    )
-    parser.add_argument(
-        "--force",
-        dest="force",
-        action="store_true",
-        help=(
-            "Overwrite a contract file that already exists and differs from what the import "
-            "writes. airflow and pyspark never replace such a file without it; the other "
-            "importers always overwrite"
-        ),
-    )
+    _add_code_importer_arguments(parser)
     parser.add_argument(
         "--server-url",
         dest="server_url",
