@@ -116,6 +116,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`[profile]` takes flux-stats 0.9 and every later 0.x release.** From 0.9 flux-stats is
+  versioned by its own formats and API (flux-engine ADR 0009, as amended), so a minor release no
+  longer renames what the profiler imports, and the range is `>=0.9,<1`. 0.9.0 is the first
+  release that holds the profile request reader, a boolean read as a category and profile
+  format 1-2-0. A flux-stats below 0.9 is replaced when the extra is installed.
+
 - **A dict key written before a `**spread` that does not fold is no longer taken as known.**
   `fluid import pyspark` and `fluid import airflow` read `{"table": "a", **unknown}` as a dict
   whose `table` is `a`, though the spread can replace it when the code runs: that key is now
