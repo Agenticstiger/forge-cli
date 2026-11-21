@@ -140,8 +140,16 @@ _SHELL_WORD = re.compile(r"""(?:[^\s'"\\]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+""")
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*=")
 #: Words that make a name a credential's: the redactor's own list covers ``password``, ``secret``,
 #: ``token`` and the like inside a name; these are the ones that need to be a whole word
-#: (``keyPassword`` and ``access-key`` are credentials, ``keyspace`` is not).
-_SECRET_WORDS = frozenset({"pass", "pwd", "key", "keys", "cred", "creds", "sas", "signature"})
+#: (``keyPassword`` is a credential, ``keyspace`` is not).
+_SECRET_WORDS = frozenset({"pass", "pwd", "cred", "creds", "sas", "signature"})
+#: ``key`` alone is a column in a data job (``--partition-key``, ``--primary-key``); it is a
+#: credential next to one of these (``--access-key``, ``--ssh-key``, ``--api-key``).
+_KEY_QUALIFIERS = frozenset(
+    {
+        "access", "secret", "private", "api", "auth", "ssh", "account", "storage", "signing",
+        "encryption", "master", "license", "aws", "client", "service",
+    }
+)  # fmt: skip
 _NAME_PARTS = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
 _PASSWORD_SHORT_FLAGS = frozenset({"-p", "-w"})
 _MAX_COMMAND_TEXT = 20_000
@@ -156,7 +164,10 @@ def _sensitive_name(name: str) -> bool:
         return False
     if is_sensitive_key_name(name.replace("-", "_")):
         return True
-    return any(part.lower() in _SECRET_WORDS for part in _NAME_PARTS.split(name) if part)
+    words = {part.lower() for part in _NAME_PARTS.split(name) if part}
+    if words & _SECRET_WORDS:
+        return True
+    return bool(words & {"key", "keys"}) and bool(words & _KEY_QUALIFIERS)
 
 
 class _Words:
@@ -165,7 +176,9 @@ class _Words:
 
     def __init__(self, depth: int = 0) -> None:
         self.depth = depth
-        self._mask_next = False
+        #: After a credential flag: ``True`` (mask the next word) or ``"short"`` (``-p``, ``-w``:
+        #: mask it unless it is a path or a port, as in ``mkdir -p /tmp/x`` and ``ssh -p 22``).
+        self._mask_next: Union[bool, str] = False
         self._setting_next: Optional[str] = None
         self._user_next = False
 
@@ -173,8 +186,8 @@ class _Words:
         from fluid_build.observability.secret_redactor import redact_secret_text
 
         if self._mask_next:
-            self._mask_next = False
-            if not value.startswith("-"):
+            short, self._mask_next = self._mask_next == "short", False
+            if not value.startswith("-") and not (short and _path_or_port(value)):
                 return _REDACTED
         if self._setting_next is not None:
             flag, self._setting_next = self._setting_next, None
@@ -194,7 +207,7 @@ class _Words:
             if _sensitive_name(flag) or flag in _PASSWORD_SHORT_FLAGS:
                 if equals:
                     return f"{flag}={_REDACTED}"
-                self._mask_next = True
+                self._mask_next = "short" if flag in _PASSWORD_SHORT_FLAGS else True
                 return value
             if flag == "-u" and not equals:
                 self._user_next = True
@@ -222,6 +235,10 @@ class _Words:
         if self.depth < 2 and any(c.isspace() for c in value):
             return _redact_command(value, self.depth + 1)
         return redact_secret_text(value)
+
+
+def _path_or_port(value: str) -> bool:
+    return value.isdigit() or value.startswith(("/", "./", "../", "~"))
 
 
 def _unquote(raw: str) -> str:

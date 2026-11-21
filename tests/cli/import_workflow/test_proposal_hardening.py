@@ -443,3 +443,35 @@ def test_a_proposal_with_too_many_outputs_or_products_is_refused_with_a_way_out(
     assert "5 products (the most is 2)" in refused.value.why
     contracts, _ = propose(tmp_path, split_by="project")  # one product holding them all
     assert len(contracts) == 1 and len(contracts[0]["exposes"]) == 5
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "mkdir -p /tmp/out/{{ ds }} && cp a.csv /tmp/out/",
+        "ssh -p 22 host ls",
+        "docker run -p 8080 image",
+        "hadoop fs -mkdir -p ~/stage",
+        "tool --partition-key dt --primary-key id --sort-key ts --key col",
+        "spark-submit --conf spark.cassandra.connection.keyspace=ks job.py --keyspace ks",
+    ],
+)
+def test_ordinary_flags_that_look_like_credential_flags_are_left_alone(command):
+    assert safe_command(command) == command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "tool --access-key hunter2hunter2",
+        "tool --secret-key=hunter2hunter2",
+        "tool --api-key hunter2hunter2",
+        "tool --ssh-key hunter2hunter2",
+        "tool --accessKey hunter2hunter2",
+        "tool -p hunter2hunter2",
+        "sshpass -p hunter2hunter2 ssh host",
+    ],
+)
+def test_credential_flags_still_mask_their_value(command):
+    shown = safe_command(command)
+    assert "hunter2" not in shown and "***REDACTED***" in shown
