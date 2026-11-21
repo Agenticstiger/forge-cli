@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The Spark runner stamps every Iceberg commit with the run's identity.** Each commit the
+  runner makes (a batch overwrite, a stream's append, a dead-letter table's append) carries
+  `fluid.product`, `fluid.build` and `fluid.job-sha256` (the digest of the job config as it ran) in
+  its snapshot summary, and, when `fluid apply` passes them, `fluid.product-version` (the version of
+  the build's output), `fluid.contract-digest` (the contract as loaded, before `{{ env.* }}` is
+  resolved), `fluid.release-id` (`FLUID_RELEASE_ID`, when the deploy names a release) and
+  `fluid.run-id` (the pipeline's run id, which `fluid ship` records as `provenance.run_id`; set
+  `FLUID_RUN_ID` to an orchestrator's run id to have it stamped instead). They are Iceberg
+  `snapshot-property.` write options, which Iceberg applies to a batch commit and to a streaming
+  one alike, and the job's Spark conf holds them as `spark.fluid.*`. They reach the runner as
+  arguments, not in the job config, the Spark configuration or the plan, so a contract edit that
+  leaves the job alone, or a new run id, restarts no stream. The runner itself changed, so a
+  running stream is replaced once by the first `fluid apply` after the upgrade, as for any change
+  to the runner. A value with a space, a control character or more than 256 characters stops the
+  run before it reads anything; a `FLUID_RELEASE_ID` like that refuses the apply before anything
+  is applied.
+
+- **`fluid runs status <product> --release-dir DIR [--on YYYY-MM-DD]` says which release was in
+  force, and so which version of the code ran.** A job Forge does not run (an existing job on its
+  own runner, scheduled by Airflow) leaves no run record; the sealed release
+  `fluid ship --release-dir` publishes at each deploy is what it leaves. The command reads those
+  records (DIR is one release or a directory of them, read one level deep; a link is never
+  followed and each `release.json` is read up to 1 MB), and prints the release in force now or at
+  the start of the UTC day, the ones sealed during it, their versions, the revision of the code,
+  the run that sealed them, and whether the record still matches its identity digest; `--json`
+  gives the same. Exit 1 when no release of the product was sealed by then. `release.json` gains
+  `identity.expose_versions` (each expose's version) and `provenance.source` (the revision,
+  repository and ref the CI names, read from its environment variables; a clone URL loses its
+  user, password, query and fragment, and anything that is not a hex commit, a URL or a ref name is
+  left out).
+
 - **`fluid generate pyspark-schema` writes a PySpark `StructType` module for each output
   port.** For every output port that declares `contract.schema` columns it writes
   `<port>_schema.py` with a `SCHEMA` a Spark job imports (`spark.read.schema(SCHEMA)`). forge-cli
