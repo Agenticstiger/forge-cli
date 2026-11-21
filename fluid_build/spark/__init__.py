@@ -7,6 +7,8 @@
 deterministic ``job.json``. ``runner/forge_spark_runner.py`` is the one PySpark
 program that reads it, shipped as package data: forge-cli never imports it, so core
 has no pyspark dependency. :func:`runner_source` returns its text for an uploader.
+:mod:`fluid_build.spark.pyspark_schema` renders a ``StructType`` module for each output port
+(``fluid generate pyspark-schema``), as text, so it needs no pyspark either.
 """
 
 from __future__ import annotations

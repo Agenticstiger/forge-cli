@@ -60,6 +60,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   several products are written, and `--split-by table`, `job` and `dag` are refused for the
   importers that do not read code.
 
+- **`fluid generate pyspark-schema` writes a PySpark `StructType` module for each output
+  port.** For every output port that declares `contract.schema` columns it writes
+  `<port>_schema.py` with a `SCHEMA` a Spark job imports (`spark.read.schema(SCHEMA)`). forge-cli
+  never imports pyspark: only the generated module does, when a job imports it. Names, types and
+  nullability come from the contract (`required: true` is `nullable=False`); a struct, array or map
+  declares its nested types (contract 0.7.7) and each level is typed; `decimal(p,s)` keeps its
+  precision and scale and `timestamp_ntz` is `TimestampNTZType`. A type Spark has no form for
+  (`json`, `variant`, `time`, `interval`) is written as a string with a warning; one it cannot hold
+  (a spatial type, a decimal past 38 digits, a type with text after its parameters such as
+  `int(11) unsigned`, a struct, array or map with no declared nested types)
+  refuses the run and writes nothing, as the Glue and BigQuery emitters judge their column types
+  (so does a contract whose `exposes` or `contract.schema` is not a list). The output is
+  deterministic (contract order, no timestamp or version) and carries `# fmt: off` and
+  `# isort: skip_file`. A module is a program a job imports, so contract text reaches it only as
+  string literals and as comment or docstring lines with their control characters replaced, never
+  on its first two lines (an encoding declared there would change how Python decodes the file),
+  and every module is checked against an allowlist of what it may hold before it is written.
+  `py_comment_text` now also spells `coding:` and `coding=` apart for the same reason. The command
+  replaces only files it wrote itself for the same data product (a file without its header is never
+  overwritten, and neither is one whose `# data product:` line names another product: two products
+  that share an `--out` and a port id get the typed error `generate_pyspark_schema_other_product`,
+  from a run and from `--check`, with nothing written, and are told to give each product its own
+  `--out`), writes no `__init__.py` and deletes nothing; `--check` writes nothing and exits 1 when a module is
+  missing, differs or is no longer in the contract (another data product's modules in the same
+  directory are left out of that), for a CI job that keeps committed modules current.
 - **`fluid datamesh-manager status` shows where a migration's products stand in Entropy Data.**
   `status products/` takes contract files, globs and folders as `publish` and `promote` do, reads
   Entropy's product list once and reports each product the contracts declare as `active`, `draft`,
