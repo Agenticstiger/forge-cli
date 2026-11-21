@@ -430,9 +430,21 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         seen: set = set()
         for page in range(_MAX_PRODUCT_PAGES):
             resp = self._request("GET", f"/api/dataproducts?p={page}")
-            batch = resp.json()
+            try:
+                batch = resp.json()
+            except ValueError as exc:  # a 200 that is not JSON (a proxy's page, say)
+                raise ProviderError(
+                    "Entropy Data answered the product list with something that is not JSON"
+                ) from exc
             if not isinstance(batch, list):
-                return batch if page == 0 else products
+                if page == 0:
+                    return batch
+                # A later page that is not a list means the list was not read whole; handing
+                # back the pages before it would read as every product the server holds.
+                raise ProviderError(
+                    f"Entropy Data answered page {page} of the product list with something "
+                    "other than a list"
+                )
             fresh = [p for p in batch if not (isinstance(p, dict) and str(p.get("id")) in seen)]
             products.extend(fresh)
             seen.update(str(p.get("id")) for p in fresh if isinstance(p, dict))
