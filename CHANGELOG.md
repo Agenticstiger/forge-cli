@@ -38,9 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the encoding Python reads it in: CPython parses a long f-string in time that grows with the
   square of its fields), is not parsed; one import reads at most 64 MB of source and keeps at most
   200,000 syntax-tree nodes parsed at once; the work spent folding a name and the size of a string
-  are capped; the same SQL is parsed once; one proposal holds at most 50,000 outputs, 10,000
-  products and 100,000 reads between its products, each product listing at most 500; and a script
-  path in a DAG file is judged on its text (no `..`, not absolute) before any file is looked at.
+  are capped; the same SQL is parsed once; one proposal holds at most 50,000 outputs and 10,000
+  products, lists at most 200,000 reads in consumes[] between its products (each lists at most
+  500) and goes through at most 1,000,000 reads; and a script path in a DAG file is judged on its
+  text (no `..`, not absolute) before any file is looked at.
   Product, expose and build ids are unique whatever the names look like, two jobs with one file
   name are two products, and what the reader cannot follow (a reader variable assigned twice, a
   task group in a dependency, a placeholder in SQL that is not an f-string) is said in the report.

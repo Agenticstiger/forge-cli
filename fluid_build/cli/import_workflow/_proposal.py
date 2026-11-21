@@ -55,9 +55,11 @@ SPLITS = ("table", "job", "dag", "folder", "project")
 MAX_OUTPUTS = 50_000
 MAX_PRODUCTS = 10_000
 #: Every product of a job lists the job's reads (the code does not say which read feeds which
-#: output), so products times reads is what a proposal writes: it is capped in all, and each
-#: product lists at most this many of them (the rest are counted in the report).
-MAX_FANOUT = 100_000
+#: output): a product lists at most ``MAX_CONSUMES_PER_PRODUCT`` of them (the rest are counted in
+#: the report), a proposal lists ``MAX_FANOUT`` in all, and it goes through ``MAX_READ_VISITS``
+#: reads in all (products times reads).
+MAX_FANOUT = 200_000
+MAX_READ_VISITS = 1_000_000
 MAX_CONSUMES_PER_PRODUCT = 500
 #: Reads of one product named one by one in the report; the rest are counted.
 MAX_READ_LINES = 20
@@ -510,14 +512,21 @@ def build_proposal(
         raise ProposalTooLarge(
             f"the proposal would hold {len(groups):,} products (the most is {MAX_PRODUCTS:,})"
         )
-    fanout = 0
+    fanout = visits = 0
     for group in groups:
         jobs = {str(output.writer.path): output.writer for output in group.outputs}
-        fanout += sum(len(job.facts.reads) for job in jobs.values())
+        reads = sum(len(job.facts.reads) for job in jobs.values())
+        visits += reads
+        fanout += min(reads, MAX_CONSUMES_PER_PRODUCT)
     if fanout > MAX_FANOUT:
         raise ProposalTooLarge(
             f"the products would list {fanout:,} reads between them (the most is {MAX_FANOUT:,}): "
             "every product of a job lists all the job's reads"
+        )
+    if visits > MAX_READ_VISITS:
+        raise ProposalTooLarge(
+            f"the products would go through {visits:,} reads between them (the most is "
+            f"{MAX_READ_VISITS:,}): every product of a job goes through all the job's reads"
         )
 
     # who produces what, for consumes[]: an id is handed out once, whatever the names look like

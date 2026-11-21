@@ -621,6 +621,34 @@ def test_a_job_with_many_outputs_and_reads_is_refused_before_it_is_listed_everyw
     assert len(contracts) == 1 and len(contracts[0]["consumes"]) == 8
 
 
+def test_what_a_product_lists_is_what_counts_toward_the_fan_out_not_every_read_of_its_job(
+    tmp_path, monkeypatch
+):
+    from fluid_build.cli.import_workflow import _proposal
+
+    monkeypatch.chdir(tmp_path)
+    body = "\n".join(f'spark.table("t{i}")' for i in range(12))
+    body += "\n" + "\n".join(f'df.write.saveAsTable("o{i}")' for i in range(6))
+    write(tmp_path, {"jobs/wide.py": body + "\n"})
+    monkeypatch.setattr(_proposal, "MAX_CONSUMES_PER_PRODUCT", 4)
+    monkeypatch.setattr(_proposal, "MAX_FANOUT", 30)  # 6 products x 4 listed reads = 24
+    contracts, _ = propose(tmp_path)  # 6 x 12 = 72 reads would be over 30, 6 x 4 is not
+    assert len(contracts) == 6 and all(len(c["consumes"]) == 4 for c in contracts)
+
+
+def test_the_reads_a_proposal_goes_through_are_counted_too(tmp_path, monkeypatch):
+    from fluid_build._errors import FluidUserError
+    from fluid_build.cli.import_workflow import _proposal
+
+    monkeypatch.chdir(tmp_path)
+    body = "\n".join(f'spark.table("t{i}").write.saveAsTable("o{i}")' for i in range(8))
+    write(tmp_path, {"jobs/fan.py": body + "\n"})
+    monkeypatch.setattr(_proposal, "MAX_READ_VISITS", 50)  # 8 products x 8 reads = 64
+    with pytest.raises(FluidUserError) as refused:
+        propose(tmp_path)
+    assert "go through 64 reads between them (the most is 50)" in refused.value.why
+
+
 def test_a_product_lists_a_bounded_number_of_reads_and_the_report_counts_the_rest(
     tmp_path, monkeypatch
 ):
