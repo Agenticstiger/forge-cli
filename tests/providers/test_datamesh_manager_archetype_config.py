@@ -35,6 +35,7 @@ from fluid_build.build_runners.catalog_registrars.datamesh_manager import (
     DataMeshManagerRegistrar,
     _build_dmm_registrar,
 )
+from fluid_build.providers.base import ProviderError
 from fluid_build.providers.datamesh_manager import DataMeshManagerProvider
 from fluid_build.providers.datamesh_manager._odps_helpers import dmm_archetype
 
@@ -216,6 +217,45 @@ def test_the_native_listing_reads_every_page():
     products = provider.list_products()
     assert len(products) == 1001 and products[-1]["id"] == "late"
     assert asked == ["/api/dataproducts?p=0", "/api/dataproducts?p=1"]
+
+
+def test_a_later_page_that_is_not_a_list_is_an_error_not_the_pages_before_it():
+    provider = DataMeshManagerProvider(api_key="k", api_url=API)
+    pages = [[{"id": f"p{i}"} for i in range(1000)], {"error": "rate limited"}]
+
+    def request(method: str, path: str, *, json_body: Any = None):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = pages[int(path.rsplit("p=", 1)[1])]
+        return resp
+
+    provider._request = request  # type: ignore[method-assign]
+    with pytest.raises(ProviderError, match="page 1 of the product list"):
+        provider.list_products()
+
+
+def test_an_answer_that_is_not_json_is_a_provider_error_not_a_value_error():
+    provider = DataMeshManagerProvider(api_key="k", api_url=API)
+
+    def request(method: str, path: str, *, json_body: Any = None):
+        resp = MagicMock(status_code=200)
+        resp.json.side_effect = ValueError("Expecting value: line 1 column 1 (char 0)")
+        return resp
+
+    provider._request = request  # type: ignore[method-assign]
+    with pytest.raises(ProviderError, match="not JSON"):
+        provider.list_products()
+
+
+def test_a_first_page_that_is_not_a_list_is_handed_back_as_it_always_was():
+    provider = DataMeshManagerProvider(api_key="k", api_url=API)
+
+    def request(method: str, path: str, *, json_body: Any = None):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"error": "nope"}
+        return resp
+
+    provider._request = request  # type: ignore[method-assign]
+    assert provider.list_products() == {"error": "nope"}
 
 
 @pytest.mark.parametrize("field", ["type", "product_type"])
