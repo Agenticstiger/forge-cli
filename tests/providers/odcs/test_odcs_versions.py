@@ -324,9 +324,9 @@ CRED_WITH_AT = "user:p@" + "s3cr3t"
         ("ht\ttp://{c}@lk.example.com/catalog", "http://lk.example.com/catalog"),
         # cutting the part must not leave an authority of its own behind
         ("a@//{c}@lk.example.com/catalog", "//lk.example.com/catalog"),
-        # an @ outside the authority is not a credential
+        # an @ after the query or the fragment starts is not a credential
         ("https://lk.example.com/catalog?owner=a@b", "https://lk.example.com/catalog?owner=a@b"),
-        ("https://lk.example.com/a@b/catalog", "https://lk.example.com/a@b/catalog"),
+        ("https://lk.example.com/catalog#a@b", "https://lk.example.com/catalog#a@b"),
         ("https://lk.example.com/catalog", "https://lk.example.com/catalog"),
     ],
 )
@@ -342,6 +342,38 @@ def test_a_credential_in_the_catalog_uri_is_not_written_to_the_catalog_url(uri, 
     assert "s3cr3t" not in str(server)
     assert ("not written to catalogUrl" in caplog.text) == (written != uri)
     assert _without_userinfo(written) == written  # cutting twice cuts nothing more
+
+
+# Shapes a URL parser (the WHATWG rules) reads as userinfo although the cut by text does not match
+# them. Whatever is left with an @ before the first ? or # is not written at all.
+_UNCUTTABLE = [
+    "https:///{c}@h/x",
+    "https:/{c}@h",
+    "HTTPS:///{c}@h",
+    "https:////{c}@h",
+    "https:///\\{c}@h",
+    "a@/\\{c}@h",
+    "//x@//y@//{c}@h",
+    "x@//y@//z@//{c}@h",
+    # an @ in the path may be userinfo to a parser too: nothing is written from it
+    "https://lk.example.com/a@b/catalog",
+    "https://lk.example.com/{c}@/catalog",
+]
+
+
+@pytest.mark.parametrize("uri", _UNCUTTABLE)
+def test_a_catalog_uri_that_may_still_hold_a_credential_is_not_written(uri, caplog):
+    uri = uri.replace("{c}", CRED)
+
+    with caplog.at_level(logging.WARNING):
+        [server] = _servers(
+            _contract(_expose(_rest_iceberg("rest", uri=uri, warehouse="w"))), "3.2.0"
+        )
+
+    assert server["catalogUrl"] == "${ICEBERG_CATALOG_URL}"
+    assert "s3cr3t" not in str(server) and "s3cr3t" not in caplog.text
+    assert "cannot be cut" in caplog.text
+    assert _without_userinfo(uri) == ""
 
 
 def test_a_url_that_still_holds_a_credential_after_every_cut_is_not_written(monkeypatch, caplog):

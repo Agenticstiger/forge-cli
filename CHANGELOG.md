@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written as an `iceberg` server: `catalog`, `catalogUrl` (the binding's `uri` without any user and
   password, Glue's regional REST endpoint for a commercial region, or a `${ICEBERG_CATALOG_URL}`
   placeholder, as the other server types fill what a binding cannot), `namespace` and `warehouse`.
+  The user and password are cut by text, and the cut fails closed: a `uri` that still has an `@`
+  before its first `?` or `#` after the cut (three or four slashes after the scheme, a single
+  slash, a backslash, a nested `@`, an `@` in the path) is not written, and the placeholder takes
+  its place.
   Every other binding keeps the server it had: so does an Iceberg table that lives in a
   warehouse's own catalog (Snowflake-managed, BigQuery) and one that names no catalog on a platform
   with no default one. A document is held to the schema of the version it declares in

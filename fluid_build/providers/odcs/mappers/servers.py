@@ -326,6 +326,9 @@ _USERINFO_RE = re.compile(r"^((?:[A-Za-z][A-Za-z0-9+.\-]*:)?//)?[^/?#]*@")
 # What a URL parser skips or refuses: a tab, a newline, any other control character.
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
+# Where the part of a URL that can hold userinfo ends: a query or a fragment.
+_QUERY_OR_FRAGMENT_RE = re.compile(r"[?#]")
+
 # Cutting a user and password can leave the text after it reading as an authority of its own
 # (``a@//u:p@h``): a URL that still holds one after this many cuts is not written at all.
 _USERINFO_PASSES = 3
@@ -336,23 +339,36 @@ def _without_userinfo(url: str) -> str:
 
     The rest of the URL is kept as written, a port or host that does not parse included: the
     part is cut by text, never through a URL parser that can fail and leave it in. Control
-    characters are dropped first, as a URL parser drops them. ``""`` when the text still holds
-    a user and password after every cut, so no URL is written from it.
+    characters are dropped first, as a URL parser drops them. The cut fails closed: ``""`` when
+    the text still holds a user and password after every cut, and when any ``@`` is left before
+    the first ``?`` or ``#``. A URL parser reads such an ``@`` as the end of userinfo in more
+    shapes than the plain ``scheme://`` form: three or four slashes after the scheme, a single
+    slash, a backslash, a nested ``@`` before another authority, and an ``@`` in the path. No
+    URL is written from any of them; the tests spell them out.
     """
     url = _CONTROL_RE.sub("", url)
     cut = False
     for _ in range(_USERINFO_PASSES):
         found = _USERINFO_RE.match(url)
         if found is None:
-            if cut:
-                LOG.warning(
-                    "the user and password of the Iceberg catalog uri are not written to catalogUrl"
-                )
-            return url
+            break
         url = (found.group(1) or "") + url[found.end() :]
         cut = True
-    LOG.warning("the Iceberg catalog uri holds a user and password that cannot be cut: not written")
-    return ""
+    else:
+        LOG.warning(
+            "the Iceberg catalog uri holds a user and password that cannot be cut: not written"
+        )
+        return ""
+    if "@" in _QUERY_OR_FRAGMENT_RE.split(url, maxsplit=1)[0]:
+        LOG.warning(
+            "the Iceberg catalog uri holds a user and password that cannot be cut: not written"
+        )
+        return ""
+    if cut:
+        LOG.warning(
+            "the user and password of the Iceberg catalog uri are not written to catalogUrl"
+        )
+    return url
 
 
 # An AWS commercial region name (``eu-north-1``): what goes into Glue's regional endpoint host.
