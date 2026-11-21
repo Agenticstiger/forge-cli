@@ -105,7 +105,7 @@ def _deploy(tmp_path, monkeypatch, jobs: str = JOBS, dead=None):
     body = package_zip({"orders_pkg/__init__.py": "", "orders_pkg/jobs.py": jobs})
     sha = hashlib.sha256(body).hexdigest()
     wheel = tmp_path / "dist" / "orders_pkg.zip"
-    wheel.parent.mkdir(exist_ok=True)
+    wheel.parent.mkdir(parents=True, exist_ok=True)
     wheel.write_bytes(body)
     monkeypatch.setenv(PACKAGE_ALLOWLIST_ENV, f"file://{wheel.parent}/")
     monkeypatch.setenv(LOCAL_NAMESPACE_ALLOWLIST_ENV, "fluid/commerce")
@@ -322,3 +322,72 @@ def test_the_sql_check_refuses_what_spark_parses_as_a_write(spark, runner_module
 def test_the_sql_check_allows_what_spark_parses_as_a_read(spark, runner_module, text):
     assert not _parsed_write(spark, text)
     assert runner_module.sql_write(text) is None
+
+
+MAINTAINED = (
+    JOBS
+    + '''
+
+def maintained(spark, context):
+    """Table maintenance runs while the package does: a compaction and snapshot expiry."""
+    jvm = spark._jsparkSession
+    jvm.sql("CALL fluid.system.rewrite_manifests('commerce.orders')")
+    jvm.sql(
+        "CALL fluid.system.expire_snapshots(table => 'commerce.orders', "
+        "older_than => TIMESTAMP '9999-01-01 00:00:00', retain_last => 1)"
+    )
+    return merge_orders(spark, context)
+'''
+)
+
+
+def test_table_maintenance_during_the_run_is_not_a_write(
+    spark, runner_module, tmp_path, monkeypatch
+):
+    config, config_uri, _ = _deploy(tmp_path, monkeypatch, dead={"maxRecordsBeforeAbort": 10})
+    runner_module.run_package(spark, runner_module.parse_config(json.dumps(config)), config_uri)
+    spark.sql(f"INSERT INTO {OUTPUT} SELECT * FROM {OUTPUT}")  # a second data file to compact
+    _forget_package()
+    config, config_uri, _ = _deploy(
+        tmp_path / "again", monkeypatch, jobs=MAINTAINED, dead={"maxRecordsBeforeAbort": 10}
+    )
+    config["package"]["entryPoint"] = "orders_pkg.jobs:maintained"
+    runner_module.run_package(spark, runner_module.parse_config(json.dumps(config)), config_uri)
+    assert spark.table(OUTPUT).count() == 2
+    operations = [
+        r["operation"] for r in spark.sql(f"SELECT operation FROM {OUTPUT}.snapshots").collect()
+    ]
+    assert "replace" in operations  # the compaction ran during the package, and was let be
+
+
+OTHER_SESSION = (
+    JOBS
+    + """
+
+def elsewhere(spark, context):
+    return merge_orders(spark.newSession(), context)
+"""
+)
+
+
+def test_a_dataframe_of_another_session_is_refused(spark, runner_module, tmp_path, monkeypatch):
+    config, config_uri, _ = _deploy(tmp_path, monkeypatch, jobs=OTHER_SESSION)
+    config["package"]["entryPoint"] = "orders_pkg.jobs:elsewhere"
+    with pytest.raises(runner_module.PackageError, match="another Spark session"):
+        runner_module.run_package(spark, runner_module.parse_config(json.dumps(config)), config_uri)
+    assert not _snapshots(spark, OUTPUT)
+
+
+def test_a_run_leaves_no_view_and_no_copy_behind(spark, runner_module, tmp_path, monkeypatch):
+    made = []
+    real = runner_module.tempfile.mkdtemp
+
+    def mkdtemp(**kw):
+        made.append(real(**kw))
+        return made[-1]
+
+    monkeypatch.setattr(runner_module.tempfile, "mkdtemp", mkdtemp)
+    config, config_uri, _ = _deploy(tmp_path, monkeypatch, dead={"maxRecordsBeforeAbort": 10})
+    runner_module.run_package(spark, runner_module.parse_config(json.dumps(config)), config_uri)
+    assert made and not any(os.path.exists(d) for d in made)
+    assert not spark.catalog.tableExists("package_output")

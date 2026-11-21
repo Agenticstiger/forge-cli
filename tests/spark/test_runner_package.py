@@ -558,3 +558,72 @@ def test_the_entry_point_text_never_reaches_the_runner_s_log_as_data(runner, cap
 
 def test_the_jobs_fixture_is_a_real_module():
     compile(JOBS, "jobs.py", "exec")
+
+
+def test_a_pinned_zip_that_does_not_read_is_refused(runner, tmp_path):
+    body = bytearray(package_zip({"orders_pkg/__init__.py": "x = 1\n"}))
+    at = body.find(b"PK\x01\x02")  # the central directory: is_zipfile still says yes
+    body[at : at + 4] = b"XXXX"
+    body = bytes(body)
+    with pytest.raises(runner.PackageError, match="not a readable zip"):
+        runner.fetch_package(None, str(_copy(tmp_path, body)), hashlib.sha256(body).hexdigest())
+
+
+def test_a_remote_read_that_fails_names_the_java_error(runner, tmp_path):
+    class Denied(Exception):
+        class java_exception:  # Py4J keeps the Java exception here
+            @staticmethod
+            def getClass():
+                return types.SimpleNamespace(getSimpleName=lambda: "AccessDeniedException")
+
+    class FileSystem:
+        def getFileStatus(self, path):
+            return types.SimpleNamespace(getLen=lambda: 10)
+
+        def copyToLocalFile(self, *args):
+            raise Denied("a message that is never shown")
+
+    class Path:
+        def __init__(self, uri):
+            self.uri = uri
+
+        def getFileSystem(self, conf):
+            return FileSystem()
+
+    jvm = types.SimpleNamespace(
+        org=types.SimpleNamespace(
+            apache=types.SimpleNamespace(
+                hadoop=types.SimpleNamespace(fs=types.SimpleNamespace(Path=Path))
+            )
+        )
+    )
+    spark = types.SimpleNamespace(
+        sparkContext=types.SimpleNamespace(
+            _jvm=jvm, _jsc=types.SimpleNamespace(hadoopConfiguration=lambda: None)
+        )
+    )
+    with pytest.raises(runner.PackageError, match=r"\(AccessDeniedException\)") as caught:
+        runner.fetch_package(spark, "s3://b/_fluid/spark/p/b/package/0/package.zip", SHA)
+    assert "never shown" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("known", "now", "main_now", "changed"),
+    [
+        ({1}, {1: "append", 2: "append"}, 2, True),  # a write the runner did not make
+        ({1}, {1: "append", 2: "overwrite"}, 2, True),
+        ({1}, {1: "append", 2: "delete"}, 2, True),
+        ({1}, {1: "append", 2: "replace"}, 2, False),  # a compaction: the same rows
+        ({0, 1}, {1: "append"}, 1, False),  # an older snapshot expired: no data changed
+        ({0, 1}, {0: "append", 1: "append"}, 0, True),  # main moved back
+        ({1}, {1: "append"}, 1, False),
+        (set(), {}, None, False),  # an empty table stays empty
+    ],
+)
+def test_maintenance_is_not_a_write_and_a_rollback_is(
+    runner, monkeypatch, known, now, main_now, changed
+):
+    monkeypatch.setattr(runner, "_snapshots", lambda spark, table: dict(now))
+    monkeypatch.setattr(runner, "_main_snapshot", lambda spark, table: main_now)
+    main_before = max(known) if known else None
+    assert runner.changed_since(None, "fluid.db.t", (frozenset(known), main_before)) is changed

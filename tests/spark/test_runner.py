@@ -166,7 +166,7 @@ def test_the_runner_imports_nothing_but_the_standard_library_at_module_level():
             names.add(node.module.split(".")[0])
     assert names <= {
         "__future__", "argparse", "base64", "functools", "hashlib", "hmac", "importlib",
-        "inspect", "json", "os", "re", "sys", "tempfile", "time", "types", "unicodedata",
+        "inspect", "json", "os", "re", "shutil", "sys", "tempfile", "time", "types", "unicodedata",
         "urllib", "zipfile",
     }  # fmt: skip
 

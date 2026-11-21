@@ -47,6 +47,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -1056,19 +1057,31 @@ def _copy_local(source: str, target: str) -> None:
 def _copy_remote(spark, uri: str, target: str) -> None:
     """Through Hadoop's file system, with the job's own credentials (EMRFS or S3A)."""
     jvm = spark.sparkContext._jvm
-    path = jvm.org.apache.hadoop.fs.Path(uri)
-    fs = path.getFileSystem(spark.sparkContext._jsc.hadoopConfiguration())
     try:
+        path = jvm.org.apache.hadoop.fs.Path(uri)
+        fs = path.getFileSystem(spark.sparkContext._jsc.hadoopConfiguration())
         size = int(fs.getFileStatus(path).getLen())
-    except Exception as exc:  # noqa: BLE001 - Py4J's error, a missing object among them
+        _refuse_oversized(size, uri)
+        # useRawLocalFileSystem: no .crc file beside the copy.
+        fs.copyToLocalFile(False, path, jvm.org.apache.hadoop.fs.Path(target), True)
+    except PackageError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - Py4J's error: a missing object, a denied read
         raise PackageError(
-            f"the package at {uri} cannot be read ({type(exc).__name__}); run fluid apply, "
+            f"the package at {uri} cannot be read ({_error_name(exc)}); run fluid apply, "
             "which copies it beside the job config"
         ) from None
-    _refuse_oversized(size, uri)
-    # useRawLocalFileSystem: no .crc file beside the copy.
-    fs.copyToLocalFile(False, path, jvm.org.apache.hadoop.fs.Path(target), True)
     _refuse_oversized(os.path.getsize(target), uri)
+
+
+def _error_name(exc: BaseException) -> str:
+    """The Java exception's class behind a Py4J error (FileNotFoundException,
+    AccessDeniedException), or the Python one's: a name, never a message."""
+    java = getattr(exc, "java_exception", None)
+    try:
+        return str(java.getClass().getSimpleName()) if java is not None else type(exc).__name__
+    except Exception:  # noqa: BLE001 - the JVM may be gone; the Python name will do
+        return type(exc).__name__
 
 
 def _file_sha256(path: str) -> str:
@@ -1082,8 +1095,14 @@ def _file_sha256(path: str) -> str:
 def _check_archive(path: str, where: str) -> None:
     if not zipfile.is_zipfile(path):
         raise PackageError(f"the package at {where} is not a wheel or a zip")
-    with zipfile.ZipFile(path) as archive:
-        names = archive.namelist()
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+    except (zipfile.BadZipFile, OSError, ValueError) as exc:
+        raise PackageError(
+            f"the package at {where} is not a readable zip ({type(exc).__name__}); build and "
+            "publish it again, and pin the new digest"
+        ) from None
     compiled = sorted(
         name
         for name in names
@@ -1540,19 +1559,41 @@ def package_outcome(failed: int, dead) -> tuple:
 
 
 def table_marker(spark, table: str) -> tuple:
-    """What a commit to ``table`` changes: how many snapshots it has, the newest one's
-    time, and the snapshot its main branch is at (a rollback moves only that)."""
-    from pyspark.sql import functions as F
+    """Where ``table`` stands: the ids of its snapshots, and the one its main branch is at."""
+    return frozenset(_snapshots(spark, table)), _main_snapshot(spark, table)
 
-    # The catalog keeps loaded tables a while; REFRESH drops its copy, so a commit made
-    # through another catalog object is seen too. The name is the compiled sink's.
+
+def changed_since(spark, table: str, marker: tuple) -> bool:
+    """Whether a commit that changes ``table``'s data landed since ``marker``, or its main
+    branch was moved back. A compaction (a ``replace`` snapshot) and snapshot expiry, which
+    table maintenance runs at any time, change no data and do not count."""
+    known, main = marker
+    new = {i: op for i, op in _snapshots(spark, table).items() if i not in known}
+    if any(op != "replace" for op in new.values()):
+        return True
+    now = _main_snapshot(spark, table)
+    return now != main and now not in new
+
+
+def _snapshots(spark, table: str) -> dict:
+    """``{snapshot id: operation}``, fresh: the catalog keeps loaded tables a while, and
+    REFRESH drops its copy, so a commit made through another catalog object is seen too.
+    The name is the compiled sink's."""
     statement = f"REFRESH TABLE {table}"
     spark.sql(statement)
-    snapshots = spark.table(f"{table}.snapshots")
-    count, last = snapshots.agg(F.count(F.lit(1)), F.max("committed_at")).first()
-    refs = spark.table(f"{table}.refs").where(F.col("name") == "main")
-    main = refs.select("snapshot_id").first()
-    return int(count), str(last), None if main is None else int(main[0])
+    rows = spark.table(f"{table}.snapshots").select("snapshot_id", "operation").collect()
+    return {int(row[0]): row[1] for row in rows}
+
+
+def _main_snapshot(spark, table: str):
+    from pyspark.sql import functions as F
+
+    try:
+        refs = spark.table(f"{table}.refs").where(F.col("name") == "main")
+        row = refs.select("snapshot_id").first()
+    except Exception:  # noqa: BLE001 - an Iceberg before the refs table (1.1): no rollback check
+        return None
+    return None if row is None else int(row[0])
 
 
 def _add_package(spark, location: str, sha: str) -> list:
@@ -1584,6 +1625,13 @@ def _conformed_columns(spark, output, ddl: str) -> list:
     if output.isStreaming:
         raise PackageError(
             "the entry point returned a streaming DataFrame; a package build is batch"
+        )
+    if not output.sparkSession._jsparkSession.equals(spark._jsparkSession):
+        # Its rows would be checked through another session's views: build it from the
+        # session the entry point is given.
+        raise PackageError(
+            "the entry point returned a DataFrame of another Spark session; build it from "
+            "the session it is called with"
         )
     # PySpark has no StructType.fromDDL; an empty frame of the DDL is its public parser.
     declared = spark.createDataFrame([], ddl).schema
@@ -1681,7 +1729,7 @@ def _land(spark, config: dict, checked, columns, run_id: str, before: dict) -> N
     counts = {row[0]: int(row[1]) for row in checked.groupBy(ERROR_COLUMN).count().collect()}
     failures = {reason: n for reason, n in counts.items() if reason is not None}
     failed = sum(failures.values())
-    changed = [t for t in before if table_marker(spark, t) != before[t]]
+    changed = [t for t in before if changed_since(spark, t, before[t])]
     if changed:
         raise PackageError(
             f"{', '.join(changed)} changed while the package ran: a commit the runner did not "
@@ -1721,30 +1769,37 @@ def run_package(spark, config: dict, config_uri: str) -> None:
     for statement in (dead or {}).get("create") or []:
         spark.sql(statement)
     zips = _add_package(spark, package_location(config_uri, package["sha256"]), package["sha256"])
-    run_id = str(spark.sparkContext.applicationId)
-    # Before the package's code runs at all, its import included.
-    watched = [table] + ([f"{sink['catalog']}.{dead['table']}"] if dead else [])
-    before = {t: table_marker(spark, t) for t in watched}
-    context = PackageContext(
-        arguments=types.MappingProxyType(dict(package["arguments"])),
-        product=config["product"],
-        build=config["build"],
-        output=table,
-        run_id=run_id,
-        package_sha256=package["sha256"],
-    )
-    output = _call_package(spark, package, zips, context)
-    columns = _conformed_columns(spark, output, package["schema"])
-    output.select(*columns).createOrReplaceTempView(PACKAGE_VIEW)
-    queries = config["sql"]
-    checked = spark.sql(queries["check"])
-    # Computed once for the count and both writes: Spark recomputes a lost block from the
-    # package's plan, so a package's output should be deterministic.
-    checked = checked.persist(StorageLevel.MEMORY_AND_DISK)
     try:
-        _land(spark, config, checked, columns, run_id, before)
+        run_id = str(spark.sparkContext.applicationId)
+        # Before the package's code runs at all, its import included.
+        watched = [table] + ([f"{sink['catalog']}.{dead['table']}"] if dead else [])
+        before = {t: table_marker(spark, t) for t in watched}
+        context = PackageContext(
+            arguments=types.MappingProxyType(dict(package["arguments"])),
+            product=config["product"],
+            build=config["build"],
+            output=table,
+            run_id=run_id,
+            package_sha256=package["sha256"],
+        )
+        output = _call_package(spark, package, zips, context)
+        columns = _conformed_columns(spark, output, package["schema"])
+        output.select(*columns).createOrReplaceTempView(PACKAGE_VIEW)
+        try:
+            queries = config["sql"]
+            checked = spark.sql(queries["check"])
+            # Computed once for the count and both writes: Spark recomputes a lost block
+            # from the package's plan, so a package's output should be deterministic.
+            checked = checked.persist(StorageLevel.MEMORY_AND_DISK)
+            try:
+                _land(spark, config, checked, columns, run_id, before)
+            finally:
+                checked.unpersist()
+        finally:
+            spark.catalog.dropTempView(PACKAGE_VIEW)
     finally:
-        checked.unpersist()
+        # The runner's own copy; every task that reads it has ended by now.
+        shutil.rmtree(os.path.dirname(zips[0]), ignore_errors=True)
 
 
 if __name__ == "__main__":
