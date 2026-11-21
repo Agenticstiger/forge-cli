@@ -162,6 +162,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid validate-artifacts` no longer reports a declared dotfile as missing.** A file the
+  MANIFEST lists whose name starts with `.` (a scaffold's `.gitlab-ci.yml`) was skipped when the
+  directory was read, so stage 4 failed with `MANIFEST-MISSING-FILE`; only an undeclared hidden
+  file (`.DS_Store`) is ignored now.
 - **Entropy Data's product list is read whole or not at all.** A page after the first that was
   not a list (a rate-limit answer, say) used to hand back the pages before it as if they were
   every product the server holds, and an answer that was not JSON was a bare `ValueError`. Both

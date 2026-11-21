@@ -166,7 +166,9 @@ def validate_manifest_dir(
     expected_paths = set(declared.keys())
 
     # Actual files on disk (recursive, relative to artifacts_dir; exclude
-    # MANIFEST.json itself and anything starting with .).
+    # MANIFEST.json itself). A hidden file (.DS_Store etc.) is never reported
+    # as undeclared, but one the MANIFEST declares (a scaffold's .gitlab-ci.yml)
+    # must be there like any other.
     actual_paths: set = set()
     for fp in artifacts_dir.rglob("*"):
         if not fp.is_file():
@@ -174,12 +176,12 @@ def validate_manifest_dir(
         rel = fp.relative_to(artifacts_dir).as_posix()
         if rel == manifest_path.relative_to(artifacts_dir).as_posix():
             continue
-        if rel.startswith(".") or "/." in rel:
-            continue  # hidden files (.DS_Store etc.)
         actual_paths.add(rel)
 
     missing = expected_paths - actual_paths
-    extra = actual_paths - expected_paths
+    extra = {
+        rel for rel in actual_paths - expected_paths if not (rel.startswith(".") or "/." in rel)
+    }
     for path in sorted(missing):
         issues.append(
             ValidationIssue(
