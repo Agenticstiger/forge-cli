@@ -26,6 +26,7 @@ from fluid_build.profiler.dp.selection import (
     select_cliques,
 )
 from tests.ci_guards import extras_alongside_base as g
+from tests.profiler.dp._privacy import need
 
 pytestmark = pytest.mark.unit
 
@@ -200,7 +201,7 @@ def _has_running_intersection(cliques):
 
 
 def _structure(columns, cliques, sizes=None, **kwargs):
-    pytest.importorskip("mbi")
+    need("mbi")
     sizes = sizes or [2] * len(columns)
     result = release_structure(tuple(columns), sizes, cliques, **kwargs)
     assert _has_running_intersection(result)
@@ -252,7 +253,7 @@ def test_each_clique_is_in_column_order_and_the_cliques_are_sorted_by_position()
 def test_the_cells_are_the_product_of_sizes_added_up():
     columns, sizes = ("a", "b", "c"), (4, 8, 16)
     cliques = [("a", "b"), ("b", "c")]
-    pytest.importorskip("mbi")
+    need("mbi")
     assert release_structure(columns, sizes, cliques, max_cells=32 + 128) == (
         ("a", "b"),
         ("b", "c"),
@@ -262,7 +263,7 @@ def test_the_cells_are_the_product_of_sizes_added_up():
 
 
 def test_the_cap_applies_to_the_triangulated_cliques():
-    pytest.importorskip("mbi")
+    need("mbi")
     cycle = [("a", "b"), ("b", "c"), ("c", "a")]
     with pytest.raises(ValueError):
         release_structure(("a", "b", "c"), (10, 10, 10), cycle, max_cells=999)
@@ -289,9 +290,9 @@ def test_aim_chooses_a_column_that_copies_another():
     With 4,000 records and a selection share of 1 the signal is so strong that a miss of
     ``("a", "b")`` would be a defect, not chance.
     """
-    pytest.importorskip("opendp")
-    pytest.importorskip("mbi")
-    pytest.importorskip("polars")
+    need("opendp")
+    need("mbi")
+    need("polars")
     rng = random.Random(20260101)
     columns = ("a", "b", "c", "d")
     levels = {"a": ("x", "y", "z"), "b": ("x", "y", "z"), "c": ("p", "q"), "d": ("p", "q")}
