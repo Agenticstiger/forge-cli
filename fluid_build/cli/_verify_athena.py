@@ -11,7 +11,13 @@ the summary counts as *not checked* and ``--strict`` never fails on, so a
 pipeline could land nothing, or land it where no query engine could read it,
 and still go green.
 
-Five checks, each against the live account:
+An Iceberg table registered in Glue (``format: iceberg``, the catalog Glue, which
+is the default on AWS) is verified the same way: Glue holds its columns and its
+location, and Athena counts its rows. It is an error when Glue does not say the
+table is Iceberg (``table_type``). Its partitions are hidden, so none is ever
+unregistered. Until the Iceberg branch it was reported as skipped.
+
+Six checks, each against the live account:
 
 1. **The catalogue.** ``glue:GetTable`` must find the table, and its columns
    (storage-descriptor columns plus partition keys) must match the contract's
@@ -58,13 +64,27 @@ Five checks, each against the live account:
    default below and the binding declares a key, Athena encrypts the result
    with that key (``EncryptionConfiguration`` SSE_KMS).
 
+6. **Freshness**, for an Iceberg table whose expose declares ``qos.freshnessSLO``:
+   the age of its newest write against that objective, read from the table's
+   ``$snapshots`` metadata table in a second query (``_verify_freshness``). A
+   compaction is not a write. A missed objective is CRITICAL, so ``--strict``
+   fails on it, and ``--warn-only`` downgrades it to WARNING. A check that cannot
+   run (the query fails) is an error, like a storage policy that cannot be read.
+   Athena does not evaluate Lake Formation for an Iceberg table's metadata tables
+   and refuses ``$snapshots`` when the table has row or cell filters, or the
+   principal cannot see every column, so the freshness of such a table is read
+   by a principal that can read all of it. An Iceberg table's snapshots are
+   read from its metadata files, which sit under the table location the data
+   grant below already covers.
+
 The binding's ``{{ env.* }}`` templates are resolved with the resolver
 ``fluid apply`` runs before it emits (``resolve_env_templates_in_contract``),
 so verify looks for the table apply created; a database, table or bucket still
 templated after that is an error naming the variable.
 
 A missing column, a type change, a moved location, an empty table, a count
-that breaks the build's rule and an untreated masked value are CRITICAL, so
+that breaks the build's rule, an untreated masked value and a missed freshness
+objective are CRITICAL, so
 ``--strict`` fails on them. Extra columns are INFO, as in every other
 verifier. Glue declares no nullability, so there is no catalogue constraint to
 drift and the constraints dimension says so rather than reporting a comparison
@@ -130,6 +150,19 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+
+from fluid_build.cli._verify_freshness import (
+    SnapshotReading,
+    declared_objective,
+    error_dimension,
+    explain_failure,
+    freshness_dimension,
+    objective_seconds,
+    read_snapshot_row,
+    skipped_dimension,
+    snapshot_sql,
+)
+from fluid_build.cli._verify_freshness import severity_problem as freshness_problem
 
 LOG = logging.getLogger("fluid.cli.verify.athena")
 
@@ -211,9 +244,10 @@ def is_athena_verifiable(binding: Any) -> bool:
 
     The same gates the IaC emitter applies before it writes a Glue table
     (``iac/providers/aws.py::_emit_glue``): an AWS platform, a
-    ``location.database`` and ``location.table``, and a format with Hive
-    storage classes Athena can read the table through. Resolved through the
-    emitter's own ``is_cloud`` and ``_GLUE_HIVE_STORAGE`` so the two cannot
+    ``location.database`` and ``location.table``, and either a format with Hive
+    storage classes Athena can read the table through or an Iceberg table
+    cataloged in Glue. Resolved through the emitter's own ``is_cloud``,
+    ``_GLUE_HIVE_STORAGE`` and ``is_glue_cataloged`` so the two cannot
     disagree about what ``fluid apply`` created. A bucket is required because
     the default results location lives in it; a bucket-less binding keeps its
     previous handling.
@@ -224,12 +258,18 @@ def is_athena_verifiable(binding: Any) -> bool:
         return False
     from fluid_build.iac.provider_match import is_cloud
     from fluid_build.iac.providers.aws import _GLUE_HIVE_STORAGE
+    from fluid_build.providers._iceberg_catalog import is_glue_cataloged, is_iceberg_format
 
     if not is_cloud(binding, "aws"):
         return False
     # The emitter's own default: a binding with no format is emitted as parquet.
     fmt = str(binding.get("format") or "parquet").lower()
-    if fmt not in _GLUE_HIVE_STORAGE:
+    if is_iceberg_format(fmt):
+        # An Iceberg table is a Glue table when its catalog is Glue (the emitter's own
+        # ``is_glue_cataloged``, which is the default on AWS); one in a REST catalog is not.
+        if not is_glue_cataloged(binding):
+            return False
+    elif fmt not in _GLUE_HIVE_STORAGE:
         return False
     location = binding.get("location")
     if not isinstance(location, Mapping):
@@ -578,37 +618,39 @@ def _wait(
         raise
 
 
-def _count_rows(
+def _check_identifiers(database: str, table: str) -> None:
+    """Refuse a name that could close a quoted identifier, before it is interpolated.
+
+    Identifier positions cannot be bound, so check before interpolating:
+    ``_ATHENA_IDENT_RE`` admits nothing that can close a double-quoted name.
+    """
+    for name in (database, table):
+        if not _ATHENA_IDENT_RE.fullmatch(name):
+            raise AthenaVerifyError(f"{name!r} is not a quotable Athena identifier", exists=True)
+
+
+def _run_query(
     athena: Any,
+    sql: str,
+    *,
+    what: str,
     database: str,
     table: str,
     options: AthenaOptions,
     bucket: str,
     table_locations: List[str],
     region: str,
-    *,
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
-    extra: Sequence[str] = (),
     results_kms_key: Optional[str] = None,
-) -> Tuple[int, Dict[str, Any], List[int]]:
-    """``(rows, query facts, the value of each ``extra`` expression)``.
+) -> Tuple[str, Dict[str, Any], List[Mapping[str, Any]]]:
+    """Run ``sql`` and wait for it: ``(query id, the query's facts, its result rows)``.
 
-    ``extra`` are more integer expressions over the same table, selected after
-    ``COUNT(*)`` in the same query: the masking checks (``_verify_masking``),
-    so they cost no second query, and a contract without masking rules sends
-    exactly the ``COUNT(*)`` it always did. ``results_kms_key`` is the key the
-    binding declares; a result written to the binding-bucket default is
-    encrypted with it.
+    ``rows[0]`` is the header row Athena always returns for a SELECT. ``what``
+    completes "Athena could not ..." when the query does not succeed.
+    ``results_kms_key`` is the key the binding declares; a result written to the
+    binding-bucket default is encrypted with it.
     """
-    # Identifier positions cannot be bound, so check before interpolating:
-    # ``_ATHENA_IDENT_RE`` admits nothing that can close a double-quoted name.
-    for name in (database, table):
-        if not _ATHENA_IDENT_RE.fullmatch(name):
-            raise AthenaVerifyError(f"{name!r} is not a quotable Athena identifier", exists=True)
-    selected = ", ".join(["COUNT(*)", *extra])
-    sql = f'SELECT {selected} FROM "{database}"."{table}"'
-
     results = _results_location(athena, options, bucket, table_locations)
     request: Dict[str, Any] = {"QueryString": sql, "WorkGroup": options.workgroup}
     if results.send:
@@ -660,11 +702,54 @@ def _count_rows(
             or "no reason given"
         )
         raise AthenaVerifyError(
-            f"Athena could not count {database}.{table}: query {query_id} {state}: {reason}",
+            f"Athena could not {what} {database}.{table}: query {query_id} {state}: {reason}",
             exists=True,
         )
 
     rows = athena.get_query_results(QueryExecutionId=query_id, MaxResults=2)["ResultSet"]["Rows"]
+    return query_id, query, rows
+
+
+def _count_rows(
+    athena: Any,
+    database: str,
+    table: str,
+    options: AthenaOptions,
+    bucket: str,
+    table_locations: List[str],
+    region: str,
+    *,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+    extra: Sequence[str] = (),
+    results_kms_key: Optional[str] = None,
+) -> Tuple[int, Dict[str, Any], List[int]]:
+    """``(rows, query facts, the value of each ``extra`` expression)``.
+
+    ``extra`` are more integer expressions over the same table, selected after
+    ``COUNT(*)`` in the same query: the masking checks (``_verify_masking``),
+    so they cost no second query, and a contract without masking rules sends
+    exactly the ``COUNT(*)`` it always did. ``results_kms_key`` is the key the
+    binding declares; a result written to the binding-bucket default is
+    encrypted with it.
+    """
+    _check_identifiers(database, table)
+    selected = ", ".join(["COUNT(*)", *extra])
+    sql = f'SELECT {selected} FROM "{database}"."{table}"'
+    query_id, query, rows = _run_query(
+        athena,
+        sql,
+        what="count",
+        database=database,
+        table=table,
+        options=options,
+        bucket=bucket,
+        table_locations=table_locations,
+        region=region,
+        sleep=sleep,
+        monotonic=monotonic,
+        results_kms_key=results_kms_key,
+    )
     try:
         # Rows[0] is the header row Athena always returns for a SELECT.
         count = int(rows[1]["Data"][0]["VarCharValue"])
@@ -678,11 +763,55 @@ def _count_rows(
         "verify_athena_query_finished query_execution_id=%s state=%s rows=%d "
         "data_scanned_bytes=%s",
         query_id,
-        state,
+        query["state"],
         count,
         query["data_scanned_bytes"],
     )
     return count, query, extra_values
+
+
+def _read_snapshots(
+    athena: Any,
+    database: str,
+    table: str,
+    options: AthenaOptions,
+    bucket: str,
+    table_locations: List[str],
+    region: str,
+    *,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+    results_kms_key: Optional[str] = None,
+) -> Tuple[SnapshotReading, Dict[str, Any]]:
+    """The newest write to an Iceberg table, from its ``$snapshots`` metadata table."""
+    _check_identifiers(database, table)
+    query_id, query, rows = _run_query(
+        athena,
+        snapshot_sql(database, table),
+        what="read the snapshots of",
+        database=database,
+        table=table,
+        options=options,
+        bucket=bucket,
+        table_locations=table_locations,
+        region=region,
+        sleep=sleep,
+        monotonic=monotonic,
+        results_kms_key=results_kms_key,
+    )
+    try:
+        reading = read_snapshot_row(rows)
+    except ValueError as exc:
+        raise AthenaVerifyError(
+            f"Athena query {query_id} succeeded but returned no readable snapshot: {exc}",
+            exists=True,
+        ) from exc
+    LOG.info(
+        "verify_athena_snapshots_read query_execution_id=%s snapshots_counted=%d",
+        query_id,
+        reading.counted,
+    )
+    return reading, query
 
 
 # ── Run records ─────────────────────────────────────────────────────────
@@ -1216,9 +1345,18 @@ def _catalogue_dimensions(
 
 
 def _severity(
-    schema: Mapping[str, Any], dimensions: Mapping[str, Any], expected_location: str
+    schema: Mapping[str, Any],
+    dimensions: Mapping[str, Any],
+    expected_location: str,
+    *,
+    freshness_critical: bool = True,
 ) -> Dict[str, Any]:
-    """The shared drift grading, raised to CRITICAL by a moved table or a bad count."""
+    """The shared drift grading, raised to CRITICAL by a moved table or a bad count.
+
+    A missed freshness objective is CRITICAL too, unless ``freshness_critical`` is
+    ``False`` (``--warn-only``): then it grades WARNING, which ``--strict`` reports
+    without failing on.
+    """
     from fluid_build.cli.verify import assess_drift_severity
 
     severity = assess_drift_severity(
@@ -1229,6 +1367,7 @@ def _severity(
         region_match=True,
     )
     problems: List[Tuple[str, str]] = []
+    advisories: List[Tuple[str, str]] = []  # problems that grade WARNING, not CRITICAL
     if dimensions["location"]["status"] == "fail":
         problems.append(
             (
@@ -1248,8 +1387,20 @@ def _severity(
     masking_problem = severity_problem(dimensions.get("masking"))
     if masking_problem is not None:
         problems.append(masking_problem)
+    missed = freshness_problem(dimensions.get("freshness"))
+    if missed is not None:
+        (problems if freshness_critical else advisories).append(missed)
     problems.extend(_storage_problems(dimensions))
     if not problems:
+        if advisories and severity["level"] != "CRITICAL":
+            return {
+                "level": "WARNING",
+                "impact": "MEDIUM",
+                "symbol": "🟡",
+                "remediation": "MANUAL_RECOMMENDED",
+                "reason": "; ".join(reason for reason, _ in advisories),
+                "actions": [action for _, action in advisories],
+            }
         if dimensions["row_count"]["status"] == "info" and severity["level"] == "SUCCESS":
             return {
                 "level": "INFO",
@@ -1373,6 +1524,59 @@ def _partition_layout(
     return bool(layout.keys), bool(layout.keys) and not layout.projection
 
 
+def _freshness(
+    objective: str,
+    athena: Any,
+    database: str,
+    table: str,
+    options: AthenaOptions,
+    bucket: str,
+    table_locations: List[str],
+    region: str,
+    *,
+    reference_only: bool,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+    results_kms_key: Optional[str],
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """The freshness dimension, and why the check could not run (``None`` when it did)."""
+    seconds = objective_seconds(objective)
+    if seconds is None:
+        return (
+            skipped_dimension(
+                objective,
+                f"{objective!r} is not a duration with a fixed length "
+                "(weeks, days, hours, minutes and seconds only)",
+            ),
+            None,
+        )
+    try:
+        reading, query = _read_snapshots(
+            athena,
+            database,
+            table,
+            options,
+            bucket,
+            table_locations,
+            region,
+            sleep=sleep,
+            monotonic=monotonic,
+            results_kms_key=results_kms_key,
+        )
+    except AthenaVerifyError as exc:
+        message = explain_failure(str(exc))
+        return error_dimension(objective, message), message
+    except Exception as exc:  # noqa: BLE001
+        # Every AWS failure is reported, not raised.
+        message = explain_failure(
+            f"Athena could not read the snapshots of {database}.{table}: {exc}"
+        )
+        return error_dimension(objective, message), message
+    dimension = freshness_dimension(objective, seconds, reading, reference_only=reference_only)
+    dimension["query"] = query
+    return dimension, None
+
+
 def verify_athena_expose(
     expose_id: str,
     expose: Mapping[str, Any],
@@ -1384,6 +1588,7 @@ def verify_athena_expose(
     client_factory: Optional[ClientFactory] = None,
     sleep: Optional[Callable[[float], None]] = None,
     monotonic: Optional[Callable[[], float]] = None,
+    freshness_critical: bool = True,
 ) -> Dict[str, Any]:
     """Verify one S3+Glue expose. Returns the shape the other verifiers return.
 
@@ -1394,11 +1599,15 @@ def verify_athena_expose(
     owns the rows, so an empty table with no run of this contract's own to
     compare with is INFO rather than CRITICAL, as a missing one already is.
     ``client_factory(service, region)``, ``sleep`` and ``monotonic`` default to
-    boto3 and the ``time`` module, resolved at call time.
+    boto3 and the ``time`` module, resolved at call time. ``freshness_critical``
+    grades a missed freshness objective CRITICAL; ``False`` (``--warn-only``)
+    grades it WARNING.
     """
+    from fluid_build.providers._iceberg_catalog import is_iceberg_format
     from fluid_build.providers.aws.util.warehouse import normalize_location
 
     binding = _resolved_binding(expose.get("binding"))
+    iceberg = is_iceberg_format(binding.get("format"))
     loc = binding.get("location") or {}
     if not isinstance(loc, Mapping):
         loc = {}
@@ -1435,6 +1644,15 @@ def verify_athena_expose(
                 f"Glue table not found: {table_id} in {region}", target=target, exists=False
             )
         return _error(f"Glue GetTable {table_id} failed: {exc}", target=target, exists=None)
+
+    table_type = str((glue_table.get("Parameters") or {}).get("table_type") or "")
+    if iceberg and table_type.upper() != "ICEBERG":
+        return _error(
+            f"Glue table {table_id} is not an Iceberg table (its table_type is "
+            f"{table_type or 'unset'}), but the binding declares format {binding.get('format')}",
+            target=target,
+            exists=True,
+        )
 
     schema = _compare_schema(glue_table, _declared_fields(expose))
     actual_location = str((glue_table.get("StorageDescriptor") or {}).get("Location") or "")
@@ -1490,7 +1708,12 @@ def verify_athena_expose(
     except Exception as exc:  # noqa: BLE001 — an unreadable record is not a count
         LOG.warning("verify_athena_run_record_unreadable error=%s", type(exc).__name__)
         landed, info = None, {"source": "none", "note": "the run record could not be read"}
-    partitioned, unregistered = _partition_layout(expose_id, expose, contract)
+    if iceberg:
+        # Iceberg partitions are hidden: the table's own metadata tracks them, and none is
+        # registered in Glue for Athena to miss.
+        partitioned = unregistered = False
+    else:
+        partitioned, unregistered = _partition_layout(expose_id, expose, contract)
     if partitioned and info.get("rule") == RULE_EQUAL:
         info = {**info, "rule": RULE_AT_LEAST_RUN}
     row_count = _row_count_dimension(
@@ -1501,10 +1724,39 @@ def verify_athena_expose(
     if masking is not None:
         dimensions["masking"] = masking
 
-    severity = _severity(schema, dimensions, expected_location)
+    # An Iceberg table that declares a freshness objective: how old is its newest write.
+    objective = declared_objective(expose) if iceberg else None
+    freshness_error: Optional[str] = None
+    if objective is not None:
+        dimensions["freshness"], freshness_error = _freshness(
+            objective,
+            athena,
+            database,
+            table,
+            options,
+            bucket,
+            table_locations,
+            region,
+            reference_only=reference_only,
+            sleep=sleep or time.sleep,
+            monotonic=monotonic or time.monotonic,
+            results_kms_key=storage.kms_key_arn,
+        )
+
+    severity = _severity(
+        schema, dimensions, expected_location, freshness_critical=freshness_critical
+    )
     has_issues = any(
         dimensions[name]["status"] == "fail"
-        for name in ("structure", "types", "location", "row_count", "masking", *storage.dimensions)
+        for name in (
+            "structure",
+            "types",
+            "location",
+            "row_count",
+            "masking",
+            "freshness",
+            *storage.dimensions,
+        )
         if name in dimensions
     )
     created = glue_table.get("CreateTime")
@@ -1524,9 +1776,10 @@ def verify_athena_expose(
         },
         "athena": query,
     }
-    if storage.errors:
-        # A declared policy that could not be checked is unproven, not passed:
-        # an error, which fails verify with or without --strict.
+    unchecked = [*storage.errors, *([freshness_error] if freshness_error else [])]
+    if unchecked:
+        # A declared policy or objective that could not be checked is unproven, not
+        # passed: an error, which fails verify with or without --strict.
         result["status"] = "error"
-        result["error"] = _with_storage_failures("; ".join(storage.errors), dimensions)
+        result["error"] = _with_storage_failures("; ".join(unchecked), dimensions)
     return result

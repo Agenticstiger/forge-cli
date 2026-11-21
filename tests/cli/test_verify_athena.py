@@ -15,6 +15,10 @@ demo uses, and real botocore clients answered by ``botocore.stub.Stubber`` —
 which also checks each request against the service model, so a request shape
 Athena or Glue would reject fails here too. ``boto3.client`` is the only seam.
 
+An Iceberg table cataloged in Glue goes through the same checks, and one that
+declares ``qos.freshnessSLO`` also has its newest write read from its
+``$snapshots`` metadata table (the last section).
+
 Marked ``emulated`` so the keyless ``emulated-integration`` CI lane, which has
 boto3, runs them. Without boto3 the stubbed tests skip and the missing-extra
 test still runs.
@@ -55,6 +59,17 @@ DATA_LOCATION = "s3://northwind-demo-lake/bronze/customer_subscriptions/"
 DATA_FILE = DATA_LOCATION + "customer_subscriptions.parquet"
 DEFAULT_RESULTS = "s3://northwind-demo-lake/.fluid/athena-results/"
 COUNT_SQL = 'SELECT COUNT(*) FROM "demo_bronze"."customer_subscriptions"'
+# The snapshot query an Iceberg table with a freshness objective also gets: every
+# operation but a compaction, the newest of them, its age computed by Athena.
+SNAPSHOT_SQL = (
+    "SELECT CAST(to_unixtime(max(committed_at)) * 1000 AS bigint), "
+    "date_diff('millisecond', max(committed_at), current_timestamp), "
+    "max_by(snapshot_id, committed_at), max_by(operation, committed_at), COUNT(*) "
+    'FROM "demo_bronze"."customer_subscriptions$snapshots" '
+    "WHERE operation IS DISTINCT FROM 'replace'"
+)
+HOUR_MS = 3_600_000
+LAST_COMMIT_MS = "1763712000000"  # 2025-11-21T08:00:00+00:00
 DATA_PREFIX = "bronze/customer_subscriptions/"
 # The key ``fluid apply`` creates for the demo bucket under ``kms: product``
 # (``aws_storage.product_key_alias``), and the ARN KMS answers for it.
@@ -175,22 +190,22 @@ class _Aws:
         location: str = DATA_LOCATION,
         partition_keys: Optional[List[Dict[str, str]]] = None,
         name: str = "customer_subscriptions",
+        parameters: Optional[Dict[str, str]] = None,
     ) -> None:
-        self.glue_stub.add_response(
-            "get_table",
-            {
-                "Table": {
-                    "Name": name,
-                    "DatabaseName": "demo_bronze",
-                    "TableType": "EXTERNAL_TABLE",
-                    "StorageDescriptor": {
-                        "Columns": GLUE_COLUMNS if columns is None else columns,
-                        "Location": location,
-                    },
-                    "PartitionKeys": partition_keys or [],
-                }
+        table: Dict[str, Any] = {
+            "Name": name,
+            "DatabaseName": "demo_bronze",
+            "TableType": "EXTERNAL_TABLE",
+            "StorageDescriptor": {
+                "Columns": GLUE_COLUMNS if columns is None else columns,
+                "Location": location,
             },
-            {"DatabaseName": "demo_bronze", "Name": name},
+            "PartitionKeys": partition_keys or [],
+        }
+        if parameters is not None:
+            table["Parameters"] = parameters
+        self.glue_stub.add_response(
+            "get_table", {"Table": table}, {"DatabaseName": "demo_bronze", "Name": name}
         )
 
     def no_table(self) -> None:
@@ -215,6 +230,7 @@ class _Aws:
         workgroup="primary",
         sql=COUNT_SQL,
         kms_key: Optional[str] = None,
+        query_id: str = "q-1",
     ):
         expected: Dict[str, Any] = {"QueryString": sql, "WorkGroup": workgroup}
         if output_location is not None:
@@ -225,10 +241,10 @@ class _Aws:
                 "KmsKey": kms_key,
             }
         self.athena_stub.add_response(
-            "start_query_execution", {"QueryExecutionId": "q-1"}, expected
+            "start_query_execution", {"QueryExecutionId": query_id}, expected
         )
 
-    def state(self, state: str, reason: Optional[str] = None) -> None:
+    def state(self, state: str, reason: Optional[str] = None, query_id: str = "q-1") -> None:
         status: Dict[str, Any] = {"State": state}
         if reason:
             status["StateChangeReason"] = reason
@@ -236,12 +252,12 @@ class _Aws:
             "get_query_execution",
             {
                 "QueryExecution": {
-                    "QueryExecutionId": "q-1",
+                    "QueryExecutionId": query_id,
                     "Status": status,
                     "Statistics": {"DataScannedInBytes": 0, "EngineExecutionTimeInMillis": 412},
                 }
             },
-            {"QueryExecutionId": "q-1"},
+            {"QueryExecutionId": query_id},
         )
 
     def count(self, rows: int) -> None:
@@ -256,6 +272,40 @@ class _Aws:
                 }
             },
             {"QueryExecutionId": "q-1", "MaxResults": 2},
+        )
+
+    def freshness(
+        self,
+        cells: Optional[List[Optional[str]]] = None,
+        *,
+        state: str = "SUCCEEDED",
+        reason: Optional[str] = None,
+    ) -> None:
+        """The whole snapshot query (the second one): workgroup, start, running, done, one row.
+
+        ``cells`` are the five aggregates in the order the query selects them; a
+        ``None`` is a NULL, which Athena returns as a cell with no value.
+        """
+        self.workgroup()
+        self.start(sql=SNAPSHOT_SQL, query_id="q-2")
+        self.state("RUNNING", query_id="q-2")
+        self.state(state, reason=reason, query_id="q-2")
+        if state != "SUCCEEDED":
+            return
+        cells = (
+            [LAST_COMMIT_MS, str(2 * HOUR_MS), "4242", "append", "3"] if cells is None else cells
+        )
+        self.athena_stub.add_response(
+            "get_query_results",
+            {
+                "ResultSet": {
+                    "Rows": [
+                        {"Data": [{"VarCharValue": f"_col{i}"} for i in range(5)]},
+                        {"Data": [{} if c is None else {"VarCharValue": c} for c in cells]},
+                    ]
+                }
+            },
+            {"QueryExecutionId": "q-2", "MaxResults": 2},
         )
 
     def counts(self, rows: int, **start: Any) -> None:
@@ -2323,3 +2373,380 @@ def test_a_sooner_rule_and_a_retention_not_applied_get_both_remedies(
     [action] = [a for a in result["severity"]["actions"] if "lifecycle" in a]
     assert action.startswith("Re-apply so the bucket's lifecycle rule matches lifecycle.retention")
     assert "remove or narrow the rule that expires objects under the prefix sooner" in action
+
+
+# ── Freshness: an Iceberg table's newest write ──────────────────────────
+#
+# An Iceberg table cataloged in Glue is verified like any Glue table (its
+# columns, its location, Athena's count). When its expose declares
+# ``qos.freshnessSLO``, a second query reads the newest snapshot that wrote
+# data from ``"<table>$snapshots"`` and holds its age to the objective.
+
+ICEBERG_OVERLAY = AWS_OVERLAY.replace("format: parquet", "format: iceberg")
+ICEBERG_TABLE = {
+    "table_type": "ICEBERG",
+    "metadata_location": DATA_LOCATION + "metadata/00003-1f2e.metadata.json",
+}
+_SLO_ANCHOR = "    kind: table\n    binding:\n      platform: local\n"
+SLO_CONTRACT = CONTRACT.replace(
+    _SLO_ANCHOR,
+    "    kind: table\n    qos:\n      freshnessSLO: PT6H\n    binding:\n      platform: local\n",
+)
+
+
+def _iceberg(
+    tmp_path: Path,
+    *,
+    slo: str = "PT6H",
+    contract: Optional[str] = None,
+    landed: Optional[int] = 10172,
+) -> Path:
+    """The demo contract on an Iceberg binding, with a run record that landed ``landed`` rows.
+
+    The record keeps the acquisition build's own post-apply probe (a missing run
+    record) out of what a test here counts; ``landed=None`` writes none.
+    """
+    text = contract or SLO_CONTRACT.replace("PT6H", slo)
+    path = _write_contract(tmp_path, overlay=ICEBERG_OVERLAY, contract=text)
+    if landed is not None:
+        _write_run_record(tmp_path, landed)
+    return path
+
+
+def _iceberg_run(aws: "_Aws", rows: int = 10172, **freshness: Any) -> None:
+    """Glue, the count, then the snapshot query: the order ``verify_athena_expose`` asks."""
+    aws.table(parameters=ICEBERG_TABLE)
+    aws.counts(rows)
+    aws.freshness(**freshness)
+
+
+def test_an_iceberg_table_within_its_objective_passes(tmp_path, aws, capsys):
+    contract = _iceberg(tmp_path)
+    _iceberg_run(aws)
+
+    code, report = _verify(tmp_path, contract)
+
+    result = report["results"]["subscriptions"]
+    assert code == 0, result
+    assert result["status"] == "match"
+    freshness = result["dimensions"]["freshness"]
+    assert freshness["status"] == "pass"
+    assert freshness["objective"] == "PT6H" and freshness["objective_seconds"] == 6 * 3600
+    assert freshness["age_seconds"] == 7200
+    assert freshness["last_commit"] == "2025-11-21T08:00:00+00:00"
+    assert (freshness["snapshot_id"], freshness["operation"]) == (4242, "append")
+    assert freshness["snapshots_counted"] == 3
+    assert freshness["query"]["sql"] == SNAPSHOT_SQL
+    assert freshness["query"]["query_execution_id"] == "q-2"
+    # The table was held to the rest of its checks: the count went through Athena too.
+    assert result["dimensions"]["row_count"]["actual"] == 10172
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Freshness (Iceberg snapshots)" in out
+    assert "PASS - last write 2h ago (snapshot 4242, append), within PT6H" in out
+    aws.assert_all_called()
+
+
+def test_the_limit_itself_is_within_the_objective(tmp_path, aws):
+    contract = _iceberg(tmp_path)
+    _iceberg_run(aws, cells=[LAST_COMMIT_MS, str(6 * HOUR_MS), "7", "overwrite", "1"])
+
+    code, report = _verify(tmp_path, contract)
+
+    assert code == 0
+    assert report["results"]["subscriptions"]["dimensions"]["freshness"]["status"] == "pass"
+
+
+def test_a_table_older_than_its_objective_fails_strict(tmp_path, aws, capsys):
+    contract = _iceberg(tmp_path)
+    _iceberg_run(
+        aws, cells=[LAST_COMMIT_MS, str(7 * HOUR_MS + 30 * 60 * 1000), "4242", "append", "3"]
+    )
+
+    code, report = _verify(tmp_path, contract)
+
+    result = report["results"]["subscriptions"]
+    assert code == 1
+    assert result["status"] == "mismatch"
+    assert result["severity"]["level"] == "CRITICAL"
+    assert "freshness objective missed" in result["severity"]["reason"]
+    freshness = result["dimensions"]["freshness"]
+    assert freshness["status"] == "fail" and freshness["fix"]
+    assert freshness["message"] == (
+        "last write 7h 30m ago (snapshot 4242, append); the objective is PT6H"
+    )
+    assert "FAIL - last write 7h 30m ago" in " ".join(capsys.readouterr().out.split())
+
+
+def test_without_strict_a_missed_objective_is_reported_not_failed(tmp_path, aws):
+    contract = _iceberg(tmp_path)
+    _iceberg_run(aws, cells=[LAST_COMMIT_MS, str(9 * HOUR_MS), "4242", "append", "3"])
+
+    code, report = _verify(tmp_path, contract, strict=False)
+
+    assert code == 0
+    assert report["results"]["subscriptions"]["status"] == "mismatch"
+
+
+def test_warn_only_grades_a_missed_objective_a_warning(tmp_path, aws, capsys):
+    """``--strict --warn-only`` reports the miss and does not fail on it; the dimension still says fail."""
+    contract = _iceberg(tmp_path)
+    _iceberg_run(aws, cells=[LAST_COMMIT_MS, str(9 * HOUR_MS), "4242", "append", "3"])
+
+    code, report = _verify(tmp_path, contract, warn_only=True)
+
+    result = report["results"]["subscriptions"]
+    assert code == 0
+    assert result["severity"]["level"] == "WARNING"
+    assert result["dimensions"]["freshness"]["status"] == "fail"
+    out = " ".join(capsys.readouterr().out.split())
+    assert "1 non-critical mismatch(es) downgraded to warning" in out
+    assert "the objective is PT6H [WARNING]" in out
+
+    # --fail-on-warning still gates it: it was asked to fail on every mismatch.
+    _iceberg_run(aws, cells=[LAST_COMMIT_MS, str(9 * HOUR_MS), "4242", "append", "3"])
+    code, _ = _verify(tmp_path, contract, warn_only=True, fail_on_warning=True)
+    assert code == 1
+
+
+def test_warn_only_does_not_soften_a_schema_failure(tmp_path, aws):
+    contract = _iceberg(tmp_path)
+    aws.table(columns=[c for c in GLUE_COLUMNS if c["Name"] != "msisdn"], parameters=ICEBERG_TABLE)
+    aws.counts(10172)
+    aws.freshness(cells=[LAST_COMMIT_MS, str(9 * HOUR_MS), "4242", "append", "3"])
+
+    code, report = _verify(tmp_path, contract, warn_only=True)
+
+    assert code == 1
+    assert report["results"]["subscriptions"]["severity"]["level"] == "CRITICAL"
+
+
+def test_a_table_no_snapshot_wrote_to_fails(tmp_path, aws):
+    """Only compactions, or a history expired away: the objective cannot be shown met."""
+    contract = _iceberg(tmp_path)
+    _iceberg_run(aws, cells=[None, None, None, None, "0"])
+
+    code, report = _verify(tmp_path, contract)
+
+    freshness = report["results"]["subscriptions"]["dimensions"]["freshness"]
+    assert code == 1
+    assert freshness["status"] == "fail" and freshness["snapshots_counted"] == 0
+    assert "no snapshot records a write" in freshness["message"]
+    assert "age_seconds" not in freshness
+
+
+def test_a_reference_only_table_no_snapshot_wrote_to_is_not_gated(tmp_path, aws):
+    """The pipeline that owns the table may not have run yet, as for an empty one."""
+    reference = _REFERENCE_CONTRACT.replace(
+        "    kind: table\n    binding:\n      platform: local\n",
+        "    kind: table\n    qos:\n      freshnessSLO: PT6H\n    binding:\n      platform: local\n",
+    )
+    assert "freshnessSLO" in reference
+    contract = _iceberg(tmp_path, contract=reference, landed=None)
+    _iceberg_run(aws, rows=0, cells=[None, None, None, None, "0"])
+
+    code, report = _verify(tmp_path, contract)
+
+    freshness = report["results"]["subscriptions"]["dimensions"]["freshness"]
+    assert code == 0
+    assert freshness["status"] == "skip" and "reference-only" in freshness["message"]
+
+
+def test_a_failed_snapshot_query_is_an_error_and_the_rest_is_kept(tmp_path, aws):
+    """A declared objective that could not be read is unproven, not passed."""
+    contract = _iceberg(tmp_path)
+    reason = "TABLE_NOT_FOUND: line 1:15: Table 'awsdatacatalog.demo_bronze.customer_subscriptions$snapshots' does not exist"
+    aws.table(parameters=ICEBERG_TABLE)
+    aws.counts(10172)
+    aws.freshness(state="FAILED", reason=reason)
+
+    code, report = _verify(tmp_path, contract, strict=False)
+
+    result = report["results"]["subscriptions"]
+    assert code == 1
+    assert result["status"] == "error"
+    assert "could not read the snapshots of demo_bronze.customer_subscriptions" in result["error"]
+    assert reason in result["error"]
+    assert "Lake Formation" not in result["error"]
+    assert result["dimensions"]["freshness"]["status"] == "error"
+    assert result["dimensions"]["row_count"]["actual"] == 10172
+    aws.assert_all_called()
+
+
+def test_a_snapshot_query_athena_refuses_to_a_filtered_principal_says_why(tmp_path, aws):
+    """Lake Formation is not evaluated for an Iceberg table's metadata tables: Athena refuses
+    ``$snapshots`` when the base table has row or cell filters or a column the principal cannot see.
+    """
+    contract = _iceberg(tmp_path)
+    aws.table(parameters=ICEBERG_TABLE)
+    aws.counts(10172)
+    aws.freshness(state="FAILED", reason="AccessDeniedException: Insufficient permissions")
+
+    code, report = _verify(tmp_path, contract, strict=False)
+
+    result = report["results"]["subscriptions"]
+    assert code == 1 and result["status"] == "error"
+    assert "AccessDeniedException: Insufficient permissions" in result["error"]
+    assert "run verify as a principal that can read the whole table" in result["error"]
+    assert "every column" in result["dimensions"]["freshness"]["message"]
+    aws.assert_all_called()
+
+
+def test_a_result_row_that_is_not_a_reading_is_an_error(tmp_path, aws):
+    contract = _iceberg(tmp_path)
+    _iceberg_run(aws, cells=[LAST_COMMIT_MS, "not-a-number", "4242", "append", "3"])
+
+    code, report = _verify(tmp_path, contract, strict=False)
+
+    result = report["results"]["subscriptions"]
+    assert code == 1 and result["status"] == "error"
+    assert "returned no readable snapshot" in result["error"]
+
+
+def test_an_iceberg_table_with_no_objective_asks_athena_only_for_the_count(tmp_path, aws):
+    contract = _iceberg(tmp_path, contract=CONTRACT)
+    aws.table(parameters=ICEBERG_TABLE)
+    aws.counts(10172)
+
+    code, report = _verify(tmp_path, contract)
+
+    result = report["results"]["subscriptions"]
+    assert code == 0
+    assert "freshness" not in result["dimensions"]
+    aws.assert_all_called()
+
+
+def test_a_parquet_table_with_an_objective_is_not_asked_for_snapshots(tmp_path, aws):
+    """Only an Iceberg table has commits to read: a Hive one keeps its behavior."""
+    contract = _write_contract(tmp_path, contract=SLO_CONTRACT)
+    aws.table()
+    aws.counts(10172)
+
+    code, report = _verify(tmp_path, contract)
+
+    assert code == 0
+    assert "freshness" not in report["results"]["subscriptions"]["dimensions"]
+    aws.assert_all_called()
+
+
+def test_an_objective_without_a_fixed_length_is_not_checked_and_never_gates(tmp_path, aws):
+    contract = _iceberg(tmp_path, slo="P1M")
+    aws.table(parameters=ICEBERG_TABLE)
+    aws.counts(10172)
+
+    code, report = _verify(tmp_path, contract)
+
+    freshness = report["results"]["subscriptions"]["dimensions"]["freshness"]
+    assert code == 0
+    assert freshness["status"] == "skip"
+    assert "'P1M' is not a duration with a fixed length" in freshness["message"]
+    assert "(weeks, days, hours, minutes and seconds only)" in freshness["message"]
+    aws.assert_all_called()
+
+
+def test_a_glue_table_that_is_not_iceberg_is_an_error_when_the_binding_says_it_is(tmp_path, aws):
+    contract = _iceberg(tmp_path)
+    aws.table(parameters={"classification": "parquet"})
+
+    code, report = _verify(tmp_path, contract, strict=False)
+
+    result = report["results"]["subscriptions"]
+    assert code == 1 and result["status"] == "error"
+    assert "is not an Iceberg table (its table_type is unset)" in result["error"]
+    # Athena was not asked: nothing was run against a table of the wrong kind.
+    aws.athena_stub.assert_no_pending_responses()
+    aws.glue_stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize(
+    "binding, claimed",
+    [
+        pytest.param({"platform": "aws", "format": "iceberg"}, True, id="iceberg"),
+        pytest.param({"platform": "aws", "format": "iceberg_table"}, True, id="iceberg_table"),
+        pytest.param(
+            {"platform": "aws", "format": "Iceberg-Table"}, True, id="spelled-differently"
+        ),
+        pytest.param({"platform": "aws", "format": "iceberg", "catalog": "glue"}, True, id="glue"),
+        pytest.param(
+            {"platform": "aws", "format": "iceberg", "catalog": "lakekeeper"},
+            False,
+            id="a-rest-catalog-holds-it-not-glue",
+        ),
+        pytest.param({"platform": "aws", "format": "csv"}, False, id="csv"),
+        pytest.param({"platform": "aws", "format": "parquet"}, True, id="parquet"),
+        pytest.param({"platform": "gcp", "format": "iceberg"}, False, id="not-aws"),
+    ],
+)
+def test_which_bindings_athena_verifies(binding, claimed):
+    from fluid_build.cli._verify_athena import is_athena_verifiable
+
+    location = {"database": "d", "table": "t", "bucket": "b"}
+    if "catalog" in binding:
+        location["catalog"] = binding.pop("catalog")
+    assert is_athena_verifiable({**binding, "location": location}) is claimed
+
+
+def test_a_hostile_operation_is_not_printed_and_the_run_completes(tmp_path, aws, capsys):
+    """The operation is data a writer of the table chose: Rich markup would crash the run,
+    an escape sequence or a newline would forge terminal output. It is kept only as a word."""
+    contract = _iceberg(tmp_path)
+    hostile = "[/bold]x[red]y\x1b]0;title\x07\n      PASS - forged"
+    _iceberg_run(aws, cells=[LAST_COMMIT_MS, str(9 * HOUR_MS), "4242", hostile, "3"])
+
+    code, report = _verify(tmp_path, contract)
+
+    out = capsys.readouterr().out
+    freshness = report["results"]["subscriptions"]["dimensions"]["freshness"]
+    assert code == 1
+    assert "\x1b" not in out and "\x07" not in out
+    assert "forged" not in out and "[/bold]" not in out
+    assert freshness["status"] == "fail" and freshness["operation"] is None
+    assert freshness["message"] == "last write 9h ago (snapshot 4242); the objective is PT6H"
+    assert "forged" not in json.dumps(report)
+
+
+def test_a_commit_time_no_clock_can_hold_is_an_error_not_a_crash(tmp_path, aws):
+    """A writer that stores microseconds as milliseconds: year 57859."""
+    contract = _iceberg(tmp_path)
+    _iceberg_run(aws, cells=["1763712000000000", str(2 * HOUR_MS), "4242", "append", "3"])
+
+    code, report = _verify(tmp_path, contract, strict=False)
+
+    result = report["results"]["subscriptions"]
+    assert code == 1 and result["status"] == "error"
+    assert (
+        "returned no readable snapshot: a commit time outside the years 1 to 9999"
+        in result["error"]
+    )
+    assert result["dimensions"]["row_count"]["actual"] == 10172
+
+
+def test_an_objective_longer_than_a_timedelta_is_not_checked_and_does_not_crash(tmp_path, aws):
+    """The schema takes any number of digits, so a contract can declare one."""
+    contract = _iceberg(tmp_path, slo="P" + "9" * 30 + "D")
+    aws.table(parameters=ICEBERG_TABLE)
+    aws.counts(10172)
+
+    code, report = _verify(tmp_path, contract)
+
+    freshness = report["results"]["subscriptions"]["dimensions"]["freshness"]
+    assert code == 0
+    assert (
+        freshness["status"] == "skip"
+        and "not a duration with a fixed length" in freshness["message"]
+    )
+    aws.assert_all_called()
+
+
+@pytest.mark.parametrize(
+    "days, status, code",
+    [(6, "pass", 0), (7, "pass", 0), (8, "fail", 1)],
+)
+def test_a_weekly_objective_is_checked(tmp_path, aws, days, status, code):
+    contract = _iceberg(tmp_path, slo="P1W")
+    _iceberg_run(aws, cells=[LAST_COMMIT_MS, str(days * 24 * HOUR_MS), "4242", "append", "3"])
+
+    exit_code, report = _verify(tmp_path, contract)
+
+    freshness = report["results"]["subscriptions"]["dimensions"]["freshness"]
+    assert (freshness["status"], exit_code) == (status, code)
+    assert freshness["objective_seconds"] == 7 * 86400
