@@ -125,29 +125,40 @@ def _repository(value: Optional[str]) -> Optional[str]:
     return f"{scp.group(1)}:{scp.group(2)}"
 
 
+def _repository_value(env: Mapping[str, str], repository_var: str) -> Optional[str]:
+    """What the CI says the repository is: a URL, or for GitHub the ``org/repo`` on its server."""
+    repository = env.get(repository_var)
+    if repository_var != "GITHUB_REPOSITORY":
+        return repository
+    slug = (repository or "").strip()
+    server = (env.get("GITHUB_SERVER_URL") or "https://github.com").rstrip("/")
+    return f"{server}/{slug}" if _GITHUB_REPOSITORY.fullmatch(slug) else None
+
+
+def _source_of(
+    env: Mapping[str, str], revision_var: str, repository_var: str, ref_var: str
+) -> Dict[str, str]:
+    """``{"revision", "repository", "ref"}`` of one CI, each only when it is what it should be."""
+    found: Dict[str, str] = {}
+    revision = (env.get(revision_var) or "").strip().lower()
+    if _REVISION.fullmatch(revision):
+        found["revision"] = revision
+    repository = _repository(_repository_value(env, repository_var))
+    if repository:
+        found["repository"] = repository
+    ref = (env.get(ref_var) or "").strip()
+    if _REF.fullmatch(ref):
+        found["ref"] = ref
+    return found
+
+
 def source_revision(env: Mapping[str, str]) -> Optional[Dict[str, str]]:
     """The code the run built, as its CI names it: ``{"revision", "repository", "ref"}``, each
     only when the CI sets it and it is what it should be (a hex commit, a URL with no
     credential in it, a ref name). Read from environment variables only, as the CI run is."""
-    for markers, revision_var, repository_var, ref_var in _SOURCE_VARS:
-        if not any(env.get(name) for name in markers):
-            continue
-        found: Dict[str, str] = {}
-        revision = (env.get(revision_var) or "").strip().lower()
-        if _REVISION.fullmatch(revision):
-            found["revision"] = revision
-        repository = env.get(repository_var)
-        if repository_var == "GITHUB_REPOSITORY":
-            slug = (repository or "").strip()
-            server = (env.get("GITHUB_SERVER_URL") or "https://github.com").rstrip("/")
-            repository = f"{server}/{slug}" if _GITHUB_REPOSITORY.fullmatch(slug) else None
-        clean = _repository(repository)
-        if clean:
-            found["repository"] = clean
-        ref = (env.get(ref_var) or "").strip()
-        if _REF.fullmatch(ref):
-            found["ref"] = ref
-        return found or None
+    for markers, *names in _SOURCE_VARS:
+        if any(env.get(name) for name in markers):
+            return _source_of(env, *names) or None
     return None
 
 

@@ -346,16 +346,10 @@ def reconcile_only(
     from fluid_build.build_runners.spark._reconcile import reconcile
     from fluid_build.cli.console import cprint
 
-    runs = (
-        _desired(
-            contract,
-            "apply_spark",
-            build_id=build_id,
-            stamps=_stamps(contract, run_id, refuse_release=False),
-        )
-        if _has_spark(contract)
-        else []
-    )
+    runs: List[DesiredRun] = []
+    if _has_spark(contract):
+        stamps = _stamps(contract, run_id, refuse_release=False)
+        runs = _desired(contract, "apply_spark", build_id=build_id, stamps=stamps)
     if build_id and not runs:
         raise _cli_error(
             "apply_reconcile_not_a_stream",

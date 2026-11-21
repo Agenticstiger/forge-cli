@@ -232,6 +232,23 @@ def _candidates(top: Path, root: str, found: Found) -> List[Tuple[Path, str]]:
     return out
 
 
+def _release_in(directory: Path, shown: str, wanted: str, found: Found) -> Optional[Release]:
+    """The release of ``wanted`` that ``directory`` holds, or None, with the reason counted in
+    ``found``."""
+    index = _read_index(directory)
+    if index is None:
+        found.skip("a directory with no readable release.json")
+        return None
+    release = _release(shown, index)
+    if release is None:
+        found.skip("a release.json that is not a fluid-release/1 record")
+    elif release.product_id != wanted:
+        found.skip("a release of another product")
+    else:
+        return release
+    return None
+
+
 def find_releases(roots: Sequence[str], product_id: str) -> Found:
     """The sealed releases of ``product_id`` under ``roots``, oldest first. A root that holds a
     ``release.json`` is one release; any other directory is read one level deep, in name order,
@@ -249,20 +266,13 @@ def find_releases(roots: Sequence[str], product_id: str) -> Found:
         if not top.is_dir():
             raise NotADirectoryError(f"--release-dir {clean(root)}: not a directory")
         for directory, shown in _candidates(top, root, found):
-            index = _read_index(directory)
-            if index is None:
-                found.skip("a directory with no readable release.json")
-                continue
-            release = _release(shown, index)
+            release = _release_in(directory, shown, wanted, found)
             if release is None:
-                found.skip("a release.json that is not a fluid-release/1 record")
-            elif release.product_id != wanted:
-                found.skip("a release of another product")
-            else:
-                key = (release.release_id, os.path.realpath(directory))
-                if key not in seen:
-                    seen.add(key)
-                    found.releases.append(release)
+                continue
+            key = (release.release_id, os.path.realpath(directory))
+            if key not in seen:
+                seen.add(key)
+                found.releases.append(release)
     found.releases.sort(key=lambda r: (r.sealed_at, r.path, r.release_id))
     return found
 

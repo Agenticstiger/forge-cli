@@ -307,14 +307,11 @@ def test_reconcile_only_stamps_the_runs_it_starts(contract, monkeypatch):
         lambda runs, *a, **k: seen.extend(runs) or [],
     )
     monkeypatch.setattr(_apply, "_require_boto3", lambda: None)
-    try:
-        _apply.reconcile_only(
-            contract,
-            logging.getLogger("test"),
-            build_id=None,
-            dry_run=True,
-            run_id="3f9a3f9a3f9a",
-        )
-    except Exception:  # noqa: BLE001 - what it does next is not this test's
-        pass
-    assert all(run.run_id == "3f9a3f9a3f9a" for run in seen)
+    _apply.reconcile_only(
+        contract,
+        logging.getLogger("test"),
+        build_id=None,
+        dry_run=True,
+        run_id="3f9a3f9a3f9a",
+    )
+    assert seen and all(run.run_id == "3f9a3f9a3f9a" for run in seen)

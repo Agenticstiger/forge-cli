@@ -474,13 +474,9 @@ def test_without_release_dir_the_status_reads_run_records_as_before(tmp_path, ca
 def test_the_module_imports_only_the_standard_library_when_it_is_loaded():
     import ast
 
-    source = Path(rs.__file__).read_text(encoding="utf-8")
-    names = set()
-    for node in ast.parse(source).body:
-        if isinstance(node, ast.Import):
-            names |= {a.name.split(".")[0] for a in node.names}
-        elif isinstance(node, ast.ImportFrom):
-            names.add((node.module or "").split(".")[0])
+    body = ast.parse(Path(rs.__file__).read_text(encoding="utf-8")).body
+    names = {a.name.split(".")[0] for n in body if isinstance(n, ast.Import) for a in n.names}
+    names |= {(n.module or "").split(".")[0] for n in body if isinstance(n, ast.ImportFrom)}
     assert names <= {
         "__future__", "os", "re", "stat", "dataclasses", "datetime", "pathlib", "typing",
     }  # fmt: skip

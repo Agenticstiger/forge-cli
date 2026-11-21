@@ -105,6 +105,34 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--json", action="store_true", help="Emit JSON")
 
 
+def _add_release_flags(p: argparse.ArgumentParser) -> None:
+    """The flags that make ``fluid runs status`` read sealed releases instead of run records."""
+    p.add_argument(
+        "--release-dir",
+        action="append",
+        dest="release_dirs",
+        metavar="DIR",
+        help=(
+            "Read the sealed releases `fluid ship --release-dir` published (DIR is one release "
+            "or a directory of them; repeatable) and say which was in force: for jobs Forge "
+            "does not run, which leave no run record. Replaces the run records."
+        ),
+    )
+    p.add_argument(
+        "--on",
+        metavar="YYYY-MM-DD",
+        help="With --release-dir: the UTC day to answer for (default: now)",
+    )
+    p.add_argument(
+        "--env",
+        metavar="NAME",
+        help=(
+            "With --release-dir: answer only for the releases of this environment "
+            "(default: one answer per environment the releases name)"
+        ),
+    )
+
+
 def register_runs(subparsers: argparse._SubParsersAction) -> None:
     """Register ``fluid runs {status,logs,diff}``."""
     p = subparsers.add_parser(
@@ -120,30 +148,7 @@ def register_runs(subparsers: argparse._SubParsersAction) -> None:
     s.add_argument("product_id", help="Product id (e.g. bronze.crm_orders)")
     s.add_argument("--build", default=None, help="Build id to inspect (default: first found)")
     s.add_argument("--last", type=int, default=5, help="Number of recent runs to show (default 5)")
-    s.add_argument(
-        "--release-dir",
-        action="append",
-        dest="release_dirs",
-        metavar="DIR",
-        help=(
-            "Read the sealed releases `fluid ship --release-dir` published (DIR is one release "
-            "or a directory of them; repeatable) and say which was in force: for jobs Forge "
-            "does not run, which leave no run record. Replaces the run records."
-        ),
-    )
-    s.add_argument(
-        "--on",
-        metavar="YYYY-MM-DD",
-        help="With --release-dir: the UTC day to answer for (default: now)",
-    )
-    s.add_argument(
-        "--env",
-        metavar="NAME",
-        help=(
-            "With --release-dir: answer only for the releases of this environment "
-            "(default: one answer per environment the releases name)"
-        ),
-    )
+    _add_release_flags(s)
     _add_common_flags(s)
     s.set_defaults(func=_run_runs_status)
 
