@@ -580,9 +580,10 @@ def _yaml_1_1_load(text: str):
 
 
 def _flatten_mapping_pyyaml_6_0_4(self, node):
-    """PyYAML 6.0.4's ``SafeConstructor.flatten_mapping`` (lib/yaml/constructor.py, MIT), to
-    run the loader against a PyYAML that has it, whichever one is installed. The loop is
-    PyYAML's own, line for line."""
+    """PyYAML 6.0.4's ``SafeConstructor.flatten_mapping`` (lib/yaml/constructor.py), to run
+    the loader against a PyYAML that has it, whichever one is installed. The loop is PyYAML's
+    own, line for line: Copyright (c) 2017-2021 Ingy döt Net, (c) 2006-2016 Kirill Simonov,
+    MIT license (the notice is in ``fluid_build/config_manager.py``)."""
     import yaml
     from yaml.constructor import ConstructorError
 
