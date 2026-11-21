@@ -194,7 +194,11 @@ def run_import(
             dags_root = _directory(str(dags_dir), "DAGs directory", "--dags")
             dag_scan = scan_dags(dags_root, conv, budget)
             linked, unlinked = link_tasks(
-                dag_scan.dags, scans, conv, project_root=dags_root.resolve().parent
+                dag_scan.dags,
+                scans,
+                conv,
+                project_root=dags_root.resolve().parent,
+                notes=report.notes,
             )
     else:
         dag_scan = scan_dags(root, conv, budget)
@@ -204,7 +208,9 @@ def run_import(
                 f"script_roots names the directory {safe_text(path, 100)}, which does not exist"
             )
         scans = [scan_jobs(directory, conv, budget) for directory in roots]
-        linked, unlinked = link_tasks(dag_scan.dags, scans, conv, project_root=None)
+        linked, unlinked = link_tasks(
+            dag_scan.dags, scans, conv, project_root=None, notes=report.notes
+        )
 
     _scan_report(tool, scans, dag_scan, linked, unlinked, report)
     budget_note(budget.skipped, report.notes, budget.sql_skipped)
@@ -234,7 +240,8 @@ def run_import(
             f"too much to propose from {safe_text(str(root), 80)!r}",
             f"{exc}, which is more than a proposal holds: every product is validated and written "
             "as a file.",
-            "Import a smaller directory (one domain at a time), or ignore generated code under "
+            exc.hint
+            or "Import a smaller directory (one domain at a time), or ignore generated code under "
             "`ignore.files` in the conventions.",
             path=safe_text(str(root), 120),
         ) from exc

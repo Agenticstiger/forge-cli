@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
+from ._airflow_dags import Dag, Task
 from ._conventions import Conventions, PathRule
 from ._redact import safe_args, safe_command, safe_text
 from ._scan import JobRecord, LinkedTask
@@ -61,12 +62,30 @@ MAX_PRODUCTS = 10_000
 MAX_FANOUT = 200_000
 MAX_READ_VISITS = 1_000_000
 MAX_CONSUMES_PER_PRODUCT = 500
+_SPLIT_BY_JOB = (
+    "Propose one product per job with `--split-by job` (every product of a job repeats the job's "
+    "reads and tasks), or import a smaller directory."
+)
+#: Every product of a job also lists the DAG tasks that submit the job, with their arguments: a
+#: task lists at most this many arguments (the rest are counted in the report), a proposal writes
+#: at most ``MAX_TASK_TEXT`` characters of tasks in all, and it goes through ``MAX_LINK_VISITS``
+#: task links (products times the links of their jobs).
+MAX_ARGS_PER_TASK = 100
+MAX_TASK_TEXT = 16_000_000
+MAX_LINK_VISITS = 1_000_000
+#: Tasks of one product named one by one in the report; the rest are counted.
+MAX_TASK_LINES = 20
 #: Reads of one product named one by one in the report; the rest are counted.
 MAX_READ_LINES = 20
 
 
 class ProposalTooLarge(Exception):
-    """The code writes more outputs, or makes more products, than one proposal holds."""
+    """The code writes more outputs, or makes more products, than one proposal holds. ``hint``
+    is the way out that fits (the caller has a general one)."""
+
+    def __init__(self, message: str, hint: str = "") -> None:
+        super().__init__(message)
+        self.hint = hint
 
 
 #: The id pattern of ``airflowOrchestration.dagId`` and ``airflowTask.taskId`` (lower case only).
@@ -121,13 +140,26 @@ def ident(text: str, fallback: str = "x") -> str:
     return cleaned
 
 
+class _Names(set):
+    """Names handed out, and for each base the number to try next: ten thousand products that
+    share a name do not each count up from 2."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.next: Dict[str, int] = {}
+
+
 def _unique(base: str, taken: Set[str], separator: str) -> str:
     """``base``, or ``base`` with a number after it, whichever is not in ``taken`` yet: a name
     that already ends in ``_2`` is not a reason to hand ``_2`` out twice."""
-    candidate, number = base, 2
+    candidate = base
+    counters = taken.next if isinstance(taken, _Names) else None
+    number = counters.get(base, 2) if counters is not None else 2
     while candidate in taken:
         candidate = ident(f"{base}{separator}{number}")
         number += 1
+    if counters is not None:
+        counters[base] = number
     taken.add(candidate)
     return candidate
 
@@ -327,6 +359,9 @@ class _Ctx:
     topic_schema: Optional[TopicSchema] = None
     #: ``(file, line, shown)`` of unresolved reads already reported (a job feeds several products).
     reported: set = field(default_factory=set)
+    #: The entry of each task link as a build lists it, by ``id(link)``: a job that feeds a
+    #: hundred products is rendered (and read for credentials) once, not a hundred times.
+    entries: Dict[int, Optional[Dict[str, Any]]] = field(default_factory=dict)
 
 
 def _job_labels(jobs: Sequence[JobRecord]) -> Dict[str, str]:
@@ -385,7 +420,66 @@ def _groups(outputs: List[Output], split_by: str, conv: Conventions, root_name: 
 
 
 def _first_links(job: JobRecord) -> List[LinkedTask]:
-    return sorted(job.tasks, key=lambda t: (t.dag.file, t.dag.line, t.task.line))
+    """The tasks that submit the job, in file and line order. Kept on the job: every product of
+    the job asks."""
+    kept = getattr(job, "_first_links", None)
+    if kept is None or kept[0] != len(job.tasks):
+        ordered = sorted(job.tasks, key=lambda t: (t.dag.file, t.dag.line, t.task.line))
+        kept = (len(job.tasks), ordered)
+        job._first_links = kept  # type: ignore[attr-defined]
+    return kept[1]
+
+
+class _DagIndex:
+    """What the tasks and the dependencies of one DAG answer, built once: every product of every
+    job the DAG submits asks."""
+
+    def __init__(self, dag: Dag) -> None:
+        self.task_by_key: Dict[str, Task] = {}
+        for task in dag.tasks:
+            self.task_by_key.setdefault(task.key, task)
+        #: ``task key -> the keys of the tasks upstream of it``, in the order the DAG lists them.
+        self.upstream: Dict[str, List[str]] = {}
+        for up, down in dag.edges:
+            self.upstream.setdefault(down, []).append(up)
+
+
+def _dag_index(dag: Dag) -> _DagIndex:
+    kept = getattr(dag, "_fluid_index", None)
+    shape = (len(dag.tasks), len(dag.edges))
+    if kept is None or kept[0] != shape:
+        kept = (shape, _DagIndex(dag))
+        dag._fluid_index = kept  # type: ignore[attr-defined]
+    return kept[1]
+
+
+def _link_cost(link: LinkedTask) -> int:
+    """About how many characters the entry of this task link writes on a build."""
+    submit = link.submit
+    args = sum(min(len(str(arg)), 200) + 20 for arg in submit.args[:MAX_ARGS_PER_TASK])
+    upstream = len(_dag_index(link.dag).upstream.get(link.task.key, ()))
+    return (
+        200
+        + args
+        + min(len(submit.command or ""), 2_000)
+        + min(len(submit.script or ""), 300)
+        + 24 * upstream
+    )
+
+
+def _task_text(links: Sequence[LinkedTask], costs: Dict[int, int]) -> int:
+    """Characters a build writes for the tasks of its first DAG (the ones it lists)."""
+    if not links:
+        return 0
+    first = links[0].dag
+    total = 0
+    for link in links:
+        if link.dag is first:
+            cost = costs.get(id(link))
+            if cost is None:
+                cost = costs[id(link)] = _link_cost(link)
+            total += cost
+    return total
 
 
 def _owner_block(label: str, conv: Conventions) -> Dict[str, str]:
@@ -521,23 +615,46 @@ def build_proposal(
     if fanout > MAX_FANOUT:
         raise ProposalTooLarge(
             f"the products would list {fanout:,} reads between them (the most is {MAX_FANOUT:,}): "
-            "every product of a job lists all the job's reads"
+            "every product of a job lists all the job's reads",
+            hint=_SPLIT_BY_JOB,
         )
     if visits > MAX_READ_VISITS:
         raise ProposalTooLarge(
             f"the products would go through {visits:,} reads between them (the most is "
-            f"{MAX_READ_VISITS:,}): every product of a job goes through all the job's reads"
+            f"{MAX_READ_VISITS:,}): every product of a job goes through all the job's reads",
+            hint=_SPLIT_BY_JOB,
+        )
+    link_visits = task_text = 0
+    costs: Dict[int, int] = {}
+    for group in groups:
+        for job in {str(output.writer.path): output.writer for output in group.outputs}.values():
+            links = _first_links(job)
+            link_visits += len(links)
+            task_text += _task_text(links, costs)
+    if link_visits > MAX_LINK_VISITS:
+        raise ProposalTooLarge(
+            f"the products would go through {link_visits:,} DAG task links between them (the "
+            f"most is {MAX_LINK_VISITS:,}): every product of a job goes through the tasks that "
+            "submit the job",
+            hint=_SPLIT_BY_JOB,
+        )
+    if task_text > MAX_TASK_TEXT:
+        raise ProposalTooLarge(
+            f"the products would write {task_text:,} characters of DAG tasks between them (the "
+            f"most is {MAX_TASK_TEXT:,}): every product of a job lists the tasks that submit the "
+            "job, with their arguments",
+            hint=_SPLIT_BY_JOB,
         )
 
     # who produces what, for consumes[]: an id is handed out once, whatever the names look like
     produced: Dict[Tuple[str, ...], Tuple[str, str]] = {}
     group_ids: Dict[int, str] = {}
-    taken_ids: Set[str] = set()
+    taken_ids: Set[str] = _Names()
     groups_of_job: Dict[str, Set[int]] = {}
     for index, group in enumerate(groups):
         pid = _unique(group.label, taken_ids, "-")
         group_ids[index] = pid
-        taken_eids: Set[str] = set()
+        taken_eids: Set[str] = _Names()
         for output in group.outputs:
             eid = _unique(expose_id(output.identity), taken_eids, "_")
             produced[output.identity.key] = (pid, eid)
@@ -634,7 +751,7 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
     # builds
     builds: List[Dict[str, Any]] = []
     build_ids: Dict[int, str] = {}
-    taken: Set[str] = set()
+    taken: Set[str] = _Names()
     labels = _job_labels(writer_jobs)
     for job in writer_jobs:
         build_ids[id(job)] = _unique(labels[str(job.path)], taken, "-")
@@ -644,9 +761,7 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
             task_build[(link.dag.file, link.dag.line, link.task.key)] = build_ids[id(job)]
     for job in writer_jobs:
         builds.append(
-            _build(
-                job, group, build_ids, task_build, expose_by_key, conv, report, pid, ctx.reported
-            )
+            _build(job, group, build_ids, task_build, expose_by_key, conv, report, pid, ctx)
         )
 
     # consumes
@@ -764,7 +879,7 @@ def _build(
     conv: Conventions,
     report: ImportReport,
     pid: str,
-    reported: set,
+    ctx: _Ctx,
 ) -> Dict[str, Any]:
     writes = [w for w in job.facts.writes if w.resolved]
     mine = [o for o in group.outputs if o.writer is job]
@@ -788,7 +903,7 @@ def _build(
     if platform:
         execution["runtime"] = {"platform": platform}
     if links:
-        orchestration = _orchestration(links, task_build, build_ids[id(job)], report, pid, reported)
+        orchestration = _orchestration(links, task_build, build_ids[id(job)], report, pid, ctx)
         if orchestration:
             execution["orchestration"] = orchestration
     build["execution"] = execution
@@ -803,13 +918,79 @@ def _dependencies(
 ) -> List[Dict[str, str]]:
     deps: List[str] = []
     for link in links:
-        for up, down in link.dag.edges:
-            if down != link.task.key:
-                continue
+        for up in _dag_index(link.dag).upstream.get(link.task.key, ()):
             upstream = task_build.get((link.dag.file, link.dag.line, up))
             if upstream and upstream != own and upstream not in deps:
                 deps.append(upstream)
     return [{"buildId": d, "condition": "success"} for d in deps]
+
+
+def _task_entry(link: LinkedTask, report: ImportReport, ctx: _Ctx) -> Optional[Dict[str, Any]]:
+    """The entry a build lists for one task link: ``None`` when the task cannot be recorded
+    (its id does not fit the contract's pattern; said once). Read once per link, whatever the
+    number of products the job feeds, and copied by the caller."""
+    if id(link) in ctx.entries:
+        return ctx.entries[id(link)]
+    dag, task, reported = link.dag, link.task, ctx.reported
+    entry: Optional[Dict[str, Any]] = None
+    if not task.task_id or not _AIRFLOW_ID.fullmatch(task.task_id):
+        mark = ("task-id", task.file, task.line)
+        if mark not in reported:
+            reported.add(mark)
+            report.unsupported.append(
+                f"{safe_text(task.file, 80)}:{task.line} the task id "
+                f"{safe_text(task.shown, 60)!r} in DAG {safe_text(dag.dag_id, 60)} does not "
+                "match the contract's task id pattern, so the task is not recorded"
+            )
+    else:
+        params: Dict[str, Any] = {
+            "runtime": link.submit.runtime,
+            "script": safe_text(link.submit.script or "", 300),
+        }
+        args = link.submit.args
+        if args:
+            params["args"] = safe_args(args[:MAX_ARGS_PER_TASK])
+            if len(args) > MAX_ARGS_PER_TASK:
+                report.notes.append(
+                    f"{safe_text(task.file, 80)}:{link.submit.line} task {task.task_id} passes "
+                    f"{len(args):,} arguments: the first {MAX_ARGS_PER_TASK} are listed"
+                )
+        if link.submit.command:
+            # the schema's own rule for a Bash task asks for the command
+            params["bash_command"] = safe_command(link.submit.command)
+        # ``type`` and ``operator`` at the task level: the schema's task rules (fluid_execute,
+        # bash, python) key on them, and a task that lacks either is held to the fluid_execute
+        # rule and refused for want of a contract_path. ``custom`` is the type that names
+        # nothing forge-cli runs.
+        entry = {
+            "taskId": task.task_id,
+            "type": "custom",
+            "operator": task.operator,
+            "params": params,
+        }
+        index = _dag_index(dag)
+        upstream_ids = []
+        for up in index.upstream.get(task.key, ()):
+            up_task = index.task_by_key.get(up)
+            if up_task and up_task.task_id and _AIRFLOW_ID.fullmatch(up_task.task_id):
+                upstream_ids.append(up_task.task_id)
+        if upstream_ids:
+            entry["dependencies"] = upstream_ids
+    ctx.entries[id(link)] = entry
+    return entry
+
+
+def _copy_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """A copy of a task entry that shares nothing with it (two contracts are dumped as YAML
+    separately: a shared list would come out as an anchor and an alias)."""
+    copy = dict(entry)
+    params = dict(entry["params"])
+    if "args" in params:
+        params["args"] = list(params["args"])
+    copy["params"] = params
+    if "dependencies" in copy:
+        copy["dependencies"] = list(copy["dependencies"])
+    return copy
 
 
 def _orchestration(
@@ -818,10 +999,10 @@ def _orchestration(
     build_id: str,
     report: ImportReport,
     pid: str,
-    reported: set,
+    ctx: _Ctx,
 ) -> Optional[Dict[str, Any]]:
     first = links[0]
-    dag = first.dag
+    dag, reported = first.dag, ctx.reported
     if not dag.dag_id or not _AIRFLOW_ID.fullmatch(dag.dag_id):
         mark = ("dag-id", dag.file, dag.line)
         if mark not in reported:  # one DAG feeds several jobs: say it once
@@ -851,19 +1032,13 @@ def _orchestration(
         airflow["dagConfig"] = config
     tasks: List[Dict[str, Any]] = []
     recorded: set = set()
+    more_lines = 0
     for link in links:
         if link.dag is not dag:
             continue
         task = link.task
-        if not task.task_id or not _AIRFLOW_ID.fullmatch(task.task_id):
-            mark = ("task-id", task.file, task.line)
-            if mark not in reported:
-                reported.add(mark)
-                report.unsupported.append(
-                    f"{safe_text(task.file, 80)}:{task.line} the task id "
-                    f"{safe_text(task.shown, 60)!r} in DAG {safe_text(dag.dag_id, 60)} does not "
-                    "match the contract's task id pattern, so the task is not recorded"
-                )
+        entry = _task_entry(link, report, ctx)
+        if entry is None:
             continue
         if task.task_id in recorded:
             mark = ("task-twice", task.file, task.line)
@@ -875,36 +1050,17 @@ def _orchestration(
                 )
             continue
         recorded.add(task.task_id)
-        params: Dict[str, Any] = {
-            "runtime": link.submit.runtime,
-            "script": safe_text(link.submit.script or "", 300),
-        }
-        if link.submit.args:
-            params["args"] = safe_args(link.submit.args)
-        if link.submit.command:
-            # the schema's own rule for a Bash task asks for the command
-            params["bash_command"] = safe_command(link.submit.command)
-        # ``type`` and ``operator`` at the task level: the schema's task rules (fluid_execute,
-        # bash, python) key on them, and a task that lacks either is held to the fluid_execute
-        # rule and refused for want of a contract_path. ``custom`` is the type that names
-        # nothing forge-cli runs.
-        entry: Dict[str, Any] = {
-            "taskId": task.task_id,
-            "type": "custom",
-            "operator": task.operator,
-            "params": params,
-        }
-        upstream_ids = []
-        for up, down in dag.edges:
-            if down == task.key:
-                up_task = next((t for t in dag.tasks if t.key == up), None)
-                if up_task and up_task.task_id and _AIRFLOW_ID.fullmatch(up_task.task_id):
-                    upstream_ids.append(up_task.task_id)
-        if upstream_ids:
-            entry["dependencies"] = upstream_ids
-        tasks.append(entry)
+        tasks.append(_copy_entry(entry))
+        if len(tasks) <= MAX_TASK_LINES:
+            report.mapped_one_to_one.append(
+                f"DAG {dag.dag_id} task {task.task_id} ({task.operator}) → builds[{build_id}].execution.orchestration of {pid}"
+            )
+        else:
+            more_lines += 1
+    if more_lines:
         report.mapped_one_to_one.append(
-            f"DAG {dag.dag_id} task {task.task_id} ({task.operator}) → builds[{build_id}].execution.orchestration of {pid}"
+            f"{pid}: {more_lines} more DAG task(s) → builds[{build_id}].execution.orchestration "
+            "(not listed one by one)"
         )
     if tasks:
         airflow["tasks"] = tasks

@@ -93,6 +93,8 @@ _MAX_EDGES = 10_000
 _MAX_OPERAND_NOTES = 10
 #: Characters of a command line read.
 _MAX_COMMAND = 50_000
+#: Submits kept for one task: a command that holds a hundred ``spark-submit`` lines is a script.
+_MAX_SUBMITS_PER_TASK = 20
 
 
 @dataclass(frozen=True)
@@ -489,6 +491,12 @@ class _Reader:
                 break
         if kind in SUBMIT_KINDS:
             task.submits = self._submits(kind, call)
+            if len(task.submits) > _MAX_SUBMITS_PER_TASK:
+                task.notes.append(
+                    f"it submits {len(task.submits)} scripts; the first {_MAX_SUBMITS_PER_TASK} "
+                    "are read"
+                )
+                task.submits = task.submits[:_MAX_SUBMITS_PER_TASK]
         dag_def.dag.tasks.append(task)
         self.tasks_by_node[id(call)] = (task, dag_def)
         if task.var:

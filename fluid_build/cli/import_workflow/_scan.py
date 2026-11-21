@@ -104,6 +104,8 @@ def _display(path: Path, rel: str) -> str:
 #: Reads and writes kept from one scan, in all the jobs it reads: past it the rest of the files
 #: are left unread (a project has tens of thousands, not millions).
 MAX_REFS_PER_SCAN = 200_000
+#: Tasks recorded against one job file: a script that hundreds of tasks submit is one job.
+MAX_TASKS_PER_JOB = 1_000
 
 
 def budget_note(skipped: int, notes: List[str], sql_skipped: int = 0) -> None:
@@ -276,11 +278,19 @@ def link_tasks(
     scans: Sequence[JobScan],
     conventions: Conventions,
     project_root: Optional[Path],
+    notes: Optional[List[str]] = None,
 ) -> Tuple[List[LinkedTask], List[Tuple[Dag, Task, Submit, str]]]:
     """Join every submit of every task to a job file of ``scans``. Returns ``(linked,
-    unlinked)``; an unlinked submit comes with why."""
+    unlinked)``; an unlinked submit comes with why. A job records at most
+    :data:`MAX_TASKS_PER_JOB` tasks (the rest are counted in ``notes``)."""
     jobs = [job for scan in scans for job in scan.jobs]
     by_path = {job.path: job for job in jobs}
+    by_name: Dict[str, List[JobRecord]] = {}
+    for job in jobs:
+        by_name.setdefault(job.rel.rsplit("/", 1)[-1], []).append(job)
+    #: A script text answers the same every time: the tasks of a project share a few.
+    answers: Dict[str, "Tuple[JobRecord, str] | str"] = {}
+    over: Dict[str, int] = {}
     linked: List[LinkedTask] = []
     unlinked: List[Tuple[Dag, Task, Submit, str]] = []
     for dag in dags:
@@ -289,20 +299,33 @@ def link_tasks(
                 if submit.script is None:
                     unlinked.append((dag, task, submit, submit.why or "no script"))
                     continue
-                found = _match(submit.script, jobs, by_path, conventions, project_root)
+                found = answers.get(submit.script)
+                if found is None:
+                    found = answers[submit.script] = _match(
+                        submit.script, by_name, by_path, conventions, project_root
+                    )
                 if isinstance(found, str):
                     unlinked.append((dag, task, submit, found))
                     continue
                 job, how = found
+                if len(job.tasks) >= MAX_TASKS_PER_JOB:
+                    over[job.shown] = over.get(job.shown, 0) + 1
+                    continue
                 link = LinkedTask(dag, task, submit, how)
                 job.tasks.append(link)
                 linked.append(link)
+    if notes is not None:
+        for shown, count in sorted(over.items()):
+            notes.append(
+                f"{count} more task(s) submit {clean_chars(shown)}: the first "
+                f"{MAX_TASKS_PER_JOB:,} are recorded on it"
+            )
     return linked, unlinked
 
 
 def _match(
     script: str,
-    jobs: Sequence[JobRecord],
+    by_name: Dict[str, List[JobRecord]],
     by_path: Dict[Path, JobRecord],
     conventions: Conventions,
     project_root: Optional[Path],
@@ -317,7 +340,7 @@ def _match(
     if not wanted:
         return "the script path is empty"
     scored: List[Tuple[int, JobRecord]] = []
-    for job in jobs:
+    for job in by_name.get(wanted[-1], ()):  # a match shares the last segment, at least
         have = job.rel.split("/")
         common = 0
         while common < min(len(wanted), len(have)) and wanted[-1 - common] == have[-1 - common]:

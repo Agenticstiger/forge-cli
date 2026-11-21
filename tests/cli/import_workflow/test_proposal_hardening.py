@@ -939,3 +939,164 @@ def test_a_masked_word_is_quoted_again_when_it_holds_an_operator_or_white_space(
     assert shown == "tool 'X-Api-Key: ***REDACTED***' --note ok"
     name = "PGPASS" + "WORD"
     assert safe_command(f"{name}='a b;c' run") == f"{name}=***REDACTED*** run"
+
+
+# ── what a job's tasks cost when the job feeds many products ──────────
+
+
+def _fan_project(root: Path, outputs: int, tasks: int, args=(), command: str = "") -> None:
+    """One job that writes ``outputs`` tables, submitted by ``tasks`` tasks of one DAG."""
+    writes = "".join(f"df.write.parquet('s3://b/o{i}')\n" for i in range(outputs))
+    write(root, {"jobs/job.py": "df = spark.read.parquet('s3://src/in')\n" + writes})
+    (root / "dags").mkdir(exist_ok=True)
+    listing = ", ".join(repr(a) for a in args)
+    if command:
+        body = f"    BashOperator(task_id='t', bash_command={command!r})\n"
+    else:
+        body = "".join(
+            f"    SparkSubmitOperator(task_id='t{i}', application='jobs/job.py', "
+            f"application_args=[{listing}])\n"
+            for i in range(tasks)
+        )
+    head = (
+        "from airflow import DAG\n"
+        "from airflow.operators.bash import BashOperator\n"
+        "from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator\n"
+        "with DAG('d1'):\n"
+    )
+    (root / "dags" / "d.py").write_text(head + body, encoding="utf-8")
+
+
+def _tasks_of(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return contract["builds"][0]["execution"]["orchestration"]["airflow"]["tasks"]
+
+
+def test_a_job_records_a_bounded_number_of_its_tasks_and_says_how_many_it_left(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    _fan_project(tmp_path, outputs=1, tasks=6)
+    monkeypatch.setattr(_scan, "MAX_TASKS_PER_JOB", 3)
+    (contract,), report = propose(tmp_path, dags=str(tmp_path / "dags"))
+    assert len(_tasks_of(contract)) == 3
+    assert [n for n in report.notes if "3 more task(s) submit" in n and "first 3 are recorded" in n]
+
+
+def test_a_task_that_submits_many_scripts_keeps_the_first_ones_and_says_so(tmp_path, monkeypatch):
+    from fluid_build.cli.import_workflow import _airflow_dags
+
+    monkeypatch.chdir(tmp_path)
+    command = "; ".join(f"spark-submit jobs/job.py --a {i}" for i in range(5))
+    _fan_project(tmp_path, outputs=1, tasks=1, command=command)
+    monkeypatch.setattr(_airflow_dags, "_MAX_SUBMITS_PER_TASK", 2)
+    _contracts, report = propose(tmp_path, dags=str(tmp_path / "dags"))
+    assert [n for n in report.unsupported if "it submits 5 scripts; the first 2 are read" in n]
+
+
+def test_a_task_lists_a_bounded_number_of_arguments_and_the_report_counts_the_rest(
+    tmp_path, monkeypatch
+):
+    from fluid_build.cli.import_workflow import _proposal
+
+    monkeypatch.chdir(tmp_path)
+    _fan_project(tmp_path, outputs=1, tasks=1, args=[f"--a{i}" for i in range(5)])
+    monkeypatch.setattr(_proposal, "MAX_ARGS_PER_TASK", 3)
+    (contract,), report = propose(tmp_path, dags=str(tmp_path / "dags"))
+    assert _tasks_of(contract)[0]["params"]["args"] == ["--a0", "--a1", "--a2"]
+    assert [n for n in report.notes if "passes 5 arguments: the first 3 are listed" in n]
+
+
+def test_the_tasks_of_a_job_are_read_once_however_many_products_the_job_feeds(
+    tmp_path, monkeypatch
+):
+    import yaml
+
+    from fluid_build.cli.import_workflow import _proposal
+
+    monkeypatch.chdir(tmp_path)
+    _fan_project(tmp_path, outputs=6, tasks=4, args=["--day", "2026-01-01"])
+    calls: List[int] = []
+    real = _proposal.safe_args
+    monkeypatch.setattr(_proposal, "safe_args", lambda *a, **k: calls.append(1) or real(*a, **k))
+    contracts, _report = propose(tmp_path, dags=str(tmp_path / "dags"))
+    assert len(contracts) == 6 and len(calls) == 4  # not 6 x 4
+    first, second = _tasks_of(contracts[0])[0], _tasks_of(contracts[1])[0]
+    assert first == second and first is not second
+    assert first["params"] is not second["params"]
+    assert first["params"]["args"] is not second["params"]["args"]
+    dumped = yaml.safe_dump(contracts[0])
+    assert "&id" not in dumped and "*id" not in dumped  # shared lists would be anchors
+
+
+def test_the_text_of_the_tasks_a_proposal_writes_is_bounded(tmp_path, monkeypatch):
+    from fluid_build._errors import FluidUserError
+    from fluid_build.cli.import_workflow import _proposal
+
+    monkeypatch.chdir(tmp_path)
+    _fan_project(tmp_path, outputs=4, tasks=3, args=["--day", "2026-01-01"])
+    monkeypatch.setattr(_proposal, "MAX_TASK_TEXT", 1_000)  # 4 products x 3 tasks is more
+    with pytest.raises(FluidUserError) as refused:
+        propose(tmp_path, dags=str(tmp_path / "dags"))
+    assert "characters of DAG tasks between them (the most is 1,000)" in refused.value.why
+    assert "--split-by job" in refused.value.fix
+    contracts, _report = propose(tmp_path, dags=str(tmp_path / "dags"), split_by="job")
+    assert len(contracts) == 1 and len(_tasks_of(contracts[0])) == 3
+
+
+def test_the_task_links_a_proposal_goes_through_are_counted_too(tmp_path, monkeypatch):
+    from fluid_build._errors import FluidUserError
+    from fluid_build.cli.import_workflow import _proposal
+
+    monkeypatch.chdir(tmp_path)
+    _fan_project(tmp_path, outputs=4, tasks=3)
+    monkeypatch.setattr(_proposal, "MAX_LINK_VISITS", 5)  # 4 products x 3 links
+    with pytest.raises(FluidUserError) as refused:
+        propose(tmp_path, dags=str(tmp_path / "dags"))
+    assert "go through 12 DAG task links between them (the most is 5)" in refused.value.why
+
+
+def test_the_report_names_a_few_tasks_of_a_product_and_counts_the_rest(tmp_path, monkeypatch):
+    from fluid_build.cli.import_workflow import _proposal
+
+    monkeypatch.chdir(tmp_path)
+    _fan_project(tmp_path, outputs=1, tasks=5)
+    monkeypatch.setattr(_proposal, "MAX_TASK_LINES", 2)
+    (contract,), report = propose(tmp_path, dags=str(tmp_path / "dags"))
+    assert len(_tasks_of(contract)) == 5
+    named = [x for x in report.mapped_one_to_one if x.startswith("DAG d1 task")]
+    assert len(named) == 2
+    assert [x for x in report.mapped_one_to_one if "3 more DAG task(s)" in x]
+
+
+def test_a_script_name_is_looked_up_once_however_many_tasks_submit_it(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _fan_project(tmp_path, outputs=1, tasks=30)
+    calls: List[str] = []
+    real = _scan._match
+    monkeypatch.setattr(
+        _scan, "_match", lambda script, *a, **k: calls.append(script) or real(script, *a, **k)
+    )
+    (contract,), _report = propose(tmp_path, dags=str(tmp_path / "dags"))
+    assert len(_tasks_of(contract)) == 30 and calls == ["jobs/job.py"]
+
+
+def test_ten_thousand_products_that_share_a_name_are_numbered_in_linear_time():
+    import time
+
+    from fluid_build.cli.import_workflow._proposal import _Names, _unique
+
+    taken = _Names()
+    taken.add("a-2")  # a name the numbering would reach is skipped
+    started = time.monotonic()
+    names = [_unique("a", taken, "-") for _ in range(10_000)]
+    assert time.monotonic() - started < 2.0
+    assert len(set(names)) == 10_000 and names[0] == "a" and names[1] == "a-3"
+
+
+def test_one_long_argument_is_not_read_to_its_end():
+    import time
+
+    started = time.monotonic()
+    shown = safe_args(["a b " * 50_000, "--x"])
+    assert time.monotonic() - started < 1.0
+    assert len(shown[0]) <= 200 and shown[1] == "--x"

@@ -78,6 +78,8 @@ _S3_USERINFO = re.compile(
 )
 _S3_SECRET = re.compile(r"(s3[an]?://[^/:@\s?#'\"]{0,512}:)[^@\s?#'\"]{1,512}@", re.I)
 _MAX_COMMAND_TEXT = 20_000
+#: Characters of one argument read for credentials (an argument is shown at 200).
+_MAX_ARG = 2_000
 #: How many levels of quoting inside quoting (``bash -c "bash -c ..."``) are looked into.
 _MAX_DEPTH = 5
 
@@ -530,7 +532,7 @@ def safe_args(args: Sequence[str], limit: int = 200) -> List[str]:
     ``--conf spark.hadoop.fs.s3a.secret.key=abc``), the value of ``NAME=value`` when the name is,
     and a secret in a JSON value or a connection string."""
     words = _Words()
-    return [safe_text(words.show(str(arg)), limit) for arg in args]
+    return [safe_text(words.show(str(arg)[:_MAX_ARG]), limit) for arg in args]
 
 
 def safe_command(command: str, limit: int = 2000) -> str:
