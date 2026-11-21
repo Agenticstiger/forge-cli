@@ -9,7 +9,13 @@ line or an argument list is masked word by word while what is not a secret stays
 (:func:`scrub_path`, :func:`scrub_host`). The masking is the repository's own
 (:mod:`fluid_build.observability.secret_redactor`) plus the shapes a command line has that a
 free-text scan does not see: ``NAME=value``, a credential flag and its value, ``-u user:pass``,
-``mysql -pSECRET``, a header in a quoted word, a command inside ``bash -c``.
+``mysql -pSECRET``, a header or a JSON value in a quoted word, ``key=value`` pairs in a
+connection string or a query string, a command inside ``bash -c``.
+
+What is not a secret stays: a name that ends in ``file``, ``path``, ``id``, ``url`` and the like
+holds a reference, a ``true``, a small number or a path is no secret, a command keeps its lines,
+its operators and its quoting, and ``mkdir -p``, ``docker run -u 1000:1000`` and ``git log
+--author`` come out as they went in.
 """
 
 from __future__ import annotations
@@ -20,21 +26,27 @@ from typing import Any, List, Optional, Sequence, Union
 
 from ._pysource import clean_chars
 
+_REDACTED = "***REDACTED***"
+
+
+def _free_text(text: str) -> str:
+    """The repository's own free-text redaction of ``text``."""
+    from fluid_build.observability.secret_redactor import redact_secret_text
+
+    return redact_secret_text(text)
+
 
 def safe_text(text: Any, limit: int = 200) -> str:
     """Text from the scanned code made safe to print and to write into a contract: control,
     line-separator and bidirectional characters are gone (an escape sequence, a new line), a
     credential-shaped value is masked, and it is cut at ``limit``."""
-    from fluid_build.observability.secret_redactor import redact_secret_text
-
-    cleaned = redact_secret_text(" ".join(clean_chars(text).split()))
+    cleaned = _free_text(" ".join(clean_chars(text).split()))
     return cleaned if len(cleaned) <= limit else cleaned[: limit - 3] + "..."
 
 
-_REDACTED = "***REDACTED***"
 #: A shell word: unquoted characters that are not an operator, escapes and quoted parts, as
-#: written. An operator (``;``, ``&``, ``|``, ``(``, ``)``, ``<``, ``>``) ends a word and stays as
-#: written, so masking a value never removes the operator beside it.
+#: written. An operator (``;``, ``&``, ``|``, ``(``, ``)``, ``<``, ``>``, a backtick) ends a word
+#: and stays as written, so masking a value never removes the operator beside it.
 _SHELL_WORD = re.compile(r"""(?:[^\s'"\\;&|()<>`]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+""")
 #: Where one command ends and the next begins.
 _COMMAND_BOUNDARY = re.compile(r"[;&|()\n]")
@@ -42,11 +54,30 @@ _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*=")
 #: A Jinja field stays one word (it holds white space), and is a reference, not a value.
 _JINJA = re.compile(r"\{\{.{0,1000}?\}\}|\{%.{0,1000}?%\}|\{#.{0,1000}?#\}", re.DOTALL)
 _JINJA_TOKEN = re.compile(r"__fluidjinja(\d+)x(\d+)__")
+#: ``Name: value`` in one quoted word is a header (``-H "X-Api-Key: ..."``).
+_HEADER = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*):\s*(\S.*)$", re.DOTALL)
+#: ``key=value`` pairs in one word, separated by ``;``, ``&``, ``,`` or ``?`` (a connection string,
+#: a query string).
+_PAIR = re.compile(r"(^|[;&,?])([A-Za-z_][A-Za-z0-9_.\-]{0,64})=([^;&,\s]*)")
+#: ``"key": "value"`` in JSON, as ``json.dumps`` writes it (a space after the colon) or compact.
+_JSON_PAIR = re.compile(
+    r"""(["'])([A-Za-z_][A-Za-z0-9_.\-]{0,64})\1(\s*:\s*)(["'])([^"']{0,512})\4"""
+)
+#: What makes a masked word need quotes again: white space, an operator, a quote, a backslash.
+_NEEDS_QUOTES = re.compile(r"""[\s;&|()<>`$\\'"]""")
+_USERINFO = re.compile(
+    r"^((?:[A-Za-z][A-Za-z0-9+.\-]{0,40}:)*[A-Za-z][A-Za-z0-9+.\-]{0,40}://)([^/?#]{0,512})@"
+)
+_MAX_COMMAND_TEXT = 20_000
+#: How many levels of quoting inside quoting (``bash -c "bash -c ..."``) are looked into.
+_MAX_DEPTH = 5
+
 #: Words that make a name a credential's: the redactor's own list covers ``password``, ``secret``,
 #: ``token`` and the like inside a name; these are the spellings it does not (``--passwd``,
 #: ``--pw``, ``--dbpass``), as whole words, and the compound ones, anywhere in the name.
 _SECRET_WORDS = frozenset(
-    {"pass", "passwd", "pswd", "pwd", "pw", "dbpass", "dbpwd", "cred", "creds", "sas", "signature"}
+    {"pass", "passwd", "pswd", "pwd", "pw", "dbpass", "dbpwd", "cred", "creds", "sas", "sig"}
+    | {"signature"}
 )
 _SECRET_SUBSTRINGS = ("passwd", "passphrase", "accesskey", "secretkey", "apikey", "privatekey")
 #: ``key`` alone is a column in a data job (``--partition-key``, ``--primary-key``); it is a
@@ -54,31 +85,69 @@ _SECRET_SUBSTRINGS = ("passwd", "passphrase", "accesskey", "secretkey", "apikey"
 _KEY_QUALIFIERS = frozenset(
     {
         "access", "secret", "private", "api", "auth", "ssh", "account", "storage", "signing",
-        "encryption", "master", "license", "aws", "client", "service",
+        "encryption", "master", "license", "aws", "client", "service", "sse",
     }
 )  # fmt: skip
 _NAME_PARTS = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
-#: A name that ends in one of these holds a reference to a secret, not the secret
-#: (``--password-file``, ``--token-url``, ``--secret-name``): its value is left to the free-text
-#: scan, which still finds a password inside a URL.
+#: Words that contain a credential's name and are not one (``--author``, ``--tokenizer``,
+#: ``spark.authenticate``): they are left out before a name is judged.
+_NOT_CREDENTIAL_WORDS = frozenset(
+    {
+        "author", "authors", "authored", "authority", "authorities", "authorized", "authorised",
+        "authenticate", "authenticated", "authentication", "tokenizer", "tokenizers", "tokenize",
+        "tokenized", "secretary", "secretaries",
+    }
+)  # fmt: skip
+#: A name that ends in one of these holds a reference to a secret, or a setting about it, not the
+#: secret (``--password-file``, ``--token-url``, ``--secret-name``, ``--auth-type``): its value is
+#: left to the free-text scan, which still finds a password inside a URL.
 _REFERENCE_SUFFIXES = frozenset(
     {
         "file", "path", "dir", "directory", "id", "name", "provider", "class", "type", "env",
-        "var", "ref", "url", "uri", "endpoint", "host", "port", "location", "store",
+        "var", "ref", "url", "uri", "endpoint", "host", "port", "location", "store", "arn",
+        "version", "stdin", "count", "limit", "size", "length", "ttl", "timeout", "expiry",
+        "expiration", "interval", "enabled", "mode", "algorithm", "format", "strategy", "scheme",
+        "method", "kind",
     }
 )  # fmt: skip
+#: A name that starts with one of these is a switch (``--skip-auth``, ``--no-password``): it takes
+#: no value, and the word after it is not one.
+_SWITCH_PREFIXES = frozenset(
+    {
+        "skip", "no", "disable", "disabled", "enable", "enabled", "use", "uses", "is", "has",
+        "with", "without", "allow", "require", "verify", "ignore", "show", "print", "dry", "check",
+    }
+)  # fmt: skip
+#: Values that are no secret: a flag's state, a small number (a count, a port), a path.
+_PLAIN_WORDS = frozenset({"true", "false", "yes", "no", "on", "off", "none", "null", "nil"})
+
 _PASSWORD_SHORT_FLAGS = frozenset({"-p", "-P", "-w"})
 #: ``-u user:password`` (and ``--user``): the part after the colon is the password.
 _USER_FLAGS = frozenset({"-u", "--user", "--proxy-user"})
-#: Commands whose ``-p``, ``-P`` or ``-w`` is a mode, a port or a directory, never a password.
+#: Commands whose ``-u`` is a user, a group or a JDBC url, not ``user:password``.
+_USER_FLAG_NOT_CREDENTIALS = frozenset(
+    {
+        "docker", "podman", "nerdctl", "crictl", "kubectl", "beeline", "hive", "su", "sudo", "ssh",
+        "scp", "git", "ansible", "ansible-playbook",
+    }
+)  # fmt: skip
+#: Commands whose ``-p``, ``-P`` or ``-w`` is a mode, a port, a width or a directory, never a
+#: password.
 _SHORT_FLAG_IS_NOT_A_PASSWORD = frozenset(
     {
         "mkdir", "cp", "mv", "ls", "tar", "ssh", "scp", "sftp", "rsync", "sort", "install", "rm",
         "ln", "ps", "nc", "ncat", "docker", "podman", "kubectl", "git", "pip", "hdfs", "hadoop",
         "xargs", "find", "grep", "egrep", "fgrep", "sed", "awk", "chmod", "chown", "du", "env",
-        "java", "wget", "curl",
+        "java", "wget", "curl", "wc", "diff", "cut", "tr", "date", "less", "head", "tail",
+        "watch", "top", "df", "free", "kill", "pgrep", "pkill",
     }
 )  # fmt: skip
+#: Flags that carry a password in one command and mean something else in most.
+_SHORT_PASSWORD_BY_COMMAND = {
+    "redis-cli": frozenset({"-a"}),
+    "openssl": frozenset({"-k", "-pass", "-passin", "-passout"}),
+    "sshpass": frozenset({"-p"}),
+}
 #: Commands whose ``-p<value>``, with no space, is the password.
 _GLUED_PASSWORD_COMMANDS = frozenset(
     {
@@ -91,12 +160,8 @@ _COMMAND_PREFIX = frozenset(
     {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time", "exec", "sudo", "env"}
     | {"nohup", "nice"}
 )
-_MAX_COMMAND_TEXT = 20_000
-_USERINFO = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]{0,40}://)[^/?#]{0,512}@")
-#: How many levels of quoting inside quoting (``bash -c "bash -c ..."``) are looked into.
-_MAX_DEPTH = 5
-#: ``Name: value`` in one quoted word is a header (``-H "X-Api-Key: ..."``).
-_HEADER = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*):\s*(\S.*)$", re.DOTALL)
+#: Schemes whose ``container@account`` is a place, not a ``user:password`` (Azure storage).
+_CONTAINER_SCHEMES = frozenset({"abfs", "abfss", "wasb", "wasbs", "adl"})
 
 
 def sensitive_name(name: str) -> bool:
@@ -107,17 +172,42 @@ def sensitive_name(name: str) -> bool:
     if not name:
         return False
     listed = [part.lower() for part in _NAME_PARTS.split(name) if part]
-    if listed and listed[-1] in _REFERENCE_SUFFIXES:
+    if not listed or listed[-1] in _REFERENCE_SUFFIXES or listed[0] in _SWITCH_PREFIXES:
         return False  # ``--password-file``: a path to a secret is not the secret
-    if is_sensitive_key_name(name.replace("-", "_")):
+    kept = [part for part in listed if part not in _NOT_CREDENTIAL_WORDS]
+    if not kept:
+        return False
+    if is_sensitive_key_name("_".join(kept)):
         return True
-    joined = re.sub(r"[^a-z0-9]", "", name.lower())
-    if any(part in joined for part in _SECRET_SUBSTRINGS):
+    if any(part in "".join(kept) for part in _SECRET_SUBSTRINGS):
         return True
-    words = set(listed)
+    words = set(kept)
     if words & _SECRET_WORDS:
         return True
     return bool(words & {"key", "keys"}) and bool(words & _KEY_QUALIFIERS)
+
+
+def _plain_value(value: str) -> bool:
+    """A value that is no secret: a flag's state, a number of up to four digits, a path."""
+    text = value.strip().strip("'\"")
+    return (
+        text.lower() in _PLAIN_WORDS
+        or (text.isdigit() and len(text) <= 4)
+        or text.startswith(("/", "./", "../", "~"))
+    )
+
+
+def _path_or_port(value: str) -> bool:
+    return value.isdigit() or value.startswith(("/", "./", "../", "~"))
+
+
+def _is_user_credential(value: str, command: Optional[str]) -> bool:
+    """Whether ``value`` after ``-u`` is ``user:password``: not a numeric ``uid:gid``, not a URL
+    (``beeline -u jdbc:hive2://...``), and not the ``-u`` of a command that has no passwords."""
+    if command in _USER_FLAG_NOT_CREDENTIALS:
+        return False
+    user, colon, secret = value.partition(":")
+    return bool(colon and secret) and not user.isdigit() and "//" not in value and "/" not in user
 
 
 def _mask_user(text: str) -> str:
@@ -126,8 +216,32 @@ def _mask_user(text: str) -> str:
     return f"{user}:{_REDACTED}" if colon else text
 
 
-def _path_or_port(value: str) -> bool:
-    return value.isdigit() or value.startswith(("/", "./", "../", "~"))
+def _mask_pairs(text: str) -> str:
+    """The value of each ``key=value`` pair, and of each JSON ``"key": "value"`` pair, of ``text``
+    whose key is a credential's, masked."""
+    if ":" in text and ('"' in text or "'" in text):
+
+        def mask_json(match: "re.Match[str]") -> str:
+            if sensitive_name(match.group(2)) and not _plain_value(match.group(5)):
+                quote, key, colon, inner = (
+                    match.group(1),
+                    match.group(2),
+                    match.group(3),
+                    match.group(4),
+                )
+                return f"{quote}{key}{quote}{colon}{inner}{_REDACTED}{inner}"
+            return match.group(0)
+
+        text = _JSON_PAIR.sub(mask_json, text)
+    if "=" not in text:
+        return text
+
+    def mask(match: "re.Match[str]") -> str:
+        if sensitive_name(match.group(2)) and not _plain_value(match.group(3)):
+            return f"{match.group(1)}{match.group(2)}={_REDACTED}"
+        return match.group(0)
+
+    return _PAIR.sub(mask, text)
 
 
 class _Words:
@@ -155,8 +269,6 @@ class _Words:
             self.command, self._at_start = value.rsplit("/", 1)[-1], False
 
     def show(self, value: str) -> str:
-        from fluid_build.observability.secret_redactor import redact_secret_text
-
         self._start_of(value)
         if _JINJA_TOKEN.fullmatch(value):
             # a template reference, not a value: nothing to mask, and a flag before it is spent
@@ -167,32 +279,47 @@ class _Words:
             if short:
                 if not value.startswith("-") and not _path_or_port(value):
                     return _REDACTED
-            elif not value.startswith("--"):
+            elif not value.startswith("--") and not _plain_value(value):
                 return _REDACTED
         if self._setting_next is not None:
             flag, self._setting_next = self._setting_next, None
             return self._setting(value, flag)
         if self._user_next:
             self._user_next = False
-            if ":" in value:
+            if _is_user_credential(value, self.command):
                 return _mask_user(value)
-        flag, equals, rest = value.partition("=")
-        if value.startswith("-") and len(value) > 1 and not any(c.isspace() for c in flag):
-            return self._flag(value, flag, equals, rest)
-        if _ASSIGNMENT.match(value):
-            name = value.partition("=")[0]
-            if sensitive_name(name):
-                return f"{name}={_REDACTED}"
+        name, equals, rest = value.partition("=")
+        if value.startswith("-") and len(value) > 1 and not any(c.isspace() for c in name):
+            return self._flag(value, name, equals, rest)
+        if _ASSIGNMENT.match(value) and sensitive_name(name):
+            return value if _plain_value(rest) else self._secret_value(name + "=", rest)
         header = _HEADER.match(value)
         if header and sensitive_name(header.group(1)):
             return f"{header.group(1)}: {_REDACTED}"  # ``-H "X-Api-Key: ..."``
-        if self.depth < _MAX_DEPTH and any(c.isspace() for c in value):
-            return _redact_command(value, self.depth + 1)  # ``--extra "--password x"``
-        return redact_secret_text(value)
+        if any(c.isspace() for c in value):
+            return self._multi_word(value)
+        return _mask_pairs(_free_text(value))
+
+    def _secret_value(self, head: str, rest: str) -> str:
+        """``head`` and the masked value ``rest``. A value that is a quoted word with a flag list
+        after the first word (``-Dpassword=x -Dfoo=bar``) keeps the flags."""
+        found = re.match(r"\S*\s+(.*)", rest, re.DOTALL)
+        tail = found.group(1) if found else ""
+        if tail.lstrip().startswith("-") and self.depth < _MAX_DEPTH:
+            return f"{head}{_REDACTED} {_redact_command(tail.lstrip(), self.depth + 1)}"
+        return f"{head}{_REDACTED}"
+
+    def _multi_word(self, value: str) -> str:
+        """A word that holds white space: JSON, a header, SQL, or a command line in quotes. The
+        free-text scan reads the whole of it (it knows ``"password": "x"`` and ``Bearer x``); one
+        that starts like a command line (a flag, ``NAME=value``) is then read word by word."""
+        masked = _mask_pairs(_free_text(value))
+        stripped = masked.lstrip()
+        if self.depth < _MAX_DEPTH and (stripped.startswith("-") or _ASSIGNMENT.match(stripped)):
+            return _redact_command(masked, self.depth + 1)
+        return masked
 
     def _flag(self, value: str, flag: str, equals: str, rest: str) -> str:
-        from fluid_build.observability.secret_redactor import redact_secret_text
-
         if flag in {"--conf", "-c"}:
             if equals:
                 return f"{flag}={self._setting(rest, flag)}"
@@ -200,10 +327,14 @@ class _Words:
             return value
         if flag in _USER_FLAGS:
             if equals:
-                return f"{flag}={_mask_user(rest)}"
+                return f"{flag}={_mask_user(rest) if _is_user_credential(rest, self.command) else rest}"
             self._user_next = True
             return value
-        if value.startswith("-u") and not value.startswith("--") and ":" in value[2:]:
+        if (
+            value.startswith("-u")
+            and not value.startswith("--")
+            and _is_user_credential(value[2:], self.command)
+        ):
             return "-u" + _mask_user(value[2:])  # ``curl -uadmin:pw``
         if (
             self.command in _GLUED_PASSWORD_COMMANDS
@@ -215,29 +346,36 @@ class _Words:
             return "-p" + _REDACTED  # ``mysql -phunter2``
         short = flag in _PASSWORD_SHORT_FLAGS
         if short and self.command in _SHORT_FLAG_IS_NOT_A_PASSWORD:
-            return redact_secret_text(value)
-        if short or sensitive_name(flag):
+            return _mask_pairs(_free_text(value))
+        by_command = flag in _SHORT_PASSWORD_BY_COMMAND.get(self.command or "", ())
+        judged = flag[2:] if re.match(r"-D[A-Za-z_]", flag) else flag  # ``-Dpwd=x`` (a JVM option)
+        if short or by_command or sensitive_name(judged):
             if equals:
-                return f"{flag}={_REDACTED}"
+                return value if _plain_value(rest) else self._secret_value(flag + "=", rest)
             self._mask_next = "short" if short else True
             return value
-        return redact_secret_text(value)
+        return _mask_pairs(_free_text(value))
 
     def _setting(self, value: str, flag: str) -> str:
         """The value after ``--conf`` or ``-c``: ``key=value``, or, after ``-c`` when what comes
         before the ``=`` is not a dotted configuration key (``bash -c "PGPASSWORD=x run"``), a
-        command line."""
-        from fluid_build.observability.secret_redactor import redact_secret_text
-
-        key, equals, _rest = value.partition("=")
+        command line. A value that holds options (``-Dpassword=x -Dy=z``) is read as a command
+        line too."""
+        key, equals, rest = value.partition("=")
         is_setting = (
             equals and not any(c.isspace() for c in key) and (flag == "--conf" or "." in key)
         )
         if is_setting:
-            return f"{key}={_REDACTED}" if sensitive_name(key) else redact_secret_text(value)
+            if sensitive_name(key):
+                return value if _plain_value(rest) else f"{key}={_REDACTED}"
+            if self.depth < _MAX_DEPTH and (rest.lstrip().startswith("-") or " " in rest.strip()):
+                return f"{key}={_redact_command(rest, self.depth + 1)}"
+            return _mask_pairs(_free_text(value))
         if self.depth < _MAX_DEPTH and any(c.isspace() for c in value):
+            if value.lstrip().startswith(("{", "[")):
+                return self._multi_word(value)  # JSON is data, not a command line
             return _redact_command(value, self.depth + 1)
-        return redact_secret_text(value)
+        return _mask_pairs(_free_text(value))
 
 
 def _unquote(raw: str) -> str:
@@ -250,25 +388,9 @@ def _unquote(raw: str) -> str:
     return parts[0] if len(parts) == 1 else raw
 
 
-def _gap(text: str, *, edge: bool) -> str:
-    """The text between two words: a line continuation is a space, a new line between two
-    commands that no operator separates is ``;`` (at the start or end of the command it is
-    nothing), and an operator is kept as written."""
-    if "\n" not in text:
-        return text
-    if edge:
-        return " "
-    joined = text.replace("\\\r\n", " ").replace("\\\n", " ")
-    if "\n" not in joined:
-        return joined
-    if any(char in joined for char in ";&|("):
-        return joined.replace("\r", "").replace("\n", " ")
-    return "; "
-
-
 def _redact_command(command: str, depth: int = 0) -> str:
     """``command`` with the values of credentials masked, word by word, keeping what is not
-    one exactly as written (quoting, operators, ``$VAR``, ``{{ ds }}``)."""
+    one exactly as written (lines, quoting, operators, ``$VAR``, ``{{ ds }}``)."""
     fields: List[str] = []
 
     def hide(match: "re.Match[str]") -> str:
@@ -291,7 +413,7 @@ def _redact_command(command: str, depth: int = 0) -> str:
         gap = text[position : match.start()]
         if not first and _COMMAND_BOUNDARY.search(gap):
             words.boundary()
-        out.append(_gap(gap, edge=first))
+        out.append(gap)
         first = False
         raw = match.group(0)
         value = _unquote(raw)
@@ -299,9 +421,10 @@ def _redact_command(command: str, depth: int = 0) -> str:
         if shown == value:
             out.append(raw)
         else:
-            out.append(shlex.quote(shown) if any(c.isspace() for c in shown) else shown)
+            quote = _NEEDS_QUOTES.search(shown.replace(_REDACTED, ""))
+            out.append(shlex.quote(shown) if quote else shown)
         position = match.end()
-    out.append(_gap(text[position:], edge=True))
+    out.append(text[position:])
     result = "".join(out)
     return _JINJA_TOKEN.sub(back, result) if fields else result
 
@@ -309,48 +432,44 @@ def _redact_command(command: str, depth: int = 0) -> str:
 def safe_args(args: Sequence[str], limit: int = 200) -> List[str]:
     """Arguments of a submitted job, safe to write: a credential-shaped value is masked, and so is
     the value after a flag whose name is one (``--password hunter2``, ``-p hunter2``, ``--token=abc``,
-    ``--conf spark.hadoop.fs.s3a.secret.key=abc``) and the value of ``NAME=value`` when the name is.
-    """
+    ``--conf spark.hadoop.fs.s3a.secret.key=abc``), the value of ``NAME=value`` when the name is,
+    and a secret in a JSON value or a connection string."""
     words = _Words()
     return [safe_text(words.show(str(arg)), limit) for arg in args]
 
 
-def _parses(text: str) -> bool:
-    try:
-        shlex.split(text)
-    except ValueError:
-        return False
-    return True
-
-
-def safe_command(command: str, limit: int = 500) -> str:
-    """A command line, safe to write: each word is looked at as :func:`safe_args` does, and the
-    words that are nothing to hide stay as written, operators and quoting included. New lines
-    between commands become ``;``. The text is then scanned as a whole, which finds what spans
-    words (``Bearer <token>``), unless that would unbalance its quotes."""
-    from fluid_build.observability.secret_redactor import redact_secret_text
-
-    masked = " ".join(clean_chars(_redact_command(command[:_MAX_COMMAND_TEXT])).split())
-    whole = redact_secret_text(masked)
-    same_quotes = whole.count("'") == masked.count("'") and whole.count('"') == masked.count('"')
-    text = whole if same_quotes and (_parses(whole) or not _parses(masked)) else masked
+def safe_command(command: str, limit: int = 2000) -> str:
+    """A command line, safe to write: each word is looked at as :func:`safe_args` does (a word
+    that holds white space, a header or a JSON value in quotes, is read whole), and the words
+    that are nothing to hide stay as written, lines, operators and quoting included."""
+    text = clean_chars(_redact_command(command[:_MAX_COMMAND_TEXT]), keep="\n\t").strip()
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 def scrub_path(path: str) -> str:
-    """A data path with no credential in it: the userinfo of a URL-style path (what stands
-    between ``://`` and the ``@`` before the bucket or host) is dropped, and a ``key=value`` segment whose key is a credential's (``token=...``) keeps its
-    key and loses its value. A path is an identity: this runs where it is read from the code, so
-    nothing made from it (an id, a file name, a binding) can carry the credential."""
-    path = _USERINFO.sub(r"\1", path)
-    if "=" not in path:
-        return path
-    segments = path.split("/")
-    for index, segment in enumerate(segments):
-        key, equals, _value = segment.partition("=")
-        if equals and sensitive_name(key):
-            segments[index] = f"{key}=REDACTED"
-    return "/".join(segments)
+    """A data path with no credential in it. The userinfo of a URL-style path (what stands between
+    ``://`` and the ``@`` before the bucket or host) is dropped, except where it is a place
+    (``abfss://container@account...``, Azure storage, where only ``container:password@`` is a
+    credential). A ``key=value`` segment of the path, and a pair of its query string, whose key is
+    a credential's (``token=...``, ``sig=...``) keeps its key and loses its value. A path is an
+    identity: this runs where it is read from the code, so nothing made from it (an id, a file
+    name, a binding) can carry the credential."""
+    found = _USERINFO.match(path)
+    if found:
+        scheme = found.group(1)[:-3].rsplit(":", 1)[-1].lower()
+        if scheme not in _CONTAINER_SCHEMES or ":" in found.group(2):
+            path = found.group(1) + path[found.end() :]
+    path, question, query = path.partition("?")
+    if query:
+        query = "&".join(_scrub_pair(pair) for pair in query.split("&"))
+    if "=" in path:
+        path = "/".join(_scrub_pair(segment, "REDACTED") for segment in path.split("/"))
+    return path + question + query
+
+
+def _scrub_pair(pair: str, mask: str = "REDACTED") -> str:
+    key, equals, _value = pair.partition("=")
+    return f"{key}={mask}" if equals and sensitive_name(key) else pair
 
 
 def scrub_host(host: str) -> str:

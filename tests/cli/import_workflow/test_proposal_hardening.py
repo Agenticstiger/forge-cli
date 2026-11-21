@@ -141,12 +141,11 @@ def test_a_command_text_after_dash_c_is_read_as_a_command_not_as_a_setting():
     assert safe_command(kept) == kept
 
 
-def test_a_command_flattens_new_lines_without_joining_commands():
-    assert safe_command("cd /x\nspark-submit job.py") == "cd /x; spark-submit job.py"
-    assert (
-        safe_command("spark-submit \\\n  --master yarn \\\n  job.py")
-        == "spark-submit --master yarn job.py"
-    )
+def test_a_command_keeps_its_lines_and_its_continuations():
+    assert safe_command("cd /x\nspark-submit job.py") == "cd /x\nspark-submit job.py"
+    continued = "spark-submit \\\n  --master yarn \\\n  job.py"
+    assert safe_command(continued) == continued
+    assert safe_command("\nspark-submit x.py\n") == "spark-submit x.py"  # trimmed at the ends
 
 
 def test_arguments_are_masked_the_same_way():
@@ -499,10 +498,10 @@ def test_credential_flags_still_mask_their_value(command):
         ("(PGPASSWORD=hunter2hunter2 psql)", "(PGPASSWORD=***REDACTED*** psql)"),
         ("echo $(PGPASSWORD=hunter2hunter2 psql)", "echo $(PGPASSWORD=***REDACTED*** psql)"),
         ("echo `PGPASSWORD=hunter2hunter2 psql`", "echo `PGPASSWORD=***REDACTED*** psql`"),
-        ("a &&\n b", "a && b"),
-        ("a\nb", "a; b"),
-        ("cd /x \\\n  && ls", "cd /x && ls"),
-        ("spark-submit a.py \\\r\n  --x 1", "spark-submit a.py --x 1"),
+        ("a &&\n b", "a &&\n b"),
+        ("a\nb", "a\nb"),
+        ("cd /x \\\n  && ls", "cd /x \\\n  && ls"),
+        ("spark-submit a.py \\\r\n  --x 1", "spark-submit a.py \\\n  --x 1"),  # CRLF becomes LF
     ],
 )
 def test_masking_a_value_keeps_the_operators_and_the_lines_around_it(command, expected):
@@ -703,3 +702,96 @@ def test_a_partition_directory_is_not_a_credential_unless_its_key_is_one():
     kept = "s3://bucket/dt=2026-01-01/region=eu/key=abc/part-0.parquet"
     assert scrub_path(kept) == kept
     assert scrub_path("s3://bucket/password=abc/x") == "s3://bucket/password=REDACTED/x"
+    words = "s3://bucket/author=bob/auth_type=basic/token_type=bearer/x.parquet"
+    assert scrub_path(words) == words  # names that hold a credential's name and are not one
+
+
+def test_an_azure_container_is_a_place_and_a_container_with_a_password_is_not():
+    from fluid_build.cli.import_workflow._redact import scrub_path
+
+    for kept in (
+        "abfss://container@account.dfs.core.windows.net/path/x",
+        "wasbs://c@a.blob.core.windows.net/x",
+    ):
+        assert scrub_path(kept) == kept
+    word = "hunter2" + "word"
+    assert scrub_path(f"abfss://container:{word}@account.dfs.core.windows.net/x") == (
+        "abfss://account.dfs.core.windows.net/x"
+    )
+
+
+def test_a_credential_in_a_query_string_or_a_jdbc_url_does_not_stay_in_a_path():
+    from fluid_build.cli.import_workflow._redact import scrub_path
+
+    assert scrub_path("https://h/x?token=abc&limit=5") == "https://h/x?token=REDACTED&limit=5"
+    assert scrub_path("https://h/x?sig=abc&x=1") == "https://h/x?sig=REDACTED&x=1"
+    word = "hunter2" + "word"
+    assert scrub_path(f"jdbc:postgresql://app:{word}@db:5432/x") == "jdbc:postgresql://db:5432/x"
+
+
+# ── the spellings that went through, and the words that must not be touched ──
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "tool -Dpwd=hunter2hunter2",
+        "spark-submit --conf spark.executor.extraJavaOptions=-Dpassword=hunter2hunter2 job.py",
+        "redis-cli -a hunter2hunter2 ping",
+        "openssl enc -aes-256-cbc -k hunter2hunter2 -in a -out b",
+        "aws s3 cp a s3://b/c --sse-c-key hunter2hunter2",
+        "tool --sas hunter2hunter2",
+        "psql 'host=h user=app password=hunter2hunter2 dbname=d'",
+        "tool 'Server=h;Database=d;Uid=app;Pwd=hunter2hunter2;'",
+        "tool 'https://h/x?a=1&pwd=hunter2hunter2'",
+        "tool 'https://h/x?token=hunter2hunter2'",
+        "tool 'https://h/x?sig=hunter2hunter2&x=1'",
+        'tool --conf \'{"db": {"pass": "hunter2hunter2"}}\'',
+        'tool \'{"user": "bob", "' + "pw" + 'd": "hunter2hunter2"}\'',
+        'tool --json \'{"db":{"pass":"hunter2hunter2"}}\'',
+        "echo ok; (PGPASSWORD=hunter2hunter2 psql)",
+        "if true; then PGPASSWORD=hunter2hunter2 psql; fi",
+        "sudo -u app PGPASSWORD=hunter2hunter2 psql",
+        'tool "password=a b;c"',
+    ],
+)
+def test_more_credential_spellings_are_masked_and_nothing_of_the_value_is_left(command):
+    shown = safe_command(command)
+    assert "hunter2" not in shown and "***REDACTED***" in shown
+    assert "b;c" not in shown
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "docker run -u 1000:1000 --rm img",
+        "git log --author bob --since 2026-01-01",
+        "tool --max-tokens 10 --skip-auth --author bob",
+        "wc -w notes.txt && diff -w a b",
+        "spark-submit --conf spark.authenticate=true job.py",
+        "tool --partition-key dt --primary-key id --sort-key ts",
+        "GOOGLE_APPLICATION_CREDENTIALS=/etc/gcp/key.json spark-submit job.py",
+        "hdfs dfs -ls abfss://container@acct.dfs.core.windows.net/data",
+        "tool s3://b/author=bob/auth_type=basic/token_type=bearer/x.parquet",
+        "echo ok; (mkdir -p tmp)",
+        "beeline -u jdbc:hive2://h:10000/default -n app",
+        "curl -w '%{http_code}' https://h/x",
+        "sudo -u app run.sh",
+        "# the password comes from the vault\nspark-submit x.py --day 1",
+        "for d in a b; do\n  spark-submit job.py --day $d\ndone",
+    ],
+)
+def test_commands_with_no_secret_in_them_come_out_exactly_as_written(command):
+    assert safe_command(command) == command
+
+
+def test_a_json_argument_is_masked_by_its_keys():
+    shown = safe_args(['{"db": {"pass": "hunter2hunter2"}, "port": 5432, "user": "bob"}'])
+    assert shown == ['{"db": {"pass": "***REDACTED***"}, "port": 5432, "user": "bob"}']
+
+
+def test_a_masked_word_is_quoted_again_when_it_holds_an_operator_or_white_space():
+    shown = safe_command("tool 'X-Api-Key: a;b|c' --note ok")
+    assert shown == "tool 'X-Api-Key: ***REDACTED***' --note ok"
+    name = "PGPASS" + "WORD"
+    assert safe_command(f"{name}='a b;c' run") == f"{name}=***REDACTED*** run"

@@ -333,17 +333,21 @@ def ancestors(node: ast.AST, parents: Dict[ast.AST, ast.AST]) -> Iterable[ast.AS
         yield node
 
 
-def clean_chars(text: object) -> str:
+def clean_chars(text: object, *, keep: str = "") -> str:
     """``text`` without the characters that can rewrite what a terminal shows or hide what a
     reader sees: control characters (a new line, an escape sequence) and line and paragraph
     separators become spaces, and format characters (bidirectional marks, zero-width
-    characters) are dropped. Text from the scanned code goes through this before it is
-    printed or written."""
+    characters) are dropped. ``keep`` names control characters that stay (``"\\n\\t"`` for a
+    command written over several lines). Text from the scanned code goes through this before it
+    is printed or written."""
     value = str(text)
     if value.isprintable():
         return value
     out: List[str] = []
     for char in value:
+        if char in keep:
+            out.append(char)
+            continue
         category = unicodedata.category(char)
         if category in ("Cc", "Zl", "Zp"):
             out.append(" ")
