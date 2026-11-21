@@ -251,7 +251,7 @@ def test_a_record_that_was_changed_after_it_was_sealed_is_shown_as_not_intact(re
 
 
 def test_texts_from_a_record_cannot_rewrite_the_terminal(releases):
-    esc, bidi = "\x1b[31m", "‮"
+    esc, bidi = "\x1b[31m", chr(0x202E)
     seal(
         releases,
         "r5",
@@ -434,7 +434,14 @@ def test_the_command_can_answer_for_one_environment(tmp_path, capsys):
 
 @pytest.mark.parametrize(
     "day",
-    ["20261120", "2026-W47-5", "2026-11-20T00:00", "２０２６-11-20", "2026-1-20", "0000-01-01"]
+    [
+        "20261120",
+        "2026-W47-5",
+        "2026-11-20T00:00",
+        chr(0xFF12) + "026-11-20",
+        "2026-1-20",
+        "0000-01-01",
+    ]
     + [" 2026-11-20", "2026-11-20\n", "2026-11-31"],
 )
 def test_a_day_is_year_month_day_and_nothing_else(releases, day):

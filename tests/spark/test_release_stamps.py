@@ -117,7 +117,7 @@ def test_the_stamp_keys_are_lower_case_and_never_one_of_icebergs_own(runner):
 @pytest.mark.parametrize(
     "value",
     [
-        "two words", "line\nbreak", "tab\tsep", "semi;colon", "café", "{braces}", "q'uote",
+        "two words", "line\nbreak", "tab\tsep", "semi;colon", "caf" + chr(0xE9), "{braces}", "q'uote",
         "x" * 257, "-x", "--config=s3://other/job.json", ".dot", "_under",
     ],  # fmt: skip
 )
