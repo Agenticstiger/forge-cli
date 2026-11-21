@@ -609,13 +609,13 @@ class _Reader:
         if isinstance(value, Unresolved):
             # A command too long to fold is said, not dropped: nothing of it was read, so
             # whether it runs a spark-submit is not known.
-            if "spark-submit" in value.text or "longer than" in value.why:
-                return [
-                    self._submit(
-                        "bash", Unresolved(value.why, value.text), None, call, "bash_command"
-                    )
-                ]
-            return []
+            if "longer than" in value.why:
+                text = "bash_command"  # nothing of the command is shown: it was not read
+            elif "spark-submit" in value.text:
+                text = value.text
+            else:
+                return []
+            return [self._submit("bash", Unresolved(value.why, text), None, call, "bash_command")]
         found = _spark_submits_in_text(value, holes)
         command = _restore(value, holes)
         return [
@@ -644,9 +644,8 @@ class _Reader:
             if not isinstance(argv, list):
                 continue
             tokens = [a for a in argv if isinstance(a, (str, Unresolved))]
-            found = _spark_submit_in_tokens(tokens)
-            if found is not None:
-                out.append(self._submit(runtime, found[0], found[1], call))
+            for script, args in _spark_submits_in_tokens(tokens):
+                out.append(self._submit(runtime, script, args, call))
         return out
 
     def _emr_steps(self, call: ast.Call) -> List[Submit]:
@@ -842,7 +841,7 @@ class _Reader:
                 self._link(left, right)
 
 
-_SPARK_SUBMIT = re.compile(r"(^|/)spark-submit(\.sh)?$")
+_SPARK_SUBMIT = re.compile(r"(^|/)spark[0-9]*-submit(\.sh)?$")
 #: The token ``Folder.fold_sql`` puts where a field of the text did not fold.
 _HOLE = re.compile(r"__fluidhole\d+__")
 # A Jinja field is at most 1,000 characters: an unclosed ``{{`` then costs a bounded look ahead,
@@ -902,11 +901,56 @@ def _restore(text: str, holes: Mapping[str, str]) -> str:
     return _HOLE.sub(lambda m: "{" + holes.get(m.group(0), "?") + "}", text)
 
 
+def _strip_comments(text: str) -> str:
+    """``text`` without its shell comments. A ``#`` starts one only at the start of a word
+    (after white space or an operator) and outside quotes, as in a shell: the ``#`` of
+    ``--archives env.tar.gz#environment`` or ``$#`` is part of its word. The new line that ends a
+    comment is kept."""
+    out: List[str] = []
+    quote = ""
+    at_start = True
+    index, size = 0, len(text)
+    while index < size:
+        char = text[index]
+        if quote:
+            out.append(char)
+            if char == "\\" and quote == '"' and index + 1 < size:
+                out.append(text[index + 1])
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+            at_start = False
+            index += 1
+            continue
+        if char == "\\" and index + 1 < size:
+            out.append(char)
+            out.append(text[index + 1])
+            index += 2
+            at_start = False
+            continue
+        if char in "'\"":
+            quote = char
+            out.append(char)
+            at_start = False
+            index += 1
+            continue
+        if char == "#" and at_start:
+            while index < size and text[index] != "\n":
+                index += 1
+            continue
+        out.append(char)
+        at_start = char.isspace() or char in ";&|("
+        index += 1
+    return "".join(out)
+
+
 def _split_words(text: str) -> Optional[List[str]]:
-    """The words of one shell line, comments dropped; ``None`` when a quote is left open."""
+    """The words of one shell line (comments are already gone); ``None`` when a quote is left
+    open."""
     lexer = shlex.shlex(text, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
     lexer.whitespace_split = True
-    lexer.commenters = "#"
+    lexer.commenters = ""
     try:
         return list(lexer)
     except ValueError:
@@ -937,6 +981,7 @@ def _shell_commands(command: str, holes: Mapping[str, str]) -> List[List[Any]]:
 
     text = _JINJA.sub(hide, command[:_MAX_COMMAND])
     text = text.replace("\\\r\n", " ").replace("\\\n", " ")
+    text = _strip_comments(text)
     commands: List[List[Any]] = []
     pending = ""
     for line in text.split("\n"):
@@ -1012,10 +1057,10 @@ def _is_python(word: Any) -> bool:
     return isinstance(word, str) and word.endswith(".py")
 
 
-def _spark_submit_in_words(words: Sequence[Any], depth: int = 0) -> Optional[Tuple[Any, List[Any]]]:
-    """``(script, args)`` of the ``spark-submit`` one command runs, ``None`` when it runs none:
-    a ``spark-submit`` after ``echo`` or ``grep`` is text, one run through ``sudo``, ``timeout``
-    or ``bash -c`` is run."""
+def _spark_submits_in_words(words: Sequence[Any], depth: int = 0) -> List[Tuple[Any, List[Any]]]:
+    """``(script, args)`` of each ``spark-submit`` one command runs (none: an empty list): a
+    ``spark-submit`` after ``echo`` or ``grep`` is text, one run through ``sudo``, ``timeout`` or
+    ``bash -c`` is run."""
     head = 0
     while head < len(words) and isinstance(words[head], str):
         if _ASSIGNMENT.match(words[head]) or words[head] in _KEYWORDS:
@@ -1027,18 +1072,19 @@ def _spark_submit_in_words(words: Sequence[Any], depth: int = 0) -> Optional[Tup
         if not isinstance(word, str):
             continue
         if _SPARK_SUBMIT.search(word):
-            return _application(words, index)
+            found = _application(words, index)
+            return [] if found is None else [found]
         name = word.rsplit("/", 1)[-1]
         if name in _NOT_EXECUTING:
-            return None
+            return []
         if name == "command" and index + 1 < len(words) and words[index + 1] in ("-v", "-V"):
-            return None  # `command -v spark-submit` asks where it is
+            return []  # `command -v spark-submit` asks where it is
         if name in _SHELLS:
             return _in_shell(words[index + 1 :], depth)
-    return None
+    return []
 
 
-def _in_shell(rest: Sequence[Any], depth: int) -> Optional[Tuple[Any, List[Any]]]:
+def _in_shell(rest: Sequence[Any], depth: int) -> List[Tuple[Any, List[Any]]]:
     """``bash -c "spark-submit ..."``: the text after ``-c`` is a command line of its own."""
     for index, word in enumerate(rest):
         if (
@@ -1050,19 +1096,18 @@ def _in_shell(rest: Sequence[Any], depth: int) -> Optional[Tuple[Any, List[Any]]
             text = rest[index + 1] if index + 1 < len(rest) else None
             if isinstance(text, Unresolved):
                 if "spark-submit" in text.text:
-                    return Unresolved("the shell command is not a constant", text.text), []
-                return None
+                    return [(Unresolved("the shell command is not a constant", text.text), [])]
+                return []
             if isinstance(text, str) and depth < 3:
-                found = _spark_submits_in_text(text, {}, depth + 1)
-                return found[0] if found else None
-            return None
-    return None
+                return _spark_submits_in_text(text, {}, depth + 1)
+            return []
+    return []
 
 
-def _spark_submit_in_tokens(tokens: Sequence[Any]) -> Optional[Tuple[Any, List[Any]]]:
-    """``(script, args)`` of a ``spark-submit`` command given as words (an EMR step's ``Args``);
-    ``None`` when the command is not a ``spark-submit``."""
-    return _spark_submit_in_words(tokens)
+def _spark_submits_in_tokens(tokens: Sequence[Any]) -> List[Tuple[Any, List[Any]]]:
+    """``(script, args)`` of the ``spark-submit`` a command given as words runs (an EMR step's
+    ``Args``); an empty list when the command is not a ``spark-submit``."""
+    return _spark_submits_in_words(tokens)
 
 
 def _spark_submits_in_text(
@@ -1071,9 +1116,7 @@ def _spark_submits_in_text(
     """Every ``spark-submit`` a command line runs, in order."""
     found: List[Tuple[Any, List[Any]]] = []
     for words in _shell_commands(command, holes):
-        submit = _spark_submit_in_words(words, depth)
-        if submit is not None:
-            found.append(submit)
+        found.extend(_spark_submits_in_words(words, depth))
     return found
 
 

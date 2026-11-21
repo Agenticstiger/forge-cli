@@ -135,13 +135,23 @@ def safe_text(text: Any, limit: int = 200) -> str:
 
 
 _REDACTED = "***REDACTED***"
-#: A shell word: unquoted characters, escapes and quoted parts, as written.
-_SHELL_WORD = re.compile(r"""(?:[^\s'"\\]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+""")
+#: A shell word: unquoted characters that are not an operator, escapes and quoted parts, as
+#: written. An operator (``;``, ``&``, ``|``, ``(``, ``)``, ``<``, ``>``) ends a word and stays as
+#: written, so masking a value never removes the operator beside it.
+_SHELL_WORD = re.compile(r"""(?:[^\s'"\\;&|()<>]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+""")
+#: Where one command ends and the next begins.
+_COMMAND_BOUNDARY = re.compile(r"[;&|()\n]")
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*=")
+#: A Jinja field stays one word (it holds white space), and is a reference, not a value.
+_JINJA = re.compile(r"\{\{.{0,1000}?\}\}|\{%.{0,1000}?%\}|\{#.{0,1000}?#\}", re.DOTALL)
+_JINJA_TOKEN = re.compile(r"__fluidjinja(\d+)x(\d+)__")
 #: Words that make a name a credential's: the redactor's own list covers ``password``, ``secret``,
-#: ``token`` and the like inside a name; these are the ones that need to be a whole word
-#: (``keyPassword`` is a credential, ``keyspace`` is not).
-_SECRET_WORDS = frozenset({"pass", "pwd", "cred", "creds", "sas", "signature"})
+#: ``token`` and the like inside a name; these are the spellings it does not (``--passwd``,
+#: ``--pw``, ``--dbpass``), as whole words, and the compound ones, anywhere in the name.
+_SECRET_WORDS = frozenset(
+    {"pass", "passwd", "pswd", "pwd", "pw", "dbpass", "dbpwd", "cred", "creds", "sas", "signature"}
+)
+_SECRET_SUBSTRINGS = ("passwd", "passphrase", "accesskey", "secretkey", "apikey", "privatekey")
 #: ``key`` alone is a column in a data job (``--partition-key``, ``--primary-key``); it is a
 #: credential next to one of these (``--access-key``, ``--ssh-key``, ``--api-key``).
 _KEY_QUALIFIERS = frozenset(
@@ -151,7 +161,30 @@ _KEY_QUALIFIERS = frozenset(
     }
 )  # fmt: skip
 _NAME_PARTS = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
-_PASSWORD_SHORT_FLAGS = frozenset({"-p", "-w"})
+_PASSWORD_SHORT_FLAGS = frozenset({"-p", "-P", "-w"})
+#: ``-u user:password`` (and ``--user``): the part after the colon is the password.
+_USER_FLAGS = frozenset({"-u", "--user", "--proxy-user"})
+#: Commands whose ``-p``, ``-P`` or ``-w`` is a mode, a port or a directory, never a password.
+_SHORT_FLAG_IS_NOT_A_PASSWORD = frozenset(
+    {
+        "mkdir", "cp", "mv", "ls", "tar", "ssh", "scp", "sftp", "rsync", "sort", "install", "rm",
+        "ln", "ps", "nc", "ncat", "docker", "podman", "kubectl", "git", "pip", "hdfs", "hadoop",
+        "xargs", "find", "grep", "egrep", "fgrep", "sed", "awk", "chmod", "chown", "du", "env",
+        "java", "wget", "curl",
+    }
+)  # fmt: skip
+#: Commands whose ``-p<value>``, with no space, is the password.
+_GLUED_PASSWORD_COMMANDS = frozenset(
+    {
+        "mysql", "mysqldump", "mysqladmin", "mysqlimport", "mysqlcheck", "mariadb",
+        "mariadb-dump", "mariadb-admin", "mysqlsh",
+    }
+)  # fmt: skip
+#: Words that come before the command in a command line.
+_COMMAND_PREFIX = frozenset(
+    {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time", "exec", "sudo", "env"}
+    | {"nohup", "nice"}
+)
 _MAX_COMMAND_TEXT = 20_000
 
 
@@ -164,10 +197,23 @@ def _sensitive_name(name: str) -> bool:
         return False
     if is_sensitive_key_name(name.replace("-", "_")):
         return True
+    joined = re.sub(r"[^a-z0-9]", "", name.lower())
+    if any(part in joined for part in _SECRET_SUBSTRINGS):
+        return True
     words = {part.lower() for part in _NAME_PARTS.split(name) if part}
     if words & _SECRET_WORDS:
         return True
     return bool(words & {"key", "keys"}) and bool(words & _KEY_QUALIFIERS)
+
+
+def _mask_user(text: str) -> str:
+    """``user:password`` as ``user:***REDACTED***``; a user name alone is not a secret."""
+    user, colon, _secret = text.partition(":")
+    return f"{user}:{_REDACTED}" if colon else text
+
+
+def _path_or_port(value: str) -> bool:
+    return value.isdigit() or value.startswith(("/", "./", "../", "~"))
 
 
 class _Words:
@@ -181,10 +227,27 @@ class _Words:
         self._mask_next: Union[bool, str] = False
         self._setting_next: Optional[str] = None
         self._user_next = False
+        #: The command the word belongs to (its first word, without a path); ``None`` in an
+        #: argument list, which has no command.
+        self.command: Optional[str] = None
+        self._at_start = False
+
+    def boundary(self) -> None:
+        """A new command begins."""
+        self.command, self._at_start = None, True
+
+    def _start_of(self, value: str) -> None:
+        if self._at_start and not _ASSIGNMENT.match(value) and value not in _COMMAND_PREFIX:
+            self.command, self._at_start = value.rsplit("/", 1)[-1], False
 
     def show(self, value: str) -> str:
         from fluid_build.observability.secret_redactor import redact_secret_text
 
+        self._start_of(value)
+        if _JINJA_TOKEN.fullmatch(value):
+            # a template reference, not a value: nothing to mask, and a flag before it is spent
+            self._mask_next, self._setting_next, self._user_next = False, None, False
+            return value
         if self._mask_next:
             short, self._mask_next = self._mask_next == "short", False
             if not value.startswith("-") and not (short and _path_or_port(value)):
@@ -194,30 +257,48 @@ class _Words:
             return self._setting(value, flag)
         if self._user_next:
             self._user_next = False
-            user, colon, _secret = value.partition(":")
-            if colon:
-                return f"{user}:{_REDACTED}"
-        if value.startswith("-") and len(value) > 1:
-            flag, equals, rest = value.partition("=")
-            if flag in {"--conf", "-c"}:
-                if equals:
-                    return f"{flag}={self._setting(rest, flag)}"
-                self._setting_next = flag
-                return value
-            if _sensitive_name(flag) or flag in _PASSWORD_SHORT_FLAGS:
-                if equals:
-                    return f"{flag}={_REDACTED}"
-                self._mask_next = "short" if flag in _PASSWORD_SHORT_FLAGS else True
-                return value
-            if flag == "-u" and not equals:
-                self._user_next = True
-            return redact_secret_text(value)
+            if ":" in value:
+                return _mask_user(value)
+        flag, equals, rest = value.partition("=")
+        if value.startswith("-") and len(value) > 1 and not any(c.isspace() for c in flag):
+            return self._flag(value, flag, equals, rest)
         if _ASSIGNMENT.match(value):
-            name, _, _rest = value.partition("=")
+            name = value.partition("=")[0]
             if _sensitive_name(name):
                 return f"{name}={_REDACTED}"
         if self.depth < 2 and any(c.isspace() for c in value):
-            return _redact_command(value, self.depth + 1)  # ``bash -c "PGPASSWORD=x ..."``
+            return _redact_command(value, self.depth + 1)  # ``--extra "--password x"``
+        return redact_secret_text(value)
+
+    def _flag(self, value: str, flag: str, equals: str, rest: str) -> str:
+        from fluid_build.observability.secret_redactor import redact_secret_text
+
+        if flag in {"--conf", "-c"}:
+            if equals:
+                return f"{flag}={self._setting(rest, flag)}"
+            self._setting_next = flag
+            return value
+        if flag in _USER_FLAGS:
+            if equals:
+                return f"{flag}={_mask_user(rest)}"
+            self._user_next = True
+            return value
+        if (
+            self.command in _GLUED_PASSWORD_COMMANDS
+            and value.startswith("-p")
+            and not value.startswith("--")
+            and len(value) > 2
+            and not value[2:].isdigit()
+        ):
+            return "-p" + _REDACTED  # ``mysql -phunter2``
+        short = flag in _PASSWORD_SHORT_FLAGS
+        if short and self.command in _SHORT_FLAG_IS_NOT_A_PASSWORD:
+            return redact_secret_text(value)
+        if short or _sensitive_name(flag):
+            if equals:
+                return f"{flag}={_REDACTED}"
+            self._mask_next = "short" if short else True
+            return value
         return redact_secret_text(value)
 
     def _setting(self, value: str, flag: str) -> str:
@@ -237,10 +318,6 @@ class _Words:
         return redact_secret_text(value)
 
 
-def _path_or_port(value: str) -> bool:
-    return value.isdigit() or value.startswith(("/", "./", "../", "~"))
-
-
 def _unquote(raw: str) -> str:
     try:
         parts = shlex.split(raw)
@@ -250,24 +327,47 @@ def _unquote(raw: str) -> str:
 
 
 def _gap(text: str, *, edge: bool) -> str:
-    """The text between two words: a line continuation is a space, and a new line a command
-    separator (at the start or end of the command it is nothing)."""
+    """The text between two words: a line continuation is a space, a new line between two
+    commands that no operator separates is ``;`` (at the start or end of the command it is
+    nothing), and an operator is kept as written."""
     if "\n" not in text:
         return text
     if edge:
         return " "
-    return " " if "\\" in text else "; "
+    joined = text.replace("\\\r\n", " ").replace("\\\n", " ")
+    if "\n" not in joined:
+        return joined
+    if any(char in joined for char in ";&|("):
+        return joined.replace("\r", "").replace("\n", " ")
+    return "; "
 
 
 def _redact_command(command: str, depth: int = 0) -> str:
     """``command`` with the values of credentials masked, word by word, keeping what is not
-    one exactly as written (quoting, ``$VAR``, ``{{ ds }}``)."""
+    one exactly as written (quoting, operators, ``$VAR``, ``{{ ds }}``)."""
+    fields: List[str] = []
+
+    def hide(match: "re.Match[str]") -> str:
+        fields.append(match.group(0))
+        return f"__fluidjinja{depth}x{len(fields) - 1}__"
+
+    def back(match: "re.Match[str]") -> str:
+        index = int(match.group(2))
+        if int(match.group(1)) == depth and index < len(fields):
+            return fields[index]
+        return match.group(0)
+
+    text = _JINJA.sub(hide, command.replace("\r\n", "\n"))
     words = _Words(depth)
+    words.boundary()
     out: List[str] = []
     position = 0
     first = True
-    for match in _SHELL_WORD.finditer(command):
-        out.append(_gap(command[position : match.start()], edge=first))
+    for match in _SHELL_WORD.finditer(text):
+        gap = text[position : match.start()]
+        if not first and _COMMAND_BOUNDARY.search(gap):
+            words.boundary()
+        out.append(_gap(gap, edge=first))
         first = False
         raw = match.group(0)
         value = _unquote(raw)
@@ -277,8 +377,9 @@ def _redact_command(command: str, depth: int = 0) -> str:
         else:
             out.append(shlex.quote(shown) if any(c.isspace() for c in shown) else shown)
         position = match.end()
-    out.append(_gap(command[position:], edge=True))
-    return "".join(out)
+    out.append(_gap(text[position:], edge=True))
+    result = "".join(out)
+    return _JINJA_TOKEN.sub(back, result) if fields else result
 
 
 def safe_args(args: Sequence[str], limit: int = 200) -> List[str]:
@@ -292,7 +393,8 @@ def safe_args(args: Sequence[str], limit: int = 200) -> List[str]:
 
 def safe_command(command: str, limit: int = 500) -> str:
     """A command line, safe to write: each word is looked at as :func:`safe_args` does, and the
-    words that are nothing to hide stay as written. New lines between commands become ``;``."""
+    words that are nothing to hide stay as written, operators and quoting included. New lines
+    between commands become ``;``."""
     return safe_text(_redact_command(command[:_MAX_COMMAND_TEXT]), limit)
 
 
