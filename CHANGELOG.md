@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--adopt-tables` takes existing Glue tables over into the OpenTofu state, each only
+  when it matches the contract.** `fluid plan <contract> --tofu --adopt-tables` (and
+  `fluid apply <contract> --adopt-tables`) finds the tables the contract names that
+  already exist and that the state does not hold, and plans each through an OpenTofu
+  `import` block in the module's `main.tf.json`, so the plan shows the import and writes
+  no state before the apply. The saved plan is read back with `tofu show -json` before
+  the data-loss gate: a table that matches is imported unreplaced, its Lake Formation
+  permissions kept, and what the apply still changes in place (a description, an owner,
+  column comments, the columns of older Iceberg schemas Glue lists) is printed and
+  audited at WARNING (`table_adoption_accepted`). A table that differs refuses the run
+  (`table_adoption_mismatch`), naming each column missing, added, of another type, case
+  or order, and each property: location, Iceberg or not, input and output format, SerDe
+  and storage parameters, partition keys, table type, any other storage setting, or the
+  replace OpenTofu would plan; nothing is imported or applied. The saved plan records
+  the adopted tables in `opentofuPlan.adoptedTables`, under `planDigest`, and `fluid
+  apply plan.json` names them. With the flag a table whose look-up fails for any reason
+  but "no such object" stops the run, and one it cannot look for (no AWS account id)
+  is refused (`table_adoption_unavailable`); `fluid plan --adopt-tables` needs `--tofu`
+  (`plan_adopt_tables_needs_tofu`). A partitioned Hive table cannot be adopted yet: its
+  partition trigger is new to the state, so OpenTofu plans its replacement, and the run
+  is refused saying so.
+
 - **`fluid generate pyspark-schema` writes a PySpark `StructType` module for each output
   port.** For every output port that declares `contract.schema` columns it writes
   `<port>_schema.py` with a `SCHEMA` a Spark job imports (`spark.read.schema(SCHEMA)`). forge-cli
@@ -155,6 +177,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under every scaled rule, exact counts included.
 
 ### Changed
+
+- **An existing Glue table is no longer taken over without being asked.** A table the
+  contract names that already exists and that the OpenTofu state does not manage used
+  to be imported on every `fluid apply` and rewritten to the contract in place. It is
+  now refused before the plan (`table_adoption_requires_flag`), naming each table;
+  `--adopt-tables` adopts it after the match check. S3 buckets, Glue databases, Kinesis
+  streams and the other brownfield resources are adopted as before, and so are tables
+  on the other clouds.
 
 - **`--fail-on-breaking` fails on a changed product id.** The changelog did not compare ids, so a
   contract that only changed its id passed the gate; it is a breaking change now, as it is in the
