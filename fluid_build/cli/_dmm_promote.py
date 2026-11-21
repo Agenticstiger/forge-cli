@@ -16,13 +16,12 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
-from fluid_build.cli.console import cprint_literal
+from fluid_build.cli.console import cprint_json, cprint_literal
 
 __all__ = ["Verdict", "load_verdicts", "report_verdict", "run_promote"]
 
@@ -227,13 +226,11 @@ def run_promote(args: Any, log: logging.Logger) -> int:
         counts[row["outcome"]] = counts.get(row["outcome"], 0) + 1
     code = 1 if counts.get(FAILED) or counts.get(HELD_BACK) else 0
     if as_json:
-        sys.stdout.write(
+        cprint_json(
             json.dumps(
                 {"dry_run": dry_run, "results": results, "summary": counts}, indent=2, default=str
             )
         )
-        sys.stdout.write("\n")
-        sys.stdout.flush()
         return code
     for row in results:
         detail = f" - {row['detail']}" if row.get("detail") else ""

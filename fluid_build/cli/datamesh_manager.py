@@ -472,9 +472,7 @@ def _cmd_publish(args, logger=None):
         )
 
         if machine:
-            sys.stdout.write(json.dumps(result, indent=2, default=str))
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+            cprint_json(json.dumps(result, indent=2, default=str))
             return 0 if args.dry_run else _publish_exit_code(result, args)
 
         if args.dry_run:

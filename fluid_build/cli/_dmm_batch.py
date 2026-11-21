@@ -27,7 +27,7 @@ from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from fluid_build.cli.console import cprint_literal
+from fluid_build.cli.console import cprint_json, cprint_literal
 from fluid_build.providers.datamesh_manager._ids import dmm_product_id
 
 __all__ = [
@@ -387,9 +387,7 @@ def run_publish(args: Any, paths: Sequence[str], log: logging.Logger) -> int:
             "results": [o.to_dict() for o in outcomes],
             "summary": counts,
         }
-        sys.stdout.write(json.dumps(report, indent=2, default=str))
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+        cprint_json(json.dumps(report, indent=2, default=str))
     else:
         _print_summary(counts, dry_run)
         for o in outcomes:
