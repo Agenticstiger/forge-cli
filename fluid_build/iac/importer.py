@@ -42,6 +42,12 @@ class ImportBlock:
     #: and the block is never rendered into a module (:func:`import_section`): an import
     #: id there must be known before the plan.
     id_from: Optional[Tuple[str, str]] = None
+    #: The table this import would take over, as ``<database>.<table>``, for a plugin
+    #: that adopts tables only when asked (``--adopt-tables``, :mod:`iac.adoption`):
+    #: such an import is refused without the flag, and with it goes through an
+    #: ``import`` block whose plan must match the contract. ``None`` for every other
+    #: import, adopted on sight as before. Never rendered (:func:`import_section`).
+    table: Optional[str] = None
 
 
 def import_section(blocks: List[ImportBlock]) -> Dict[str, Any]:

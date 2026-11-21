@@ -871,10 +871,10 @@ class AwsIacPlugin:
         blocks: List[ImportBlock] = []
         seen: set[str] = set()
 
-        def _add(address: str, resource_id: str) -> None:
+        def _add(address: str, resource_id: str, table: Optional[str] = None) -> None:
             if address not in seen:
                 seen.add(address)
-                blocks.append(ImportBlock(to=address, id=resource_id))
+                blocks.append(ImportBlock(to=address, id=resource_id, table=table))
 
         # Resolve catalog_id once — only when needed (Glue catalog refs). The
         # raw format here, not the emit's parquet default: unchanged from before
@@ -914,10 +914,13 @@ class AwsIacPlugin:
                     )
                 if table:
                     table_key = safe_ident(f"{cid}_{database}_{table}")
-                    # provider id: ``{catalog_id}:{database}:{name}``
+                    # provider id: ``{catalog_id}:{database}:{name}``. A table holds a
+                    # team's data: it is taken over only on --adopt-tables, and only
+                    # when it matches the contract (``iac/adoption.py``).
                     _add(
                         f"aws_glue_catalog_table.{table_key}",
                         f"{catalog_id}:{database}:{table}",
+                        table=f"{database}.{table}",
                     )
 
             # S3 bucket — provider id is the bucket name.
@@ -954,6 +957,42 @@ class AwsIacPlugin:
                 )
 
         return blocks
+
+    #: Why a Glue table could not be looked for, when ``discover_imports`` offers none for
+    #: a table the contract names: its import id needs the account.
+    table_adoption_hint = (
+        "A Glue table's import id names the AWS account: set AWS_ACCOUNT_ID, or run with "
+        "credentials sts:GetCallerIdentity accepts."
+    )
+
+    def adoptable_tables(self, contract: Mapping[str, Any]) -> Dict[str, str]:
+        """``{address: "<database>.<table>"}`` of every Glue table the contract names.
+
+        The tables :meth:`discover_imports` looks for, under the same gate
+        (``_glue_cataloged``), whether or not the account id is known: ``--adopt-tables``
+        refuses a run that could not look for one of them.
+        """
+        cid = safe_ident(contract.get("id") or contract.get("name") or "product")
+        tables: Dict[str, str] = {}
+        for exposure in contract.get("exposes") or []:
+            binding = exposure.get("binding") or {}
+            if not is_cloud(binding, "aws"):
+                continue
+            loc = binding.get("location") or {}
+            database, table = loc.get("database"), loc.get("table")
+            if database and table and _glue_cataloged(binding, binding.get("format") or "parquet"):
+                key = safe_ident(f"{cid}_{database}_{table}")
+                tables[f"aws_glue_catalog_table.{key}"] = f"{database}.{table}"
+        return tables
+
+    def review_table_adoption(
+        self, change: Mapping[str, Any], declared: Mapping[str, Any]
+    ) -> Tuple[List[str], List[str]]:
+        """``(differences, updates)`` of adopting the Glue table one saved-plan change
+        imports (``aws_adoption.review_glue_table``)."""
+        from .aws_adoption import review_glue_table
+
+        return review_glue_table(change, declared)
 
     def provider_block(self) -> Dict[str, Any]:
         """Static provider configuration for the ``hashicorp/aws`` provider.

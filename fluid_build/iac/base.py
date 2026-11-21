@@ -63,6 +63,15 @@ class IacProviderPlugin(Protocol):
     * ``strict_adoption``: ``True`` when the provider replaces an object it
       creates over, so an import that fails for any reason but "no such
       object" must stop the apply (:meth:`discover_imports`).
+    * ``adoptable_tables(contract)``: ``{address: name}`` of every table the
+      contract names, for a plugin whose table imports carry
+      ``ImportBlock.table``: such a table is taken over only on
+      ``--adopt-tables`` (``iac/adoption.py``), and a run with the flag that
+      found no import for one of them is refused (``table_adoption_hint`` says
+      why). A plugin without it adopts what it finds, as before.
+    * ``review_table_adoption(change, declared)``: ``(differences, updates)`` of
+      one table the saved plan imports (a ``tofu show -json`` resource change,
+      and the table's body in the module); any difference refuses the run.
     * ``plan_data_changes(plan)``: what the saved plan's in-place updates do to
       existing data (``tofu show -json``), one line each; any line needs
       ``--allow-data-loss``, as a destroy does. It raises
