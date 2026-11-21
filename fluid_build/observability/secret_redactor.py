@@ -142,8 +142,14 @@ _PROVIDER_KEY_RES = (
     re.compile(r"\bsk-ant-[A-Za-z0-9-]{30,}"),  # Anthropic
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),  # OpenAI (incl. sk-proj-/sk-svcacct-/sk-admin-)
     re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),  # AWS access key id
-    re.compile(r"\bAIza[0-9A-Za-z_\-]{35}"),  # GCP API key
-    re.compile(r"\bxox[abprs]-[0-9A-Za-z-]{10,}"),  # Slack
+    # GCP API key, with no ``\b`` before it, as for Databricks below: after ``_``
+    # (``GOOGLE_API_KEY_AIza...``) or ``%3D`` there is a word character before the ``A``.
+    re.compile(r"AIza[0-9A-Za-z_\-]{35}"),
+    re.compile(r"\bxox[abprs]-[0-9A-Za-z-]{10,}"),  # Slack token
+    # A Slack incoming webhook: the URL is the secret, whoever holds it can post to the channel.
+    re.compile(
+        r"(?i)\bhttps?://hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9/_-]{8,256}"
+    ),
     re.compile(r"\bhf_[A-Za-z0-9]{30,}"),  # HuggingFace
     re.compile(r"\br8_[A-Za-z0-9]{30,}"),  # Replicate
     re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"),  # GitLab PAT
@@ -182,6 +188,18 @@ _FERNET_TOKEN_RE = re.compile(r"\bgAAAAA[A-Za-z0-9_-]{20,}")
 # turned ``postgres://u:***@db/x`` into ``postgres://u:***REDACTED***@db/x``.
 _URL_USERINFO_RE = re.compile(
     r"([A-Za-z][A-Za-z0-9+.\-]{0,40}://[^/?#@:\s]{0,256}:)(?!\*{3}@)[^/?#@\s]{1,4096}(@)"
+)
+# Oracle JDBC thin / OCI URL with the login in it, ``jdbc:oracle:thin:user/password@host:1521/svc``
+# (``@//host`` too; ``oci``, ``oci8``, ``kprb``; any case). The password is what stands between
+# the ``/`` after the user and the LAST ``@`` of the word, so one that holds an ``@`` is masked
+# whole; one in double quotes (``scott/"p@ss"@h``, or with the quotes backslash-escaped) is read to
+# its closing quote. ``thin:@host`` and ``thin:user@host`` have no password: no match. Two unnamed
+# groups (the text up to the password, and the ``@``), so the Snowflake twin renders it as
+# ``\1[REDACTED]\2`` and imports THIS object, as it does :data:`_URL_USERINFO_RE`. Every repeat
+# is length-bounded: the cost is linear in the line.
+_ORACLE_JDBC_RE = re.compile(
+    r"(?i)(jdbc:oracle:(?:thin|oci8?|kprb):[^/@\s'\"]{1,128}/)"
+    r"(?:\\?\"[^\"\r\n]{0,512}\"|[^\s'\"]{1,512})(@)"
 )
 # PEM private-key block (RSA / EC / OPENSSH / DSA / bare PKCS#8 ...).
 # ``[^-]*`` (zero-or-more) so the algorithm word is optional and the bare
@@ -701,6 +719,8 @@ def redact_secret_text(text: str, *, extra_secrets: Iterable[str] = ()) -> str:
     # scrubbed even when its key name isn't credential-shaped (``uri=https://u:p@h``,
     # ``connection_url=...``).
     redacted = _URL_USERINFO_RE.sub(r"\1" + _REDACTED + r"\2", redacted)
+    # The same for an Oracle JDBC URL, whose login has no ``://`` and no ``:`` before the password.
+    redacted = _ORACLE_JDBC_RE.sub(r"\1" + _REDACTED + r"\2", redacted)
     # Mask the whole sasl.jaas.config value BEFORE the assignment regex (which
     # would only catch an inner ``password=`` and leave a non-standard secret).
     redacted = _JAAS_CONFIG_RE.sub(r"\1" + _REDACTED + r"\3", redacted)

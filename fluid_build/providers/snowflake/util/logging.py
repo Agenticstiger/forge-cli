@@ -15,6 +15,7 @@ import re
 from typing import Any, Dict, List
 
 from fluid_build.observability.secret_redactor import (
+    _ORACLE_JDBC_RE,
     _URL_USERINFO_RE,
     is_sensitive_key_name,
     redact_jose_tokens,
@@ -49,6 +50,9 @@ SENSITIVE_PATTERNS = [
     # mask the identical shape and cannot drift (CLAUDE.md "extend both"). The
     # generic 2-group branch in redact_string() renders it as \1[REDACTED]\2.
     _URL_USERINFO_RE,
+    # An Oracle JDBC URL with the login in it (``jdbc:oracle:thin:user/password@host``): shared
+    # object, two groups, rendered the same way.
+    _ORACLE_JDBC_RE,
     # Private keys and credentials
     re.compile(r'"private_key":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r'"private_key_id":\s*"[^"]*"', re.IGNORECASE),
@@ -154,8 +158,13 @@ SENSITIVE_PATTERNS = [
     re.compile(r"\bsk-ant-[A-Za-z0-9-]{30,}"),  # Anthropic
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),  # OpenAI (incl. sk-proj-/sk-svcacct-/sk-admin-)
     re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),  # AWS access key id
-    re.compile(r"\bAIza[0-9A-Za-z_\-]{35}"),  # GCP API key
-    re.compile(r"\bxox[abprs]-[0-9A-Za-z-]{10,}"),  # Slack
+    # GCP API key, with no ``\b`` before it (after ``_`` or ``%3D`` there is a word character).
+    re.compile(r"AIza[0-9A-Za-z_\-]{35}"),
+    re.compile(r"\bxox[abprs]-[0-9A-Za-z-]{10,}"),  # Slack token
+    # A Slack incoming webhook: the URL is the secret.
+    re.compile(
+        r"(?i)\bhttps?://hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9/_-]{8,256}"
+    ),
     re.compile(r"\bhf_[A-Za-z0-9]{30,}"),  # HuggingFace
     re.compile(r"\br8_[A-Za-z0-9]{30,}"),  # Replicate
     re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"),  # GitLab PAT

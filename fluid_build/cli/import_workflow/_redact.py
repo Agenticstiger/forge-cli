@@ -295,12 +295,22 @@ def _mask_pairs(text: str) -> str:
     return _mask_kv(_mask_json(text))
 
 
+def _oracle_jdbc(text: str) -> str:
+    """``jdbc:oracle:thin:user/password@host`` (``oci``, ``oci8``, ``kprb``, any case) with the
+    password masked: the repository's own rule, which the free-text scan below also applies."""
+    from fluid_build.observability.secret_redactor import _ORACLE_JDBC_RE
+
+    return _ORACLE_JDBC_RE.sub(lambda m: f"{m.group(1)}{_REDACTED}{m.group(2)}", text)
+
+
 def _scan(text: str) -> str:
     """One word, or one value, read for credentials: the free-text scan of the repository, the
-    secret in the user information of an ``s3a`` URL (it holds ``/``, which the scan stops at), and
-    the pairs a connection string, a query string or JSON holds."""
+    secret in the user information of an ``s3a`` URL (it holds ``/``, which the scan stops at), the
+    password of an Oracle JDBC URL (``user/password@host``, no ``://``), and the pairs a
+    connection string, a query string or JSON holds."""
     if "@" in text:
         text = _S3_SECRET.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
+        text = _oracle_jdbc(text)
     return _mask_pairs(_free_text(text))
 
 
@@ -574,6 +584,8 @@ def scrub_path(path: str) -> str:
     (an AWS secret holds ``/``). A path is an
     identity: this runs where it is read from the code, so nothing made from it (an id, a file
     name, a binding) can carry the credential."""
+    if "@" in path:
+        path = _oracle_jdbc(path)
     found = _S3_USERINFO.match(path) or _USERINFO.match(path)
     if found:
         scheme = found.group(1)[:-3].rsplit(":", 1)[-1].lower()
