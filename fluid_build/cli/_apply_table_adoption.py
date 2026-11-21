@@ -34,6 +34,7 @@ from fluid_build.iac.adoption import (
     review_tables,
 )
 from fluid_build.iac.importer import ImportBlock, import_section
+from fluid_build.iac.module import render_tofu_json
 
 from ._logging import warn
 
@@ -110,11 +111,18 @@ def refuse_unless_asked(args: Any, tables: Sequence[Any]) -> None:
 
 
 def write_import_blocks(module_path: Path, blocks: Sequence[ImportBlock]) -> None:
-    """Add an ``import`` block per entry of ``blocks`` to the module at ``module_path``."""
+    """Add an ``import`` block per entry of ``blocks`` to the module at ``module_path``.
+
+    Through the module renderer (``iac.module.render_tofu_json``): an import id carries
+    contract text (a Glue database or table name), and OpenTofu reads a ``${...}`` or
+    ``%{...}`` in a ``.tf.json`` string as a template, so ``file("...")`` there would
+    read the host's files into the plan. Escaped, it is the literal id.
+    """
     if not blocks:
         return
+    rendered = json.loads(render_tofu_json(import_section(list(blocks))))
     document = json.loads(module_path.read_text(encoding="utf-8"))
-    document.setdefault("import", []).extend(import_section(list(blocks)).get("import", []))
+    document.setdefault("import", []).extend(rendered.get("import", []))
     module_path.write_text(json.dumps(document, indent=2), encoding="utf-8")
 
 

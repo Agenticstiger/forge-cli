@@ -638,7 +638,7 @@ def _plan_with_opentofu(
     args, logger: logging.Logger, contract: Mapping[str, Any], out: Path
 ) -> Dict[str, Any]:
     from fluid_build.forge.core.plan_digest import sha256_bytes
-    from fluid_build.iac.importer import ImportBlock, import_section
+    from fluid_build.iac.importer import ImportBlock
 
     # Before anything reads or writes state: the files go next to plan.json.
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -655,9 +655,8 @@ def _plan_with_opentofu(
     _refuse_unreleased_imports(eng, adopted)
     tables = _table_adoption.tables_of(adopted)
     if adopted:
-        document = json.loads(eng.module_path.read_text(encoding="utf-8"))
-        document.setdefault("import", []).extend(import_section(adopted).get("import", []))
-        eng.module_path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+        # Escaped as the module is: an import id carries contract text.
+        _table_adoption.write_import_blocks(eng.module_path, adopted)
         cprint(f"  brownfield:  the saved plan adopts {len(adopted)} pre-existing resource(s)")
 
     plan = runner.tofu_plan(eng.workdir, out_file=_WORKDIR_PLAN, env=eng.env)

@@ -355,3 +355,46 @@ def test_plan_tofu_records_no_adopted_tables_when_none_is_adopted(tofu, tmp_path
     record = _plan(tmp_path, adopt_tables=True)
 
     assert "adoptedTables" not in record
+
+
+# ── the module the import blocks go into ────────────────────────────────────
+
+
+def test_an_import_id_is_written_as_its_literal_text_never_as_a_template(tmp_path):
+    """A Glue name is contract text; OpenTofu would evaluate a template in the id."""
+    from fluid_build.cli._apply_table_adoption import write_import_blocks
+    from fluid_build.iac.importer import ImportBlock
+
+    module = tmp_path / "main.tf.json"
+    module.write_text(json.dumps({"resource": {"x": {}}}), encoding="utf-8")
+    sneaky = ACCOUNT + ":sales:x" + "$" + '{file("/etc/passwd")}' + "%" + "{if true}y"
+
+    write_import_blocks(module, [ImportBlock(to=TABLE, id=sneaky, table="sales.x")])
+
+    (entry,) = json.loads(module.read_text(encoding="utf-8"))["import"]
+    assert entry == {
+        "to": TABLE,
+        "id": ACCOUNT + ":sales:x" + "$$" + '{file("/etc/passwd")}' + "%%" + "{if true}y",
+    }
+
+
+def test_plan_tofu_writes_every_brownfield_import_block_escaped(tofu, tmp_path):
+    """The saved plan's import blocks for the other brownfield finds go the same way."""
+    contract = json.loads(json.dumps(CONTRACT))
+    contract["exposes"][0]["binding"]["location"]["table"] = "o" + "$" + "{path.cwd}"
+    from fluid_build.iac.naming import safe_ident
+
+    sneaky_table = "aws_glue_catalog_table." + safe_ident(
+        "sales_orders_sales_o" + "$" + "{path.cwd}"
+    )
+    tofu["exists"] = {sneaky_table, BUCKET}
+    tofu["shown"] = {"resource_changes": []}
+
+    with pytest.raises(CLIError):
+        engine.plan_with_opentofu(
+            _args(tmp_path, adopt_tables=True), _LOG, contract, str(tmp_path / "plan.json")
+        )
+
+    (module,) = tofu["plans"]
+    ids = {entry["to"]: entry["id"] for entry in module["import"]}
+    assert ids[sneaky_table] == ACCOUNT + ":sales:o" + "$$" + "{path.cwd}"
