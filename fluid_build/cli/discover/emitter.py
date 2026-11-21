@@ -118,6 +118,11 @@ def emit_contract(
 #: ``bigint`` and ``numeric``. The schema's own enum keeps ``bigint`` and
 #: ``integer`` distinct, so the choice is visible in the emitted contract.
 #:
+#: DuckDB 2.0.1 added one more, ``parquet_variant``: the Parquet VARIANT storage
+#: layout, ``STRUCT(metadata BLOB, value BLOB[, typed_value ...])`` (the
+#: ``arrow.parquet.variant`` extension type). It holds a value of the variant
+#: type, so it maps to ``variant`` rather than to the struct it is stored as.
+#:
 #: Parameterised and spaced forms are deliberately absent: the schema's pattern
 #: branch already accepts ``decimal(18,2)``, ``varchar(255)``, ``struct(...)``,
 #: ``map(...)`` and ``timestamp with time zone``. Only ``<type>[]`` and the
@@ -161,6 +166,7 @@ _SCHEMA_TYPE_ALIASES = {
     "list": "array",
     "tuple": "struct",
     "union": "variant",
+    "parquet_variant": "variant",
     # a column of only NULLs, and DuckDB's own meta type
     "null": "string",
     "type": "string",

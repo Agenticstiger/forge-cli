@@ -64,6 +64,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count (up to 144,962 worlds), and up to 7 parents keyed by their exact numbers pin none
   under every scaled rule, exact counts included.
 
+### Fixed
+
+- **`fluid` reads a config file's merge keys the same on every PyYAML release.** PyYAML 6.0.4
+  changed how it copies the pairs of a merge key (`<<: *name`, `<<: [*a, *b]`): it skips a pair
+  whose key text is the same string object as one already copied, and no longer copies a list of
+  mappings last to first. That left two things wrong. The loader's alias budget, which watched
+  PyYAML's copy, saw nothing to refuse, so a nested merge-key bomb in a config file or a market
+  file loaded instead of being refused with "document contains excessive aliasing". And in a
+  list of merges, for keys longer than one character, the last mapping won where the merge key
+  type says the first does (yaml/pyyaml#953, open), so a config meant something else on 6.0.4
+  than on 6.0.3. The config loader now copies merge keys itself, as the YAML 1.1 merge type
+  defines them and as PyYAML 6.0.3 read them, and spends the alias budget before each copy: a
+  merge bomb is refused, and a config means the same thing, on every release. It also closes an
+  older gap in the same guard: a merge key whose value is an alias to a list of mappings
+  (`<<: *l1` over `l1: [{...}]`, repeated in one mapping, which PyYAML accepts) was never
+  counted as an alias decode, so a document of a few hundred bytes expanded ninefold a level
+  inside the loader and was not refused; nor was a chain of inline mappings that each merge
+  the one inside it (`{<<: {<<: ... {<<: [*m, *m]}}}`), which counted the copies it made as
+  plain decodes and so kept the share of alias decodes under the ratio that refuses a
+  document: 2 KB expanded to 12 million copies and 3 KB to 5 GB. Only the pairs a mapping wrote
+  itself, copied for the first time through no alias, are plain decodes now, so the work a
+  config can force is bounded by a multiple of its size. `pyyaml` is now `>=6.0,!=6.0.4` (also in
+  `Dockerfile.verify`), so a fresh install never picks the release: the other YAML that `fluid`
+  reads through `yaml.safe_load` (contracts, for one) would otherwise read a list of merges the
+  6.0.4 way. Drop the exclusion once PyYAML fixes #953.
+- **`fluid init --discover` maps DuckDB's `PARQUET_VARIANT` type.** DuckDB 2.0.1 lists
+  `PARQUET_VARIANT` (the Parquet VARIANT storage layout, a struct of metadata and value bytes)
+  among its type names. The emitter passed unknown names through, so a column of that type
+  wrote `type: parquet_variant` into a contract that `fluid validate` then rejected. It maps to
+  `variant`, as DuckDB's `UNION` already does, and the schema-drift gate reads the two as one
+  type family, so a contract written that way does not fail at apply.
+
 ## [0.36.0] — 2026-11-19
 
 ### Added

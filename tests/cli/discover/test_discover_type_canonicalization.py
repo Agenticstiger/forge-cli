@@ -85,6 +85,9 @@ def _validator(version: str) -> Any:
         # Composites and odds.
         ("LIST", "array"),
         ("UNION", "variant"),
+        # DuckDB 2.0.1: the Parquet VARIANT storage layout, a value of the variant type.
+        ("PARQUET_VARIANT", "variant"),
+        ("parquet_variant", "variant"),
         ("LOGICAL", "boolean"),
         ("BPCHAR", "varchar"),
         ("VARCHAR[][]", "array"),
@@ -123,6 +126,7 @@ def test_every_mapped_type_satisfies_the_bundled_schema() -> None:
         "TIMETZ",
         "LIST",
         "UNION",
+        "PARQUET_VARIANT",
         "TUPLE",
         "LOGICAL",
         "BPCHAR",

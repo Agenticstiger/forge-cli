@@ -32,7 +32,10 @@ classifiers = [
 # Core runtime deps (keep lean; providers add heavy SDKs via extras)
 dependencies = [
   "click>=8.1",
-  "pyyaml>=6.0",
+  # 6.0.4 (2026-11-20) lets the LAST mapping of a list of merge keys win for keys longer than
+  # one character, where YAML 1.1 and 6.0.3 let the first win (yaml/pyyaml#953). Drop the
+  # exclusion once a PyYAML release fixes it.
+  "pyyaml>=6.0,!=6.0.4",
   "jsonschema>=4.22",
   # RFC 8785 (JSON Canonicalization Scheme) — the substrate the agentPolicy
   # policyDigest sits on (fluid_build/policy/decision.py). Chosen because the
