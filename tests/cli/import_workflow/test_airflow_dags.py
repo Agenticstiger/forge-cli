@@ -902,3 +902,83 @@ def test_asking_where_spark_submit_is_does_not_run_it(command):
 def test_command_in_front_of_spark_submit_still_runs_it():
     (submit,) = bash_submits("command spark-submit job.py")
     assert submit.script == "job.py"
+
+
+# ── a shell comment, a quote and a command the way a shell reads them ──
+
+
+@pytest.mark.parametrize(
+    "command, script, args",
+    [
+        (
+            "spark-submit --archives env.tar.gz#environment --master yarn jobs/main.py a",
+            "jobs/main.py",
+            ("a",),
+        ),
+        ("spark-submit --conf spark.x=a#b main.py", "main.py", ()),
+        (
+            "spark-submit main.py --color=#fff --other x",
+            "main.py",
+            ("--color=#fff", "--other", "x"),
+        ),
+        ("spark-submit main.py --tag C#sharp", "main.py", ("--tag", "C#sharp")),
+        ("# spark-submit old.py\nspark-submit new.py  # a comment\n", "new.py", ()),
+        ("echo $# && spark-submit x.py", "x.py", ()),
+        ("echo 'it'\"'\"'s' # c\nspark-submit z.py", "z.py", ()),
+        ("spark3-submit job.py", "job.py", ()),
+        ("/opt/spark2/bin/spark2-submit job.py", "job.py", ()),
+    ],
+)
+def test_a_hash_starts_a_comment_only_at_the_start_of_a_word(command, script, args):
+    (submit,) = bash_submits(command)
+    assert (submit.script, submit.args) == (script, args)
+
+
+def test_every_spark_submit_in_a_bash_dash_c_is_read():
+    for command in (
+        "bash -c 'spark-submit a.py && spark-submit b.py'",
+        'sh -c "spark-submit a.py; spark-submit b.py"',
+        "bash -lc 'spark-submit a.py\nspark-submit b.py'",
+        "bash -c \"bash -c 'spark-submit a.py; spark-submit b.py'\"",
+    ):
+        assert [s.script for s in bash_submits(command)] == ["a.py", "b.py"], command
+
+
+def test_a_jinja_template_stands_where_the_script_goes_when_an_argument_follows_it():
+    (submit,) = bash_submits("spark-submit --master yarn {{ params.script }} 1")
+    assert submit.script == "{{ params.script }}" and submit.args == ("1",) and submit.templated
+
+
+def test_an_unclosed_quote_costs_a_pass_over_the_text_not_one_per_line():
+    import time
+
+    from fluid_build.cli.import_workflow import _airflow_dags as A
+
+    started = time.monotonic()
+    assert A._shell_commands("'" + "\n" * 3999, {}) == []
+    assert time.monotonic() - started < 0.2
+    assert A._shell_commands("echo a\n'oops\nstill open", {}) == [["echo", "a"]]
+
+
+def test_tasks_that_share_one_command_read_it_once():
+    import time
+
+    command = "spark-submit --conf a=b jobs/main.py " + "x " * 1000
+    tasks = "\n".join(f'    BashOperator(task_id="t{i}", bash_command=CMD)' for i in range(40))
+    source = (
+        "from airflow import DAG\n"
+        "from airflow.operators.bash import BashOperator\n"
+        f"CMD = {command!r}\n"
+        'with DAG("shared"):\n' + tasks + "\n"
+    )
+    started = time.monotonic()
+    dag = one(source)
+    assert time.monotonic() - started < 2
+    assert len(dag.tasks) == 40 and all(t.submits[0].script == "jobs/main.py" for t in dag.tasks)
+
+
+def test_a_command_too_long_to_fold_shows_none_of_its_text():
+    secret = "hunter2" * 3
+    submits = bash_submits(f"spark-submit --password {secret} " + "y" * 5000)
+    assert len(submits) == 1 and submits[0].script is None
+    assert secret not in submits[0].shown and secret not in submits[0].why

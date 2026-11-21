@@ -192,6 +192,9 @@ class _Reader:
         self._capped: Set[int] = set()
         self._unread_seen: Set[Tuple[int, str]] = set()
         self._calls_at_module_level: Optional[Set[str]] = None
+        #: Command text (with its holes) to the spark-submits in it: twenty tasks that share one
+        #: command read it once.
+        self._read_commands: Dict[Any, Tuple[List[Tuple[Any, List[Any]]], str]] = {}
         self._call_targets: Optional[Dict[str, List[str]]] = None
 
     # ── entry ───────────────────────────────────────────────────────
@@ -616,8 +619,14 @@ class _Reader:
             else:
                 return []
             return [self._submit("bash", Unresolved(value.why, text), None, call, "bash_command")]
-        found = _spark_submits_in_text(value, holes)
-        command = _restore(value, holes)
+        key = (value, tuple(sorted(holes.items())))
+        cached = self._read_commands.get(key)
+        if cached is None:
+            cached = self._read_commands[key] = (
+                _spark_submits_in_text(value, holes),
+                _restore(value, holes),
+            )
+        found, command = cached
         return [
             self._submit("bash", script, args, call, "bash_command", command=command)
             for script, args in found
@@ -901,11 +910,13 @@ def _restore(text: str, holes: Mapping[str, str]) -> str:
     return _HOLE.sub(lambda m: "{" + holes.get(m.group(0), "?") + "}", text)
 
 
-def _strip_comments(text: str) -> str:
-    """``text`` without its shell comments. A ``#`` starts one only at the start of a word
-    (after white space or an operator) and outside quotes, as in a shell: the ``#`` of
-    ``--archives env.tar.gz#environment`` or ``$#`` is part of its word. The new line that ends a
-    comment is kept."""
+def _logical_lines(text: str) -> List[str]:
+    """The lines of a shell command, in one pass: a new line inside quotes does not end a line,
+    and a ``#`` starts a comment only at the start of a word (after white space or an operator)
+    and outside quotes, as in a shell (the ``#`` of ``--archives env.tar.gz#environment`` or of
+    ``$#`` is part of its word). A line that ends inside an open quote is dropped with the rest
+    of the text, as the command is not one a shell would run."""
+    lines: List[str] = []
     out: List[str] = []
     quote = ""
     at_start = True
@@ -939,10 +950,18 @@ def _strip_comments(text: str) -> str:
             while index < size and text[index] != "\n":
                 index += 1
             continue
+        if char == "\n":
+            lines.append("".join(out))
+            out = []
+            at_start = True
+            index += 1
+            continue
         out.append(char)
         at_start = char.isspace() or char in ";&|("
         index += 1
-    return "".join(out)
+    if not quote:
+        lines.append("".join(out))
+    return lines
 
 
 def _split_words(text: str) -> Optional[List[str]]:
@@ -981,15 +1000,11 @@ def _shell_commands(command: str, holes: Mapping[str, str]) -> List[List[Any]]:
 
     text = _JINJA.sub(hide, command[:_MAX_COMMAND])
     text = text.replace("\\\r\n", " ").replace("\\\n", " ")
-    text = _strip_comments(text)
     commands: List[List[Any]] = []
-    pending = ""
-    for line in text.split("\n"):
-        pending = line if not pending else pending + "\n" + line
-        words = _split_words(pending)
-        if words is None:  # a quote is open: the text goes on in the next line
+    for line in _logical_lines(text):
+        words = _split_words(line)
+        if words is None:
             continue
-        pending = ""
         current: List[Any] = []
         for raw in words:
             if raw and all(ch in _SHELL_PUNCTUATION for ch in raw):
@@ -1039,6 +1054,8 @@ def _application(words: Sequence[Any], start: int) -> Optional[Tuple[Any, List[A
             continue
         if word.endswith(".py"):
             return word, list(words[index + 1 :])
+        if expansion is not None and ("{{" in expansion or "{%" in expansion):
+            return expansion, list(words[index:])  # a template stands where the script goes
         return (
             Unresolved(
                 f"the spark-submit command names no Python script (the application is `{word}`)",
