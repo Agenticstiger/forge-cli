@@ -173,6 +173,10 @@ _SHORT_PASSWORD_BY_COMMAND = {
 }
 #: ``docker login -p``: the one use of ``-p`` in these commands that is a password.
 _LOGIN_COMMANDS = frozenset({("docker", "login"), ("podman", "login"), ("nerdctl", "login")})
+#: Oracle clients take ``user/password@service`` as a word (``sqlplus app/pw@db``) or as the value
+#: of ``userid=``.
+_ORACLE_COMMANDS = frozenset({"sqlplus", "sqlldr", "expdp", "impdp", "rman", "sqlcl"})
+_ORACLE_LOGIN = re.compile(r"([^/\s@=]+)/([^@\s/]+)(@\S*)?")
 #: Commands whose ``-P<value>``, with no space, is the password.
 _GLUED_UPPER_P_COMMANDS = frozenset({"bcp", "sqlcmd"})
 #: Commands whose ``-p<value>``, with no space, is the password.
@@ -359,6 +363,10 @@ class _Words:
             self._user_next = False
             if _is_user_credential(value, self.command):
                 return _mask_user(value)
+        if self.command in _ORACLE_COMMANDS:
+            login = self._oracle_login(value)
+            if login is not None:
+                return login
         if value.startswith("-H") and len(value) > 2 and not value.startswith("--"):
             glued = _HEADER.match(value[2:])  # ``curl -H"Authorization: token ..."``
             if glued:
@@ -383,6 +391,19 @@ class _Words:
         if any(c.isspace() for c in value):
             return self._multi_word(value)
         return _scan(value)
+
+    @staticmethod
+    def _oracle_login(value: str) -> Optional[str]:
+        """``user/password@service`` (or ``userid=user/password@service``) with the password
+        masked, or ``None`` when the word is not one."""
+        head, equals, rest = value.partition("=")
+        if equals and head.lower() == "userid":
+            masked = _Words._oracle_login(rest)
+            return f"{head}={masked}" if masked is not None else None
+        found = _ORACLE_LOGIN.fullmatch(value) if not value.startswith("-") else None
+        if found is None:
+            return None
+        return f"{found.group(1)}/{_REDACTED}{found.group(3) or ''}"
 
     def _header(self, match: "re.Match[str]") -> str:
         """``Name: value`` with the value masked when the header carries a credential."""

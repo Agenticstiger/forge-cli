@@ -870,6 +870,8 @@ _WORD = "hunter2" + "hunter2"
         f"azcopy copy 'https://a.blob.core.windows.net/c/f?sv=2022-11-02&sig={_WORD}' /tmp/x",
         f"curl https://host/api?key={_WORD}",
         f"curl 'https://host/api?x=1&code={_WORD}'",
+        f"sqlplus -S app/{_WORD}@db @script.sql",
+        f"sqlldr userid=app/{_WORD}@db control=load.ctl",
         f"curl https://storage.googleapis.com/b/o?X-Goog-Signature={_WORD}&X-Goog-Credential=x",
         "python -c 'import os; os.environ[" + '"PASS' + 'WORD"]="' + _WORD + "\"'",
     ],
@@ -887,6 +889,9 @@ def test_signatures_cookies_headers_and_keys_in_urls_are_masked(command):
         "curl 'https://h/api?limit=5&page=2' -o out.json",
         "docker run -p 8080:80 img",
         "x s3a://bucket/a@b/c https://host:8080/users/bob@example.com",
+        "sqlplus / as sysdba @script.sql",
+        "sqlplus -S app@db @script.sql",
+        "cp a/b /tmp/x && sqlplus -S @jobs/run.sql",
     ],
 )
 def test_headers_urls_and_flags_that_hold_no_credential_are_left_alone(command):
