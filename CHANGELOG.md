@@ -61,7 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PARQUET_VARIANT` (the Parquet VARIANT storage layout, a struct of metadata and value bytes)
   among its type names. The emitter passed unknown names through, so a column of that type
   wrote `type: parquet_variant` into a contract that `fluid validate` then rejected. It maps to
-  `variant`, as DuckDB's `UNION` already does.
+  `variant`, as DuckDB's `UNION` already does, and the schema-drift gate reads the two as one
+  type family, so a contract written that way does not fail at apply.
 
 ## [0.36.0] — 2026-11-19
 
