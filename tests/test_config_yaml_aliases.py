@@ -345,12 +345,24 @@ def _merge_laughs(depth: int, width: int = 9) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _sequence_merge_laughs(depth: int, width: int = 9) -> str:
+    """``depth`` levels in which each mapping repeats ``<<`` ``width`` times over the LIST that
+    holds the previous level's mapping, so what it merges is reached through an alias to a list
+    and not to the mapping itself (PyYAML takes a repeated ``<<`` key in one mapping)."""
+    lines = ["x-laughs:", "  l1: &l1 [{" + ", ".join(f"k{i}: v" for i in range(width)) + "}]"]
+    for level in range(2, depth + 1):
+        merges = ", ".join([f"<<: *l{level - 1}"] * width)
+        lines.append(f"  l{level}: &l{level} [{{{merges}}}]")
+    return "\n".join(lines) + "\n"
+
+
 # Each of these completes in well under a second on a loader without a budget,
 # so a refusal is what tells them apart.
 _BOMBS = {
     "aliases": _laughs(5),
     "merge-keys": _merge_laughs(6),
     "narrow-merge-keys": _merge_laughs(16, width=2),
+    "sequence-merge-keys": _sequence_merge_laughs(6),
 }
 
 
@@ -416,7 +428,11 @@ print(f"returned after {time.monotonic() - start:.3f}s")
 """
 
 
-@pytest.mark.parametrize("bomb", [_laughs, _merge_laughs], ids=["aliases", "merge-keys"])
+@pytest.mark.parametrize(
+    "bomb",
+    [_laughs, _merge_laughs, _sequence_merge_laughs],
+    ids=["aliases", "merge-keys", "sequence-merge-keys"],
+)
 @pytest.mark.parametrize(
     ("loader", "name"),
     [("config", "fluid.config.yaml"), ("market", "market.yaml")],
@@ -565,7 +581,8 @@ def _yaml_1_1_load(text: str):
 
 def _flatten_mapping_pyyaml_6_0_4(self, node):
     """PyYAML 6.0.4's ``SafeConstructor.flatten_mapping`` (lib/yaml/constructor.py, MIT), to
-    run the loader against a PyYAML that has it, whichever one is installed."""
+    run the loader against a PyYAML that has it, whichever one is installed. The loop is
+    PyYAML's own, line for line."""
     import yaml
     from yaml.constructor import ConstructorError
 
@@ -578,9 +595,11 @@ def _flatten_mapping_pyyaml_6_0_4(self, node):
             del node.value[index]
             if isinstance(value_node, yaml.MappingNode):
                 self.flatten_mapping(value_node)
-                sources = [value_node]
+                for pair in value_node.value:
+                    if (key_id := id(pair[0].value)) not in merge_key_ids:
+                        merge_key_ids.add(key_id)
+                        merge.append(pair)
             elif isinstance(value_node, yaml.SequenceNode):
-                sources = []
                 for subnode in value_node.value:
                     if not isinstance(subnode, yaml.MappingNode):
                         raise ConstructorError(
@@ -590,7 +609,10 @@ def _flatten_mapping_pyyaml_6_0_4(self, node):
                             subnode.start_mark,
                         )
                     self.flatten_mapping(subnode)
-                    sources.append(subnode)
+                    for pair in subnode.value:
+                        if (key_id := id(pair[0].value)) not in merge_key_ids:
+                            merge_key_ids.add(key_id)
+                            merge.append(pair)
             else:
                 raise ConstructorError(
                     "while constructing a mapping",
@@ -599,11 +621,6 @@ def _flatten_mapping_pyyaml_6_0_4(self, node):
                     % value_node.id,
                     value_node.start_mark,
                 )
-            for source in sources:
-                for pair in source.value:
-                    if (key_id := id(pair[0].value)) not in merge_key_ids:
-                        merge_key_ids.add(key_id)
-                        merge.append(pair)
         elif key_node.tag == "tag:yaml.org,2002:value":
             key_node.tag = "tag:yaml.org,2002:str"
             index += 1
@@ -626,6 +643,14 @@ def pyyaml(request, monkeypatch):
 
 
 _ORDER = "a: &a {timeout: 30}\nb: &b {timeout: 60}\nc: &c {timeout: 3}\nr:\n  <<: [*b, *a]\n"
+
+
+def test_two_merge_keys_in_one_mapping_and_an_equals_key_read_as_pyyaml_has_always_read_them():
+    from fluid_build.config_manager import load_config_file
+
+    two = "a: &a {timeout: 30}\nb: &b {timeout: 60}\nr:\n  <<: *a\n  <<: *b\n"
+    assert load_config_file(two, "f.yaml")["r"] == {"timeout": 60}  # the later merge key wins
+    assert load_config_file("r:\n  =: 1\n", "f.yaml") == {"r": {"=": 1}}  # ``=`` is a plain key
 
 
 def test_the_reference_reads_a_list_of_merges_first_mapping_first():
@@ -663,7 +688,7 @@ def test_merge_keys_mean_what_the_merge_type_says_whichever_pyyaml_copies_them(p
     assert loaded["blocks"]["b7"]["timeout"] == 30 and loaded["blocks"]["b7"]["own"] == 7
 
 
-@pytest.mark.parametrize("bomb", ["merge-keys", "narrow-merge-keys"])
+@pytest.mark.parametrize("bomb", ["merge-keys", "narrow-merge-keys", "sequence-merge-keys"])
 def test_merge_key_bombs_are_refused_whichever_pyyaml_copies_the_merge(pyyaml, bomb):
     import yaml
 
@@ -673,9 +698,15 @@ def test_merge_key_bombs_are_refused_whichever_pyyaml_copies_the_merge(pyyaml, b
         load_config_file(_BOMBS[bomb], "f.yaml")
 
 
-def test_a_depth_nine_merge_bomb_is_refused_on_pyyaml_6_0_4s_merge_copy(monkeypatch):
-    # In this process, which is safe only because 6.0.4's copy drops the duplicates: a loader
-    # that left the copy to PyYAML would see nothing to refuse there and return.
+@pytest.mark.parametrize(
+    "bomb",
+    [_merge_laughs(9), _sequence_merge_laughs(7)],
+    ids=["depth-9-merge-keys", "depth-7-sequence-merge-keys"],
+)
+def test_a_deep_merge_bomb_is_refused_on_pyyaml_6_0_4s_merge_copy(monkeypatch, bomb):
+    # In this process, which is safe only because 6.0.4's copy drops the duplicates (and the
+    # depth is kept where a miss costs seconds, not minutes): a loader that left the copy to
+    # PyYAML would see nothing to refuse there and return.
     import time
 
     import yaml
@@ -687,8 +718,18 @@ def test_a_depth_nine_merge_bomb_is_refused_on_pyyaml_6_0_4s_merge_copy(monkeypa
     )
     start = time.monotonic()
     with pytest.raises(yaml.YAMLError, match="excessive aliasing"):
-        load_config_file(_merge_laughs(9), "f.yaml")
+        load_config_file(bomb, "f.yaml")
     assert time.monotonic() - start < 5
+
+
+def test_a_merge_the_file_lists_inline_and_once_is_not_an_alias_decode():
+    # What the classification must not do: charge every merge as an alias. A wide mapping that
+    # merges a few inline mappings once each loads, however many keys they bring.
+    from fluid_build.config_manager import load_config_file
+
+    inline = ", ".join("{" + ", ".join(f"k{n}x{i}: v" for i in range(40)) + "}" for n in range(60))
+    loaded = load_config_file(f"wide:\n  <<: [{inline}]\n  own: 1\n", "f.yaml")
+    assert len(loaded["wide"]) == 60 * 40 + 1
 
 
 @pytest.mark.parametrize("layer", _LAYERS)
@@ -710,7 +751,14 @@ def test_the_config_loader_reads_every_shape_within_the_budget_as_the_merge_type
 
     for text in (_MERGES, _LEGIT, _ANCHORED, _laughs(3), "a: &a !!set {x, y}\nb: *a\n", ""):
         assert load_config_file(text, "f.yaml") == (_yaml_1_1_load(text) or {}), text[:60]
-    for bad in ("a:\n  <<: 1\n", "a:\n  <<: [1]\n", "a: *undefined\n"):
+    for bad in (
+        "a:\n  <<: 1\n",
+        "a:\n  <<: [1]\n",
+        "a: *undefined\n",
+        # two invalid merges in one list: the first listed is the one reported
+        "a0: &a0 {<<: [{<<: [1]}, {<<: 1}]}\n",
+        "a0: &a0 {<<: [{<<: 1}, {<<: [1]}]}\n",
+    ):
         with pytest.raises(yaml.YAMLError) as ours:
             load_config_file(bad, "f.yaml")
         with pytest.raises(yaml.YAMLError) as theirs:

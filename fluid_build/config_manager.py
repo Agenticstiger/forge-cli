@@ -344,8 +344,8 @@ class _BudgetedLoader(yaml.SafeLoader):
     so grow ninefold a level inside the loader, and :func:`without_aliases`
     only sees the few keys left once the duplicates collapse. Here each node
     the file writes is one decode, each pair a merge key copies is one more,
-    and an alias decode when the mapping it comes from is one an alias in the
-    file refers to; the budget is checked before the pairs are copied.
+    and an alias decode when what it copies is reached through an alias or was
+    copied before; the budget is checked before the pairs are copied.
 
     The copy is made here, not by ``SafeConstructor.flatten_mapping``, because
     PyYAML decides what a merge copies and has changed it. Up to 6.0.3 it
@@ -363,6 +363,7 @@ class _BudgetedLoader(yaml.SafeLoader):
         super().__init__(stream)
         self.budget = _AliasBudget(origin)
         self.aliased: Set[yaml.Node] = set()  # the nodes an alias in the file refers to
+        self.copied: Set[yaml.Node] = set()  # the mappings a merge key has copied from
 
     def compose_node(self, parent: Optional[yaml.Node], index: Any) -> Any:
         if self.check_event(yaml.AliasEvent):
@@ -379,9 +380,7 @@ class _BudgetedLoader(yaml.SafeLoader):
             key_node, value_node = node.value[index]
             if key_node.tag == _MERGE_TAG:
                 del node.value[index]
-                for source in self._merge_sources(node, value_node):
-                    self.flatten_mapping(source)
-                    self.budget.spend(len(source.value), aliased=source in self.aliased)
+                for source in self._flattened_merge_sources(node, value_node):
                     merge.extend(source.value)
             elif key_node.tag == _VALUE_TAG:
                 key_node.tag = "tag:yaml.org,2002:str"
@@ -391,33 +390,54 @@ class _BudgetedLoader(yaml.SafeLoader):
         if merge:
             node.value = merge + node.value
 
-    @staticmethod
-    def _merge_sources(node: yaml.MappingNode, value_node: yaml.Node) -> List[yaml.MappingNode]:
-        """The mappings a merge key names, in the order they are copied.
+    def _flattened_merge_sources(
+        self, node: yaml.MappingNode, value_node: yaml.Node
+    ) -> List[yaml.MappingNode]:
+        """The mappings a merge key names, flattened and charged, in the order they are copied.
+
+        Each one is flattened in the order the file lists it, and the budget is
+        spent on the pairs it will copy right then, before any pair is copied.
+        The pairs are alias decodes when the merge key names an alias (also an
+        alias to a list of mappings), when the mapping is listed through an
+        alias, and when it was copied before: a second copy is a repeated
+        occurrence, which is what an alias is.
 
         A list is copied last to first, so that a key in a mapping listed
         earlier overrides the same key in one listed later; the mapping's own
-        keys, which come after every copy, override them all. Errors are
-        PyYAML's, word for word.
+        keys, which come after every copy, override them all. What an invalid
+        merge value raises, and which invalid one is met first, are PyYAML
+        6.0.3's: the same messages, marks and order.
         """
         if isinstance(value_node, yaml.MappingNode):
-            return [value_node]
-        if isinstance(value_node, yaml.SequenceNode):
-            for subnode in value_node.value:
-                if not isinstance(subnode, yaml.MappingNode):
-                    raise yaml.constructor.ConstructorError(
-                        "while constructing a mapping",
-                        node.start_mark,
-                        "expected a mapping for merging, but found %s" % subnode.id,
-                        subnode.start_mark,
-                    )
-            return list(reversed(value_node.value))
-        raise yaml.constructor.ConstructorError(
-            "while constructing a mapping",
-            node.start_mark,
-            "expected a mapping or list of mappings for merging, but found %s" % value_node.id,
-            value_node.start_mark,
-        )
+            named = [value_node]
+        elif isinstance(value_node, yaml.SequenceNode):
+            named = list(value_node.value)
+        else:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "expected a mapping or list of mappings for merging, but found %s" % value_node.id,
+                value_node.start_mark,
+            )
+        via_alias = value_node in self.aliased
+        sources: List[yaml.MappingNode] = []
+        for subnode in named:
+            if not isinstance(subnode, yaml.MappingNode):
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "expected a mapping for merging, but found %s" % subnode.id,
+                    subnode.start_mark,
+                )
+            self.flatten_mapping(subnode)
+            self.budget.spend(
+                len(subnode.value),
+                aliased=via_alias or subnode in self.aliased or subnode in self.copied,
+            )
+            self.copied.add(subnode)
+            sources.append(subnode)
+        sources.reverse()
+        return sources
 
 
 class _Unaliasing:
