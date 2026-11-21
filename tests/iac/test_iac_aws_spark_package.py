@@ -95,6 +95,17 @@ def test_the_pinned_package_is_copied_beside_the_job_config(contract):
     assert post["condition"] == f'${{self.checksum_sha256 == "{B64}"}}'
 
 
+def test_a_new_digest_switches_in_order(contract):
+    """The new copy is made before the old one goes, and job.json names it only after it
+    exists: a run started during an apply never reads a config whose package is missing."""
+    resources, _ = emit(contract)
+    copied = resources["aws_s3_object_copy"][f"{KEY}_package"]
+    assert copied["lifecycle"]["create_before_destroy"] is True
+    config = resources["aws_s3_object"][f"{KEY}_config"]
+    assert config["depends_on"] == [f"aws_s3_object_copy.{KEY}_package"]
+    assert "depends_on" not in resources["aws_s3_object"][f"{KEY}_runner"]
+
+
 def test_the_job_config_names_the_digest_and_never_the_store(contract):
     resources, _ = emit(contract)
     text = resources["aws_s3_object"][f"{KEY}_config"]["content"]

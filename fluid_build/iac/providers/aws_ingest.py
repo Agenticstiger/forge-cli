@@ -678,10 +678,11 @@ def _emit_package(
 
     spec = _package.parse_package(_package.declared(build), b.runtime, b.where)
     source = f"s3://{spec.bucket}/{spec.key}"
+    name = f"{b.key}_package"
     _pinned_copy(
         blocks,
         b,
-        f"{b.key}_package",
+        name,
         source=(str(spec.bucket), str(spec.key)),
         bucket_ref=bucket_ref,
         key=names.package_key(b.ctx.product, b.build_id, spec.sha256),
@@ -693,6 +694,12 @@ def _emit_package(
         ),
         copied=f"The copy of {source} is not the pinned bytes (sha256 {spec.sha256}).",
     )
+    # A release switches in order: the new copy exists, then job.json names it, then the old
+    # copy goes. A run started at any point reads a job config whose package is there.
+    blocks.resources["aws_s3_object_copy"][name]["lifecycle"]["create_before_destroy"] = True
+    blocks.resources["aws_s3_object"][f"{b.key}_config"]["depends_on"] = [
+        f"aws_s3_object_copy.{name}"
+    ]
 
 
 def _job_content(
