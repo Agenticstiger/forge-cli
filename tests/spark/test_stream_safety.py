@@ -264,6 +264,21 @@ def test_a_table_dead_letter_append_stamps_its_query_and_batch(runner, contract,
     assert called(batch.calls, "append") == [((), {})]
 
 
+def test_a_table_dead_letter_append_carries_the_runs_stamps_beside_its_own(
+    runner, contract, functions
+):
+    sink, _spark, _table = table_sink(runner, contract, committed=[])
+    sink.stamps = {"fluid.product": "commerce.orders-stream", "fluid.run-id": "r-1"}
+    batch = Recorder([])
+    sink.to_table(batch, 7)
+    stamped = dict(args for args, _ in called(batch.calls, "option"))
+    assert stamped["snapshot-property.fluid.dead-letter.query"] == "4d8f6a2e-query"
+    assert stamped["snapshot-property.fluid.dead-letter.batch"] == "7"
+    assert stamped["snapshot-property.fluid.product"] == "commerce.orders-stream"
+    assert stamped["snapshot-property.fluid.run-id"] == "r-1"
+    assert called(batch.calls, "append") == [((), {})]
+
+
 def test_a_batch_already_committed_is_not_appended_again(runner, contract, functions):
     sink, spark, _ = table_sink(runner, contract, committed=[object()])
     batch = Recorder([])
