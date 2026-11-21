@@ -250,6 +250,12 @@ class DesiredRun:
     contract_digest: Optional[str] = field(default=None, compare=False)
     release_id: Optional[str] = field(default=None, compare=False)
     run_id: Optional[str] = field(default=None, compare=False)
+    #: Stamped the same way: the bundle the verified plan binds (its ``bundleDigest``, the
+    #: ``identity.bundle.manifest_digest`` of the sealed release), and the job and run of the
+    #: scheduler that started ``fluid apply`` (Airflow's DAG id and run id).
+    bundle_digest: Optional[str] = field(default=None, compare=False)
+    scheduler_job: Optional[str] = field(default=None, compare=False)
+    scheduler_run_id: Optional[str] = field(default=None, compare=False)
 
     @property
     def long_running(self) -> bool:
@@ -330,14 +336,18 @@ class DesiredRun:
 
     def stamp_args(self) -> List[str]:
         """The flags the runner stamps on each commit (:data:`STAMP_VALUE`'s values only), for
-        each of the version, contract digest, release and run this run has. They are not in the
-        config hash, so a stream that is already running keeps the ones it was started with."""
+        each of the version, contract digest, bundle, release, run and scheduler run this run
+        has. They are not in the config hash, so a stream that is already running keeps the
+        ones it was started with."""
         args: List[str] = []
         for flag, value in (
             ("--fluid-product-version", self.product_version),
             ("--fluid-contract-digest", self.contract_digest),
+            ("--fluid-bundle-digest", self.bundle_digest),
             ("--fluid-release-id", self.release_id),
             ("--fluid-run-id", self.run_id),
+            ("--fluid-scheduler-job", self.scheduler_job),
+            ("--fluid-scheduler-run-id", self.scheduler_run_id),
         ):
             if value:
                 args += [flag, value]
@@ -869,8 +879,11 @@ def _stamp_fields(
     return {
         "product_version": _product_version(contract, build),
         "contract_digest": given.get("contract_digest"),
+        "bundle_digest": given.get("bundle_digest"),
         "release_id": given.get("release_id"),
         "run_id": given.get("run_id"),
+        "scheduler_job": given.get("scheduler_job"),
+        "scheduler_run_id": given.get("scheduler_run_id"),
     }
 
 
@@ -917,21 +930,60 @@ def _contract_digest(contract: Mapping[str, Any]) -> Optional[str]:
         return None
 
 
+def _made_safe(value: Optional[str]) -> Optional[str]:
+    """``value`` as a stamp can hold it, or None when nothing is left: what a stamp may not hold
+    becomes ``_``, what is not a letter or a digit is cut from its start (so it is never read
+    as an option), and it is cut to 256 characters."""
+    safe = re.sub(r"^[^A-Za-z0-9]+", "", re.sub(r"[^A-Za-z0-9._:+@/=~-]", "_", value or ""))
+    return safe[:256] or None
+
+
+def _scheduler_stamps(env: Mapping[str, str]) -> Dict[str, str]:
+    """The job and run of the scheduler that started ``fluid apply`` (``run_id.scheduler_run``:
+    ``FLUID_SCHEDULER_*``, else Airflow's task context), made safe like the run id: a value a
+    scheduler chose never refuses a scheduled run or the keepalive."""
+    from fluid_build.observability.run_id import scheduler_run
+
+    found = scheduler_run(env)
+    if found is None:
+        return {}
+    pairs = (
+        ("scheduler_job", _made_safe(found.job)),
+        ("scheduler_run_id", _made_safe(found.run_id)),
+    )
+    return {key: value for key, value in pairs if value}
+
+
+def _bundle_stamp(bundle_digest: Any) -> Dict[str, str]:
+    """The ``bundleDigest`` of the plan ``fluid apply`` verified, when a stamp can hold it; a
+    plan that names a bundle no stamp can hold is left unstamped, with a warning."""
+    if bundle_digest is None or bundle_digest == "":
+        return {}
+    if isinstance(bundle_digest, str) and STAMP_VALUE.fullmatch(bundle_digest):
+        return {"bundle_digest": bundle_digest}
+    logging.getLogger(__name__).warning(
+        "the plan's bundleDigest is not a digest a stamp may hold: the commits carry no bundle"
+    )
+    return {}
+
+
 def run_stamps(
     contract: Mapping[str, Any],
     *,
     run_id: Optional[str] = None,
     environ: Optional[Mapping[str, str]] = None,
     refuse_release: bool = True,
+    bundle_digest: Any = None,
 ) -> Dict[str, str]:
     """What ``fluid apply`` hands the runner of each run it starts, besides what the job config
     says: the digest of ``contract`` as loaded (before ``{{ env.* }}`` is resolved, so no
     environment value is in what it hashes; a contract no JSON can hold is left unstamped, with
-    a warning), the pipeline's ``run_id`` (anything a stamp may not hold becomes ``_`` and what
-    is not a letter or a digit is cut from its start: an operator's own ``FLUID_RUN_ID`` never
-    refuses a deploy) and the release :data:`RELEASE_ID_ENV` names. A release a stamp may not
-    hold refuses the deploy (``refuse_release``); the keepalive, which nobody is watching,
-    leaves it off with a warning, so a label cannot stop a dead stream from being restarted.
+    a warning), the ``bundle_digest`` of the plan it verified, the pipeline's ``run_id`` (made
+    safe, :func:`_made_safe`: an operator's own ``FLUID_RUN_ID`` never refuses a deploy), the
+    release :data:`RELEASE_ID_ENV` names and the scheduler's job and run, when a scheduler
+    started it. A release a stamp may not hold refuses the deploy (``refuse_release``); the
+    keepalive, which nobody is watching, leaves it off with a warning, so a label cannot stop a
+    dead stream from being restarted.
 
     Raises:
         ValueError: :data:`RELEASE_ID_ENV` holds a character a stamp may not, and
@@ -942,9 +994,11 @@ def run_stamps(
     digest = _contract_digest(contract)
     if digest:
         stamps["contract_digest"] = digest
-    safe_id = re.sub(r"^[^A-Za-z0-9]+", "", re.sub(r"[^A-Za-z0-9._:+@/=~-]", "_", run_id or ""))
+    stamps.update(_bundle_stamp(bundle_digest))
+    safe_id = _made_safe(run_id)
     if safe_id:
-        stamps["run_id"] = safe_id[:256]
+        stamps["run_id"] = safe_id
+    stamps.update(_scheduler_stamps(env))
     release = (env.get(RELEASE_ID_ENV) or "").strip()
     if release and STAMP_VALUE.fullmatch(release):
         stamps["release_id"] = release

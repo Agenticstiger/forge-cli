@@ -27,12 +27,23 @@ from .test_stream_safety import Recorder, called
 DIGEST = "sha256:" + "ab" * 32
 RELEASE = "sha256:" + "cd" * 32
 AIRFLOW_RUN = "scheduled__2026-11-21T00:00:00+00:00"
+BUNDLE = "sha256:" + "ef" * 32
+DAG = "commerce.orders-stream__ingest-orders"
+#: Every flag ``main`` reads into a stamp, by its argparse name.
+STAMP_NAMES = (
+    "product_version",
+    "contract_digest",
+    "bundle_digest",
+    "release_id",
+    "run_id",
+    "scheduler_job",
+    "scheduler_run_id",
+)
 
 
 def flags(**given):
     """The namespace ``main`` builds from the command line: a flag not given is ``None``."""
-    names = ("product_version", "contract_digest", "release_id", "run_id")
-    return types.SimpleNamespace(**{f"fluid_{n}": given.get(n) for n in names})
+    return types.SimpleNamespace(**{f"fluid_{n}": given.get(n) for n in STAMP_NAMES})
 
 
 class Session:
@@ -75,8 +86,11 @@ def everything(**given):
     return {
         "product_version": "1.4.0",
         "contract_digest": DIGEST,
+        "bundle_digest": BUNDLE,
         "release_id": RELEASE,
-        "run_id": AIRFLOW_RUN,
+        "run_id": "3f9a3f9a3f9a",
+        "scheduler_job": DAG,
+        "scheduler_run_id": AIRFLOW_RUN,
         **given,
     }
 
@@ -93,8 +107,11 @@ def test_a_run_is_stamped_with_what_it_is(runner, contract):
         "fluid.job-sha256": runner.config_digest(text),
         "fluid.product-version": "1.4.0",
         "fluid.contract-digest": DIGEST,
+        "fluid.bundle-digest": BUNDLE,
         "fluid.release-id": RELEASE,
-        "fluid.run-id": AIRFLOW_RUN,
+        "fluid.run-id": "3f9a3f9a3f9a",
+        "fluid.scheduler-job": DAG,
+        "fluid.scheduler-run-id": AIRFLOW_RUN,
     }
 
 
@@ -119,7 +136,7 @@ def test_the_stamp_keys_are_lower_case_and_never_one_of_icebergs_own(runner):
     assert not owned & set(keys)  # a stream's option keys are lower-cased: no key collides
 
 
-@pytest.mark.parametrize("name", ["product_version", "contract_digest", "release_id", "run_id"])
+@pytest.mark.parametrize("name", STAMP_NAMES)
 @pytest.mark.parametrize(
     "value",
     [
@@ -226,7 +243,8 @@ def test_the_jobs_spark_conf_holds_the_stamps_too(runner, contract, monkeypatch)
     _calls, session, stamps = stamped_run(runner, contract, monkeypatch)
     for key, value in stamps.items():
         assert session.values[f"spark.{key}"] == value
-    assert session.values["spark.fluid.run-id"] == AIRFLOW_RUN
+    assert session.values["spark.fluid.scheduler-run-id"] == AIRFLOW_RUN
+    assert session.values["spark.fluid.bundle-digest"] == BUNDLE
 
 
 def test_a_spark_conf_that_is_refused_does_not_stop_the_run(runner, contract, monkeypatch, capsys):
@@ -257,7 +275,9 @@ def test_the_start_line_names_the_stamps_and_nothing_secret(runner, contract, mo
         json.loads(line) for line in capsys.readouterr().out.splitlines() if '"start"' in line
     )
     assert start["stamps"]["fluid.release-id"] == RELEASE
-    assert start["stamps"]["fluid.run-id"] == AIRFLOW_RUN
+    assert start["stamps"]["fluid.run-id"] == "3f9a3f9a3f9a"
+    assert start["stamps"]["fluid.scheduler-job"] == DAG
+    assert start["stamps"]["fluid.scheduler-run-id"] == AIRFLOW_RUN
 
 
 def test_a_run_without_stamps_writes_what_it_always_wrote(runner, contract, monkeypatch):
@@ -299,13 +319,19 @@ def test_the_flags_fluid_apply_passes_become_stamps(runner, contract, monkeypatc
     argv = [
         "--fluid-product-version", "1.4.0",
         "--fluid-contract-digest", DIGEST,
+        "--fluid-bundle-digest", BUNDLE,
         "--fluid-release-id", RELEASE,
-        "--fluid-run-id", AIRFLOW_RUN,
+        "--fluid-run-id", "3f9a3f9a3f9a",
+        "--fluid-scheduler-job", DAG,
+        "--fluid-scheduler-run-id", AIRFLOW_RUN,
         "--JOB_NAME", "glue-owns-this",
     ]  # fmt: skip
     code, seen, text = main_with(runner, monkeypatch, contract, argv)
     assert code == 0 and len(seen) == 1
-    assert seen[0]["fluid.run-id"] == AIRFLOW_RUN
+    assert seen[0]["fluid.run-id"] == "3f9a3f9a3f9a"
+    assert seen[0]["fluid.bundle-digest"] == BUNDLE
+    assert seen[0]["fluid.scheduler-job"] == DAG
+    assert seen[0]["fluid.scheduler-run-id"] == AIRFLOW_RUN
     assert seen[0]["fluid.contract-digest"] == DIGEST
     assert seen[0]["fluid.job-sha256"] == runner.config_digest(text)
 
