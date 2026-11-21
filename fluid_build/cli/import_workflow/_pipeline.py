@@ -263,45 +263,72 @@ def _drop_tasks(contract: Dict[str, Any]) -> bool:
     return dropped
 
 
-def _check_valid(contracts: Sequence[Dict[str, Any]], report: ImportReport) -> None:
-    """Refuse, before anything is written, a proposal ``fluid validate`` does not accept: the
-    schema and every contract rule it runs (:func:`validate_loaded_contract`), so what this writes
-    is what the command reads back without an error.
+#: ``fluid validate`` findings listed one by one in the report; the rest are counted.
+MAX_RULE_LINES = 100
 
-    One exception: the DAG tasks recorded under a build are what the schema's own task rules are
-    strictest about (they key on the operator's name). A proposal that is valid without them is
-    kept without them, and the report says so.
+
+def _check_valid(contracts: Sequence[Dict[str, Any]], report: ImportReport) -> None:
+    """Refuse, before anything is written, a proposal the schema does not accept, and report what
+    ``fluid validate``'s contract rules find in the rest.
+
+    A schema error is a bug in the importer or a value in the conventions: nothing is written. A
+    rule finding is not always one: a Databricks or Snowflake binding asks for columns, a schema or
+    a warehouse that no code holds, so the contract is written and the report says what
+    ``fluid validate`` will ask a person for (one product in a directory of hundreds must not
+    stop the other ones).
+
+    One exception to the first: the DAG tasks recorded under a build are what the schema's own task
+    rules are strictest about (they key on the operator's name). A proposal that is valid without
+    them is kept without them, and the report says so.
     """
-    from fluid_build.cli.validate import validate_loaded_contract
+    from fluid_build.cli.validate import contract_rule_findings
     from fluid_build.schema_manager import FluidSchemaManager
 
-    # One schema manager for every product, and no plugin validators (they are the project's own
-    # rules about blocks this command never writes, and finding them costs ~0.1 s a contract).
-    manager = FluidSchemaManager()
+    manager = FluidSchemaManager()  # one for every product
 
-    def check(contract: Dict[str, Any]) -> Any:
-        return validate_loaded_contract(contract, manager=manager, plugins=False)
+    def schema(contract: Dict[str, Any]) -> Any:
+        return manager.validate_contract(
+            contract, schema_version=contract["fluidVersion"], offline_only=True
+        )
 
+    listed = more = 0
     for contract in contracts:
-        result = check(contract)
-        if result.is_valid:
-            continue
-        errors = "; ".join(result.errors)
-        if _drop_tasks(contract):
-            retry = check(contract)
-            if retry.is_valid:
-                report.unsupported.append(
-                    f"{contract['id']}: the DAG tasks are not recorded on its builds, because the "
-                    f"schema refuses them ({safe_text(errors, 200)})"
+        result = schema(contract)
+        if not result.is_valid:
+            errors = "; ".join(result.errors)
+            if _drop_tasks(contract):
+                retry = schema(contract)
+                if retry.is_valid:
+                    report.unsupported.append(
+                        f"{contract['id']}: the DAG tasks are not recorded on its builds, because "
+                        f"the schema refuses them ({safe_text(errors, 200)})"
+                    )
+                    result = retry
+                else:
+                    errors = "; ".join(retry.errors)
+            if not result.is_valid:
+                raise refusal(
+                    f"the proposal for {safe_text(contract['id'], 80)} is not a valid contract",
+                    safe_text(errors, 600),
+                    "This is a bug in the importer or a value in the conventions the schema "
+                    "refuses: check the conventions file, or report it with the DAG or job that "
+                    "causes it.",
+                    product=safe_text(contract["id"], 120),
                 )
+        # no plugin validators: they are the project's own rules about blocks this command never
+        # writes, and finding them costs about 0.1 s a contract
+        for message in contract_rule_findings(contract, manager=manager, plugins=False).errors:
+            if listed >= MAX_RULE_LINES:
+                more += 1
                 continue
-            errors = "; ".join(retry.errors)
-        raise refusal(
-            f"the proposal for {safe_text(contract['id'], 80)} is not a valid contract",
-            safe_text(errors, 600),
-            "This is a bug in the importer or a value in the conventions the schema refuses: "
-            "check the conventions file, or report it with the DAG or job that causes it.",
-            product=safe_text(contract["id"], 120),
+            listed += 1
+            report.required_defaults.append(
+                f"{safe_text(contract['id'], 120)}: `fluid validate` reports an error until a "
+                f"person completes it: {safe_text(message, 400)}"
+            )
+    if more:
+        report.required_defaults.append(
+            f"{more} more `fluid validate` finding(s) on these products are not listed"
         )
 
 
