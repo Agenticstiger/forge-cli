@@ -213,3 +213,60 @@ def test_the_binding_enums_come_from_the_bundled_schema():
         "parquet",
         "kafka_topic",
     } <= formats
+
+
+# ── what the file may point at, and what its patterns are matched against ──
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'script_roots: {"s3://c/": ../jobs}',
+        'script_roots: {"s3://c/": /etc}',
+        'script_roots: {"s3://c/": "jobs/../../x"}',
+        "config_modules: [{module: m.settings, path: ../libs/settings.py}]",
+        "config_modules: [{module: m.settings, path: /opt/libs/settings.py}]",
+    ],
+)
+def test_a_path_that_leaves_the_directory_of_the_file_is_refused(tmp_path, text):
+    folder = tmp_path / "conf"
+    folder.mkdir()
+    with pytest.raises(FluidUserError) as refused:
+        C.load_conventions(write(folder, text))
+    assert "leaves the directory of the conventions file" in refused.value.why
+    assert refused.value.extras == {"conventions": "conventions.yaml"}
+
+
+def test_a_link_that_points_out_of_the_directory_is_refused(tmp_path):
+    folder = tmp_path / "conf"
+    folder.mkdir()
+    (tmp_path / "elsewhere").mkdir()
+    (folder / "jobs").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(FluidUserError) as refused:
+        C.load_conventions(write(folder, 'script_roots: {"s3://c/": jobs}'))
+    assert "leaves the directory" in refused.value.why
+
+
+def test_paths_inside_the_directory_are_kept(tmp_path):
+    (tmp_path / "libs").mkdir()
+    conv = C.load_conventions(
+        write(
+            tmp_path,
+            """
+            script_roots: {"s3://c/": jobs, "s3://d/": "./deep/er/../jobs"}
+            config_modules: [{module: m.settings, path: libs/settings.py}]
+            """,
+        )
+    )
+    root = tmp_path.resolve()
+    assert dict(conv.script_roots) == {"s3://c/": root / "jobs", "s3://d/": root / "deep" / "jobs"}
+    assert conv.config_modules == {"m.settings": root / "libs" / "settings.py"}
+
+
+def test_an_ignore_pattern_is_matched_against_a_bounded_text():
+    conv = C.Conventions(ignore_tables=(C.re.compile("b$"),), ignore_paths=(C.re.compile("b$"),))
+    long = "a" * (C.MAX_SUBJECT + 40) + "b"
+    assert not conv.ignores_table([long])
+    assert not conv.ignores_path(long)
+    assert conv.ignores_table(["a" * 10 + "b"]) and conv.ignores_path("a" * 10 + "b")
+    assert not conv.ignores_table([])

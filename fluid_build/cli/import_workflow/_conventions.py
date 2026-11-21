@@ -45,7 +45,13 @@ be silently ignored), and a size cap and the alias limits of
       files: ["jobs/legacy/*"]         # globs, relative to the scanned directory
     products: {id: "{database}.{table}"}   # how a product id is made
 
-Every key is optional. A path in the file is relative to the file.
+Every key is optional. A path in the file is relative to the file and stays inside the file's
+directory: a path that leaves it (``..``, an absolute path, a link that points out) is refused,
+so a conventions file cannot make the scan read a file from somewhere else.
+
+The file is the operator's own, and is trusted as input to the tool: its regular expressions
+are compiled as written (a pattern that backtracks badly is the operator's to avoid), and the
+text each is matched against is cut at 256 characters.
 """
 
 from __future__ import annotations
@@ -64,6 +70,8 @@ MAX_BYTES = 256 * 1024
 MAX_ENTRIES = 500
 MAX_TEXT = 500
 MAX_PATTERN = 200
+#: Longest text an ``ignore`` pattern is matched against: a table or path name from the code.
+MAX_SUBJECT = 256
 
 _TOP_KEYS = frozenset(
     {
@@ -144,11 +152,14 @@ class Conventions:
     id_template: str = "{database}.{table}"
 
     def ignores_table(self, parts: Sequence[str]) -> bool:
-        dotted = ".".join(parts)
-        return any(p.search(dotted) or p.search(parts[-1]) for p in self.ignore_tables if parts)
+        if not parts:
+            return False
+        dotted, last = ".".join(parts)[:MAX_SUBJECT], parts[-1][:MAX_SUBJECT]
+        return any(p.search(dotted) or p.search(last) for p in self.ignore_tables)
 
     def ignores_path(self, path: str) -> bool:
-        return any(p.search(path) for p in self.ignore_paths)
+        subject = path[:MAX_SUBJECT]
+        return any(p.search(subject) for p in self.ignore_paths)
 
 
 def _fail(path: Optional[Path], where: str, why: str) -> ConventionsError:
@@ -246,8 +257,21 @@ def _pattern(value: Any, path: Optional[Path], where: str) -> "re.Pattern[str]":
 
 
 def _local(base: Path, value: Any, path: Optional[Path], where: str) -> Path:
+    """A path in the file: relative to the file's directory, and inside it."""
     text = _text(value, path, where)
-    return (base / text).resolve()
+    try:
+        root = base.resolve()
+        resolved = (base / text).resolve()
+    except (OSError, RuntimeError) as exc:  # a link loop
+        raise _fail(path, where, f"{text!r} cannot be resolved ({type(exc).__name__})") from None
+    if resolved != root and root not in resolved.parents:
+        raise _fail(
+            path,
+            where,
+            f"{text!r} leaves the directory of the conventions file: keep what the scan reads "
+            "inside it",
+        )
+    return resolved
 
 
 def _template(value: Any, path: Optional[Path], where: str) -> str:
