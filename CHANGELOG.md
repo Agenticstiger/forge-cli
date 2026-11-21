@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid datamesh-manager status` shows where a migration's products stand in Entropy Data.**
+  `status products/` takes contract files, globs and folders as `publish` and `promote` do, reads
+  Entropy's product list once and reports each product the contracts declare as `active`, `draft`,
+  `deprecated`, `retired`, `unknown` (listed with no status) or `missing`, with `active N of M`.
+  It is read-only: it sends nothing but that one read. A contract that cannot be read, or declares
+  no id, is a row of its own (`unreadable`, `unnamed`) instead of ending the report. `--format
+  json` prints the rows and the summary; `--strict` exits 1 unless every product is active, for a
+  migration that is not finished until they all are. A product list that cannot be read is an
+  error, never a report that every product is missing. A product is looked up under the id forge
+  publishes it under; one Entropy holds only as written (its ids are case-sensitive) is reported
+  as missing, and the report says so. A status from the server is cut and cleaned to plain
+  characters before it is printed (one that spells like a word of the tool's own, such as
+  `missing`, shows as `status-missing`), and an id or a path is printed on one line whatever a
+  contract holds.
+
 - **`fluid diff --baseline` reports a changed product id, and `--fail-on-id-change` fails on it.**
   The changelog gains a breaking `product_id_changed` change, first in the report: the id is the
   product's identity, so a contract whose id differs from the baseline's describes another
@@ -99,6 +114,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--impact` report.
 
 ### Fixed
+
+- **Entropy Data's product list is read whole or not at all.** A page after the first that was
+  not a list (a rate-limit answer, say) used to hand back the pages before it as if they were
+  every product the server holds, and an answer that was not JSON was a bare `ValueError`. Both
+  are a typed provider error now, for every command that reads the list.
 
 - **`fluid` reads a config file's merge keys the same on every PyYAML release.** PyYAML 6.0.4
   changed how it copies the pairs of a merge key (`<<: *name`, `<<: [*a, *b]`): it skips a pair
