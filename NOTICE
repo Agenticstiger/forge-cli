@@ -28,6 +28,15 @@ PyYAML 6.0.3 (lib/yaml/constructor.py, SafeConstructor.flatten_mapping), adapted
 PyYAML is MIT licensed: Copyright (c) 2017-2021 Ingy döt Net, Copyright
 (c) 2006-2016 Kirill Simonov. The permission notice is kept with the code.
 
+The discrete Gaussian sampler (fluid_build/profiler/dp/discrete_gaussian.py) is
+adapted from discretegauss.py of https://github.com/IBM/discrete-gaussian-differential-privacy
+at commit cb190d2a990a78eff6e21159203bc888e095f01b, the reference implementation
+of Canonne, Kamath and Steinke, "The discrete Gaussian for differential privacy"
+(NeurIPS 2020), under the Apache License 2.0. Its file header names Thomas
+Steinke (2020) as the author; the repository's LICENSE names no other holder.
+Only the exact sampling part is ported, with the randomness drawn from a seeded
+source and explicit checks in place of assertions.
+
 The JSON Schemas of the Bitol Open Data Contract Standard (ODCS) vendored under
 fluid_build/providers/odcs/ (odcs-schema-v3.1.0.json, odcs-schema-v3.2.0.json) are
 published by the Bitol project under the Apache License 2.0.
