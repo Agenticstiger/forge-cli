@@ -739,7 +739,9 @@ _COMMAND_ENRICHMENT: dict[str, tuple[str, str]] = {
             "  fluid diff contract.fluid.yaml\n"
             "  fluid diff contract.fluid.yaml --env prod\n"
             "  fluid diff contract.fluid.yaml --exit-on-drift   # CI/CD gate\n"
-            "  fluid diff contract.fluid.yaml --out drift.json"
+            "  fluid diff contract.fluid.yaml --out drift.json\n"
+            "  fluid diff new.fluid.yaml --baseline old.fluid.yaml --fail-on-id-change   "
+            "# migration: the product id must stay"
         ),
     ),
     "doctor": (

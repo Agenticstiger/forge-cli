@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from fluid_build.iac.drift import StateDriftReport
 
     from ..api.changelog import ContractValidationError
-    from ..api.changelog_types import ChangelogReport
+    from ..api.changelog_types import Change, ChangelogReport
     from ._diff_live import LiveDriftReport
 
 COMMAND = "diff"
@@ -65,7 +65,8 @@ def register(subparsers: argparse._SubParsersAction):
             "(drift) apart from what the next apply will change (pending); "
             "(2) version diff — when --baseline is set, compares the positional "
             "contract (new) against the baseline contract (old) for breaking-"
-            "change classification. The two modes are mutually exclusive."
+            "change classification; --fail-on-id-change fails when the product "
+            "id differs between the two. The two modes are mutually exclusive."
         ),
     )
     p.add_argument("contract", help="contract.fluid.yaml (new version when --baseline is set)")
@@ -169,6 +170,18 @@ def register(subparsers: argparse._SubParsersAction):
         help=(
             "Version-diff mode only: exit with code 1 if any breaking change "
             "is detected. Use in CI to gate on contract version compatibility."
+        ),
+    )
+    p.add_argument(
+        "--fail-on-id-change",
+        action="store_true",
+        help=(
+            "Version-diff mode only: exit with code 1 (product_id_changed) if the contract's "
+            "product id differs from the baseline's, once the report is printed and written to "
+            "--out (stdout holds the report, then the error). A new id is another product, not "
+            "a new version of the old one, so this guards a migration while every other change "
+            "stays free. --fail-on-breaking also fails on an id change, as on any breaking "
+            "change, but without this message"
         ),
     )
     p.add_argument(
@@ -809,8 +822,16 @@ def _run_version_diff(args, logger: logging.Logger) -> int:
     change was detected. A contract that is not schema-valid exits 2 (diff(1)'s
     "trouble") before anything is printed or written, so it never reads as 0
     (no changes) or 1 (breaking).
+
+    A product id that differs between the two contracts is a breaking change
+    like any other. ``--fail-on-id-change`` fails on it alone, with the typed
+    ``product_id_changed`` error (exit 1), so a migration can require the id to
+    stay while every other change is free. The report is printed and written
+    first, as the drift mode does for its own failures, so the error comes with
+    the full list of changes.
     """
     from ..api.changelog import ContractValidationError, compare_contracts
+    from ..api.changelog_types import KIND_PRODUCT_ID_CHANGED
 
     if getattr(args, "env", None):
         # Environment overlays are a drift-mode concept (they shape the
@@ -872,6 +893,10 @@ def _run_version_diff(args, logger: logging.Logger) -> int:
                 exc, {"baseline": baseline_path, "new": new_path}, logger
             ) from exc
         span.set_attribute("fluid.diff.breaking_count", len(report.breaking))
+        span.set_attribute(
+            "fluid.diff.product_id_changed",
+            any(c.kind == KIND_PRODUCT_ID_CHANGED for c in report.breaking),
+        )
         span.set_attribute("fluid.diff.non_breaking_count", len(report.non_breaking))
         span.set_attribute("fluid.diff.info_count", len(report.info))
 
@@ -902,9 +927,31 @@ def _run_version_diff(args, logger: logging.Logger) -> int:
         out=args.out,
     )
 
+    renamed = next((c for c in safe.breaking if c.kind == KIND_PRODUCT_ID_CHANGED), None)
+    if renamed is not None and getattr(args, "fail_on_id_change", False):
+        raise _product_id_changed_error(renamed, args.out)
     if getattr(args, "fail_on_breaking", False) and report.has_breaking:
         return 1
     return 0
+
+
+def _product_id_changed_error(change: "Change", out: str) -> CLIError:
+    """``product_id_changed``: the two contracts describe two products, not two versions of one.
+
+    ``change`` is the redacted entry of the safe report, so the ids in the
+    message are as safe to print as the report itself.
+    """
+    return CLIError(
+        1,
+        "product_id_changed",
+        {
+            "message": (
+                f"the contract's id is {change.after!r} but the baseline's is {change.before!r}. "
+                "A new id is another product, not a new version of the old one"
+            ),
+            "out": out,
+        },
+    )
 
 
 def _safe_report(report: ChangelogReport) -> ChangelogReport:

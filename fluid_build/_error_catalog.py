@@ -325,6 +325,26 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ["Re-create the bundle with 'fluid bundle' — it has no contract entry"],
         None,
     ),
+    # ── diff ───────────────────────────────────────────────────────────────
+    "product_id_changed": (
+        [
+            (
+                "If the id changed by mistake, set it back to the baseline's value: the id is "
+                "the product's identity, so the contract then stays the same product"
+            ),
+            (
+                "A new id is a second product: the old catalog entry stays, apply state and run "
+                "cursors start over, and a consumes[].productId that names the old id keeps "
+                "pointing at it"
+            ),
+            (
+                "If the rename is intended, run 'fluid diff <contract> --baseline <baseline>' "
+                "without --fail-on-id-change, then update every consumes[].productId that names "
+                "the old id and retire the old catalog entry"
+            ),
+        ],
+        None,
+    ),
     # ── plan / apply ───────────────────────────────────────────────────────
     "planner_failed": (
         ["Run 'fluid validate <contract>' first to rule out a contract problem"],

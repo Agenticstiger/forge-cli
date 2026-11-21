@@ -526,18 +526,10 @@ def build_impact(
     JSON (``None``: ``plan_reason`` says why there is none).
     """
     base_ids, new_ids = _expose_ids(baseline), _expose_ids(new)
+    # A changed product id is in the changelog (``diff_identity``), first among the
+    # breaking changes, so a reader's ``consumes[]`` entry that names the old id
+    # is reported with the rest.
     changes = [(c, _change_expose(c, base_ids, new_ids)) for c in _all_changes(report)]
-    if baseline.get("id") != new.get("id"):
-        # A consumes[] entry names a product by its id; the changelog does not compare it.
-        renamed = Change(
-            path="id",
-            kind="product_id_changed",
-            severity="breaking",
-            description=f"product id {baseline.get('id')} is now {new.get('id')}",
-            before=baseline.get("id"),
-            after=new.get("id"),
-        )
-        changes.insert(0, (renamed, None))
 
     targets, partitions = _bindings(baseline, new)
     grants = _grants(baseline, new)
