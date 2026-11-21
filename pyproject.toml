@@ -1008,6 +1008,7 @@ module = [
     "fluid_build.profiler.defaults",
     "fluid_build.profiler.disclosure",
     "fluid_build.profiler.document",
+    "fluid_build.profiler.request",
     "fluid_build.profiler.runner",
     "fluid_build.profiler.sources",
     "fluid_build.cli.profile_cmd",

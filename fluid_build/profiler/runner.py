@@ -39,7 +39,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fluid_build.policy._common import iter_exposes
 from fluid_build.profiler import defaults, disclosure, document, sources
@@ -54,6 +54,9 @@ from fluid_build.profiler._stats import (
     MeasuredStatistic,
     MeasureRefused,
     MetricDefinition,
+    Request,
+    RequestColumn,
+    RequestTable,
     StatisticDefinition,
     StatisticsBackend,
 )
@@ -252,6 +255,8 @@ class ProfileResult:
     relationships: Tuple[RelationshipResult, ...] = ()
     #: Each declared relationship not counted: the child, the relationship, and why.
     relationships_left_out: Tuple[Tuple[str, str, str], ...] = ()
+    #: Answering a request: each listed item the profile does not hold, and why.
+    not_measured: Tuple[Tuple[str, str], ...] = ()
 
 
 def _base_type(type_name: Any) -> str:
@@ -352,8 +357,11 @@ def _column(
     fractional_bits: int,
     declares_mean: bool = False,
     withhold: FrozenSet[str] = frozenset(),
+    asked: Optional[RequestColumn] = None,
 ) -> Dict[str, Any]:
     """One column of the table: its domain, then its checked metrics and statistics.
+
+    *asked* is the request's entry for the column: only the metrics and the ``mean/1`` it lists.
 
     *declares_mean* says the fidelity block declares an ungrouped ``mean`` of this
     column: that statistic replaces the fixed ``mean/1``, which is not formed.
@@ -365,11 +373,20 @@ def _column(
     ]
     entry: Dict[str, Any] = {
         "domain": column.domain,
-        "metrics": _column_metrics(column, read, row_count, backend, rule, tally, withhold),
+        "metrics": _column_metrics(
+            column,
+            read,
+            row_count,
+            backend,
+            rule,
+            tally,
+            withhold,
+            None if asked is None else frozenset(asked.metrics),
+        ),
     }
     statistics = (
         []
-        if declares_mean
+        if declares_mean or (asked is not None and "mean/1" not in asked.statistics)
         else _column_statistics(column, read, backend, rule, tally, fractional_bits)
     )
     if statistics:
@@ -385,8 +402,11 @@ def _column_metrics(
     rule: disclosure.DisclosureRule,
     tally: "Counter[str]",
     withhold: FrozenSet[str] = frozenset(),
+    listed: Optional[FrozenSet[str]] = None,
 ) -> Dict[str, Any]:
     """The checked ``metrics`` object of one column, from its values as read.
+
+    A request's *listed* metrics are the only ones formed.
 
     A metric *withhold* names is withheld under ``D`` whatever its value and its own
     check, so its status says nothing about the records either.
@@ -400,7 +420,7 @@ def _column_metrics(
     metrics: Dict[str, Any] = {}
     for name in _METRICS:
         metric = available.get(name)
-        if metric is None:
+        if metric is None or (listed is not None and name not in listed):
             continue
         levels = DEFAULT_QUANTILE_LEVELS if name == "quantiles" else ()
         value = metric.measure(read, levels)
@@ -561,6 +581,7 @@ def profile_exposes(
     producer: Optional[str] = None,
     fractional_bits: Optional[int] = None,
     bundles: Optional[Mapping[str, BundleBlock]] = None,
+    request: Optional[Request] = None,
 ) -> ProfileResult:
     """Profile each of *exposes* of *contract*, each from its own source, into one document.
 
@@ -570,7 +591,32 @@ def profile_exposes(
     block, on the block's grid (:func:`_declared_block`), and the blocks of one
     document declare one grid. Every expose's plan and block is checked before any
     record is read, and each expose's records are read once.
+
+    With a *request* the profile measures what it lists and nothing else
+    (:mod:`fluid_build.profiler.request`); its grid is the profile's.
     """
+    if request is not None:
+        from fluid_build.profiler import request as asked_for
+
+        if bundles:
+            raise ProfileError(
+                "profile_request_with_bundle",
+                "a request and a bundle both say what the profile answers",
+                {"read": "nothing: no record was read", "next": "give one of them"},
+            )
+        if fractional_bits is not None and fractional_bits != request.fractional_bits:
+            raise ProfileError(
+                "profile_request_fractional_bits_conflict",
+                f"--fractional-bits {fractional_bits} differs from the request's "
+                f"encoding.fractionalBits {request.fractional_bits}",
+                {
+                    "read": "nothing: no record was read",
+                    "next": "drop --fractional-bits: the request's grid is the profile's",
+                },
+            )
+        fractional_bits = request.fractional_bits
+        asked_for.check_tables(request, contract)
+        asked_for.check_sources(request, [each.expose_id for each in exposes])
     if fractional_bits is not None:
         document.check_fractional_bits(fractional_bits)
     if not exposes:
@@ -579,6 +625,11 @@ def profile_exposes(
         )
     _refuse_repeated(exposes)
     plans = [_plan_with_columns(contract, each.expose_id) for each in exposes]
+    asked: Dict[str, RequestTable] = {}
+    if request is not None:
+        for each in request.tables:
+            asked[each.expose_id] = each
+        plans = [asked_for.restrict_plan(plan, asked[plan.expose_id]) for plan in plans]
     blocks = bundles or {}
     declared: List[Optional[DeclaredBlock]] = []
     grids: Dict[str, int] = {}
@@ -591,13 +642,23 @@ def profile_exposes(
             grids[plan.expose_id] = grid
     fractional_bits = _one_grid(grids, blocks, fractional_bits)
     uncovered: List[Tuple[Tuple[str, str], ...]] = [() for _ in plans]
-    relationships, relationships_left_out = _declared_relationships(contract, plans, blocks)
+    matched: Set[int] = set()
+    wanted = None
+    if request is not None:
+        wanted, matched = asked_for.relationship_filter(request)
+    relationships, relationships_left_out = _declared_relationships(contract, plans, blocks, wanted)
     held = _relationship_keys(relationships)
+    unfiltered: Dict[str, Optional[DeclaredBlock]] = {}
     for position, plan in enumerate(plans):
         if plan.expose_id not in blocks:
             declared[position], uncovered[position] = _default_block(
                 contract, plan, backend, fractional_bits, held.get(plan.expose_id, frozenset())
             )
+            if request is not None:
+                unfiltered[plan.expose_id] = declared[position]
+                declared[position] = asked_for.filter_block(
+                    declared[position], asked[plan.expose_id]
+                )
     edges = {
         plan.expose_id: _edge_counted(found) for plan, found in zip(plans, declared, strict=True)
     }
@@ -627,14 +688,36 @@ def profile_exposes(
             tallies,
             fractional_bits,
             keys.get(plan.expose_id, frozenset()),
+            asked.get(plan.expose_id),
         )
         tables_doc[plan.expose_id] = table_doc
-        results.append(replace(result, uncovered=missing))
+        # A request lists what it asks, so what the defaults leave out is told per listed item.
+        results.append(
+            replace(result, uncovered=(), left_out=())
+            if request is not None
+            else replace(result, uncovered=missing)
+        )
     by_expose = {plan.expose_id: (plan, read) for plan, read in zip(plans, reads, strict=True)}
     counted = [
         _children_per_parent(each, by_expose, backend, rule, tallies, fractional_bits)
         for each in relationships
     ]
+    unanswered: Tuple[Tuple[str, str], ...] = ()
+    if request is not None:
+        unanswered = tuple(
+            asked_for.not_measured(
+                request,
+                tables=tables_doc,
+                defaults=unfiltered,
+                uncovered={
+                    plan.expose_id: dict(missing)
+                    for plan, missing in zip(plans, uncovered, strict=True)
+                },
+                keys=keys,
+                matched=matched,
+                metric_names=frozenset(_METRICS),
+            )
+        )
     if producer is None:
         from fluid_build import __version__
 
@@ -661,6 +744,7 @@ def profile_exposes(
         fractional_bits=fractional_bits,
         relationships=tuple(result for _, result in counted),
         relationships_left_out=tuple(relationships_left_out),
+        not_measured=unanswered,
     )
 
 
@@ -702,8 +786,11 @@ def _declared_relationships(
     contract: Mapping[str, Any],
     plans: Sequence[ExposePlan],
     blocks: Mapping[str, BundleBlock],
+    wanted: Optional[Callable[[str, str, Tuple[str, ...], Tuple[str, ...]], bool]] = None,
 ) -> Tuple[List[Relationship], List[Tuple[str, str, str]]]:
     """The ``semantics.relationships`` this profile counts children per parent for.
+
+    With *wanted* (a request's test) only the declared relationships it accepts are considered.
 
     A relationship is counted when the profile reads both its exposes, without a bundle
     (a bundle's profile answers its block alone), and both keys are columns it reads in
@@ -731,6 +818,10 @@ def _declared_relationships(
             name, target = str(raw.get("name") or "?"), raw.get("to")
             child_columns = _column_names(raw.get("fromColumns"))
             parent_columns = _column_names(raw.get("toColumns"))
+            if wanted is not None and not wanted(
+                plan.expose_id, str(target), child_columns, parent_columns
+            ):
+                continue
             reason: Optional[str] = None
             if not isinstance(target, str) or target not in planned:
                 reason = "its target is not profiled in this call: profile both exposes together"
@@ -1071,6 +1162,7 @@ def _profile_table(
     tallies: Tuple["Counter[str]", "Counter[str]"],
     fractional_bits: int,
     keys: FrozenSet[str] = frozenset(),
+    asked: Optional[RequestTable] = None,
 ) -> Tuple[Dict[str, Any], TableResult]:
     """One table of the document, from one read of its records, and its summary.
 
@@ -1094,6 +1186,7 @@ def _profile_table(
             column.name in replaced,
             (frozenset({"distinctCount"}) if column.name in counted else frozenset())
             | (_BINNED_WITHHELD if column.name in binned else frozenset()),
+            None if asked is None else asked.column(column.name),
         )
         for column in plan.columns
     }
@@ -1105,7 +1198,9 @@ def _profile_table(
             )
         )
     table_doc: Dict[str, Any] = {"columns": columns_doc}
-    row_count = _row_count(read.row_count, rule, tally)
+    row_count = (
+        _row_count(read.row_count, rule, tally) if asked is None or asked.row_count else None
+    )
     if row_count is not None:
         table_doc["rowCount"] = row_count
     all_published, none_published, some_published = _statistic_summaries(columns_doc)

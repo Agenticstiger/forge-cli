@@ -267,3 +267,10 @@ class FakeBackend:
 
     def canonicalise(self, value: Any, *, name: str) -> Any:
         return value
+
+    def read_request(self, text: str, *, name: str) -> Any:
+        return self._real().read_request(text, name=name)
+
+    def contract_digest(self, text: str, *, name: str) -> str:
+        digest: str = self._real().contract_digest(text, name=name)
+        return digest

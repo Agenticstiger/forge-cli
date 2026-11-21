@@ -1,0 +1,59 @@
+fluidVersion: 0.7.7
+kind: DataProduct
+id: shop.orders
+name: Shop orders
+exposes:
+  - exposeId: customers
+    kind: table
+    contract:
+      schema:
+        - name: customer_id
+          type: int
+          required: true
+        - name: region
+          type: enum('north', 'south', 'west')
+    semantics:
+      entities:
+        - name: customer
+          type: primary
+          expr: customer_id
+  - exposeId: orders
+    kind: table
+    contract:
+      schema:
+        - name: order_id
+          type: int
+          required: true
+        - name: customer_id
+          type: int
+        - name: status
+          type: enum('open', 'paid', 'void')
+        - name: quantity
+          type: int
+          validationRules:
+            - type: range
+              constraint: ">= 0 and <= 100"
+        - name: units
+          type: int
+        - name: amount
+          type: decimal(10,2)
+        - name: placed_at
+          type: timestamp
+        - name: paid
+          type: boolean
+        - name: note
+          type: string
+      invariants:
+        - id: quantity_not_above_units
+          rule: quantity <= units
+    semantics:
+      entities:
+        - name: order
+          type: primary
+          expr: order_id
+      relationships:
+        - name: placed_by
+          to: customers
+          fromColumns: [customer_id]
+          toColumns: [customer_id]
+          cardinality: many_to_one

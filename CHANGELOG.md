@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid profile --request FILE` answers a FLUX profile request.** The request is the list of
+  statistics, column metrics and relationships `fluxsim init --contract` writes for a contract, and
+  the profile measures what it lists and nothing else, under the same output checks: per listed
+  table only the listed columns, metrics and statistics (the contract's default statistics,
+  ungrouped), the row count only when asked, and children per parent only for a listed relationship
+  the contract declares. Each listed item the profile cannot answer is named in the report as
+  `Not measured`, with its reason (for example a histogram over a number with no declared range, or
+  quantiles beside a histogram on one set of bins); fact shares are not measured yet. The request's
+  grid is the profile's. Refused before any record is read, each with its own event code: a request
+  beside `--bundle`, `--env` or `--expose`, a stage-1 bundle archive as the contract, a request file
+  that is not a regular file, is too large, is not UTF-8 or that flux-stats refuses, a contract digest
+  that is not the contract file's (run `fluxsim init` again), a table, column or domain the contract
+  and profile do not share, a `--fractional-bits` that differs from the request's, and a listed table
+  with no `--source` or a `--source` for one the request does not list.
+
 - **`fluid profile` profiles boolean columns.** A column typed `boolean`, `bool` or `bit` is read as
   the category `false` or `true`, as flux-stats reads one, so it has `count`, `nullCount` and
   `distinctCount` like any category column. Without `--bundle` it also gets a `levelHistogram/1` over
