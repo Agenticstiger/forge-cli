@@ -611,6 +611,7 @@ def _execute_spark_build(
     running. A local run (``runtime: local``) keeps its state in ``workspace``, the
     source contract's directory."""
     from fluid_build._errors import FluidUserError
+    from fluid_build.observability.run_id import get_or_create_run_id
 
     from .spark._local import LocalHost
     from .spark._reconcile import run_build
@@ -624,6 +625,8 @@ def _execute_spark_build(
             dry_run=dry_run,
             say=lambda text: cprint(f"   {text}", markup=False),
             local_host=LocalHost(Path(workspace)) if workspace is not None else None,
+            # the pipeline's run id, as apply, plan and verify read it: stamped on each commit
+            run_id=get_or_create_run_id(),
         )
     except FluidUserError as exc:
         _print_typed_error(exc)

@@ -46,6 +46,12 @@ _MAX_STREAMING_ATTEMPTS_PER_HOUR = 10
 RESTART_WINDOW_S = 3600.0
 #: The runner argument that marks a run started again after another one died.
 RESTART_FLAG = "--fluid-restart-of"
+#: Names the release a deploy belongs to (a tag, a build number, a release's identity digest):
+#: the runner stamps it on every commit as ``fluid.release-id`` when set.
+RELEASE_ID_ENV = "FLUID_RELEASE_ID"
+#: What the runner accepts as a stamp's value (``forge_spark_runner._STAMP_VALUE``; a test
+#: checks the two agree): an identifier, a version, a digest or an orchestrator's run id.
+STAMP_VALUE = re.compile(r"[A-Za-z0-9._:+@/=~-]{1,256}")
 
 # EMR 7.x paths and the Maven coordinates the runner's docstring lists (Spark 3.5).
 _EMR_ICEBERG_JAR = "/usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar"
@@ -232,6 +238,15 @@ class DesiredRun:
     #: The sha256 of the job config the run's runtime reads, once ``fluid apply`` has read
     #: it back (or written it, for a local run): the runner refuses any other config.
     job_sha256: Optional[str] = field(default=None, compare=False)
+    #: What the runner stamps on each Iceberg commit beside the product, build and job config
+    #: digest: the version of the build's output, the contract's digest, the release the deploy
+    #: names and the pipeline's run id (``--fluid-*``). They are sent as runner arguments,
+    #: never in the job config, the Spark configuration or the plan: a contract edit that does
+    #: not change the job, or a new run id, must not change the config hash and restart a stream.
+    product_version: Optional[str] = field(default=None, compare=False)
+    contract_digest: Optional[str] = field(default=None, compare=False)
+    release_id: Optional[str] = field(default=None, compare=False)
+    run_id: Optional[str] = field(default=None, compare=False)
 
     @property
     def long_running(self) -> bool:
@@ -305,8 +320,23 @@ class DesiredRun:
         args = ["--config", self.job_uri, *self.identity_args()]
         if self.job_sha256:
             args += ["--fluid-job-sha256", self.job_sha256]
+        args += self.stamp_args()
         if restart_of:
             args += [RESTART_FLAG, restart_of]
+        return args
+
+    def stamp_args(self) -> List[str]:
+        """The flags the runner stamps on each commit (:data:`STAMP_VALUE`'s values only), for
+        each of the version, contract digest, release and run this run has."""
+        args: List[str] = []
+        for flag, value in (
+            ("--fluid-product-version", self.product_version),
+            ("--fluid-contract-digest", self.contract_digest),
+            ("--fluid-release-id", self.release_id),
+            ("--fluid-run-id", self.run_id),
+        ):
+            if value:
+                args += [flag, value]
         return args
 
     def config_matches(self, body: bytes) -> bool:
@@ -692,12 +722,16 @@ def desired_runs(
     build_id: Optional[str] = None,
     environ: Optional[Mapping[str, str]] = None,
     policy: bool = True,
+    stamps: Optional[Mapping[str, str]] = None,
 ) -> List[DesiredRun]:
     """Each Spark build's :class:`DesiredRun`, in contract order (``build_id``: just that one).
 
     ``account`` binds the runs to that AWS account; when None, a name that needs one (a
     bucketless output, a role forge creates) holds :data:`ACCOUNT_TOKEN` until the run is
     started, so planning needs no credentials. The config hash never depends on it.
+    ``stamps`` (:func:`run_stamps`) is what the runner stamps on each commit besides the
+    product, build and job config: it never reaches the config hash, the plan or the
+    Spark configuration.
 
     Raises:
         ValueError: a build forge cannot compile, or two builds with one id.
@@ -816,9 +850,63 @@ def desired_runs(
                 topic=source.get("topic") if isinstance(source, Mapping) else None,
                 restarts_per_hour=restart_budget(build, scheduled),
                 job_text=job.text,
+                product_version=_product_version(contract, build),
+                contract_digest=(stamps or {}).get("contract_digest"),
+                release_id=(stamps or {}).get("release_id"),
+                run_id=(stamps or {}).get("run_id"),
             )
         )
     return [run.bind(account) for run in runs] if account else runs
+
+
+def _product_version(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Optional[str]:
+    """The version of the first output of ``build`` that declares one (an expose's ``version``,
+    a semver), or None."""
+    exposes = {
+        e.get("exposeId"): e for e in contract.get("exposes") or [] if isinstance(e, Mapping)
+    }
+    for output in build.get("outputs") or []:
+        version = (exposes.get(output) or {}).get("version")
+        if isinstance(version, str) and STAMP_VALUE.fullmatch(version.strip()):
+            return version.strip()
+    return None
+
+
+def run_stamps(
+    contract: Mapping[str, Any],
+    *,
+    run_id: Optional[str] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Dict[str, str]:
+    """What ``fluid apply`` hands the runner of each run it starts, besides what the job config
+    says: the digest of ``contract`` as loaded (before ``{{ env.* }}`` is resolved, so no
+    environment value is in what it hashes), the pipeline's ``run_id`` (anything a stamp may
+    not hold becomes ``_``: an operator's own ``FLUID_RUN_ID`` never refuses a deploy) and the
+    release :data:`RELEASE_ID_ENV` names. A contract that cannot be hashed is left unstamped.
+
+    Raises:
+        ValueError: :data:`RELEASE_ID_ENV` holds a character a stamp may not.
+    """
+    from fluid_build.forge.core.plan_digest import compute_contract_digest
+
+    env = os.environ if environ is None else environ
+    stamps: Dict[str, str] = {}
+    try:
+        stamps["contract_digest"] = compute_contract_digest(contract)
+    except (TypeError, ValueError, RecursionError):
+        pass  # a value no digest can hold: the commits carry the rest
+    if run_id:
+        stamps["run_id"] = re.sub(r"[^A-Za-z0-9._:+@/=~-]", "_", run_id)[:256]
+    release = (env.get(RELEASE_ID_ENV) or "").strip()
+    if release:
+        if not STAMP_VALUE.fullmatch(release):
+            raise ValueError(
+                f"{RELEASE_ID_ENV} {release[:60]!r} is not an identifier, a version, a digest or "
+                "a run id (letters, digits and . _ : + @ / = ~ -, at most 256 characters); "
+                "nothing was started"
+            )
+        stamps["release_id"] = release
+    return stamps
 
 
 def plan_actions(contract: Mapping[str, Any], **kwargs: Any) -> List[Dict[str, Any]]:
