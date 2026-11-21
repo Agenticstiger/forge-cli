@@ -156,6 +156,11 @@ def py_str_literal(value: Any) -> str:
 _CONTROL_OR_LINE_BREAK = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
 
+#: An encoding declaration (PEP 263): ``coding:`` or ``coding=`` in a comment on the first
+#: or second line of a file names the codec the interpreter decodes the whole file with.
+_CODING_COOKIE = re.compile(r"coding(?=[:=])")
+
+
 def py_comment_text(value: Any) -> str:
     """Return ``value`` as one line of text for a ``#`` comment in generated source.
 
@@ -164,8 +169,14 @@ def py_comment_text(value: Any) -> str:
     datamodel-code-generator's comment escaping handled LF but not CR
     (CVE-2026-54621). Every control character and line separator becomes a
     space here; anything else is kept as written, so ``orders`` stays ``orders``.
+
+    A ``coding:`` or ``coding=`` is spelled ``coding :`` or ``coding =``: on line 1 or 2 of a
+    file it declares the encoding the whole file is decoded with, and a value that chooses UTF-7
+    can carry a quote or a newline past every other escape as plain ASCII. Generated files
+    keep contract text off those two lines as well; this keeps a value harmless wherever it lands.
     """
-    return _CONTROL_OR_LINE_BREAK.sub(" ", "" if value is None else str(value))
+    text = _CONTROL_OR_LINE_BREAK.sub(" ", "" if value is None else str(value))
+    return _CODING_COOKIE.sub("coding ", text)
 
 
 def unique_identifiers(names: Iterable[Any]) -> List[str]:

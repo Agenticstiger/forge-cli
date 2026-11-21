@@ -44,6 +44,7 @@ def register(subparsers: argparse._SubParsersAction):
           vector                 Compile a contract to a pgvector embeddings target
                                  (DDL + RAG manifest for the ai-embeddable columns)
           flink                  Compile preview managed Flink SQL and operator resources
+          pyspark-schema         Generate a PySpark StructType module for each output port
           artifacts              Stage-3 fanout: bundle → ODCS, Bitol ODPS,
                                  LF/ODPI ODPS v4.1, schedule, policies
 
@@ -83,6 +84,7 @@ Examples:
         generate_dbt_tests,
         generate_flink,
         generate_iac,
+        generate_pyspark_schema,
         generate_schedule,
         generate_speed_transformation,
         generate_standard,
@@ -98,6 +100,7 @@ Examples:
     generate_iac.register_subcommand(sub)
     generate_vector.register_subcommand(sub)
     generate_flink.register_subcommand(sub)
+    generate_pyspark_schema.register_subcommand(sub)
 
     # Default handler (backward compat: no subcommand → transformation)
     p.set_defaults(cmd=COMMAND, func=run)
@@ -150,6 +153,11 @@ def run(args: Any, logger: logging.Logger) -> int:
 
         return generate_vector.run(args, logger)
 
+    if sub == "pyspark-schema":
+        from . import generate_pyspark_schema
+
+        return generate_pyspark_schema.run(args, logger)
+
     # No subcommand specified — default to speed-transformation.
     if sub is None:
         # Check if user passed --list
@@ -170,6 +178,7 @@ def run(args: Any, logger: logging.Logger) -> int:
         )
         cprint("  iac                    Compile a contract to an OpenTofu .tf.json module")
         cprint("  vector                 Compile a contract to a pgvector embeddings target")
+        cprint("  pyspark-schema         Generate a PySpark StructType module for each output port")
         cprint("")
         cprint("Examples:")
         cprint("  fluid generate transformation")
