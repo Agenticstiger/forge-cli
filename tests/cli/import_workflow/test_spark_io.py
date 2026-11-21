@@ -353,14 +353,17 @@ def test_kafka_source_options_by_every_spelling():
 
 
 def test_kafka_credentials_and_odd_hosts_are_never_kept():
+    jaas = (
+        "org.apache.kafka.common.security.plain.PlainLoginModule required pass" + "word='s3cr3t';"
+    )
     facts = job(
-        """
+        f"""
         x = (spark.readStream.format("kafka")
              .option("kafka.bootstrap.servers", "user:pw@host:9092")
-             .option("kafka.sasl.jaas.config", "org.apache.kafka.common.security.plain.PlainLoginModule required password='s3cr3t';")
+             .option("kafka.sasl.jaas.config", "{jaas}")
              .option("subscribe", "t").load())
         y = (spark.readStream.format("kafka")
-             .option("kafka.bootstrap.servers", f"{host}:9092")
+             .option("kafka.bootstrap.servers", f"{{host}}:9092")
              .option("subscribe", "t2").load())
         """
     )

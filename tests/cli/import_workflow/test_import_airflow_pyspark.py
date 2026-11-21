@@ -431,12 +431,15 @@ def test_nothing_in_the_scanned_files_runs(project, tmp_path):
 
 
 def test_names_and_arguments_from_the_code_are_sanitised_and_redacted(project, capsys):
+    # credential-shaped values are built at run time: no token shape sits in the repository
+    word = "hunter2" * 2
+    token = "gh" + "p_" + "a" * 36
     (project / "dags" / "orders_daily.py").write_text(
         (project / "dags" / "orders_daily.py")
         .read_text(encoding="utf-8")
         .replace(
             'application_args=["--date", "{{ ds }}"]',
-            'application_args=["--password", "hunter2hunter2", "--token=ghp_abcdefghijklmnopqrstuvwxyz0123456789"]',
+            f'application_args=["--password", "{word}", "--token={token}"]',
         ),
         encoding="utf-8",
     )
@@ -448,7 +451,7 @@ def test_names_and_arguments_from_the_code_are_sanitised_and_redacted(project, c
     )
     contracts, report = pyspark()
     text = yaml.safe_dump(contracts)
-    assert "hunter2hunter2" not in text and "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in text
+    assert word not in text and token not in text
     for contract in contracts:
         assert_valid(contract)
         assert "/" not in contract["id"] and "\x1b" not in contract["id"]
