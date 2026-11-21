@@ -30,13 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   config modules, environment names, owners, layers, what to ignore, the product id rule); it is
   read strictly and no code in it runs. `--registry` reads a written topic's columns through the
   existing schema-registry importer, only when asked. Every proposal is validated against the
-  schema before anything is written, credential-shaped arguments are masked, and a second import
-  never replaces a file that differs from what it would write unless `--force` is given. The
-  reading is bounded: a file with more than 50,000 `{` characters is not parsed (CPython parses a
-  long f-string in time that grows with the square of its fields), a scan reads at most 64 MB of
-  source and keeps a few MB of it parsed at once, the work spent folding one name is capped, and a
-  script path in a DAG file is judged on its text (no `..`, not absolute) before any file is looked
-  at. Product, expose and build ids are unique whatever the names look like, two jobs with one file
+  schema before anything is written, credentials in command lines and argument lists are masked
+  word by word (`NAME=value`, `--password`, `-uUSER:PASS`, `mysql -pSECRET`, a header, `bash -c`),
+  the `user:password@` of a data path or a host never reaches an id, a file name or a binding, and
+  a second import never replaces a file that differs from what it would write unless `--force` is
+  given. The reading is bounded: a file over 300 KB, or with more than 50,000 `{` characters (in
+  the encoding Python reads it in: CPython parses a long f-string in time that grows with the
+  square of its fields), is not parsed; one import reads at most 64 MB of source and keeps at most
+  200,000 syntax-tree nodes parsed at once; the work spent folding a name and the size of a string
+  are capped; the same SQL is parsed once; one proposal holds at most 50,000 outputs, 10,000
+  products and 100,000 reads between its products, each product listing at most 500; and a script
+  path in a DAG file is judged on its text (no `..`, not absolute) before any file is looked at.
+  Product, expose and build ids are unique whatever the names look like, two jobs with one file
   name are two products, and what the reader cannot follow (a reader variable assigned twice, a
   task group in a dependency, a placeholder in SQL that is not an f-string) is said in the report.
 

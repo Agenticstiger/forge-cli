@@ -58,6 +58,9 @@ DEFAULT_SESSION_NAMES = frozenset({"spark", "session", "spark_session", "sparkSe
 #: Reads, and writes, kept for one job file: a job has tens, and a file of nothing but ``.table(...)``
 #: calls is not one.
 MAX_REFS_PER_JOB = 5_000
+#: Notes kept for one job file: a file whose every ``spark.sql`` takes a name that is not a
+#: constant has one per call, and a person reads a few.
+MAX_NOTES_PER_JOB = 200
 
 #: Formats whose writes and reads are not data we keep: nothing persistent is behind them.
 _NON_PERSISTENT = frozenset({"console", "memory", "noop", "foreach", "rate", "socket"})
@@ -1035,6 +1038,9 @@ class _Reader:
             )
         facts.reads = _unique(facts.reads)
         facts.writes = _unique(facts.writes)
+        if len(facts.notes) > MAX_NOTES_PER_JOB:
+            more = len(facts.notes) - MAX_NOTES_PER_JOB
+            facts.notes = [*facts.notes[:MAX_NOTES_PER_JOB], f"{self.file}: and {more} more notes"]
         if facts.has_io:
             facts.is_spark = True
 

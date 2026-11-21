@@ -876,3 +876,10 @@ def test_a_path_with_a_credential_in_it_is_kept_without_it():
     )
     assert reads(facts) == [("path", "s3a://inbucket/raw/orders")]
     assert writes(facts) == [("path", "gs://b/x/token=REDACTED/y"), ("table", "db.name")]
+
+
+def test_a_file_whose_every_statement_is_a_note_keeps_a_few_and_counts_the_rest():
+    lines = "\n".join(f"spark.sql(build({i}))" for i in range(500))
+    facts = job("spark = SparkSession.builder.getOrCreate()\n" + lines + "\n")
+    assert len(facts.notes) == 201
+    assert facts.notes[-1] == "job.py: and 300 more notes"
