@@ -16,35 +16,14 @@ A task whose script is not readable here is listed in the report with how to mak
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import ClassVar
 
-from . import _pipeline
-from .registry import Importer, ImportReport
+from ._pipeline import CodeImporter
 
 TOOL = "airflow"
 
 
 @dataclass
-class AirflowImporter(Importer):
+class AirflowImporter(CodeImporter):
+    tool: ClassVar[str] = TOOL
     name: str = TOOL
-    #: A proposal is completed by hand, so a second import never replaces an edited file
-    #: (``--force`` does).
-    guards_overwrite: bool = True
-
-    def can_import(self, source: str) -> bool:
-        return Path(source).is_dir()
-
-    def import_to_contracts(
-        self, source: str, *, options: Optional[Dict[str, Any]] = None
-    ) -> tuple[List[Dict[str, Any]], ImportReport]:
-        return _pipeline.run_import(TOOL, source, options or {})
-
-    def import_to_contract(
-        self, source: str, *, options: Optional[Dict[str, Any]] = None
-    ) -> tuple[Dict[str, Any], ImportReport]:
-        """The single-contract protocol: everything in one product (``project`` boundary)."""
-        merged = dict(options or {})
-        merged["split_by"] = "project"
-        contracts, report = self.import_to_contracts(source, options=merged)
-        return (contracts[0] if contracts else {}), report

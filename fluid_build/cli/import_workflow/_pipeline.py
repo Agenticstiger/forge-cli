@@ -11,15 +11,45 @@ when ``--registry`` is given.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ._conventions import Conventions, load_conventions
 from ._proposal import SPLITS, ProposalTooLarge, TopicSchema, build_proposal, safe_text
 from ._scan import DagScan, JobScan, LinkedTask, link_tasks, scan_dags, scan_jobs
-from .registry import ImportReport
+from .registry import Importer, ImportReport
 
 DOC = "https://agenticstiger.github.io/forge_docs/cli/import.html"
+
+
+@dataclass
+class CodeImporter(Importer):
+    """What ``fluid import airflow`` and ``fluid import pyspark`` share: they read a directory,
+    propose products with :func:`run_import`, and never replace a proposal a person has edited
+    (``--force`` does)."""
+
+    #: The tool name ``run_import`` is called with.
+    tool: ClassVar[str] = ""
+    name: str = ""
+    guards_overwrite: bool = True
+
+    def can_import(self, source: str) -> bool:
+        return Path(source).is_dir()
+
+    def import_to_contracts(
+        self, source: str, *, options: Optional[Dict[str, Any]] = None
+    ) -> Tuple[List[Dict[str, Any]], ImportReport]:
+        return run_import(self.tool, source, options or {})
+
+    def import_to_contract(
+        self, source: str, *, options: Optional[Dict[str, Any]] = None
+    ) -> Tuple[Dict[str, Any], ImportReport]:
+        """The single-contract protocol: everything in one product (``project`` boundary)."""
+        merged = dict(options or {})
+        merged["split_by"] = "project"
+        contracts, report = self.import_to_contracts(source, options=merged)
+        return (contracts[0] if contracts else {}), report
 
 
 def refusal(what: str, why: str, fix: str, **extras: Any) -> Exception:
