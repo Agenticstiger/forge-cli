@@ -153,7 +153,8 @@ def test_a_slack_webhook_is_masked_whole(kind):
 
 # --- a Google API key -----------------------------------------------------------------
 
-GOOGLE_KEY = "AIza" + "Sy" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6q"
+GOOGLE_BODY = "Sy" + "C" * 33
+GOOGLE_KEY = "AIza" + GOOGLE_BODY
 
 
 @pytest.mark.parametrize(
@@ -169,4 +170,4 @@ GOOGLE_KEY = "AIza" + "Sy" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6q"
 )
 def test_a_google_api_key_is_masked_wherever_it_stands(text):
     for out in (redact_secret_text(text), twin(text)):
-        assert "A1b2C3d4" not in out and MASK in out
+        assert GOOGLE_BODY[:8] not in out and MASK in out
