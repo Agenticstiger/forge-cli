@@ -32,12 +32,15 @@ from __future__ import annotations
 import ast
 import posixpath
 import re
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from ._pysource import (
+    MAX_CACHED_BYTES,
     Module,
+    SourceBudget,
     SourceFile,
     SourceUnreadable,
     parse_module,
@@ -454,9 +457,14 @@ class ModuleIndex:
     ) -> None:
         self.variables: Mapping[str, str] = dict(variables or {})
         self._dotted: Dict[str, List[SourceFile]] = {}
-        self._modules: Dict[str, Optional[Module]] = {}
+        #: Parsed modules, least recently used first, at most ``MAX_CACHED_BYTES`` of source
+        #: between them: a scan of thousands of files keeps a few, not all, in memory.
+        self._modules: "OrderedDict[str, Module]" = OrderedDict()
+        self._cached_bytes = 0
         self._folders: Dict[str, "Folder"] = {}
         self.unreadable: Dict[str, str] = {}
+        #: What this scan has read, in all: every read of a source file counts against it.
+        self.budget = SourceBudget()
         for source in files:
             parts = source.rel[: -len(".py")].split("/")
             if parts[-1] == "__init__":
@@ -468,17 +476,30 @@ class ModuleIndex:
 
     def load(self, source: SourceFile) -> Optional[Module]:
         """The parsed module, or ``None`` (the reason is in ``unreadable``)."""
-        if source.rel in self._modules:
-            return self._modules[source.rel]
-        module: Optional[Module] = None
+        if source.rel in self.unreadable:
+            return None
+        cached = self._modules.get(source.rel)
+        if cached is not None:
+            self._modules.move_to_end(source.rel)
+            return cached
         try:
-            module = parse_module(source.rel, read_source(source.path))
+            module = parse_module(source.rel, read_source(source.path, self.budget))
         except SourceUnreadable as exc:
             self.unreadable[source.rel] = str(exc)
+            return None
         self._modules[source.rel] = module
+        self._cached_bytes += module.size
+        while self._cached_bytes > MAX_CACHED_BYTES and len(self._modules) > 1:
+            rel, old = self._modules.popitem(last=False)
+            self._cached_bytes -= old.size
+            self._folders.pop(rel, None)  # a folder is only kept with its module
         return module
 
     def folder(self, module: Module) -> "Folder":
+        """The folder of a module, kept while the module is. A module this index did not load
+        (a DAG file, read once) gets a folder of its own, kept by nobody."""
+        if self._modules.get(module.rel) is not module:
+            return Folder(module, index=self)
         found = self._folders.get(module.rel)
         if found is None:
             found = Folder(module, index=self)

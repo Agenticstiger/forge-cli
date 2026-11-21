@@ -32,6 +32,13 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 #: A source file larger than this is not read (1 MB: a job or a DAG file is a few KB).
 MAX_FILE_BYTES = 1_000_000
+#: A file with more ``{`` characters than this is not parsed. CPython parses an f-string in time
+#: that grows with the square of its fields (a 900 KB file of ``{b}`` fields takes 15 s and
+#: 500 MB); a job or a DAG file has a few hundred braces.
+MAX_BRACES = 50_000
+#: Source one scan reads in all, and the most source kept parsed at once.
+MAX_TOTAL_BYTES = 64 * 1024 * 1024
+MAX_CACHED_BYTES = 4 * 1024 * 1024
 #: Most Python files one walk keeps, and directory entries it reads, and levels it descends.
 MAX_FILES = 5_000
 MAX_ENTRIES = 50_000
@@ -149,11 +156,31 @@ def find_python_files(root: Path, *, ignore: Iterable[str] = ()) -> Walk:
     return walk
 
 
-def read_source(path: Path) -> bytes:
-    """The bytes of a Python source file: a regular file of at most :data:`MAX_FILE_BYTES`.
+@dataclass
+class SourceBudget:
+    """How much source one scan reads in all (:data:`MAX_TOTAL_BYTES`): a scan of a directory
+    full of files at the size limit costs what the sum of them costs, not what one does."""
+
+    left: int = MAX_TOTAL_BYTES
+    #: Files not read because the budget was spent.
+    skipped: int = 0
+
+    def take(self, size: int) -> bool:
+        if size > self.left:
+            self.skipped += 1
+            self.left = 0
+            return False
+        self.left -= size
+        return True
+
+
+def read_source(path: Path, budget: Optional[SourceBudget] = None) -> bytes:
+    """The bytes of a Python source file: a regular file of at most :data:`MAX_FILE_BYTES`,
+    counted against ``budget`` when there is one.
 
     Raises:
-        SourceUnreadable: with the reason (not a regular file, too large, unreadable).
+        SourceUnreadable: with the reason (not a regular file, too large, unreadable, or the
+            scan has read all the source it reads).
     """
     from fluid_build.util.safe_yaml import read_bounded_file
 
@@ -163,6 +190,10 @@ def read_source(path: Path) -> bytes:
         raise SourceUnreadable(f"cannot read it ({type(exc).__name__})") from exc
     if data is None:
         raise SourceUnreadable(f"it is larger than {MAX_FILE_BYTES:,} bytes")
+    if budget is not None and not budget.take(len(data)):
+        raise SourceUnreadable(
+            f"the scan has read {MAX_TOTAL_BYTES // (1024 * 1024)} MB of source, the most it reads"
+        )
     return data
 
 
@@ -182,6 +213,8 @@ class Module:
     tree: ast.Module
     imports: Dict[str, str]
     _parents: Optional[Dict[ast.AST, ast.AST]] = None
+    #: Bytes of source it was parsed from.
+    size: int = 0
 
     @property
     def parents(self) -> Dict[ast.AST, ast.AST]:
@@ -197,6 +230,11 @@ def parse_module(rel: str, data: bytes) -> Module:
         SourceUnreadable: it is not valid Python for this interpreter, or too deeply nested
             to parse; the reason carries no source text.
     """
+    if data.count(b"{") > MAX_BRACES:
+        raise SourceUnreadable(
+            f"it has more than {MAX_BRACES:,} '{{' characters, more than a job or a DAG file has: "
+            "it is not read"
+        )
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # invalid escape sequences, in a file we only read
@@ -206,7 +244,7 @@ def parse_module(rel: str, data: bytes) -> Module:
         raise SourceUnreadable(f"it is not valid Python{where}: {exc.msg}") from exc
     except (ValueError, RecursionError, MemoryError, OverflowError) as exc:
         raise SourceUnreadable(f"it cannot be parsed ({type(exc).__name__})") from exc
-    return Module(rel=rel, tree=tree, imports=import_table(tree))
+    return Module(rel=rel, tree=tree, imports=import_table(tree), size=len(data))
 
 
 def import_table(tree: ast.AST) -> Dict[str, str]:

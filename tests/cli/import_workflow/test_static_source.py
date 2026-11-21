@@ -630,3 +630,82 @@ def test_the_first_iterable_of_a_comprehension_is_still_the_outer_name():
     folder = Folder(module)
     comp = next(n for n in ast.walk(module.tree) if isinstance(n, ast.ListComp))
     assert list(folder.fold(comp.generators[0].iter)) == ["a.t", "b.t"]
+
+
+# ── what one scan parses and keeps is bounded ─────────────────────────
+
+
+def test_a_file_with_more_braces_than_a_job_has_is_not_parsed():
+    hostile = ('b = "x"\nc = f"' + "{b}" * 60_000 + '"\n').encode("utf-8")  # 60,000 "{"
+    started = time.monotonic()
+    with pytest.raises(P.SourceUnreadable) as refused:
+        P.parse_module("hostile.py", hostile)
+    assert time.monotonic() - started < 1  # not parsed: the parse of this takes seconds
+    assert "more than 50,000 '{' characters" in str(refused.value)
+    ordinary = ('x = 1\ny = f"{x}-{x}"\nz = {"a": {"b": 1}}\n' * 100).encode("utf-8")
+    assert P.parse_module("ordinary.py", ordinary).size == len(ordinary)
+
+
+def test_the_source_a_scan_reads_is_counted_and_the_files_past_it_are_said_to_be_unread(
+    tmp_path, monkeypatch
+):
+    from fluid_build.cli.import_workflow import _fold as F
+    from fluid_build.cli.import_workflow import _scan
+    from fluid_build.cli.import_workflow._conventions import Conventions
+
+    _write(
+        tmp_path,
+        {f"jobs/j{i}.py": f'spark.table("db.t{i}")\n' + "# padding\n" * 20 for i in range(6)},
+    )
+    one = len((tmp_path / "jobs" / "j0.py").read_bytes())
+    monkeypatch.setattr(F, "SourceBudget", lambda: P.SourceBudget(left=3 * one + one // 2))
+    scan = _scan.scan_jobs(tmp_path / "jobs", Conventions())
+    assert len(scan.jobs) == 3
+    assert sorted(scan.unreadable) == ["j3.py", "j4.py", "j5.py"]
+    assert all("the most it reads" in why for why in scan.unreadable.values())
+    assert any("3 file(s) not read" in note for note in scan.notes)
+
+
+def test_a_scan_with_room_for_everything_says_nothing_about_a_limit(tmp_path):
+    from fluid_build.cli.import_workflow import _scan
+    from fluid_build.cli.import_workflow._conventions import Conventions
+
+    _write(tmp_path, {"jobs/a.py": 'spark.table("db.a")\n', "jobs/b.py": 'spark.table("db.b")\n'})
+    scan = _scan.scan_jobs(tmp_path / "jobs", Conventions())
+    assert len(scan.jobs) == 2 and not any("not read" in n for n in scan.notes)
+
+
+def test_only_a_few_modules_stay_parsed_and_one_that_was_dropped_is_read_again(
+    tmp_path, monkeypatch
+):
+    from fluid_build.cli.import_workflow import _fold as F
+
+    files = {f"m{i}.py": f"V{i} = 'value-{i}'\n" for i in range(5)}
+    files["job.py"] = "from m0 import V0\nx = V0\n"
+    _write(tmp_path, files)
+    walk = P.find_python_files(tmp_path)
+    monkeypatch.setattr(F, "MAX_CACHED_BYTES", 40)  # room for about two of these files
+    index = ModuleIndex(walk.files)
+    by_rel = {f.rel: f for f in walk.files}
+    for i in range(1, 5):
+        assert index.load(by_rel[f"m{i}.py"]) is not None
+    assert len(index._modules) <= 3 and "m1.py" not in index._modules  # the oldest were dropped
+    assert index._cached_bytes == sum(m.size for m in index._modules.values())
+    assert set(index._folders) <= set(index._modules)  # a folder is not kept without its module
+    # m0 was never loaded; the job's import reads it, whatever has been dropped
+    job = index.load(by_rel["job.py"])
+    assert job is not None
+    node = next(n for n in job.tree.body if isinstance(n, ast.Assign) and n.targets[0].id == "x")  # type: ignore[attr-defined]
+    assert index.folder(job).fold(node.value) == "value-0"
+    # and a dropped module comes back as the same module, parsed again
+    again = index.load(by_rel["m1.py"])
+    assert again is not None and index.load(by_rel["m1.py"]) is again
+
+
+def test_a_module_the_index_did_not_load_gets_a_folder_nobody_keeps(tmp_path):
+    _write(tmp_path, {"a.py": "X = 1\n"})
+    walk = P.find_python_files(tmp_path)
+    index = ModuleIndex(walk.files)
+    stranger = P.parse_module("dag.py", b"Y = 2\n")
+    first, second = index.folder(stranger), index.folder(stranger)
+    assert first is not second and not index._folders

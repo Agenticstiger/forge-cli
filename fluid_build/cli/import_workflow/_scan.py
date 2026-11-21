@@ -32,6 +32,7 @@ from ._airflow_dags import Dag, Submit, Task, read_dags
 from ._conventions import Conventions
 from ._fold import ModuleIndex
 from ._pysource import (
+    MAX_TOTAL_BYTES,
     SourceUnreadable,
     clean_chars,
     find_python_files,
@@ -98,6 +99,14 @@ def _display(path: Path, rel: str) -> str:
     return clean_chars(shown)
 
 
+def _budget_note(skipped: int, notes: List[str]) -> None:
+    if skipped:
+        notes.append(
+            f"stopped reading after {MAX_TOTAL_BYTES // (1024 * 1024)} MB of source: {skipped} "
+            "file(s) not read"
+        )
+
+
 def scan_jobs(root: Path, conventions: Conventions) -> JobScan:
     """Read the job files under ``root``.
 
@@ -136,6 +145,7 @@ def scan_jobs(root: Path, conventions: Conventions) -> JobScan:
             scan.other_files += 1
             # a helper's note (a name from a parameter) still matters to the person reading
             scan.notes.extend(facts.notes)
+    _budget_note(index.budget.skipped, scan.notes)
     return scan
 
 
@@ -152,7 +162,7 @@ def scan_dags(root: Path, conventions: Conventions) -> DagScan:
     )
     for source in walk.files:
         try:
-            data = read_source(source.path)
+            data = read_source(source.path, index.budget)
         except SourceUnreadable as exc:
             scan.unreadable[source.rel] = str(exc)
             continue
@@ -169,6 +179,7 @@ def scan_dags(root: Path, conventions: Conventions) -> DagScan:
         scan.dags.extend(found.dags)
         scan.notes.extend(found.notes)
     scan.dags.sort(key=lambda d: (d.file, d.line))
+    _budget_note(index.budget.skipped, scan.notes)
     return scan
 
 
