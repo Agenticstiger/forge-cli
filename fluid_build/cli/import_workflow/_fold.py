@@ -173,6 +173,19 @@ _RUNNERS = frozenset({"globals", "exec", "eval"})
 _SETTERS = frozenset({"setattr", "delattr"})
 _IMPORTERS = frozenset({"import_module", "__import__"})
 _FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
+#: ``dict.update(C, ...)`` and the like: the method of the type called on the object.
+_CONTAINER_TYPES = frozenset(
+    {"dict", "list", "set", "bytearray", "deque", "OrderedDict", "defaultdict", "Counter"}
+)
+#: ``operator.setitem(C, ...)``: the in-place functions of the ``operator`` module.
+_OPERATOR_MUTATORS = frozenset(
+    {"setitem", "delitem", "iadd", "iand", "iconcat", "ifloordiv", "ilshift", "imod", "imul"}
+    | {"ior", "ipow", "irshift", "isub", "itruediv", "ixor", "__setitem__", "__delitem__"}
+)
+#: Passes over the calls of the file to follow a parameter that is changed through a helper that
+#: calls a helper.
+_MAX_PARAMETER_PASSES = 8
 
 
 def _text_size(value: Any) -> int:
@@ -184,44 +197,123 @@ def _text_size(value: Any) -> int:
     return 0
 
 
+def _roots(node: ast.AST) -> List[str]:
+    """The names an expression reaches into: ``CFG["t"].x`` is ``CFG``; a list, tuple, set or
+    dict written in place (``[C][0]``), a conditional and an ``or`` are every name in them;
+    ``vars(obj)`` is ``obj``. Anything else (a call, a literal) reaches no name."""
+    names: List[str] = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (ast.Subscript, ast.Attribute, ast.Starred)):
+            stack.append(current.value)
+        elif isinstance(current, (ast.List, ast.Tuple, ast.Set)):
+            stack.extend(current.elts)
+        elif isinstance(current, ast.Dict):
+            stack.extend(v for v in current.values if v is not None)
+        elif isinstance(current, ast.IfExp):
+            stack.extend((current.body, current.orelse))
+        elif isinstance(current, ast.BoolOp):
+            stack.extend(current.values)
+        elif (
+            isinstance(current, ast.Call)
+            and isinstance(current.func, ast.Name)
+            and current.func.id == "vars"
+            and len(current.args) == 1
+        ):
+            stack.append(current.args[0])  # ``vars(obj)`` is the attributes of ``obj``
+        elif isinstance(current, ast.Name):
+            names.append(current.id)
+    return names
+
+
+def _levels(node: ast.AST) -> int:
+    """How many items or attributes deep ``node`` is below its name (``CFG`` 0, ``CFG["t"]`` 1)."""
+    depth = 0
+    while isinstance(node, (ast.Subscript, ast.Attribute)):
+        node = node.value
+        depth += 1
+    return depth
+
+
+def _contents(value: ast.AST) -> List[str]:
+    """The names directly inside a list, tuple, set or dict written in place."""
+    if isinstance(value, ast.Dict):
+        items = [v for v in value.values if v is not None]
+    elif isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+        items = list(value.elts)
+    else:
+        return []
+    return [item.id for item in items if isinstance(item, ast.Name)]
+
+
+def _target_exprs(target: ast.AST) -> List[ast.AST]:
+    """The items and attributes assigned to by a target (``C["x"]``; a tuple holds several)."""
+    found: List[ast.AST] = []
+    stack = [target]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (ast.Tuple, ast.List)):
+            stack.extend(current.elts)
+        elif isinstance(current, ast.Starred):
+            stack.append(current.value)
+        elif isinstance(current, (ast.Subscript, ast.Attribute)):
+            found.append(current)
+    return found
+
+
 def _rebound_names(tree: ast.AST) -> Dict[str, str]:
     """Names the file changes after they are bound, which the single assignment a scope sees does
     not fix: a ``global`` or ``nonlocal`` declaration, an item or attribute assigned
-    (``CFG["t"] = ...``), a mutating method called on the name (``CFG.update(...)``), ``setattr``
-    or ``delattr`` on it, ``del``, an assignment expression (``(T := ...)``), a ``match`` capture
-    and a ``type`` alias; a name that is another name (``D = C``) is changed when either is.
-    A file that writes names by string where it cannot be told which name (``globals()``,
-    ``exec``, ``eval``, ``vars()`` or ``locals()`` outside a function, ``sys.modules[__name__]``,
-    ``setattr`` on something that is not a name) is ``"*"``: no name in it is trusted. Reading
-    by string (``vars(args)``, ``self.__dict__``, ``"{x}".format(**locals())`` in a function)
-    changes no constant, and is not that. One pass over the tree, without recursion.
-    ``{name: why}``."""
+    (``CFG["t"] = ...``, also as a ``for`` or ``with`` target), a mutating method called on the
+    name (``CFG.update(...)``, ``dict.update(CFG, ...)``, ``getattr(CFG, "update")(...)``,
+    ``operator.setitem(CFG, ...)``), ``setattr`` or ``delattr`` on it, a helper of the file that
+    changes its parameter called with it, ``del``, an assignment expression (``(T := ...)``), a
+    ``match`` capture and a ``type`` alias; a name that is another name (``D = C``) is changed
+    when either is, and what is held in a list or dict written in place (``D = {"c": C}``) is
+    changed by an item of an item of it. A file that writes names by string where it cannot be
+    told which name (``globals()``, ``exec``, ``eval``, ``vars()`` or ``locals()`` outside a
+    function, ``sys.modules[__name__]``, ``setattr`` on something that is not a name) is
+    ``"*"``: no name in it is trusted. Reading by string (``vars(args)``, ``self.__dict__``,
+    ``"{x}".format(**locals())`` in a function) changes no constant, and is not that. One pass
+    over the tree, without recursion. ``{name: why}``."""
     out: Dict[str, str] = {}
     aliases: List[Tuple[str, str]] = []
-
-    def base(node: ast.AST) -> Optional[str]:
-        while True:
-            if isinstance(node, (ast.Subscript, ast.Attribute)):
-                node = node.value
-            elif (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "vars"
-                and len(node.args) == 1
-            ):
-                node = node.args[0]  # ``vars(obj)`` is the attributes of ``obj``
-            else:
-                return node.id if isinstance(node, ast.Name) else None
+    held: Dict[str, List[str]] = {}
+    #: Names changed in place inside each function, by the function.
+    touched: Dict[int, Set[str]] = {}
+    defs: Dict[str, ast.AST] = {}
+    calls: List[Tuple[ast.Call, Optional[ast.AST]]] = []
+    in_place = "is changed in place elsewhere in the file"
 
     def dynamic(how: str) -> None:
         out.setdefault("*", f"the file reaches names by string ({how})")
 
-    in_place = "is changed in place elsewhere in the file"
-    stack: List[Tuple[ast.AST, bool]] = [(tree, False)]
+    #: Objects changed in place, seen in the walk (statements come in any order, and what a name
+    #: holds is known only at the end): ``(expression, the function it is in)``.
+    pending: List[Tuple[ast.AST, Optional[ast.AST]]] = []
+
+    def touch(obj: ast.AST, owner: Optional[ast.AST]) -> None:
+        pending.append((obj, owner))
+
+    def apply(obj: ast.AST, owner: Optional[ast.AST]) -> None:
+        """``obj`` (an expression for an object) is changed in place."""
+        deep = _levels(obj) > 0  # an item of a name: what the name holds is changed too
+        for name in _roots(obj):
+            targets = [name, *(held.get(name, ()) if deep else ())]
+            for each in targets:
+                out.setdefault(each, f"`{each}` {in_place}")
+                if owner is not None:
+                    touched.setdefault(id(owner), set()).add(each)
+
+    stack: List[Tuple[ast.AST, bool, Optional[ast.AST]]] = [(tree, False, None)]
     while stack:
-        node, in_function = stack.pop()
+        node, in_function, owner = stack.pop()
         inside = in_function or isinstance(node, _FUNCTIONS)
-        stack.extend((child, inside) for child in ast.iter_child_nodes(node))
+        here = node if isinstance(node, _DEFS) else owner
+        stack.extend((child, inside, here) for child in ast.iter_child_nodes(node))
+        if isinstance(node, _DEFS):
+            defs.setdefault(node.name, node)
         if isinstance(node, (ast.Global, ast.Nonlocal)):
             for name in node.names:
                 out.setdefault(name, f"`{name}` is rebound by a global or nonlocal declaration")
@@ -231,18 +323,23 @@ def _rebound_names(tree: ast.AST) -> Dict[str, str]:
             else:
                 targets = [node.target]
             for target in targets:
-                if isinstance(target, (ast.Subscript, ast.Attribute)):
-                    name = base(target)
-                    if name is not None:
-                        out.setdefault(name, f"`{name}` {in_place}")
-                elif isinstance(target, ast.Name) and isinstance(node, ast.Delete):
+                for item in _target_exprs(target):
+                    touch(item.value, owner)  # type: ignore[attr-defined]
+                if isinstance(target, ast.Name) and isinstance(node, ast.Delete):
                     out.setdefault(target.id, f"`{target.id}` is deleted elsewhere in the file")
-            if (
-                isinstance(node, ast.Assign)
-                and isinstance(node.value, ast.Name)
-                and all(isinstance(t, ast.Name) for t in node.targets)
-            ):
-                aliases.extend((t.id, node.value.id) for t in node.targets)  # type: ignore[attr-defined]
+            if isinstance(node, ast.Assign) and all(isinstance(t, ast.Name) for t in node.targets):
+                names = [t.id for t in node.targets]  # type: ignore[attr-defined]
+                if isinstance(node.value, ast.Name):
+                    aliases.extend((n, node.value.id) for n in names)
+                else:
+                    for n in names:
+                        held.setdefault(n, []).extend(_contents(node.value))
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+            for item in _target_exprs(node.target):
+                touch(item.value, owner)  # type: ignore[attr-defined]
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            for item in _target_exprs(node.optional_vars):
+                touch(item.value, owner)  # type: ignore[attr-defined]
         elif isinstance(node, ast.NamedExpr):
             name = node.target.id
             out.setdefault(name, f"`{name}` is assigned by an assignment expression")
@@ -254,27 +351,7 @@ def _rebound_names(tree: ast.AST) -> Dict[str, str]:
             name = node.name.id
             out.setdefault(name, f"`{name}` is bound by a type alias")
         elif isinstance(node, ast.Call):
-            func = node.func
-            if isinstance(func, ast.Attribute) and func.attr in _MUTATORS:
-                name = base(func.value)
-                if name is not None:
-                    out.setdefault(name, f"`{name}` {in_place}")
-            elif isinstance(func, ast.Name):
-                called = func.id
-                if called in _RUNNERS:
-                    dynamic(f"{called}(...)")
-                elif called in _NAMESPACES and not in_function and not node.args:
-                    dynamic(f"{called}(...)")
-                elif called in _SETTERS and node.args:
-                    name = base(node.args[0])
-                    if name is None:
-                        dynamic(f"{called}(...)")
-                    else:
-                        out.setdefault(name, f"`{name}` {in_place}")
-                elif called in _IMPORTERS and any(
-                    isinstance(arg, ast.Name) and arg.id == "__name__" for arg in node.args
-                ):
-                    dynamic(f"{called}(__name__)")
+            _on_call(node, owner, in_function, touch, dynamic, calls)
         elif (
             isinstance(node, ast.Subscript)
             and isinstance(node.value, ast.Attribute)
@@ -283,8 +360,91 @@ def _rebound_names(tree: ast.AST) -> Dict[str, str]:
             and node.slice.id == "__name__"
         ):
             dynamic("sys.modules[__name__]")
+    for obj, owner in pending:
+        apply(obj, owner)
+    _follow_parameters(calls, defs, touched, apply)
     _spread_to_aliases(out, aliases, in_place)
     return out
+
+
+def _on_call(
+    node: ast.Call,
+    owner: Optional[ast.AST],
+    in_function: bool,
+    touch: Callable[[ast.AST, Optional[ast.AST]], None],
+    dynamic: Callable[[str], None],
+    calls: List[Tuple[ast.Call, Optional[ast.AST]]],
+) -> None:
+    """What a call can change: its receiver (``CFG.update(...)``), its first argument (``setattr``,
+    ``dict.update(CFG, ...)``, ``operator.setitem(CFG, ...)``), or any name, by string."""
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        if func.attr in _MUTATORS:
+            receiver = func.value
+            type_name = receiver.attr if isinstance(receiver, ast.Attribute) else None
+            if isinstance(receiver, ast.Name):
+                type_name = receiver.id
+            if type_name in _CONTAINER_TYPES and node.args:
+                touch(node.args[0], owner)  # ``dict.update(CFG, ...)``
+            else:
+                touch(receiver, owner)
+        elif func.attr in _OPERATOR_MUTATORS and node.args:
+            touch(node.args[0], owner)  # ``operator.setitem(CFG, ...)``
+    elif isinstance(func, ast.Call) and isinstance(func.func, ast.Name):
+        if func.func.id == "getattr" and func.args:
+            touch(func.args[0], owner)  # ``getattr(CFG, "update")(...)``
+    elif isinstance(func, ast.Name):
+        called = func.id
+        if called in _RUNNERS:
+            dynamic(f"{called}(...)")
+        elif called in _NAMESPACES and not in_function and not node.args:
+            dynamic(f"{called}(...)")
+        elif called in _SETTERS and node.args:
+            if not _roots(node.args[0]):
+                dynamic(f"{called}(...)")
+            else:
+                touch(node.args[0], owner)
+        elif called in _OPERATOR_MUTATORS and node.args:
+            touch(node.args[0], owner)  # ``from operator import setitem``
+        elif called in _IMPORTERS and any(
+            isinstance(arg, ast.Name) and arg.id == "__name__" for arg in node.args
+        ):
+            dynamic(f"{called}(__name__)")
+        else:
+            calls.append((node, owner))  # a helper of the file, maybe: see _follow_parameters
+
+
+def _follow_parameters(
+    calls: List[Tuple[ast.Call, Optional[ast.AST]]],
+    defs: Dict[str, ast.AST],
+    touched: Dict[int, Set[str]],
+    touch: Callable[[ast.AST, Optional[ast.AST]], None],
+) -> None:
+    """``def add(cfg): cfg["t"] = ...`` called as ``add(CFG)`` changes ``CFG``: a helper of this
+    file that changes a parameter in place changes what it is called with (through helpers that
+    call helpers too: the passes end when nothing new is found)."""
+    for _ in range(_MAX_PARAMETER_PASSES):
+        grew = False
+        for call, owner in calls:
+            helper = defs.get(call.func.id)  # type: ignore[attr-defined]
+            changed = touched.get(id(helper)) if helper is not None else None
+            if not changed:
+                continue
+            arguments = helper.args  # type: ignore[attr-defined]
+            positional = [a.arg for a in [*arguments.posonlyargs, *arguments.args]]
+            passed = [
+                arg
+                for index, arg in enumerate(call.args)
+                if index < len(positional) and positional[index] in changed
+            ]
+            passed += [kw.value for kw in call.keywords if kw.arg in changed]
+            for arg in passed:
+                before = len(touched.get(id(owner), ())) if owner is not None else 0
+                touch(arg, owner)
+                if owner is not None and len(touched.get(id(owner), ())) > before:
+                    grew = True
+        if not grew:
+            return
 
 
 def _spread_to_aliases(out: Dict[str, str], aliases: List[Tuple[str, str]], in_place: str) -> None:

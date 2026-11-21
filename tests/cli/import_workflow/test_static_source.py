@@ -780,6 +780,20 @@ def _value_of(source: str, name: str = "X"):
         'T = "a"\nsetattr(make(), "T", "b")\nX = T\n',
         'class K:\n    t = "x"\nsetattr(K, "t", "y")\nX = K.t\n',
         'class K:\n    t = "x"\ndelattr(K, "t")\nX = K.t\n',
+        'C = {"t": "x"}\nfor C["t"] in ["y"]:\n    pass\nX = C["t"]\n',
+        'C = {"t": "x"}\nwith ctx() as C["t"]:\n    pass\nX = C["t"]\n',
+        'C = {"t": "x"}\nitems = [1 for C["t"] in ["y"]]\nX = C["t"]\n',
+        'C = {"t": "x"}\n[C][0]["t"] = "y"\nX = C["t"]\n',
+        'C = {"t": "x"}\ndict.update(C, t="y")\nX = C["t"]\n',
+        'L = ["x"]\nlist.insert(L, 0, "y")\nX = L[0]\n',
+        'import operator\nC = {"t": "x"}\noperator.setitem(C, "t", "y")\nX = C["t"]\n',
+        'from operator import setitem\nC = {"t": "x"}\nsetitem(C, "t", "y")\nX = C["t"]\n',
+        'C = {"t": "x"}\ngetattr(C, "update")(t="y")\nX = C["t"]\n',
+        'C = {"t": "x"}\ndef put(d):\n    d["t"] = "y"\nput(C)\nX = C["t"]\n',
+        'C = {"t": "x"}\ndef put(d, v):\n    d["t"] = v\nput(d=C, v="y")\nX = C["t"]\n',
+        'C = {"t": "x"}\ndef put(d):\n    d["t"] = "y"\ndef put_all(e):\n    put(e)\nput_all(C)\nX = C["t"]\n',
+        'C = {"t": "x"}\nD = {"c": C}\nD["c"]["t"] = "y"\nX = C["t"]\n',
+        'C = {"t": "x"}\nD = {"c": C}\nD["c"].update(t="y")\nX = C["t"]\n',
     ],
 )
 def test_a_name_the_file_changes_by_any_route_is_not_a_constant(source):
@@ -800,6 +814,20 @@ def test_a_name_the_file_changes_by_any_route_is_not_a_constant(source):
     ],
 )
 def test_reading_names_by_string_or_changing_an_object_that_is_no_constant_voids_nothing(source):
+    assert _value_of(source) == "a"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'T = "a"\ndef put(d):\n    d["t"] = "y"\nother = {}\nput(other)\nX = T\n',
+        'T = "a"\nL = [T]\nL.append("b")\nX = T\n',
+        'T = "a"\nD = {"c": T}\nD["c"] = "z"\nX = T\n',
+        'T = "a"\ndef put(d):\n    d["t"] = "y"\nX = T\n',
+        'T = "a"\ndef put(d):\n    d["t"] = "y"\nput(make())\nX = T\n',
+    ],
+)
+def test_a_name_held_beside_a_change_but_not_reached_by_it_is_still_a_constant(source):
     assert _value_of(source) == "a"
 
 
