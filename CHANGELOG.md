@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid schedule-sync --airflow-url` waits until Airflow has parsed the pushed DAG files, on
+  Airflow 2 and Airflow 3.** It finds the API major itself (`/api/v2` on Airflow 3, `/api/v1` on
+  Airflow 2; `--airflow-api v1|v2` pins it) and signs in the way each major takes a credential: a
+  token in `FLUID_AIRFLOW_TOKEN_REF`, sent as a bearer token to both, or `user:password` in
+  `FLUID_AIRFLOW_CREDENTIAL_REF`, sent as HTTP Basic to Airflow 2 and exchanged for a token at
+  `POST /auth/token` on Airflow 3. Both variables hold a secret reference (`env://`, `file://`,
+  `vault://`, `aws-sm://`), and a project `.env` cannot set them. The version check, the sign-in
+  and one read run before anything is pushed, so a check that cannot run leaves nothing pushed.
+  After the push, every pushed file must be parsed with no import error within `--airflow-wait`
+  seconds (default 600, cap 3600). On an Airflow 3 Git Dag bundle, its Dags must report the
+  commit the `git+ssh` push made (or `--airflow-bundle-version`). Elsewhere, Airflow must parse
+  each Dag twice after the sync: a parse that was already running when the files landed read the
+  old file, and Airflow 3 can take several seconds per file. A failure counts the same way, from
+  two stamps of the file's import error. On Airflow 3.4, `/api/v2/dagBundles` shows when the
+  bundle reached the pushed commit, so a broken push fails within a parse or two. A Dag that never
+  appears is reported as not parsed: Airflow 3 shows the import error of a file with no
+  registered Dag only to a user who may read all import errors. `--airflow-bundle` limits the
+  check to one bundle. `--check-only` checks the files under `--dags-dir` without pushing, for a
+  deploy that puts them in place itself. A file that fails to import, or is not parsed in time,
+  exits 1 with `schedule_sync_airflow_import_errors` or `schedule_sync_airflow_not_parsed`, and
+  the report's `airflow_check` block names each file. Typed errors cover an unreachable server, a
+  refused credential, a forbidden read, a redirect (never followed) and a mismatched major. Plain
+  HTTP is refused for any host but loopback unless `FLUID_AIRFLOW_ALLOW_INSECURE_HTTP` is set.
+  MWAA, Prefect and Dagster are refused with `--airflow-url`. Without `--airflow-url` the stage
+  behaves as before.
+- **Every DAG forge generates is loaded by a real Airflow in a gated test.**
+  `tests/schedulers/test_generated_dags_airflow_live.py` loads each generator's DAG in the
+  `DagBag` of the Airflow 2 and 3 named by `FLUID_AIRFLOW2_PYTHON` / `FLUID_AIRFLOW3_PYTHON`. It
+  checks that there is no import error and no Airflow removal or deprecation warning, and that
+  the Dag ids match what the new check reads from the files. A unit test runs Ruff's Airflow 3
+  rules (AIR3) over every generated DAG, the `fluid apply` DAGs included. It allows a finding
+  only inside an Airflow 2 `except ImportError` fallback.
+
 - **`fluid generate pyspark-schema` writes a PySpark `StructType` module for each output
   port.** For every output port that declares `contract.schema` columns it writes
   `<port>_schema.py` with a `SCHEMA` a Spark job imports (`spark.read.schema(SCHEMA)`). forge-cli
