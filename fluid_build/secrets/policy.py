@@ -48,6 +48,13 @@ repository could grant itself the policy meant to constrain it.
 
   A host written with a port never matches: leave the port off.
 
+Every destination a connection names is judged (:func:`connection_hosts`):
+``host`` and the host part of every URI field, each host of a host list, and
+the host of an SSH tunnel in use. A driver can be pointed elsewhere by a
+query-string parameter that names a host, or by a database name a connection
+URL reads as more than a name; this policy cannot judge either, so beside a
+secret both are refused unless the reference may go to any host.
+
 The destination policy used to cover ``env://`` only, on the reasoning that the
 other schemes name a store the operator provisioned. That left the same hole one
 step removed: a contract could name any secret the operator's identity can read
@@ -67,7 +74,7 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple, Union
-from urllib.parse import urlsplit
+from urllib.parse import unquote, unquote_plus, urlsplit
 
 from fluid_build._errors import doc_url
 from fluid_build._net import is_loopback_host
@@ -93,25 +100,115 @@ NEVER_RESOLVE_STAGES: FrozenSet[str] = frozenset({"validate", "plan", "bundle", 
 #: Every field that can carry a destination. ALL of them are checked, not just
 #: the first that parses: a contract that set ``host: localhost`` as a decoy
 #: beside a remote ``connection_string`` would otherwise be exempted on the
-#: strength of the decoy. ``connection_string`` is debezium's mongodb shape.
-_HOST_FIELDS = ("host", "uri", "instance_url", "connection_string", "server", "endpoint")
+#: strength of the decoy. ``connection_string`` is debezium's mongodb shape;
+#: ``sqlalchemy_url`` is the Singer taps' (tap-postgres, tap-mysql), which wins
+#: over their ``host`` and ``port``.
+_HOST_FIELDS = (
+    "host",
+    "uri",
+    "instance_url",
+    "connection_string",
+    "server",
+    "endpoint",
+    "sqlalchemy_url",
+)
 
 #: Connector settings that name where a connector connects, or the credential it
 #: connects with, in Debezium's and Kafka Connect JDBC's spellings. The runner
 #: derives them from the connection block, which this policy clears before the
 #: secret is read; an override (Debezium's ``extra_config``) would send the
-#: resolved value past that check, to a host the contract chose.
+#: resolved value past that check, to a host the contract chose. The port and
+#: the database go into the JDBC URL Debezium builds next to the host, and the
+#: connector class decides which of the settings are read at all.
 DESTINATION_OVERRIDE_KEYS: FrozenSet[str] = frozenset(
     {
         "database.hostname",
+        "database.port",
+        "database.dbname",
+        "database.names",
         "database.url",
         "mongodb.connection.string",
         "mongodb.hosts",
         "connection.url",
+        "connector.class",
         "database.password",
         "mongodb.password",
         "connection.password",
     }
+)
+
+#: Query-string parameters that name the host a driver connects to, or a file or
+#: a connection string that does, spelled as :func:`_query_keys` compares them
+#: (lower case, letters and digits only). A driver can take its host from the
+#: query string as well as from the URI's host part, and drivers differ on which
+#: wins: libpq lets the query win (``conninfo_uri_parse_params``), and
+#: SQLAlchemy's dialects merge the query into the DBAPI's keyword arguments
+#: (``opts.update(url.query)``). This policy reads the host part only, so a
+#: query that names a host is refused beside a secret rather than guessed at.
+_QUERY_HOST_KEYS: FrozenSet[str] = frozenset(
+    {
+        # libpq keywords, which SQLAlchemy's psycopg dialects pass through
+        # (``service`` reads its parameters from a service file)
+        "host",
+        "hostaddr",
+        "service",
+        # pgjdbc's spellings of the same properties
+        "pghost",
+        "pghostaddr",
+        "pgservice",
+        # MySQL drivers: mysqlclient, PyMySQL, MySQL Connector/J
+        "unixsocket",
+        "readdefaultfile",
+        "readdefaultgroup",
+        "socksproxyhost",
+        # SQL Server: pyodbc (``odbc_connect`` is a whole ODBC string) and mssql-jdbc
+        "odbcconnect",
+        "dsn",
+        "server",
+        "servername",
+        "address",
+        "addr",
+        "networkaddress",
+        "datasource",
+        "failoverpartner",
+        # MongoDB's SOCKS5 proxy; Snowflake's account and region make its host
+        "proxyhost",
+        "account",
+        "region",
+        # clickhouse-driver's failover hosts
+        "althosts",
+        # a host or a URL under another name
+        "hostname",
+        "url",
+        "uri",
+        "endpoint",
+        "connectionstring",
+    }
+)
+
+#: Connection fields that hold a query string of their own: Airbyte's JDBC
+#: sources append ``jdbc_url_params`` to the JDBC URL they build.
+_QUERY_STRING_FIELDS = ("jdbc_url_params",)
+
+#: URI schemes whose client never takes its host from the query string.
+_UNROUTED_QUERY_SCHEMES = frozenset({"http", "https", "ws", "wss"})
+
+#: Fields that runners and connectors put into a connection URL as its database
+#: (``URL.create(database=...)``, ``jdbc:postgresql://host:port/<database>``).
+_DATABASE_FIELDS = ("database", "dbname")
+#: What such a URL reads in a database name as more than the name: ``?`` starts
+#: the connection settings, ``;`` starts SQL Server's, ``&`` and ``#`` delimit
+#: them, and ``@`` and ``\`` end a part in other parsers.
+_URL_SYNTAX = "?#;&@\\"
+#: Control characters (Unicode Cc), as ``providers/_sql_safety.py`` refuses them.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+#: The SSH tunnels a client can connect through, as ``(field, host key, off)``:
+#: the Singer taps' ``ssh_tunnel`` (``enable: false`` is off) and Airbyte's
+#: ``tunnel_method`` (``tunnel_method: NO_TUNNEL`` is off).
+_TUNNELS: Tuple[Tuple[str, str, Tuple[str, Any]], ...] = (
+    ("ssh_tunnel", "host", ("enable", False)),
+    ("tunnel_method", "tunnel_host", ("tunnel_method", "NO_TUNNEL")),
 )
 
 #: URI schemes that name an object store rather than a database server. Their
@@ -434,14 +531,152 @@ def connection_hosts(connection: Mapping[str, Any]) -> List[Optional[str]]:
 
     Every host of a host list counts (:func:`_authority_hosts`), and a ``port``
     that is not a port number adds a ``None`` (:func:`_port_is_readable`).
+
+    So does every other way a connection can name where a driver connects: a
+    query-string parameter that names a host (:data:`_QUERY_HOST_KEYS`), in a
+    URI field or in ``jdbc_url_params``; a database name holding URL syntax
+    (:data:`_URL_SYNTAX`), which a runner or connector puts into a connection
+    URL; and the host of an SSH tunnel in use (:data:`_TUNNELS`), which adds a
+    destination of its own and is ``None`` when it names no host.
     """
-    out: List[Optional[str]] = []
+    return [target.host for target in _connection_targets(connection)]
+
+
+@dataclass(frozen=True)
+class _Target:
+    """One destination of a connection, and where the connection names it.
+
+    ``host`` is ``None`` for a destination this policy cannot read, and
+    ``query_key`` or ``database_char`` then says why when the reason is a query
+    parameter that names a host or URL syntax in a database name. ``tunnel``
+    marks an SSH tunnel's host, and ``behind_tunnel`` a host the client reads
+    from the tunnel host's side, where a loopback host is not this machine.
+    """
+
+    host: Optional[str]
+    field: Optional[str] = None
+    query_key: Optional[str] = None
+    database_char: Optional[str] = None
+    tunnel: bool = False
+    behind_tunnel: bool = False
+
+    @property
+    def has_reason(self) -> bool:
+        """Whether a query parameter or a database name is why this cannot be read."""
+        return self.query_key is not None or self.database_char is not None
+
+
+def _connection_targets(connection: Mapping[str, Any]) -> List[_Target]:
+    """:func:`connection_hosts`, each destination with the field that names it."""
+    # The tunnel host first: it is the first host the value reaches.
+    tunnels = _tunnel_targets(connection)
+    behind = bool(tunnels)
+    out: List[_Target] = list(tunnels)
     for field_name in _HOST_FIELDS:
-        if field_name in connection:
-            out.extend(_field_hosts(field_name, connection[field_name]))
+        if field_name not in connection:
+            continue
+        raw = connection[field_name]
+        if field_name != "host" and isinstance(raw, str):
+            out.extend(
+                _Target(None, field_name, query_key=key) for key in _uri_query_host_keys(raw)
+            )
+        out.extend(
+            _Target(host, field_name, behind_tunnel=behind)
+            for host in _field_hosts(field_name, raw)
+        )
+    for field_name in _QUERY_STRING_FIELDS:
+        raw = connection.get(field_name)
+        if isinstance(raw, str):
+            out.extend(
+                _Target(None, field_name, query_key=key) for key in _query_keys_naming_a_host(raw)
+            )
+        elif raw is not None:
+            out.append(_Target(None, field_name))
+    out.extend(_database_targets(connection))
     if not _port_is_readable(connection.get("port")):
-        out.append(None)
+        out.append(_Target(None, "port"))
     return out
+
+
+def _uri_query_host_keys(text: str) -> List[str]:
+    """The query-string parameters of URI ``text`` that name a host.
+
+    Everything after the first ``?`` counts, a fragment included: libpq has no
+    fragment, and reads a ``#`` as part of the query. An object-store URI, an
+    http(s) or ws(s) URI (its client never takes the host from the query) and
+    text that is not a URI have none.
+    """
+    stripped = text.strip()
+    scheme, sep, _rest = stripped.partition("://")
+    if not sep or "?" not in stripped or _is_object_store_uri(stripped):
+        return []
+    if scheme.strip().lower() in _UNROUTED_QUERY_SCHEMES:
+        return []
+    return _query_keys_naming_a_host(stripped.partition("?")[2])
+
+
+def _query_keys_naming_a_host(query: str) -> List[str]:
+    """The keys of query string ``query`` in :data:`_QUERY_HOST_KEYS`, as spelled there.
+
+    A key is compared percent-decoded, as libpq decodes both keys and values,
+    and once more with ``+`` read as a space, as SQLAlchemy's ``parse_qsl``
+    reads it; in any case; and with everything but letters and digits left
+    out, so ``HOST``, ``%68ost`` and ``unix_socket`` are ``host``, ``host`` and
+    ``unixsocket``. Parameters are split on ``&``, on ``;`` (SQL Server's JDBC
+    properties) and on ``#``.
+    """
+    found: List[str] = []
+    for part in re.split(r"[&;#]", query):
+        key = part.partition("=")[0]
+        for spelling in (unquote(key), unquote_plus(key)):
+            name = re.sub(r"[^a-z0-9]", "", spelling.lower())
+            if name in _QUERY_HOST_KEYS and name not in found:
+                found.append(name)
+    return found
+
+
+def _database_targets(connection: Mapping[str, Any]) -> List[_Target]:
+    """A destination this policy cannot read for each database name holding URL syntax."""
+    out: List[_Target] = []
+    for field_name in _DATABASE_FIELDS:
+        raw = connection.get(field_name)
+        if not isinstance(raw, str):
+            continue
+        char = next((c for c in raw if c in _URL_SYNTAX or _CONTROL_CHARS.match(c)), None)
+        if char is not None:
+            out.append(_Target(None, field_name, database_char=char))
+    return out
+
+
+def _tunnel_targets(connection: Mapping[str, Any]) -> List[_Target]:
+    """The host of each SSH tunnel ``connection`` connects through (:data:`_TUNNELS`).
+
+    A tunnel is in use unless it is switched off as its connector spells it, or
+    it is empty (``{}``, ``null``, ``false``). One in use whose host is not a
+    non-empty string is a destination this policy cannot read.
+    """
+    out: List[_Target] = []
+    for field_name, host_key, (off_key, off_value) in _TUNNELS:
+        tunnel = connection.get(field_name)
+        if not tunnel:
+            continue
+        raw: Any = None
+        if isinstance(tunnel, Mapping):
+            if _switched_off(tunnel, off_key, off_value):
+                continue
+            raw = tunnel.get(host_key)
+        host = raw.strip() if isinstance(raw, str) and raw.strip() else None
+        out.append(_Target(host, f"{field_name}.{host_key}", tunnel=True))
+    return out
+
+
+def _switched_off(tunnel: Mapping[str, Any], off_key: str, off_value: Any) -> bool:
+    """``enable`` present and false (the taps read it so), or ``tunnel_method: NO_TUNNEL``."""
+    if off_key not in tunnel:
+        return False
+    if off_value is False:
+        return not tunnel[off_key]
+    return bool(tunnel[off_key] == off_value)
 
 
 def _field_hosts(field_name: str, raw: Any) -> List[Optional[str]]:
@@ -563,7 +798,7 @@ def _names_an_object_store(connection: Mapping[str, Any]) -> bool:
 
 def _destination_targets(
     connection: Optional[Mapping[str, Any]], host: Optional[str]
-) -> Optional[List[Optional[str]]]:
+) -> Optional[List[_Target]]:
     """Every destination to judge, or ``None`` when the connection has none to judge.
 
     ``None`` only for a connection whose one destination is an object store (the
@@ -571,13 +806,13 @@ def _destination_targets(
     empty are not that: they leave the client to pick its host, so the result is
     a destination this policy cannot clear, as for a connection naming none.
     """
-    targets: List[Optional[str]] = []
+    targets: List[_Target] = []
     if connection is not None:
-        targets.extend(connection_hosts(connection))
+        targets.extend(_connection_targets(connection))
         if not targets and _names_an_object_store(connection):
             return None
     if host is not None or not targets:
-        targets.append(host)
+        targets.append(_Target(host))
     return targets
 
 
@@ -621,24 +856,99 @@ def _blank_host_refusal(parsed: SecretRef) -> AcquisitionSecretPolicyError:
     )
 
 
-def _destination_refusal(parsed: SecretRef, target: Optional[str]) -> AcquisitionSecretPolicyError:
-    where = f"host {target!r}" if target else "a host that could not be determined"
+def _field_label(target: _Target) -> str:
+    """``connection.<field>`` for a destination a connection names, else nothing."""
+    return f"connection.{target.field}" if target.field else ""
+
+
+def _any_host_fix(parsed: SecretRef) -> str:
+    """The allowlist entry that sends ``parsed`` to any host, for a refusal's fix."""
+    return f'{ALLOWLIST_ENV}="{_suggested_entry(parsed, None)}"'
+
+
+def _destination_refusal(parsed: SecretRef, target: _Target) -> AcquisitionSecretPolicyError:
+    label = _field_label(target)
+    where = f"host {target.host!r}" if target.host else "a host that could not be determined"
+    if label:
+        where = f"{where} ({label})"
     what_sent = _what_sent(parsed)
-    entry = _suggested_entry(parsed, target)
-    any_host = _suggested_entry(parsed, None)
+    entry = _suggested_entry(parsed, target.host)
+    why = (
+        "A contract names both the secret to read and the host it is sent to, so "
+        "without an operator allowlist any secret this run can read could be sent "
+        "to a host the contract chose. A loopback host needs no entry; every "
+        "destination that leaves this machine does."
+    )
+    if target.tunnel:
+        why += " The value travels through this SSH tunnel host on its way to the database."
+    elif target.behind_tunnel and is_loopback(target.host):
+        why += (
+            " Behind an SSH tunnel the client reads this host from the tunnel host's side, "
+            "so a loopback host there is that machine, not this one."
+        )
     return AcquisitionSecretPolicyError(
         what=f"the contract would send {what_sent} to {where} as a credential",
-        why=(
-            "A contract names both the secret to read and the host it is sent to, so "
-            "without an operator allowlist any secret this run can read could be sent "
-            "to a host the contract chose. A loopback host needs no entry; every "
-            "destination that leaves this machine does."
-        ),
+        why=why,
         fix=(
             f"If this is intended, set it in {_OPERATOR_ONLY}: "
             f'{ALLOWLIST_ENV}="{entry}" for that host only, or '
-            f'{ALLOWLIST_ENV}="{any_host}" for any host. A host written with a port '
+            f"{_any_host_fix(parsed)} for any host. A host written with a port "
             "never matches, so leave the port off."
+        ),
+        doc=doc_url("secrets"),
+    )
+
+
+def _query_host_refusal(parsed: SecretRef, target: _Target) -> AcquisitionSecretPolicyError:
+    """The refusal for a query-string parameter that names a host (:data:`_QUERY_HOST_KEYS`)."""
+    label = _field_label(target)
+    if target.field in _QUERY_STRING_FIELDS:
+        where = f"{label}, the query string of the JDBC URL"
+        fix = f"Name the host in connection.host and remove {target.query_key!r} from {label}."
+    else:
+        where = f"the query string of {label}"
+        fix = (
+            f"Name the host in the host part of {label} (scheme://host/...), and remove "
+            f"{target.query_key!r} from its query string."
+        )
+    return AcquisitionSecretPolicyError(
+        what=(
+            f"the contract would send {_what_sent(parsed)} to a host that {target.query_key!r} "
+            f"names in {where}, which this check does not read"
+        ),
+        why=(
+            "A driver can take its host from a query string as well as from the URI's host "
+            "part, and drivers differ on which one wins. This check judges the host part, so "
+            "a query parameter that names a host could send the value to a host the operator "
+            "never allowed."
+        ),
+        fix=(
+            f"{fix} To send the value to any host instead, set it in {_OPERATOR_ONLY}: "
+            f"{_any_host_fix(parsed)}."
+        ),
+        doc=doc_url("secrets"),
+    )
+
+
+def _database_refusal(parsed: SecretRef, target: _Target) -> AcquisitionSecretPolicyError:
+    """The refusal for a database name that holds URL syntax (:data:`_URL_SYNTAX`)."""
+    label = _field_label(target)
+    char = target.database_char or ""
+    shown = "a control character" if _CONTROL_CHARS.match(char) else repr(char)
+    return AcquisitionSecretPolicyError(
+        what=(
+            f"the contract would send {_what_sent(parsed)} over a connection whose {label} "
+            f"holds {shown}, which a connection URL reads as more than a database name"
+        ),
+        why=(
+            "Runners and connectors put the database name into a connection URL (a "
+            "SQLAlchemy or a JDBC URL), where '?' starts connection settings that can name "
+            "another host and ';', '&', '#', '@' and '\\' end other parts of it, so this "
+            "check cannot tell where the value would go."
+        ),
+        fix=(
+            f"Write the database's own name in {label}. To send the value regardless, set it "
+            f"in {_OPERATOR_ONLY}: {_any_host_fix(parsed)}."
         ),
         doc=doc_url("secrets"),
     )
@@ -670,10 +980,16 @@ def refuse_unless_allowed(
     if targets is None:
         return
     grants = destination_grants(environ)
-    for target in targets:
-        if is_loopback(target) or _grants_allow(parsed, target, grants):
+    # A reason first: it is what to change whatever the hosts are.
+    for target in sorted(targets, key=lambda target: not target.has_reason):
+        exempt = not target.behind_tunnel and is_loopback(target.host)
+        if exempt or _grants_allow(parsed, target.host, grants):
             continue
-        if target is None and connection is not None and _host_is_blank(connection):
+        if target.query_key is not None:
+            raise _query_host_refusal(parsed, target)
+        if target.database_char is not None:
+            raise _database_refusal(parsed, target)
+        if target.host is None and connection is not None and _host_is_blank(connection):
             raise _blank_host_refusal(parsed)
         raise _destination_refusal(parsed, target)
 
@@ -697,11 +1013,15 @@ def renders_at_apply(field_name: str, value: Any) -> bool:
     The field waits whole: a literal host beside a placeholder in one host list
     (``h1,{{ env.H }}``) is judged by apply alone, which judges every host. An
     object-store URI names a bucket, never a host, so it never waits, and nor
-    does text that does not read as a destination (:func:`_reads_as_destination`).
+    does text that does not read as a destination (:func:`_reads_as_destination`)
+    or a URI whose query string names a host, which is refused whatever the
+    placeholder renders to.
     """
     if not isinstance(value, str) or not _ENV_PLACEHOLDER.search(value):
         return False
     if field_name != "host" and _is_object_store_uri(value.strip()):
+        return False
+    if field_name != "host" and _uri_query_host_keys(value):
         return False
     scheme, host = _deciding_parts(field_name, value)
     if not _reads_as_destination(scheme, host):
@@ -787,12 +1107,21 @@ def allows_any_host(
 
 
 def destinations_rendered_at_apply(connection: Mapping[str, Any]) -> List[str]:
-    """The destination fields of ``connection`` whose host :func:`renders_at_apply`."""
-    return [
+    """The destination fields of ``connection`` whose host :func:`renders_at_apply`.
+
+    A tunnel's host is named ``<tunnel>.<key>`` (``ssh_tunnel.host``) and read as
+    ``host`` is.
+    """
+    waiting = [
         field_name
         for field_name in _HOST_FIELDS
         if renders_at_apply(field_name, connection.get(field_name))
     ]
+    for field_name, host_key, _off in _TUNNELS:
+        tunnel = connection.get(field_name)
+        if isinstance(tunnel, Mapping) and renders_at_apply("host", tunnel.get(host_key)):
+            waiting.append(f"{field_name}.{host_key}")
+    return waiting
 
 
 def deferred_destination_notice(

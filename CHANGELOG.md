@@ -282,6 +282,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An address with an IPv6 zone id, such as `::1%lo0`, is no longer read as this machine. The
   secret destination policy judges it like any other host, the MCP HTTP server needs
   authentication to listen on it, and an OpenBao or Vault address on it needs https.
+- The secret destination policy judges every host a connection names. Beside a `secretRef`,
+  a query-string parameter that names a host (`host` or `hostaddr` in a libpq URI, a host in
+  `jdbc_url_params` or in a Singer tap's `sqlalchemy_url`) is refused unless the reference may
+  go to any host, and so is a database name that holds `?`, `#`, `;`, `&`, `@`, `\` or a
+  control character. The host of an SSH tunnel in use (a tap's `ssh_tunnel`, Airbyte's
+  `tunnel_method`) needs an allowlist entry of its own, and so does a loopback host behind
+  it. A Debezium `extra_config` may no longer set `database.port`, `database.dbname`,
+  `database.names` or `connector.class` beside a `secretRef`.
 
 ## [0.36.0] — 2026-11-19
 

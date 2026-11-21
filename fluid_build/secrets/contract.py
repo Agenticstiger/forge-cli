@@ -196,14 +196,25 @@ def _check_destinations(
     if not waiting:
         refuse_unless_allowed(ref, connection=site.connection, environ=environ)
         return None
-    literal = {key: value for key, value in site.connection.items() if key not in waiting}
+    # A tunnel's host (``ssh_tunnel.host``) takes its tunnel with it: apply judges both.
+    drop = {name.partition(".")[0] for name in waiting}
+    literal = {key: value for key, value in site.connection.items() if key not in drop}
     if connection_hosts(literal):
         refuse_unless_allowed(ref, connection=literal, environ=environ)
     if allows_any_host(ref, environ):
         return None
     return deferred_destination_notice(
-        ref, {f"connection.{name}": str(site.connection[name]) for name in waiting}
+        ref, {f"connection.{name}": str(_written_at(site.connection, name)) for name in waiting}
     )
+
+
+def _written_at(connection: Mapping[str, Any], name: str) -> Any:
+    """The value of field ``name`` of ``connection``; ``a.b`` is field ``b`` of ``a``."""
+    head, _, rest = name.partition(".")
+    value = connection.get(head)
+    if rest and isinstance(value, Mapping):
+        return value.get(rest)
+    return value
 
 
 def _override_findings(contract: Mapping[str, Any]) -> Iterator[RefFinding]:
