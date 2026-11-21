@@ -101,7 +101,10 @@ def parse_iso_duration(text: Optional[str]) -> Optional[timedelta]:
             minutes=int(parts["minutes"] or 0),
             seconds=float(parts["seconds"] or 0),
         )
-    except (TypeError, ValueError) as exc:  # pragma: no cover — defensive
+    except (TypeError, ValueError, OverflowError) as exc:
+        # ``OverflowError``: a length no ``timedelta`` holds (``P99999999999D``, or a
+        # seconds field of 400 digits, which ``float`` reads as infinity). The regex
+        # accepts any number of digits, so a config can write one.
         LOG.debug("iso_duration_parse_failed: text=%r error=%s", text, exc)
         return None
     # Reject all-zero durations like ``PT`` or ``P`` — the regex accepts

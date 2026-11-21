@@ -47,6 +47,19 @@ class TestParseIsoDuration:
     def test_invalid_returns_none(self, text):
         assert parse_iso_duration(text) is None
 
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "P" + "9" * 30 + "D",  # more days than a timedelta holds
+            "P999999999999D",
+            "PT" + "9" * 400 + "S",  # float reads it as infinity
+            "PT" + "9" * 30 + "H",
+        ],
+    )
+    def test_a_length_no_timedelta_holds_is_none_not_an_error(self, text):
+        """The regex takes any number of digits, so a config can write one."""
+        assert parse_iso_duration(text) is None
+
 
 class TestClassifyArrival:
     def test_on_time_within_budget(self):

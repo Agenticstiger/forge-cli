@@ -174,7 +174,8 @@ Use Cases:
         action="store_true",
         help=(
             "Exit non-zero on CRITICAL drift (missing fields, type mismatches, "
-            "region drift, a local csv/parquet output whose columns differ from "
+            "region drift, an Iceberg table older than its qos.freshnessSLO, a "
+            "local csv/parquet output whose columns differ from "
             "the declared schema) and on verification errors. Non-critical drift "
             "(nullable-vs-required constraints, extra columns) is reported and "
             "downgraded to a warning — add --fail-on-warning to gate on those too. "
@@ -271,8 +272,9 @@ Use Cases:
         action="store_true",
         help=(
             "Downgrade --reconcile-dbt / --reconcile-lineage / --state-drift drift, "
-            "and the failure of a --strict run that verified nothing, to a warning "
-            "(exit 0). Reports it but does not fail the build."
+            "a missed freshness objective (qos.freshnessSLO), and the failure of a "
+            "--strict run that verified nothing, to a warning (exit 0). Reports it "
+            "but does not fail the build."
         ),
     )
 
@@ -284,7 +286,8 @@ Use Cases:
         dest="athena_output_location",
         metavar="S3_URI",
         help=(
-            "Where Athena writes the row-count query result (env "
+            "Where Athena writes its query results (the row count, and an Iceberg "
+            "table's snapshots; env "
             "FLUID_ATHENA_OUTPUT_LOCATION). Default: the workgroup's configured "
             "location, else s3://<binding bucket>/.fluid/athena-results/. A "
             "workgroup that enforces its own location always wins."
@@ -294,7 +297,7 @@ Use Cases:
         "--athena-workgroup",
         dest="athena_workgroup",
         metavar="NAME",
-        help="Athena workgroup for the row-count query (env FLUID_ATHENA_WORKGROUP; default primary)",
+        help="Athena workgroup for the queries (env FLUID_ATHENA_WORKGROUP; default primary)",
     )
     p.add_argument(
         "--athena-timeout",
@@ -302,7 +305,8 @@ Use Cases:
         type=float,
         metavar="SECONDS",
         help=(
-            "Stop the Athena row-count query and fail after this long "
+            "Stop an Athena query (the row count, an Iceberg table's snapshots) and fail "
+            "after this long "
             "(env FLUID_ATHENA_TIMEOUT_SECONDS; default 300)"
         ),
     )
@@ -1208,6 +1212,7 @@ _FINDINGS_DIMENSIONS = (
     ("row_filter_masks", "\n   🔍 Row filter and column masks (Unity Catalog)"),
     ("retention", "\n   🔍 Retention (Delta history)"),
     ("jobs", "\n   🔍 Jobs"),
+    ("freshness", "\n   🔍 Freshness (Iceberg snapshots)"),
 )
 
 
@@ -1829,6 +1834,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 workdir=Path(contract_path).resolve().parent,
                 options=options_from_args(args),
                 reference_only=reference_only,
+                freshness_critical=not getattr(args, "warn_only", False),
             )
         elif _is_object_store_binding(expose_config.get("binding")):
             # An AWS/Azure binding that names a bucket writes to object storage,
@@ -2058,7 +2064,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         if dimensions.get("masking") is not None:
             _render_masking_dimension(dimensions["masking"], "pass", "\n   🔍 Dimension 5: Masking")
 
-        # Databricks: reader access to the catalog, and the dbt jobs.
+        # Databricks: reader access to the catalog, and the dbt jobs. An Iceberg
+        # table on AWS: its freshness against qos.freshnessSLO.
         _render_findings_dimensions(dimensions)
 
         # Remediation guidance
