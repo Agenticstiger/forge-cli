@@ -377,6 +377,52 @@ def build_mysql_dsn(connection: Mapping[str, Any], *, database_key: str = "datab
     return " ".join(parts)
 
 
+#: What a connection URL reads in a host or a database name as more than the
+#: name: ``?`` starts the connection properties (pgjdbc reads ``host=`` there,
+#: after the URL's own host), ``;`` starts SQL Server's, ``&`` and ``#`` delimit
+#: them, and ``@`` and ``\`` end a part in other parsers. A host may not hold a
+#: ``/`` either, which ends it, nor whitespace.
+_URL_NAME_SYNTAX = "?#;&@\\"
+
+
+def reject_url_syntax(connection: Mapping[str, Any], *, where: str) -> None:
+    """Raise ``ValueError`` when ``host``, ``port`` or ``database`` would not stay in its URL part.
+
+    For the runners that build a connection URL from these fields, or hand them
+    to a connector that does: the Kafka Connect JDBC source builds
+    ``jdbc:<protocol>://host:port/database`` itself, and Debezium builds the
+    same URL from ``database.hostname``, ``database.port`` and
+    ``database.dbname``. A field that holds URL syntax would move the
+    connection, so it is refused before the URL is built. ``port`` must be
+    ASCII digits. The message names the field and never its value.
+    """
+    for key, refused, name in (
+        ("host", _URL_NAME_SYNTAX + "/", "host name"),
+        ("database", _URL_NAME_SYNTAX, "database name"),
+    ):
+        value = connection.get(key)
+        if value is None:
+            continue
+        for char in str(value):
+            if _CONTROL_CHARS.match(char):
+                shown = "a control character"
+            elif key == "host" and char.isspace():
+                shown = "whitespace"
+            elif char in refused:
+                shown = repr(char)
+            else:
+                continue
+            raise ValueError(
+                f"Invalid {key} for {where}: {shown} is not permitted, because the "
+                f"connection URL would read it as more than a {name}."
+            )
+    port = connection.get("port")
+    if port not in (None, ""):
+        text = str(port)
+        if not (text.isascii() and text.isdigit()):
+            raise ValueError(f"Invalid port for {where}: connection.port must be a port number.")
+
+
 def mask_dsn_password(text: str, password: Optional[str]) -> str:
     """Replace every quoted form of ``password`` in a driver message with ``***``.
 

@@ -26,6 +26,7 @@ import importlib
 import importlib.util
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -88,6 +89,51 @@ def _make_filesystem_source(connection: Dict[str, Any], reader: Dict[str, Any]) 
     raise ValueError(f"dlt filesystem: unsupported format '{fmt}'")
 
 
+#: A SQLAlchemy dialect name with an optional driver (``postgresql+psycopg``):
+#: the only drivername ``make_url`` reads back as a drivername and nothing more.
+_DRIVERNAME = re.compile(r"[A-Za-z0-9_]+(?:\+[A-Za-z0-9_]+)?")
+
+
+def _require_same_url(url: Any, rendered: str) -> None:
+    """Raise ``ValueError`` unless ``rendered`` parses back to exactly ``url``.
+
+    ``render_as_string`` quotes the user name and the password but neither the
+    host nor the database, and dlt parses the string again with ``make_url``,
+    whose query part SQLAlchemy's dialects pass to the driver (a ``host`` there
+    replaces the URL's own). So a field holding URL syntax would move the
+    connection. Superset judges a database URL after parsing it with
+    ``make_url`` the same way. A password without a user name is left out of
+    the string, as before. The message never holds a value.
+    """
+    from sqlalchemy.engine import make_url
+
+    try:
+        parsed = make_url(rendered)
+    except Exception:  # noqa: BLE001 — sqlalchemy.exc.ArgumentError and friends
+        parsed = None
+    password = url.password if url.username is not None else None
+    no_query: Dict[str, Any] = {}
+    expected = (url.drivername, url.username, password, url.host, url.port, url.database, no_query)
+    if (
+        parsed is None
+        or (
+            parsed.drivername,
+            parsed.username,
+            parsed.password,
+            parsed.host,
+            parsed.port,
+            parsed.database,
+            dict(parsed.query),
+        )
+        != expected
+    ):
+        raise ValueError(
+            "sql_database connection: the host, database or drivername holds URL syntax "
+            "(such as '?', '/' or '@') that would change where the connection URL points; "
+            "write each as a plain name."
+        )
+
+
 def _make_sql_database_source(connection: Dict[str, Any], streams: List[str]) -> Any:
     """Build a dlt sql_database source for Postgres/MySQL/SQLite/etc.
 
@@ -143,6 +189,11 @@ def _make_sql_database_source(connection: Dict[str, Any], streams: List[str]) ->
     password = connection.get("password") or None
     database = connection.get("database") or None
     drivername = connection.get("drivername", "postgresql+psycopg")
+    if not isinstance(drivername, str) or not _DRIVERNAME.fullmatch(drivername):
+        raise ValueError(
+            "sql_database drivername must be a SQLAlchemy dialect name with an optional "
+            "'+driver', such as postgresql+psycopg."
+        )
 
     url = URL.create(
         drivername=drivername,
@@ -156,6 +207,7 @@ def _make_sql_database_source(connection: Dict[str, Any], streams: List[str]) ->
     # connection string dlt's ``ConnectionStringCredentials`` parses; passing the
     # raw ``URL`` object trips dlt's native-value resolver.
     rendered_dsn = url.render_as_string(hide_password=False)
+    _require_same_url(url, rendered_dsn)
 
     # connection.schema / connection.schemas → dlt sql_database(schema=...).
     # dlt's sql_database accepts a single schema (Postgres/MySQL/Oracle

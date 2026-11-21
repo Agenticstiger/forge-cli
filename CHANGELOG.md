@@ -290,6 +290,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tunnel_method`) needs an allowlist entry of its own, and so does a loopback host behind
   it. A Debezium `extra_config` may no longer set `database.port`, `database.dbname`,
   `database.names` or `connector.class` beside a `secretRef`.
+- A runner that builds a connection URL keeps each field in its own part. dlt's
+  `sql_database` source refuses a host, database or `drivername` that would change how its
+  connection URL is read back, and `drivername` must be a SQLAlchemy dialect name with an
+  optional `+driver`. The Kafka Connect JDBC source and Debezium refuse a host or database
+  that holds URL syntax, and a port that is not a number.
 
 ## [0.36.0] — 2026-11-19
 

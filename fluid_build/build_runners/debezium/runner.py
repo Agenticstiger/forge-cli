@@ -38,6 +38,7 @@ from fluid_build.api.schema import SchemaFingerprint
 from fluid_build.build_runners._deployment_host_policy import (
     refuse_unless_host_allowed,
 )
+from fluid_build.providers._sql_safety import reject_url_syntax
 
 from .._acquisition_common import (
     extract_source_schemas,
@@ -157,6 +158,10 @@ def build_connector_config(
     passed verbatim under the ``database.*`` namespace.
     """
     connector_class = resolve_debezium_class(kind)
+    # Debezium builds its JDBC URL (or MongoDB's ``mongodb://host:port`` here)
+    # from the host, port and database: refused before the secret is read when
+    # one would not stay in its part.
+    reject_url_syntax(connection, where="the Debezium connector")
     if extra and connection.get("secretRef"):
         # extra_config is merged last, so a host or credential key in it would
         # move the resolved secret past the destination policy, which only saw
