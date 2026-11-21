@@ -17,7 +17,7 @@ import logging
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Collection, Dict, List, Mapping, Optional
 from urllib.parse import quote
 
 # Regex to strip URL-unsafe characters from access-agreement IDs.
@@ -251,6 +251,7 @@ class _PublishFlowMixin:
         consumer_product_id: str,
         *,
         auto_approve_access: bool = False,
+        known_product_ids: Optional[Collection[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Create Entropy Access agreements for FLUID ``consumes``.
 
@@ -259,20 +260,28 @@ class _PublishFlowMixin:
         a generic ``404`` on PUT in that case, which is hard to read in a
         publish log). Each skipped agreement gets a row in the returned
         results so the operator sees the missing-upstream warning.
+        ``known_product_ids`` is that list when the caller has just read it (a
+        batch reads it once and adds each product it publishes), so the publish
+        does not list every product again.
         """
         payloads = self._build_access_agreements(fluid, consumer_product_id)
         results: List[Dict[str, Any]] = []
 
         # Pre-flight: build the set of existing product IDs so we can detect
         # missing upstreams without a noisy 404 mid-publish.
-        existing_product_ids: set[str] = set()
-        try:
-            for prod in self.list_products() or []:
-                pid = prod.get("id")
-                if pid:
-                    existing_product_ids.add(str(pid))
-        except Exception:  # noqa: BLE001 — best effort; fall back to PUT-and-pray
-            existing_product_ids = set()
+        existing_product_ids: Collection[str]
+        if known_product_ids is not None:
+            existing_product_ids = known_product_ids
+        else:
+            listed: set[str] = set()
+            try:
+                for prod in self.list_products() or []:
+                    pid = prod.get("id")
+                    if pid:
+                        listed.add(str(pid))
+            except Exception:  # noqa: BLE001  (best effort: fall back to PUT-and-pray)
+                listed = set()
+            existing_product_ids = listed
 
         for payload in payloads:
             access_id = payload["id"]
@@ -726,9 +735,24 @@ class _PublishFlowMixin:
         found, body = self._read_json_or_none(f"/api/datacontracts/{quote(contract_id, safe='')}")
         return is_live_contract(found, body)
 
-    def _existing_product(self, product_id: str) -> Optional[Dict[str, Any]]:
-        """The product as Entropy holds it before this publish, or ``None``."""
+    def _existing_product(
+        self, product_id: str, *, must_read: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """The product as Entropy holds it before this publish, or ``None``.
+
+        ``None`` is "absent", and also "could not read". A publish that decides by what the
+        product holds (a managed ``--status``) passes ``must_read``: an unreadable product is
+        then an error, because treating it as absent would send a status over an active
+        product or over a retired one.
+        """
         found, body = self._read_json_or_none(f"/api/dataproducts/{quote(product_id, safe='')}")
+        if must_read and (found is None or (found and not isinstance(body, dict))):
+            # Unreadable, or a 200 that is not a product (a proxy's page, ``null``, a list).
+            raise ProviderError(
+                f"Could not read data product {product_id!r} from Entropy Data, so what it "
+                "holds is unknown and nothing was sent for it. See the warning above for the "
+                "cause, then run the same command again."
+            )
         return body if found and isinstance(body, dict) else None
 
     def _retire_stale_contracts(
