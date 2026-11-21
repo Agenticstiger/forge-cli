@@ -939,7 +939,7 @@ def test_a_new_module_is_written_and_then_unchanged(tmp_path: Path):
 
 
 def test_a_module_the_command_wrote_is_replaced_when_the_contract_changes(tmp_path: Path):
-    [old] = _modules("orders")
+    [old] = ps.render_contract(_contract(_field("a"), port="orders")).modules  # the same product
     ps.write(ps.plan([old], tmp_path))
     new = ps.render_contract(_contract(_field("a"), _field("b", "int"), port="orders")).modules
 
@@ -1206,7 +1206,8 @@ def test_an_existing_file_of_any_size_is_judged_by_its_head(tmp_path: Path):
     [module] = _modules("orders")
     huge = tmp_path / "orders_schema.py"
     with huge.open("wb") as handle:
-        handle.write(ps.HEADER.encode("utf-8") + b"\n")
+        # the module's own first lines, product line included: a file this product wrote
+        handle.write("\n".join(module.source.split("\n")[:8]).encode("utf-8") + b"\n")
         handle.truncate(3 * 1024**3)  # sparse: nothing is stored for the gap
 
     [stale] = ps.plan([module], tmp_path)
@@ -1215,6 +1216,63 @@ def test_an_existing_file_of_any_size_is_judged_by_its_head(tmp_path: Path):
     [foreign] = ps.plan([module], tmp_path)
 
     assert (stale.status, foreign.status) == ("stale", "foreign")
+
+
+def _of_product(product: str, port: str = "orders", column: str = "a") -> List[ps.PortModule]:
+    contract = {
+        "id": product,
+        "exposes": [{"exposeId": port, "contract": {"schema": [_field(column)]}}],
+    }
+    return list(ps.render_contract(contract).modules)
+
+
+def test_a_module_another_product_generated_is_never_replaced(tmp_path: Path):
+    [sales] = _of_product("sales.orders")
+    [billing] = _of_product("billing.invoices", column="invoice_id")
+    ps.write(ps.plan([sales], tmp_path))
+    written = (tmp_path / "orders_schema.py").read_bytes()
+
+    [item] = ps.plan([billing], tmp_path)
+    ps.write([item])
+
+    assert (item.status, item.owner) == ("other_product", "sales.orders")
+    assert (tmp_path / "orders_schema.py").read_bytes() == written
+
+
+def test_the_same_product_still_replaces_its_stale_module_whatever_the_line_endings(
+    tmp_path: Path,
+):
+    [old] = _of_product("sales.orders", column="a")
+    [new] = _of_product("sales.orders", column="b")
+    ps.write(ps.plan([old], tmp_path))
+    assert [p.status for p in ps.plan([new], tmp_path)] == ["stale"]
+    path = tmp_path / "orders_schema.py"
+    path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))  # a checkout that converted them
+    assert [p.status for p in ps.plan([new], tmp_path)] == ["stale"]
+    ps.write(ps.plan([new], tmp_path))
+    assert [p.status for p in ps.plan([new], tmp_path)] == ["unchanged"]
+
+
+def test_a_header_file_that_names_no_product_is_not_replaced(tmp_path: Path):
+    [module] = _of_product("sales.orders")
+    (tmp_path / "orders_schema.py").write_text(ps.HEADER + "\nSCHEMA = None\n", encoding="utf-8")
+
+    [item] = ps.plan([module], tmp_path)
+
+    assert (item.status, item.owner) == ("other_product", None)
+
+
+def test_the_owner_a_file_names_is_printed_as_plain_text(tmp_path: Path):
+    [module] = _of_product("sales.orders")
+    planted = (
+        ps.HEADER + "\n" + ps.PRODUCT_PREFIX + "evil\x1b[31m" + "x" * 200 + "\nSCHEMA = None\n"
+    )
+    (tmp_path / "orders_schema.py").write_text(planted, encoding="utf-8")
+
+    [item] = ps.plan([module], tmp_path)
+
+    assert item.status == "other_product"
+    assert item.owner is not None and "\x1b" not in item.owner and len(item.owner) <= 80
 
 
 def test_a_module_this_command_wrote_for_a_port_the_contract_dropped_is_an_orphan(tmp_path: Path):

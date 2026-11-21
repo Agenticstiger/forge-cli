@@ -715,13 +715,20 @@ def _verify(source: str, filename: str, names: FrozenSet[str]) -> None:
 _HEADER_BYTES = HEADER.encode("utf-8")
 
 
+_PRODUCT_PREFIX_BYTES = PRODUCT_PREFIX.encode("utf-8")
+
+
 @dataclass(frozen=True)
 class Planned:
     """A module, where it goes, and what writing it would do."""
 
     module: PortModule
     path: Path
-    status: str  # new | unchanged | stale | foreign
+    #: new | unchanged | stale | foreign | other_product
+    status: str
+    #: For ``other_product``: the product the file says it was generated for (one line of plain
+    #: text), or ``None`` when its header names none.
+    owner: Optional[str] = None
 
 
 def _head(path: Path, limit: int) -> Optional[bytes]:
@@ -753,13 +760,38 @@ def _head(path: Path, limit: int) -> Optional[bytes]:
         os.close(descriptor)
 
 
+def _product_line(source: str) -> Optional[bytes]:
+    """The ``# data product: ...`` line among the first lines of a module's own source."""
+    for line in source.split("\n")[:10]:
+        if line.startswith(PRODUCT_PREFIX):
+            return line.encode("utf-8")
+    return None
+
+
+def _first_lines(head: bytes) -> List[bytes]:
+    """The first ten lines of a file's head, whatever its line endings."""
+    return head.replace(b"\r\n", b"\n").split(b"\n")[:10]
+
+
+def _owner_of(head: bytes) -> Optional[str]:
+    """The product a header file says it was generated for, as one line of plain text."""
+    for line in _first_lines(head):
+        if line.startswith(_PRODUCT_PREFIX_BYTES):
+            return _prose(line[len(_PRODUCT_PREFIX_BYTES) :].decode("utf-8", "replace"))[:80]
+    return None
+
+
 def plan(modules: Sequence[PortModule], out_dir: Path) -> List[Planned]:
     """What each module would do in ``out_dir``: ``new`` (no file), ``unchanged``, ``stale``
-    (a file this command wrote, now different) or ``foreign`` (a file it did not write, or
-    one it cannot read, or a link: never overwritten)."""
+    (a file this command wrote for THIS product, now different), ``other_product`` (a file this
+    command wrote for another product, or one whose header names none: two products that share an
+    output directory and a port id must not replace each other's module) or ``foreign`` (a file it
+    did not write, or one it cannot read, or a link). Only ``new`` and ``stale`` are ever written.
+    """
     planned: List[Planned] = []
     for module in modules:
         path = out_dir / module.filename
+        owner: Optional[str] = None
         if path.is_symlink() or (path.exists() and not path.is_file()):
             status = "foreign"
         elif not path.exists():
@@ -774,10 +806,14 @@ def plan(modules: Sequence[PortModule], out_dir: Path) -> List[Planned]:
             elif len(head) < limit and head.replace(b"\r\n", b"\n") == wanted:
                 status = "unchanged"
             elif head.startswith(_HEADER_BYTES):
-                status = "stale"
+                ours = _product_line(module.source)
+                if ours is None or ours in _first_lines(head):
+                    status = "stale"
+                else:
+                    status, owner = "other_product", _owner_of(head)
             else:
                 status = "foreign"
-        planned.append(Planned(module, path, status))
+        planned.append(Planned(module, path, status, owner))
     return planned
 
 

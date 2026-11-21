@@ -32,11 +32,16 @@ def _port(port: str, *columns: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _write(tmp_path: Path, *ports: Dict[str, Any], name: str = "c.fluid.yaml") -> Path:
+def _write(
+    tmp_path: Path,
+    *ports: Dict[str, Any],
+    name: str = "c.fluid.yaml",
+    product: str = "acme.sales.orders",
+) -> Path:
     contract = {
         "fluidVersion": "0.7.7",
         "kind": "DataProduct",
-        "id": "acme.sales.orders",
+        "id": product,
         "name": "Orders",
         "exposes": list(ports),
     }
@@ -170,6 +175,43 @@ def test_a_file_it_did_not_write_is_never_overwritten_and_nothing_else_is_writte
     assert "ERR_GENERATE_PYSPARK_SCHEMA_FOREIGN_FILE" in text and "orders_schema.py" in text
     assert mine.read_text(encoding="utf-8") == "# written by hand\nSCHEMA = None\n"
     assert [p.name for p in out.iterdir()] == ["orders_schema.py"]  # events_schema.py waits
+
+
+def test_two_products_that_share_an_out_and_a_port_id_never_replace_each_other(
+    tmp_path: Path, capsys
+):
+    sales = _write(tmp_path, ORDERS, name="sales.yaml", product="sales.orders")
+    billing = _write(
+        tmp_path,
+        _port("orders", _column("invoice_id"), _column("total", "decimal(12,2)")),
+        _port("events", _column("id", "bigint")),
+        name="billing.yaml",
+        product="billing.invoices",
+    )
+    out = tmp_path / "runtime" / "pyspark_schema"  # the default --out, shared by a monorepo
+    assert _main("generate", "pyspark-schema", str(sales), "-o", str(out)) == 0
+    module = out / "orders_schema.py"
+    written = module.read_bytes()
+    capsys.readouterr()
+
+    rc = _main("generate", "pyspark-schema", str(billing), "-o", str(out))
+
+    text = _text(capsys)
+    assert rc == 1
+    assert "ERR_GENERATE_PYSPARK_SCHEMA_OTHER_PRODUCT" in text
+    assert "orders_schema.py" in text and "generated for sales.orders" in text
+    assert "own --out" in text
+    assert module.read_bytes() == written  # sales' module is still sales'
+    assert [p.name for p in out.iterdir()] == ["orders_schema.py"]  # nothing of billing's written
+    # sales still checks clean, and billing's check says why it cannot pass here
+    assert _main("generate", "pyspark-schema", str(sales), "-o", str(out), "--check") == 0
+    capsys.readouterr()
+    assert _main("generate", "pyspark-schema", str(billing), "-o", str(out), "--check") == 1
+    assert "ERR_GENERATE_PYSPARK_SCHEMA_OTHER_PRODUCT" in _text(capsys)
+    # each product keeps its own directory
+    own = tmp_path / "billing"
+    assert _main("generate", "pyspark-schema", str(billing), "-o", str(own)) == 0
+    assert b"invoice_id" in (own / "orders_schema.py").read_bytes()
 
 
 def test_it_writes_no_package_marker_and_deletes_nothing(tmp_path: Path):

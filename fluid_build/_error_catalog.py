@@ -564,6 +564,16 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         None,
     ),
+    "generate_pyspark_schema_other_product": (
+        [
+            "A module with this name is already in --out and was generated for another data "
+            "product, so it is left alone and nothing is written: give each product its own "
+            "--out, for example runtime/pyspark_schema/<product>",
+            "Or delete the file if that product no longer uses this --out: this command never "
+            "replaces a module another product generated",
+        ],
+        None,
+    ),
     "generate_pyspark_schema_drift": (
         [
             "Run 'fluid generate pyspark-schema <contract> --out <dir>' and commit the "

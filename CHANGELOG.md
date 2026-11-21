@@ -27,8 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on its first two lines (an encoding declared there would change how Python decodes the file),
   and every module is checked against an allowlist of what it may hold before it is written.
   `py_comment_text` now also spells `coding:` and `coding=` apart for the same reason. The command
-  replaces only files it wrote itself (a file without its header is never overwritten), writes no
-  `__init__.py` and deletes nothing; `--check` writes nothing and exits 1 when a module is
+  replaces only files it wrote itself for the same data product (a file without its header is never
+  overwritten, and neither is one whose `# data product:` line names another product: two products
+  that share an `--out` and a port id get the typed error `generate_pyspark_schema_other_product`,
+  from a run and from `--check`, with nothing written, and are told to give each product its own
+  `--out`), writes no `__init__.py` and deletes nothing; `--check` writes nothing and exits 1 when a module is
   missing, differs or is no longer in the contract (another data product's modules in the same
   directory are left out of that), for a CI job that keeps committed modules current.
 

@@ -98,6 +98,19 @@ def run(args, logger: logging.Logger) -> int:
         foreign = [str(p.path) for p in planned if p.status == "foreign"]
         if foreign:
             raise CLIError(1, "generate_pyspark_schema_foreign_file", {"files": ", ".join(foreign)})
+        # Another product's module in a shared --out: refused whole, nothing written, so a run for
+        # one product never replaces what a run for another wrote (and --check says the same).
+        other = [p for p in planned if p.status == "other_product"]
+        if other:
+            raise CLIError(
+                1,
+                "generate_pyspark_schema_other_product",
+                {
+                    "files": ", ".join(
+                        f"{p.path} (generated for {p.owner or 'no named product'})" for p in other
+                    )
+                },
+            )
     except CLIError:
         raise
     except UnsupportedBindingError as exc:
