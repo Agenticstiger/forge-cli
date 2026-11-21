@@ -405,6 +405,34 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "troubleshooting#connectivity",
     ),
+    "table_adoption_requires_flag": (
+        [
+            "Review the take-over first: 'fluid plan <contract> --tofu --adopt-tables' "
+            + "checks each table against the contract and saves the plan",
+            "Then apply that plan with 'fluid apply plan.json', or re-run this apply "
+            + "with --adopt-tables",
+        ],
+        None,
+    ),
+    "table_adoption_mismatch": (
+        [
+            "Nothing was imported or applied: the tables are as they were",
+            "Align exposes[].contract.schema and binding.location with each table named "
+            + "above, then re-run with --adopt-tables",
+        ],
+        None,
+    ),
+    "table_adoption_unavailable": (
+        [
+            "Set AWS_ACCOUNT_ID to the account that holds the tables, or run with "
+            + "credentials sts:GetCallerIdentity accepts, then re-run with --adopt-tables",
+        ],
+        "troubleshooting#connectivity",
+    ),
+    "plan_adopt_tables_needs_tofu": (
+        ["Run 'fluid plan <contract> --tofu --adopt-tables'"],
+        None,
+    ),
     "opentofu_region_moved": (
         [
             "If the resources should stay where they are, set the binding's location.region "

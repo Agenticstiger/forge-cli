@@ -68,6 +68,7 @@ from fluid_build.iac.state_migration import (
 from fluid_build.iac.state_migration import reconcile_state_key as _reconcile_state
 from fluid_build.observability.secret_redactor import redact_secret_text
 
+from . import _apply_table_adoption as _table_adoption
 from ._apply_cc_report import current_report
 from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
 from ._logging import info, warn
@@ -176,13 +177,22 @@ def _apply_via_opentofu(
         reconcile_state_key(eng.target, eng.provider, eng.env, logger, migrate=True)
 
     _guard_before_plan(eng, args, logger)
+    _table_adoption.before_lookup(eng.plugin, eng.provider, eng.contract, eng.actions, args)
 
     # What this run imports stays in state only once its ``tofu apply`` starts
     # (:func:`_imports_kept_only_by_an_apply`).
     with _imports_kept_only_by_an_apply(eng.workdir, eng.env, logger) as imported:
-        _adopt_existing(
-            eng.plugin, eng.contract, eng.actions, eng.workdir, eng.env, logger, imported.addresses
+        adopted = _adopt_existing(
+            eng.plugin,
+            eng.contract,
+            eng.actions,
+            eng.workdir,
+            eng.env,
+            logger,
+            imported.addresses,
+            strict_tables=_table_adoption.asked(args),
         )
+        tables = _tables_through_import_blocks(eng, args, adopted, imported)
 
         plan = runner.tofu_plan(eng.workdir, env=eng.env)
         if not plan.ok:
@@ -190,6 +200,10 @@ def _apply_via_opentofu(
         changes = runner.change_summary(plan)
         cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
         _record_planned(eng, changes, dry_run)
+        # Before the data-loss gate: a table that differs is refused naming what differs.
+        _table_adoption.check_plan(
+            eng.plugin, eng.module, tables, _shown_for_adoption(eng, tables), logger
+        )
         destroyed = _review_plan(eng, args, logger, changes, runner.planned_removals(plan))
         if dry_run:
             _preview_outside_opentofu(eng, logger, destroyed, changes)
@@ -203,6 +217,50 @@ def _apply_via_opentofu(
         imported.keep()
 
     return _finish_apply(eng, logger, changes, destroyed, applied_state)
+
+
+def _tables_through_import_blocks(
+    eng: _Engine, args, adopted: List[Any], imported: Any
+) -> List[Any]:
+    """The existing tables ``fluid apply`` found, moved from state into ``import`` blocks.
+
+    The brownfield look-up (:func:`_adopt_existing`) imports a table to learn that it
+    exists. Without ``--adopt-tables`` the run stops here (``_apply_table_adoption``);
+    with it the table goes back out of state and into the module as an ``import`` block,
+    so the plan shows its import and the check reads it from the saved plan. The other
+    imports stay in state for the apply, as before.
+    """
+    tables = _table_adoption.tables_of(adopted)
+    _table_adoption.refuse_unless_asked(args, tables)
+    if not tables:
+        return []
+    addresses = [block.to for block in tables]
+    released = runner.tofu_state_rm(eng.workdir, addresses, env=eng.env)
+    if not released.ok:
+        # Still held, so the run's own hand-back tries again as it stops.
+        raise CLIError(
+            1,
+            "plan_tofu_adoption_not_released",
+            {
+                "error": "the tables to adopt could not be released from state for their "
+                "import blocks: " + _tail(released.stderr or released.stdout, 200),
+                "remediation": [
+                    f"tofu -chdir={shlex.quote(eng.workdir)} state rm " + " ".join(addresses),
+                    "then re-run",
+                ],
+            },
+        )
+    for address in addresses:
+        imported.addresses.remove(address)
+    _table_adoption.write_import_blocks(eng.module_path, tables)
+    return tables
+
+
+def _shown_for_adoption(eng: _Engine, tables: List[Any]) -> Optional[Dict[str, Any]]:
+    """The saved plan as ``tofu show -json`` prints it, when there are tables to check."""
+    if not tables:
+        return None
+    return runner.tofu_show_plan(eng.workdir, plan_file=_WORKDIR_PLAN, env=eng.env)
 
 
 def _verify_registry_at_apply(
@@ -582,12 +640,24 @@ def _plan_with_opentofu(
     eng = _open_engine(args, logger, contract)
     reconcile_state_key(eng.target, eng.provider, eng.env, logger, migrate=True)
     _guard_before_plan(eng, args, logger)
+    _table_adoption.before_lookup(eng.plugin, eng.provider, eng.contract, eng.actions, args)
 
     with _imports_kept_only_by_an_apply(eng.workdir, eng.env, logger) as imported:
         adopted: List[ImportBlock] = _adopt_existing(
-            eng.plugin, eng.contract, eng.actions, eng.workdir, eng.env, logger, imported.addresses
+            eng.plugin,
+            eng.contract,
+            eng.actions,
+            eng.workdir,
+            eng.env,
+            logger,
+            imported.addresses,
+            strict_tables=_table_adoption.asked(args),
         )
+        # An existing table the state does not hold stops the plan unless it was asked to
+        # adopt it; the hand-back runs first, as the run stops.
+        _table_adoption.refuse_unless_asked(args, _table_adoption.tables_of(adopted))
     _refuse_unreleased_imports(eng, adopted)
+    tables = _table_adoption.tables_of(adopted)
     if adopted:
         document = json.loads(eng.module_path.read_text(encoding="utf-8"))
         document.setdefault("import", []).extend(import_section(adopted).get("import", []))
@@ -599,10 +669,6 @@ def _plan_with_opentofu(
         raise _plan_failure(eng.plugin, eng.contract, plan, eng.workdir, eng.env)
     changes = runner.change_summary(plan)
     cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
-    _review_plan(eng, args, logger, changes, runner.planned_removals(plan), enforce=False)
-
-    saved = (Path(eng.workdir) / _WORKDIR_PLAN).read_bytes()
-    os.chmod(Path(eng.workdir) / _WORKDIR_PLAN, 0o600)
     shown = runner.tofu_show_plan(eng.workdir, plan_file=_WORKDIR_PLAN, env=eng.env)
     if shown is None:
         raise CLIError(
@@ -610,6 +676,12 @@ def _plan_with_opentofu(
             "plan_tofu_show_failed",
             {"error": f"`tofu show -json {_WORKDIR_PLAN}` failed in {eng.workdir}"},
         )
+    # Before the data-loss reading, and before any file is written next to plan.json.
+    reviews = _table_adoption.check_plan(eng.plugin, eng.module, tables, shown, logger)
+    _review_plan(eng, args, logger, changes, runner.planned_removals(plan), enforce=False)
+
+    saved = (Path(eng.workdir) / _WORKDIR_PLAN).read_bytes()
+    os.chmod(Path(eng.workdir) / _WORKDIR_PLAN, 0o600)
     target = _target_record(eng)
     cprint_literal(f"  target:      {target_identity.describe(eng.provider, target['identity'])}")
     for field_name, why in sorted(target["unread"].items()):
@@ -645,6 +717,8 @@ def _plan_with_opentofu(
         **_state_version(eng),
         "changes": changes,
         "imports": sorted(block.to for block in adopted),
+        # Under planDigest: an approval of plan.json is an approval of these take-overs.
+        **({"adoptedTables": sorted(review.table for review in reviews)} if reviews else {}),
         "target": target,
     }
 
@@ -989,6 +1063,7 @@ def _apply_bound_plan(
         f"\n  saved plan {record['planFile']} ({str(record['sha256'])[:19]}…): "
         f"+{changes['add']} ~{changes['change']} -{changes['remove']}"
     )
+    _table_adoption.say_bound(record)
     _record_planned(eng, changes, dry_run)
     destroyed = _review_plan(eng, args, logger, changes, runner.saved_plan_removals(shown))
     if dry_run:
@@ -1905,10 +1980,18 @@ def _adopt_existing(
     env: Mapping[str, str],
     logger: logging.Logger,
     held: Optional[List[str]] = None,
+    *,
+    strict_tables: bool = False,
 ) -> List[Any]:
     """Brownfield adoption — ``tofu import`` each declared resource that
     already exists in the cloud, so ``tofu apply`` reconciles it instead of
     failing "already exists" against pre-provisioned infrastructure.
+
+    An import that takes over a table (``ImportBlock.table``) is only a look-up here:
+    the caller refuses it without ``--adopt-tables`` and otherwise moves it into an
+    ``import`` block (``cli/_apply_table_adoption.py``). ``strict_tables`` (the flag)
+    makes such a look-up strict, as ``strict_adoption`` makes every import: a table the
+    run was asked to adopt is never planned as new because its look-up failed.
 
     Best-effort: a candidate already in state is skipped; one that does not
     exist in the cloud fails to import and is left for ``tofu apply`` to
@@ -1942,7 +2025,9 @@ def _adopt_existing(
             adopted.append(replace(block, id=import_id, id_from=None))
             if held is not None:
                 held.append(block.to)
-        elif strict and not block.best_effort:
+        elif (strict or (strict_tables and getattr(block, "table", None))) and not (
+            block.best_effort
+        ):
             _refuse_unadopted(plugin, contract, block, result, workdir, env)
         else:
             logger.debug(
@@ -2054,14 +2139,22 @@ def _refuse_unadopted(
     explained = _explained_failure(plugin, contract, output, workdir, env)
     if explained is not None:
         raise explained
+    why = (
+        "the provider replaces an existing object it creates over; "
+        "applying now could replace it, with the plan showing a plain create"
+    )
+    if getattr(block, "table", None) and not getattr(plugin, "strict_adoption", False):
+        why = (
+            "--adopt-tables adopts a table only once it is known to exist; planned as new, "
+            "an existing table would fail the apply after the resources before it"
+        )
     raise CLIError(
         1,
         "opentofu_adoption_failed",
         {
             "error": f"could not tell whether {block.id} already exists, so it was not "
             f"adopted into {block.to}: {_first_error(output)}",
-            "why": "the provider replaces an existing object it creates over; "
-            "applying now could replace it, with the plan showing a plain create",
+            "why": why,
         },
     )
 

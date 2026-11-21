@@ -650,6 +650,19 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
     mode_group.add_argument(
+        "--adopt-tables",
+        action="store_true",
+        default=False,
+        help=(
+            "Take over the existing tables the contract names (Glue tables on AWS) "
+            "through OpenTofu import blocks, each only if it matches the contract: "
+            "columns, location and format; one that differs is refused with its "
+            "differences. Off by default: an existing table the state does not manage "
+            "is refused. Logs a WARNING-level audit event; the data-loss gate still "
+            "applies."
+        ),
+    )
+    mode_group.add_argument(
         "--bundle",
         default=None,
         help=(
