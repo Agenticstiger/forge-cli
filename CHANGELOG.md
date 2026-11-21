@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid import pyspark` and `fluid import airflow` propose products from the code that already
+  runs.** `fluid import pyspark <jobs-dir> [--dags <dags-dir>]` reads PySpark jobs and
+  `fluid import airflow <dags-dir>` reads Airflow DAG files, both statically: the files are parsed
+  with `ast` and never imported or run, so Airflow is never loaded and no job executes. A job's
+  tables, paths and Kafka topics (read and written), a stream's checkpoint and trigger, and the SQL
+  in `spark.sql(...)` (CTE names and temporary views left out; an f-string field that does not fold
+  leaves the rest of the statement readable) become **one product per output table or topic, with a
+  single writer and one owner**, and the upstream reads become `consumes[]`. A table written by two
+  jobs is proposed once and reported; a name that is not a constant is reported with the reason,
+  never guessed. With `--dags` (or through `script_roots` for `airflow`), each task is joined to the
+  script it submits: the standard Spark-submitting operators are read (SparkSubmit, EMR add steps
+  and create job flow, EMR on EKS and Serverless job drivers, Glue, Databricks `spark_python_task`,
+  and a `spark-submit` in a `BashOperator`) and the DAG's schedule, tags, owner, tasks and
+  dependencies land on the build under `execution.orchestration` with `mode: manual`; the trigger
+  is `manual`, or `continuous` for a long-running stream, never `schedule`, because
+  `fluid generate schedule` would render a second DAG for it. `--split-by` takes `table` (the
+  default), `job`, `dag`, `folder` and `project` for these importers. `--conventions <file>` holds
+  the organisation's layout as data (script prefixes, data path prefixes, helper function names,
+  config modules, environment names, owners, layers, what to ignore, the product id rule); it is
+  read strictly and no code in it runs. `--registry` reads a written topic's columns through the
+  existing schema-registry importer, only when asked. Every proposal is validated against the
+  schema before anything is written, credential-shaped arguments are masked, and a second import
+  never replaces a file that differs from what it would write unless `--force` is given.
+
+- **`fluid import` takes a generic `--dry-run`, and importers can be added by packages.** `--dry-run`
+  prints the proposal (each product, its writer, outputs and upstreams) and the report and writes
+  nothing, for every importer. The importer names come from a registry now, and a package adds
+  `fluid import <tool>` through the `fluid_build.importers` entry-point group: a duck-typed object
+  with `import_to_contract` or `import_to_contracts` and no forge import, any report object with the
+  report's four lists, read by name and loaded only when its tool is asked for, held to
+  `FLUID_PLUGINS_ALLOWLIST` and `FLUID_PLUGINS_BLOCKLIST`, unable to take a built-in's name, and
+  refused when two distributions ship one name. `fluid --help` stays cold.
+
 - **`fluid diff --baseline` reports a changed product id, and `--fail-on-id-change` fails on it.**
   The changelog gains a breaking `product_id_changed` change, first in the report: the id is the
   product's identity, so a contract whose id differs from the baseline's describes another
