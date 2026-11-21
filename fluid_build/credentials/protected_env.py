@@ -211,6 +211,10 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         "FLUID_STATE_ENCRYPTION",
         # =0 turns S3 state locking off: the operator's call, never a checkout's
         "FLUID_TOFU_S3_LOCKFILE",
+        # the scheduler run a command belongs to (observability/run_id.scheduler_run), which the
+        # scheduler sets per run: a checkout's .env would put every run, and its run id, under one
+        "FLUID_SCHEDULER_JOB",
+        "FLUID_SCHEDULER_RUN_ID",
         "FLUID_STORE_BACKEND",
         "FLUID_STORE_DSN",
         "FLUID_STORE_PATH",

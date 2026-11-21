@@ -12,8 +12,10 @@ happened on Monday's deploy of orders_v1?" by ID.
 This module provides a single canonical run-id resolver:
 
 1. ``$FLUID_RUN_ID`` env var (operator override / CI injection).
-2. ``.fluid/run-id.txt`` (persisted between stages).
-3. Newly-generated id (first stage of a run).
+2. The scheduler's run, for a command a scheduler started (:func:`scheduler_run`): an id
+   derived from it, never persisted.
+3. ``.fluid/run-id.txt`` (persisted between stages).
+4. Newly-generated id (first stage of a run).
 
 Every CLI stage that emits OTel spans should call
 :func:`get_or_create_run_id` early and stamp the result onto its root
@@ -28,11 +30,13 @@ the run_id is read from this module at command entry.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import secrets
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, NamedTuple, Optional
 
 LOG = logging.getLogger("fluid.observability.run_id")
 
@@ -43,6 +47,46 @@ RUN_ID_ENV_VAR = "FLUID_RUN_ID"
 #: successful completion of the final pipeline stage (publish or
 #: schedule-sync) — see ``cli/_cleanup.py``.
 RUN_ID_FILE = "run-id.txt"
+
+#: The scheduler's run a command belongs to, set by whatever started it: the job the scheduler
+#: runs (Airflow's DAG id) and its run of that job (Airflow's run id, which is unique per DAG
+#: only). The DAGs ``fluid generate schedule`` writes set them from Airflow's task context.
+SCHEDULER_JOB_ENV = "FLUID_SCHEDULER_JOB"
+SCHEDULER_RUN_ID_ENV = "FLUID_SCHEDULER_RUN_ID"
+
+
+class SchedulerRun(NamedTuple):
+    """A scheduler's run: the job it runs (None when not named) and the run's id."""
+
+    job: Optional[str]
+    run_id: str
+
+
+def scheduler_run(environ: Mapping[str, str] = os.environ) -> Optional[SchedulerRun]:
+    """The scheduler run this command belongs to, or None when no scheduler started it.
+
+    Read from :data:`SCHEDULER_RUN_ID_ENV` with :data:`SCHEDULER_JOB_ENV`, else from the task
+    context Airflow 2 and 3 export to every task (``AIRFLOW_CTX_DAG_RUN_ID`` with
+    ``AIRFLOW_CTX_DAG_ID``; a BashOperator's command always has them). A pair comes whole from
+    one of the two, so a run id is never paired with another source's job. A job with no run
+    names no run.
+    """
+    for job, run in (
+        (environ.get(SCHEDULER_JOB_ENV), environ.get(SCHEDULER_RUN_ID_ENV)),
+        (environ.get("AIRFLOW_CTX_DAG_ID"), environ.get("AIRFLOW_CTX_DAG_RUN_ID")),
+    ):
+        run_id = (run or "").strip()
+        if run_id:
+            return SchedulerRun((job or "").strip() or None, run_id)
+    return None
+
+
+def _scheduled_run_id(run: SchedulerRun) -> str:
+    """A run id of the usual shape that names ``run`` alone: the same for every command of one
+    scheduler run, another for each other run. OpenLineage's Airflow integration names its runs
+    the same way, from the DAG run rather than from anything kept on the worker."""
+    text = json.dumps([run.job, run.run_id], ensure_ascii=True)
+    return hashlib.sha256(text.encode("ascii")).hexdigest()[:12]
 
 
 def _generate_id() -> str:
@@ -69,8 +113,12 @@ def get_or_create_run_id(
     Resolution order:
 
     1. ``$FLUID_RUN_ID`` (env var override).
-    2. ``.fluid/run-id.txt`` (persisted from a prior stage).
-    3. Newly generated id, persisted to ``.fluid/run-id.txt`` when
+    2. The run of the scheduler that started this command (:func:`scheduler_run`): an id
+       derived from it, the same for each command of that run, neither read from nor written
+       to ``.fluid/run-id.txt``. A worker's checkout keeps that file from run to run, so
+       reading it would give every scheduled run one id.
+    3. ``.fluid/run-id.txt`` (persisted from a prior stage).
+    4. Newly generated id, persisted to ``.fluid/run-id.txt`` when
        ``create_persisted_file=True`` (the default).
 
     Args:
@@ -87,6 +135,10 @@ def get_or_create_run_id(
     env_value = os.environ.get(RUN_ID_ENV_VAR)
     if env_value:
         return env_value.strip()
+
+    scheduled = scheduler_run()
+    if scheduled is not None:
+        return _scheduled_run_id(scheduled)
 
     persisted_path = _runtime_dir(workspace_root) / RUN_ID_FILE
     if persisted_path.is_file():
@@ -136,6 +188,10 @@ __all__ = [
     "RUN_ID_ENV_VAR",
     "RUN_ID_FILE",
     "get_or_create_run_id",
+    "SCHEDULER_JOB_ENV",
+    "SCHEDULER_RUN_ID_ENV",
+    "SchedulerRun",
+    "scheduler_run",
     "clear_run_id",
     "run_id_span_attribute",
 ]
