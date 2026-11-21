@@ -836,6 +836,28 @@ def test_an_enormous_expression_is_described_without_being_unparsed():
     assert time.monotonic() - started < 0.5
 
 
+def test_an_expression_of_a_few_long_lines_is_not_unparsed_to_be_described():
+    import time
+
+    row = ",".join(
+        "a" for _ in range(3000)
+    )  # 30 lines of 6 KB: neither many lines nor one wide one
+    source = "x = f(\n" + ",\n".join([row] * 30) + ")\n"
+    module = P.parse_module("wide.py", source.encode("utf-8"))
+    node = module.tree.body[0].value  # type: ignore[attr-defined]
+    started = time.monotonic()
+    assert P.snippet(node) == "<expression>"  # about 200 nodes are counted, not 90,000 unparsed
+    assert time.monotonic() - started < 0.2
+    started = time.monotonic()
+    for _ in range(1000):
+        assert P.snippet(node) == "<expression>"  # and the answer is kept
+    assert time.monotonic() - started < 0.2
+    text = "x = '" + "q" * 5000 + "'\n"  # one long string: the text counts, not the nodes
+    assert P.snippet(P.parse_module("s.py", text.encode()).tree.body[0].value) == "<expression>"  # type: ignore[attr-defined]
+    small = P.parse_module("t.py", b"x = spark.table('db.orders').where(a > 1)\n")
+    assert P.snippet(small.tree.body[0].value) == "spark.table('db.orders').where(a > 1)"  # type: ignore[attr-defined]
+
+
 def test_braces_are_counted_in_the_encoding_the_parser_reads():
     fields = "+AHsAYgB9-" * 60_000  # {b} in UTF-7, 60,000 of them
     hostile = ("# coding: utf-7\n" + "c = f'" + fields + "'\n").encode("ascii")

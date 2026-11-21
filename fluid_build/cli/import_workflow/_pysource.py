@@ -358,16 +358,33 @@ def clean_chars(text: object, *, keep: str = "") -> str:
     return "".join(out)
 
 
+#: A snippet shows at most 80 characters, so an expression of more than this many nodes, or with
+#: more than this many characters of text in its strings, is not unparsed to be cut short.
+_SNIPPET_NODES = 200
+_SNIPPET_TEXT = 2_000
+
+
 def _is_large(node: ast.AST) -> bool:
-    """Whether ``node`` spans too much source to be worth unparsing for a short description:
-    unparsing a subtree costs its size, and a report line may ask for it at every level."""
-    first = getattr(node, "lineno", None)
-    last = getattr(node, "end_lineno", None)
-    if first is None or last is None:
-        return False
-    if last - first > 40:
-        return True
-    return last == first and (getattr(node, "end_col_offset", 0) - node.col_offset) > 2000
+    """Whether ``node`` is too big to be worth unparsing for a short description: unparsing a
+    subtree costs its size, and a report line may ask for it at every level. Counted on the tree,
+    not on lines and columns (a node on 40 lines of 7 KB each is as costly as one line of 280 KB),
+    and the count stops at the limit, so it costs at most that much itself. The answer is kept on
+    the node: a name used a hundred times is judged once."""
+    kept = getattr(node, "_fluid_large", None)
+    if kept is not None:
+        return bool(kept)
+    nodes = text = 0
+    large = False
+    stack = [node]
+    while stack and not large:
+        current = stack.pop()
+        nodes += 1
+        if isinstance(current, ast.Constant) and isinstance(current.value, (str, bytes)):
+            text += len(current.value)
+        large = nodes > _SNIPPET_NODES or text > _SNIPPET_TEXT
+        stack.extend(ast.iter_child_nodes(current))
+    node._fluid_large = large  # type: ignore[attr-defined]
+    return large
 
 
 def snippet(node: ast.AST, limit: int = 80) -> str:
