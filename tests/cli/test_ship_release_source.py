@@ -136,6 +136,9 @@ def test_the_first_ci_that_is_running_wins():
         ),
         ("ssh://deploy@git.example.com/org/orders.git", "ssh://git.example.com/org/orders.git"),
         ("deploy@git.example.com:org/orders.git", "git.example.com:org/orders.git"),
+        ("git@gitlab.example.com:group/sub/orders.git", "gitlab.example.com:group/sub/orders.git"),
+        ("ssh://git@[2001:db8::1]:2222/org/orders.git", "ssh://[2001:db8::1]:2222/org/orders.git"),
+        ("https://deploy:" + "pw" + "@[::1]:8443/o/r", "https://[::1]:8443/o/r"),
     ],
 )
 def test_a_clone_url_loses_the_user_the_password_the_query_and_the_fragment(clone, shown):
@@ -158,11 +161,28 @@ def test_a_clone_url_loses_the_user_the_password_the_query_and_the_fragment(clon
         "https://host/" + "x" * 300,
         "https://host/\nhttps://evil",
         "",
+        # a CI variable set to a credential, a drive, a path on the server's root, no org
+        "oauth2:" + "tok" + "en123",
+        "x-token-auth:" + "tok" + "en123",
+        "john.doe:" + "pw",
+        "C:/Users/runner/work/repo",
+        "host:/etc/shadow",
+        "git.example.com:/srv/git/repo.git",
+        "git.example.com:repo.git",
+        "git.example.com:../x/y",
+        # not printable ASCII: a bidirectional mark, a letter outside it
+        "https://host/org/" + chr(0x202E) + "repo",
+        "https://ex" + chr(0xE4) + "mple.com/org/repo",
     ],
 )
 def test_a_repository_that_is_not_a_plain_url_is_left_out(clone):
     env = {"BUILD_ID": "1", "GIT_COMMIT": SHA, "GIT_URL": clone}
     assert release.source_revision(env) == {"revision": SHA}
+
+
+def test_an_ipv6_server_keeps_its_brackets():
+    env = github(GITHUB_SERVER_URL="http://[::1]:8080")
+    assert release.source_revision(env)["repository"] == "http://[::1]:8080/org/orders"
 
 
 @pytest.mark.parametrize("value", ["not-a-sha", "abc", "g" * 40, "a" * 65, "4458aaa 4458aaa"])
@@ -171,9 +191,15 @@ def test_a_revision_that_is_not_hex_is_left_out(value):
     assert "revision" not in got and "repository" in got
 
 
-@pytest.mark.parametrize("value", ["two words", "refs/heads/a;b", "x" * 201, "é", ""])
+@pytest.mark.parametrize("value", ["two words", "refs/heads/a;b", "x" * 201, chr(0xE9), ""])
 def test_a_ref_that_is_not_a_name_is_left_out(value):
     assert "ref" not in release.source_revision(github(GITHUB_REF=value))
+
+
+def test_a_branch_named_for_an_issue_is_a_ref():
+    assert release.source_revision(github(GITHUB_REF="refs/heads/fix#12"))["ref"] == (
+        "refs/heads/fix#12"
+    )
 
 
 def test_a_ci_that_sets_nothing_usable_records_no_source():
@@ -182,8 +208,9 @@ def test_a_ci_that_sets_nothing_usable_records_no_source():
 
 
 def test_the_run_details_carry_the_source_only_when_there_is_one(monkeypatch):
-    for name in ("GITHUB_RUN_ID", "CI_JOB_ID", "BUILD_ID", "BUILD_BUILDID", "CIRCLE_BUILD_NUM"):
-        monkeypatch.delenv(name, raising=False)
+    for markers, *names in release._SOURCE_VARS:  # whatever CI this suite runs on
+        for name in (*markers, *names, "GITHUB_SERVER_URL"):
+            monkeypatch.delenv(name, raising=False)
     assert "source" not in release.provenance([], run_id="r-1", report_written_at=None)
     for name, value in github().items():
         monkeypatch.setenv(name, value)

@@ -85,19 +85,27 @@ _SOURCE_VARS = (
     (("BUILD_ID",), "GIT_COMMIT", "GIT_URL", "GIT_BRANCH"),
 )
 _REVISION = re.compile(r"[0-9a-f]{7,64}")
-_REF = re.compile(r"[A-Za-z0-9._/@+-]{1,200}")
-_SCP_URL = re.compile(r"(?:[A-Za-z0-9._-]+@)?([A-Za-z0-9.-]+):([A-Za-z0-9._/~-]+)")
+_REF = re.compile(r"[A-Za-z0-9._/@+#-]{1,200}")
+#: ``[user@]host.example.com:org/repo.git``. A dotted host and a path of at least two segments
+#: that does not start at a root: ``user:token`` (a CI variable set to a credential), a Windows
+#: drive (``C:/work``) and ``host:/etc/passwd`` are none of that.
+_SCP_URL = re.compile(
+    r"(?:[A-Za-z0-9._-]+@)?"
+    r"([A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)+)"
+    r":([A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)+)"
+)
 _GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 
 
 def _repository(value: Optional[str]) -> Optional[str]:
     """A repository URL with no user, password, query or fragment (a CI's clone URL can carry a
     token), or ``None`` for anything that is not an ``https``, ``http``, ``ssh`` or ``git`` URL
-    or an ``host:path`` one: a path on the runner's disk is no part of a release record."""
+    or a ``host.name:org/repo`` one, or is not printable ASCII: a path on the runner's disk is no
+    part of a release record."""
     from urllib.parse import urlsplit
 
     text = (value or "").strip()
-    if not text or len(text) > 256 or any(ord(c) <= 32 or ord(c) == 127 for c in text):
+    if not text or len(text) > 256 or not all(32 < ord(c) < 127 for c in text):
         return None
     if "://" in text:
         try:
@@ -105,11 +113,16 @@ def _repository(value: Optional[str]) -> Optional[str]:
             port = f":{parts.port}" if parts.port else ""
         except ValueError:
             return None
-        if parts.scheme not in ("https", "http", "ssh", "git") or not parts.hostname:
+        host = parts.hostname
+        if parts.scheme not in ("https", "http", "ssh", "git") or not host:
             return None
-        return f"{parts.scheme}://{parts.hostname}{port}{parts.path}"
+        if ":" in host:  # an IPv6 literal: urlsplit took its brackets off
+            host = f"[{host}]"
+        return f"{parts.scheme}://{host}{port}{parts.path}"
     scp = _SCP_URL.fullmatch(text)
-    return f"{scp.group(1)}:{scp.group(2)}" if scp else None
+    if scp is None or ".." in scp.group(2).split("/"):
+        return None
+    return f"{scp.group(1)}:{scp.group(2)}"
 
 
 def source_revision(env: Mapping[str, str]) -> Optional[Dict[str, str]]:
