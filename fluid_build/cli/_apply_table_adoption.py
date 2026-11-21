@@ -24,6 +24,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from fluid_build._contract_loader import CLIError
 from fluid_build.cli.console import cprint_literal
 from fluid_build.iac.adoption import (
     ADOPT_TABLES_FLAG,
@@ -34,7 +35,6 @@ from fluid_build.iac.adoption import (
 )
 from fluid_build.iac.importer import ImportBlock, import_section
 
-from ._common import CLIError
 from ._logging import warn
 
 
