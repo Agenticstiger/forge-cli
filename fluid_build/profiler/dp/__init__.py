@@ -11,7 +11,9 @@ live here, each as its own module:
   Gaussian sampler.
 * :mod:`~fluid_build.profiler.dp.consistency` makes the noisy count tables agree
   exactly, and writes them as decimal text that still agrees.
+* :mod:`~fluid_build.profiler.dp.bounding` reads the privacy unit from the contract and
+  bounds what one unit contributes to a release.
 
 Nothing here reads a record, and nothing here imports a heavy package at module
-scope; both modules use the standard library alone.
+scope.
 """
