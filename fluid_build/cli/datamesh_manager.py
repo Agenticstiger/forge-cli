@@ -12,6 +12,7 @@ Usage:
   fluid datamesh-manager publish contract.fluid.yaml --with-contract
   fluid datamesh-manager publish products/ --status draft     # a folder, upstream products first
   fluid datamesh-manager promote products/ --verify-report reports/   # draft -> active
+  fluid datamesh-manager status products/                     # active N of M, read-only
   fluid datamesh-manager list
   fluid datamesh-manager get <product-id>
   fluid datamesh-manager delete <product-id>
@@ -257,6 +258,45 @@ def add_parser(subparsers):
     pm.add_argument("--api-key", help="Entropy Data API key (or set DMM_API_KEY env var)")
     pm.add_argument("--api-url", help="API base URL (default: https://api.entropy-data.com)")
     pm.set_defaults(func=_cmd_promote)
+
+    # --- status ------------------------------------------------------------
+    st = dmm_sub.add_parser(
+        "status",
+        help="Show where the products of these contracts stand in Entropy Data (read-only)",
+        description=(
+            "Report the status of each product the contracts declare (active, draft, "
+            "deprecated, retired, or missing from Entropy Data), with 'active N of M'. Reads "
+            "Entropy's product list once and writes nothing. A contract that cannot be read is "
+            "a row of its own. With --strict the command exits 1 unless every product is "
+            "active, for a migration that is not finished until they all are."
+        ),
+    )
+    st.add_argument(
+        "contract",
+        nargs="+",
+        metavar="CONTRACT",
+        help="contract file, glob pattern or folder (a folder is searched for *.fluid.yaml)",
+    )
+    st.add_argument(
+        "-o",
+        "--overlay",
+        help="Environment overlay the contracts are read with (as 'fluid verify --env' reads them)",
+    )
+    st.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit 1 unless every product is active",
+    )
+    st.add_argument(
+        "--format",
+        "-f",
+        choices=["text", "json"],
+        default="text",
+        help="Output format (default: text)",
+    )
+    st.add_argument("--api-key", help="Entropy Data API key (or set DMM_API_KEY env var)")
+    st.add_argument("--api-url", help="API base URL (default: https://api.entropy-data.com)")
+    st.set_defaults(func=_cmd_status)
 
     # --- list --------------------------------------------------------------
     ls = dmm_sub.add_parser("list", help="List all data products")
@@ -522,6 +562,23 @@ def _cmd_promote(args, logger=None):
         console_error(f"Error: {exc}")
         return 1
     except Exception as exc:  # a contract the loader cannot read, as in publish
+        console_error(f"Error: {exc}")
+        return 1
+
+
+def _cmd_status(args, logger=None):
+    """Show where each product of the contracts stands in Entropy Data (read-only)."""
+    log = logger or logging.getLogger(__name__)
+    try:
+        from fluid_build.cli._dmm_status import run_status
+
+        return run_status(args, log)
+    except CLIError:
+        raise
+    except ProviderError as exc:
+        console_error(f"Error: {exc}")
+        return 1
+    except Exception as exc:  # a contract path the expansion cannot read, as in promote
         console_error(f"Error: {exc}")
         return 1
 
