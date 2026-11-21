@@ -970,6 +970,19 @@ def test_a_replaced_file_keeps_its_mode_even_when_the_umask_is_narrower(project)
     assert "# by hand" not in written.read_text(encoding="utf-8")
 
 
+def test_a_replaced_file_loses_setuid_and_stays_readable_by_its_owner(project):
+    assert run(parse(*ARGV), LOG) == 0
+    written = project / "out" / ORDERS_DAILY
+    written.write_text(written.read_text(encoding="utf-8") + "# by hand\n", encoding="utf-8")
+    written.chmod(0o4600)  # setuid, and owner-only
+    assert run(parse(*ARGV, "--force"), LOG) == 0
+    assert (written.stat().st_mode & 0o7777) == 0o600
+    written.write_text(written.read_text(encoding="utf-8") + "# by hand\n", encoding="utf-8")
+    written.chmod(0o200)  # write-only: a contract its owner could not read
+    assert run(parse(*ARGV, "--force"), LOG) == 0
+    assert (written.stat().st_mode & 0o777) == 0o600
+
+
 @pytest.mark.skipif(
     hasattr(__import__("os"), "geteuid") and __import__("os").geteuid() == 0,
     reason="root can read any file",

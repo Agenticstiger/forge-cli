@@ -333,7 +333,8 @@ def _write_file(path: Path, text: str, state: str) -> None:
     try:
         replaces = state in ("overwrite", *_REPLACEABLE)
         if replaces:
-            mode = stat.S_IMODE(os.lstat(path).st_mode)
+            # the permission bits, not setuid, setgid or sticky, and readable by its owner
+            mode = (stat.S_IMODE(os.lstat(path).st_mode) & 0o777) | 0o400
         else:
             current = os.umask(0)
             os.umask(current)
