@@ -20,7 +20,7 @@ from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ..severity import is_error
 from ..util.contract import column_is_key
-from .changelog_types import Change
+from .changelog_types import KIND_PRODUCT_ID_CHANGED, SEV_BREAKING, Change
 
 # Type widening table — keys are the "from" type, values are the set of
 # types that strictly widen them. Anything not in this table is treated as
@@ -915,6 +915,35 @@ def _rules_by_name(rules: Any, keys: Sequence[str]) -> dict[str, List[Mapping[st
             if isinstance(name, str):
                 out.setdefault(name, []).append(rule)
     return out
+
+
+def diff_identity(baseline: Mapping[str, Any], new: Mapping[str, Any]) -> List[Change]:
+    """A different root ``id``: the new contract describes another product.
+
+    The schema calls the id the product's stable identifier, and everything
+    that names the product names it by that: a ``consumes[].productId``, the
+    state ``fluid apply`` keeps and the cursors a build keeps under it, and
+    the one catalog entry each id gets. A new id therefore starts a second
+    product next to the old one; it is not a new version of it. Ids are
+    compared character for character, as those lookups are.
+    """
+    old_id = baseline.get("id")
+    new_id = new.get("id")
+    if old_id == new_id:
+        return []
+    return [
+        Change(
+            path="id",
+            kind=KIND_PRODUCT_ID_CHANGED,
+            severity=SEV_BREAKING,
+            description=(
+                f"product id changed from {old_id!r} to {new_id!r} "
+                "(consumers and state keyed by the old id no longer match)"
+            ),
+            before=old_id,
+            after=new_id,
+        )
+    ]
 
 
 def diff_metadata(baseline: Mapping[str, Any], new: Mapping[str, Any]) -> List[Change]:

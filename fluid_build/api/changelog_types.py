@@ -19,6 +19,10 @@ SEV_BREAKING = "breaking"
 SEV_NON_BREAKING = "non_breaking"
 SEV_INFO = "info"
 
+# The one change kind a caller acts on by name: ``fluid diff --baseline
+# --fail-on-id-change`` fails on it alone. Every other kind is only reported.
+KIND_PRODUCT_ID_CHANGED = "product_id_changed"
+
 
 @dataclass
 class Change:
