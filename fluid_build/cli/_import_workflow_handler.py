@@ -43,6 +43,8 @@ from fluid_build.util.safe_yaml import read_bounded_file
 PROPOSING_TOOLS = ("airflow", "pyspark")
 #: The ``--split-by`` values that are about code, and so for those importers only.
 CODE_SPLITS = ("table", "job", "dag")
+#: File states ``--force`` replaces: a file that differs, and one that cannot be read.
+_REPLACEABLE = ("different", "unreadable")
 
 
 def _flag_refusal(what: str, why: str, fix: str, **extras) -> Exception:
@@ -265,7 +267,9 @@ def _file_state(path: Path, data: bytes, *, guarded: bool) -> str:
     * ``overwrite``: a regular file, for an importer that always replaces it;
     * ``unchanged`` / ``different``: a regular file, for a guarded importer, holding the bytes
       it would write (line endings aside) or other bytes. The file is read as far as it could
-      equal ``data``: a bigger one is ``different`` without being read in full.
+      equal ``data``: a bigger one is ``different`` without being read in full;
+    * ``unreadable``: a regular file this process may not read: nobody can say whether it
+      differs, and ``--force`` replaces it like a file that does.
     """
     try:
         info = os.lstat(path)
@@ -282,6 +286,8 @@ def _file_state(path: Path, data: bytes, *, guarded: bool) -> str:
         return "different"
     try:
         existing = read_bounded_file(path, limit)
+    except PermissionError:
+        return "unreadable"
     except OSError:
         return "special"
     if existing is None:
@@ -295,6 +301,8 @@ def _plan_writes(contracts: list, out_arg: Optional[str], *, guarded: bool = Tru
 
     One contract: ``--out`` names the file. Several: ``--out`` names the directory.
     """
+    if not contracts:
+        return []
     paths: list[Path] = []
     if len(contracts) == 1:
         paths.append(Path(out_arg or _default_out_path(contracts[0])))
@@ -320,7 +328,8 @@ def _write_file(path: Path, text: str, state: str) -> None:
     """Write ``text`` to ``path``: whole, to a temporary file beside it, renamed over the target.
     A file that is replaced keeps its permission bits; a new one gets what the umask allows."""
     try:
-        if state in ("overwrite", "different"):
+        replaces = state in ("overwrite", *_REPLACEABLE)
+        if replaces:
             mode = stat.S_IMODE(os.lstat(path).st_mode)
         else:
             current = os.umask(0)
@@ -328,6 +337,8 @@ def _write_file(path: Path, text: str, state: str) -> None:
             mode = 0o666 & ~current
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_bytes(path, text.encode("utf-8"), mode=mode)
+        if replaces:
+            os.chmod(path, mode)  # the umask had narrowed the mode the temporary file was made with
     except OSError as exc:
         raise SchemaValidationError(
             what=f"cannot write {clean_chars(str(path))}",
@@ -358,7 +369,7 @@ def _refuse_overwrites(planned: list, *, force: bool) -> None:
             doc="https://agenticstiger.github.io/forge_docs/cli/import.html",
             extras={"files": [clean_chars(str(p)) for p in special]},
         )
-    clash = [path for path, _text, state in planned if state == "different"]
+    clash = [path for path, _text, state in planned if state in _REPLACEABLE]
     if not clash or force:
         return
     raise SchemaValidationError(
@@ -383,12 +394,12 @@ def _line(text: str) -> None:
 
 
 def _state_label(state: str, force: bool) -> str:
-    if state == "different":
-        return (
-            "replaces the existing file (--force)"
-            if force
-            else "differs from the existing file: refused without --force"
-        )
+    if state in _REPLACEABLE:
+        if force:
+            return "replaces the existing file (--force)"
+        if state == "unreadable":
+            return "cannot be read: refused without --force"
+        return "differs from the existing file: refused without --force"
     return {
         "new": "new",
         "unchanged": "unchanged",
@@ -422,9 +433,10 @@ def _print_proposal(contracts: list, planned: list, *, force: bool = False) -> N
 
 def _print_dry_run_summary(planned: list, *, force: bool) -> None:
     states = [state for _path, _text, state in planned]
-    writes = sum(1 for s in states if s in ("new", "overwrite") or (s == "different" and force))
+    replaceable = sum(1 for s in states if s in _REPLACEABLE)
+    writes = sum(1 for s in states if s in ("new", "overwrite")) + (replaceable if force else 0)
     same = states.count("unchanged")
-    refused = states.count("special") + (0 if force else states.count("different"))
+    refused = states.count("special") + (0 if force else replaceable)
     parts = [f"{writes} file(s) would be written"]
     if same:
         parts.append(f"{same} unchanged")

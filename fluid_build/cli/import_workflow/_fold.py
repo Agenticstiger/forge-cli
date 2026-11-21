@@ -508,6 +508,7 @@ class ModuleIndex:
         *,
         variables: Optional[Mapping[str, str]] = None,
         extra: Optional[Mapping[str, Path]] = None,
+        budget: Optional[SourceBudget] = None,
     ) -> None:
         self.variables: Mapping[str, str] = dict(variables or {})
         self._dotted: Dict[str, List[SourceFile]] = {}
@@ -521,7 +522,7 @@ class ModuleIndex:
         self._folders: Dict[str, "Folder"] = {}
         self.unreadable: Dict[str, str] = {}
         #: What this scan has read, in all: every read of a source file counts against it.
-        self.budget = SourceBudget()
+        self.budget = budget if budget is not None else SourceBudget()
         for source in files:
             parts = source.rel[: -len(".py")].split("/")
             if parts[-1] == "__init__":
@@ -540,17 +541,25 @@ class ModuleIndex:
             self._modules.move_to_end(source.rel)
             return cached
         try:
-            module = parse_module(source.rel, read_source(source.path, self.budget))
+            data = read_source(source.path, self.budget)
+            # Room is made before the parse, not after: a file has at most as many nodes as it
+            # has bytes, and two big modules alive at once is what a cache is there to prevent.
+            while self._modules and self._cached_nodes + len(data) > MAX_CACHED_NODES:
+                self._evict()
+            module = parse_module(source.rel, data)
         except SourceUnreadable as exc:
             self.unreadable[source.rel] = str(exc)
             return None
         self._modules[source.rel] = module
         self._cached_nodes += module.nodes
         while self._cached_nodes > MAX_CACHED_NODES and len(self._modules) > 1:
-            rel, old = self._modules.popitem(last=False)
-            self._cached_nodes -= old.nodes
-            self._folders.pop(rel, None)  # a folder is only kept with its module
+            self._evict()
         return module
+
+    def _evict(self) -> None:
+        rel, old = self._modules.popitem(last=False)
+        self._cached_nodes -= old.nodes
+        self._folders.pop(rel, None)  # a folder is only kept with its module
 
     def folder(self, module: Module) -> "Folder":
         """The folder of a module, kept while the module is. A module this index did not load

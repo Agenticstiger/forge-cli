@@ -32,16 +32,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-#: A source file larger than this is not read (1 MB: a job or a DAG file is a few KB).
-MAX_FILE_BYTES = 1_000_000
+#: A source file larger than this is not read (300 KB: a job or a DAG file is a few KB, and a
+#: dense one costs about a kilobyte and a half of memory per byte of source once it is parsed).
+MAX_FILE_BYTES = 300_000
 #: A file with more ``{`` characters than this is not parsed. CPython parses an f-string in time
 #: that grows with the square of its fields (a 900 KB file of ``{b}`` fields takes 15 s and
 #: 500 MB); a job or a DAG file has a few hundred braces.
 MAX_BRACES = 50_000
 #: Source one scan reads in all, and the most syntax-tree nodes kept parsed at once (about
-#: 150 MB: a node of a dense file costs about 300 bytes with the parent links the readers build).
+#: 280 MB: a node of a dense file costs up to 1.4 KB, parent links included).
 MAX_TOTAL_BYTES = 64 * 1024 * 1024
-MAX_CACHED_NODES = 400_000
+MAX_CACHED_NODES = 200_000
 #: Most Python files one walk keeps, and directory entries it reads, and levels it descends.
 MAX_FILES = 5_000
 MAX_ENTRIES = 50_000

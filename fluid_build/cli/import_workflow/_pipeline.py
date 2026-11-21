@@ -16,8 +16,16 @@ from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ._conventions import Conventions, load_conventions
-from ._proposal import SPLITS, ProposalTooLarge, TopicSchema, build_proposal, safe_text
-from ._scan import DagScan, JobScan, LinkedTask, link_tasks, scan_dags, scan_jobs
+from ._proposal import (
+    SPLITS,
+    ProposalTooLarge,
+    TopicSchema,
+    build_proposal,
+    safe_command,
+    safe_text,
+)
+from ._pysource import SourceBudget
+from ._scan import DagScan, JobScan, LinkedTask, budget_note, link_tasks, scan_dags, scan_jobs
 from .registry import Importer, ImportReport
 
 DOC = "https://agenticstiger.github.io/forge_docs/cli/import.html"
@@ -172,32 +180,34 @@ def run_import(
         source, "DAGs directory" if tool == "airflow" else "jobs directory", f"fluid import {tool}"
     )
 
+    budget = SourceBudget()  # the source this import reads, in all its scans
     scans: List[JobScan] = []
     dag_scan: Optional[DagScan] = None
     linked: List[LinkedTask] = []
     unlinked: List[Tuple[Any, Any, Any, str]] = []
 
     if tool == "pyspark":
-        jobs_scan = scan_jobs(root, conv)
+        jobs_scan = scan_jobs(root, conv, budget)
         scans = [jobs_scan]
         dags_dir = options.get("dags")
         if dags_dir:
             dags_root = _directory(str(dags_dir), "DAGs directory", "--dags")
-            dag_scan = scan_dags(dags_root, conv)
+            dag_scan = scan_dags(dags_root, conv, budget)
             linked, unlinked = link_tasks(
                 dag_scan.dags, scans, conv, project_root=dags_root.resolve().parent
             )
     else:
-        dag_scan = scan_dags(root, conv)
+        dag_scan = scan_dags(root, conv, budget)
         roots, missing = _referenced_roots(dag_scan, conv)
         for path in missing:
             report.unsupported.append(
                 f"script_roots names the directory {safe_text(path, 100)}, which does not exist"
             )
-        scans = [scan_jobs(directory, conv) for directory in roots]
+        scans = [scan_jobs(directory, conv, budget) for directory in roots]
         linked, unlinked = link_tasks(dag_scan.dags, scans, conv, project_root=None)
 
     _scan_report(tool, scans, dag_scan, linked, unlinked, report)
+    budget_note(budget.skipped, report.notes)
     jobs = [job for scan in scans for job in scan.jobs]
     if not jobs and not any(scan.other_files for scan in scans) and tool == "pyspark":
         raise refusal(
@@ -325,7 +335,7 @@ def _scan_report(
             if link.how == "name":
                 report.unsupported.append(
                     f"DAG {safe_text(link.dag.shown, 60)} task {safe_text(link.task.shown, 60)} submits "
-                    f"{safe_text(link.submit.script or '', 100)}: joined to a job file by file name only"
+                    f"{safe_command(link.submit.script or '', 100)}: joined to a job file by file name only"
                 )
         report.notes.append(
             f"{len(linked)} submitted script(s) joined to a job file"
@@ -340,7 +350,7 @@ def _scan_report(
             line = (
                 f"DAG {safe_text(dag.shown, 60)} task {safe_text(task.shown, 60)} "
                 f"({task.file}:{submit.line}) submits "
-                f"{safe_text(submit.script or submit.shown or '(no script)', 100)}: not joined ({safe_text(why, 120)})"
+                f"{safe_command(submit.script or submit.shown or '(no script)', 100)}: not joined ({safe_text(why, 120)})"
             )
             if tool == "airflow" and submit.script:
                 report.unsupported.append(

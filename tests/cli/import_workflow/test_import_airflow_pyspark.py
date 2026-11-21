@@ -926,3 +926,97 @@ def test_an_unread_command_is_listed_without_advice_about_script_roots(tmp_path,
     named_line = next(x for x in lines if "task named" in x)
     assert "longer than" in long_line and "script_roots" not in long_line
     assert "script_roots" in named_line  # a script that was found but not joined gets the way out
+
+
+# ── what the command does with a file's mode, an unreadable file and an empty import ──
+
+
+def test_a_replaced_file_keeps_its_mode_even_when_the_umask_is_narrower(project):
+    import os
+
+    assert run(parse(*ARGV), LOG) == 0
+    written = project / "out" / ORDERS_DAILY
+    written.write_text(written.read_text(encoding="utf-8") + "# by hand\n", encoding="utf-8")
+    written.chmod(0o666)
+    old = os.umask(0o022)
+    try:
+        assert run(parse(*ARGV, "--force"), LOG) == 0
+    finally:
+        os.umask(old)
+    assert (written.stat().st_mode & 0o777) == 0o666
+    assert "# by hand" not in written.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(
+    hasattr(__import__("os"), "geteuid") and __import__("os").geteuid() == 0,
+    reason="root can read any file",
+)
+def test_a_file_that_cannot_be_read_is_replaced_only_with_force_and_says_why(project, capsys):
+    assert run(parse(*ARGV), LOG) == 0
+    locked = project / "out" / ORDERS_DAILY
+    locked.chmod(0o000)
+    try:
+        capsys.readouterr()
+        assert run(parse(*ARGV, "--dry-run"), LOG) == 0
+        out = capsys.readouterr().out
+        assert "[cannot be read: refused without --force]" in out
+        assert "not a regular file" not in out
+        with pytest.raises(FluidUserError) as refused:
+            run(parse(*ARGV), LOG)
+        assert "refusing to overwrite 1 existing file(s)" in refused.value.what
+        assert run(parse(*ARGV, "--force", "--dry-run"), LOG) == 0
+        assert "[replaces the existing file (--force)]" in capsys.readouterr().out
+        assert run(parse(*ARGV, "--force"), LOG) == 0
+    finally:
+        locked.chmod(0o644)
+    assert "TODO: declare the columns" in locked.read_text(encoding="utf-8")
+
+
+def test_an_import_with_nothing_to_write_does_not_complain_about_out(project, capsys):
+    (project / "jobs" / "clean_orders.py").unlink()
+    (project / "jobs" / "clicks_clean.py").unlink()
+    (project / "jobs" / "orders_daily.py").unlink()
+    (project / "jobs" / "nothing.py").write_text("x = 1\n", encoding="utf-8")
+    (project / "out").write_text("a file\n", encoding="utf-8")
+    capsys.readouterr()
+    run(parse("pyspark", "jobs", "--out", "out", "--dry-run"), LOG)
+    out = capsys.readouterr().out
+    assert "--out names a file" not in out and "Proposal (0 product(s))" in out
+
+
+def test_a_path_with_brackets_is_printed_as_it_is_and_never_crashes_the_command(project, capsys):
+    argv = ("pyspark", "jobs", "--dags", "dags", "--conventions", "conventions.yaml", "--out")
+    target = "o[/b]x"
+    assert run(parse(*argv, target), LOG) == 0
+    capsys.readouterr()
+    assert run(parse(*argv, target), LOG) == 0  # a markup error would end it here
+    out = capsys.readouterr().out
+    assert out.count("= Unchanged") == 3 and "o[/b]x/contract.retail.orders_daily" in out
+    single = "c[red].yaml"
+    (project / "jobs" / "clicks_clean.py").unlink()
+    (project / "jobs" / "orders_daily.py").unlink()
+    one = ("pyspark", "jobs", "--out", single)
+    assert run(parse(*one), LOG) == 0
+    assert f"fluid validate {single}" in capsys.readouterr().out
+
+
+def test_a_long_out_directory_does_not_wrap_the_lines_that_name_files(project, capsys, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "60")
+    deep = "d" * 120
+    argv = ("pyspark", "jobs", "--dags", "dags", "--conventions", "conventions.yaml", "--out", deep)
+    assert run(parse(*argv), LOG) == 0
+    capsys.readouterr()
+    assert run(parse(*argv), LOG) == 0
+    lines = [x for x in capsys.readouterr().out.splitlines() if x.startswith("= Unchanged")]
+    assert len(lines) == 3 and all(deep in line and line.endswith(".fluid.yaml") for line in lines)
+
+
+def test_two_scans_of_one_import_share_one_source_budget(project, monkeypatch, capsys):
+    from fluid_build.cli.import_workflow import _pipeline
+    from fluid_build.cli.import_workflow._pysource import SourceBudget
+
+    one = len((project / "jobs" / "clean_orders.py").read_bytes())
+    monkeypatch.setattr(_pipeline, "SourceBudget", lambda: SourceBudget(left=3 * one))
+    _contracts, report = pyspark()  # jobs and DAG files together are more than 3 files' worth
+    notes = [n for n in report.notes if "stopped reading after" in n]
+    assert len(notes) == 1 and "file(s) not read" in notes[0]

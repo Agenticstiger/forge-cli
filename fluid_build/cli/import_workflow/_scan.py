@@ -33,6 +33,7 @@ from ._conventions import Conventions
 from ._fold import ModuleIndex
 from ._pysource import (
     MAX_TOTAL_BYTES,
+    SourceBudget,
     SourceUnreadable,
     clean_chars,
     find_python_files,
@@ -104,7 +105,8 @@ def _display(path: Path, rel: str) -> str:
 MAX_REFS_PER_SCAN = 200_000
 
 
-def _budget_note(skipped: int, notes: List[str]) -> None:
+def budget_note(skipped: int, notes: List[str]) -> None:
+    """Say how many files the source budget left unread (nothing when it left none)."""
     if skipped:
         notes.append(
             f"stopped reading after {MAX_TOTAL_BYTES // (1024 * 1024)} MB of source: {skipped} "
@@ -112,8 +114,11 @@ def _budget_note(skipped: int, notes: List[str]) -> None:
         )
 
 
-def scan_jobs(root: Path, conventions: Conventions) -> JobScan:
-    """Read the job files under ``root``.
+def scan_jobs(
+    root: Path, conventions: Conventions, budget: Optional[SourceBudget] = None
+) -> JobScan:
+    """Read the job files under ``root``. ``budget`` is the source one import reads in all; a scan
+    that is given none has its own and says what it left unread.
 
     Raises:
         NotADirectoryError: ``root`` is not a directory.
@@ -121,7 +126,10 @@ def scan_jobs(root: Path, conventions: Conventions) -> JobScan:
     walk = find_python_files(root, ignore=conventions.ignore_files)
     scan = JobScan(root=Path(root), notes=list(walk.notes))
     index = ModuleIndex(
-        walk.files, variables=conventions.variables, extra=conventions.config_modules
+        walk.files,
+        variables=conventions.variables,
+        extra=conventions.config_modules,
+        budget=budget,
     )
     sessions = set(DEFAULT_SESSION_NAMES) | set(conventions.session_names)
     kept = 0
@@ -158,12 +166,16 @@ def scan_jobs(root: Path, conventions: Conventions) -> JobScan:
             scan.other_files += 1
             # a helper's note (a name from a parameter) still matters to the person reading
             scan.notes.extend(facts.notes)
-    _budget_note(index.budget.skipped, scan.notes)
+    if budget is None:
+        budget_note(index.budget.skipped, scan.notes)
     return scan
 
 
-def scan_dags(root: Path, conventions: Conventions) -> DagScan:
-    """Read the DAG files under ``root`` (never importing them).
+def scan_dags(
+    root: Path, conventions: Conventions, budget: Optional[SourceBudget] = None
+) -> DagScan:
+    """Read the DAG files under ``root`` (never importing them), against ``budget`` as
+    :func:`scan_jobs` does.
 
     Raises:
         NotADirectoryError: ``root`` is not a directory.
@@ -171,7 +183,10 @@ def scan_dags(root: Path, conventions: Conventions) -> DagScan:
     walk = find_python_files(root, ignore=conventions.ignore_files)
     scan = DagScan(root=Path(root), notes=list(walk.notes))
     index = ModuleIndex(
-        walk.files, variables=conventions.variables, extra=conventions.config_modules
+        walk.files,
+        variables=conventions.variables,
+        extra=conventions.config_modules,
+        budget=budget,
     )
     for source in walk.files:
         try:
@@ -192,7 +207,8 @@ def scan_dags(root: Path, conventions: Conventions) -> DagScan:
         scan.dags.extend(found.dags)
         scan.notes.extend(found.notes)
     scan.dags.sort(key=lambda d: (d.file, d.line))
-    _budget_note(index.budget.skipped, scan.notes)
+    if budget is None:
+        budget_note(index.budget.skipped, scan.notes)
     return scan
 
 
