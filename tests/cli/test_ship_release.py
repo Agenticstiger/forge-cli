@@ -272,6 +272,38 @@ def test_a_passing_run_publishes_the_release(
     assert shipped["release"]["identity_digest"] == index["identity_digest"]
 
 
+def test_a_release_records_the_versions_of_the_exposes_and_the_code_it_was_built_from(
+    work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    contract = _contract()
+    versions = {"orders": "1.4.0", "customers": "2.0.0-rc.1"}
+    for expose in contract["exposes"]:  # type: ignore[attr-defined]
+        expose["version"] = versions[expose["exposeId"]]
+    (work / "contract.fluid.yaml").write_text(yaml.safe_dump(contract, sort_keys=False))
+    done = _cli(work, "bundle", "contract.fluid.yaml", "--format", "tgz", "--out", "seed.tgz")
+    assert done.returncode == 0, done.stderr[-2000:]
+    _install(monkeypatch, work / "seed.tgz")
+    sha = "4458aaa47b3ad2190a101dd457e244c7ed5a14a8"
+    for name, value in {
+        "GITHUB_RUN_ID": "42",
+        "GITHUB_SHA": sha,
+        "GITHUB_REPOSITORY": "org/orders",
+        "GITHUB_REF": "refs/tags/v1.4.0",
+    }.items():
+        monkeypatch.setenv(name, value)
+    assert _ship([*_UNTIL_4, "--release-dir", "../rel"]) == 0
+    index = json.loads((work.parent / "rel" / "release.json").read_text())
+    assert index["identity"]["expose_versions"] == versions
+    assert index["identity_digest"] == release.identity_digest(index["identity"])
+    assert index["provenance"]["source"] == {
+        "revision": sha,
+        "repository": "https://github.com/org/orders",
+        "ref": "refs/tags/v1.4.0",
+    }
+    # the code's revision describes the run: it is not in what identifies the release
+    assert sha not in json.dumps(index["identity"])
+
+
 def test_the_release_names_its_bundles_source_contract_from_where_it_sits(
     work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
