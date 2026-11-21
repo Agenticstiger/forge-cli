@@ -736,13 +736,37 @@ def _value_of(source: str, name: str = "X"):
         'C = {"t": "x"}\nD = C\nC.update(t="y")\nX = D["t"]\n',
         'T = "a"\nglobals()["T"] = "b"\nX = T\n',
         'T = "a"\nvars()["T"] = "b"\nX = T\n',
-        'T = "a"\nsetattr(mod, "T", "b")\nX = T\n',
-        'T = "a"\nmod.__dict__["T"] = "b"\nX = T\n',
+        'T = "a"\nlocals()["T"] = "b"\nX = T\n',
+        'T = "a"\nglobals().update(T="b")\nX = T\n',
+        'T = "a"\nexec("T = 1")\nX = T\n',
+        'import sys\nT = "a"\nsetattr(sys.modules[__name__], "T", "b")\nX = T\n',
+        'import sys\nT = "a"\nsys.modules[__name__].__dict__["T"] = "b"\nX = T\n',
+        'import sys\nT = "a"\nm = sys.modules[__name__]\nm.T = "b"\nX = T\n',
+        'import importlib\nT = "a"\nsetattr(importlib.import_module(__name__), "T", "b")\nX = T\n',
+        'T = "a"\nsetattr(make(), "T", "b")\nX = T\n',
+        'class K:\n    t = "x"\nsetattr(K, "t", "y")\nX = K.t\n',
+        'class K:\n    t = "x"\ndelattr(K, "t")\nX = K.t\n',
     ],
 )
 def test_a_name_the_file_changes_by_any_route_is_not_a_constant(source):
     value = _value_of(source)
     assert isinstance(value, Unresolved), value
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'T = "a"\nargs = parse()\nd = vars(args)\nX = T\n',
+        'T = "a"\nobj = make()\nsetattr(obj, "x", 1)\nX = T\n',
+        'T = "a"\nclass A:\n    def m(self):\n        return self.__dict__\nX = T\n',
+        'T = "a"\nclass A:\n    def m(self, k, v):\n        setattr(self, k, v)\nX = T\n',
+        'T = "a"\ndef f(x):\n    return "{x}".format(**locals())\nX = T\n',
+        'T = "a"\ndef f():\n    d = vars()\n    d["k"] = 1\n    return d\nX = T\n',
+        'T = "a"\nname = globals_of_the_job\nX = T\n',
+    ],
+)
+def test_reading_names_by_string_or_changing_an_object_that_is_no_constant_voids_nothing(source):
+    assert _value_of(source) == "a"
 
 
 def test_a_name_nothing_changes_still_folds_beside_names_that_are_changed():

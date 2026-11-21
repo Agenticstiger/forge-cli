@@ -161,27 +161,54 @@ class Scope:
     classes: Dict[str, ast.ClassDef] = field(default_factory=dict)
 
 
-_DYNAMIC_NAMES = frozenset({"globals", "vars", "locals", "setattr", "delattr", "exec", "eval"})
+#: Called with no argument, these are the names of the module (or class) body they are in; inside a
+#: function they are a copy, and writing to a copy changes no name.
+_NAMESPACES = frozenset({"locals", "vars"})
+#: Calls that can write any name of the module, or run code the folder cannot see.
+_RUNNERS = frozenset({"globals", "exec", "eval"})
+_SETTERS = frozenset({"setattr", "delattr"})
+_IMPORTERS = frozenset({"import_module", "__import__"})
+_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
 
 def _rebound_names(tree: ast.AST) -> Dict[str, str]:
     """Names the file changes after they are bound, which the single assignment a scope sees does
     not fix: a ``global`` or ``nonlocal`` declaration, an item or attribute assigned
-    (``CFG["t"] = ...``), a mutating method called on the name (``CFG.update(...)``), ``del``, an
-    assignment expression (``(T := ...)``), a ``match`` capture and a ``type`` alias; a name that
-    is another name (``D = C``) is changed when either is. A file that reaches names by string
-    (``globals()``, ``vars()``, ``setattr``, ``exec``) is ``"*"``: no name in it is trusted.
-    One pass over the tree, without recursion. ``{name: why}``."""
+    (``CFG["t"] = ...``), a mutating method called on the name (``CFG.update(...)``), ``setattr``
+    or ``delattr`` on it, ``del``, an assignment expression (``(T := ...)``), a ``match`` capture
+    and a ``type`` alias; a name that is another name (``D = C``) is changed when either is.
+    A file that writes names by string where it cannot be told which name (``globals()``,
+    ``exec``, ``eval``, ``vars()`` or ``locals()`` outside a function, ``sys.modules[__name__]``,
+    ``setattr`` on something that is not a name) is ``"*"``: no name in it is trusted. Reading
+    by string (``vars(args)``, ``self.__dict__``, ``"{x}".format(**locals())`` in a function)
+    changes no constant, and is not that. One pass over the tree, without recursion.
+    ``{name: why}``."""
     out: Dict[str, str] = {}
     aliases: List[Tuple[str, str]] = []
 
     def base(node: ast.AST) -> Optional[str]:
-        while isinstance(node, (ast.Subscript, ast.Attribute)):
-            node = node.value
-        return node.id if isinstance(node, ast.Name) else None
+        while True:
+            if isinstance(node, (ast.Subscript, ast.Attribute)):
+                node = node.value
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "vars"
+                and len(node.args) == 1
+            ):
+                node = node.args[0]  # ``vars(obj)`` is the attributes of ``obj``
+            else:
+                return node.id if isinstance(node, ast.Name) else None
+
+    def dynamic(how: str) -> None:
+        out.setdefault("*", f"the file reaches names by string ({how})")
 
     in_place = "is changed in place elsewhere in the file"
-    for node in ast.walk(tree):
+    stack: List[Tuple[ast.AST, bool]] = [(tree, False)]
+    while stack:
+        node, in_function = stack.pop()
+        inside = in_function or isinstance(node, _FUNCTIONS)
+        stack.extend((child, inside) for child in ast.iter_child_nodes(node))
         if isinstance(node, (ast.Global, ast.Nonlocal)):
             for name in node.names:
                 out.setdefault(name, f"`{name}` is rebound by a global or nonlocal declaration")
@@ -219,10 +246,30 @@ def _rebound_names(tree: ast.AST) -> Dict[str, str]:
                 name = base(func.value)
                 if name is not None:
                     out.setdefault(name, f"`{name}` {in_place}")
-            elif isinstance(func, ast.Name) and func.id in _DYNAMIC_NAMES:
-                out.setdefault("*", f"the file reaches names by string ({func.id}(...))")
-        elif isinstance(node, ast.Attribute) and node.attr == "__dict__":
-            out.setdefault("*", "the file reaches names by string (__dict__)")
+            elif isinstance(func, ast.Name):
+                called = func.id
+                if called in _RUNNERS:
+                    dynamic(f"{called}(...)")
+                elif called in _NAMESPACES and not in_function and not node.args:
+                    dynamic(f"{called}(...)")
+                elif called in _SETTERS and node.args:
+                    name = base(node.args[0])
+                    if name is None:
+                        dynamic(f"{called}(...)")
+                    else:
+                        out.setdefault(name, f"`{name}` {in_place}")
+                elif called in _IMPORTERS and any(
+                    isinstance(arg, ast.Name) and arg.id == "__name__" for arg in node.args
+                ):
+                    dynamic(f"{called}(__name__)")
+        elif (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "modules"
+            and isinstance(node.slice, ast.Name)
+            and node.slice.id == "__name__"
+        ):
+            dynamic("sys.modules[__name__]")
     _spread_to_aliases(out, aliases, in_place)
     return out
 
