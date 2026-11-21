@@ -407,7 +407,9 @@ def detailed_plugins(
                 entry["allowed"] = False
                 entry["reserved"] = True
                 allowed = False
-            if allowed:  # only ALLOWED plugins are ever loaded
+            # Only ALLOWED plugins are ever loaded, and an importer plugin is imported when its
+            # tool is asked for (``fluid import <name>``), not by listing it.
+            if allowed and k != "importer":
                 try:
                     obj = ep.load()
                 except Exception as e:  # noqa: BLE001 - isolate a bad plugin; type only

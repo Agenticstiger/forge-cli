@@ -763,3 +763,142 @@ def test_the_help_names_both_importers_and_the_new_flags(capsys):
         "{project,folder,group,table,job,dag}",
     ):
         assert word in out.replace("\n", " ") or word in out
+
+
+# ── what the command does to the files it is asked to write ───────────
+
+ARGV = ("pyspark", "jobs", "--dags", "dags", "--conventions", "conventions.yaml", "--out", "out")
+ORDERS_DAILY = "contract.retail.orders_daily.fluid.yaml"
+
+
+def test_a_link_at_an_output_path_is_never_written_through_and_nothing_is_written(project, capsys):
+    victim = project / "victim.txt"
+    victim.write_text("keep me\n", encoding="utf-8")
+    (project / "out").mkdir()
+    (project / "out" / ORDERS_DAILY).symlink_to(victim)
+    for extra in ((), ("--force",)):
+        with pytest.raises(FluidUserError) as refused:
+            run(parse(*ARGV, *extra), LOG)
+        assert "not regular files" in refused.value.what
+        assert ORDERS_DAILY in refused.value.why and "never written" in refused.value.why
+    assert victim.read_text(encoding="utf-8") == "keep me\n"
+    assert sorted(p.name for p in (project / "out").iterdir()) == [ORDERS_DAILY]  # nothing else
+
+
+@pytest.mark.skipif(not Path("/dev/zero").exists(), reason="needs /dev/zero")
+def test_a_link_to_an_endless_file_is_not_read_by_a_dry_run(project, capsys):
+    (project / "out").mkdir()
+    (project / "out" / ORDERS_DAILY).symlink_to("/dev/zero")
+    assert run(parse(*ARGV, "--dry-run"), LOG) == 0  # returns: the link is not opened
+    out = capsys.readouterr().out
+    assert "refused: not a regular file" in out and "1 refused" in out
+
+
+def test_the_dry_run_says_what_each_file_would_do(project, capsys):
+    assert run(parse(*ARGV), LOG) == 0
+    edited = project / "out" / ORDERS_DAILY
+    edited.write_text(edited.read_text(encoding="utf-8") + "# by hand\n", encoding="utf-8")
+    capsys.readouterr()
+
+    assert run(parse(*ARGV, "--dry-run"), LOG) == 0
+    out = capsys.readouterr().out
+    assert out.count("[unchanged]") == 2
+    assert "[differs from the existing file: refused without --force]" in out
+    assert "0 file(s) would be written, 2 unchanged, 1 refused" in out
+
+    assert run(parse(*ARGV, "--dry-run", "--force"), LOG) == 0
+    out = capsys.readouterr().out
+    assert "[replaces the existing file (--force)]" in out
+    assert "1 file(s) would be written, 2 unchanged" in out and "refused" not in out
+    assert edited.read_text(encoding="utf-8").endswith("# by hand\n")  # a dry run writes nothing
+
+
+def test_an_existing_file_much_bigger_than_the_proposal_is_not_read_in_full(project, capsys):
+    (project / "out").mkdir()
+    big = project / "out" / ORDERS_DAILY
+    with big.open("wb") as handle:
+        handle.truncate(1024**3)  # sparse: nothing is stored for the gap
+    assert run(parse(*ARGV, "--dry-run"), LOG) == 0
+    assert "differs from the existing file" in capsys.readouterr().out
+    with pytest.raises(FluidUserError) as refused:
+        run(parse(*ARGV), LOG)
+    assert "refusing to overwrite 1 existing file(s)" in refused.value.what
+    assert big.stat().st_size == 1024**3
+
+
+def test_an_existing_file_that_only_has_other_line_endings_is_unchanged(project, capsys):
+    assert run(parse(*ARGV), LOG) == 0
+    target = project / "out" / ORDERS_DAILY
+    target.write_bytes(target.read_bytes().replace(b"\n", b"\r\n"))
+    capsys.readouterr()
+    assert run(parse(*ARGV), LOG) == 0
+    assert capsys.readouterr().out.count("= Unchanged") == 3
+
+
+def test_a_file_is_written_whole_with_the_permissions_the_umask_allows(project, monkeypatch):
+    import os
+
+    old = os.umask(0o027)
+    try:
+        assert run(parse(*ARGV), LOG) == 0
+        written = project / "out" / ORDERS_DAILY
+        assert (written.stat().st_mode & 0o777) == 0o640
+        assert not [p for p in (project / "out").iterdir() if p.name.endswith(".tmp")]
+        # a file that is replaced keeps the permission bits it has
+        written.write_text(written.read_text(encoding="utf-8") + "# by hand\n", encoding="utf-8")
+        written.chmod(0o600)
+        assert run(parse(*ARGV, "--force"), LOG) == 0
+        assert (written.stat().st_mode & 0o777) == 0o600
+        assert "# by hand" not in written.read_text(encoding="utf-8")
+    finally:
+        os.umask(old)
+
+
+def test_several_products_into_an_existing_file_is_refused_before_anything_is_written(project):
+    (project / "out").write_text("a file\n", encoding="utf-8")
+    with pytest.raises(FluidUserError) as refused:
+        run(parse(*ARGV), LOG)
+    assert "--out names a file, but this import writes 3 files" in refused.value.what
+    assert (project / "out").read_text(encoding="utf-8") == "a file\n"
+
+
+@pytest.mark.parametrize(
+    "argv, ok",
+    [
+        (("dbt", "x", "--split-by", "table"), False),
+        (("meltano", "x", "--split-by", "job"), False),
+        (("--split-by", "dag"), False),
+        (("dbt", "x", "--split-by", "group"), True),
+        (("dbt", "x", "--split-by", "folder"), True),
+        (("pyspark", "jobs", "--split-by", "job"), True),
+        (("airflow", "dags", "--split-by", "dag"), True),
+    ],
+)
+def test_the_splits_about_code_belong_to_the_importers_that_read_code(project, argv, ok):
+    from fluid_build.cli._import_workflow_handler import check_import_flags
+
+    args = parse(*argv)
+    tool = args.tool
+    if ok:
+        check_import_flags(args, tool)
+        return
+    with pytest.raises(FluidUserError) as refused:
+        check_import_flags(args, tool)
+    assert "applies to `fluid import airflow` and `fluid import pyspark`" in refused.value.what
+
+
+def test_the_printed_lines_are_clean_and_never_wrapped(project, capsys, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "40")
+    name = "jobs/evil‮ name.py"
+    (project / "jobs" / "evil‮ name.py").write_text(
+        'from pyspark.sql import SparkSession\ndf.write.saveAsTable("retail.evil")\n',
+        encoding="utf-8",
+    )
+    assert run(parse(*ARGV, "--dry-run"), LOG) == 0
+    out = capsys.readouterr().out
+    assert "‮" not in out and " " not in out and name not in out
+    # one proposal line stays one line, whatever the width of the terminal
+    assert (
+        "retail.orders_daily  (owner retail-data) → out/contract.retail.orders_daily.fluid.yaml [new]"
+        in out
+    )

@@ -135,10 +135,9 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         metavar="tool",
         choices=ImporterChoices(),
         default=None,
-        help=(
-            "Foreign tool to import from: %(choices)s "
-            "(omit for a dbt/Terraform/SQL directory scan)"
-        ),
+        # No ``%(choices)s``: the CLI's own help formatter prints the help text as it is and
+        # then lists the choices (the built-ins and the installed plugins) itself.
+        help="Foreign tool to import from (omit for a dbt/Terraform/SQL directory scan)",
     )
     parser.add_argument(
         "source",

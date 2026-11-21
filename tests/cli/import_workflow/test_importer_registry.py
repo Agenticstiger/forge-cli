@@ -262,13 +262,23 @@ def test_building_the_parser_and_taking_a_builtin_read_no_metadata(monkeypatch):
     assert parser.parse_args(["import", "schema-registry", "s"]).tool == "schema-registry"
 
 
-def test_the_import_help_lists_plugin_names_and_loads_nothing(eps, capsys):
+def test_the_import_help_lists_plugin_names_and_loads_nothing(eps, capsys, monkeypatch):
     ep = _EP("my-tool", _Plugin)
     eps(ep)
-    with pytest.raises(SystemExit) as helped:
+    monkeypatch.setenv("COLUMNS", "200")
+    from fluid_build.cli import build_parser
+    from fluid_build.cli.help_formatter import print_command_help
+
+    print_command_help(build_parser(), "import")  # the help `fluid import --help` prints
+    out = capsys.readouterr().out
+    assert "my-tool" in out and "pyspark" in out  # the formatter lists the choices itself
+    assert "%(choices)s" not in out  # and the help text does not ask argparse to
+    assert ep.loads == 0
+
+    with pytest.raises(SystemExit) as helped:  # plain argparse help never shows the literal either
         _parser().parse_args(["import", "--help"])
     assert helped.value.code == 0
-    assert "my-tool" in capsys.readouterr().out
+    assert "%(choices)s" not in capsys.readouterr().out
     assert ep.loads == 0
 
 
@@ -371,3 +381,71 @@ def test_coerce_report_keeps_the_four_lists_and_survives_anything_else():
 
     out = R.coerce_report(Odd())
     assert out.mapped_one_to_one == ["a", "2"] and out.notes == [] and out.unsupported == []
+
+
+# ── where a plugin's contract is written ──────────────────────────────
+
+
+def test_listing_plugins_does_not_import_an_importer_plugin(eps):
+    ep = _EP("my-tool", _Plugin, dist="acme-importers")
+    eps(ep)
+    listed = plugin_manager.detailed_plugins("importer")["importer"]
+    assert [(e["name"], e["allowed"], e["metadata"]) for e in listed] == [("my-tool", True, None)]
+    assert ep.loads == 0  # imported when `fluid import my-tool` asks for it, not by a listing
+
+
+def test_a_link_at_the_output_path_is_not_written_through_even_by_an_importer_that_overwrites(
+    eps, tmp_path
+):
+    eps(_EP("plain", _Plugin))
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me\n", encoding="utf-8")
+    target = tmp_path / "out.fluid.yaml"
+    target.symlink_to(victim)
+    with pytest.raises(FluidUserError) as refused:
+        _run(tmp_path, "plain", split_by=None)
+    assert "not regular files" in refused.value.what and "out.fluid.yaml" in refused.value.why
+    assert victim.read_text(encoding="utf-8") == "keep me\n"
+    assert target.is_symlink()
+    with pytest.raises(FluidUserError):  # --force does not change that
+        _run(tmp_path, "plain", split_by=None, force=True)
+    assert victim.read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_a_directory_at_the_output_path_is_refused(eps, tmp_path):
+    eps(_EP("plain", _Plugin))
+    (tmp_path / "out.fluid.yaml").mkdir()
+    with pytest.raises(FluidUserError) as refused:
+        _run(tmp_path, "plain", split_by=None)
+    assert "not regular files" in refused.value.what
+
+
+def test_several_contracts_need_a_directory_for_out_not_a_file(eps, tmp_path):
+    class Many:
+        def import_to_contracts(self, source, *, options=None):
+            return [{"id": "a"}, {"id": "b"}], None
+
+    eps(_EP("many", Many))
+    from fluid_build.cli._import_workflow_handler import run_import_from_tool
+
+    target = tmp_path / "a-file"
+    target.write_text("x\n", encoding="utf-8")
+    args = argparse.Namespace(out_path=str(target), split_by=None)
+    with pytest.raises(FluidUserError) as refused:
+        run_import_from_tool(args, logging.getLogger("t"), tool="many", source="x")
+    assert "--out names a file, but this import writes 2 files" in refused.value.what
+    assert target.read_text(encoding="utf-8") == "x\n"
+
+
+def test_a_failed_write_is_a_typed_error_and_leaves_no_temporary_file(eps, tmp_path, monkeypatch):
+    eps(_EP("plain", _Plugin))
+    from fluid_build.cli import _import_workflow_handler as handler
+
+    def broken(path, data, *, mode):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(handler, "atomic_write_bytes", broken)
+    with pytest.raises(FluidUserError) as refused:
+        _run(tmp_path, "plain", split_by=None)
+    assert refused.value.what.startswith("cannot write ") and "PermissionError" in refused.value.why
+    assert list(tmp_path.iterdir()) == []
