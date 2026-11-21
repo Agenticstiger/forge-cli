@@ -28,11 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upgrade, as for any change to the runner. A value passed on the command line that a stamp may not
   hold (a space, a control character, more than 256 characters, a first character that is not a
   letter or a digit) stops the run before Spark starts. A `FLUID_RELEASE_ID` like that refuses
-  `fluid apply` before anything is applied; `fluid apply --mode reconcile` and a scheduled build
-  leave it off, with a warning, so a mis-set variable cannot stop a keepalive or a night's batch.
-  A run id is stamped as the pipeline has it except that what a stamp may not hold becomes `_` and
-  what is not a letter or a digit is cut from its start (`Build #42` is stamped `Build__42`), and a
-  date in the contract is hashed as its ISO text, as `yq -o=json` prints it.
+  `fluid apply` in every mode, before anything is applied, except `--mode reconcile`: the
+  keepalive leaves it off, with a warning, so a mis-set variable cannot stop a dead stream from
+  being restarted. A run id is stamped as the pipeline has it except that what a stamp may not hold
+  becomes `_` and what is not a letter or a digit is cut from its start (`Build #42` is stamped
+  `Build__42`), and a date in the contract, as a value or a key, is hashed as its ISO 8601 text
+  (`yq -o=json` prints a date the same way and a datetime as written).
 
 - **`fluid runs status <product> --release-dir DIR [--on YYYY-MM-DD] [--env NAME]` says which
   release was in force, and so which version of the code ran.** A job Forge does not run (an
@@ -49,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then, 2 for a bad day or directory. `release.json` gains `identity.expose_versions` (each
   expose's version) and `provenance.source` (the revision, repository and ref the CI names, read
   from its environment variables; a clone URL loses its user, password, query and fragment, and
-  anything that is not a hex commit, a URL or `host.name:org/repo`, or a ref name, is left out: a
+  anything that is not a hex commit, a URL or `user@host:org/repo`, or a ref name, is left out: a
   credential or a path on the runner is no part of a release record).
 
 - **`fluid generate pyspark-schema` writes a PySpark `StructType` module for each output

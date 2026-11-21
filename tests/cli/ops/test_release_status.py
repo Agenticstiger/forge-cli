@@ -143,6 +143,16 @@ def test_a_release_reached_by_two_spellings_of_one_root_is_listed_once(
     assert len(found.releases) == 3 and found.skipped == {}
 
 
+def test_the_same_release_sealed_in_one_second_in_two_roots_is_ordered_by_path_not_by_root(
+    tmp_path,
+):
+    sealed = "2026-11-18T09:12:03+00:00"
+    seal(tmp_path / "b", "x", sealed=sealed, run_id="from-b")
+    seal(tmp_path / "a", "y", sealed=sealed, run_id="from-a")
+    found = rs.find_releases([str(tmp_path / "b"), str(tmp_path / "a")], PRODUCT)
+    assert [r.run_id for r in found.releases] == ["from-a", "from-b"]  # one identity digest
+
+
 def test_releases_sealed_in_the_same_second_are_listed_in_the_order_of_their_directories(tmp_path):
     root = tmp_path / "rel"
     for name, version in (("b", "1.1.0"), ("a", "1.0.0"), ("c", "1.2.0")):
@@ -199,6 +209,7 @@ def test_a_time_no_utc_day_can_hold_skips_that_record_and_not_the_others(release
     assert "orders 1.5.0" in capsys.readouterr().out
 
 
+@pytest.mark.timeout(30)  # a pipe that is opened for reading blocks until a writer comes
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs named pipes")
 def test_a_release_json_that_is_a_named_pipe_is_skipped_without_blocking(releases):
     (releases / "r2" / "release.json").unlink()
@@ -206,6 +217,23 @@ def test_a_release_json_that_is_a_named_pipe_is_skipped_without_blocking(release
     found = rs.find_releases([str(releases)], PRODUCT)
     assert [r.run_id for r in found.releases] == ["3f9a1c0b7e2d", "bbbb"]
     assert found.skipped == {"a directory with no readable release.json": 1}
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs named pipes")
+def test_a_named_pipe_that_holds_a_valid_record_is_not_read_as_one(tmp_path):
+    directory = seal(tmp_path / "rel", "a")
+    record = (directory / "release.json").read_bytes()
+    (directory / "release.json").unlink()
+    os.mkfifo(directory / "release.json")
+    keep = os.open(directory / "release.json", os.O_RDONLY | os.O_NONBLOCK)  # keeps the buffer
+    try:
+        writer = os.open(directory / "release.json", os.O_WRONLY)
+        os.write(writer, record)
+        os.close(writer)
+        assert rs.find_releases([str(tmp_path / "rel")], PRODUCT).releases == []
+    finally:
+        os.close(keep)
 
 
 @pytest.mark.parametrize("value", [["prod"], {"a": 1}, 7, True, [[[[]]]] * 3, ""])
@@ -232,6 +260,16 @@ def test_what_the_digest_does_not_cover_can_change_and_the_answer_says_so(releas
     answers = rs.in_force_by_environment(found.releases, None, moment("2026-11-25T00:00:00"))
     text = "\n".join(rs.report(PRODUCT, answers, found, None))
     assert rs.NOT_AUTHENTICATED in text and "does not say who wrote the record" in text
+
+
+def test_a_record_of_exactly_the_limit_is_read_and_one_byte_more_is_not(tmp_path, monkeypatch):
+    directory = seal(tmp_path / "rel", "a")
+    text = (directory / "release.json").read_text(encoding="utf-8")
+    monkeypatch.setattr(rs, "MAX_INDEX_BYTES", len(text) + 5)
+    (directory / "release.json").write_text(text + " " * 5, encoding="utf-8")
+    assert len(rs.find_releases([str(tmp_path / "rel")], PRODUCT).releases) == 1
+    (directory / "release.json").write_text(text + " " * 6, encoding="utf-8")
+    assert rs.find_releases([str(tmp_path / "rel")], PRODUCT).releases == []
 
 
 def test_a_record_larger_than_the_limit_is_not_read(releases, monkeypatch):
@@ -291,6 +329,9 @@ def test_without_a_day_it_is_the_latest_release_sealed_by_now(releases):
     now = rs.in_force(found, None, moment("2026-11-21T12:00:00"))
     assert now.at_start.expose_versions["orders"] == "1.5.0" and now.during == []
     assert rs.in_force(found, None, moment("2026-11-01T00:00:00")).at_start is None
+    # a release sealed at this very second is already in force
+    exact = rs.in_force(found, None, moment("2026-11-20T15:02:11"))
+    assert exact.at_start.expose_versions["orders"] == "1.5.0"
 
 
 def test_a_time_with_an_offset_or_none_is_read_as_utc(releases):
@@ -446,6 +487,11 @@ def test_the_command_can_answer_for_one_environment(tmp_path, capsys):
 )
 def test_a_day_is_year_month_day_and_nothing_else(releases, day):
     assert runs_status("--release-dir", str(releases), "--on", day) == 2
+
+
+def test_an_environment_that_is_empty_is_a_usage_error(releases, caplog):
+    assert runs_status("--release-dir", str(releases), "--env", "  ") == 2
+    assert "--env needs an environment name" in caplog.text
 
 
 def test_the_last_day_there_is_can_be_asked_about(releases, capsys):

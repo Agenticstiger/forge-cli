@@ -208,6 +208,9 @@ def _run_release_status(args: argparse.Namespace, logger: logging.Logger) -> int
     except NotADirectoryError as exc:
         logger.error("%s", exc)
         return 2
+    if args.env is not None and not args.env.strip():
+        logger.error("--env needs an environment name")
+        return 2
     environment = rs.clean(args.env, 40) if args.env else None
     answers = rs.in_force_by_environment(
         found.releases, on, datetime.now(timezone.utc), environment

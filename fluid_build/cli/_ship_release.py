@@ -86,12 +86,13 @@ _SOURCE_VARS = (
 )
 _REVISION = re.compile(r"[0-9a-f]{7,64}")
 _REF = re.compile(r"[A-Za-z0-9._/@+#-]{1,200}")
-#: ``[user@]host.example.com:org/repo.git``. A dotted host and a path of at least two segments
-#: that does not start at a root: ``user:token`` (a CI variable set to a credential), a Windows
-#: drive (``C:/work``) and ``host:/etc/passwd`` are none of that.
+#: ``user@host:org/repo.git`` (the host may be a bare name such as ``gitserver``). The ``user@``
+#: and a path of at least two segments that does not start at a root make it one: ``user:token``
+#: (a CI variable set to a credential), a Windows drive (``C:/work``) and ``host:/etc/passwd``
+#: are none of that.
 _SCP_URL = re.compile(
-    r"(?:[A-Za-z0-9._-]+@)?"
-    r"([A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)+)"
+    r"[A-Za-z0-9._-]+@"
+    r"([A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)*)"
     r":([A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)+)"
 )
 _GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
@@ -100,7 +101,7 @@ _GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 def _repository(value: Optional[str]) -> Optional[str]:
     """A repository URL with no user, password, query or fragment (a CI's clone URL can carry a
     token), or ``None`` for anything that is not an ``https``, ``http``, ``ssh`` or ``git`` URL
-    or a ``host.name:org/repo`` one, or is not printable ASCII: a path on the runner's disk is no
+    or a ``user@host:org/repo`` one, or is not printable ASCII: a path on the runner's disk is no
     part of a release record."""
     from urllib.parse import urlsplit
 

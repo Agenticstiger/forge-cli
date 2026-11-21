@@ -888,16 +888,18 @@ def _product_version(contract: Mapping[str, Any], build: Mapping[str, Any]) -> O
 
 
 def _as_json(value: Any) -> Any:
-    """``value`` with each date and time as its ISO 8601 text: what an unquoted YAML date
-    loads as, and what ``yq -o=json`` prints for it, so the digest of such a contract can
-    still be reproduced outside Forge."""
+    """``value`` with each date and time, as a value or as a key, as its ISO 8601 text: what an
+    unquoted YAML date loads as. ``yq -o=json`` prints a date the same way; a datetime it prints
+    as written, which may not be ISO 8601 (a space for the ``T``, a lower case ``t``)."""
     if isinstance(value, Mapping):
-        return {k: _as_json(v) for k, v in value.items()}
+        return {_as_json(k) if _is_moment(k) else k: _as_json(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_as_json(v) for v in value]
-    if isinstance(value, (_datetime.date, _datetime.time)):
-        return value.isoformat()
-    return value
+    return value.isoformat() if _is_moment(value) else value
+
+
+def _is_moment(value: Any) -> bool:
+    return isinstance(value, (_datetime.date, _datetime.time))
 
 
 def _contract_digest(contract: Mapping[str, Any]) -> Optional[str]:
@@ -928,8 +930,8 @@ def run_stamps(
     a warning), the pipeline's ``run_id`` (anything a stamp may not hold becomes ``_`` and what
     is not a letter or a digit is cut from its start: an operator's own ``FLUID_RUN_ID`` never
     refuses a deploy) and the release :data:`RELEASE_ID_ENV` names. A release a stamp may not
-    hold refuses the deploy (``refuse_release``); a run nobody is watching (a keepalive, a
-    scheduled build) leaves it off, with a warning, so a label cannot stop the data.
+    hold refuses the deploy (``refuse_release``); the keepalive, which nobody is watching,
+    leaves it off with a warning, so a label cannot stop a dead stream from being restarted.
 
     Raises:
         ValueError: :data:`RELEASE_ID_ENV` holds a character a stamp may not, and

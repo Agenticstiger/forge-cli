@@ -18,7 +18,6 @@ import re
 import pytest
 
 from fluid_build.build_runners.spark import _desired
-from fluid_build.build_runners.spark import _reconcile as rc
 from fluid_build.build_runners.spark._adapters import _identity
 from fluid_build.cli import _spark_apply as _apply
 from fluid_build.cli._common import CLIError
@@ -194,6 +193,17 @@ def test_a_contract_with_an_unquoted_yaml_date_is_hashed_as_the_dates_text(contr
     assert _desired.run_stamps(contract)["contract_digest"] == compute_contract_digest(as_text)
 
 
+def test_a_date_used_as_a_key_is_hashed_as_its_text_too(contract):
+    contract["metadata"] = {datetime.date(2026, 1, 1): "released", "tuple": (1, 2)}
+    as_text = {**contract, "metadata": {"2026-01-01": "released", "tuple": [1, 2]}}
+    assert _desired.run_stamps(contract)["contract_digest"] == compute_contract_digest(as_text)
+
+
+def test_a_contract_with_bool_and_tuple_keys_still_hashes_as_the_primitive_does(contract):
+    contract["metadata"] = {True: "on", None: "none", (1, 2): "pair"}
+    assert _desired.run_stamps(contract)["contract_digest"] == compute_contract_digest(contract)
+
+
 def test_a_contract_no_json_can_hold_is_left_unstamped_with_a_warning(contract, caplog):
     contract["metadata"] = {"tags": {1, 2}}  # a set
     with caplog.at_level(logging.WARNING):
@@ -236,12 +246,13 @@ def test_prepare_accepts_a_bound_plan_whatever_the_stamps(contract, monkeypatch)
     assert run.release_id == "v9"  # a plan made with other stamps still binds
 
 
+@pytest.mark.parametrize("build_id", [None, "ingest-orders"])
 def test_prepare_refuses_a_release_id_a_stamp_may_not_hold_before_anything_starts(
-    contract, monkeypatch
+    contract, monkeypatch, build_id
 ):
     monkeypatch.setenv(_desired.RELEASE_ID_ENV, "two words")
     with pytest.raises(CLIError) as err:
-        _apply.prepare(contract, build_id=None, verified_plan=None, dry_run=True)
+        _apply.prepare(contract, build_id=build_id, verified_plan=None, dry_run=True)
     assert err.value.event == "apply_spark_invalid"
     assert _desired.RELEASE_ID_ENV in str(err.value.context["error"])
     assert "nothing was started" in str(err.value.context["error"])
@@ -273,30 +284,6 @@ def test_the_keepalive_leaves_a_release_a_stamp_may_not_hold_off_and_still_runs(
         )
     assert seen and all(run.release_id is None for run in seen)
     assert all(run.run_id == "3f9a3f9a3f9a" for run in seen)
-    assert "carries no release stamp" in caplog.text
-
-
-def test_a_scheduled_build_leaves_a_release_a_stamp_may_not_hold_off_and_still_runs(
-    contract, monkeypatch, caplog
-):
-    contract["builds"][0]["properties"]["stream"]["trigger"] = {"availableNow": True}
-    monkeypatch.setenv(_desired.RELEASE_ID_ENV, "two words")
-    seen = []
-    monkeypatch.setattr(
-        rc,
-        "run_once",
-        lambda run, **kw: seen.append(run) or rc.Outcome(run.build, run.runtime, "succeeded"),
-    )
-    with caplog.at_level(logging.WARNING):
-        code = rc.run_build(
-            contract,
-            contract["builds"][0],
-            dry_run=False,
-            say=lambda text: None,
-            run_id="3f9a3f9a3f9a",
-        )
-    assert code == 0 and len(seen) == 1
-    assert seen[0].release_id is None and seen[0].run_id == "3f9a3f9a3f9a"
     assert "carries no release stamp" in caplog.text
 
 

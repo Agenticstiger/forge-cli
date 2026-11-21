@@ -976,8 +976,7 @@ def run_build(
         raise ValueError(refusal)
     # As fluid plan and fluid apply read it: ``{{ env.* }}`` resolved.
     resolved = resolve_contract_env_templates(copy.deepcopy(dict(contract)))
-    stamps = run_stamps(contract, run_id=run_id, refuse_release=False)
-    runs = desired_runs(resolved, build_id=bid, stamps=stamps)
+    runs = desired_runs(resolved, build_id=bid, stamps=run_stamps(contract, run_id=run_id))
     if not runs:
         raise ValueError(
             f"Spark build {bid}: forge's Spark runner runs a build of engine: spark with "
