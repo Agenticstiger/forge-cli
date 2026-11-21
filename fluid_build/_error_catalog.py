@@ -762,6 +762,106 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ["Use a supported destination scheme (file / scp / git+ssh) for --to"],
         None,
     ),
+    # ── schedule-sync --airflow-url (the Airflow check, Airflow 2 and 3) ─────
+    "schedule_sync_airflow_flags": (
+        [
+            "Add --airflow-url <Airflow API server URL> to run the Airflow check, or drop the "
+            "--airflow-* / --check-only flags",
+            "--airflow-bundle and --airflow-bundle-version need Airflow 3 (Dag bundles)",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_unsupported_scheduler": (
+        ["Run the Airflow check with --scheduler airflow, astronomer or composer"],
+        None,
+    ),
+    "schedule_sync_airflow_no_dag_files": (
+        ["Point --dags-dir at the DAG files fluid generate schedule wrote"],
+        None,
+    ),
+    "schedule_sync_airflow_bad_url": (
+        [
+            "Pass --airflow-url as https://<host>[/<prefix>], with no user name, password, "
+            "query or fragment",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_insecure_url": (
+        [
+            "Use an https:// --airflow-url",
+            "Or set FLUID_AIRFLOW_ALLOW_INSECURE_HTTP=true in the operator environment where "
+            "plain HTTP is intended",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_credentials": (
+        [
+            "Set FLUID_AIRFLOW_TOKEN_REF (a token) or FLUID_AIRFLOW_CREDENTIAL_REF "
+            "(user:password) to a secret reference such as env://NAME, not both",
+            "Run fluid secrets check to see why a reference does not resolve",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_unreachable": (
+        [
+            "Check that the Airflow API server answers at --airflow-url from this machine",
+            "A restarting server answers 502/503 for a while: raise --airflow-wait or re-run",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_api_not_found": (
+        [
+            "Pass the root URL of Airflow's API server (Airflow 2: the webserver); include a "
+            "path prefix it is served under",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_api_mismatch": (
+        ["Leave --airflow-api at auto, or pass v2 for Airflow 3 and v1 for Airflow 2"],
+        None,
+    ),
+    "schedule_sync_airflow_unsupported_version": (
+        ["Check that --airflow-url is an Airflow 2.x or 3.x API server"],
+        None,
+    ),
+    "schedule_sync_airflow_auth_failed": (
+        [
+            "Check the secret behind FLUID_AIRFLOW_CREDENTIAL_REF or FLUID_AIRFLOW_TOKEN_REF",
+            "Airflow 2 takes a password only with airflow.api.auth.backend.basic_auth in "
+            "[api] auth_backends; Airflow 3 issues a token from POST /auth/token",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_forbidden": (
+        ["Give the Airflow user or token read access to Dags and import errors (Viewer)"],
+        None,
+    ),
+    "schedule_sync_airflow_redirect": (
+        [
+            "Pass the URL the redirect points at as --airflow-url; a sign-in page means a "
+            "proxy sits in front of Airflow",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_bad_response": (
+        ["Check that --airflow-url points at Airflow's API server, not another service"],
+        None,
+    ),
+    "schedule_sync_airflow_import_errors": (
+        [
+            "Fix the import error the report names, then re-run fluid schedule-sync",
+            "Parse the DAG locally against the same Airflow major before pushing",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_not_parsed": (
+        [
+            "Raise --airflow-wait: Airflow lists new files every dag_dir_list_interval "
+            "(Airflow 2) or refresh_interval (Airflow 3), 300 s by default",
+            "On an Airflow 3 Git bundle, check that it tracks the branch the push went to",
+        ],
+        None,
+    ),
     # ── rollback ───────────────────────────────────────────────────────────
     "rollback_product_id_empty": (
         ["Pass the product id to roll back: fluid rollback <product-id>"],

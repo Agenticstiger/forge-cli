@@ -67,6 +67,20 @@ CLI surface::
                         [--dry-run]
                         [--timeout <seconds>]                # per-subprocess, default 600, hard cap 3600
                         [--report <path>]                    # JSON result summary
+                        [--airflow-url <url>]                # then wait until Airflow parsed them
+                        [--airflow-api {auto|v1|v2}]         # REST dialect, default auto-detect
+                        [--airflow-wait <seconds>]           # default 600, cap 3600
+                        [--airflow-bundle <name>]            # Airflow 3 Dag bundle
+                        [--airflow-bundle-version <version>] # default: the commit a git+ssh push made
+                        [--check-only]                       # check, push nothing
+
+The Airflow check (``--airflow-url``, ``cli/_schedule_sync_airflow.py``) works on Airflow
+2 (``/api/v1``, HTTP Basic or a bearer token) and Airflow 3 (``/api/v2``, a JWT from
+``/auth/token`` or a bearer token). It runs a preflight before the push (version,
+sign-in, one read), so a check that cannot run pushes nothing, then waits until each
+pushed file is parsed with no import error: on an Airflow 3 Git bundle, its Dags at the
+pushed commit; otherwise two parses after the sync. Exit 1 when a file fails to import
+or is not parsed in time; the report's ``airflow_check`` block names each file.
 """
 
 from __future__ import annotations
@@ -122,6 +136,14 @@ _AIRFLOW_URL_SCHEMES = {
 _DEFAULT_TIMEOUT = 600
 _MAX_TIMEOUT = 3600
 
+# ``--airflow-*`` (the Airflow check). The env names are the ones
+# ``cli/_airflow_api.py`` reads; that module is imported only when the check runs, so
+# the help text spells them here (tests/cli/test_schedule_sync_airflow.py pins both).
+_DEFAULT_AIRFLOW_WAIT = 600
+_AIRFLOW_API_CHOICES = ("auto", "v1", "v2")
+_AIRFLOW_TOKEN_REF_ENV = "FLUID_AIRFLOW_TOKEN_REF"
+_AIRFLOW_CREDENTIAL_REF_ENV = "FLUID_AIRFLOW_CREDENTIAL_REF"
+
 # ``--delete-scope`` values; see the module docstring.
 _DELETE_SCOPES = ("product", "destination", "none")
 _DEFAULT_DELETE_SCOPE = "product"
@@ -175,7 +197,15 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "                      --workspace production\n\n"
             "  # Dagster Cloud\n"
             "  fluid schedule-sync --scheduler dagster --dags-dir dist/artifacts/schedule/ \\\n"
-            "                      --workspace prod-deployment\n"
+            "                      --workspace prod-deployment\n\n"
+            "  # Push, then wait until Airflow (2 or 3, detected) has parsed the files; on an\n"
+            "  # Airflow 3 Git Dag bundle, until their Dags are at the pushed commit\n"
+            "  fluid schedule-sync --scheduler airflow --dags-dir dags/ "
+            "--airflow-url https://airflow.example.org \\\n"
+            "                      --destination git+ssh://git@git.example.org/data/dags.git\n\n"
+            "  # Your own deploy put the files in place: only check them\n"
+            "  fluid schedule-sync --scheduler airflow --dags-dir dags/ --check-only \\\n"
+            "                      --airflow-url https://airflow.example.org\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -318,6 +348,57 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "for CI / service-account use so commits are attributable to "
             "a deterministic identity (e.g., 'fluid-bot <bot@example.com>')."
         ),
+    )
+    check = p.add_argument_group(
+        "Airflow check (Airflow 2 and 3)",
+        "After the push, wait until Airflow has parsed the pushed files with no import error.",
+    )
+    check.add_argument(
+        "--airflow-url",
+        default=None,
+        help=(
+            "Airflow API server URL (on Airflow 2, the webserver). Checks version and sign-in "
+            "before the push (nothing is pushed if that fails), then waits until Airflow has "
+            "parsed the pushed files with no import error. Credentials are secret "
+            f"references in the operator environment: {_AIRFLOW_TOKEN_REF_ENV} (an API "
+            f"token) or {_AIRFLOW_CREDENTIAL_REF_ENV} (user:password; HTTP Basic on "
+            "Airflow 2, a token from /auth/token on Airflow 3), e.g. env://NAME. https, or "
+            "http to localhost (FLUID_AIRFLOW_ALLOW_INSECURE_HTTP=true allows other hosts)."
+        ),
+    )
+    check.add_argument(
+        "--airflow-api",
+        choices=list(_AIRFLOW_API_CHOICES),
+        default="auto",
+        help="REST dialect: v2 (Airflow 3), v1 (Airflow 2), or auto (detect; default).",
+    )
+    check.add_argument(
+        "--airflow-wait",
+        type=int,
+        default=_DEFAULT_AIRFLOW_WAIT,
+        help=(
+            f"Seconds to wait for the parse (default {_DEFAULT_AIRFLOW_WAIT}, cap 3600). "
+            "Airflow lists new files every dag_dir_list_interval (Airflow 2) or "
+            "refresh_interval (Airflow 3), 300 s by default."
+        ),
+    )
+    check.add_argument(
+        "--airflow-bundle",
+        default=None,
+        help="Airflow 3 Dag bundle the files belong to: Dags and import errors of other bundles are ignored.",
+    )
+    check.add_argument(
+        "--airflow-bundle-version",
+        default=None,
+        help=(
+            "Wait until the pushed Dags report this bundle version (Airflow 3, a versioned "
+            "bundle). Default: the commit a git+ssh push made, where the bundle is versioned."
+        ),
+    )
+    check.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Push nothing; only check the files under --dags-dir in Airflow (after your own deploy).",
     )
     p.set_defaults(func=run)
 
@@ -988,6 +1069,10 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
                 f"user.email={author_email}",
             ]
         commit_argv = [git, *commit_author_argv, "commit", "-m", commit_message]
+        # The Airflow check waits for the commit the push leaves the branch at (an
+        # Airflow 3 Git bundle reports it as each Dag's bundle_version).
+        head_argv = [git, "rev-parse", "HEAD"]
+        record_head = bool(getattr(args, "airflow_url", None))
         rsync_argvs = [
             [
                 rsync,
@@ -1042,6 +1127,15 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
                     timeout=args.timeout,
                     dry_run=True,
                 ),
+                *(
+                    [
+                        _run_subprocess_with_cwd(
+                            head_argv, cwd=clone_dir, timeout=args.timeout, dry_run=True
+                        )
+                    ]
+                    if record_head
+                    else []
+                ),
             ]
 
         if args.dry_run:
@@ -1090,22 +1184,26 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
             results.append(status)
             if status["exit_code"] != 0:
                 return results
-            if not status.get("stdout_tail", "").strip():
-                return results
-
-            for argv in (
-                commit_argv,
-                [git, "push"],
-            ):
-                result = _run_subprocess_with_cwd(
-                    argv,
-                    cwd=clone_dir,
-                    timeout=args.timeout,
-                    dry_run=False,
+            if status.get("stdout_tail", "").strip():
+                for argv in (
+                    commit_argv,
+                    [git, "push"],
+                ):
+                    result = _run_subprocess_with_cwd(
+                        argv,
+                        cwd=clone_dir,
+                        timeout=args.timeout,
+                        dry_run=False,
+                    )
+                    results.append(result)
+                    if result["exit_code"] != 0:
+                        return results
+            if record_head:
+                results.append(
+                    _run_subprocess_with_cwd(
+                        head_argv, cwd=clone_dir, timeout=args.timeout, dry_run=False
+                    )
                 )
-                results.append(result)
-                if result["exit_code"] != 0:
-                    return results
         return results
 
     # SECURITY: every argv below that positions user-controlled strings
@@ -1548,6 +1646,10 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
             {"scheduler": args.scheduler, "supported": list(_DISPATCHERS.keys())},
         )
 
+    # Flags of the Airflow check first: a bad combination is exit 2 before anything runs.
+    airflow_check = _airflow_check(args, dags_dir)
+    check_only = bool(getattr(args, "check_only", False))
+
     # ── Supply-chain gate: verify bundle signature BEFORE dispatching ──
     # Opt-in via --verify-signature. When set, the bundle signature is
     # verified before any DAG reaches the scheduler. Rationale: DAGs
@@ -1625,8 +1727,21 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
         markup=False,
     )
 
-    results = dispatcher(dags_dir, args)
-    superseded = _report_superseded_scopes(dags_dir, args)
+    # The Airflow check signs in and reads once BEFORE the push: a check that cannot
+    # run (wrong URL, credential or major) must not leave a pushed, unchecked deploy.
+    if airflow_check is not None:
+        if args.dry_run:
+            airflow_check.plan()
+        else:
+            airflow_check.preflight()
+
+    if check_only:
+        cprint("[schedule-sync] --check-only: nothing is pushed", markup=False)
+        results: List[Dict[str, Any]] = []
+        superseded: List[Dict[str, Any]] = []
+    else:
+        results = dispatcher(dags_dir, args)
+        superseded = _report_superseded_scopes(dags_dir, args)
 
     # ── Acquisition pattern: emit per-orchestrator artifacts ────────────
     # When the contract carries a Bronze ``pattern: acquisition`` build,
@@ -1682,6 +1797,17 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
                 },
             )
 
+    airflow_report: Optional[Dict[str, Any]] = None
+    if airflow_check is not None and not args.dry_run:
+        if overall_exit == 0:
+            airflow_report = airflow_check.wait(results)
+            if airflow_report.get("result") != "passed":
+                overall_exit = 1
+        else:
+            from fluid_build.cli._schedule_sync_airflow import skipped_report
+
+            airflow_report = skipped_report("The push failed, so Airflow was not checked.")
+
     report = {
         "command": COMMAND,
         "scheduler": args.scheduler,
@@ -1693,6 +1819,8 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
         "superseded_scopes": superseded,
         "overall_exit": overall_exit,
     }
+    if airflow_report is not None:
+        report["airflow_check"] = airflow_report
 
     if args.report:
         report_path = Path(args.report).resolve()
@@ -1702,9 +1830,24 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
         )
         cprint(f"[schedule-sync] report → {report_path}", markup=False)
 
-    if overall_exit == 0:
+    checked = airflow_report is not None and airflow_report.get("result") == "passed"
+    if overall_exit == 0 and check_only:
+        cprint("[schedule-sync] ✔ Airflow check passed", markup=False)
+    elif overall_exit == 0:
         cprint(
-            f"[schedule-sync] ✔ {args.scheduler} sync complete ({len(results)} subprocess(es))",
+            f"[schedule-sync] ✔ {args.scheduler} sync complete ({len(results)} subprocess(es))"
+            + ("; Airflow parsed the pushed files" if checked else ""),
+            markup=False,
+        )
+    elif airflow_report is not None and airflow_report.get("result") == "failed":
+        cprint(
+            "[schedule-sync] ✘ "
+            + (
+                "Airflow check failed"
+                if check_only
+                else f"{args.scheduler} sync pushed, but the Airflow check failed"
+            )
+            + " (see above; the report's airflow_check block names each file)",
             markup=False,
         )
     else:
@@ -1714,3 +1857,30 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
         )
 
     return overall_exit
+
+
+def _airflow_flags_given(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "airflow_url", None)
+        or getattr(args, "check_only", False)
+        or getattr(args, "airflow_bundle", None)
+        or getattr(args, "airflow_bundle_version", None)
+        or getattr(args, "airflow_api", "auto") not in (None, "auto")
+        or getattr(args, "airflow_wait", _DEFAULT_AIRFLOW_WAIT) != _DEFAULT_AIRFLOW_WAIT
+    )
+
+
+def _airflow_check(args: argparse.Namespace, dags_dir: Path) -> Any:
+    """The ``--airflow-url`` check, or ``None``; the module is imported only when it is asked for."""
+    if not _airflow_flags_given(args):
+        return None
+    from fluid_build.cli._schedule_sync_airflow import AirflowCheck
+
+    scheme: Optional[str] = None
+    if (
+        args.scheduler == "airflow"
+        and getattr(args, "destination", None)
+        and not getattr(args, "check_only", False)
+    ):
+        scheme = _validate_destination(args.destination, args.scheduler)[0]
+    return AirflowCheck.from_args(args, dags_dir, scheme=scheme, default_wait=_DEFAULT_AIRFLOW_WAIT)
