@@ -15,6 +15,8 @@ validators:
     odps/*.opds.json       → (back-compat alias of opds/) same OPDS v4.1 check
     schedule/<product-id>/*.py → py_compile (DAGs and flows)
     policy/bindings.json   → key-check + OPA conftest (optional)
+    spark/<build-id>/job.json → structural check of the forge Spark job config
+    pyspark-schema/*_schema.py → the PySpark schema module allowlist
     <dir>/dbt/             → dbt parse (optional, for speed-transformation output)
 
 Reuses ``ValidationIssue`` / ``BundleValidationReport`` from Phase 3's
@@ -558,6 +560,40 @@ def validate_spark_job_json(path: str, content: bytes) -> List[ValidationIssue]:
     ]
 
 
+def validate_pyspark_schema_module(path: str, content: bytes) -> List[ValidationIssue]:
+    """``pyspark-schema/<port>_schema.py`` is a module the PySpark schema emitter could
+    have written: UTF-8, its fixed first lines, and nothing but one ``StructType`` (the
+    allowlist :func:`fluid_build.spark.pyspark_schema.check_module` applies). A job imports
+    the module, so anything else in it would run there."""
+    from fluid_build.spark import pyspark_schema
+
+    parts = path.split("/")
+    if len(parts) != 2 or not parts[1].endswith(f"{pyspark_schema.SUFFIX}.py"):
+        problem: Optional[Tuple[str, str]] = (
+            f"expected pyspark-schema/<port>{pyspark_schema.SUFFIX}.py",
+            "PYSPARK-SCHEMA-PATH",
+        )
+    else:
+        problem = None
+        try:
+            pyspark_schema.check_module(content.decode("utf-8"), parts[1])
+        except UnicodeDecodeError as exc:
+            problem = (f"not UTF-8: {exc}", "PYSPARK-SCHEMA-ENCODING")
+        except ValueError as exc:
+            problem = (str(exc), "PYSPARK-SCHEMA-SHAPE")
+    if problem is None:
+        return []
+    return [
+        ValidationIssue(
+            file=path,
+            validator="pyspark-schema",
+            severity="error",
+            message=problem[0],
+            code=problem[1],
+        )
+    ]
+
+
 def validate_bindings_json(path: str, content: bytes) -> List[ValidationIssue]:
     """Structural key-check on ``policy/bindings.json``.
 
@@ -879,6 +915,8 @@ def _dispatch_by_prefix(path: str, content: bytes) -> Callable[[str, bytes], Lis
         return validate_bindings_json
     if path.startswith("spark/"):
         return validate_spark_job_json
+    if path.startswith("pyspark-schema/"):
+        return validate_pyspark_schema_module
     # Unknown — bind a no-op validator that flags it as a warning.
     return _flag_unexpected
 
@@ -1000,5 +1038,6 @@ __all__ = [
     "validate_odps_bitol",
     "validate_opa_conftest",
     "validate_opds",
+    "validate_pyspark_schema_module",
     "validate_spark_job_json",
 ]

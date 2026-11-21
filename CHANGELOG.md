@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid generate artifacts --emit pyspark-schema` puts the PySpark schema modules in the
+  MANIFEST.** It writes `pyspark-schema/<port>_schema.py`, the module `fluid generate
+  pyspark-schema` writes, byte for byte (same loader, renderer and writer), for each output port
+  with columns. It is requested by name, not in the default set: on by default it would fail stage
+  3 for every contract with a column Spark has no type for. A file at a module's path that the
+  emitter did not write is left alone and refused, and a run removes only the modules an earlier
+  run wrote. `fluid validate-artifacts` checks each module against the emitter's allowlist (one
+  `StructType`, nothing else), so a module changed after stage 3 fails stage 4 even with its
+  MANIFEST rewritten; `fluid ship --require-artifacts pyspark-schema` requires them.
 - **`fluid generate pyspark-schema` writes a PySpark `StructType` module for each output
   port.** For every output port that declares `contract.schema` columns it writes
   `<port>_schema.py` with a `SCHEMA` a Spark job imports (`spark.read.schema(SCHEMA)`). forge-cli

@@ -5,7 +5,7 @@
 
 Fanout wrapper that takes a stage-1 bundle (.tgz) and emits catalog-ready
 artifacts (ODCS, ODPS-Bitol, OPDS v4.1 LF/ODPI, schedule DAGs, policy
-bindings) into a single directory with a unified MANIFEST.json. ``opds`` is
+bindings, Spark job configs, PySpark schema modules) into a single directory with a unified MANIFEST.json. ``opds`` is
 the canonical LF/ODPI Open Data Product Specification key; the bare ``odps``
 emit key is a deprecated alias that resolves to ``opds``. Delegates all
 emission to existing per-format commands; orchestration lives in
@@ -36,7 +36,7 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
         "artifacts",
         help=(
             "Fanout bundle → catalog artifacts (ODCS, OPDS LF/ODPI, ODPS-Bitol, schedule, "
-            "policies, Spark job configs)"
+            "policies, Spark job configs, PySpark schemas)"
         ),
         description=(
             "Stage-3 of the 11-stage pipeline. Reads a Phase-2 bundle and emits "
@@ -56,6 +56,8 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
             "  # schedule DAGs that run `fluid apply --env aws` on the Airflow worker\n"
             "  fluid generate artifacts runtime/bundle.tgz --env aws \\\n"
             "      --contract-path contracts/orders/contract.fluid.yaml\n\n"
+            "  # PySpark StructType modules too (pyspark-schema/<port>_schema.py)\n"
+            "  fluid generate artifacts bundle.tgz --emit odcs,pyspark-schema\n\n"
             "Note: --emit dbt is NOT supported. dbt projects are execution artifacts;\n"
             "use `fluid generate speed-transformation` instead.\n"
         ),
@@ -79,9 +81,13 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
         default=None,
         help=(
             "Comma-separated emit selector. Valid: opds, odps-bitol, odcs, schedule, "
-            "policies, spark. ``spark`` writes spark/<build id>/job.json for each "
-            "forge Spark build. ``odps`` is accepted as a deprecated alias of ``opds`` "
-            "(the LF/ODPI Open Data Product Specification v4.1 target). Default: all six. "
+            "policies, spark, pyspark-schema. ``spark`` writes "
+            "spark/<build id>/job.json for each forge Spark build; ``pyspark-schema`` "
+            "writes pyspark-schema/<port>_schema.py, the module `fluid generate "
+            "pyspark-schema` writes, for each output port with columns. "
+            "``odps`` is accepted as a deprecated "
+            "alias of ``opds`` (the LF/ODPI Open Data Product Specification v4.1 target). "
+            "Default: every key but pyspark-schema. "
             "``dbt`` is NOT a valid emit key — dbt projects are execution artifacts "
             "(see `fluid generate speed-transformation`)."
         ),
@@ -200,11 +206,13 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 source_path=None if fanout_input == bundle_path else bundle_path,
             )
     except FanoutError as exc:
-        # Surface emit-key context so the operator knows which generator failed.
+        # Surface emit-key context so the operator knows which generator failed; an
+        # emitter's own code (a column Spark cannot hold, say) replaces the generic one.
         meta = {"error": str(exc)}
         if exc.key:
             meta["emit_key"] = exc.key
-        raise CLIError(1, "generate_artifacts_failed", meta)
+        meta.update(exc.context)
+        raise CLIError(1, exc.code or "generate_artifacts_failed", meta)
 
     if env:
         cprint(f"   env: {env}")

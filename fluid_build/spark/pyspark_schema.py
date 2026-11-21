@@ -710,6 +710,40 @@ def _verify(source: str, filename: str, names: FrozenSet[str]) -> None:
             raise ValueError("the generated module holds more than its schema")
 
 
+#: Every name a generated module may import from ``pyspark.sql.types``.
+TYPE_NAMES: FrozenSet[str] = frozenset(
+    {"StructType", "StructField", "ArrayType", "MapType", "StringType", "DecimalType"}
+    | {_class_of(expression) for expression in _SPARK_TYPES.values()}
+)
+
+
+def check_module(source: str, filename: str) -> None:
+    """Raise ``ValueError`` unless ``source`` is shaped like a module this emitter writes.
+
+    The check :func:`render_contract` applies before it returns a module, for a module read
+    back without its contract (``fluid validate-artifacts`` on stage 3's output): the fixed
+    first lines, a docstring, one import of names from :data:`TYPE_NAMES`, and ``SCHEMA =``
+    one expression of calls to those names. It says nothing about which columns the module
+    should hold; regenerate from the contract for that.
+    """
+    try:
+        body = ast.parse(source.encode("utf-8"), filename).body
+    except (SyntaxError, ValueError) as exc:
+        raise ValueError(f"the module does not parse: {exc}") from None
+    imported: FrozenSet[str] = frozenset()
+    if len(body) > 1 and isinstance(body[1], ast.ImportFrom):
+        imported = frozenset(alias.name for alias in body[1].names)
+    if not imported or not imported <= TYPE_NAMES:
+        raise ValueError("the generated module holds more than its schema")
+    _verify(source, filename, imported)
+
+
+def is_generated_module(path: Path) -> bool:
+    """Whether ``path`` is a regular file (not a link) that starts with :data:`HEADER`."""
+    head = _head(path, len(_HEADER_BYTES) + 2)
+    return head is not None and _first_lines(head)[0].rstrip(b"\r") == _HEADER_BYTES
+
+
 # ── Writing ──────────────────────────────────────────────────────────────────
 
 _HEADER_BYTES = HEADER.encode("utf-8")

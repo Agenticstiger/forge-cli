@@ -174,7 +174,10 @@ def _add_artifact_options(g: argparse._ArgumentGroup) -> None:
         "--emit",
         default=None,
         metavar="LIST",
-        help="Stage 3 --emit, comma-separated (default: $GENERATE_EMIT, all).",
+        help=(
+            "Stage 3 --emit, comma-separated (default: $GENERATE_EMIT, else generate "
+            "artifacts' default set: every key but pyspark-schema)."
+        ),
     )
     g.add_argument(
         "--require-artifacts",
@@ -183,7 +186,8 @@ def _add_artifact_options(g: argparse._ArgumentGroup) -> None:
         metavar="LIST",
         help=(
             "Stage 3 fails unless this run writes each (repeatable, comma-separated): odcs "
-            "(one per port), odps-bitol, opds, policies, schedule. Earlier runs' files never count."
+            "(one per port), odps-bitol, opds, policies, schedule, pyspark-schema. "
+            "Earlier runs' files never count."
         ),
     )
 

@@ -231,6 +231,46 @@ def test_a_port_without_its_odcs_fails_and_names_the_port(
     assert "port 'customers' has no ODCS" in junit
 
 
+_MODULE = "pyspark-schema/orders_schema.py"
+_PYSPARK = ["--until", "validate-artifacts", "--emit", "odcs,pyspark-schema"]
+
+
+def test_a_required_pyspark_schema_module_written_passes(
+    work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install(monkeypatch, FakeStages({**_ALL_OUTPUTS, _MODULE: b"# module"}))
+    assert _ship([*_PYSPARK, "--require-artifacts", "pyspark-schema"]) == 0
+    assert _stage3(work)["status"] == "passed"
+
+
+def test_a_required_pyspark_schema_without_a_module_fails(
+    work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install(monkeypatch, FakeStages(dict(_ALL_OUTPUTS)))
+    assert _ship([*_PYSPARK, "--require-artifacts", "pyspark-schema"]) == 1
+    reason = str(_stage3(work)["reason"])
+    assert "pyspark-schema: stage 3 wrote no PySpark schema module" in reason
+
+
+def test_pyspark_schema_is_not_in_the_default_emit_set_so_requiring_it_is_refused(
+    work: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake = _install(monkeypatch, FakeStages(dict(_ALL_OUTPUTS)))
+    assert _ship(["--until", "validate-artifacts", "--require-artifacts", "pyspark-schema"]) == 2
+    assert fake.calls == []
+    assert "pyspark-schema is not in stage 3's default --emit set (name it in --emit)" in (
+        caplog.text
+    )
+
+
+def test_blank_emit_means_the_default_set() -> None:
+    from fluid_build.forge.core.artifact_fanout import DEFAULT_EMIT, EMIT_KEYS
+
+    opts = st.ShipOptions(contract="c.fluid.yaml")
+    assert [k for k in EMIT_KEYS if st.emits(opts, k)] == list(DEFAULT_EMIT)
+    assert not st.emits(opts, "pyspark-schema")
+
+
 def test_a_missing_odps_product_fails(work: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     outputs = {k: v for k, v in _ALL_OUTPUTS.items() if not k.endswith(".odps.yaml")}
     _install(monkeypatch, FakeStages(outputs))
