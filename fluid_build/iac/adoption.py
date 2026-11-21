@@ -62,8 +62,8 @@ class TableReview:
         return not self.differences
 
     def as_event(self) -> Dict[str, Any]:
-        """The review for a structured log event or an error's context."""
-        return asdict(self)
+        """The review for a structured log event or an error's context (lists, as JSON)."""
+        return {key: list(v) if isinstance(v, tuple) else v for key, v in asdict(self).items()}
 
 
 def planned_imports(shown: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:

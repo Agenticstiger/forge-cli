@@ -59,7 +59,8 @@ def before_lookup(
     if not callable(named):
         cprint_literal(
             f"  adoption:    {ADOPT_TABLES_FLAG} changes nothing for {provider}: forge adopts "
-            "no tables on request there, and adopts what it finds as before"
+            "no tables on request there, and adopts what it finds as before",
+            soft_wrap=True,
         )
         return
     tables: Mapping[str, str] = named(contract)
@@ -156,9 +157,15 @@ def check_plan(
             },
         )
     for entry in reviews:
-        cprint_literal(f"  adoption:    {entry.table} matches the contract: the plan imports it")
+        # soft_wrap: a piped run (a CI log) keeps each line whole, as Rich would cut it at 80.
+        cprint_literal(
+            f"  adoption:    {entry.table} matches the contract: the plan imports it",
+            soft_wrap=True,
+        )
         if entry.updates:
-            cprint_literal("               and changes in place: " + "; ".join(entry.updates))
+            cprint_literal(
+                "               and changes in place: " + "; ".join(entry.updates), soft_wrap=True
+            )
     # Taking over a table is an ownership change: audited at WARNING, as the other
     # ownership and data-loss overrides are (``packaging_adoption_override``).
     warn(logger, "table_adoption_accepted", tables=[entry.as_event() for entry in reviews])
@@ -182,4 +189,7 @@ def say_bound(record: Mapping[str, Any]) -> None:
     """``fluid apply plan.json``: name the tables its saved plan adopts."""
     adopted = record.get("adoptedTables")
     if isinstance(adopted, list) and adopted:
-        cprint_literal("  adoption:    the saved plan adopts " + ", ".join(str(t) for t in adopted))
+        cprint_literal(
+            "  adoption:    the saved plan adopts " + ", ".join(str(t) for t in adopted),
+            soft_wrap=True,
+        )
