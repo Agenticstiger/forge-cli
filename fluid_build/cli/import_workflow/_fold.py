@@ -34,7 +34,7 @@ import posixpath
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from ._pysource import (
     Module,
@@ -240,13 +240,18 @@ def _too_long(text: str) -> Optional[Unresolved]:
 
 
 def format_template(
-    fmt: str, args: Sequence[Any], kwargs: Mapping[str, Any]
+    fmt: str,
+    args: Sequence[Any],
+    kwargs: Mapping[str, Any],
+    hole: Optional[Callable[[Union[int, str]], str]] = None,
 ) -> Union[str, Unresolved]:
     """``fmt.format(*args, **kwargs)`` for plain ``{}``, ``{0}`` and ``{name}`` fields only.
 
     A field with a conversion, a spec, an attribute or an index (``{x!r}``, ``{x:>9}``,
     ``{x.y}``), a field whose value is unresolved, and an unbalanced brace are all
-    unresolved. A field whose value is unresolved shows as itself in the text.
+    unresolved. A field whose value is unresolved shows as itself in the text, or, when the
+    caller gives ``hole``, as the token ``hole(key)`` returns for it (``key`` is the field's
+    position or name; the caller reads text that must stay parseable, such as SQL).
     """
     out: List[str] = []
     auto = 0
@@ -273,10 +278,13 @@ def format_template(
             else:
                 value = kwargs.get(key, Unresolved(f"`{key}` is not given"))
             if isinstance(value, Unresolved) or not is_scalar(value):
-                unresolved = unresolved or (
-                    value.why if isinstance(value, Unresolved) else "a value that is not text"
-                )
-                out.append(match.group(0))
+                if hole is not None:
+                    out.append(hole(key))
+                else:
+                    unresolved = unresolved or (
+                        value.why if isinstance(value, Unresolved) else "a value that is not text"
+                    )
+                    out.append(match.group(0))
             else:
                 out.append(str(value))
             i = match.end()
@@ -295,8 +303,12 @@ def format_template(
     return _too_long(text) or text
 
 
-def percent_template(fmt: str, operand: Any) -> Union[str, Unresolved]:
-    """``fmt % operand`` for ``%s``, ``%d``, ``%r``, ``%%`` and ``%(key)s`` only."""
+def percent_template(
+    fmt: str, operand: Any, hole: Optional[Callable[[Union[int, str]], str]] = None
+) -> Union[str, Unresolved]:
+    """``fmt % operand`` for ``%s``, ``%d``, ``%r``, ``%%`` and ``%(key)s`` only. A ``%s``
+    whose value is unresolved becomes the token ``hole(key)`` returns, when given (``key`` is
+    the operand's position or name)."""
     keyed = isinstance(operand, dict)
     positional: List[Any] = (
         list(operand) if isinstance(operand, (tuple, FoldedTuple)) else [operand]
@@ -319,14 +331,19 @@ def percent_template(fmt: str, operand: Any) -> Union[str, Unresolved]:
         if match.group("key") is not None:
             if not keyed:
                 return Unresolved("a keyed percent format without a dict", fmt)
-            value = operand.get(match.group("key"), Unresolved("a missing key"))
+            operand_key: Union[int, str] = match.group("key")
+            value = operand.get(operand_key, Unresolved("a missing key"))
         else:
             if keyed or pos >= len(positional):
                 return Unresolved("the percent format and its operands do not match", fmt)
+            operand_key = pos
             value = positional[pos]
             pos += 1
         used += 1
         if isinstance(value, Unresolved) or not is_scalar(value):
+            if hole is not None and match.group("conv") == "s":
+                out.append(hole(operand_key))
+                continue
             return Unresolved(value.why if isinstance(value, Unresolved) else "not text", fmt)
         if match.group("conv") == "d":
             if not isinstance(value, int) or isinstance(value, bool):
@@ -462,6 +479,9 @@ class Folder:
         )
         self._scopes: Dict[ast.AST, Scope] = {}
         self._active: Set[int] = set()
+        #: While folding text that must stay parseable (SQL), an unresolved field is replaced
+        #: by a token and recorded here: ``{token: what it stood for}``.
+        self._holes: Optional[Dict[str, str]] = None
         self._module_scope = self._scope(module.tree, None)
 
     # scopes
@@ -507,6 +527,44 @@ class Folder:
             return method(node, scope, _depth + 1)
         finally:
             self._active.discard(key)
+
+    def fold_sql(
+        self, node: ast.AST, scope: Optional[Scope] = None
+    ) -> Tuple[Union[str, Unresolved], Dict[str, str]]:
+        """:meth:`fold` for text that must stay parseable, SQL: a field of an f-string, a
+        ``.format``, a ``%`` or a ``+`` that does not fold becomes a token (``__fluidhole0__``)
+        instead of making the whole text unresolved. Returns the text and ``{token: what it
+        stood for}``; text with no hole is exactly what :meth:`fold` gives."""
+        holes: Dict[str, str] = {}
+        previous, self._holes = self._holes, holes
+        try:
+            value = self.fold(node, scope)
+        finally:
+            self._holes = previous
+        if isinstance(value, str) or isinstance(value, Unresolved):
+            return value, holes
+        return Unresolved("it is not a string", snippet(node)), holes
+
+    def _hole_for(
+        self, positional: Sequence[ast.expr], keyword: Mapping[str, ast.expr]
+    ) -> Optional[Callable[[Union[int, str]], str]]:
+        """The ``hole`` callback of :func:`format_template` and :func:`percent_template` while
+        folding SQL: it names the hole by the expression the operand was written as."""
+        if self._holes is None:
+            return None
+
+        def hole(key: Union[int, str]) -> str:
+            node = positional[key] if isinstance(key, int) and key < len(positional) else None
+            node = node if node is not None else keyword.get(str(key))
+            return self._hole(snippet(node, 40) if node is not None else str(key))
+
+        return hole
+
+    def _hole(self, described: str) -> str:
+        assert self._holes is not None
+        token = f"__fluidhole{len(self._holes)}__"
+        self._holes[token] = described
+        return token
 
     def string(self, node: ast.AST, scope: Optional[Scope] = None) -> Union[str, Unresolved]:
         """:meth:`fold` that must be a string."""
@@ -589,6 +647,8 @@ class Folder:
             value = self.fold(part.value, scope, depth) if simple else None
             if simple and not isinstance(value, Unresolved) and is_scalar(value):
                 parts.append(str(value))
+            elif simple and self._holes is not None:
+                parts.append(self._hole(snippet(part.value, 40)))
             else:
                 if not simple:
                     why = "an f-string field with a format spec or conversion"
@@ -607,6 +667,11 @@ class Folder:
         if isinstance(node.op, ast.Add):
             left = self.fold(node.left, scope, depth)
             right = self.fold(node.right, scope, depth)
+            if self._holes is not None and (isinstance(left, str) or isinstance(right, str)):
+                if isinstance(left, Unresolved):
+                    left = self._hole(left.text or snippet(node.left, 40))
+                if isinstance(right, Unresolved):
+                    right = self._hole(right.text or snippet(node.right, 40))
             if isinstance(left, str) and isinstance(right, str):
                 return _too_long(left + right) or left + right
             if isinstance(left, list) and isinstance(right, list):
@@ -624,7 +689,23 @@ class Folder:
                     left.why if isinstance(left, Unresolved) else "not a format string",
                     snippet(node),
                 )
-            return percent_template(left, self.fold(node.right, scope, depth))
+            right = node.right
+            if isinstance(right, ast.Tuple):
+                positional: List[ast.expr] = list(right.elts)
+            else:
+                positional = [right]
+            keyed = {
+                key.value: value
+                for key, value in zip(
+                    right.keys if isinstance(right, ast.Dict) else [],
+                    right.values if isinstance(right, ast.Dict) else [],
+                    strict=True,
+                )
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
+            return percent_template(
+                left, self.fold(right, scope, depth), self._hole_for(positional, keyed)
+            )
         return Unresolved("an arithmetic expression", snippet(node))
 
     def _fold_IfExp(self, node: ast.IfExp, scope: Scope, depth: int) -> Any:
@@ -790,7 +871,10 @@ class Folder:
                 if keyword.arg is None:
                     return Unresolved("a format call with **arguments", snippet(node))
                 kwargs[keyword.arg] = self.fold(keyword.value, scope, depth)
-            return format_template(receiver, args, kwargs)
+            keyed_nodes = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+            return format_template(
+                receiver, args, kwargs, self._hole_for(list(node.args), keyed_nodes)
+            )
         if node.keywords:
             return Unresolved(f"a call to str.{method} with keywords", snippet(node))
         if method == "join" and len(args) == 1 and isinstance(args[0], (list, tuple)):
