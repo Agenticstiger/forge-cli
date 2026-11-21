@@ -212,6 +212,22 @@ def _binding_enums() -> Tuple[frozenset, frozenset]:
     return frozenset(binding["platform"]["enum"]), frozenset(binding["format"]["enum"])
 
 
+def _runtime_platforms() -> frozenset:
+    """The platforms ``execution.runtime.platform`` accepts in the newest bundled schema."""
+    import importlib.resources
+    import json
+
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    version = FluidSchemaManager.latest_bundled_version()
+    text = (
+        importlib.resources.files("fluid_build.schemas")
+        .joinpath(f"fluid-schema-{version}.json")
+        .read_text(encoding="utf-8")
+    )
+    return frozenset(json.loads(text)["$defs"]["runtime"]["properties"]["platform"]["enum"])
+
+
 def _enum(value: Any, allowed: frozenset, path: Optional[Path], where: str) -> str:
     text = _text(value, path, where)
     if text not in allowed:
@@ -404,7 +420,7 @@ def parse_conventions(document: Any, source: Optional[Path] = None) -> Conventio
         top.get("defaults", {}), source, "defaults", frozenset({"database", "domain", "platform"})
     )
     default_platform = (
-        _enum(defaults["platform"], enums()[0], source, "defaults.platform")
+        _enum(defaults["platform"], _runtime_platforms(), source, "defaults.platform")
         if "platform" in defaults
         else None
     )

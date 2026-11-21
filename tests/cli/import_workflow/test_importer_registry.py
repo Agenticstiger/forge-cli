@@ -333,6 +333,25 @@ def test_the_handler_refuses_contracts_of_the_wrong_shape(eps, tmp_path, bad):
     assert not (tmp_path / "out.fluid.yaml").exists()
 
 
+def test_a_plugin_that_guards_overwrite_never_replaces_a_different_file(eps, tmp_path):
+    class Guarded(_Plugin):
+        guards_overwrite = True
+
+    eps(_EP("guarded", Guarded), _EP("plain", _Plugin))
+    target = tmp_path / "out.fluid.yaml"
+    target.write_text("id: edited by hand\n", encoding="utf-8")
+    with pytest.raises(FluidUserError) as refused:
+        _run(tmp_path, "guarded", split_by=None)
+    assert "refusing to overwrite 1 existing file(s)" in refused.value.what
+    assert target.read_text(encoding="utf-8") == "id: edited by hand\n"
+    assert _run(tmp_path, "guarded", split_by=None, force=True) == 0
+    assert yaml.safe_load(target.read_text(encoding="utf-8"))["id"] == "from-plugin"
+    # an importer that does not guard overwrites, as importers always have
+    target.write_text("id: edited by hand\n", encoding="utf-8")
+    assert _run(tmp_path, "plain", split_by=None) == 0
+    assert yaml.safe_load(target.read_text(encoding="utf-8"))["id"] == "from-plugin"
+
+
 def test_the_handler_names_every_importer_when_the_tool_is_unknown(eps, tmp_path):
     eps(_EP("my-tool", _Plugin))
     with pytest.raises(FluidUserError) as refused:

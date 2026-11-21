@@ -35,6 +35,8 @@ REGISTRY_FLAGS = {
     "registry_version": "--version",
 }
 
+#: The importers that read a registry for the columns of the topics they find.
+TOPIC_TOOLS = ("airflow", "pyspark")
 _KINDS = ("confluent", "glue")
 # The subject's schema types that become a consumed stream format.
 _CONSUMABLE = ("AVRO", "JSON")
@@ -56,6 +58,9 @@ def check_flags(args: Any, tool: Optional[str]) -> None:
         for dest in REGISTRY_FLAGS
         if getattr(args, dest, None) is not None
     }
+    if tool in TOPIC_TOOLS:
+        _check_topic_tool(given, tool)
+        return
     if tool != TOOL:
         if given:
             flags = ", ".join(REGISTRY_FLAGS[d] for d in given)
@@ -81,13 +86,20 @@ def check_flags(args: Any, tool: Optional[str]) -> None:
             "A subject is read from one registry kind.",
             "Pass --registry confluent (with --url) or --registry glue.",
         )
+    _check_pairing(
+        kind, given, f"`fluid import {TOOL} <subject> --registry confluent --url https://<host>`"
+    )
+
+
+def _check_pairing(kind: str, given: Dict[str, Any], example: str) -> None:
+    """``--url`` belongs to a Confluent registry and ``--registry-name`` to a Glue one."""
     wrong: Dict[str, str] = {}
     if kind == "confluent":
         if not given.get("url"):
             raise _refusal(
                 "--registry confluent requires --url",
                 "A Confluent registry is named by its https REST endpoint.",
-                f"`fluid import {TOOL} <subject> --registry confluent --url https://<host>`.",
+                f"{example}.",
             )
         wrong = {"registry_name": "--registry confluent"} if "registry_name" in given else {}
     elif kind == "glue":
@@ -100,6 +112,32 @@ def check_flags(args: Any, tool: Optional[str]) -> None:
             f"Remove {REGISTRY_FLAGS[dest]}.",
             flag=REGISTRY_FLAGS[dest],
         )
+
+
+def _check_topic_tool(given: Dict[str, Any], tool: str) -> None:
+    """The registry flags of ``fluid import airflow|pyspark``: optional, and they give the columns
+    of the Kafka topics the jobs write (the subject is ``<topic>-value``, then ``<topic>``)."""
+    if "registry_version" in given:
+        raise _refusal(
+            "--version does not apply to `fluid import " + tool + "`",
+            "--version pins one subject's version; this import reads one subject per topic.",
+            "Remove --version.",
+            flag="--version",
+        )
+    kind = given.get("registry")
+    if kind is None:
+        if given:
+            flags = ", ".join(REGISTRY_FLAGS[d] for d in given)
+            raise _refusal(
+                f"{flags} requires --registry",
+                "A registry endpoint or name is only used with the kind of registry it belongs to.",
+                f"Pass --registry confluent (with --url) or --registry glue, or remove {flags}.",
+                flags=sorted(given),
+            )
+        return
+    _check_pairing(
+        kind, given, f"`fluid import {tool} <dir> --registry confluent --url https://<host>`"
+    )
 
 
 class _ProtobufSubject(Exception):

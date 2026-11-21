@@ -224,11 +224,13 @@ class _Reader:
         folder: Folder,
         helpers: Mapping[str, HelperSpec],
         session_names: Iterable[str],
+        shown: Optional[str] = None,
     ) -> None:
         self.module = module
         self.folder = folder
         self.helpers = helpers
         self.sessions: Set[str] = set(session_names)
+        self.file = shown or module.rel
         self.facts = JobFacts(rel=module.rel)
         self.temp_views: Set[str] = set()
         self.default_checkpoint: Optional[str] = None
@@ -435,7 +437,7 @@ class _Reader:
         missing: str = "no name is given",
     ) -> Ref:
         line = getattr(node, "lineno", 0)
-        rel = self.module.rel
+        rel = self.file
         if value is None:
             return Ref(kind, (), "", missing, rel, line, fmt)
         if isinstance(value, Unresolved):
@@ -523,14 +525,14 @@ class _Reader:
                 self.parameter_named += 1
             else:
                 self.facts.notes.append(
-                    f"{self.module.rel}:{call.lineno} spark.sql(...) takes SQL that is not a "
+                    f"{self.file}:{call.lineno} spark.sql(...) takes SQL that is not a "
                     f"constant ({value.why})"
                 )
             return
         sql = _spark_sql.analyze(value, holes)
         self.temp_views.update(sql.temp_views)
         for note in sql.notes:
-            self.facts.notes.append(f"{self.module.rel}:{call.lineno} {note}")
+            self.facts.notes.append(f"{self.file}:{call.lineno} {note}")
         for name in sql.reads:
             ref = self._from_sql_name(name, call)
             self._add_read(ref, streaming=False)
@@ -539,7 +541,7 @@ class _Reader:
             self._add_write(ref, mode=write.mode)
 
     def _from_sql_name(self, name: _spark_sql.SqlName, call: ast.Call) -> Ref:
-        rel, line = self.module.rel, call.lineno
+        rel, line = self.file, call.lineno
         if name.why:
             return Ref(name.kind, (), name.shown, name.why, rel, line, name.fmt)
         return Ref(name.kind, name.parts, name.shown, "", rel, line, name.fmt)
@@ -586,7 +588,7 @@ class _Reader:
                 )
         elif name == "jdbc":
             self.facts.notes.append(
-                f"{self.module.rel}:{call.lineno} reads a JDBC table: declare the source by hand"
+                f"{self.file}:{call.lineno} reads a JDBC table: declare the source by hand"
             )
 
     def _on_load(
@@ -601,7 +603,7 @@ class _Reader:
             return
         if fmt == "jdbc":
             self.facts.notes.append(
-                f"{self.module.rel}:{call.lineno} reads a JDBC table: declare the source by hand"
+                f"{self.file}:{call.lineno} reads a JDBC table: declare the source by hand"
             )
             return
         node = self._arg(call, 0, "path")
@@ -756,7 +758,7 @@ class _Reader:
             return
         if fmt == "jdbc" or name == "jdbc":
             self.facts.notes.append(
-                f"{self.module.rel}:{call.lineno} writes a JDBC table: declare the target by hand"
+                f"{self.file}:{call.lineno} writes a JDBC table: declare the target by hand"
             )
             return
         if name in {"saveAsTable", "toTable"}:
@@ -866,7 +868,7 @@ class _Reader:
                     break
         self.facts.streams.append(
             Stream(
-                file=self.module.rel,
+                file=self.file,
                 line=call.lineno,
                 via_foreach_batch=True,
                 checkpoint=extra["checkpoint"],
@@ -902,7 +904,7 @@ class _Reader:
             ]
         if self.parameter_named:
             facts.notes.append(
-                f"{self.module.rel}: {self.parameter_named} read(s) or write(s) take a table, path "
+                f"{self.file}: {self.parameter_named} read(s) or write(s) take a table, path "
                 "or SQL from a function parameter: this looks like a helper. Name it under "
                 "`helpers` in the conventions file, and its call sites are read instead"
             )
@@ -962,9 +964,11 @@ def read_job(
     *,
     helpers: Optional[Mapping[str, HelperSpec]] = None,
     session_names: Iterable[str] = DEFAULT_SESSION_NAMES,
+    shown: Optional[str] = None,
 ) -> JobFacts:
-    """What ``module`` reads, writes and streams. See the module docstring."""
-    return _Reader(module, folder, helpers or {}, session_names).run()
+    """What ``module`` reads, writes and streams. See the module docstring. ``shown`` is the
+    path reports name the file by (default: the module's own relative path)."""
+    return _Reader(module, folder, helpers or {}, session_names, shown).run()
 
 
 __all__ = [

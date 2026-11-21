@@ -103,6 +103,8 @@ class Submit:
     shown: str
     args: Tuple[str, ...]
     line: int
+    #: The command line, for a ``BashOperator`` (what ``bash_command`` says, as text).
+    command: Optional[str] = None
 
     @property
     def templated(self) -> bool:
@@ -525,15 +527,21 @@ class _Reader:
             return []
 
     def _submit(
-        self, runtime: str, script: Any, args: Any, call: ast.Call, shown: str = ""
+        self,
+        runtime: str,
+        script: Any,
+        args: Any,
+        call: ast.Call,
+        shown: str = "",
+        command: Optional[str] = None,
     ) -> Submit:
         if isinstance(script, str) and script.strip():
             return Submit(
-                runtime, script.strip(), "", script.strip(), _arg_texts(args), call.lineno
+                runtime, script.strip(), "", script.strip(), _arg_texts(args), call.lineno, command
             )
         why = script.why if isinstance(script, Unresolved) else "no script is named"
         text = script.text if isinstance(script, Unresolved) else shown
-        return Submit(runtime, None, why, text, _arg_texts(args), call.lineno)
+        return Submit(runtime, None, why, text, _arg_texts(args), call.lineno, command)
 
     def _spark_submit(self, call: ast.Call) -> List[Submit]:
         script = self._text(self._kw(call, "application"))
@@ -578,7 +586,7 @@ class _Reader:
         if found is None:
             return []
         script, args = found
-        return [self._submit("bash", script, args, call, "bash_command")]
+        return [self._submit("bash", script, args, call, "bash_command", command=command)]
 
     def _steps_of(self, steps: Any, call: ast.Call, runtime: str) -> List[Submit]:
         if isinstance(steps, str):

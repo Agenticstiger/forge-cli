@@ -22,8 +22,10 @@ returning ``(contract, report)``, or ``import_to_contracts(source, *, options)``
 ``([contract, ...], report)`` for a tool that splits a source into several products; and may
 have ``can_import(source)``. The report is any object with the four lists
 :class:`ImportReport` has (``mapped_one_to_one``, ``required_defaults``, ``unsupported``,
-``notes``), or ``None``. ``options`` holds ``split_by``, ``conventions`` and ``dags`` when
-the user gave them (strings, never opened for the plugin).
+``notes``), or ``None``. ``options`` holds ``split_by`` (``project`` unless the user chose a
+boundary) and ``conventions`` and ``dags`` when the user gave them: strings, never opened for the
+plugin. A plugin whose output a person is meant to complete sets ``guards_overwrite = True``: the
+command then refuses to replace a file that differs from what the plugin writes, unless ``--force``.
 
 Policy, the operator's (the unified plugin manager's, see :mod:`fluid_build.plugin_manager`):
 
@@ -103,6 +105,8 @@ BUILTIN_IMPORTERS: Dict[str, Tuple[str, str]] = {
     "singer": ("singer", "SingerImporter"),
     "dbt": ("dbt", "DbtManifestImporter"),
     "schema-registry": ("schema_registry", "SchemaRegistryImporter"),
+    "airflow": ("airflow", "AirflowImporter"),
+    "pyspark": ("pyspark", "PySparkImporter"),
 }
 
 _LOCK = threading.RLock()

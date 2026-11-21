@@ -11,6 +11,8 @@ Built-in sources (the names are :data:`registry.BUILTIN_IMPORTERS`):
   - ``singer <tap-cfg>``         - converts a single Singer tap+target pair
   - ``dbt <project-dir>``        - converts ``target/manifest.json``
   - ``schema-registry <subject>`` - a Confluent or Glue subject -> a consumer contract
+  - ``airflow <dags-dir>``       - Airflow DAG files -> products, read without importing Airflow
+  - ``pyspark <jobs-dir>``       - PySpark jobs -> one product per output table or topic
 
 Packages add sources through the ``fluid_build.importers`` entry-point group (see
 :mod:`fluid_build.cli.import_workflow.registry`).
@@ -43,6 +45,7 @@ from .registry import (
 
 __all__ = [
     "AirbyteImporter",
+    "AirflowImporter",
     "BUILTIN_IMPORTERS",
     "DbtManifestImporter",
     "DltImporter",
@@ -51,6 +54,7 @@ __all__ = [
     "ImporterChoices",
     "ImportReport",
     "MeltanoImporter",
+    "PySparkImporter",
     "SchemaRegistryImporter",
     "SingerImporter",
     "coerce_report",
@@ -63,6 +67,8 @@ __all__ = [
 # does not import them.
 _CLASSES = {
     "AirbyteImporter": "airbyte",
+    "AirflowImporter": "airflow",
+    "PySparkImporter": "pyspark",
     "DbtManifestImporter": "dbt",
     "DltImporter": "dlt",
     "MeltanoImporter": "meltano",
