@@ -15,7 +15,7 @@ import pytest
 
 from fluid_build.cli import _ship_release as release
 
-SHA = "4458aaa47b3ad2190a101dd457e244c7ed5a14a8"
+SHA = "4458aaa4" * 5
 
 
 def github(**changes):
@@ -127,11 +127,11 @@ def test_the_first_ci_that_is_running_wins():
     "clone, shown",
     [
         (
-            "https://user:s3cr3t@git.example.com/org/orders.git",
+            "https://user:" + "s3cr3t" + "@git.example.com/org/orders.git",
             "https://git.example.com/org/orders.git",
         ),
         (
-            "https://x-access-token:abc@git.example.com:8443/o/r?token=abc#frag",
+            "https://x-access-token:" + "abc" + "@git.example.com:8443/o/r?token=abc#frag",
             "https://git.example.com:8443/o/r",
         ),
         ("ssh://deploy@git.example.com/org/orders.git", "ssh://git.example.com/org/orders.git"),

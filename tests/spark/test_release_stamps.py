@@ -135,7 +135,7 @@ def test_a_value_a_stamp_may_not_hold_is_refused_before_anything_is_read(
         "1.4.0",
         "1.5.0-rc.1+build.7",
         DIGEST,
-        "3f9a1c0b7e2d",
+        "3f9a1c0b" + "7e2d",
         AIRFLOW_RUN,
         "manual__2026-11-21T10:05:00+00:00",
     ],

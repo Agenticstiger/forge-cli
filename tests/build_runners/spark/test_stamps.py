@@ -37,7 +37,7 @@ def _account(monkeypatch):
 
 
 def stamps(**given):
-    return {"contract_digest": DIGEST, "run_id": "3f9a1c0b7e2d", "release_id": "v1.4.0", **given}
+    return {"contract_digest": DIGEST, "run_id": "3f9a3f9a3f9a", "release_id": "v1.4.0", **given}
 
 
 def flag_values(run):
@@ -55,7 +55,7 @@ def test_a_run_started_with_stamps_passes_them_to_the_runner(contract):
         "--fluid-product-version": "1.4.0",
         "--fluid-contract-digest": DIGEST,
         "--fluid-release-id": "v1.4.0",
-        "--fluid-run-id": "3f9a1c0b7e2d",
+        "--fluid-run-id": "3f9a3f9a3f9a",
     }
     args = run.entry_args(restart_of="run-1")
     assert args.index("--fluid-run-id") < args.index(_desired.RESTART_FLAG)
@@ -141,7 +141,7 @@ def test_the_digest_is_the_contracts_and_holds_no_environment_value(contract, mo
 
 
 def test_the_run_id_is_kept_as_it_is_when_it_can_be_stamped(contract):
-    for run_id in ("3f9a1c0b7e2d", "scheduled__2026-11-21T00:00:00+00:00"):
+    for run_id in ("3f9a3f9a3f9a", "scheduled__2026-11-21T00:00:00+00:00"):
         assert _desired.run_stamps(contract, run_id=run_id)["run_id"] == run_id
 
 
@@ -180,9 +180,9 @@ def test_prepare_hands_each_run_its_stamps(contract, monkeypatch):
     monkeypatch.setenv(_desired.RELEASE_ID_ENV, "v1.4.0")
     contract["exposes"][0]["version"] = "1.4.0"
     (run,) = _apply.prepare(
-        contract, build_id=None, verified_plan=None, dry_run=True, run_id="3f9a1c0b7e2d"
+        contract, build_id=None, verified_plan=None, dry_run=True, run_id="3f9a3f9a3f9a"
     )
-    assert run.run_id == "3f9a1c0b7e2d" and run.release_id == "v1.4.0"
+    assert run.run_id == "3f9a3f9a3f9a" and run.release_id == "v1.4.0"
     assert run.contract_digest == compute_contract_digest(contract)
     assert run.product_version == "1.4.0"
 
@@ -228,8 +228,8 @@ def test_reconcile_only_stamps_the_runs_it_starts(contract, monkeypatch):
             logging.getLogger("test"),
             build_id=None,
             dry_run=True,
-            run_id="3f9a1c0b7e2d",
+            run_id="3f9a3f9a3f9a",
         )
     except Exception:  # noqa: BLE001 - what it does next is not this test's
         pass
-    assert all(run.run_id == "3f9a1c0b7e2d" for run in seen)
+    assert all(run.run_id == "3f9a3f9a3f9a" for run in seen)

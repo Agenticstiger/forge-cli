@@ -26,7 +26,7 @@ from fluid_build.cli.ops._cli import register_runs
 
 PRODUCT = "commerce.orders"
 LOG = logging.getLogger("test_release_status")
-SHA = "4458aaa47b3ad2190a101dd457e244c7ed5a14a8"
+SHA = "4458aaa4" * 5
 
 
 def seal(

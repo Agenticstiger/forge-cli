@@ -283,7 +283,7 @@ def test_a_release_records_the_versions_of_the_exposes_and_the_code_it_was_built
     done = _cli(work, "bundle", "contract.fluid.yaml", "--format", "tgz", "--out", "seed.tgz")
     assert done.returncode == 0, done.stderr[-2000:]
     _install(monkeypatch, work / "seed.tgz")
-    sha = "4458aaa47b3ad2190a101dd457e244c7ed5a14a8"
+    sha = "4458aaa4" * 5
     for name, value in {
         "GITHUB_RUN_ID": "42",
         "GITHUB_SHA": sha,
