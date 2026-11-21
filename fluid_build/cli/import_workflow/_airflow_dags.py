@@ -45,7 +45,7 @@ import ast
 import re
 import shlex
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from ._fold import ABSENT, Folder, Unresolved, lookup
 from ._pysource import Module, ancestors, qualified_name, snippet
@@ -87,6 +87,12 @@ _LOOPS = (
     ast.GeneratorExp,
 )
 _MAX_STEPS = 200
+#: Dependencies kept per DAG: a ``[300 tasks] >> [300 tasks]`` is 90,000 of them.
+_MAX_EDGES = 10_000
+#: Dependency operands reported as not read, per file.
+_MAX_OPERAND_NOTES = 10
+#: Characters of a command line read.
+_MAX_COMMAND = 50_000
 
 
 @dataclass(frozen=True)
@@ -179,6 +185,14 @@ class _Reader:
         self.defs: List[_DagDef] = []
         self.tasks_by_node: Dict[int, Tuple[Task, _DagDef]] = {}
         self.tasks_by_var: Dict[str, Task] = {}
+        #: ``@task`` function name to its task: ``extract()`` written inline is that task.
+        self.taskflow_by_name: Dict[str, Task] = {}
+        #: Per DAG: its task keys and the edges already recorded, so a link costs a set lookup.
+        self._edge_state: List[Tuple[_DagDef, Set[str], Set[Tuple[str, str]]]] = []
+        self._capped: Set[int] = set()
+        self._unread_seen: Set[Tuple[int, str]] = set()
+        self._calls_at_module_level: Optional[Set[str]] = None
+        self._call_targets: Optional[Dict[str, List[str]]] = None
 
     # ── entry ───────────────────────────────────────────────────────
 
@@ -209,6 +223,11 @@ class _Reader:
         self._edges()
         for dag_def in self.defs:
             self.result.dags.append(dag_def.dag)
+        if self.folder.exhausted:
+            self.result.notes.append(
+                f"{self.module.rel}: folding stopped early (the file asks for too much work): "
+                "some values are reported as not constant"
+            )
         return self.result
 
     def _no_dag_notes(self, nodes: Sequence[ast.AST]) -> None:
@@ -306,15 +325,14 @@ class _Reader:
         self.defs.append(_DagDef(node=function, dag=dag))
 
     def _called_at_module_level(self, name: str) -> bool:
-        for statement in self.module.tree.body:
-            for node in ast.walk(statement):
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Name)
-                    and node.func.id == name
-                ):
-                    return True
-        return False
+        if self._calls_at_module_level is None:
+            called: Set[str] = set()
+            for statement in self.module.tree.body:
+                for node in ast.walk(statement):
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                        called.add(node.func.id)
+            self._calls_at_module_level = called
+        return name in self._calls_at_module_level
 
     def _bound_name(self, call: ast.Call) -> Optional[str]:
         parent = self.module.parents.get(call)
@@ -497,16 +515,21 @@ class _Reader:
         )
         dag_def.dag.tasks.append(task)
         self.tasks_by_node[id(function)] = (task, dag_def)
-        for node in ast.walk(self.module.tree):  # ``extracted = extract()`` binds the task
-            if (
-                isinstance(node, ast.Assign)
-                and isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Name)
-                and node.value.func.id == function.name
-                and node.targets
-                and isinstance(node.targets[0], ast.Name)
-            ):
-                self.tasks_by_var[node.targets[0].id] = task
+        self.taskflow_by_name[function.name] = task
+        if self._call_targets is None:  # ``extracted = extract()`` binds the task
+            targets: Dict[str, List[str]] = {}
+            for node in ast.walk(self.module.tree):
+                if (
+                    isinstance(node, ast.Assign)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.targets
+                    and isinstance(node.targets[0], ast.Name)
+                ):
+                    targets.setdefault(node.value.func.id, []).append(node.targets[0].id)
+            self._call_targets = targets
+        for target in self._call_targets.get(function.name, ()):
+            self.tasks_by_var[target] = task
 
     # ── what a task submits ─────────────────────────────────────────
 
@@ -577,16 +600,26 @@ class _Reader:
         ]
 
     def _bash(self, call: ast.Call) -> List[Submit]:
-        command = self._text(self._kw(call, "bash_command"))
-        if isinstance(command, Unresolved) and "spark-submit" in command.text:
-            command = command.text  # a literal script survives a field that did not fold
-        if not isinstance(command, str):
+        node = self._kw(call, "bash_command")
+        if node is None:
             return []
-        found = _spark_submit_in_text(command)
-        if found is None:
+        # A field that does not fold is a hole, not the end of the command: a script written
+        # out in full beside it is still read.
+        value, holes = self.folder.fold_sql(node)
+        if isinstance(value, Unresolved):
+            if "spark-submit" in value.text:
+                return [
+                    self._submit(
+                        "bash", Unresolved(value.why, value.text), None, call, "bash_command"
+                    )
+                ]
             return []
-        script, args = found
-        return [self._submit("bash", script, args, call, "bash_command", command=command)]
+        found = _spark_submits_in_text(value, holes)
+        command = _restore(value, holes)
+        return [
+            self._submit("bash", script, args, call, "bash_command", command=command)
+            for script, args in found
+        ]
 
     def _steps_of(self, steps: Any, call: ast.Call, runtime: str) -> List[Submit]:
         if isinstance(steps, str):
@@ -661,13 +694,9 @@ class _Reader:
             if entry:
                 return [entry[0]]
             if isinstance(node.func, ast.Name):  # a @task function called inline
-                for definition in ast.walk(self.module.tree):
-                    if (
-                        isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef))
-                        and definition.name == node.func.id
-                        and id(definition) in self.tasks_by_node
-                    ):
-                        return [self.tasks_by_node[id(definition)][0]]
+                task = self.taskflow_by_name.get(node.func.id)
+                if task is not None:
+                    return [task]
             return None
         if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.RShift, ast.LShift)):
             return self._operand_tasks(node.right)  # ``a >> b`` evaluates to ``b``
@@ -682,16 +711,57 @@ class _Reader:
         return None
 
     def _link(self, upstream: Sequence[Task], downstream: Sequence[Task]) -> None:
-        for up in upstream:
-            for down in downstream:
-                for dag_def in self.defs:
-                    keys = {t.key for t in dag_def.dag.tasks}
-                    if up.key in keys and down.key in keys:
-                        edge = (up.key, down.key)
-                        if edge not in dag_def.dag.edges and up.key != down.key:
-                            dag_def.dag.edges.append(edge)
+        for dag_def, keys, seen in self._edge_state:
+            ups = [t.key for t in upstream if t.key in keys]
+            downs = [t.key for t in downstream if t.key in keys]
+            for up in ups:
+                for down in downs:
+                    edge = (up, down)
+                    if up == down or edge in seen:
+                        continue
+                    if len(dag_def.dag.edges) >= _MAX_EDGES:
+                        if id(dag_def) not in self._capped:
+                            self._capped.add(id(dag_def))
+                            dag_def.dag.notes.append(
+                                f"more than {_MAX_EDGES} dependencies: the rest are not read"
+                            )
+                        return
+                    seen.add(edge)
+                    dag_def.dag.edges.append(edge)
+
+    def _unread(self, node: ast.AST) -> None:
+        """Say once that a dependency operand is not a task this reader found (a task group, a
+        name it cannot follow). Bounded: a long chain of them is one note and a count."""
+        if not isinstance(
+            node, (ast.Name, ast.Attribute, ast.Call, ast.Subscript, ast.List, ast.Tuple)
+        ):
+            return
+        text = snippet(node, 40)
+        key = (getattr(node, "lineno", 0), text)
+        if key in self._unread_seen:
+            return
+        self._unread_seen.add(key)
+        count = len(self._unread_seen)
+        if count <= _MAX_OPERAND_NOTES:
+            self.result.notes.append(
+                f"{self.module.rel}:{key[0]} a dependency on `{text}` is not read: it is not a "
+                "task this reader found (a task group, or a name it cannot follow)"
+            )
+        elif count == _MAX_OPERAND_NOTES + 1:
+            self.result.notes.append(
+                f"{self.module.rel}: more dependencies on operands this reader did not find as "
+                "tasks are not read"
+            )
+
+    def _is_label(self, node: ast.AST) -> bool:
+        """``Label("x")`` in ``a >> Label("x") >> b`` names an edge: it is not a task."""
+        if isinstance(node, ast.Call):
+            qualified = qualified_name(node.func, self.module.imports) or ""
+            return _is_airflow(qualified) and _last(qualified) == "Label"
+        return False
 
     def _edges(self) -> None:
+        self._edge_state = [(d, {t.key for t in d.dag.tasks}, set(d.dag.edges)) for d in self.defs]
         for node in ast.walk(self.module.tree):
             if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.RShift, ast.LShift)):
                 # ``a >> b >> c`` is ``(a >> b) >> c``: the chain is read from its outermost node
@@ -717,10 +787,21 @@ class _Reader:
         operands.append(current)
         operands.reverse()
         ops.reverse()
+        # ``a >> Label("x") >> b`` is the edge a >> b: the label is dropped with its operator
+        kept = [(operands[0], None)]
+        for operand, op in zip(operands[1:], ops, strict=True):
+            if self._is_label(operand):
+                continue
+            kept.append((operand, op))
+        operands = [operand for operand, _ in kept]
+        ops = [op for _, op in kept[1:]]
         for index, op in enumerate(ops):
             left = self._operand_tasks(operands[index])
             right = self._operand_tasks(operands[index + 1])
             if left is None or right is None:
+                for side, found in ((operands[index], left), (operands[index + 1], right)):
+                    if found is None:
+                        self._unread(side)
                 continue
             if isinstance(op, ast.RShift):
                 self._link(left, right)
@@ -760,6 +841,40 @@ class _Reader:
 
 
 _SPARK_SUBMIT = re.compile(r"(^|/)spark-submit(\.sh)?$")
+#: The token ``Folder.fold_sql`` puts where a field of the text did not fold.
+_HOLE = re.compile(r"__fluidhole\d+__")
+_JINJA = re.compile(r"\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\}", re.DOTALL)
+_JINJA_TOKEN = re.compile(r"__fluidjinja(\d+)__")
+_SHELL_PUNCTUATION = "();<>|&"
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
+#: Shell keywords that come before a command on the same line: ``then spark-submit ...``.
+_KEYWORDS = frozenset(
+    {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time", "exec"}
+)
+#: Commands that print, search or test: a ``spark-submit`` after one is text, not a command.
+_NOT_EXECUTING = frozenset(
+    {
+        "echo", "printf", "cat", "grep", "egrep", "fgrep", "rg", "test", "[", "[[", "which",
+        "type", "whereis", "man", "ls", "rm", "cp", "mv", "ln", "vi", "vim", "nano", "less",
+        "more", "head", "tail", "wc", "touch", "mkdir", "read", "export", "set", "unset", "alias",
+        "cd", "source", ".", "tee", "find", "sed", "awk", "diff", "stat", "chmod", "chown",
+    }
+)  # fmt: skip
+#: ``spark-submit`` options that take the next word as their value (``--opt=value`` is one word).
+_SUBMIT_VALUE_OPTIONS = frozenset(
+    {
+        "--master", "--deploy-mode", "--class", "--name", "--jars", "--packages",
+        "--exclude-packages", "--repositories", "--py-files", "--files", "--archives", "--conf",
+        "-c", "--properties-file", "--driver-memory", "--driver-java-options",
+        "--driver-library-path", "--driver-class-path", "--executor-memory", "--proxy-user",
+        "--driver-cores", "--queue", "--num-executors", "--executor-cores",
+        "--total-executor-cores", "--keytab", "--principal",
+    }
+)  # fmt: skip
+_SUBMIT_FLAGS = frozenset({"--supervise", "--verbose", "-v"})
+#: Options after which ``spark-submit`` does not run a job.
+_SUBMIT_NO_JOB = frozenset({"--help", "-h", "--version", "--kill", "--status"})
 
 
 def _arg_texts(args: Any) -> Tuple[str, ...]:
@@ -777,35 +892,182 @@ def _arg_texts(args: Any) -> Tuple[str, ...]:
     return tuple(out)
 
 
-def _spark_submit_in_tokens(tokens: Sequence[Any]) -> Optional[Tuple[Any, List[Any]]]:
-    """``(script, args)`` of a ``spark-submit`` command given as tokens: the first ``.py``
-    token after ``spark-submit`` is the script, and what follows it the arguments. ``None``
-    when the command is not a ``spark-submit``."""
-    start = None
-    for index, token in enumerate(tokens):
-        if isinstance(token, str) and _SPARK_SUBMIT.search(token):
-            start = index
-            break
-    if start is None:
-        for token in tokens:  # ["bash", "-c", "spark-submit job.py ..."]
-            if isinstance(token, str) and " " in token and "spark-submit" in token:
-                return _spark_submit_in_text(token)
+def _restore(text: str, holes: Mapping[str, str]) -> str:
+    """``text`` with each hole token shown as the expression it stood for, in braces."""
+    return _HOLE.sub(lambda m: "{" + holes.get(m.group(0), "?") + "}", text)
+
+
+def _split_words(text: str) -> Optional[List[str]]:
+    """The words of one shell line, comments dropped; ``None`` when a quote is left open."""
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    try:
+        return list(lexer)
+    except ValueError:
         return None
-    for index in range(start + 1, len(tokens)):
-        token = tokens[index]
-        if isinstance(token, str) and token.endswith(".py"):
-            return token, list(tokens[index + 1 :])
-        if isinstance(token, Unresolved):
-            return Unresolved("the script is not a constant", token.text), list(tokens[index + 1 :])
+
+
+def _shell_commands(command: str, holes: Mapping[str, str]) -> List[List[Any]]:
+    """The commands of a shell command line, each as its words: split at ``&&``, ``||``, ``;``,
+    ``|``, ``&``, a redirection, a sub-shell and a new line, comments dropped. A Jinja
+    ``{{ ... }}`` stays inside its word, and a word with a field that did not fold is an
+    :class:`Unresolved`. Text that does not split into words (a quote never closed) gives
+    what came before it."""
+    jinja: List[str] = []
+
+    def hide(match: "re.Match[str]") -> str:
+        jinja.append(match.group(0))
+        return f"__fluidjinja{len(jinja) - 1}__"
+
+    def word(raw: str) -> Any:
+        def back(match: "re.Match[str]") -> str:
+            index = int(match.group(1))
+            return jinja[index] if index < len(jinja) else match.group(0)
+
+        text = _JINJA_TOKEN.sub(back, raw) if jinja else raw
+        if _HOLE.search(text):
+            return Unresolved("the word is not a constant", _restore(text, holes))
+        return text
+
+    text = _JINJA.sub(hide, command[:_MAX_COMMAND])
+    text = text.replace("\\\r\n", " ").replace("\\\n", " ")
+    commands: List[List[Any]] = []
+    pending = ""
+    for line in text.split("\n"):
+        pending = line if not pending else pending + "\n" + line
+        words = _split_words(pending)
+        if words is None:  # a quote is open: the text goes on in the next line
+            continue
+        pending = ""
+        current: List[Any] = []
+        for raw in words:
+            if raw and all(ch in _SHELL_PUNCTUATION for ch in raw):
+                if current and isinstance(current[-1], str):
+                    if raw[0] in "<>" and current[-1].isdigit():
+                        current.pop()  # the 2 of 2>&1
+                    elif raw == "(" and current[-1] == "$":
+                        current.pop()  # $( ... )
+                if current:
+                    commands.append(current)
+                current = []
+            else:
+                current.append(word(raw))
+        if current:
+            commands.append(current)
+    return commands
+
+
+def _application(words: Sequence[Any], start: int) -> Optional[Tuple[Any, List[Any]]]:
+    """``(script, args)`` for the ``spark-submit`` at ``words[start]``: the application is the
+    first word that is not an option or the value of one, and a ``.py`` application is the
+    script. ``None`` for a ``spark-submit`` that runs no job (``--version``)."""
+    index = start + 1
+    expansion: Optional[Any] = None
+    while index < len(words):
+        word = words[index]
+        if isinstance(word, Unresolved):
+            return Unresolved("the script is not a constant", word.text), list(words[index + 1 :])
+        if word.startswith("-") and len(word) > 1:
+            if word in _SUBMIT_NO_JOB:
+                return None
+            if "=" in word or word in _SUBMIT_FLAGS:
+                index += 1
+            elif word in _SUBMIT_VALUE_OPTIONS:
+                index += 2
+            else:
+                # an option this reader does not know: the next word is its value, unless that
+                # is the script
+                following = words[index + 1] if index + 1 < len(words) else None
+                index += 1 if following is None or _is_python(following) else 2
+            continue
+        if word.startswith(("$", "`")) or "{{" in word or "{%" in word:
+            if _is_python(word):
+                return word, list(words[index + 1 :])
+            expansion = expansion if expansion is not None else word  # may be several words
+            index += 1
+            continue
+        if word.endswith(".py"):
+            return word, list(words[index + 1 :])
+        return (
+            Unresolved(
+                f"the spark-submit command names no Python script (the application is `{word}`)",
+                word,
+            ),
+            list(words[index + 1 :]),
+        )
+    if expansion is not None:
+        if "{{" in expansion or "{%" in expansion:
+            return expansion, []  # a template: kept as written, and marked
+        return Unresolved("the script is a shell variable or substitution", expansion), []
     return Unresolved("the spark-submit command names no Python script", ""), []
 
 
-def _spark_submit_in_text(command: str) -> Optional[Tuple[Any, List[str]]]:
-    try:
-        tokens = shlex.split(command, comments=False, posix=True)
-    except ValueError:
-        return None
-    return _spark_submit_in_tokens(tokens)
+def _is_python(word: Any) -> bool:
+    return isinstance(word, str) and word.endswith(".py")
+
+
+def _spark_submit_in_words(words: Sequence[Any], depth: int = 0) -> Optional[Tuple[Any, List[Any]]]:
+    """``(script, args)`` of the ``spark-submit`` one command runs, ``None`` when it runs none:
+    a ``spark-submit`` after ``echo`` or ``grep`` is text, one run through ``sudo``, ``timeout``
+    or ``bash -c`` is run."""
+    head = 0
+    while head < len(words) and isinstance(words[head], str):
+        if _ASSIGNMENT.match(words[head]) or words[head] in _KEYWORDS:
+            head += 1
+        else:
+            break
+    for index in range(head, len(words)):
+        word = words[index]
+        if not isinstance(word, str):
+            continue
+        if _SPARK_SUBMIT.search(word):
+            return _application(words, index)
+        name = word.rsplit("/", 1)[-1]
+        if name in _NOT_EXECUTING:
+            return None
+        if name in _SHELLS:
+            return _in_shell(words[index + 1 :], depth)
+    return None
+
+
+def _in_shell(rest: Sequence[Any], depth: int) -> Optional[Tuple[Any, List[Any]]]:
+    """``bash -c "spark-submit ..."``: the text after ``-c`` is a command line of its own."""
+    for index, word in enumerate(rest):
+        if (
+            isinstance(word, str)
+            and word.startswith("-")
+            and not word.startswith("--")
+            and "c" in word
+        ):
+            text = rest[index + 1] if index + 1 < len(rest) else None
+            if isinstance(text, Unresolved):
+                if "spark-submit" in text.text:
+                    return Unresolved("the shell command is not a constant", text.text), []
+                return None
+            if isinstance(text, str) and depth < 3:
+                found = _spark_submits_in_text(text, {}, depth + 1)
+                return found[0] if found else None
+            return None
+    return None
+
+
+def _spark_submit_in_tokens(tokens: Sequence[Any]) -> Optional[Tuple[Any, List[Any]]]:
+    """``(script, args)`` of a ``spark-submit`` command given as words (an EMR step's ``Args``);
+    ``None`` when the command is not a ``spark-submit``."""
+    return _spark_submit_in_words(tokens)
+
+
+def _spark_submits_in_text(
+    command: str, holes: Mapping[str, str], depth: int = 0
+) -> List[Tuple[Any, List[Any]]]:
+    """Every ``spark-submit`` a command line runs, in order."""
+    found: List[Tuple[Any, List[Any]]] = []
+    for words in _shell_commands(command, holes):
+        submit = _spark_submit_in_words(words, depth)
+        if submit is not None:
+            found.append(submit)
+    return found
 
 
 def read_dags(

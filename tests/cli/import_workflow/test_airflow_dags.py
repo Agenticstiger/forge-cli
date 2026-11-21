@@ -284,7 +284,9 @@ def test_bash_submits_only_when_the_command_is_a_spark_submit_of_a_python_script
     assert by_id["a"][0].script == "/j/a.py" and by_id["a"][0].args == ("x",)
     assert by_id["b"][0].script is None and "no Python script" in by_id["b"][0].why
     assert by_id["c"] == []
-    assert by_id["d"][0].script == "{unknown}/d.py"
+    # a field that did not fold is a field, not a path: the script is not a constant
+    assert by_id["d"][0].script is None and by_id["d"][0].shown == "{unknown}/d.py"
+    assert by_id["d"][0].args == ("--x",)
     assert by_id["e"] == []
 
 
@@ -569,3 +571,294 @@ def test_airflow_is_never_imported_and_the_file_never_runs(tmp_path):
     )
     assert [d.dag_id for d in found.dags] == ["d"]
     assert not marker.exists() and "airflow" not in sys.modules
+
+
+# ── spark-submit is read as the command line it is ────────────────────
+
+
+def bash_submits(command: str):
+    dag = one(
+        f"""
+        from airflow import DAG
+        from airflow.operators.bash import BashOperator
+        with DAG("b"):
+            BashOperator(task_id="t", bash_command={command!r})
+        """
+    )
+    return dag.tasks[0].submits
+
+
+@pytest.mark.parametrize(
+    "command, script, args",
+    [
+        ("spark-submit --py-files deps.py main.py a b", "main.py", ("a", "b")),
+        (
+            "spark-submit --py-files=deps.py --conf a=b -c c=d /jobs/main.py x",
+            "/jobs/main.py",
+            ("x",),
+        ),
+        (
+            "spark-submit --master yarn --deploy-mode cluster s3://code/job.py --day 1",
+            "s3://code/job.py",
+            ("--day", "1"),
+        ),
+        ("spark-submit --supervise --verbose job.py", "job.py", ()),
+        ("spark-submit --some-new-flag job.py", "job.py", ()),
+        ("spark-submit --some-new-option value job.py", "job.py", ()),
+        ("spark-submit --files a.py,b.py --jars x.jar job.py", "job.py", ()),
+        ("/opt/spark/bin/spark-submit local:///opt/job.py", "local:///opt/job.py", ()),
+        ("$SPARK_HOME/bin/spark-submit --conf k=v job.py", "job.py", ()),
+        ("spark-submit $EXTRA_OPTS job.py", "job.py", ()),
+        ("spark-submit {{ var.value.opts }} job.py", "job.py", ()),
+        (
+            "spark-submit job.py --day {{ ds }} --to '{{ next_ds }}'",
+            "job.py",
+            ("--day", "{{ ds }}", "--to", "{{ next_ds }}"),
+        ),
+        ("spark-submit {{ params.script }} --day 1", "{{ params.script }}", ()),
+    ],
+)
+def test_the_application_is_the_first_word_that_is_not_an_option_or_its_value(
+    command, script, args
+):
+    (submit,) = bash_submits(command)
+    assert (submit.script, submit.args) == (script, args)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo spark-submit job.py",
+        "# spark-submit job.py",
+        "ps aux | grep spark-submit",
+        "grep -q spark-submit job.py || true",
+        "cat spark-submit.sh",
+        "which spark-submit && echo ok",
+        "spark-submit --version",
+        "spark-submit --help",
+        "test -x /opt/spark/bin/spark-submit",
+    ],
+)
+def test_a_command_that_only_names_spark_submit_does_not_submit_a_job(command):
+    assert bash_submits(command) == []
+
+
+def test_several_spark_submits_in_one_command_are_all_read():
+    submits = bash_submits("cd /opt && spark-submit a.py; spark-submit --conf k=v b.py x | tee log")
+    assert [(s.script, s.args) for s in submits] == [("a.py", ()), ("b.py", ("x",))]
+    assert all(s.command and "tee log" in s.command for s in submits)
+
+
+def test_a_spark_submit_run_through_a_wrapper_or_a_shell_is_read():
+    for command, script in [
+        ("sudo -u hadoop spark-submit job.py", "job.py"),
+        ("timeout 3600 spark-submit job.py", "job.py"),
+        ("env A=1 B=2 spark-submit job.py", "job.py"),
+        ("A=1 spark-submit job.py", "job.py"),
+        ("nohup spark-submit job.py > out.log 2>&1 &", "job.py"),
+        ("if [ -f x ]; then spark-submit a.py; fi", "a.py"),
+        ("bash -c 'spark-submit a.py && echo ok'", "a.py"),
+        ('/bin/bash -lc "cd /x; spark-submit a.py"', "a.py"),
+    ]:
+        (submit,) = bash_submits(command)
+        assert submit.script == script, command
+
+
+def test_redirections_and_line_continuations_are_not_arguments():
+    (submit,) = bash_submits("spark-submit \\\n  --master yarn \\\n  job.py a 2>&1 | tee log")
+    assert (submit.script, submit.args) == ("job.py", ("a",))
+    (submit,) = bash_submits("spark-submit job.py a $(date +%F)")
+    assert submit.args == ("a",)
+
+
+def test_a_comment_line_before_the_command_is_not_part_of_it():
+    (submit,) = bash_submits("# run the job\n# spark-submit old.py\nspark-submit new.py")
+    assert submit.script == "new.py"
+
+
+def test_a_jar_application_is_not_a_script():
+    (submit,) = bash_submits("spark-submit --class Main app.jar")
+    assert submit.script is None and "no Python script" in submit.why and "app.jar" in submit.why
+
+
+def test_a_shell_variable_as_the_script_is_not_a_constant():
+    (submit,) = bash_submits("spark-submit --master yarn $SCRIPT")
+    assert submit.script is None and "shell variable" in submit.why
+
+
+def test_a_field_that_did_not_fold_is_a_hole_the_rest_of_the_command_is_still_read():
+    dag = one(
+        """
+        from airflow import DAG
+        from airflow.operators.bash import BashOperator
+        with DAG("b"):
+            BashOperator(task_id="a", bash_command=f"spark-submit --master {master} /jobs/main.py --day {day}")
+            BashOperator(task_id="b", bash_command=f"spark-submit {script} --x")
+        """
+    )
+    first, second = (t.submits[0] for t in dag.tasks)
+    assert (first.script, first.args) == ("/jobs/main.py", ("--day", "<not constant>"))
+    assert first.command == "spark-submit --master {master} /jobs/main.py --day {day}"
+    assert second.script is None and second.shown == "{script}"
+
+
+def test_a_command_the_file_does_not_define_but_that_mentions_spark_submit_is_reported():
+    dag = one(
+        """
+        from airflow import DAG
+        from airflow.operators.bash import BashOperator
+        with DAG("b"):
+            BashOperator(task_id="a", bash_command=build("spark-submit"))
+            BashOperator(task_id="b", bash_command=build("dbt"))
+        """
+    )
+    first, second = (t.submits for t in dag.tasks)
+    assert len(first) == 1 and first[0].script is None
+    assert second == []
+
+
+def test_an_emr_step_skips_option_values_too():
+    dag = one(
+        """
+        from airflow import DAG
+        from airflow.providers.amazon.aws.operators.emr import EmrAddStepsOperator
+        STEPS = [{"Name": "s", "HadoopJarStep": {"Jar": "command-runner.jar",
+                  "Args": ["spark-submit", "--py-files", "s3://code/deps.py", "--deploy-mode", "cluster", "s3://code/main.py", "x"]}}]
+        with DAG("e"):
+            EmrAddStepsOperator(task_id="add", job_flow_id="j", steps=STEPS)
+        """
+    )
+    (submit,) = dag.tasks[0].submits
+    assert (submit.script, submit.args) == ("s3://code/main.py", ("x",))
+
+
+# ── dependencies: bounded, and what is not read is said ───────────────
+
+
+def test_a_wide_cross_dependency_is_read_in_bounded_time_and_capped():
+    import time
+
+    body = "\n".join(
+        [f'    a{i} = EmptyOperator(task_id="a{i}")' for i in range(300)]
+        + [f'    b{i} = EmptyOperator(task_id="b{i}")' for i in range(300)]
+        + [
+            "    ["
+            + ", ".join(f"a{i}" for i in range(300))
+            + "] >> ["
+            + ", ".join(f"b{i}" for i in range(300))
+            + "]"
+        ]
+    )
+    source = (
+        "from airflow import DAG\n"
+        "from airflow.operators.empty import EmptyOperator\n"
+        'with DAG("wide"):\n' + body + "\n"
+    )
+    started = time.monotonic()
+    dag = one(source)
+    assert time.monotonic() - started < 5
+    assert len(dag.edges) == 10_000
+    assert any("more than 10000 dependencies" in note for note in dag.notes)
+    assert len(set(dag.edges)) == len(dag.edges)
+
+
+def test_a_dependency_written_twice_is_recorded_once():
+    dag = one(
+        """
+        from airflow import DAG
+        from airflow.operators.empty import EmptyOperator
+        with DAG("d"):
+            a = EmptyOperator(task_id="a")
+            b = EmptyOperator(task_id="b")
+            a >> b
+            b << a
+            a.set_downstream(b)
+        """
+    )
+    assert edges(dag) == [("a", "b")]
+
+
+def test_a_task_group_in_a_dependency_is_said_to_be_unread_and_the_rest_still_linked():
+    found = dags(
+        """
+        from airflow import DAG
+        from airflow.utils.task_group import TaskGroup
+        from airflow.operators.empty import EmptyOperator
+        with DAG("g") as dag:
+            start = EmptyOperator(task_id="start")
+            end = EmptyOperator(task_id="end")
+            with TaskGroup("work") as work:
+                inner = EmptyOperator(task_id="inner")
+            start >> work >> end
+            start >> end
+        """
+    )
+    assert edges(found.dags[0]) == [("start", "end")]
+    notes = [n for n in found.notes if "a dependency on `work`" in n]
+    assert len(notes) == 1 and notes[0].startswith("dag.py:")
+
+
+def test_unread_dependencies_are_a_few_notes_and_a_count_not_one_per_operand():
+    lines = "\n".join(f"    start >> group{i}" for i in range(40))
+    source = (
+        "from airflow import DAG\n"
+        "from airflow.operators.empty import EmptyOperator\n"
+        'with DAG("g"):\n'
+        '    start = EmptyOperator(task_id="start")\n' + lines + "\n"
+    )
+    found = dags(source)
+    notes = [n for n in found.notes if "a dependency on" in n or "more dependencies" in n]
+    assert len(notes) == 11 and "more dependencies" in notes[-1]
+
+
+def test_an_edge_label_is_not_a_task_and_does_not_cut_the_dependency():
+    found = dags(
+        """
+        from airflow import DAG
+        from airflow.utils.edgemodifier import Label
+        from airflow.operators.empty import EmptyOperator
+        with DAG("l"):
+            a = EmptyOperator(task_id="a")
+            b = EmptyOperator(task_id="b")
+            c = EmptyOperator(task_id="c")
+            a >> Label("ok") >> b >> Label("then") >> c
+        """
+    )
+    assert edges(found.dags[0]) == [("a", "b"), ("b", "c")]
+    assert not [n for n in found.notes if "Label" in n]
+
+
+def test_many_task_functions_are_read_without_walking_the_file_for_each():
+    import time
+
+    functions = "\n".join(f"    @task\n    def t{i}():\n        pass\n" for i in range(400))
+    calls = "\n".join(f"    x{i} = t{i}()" for i in range(400))
+    source = (
+        "from airflow.decorators import dag, task\n"
+        "@dag(dag_id='many')\n"
+        "def many():\n" + functions + calls + "\n"
+        "many()\n"
+    )
+    started = time.monotonic()
+    dag = one(source)
+    assert time.monotonic() - started < 5
+    assert len(dag.tasks) == 400
+
+
+def test_a_file_that_asks_for_too_much_folding_is_said_so_once():
+    lines = ['x0 = ""']
+    for level in range(1, 11):
+        lines.append(f'x{level} = f"' + ("{x%d}" % (level - 1)) * 300 + '"')
+    source = "\n".join(
+        [
+            "from airflow import DAG",
+            *lines,
+            'with DAG(x10 + "a", schedule=x10 + "b", tags=[x10 + "c"]):',
+            "    pass",
+        ]
+    )
+    found = dags(source)
+    assert [n for n in found.notes if "folding stopped early" in n] == [
+        "dag.py: folding stopped early (the file asks for too much work): some values are "
+        "reported as not constant"
+    ]
