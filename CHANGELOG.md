@@ -31,7 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read strictly and no code in it runs. `--registry` reads a written topic's columns through the
   existing schema-registry importer, only when asked. Every proposal is validated against the
   schema before anything is written, credential-shaped arguments are masked, and a second import
-  never replaces a file that differs from what it would write unless `--force` is given.
+  never replaces a file that differs from what it would write unless `--force` is given. The
+  reading is bounded: a file with more than 50,000 `{` characters is not parsed (CPython parses a
+  long f-string in time that grows with the square of its fields), a scan reads at most 64 MB of
+  source and keeps a few MB of it parsed at once, the work spent folding one name is capped, and a
+  script path in a DAG file is judged on its text (no `..`, not absolute) before any file is looked
+  at. Product, expose and build ids are unique whatever the names look like, two jobs with one file
+  name are two products, and what the reader cannot follow (a reader variable assigned twice, a
+  task group in a dependency, a placeholder in SQL that is not an f-string) is said in the report.
 
 - **`fluid import` takes a generic `--dry-run`, and importers can be added by packages.** `--dry-run`
   prints the proposal (each product, its writer, outputs and upstreams) and the report and writes
@@ -40,7 +47,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `import_to_contract` or `import_to_contracts` and no forge import, any report object with the
   report's four lists, read by name and loaded only when its tool is asked for, held to
   `FLUID_PLUGINS_ALLOWLIST` and `FLUID_PLUGINS_BLOCKLIST`, unable to take a built-in's name, and
-  refused when two distributions ship one name. `fluid --help` stays cold.
+  refused when two distributions ship one name. `fluid --help` stays cold. A dry run labels each
+  file as new, unchanged, replacing the existing file (with `--force`) or refused. For every
+  importer an output path that is a symbolic link, a directory or a device is refused, with or
+  without `--force`, and a file is written whole beside its target and renamed over it, keeping
+  the permission bits of a file it replaces. `--out` that names an existing file is refused when
+  several products are written, and `--split-by table`, `job` and `dag` are refused for the
+  importers that do not read code.
+
 - **`fluid datamesh-manager status` shows where a migration's products stand in Entropy Data.**
   `status products/` takes contract files, globs and folders as `publish` and `promote` do, reads
   Entropy's product list once and reports each product the contracts declare as `active`, `draft`,
