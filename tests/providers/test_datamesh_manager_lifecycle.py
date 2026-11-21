@@ -63,10 +63,12 @@ class FakeEntropy:
         products: Optional[Dict[str, Dict[str, Any]]] = None,
         unreadable: Iterable[str] = (),
         list_fails: bool = False,
+        raw_get: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.products = copy.deepcopy(products or {})
         self.unreadable = set(unreadable)  # GET of these answers 500
         self.list_fails = list_fails
+        self.raw_get = raw_get or {}  # GET of these answers 200 with exactly this body
         self.calls: List[tuple] = []
 
     def request(self, method: str, path: str, *, json_body: Any = None) -> MagicMock:
@@ -83,6 +85,9 @@ class FakeEntropy:
             if method == "GET":
                 if pid in self.unreadable:
                     raise ProviderError(f"Entropy Data API error 500 on GET {path}: boom")
+                if pid in self.raw_get:
+                    resp.json.return_value = self.raw_get[pid]
+                    return resp
                 if pid not in self.products:
                     raise ProviderError(f"Entropy Data API error 404 on GET {path}: not found")
                 resp.json.return_value = copy.deepcopy(self.products[pid])
@@ -206,11 +211,13 @@ class TestPublishWithStatus:
         with pytest.raises(ProviderError, match="Invalid product status"):
             _publish(FakeEntropy(), _contract(), status=bad)
 
-    def test_a_dry_run_shows_the_status_and_that_draft_never_demotes(self):
+    @pytest.mark.parametrize("asked", ["draft", "active"])
+    def test_a_dry_run_shows_the_status_and_that_it_only_moves_forward(self, asked):
         entropy = FakeEntropy()
-        result = _publish(entropy, _contract(), status="draft", dry_run=True)
-        assert result["payload"]["status"] == "draft"
-        assert result["status"] == "draft"
+        result = _publish(entropy, _contract(), status=asked, dry_run=True)
+        assert result["payload"]["status"] == asked
+        assert result["status"] == asked
+        assert "only moves forward" in result["status_note"]
         assert "never demotes" in result["status_note"]
         assert entropy.puts() == []
 
@@ -244,6 +251,13 @@ class TestPublishNeverGuessesWhatItCannotRead:
                 _publish(entropy, _contract(), status="draft")
             assert entropy.puts() == []
             _publish.ensure_team.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.parametrize("body", [[], None, "<html>proxy</html>", 5])
+    def test_a_200_that_is_not_a_product_is_unreadable_too(self, body):
+        entropy = FakeEntropy(raw_get={"silver.orders": body})
+        with pytest.raises(ProviderError, match="Could not read data product"):
+            _publish(entropy, _contract(), status="draft")
+        assert entropy.puts() == []
 
     def test_without_a_status_an_unreadable_product_is_published_as_before(self):
         entropy = FakeEntropy(

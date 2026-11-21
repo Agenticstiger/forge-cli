@@ -716,12 +716,12 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             }
             if status is not None:
                 result["status"] = status
-                if status == "draft":
-                    # A dry run makes no call, so it cannot read what Entropy holds.
-                    result["status_note"] = (
-                        "On publish, a product Entropy already holds as active or deprecated "
-                        "keeps that status; draft never demotes."
-                    )
+                # A dry run makes no call, so it cannot read what Entropy holds.
+                result["status_note"] = (
+                    "On publish, a status only moves forward: draft never demotes a product "
+                    "Entropy holds as active, a deprecated product keeps its status, and a "
+                    "retired product is refused."
+                )
             access_previews = self._preview_access_agreements(
                 fluid,
                 product_id,

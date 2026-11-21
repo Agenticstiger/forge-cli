@@ -67,8 +67,21 @@ def _put(folder: Path, name: str, report: Any) -> Path:
     return path
 
 
-def _contract(folder: Path, product_id: str) -> Path:
+def _contract(folder: Path, product_id: str, ports: int = 1) -> Path:
     path = folder / f"{product_id}.fluid.yaml"
+    exposes = [
+        {
+            "exposeId": f"port{n}",
+            "kind": "table",
+            "binding": {
+                "platform": "local",
+                "format": "parquet",
+                "location": {"path": f"out/{product_id}{n}.parquet"},
+            },
+            "contract": {"schema": [{"name": "order_id", "type": "VARCHAR"}]},
+        }
+        for n in range(ports)
+    ]
     path.write_text(
         yaml.safe_dump(
             {
@@ -77,18 +90,7 @@ def _contract(folder: Path, product_id: str) -> Path:
                 "id": product_id,
                 "name": product_id,
                 "metadata": {"layer": "Silver", "owner": {"team": "retail"}},
-                "exposes": [
-                    {
-                        "exposeId": "orders",
-                        "kind": "table",
-                        "binding": {
-                            "platform": "local",
-                            "format": "parquet",
-                            "location": {"path": "out/o.parquet"},
-                        },
-                        "contract": {"schema": [{"name": "order_id", "type": "VARCHAR"}]},
-                    }
-                ],
+                "exposes": exposes,
             }
         ),
         encoding="utf-8",
@@ -187,6 +189,27 @@ class TestReportVerdict:
         assert report_verdict({"results": []})[0] is False
         assert report_verdict({"summary": "nope"})[0] is False
 
+    @pytest.mark.parametrize("missing", ["total", "match", "mismatch", "error"])
+    def test_a_summary_without_a_count_verify_always_writes_is_not_a_report(self, missing):
+        report = _report()
+        del report["summary"][missing]
+        passed, reason = report_verdict(report)
+        assert not passed and f"no {missing} count" in reason
+
+    def test_a_run_that_left_ports_unverified_under_require_every_port_is_not_a_pass(self):
+        # verify exits 1 for this run, but still writes the report.
+        report = _report(total=2, match=1, unsupported=1)
+        report["require_every_port"] = {"unverified": ["x (no verifier for the binding)"]}
+        assert report_verdict(report) == (
+            False,
+            "1 output port(s) were left unverified (--require-every-port)",
+        )
+
+    def test_an_empty_require_every_port_section_is_a_pass(self):
+        report = _report()
+        report["require_every_port"] = {"unverified": []}
+        assert report_verdict(report) == (True, "")
+
 
 class TestLoadVerdicts:
     def test_the_newest_report_for_a_product_decides(self, tmp_path):
@@ -200,6 +223,23 @@ class TestLoadVerdicts:
         _put(tmp_path, "a.json", _report(timestamp="2026-11-19T09:00:00Z"))
         _put(tmp_path, "b.json", _report(error=1, match=1, timestamp="2026-11-20T09:00:00Z"))
         assert load_verdicts([str(tmp_path)])["silver.orders"].passed is False
+
+    def test_two_reports_made_at_the_same_moment_decide_as_the_failing_one(self, tmp_path):
+        stamp = "2026-11-20T09:00:00+00:00"
+        _put(tmp_path, "a_pass.json", _report(timestamp=stamp))
+        _put(tmp_path, "z_fail.json", _report(error=1, match=1, timestamp=stamp))
+        assert load_verdicts([str(tmp_path)])["silver.orders"].passed is False
+        # In either file order: the verdict does not depend on the names.
+        other = tmp_path / "other"
+        _put(other, "a_fail.json", _report(error=1, match=1, timestamp=stamp))
+        _put(other, "z_pass.json", _report(timestamp=stamp))
+        assert load_verdicts([str(other)])["silver.orders"].passed is False
+
+    def test_a_timestamp_without_an_offset_is_read_as_utc(self, tmp_path):
+        # 10:00 UTC is later than 09:30 UTC whatever this machine's time zone is.
+        _put(tmp_path, "old.json", _report(error=1, match=1, timestamp="2026-11-20T09:30:00+00:00"))
+        _put(tmp_path, "new.json", _report(timestamp="2026-11-20T10:00:00"))
+        assert load_verdicts([str(tmp_path)])["silver.orders"].passed is True
 
     def test_without_a_timestamp_the_file_time_decides(self, tmp_path):
         old = _put(tmp_path, "old.json", _report(mismatch=1, match=1, timestamp=None))
@@ -218,6 +258,19 @@ class TestLoadVerdicts:
         (tmp_path / "broken.json").write_text("{not json", encoding="utf-8")
         _put(tmp_path, "nested/r.json", _report("gold.revenue"))
         assert list(load_verdicts([str(tmp_path)])) == ["gold.revenue"]
+
+    def test_a_folder_scan_survives_a_file_json_cannot_parse(self, tmp_path):
+        # Nested past the interpreter's stack: json.loads raises RecursionError, not ValueError.
+        (tmp_path / "deep.json").write_text("[" * 200_000, encoding="utf-8")
+        _put(tmp_path, "r.json", _report("gold.revenue"))
+        assert list(load_verdicts([str(tmp_path)])) == ["gold.revenue"]
+
+    def test_a_file_named_outright_that_json_cannot_parse_is_the_reports_error(self, tmp_path):
+        deep = tmp_path / "deep.json"
+        deep.write_text("[" * 200_000, encoding="utf-8")
+        with pytest.raises(CLIError) as exc:
+            load_verdicts([str(deep)])
+        assert exc.value.event == "dmm_verify_report_unreadable"
 
     def test_a_folder_does_not_follow_a_symlink(self, tmp_path):
         outside = tmp_path / "outside"
@@ -303,16 +356,61 @@ class TestPromoteCommand:
         assert code == 0
         assert [p["id"] for p in provider.promoted] == ["a", "b"]
 
-    def test_an_id_is_matched_to_its_report_by_the_id_entropy_knows_it_by(self, tmp_path, capsys):
+    def test_an_id_spelled_otherwise_is_not_the_product_the_report_verified(self, tmp_path, capsys):
+        # Entropy ids are case-sensitive: `Silver.Orders` is another product than the
+        # `silver.orders` forge publishes and verifies, so its report says nothing about it.
+        reports = tmp_path / "reports"
+        _put(reports, "r.json", _report("silver.orders"))
+        provider = FakeProvider()
+        code, out = _run(
+            ["promote", "--id", "Silver.Orders", "--verify-report", str(reports)], provider, capsys
+        )
+        assert code == 1
+        assert provider.promoted == []
+        assert "forge publishes and verifies it as 'silver.orders'" in out
+
+    def test_the_slug_of_an_id_passes_the_gate_on_its_own_report(self, tmp_path, capsys):
         reports = tmp_path / "reports"
         _put(reports, "r.json", _report("silver.orders"))
         provider = FakeProvider()
         code, _ = _run(
-            ["promote", "--id", "Silver.Orders", "--verify-report", str(reports)], provider, capsys
+            ["promote", "--id", "silver.orders", "--verify-report", str(reports)], provider, capsys
         )
-        assert code == 0
-        # The report is found by the slug; the id is sent as given.
-        assert [p["id"] for p in provider.promoted] == ["Silver.Orders"]
+        assert code == 0 and [p["id"] for p in provider.promoted] == ["silver.orders"]
+
+    def test_a_report_that_covers_only_some_of_the_contracts_ports_holds_the_product_back(
+        self, tmp_path, capsys
+    ):
+        contracts = tmp_path / "products"
+        contracts.mkdir()
+        _contract(contracts, "silver.orders", ports=2)
+        reports = tmp_path / "reports"
+        # `fluid verify --expose-id port0`: one port checked, nothing says it was partial.
+        _put(reports, "r.json", _report("silver.orders", total=1, match=1))
+        provider = FakeProvider()
+        code, out = _run(
+            ["promote", str(contracts), "--verify-report", str(reports)], provider, capsys
+        )
+        assert code == 1 and provider.promoted == []
+        assert "covers 1 of the contract's 2 output ports" in out
+
+    def test_a_report_that_covers_every_port_promotes(self, tmp_path, capsys):
+        contracts = tmp_path / "products"
+        contracts.mkdir()
+        _contract(contracts, "silver.orders", ports=2)
+        reports = tmp_path / "reports"
+        _put(reports, "r.json", _report("silver.orders", total=2, match=2))
+        provider = FakeProvider()
+        code, _ = _run(
+            ["promote", str(contracts), "--verify-report", str(reports)], provider, capsys
+        )
+        assert code == 0 and [p["id"] for p in provider.promoted] == ["silver.orders"]
+
+    def test_a_contract_that_cannot_be_read_is_an_error_line_not_a_crash(self, tmp_path, capsys):
+        broken = tmp_path / "broken.fluid.yaml"
+        broken.write_text("- a list, not a contract\n", encoding="utf-8")
+        code, _ = _run(["promote", str(broken)], FakeProvider(), capsys)
+        assert code == 1
 
     def test_an_active_product_is_left_alone_and_is_not_an_error(self, tmp_path, capsys):
         provider = FakeProvider(status={"a": "active"})

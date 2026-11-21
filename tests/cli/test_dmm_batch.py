@@ -136,13 +136,19 @@ class FakeProvider:
         return [a["id"] for a in self.applied]
 
 
-def _run(argv: Sequence[str], provider: FakeProvider, capsys) -> tuple:
+def _run_full(argv: Sequence[str], provider: FakeProvider, capsys, **patches: Any) -> tuple:
     parser = argparse.ArgumentParser()
     add_parser(parser.add_subparsers())
     args = parser.parse_args(["dmm", *argv])
     with patch("fluid_build.cli.datamesh_manager.DataMeshManagerProvider", return_value=provider):
         code = args.func(args, logging.getLogger("test"))
-    return code, capsys.readouterr().out
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def _run(argv: Sequence[str], provider: FakeProvider, capsys) -> tuple:
+    code, out, _err = _run_full(argv, provider, capsys)
+    return code, out
 
 
 # ── the order ─────────────────────────────────────────────────────────────
@@ -234,6 +240,25 @@ class TestContractPaths:
         _write(tmp_path, "b", sub="p")
         found = resolve_contract_paths([str(tmp_path / "p" / "*.fluid.yaml")])
         assert [Path(p).name for p in found] == ["a.fluid.yaml", "b.fluid.yaml"]
+
+    def test_a_file_whose_name_holds_glob_characters_is_a_file_not_a_pattern(self, tmp_path):
+        weird = _write(tmp_path, "a[1]")
+        assert not needs_expansion([str(weird)])
+        assert resolve_contract_paths([str(weird)]) == [str(weird)]
+        sub = tmp_path / "sub"
+        _write(sub, "b")
+        found = resolve_contract_paths([str(weird), str(sub)])
+        assert [Path(p).name for p in found] == ["a[1].fluid.yaml", "b.fluid.yaml"]
+
+    def test_the_same_file_spelled_two_ways_is_named_once(self, tmp_path):
+        a = _write(tmp_path, "a")
+        again = str(tmp_path / "." / "a.fluid.yaml")
+        assert resolve_contract_paths([str(a), again, str(a)]) == [str(a)]
+
+    def test_a_path_that_does_not_exist_is_the_not_found_error(self, tmp_path):
+        with pytest.raises(CLIError) as exc:
+            resolve_contract_paths([str(tmp_path / "missing.fluid.yaml")])
+        assert exc.value.event == "contract_file_not_found"
 
     def test_a_folder_with_no_contract_is_the_batch_error_that_names_it(self, tmp_path):
         (tmp_path / "empty").mkdir()
@@ -492,6 +517,88 @@ class TestBatchLifecycleAndBlocking:
         assert provider.order == ["bronze.raw_orders"]  # silver failed, gold is blocked
         assert "upstream silver.orders did not publish" in out
         assert "1 published, 1 failed, 1 blocked" in out
+
+
+class TestBatchLoadFailures:
+    def test_a_contract_the_loader_refuses_blocks_its_consumers_by_the_id_it_declares(
+        self, tmp_path, capsys
+    ):
+        import fluid_build.cli.datamesh_manager as dmm
+
+        real_load = dmm.load_contract_with_overlay
+
+        def loader(path, env, log):
+            if Path(path).name == "up.fluid.yaml":
+                raise RuntimeError("cannot resolve a $ref")
+            return real_load(path, env, log)
+
+        (tmp_path / "up.fluid.yaml").write_text(
+            yaml.safe_dump(_contract("bronze.raw_orders")), encoding="utf-8"
+        )
+        _write(tmp_path, "gold.revenue", ["bronze.raw_orders"])
+        _write(tmp_path, "free.report")
+        provider = FakeProvider()
+        with patch.object(dmm, "load_contract_with_overlay", side_effect=loader):
+            code, out = _run(["publish", str(tmp_path)], provider, capsys)
+        assert code == 1
+        assert provider.order == ["free.report"]
+        assert "upstream bronze.raw_orders did not publish" in out
+        assert "1 published, 1 failed, 1 blocked" in out
+
+    def test_a_file_that_does_not_parse_names_no_product_and_fails_alone(self, tmp_path, capsys):
+        (tmp_path / "broken.fluid.yaml").write_text("id: [unclosed\n", encoding="utf-8")
+        _write(tmp_path, "good")
+        _write(tmp_path, "good2", ["nothing.here"])
+        provider = FakeProvider()
+        code, out = _run(["publish", str(tmp_path)], provider, capsys)
+        assert code == 1 and provider.order == ["good", "good2"]
+
+    def test_a_contract_whose_id_is_not_a_string_fails_alone(self, tmp_path, capsys):
+        bad = _contract("x")
+        bad["id"] = ["not", "a", "string"]
+        (tmp_path / "bad.fluid.yaml").write_text(yaml.safe_dump(bad), encoding="utf-8")
+        _write(tmp_path, "good")
+        _write(tmp_path, "good2")
+        provider = FakeProvider()
+        code, out = _run(["publish", str(tmp_path)], provider, capsys)
+        assert code == 1
+        assert provider.order == ["good", "good2"]
+        assert "the contract's id is not a string" in out
+
+    def test_what_the_validator_found_is_shown_with_its_file(self, tmp_path, capsys):
+        # No exposes: it loads and publishes in the default warn mode, with the findings shown.
+        broken = _contract("silver.orders")
+        del broken["exposes"]
+        (tmp_path / "silver.fluid.yaml").write_text(yaml.safe_dump(broken), encoding="utf-8")
+        _write(tmp_path, "gold.revenue")
+        provider = FakeProvider()
+        code, out, _err = _run_full(["publish", str(tmp_path)], provider, capsys)
+        assert code == 0
+        assert "silver.fluid.yaml:" in out
+        assert "'exposes' is a required property" in out
+        assert "Valid FLUID contract" not in out  # the all-clear banner stays out
+
+    def test_in_json_mode_the_findings_go_to_stderr_and_stdout_is_the_document(
+        self, tmp_path, capsys
+    ):
+        broken = _contract("silver.orders")
+        del broken["exposes"]
+        (tmp_path / "silver.fluid.yaml").write_text(yaml.safe_dump(broken), encoding="utf-8")
+        _write(tmp_path, "gold.revenue")
+        code, out, err = _run_full(
+            ["publish", str(tmp_path), "--format", "json"], FakeProvider(), capsys
+        )
+        assert code == 0
+        assert json.loads(out)["summary"]["published"] == 2
+        assert "'exposes' is a required property" in err
+
+    def test_a_dry_run_predicts_that_a_deprecated_product_keeps_its_status(self, products, capsys):
+        provider = FakeProvider(held={"loose.report": "deprecated"})
+        code, out = _run(
+            ["publish", str(products), "--status", "active", "--dry-run"], provider, capsys
+        )
+        assert code == 0
+        assert "loose.report (deprecated) - kept deprecated" in out
 
 
 # ── the single-contract path and the parser ───────────────────────────────

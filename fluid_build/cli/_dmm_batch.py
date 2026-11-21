@@ -69,6 +69,41 @@ def _validator_findings(text: str) -> str:
     return "\n".join(kept)
 
 
+def _relay_findings(label: str, printed: str, machine: bool) -> None:
+    """Show what the schema validator printed besides its all-clear banner, with the file it
+    belongs to: through the literal writer for people, on stderr when stdout carries the
+    JSON report."""
+    findings = _validator_findings(printed)
+    if not findings:
+        return
+    if machine:
+        sys.stderr.write(f"{label}:\n{findings}\n")
+        return
+    _say(f"{label}:")
+    for line in findings.splitlines():
+        _say(line)
+
+
+def _declared_id(label: str) -> Optional[str]:
+    """The product id a file declares, read as plain YAML, or ``None``.
+
+    For a contract the loader refused (an unresolvable ``$ref``, say): its id still names the
+    product the others consume, so they are blocked instead of published against a product
+    that is not there. A file that does not even parse names nothing.
+    """
+    from fluid_build.util.safe_yaml import MAX_YAML_BYTES, load_yaml_safe
+
+    try:
+        path = Path(label)
+        if path.stat().st_size > MAX_YAML_BYTES:
+            return None
+        document = load_yaml_safe(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - best effort: any failure means "names nothing"
+        return None
+    raw = document.get("id") if isinstance(document, dict) else None
+    return dmm_product_id(raw) if isinstance(raw, str) and raw.strip() else None
+
+
 def _say(text: str) -> None:
     """One line of output, literal (no markup) and never word-wrapped: an id or a path
     must stay on one line, also when the output is piped."""
@@ -145,28 +180,44 @@ class ItemOutcome:
 
 
 def needs_expansion(items: Sequence[str]) -> bool:
-    """Whether any argument is a folder or a glob pattern (so more than a file is named)."""
-    return any(Path(item).is_dir() or set("*?[") & set(item) for item in items)
+    """Whether any argument is a folder or a glob pattern (so more than a file is named).
+
+    An argument that exists as a file is a file whatever its name holds: ``a[1].fluid.yaml``
+    is a contract, not a pattern.
+    """
+    return any(
+        Path(item).is_dir() or (not Path(item).exists() and set("*?[") & set(item))
+        for item in items
+    )
 
 
 def resolve_contract_paths(items: Sequence[str]) -> List[str]:
-    """The contract files the arguments name, each once.
+    """The contract files the arguments name, each once (by resolved path), in the order met.
 
-    Files named outright are used as given (a ``.tgz`` bundle is a valid contract argument,
+    A file named outright is used as given (a ``.tgz`` bundle is a valid contract argument,
     as it is for the single publish); a folder or a glob pattern goes through the shared
     expansion (``cli/_contract_paths.py``), which searches a folder for ``*.fluid.yaml`` at
-    any depth and validates every path it returns.
+    any depth and validates every path it returns. A path that is neither (a file that does
+    not exist) is that expansion's ``contract_file_not_found`` error.
     """
-    if not needs_expansion(items):
-        seen: Dict[str, None] = {}
-        for item in items:
-            seen.setdefault(item, None)
-        return list(seen)
     from fluid_build.cli._contract_paths import contract_paths
 
-    return [
-        str(path) for _label, path in contract_paths(items, empty_event="dmm_batch_no_contracts")
-    ]
+    seen: Dict[Path, str] = {}
+    for item in items:
+        if Path(item).is_file():
+            found = [item]
+        else:
+            found = [
+                str(path)
+                for _label, path in contract_paths([item], empty_event="dmm_batch_no_contracts")
+            ]
+        for path in found:
+            try:
+                key = Path(path).resolve()
+            except (OSError, RuntimeError):
+                key = Path(path)
+            seen.setdefault(key, path)
+    return list(seen.values())
 
 
 # ---------------------------------------------------------------------------
@@ -276,15 +327,18 @@ def load_items(
                 contract = dmm.load_contract_with_overlay(label, overlay, log)
                 rc = dmm._validate_fluid_contract(contract, validation_mode, log)
         except Exception as exc:  # noqa: BLE001 - one unreadable contract must not stop the batch
-            failures.append(ItemOutcome(label, label, FAILED, _one_line(exc)))
+            declared = _declared_id(label)
+            failures.append(ItemOutcome(label, declared or label, FAILED, _one_line(exc)))
+            if declared:
+                failed_ids.add(declared)
             continue
         finally:
-            findings = _validator_findings(printed.getvalue())
-            if findings:
-                # Errors and warnings are shown with the file they belong to: on stdout for
-                # people, on stderr when stdout carries the JSON report.
-                print(f"{label}:\n{findings}", file=sys.stderr if machine else sys.stdout)
-        product_id = dmm_product_id(str(contract.get("id") or ""))
+            _relay_findings(label, printed.getvalue(), machine)
+        raw_id = contract.get("id")
+        if raw_id is not None and not isinstance(raw_id, str):
+            failures.append(ItemOutcome(label, label, FAILED, "the contract's id is not a string"))
+            continue
+        product_id = dmm_product_id(raw_id or "")
         if rc != 0:
             failures.append(
                 ItemOutcome(

@@ -746,7 +746,8 @@ class _PublishFlowMixin:
         product or over a retired one.
         """
         found, body = self._read_json_or_none(f"/api/dataproducts/{quote(product_id, safe='')}")
-        if found is None and must_read:
+        if must_read and (found is None or (found and not isinstance(body, dict))):
+            # Unreadable, or a 200 that is not a product (a proxy's page, ``null``, a list).
             raise ProviderError(
                 f"Could not read data product {product_id!r} from Entropy Data, so what it "
                 "holds is unknown and nothing was sent for it. See the warning above for the "

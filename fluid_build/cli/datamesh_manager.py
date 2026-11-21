@@ -188,7 +188,10 @@ def add_parser(subparsers):
         "-f",
         choices=["text", "json"],
         default="text",
-        help="Output format (default: text). json prints one machine-readable report.",
+        help=(
+            "Output format (default: text). json prints one machine-readable report: the batch "
+            "report for a folder, a glob or several contracts, the provider's result for one file."
+        ),
     )
     pub.add_argument(
         "--api-key",
@@ -511,6 +514,9 @@ def _cmd_promote(args, logger=None):
     except CLIError:
         raise
     except ProviderError as exc:
+        console_error(f"Error: {exc}")
+        return 1
+    except Exception as exc:  # a contract the loader cannot read, as in publish
         console_error(f"Error: {exc}")
         return 1
 
