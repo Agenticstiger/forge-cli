@@ -284,3 +284,41 @@ def test_a_copy_that_is_not_the_pinned_bytes_is_never_imported(
     with pytest.raises(runner_module.PackageError, match="not the one the job config pins"):
         runner_module.run_package(spark, runner_module.parse_config(json.dumps(config)), config_uri)
     assert "orders_pkg" not in sys.modules
+
+
+#: Statements Spark's own parser reads as a write, however the text hides the verb.
+HIDDEN_WRITES = [
+    "INSERT INTO fluid.commerce.orders_raw SELECT * FROM fluid.commerce.orders_raw",
+    "WITH a AS (SELECT 1 AS x) INSERT INTO t SELECT * FROM a",
+    "WITH a AS (SELECT 1 AS x) -- c\r INSERT INTO t SELECT * FROM a",
+    "FROM v INSERT INTO t SELECT *",
+    "/* SELECT */ INSERT INTO t SELECT 1",
+    "MERGE INTO t USING v ON t.id = v.id WHEN MATCHED THEN DELETE",
+    "DELETE FROM t WHERE x = 1",
+    "CREATE TABLE t AS SELECT 1",
+]
+#: Reads, as Spark's parser reads them.
+READS = [
+    "SELECT 1 -- a comment\rFROM t",
+    "WITH a AS (SELECT 1 AS x) SELECT comment, x FROM a",
+    "SELECT 'INSERT INTO t', `insert` FROM t",
+    "CREATE OR REPLACE TEMP VIEW v AS SELECT 1",
+]
+_WRITE_NODES = ("InsertInto", "MergeIntoTable", "DeleteFromTable", "UpdateTable", "CreateTable")
+
+
+def _parsed_write(spark, text: str) -> bool:
+    plan = spark._jsparkSession.sessionState().sqlParser().parsePlan(text)
+    return any(node in plan.toString() for node in _WRITE_NODES)
+
+
+@pytest.mark.parametrize("text", HIDDEN_WRITES)
+def test_the_sql_check_refuses_what_spark_parses_as_a_write(spark, runner_module, text):
+    assert _parsed_write(spark, text)
+    assert runner_module.sql_write(text) is not None
+
+
+@pytest.mark.parametrize("text", READS)
+def test_the_sql_check_allows_what_spark_parses_as_a_read(spark, runner_module, text):
+    assert not _parsed_write(spark, text)
+    assert runner_module.sql_write(text) is None

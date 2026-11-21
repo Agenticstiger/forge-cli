@@ -303,6 +303,8 @@ def test_the_context_is_read_only(runner):
     assert context.arguments["a"] == "b" and context.output == "fluid.db.t"
     with pytest.raises(AttributeError):
         context.output = "fluid.db.other"
+    with pytest.raises(AttributeError):
+        del context.arguments
     with pytest.raises(TypeError):
         context.arguments["a"] = "c"
 
@@ -316,6 +318,7 @@ def test_the_context_is_read_only(runner):
         "SELECT * FROM commerce.orders_raw",
         "  select 1",
         "-- the orders\nSELECT order_id FROM t",
+        "-- the orders\rSELECT order_id FROM t",
         "/* a /* nested */ comment */ SELECT 1",
         "WITH a AS (SELECT 1 AS x) SELECT comment, x FROM a",
         "WITH a AS (INSERT_ME) SELECT 1",  # a word, not the verb
@@ -366,6 +369,11 @@ def test_reads_pass_the_sql_check(runner, sql):
         ("FROM v INSERT INTO t SELECT *", "INSERT"),
         ("/* SELECT */ INSERT INTO t SELECT 1", "INSERT"),
         ("-- SELECT\nDELETE FROM t", "DELETE"),
+        # A lone carriage return ends a line comment, as Spark's lexer ends it.
+        ("WITH a AS (SELECT 1) -- c\r INSERT INTO t SELECT * FROM a", "INSERT"),
+        ("FROM v -- c\rINSERT INTO t SELECT *", "INSERT"),
+        # Spark reads a backslash-newline as more comment; reading the line as SQL refuses.
+        ("WITH a AS (SELECT 1) -- c\\\n INSERT INTO t SELECT * FROM a", "INSERT"),
         ("SELECT 'unterminated", "cannot read"),
         ("SELECT /* unterminated", "cannot read"),
         ("", "no statement"),
@@ -504,6 +512,15 @@ def test_every_difference_is_named(runner):
 )
 def test_a_type_must_be_the_declared_one_exactly(runner, actual, declared):
     assert runner.conformance_problems(_schema(("x", actual)), _schema(("x", declared)))
+
+
+@pytest.mark.parametrize("names", [("foo", "FOO"), ("Foo", "foo")])
+def test_names_that_differ_only_in_case_are_one_column(runner, names):
+    """Spark resolves names regardless of case: two of them are one ambiguous column."""
+    problems = runner.conformance_problems(
+        _schema(*((n, "string") for n in names)), _schema(("foo", "string"))
+    )
+    assert problems == [f"{names[0]}, {names[1]} differ only in case, and are one column to Spark"]
 
 
 def test_nullability_inside_arrays_and_maps_is_the_row_checks_business(runner):

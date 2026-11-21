@@ -1196,6 +1196,9 @@ class PackageContext:
     def __setattr__(self, name, value) -> None:
         raise AttributeError("the package context is read-only")
 
+    def __delattr__(self, name) -> None:
+        raise AttributeError("the package context is read-only")
+
 
 #: The PySpark calls that write, create a table or put more code on the cluster, refused
 #: while a package's entry point runs: ``(module, class, methods)``.
@@ -1395,10 +1398,13 @@ def _sql_tokens(text: str) -> list:
 
 
 def _end_of_comment(text: str, start: int) -> int:
-    """Past a ``--`` line comment, or a ``/* */`` one, which may nest as Spark's do."""
+    """Past a ``--`` line comment, or a ``/* */`` one, which may nest as Spark's do. A line
+    comment ends at the first carriage return or line feed, as Spark's lexer ends it
+    (``SIMPLE_COMMENT``); where Spark reads a backslash-newline as more comment, this reads
+    the next line as SQL, so it can only refuse more."""
     if text.startswith("--", start):
-        end = text.find("\n", start)
-        return len(text) if end < 0 else end + 1
+        ends = [i for i in (text.find("\r", start), text.find("\n", start)) if i >= 0]
+        return min(ends) + 1 if ends else len(text)
     depth, i = 1, start + 2
     while depth:
         if i >= len(text):
@@ -1487,9 +1493,19 @@ def conformance_problems(actual: dict, declared: dict) -> list:
     have = {f["name"]: f["type"] for f in actual.get("fields", [])}
     wanted = [(f["name"], f["type"]) for f in declared.get("fields", [])]
     folded = {name.casefold() for name, _ in wanted}
+    # Spark resolves names regardless of case: Amount and amount are one column to it.
+    groups: dict = {}
+    for name in names:
+        groups.setdefault(name.casefold(), []).append(name)
     problems = [
-        f"{_shown(name)} appears {names.count(name)} times"
-        for name in sorted({n for n in names if names.count(n) > 1})
+        (
+            f"{_shown(group[0])} appears {len(group)} times"
+            if len(set(group)) == 1
+            else f"{', '.join(_shown(n) for n in dict.fromkeys(group))} differ only in case, "
+            "and are one column to Spark"
+        )
+        for group in groups.values()
+        if len(group) > 1
     ]
     for name, kind in wanted:
         if name not in have:
