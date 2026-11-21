@@ -349,6 +349,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "a deterministic identity (e.g., 'fluid-bot <bot@example.com>')."
         ),
     )
+    _add_airflow_check_flags(p)
+    p.set_defaults(func=run)
+
+
+def _add_airflow_check_flags(p: argparse.ArgumentParser) -> None:
+    """``--airflow-*`` and ``--check-only``: wait until Airflow parsed the pushed files."""
     check = p.add_argument_group(
         "Airflow check (Airflow 2 and 3)",
         "After the push, wait until Airflow has parsed the pushed files with no import error.",
@@ -400,7 +406,6 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Push nothing; only check the files under --dags-dir in Airflow (after your own deploy).",
     )
-    p.set_defaults(func=run)
 
 
 # -----------------------------------------------------------------------------
@@ -1071,8 +1076,7 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
         commit_argv = [git, *commit_author_argv, "commit", "-m", commit_message]
         # The Airflow check waits for the commit the push leaves the branch at (an
         # Airflow 3 Git bundle reports it as each Dag's bundle_version).
-        head_argv = [git, "rev-parse", "HEAD"]
-        record_head = bool(getattr(args, "airflow_url", None))
+        head_argvs = [[git, "rev-parse", "HEAD"]] if getattr(args, "airflow_url", None) else []
         rsync_argvs = [
             [
                 rsync,
@@ -1128,13 +1132,10 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
                     dry_run=True,
                 ),
                 *(
-                    [
-                        _run_subprocess_with_cwd(
-                            head_argv, cwd=clone_dir, timeout=args.timeout, dry_run=True
-                        )
-                    ]
-                    if record_head
-                    else []
+                    _run_subprocess_with_cwd(
+                        argv, cwd=clone_dir, timeout=args.timeout, dry_run=True
+                    )
+                    for argv in head_argvs
                 ),
             ]
 
@@ -1198,12 +1199,10 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
                     results.append(result)
                     if result["exit_code"] != 0:
                         return results
-            if record_head:
-                results.append(
-                    _run_subprocess_with_cwd(
-                        head_argv, cwd=clone_dir, timeout=args.timeout, dry_run=False
-                    )
-                )
+            results.extend(
+                _run_subprocess_with_cwd(argv, cwd=clone_dir, timeout=args.timeout, dry_run=False)
+                for argv in head_argvs
+            )
         return results
 
     # SECURITY: every argv below that positions user-controlled strings
@@ -1730,18 +1729,8 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
     # The Airflow check signs in and reads once BEFORE the push: a check that cannot
     # run (wrong URL, credential or major) must not leave a pushed, unchecked deploy.
     if airflow_check is not None:
-        if args.dry_run:
-            airflow_check.plan()
-        else:
-            airflow_check.preflight()
-
-    if check_only:
-        cprint("[schedule-sync] --check-only: nothing is pushed", markup=False)
-        results: List[Dict[str, Any]] = []
-        superseded: List[Dict[str, Any]] = []
-    else:
-        results = dispatcher(dags_dir, args)
-        superseded = _report_superseded_scopes(dags_dir, args)
+        airflow_check.before_push(dry_run=args.dry_run)
+    results, superseded = _push(dispatcher, dags_dir, args, check_only)
 
     # ── Acquisition pattern: emit per-orchestrator artifacts ────────────
     # When the contract carries a Bronze ``pattern: acquisition`` build,
@@ -1798,15 +1787,12 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
             )
 
     airflow_report: Optional[Dict[str, Any]] = None
-    if airflow_check is not None and not args.dry_run:
-        if overall_exit == 0:
-            airflow_report = airflow_check.wait(results)
-            if airflow_report.get("result") != "passed":
-                overall_exit = 1
-        else:
-            from fluid_build.cli._schedule_sync_airflow import skipped_report
-
-            airflow_report = skipped_report("The push failed, so Airflow was not checked.")
+    if airflow_check is not None:
+        airflow_report = airflow_check.after_push(
+            results, pushed=overall_exit == 0, dry_run=args.dry_run
+        )
+    if airflow_report is not None and airflow_report.get("result") == "failed":
+        overall_exit = 1
 
     report = {
         "command": COMMAND,
@@ -1830,33 +1816,47 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
         )
         cprint(f"[schedule-sync] report → {report_path}", markup=False)
 
-    checked = airflow_report is not None and airflow_report.get("result") == "passed"
-    if overall_exit == 0 and check_only:
-        cprint("[schedule-sync] ✔ Airflow check passed", markup=False)
-    elif overall_exit == 0:
-        cprint(
-            f"[schedule-sync] ✔ {args.scheduler} sync complete ({len(results)} subprocess(es))"
-            + ("; Airflow parsed the pushed files" if checked else ""),
-            markup=False,
-        )
-    elif airflow_report is not None and airflow_report.get("result") == "failed":
-        cprint(
-            "[schedule-sync] ✘ "
-            + (
-                "Airflow check failed"
-                if check_only
-                else f"{args.scheduler} sync pushed, but the Airflow check failed"
-            )
-            + " (see above; the report's airflow_check block names each file)",
-            markup=False,
-        )
-    else:
-        cprint(
-            f"[schedule-sync] ✘ {args.scheduler} sync failed (see logs for argv + stderr tail)",
-            markup=False,
-        )
-
+    cprint(
+        _outcome_line(args.scheduler, len(results), overall_exit, airflow_report, check_only),
+        markup=False,
+    )
     return overall_exit
+
+
+def _push(
+    dispatcher: Any, dags_dir: Path, args: argparse.Namespace, check_only: bool
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """The dispatch and its superseded-scope report; nothing under ``--check-only``."""
+    if check_only:
+        cprint("[schedule-sync] --check-only: nothing is pushed", markup=False)
+        return [], []
+    return dispatcher(dags_dir, args), _report_superseded_scopes(dags_dir, args)
+
+
+def _outcome_line(
+    scheduler: str,
+    subprocesses: int,
+    overall_exit: int,
+    airflow_report: Optional[Dict[str, Any]],
+    check_only: bool,
+) -> str:
+    """The stage's last line: the push, and the Airflow check when one ran."""
+    result = (airflow_report or {}).get("result")
+    if overall_exit == 0 and check_only:
+        return "[schedule-sync] ✔ Airflow check passed"
+    if overall_exit == 0:
+        checked = "; Airflow parsed the pushed files" if result == "passed" else ""
+        return (
+            f"[schedule-sync] ✔ {scheduler} sync complete ({subprocesses} subprocess(es)){checked}"
+        )
+    if result == "failed":
+        what = (
+            "Airflow check failed"
+            if check_only
+            else f"{scheduler} sync pushed, but the Airflow check failed"
+        )
+        return f"[schedule-sync] ✘ {what} (see above; the report's airflow_check block names each file)"
+    return f"[schedule-sync] ✘ {scheduler} sync failed (see logs for argv + stderr tail)"
 
 
 def _airflow_flags_given(args: argparse.Namespace) -> bool:

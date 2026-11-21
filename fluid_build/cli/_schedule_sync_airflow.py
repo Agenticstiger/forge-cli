@@ -21,6 +21,7 @@ Imported only when ``--airflow-url`` is set (``httpx`` comes with it).
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -74,32 +75,20 @@ def pushed_git_head(results: List[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+@dataclass
 class AirflowCheck:
     """One ``--airflow-url`` check, from its flags to its report block."""
 
-    def __init__(
-        self,
-        *,
-        base_url: str,
-        api: str,
-        wait_s: int,
-        bundle: Optional[str],
-        bundle_version: Optional[str],
-        check_only: bool,
-        scheme: Optional[str],
-        indirect: bool,
-        files: List[chk.DagFile],
-    ) -> None:
-        self.base_url = base_url
-        self.api = api
-        self.wait_s = wait_s
-        self.bundle = bundle
-        self.bundle_version = bundle_version
-        self.check_only = check_only
-        self.scheme = scheme
-        self.indirect = indirect
-        self.files = files
-        self.client: Optional[AirflowApi] = None
+    base_url: str
+    api: str
+    wait_s: int
+    bundle: Optional[str]
+    bundle_version: Optional[str]
+    check_only: bool
+    scheme: Optional[str]
+    indirect: bool
+    files: List[chk.DagFile]
+    client: Optional[AirflowApi] = None
 
     # 1 ── flags ─────────────────────────────────────────────────────────
 
@@ -219,6 +208,13 @@ class AirflowCheck:
 
     # 2 ── before the push ───────────────────────────────────────────────
 
+    def before_push(self, *, dry_run: bool) -> None:
+        """``--dry-run`` plans the check; otherwise sign in and read once, or raise."""
+        if dry_run:
+            self.plan()
+        else:
+            self.preflight()
+
     def preflight(self) -> None:
         try:
             credentials = credentials_from_env()
@@ -238,6 +234,17 @@ class AirflowCheck:
         )
 
     # 4 ── after the push ────────────────────────────────────────────────
+
+    def after_push(
+        self, results: List[Dict[str, Any]], *, pushed: bool, dry_run: bool
+    ) -> Optional[Dict[str, Any]]:
+        """The report's ``airflow_check`` block: ``None`` on a dry run, ``skipped`` when the
+        push failed, otherwise the outcome of :meth:`wait`."""
+        if dry_run:
+            return None
+        if not pushed:
+            return skipped_report("The push failed, so Airflow was not checked.")
+        return self.wait(results)
 
     def wait(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Wait for the parse; the report's ``airflow_check`` block (``result`` says pass)."""
