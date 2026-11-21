@@ -883,3 +883,22 @@ def test_a_jinja_field_that_never_closes_costs_a_bounded_look_ahead():
         started = time.monotonic()
         A._shell_commands(text, {})
         assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "command -v spark-submit",
+        "if ! command -v spark-submit >/dev/null; then echo missing; fi",
+        "hash spark-submit",
+        "dirname $(which spark-submit)",
+        "readlink -f /opt/spark/bin/spark-submit",
+    ],
+)
+def test_asking_where_spark_submit_is_does_not_run_it(command):
+    assert bash_submits(command) == []
+
+
+def test_command_in_front_of_spark_submit_still_runs_it():
+    (submit,) = bash_submits("command spark-submit job.py")
+    assert submit.script == "job.py"

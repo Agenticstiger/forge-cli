@@ -863,6 +863,7 @@ _NOT_EXECUTING = frozenset(
         "type", "whereis", "man", "ls", "rm", "cp", "mv", "ln", "vi", "vim", "nano", "less",
         "more", "head", "tail", "wc", "touch", "mkdir", "read", "export", "set", "unset", "alias",
         "cd", "source", ".", "tee", "find", "sed", "awk", "diff", "stat", "chmod", "chown",
+        "hash", "file", "readlink", "realpath", "dirname", "basename",
     }
 )  # fmt: skip
 #: ``spark-submit`` options that take the next word as their value (``--opt=value`` is one word).
@@ -1030,6 +1031,8 @@ def _spark_submit_in_words(words: Sequence[Any], depth: int = 0) -> Optional[Tup
         name = word.rsplit("/", 1)[-1]
         if name in _NOT_EXECUTING:
             return None
+        if name == "command" and index + 1 < len(words) and words[index + 1] in ("-v", "-V"):
+            return None  # `command -v spark-submit` asks where it is
         if name in _SHELLS:
             return _in_shell(words[index + 1 :], depth)
     return None
