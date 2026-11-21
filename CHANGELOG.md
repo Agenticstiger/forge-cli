@@ -20,6 +20,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written to `--out`, and looks at nothing else, so a migration can require the id to stay while
   every other change is free. Without it the diff only reports.
 
+- **`fluid verify` holds an Iceberg table to its freshness objective.** An AWS binding with
+  `format: iceberg` cataloged in Glue (the default on AWS) used to be reported as skipped; it goes
+  through the Glue and Athena checks now: columns, location, row count, masking and storage
+  policies. When its expose declares `qos.freshnessSLO`, a second Athena query reads the table's
+  `$snapshots` metadata table, and a new `freshness` dimension in the `--out` report holds the
+  age of the newest write to that objective: the commit time, the snapshot id and operation, the
+  age (computed by Athena, so this machine's clock is not in it) and the verdict. A compaction
+  (the `replace` operation) is not a write, so rewriting files never makes a stale table look
+  fresh. A missed objective is CRITICAL, so `--strict` fails on it and `--warn-only` grades it
+  WARNING; a table no snapshot wrote to fails (skipped for a reference-only contract); an
+  objective with no fixed length (`P1M`, `P1Y`) is reported as not checked; a query that cannot
+  run is an error, as for a storage policy. Athena does not evaluate Lake Formation for an
+  Iceberg table's metadata tables and refuses `$snapshots` when the table has row or cell
+  filters or the principal cannot see every column, so verify needs a principal that can read
+  the whole table; the error says so. An Iceberg table that was skipped is checked now, so it can
+  fail where Glue or Athena access is not set up. Parquet tables are unchanged.
+
 - **`fluid datamesh-manager publish` takes a folder, and `fluid datamesh-manager promote` moves
   drafts to active.** `publish` accepts contract files, glob patterns and folders (a folder is
   searched for `*.fluid.yaml` at any depth, the way `fluid genie apply` already searches one; the
