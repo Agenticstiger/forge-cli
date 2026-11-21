@@ -58,6 +58,15 @@ _KEY_QUALIFIERS = frozenset(
     }
 )  # fmt: skip
 _NAME_PARTS = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
+#: A name that ends in one of these holds a reference to a secret, not the secret
+#: (``--password-file``, ``--token-url``, ``--secret-name``): its value is left to the free-text
+#: scan, which still finds a password inside a URL.
+_REFERENCE_SUFFIXES = frozenset(
+    {
+        "file", "path", "dir", "directory", "id", "name", "provider", "class", "type", "env",
+        "var", "ref", "url", "uri", "endpoint", "host", "port", "location", "store",
+    }
+)  # fmt: skip
 _PASSWORD_SHORT_FLAGS = frozenset({"-p", "-P", "-w"})
 #: ``-u user:password`` (and ``--user``): the part after the colon is the password.
 _USER_FLAGS = frozenset({"-u", "--user", "--proxy-user"})
@@ -97,12 +106,15 @@ def sensitive_name(name: str) -> bool:
     name = name.strip().lstrip("-")
     if not name:
         return False
+    listed = [part.lower() for part in _NAME_PARTS.split(name) if part]
+    if listed and listed[-1] in _REFERENCE_SUFFIXES:
+        return False  # ``--password-file``: a path to a secret is not the secret
     if is_sensitive_key_name(name.replace("-", "_")):
         return True
     joined = re.sub(r"[^a-z0-9]", "", name.lower())
     if any(part in joined for part in _SECRET_SUBSTRINGS):
         return True
-    words = {part.lower() for part in _NAME_PARTS.split(name) if part}
+    words = set(listed)
     if words & _SECRET_WORDS:
         return True
     return bool(words & {"key", "keys"}) and bool(words & _KEY_QUALIFIERS)

@@ -662,3 +662,44 @@ def test_a_task_that_submits_one_job_twice_is_one_entry_on_the_build(tmp_path, m
     assert [t["taskId"] for t in tasks] == ["t"]
     assert any("submits this job more than once" in n for n in report.notes)
     valid(contract)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "spark-submit --master yarn --deploy-mode cluster --conf spark.executor.memory=4g --py-files s3://b/deps.zip s3://b/job.py --date {{ ds }}",
+        "hdfs dfs -mkdir -p /data/{{ ds }}",
+        "aws s3 cp s3://bucket/key.csv /tmp/key.csv --region eu-west-1",
+        "kubectl apply -f deploy.yaml -n prod",
+        "docker run --rm -v /data:/data -e ENV=prod img:latest python run.py --key id",
+        """curl -s -X POST -H "Content-Type: application/json" -d '{"a": 1}' https://api.example.com/v1/x""",
+        'psql -h db -U app -d warehouse -c "select 1"',
+        "git clone https://github.com/org/repo.git && cd repo && git checkout -b feature",
+        """dbt run --select tag:daily --target prod --vars '{"run_date": "{{ ds }}"}'""",
+        'echo "done" > /tmp/flag; cat /tmp/flag',
+        "bq query --use_legacy_sql=false 'SELECT 1'",
+        "sqoop import --connect jdbc:mysql://h/db --username app --password-file /user/app/pw --table t",
+        "spark-submit --keytab /etc/x.keytab --principal app@REALM job.py",
+        "tool --secret-name prod/db --token-url https://auth.example.com/token --access-key-id AKIA0000",
+        "tar -czf out.tgz -C /data . && scp -P 2222 out.tgz host:/x",
+    ],
+)
+def test_realistic_commands_that_hold_no_secret_come_out_as_they_went_in(command):
+    assert safe_command(command) == command
+
+
+def test_a_path_to_a_secret_is_not_the_secret_and_a_url_in_a_url_flag_is_still_scanned():
+    userinfo = "admin" + ":" + "pw" + "@"
+    shown = safe_command(
+        f"tool --password-file /run/pw --token-url https://{userinfo}auth.example.com/t"
+    )
+    assert "--password-file /run/pw" in shown
+    assert "pw@" not in shown and "***REDACTED***" in shown
+
+
+def test_a_partition_directory_is_not_a_credential_unless_its_key_is_one():
+    from fluid_build.cli.import_workflow._redact import scrub_path
+
+    kept = "s3://bucket/dt=2026-01-01/region=eu/key=abc/part-0.parquet"
+    assert scrub_path(kept) == kept
+    assert scrub_path("s3://bucket/password=abc/x") == "s3://bucket/password=REDACTED/x"
