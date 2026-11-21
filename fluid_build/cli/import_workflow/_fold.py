@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from ._pysource import (
-    MAX_CACHED_BYTES,
+    MAX_CACHED_NODES,
     Module,
     SourceBudget,
     SourceFile,
@@ -161,18 +161,26 @@ class Scope:
     classes: Dict[str, ast.ClassDef] = field(default_factory=dict)
 
 
+_DYNAMIC_NAMES = frozenset({"globals", "vars", "locals", "setattr", "delattr", "exec", "eval"})
+
+
 def _rebound_names(tree: ast.AST) -> Dict[str, str]:
     """Names the file changes after they are bound, which the single assignment a scope sees does
     not fix: a ``global`` or ``nonlocal`` declaration, an item or attribute assigned
-    (``CFG["t"] = ...``), a mutating method called on the name (``CFG.update(...)``) and ``del``.
+    (``CFG["t"] = ...``), a mutating method called on the name (``CFG.update(...)``), ``del``, an
+    assignment expression (``(T := ...)``), a ``match`` capture and a ``type`` alias; a name that
+    is another name (``D = C``) is changed when either is. A file that reaches names by string
+    (``globals()``, ``vars()``, ``setattr``, ``exec``) is ``"*"``: no name in it is trusted.
     One pass over the tree, without recursion. ``{name: why}``."""
     out: Dict[str, str] = {}
+    aliases: List[Tuple[str, str]] = []
 
     def base(node: ast.AST) -> Optional[str]:
         while isinstance(node, (ast.Subscript, ast.Attribute)):
             node = node.value
         return node.id if isinstance(node, ast.Name) else None
 
+    in_place = "is changed in place elsewhere in the file"
     for node in ast.walk(tree):
         if isinstance(node, (ast.Global, ast.Nonlocal)):
             for name in node.names:
@@ -186,13 +194,59 @@ def _rebound_names(tree: ast.AST) -> Dict[str, str]:
                 if isinstance(target, (ast.Subscript, ast.Attribute)):
                     name = base(target)
                     if name is not None:
-                        out.setdefault(name, f"`{name}` is changed in place elsewhere in the file")
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if node.func.attr in _MUTATORS:
-                name = base(node.func.value)
+                        out.setdefault(name, f"`{name}` {in_place}")
+                elif isinstance(target, ast.Name) and isinstance(node, ast.Delete):
+                    out.setdefault(target.id, f"`{target.id}` is deleted elsewhere in the file")
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Name)
+                and all(isinstance(t, ast.Name) for t in node.targets)
+            ):
+                aliases.extend((t.id, node.value.id) for t in node.targets)  # type: ignore[attr-defined]
+        elif isinstance(node, ast.NamedExpr):
+            name = node.target.id
+            out.setdefault(name, f"`{name}` is assigned by an assignment expression")
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            out.setdefault(node.name, f"`{node.name}` is bound by a match pattern")
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            out.setdefault(node.rest, f"`{node.rest}` is bound by a match pattern")
+        elif hasattr(ast, "TypeAlias") and isinstance(node, ast.TypeAlias):
+            name = node.name.id
+            out.setdefault(name, f"`{name}` is bound by a type alias")
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr in _MUTATORS:
+                name = base(func.value)
                 if name is not None:
-                    out.setdefault(name, f"`{name}` is changed in place elsewhere in the file")
+                    out.setdefault(name, f"`{name}` {in_place}")
+            elif isinstance(func, ast.Name) and func.id in _DYNAMIC_NAMES:
+                out.setdefault("*", f"the file reaches names by string ({func.id}(...))")
+        elif isinstance(node, ast.Attribute) and node.attr == "__dict__":
+            out.setdefault("*", "the file reaches names by string (__dict__)")
+    _spread_to_aliases(out, aliases, in_place)
     return out
+
+
+def _spread_to_aliases(out: Dict[str, str], aliases: List[Tuple[str, str]], in_place: str) -> None:
+    """``D = C`` makes ``D`` another name for the same object: a change through either is a change
+    to both. Names joined by an alias are one group, and a group with a changed name is changed."""
+    parent: Dict[str, str] = {}
+
+    def find(name: str) -> str:
+        while parent.get(name, name) != name:
+            parent[name] = parent.get(parent[name], parent[name])
+            name = parent[name]
+        return name
+
+    for left, right in aliases:
+        parent[find(left)] = find(right)
+    changed = {find(name) for name, why in out.items() if in_place in why}
+    if not changed:
+        return
+    for left, right in aliases:
+        for name in (left, right):
+            if find(name) in changed:
+                out.setdefault(name, f"`{name}` {in_place}")
 
 
 def _target_names(target: ast.AST) -> List[str]:
@@ -457,10 +511,13 @@ class ModuleIndex:
     ) -> None:
         self.variables: Mapping[str, str] = dict(variables or {})
         self._dotted: Dict[str, List[SourceFile]] = {}
-        #: Parsed modules, least recently used first, at most ``MAX_CACHED_BYTES`` of source
-        #: between them: a scan of thousands of files keeps a few, not all, in memory.
+        #: Parsed modules, least recently used first, at most ``MAX_CACHED_NODES`` syntax-tree
+        #: nodes between them: a scan of thousands of files keeps a few, not all, in memory.
         self._modules: "OrderedDict[str, Module]" = OrderedDict()
-        self._cached_bytes = 0
+        self._cached_nodes = 0
+        #: Where a dotted name is found, by ``(name, importing file)``: the answer does not change
+        #: and a name many files answer to costs a pass over them.
+        self._located: Dict[Tuple[str, str], Union[Tuple[SourceFile, List[str]], str]] = {}
         self._folders: Dict[str, "Folder"] = {}
         self.unreadable: Dict[str, str] = {}
         #: What this scan has read, in all: every read of a source file counts against it.
@@ -488,10 +545,10 @@ class ModuleIndex:
             self.unreadable[source.rel] = str(exc)
             return None
         self._modules[source.rel] = module
-        self._cached_bytes += module.size
-        while self._cached_bytes > MAX_CACHED_BYTES and len(self._modules) > 1:
+        self._cached_nodes += module.nodes
+        while self._cached_nodes > MAX_CACHED_NODES and len(self._modules) > 1:
             rel, old = self._modules.popitem(last=False)
-            self._cached_bytes -= old.size
+            self._cached_nodes -= old.nodes
             self._folders.pop(rel, None)  # a folder is only kept with its module
         return module
 
@@ -532,6 +589,29 @@ class ModuleIndex:
         ``config.paths.ORDERS`` is the module ``config.paths`` and ``["ORDERS"]`` (or the module
         ``config`` and ``["paths", "ORDERS"]``: the longest module name wins).
         """
+        located = self._locate(qualified, from_rel)
+        if isinstance(located, str):
+            return located
+        source, chain = located
+        module = self.load(source)
+        if module is None:
+            return f"the module `{qualified.rsplit('.', len(chain))[0]}` cannot be read"
+        return module, chain
+
+    def _locate(self, qualified: str, from_rel: str) -> Union[Tuple[SourceFile, List[str]], str]:
+        """The file holding ``qualified`` and the attribute chain inside it, or why there is
+        none. Remembered: nothing here depends on what has been read."""
+        key = (qualified, from_rel)
+        found = self._located.get(key)
+        if found is not None:
+            return found
+        found = self._locate_uncached(qualified, from_rel)
+        self._located[key] = found
+        return found
+
+    def _locate_uncached(
+        self, qualified: str, from_rel: str
+    ) -> Union[Tuple[SourceFile, List[str]], str]:
         parts = self._absolute(qualified, from_rel).split(".")
         for cut in range(len(parts) - 1, 0, -1):
             dotted = ".".join(parts[:cut])
@@ -539,10 +619,7 @@ class ModuleIndex:
             if len(candidates) > 1:
                 return f"more than one scanned file answers to the module name `{dotted}`"
             if len(candidates) == 1:
-                module = self.load(candidates[0])
-                if module is None:
-                    return f"the module `{dotted}` cannot be read"
-                return module, parts[cut:]
+                return candidates[0], parts[cut:]
         return f"`{qualified}` is not in the scanned files"
 
 
@@ -892,8 +969,9 @@ class Folder:
         current: Optional[Scope] = scope
         while current is not None:
             if name in current.values:
-                if name in self._rebound:
-                    return Unresolved(self._rebound[name], snippet(origin))
+                why = self._rebound.get(name) or self._rebound.get("*")
+                if why:
+                    return Unresolved(why, snippet(origin))
                 return self.fold(current.values[name], current, depth)
             if name in current.blocked:
                 why = current.blocked[name]
@@ -930,8 +1008,9 @@ class Folder:
         scope = self._module_scope
         if len(chain) == 1:
             return self.name_value(chain[0], scope, depth + 1, origin)
-        if chain[0] in self._rebound:
-            return Unresolved(self._rebound[chain[0]], snippet(origin))
+        why = self._rebound.get(chain[0]) or self._rebound.get("*")
+        if why:
+            return Unresolved(why, snippet(origin))
         cls = scope.classes.get(chain[0])
         if cls is None or len(chain) > 2:
             return Unresolved(f"`{'.'.join(chain)}` is not a constant", snippet(origin))
@@ -1060,11 +1139,16 @@ class Folder:
             return Unresolved("a join of values that are not all text", snippet(node))
         if method in _STR_METHODS and all(isinstance(arg, str) for arg in args):
             if method in {"lower", "upper"} and not args:
-                return getattr(receiver, method)()
+                changed = getattr(receiver, method)()  # a case change can lengthen a string
+                return _too_long(changed) or changed
             if method in {"strip", "lstrip", "rstrip"} and len(args) <= 1:
                 return getattr(receiver, method)(*args)
             if method == "replace" and len(args) == 2:
-                replaced = receiver.replace(args[0], args[1])
+                old, new = args
+                times = receiver.count(old) if old else len(receiver) + 1
+                if len(receiver) + times * (len(new) - len(old)) > MAX_STRING:
+                    return Unresolved(f"it is longer than {MAX_STRING} characters", "")
+                replaced = receiver.replace(old, new)
                 return _too_long(replaced) or replaced
             if method in {"removeprefix", "removesuffix"} and len(args) == 1:
                 return getattr(receiver, method)(args[0])

@@ -684,13 +684,13 @@ def test_only_a_few_modules_stay_parsed_and_one_that_was_dropped_is_read_again(
     files["job.py"] = "from m0 import V0\nx = V0\n"
     _write(tmp_path, files)
     walk = P.find_python_files(tmp_path)
-    monkeypatch.setattr(F, "MAX_CACHED_BYTES", 40)  # room for about two of these files
+    monkeypatch.setattr(F, "MAX_CACHED_NODES", 11)  # room for two of these files (5 nodes each)
     index = ModuleIndex(walk.files)
     by_rel = {f.rel: f for f in walk.files}
     for i in range(1, 5):
         assert index.load(by_rel[f"m{i}.py"]) is not None
     assert len(index._modules) <= 3 and "m1.py" not in index._modules  # the oldest were dropped
-    assert index._cached_bytes == sum(m.size for m in index._modules.values())
+    assert index._cached_nodes == sum(m.nodes for m in index._modules.values())
     assert set(index._folders) <= set(index._modules)  # a folder is not kept without its module
     # m0 was never loaded; the job's import reads it, whatever has been dropped
     job = index.load(by_rel["job.py"])
@@ -709,3 +709,115 @@ def test_a_module_the_index_did_not_load_gets_a_folder_nobody_keeps(tmp_path):
     stranger = P.parse_module("dag.py", b"Y = 2\n")
     first, second = index.folder(stranger), index.folder(stranger)
     assert first is not second and not index._folders
+
+
+# ── names the file changes in ways a single assignment does not show ──
+
+
+def _value_of(source: str, name: str = "X"):
+    module = P.parse_module("m.py", source.encode("utf-8"))
+    for node in module.tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == name
+        ):
+            return Folder(module).fold(node.value)
+    raise AssertionError(f"no assignment to {name}")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'T = "a"\nif (T := "b"):\n    pass\nX = T\n',
+        'T = "a"\nmatch 1:\n    case T:\n        pass\nX = T\n',
+        'T = "a"\ndel T\nX = T\n',
+        'C = {"t": "x"}\nD = C\nD["t"] = "y"\nX = C["t"]\n',
+        'C = {"t": "x"}\nD = C\nC.update(t="y")\nX = D["t"]\n',
+        'T = "a"\nglobals()["T"] = "b"\nX = T\n',
+        'T = "a"\nvars()["T"] = "b"\nX = T\n',
+        'T = "a"\nsetattr(mod, "T", "b")\nX = T\n',
+        'T = "a"\nmod.__dict__["T"] = "b"\nX = T\n',
+    ],
+)
+def test_a_name_the_file_changes_by_any_route_is_not_a_constant(source):
+    value = _value_of(source)
+    assert isinstance(value, Unresolved), value
+
+
+def test_a_name_nothing_changes_still_folds_beside_names_that_are_changed():
+    value = _value_of('T = "a"\nU = "b"\nif (U := "c"):\n    pass\nX = T\n')
+    assert value == "a"
+
+
+def test_a_type_alias_rebinds_its_name_on_python_312():
+    if not hasattr(ast, "TypeAlias"):
+        pytest.skip("type aliases are Python 3.12")
+    assert isinstance(_value_of('T = "a"\ntype T = int\nX = T\n'), Unresolved)
+
+
+# ── what a string method costs is judged before it is paid ────────────
+
+
+def test_a_replace_that_would_be_too_long_is_not_built():
+    import resource
+
+    big = "a" * 4000
+    source = f'A = "{big}"\nB = "{big}"\nX = A.replace("a", B)\nY = A.replace("", B)\n'
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    for name in ("X", "Y"):
+        value = _value_of(source, name)
+        assert isinstance(value, Unresolved) and "longer than" in value.why
+    grown = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before
+    assert grown < 40 * 1024 * 1024  # a 16 MB string is not built (ru_maxrss: bytes on macOS)
+
+
+def test_a_case_change_that_lengthens_a_string_past_the_limit_is_refused():
+    text = "\u00df" * 3000  # upper() makes it SS: twice as long
+    value = _value_of(f'A = "{text}"\nX = A.upper()\n')
+    assert isinstance(value, Unresolved) and "longer than" in value.why
+
+
+# ── a scan's cost does not grow with what a name could be ─────────────
+
+
+def test_a_name_many_files_answer_to_is_looked_up_once(tmp_path):
+    files = {f"p{i}/config.py": f"T = 'v{i}'\n" for i in range(300)}
+    files["job.py"] = "from config import T\nx = T\n"
+    _write(tmp_path, files)
+    walk = P.find_python_files(tmp_path)
+    index = ModuleIndex(walk.files)
+    calls = []
+    original = index._candidates
+
+    def counting(dotted, from_rel):
+        calls.append(dotted)
+        return original(dotted, from_rel)
+
+    index._candidates = counting  # type: ignore[method-assign]
+    for _ in range(50):
+        assert isinstance(index.resolve("config.T", "job.py"), str)  # 300 files answer to it
+    assert len(calls) == 1
+
+
+def test_an_enormous_expression_is_described_without_being_unparsed():
+    import time
+
+    source = "x = " + "(" * 150 + "f(" + "a," * 60_000 + ")" + "+1)" * 150 + "\n"
+    module = P.parse_module("big.py", source.encode("utf-8"))
+    node = module.tree.body[0].value  # type: ignore[attr-defined]
+    started = time.monotonic()
+    for _ in range(200):
+        assert P.snippet(node) == "<expression>"
+    assert time.monotonic() - started < 0.5
+
+
+def test_braces_are_counted_in_the_encoding_the_parser_reads():
+    fields = "+AHsAYgB9-" * 60_000  # {b} in UTF-7, 60,000 of them
+    hostile = ("# coding: utf-7\n" + "c = f'" + fields + "'\n").encode("ascii")
+    assert hostile.count(b"{") == 0  # the bytes hold none
+    with pytest.raises(P.SourceUnreadable) as refused:
+        P.parse_module("utf7.py", hostile)
+    assert "more than 50,000 '{' characters" in str(refused.value)
+    latin = "# coding: latin-1\nx = '\xe9'\n".encode("latin-1")
+    assert P.parse_module("latin.py", latin).nodes > 0

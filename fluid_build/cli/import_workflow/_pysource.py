@@ -23,7 +23,9 @@ is still seen, and read only what is literal).
 from __future__ import annotations
 
 import ast
+import io
 import os
+import tokenize
 import unicodedata
 import warnings
 from dataclasses import dataclass, field
@@ -36,9 +38,10 @@ MAX_FILE_BYTES = 1_000_000
 #: that grows with the square of its fields (a 900 KB file of ``{b}`` fields takes 15 s and
 #: 500 MB); a job or a DAG file has a few hundred braces.
 MAX_BRACES = 50_000
-#: Source one scan reads in all, and the most source kept parsed at once.
+#: Source one scan reads in all, and the most syntax-tree nodes kept parsed at once (about
+#: 150 MB: a node of a dense file costs about 300 bytes with the parent links the readers build).
 MAX_TOTAL_BYTES = 64 * 1024 * 1024
-MAX_CACHED_BYTES = 4 * 1024 * 1024
+MAX_CACHED_NODES = 400_000
 #: Most Python files one walk keeps, and directory entries it reads, and levels it descends.
 MAX_FILES = 5_000
 MAX_ENTRIES = 50_000
@@ -215,12 +218,26 @@ class Module:
     _parents: Optional[Dict[ast.AST, ast.AST]] = None
     #: Bytes of source it was parsed from.
     size: int = 0
+    #: How many syntax-tree nodes it has: what keeping it parsed costs.
+    nodes: int = 0
 
     @property
     def parents(self) -> Dict[ast.AST, ast.AST]:
         if self._parents is None:
             self._parents = parent_map(self.tree)
         return self._parents
+
+
+def _braces(data: bytes) -> int:
+    """How many ``{`` the source has once it is decoded as Python decodes it: a coding cookie
+    (``# coding: utf-7``) changes the bytes a brace is written in, and the parser follows it."""
+    try:
+        encoding, _lines = tokenize.detect_encoding(io.BytesIO(data).readline)
+    except (SyntaxError, LookupError, ValueError):
+        return data.count(b"{")  # a cookie the parser refuses too: it reports it
+    if encoding.lower().replace("_", "-") in ("utf-8", "utf-8-sig"):
+        return data.count(b"{")
+    return data.decode(encoding, "replace").count("{")
 
 
 def parse_module(rel: str, data: bytes) -> Module:
@@ -230,7 +247,7 @@ def parse_module(rel: str, data: bytes) -> Module:
         SourceUnreadable: it is not valid Python for this interpreter, or too deeply nested
             to parse; the reason carries no source text.
     """
-    if data.count(b"{") > MAX_BRACES:
+    if _braces(data) > MAX_BRACES:
         raise SourceUnreadable(
             f"it has more than {MAX_BRACES:,} '{{' characters, more than a job or a DAG file has: "
             "it is not read"
@@ -244,7 +261,13 @@ def parse_module(rel: str, data: bytes) -> Module:
         raise SourceUnreadable(f"it is not valid Python{where}: {exc.msg}") from exc
     except (ValueError, RecursionError, MemoryError, OverflowError) as exc:
         raise SourceUnreadable(f"it cannot be parsed ({type(exc).__name__})") from exc
-    return Module(rel=rel, tree=tree, imports=import_table(tree), size=len(data))
+    return Module(
+        rel=rel,
+        tree=tree,
+        imports=import_table(tree),
+        size=len(data),
+        nodes=sum(1 for _ in ast.walk(tree)),
+    )
 
 
 def import_table(tree: ast.AST) -> Dict[str, str]:
@@ -328,9 +351,23 @@ def clean_chars(text: object) -> str:
     return "".join(out)
 
 
+def _is_large(node: ast.AST) -> bool:
+    """Whether ``node`` spans too much source to be worth unparsing for a short description:
+    unparsing a subtree costs its size, and a report line may ask for it at every level."""
+    first = getattr(node, "lineno", None)
+    last = getattr(node, "end_lineno", None)
+    if first is None or last is None:
+        return False
+    if last - first > 40:
+        return True
+    return last == first and (getattr(node, "end_col_offset", 0) - node.col_offset) > 2000
+
+
 def snippet(node: ast.AST, limit: int = 80) -> str:
     """A short, single-line rendering of an expression, for a report. Never raises: a tree
     too deep to unparse is shown as ``<expression>``."""
+    if _is_large(node):
+        return "<expression>"
     try:
         text = ast.unparse(node)
     except (RecursionError, ValueError, MemoryError):
