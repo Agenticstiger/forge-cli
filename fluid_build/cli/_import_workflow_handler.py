@@ -458,4 +458,4 @@ def _print_report(report) -> None:
     if report.notes:
         cprint("\n  Notes:")
         for x in report.notes:
-            _line(f"    – {x}")
+            _line(f"    • {x}")
