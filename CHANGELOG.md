@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid datamesh-manager publish` takes a folder, and `fluid datamesh-manager promote` moves
+  drafts to active.** `publish` accepts contract files, glob patterns and folders (a folder is
+  searched for `*.fluid.yaml` at any depth, the way `fluid genie apply` already searches one; the
+  expansion is now one shared helper). Several contracts publish as one batch, each product
+  after the products it consumes (`consumes[].productId`, a standard-library topological sort in
+  a stable order). A loop of products that consume each other, two files declaring one product
+  id, and a folder with no contract are refused before anything is sent, each with a stable
+  error code. The product list is read once for the batch, and the access-agreement pre-flight
+  reuses it instead of listing every product again. A product that fails blocks only the
+  products that consume it, the others go on, and a re-run resumes. `--status draft|active`
+  manages the lifecycle: `draft` never demotes a product Entropy already holds as active, and a
+  retired product is skipped, because Entropy keeps it retired. `--format json` prints one
+  report. `promote` moves draft products to active, named by contract or with `--id`;
+  `--verify-report` (a `fluid verify --out` file, or a folder of them) promotes only the products
+  whose newest report is clean (no error or mismatch, at least one port checked, no drift in the
+  reconcile, state-drift or lineage sections) and exits 1 for the rest. A publish without
+  `--status` behaves as before.
+
 - **`fluid profile` counts children per parent for each declared relationship.** When one call
   profiles both exposes of a `semantics.relationships` entry, without `--bundle`, the
   document's `relationships[]` (PROFILE-SPEC §5, format unchanged) carries a

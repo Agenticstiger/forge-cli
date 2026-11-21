@@ -1,0 +1,505 @@
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
+
+"""``fluid datamesh-manager publish`` over a folder of contracts: upstreams first, per-product
+outcomes, a lifecycle status.
+
+The provider is a stand-in that records what it is asked; the contracts are real files that
+go through the real loader and validator.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import random
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence
+from unittest.mock import patch
+
+import pytest
+import yaml
+
+from fluid_build._contract_loader import CLIError
+from fluid_build.cli._dmm_batch import (
+    BatchItem,
+    needs_expansion,
+    refuse_duplicate_ids,
+    resolve_contract_paths,
+    upstream_first,
+)
+from fluid_build.cli.datamesh_manager import add_parser
+from fluid_build.providers.base import ProviderError
+from fluid_build.providers.datamesh_manager._ids import dmm_product_id
+from fluid_build.providers.datamesh_manager._lifecycle import ProductRetiredError
+
+# ── fixtures ──────────────────────────────────────────────────────────────
+
+
+def _contract(product_id: str, upstreams: Sequence[str] = ()) -> Dict[str, Any]:
+    contract: Dict[str, Any] = {
+        "fluidVersion": "0.7.7",
+        "kind": "DataProduct",
+        "id": product_id,
+        "name": product_id,
+        "metadata": {"layer": "Silver", "owner": {"team": "retail"}},
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "kind": "table",
+                "binding": {
+                    "platform": "local",
+                    "format": "parquet",
+                    "location": {"path": f"out/{product_id}.parquet"},
+                },
+                "contract": {"schema": [{"name": "order_id", "type": "VARCHAR"}]},
+            }
+        ],
+    }
+    if upstreams:
+        contract["consumes"] = [{"productId": u, "exposeId": "orders"} for u in upstreams]
+    return contract
+
+
+def _write(folder: Path, product_id: str, upstreams: Sequence[str] = (), sub: str = "") -> Path:
+    target = folder / sub / f"{product_id}.fluid.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(yaml.safe_dump(_contract(product_id, upstreams)), encoding="utf-8")
+    return target
+
+
+def _items(graph: Dict[str, Iterable[str]]) -> List[BatchItem]:
+    return [
+        BatchItem(f"{pid}.fluid.yaml", _contract(pid, tuple(ups)), dmm_product_id(pid), tuple(ups))
+        for pid, ups in graph.items()
+    ]
+
+
+class FakeProvider:
+    """What the batch needs of the provider, recording what it is asked."""
+
+    def __init__(
+        self,
+        held: Iterable[str] = (),
+        fail: Iterable[str] = (),
+        retired: Iterable[str] = (),
+        held_unreadable: bool = False,
+        odcs_failed: Iterable[str] = (),
+    ) -> None:
+        self.held = set(held)
+        self.fail = set(fail)
+        self.retired = set(retired)
+        self.held_unreadable = held_unreadable
+        self.odcs_failed = set(odcs_failed)
+        self.held_reads = 0
+        self.applied: List[Dict[str, Any]] = []
+
+    def _require_api_key(self) -> None:
+        return None
+
+    def _held_product_ids(self) -> Optional[set]:
+        self.held_reads += 1
+        return None if self.held_unreadable else set(self.held)
+
+    def apply(self, contract: Dict[str, Any], **kw: Any) -> Dict[str, Any]:
+        pid = dmm_product_id(contract["id"])
+        self.applied.append({"id": pid, **kw, "held_seen": set(kw.get("held_product_ids") or ())})
+        if pid in self.fail:
+            raise ProviderError(f"Entropy Data API error 422 on PUT /api/dataproducts/{pid}")
+        if pid in self.retired:
+            raise ProductRetiredError(pid)
+        if kw.get("dry_run"):
+            return {"dry_run": True, "url": f"https://api.example.test/api/dataproducts/{pid}"}
+        result: Dict[str, Any] = {
+            "success": True,
+            "product_id": pid,
+            "url": f"https://app.example.test/dataproducts/{pid}",
+        }
+        if kw.get("status"):
+            result["status"] = kw["status"]
+        if pid in self.odcs_failed:
+            result["odcs_contracts"] = [{"contract_id": f"{pid}.orders", "success": False}]
+        return result
+
+    @property
+    def order(self) -> List[str]:
+        return [a["id"] for a in self.applied]
+
+
+def _run(argv: Sequence[str], provider: FakeProvider, capsys) -> tuple:
+    parser = argparse.ArgumentParser()
+    add_parser(parser.add_subparsers())
+    args = parser.parse_args(["dmm", *argv])
+    with patch("fluid_build.cli.datamesh_manager.DataMeshManagerProvider", return_value=provider):
+        code = args.func(args, logging.getLogger("test"))
+    return code, capsys.readouterr().out
+
+
+# ── the order ─────────────────────────────────────────────────────────────
+
+
+class TestUpstreamFirst:
+    def test_a_chain_publishes_each_product_after_the_one_it_consumes(self):
+        ordered = upstream_first(_items({"c": ["b"], "b": ["a"], "a": []}))
+        assert [i.product_id for i in ordered] == ["a", "b", "c"]
+
+    def test_a_wave_is_sorted_by_id_and_waves_follow_dependencies(self):
+        graph = {"gold": ["silver_b", "silver_a"], "silver_b": ["bronze"], "silver_a": ["bronze"]}
+        graph["bronze"] = []
+        ordered = [i.product_id for i in upstream_first(_items(graph))]
+        assert ordered == ["bronze", "silver_a", "silver_b", "gold"]
+
+    def test_the_same_products_give_the_same_order_whatever_the_input_order(self):
+        graph = {"e": ["c", "d"], "d": ["b"], "c": ["a"], "b": [], "a": [], "f": []}
+        expected = [i.product_id for i in upstream_first(_items(graph))]
+        for seed in range(8):
+            keys = list(graph)
+            random.Random(seed).shuffle(keys)
+            shuffled = _items({k: graph[k] for k in keys})
+            assert [i.product_id for i in upstream_first(shuffled)] == expected
+
+    def test_an_upstream_outside_the_batch_is_not_waited_for(self):
+        ordered = upstream_first(_items({"mine": ["held.elsewhere"], "other": []}))
+        assert [i.product_id for i in ordered] == ["mine", "other"]
+
+    def test_a_product_that_consumes_itself_is_not_a_loop(self):
+        assert [i.product_id for i in upstream_first(_items({"a": ["a"]}))] == ["a"]
+
+    def test_an_upstream_is_matched_by_the_id_entropy_knows_it_by(self):
+        # ``consumes[].productId`` is as written; the product is known by its slug.
+        ordered = upstream_first(_items({"consumer": ["Silver.Orders"], "Silver.Orders": []}))
+        assert [i.product_id for i in ordered] == ["silver.orders", "consumer"]
+
+    def test_a_loop_is_refused_and_named(self):
+        with pytest.raises(CLIError) as exc:
+            upstream_first(_items({"a": ["c"], "b": ["a"], "c": ["b"], "free": []}))
+        assert exc.value.event == "dmm_batch_dependency_cycle"
+        assert exc.value.error_slug == "ERR_DMM_BATCH_DEPENDENCY_CYCLE"
+        message = exc.value.context["error"]
+        for pid in ("a", "b", "c"):
+            assert f"{pid} reads from" in message
+        assert "free" not in message
+        assert exc.value.suggestions
+
+    def test_a_pair_that_consume_each_other_is_a_loop(self):
+        with pytest.raises(CLIError, match="dmm_batch_dependency_cycle"):
+            upstream_first(_items({"x": ["y"], "y": ["x"]}))
+
+    def test_two_files_declaring_one_product_are_refused(self):
+        items = _items({"a": [], "b": []})
+        items.append(BatchItem("copy.fluid.yaml", _contract("A"), "a"))
+        with pytest.raises(CLIError) as exc:
+            refuse_duplicate_ids(items)
+        assert exc.value.event == "dmm_batch_duplicate_product"
+        assert "a in a.fluid.yaml, copy.fluid.yaml" in exc.value.context["error"]
+
+
+# ── which contracts ───────────────────────────────────────────────────────
+
+
+class TestContractPaths:
+    def test_files_named_outright_are_used_as_given_once_each(self, tmp_path):
+        a = _write(tmp_path, "a")
+        assert resolve_contract_paths([str(a), str(a)]) == [str(a)]
+        assert not needs_expansion([str(a)])
+
+    def test_a_folder_is_searched_at_any_depth_in_name_order(self, tmp_path):
+        _write(tmp_path, "b", sub="gold")
+        _write(tmp_path, "a", sub="bronze/deep")
+        (tmp_path / "notes.yaml").write_text("not: a contract\n", encoding="utf-8")
+        found = resolve_contract_paths([str(tmp_path)])
+        assert [Path(p).name for p in found] == ["a.fluid.yaml", "b.fluid.yaml"]
+        assert needs_expansion([str(tmp_path)])
+
+    def test_ignored_and_build_folders_are_not_searched(self, tmp_path):
+        _write(tmp_path, "keep")
+        _write(tmp_path, "vendored", sub="node_modules/pkg")
+        _write(tmp_path, "built", sub="dist")
+        assert [Path(p).name for p in resolve_contract_paths([str(tmp_path)])] == [
+            "keep.fluid.yaml"
+        ]
+
+    def test_a_glob_pattern_is_expanded(self, tmp_path):
+        _write(tmp_path, "a", sub="p")
+        _write(tmp_path, "b", sub="p")
+        found = resolve_contract_paths([str(tmp_path / "p" / "*.fluid.yaml")])
+        assert [Path(p).name for p in found] == ["a.fluid.yaml", "b.fluid.yaml"]
+
+    def test_a_folder_with_no_contract_is_the_batch_error_that_names_it(self, tmp_path):
+        (tmp_path / "empty").mkdir()
+        with pytest.raises(CLIError) as exc:
+            resolve_contract_paths([str(tmp_path / "empty")])
+        assert exc.value.event == "dmm_batch_no_contracts"
+        assert "holds no" in exc.value.context["error"]
+        assert exc.value.suggestions
+
+
+# ── the batch run ─────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def products(tmp_path) -> Path:
+    """gold consumes silver, silver consumes bronze; one loose product."""
+    _write(tmp_path, "gold.revenue", ["silver.orders"])
+    _write(tmp_path, "silver.orders", ["bronze.raw_orders"])
+    _write(tmp_path, "bronze.raw_orders")
+    _write(tmp_path, "loose.report")
+    return tmp_path
+
+
+class TestBatchRun:
+    def test_every_product_follows_the_products_it_consumes(self, products, capsys):
+        provider = FakeProvider()
+        code, out = _run(["publish", str(products)], provider, capsys)
+        assert code == 0
+        order = provider.order
+        assert order.index("bronze.raw_orders") < order.index("silver.orders")
+        assert order.index("silver.orders") < order.index("gold.revenue")
+        assert "4 published" in out
+        assert "upstream products first" in out
+
+    def test_the_product_list_is_read_once_for_the_whole_batch(self, products, capsys):
+        provider = FakeProvider(held={"already.there"})
+        _run(["publish", str(products)], provider, capsys)
+        assert provider.held_reads == 1
+        # Each publish is told what Entropy holds, including what this run published before it.
+        by_id = {a["id"]: a["held_seen"] for a in provider.applied}
+        assert by_id["bronze.raw_orders"] >= {"already.there"}
+        assert "bronze.raw_orders" in by_id["silver.orders"]
+        assert {"bronze.raw_orders", "silver.orders"} <= by_id["gold.revenue"]
+
+    def test_the_status_and_the_other_flags_reach_every_publish(self, products, capsys):
+        provider = FakeProvider()
+        code, out = _run(
+            [
+                "publish",
+                str(products),
+                "--status",
+                "draft",
+                "--team-id",
+                "retail",
+                "--with-contract",
+            ],
+            provider,
+            capsys,
+        )
+        assert code == 0
+        assert {a["status"] for a in provider.applied} == {"draft"}
+        assert {a["team_id"] for a in provider.applied} == {"retail"}
+        assert all(a["publish_contract"] for a in provider.applied)
+        assert "(draft)" in out
+
+    def test_a_failed_product_blocks_only_the_products_that_consume_it(self, products, capsys):
+        provider = FakeProvider(fail={"silver.orders"})
+        code, out = _run(["publish", str(products)], provider, capsys)
+        assert code == 1
+        assert "gold.revenue" not in provider.order  # blocked: never sent
+        assert {"bronze.raw_orders", "silver.orders", "loose.report"} <= set(provider.order)
+        assert "blocked" in out and "upstream silver.orders did not publish" in out
+        assert "FAILED" in out
+        assert "2 published, 1 failed, 1 blocked" in out
+        assert "run resumes" in out
+
+    def test_blocking_follows_the_chain_to_the_end(self, products, capsys):
+        provider = FakeProvider(fail={"bronze.raw_orders"})
+        code, out = _run(["publish", str(products)], provider, capsys)
+        assert code == 1
+        assert provider.order.count("silver.orders") == 0
+        assert provider.order.count("gold.revenue") == 0
+        assert "upstream bronze.raw_orders did not publish" in out
+        assert "upstream silver.orders did not publish" in out
+
+    def test_a_retired_product_is_skipped_and_the_run_stays_green(self, products, capsys):
+        provider = FakeProvider(retired={"loose.report"})
+        code, out = _run(["publish", str(products), "--status", "draft"], provider, capsys)
+        assert code == 0
+        assert "skipped" in out and "stays retired" in out
+        assert "1 skipped" in out
+
+    def test_a_retired_upstream_does_not_block_its_consumers(self, products, capsys):
+        provider = FakeProvider(retired={"bronze.raw_orders"})
+        code, _ = _run(["publish", str(products), "--status", "draft"], provider, capsys)
+        assert code == 0
+        assert "silver.orders" in provider.order and "gold.revenue" in provider.order
+
+    def test_a_dry_run_previews_every_product_and_sends_none(self, products, capsys):
+        provider = FakeProvider()
+        code, out = _run(["publish", str(products), "--dry-run"], provider, capsys)
+        assert code == 0
+        assert all(a["dry_run"] for a in provider.applied)
+        assert "Previewing" in out and "would publish" in out
+        assert "Next: verify" not in out
+
+    def test_json_is_one_report_with_the_order_and_every_outcome(self, products, capsys):
+        provider = FakeProvider(fail={"loose.report"})
+        code, out = _run(["publish", str(products), "--format", "json"], provider, capsys)
+        report = json.loads(out)
+        assert code == 1
+        assert report["dry_run"] is False
+        assert report["order"].index("bronze.raw_orders") < report["order"].index("gold.revenue")
+        outcomes = {r["product_id"]: r["outcome"] for r in report["results"]}
+        assert outcomes["loose.report"] == "failed"
+        assert outcomes["gold.revenue"] == "published"
+        assert report["summary"]["failed"] == 1
+        assert report["summary"]["published"] == 3
+
+    def test_an_upstream_nothing_holds_is_named_not_failed(self, tmp_path, capsys):
+        _write(tmp_path, "consumer", ["ghost.product"])
+        _write(tmp_path, "other")
+        provider = FakeProvider(held={"unrelated"})
+        code, out = _run(["publish", str(tmp_path)], provider, capsys)
+        assert code == 0
+        assert "consumer consumes ghost.product" in out
+        assert "points at nothing yet" in out
+
+    def test_an_upstream_entropy_holds_is_not_reported(self, tmp_path, capsys):
+        _write(tmp_path, "consumer", ["held.upstream"])
+        _write(tmp_path, "other")
+        provider = FakeProvider(held={"held.upstream"})
+        _, out = _run(["publish", str(tmp_path)], provider, capsys)
+        assert "points at nothing yet" not in out
+
+    def test_when_the_list_cannot_be_read_no_upstream_is_called_missing(self, tmp_path, capsys):
+        _write(tmp_path, "consumer", ["ghost.product"])
+        _write(tmp_path, "other")
+        provider = FakeProvider(held_unreadable=True)
+        code, out = _run(["publish", str(tmp_path)], provider, capsys)
+        assert code == 0
+        assert "points at nothing yet" not in out
+
+    def test_a_contract_that_cannot_be_loaded_fails_alone(self, tmp_path, capsys):
+        _write(tmp_path, "good")
+        _write(tmp_path, "good2")
+        (tmp_path / "broken.fluid.yaml").write_text("id: [unclosed\n", encoding="utf-8")
+        provider = FakeProvider()
+        code, out = _run(["publish", str(tmp_path)], provider, capsys)
+        assert code == 1
+        assert provider.order == ["good", "good2"]
+        assert "FAILED" in out and "broken.fluid.yaml" in out
+
+    def test_a_contract_without_an_id_fails_alone(self, tmp_path, capsys):
+        _write(tmp_path, "good")
+        _write(tmp_path, "good2")
+        noid = _contract("x")
+        del noid["id"]
+        (tmp_path / "noid.fluid.yaml").write_text(yaml.safe_dump(noid), encoding="utf-8")
+        provider = FakeProvider()
+        code, out = _run(["publish", str(tmp_path)], provider, capsys)
+        assert code == 1
+        assert sorted(provider.order) == ["good", "good2"]
+
+    def test_two_files_with_one_id_stop_the_run_before_anything_is_sent(self, tmp_path, capsys):
+        _write(tmp_path, "a", sub="one")
+        _write(tmp_path, "a", sub="two")
+        _write(tmp_path, "b")
+        provider = FakeProvider()
+        with pytest.raises(CLIError) as exc:
+            _run(["publish", str(tmp_path)], provider, capsys)
+        assert exc.value.event == "dmm_batch_duplicate_product"
+        assert provider.applied == []
+
+    def test_a_loop_stops_the_run_before_anything_is_sent(self, tmp_path, capsys):
+        _write(tmp_path, "a", ["b"])
+        _write(tmp_path, "b", ["a"])
+        provider = FakeProvider()
+        with pytest.raises(CLIError) as exc:
+            _run(["publish", str(tmp_path)], provider, capsys)
+        assert exc.value.event == "dmm_batch_dependency_cycle"
+        assert provider.applied == []
+
+    def test_an_odcs_contract_failure_leaves_the_product_published_and_the_run_red(
+        self, products, capsys
+    ):
+        provider = FakeProvider(odcs_failed={"loose.report"})
+        code, out = _run(
+            ["publish", str(products), "--with-contract", "--fail-on-contract-error"],
+            provider,
+            capsys,
+        )
+        assert code == 1
+        assert "4 published" in out
+
+    def test_several_files_named_outright_are_a_batch_too(self, tmp_path, capsys):
+        gold = _write(tmp_path, "gold", ["silver"])
+        silver = _write(tmp_path, "silver")
+        provider = FakeProvider()
+        code, _ = _run(["publish", str(gold), str(silver)], provider, capsys)
+        assert code == 0
+        assert provider.order == ["silver", "gold"]
+
+
+# ── the single-contract path and the parser ───────────────────────────────
+
+
+class TestSingleAndParser:
+    def test_one_file_keeps_the_single_publish_output(self, tmp_path, capsys):
+        only = _write(tmp_path, "solo")
+        provider = FakeProvider()
+        code, out = _run(["publish", str(only), "--status", "active"], provider, capsys)
+        assert code == 0
+        assert provider.applied[0]["status"] == "active"
+        assert "Published" in out
+        assert "upstream products first" not in out
+
+    def test_one_contract_in_a_folder_is_a_single_publish(self, tmp_path, capsys):
+        _write(tmp_path, "solo")
+        provider = FakeProvider()
+        code, out = _run(["publish", str(tmp_path)], provider, capsys)
+        assert code == 0
+        assert provider.order == ["solo"]
+        assert "upstream products first" not in out
+
+    def test_a_typed_error_reaches_the_cli_handler_instead_of_being_printed_flat(
+        self, tmp_path, capsys
+    ):
+        (tmp_path / "empty").mkdir()
+        with pytest.raises(CLIError) as exc:
+            _run(["publish", str(tmp_path / "empty")], FakeProvider(), capsys)
+        assert exc.value.event == "dmm_batch_no_contracts"
+
+    def test_a_retired_product_on_a_single_publish_is_an_error_that_says_why(
+        self, tmp_path, capsys
+    ):
+        only = _write(tmp_path, "solo")
+        code, _ = _run(
+            ["publish", str(only), "--status", "draft"], FakeProvider(retired={"solo"}), capsys
+        )
+        assert code == 1
+
+    def test_single_publish_json_is_the_provider_result(self, tmp_path, capsys):
+        only = _write(tmp_path, "solo")
+        code, out = _run(["publish", str(only), "--format", "json"], FakeProvider(), capsys)
+        assert code == 0
+        assert json.loads(out)["product_id"] == "solo"
+
+    def test_publish_takes_several_contracts_a_status_and_a_format(self):
+        parser = argparse.ArgumentParser()
+        add_parser(parser.add_subparsers())
+        args = parser.parse_args(["dmm", "publish", "a", "b/", "c*", "--status", "draft"])
+        assert args.contract == ["a", "b/", "c*"]
+        assert args.status == "draft"
+        assert args.format == "text"
+        with pytest.raises(SystemExit):
+            parser.parse_args(["dmm", "publish", "a", "--status", "retired"])
+        with pytest.raises(SystemExit):
+            parser.parse_args(["dmm", "publish"])
+
+    def test_the_cold_help_path_does_not_load_the_batch_modules(self):
+        import subprocess
+        import sys
+
+        code = (
+            "import sys; import fluid_build.cli.datamesh_manager as m; "
+            "import argparse; p = argparse.ArgumentParser(); m.add_parser(p.add_subparsers()); "
+            "heavy = [n for n in ('fluid_build.cli._dmm_batch', 'fluid_build.cli._dmm_promote', "
+            "'httpx', 'requests') if n in sys.modules]; print(heavy)"
+        )
+        out = subprocess.run(
+            [sys.executable, "-I", "-c", code],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={"PYTHONPATH": str(Path(__file__).resolve().parents[2])},
+        ).stdout.strip()
+        assert out == "[]"
