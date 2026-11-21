@@ -80,7 +80,13 @@ class SqlFacts:
 
 
 def _holes_text(text: str, holes: Dict[str, str]) -> str:
-    return _HOLE_RE.sub(lambda m: "{" + holes.get(m.group(0), "?") + "}", text)
+    def shown(match: "re.Match[str]") -> str:
+        inner = holes.get(match.group(0), "?")
+        # A placeholder written in the SQL text (``${db}``, ``{db}``, ``%(db)s``) shows as
+        # written; the expression of an f-string field is put in braces.
+        return inner if inner.startswith(("{", "$", "%")) else "{" + inner + "}"
+
+    return _HOLE_RE.sub(shown, text)
 
 
 def _name_of(table: Any, holes: Dict[str, str]) -> Optional[SqlName]:

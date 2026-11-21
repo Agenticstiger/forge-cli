@@ -89,6 +89,24 @@ _TERMINALS = frozenset(
 
 _PLAIN_TABLE = re.compile(r"[A-Za-z0-9_$`.\-]+")
 
+#: A placeholder a templating layer fills in later, in SQL that is not an f-string: ``${db}``,
+#: ``{db}``, ``{{ db }}``, ``%(db)s``. The SQL parser would read the text around it as a name.
+_PLACEHOLDER = re.compile(
+    r"\$\{[^}\s]*\}|\{\{[^}]*\}\}|\{[A-Za-z_][A-Za-z0-9_.]*\}|%\([A-Za-z_][A-Za-z0-9_]*\)s"
+)
+
+
+def _placeholders_to_holes(text: str, holes: Dict[str, str]) -> str:
+    """``text`` with each placeholder replaced by a hole token (as an f-string field that does not
+    fold is), so the name around it is reported as unresolved, not read as another table."""
+
+    def token(match: "re.Match[str]") -> str:
+        name = _spark_sql.HOLE.format(len(holes))
+        holes[name] = match.group(0)
+        return name
+
+    return _PLACEHOLDER.sub(token, text)
+
 
 @dataclass(frozen=True)
 class HelperSpec:
@@ -265,6 +283,12 @@ class _Reader:
                 name = self.folder.string(call.args[0])
                 if isinstance(name, str):
                     self.temp_views.add(name.lower())
+                else:
+                    self.facts.notes.append(
+                        f"{self.file}:{call.lineno} registers a temporary view under a name that "
+                        "is not a constant: a read of a table this file does not name may be "
+                        "that view"
+                    )
             elif func.attr in {"config", "set"} and len(call.args) >= 2:
                 key = self.folder.string(call.args[0])
                 if key == "spark.sql.streaming.checkpointLocation":
@@ -356,9 +380,10 @@ class _Reader:
             return
         if attr not in _TERMINALS:
             return
-        links, _root = self._links(call)
+        links, root = self._links(call)
         marker = self._marker(links)
         if marker is None:
+            self._note_unfollowed(call, root, attr)
             return
         own = links[marker + 1 :]
         start = links[marker]
@@ -368,6 +393,29 @@ class _Reader:
             self._on_write(call, own, streaming=start.name == "writeStream", start=start)
         elif start.call is not None and start.name == "writeTo":
             self._on_write_v2(call, own, start)
+
+    def _note_unfollowed(self, call: ast.Call, root: ast.AST, attr: str) -> None:
+        """A read or write made through a variable that is assigned more than once cannot be
+        followed (which assignment is meant depends on the order the code runs in): say so."""
+        if not (isinstance(root, ast.Name) and self.facts.is_spark):
+            return
+        scope = self.folder.scope_of(root)
+        current: Optional[Any] = scope
+        while current is not None:
+            why = current.blocked.get(root.id)
+            if why is not None:
+                if "assigned more than once" in why:
+                    note = (
+                        f"{self.file}:{call.lineno} .{attr}(...) is called on "
+                        f"`{root.id}`, which is assigned more than once: the read or write it "
+                        "makes is not followed"
+                    )
+                    if note not in self.facts.notes:
+                        self.facts.notes.append(note)
+                return
+            if root.id in current.values or root.id in current.classes:
+                return
+            current = current.parent
 
     def _on_session(self, receiver: ast.AST) -> bool:
         name = None
@@ -529,7 +577,7 @@ class _Reader:
                     f"constant ({value.why})"
                 )
             return
-        sql = _spark_sql.analyze(value, holes)
+        sql = _spark_sql.analyze(_placeholders_to_holes(value, holes), holes)
         self.temp_views.update(sql.temp_views)
         for note in sql.notes:
             self.facts.notes.append(f"{self.file}:{call.lineno} {note}")
@@ -907,6 +955,11 @@ class _Reader:
                 f"{self.file}: {self.parameter_named} read(s) or write(s) take a table, path "
                 "or SQL from a function parameter: this looks like a helper. Name it under "
                 "`helpers` in the conventions file, and its call sites are read instead"
+            )
+        if self.folder.exhausted:
+            facts.notes.append(
+                f"{self.file}: folding stopped early (the file asks for too much work): some "
+                "names are reported as not constant"
             )
         facts.reads = _unique(facts.reads)
         facts.writes = _unique(facts.writes)

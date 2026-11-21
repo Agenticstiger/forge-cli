@@ -680,3 +680,117 @@ def test_the_reader_does_not_run_the_job(tmp_path):
         """
     )
     assert not marker.exists()
+
+
+# ── what the reader cannot follow is said, not dropped ────────────────
+
+
+def test_a_placeholder_in_sql_that_is_not_an_f_string_is_a_hole_not_a_table():
+    facts = job(
+        """
+        from pyspark.sql import SparkSession
+        spark = SparkSession.builder.getOrCreate()
+        spark.sql("INSERT INTO ${env}.orders SELECT * FROM {src}.events JOIN retail.users")
+        spark.sql("SELECT * FROM %(db)s.clicks")
+        spark.sql("SELECT * FROM {{ db }}.sessions")
+        """
+    )
+    resolved = [r for r in facts.reads if r.name]
+    unresolved = [r for r in facts.reads if not r.name]
+    assert [r.name for r in resolved] == ["retail.users"]
+    assert sorted(r.shown for r in unresolved) == [
+        "%(db)s.clicks",
+        "{src}.events",
+        "{{ db }}.sessions",
+    ]
+    assert all(r.why for r in unresolved)
+    [write] = facts.writes
+    assert not write.name and write.shown == "${env}.orders" and write.why
+
+
+def test_a_placeholder_inside_a_string_literal_is_harmless():
+    facts = job(
+        """
+        spark = SparkSession.builder.getOrCreate()
+        spark.sql("SELECT * FROM retail.orders WHERE dt = '{{ ds }}' AND k = '${key}'")
+        """
+    )
+    assert reads(facts) == [("table", "retail.orders")]
+
+
+def test_a_temp_view_registered_under_a_name_that_is_not_a_constant_is_noted():
+    facts = job(
+        """
+        from pyspark.sql import SparkSession
+        spark = SparkSession.builder.getOrCreate()
+        df = spark.table("retail.orders")
+        df.createOrReplaceTempView(view_name)
+        spark.table("whatever")
+        """
+    )
+    assert any("temporary view" in note and "not a constant" in note for note in facts.notes)
+    assert [n for n in facts.notes if "temporary view" in n][0].startswith("job.py:5 ")
+
+
+def test_a_reader_variable_assigned_twice_is_not_followed_and_the_note_says_so():
+    facts = job(
+        """
+        from pyspark.sql import SparkSession
+        spark = SparkSession.builder.getOrCreate()
+        reader = spark.read.format("parquet")
+        if flag:
+            reader = spark.read.format("csv")
+        df = reader.load("s3://bucket/in/")
+        """
+    )
+    assert facts.reads == []
+    [note] = [n for n in facts.notes if "assigned more than once" in n]
+    assert note.startswith("job.py:7 ") and ".load(...)" in note and "`reader`" in note
+
+
+def test_a_writer_variable_assigned_twice_is_not_followed_and_the_note_says_so():
+    facts = job(
+        """
+        from pyspark.sql import SparkSession
+        spark = SparkSession.builder.getOrCreate()
+        out = df.write.mode("append")
+        out = df.write.mode("overwrite")
+        out.saveAsTable("retail.totals")
+        """
+    )
+    assert facts.writes == []
+    assert any("assigned more than once" in n and "`out`" in n for n in facts.notes)
+
+
+def test_a_variable_assigned_once_is_still_followed_without_a_note():
+    facts = job(
+        """
+        from pyspark.sql import SparkSession
+        spark = SparkSession.builder.getOrCreate()
+        reader = spark.read.format("parquet")
+        df = reader.load("s3://bucket/in/")
+        """
+    )
+    assert reads(facts) == [("path", "s3://bucket/in/")]
+    assert not [n for n in facts.notes if "assigned more than once" in n]
+
+
+def test_folding_that_runs_out_of_budget_is_said_once_for_the_file():
+    lines = ['x0 = ""']
+    for level in range(1, 11):
+        lines.append(f'x{level} = f"' + ("{x%d}" % (level - 1)) * 300 + '"')
+    source = "\n".join(
+        [
+            "from pyspark.sql import SparkSession",
+            "spark = SparkSession.builder.getOrCreate()",
+            *lines,
+            'spark.read.parquet(x10 + "/a")',
+            'spark.read.parquet(x10 + "/b")',
+        ]
+    )
+    facts = job(source)
+    assert [n for n in facts.notes if "folding stopped early" in n] == [
+        "job.py: folding stopped early (the file asks for too much work): some names are "
+        "reported as not constant"
+    ]
+    assert all(not r.name for r in facts.reads)
