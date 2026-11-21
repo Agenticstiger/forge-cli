@@ -238,7 +238,8 @@ def _run_release_status(args: argparse.Namespace, logger: logging.Logger) -> int
         sys.stdout.write("\n")
     else:
         for line in rs.report(args.product_id, answers, found, on, environment):
-            cprint_literal(line)
+            # soft_wrap: piped (a CI log), the console is 80 columns and would cut a digest
+            cprint_literal(line, soft_wrap=True)
     return 0 if any(a.at_start or a.during for a in answers) else 1
 
 

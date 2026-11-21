@@ -350,6 +350,9 @@ def describe(release: Release) -> List[str]:
         v for v in (release.source.get(k) for k in ("revision", "repository", "ref")) if v
     )
     lines.append(f"  code     {code}" if code else "  code     (the record names no source)")
+    if release.bundle_digest:
+        # what the Spark runner stamps on each commit as fluid.bundle-digest
+        lines.append(f"  bundle   {release.bundle_digest}")
     if not release.intact:
         lines.append(
             "  NOT INTACT: its identity_digest is not the digest of its identity; the record "

@@ -14,6 +14,7 @@ import argparse
 import json
 import logging
 import os
+import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -406,6 +407,8 @@ def test_the_text_answer_names_the_version_the_release_the_run_and_the_code(rele
     assert "run 3f9a1c0b7e2d" in text and "env prod" in text and "forge 0.37.0" in text
     assert f"code     {SHA} https://github.com/org/orders refs/tags/v1.4.0" in text
     assert "(the record names no source)" in text  # the second release names none
+    # the bundle a commit's fluid.bundle-digest stamp names, so a snapshot finds its release
+    assert text.count("bundle   sha256:bundle") == 2
     assert "At the start" not in text and "In force at the start of 2026-11-20" in text
     assert "Sealed during 2026-11-20:" in text
 
@@ -418,6 +421,20 @@ def runs_status(*argv: str) -> int:
     register_runs(parser.add_subparsers(dest="command"))
     args = parser.parse_args(["runs", "status", PRODUCT, *argv])
     return args.func(args, LOG)
+
+
+def test_the_text_answer_keeps_each_line_whole_at_any_width(releases, capsys, monkeypatch):
+    """Piped (a CI log, ``| grep``), the console is 80 columns wide: a release's digest must
+    stay on the line that names it."""
+    from rich.console import Console
+
+    import fluid_build._console as shown
+
+    monkeypatch.setattr(shown, "console", Console(width=40))
+    assert runs_status("--release-dir", str(releases)) == 0
+    out = capsys.readouterr().out
+    assert re.search(r"^  release  sha256:[0-9a-f]{64}$", out, re.M), out
+    assert "  bundle   sha256:bundle\n" in out
 
 
 def test_the_command_says_which_release_was_in_force_on_a_day(releases, capsys):
