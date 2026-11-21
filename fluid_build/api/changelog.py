@@ -29,6 +29,7 @@ from .changelog_rules import (
     diff_columns,
     diff_consumes,
     diff_duplicates,
+    diff_identity,
     diff_metadata,
     diff_quality_severity,
     diff_sovereignty,
@@ -80,6 +81,10 @@ def compare_contracts(
 
     if validate:
         _require_valid({"baseline": baseline, "new": new})
+
+    # A different product id: the first thing a reader of the report needs, since
+    # every other line then compares two products.
+    report.extend(diff_identity(baseline, new))
 
     # Top-level metadata churn — info-level signals.
     report.extend(diff_metadata(baseline, new))

@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid diff --baseline` reports a changed product id, and `--fail-on-id-change` fails on it.**
+  The changelog gains a breaking `product_id_changed` change, first in the report: the id is the
+  product's identity, so a contract whose id differs from the baseline's describes another
+  product, not a new version of it. Consumers (`consumes[].productId`), the catalog, `fluid apply`
+  state and run cursors all name the product by its id. The comparison is exact, so a change of
+  case counts. `--impact` reads the change from the changelog instead of adding an entry of its
+  own, so it lists it once. `--fail-on-id-change` exits 1 with the typed error
+  `product_id_changed` (`ERR_PRODUCT_ID_CHANGED`, with next steps) once the report is printed and
+  written to `--out`, and looks at nothing else, so a migration can require the id to stay while
+  every other change is free. Without it the diff only reports.
+
 - **`fluid verify` holds an Iceberg table to its freshness objective.** An AWS binding with
   `format: iceberg` cataloged in Glue (the default on AWS) used to be reported as skipped; it goes
   through the Glue and Athena checks now: columns, location, row count, masking and storage
@@ -80,6 +91,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   orphan: under ACRO's rule no split of a band of children over a band of parents pins a
   count (up to 144,962 worlds), and up to 7 parents keyed by their exact numbers pin none
   under every scaled rule, exact counts included.
+
+### Changed
+
+- **`--fail-on-breaking` fails on a changed product id.** The changelog did not compare ids, so a
+  contract that only changed its id passed the gate; it is a breaking change now, as it is in the
+  `--impact` report.
 
 ### Fixed
 
