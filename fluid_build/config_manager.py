@@ -329,9 +329,27 @@ class _AliasBudget:
             )
 
 
-# The merge copy in ``_BudgetedLoader.flatten_mapping`` below is adapted from PyYAML 6.0.3,
-# lib/yaml/constructor.py, ``SafeConstructor.flatten_mapping``. PyYAML is distributed under
-# the MIT license:
+# Merge keys in a config file are copied by ``_MergeKeyCopier``, not by PyYAML. PyYAML decides
+# what a merge copies and has changed it: up to 6.0.3 it copied every pair of every merge and
+# let the first mapping of a list win (https://yaml.org/type/merge.html); 6.0.4 skips a pair
+# whose key text is the same string object as one it already copied and no longer reverses the
+# list, so a budget spent inside its copy sees none of what 6.0.3 copied, and for keys longer
+# than one character the last mapping of a list wins (yaml/pyyaml#953, open). Copying here gives
+# one reading of a config file, and one refusal, on every PyYAML release.
+#
+# The budget is go-yaml v3's, which assumes that decodes that are not alias decodes stay within
+# the text of the file, so that the work a document can force is bounded by a multiple of its
+# size. A copy keeps that true. It is alias decodes in full when the merge key names an alias
+# (also an alias to a list of mappings), when the mapping is listed through an alias, and when
+# it was copied before: a second copy is a repeated occurrence, which is what an alias is.
+# Copied the first time through no alias, only the pairs the mapping wrote itself are plain
+# decodes and the rest are alias decodes, because they came in through merges and this copy only
+# repeats them. Counting them as plain let a chain of inline mappings that each merge the one
+# inside it launder an aliased fan-out into plain decodes, keep the share of alias decodes under
+# the ratio that refuses a document, and expand a 3 KB file to gigabytes.
+#
+# The copy below is adapted from PyYAML 6.0.3, lib/yaml/constructor.py,
+# ``SafeConstructor.flatten_mapping``. PyYAML is distributed under the MIT license:
 #
 #   Copyright (c) 2017-2021 Ingy döt Net
 #   Copyright (c) 2006-2016 Kirill Simonov
@@ -355,51 +373,19 @@ _MERGE_TAG = "tag:yaml.org,2002:merge"
 _VALUE_TAG = "tag:yaml.org,2002:value"
 
 
-class _BudgetedLoader(yaml.SafeLoader):
-    """``yaml.SafeLoader`` that copies merge keys itself, as YAML 1.1 defines them, and whose
-    copies spend the file's alias budget (:class:`_AliasBudget`).
+class _MergeKeyCopier:
+    """Copies the merge keys of a ``yaml.SafeLoader`` itself (see the note above).
 
-    A merge key (``<<: *name``, ``<<: [*a, *b]``) copies the key/value pairs of
-    each mapping it names into the mapping that holds it, after flattening that
-    mapping's own merge keys and before anything is constructed. Nested
-    repeated merges (``m2: {<<: [*m1, *m1, ...]}``, ``m3: {<<: [*m2, ...]}``)
-    so grow ninefold a level inside the loader, and :func:`without_aliases`
-    only sees the few keys left once the duplicates collapse. Here each node
-    the file writes is one decode, each pair a merge key copies is one more,
-    and an alias decode unless it is a pair its mapping wrote itself and the
-    mapping is copied for the first time through no alias; the budget is
-    checked before the pairs are copied. That keeps what go-yaml's rule
-    assumes: decodes that are not alias decodes stay within the text of the
-    file, so the work a document can force is bounded by a multiple of its
-    size, however its merges are nested.
-
-    The copy is made here, not by ``SafeConstructor.flatten_mapping``, because
-    PyYAML decides what a merge copies and has changed it. Up to 6.0.3 it
-    copied every pair of every merge and let the first mapping of a list win
-    (https://yaml.org/type/merge.html). 6.0.4 skips a pair whose key text is the
-    same string object as one it already copied and no longer reverses the
-    list, so a budget spent inside its copy sees none of what 6.0.3 copied, and
-    for keys longer than one character the last mapping of a list wins
-    (yaml/pyyaml#953, open). This is that copy as 6.0.3 wrote it
-    (lib/yaml/constructor.py, MIT) with the budget spent before each copy: one
-    reading of a config file, and one refusal, on every PyYAML release.
+    A mixin for the loader, which calls ``flatten_mapping`` on every mapping it constructs. It
+    needs the loader's ``budget``, ``aliased`` (the nodes an alias refers to), ``copied`` (the
+    mappings a merge key has copied from) and ``own_pairs`` (the pairs a mapping wrote itself,
+    not through a merge key, counted when it is first flattened).
     """
 
-    def __init__(self, stream: Union[str, IO[str]], origin: Optional[str]) -> None:
-        super().__init__(stream)
-        self.budget = _AliasBudget(origin)
-        self.aliased: Set[yaml.Node] = set()  # the nodes an alias in the file refers to
-        self.copied: Set[yaml.Node] = set()  # the mappings a merge key has copied from
-        # the pairs a mapping wrote itself, not through a merge key, counted before it is flattened
-        self.own_pairs: Dict[yaml.Node, int] = {}
-
-    def compose_node(self, parent: Optional[yaml.Node], index: Any) -> Any:
-        if self.check_event(yaml.AliasEvent):
-            node = super().compose_node(parent, index)
-            self.aliased.add(node)
-            return node
-        self.budget.spend(1, aliased=False)
-        return super().compose_node(parent, index)
+    budget: "_AliasBudget"
+    aliased: Set[yaml.Node]
+    copied: Set[yaml.Node]
+    own_pairs: Dict[yaml.Node, int]
 
     def flatten_mapping(self, node: yaml.MappingNode) -> None:
         if node not in self.own_pairs:  # the first call sees the pairs as the file wrote them
@@ -427,23 +413,11 @@ class _BudgetedLoader(yaml.SafeLoader):
     ) -> List[yaml.MappingNode]:
         """The mappings a merge key names, flattened and charged, in the order they are copied.
 
-        Each one is flattened in the order the file lists it, and the budget is
-        spent on the pairs it will copy right then, before any pair is copied.
-        All its pairs are alias decodes when the merge key names an alias (also
-        an alias to a list of mappings), when the mapping is listed through an
-        alias, and when it was copied before: a second copy is a repeated
-        occurrence, which is what an alias is. Copied the first time through no
-        alias, only the pairs it wrote itself are plain decodes, and the rest
-        are alias decodes: they came into it through merges, so this copy only
-        repeats them. Counting them as plain let a chain of inline mappings,
-        each merging the one inside it, launder an aliased fan-out into plain
-        decodes and keep the alias share under the ratio that refuses it.
-
-        A list is copied last to first, so that a key in a mapping listed
-        earlier overrides the same key in one listed later; the mapping's own
-        keys, which come after every copy, override them all. What an invalid
-        merge value raises, and which invalid one is met first, are PyYAML
-        6.0.3's: the same messages, marks and order.
+        Each is flattened in the order the file lists it, as PyYAML does, so what an invalid
+        merge value raises, and which invalid one is met first, are PyYAML 6.0.3's: the same
+        messages, marks and order. A list is copied last to first, so that a key in a mapping
+        listed earlier overrides the same key in one listed later; the mapping's own keys, which
+        come after every copy, override them all.
         """
         if isinstance(value_node, yaml.MappingNode):
             named = [value_node]
@@ -467,17 +441,49 @@ class _BudgetedLoader(yaml.SafeLoader):
                     subnode.start_mark,
                 )
             self.flatten_mapping(subnode)
-            repeated = via_alias or subnode in self.aliased or subnode in self.copied
-            pairs = len(subnode.value)
-            written = 0 if repeated else self.own_pairs[subnode]
-            if written:
-                self.budget.spend(written, aliased=False)
-            if pairs > written:
-                self.budget.spend(pairs - written, aliased=True)
-            self.copied.add(subnode)
+            self._spend_for_copy(subnode, via_alias)
             sources.append(subnode)
         sources.reverse()
         return sources
+
+    def _spend_for_copy(self, source: yaml.MappingNode, via_alias: bool) -> None:
+        """Spend the budget on the pairs a copy of ``source`` brings in, before it is made."""
+        repeated = via_alias or source in self.aliased or source in self.copied
+        pairs = len(source.value)
+        written = 0 if repeated else self.own_pairs[source]
+        if written:
+            self.budget.spend(written, aliased=False)
+        if pairs > written:
+            self.budget.spend(pairs - written, aliased=True)
+        self.copied.add(source)
+
+
+class _BudgetedLoader(_MergeKeyCopier, yaml.SafeLoader):
+    """``yaml.SafeLoader`` whose nodes and merge-key copies spend the file's alias budget
+    (:class:`_AliasBudget`) before any pair is copied.
+
+    A merge key (``<<: *name``, ``<<: [*a, *b]``) copies the pairs of each mapping it names into
+    the mapping that holds it, before anything is constructed. Nested repeated merges
+    (``m2: {<<: [*m1, *m1, ...]}``, ``m3: {<<: [*m2, ...]}``) so grow ninefold a level in the
+    loader, and :func:`without_aliases` only sees the few keys left once the duplicates
+    collapse. Each node the file writes is one decode here, and each pair a merge key copies is
+    another (an alias decode, or not: see the note above).
+    """
+
+    def __init__(self, stream: Union[str, IO[str]], origin: Optional[str]) -> None:
+        super().__init__(stream)
+        self.budget = _AliasBudget(origin)
+        self.aliased = set()
+        self.copied = set()
+        self.own_pairs = {}
+
+    def compose_node(self, parent: Optional[yaml.Node], index: Any) -> Any:
+        if self.check_event(yaml.AliasEvent):
+            node = super().compose_node(parent, index)
+            self.aliased.add(node)
+            return node
+        self.budget.spend(1, aliased=False)
+        return super().compose_node(parent, index)
 
 
 class _Unaliasing:

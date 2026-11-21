@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable
 
 import pytest
 
@@ -328,32 +329,39 @@ def test_a_checkout_market_file_alias_does_not_carry_the_env_token_to_another_bl
 _LAYERS = ("system", "user", "project")
 
 
+def _anchored_stack(depth: int, first: str, level: Callable[[int], str]) -> str:
+    """``x-laughs`` as a stack of anchors: ``first`` as written, then ``level(n)`` for each of the
+    next ``depth - 1`` levels, which repeats the one before. The shape of every bomb here."""
+    return "\n".join(["x-laughs:", first, *(level(n) for n in range(2, depth + 1))]) + "\n"
+
+
 def _laughs(depth: int, width: int = 9) -> str:
     """``depth`` levels of ``width`` aliases each: ``width ** depth`` values copied out."""
-    lines = ["x-laughs:", "  l1: &l1 [" + ", ".join(["lol"] * width) + "]"]
-    for level in range(2, depth + 1):
-        lines.append(f"  l{level}: &l{level} [" + ", ".join([f"*l{level - 1}"] * width) + "]")
-    return "\n".join(lines) + "\n"
+    return _anchored_stack(
+        depth,
+        "  l1: &l1 [" + ", ".join(["lol"] * width) + "]",
+        lambda n: f"  l{n}: &l{n} [" + ", ".join([f"*l{n - 1}"] * width) + "]",
+    )
 
 
 def _merge_laughs(depth: int, width: int = 9) -> str:
     """``depth`` levels of ``width`` merged aliases each: ``width ** depth`` pairs merged."""
-    lines = ["x-laughs:", "  m1: &m1 {" + ", ".join(f"k{i}: v" for i in range(width)) + "}"]
-    for level in range(2, depth + 1):
-        lines.append(f"  m{level}: &m{level}")
-        lines.append("    <<: [" + ", ".join([f"*m{level - 1}"] * width) + "]")
-    return "\n".join(lines) + "\n"
+    return _anchored_stack(
+        depth,
+        "  m1: &m1 {" + ", ".join(f"k{i}: v" for i in range(width)) + "}",
+        lambda n: f"  m{n}: &m{n}\n    <<: [" + ", ".join([f"*m{n - 1}"] * width) + "]",
+    )
 
 
 def _sequence_merge_laughs(depth: int, width: int = 9) -> str:
     """``depth`` levels in which each mapping repeats ``<<`` ``width`` times over the LIST that
     holds the previous level's mapping, so what it merges is reached through an alias to a list
     and not to the mapping itself (PyYAML takes a repeated ``<<`` key in one mapping)."""
-    lines = ["x-laughs:", "  l1: &l1 [{" + ", ".join(f"k{i}: v" for i in range(width)) + "}]"]
-    for level in range(2, depth + 1):
-        merges = ", ".join([f"<<: *l{level - 1}"] * width)
-        lines.append(f"  l{level}: &l{level} [{{{merges}}}]")
-    return "\n".join(lines) + "\n"
+    return _anchored_stack(
+        depth,
+        "  l1: &l1 [{" + ", ".join(f"k{i}: v" for i in range(width)) + "}]",
+        lambda n: f"  l{n}: &l{n} [{{" + ", ".join([f"<<: *l{n - 1}"] * width) + "}]",
+    )
 
 
 def _wrapped_merge_laughs(levels: int, fanout: int, wrappers: int) -> str:
@@ -362,13 +370,12 @@ def _wrapped_merge_laughs(levels: int, fanout: int, wrappers: int) -> str:
     every wrapper, and a copy of an inline mapping used to count as plain decodes, which kept
     the share of alias decodes under the ratio that refuses a document: about 2 KB then
     expanded to 12 million copies, and 2.9 KB to 600 million (5 GB)."""
-    lines = ["x-laughs:", "  m1: &m1 {k: 1}"]
-    for level in range(2, levels + 1):
-        inner = "[" + ",".join([f"*m{level - 1}"] * fanout) + "]"
-        lines.append(
-            f"  m{level}: &m{level} {{<<: " + "{<<: " * wrappers + inner + "}" * (wrappers + 1)
-        )
-    return "\n".join(lines) + "\n"
+
+    def level(n: int) -> str:
+        inner = "[" + ",".join([f"*m{n - 1}"] * fanout) + "]"
+        return f"  m{n}: &m{n} {{<<: " + "{<<: " * wrappers + inner + "}" * (wrappers + 1)
+
+    return _anchored_stack(levels, "  m1: &m1 {k: 1}", level)
 
 
 # Each of these completes in well under a second on a loader without a budget,
@@ -729,8 +736,9 @@ def test_merge_key_bombs_are_refused_whichever_pyyaml_copies_the_merge(pyyaml, b
 
     from fluid_build.config_manager import load_config_file
 
-    with pytest.raises(yaml.YAMLError, match="excessive aliasing"):
+    with pytest.raises(yaml.YAMLError) as refused:
         load_config_file(_BOMBS[bomb], "f.yaml")
+    assert str(refused.value).startswith("f.yaml: document contains excessive aliasing")
 
 
 @pytest.mark.parametrize(
