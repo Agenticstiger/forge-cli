@@ -27,8 +27,8 @@ The order is fixed, and nothing is written until every step has passed:
 The domains follow flux-engine's FLUID type table (``flux_engine/seam/contract.py``):
 the types FLUX refuses (binary floats, a bare time, an interval, geospatial
 values, sketches) and those with no profile domain (nested values, bytes) are
-not profiled, and neither is a boolean, which flux-engine's reader refuses as a
-category value.
+not profiled. A boolean (``boolean``, ``bool``, ``bit``) is read in the ``category``
+domain, as the levels ``false`` and ``true``, which is how flux-stats reads one.
 """
 
 from __future__ import annotations
@@ -81,9 +81,12 @@ __all__ = [
 
 CATEGORY, NUMBER, TIMESTAMP = "category", "number", "timestamp"
 
-_CATEGORY_TYPES = frozenset(
-    "string text varchar varchar2 nvarchar char nchar character clob enum uuid "
-    "uniqueidentifier guid".split()
+_CATEGORY_TYPES = (
+    frozenset(
+        "string text varchar varchar2 nvarchar char nchar character clob enum uuid "
+        "uniqueidentifier guid".split()
+    )
+    | defaults.BOOLEAN_TYPES
 )
 _NUMBER_TYPES = frozenset(
     "int integer int2 int4 int8 int16 int32 int64 tinyint smallint mediumint bigint long "
@@ -114,12 +117,6 @@ _NOT_PROFILED: Mapping[str, str] = {
         for name in "geography geometry geom point".split()
     },
     "hll": "a sketch has no profile domain",
-    # flux-engine's reader reads a category value as text and refuses a boolean, and
-    # how flux-stats will read one is not decided: a boolean column waits for it.
-    **{
-        name: "FLUX's reader has no reading for a boolean yet"
-        for name in "boolean bool bit".split()
-    },
 }
 
 #: The quantile levels ``quantiles`` is measured at.

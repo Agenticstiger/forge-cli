@@ -13,6 +13,10 @@ column's edges (FLUX ADR 0012) and the ACRO rules for the rest.
 - **A column typed** ``enum(...)``: ``levelHistogram/1`` over every level the type
   declares. A level no record holds is a cell of none, which the check withholds as
   ``C``, so the levels listed never depend on the records.
+- **A column typed** ``boolean``, ``bool`` or ``bit``: the same, over the two levels
+  ``false`` and ``true``, which flux-stats reads a boolean as. The grammar takes a
+  ``support`` of written-out values on any column, so a boolean is declared as an enum of
+  those two levels, and a level no record holds is a withheld cell as for an enum.
 - **A number whose** ``validationRules`` **declare both ends of a range** inside its
   type: ``marginalHistogram/1`` over about ten bins of one width, exact at both ends: the
   first edge is the declared minimum and the last the declared maximum, which the last bin,
@@ -28,9 +32,10 @@ column's edges (FLUX ADR 0012) and the ACRO rules for the rest.
   and counts, a histogram on the ladder published nothing, and the quantiles beside it
   nothing.
 - **A grouping the contract declares**, a categorical ``semantics.dimensions`` entry on
-  an ``enum`` column: each other ``enum`` column's level histogram per level of the
-  grouping. Every declared level is a group, one that no record holds included, so the
-  groups listed never depend on the records either; such a group withholds its siblings.
+  an ``enum`` or boolean column: each other ``enum`` or boolean column's level histogram
+  per level of the grouping. Every declared level is a group, one that no record holds
+  included, so the groups listed never depend on the records either; such a group
+  withholds its siblings.
   One column's groupings hold at most :data:`MOST_GROUPED_CELLS` cells together: one past
   that is left out, and named.
 
@@ -94,6 +99,10 @@ _LADDER_YEARS = range(1900, 2101)
 
 #: The smallest sub-unit edge a decimal's ladder takes: 2^-10, and never below the grid.
 _FINEST_SUB_UNIT = 10
+
+#: The types flux-engine reads as a boolean, and the two levels flux-stats reads one as.
+BOOLEAN_TYPES = frozenset({"boolean", "bool", "bit"})
+BOOLEAN_LEVELS: Tuple[str, str] = ("false", "true")
 
 #: The most cells one column's grouped level histograms hold together, every declared level
 #: of each grouping a group. Checking them together costs about the cube of the levels, so
@@ -332,6 +341,13 @@ def default_plan(
         entry = schema.get(column.name, {})
         declared_type = entry.get("type")
         if column.domain == "category":
+            if _is_boolean(declared_type):
+                levels[column.name] = len(BOOLEAN_LEVELS)
+                declared[column.name] = {
+                    "support": {"values": list(BOOLEAN_LEVELS)},
+                    "maxCardinality": len(BOOLEAN_LEVELS),
+                }
+                continue
             try:
                 found = _levels(enum_levels, declared_type)
             except ValueError as refused:  # the registry's FLX-3001: a list it cannot read
@@ -425,6 +441,12 @@ def default_plan(
         "properties": properties,
     }
     return DefaultPlan(block=block, uncovered=tuple(uncovered), ranges=ranges)
+
+
+def _is_boolean(declared_type: Any) -> bool:
+    """Whether a column's declared type is one of flux-engine's BOOL types."""
+    text = re.sub(r"\s+", " ", str(declared_type or "").strip().lower())
+    return re.sub(r"\s*\(.*\)$", "", text) in BOOLEAN_TYPES
 
 
 def _levels(enum_levels: Callable[[str], Sequence[str]], declared_type: Any) -> int:

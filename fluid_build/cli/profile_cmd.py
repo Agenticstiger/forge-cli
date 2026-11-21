@@ -58,6 +58,9 @@ fidelity block FLUX's grammar reads (so `fluxsim init` can start from them):
   - for each enum(...) column, a levelHistogram over every declared level; a
     level no record holds is a withheld cell, and the column's distinctCount
     is withheld (D);
+  - for each boolean column (boolean, bool, bit), the same over the two levels
+    false and true, which a boolean is read as; a level no record holds is a
+    withheld cell, and a value that is neither false nor true refuses the profile;
   - for a number whose validationRules declare both ends of a range inside
     its type, a marginalHistogram over about ten bins of it; its sum, min,
     max, quantiles and distinctCount are then withheld (D), and it has no
@@ -66,8 +69,8 @@ fidelity block FLUX's grammar reads (so `fluxsim init` can start from them):
     quantile/2 at 0.25, 0.5 and 0.75 on a ladder fixed by the type (0, 1, 2,
     5, 10, 20, 50 ... for a number, one bin per year from 1900 to 2100 for a
     date or a timestamp);
-  - for each categorical semantics.dimensions entry on an enum column, the
-    other enum columns' histograms per level of it, every declared level a
+  - for each categorical semantics.dimensions entry on an enum or boolean
+    column, the other enum and boolean columns' histograms per level of it, every declared level a
     group, up to 10,000 cells for one column's groupings;
   - for each semantics.relationships entry between two exposes of the call,
     children per parent: how many child rows each parent row has, counted on

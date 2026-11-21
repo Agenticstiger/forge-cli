@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid profile` profiles boolean columns.** A column typed `boolean`, `bool` or `bit` is read as
+  the category `false` or `true`, as flux-stats reads one, so it has `count`, `nullCount` and
+  `distinctCount` like any category column. Without `--bundle` it also gets a `levelHistogram/1` over
+  the levels `false` and `true`, declared from the contract and never from the records, so a level no
+  record holds is a withheld cell as for an enum, and it joins the grouped histograms under a
+  categorical `semantics.dimensions` entry as an enum of those two levels. A value that is neither
+  (such as the text `yes`) refuses the profile without naming it, as a value outside an enum's levels
+  does. A Simulation's fidelity block under `--bundle` may declare a property on a boolean column.
+
 - **`fluid import airflow` finds the Spark jobs a DAG submits through a Python task's function.**
   A `PythonOperator` (and a TaskFlow `@task`) used to be read no further, so a DAG that submits its
   jobs from Python proposed nothing. Now the function it runs is followed, statically: nothing is
