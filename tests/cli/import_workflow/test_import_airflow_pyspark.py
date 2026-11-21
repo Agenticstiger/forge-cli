@@ -902,3 +902,27 @@ def test_the_printed_lines_are_clean_and_never_wrapped(project, capsys, monkeypa
         "retail.orders_daily  (owner retail-data) → out/contract.retail.orders_daily.fluid.yaml [new]"
         in out
     )
+
+
+def test_an_unread_command_is_listed_without_advice_about_script_roots(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "dags").mkdir()
+    (tmp_path / "dags" / "long.py").write_text(
+        textwrap.dedent(
+            f"""
+            from airflow import DAG
+            from airflow.operators.bash import BashOperator
+            from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+            with DAG("long"):
+                BashOperator(task_id="long", bash_command={"echo " + "x" * 5000!r})
+                SparkSubmitOperator(task_id="named", application="s3://code/jobs/a.py")
+            """
+        ),
+        encoding="utf-8",
+    )
+    _contracts, report = AirflowImporter().import_to_contracts("dags", options={})
+    lines = [x for x in report.unsupported if "task long" in x or "task named" in x]
+    long_line = next(x for x in lines if "task long" in x)
+    named_line = next(x for x in lines if "task named" in x)
+    assert "longer than" in long_line and "script_roots" not in long_line
+    assert "script_roots" in named_line  # a script that was found but not joined gets the way out

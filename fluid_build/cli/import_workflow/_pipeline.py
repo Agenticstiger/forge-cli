@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ._conventions import Conventions, load_conventions
-from ._proposal import SPLITS, TopicSchema, build_proposal, safe_text
+from ._proposal import SPLITS, ProposalTooLarge, TopicSchema, build_proposal, safe_text
 from ._scan import DagScan, JobScan, LinkedTask, link_tasks, scan_dags, scan_jobs
 from .registry import ImportReport
 
@@ -178,16 +178,26 @@ def run_import(
             path=safe_text(str(root), 120),
         )
 
-    proposal = build_proposal(
-        tool=tool,
-        version=contract_version(),
-        jobs=jobs,
-        conv=conv,
-        split_by=split_by,
-        root_name=root.resolve().name,
-        topic_schema=topic_schema_reader(options),
-        report=report,
-    )
+    try:
+        proposal = build_proposal(
+            tool=tool,
+            version=contract_version(),
+            jobs=jobs,
+            conv=conv,
+            split_by=split_by,
+            root_name=root.resolve().name,
+            topic_schema=topic_schema_reader(options),
+            report=report,
+        )
+    except ProposalTooLarge as exc:
+        raise refusal(
+            f"too much to propose from {safe_text(str(root), 80)!r}",
+            f"{exc}, which is more than a proposal holds: every product is validated and written "
+            "as a file.",
+            "Import a smaller directory (one domain at a time), or ignore generated code under "
+            "`ignore.files` in the conventions.",
+            path=safe_text(str(root), 120),
+        ) from exc
     _check_valid(proposal.contracts, proposal.report)
     return proposal.contracts, proposal.report
 
@@ -302,11 +312,13 @@ def _scan_report(
                 f"({task.file}:{submit.line}) submits "
                 f"{safe_text(submit.script or submit.shown or '(no script)', 100)}: not joined ({safe_text(why, 120)})"
             )
-            if tool == "airflow":
+            if tool == "airflow" and submit.script:
                 report.unsupported.append(
                     line + "; map its prefix under `script_roots` in the conventions, or run "
                     "`fluid import pyspark <jobs-dir> --dags <dags-dir>`"
                 )
+            elif tool == "airflow":
+                report.unsupported.append(line)
             else:
                 report.notes.append(line)
         no_dag = [j for j in jobs if not j.tasks]

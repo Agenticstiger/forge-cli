@@ -794,3 +794,35 @@ def test_folding_that_runs_out_of_budget_is_said_once_for_the_file():
         "reported as not constant"
     ]
     assert all(not r.name for r in facts.reads)
+
+
+# ── a file of nothing but reads is not a job ──────────────────────────
+
+
+def test_a_job_keeps_a_bounded_number_of_reads_and_writes_and_says_so(monkeypatch):
+    from fluid_build.cli.import_workflow import _spark_io as IO
+
+    monkeypatch.setattr(IO, "MAX_REFS_PER_JOB", 5)
+    lines = "\n".join(f'spark.table("db.t{i}")' for i in range(9))
+    lines += "\n" + "\n".join(f'df.write.saveAsTable("db.o{i}")' for i in range(7))
+    facts = job(
+        "from pyspark.sql import SparkSession\nspark = SparkSession.builder.getOrCreate()\n" + lines
+    )
+    assert len(facts.reads) == 5 and len(facts.writes) == 5
+    assert [n for n in facts.notes if "more than 5 reads" in n] == [
+        "job.py: more than 5 reads: the rest are not listed"
+    ]
+    assert [n for n in facts.notes if "more than 5 writes" in n] == [
+        "job.py: more than 5 writes: the rest are not listed"
+    ]
+
+
+def test_placeholders_in_the_longest_sql_the_folder_gives_are_found_in_bounded_time():
+    import time
+
+    from fluid_build.cli.import_workflow import _spark_io as IO
+
+    for text in ("${" * 2048, "{{" * 2048, "{a" * 2048, "%(a" * 1365):
+        started = time.monotonic()
+        IO._placeholders_to_holes(text, {})
+        assert time.monotonic() - started < 0.5

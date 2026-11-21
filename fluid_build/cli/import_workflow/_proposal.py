@@ -50,6 +50,16 @@ from ._spark_io import Ref, Write
 from .registry import ImportReport
 
 SPLITS = ("table", "job", "dag", "folder", "project")
+#: Distinct outputs, and products, one proposal holds. Every product is validated against the
+#: schema and written as a file; a project has hundreds, and a directory of generated code that
+#: names a table per line is not what this reads.
+MAX_OUTPUTS = 50_000
+MAX_PRODUCTS = 10_000
+
+
+class ProposalTooLarge(Exception):
+    """The code writes more outputs, or makes more products, than one proposal holds."""
+
 
 #: The id pattern of ``airflowOrchestration.dagId`` and ``airflowTask.taskId`` (lower case only).
 _AIRFLOW_ID = re.compile(r"[a-z0-9_][a-z0-9_.-]*[a-z0-9_]|[a-z0-9_]")
@@ -615,6 +625,10 @@ def build_proposal(
                 continue
             existing = outputs.get(identity.key)
             if existing is None:
+                if len(outputs) >= MAX_OUTPUTS:
+                    raise ProposalTooLarge(
+                        f"the code writes more than {MAX_OUTPUTS:,} distinct outputs"
+                    )
                 outputs[identity.key] = Output(identity, job, write)
             elif existing.writer is job:
                 mark = ("catalogs", job.shown, identity.key)
@@ -641,6 +655,10 @@ def build_proposal(
 
     flat = sorted(outputs.values(), key=lambda o: (o.writer.shown, o.write.line, o.identity.shown))
     groups = _groups(flat, split_by, conv, root_name)
+    if len(groups) > MAX_PRODUCTS:
+        raise ProposalTooLarge(
+            f"the proposal would hold {len(groups):,} products (the most is {MAX_PRODUCTS:,})"
+        )
 
     # who produces what, for consumes[]: an id is handed out once, whatever the names look like
     produced: Dict[Tuple[str, ...], Tuple[str, str]] = {}

@@ -865,3 +865,21 @@ def test_a_file_that_asks_for_too_much_folding_is_said_so_once():
         "dag.py: folding stopped early (the file asks for too much work): some values are "
         "reported as not constant"
     ]
+
+
+def test_a_command_too_long_to_fold_is_said_not_dropped():
+    long_command = "echo " + "x" * 5000
+    submits = bash_submits(long_command)
+    assert len(submits) == 1
+    assert submits[0].script is None and "longer than" in submits[0].why
+
+
+def test_a_jinja_field_that_never_closes_costs_a_bounded_look_ahead():
+    import time
+
+    from fluid_build.cli.import_workflow import _airflow_dags as A
+
+    for text in ("{{" * 2048, "{% " * 1365, "{# " * 1365):
+        started = time.monotonic()
+        A._shell_commands(text, {})
+        assert time.monotonic() - started < 0.5

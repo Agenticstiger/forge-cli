@@ -54,6 +54,9 @@ from ._pysource import Module, qualified_name, snippet
 #: Receivers whose ``.table(...)`` and ``.sql(...)`` are Spark's. The conventions add names; a
 #: name assigned from ``....getOrCreate()`` in the file is added as it is met.
 DEFAULT_SESSION_NAMES = frozenset({"spark", "session", "spark_session", "sparkSession", "ss"})
+#: Reads, and writes, kept for one job file: a job has tens, and a file of nothing but ``.table(...)``
+#: calls is not one.
+MAX_REFS_PER_JOB = 5_000
 
 #: Formats whose writes and reads are not data we keep: nothing persistent is behind them.
 _NON_PERSISTENT = frozenset({"console", "memory", "noop", "foreach", "rate", "socket"})
@@ -92,7 +95,8 @@ _PLAIN_TABLE = re.compile(r"[A-Za-z0-9_$`.\-]+")
 #: A placeholder a templating layer fills in later, in SQL that is not an f-string: ``${db}``,
 #: ``{db}``, ``{{ db }}``, ``%(db)s``. The SQL parser would read the text around it as a name.
 _PLACEHOLDER = re.compile(
-    r"\$\{[^}\s]*\}|\{\{[^}]*\}\}|\{[A-Za-z_][A-Za-z0-9_.]*\}|%\([A-Za-z_][A-Za-z0-9_]*\)s"
+    r"\$\{[^}\s]{0,200}\}|\{\{[^}]{0,200}\}\}|\{[A-Za-z_][A-Za-z0-9_.]{0,100}\}"
+    r"|%\([A-Za-z_][A-Za-z0-9_]{0,100}\)s"
 )
 
 
@@ -526,13 +530,24 @@ class _Reader:
             return
         if ref.kind == "table" and ref.resolved and self._is_temp_view(ref):
             return
+        if len(self.facts.reads) >= MAX_REFS_PER_JOB:
+            self._too_many("reads")
+            return
         self.facts.reads.append(Read(**_fields(ref), streaming=streaming, host=host))
 
     def _add_write(self, ref: Ref, **extra: Any) -> None:
         if not ref.resolved and _PARAMETER in ref.why:
             self.parameter_named += 1
             return
+        if len(self.facts.writes) >= MAX_REFS_PER_JOB:
+            self._too_many("writes")
+            return
         self.facts.writes.append(Write(**_fields(ref), **extra))
+
+    def _too_many(self, kind: str) -> None:
+        note = f"{self.file}: more than {MAX_REFS_PER_JOB:,} {kind}: the rest are not listed"
+        if note not in self.facts.notes:
+            self.facts.notes.append(note)
 
     def _is_temp_view(self, ref: Ref) -> bool:
         if len(ref.parts) == 1:

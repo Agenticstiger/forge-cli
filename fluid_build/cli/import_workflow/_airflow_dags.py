@@ -607,7 +607,9 @@ class _Reader:
         # out in full beside it is still read.
         value, holes = self.folder.fold_sql(node)
         if isinstance(value, Unresolved):
-            if "spark-submit" in value.text:
+            # A command too long to fold is said, not dropped: nothing of it was read, so
+            # whether it runs a spark-submit is not known.
+            if "spark-submit" in value.text or "longer than" in value.why:
                 return [
                     self._submit(
                         "bash", Unresolved(value.why, value.text), None, call, "bash_command"
@@ -843,7 +845,9 @@ class _Reader:
 _SPARK_SUBMIT = re.compile(r"(^|/)spark-submit(\.sh)?$")
 #: The token ``Folder.fold_sql`` puts where a field of the text did not fold.
 _HOLE = re.compile(r"__fluidhole\d+__")
-_JINJA = re.compile(r"\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\}", re.DOTALL)
+# A Jinja field is at most 1,000 characters: an unclosed ``{{`` then costs a bounded look ahead,
+# not a scan to the end of the text for each one.
+_JINJA = re.compile(r"\{\{.{0,1000}?\}\}|\{%.{0,1000}?%\}|\{#.{0,1000}?#\}", re.DOTALL)
 _JINJA_TOKEN = re.compile(r"__fluidjinja(\d+)__")
 _SHELL_PUNCTUATION = "();<>|&"
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")

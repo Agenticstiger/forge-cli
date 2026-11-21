@@ -398,3 +398,48 @@ def test_a_symlink_that_leaves_the_project_is_not_followed(tmp_path):
     outside.write_text("x = 1\n", encoding="utf-8")
     (project / "jobs" / "link.py").symlink_to(outside)
     assert _scan.local_script("jobs/link.py", Conventions(), project) is None
+
+
+# ── how much one import holds ─────────────────────────────────────────
+
+
+def test_a_scan_stops_after_the_most_reads_and_writes_it_keeps(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(_scan, "MAX_REFS_PER_SCAN", 3)
+    write(
+        tmp_path,
+        {
+            f"jobs/j{i}.py": f'spark.table("db.in{i}")\ndf.write.saveAsTable("db.out{i}")\n'
+            for i in range(6)
+        },
+    )
+    scan = _scan.scan_jobs(tmp_path / "jobs", Conventions())
+    assert len(scan.jobs) == 2  # the second file takes it past 3
+    assert any("stopped after 4 reads and writes: 4 file(s) not read" in n for n in scan.notes)
+
+
+def test_a_proposal_with_too_many_outputs_or_products_is_refused_with_a_way_out(
+    tmp_path, monkeypatch
+):
+    from fluid_build._errors import FluidUserError
+    from fluid_build.cli.import_workflow import _proposal
+
+    monkeypatch.chdir(tmp_path)
+    write(
+        tmp_path,
+        {"jobs/many.py": "\n".join(f'df.write.saveAsTable("db.o{i}")' for i in range(5)) + "\n"},
+    )
+    monkeypatch.setattr(_proposal, "MAX_OUTPUTS", 3)
+    with pytest.raises(FluidUserError) as refused:
+        propose(tmp_path)
+    assert "too much to propose" in refused.value.what
+    assert "more than 3 distinct outputs" in refused.value.why
+    assert "smaller directory" in refused.value.fix and "ignore.files" in refused.value.fix
+
+    monkeypatch.setattr(_proposal, "MAX_OUTPUTS", 50_000)
+    monkeypatch.setattr(_proposal, "MAX_PRODUCTS", 2)
+    with pytest.raises(FluidUserError) as refused:
+        propose(tmp_path)  # five tables are five products
+    assert "5 products (the most is 2)" in refused.value.why
+    contracts, _ = propose(tmp_path, split_by="project")  # one product holding them all
+    assert len(contracts) == 1 and len(contracts[0]["exposes"]) == 5

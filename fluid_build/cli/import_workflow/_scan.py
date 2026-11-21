@@ -99,6 +99,11 @@ def _display(path: Path, rel: str) -> str:
     return clean_chars(shown)
 
 
+#: Reads and writes kept from one scan, in all the jobs it reads: past it the rest of the files
+#: are left unread (a project has tens of thousands, not millions).
+MAX_REFS_PER_SCAN = 200_000
+
+
 def _budget_note(skipped: int, notes: List[str]) -> None:
     if skipped:
         notes.append(
@@ -119,7 +124,14 @@ def scan_jobs(root: Path, conventions: Conventions) -> JobScan:
         walk.files, variables=conventions.variables, extra=conventions.config_modules
     )
     sessions = set(DEFAULT_SESSION_NAMES) | set(conventions.session_names)
-    for source in walk.files:
+    kept = 0
+    for position, source in enumerate(walk.files):
+        if kept > MAX_REFS_PER_SCAN:
+            scan.notes.append(
+                f"stopped after {kept:,} reads and writes: {len(walk.files) - position} file(s) "
+                "not read"
+            )
+            break
         module = index.load(source)
         if module is None:
             scan.unreadable[source.rel] = index.unreadable.get(source.rel, "it cannot be read")
@@ -132,6 +144,7 @@ def scan_jobs(root: Path, conventions: Conventions) -> JobScan:
             session_names=sessions,
             shown=shown,
         )
+        kept += len(facts.reads) + len(facts.writes)
         if facts.has_io:
             scan.jobs.append(
                 JobRecord(
