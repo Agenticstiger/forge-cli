@@ -39,6 +39,7 @@ credentials, which is what they are for. They may not carry a setting that:
   lineage, telemetry, webhook, registry, LLM and agent-tool endpoints and
   selectors (``FLUID_COMMAND_CENTER_URL``/``_ENABLED``, ``FLUID_API_URL``,
   ``FLUID_CC_ENDPOINT``, ``FLUID_CATALOG_*_URL``, ``FLUID_LAKEKEEPER_*``,
+  ``FLUID_AIRFLOW_*``,
   ``FLUID_OPENLINEAGE_URL``,
   ``FLUID_LLM_ENDPOINT``, ``FLUID_LLM_PROVIDER``/``_MODEL``,
   ``FLUID_RUNNER_HOST_OVERRIDE``, ``FLUID_PUBLIC_REGISTRY``,
@@ -585,6 +586,10 @@ PROTECTED_ENV_PREFIXES: Tuple[str, ...] = (
     # signs in to Lakekeeper with to change its grants (policy/lakekeeper_apply.py):
     # a project file must not choose which credential is sent, or where
     "FLUID_LAKEKEEPER_",
+    # the credential references ``fluid schedule-sync --airflow-url`` signs in to Airflow
+    # with, and its plain-HTTP opt-in (cli/_airflow_api.py): a project file must not
+    # choose which credential is sent, or whether it may travel unencrypted
+    "FLUID_AIRFLOW_",
     "FLUID_MCP_JWT_",
     "FLUID_LLM_DEFAULT_MODEL_",
     # credentials the Debezium runner itself sets: it writes each credential
