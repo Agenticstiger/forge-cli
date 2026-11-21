@@ -51,17 +51,45 @@ MAX_FOLD_DEPTH = 40
 MAX_STRING = 4096
 #: Most containers elements folded in one literal.
 MAX_ITEMS = 2_000
+#: Most nodes one top-level :meth:`Folder.fold` call may visit, and one module in all: the work a
+#: hostile file can ask for is bounded, whatever its expressions refer to.
+MAX_STEPS_PER_FOLD = 5_000
+MAX_STEPS_PER_MODULE = 250_000
+#: Methods that change what a name holds: a name they are called on is not the value it was
+#: assigned.
+_MUTATORS = frozenset(
+    {
+        "update",
+        "append",
+        "extend",
+        "insert",
+        "pop",
+        "popitem",
+        "remove",
+        "clear",
+        "setdefault",
+        "add",
+        "discard",
+        "sort",
+        "reverse",
+        "__setitem__",
+        "__delitem__",
+    }
+)
 
 
 class Unresolved:
     """A value the syntax does not fix. ``why`` says what it depends on, ``text`` shows it
     (the expression, or a template such as ``{env}_orders`` when part of it folded)."""
 
-    __slots__ = ("why", "text")
+    __slots__ = ("why", "text", "transient")
 
-    def __init__(self, why: str, text: str = "") -> None:
+    def __init__(self, why: str, text: str = "", transient: bool = False) -> None:
         self.why = why
         self.text = text
+        #: True for a result that depends on how deep or how long the folding ran, not on the
+        #: expression: it is never remembered.
+        self.transient = transient
 
     def __repr__(self) -> str:
         return f"Unresolved({self.why!r}, {self.text!r})"
@@ -128,6 +156,40 @@ class Scope:
     values: Dict[str, ast.expr] = field(default_factory=dict)
     blocked: Dict[str, str] = field(default_factory=dict)
     classes: Dict[str, ast.ClassDef] = field(default_factory=dict)
+
+
+def _rebound_names(tree: ast.AST) -> Dict[str, str]:
+    """Names the file changes after they are bound, which the single assignment a scope sees does
+    not fix: a ``global`` or ``nonlocal`` declaration, an item or attribute assigned
+    (``CFG["t"] = ...``), a mutating method called on the name (``CFG.update(...)``) and ``del``.
+    One pass over the tree, without recursion. ``{name: why}``."""
+    out: Dict[str, str] = {}
+
+    def base(node: ast.AST) -> Optional[str]:
+        while isinstance(node, (ast.Subscript, ast.Attribute)):
+            node = node.value
+        return node.id if isinstance(node, ast.Name) else None
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            for name in node.names:
+                out.setdefault(name, f"`{name}` is rebound by a global or nonlocal declaration")
+        elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
+            if isinstance(node, (ast.Assign, ast.Delete)):
+                targets = list(node.targets)
+            else:
+                targets = [node.target]
+            for target in targets:
+                if isinstance(target, (ast.Subscript, ast.Attribute)):
+                    name = base(target)
+                    if name is not None:
+                        out.setdefault(name, f"`{name}` is changed in place elsewhere in the file")
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in _MUTATORS:
+                name = base(node.func.value)
+                if name is not None:
+                    out.setdefault(name, f"`{name}` is changed in place elsewhere in the file")
+    return out
 
 
 def _target_names(target: ast.AST) -> List[str]:
@@ -256,6 +318,7 @@ def format_template(
     out: List[str] = []
     auto = 0
     unresolved: Optional[str] = None
+    size = len(fmt)
     i = 0
     while i < len(fmt):
         char = fmt[i]
@@ -286,7 +349,11 @@ def format_template(
                     )
                     out.append(match.group(0))
             else:
-                out.append(str(value))
+                piece = str(value)
+                size += len(piece)
+                if size > MAX_STRING:
+                    return Unresolved(f"it is longer than {MAX_STRING} characters", "")
+                out.append(piece)
             i = match.end()
         elif char == "}":
             if fmt.startswith("}}", i):
@@ -316,6 +383,7 @@ def percent_template(
     out: List[str] = []
     used = 0
     pos = 0
+    size = len(fmt)
     for part in re.split(r"(%(?:\([^)]*\))?[A-Za-z%])", fmt):
         if not part.startswith("%"):
             if "%" in part:
@@ -348,11 +416,15 @@ def percent_template(
         if match.group("conv") == "d":
             if not isinstance(value, int) or isinstance(value, bool):
                 return Unresolved("%d takes a whole number", fmt)
-            out.append(str(value))
+            piece = str(value)
         elif match.group("conv") == "r":
-            out.append(repr(value))
+            piece = repr(value)
         else:
-            out.append(str(value))
+            piece = str(value)
+        size += len(piece)
+        if size > MAX_STRING:
+            return Unresolved(f"it is longer than {MAX_STRING} characters", "")
+        out.append(piece)
     if not keyed and pos != len(positional):
         return Unresolved("the percent format and its operands do not match", fmt)
     text = "".join(out)
@@ -483,6 +555,16 @@ class Folder:
         #: by a token and recorded here: ``{token: what it stood for}``.
         self._holes: Optional[Dict[str, str]] = None
         self._module_scope = self._scope(module.tree, None)
+        #: Folded values by ``(node, scope)``: an expression that many names refer to is folded
+        #: once, so a chain of names each built from the one before costs one pass, not a tree.
+        self._memo: Dict[Tuple[int, int], Any] = {}
+        self._nesting = 0
+        self._steps_call = 0
+        self._steps_module = 0
+        #: True once a fold was cut short by the work budget: some names are then reported as
+        #: not constant (``Unresolved`` says so), and the importer says so once per file.
+        self.exhausted = False
+        self._rebound = _rebound_names(module.tree)
 
     # scopes
 
@@ -511,22 +593,44 @@ class Folder:
     # entry points
 
     def fold(self, node: ast.AST, scope: Optional[Scope] = None, _depth: int = 0) -> Any:
-        """The value ``node`` fixes, or an :class:`Unresolved`."""
+        """The value ``node`` fixes, or an :class:`Unresolved`.
+
+        Bounded: a call visits at most :data:`MAX_STEPS_PER_FOLD` nodes and a module at most
+        :data:`MAX_STEPS_PER_MODULE` in all (past either, the answer is ``Unresolved`` and
+        :attr:`exhausted` is set), and a value already folded is remembered, so many names
+        built from the one before cost one pass each."""
         if _depth > MAX_FOLD_DEPTH:
-            return Unresolved("it is nested too deeply", snippet(node))
+            return Unresolved("it is nested too deeply", snippet(node), transient=True)
         if scope is None:
             scope = self.scope_of(node)
+        if self._nesting == 0:
+            self._steps_call = 0
+        self._steps_call += 1
+        self._steps_module += 1
+        if self._steps_call > MAX_STEPS_PER_FOLD or self._steps_module > MAX_STEPS_PER_MODULE:
+            self.exhausted = True
+            return Unresolved("it takes too much work to fold", snippet(node), transient=True)
         key = id(node)
         if key in self._active:
             return Unresolved("it refers to itself", snippet(node))
+        memo_key = (key, id(scope))
+        remember = self._holes is None
+        if remember and memo_key in self._memo:
+            return self._memo[memo_key]
         self._active.add(key)
+        self._nesting += 1
         try:
             method = getattr(self, f"_fold_{type(node).__name__}", None)
             if method is None:
-                return Unresolved(f"a {type(node).__name__} expression", snippet(node))
-            return method(node, scope, _depth + 1)
+                value: Any = Unresolved(f"a {type(node).__name__} expression", snippet(node))
+            else:
+                value = method(node, scope, _depth + 1)
         finally:
             self._active.discard(key)
+            self._nesting -= 1
+        if remember and not (isinstance(value, Unresolved) and value.transient):
+            self._memo[memo_key] = value
+        return value
 
     def fold_sql(
         self, node: ast.AST, scope: Optional[Scope] = None
@@ -635,33 +739,40 @@ class Folder:
         return result
 
     def _fold_JoinedStr(self, node: ast.JoinedStr, scope: Scope, depth: int) -> Any:
+        if len(node.values) > MAX_ITEMS:
+            return Unresolved("an f-string with too many parts", snippet(node, 60))
         parts: List[str] = []
+        size = 0
         unresolved: Optional[str] = None
         for part in node.values:
             if isinstance(part, ast.Constant):
-                parts.append(str(part.value))
-                continue
-            if not isinstance(part, ast.FormattedValue):
+                piece = str(part.value)
+            elif not isinstance(part, ast.FormattedValue):
                 return Unresolved("an f-string part", snippet(node))
-            simple = part.format_spec is None and part.conversion in (-1, ord("s"))
-            value = self.fold(part.value, scope, depth) if simple else None
-            if simple and not isinstance(value, Unresolved) and is_scalar(value):
-                parts.append(str(value))
-            elif simple and self._holes is not None:
-                parts.append(self._hole(snippet(part.value, 40)))
             else:
-                if not simple:
-                    why = "an f-string field with a format spec or conversion"
-                elif isinstance(value, Unresolved):
-                    why = value.why
+                simple = part.format_spec is None and part.conversion in (-1, ord("s"))
+                value = self.fold(part.value, scope, depth) if simple else None
+                if simple and not isinstance(value, Unresolved) and is_scalar(value):
+                    piece = str(value)
+                elif simple and self._holes is not None:
+                    piece = self._hole(snippet(part.value, 40))
                 else:
-                    why = "a value that is not text"
-                unresolved = unresolved or why
-                parts.append("{" + snippet(part.value, 40) + "}")
+                    if not simple:
+                        why = "an f-string field with a format spec or conversion"
+                    elif isinstance(value, Unresolved):
+                        why = value.why
+                    else:
+                        why = "a value that is not text"
+                    unresolved = unresolved or why
+                    piece = "{" + snippet(part.value, 40) + "}"
+            size += len(piece)
+            if size > MAX_STRING:
+                return Unresolved(f"it is longer than {MAX_STRING} characters", "")
+            parts.append(piece)
         text = "".join(parts)
         if unresolved is not None:
             return Unresolved(unresolved, text)
-        return _too_long(text) or text
+        return text
 
     def _fold_BinOp(self, node: ast.BinOp, scope: Scope, depth: int) -> Any:
         if isinstance(node.op, ast.Add):
@@ -675,6 +786,8 @@ class Folder:
             if isinstance(left, str) and isinstance(right, str):
                 return _too_long(left + right) or left + right
             if isinstance(left, list) and isinstance(right, list):
+                if len(left) + len(right) > MAX_ITEMS:
+                    return Unresolved("a list with too many items", snippet(node, 60))
                 joined = FoldedList([*left, *right])
                 joined.complete = getattr(left, "complete", True) and getattr(
                     right, "complete", True
@@ -718,12 +831,48 @@ class Folder:
     # names and attributes
 
     def _fold_Name(self, node: ast.Name, scope: Scope, depth: int) -> Any:
+        shadow = self._shadowed(node)
+        if shadow is not None:
+            return Unresolved(shadow, snippet(node))
         return self.name_value(node.id, scope, depth, node)
+
+    def _shadowed(self, node: ast.Name) -> Optional[str]:
+        """Why ``node`` is not the module's or the function's name of that spelling: a
+        comprehension or a lambda around it binds the name itself (the first iterable of a
+        comprehension is evaluated outside it, and is left alone)."""
+        parents = self.module.parents
+        child: ast.AST = node
+        current = parents.get(node)
+        from_first_iter = False
+        while current is not None:
+            if isinstance(current, ast.comprehension):
+                from_first_iter = child is current.iter
+            elif isinstance(current, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                skip_first = from_first_iter and child is current.generators[0]
+                for index, generator in enumerate(current.generators):
+                    if skip_first and index == 0:
+                        continue
+                    if node.id in _target_names(generator.target):
+                        return f"`{node.id}` is a comprehension variable"
+                from_first_iter = False
+            elif isinstance(current, ast.Lambda):
+                args = current.args
+                names = [a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)]
+                names += [a.arg for a in (args.vararg, args.kwarg) if a is not None]
+                if node.id in names:
+                    return f"`{node.id}` is a parameter of a lambda"
+            elif isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                break
+            child = current
+            current = parents.get(current)
+        return None
 
     def name_value(self, name: str, scope: Scope, depth: int, origin: ast.AST) -> Any:
         current: Optional[Scope] = scope
         while current is not None:
             if name in current.values:
+                if name in self._rebound:
+                    return Unresolved(self._rebound[name], snippet(origin))
                 return self.fold(current.values[name], current, depth)
             if name in current.blocked:
                 why = current.blocked[name]
@@ -760,6 +909,8 @@ class Folder:
         scope = self._module_scope
         if len(chain) == 1:
             return self.name_value(chain[0], scope, depth + 1, origin)
+        if chain[0] in self._rebound:
+            return Unresolved(self._rebound[chain[0]], snippet(origin))
         cls = scope.classes.get(chain[0])
         if cls is None or len(chain) > 2:
             return Unresolved(f"`{'.'.join(chain)}` is not a constant", snippet(origin))
@@ -881,6 +1032,8 @@ class Folder:
             if all(isinstance(item, str) for item in args[0]) and getattr(
                 args[0], "complete", True
             ):
+                if sum(len(item) for item in args[0]) + len(receiver) * len(args[0]) > MAX_STRING:
+                    return Unresolved(f"it is longer than {MAX_STRING} characters", "")
                 joined = receiver.join(args[0])
                 return _too_long(joined) or joined
             return Unresolved("a join of values that are not all text", snippet(node))

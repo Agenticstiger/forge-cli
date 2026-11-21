@@ -523,3 +523,103 @@ def test_the_module_does_not_import_anything_the_project_names():
     sys.modules.pop("some_project_module_that_does_not_exist", None)
     _fold("import some_project_module_that_does_not_exist as m\nx = m.T")
     assert "some_project_module_that_does_not_exist" not in sys.modules
+
+
+# ── work budgets, and names that are not what they were assigned ──────
+
+
+def _chain(levels: int, fields: int = 100) -> str:
+    lines = ['x0 = ""']
+    for level in range(1, levels + 1):
+        lines.append(f'x{level} = f"' + ("{x%d}" % (level - 1)) * fields + '"')
+    return "\n".join(lines) + f"\nx = x{levels}\n"
+
+
+def test_names_each_built_from_the_one_before_cost_one_pass_each():
+    started = time.monotonic()
+    value = _fold(_chain(7))
+    assert value == ""
+    assert time.monotonic() - started < 3  # a tree of 100 ** 7 visits without the memo
+
+
+def test_a_fan_out_deeper_than_the_budget_is_cut_not_followed_forever():
+    module = P.parse_module("m.py", _chain(10, fields=300).encode("utf-8"))
+    folder = Folder(module)
+    node = next(n for n in module.tree.body if isinstance(n, ast.Assign) and n.targets[0].id == "x")
+    started = time.monotonic()
+    value = folder.fold(node.value)
+    assert time.monotonic() - started < 3
+    assert isinstance(value, Unresolved) and "too much work" in value.why
+    assert folder.exhausted
+
+
+def test_a_result_cut_short_by_the_budget_is_not_remembered():
+    module = P.parse_module("m.py", _chain(10, fields=300).encode("utf-8"))
+    folder = Folder(module)
+    nodes = {n.targets[0].id: n.value for n in module.tree.body if isinstance(n, ast.Assign)}
+    assert isinstance(folder.fold(nodes["x"]), Unresolved)
+    # the lower levels were folded on the way: asked for directly, each is a value, not the cut
+    assert folder.fold(nodes["x3"]) == ""
+
+
+def test_a_huge_f_string_is_refused_as_it_grows_not_after():
+    big = "a" * 4000
+    started = time.monotonic()
+    too_long = _fold(f'b = "{big}"\nx = f"' + "{b}" * 50 + '"')
+    too_many = _fold('b = "a"\nx = f"' + "{b}" * 3000 + '"')
+    assert "longer than" in _why(too_long) and "too many parts" in _why(too_many)
+    assert time.monotonic() - started < 3
+    assert "longer than" in _why(_fold(f'b = "{big}"\nx = "{{}}{{}}".format(b, b)'))
+    assert "longer than" in _why(_fold(f'b = "{big}"\nx = "%s%s" % (b, b)'))
+    assert "longer than" in _why(_fold(f'b = "{big}"\nx = ",".join([b, b, b])'))
+    hundred = "[" + ",".join(["1"] * 100) + "]"
+    assert "too many items" in _why(_fold("x = " + " + ".join([hundred] * 30)))
+
+
+@pytest.mark.parametrize(
+    "source, why",
+    [
+        ('CFG = {"t": "a.t"}\nCFG["t"] = "b.t"\nx = CFG["t"]', "changed in place"),
+        ('CFG = {"t": "a.t"}\nCFG.update(t="b.t")\nx = CFG["t"]', "changed in place"),
+        ('L = ["a.t"]\nL.insert(0, "b.t")\nx = L[0]', "changed in place"),
+        ('L = ["a.t"]\ndel L[0]\nx = L', "changed in place"),
+        ('T = "a.t"\ndef init():\n    global T\n    T = "b.t"\nx = T', "global or nonlocal"),
+        ('class Cfg:\n    A = "a.t"\nCfg.A = "b.t"\nx = Cfg.A', "changed in place"),
+    ],
+)
+def test_a_name_changed_elsewhere_is_not_the_value_it_was_assigned(source, why):
+    assert why in _why(_fold(source))
+
+
+def test_reading_an_item_does_not_change_it():
+    assert _fold('D = {"k": "v"}\nprint(D["k"])\nx = D["k"]') == "v"
+
+
+def _name_in(source: str, ancestor: type, name: str) -> tuple:
+    module = P.parse_module("m.py", source.encode("utf-8"))
+    for node in ast.walk(module.tree):
+        if isinstance(node, ancestor):
+            for inner in ast.walk(node):
+                if (
+                    isinstance(inner, ast.Name)
+                    and inner.id == name
+                    and isinstance(inner.ctx, ast.Load)
+                ):
+                    return Folder(module), inner
+    raise AssertionError("no such name")
+
+
+def test_a_comprehension_or_a_lambda_that_binds_a_name_hides_the_module_constant():
+    folder, name = _name_in('T = "raw.t"\nxs = [t(T) for T in ["x.a"]]\n', ast.ListComp, "T")
+    # the name in the element is the loop variable; the module's T is not what it stands for
+    elt = next(n for n in ast.walk(name) if isinstance(n, ast.Name) and n.id == "T")
+    assert "comprehension variable" in _why(folder.fold(elt))
+    folder, name = _name_in('T = "raw.t"\nf = lambda T: T\n', ast.Lambda, "T")
+    assert "parameter of a lambda" in _why(folder.fold(name))
+
+
+def test_the_first_iterable_of_a_comprehension_is_still_the_outer_name():
+    module = P.parse_module("m.py", b'T = ["a.t", "b.t"]\nys = [t for t in T]\n')
+    folder = Folder(module)
+    comp = next(n for n in ast.walk(module.tree) if isinstance(n, ast.ListComp))
+    assert list(folder.fold(comp.generators[0].iter)) == ["a.t", "b.t"]
