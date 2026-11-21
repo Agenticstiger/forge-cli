@@ -141,6 +141,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A histogram over a declared range ends at the column's maximum.** `fluid profile` gave an
+  integer range's histogram a top edge half a unit past the declared maximum (a whole unit on
+  a grid of whole steps), so a bundle `fluxsim init` wrote from the profile read a maximum the
+  contract never declared, and flux-engine refuses bins that leave a column's range
+  (`FLX-5032`). The last edge is now the maximum itself, and the last bin, closed at the top,
+  holds it: `between 1 and 5` gets the edges 1, 2, 3, 4 and 5.
+
 - **`fluid import airflow|pyspark` keeps the DAG of an Airflow id with capitals.** Airflow takes
   `Nightly_Orders` as a `dag_id`; the contract's `dagId` and `taskId` take only lower case letters,
   digits, `_`, `.` and `-`, so such a DAG was left off the builds it runs (its schedule, its tasks

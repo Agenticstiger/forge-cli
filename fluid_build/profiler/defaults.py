@@ -14,9 +14,9 @@ column's edges (FLUX ADR 0012) and the ACRO rules for the rest.
   declares. A level no record holds is a cell of none, which the check withholds as
   ``C``, so the levels listed never depend on the records.
 - **A number whose** ``validationRules`` **declare both ends of a range** inside its
-  type: ``marginalHistogram/1`` over about ten bins of one width, exact at both ends (an
-  integer range ends half a unit past its top, a whole unit on a grid of whole steps, so
-  each value has a bin of its own). A side at or past the type's own bound declares
+  type: ``marginalHistogram/1`` over about ten bins of one width, exact at both ends: the
+  first edge is the declared minimum and the last the declared maximum, which the last bin,
+  closed at the top, holds. A side at or past the type's own bound declares
   nothing the type does not, and a range of one side is not closed: ten bins over the rest
   of the type would hold every record in one of them, so such a number takes the ladder.
 - **Any other number of a bounded type, a date or a timestamp**: ``quantile/2`` at the
@@ -239,18 +239,19 @@ def range_bins(
     The edges are the range's two ends and the multiples of one width strictly between
     them: the narrowest of 2^-k (on the grid), 1, 2, 5, 10, 20, 50 ... that cuts the range
     into at most :data:`RANGE_BINS` bins. An *integral* column (an integer type, or a
-    decimal of scale 0) takes whole widths only, and its range ends half a unit past
-    ``high`` (a whole unit on a grid of whole steps, which holds no half), so the last
-    value is not alone with the one below it in the last bin, which is closed at the top:
-    ``between 1 and 5`` gets one bin per value. The ends are rounded outward to the grid.
+    decimal of scale 0) takes whole widths only. The last edge is ``high``, the column's
+    maximum, and the last bin is closed at the top, so it holds the maximum: an edge past
+    it would leave the declared range, which flux-engine refuses (``FLX-5032``), and a
+    bundle made from such a profile would read a maximum the contract never declared.
+    ``between 1 and 5`` gets the edges 1, 2, 3, 4 and 5, the last bin holding 4 and 5. The
+    ends are rounded outward to the grid.
     The grid can be coarser than the column's own scale, so an end bin can reach past a
     bound: the runner checks each value against the range itself before it is counted
     (:class:`DeclaredRange`).
     """
     step = Fraction(1, 2**fractional_bits)
     first = math.floor(low / step) * step
-    top = high + (Fraction(1, 2) if fractional_bits >= 1 else 1) if integral else high
-    last = math.ceil(top / step) * step
+    last = math.ceil(high / step) * step
     span = high - low
     widths: List[Fraction] = (
         [] if integral else [Fraction(1, 2**power) for power in range(fractional_bits, 0, -1)]

@@ -94,19 +94,18 @@ def test_a_declared_range_gets_a_histogram_on_bins_of_one_width(tmp_path):
     )
     rows = [{"score": str(n % 101)} for n in range(400)]
     result = _profile(tmp_path, _contract([score]), rows)
-    bins = [*(str(edge) for edge in range(0, 101, 10)), "100.5"]  # 100 alone in the last bin
+    bins = [str(edge) for edge in range(0, 101, 10)]  # the last bin ends at the maximum, 100
     assert _one(result, "score", "marginalHistogram/1")["bins"] == bins
     # The histogram alone: checked beside quantiles on the same bins, the two let a reader
     # who knows the check tell worlds apart (tests/profiler/test_disclosure_oracle.py).
     definitions = [s["definition"] for s in _statistics(result, "score")]
     assert definitions == ["marginalHistogram/1"]
     (group,) = _one(result, "score", "marginalHistogram/1")["groups"]
-    # 0 to 96 are held 4 times each and 97 to 100 three times: every bin of ten publishes,
-    # and 100, alone in the last bin with 3 records, is withheld with the bin beside it.
+    # 0 to 96 are held 4 times each and 97 to 100 three times: the nine bins of ten values
+    # hold 40 each, and the last bin, 90 to 100 closed at the top, 7 * 4 + 4 * 3 = 40 too.
     assert group["status"] == "F"
-    assert group["binCounts"][:9] == [40] * 9
-    assert group["binCounts"][9:] == [None, None]
-    assert group["cellStatus"][9:] == ["C", "C"]
+    assert group["binCounts"] == [40] * 10
+    assert "cellStatus" not in group
     # Its sum, distinct count and quantiles are withheld, and it has no mean/1: each would
     # give a withheld bin back from the published ones.
     metrics = result.document["tables"]["t"]["columns"]["score"]["metrics"]
@@ -116,7 +115,7 @@ def test_a_declared_range_gets_a_histogram_on_bins_of_one_width(tmp_path):
     assert metrics["count"]["status"] == "F"
 
 
-@pytest.mark.parametrize("bits", [16, 0])  # at 0 the last bin, [5, 6], holds 6 too
+@pytest.mark.parametrize("bits", [16, 0])  # each value is checked against the range itself
 def test_a_value_outside_the_declared_range_refuses_the_profile(tmp_path, bits):
     score = (
         "score",
@@ -396,20 +395,30 @@ def test_a_declared_range_is_cut_into_about_ten_bins_on_the_grid(low, high, bits
 @pytest.mark.parametrize(
     "low, high, edges",
     [
-        (1, 5, [1, 2, 3, 4, 5, Fraction(11, 2)]),  # one bin per value, 5 not beside 4
-        (0, 100, [*range(0, 101, 10), Fraction(201, 2)]),
-        (-3, 3, [-3, -2, -1, 0, 1, 2, 3, Fraction(7, 2)]),
+        (1, 5, [1, 2, 3, 4, 5]),  # the last bin, closed at the top, holds 4 and 5
+        (0, 100, [*range(0, 101, 10)]),
+        (-3, 3, [-3, -2, -1, 0, 1, 2, 3]),
+        (0, 7, [0, 1, 2, 3, 4, 5, 6, 7]),
     ],
 )
-def test_an_integral_range_gets_whole_bins_and_half_a_unit_past_its_top(low, high, edges):
+def test_an_integral_range_gets_whole_bins_and_ends_at_its_maximum(low, high, edges):
     got = defaults.range_bins(Fraction(low), Fraction(high), 16, integral=True)
     assert list(got) == [Fraction(edge) for edge in edges]
+    # The top edge is the declared maximum: flux-engine refuses bins that leave the range.
+    assert got[-1] == Fraction(high)
 
 
-def test_on_a_grid_of_whole_steps_an_integral_range_ends_a_whole_unit_past_its_top():
-    # Half a unit is off that grid; a whole one keeps 5 out of 4's bin.
+def test_on_a_grid_of_whole_steps_an_integral_range_ends_at_its_maximum_too():
     got = defaults.range_bins(Fraction(1), Fraction(5), 0, integral=True)
-    assert list(got) == [Fraction(edge) for edge in (1, 2, 3, 4, 5, 6)]
+    assert list(got) == [Fraction(edge) for edge in (1, 2, 3, 4, 5)]
+
+
+@pytest.mark.parametrize("integral", [True, False])
+@pytest.mark.parametrize("low, high", [(0, 100), (-50, 3), (1, 2), (0, 10**12)])
+def test_no_edge_leaves_the_declared_range_on_the_grid(low, high, integral):
+    got = defaults.range_bins(Fraction(low), Fraction(high), 16, integral=integral)
+    assert got[0] == Fraction(low) and got[-1] == Fraction(high)
+    assert all(a < b for a, b in zip(got, got[1:], strict=False))
 
 
 def test_a_range_off_the_grid_is_rounded_outward_to_it():
