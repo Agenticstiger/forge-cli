@@ -519,10 +519,17 @@ def test_a_name_from_a_star_import_or_outside_the_files_is_unresolved():
     assert "not defined" in _why(_fold("from star import *\nx = T"))
 
 
-def test_the_module_does_not_import_anything_the_project_names():
-    sys.modules.pop("some_project_module_that_does_not_exist", None)
-    _fold("import some_project_module_that_does_not_exist as m\nx = m.T")
-    assert "some_project_module_that_does_not_exist" not in sys.modules
+def test_the_module_does_not_import_anything_the_project_names(tmp_path, monkeypatch):
+    # a module that really exists on sys.path and does something when it is imported
+    marker = tmp_path / "imported"
+    (tmp_path / "project_probe_module.py").write_text(
+        f"open({str(marker)!r}, 'w').write('x')\nT = 'from the module'\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules.pop("project_probe_module", None)
+    value = _fold("import project_probe_module as m\nx = m.T")
+    assert isinstance(value, Unresolved)  # a name in another module is not read by running it
+    assert not marker.exists() and "project_probe_module" not in sys.modules
 
 
 # ── work budgets, and names that are not what they were assigned ──────

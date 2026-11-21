@@ -557,20 +557,23 @@ def test_two_dags_in_one_file_keep_their_tasks_and_edges_apart():
 
 
 def test_airflow_is_never_imported_and_the_file_never_runs(tmp_path):
-    marker = tmp_path / "ran"
+    before, inside, after = (tmp_path / name for name in ("before", "inside", "after"))
     sys.modules.pop("airflow", None)
     found = dags(
         f"""
         from airflow import DAG
         from airflow.operators.bash import BashOperator
-        open({str(marker)!r}, "w").write("x")
+        open({str(before)!r}, "w").write("x")
         with DAG("d"):
+            open({str(inside)!r}, "w").write("x")
             BashOperator(task_id="t", bash_command="rm -rf /")
+        open({str(after)!r}, "w").write("x")
         raise SystemExit(2)
         """
     )
     assert [d.dag_id for d in found.dags] == ["d"]
-    assert not marker.exists() and "airflow" not in sys.modules
+    assert not (before.exists() or inside.exists() or after.exists())
+    assert "airflow" not in sys.modules
 
 
 # ── spark-submit is read as the command line it is ────────────────────

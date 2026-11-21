@@ -260,6 +260,9 @@ def test_building_the_parser_and_taking_a_builtin_read_no_metadata(monkeypatch):
     parser = _parser()  # register() builds the parser
     assert parser.parse_args(["import", "dbt", "proj"]).tool == "dbt"
     assert parser.parse_args(["import", "schema-registry", "s"]).tool == "schema-registry"
+    # the scanner is the one that would have been used: a name that is not a built-in reads it
+    with pytest.raises(AssertionError, match="entry-point metadata read"):
+        parser.parse_args(["import", "some-plugin", "src"])
 
 
 def test_the_import_help_lists_plugin_names_and_loads_nothing(eps, capsys, monkeypatch):
