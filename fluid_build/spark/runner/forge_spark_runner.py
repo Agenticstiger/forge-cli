@@ -958,6 +958,12 @@ def _check_package(config: dict) -> None:
         raise JobConfigError("a package build's dead letters are package.deadLetter")
     if not isinstance((config["sql"] or {}).get("check"), str):
         raise JobConfigError("a package build carries sql.check, the query its rows are checked by")
+    _check_package_fields(package)
+    if package.get("deadLetter") is not None:
+        _check_package_dead_letters(package["deadLetter"])
+
+
+def _check_package_fields(package: dict) -> None:
     if not (isinstance(package.get("sha256"), str) and _SHA256.fullmatch(package["sha256"])):
         raise JobConfigError("package.sha256 must be 64 lowercase hex characters")
     entry = package.get("entryPoint")
@@ -970,9 +976,9 @@ def _check_package(config: dict) -> None:
         raise JobConfigError("package.arguments must map names to strings")
     if not (isinstance(package.get("schema"), str) and package["schema"]):
         raise JobConfigError("package.schema must hold the output's declared columns")
-    dead = package.get("deadLetter")
-    if dead is None:
-        return
+
+
+def _check_package_dead_letters(dead) -> None:
     cap = dead.get("maxRecordsBeforeAbort") if isinstance(dead, dict) else None
     if (
         not isinstance(dead, dict)
@@ -1115,6 +1121,27 @@ def import_entry_point(entry_point: str, zips):
     module_name, _, qualname = entry_point.partition(":")
     parts = module_name.split(".")
     chain = [".".join(parts[: i + 1]) for i in range(len(parts))]
+    _refuse_loaded_elsewhere(chain, zips)
+    importlib.invalidate_caches()
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as exc:  # noqa: BLE001 - the package's own import, whatever it raised
+        raise PackageError(
+            f"importing {module_name} from the package failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    _refuse_imported_elsewhere(chain, zips)
+    function = module
+    for attribute in qualname.split("."):
+        try:
+            function = getattr(function, attribute)
+        except AttributeError:
+            raise PackageError(f"{module_name} has no {qualname}") from None
+    _check_callable(function, entry_point)
+    return function
+
+
+def _refuse_loaded_elsewhere(chain, zips) -> None:
+    """Before the import: a module of the entry point's name loaded from anywhere else."""
     for name in chain:
         loaded = sys.modules.get(name)
         if loaded is not None and not _inside(_origin(loaded), zips):
@@ -1124,40 +1151,34 @@ def import_entry_point(entry_point: str, zips):
                 "; a module of that name is on the runtime's Python path: take it out of the "
                 "image, or rename the package's"
             )
-    importlib.invalidate_caches()
-    try:
-        module = importlib.import_module(module_name)
-    except Exception as exc:  # noqa: BLE001 - the package's own import, whatever it raised
-        raise PackageError(
-            f"importing {module_name} from the package failed: {type(exc).__name__}: {exc}"
-        ) from exc
+
+
+def _refuse_imported_elsewhere(chain, zips) -> None:
+    """After it: the entry module, and each parent with a file of its own, from the package
+    (a parent without one is a namespace package, which holds no code)."""
     for name in chain:
         origin = _origin(sys.modules.get(name))
-        if (origin is not None or name == module_name) and not _inside(origin, zips):
+        if (origin is not None or name == chain[-1]) and not _inside(origin, zips):
             raise PackageError(
                 f"{name} was imported from {origin}, not from the package: a module of that "
                 "name comes first on the runtime's Python path; take it out of the image, or "
                 "rename the package's"
             )
-    function = module
-    for attribute in qualname.split("."):
-        try:
-            function = getattr(function, attribute)
-        except AttributeError:
-            raise PackageError(f"{module_name} has no {qualname}") from None
+
+
+def _check_callable(function, entry_point: str) -> None:
     if not callable(function):
         raise PackageError(f"{entry_point} is not a function")
     try:
         signature = inspect.signature(function)
     except (TypeError, ValueError):
-        return function  # nothing to read the parameters from: the call says
+        return  # nothing to read the parameters from: the call says
     try:
         signature.bind(None, None)
     except TypeError:
         raise PackageError(
             f"{entry_point} takes {signature}; a package's entry point takes (spark, context)"
         ) from None
-    return function
 
 
 class PackageContext:
@@ -1316,23 +1337,31 @@ def sql_write(text) -> str | None:
     if head in _SQL_READS:
         return None
     if head == "CREATE":
-        rest = [t for t in tokens[1:6] if t not in "()"]
-        at = 2 if rest[:2] == ["OR", "REPLACE"] else 0
-        at += 1 if rest[at : at + 1] == ["GLOBAL"] else 0
-        if rest[at : at + 1] in (["TEMP"], ["TEMPORARY"]) and rest[at + 1 : at + 2] == ["VIEW"]:
-            return None
-        return "CREATE"
+        return None if _temporary_view(tokens) else "CREATE"
     if head in _SQL_PREFIXES:
-        depth = 0
-        for token in tokens:
-            if token == "(":
-                depth += 1
-            elif token == ")":
-                depth -= 1
-            elif depth == 0 and token in _SQL_PREFIXED_WRITES:
-                return token
-        return None
+        return _top_level_write(tokens)
     return head
+
+
+def _temporary_view(tokens: list) -> bool:
+    """``CREATE [OR REPLACE] [GLOBAL] TEMP|TEMPORARY VIEW``: a view of this session only."""
+    rest = [t for t in tokens[1:6] if t not in "()"]
+    at = 2 if rest[:2] == ["OR", "REPLACE"] else 0
+    at += 1 if rest[at : at + 1] == ["GLOBAL"] else 0
+    return rest[at : at + 1] in (["TEMP"], ["TEMPORARY"]) and rest[at + 1 : at + 2] == ["VIEW"]
+
+
+def _top_level_write(tokens: list) -> str | None:
+    """The write verb a read's prefix leads to, at the top level (outside parentheses)."""
+    depth = 0
+    for token in tokens:
+        if token == "(":
+            depth += 1
+        elif token == ")":
+            depth -= 1
+        elif depth == 0 and token in _SQL_PREFIXED_WRITES:
+            return token
+    return None
 
 
 def _sql_tokens(text: str) -> list:
@@ -1342,33 +1371,12 @@ def _sql_tokens(text: str) -> list:
     i, n = 0, len(text)
     while i < n:
         c = text[i]
-        if text.startswith("--", i):
-            end = text.find("\n", i)
-            i = n if end < 0 else end + 1
-        elif text.startswith("/*", i):
-            depth, i = 1, i + 2
-            while depth:
-                if i >= n:
-                    raise ValueError("comment")
-                if text.startswith("/*", i):
-                    depth, i = depth + 1, i + 2
-                elif text.startswith("*/", i):
-                    depth, i = depth - 1, i + 2
-                else:
-                    i += 1
+        if text.startswith(("--", "/*"), i):
+            i = _end_of_comment(text, i)
         elif c in "'\"":
             i = _end_of_string(text, i, raw=False)
         elif c == "`":
-            end = i + 1
-            while True:
-                end = text.find("`", end)
-                if end < 0:
-                    raise ValueError("name")
-                if text.startswith("``", end):
-                    end += 2
-                    continue
-                break
-            i = end + 1
+            i = _end_of_name(text, i)
         elif c in "()":
             tokens.append(c)
             i += 1
@@ -1384,6 +1392,36 @@ def _sql_tokens(text: str) -> list:
         else:
             i += 1
     return tokens
+
+
+def _end_of_comment(text: str, start: int) -> int:
+    """Past a ``--`` line comment, or a ``/* */`` one, which may nest as Spark's do."""
+    if text.startswith("--", start):
+        end = text.find("\n", start)
+        return len(text) if end < 0 else end + 1
+    depth, i = 1, start + 2
+    while depth:
+        if i >= len(text):
+            raise ValueError("comment")
+        if text.startswith("/*", i):
+            depth, i = depth + 1, i + 2
+        elif text.startswith("*/", i):
+            depth, i = depth - 1, i + 2
+        else:
+            i += 1
+    return i
+
+
+def _end_of_name(text: str, start: int) -> int:
+    """Past a backquoted name, where a doubled backquote is one of its own characters."""
+    end = start + 1
+    while True:
+        end = text.find("`", end)
+        if end < 0:
+            raise ValueError("name")
+        if not text.startswith("``", end):
+            return end + 1
+        end += 2
 
 
 def _end_of_string(text: str, start: int, *, raw: bool) -> int:
@@ -1501,12 +1539,12 @@ def table_marker(spark, table: str) -> tuple:
     return int(count), str(last), None if main is None else int(main[0])
 
 
-def _load_package(spark, location: str, package: dict):
-    """The entry point, imported from the verified bytes, which addPyFile also hands to
-    every executor (from the driver: no executor reads the store)."""
+def _add_package(spark, location: str, sha: str) -> list:
+    """The verified bytes on the driver's Python path and handed to every executor by
+    addPyFile (from the driver: no executor reads the store); the copies the entry point
+    may be imported from."""
     from pyspark import SparkFiles
 
-    sha = package["sha256"]
     path = fetch_package(spark, location, sha)
     spark.sparkContext.addPyFile(path)
     # addPyFile copies the file into Spark's own directory and puts that copy on the path.
@@ -1515,9 +1553,7 @@ def _load_package(spark, location: str, package: dict):
         raise PackageError(
             "Spark's copy of the package is not the pinned one; nothing was imported"
         )
-    function = import_entry_point(package["entryPoint"], [path, copy])
-    log("package_loaded", entry_point=package["entryPoint"], sha256=sha)
-    return function
+    return [path, copy]
 
 
 def _conformed_columns(spark, output, ddl: str) -> list:
@@ -1592,6 +1628,61 @@ def write_package_output(checked, table: str, columns, sha: str) -> None:
     )
 
 
+def _not_written(failed: int, failures: dict, dead) -> str:
+    if dead is None:
+        return (
+            f"{failed} rows of the package's output fail the contract's checks "
+            f"({_reasons(failures)}) and the build has no dead letters: nothing was written. "
+            "Fix the package, or add properties.package.deadLetter"
+        )
+    return (
+        f"{failed} rows went to the dead letters ({_reasons(failures)}), past "
+        f"maxRecordsBeforeAbort {dead['maxRecordsBeforeAbort']}: the output was not written"
+    )
+
+
+def _call_package(spark, package: dict, zips: list, context) -> object:
+    """Import the entry point and call it, with writes refused throughout: what the
+    package's modules run as they are imported counts as the package's too."""
+    guard = WriteGuard()
+    with guard:
+        function = import_entry_point(package["entryPoint"], zips)
+        log("package_loaded", entry_point=package["entryPoint"], sha256=package["sha256"])
+        output = function(spark, context)
+    if guard.refused:
+        raise PackageError(
+            f"the package tried to write while it ran ({', '.join(guard.refused)}); a package "
+            "returns its DataFrame, and the runner writes it. Nothing was written"
+        )
+    return output
+
+
+def _land(spark, config: dict, checked, columns, run_id: str, before: dict) -> None:
+    """Count what the checks refused, refuse a table changed behind the runner's back, then
+    land the dead letters and the output as :func:`package_outcome` says."""
+    package, sink = config["package"], config["sink"]
+    table, dead = f"{sink['catalog']}.{sink['table']}", package.get("deadLetter")
+    counts = {row[0]: int(row[1]) for row in checked.groupBy(ERROR_COLUMN).count().collect()}
+    failures = {reason: n for reason, n in counts.items() if reason is not None}
+    failed = sum(failures.values())
+    changed = [t for t in before if table_marker(spark, t) != before[t]]
+    if changed:
+        raise PackageError(
+            f"{', '.join(changed)} changed while the package ran: a commit the runner did not "
+            "make. The runner wrote nothing; read the table's snapshots and roll back what the "
+            "package wrote"
+        )
+    land, write = package_outcome(failed, dead)
+    if land:
+        dead_table = f"{sink['catalog']}.{dead['table']}"
+        write_package_dead_letters(spark, checked, dead_table, columns, run_id, package["sha256"])
+        log("dead_letters", table=dead_table, records=failed, reasons=failures)
+    if not write:
+        raise PackageError(_not_written(failed, failures, dead))
+    write_package_output(checked, table, columns, package["sha256"])
+    log("done", table=table, rows=sum(counts.values()) - failed, dead_letters=failed)
+
+
 def run_package(spark, config: dict, config_uri: str) -> None:
     """Run a prebuilt package's entry point by digest and write what it returns (see this
     section's comment). Raises PackageError when the runner writes no output."""
@@ -1601,7 +1692,6 @@ def run_package(spark, config: dict, config_uri: str) -> None:
     package, sink = config["package"], config["sink"]
     table = f"{sink['catalog']}.{sink['table']}"
     dead = package.get("deadLetter")
-    dead_table = f"{sink['catalog']}.{dead['table']}" if dead else None
     log(
         "start",
         product=config["product"],
@@ -1614,9 +1704,10 @@ def run_package(spark, config: dict, config_uri: str) -> None:
     create_sink_table(spark, config)
     for statement in (dead or {}).get("create") or []:
         spark.sql(statement)
-    function = _load_package(spark, package_location(config_uri, package["sha256"]), package)
+    zips = _add_package(spark, package_location(config_uri, package["sha256"]), package["sha256"])
     run_id = str(spark.sparkContext.applicationId)
-    watched = [t for t in (table, dead_table) if t]
+    # Before the package's code runs at all, its import included.
+    watched = [table] + ([f"{sink['catalog']}.{dead['table']}"] if dead else [])
     before = {t: table_marker(spark, t) for t in watched}
     context = PackageContext(
         arguments=types.MappingProxyType(dict(package["arguments"])),
@@ -1626,54 +1717,16 @@ def run_package(spark, config: dict, config_uri: str) -> None:
         run_id=run_id,
         package_sha256=package["sha256"],
     )
-    guard = WriteGuard()
-    with guard:
-        output = function(spark, context)
-    if guard.refused:
-        raise PackageError(
-            f"the package tried to write while it ran ({', '.join(guard.refused)}); a package "
-            "returns its DataFrame, and the runner writes it. Nothing was written"
-        )
+    output = _call_package(spark, package, zips, context)
     columns = _conformed_columns(spark, output, package["schema"])
     output.select(*columns).createOrReplaceTempView(PACKAGE_VIEW)
     queries = config["sql"]
     checked = spark.sql(queries["check"])
-    # Computed once for both writes: Spark recomputes a lost block from the package's
-    # plan, so a package's output should be deterministic.
+    # Computed once for the count and both writes: Spark recomputes a lost block from the
+    # package's plan, so a package's output should be deterministic.
     checked = checked.persist(StorageLevel.MEMORY_AND_DISK)
     try:
-        counts = {row[0]: int(row[1]) for row in checked.groupBy(ERROR_COLUMN).count().collect()}
-        failures = {reason: n for reason, n in counts.items() if reason is not None}
-        failed = sum(failures.values())
-        changed = [t for t in watched if table_marker(spark, t) != before[t]]
-        if changed:
-            raise PackageError(
-                f"{', '.join(changed)} changed while the package ran: a commit the runner did "
-                "not make. The runner wrote nothing; read the table's snapshots and roll back "
-                "what the package wrote"
-            )
-        land, write = package_outcome(failed, dead)
-        if land:
-            write_package_dead_letters(
-                spark, checked, dead_table, columns, run_id, package["sha256"]
-            )
-            log("dead_letters", table=dead_table, records=failed, reasons=failures)
-        if not write:
-            raise PackageError(
-                (
-                    f"{failed} rows of the package's output fail the contract's checks "
-                    f"({_reasons(failures)}) and the build has no dead letters: nothing was "
-                    "written. Fix the package, or add properties.package.deadLetter"
-                )
-                if dead is None
-                else (
-                    f"{failed} rows went to the dead letters ({_reasons(failures)}), past "
-                    f"maxRecordsBeforeAbort {dead['maxRecordsBeforeAbort']}: the output was "
-                    "not written"
-                )
-            )
-        write_package_output(checked, table, columns, package["sha256"])
-        log("done", table=table, rows=sum(counts.values()) - failed, dead_letters=failed)
+        _land(spark, config, checked, columns, run_id, before)
     finally:
         checked.unpersist()
 

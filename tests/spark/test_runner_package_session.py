@@ -241,6 +241,30 @@ def test_a_commit_made_around_the_runner_fails_the_run(spark, runner_module, tmp
     assert "fluid.package.sha256" not in commit["summary"]
 
 
+AT_IMPORT = (
+    JOBS
+    + """
+
+from pyspark.sql import SparkSession
+
+# Run as the module is imported, before any entry point is called.
+SparkSession.getActiveSession().sql(
+    "INSERT INTO fluid.commerce.orders SELECT 'x', named_struct('id', 'c', 'email', "
+    "CAST(NULL AS STRING)), CAST(1 AS DECIMAL(18,2)), DATE '2026-11-20'"
+)
+"""
+)
+
+
+def test_a_write_the_package_makes_as_it_is_imported_is_stopped(
+    spark, runner_module, tmp_path, monkeypatch
+):
+    config, config_uri, _ = _deploy(tmp_path, monkeypatch, jobs=AT_IMPORT)
+    with pytest.raises(runner_module.PackageError, match="INSERT statement is refused"):
+        runner_module.run_package(spark, runner_module.parse_config(json.dumps(config)), config_uri)
+    assert not _snapshots(spark, OUTPUT)
+
+
 WRONG = JOBS.replace('.cast("decimal(18,2)")', '.cast("double")')
 
 
