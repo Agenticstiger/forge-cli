@@ -264,6 +264,9 @@ def _file_state(path: Path, data: bytes, *, guarded: bool) -> str:
     * ``new``: nothing is there;
     * ``special``: a link, a directory, a device or anything that is not a regular file: it is
       never read and never written, whatever the flags;
+    * ``inaccessible``: the path cannot be looked at (a folder above it that this process may not
+      enter, a name in the path that is a file): nobody can say what is there, so it is never
+      written, whatever the flags;
     * ``overwrite``: a regular file, for an importer that always replaces it;
     * ``unchanged`` / ``different``: a regular file, for a guarded importer, holding the bytes
       it would write (line endings aside) or other bytes. The file is read as far as it could
@@ -276,7 +279,7 @@ def _file_state(path: Path, data: bytes, *, guarded: bool) -> str:
     except FileNotFoundError:
         return "new"
     except OSError:
-        return "special"
+        return "inaccessible"
     if not stat.S_ISREG(info.st_mode):
         return "special"
     if not guarded:
@@ -357,6 +360,19 @@ def _shown(paths, limit: int = 5) -> str:
 
 
 def _refuse_overwrites(planned: list, *, force: bool) -> None:
+    blind = [path for path, _text, state in planned if state == "inaccessible"]
+    if blind:
+        raise SchemaValidationError(
+            what=f"cannot look at {len(blind)} path(s) this import would write",
+            why=(
+                f"{_shown(blind)}: a folder above it cannot be entered, or a name in the path is "
+                "a file, so nobody can say what is there. Nothing was written, with or without "
+                "--force."
+            ),
+            fix="Fix the permissions of the folder, or choose another --out.",
+            doc="https://agenticstiger.github.io/forge_docs/cli/import.html",
+            extras={"files": [clean_chars(str(p)) for p in blind]},
+        )
     special = [path for path, _text, state in planned if state == "special"]
     if special:
         raise SchemaValidationError(
@@ -405,6 +421,7 @@ def _state_label(state: str, force: bool) -> str:
         "unchanged": "unchanged",
         "overwrite": "replaces the existing file",
         "special": "refused: not a regular file",
+        "inaccessible": "refused: cannot be looked at",
     }.get(state, state)
 
 
@@ -436,7 +453,8 @@ def _print_dry_run_summary(planned: list, *, force: bool) -> None:
     replaceable = sum(1 for s in states if s in _REPLACEABLE)
     writes = sum(1 for s in states if s in ("new", "overwrite")) + (replaceable if force else 0)
     same = states.count("unchanged")
-    refused = states.count("special") + (0 if force else replaceable)
+    refused = states.count("special") + states.count("inaccessible")
+    refused += 0 if force else replaceable
     parts = [f"{writes} file(s) would be written"]
     if same:
         parts.append(f"{same} unchanged")

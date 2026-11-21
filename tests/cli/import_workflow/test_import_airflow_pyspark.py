@@ -887,8 +887,9 @@ def test_the_splits_about_code_belong_to_the_importers_that_read_code(project, a
     assert "applies to `fluid import airflow` and `fluid import pyspark`" in refused.value.what
 
 
-def test_the_printed_lines_are_clean_and_never_wrapped(project, capsys, monkeypatch):
-    monkeypatch.setenv("COLUMNS", "40")
+def test_the_printed_lines_are_clean_and_longer_than_the_default_width_stay_one_line(
+    project, capsys
+):
     name = "jobs/evil‮ name.py"
     (project / "jobs" / "evil‮ name.py").write_text(
         'from pyspark.sql import SparkSession\ndf.write.saveAsTable("retail.evil")\n',
@@ -902,6 +903,28 @@ def test_the_printed_lines_are_clean_and_never_wrapped(project, capsys, monkeypa
         "retail.orders_daily  (owner retail-data) → out/contract.retail.orders_daily.fluid.yaml [new]"
         in out
     )
+
+
+def test_a_narrow_terminal_does_not_wrap_the_lines_that_name_a_file(project):
+    """The console reads its width from the environment when it is made, so the width is set
+    before the process starts."""
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "COLUMNS": "40", "NO_COLOR": "1", "PYTHONIOENCODING": "utf-8"}
+    done = subprocess.run(
+        [sys.executable, "-m", "fluid_build.cli", "import", *ARGV, "--dry-run"],
+        cwd=project,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert done.returncode == 0, done.stderr
+    proposal = "retail.orders_daily  (owner retail-data) → out/contract.retail.orders_daily.fluid.yaml [new]"
+    assert proposal in done.stdout, done.stdout
+    assert "Dry run: nothing was written. 3 file(s) would be written." in done.stdout
 
 
 def test_an_unread_command_is_listed_without_advice_about_script_roots(tmp_path, monkeypatch):
@@ -970,6 +993,29 @@ def test_a_file_that_cannot_be_read_is_replaced_only_with_force_and_says_why(pro
     finally:
         locked.chmod(0o644)
     assert "TODO: declare the columns" in locked.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(
+    hasattr(__import__("os"), "geteuid") and __import__("os").geteuid() == 0,
+    reason="root can enter any folder",
+)
+def test_a_folder_that_cannot_be_entered_is_said_so_and_nothing_is_written(project, capsys):
+    out_dir = project / "out"
+    out_dir.mkdir()
+    out_dir.chmod(0o000)
+    try:
+        assert run(parse(*ARGV, "--dry-run"), LOG) == 0
+        shown = capsys.readouterr().out
+        assert "[refused: cannot be looked at]" in shown and "3 refused" in shown
+        assert "not a regular file" not in shown
+        for extra in ((), ("--force",)):
+            with pytest.raises(FluidUserError) as refused:
+                run(parse(*ARGV, *extra), LOG)
+            assert "cannot look at 3 path(s)" in refused.value.what
+            assert "with or without --force" in refused.value.why
+    finally:
+        out_dir.chmod(0o755)
+    assert list(out_dir.iterdir()) == []
 
 
 def test_an_import_with_nothing_to_write_does_not_complain_about_out(project, capsys):
