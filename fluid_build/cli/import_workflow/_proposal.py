@@ -35,12 +35,16 @@ The rules, in one place:
 from __future__ import annotations
 
 import copy
+import hashlib
 import re
+import shlex
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from ._conventions import Conventions, PathRule
+from ._pysource import clean_chars
 from ._scan import JobRecord, LinkedTask
 from ._spark_io import Ref, Write
 from .registry import ImportReport
@@ -75,61 +79,194 @@ _RUNTIME_PLATFORM = {
 }
 
 
+#: Longest identifier written: a table or job name from the code is not trusted to be short.
+_MAX_IDENT = 120
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+
+
 def ident(text: str, fallback: str = "x") -> str:
-    """``text`` as a FLUID identifier: lower case, ``[a-z0-9_.-]``, starting and ending with
-    a letter, digit or underscore."""
-    cleaned = _BAD.sub("-", str(text).strip().lower())
+    """``text`` as a FLUID identifier: lower case, ``[a-z0-9_.-]``, starting and ending with a
+    letter, digit or underscore, at most 120 characters. Accents are folded (``café`` is
+    ``cafe``); a name with no ASCII letter or digit in it, or one that is cut, ends in a short
+    digest of the text, so two such names stay two names."""
+    raw = str(text).strip()
+    folded = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
+    cleaned = _BAD.sub("-", folded.lower())
     cleaned = re.sub(r"\.{2,}", ".", re.sub(r"-{2,}", "-", cleaned)).strip(".-")
-    return cleaned or fallback
+    if not cleaned:
+        return f"{fallback}-{_digest(raw)}" if raw else fallback
+    if len(cleaned) > _MAX_IDENT:
+        cleaned = cleaned[: _MAX_IDENT - 9].rstrip(".-") + "-" + _digest(raw)
+    return cleaned
+
+
+def _unique(base: str, taken: Set[str], separator: str) -> str:
+    """``base``, or ``base`` with a number after it, whichever is not in ``taken`` yet: a name
+    that already ends in ``_2`` is not a reason to hand ``_2`` out twice."""
+    candidate, number = base, 2
+    while candidate in taken:
+        candidate = ident(f"{base}{separator}{number}")
+        number += 1
+    taken.add(candidate)
+    return candidate
 
 
 def safe_text(text: Any, limit: int = 200) -> str:
-    """Text from the scanned code made safe to print and to write into a contract: control
-    characters (an escape sequence, a newline) become spaces, a credential-shaped value is masked
-    (a ``--password`` in a task's arguments), and it is cut at ``limit``."""
+    """Text from the scanned code made safe to print and to write into a contract: control,
+    line-separator and bidirectional characters are gone (an escape sequence, a new line), a
+    credential-shaped value is masked, and it is cut at ``limit``."""
     from fluid_build.observability.secret_redactor import redact_secret_text
 
-    cleaned = "".join(" " if ord(c) < 32 or ord(c) == 127 else c for c in str(text))
-    cleaned = redact_secret_text(" ".join(cleaned.split()))
+    cleaned = redact_secret_text(" ".join(clean_chars(text).split()))
     return cleaned if len(cleaned) <= limit else cleaned[: limit - 3] + "..."
+
+
+_REDACTED = "***REDACTED***"
+#: A shell word: unquoted characters, escapes and quoted parts, as written.
+_SHELL_WORD = re.compile(r"""(?:[^\s'"\\]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+""")
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*=")
+#: Words that make a name a credential's: the redactor's own list covers ``password``, ``secret``,
+#: ``token`` and the like inside a name; these are the ones that need to be a whole word
+#: (``keyPassword`` and ``access-key`` are credentials, ``keyspace`` is not).
+_SECRET_WORDS = frozenset({"pass", "pwd", "key", "keys", "cred", "creds", "sas", "signature"})
+_NAME_PARTS = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
+_PASSWORD_SHORT_FLAGS = frozenset({"-p", "-w"})
+_MAX_COMMAND_TEXT = 20_000
+
+
+def _sensitive_name(name: str) -> bool:
+    """Whether a flag, an environment variable or a configuration key holds a credential."""
+    from fluid_build.observability.secret_redactor import is_sensitive_key_name
+
+    name = name.strip().lstrip("-")
+    if not name:
+        return False
+    if is_sensitive_key_name(name.replace("-", "_")):
+        return True
+    return any(part.lower() in _SECRET_WORDS for part in _NAME_PARTS.split(name) if part)
+
+
+class _Words:
+    """Decides, word by word, what a command line or an argument list may show. A word that
+    is nothing to hide is returned as it is, so a command keeps the quoting it was written in."""
+
+    def __init__(self, depth: int = 0) -> None:
+        self.depth = depth
+        self._mask_next = False
+        self._setting_next: Optional[str] = None
+        self._user_next = False
+
+    def show(self, value: str) -> str:
+        from fluid_build.observability.secret_redactor import redact_secret_text
+
+        if self._mask_next:
+            self._mask_next = False
+            if not value.startswith("-"):
+                return _REDACTED
+        if self._setting_next is not None:
+            flag, self._setting_next = self._setting_next, None
+            return self._setting(value, flag)
+        if self._user_next:
+            self._user_next = False
+            user, colon, _secret = value.partition(":")
+            if colon:
+                return f"{user}:{_REDACTED}"
+        if value.startswith("-") and len(value) > 1:
+            flag, equals, rest = value.partition("=")
+            if flag in {"--conf", "-c"}:
+                if equals:
+                    return f"{flag}={self._setting(rest, flag)}"
+                self._setting_next = flag
+                return value
+            if _sensitive_name(flag) or flag in _PASSWORD_SHORT_FLAGS:
+                if equals:
+                    return f"{flag}={_REDACTED}"
+                self._mask_next = True
+                return value
+            if flag == "-u" and not equals:
+                self._user_next = True
+            return redact_secret_text(value)
+        if _ASSIGNMENT.match(value):
+            name, _, _rest = value.partition("=")
+            if _sensitive_name(name):
+                return f"{name}={_REDACTED}"
+        if self.depth < 2 and any(c.isspace() for c in value):
+            return _redact_command(value, self.depth + 1)  # ``bash -c "PGPASSWORD=x ..."``
+        return redact_secret_text(value)
+
+    def _setting(self, value: str, flag: str) -> str:
+        """The value after ``--conf`` or ``-c``: ``key=value``, or, after ``-c`` when what comes
+        before the ``=`` is not a dotted configuration key (``bash -c "PGPASSWORD=x run"``), a
+        command line."""
+        from fluid_build.observability.secret_redactor import redact_secret_text
+
+        key, equals, _rest = value.partition("=")
+        is_setting = (
+            equals and not any(c.isspace() for c in key) and (flag == "--conf" or "." in key)
+        )
+        if is_setting:
+            return f"{key}={_REDACTED}" if _sensitive_name(key) else redact_secret_text(value)
+        if self.depth < 2 and any(c.isspace() for c in value):
+            return _redact_command(value, self.depth + 1)
+        return redact_secret_text(value)
+
+
+def _unquote(raw: str) -> str:
+    try:
+        parts = shlex.split(raw)
+    except ValueError:
+        return raw
+    return parts[0] if len(parts) == 1 else raw
+
+
+def _gap(text: str, *, edge: bool) -> str:
+    """The text between two words: a line continuation is a space, and a new line a command
+    separator (at the start or end of the command it is nothing)."""
+    if "\n" not in text:
+        return text
+    if edge:
+        return " "
+    return " " if "\\" in text else "; "
+
+
+def _redact_command(command: str, depth: int = 0) -> str:
+    """``command`` with the values of credentials masked, word by word, keeping what is not
+    one exactly as written (quoting, ``$VAR``, ``{{ ds }}``)."""
+    words = _Words(depth)
+    out: List[str] = []
+    position = 0
+    first = True
+    for match in _SHELL_WORD.finditer(command):
+        out.append(_gap(command[position : match.start()], edge=first))
+        first = False
+        raw = match.group(0)
+        value = _unquote(raw)
+        shown = words.show(value)
+        if shown == value:
+            out.append(raw)
+        else:
+            out.append(shlex.quote(shown) if any(c.isspace() for c in shown) else shown)
+        position = match.end()
+    out.append(_gap(command[position:], edge=True))
+    return "".join(out)
 
 
 def safe_args(args: Sequence[str], limit: int = 200) -> List[str]:
     """Arguments of a submitted job, safe to write: a credential-shaped value is masked, and so is
-    the value after a flag whose name is one (``--password hunter2``, ``--token=abc``)."""
-    from fluid_build.observability.secret_redactor import is_sensitive_key_name
-
-    out: List[str] = []
-    mask_next = False
-    for arg in args:
-        if mask_next:
-            out.append("***REDACTED***")
-            mask_next = False
-            continue
-        text = str(arg)
-        if text.startswith("-"):
-            flag, equals, _value = text.partition("=")
-            if is_sensitive_key_name(flag.lstrip("-").replace("-", "_")):
-                if equals:
-                    out.append(f"{flag}=***REDACTED***")
-                else:
-                    out.append(safe_text(text, limit))
-                    mask_next = True
-                continue
-        out.append(safe_text(text, limit))
-    return out
+    the value after a flag whose name is one (``--password hunter2``, ``-p hunter2``, ``--token=abc``,
+    ``--conf spark.hadoop.fs.s3a.secret.key=abc``) and the value of ``NAME=value`` when the name is.
+    """
+    words = _Words()
+    return [safe_text(words.show(str(arg)), limit) for arg in args]
 
 
 def safe_command(command: str, limit: int = 500) -> str:
-    """A command line, safe to write: split into words, :func:`safe_args`, joined again. A command
-    that does not split (unbalanced quotes) is cleaned as plain text."""
-    import shlex
-
-    try:
-        words = shlex.split(command)
-    except ValueError:
-        return safe_text(command, limit)
-    return safe_text(shlex.join(safe_args(words, limit)), limit)
+    """A command line, safe to write: each word is looked at as :func:`safe_args` does, and the
+    words that are nothing to hide stay as written. New lines between commands become ``;``."""
+    return safe_text(_redact_command(command[:_MAX_COMMAND_TEXT]), limit)
 
 
 @dataclass(frozen=True)
@@ -150,7 +287,8 @@ class Identity:
             return ("table", self.database or "", self.name)
         if self.kind == "topic":
             return ("topic", self.name)
-        return ("path", (self.location or self.name).lower())
+        # case-sensitive: on an object store ``s3://b/Orders`` and ``s3://b/orders`` are two paths
+        return ("path", self.location or self.name)
 
     @property
     def shown(self) -> str:
@@ -328,33 +466,58 @@ class _Ctx:
     reported: set = field(default_factory=set)
 
 
-def _stem(job: JobRecord) -> str:
-    return PurePosixPath(job.rel).stem
-
-
-def _job_label(job: JobRecord) -> str:
-    return ident(_stem(job), fallback="job")
+def _job_labels(jobs: Sequence[JobRecord]) -> Dict[str, str]:
+    """A label for each job, by its absolute path: its file name without ``.py``, or, when two of
+    the jobs would share that, its path under the scanned directory (``a-main`` and ``b-main``,
+    not both ``main``)."""
+    stems: Dict[str, Set[str]] = {}
+    for job in jobs:
+        stems.setdefault(ident(PurePosixPath(job.rel).stem, fallback="job"), set()).add(
+            str(job.path)
+        )
+    labels: Dict[str, str] = {}
+    for job in jobs:
+        stem = ident(PurePosixPath(job.rel).stem, fallback="job")
+        if len(stems[stem]) == 1:
+            labels[str(job.path)] = stem
+        else:
+            parts = PurePosixPath(job.rel).with_suffix("").parts
+            labels[str(job.path)] = ident("-".join(parts), fallback="job")
+    return labels
 
 
 def _groups(outputs: List[Output], split_by: str, conv: Conventions, root_name: str) -> List[Group]:
-    if split_by == "table":
-        return [Group(label=product_id(o.identity, conv), outputs=[o]) for o in outputs]
-    keyed: Dict[str, Group] = {}
+    """The products: outputs grouped by what the split is about. Groups are keyed by what they
+    are (a job's absolute path, a DAG id, a folder, ``None`` for files at the top), never by
+    the label made from it, so two jobs named alike are two products."""
+    keyed: Dict[Tuple[Any, ...], Group] = {}
+    writers = list({str(o.writer.path): o.writer for o in outputs}.values())
+    labels = _job_labels(writers)
     for output in outputs:
         job = output.writer
-        if split_by == "job":
-            label = _job_label(job)
+        key: Tuple[Any, ...]
+        if split_by == "table":
+            key, label = ("table", *output.identity.key), product_id(output.identity, conv)
+        elif split_by == "job":
+            key, label = ("job", str(job.path)), labels[str(job.path)]
         elif split_by == "dag":
             dag_ids = sorted({link.dag.dag_id for link in job.tasks if link.dag.dag_id})
-            label = ident(dag_ids[0]) if dag_ids else _job_label(job)
+            if dag_ids:
+                key, label = ("dag", dag_ids[0]), ident(dag_ids[0])
+            else:
+                key, label = ("job", str(job.path)), labels[str(job.path)]
         elif split_by == "folder":
-            head = job.rel.split("/")[0] if "/" in job.rel else "root"
-            label = ident(head, fallback="root")
+            head = job.rel.split("/")[0] if "/" in job.rel else None
+            key = ("folder", head)
+            label = ident(head if head is not None else root_name, fallback="root")
         else:  # project
-            label = ident(root_name, fallback="project")
+            key, label = ("project",), ident(root_name, fallback="project")
         if conv.domain and split_by != "table":
             label = ident(f"{conv.domain}.{label}")
-        keyed.setdefault(label, Group(label=label)).outputs.append(output)
+        group = keyed.get(key)
+        if group is None:
+            group = keyed[key] = Group(label=label)
+        group.outputs.append(output)
     return list(keyed.values())
 
 
@@ -436,6 +599,7 @@ def build_proposal(
 
     # ── outputs, and what has no identity ─────────────────────────
     outputs: Dict[Tuple[str, ...], Output] = {}
+    seen_notes: Set[Tuple[Any, ...]] = set()
     ignored = 0
     for job in ordered:
         for write in job.facts.writes:
@@ -453,6 +617,14 @@ def build_proposal(
             if existing is None:
                 outputs[identity.key] = Output(identity, job, write)
             elif existing.writer is job:
+                mark = ("catalogs", job.shown, identity.key)
+                if existing.identity.catalog != identity.catalog and mark not in seen_notes:
+                    seen_notes.add(mark)
+                    report.notes.append(
+                        f"{safe_text(job.shown, 80)} writes {safe_text(existing.identity.shown, 80)} "
+                        f"and {safe_text(identity.shown, 80)}, which differ only by catalog: they "
+                        "are proposed as one output"
+                    )
                 continue
             else:
                 existing.others.append((job, write))
@@ -470,24 +642,28 @@ def build_proposal(
     flat = sorted(outputs.values(), key=lambda o: (o.writer.shown, o.write.line, o.identity.shown))
     groups = _groups(flat, split_by, conv, root_name)
 
-    # who produces what, for consumes[]
+    # who produces what, for consumes[]: an id is handed out once, whatever the names look like
     produced: Dict[Tuple[str, ...], Tuple[str, str]] = {}
     group_ids: Dict[int, str] = {}
-    used_ids: Dict[str, int] = {}
+    taken_ids: Set[str] = set()
+    groups_of_job: Dict[str, Set[int]] = {}
     for index, group in enumerate(groups):
-        base = group.label
-        count = used_ids.get(base, 0)
-        used_ids[base] = count + 1
-        pid = base if count == 0 else ident(f"{base}-{count + 1}")
+        pid = _unique(group.label, taken_ids, "-")
         group_ids[index] = pid
-        used_eids: Dict[str, int] = {}
+        taken_eids: Set[str] = set()
         for output in group.outputs:
-            eid = expose_id(output.identity)
-            n = used_eids.get(eid, 0)
-            used_eids[eid] = n + 1
-            if n:
-                eid = ident(f"{eid}_{n + 1}")
+            eid = _unique(expose_id(output.identity), taken_eids, "_")
             produced[output.identity.key] = (pid, eid)
+            groups_of_job.setdefault(str(output.writer.path), set()).add(index)
+    for job in ordered:
+        if len(groups_of_job.get(str(job.path), ())) > 1 and any(
+            r.resolved for r in job.facts.reads
+        ):
+            report.notes.append(
+                f"{safe_text(job.shown, 80)} writes outputs that are in different products: the "
+                "code does not say which input feeds which output, so each of those products "
+                "lists all of the job's inputs in consumes[]"
+            )
 
     ctx = _Ctx(
         version=version,
@@ -571,20 +747,20 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
     # builds
     builds: List[Dict[str, Any]] = []
     build_ids: Dict[int, str] = {}
-    taken: Dict[str, int] = {}
+    taken: Set[str] = set()
+    labels = _job_labels(writer_jobs)
     for job in writer_jobs:
-        bid = _job_label(job)
-        count = taken.get(bid, 0)
-        taken[bid] = count + 1
-        if count:
-            bid = ident(f"{bid}-{count + 1}")
-        build_ids[id(job)] = bid
+        build_ids[id(job)] = _unique(labels[str(job.path)], taken, "-")
     task_build: Dict[Tuple[str, int, str], str] = {}
     for job in writer_jobs:
         for link in job.tasks:
             task_build[(link.dag.file, link.dag.line, link.task.key)] = build_ids[id(job)]
     for job in writer_jobs:
-        builds.append(_build(job, group, build_ids, task_build, expose_by_key, conv, report, pid))
+        builds.append(
+            _build(
+                job, group, build_ids, task_build, expose_by_key, conv, report, pid, ctx.reported
+            )
+        )
 
     # consumes
     consumes: List[Dict[str, Any]] = []
@@ -623,6 +799,15 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
                 purpose = f"read by {safe_text(job.shown, 80)}; no scanned job writes it"
                 known = False
                 external.setdefault((other_pid, other_eid), identity.shown)
+            if other_pid == pid:
+                mark = ("own-id", pid, other_eid)
+                if mark not in ctx.reported:
+                    ctx.reported.add(mark)
+                    report.notes.append(
+                        f"{pid}: reads {safe_text(identity.shown, 80)}, which the id rule gives "
+                        "this product's own id: not listed in consumes[]"
+                    )
+                continue
             if (other_pid, other_eid) in seen:
                 continue
             seen.add((other_pid, other_eid))
@@ -676,6 +861,7 @@ def _build(
     conv: Conventions,
     report: ImportReport,
     pid: str,
+    reported: set,
 ) -> Dict[str, Any]:
     writes = [w for w in job.facts.writes if w.resolved]
     mine = [o for o in group.outputs if o.writer is job]
@@ -699,7 +885,7 @@ def _build(
     if platform:
         execution["runtime"] = {"platform": platform}
     if links:
-        orchestration = _orchestration(links, task_build, build_ids[id(job)], report, pid)
+        orchestration = _orchestration(links, task_build, build_ids[id(job)], report, pid, reported)
         if orchestration:
             execution["orchestration"] = orchestration
     build["execution"] = execution
@@ -729,14 +915,20 @@ def _orchestration(
     build_id: str,
     report: ImportReport,
     pid: str,
+    reported: set,
 ) -> Optional[Dict[str, Any]]:
     first = links[0]
     dag = first.dag
     if not dag.dag_id or not _AIRFLOW_ID.fullmatch(dag.dag_id):
-        report.unsupported.append(
-            f"{pid}: the DAG id {safe_text(dag.dag_id or dag.shown, 60)!r} does not match the contract's "
-            "DAG id pattern (lower case letters, digits, '_', '.', '-'), so the DAG is not recorded on the build"
-        )
+        mark = ("dag-id", dag.file, dag.line)
+        if mark not in reported:  # one DAG feeds several jobs: say it once
+            reported.add(mark)
+            report.unsupported.append(
+                f"{safe_text(dag.file, 80)}:{dag.line} the DAG id "
+                f"{safe_text(dag.dag_id or dag.shown, 60)!r} does not match the contract's DAG id "
+                "pattern (lower case letters, digits, '_', '.', '-'), so the DAG is not recorded "
+                "on the builds it runs"
+            )
         return None
     others = sorted({link.dag.dag_id for link in links if link.dag is not dag and link.dag.dag_id})
     if others:
@@ -760,10 +952,14 @@ def _orchestration(
             continue
         task = link.task
         if not task.task_id or not _AIRFLOW_ID.fullmatch(task.task_id):
-            report.unsupported.append(
-                f"{pid}: the task id {safe_text(task.shown, 60)!r} in DAG {dag.dag_id} does not match the "
-                "contract's task id pattern, so the task is not recorded"
-            )
+            mark = ("task-id", task.file, task.line)
+            if mark not in reported:
+                reported.add(mark)
+                report.unsupported.append(
+                    f"{safe_text(task.file, 80)}:{task.line} the task id "
+                    f"{safe_text(task.shown, 60)!r} in DAG {safe_text(dag.dag_id, 60)} does not "
+                    "match the contract's task id pattern, so the task is not recorded"
+                )
             continue
         params: Dict[str, Any] = {
             "runtime": link.submit.runtime,

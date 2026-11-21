@@ -24,7 +24,6 @@ not read.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -34,6 +33,7 @@ from ._conventions import Conventions
 from ._fold import ModuleIndex
 from ._pysource import (
     SourceUnreadable,
+    clean_chars,
     find_python_files,
     might_contain_dag,
     parse_module,
@@ -88,10 +88,14 @@ class DagScan:
 
 
 def _display(path: Path, rel: str) -> str:
+    """The path as reports and contracts show it: relative to the working directory when the
+    file is under it, else relative to the scanned directory. A file name can hold a new line or
+    an escape sequence: it is cleaned here, once, for everything that shows it."""
     try:
-        return path.resolve().relative_to(Path.cwd().resolve()).as_posix()
-    except (ValueError, OSError):
-        return rel
+        shown = path.resolve().relative_to(Path.cwd().resolve()).as_posix()
+    except (ValueError, OSError, RuntimeError):
+        shown = rel
+    return clean_chars(shown)
 
 
 def scan_jobs(root: Path, conventions: Conventions) -> JobScan:
@@ -155,7 +159,8 @@ def scan_dags(root: Path, conventions: Conventions) -> DagScan:
         if not might_contain_dag(data):
             continue
         try:
-            module = parse_module(source.rel, data)
+            # the path as the job files show theirs, so a DAG's notes name a file a person can open
+            module = parse_module(_display(source.path, source.rel), data)
         except SourceUnreadable as exc:
             scan.unreadable[source.rel] = str(exc)
             continue
@@ -173,9 +178,22 @@ def scan_dags(root: Path, conventions: Conventions) -> DagScan:
 def _inside(path: Path, roots: Sequence[Path]) -> bool:
     try:
         resolved = path.resolve()
-    except OSError:
+    except (OSError, RuntimeError):  # RuntimeError: a symlink loop, before Python 3.13
         return False
     return any(resolved == r or r in resolved.parents for r in roots)
+
+
+def _stays_inside(relative: str) -> bool:
+    """Whether ``relative``, joined to a directory, stays under it, judged on the text alone and
+    before any file is looked at: not absolute, no drive letter, no ``..`` part, no NUL. A path
+    in a DAG file is the DAG file's text, so it does not get to ask the file system about
+    anything outside the directories the scan is about."""
+    if not relative or "\x00" in relative:
+        return False
+    text = relative.replace("\\", "/")
+    if text.startswith("/") or (len(text) > 1 and text[1] == ":"):
+        return False
+    return ".." not in text.split("/")
 
 
 def _segments(script: str) -> List[str]:
@@ -192,13 +210,16 @@ def local_script(
     relative path inside the project; ``None`` when neither names an existing file."""
     for prefix, directory in conventions.script_roots:
         if script.startswith(prefix):
-            candidate = directory / script[len(prefix) :]
-            if candidate.is_file() and _inside(candidate, [directory]):
+            rest = script[len(prefix) :]
+            if not _stays_inside(rest):
+                return None
+            candidate = directory / rest
+            if _inside(candidate, [directory]) and candidate.is_file():
                 return candidate
             return None
-    if "://" not in script and not os.path.isabs(script) and project_root is not None:
+    if "://" not in script and project_root is not None and _stays_inside(script):
         candidate = project_root / script
-        if candidate.is_file() and _inside(candidate, [project_root]):
+        if _inside(candidate, [project_root]) and candidate.is_file():
             return candidate
     return None
 

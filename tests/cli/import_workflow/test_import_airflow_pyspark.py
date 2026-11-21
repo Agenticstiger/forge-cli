@@ -338,7 +338,8 @@ def test_split_by_job_dag_folder_and_project(project):
     assert [c["productId"] for c in orders["consumes"]] == ["retail.orders_raw", "retail.customers"]
 
     folder, _ = pyspark({"split_by": "folder"})
-    assert {c["id"] for c in folder} == {"retail.root", "retail.ingest", "retail.serve"}
+    # the files at the top of the scanned directory are named after it, like the project split
+    assert {c["id"] for c in folder} == {"retail.jobs", "retail.ingest", "retail.serve"}
 
     everything, _ = pyspark({"split_by": "project"})
     assert [c["id"] for c in everything] == ["retail.jobs"]  # the scanned directory's name

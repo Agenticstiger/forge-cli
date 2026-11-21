@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import os
+import unicodedata
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -268,6 +269,25 @@ def ancestors(node: ast.AST, parents: Dict[ast.AST, ast.AST]) -> Iterable[ast.AS
     while node in parents:
         node = parents[node]
         yield node
+
+
+def clean_chars(text: object) -> str:
+    """``text`` without the characters that can rewrite what a terminal shows or hide what a
+    reader sees: control characters (a new line, an escape sequence) and line and paragraph
+    separators become spaces, and format characters (bidirectional marks, zero-width
+    characters) are dropped. Text from the scanned code goes through this before it is
+    printed or written."""
+    value = str(text)
+    if value.isprintable():
+        return value
+    out: List[str] = []
+    for char in value:
+        category = unicodedata.category(char)
+        if category in ("Cc", "Zl", "Zp"):
+            out.append(" ")
+        elif category != "Cf":
+            out.append(char)
+    return "".join(out)
 
 
 def snippet(node: ast.AST, limit: int = 80) -> str:
