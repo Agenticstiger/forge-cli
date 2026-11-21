@@ -149,16 +149,16 @@ class ProviderOptions:
     # Core connection settings
     account: str
     user: str
-    password: Optional[str] = None
+    password: Optional[str] = field(default=None, repr=False)
     private_key_path: Optional[str] = None
-    private_key_passphrase: Optional[str] = None
+    private_key_passphrase: Optional[str] = field(default=None, repr=False)
     role: Optional[str] = None
     warehouse: Optional[str] = None
     database: Optional[str] = None
     schema: Optional[str] = None
 
     # Authentication options
-    oauth_token: Optional[str] = None
+    oauth_token: Optional[str] = field(default=None, repr=False)
     authenticator: Optional[str] = None
     # Workload identity federation (``authenticator`` WORKLOAD_IDENTITY): the provider
     # (OIDC, AWS, AZURE, GCP) and, for OIDC, the file holding the ID token.
@@ -260,9 +260,9 @@ class MonitoringConfig:
     alert_on_security_events: bool = True
 
     # Integration settings
-    slack_webhook: Optional[str] = None
-    pagerduty_integration_key: Optional[str] = None
-    datadog_api_key: Optional[str] = None
+    slack_webhook: Optional[str] = field(default=None, repr=False)
+    pagerduty_integration_key: Optional[str] = field(default=None, repr=False)
+    datadog_api_key: Optional[str] = field(default=None, repr=False)
 
     # Retention settings
     metrics_retention_days: int = 30

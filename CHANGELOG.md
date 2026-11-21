@@ -277,6 +277,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `variant`, as DuckDB's `UNION` already does, and the schema-drift gate reads the two as one
   type family, so a contract written that way does not fail at apply.
 
+### Security
+
+- **No dataclass prints a secret in its repr.** A dataclass's generated repr prints every field,
+  so a debug line, an f-string with `!r` or a traceback that shows locals would put a credential
+  in a log. 24 fields that hold one are now `field(repr=False)`:
+  - the environments an OpenTofu apply, a build runner, a local Spark run and `fluid ship`'s
+    stages get, which hold `BAO_TOKEN` and the state passphrase;
+  - API keys and tokens for LLM providers, DataHub, Entropy Data, OpenMetadata, Airbyte and
+    lineage, plus the lineage endpoint, which may carry a token in its query;
+  - Snowflake's password, key passphrase, OAuth token and monitoring keys;
+  - the PII hook's HMAC key, the masked values of a `--discover` URI, deployment secrets and GCP
+    credentials.
+
+  A static test walks every dataclass in `fluid_build/`. It fails when a field named for a secret,
+  or an environment held as a mapping, stays in the repr; fields whose names hold no secret are
+  listed with the reason.
+
 ## [0.36.0] — 2026-11-19
 
 ### Added

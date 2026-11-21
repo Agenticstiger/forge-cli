@@ -16,7 +16,7 @@ import json
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -77,8 +77,8 @@ class DeploymentConfig:
     namespace: Optional[str] = None
     region: Optional[str] = None
     resources: Optional[Dict[str, Any]] = None
-    env_vars: Optional[Dict[str, str]] = None
-    secrets: Optional[Dict[str, str]] = None
+    env_vars: Optional[Dict[str, str]] = field(default=None, repr=False)
+    secrets: Optional[Dict[str, str]] = field(default=None, repr=False)
 
     def __post_init__(self):
         if self.resources is None:

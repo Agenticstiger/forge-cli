@@ -86,7 +86,7 @@ def _resolve_default_key() -> bytes:
 @dataclass
 class TokenizePiiHook:
     name: str = "tokenize_pii"
-    hmac_key: Optional[bytes] = None
+    hmac_key: Optional[bytes] = field(default=None, repr=False)
     tokenize: Optional[Callable[[Any], str]] = None
     sensitive_labels: Optional[List[str]] = None
 

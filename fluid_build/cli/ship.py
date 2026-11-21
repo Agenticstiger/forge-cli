@@ -34,7 +34,7 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
@@ -503,7 +503,7 @@ class _Context:
     opts: st.ShipOptions
     ci: _ci_output.CiOutput
     fluid_bin: List[str]
-    child_env: Dict[str, str]
+    child_env: Dict[str, str] = field(repr=False)  # holds the store token ship hands on
     logger: logging.Logger
     run_id: str
     fresh: bool  # this run bundles: it starts a new report, never merges an old one

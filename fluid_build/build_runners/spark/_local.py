@@ -160,7 +160,7 @@ class LocalHost:
     """Where local runs live: the contract's directory, and the operator's environment."""
 
     workspace: Path
-    env: Mapping[str, str] = field(default_factory=lambda: os.environ)
+    env: Mapping[str, str] = field(default_factory=lambda: os.environ, repr=False)
 
     def runtime_dir(self, product: str) -> Path:
         return Path(self.workspace) / ".fluid" / product / "runtime" / "spark"
