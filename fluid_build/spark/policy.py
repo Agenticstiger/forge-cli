@@ -29,6 +29,31 @@ class SparkPolicyError(FluidUserError):
     code: str = "SparkPolicyError"
 
 
+def refuse_unless_package_allowed(
+    product_id: Any, build_id: Any, uri: str, environ: Optional[Mapping[str, str]] = None
+) -> None:
+    """Raise unless :data:`~fluid_build.spark.package.PACKAGE_ALLOWLIST_ENV` lists the place
+    a build's prebuilt package comes from. An unset list allows nothing."""
+    from fluid_build.spark.package import PACKAGE_ALLOWLIST_ENV, listed
+
+    if listed(uri, environ):
+        return
+    place = uri.rsplit("/", 1)[0] + "/"
+    raise SparkPolicyError(
+        what=f"Spark build {build_id!r} runs a prebuilt package from {place}",
+        why=(
+            f"{place} is not in {PACKAGE_ALLOWLIST_ENV}. A package's code runs inside the job "
+            "with its role, so the operator names the places packages may come from (the "
+            f"team's write-once artifact store, say). An unset list allows nothing ({product_id})."
+        ),
+        fix=(
+            "Have the operator list the store in the real environment (a project .env cannot "
+            f'set it), as a whole prefix: export {PACKAGE_ALLOWLIST_ENV}="{place}".'
+        ),
+        doc=doc_url(),
+    )
+
+
 def refuse_unless_contract_sql_allowed(
     product_id: Any, build: Mapping[str, Any], environ: Optional[Mapping[str, str]] = None
 ) -> None:

@@ -816,14 +816,17 @@ def compile_job_config(
         raise ValueError(f"{where}: parameters.spark.runtime: expected one of {list(RUNTIMES)}")
     props = build.get("properties") or {}
     stream_spec, mapping, sql = props.get("stream"), props.get("mapping"), props.get("sql")
+    package_spec = props.get("package")
     mode = cfg.get("mode") or ("streaming" if stream_spec is not None else "batch")
     if mode not in MODES:
         raise ValueError(f"{where}: parameters.spark.mode: expected one of {list(MODES)}")
     if sql is not None and mapping is not None:
         raise ValueError(f"{where}: declare properties.mapping or properties.sql, not both")
-    if mode == "streaming" and stream_spec is None:
+    if package_spec is not None:
+        _check_package_build(props, mode, where)
+    elif mode == "streaming" and stream_spec is None:
         raise ValueError(f"{where}: a streaming job reads the records properties.stream declares")
-    if mode == "batch" and (stream_spec is not None or sql is None):
+    if mode == "batch" and package_spec is None and (stream_spec is not None or sql is None):
         # A batch read of a topic sees only what Kafka still retains, so overwriting the
         # table with it would drop every older row; a stream keeps its position instead.
         raise ValueError(
@@ -948,10 +951,24 @@ def compile_job_config(
         if not (isinstance(mask_key, str) and _SECRET_ARN.fullmatch(mask_key)):
             raise ValueError(f"{where}: parameters.spark.maskKeySecretArn: expected a secret ARN")
         _refuse_unless_mask_key_allowed(mask_key, environ)
-    if sql is not None:
+    queries: dict[str, Any]
+    package_block: Optional[dict[str, Any]] = None
+    if package_spec is not None:
+        package_block = _package_block(
+            package_spec, cfg["runtime"], fields, database, table, local, where
+        )
         if contract_sql_gate:
-            refuse_unless_contract_sql_allowed(product, build, environ)
-        select = bind_by_name(_contract_sql(sql, bid), fields)
+            # The code the contract brings, as its own SQL is: the operator's to approve.
+            from fluid_build.spark.policy import refuse_unless_package_allowed
+
+            refuse_unless_package_allowed(product, bid, package_spec["uri"], environ)
+        queries = {"check": package_block.pop("check")}
+    else:
+        if sql is not None:
+            if contract_sql_gate:
+                refuse_unless_contract_sql_allowed(product, build, environ)
+            select = bind_by_name(_contract_sql(sql, bid), fields)
+        queries = {"source": source_sql, "select": select}
 
     config = {
         "configVersion": CONFIG_VERSION,
@@ -959,19 +976,23 @@ def compile_job_config(
         "build": bid,
         "mode": mode,
         "source": source,
-        "sql": {"source": source_sql, "select": select},
+        "sql": queries,
         **streaming,
         "sink": _sink(local, resolved, database, table, fields),
         "maskedColumns": masked,
         # The secret's ARN, never its value: the runner reads the key with the job's role.
         "maskKey": {"secretArn": mask_key} if masked else None,
     }
+    if package_block is not None:
+        config["package"] = package_block
     if dead_letters is not None:
         _add_dead_letters(config, dead_letters, masked=bool(masked))
     if local and host_gate:
         tables = [f"{database}.{table}"]
         if dead_letters is not None and dead_letters.get("table"):
             tables.append(str(dead_letters["table"]))
+        if package_block is not None and package_block["deadLetter"]:
+            tables.append(str(package_block["deadLetter"]["table"]))
         _refuse_unless_namespace_listed(
             bid, local_namespace_scope(resolved), database, tables, environ
         )
@@ -1046,6 +1067,72 @@ def _dead_letter_block(
     if local:
         block["create"] = dead_letter.create_statements(CATALOG, database, name)
     return block
+
+
+def _check_package_build(props: Mapping[str, Any], mode: str, where: str) -> None:
+    """A build with ``properties.package``: a batch PySpark job, computed by the package
+    alone (:mod:`fluid_build.spark.package`)."""
+    given = [k for k in ("sql", "mapping", "stream") if props.get(k) is not None]
+    if given:
+        raise ValueError(
+            f"{where}: properties.package runs in place of properties.sql, properties.mapping "
+            f"and properties.stream; this build also declares {', '.join(given)}"
+        )
+    if mode != "batch":
+        raise ValueError(
+            f"{where}: a package build is a batch job (parameters.spark.mode: batch); a "
+            "streaming package is not supported yet"
+        )
+    if props.get("language") not in (None, "pyspark"):
+        raise ValueError(f"{where}: properties.language: a package build runs pyspark")
+
+
+def _package_block(
+    spec: Any,
+    runtime: Any,
+    fields: Any,
+    database: str,
+    table: str,
+    local: bool,
+    where: str,
+) -> dict[str, Any]:
+    """The job config's ``package``: the digest the runner checks the copy beside the job
+    config against, the entry point and its arguments, the output's declared columns and
+    types, and the dead letters' table; plus ``check``, the query that gives each row its
+    dead-letter reason, which goes into ``sql``. Where the team published the package is not
+    in it: the runner reads forge's copy only."""
+    from fluid_build.spark import package as _package
+
+    parsed = _package.parse_package(spec, runtime, where)
+    if any(name.casefold() == dead_letter.ERROR_COLUMN for name, _ in fields):
+        raise ValueError(
+            f"{where}: the output declares a column named {dead_letter.ERROR_COLUMN}, which the "
+            "runner keeps each row's dead-letter reason in; rename it"
+        )
+    dead: Optional[dict[str, Any]] = None
+    if parsed.dead_letter is not None:
+        name = parsed.dead_letter["table"] or dead_letter.table_name(table)
+        if name.casefold() == table.casefold():
+            raise ValueError(
+                f"{where}: properties.package.deadLetter.table: the output's own table; the "
+                "dead letters need a table of their own"
+            )
+        dead = {
+            "table": f"{database}.{validate_ident(name)}",
+            "maxRecordsBeforeAbort": parsed.dead_letter["maxRecordsBeforeAbort"],
+        }
+        if local:
+            dead["create"] = dead_letter.create_statements(
+                CATALOG, database, name, dead_letter.BATCH_COLUMNS
+            )
+    return {
+        "sha256": parsed.sha256,
+        "entryPoint": parsed.entry_point,
+        "arguments": dict(parsed.arguments),
+        "schema": spark_schema(fields),
+        "deadLetter": dead,
+        "check": dead_letter.output_check_select(fields),
+    }
 
 
 def validation_errors(contract: Mapping[str, Any]) -> list[str]:
@@ -1136,6 +1223,16 @@ def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
         sql_warning = contract_sql_warning(CONTRACT_SQL_ALLOWLIST_ENV, contract, build)
         if sql_warning:
             warnings.append(sql_warning)
+        package = props.get("package")
+        if isinstance(package, Mapping) and isinstance(package.get("uri"), str):
+            from fluid_build.spark.package import PACKAGE_ALLOWLIST_ENV, listed
+
+            if not listed(package["uri"]):
+                warnings.append(
+                    f"Build {build.get('id')}: not in {PACKAGE_ALLOWLIST_ENV}: "
+                    f"{package['uri'].rsplit('/', 1)[0]}/; fluid apply refuses the build until "
+                    "the operator lists where its package comes from"
+                )
         namespace = _local_namespace(contract, build)
         if namespace is not None and not local_namespace_listed(*namespace):
             warnings.append(
