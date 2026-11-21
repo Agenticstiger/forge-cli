@@ -279,7 +279,7 @@ class _PublishFlowMixin:
                     pid = prod.get("id")
                     if pid:
                         listed.add(str(pid))
-            except Exception:  # noqa: BLE001 — best effort; fall back to PUT-and-pray
+            except Exception:  # noqa: BLE001  (best effort: fall back to PUT-and-pray)
                 listed = set()
             existing_product_ids = listed
 
