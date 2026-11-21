@@ -23,14 +23,15 @@ DMM_API_URL   (optional)  Base URL, default ``https://api.entropy-data.com``.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from fluid_build.providers.base import BaseProvider, ProviderError
 from fluid_build.util.contract import (
@@ -121,6 +122,14 @@ from fluid_build.providers.datamesh_manager._ids import (
     dmm_product_id,
     needs_existing_ids,
     with_dmm_product_ids,
+)
+from fluid_build.providers.datamesh_manager._lifecycle import (
+    PUBLISH_STATUSES,
+    ProductRetiredError,
+    product_status,
+    promotion_blocker,
+    set_product_status,
+    status_to_send,
 )
 from fluid_build.providers.datamesh_manager._odps_helpers import (
     ensure_odps_archetype_custom_property,
@@ -220,6 +229,14 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             Also publish a companion data contract (default False).
         contract_format : str
             ``"odcs"`` (default) or ``"dcs"`` for the companion data contract.
+        status : str | None
+            ``"draft"`` or ``"active"`` to manage the product's lifecycle: that status is
+            sent over the contract's own, a draft never demotes a product Entropy holds as
+            active, and a retired product is refused (:class:`ProductRetiredError`).
+            ``None`` (default) sends the contract's own status and changes nothing else.
+        held_product_ids : Collection[str] | None
+            The product ids Entropy holds, when the caller already read them (a batch reads
+            the list once). ``None`` reads them here, when an upstream id needs them.
         """
         dry_run: bool = kw.get("dry_run", False)
         team_id: Optional[str] = kw.get("team_id")
@@ -232,6 +249,8 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         validation_mode: str = kw.get("validation_mode", "warn")
         odps_lineage_mode: Optional[str] = kw.get("odps_lineage_mode")
         auto_approve_access: Optional[bool] = kw.get("auto_approve_access")
+        status: Optional[str] = kw.get("status")
+        held_product_ids: Optional[Collection[str]] = kw.get("held_product_ids")
 
         self._require_api_key()
 
@@ -254,6 +273,8 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                 validation_mode=validation_mode,
                 odps_lineage_mode=odps_lineage_mode,
                 auto_approve_access=auto_approve_access,
+                status=status,
+                held_product_ids=held_product_ids,
             )
             results.append(result)
 
@@ -355,6 +376,52 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         self._require_api_key()
         resp = self._request("DELETE", f"/api/dataproducts/{product_id}")
         return resp.status_code in (200, 204)
+
+    def promote_product(self, product_id: str, *, dry_run: bool = False) -> Dict[str, Any]:
+        """Promote a draft data product to active: ``GET`` it, set its status, ``PUT`` it back.
+
+        The body goes back as Entropy returned it with only the status changed, so nothing
+        else about the product moves (the same read-modify-write the contract retirement
+        uses). Returns ``{"product_id", "outcome", "from", ...}``: ``outcome`` is
+        ``"promoted"``, or ``"skipped"`` with a ``reason`` when the product is already active,
+        deprecated or retired (see :func:`_lifecycle.promotion_blocker`). With ``dry_run`` it
+        reads the product and says ``"would-promote"``, writing nothing. Raises
+        :class:`ProviderError` when the product does not exist or cannot be read or written.
+        """
+        self._require_api_key()
+        path = f"/api/dataproducts/{quote(product_id, safe='')}"
+        found, body = self._read_json_or_none(path)
+        if found is False:
+            raise ProviderError(
+                f"Data product {product_id!r} is not in Entropy Data: publish it first "
+                "(fluid datamesh-manager publish --status draft)."
+            )
+        if not found or not isinstance(body, dict):
+            raise ProviderError(
+                f"Could not read data product {product_id!r} from Entropy Data; "
+                "see the warning above for the cause."
+            )
+        current = product_status(body)
+        blocker = promotion_blocker(current)
+        if blocker:
+            return {
+                "product_id": product_id,
+                "outcome": "skipped",
+                "from": current,
+                "reason": blocker,
+            }
+        if dry_run:
+            return {"product_id": product_id, "outcome": "would-promote", "from": current}
+        promoted = copy.deepcopy(body)
+        set_product_status(promoted, "active")
+        self._request("PUT", path, json_body=promoted)
+        self._log.info("Promoted data product %s: %s -> active", product_id, current)
+        return {
+            "product_id": product_id,
+            "outcome": "promoted",
+            "from": current,
+            "url": f"{self.api_url}/dataproducts/{product_id}",
+        }
 
     def list_products(self) -> List[Dict[str, Any]]:
         """GET all data products, every page (Entropy pages the list at 1000)."""
@@ -519,18 +586,26 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         validation_mode: str = "warn",
         odps_lineage_mode: Optional[str] = None,
         auto_approve_access: Optional[bool] = None,
+        status: Optional[str] = None,
+        held_product_ids: Optional[Collection[str]] = None,
     ) -> Dict[str, Any]:
+        if status is not None and status not in PUBLISH_STATUSES:
+            raise ProviderError(
+                f"Invalid product status {status!r}: expected one of "
+                f"{', '.join(PUBLISH_STATUSES)}. A retired product is never sent."
+            )
         # One spelling of every product id, this one's and its upstreams' (Entropy ids
         # are case-sensitive): see ``_ids.with_dmm_product_ids``.
-        fluid = with_dmm_product_ids(
-            fluid,
-            self._held_product_ids() if not dry_run and needs_existing_ids(fluid) else None,
-        )
+        if held_product_ids is None and not dry_run and needs_existing_ids(fluid):
+            held_product_ids = self._held_product_ids()
+        fluid = with_dmm_product_ids(fluid, held_product_ids)
         dp = self._to_data_product(
             fluid,
             data_product_specification=data_product_specification,
         )
         product_id = dp.get("id") or self._extract_id(fluid)
+        if status is not None:
+            set_product_status(dp, status)
 
         # Refuse a contract-id collision before anything is sent or previewed.
         # The same contract-level check the exporters call, by the same helper
@@ -631,6 +706,14 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                 "url": f"{self.api_url}/api/dataproducts/{product_id}",
                 "payload": dp,
             }
+            if status is not None:
+                result["status"] = status
+                if status == "draft":
+                    # A dry run makes no call, so it cannot read what Entropy holds.
+                    result["status_note"] = (
+                        "On publish, a product Entropy already holds as active or deprecated "
+                        "keeps that status; draft never demotes."
+                    )
             access_previews = self._preview_access_agreements(
                 fluid,
                 product_id,
@@ -655,6 +738,21 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             )
             return result
 
+        # What the product named before this publish: the contracts it no longer names
+        # are retired below, and (with a managed status) its status decides what is sent.
+        existing_product = self._existing_product(product_id)
+        status_kept: Optional[str] = None
+        if status is not None:
+            current = product_status(existing_product)
+            if current == "retired":
+                # Before any side effect (team, source systems, contracts): a retired
+                # product stays retired, so nothing is sent for it.
+                raise ProductRetiredError(product_id)
+            to_send = status_to_send(status, current)
+            if to_send != status:
+                set_product_status(dp, to_send)
+                status_kept = to_send
+
         # Ensure team exists
         if create_team:
             self._ensure_team(fluid, tid)
@@ -668,10 +766,6 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                 fluid,
                 tid,
             )
-
-        # What the product named before this publish: the contracts it no longer names
-        # are retired below.
-        existing_product = self._existing_product(product_id)
 
         # One ODCS data contract per expose, BEFORE the product, as the registrar
         # does: an output port may then name only a contract that landed. The product
@@ -720,6 +814,10 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         }
         if is_odps_payload:
             result["odps_lineage_mode"] = lineage_mode
+        if status is not None:
+            result["status"] = status_kept or status
+            if status_kept:
+                result["status_kept"] = status_kept
         if odcs_results is not None:
             result["odcs_contracts"] = odcs_results
 
@@ -727,6 +825,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             fluid,
             product_id,
             auto_approve_access=approve_access,
+            known_product_ids=held_product_ids,
         )
         if access_results:
             result["access_agreements"] = access_results
