@@ -289,8 +289,10 @@ def _review_storage(
         differences,
         updates,
     )
-    _sweep(live_serde, planned_serde, {}, _SERDE_REVIEWED, "SerDe setting ", differences)
-    _sweep(live, planned, planned_unknown, _STORAGE_REVIEWED, "storage setting ", differences)
+    differences.extend(_sweep(live_serde, planned_serde, {}, _SERDE_REVIEWED, "SerDe setting "))
+    differences.extend(
+        _sweep(live, planned, planned_unknown, _STORAGE_REVIEWED, "storage setting ")
+    )
 
 
 def _review_parameters(
@@ -328,6 +330,16 @@ def _review_table(
     differences: List[str],
     updates: List[str],
 ) -> None:
+    differences.extend(_table_differences(before, after, unknown))
+    updates.extend(_metadata_updates(before, after, unknown))
+    reviewed = _IGNORED | set(_TABLE_PROPERTIES) | _TABLE_METADATA | {"storage_descriptor"}
+    differences.extend(_sweep(before, after, unknown, reviewed, ""))
+
+
+def _table_differences(
+    before: Mapping[str, Any], after: Mapping[str, Any], unknown: Mapping[str, Any]
+) -> List[str]:
+    differences: List[str] = []
     for attribute, words in _TABLE_PROPERTIES.items():
         if unknown.get(attribute) is True:
             continue
@@ -342,30 +354,29 @@ def _review_table(
             differences.append(
                 f"{words}: {_show(found)} in the table, {_show(wanted)} in the contract"
             )
+    return differences
 
-    if unknown.get("description") is not True:
-        found_text, wanted_text = _text(before.get("description")), _text(after.get("description"))
-        if found_text != wanted_text:
-            updates.append(
-                "clears the description"
-                if not wanted_text
-                else ("replaces the description" if found_text else "sets the description")
-            )
-    if unknown.get("owner") is not True:
-        owner, wanted_owner = _text(before.get("owner")), _text(after.get("owner"))
-        if owner != wanted_owner:
-            updates.append(
-                f"clears the owner {_say(owner)}"
-                if not wanted_owner
-                else f"sets the owner to {_say(wanted_owner)}"
-            )
-    if unknown.get("retention") is not True and not _same(
-        before.get("retention"), after.get("retention")
-    ):
-        updates.append(f"sets the retention to {_show(after.get('retention'))}")
 
-    reviewed = _IGNORED | set(_TABLE_PROPERTIES) | _TABLE_METADATA | {"storage_descriptor"}
-    _sweep(before, after, unknown, reviewed, "", differences)
+def _metadata_updates(
+    before: Mapping[str, Any], after: Mapping[str, Any], unknown: Mapping[str, Any]
+) -> List[str]:
+    """What the apply changes of the table's description, owner and retention."""
+    updates: List[str] = []
+    found, wanted = _text(before.get("description")), _text(after.get("description"))
+    if unknown.get("description") is not True and found != wanted:
+        verb = "replaces" if found and wanted else ("sets" if wanted else "clears")
+        updates.append(f"{verb} the description")
+    owner, wanted_owner = _text(before.get("owner")), _text(after.get("owner"))
+    if unknown.get("owner") is not True and owner != wanted_owner:
+        updates.append(
+            f"sets the owner to {_say(wanted_owner)}"
+            if wanted_owner
+            else f"clears the owner {_say(owner)}"
+        )
+    retention = after.get("retention")
+    if unknown.get("retention") is not True and not _same(before.get("retention"), retention):
+        updates.append(f"sets the retention to {_show(retention)}")
+    return updates
 
 
 def _keys(value: Any) -> List[Tuple[str, str]]:
@@ -388,17 +399,15 @@ def _sweep(
     unknown: Mapping[str, Any],
     reviewed: FrozenSet[str],
     prefix: str,
-    differences: List[str],
-) -> None:
-    """Every attribute no rule reviewed that the apply would change is a difference."""
-    for attribute in sorted((set(found) | set(wanted)) - reviewed, key=str):
-        if unknown.get(attribute) is True:
-            continue
-        if not _same(found.get(attribute), wanted.get(attribute)):
-            differences.append(
-                f"{prefix}{_say(str(attribute))}: {_show(found.get(attribute))} in the table, "
-                f"{_show(wanted.get(attribute))} in the contract"
-            )
+) -> List[str]:
+    """Every attribute no rule reviewed that the apply would change: a difference each."""
+    return [
+        f"{prefix}{_say(str(attribute))}: {_show(found.get(attribute))} in the table, "
+        f"{_show(wanted.get(attribute))} in the contract"
+        for attribute in sorted((set(found) | set(wanted)) - reviewed, key=str)
+        if unknown.get(attribute) is not True
+        and not _same(found.get(attribute), wanted.get(attribute))
+    ]
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:

@@ -26,7 +26,7 @@ OpenTofu does the reading and the diffing; this module only judges the plan.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
 
 #: The flag of ``fluid plan --tofu`` and ``fluid apply`` that lets a run take over tables.
@@ -63,12 +63,7 @@ class TableReview:
 
     def as_event(self) -> Dict[str, Any]:
         """The review for a structured log event or an error's context."""
-        return {
-            "table": self.table,
-            "address": self.address,
-            "differences": list(self.differences),
-            "updates": list(self.updates),
-        }
+        return asdict(self)
 
 
 def planned_imports(shown: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:

@@ -132,28 +132,11 @@ def check_plan(
     if not tables:
         return []
     named: Dict[str, str] = {block.to: str(block.table) for block in tables}
-    if shown is None:
-        raise CLIError(
-            1,
-            "table_adoption_mismatch",
-            {
-                "error": "`tofu show -json` could not read the saved plan, so the tables "
-                f"to adopt ({', '.join(sorted(named.values()))}) could not be checked "
-                "against the contract; nothing was adopted",
-                "tables": [{"table": name, "address": a} for a, name in sorted(named.items())],
-            },
-        )
     review = getattr(plugin, "review_table_adoption", None)
+    if shown is None:
+        raise _unchecked(named, "`tofu show -json` could not read the saved plan")
     if not callable(review):
-        raise CLIError(
-            1,
-            "table_adoption_mismatch",
-            {
-                "error": "the provider plugin found tables to adopt but cannot compare them "
-                "with the contract, so none was adopted",
-                "tables": [{"table": name, "address": a} for a, name in sorted(named.items())],
-            },
-        )
+        raise _unchecked(named, "the provider plugin cannot compare them with the contract")
     reviews = review_tables(shown, named, declared_resources(module), review)
     refused = [entry for entry in reviews if not entry.matches]
     if refused:
@@ -180,6 +163,19 @@ def check_plan(
     # ownership and data-loss overrides are (``packaging_adoption_override``).
     warn(logger, "table_adoption_accepted", tables=[entry.as_event() for entry in reviews])
     return reviews
+
+
+def _unchecked(named: Mapping[str, str], why: str) -> CLIError:
+    """The tables could not be compared with the contract, so none is adopted."""
+    return CLIError(
+        1,
+        "table_adoption_mismatch",
+        {
+            "error": f"{why}, so the tables to adopt ({', '.join(sorted(named.values()))}) "
+            "could not be checked against the contract; nothing was adopted",
+            "tables": [{"table": name, "address": a} for a, name in sorted(named.items())],
+        },
+    )
 
 
 def say_bound(record: Mapping[str, Any]) -> None:

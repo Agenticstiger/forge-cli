@@ -182,16 +182,7 @@ def _apply_via_opentofu(
     # What this run imports stays in state only once its ``tofu apply`` starts
     # (:func:`_imports_kept_only_by_an_apply`).
     with _imports_kept_only_by_an_apply(eng.workdir, eng.env, logger) as imported:
-        adopted = _adopt_existing(
-            eng.plugin,
-            eng.contract,
-            eng.actions,
-            eng.workdir,
-            eng.env,
-            logger,
-            imported.addresses,
-            strict_tables=_table_adoption.asked(args),
-        )
+        adopted = _look_up_existing(eng, args, logger, imported)
         tables = _tables_through_import_blocks(eng, args, adopted, imported)
 
         plan = runner.tofu_plan(eng.workdir, env=eng.env)
@@ -217,6 +208,20 @@ def _apply_via_opentofu(
         imported.keep()
 
     return _finish_apply(eng, logger, changes, destroyed, applied_state)
+
+
+def _look_up_existing(eng: _Engine, args, logger: logging.Logger, imported: Any) -> List[Any]:
+    """:func:`_adopt_existing` for this run; a table's look-up is strict under ``--adopt-tables``."""
+    return _adopt_existing(
+        eng.plugin,
+        eng.contract,
+        eng.actions,
+        eng.workdir,
+        eng.env,
+        logger,
+        imported.addresses,
+        strict_tables=_table_adoption.asked(args),
+    )
 
 
 def _tables_through_import_blocks(
@@ -643,16 +648,7 @@ def _plan_with_opentofu(
     _table_adoption.before_lookup(eng.plugin, eng.provider, eng.contract, eng.actions, args)
 
     with _imports_kept_only_by_an_apply(eng.workdir, eng.env, logger) as imported:
-        adopted: List[ImportBlock] = _adopt_existing(
-            eng.plugin,
-            eng.contract,
-            eng.actions,
-            eng.workdir,
-            eng.env,
-            logger,
-            imported.addresses,
-            strict_tables=_table_adoption.asked(args),
-        )
+        adopted: List[ImportBlock] = _look_up_existing(eng, args, logger, imported)
         # An existing table the state does not hold stops the plan unless it was asked to
         # adopt it; the hand-back runs first, as the run stops.
         _table_adoption.refuse_unless_asked(args, _table_adoption.tables_of(adopted))
@@ -1987,11 +1983,9 @@ def _adopt_existing(
     already exists in the cloud, so ``tofu apply`` reconciles it instead of
     failing "already exists" against pre-provisioned infrastructure.
 
-    An import that takes over a table (``ImportBlock.table``) is only a look-up here:
-    the caller refuses it without ``--adopt-tables`` and otherwise moves it into an
-    ``import`` block (``cli/_apply_table_adoption.py``). ``strict_tables`` (the flag)
-    makes such a look-up strict, as ``strict_adoption`` makes every import: a table the
-    run was asked to adopt is never planned as new because its look-up failed.
+    A table's import (``ImportBlock.table``) is only a look-up, which the caller refuses or
+    turns into an ``import`` block (``cli/_apply_table_adoption.py``); ``strict_tables``
+    (``--adopt-tables``) makes it strict, as ``strict_adoption`` makes every import.
 
     Best-effort: a candidate already in state is skipped; one that does not
     exist in the cloud fails to import and is left for ``tofu apply`` to
