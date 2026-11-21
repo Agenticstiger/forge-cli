@@ -49,7 +49,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 
 from . import _spark_sql
 from ._fold import FoldedDict, Folder, Unresolved
-from ._pysource import Module, qualified_name, snippet
+from ._pysource import Module, clean_chars, qualified_name, snippet
+from ._redact import scrub_host, scrub_path
 
 #: Receivers whose ``.table(...)`` and ``.sql(...)`` are Spark's. The conventions add names; a
 #: name assigned from ``....getOrCreate()`` in the file is added as it is met.
@@ -100,9 +101,55 @@ _PLACEHOLDER = re.compile(
 )
 
 
+_IDENTIFIER_CALL = re.compile(r"(?i)" + chr(92) + "bIDENTIFIER" + chr(92) + "s*" + chr(92) + "(")
+
+
+def _closing_paren(text: str, open_at: int) -> int:
+    """Where the parenthesis opened at ``open_at`` closes, or -1 (within 500 characters, quotes
+    respected)."""
+    depth, quote = 0, ""
+    for index in range(open_at, min(len(text), open_at + 500)):
+        char = text[index]
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in "'" + chr(34) + "`":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _identifier_calls_to_holes(text: str, holes: Dict[str, str]) -> str:
+    """Spark's ``IDENTIFIER(...)`` names a table by an expression: it is a hole, not a table
+    called ``identifier``."""
+    out: List[str] = []
+    index = 0
+    while True:
+        match = _IDENTIFIER_CALL.search(text, index)
+        if match is None:
+            out.append(text[index:])
+            return "".join(out)
+        end = _closing_paren(text, match.end() - 1)
+        if end < 0:
+            out.append(text[index : match.end()])
+            index = match.end()
+            continue
+        token = _spark_sql.HOLE.format(len(holes))
+        holes[token] = text[match.start() : end + 1]
+        out.append(text[index : match.start()])
+        out.append(token)
+        index = end + 1
+
+
 def _placeholders_to_holes(text: str, holes: Dict[str, str]) -> str:
     """``text`` with each placeholder replaced by a hole token (as an f-string field that does not
     fold is), so the name around it is reported as unresolved, not read as another table."""
+    text = _identifier_calls_to_holes(text, holes)
 
     def token(match: "re.Match[str]") -> str:
         name = _spark_sql.HOLE.format(len(holes))
@@ -258,6 +305,9 @@ class _Reader:
         self.default_checkpoint: Optional[str] = None
         self.parameter_named = 0
         self._handled: Set[int] = set()
+        #: What the SQL parser found in a statement, by the statement (and its holes): the same
+        #: text passed to ``spark.sql`` a thousand times is parsed once.
+        self._sql_cache: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], _spark_sql.SqlFacts] = {}
 
     # ── entry ───────────────────────────────────────────────────────
 
@@ -533,6 +583,7 @@ class _Reader:
         if len(self.facts.reads) >= MAX_REFS_PER_JOB:
             self._too_many("reads")
             return
+        host = scrub_host(host) if host else host
         self.facts.reads.append(Read(**_fields(ref), streaming=streaming, host=host))
 
     def _add_write(self, ref: Ref, **extra: Any) -> None:
@@ -542,6 +593,8 @@ class _Reader:
         if len(self.facts.writes) >= MAX_REFS_PER_JOB:
             self._too_many("writes")
             return
+        if extra.get("host"):
+            extra["host"] = scrub_host(extra["host"])
         self.facts.writes.append(Write(**_fields(ref), **extra))
 
     def _too_many(self, kind: str) -> None:
@@ -592,7 +645,11 @@ class _Reader:
                     f"constant ({value.why})"
                 )
             return
-        sql = _spark_sql.analyze(_placeholders_to_holes(value, holes), holes)
+        prepared = _placeholders_to_holes(value, holes)
+        key = (prepared, tuple(sorted(holes.items())))
+        sql = self._sql_cache.get(key)
+        if sql is None:
+            sql = self._sql_cache[key] = _spark_sql.analyze(prepared, holes)
         self.temp_views.update(sql.temp_views)
         for note in sql.notes:
             self.facts.notes.append(f"{self.file}:{call.lineno} {note}")
@@ -983,10 +1040,19 @@ class _Reader:
 
 
 def _fields(ref: Ref) -> Dict[str, Any]:
+    """The fields a read or a write keeps of ``ref``. A data path loses the credential in it
+    (``s3://KEY:SECRET@bucket/x``), and every name loses control and bidirectional characters:
+    ids, file names and bindings are made from what is kept here."""
+    if ref.kind == "path":
+        parts = tuple(scrub_path(clean_chars(p)) for p in ref.parts)
+        shown = scrub_path(clean_chars(ref.shown))
+    else:
+        parts = tuple(clean_chars(p) for p in ref.parts)
+        shown = clean_chars(ref.shown)
     return {
         "kind": ref.kind,
-        "parts": ref.parts,
-        "shown": ref.shown,
+        "parts": parts,
+        "shown": shown,
         "why": ref.why,
         "file": ref.file,
         "line": ref.line,

@@ -475,3 +475,190 @@ def test_ordinary_flags_that_look_like_credential_flags_are_left_alone(command):
 def test_credential_flags_still_mask_their_value(command):
     shown = safe_command(command)
     assert "hunter2" not in shown and "***REDACTED***" in shown
+
+
+# ── a credential next to an operator, in another spelling, or in a path ──
+
+
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        (
+            "export TOKEN=hunter2hunter2; spark-submit main.py",
+            "export TOKEN=***REDACTED***; spark-submit main.py",
+        ),
+        (
+            "spark-submit x.py --password hunter2hunter2; echo done",
+            "spark-submit x.py --password ***REDACTED***; echo done",
+        ),
+        ("PGPASSWORD=hunter2hunter2&&psql", "PGPASSWORD=***REDACTED***&&psql"),
+        (
+            "spark-submit x.py --token hunter2hunter2|tee log",
+            "spark-submit x.py --token ***REDACTED***|tee log",
+        ),
+        ("(PGPASSWORD=hunter2hunter2 psql)", "(PGPASSWORD=***REDACTED*** psql)"),
+        ("echo $(PGPASSWORD=hunter2hunter2 psql)", "echo $(PGPASSWORD=***REDACTED*** psql)"),
+        ("echo `PGPASSWORD=hunter2hunter2 psql`", "echo `PGPASSWORD=***REDACTED*** psql`"),
+        ("a &&\n b", "a && b"),
+        ("a\nb", "a; b"),
+        ("cd /x \\\n  && ls", "cd /x && ls"),
+        ("spark-submit a.py \\\r\n  --x 1", "spark-submit a.py --x 1"),
+    ],
+)
+def test_masking_a_value_keeps_the_operators_and_the_lines_around_it(command, expected):
+    assert safe_command(command) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "tool --passwd hunter2hunter2",
+        "tool --pw hunter2hunter2",
+        "tool --pswd hunter2hunter2",
+        "tool --dbpass hunter2hunter2",
+        "tool --dbpwd hunter2hunter2",
+        "tool --accesskey hunter2hunter2",
+        "curl --user admin:hunter2hunter2 http://h",
+        "curl --user=admin:hunter2hunter2 http://h",
+        "curl -uadmin:hunter2hunter2 http://h",
+        "mysql -u root -phunter2hunter2 -e 'select 1'",
+        'curl -H "X-Api-Key: hunter2hunter2" x',
+        'curl -H "password: hunter2hunter2" x',
+        "curl -H 'Authorization: Bearer hunter2hunter2' x",
+        "sh -c $'PGPASSWORD=hunter2hunter2 run'",
+        'bash -c \'bash -c "bash -c \\"PGPASSWORD=hunter2hunter2 run\\""\'',
+        "cmd --password -hunter2hunter2",
+        "tool --extra '--password hunter2hunter2'",
+    ],
+)
+def test_the_credential_spellings_a_free_text_scan_misses_are_masked(command):
+    shown = safe_command(command)
+    assert "hunter2" not in shown and "***REDACTED***" in shown
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "tool --password {{ var.value.pw }} --x 1",
+        "curl --user bob http://h",
+        "mysql -p3306",
+        "tool --partition-key dt",
+    ],
+)
+def test_a_reference_a_user_name_a_port_and_a_column_are_left_alone(command):
+    assert safe_command(command) == command
+
+
+def test_masking_does_not_unbalance_the_quotes_of_what_it_keeps():
+    shown = safe_command('curl -H "X-Api-Key: pw1" -H "password: pw2" x')
+    assert shown == "curl -H 'X-Api-Key: ***REDACTED***' -H 'password: ***REDACTED***' x"
+    assert safe_command("curl -H 'Authorization: Bearer abc123' x") == (
+        "curl -H 'Authorization: ***REDACTED***' x"
+    )
+
+
+def test_a_data_path_and_a_host_lose_the_credential_in_them():
+    from fluid_build.cli.import_workflow._redact import scrub_host, scrub_path
+
+    key, secret = "AKIA" + "IOSFODNN7EXAMPLE", "hunter2" + "secret"
+    assert scrub_path(f"s3://{key}:{secret}@bucket/curated/orders") == "s3://bucket/curated/orders"
+    assert scrub_path(f"https://admin:{secret}@files.example.com/x/y") == (
+        "https://files.example.com/x/y"
+    )
+    assert scrub_path("gs://b/x/token=hunterE/y/dt=2026-01-01") == (
+        "gs://b/x/token=REDACTED/y/dt=2026-01-01"
+    )
+    assert (
+        scrub_path("s3://bucket/a@b/c") == "s3://bucket/a@b/c"
+    )  # an @ in the path is not userinfo
+    assert scrub_host(f"user:{secret}@broker1:9092,broker2:9092") == "broker1:9092,broker2:9092"
+
+
+def test_no_credential_in_a_path_reaches_an_id_a_file_name_or_a_binding(tmp_path, monkeypatch):
+    import yaml
+
+    monkeypatch.chdir(tmp_path)
+    key, secret, token = "AKIA" + "IOSFODNN7EXAMPLE", "hunter2" + "secret", "hunterE" + "token"
+    write(
+        tmp_path,
+        {
+            "jobs/job.py": f"""
+                src = spark.read.parquet("s3a://{key}:{secret}@inbucket/raw/orders")
+                src.write.parquet("s3://{key}:{secret}@bucket/curated/orders")
+                src.write.parquet("https://admin:{secret}@files.example.com/x/y")
+                src.write.parquet("gs://b/x/token={token}/y")
+            """,
+        },
+    )
+    contracts, report = propose(tmp_path)
+    text = yaml.safe_dump(contracts) + "\n".join(
+        [*report.mapped_one_to_one, *report.required_defaults, *report.unsupported, *report.notes]
+    )
+    for value in (key, secret, token, key.lower(), secret.lower(), token.lower()):
+        assert value not in text, value
+    assert any(c["id"].startswith("bucket.") for c in contracts)
+    for contract in contracts:
+        valid(contract)
+
+
+# ── what the fan-out of a job's reads costs ───────────────────────────
+
+
+def test_a_job_with_many_outputs_and_reads_is_refused_before_it_is_listed_everywhere(
+    tmp_path, monkeypatch
+):
+    from fluid_build._errors import FluidUserError
+    from fluid_build.cli.import_workflow import _proposal
+
+    monkeypatch.chdir(tmp_path)
+    body = "\n".join(f'spark.table("t{i}").write.saveAsTable("o{i}")' for i in range(8))
+    write(tmp_path, {"jobs/fan.py": body + "\n"})
+    monkeypatch.setattr(_proposal, "MAX_FANOUT", 50)  # 8 products x 8 reads = 64
+    with pytest.raises(FluidUserError) as refused:
+        propose(tmp_path)
+    assert "too much to propose" in refused.value.what
+    assert "64 reads between them (the most is 50)" in refused.value.why
+    contracts, _ = propose(tmp_path, split_by="job")  # one product: 8 reads
+    assert len(contracts) == 1 and len(contracts[0]["consumes"]) == 8
+
+
+def test_a_product_lists_a_bounded_number_of_reads_and_the_report_counts_the_rest(
+    tmp_path, monkeypatch
+):
+    from fluid_build.cli.import_workflow import _proposal
+
+    monkeypatch.chdir(tmp_path)
+    reads = "\n".join(f'    spark.table("t{i}")' for i in range(10))
+    write(
+        tmp_path, {"jobs/many.py": "def run():\n" + reads + '\n    df.write.saveAsTable("out")\n'}
+    )
+    monkeypatch.setattr(_proposal, "MAX_CONSUMES_PER_PRODUCT", 6)
+    monkeypatch.setattr(_proposal, "MAX_READ_LINES", 2)
+    (contract,), report = propose(tmp_path)
+    assert len(contract["consumes"]) == 6
+    assert [n for n in report.notes if "lists 6 reads in consumes[]; 4 more are not listed" in n]
+    lines = [x for x in report.mapped_one_to_one if "→ consumes[" in x]
+    assert len(lines) == 3
+    assert lines[-1].endswith("4 more read(s) → consumes[] (not listed one by one)")
+
+
+def test_a_task_that_submits_one_job_twice_is_one_entry_on_the_build(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    write(tmp_path, {"jobs/ok.py": 'df.write.saveAsTable("retail.out")\n'})
+    (tmp_path / "dags").mkdir()
+    (tmp_path / "dags" / "twice.py").write_text(
+        textwrap.dedent(
+            """
+            from airflow import DAG
+            from airflow.operators.bash import BashOperator
+            with DAG("twice"):
+                BashOperator(task_id="t", bash_command="spark-submit jobs/ok.py --a 1; spark-submit jobs/ok.py --a 2")
+            """
+        ),
+        encoding="utf-8",
+    )
+    (contract,), report = propose(tmp_path, dags=str(tmp_path / "dags"))
+    tasks = contract["builds"][0]["execution"]["orchestration"]["airflow"]["tasks"]
+    assert [t["taskId"] for t in tasks] == ["t"]
+    assert any("submits this job more than once" in n for n in report.notes)
+    valid(contract)

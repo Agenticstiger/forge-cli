@@ -826,3 +826,53 @@ def test_placeholders_in_the_longest_sql_the_folder_gives_are_found_in_bounded_t
         started = time.monotonic()
         IO._placeholders_to_holes(text, {})
         assert time.monotonic() - started < 0.5
+
+
+# ── names the SQL does not state, and statements that repeat ──────────
+
+
+def test_a_table_named_by_identifier_is_a_name_that_is_not_a_constant():
+    facts = job(
+        """
+        spark = SparkSession.builder.getOrCreate()
+        spark.sql("INSERT INTO IDENTIFIER(:tbl) SELECT * FROM raw.src")
+        spark.sql("INSERT INTO out.t SELECT * FROM IDENTIFIER('a.b')")
+        """
+    )
+    assert [r.name for r in facts.reads if r.name] == ["raw.src"]
+    unresolved = [x for x in (*facts.reads, *facts.writes) if not x.name]
+    assert sorted(x.shown for x in unresolved) == ["{IDENTIFIER('a.b')}", "{IDENTIFIER(:tbl)}"]
+    assert [w.name for w in facts.writes if w.name] == ["out.t"]
+    assert not [x for x in (*facts.reads, *facts.writes) if x.name == "identifier"]
+
+
+def test_the_same_statement_is_parsed_once_however_often_it_is_passed(monkeypatch):
+    calls = []
+    original = Q.analyze
+
+    def counting(sql, holes=None):
+        calls.append(sql)
+        return original(sql, holes)
+
+    monkeypatch.setattr(Q, "analyze", counting)
+    lines = "\n".join("spark.sql(QUERY)" for _ in range(50))
+    facts = job(
+        'spark = SparkSession.builder.getOrCreate()\nQUERY = "INSERT INTO a.out SELECT * FROM a.src"\n'
+        + lines
+        + "\n"
+    )
+    assert len(calls) == 1
+    assert len(facts.reads) == 50 and len(facts.writes) == 50  # one per call site, as always
+
+
+def test_a_path_with_a_credential_in_it_is_kept_without_it():
+    facts = job(
+        """
+        spark = SparkSession.builder.getOrCreate()
+        spark.read.parquet("s3a://KEY:SECRETVALUE@inbucket/raw/orders")
+        df.write.parquet("gs://b/x/token=hunterE/y")
+        df.write.saveAsTable("db.\\u202ename")
+        """
+    )
+    assert reads(facts) == [("path", "s3a://inbucket/raw/orders")]
+    assert writes(facts) == [("path", "gs://b/x/token=REDACTED/y"), ("table", "db.name")]
