@@ -8,6 +8,7 @@ ODCS (Open Data Contract Standard) CLI Commands
 Commands for bidirectional conversion between FLUID and ODCS formats.
 """
 
+import argparse
 import json
 import logging
 from pathlib import Path
@@ -15,11 +16,14 @@ from typing import Optional
 
 import click
 
+from fluid_build.cli import _odcs_version
+from fluid_build.cli._common import CLIError
 from fluid_build.cli._export_env import resolve_for_export
 from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.cli.console import error as console_error
 from fluid_build.loader import load_contract
 from fluid_build.providers.odcs import OdcsProvider
+from fluid_build.providers.odcs.versions import SUPPORTED_VERSIONS
 
 
 @click.group(name="odcs")
@@ -71,6 +75,7 @@ def odcs_cli():
         "Mutually exclusive with --expose-id."
     ),
 )
+@click.option("--odcs-version", default=None, metavar="VERSION", help=_odcs_version.HELP)
 def export_command(
     contract: str,
     output: Optional[str],
@@ -79,6 +84,7 @@ def export_command(
     sla: bool,
     expose_id: Optional[str],
     per_port: bool,
+    odcs_version: Optional[str],
 ):
     """
     Export FLUID contract to ODCS format.
@@ -94,6 +100,10 @@ def export_command(
 
     if expose_id and per_port:
         raise click.UsageError("--expose-id and --per-port are mutually exclusive.")
+    try:
+        version = _odcs_version.requested(argparse.Namespace(odcs_version=odcs_version))
+    except CLIError as exc:
+        raise click.BadParameter(exc.context["message"], param_hint="--odcs-version") from exc
 
     try:
         # Load FLUID contract
@@ -101,11 +111,11 @@ def export_command(
         fluid_contract = resolve_for_export(load_contract(contract))
 
         # Configure provider
-        provider = OdcsProvider()
+        provider = OdcsProvider(version=version)
         provider.include_quality_checks = quality
         provider.include_sla = sla
 
-        click.echo(f"Exporting to ODCS v{provider.odcs_version}...")
+        click.echo(f"Exporting to ODCS {provider.odcs_version}...")
 
         # ── Per-port mode ────────────────────────────────────────────────────
         if per_port:
@@ -284,7 +294,8 @@ def info_command():
 
     click.echo("ODCS (Open Data Contract Standard) Provider")
     click.echo("=" * 50)
-    click.echo(f"Version: {provider.odcs_version}")
+    click.echo(f"Version: {provider.odcs_version} (default)")
+    click.echo("Writes: " + ", ".join(SUPPORTED_VERSIONS) + " (--odcs-version)")
     click.echo(f"Specification: {provider.odcs_spec_url}")
     click.echo("\nCapabilities:")
 
@@ -299,7 +310,7 @@ def info_command():
 
     click.echo("\nJSON Schema:")
     if provider.schema:
-        click.echo(f"  ✓ Loaded (v{provider.odcs_version})")
+        click.echo(f"  ✓ Loaded ({provider.odcs_version})")
     else:
         click.echo("  ✗ Not found")
 
@@ -341,6 +352,7 @@ def register(subparsers) -> None:
     export.add_argument("--no-quality", action="store_true", help="Exclude quality checks")
     export.add_argument("--no-sla", action="store_true", help="Exclude SLA properties")
     export.add_argument("--env", help="Environment name for overlay application")
+    _odcs_version.add_argument(export)
     export.set_defaults(func=lambda args, logger=None: _run_odcs_export(args))
 
     # odcs import
@@ -403,7 +415,7 @@ def _run_odcs_export(args):
     )
 
     # Configure provider
-    provider = OdcsProvider()
+    provider = OdcsProvider(version=_odcs_version.requested(args))
     if args.no_quality:
         provider.include_quality_checks = False
     if args.no_sla:
@@ -506,8 +518,9 @@ def _run_odcs_validate(args):
     """Run ODCS validate command — multi-pass with structured report.
 
     Passes:
-      1. jsonschema against the vendored ODCS v3.1.0 schema. ALL violations
-         collected via collect_errors().
+      1. jsonschema against the vendored ODCS schema of the version the document
+         declares (v3.1.0 or v3.2.0). ALL violations collected via
+         collect_errors().
       2. vowl second-pass (when installed via the ``odcs-strict`` extra).
          Catches semantic issues jsonschema misses (format validation,
          unevaluated-properties enforcement, …).
@@ -524,10 +537,11 @@ def _run_odcs_validate(args):
     from fluid_build.cli._common import load_yaml_json
     from fluid_build.providers.odcs.validation import (
         collect_errors,
-        load_schema,
+        load_schema_for,
         roundtrip_check,
         validate_via_vowl,
     )
+    from fluid_build.providers.odcs.versions import DEFAULT_VERSION, version_of
     from fluid_build.util.safe_yaml import UnsafeYamlError
 
     file_path = Path(args.odcs_file)
@@ -545,8 +559,10 @@ def _run_odcs_validate(args):
         _write_validate_report(args, report)
         return 1
 
-    # Pass 1 — jsonschema (multi-error)
-    schema = load_schema()
+    # Pass 1: jsonschema (multi-error), against the schema of the version the
+    # document declares in apiVersion (v3.1.0 when it declares none, or one with
+    # no vendored schema).
+    schema = load_schema_for(odcs_data)
     if schema:
         errors = collect_errors(odcs_data, schema)
         report["passes"]["jsonschema"] = {
@@ -587,6 +603,9 @@ def _run_odcs_validate(args):
                     "○ vowl: not installed (pip install 'data-product-forge[odcs-strict]')",
                     markup=False,
                 )
+            elif "skipped" in diag:
+                report["passes"]["vowl"] = {"ok": True, "skipped": diag["skipped"]}
+                cprint(f"○ vowl: skipped, {diag['skipped']}", markup=False)
             else:
                 report["passes"]["vowl"] = {"ok": True, "diagnostics": diag}
                 cprint(
@@ -598,7 +617,9 @@ def _run_odcs_validate(args):
     # Pass 3 — round-trip (opt-in)
     if getattr(args, "roundtrip", False):
         try:
-            rt = OdcsProvider().roundtrip_check(odcs_data)
+            rt = OdcsProvider(version=version_of(odcs_data) or DEFAULT_VERSION).roundtrip_check(
+                odcs_data
+            )
         except Exception as exc:  # noqa: BLE001
             report["passes"]["roundtrip"] = {"ok": False, "error": str(exc)[:300]}
             report["ok"] = False
@@ -629,10 +650,13 @@ def _write_validate_report(args, report: dict) -> None:
 
 def _run_odcs_info(args):
     """Run ODCS info command."""
+    from fluid_build.providers.odcs.versions import SUPPORTED_VERSIONS
+
     provider = OdcsProvider()
     cprint("ODCS (Open Data Contract Standard) Provider")
     cprint("=" * 50)
-    cprint(f"Version: {provider.odcs_version}")
+    cprint(f"Version: {provider.odcs_version} (default)")
+    cprint("Writes: " + ", ".join(SUPPORTED_VERSIONS) + " (--odcs-version)")
     cprint(f"Specification: {provider.odcs_spec_url}")
     cprint(f"Schema: {'Loaded' if provider.schema else 'Not found'}")
     return 0

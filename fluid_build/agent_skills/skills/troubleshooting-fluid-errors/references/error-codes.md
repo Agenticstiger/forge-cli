@@ -12,6 +12,7 @@ Docs pages are relative to https://agenticstiger.github.io/forge_docs/
 
 | Code | What to do | Docs page |
 |---|---|---|
+| `ERR_ODCS_VERSION_UNSUPPORTED` | Pass one of the versions the message lists: --odcs-version 3.1.0 (the default) or 3.2.0. 3.2.0 adds the Iceberg server type; a catalog that validates v3.1.0 only needs the default. | advanced/production-troubleshooting.html |
 | `ERR_DOCTOR_PREFLIGHT_FAILED` | Run 'fluid doctor --contract contract.fluid.yaml --operation plan'. Compare two saved reports with 'fluid doctor --compare left.json right.json'. | advanced/production-troubleshooting.html |
 | `ERR_PROVIDER_NOT_SPECIFIED` | Pass a provider: --provider aws\|databricks\|gcp\|local\|snowflake. Or set the FLUID_PROVIDER environment variable. Run 'fluid providers' to list the available providers. | cli/providers.html |
 | `ERR_PROVIDER_NOT_FOUND` | Run 'fluid providers' to see the available providers. Check the provider name spelling. Install the provider extra, e.g. pip install 'data-product-forge[gcp]'. | cli/providers.html |

@@ -13,9 +13,11 @@ re-attach to exposes if desired.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
+from ..versions import DEFAULT_VERSION, at_least
 from .base import (
     ExportCtx,
     ImportCtx,
@@ -131,19 +133,20 @@ def to_odcs(ctx: ExportCtx) -> None:
         ctx.odcs["servers"] = [dict(s) for s in raw if isinstance(s, Mapping)]
         return
 
+    version = ctx.options.get("odcs_version") or DEFAULT_VERSION
     servers: List[Dict[str, Any]] = []
     for expose in ctx.fluid.get("exposes") or []:
-        s = _expose_to_server(expose)
+        s = _expose_to_server(expose, version)
         if s:
             servers.append(s)
     for expect in ctx.fluid.get("expects") or []:
-        s = _expect_to_server(expect)
+        s = _expect_to_server(expect, version)
         if s:
             servers.append(s)
     ctx.odcs["servers"] = servers
 
 
-def _expose_to_server(expose: Any) -> Optional[Dict[str, Any]]:
+def _expose_to_server(expose: Any, version: str = DEFAULT_VERSION) -> Optional[Dict[str, Any]]:
     if not isinstance(expose, Mapping):
         return None
     binding = expose.get("binding") if isinstance(expose.get("binding"), Mapping) else None
@@ -158,15 +161,18 @@ def _expose_to_server(expose: Any) -> Optional[Dict[str, Any]]:
         return None
 
     expose_id = expose.get("exposeId") or expose.get("id") or "default"
+    if not isinstance(location, Mapping):
+        loc = expose.get("location")
+        location = loc if isinstance(loc, Mapping) else None
+    merged = _merge_binding_into_location(location, binding) if location is not None else {}
+    iceberg = _iceberg_server(binding, merged, version)
+    if iceberg is not None:
+        return {"server": expose_id, **iceberg}
     server: Dict[str, Any] = {
         "server": expose_id,
         "type": provider_to_server_type(provider),
     }
-    if not isinstance(location, Mapping):
-        loc = expose.get("location")
-        location = loc if isinstance(loc, Mapping) else None
     if isinstance(location, Mapping):
-        merged = _merge_binding_into_location(location, binding)
         server.update(_server_details_from_location(merged, provider))
     return server
 
@@ -197,7 +203,7 @@ def _merge_binding_into_location(
     return merged
 
 
-def _expect_to_server(expect: Any) -> Optional[Dict[str, Any]]:
+def _expect_to_server(expect: Any, version: str = DEFAULT_VERSION) -> Optional[Dict[str, Any]]:
     if not isinstance(expect, Mapping):
         return None
     binding = expect.get("binding") if isinstance(expect.get("binding"), Mapping) else None
@@ -212,17 +218,168 @@ def _expect_to_server(expect: Any) -> Optional[Dict[str, Any]]:
         return None
 
     expect_id = expect.get("id") or "dependency"
+    if not isinstance(location, Mapping):
+        loc = expect.get("location")
+        location = loc if isinstance(loc, Mapping) else None
+    merged = _merge_binding_into_location(location, binding) if location is not None else {}
+    iceberg = _iceberg_server(binding, merged, version)
+    if iceberg is not None:
+        return {"server": expect_id, **iceberg}
     server: Dict[str, Any] = {
         "server": expect_id,
         "type": provider_to_server_type(provider),
     }
-    if not isinstance(location, Mapping):
-        loc = expect.get("location")
-        location = loc if isinstance(loc, Mapping) else None
     if isinstance(location, Mapping):
-        merged = _merge_binding_into_location(location, binding)
         server.update(_server_details_from_location(merged, provider))
     return server
+
+
+#: The placeholder for a REST catalog URL the binding does not name, substituted at deploy
+#: time like the other server types' (the field is required by ODCS).
+_CATALOG_URL_PLACEHOLDER = "${ICEBERG_CATALOG_URL}"
+
+
+def _iceberg_server(
+    binding: Optional[Mapping[str, Any]], location: Mapping[str, Any], version: str
+) -> Optional[Dict[str, Any]]:
+    """The ODCS v3.2.0 ``iceberg`` server of an Iceberg binding, or ``None``.
+
+    ODCS 3.2.0 describes an Iceberg table by its catalog service: ``catalog`` (the
+    name it is registered under), ``catalogUrl`` (the Iceberg REST endpoint),
+    ``namespace`` and ``warehouse``; both ``catalog`` and ``catalogUrl`` are
+    required, and the server takes no other field. It is written only for the
+    version that has it (an ``iceberg`` server fails v3.1.0's closed type list),
+    and only for a table in a catalog a client reaches by URL that the binding
+    names: Glue (the platform default on AWS and Confluent, or ``catalog: glue``),
+    whose Iceberg REST endpoint is ``https://glue.<region>.amazonaws.com/iceberg``,
+    or an Iceberg REST catalog (``catalog`` names one, or the binding gives its
+    ``uri``). An Iceberg table in a warehouse's own catalog (Snowflake-managed,
+    BigQuery) is an object of that system, and a binding that names no catalog on
+    a platform with no default one has none to describe: both keep the server of
+    their platform.
+
+    * ``catalog``: the warehouse for a catalog whose warehouse is its name
+      (Lakekeeper, Polaris, Unity), else the catalog kind (``glue``, ``rest``).
+    * ``catalogUrl``: the binding's ``location.uri`` without any user and password;
+      for Glue, its regional endpoint; else a ``${ICEBERG_CATALOG_URL}`` placeholder.
+    * ``namespace``: the table's database (``iceberg_namespace``).
+    * ``warehouse``: ``location.warehouse``; for Glue, the table's ``s3://`` base.
+
+    ``location`` is the merged one (:func:`_merge_binding_into_location`), the
+    same mapping every field here is read from.
+    """
+    if not at_least(version, "v3.2.0") or not isinstance(binding, Mapping):
+        return None
+    # Imported here: only a v3.2.0 export of an Iceberg binding reads the catalog table.
+    from fluid_build.providers._iceberg_catalog import (
+        FAMILY_GLUE,
+        FAMILY_REST,
+        canonical_catalog_kind,
+        catalog_kind_info,
+        default_catalog_kind,
+        iceberg_namespace,
+        is_iceberg_format,
+    )
+
+    if not is_iceberg_format(binding.get("format") or location.get("format")):
+        return None
+    named = canonical_catalog_kind(location.get("catalog"))
+    uri = str(location.get("uri") or "").strip()
+    info = catalog_kind_info(named or default_catalog_kind(binding))
+    if info.family not in (FAMILY_GLUE, FAMILY_REST):
+        return None
+    if not named and info.family == FAMILY_REST and not uri:
+        # The platform's default is a REST catalog for the streaming sink, but this
+        # binding names neither a catalog nor where one is.
+        return None
+
+    warehouse = str(location.get("warehouse") or "").strip()
+    if info.family == FAMILY_GLUE:
+        region = str(location.get("region") or "").strip()
+        catalog_url = (
+            f"https://glue.{region}.amazonaws.com/iceberg"
+            if _GLUE_REGION_RE.fullmatch(region)
+            else _CATALOG_URL_PLACEHOLDER
+        )
+        warehouse = warehouse or (
+            _build_s3_uri(_plain(location.get("bucket")), _plain(location.get("path"))) or ""
+        )
+    else:
+        catalog_url = _without_userinfo(uri) or _CATALOG_URL_PLACEHOLDER
+    server: Dict[str, Any] = {
+        "type": "iceberg",
+        "catalog": warehouse if info.warehouse_is_name and warehouse else info.name,
+        "catalogUrl": catalog_url,
+    }
+    namespace = iceberg_namespace({**dict(binding), "location": dict(location)})
+    if namespace:
+        server["namespace"] = namespace
+    if warehouse:
+        server["warehouse"] = warehouse
+    return server
+
+
+# The ``user:password@`` part of a URL, scheme-less or not: everything up to the last ``@`` of
+# the authority (the text before the first ``/``, ``?`` or ``#``).
+_USERINFO_RE = re.compile(r"^((?:[A-Za-z][A-Za-z0-9+.\-]*:)?//)?[^/?#]*@")
+
+# What a URL parser skips or refuses: a tab, a newline, any other control character.
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+# Where the part of a URL that can hold userinfo ends: a query or a fragment.
+_QUERY_OR_FRAGMENT_RE = re.compile(r"[?#]")
+
+# Cutting a user and password can leave the text after it reading as an authority of its own
+# (``a@//u:p@h``): a URL that still holds one after this many cuts is not written at all.
+_USERINFO_PASSES = 3
+
+
+def _without_userinfo(url: str) -> str:
+    """``url`` without a ``user:password@`` part: the catalogUrl is published, a credential is not.
+
+    The rest of the URL is kept as written, a port or host that does not parse included: the
+    part is cut by text, never through a URL parser that can fail and leave it in. Control
+    characters are dropped first, as a URL parser drops them. The cut fails closed: ``""`` when
+    the text still holds a user and password after every cut, and when any ``@`` is left before
+    the first ``?`` or ``#``. A URL parser reads such an ``@`` as the end of userinfo in more
+    shapes than the plain ``scheme://`` form: three or four slashes after the scheme, a single
+    slash, a backslash, a nested ``@`` before another authority, and an ``@`` in the path. No
+    URL is written from any of them; the tests spell them out.
+    """
+    url = _CONTROL_RE.sub("", url)
+    cut = False
+    for _ in range(_USERINFO_PASSES):
+        found = _USERINFO_RE.match(url)
+        if found is None:
+            break
+        url = (found.group(1) or "") + url[found.end() :]
+        cut = True
+    else:
+        LOG.warning(
+            "the Iceberg catalog uri holds a user and password that cannot be cut: not written"
+        )
+        return ""
+    if "@" in _QUERY_OR_FRAGMENT_RE.split(url, maxsplit=1)[0]:
+        LOG.warning(
+            "the Iceberg catalog uri holds a user and password that cannot be cut: not written"
+        )
+        return ""
+    if cut:
+        LOG.warning(
+            "the user and password of the Iceberg catalog uri are not written to catalogUrl"
+        )
+    return url
+
+
+# An AWS commercial region name (``eu-north-1``): what goes into Glue's regional endpoint host.
+# The China and GovCloud partitions use other endpoints, so they get the placeholder instead.
+_GLUE_REGION_RE = re.compile(r"(?!cn-)[a-z]{2}-[a-z]+-\d+", re.ASCII)
+
+
+def _plain(value: Any) -> Optional[str]:
+    """``value`` as text, or ``None`` when it is empty or still an ``{{ env.* }}`` / ``${...}`` template."""
+    text = str(value or "").strip()
+    return text if text and "{{" not in text and "${" not in text else None
 
 
 def _server_details_from_location(location: Mapping[str, Any], provider: str) -> Dict[str, Any]:

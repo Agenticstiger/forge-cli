@@ -34,6 +34,7 @@ import os
 from fluid_build.cli.console import cprint
 from fluid_build.cli.console import error as console_error
 
+from . import _odcs_version
 from ._common import CLIError, load_contract_with_overlay, write_json
 from ._export_env import resolve_for_export
 from ._logging import info
@@ -77,7 +78,8 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
             "Supported formats:\n"
             "  odps        Bitol ODPS v1.0.0 — bare product YAML (default ODPS)\n"
             "  odps-bitol  Explicit alias of ``odps`` (same Bitol v1.0.0 output)\n"
-            "  odcs        Open Data Contract Standard v3.1 (Bitol.io) — per-port\n"
+            "  odcs        Open Data Contract Standard v3.1 (Bitol.io), or v3.2 with\n"
+            "              --odcs-version 3.2.0; per-port\n"
             "  odps-v4.1   LF/ODPI Open Data Product Specification v4.1 — JSON,\n"
             "              opt-in back-pocket option for LF-aligned catalogs\n"
             "  opds        Deprecated letter-swap alias of ``odps-v4.1`` (historical\n"
@@ -104,6 +106,7 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
     )
     p.add_argument("--out", "-o", help="Output file path (auto-detected if not set)")
     p.add_argument("--env", help="Environment overlay")
+    _odcs_version.add_argument(p, help_suffix=" (only with --format odcs)")
     p.add_argument(
         "--list", dest="list_formats", action="store_true", help="List supported formats"
     )
@@ -145,7 +148,7 @@ def _format_description(fmt: str) -> str:
     descriptions = {
         "odps": "Bitol Open Data Product Standard v1.0.0 (default, center-stage)",
         "odps-bitol": "Explicit alias of 'odps' (Bitol ODPS v1.0.0)",
-        "odcs": "Open Data Contract Standard v3.1 (Bitol.io) — per exposed port",
+        "odcs": "Open Data Contract Standard v3.1 (Bitol.io; v3.2 with --odcs-version), per exposed port",
         "odps-v4.1": "LF/ODPI Open Data Product Specification v4.1 (opt-in)",
         "opds": "Deprecated letter-swap alias of 'odps-v4.1' (LF/ODPI v4.1 JSON)",
     }
@@ -180,12 +183,16 @@ def _export_format(fmt: str, contract_path: str, args, logger: logging.Logger) -
     out = getattr(args, "out", None) or DEFAULT_OUTPUTS.get(
         fmt, f"runtime/exports/product.{fmt}.yaml"
     )
+    odcs_version = _odcs_version.requested(args)
+    if odcs_version is not None and fmt != "odcs":
+        cprint("Error: --odcs-version applies to --format odcs only.")
+        return 1
 
     if fmt == "odps":
         # Bitol ODPS v1.0.0 — the center-stage default.
         return _export_odps_bitol(contract_path, env, out, logger)
     elif fmt == "odcs":
-        return _export_odcs(contract_path, env, out, logger)
+        return _export_odcs(contract_path, env, out, logger, odcs_version=odcs_version)
     elif fmt == "odps-v4.1":
         return _export_odps_v4_1(contract_path, env, out, logger)
     else:
@@ -228,8 +235,15 @@ _export_odps = _export_odps_v4_1  # NOTE: when called via --format dispatch, the
 # Bitol. This direct symbol is only for callers that imported the function name.
 
 
-def _export_odcs(contract_path: str, env, out: str, logger: logging.Logger) -> int:
-    """Export to Open Data Contract Standard v3.1 (Bitol.io) — one file per port.
+def _export_odcs(
+    contract_path: str,
+    env,
+    out: str,
+    logger: logging.Logger,
+    odcs_version: "str | None" = None,
+) -> int:
+    """Export to Open Data Contract Standard (Bitol.io), v3.1.0 unless ``odcs_version`` says
+    v3.2.0: one file per port.
 
     ODCS is **per-exposed-port** by definition — every ``exposes[]`` entry in
     the FLUID contract becomes its own ``DataContract`` document. The CLI
@@ -257,7 +271,7 @@ def _export_odcs(contract_path: str, env, out: str, logger: logging.Logger) -> i
     # Loading without the overlay exported the base contract and said nothing,
     # so `--env prod` silently produced the dev topic / database.
     c = resolve_for_export(load_contract_with_overlay(contract_path, env, logger))
-    provider = OdcsProvider()
+    provider = OdcsProvider(version=odcs_version)
     results = provider.render_all_ports(c)  # [(expose_id, odcs_doc), ...]
 
     if not results:
@@ -282,7 +296,7 @@ def _export_odcs(contract_path: str, env, out: str, logger: logging.Logger) -> i
                 _yaml.safe_dump(doc, fh, default_flow_style=False, sort_keys=False)
             written.append(path)
         info(logger, "generate_standard_odcs_ok", out=out_dir, ports=len(written))
-        cprint(f"✓ Wrote {len(written)} ODCS v3.1.0 doc(s) to {out_dir}/")
+        cprint(f"✓ Wrote {len(written)} ODCS {provider.odcs_version} doc(s) to {out_dir}/")
         return 0
 
     # Single-file mode: multi-document YAML stream (one ---block per port).
@@ -299,11 +313,11 @@ def _export_odcs(contract_path: str, env, out: str, logger: logging.Logger) -> i
     )
     if len(docs) > 1:
         cprint(
-            f"✓ Wrote {len(docs)} ODCS v3.1.0 docs to {out} (multi-document YAML; "
+            f"✓ Wrote {len(docs)} ODCS {provider.odcs_version} docs to {out} (multi-document YAML; "
             f"pass a directory path to --out for one file per port)"
         )
     else:
-        cprint(f"✓ Wrote 1 ODCS v3.1.0 doc to {out}")
+        cprint(f"✓ Wrote 1 ODCS {provider.odcs_version} doc to {out}")
     return 0
 
 

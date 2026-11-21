@@ -19,10 +19,15 @@ from .io import read_input, write_output
 from .mappers import EXPORT_PIPELINE, IMPORT_PIPELINE, normalize
 from .mappers.base import ExportCtx, ImportCtx
 from .validation import load_schema, roundtrip_check, validate, validate_via_vowl
+from .versions import normalize_version, version_of
 
 
 class OdcsProvider(BaseProvider):
-    """ODCS v3.1.0 bidirectional provider.
+    """ODCS bidirectional provider: v3.1.0 by default, v3.2.0 when asked.
+
+    The version an export writes is the provider's ``odcs_version`` (``version=``
+    here, or per call to :meth:`render`); nothing is written in another version
+    unless the caller says so (see :mod:`.versions`).
 
     Public surface:
       - :meth:`render`            — FLUID → ODCS (one expose or whole contract)
@@ -34,12 +39,12 @@ class OdcsProvider(BaseProvider):
     All real work lives in :mod:`fluid_build.providers.odcs.mappers`.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, version: Optional[str] = None) -> None:
         super().__init__()
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-        self.odcs_version = "v3.1.0"
+        self.odcs_version = normalize_version(version)
         self.odcs_spec_url = "https://github.com/bitol-io/open-data-contract-standard"
-        self.schema = load_schema()
+        self.schema = load_schema(self.odcs_version)
         self.include_quality_checks = os.getenv("ODCS_INCLUDE_QUALITY", "true").lower() == "true"
         self.include_sla = os.getenv("ODCS_INCLUDE_SLA", "true").lower() == "true"
         # Whether ``render()`` runs vowl's parser as a second-pass validator
@@ -89,8 +94,9 @@ class OdcsProvider(BaseProvider):
         out: Optional[Union[Path, str]] = None,
         fmt: Optional[str] = "yaml",
         expose_id: Optional[str] = None,
+        version: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Render a FLUID contract to ODCS v3.1.0.
+        """Render a FLUID contract to ODCS (``version``, else the provider's ``odcs_version``).
 
         When ``expose_id`` is provided the rendered ODCS takes its ``id`` from
         :func:`fluid_build.util.contract.expose_contract_id` — the id that
@@ -128,11 +134,14 @@ class OdcsProvider(BaseProvider):
                 raise ProviderError(collision)
         fluid = self._scope_to_expose(src, expose_id) if expose_id else src
         odcs: Dict[str, Any] = {}
+        odcs_version = normalize_version(version) if version is not None else self.odcs_version
+        schema = self.schema if odcs_version == self.odcs_version else load_schema(odcs_version)
         ctx = ExportCtx(
             fluid=fluid,
             odcs=odcs,
             logger=self.logger,
             options={
+                "odcs_version": odcs_version,
                 "include_sla": self.include_sla,
                 "include_quality_checks": self.include_quality_checks,
                 "expose_id": expose_id,
@@ -143,13 +152,13 @@ class OdcsProvider(BaseProvider):
         for mapper in EXPORT_PIPELINE:
             mapper.to_odcs(ctx)
 
-        # Default-on schema validation against the vendored ODCS v3.1.0 JSON
-        # Schema. Warns rather than raises so a payload with unmodeled extras
-        # still emits — callers opt into hard fail via ODCS_VALIDATE_STRICT=true
-        # or by calling validate_contract() directly.
-        if self.schema and os.getenv("ODCS_VALIDATE", "true").lower() == "true":
+        # Default-on schema validation against the vendored ODCS JSON Schema of
+        # the version being written. Warns rather than raises so a payload with
+        # unmodeled extras still emits; callers opt into hard fail via
+        # ODCS_VALIDATE_STRICT=true or by calling validate_contract() directly.
+        if schema and os.getenv("ODCS_VALIDATE", "true").lower() == "true":
             try:
-                validate(odcs, self.schema)
+                validate(odcs, schema)
             except ProviderError as exc:
                 if os.getenv("ODCS_VALIDATE_STRICT", "false").lower() == "true":
                     raise
@@ -164,7 +173,9 @@ class OdcsProvider(BaseProvider):
             or os.getenv("ODCS_VOWL_VALIDATE", "false").lower() == "true"
         ):
             diag = validate_via_vowl(odcs)
-            if diag is not None:
+            if diag is not None and "skipped" in diag:
+                self.logger.info("vowl: skipped, %s", diag["skipped"])
+            elif diag is not None:
                 self.logger.info(
                     "vowl: ODCS v%s parsed; %d checks across %d schema(s)",
                     diag["api_version"],
@@ -216,7 +227,7 @@ class OdcsProvider(BaseProvider):
 
     def import_contract(self, odcs: Union[Mapping[str, Any], str, Path]) -> Dict[str, Any]:
         odcs_data = read_input(odcs) if isinstance(odcs, (str, Path)) else dict(odcs)
-        if self.schema:
+        if self._schema_for(odcs_data):
             try:
                 self.validate_contract(odcs_data)
             except ProviderError:
@@ -247,11 +258,24 @@ class OdcsProvider(BaseProvider):
     # ---- validation / round-trip ---------------------------------------
 
     def validate_contract(self, odcs: Mapping[str, Any]) -> None:
-        """Validate an ODCS contract payload against the vendored JSON Schema."""
-        if not self.schema:
+        """Validate an ODCS contract payload against the vendored JSON Schema.
+
+        The schema is the one of the version the payload declares in ``apiVersion``,
+        else the provider's own (``self.schema``: v3.1.0 unless the provider was
+        made for another version, or the caller replaced it).
+        """
+        schema = self._schema_for(odcs)
+        if not schema:
             self.logger.warning("ODCS schema not available, skipping validation")
             return
-        validate(odcs, self.schema)
+        validate(odcs, schema)
+
+    def _schema_for(self, odcs: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """The schema ``odcs`` is held to: its declared version's, else ``self.schema``."""
+        declared = version_of(odcs)
+        if declared is None or declared == self.odcs_version:
+            return self.schema
+        return load_schema(declared)
 
     def roundtrip_check(self, odcs: Mapping[str, Any]) -> Dict[str, Any]:
         """Convert ODCS → FLUID → ODCS and return a structured diff.
@@ -260,7 +284,9 @@ class OdcsProvider(BaseProvider):
         "changed": [...]}``. Pure; no I/O.
         """
         fluid = self.import_contract(odcs)
-        reconstructed = self.render(fluid)
+        # At the version the document declares, so ``apiVersion`` and the servers a
+        # newer version has are not reported as lost.
+        reconstructed = self.render(fluid, version=version_of(odcs) or self.odcs_version)
         return roundtrip_check(odcs, reconstructed)
 
     # ---- internal helpers ----------------------------------------------

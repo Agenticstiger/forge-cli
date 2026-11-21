@@ -30,7 +30,7 @@ import logging
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import yaml
 
@@ -247,25 +247,31 @@ def validate_manifest_dir(
 # ---------------------------------------------------------------------------
 
 
+def _schema_missing(artifact_path: str, validator_name: str, code_prefix: str) -> ValidationIssue:
+    return ValidationIssue(
+        file=artifact_path,
+        validator=validator_name,
+        severity="info",
+        message=("schema not vendored; skipped. Expected at one of the schemas/ paths."),
+        code=f"{code_prefix}-SCHEMA-MISSING",
+    )
+
+
 def _validate_against_schema(
     artifact_path: str,
     content: bytes,
-    schema: Optional[Dict[str, Any]],
+    schema: Union[Optional[Dict[str, Any]], Callable[[Any], Optional[Dict[str, Any]]]],
     *,
     validator_name: str,
     code_prefix: str,
 ) -> List[ValidationIssue]:
-    """Common path for JSON Schema validation of a YAML or JSON artifact."""
+    """Common path for JSON Schema validation of a YAML or JSON artifact.
+
+    ``schema`` is the vendored schema, or a function of the parsed document for a format whose
+    schema depends on a version the document declares (ODCS): the artifact is parsed once.
+    """
     if schema is None:
-        return [
-            ValidationIssue(
-                file=artifact_path,
-                validator=validator_name,
-                severity="info",
-                message=("schema not vendored; skipped. Expected at one of the schemas/ paths."),
-                code=f"{code_prefix}-SCHEMA-MISSING",
-            )
-        ]
+        return [_schema_missing(artifact_path, validator_name, code_prefix)]
 
     # Parse YAML or JSON depending on extension.
     # SECURITY (billion-laughs DoS): generated/vendored artifacts are
@@ -289,6 +295,11 @@ def _validate_against_schema(
                 code=f"{code_prefix}-PARSE",
             )
         ]
+
+    if callable(schema):
+        schema = schema(doc)
+        if schema is None:
+            return [_schema_missing(artifact_path, validator_name, code_prefix)]
 
     from fluid_build.schema_manager import JSONSCHEMA_AVAILABLE, schema_validator
 
@@ -340,12 +351,26 @@ def _validate_against_schema(
     return issues
 
 
+def _odcs_schema(doc: Any) -> Optional[Dict[str, Any]]:
+    """The vendored ODCS schema of the version ``doc`` declares in ``apiVersion``.
+
+    v3.1.0 for a document that declares none, or one whose version has no vendored schema
+    (the v3.1.0 schema lists the older versions in its ``apiVersion`` enum).
+    """
+    from fluid_build.providers.odcs.versions import schema_filename, version_of
+
+    declared = version_of(doc)
+    return _load_schema(
+        _ODCS_SCHEMA_PATH.with_name(schema_filename(declared)) if declared else _ODCS_SCHEMA_PATH
+    )
+
+
 def validate_odcs(path: str, content: bytes) -> List[ValidationIssue]:
-    """Validate an ODCS YAML artifact against the vendored ODCS v3.1.0 schema."""
+    """Validate an ODCS YAML artifact against the vendored ODCS schema of its declared version."""
     return _validate_against_schema(
         path,
         content,
-        _load_schema(_ODCS_SCHEMA_PATH),
+        _odcs_schema,
         validator_name="odcs",
         code_prefix="ODCS",
     )
