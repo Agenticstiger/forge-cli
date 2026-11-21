@@ -150,6 +150,11 @@ def test_an_operators_run_id_that_a_stamp_may_not_hold_is_made_safe_not_refused(
     assert got == "build_42__next" and _desired.STAMP_VALUE.fullmatch(got)
     assert len(_desired.run_stamps(contract, run_id="r" * 400)["run_id"]) == 256
     assert "run_id" not in _desired.run_stamps(contract)
+    # never an option of the command line: what is not a letter or a digit is cut from its start
+    assert _desired.run_stamps(contract, run_id="--config=s3://x/job.json")["run_id"] == (
+        "config=s3://x/job.json"
+    )
+    assert "run_id" not in _desired.run_stamps(contract, run_id="--- ")
 
 
 def test_the_release_is_the_one_the_deploy_names(contract):
@@ -158,7 +163,7 @@ def test_the_release_is_the_one_the_deploy_names(contract):
     assert got["release_id"] == "v1.4.0"
 
 
-@pytest.mark.parametrize("value", ["two words", "a;b", "x" * 257, "v1\nv2"])
+@pytest.mark.parametrize("value", ["two words", "a;b", "x" * 257, "v1\nv2", "-v1", "--config=x"])
 def test_a_release_a_stamp_may_not_hold_is_refused_by_name(contract, value):
     with pytest.raises(ValueError, match=_desired.RELEASE_ID_ENV) as refused:
         _desired.run_stamps(contract, environ={_desired.RELEASE_ID_ENV: value})

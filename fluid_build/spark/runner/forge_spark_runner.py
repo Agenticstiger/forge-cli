@@ -89,8 +89,10 @@ STAMP_FLAGS = (
 )
 #: What a stamp may hold: an identifier, a version, a digest, or the run id an orchestrator names
 #: (``scheduled__2026-11-21T00:00:00+00:00``); never a space or a control character, so a value
-#: cannot change what the log line or the snapshot summary shows.
-_STAMP_VALUE = re.compile(r"[A-Za-z0-9._:+@/=~-]{1,256}")
+#: cannot change what the log line or the snapshot summary shows. A value ``fluid apply`` passes
+#: starts with a letter or a digit, so it is never read as an option of the command line.
+_STAMP_IDENT = re.compile(r"[A-Za-z0-9._:+@/=~-]{1,256}")
+_STAMP_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+@/=~-]{0,255}")
 GLUE_CATALOG_IMPL = "org.apache.iceberg.aws.glue.GlueCatalog"
 S3_FILE_IO = "org.apache.iceberg.aws.s3.S3FileIO"
 #: Session settings the generated SQL relies on.
@@ -138,16 +140,18 @@ def release_stamps(config: dict, text: str, args) -> dict:
         "fluid.build": config["build"],
         "fluid.job-sha256": config_digest(text),
     }
+    given = []
     for flag, key in STAMP_FLAGS:
         value = getattr(args, flag[2:].replace("-", "_"), None)
         if value:
             stamps[key] = value
+            given.append(key)
     for key, value in stamps.items():
-        if not _STAMP_VALUE.fullmatch(str(value)):
+        if not (_STAMP_VALUE if key in given else _STAMP_IDENT).fullmatch(str(value)):
             raise JobConfigError(
                 f"{key}: {str(value)[:60]!r} is not an identifier, a version, a digest or a run "
-                "id (letters, digits and . _ : + @ / = ~ -, at most 256 characters); "
-                "nothing was read"
+                "id (starting with a letter or a digit; letters, digits and . _ : + @ / = ~ -, "
+                "at most 256 characters); nothing was read"
             )
     return stamps
 

@@ -116,7 +116,10 @@ def test_the_stamp_keys_are_lower_case_and_never_one_of_icebergs_own(runner):
 @pytest.mark.parametrize("name", ["product_version", "contract_digest", "release_id", "run_id"])
 @pytest.mark.parametrize(
     "value",
-    ["two words", "line\nbreak", "tab\tsep", "semi;colon", "café", "{braces}", "q'uote", "x" * 257],
+    [
+        "two words", "line\nbreak", "tab\tsep", "semi;colon", "café", "{braces}", "q'uote",
+        "x" * 257, "-x", "--config=s3://other/job.json", ".dot", "_under",
+    ],  # fmt: skip
 )
 def test_a_value_a_stamp_may_not_hold_is_refused_before_anything_is_read(
     runner, contract, name, value
@@ -144,6 +147,16 @@ def test_the_ids_and_versions_the_pipeline_makes_are_accepted(runner, contract, 
     text = config_text(contract)
     stamps = runner.release_stamps(runner.parse_config(text), text, flags(run_id=value))
     assert stamps["fluid.run-id"] == value
+
+
+def test_a_product_or_build_id_may_start_with_an_underscore_a_flag_value_may_not(runner, contract):
+    text = config_text(contract)
+    config = runner.parse_config(text)
+    config.update(product="_internal.orders", build="_ingest")
+    stamps = runner.release_stamps(config, text, flags())
+    assert stamps["fluid.product"] == "_internal.orders" and stamps["fluid.build"] == "_ingest"
+    with pytest.raises(runner.JobConfigError, match="starting with a letter or a digit"):
+        runner.release_stamps(config, text, flags(run_id="_internal"))
 
 
 # --- where the stamps go --------------------------------------------------------------

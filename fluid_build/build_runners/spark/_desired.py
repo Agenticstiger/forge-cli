@@ -49,9 +49,10 @@ RESTART_FLAG = "--fluid-restart-of"
 #: Names the release a deploy belongs to (a tag, a build number, a release's identity digest):
 #: the runner stamps it on every commit as ``fluid.release-id`` when set.
 RELEASE_ID_ENV = "FLUID_RELEASE_ID"
-#: What the runner accepts as a stamp's value (``forge_spark_runner._STAMP_VALUE``; a test
-#: checks the two agree): an identifier, a version, a digest or an orchestrator's run id.
-STAMP_VALUE = re.compile(r"[A-Za-z0-9._:+@/=~-]{1,256}")
+#: What the runner accepts as the value of a ``--fluid-*`` flag (``forge_spark_runner._STAMP_VALUE``;
+#: a test checks the two agree): an identifier, a version, a digest or an orchestrator's run id,
+#: starting with a letter or a digit so it is never read as an option.
+STAMP_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+@/=~-]{0,255}")
 
 # EMR 7.x paths and the Maven coordinates the runner's docstring lists (Spark 3.5).
 _EMR_ICEBERG_JAR = "/usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar"
@@ -881,7 +882,8 @@ def run_stamps(
     """What ``fluid apply`` hands the runner of each run it starts, besides what the job config
     says: the digest of ``contract`` as loaded (before ``{{ env.* }}`` is resolved, so no
     environment value is in what it hashes), the pipeline's ``run_id`` (anything a stamp may
-    not hold becomes ``_``: an operator's own ``FLUID_RUN_ID`` never refuses a deploy) and the
+    not hold becomes ``_`` and what is not a letter or a digit is cut from its start: an
+    operator's own ``FLUID_RUN_ID`` never refuses a deploy) and the
     release :data:`RELEASE_ID_ENV` names. A contract that cannot be hashed is left unstamped.
 
     Raises:
@@ -895,15 +897,16 @@ def run_stamps(
         stamps["contract_digest"] = compute_contract_digest(contract)
     except (TypeError, ValueError, RecursionError):
         pass  # a value no digest can hold: the commits carry the rest
-    if run_id:
-        stamps["run_id"] = re.sub(r"[^A-Za-z0-9._:+@/=~-]", "_", run_id)[:256]
+    safe_id = re.sub(r"^[^A-Za-z0-9]+", "", re.sub(r"[^A-Za-z0-9._:+@/=~-]", "_", run_id or ""))
+    if safe_id:
+        stamps["run_id"] = safe_id[:256]
     release = (env.get(RELEASE_ID_ENV) or "").strip()
     if release:
         if not STAMP_VALUE.fullmatch(release):
             raise ValueError(
                 f"{RELEASE_ID_ENV} {release[:60]!r} is not an identifier, a version, a digest or "
-                "a run id (letters, digits and . _ : + @ / = ~ -, at most 256 characters); "
-                "nothing was started"
+                "a run id (starting with a letter or a digit; letters, digits and . _ : + @ / = ~ -, "
+                "at most 256 characters); nothing was started"
             )
         stamps["release_id"] = release
     return stamps
