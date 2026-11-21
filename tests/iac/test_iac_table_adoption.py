@@ -108,9 +108,11 @@ def _change(
     before: Dict[str, Any],
     after: Dict[str, Any],
     actions: Sequence[str] = ("update",),
+    action_reason: Optional[str] = None,
     **extra: Any,
 ) -> Dict[str, Any]:
-    return {
+    """A resource change; ``action_reason`` sits beside ``change``, as OpenTofu prints it."""
+    resource: Dict[str, Any] = {
         "address": ADDRESS,
         "mode": "managed",
         "type": "aws_glue_catalog_table",
@@ -124,6 +126,9 @@ def _change(
             **extra,
         },
     }
+    if action_reason:
+        resource["action_reason"] = action_reason
+    return resource
 
 
 #: forge's own table body in main.tf.json (``aws._emit_glue``), the parts the review reads.
@@ -502,6 +507,26 @@ def test_a_replace_is_refused_whatever_the_attributes_say():
     assert review.differences == (
         "OpenTofu would replace it (a replace_triggered_by trigger fires), which drops the "
         "table and its Lake Formation permissions",
+    )
+
+
+def test_a_replace_names_the_attributes_that_cannot_change_in_place():
+    change = _change(
+        LIVE_ICEBERG,
+        PLANNED_ICEBERG,
+        actions=("create", "delete"),
+        action_reason="replace_because_cannot_update",
+        replace_paths=[["open_table_format_input", 0, "iceberg_input"]],
+    )
+    shown = {"resource_changes": [change]}
+
+    (review,) = review_tables(
+        shown, {ADDRESS: "sales.orders"}, {ADDRESS: ICEBERG}, review_glue_table
+    )
+
+    assert review.differences == (
+        "OpenTofu would replace it (open_table_format_input.0.iceberg_input cannot change "
+        "in place), which drops the table and its Lake Formation permissions",
     )
 
 

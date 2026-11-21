@@ -75,7 +75,8 @@ def planned_imports(shown: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
     """``{address: resource change}`` of each managed resource the saved plan imports.
 
     ``tofu show -json`` sets ``change.importing`` on a resource an ``import`` block
-    brings in (opentofu.org/docs/internals/json-format).
+    brings in; ``action_reason`` sits beside ``change``, on the resource change
+    (opentofu.org/docs/internals/json-format).
     """
     found: Dict[str, Mapping[str, Any]] = {}
     for change in shown.get("resource_changes") or []:
@@ -83,7 +84,7 @@ def planned_imports(shown: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
             continue
         detail = change.get("change")
         if isinstance(detail, Mapping) and detail.get("importing") is not None:
-            found[str(change.get("address") or "")] = detail
+            found[str(change.get("address") or "")] = change
     return found
 
 
@@ -118,24 +119,27 @@ def review_tables(
     imports = planned_imports(shown)
     reviews: List[TableReview] = []
     for address, name in sorted(tables.items()):
-        change = imports.get(address)
-        if change is None:
+        resource = imports.get(address)
+        if resource is None:
             reviews.append(TableReview(address, name, ("the plan does not import it",)))
             continue
+        change: Mapping[str, Any] = resource["change"]
         differences: List[str] = []
         actions = [str(action) for action in change.get("actions") or []]
         if "delete" in actions:
-            differences.append(_replaced(change, actions))
+            differences.append(_replaced(resource, change, actions))
         found, updates = review(change, declared.get(address) or {})
         differences.extend(found)
         reviews.append(TableReview(address, name, tuple(differences), tuple(updates)))
     return reviews
 
 
-def _replaced(change: Mapping[str, Any], actions: Sequence[str]) -> str:
+def _replaced(
+    resource: Mapping[str, Any], change: Mapping[str, Any], actions: Sequence[str]
+) -> str:
     if "create" not in actions:
         return "OpenTofu would delete it"
-    reason = str(change.get("action_reason") or "")
+    reason = str(resource.get("action_reason") or "")
     why = _REPLACE_REASONS.get(reason, "")
     if reason == "replace_because_cannot_update":
         paths = [
