@@ -165,7 +165,7 @@ def test_the_runner_imports_nothing_but_the_standard_library_at_module_level():
         elif isinstance(node, ast.ImportFrom):
             names.add(node.module.split(".")[0])
     assert names <= {
-        "__future__", "argparse", "base64", "hashlib", "hmac", "json", "os", "sys", "time",
+        "__future__", "argparse", "base64", "hashlib", "hmac", "json", "os", "re", "sys", "time",
         "unicodedata", "urllib",
     }  # fmt: skip
 
@@ -319,6 +319,7 @@ def test_glue_arguments_never_stand_in_for_the_config(runner, monkeypatch, argv)
     monkeypatch.setitem(sys.modules, "pyspark.sql", types.SimpleNamespace(SparkSession=session))
     monkeypatch.setattr(runner, "read_text", lambda spark, path: read.append(path) or "{}")
     monkeypatch.setattr(runner, "parse_config", lambda text: {})
-    monkeypatch.setattr(runner, "run", lambda spark, config: None)
+    monkeypatch.setattr(runner, "release_stamps", lambda config, text, args: {})
+    monkeypatch.setattr(runner, "run", lambda spark, config, stamps: None)
     assert runner.main(argv) == 0
     assert read == ["s3://b/_fluid/job.json"]
