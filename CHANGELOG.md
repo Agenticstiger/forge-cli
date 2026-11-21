@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the build's output), `fluid.contract-digest` (the contract as loaded, before `{{ env.* }}` is
   resolved), `fluid.release-id` (`FLUID_RELEASE_ID`, when the deploy names a release) and
   `fluid.run-id` (the pipeline's run id, which `fluid ship` records as `provenance.run_id`; set
-  `FLUID_RUN_ID` to an orchestrator's run id to have it stamped instead). They are Iceberg
+  `FLUID_RUN_ID` to a scheduler's run id to have it stamped instead). They are Iceberg
   `snapshot-property.` write options, which Iceberg applies to a batch commit and to a streaming
   one alike, and the job's Spark conf holds them as `spark.fluid.*` (a conf Spark refuses is
   logged, and the run goes on). They reach the runner as arguments, not in the job config, the

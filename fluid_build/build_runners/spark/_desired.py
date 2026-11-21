@@ -52,7 +52,7 @@ RESTART_FLAG = "--fluid-restart-of"
 #: the runner stamps it on every commit as ``fluid.release-id`` when set.
 RELEASE_ID_ENV = "FLUID_RELEASE_ID"
 #: What the runner accepts as the value of a ``--fluid-*`` flag (``forge_spark_runner._STAMP_VALUE``;
-#: a test checks the two agree): an identifier, a version, a digest or an orchestrator's run id,
+#: a test checks the two agree): an identifier, a version, a digest or a scheduler's run id,
 #: starting with a letter or a digit so it is never read as an option.
 STAMP_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+@/=~-]{0,255}")
 

@@ -87,7 +87,7 @@ STAMP_FLAGS = (
     ("--fluid-release-id", "fluid.release-id"),
     ("--fluid-run-id", "fluid.run-id"),
 )
-#: What a stamp may hold: an identifier, a version, a digest, or the run id an orchestrator names
+#: What a stamp may hold: an identifier, a version, a digest, or the run id a scheduler names
 #: (``scheduled__2026-11-21T00:00:00+00:00``); never a space or a control character, so a value
 #: cannot change what the log line or the snapshot summary shows. A value ``fluid apply`` passes
 #: starts with a letter or a digit, so it is never read as an option of the command line.
