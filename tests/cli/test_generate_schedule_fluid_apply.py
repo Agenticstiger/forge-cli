@@ -144,6 +144,34 @@ class TestTheDemoContractGetsADagThatDoesTheWork:
         ):
             assert dropped not in run.env, dropped
 
+    def test_airflows_run_reaches_fluid_under_fluids_names(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        write_project(tmp_path)
+        assert _generate(tmp_path, monkeypatch) == 0
+        loaded = load_dag((tmp_path / "out" / DAG_FILE).read_text(), monkeypatch)
+        dag_id = "bronze.customer_subscriptions__ingest_subscriptions"
+        worker = {
+            "FLUID_PROJECT_DIR": str(tmp_path),
+            # What Airflow's BashOperator adds to every task's environment.
+            "AIRFLOW_CTX_DAG_ID": dag_id,
+            "AIRFLOW_CTX_DAG_RUN_ID": "scheduled__2026-11-21T00:00:00+00:00",
+            "AIRFLOW_CTX_TASK_ID": "ingest_subscriptions",
+            # A value the worker holds never stands in for the run Airflow names.
+            "FLUID_SCHEDULER_JOB": "a-stale-job",
+            "FLUID_SCHEDULER_RUN_ID": "a-stale-run",
+        }
+        run = run_task(loaded.tasks[0], tmp_path, worker)
+        assert run.returncode == 0, run.stderr
+        assert run.env["FLUID_SCHEDULER_JOB"] == dag_id
+        assert run.env["FLUID_SCHEDULER_RUN_ID"] == "scheduled__2026-11-21T00:00:00+00:00"
+        assert not [name for name in run.env if name.startswith("AIRFLOW")]
+
+        outside = run_task(loaded.tasks[0], tmp_path, {"FLUID_PROJECT_DIR": str(tmp_path)})
+        assert outside.returncode == 0, outside.stderr
+        assert "FLUID_SCHEDULER_JOB" not in outside.env
+        assert "FLUID_SCHEDULER_RUN_ID" not in outside.env
+
     def test_without_env_the_flag_is_left_out(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -409,6 +437,14 @@ def _literal_connection(contract: str = DEMO_CONTRACT) -> str:
 #: need, so the worker environment does not pass them.
 NOT_PASSED = {
     "_ARGCOMPLETE": "set by the shell's tab completion, which a scheduled DAG task never is",
+    "AIRFLOW_CTX_DAG_ID": (
+        "Airflow's task context: the DAG's script hands its value on as FLUID_SCHEDULER_JOB, "
+        "so no AIRFLOW* name passes"
+    ),
+    "AIRFLOW_CTX_DAG_RUN_ID": (
+        "Airflow's task context: the DAG's script hands its value on as FLUID_SCHEDULER_RUN_ID, "
+        "so no AIRFLOW* name passes"
+    ),
     "GIT_CONFIG_PARAMETERS": (
         "federation reads it only to append its own git config entries after any the "
         "caller already set; with none set its entries are the whole value"
