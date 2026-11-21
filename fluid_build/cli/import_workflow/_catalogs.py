@@ -16,9 +16,11 @@ kind is known only when the code says so:
 
 set as a constant in the code that is scanned: ``SparkSession.builder.config(key, value)``,
 ``spark.conf.set(key, value)``, a dict entry (``SparkSubmitOperator(conf={...})``), or
-``--conf key=value`` in any string (a ``spark-submit`` command, ``sparkSubmitParameters``, an
-argument list). Nothing is run and nothing is read from outside the scanned files. An alias the
-code sets to two kinds is no kind.
+``--conf key=value`` in a string (a ``spark-submit`` command, ``sparkSubmitParameters``) or after
+a ``--conf`` element of an argument list. Text that only mentions a setting (a docstring, a log
+line, a help text) is no setting: a string counts only with the ``--conf`` before the pair.
+Nothing is run and nothing is read from outside the scanned files. An alias the code sets to two
+kinds is no kind.
 """
 
 from __future__ import annotations
@@ -41,10 +43,18 @@ IMPL_KINDS = {
 }
 _NEEDLE = "spark.sql.catalog"
 _KEY = re.compile(r"spark\.sql\.catalog\.([A-Za-z0-9_-]{1,64})\.(type|catalog-impl)", re.I)
-#: ``key=value`` inside a string: a ``--conf`` of a command line or of ``sparkSubmitParameters``.
-_PAIR = re.compile(
-    r"(spark\.sql\.catalog\.[A-Za-z0-9_-]{1,64}\.(?:type|catalog-impl))\s*=\s*([^\s,;'\"]{1,200})",
-    re.I,
+_PAIR = (
+    r"(spark\.sql\.catalog\.[A-Za-z0-9_-]{1,64}\.(?:type|catalog-impl))\s*=\s*([^\s,;'\"]{1,200})"
+)
+#: ``--conf key=value`` inside a string: a command line, ``sparkSubmitParameters``.
+_CONF = re.compile(r"(?:^|\s)(?:--conf|-c)(?:\s+|=)\s*" + _PAIR, re.I)
+#: A whole string that is ``key=value``: an element of an argument list, after its ``--conf``.
+_WHOLE = re.compile(_PAIR, re.I)
+_FLAGS = frozenset({"--conf", "-c"})
+#: Calls whose string arguments are text for a reader, not code that sets anything.
+_PROSE_CALLS = frozenset(
+    {"print", "info", "debug", "warning", "warn", "error", "exception", "critical", "log"}
+    | {"add_argument", "echo"}
 )
 #: Values folded and settings kept from one file: a file that sets more is not about catalogs.
 MAX_FOLDS = 2_000
@@ -100,6 +110,24 @@ def _mentions(node: ast.AST) -> Optional[bool]:
     return None
 
 
+def _prose(node: ast.AST, parents: Dict[ast.AST, ast.AST]) -> bool:
+    """Whether the string ``node`` is text for a reader: a docstring or a bare string statement,
+    or an argument of a ``print``, a log call or an ``add_argument`` (a help text)."""
+    current: Optional[ast.AST] = node
+    for _ in range(4):
+        parent = parents.get(current) if current is not None else None
+        if isinstance(parent, ast.Expr):
+            return True
+        if isinstance(parent, ast.Call):
+            func = parent.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            return name in _PROSE_CALLS
+        if parent is None or isinstance(parent, (ast.stmt, ast.Dict)):
+            return False  # a keyword argument is part of its call: look on
+        current = parent
+    return False
+
+
 def module_settings(module: Module, folder: Folder) -> List[Tuple[str, str]]:
     """The ``(alias, kind)`` settings ``module`` fixes (see the module's docstring), in the order
     they are first written. Run after the module's own reads, so what it folds never takes the
@@ -117,8 +145,10 @@ def module_settings(module: Module, folder: Folder) -> List[Tuple[str, str]]:
 
     def pairs_in(text: Any) -> None:
         if isinstance(text, str) and _NEEDLE in text:
-            for match in _PAIR.finditer(text):
+            for match in _CONF.finditer(text):
                 take(match.group(1), match.group(2))
+
+    parents = module.parents
 
     for node in ast.walk(tree):
         if folds >= MAX_FOLDS or len(found) >= MAX_SETTINGS:
@@ -133,11 +163,27 @@ def module_settings(module: Module, folder: Folder) -> List[Tuple[str, str]]:
                 if key is not None and _mentions(key) is not False:
                     folds += 2
                     take(folder.string(key), folder.string(value))
+        elif isinstance(node, (ast.List, ast.Tuple)):
+            for flag, value in zip(
+                node.elts, node.elts[1:], strict=False
+            ):  # ["--conf", "key=value"]
+                if (
+                    isinstance(flag, ast.Constant)
+                    and flag.value in _FLAGS
+                    and not _prose(node, parents)
+                ):
+                    folds += 1
+                    text = folder.string(value)
+                    whole = _WHOLE.fullmatch(text.strip()) if isinstance(text, str) else None
+                    if whole is not None:
+                        take(whole.group(1), whole.group(2))
         elif isinstance(node, ast.Constant):
-            pairs_in(node.value)
+            if not _prose(node, parents):
+                pairs_in(node.value)
         elif isinstance(node, ast.JoinedStr):
-            folds += 1
-            pairs_in(folder.string(node))
+            if not _prose(node, parents):
+                folds += 1
+                pairs_in(folder.string(node))
     return list(found)
 
 

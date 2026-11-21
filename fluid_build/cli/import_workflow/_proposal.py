@@ -316,7 +316,9 @@ def _binding(
             platform, rule_format = catalog_rule.platform, catalog_rule.format
             if catalog_rule.catalog:
                 location["catalog"] = catalog_rule.catalog
-        elif identity.catalog:
+        if identity.catalog and identity.rule is None and "catalog" not in location:
+            # a rule that gives no kind leaves it to the code, as no rule does (a path rule's
+            # catalog is the person's own word, below)
             kind = catalog_kind(identity.catalog, catalogs or CatalogKinds())
             if kind:
                 location["catalog"] = kind

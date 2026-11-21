@@ -222,6 +222,107 @@ def test_a_catalog_impl_is_the_kind_its_class_is(tmp_path, monkeypatch, impl, ki
     assert binding_of(contracts, "cur.b")["location"]["catalog"] == kind
 
 
+# --- prose is no setting ------------------------------------------------------------------
+
+PROSE = {
+    "a docstring": 'def setup():\n    """Locally: spark.sql.catalog.glue_catalog.type=hive"""\n',
+    "a bare string": '"spark.sql.catalog.glue_catalog.type=hive"\n',
+    "a log line": 'import logging\nlogging.info("spark.sql.catalog.glue_catalog.type=rest is set")\n',
+    "a print": 'print("--conf spark.sql.catalog.glue_catalog.type=rest")\n',
+    "a help text": (
+        "import argparse\np = argparse.ArgumentParser()\n"
+        'p.add_argument("--x", help="use --conf spark.sql.catalog.glue_catalog.type=rest")\n'
+    ),
+    "a bare pair": 'ARGS = ["spark.sql.catalog.glue_catalog.type=glue"]\n',
+    "a pair after another flag": 'ARGS = ["--name", "spark.sql.catalog.glue_catalog.type=glue"]\n',
+    "a pair in a command that does not conf": 'CMD = "echo spark.sql.catalog.glue_catalog.type=glue"\n',
+}
+
+
+@pytest.mark.parametrize("name", sorted(PROSE))
+def test_text_that_only_mentions_a_setting_does_not_set_it(tmp_path, monkeypatch, name):
+    source = SESSION + PROSE[name] + BATCH.split(SESSION, 1)[1]
+    contracts, report = propose(tmp_path, monkeypatch, {"jobs/j.py": source})
+    assert "catalog" not in binding_of(contracts, "cur.b")["location"]
+    assert [x for x in report.required_defaults if "binding.location.catalog" in x]
+
+
+def test_a_docstring_that_says_another_kind_does_not_undo_the_setting_beside_it(
+    tmp_path, monkeypatch
+):
+    source = (
+        SESSION
+        + '"""Locally: spark.sql.catalog.glue_catalog.type=hive"""\n'
+        + 'spark = SparkSession.builder.config("spark.sql.catalog.glue_catalog.type", "glue")'
+        + ".getOrCreate()\n"
+        + 'spark.table("glue_catalog.raw.orders").write.format("iceberg")'
+        + '.saveAsTable("glue_catalog.cur.b")\n'
+    )
+    contracts, _report = propose(tmp_path, monkeypatch, {"jobs/j.py": source})
+    assert binding_of(contracts, "cur.b")["location"]["catalog"] == "glue"
+
+
+@pytest.mark.parametrize("flag", ["--conf", "-c"])
+def test_a_pair_after_the_conf_flag_of_an_argument_list_is_a_setting(tmp_path, monkeypatch, flag):
+    source = (
+        SESSION
+        + f'ARGS = ["{flag}", "spark.sql.catalog.glue_catalog.type=glue"]\n'
+        + BATCH.split(SESSION, 1)[1]
+    )
+    contracts, _report = propose(tmp_path, monkeypatch, {"jobs/j.py": source})
+    assert binding_of(contracts, "cur.b")["location"]["catalog"] == "glue"
+
+
+# --- a conventions rule that names no kind -------------------------------------------------
+
+
+def test_a_conventions_rule_with_no_catalog_key_leaves_the_kind_to_the_code(tmp_path, monkeypatch):
+    conventions = "catalogs:\n  glue_catalog: {platform: aws, format: iceberg}\n"
+    configured = BATCH.replace(
+        "SparkSession.builder",
+        'SparkSession.builder.config("spark.sql.catalog.glue_catalog.type", "glue")',
+    )
+    contracts, report = propose(
+        tmp_path / "a",
+        monkeypatch,
+        {"jobs/j.py": configured, "conventions.yaml": conventions},
+        conventions="conventions.yaml",
+    )
+    binding = binding_of(contracts, "cur.b")
+    assert binding["platform"] == "aws" and binding["location"]["catalog"] == "glue"
+    assert not [x for x in report.required_defaults if "binding.location.catalog" in x]
+
+    contracts, report = propose(
+        tmp_path / "b",
+        monkeypatch,
+        {"jobs/j.py": BATCH, "conventions.yaml": conventions},
+        conventions="conventions.yaml",
+    )
+    assert "catalog" not in binding_of(contracts, "cur.b")["location"]
+    assert [x for x in report.required_defaults if "binding.location.catalog" in x]
+
+
+def test_a_path_rules_own_catalog_is_not_reported_as_unset(tmp_path, monkeypatch):
+    source = (
+        SESSION
+        + "spark = SparkSession.builder.getOrCreate()\n"
+        + 'spark.read.parquet("s3://lake/raw/orders").write.mode("overwrite")'
+        + '.parquet("s3://lake/curated/orders")\n'
+    )
+    files = {
+        "jobs/j.py": source,
+        "conventions.yaml": """
+            paths:
+              - {prefix: "s3://lake/curated/", database: cur, platform: aws, format: iceberg, catalog: my_glue}
+            """,
+    }
+    contracts, report = propose(tmp_path, monkeypatch, files, conventions="conventions.yaml")
+    assert (
+        binding_of(contracts, "cur.orders")["location"]["catalog"] == "my_glue"
+    )  # the person's word
+    assert not [x for x in report.required_defaults if "binding.location.catalog is not set" in x]
+
+
 # --- when the code does not say, or says it twice -------------------------------------
 
 
