@@ -9,12 +9,16 @@ no run record here. What it leaves is the sealed release ``fluid ship --release-
 publishes at each deploy: ``release.json`` (``fluid-release/1``), written last into a directory
 that is renamed into place and never changed. This reads those records and answers "which release
 of this product was in force on that date": its version(s), the revision of the code the CI built
-it from, the run that sealed it.
+it from, the run that sealed it. Each environment is answered on its own: a dev release sealed
+between two prod ones is not what was in force in prod.
 
 The records are the reader's own files, not trusted input: a directory is read one level deep,
-a link is never followed, an index is read up to :data:`MAX_INDEX_BYTES`, one that does not parse
-or is another product's is skipped (and counted), and every text that comes out of a record is
-cleaned of control characters and cut, so a record cannot rewrite the terminal.
+a link is never followed (the index is opened with ``O_NOFOLLOW`` and checked on the open handle),
+an index is read up to :data:`MAX_INDEX_BYTES`, one that does not parse or is another product's is
+skipped (and counted), and every text that comes out of a record is cleaned of control characters
+and cut, so a record cannot rewrite the terminal. Nothing authenticates a record: ``intact`` says
+its ``identity_digest`` matches its ``identity``, which anyone who writes a record can arrange;
+the sealed time and the source are not in that digest at all.
 
 Standard library only at module scope (``fluid --help`` imports the ops commands).
 """
@@ -22,17 +26,24 @@ Standard library only at module scope (``fluid --help`` imports the ops commands
 from __future__ import annotations
 
 import os
+import re
 import stat
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 #: Release directories read in one directory, and bytes of one ``release.json``.
 MAX_ENTRIES = 2_000
 MAX_INDEX_BYTES = 1_048_576
 #: Characters of any text taken from a record.
 _TEXT = 200
+_DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+#: What a reader of a record is told about it, once, under an answer.
+NOT_AUTHENTICATED = (
+    "Records are read as written. 'intact' means a record's identity_digest matches its identity; "
+    "it does not say who wrote the record, and its sealed time and source are outside that digest."
+)
 
 
 def clean(value: Any, limit: int = _TEXT) -> str:
@@ -57,7 +68,8 @@ class Release:
     source: Dict[str, str] = field(default_factory=dict)
     bundle_digest: Optional[str] = None
     #: False when ``identity_digest`` is not the digest of ``identity``: the record was changed
-    #: after it was sealed, or was never one.
+    #: after it was sealed, or was never one. True proves little: whoever writes a record can
+    #: compute the digest, and the sealed time and the source are outside it.
     intact: bool = True
 
     def as_dict(self) -> Dict[str, Any]:
@@ -78,48 +90,81 @@ class Found:
         self.skipped[why] = self.skipped.get(why, 0) + 1
 
 
+def parse_day(text: str) -> Optional[date]:
+    """``YYYY-MM-DD`` as a date, or None. Nothing else: ``date.fromisoformat`` also takes
+    ``20261114`` and week dates, depending on the Python version."""
+    if not _DAY.fullmatch(text):
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 def _moment(value: Any) -> Optional[datetime]:
     """An ISO 8601 time as UTC, or None."""
     if not isinstance(value, str) or not value or len(value) > 64:
         return None
     try:
         parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
-    except ValueError:
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)  # an offset can push year 1 or 9999 out of range
+    except (ValueError, OverflowError):
         return None
-    return (
-        parsed.replace(tzinfo=timezone.utc)
-        if parsed.tzinfo is None
-        else parsed.astimezone(timezone.utc)
-    )
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
-def _read_index(directory: Path) -> Optional[Dict[str, Any]]:
-    """``directory/release.json`` as an object, or None: absent, not a regular file, too big,
-    not JSON or not an object. A link is not followed."""
-    import json
+def _text(value: Any, limit: int) -> Optional[str]:
+    """``value`` cleaned, when it is text; None for anything else (a record can hold any JSON,
+    and a deeply nested value must not be turned into text)."""
+    return clean(value, limit) if isinstance(value, str) and value else None
 
-    from fluid_build.util.safe_yaml import read_bounded_file
 
-    path = directory / "release.json"
+def _read_bounded(path: Path) -> Optional[bytes]:
+    """The bytes of ``path``, or None: absent, a link (never followed: opened with
+    ``O_NOFOLLOW``), not a regular file (checked on the open handle, so a FIFO or a device never
+    blocks or runs on), or longer than :data:`MAX_INDEX_BYTES`."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        info = os.lstat(path)
+        fd = os.open(path, flags)
     except OSError:
         return None
-    if not stat.S_ISREG(info.st_mode):
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = b""
+        while len(data) <= MAX_INDEX_BYTES:
+            chunk = os.read(fd, MAX_INDEX_BYTES + 1 - len(data))
+            if not chunk:
+                return data
+            data += chunk
+        return None  # longer than the limit
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _read_index(directory: Path) -> Optional[Dict[str, Any]]:
+    """``directory/release.json`` as an object, or None: absent, a link, not a regular file, too
+    big, not JSON or not an object."""
+    import json
+
+    data = _read_bounded(directory / "release.json")
+    if data is None:
         return None
     try:
-        data = read_bounded_file(path, MAX_INDEX_BYTES)
-        parsed = json.loads(data) if data is not None else None
-    except (OSError, ValueError, RecursionError):
+        parsed = json.loads(data)
+    except (ValueError, RecursionError):
         return None
     return parsed if isinstance(parsed, dict) else None
 
 
-def _release(directory: Path, shown: str, index: Mapping[str, Any]) -> Optional[Release]:
+def _release(shown: str, index: Mapping[str, Any]) -> Optional[Release]:
     """The release ``index`` describes, or None when it is not a release record."""
     from fluid_build.cli import _ship_release as ship_release
 
@@ -144,99 +189,134 @@ def _release(directory: Path, shown: str, index: Mapping[str, Any]) -> Optional[
         for key, value in _mapping(provenance.get("source")).items()
         if key in ("revision", "repository", "ref") and isinstance(value, str)
     }
-    bundle = _mapping(identity.get("bundle")).get("manifest_digest")
     return Release(
         path=clean(shown),
         product_id=clean(product, 120),
         sealed_at=sealed,
         release_id=clean(digest, 80),
         expose_versions=dict(list(versions.items())[:50]),
-        environment=clean(identity["environment"], 40) if identity.get("environment") else None,
-        forge_version=(
-            clean(identity["forge_version"], 40) if identity.get("forge_version") else None
-        ),
-        run_id=clean(provenance["run_id"], 80) if provenance.get("run_id") else None,
+        environment=_text(identity.get("environment"), 40),
+        forge_version=_text(identity.get("forge_version"), 40),
+        run_id=_text(provenance.get("run_id"), 80),
         source=source,
-        bundle_digest=clean(bundle, 80) if isinstance(bundle, str) else None,
+        bundle_digest=_text(_mapping(identity.get("bundle")).get("manifest_digest"), 80),
         intact=intact,
     )
 
 
+def _candidates(top: Path, root: str, found: Found) -> List[Tuple[Path, str]]:
+    """The directories under ``root`` that may hold a release: ``root`` itself when it holds a
+    ``release.json``, otherwise its subdirectories (one level, in name order, up to
+    :data:`MAX_ENTRIES`; a link to a directory is not one)."""
+    if (top / "release.json").exists():
+        return [(top, root)]
+    try:
+        names = sorted(os.listdir(top))
+    except OSError:
+        found.skip("a directory that cannot be listed")
+        return []
+    if len(names) > MAX_ENTRIES:
+        found.skip(f"entries past the first {MAX_ENTRIES:,} of a directory")
+        names = names[:MAX_ENTRIES]
+    out: List[Tuple[Path, str]] = []
+    for name in names:
+        if name.startswith(".") or ".partial-" in name:
+            continue  # a run that did not publish
+        child = top / name
+        try:
+            is_directory = stat.S_ISDIR(os.lstat(child).st_mode)  # a link is not one
+        except OSError:
+            continue
+        if is_directory:
+            out.append((child, f"{root.rstrip(os.sep)}{os.sep}{name}"))
+    return out
+
+
 def find_releases(roots: Sequence[str], product_id: str) -> Found:
-    """The sealed releases of ``product_id`` under ``roots``. A root that holds a
+    """The sealed releases of ``product_id`` under ``roots``, oldest first. A root that holds a
     ``release.json`` is one release; any other directory is read one level deep, in name order,
-    up to :data:`MAX_ENTRIES` entries (the rest are counted as not read).
+    up to :data:`MAX_ENTRIES` entries (the rest are counted as not read). A release reached by
+    two roots, or by two spellings of one, is listed once.
 
     Raises:
         NotADirectoryError: a root is not a directory (a link to one is read as it points).
     """
     found = Found()
-    seen = set()
+    seen: Set[Tuple[str, str]] = set()
+    wanted = clean(product_id, 120)
     for root in roots:
         top = Path(root)
         if not top.is_dir():
             raise NotADirectoryError(f"--release-dir {clean(root)}: not a directory")
-        candidates: List[Tuple[Path, str]] = []
-        if (top / "release.json").exists():
-            candidates.append((top, root))
-        else:
-            try:
-                names = sorted(os.listdir(top))
-            except OSError:
-                found.skip("a directory that cannot be listed")
-                continue
-            if len(names) > MAX_ENTRIES:
-                found.skip(f"entries past the first {MAX_ENTRIES:,} of a directory")
-                names = names[:MAX_ENTRIES]
-            for name in names:
-                if name.startswith(".") or ".partial-" in name:
-                    continue  # a run that did not publish
-                child = top / name
-                try:
-                    is_directory = stat.S_ISDIR(os.lstat(child).st_mode)  # a link is not one
-                except OSError:
-                    continue
-                if is_directory:
-                    candidates.append((child, f"{root.rstrip(os.sep)}{os.sep}{name}"))
-        for directory, shown in candidates:
+        for directory, shown in _candidates(top, root, found):
             index = _read_index(directory)
             if index is None:
                 found.skip("a directory with no readable release.json")
                 continue
-            release = _release(directory, shown, index)
+            release = _release(shown, index)
             if release is None:
                 found.skip("a release.json that is not a fluid-release/1 record")
-            elif release.product_id != product_id:
+            elif release.product_id != wanted:
                 found.skip("a release of another product")
-            elif (release.release_id, release.path) not in seen:
-                seen.add((release.release_id, release.path))
-                found.releases.append(release)
-    found.releases.sort(key=lambda r: (r.sealed_at, r.release_id))
+            else:
+                key = (release.release_id, os.path.realpath(directory))
+                if key not in seen:
+                    seen.add(key)
+                    found.releases.append(release)
+    found.releases.sort(key=lambda r: (r.sealed_at, r.path, r.release_id))
     return found
 
 
 @dataclass
 class InForce:
-    """The answer for a moment or a day: the release in force when it began, and the ones
-    sealed during it."""
+    """The answer for a moment or a day, for one environment: the release in force when it
+    began, and the ones sealed during it."""
 
+    environment: Optional[str]
     start: datetime
     end: Optional[datetime]
     at_start: Optional[Release]
     during: List[Release]
 
 
-def in_force(releases: Sequence[Release], on: Optional[date], now: datetime) -> InForce:
-    """Which release was in force at ``now`` (``on`` is None), or on the UTC day ``on``: the latest
-    sealed before the day began, and every one sealed during it."""
+def in_force(
+    releases: Sequence[Release],
+    on: Optional[date],
+    now: datetime,
+    environment: Optional[str] = None,
+) -> InForce:
+    """Which of ``releases`` (oldest first) was in force at ``now`` (``on`` is None), or on the
+    UTC day ``on``: the latest sealed before the day began, and every one sealed during it. The
+    caller picks the releases that answer together (:func:`in_force_by_environment`)."""
     if on is None:
         before = [r for r in releases if r.sealed_at <= now]
-        return InForce(now, None, before[-1] if before else None, [])
+        return InForce(environment, now, None, before[-1] if before else None, [])
     start = datetime.combine(on, time.min, tzinfo=timezone.utc)
-    end = start + timedelta(days=1)
+    try:
+        end = start + timedelta(days=1)
+    except OverflowError:  # the last day there is
+        end = datetime.max.replace(tzinfo=timezone.utc)
     before = [r for r in releases if r.sealed_at < start]
     during = [r for r in releases if start <= r.sealed_at < end]
-    return InForce(start, end, before[-1] if before else None, during)
+    return InForce(environment, start, end, before[-1] if before else None, during)
+
+
+def in_force_by_environment(
+    releases: Sequence[Release],
+    on: Optional[date],
+    now: datetime,
+    environment: Optional[str] = None,
+) -> List[InForce]:
+    """One :func:`in_force` answer for each environment the releases name (the one without a
+    recorded environment first), or only for ``environment``."""
+    names: List[Optional[str]] = (
+        [environment]
+        if environment is not None
+        else sorted(
+            {r.environment for r in releases}, key=lambda name: (name is not None, name or "")
+        )
+    )
+    return [in_force([r for r in releases if r.environment == n], on, now, n) for n in names]
 
 
 def _stamp(moment: datetime) -> str:
@@ -268,21 +348,45 @@ def describe(release: Release) -> List[str]:
     return lines
 
 
-def report(product_id: str, answer: InForce, found: Found, on: Optional[date]) -> List[str]:
-    """The text answer."""
-    out = [f"{clean(product_id, 120)}: {len(found.releases)} sealed release(s) read"]
-    when = f"on {on.isoformat()}" if on else "now"
+def _none_sealed(product: str, environment: Optional[str], on: Optional[date]) -> str:
+    where = f" in environment {clean(environment, 40)}" if environment is not None else ""
+    if on is None:
+        return f"No release of {product}{where} has been sealed."
+    return f"No release of {product}{where} was sealed by the end of {on.isoformat()}."
+
+
+def _block(answer: InForce, on: Optional[date]) -> List[str]:
+    """The lines of one environment's answer (none when nothing was in force or sealed)."""
+    out: List[str] = []
     if answer.at_start:
-        out += [
-            f"In force {when if on is None else 'at the start of ' + on.isoformat()}:",
-            *describe(answer.at_start),
-        ]
-    elif not answer.during:
-        out.append(f"No release of {clean(product_id, 120)} was sealed on or before {when}.")
-    if answer.during:
-        out.append(f"Sealed during {on.isoformat() if on else 'the day'}:")
+        when = f"at the start of {on.isoformat()}" if on else "now"
+        out += [f"In force {when}:", *describe(answer.at_start)]
+    if answer.during and on:
+        out.append(f"Sealed during {on.isoformat()}:")
         for release in answer.during:
             out += describe(release)
+    return out
+
+
+def report(
+    product_id: str,
+    answers: Sequence[InForce],
+    found: Found,
+    on: Optional[date],
+    environment: Optional[str] = None,
+) -> List[str]:
+    """The text answer: one block per environment (headed when there are several);
+    ``environment`` is the one the caller asked for, if any."""
+    product = clean(product_id, 120)
+    out = [f"{product}: {len(found.releases)} sealed release(s) read"]
+    if not answers:
+        out.append(_none_sealed(product, environment, on))
+    for answer in answers:
+        if len(answers) > 1:
+            out.append(f"environment {answer.environment or '(none recorded)'}:")
+        out += _block(answer, on) or [_none_sealed(product, environment, on)]
     for why, count in sorted(found.skipped.items()):
         out.append(f"not read: {count} x {why}")
+    if found.releases:
+        out.append(NOT_AUTHENTICATED)
     return out

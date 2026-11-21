@@ -136,6 +136,14 @@ def register_runs(subparsers: argparse._SubParsersAction) -> None:
         metavar="YYYY-MM-DD",
         help="With --release-dir: the UTC day to answer for (default: now)",
     )
+    s.add_argument(
+        "--env",
+        metavar="NAME",
+        help=(
+            "With --release-dir: answer only for the releases of this environment "
+            "(default: one answer per environment the releases name)"
+        ),
+    )
     _add_common_flags(s)
     s.set_defaults(func=_run_runs_status)
 
@@ -178,16 +186,16 @@ def register_retention(subparsers: argparse._SubParsersAction) -> None:
 
 
 def _run_release_status(args: argparse.Namespace, logger: logging.Logger) -> int:
-    """``fluid runs status <product> --release-dir DIR [--on DAY]``: the release in force."""
-    from datetime import date, datetime, timezone
+    """``fluid runs status <product> --release-dir DIR [--on DAY] [--env NAME]``: the release in
+    force, for each environment the releases name."""
+    from datetime import datetime, timezone
 
     from fluid_build.cli.ops import release_status as rs
 
     on = None
     if args.on:
-        try:
-            on = date.fromisoformat(args.on)
-        except ValueError:
+        on = rs.parse_day(args.on)
+        if on is None:
             logger.error("--on %s is not a day (YYYY-MM-DD)", rs.clean(args.on, 40))
             return 2
     try:
@@ -195,14 +203,23 @@ def _run_release_status(args: argparse.Namespace, logger: logging.Logger) -> int
     except NotADirectoryError as exc:
         logger.error("%s", exc)
         return 2
-    answer = rs.in_force(found.releases, on, datetime.now(timezone.utc))
+    environment = rs.clean(args.env, 40) if args.env else None
+    answers = rs.in_force_by_environment(
+        found.releases, on, datetime.now(timezone.utc), environment
+    )
     if getattr(args, "json", False):
         json.dump(
             {
                 "product_id": args.product_id,
                 "on": on.isoformat() if on else None,
-                "in_force": answer.at_start.as_dict() if answer.at_start else None,
-                "during": [r.as_dict() for r in answer.during],
+                "answers": [
+                    {
+                        "environment": a.environment,
+                        "in_force": a.at_start.as_dict() if a.at_start else None,
+                        "during": [r.as_dict() for r in a.during],
+                    }
+                    for a in answers
+                ],
                 "releases_read": len(found.releases),
                 "not_read": found.skipped,
             },
@@ -212,16 +229,16 @@ def _run_release_status(args: argparse.Namespace, logger: logging.Logger) -> int
         )
         sys.stdout.write("\n")
     else:
-        for line in rs.report(args.product_id, answer, found, on):
+        for line in rs.report(args.product_id, answers, found, on, environment):
             cprint_literal(line)
-    return 0 if (answer.at_start or answer.during) else 1
+    return 0 if any(a.at_start or a.during for a in answers) else 1
 
 
 def _run_runs_status(args: argparse.Namespace, logger: logging.Logger) -> int:
     if getattr(args, "release_dirs", None):
         return _run_release_status(args, logger)
-    if getattr(args, "on", None):
-        logger.error("--on answers for --release-dir: pass the directory of releases too")
+    if getattr(args, "on", None) or getattr(args, "env", None):
+        logger.error("--on and --env answer for --release-dir: pass the directory of releases too")
         return 2
     from fluid_build.cli.ops.status import build_status_report
 

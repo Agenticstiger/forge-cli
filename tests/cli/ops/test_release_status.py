@@ -38,17 +38,19 @@ def seal(
     versions: Optional[Dict[str, str]] = None,
     source: Optional[Dict[str, str]] = None,
     run_id: str = "3f9a1c0b7e2d",
+    environment: Optional[str] = "prod",
     tamper: bool = False,
     **extra: Any,
 ) -> Path:
     """A release directory with a ``release.json`` as ``fluid ship`` writes it."""
     identity = {
         "product_id": product,
-        "environment": "prod",
         "forge_version": "0.37.0",
         "bundle": {"manifest_digest": "sha256:bundle"},
         "expose_versions": versions if versions is not None else {"orders": "1.4.0"},
     }
+    if environment is not None:
+        identity["environment"] = environment
     index = {
         "schema": release.RELEASE_SCHEMA,
         "identity": identity,
@@ -124,6 +126,31 @@ def test_several_roots_are_read_and_a_release_reached_twice_by_one_path_is_liste
     assert len(found.releases) == 3 and len(set(ids)) == 3
 
 
+def test_a_release_reached_by_two_spellings_of_one_root_is_listed_once(
+    releases, tmp_path, monkeypatch
+):
+    link = tmp_path / "link-to-releases"
+    os.symlink(releases, link)
+    monkeypatch.chdir(tmp_path)
+    roots = [
+        str(releases),
+        str(link),
+        "releases",
+        "./releases/r1",
+        str(releases / ".." / "releases"),
+    ]
+    found = rs.find_releases(roots, PRODUCT)
+    assert len(found.releases) == 3 and found.skipped == {}
+
+
+def test_releases_sealed_in_the_same_second_are_listed_in_the_order_of_their_directories(tmp_path):
+    root = tmp_path / "rel"
+    for name, version in (("b", "1.1.0"), ("a", "1.0.0"), ("c", "1.2.0")):
+        seal(root, name, sealed="2026-11-18T09:12:03+00:00", versions={"orders": version})
+    found = rs.find_releases([str(root)], PRODUCT)
+    assert [r.expose_versions["orders"] for r in found.releases] == ["1.0.0", "1.1.0", "1.2.0"]
+
+
 def test_a_directory_holding_more_than_the_limit_is_read_to_the_limit(releases, monkeypatch):
     monkeypatch.setattr(rs, "MAX_ENTRIES", 2)
     found = rs.find_releases([str(releases)], PRODUCT)
@@ -162,6 +189,51 @@ def test_a_record_with_no_time_it_was_sealed_at_is_skipped(releases):
     assert len(rs.find_releases([str(releases)], PRODUCT).releases) == 2
 
 
+@pytest.mark.parametrize("sealed", ["9999-12-31T23:59:59-05:00", "0001-01-01T00:00:00+05:00"])
+def test_a_time_no_utc_day_can_hold_skips_that_record_and_not_the_others(releases, sealed, capsys):
+    seal(releases, "r9", sealed=sealed)
+    found = rs.find_releases([str(releases)], PRODUCT)
+    assert len(found.releases) == 3
+    assert found.skipped == {"a release.json that is not a fluid-release/1 record": 1}
+    assert runs_status("--release-dir", str(releases), "--on", "2026-11-20") == 0
+    assert "orders 1.5.0" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs named pipes")
+def test_a_release_json_that_is_a_named_pipe_is_skipped_without_blocking(releases):
+    (releases / "r2" / "release.json").unlink()
+    os.mkfifo(releases / "r2" / "release.json")
+    found = rs.find_releases([str(releases)], PRODUCT)
+    assert [r.run_id for r in found.releases] == ["3f9a1c0b7e2d", "bbbb"]
+    assert found.skipped == {"a directory with no readable release.json": 1}
+
+
+@pytest.mark.parametrize("value", [["prod"], {"a": 1}, 7, True, [[[[]]]] * 3, ""])
+def test_a_field_that_is_not_text_is_left_out_not_turned_into_text(tmp_path, value):
+    directory = seal(tmp_path / "rel", "a")
+    index = json.loads((directory / "release.json").read_text())
+    index["identity"]["environment"] = value
+    index["identity"]["forge_version"] = value
+    index["identity"]["bundle"]["manifest_digest"] = value
+    index["provenance"]["run_id"] = value
+    (directory / "release.json").write_text(json.dumps(index))
+    (release,) = rs.find_releases([str(tmp_path / "rel")], PRODUCT).releases
+    assert (release.environment, release.forge_version, release.run_id) == (None, None, None)
+    assert release.bundle_digest is None
+    assert "env" not in "\n".join(rs.describe(release))
+
+
+def test_what_the_digest_does_not_cover_can_change_and_the_answer_says_so(releases):
+    index = json.loads((releases / "r3" / "release.json").read_text())
+    index["provenance"]["finished_at"] = "2026-11-17T00:00:00Z"  # outside the identity digest
+    (releases / "r3" / "release.json").write_text(json.dumps(index))
+    found = rs.find_releases([str(releases)], PRODUCT)
+    assert all(r.intact for r in found.releases)
+    answers = rs.in_force_by_environment(found.releases, None, moment("2026-11-25T00:00:00"))
+    text = "\n".join(rs.report(PRODUCT, answers, found, None))
+    assert rs.NOT_AUTHENTICATED in text and "does not say who wrote the record" in text
+
+
 def test_a_record_larger_than_the_limit_is_not_read(releases, monkeypatch):
     monkeypatch.setattr(rs, "MAX_INDEX_BYTES", 50)
     found = rs.find_releases([str(releases)], PRODUCT)
@@ -187,7 +259,7 @@ def test_texts_from_a_record_cannot_rewrite_the_terminal(releases):
         versions={f"orders{esc}": f"1.0{bidi}0\n"},
         source={"revision": SHA, "repository": f"https://h/{esc}x{bidi}", "ref": "a\nb"},
         run_id=f"run{esc}\r\nforged: ok",
-        environment=None,
+        environment=f"prod{esc}{bidi}",
     )
     found = rs.find_releases([str(releases)], PRODUCT)
     shown = "\n".join(line for r in found.releases for line in rs.describe(r))
@@ -231,10 +303,63 @@ def test_a_time_with_an_offset_or_none_is_read_as_utc(releases):
     assert times["3.1.0"] == "2026-11-23T10:00:00Z" and times["3.2.0"] == "2026-11-24T10:00:00Z"
 
 
+def test_a_release_sealed_at_midnight_was_sealed_during_the_new_day_not_in_force_at_its_start(
+    tmp_path,
+):
+    root = tmp_path / "rel"
+    seal(root, "old", sealed="2026-11-19T10:00:00Z", versions={"orders": "1.0.0"})
+    seal(root, "mid", sealed="2026-11-20T00:00:00Z", versions={"orders": "1.1.0"})
+    seal(root, "next", sealed="2026-11-21T00:00:00Z", versions={"orders": "1.2.0"})
+    found = rs.find_releases([str(root)], PRODUCT).releases
+    got = rs.in_force(found, date(2026, 11, 20), moment("2026-11-25T00:00:00"))
+    assert got.at_start.expose_versions["orders"] == "1.0.0"
+    assert [r.expose_versions["orders"] for r in got.during] == ["1.1.0"]  # the next day's is not
+
+
+def test_the_last_day_there_is_has_an_end(releases):
+    found = rs.find_releases([str(releases)], PRODUCT).releases
+    got = rs.in_force(found, date(9999, 12, 31), moment("2026-11-25T00:00:00"))
+    assert got.at_start.expose_versions["orders"] == "2.0.0" and got.end.year == 9999
+
+
+def test_each_environment_is_answered_on_its_own(tmp_path):
+    root = tmp_path / "envs"
+    seal(root, "p1", sealed="2026-11-10T09:00:00Z", versions={"orders": "1.0.0"})
+    seal(
+        root,
+        "d1",
+        sealed="2026-11-12T09:00:00Z",
+        versions={"orders": "2.0.0-dev"},
+        environment="dev",
+    )
+    seal(root, "p2", sealed="2026-11-14T09:00:00Z", versions={"orders": "1.1.0"})
+    found = rs.find_releases([str(root)], PRODUCT)
+    day = date(2026, 11, 13)
+    answers = rs.in_force_by_environment(found.releases, day, moment("2026-11-25T00:00:00"))
+    assert {a.environment: a.at_start.expose_versions["orders"] for a in answers} == {
+        "dev": "2.0.0-dev",
+        "prod": "1.0.0",  # the dev release sealed after it does not stand in for it
+    }
+    only = rs.in_force_by_environment(found.releases, day, moment("2026-11-25T00:00:00"), "prod")
+    assert [a.environment for a in only] == ["prod"]
+    text = "\n".join(rs.report(PRODUCT, answers, found, day))
+    assert "environment dev:" in text and "environment prod:" in text
+
+
+def test_a_release_with_no_environment_is_an_answer_of_its_own_and_comes_first(tmp_path):
+    root = tmp_path / "rel"
+    seal(root, "a", environment=None, versions={"orders": "1.0.0"})
+    seal(root, "b", sealed="2026-11-19T00:00:00Z", versions={"orders": "1.1.0"})
+    found = rs.find_releases([str(root)], PRODUCT)
+    answers = rs.in_force_by_environment(found.releases, None, moment("2026-11-25T00:00:00"))
+    assert [a.environment for a in answers] == [None, "prod"]
+    assert "environment (none recorded):" in "\n".join(rs.report(PRODUCT, answers, found, None))
+
+
 def test_the_text_answer_names_the_version_the_release_the_run_and_the_code(releases):
     found = rs.find_releases([str(releases)], PRODUCT)
     answer = rs.in_force(found.releases, date(2026, 11, 20), moment("2026-11-25T00:00:00"))
-    text = "\n".join(rs.report(PRODUCT, answer, found, date(2026, 11, 20)))
+    text = "\n".join(rs.report(PRODUCT, [answer], found, date(2026, 11, 20)))
     assert "orders 1.4.0" in text and "orders 1.5.0" in text
     assert f"release  {found.releases[0].release_id}" in text
     assert "run 3f9a1c0b7e2d" in text and "env prod" in text and "forge 0.37.0" in text
@@ -264,23 +389,68 @@ def test_json_carries_the_same_answer(releases, capsys):
     assert runs_status("--release-dir", str(releases), "--on", "2026-11-20", "--json") == 0
     got = json.loads(capsys.readouterr().out)
     assert got["on"] == "2026-11-20" and got["releases_read"] == 3 and got["not_read"] == {}
-    assert got["in_force"]["expose_versions"] == {"orders": "1.4.0"}
-    assert got["in_force"]["sealed_at"] == "2026-11-18T09:12:03Z"
-    assert got["in_force"]["source"]["revision"] == SHA
-    assert [r["run_id"] for r in got["during"]] == ["aaaa"]
+    (answer,) = got["answers"]
+    assert answer["environment"] == "prod"
+    assert answer["in_force"]["expose_versions"] == {"orders": "1.4.0"}
+    assert answer["in_force"]["sealed_at"] == "2026-11-18T09:12:03Z"
+    assert answer["in_force"]["source"]["revision"] == SHA
+    assert [r["run_id"] for r in answer["during"]] == ["aaaa"]
 
 
 def test_no_release_by_then_is_exit_1(releases, capsys):
     assert runs_status("--release-dir", str(releases), "--on", "2026-11-01") == 1
-    assert "No release of commerce.orders was sealed on or before on 2026-11-01" in (
+    assert "No release of commerce.orders was sealed by the end of 2026-11-01." in (
         capsys.readouterr().out
     )
+
+
+def test_no_release_at_all_is_exit_1(tmp_path, capsys):
+    (tmp_path / "empty").mkdir()
+    assert runs_status("--release-dir", str(tmp_path / "empty")) == 1
+    assert "No release of commerce.orders has been sealed." in capsys.readouterr().out
+
+
+def test_the_command_can_answer_for_one_environment(tmp_path, capsys):
+    root = tmp_path / "envs"
+    seal(root, "p1", sealed="2026-11-10T09:00:00Z", versions={"orders": "1.0.0"})
+    seal(
+        root,
+        "d1",
+        sealed="2026-11-12T09:00:00Z",
+        versions={"orders": "2.0.0-dev"},
+        environment="dev",
+    )
+    assert runs_status("--release-dir", str(root), "--on", "2026-11-13") == 0
+    both = capsys.readouterr().out
+    assert "environment dev:" in both and "environment prod:" in both
+    assert runs_status("--release-dir", str(root), "--on", "2026-11-13", "--env", "prod") == 0
+    one = capsys.readouterr().out
+    assert "orders 1.0.0" in one and "2.0.0-dev" not in one and "environment prod:" not in one
+    assert runs_status("--release-dir", str(root), "--env", "staging") == 1
+    assert "No release of commerce.orders in environment staging has been sealed." in (
+        capsys.readouterr().out
+    )
+
+
+@pytest.mark.parametrize(
+    "day",
+    ["20261120", "2026-W47-5", "2026-11-20T00:00", "２０２６-11-20", "2026-1-20", "0000-01-01"]
+    + [" 2026-11-20", "2026-11-20\n", "2026-11-31"],
+)
+def test_a_day_is_year_month_day_and_nothing_else(releases, day):
+    assert runs_status("--release-dir", str(releases), "--on", day) == 2
+
+
+def test_the_last_day_there_is_can_be_asked_about(releases, capsys):
+    assert runs_status("--release-dir", str(releases), "--on", "9999-12-31") == 0
+    assert "orders 2.0.0" in capsys.readouterr().out
 
 
 def test_a_day_that_is_not_one_and_a_missing_directory_are_usage_errors(releases, tmp_path, caplog):
     assert runs_status("--release-dir", str(releases), "--on", "yesterday") == 2
     assert runs_status("--release-dir", str(tmp_path / "nope")) == 2
     assert runs_status("--on", "2026-11-20") == 2  # a day answers for a release directory
+    assert runs_status("--env", "prod") == 2  # and so does an environment
     assert "pass the directory of releases too" in caplog.text
 
 
@@ -305,5 +475,5 @@ def test_the_module_imports_only_the_standard_library_when_it_is_loaded():
         elif isinstance(node, ast.ImportFrom):
             names.add((node.module or "").split(".")[0])
     assert names <= {
-        "__future__", "os", "stat", "dataclasses", "datetime", "pathlib", "typing",
+        "__future__", "os", "re", "stat", "dataclasses", "datetime", "pathlib", "typing",
     }  # fmt: skip
