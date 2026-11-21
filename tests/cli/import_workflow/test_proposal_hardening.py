@@ -813,6 +813,84 @@ def test_commands_with_no_secret_in_them_come_out_exactly_as_written(command):
     assert safe_command(command) == command
 
 
+_WORD = "hunter2" + "hunter2"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"curl -H 'Cookie: session={_WORD}' http://x",
+        f"curl -H 'Ocp-Apim-Subscription-Key: {_WORD}' http://x",
+        f"curl -HX-Api-Key:{_WORD} http://x",
+        f'curl -H"Authorization: token {_WORD}" http://x',
+        f"curl -b session={_WORD} http://x",
+        f"curl --cookie 'sid={_WORD}' http://x",
+        f"docker login -u u -p {_WORD} registry",
+        f"bcp t out f -U sa -P{_WORD}",
+        f"x s3a://AKIA0000:wJalr/K7MDENG/{_WORD}@bucket/x",
+        f"x Authorization: Bearer {_WORD} tail",
+        f"azcopy copy 'https://a.blob.core.windows.net/c/f?sv=2022-11-02&sig={_WORD}' /tmp/x",
+        f"curl https://host/api?key={_WORD}",
+        f"curl 'https://host/api?x=1&code={_WORD}'",
+        f"curl https://storage.googleapis.com/b/o?X-Goog-Signature={_WORD}&X-Goog-Credential=x",
+        "python -c 'import os; os.environ[" + '"PASS' + 'WORD"]="' + _WORD + "\"'",
+    ],
+)
+def test_signatures_cookies_headers_and_keys_in_urls_are_masked(command):
+    shown = safe_command(command)
+    assert "hunter2" not in shown and "***REDACTED***" in shown
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "run --cookie-jar /tmp/jar --partition-key dt",
+        "curl -H 'Content-Type: application/json' -H 'Accept: text/csv' https://h/x",
+        "curl 'https://h/api?limit=5&page=2' -o out.json",
+        "docker run -p 8080:80 img",
+        "x s3a://bucket/a@b/c https://host:8080/users/bob@example.com",
+    ],
+)
+def test_headers_urls_and_flags_that_hold_no_credential_are_left_alone(command):
+    assert safe_command(command) == command
+
+
+def test_text_in_a_report_masks_a_signature_a_key_in_a_query_and_a_pair():
+    shown = safe_text(f"see https://h/api?key={_WORD} and sig={_WORD}x then token={_WORD}y")
+    assert "hunter2" not in shown and shown.count("***REDACTED***") == 3
+    assert safe_text("read https://h/x?limit=5&page=2") == "read https://h/x?limit=5&page=2"
+
+
+def test_an_aws_secret_with_a_slash_does_not_stay_in_the_path_or_the_ids(tmp_path, monkeypatch):
+    from fluid_build.cli.import_workflow._redact import scrub_path
+
+    word = "wJalr/K7MDENG/" + _WORD
+    assert scrub_path(f"s3a://AKIA0000:{word}@bkt3/raw/c") == "s3a://bkt3/raw/c"
+    assert scrub_path("s3://bucket/a@b/c") == "s3://bucket/a@b/c"
+    assert scrub_path(f"https://h/api?key={_WORD}&code=abc&limit=5") == (
+        "https://h/api?key=REDACTED&code=REDACTED&limit=5"
+    )
+    monkeypatch.chdir(tmp_path)
+    write(
+        tmp_path, {"jobs/job.py": f'src = spark.read.parquet("s3a://AKIA0000:{word}@bkt3/raw/c")\n'}
+    )
+    contracts, report = propose(tmp_path)
+    import yaml
+
+    text = yaml.safe_dump(contracts) + "\n".join(
+        [*report.mapped_one_to_one, *report.required_defaults, *report.unsupported, *report.notes]
+    )
+    assert "hunter2" not in text and "wjalr" not in text.lower() and "akia0000" not in text.lower()
+
+
+def test_a_lone_surrogate_is_not_left_in_text_that_is_printed():
+    from fluid_build.cli.import_workflow._pysource import clean_chars
+
+    shown = clean_chars("db.t" + chr(0xD800) + "x")
+    assert shown == "db.t" + chr(0xFFFD) + "x"
+    shown.encode("utf-8")  # does not raise
+
+
 def test_a_json_argument_is_masked_by_its_keys():
     shown = safe_args(['{"db": {"pass": "hunter2hunter2"}, "port": 5432, "user": "bob"}'])
     assert shown == ['{"db": {"pass": "***REDACTED***"}, "port": 5432, "user": "bob"}']

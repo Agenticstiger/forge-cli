@@ -351,6 +351,8 @@ def clean_chars(text: object, *, keep: str = "") -> str:
         category = unicodedata.category(char)
         if category in ("Cc", "Zl", "Zp"):
             out.append(" ")
+        elif category == "Cs":
+            out.append(chr(0xFFFD))  # a lone surrogate cannot be written out as text
         elif category != "Cf":
             out.append(char)
     return "".join(out)

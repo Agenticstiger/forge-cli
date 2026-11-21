@@ -40,7 +40,7 @@ def safe_text(text: Any, limit: int = 200) -> str:
     """Text from the scanned code made safe to print and to write into a contract: control,
     line-separator and bidirectional characters are gone (an escape sequence, a new line), a
     credential-shaped value is masked, and it is cut at ``limit``."""
-    cleaned = _free_text(" ".join(clean_chars(text).split()))
+    cleaned = _scan(" ".join(clean_chars(text).split()))
     return cleaned if len(cleaned) <= limit else cleaned[: limit - 3] + "..."
 
 
@@ -56,18 +56,27 @@ _JINJA = re.compile(r"\{\{.{0,1000}?\}\}|\{%.{0,1000}?%\}|\{#.{0,1000}?#\}", re.
 _JINJA_TOKEN = re.compile(r"__fluidjinja(\d+)x(\d+)__")
 #: ``Name: value`` in one quoted word is a header (``-H "X-Api-Key: ..."``).
 _HEADER = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*):\s*(\S.*)$", re.DOTALL)
-#: ``key=value`` pairs in one word, separated by ``;``, ``&``, ``,`` or ``?`` (a connection string,
-#: a query string).
-_PAIR = re.compile(r"(^|[;&,?])([A-Za-z_][A-Za-z0-9_.\-]{0,64})=([^;&,\s]*)")
-#: ``"key": "value"`` in JSON, as ``json.dumps`` writes it (a space after the colon) or compact.
+_HEADER_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
+#: ``key=value`` pairs, separated by ``;``, ``&``, ``,``, ``?`` or white space (a connection
+#: string, a query string).
+_PAIR = re.compile(r"(^|[;&,?\s])([A-Za-z_][A-Za-z0-9_.\-]{0,64})=([^;&,\s]*)")
+#: ``"key": "value"`` in JSON, as ``json.dumps`` writes it (a space after the colon) or compact,
+#: and ``["KEY"] = "value"`` in code.
 _JSON_PAIR = re.compile(
-    r"""(["'])([A-Za-z_][A-Za-z0-9_.\-]{0,64})\1(\s*:\s*)(["'])([^"']{0,512})\4"""
+    r"""(["'])([A-Za-z_][A-Za-z0-9_.\-]{0,64})\1(\]?\s*[:=]\s*)(["'])([^"']{0,512})\4"""
 )
 #: What makes a masked word need quotes again: white space, an operator, a quote, a backslash.
 _NEEDS_QUOTES = re.compile(r"""[\s;&|()<>`$\\'"]""")
 _USERINFO = re.compile(
     r"^((?:[A-Za-z][A-Za-z0-9+.\-]{0,40}:)*[A-Za-z][A-Za-z0-9+.\-]{0,40}://)([^/?#]{0,512})@"
 )
+#: An ``s3a`` URL that names an access key and its secret before the ``@`` (Hadoop takes the secret
+#: as it is, and an AWS secret holds ``/``):
+#: the user information of these runs to the ``@``, not to the first ``/``.
+_S3_USERINFO = re.compile(
+    r"^((?:[A-Za-z][A-Za-z0-9+.\-]{0,40}:)*s3[an]?://)([^/:@?#]{0,512}:[^@?#]{0,512})@", re.I
+)
+_S3_SECRET = re.compile(r"(s3[an]?://[^/:@\s?#'\"]{0,512}:)[^@\s?#'\"]{1,512}@", re.I)
 _MAX_COMMAND_TEXT = 20_000
 #: How many levels of quoting inside quoting (``bash -c "bash -c ..."``) are looked into.
 _MAX_DEPTH = 5
@@ -77,8 +86,19 @@ _MAX_DEPTH = 5
 #: ``--pw``, ``--dbpass``), as whole words, and the compound ones, anywhere in the name.
 _SECRET_WORDS = frozenset(
     {"pass", "passwd", "pswd", "pwd", "pw", "dbpass", "dbpwd", "cred", "creds", "sas", "sig"}
-    | {"signature"}
+    | {"signature", "cookie", "cookies"}
 )
+#: In a URL's query string these are credentials, although ``key`` and ``code`` alone are only
+#: names in a path or a job's arguments (``--partition-key``, ``dt=...``).
+_QUERY_SECRETS = frozenset({"key", "code", "sid", "session", "sessionid", "auth", "jwt"})
+#: A header whose name holds one of these words carries a credential, ``key`` included
+#: (``X-Api-Key``, ``Ocp-Apim-Subscription-Key``).
+_HEADER_WORDS = frozenset(
+    {"cookie", "authorization", "auth", "key", "keys", "session", "token", "secret", "password"}
+    | {"signature", "credential", "credentials"}
+)
+#: The word between ``Authorization:`` and the credential.
+_AUTH_SCHEMES = frozenset({"bearer", "basic", "token", "digest", "negotiate", "bot"})
 _SECRET_SUBSTRINGS = ("passwd", "passphrase", "accesskey", "secretkey", "apikey", "privatekey")
 #: ``key`` alone is a column in a data job (``--partition-key``, ``--primary-key``); it is a
 #: credential next to one of these (``--access-key``, ``--ssh-key``, ``--api-key``).
@@ -105,7 +125,7 @@ _REFERENCE_SUFFIXES = frozenset(
     {
         "file", "path", "dir", "directory", "id", "name", "provider", "class", "type", "env",
         "var", "ref", "url", "uri", "endpoint", "host", "port", "location", "store", "arn",
-        "version", "stdin", "count", "limit", "size", "length", "ttl", "timeout", "expiry",
+        "version", "stdin", "count", "limit", "size", "length", "ttl", "timeout", "expiry", "jar",
         "expiration", "interval", "enabled", "mode", "algorithm", "format", "strategy", "scheme",
         "method", "kind",
     }
@@ -147,7 +167,12 @@ _SHORT_PASSWORD_BY_COMMAND = {
     "redis-cli": frozenset({"-a"}),
     "openssl": frozenset({"-k", "-pass", "-passin", "-passout"}),
     "sshpass": frozenset({"-p"}),
+    "curl": frozenset({"-b"}),  # a cookie
 }
+#: ``docker login -p``: the one use of ``-p`` in these commands that is a password.
+_LOGIN_COMMANDS = frozenset({("docker", "login"), ("podman", "login"), ("nerdctl", "login")})
+#: Commands whose ``-P<value>``, with no space, is the password.
+_GLUED_UPPER_P_COMMANDS = frozenset({"bcp", "sqlcmd"})
 #: Commands whose ``-p<value>``, with no space, is the password.
 _GLUED_PASSWORD_COMMANDS = frozenset(
     {
@@ -192,6 +217,7 @@ def _plain_value(value: str) -> bool:
     text = value.strip().strip("'\"")
     return (
         text.lower() in _PLAIN_WORDS
+        or _JINJA_TOKEN.fullmatch(text) is not None  # a template field is a reference
         or (text.isdigit() and len(text) <= 4)
         or text.startswith(("/", "./", "../", "~"))
     )
@@ -216,32 +242,60 @@ def _mask_user(text: str) -> str:
     return f"{user}:{_REDACTED}" if colon else text
 
 
-def _mask_pairs(text: str) -> str:
-    """The value of each ``key=value`` pair, and of each JSON ``"key": "value"`` pair, of ``text``
-    whose key is a credential's, masked."""
-    if ":" in text and ('"' in text or "'" in text):
+def sensitive_header(name: str) -> bool:
+    """Whether an HTTP header of this name carries a credential (``Cookie``, ``X-Api-Key``,
+    ``Ocp-Apim-Subscription-Key``, ``Authorization``)."""
+    if sensitive_name(name):
+        return True
+    words = {part.lower() for part in _NAME_PARTS.split(name.strip()) if part}
+    return bool(words & _HEADER_WORDS)
 
-        def mask_json(match: "re.Match[str]") -> str:
-            if sensitive_name(match.group(2)) and not _plain_value(match.group(5)):
-                quote, key, colon, inner = (
-                    match.group(1),
-                    match.group(2),
-                    match.group(3),
-                    match.group(4),
-                )
-                return f"{quote}{key}{quote}{colon}{inner}{_REDACTED}{inner}"
-            return match.group(0)
 
-        text = _JSON_PAIR.sub(mask_json, text)
+def _mask_json(text: str) -> str:
+    """The value of each ``"key": "value"`` pair (JSON) and ``["KEY"] = "value"`` (code) of
+    ``text`` whose key is a credential's, masked."""
+    if (":" not in text and "=" not in text) or ('"' not in text and "'" not in text):
+        return text
+
+    def mask(match: "re.Match[str]") -> str:
+        if sensitive_name(match.group(2)) and not _plain_value(match.group(5)):
+            quote, key, colon, inner = match.group(1, 2, 3, 4)
+            return f"{quote}{key}{quote}{colon}{inner}{_REDACTED}{inner}"
+        return match.group(0)
+
+    return _JSON_PAIR.sub(mask, text)
+
+
+def _mask_kv(text: str) -> str:
+    """The value of each ``key=value`` pair of ``text`` (a connection string, a query string)
+    whose key is a credential's, masked. After a ``?`` the keys of a query string that name a
+    credential in a URL (``key``, ``code``) count too."""
     if "=" not in text:
         return text
 
     def mask(match: "re.Match[str]") -> str:
-        if sensitive_name(match.group(2)) and not _plain_value(match.group(3)):
-            return f"{match.group(1)}{match.group(2)}={_REDACTED}"
+        name = match.group(2)
+        in_query = "?" in text[: match.end(1)]
+        named = sensitive_name(name) or (in_query and name.lower() in _QUERY_SECRETS)
+        if named and not _plain_value(match.group(3)):
+            return f"{match.group(1)}{name}={_REDACTED}"
         return match.group(0)
 
     return _PAIR.sub(mask, text)
+
+
+def _mask_pairs(text: str) -> str:
+    """JSON and ``key=value`` pairs of ``text`` whose key is a credential's, masked."""
+    return _mask_kv(_mask_json(text))
+
+
+def _scan(text: str) -> str:
+    """One word, or one value, read for credentials: the free-text scan of the repository, the
+    secret in the user information of an ``s3a`` URL (it holds ``/``, which the scan stops at), and
+    the pairs a connection string, a query string or JSON holds."""
+    if "@" in text:
+        text = _S3_SECRET.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
+    return _mask_pairs(_free_text(text))
 
 
 class _Words:
@@ -258,15 +312,24 @@ class _Words:
         #: The command the word belongs to (its first word, without a path); ``None`` in an
         #: argument list, which has no command.
         self.command: Optional[str] = None
+        #: The word after the command, when it is not a flag (``docker login``).
+        self.subcommand: Optional[str] = None
         self._at_start = False
+        self._expect_subcommand = False
 
     def boundary(self) -> None:
         """A new command begins."""
-        self.command, self._at_start = None, True
+        self.command, self.subcommand, self._at_start = None, None, True
+        self._expect_subcommand = False
 
     def _start_of(self, value: str) -> None:
         if self._at_start and not _ASSIGNMENT.match(value) and value not in _COMMAND_PREFIX:
             self.command, self._at_start = value.rsplit("/", 1)[-1], False
+            self._expect_subcommand = True
+        elif self._expect_subcommand:
+            self._expect_subcommand = False
+            if not value.startswith("-"):
+                self.subcommand = value
 
     def show(self, value: str) -> str:
         self._start_of(value)
@@ -274,6 +337,12 @@ class _Words:
             # a template reference, not a value: nothing to mask, and a flag before it is spent
             self._mask_next, self._setting_next, self._user_next = False, None, False
             return value
+        if self._mask_next == "header":
+            # ``Authorization: Bearer <credential>`` as separate words: the scheme stays
+            if value.lower() in _AUTH_SCHEMES:
+                return value
+            self._mask_next = False
+            return _REDACTED
         if self._mask_next:
             short, self._mask_next = self._mask_next == "short", False
             if short:
@@ -288,17 +357,35 @@ class _Words:
             self._user_next = False
             if _is_user_credential(value, self.command):
                 return _mask_user(value)
+        if value.startswith("-H") and len(value) > 2 and not value.startswith("--"):
+            glued = _HEADER.match(value[2:])  # ``curl -H"Authorization: token ..."``
+            if glued:
+                return f"-H{self._header(glued)}"
         name, equals, rest = value.partition("=")
         if value.startswith("-") and len(value) > 1 and not any(c.isspace() for c in name):
             return self._flag(value, name, equals, rest)
         if _ASSIGNMENT.match(value) and sensitive_name(name):
             return value if _plain_value(rest) else self._secret_value(name + "=", rest)
         header = _HEADER.match(value)
-        if header and sensitive_name(header.group(1)):
-            return f"{header.group(1)}: {_REDACTED}"  # ``-H "X-Api-Key: ..."``
+        if header:
+            shown = self._header(header)
+            if shown != value:
+                return shown
+        elif (
+            value.endswith(":")
+            and sensitive_header(value[:-1])
+            and _HEADER_NAME.fullmatch(value[:-1])
+        ):
+            self._mask_next = "header"  # ``Authorization: Bearer <credential>`` as words
+            return value
         if any(c.isspace() for c in value):
             return self._multi_word(value)
-        return _mask_pairs(_free_text(value))
+        return _scan(value)
+
+    def _header(self, match: "re.Match[str]") -> str:
+        """``Name: value`` with the value masked when the header carries a credential."""
+        name = match.group(1)
+        return f"{name}: {_REDACTED}" if sensitive_header(name) else match.group(0)
 
     def _secret_value(self, head: str, rest: str) -> str:
         """``head`` and the masked value ``rest``. A value that is a quoted word with a flag list
@@ -313,7 +400,7 @@ class _Words:
         """A word that holds white space: JSON, a header, SQL, or a command line in quotes. The
         free-text scan reads the whole of it (it knows ``"password": "x"`` and ``Bearer x``); one
         that starts like a command line (a flag, ``NAME=value``) is then read word by word."""
-        masked = _mask_pairs(_free_text(value))
+        masked = _scan(value)
         stripped = masked.lstrip()
         if self.depth < _MAX_DEPTH and (stripped.startswith("-") or _ASSIGNMENT.match(stripped)):
             return _redact_command(masked, self.depth + 1)
@@ -344,9 +431,17 @@ class _Words:
             and not value[2:].isdigit()
         ):
             return "-p" + _REDACTED  # ``mysql -phunter2``
+        if (
+            self.command in _GLUED_UPPER_P_COMMANDS
+            and value.startswith("-P")
+            and not value.startswith("--")
+            and len(value) > 2
+        ):
+            return "-P" + _REDACTED  # ``bcp ... -Phunter2``
         short = flag in _PASSWORD_SHORT_FLAGS
-        if short and self.command in _SHORT_FLAG_IS_NOT_A_PASSWORD:
-            return _mask_pairs(_free_text(value))
+        logs_in = (self.command, self.subcommand) in _LOGIN_COMMANDS
+        if short and self.command in _SHORT_FLAG_IS_NOT_A_PASSWORD and not logs_in:
+            return _scan(value)
         by_command = flag in _SHORT_PASSWORD_BY_COMMAND.get(self.command or "", ())
         judged = flag[2:] if re.match(r"-D[A-Za-z_]", flag) else flag  # ``-Dpwd=x`` (a JVM option)
         if short or by_command or sensitive_name(judged):
@@ -354,7 +449,7 @@ class _Words:
                 return value if _plain_value(rest) else self._secret_value(flag + "=", rest)
             self._mask_next = "short" if short else True
             return value
-        return _mask_pairs(_free_text(value))
+        return _scan(value)
 
     def _setting(self, value: str, flag: str) -> str:
         """The value after ``--conf`` or ``-c``: ``key=value``, or, after ``-c`` when what comes
@@ -370,12 +465,12 @@ class _Words:
                 return value if _plain_value(rest) else f"{key}={_REDACTED}"
             if self.depth < _MAX_DEPTH and (rest.lstrip().startswith("-") or " " in rest.strip()):
                 return f"{key}={_redact_command(rest, self.depth + 1)}"
-            return _mask_pairs(_free_text(value))
+            return _scan(value)
         if self.depth < _MAX_DEPTH and any(c.isspace() for c in value):
             if value.lstrip().startswith(("{", "[")):
                 return self._multi_word(value)  # JSON is data, not a command line
             return _redact_command(value, self.depth + 1)
-        return _mask_pairs(_free_text(value))
+        return _scan(value)
 
 
 def _unquote(raw: str) -> str:
@@ -403,7 +498,7 @@ def _redact_command(command: str, depth: int = 0) -> str:
             return fields[index]
         return match.group(0)
 
-    text = _JINJA.sub(hide, command.replace("\r\n", "\n"))
+    text = _mask_json(_JINJA.sub(hide, command.replace("\r\n", "\n")))
     words = _Words(depth)
     words.boundary()
     out: List[str] = []
@@ -451,25 +546,28 @@ def scrub_path(path: str) -> str:
     ``://`` and the ``@`` before the bucket or host) is dropped, except where it is a place
     (``abfss://container@account...``, Azure storage, where only ``container:password@`` is a
     credential). A ``key=value`` segment of the path, and a pair of its query string, whose key is
-    a credential's (``token=...``, ``sig=...``) keeps its key and loses its value. A path is an
+    a credential's (``token=...``, ``sig=...``, and in a query string ``key=...`` and ``code=...``)
+    keeps its key and loses its value. The user information of an ``s3`` URL runs to the ``@``
+    (an AWS secret holds ``/``). A path is an
     identity: this runs where it is read from the code, so nothing made from it (an id, a file
     name, a binding) can carry the credential."""
-    found = _USERINFO.match(path)
+    found = _S3_USERINFO.match(path) or _USERINFO.match(path)
     if found:
         scheme = found.group(1)[:-3].rsplit(":", 1)[-1].lower()
         if scheme not in _CONTAINER_SCHEMES or ":" in found.group(2):
             path = found.group(1) + path[found.end() :]
     path, question, query = path.partition("?")
     if query:
-        query = "&".join(_scrub_pair(pair) for pair in query.split("&"))
+        query = "&".join(_scrub_pair(pair, query=True) for pair in query.split("&"))
     if "=" in path:
-        path = "/".join(_scrub_pair(segment, "REDACTED") for segment in path.split("/"))
+        path = "/".join(_scrub_pair(segment) for segment in path.split("/"))
     return path + question + query
 
 
-def _scrub_pair(pair: str, mask: str = "REDACTED") -> str:
+def _scrub_pair(pair: str, *, query: bool = False) -> str:
     key, equals, _value = pair.partition("=")
-    return f"{key}={mask}" if equals and sensitive_name(key) else pair
+    named = sensitive_name(key) or (query and key.lower() in _QUERY_SECRETS)
+    return f"{key}=REDACTED" if equals and named else pair
 
 
 def scrub_host(host: str) -> str:
