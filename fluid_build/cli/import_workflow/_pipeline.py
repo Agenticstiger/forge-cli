@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
+from ._catalogs import CatalogKinds
 from ._conventions import Conventions, load_conventions
 from ._proposal import (
     SPLITS,
@@ -234,6 +235,9 @@ def run_import(
             root_name=root.resolve().name,
             topic_schema=topic_schema_reader(options),
             report=report,
+            catalogs=CatalogKinds.of(
+                *(scan.catalogs for scan in scans), dag_scan.catalogs if dag_scan else []
+            ),
         )
     except ProposalTooLarge as exc:
         raise refusal(
@@ -260,23 +264,23 @@ def _drop_tasks(contract: Dict[str, Any]) -> bool:
 
 
 def _check_valid(contracts: Sequence[Dict[str, Any]], report: ImportReport) -> None:
-    """Refuse, before anything is written, a proposal the schema does not accept.
+    """Refuse, before anything is written, a proposal ``fluid validate`` does not accept: the
+    schema and every contract rule it runs (:func:`validate_loaded_contract`), so what this writes
+    is what the command reads back without an error.
 
     One exception: the DAG tasks recorded under a build are what the schema's own task rules are
     strictest about (they key on the operator's name). A proposal that is valid without them is
     kept without them, and the report says so.
     """
-    from fluid_build.schema_manager import FluidSchemaManager
+    from fluid_build.cli.validate import validate_loaded_contract
 
-    manager = FluidSchemaManager()
     for contract in contracts:
-        version = contract["fluidVersion"]
-        result = manager.validate_contract(contract, schema_version=version, offline_only=True)
+        result = validate_loaded_contract(contract)
         if result.is_valid:
             continue
         errors = "; ".join(result.errors)
         if _drop_tasks(contract):
-            retry = manager.validate_contract(contract, schema_version=version, offline_only=True)
+            retry = validate_loaded_contract(contract)
             if retry.is_valid:
                 report.unsupported.append(
                     f"{contract['id']}: the DAG tasks are not recorded on its builds, because the "

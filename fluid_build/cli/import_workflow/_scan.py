@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from ._airflow_dags import Dag, Submit, Task, read_dags
+from ._catalogs import module_settings
 from ._conventions import Conventions
 from ._fold import ModuleIndex
 from ._pysource import (
@@ -79,6 +80,8 @@ class JobScan:
     notes: List[str] = field(default_factory=list)
     #: Unreadable files and why, by relative path.
     unreadable: Dict[str, str] = field(default_factory=dict)
+    #: ``(alias, kind)`` of each Spark catalog any file of the scan sets to a kind of catalog.
+    catalogs: List[Tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -88,6 +91,8 @@ class DagScan:
     files: int = 0
     notes: List[str] = field(default_factory=list)
     unreadable: Dict[str, str] = field(default_factory=dict)
+    #: ``(alias, kind)`` of each Spark catalog any DAG file sets to a kind of catalog.
+    catalogs: List[Tuple[str, str]] = field(default_factory=list)
 
 
 def _display(path: Path, rel: str) -> str:
@@ -154,13 +159,15 @@ def scan_jobs(
             scan.unreadable[source.rel] = index.unreadable.get(source.rel, "it cannot be read")
             continue
         shown = _display(source.path, source.rel)
+        folder = index.folder(module)
         facts = read_job(
             module,
-            index.folder(module),
+            folder,
             helpers=conventions.helpers,
             session_names=sessions,
             shown=shown,
         )
+        scan.catalogs.extend(module_settings(module, folder))
         kept += len(facts.reads) + len(facts.writes)
         if facts.has_io:
             scan.jobs.append(
@@ -212,7 +219,9 @@ def scan_dags(
             scan.unreadable[source.rel] = str(exc)
             continue
         scan.files += 1
-        found = read_dags(module, index.folder(module), operators=conventions.operators)
+        folder = index.folder(module)
+        found = read_dags(module, folder, operators=conventions.operators)
+        scan.catalogs.extend(module_settings(module, folder))
         scan.dags.extend(found.dags)
         scan.notes.extend(found.notes)
     scan.dags.sort(key=lambda d: (d.file, d.line))

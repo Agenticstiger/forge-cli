@@ -43,6 +43,7 @@ from pathlib import PurePosixPath
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from ._airflow_dags import Dag, Task
+from ._catalogs import CatalogKinds
 from ._conventions import Conventions, PathRule
 from ._redact import safe_args, safe_command, safe_text
 from ._scan import JobRecord, LinkedTask
@@ -269,17 +270,41 @@ def expose_id(identity: Identity) -> str:
 # ── binding ──────────────────────────────────────────────────────────
 
 
+def catalog_kind(alias: str, catalogs: CatalogKinds) -> Optional[str]:
+    """The ``binding.location.catalog`` of a table in the Spark catalog ``alias``: the kind the
+    scanned code configures it as (``spark.sql.catalog.<alias>.type``, or a ``catalog-impl``), else
+    the alias itself when it is a kind FLUID knows; ``None`` when nothing says. An alias is no
+    kind (``glue_catalog`` is a name the job gave a Glue catalog), and a binding that names one is
+    a contract ``fluid validate`` refuses."""
+    configured = catalogs.kind(alias)
+    if configured or catalogs.conflicting(alias):
+        return configured
+    from fluid_build.providers._iceberg_catalog import (
+        FAMILY_UNKNOWN,
+        canonical_catalog_kind,
+        catalog_kind_info,
+    )
+
+    known = canonical_catalog_kind(alias)
+    return alias if known and catalog_kind_info(known).family != FAMILY_UNKNOWN else None
+
+
 def _binding(
-    identity: Identity, write: Optional[Write], conv: Conventions
-) -> Tuple[Dict[str, Any], bool]:
-    """``(binding, defaulted)``: the expose's binding, and whether platform and format had to be
-    defaulted to ``other``."""
+    identity: Identity,
+    write: Optional[Write],
+    conv: Conventions,
+    catalogs: Optional[CatalogKinds] = None,
+) -> Tuple[Dict[str, Any], bool, Optional[str]]:
+    """``(binding, defaulted, unmapped)``: the expose's binding, whether platform and format had
+    to be defaulted to ``other``, and the Spark catalog alias whose kind nothing says (the binding
+    then has no ``catalog``: a person sets it)."""
+    unmapped: Optional[str] = None
     fmt = _FORMATS.get((write.fmt or "") if write else "", None)
     if identity.kind == "topic":
         location: Dict[str, Any] = {"topic": identity.name}
         if write is not None and write.host:
             location["host"] = write.host
-        return {"platform": "kafka", "format": "kafka_topic", "location": location}, False
+        return {"platform": "kafka", "format": "kafka_topic", "location": location}, False, None
     if identity.kind == "table":
         platform = None
         rule_format = None
@@ -292,7 +317,11 @@ def _binding(
             if catalog_rule.catalog:
                 location["catalog"] = catalog_rule.catalog
         elif identity.catalog:
-            location["catalog"] = identity.catalog
+            kind = catalog_kind(identity.catalog, catalogs or CatalogKinds())
+            if kind:
+                location["catalog"] = kind
+            else:
+                unmapped = identity.catalog
         if identity.rule is not None:
             platform = identity.rule.platform or platform
             rule_format = identity.rule.format or rule_format
@@ -305,6 +334,7 @@ def _binding(
         return (
             {"platform": platform, "format": chosen, "location": location},
             platform == "other" and chosen == "other",
+            unmapped,
         )
     # a path no rule explains
     path = identity.location or identity.name
@@ -315,7 +345,7 @@ def _binding(
     if "://" in path:
         bucket, _, rest = path.split("://", 1)[1].partition("/")
         location = {"bucket": bucket, "path": rest} if rest else {"bucket": bucket}
-    return {"platform": platform, "format": chosen, "location": location}, platform == "other"
+    return {"platform": platform, "format": chosen, "location": location}, platform == "other", None
 
 
 # ── the proposal ─────────────────────────────────────────────────────
@@ -357,6 +387,8 @@ class _Ctx:
     #: ``(product id, expose id) -> shown`` for reads nobody writes.
     external: Dict[Tuple[str, str], str] = field(default_factory=dict)
     topic_schema: Optional[TopicSchema] = None
+    #: What the scanned code says each Spark catalog is.
+    catalogs: CatalogKinds = field(default_factory=CatalogKinds)
     #: ``(file, line, shown)`` of unresolved reads already reported (a job feeds several products).
     reported: set = field(default_factory=set)
     #: The entry of each task link as a build lists it, by ``id(link)``: a job that feeds a
@@ -546,10 +578,13 @@ def build_proposal(
     root_name: str,
     topic_schema: Optional[TopicSchema] = None,
     report: Optional[ImportReport] = None,
+    catalogs: Optional[CatalogKinds] = None,
 ) -> Proposal:
     """The contracts the jobs (and the DAG tasks joined to them) propose, and the report.
 
     ``jobs`` are the job files, in path order, each with its ``tasks`` joined already.
+    ``catalogs`` is what the scanned code says each Spark catalog is (the kind a table's
+    ``binding.location.catalog`` names).
     """
     report = report or ImportReport()
     ordered = sorted(jobs, key=lambda j: j.shown)
@@ -675,6 +710,7 @@ def build_proposal(
         report=report,
         produced=produced,
         topic_schema=topic_schema,
+        catalogs=catalogs or CatalogKinds(),
     )
     contracts = [_product(group, group_ids[index], ctx) for index, group in enumerate(groups)]
 
@@ -692,6 +728,25 @@ def build_proposal(
     return Proposal(contracts=contracts, report=report)
 
 
+def _unmapped_catalog(pid: str, alias: str, eids: Sequence[str], catalogs: CatalogKinds) -> str:
+    """The report line for a table in a Spark catalog whose kind nothing says: its binding has no
+    ``catalog``, and how to set one."""
+    shown = safe_text(alias, 60)
+    listed = ", ".join(eids[:3]) + (f" and {len(eids) - 3} more" if len(eids) > 3 else "")
+    clash = catalogs.conflicting(alias)
+    why = (
+        f"the code sets it to more than one kind ({', '.join(clash)})"
+        if clash
+        else "nothing in the scanned code or the conventions says which kind of catalog it is"
+    )
+    return (
+        f"{pid}: exposes[{listed}] binding.location.catalog is not set: {shown} is the name of a "
+        f"Spark catalog, not a kind of catalog, and {why}. Set binding.location.catalog "
+        f"(glue, rest, hive, nessie, hadoop, ...) by hand, map {shown} under `catalogs` in the "
+        f"conventions, or set spark.sql.catalog.{shown}.type in the scanned code"
+    )
+
+
 def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
     conv, report, produced = ctx.conv, ctx.report, ctx.produced
     version, topic_schema = ctx.version, ctx.topic_schema
@@ -705,11 +760,14 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
     exposes: List[Dict[str, Any]] = []
     expose_by_key: Dict[Tuple[str, ...], str] = {}
     defaulted_binding = False
+    unmapped: Dict[str, List[str]] = {}
     for output in group.outputs:
         identity = output.identity
         eid = produced[identity.key][1]
-        binding, defaulted = _binding(identity, output.write, conv)
+        binding, defaulted, alias = _binding(identity, output.write, conv, ctx.catalogs)
         defaulted_binding = defaulted_binding or defaulted
+        if alias:
+            unmapped.setdefault(alias, []).append(eid)
         columns: List[Dict[str, Any]] = []
         note = ""
         if identity.kind == "topic" and topic_schema is not None:
@@ -747,6 +805,8 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
             f"{pid}: binding platform and format default to other: name the catalog or path prefix "
             "under `catalogs` or `paths` in the conventions, or set them by hand"
         )
+    for alias, eids in unmapped.items():
+        report.required_defaults.append(_unmapped_catalog(pid, alias, eids, ctx.catalogs))
 
     # builds
     builds: List[Dict[str, Any]] = []
