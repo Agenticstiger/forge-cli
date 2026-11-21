@@ -17,8 +17,10 @@ reconcile refuses a new source on the old checkpoint.
 
 from __future__ import annotations
 
+import datetime as _datetime
 import hashlib
 import json
+import logging
 import os
 import re
 import unicodedata
@@ -328,7 +330,8 @@ class DesiredRun:
 
     def stamp_args(self) -> List[str]:
         """The flags the runner stamps on each commit (:data:`STAMP_VALUE`'s values only), for
-        each of the version, contract digest, release and run this run has."""
+        each of the version, contract digest, release and run this run has. They are not in the
+        config hash, so a stream that is already running keeps the ones it was started with."""
         args: List[str] = []
         for flag, value in (
             ("--fluid-product-version", self.product_version),
@@ -851,13 +854,24 @@ def desired_runs(
                 topic=source.get("topic") if isinstance(source, Mapping) else None,
                 restarts_per_hour=restart_budget(build, scheduled),
                 job_text=job.text,
-                product_version=_product_version(contract, build),
-                contract_digest=(stamps or {}).get("contract_digest"),
-                release_id=(stamps or {}).get("release_id"),
-                run_id=(stamps or {}).get("run_id"),
+                **_stamp_fields(contract, build, stamps),
             )
         )
     return [run.bind(account) for run in runs] if account else runs
+
+
+def _stamp_fields(
+    contract: Mapping[str, Any], build: Mapping[str, Any], stamps: Optional[Mapping[str, str]]
+) -> Dict[str, Optional[str]]:
+    """The :class:`DesiredRun` fields the runner stamps on each commit: the version of the
+    build's output, and what ``stamps`` (:func:`run_stamps`) carries."""
+    given = stamps or {}
+    return {
+        "product_version": _product_version(contract, build),
+        "contract_digest": given.get("contract_digest"),
+        "release_id": given.get("release_id"),
+        "run_id": given.get("run_id"),
+    }
 
 
 def _product_version(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Optional[str]:
@@ -873,42 +887,74 @@ def _product_version(contract: Mapping[str, Any], build: Mapping[str, Any]) -> O
     return None
 
 
+def _as_json(value: Any) -> Any:
+    """``value`` with each date and time as its ISO 8601 text: what an unquoted YAML date
+    loads as, and what ``yq -o=json`` prints for it, so the digest of such a contract can
+    still be reproduced outside Forge."""
+    if isinstance(value, Mapping):
+        return {k: _as_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_as_json(v) for v in value]
+    if isinstance(value, (_datetime.date, _datetime.time)):
+        return value.isoformat()
+    return value
+
+
+def _contract_digest(contract: Mapping[str, Any]) -> Optional[str]:
+    """The digest of ``contract`` as loaded (``compute_contract_digest``), or None, with a
+    warning, for a contract no JSON can hold."""
+    from fluid_build.forge.core.plan_digest import compute_contract_digest
+
+    try:
+        return compute_contract_digest(_as_json(contract))
+    except (TypeError, ValueError, RecursionError) as exc:
+        logging.getLogger(__name__).warning(
+            "the contract cannot be hashed (%s): its digest is not stamped on the commits",
+            type(exc).__name__,
+        )
+        return None
+
+
 def run_stamps(
     contract: Mapping[str, Any],
     *,
     run_id: Optional[str] = None,
     environ: Optional[Mapping[str, str]] = None,
+    refuse_release: bool = True,
 ) -> Dict[str, str]:
     """What ``fluid apply`` hands the runner of each run it starts, besides what the job config
     says: the digest of ``contract`` as loaded (before ``{{ env.* }}`` is resolved, so no
-    environment value is in what it hashes), the pipeline's ``run_id`` (anything a stamp may
-    not hold becomes ``_`` and what is not a letter or a digit is cut from its start: an
-    operator's own ``FLUID_RUN_ID`` never refuses a deploy) and the
-    release :data:`RELEASE_ID_ENV` names. A contract that cannot be hashed is left unstamped.
+    environment value is in what it hashes; a contract no JSON can hold is left unstamped, with
+    a warning), the pipeline's ``run_id`` (anything a stamp may not hold becomes ``_`` and what
+    is not a letter or a digit is cut from its start: an operator's own ``FLUID_RUN_ID`` never
+    refuses a deploy) and the release :data:`RELEASE_ID_ENV` names. A release a stamp may not
+    hold refuses the deploy (``refuse_release``); a run nobody is watching (a keepalive, a
+    scheduled build) leaves it off, with a warning, so a label cannot stop the data.
 
     Raises:
-        ValueError: :data:`RELEASE_ID_ENV` holds a character a stamp may not.
+        ValueError: :data:`RELEASE_ID_ENV` holds a character a stamp may not, and
+            ``refuse_release`` is set.
     """
-    from fluid_build.forge.core.plan_digest import compute_contract_digest
-
     env = os.environ if environ is None else environ
     stamps: Dict[str, str] = {}
-    try:
-        stamps["contract_digest"] = compute_contract_digest(contract)
-    except (TypeError, ValueError, RecursionError):
-        pass  # a value no digest can hold: the commits carry the rest
+    digest = _contract_digest(contract)
+    if digest:
+        stamps["contract_digest"] = digest
     safe_id = re.sub(r"^[^A-Za-z0-9]+", "", re.sub(r"[^A-Za-z0-9._:+@/=~-]", "_", run_id or ""))
     if safe_id:
         stamps["run_id"] = safe_id[:256]
     release = (env.get(RELEASE_ID_ENV) or "").strip()
-    if release:
-        if not STAMP_VALUE.fullmatch(release):
-            raise ValueError(
-                f"{RELEASE_ID_ENV} {release[:60]!r} is not an identifier, a version, a digest or "
-                "a run id (starting with a letter or a digit; letters, digits and . _ : + @ / = ~ -, "
-                "at most 256 characters); nothing was started"
-            )
+    if release and STAMP_VALUE.fullmatch(release):
         stamps["release_id"] = release
+    elif release:
+        why = (
+            f"{RELEASE_ID_ENV} {release[:60]!r} is not an identifier, a version, a digest or a "
+            "run id (starting with a letter or a digit; letters, digits and . _ : + @ / = ~ -, "
+            "at most 256 characters)"
+        )
+        if refuse_release:
+            raise ValueError(why)
+        logging.getLogger(__name__).warning("%s: this run carries no release stamp", why)
     return stamps
 
 

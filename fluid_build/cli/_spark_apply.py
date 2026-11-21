@@ -54,9 +54,14 @@ def _desired(contract: Mapping[str, Any], event: str, **kwargs: Any) -> List[Des
         raise _cli_error(f"{event}_invalid", {"error": str(exc)}) from exc
 
 
-def _stamps(contract: Mapping[str, Any], run_id: Optional[str]) -> Dict[str, str]:
+def _stamps(
+    contract: Mapping[str, Any], run_id: Optional[str], *, refuse_release: bool = True
+) -> Dict[str, str]:
     """What the runner stamps on each commit besides the job config's own: the contract's
-    digest, the pipeline's ``run_id`` and ``FLUID_RELEASE_ID`` (``_desired.run_stamps``).
+    digest, the pipeline's ``run_id`` and ``FLUID_RELEASE_ID`` (``_desired.run_stamps``). A
+    deploy refuses a release a stamp may not hold; ``--mode reconcile`` (``refuse_release``
+    off) leaves it off with a warning, so a mis-set variable cannot stop the keepalive from
+    restarting a dead stream.
 
     Raises:
         CLIError: ``apply_spark_invalid`` (``FLUID_RELEASE_ID`` holds a character a stamp may not).
@@ -64,9 +69,9 @@ def _stamps(contract: Mapping[str, Any], run_id: Optional[str]) -> Dict[str, str
     from fluid_build.build_runners.spark._desired import run_stamps
 
     try:
-        return run_stamps(contract, run_id=run_id)
+        return run_stamps(contract, run_id=run_id, refuse_release=refuse_release)
     except ValueError as exc:
-        raise _cli_error("apply_spark_invalid", {"error": str(exc)}) from exc
+        raise _cli_error("apply_spark_invalid", {"error": f"{exc}; nothing was started"}) from exc
 
 
 def _has_spark(contract: Mapping[str, Any]) -> bool:
@@ -342,7 +347,12 @@ def reconcile_only(
     from fluid_build.cli.console import cprint
 
     runs = (
-        _desired(contract, "apply_spark", build_id=build_id, stamps=_stamps(contract, run_id))
+        _desired(
+            contract,
+            "apply_spark",
+            build_id=build_id,
+            stamps=_stamps(contract, run_id, refuse_release=False),
+        )
         if _has_spark(contract)
         else []
     )

@@ -11,12 +11,14 @@ or a running stream would be replaced by every deploy.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import re
 
 import pytest
 
 from fluid_build.build_runners.spark import _desired
+from fluid_build.build_runners.spark import _reconcile as rc
 from fluid_build.build_runners.spark._adapters import _identity
 from fluid_build.cli import _spark_apply as _apply
 from fluid_build.cli._common import CLIError
@@ -167,7 +169,37 @@ def test_the_release_is_the_one_the_deploy_names(contract):
 def test_a_release_a_stamp_may_not_hold_is_refused_by_name(contract, value):
     with pytest.raises(ValueError, match=_desired.RELEASE_ID_ENV) as refused:
         _desired.run_stamps(contract, environ={_desired.RELEASE_ID_ENV: value})
-    assert "nothing was started" in str(refused.value) and "x" * 100 not in str(refused.value)
+    assert "x" * 100 not in str(refused.value)  # a long value is not echoed whole
+
+
+def test_a_run_nobody_watches_leaves_a_release_a_stamp_may_not_hold_off_with_a_warning(
+    contract, caplog
+):
+    env = {_desired.RELEASE_ID_ENV: "two words"}
+    with caplog.at_level(logging.WARNING):
+        got = _desired.run_stamps(contract, run_id="r-1", environ=env, refuse_release=False)
+    assert "release_id" not in got and got["run_id"] == "r-1" and "contract_digest" in got
+    assert _desired.RELEASE_ID_ENV in caplog.text and "carries no release stamp" in caplog.text
+
+
+def test_a_contract_with_an_unquoted_yaml_date_is_hashed_as_the_dates_text(contract):
+    contract["metadata"] = {
+        "created": datetime.date(2026, 1, 1),
+        "reviewed": [datetime.datetime(2026, 1, 1, 10, 30)],
+    }
+    as_text = {
+        **contract,
+        "metadata": {"created": "2026-01-01", "reviewed": ["2026-01-01T10:30:00"]},
+    }
+    assert _desired.run_stamps(contract)["contract_digest"] == compute_contract_digest(as_text)
+
+
+def test_a_contract_no_json_can_hold_is_left_unstamped_with_a_warning(contract, caplog):
+    contract["metadata"] = {"tags": {1, 2}}  # a set
+    with caplog.at_level(logging.WARNING):
+        got = _desired.run_stamps(contract, run_id="r-1")
+    assert got == {"run_id": "r-1"}
+    assert "digest is not stamped" in caplog.text and "TypeError" in caplog.text
 
 
 def test_a_contract_no_digest_can_hold_is_left_unstamped(contract, monkeypatch):
@@ -212,12 +244,60 @@ def test_prepare_refuses_a_release_id_a_stamp_may_not_hold_before_anything_start
         _apply.prepare(contract, build_id=None, verified_plan=None, dry_run=True)
     assert err.value.event == "apply_spark_invalid"
     assert _desired.RELEASE_ID_ENV in str(err.value.context["error"])
+    assert "nothing was started" in str(err.value.context["error"])
 
 
 def test_a_contract_without_a_spark_build_never_reads_the_release_variable(contract, monkeypatch):
     monkeypatch.setenv(_desired.RELEASE_ID_ENV, "two words")
     contract["builds"] = []
     assert _apply.prepare(contract, build_id=None, verified_plan=None, dry_run=True) == []
+
+
+def test_the_keepalive_leaves_a_release_a_stamp_may_not_hold_off_and_still_runs(
+    contract, monkeypatch, caplog
+):
+    monkeypatch.setenv(_desired.RELEASE_ID_ENV, "two words")
+    seen = []
+    monkeypatch.setattr(
+        "fluid_build.build_runners.spark._reconcile.reconcile",
+        lambda runs, *a, **k: seen.extend(runs) or [],
+    )
+    monkeypatch.setattr(_apply, "_require_boto3", lambda: None)
+    with caplog.at_level(logging.WARNING):
+        _apply.reconcile_only(
+            contract,
+            logging.getLogger("test"),
+            build_id=None,
+            dry_run=True,
+            run_id="3f9a3f9a3f9a",
+        )
+    assert seen and all(run.release_id is None for run in seen)
+    assert all(run.run_id == "3f9a3f9a3f9a" for run in seen)
+    assert "carries no release stamp" in caplog.text
+
+
+def test_a_scheduled_build_leaves_a_release_a_stamp_may_not_hold_off_and_still_runs(
+    contract, monkeypatch, caplog
+):
+    contract["builds"][0]["properties"]["stream"]["trigger"] = {"availableNow": True}
+    monkeypatch.setenv(_desired.RELEASE_ID_ENV, "two words")
+    seen = []
+    monkeypatch.setattr(
+        rc,
+        "run_once",
+        lambda run, **kw: seen.append(run) or rc.Outcome(run.build, run.runtime, "succeeded"),
+    )
+    with caplog.at_level(logging.WARNING):
+        code = rc.run_build(
+            contract,
+            contract["builds"][0],
+            dry_run=False,
+            say=lambda text: None,
+            run_id="3f9a3f9a3f9a",
+        )
+    assert code == 0 and len(seen) == 1
+    assert seen[0].release_id is None and seen[0].run_id == "3f9a3f9a3f9a"
+    assert "carries no release stamp" in caplog.text
 
 
 def test_reconcile_only_stamps_the_runs_it_starts(contract, monkeypatch):

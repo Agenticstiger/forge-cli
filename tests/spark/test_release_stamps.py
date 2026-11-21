@@ -9,8 +9,9 @@ the options, and the streaming commit reaches it), so the runner puts the produc
 config digest, version, contract digest, release and run on the write options of each writer it
 builds, and in the job's own Spark conf.
 
-The writers run without Spark here, against recorders; the opt-in run on Spark 3.5
-(``test_runner_integration.py``) proves the summary entries on a real table.
+The writers run without Spark here, against recorders. That Iceberg keeps the options as
+summary entries is read off a real table by the opt-in run on Spark 3.5
+(``test_runner_integration.py::test_every_commit_the_runner_makes_carries_the_runs_stamps``).
 """
 
 from __future__ import annotations
@@ -65,6 +66,11 @@ class Frame(Recorder):
         return Query(self.calls)
 
 
+def stamps_of(runner, config, text, **given):
+    """What ``main`` builds: the command line's flags, checked, beside the config's own."""
+    return runner.release_stamps(config, text, runner.stamp_flags(flags(**given)))
+
+
 def everything(**given):
     return {
         "product_version": "1.4.0",
@@ -80,7 +86,7 @@ def everything(**given):
 
 def test_a_run_is_stamped_with_what_it_is(runner, contract):
     text = config_text(contract)
-    stamps = runner.release_stamps(runner.parse_config(text), text, flags(**everything()))
+    stamps = stamps_of(runner, runner.parse_config(text), text, **everything())
     assert stamps == {
         "fluid.product": "commerce.orders-stream",
         "fluid.build": "ingest-orders",
@@ -94,14 +100,14 @@ def test_a_run_is_stamped_with_what_it_is(runner, contract):
 
 def test_a_flag_that_is_not_given_leaves_its_stamp_out(runner, contract):
     text = config_text(contract)
-    stamps = runner.release_stamps(runner.parse_config(text), text, flags(run_id="r-1"))
+    stamps = stamps_of(runner, runner.parse_config(text), text, run_id="r-1")
     assert sorted(stamps) == [
         "fluid.build",
         "fluid.job-sha256",
         "fluid.product",
         "fluid.run-id",
     ]
-    bare = runner.release_stamps(runner.parse_config(text), text, flags())
+    bare = stamps_of(runner, runner.parse_config(text), text)
     assert sorted(bare) == ["fluid.build", "fluid.job-sha256", "fluid.product"]
 
 
@@ -121,15 +127,20 @@ def test_the_stamp_keys_are_lower_case_and_never_one_of_icebergs_own(runner):
         "x" * 257, "-x", "--config=s3://other/job.json", ".dot", "_under",
     ],  # fmt: skip
 )
-def test_a_value_a_stamp_may_not_hold_is_refused_before_anything_is_read(
-    runner, contract, name, value
-):
+def test_a_value_a_stamp_may_not_hold_is_refused_before_spark_starts(runner, name, value):
+    with pytest.raises(runner.JobConfigError, match="fluid\\.") as refused:
+        runner.stamp_flags(flags(**{name: value}))
+    assert "the job was not run" in str(refused.value)
+    assert "x" * 100 not in str(refused.value)  # a long value is not echoed whole
+
+
+@pytest.mark.parametrize("field", ["product", "build"])
+def test_a_product_or_build_a_stamp_may_not_hold_is_refused(runner, contract, field):
     text = config_text(contract)
     config = runner.parse_config(text)
-    with pytest.raises(runner.JobConfigError, match="fluid\\.") as refused:
-        runner.release_stamps(config, text, flags(**{name: value}))
-    assert "nothing was read" in str(refused.value)
-    assert "x" * 100 not in str(refused.value)  # a long value is not echoed whole
+    config[field] = "two words"
+    with pytest.raises(runner.JobConfigError, match=f"fluid\\.{field}"):
+        runner.release_stamps(config, text)
 
 
 @pytest.mark.parametrize(
@@ -145,7 +156,7 @@ def test_a_value_a_stamp_may_not_hold_is_refused_before_anything_is_read(
 )
 def test_the_ids_and_versions_the_pipeline_makes_are_accepted(runner, contract, value):
     text = config_text(contract)
-    stamps = runner.release_stamps(runner.parse_config(text), text, flags(run_id=value))
+    stamps = stamps_of(runner, runner.parse_config(text), text, run_id=value)
     assert stamps["fluid.run-id"] == value
 
 
@@ -153,10 +164,10 @@ def test_a_product_or_build_id_may_start_with_an_underscore_a_flag_value_may_not
     text = config_text(contract)
     config = runner.parse_config(text)
     config.update(product="_internal.orders", build="_ingest")
-    stamps = runner.release_stamps(config, text, flags())
+    stamps = stamps_of(runner, config, text)
     assert stamps["fluid.product"] == "_internal.orders" and stamps["fluid.build"] == "_ingest"
-    with pytest.raises(runner.JobConfigError, match="starting with a letter or a digit"):
-        runner.release_stamps(config, text, flags(run_id="_internal"))
+    with pytest.raises(runner.JobConfigError, match="starts with a letter or a digit"):
+        runner.stamp_flags(flags(run_id="_internal"))
 
 
 # --- where the stamps go --------------------------------------------------------------
@@ -187,7 +198,7 @@ def stamped_run(runner, contract, monkeypatch, **config_changes):
     frame = Frame(calls)
     monkeypatch.setattr(runner, "build_output", lambda spark, cfg: frame)
     session = Session()
-    stamps = runner.release_stamps(config, text, flags(**everything()))
+    stamps = stamps_of(runner, config, text, **everything())
     runner.run(session, config, stamps)
     return calls, session, stamps
 
@@ -218,6 +229,28 @@ def test_the_jobs_spark_conf_holds_the_stamps_too(runner, contract, monkeypatch)
     assert session.values["spark.fluid.run-id"] == AIRFLOW_RUN
 
 
+def test_a_spark_conf_that_is_refused_does_not_stop_the_run(runner, contract, monkeypatch, capsys):
+    text = config_text(contract)
+    config = runner.parse_config(text)
+    config.update(mode="batch", source=None, maskedColumns=[], maskKey=None)
+    calls = []
+    monkeypatch.setattr(runner, "build_output", lambda spark, cfg: Frame(calls))
+    session = Session()
+    accept = session.conf.set
+
+    def refuse(name, value):
+        if name.startswith("spark.fluid."):
+            raise RuntimeError("Cannot modify the value of a static config: " + name)
+        accept(name, value)
+
+    session.conf.set = refuse
+    runner.run(session, config, {"fluid.run-id": "r-1"})
+    out = capsys.readouterr().out
+    assert '"stamp_conf_not_set"' in out and "fluid.run-id" in out and "static config" not in out
+    options = dict(args for args, _ in called(calls, "option"))
+    assert options["snapshot-property.fluid.run-id"] == "r-1"  # the commit still carries it
+
+
 def test_the_start_line_names_the_stamps_and_nothing_secret(runner, contract, monkeypatch, capsys):
     stamped_run(runner, contract, monkeypatch)
     start = next(
@@ -242,16 +275,22 @@ def test_a_run_without_stamps_writes_what_it_always_wrote(runner, contract, monk
 # --- the command line -----------------------------------------------------------------
 
 
-def main_with(runner, monkeypatch, contract, argv):
+def main_with(runner, monkeypatch, contract, argv, events=None):
+    """``main`` on stand-ins; ``events`` records the steps it takes, in order."""
     import sys
 
     seen = []
-    session = types.SimpleNamespace(builder=types.SimpleNamespace(getOrCreate=lambda: "spark"))
+    events = [] if events is None else events
+    session = types.SimpleNamespace(
+        builder=types.SimpleNamespace(getOrCreate=lambda: events.append("spark") or "spark")
+    )
     monkeypatch.setitem(sys.modules, "pyspark", types.ModuleType("pyspark"))
     monkeypatch.setitem(sys.modules, "pyspark.sql", types.SimpleNamespace(SparkSession=session))
     text = config_text(contract)
-    monkeypatch.setattr(runner, "read_text", lambda spark, path: text)
-    monkeypatch.setattr(runner, "run", lambda spark, config, stamps: seen.append(stamps))
+    monkeypatch.setattr(runner, "read_text", lambda spark, path: events.append("read") or text)
+    monkeypatch.setattr(
+        runner, "run", lambda spark, config, stamps: events.append("run") or seen.append(stamps)
+    )
     code = runner.main(["--config", "s3://b/_fluid/job.json", *argv])
     return code, seen, text
 
@@ -279,8 +318,8 @@ def test_a_plain_spark_submit_still_runs_with_the_three_stamps_it_can_make(
     assert sorted(seen[0]) == ["fluid.build", "fluid.job-sha256", "fluid.product"]
 
 
-def test_a_flag_with_a_bad_value_stops_the_run_before_it_starts(runner, contract, monkeypatch):
-    seen = []
+def test_a_flag_with_a_bad_value_stops_the_run_before_spark_starts(runner, contract, monkeypatch):
+    events = []
     with pytest.raises(runner.JobConfigError, match="fluid.run-id"):
-        main_with(runner, monkeypatch, contract, ["--fluid-run-id", "two words"])
-    assert seen == []
+        main_with(runner, monkeypatch, contract, ["--fluid-run-id", "two words"], events)
+    assert events == []  # no session, no config read, no job

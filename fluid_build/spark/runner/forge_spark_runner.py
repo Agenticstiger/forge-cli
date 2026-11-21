@@ -126,34 +126,59 @@ def log(event: str, **fields: object) -> None:
     sys.stdout.flush()
 
 
-def release_stamps(config: dict, text: str, args) -> dict:
-    """What identifies this run on every commit it makes: the product and build the config names,
-    the digest of the job config as it ran, and the version, contract digest, release and run
-    ``fluid apply`` handed over (``--fluid-*``; each only when given: the runner also runs under
-    a plain spark-submit). Each value is checked before Spark does anything.
+def _check_stamp(key: str, value: object, pattern: re.Pattern) -> None:
+    if not pattern.fullmatch(str(value)):
+        raise JobConfigError(
+            f"{key}: {str(value)[:60]!r} is not an identifier, a version, a digest or a run id "
+            "(letters, digits and . _ : + @ / = ~ -, at most 256 characters; a value passed on "
+            "the command line starts with a letter or a digit); the job was not run"
+        )
+
+
+def stamp_flags(args) -> dict:
+    """The ``--fluid-*`` values the command line carries, as stamps, each only when given (the
+    runner also runs under a plain spark-submit). Each is checked here, before Spark starts: a
+    value a stamp may not hold runs nothing.
 
     Raises:
         JobConfigError: a value holds a character a stamp may not.
+    """
+    given = {}
+    for flag, key in STAMP_FLAGS:
+        value = getattr(args, flag[2:].replace("-", "_"), None)
+        if value:
+            _check_stamp(key, value, _STAMP_VALUE)
+            given[key] = value
+    return given
+
+
+def release_stamps(config: dict, text: str, given: dict | None = None) -> dict:
+    """What identifies this run on every commit it makes: the product and build the config names,
+    the digest of the job config as it ran, and the version, contract digest, release and run
+    ``fluid apply`` handed over (``given``: :func:`stamp_flags`).
+
+    Raises:
+        JobConfigError: the config's product or build holds a character a stamp may not.
     """
     stamps = {
         "fluid.product": config["product"],
         "fluid.build": config["build"],
         "fluid.job-sha256": config_digest(text),
     }
-    given = []
-    for flag, key in STAMP_FLAGS:
-        value = getattr(args, flag[2:].replace("-", "_"), None)
-        if value:
-            stamps[key] = value
-            given.append(key)
     for key, value in stamps.items():
-        if not (_STAMP_VALUE if key in given else _STAMP_IDENT).fullmatch(str(value)):
-            raise JobConfigError(
-                f"{key}: {str(value)[:60]!r} is not an identifier, a version, a digest or a run "
-                "id (starting with a letter or a digit; letters, digits and . _ : + @ / = ~ -, "
-                "at most 256 characters); nothing was read"
-            )
+        _check_stamp(key, value, _STAMP_IDENT)
+    stamps.update(given or {})
     return stamps
+
+
+def stamp_conf(spark, stamps: dict) -> None:
+    """The job's own conf holds the stamps as ``spark.<key>``, which the Spark UI and a listener
+    read. A conf Spark refuses is logged, not fatal: the commits carry the stamps."""
+    for key, value in stamps.items():
+        try:
+            spark.conf.set(f"spark.{key}", value)
+        except Exception as exc:  # noqa: BLE001 - Py4J's error: the stamp stays on the commits
+            log("stamp_conf_not_set", key=key, error=type(exc).__name__)
 
 
 def stamped(writer, stamps: dict | None):
@@ -543,9 +568,8 @@ def build_output(spark, config: dict):
 
 def run(spark, config: dict, stamps: dict | None = None) -> None:
     configure_session(spark, config)
-    for key, value in (stamps or {}).items():
-        # The job's own conf, which the Spark UI and a listener read: ``spark.fluid.<key>``.
-        spark.conf.set(f"spark.{key}", value)
+    stamps = stamps or {}
+    stamp_conf(spark, stamps)
     sink = config["sink"]
     table = f"{sink['catalog']}.{sink['table']}"
     log(
@@ -555,7 +579,7 @@ def run(spark, config: dict, stamps: dict | None = None) -> None:
         mode=config["mode"],
         table=table,
         masked_columns=config.get("maskedColumns") or [],
-        stamps=stamps or {},
+        stamps=stamps,
     )
     if config.get("maskedColumns"):
         mask = config.get("maskKey") or {}
@@ -909,12 +933,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.add_argument(flag, help=f"stamped on every commit as {key}")
     # Glue passes its own --JOB_NAME and friends; they are not this runner's.
     args, _ = parser.parse_known_args(argv)
+    flags = stamp_flags(args)  # before Spark starts: a value a stamp may not hold runs nothing
     from pyspark.sql import SparkSession
 
     spark = SparkSession.builder.getOrCreate()
     text = checked_text(read_text(spark, args.config), args.fluid_job_sha256, args.config)
     config = parse_config(text)
-    run(spark, config, release_stamps(config, text, args))
+    run(spark, config, release_stamps(config, text, flags))
     return 0
 
 
