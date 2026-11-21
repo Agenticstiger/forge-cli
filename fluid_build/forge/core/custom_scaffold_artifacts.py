@@ -56,7 +56,7 @@ import secrets
 import shutil
 import stat
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, NoReturn, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, NoReturn, Optional, Tuple
 
 from fluid_build.forge.core.artifact_fanout import FanoutError
 
@@ -90,6 +90,14 @@ _UNSAFE = "custom_scaffold_unsafe_path"
 _OUTPUT = "custom_scaffold_output_failed"
 
 
+class ContractAnchor(NamedTuple):
+    """Where the engine reads a relative ``path:`` source from: ``directory``, or the
+    current directory when it is ``None`` (then ``why`` says why there is none)."""
+
+    directory: Optional[Path]
+    why: str = ""
+
+
 def scaffold_block(contract: Mapping[str, Any]) -> Optional[Any]:
     """The contract's ``extensions.customScaffold`` block, or ``None`` when it has none."""
     extensions = contract.get("extensions")
@@ -114,24 +122,24 @@ def emit(
     logger: logging.Logger,
     *,
     required: bool,
-    contract_dir: Optional[Path],
-    contract_dir_note: str = "",
+    anchor: ContractAnchor,
 ) -> List[Path]:
     """Generate the scaffold ``contract`` declares into ``out_dir`` (``<out>/custom-scaffold``).
 
     ``required`` is ``True`` when ``--emit`` named the key: then a missing or too old engine
-    raises instead of being skipped with a warning. ``contract_dir`` anchors a relative
-    ``path:`` source (``None``: the current directory, with a warning that names
-    ``contract_dir_note`` when the block has such a source). Returns the files written, each
-    under ``out_dir``; raises :class:`FanoutError` (or the optional-dependency error) and
-    leaves nothing under ``out_dir`` when the run is refused.
+    raises instead of being skipped with a warning. ``anchor`` says where a relative
+    ``path:`` source is read from (no directory: the current one, with a warning when the
+    block has such a source). Returns the files written, each under ``out_dir``; raises
+    :class:`FanoutError` (or the optional-dependency error) and leaves nothing under
+    ``out_dir`` when the run is refused.
     """
     block = scaffold_block(contract)
     if block is None:
         if required:
             logger.info(
-                "generate_artifacts_custom_scaffold_none",
-                extra={"hint": f"the contract has no extensions.{EXTENSION_KEY} block"},
+                "generate_artifacts_custom_scaffold_none: the contract has no extensions.%s "
+                "block, so there is no scaffold to generate",
+                EXTENSION_KEY,
             )
         return []
     engine = _engine(required, logger)
@@ -139,25 +147,25 @@ def emit(
         return []
     _check_block(engine, contract)
     _check_plugins(block)
-    if contract_dir is None and _has_relative_path_source(block):
+    if anchor.directory is None and _has_relative_path_source(block):
         logger.warning(
             "generate_artifacts_custom_scaffold_contract_dir: %s records no source contract, "
             "so relative path: sources are read from the current directory %s; pass "
             "--contract-path, or run stage 3 on the contract",
-            contract_dir_note or "the input",
+            anchor.why or "the input",
             Path.cwd(),
         )
     out_dir.parent.mkdir(parents=True, exist_ok=True)
     staging = _new_staging(out_dir.parent)
     try:
-        result = _generate(engine, contract, staging, contract_dir)
+        result = _generate(engine, contract, staging, anchor.directory)
         rows = _verified_rows(staging, getattr(result, "files", None))
         if rows:
             _publish(staging, out_dir)
     finally:
         if os.path.lexists(staging):
             _remove(staging)
-    logger.info("generate_artifacts_custom_scaffold_ok", extra={"files": len(rows)})
+    logger.info("generate_artifacts_custom_scaffold_ok: %d file(s) in %s", len(rows), out_dir)
     return [out_dir / rel for rel in rows]
 
 
@@ -440,6 +448,7 @@ def _refuse(message: str, code: str) -> NoReturn:
 
 
 __all__ = [
+    "ContractAnchor",
     "EMIT_KEY",
     "ENGINE_EXTRA",
     "ENGINE_MODULE",

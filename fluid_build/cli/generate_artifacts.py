@@ -30,6 +30,28 @@ from fluid_build.cli._common import CLIError
 from fluid_build.cli.console import cprint
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 
+#: The examples and notes ``fluid generate artifacts --help`` ends with.
+_EPILOG = (
+    "Examples:\n"
+    "  fluid generate artifacts dist/product.fluid.bundle.tgz \\\n"
+    "      --out dist/artifacts/\n"
+    "  fluid generate artifacts bundle.tgz --emit odps-bitol,odcs\n"
+    "  fluid generate artifacts contract.fluid.yaml --out /tmp/art  # dev shortcut\n"
+    "  # schedule DAGs that run `fluid apply --env aws` on the Airflow worker\n"
+    "  fluid generate artifacts runtime/bundle.tgz --env aws \\\n"
+    "      --contract-path contracts/orders/contract.fluid.yaml\n\n"
+    "  # PySpark StructType modules too (pyspark-schema/<port>_schema.py)\n"
+    "  fluid generate artifacts bundle.tgz --emit odcs,pyspark-schema\n\n"
+    "custom-scaffold runs the custom-scaffold engine, an optional extra:\n"
+    "  pip install 'data-product-forge[custom-scaffold]'\n"
+    "Without it the default run skips the scaffold with a warning, and\n"
+    "--emit custom-scaffold is an error. A git bundle that authenticates needs its\n"
+    "host in FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS and a secret_ref that starts with the\n"
+    "prefix FLUID_SCAFFOLD_, both set where the command runs, never in the contract.\n\n"
+    "Note: --emit dbt is NOT supported. dbt projects are execution artifacts;\n"
+    "use `fluid generate speed-transformation` instead.\n"
+)
+
 
 def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
     """Register as a subcommand of ``fluid generate``."""
@@ -49,26 +71,7 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
             "Open Data Product Specification key; the bare ``odps`` emit key is a "
             "deprecated alias that resolves to ``opds``."
         ),
-        epilog=(
-            "Examples:\n"
-            "  fluid generate artifacts dist/product.fluid.bundle.tgz \\\n"
-            "      --out dist/artifacts/\n"
-            "  fluid generate artifacts bundle.tgz --emit odps-bitol,odcs\n"
-            "  fluid generate artifacts contract.fluid.yaml --out /tmp/art  # dev shortcut\n"
-            "  # schedule DAGs that run `fluid apply --env aws` on the Airflow worker\n"
-            "  fluid generate artifacts runtime/bundle.tgz --env aws \\\n"
-            "      --contract-path contracts/orders/contract.fluid.yaml\n\n"
-            "  # PySpark StructType modules too (pyspark-schema/<port>_schema.py)\n"
-            "  fluid generate artifacts bundle.tgz --emit odcs,pyspark-schema\n\n"
-            "custom-scaffold runs the custom-scaffold engine, an optional extra:\n"
-            "  pip install 'data-product-forge[custom-scaffold]'\n"
-            "Without it the default run skips the scaffold with a warning, and\n"
-            "--emit custom-scaffold is an error. A git bundle that authenticates needs its\n"
-            "host in FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS and a secret_ref that starts with the\n"
-            "prefix FLUID_SCAFFOLD_, both set where the command runs, never in the contract.\n\n"
-            "Note: --emit dbt is NOT supported. dbt projects are execution artifacts;\n"
-            "use `fluid generate speed-transformation` instead.\n"
-        ),
+        epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(

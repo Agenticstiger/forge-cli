@@ -73,6 +73,7 @@ import os
 import shutil
 import tarfile
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Tuple
 
@@ -1023,8 +1024,9 @@ def _emit_pyspark_schema(
             logger.warning("generate_artifacts_pyspark_schema_lossy: %s", warning)
     if rendered.skipped:
         logger.info(
-            "generate_artifacts_pyspark_schema_no_columns",
-            extra={"ports": list(rendered.skipped)},
+            "generate_artifacts_pyspark_schema_no_columns: no module for the output port(s) "
+            "without contract.schema columns: %s",
+            ", ".join(rendered.skipped),
         )
     try:
         pyspark_schema.write(planned)
@@ -1075,15 +1077,7 @@ def _scaffold_contract_dir(
     return None, f"{bundle_or_contract} {why}" if why else str(bundle_or_contract)
 
 
-def _emit_custom_scaffold(
-    contract_path: Path,
-    out_dir: Path,
-    logger: logging.Logger,
-    *,
-    required: bool,
-    contract_dir: Optional[Path],
-    contract_dir_note: str = "",
-) -> List[Path]:
+def _emit_custom_scaffold(run: "_Inputs", out_dir: Path, logger: logging.Logger) -> List[Path]:
     """The files ``extensions.customScaffold`` generates, under ``custom-scaffold/``.
 
     Delegates to :mod:`fluid_build.forge.core.custom_scaffold_artifacts`, which runs the
@@ -1091,13 +1085,15 @@ def _emit_custom_scaffold(
     """
     from fluid_build.forge.core import custom_scaffold_artifacts
 
+    anchor = custom_scaffold_artifacts.ContractAnchor(
+        *_scaffold_contract_dir(run.source, run.source_path, run.contract_path)
+    )
     return custom_scaffold_artifacts.emit(
-        _load_contract(contract_path),
+        _load_contract(run.resolved_contract),
         out_dir,
         logger,
-        required=required,
-        contract_dir=contract_dir,
-        contract_dir_note=contract_dir_note,
+        required=run.explicit,
+        anchor=anchor,
     )
 
 
@@ -1116,6 +1112,69 @@ _DISPATCH = {
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Inputs:
+    """What one fanout run's emitters read besides their output directory."""
+
+    #: The fanout's input, a bundle or a raw contract: what ``generate iac`` and
+    #: ``generate pyspark-schema`` would be given.
+    source: Path
+    #: The contract file the catalog emitters read (a bundle's ``contract.resolved.yaml``).
+    resolved_contract: Path
+    overlay_env: Optional[str]
+    env: Optional[str]
+    dag_contract_path: Optional[str]
+    schedule_contract: Optional[Dict[str, Any]]
+    #: ``--emit`` named the keys, so an optional engine that is missing is an error.
+    explicit: bool
+    source_path: Optional[Path]
+    contract_path: Optional[str]
+
+
+def _clear_outputs(out_dir: Path) -> None:
+    """Remove what an earlier fanout wrote, so a stale file never survives into the MANIFEST.
+
+    The caller owns ``out_dir``: only the subdirectories this module generates into are
+    touched, and in ``spark/`` and ``pyspark-schema/`` only the files it writes there.
+    """
+    for sub in ("odps", "odps-bitol", "odcs", "opds", "schedule", "policy"):
+        target = out_dir / sub
+        if target.exists():
+            shutil.rmtree(target)
+    _clear_spark(out_dir / "spark")
+    _clear_pyspark_schema(out_dir / "pyspark-schema")
+    from fluid_build.forge.core import custom_scaffold_artifacts
+
+    custom_scaffold_artifacts.clear(out_dir)
+
+
+def _emit_key(key: str, subdir: Path, run: _Inputs, logger: logging.Logger) -> List[Path]:
+    """Run the emitter of ``key`` into ``subdir``, with the inputs that emitter reads."""
+    if key == "schedule":
+        return _emit_schedule(
+            run.resolved_contract,
+            subdir,
+            logger,
+            contract=run.schedule_contract,
+            overlay_env=run.overlay_env,
+            env=run.env,
+            dag_contract_path=run.dag_contract_path,
+            # A bundle does not say whether stage 1 used an overlay.
+            warn_no_env=_is_tgz_input(run.source) or _declares_overlays(run.source),
+        )
+    if key == "spark":
+        # The original input: the contract as generate iac and apply load it.
+        return _emit_spark(run.source, subdir, logger, overlay_env=run.overlay_env)
+    if key == "pyspark-schema":
+        # The original input too: the contract as `generate pyspark-schema` loads it.
+        return _emit_pyspark_schema(run.source, subdir, logger, overlay_env=run.overlay_env)
+    if key == "custom-scaffold":
+        return _emit_custom_scaffold(run, subdir, logger)
+    emit: Any = _DISPATCH[key][1]
+    files: List[Path] = emit(run.resolved_contract, subdir, logger)
+    return files
 
 
 def project_relative_path(path: Path) -> Optional[str]:
@@ -1190,18 +1249,7 @@ def run_fanout(
     except fluid_apply.ScheduleRenderError as exc:
         raise FanoutError(str(exc), key="schedule") from exc
 
-    # Clean slate — blow away pre-existing outputs so stale files don't
-    # survive into the MANIFEST. The caller owns out_dir; we only remove
-    # subdirs we generate into.
-    for sub in ("odps", "odps-bitol", "odcs", "opds", "schedule", "policy"):
-        target = out_dir / sub
-        if target.exists():
-            shutil.rmtree(target)
-    _clear_spark(out_dir / "spark")
-    _clear_pyspark_schema(out_dir / "pyspark-schema")
-    from fluid_build.forge.core import custom_scaffold_artifacts
-
-    custom_scaffold_artifacts.clear(out_dir)
+    _clear_outputs(out_dir)
 
     dag_contract_path = contract_path
     if dag_contract_path is None:
@@ -1240,47 +1288,21 @@ def run_fanout(
             emits = [k for k in emits if k != "schedule"]
 
         out_dir.mkdir(parents=True, exist_ok=True)
+        run = _Inputs(
+            source=bundle_or_contract,
+            resolved_contract=resolved_contract,
+            overlay_env=overlay_env,
+            env=env,
+            dag_contract_path=dag_contract_path,
+            schedule_contract=schedule_contract,
+            # Named in --emit: a missing optional engine is an error, not a skip.
+            explicit=bool(emit_raw and emit_raw.strip()),
+            source_path=source_path,
+            contract_path=contract_path,
+        )
         written: List[Path] = []
         for key in emits:
-            subdir_name, fn = _DISPATCH[key]
-            subdir = out_dir / subdir_name
-            if key == "schedule":
-                files = _emit_schedule(
-                    resolved_contract,
-                    subdir,
-                    logger,
-                    contract=schedule_contract,
-                    overlay_env=overlay_env,
-                    env=env,
-                    dag_contract_path=dag_contract_path,
-                    # A bundle does not say whether stage 1 used an overlay.
-                    warn_no_env=_is_tgz_input(bundle_or_contract)
-                    or _declares_overlays(bundle_or_contract),
-                )
-            elif key == "spark":
-                # The original input: the contract as generate iac and apply load it.
-                files = _emit_spark(bundle_or_contract, subdir, logger, overlay_env=overlay_env)
-            elif key == "pyspark-schema":
-                # The original input too: the contract as `generate pyspark-schema` loads it.
-                files = _emit_pyspark_schema(
-                    bundle_or_contract, subdir, logger, overlay_env=overlay_env
-                )
-            elif key == "custom-scaffold":
-                anchor, anchor_note = _scaffold_contract_dir(
-                    bundle_or_contract, source_path, contract_path
-                )
-                files = _emit_custom_scaffold(
-                    resolved_contract,
-                    subdir,
-                    logger,
-                    # Named in --emit: a missing engine is an error, not a skip.
-                    required=bool(emit_raw and emit_raw.strip()),
-                    contract_dir=anchor,
-                    contract_dir_note=anchor_note,
-                )
-            else:
-                files = fn(resolved_contract, subdir, logger)
-            written.extend(files)
+            written.extend(_emit_key(key, out_dir / _DISPATCH[key][0], run, logger))
 
     # Build MANIFEST across all emitted files (bytes from disk — matches
     # the bundle's hash-what-you-wrote model).
