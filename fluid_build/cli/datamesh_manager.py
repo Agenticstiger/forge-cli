@@ -222,6 +222,11 @@ def add_parser(subparsers):
         help="contract file, glob pattern or folder whose products to promote",
     )
     pm.add_argument(
+        "-o",
+        "--overlay",
+        help="Environment overlay the contracts are read with (as 'fluid verify --env' reads them)",
+    )
+    pm.add_argument(
         "--id",
         dest="product_ids",
         action="append",

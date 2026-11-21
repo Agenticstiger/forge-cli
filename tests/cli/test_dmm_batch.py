@@ -255,9 +255,14 @@ class TestContractPaths:
         again = str(tmp_path / "." / "a.fluid.yaml")
         assert resolve_contract_paths([str(a), again, str(a)]) == [str(a)]
 
-    def test_a_path_that_does_not_exist_is_the_not_found_error(self, tmp_path):
+    def test_a_path_that_does_not_exist_is_left_to_the_loader_as_it_always_was(self, tmp_path):
+        missing = str(tmp_path / "missing.fluid.yaml")
+        assert resolve_contract_paths([missing]) == [missing]
+        assert not needs_expansion([missing])
+
+    def test_a_glob_that_matches_nothing_is_the_not_found_error(self, tmp_path):
         with pytest.raises(CLIError) as exc:
-            resolve_contract_paths([str(tmp_path / "missing.fluid.yaml")])
+            resolve_contract_paths([str(tmp_path / "nothing*.fluid.yaml")])
         assert exc.value.event == "contract_file_not_found"
 
     def test_a_folder_with_no_contract_is_the_batch_error_that_names_it(self, tmp_path):
@@ -638,6 +643,19 @@ class TestSingleAndParser:
         with pytest.raises(CLIError) as exc:
             _run(["publish", str(tmp_path / "empty")], FakeProvider(), capsys)
         assert exc.value.event == "dmm_batch_no_contracts"
+
+    def test_a_file_that_does_not_exist_is_one_error_line_as_before(self, tmp_path, capsys):
+        code, _ = _run(["publish", str(tmp_path / "missing.fluid.yaml")], FakeProvider(), capsys)
+        assert code == 1
+
+    def test_in_a_batch_a_file_that_does_not_exist_fails_alone(self, tmp_path, capsys):
+        good = _write(tmp_path, "good")
+        provider = FakeProvider()
+        code, out = _run(
+            ["publish", str(good), str(tmp_path / "missing.fluid.yaml")], provider, capsys
+        )
+        assert code == 1 and provider.order == ["good"]
+        assert "missing.fluid.yaml" in out and "FAILED" in out
 
     def test_a_retired_product_on_a_single_publish_is_an_error_that_says_why(
         self, tmp_path, capsys

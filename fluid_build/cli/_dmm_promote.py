@@ -233,7 +233,7 @@ def _product_ids(args: Any, log: logging.Logger) -> Dict[str, Optional[int]]:
     contracts = list(getattr(args, "contract", None) or [])
     if contracts:
         for label in resolve_contract_paths(contracts):
-            contract = dmm.load_contract_with_overlay(label, None, log)
+            contract = dmm.load_contract_with_overlay(label, getattr(args, "overlay", None), log)
             raw_id = contract.get("id")
             product_id = dmm_product_id(raw_id) if isinstance(raw_id, str) else ""
             if not product_id:

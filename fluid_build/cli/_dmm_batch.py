@@ -195,22 +195,23 @@ def resolve_contract_paths(items: Sequence[str]) -> List[str]:
     """The contract files the arguments name, each once (by resolved path), in the order met.
 
     A file named outright is used as given (a ``.tgz`` bundle is a valid contract argument,
-    as it is for the single publish); a folder or a glob pattern goes through the shared
-    expansion (``cli/_contract_paths.py``), which searches a folder for ``*.fluid.yaml`` at
-    any depth and validates every path it returns. A path that is neither (a file that does
-    not exist) is that expansion's ``contract_file_not_found`` error.
+    as it is for the single publish), and so is a path that does not exist: the loader says so
+    when it reads it, as it always has, and in a batch that file fails alone. A folder or a
+    glob pattern goes through the shared expansion (``cli/_contract_paths.py``), which searches
+    a folder for ``*.fluid.yaml`` at any depth and validates every path it returns; a glob that
+    matches nothing is its ``contract_file_not_found`` error.
     """
     from fluid_build.cli._contract_paths import contract_paths
 
     seen: Dict[Path, str] = {}
     for item in items:
-        if Path(item).is_file():
-            found = [item]
-        else:
+        if needs_expansion([item]):
             found = [
                 str(path)
                 for _label, path in contract_paths([item], empty_event="dmm_batch_no_contracts")
             ]
+        else:
+            found = [item]
         for path in found:
             try:
                 key = Path(path).resolve()

@@ -13,6 +13,7 @@ import argparse
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 from unittest.mock import patch
@@ -236,10 +237,27 @@ class TestLoadVerdicts:
         assert load_verdicts([str(other)])["silver.orders"].passed is False
 
     def test_a_timestamp_without_an_offset_is_read_as_utc(self, tmp_path):
-        # 10:00 UTC is later than 09:30 UTC whatever this machine's time zone is.
-        _put(tmp_path, "old.json", _report(error=1, match=1, timestamp="2026-11-20T09:30:00+00:00"))
-        _put(tmp_path, "new.json", _report(timestamp="2026-11-20T10:00:00"))
-        assert load_verdicts([str(tmp_path)])["silver.orders"].passed is True
+        # In Tokyo, 10:00 local is 01:00 UTC: read as local time the naive report would be
+        # the older one. Read as UTC it is later than 09:30 UTC, in any time zone.
+        if not hasattr(time, "tzset"):
+            pytest.skip("needs time.tzset")
+        before = os.environ.get("TZ")
+        os.environ["TZ"] = "Asia/Tokyo"
+        time.tzset()
+        try:
+            _put(
+                tmp_path,
+                "old.json",
+                _report(error=1, match=1, timestamp="2026-11-20T09:30:00+00:00"),
+            )
+            _put(tmp_path, "new.json", _report(timestamp="2026-11-20T10:00:00"))
+            assert load_verdicts([str(tmp_path)])["silver.orders"].passed is True
+        finally:
+            if before is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = before
+            time.tzset()
 
     def test_without_a_timestamp_the_file_time_decides(self, tmp_path):
         old = _put(tmp_path, "old.json", _report(mismatch=1, match=1, timestamp=None))
@@ -455,6 +473,26 @@ class TestPromoteCommand:
         with pytest.raises(CLIError) as exc:
             _run(["promote", str(path)], FakeProvider(), capsys)
         assert exc.value.event == "dmm_promote_contract_without_id"
+
+    def test_a_contract_is_read_with_the_overlay_given(self, tmp_path, capsys):
+        # --overlay reaches the loader, as it does for publish (and `fluid verify --env`).
+        import fluid_build.cli.datamesh_manager as dmm
+
+        _contract(tmp_path, "silver.orders")
+        seen = []
+        real_load = dmm.load_contract_with_overlay
+
+        def loader(path, env, log):
+            seen.append(env)
+            return real_load(path, env, log)
+
+        with patch.object(dmm, "load_contract_with_overlay", side_effect=loader):
+            code, _ = _run(
+                ["promote", str(tmp_path / "silver.orders.fluid.yaml"), "-o", "prod"],
+                FakeProvider(),
+                capsys,
+            )
+        assert code == 0 and seen == ["prod"]
 
     def test_the_parser_reads_ids_and_reports(self):
         parser = argparse.ArgumentParser()
