@@ -27,9 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the product list and says what the real run would skip or keep. `--format json` prints one
   report. `promote` moves draft products to active, named by contract or with `--id`;
   `--verify-report` (a `fluid verify --out` file, or a folder of them) promotes only the products
-  whose newest report is clean (no error or mismatch, at least one port checked, no drift in the
-  reconcile, state-drift or lineage sections, and no failed state refresh) and exits 1 for the
-  rest. A publish without `--status` behaves as before. One change on the single-publish path: a
+  whose newest report is clean (no error or mismatch, no port left unverified under
+  `--require-every-port`, at least one port checked, every output port the contract declares
+  covered, and no drift or failed refresh in the reconcile, state-drift or lineage sections) and
+  exits 1 for the rest. A publish without `--status` behaves as before. One change on the single-publish path: a
   contract the loader cannot read now shows the CLI's typed error (code, next steps) instead of
   `Error: <event>`, with that error's own exit code.
 
