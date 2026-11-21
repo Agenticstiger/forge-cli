@@ -434,6 +434,24 @@ profile = [
   "flux-stats[yaml]>=0.9,<1",
 ]
 
+# ``fluid profile`` releasing a table under differential privacy: the choice of
+# which clique marginals the release measures. OpenDP (MIT) runs AIM, the
+# adaptive and iterative mechanism, and mbi (Apache-2.0, Private-PGM) builds the
+# junction tree over the chosen cliques. They bring JAX, Polars, PyArrow and
+# scikit-learn with them, so this stays out of ``[dev]`` and ``[all]``. Both are
+# pinned exactly: ``opendp[mbi]==0.16.0`` and ``mbi==1.1.0`` (the pin OpenDP's own
+# ``mbi`` extra names), because a selection run on other versions could choose
+# otherwise and the release record names the versions.
+# fluid_build/profiler/dp/selection.py imports them only when a selection runs,
+# so ``fluid --help`` and a profile without the flag never load them; it repeats
+# the pins in its install message, and tests/profiler/dp/test_selection.py keeps
+# the two equal.
+privacy = [
+  "data-product-forge[profile]",
+  "opendp[mbi]==0.16.0",
+  "mbi==1.1.0",
+]
+
 # AI + MCP together: restores the pre-0.28.0 base behaviour (the
 # ``fastapi[standard]`` precedent).
 standard = [

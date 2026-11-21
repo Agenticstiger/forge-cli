@@ -13,6 +13,8 @@ live here, each as its own module:
   exactly, and writes them as decimal text that still agrees.
 * :mod:`~fluid_build.profiler.dp.bounding` reads the privacy unit from the contract and
   bounds what one unit contributes to a release.
+* :mod:`~fluid_build.profiler.dp.selection` chooses the clique marginals a release
+  measures, with OpenDP's AIM, from the optional ``[privacy]`` extra.
 
 Nothing here reads a record, and nothing here imports a heavy package at module
 scope.

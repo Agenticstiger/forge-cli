@@ -31,6 +31,7 @@ NOT_IN_ALL = {
     "opds": "back-compat alias of [odps]",
     "standard": "alias group, covered through [litellm] and [mcp]",
     "ai": "alias of [litellm]",
+    "privacy": "opt-in release under differential privacy; brings JAX and exact pins",
     "test-emulators": "CI-only emulators",
     "test-emulators-heavy": "CI-only emulators",
 }
