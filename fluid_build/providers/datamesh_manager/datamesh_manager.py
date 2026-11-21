@@ -442,8 +442,9 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                 break
         return products
 
-    def _held_product_ids(self) -> Optional[set]:
-        """The product ids Entropy holds, or ``None`` when they cannot be read."""
+    def held_products(self) -> Optional[Dict[str, Optional[str]]]:
+        """``{product id: status}`` for every product Entropy holds, or ``None`` when the list
+        cannot be read. One paged read; the status is ``None`` where the list carries none."""
         try:
             products = self.list_products()
         except Exception as exc:  # noqa: BLE001 — only informs how upstream ids are spelled
@@ -451,7 +452,14 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             return None
         if not isinstance(products, list):
             return None
-        return {str(p.get("id")) for p in products if isinstance(p, dict) and p.get("id")}
+        return {
+            str(p["id"]): product_status(p) for p in products if isinstance(p, dict) and p.get("id")
+        }
+
+    def _held_product_ids(self) -> Optional[set]:
+        """The product ids Entropy holds, or ``None`` when they cannot be read."""
+        held = self.held_products()
+        return None if held is None else set(held)
 
     def list_teams(self) -> List[Dict[str, Any]]:
         """GET all teams."""
@@ -740,7 +748,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
 
         # What the product named before this publish: the contracts it no longer names
         # are retired below, and (with a managed status) its status decides what is sent.
-        existing_product = self._existing_product(product_id)
+        existing_product = self._existing_product(product_id, must_read=status is not None)
         status_kept: Optional[str] = None
         if status is not None:
             current = product_status(existing_product)

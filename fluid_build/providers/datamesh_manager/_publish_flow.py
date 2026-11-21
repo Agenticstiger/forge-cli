@@ -735,9 +735,23 @@ class _PublishFlowMixin:
         found, body = self._read_json_or_none(f"/api/datacontracts/{quote(contract_id, safe='')}")
         return is_live_contract(found, body)
 
-    def _existing_product(self, product_id: str) -> Optional[Dict[str, Any]]:
-        """The product as Entropy holds it before this publish, or ``None``."""
+    def _existing_product(
+        self, product_id: str, *, must_read: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """The product as Entropy holds it before this publish, or ``None``.
+
+        ``None`` is "absent", and also "could not read". A publish that decides by what the
+        product holds (a managed ``--status``) passes ``must_read``: an unreadable product is
+        then an error, because treating it as absent would send a status over an active
+        product or over a retired one.
+        """
         found, body = self._read_json_or_none(f"/api/dataproducts/{quote(product_id, safe='')}")
+        if found is None and must_read:
+            raise ProviderError(
+                f"Could not read data product {product_id!r} from Entropy Data, so what it "
+                "holds is unknown and nothing was sent for it. See the warning above for the "
+                "cause, then run the same command again."
+            )
         return body if found and isinstance(body, dict) else None
 
     def _retire_stale_contracts(

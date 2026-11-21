@@ -11,7 +11,7 @@ to a small in-memory stand-in for Entropy's product endpoints.
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 from unittest.mock import MagicMock, patch
 from urllib.parse import unquote
 
@@ -58,18 +58,31 @@ def _contract(product_id: str = "silver.orders", upstream: Optional[str] = None)
 class FakeEntropy:
     """The product endpoints Entropy serves, in memory: list, get, put."""
 
-    def __init__(self, products: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+    def __init__(
+        self,
+        products: Optional[Dict[str, Dict[str, Any]]] = None,
+        unreadable: Iterable[str] = (),
+        list_fails: bool = False,
+    ) -> None:
         self.products = copy.deepcopy(products or {})
+        self.unreadable = set(unreadable)  # GET of these answers 500
+        self.list_fails = list_fails
         self.calls: List[tuple] = []
 
     def request(self, method: str, path: str, *, json_body: Any = None) -> MagicMock:
         self.calls.append((method, path, copy.deepcopy(json_body)))
         resp = MagicMock(status_code=200)
         if method == "GET" and path.startswith("/api/dataproducts?p="):
-            resp.json.return_value = [{"id": pid} for pid in self.products]
+            if self.list_fails:
+                raise ProviderError(f"Entropy Data API error 500 on GET {path}: boom")
+            resp.json.return_value = [
+                {"id": pid, "status": body.get("status")} for pid, body in self.products.items()
+            ]
         elif path.startswith("/api/dataproducts/"):
             pid = unquote(path.split("/api/dataproducts/", 1)[1])
             if method == "GET":
+                if pid in self.unreadable:
+                    raise ProviderError(f"Entropy Data API error 500 on GET {path}: boom")
                 if pid not in self.products:
                     raise ProviderError(f"Entropy Data API error 404 on GET {path}: not found")
                 resp.json.return_value = copy.deepcopy(self.products[pid])
@@ -125,12 +138,18 @@ class TestStatusHelpers:
         assert odps == {"status": "active"}
         assert dps == {"info": {"status": "active"}}
 
-    def test_draft_never_demotes(self):
-        assert status_to_send("draft", "active") == "active"
-        assert status_to_send("draft", "deprecated") == "deprecated"
+    def test_a_status_only_moves_forward(self):
+        assert status_to_send("draft", "active") == "active"  # never demotes
         assert status_to_send("draft", None) == "draft"
         assert status_to_send("draft", "draft") == "draft"
-        assert status_to_send("active", "draft") == "active"
+        assert status_to_send("active", "draft") == "active"  # promotes
+        assert status_to_send("active", "active") == "active"
+        assert status_to_send("active", None) == "active"
+
+    def test_a_deprecated_product_keeps_its_status_whatever_is_asked(self):
+        # Forge does not revive it, as promote does not either.
+        assert status_to_send("draft", "deprecated") == "deprecated"
+        assert status_to_send("active", "deprecated") == "deprecated"
 
     def test_only_a_draft_is_promoted(self):
         assert promotion_blocker("draft") is None
@@ -210,6 +229,90 @@ class TestPublishWithStatus:
         entropy = FakeEntropy({"Acme.Orders": {"id": "Acme.Orders"}})
         _publish(entropy, _contract(upstream="Acme.Orders"))
         assert len(entropy.lists()) == 1
+
+
+class TestPublishNeverGuessesWhatItCannotRead:
+    def test_an_unreadable_product_is_an_error_when_a_status_is_asked_for(self):
+        # Treated as absent, a draft publish would demote an active product and overwrite a
+        # retired one: the rules would fail open on a 500 or a timeout.
+        for held in ("active", "retired"):
+            entropy = FakeEntropy(
+                {"silver.orders": {"id": "silver.orders", "status": held}},
+                unreadable={"silver.orders"},
+            )
+            with pytest.raises(ProviderError, match="Could not read data product"):
+                _publish(entropy, _contract(), status="draft")
+            assert entropy.puts() == []
+            _publish.ensure_team.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_without_a_status_an_unreadable_product_is_published_as_before(self):
+        entropy = FakeEntropy(
+            {"silver.orders": {"id": "silver.orders", "status": "active"}},
+            unreadable={"silver.orders"},
+        )
+        result = _publish(entropy, _contract())
+        assert result["success"] is True
+        assert len(entropy.puts()) == 1
+
+    def test_a_deprecated_product_keeps_its_status_whatever_is_asked(self):
+        for asked in ("draft", "active"):
+            entropy = FakeEntropy(
+                {"silver.orders": {"id": "silver.orders", "status": "deprecated"}}
+            )
+            result = _publish(entropy, _contract(), status=asked)
+            assert entropy.products["silver.orders"]["status"] == "deprecated"
+            assert result["status"] == result["status_kept"] == "deprecated"
+
+
+class TestKnownProductIds:
+    """A caller that already read the product list hands it to the publish."""
+
+    @staticmethod
+    def _access_puts(entropy: FakeEntropy) -> List[str]:
+        return [c[1] for c in entropy.calls if c[0] == "PUT" and c[1].startswith("/api/access/")]
+
+    def test_an_upstream_in_the_list_gets_its_access_agreement_with_no_further_read(self):
+        entropy = FakeEntropy()
+        result = _publish(entropy, _contract(upstream="up.stream"), held_product_ids={"up.stream"})
+        assert entropy.lists() == []
+        assert len(self._access_puts(entropy)) == 1
+        assert result["access_agreements"][0]["success"] is True
+
+    def test_an_upstream_missing_from_a_non_empty_list_is_skipped_with_its_reason(self):
+        entropy = FakeEntropy()
+        result = _publish(entropy, _contract(upstream="up.stream"), held_product_ids={"other"})
+        assert self._access_puts(entropy) == []
+        (agreement,) = result["access_agreements"]
+        assert agreement["skipped"] is True
+        assert agreement["reason"] == "missing_upstream_product"
+
+    def test_a_caller_that_passes_nothing_still_lists_once_for_the_pre_flight(self):
+        entropy = FakeEntropy({"up.stream": {"id": "up.stream"}})
+        result = _publish(entropy, _contract(upstream="up.stream"))
+        assert len(entropy.lists()) == 1
+        assert result["access_agreements"][0]["success"] is True
+
+    def test_held_products_is_one_read_with_each_status(self):
+        entropy = FakeEntropy(
+            {
+                "a": {"id": "a", "status": "active"},
+                "b": {"id": "b", "status": "draft"},
+                "c": {"id": "c"},
+            }
+        )
+        provider = DataMeshManagerProvider(api_key="k", api_url=API)
+        with patch.object(DataMeshManagerProvider, "_request", side_effect=entropy.request):
+            held = provider.held_products()
+        assert held == {"a": "active", "b": "draft", "c": None}
+        assert len(entropy.lists()) == 1
+
+    def test_held_products_says_none_when_the_list_cannot_be_read(self):
+        provider = DataMeshManagerProvider(api_key="k", api_url=API)
+        with patch.object(
+            DataMeshManagerProvider, "_request", side_effect=FakeEntropy(list_fails=True).request
+        ):
+            assert provider.held_products() is None
+            assert provider._held_product_ids() is None
 
 
 # ── promote_product ───────────────────────────────────────────────────────

@@ -24,9 +24,7 @@ CONTRACT_SUFFIXES = (".fluid.yaml", ".fluid.yml", ".fluid.json")
 _GLOB_CHARS = frozenset("*?[")
 
 
-def contract_paths(
-    items: Sequence[str], *, empty_event: str = "contract_folder_empty"
-) -> List[Tuple[str, Path]]:
+def contract_paths(items: Sequence[str], *, empty_event: str) -> List[Tuple[str, Path]]:
     """``(label, path)`` per contract: each item a file, a glob pattern (expanded as ``fluid
     publish`` expands one, ``**`` a single level) or a folder searched for
     :data:`CONTRACT_SUFFIXES` at any depth, in that order, each file once. A folder or

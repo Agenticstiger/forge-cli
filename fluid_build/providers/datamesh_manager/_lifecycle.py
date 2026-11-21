@@ -4,8 +4,10 @@
 """Lifecycle status of a Data Mesh Manager data product: draft, active, retired.
 
 A product may be published as ``draft`` and promoted to ``active`` later, for example once
-``fluid verify`` passes. ``retired`` is one way: Entropy keeps a retired product retired, so
-forge never sends it a status or a new definition, and never sets ``retired`` itself.
+``fluid verify`` passes. Forge moves a product forward only (draft to active): it never
+demotes an active product, never revives a deprecated one, and never sets ``retired`` itself.
+``retired`` is one way: Entropy keeps a retired product retired, so forge sends it no status
+and no new definition.
 
 The status values are Entropy's and the Open Data Product Standard's own vocabulary
 (``proposed`` / ``draft`` / ``active`` / ``deprecated`` / ``retired``); the standard defines
@@ -84,11 +86,14 @@ def set_product_status(body: Dict[str, Any], status: str) -> None:
 def status_to_send(requested: str, current: Optional[str]) -> str:
     """The status a publish sends for ``requested``, given what Entropy holds now.
 
-    ``draft`` never demotes: a product Entropy holds as active (or deprecated) keeps that
-    status, so re-running a migration batch does not pull a live product back to draft.
+    Forward only: ``draft`` never demotes a product Entropy holds as active, so re-running a
+    migration batch does not pull a live product back to draft; a deprecated product keeps
+    its status whatever is asked, as forge does not revive it (``promote`` refuses it too).
     """
-    if requested == DRAFT and current in (ACTIVE, DEPRECATED):
-        return current
+    if current == DEPRECATED:
+        return DEPRECATED
+    if requested == DRAFT and current == ACTIVE:
+        return ACTIVE
     return requested
 
 
