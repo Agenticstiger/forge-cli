@@ -1,0 +1,525 @@
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
+
+"""Static reading of Python source: the files, the parse and the folding of values.
+
+The importers for Airflow DAGs and PySpark jobs read a project's code and must never run it.
+These tests pin that, and what a value read from the syntax is (or is not).
+"""
+
+from __future__ import annotations
+
+import ast
+import os
+import sys
+import time
+import warnings
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import pytest
+
+from fluid_build.cli.import_workflow import _pysource as P
+from fluid_build.cli.import_workflow._fold import (
+    ABSENT,
+    FoldedDict,
+    Folder,
+    ModuleIndex,
+    Unresolved,
+    lookup,
+)
+
+
+def _write(root: Path, files: Dict[str, str]) -> None:
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+
+# ── finding files ─────────────────────────────────────────────────────
+
+
+def test_find_python_files_is_sorted_and_leaves_out_what_is_not_the_project(tmp_path):
+    _write(
+        tmp_path,
+        {
+            "b.py": "",
+            "a/z.py": "",
+            "a/y.py": "",
+            "a/notes.txt": "",
+            "tests/test_a.py": "",
+            "test/test_b.py": "",
+            ".hidden/h.py": "",
+            "venv/lib/v.py": "",
+            "node_modules/m.py": "",
+            "build/out.py": "",
+            "pkg/__pycache__/c.py": "",
+        },
+    )
+    walk = P.find_python_files(tmp_path)
+    assert [f.rel for f in walk.files] == ["a/y.py", "a/z.py", "b.py"]
+    assert walk.notes == []
+
+
+def test_find_python_files_honours_ignore_patterns(tmp_path):
+    _write(tmp_path, {"jobs/a.py": "", "jobs/legacy/old.py": "", "scratch_x.py": ""})
+    walk = P.find_python_files(tmp_path, ignore=["jobs/legacy", "scratch_*"])
+    assert [f.rel for f in walk.files] == ["jobs/a.py"]
+
+
+def test_find_python_files_never_follows_a_symlink(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text("x = 1\n", encoding="utf-8")
+    root = tmp_path / "root"
+    _write(root, {"a.py": ""})
+    os.symlink(outside, root / "linked_dir")
+    os.symlink(outside / "secret.py", root / "linked_file.py")
+    walk = P.find_python_files(root)
+    assert [f.rel for f in walk.files] == ["a.py"]
+    assert walk.notes == ["2 symbolic link(s) not followed"]
+
+
+def test_find_python_files_is_bounded(tmp_path, monkeypatch):
+    _write(tmp_path, {f"f{i}.py": "" for i in range(6)})
+    monkeypatch.setattr(P, "MAX_FILES", 4)
+    walk = P.find_python_files(tmp_path)
+    assert len(walk.files) == 4 and "stopped at 4 Python files" in walk.notes
+    monkeypatch.setattr(P, "MAX_FILES", 5000)
+    monkeypatch.setattr(P, "MAX_ENTRIES", 3)
+    walk = P.find_python_files(tmp_path)
+    assert any("directory entries" in note for note in walk.notes)
+
+
+def test_find_python_files_is_bounded_in_depth(tmp_path, monkeypatch):
+    _write(tmp_path, {"a/b/c/d.py": "", "a/top.py": ""})
+    monkeypatch.setattr(P, "MAX_DEPTH", 2)
+    walk = P.find_python_files(tmp_path)
+    assert [f.rel for f in walk.files] == ["a/top.py"]
+    assert any("deeper than 2 levels" in note for note in walk.notes)
+
+
+def test_find_python_files_refuses_a_file(tmp_path):
+    (tmp_path / "x.py").write_text("", encoding="utf-8")
+    with pytest.raises(NotADirectoryError):
+        P.find_python_files(tmp_path / "x.py")
+
+
+# ── reading and parsing ───────────────────────────────────────────────
+
+
+def test_read_source_refuses_a_large_file_and_a_fifo_without_waiting(tmp_path, monkeypatch):
+    big = tmp_path / "big.py"
+    big.write_bytes(b"#" * 40)
+    monkeypatch.setattr(P, "MAX_FILE_BYTES", 10)
+    with pytest.raises(P.SourceUnreadable, match="larger than 10 bytes"):
+        P.read_source(big)
+    if hasattr(os, "mkfifo"):
+        fifo = tmp_path / "pipe.py"
+        os.mkfifo(fifo)
+        started = time.monotonic()
+        with pytest.raises(P.SourceUnreadable, match="cannot read it"):
+            P.read_source(fifo)
+        assert time.monotonic() - started < 5
+
+
+@pytest.mark.parametrize(
+    "data",
+    [b"def (:\n", b"x = 1\x00\n", b"(" * 5000 + b")" * 5000, b"\xff\xfe\x00bad"],
+    ids=["syntax", "null-byte", "deep-nesting", "bad-bytes"],
+)
+def test_parse_module_refuses_what_is_not_python_without_echoing_it(data):
+    with pytest.raises(P.SourceUnreadable) as refused:
+        P.parse_module("x.py", data)
+    assert "def (" not in str(refused.value) and "\x00" not in str(refused.value)
+
+
+def test_parse_module_is_quiet_about_escape_sequences():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        module = P.parse_module("x.py", b"x = '\\d'\n")
+    assert isinstance(module.tree, ast.Module)
+
+
+def test_a_file_is_parsed_and_never_run(tmp_path):
+    marker = tmp_path / "ran"
+    source = (
+        f"open({str(marker)!r}, 'w').write('x')\n"
+        "raise SystemExit(3)\n"
+        "import os; os.system('touch /tmp/should-never-exist-fluid-import')\n"
+    )
+    module = P.parse_module("hostile.py", source.encode("utf-8"))
+    Folder(module).fold(module.tree.body[0].value)  # type: ignore[attr-defined]
+    assert not marker.exists()
+    assert not Path("/tmp/should-never-exist-fluid-import").exists()
+
+
+@pytest.mark.parametrize(
+    "data, expected",
+    [
+        (b"from airflow import DAG\n", True),
+        (b"# AIRFLOW dag\n", True),
+        (b"import pyspark\n", False),
+        (b"airflow only\n", False),
+    ],
+)
+def test_might_contain_dag_is_the_two_word_prefilter(data, expected):
+    assert P.might_contain_dag(data) is expected
+
+
+def test_import_table_and_qualified_names():
+    module = P.parse_module(
+        "m.py",
+        (
+            b"import os\n"
+            b"import pyspark.sql.functions as F\n"
+            b"import a.b\n"
+            b"from airflow import DAG\n"
+            b"from airflow.providers.x import Op as Renamed\n"
+            b"from . import sibling\n"
+            b"from .pkg import thing\n"
+            b"from ..up import deeper\n"
+            b"from star import *\n"
+            b"def f():\n    import late\n"
+        ),
+    )
+    table = module.imports
+    assert table["os"] == "os" and table["F"] == "pyspark.sql.functions"
+    assert table["a"] == "a" and table["DAG"] == "airflow.DAG"
+    assert table["Renamed"] == "airflow.providers.x.Op"
+    assert table["sibling"] == ".sibling" and table["thing"] == ".pkg.thing"
+    assert table["deeper"] == "..up.deeper" and table["late"] == "late"
+    assert "*" not in table
+
+    def q(code: str) -> Optional[str]:
+        return P.qualified_name(ast.parse(code, mode="eval").body, table)
+
+    assert q("F.col") == "pyspark.sql.functions.col"
+    assert q("Renamed") == "airflow.providers.x.Op"
+    assert q("a.b.c") == "a.b.c"
+    assert q("spark.read") == "spark.read"
+    assert q("f(x).y") is None and q("1") is None
+
+
+def test_snippet_is_one_short_line_and_survives_deep_trees():
+    node = ast.parse("(a +\n  b)", mode="eval").body
+    assert P.snippet(node) == "a + b"
+    assert len(P.snippet(ast.parse("x" * 500, mode="eval").body)) == 80
+    deep = ast.parse("1", mode="eval").body
+    for _ in range(3000):
+        deep = ast.UnaryOp(op=ast.USub(), operand=deep)
+    assert P.snippet(deep) == "<expression>"
+
+
+# ── folding ───────────────────────────────────────────────────────────
+
+
+def _fold(source: str, name: str = "x", **variables: str) -> Any:
+    module = P.parse_module("m.py", source.encode("utf-8"))
+    folder = Folder(module, variables=variables)
+    for node in module.tree.body:
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == name:
+            return folder.fold(node.value)
+    raise AssertionError(f"no assignment to {name}")
+
+
+def _why(value: Any) -> str:
+    assert isinstance(value, Unresolved), value
+    return value.why
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        ("x = 'a'", "a"),
+        ("x = 3", 3),
+        ("x = None", None),
+        ("x = ('a' 'b')", "ab"),
+        ("x = 'a' + 'b'", "ab"),
+        ("T = 'orders'\nx = f'retail.{T}'", "retail.orders"),
+        ("T = 'orders'\nx = f'{T!s}'", "orders"),
+        ("x = '%s.%s' % ('db', 'orders')", "db.orders"),
+        ("x = '%(a)s-%(b)d' % {'a': 'z', 'b': 4}", "z-4"),
+        ("x = '100%%' % ()", "100%"),
+        ("x = '{}.{}'.format('db', 'orders')", "db.orders"),
+        ("x = '{1}{0}'.format('a', 'b')", "ba"),
+        ("x = '{t}'.format(t='orders')", "orders"),
+        ("x = '{{}}'.format()", "{}"),
+        ("x = '/'.join(['a', 'b'])", "a/b"),
+        ("import os\nx = os.path.join('s3://b', 'k', 'f')", "s3://b/k/f"),
+        ("x = ' Ab '.strip().lower()", "ab"),
+        ("x = 'a-b'.replace('-', '_')", "a_b"),
+        ("x = 's3://b/p/'.rstrip('/')", "s3://b/p"),
+        ("x = 'pre_t'.removeprefix('pre_')", "t"),
+        ("x = str(4) + 'x'", "4x"),
+    ],
+)
+def test_what_folds(source, expected):
+    assert _fold(source) == expected
+
+
+@pytest.mark.parametrize(
+    "source, why",
+    [
+        ("import sys\nx = sys.argv[1]", "command-line"),
+        ("x = unknown_name", "not defined"),
+        ("x = f'{env}_orders'", "not defined"),
+        ("x = 'a' + 1", "not text"),
+        ("x = '{:>9}'.format('a')", "format field"),
+        ("x = '{0.real}'.format(1)", "format field"),
+        ("x = '{!r}'.format('a')", "format field"),
+        ("x = '{'.format()", "format"),
+        ("x = '%s %s' % ('a',)", "do not match"),
+        ("x = '%s' % ('a', 'b')", "do not match"),
+        ("x = '%x' % 3", "percent format"),
+        ("x = '%(a)s' % ('a',)", "keyed"),
+        ("x = f'{1:>5}'", "format spec"),
+        ("x = f'{\"a\"!r}'", "format spec or conversion"),
+        ("x = open('p').read()", "call to"),
+        ("x = [1][0] + 2", "not text"),
+        ("x = 1 if c else 2", "conditional"),
+        ("x = (lambda: 1)()", "call to"),
+        ("x = b'bytes'", "not text or a number"),
+    ],
+)
+def test_what_does_not_fold(source, why):
+    assert why in _why(_fold(source))
+
+
+def test_hostile_formats_do_not_spend_memory():
+    started = time.monotonic()
+    assert "format field" in _why(_fold("x = '{:>999999999}'.format('a')"))
+    assert "percent format" in _why(_fold("x = '%999999999s' % 'a'"))
+    assert "percent format" in _why(_fold("x = '%*d' % (9, 1)"))
+    assert time.monotonic() - started < 2
+
+
+def test_a_string_over_the_cap_is_refused():
+    big = "a" * 3000
+    value = _fold(f"x = '{big}' + '{big}'")
+    assert "longer than" in _why(value)
+    assert "longer than" in _why(_fold("x = '" + "b" * 5000 + "'"))
+
+
+def test_f_string_with_an_unresolved_field_keeps_its_template():
+    value = _fold("x = f'{env}.orders_{kind}'")
+    assert isinstance(value, Unresolved)
+    assert value.text == "{env}.orders_{kind}"
+
+
+def test_names_are_read_when_assigned_once_in_their_scope():
+    source = (
+        "A = 'x'\n"
+        "B = A + '_y'\n"
+        "C = 'one'\n"
+        "C = 'two'\n"
+        "D: str = 'typed'\n"
+        "for E in ['p']:\n    pass\n"
+        "F = 'f'\nF += 'g'\n"
+        "G, H = 'g', 'h'\n"
+        "def fn():\n    pass\n"
+        "class K:\n    pass\n"
+        "import os as O\n"
+    )
+    assert _fold(source + "x = B") == "x_y"
+    assert "more than once" in _why(_fold(source + "x = C"))
+    assert _fold(source + "x = D") == "typed"
+    assert "loop variable" in _why(_fold(source + "x = E"))
+    assert "changed in place" in _why(_fold(source + "x = F"))
+    assert "unpacked" in _why(_fold(source + "x = G"))
+    assert "is a function" in _why(_fold(source + "x = fn"))
+    assert "is a class" in _why(_fold(source + "x = K"))
+
+
+def test_a_function_parameter_and_a_function_local():
+    source = (
+        "T = 'module'\n"
+        "def f(table):\n"
+        "    local = 'db.' + 'orders'\n"
+        "    y = table\n"
+        "    z = local\n"
+        "    w = T\n"
+        "    return y, z, w\n"
+    )
+    module = P.parse_module("m.py", source.encode("utf-8"))
+    folder = Folder(module)
+    fn = module.tree.body[1]
+    results = {
+        stmt.targets[0].id: folder.fold(stmt.value)  # type: ignore[attr-defined]
+        for stmt in fn.body  # type: ignore[attr-defined]
+        if isinstance(stmt, ast.Assign)
+    }
+    assert "parameter" in _why(results["y"])
+    assert results["z"] == "db.orders" and results["w"] == "module"
+
+
+def test_a_name_that_refers_to_itself_does_not_loop():
+    assert "refers to itself" in _why(_fold("a = b\nb = a\nx = a"))
+
+
+def test_class_attributes_of_a_class_in_the_same_module():
+    source = "class Cfg:\n    ORDERS = 'retail.orders'\n    MORE = ORDERS\nx = Cfg.ORDERS\ny = Cfg.MORE\n"
+    assert _fold(source) == "retail.orders"
+    assert _fold(source, "y") == "retail.orders"
+    assert "not a constant of the class" in _why(_fold(source + "z = Cfg.NOPE\n", "z"))
+    # a module-level name of the same spelling is not an attribute of the class
+    assert "not a constant of the class" in _why(
+        _fold("NOPE = 'module'\nclass Cfg:\n    A = 'a'\nz = Cfg.NOPE\n", "z")
+    )
+    assert "assigned more than once" in _why(
+        _fold("class Cfg:\n    A = 'a'\n    A = 'b'\nz = Cfg.A\n", "z")
+    )
+
+
+def test_dicts_lists_and_incomplete_containers():
+    d = _fold("x = {'a': 'b', 'n': 1}")
+    assert isinstance(d, FoldedDict) and d["a"] == "b" and d.complete
+    assert lookup(d, "a") == "b" and lookup(d, "q") is ABSENT
+
+    spread = _fold("x = {'a': 'b', **unknown}")
+    assert not spread.complete
+    assert isinstance(lookup(spread, "q"), Unresolved)  # might be in the spread
+    assert lookup(spread, "a") == "b"
+
+    merged = _fold("base = {'k': 'v'}\nx = {**base, 'o': 'p'}")
+    assert merged == {"k": "v", "o": "p"} and merged.complete
+
+    items = _fold("x = ['a', *unknown, 'b']")
+    assert list(items) == ["a", "b"] and not items.complete
+    assert _fold("x = ['a'] + ['b']") == ["a", "b"]
+    assert _fold("L = ['p', 'q']\nx = L[1]") == "q"
+    assert _fold("D = {'k': 'v'}\nx = D['k']") == "v"
+    assert "not in the dict" in _why(_fold("D = {'k': 'v'}\nx = D['z']"))
+    assert isinstance(lookup(Unresolved("w"), "k"), Unresolved)
+    assert isinstance(lookup("text", "k"), Unresolved)
+
+
+def test_a_tuple_and_a_list_differ_as_percent_operands():
+    assert _fold("x = '%s' % ('a',)") == "a"
+    assert "not text" in _why(_fold("x = '%s' % ['a']"))
+
+
+def test_the_environment_comes_from_the_operators_variables_only():
+    src_get = "import os\nx = os.environ.get('ENV', 'dev')\n"
+    src_idx = "import os\nx = os.environ['ENV']\n"
+    src_geten = "from os import getenv\nx = getenv('ENV')\n"
+    for source in (src_get, src_idx, src_geten):
+        assert "environment variable ENV" in _why(_fold(source))  # the default is not assumed
+        assert _fold(source, ENV="prod") == "prod"
+    assert "environment" in _why(_fold("import os\nx = os.environ[k]\n"))
+    assert _fold("import os\nx = f\"{os.environ['ENV']}_orders\"", ENV="prod") == "prod_orders"
+
+
+def test_a_constant_of_another_module_of_the_tree(tmp_path):
+    _write(
+        tmp_path,
+        {
+            "jobs/etl/job.py": (
+                "from config import ORDERS\n"
+                "import config as cfg\n"
+                "from .local import LOCAL\n"
+                "from . import local as loc\n"
+                "from ..shared import SHARED\n"
+                "from config import Cls\n"
+                "a = ORDERS\nb = cfg.ORDERS\nc = LOCAL\nd = loc.LOCAL\ne = SHARED\nf = Cls.NAME\n"
+            ),
+            "jobs/etl/local.py": "LOCAL = 'near'\n",
+            "jobs/shared.py": "SHARED = 'up'\n",
+            "jobs/config.py": "ORDERS = 'retail.orders'\nclass Cls:\n    NAME = 'in-class'\n",
+        },
+    )
+    walk = P.find_python_files(tmp_path / "jobs")
+    index = ModuleIndex(walk.files)
+    module = index.load(next(f for f in walk.files if f.rel == "etl/job.py"))
+    assert module is not None
+    folder = index.folder(module)
+    values = {
+        stmt.targets[0].id: folder.fold(stmt.value)  # type: ignore[attr-defined]
+        for stmt in module.tree.body
+        if isinstance(stmt, ast.Assign)
+    }
+    assert values == {
+        "a": "retail.orders",
+        "b": "retail.orders",
+        "c": "near",
+        "d": "near",
+        "e": "up",
+        "f": "in-class",
+    }
+
+
+def test_a_module_name_two_files_answer_to_is_ambiguous_unless_one_is_next_door(tmp_path):
+    _write(
+        tmp_path,
+        {
+            "a/job.py": "from config import T\nx = T\n",
+            "b/job.py": "from config import T\nx = T\n",
+            "a/config.py": "T = 'from-a'\n",
+            "b/config.py": "T = 'from-b'\n",
+            "c/lonely.py": "from config import T\nx = T\n",
+        },
+    )
+    walk = P.find_python_files(tmp_path)
+    index = ModuleIndex(walk.files)
+    got = {}
+    for source in walk.files:
+        if source.rel.endswith("job.py") or source.rel.endswith("lonely.py"):
+            module = index.load(source)
+            assert module is not None
+            node = next(n for n in module.tree.body if isinstance(n, ast.Assign))
+            got[source.rel] = index.folder(module).fold(node.value)
+    assert got["a/job.py"] == "from-a" and got["b/job.py"] == "from-b"
+    assert "more than one scanned file answers" in _why(got["c/lonely.py"])
+
+
+def test_a_config_module_outside_the_tree_is_found_by_name(tmp_path):
+    _write(tmp_path, {"jobs/job.py": "from acme_cfg.settings import T\nx = T\n"})
+    outside = tmp_path / "libs" / "settings.py"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("T = 'outside'\n", encoding="utf-8")
+    walk = P.find_python_files(tmp_path / "jobs")
+    index = ModuleIndex(walk.files, extra={"acme_cfg.settings": outside})
+    module = index.load(walk.files[0])
+    assert module is not None
+    node = next(n for n in module.tree.body if isinstance(n, ast.Assign))
+    assert index.folder(module).fold(node.value) == "outside"
+
+
+def test_an_unreadable_module_is_unresolved_and_remembered(tmp_path):
+    _write(tmp_path, {"job.py": "from broken import T\nx = T\n", "broken.py": "def (:\n"})
+    walk = P.find_python_files(tmp_path)
+    index = ModuleIndex(walk.files)
+    module = index.load(next(f for f in walk.files if f.rel == "job.py"))
+    assert module is not None
+    node = next(n for n in module.tree.body if isinstance(n, ast.Assign))
+    assert "cannot be read" in _why(index.folder(module).fold(node.value))
+    assert "broken.py" in index.unreadable
+
+
+def test_imports_cycle_without_looping(tmp_path):
+    _write(tmp_path, {"a.py": "from b import B\nA = B\n", "b.py": "from a import A\nB = A\n"})
+    walk = P.find_python_files(tmp_path)
+    index = ModuleIndex(walk.files)
+    module = index.load(walk.files[0])
+    assert module is not None
+    node = next(n for n in module.tree.body if isinstance(n, ast.Assign))
+    assert isinstance(index.folder(module).fold(node.value), Unresolved)
+
+
+def test_deep_expressions_are_cut_not_crashed_on():
+    source = "x = " + "(" * 30 + "'a'" + " + 'b')" * 30
+    assert _fold(source) == "a" + "b" * 30
+    deep = "x = " + " + ".join(["'a'"] * 3000)
+    assert "nested too deeply" in _why(_fold(deep))
+
+
+def test_a_name_from_a_star_import_or_outside_the_files_is_unresolved():
+    assert "outside the scanned files" in _why(_fold("from somewhere import T\nx = T"))
+    assert "not defined" in _why(_fold("from star import *\nx = T"))
+
+
+def test_the_module_does_not_import_anything_the_project_names():
+    sys.modules.pop("some_project_module_that_does_not_exist", None)
+    _fold("import some_project_module_that_does_not_exist as m\nx = m.T")
+    assert "some_project_module_that_does_not_exist" not in sys.modules
