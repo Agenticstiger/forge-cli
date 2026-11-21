@@ -633,21 +633,8 @@ databricks = "fluid_build.providers.databricks:DatabricksProvider"
 # aliases, local) are reserved: an entry point claiming one is skipped before it
 # is imported. Declared by THIRD-PARTY packages only.
 
-# Sources for ``fluid import <tool> <source>`` are a discovered plugin group
-# (``cli/import_workflow/registry.py``). A third-party package ships one so that installing
-# it adds ``fluid import <name>`` with no core edit:
-#
-#     [project.entry-points."fluid_build.importers"]
-#     my-tool = "my_pkg.importer:MyToolImporter"   # an importer class or instance
-#
-# The names are read from the entry-point metadata without importing anything, and a
-# plugin is imported only when its own name is asked for (never by ``fluid --help``, a
-# listing or another tool's import). Governed by FLUID_PLUGINS_ALLOWLIST /
-# FLUID_PLUGINS_BLOCKLIST. The built-in names (meltano, airbyte, dlt, singer, dbt,
-# schema-registry, airflow, pyspark) are reserved, and two plugins that claim one name are
-# both refused. An importer that proposes contracts for a person to complete sets
-# ``guards_overwrite = True`` to get the ``--force`` guard. Declared by THIRD-PARTY
-# packages only.
+# ``fluid import <tool>`` sources are a discovered plugin group (``fluid_build.importers``), declared
+# by THIRD-PARTY packages only; ``cli/import_workflow/registry.py`` documents its shape and policy.
 
 [project.urls]
 Homepage = "https://agenticstiger.github.io/forge_docs/"
