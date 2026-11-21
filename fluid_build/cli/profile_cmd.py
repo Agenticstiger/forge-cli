@@ -134,7 +134,12 @@ parent are counted for a listed relationship the contract declares, as a
 histogram. Each listed item the profile does not answer is named in the report
 with its reason (for example a histogram over a number with no declared range,
 quantiles beside a histogram on one set of bins, a mean of a timestamp, a key
-column of a counted relationship); fact shares are not measured yet. A boolean
+column of a counted relationship). A listed fact, a rule of the contract's
+invariants, is measured on the table's records as the share of the rows it covers
+that satisfy it: two counts (the rows that do not, the rows that do) that pass the
+checks as cells do, and either withheld withholds both (format 1-2-0, the
+invariants section); a rule over an aggregate, a dependency or a related row is
+not measured, and the report says why. A boolean
 column is asked only its counts by `fluxsim init`, so it gets no level
 histogram this way.
 
@@ -860,6 +865,16 @@ def _report(
         )
     for child, name, reason in result.relationships_left_out:
         say(f"No children per parent for exposes[{child}] {name!r}: {reason}.", soft_wrap=True)
+    for fact in result.facts:
+        say(
+            (
+                f"Fact {fact.name}: its share is published, as rounded counts."
+                if fact.published
+                else f"Fact {fact.name}: withheld by the check "
+                f"({fact.code}, {_CODE_MEANING.get(str(fact.code), 'withheld')})."
+            ),
+            soft_wrap=True,
+        )
     for what, reason in result.not_measured:
         say(f"Not measured: {what}: {reason}.", soft_wrap=True)
     if not result.published:

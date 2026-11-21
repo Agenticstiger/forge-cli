@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fluid_build.policy._common import iter_exposes
-from fluid_build.profiler import defaults, disclosure, document, sources
+from fluid_build.profiler import defaults, disclosure, document, facts, sources
 from fluid_build.profiler._stats import (
     WITHHELD_ROUNDING,
     BlockRefused,
@@ -67,6 +67,7 @@ __all__ = [
     "DEFAULT_QUANTILE_LEVELS",
     "ColumnPlan",
     "ExposePlan",
+    "FactResult",
     "CHILDREN_EDGES",
     "ExposeSource",
     "ProfileError",
@@ -235,6 +236,17 @@ class RelationshipResult:
 
 
 @dataclass(frozen=True)
+class FactResult:
+    """What the profile says about one measured fact, for the summary: never a count."""
+
+    name: str
+    #: Whether the share is published (as rounded counts); else the group is withheld whole.
+    published: bool
+    #: The ``CL_CONF_STATUS`` code of the check that withheld it; ``None`` when published.
+    code: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class ProfileResult:
     document: Dict[str, Any]
     canonical: bytes
@@ -257,6 +269,8 @@ class ProfileResult:
     relationships_left_out: Tuple[Tuple[str, str, str], ...] = ()
     #: Answering a request: each listed item the profile does not hold, and why.
     not_measured: Tuple[Tuple[str, str], ...] = ()
+    #: Answering a request: each fact measured, published or withheld.
+    facts: Tuple[FactResult, ...] = ()
 
 
 def _base_type(type_name: Any) -> str:
@@ -595,6 +609,7 @@ def profile_exposes(
     With a *request* the profile measures what it lists and nothing else
     (:mod:`fluid_build.profiler.request`); its grid is the profile's.
     """
+    fact_plans: List[facts.FactPlan] = []
     if request is not None:
         from fluid_build.profiler import request as asked_for
 
@@ -617,6 +632,7 @@ def profile_exposes(
         fractional_bits = request.fractional_bits
         asked_for.check_tables(request, contract)
         asked_for.check_sources(request, [each.expose_id for each in exposes])
+        fact_plans = _plan_facts(contract, request)
     if fractional_bits is not None:
         document.check_fractional_bits(fractional_bits)
     if not exposes:
@@ -670,7 +686,10 @@ def profile_exposes(
         _dates_read(
             plan,
             sources.read_columns(
-                each.source, [column.name for column in plan.columns], table=each.table, cwd=cwd
+                each.source,
+                _read_names(plan, fact_plans),
+                table=each.table,
+                cwd=cwd,
             ),
         )
         for each, plan in zip(exposes, plans, strict=True)
@@ -718,6 +737,14 @@ def profile_exposes(
                 metric_names=frozenset(_METRICS),
             )
         )
+    fact_results: Tuple[FactResult, ...] = ()
+    invariants: List[Dict[str, Any]] = []
+    if request is not None:
+        by_table = {plan.expose_id: read for plan, read in zip(plans, reads, strict=True)}
+        invariants, fact_results, unmeasured = _fact_entries(
+            contract, fact_plans, by_table, rule, tallies[0]
+        )
+        unanswered = (*unanswered, *unmeasured)
     if producer is None:
         from fluid_build import __version__
 
@@ -728,6 +755,7 @@ def profile_exposes(
         tables=tables_doc,
         fractional_bits=fractional_bits,
         relationships=[entry for entry, _ in counted],
+        invariants=invariants,
     )
     canonical = document.canonical_bytes(built)
     backend.check_document(canonical.decode("utf-8"))
@@ -745,7 +773,129 @@ def profile_exposes(
         relationships=tuple(result for _, result in counted),
         relationships_left_out=tuple(relationships_left_out),
         not_measured=unanswered,
+        facts=fact_results,
     )
+
+
+def _plan_facts(contract: Mapping[str, Any], request: Request) -> List[facts.FactPlan]:
+    """What each requested fact needs, decided from the contract before any record is read.
+
+    A fact whose table or rule the contract does not hold refuses the profile; one that
+    cannot be measured on a table's records comes back with its reason.
+    """
+    planned: List[facts.FactPlan] = []
+    for each in request.facts:
+        try:
+            planned.append(facts.plan_fact(contract, each.name, each.table, each.rule))
+        except facts.FactRefused as exc:
+            raise _fact_refusal(exc) from None
+    return planned
+
+
+def _fact_refusal(exc: "facts.FactRefused") -> ProfileError:
+    return ProfileError(
+        "profile_request_" + exc.event.replace("-", "_"),
+        str(exc),
+        (
+            {
+                "written": "nothing",
+                "next": "write the request again with `fluxsim init` for this contract",
+            }
+            if exc.event.startswith(("fact-table", "fact-rule", "fact-name"))
+            else {
+                "written": "nothing",
+                "next": "the records and the contract disagree: fix either, then profile",
+            }
+        ),
+    )
+
+
+def _read_names(plan: ExposePlan, fact_plans: Sequence["facts.FactPlan"]) -> List[str]:
+    """The columns of a table to read: those profiled, then those only a fact's rule reads.
+
+    A column read for a fact alone is read and never profiled: reading is not publishing.
+    """
+    names = [column.name for column in plan.columns]
+    for each in fact_plans:
+        if each.table == plan.expose_id:
+            names.extend(name for name in each.columns if name not in names)
+    return names
+
+
+#: The levels of a fact's histogram: the rows that do not satisfy it, then those that do.
+_FACT_LEVELS = ["false", "true"]
+
+
+def _fact_entries(
+    contract: Mapping[str, Any],
+    fact_plans: Sequence["facts.FactPlan"],
+    reads: Mapping[str, sources.SourceColumns],
+    rule: disclosure.DisclosureRule,
+    tally: "Counter[str]",
+) -> Tuple[List[Dict[str, Any]], Tuple[FactResult, ...], List[Tuple[str, str]]]:
+    """The ``invariants`` entries of the facts measured, how each fared, and those not measured.
+
+    A fact's two counts, the covered rows that do not and do satisfy its rule, are two
+    cells of one histogram and pass the output checks as cells do: a cell of fewer than the
+    minimum or a zero where zeros are disclosive is withheld, and either cell withheld
+    withholds the whole group, since the other cell and the table's published row count would
+    give it back. Published counts are rounded as other counts are.
+    """
+    entries: List[Dict[str, Any]] = []
+    results: List[FactResult] = []
+    unmeasured: List[Tuple[str, str]] = []
+    for each in fact_plans:
+        if each.reason is not None:
+            unmeasured.append((f"fact {each.name}", each.reason))
+            continue
+        read = reads[each.table]
+        try:
+            counted = facts.count_fact(
+                contract, each, {name: read.values[name] for name in each.columns}
+            )
+        except facts.FactRefused as exc:
+            raise _fact_refusal(exc) from None
+        cells = [counted.covered - counted.satisfied, counted.satisfied]
+        verdicts = [_checked_cell(count, rule) for count in cells]
+        refused = next(
+            (each_verdict for each_verdict in verdicts if not each_verdict.published), None
+        )
+        total = counted.covered
+        group: Dict[str, Any]
+        if refused is None:
+            tally[disclosure.FREE] += 1
+            group = {
+                "group": "",
+                "status": disclosure.FREE,
+                "k": disclosure.round_count(total, rule),
+                "levelCounts": [disclosure.round_count(count, rule) for count in cells],
+            }
+            results.append(FactResult(each.name, True))
+        else:
+            tally[refused.status] += 1
+            group = {"group": "", "status": disclosure.WITHHELD}
+            results.append(FactResult(each.name, False, refused.status))
+        entries.append(
+            {
+                "name": each.name,
+                "statistics": [
+                    {
+                        "definition": "levelHistogram/1",
+                        "sampleSize": disclosure.sample_size(total, rule),
+                        "disclosure": rule.name,
+                        "levels": list(_FACT_LEVELS),
+                        "groups": [group],
+                    }
+                ],
+            }
+        )
+    return entries, tuple(results), unmeasured
+
+
+def _checked_cell(count: int, rule: disclosure.DisclosureRule) -> disclosure.Verdict:
+    """One cell of a fact's counts: its size, then the rounding."""
+    verdict = disclosure.check_count(count, rule)
+    return disclosure.check_rounding(count, rule) if verdict.published else verdict
 
 
 #: A date as a CSV, a JSON slice or a text column writes one: exactly ``YYYY-MM-DD``.

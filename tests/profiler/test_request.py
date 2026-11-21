@@ -156,7 +156,9 @@ def test_the_profile_answers_exactly_what_the_request_lists(workspace):
 def test_every_listed_item_left_out_has_its_reason(workspace):
     result = _profile(workspace, _asked(workspace))
     said = dict(result.not_measured)
-    assert "fact shares are not measured yet" in said["fact orders.quantity_not_above_units"]
+    assert "aggregate reads child rows" in said["fact orders.lines_counted"]
+    assert "row order" in said["fact orders.customer_fixes_status"]
+    assert "fact orders.quantity_not_above_units" not in said
     expected = {
         "marginalHistogram/1 of orders.units": "no declared range",
         "quantile/2 of orders.quantity": "never both on one set of bins",
@@ -233,7 +235,7 @@ def test_the_document_reads_back_and_follows_its_content(workspace):
     load_profile_text(result.canonical.decode("utf-8"))
     FakeBackend().check_document(result.canonical.decode("utf-8"))
     assert result.digest.startswith("sha256:")
-    assert "1-1-0" in result.document["_schemaURL"]  # it holds quantile/2
+    assert "1-2-0" in result.document["_schemaURL"]  # it holds invariants
 
 
 def test_the_cli_profile_answers_the_request_and_says_what_it_left_out(workspace, registry, capsys):
@@ -242,7 +244,8 @@ def test_the_cli_profile_answers_the_request_and_says_what_it_left_out(workspace
     assert rc == 0, out
     assert "The profile answers the request shop.profile-request.yml" in out
     assert "its contract digest is this contract's" in out
-    assert "Not measured: fact orders.quantity_not_above_units: fact shares are not" in out
+    assert "Fact orders.quantity_not_above_units: its share is published" in out
+    assert "Not measured: fact orders.lines_counted: an aggregate reads child rows" in out
     assert "Not measured: quantile/2 of orders.quantity:" in out
     assert (workspace / "shop.profile.json").is_file()
 

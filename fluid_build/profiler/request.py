@@ -47,7 +47,6 @@ from fluid_build.profiler._stats import (
 from fluid_build.profiler.runner import ProfileError
 
 __all__ = [
-    "FACTS_NOT_MEASURED",
     "MOST_CONTRACT_BYTES",
     "MOST_REQUEST_BYTES",
     "check_contract_file",
@@ -66,9 +65,6 @@ __all__ = [
 MOST_REQUEST_BYTES = 8 * 1024 * 1024 + 64 * 1024
 #: The most a contract file may hold for its digest, as a request's.
 MOST_CONTRACT_BYTES = 8 * 1024 * 1024 + 64 * 1024
-
-#: Why a listed fact share is not in the profile.
-FACTS_NOT_MEASURED = "fact shares are not measured yet"
 
 _NOT_MEASURED_RELATIONSHIP = (
     "children per parent is formed as a histogram on fixed bins (marginalHistogram/1) only"
@@ -359,7 +355,8 @@ def not_measured(
     *tables* are the profile's table documents, *defaults* each table's default
     block before the request's filter, *uncovered* the columns the defaults leave
     out with why, *keys* the key columns of the counted relationships, and *matched* the
-    listed relationships that name a declared one. Facts come last. Never a value.
+    listed relationships that name a declared one. A listed fact is the runner's
+    (:func:`fluid_build.profiler.runner._fact_entries`). Never a value.
     """
     found: List[Tuple[str, str]] = []
     for table in request.tables:
@@ -415,8 +412,6 @@ def not_measured(
                         _NOT_MEASURED_RELATIONSHIP,
                     )
                 )
-    for fact in request.facts:
-        found.append((f"fact {fact.name}", FACTS_NOT_MEASURED))
     return found
 
 

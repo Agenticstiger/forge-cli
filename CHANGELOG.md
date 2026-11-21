@@ -16,7 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ungrouped), the row count only when asked, and children per parent only for a listed relationship
   the contract declares. Each listed item the profile cannot answer is named in the report as
   `Not measured`, with its reason (for example a histogram over a number with no declared range, or
-  quantiles beside a histogram on one set of bins); fact shares are not measured yet. The request's
+  quantiles beside a histogram on one set of bins). A listed fact, a rule of the contract's
+  `invariants`, is measured on the table's records as the rows the rule covers that do not and do
+  satisfy it, two counts that pass the output checks as cells do (either withheld withholds both),
+  and written as an `invariants` entry, which makes the profile format 1-2-0; a column a rule reads
+  is read and never profiled, and a rule over an aggregate, a dependency or a related row is
+  reported as not measured, with why. The request's
   grid is the profile's. Refused before any record is read, each with its own event code: a request
   beside `--bundle`, `--env` or `--expose`, a stage-1 bundle archive as the contract, a request file
   that is not a regular file, is too large, is not UTF-8 or that flux-stats refuses, a contract digest

@@ -45,7 +45,23 @@ exposes:
           type: string
       invariants:
         - id: quantity_not_above_units
-          rule: quantity <= units
+          check: quantity <= units
+        - id: paid_has_amount
+          when: status = 'paid'
+          check: amount > 0
+        - id: units_follow_quantity
+          derive: units
+          expr: quantity
+        - id: lines_counted
+          derive: units
+          aggregate:
+            function: count
+            from: order_lines
+            via: order
+        - id: customer_fixes_status
+          dependency:
+            from: [customer_id]
+            to: [status]
     semantics:
       entities:
         - name: order

@@ -1,6 +1,6 @@
 "_schemaURL": "https://agenticstiger.github.io/flux/engine/spec/profile-request/1-0-0/FluxProfileRequest.json"
 "contract":
-  "digest": "sha256:b1895069dc5652fb533db859291c88135a5acb681ba447445dd88630a360d58f"
+  "digest": "sha256:fabb520518ca2c12de17bf3f3446629b6d9ab6ecc55f6c90098a71179bf13fb4"
 "encoding":
   "fractionalBits": 16
   "rounding": "floor"
@@ -155,3 +155,15 @@
   - "name": "orders.quantity_not_above_units"
     "table": "orders"
     "rule": "quantity_not_above_units"
+  - "name": "orders.paid_has_amount"
+    "table": "orders"
+    "rule": "paid_has_amount"
+  - "name": "orders.units_follow_quantity"
+    "table": "orders"
+    "rule": "units_follow_quantity"
+  - "name": "orders.lines_counted"
+    "table": "orders"
+    "rule": "lines_counted"
+  - "name": "orders.customer_fixes_status"
+    "table": "orders"
+    "rule": "customer_fixes_status"
