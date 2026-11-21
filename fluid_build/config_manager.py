@@ -253,13 +253,15 @@ def without_aliases(value: Any, origin: Optional[str] = None) -> Any:
 
 
 def load_config_file(stream: Union[str, IO[str]], origin: Optional[str]) -> Any:
-    """One config file, read as ``yaml.safe_load`` reads it, through :func:`without_aliases`.
+    """One config file, read as ``yaml.safe_load`` read it up to PyYAML 6.0.3, through
+    :func:`without_aliases`.
 
-    The file is parsed by :class:`_BudgetedLoader`, which spends the alias
-    budget on what a merge key (``<<:``) copies while the loader flattens it,
-    and the result is copied by :func:`without_aliases`, which spends the same
-    budget on what an alias copies out. Past either, a YAML error names
-    ``origin``. An empty file is ``{}``.
+    The file is parsed by :class:`_BudgetedLoader`, which copies the merge keys
+    (``<<:``) itself, as the YAML 1.1 merge type defines them and on every
+    PyYAML release, and spends the alias budget on what they copy; the result
+    is copied by :func:`without_aliases`, which spends the same budget on what
+    an alias copies out. Past either, a YAML error names ``origin``. An empty
+    file is ``{}``.
     """
     loader = _BudgetedLoader(stream, origin)
     try:  # the body of ``yaml.load``
@@ -327,26 +329,40 @@ class _AliasBudget:
             )
 
 
-class _BudgetedLoader(yaml.SafeLoader):
-    """``yaml.SafeLoader`` whose merge keys spend the file's alias budget (:class:`_AliasBudget`).
+_MERGE_TAG = "tag:yaml.org,2002:merge"
+_VALUE_TAG = "tag:yaml.org,2002:value"
 
-    SafeLoader flattens a merge key (``<<: *name``, ``<<: [*a, *b]``) by
-    copying the merged mapping's key/value pairs into the mapping that merges
-    it, after flattening that mapping's own merge keys, and before anything is
-    constructed. Nested repeated merges (``m2: {<<: [*m1, *m1, ...]}``,
-    ``m3: {<<: [*m2, ...]}``) so grow ninefold a level inside the loader, and
-    :func:`without_aliases` only sees the few keys left once the duplicates
-    collapse. Here each node the file writes is one decode, each pair a merge
-    key copies is one more, and an alias decode when the mapping it comes from
-    is one an alias in the file refers to; the budget is checked before the
-    pairs are copied.
+
+class _BudgetedLoader(yaml.SafeLoader):
+    """``yaml.SafeLoader`` that copies merge keys itself, as YAML 1.1 defines them, and whose
+    copies spend the file's alias budget (:class:`_AliasBudget`).
+
+    A merge key (``<<: *name``, ``<<: [*a, *b]``) copies the key/value pairs of
+    each mapping it names into the mapping that holds it, after flattening that
+    mapping's own merge keys and before anything is constructed. Nested
+    repeated merges (``m2: {<<: [*m1, *m1, ...]}``, ``m3: {<<: [*m2, ...]}``)
+    so grow ninefold a level inside the loader, and :func:`without_aliases`
+    only sees the few keys left once the duplicates collapse. Here each node
+    the file writes is one decode, each pair a merge key copies is one more,
+    and an alias decode when the mapping it comes from is one an alias in the
+    file refers to; the budget is checked before the pairs are copied.
+
+    The copy is made here, not by ``SafeConstructor.flatten_mapping``, because
+    PyYAML decides what a merge copies and has changed it. Up to 6.0.3 it
+    copied every pair of every merge and let the first mapping of a list win
+    (https://yaml.org/type/merge.html). 6.0.4 skips a pair whose key text is the
+    same string object as one it already copied and no longer reverses the
+    list, so a budget spent inside its copy sees none of what 6.0.3 copied, and
+    for keys longer than one character the last mapping of a list wins
+    (yaml/pyyaml#953, open). This is that copy as 6.0.3 wrote it
+    (lib/yaml/constructor.py, MIT) with the budget spent before each copy: one
+    reading of a config file, and one refusal, on every PyYAML release.
     """
 
     def __init__(self, stream: Union[str, IO[str]], origin: Optional[str]) -> None:
         super().__init__(stream)
         self.budget = _AliasBudget(origin)
         self.aliased: Set[yaml.Node] = set()  # the nodes an alias in the file refers to
-        self.merging = False  # flattening a mapping that a merge key copies
 
     def compose_node(self, parent: Optional[yaml.Node], index: Any) -> Any:
         if self.check_event(yaml.AliasEvent):
@@ -357,16 +373,51 @@ class _BudgetedLoader(yaml.SafeLoader):
         return super().compose_node(parent, index)
 
     def flatten_mapping(self, node: yaml.MappingNode) -> None:
-        # SafeConstructor.flatten_mapping (PyYAML 6.0.3, lib/yaml/constructor.py,
-        # MIT) flattens each mapping a merge key names by calling this method on
-        # it, right before it copies that mapping's pairs: that call spends them.
-        merging, self.merging = self.merging, True
-        try:
-            super().flatten_mapping(node)
-        finally:
-            self.merging = merging
-        if merging:
-            self.budget.spend(len(node.value), aliased=node in self.aliased)
+        merge: List[Tuple[yaml.Node, yaml.Node]] = []
+        index = 0
+        while index < len(node.value):
+            key_node, value_node = node.value[index]
+            if key_node.tag == _MERGE_TAG:
+                del node.value[index]
+                for source in self._merge_sources(node, value_node):
+                    self.flatten_mapping(source)
+                    self.budget.spend(len(source.value), aliased=source in self.aliased)
+                    merge.extend(source.value)
+            elif key_node.tag == _VALUE_TAG:
+                key_node.tag = "tag:yaml.org,2002:str"
+                index += 1
+            else:
+                index += 1
+        if merge:
+            node.value = merge + node.value
+
+    @staticmethod
+    def _merge_sources(node: yaml.MappingNode, value_node: yaml.Node) -> List[yaml.MappingNode]:
+        """The mappings a merge key names, in the order they are copied.
+
+        A list is copied last to first, so that a key in a mapping listed
+        earlier overrides the same key in one listed later; the mapping's own
+        keys, which come after every copy, override them all. Errors are
+        PyYAML's, word for word.
+        """
+        if isinstance(value_node, yaml.MappingNode):
+            return [value_node]
+        if isinstance(value_node, yaml.SequenceNode):
+            for subnode in value_node.value:
+                if not isinstance(subnode, yaml.MappingNode):
+                    raise yaml.constructor.ConstructorError(
+                        "while constructing a mapping",
+                        node.start_mark,
+                        "expected a mapping for merging, but found %s" % subnode.id,
+                        subnode.start_mark,
+                    )
+            return list(reversed(value_node.value))
+        raise yaml.constructor.ConstructorError(
+            "while constructing a mapping",
+            node.start_mark,
+            "expected a mapping or list of mappings for merging, but found %s" % value_node.id,
+            value_node.start_mark,
+        )
 
 
 class _Unaliasing:
