@@ -26,6 +26,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the whole table; the error says so. An Iceberg table that was skipped is checked now, so it can
   fail where Glue or Athena access is not set up. Parquet tables are unchanged.
 
+- **The ODCS exporter writes v3.2.0 on request, with the Iceberg server type.**
+  `--odcs-version 3.2.0` on `fluid odcs export`, `fluid generate standard --format odcs` and
+  `fluid datamesh-manager publish` (for the per-port contracts `--with-contract` sends). v3.1.0 stays
+  the default everywhere, and the Data Mesh Manager publish is pinned to it, because a v3.1.0
+  validator refuses `apiVersion: v3.2.0` and a server type outside its closed list. The vendored
+  schema is Bitol's v3.2.0, unchanged. An expose bound to an Iceberg table in Glue or in an
+  Iceberg REST catalog the binding names (Lakekeeper, Polaris, Unity, a plain REST catalog) is
+  written as an `iceberg` server: `catalog`, `catalogUrl` (the binding's `uri` without any user and
+  password, Glue's regional REST endpoint for a commercial region, or a `${ICEBERG_CATALOG_URL}`
+  placeholder, as the other server types fill what a binding cannot), `namespace` and `warehouse`.
+  Every other binding keeps the server it had: so does an Iceberg table that lives in a
+  warehouse's own catalog (Snowflake-managed, BigQuery) and one that names no catalog on a platform
+  with no default one. A document is held to the schema of the version it declares in
+  `apiVersion`: `fluid odcs validate`, an import, the round-trip check and the artifact validator
+  (YAML or JSON) read it. The optional vowl pass is skipped, and says so, for a version the
+  installed vowl does not read. A version the exporter does not write is the typed error
+  `odcs_version_unsupported`, which names the ones it does.
+
 - **`fluid datamesh-manager publish` takes a folder, and `fluid datamesh-manager promote` moves
   drafts to active.** `publish` accepts contract files, glob patterns and folders (a folder is
   searched for `*.fluid.yaml` at any depth, the way `fluid genie apply` already searches one; the

@@ -39,6 +39,7 @@ except ImportError:
 from typing import TYPE_CHECKING
 
 from fluid_build._contract_loader import CLIError
+from fluid_build.cli import _odcs_version
 from fluid_build.cli.bootstrap import load_contract_with_overlay
 from fluid_build.providers.base import ProviderError
 
@@ -106,6 +107,9 @@ def add_parser(subparsers):
         "--no-create-team",
         action="store_true",
         help="Don't auto-create team if missing",
+    )
+    _odcs_version.add_argument(
+        pub, help_suffix=" for the per-port contracts --with-contract publishes"
     )
     pub.add_argument(
         "--contract-format",
@@ -440,6 +444,7 @@ def _publish_kwargs(args) -> dict:
         "validation_mode": getattr(args, "validation_mode", "warn"),
         "odps_lineage_mode": getattr(args, "odps_lineage_mode", None),
         "auto_approve_access": getattr(args, "auto_approve_access", False),
+        "odcs_version": _odcs_version.requested(args),
     }
 
 
@@ -447,6 +452,9 @@ def _cmd_publish(args, logger=None):
     """Execute publish command: one contract as before, several as an upstream-first batch."""
     log = logger or logging.getLogger(__name__)
     try:
+        _odcs_version.requested(
+            args
+        )  # a version the exporter does not write fails before anything is read
         from fluid_build.cli._dmm_batch import (
             needs_expansion,
             resolve_contract_paths,

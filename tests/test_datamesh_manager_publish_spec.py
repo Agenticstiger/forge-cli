@@ -772,6 +772,9 @@ def test_publish_odcs_strict_validation_skips_put_on_invalid(monkeypatch):
     }
 
     class _FakeOdcsProvider:
+        def __init__(self, version=None):
+            self.odcs_version = version
+
         def render(self, fluid, expose_id=None):
             return {"id": f"sales-product.{expose_id}", "kind": "DataContract"}
 
@@ -817,6 +820,9 @@ def test_publish_odcs_warn_validation_still_puts(monkeypatch):
     }
 
     class _FakeOdcsProvider:
+        def __init__(self, version=None):
+            self.odcs_version = version
+
         def render(self, fluid, expose_id=None):
             return {"id": f"sales-product.{expose_id}", "kind": "DataContract"}
 

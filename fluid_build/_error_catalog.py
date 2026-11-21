@@ -61,6 +61,14 @@ def slug_for(event: str) -> str:
 # canonical troubleshooting page (``troubleshooting#err_<event>``), which is a
 # page that exists today; explicit topics point at other real doc sections.
 _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
+    # ── ODCS export ────────────────────────────────────────────────────────
+    "odcs_version_unsupported": (
+        [
+            "Pass one of the versions the message lists: --odcs-version 3.1.0 (the default) or 3.2.0",
+            "3.2.0 adds the Iceberg server type; a catalog that validates v3.1.0 only needs the default",
+        ],
+        None,
+    ),
     # ── doctor ─────────────────────────────────────────────────────────────
     "doctor_preflight_failed": (
         [

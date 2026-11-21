@@ -70,7 +70,7 @@ _BUILTINS: Tuple[Tuple[str, str, str, str, str, Tuple[str, ...], Tuple[str, ...]
         "odcs",
         "fluid_build.providers.odcs.provider",
         "OdcsProvider",
-        "Bitol Open Data Contract Standard v3.1.0",
+        "Bitol Open Data Contract Standard v3.1.0 (default) or v3.2.0",
         "https://github.com/bitol-io/open-data-contract-standard",
         ("odcs",),
         (),

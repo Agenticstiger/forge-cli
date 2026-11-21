@@ -232,6 +232,7 @@ def _nodes(node: Any) -> Iterator[Dict[str, Any]]:
 #: standards (tests/test_standard_schema_pattern_end_anchor.py tests their checks).
 _SHIPPED = sorted(_SCHEMA_DIR.glob("*.json")) + [
     _SCHEMA_DIR.parent / "providers" / "odcs" / "odcs-schema-v3.1.0.json",
+    _SCHEMA_DIR.parent / "providers" / "odcs" / "odcs-schema-v3.2.0.json",
     _SCHEMA_DIR.parent / "providers" / "odps_standard" / "schemas" / "odps-product-v1.0.0.json",
     _SCHEMA_DIR.parent / "providers" / "odps_standard" / "schemas" / "odps-product-v1.1.0.json",
     _SCHEMA_DIR.parent / "providers" / "opds" / "opds-schema-v4.1.0.json",

@@ -31,6 +31,7 @@ import os
 from collections.abc import Mapping
 from typing import Any, Dict, List
 
+from ..versions import DEFAULT_VERSION
 from .base import PASSTHROUGH_KEY, ExportCtx, ImportCtx, metadata_passthrough
 
 FLUID_EXTRAS_PROPERTY = "fluidExtras"
@@ -126,12 +127,13 @@ def to_odcs(ctx: ExportCtx) -> None:
         baseline = _reimport({k: v for k, v in ctx.odcs.items() if k != "customProperties"}, ctx)
         extras = _collect(ctx.fluid, baseline)
     if extras:
+        version = ctx.options.get("odcs_version") or DEFAULT_VERSION
         others.append(
             {
                 "property": FLUID_EXTRAS_PROPERTY,
                 "value": extras,
                 "description": (
-                    "FLUID-native contract blocks with no ODCS v3.1.0 field. "
+                    f"FLUID-native contract blocks with no ODCS {version} field. "
                     "Written by the FLUID exporter so FLUID → ODCS → FLUID is "
                     "lossless; safe for other consumers to ignore."
                 ),
