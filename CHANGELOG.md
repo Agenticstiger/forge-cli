@@ -295,6 +295,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection URL is read back, and `drivername` must be a SQLAlchemy dialect name with an
   optional `+driver`. The Kafka Connect JDBC source and Debezium refuse a host or database
   that holds URL syntax, and a port that is not a number.
+- A secret-policy refusal no longer prints a value it cannot trace to the contract. At
+  `fluid apply`, where `{{ env.NAME }}` placeholders are rendered, a refusal quotes a host only
+  when the contract wrote it as it stands, and names the placeholder of one it rendered. A
+  keyword connection string (`Server=...;Database=...`) shows its host part only.
 
 ## [0.36.0] — 2026-11-19
 

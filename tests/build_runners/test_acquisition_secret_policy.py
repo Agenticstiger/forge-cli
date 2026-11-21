@@ -28,6 +28,7 @@ from fluid_build.secrets.policy import (
     ALLOWLIST_ENV,
     AcquisitionSecretPolicyError,
     connection_host,
+    destinations_as_written,
     is_loopback,
     refuse_unless_allowed,
 )
@@ -298,16 +299,21 @@ def test_a_decoy_loopback_field_cannot_mask_a_remote_sibling() -> None:
     A contract set ``host: localhost`` beside a remote ``connection_string``
     (debezium's mongodb shape) and was exempted on the decoy, while the
     credential went to the remote one. EVERY destination has to clear.
+    Within the contract as written (the acquisition dispatcher sets it), the
+    refusal quotes the remote host by name.
     """
-    with pytest.raises(AcquisitionSecretPolicyError) as caught:
-        _resolve(
-            {
-                "host": "localhost",
-                "connection_string": "mongodb://evil.example.com/db",
-                "secretRef": f"env://{VARIABLE}",
-            }
-        )
+    connection = {
+        "host": "localhost",
+        "connection_string": "mongodb://evil.example.com/db",
+        "secretRef": f"env://{VARIABLE}",
+    }
+    with destinations_as_written(
+        {"builds": [{"properties": {"source": {"connection": connection}}}]}
+    ):
+        with pytest.raises(AcquisitionSecretPolicyError) as caught:
+            _resolve(connection)
     assert "evil.example.com" in caught.value.what, caught.value.what
+    assert "connection.connection_string" in caught.value.what
 
 
 @pytest.mark.parametrize(

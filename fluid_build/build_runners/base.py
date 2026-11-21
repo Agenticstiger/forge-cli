@@ -740,6 +740,7 @@ def _execute_acquisition_build(
     # ``cli/_common.py::resolve_contract_env_templates`` instead, which
     # leaves sensitive placeholders literal.
     unresolved_contract = contract if as_written is None else as_written
+    unresolved_build = build
     build = _resolve_env_placeholders(build)
     contract = _resolve_env_placeholders(contract)
 
@@ -757,7 +758,13 @@ def _execute_acquisition_build(
         from .kafka_connect.iceberg_sink_validation import contract_as_written
 
         scope = contract_as_written(unresolved_contract)
-    with scope:
+    # A secret-policy refusal quotes only what the contract wrote, never a value
+    # the resolution above rendered. A build passed beside a contract as written
+    # may itself be resolved already, so it is left out then.
+    from fluid_build.secrets.policy import destinations_as_written
+
+    written = (unresolved_build, unresolved_contract) if as_written is None else as_written
+    with scope, destinations_as_written(written):
         return runner_fn(
             build,
             contract,

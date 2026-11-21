@@ -72,8 +72,10 @@ from __future__ import annotations
 
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, FrozenSet, Iterator, List, Mapping, Optional, Tuple, Union
 from urllib.parse import unquote, unquote_plus, urlsplit
 
 from fluid_build._errors import doc_url
@@ -559,6 +561,9 @@ class _Target:
     database_char: Optional[str] = None
     tunnel: bool = False
     behind_tunnel: bool = False
+    #: The field's text, for a keyword connection string (``Server=...;...``):
+    #: a destination this policy cannot read, whose host part a refusal shows.
+    keyword_text: Optional[str] = None
 
     @property
     def has_reason(self) -> bool:
@@ -577,6 +582,9 @@ def _connection_targets(connection: Mapping[str, Any]) -> List[_Target]:
             continue
         raw = connection[field_name]
         if field_name != "host" and isinstance(raw, str):
+            if _is_keyword_string(raw):
+                out.append(_Target(None, field_name, keyword_text=raw))
+                continue
             out.extend(
                 _Target(None, field_name, query_key=key) for key in _uri_query_host_keys(raw)
             )
@@ -596,6 +604,16 @@ def _connection_targets(connection: Mapping[str, Any]) -> List[_Target]:
     if not _port_is_readable(connection.get("port")):
         out.append(_Target(None, "port"))
     return out
+
+
+def _is_keyword_string(text: str) -> bool:
+    """Whether ``text`` is a keyword connection string, not a URI or a host.
+
+    ``Server=h;Database=d``, ``host=h dbname=d``: no ``://``, and an ``=`` before
+    any ``/``, ``?`` or ``#``. This policy reads no host out of one, so it is a
+    destination it cannot read, whose host part alone a refusal shows.
+    """
+    return "://" not in text and "=" in re.split(r"[/?#]", text, maxsplit=1)[0]
 
 
 def _uri_query_host_keys(text: str) -> List[str]:
@@ -866,13 +884,164 @@ def _any_host_fix(parsed: SecretRef) -> str:
     return f'{ALLOWLIST_ENV}="{_suggested_entry(parsed, None)}"'
 
 
-def _destination_refusal(parsed: SecretRef, target: _Target) -> AcquisitionSecretPolicyError:
+#: The keys a keyword connection string names its host with: libpq's
+#: ``host=... dbname=...`` and ADO.NET's or ODBC's ``Server=...;Database=...``
+#: (``Data Source=tcp:host,1433``). The value runs to the next ``;`` or blank,
+#: a whole ``{{ env.NAME }}`` placeholder included.
+_KEYWORD_HOST = re.compile(
+    r"(?:^|[;\s])\s*(?:host|hostaddr|server|address|addr|network\s+address|data\s+source)"
+    r"\s*=\s*((?:\{\{[^{}]*\}\}|[^;\s])+)",
+    re.IGNORECASE,
+)
+#: What a refusal may quote as a host: a name, an address, a port, a placeholder.
+_QUOTABLE_HOST = re.compile(r"(?:\{\{\s*env\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}|[A-Za-z0-9._%:\[\]\-])+")
+
+
+def _keyword_host(text: str) -> Optional[str]:
+    """The host part of keyword connection string ``text``, or ``None`` when it names none.
+
+    Never anything else of the string: a password written beside the host stays
+    out of every message.
+    """
+    match = _KEYWORD_HOST.search(text)
+    if match is None:
+        return None
+    host = match.group(1).strip("'\"")
+    if host[:4].lower() == "tcp:":
+        host = host[4:]
+    host = host.split(",")[0]
+    return host if _QUOTABLE_HOST.fullmatch(host) else None
+
+
+#: Every string the running contract wrote, before ``fluid apply`` rendered its
+#: placeholders, while :func:`destinations_as_written` is active; else ``None``.
+_AS_WRITTEN: ContextVar[Optional[Tuple[str, ...]]] = ContextVar(
+    "fluid_secret_destinations_as_written", default=None
+)
+
+
+@contextmanager
+def destinations_as_written(written: Any) -> Iterator[None]:
+    """Within the block, a refusal at apply quotes only a host ``written`` holds as text.
+
+    ``fluid apply`` renders a contract's ``{{ env.NAME }}`` placeholders before a
+    runner asks for a secret (``build_runners/base.py``), so a host judged there
+    may be the value of any variable the contract named. The acquisition
+    dispatcher passes the contract as written: a refusal then quotes a host the
+    contract wrote as it stands, names the placeholder of one it rendered, and
+    quotes nothing it cannot trace (:func:`_shown_host`).
+    """
+    token = _AS_WRITTEN.set(tuple(_strings_in(written)))
+    try:
+        yield
+    finally:
+        _AS_WRITTEN.reset(token)
+
+
+def _strings_in(value: Any) -> Iterator[str]:
+    """Every string in ``value``, through its mappings and lists."""
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            yield item
+        elif isinstance(item, Mapping):
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
+
+
+def _host_readings(text: str) -> List[str]:
+    """Every host ``text`` names, as a host field or a URI field reads it, compared case-blind."""
+    hosts = [text.strip().lower().rstrip(".")]
+    hosts.extend(host.rstrip(".") for host in _field_hosts("uri", text) if host)
+    return hosts
+
+
+def _render(text: str) -> str:
+    """``text`` with its placeholders rendered, as ``build_runners/base.py`` renders them."""
+    return _ENV_PLACEHOLDER.sub(lambda match: os.environ.get(match.group(1), ""), text)
+
+
+def _shown_host(target: _Target, rendered: bool) -> Tuple[Optional[str], bool]:
+    """What a refusal may quote of ``target``, and whether that is placeholder text.
+
+    That is its host, or a keyword string whole (of which the refusal then shows
+    the host part alone). Outside ``fluid apply`` it is the contract's own text,
+    and is quoted. At apply, where placeholders are rendered, it is quoted only
+    when the contract wrote it as it stands (:func:`destinations_as_written`);
+    for one a placeholder rendered, the contract's text is quoted with the
+    placeholder; one traced to neither is not quoted at all.
+    """
+    quoted = target.keyword_text if target.keyword_text is not None else target.host
+    if quoted is None or not rendered:
+        return quoted, False
+    written = _AS_WRITTEN.get()
+    if written is None:
+        return None, False
+    if target.keyword_text is not None:
+        whole = quoted.strip()
+
+        def names(text: str) -> bool:
+            return text.strip() == whole
+
+    else:
+        wanted = quoted.strip().lower().rstrip(".")
+
+        def names(text: str) -> bool:
+            return wanted in _host_readings(text)
+
+    if any(not _ENV_PLACEHOLDER.search(text) and names(text) for text in written):
+        return quoted, False
+    for text in written:
+        if _ENV_PLACEHOLDER.search(text) and names(_render(text)):
+            if target.keyword_text is not None:
+                return text, True
+            return _shown_destination(f"connection.{target.field or 'host'}", text), True
+    return None, False
+
+
+def _destination_refusal(
+    parsed: SecretRef, target: _Target, *, rendered: bool = False
+) -> AcquisitionSecretPolicyError:
     label = _field_label(target)
-    where = f"host {target.host!r}" if target.host else "a host that could not be determined"
-    if label:
+    shown, placeholder = _shown_host(target, rendered)
+    keyword = target.keyword_text is not None or (target.host is not None and "=" in target.host)
+    if shown is not None and keyword:
+        shown = _keyword_host(shown)
+    if keyword:
+        where = f"a keyword string naming host {shown!r}" if shown else "a keyword string"
+    elif target.host is None:
+        where = "a host that could not be determined"
+    elif placeholder:
+        where = f"the host {shown!r} renders to"
+    elif shown is not None:
+        where = f"host {shown!r}"
+    else:
+        where = f"the host in {label}" if label else "the host this build sends it to"
+    if label and not where.endswith(label):
         where = f"{where} ({label})"
     what_sent = _what_sent(parsed)
-    entry = _suggested_entry(parsed, target.host)
+    if keyword:
+        fix = (
+            f"Write {label or 'the destination'} as a URI (scheme://host/...), whose host this "
+            "check reads and the operator can allow, or, to send the value to any host, set it "
+            f"in {_OPERATOR_ONLY}: {_any_host_fix(parsed)}."
+        )
+    elif target.host is not None and (shown is None or placeholder):
+        fix = (
+            f"If this is intended, set it in {_OPERATOR_ONLY}: "
+            f'{ALLOWLIST_ENV}="{_suggested_entry(parsed, "<host>")}" for that host only, with '
+            "<host> the host it renders to where fluid apply runs and without a port, or "
+            f"{_any_host_fix(parsed)} for any host."
+        )
+    else:
+        fix = (
+            f"If this is intended, set it in {_OPERATOR_ONLY}: "
+            f'{ALLOWLIST_ENV}="{_suggested_entry(parsed, shown)}" for that host only, or '
+            f"{_any_host_fix(parsed)} for any host. A host written with a port "
+            "never matches, so leave the port off."
+        )
     why = (
         "A contract names both the secret to read and the host it is sent to, so "
         "without an operator allowlist any secret this run can read could be sent "
@@ -889,12 +1058,7 @@ def _destination_refusal(parsed: SecretRef, target: _Target) -> AcquisitionSecre
     return AcquisitionSecretPolicyError(
         what=f"the contract would send {what_sent} to {where} as a credential",
         why=why,
-        fix=(
-            f"If this is intended, set it in {_OPERATOR_ONLY}: "
-            f'{ALLOWLIST_ENV}="{entry}" for that host only, or '
-            f"{_any_host_fix(parsed)} for any host. A host written with a port "
-            "never matches, so leave the port off."
-        ),
+        fix=fix,
         doc=doc_url("secrets"),
     )
 
@@ -960,11 +1124,15 @@ def refuse_unless_allowed(
     connection: Optional[Mapping[str, Any]] = None,
     host: Optional[str] = None,
     environ: Optional[Mapping[str, str]] = None,
+    rendered: bool = False,
 ) -> None:
     """Raise unless ``ref`` may be sent to every destination given.
 
     Called before the reference is resolved, so a refusal never reads the
-    secret. Every scheme is policed.
+    secret. Every scheme is policed. ``rendered`` says the destinations went
+    through ``fluid apply``'s placeholder rendering (``resolve_secret`` passes
+    it): a refusal then quotes only a host the contract wrote
+    (:func:`destinations_as_written`), never a value a placeholder rendered.
 
     ``connection`` is the preferred argument: EVERY destination it carries has
     to clear, so a decoy loopback field cannot mask a remote sibling. ``host``
@@ -991,7 +1159,7 @@ def refuse_unless_allowed(
             raise _database_refusal(parsed, target)
         if target.host is None and connection is not None and _host_is_blank(connection):
             raise _blank_host_refusal(parsed)
-        raise _destination_refusal(parsed, target)
+        raise _destination_refusal(parsed, target, rendered=rendered)
 
 
 # ── destinations only fluid apply can read ───────────────────────────────────
@@ -1039,8 +1207,8 @@ def _reads_as_destination(scheme: str, host: str) -> bool:
     """Whether ``scheme`` and ``host`` read as a URI scheme and a host list, placeholders aside.
 
     A keyword string (``Server={{ env.H }};Database=d``) does not: apply reads
-    it whole as one host that no allowlist entry names, so the lint judges it
-    as written too, and never quotes it in a notice.
+    no host out of it (:func:`_is_keyword_string`), so the lint judges it as
+    written too, and never quotes it in a notice.
     """
     if scheme and not _SCHEME_TEXT.fullmatch(_ENV_PLACEHOLDER.sub("x", scheme)):
         return False
