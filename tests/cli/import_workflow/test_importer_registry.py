@@ -452,3 +452,18 @@ def test_a_failed_write_is_a_typed_error_and_leaves_no_temporary_file(eps, tmp_p
         _run(tmp_path, "plain", split_by=None)
     assert refused.value.what.startswith("cannot write ") and "PermissionError" in refused.value.why
     assert list(tmp_path.iterdir()) == []
+
+
+def test_an_importer_registered_in_this_process_is_found_listed_and_accepted(eps):
+    class Mine(_Plugin):
+        name = "in-process"
+
+    mine = Mine()
+    try:
+        R.register_importer("in-process", mine)
+        assert R.get_importer("in-process") is mine
+        assert "in-process" in R.importer_names(plugins=False)
+        assert _parser().parse_args(["import", "in-process", "src"]).tool == "in-process"
+    finally:
+        R.IMPORTERS.pop("in-process", None)
+    assert R.get_importer("in-process") is None
