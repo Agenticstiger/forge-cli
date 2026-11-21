@@ -20,7 +20,7 @@ import yaml
 
 from fluid_build.cli._errors import FluidUserError, SchemaValidationError
 from fluid_build.cli.console import cprint, cprint_literal
-from fluid_build.cli.import_workflow import get_importer
+from fluid_build.cli.import_workflow import coerce_report, get_importer, importer_names
 from fluid_build.cli.import_workflow.airbyte import SERVER_URL_ENV as AIRBYTE_SERVER_URL_ENV
 
 
@@ -43,15 +43,13 @@ def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Opt
 
     importer = get_importer(tool)
     if importer is None:
+        known = importer_names()
         raise SchemaValidationError(
             what=f"unknown importer tool: {tool}",
             why=f"`{tool}` is not in the registered importer set.",
-            fix="Use one of: meltano | airbyte | dlt | singer | dbt | schema-registry.",
+            fix=f"Use one of: {' | '.join(known)}.",
             doc="https://agenticstiger.github.io/forge_docs/cli/import.html",
-            extras={
-                "tool": tool,
-                "supported": ["meltano", "airbyte", "dlt", "singer", "dbt", "schema-registry"],
-            },
+            extras={"tool": tool, "supported": known},
         )
 
     options = {"split_by": getattr(args, "split_by", None) or "project"}
@@ -74,11 +72,16 @@ def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Opt
     try:
         # Split-capable importers (dbt) expose a plural API; the rest keep the
         # single-contract Protocol shape.
-        if hasattr(importer, "import_to_contracts"):
+        if callable(getattr(importer, "import_to_contracts", None)):
             contracts, report = importer.import_to_contracts(source, options=options)
         else:
             contract, report = importer.import_to_contract(source, options=options)
             contracts = [contract] if contract else []
+        # A plugin's own shapes: the contracts are a list of mappings, and the report is
+        # any object with the report's four lists.
+        if not isinstance(contracts, list) or not all(isinstance(c, dict) for c in contracts):
+            raise TypeError("an importer returns a contract mapping, or a list of them")
+        report = coerce_report(report)
     except FluidUserError:
         # Already a typed refusal in the house shape, and its `fix` is the
         # specific one — "set --server-url or FLUID_IMPORT_AIRBYTE_URL", say.

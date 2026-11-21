@@ -1,51 +1,80 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""Foreign-config converters for ``fluid import <tool> <config>``.
+"""Foreign-config converters for ``fluid import <tool> <source>``.
 
-Six sources covered:
+Built-in sources (the names are :data:`registry.BUILTIN_IMPORTERS`):
 
-  - ``meltano <project-dir>``    — converts ``meltano.yml`` + plugins
-  - ``airbyte --workspace-id``   — converts an Airbyte workspace via REST
-  - ``dlt --pipeline-name``      — converts a dlt pipeline state directory
-  - ``singer <tap-cfg>``         — converts a single Singer tap+target pair
-  - ``dbt <project-dir>``        — converts ``target/manifest.json``
-  - ``schema-registry <subject>`` — a Confluent or Glue subject -> a consumer contract
+  - ``meltano <project-dir>``    - converts ``meltano.yml`` + plugins
+  - ``airbyte --workspace-id``   - converts an Airbyte workspace via REST
+  - ``dlt --pipeline-name``      - converts a dlt pipeline state directory
+  - ``singer <tap-cfg>``         - converts a single Singer tap+target pair
+  - ``dbt <project-dir>``        - converts ``target/manifest.json``
+  - ``schema-registry <subject>`` - a Confluent or Glue subject -> a consumer contract
+
+Packages add sources through the ``fluid_build.importers`` entry-point group (see
+:mod:`fluid_build.cli.import_workflow.registry`).
 
 Each converter returns a contract dict + a translation report describing
 what mapped 1:1, what required defaults, and what the user still needs
 to fill in.
+
+Importing this package loads the registry only; an importer's module loads when its tool is
+used, or when its class is read from here (``from fluid_build.cli.import_workflow import
+DbtManifestImporter``).
 """
 
 from __future__ import annotations
 
-from .airbyte import AirbyteImporter
-from .dbt import DbtManifestImporter
-from .dlt import DltImporter
-from .meltano import MeltanoImporter
-from .registry import IMPORTERS, Importer, ImportReport, get_importer, register_importer
-from .schema_registry import SchemaRegistryImporter
-from .singer import SingerImporter
+import importlib
+from typing import Any
+
+from .registry import (
+    BUILTIN_IMPORTERS,
+    IMPORTERS,
+    Importer,
+    ImporterChoices,
+    ImportReport,
+    coerce_report,
+    get_importer,
+    importer_names,
+    register_importer,
+)
 
 __all__ = [
     "AirbyteImporter",
+    "BUILTIN_IMPORTERS",
     "DbtManifestImporter",
     "DltImporter",
     "IMPORTERS",
     "Importer",
+    "ImporterChoices",
     "ImportReport",
     "MeltanoImporter",
     "SchemaRegistryImporter",
     "SingerImporter",
+    "coerce_report",
     "get_importer",
+    "importer_names",
     "register_importer",
 ]
 
+# Importer classes, resolved from their module on first read (PEP 562), so naming them here
+# does not import them.
+_CLASSES = {
+    "AirbyteImporter": "airbyte",
+    "DbtManifestImporter": "dbt",
+    "DltImporter": "dlt",
+    "MeltanoImporter": "meltano",
+    "SchemaRegistryImporter": "schema_registry",
+    "SingerImporter": "singer",
+}
 
-# Auto-registry.
-register_importer("meltano", MeltanoImporter())
-register_importer("airbyte", AirbyteImporter())
-register_importer("dlt", DltImporter())
-register_importer("singer", SingerImporter())
-register_importer("dbt", DbtManifestImporter())
-register_importer("schema-registry", SchemaRegistryImporter())
+
+def __getattr__(name: str) -> Any:
+    module = _CLASSES.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(f"{__name__}.{module}"), name)
+    globals()[name] = value
+    return value

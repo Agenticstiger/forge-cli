@@ -118,13 +118,21 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     )
     # Optional first positional: tool name. When present, dispatches to the
     # foreign-config importer; when absent, falls through to the legacy
-    # directory scanner.
+    # directory scanner. The names come from the importer registry: the built-ins,
+    # and the installed ``fluid_build.importers`` plugins (read by name when the
+    # value is not a built-in; nothing is scanned or loaded to build the parser).
+    from fluid_build.cli.import_workflow.registry import ImporterChoices
+
     parser.add_argument(
         "tool",
         nargs="?",
-        choices=["meltano", "airbyte", "dlt", "singer", "dbt", "schema-registry"],
+        metavar="tool",
+        choices=ImporterChoices(),
         default=None,
-        help="Foreign tool to import from (omit for a dbt/Terraform/SQL directory scan)",
+        help=(
+            "Foreign tool to import from: %(choices)s "
+            "(omit for a dbt/Terraform/SQL directory scan)"
+        ),
     )
     parser.add_argument(
         "source",
