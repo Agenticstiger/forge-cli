@@ -126,7 +126,9 @@ _TYPE_FAMILIES: Tuple[Tuple[str, ...], ...] = (
     ("boolean", "logical"),
     ("array", "list"),
     ("struct", "tuple"),
-    ("variant", "union"),
+    # `parquet_variant` is DuckDB 2.0.1's Parquet VARIANT storage layout; the emitter
+    # writes `variant` for it, so the gate must read the two as one.
+    ("variant", "union", "parquet_variant"),
 )
 
 #: The names ``duckdb_types()`` gives the logical type VARCHAR (measured on

@@ -23,6 +23,11 @@ This software includes or depends on the following open-source components:
 - Jinja2 (BSD-3-Clause) — https://jinja.palletsprojects.com/
 - HTTPX (BSD-3-Clause) — https://www.python-httpx.org/
 
+The config loader (fluid_build/config_manager.py) includes the merge-key copy of
+PyYAML 6.0.3 (lib/yaml/constructor.py, SafeConstructor.flatten_mapping), adapted.
+PyYAML is MIT licensed: Copyright (c) 2017-2021 Ingy döt Net, Copyright
+(c) 2006-2016 Kirill Simonov. The permission notice is kept with the code.
+
 OPDS export functionality references the Open Data Product Standard (ODPS)
 v4.1 schema, developed by the Open Data Product Initiative under the
 Creative Commons Attribution 4.0 International License.
