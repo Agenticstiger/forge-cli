@@ -237,6 +237,9 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         held_product_ids : Collection[str] | None
             The product ids Entropy holds, when the caller already read them (a batch reads
             the list once). ``None`` reads them here, when an upstream id needs them.
+        odcs_version : str | None
+            The ODCS version of the per-port contracts ``publish_contract`` sends
+            (``"v3.2.0"`` adds the Iceberg server type). ``None`` (default) is v3.1.0.
         """
         dry_run: bool = kw.get("dry_run", False)
         team_id: Optional[str] = kw.get("team_id")
@@ -251,6 +254,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         auto_approve_access: Optional[bool] = kw.get("auto_approve_access")
         status: Optional[str] = kw.get("status")
         held_product_ids: Optional[Collection[str]] = kw.get("held_product_ids")
+        odcs_version: Optional[str] = kw.get("odcs_version")
 
         self._require_api_key()
 
@@ -275,6 +279,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                 auto_approve_access=auto_approve_access,
                 status=status,
                 held_product_ids=held_product_ids,
+                odcs_version=odcs_version,
             )
             results.append(result)
 
@@ -608,6 +613,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         auto_approve_access: Optional[bool] = None,
         status: Optional[str] = None,
         held_product_ids: Optional[Collection[str]] = None,
+        odcs_version: Optional[str] = None,
     ) -> Dict[str, Any]:
         if status is not None and status not in PUBLISH_STATUSES:
             raise ProviderError(
@@ -750,7 +756,9 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                 result["odps_lineage_mode"] = lineage_mode
             # Also preview per-expose ODCS contracts so the caller can inspect them
             if publish_contract:
-                result["odcs_contracts"] = self._preview_odcs_per_expose(fluid, product_id)
+                result["odcs_contracts"] = self._preview_odcs_per_expose(
+                    fluid, product_id, odcs_version=odcs_version
+                )
             result["stale_contracts"] = (
                 "On publish, contracts in this product's namespace that its output ports "
                 "named before and no longer do are retired (status: retired), and an output "
@@ -798,6 +806,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                 product_id,
                 validate_generated_contracts=validate_generated_contracts,
                 validation_mode=validation_mode,
+                odcs_version=odcs_version,
             )
         sent_contract_ids = {
             str(r["contract_id"])

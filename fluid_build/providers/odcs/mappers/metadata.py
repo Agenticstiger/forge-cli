@@ -30,6 +30,8 @@ from .base import (
 )
 from .types import fluid_to_odcs_status, odcs_to_fluid_status
 
+#: The ``apiVersion`` an export writes when its options name none; the exporter's
+#: own default is ``versions.DEFAULT_VERSION``, which the provider passes in.
 ODCS_API_VERSION = "v3.1.0"
 ODCS_KIND = "DataContract"
 
@@ -116,7 +118,7 @@ def to_odcs(ctx: ExportCtx) -> None:
         )
 
     odcs["version"] = fluid.get("_scoped_version") or metadata.get("version", "1.0.0")
-    odcs["apiVersion"] = ODCS_API_VERSION
+    odcs["apiVersion"] = ctx.options.get("odcs_version") or ODCS_API_VERSION
     odcs["kind"] = ODCS_KIND
     odcs["id"] = contract_id
     odcs["status"] = fluid_to_odcs_status(resolve_status(fluid))

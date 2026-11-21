@@ -28,6 +28,13 @@ PyYAML 6.0.3 (lib/yaml/constructor.py, SafeConstructor.flatten_mapping), adapted
 PyYAML is MIT licensed: Copyright (c) 2017-2021 Ingy döt Net, Copyright
 (c) 2006-2016 Kirill Simonov. The permission notice is kept with the code.
 
+The JSON Schemas of the Bitol Open Data Contract Standard (ODCS) vendored under
+fluid_build/providers/odcs/ (odcs-schema-v3.1.0.json, odcs-schema-v3.2.0.json) are
+published by the Bitol project under the Apache License 2.0.
+odcs-schema-v3.2.0.json is schema/odcs-json-schema-v3.2.0.json of tag v3.2.0
+(commit f0bdad95346905d500be5ef4b2c2d9b1d95223b7), unchanged.
+https://github.com/bitol-io/open-data-contract-standard
+
 OPDS export functionality references the Open Data Product Standard (ODPS)
 v4.1 schema, developed by the Open Data Product Initiative under the
 Creative Commons Attribution 4.0 International License.

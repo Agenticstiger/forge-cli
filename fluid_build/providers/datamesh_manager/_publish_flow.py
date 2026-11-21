@@ -38,6 +38,12 @@ from fluid_build.util.contract import (
 
 LOG = logging.getLogger("fluid.providers.datamesh_manager.publish")
 
+#: The ODCS version of the per-port contracts a publish sends unless the caller names another
+#: (``--odcs-version``). Entropy Data checks each document against the schema of the version it
+#: declares, and an organization can pin its catalog to v3.1.0, so publishing stays on v3.1.0
+#: until it is asked for v3.2.0 (which adds the Iceberg server type).
+DMM_ODCS_VERSION = "v3.1.0"
+
 # Entropy pages ``GET /api/access`` (pageSize 2..10000). One consumer with more
 # agreements than this is far outside what a contract's ``consumes[]`` makes.
 _ACCESS_PAGE_SIZE = 10000
@@ -469,7 +475,7 @@ class _PublishFlowMixin:
     # ---- ODCS per-expose publishing ---------------------------------------
 
     def _preview_odcs_per_expose(
-        self, fluid: Mapping[str, Any], product_id: str
+        self, fluid: Mapping[str, Any], product_id: str, *, odcs_version: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """Return the ODCS payloads that *_publish_odcs_per_expose* would PUT
         (used for dry-run mode only — no HTTP calls made).
@@ -491,7 +497,7 @@ class _PublishFlowMixin:
         if collision:
             raise ProviderError(collision)
 
-        odcs_prov = OdcsProvider()
+        odcs_prov = OdcsProvider(version=odcs_version or DMM_ODCS_VERSION)
         previews: List[Dict[str, Any]] = []
         for expose in fluid.get("exposes", []):
             if not isinstance(expose, dict):
@@ -527,11 +533,13 @@ class _PublishFlowMixin:
         *,
         validate_generated_contracts: bool = False,
         validation_mode: str = "warn",
+        odcs_version: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Publish one ODCS data contract for every expose port.
 
         Each contract is PUT to ``/api/datacontracts/<contract id>`` in ODCS
-        v3.1.0 JSON format, where the contract id is what
+        JSON format, v3.1.0 unless ``odcs_version`` asks for another
+        (:data:`DMM_ODCS_VERSION`), where the contract id is what
         :func:`~fluid_build.util.contract.expose_contract_id_for_ref` resolves
         for the port — the id the expose pins or an ODPS import recorded, else
         the derived ``{product_id}.{exposeId}``. That is the same resolution
@@ -554,7 +562,7 @@ class _PublishFlowMixin:
         if collision:
             raise ProviderError(collision)
 
-        odcs_prov = OdcsProvider()
+        odcs_prov = OdcsProvider(version=odcs_version or DMM_ODCS_VERSION)
         results: List[Dict[str, Any]] = []
 
         for expose in fluid.get("exposes", []):
