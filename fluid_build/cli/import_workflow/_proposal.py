@@ -40,10 +40,9 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
-from ._airflow_dags import Dag
 from ._conventions import Conventions, PathRule
 from ._scan import JobRecord, LinkedTask
-from ._spark_io import Read, Ref, Write
+from ._spark_io import Ref, Write
 from .registry import ImportReport
 
 SPLITS = ("table", "job", "dag", "folder", "project")

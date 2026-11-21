@@ -16,11 +16,10 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ._conventions import Conventions, load_conventions
 from ._proposal import SPLITS, TopicSchema, build_proposal, safe_text
-from ._scan import DagScan, JobScan, LinkedTask, link_tasks, local_script, scan_dags, scan_jobs
+from ._scan import DagScan, JobScan, LinkedTask, link_tasks, scan_dags, scan_jobs
 from .registry import ImportReport
 
 DOC = "https://agenticstiger.github.io/forge_docs/cli/import.html"
-TOOL_SPLITS = {"pyspark": SPLITS, "airflow": SPLITS}
 
 
 def refusal(what: str, why: str, fix: str, **extras: Any) -> Exception:
@@ -58,11 +57,6 @@ def _directory(path: str, what: str, flag: str) -> Path:
             path=safe_text(path, 120),
         )
     return directory
-
-
-def _scan_jobs(root: Path, conv: Conventions) -> JobScan:
-    scan = scan_jobs(root, conv)
-    return scan
 
 
 def _referenced_roots(dag_scan: DagScan, conv: Conventions) -> Tuple[List[Path], List[str]]:
@@ -173,7 +167,7 @@ def run_import(
         scans = [scan_jobs(directory, conv) for directory in roots]
         linked, unlinked = link_tasks(dag_scan.dags, scans, conv, project_root=None)
 
-    _scan_report(tool, root, scans, dag_scan, linked, unlinked, report, conv)
+    _scan_report(tool, scans, dag_scan, linked, unlinked, report)
     jobs = [job for scan in scans for job in scan.jobs]
     if not jobs and not any(scan.other_files for scan in scans) and tool == "pyspark":
         raise refusal(
@@ -244,13 +238,11 @@ def _check_valid(contracts: Sequence[Dict[str, Any]], report: ImportReport) -> N
 
 def _scan_report(
     tool: str,
-    root: Path,
     scans: Sequence[JobScan],
     dag_scan: Optional[DagScan],
     linked: Sequence[LinkedTask],
     unlinked: Sequence[Tuple[Any, Any, Any, str]],
     report: ImportReport,
-    conv: Conventions,
 ) -> None:
     jobs = [job for scan in scans for job in scan.jobs]
     for scan in scans:
@@ -320,4 +312,3 @@ def _scan_report(
         no_dag = [j for j in jobs if not j.tasks]
         if tool == "pyspark" and no_dag:
             report.notes.append(f"{len(no_dag)} job(s) are submitted by no DAG task read here")
-    _ = conv, root

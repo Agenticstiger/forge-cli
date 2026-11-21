@@ -567,7 +567,6 @@ def test_a_topics_columns_come_from_the_schema_registry_importer(project, monkey
             pass
 
         def get_version(self, *args: Any) -> SubjectVersion:
-            subject = args[0] if args else ""
             seen.append(str(args))
             columns = [
                 {"name": "click_id", "type": "string", "required": True},
@@ -585,6 +584,7 @@ def test_a_topics_columns_come_from_the_schema_registry_importer(project, monkey
     monkeypatch.setattr(clients, "ConfluentRegistry", Fake)
     contracts, report = pyspark({"registry": "confluent", "url": "https://sr.example.com"})
     clicks = by_id(contracts)["clicks_clean"]
+    assert any("clicks_clean-value" in call for call in seen)  # the subject is <topic>-value
     assert [c["name"] for c in clicks["exposes"][0]["contract"]["schema"]] == ["click_id", "ts"]
     assert "description" not in clicks["exposes"][0]
     assert any("schema from the registry (2 columns)" in x for x in report.mapped_one_to_one)

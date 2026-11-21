@@ -33,7 +33,6 @@ from ._airflow_dags import Dag, Submit, Task, read_dags
 from ._conventions import Conventions
 from ._fold import ModuleIndex
 from ._pysource import (
-    SourceFile,
     SourceUnreadable,
     find_python_files,
     might_contain_dag,

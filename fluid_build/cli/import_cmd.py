@@ -114,12 +114,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "  fluid import schema-registry <subject> --registry glue [--registry-name N]\n"
             "                                           — a registry subject -> a consumer contract\n"
             "  fluid import pyspark <jobs-dir> [--dags <dags-dir>] [--conventions FILE]\n"
-            "                                           — PySpark jobs -> one product per output (static)\n"
+            "                                           : PySpark jobs, one product per output (static)\n"
             "  fluid import airflow <dags-dir> [--conventions FILE]\n"
-            "                                           — Airflow DAGs -> products (never imports Airflow)\n"
-            "  fluid import [--dir <path>]              — legacy dbt/Terraform/SQL scan\n"
+            "                                           : Airflow DAGs to products (never imports Airflow)\n"
             "  Any importer plugin installed adds `fluid import <name> <source>`.\n"
-            "  Add --dry-run to print the proposal and the report and write nothing."
+            "  Add --dry-run to print the proposal and the report and write nothing.\n"
+            "  fluid import [--dir <path>]              — legacy dbt/Terraform/SQL scan"
         ),
     )
     # Optional first positional: tool name. When present, dispatches to the
