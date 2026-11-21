@@ -2321,15 +2321,21 @@ def validate_loaded_contract(
     *,
     logger: Optional[logging.Logger] = None,
     offline_only: bool = True,
+    manager: Optional[FluidSchemaManager] = None,
+    plugins: bool = True,
 ) -> ValidationResult:
     """What ``fluid validate`` finds in a contract it has loaded, collected and not printed.
 
     The JSON-Schema check against the contract's own ``fluidVersion``, then every contract rule
     ``fluid validate`` runs after it (governance, metadata, binding prerequisites, packaging,
-    semantics) and the plugin validators: :func:`_run_contract_rules`, the path a bundle takes.
-    For a command that writes contracts and must write only ones ``fluid validate`` accepts.
-    What needs the file or an overlay (the composition rule's walk of the workspace, the
-    overlay-packaging check) is left out, as it is for a bundle with no source.
+    semantics): :func:`_run_contract_rules`, the path a bundle takes. For a command that writes
+    contracts and must write only ones ``fluid validate`` accepts. What needs the file or an
+    overlay (the composition rule's walk of the workspace, the overlay-packaging check) is left
+    out, as it is for a bundle with no source.
+
+    ``plugins`` also runs the validators plugins register (``contract.extensions`` and
+    ``Validator`` roles): finding them costs about 0.1 s a call, so a caller with thousands of
+    contracts leaves them out. ``manager`` is a schema manager to reuse.
 
     A finding is in ``result.errors`` or ``result.warnings``; ``result.is_valid`` is false when
     there is an error.
@@ -2340,13 +2346,14 @@ def validate_loaded_contract(
 
     log = logger or logging.getLogger(__name__)
     loaded = copy.deepcopy(dict(contract))  # a rule may normalise what it is given
-    manager = _self.FluidSchemaManager()
+    manager = manager or _self.FluidSchemaManager()
     version = manager.detect_version(loaded)
     result = manager.validate_contract(loaded, schema_version=version, offline_only=offline_only)
     rule_args = SimpleNamespace(quiet=True, verbose=False, strict=False, contract=None, env=None)
     _run_contract_rules(loaded, version, result, rule_args, log)
-    _run_extension_validators(loaded, result, log)
-    _run_role_validators(loaded, result, log)
+    if plugins:
+        _run_extension_validators(loaded, result, log)
+        _run_role_validators(loaded, result, log)
     result.is_valid = result.is_valid and not result.errors
     return result
 

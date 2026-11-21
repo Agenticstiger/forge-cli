@@ -273,14 +273,22 @@ def _check_valid(contracts: Sequence[Dict[str, Any]], report: ImportReport) -> N
     kept without them, and the report says so.
     """
     from fluid_build.cli.validate import validate_loaded_contract
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    # One schema manager for every product, and no plugin validators (they are the project's own
+    # rules about blocks this command never writes, and finding them costs ~0.1 s a contract).
+    manager = FluidSchemaManager()
+
+    def check(contract: Dict[str, Any]) -> Any:
+        return validate_loaded_contract(contract, manager=manager, plugins=False)
 
     for contract in contracts:
-        result = validate_loaded_contract(contract)
+        result = check(contract)
         if result.is_valid:
             continue
         errors = "; ".join(result.errors)
         if _drop_tasks(contract):
-            retry = validate_loaded_contract(contract)
+            retry = check(contract)
             if retry.is_valid:
                 report.unsupported.append(
                     f"{contract['id']}: the DAG tasks are not recorded on its builds, because the "
