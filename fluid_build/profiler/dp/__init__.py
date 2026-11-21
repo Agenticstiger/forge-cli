@@ -15,6 +15,8 @@ live here, each as its own module:
   bounds what one unit contributes to a release.
 * :mod:`~fluid_build.profiler.dp.selection` chooses the clique marginals a release
   measures, with OpenDP's AIM, from the optional ``[privacy]`` extra.
+* :mod:`~fluid_build.profiler.dp.record` writes and reads the owner-only release
+  record, so a release can be re-derived inside the data owner's boundary.
 
 Nothing here reads a record, and nothing here imports a heavy package at module
 scope.
