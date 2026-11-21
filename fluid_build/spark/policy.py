@@ -34,21 +34,22 @@ def refuse_unless_package_allowed(
 ) -> None:
     """Raise unless :data:`~fluid_build.spark.package.PACKAGE_ALLOWLIST_ENV` lists the place
     a build's prebuilt package comes from. An unset list allows nothing."""
-    from fluid_build.spark.package import PACKAGE_ALLOWLIST_ENV, listed
+    from fluid_build.spark.package import PACKAGE_ALLOWLIST_ENV, listed, store_prefix
 
     if listed(uri, environ):
         return
     place = uri.rsplit("/", 1)[0] + "/"
     raise SparkPolicyError(
-        what=f"Spark build {build_id!r} runs a prebuilt package from {place}",
+        what=f"Spark build {build_id!r} of {product_id} runs a prebuilt package from {place}",
         why=(
             f"{place} is not in {PACKAGE_ALLOWLIST_ENV}. A package's code runs inside the job "
             "with its role, so the operator names the places packages may come from (the "
-            f"team's write-once artifact store, say). An unset list allows nothing ({product_id})."
+            "team's write-once artifact store, say). An unset list allows nothing."
         ),
         fix=(
             "Have the operator list the store in the real environment (a project .env cannot "
-            f'set it), as a whole prefix: export {PACKAGE_ALLOWLIST_ENV}="{place}".'
+            "set it), as a whole prefix that every release's package sits under: export "
+            f'{PACKAGE_ALLOWLIST_ENV}="{store_prefix(uri)}".'
         ),
         doc=doc_url(),
     )

@@ -206,6 +206,19 @@ def _listed_prefixes(environ: Optional[Mapping[str, str]]) -> list[str]:
     return [entry.strip() for entry in raw.split(",") if entry.strip()]
 
 
+def store_prefix(uri: str) -> str:
+    """The prefix to suggest listing for ``uri``: its folder, above the first segment that
+    names a digest (``sha256-<hex>/``, as a content-addressed store lays releases out), so
+    one entry covers every release's package rather than this one's."""
+    head, _, _ = uri.rpartition("/")
+    scheme, _, path = head.partition("://")
+    segments = path.split("/")
+    for index, segment in enumerate(segments[1:], 1):
+        if re.search(r"(?:^|[^0-9a-f])[0-9a-f]{32,64}(?:$|[^0-9a-f])", segment):
+            return f"{scheme}://{'/'.join(segments[:index])}/"
+    return head + "/"
+
+
 def listed(uri: str, environ: Optional[Mapping[str, str]] = None) -> bool:
     """Whether the operator lists ``uri``'s place: an entry is a whole prefix of it, segment
     by segment (``s3://b/code`` covers ``s3://b/code/x.whl``, never ``s3://b/codex.whl``), or

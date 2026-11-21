@@ -217,8 +217,27 @@ def test_an_unlisted_package_is_refused(contract, monkeypatch):
         _config(contract)
     message = caught.value.as_json()
     assert PACKAGE_ALLOWLIST_ENV in message
-    assert "merge-orders" in message
-    assert 'export FLUID_SPARK_PACKAGE_ALLOWLIST=\\"s3://commerce-artifacts/code/orders/' in message
+    assert "merge-orders" in message and "commerce.orders-silver" in caught.value.what
+    # The store every release sits under, never this release's own folder.
+    assert caught.value.fix.endswith(
+        'export FLUID_SPARK_PACKAGE_ALLOWLIST="s3://commerce-artifacts/code/orders/".'
+    )
+
+
+@pytest.mark.parametrize(
+    ("uri", "prefix"),
+    [
+        (SOURCE, "s3://commerce-artifacts/code/orders/"),
+        ("s3://b/code/orders/1.4.0/orders.whl", "s3://b/code/orders/1.4.0/"),
+        (f"s3://b/{SHA}/orders.whl", "s3://b/"),  # a store keyed by digest at its root
+        ("file:///home/dev/dist/orders.zip", "file:///home/dev/dist/"),
+        (f"file:///srv/code/{SHA[:40]}/orders.zip", "file:///srv/code/"),
+    ],
+)
+def test_the_suggested_entry_is_the_store_above_any_digest(uri, prefix):
+    from fluid_build.spark.package import store_prefix
+
+    assert store_prefix(uri) == prefix
 
 
 @pytest.mark.parametrize(
