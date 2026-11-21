@@ -55,8 +55,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   older gap in the same guard: a merge key whose value is an alias to a list of mappings
   (`<<: *l1` over `l1: [{...}]`, repeated in one mapping, which PyYAML accepts) was never
   counted as an alias decode, so a document of a few hundred bytes expanded ninefold a level
-  inside the loader and was not refused. Other YAML that `fluid` reads through `yaml.safe_load`
-  (contracts, for one) still reads a list of merges the 6.0.4 way until PyYAML fixes #953.
+  inside the loader and was not refused. `pyyaml` is now `>=6.0,!=6.0.4` (also in
+  `Dockerfile.verify`), so a fresh install never picks the release: the other YAML that `fluid`
+  reads through `yaml.safe_load` (contracts, for one) would otherwise read a list of merges the
+  6.0.4 way. Drop the exclusion once PyYAML fixes #953.
 - **`fluid init --discover` maps DuckDB's `PARQUET_VARIANT` type.** DuckDB 2.0.1 lists
   `PARQUET_VARIANT` (the Parquet VARIANT storage layout, a struct of metadata and value bytes)
   among its type names. The emitter passed unknown names through, so a column of that type
