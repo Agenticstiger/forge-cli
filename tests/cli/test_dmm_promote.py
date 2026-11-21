@@ -165,6 +165,11 @@ class TestReportVerdict:
                 {"reconcile_lineage": {"has_drift": True, "has_critical_drift": True}},
                 "reconcile lineage found critical drift",
             ),
+            # verify fails this run ("state could not be refreshed") though has_drift is false.
+            (
+                {"state_drift": {"status": "error", "has_drift": False}},
+                "state drift could not refresh the apply's state",
+            ),
         ],
     )
     def test_drift_in_an_optional_section_is_not_a_pass(self, section, reason):
@@ -173,7 +178,7 @@ class TestReportVerdict:
     def test_soft_lineage_drift_and_clean_sections_still_pass(self):
         report = _report(
             reconcile={"has_drift": False},
-            state_drift={"has_drift": False},
+            state_drift={"status": "not_checked", "has_drift": False},
             reconcile_lineage={"has_drift": True, "has_critical_drift": False},
         )
         assert report_verdict(report) == (True, "")
@@ -297,6 +302,17 @@ class TestPromoteCommand:
         )
         assert code == 0
         assert [p["id"] for p in provider.promoted] == ["a", "b"]
+
+    def test_an_id_is_matched_to_its_report_by_the_id_entropy_knows_it_by(self, tmp_path, capsys):
+        reports = tmp_path / "reports"
+        _put(reports, "r.json", _report("silver.orders"))
+        provider = FakeProvider()
+        code, _ = _run(
+            ["promote", "--id", "Silver.Orders", "--verify-report", str(reports)], provider, capsys
+        )
+        assert code == 0
+        # The report is found by the slug; the id is sent as given.
+        assert [p["id"] for p in provider.promoted] == ["Silver.Orders"]
 
     def test_an_active_product_is_left_alone_and_is_not_an_error(self, tmp_path, capsys):
         provider = FakeProvider(status={"a": "active"})

@@ -90,8 +90,8 @@ def add_parser(subparsers):
         metavar="CONTRACT",
         help=(
             "FLUID contract file, glob pattern or folder (a folder is searched for "
-            "*.fluid.yaml at any depth). Several contracts publish as one batch, each product "
-            "after the products it consumes."
+            "*.fluid.yaml at any depth). A folder, a glob or several contracts publish as one "
+            "batch, each product after the products it consumes; one file is a single publish."
         ),
     )
     pub.add_argument("-o", "--overlay", help="Path to overlay file")
@@ -176,10 +176,11 @@ def add_parser(subparsers):
         "--status",
         choices=["draft", "active"],
         help=(
-            "Manage the lifecycle: send this status instead of the contract's own. 'draft' "
-            "never demotes a product Entropy already holds as active, and a retired product is "
-            "skipped (Entropy keeps it retired). Promote drafts later with "
-            "'fluid datamesh-manager promote'."
+            "Manage the lifecycle: send this status instead of the contract's own. A status "
+            "only moves forward: 'draft' never demotes a product Entropy already holds as "
+            "active, a deprecated product keeps its status, and a retired product is skipped "
+            "(Entropy keeps it retired; one contract named outright is an error instead). "
+            "Promote drafts later with 'fluid datamesh-manager promote'."
         ),
     )
     pub.add_argument(
@@ -438,11 +439,19 @@ def _cmd_publish(args, logger=None):
     """Execute publish command: one contract as before, several as an upstream-first batch."""
     log = logger or logging.getLogger(__name__)
     try:
-        from fluid_build.cli._dmm_batch import resolve_contract_paths, run_publish, stdout_to_stderr
+        from fluid_build.cli._dmm_batch import (
+            needs_expansion,
+            resolve_contract_paths,
+            run_publish,
+            stdout_to_stderr,
+        )
 
         requested = [args.contract] if isinstance(args.contract, str) else list(args.contract)
         paths = resolve_contract_paths(requested)
-        if len(paths) > 1:
+        # A folder or a glob is a batch whatever it holds today, so the output and the exit
+        # codes do not change when the folder grows from one contract to two; one file named
+        # outright is the single publish.
+        if len(paths) > 1 or needs_expansion(requested):
             return run_publish(args, paths, log)
 
         machine = getattr(args, "format", "text") == "json"

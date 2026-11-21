@@ -15,7 +15,7 @@ import json
 import logging
 import random
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
 from unittest.mock import patch
 
 import pytest
@@ -32,7 +32,7 @@ from fluid_build.cli._dmm_batch import (
 from fluid_build.cli.datamesh_manager import add_parser
 from fluid_build.providers.base import ProviderError
 from fluid_build.providers.datamesh_manager._ids import dmm_product_id
-from fluid_build.providers.datamesh_manager._lifecycle import ProductRetiredError
+from fluid_build.providers.datamesh_manager._lifecycle import ProductRetiredError, status_to_send
 
 # ── fixtures ──────────────────────────────────────────────────────────────
 
@@ -81,13 +81,16 @@ class FakeProvider:
 
     def __init__(
         self,
-        held: Iterable[str] = (),
+        held: Union[Dict[str, Optional[str]], Iterable[str]] = (),
         fail: Iterable[str] = (),
         retired: Iterable[str] = (),
         held_unreadable: bool = False,
         odcs_failed: Iterable[str] = (),
     ) -> None:
-        self.held = set(held)
+        # What Entropy holds: ids, or ids with their status.
+        self.statuses: Dict[str, Optional[str]] = (
+            dict(held) if isinstance(held, dict) else {pid: None for pid in held}
+        )
         self.fail = set(fail)
         self.retired = set(retired)
         self.held_unreadable = held_unreadable
@@ -98,13 +101,16 @@ class FakeProvider:
     def _require_api_key(self) -> None:
         return None
 
-    def _held_product_ids(self) -> Optional[set]:
+    def held_products(self) -> Optional[Dict[str, Optional[str]]]:
         self.held_reads += 1
-        return None if self.held_unreadable else set(self.held)
+        return None if self.held_unreadable else dict(self.statuses)
 
     def apply(self, contract: Dict[str, Any], **kw: Any) -> Dict[str, Any]:
         pid = dmm_product_id(contract["id"])
-        self.applied.append({"id": pid, **kw, "held_seen": set(kw.get("held_product_ids") or ())})
+        handed = kw.get("held_product_ids")
+        self.applied.append(
+            {"id": pid, **kw, "held_seen": set(handed) if handed is not None else None}
+        )
         if pid in self.fail:
             raise ProviderError(f"Entropy Data API error 422 on PUT /api/dataproducts/{pid}")
         if pid in self.retired:
@@ -117,7 +123,10 @@ class FakeProvider:
             "url": f"https://app.example.test/dataproducts/{pid}",
         }
         if kw.get("status"):
-            result["status"] = kw["status"]
+            sent = status_to_send(kw["status"], self.statuses.get(pid))
+            result["status"] = sent
+            if sent != kw["status"]:
+                result["status_kept"] = sent
         if pid in self.odcs_failed:
             result["odcs_contracts"] = [{"contract_id": f"{pid}.orders", "success": False}]
         return result
@@ -269,6 +278,15 @@ class TestBatchRun:
         assert "bronze.raw_orders" in by_id["silver.orders"]
         assert {"bronze.raw_orders", "silver.orders"} <= by_id["gold.revenue"]
 
+    def test_when_the_list_cannot_be_read_the_provider_is_handed_nothing(self, products, capsys):
+        # An empty set would read as "Entropy holds no products" and the access-agreement
+        # pre-flight would then skip every upstream outside the batch.
+        provider = FakeProvider(held_unreadable=True)
+        code, _ = _run(["publish", str(products)], provider, capsys)
+        assert code == 0
+        assert provider.held_reads == 1
+        assert [a["held_seen"] for a in provider.applied] == [None] * 4
+
     def test_the_status_and_the_other_flags_reach_every_publish(self, products, capsys):
         provider = FakeProvider()
         code, out = _run(
@@ -314,8 +332,9 @@ class TestBatchRun:
         provider = FakeProvider(retired={"loose.report"})
         code, out = _run(["publish", str(products), "--status", "draft"], provider, capsys)
         assert code == 0
-        assert "skipped" in out and "stays retired" in out
+        assert "skipped" in out and "keeps it retired" in out
         assert "1 skipped" in out
+        assert "cannot be published again" in out
 
     def test_a_retired_upstream_does_not_block_its_consumers(self, products, capsys):
         provider = FakeProvider(retired={"bronze.raw_orders"})
@@ -429,6 +448,52 @@ class TestBatchRun:
         assert provider.order == ["silver", "gold"]
 
 
+class TestBatchLifecycleAndBlocking:
+    def test_a_dry_run_says_what_the_real_run_skips_and_keeps(self, products, capsys):
+        provider = FakeProvider(
+            held={"loose.report": "retired", "bronze.raw_orders": "active", "x": "deprecated"}
+        )
+        code, out = _run(
+            ["publish", str(products), "--status", "draft", "--dry-run"], provider, capsys
+        )
+        assert code == 0
+        assert "loose.report" not in provider.order  # the retired product is not even previewed
+        assert "a real run skips it" in out
+        assert "bronze.raw_orders (active) - kept active: draft never demotes" in out
+        assert "2 skipped" not in out and "1 skipped" in out
+
+    def test_a_dry_run_without_a_status_predicts_nothing(self, products, capsys):
+        provider = FakeProvider(held={"loose.report": "retired", "bronze.raw_orders": "active"})
+        code, out = _run(["publish", str(products), "--dry-run"], provider, capsys)
+        assert code == 0
+        assert "a real run skips it" not in out and "kept" not in out
+        assert "loose.report" in provider.order
+
+    def test_a_kept_deprecated_status_says_so(self, products, capsys):
+        provider = FakeProvider(held={"loose.report": "deprecated"})
+        code, out = _run(["publish", str(products), "--status", "active"], provider, capsys)
+        assert code == 0
+        assert "kept deprecated: forge does not revive a deprecated product" in out
+
+    def test_a_contract_that_fails_strict_validation_blocks_the_products_that_consume_it(
+        self, tmp_path, capsys
+    ):
+        # No exposes: it loads and declares an id, but is not a valid contract.
+        broken = _contract("silver.orders", ["bronze.raw_orders"])
+        del broken["exposes"]
+        (tmp_path / "silver.fluid.yaml").write_text(yaml.safe_dump(broken), encoding="utf-8")
+        _write(tmp_path, "bronze.raw_orders")
+        _write(tmp_path, "gold.revenue", ["silver.orders"])
+        provider = FakeProvider()
+        code, out = _run(
+            ["publish", str(tmp_path), "--validation-mode", "strict"], provider, capsys
+        )
+        assert code == 1
+        assert provider.order == ["bronze.raw_orders"]  # silver failed, gold is blocked
+        assert "upstream silver.orders did not publish" in out
+        assert "1 published, 1 failed, 1 blocked" in out
+
+
 # ── the single-contract path and the parser ───────────────────────────────
 
 
@@ -442,13 +507,22 @@ class TestSingleAndParser:
         assert "Published" in out
         assert "upstream products first" not in out
 
-    def test_one_contract_in_a_folder_is_a_single_publish(self, tmp_path, capsys):
+    def test_a_folder_is_a_batch_even_when_it_holds_one_contract(self, tmp_path, capsys):
+        # The output and the exit codes must not change when a folder grows from one
+        # contract to two.
         _write(tmp_path, "solo")
-        provider = FakeProvider()
-        code, out = _run(["publish", str(tmp_path)], provider, capsys)
+        provider = FakeProvider(retired={"solo"})
+        code, out = _run(["publish", str(tmp_path), "--status", "draft"], provider, capsys)
         assert code == 0
         assert provider.order == ["solo"]
-        assert "upstream products first" not in out
+        assert "upstream products first" in out
+        assert "1 skipped" in out
+
+    def test_a_glob_is_a_batch_too(self, tmp_path, capsys):
+        _write(tmp_path, "solo")
+        provider = FakeProvider()
+        code, out = _run(["publish", str(tmp_path / "*.fluid.yaml")], provider, capsys)
+        assert code == 0 and "upstream products first" in out
 
     def test_a_typed_error_reaches_the_cli_handler_instead_of_being_printed_flat(
         self, tmp_path, capsys

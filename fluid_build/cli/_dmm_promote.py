@@ -78,6 +78,10 @@ def report_verdict(report: Mapping[str, Any]) -> Tuple[bool, str]:
         section = report.get(name)
         if isinstance(section, Mapping) and section.get("has_drift"):
             return False, f"{name.replace('_', ' ')} found drift"
+    state = report.get("state_drift")
+    if isinstance(state, Mapping) and state.get("status") == "error":
+        # verify fails such a run ("state could not be refreshed"), and has_drift is false.
+        return False, "state drift could not refresh the apply's state"
     lineage = report.get("reconcile_lineage")
     if isinstance(lineage, Mapping) and lineage.get("has_critical_drift"):
         return False, "reconcile lineage found critical drift"
@@ -183,6 +187,7 @@ def run_promote(args: Any, log: logging.Logger) -> int:
     """Promote the products named. Returns 1 when any failed or was held back by the gate."""
     import fluid_build.cli.datamesh_manager as dmm
     from fluid_build.providers.base import ProviderError
+    from fluid_build.providers.datamesh_manager._ids import dmm_product_id
 
     dry_run = bool(getattr(args, "dry_run", False))
     as_json = getattr(args, "format", "text") == "json"
@@ -196,7 +201,8 @@ def run_promote(args: Any, log: logging.Logger) -> int:
     for product_id in product_ids:
         row: Dict[str, Any] = {"product_id": product_id}
         if verdicts is not None:
-            verdict = verdicts.get(product_id)
+            # Verdicts are keyed by the id Entropy knows a product by; --id is sent as given.
+            verdict = verdicts.get(dmm_product_id(product_id))
             if verdict is None:
                 row.update(outcome=HELD_BACK, detail="no fluid verify report names this product")
             elif not verdict.passed:

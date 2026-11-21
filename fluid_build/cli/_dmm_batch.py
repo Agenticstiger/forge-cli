@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from fluid_build.cli.console import cprint_json, cprint_literal
 from fluid_build.providers.datamesh_manager._ids import dmm_product_id
+from fluid_build.providers.datamesh_manager._lifecycle import RETIRED, status_to_send
 
 __all__ = [
     "BatchItem",
@@ -255,16 +256,19 @@ def load_items(
     validation_mode: str,
     log: logging.Logger,
     machine: bool = False,
-) -> Tuple[List[BatchItem], List[ItemOutcome]]:
-    """Load and validate each contract: ``(items, failures)``.
+) -> Tuple[List[BatchItem], List[ItemOutcome], Set[str]]:
+    """Load and validate each contract: ``(items, failures, failed_ids)``.
 
     One contract that cannot be loaded, or fails ``--validation-mode strict``, fails on its
-    own; it never stops the others.
+    own; it never stops the others. ``failed_ids`` holds the product ids of the failures
+    that got far enough to declare one (a strict-validation failure), so the products that
+    consume them are blocked; a file that cannot even be read names no product.
     """
     import fluid_build.cli.datamesh_manager as dmm
 
     items: List[BatchItem] = []
     failures: List[ItemOutcome] = []
+    failed_ids: Set[str] = set()
     for label in paths:
         printed = io.StringIO()
         try:
@@ -280,22 +284,24 @@ def load_items(
                 # Errors and warnings are shown with the file they belong to: on stdout for
                 # people, on stderr when stdout carries the JSON report.
                 print(f"{label}:\n{findings}", file=sys.stderr if machine else sys.stdout)
+        product_id = dmm_product_id(str(contract.get("id") or ""))
         if rc != 0:
             failures.append(
                 ItemOutcome(
                     label,
-                    label,
+                    product_id or label,
                     FAILED,
                     "does not conform to the FLUID schema (--validation-mode strict)",
                 )
             )
+            if product_id:
+                failed_ids.add(product_id)
             continue
-        product_id = dmm_product_id(str(contract.get("id") or ""))
         if not product_id:
             failures.append(ItemOutcome(label, label, FAILED, "the contract declares no id"))
             continue
         items.append(BatchItem(label, contract, product_id, _upstreams_of(contract)))
-    return items, failures
+    return items, failures, failed_ids
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +317,7 @@ def run_publish(args: Any, paths: Sequence[str], log: logging.Logger) -> int:
     as_json = getattr(args, "format", "text") == "json"
     status = getattr(args, "status", None)
 
-    items, outcomes = load_items(
+    items, outcomes, failed_ids = load_items(
         paths,
         overlay=getattr(args, "overlay", None),
         validation_mode=getattr(args, "validation_mode", "warn"),
@@ -324,11 +330,15 @@ def run_publish(args: Any, paths: Sequence[str], log: logging.Logger) -> int:
     provider = dmm._make_provider(args)
     provider._require_api_key()
     # One read of the product list for the whole batch, not one per product: it spells the
-    # upstream ids and says which upstreams outside the batch Entropy holds. A dry run reads
-    # the list too (it writes nothing).
-    held_list = provider._held_product_ids()
-    held_known = held_list is not None
-    held: Set[str] = set(held_list or ())
+    # upstream ids, says which upstreams outside the batch Entropy holds, and (with each
+    # product's status) lets a dry run say what the real run would skip or keep. A dry run
+    # reads the list too; it writes nothing. When the list cannot be read the provider is
+    # handed nothing and reads what it needs per product, as a single publish does: an
+    # empty set would read as "Entropy holds no products".
+    held_map = provider.held_products()
+    held_known = held_map is not None
+    statuses: Dict[str, Optional[str]] = dict(held_map or {})
+    held: Set[str] = set(statuses)
     batch_ids = {item.product_id for item in items}
 
     if not as_json:
@@ -340,7 +350,6 @@ def run_publish(args: Any, paths: Sequence[str], log: logging.Logger) -> int:
             _print_outcome(failure, 0, total)
 
     base_kwargs = dmm._publish_kwargs(args)
-    failed_ids: Set[str] = set()
     done = len(outcomes)
     for item in ordered:
         done += 1
@@ -368,10 +377,19 @@ def run_publish(args: Any, paths: Sequence[str], log: logging.Logger) -> int:
             )
             failed_ids.add(item.product_id)
         else:
-            outcome = _publish_item(provider, item, base, base_kwargs, held, dry_run, args)
+            outcome = _publish_item(
+                provider,
+                item,
+                base,
+                base_kwargs,
+                held if held_known else None,
+                statuses if held_known else {},
+                dry_run,
+                args,
+            )
             if outcome.outcome == FAILED:
                 failed_ids.add(item.product_id)
-            elif outcome.outcome == PUBLISHED:
+            elif outcome.outcome == PUBLISHED and held_known:
                 held.add(item.product_id)
         outcomes.append(outcome)
         if not as_json:
@@ -399,33 +417,57 @@ def run_publish(args: Any, paths: Sequence[str], log: logging.Logger) -> int:
     return code
 
 
+_RETIRED_DETAIL = "retired in Entropy Data, which keeps it retired: nothing is sent for it"
+
+
+def _kept_note(kept: str) -> str:
+    """Why a managed status was not sent: what Entropy holds stays."""
+    if kept == "deprecated":
+        return "kept deprecated: forge does not revive a deprecated product"
+    return f"kept {kept}: draft never demotes"
+
+
 def _publish_item(
     provider: Any,
     item: BatchItem,
     base: Dict[str, Any],
     kwargs: Dict[str, Any],
-    held: Set[str],
+    held: Optional[Set[str]],
+    statuses: Dict[str, Optional[str]],
     dry_run: bool,
     args: Any,
 ) -> ItemOutcome:
     import fluid_build.cli.datamesh_manager as dmm
     from fluid_build.providers.datamesh_manager._lifecycle import ProductRetiredError
 
+    requested = getattr(args, "status", None)
+    current = statuses.get(item.product_id)
+    if dry_run and requested and current == RETIRED:
+        # A dry run sends nothing, so it cannot meet the retired refusal; the list it read
+        # already says the real run would skip this product.
+        return ItemOutcome(
+            item.label, item.product_id, SKIPPED, f"{_RETIRED_DETAIL} (a real run skips it)", **base
+        )
     try:
         result = provider.apply(
             item.contract,
             dry_run=dry_run,
-            status=getattr(args, "status", None),
+            status=requested,
             held_product_ids=held,
             **kwargs,
         )
-    except ProductRetiredError as exc:
-        return ItemOutcome(item.label, item.product_id, SKIPPED, _one_line(exc), **base)
+    except ProductRetiredError:
+        return ItemOutcome(item.label, item.product_id, SKIPPED, _RETIRED_DETAIL, **base)
     except Exception as exc:  # noqa: BLE001 - a failed product blocks its consumers, not the batch
         return ItemOutcome(item.label, item.product_id, FAILED, _one_line(exc), **base)
     note = ""
-    if result.get("status_kept"):
-        note = f"kept {result['status_kept']}: draft never demotes"
+    kept = result.get("status_kept")
+    if not kept and dry_run and requested and current:
+        # What a real run keeps, read from the list: draft never demotes, deprecated stays.
+        predicted = status_to_send(requested, current)
+        kept = predicted if predicted != requested else None
+    if kept:
+        note = _kept_note(kept)
     elif dry_run and item.upstreams:
         shown = ", ".join(item.upstreams[:3]) + (" ..." if len(item.upstreams) > 3 else "")
         note = f"consumes {shown}"
@@ -434,7 +476,7 @@ def _publish_item(
         item.product_id,
         DRY_RUN if dry_run else PUBLISHED,
         note,
-        status=result.get("status"),
+        status=kept or result.get("status"),
         url=result.get("url"),
         exit_code=0 if dry_run else dmm._publish_exit_code(result, args),
         result=result,
@@ -490,4 +532,9 @@ def _print_summary(counts: Dict[str, int], dry_run: bool) -> None:
         _say(
             "Next: verify each product (fluid verify <contract> --out report.json), then "
             "promote the ones that pass (fluid datamesh-manager promote --verify-report ...)."
+        )
+    if counts[SKIPPED]:
+        _say(
+            "A retired product cannot be published again: give it a new product id, or leave "
+            "it out of the run."
         )
