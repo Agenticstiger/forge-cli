@@ -58,6 +58,9 @@ DEFAULT_SESSION_NAMES = frozenset({"spark", "session", "spark_session", "sparkSe
 #: Reads, and writes, kept for one job file: a job has tens, and a file of nothing but ``.table(...)``
 #: calls is not one.
 MAX_REFS_PER_JOB = 5_000
+#: Longest table name or path kept (an object key is at most 1,024 bytes anywhere): every ref is
+#: held until the proposal is built, and a scan keeps up to ``MAX_REFS_PER_SCAN`` of them.
+MAX_NAME = 512
 #: Notes kept for one job file: a file whose every ``spark.sql`` takes a name that is not a
 #: constant has one per call, and a person reads a few.
 MAX_NOTES_PER_JOB = 200
@@ -550,6 +553,9 @@ class _Reader:
         text = value.strip()
         if not text:
             return Ref(kind, (), "", "the name is empty", rel, line, fmt)
+        if len(text) > MAX_NAME:
+            why = f"the name is longer than {MAX_NAME} characters"
+            return Ref(kind, (), text[:60] + "...", why, rel, line, fmt)
         if any(mark in text for mark in ("{", "}", "%(")):
             return Ref(kind, (), text, "the name holds a placeholder", rel, line, fmt)
         if kind == "table":

@@ -46,6 +46,10 @@ MAX_TOTAL_BYTES = 64 * 1024 * 1024
 #: number of calls that pass it): the parser takes about 4 ms per kilobyte, so this is some twelve
 #: seconds at the most.
 MAX_TOTAL_SQL_CHARS = 1_500_000
+#: Source read again, in all, after its module was dropped from the cache to make room: a name
+#: that needs three big modules in turn reads each over and over, and that is paid from this, so
+#: the job files still get the budget above.
+MAX_RELOAD_BYTES = 2 * 1024 * 1024
 MAX_CACHED_NODES = 200_000
 #: Most Python files one walk keeps, and directory entries it reads, and levels it descends.
 MAX_FILES = 5_000
@@ -175,6 +179,15 @@ class SourceBudget:
     #: Characters of SQL still to parse (:data:`MAX_TOTAL_SQL_CHARS`), and statements left alone.
     sql_left: int = MAX_TOTAL_SQL_CHARS
     sql_skipped: int = 0
+    #: Bytes of source that may still be read a second time (:data:`MAX_RELOAD_BYTES`).
+    reload_left: int = MAX_RELOAD_BYTES
+
+    def take_reload(self, size: int) -> bool:
+        """Charge a file read again; ``False`` when the reloads have used their budget."""
+        if size > self.reload_left:
+            return False
+        self.reload_left -= size
+        return True
 
     def take_sql(self, size: int) -> bool:
         """Charge a statement of ``size`` characters; ``False`` when the SQL budget is spent."""
@@ -193,9 +206,12 @@ class SourceBudget:
         return True
 
 
-def read_source(path: Path, budget: Optional[SourceBudget] = None) -> bytes:
+def read_source(
+    path: Path, budget: Optional[SourceBudget] = None, *, reload: bool = False
+) -> bytes:
     """The bytes of a Python source file: a regular file of at most :data:`MAX_FILE_BYTES`,
-    counted against ``budget`` when there is one.
+    counted against ``budget`` when there is one (a file read again, ``reload``, against the
+    budget for that, not the one the files of the project need).
 
     Raises:
         SourceUnreadable: with the reason (not a regular file, too large, unreadable, or the
@@ -209,7 +225,13 @@ def read_source(path: Path, budget: Optional[SourceBudget] = None) -> bytes:
         raise SourceUnreadable(f"cannot read it ({type(exc).__name__})") from exc
     if data is None:
         raise SourceUnreadable(f"it is larger than {MAX_FILE_BYTES:,} bytes")
-    if budget is not None and not budget.take(len(data)):
+    if budget is not None and reload:
+        if not budget.take_reload(len(data)):
+            raise SourceUnreadable(
+                f"the scan has read modules again for {MAX_RELOAD_BYTES // (1024 * 1024)} MB, "
+                "the most it re-reads"
+            )
+    elif budget is not None and not budget.take(len(data)):
         raise SourceUnreadable(
             f"the scan has read {MAX_TOTAL_BYTES // (1024 * 1024)} MB of source, the most it reads"
         )

@@ -702,6 +702,40 @@ def test_only_a_few_modules_stay_parsed_and_one_that_was_dropped_is_read_again(
     assert again is not None and index.load(by_rel["m1.py"]) is again
 
 
+def test_a_module_read_again_is_paid_from_the_reload_budget_not_the_jobs_budget(
+    tmp_path, monkeypatch
+):
+    from fluid_build.cli.import_workflow import _fold as F
+
+    _write(tmp_path, {f"m{i}.py": f"V{i} = 'value-{i}'\n" for i in range(3)})
+    walk = P.find_python_files(tmp_path)
+    monkeypatch.setattr(F, "MAX_CACHED_NODES", 6)  # room for one of these files (5 nodes)
+    one = len((tmp_path / "m0.py").read_bytes())
+    budget = P.SourceBudget(reload_left=2 * one)
+    index = ModuleIndex(walk.files, budget=budget)
+    by_rel = {f.rel: f for f in walk.files}
+    for i in range(3):
+        assert index.load(by_rel[f"m{i}.py"]) is not None  # the first reads: the main budget
+    spent = budget.left
+    assert index.load(by_rel["m0.py"]) is not None  # two reads again fit
+    assert index.load(by_rel["m1.py"]) is not None
+    assert budget.left == spent and budget.reload_left == 0
+    assert index.load(by_rel["m2.py"]) is None  # a third does not, and the reason says so
+    assert "read modules again" in index.unreadable["m2.py"]
+
+
+def test_the_memo_of_a_module_holds_a_bounded_amount_of_text(monkeypatch):
+    from fluid_build.cli.import_workflow import _fold as F
+
+    monkeypatch.setattr(F, "MAX_MEMO_CHARS", 10_000)
+    source = f"S = '{'a' * 3000}'\n" + "".join(f"X{i} = S + '{i}'\n" for i in range(10))
+    module = P.parse_module("m.py", source.encode("utf-8"))
+    folder = Folder(module)
+    for i, node in enumerate(module.tree.body[1:]):
+        assert folder.fold(node.value) == "a" * 3000 + str(i)  # type: ignore[attr-defined]
+    assert folder._memo_chars <= 10_000
+
+
 def test_a_module_the_index_did_not_load_gets_a_folder_nobody_keeps(tmp_path):
     _write(tmp_path, {"a.py": "X = 1\n"})
     walk = P.find_python_files(tmp_path)

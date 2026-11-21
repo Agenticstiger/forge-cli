@@ -58,6 +58,10 @@ MAX_ITEMS = 2_000
 #: hostile file can ask for is bounded, whatever its expressions refer to.
 MAX_STEPS_PER_FOLD = 5_000
 MAX_STEPS_PER_MODULE = 250_000
+#: Characters of text the folded values of one module keep in its memo: a list of thousands of
+#: long strings built from one long string is as big as its elements, and every element is one
+#: more node to remember.
+MAX_MEMO_CHARS = 4_000_000
 #: Methods that change what a name holds: a name they are called on is not the value it was
 #: assigned.
 _MUTATORS = frozenset(
@@ -169,6 +173,15 @@ _RUNNERS = frozenset({"globals", "exec", "eval"})
 _SETTERS = frozenset({"setattr", "delattr"})
 _IMPORTERS = frozenset({"import_module", "__import__"})
 _FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _text_size(value: Any) -> int:
+    """The characters of text a folded value holds, one level down (a string, a list of them)."""
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, (list, tuple)):
+        return sum(len(item) for item in value if isinstance(item, str))
+    return 0
 
 
 def _rebound_names(tree: ast.AST) -> Dict[str, str]:
@@ -563,6 +576,8 @@ class ModuleIndex:
         #: nodes between them: a scan of thousands of files keeps a few, not all, in memory.
         self._modules: "OrderedDict[str, Module]" = OrderedDict()
         self._cached_nodes = 0
+        #: Files read at least once: a read of one of these again is a reload.
+        self._read_once: Set[str] = set()
         #: Where a dotted name is found, by ``(name, importing file)``: the answer does not change
         #: and a name many files answer to costs a pass over them.
         self._located: Dict[Tuple[str, str], Union[Tuple[SourceFile, List[str]], str]] = {}
@@ -588,7 +603,9 @@ class ModuleIndex:
             self._modules.move_to_end(source.rel)
             return cached
         try:
-            data = read_source(source.path, self.budget)
+            again = source.rel in self._read_once
+            data = read_source(source.path, self.budget, reload=again)
+            self._read_once.add(source.rel)
             # Room is made before the parse, not after: a file has at most as many nodes as it
             # has bytes, and two big modules alive at once is what a cache is there to prevent.
             while self._modules and self._cached_nodes + len(data) > MAX_CACHED_NODES:
@@ -712,6 +729,7 @@ class Folder:
         #: Folded values by ``(node, scope)``: an expression that many names refer to is folded
         #: once, so a chain of names each built from the one before costs one pass, not a tree.
         self._memo: Dict[Tuple[int, int], Any] = {}
+        self._memo_chars = 0
         self._nesting = 0
         self._steps_call = 0
         self._steps_module = 0
@@ -783,7 +801,10 @@ class Folder:
             self._active.discard(key)
             self._nesting -= 1
         if remember and not (isinstance(value, Unresolved) and value.transient):
-            self._memo[memo_key] = value
+            weight = _text_size(value)
+            if self._memo_chars + weight <= MAX_MEMO_CHARS:
+                self._memo_chars += weight
+                self._memo[memo_key] = value
         return value
 
     def fold_sql(

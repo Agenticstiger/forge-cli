@@ -941,6 +941,19 @@ def test_a_masked_word_is_quoted_again_when_it_holds_an_operator_or_white_space(
     assert safe_command(f"{name}='a b;c' run") == f"{name}=***REDACTED*** run"
 
 
+def test_a_table_or_path_name_longer_than_any_object_key_is_not_kept(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    long_path = "s3://b/" + "a" * 600
+    write(
+        tmp_path,
+        {"jobs/long.py": f'df.write.parquet("{long_path}")\ndf.write.saveAsTable("db.ok")\n'},
+    )
+    contracts, report = propose(tmp_path)
+    assert len(contracts) == 1
+    assert [x for x in report.unsupported if "the name is longer than 512 characters" in x]
+    assert "a" * 200 not in "".join(report.unsupported)  # the name is not repeated in full
+
+
 # ── what a job's tasks cost when the job feeds many products ──────────
 
 
