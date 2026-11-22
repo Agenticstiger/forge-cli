@@ -166,7 +166,11 @@ def test_a_directory_holding_more_than_the_limit_is_read_to_the_limit(releases, 
     monkeypatch.setattr(rs, "MAX_ENTRIES", 2)
     found = rs.find_releases([str(releases)], PRODUCT)
     assert len(found.releases) == 2
-    assert any("past the first 2" in why for why in found.skipped)
+    # every entry past the limit is counted, not the directory once
+    assert found.skipped == {"entries past the first 2 of a directory": 1}
+    (releases / "zz-one-more").mkdir()
+    again = rs.find_releases([str(releases)], PRODUCT)
+    assert again.skipped == {"entries past the first 2 of a directory": 2}
 
 
 # --- records are not trusted ----------------------------------------------------------
@@ -543,3 +547,78 @@ def test_the_module_imports_only_the_standard_library_when_it_is_loaded():
     assert names <= {
         "__future__", "os", "re", "stat", "dataclasses", "datetime", "pathlib", "typing",
     }  # fmt: skip
+
+
+# --- a long root, a changed record, a directory that cannot be read ---------------------
+
+
+def _deep(tmp_path, length=345):
+    """A root ``length`` characters long, as a CI runner's work directory can be."""
+    root = tmp_path
+    while len(str(root)) < length:
+        root = root / ("d" * 40)
+    return root
+
+
+def test_under_a_long_root_each_release_shows_the_end_of_its_path(tmp_path):
+    root = _deep(tmp_path)
+    for name, version in (("b", "1.1.0"), ("a", "1.0.0")):
+        seal(root, name, sealed="2026-11-18T09:12:03+00:00", versions={"orders": version})
+    found = rs.find_releases([str(root)], PRODUCT)
+    paths = [r.path for r in found.releases]
+    assert [r.expose_versions["orders"] for r in found.releases] == ["1.0.0", "1.1.0"]
+    assert paths[0].endswith(f"{os.sep}a") and paths[1].endswith(f"{os.sep}b"), paths
+    assert all(p.startswith("...") and len(p) <= 200 for p in paths)
+
+
+def test_under_a_long_root_two_roots_still_order_by_path(tmp_path):
+    root = _deep(tmp_path)
+    sealed = "2026-11-18T09:12:03+00:00"
+    seal(root / "b", "x", sealed=sealed, run_id="from-b")
+    seal(root / "a", "y", sealed=sealed, run_id="from-a")
+    found = rs.find_releases([str(root / "b"), str(root / "a")], PRODUCT)
+    assert [r.run_id for r in found.releases] == ["from-a", "from-b"]
+
+
+def test_a_newer_record_that_is_not_intact_never_wins_over_an_older_intact_one(releases):
+    seal(releases, "r4", sealed="2026-11-23T08:00:00+00:00", tamper=True)
+    found = rs.find_releases([str(releases)], PRODUCT)
+    answer = rs.in_force(found.releases, None, moment("2026-11-25T00:00:00"))
+    assert answer.at_start is not None and answer.at_start.expose_versions == {"orders": "2.0.0"}
+    assert [r.path[-3:] for r in answer.not_intact] == [f"{os.sep}r4"]
+    text = "\n".join(rs.report(PRODUCT, [answer], found, None))
+    head, _, warning = text.partition("Not in force:")
+    assert "orders 2.0.0" in head and "9.9.9" not in head
+    assert "NOT INTACT" in warning and "9.9.9" in warning
+
+
+def test_on_a_day_a_record_that_is_not_intact_is_never_the_one_in_force(releases):
+    seal(releases, "r1b", sealed="2026-11-19T00:00:00+00:00", tamper=True)
+    found = rs.find_releases([str(releases)], PRODUCT)
+    answer = rs.in_force(found.releases, date(2026, 11, 20), moment("2026-11-25T00:00:00"))
+    assert answer.at_start is not None and answer.at_start.expose_versions == {"orders": "1.4.0"}
+    assert [r.path[-4:] for r in answer.not_intact] == [f"{os.sep}r1b"]
+
+
+def test_with_no_intact_record_nothing_is_in_force_and_the_command_says_why(tmp_path, capsys):
+    root = tmp_path / "releases"
+    seal(root, "r1", sealed="2026-11-18T09:12:03+00:00", tamper=True)
+    assert runs_status("--release-dir", str(root)) == 1
+    out = capsys.readouterr().out
+    assert "No intact release of commerce.orders" in out and "Not in force:" in out
+    assert runs_status("--release-dir", str(root), "--json") == 1
+    (answer,) = json.loads(capsys.readouterr().out)["answers"]
+    assert answer["in_force"] is None and answer["not_intact"][0]["intact"] is False
+
+
+def test_a_release_dir_that_cannot_be_read_is_a_usage_error(tmp_path, caplog):
+    if os.geteuid() == 0:
+        pytest.skip("root reads every directory")
+    locked = tmp_path / "locked"
+    (locked / "releases").mkdir(parents=True)
+    locked.chmod(0)
+    try:
+        assert runs_status("--release-dir", str(locked / "releases")) == 2
+    finally:
+        locked.chmod(0o700)
+    assert "cannot be read" in caplog.text

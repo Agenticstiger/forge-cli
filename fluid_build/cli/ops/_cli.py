@@ -205,7 +205,7 @@ def _run_release_status(args: argparse.Namespace, logger: logging.Logger) -> int
             return 2
     try:
         found = rs.find_releases(args.release_dirs, args.product_id)
-    except NotADirectoryError as exc:
+    except (NotADirectoryError, PermissionError) as exc:
         logger.error("%s", exc)
         return 2
     if args.env is not None and not args.env.strip():
@@ -225,6 +225,7 @@ def _run_release_status(args: argparse.Namespace, logger: logging.Logger) -> int
                         "environment": a.environment,
                         "in_force": a.at_start.as_dict() if a.at_start else None,
                         "during": [r.as_dict() for r in a.during],
+                        "not_intact": [r.as_dict() for r in a.not_intact],
                     }
                     for a in answers
                 ],
