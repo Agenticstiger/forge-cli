@@ -945,9 +945,11 @@ def run_build(
     say: Callable[[str], None] = print,
     clients: Optional[ClientFactory] = None,
     local_host: Any = None,
+    run_id: Optional[str] = None,
 ) -> Optional[int]:
     """The build phase of ``fluid apply --mode amend-and-build`` for one Spark build: how its
     scheduler runs it. A local run lives in ``local_host`` (the contract's directory).
+    ``run_id`` is the pipeline's, which the runner stamps on each commit of the run.
 
     A scheduled build (batch, or a stream triggered ``availableNow``) gets one run, waited for
     until it ends or ``execution.runtime.timeout`` (:data:`DEFAULT_RUN_WAIT_S` when unset)
@@ -965,7 +967,7 @@ def run_build(
     import copy
 
     from fluid_build._contract_loader import resolve_contract_env_templates
-    from fluid_build.build_runners.spark._desired import desired_runs
+    from fluid_build.build_runners.spark._desired import desired_runs, run_stamps
     from fluid_build.spark.compiler import run_timeout_seconds
 
     bid = str(build.get("id"))
@@ -974,7 +976,7 @@ def run_build(
         raise ValueError(refusal)
     # As fluid plan and fluid apply read it: ``{{ env.* }}`` resolved.
     resolved = resolve_contract_env_templates(copy.deepcopy(dict(contract)))
-    runs = desired_runs(resolved, build_id=bid)
+    runs = desired_runs(resolved, build_id=bid, stamps=run_stamps(contract, run_id=run_id))
     if not runs:
         raise ValueError(
             f"Spark build {bid}: forge's Spark runner runs a build of engine: spark with "

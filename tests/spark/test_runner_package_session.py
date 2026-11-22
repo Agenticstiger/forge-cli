@@ -391,3 +391,23 @@ def test_a_run_leaves_no_view_and_no_copy_behind(spark, runner_module, tmp_path,
     runner_module.run_package(spark, runner_module.parse_config(json.dumps(config)), config_uri)
     assert made and not any(os.path.exists(d) for d in made)
     assert not spark.catalog.tableExists("package_output")
+
+
+def test_the_package_s_commits_carry_the_run_s_stamps(spark, runner_module, tmp_path, monkeypatch):
+    config, config_uri, sha = _deploy(tmp_path, monkeypatch, dead={"maxRecordsBeforeAbort": 10})
+    text = Path(config_uri).read_text()
+    run = "scheduled__2026-11-21T00:00:00+00:00"
+    stamps = runner_module.release_stamps(config, text, {"fluid.run-id": run})
+    runner_module.run_package(spark, runner_module.parse_config(text), config_uri, stamps)
+    (commit,) = _snapshots(spark, OUTPUT)
+    assert commit["summary"]["fluid.product"] == "commerce.orders-silver"
+    assert commit["summary"]["fluid.build"] == "merge-orders"
+    assert commit["summary"]["fluid.job-sha256"] == runner_module.config_digest(text)
+    assert commit["summary"]["fluid.run-id"] == run
+    assert commit["summary"]["fluid.package.sha256"] == sha
+    # The dead letters land once per scheduler run, whatever application retries it.
+    (letter,) = spark.table(DEAD).collect()
+    assert letter["run_id"] == run
+    (dead_commit,) = _snapshots(spark, DEAD)
+    assert dead_commit["summary"]["fluid.dead-letter.run"] == run
+    assert dead_commit["summary"]["fluid.run-id"] == run

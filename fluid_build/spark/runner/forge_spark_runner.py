@@ -24,6 +24,13 @@ credential).
   the pinned bytes, calls the entry point, checks the DataFrame it returns, and writes it
   as a batch run does; the package computes rows and never writes (:func:`run_package`).
 
+Every commit the runner makes (a batch's overwrite, the stream's append, a dead-letter table's
+append) carries ``fluid.*`` entries in its Iceberg snapshot summary: the product and build, the
+digest of the job config as it ran, and the product version, contract digest, release id and run
+id that ``fluid apply`` passes (``--fluid-product-version``, ``--fluid-contract-digest``,
+``--fluid-release-id``, ``--fluid-run-id``). The job's Spark conf holds the same as
+``spark.fluid.*``. Any of them missing is left out: a plain spark-submit runs the job too.
+
 The submitter puts on the classpath what the job uses: the Iceberg Spark runtime and
 its AWS bundle (EMR: the release's Iceberg; Glue: ``--datalake-formats iceberg``),
 ``spark-sql-kafka-0-10``, ``aws-msk-iam-auth`` for MSK IAM, and for Avro ``spark-avro``
@@ -79,6 +86,23 @@ RAW_KEY_HEADER = "fluid.dead-letter.raw-key"
 #: Snapshot summary keys that make a dead-letter table append happen once per batch.
 _DL_QUERY_PROPERTY = "fluid.dead-letter.query"
 _DL_BATCH_PROPERTY = "fluid.dead-letter.batch"
+#: The flags that carry a run's identity, and the snapshot summary key each becomes on every commit
+#: the runner makes. Iceberg keeps a ``snapshot-property.<key>`` write option as ``<key>`` in the
+#: commit's summary, for a batch write and for a stream's, and Spark lower-cases a stream's option
+#: keys, so the keys are lower case. They sit beside the ``spark.app.id`` Iceberg writes itself and
+#: never take the name of one of its own (the streaming sink's query and epoch ids).
+STAMP_FLAGS = (
+    ("--fluid-product-version", "fluid.product-version"),
+    ("--fluid-contract-digest", "fluid.contract-digest"),
+    ("--fluid-release-id", "fluid.release-id"),
+    ("--fluid-run-id", "fluid.run-id"),
+)
+#: What a stamp may hold: an identifier, a version, a digest, or the run id a scheduler names
+#: (``scheduled__2026-11-21T00:00:00+00:00``); never a space or a control character, so a value
+#: cannot change what the log line or the snapshot summary shows. A value ``fluid apply`` passes
+#: starts with a letter or a digit, so it is never read as an option of the command line.
+_STAMP_IDENT = re.compile(r"[A-Za-z0-9._:+@/=~-]{1,256}")
+_STAMP_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+@/=~-]{0,255}")
 GLUE_CATALOG_IMPL = "org.apache.iceberg.aws.glue.GlueCatalog"
 S3_FILE_IO = "org.apache.iceberg.aws.s3.S3FileIO"
 #: Session settings the generated SQL relies on.
@@ -110,6 +134,69 @@ def log(event: str, **fields: object) -> None:
     """One JSON line on stdout: never a credential, never a record."""
     sys.stdout.write(json.dumps({"forge_spark_runner": event, **fields}, sort_keys=True) + "\n")
     sys.stdout.flush()
+
+
+def _check_stamp(key: str, value: object, pattern: re.Pattern) -> None:
+    if not pattern.fullmatch(str(value)):
+        raise JobConfigError(
+            f"{key}: {str(value)[:60]!r} is not an identifier, a version, a digest or a run id "
+            "(letters, digits and . _ : + @ / = ~ -, at most 256 characters; a value passed on "
+            "the command line starts with a letter or a digit); the job was not run"
+        )
+
+
+def stamp_flags(args) -> dict:
+    """The ``--fluid-*`` values the command line carries, as stamps, each only when given (the
+    runner also runs under a plain spark-submit). Each is checked here, before Spark starts: a
+    value a stamp may not hold runs nothing.
+
+    Raises:
+        JobConfigError: a value holds a character a stamp may not.
+    """
+    given = {}
+    for flag, key in STAMP_FLAGS:
+        value = getattr(args, flag[2:].replace("-", "_"), None)
+        if value:
+            _check_stamp(key, value, _STAMP_VALUE)
+            given[key] = value
+    return given
+
+
+def release_stamps(config: dict, text: str, given: dict | None = None) -> dict:
+    """What identifies this run on every commit it makes: the product and build the config names,
+    the digest of the job config as it ran, and the version, contract digest, release and run
+    ``fluid apply`` handed over (``given``: :func:`stamp_flags`).
+
+    Raises:
+        JobConfigError: the config's product or build holds a character a stamp may not.
+    """
+    stamps = {
+        "fluid.product": config["product"],
+        "fluid.build": config["build"],
+        "fluid.job-sha256": config_digest(text),
+    }
+    for key, value in stamps.items():
+        _check_stamp(key, value, _STAMP_IDENT)
+    stamps.update(given or {})
+    return stamps
+
+
+def stamp_conf(spark, stamps: dict) -> None:
+    """The job's own conf holds the stamps as ``spark.<key>``, which the Spark UI and a listener
+    read. A conf Spark refuses is logged, not fatal: the commits carry the stamps."""
+    for key, value in stamps.items():
+        try:
+            spark.conf.set(f"spark.{key}", value)
+        except Exception as exc:  # noqa: BLE001 - Py4J's error: the stamp stays on the commits
+            log("stamp_conf_not_set", key=key, error=type(exc).__name__)
+
+
+def stamped(writer, stamps: dict | None):
+    """``writer`` (a DataFrameWriterV2 or a DataStreamWriter) with each stamp as the
+    ``snapshot-property.`` write option that puts it in the commit's snapshot summary."""
+    for key, value in (stamps or {}).items():
+        writer = writer.option(f"snapshot-property.{key}", value)
+    return writer
 
 
 def parse_config(text: str) -> dict:
@@ -491,8 +578,10 @@ def build_output(spark, config: dict):
     return spark.sql(queries["select"])
 
 
-def run(spark, config: dict) -> None:
+def run(spark, config: dict, stamps: dict | None = None) -> None:
     configure_session(spark, config)
+    stamps = stamps or {}
+    stamp_conf(spark, stamps)
     sink = config["sink"]
     table = f"{sink['catalog']}.{sink['table']}"
     log(
@@ -502,6 +591,7 @@ def run(spark, config: dict) -> None:
         mode=config["mode"],
         table=table,
         masked_columns=config.get("maskedColumns") or [],
+        stamps=stamps,
     )
     if config.get("maskedColumns"):
         mask = config.get("maskKey") or {}
@@ -512,14 +602,17 @@ def run(spark, config: dict) -> None:
     output = build_output(spark, config)
     if config["mode"] == "batch":
         # A batch run replaces the partitions it computes; a stream appends what it reads.
-        output.writeTo(table).option("check-nullability", "false").overwritePartitions()
+        stamped(
+            output.writeTo(table).option("check-nullability", "false"), stamps
+        ).overwritePartitions()
         log("done", table=table)
         return
-    writer = (
+    writer = stamped(
         output.writeStream.format("iceberg")
         .outputMode("append")
         .option("checkpointLocation", config["checkpoint"])
-        .option("check-nullability", "false")
+        .option("check-nullability", "false"),
+        stamps,
     )
     trigger = config.get("trigger") or {}
     if trigger.get("availableNow"):
@@ -535,7 +628,7 @@ def run(spark, config: dict) -> None:
     if dead:
         if seed is None and not _names(spark, f"{dead['checkpoint']}offsets"):
             seed = await_initial_offsets(spark, config["checkpoint"], query)
-        queries.append(start_dead_letters(spark, config, trigger, seed))
+        queries.append(start_dead_letters(spark, config, trigger, seed, stamps))
     await_queries(spark, queries)
     log("done", table=table)
 
@@ -564,8 +657,8 @@ class DeadLetters:
     """The dead letters' ``foreachBatch``: land each micro-batch's in its sink, count them,
     and fail the stream past the threshold, once that batch has landed."""
 
-    def __init__(self, spark, config: dict) -> None:
-        self.spark, self.config = spark, config
+    def __init__(self, spark, config: dict, stamps: dict | None = None) -> None:
+        self.spark, self.config, self.stamps = spark, config, stamps
         self.spec = config["deadLetter"]
         self.total = 0
         self._query_id: str | None = None
@@ -621,13 +714,13 @@ class DeadLetters:
         )
         if done:
             return
-        (
+        stamped(
             batch.writeTo(table)
             .option(f"snapshot-property.{_DL_QUERY_PROPERTY}", query)
             .option(f"snapshot-property.{_DL_BATCH_PROPERTY}", str(int(batch_id)))
-            .option("check-nullability", "false")
-            .append()
-        )
+            .option("check-nullability", "false"),
+            self.stamps,
+        ).append()
 
     def to_topic(self, batch) -> None:
         """Send the batch, at least once, with Kafka Connect's error-context headers.
@@ -677,10 +770,12 @@ class DeadLetters:
         )
 
 
-def start_dead_letters(spark, config: dict, trigger: dict, starting_offsets: str | None):
+def start_dead_letters(
+    spark, config: dict, trigger: dict, starting_offsets: str | None, stamps: dict | None = None
+):
     """The dead letters' own query: the records ``sql.check`` refuses, read by a source of
     its own (from ``starting_offsets`` when its checkpoint is new), with a checkpoint
-    inside the stream's and the stream's trigger."""
+    inside the stream's and the stream's trigger; a table's commits carry the run's ``stamps``."""
     spec, queries = config["deadLetter"], config["sql"]
     read_records(spark, config, starting_offsets).createOrReplaceTempView(DECODED_TABLE)
     checked = spark.sql(queries["check"])
@@ -691,7 +786,7 @@ def start_dead_letters(spark, config: dict, trigger: dict, starting_offsets: str
         select[1:3] = ["CAST(NULL AS BINARY) AS `raw_value`", "CAST(NULL AS BINARY) AS `raw_key`"]
     writer = (
         rows.selectExpr(*select)
-        .writeStream.foreachBatch(DeadLetters(spark, config))
+        .writeStream.foreachBatch(DeadLetters(spark, config, stamps))
         .option("checkpointLocation", spec["checkpoint"])
     )
     if trigger.get("availableNow"):
@@ -846,18 +941,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--fluid-job-sha256", help="the sha256 of the job config fluid apply started the run on"
     )
+    for flag, key in STAMP_FLAGS:
+        parser.add_argument(flag, help=f"stamped on every commit as {key}")
     # Glue passes its own --JOB_NAME and friends; they are not this runner's.
     args, _ = parser.parse_known_args(argv)
+    flags = stamp_flags(args)  # before Spark starts: a value a stamp may not hold runs nothing
     from pyspark.sql import SparkSession
 
     spark = SparkSession.builder.getOrCreate()
     text = checked_text(read_text(spark, args.config), args.fluid_job_sha256, args.config)
     config = parse_config(text)
+    stamps = release_stamps(config, text, flags)
     if config.get("package"):
         # The package's copy sits beside the job config: found from where it was read.
-        run_package(spark, config, args.config)
+        run_package(spark, config, args.config, stamps)
     else:
-        run(spark, config)
+        run(spark, config, stamps)
     return 0
 
 
@@ -1209,8 +1308,8 @@ def _check_callable(function, entry_point: str) -> None:
 class PackageContext:
     """What a package's entry point gets beside the session, read-only: ``arguments`` (the
     contract's strings), ``product``, ``build``, ``output`` (the table the runner writes,
-    which the function may read), ``run_id`` (Spark's application id) and
-    ``package_sha256``."""
+    which the function may read), ``run_id`` (the scheduler's run id when ``fluid apply``
+    hands one over, else Spark's application id) and ``package_sha256``."""
 
     __slots__ = ("arguments", "product", "build", "output", "run_id", "package_sha256")
 
@@ -1659,9 +1758,12 @@ def _reasons(failures: dict) -> str:
     return "; ".join(f"{reason}: {count}" for reason, count in sorted(failures.items()))
 
 
-def write_package_dead_letters(spark, checked, table: str, columns, run_id: str, sha: str) -> None:
+def write_package_dead_letters(
+    spark, checked, table: str, columns, run_id: str, sha: str, stamps: dict | None = None
+) -> None:
     """Append the rows the checks refused, once per run: a re-attempt of the run finds its
-    own snapshot, which carries the run's id, as a stream's dead letters keep their batch."""
+    own snapshot, which carries the run's id, as a stream's dead letters keep their batch. The
+    commit carries the run's ``stamps`` too."""
     from pyspark.sql.functions import col, current_timestamp, lit, struct, to_json
 
     done = (
@@ -1672,34 +1774,35 @@ def write_package_dead_letters(spark, checked, table: str, columns, run_id: str,
     )
     if done:
         return
-    (
-        checked.where(f"`{ERROR_COLUMN}` IS NOT NULL")
-        .select(
-            col(f"`{ERROR_COLUMN}`").alias("error"),
-            to_json(struct(*columns)).alias("row_json"),
-            lit(run_id).alias("run_id"),
-            lit(sha).alias("package_sha256"),
-            current_timestamp().alias("dead_lettered_at"),
-        )
-        .writeTo(table)
+    rows = checked.where(f"`{ERROR_COLUMN}` IS NOT NULL").select(
+        col(f"`{ERROR_COLUMN}`").alias("error"),
+        to_json(struct(*columns)).alias("row_json"),
+        lit(run_id).alias("run_id"),
+        lit(sha).alias("package_sha256"),
+        current_timestamp().alias("dead_lettered_at"),
+    )
+    stamped(
+        rows.writeTo(table)
         .option(f"snapshot-property.{_PACKAGE_RUN_PROPERTY}", run_id)
         .option(f"snapshot-property.{PACKAGE_SHA_PROPERTY}", sha)
-        .option("check-nullability", "false")
-        .append()
-    )
+        .option("check-nullability", "false"),
+        stamps,
+    ).append()
 
 
-def write_package_output(checked, table: str, columns, sha: str) -> None:
+def write_package_output(
+    checked, table: str, columns, sha: str, stamps: dict | None = None
+) -> None:
     """Replace the partitions the passing rows hold, as a batch run does, stamped with the
-    package's digest."""
-    (
+    package's digest and the run's ``stamps``."""
+    writer = (
         checked.where(f"`{ERROR_COLUMN}` IS NULL")
         .select(*columns)
         .writeTo(table)
         .option("check-nullability", "false")
         .option(f"snapshot-property.{PACKAGE_SHA_PROPERTY}", sha)
-        .overwritePartitions()
     )
+    stamped(writer, stamps).overwritePartitions()
 
 
 def _not_written(failed: int, failures: dict, dead) -> str:
@@ -1731,7 +1834,7 @@ def _call_package(spark, package: dict, zips: list, context) -> object:
     return output
 
 
-def _land(spark, config: dict, checked, columns, run_id: str, before: dict) -> None:
+def _land(spark, config: dict, checked, columns, run_id: str, before: dict, stamps: dict) -> None:
     """Count what the checks refused, refuse a table changed behind the runner's back, then
     land the dead letters and the output as :func:`package_outcome` says."""
     package, sink = config["package"], config["sink"]
@@ -1749,20 +1852,25 @@ def _land(spark, config: dict, checked, columns, run_id: str, before: dict) -> N
     land, write = package_outcome(failed, dead)
     if land:
         dead_table = f"{sink['catalog']}.{dead['table']}"
-        write_package_dead_letters(spark, checked, dead_table, columns, run_id, package["sha256"])
+        write_package_dead_letters(
+            spark, checked, dead_table, columns, run_id, package["sha256"], stamps
+        )
         log("dead_letters", table=dead_table, records=failed, reasons=failures)
     if not write:
         raise PackageError(_not_written(failed, failures, dead))
-    write_package_output(checked, table, columns, package["sha256"])
+    write_package_output(checked, table, columns, package["sha256"], stamps)
     log("done", table=table, rows=sum(counts.values()) - failed, dead_letters=failed)
 
 
-def run_package(spark, config: dict, config_uri: str) -> None:
+def run_package(spark, config: dict, config_uri: str, stamps: dict | None = None) -> None:
     """Run a prebuilt package's entry point by digest and write what it returns (see this
-    section's comment). Raises PackageError when the runner writes no output."""
+    section's comment), each commit carrying ``stamps`` (:func:`release_stamps`). Raises
+    PackageError when the runner writes no output."""
     from pyspark import StorageLevel
 
     configure_session(spark, config)
+    stamps = stamps or {}
+    stamp_conf(spark, stamps)
     package, sink = config["package"], config["sink"]
     table = f"{sink['catalog']}.{sink['table']}"
     dead = package.get("deadLetter")
@@ -1774,13 +1882,16 @@ def run_package(spark, config: dict, config_uri: str) -> None:
         table=table,
         package_sha256=package["sha256"],
         entry_point=package["entryPoint"],
+        stamps=stamps,
     )
     create_sink_table(spark, config)
     for statement in (dead or {}).get("create") or []:
         spark.sql(statement)
     zips = _add_package(spark, package_location(config_uri, package["sha256"]), package["sha256"])
     try:
-        run_id = str(spark.sparkContext.applicationId)
+        # The scheduler's run id when fluid apply hands one over (a retry of that run keeps
+        # it), else Spark's application id: what the dead letters land once for.
+        run_id = str(stamps.get("fluid.run-id") or spark.sparkContext.applicationId)
         # Before the package's code runs at all, its import included.
         watched = [table] + ([f"{sink['catalog']}.{dead['table']}"] if dead else [])
         before = {t: table_marker(spark, t) for t in watched}
@@ -1802,7 +1913,7 @@ def run_package(spark, config: dict, config_uri: str) -> None:
             # from the package's plan, so a package's output should be deterministic.
             checked = checked.persist(StorageLevel.MEMORY_AND_DISK)
             try:
-                _land(spark, config, checked, columns, run_id, before)
+                _land(spark, config, checked, columns, run_id, before, stamps)
             finally:
                 checked.unpersist()
         finally:

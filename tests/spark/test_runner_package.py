@@ -660,3 +660,25 @@ def test_a_zip_python_cannot_open_is_refused_by_name(runner, tmp_path, monkeypat
     monkeypatch.setattr(runner.zipfile, "ZipFile", unsupported)
     with pytest.raises(runner.PackageError, match=r"not a readable zip \(NotImplementedError\)"):
         runner.fetch_package(None, str(_copy(tmp_path)), SHA)
+
+
+def test_main_runs_a_package_config_by_its_location_with_the_run_s_stamps(
+    runner, contract, monkeypatch
+):
+    """The package's copy is found beside the job config read from --config, and the run's
+    commits carry the stamps fluid apply's flags name, as any run's do."""
+    session = types.SimpleNamespace(builder=types.SimpleNamespace(getOrCreate=lambda: "spark"))
+    monkeypatch.setitem(sys.modules, "pyspark", types.ModuleType("pyspark"))
+    monkeypatch.setitem(sys.modules, "pyspark.sql", types.SimpleNamespace(SparkSession=session))
+    text = config_text(contract)
+    monkeypatch.setattr(runner, "read_text", lambda spark, path: text)
+    seen = []
+    monkeypatch.setattr(runner, "run", lambda *a: seen.append(("run", a)))
+    monkeypatch.setattr(runner, "run_package", lambda *a: seen.append(("package", a)))
+    uri = "s3://commerce-lake/_fluid/spark/commerce.orders-silver/merge-orders/job.json"
+    assert runner.main(["--config", uri, "--fluid-run-id", "scheduled__2026-11-21"]) == 0
+    ((kind, (spark, config, where, stamps)),) = seen
+    assert (kind, spark, where) == ("package", "spark", uri)
+    assert config["package"]["sha256"] == SHA
+    assert stamps["fluid.run-id"] == "scheduled__2026-11-21"
+    assert stamps["fluid.job-sha256"] == runner.config_digest(text)
