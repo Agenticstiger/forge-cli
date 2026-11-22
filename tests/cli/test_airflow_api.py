@@ -93,7 +93,8 @@ def test_password_on_airflow_3_logs_in_and_sends_the_jwt():
         client.import_errors()
         login = [r for r in fake.requests if r.path == "/auth/token"]
         read = [r for r in fake.requests if r.path == "/api/v2/importErrors"]
-    assert login[0].method == "POST" and login[0].body == {"username": "admin", "password": "admin"}
+    expected = {"username": "admin", "password": "admin"}  # pragma: allowlist secret
+    assert login[0].method == "POST" and login[0].body == expected
     assert read[-1].authorization == "Bearer jwt-1-admin"
 
 
@@ -198,7 +199,10 @@ def test_a_5xx_during_connect_is_tried_again():
     "raw, event",
     [
         ("ftp://airflow.example.org", "schedule_sync_airflow_bad_url"),
-        ("https://user:pw@airflow.example.org", "schedule_sync_airflow_bad_url"),
+        (
+            "https://user:pw@airflow.example.org",  # pragma: allowlist secret
+            "schedule_sync_airflow_bad_url",
+        ),
         ("https://airflow.example.org/?token=x", "schedule_sync_airflow_bad_url"),
         ("https://airflow.example.org/#x", "schedule_sync_airflow_bad_url"),
         ("airflow.example.org", "schedule_sync_airflow_bad_url"),
