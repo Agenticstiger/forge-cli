@@ -148,7 +148,11 @@ def test_two_dags_on_one_file_name_are_refused() -> None:
     contract["builds"][0]["id"] = "maintain-order-lines"
     contract["exposes"][0]["exposeId"] = "order_lines"
     contract["builds"][0]["outputs"] = ["order_lines"]
-    with pytest.raises(fluid_apply.ScheduleRenderError, match="same DAG file"):
+    # The contract check names it first; the renderer's own file check is the backstop.
+    with pytest.raises(
+        fluid_apply.ScheduleRenderError,
+        match="has the name this table's maintenance takes|same DAG file",
+    ):
         _files(contract)
 
 

@@ -1152,7 +1152,7 @@ def main(argv: list[str] | None = None) -> int:
     text = checked_text(read_text(spark, args.config), args.fluid_job_sha256, args.config)
     config = parse_config(text)
     stamps = release_stamps(config, text, flags)
-    if config["mode"] == "maintenance":
+    if config.get("mode") == "maintenance":
         run_maintenance(spark, config, stamps)
     elif config.get("package"):
         # The package's copy sits beside the job config: found from where it was read.
@@ -2209,7 +2209,11 @@ def _whole(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _check_statement(step: dict) -> None:
+#: How forge renders a statement's head (sqlglot, Spark dialect): the words before the table.
+_STATEMENT_HEADS = {"DELETE": ("DELETE", "FROM"), "UPDATE": ("UPDATE",), "MERGE": ("MERGE", "INTO")}
+
+
+def _check_statement(step: dict, table: str) -> None:
     sql = step.get("sql")
     name = step.get("name")
     if not isinstance(name, str) or not _STAMP_IDENT.fullmatch(f"statement:{name}"):
@@ -2224,6 +2228,14 @@ def _check_statement(step: dict) -> None:
         raise JobConfigError(f"statement step {name}: SQL the runner cannot read") from None
     if separated:
         raise JobConfigError(f"statement step {name}: one statement, with no ';'")
+    head = _STATEMENT_HEADS[sql_write(sql)]
+    words = sql.split(" ", len(head) + 1)
+    written = words[len(head)].replace("`", "") if len(words) > len(head) else ""
+    if tuple(words[: len(head)]) != head or written.lower() != table.lower():
+        raise JobConfigError(
+            f"statement step {name}: it must start {' '.join(head)} {table}, as forge renders "
+            "it: a statement writes the job's own table"
+        )
 
 
 def _has_separator(text: str) -> bool:
@@ -2269,7 +2281,8 @@ def _check_maintenance(config: dict) -> None:
     for step in steps:
         kind = step["step"]
         if kind == "statement":
-            _check_statement(step)
+            sink = config["sink"]
+            _check_statement(step, f"{sink.get('catalog')}.{sink.get('table')}")
         elif kind == "rewrite_data_files":
             if step.get("strategy", "binpack") not in _STRATEGIES:
                 raise JobConfigError(f"rewrite_data_files strategy is one of {_STRATEGIES}")
@@ -2305,12 +2318,16 @@ class _Callable:
         implements = ["java.util.concurrent.Callable"]
 
 
-def stamped_sql(spark, sql: str, stamps: dict) -> None:
+def stamped_sql(spark, statement: str, stamps: dict) -> None:
     """Run one DML statement with ``stamps`` in the summary of the snapshot it commits.
     Iceberg's ``CommitMetadata.withCommitProperties`` holds them in a thread-local of the JVM
     thread that commits, the one py4j pins to this Python thread."""
+
+    def execute() -> None:
+        spark.sql(statement).collect()
+
     if not stamps:
-        spark.sql(sql).collect()
+        execute()
         return
     from pyspark.java_gateway import ensure_callback_server_started
 
@@ -2320,9 +2337,7 @@ def stamped_sql(spark, sql: str, stamps: dict) -> None:
     for key, value in stamps.items():
         props.put(key, value)
     jvm.org.apache.iceberg.spark.CommitMetadata.withCommitProperties(
-        props,
-        _Callable(lambda: spark.sql(sql).collect()),
-        jvm.java.lang.RuntimeException._java_lang_class,
+        props, _Callable(execute), jvm.java.lang.RuntimeException._java_lang_class
     )
 
 

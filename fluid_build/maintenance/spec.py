@@ -182,6 +182,11 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _plain(name: str) -> str:
+    """``name`` as a DAG file and a plan action spell it (``fluid_apply.dag_filename_for``)."""
+    return re.sub(r"[^A-Za-z0-9_]", "_", name)
+
+
 def _whole(value: Any, low: int, high: int) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
 
@@ -228,8 +233,10 @@ def _read_compaction(
         errors.append(
             f"{where}.strategy must be one of {', '.join(STRATEGIES[backend])} on backend {backend}"
         )
-    size = block.get("targetFileSizeMb", legacy.get("targetFileSizeMb"))
-    if block.get("targetFileSizeMb") is not None and legacy.get("targetFileSizeMb") not in (
+    # The legacy field is forge's runner's default; Glue's optimizer reads the table property.
+    default = legacy.get("targetFileSizeMb") if backend == "spark" else None
+    size = block.get("targetFileSizeMb", default)
+    if block.get("targetFileSizeMb") is not None and default not in (
         None,
         block.get("targetFileSizeMb"),
     ):
@@ -237,8 +244,13 @@ def _read_compaction(
             f"{where}.targetFileSizeMb and iceberg.compaction.targetFileSizeMb differ; keep one"
         )
     if size is not None and not _whole(size, 1, 1024 * 1024):
-        errors.append(f"{where}.targetFileSizeMb must be a whole number of megabytes")
-    if size is not None and backend == "glue":
+        source = (
+            f"{where}.targetFileSizeMb"
+            if "targetFileSizeMb" in block
+            else ("iceberg.compaction.targetFileSizeMb")
+        )
+        errors.append(f"{source} must be a whole number of megabytes")
+    if block.get("targetFileSizeMb") is not None and backend == "glue":
         errors.append(
             f"{where}.targetFileSizeMb: Glue's optimizer reads the table's "
             "write.target-file-size-bytes property, not a setting of its own; leave it out"
@@ -260,7 +272,9 @@ def _read_compaction(
         target_file_size_mb=size if _whole(size, 1, 1024 * 1024) else None,
         min_input_files=block.get("minInputFiles"),
         delete_file_threshold=block.get("deleteFileThreshold"),
-        max_commits=int(block.get("maxCommits") or DEFAULT_MAX_COMMITS),
+        max_commits=(
+            block["maxCommits"] if _whole(block.get("maxCommits"), 1, 1000) else DEFAULT_MAX_COMMITS
+        ),
         max_concurrent_rewrites=block.get("maxConcurrentRewrites"),
     )
 
@@ -298,7 +312,12 @@ def _read_expire(
             f"{where}.retainLast and iceberg.snapshotRetention.minSnapshotsToKeep differ; keep one"
         )
     if not _whole(retain, 1, 100_000):
-        errors.append(f"{where}.retainLast must be a whole number from 1 to 100000")
+        source = (
+            f"{where}.retainLast"
+            if "retainLast" in block
+            else "iceberg.snapshotRetention.minSnapshotsToKeep"
+        )
+        errors.append(f"{source} must be a whole number from 1 to 100000")
         retain = DEFAULT_RETAIN_LAST
     clean = block.get("cleanExpiredFiles", True)
     if not isinstance(clean, bool):
@@ -310,7 +329,12 @@ def _read_expire(
             "snapshots held; false is for backend glue"
         )
     if backend == "glue" and older % 86400:
-        errors.append(f"{where}.olderThan must be whole days on backend glue")
+        source = (
+            f"{where}.olderThan"
+            if block.get("olderThan") is not None
+            else "iceberg.snapshotRetention.maxSnapshotAgeMs"
+        )
+        errors.append(f"{source} must be whole days on backend glue")
     return ExpireSnapshots(
         older_than_seconds=older, retain_last=int(retain), clean_expired_files=clean
     )
@@ -516,6 +540,27 @@ def _read_spark_placement(
         )
         return schedule, timezone, None
     build = writers[0]
+    from fluid_build.build_runners._ids import IdentifierViolation, validate_identifier
+
+    try:
+        validate_identifier(eid, kind="exposeId")
+    except IdentifierViolation:
+        errors.append(
+            f"{where}: backend spark names the table's maintenance DAG and run after the "
+            f"expose, and {eid!r} is not an id they take (a letter or '_' first, then letters, "
+            "digits, '_', '.' or '-')"
+        )
+    clash = _plain(f"maintain_{eid}")
+    named_like = [
+        str(b.get("id"))
+        for b in contract.get("builds") or []
+        if isinstance(b, Mapping) and _plain(str(b.get("id"))) == clash
+    ]
+    if named_like:
+        errors.append(
+            f"{where}: build {named_like[0]} has the name this table's maintenance takes "
+            f"(its plan action spark_maintain_{eid} and its DAG maintain_{eid}); rename the build"
+        )
     if (spark_parameters(build) or {}).get("runtime") == "glue":
         errors.append(
             f"{where}: build {build.get('id')} runs on AWS Glue, whose one job is the build's "
@@ -613,6 +658,11 @@ def read_table(
         schedule, timezone, build_id = _read_spark_placement(contract, raw, eid, where, errors)
     else:
         role_arn, hours = _read_glue_placement(raw, expose, platform, where, errors)
+        if "runEveryHours" in raw and expire is None and orphans is None:
+            errors.append(
+                f"{where}.runEveryHours paces Glue's retention and orphan file deletion "
+                "optimizers, and neither is declared (compaction runs when Glue sees fit)"
+            )
     if len(errors) > before:
         return None
     return TableMaintenance(

@@ -1514,6 +1514,9 @@ def _run_maintain_mode(
     from fluid_build.cli import _spark_apply as _spark
     from fluid_build.observability.run_id import get_or_create_run_id
 
+    # As reconcile asks: at a terminal, before a run that may delete rows and files (--yes and
+    # the maintenance DAG, which passes it, skip the question).
+    ask = None if args.yes or dry_run or not os.isatty(0) else _confirm_reconcile
     return _spark.maintain_only(
         contract,
         logger,
@@ -1521,12 +1524,13 @@ def _run_maintain_mode(
         dry_run=dry_run,
         workspace=_spark_workspace(args, None),
         run_id=get_or_create_run_id(),
+        confirm=ask,
     )
 
 
 def _confirm_reconcile(question: str) -> bool:
-    """Ask on the terminal before ``--mode reconcile`` starts or cancels a run (``--yes``
-    skips it, as it skips apply's own prompt). An empty or closed input is a no; Ctrl-C
+    """Ask on the terminal before ``--mode reconcile`` starts or cancels a run, or ``--mode
+    maintain`` starts one (``--yes`` skips it, as it skips apply's own prompt). An empty or closed input is a no; Ctrl-C
     stops the command, as it stops any apply."""
     prompt = f"{question} [y/N]: "
     try:

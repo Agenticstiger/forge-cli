@@ -460,6 +460,7 @@ def maintain_only(
     workspace: Optional[Path] = None,
     clients: Any = None,
     run_id: Optional[str] = None,
+    confirm: Any = None,
 ) -> int:
     """``fluid apply --mode maintain``: one run of each backend-spark table maintenance (with
     ``expose_id``, that table's), started on its writer build's runtime and waited for; 1 when
@@ -469,6 +470,7 @@ def maintain_only(
     refused unless it is the one the contract compiles to now (``_adapters.checked_run``). A
     retried task finds its run going and waits for it. A dry run says what it would start and
     reads nothing from AWS. A backend-glue table has nothing to start: AWS runs its optimizers.
+    ``confirm`` (a terminal's ``[y/N]``) is asked before each run starts; a no starts nothing.
 
     Raises:
         CLIError: ``apply_maintain_not_declared`` (``expose_id`` declares no maintenance),
@@ -524,6 +526,12 @@ def maintain_only(
                 f"{head}: would start one run and wait up to {int(DEFAULT_RUN_WAIT_S)} s for it "
                 "to end"
             )
+            continue
+        if confirm is not None and not confirm(
+            f"Start {run.maintains}'s maintenance on {run.runtime} as build {run.build}'s role? "
+            "It may delete rows, snapshots and files"
+        ):
+            say(f"{head}: not started")
             continue
         say(f"{head}:")
         outcome = run_once(

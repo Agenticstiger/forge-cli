@@ -31,7 +31,7 @@ def test_the_runner_reads_what_the_compiler_writes(runner, contract):
     [
         ({"configVersion": 2}, "configVersion 1 only"),
         ({"sink": None}, "lacks"),
-        ({"mode": "micro"}, "streaming or batch"),
+        ({"mode": "micro"}, "streaming, batch or maintenance"),
         ({"checkpoint": None}, "keeps a checkpoint"),
     ],
 )
@@ -185,6 +185,8 @@ def test_the_runner_never_formats_the_query_text():
         or c.endswith('spark.sql(queries["check"])')
         # the sink's own CREATE ... IF NOT EXISTS statements, compiled by forge-cli
         or c == "spark.sql(statement)"
+        # a maintenance action's one DML statement, checked by forge-cli and the runner
+        or c == "spark.sql(statement).collect()"
         for c in calls
     )
 

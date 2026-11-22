@@ -578,7 +578,7 @@ def _maintenance_dags(contract: Dict[str, Any]) -> List[ScheduledDag]:
     return out
 
 
-def _declares_spark_maintenance(contract: Mapping[str, Any]) -> bool:
+def declares_spark_maintenance(contract: Mapping[str, Any]) -> bool:
     """Whether an expose declares ``iceberg.maintenance`` that runs on forge's Spark runner (no
     validation; ``backend`` defaults to ``spark``)."""
     for expose in contract.get("exposes") or []:
@@ -595,7 +595,7 @@ def has_scheduled_builds(contract: Dict[str, Any], *, maintenance: bool = False)
     """True when at least one build declares a trigger a DAG runs on (no validation): a cron,
     datasets, or both. ``maintenance=True`` counts a table's Spark maintenance too, which has
     a DAG of its own (:func:`_maintenance_dags`)."""
-    if maintenance and _declares_spark_maintenance(contract):
+    if maintenance and declares_spark_maintenance(contract):
         return True
     builds = contract.get("builds")
     if not isinstance(builds, list):
@@ -616,7 +616,7 @@ def runs_only_outside_schedulers(contract: Dict[str, Any], *, keepalive: bool = 
     A table's Spark maintenance has a DAG too. ``keepalive=False`` is for a renderer that has
     neither DAG (``scaffold-composer``).
     """
-    if keepalive and _declares_spark_maintenance(contract):
+    if keepalive and declares_spark_maintenance(contract):
         return False
     builds = [b for b in get_builds(contract) if isinstance(b, dict)]
     if not builds:
@@ -1581,9 +1581,9 @@ _MAINTENANCE_RUN = (
     "differs from what the contract compiles to now: run fluid apply first. The\n"
     "build's stream keeps running. The run takes the steps the table declares: a\n"
     "package's actions, compaction, manifests, snapshot expiry and orphan files.\n"
-    "It runs on SCHEDULE, one run at a time, with no catch-up, and the task never\n"
-    "retries: the next scheduled run is the retry. exposes[].iceberg.maintenance.\n"
-    "schedule sets SCHEDULE.\n"
+    "It runs on SCHEDULE (exposes[].iceberg.maintenance.schedule), one run at a\n"
+    "time, with no catch-up, and the task never retries: the next scheduled run is\n"
+    "the retry.\n"
 )
 
 _BUILDS_RUN = (
@@ -2018,6 +2018,7 @@ __all__ = [
     "ScheduledDag",
     "contract_env_names",
     "dag_filename_for",
+    "declares_spark_maintenance",
     "dag_id_for",
     "has_explicit_tasks",
     "has_scheduled_builds",

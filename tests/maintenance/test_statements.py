@@ -134,9 +134,11 @@ class TestCheckedStatements:
         )
         assert out == [f"DELETE FROM {TABLE} WHERE a = 1", f"UPDATE {TABLE} SET a = 2"]
 
-    def test_accepts_a_tuple_and_an_empty_list(self):
+    def test_accepts_a_tuple_and_refuses_an_empty_list(self):
         assert checked_statements((f"DELETE FROM {TABLE}",), TABLE, "w") == [f"DELETE FROM {TABLE}"]
-        assert checked_statements([], TABLE, "w") == []
+        # An action that runs nothing would compile to a job config the runner refuses.
+        with pytest.raises(ValueError, match="w: the action returned no statement"):
+            checked_statements([], TABLE, "w")
 
     @pytest.mark.parametrize("value", [None, 5, {"a": 1}, {f"DELETE FROM {TABLE}"}])
     def test_refuses_a_non_list(self, value):

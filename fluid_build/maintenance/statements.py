@@ -18,7 +18,7 @@ this check).
 
 from __future__ import annotations
 
-from typing import Any, List, Sequence
+from typing import Any, List, Sequence, Tuple
 
 #: The writes an action's statement may be.
 WRITES = ("DELETE", "UPDATE", "MERGE")
@@ -27,61 +27,93 @@ WRITES = ("DELETE", "UPDATE", "MERGE")
 _CONTROL = frozenset(chr(c) for c in range(32) if chr(c) not in "\t\n\r") | {chr(127)}
 
 
-def _target_name(expression: Any) -> str:
-    """The written table's name as ``catalog.db.table`` / ``db.table``, lower case."""
+def _target_parts(expression: Any) -> Tuple[str, ...]:
+    """The written table's name, part by part (``catalog``, ``db``, ``table``), lower case; a
+    part that is itself dotted (`` `fluid.silver`.orders ``) is kept whole, so it never equals
+    the three plain parts it spells."""
     from sqlglot import exp
 
     table = expression.this if not isinstance(expression, exp.Table) else expression
     if not isinstance(table, exp.Table):
-        return ""
-    parts = [p for p in (table.catalog, table.db, table.name) if p]
-    return ".".join(parts).lower()
+        return ()
+    return tuple(str(p).lower() for p in (table.catalog, table.db, table.name) if p)
+
+
+def _parsed(sql: str) -> Tuple[Any, str]:
+    """``(the one statement sqlglot reads in sql, "")`` or ``(None, why not)``."""
+    import sqlglot
+    from sqlglot import exp
+    from sqlglot.errors import SqlglotError
+
+    try:
+        parsed = [e for e in sqlglot.parse(sql, read="spark") if e is not None]
+    except (SqlglotError, RecursionError):  # ParseError, TokenError, nesting too deep
+        return None, "is not SQL Spark reads"
+    if len(parsed) != 1:
+        return None, "must be exactly one statement"
+    (statement,) = parsed
+    if not isinstance(statement, (exp.Delete, exp.Update, exp.Merge)):
+        return None, f"must be one of {', '.join(WRITES)}"
+    return statement, ""
+
+
+def canonical_statement(sql: Any, table: str) -> Tuple[str, str]:
+    """``(the statement as forge ships it, "")`` or ``("", why it may not run as an action on
+    table)``. ``table`` is the name the runner reads the table by, catalog first
+    (``fluid.silver.orders``): a statement names it so, since an unqualified name is read in
+    Spark's current catalog, which may be another.
+
+    What ships is sqlglot's own rendering of the statement it checked, without comments, never
+    the text it was given: Spark and sqlglot read some text differently (Spark continues a
+    ``--`` comment over a backslash-newline), so the bytes the runner executes must be the ones
+    whose target was checked. The rendering is read back and checked again."""
+    if not isinstance(sql, str) or not sql.strip():
+        return "", "is not a SQL statement"
+    if len(sql) > 20_000:
+        return "", "is longer than 20,000 characters"
+    if "${" in sql:
+        return "", "holds a ${...} variable"
+    if any(ch in _CONTROL for ch in sql):
+        return "", "holds a control character"
+    try:
+        import sqlglot  # noqa: F401 - a core dependency
+    except ImportError:  # pragma: no cover
+        return "", "cannot be checked: sqlglot is not installed"
+    wanted = tuple(table.lower().split("."))
+    statement, why = _parsed(sql)
+    if statement is None:
+        return "", why
+    if _target_parts(statement) != wanted:
+        return "", f"must write the action's own table, named {table}"
+    shipped = statement.sql(dialect="spark", comments=False)
+    again, why = _parsed(shipped)
+    if again is None or _target_parts(again) != wanted or "${" in shipped:
+        return "", "does not read back as the statement it was checked as"
+    return shipped, ""
 
 
 def statement_problem(sql: Any, table: str) -> str:
-    """Why ``sql`` may not run as an action on ``table``, or ``""``. ``table`` is the name the
-    runner reads the table by, catalog first (``fluid.silver.orders``): a statement names it
-    so, since an unqualified name is read in Spark's current catalog, which may be another."""
-    if not isinstance(sql, str) or not sql.strip():
-        return "is not a SQL statement"
-    if len(sql) > 20_000:
-        return "is longer than 20,000 characters"
-    if "${" in sql:
-        return "holds a ${...} variable"
-    if any(ch in _CONTROL for ch in sql):
-        return "holds a control character"
-    try:
-        import sqlglot
-        from sqlglot import exp
-        from sqlglot.errors import ParseError
-    except ImportError:  # pragma: no cover - sqlglot is a core dependency
-        return "cannot be checked: sqlglot is not installed"
-    try:
-        parsed = [e for e in sqlglot.parse(sql, read="spark") if e is not None]
-    except ParseError:
-        return "is not SQL Spark reads"
-    if len(parsed) != 1:
-        return "must be exactly one statement"
-    (statement,) = parsed
-    if not isinstance(statement, (exp.Delete, exp.Update, exp.Merge)):
-        return f"must be one of {', '.join(WRITES)}"
-    if _target_name(statement) != table.lower():
-        return f"must write the action's own table, named {table}"
-    return ""
+    """Why ``sql`` may not run as an action on ``table``, or ``""`` (:func:`canonical_statement`)."""
+    return canonical_statement(sql, table)[1]
 
 
 def checked_statements(statements: Any, table: str, where: str) -> List[str]:
-    """``statements`` as a list, each checked; raises ``ValueError`` naming the first problem
-    by its position (the SQL itself is never quoted)."""
+    """``statements`` as forge ships them (:func:`canonical_statement`), at least one; raises
+    ``ValueError`` naming the first problem by its position (the SQL itself is never quoted)."""
     if isinstance(statements, str) or not isinstance(statements, Sequence):
         raise ValueError(f"{where}: the action's statements are not a list of SQL statements")
+    if not statements:
+        raise ValueError(
+            f"{where}: the action returned no statement. Its statements are compiled into the "
+            "plan, so they are the SQL that runs every time, reading the rows it acts on then"
+        )
     out: List[str] = []
     for index, sql in enumerate(statements):
-        problem = statement_problem(sql, table)
+        shipped, problem = canonical_statement(sql, table)
         if problem:
             raise ValueError(f"{where}: statement {index} {problem}")
-        out.append(str(sql).strip().rstrip(";"))
+        out.append(shipped)
     return out
 
 
-__all__ = ["WRITES", "checked_statements", "statement_problem"]
+__all__ = ["WRITES", "canonical_statement", "checked_statements", "statement_problem"]

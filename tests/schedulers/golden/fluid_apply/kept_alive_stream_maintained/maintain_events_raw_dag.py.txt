@@ -13,9 +13,9 @@ maintenance job config the last fluid apply deployed. It refuses a config that
 differs from what the contract compiles to now: run fluid apply first. The
 build's stream keeps running. The run takes the steps the table declares: a
 package's actions, compaction, manifests, snapshot expiry and orphan files.
-It runs on SCHEDULE, one run at a time, with no catch-up, and the task never
-retries: the next scheduled run is the retry. exposes[].iceberg.maintenance.
-schedule sets SCHEDULE.
+It runs on SCHEDULE (exposes[].iceberg.maintenance.schedule), one run at a
+time, with no catch-up, and the task never retries: the next scheduled run is
+the retry.
 
 Worker requirements:
 

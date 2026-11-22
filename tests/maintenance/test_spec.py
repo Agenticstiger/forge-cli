@@ -518,7 +518,9 @@ class TestGluePlacement:
 
     @pytest.mark.parametrize("hours", [3, 168])
     def test_run_every_hours_edges(self, hours):
-        assert one(glue_block(runEveryHours=hours)).run_every_hours == hours
+        # It paces the retention and orphan optimizers, so one of them is declared.
+        block = glue_block(runEveryHours=hours, expireSnapshots={})
+        assert one(block).run_every_hours == hours
 
     def test_whole_days_only(self):
         assert has(
@@ -538,11 +540,11 @@ class TestGluePlacement:
         errors = errors_of(glue_block(compaction={"targetFileSizeMb": 128}))
         assert has(errors, "write.target-file-size-bytes")
 
-    def test_target_file_size_from_the_legacy_default_is_refused_too(self):
-        errors = errors_of(
-            glue_block(compaction={}), legacy={"compaction": {"targetFileSizeMb": 64}}
-        )
-        assert has(errors, "write.target-file-size-bytes")
+    def test_the_legacy_target_file_size_is_not_glues(self):
+        """The legacy field is forge's runner's default: Glue reads the table property, so the
+        field is left to it rather than refused for a block that never set it."""
+        table = one(glue_block(compaction={}), legacy={"compaction": {"targetFileSizeMb": 64}})
+        assert table.compaction is not None and table.compaction.target_file_size_mb is None
 
     @pytest.mark.parametrize("key", ["maxCommits", "maxConcurrentRewrites"])
     def test_runner_only_compaction_keys_are_refused(self, key):
