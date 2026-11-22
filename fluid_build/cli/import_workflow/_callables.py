@@ -37,8 +37,9 @@ read once, whichever DAG file of the scan runs it. Every value is folded (:mod:`
 folding of the bodies is lent by the folders and counted against one budget per DAG file, as large
 as a module's, so that neither the file's own operators nor another file's tasks lose to it. The
 DAG files of one scan spend at most :data:`MAX_VISITS_PER_SCAN` visits and
-:data:`MAX_LENT_STEPS_PER_SCAN` lent steps between them (:class:`FollowBudget`), so many small
-files that run one heavy function do not add up.
+:data:`MAX_LENT_STEPS_PER_SCAN` lent steps between them, and each Python task followed adds its
+share (:class:`FollowBudget`): many small files that run one heavy function do not add up, and an
+estate of many light tasks is read whole.
 """
 
 from __future__ import annotations
@@ -84,6 +85,11 @@ MAX_VISITS = 200_000
 MAX_VISITS_PER_SCAN = 500_000
 MAX_LENT_STEPS_PER_SCAN = 500_000
 MAX_LENT_CHARS_PER_SCAN = 16_000_000
+#: What each Python task a scan follows adds to those visits and steps: an estate of many light
+#: tasks is read whole (a task that runs a shared EMR helper takes about 100 visits and 30
+#: steps), while files that run a heavy function cost no more than their tasks' share.
+VISITS_PER_TASK = 250
+LENT_STEPS_PER_TASK = 250
 #: What tasks' functions submitted, kept between the files of a scan.
 MAX_SHARED_RESULTS = 20_000
 #: The characters of a command line read for the cost of one visit (a visit and two characters
@@ -111,6 +117,10 @@ Place = Tuple[Union[int, str], Tuple[str, ...]]
 Template = Tuple[Union[str, Place], ...]
 
 #: Calls that run a command: the first argument is the command, as words or as a line.
+#: The EMR methods whose argument holds the work (see :meth:`Follower._emr_call`).
+_EMR_METHODS = frozenset(
+    {"add_job_flow_steps", "run_job_flow", "create_job_flow", "start_job_run", "submit_job"}
+)
 _RUNNERS = frozenset(
     {
         "subprocess.run",
@@ -198,6 +208,38 @@ def _as_text(value: Any) -> Optional[str]:
     return None
 
 
+def _steps_built_by_calls(calls: Sequence[Tuple[ast.Call, List[Submit]]]) -> List[Submit]:
+    """What the calls of a body submitted, in order. An EMR call whose work a function builds
+    (``add_job_flow_steps(Steps=steps(script))``) does not fold, and says a step whose script is
+    not known; when a call inside it submitted a script that is known, that is the step: it is
+    submitted as the EMR call submits (``emr-step``), and the unknown one is dropped. The calls
+    are in the order they are written, so those inside one follow it."""
+    found = [list(submits) for _, submits in calls]
+    for k, (node, submits) in enumerate(calls):
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr in _EMR_METHODS):
+            continue
+        unknown = [s for s in submits if not isinstance(s.script, str)]
+        if not unknown:
+            continue
+        end = node_position(node, end=True)
+        inside = []
+        for j in range(k + 1, len(calls)):
+            if node_position(calls[j][0]) >= end:
+                break
+            if any(isinstance(s.script, str) for s in found[j]):
+                inside.append(j)
+        if not inside:
+            continue
+        found[k] = [s for s in submits if isinstance(s.script, str)]
+        for j in inside:
+            found[j] = [
+                replace(s, runtime=unknown[0].runtime) if isinstance(s.script, str) else s
+                for s in found[j]
+            ]
+    return [submit for submits in found for submit in submits]
+
+
 def _keyword(call: ast.Call, *names: str) -> Optional[ast.expr]:
     for keyword in call.keywords:
         if keyword.arg in names:
@@ -250,9 +292,20 @@ class FollowBudget:
     def __init__(self) -> None:
         self.visits_left = MAX_VISITS_PER_SCAN
         self.lent_left = [MAX_LENT_STEPS_PER_SCAN, MAX_LENT_CHARS_PER_SCAN]
+        #: What it was given in all: the scan's, and each Python task's share.
+        self.allowed_visits = MAX_VISITS_PER_SCAN
+        self.allowed_steps = MAX_LENT_STEPS_PER_SCAN
         #: The DAG files whose tasks were cut short by this budget, not by their own.
         self.cut_files = 0
         self.read: Dict[Tuple[Any, ...], List[Submit]] = {}
+
+    def add_task(self) -> None:
+        """A Python task to follow brings its share (:data:`VISITS_PER_TASK`,
+        :data:`LENT_STEPS_PER_TASK`)."""
+        self.visits_left += VISITS_PER_TASK
+        self.lent_left[0] += LENT_STEPS_PER_TASK
+        self.allowed_visits += VISITS_PER_TASK
+        self.allowed_steps += LENT_STEPS_PER_TASK
 
 
 class Follower:
@@ -335,6 +388,7 @@ class Follower:
         if target.helper is not None:
             return target.shown, self._helper_submits(target, arguments, call.lineno)
         if target.function is not None:
+            self.budget.add_task()
             return target.shown, self._function_submits(target, arguments, call.lineno, 0, ())
         if target.named:
             self.unread[target.shown] = self.unread.get(target.shown, 0) + 1
@@ -346,6 +400,7 @@ class Follower:
         name = getattr(function, "name", "lambda")
         target = _Target(name, function=function, module=self.module, folder=self.folder)
         arguments = _Arguments(complete=False, why=f"`{name}` is given its values when it runs")
+        self.budget.add_task()
         return self._function_submits(target, arguments, function.lineno, 0, ())  # type: ignore[attr-defined]
 
     # ── what is called ──────────────────────────────────────────────
@@ -601,7 +656,10 @@ class Follower:
             return []
         # a task's function given the same arguments again is read once (what a function deeper
         # down submits also depends on how deep it is and on what called it: those are not kept)
-        where = (module.rel, function.lineno, function.col_offset)  # type: ignore[attr-defined]
+        # by the path the index knows the file by: the one a DAG file is shown by can be another
+        # file's path in the index
+        rel = module.index_rel or module.rel
+        where = (rel, function.lineno, function.col_offset)  # type: ignore[attr-defined]
         key = (*where, _key(arguments)) if depth == 0 else None
         kept = self.budget.read
         if key is not None and key[-1] is not None and key in kept:
@@ -739,7 +797,10 @@ class Follower:
         spec: ast.arguments = function.args  # type: ignore[attr-defined]
         positional = [*spec.posonlyargs, *spec.args]
         enclosing = folder.scope_of(function)
-        where = (module.rel, function.lineno, function.col_offset)  # type: ignore[attr-defined]
+        # by the path the index knows the file by: the one a DAG file is shown by can be another
+        # file's path in the index
+        rel = module.index_rel or module.rel
+        where = (rel, function.lineno, function.col_offset)  # type: ignore[attr-defined]
         top = enclosing.owner is module.tree
         if top and where in self._defaults:
             return self._defaults[where]
@@ -763,7 +824,7 @@ class Follower:
         depth: int,
         stack: Tuple[ast.AST, ...],
     ) -> List[Submit]:
-        from_calls: List[Submit] = []
+        calls: List[Tuple[ast.Call, List[Submit]]] = []
         from_lists: List[Submit] = []
         for node in nodes:
             if self._visits() <= 0:
@@ -771,9 +832,10 @@ class Follower:
                 break
             self._charge(1)
             if isinstance(node, ast.Call):
-                from_calls.extend(self._call(node, module, folder, line, depth, stack))
+                calls.append((node, self._call(node, module, folder, line, depth, stack)))
             else:
                 from_lists.extend(self._argv(node, folder, line))
+        from_calls = _steps_built_by_calls(calls)
         # an argument list the body hands to a call that was read is that call's submit
         seen = {(s.script, s.shown, s.args) for s in from_calls}
         return from_calls + [s for s in from_lists if (s.script, s.shown, s.args) not in seen]
@@ -916,6 +978,7 @@ __all__ = [
     "MAX_DEPTH",
     "MAX_VISITS",
     "MAX_VISITS_PER_SCAN",
+    "VISITS_PER_TASK",
     "FollowBudget",
     "Follower",
     "SubmitHelper",

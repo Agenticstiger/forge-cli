@@ -26,7 +26,9 @@ The rules, in one place:
   trigger (``continuous`` for a long-running stream), and the DAG facts under
   ``execution.orchestration`` with ``mode: manual`` and ``generateOnChange: false``. A
   ``schedule`` trigger is never written: ``fluid generate schedule`` would render a second DAG
-  for it, next to the one that already runs the job.
+  for it, next to the one that already runs the job. An Airflow DAG or task id the contract's
+  pattern does not take (capitals) is recorded under :func:`ident` of it, unique in the import,
+  and the report says which Airflow id each such recorded id stands for.
 * **Nothing is invented.** Columns are not in the code, so ``contract.schema`` is empty with a
   TODO that ``fluid validate --strict`` reports (or the columns of the topic's registry subject,
   when ``--registry`` is given); a binding the code and conventions do not decide is ``other``.
@@ -174,6 +176,122 @@ def _unique(base: str, taken: Set[str], separator: str) -> str:
         counters[base] = number
     taken.add(candidate)
     return candidate
+
+
+#: Ids recorded under another id, named one by one in the report; the rest are counted.
+MAX_ID_LINES = 20
+
+
+class _AirflowIds:
+    """The ``dagId`` and ``taskId`` each DAG and task is recorded under. An Airflow id that fits
+    the contract's pattern is recorded as it is; one that does not (``Nightly_Orders``: Airflow
+    takes capitals, the contract does not) is recorded as :func:`ident` of it, made unique among
+    the DAG ids of the import (a task's among the task ids of its DAG) with a number after it.
+    Ids that fit are taken first and never change; the others are mapped in source order, so one
+    import of the same code always records the same ids. The running DAG keeps its own ids: the
+    report says what each recorded id stands for."""
+
+    def __init__(self, dags: Sequence[Dag]) -> None:
+        self._dag: Dict[int, str] = {}
+        self._task: Dict[Tuple[int, str], str] = {}
+        #: Who holds each recorded DAG id, and each task id per DAG: said when an id is taken.
+        self._dag_holders: Dict[str, str] = {}
+        #: What each id recorded under another id stands for, and those of them written.
+        self._explain: Dict[Tuple[str, int, str], str] = {}
+        self._used: Set[Tuple[str, int, str]] = set()
+        ordered = sorted(dags, key=lambda d: (d.file, d.line, d.dag_id or ""))
+        taken = _Names()
+        #: Airflow DAG id -> the recorded id of the first DAG of that id.
+        self._by_airflow_id: Dict[str, str] = {}
+        for dag in ordered:
+            if dag.dag_id and _AIRFLOW_ID.fullmatch(dag.dag_id):
+                self._dag[id(dag)] = dag.dag_id
+                taken.add(dag.dag_id)
+                self._dag_holders.setdefault(
+                    dag.dag_id, f"DAG {dag.dag_id!r} ({dag.file}:{dag.line})"
+                )
+        for dag in ordered:
+            if dag.dag_id and id(dag) not in self._dag:
+                base = ident(dag.dag_id, "dag")
+                recorded = _unique(base, taken, "_")
+                self._dag[id(dag)] = recorded
+                why = self._taken(base, recorded, self._dag_holders.get(base))
+                self._dag_holders.setdefault(
+                    recorded, f"DAG {dag.dag_id!r} ({dag.file}:{dag.line})"
+                )
+                self._explain[("dag", id(dag), "")] = (
+                    f"DAG {safe_text(dag.dag_id, 80)!r} ({safe_text(dag.file, 80)}:{dag.line}) "
+                    f"is recorded as dagId {recorded!r}{why}"
+                )
+            self._tasks(dag)
+        for dag in ordered:
+            if dag.dag_id:
+                self._by_airflow_id.setdefault(dag.dag_id, self._dag[id(dag)])
+
+    @staticmethod
+    def _taken(base: str, recorded: str, holder: Optional[str]) -> str:
+        if recorded == base:
+            return ""
+        return f" ({base!r} is the recorded id of {safe_text(holder or 'another', 120)})"
+
+    def _tasks(self, dag: Dag) -> None:
+        taken = _Names()
+        holders: Dict[str, str] = {}
+        for task in dag.tasks:
+            if task.task_id and _AIRFLOW_ID.fullmatch(task.task_id):
+                self._task[(id(dag), task.key)] = task.task_id
+                taken.add(task.task_id)
+                holders.setdefault(task.task_id, f"task {task.task_id!r} of the same DAG")
+        for task in dag.tasks:
+            if not task.task_id or (id(dag), task.key) in self._task:
+                continue
+            base = ident(task.task_id, "task")
+            recorded = _unique(base, taken, "_")
+            self._task[(id(dag), task.key)] = recorded
+            why = self._taken(base, recorded, holders.get(base))
+            holders.setdefault(recorded, f"task {task.task_id!r} of the same DAG")
+            self._explain[("task", id(dag), task.key)] = (
+                f"task {safe_text(task.task_id, 80)!r} of DAG "
+                f"{safe_text(dag.dag_id or dag.shown, 80)!r} ({safe_text(task.file, 80)}:"
+                f"{task.line}) is recorded as taskId {recorded!r}{why}"
+            )
+
+    def label(self, dag_id: str) -> str:
+        """The recorded id of the first DAG (in file order) whose Airflow id is ``dag_id``: what a
+        product made of a DAG is named after."""
+        return self._by_airflow_id.get(dag_id) or ident(dag_id)
+
+    def task_label(self, dag: Dag, task: Task) -> str:
+        """The recorded id of a task, for a product made of a task."""
+        return self._task.get((id(dag), task.key)) or ident(task.task_id or "task")
+
+    def dag_id(self, dag: Dag) -> Optional[str]:
+        """The ``dagId`` the DAG is recorded under (``None``: its id is not a constant)."""
+        found = self._dag.get(id(dag))
+        if found is not None and ("dag", id(dag), "") in self._explain:
+            self._used.add(("dag", id(dag), ""))
+        return found
+
+    def task_id(self, dag: Dag, task: Task) -> Optional[str]:
+        """The ``taskId`` the task is recorded under (``None``: its id is not a constant)."""
+        found = self._task.get((id(dag), task.key))
+        if found is not None and ("task", id(dag), task.key) in self._explain:
+            self._used.add(("task", id(dag), task.key))
+        return found
+
+    def report(self, report: ImportReport) -> None:
+        """A line for each id written under another id than the running DAG's."""
+        lines = [self._explain[key] for key in sorted(self._used, key=lambda k: self._explain[k])]
+        for line in lines[:MAX_ID_LINES]:
+            report.required_defaults.append(
+                f"{line}: a FLUID dagId or taskId has only lower case letters, digits, '_', '.' "
+                "and '-'. The running DAG keeps its own id"
+            )
+        if len(lines) > MAX_ID_LINES:
+            report.required_defaults.append(
+                f"{len(lines) - MAX_ID_LINES} more Airflow id(s) are recorded under a FLUID id "
+                "(not listed one by one); the running DAGs keep their own ids"
+            )
 
 
 @dataclass(frozen=True)
@@ -431,6 +549,8 @@ class _Ctx:
     #: ``(text, trigger)`` of the streaming writes of the outputs a product owns of a job, by
     #: ``(id(group), id(job))``: worked out once, where the proposal is held to its size.
     streams: Dict[Tuple[int, int], Tuple[str, str]] = field(default_factory=dict)
+    #: The ``dagId`` and ``taskId`` each DAG and task of the import is recorded under.
+    ids: _AirflowIds = field(default_factory=lambda: _AirflowIds(()))
 
 
 def _job_labels(jobs: Sequence[JobRecord]) -> Dict[str, str]:
@@ -453,14 +573,22 @@ def _job_labels(jobs: Sequence[JobRecord]) -> Dict[str, str]:
     return labels
 
 
-def _groups(outputs: List[Output], split_by: str, conv: Conventions, root_name: str) -> List[Group]:
+def _groups(
+    outputs: List[Output],
+    split_by: str,
+    conv: Conventions,
+    root_name: str,
+    ids: Optional[_AirflowIds] = None,
+) -> List[Group]:
     """The products: outputs grouped by what the split is about. Groups are keyed by what they
     are (a job's absolute path, a DAG id, a folder, ``None`` for files at the top), never by
-    the label made from it, so two jobs named alike are two products."""
+    the label made from it, so two jobs named alike are two products. A product made of a DAG
+    or of a task is named after the ids they are recorded under (``ids``)."""
     keyed: Dict[Tuple[Any, ...], Group] = {}
     labels = _job_labels(list({str(o.writer.path): o.writer for o in outputs}.values()))
+    names = ids if ids is not None else _AirflowIds(())
     for output in outputs:
-        key, label = _key_and_label(split_by, output, conv, root_name, labels)
+        key, label = _key_and_label(split_by, output, conv, root_name, labels, names)
         if conv.domain and split_by != "table":
             label = ident(f"{conv.domain}.{label}")
         group = keyed.get(key)
@@ -471,7 +599,12 @@ def _groups(outputs: List[Output], split_by: str, conv: Conventions, root_name: 
 
 
 def _key_and_label(
-    split_by: str, output: Output, conv: Conventions, root_name: str, labels: Dict[str, str]
+    split_by: str,
+    output: Output,
+    conv: Conventions,
+    root_name: str,
+    labels: Dict[str, str],
+    ids: _AirflowIds,
 ) -> Tuple[Tuple[Any, ...], str]:
     """The key of the product ``output`` goes to, and the name that product gets."""
     job = output.writer
@@ -482,14 +615,15 @@ def _key_and_label(
         return own
     if split_by == "dag":
         dag_ids = sorted({link.dag.dag_id for link in job.tasks if link.dag.dag_id})
-        return (("dag", dag_ids[0]), ident(dag_ids[0])) if dag_ids else own
+        return (("dag", dag_ids[0]), ident(ids.label(dag_ids[0]))) if dag_ids else own
     if split_by == "task":
         first = _first_links(job)
         if first and first[0].task.task_id and first[0].dag.dag_id:
             # the outputs of every job one task runs are one product (a driver's job list)
             link = first[0]
             key = ("task", link.dag.file, link.dag.line, link.task.key)
-            return key, ident(f"{link.dag.dag_id}.{link.task.task_id}")
+            dag_label = ids.label(link.dag.dag_id)
+            return key, ident(f"{dag_label}.{ids.task_label(link.dag, link.task)}")
         return own
     if split_by == "folder":
         head = job.rel.split("/")[0] if "/" in job.rel else None
@@ -932,7 +1066,11 @@ def build_proposal(
     outputs = _collect_outputs(ordered, conv, report)
 
     flat = sorted(outputs.values(), key=lambda o: (o.writer.shown, o.write.line, o.identity.shown))
-    groups = _groups(flat, split_by, conv, root_name)
+    # the ids every DAG and task is recorded under: what a DAG's or a task's product is named after
+    airflow_ids = _AirflowIds(
+        list({id(link.dag): link.dag for job in ordered for link in job.tasks}.values())
+    )
+    groups = _groups(flat, split_by, conv, root_name, airflow_ids)
     if len(groups) > MAX_PRODUCTS:
         raise ProposalTooLarge(
             f"the proposal would hold {len(groups):,} products (the most is {MAX_PRODUCTS:,})"
@@ -1042,8 +1180,10 @@ def build_proposal(
         catalogs=catalogs or CatalogKinds(),
         max_consumes=listed,
         streams=streams,
+        ids=airflow_ids,
     )
     contracts = [_product(group, group_ids[index], ctx) for index, group in enumerate(groups)]
+    ctx.ids.report(report)
 
     external = ctx.external
     if external:
@@ -1422,14 +1562,15 @@ def _task_entry(link: LinkedTask, report: ImportReport, ctx: _Ctx) -> Optional[D
         return ctx.entries[id(link)]
     dag, task, reported = link.dag, link.task, ctx.reported
     entry: Optional[Dict[str, Any]] = None
-    if not task.task_id or not _AIRFLOW_ID.fullmatch(task.task_id):
+    task_id = ctx.ids.task_id(dag, task)
+    if task_id is None:
         mark = ("task-id", task.file, task.line)
         if mark not in reported:
             reported.add(mark)
             report.unsupported.append(
                 f"{safe_text(task.file, 80)}:{task.line} the task id "
-                f"{safe_text(task.shown, 60)!r} in DAG {safe_text(dag.dag_id, 60)} does not "
-                "match the contract's task id pattern, so the task is not recorded"
+                f"{safe_text(task.shown, 60)!r} in DAG {safe_text(dag.dag_id, 60)} is not a "
+                "constant, so the task is not recorded"
             )
     else:
         params: Dict[str, Any] = {
@@ -1453,7 +1594,7 @@ def _task_entry(link: LinkedTask, report: ImportReport, ctx: _Ctx) -> Optional[D
         # rule and refused for want of a contract_path. ``custom`` is the type that names
         # nothing forge-cli runs.
         entry = {
-            "taskId": task.task_id,
+            "taskId": task_id,
             "type": "custom",
             "operator": task.operator,
             "params": params,
@@ -1462,8 +1603,9 @@ def _task_entry(link: LinkedTask, report: ImportReport, ctx: _Ctx) -> Optional[D
         upstream_ids = []
         for up in index.upstream.get(task.key, ()):
             up_task = index.task_by_key.get(up)
-            if up_task and up_task.task_id and _AIRFLOW_ID.fullmatch(up_task.task_id):
-                upstream_ids.append(up_task.task_id)
+            up_id = ctx.ids.task_id(dag, up_task) if up_task is not None else None
+            if up_id is not None:
+                upstream_ids.append(up_id)
         if upstream_ids:
             entry["dependencies"] = upstream_ids
     ctx.entries[id(link)] = entry
@@ -1493,15 +1635,15 @@ def _orchestration(
 ) -> Optional[Dict[str, Any]]:
     first = links[0]
     dag, reported = first.dag, ctx.reported
-    if not dag.dag_id or not _AIRFLOW_ID.fullmatch(dag.dag_id):
+    dag_id = ctx.ids.dag_id(dag)
+    if dag_id is None:
         mark = ("dag-id", dag.file, dag.line)
         if mark not in reported:  # one DAG feeds several jobs: say it once
             reported.add(mark)
             report.unsupported.append(
                 f"{safe_text(dag.file, 80)}:{dag.line} the DAG id "
-                f"{safe_text(dag.dag_id or dag.shown, 60)!r} does not match the contract's DAG id "
-                "pattern (lower case letters, digits, '_', '.', '-'), so the DAG is not recorded "
-                "on the builds it runs"
+                f"{safe_text(dag.shown, 60)!r} is not a constant, so the DAG is not recorded on "
+                "the builds it runs"
             )
         return None
     others = sorted({link.dag.dag_id for link in links if link.dag is not dag and link.dag.dag_id})
@@ -1517,7 +1659,7 @@ def _orchestration(
         config["tags"] = [safe_text(t, 60) for t in dag.tags]
     if dag.catchup is not None:
         config["catchup"] = dag.catchup
-    airflow: Dict[str, Any] = {"dagId": dag.dag_id}
+    airflow: Dict[str, Any] = {"dagId": dag_id}
     if config:
         airflow["dagConfig"] = config
     tasks: List[Dict[str, Any]] = []
