@@ -574,6 +574,7 @@ _OTHER_CLIENTS = {
     "fluid_build/providers/gcp/util/auth.py": "googleapiclient request .execute()",
     "fluid_build/output_ports/mcp/drivers/postgres.py": "psycopg cursor health probe",
     "fluid_build/output_ports/mcp/drivers/snowflake.py": "Snowflake cursor health probe",
+    "fluid_build/spark/runner/forge_spark_runner.py": "Iceberg's Spark actions' .execute()",
 }
 
 #: The start of a statement that returns rows, for an ``execute()`` whose result
