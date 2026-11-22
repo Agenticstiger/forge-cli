@@ -734,8 +734,10 @@ def test_a_scalar_made_of_a_read_through_a_name_that_is_assigned_twice_still_fee
         a = spark.table("raw.a")
         a.where(F.col("d") > cutoff).write.saveAsTable("mart.t1")
         spark.table("raw.c").write.saveAsTable("mart.t2")
+        spark.table("raw.d").count()
         """,
     )
+    # the write is made of what it names (and the name of every assignment), not of every read
     assert got == {"mart.t1": ["raw.a", "raw.b", "raw.b2"], "mart.t2": ["raw.c"]}
 
 
@@ -959,3 +961,124 @@ def test_what_only_feeds_an_ignored_write_nobody_reads_is_on_no_product(tmp_path
         IGNORE,
     )
     assert got == {"mart.t1": ["raw.c"]}
+
+
+def test_a_list_built_by_additions_is_not_taken_for_a_constant_of_the_module(tmp_path, monkeypatch):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        """
+        cols = ["x"]
+
+
+        def build():
+            cols = ["a"]
+            cols += [spark.table("raw.b").first()[0]]
+            spark.table("raw.a").select(*cols).write.saveAsTable("mart.t1")
+
+
+        build()
+        spark.table("raw.c").write.saveAsTable("mart.t2")
+        """,
+    )
+    assert got == {"mart.t1": ["raw.a", "raw.b"], "mart.t2": ["raw.c"]}
+
+
+def test_a_memory_sink_with_a_name_the_file_does_not_give_makes_a_bare_name_uncertain(
+    tmp_path, monkeypatch
+):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        """
+        def sink(df, name):
+            df.writeStream.format("memory").queryName(name).start()
+
+
+        sink(spark.readStream.table("raw.s"), "m")
+        spark.sql("INSERT INTO mart.t1 SELECT * FROM m JOIN raw.a ON 1=1")
+        spark.sql("INSERT INTO mart.t2 SELECT * FROM raw.c")
+        spark.table("raw.d").count()
+        """,
+    )
+    assert {"raw.a", "raw.s", "raw.d"} <= set(got["mart.t1"]) and got["mart.t2"] == ["raw.c"]
+
+
+def test_a_sink_that_is_not_a_memory_sink_names_no_view(tmp_path, monkeypatch):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        """
+        spark.readStream.table("raw.s").writeStream.format("parquet").queryName("q").start("s3://o/")
+        spark.sql("INSERT INTO mart.t1 SELECT * FROM q JOIN raw.a ON 1=1")
+        spark.table("raw.d").count()
+        """,
+    )
+    assert got["mart.t1"] == ["q", "raw.a"]  # closed: it lists what the statement names, no more
+
+
+def test_a_write_the_conventions_ignore_that_does_not_say_what_feeds_it_makes_what_reads_it_loose(
+    tmp_path, monkeypatch
+):
+    got = with_conventions(
+        tmp_path,
+        monkeypatch,
+        """
+        def build():
+            return spark.table("raw.a")
+
+
+        build().write.saveAsTable("tmp_stage")
+        spark.sql("INSERT INTO mart.t1 SELECT * FROM tmp_stage JOIN raw.b ON 1=1")
+        spark.table("raw.d").count()
+        """,
+        IGNORE,
+    )
+    assert got == {"mart.t1": ["raw.a", "raw.b", "raw.d"]}
+
+
+def test_the_reads_that_only_feed_an_ignored_write_may_feed_a_product_that_does_not_say(
+    tmp_path, monkeypatch
+):
+    got = with_conventions(
+        tmp_path,
+        monkeypatch,
+        """
+        def build():
+            return spark.table("raw.c")
+
+
+        spark.sql("INSERT INTO tmp_stage SELECT * FROM raw.a")
+        build().write.saveAsTable("mart.t1")
+        """,
+        IGNORE,
+    )
+    assert got == {"mart.t1": ["raw.a", "raw.c"]}
+
+
+def test_two_ignored_writes_of_one_table_both_feed_what_reads_it(tmp_path, monkeypatch):
+    got = with_conventions(
+        tmp_path,
+        monkeypatch,
+        """
+        spark.sql("INSERT INTO tmp_stage SELECT * FROM raw.a")
+        spark.sql("INSERT INTO tmp_stage SELECT * FROM raw.b")
+        spark.sql("INSERT INTO mart.t1 SELECT * FROM tmp_stage")
+        """,
+        IGNORE,
+    )
+    assert got == {"mart.t1": ["raw.a", "raw.b"]}
+
+
+def test_ignored_writes_that_feed_each_other_do_not_loop(tmp_path, monkeypatch):
+    got = with_conventions(
+        tmp_path,
+        monkeypatch,
+        """
+        spark.sql("INSERT INTO tmp_a SELECT * FROM tmp_b JOIN raw.a ON 1=1")
+        spark.sql("INSERT INTO tmp_b SELECT * FROM tmp_a JOIN raw.b ON 1=1")
+        spark.sql("INSERT INTO mart.t1 SELECT * FROM tmp_a")
+        """,
+        IGNORE,
+    )
+    assert got == {"mart.t1": ["raw.a", "raw.b"]}

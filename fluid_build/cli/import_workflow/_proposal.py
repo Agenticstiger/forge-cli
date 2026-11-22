@@ -529,15 +529,13 @@ def _through_bridges(
     pools = _pools(job)
     owned = set(owned)
     queue = list(owned)
-    crossed: Set[Tuple[str, str]] = set()
     while queue:
         read = pools.by_key.get(queue.pop())
         if read is None:
             continue
         key = _bridge_key(read)
-        if key not in bridges or key in crossed:
+        if key not in bridges:
             continue
-        crossed.add(key)
         feeds = bridges[key]
         if feeds is None:
             loose = True

@@ -1,0 +1,272 @@
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
+
+"""Which assignments of a variable can be the last to set its trigger when a statement runs.
+
+Each case is a short body: ``w = base`` starts the variable, every later ``w = w.trigger(...)`` is
+numbered from 1 in the order the code gives them, and ``use("name")`` is a statement whose state is
+read. The state is the set of numbers that can be the last (0 is the first assignment).
+"""
+
+from __future__ import annotations
+
+import ast
+import textwrap
+from typing import Dict, FrozenSet
+
+import pytest
+
+from fluid_build.cli.import_workflow import _flow
+
+
+def states(source: str) -> Dict[str, FrozenSet[int]]:
+    tree = ast.parse(textwrap.dedent(source))
+    base = None
+    setters: Dict[int, int] = {}
+    uses: Dict[str, ast.stmt] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            if node.targets[0].id != "w":
+                continue
+            if base is None or node.lineno < base.lineno:
+                base = node
+    assert base is not None
+    later = sorted(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Assign)
+            and isinstance(n.targets[0], ast.Name)
+            and n.targets[0].id == "w"
+            and n is not base
+        ),
+        key=lambda n: n.lineno,
+    )
+    for number, node in enumerate(later, start=1):
+        setters[id(node)] = number
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and getattr(node.value.func, "id", None) == "use"
+        ):
+            uses[node.value.args[0].value] = node  # type: ignore[attr-defined]
+    flow = _flow.Flow(base, setters)
+    only = tree.body[0] if len(tree.body) == 1 else None
+    # the body of a function is read as its own: the flow does not go into a nested one
+    flow.run(only.body if isinstance(only, ast.FunctionDef) else tree.body)
+    return {name: flow.before.get(id(stmt)) for name, stmt in uses.items()}  # type: ignore[misc]
+
+
+def test_a_straight_line_keeps_the_last_assignment():
+    got = states(
+        """
+        w = base
+        use("a")
+        w = w.trigger(1)
+        use("b")
+        w = w.trigger(2)
+        use("c")
+        """
+    )
+    assert got == {"a": {0}, "b": {1}, "c": {2}}
+
+
+def test_an_if_with_an_else_has_either_arm_and_an_if_without_has_the_path_through_none():
+    got = states(
+        """
+        w = base
+        if a:
+            w = w.trigger(1)
+        else:
+            w = w.trigger(2)
+        use("both")
+        if b:
+            w = w.trigger(3)
+        use("one")
+        """
+    )
+    assert got == {"both": {1, 2}, "one": {1, 2, 3}}
+
+
+def test_a_use_inside_an_arm_has_only_the_state_of_that_arm():
+    got = states(
+        """
+        w = base
+        if a:
+            w = w.trigger(1)
+            use("in")
+        else:
+            use("out")
+        """
+    )
+    assert got == {"in": {1}, "out": {0}}  # the state before the use statement
+
+
+@pytest.mark.parametrize("ender", ["return", "raise ValueError"])
+def test_an_arm_that_ends_does_not_reach_what_follows_the_if(ender):
+    got = states(
+        f"""
+        def f():
+            w = base
+            if a:
+                w = w.trigger(1)
+                {ender}
+            use("after")
+        """
+    )
+    assert got == {"after": {0}}
+
+
+def test_what_follows_a_return_is_not_reached():
+    got = states(
+        """
+        def f():
+            w = base
+            return 1
+            use("never")
+        """
+    )
+    assert got["never"] is None
+
+
+def test_a_loop_may_not_run_and_a_second_pass_sees_what_the_first_left():
+    got = states(
+        """
+        w = base
+        for i in x:
+            use("top")
+            w = w.trigger(1)
+        use("after")
+        """
+    )
+    assert got == {"top": {0, 1}, "after": {0, 1}}
+
+
+def test_a_loop_else_runs_unless_the_loop_breaks():
+    got = states(
+        """
+        w = base
+        for i in x:
+            if i:
+                break
+        else:
+            w = w.trigger(1)
+        use("after")
+        """
+    )
+    assert got == {"after": {0, 1}}  # the path through the break keeps 0
+    got = states(
+        """
+        w = base
+        for i in x:
+            pass
+        else:
+            w = w.trigger(1)
+        use("after")
+        """
+    )
+    assert got == {"after": {0, 1}}  # no pass: the else still runs, and a pass leaves 0 too
+
+
+def test_a_while_loop_is_read_like_a_for_loop():
+    got = states(
+        """
+        w = base
+        while a:
+            w = w.trigger(1)
+        use("after")
+        """
+    )
+    assert got == {"after": {0, 1}}
+
+
+def test_a_try_body_may_stop_anywhere_and_a_handler_starts_from_what_it_may_have_set():
+    got = states(
+        """
+        w = base
+        try:
+            w = w.trigger(1)
+        except E:
+            use("handler")
+        use("after")
+        """
+    )
+    assert got == {"handler": {0, 1}, "after": {0, 1}}
+
+
+def test_a_handler_may_start_from_a_first_assignment_the_body_makes():
+    got = states(
+        """
+        try:
+            w = base
+            w = w.trigger(1)
+        except E:
+            use("handler")
+        """
+    )
+    assert got == {"handler": {0, 1}}
+
+
+def test_the_else_of_a_try_runs_after_the_body():
+    got = states(
+        """
+        w = base
+        try:
+            pass
+        except E:
+            pass
+        else:
+            w = w.trigger(1)
+        use("after")
+        """
+    )
+    assert got == {"after": {0, 1}}  # the else after a body that finished, or the handler's 0
+
+
+def test_a_use_in_finally_has_every_way_there():
+    got = states(
+        """
+        w = base
+        try:
+            w = w.trigger(1)
+        finally:
+            use("final")
+        use("after")
+        """
+    )
+    assert got == {"final": {0, 1}, "after": {1}}
+
+
+def test_a_with_body_runs():
+    got = states(
+        """
+        w = base
+        with x:
+            w = w.trigger(1)
+        use("after")
+        """
+    )
+    assert got == {"after": {1}}
+
+
+def test_a_match_may_take_no_case():
+    got = states(
+        """
+        w = base
+        match x:
+            case 1:
+                w = w.trigger(1)
+            case _:
+                w = w.trigger(2)
+        use("after")
+        """
+    )
+    assert got == {"after": {0, 1, 2}}
+
+
+def test_a_body_that_costs_too_much_is_not_read(monkeypatch):
+    monkeypatch.setattr(_flow, "MAX_VISITS", 20)
+    source = "w = base\n" + "pass\n" * 30
+    with pytest.raises(_flow.TooMuch):
+        states(source)

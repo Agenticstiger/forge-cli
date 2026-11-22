@@ -51,8 +51,8 @@ def test_an_argument_made_short_by_collapsing_its_white_space_is_read_whole():
 
 
 def test_a_flag_before_an_argument_that_was_too_long_does_not_mask_the_one_after_it():
-    got = R.safe_args(["--password", "x" * 5_000, "--table", "orders"], limit=10_000)
-    assert got[2:] == ["--table", "orders"]
+    got = R.safe_args(["--password", "x" * 5_000, "orders"], limit=10_000)
+    assert got[1:] == [R._too_long("an argument", 5_000), "orders"]
 
 
 def test_a_command_too_long_to_read_shows_only_its_size():
@@ -235,6 +235,9 @@ def test_the_new_rules_cost_in_proportion_to_the_text():
         "a/b@c:" + "1" * 4_000,
         '"' * 2_000 + "a/" + "\\" * 1_000,
         "x/" + "@:1" * 1_300,
+        "cat <<EOF\n" * 1_500,  # a here-document that never ends, over and over
+        "".join(f"cat <<D{index}\n" for index in range(1_500)),
+        "# it's a note\n" * 1_000,
     ]
     started = time.perf_counter()
     for text in hostile:
@@ -242,3 +245,9 @@ def test_the_new_rules_cost_in_proportion_to_the_text():
         R.safe_command(text)
         R.safe_text(text)
     assert time.perf_counter() - started < 10
+
+
+def test_a_setting_too_deep_to_read_is_hidden_when_it_names_a_credential():
+    deep = R._Words(R._MAX_DEPTH)
+    assert deep._setting("run --password QZXV7391", "-c") == MASK
+    assert deep._setting("run --table orders", "-c") == "run --table orders"

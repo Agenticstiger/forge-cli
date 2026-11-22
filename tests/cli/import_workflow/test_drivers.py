@@ -664,6 +664,9 @@ def test_a_list_that_gives_a_key_twice_is_not_read(tmp_path):
 def test_a_merge_key_and_a_repeated_key_in_two_mappings_are_not_duplicates(tmp_path):
     text = "base: &b {a: 1}\nx: {<<: *b, c: 2}\ny: {c: 3}\n"
     assert C.duplicate_key(text) is None
+    two_merges = "base: &b {a: 1}\nc: &c {d: 2}\ny: {<<: *b, <<: *c}\n"
+    assert C.duplicate_key(two_merges) is None  # a merge key may come twice
+    assert C.duplicate_key("1: a\n'1': b\n") is None  # a number and a text are two keys
     assert C.duplicate_key("a: 1\nb: {a: 1}\nc: [{a: 1}, {a: 2}]\n") is None
     assert C.duplicate_key("a: 1\nb: [{a: 1, a: 2}]\n") == "b[0].a"
 

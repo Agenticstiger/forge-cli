@@ -1317,8 +1317,6 @@ class _Reader:
                 found = self._trigger(link.call)
                 if found:
                     triggers[link.branch] = found
-                elif link.branch:
-                    triggers[link.branch] = "default"  # one the code does not read: not a one-shot
             elif link.name == "foreachBatch" and args:
                 foreach = args[0]
             elif link.name == "foreach":
@@ -1449,6 +1447,7 @@ class _Reader:
         branches = sorted({link.branch for link in own if link.branch})
         if not branches:
             return triggers.get(0)
+        # a branch whose trigger the code does not read may be anything: not a one-shot
         chosen = [triggers.get(branch, "default") for branch in branches]
         if not all(link.covered for link in own if link.branch):
             chosen.append(triggers.get(0, "default"))
