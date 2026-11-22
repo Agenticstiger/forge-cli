@@ -283,6 +283,32 @@ def test_fluid_apply_starts_leaves_alone_and_stops_a_local_stream(tmp_path, caps
     assert "Spark ingest-orders (local): stopped run" in out and "CANCELLED" in out
 
 
+def test_fluid_apply_stops_a_changed_local_stream_between_batches(tmp_path, capsys):
+    """The old run is asked through its stop request, ends cleanly, and the new config starts
+    on the same checkpoint; the request is withdrawn."""
+    from fluid_build.cli import main
+
+    data = stream_contract()
+    path = write(tmp_path, data)
+    runs = _runs(tmp_path, data)
+    try:
+        assert main(["apply", str(path), "--yes"]) == 0
+        (first,) = runs.runs()
+        assert first.stop_key
+        data["builds"][0]["properties"]["stream"]["maxOffsetsPerTrigger"] = 500
+        write(tmp_path, data)
+        assert main(["apply", str(path), "--yes"]) == 0
+        out = _said(capsys)
+        assert "Spark ingest-orders (local): restarted run" in out
+        assert f"run {first.run_id} stopped between batches" in out
+        assert runs.get(first.run_id).state == "SUCCEEDED"
+        assert not list((tmp_path / ".fluid").rglob("stop/*"))
+    finally:
+        data["builds"] = []
+        write(tmp_path, data)
+        assert main(["apply", str(path), "--yes"]) == 0
+
+
 def test_a_declined_apply_starts_no_local_run(tmp_path, monkeypatch):
     """No at apply's prompt applies nothing, and starts no local Spark run either."""
     from fluid_build.cli import apply as apply_cli

@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A changed Spark stream stops between batches before `fluid apply` replaces it.** Where a
+  changed config used to cancel the running stream, `fluid apply` now asks it to stop: each
+  stream's run is started with a stop key (`--fluid-stop-key`, the start's own token), and the
+  request is an object at `stop/<key>` beside the build's job config (`_fluid/spark/<product>/
+  <build>/`, which the job's role already reads and lists; on `runtime: local`, under
+  `FLUID_SPARK_LOCAL_ROOT`). The runner looks for it every 10 s, stops each of its queries once no
+  batch is running in it (or right after a batch commits, when batches run back to back), and ends
+  cleanly; the new config then starts on the same checkpoint. A run that has not stopped within
+  `FLUID_SPARK_STOP_GRACE_SECONDS` (default 300, `0` cancels at once), was started by an older
+  `fluid apply` without a key, or was started on another job config (the output's location moved,
+  so it would never see the request), is cancelled as before, and the request is removed whatever
+  happens, Ctrl-C included. The outcome names the config the stream moved from and to, and how
+  each old run stopped; a dry run and the plan's `stateImpact` say which runs would stop between
+  batches. A stream that moves to `trigger.availableNow` has its continuous run stopped the same
+  way. A second writer on the checkpoint (a second copy of the same config, or a run of another config
+  beside one of the new config) is still cancelled at once, and `--mode reconcile`, which never
+  replaces a config, writes no request. Before a stream reads anything, the runner refuses a
+  checkpoint (or the dead letters' checkpoint) whose newest offsets name another topic, which also
+  catches a checkpoint no recorded run used (a prefix copied from another stream, a new EMR
+  cluster with no step history). Moving `properties.stream.checkpoint` still starts the job from
+  `startingOffsets`, as the 0.7.7 schema says, unless the new prefix already holds a position
+  (Spark resumes it); the outcome now says which, from the runs' history. The first apply after
+  the upgrade still cancels each running stream once (see Upgrade notes).
 - **`--adopt-tables` takes existing Glue tables over into the OpenTofu state, each only
   when it matches the contract.** `fluid plan <contract> --tofu --adopt-tables` (and
   `fluid apply <contract> --adopt-tables`) finds the tables the contract names that
@@ -514,6 +537,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `aws glue get-table`, so a concurrent commit fails the update instead of being reverted. Where
   the run can pass flags and keeps its state, `--adopt-tables` once also works; adopting does not
   write the id, so a run that keeps no state needs the parameter.
+- Every Spark stream running when forge is upgraded is replaced once by the first `fluid apply`
+  after the upgrade, by a cancel, as before: the runner changed, so the config hash did, and a run
+  started before the upgrade has no stop key, so it cannot be asked to stop between batches. From
+  then on a changed stream stops between batches (see Added). A plan made before the upgrade is
+  refused at `fluid apply` (`apply_spark_artifact_mismatch`): plan again with the new version.
 
 ## [0.36.0] — 2026-11-19
 

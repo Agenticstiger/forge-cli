@@ -65,6 +65,7 @@ def identity_of(run):
         "config_hash": run.config_hash,
         "source_id": run.source_id,
         "checkpoint_id": run.checkpoint_id,
+        "config_uri": run.job_uri,
     }
 
 
@@ -86,7 +87,7 @@ def _serverless_start(run):
         "jobDriver": {
             "sparkSubmit": {
                 "entryPoint": run.runner_uri,
-                "entryPointArguments": started(run).entry_args(),
+                "entryPointArguments": started(run).entry_args(stop_key="tok"),
                 "sparkSubmitParameters": ad._submit_parameters(run.spark_conf),
             }
         },
@@ -271,6 +272,7 @@ def test_glue_start_passes_identity_and_conf_as_arguments(glue_run):
         "--fluid-source": glue_run.source_id,
         "--fluid-checkpoint": glue_run.checkpoint_id,
         "--fluid-job-sha256": started(glue_run).job_sha256,
+        "--fluid-stop-key": "tok",
         "--conf": " --conf ".join(f"{k}={v}" for k, v in conf),
     }
     stub.add_response(
@@ -331,7 +333,7 @@ def ec2_run(run):
 def test_ec2_start_adds_a_spark_submit_step_that_continues_on_failure(ec2_run):
     adapter, stub = adapter_on(ec2_run, "emr")
     args = ["spark-submit", "--deploy-mode", "client", *ad._conf_params(ec2_run.spark_conf)]
-    args += [ec2_run.runner_uri, *started(ec2_run).entry_args()]
+    args += [ec2_run.runner_uri, *started(ec2_run).entry_args(stop_key="tok")]
     stub.add_response(
         "add_job_flow_steps",
         {"StepIds": ["s-1"]},
@@ -453,7 +455,7 @@ def test_eks_start_sets_cluster_release_and_retry_policy(eks_run):
             "releaseLabel": "emr-7.12.0",
             "jobDriver": {"sparkSubmitJobDriver": {
                 "entryPoint": eks_run.runner_uri,
-                "entryPointArguments": started(eks_run).entry_args(),
+                "entryPointArguments": started(eks_run).entry_args(stop_key="tok"),
                 "sparkSubmitParameters": ad._submit_parameters(eks_run.spark_conf),
             }},
             "tags": eks_run.tags(),
@@ -598,10 +600,12 @@ def test_ec2_history_pages_until_this_builds_last_step(ec2_run):
 def test_a_restart_carries_the_run_it_restarts_and_reads_back_as_one(ec2_run):
     adapter, stub = adapter_on(ec2_run, "emr")
     args = ["spark-submit", "--deploy-mode", "client", *ad._conf_params(ec2_run.spark_conf)]
-    args += [ec2_run.runner_uri, *started(ec2_run).entry_args("s-dead")]
-    assert args[-4:] == [
+    args += [ec2_run.runner_uri, *started(ec2_run).entry_args("s-dead", stop_key="tok")]
+    assert args[-6:] == [
         "--fluid-job-sha256",
         started(ec2_run).job_sha256,
+        "--fluid-stop-key",
+        "tok",
         "--fluid-restart-of",
         "s-dead",
     ]
@@ -620,6 +624,7 @@ def test_a_restart_carries_the_run_it_restarts_and_reads_back_as_one(ec2_run):
     stub.add_response("describe_step", {"Step": step}, {"ClusterId": "j-ABC", "StepId": "s-2"})
     restarted = adapter.get("s-2")
     assert (restarted.restart_of, restarted.config_hash) == ("s-dead", ec2_run.config_hash)
+    assert restarted.stop_key == "tok"  # what a later release asks it to stop by
 
 
 def test_serverless_restart_marks_its_arguments(serverless):
