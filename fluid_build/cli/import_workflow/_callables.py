@@ -191,7 +191,7 @@ def _key(arguments: _Arguments) -> Optional[Tuple[Any, ...]]:
         return None
     left = [_MAX_KEY_ITEMS, _MAX_KEY_CHARS]
 
-    def freeze(value: Any) -> Any:
+    def keyed(value: Any) -> Any:
         left[0] -= 1
         if isinstance(value, str):
             left[1] -= len(value)
@@ -201,17 +201,17 @@ def _key(arguments: _Arguments) -> Optional[Tuple[Any, ...]]:
             left[1] -= len(value.why) + len(value.text)
             return ("?", value.why, value.text)
         if isinstance(value, dict):
-            items = tuple((repr(k), freeze(v)) for k, v in value.items())
+            items = tuple((repr(k), keyed(v)) for k, v in value.items())
             return ("{", getattr(value, "complete", True), items)
         if isinstance(value, (list, tuple)):
             kind = type(value).__name__
-            return ("[", kind, getattr(value, "complete", True), tuple(freeze(v) for v in value))
+            return ("[", kind, getattr(value, "complete", True), tuple(keyed(v) for v in value))
         return ("=", type(value).__name__, value)
 
     try:
         return (
-            tuple(freeze(v) for v in arguments.positional),
-            tuple(sorted((k, freeze(v)) for k, v in arguments.keywords.items())),
+            tuple(keyed(v) for v in arguments.positional),
+            tuple(sorted((k, keyed(v)) for k, v in arguments.keywords.items())),
             arguments.complete,
             arguments.why,
         )
