@@ -173,3 +173,24 @@ def test_fluid_generate_schedule_writes_the_maintenance_dag(
     args = parser.parse_args(["schedule", "c.fluid.yaml", "-o", "out"])
     assert generate_schedule.run(args, logging.getLogger("test.maintenance")) == 0
     assert sorted(p.name for p in (tmp_path / "out").iterdir()) == [FILE]
+
+
+def test_a_maintenance_dag_alerts_through_the_contracts_routes() -> None:
+    """The contract's alert routes are wired into its maintenance DAG as into its other DAGs:
+    a failed maintenance run alerts like a failed build."""
+    contract = _contract()
+    contract["alerts"] = {
+        "routes": [
+            {"name": "ops", "kind": "slack", "connection": "slack_ops"},
+            {"name": "oncall", "kind": "pagerduty", "connection": "pagerduty_ops"},
+        ]
+    }
+    source = _files(contract)[FILE]
+    compile(source, FILE, "exec")
+    assert "**ALERT_TASK_ARGS," in source and "**ALERT_DAG_ARGS," in source
+    assert "SlackWebhookNotifier" in source and "PagerdutyNotifier" in source
+    assert "on_failure_callback" in source
+    # Its documentation names the routes, after the maintenance run's own text.
+    doc = source.split('"""', 2)[1]
+    assert doc.startswith("Scheduled fluid table maintenance")
+    assert "Alerts, from the contract's alerts.routes: ops (slack" in " ".join(doc.split())
