@@ -29,9 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the organisation's layout as data (script prefixes, data path prefixes, helper function names,
   config modules, environment names, owners, layers, what to ignore, the product id rule); it is
   read strictly and no code in it runs. `--registry` reads a written topic's columns through the
-  existing schema-registry importer, only when asked. Every proposal is checked by `fluid
-  validate`'s own rules (the schema and every contract rule) before anything is written, so what
-  the command writes is what `fluid validate` reads back without an error. A table in a Spark
+  existing schema-registry importer, only when asked. Every proposal is checked against the
+  schema before anything is written (a schema error stops the import), and `fluid validate`'s
+  contract rules are run on it: what they find that no code can give (the columns, a Databricks
+  schema, a Snowflake warehouse) is listed in the report and the contract is still written. A
+  table in a Spark
   catalog (`glue_catalog.raw.orders`) gets `binding.location.catalog` only when its kind is
   known: the alias is a kind FLUID knows, a conventions rule maps it, or the scanned code sets
   `spark.sql.catalog.<alias>.type` or a `catalog-impl` (Glue, REST, Hive, Nessie, Hadoop) in
@@ -48,7 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parsed; one import reads at most 64 MB of source, keeps at most 200,000 syntax-tree nodes parsed
   at once and spends at most 2 MB on reading dropped modules again; the work spent folding a name,
   the text a module's memo keeps and the size of a string are capped (4,096 characters, 262,144
-  for the statement a `spark.sql` takes, and what a module builds in all); one import parses at most
+  for the statement a `spark.sql` takes, and 4,000,000 for what a module builds in all); one import
+  parses at most
   1,500,000 characters of SQL (a statement once per file); a table or path name over 512
   characters is not kept; a job records at most 1,000 of its tasks, a command keeps its first 20
   submits and a task lists at most 100 arguments; one proposal holds at most 50,000 outputs and
