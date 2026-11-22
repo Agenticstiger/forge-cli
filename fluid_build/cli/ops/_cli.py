@@ -105,6 +105,34 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--json", action="store_true", help="Emit JSON")
 
 
+def _add_release_flags(p: argparse.ArgumentParser) -> None:
+    """The flags that make ``fluid runs status`` read sealed releases instead of run records."""
+    p.add_argument(
+        "--release-dir",
+        action="append",
+        dest="release_dirs",
+        metavar="DIR",
+        help=(
+            "Read the sealed releases `fluid ship --release-dir` published (DIR is one release "
+            "or a directory of them; repeatable) and say which was in force: for jobs Forge "
+            "does not run, which leave no run record. Replaces the run records."
+        ),
+    )
+    p.add_argument(
+        "--on",
+        metavar="YYYY-MM-DD",
+        help="With --release-dir: the UTC day to answer for (default: now)",
+    )
+    p.add_argument(
+        "--env",
+        metavar="NAME",
+        help=(
+            "With --release-dir: answer only for the releases of this environment "
+            "(default: one answer per environment the releases name)"
+        ),
+    )
+
+
 def register_runs(subparsers: argparse._SubParsersAction) -> None:
     """Register ``fluid runs {status,logs,diff}``."""
     p = subparsers.add_parser(
@@ -113,10 +141,14 @@ def register_runs(subparsers: argparse._SubParsersAction) -> None:
     )
     sub = p.add_subparsers(dest="runs_subcmd", required=True)
 
-    s = sub.add_parser("status", help="Show last-N runs of a product")
+    s = sub.add_parser(
+        "status",
+        help="Show last-N runs of a product, or the release that was in force (--release-dir)",
+    )
     s.add_argument("product_id", help="Product id (e.g. bronze.crm_orders)")
     s.add_argument("--build", default=None, help="Build id to inspect (default: first found)")
     s.add_argument("--last", type=int, default=5, help="Number of recent runs to show (default 5)")
+    _add_release_flags(s)
     _add_common_flags(s)
     s.set_defaults(func=_run_runs_status)
 
@@ -158,7 +190,64 @@ def register_retention(subparsers: argparse._SubParsersAction) -> None:
 # ── Dispatchers ────────────────────────────────────────────────────────
 
 
+def _run_release_status(args: argparse.Namespace, logger: logging.Logger) -> int:
+    """``fluid runs status <product> --release-dir DIR [--on DAY] [--env NAME]``: the release in
+    force, for each environment the releases name."""
+    from datetime import datetime, timezone
+
+    from fluid_build.cli.ops import release_status as rs
+
+    on = None
+    if args.on:
+        on = rs.parse_day(args.on)
+        if on is None:
+            logger.error("--on %s is not a day (YYYY-MM-DD)", rs.clean(args.on, 40))
+            return 2
+    try:
+        found = rs.find_releases(args.release_dirs, args.product_id)
+    except NotADirectoryError as exc:
+        logger.error("%s", exc)
+        return 2
+    if args.env is not None and not args.env.strip():
+        logger.error("--env needs an environment name")
+        return 2
+    environment = rs.clean(args.env, 40) if args.env else None
+    answers = rs.in_force_by_environment(
+        found.releases, on, datetime.now(timezone.utc), environment
+    )
+    if getattr(args, "json", False):
+        json.dump(
+            {
+                "product_id": args.product_id,
+                "on": on.isoformat() if on else None,
+                "answers": [
+                    {
+                        "environment": a.environment,
+                        "in_force": a.at_start.as_dict() if a.at_start else None,
+                        "during": [r.as_dict() for r in a.during],
+                    }
+                    for a in answers
+                ],
+                "releases_read": len(found.releases),
+                "not_read": found.skipped,
+            },
+            sys.stdout,
+            indent=2,
+            sort_keys=True,
+        )
+        sys.stdout.write("\n")
+    else:
+        for line in rs.report(args.product_id, answers, found, on, environment):
+            cprint_literal(line)
+    return 0 if any(a.at_start or a.during for a in answers) else 1
+
+
 def _run_runs_status(args: argparse.Namespace, logger: logging.Logger) -> int:
+    if getattr(args, "release_dirs", None):
+        return _run_release_status(args, logger)
+    if getattr(args, "on", None) or getattr(args, "env", None):
+        logger.error("--on and --env answer for --release-dir: pass the directory of releases too")
+        return 2
     from fluid_build.cli.ops.status import build_status_report
 
     state_root = _state_root(args)

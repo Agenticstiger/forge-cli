@@ -42,6 +42,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rules (AIR3) over every generated DAG, the `fluid apply` DAGs included. It allows a finding
   only inside an Airflow 2 `except ImportError` fallback.
 
+- **The Spark runner stamps every Iceberg commit with the run's identity.** Each commit the
+  runner makes (a batch overwrite, a stream's append, a dead-letter table's append) carries
+  `fluid.product`, `fluid.build` and `fluid.job-sha256` (the digest of the job config as it ran) in
+  its snapshot summary, and, when `fluid apply` passes them, `fluid.product-version` (the version of
+  the build's output), `fluid.contract-digest` (the contract as loaded, before `{{ env.* }}` is
+  resolved), `fluid.release-id` (`FLUID_RELEASE_ID`, when the deploy names a release) and
+  `fluid.run-id` (the pipeline's run id, which `fluid ship` records as `provenance.run_id`; set
+  `FLUID_RUN_ID` to a scheduler's run id to have it stamped instead). They are Iceberg
+  `snapshot-property.` write options, which Iceberg applies to a batch commit and to a streaming
+  one alike, and the job's Spark conf holds them as `spark.fluid.*` (a conf Spark refuses is
+  logged, and the run goes on). They reach the runner as arguments, not in the job config, the
+  Spark configuration or the plan, so a contract edit that leaves the job alone, or a new run id,
+  restarts no stream. For the same reason a stream that is already running keeps the stamps it
+  started with: its later commits carry the release and run id of the run that started it until a
+  change to the job replaces it, and a stream the keepalive restarts carries the keepalive's. The
+  runner itself changed, so a running stream is replaced once by the first `fluid apply` after the
+  upgrade, as for any change to the runner. A value passed on the command line that a stamp may not
+  hold (a space, a control character, more than 256 characters, a first character that is not a
+  letter or a digit) stops the run before Spark starts. A `FLUID_RELEASE_ID` like that refuses
+  `fluid apply` in every mode, before anything is applied, except `--mode reconcile`: the
+  keepalive leaves it off, with a warning, so a mis-set variable cannot stop a dead stream from
+  being restarted. A run id is stamped as the pipeline has it except that what a stamp may not hold
+  becomes `_` and what is not a letter or a digit is cut from its start (`Build #42` is stamped
+  `Build__42`), and a date in the contract, as a value or a key, is hashed as its ISO 8601 text
+  (`yq -o=json` prints a date the same way and a datetime as written).
+
+- **`fluid runs status <product> --release-dir DIR [--on YYYY-MM-DD] [--env NAME]` says which
+  release was in force, and so which version of the code ran.** A job Forge does not run (an
+  existing job on its own runner, scheduled by Airflow) leaves no run record; the sealed release
+  `fluid ship --release-dir` publishes at each deploy is what it leaves. The command reads those
+  records (DIR is one release or a directory of them, read one level deep; a link is never
+  followed and each `release.json` is read up to 1 MB, so a record that is not a release, or whose
+  time no UTC day can hold, is skipped and counted), and prints, for each environment the
+  releases name (or only `--env`), the release in force now or at the start of the UTC day, the
+  ones sealed during it, their versions, the revision of the code, the run that sealed them, and
+  whether the record's identity digest matches its identity (`intact`); `--json` gives the same.
+  A record is read as written: nothing authenticates it, and its sealed time and source are
+  outside that digest, which the answer says. Exit 1 when no release of the product was sealed by
+  then, 2 for a bad day or directory. `release.json` gains `identity.expose_versions` (each
+  expose's version) and `provenance.source` (the revision, repository and ref the CI names, read
+  from its environment variables; a clone URL loses its user, password, query and fragment, and
+  anything that is not a hex commit, a URL or `user@host:org/repo`, or a ref name, is left out: a
+  credential or a path on the runner is no part of a release record).
+
 - **`fluid generate pyspark-schema` writes a PySpark `StructType` module for each output
   port.** For every output port that declares `contract.schema` columns it writes
   `<port>_schema.py` with a `SCHEMA` a Spark job imports (`spark.read.schema(SCHEMA)`). forge-cli
