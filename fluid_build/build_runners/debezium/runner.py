@@ -330,7 +330,7 @@ def _execute(ctx: RunContext, runner: DebeziumRunner) -> RunResult:
     try:
         # Before any secret is read or config written: Debezium Server and a
         # Kafka Connect worker expand ${...} where they run.
-        refuse_contract_expressions(props.get("source") or {}, dbz_props, engine="debezium")
+        refuse_contract_expressions(ctx.source, dbz_props, engine="debezium")
     except ValueError as exc:
         return _failed(ctx, started_at, t_start, str(exc))
 
@@ -410,11 +410,17 @@ def _execute_kafka_connect(
     )
     if late_arrival_policy.get("enabled"):
         config.update(late_arrival_policy["connector_config"])
-    from .._acquisition_common import refuse_sent_config_expressions
+    from .._acquisition_common import refuse_sent_config_expressions, secret_resolved
 
     try:
         refuse_sent_config_expressions(
-            config, ctx.source.connection.raw, where="the Debezium connector config"
+            config,
+            where="the Debezium connector config",
+            secret_keys=(
+                ("database.password", "mongodb.password")
+                if secret_resolved(ctx.source.connection.raw)
+                else ()
+            ),
         )
     except ValueError as exc:
         return _failed(ctx, started_at, t_start, str(exc))
@@ -608,6 +614,14 @@ def render_application_properties(
         _properties_line(key, "")
         if any(ch in text for ch in "\r\n\f\x00"):
             raise ValueError(f"debezium config entry {key} has a control character in its value")
+        if "${" in text:
+            # SmallRye Config expands an environment variable's value too, so a
+            # credential holding ${ would reach the connector rewritten.
+            raise ValueError(
+                f"debezium config entry {key} holds ${{ in its value (the value is not shown), "
+                "which Debezium Server would expand from its environment. A credential that "
+                "holds ${ cannot be handed to Debezium Server: change it."
+            )
         name = "FLUID_DBZ_" + re.sub(r"[^A-Za-z0-9]", "_", key.removeprefix("debezium.")).upper()
         if env.get(name, text) != text:
             raise ValueError(f"two debezium properties map to the environment variable {name}")

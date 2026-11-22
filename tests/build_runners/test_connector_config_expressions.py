@@ -73,10 +73,20 @@ def test_a_sink_type_with_an_expression_is_refused():
 
 @pytest.mark.unit
 def test_forges_own_credential_line_keeps_its_expression():
-    source = {"database.password": "p${x}"}  # pragma: allowlist secret
+    source = {"database.password": "pw-1"}  # pragma: allowlist secret
     properties, env = render_application_properties(source, "iceberg", {"catalog-name": "c"})
     assert "debezium.source.database.password=${FLUID_DBZ_SOURCE_DATABASE_PASSWORD}" in properties
-    assert env["FLUID_DBZ_SOURCE_DATABASE_PASSWORD"] == "p${x}"  # pragma: allowlist secret
+    assert env["FLUID_DBZ_SOURCE_DATABASE_PASSWORD"] == "pw-1"  # pragma: allowlist secret
+
+
+@pytest.mark.unit
+def test_a_credential_holding_dollar_brace_is_not_handed_to_debezium_server():
+    """SmallRye Config expands an environment variable's value too."""
+    source = {"database.password": "p${HOME}"}  # pragma: allowlist secret
+    with pytest.raises(ValueError) as caught:
+        render_application_properties(source, "iceberg", {})
+    assert "debezium.source.database.password" in str(caught.value)
+    assert "HOME" not in str(caught.value)
 
 
 # ── the runners refuse before anything is built or sent ──────────────────────
@@ -215,3 +225,41 @@ def test_the_properties_file_never_gets_an_expression_whatever_its_source():
         render_application_properties({"plugin.name": b"${BAO_TOKEN}"}, "iceberg", {})
     assert "debezium.source.plugin.name" in str(caught.value)
     assert "BAO_TOKEN" not in str(caught.value)
+
+
+@pytest.mark.unit
+def test_the_build_that_runs_is_read_when_another_shares_its_id(tmp_path: Path):
+    import copy
+
+    from fluid_build.build_runners.debezium.runner import execute_debezium_build
+
+    contract = _dbz_contract(
+        BASE,
+        deployment={"mode": "embedded"},
+        server={"sink": {"type": "http", "config": {"url": "https://sink.example/x"}}},
+    )
+    first = contract["builds"][0]
+    second = copy.deepcopy(first)
+    second["properties"]["source"]["connection"]["password"] = "${HOME}"  # pragma: allowlist secret
+    for build in (first, second):
+        build.pop("id", None)
+    contract["builds"] = [first, second]
+    rc = execute_debezium_build(second, contract, tmp_path, dry_run=False)
+    assert rc != 0
+    assert not list(tmp_path.rglob("application.properties"))
+
+
+@pytest.mark.unit
+def test_a_passthrough_kind_checks_its_password_beside_a_secret_ref(kafka_connect_mock, tmp_path):
+    """Only a password the runner resolved from the store is left out of the sent check."""
+    from fluid_build.build_runners.kafka_connect.runner import execute_kafka_connect_build
+
+    connection = {
+        "bucket": "b",
+        "secretRef": "env://FLUID_KC_TEST_PW",  # pragma: allowlist secret
+        "password": "${file:/etc/secrets:pw}",  # pragma: allowlist secret
+    }
+    contract = _kc_contract(connection, {"kind": "s3"})
+    rc = execute_kafka_connect_build(contract["builds"][0], contract, tmp_path, dry_run=False)
+    assert rc != 0
+    assert "expr" not in kafka_connect_mock.connectors

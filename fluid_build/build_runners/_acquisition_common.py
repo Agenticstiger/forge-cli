@@ -456,41 +456,45 @@ def _expression_refusal(where: str, below: str, *, in_key: bool = False) -> str:
 
 
 def refuse_contract_expressions(
-    source: Mapping[str, Any], engine_props: Mapping[str, Any], *, engine: str
+    source: Any, engine_props: Mapping[str, Any], *, engine: str
 ) -> None:
     """:func:`refuse_config_expressions` for the contract text a connector run reads.
 
-    The build's whole ``properties.source`` (its connection's ``secretRef``
-    aside: the secret it names is the operator's, not contract text), and
-    ``properties.<engine>``.
+    ``source`` is the run's own source (``ctx.source``, read from the build the
+    dispatcher passed in, which another build may share an id with), every field
+    of it, its connection's ``secretRef`` aside: the secret it names is the
+    operator's, not contract text. Then ``properties.<engine>``.
     """
-    block = dict(source)
-    connection = block.get("connection")
-    if isinstance(connection, Mapping):
-        block["connection"] = {k: v for k, v in connection.items() if k != "secretRef"}
-    refuse_config_expressions(block, where="properties.source")
+    spec = {
+        "kind": source.kind,
+        "mode": source.mode,
+        "connection": {k: v for k, v in source.connection.raw.items() if k != "secretRef"},
+        "cursor_field": source.cursor_field,
+        "watermark": source.watermark,
+        "streams": list(source.streams or []),
+        "reader": source.reader,
+    }
+    refuse_config_expressions(spec, where="properties.source")
     refuse_config_expressions(engine_props, where=f"properties.{engine}")
 
 
-#: The connector settings a resolved secret is written to (``resolve_connection_secrets``
-#: fills ``password``, which the runners map to these).
-_RESOLVED_SECRET_KEYS = ("database.password", "connection.password")
+def secret_resolved(connection: Mapping[str, Any]) -> bool:
+    """Whether :func:`resolve_connection_secrets` fills ``password`` from the store."""
+    return bool(connection.get("secretRef")) and not connection.get("password")
 
 
 def refuse_sent_config_expressions(
-    config: Mapping[str, Any], connection: Mapping[str, Any], *, where: str
+    config: Mapping[str, Any], *, where: str, secret_keys: Sequence[str] = ()
 ) -> None:
     """:func:`refuse_config_expressions` for a connector config as it is sent.
 
     The last check before a REST call, over everything the config holds: a
-    setting forge derives from another part of the contract included. The one
-    value left out is the secret the operator's store resolved, which is not
-    contract text: a connection with a ``secretRef`` and no password of its own.
+    setting forge derives from another part of the contract included. Left out
+    are only ``secret_keys``, the settings the caller wrote the store's resolved
+    secret to, which is the operator's and not contract text.
     """
-    resolved = bool(connection.get("secretRef")) and not connection.get("password")
-    skipped = _RESOLVED_SECRET_KEYS if resolved else ()
     refuse_config_expressions(
-        {key: value for key, value in config.items() if key not in skipped}, where=where
+        {key: value for key, value in config.items() if key not in secret_keys}, where=where
     )
 
 
