@@ -6771,7 +6771,10 @@
       "properties": {
         "dagId": {
           "type": "string",
-          "pattern": "^[a-z0-9_][a-z0-9_.-]*[a-z0-9_]$|^[a-z0-9_]$"
+          "description": "The Airflow DAG id, exactly as Airflow spells it. Airflow's own rule: ASCII letters (either case), digits, underscore, dot and dash, at most 250 characters.",
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "minLength": 1,
+          "maxLength": 250
         },
         "dagConfig": {
           "type": "object",
@@ -6985,7 +6988,10 @@
       "properties": {
         "taskId": {
           "type": "string",
-          "pattern": "^[a-z0-9_][a-z0-9_.-]*[a-z0-9_]$|^[a-z0-9_]$"
+          "description": "The Airflow task id, exactly as Airflow spells it. Airflow's own rule: ASCII letters (either case), digits, underscore, dot and dash, at most 250 characters.",
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "minLength": 1,
+          "maxLength": 250
         },
         "type": {
           "type": "string",
