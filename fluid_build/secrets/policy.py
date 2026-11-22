@@ -147,6 +147,17 @@ DESTINATION_OVERRIDE_KEYS: FrozenSet[str] = frozenset(
         "connection.password",
     }
 )
+#: Debezium hands every ``database.*`` and ``driver.*`` setting, its prefix
+#: dropped, to the JDBC driver (``RelationalDatabaseConnectorConfig``:
+#: ``config.subset("database.", true).merge(config.subset("driver.", true))``)
+#: and builds the JDBC URL from some of them. These, under either prefix, name
+#: where it connects or what it connects with; so does a driver property that
+#: names a host (:func:`_host_key_name`), such as mssql-jdbc's
+#: ``failoverPartner``, which gets the same login when the first host fails.
+_PASS_THROUGH_PREFIXES = ("database.", "driver.")
+_PASS_THROUGH_DESTINATIONS = frozenset(
+    {"hostname", "port", "dbname", "names", "url", "password", "protocol"}
+)
 
 #: Query-string parameters that name the host a driver connects to, or a file or
 #: a connection string that does, spelled as :func:`_host_key_name` compares them
@@ -1045,7 +1056,7 @@ def refuse_destination_overrides(overrides: Mapping[str, Any], *, where: str) ->
     Called before the connection's secret is resolved, so a refusal reads nothing.
     """
     for key in overrides:
-        if str(key).strip().lower() not in DESTINATION_OVERRIDE_KEYS:
+        if not _moves_destination(str(key)):
             continue
         raise AcquisitionSecretPolicyError(
             what=f"{where} sets {str(key)!r}, which would move where the secret is sent",
@@ -1061,6 +1072,27 @@ def refuse_destination_overrides(overrides: Mapping[str, Any], *, where: str) ->
             ),
             doc=doc_url("secrets"),
         )
+
+
+def _moves_destination(key: str) -> bool:
+    """Whether connector setting ``key`` names where the connector connects, or with what.
+
+    :data:`DESTINATION_OVERRIDE_KEYS` in any case, and each ``database.*`` or
+    ``driver.*`` setting that Debezium hands the JDBC driver and that does
+    (:data:`_PASS_THROUGH_DESTINATIONS`, or a property that names a host).
+    """
+    name = key.strip().lower()
+    if name in DESTINATION_OVERRIDE_KEYS:
+        return True
+    for prefix in _PASS_THROUGH_PREFIXES:
+        if not name.startswith(prefix):
+            continue
+        setting = name[len(prefix) :]
+        if setting in _PASS_THROUGH_DESTINATIONS:
+            return True
+        if "." not in setting and _host_key_name(setting) is not None:
+            return True
+    return False
 
 
 def _suggested_entry(ref: SecretRef, host: Optional[str]) -> str:

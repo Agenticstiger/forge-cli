@@ -92,3 +92,48 @@ def test_an_override_without_a_secret_is_not_this_policy_s_business():
         ]
     }
     assert lint_secret_refs(contract, {}) == []
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "database.failoverPartner",
+        "driver.failoverPartner",
+        "DATABASE.FAILOVERPARTNER",
+        "driver.serverName",
+        "driver.PGHOST",
+        "driver.socksProxyHost",
+        "database.socketFactory",
+        "driver.socketFactoryClass",
+        "driver.hostname",
+        "driver.port",
+        "driver.dbname",
+        "driver.password",
+        "database.protocol",
+        "driver.protocol",
+    ],
+)
+def test_a_driver_setting_that_moves_the_host_is_refused(key):
+    from fluid_build.secrets.policy import refuse_destination_overrides
+
+    with pytest.raises(AcquisitionSecretPolicyError) as caught:
+        refuse_destination_overrides({key: "attacker.example"}, where="extra_config")
+    assert key in caught.value.what
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "database.server.name",
+        "database.applicationIntent",
+        "database.instance",
+        "database.sslmode",
+        "driver.encrypt",
+        "database.initial.statements",
+        "topic.prefix",
+    ],
+)
+def test_a_driver_setting_that_names_no_host_passes(key):
+    from fluid_build.secrets.policy import refuse_destination_overrides
+
+    refuse_destination_overrides({key: "x"}, where="extra_config")
