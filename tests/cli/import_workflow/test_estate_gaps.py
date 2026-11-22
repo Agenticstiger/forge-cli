@@ -174,3 +174,119 @@ def test_a_landing_read_with_a_run_date_is_a_consumed_source(tmp_path, monkeypat
     ]
     assert not any("function parameter" in line for line in report.unsupported)
     assert any("is taken as that table" in line for line in report.notes)
+
+
+# ── Airflow Variables ─────────────────────────────────────────────────
+
+VARIABLE_DAG = (
+    DAG_HEAD
+    + """
+from airflow.models import Variable
+
+ENV = Variable.get("environment", "dev")
+JOBS = {"dev": "s3://code-dev/jobs", "prod": "s3://code/jobs"}
+
+with DAG(dag_id="legacy", schedule="@daily", default_args={"owner": "orders-team"}) as dag:
+    SparkSubmitOperator(
+        task_id="run",
+        application=f"{JOBS[ENV]}/merge.py",
+        application_args=[
+            "--env", "{{ var.value.environment }}", "--date", "{{ ds }}",
+            "--x", "{{ var.value.unknown }}",
+        ],
+    )
+"""
+)
+
+
+def task_of(contract: Dict[str, Any]) -> Dict[str, Any]:
+    (task,) = contract["builds"][0]["execution"]["orchestration"]["airflow"]["tasks"]
+    return task
+
+
+def test_a_dag_that_reads_its_environment_from_an_airflow_variable_is_joined_to_its_job(
+    tmp_path, monkeypatch
+):
+    contracts, report = run_pyspark(
+        tmp_path,
+        monkeypatch,
+        {
+            "jobs/merge.py": JOB,
+            "dags/legacy.py": VARIABLE_DAG,
+            "conventions.yaml": CONVENTIONS
+            + "airflow_variables:\n  prod: {environment: prod}\n  dev: {environment: dev}\n"
+            + "environment: prod\n",
+        },
+    )
+    (contract,) = contracts
+    assert dag_of(contract) == "legacy"
+    # the templates of the Variables the conventions name are filled in; any other stays as written
+    assert task_of(contract)["params"]["args"] == [
+        "--env",
+        "prod",
+        "--date",
+        "{{ ds }}",
+        "--x",
+        "{{ var.value.unknown }}",
+    ]
+
+
+def test_without_the_variables_the_dag_is_not_joined_and_its_templates_stay(tmp_path, monkeypatch):
+    contracts, report = run_pyspark(
+        tmp_path,
+        monkeypatch,
+        {
+            "jobs/merge.py": JOB,
+            "dags/legacy.py": VARIABLE_DAG,
+            "conventions.yaml": CONVENTIONS,
+        },
+    )
+    (contract,) = contracts
+    assert dag_of(contract) is None
+    assert any("the Airflow Variable environment" in line for line in report.notes), report.notes
+
+
+def test_the_environment_chosen_decides_which_variables_are_read(tmp_path, monkeypatch):
+    conventions = CONVENTIONS + (
+        "airflow_variables:\n  prod: {environment: prod}\n  dev: {environment: dev}\n"
+        "environment: dev\n"
+    )
+    contracts, report = run_pyspark(
+        tmp_path,
+        monkeypatch,
+        {"jobs/merge.py": JOB, "dags/legacy.py": VARIABLE_DAG, "conventions.yaml": conventions},
+    )
+    (contract,) = contracts
+    assert task_of(contract)["params"]["args"][:2] == ["--env", "dev"]
+    # dev reads its job from s3://code-dev/jobs, which no script root maps: joined by file name
+    assert task_of(contract)["params"]["script"] == "s3://code-dev/jobs/merge.py"
+    assert any("by file name only" in line for line in report.unsupported), report.unsupported
+
+
+def test_a_bash_command_with_a_variable_template_in_it_is_read_with_the_variable_filled_in(
+    tmp_path, monkeypatch
+):
+    contracts, _report = run_pyspark(
+        tmp_path,
+        monkeypatch,
+        {
+            "jobs/merge.py": JOB,
+            "dags/bash.py": """
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+
+with DAG(dag_id="bash", schedule="@daily", default_args={"owner": "orders-team"}) as dag:
+    BashOperator(
+        task_id="run",
+        bash_command="spark-submit {{ var.value.code_root }}/merge.py --env {{ var.value.environment }}",
+    )
+""",
+            "conventions.yaml": CONVENTIONS
+            + "airflow_variables:\n  prod: {code_root: 's3://code/jobs', environment: prod}\n",
+        },
+    )
+    (contract,) = contracts
+    assert dag_of(contract) == "bash"
+    task = task_of(contract)
+    assert task["params"]["script"] == "s3://code/jobs/merge.py"
+    assert task["params"]["args"] == ["--env", "prod"]

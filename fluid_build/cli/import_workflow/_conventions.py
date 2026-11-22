@@ -33,6 +33,9 @@ be silently ignored), and a size cap and the alias limits of
     environments:                    # what os.environ[...] holds in each
       prod: {ENV: prod}
       dev:  {ENV: dev}
+    airflow_variables:               # what Variable.get("x") and {{ var.value.x }} hold in each
+      prod: {environment: prod}
+      dev:  {environment: dev}
     defaults: {database: retail, domain: retail, platform: aws}
     catalogs:                        # the first part of a three-part table name
       glue: {platform: aws, format: iceberg, catalog: glue}
@@ -51,6 +54,13 @@ and ``--dags``): a path that leaves them all (``..``, an absolute path, a link t
 refused, checked on the resolved path. So a conventions file cannot make the scan read a file from
 somewhere the user did not point it at, and it may sit in a folder of its own beside the
 repositories it describes (``config/conventions.yaml``).
+
+``airflow_variables`` is read like ``environments``: the names of an Airflow Variable and what each
+holds in an environment. ``Variable.get("x")``, ``Variable.get("x", default_var=...)`` (Airflow 2),
+``Variable.get("x", default=...)`` (Airflow 3, ``airflow.sdk``) and ``{{ var.value.x }}`` in an
+operator's arguments are read as what the selected environment holds for ``x``. A Variable the file
+does not name stays unresolved: the default of ``get`` is not assumed, as it is not for
+``os.environ.get``. A Variable read as JSON is not read.
 
 An ``environments`` value is text and may be empty (``PREFIX: ""``, a table prefix that is empty
 in production): a variable the file names with an empty value has that value, and one it does not
@@ -92,6 +102,7 @@ _TOP_KEYS = frozenset(
         "config_modules",
         "environment",
         "environments",
+        "airflow_variables",
         "defaults",
         "catalogs",
         "layers",
@@ -148,6 +159,8 @@ class Conventions:
     environment: Optional[str] = None
     #: What ``os.environ[...]`` holds in the selected environment.
     variables: Mapping[str, str] = field(default_factory=dict)
+    #: What each Airflow Variable holds in the selected environment.
+    airflow_variables: Mapping[str, str] = field(default_factory=dict)
     default_database: Optional[str] = None
     domain: Optional[str] = None
     runtime_platform: Optional[str] = None
@@ -479,17 +492,31 @@ def parse_conventions(
             )
             for k, v in env.items()
         }
+    airflow_variables: Dict[str, Dict[str, str]] = {}
+    for name, raw in _mapping(
+        top.get("airflow_variables", {}), source, "airflow_variables"
+    ).items():
+        found = _mapping(raw, source, f"airflow_variables.{name}")
+        airflow_variables[name] = {
+            _text(k, source, f"airflow_variables.{name}", pattern=_NAME): _env_value(
+                v, source, f"airflow_variables.{name}.{k}"
+            )
+            for k, v in found.items()
+        }
+    named = sorted({*environments, *airflow_variables})
     environment = top.get("environment")
     if environment is not None:
         environment = _text(environment, source, "environment")
-        if environment not in environments:
-            raise _fail(source, "environment", f"{environment!r} is not named under environments")
-    elif len(environments) == 1:
-        environment = next(iter(environments))
-    elif environments:
-        raise _fail(
-            source, "environment", f"name the one to use ({', '.join(sorted(environments))})"
-        )
+        if environment not in named:
+            raise _fail(
+                source,
+                "environment",
+                f"{environment!r} is not named under environments or airflow_variables",
+            )
+    elif len(named) == 1:
+        environment = named[0]
+    elif named:
+        raise _fail(source, "environment", f"name the one to use ({', '.join(named)})")
 
     defaults = _mapping(
         top.get("defaults", {}), source, "defaults", frozenset({"database", "domain", "platform"})
@@ -573,6 +600,7 @@ def parse_conventions(
         config_modules=modules,
         environment=environment,
         variables=dict(environments.get(environment or "", {})),
+        airflow_variables=dict(airflow_variables.get(environment or "", {})),
         default_database=(
             _text(defaults["database"], source, "defaults.database", pattern=_NAME).lower()
             if "database" in defaults

@@ -142,6 +142,7 @@ def scan_jobs(
     index = ModuleIndex(
         walk.files,
         variables=conventions.variables,
+        airflow_variables=conventions.airflow_variables,
         extra=conventions.config_modules,
         budget=budget,
     )
@@ -203,6 +204,7 @@ def scan_dags(
     index = ModuleIndex(
         walk.files,
         variables=conventions.variables,
+        airflow_variables=conventions.airflow_variables,
         extra=conventions.config_modules,
         budget=budget,
     )

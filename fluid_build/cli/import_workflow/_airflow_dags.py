@@ -47,7 +47,7 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-from ._fold import ABSENT, Folder, Unresolved, lookup
+from ._fold import ABSENT, FoldedDict, FoldedList, FoldedTuple, Folder, Unresolved, lookup
 from ._pysource import Module, ancestors, qualified_name, snippet
 
 #: Known operator class names to the kind of work they submit.
@@ -95,6 +95,40 @@ _MAX_OPERAND_NOTES = 10
 _MAX_COMMAND = 50_000
 #: Submits kept for one task: a command that holds a hundred ``spark-submit`` lines is a script.
 _MAX_SUBMITS_PER_TASK = 20
+
+
+#: ``{{ var.value.name }}`` and ``{{ var.value["name"] }}``: the Airflow Variable a template reads.
+_VARIABLE_TEMPLATE = re.compile(
+    r"\{\{\s*var\.value\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}"
+    r"|\{\{\s*var\.value\[\s*(?:'([^'\"{}]{1,200})'|\"([^'\"{}]{1,200})\")\s*\]\s*\}\}"
+)
+
+
+def fill_variable_templates(value: Any, variables: Mapping[str, str]) -> Any:
+    """``value`` with each ``{{ var.value.name }}`` that ``variables`` names replaced by what it
+    holds, in a string or in the strings of a list, a tuple or a dict (their kind and their
+    ``complete`` mark kept). A template for a Variable nobody named, and every other template
+    (``{{ ds }}``, ``{{ var.json.x }}``, one with a filter), stays as written."""
+    if not variables:
+        return value
+    if isinstance(value, str):
+        if "{{" not in value:
+            return value
+        return _VARIABLE_TEMPLATE.sub(
+            lambda m: variables.get(m.group(1) or m.group(2) or m.group(3), m.group(0)), value
+        )
+    if isinstance(value, (list, tuple)):
+        kind = FoldedTuple if isinstance(value, FoldedTuple) else FoldedList
+        filled = kind(fill_variable_templates(item, variables) for item in value)
+        filled.complete = getattr(value, "complete", True)
+        return filled
+    if isinstance(value, dict):
+        mapped = FoldedDict(
+            (key, fill_variable_templates(item, variables)) for key, item in value.items()
+        )
+        mapped.complete = getattr(value, "complete", True)
+        return mapped
+    return value
 
 
 @dataclass(frozen=True)
@@ -277,7 +311,11 @@ class _Reader:
         return None
 
     def _text(self, node: Optional[ast.expr]) -> Any:
-        return None if node is None else self.folder.fold(node)
+        """What an operator's argument folds to, with the Airflow Variables its templates read
+        filled in (the conventions' ``airflow_variables``)."""
+        if node is None:
+            return None
+        return fill_variable_templates(self.folder.fold(node), self.folder.airflow_variables)
 
     def _add_dag_call(self, call: ast.Call) -> None:
         id_node = self._kw(call, "dag_id", 0)
@@ -617,6 +655,7 @@ class _Reader:
         # A field that does not fold is a hole, not the end of the command: a script written
         # out in full beside it is still read.
         value, holes = self.folder.fold_sql(node)
+        value = fill_variable_templates(value, self.folder.airflow_variables)
         if isinstance(value, Unresolved):
             # A command too long to fold is said, not dropped: nothing of it was read, so
             # whether it runs a spark-submit is not known.

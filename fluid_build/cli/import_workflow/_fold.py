@@ -26,7 +26,8 @@ What it folds, and nothing else:
   a list that folds, folds to the whole of it where it is used after the last of them
   (:class:`Recipe`);
 * ``os.environ[...]``, ``os.environ.get(...)`` and ``os.getenv(...)``, from the operator's
-  ``variables`` (conventions), else unresolved: the default of ``get`` is not assumed.
+  ``variables`` (conventions), else unresolved: the default of ``get`` is not assumed. An Airflow
+  ``Variable.get(...)`` is read the same way from the operator's ``airflow_variables``.
 
 There is no ``eval``, no ``ast.literal_eval`` and no import of anything the project names.
 """
@@ -886,8 +887,10 @@ class ModuleIndex:
         variables: Optional[Mapping[str, str]] = None,
         extra: Optional[Mapping[str, Path]] = None,
         budget: Optional[SourceBudget] = None,
+        airflow_variables: Optional[Mapping[str, str]] = None,
     ) -> None:
         self.variables: Mapping[str, str] = dict(variables or {})
+        self.airflow_variables: Mapping[str, str] = dict(airflow_variables or {})
         self._dotted: Dict[str, List[SourceFile]] = {}
         #: Parsed modules, least recently used first, at most ``MAX_CACHED_NODES`` syntax-tree
         #: nodes between them: a scan of thousands of files keeps a few, not all, in memory.
@@ -1020,6 +1023,15 @@ _STR_METHODS = frozenset(
 )
 _JOINS = frozenset({"os.path.join", "posixpath.join"})
 _ENV_GET = frozenset({"os.environ.get", "os.getenv"})
+#: ``Variable.get`` by where ``Variable`` is imported from (Airflow 2 and 3).
+_VARIABLE_GET = frozenset(
+    {
+        "airflow.models.Variable.get",
+        "airflow.models.variable.Variable.get",
+        "airflow.sdk.Variable.get",
+        "airflow.sdk.definitions.variable.Variable.get",
+    }
+)
 
 
 class Folder:
@@ -1031,11 +1043,17 @@ class Folder:
         *,
         index: Optional[ModuleIndex] = None,
         variables: Optional[Mapping[str, str]] = None,
+        airflow_variables: Optional[Mapping[str, str]] = None,
     ) -> None:
         self.module = module
         self.index = index
         self.variables: Mapping[str, str] = (
             variables if variables is not None else (index.variables if index else {})
+        )
+        self.airflow_variables: Mapping[str, str] = (
+            airflow_variables
+            if airflow_variables is not None
+            else (index.airflow_variables if index else {})
         )
         self._scopes: Dict[ast.AST, Scope] = {}
         self._active: Set[int] = set()
@@ -1654,11 +1672,35 @@ class Folder:
             return self.variables[key]
         return Unresolved(f"the environment variable {key}", snippet(origin))
 
+    def _airflow_variable(self, node: ast.Call, scope: Scope, depth: int) -> Any:
+        """``Variable.get("name", ...)`` from the operator's ``airflow_variables``, else
+        unresolved: the default (``default_var`` in Airflow 2, ``default`` in Airflow 3, or the
+        second argument) is not assumed, and a Variable read as JSON is not read."""
+        name_node = node.args[0] if node.args else None
+        for keyword in node.keywords:
+            if keyword.arg == "key":
+                name_node = keyword.value
+        if name_node is None:
+            return Unresolved("an Airflow Variable with no name", snippet(node))
+        name = self.fold(name_node, scope, depth)
+        if not isinstance(name, str):
+            return Unresolved("an Airflow Variable whose name is not a constant", snippet(node))
+        as_json = [kw.value for kw in node.keywords if kw.arg == "deserialize_json"]
+        if len(node.args) >= 3:
+            as_json.append(node.args[2])
+        if any(not (isinstance(v, ast.Constant) and v.value is False) for v in as_json):
+            return Unresolved(f"the Airflow Variable {name} is read as JSON", snippet(node))
+        if name in self.airflow_variables:
+            return self.airflow_variables[name]
+        return Unresolved(f"the Airflow Variable {name}", snippet(node))
+
     def _fold_Call(self, node: ast.Call, scope: Scope, depth: int) -> Any:
         func = node.func
         qualified = qualified_name(func, self.module.imports)
         if qualified in _ENV_GET and node.args:
             return self._environment(node.args[0], scope, depth, node)
+        if qualified in _VARIABLE_GET:
+            return self._airflow_variable(node, scope, depth)
         if qualified in _JOINS and node.args and not node.keywords:
             parts = [self.fold(arg, scope, depth) for arg in node.args]
             if all(isinstance(p, str) for p in parts):
