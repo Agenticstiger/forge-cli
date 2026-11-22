@@ -333,6 +333,8 @@ def test_the_context_is_read_only(runner):
         "EXPLAIN INSERT INTO t SELECT 1",
         "SET spark.sql.shuffle.partitions",  # a setting read, not changed
         "SET",
+        "SET -v",  # lists the settings
+        "set spark.sql.session.timeZone",
         "CACHE TABLE c AS SELECT * FROM t",
         "UNCACHE TABLE c",
         "REFRESH TABLE t",
@@ -378,6 +380,14 @@ def test_reads_pass_the_sql_check(runner, sql):
         # A setting changed while the package runs: substitution back on, then a variable.
         ("SET spark.sql.variable.substitute=true", "SET"),
         ("SET spark.sql.shuffle.partitions = 8", "SET"),
+        # Every other form that sets a value, not only the ones with an equals sign.
+        ("SET TIME ZONE 'America/New_York'", "SET"),
+        ("set time zone local", "SET"),
+        ("SET TIME ZONE INTERVAL 10 HOURS", "SET"),
+        ("SET CATALOG other_catalog", "SET"),
+        ("/* c */ SET CATALOG other_catalog", "SET"),
+        ("SET VAR x = 1", "SET"),
+        ("SET VARIABLE x = 1", "SET"),
         ("RESET", "RESET"),
         ("WITH a AS (SELECT 1 AS id) ${w}", "${...} variable"),
         ("SELECT 'unterminated", "cannot read"),

@@ -1634,6 +1634,9 @@ _SQL_READS = frozenset(
 #: A read with a prefix (``WITH ... AS (...)``, ``FROM t``, a parenthesis) that a write can
 #: follow, as in ``WITH a AS (...) INSERT INTO ...``: refused when one does, at the top level.
 _SQL_PREFIXES = frozenset({"WITH", "FROM", "("})
+#: The words after ``SET`` that make it a statement that sets a value (``SET TIME ZONE x``,
+#: ``SET CATALOG x``, ``SET VAR x``), as ``SET k = v`` does.
+_SET_FORMS = frozenset({"TIME", "CATALOG", "VAR", "VARIABLE"})
 _SQL_PREFIXED_WRITES = frozenset({"INSERT", "MERGE", "UPDATE", "DELETE"})
 
 
@@ -1653,7 +1656,9 @@ def sql_write(text) -> str | None:
     if not tokens:
         return "no statement"
     head = tokens[0]
-    if head == "SET" and "=" in text:  # a setting changed, not read (RESET is refused too)
+    # A setting changed, not read: SET k=v, SET TIME ZONE x, SET CATALOG x, SET VAR[IABLE] x.
+    # SET, SET k and SET -v read (RESET is refused too).
+    if head == "SET" and ("=" in text or (len(tokens) > 1 and tokens[1] in _SET_FORMS)):
         return "SET"
     if head in _SQL_READS:
         return None
