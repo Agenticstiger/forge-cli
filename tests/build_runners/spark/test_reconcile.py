@@ -18,7 +18,9 @@ from fluid_build.build_runners.spark import _reconcile as rc
 from fluid_build.build_runners.spark._adapters import RunInfo, SparkRunError, checked_run
 from fluid_build.cli import _spark_apply
 
-ENV = {rc.WAIT_ENV: "5"}
+# A released stream is kept at once here: tests/build_runners/spark/test_stream_rollback.py
+# covers the probation.
+ENV = {rc.WAIT_ENV: "5", rc.PROBATION_ENV: "0"}
 
 
 #: The wall clock of a reconcile (epoch seconds): a run ``created`` at 0 is days old.
@@ -97,6 +99,9 @@ class FakeAdapter:
 
     def cancel(self, run_id):
         self.calls.append(f"cancel {run_id}")
+
+    def keep_release(self, run):
+        return f"s3://bucket/_fluid/spark/p/b/releases/{run.config_hash[:16]}/job.json"
 
     def get(self, run_id):
         states = self.scripts[run_id]

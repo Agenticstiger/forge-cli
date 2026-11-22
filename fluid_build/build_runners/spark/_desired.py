@@ -53,6 +53,9 @@ RESTART_FLAG = "--fluid-restart-of"
 STOP_KEY_FLAG = "--fluid-stop-key"
 #: How long a stream asked to stop between batches has before it is cancelled (``_reconcile``).
 STOP_GRACE_ENV = "FLUID_SPARK_STOP_GRACE_SECONDS"
+#: How long a released stream's new run is watched before it is kept; one that ends or is retried
+#: in that time is replaced by the last good config (``_reconcile``).
+PROBATION_ENV = "FLUID_SPARK_RELEASE_PROBATION_SECONDS"
 #: Names the release a deploy belongs to (a tag, a build number, a release's identity digest):
 #: the runner stamps it on every commit as ``fluid.release-id`` when set.
 RELEASE_ID_ENV = "FLUID_RELEASE_ID"
@@ -413,7 +416,9 @@ class DesiredRun:
                     if self.scheduled
                     else "a changed config asks the running job to stop between batches "
                     f"(cancelling it after {STOP_GRACE_ENV}) and starts it again on the same "
-                    "checkpoint; a new source on that checkpoint is refused"
+                    f"checkpoint, watched for {PROBATION_ENV}: a new run that ends or is retried "
+                    "in that time is replaced by the last good config; a new source on that "
+                    "checkpoint is refused"
                 ),
             },
         }

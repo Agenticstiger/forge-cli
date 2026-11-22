@@ -65,6 +65,7 @@ from fluid_build.build_runners.spark._adapters import (
     SUCCEEDED,
     RunInfo,
     SparkRunError,
+    release_config_uri,
     stop_request_body,
     stop_request_uri,
 )
@@ -529,24 +530,71 @@ def bound_job_uri(host: LocalHost, run: DesiredRun) -> str:
     return run.bind(local_root=_root(host.env, Path(host.workspace))).job_uri
 
 
-def write_stop_request(host: LocalHost, run: DesiredRun, key: str) -> str:
+def write_stop_request(
+    host: LocalHost, run: DesiredRun, key: str, beside: Optional[str] = None
+) -> str:
     """Ask the local run started with stop key ``key`` to stop between batches: the request
-    beside ``run``'s job config at this machine's artifact root (:data:`LOCAL_ROOT_ENV`), a
-    file or an ``s3://`` object, where the runner looks (``_adapters.stop_request_uri``).
+    beside the job config it reads (``beside``, by default ``run``'s at this machine's artifact
+    root, :data:`LOCAL_ROOT_ENV`), a file or an ``s3://`` object, where the runner looks
+    (``_adapters.stop_request_uri``).
 
     Raises:
         SparkRunError: the root is unusable, or the request cannot be written.
     """
+    uri = stop_request_uri(beside or bound_job_uri(host, run), key)
+    _write_artifact(host, uri, stop_request_body(run))
+    return uri
+
+
+def _write_artifact(host: LocalHost, uri: str, body: bytes) -> None:
+    """Write ``body`` at ``uri`` under this machine's artifact root (an ``s3://`` root or a
+    directory; under the default root no link may lead out of ``.fluid``)."""
     env = host.env
-    root = _root(env, Path(host.workspace))
-    uri = stop_request_uri(bound_job_uri(host, run), key)
-    body = stop_request_body(run)
-    if root.startswith("s3://"):
+    if _root(env, Path(host.workspace)).startswith("s3://"):
         _put_s3(((uri, body),), env)
     else:
         confine = None if (env.get(LOCAL_ROOT_ENV) or "").strip() else Path(host.workspace)
         _write_local_file(Path(uri), body, confine)
+
+
+def keep_release(host: LocalHost, run: DesiredRun) -> str:
+    """Keep the job config a local run of ``run`` reads as its release record
+    (``_adapters.release_config_uri``): the bytes :func:`publish` wrote. Its URI.
+
+    Raises:
+        SparkRunError: the root is unusable, or the record cannot be written.
+    """
+    bound = run.bind(local_root=_root(host.env, Path(host.workspace)))
+    uri = release_config_uri(bound.job_uri, run.job_sha256 or config_digest(bound.job_text))
+    _write_artifact(host, uri, bound.job_text.encode("utf-8"))
     return uri
+
+
+def read_release(host: LocalHost, run: DesiredRun, job_sha256: str) -> Optional[bytes]:
+    """The job config the local release record of ``job_sha256`` holds, or None when there is
+    none (the caller checks the bytes against the digest).
+
+    Raises:
+        SparkRunError: the record exists but cannot be read.
+    """
+    uri = release_config_uri(bound_job_uri(host, run), job_sha256)
+    if uri.startswith("s3://"):
+        bucket, _, key = uri.removeprefix("s3://").partition("/")
+        try:
+            body: bytes = _s3_client(host.env).get_object(Bucket=bucket, Key=key)["Body"].read()
+            return body
+        except Exception as exc:  # noqa: BLE001 - botocore's errors; named, then raised
+            code = str((getattr(exc, "response", None) or {}).get("Error", {}).get("Code") or "")
+            if code in ("NoSuchKey", "404", "NotFound"):
+                return None
+            raise SparkRunError(f"{uri} cannot be read: {code or type(exc).__name__}") from exc
+    path = Path(uri)
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise SparkRunError(f"{uri} cannot be read: {exc.strerror}") from exc
 
 
 def remove_stop_request(host: LocalHost, uri: str) -> None:
@@ -682,6 +730,13 @@ def _log_tail(path: Path, lines: int = 6) -> str:
     return " | ".join(kept[-lines:])
 
 
+def _job_sha256(argv: Any) -> Optional[str]:
+    """The ``--fluid-job-sha256`` a local run was started with, from its recorded argv."""
+    if not isinstance(argv, list) or "--fluid-job-sha256" not in argv[:-1]:
+        return None
+    return str(argv[argv.index("--fluid-job-sha256") + 1])
+
+
 class LocalRuns:
     """The runs of one build on this machine: list, read, cancel and prune them."""
 
@@ -767,6 +822,7 @@ class LocalRuns:
             restart_of=record.get("restartOf") or None,
             stop_key=record.get("stopKey") or None,
             config_uri=record.get("jobConfig") or None,
+            job_sha256=_job_sha256(record.get("argv")),
         )
 
     def cancel(

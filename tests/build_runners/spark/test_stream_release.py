@@ -68,7 +68,7 @@ class Releasing(FakeAdapter):
 
 def go(run, clock, env=None, **kw):
     kw.setdefault("wall", lambda: WALL)
-    env = {**ENV, rc.STOP_GRACE_ENV: "30", **(env or {})}
+    env = {**ENV, rc.STOP_GRACE_ENV: "30", rc.PROBATION_ENV: "0", **(env or {})}
     return rc.reconcile([run], sleep=clock.sleep, now=clock.now, env=env, **kw)[0]
 
 

@@ -31,6 +31,8 @@ def operator_policy(monkeypatch):
     monkeypatch.setenv("AWS_ACCOUNT_ID", ACCOUNT)
     monkeypatch.delenv("AWS_PROFILE", raising=False)
     monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
+    # A released stream is kept at once: a test of the probation sets its own window.
+    monkeypatch.setenv("FLUID_SPARK_RELEASE_PROBATION_SECONDS", "0")
 
 
 @pytest.fixture

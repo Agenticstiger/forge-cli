@@ -322,6 +322,8 @@ def reconcile_after_apply(
     for out in outcomes:
         cprint(out.line(), markup=False)
         logger.info("spark_reconcile", extra={"spark": out.as_dict()})
+        if out.action == "rolled-back":
+            logger.error("spark_release_rolled_back", extra={"spark": out.as_dict()})
     return 1 if any(o.error for o in outcomes) else 0
 
 

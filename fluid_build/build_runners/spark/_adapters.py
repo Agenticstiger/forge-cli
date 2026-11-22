@@ -122,6 +122,9 @@ class RunInfo:
     #: The job config the run was started on (``--config``): it looks for its stop request
     #: beside it (:func:`stop_request_uri`).
     config_uri: Optional[str] = None
+    #: The digest of the job config forge started the run on (``--fluid-job-sha256``), as the
+    #: runtime recorded it: what a release record of that config must hash to.
+    job_sha256: Optional[str] = None
 
     @property
     def active(self) -> bool:
@@ -167,6 +170,7 @@ def _identity(args: Sequence[Any], tags: Optional[Mapping[str, Any]] = None) -> 
         (RESTART_FLAG, "restart_of"),
         (STOP_KEY_FLAG, "stop_key"),
         ("--config", "config_uri"),
+        ("--fluid-job-sha256", "job_sha256"),
     ):
         if flag in items[:-1]:
             found[key] = items[items.index(flag) + 1]
@@ -191,20 +195,37 @@ def stop_request_uri(job_uri: str, key: str) -> str:
     return f"{job_uri.rsplit('/', 1)[0]}/stop/{key}"
 
 
-def refuse_unless_beside(info: RunInfo, job_uri: str) -> None:
-    """Refuse to ask ``info`` to stop when it was started on a job config other than
-    ``job_uri`` (the output's location moved since): it looks for its request beside its own
-    config, so a request beside ``job_uri`` would never be seen. A run whose arguments do not
-    say is asked.
+#: A release record's job config, under the build's job config prefix (:func:`release_config_uri`).
+_RELEASE_CONFIG = re.compile(r"releases/[0-9a-f]{16}/job\.json")
+#: A job config digest as the runner's ``--fluid-job-sha256`` holds it.
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def release_config_uri(job_uri: str, job_sha256: str) -> str:
+    """Where a release record keeps the job config whose digest is ``job_sha256``, beside the
+    build's job config (``releases/<digest16>/job.json``): a stream rolled back to it reads it."""
+    return f"{job_uri.rsplit('/', 1)[0]}/releases/{job_sha256[:16]}/job.json"
+
+
+def stop_location(info: RunInfo, job_uri: str) -> str:
+    """The job config ``info`` looks for its stop request beside: ``job_uri`` (the build's),
+    or a release record of the build a rollback started it on. A run whose arguments do not
+    say is taken to read ``job_uri``.
 
     Raises:
-        SparkRunError: the run's job config is elsewhere (the message names both).
+        SparkRunError: the run was started on another job config (the output's location
+            moved since): a request beside ``job_uri`` would never be seen.
     """
-    if info.config_uri and info.config_uri != job_uri:
-        raise SparkRunError(
-            f"it was started on the job config {info.config_uri}, not {job_uri} (the output's "
-            "location moved), and looks for a stop request there"
-        )
+    config = info.config_uri
+    if not config or config == job_uri:
+        return job_uri
+    prefix = job_uri.rsplit("/", 1)[0] + "/"
+    if config.startswith(prefix) and _RELEASE_CONFIG.fullmatch(config[len(prefix) :]):
+        return config
+    raise SparkRunError(
+        f"it was started on the job config {config}, not {job_uri} (the output's location "
+        "moved), and looks for a stop request there"
+    )
 
 
 def stop_request_body(run: DesiredRun) -> bytes:
@@ -252,6 +273,12 @@ def checked_run(r: DesiredRun, clients: ClientFactory) -> DesiredRun:
     Raises:
         SparkRunError: an artifact cannot be read, or is another one; nothing started.
     """
+    return _checked(r, clients)[0]
+
+
+def _checked(r: DesiredRun, clients: ClientFactory) -> "tuple[DesiredRun, bytes]":
+    """:func:`checked_run`, and the job config's bytes as the runtime reads them (with the MSK
+    brokers OpenTofu fills in), which a release record keeps."""
     import dataclasses
     import hashlib
     import unicodedata
@@ -271,7 +298,7 @@ def checked_run(r: DesiredRun, clients: ClientFactory) -> DesiredRun:
             "compiled (another apply has changed it since); nothing was started. Run fluid "
             "apply again: it uploads them and starts the run on them"
         )
-    return dataclasses.replace(r, job_sha256=config_digest(r.job_text))
+    return dataclasses.replace(r, job_sha256=config_digest(r.job_text)), config
 
 
 def _read_back(clients: ClientFactory, region: str, uri: str) -> bytes:
@@ -322,13 +349,15 @@ class Adapter:
         # A local run has no AWS client: its "client" is the machine (``Local.host``).
         self.client = clients(self.service, run.region) if clients is not None else None
         self._checked: Optional[DesiredRun] = None
+        #: The job config's bytes :meth:`checked` read back, which :meth:`keep_release` keeps.
+        self._checked_body: Optional[bytes] = None
 
     def checked(self) -> DesiredRun:
         """:func:`checked_run` of this adapter's run, read once: a reconcile checks before it
         cancels the run of another config (a refusal leaves that run going), and the start
         then uses the run it checked."""
         if self._checked is None:
-            self._checked = checked_run(self.run, self.clients)
+            self._checked, self._checked_body = _checked(self.run, self.clients)
         return self._checked
 
     def runs(self, since: Optional[float] = None) -> List[RunInfo]:
@@ -390,12 +419,11 @@ class Adapter:
 
         Raises:
             SparkRunError: the request could not be written, or the run looks for one beside
-                another job config (:func:`refuse_unless_beside`; the message names it).
+                another job config (:func:`stop_location`; the message names it).
         """
         if not usable_stop_key(info.stop_key):
             return None
-        refuse_unless_beside(info, self.run.job_uri)
-        uri = stop_request_uri(self.run.job_uri, str(info.stop_key))
+        uri = stop_request_uri(stop_location(info, self.run.job_uri), str(info.stop_key))
         bucket, _, key = uri.removeprefix("s3://").partition("/")
         try:
             (self.clients or default_clients)("s3", self.run.region).put_object(
@@ -408,6 +436,53 @@ class Adapter:
             code = _error_code(exc) or type(exc).__name__
             raise SparkRunError(f"the stop request {uri} could not be written: {code}") from exc
         return uri
+
+    def sibling(self, run: DesiredRun) -> "Adapter":
+        """An adapter for ``run``, another run of this build (a rollback's), with this one's
+        clients."""
+        return type(self)(run, self.clients)
+
+    def keep_release(self, run: DesiredRun) -> str:
+        """Keep the job config ``run`` was started on as a release record
+        (:func:`release_config_uri`): the bytes :meth:`checked` read back, which a later
+        release rolls back to. Its URI.
+
+        Raises:
+            SparkRunError: the record could not be written (the message names it).
+        """
+        from fluid_build.build_runners.spark._desired import config_digest
+
+        body = self._checked_body
+        if body is None:
+            body = _artifact(run, self.clients or default_clients, run.job_uri)
+        uri = release_config_uri(run.job_uri, run.job_sha256 or config_digest(run.job_text))
+        bucket, _, key = uri.removeprefix("s3://").partition("/")
+        try:
+            (self.clients or default_clients)("s3", run.region).put_object(
+                Bucket=bucket, Key=key, Body=body, ContentType="application/json"
+            )
+        except Exception as exc:  # noqa: BLE001 - botocore's errors; named, then raised
+            code = _error_code(exc) or type(exc).__name__
+            raise SparkRunError(f"{uri} could not be written: {code}") from exc
+        return uri
+
+    def release_config(self, info: RunInfo) -> Optional[bytes]:
+        """The job config the release record of ``info``'s digest holds, or None when there is
+        none (or ``info`` carries no digest). The caller checks the bytes against the digest.
+
+        Raises:
+            SparkRunError: the record cannot be read (the message names it and the code).
+        """
+        if not info.job_sha256 or not _SHA256.fullmatch(info.job_sha256):
+            return None
+        uri = release_config_uri(self.run.job_uri, info.job_sha256)
+        try:
+            return _read_back(self.clients or default_clients, self.run.region, uri)
+        except Exception as exc:  # noqa: BLE001 - botocore's errors; named, then raised
+            code = _error_code(exc) or type(exc).__name__
+            if code in ("NoSuchKey", "404", "NotFound"):
+                return None
+            raise SparkRunError(f"the release record {uri} cannot be read: {code}") from exc
 
     def withdraw_stop(self, uri: str) -> None:
         """Delete a stop request once its run has ended or been cancelled. Best effort: one
@@ -998,13 +1073,30 @@ class Local(Adapter):
 
         if not usable_stop_key(info.stop_key):
             return None
-        refuse_unless_beside(info, bound_job_uri(self.host, self.run))
-        return write_stop_request(self.host, self.run, str(info.stop_key))
+        where = stop_location(info, bound_job_uri(self.host, self.run))
+        return write_stop_request(self.host, self.run, str(info.stop_key), beside=where)
 
     def withdraw_stop(self, uri: str) -> None:
         from fluid_build.build_runners.spark._local import remove_stop_request
 
         remove_stop_request(self.host, uri)
+
+    def sibling(self, run: DesiredRun) -> "Adapter":
+        return Local(run, self.host)
+
+    def keep_release(self, run: DesiredRun) -> str:
+        """The record under this machine's artifact root (:meth:`Adapter.keep_release`): the
+        bytes forge wrote for the run."""
+        from fluid_build.build_runners.spark._local import keep_release
+
+        return keep_release(self.host, run)
+
+    def release_config(self, info: RunInfo) -> Optional[bytes]:
+        from fluid_build.build_runners.spark._local import read_release
+
+        if not info.job_sha256 or not _SHA256.fullmatch(info.job_sha256):
+            return None
+        return read_release(self.host, self.run, info.job_sha256)
 
     def retry_hint(self) -> str:
         """How to start a stream whose restarts are spent sooner, when the cause was this
