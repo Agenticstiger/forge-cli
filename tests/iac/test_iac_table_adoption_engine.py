@@ -154,7 +154,14 @@ def tofu(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "tofu_state_rm", tofu_state_rm)
     monkeypatch.setattr(runner, "tofu_plan", tofu_plan)
     monkeypatch.setattr(runner, "tofu_apply", tofu_apply)
-    monkeypatch.setattr(runner, "tofu_show_plan", lambda *a, **k: calls["shown"])
+
+    def tofu_show_plan(*a, **k):
+        # A list answers one plan after another; anything else answers every plan.
+        if isinstance(calls["shown"], list):
+            return calls["shown"].pop(0)
+        return calls["shown"]
+
+    monkeypatch.setattr(runner, "tofu_show_plan", tofu_show_plan)
     monkeypatch.chdir(tmp_path)
     return calls
 
@@ -420,6 +427,64 @@ def test_plan_tofu_re_attaches_a_table_forge_made_without_recording_an_adoption(
     assert "adoptedTables" not in record
     (module,) = tofu["plans"]
     assert {"to": TABLE, "id": f"{ACCOUNT}:sales:orders"} in _imports(module)
+
+
+def _own_drift() -> Dict[str, Any]:
+    """The table as its writers keep it: a description and an owner the contract does not
+    declare. What the comparison lets differ, and an Iceberg table keeps on adoption."""
+    before = dict(_glue_state(), description="written by the stream", owner="hadoop")
+    return {"resource_changes": [_imported(["update"], before, _glue_state())]}
+
+
+def _held_attributes(module: Dict[str, Any]) -> List[str]:
+    body = module["resource"]["aws_glue_catalog_table"]["sales_orders_sales_orders"]
+    return list(body["lifecycle"]["ignore_changes"])
+
+
+def test_an_adopted_iceberg_table_is_planned_again_with_its_own_drift_left_alone(
+    tofu, tmp_path, capfd
+):
+    """The first plan would update it in place; an adopted Iceberg table never is, so the
+    plan is made again leaving it as it is, and that plan imports it with no change."""
+    tofu["shown"] = [_own_drift(), MATCHING]
+
+    assert engine.apply_via_opentofu(_args(tmp_path, adopt_tables=True), _LOG) == 0
+
+    first, again = tofu["plans"]
+    assert _held_attributes(first) == ["parameters", "open_table_format_input"]
+    assert _held_attributes(again) == [
+        "parameters",
+        "open_table_format_input",
+        "description",
+        "owner",
+        "retention",
+        "storage_descriptor",
+    ]
+    assert tofu["apply"] == 1
+    out = " ".join(capfd.readouterr().out.split())
+    assert "leaves as it is (an adopted Iceberg table is not updated in place)" in out
+    assert "clears the description" in out and "clears the owner hadoop" in out
+
+
+def test_an_iceberg_table_the_plan_made_again_still_updates_is_refused(tofu, tmp_path):
+    tofu["shown"] = [_own_drift(), _own_drift()]
+
+    with pytest.raises(CLIError) as raised:
+        engine.apply_via_opentofu(_args(tmp_path, adopt_tables=True), _LOG)
+
+    assert raised.value.event == "table_adoption_mismatch"
+    assert "without an in-place update" in raised.value.context["error"]
+    assert tofu["apply"] == 0
+
+
+def test_plan_tofu_saves_the_plan_that_leaves_an_adopted_iceberg_table_alone(tofu, tmp_path):
+    tofu["shown"] = [_own_drift(), MATCHING]
+
+    record = _plan(tmp_path, adopt_tables=True)
+
+    assert record["adoptedTables"] == ["sales.orders"]
+    _first, again = tofu["plans"]
+    assert "storage_descriptor" in _held_attributes(again)
 
 
 # ── fluid plan --tofu ───────────────────────────────────────────────────────

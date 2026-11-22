@@ -10,7 +10,9 @@ and output formats and SerDe), then a contract names them:
 
 * one that matches is planned through an ``import`` block (``fluid plan --tofu``), the
   saved plan destroys nothing, and ``fluid apply plan.json`` takes it over: the state
-  holds it, its metadata location is untouched, and the next plan is empty;
+  holds it, its metadata location is untouched, and the next plan is empty; what it
+  holds of its own that the contract does not declare (a description, an owner, column
+  comments) is left as it is: the adoption updates no Iceberg table in place;
 * one that differs, or a Hive table under an Iceberg binding, is refused naming the
   differences, with nothing in state and the table as it was;
 * without the flag an existing table is refused, unless forge made it: a table that
@@ -297,6 +299,60 @@ def test_a_table_forge_made_is_re_attached_after_its_state_is_lost(
     assert _table_address(cid) in _state_addresses(workdir)
     live = _boto("glue", moto_endpoint).get_table(DatabaseName=DATABASE, Name=TABLE)["Table"]
     assert [column["Name"] for column in live["StorageDescriptor"]["Columns"]] == ["id", "note"]
+
+
+def test_an_adopted_iceberg_table_with_its_own_drift_plans_no_update_and_keeps_it(
+    moto_endpoint: str, tmp_path: Path, capfd
+) -> None:
+    """A description, an owner, a column comment and a column of an older schema that the
+    contract does not declare: the comparison lets them differ, and an adopted Iceberg
+    table is never updated in place, so the saved plan imports it with no change and the
+    table keeps them."""
+    cid = "iac.adopt.drift"
+    bucket = "adopt-drift-lake"
+    commented = dict(_iceberg_column("id", "bigint", 1), Comment="the order")
+    metadata = _existing_iceberg_table(
+        moto_endpoint,
+        bucket,
+        columns=[commented, _iceberg_column("legacy", "string", 2, current=False)],
+    )
+    glue = _boto("glue", moto_endpoint)
+    table = glue.get_table(DatabaseName=DATABASE, Name=TABLE)["Table"]
+    glue.update_table(
+        DatabaseName=DATABASE,
+        TableInput={
+            "Name": TABLE,
+            "TableType": table["TableType"],
+            "Owner": "hadoop",
+            "Description": "written by the stream",
+            "Parameters": table["Parameters"],
+            "StorageDescriptor": table["StorageDescriptor"],
+        },
+    )
+    _sidecar(tmp_path, cid, moto_endpoint)
+
+    plan = _saved_plan(tmp_path, _contract(bucket, cid), adopt_tables=True)
+
+    changes = _shown(tmp_path, plan)
+    change = changes[_table_address(cid)]
+    assert change["importing"] is not None and change["actions"] == ["no-op"]
+    assert not [
+        address
+        for address, planned in changes.items()
+        if address.startswith("aws_glue_catalog_table.") and "update" in planned["actions"]
+    ]
+    out = " ".join(capfd.readouterr().out.split())
+    assert "leaves as it is (an adopted Iceberg table is not updated in place)" in out
+
+    assert (
+        engine.apply_via_opentofu(_apply_args(plan, tmp_path, no_verify_plan_binding=False), _LOG)
+        == 0
+    )
+
+    live = glue.get_table(DatabaseName=DATABASE, Name=TABLE)["Table"]
+    assert live["Description"] == "written by the stream" and live["Owner"] == "hadoop"
+    assert [c.get("Comment") for c in live["StorageDescriptor"]["Columns"]] == ["the order", None]
+    assert live["Parameters"]["metadata_location"] == metadata
 
 
 def test_a_table_that_differs_is_refused_naming_its_columns_and_location(

@@ -81,6 +81,21 @@ _SERDE_REVIEWED = frozenset({"serialization_library", "parameters"})
 #: The longest piece of catalog text a message quotes.
 _MAX_SHOWN = 200
 
+#: What an adopted Iceberg table keeps as it is in the run that adopts it: every attribute
+#: the comparison lets differ. An in-place update of a live Iceberg table is an
+#: ``UpdateTable`` that hashicorp/aws sends without a ``VersionId``, after re-reading the
+#: table's ``metadata_location`` (``internal/service/glue/catalog_table.go``,
+#: ``resourceCatalogTableUpdate``), so a commit an engine makes in between could be lost.
+#: The adoption itself never opens that window: what the table holds of its own is
+#: reported, and left alone.
+ICEBERG_HELD = ("description", "owner", "retention", "storage_descriptor")
+
+
+def held_still(declared: Mapping[str, Any]) -> Tuple[str, ...]:
+    """The attributes an adopted table keeps as it is, as the module declares the table:
+    :data:`ICEBERG_HELD` for an Iceberg table, ``()`` for any other."""
+    return ICEBERG_HELD if "open_table_format_input" in declared else ()
+
 
 def review_glue_table(
     change: Mapping[str, Any], declared: Mapping[str, Any]

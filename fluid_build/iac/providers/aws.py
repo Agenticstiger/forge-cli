@@ -1026,6 +1026,13 @@ class AwsIacPlugin:
         recorded = _recorded_product_id(parameters.get("fluid_contract"))
         return recorded is None or recorded == str(contract.get("id") or "")
 
+    def adoption_hold(self, declared: Mapping[str, Any]) -> Tuple[str, ...]:
+        """The attributes an adopted table keeps as it is in the run that adopts it
+        (``aws_adoption.held_still``): an Iceberg table is never updated in place."""
+        from .aws_adoption import held_still
+
+        return held_still(declared)
+
     def review_table_adoption(
         self, change: Mapping[str, Any], declared: Mapping[str, Any]
     ) -> Tuple[List[str], List[str]]:

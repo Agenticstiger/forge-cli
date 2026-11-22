@@ -190,11 +190,12 @@ def _apply_via_opentofu(
             raise _plan_failure(eng.plugin, eng.contract, plan, eng.workdir, eng.env)
         changes = runner.change_summary(plan)
         cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
-        _record_planned(eng, changes, dry_run)
         # Before the data-loss gate: a table that differs is refused naming what differs.
-        reviews = _table_adoption.check_plan(
+        adoption = _table_adoption.check_plan(
             eng.plugin, eng.module, tables, _shown_for_adoption(eng, tables), logger
         )
+        plan, changes, _ = _plan_holding_adopted_tables(eng, adoption, plan, changes)
+        _record_planned(eng, changes, dry_run)
         destroyed = _review_plan(eng, args, logger, changes, runner.planned_removals(plan))
         if dry_run:
             _preview_outside_opentofu(eng, logger, destroyed, changes)
@@ -207,7 +208,7 @@ def _apply_via_opentofu(
         _prepare_destroys(eng.plugin, eng.contract, destroyed)
         imported.keep()
 
-    _table_adoption.audit_take_over(logger, reviews)
+    _table_adoption.audit_take_over(logger, adoption.reviews)
     return _finish_apply(eng, logger, changes, destroyed, applied_state)
 
 
@@ -261,6 +262,29 @@ def _tables_through_import_blocks(
         imported.addresses.remove(address)
     _table_adoption.write_import_blocks(eng.module_path, tables)
     return tables
+
+
+def _plan_holding_adopted_tables(
+    eng: _Engine, adoption: Any, plan: Any, changes: Dict[str, int]
+) -> Tuple[Any, Dict[str, int], Optional[Dict[str, Any]]]:
+    """``(plan, changes, shown)`` the run goes on with: the same plan, or, when an adopted
+    table the plugin keeps as it is would be updated in place (an Iceberg table), the
+    plan made again with that table's own drift left alone and checked to import it with
+    no change at all. ``shown`` is the new plan as ``tofu show -json`` prints it, ``None``
+    when the plan was not made again."""
+    if not _table_adoption.hold_still(eng.module_path, adoption):
+        return plan, changes, None
+    again = runner.tofu_plan(eng.workdir, out_file=_WORKDIR_PLAN, env=eng.env)
+    if not again.ok:
+        raise _plan_failure(eng.plugin, eng.contract, again, eng.workdir, eng.env)
+    changes = runner.change_summary(again)
+    cprint(
+        f"  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']} "
+        "(made again, leaving the adopted Iceberg tables as they are)"
+    )
+    shown = runner.tofu_show_plan(eng.workdir, plan_file=_WORKDIR_PLAN, env=eng.env)
+    _table_adoption.check_held(shown, adoption)
+    return again, changes, shown
 
 
 def _shown_for_adoption(eng: _Engine, tables: List[Any]) -> Optional[Dict[str, Any]]:
@@ -676,7 +700,10 @@ def _plan_with_opentofu(
             {"error": f"`tofu show -json {_WORKDIR_PLAN}` failed in {eng.workdir}"},
         )
     # Before the data-loss reading, and before any file is written next to plan.json.
-    reviews = _table_adoption.check_plan(eng.plugin, eng.module, tables, shown, logger)
+    adoption = _table_adoption.check_plan(eng.plugin, eng.module, tables, shown, logger)
+    plan, changes, held = _plan_holding_adopted_tables(eng, adoption, plan, changes)
+    if held is not None:
+        shown = held
     _review_plan(eng, args, logger, changes, runner.planned_removals(plan), enforce=False)
 
     saved = (Path(eng.workdir) / _WORKDIR_PLAN).read_bytes()
@@ -717,7 +744,11 @@ def _plan_with_opentofu(
         "changes": changes,
         "imports": sorted(block.to for block in adopted),
         # Under planDigest: an approval of plan.json is an approval of these take-overs.
-        **({"adoptedTables": sorted(review.table for review in reviews)} if reviews else {}),
+        **(
+            {"adoptedTables": sorted(review.table for review in adoption.reviews)}
+            if adoption.reviews
+            else {}
+        ),
         "target": target,
     }
 

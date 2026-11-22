@@ -73,6 +73,10 @@ class IacProviderPlugin(Protocol):
       state) carries the marker forge's module sets on create, for this contract's
       product; such a table is this product's own, re-attached as before without
       ``--adopt-tables``. Without the capability every found table needs the flag.
+    * ``adoption_hold(declared)``: the attributes an adopted table keeps as it is in
+      the run that adopts it (its body in the module); the engine plans that table again
+      with them in ``ignore_changes`` and refuses a plan that still updates it in place.
+      ``()`` (or no capability) lets the adoption update it.
     * ``review_table_adoption(change, declared)``: ``(differences, updates)`` of
       one table the saved plan imports (a ``tofu show -json`` resource change,
       and the table's body in the module); any difference refuses the run.
