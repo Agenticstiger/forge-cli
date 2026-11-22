@@ -88,6 +88,61 @@ def _positive_int(text: str) -> int:
     return value
 
 
+def _add_code_importer_arguments(parser: argparse.ArgumentParser) -> None:
+    """The arguments of ``fluid import airflow|pyspark``, and of ``--dry-run`` and ``--force``,
+    which every importer takes."""
+    parser.add_argument(
+        "--split-by",
+        dest="split_by",
+        choices=["project", "folder", "group", "table", "job", "dag"],
+        default=None,
+        help=(
+            "Product boundary. dbt: one contract per project (default), per top-level "
+            "models/ subfolder (folder), or per dbt group (group; cross-split refs become "
+            "cross-product consumes[]). airflow and pyspark: one product per output table or "
+            "topic (table, the default), per job file (job), per Airflow DAG (dag), per top-level "
+            "folder (folder) or one for everything (project)"
+        ),
+    )
+    parser.add_argument(
+        "--dags",
+        dest="dags",
+        default=None,
+        metavar="DIR",
+        help=(
+            "DAGs directory for `fluid import pyspark`: each DAG task is joined to the script "
+            "it submits, which adds the schedule, the owner and the dependencies"
+        ),
+    )
+    parser.add_argument(
+        "--conventions",
+        dest="conventions",
+        default=None,
+        metavar="FILE",
+        help=(
+            "The organisation's layout as data, for `fluid import airflow|pyspark`: where "
+            "scripts and data live (S3 prefixes), helper function names, config modules, "
+            "environment names, owners, layers and what to ignore"
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="Print the proposal and the report; write nothing",
+    )
+    parser.add_argument(
+        "--force",
+        dest="force",
+        action="store_true",
+        help=(
+            "Overwrite a contract file that already exists and differs from what the import "
+            "writes. airflow and pyspark never replace such a file without it; the other "
+            "importers always overwrite"
+        ),
+    )
+
+
 def register(subparsers: argparse._SubParsersAction) -> None:
     """Register the ``fluid import`` command.
 
@@ -113,17 +168,30 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "  fluid import schema-registry <subject> --registry confluent --url <https URL>\n"
             "  fluid import schema-registry <subject> --registry glue [--registry-name N]\n"
             "                                           — a registry subject -> a consumer contract\n"
+            "  fluid import pyspark <jobs-dir> [--dags <dags-dir>] [--conventions FILE]\n"
+            "                                           : PySpark jobs, one product per output (static)\n"
+            "  fluid import airflow <dags-dir> [--conventions FILE]\n"
+            "                                           : Airflow DAGs to products (never imports Airflow)\n"
+            "  Any importer plugin installed adds `fluid import <name> <source>`.\n"
+            "  Add --dry-run to print the proposal and the report and write nothing.\n"
             "  fluid import [--dir <path>]              — legacy dbt/Terraform/SQL scan"
         ),
     )
     # Optional first positional: tool name. When present, dispatches to the
     # foreign-config importer; when absent, falls through to the legacy
-    # directory scanner.
+    # directory scanner. The names come from the importer registry: the built-ins,
+    # and the installed ``fluid_build.importers`` plugins (read by name when the
+    # value is not a built-in; nothing is scanned or loaded to build the parser).
+    from fluid_build.cli.import_workflow.registry import ImporterChoices
+
     parser.add_argument(
         "tool",
         nargs="?",
-        choices=["meltano", "airbyte", "dlt", "singer", "dbt", "schema-registry"],
+        metavar="tool",
+        choices=ImporterChoices(),
         default=None,
+        # No ``%(choices)s``: the CLI's own help formatter prints the help text as it is and
+        # then lists the choices (the built-ins and the installed plugins) itself.
         help="Foreign tool to import from (omit for a dbt/Terraform/SQL directory scan)",
     )
     parser.add_argument(
@@ -144,17 +212,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "with --split-by producing multiple products, the output DIRECTORY"
         ),
     )
-    parser.add_argument(
-        "--split-by",
-        dest="split_by",
-        choices=["project", "folder", "group"],
-        default="project",
-        help=(
-            "dbt import product boundary: one contract per project (default), "
-            "per top-level models/ subfolder, or per dbt group (cross-split "
-            "refs become cross-product consumes[])"
-        ),
-    )
+    _add_code_importer_arguments(parser)
     parser.add_argument(
         "--server-url",
         dest="server_url",
@@ -586,9 +644,11 @@ def run(args: Any, logger: logging.Logger) -> int:
     for a recognizable dbt / Terraform / SQL project.
     """
     tool = getattr(args, "tool", None)
+    from fluid_build.cli._import_workflow_handler import check_import_flags
     from fluid_build.cli.import_workflow.schema_registry import check_flags
 
     check_flags(args, tool)
+    check_import_flags(args, tool)
     if tool:
         from fluid_build.cli._import_workflow_handler import run_import_from_tool
 

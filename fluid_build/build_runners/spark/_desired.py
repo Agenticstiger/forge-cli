@@ -249,6 +249,13 @@ class DesiredRun:
     #: The sha256 of the job config the run's runtime reads, once ``fluid apply`` has read
     #: it back (or written it, for a local run): the runner refuses any other config.
     job_sha256: Optional[str] = field(default=None, compare=False)
+    #: A prebuilt package build's (``properties.package``): where the team published it,
+    #: its sha256 and entry point, and forge's copy beside the job config, the one the
+    #: runner reads (OpenTofu copies it on AWS; :func:`._local.publish` on a local run).
+    package_source: Optional[str] = None
+    package_sha256: Optional[str] = None
+    package_entry_point: Optional[str] = None
+    package_uri: Optional[str] = None
     #: What the runner stamps on each Iceberg commit beside the product, build and job config
     #: digest: the version of the build's output, the contract's digest, the release the deploy
     #: names and the pipeline's run id (``--fluid-*``). They are sent as runner arguments,
@@ -318,6 +325,7 @@ class DesiredRun:
             job_text=sub(self.job_text),
             role_arn=sub(self.role_arn),
             checkpoint=sub(self.checkpoint) if self.checkpoint else self.checkpoint,
+            package_uri=sub(self.package_uri) if self.package_uri else self.package_uri,
         )
 
     def identity_args(self) -> List[str]:
@@ -386,7 +394,21 @@ class DesiredRun:
 
     def plan_action(self, step: int) -> Dict[str, Any]:
         """The plan's ``spark.reconcile`` action, with ``op`` and ``action_type`` both set:
-        apply's dispatcher reads ``op``, display reads ``action_type``."""
+        apply's dispatcher reads ``op``, display reads ``action_type``. A package build's
+        names the package it runs and where its copy comes from, so the bound plan holds
+        both."""
+        action = self._plan_action(step)
+        if self.package_sha256:
+            payload = action["payload"]
+            payload["artifacts"]["package"] = self.package_uri
+            payload["package"] = {
+                "source": self.package_source,
+                "sha256": self.package_sha256,
+                "entryPoint": self.package_entry_point,
+            }
+        return action
+
+    def _plan_action(self, step: int) -> Dict[str, Any]:
         return {
             "step": step,
             "action_id": f"spark_{self.build}",
@@ -881,10 +903,28 @@ def desired_runs(
                 topic=source.get("topic") if isinstance(source, Mapping) else None,
                 restarts_per_hour=restart_budget(build, scheduled),
                 job_text=job.text,
+                **_package_fields(build, config, root, product, bid),
                 **_stamp_fields(contract, build, stamps),
             )
         )
     return [run.bind(account) for run in runs] if account else runs
+
+
+def _package_fields(
+    build: Mapping[str, Any], config: Mapping[str, Any], root: str, product: str, bid: str
+) -> Dict[str, Any]:
+    """A prebuilt package build's :class:`DesiredRun` fields, none for any other build: the
+    compiled config says what runs, the build where it comes from."""
+    package = config.get("package")
+    if not package:
+        return {}
+    sha = str(package["sha256"])
+    return {
+        "package_source": str((build.get("properties") or {})["package"]["uri"]),
+        "package_sha256": sha,
+        "package_entry_point": str(package["entryPoint"]),
+        "package_uri": _names.package_uri(root, product, bid, sha),
+    }
 
 
 def _stamp_fields(
