@@ -172,6 +172,53 @@ def test_fluid_commands_in_skills_exist(skill: Path) -> None:
     assert not defects, "\n".join(defects)
 
 
+#: The event a table row or a list item of a skill starts with: lower case, with an underscore.
+_EVENT_ROW = re.compile(r"^(?:\| |- )`([a-z]+(?:_[a-z0-9]+)+)`", re.M)
+
+
+#: An event built from a prefix and an error's kind: ``apply_plan_digest_`` and the kind of a
+#: ``PlanBindingError`` (``packet-mismatch``), with ``-`` read as ``_``.
+_KIND_PREFIXES = ("apply_plan_digest_",)
+
+
+def _emitted(event: str, source: str) -> bool:
+    from fluid_build import _error_catalog
+
+    if event in _error_catalog.catalogued_events() or f'"{event}"' in source:
+        return True
+    return any(
+        event.startswith(prefix) and f'"{event[len(prefix):].replace("_", "-")}"' in source
+        for prefix in _KIND_PREFIXES
+    )
+
+
+def test_every_event_a_skill_tabulates_is_one_fluid_emits() -> None:
+    """A skill's event tables name events from the error catalog or the code that raises them,
+    so a renamed or invented event fails here instead of sending an agent after it."""
+    source = "\n".join(
+        p.read_text(encoding="utf-8", errors="replace")
+        for p in sorted((REPO_ROOT / "fluid_build").rglob("*.py"))
+    )
+    named = sorted(
+        {
+            (skill.name, event)
+            for skill in SKILLS
+            for doc in _docs(skill)
+            for event in _EVENT_ROW.findall(doc.read_text(encoding="utf-8"))
+        }
+    )
+    assert len(named) >= 10, named
+    unknown = [f"{skill}: {event}" for skill, event in named if not _emitted(event, source)]
+    assert not unknown, unknown
+
+
+def test_an_invented_event_is_caught() -> None:
+    assert not _emitted("table_adoption_wished_for", 'raise CLIError("table_adoption_mismatch")')
+    assert _emitted("table_adoption_mismatch", "")
+    assert _emitted("apply_plan_digest_packet_mismatch", 'kind="packet-mismatch"')
+    assert not _emitted("apply_plan_digest_packet_lost", 'kind="packet-mismatch"')
+
+
 def test_retired_commands_and_flags_are_not_taught() -> None:
     retired = ("fluid generate-artifacts", "--no-verify-digest", "13 tools")
     offenders = [
