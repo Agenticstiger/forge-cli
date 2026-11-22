@@ -9,6 +9,8 @@ prints it: ``before`` is the table as the provider read it on import, ``after`` 
 table the module declares as the provider merges it. Measured with OpenTofu 1.13 and
 hashicorp/aws 6.73 against moto:
 
+* a type is compared as the data-loss gate compares it, spacing aside, and a column
+  name whatever its case (Glue, Hive and Athena resolve it so);
 * the provider keeps a column's ``parameters`` when the module sets none (Optional and
   Computed), so the ``iceberg.field.*`` parameters Iceberg's Glue catalog writes on
   every column (``IcebergToGlueConverter``) never differ;
@@ -24,8 +26,8 @@ hashicorp/aws 6.73 against moto:
 A difference refuses the adoption: a column missing, added, of another type or in
 another order, or another location, format, SerDe, partition key, table type or any
 other storage setting. What holds no data and the contract may not declare (the
-description, the owner, a column comment, a type written with other spacing) is an
-update the apply makes in place, reported, never refused. An attribute no rule names
+description, the owner, a column comment, a type written with other spacing, a column
+name in another case) is an update the apply makes in place, reported, never refused. An attribute no rule names
 is a difference: the review fails closed.
 """
 
@@ -33,10 +35,6 @@ from __future__ import annotations
 
 import re
 from typing import Any, FrozenSet, List, Mapping, Optional, Tuple
-
-#: How ``fluid verify`` reads Glue types (``cli/_verify_athena.py``): spacing and case
-#: aside, Glue and Athena both accept ``integer`` for ``int``.
-_TYPE_SYNONYMS = ((re.compile(r"\binteger\b"), "int"),)
 
 _ICEBERG_FIELD = "iceberg.field."
 _ICEBERG_CURRENT = "iceberg.field.current"
@@ -184,7 +182,8 @@ def _review_columns(
             continue
         name = _say(_name(wanted))
         if _name(found) != _name(wanted):
-            differences.append(f"column {name}: named {_say(_name(found))} in the table")
+            # Glue, Hive and Athena resolve a column's name whatever its case.
+            updates.append(f"writes the name of column {_say(_name(found))} as {name}")
         if _canonical(_type(found)) != _canonical(_type(wanted)):
             differences.append(
                 f"column {name}: {_say(_type(found))} in the table, "
@@ -219,10 +218,10 @@ def _current(column: Mapping[str, Any]) -> bool:
 
 
 def _canonical(glue_type: str) -> str:
-    text = re.sub(r"\s+", "", glue_type).lower()
-    for pattern, replacement in _TYPE_SYNONYMS:
-        text = pattern.sub(replacement, text)
-    return text
+    """A Glue type as the data-loss gate compares it (``aws.glue_column_type_changes``):
+    spacing aside, any other spelling (``INT``, ``integer`` for ``int``) is a type change
+    there, so it is a difference here, never a match the gate then holds."""
+    return re.sub(r"\s+", "", glue_type)
 
 
 # ── the storage ─────────────────────────────────────────────────────────────

@@ -192,7 +192,7 @@ def _apply_via_opentofu(
         cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
         _record_planned(eng, changes, dry_run)
         # Before the data-loss gate: a table that differs is refused naming what differs.
-        _table_adoption.check_plan(
+        reviews = _table_adoption.check_plan(
             eng.plugin, eng.module, tables, _shown_for_adoption(eng, tables), logger
         )
         destroyed = _review_plan(eng, args, logger, changes, runner.planned_removals(plan))
@@ -207,6 +207,7 @@ def _apply_via_opentofu(
         _prepare_destroys(eng.plugin, eng.contract, destroyed)
         imported.keep()
 
+    _table_adoption.audit_take_over(logger, reviews)
     return _finish_apply(eng, logger, changes, destroyed, applied_state)
 
 
@@ -1067,6 +1068,7 @@ def _apply_bound_plan(
         return 0
     _enforce_access(eng.plugin, "pre_apply", eng.contract)
     _prepare_destroys(eng.plugin, eng.contract, destroyed)
+    _table_adoption.audit_take_over(logger, list(record.get("adoptedTables") or []))
     return _finish_apply(eng, logger, changes, destroyed, applied_state, bound=True)
 
 

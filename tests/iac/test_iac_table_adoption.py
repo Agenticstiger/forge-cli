@@ -269,14 +269,32 @@ def test_the_same_columns_in_another_order_are_named():
     )
 
 
-def test_a_column_named_in_another_case_is_named():
+def test_a_column_named_in_another_case_is_an_update_not_a_difference():
+    """Glue, Hive and Athena resolve a column's name whatever its case."""
     after = _with_columns(
         LIVE_ICEBERG, [_column("ID", "bigint"), _column("amount", "decimal(12,2)")]
     )
 
     review = _review(_change(LIVE_ICEBERG, after))
 
-    assert review.differences == ("column ID: named id in the table",)
+    assert review.matches, review.differences
+    assert review.updates == ("writes the name of column id as ID",)
+
+
+@pytest.mark.parametrize("live_type", ["integer", "INT", "Int"])
+def test_a_type_the_data_loss_gate_reads_as_changed_is_a_difference(live_type):
+    """Spacing aside, a spelling the gate counts as a type change (``integer`` for ``int``,
+    another case) is refused here, never reported as a match the gate then holds."""
+    from fluid_build.iac.providers.aws import glue_column_type_changes
+
+    before = _with_columns(LIVE_ICEBERG, [_column("id", live_type), _column("amount", "double")])
+    after = _with_columns(LIVE_ICEBERG, [_column("id", "int"), _column("amount", "double")])
+    change = _change(before, after)
+
+    review = _review(change)
+
+    assert review.differences == (f"column id: {live_type} in the table, int in the contract",)
+    assert glue_column_type_changes({"resource_changes": [change]}), "the gate agrees"
 
 
 def test_a_column_of_an_older_iceberg_schema_is_not_compared():
@@ -594,6 +612,23 @@ def test_each_glue_table_candidate_names_its_table_and_nothing_else_does(monkeyp
         "aws_glue_catalog_table.sales_orders_sales_orders": "123456789012:sales:orders",
         "aws_glue_catalog_table.sales_orders_sales_refunds": "123456789012:sales:refunds",
     }
+
+
+def test_a_binding_without_a_format_is_looked_for_as_the_emitter_declares_it(monkeypatch):
+    """The emitter declares a Glue table for it (parquet by default), so the look-up and
+    ``adoptable_tables`` name it the same way."""
+    monkeypatch.setenv("AWS_ACCOUNT_ID", "123456789012")
+    binding = {k: v for k, v in PARQUET_BINDING.items() if k != "format"}
+    contract = _contract(binding)
+    plugin = get_iac_plugin("aws")
+
+    offered = {block.to: block.table for block in plugin.discover_imports(contract) if block.table}
+
+    assert (
+        offered
+        == plugin.adoptable_tables(contract)
+        == {"aws_glue_catalog_table.sales_orders_sales_refunds": "sales.refunds"}
+    )
 
 
 def test_adoptable_tables_are_every_glue_table_the_contract_names_account_or_not(monkeypatch):

@@ -199,10 +199,18 @@ def check_plan(
             cprint_literal(
                 "               and changes in place: " + "; ".join(entry.updates), soft_wrap=True
             )
-    # Taking over a table is an ownership change: audited at WARNING, as the other
-    # ownership and data-loss overrides are (``packaging_adoption_override``).
-    warn(logger, "table_adoption_accepted", tables=[entry.as_event() for entry in reviews])
     return reviews
+
+
+def audit_take_over(logger: logging.Logger, tables: Sequence[Any]) -> None:
+    """The run is about to apply a plan that takes ``tables`` over (reviews, or the names a
+    saved plan recorded). An ownership change, audited at WARNING as the other ownership
+    and data-loss overrides are (``packaging_adoption_override``); never for a run that
+    applies nothing (a dry run, a refusal)."""
+    if not tables:
+        return
+    described = [t.as_event() if isinstance(t, TableReview) else {"table": str(t)} for t in tables]
+    warn(logger, "table_adoption_accepted", tables=described)
 
 
 def _unchecked(named: Mapping[str, str], why: str) -> CLIError:

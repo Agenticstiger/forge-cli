@@ -876,13 +876,16 @@ class AwsIacPlugin:
                 seen.add(address)
                 blocks.append(ImportBlock(to=address, id=resource_id, table=table))
 
-        # Resolve catalog_id once — only when needed (Glue catalog refs). The
-        # raw format here, not the emit's parquet default: unchanged from before
-        # the catalog half of the gate was added.
+        # Resolve catalog_id once — only when needed (Glue catalog refs), under the
+        # emitter's own parquet default: a binding without a format still declares its
+        # Glue table (``_emit_glue``), so its import is looked for too (and
+        # ``adoptable_tables`` names it the same way).
         contract_needs_catalog_id = any(
             is_cloud(b.get("binding") or {}, "aws")
             and ((b.get("binding") or {}).get("location") or {}).get("database")
-            and _glue_cataloged(b.get("binding") or {}, (b.get("binding") or {}).get("format"))
+            and _glue_cataloged(
+                b.get("binding") or {}, (b.get("binding") or {}).get("format") or "parquet"
+            )
             for b in contract.get("exposes") or []
         )
         catalog_id = _resolve_catalog_id() if contract_needs_catalog_id else ""

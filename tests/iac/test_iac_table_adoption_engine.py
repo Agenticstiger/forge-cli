@@ -199,8 +199,14 @@ def test_without_the_flag_an_existing_table_is_refused_and_nothing_stays_in_stat
     assert sorted(sum(tofu["state_rm"], [])) == sorted([TABLE, BUCKET])
 
 
-def test_with_the_flag_a_matching_table_is_planned_through_an_import_block(tofu, tmp_path, capfd):
-    assert engine.apply_via_opentofu(_args(tmp_path, adopt_tables=True), _LOG) == 0
+def test_with_the_flag_a_matching_table_is_planned_through_an_import_block(
+    tofu, tmp_path, capfd, caplog
+):
+    with caplog.at_level(logging.WARNING):
+        assert engine.apply_via_opentofu(_args(tmp_path, adopt_tables=True), _LOG) == 0
+
+    # The take-over is audited once, by the run that applies it.
+    assert [r for r in caplog.records if "table_adoption_accepted" in r.getMessage()]
 
     (module,) = tofu["plans"]
     assert _imports(module) == [{"to": TABLE, "id": f"{ACCOUNT}:sales:orders"}]
@@ -236,6 +242,58 @@ def test_a_dry_run_with_the_flag_checks_the_table_and_applies_nothing(tofu, tmp_
         engine.apply_via_opentofu(_args(tmp_path, adopt_tables=True, dry_run=True), _LOG)
 
     assert raised.value.event == "table_adoption_mismatch" and tofu["apply"] == 0
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_no_take_over_is_audited_by_a_run_that_applies_none(tofu, tmp_path, caplog, dry_run):
+    """A dry run, and a refusal after the check (here the data-loss gate), adopt nothing."""
+    if not dry_run:
+        tofu["shown"] = {
+            "resource_changes": MATCHING["resource_changes"]
+            + [
+                {
+                    "address": BUCKET,
+                    "mode": "managed",
+                    "type": "aws_s3_bucket",
+                    "change": {"actions": ["delete"], "before": {}, "after": None},
+                }
+            ]
+        }
+        removal = {
+            "type": "planned_change",
+            "change": {
+                "action": "delete",
+                "resource": {"addr": BUCKET, "resource_type": "aws_s3_bucket"},
+            },
+        }
+        summary = {"type": "change_summary", "changes": {"add": 0, "change": 0, "remove": 1}}
+        engine.runner.tofu_plan = _planning_with(tofu, [removal, summary])
+
+    with caplog.at_level(logging.WARNING):
+        if dry_run:
+            assert (
+                engine.apply_via_opentofu(_args(tmp_path, adopt_tables=True, dry_run=True), _LOG)
+                == 0
+            )
+        else:
+            with pytest.raises(CLIError) as raised:
+                engine.apply_via_opentofu(_args(tmp_path, adopt_tables=True), _LOG)
+            assert raised.value.event == "opentofu_data_loss_gate"
+
+    assert tofu["apply"] == 0
+    assert not [r for r in caplog.records if "table_adoption_accepted" in r.getMessage()]
+
+
+def _planning_with(tofu, events):
+    """A fake ``tofu plan`` that records the module and answers ``events``."""
+    runner = engine.runner
+
+    def plan(workdir, *, out_file="tfplan", env=None):
+        tofu["plans"].append(json.loads((Path(workdir) / "main.tf.json").read_text()))
+        (Path(workdir) / out_file).write_bytes(b"saved plan")
+        return runner.TofuResult("plan", 0, "", "", events=events)
+
+    return plan
 
 
 def test_a_table_that_does_not_exist_yet_is_created_as_before(tofu, tmp_path):
