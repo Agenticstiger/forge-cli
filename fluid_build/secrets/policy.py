@@ -924,9 +924,11 @@ def _any_host_fix(parsed: SecretRef) -> str:
 #: The keys a keyword connection string names its host with: libpq's
 #: ``host=... dbname=...`` and ADO.NET's or ODBC's ``Server=...;Database=...``
 #: (``Data Source=tcp:host,1433``). The value runs to the next ``;`` or blank,
-#: a whole ``{{ env.NAME }}`` placeholder included.
+#: a whole ``{{ env.NAME }}`` placeholder included. The key is found by a
+#: look-behind rather than by consuming the blanks before it, so a long run of
+#: blanks costs linear time.
 _KEYWORD_HOST = re.compile(
-    r"(?:^|[;\s])\s*(?:host|hostaddr|server|address|addr|network\s+address|data\s+source)"
+    r"(?<![^;\s])(?:host|hostaddr|server|address|addr|network\s+address|data\s+source)"
     r"\s*=\s*((?:\{\{[^{}]*\}\}|[^;\s])+)",
     re.IGNORECASE,
 )

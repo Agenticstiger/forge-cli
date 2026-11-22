@@ -179,3 +179,13 @@ def test_apply_names_an_untraced_host_without_quoting_it():
             resolve_secret("env://PG", host=SECRET_VALUE)
     assert SECRET_VALUE not in str(info.value)
     assert "to the host it is sent to as a credential" in info.value.what
+
+
+@pytest.mark.unit
+def test_a_long_keyword_string_is_shown_in_linear_time():
+    import time
+
+    started = time.perf_counter()
+    with pytest.raises(AcquisitionSecretPolicyError):
+        refuse_unless_allowed("env://PG", connection={"server": "=" + " " * 3000}, environ={})
+    assert time.perf_counter() - started < 0.5
