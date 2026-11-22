@@ -644,23 +644,15 @@ def register(subparsers: argparse._SubParsersAction):
         action="store_true",
         default=False,
         help=(
-            "Confirm taking OWNERSHIP of a container this contract previously "
-            "referenced as a shared pool (packaging shared -> isolated). Logs a "
-            "WARNING-level audit event; the data-loss gate still applies."
+            "Take OWNERSHIP of a container this contract referenced as a shared pool "
+            "(shared -> isolated); audited, data-loss gate kept."
         ),
     )
     mode_group.add_argument(
         "--adopt-tables",
         action="store_true",
         default=False,
-        help=(
-            "Take over the existing tables the contract names (Glue tables on AWS) "
-            "through OpenTofu import blocks, each only if it matches the contract: "
-            "columns, location and format; one that differs is refused with its "
-            "differences. Off by default: an existing table the state does not manage "
-            "is refused. Logs a WARNING-level audit event; the data-loss gate still "
-            "applies."
-        ),
+        help="Take over existing tables that match the contract.",
     )
     mode_group.add_argument(
         "--bundle",

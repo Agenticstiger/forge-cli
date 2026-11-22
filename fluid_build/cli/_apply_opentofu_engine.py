@@ -182,7 +182,17 @@ def _apply_via_opentofu(
     # What this run imports stays in state only once its ``tofu apply`` starts
     # (:func:`_imports_kept_only_by_an_apply`).
     with _imports_kept_only_by_an_apply(eng.workdir, eng.env, logger) as imported:
-        adopted = _look_up_existing(eng, args, logger, imported)
+        # A table's look-up is strict under --adopt-tables (see _adopt_existing).
+        adopted = _adopt_existing(
+            eng.plugin,
+            eng.contract,
+            eng.actions,
+            eng.workdir,
+            eng.env,
+            logger,
+            imported.addresses,
+            strict_tables=_table_adoption.asked(args),
+        )
         tables = _tables_through_import_blocks(eng, args, adopted, imported)
 
         plan = runner.tofu_plan(eng.workdir, env=eng.env)
@@ -210,20 +220,6 @@ def _apply_via_opentofu(
 
     _table_adoption.audit_take_over(logger, adoption.reviews)
     return _finish_apply(eng, logger, changes, destroyed, applied_state)
-
-
-def _look_up_existing(eng: _Engine, args, logger: logging.Logger, imported: Any) -> List[Any]:
-    """:func:`_adopt_existing` for this run; a table's look-up is strict under ``--adopt-tables``."""
-    return _adopt_existing(
-        eng.plugin,
-        eng.contract,
-        eng.actions,
-        eng.workdir,
-        eng.env,
-        logger,
-        imported.addresses,
-        strict_tables=_table_adoption.asked(args),
-    )
 
 
 def _tables_through_import_blocks(
@@ -674,7 +670,17 @@ def _plan_with_opentofu(
     _table_adoption.before_lookup(eng.plugin, eng.provider, eng.contract, eng.actions, args)
 
     with _imports_kept_only_by_an_apply(eng.workdir, eng.env, logger) as imported:
-        adopted: List[ImportBlock] = _look_up_existing(eng, args, logger, imported)
+        # A table's look-up is strict under --adopt-tables (see _adopt_existing).
+        adopted: List[ImportBlock] = _adopt_existing(
+            eng.plugin,
+            eng.contract,
+            eng.actions,
+            eng.workdir,
+            eng.env,
+            logger,
+            imported.addresses,
+            strict_tables=_table_adoption.asked(args),
+        )
         # Read while the look-up's imports are in state: a table forge did not make stops
         # the plan unless it was asked to adopt it; the hand-back runs first, as it stops.
         tables = _table_adoption.foreign_tables(
