@@ -511,6 +511,9 @@ def _reconcile_one(
         if decided is None:
             return out
         start = decided
+    # With the new config already writing the checkpoint, a run of another config there is a
+    # second writer: it is cancelled at once, never asked and waited for.
+    grace = 0.0 if matching else grace
     if dry_run:
         return _planned(run, out, stale, matching, start, grace)
     if only and confirm is not None and not confirm(_question(run, out, stale, matching, start)):
@@ -524,7 +527,7 @@ def _reconcile_one(
     if matching:  # the new config already runs; the stale runs were extra
         out.run_id, out.state = matching[0].run_id, matching[0].state
         return out
-    start.release = _release_text(run, stale or ([last] if last else []), notes)
+    start.release = _release_text(run, stale or ([last] if last else []), notes, history)
     return _start(run, adapter, start, out, clock=clock, budget=budget, since=since)
 
 
@@ -701,9 +704,15 @@ def _stop_between_batches(
     return left, notes
 
 
-def _release_text(run: DesiredRun, previous: Sequence[RunInfo], notes: Sequence[str]) -> str:
+def _release_text(
+    run: DesiredRun,
+    previous: Sequence[RunInfo],
+    notes: Sequence[str],
+    history: Sequence[RunInfo] = (),
+) -> str:
     """The configs a start moves the stream between, how the old runs stopped, and, when the
-    contract moved the checkpoint, where the new run starts reading."""
+    contract moved the checkpoint, where the new run starts reading: what the checkpoint holds
+    decides (Spark resumes a position it finds), and forge sees only the runs' history."""
     older = [p for p in previous if p.config_hash != run.config_hash]
     if not older:
         return "; ".join(notes)
@@ -712,10 +721,18 @@ def _release_text(run: DesiredRun, previous: Sequence[RunInfo], notes: Sequence[
     if run.checkpoint_id and any(
         p.checkpoint_id and p.checkpoint_id != run.checkpoint_id for p in older
     ):
-        parts.append(
-            "the checkpoint moved (properties.stream.checkpoint): the new run starts from "
-            "properties.stream.startingOffsets, and the old checkpoint is left as it is"
-        )
+        used = next((h for h in history if h.checkpoint_id == run.checkpoint_id), None)
+        if used is not None:
+            parts.append(
+                f"the checkpoint moved back to one run {used.run_id} used "
+                "(properties.stream.checkpoint): the new run resumes the position it holds"
+            )
+        else:
+            parts.append(
+                "the checkpoint moved (properties.stream.checkpoint): the new run starts from "
+                "properties.stream.startingOffsets unless it already holds a position, and the "
+                "old checkpoint is left as it is"
+            )
     return "; ".join(parts)
 
 
@@ -962,9 +979,12 @@ def _stop_continuous(
     would share its checkpoint."""
     out = _scheduled(run)
     out.where = adapter.where()
-    old = [h for h in adapter.runs() if h.active and h.config_hash != run.config_hash]
+    active = [h for h in adapter.runs() if h.active]
+    old = [h for h in active if h.config_hash != run.config_hash]
     if not old:
         return out
+    if any(h.config_hash == run.config_hash for h in active):
+        grace = 0.0  # a scheduled run of this config already writes the checkpoint
     if dry_run:
         out.message += f"; would {_stop_plan(run, old, grace)}"
         return out

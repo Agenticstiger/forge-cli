@@ -523,6 +523,12 @@ def _write_local_file(path: Path, body: bytes, confine: Optional[Path]) -> None:
         raise SparkRunError(f"{path} cannot be written: {exc.strerror}") from exc
 
 
+def bound_job_uri(host: LocalHost, run: DesiredRun) -> str:
+    """Where a run of ``run`` started on this machine now reads its job config: under the
+    artifact root the operator's environment names (:data:`LOCAL_ROOT_ENV`)."""
+    return run.bind(local_root=_root(host.env, Path(host.workspace))).job_uri
+
+
 def write_stop_request(host: LocalHost, run: DesiredRun, key: str) -> str:
     """Ask the local run started with stop key ``key`` to stop between batches: the request
     beside ``run``'s job config at this machine's artifact root (:data:`LOCAL_ROOT_ENV`), a
@@ -533,7 +539,7 @@ def write_stop_request(host: LocalHost, run: DesiredRun, key: str) -> str:
     """
     env = host.env
     root = _root(env, Path(host.workspace))
-    uri = stop_request_uri(run.bind(local_root=root).job_uri, key)
+    uri = stop_request_uri(bound_job_uri(host, run), key)
     body = stop_request_body(run)
     if root.startswith("s3://"):
         _put_s3(((uri, body),), env)
@@ -760,6 +766,7 @@ class LocalRuns:
             lost=lost,
             restart_of=record.get("restartOf") or None,
             stop_key=record.get("stopKey") or None,
+            config_uri=record.get("jobConfig") or None,
         )
 
     def cancel(

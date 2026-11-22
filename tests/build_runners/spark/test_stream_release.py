@@ -28,10 +28,11 @@ from tests.spark.conftest import RUNNER_PATH
 KEY = "fluid-0123456789abcdef-0123456789abcdef0123"
 
 
-def asked(run_id, state="RUNNING", *, key=KEY, **kw):
-    """A run of another config, started with a stop key (``key=None``: an older forge's)."""
+def asked(run_id, state="RUNNING", *, key=KEY, config_uri=None, **kw):
+    """A run of another config, started with a stop key (``key=None``: an older forge's);
+    ``config_uri``: the job config it was started on, when its arguments say."""
     kw.setdefault("hash_", "stale")
-    return dataclasses.replace(info(run_id, state, **kw), stop_key=key)
+    return dataclasses.replace(info(run_id, state, **kw), stop_key=key, config_uri=config_uri)
 
 
 class Releasing(FakeAdapter):
@@ -184,6 +185,59 @@ def test_a_moved_checkpoint_is_said_to_start_from_starting_offsets(run, clock, u
     out = go(run, clock)
     assert out.action == "restarted"
     assert "checkpoint moved" in out.message and "startingOffsets" in out.message
+    # Forge cannot see into the new prefix: what is there decides, and the text says so.
+    assert "unless it already holds a position" in out.message
+
+
+def test_a_checkpoint_moved_back_to_one_an_earlier_run_used_is_said_to_resume_it(run, clock, use):
+    """Contract A on checkpoint X, then B on Y, then A again on X: the new run resumes what X
+    holds, not startingOffsets."""
+    earlier = info(
+        "prev", "SUCCEEDED", hash_="older", source=run.source_id, checkpoint=run.checkpoint_id
+    )
+    fake = Releasing([stale_of(run, checkpoint="0123456789abcdef"), earlier], answers={"old1"})
+    use(fake)
+    out = go(run, clock)
+    assert out.action == "restarted"
+    assert "run prev used" in out.message and "resumes the position it holds" in out.message
+    assert "startingOffsets" not in out.message
+
+
+def test_a_stale_run_beside_one_of_the_new_config_is_cancelled_at_once(run, clock, use):
+    """The new config already writes the checkpoint: a run of another config there is a second
+    writer, cancelled at once as before, never asked and waited for."""
+    fake = Releasing(
+        [
+            asked("jr1", hash_=run.config_hash, created=1.0, key="fluid-k1"),
+            stale_of(run, created=2.0),
+        ],
+        answers={"old1"},
+    )
+    use(fake)
+    out = go(run, clock)
+    assert (out.action, out.run_id, out.cancelled, out.stopped) == (
+        "unchanged",
+        "jr1",
+        ["old1"],
+        [],
+    )
+    assert fake.calls == ["cancel old1"] and fake.requests == []
+    assert sum(clock.slept) < 5  # no grace was waited out
+    planned = go(run, clock, dry_run=True)
+    assert "cancel old1" in planned.message and "between batches" not in planned.message
+
+
+def test_a_continuous_run_beside_a_scheduled_run_of_the_new_config_is_cancelled_at_once(
+    run, clock, use
+):
+    scheduled = dataclasses.replace(run, scheduled=True)
+    fake = Releasing(
+        [asked("sched", hash_=run.config_hash, key="fluid-k1"), stale_of(run)], answers={"old1"}
+    )
+    use(fake)
+    out = go(scheduled, clock)
+    assert (out.cancelled, out.stopped, fake.requests) == (["old1"], [], [])
+    assert "cancelled the continuous run old1" in out.message
 
 
 def test_a_stream_moved_to_available_now_stops_its_continuous_run_between_batches(run, clock, use):
@@ -297,6 +351,22 @@ def test_a_run_without_a_usable_stop_key_is_not_asked(run, key):
     assert s3.put == []
 
 
+def test_a_run_whose_job_config_is_elsewhere_is_not_asked_where_it_does_not_look(run):
+    """The output's bucket moved: the old run looks for its request beside the job config it
+    was started on, so writing one beside the new config would only wait out the grace."""
+    s3 = S3()
+    moved = "s3://old-lake/_fluid/spark/commerce.orders-stream/ingest-orders/job.json"
+    with pytest.raises(SparkRunError) as raised:
+        _serverless(run, s3).request_stop(asked("old1", config_uri=moved))
+    assert moved in str(raised.value) and run.job_uri in str(raised.value) and s3.put == []
+    same = _serverless(run, s3).request_stop(asked("old1", config_uri=run.job_uri))
+    assert same == ad.stop_request_uri(run.job_uri, KEY)
+
+
+def test_a_run_s_job_config_is_read_back_from_its_arguments(run):
+    assert ad._identity(run.entry_args(stop_key=KEY))["config_uri"] == run.job_uri
+
+
 def test_a_request_s3_refuses_names_the_error_and_a_withdraw_that_fails_is_ignored(run):
     adapter = _serverless(run, S3(error=_client_error("AccessDenied")))
     with pytest.raises(SparkRunError, match="AccessDenied"):
@@ -337,3 +407,8 @@ def test_a_local_request_is_a_file_under_the_artifact_root_and_withdrawn(tmp_pat
     adapter.withdraw_stop(uri)
     assert not expected.exists()
     adapter.withdraw_stop(uri)  # already gone: nothing raised
+    # A run started under another root (FLUID_SPARK_LOCAL_ROOT changed since) looks there.
+    elsewhere = asked("20261122T000000Z-0123abcd", config_uri=str(tmp_path / "old" / "job.json"))
+    with pytest.raises(SparkRunError, match="old/job.json"):
+        adapter.request_stop(elsewhere)
+    assert not expected.exists()

@@ -107,7 +107,9 @@ def test_forge_and_the_runner_accept_the_same_values():
 
 def test_adapters_read_back_the_run_identity_from_the_flags_and_not_the_stamps(contract):
     run = runs_of(contract, stamps=stamps())[0]
-    assert set(_identity(run.entry_args())) <= {"config_hash", "source_id", "checkpoint_id"}
+    # The job config it reads (--config) is where it looks for a stop request; never a stamp.
+    allowed = {"config_hash", "source_id", "checkpoint_id", "config_uri"}
+    assert set(_identity(run.entry_args())) <= allowed
 
 
 # --- the version ----------------------------------------------------------------------

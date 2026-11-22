@@ -119,6 +119,9 @@ class RunInfo:
     #: to stop between batches through the request it names (:func:`stop_request_uri`). None
     #: for a run an older ``fluid apply`` started: it can only be cancelled.
     stop_key: Optional[str] = None
+    #: The job config the run was started on (``--config``): it looks for its stop request
+    #: beside it (:func:`stop_request_uri`).
+    config_uri: Optional[str] = None
 
     @property
     def active(self) -> bool:
@@ -163,6 +166,7 @@ def _identity(args: Sequence[Any], tags: Optional[Mapping[str, Any]] = None) -> 
         ("--fluid-checkpoint", "checkpoint_id"),
         (RESTART_FLAG, "restart_of"),
         (STOP_KEY_FLAG, "stop_key"),
+        ("--config", "config_uri"),
     ):
         if flag in items[:-1]:
             found[key] = items[items.index(flag) + 1]
@@ -185,6 +189,22 @@ def stop_request_uri(job_uri: str, key: str) -> str:
     """Where the run started with stop key ``key`` looks for its stop request: ``stop/<key>``
     beside the job config it reads (``forge_spark_runner.stop_request_uri``)."""
     return f"{job_uri.rsplit('/', 1)[0]}/stop/{key}"
+
+
+def refuse_unless_beside(info: RunInfo, job_uri: str) -> None:
+    """Refuse to ask ``info`` to stop when it was started on a job config other than
+    ``job_uri`` (the output's location moved since): it looks for its request beside its own
+    config, so a request beside ``job_uri`` would never be seen. A run whose arguments do not
+    say is asked.
+
+    Raises:
+        SparkRunError: the run's job config is elsewhere (the message names both).
+    """
+    if info.config_uri and info.config_uri != job_uri:
+        raise SparkRunError(
+            f"it was started on the job config {info.config_uri}, not {job_uri} (the output's "
+            "location moved), and looks for a stop request there"
+        )
 
 
 def stop_request_body(run: DesiredRun) -> bytes:
@@ -369,10 +389,12 @@ class Adapter:
         asked (no stop key: an older ``fluid apply`` started it).
 
         Raises:
-            SparkRunError: the request could not be written (the message names it).
+            SparkRunError: the request could not be written, or the run looks for one beside
+                another job config (:func:`refuse_unless_beside`; the message names it).
         """
         if not usable_stop_key(info.stop_key):
             return None
+        refuse_unless_beside(info, self.run.job_uri)
         uri = stop_request_uri(self.run.job_uri, str(info.stop_key))
         bucket, _, key = uri.removeprefix("s3://").partition("/")
         try:
@@ -972,10 +994,11 @@ class Local(Adapter):
     def request_stop(self, info: RunInfo) -> Optional[str]:
         """The request beside the job config at this machine's artifact root (a file, or an
         ``s3://`` object): :meth:`Adapter.request_stop`."""
-        from fluid_build.build_runners.spark._local import write_stop_request
+        from fluid_build.build_runners.spark._local import bound_job_uri, write_stop_request
 
         if not usable_stop_key(info.stop_key):
             return None
+        refuse_unless_beside(info, bound_job_uri(self.host, self.run))
         return write_stop_request(self.host, self.run, str(info.stop_key))
 
     def withdraw_stop(self, uri: str) -> None:

@@ -65,6 +65,7 @@ def identity_of(run):
         "config_hash": run.config_hash,
         "source_id": run.source_id,
         "checkpoint_id": run.checkpoint_id,
+        "config_uri": run.job_uri,
     }
 
 
