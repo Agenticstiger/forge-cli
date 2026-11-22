@@ -39,6 +39,7 @@ credentials, which is what they are for. They may not carry a setting that:
   lineage, telemetry, webhook, registry, LLM and agent-tool endpoints and
   selectors (``FLUID_COMMAND_CENTER_URL``/``_ENABLED``, ``FLUID_API_URL``,
   ``FLUID_CC_ENDPOINT``, ``FLUID_CATALOG_*_URL``, ``FLUID_LAKEKEEPER_*``,
+  ``FLUID_AIRFLOW_*``,
   ``FLUID_OPENLINEAGE_URL``,
   ``FLUID_LLM_ENDPOINT``, ``FLUID_LLM_PROVIDER``/``_MODEL``,
   ``FLUID_RUNNER_HOST_OVERRIDE``, ``FLUID_PUBLIC_REGISTRY``,
@@ -594,6 +595,10 @@ PROTECTED_ENV_PREFIXES: Tuple[str, ...] = (
     # signs in to Lakekeeper with to change its grants (policy/lakekeeper_apply.py):
     # a project file must not choose which credential is sent, or where
     "FLUID_LAKEKEEPER_",
+    # the credential references ``fluid schedule-sync --airflow-url`` signs in to Airflow
+    # with, and its plain-HTTP opt-in (cli/_airflow_api.py): a project file must not
+    # choose which credential is sent, or whether it may travel unencrypted
+    "FLUID_AIRFLOW_",
     "FLUID_MCP_JWT_",
     # the custom-scaffold engine's operator settings, which ``fluid generate artifacts``
     # runs it under (forge/core/custom_scaffold_artifacts.py): the hosts a bundle
@@ -762,6 +767,7 @@ DOTENV_LOADABLE: FrozenSet[str] = frozenset(
         "FLUID_PARALLEL_OPERATIONS",
         "FLUID_RATE_LIMIT",
         "FLUID_ROLLBACK_KEEP_LAST_N",
+        "FLUID_SPARK_STOP_GRACE_SECONDS",
         "FLUID_SPARK_WAIT_SECONDS",
         "FLUID_STAGE_BUDGET_",
         "FLUID_TIMEOUT",

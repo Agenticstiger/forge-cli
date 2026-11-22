@@ -554,3 +554,12 @@ def test_catalog_connector_search_uses_the_real_search_filters_and_keeps_the_que
         "statuses": "active",
         "limit": "50",
     }
+
+
+def test_new_client_trusts_the_proxy_environment_unless_told_not_to():
+    default, direct = new_client(), new_client(trust_env=False)
+    try:
+        assert default.trust_env is True and direct.trust_env is False
+    finally:
+        default.close()
+        direct.close()

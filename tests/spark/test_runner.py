@@ -321,6 +321,6 @@ def test_glue_arguments_never_stand_in_for_the_config(runner, monkeypatch, argv)
     monkeypatch.setattr(runner, "read_text", lambda spark, path: read.append(path) or "{}")
     monkeypatch.setattr(runner, "parse_config", lambda text: {})
     monkeypatch.setattr(runner, "release_stamps", lambda config, text, args: {})
-    monkeypatch.setattr(runner, "run", lambda spark, config, stamps: None)
+    monkeypatch.setattr(runner, "run", lambda spark, config, stamps, stop=None: None)
     assert runner.main(argv) == 0
     assert read == ["s3://b/_fluid/job.json"]
