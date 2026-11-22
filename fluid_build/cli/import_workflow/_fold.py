@@ -21,7 +21,10 @@ What it folds, and nothing else:
 * a name assigned ONCE in its scope (a function, then the module), a class attribute of a
   class in the same module, and a constant of another module of the scanned tree (see
   :class:`ModuleIndex`); a name assigned twice, a parameter, a loop variable or a name from a
-  star import is unresolved;
+  star import is unresolved. A list or a string that is built by ``name += ...`` statements
+  after its one assignment, each at the top level of its body or inside a ``for`` over a dict or
+  a list that folds, folds to the whole of it where it is used after the last of them
+  (:class:`Recipe`);
 * ``os.environ[...]``, ``os.environ.get(...)`` and ``os.getenv(...)``, from the operator's
   ``variables`` (conventions), else unresolved: the default of ``get`` is not assumed.
 
@@ -69,6 +72,10 @@ MAX_ITEMS = 2_000
 #: hostile file can ask for is bounded, whatever its expressions refer to.
 MAX_STEPS_PER_FOLD = 5_000
 MAX_STEPS_PER_MODULE = 250_000
+#: Most items of a ``for`` loop one recipe goes through, and statements it applies in all: a
+#: list built by a loop over a dict is as long as the dict, and a hostile file can ask for more.
+MAX_LOOP_ITERATIONS = 500
+MAX_RECIPE_STEPS = 5_000
 #: Characters of text the folded values of one module keep in its memo: a list of thousands of
 #: long strings built from one long string is as big as its elements, and every element is one
 #: more node to remember.
@@ -161,6 +168,63 @@ def text_of(value: Any) -> Optional[str]:
 
 
 @dataclass
+class _Add:
+    """``name += value``: one step of a :class:`Recipe`."""
+
+    value: ast.expr
+    line: int
+    end: int
+
+
+@dataclass
+class _Loop:
+    """``for target in iterable:`` whose body holds steps of a :class:`Recipe`."""
+
+    loop: ast.For
+    body: List[Union["_Add", "_Loop"]]
+
+
+@dataclass
+class Recipe:
+    """A name built by ``+=`` after its one assignment: ``base`` and the steps in source order. A
+    step is a ``+=`` at the top level of the scope's body, or one inside a ``for`` that is
+    itself at the top level (a loop over a dict that folds is read once per item). ``ready`` is
+    the last line of the steps: used on a line before it, the name is not whole yet."""
+
+    base: ast.expr
+    steps: List[Union[_Add, _Loop]]
+    ready: int
+
+
+class _Acc:
+    """What the steps of a recipe have added up to."""
+
+    __slots__ = ("value", "complete", "budget")
+
+    def __init__(self, value: Union[List[Any], str], complete: bool, budget: int) -> None:
+        self.value = value
+        self.complete = complete
+        self.budget = budget
+
+
+def _bind(target: ast.AST, item: Any) -> Optional[Dict[str, Any]]:
+    """The names a ``for`` target takes for one item, or ``None`` when the item does not fit."""
+    if isinstance(target, ast.Name):
+        return {target.id: item}
+    if isinstance(target, (ast.Tuple, ast.List)) and isinstance(item, (list, tuple)):
+        if len(target.elts) != len(item):
+            return None
+        frame: Dict[str, Any] = {}
+        for element, value in zip(target.elts, item, strict=True):
+            inner = _bind(element, value)
+            if inner is None:
+                return None
+            frame.update(inner)
+        return frame
+    return None
+
+
+@dataclass
 class Scope:
     """The names one module, class or function body binds.
 
@@ -179,6 +243,9 @@ class Scope:
     #: assignment starts from (``writer = writer.trigger(...)``) can then be read. A name assigned
     #: once is in ``values``; a name written in any other way is in neither.
     assignments: Dict[str, List[ast.expr]] = field(default_factory=dict)
+    #: Names assigned once and then added to by ``+=`` statements (and nothing else): see
+    #: :class:`Recipe`. Not in ``values``.
+    recipes: Dict[str, Recipe] = field(default_factory=dict)
 
 
 #: Called with no argument, these are the names of the module (or class) body they are in; inside a
@@ -499,6 +566,56 @@ def _target_names(target: ast.AST) -> List[str]:
     return names
 
 
+def _plain_target(target: ast.AST) -> bool:
+    """A ``for`` target of names only: ``x``, ``k, v``, ``(a, b)``."""
+    if isinstance(target, ast.Name):
+        return True
+    return isinstance(target, (ast.Tuple, ast.List)) and all(
+        _plain_target(item) and not isinstance(item, ast.Starred) for item in target.elts
+    )
+
+
+_LEAVES = (ast.Break, ast.Continue, ast.Return, ast.Raise, ast.Yield, ast.YieldFrom, ast.Await)
+
+
+def _increment_steps(
+    body: Sequence[ast.stmt], covered: Set[int]
+) -> Dict[str, List[Union[_Add, _Loop]]]:
+    """The ``name += ...`` statements at the top level of ``body``, and those inside a ``for`` that
+    is itself at the top level (and has no ``else``, ``break``, ``continue``, ``return`` or
+    ``raise``, so each item of it is gone through once), by name and in source order. The
+    statements found are added to ``covered``."""
+    out: Dict[str, List[Union[_Add, _Loop]]] = {}
+    for stmt in body:
+        if (
+            isinstance(stmt, ast.AugAssign)
+            and isinstance(stmt.op, ast.Add)
+            and isinstance(stmt.target, ast.Name)
+        ):
+            end = stmt.end_lineno or stmt.lineno
+            out.setdefault(stmt.target.id, []).append(_Add(stmt.value, stmt.lineno, end))
+            covered.add(id(stmt))
+        elif (
+            isinstance(stmt, ast.For)
+            and not stmt.orelse
+            and _plain_target(stmt.target)
+            and not any(isinstance(node, _LEAVES) for node in ast.walk(stmt))
+        ):
+            for name, steps in _increment_steps(stmt.body, covered).items():
+                out.setdefault(name, []).append(_Loop(stmt, steps))
+    return out
+
+
+def _last_line(step: Union[_Add, _Loop]) -> int:
+    if isinstance(step, _Add):
+        return step.end
+    return step.loop.end_lineno or step.loop.lineno
+
+
+def _first_line(step: Union[_Add, _Loop]) -> int:
+    return step.line if isinstance(step, _Add) else step.loop.lineno
+
+
 def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
     """The bindings of a module, class or function body, not descending into nested
     functions, classes or lambdas (each has a scope of its own)."""
@@ -534,6 +651,8 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
         for param in params:
             block(param.arg, f"`{param.arg}` is a parameter of the function")
     body = getattr(owner, "body", [])
+    covered: Set[int] = set()
+    steps = _increment_steps(body, covered) if isinstance(body, list) else {}
     stack: List[ast.AST] = list(reversed(body)) if isinstance(body, list) else []
     while stack:
         node = stack.pop()
@@ -553,8 +672,9 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
             if isinstance(node.target, ast.Name) and node.value is not None:
                 record(node.target.id, node.value)
         elif isinstance(node, ast.AugAssign):
-            for name in _target_names(node.target):
-                block(name, f"`{name}` is changed in place")
+            if id(node) not in covered:  # a step of a recipe is decided at the end
+                for name in _target_names(node.target):
+                    block(name, f"`{name}` is changed in place")
         elif isinstance(node, (ast.For, ast.AsyncFor)):
             for name in _target_names(node.target):
                 block(name, f"`{name}` is a loop variable")
@@ -586,6 +706,13 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
         elif type(node).__name__ == "Match":
             for case in node.cases:
                 stack.extend(reversed(case.body))
+    for name, found in steps.items():
+        base = scope.values.get(name)
+        if base is not None and base.lineno < _first_line(found[0]):
+            ready = max(_last_line(step) for step in found)
+            scope.recipes[name] = Recipe(scope.values.pop(name), found, ready)
+        else:
+            block(name, f"`{name}` is changed in place")
     scope.assignments = {
         name: values for name, values in plain.items() if len(values) > 1 and name not in other
     }
@@ -933,6 +1060,11 @@ class Folder:
         #: not constant (``Unresolved`` says so), and the importer says so once per file.
         self.exhausted = False
         self._rebound = _rebound_names(module.tree)
+        #: The loop variables of the recipe being applied, innermost last: a name that is one of
+        #: them is what the loop holds on this pass. Nothing is remembered while one is set.
+        self._env: List[Dict[str, Any]] = []
+        #: What a recipe came to, by ``id(recipe)``.
+        self._recipe_values: Dict[int, Any] = {}
 
     # scopes
 
@@ -991,7 +1123,7 @@ class Folder:
         if key in self._active:
             return Unresolved("it refers to itself", snippet(node))
         memo_key = (key, id(scope))
-        remember = self._holes is None and self._limit == MAX_STRING
+        remember = self._holes is None and self._limit == MAX_STRING and not self._env
         if remember and memo_key in self._memo:
             return self._memo[memo_key]
         self._active.add(key)
@@ -1272,8 +1404,13 @@ class Folder:
         return None
 
     def name_value(self, name: str, scope: Scope, depth: int, origin: ast.AST) -> Any:
+        for frame in reversed(self._env):
+            if name in frame:
+                return frame[name]
         current: Optional[Scope] = scope
         while current is not None:
+            if name in current.recipes:
+                return self._recipe(name, current, scope, depth, origin)
             if name in current.values:
                 why = self._rebound.get(name) or self._rebound.get("*")
                 if why:
@@ -1288,6 +1425,123 @@ class Folder:
         if name in self.module.imports:
             return self._imported(name, origin, depth)
         return Unresolved(f"`{name}` is not defined in this file", snippet(origin))
+
+    def _recipe(self, name: str, owner: Scope, use: Scope, depth: int, origin: ast.AST) -> Any:
+        """What a name built by ``+=`` statements holds once they are all done (see
+        :class:`Recipe`). Read on a line of its own scope before the last of them, it is not whole
+        yet; a name the file changes in place elsewhere is not trusted."""
+        recipe = owner.recipes[name]
+        why = self.rebound(name)
+        if why:
+            return Unresolved(why, snippet(origin))
+        line = getattr(origin, "lineno", 0)
+        if owner is use and origin in self.module.parents and line <= recipe.ready:
+            return Unresolved(
+                f"`{name}` is still being added to here (up to line {recipe.ready})",
+                snippet(origin),
+            )
+        plain = self._holes is None and self._limit == MAX_STRING and not self._env
+        if plain and id(recipe) in self._recipe_values:
+            return self._recipe_values[id(recipe)]
+        value = self._built(name, recipe, owner, depth)
+        if plain and not (isinstance(value, Unresolved) and value.transient):
+            self._recipe_values[id(recipe)] = value
+        return value
+
+    def _built(self, name: str, recipe: Recipe, scope: Scope, depth: int) -> Any:
+        base = self.fold(recipe.base, scope, depth)
+        if isinstance(base, Unresolved):
+            return base
+        if isinstance(base, FoldedTuple) or not isinstance(base, (list, str)):
+            return Unresolved(f"`{name}` is not a list or a string that `+=` adds to", "")
+        acc = _Acc(
+            value=list(base) if isinstance(base, list) else base,
+            complete=getattr(base, "complete", True),
+            budget=MAX_RECIPE_STEPS,
+        )
+        done = self._apply(recipe.steps, acc, scope, depth)
+        if isinstance(done, Unresolved):
+            return done
+        if isinstance(acc.value, str):
+            if not acc.complete:
+                return Unresolved(f"part of `{name}` is added by a value that does not fold", "")
+            return self._too_long(acc.value) or acc.value
+        built = FoldedList(acc.value)
+        built.complete = acc.complete
+        return built
+
+    def _apply(
+        self, steps: Sequence[Union[_Add, _Loop]], acc: "_Acc", scope: Scope, depth: int
+    ) -> Optional[Unresolved]:
+        """Go through ``steps``, adding to ``acc``. Whatever does not fold leaves the result
+        incomplete; the answer is an :class:`Unresolved` only when the work ran out."""
+        for step in steps:
+            acc.budget -= 1
+            if acc.budget < 0:
+                self.exhausted = True
+                acc.complete = False
+                return Unresolved("it takes too much work to fold", "", transient=True)
+            if isinstance(step, _Add):
+                piece = self.fold(step.value, scope, depth)
+                if isinstance(acc.value, str):
+                    if isinstance(piece, str):
+                        acc.value += piece
+                        if (over := self._spend(len(acc.value))) is not None:
+                            return over
+                    else:
+                        acc.complete = False
+                elif isinstance(piece, (list, tuple)):
+                    acc.value.extend(piece)
+                    acc.complete = acc.complete and getattr(piece, "complete", True)
+                else:
+                    acc.complete = False
+                if isinstance(acc.value, list) and len(acc.value) > MAX_ITEMS:
+                    acc.complete = False
+                    del acc.value[MAX_ITEMS:]
+                continue
+            items = self._loop_items(step.loop, scope, depth)
+            if items is None:
+                acc.complete = False
+                continue
+            if len(items) > MAX_LOOP_ITERATIONS:
+                acc.complete = False
+            for item in items[:MAX_LOOP_ITERATIONS]:
+                frame = _bind(step.loop.target, item)
+                if frame is None:
+                    acc.complete = False
+                    break
+                self._env.append(frame)
+                try:
+                    done = self._apply(step.body, acc, scope, depth)
+                finally:
+                    self._env.pop()
+                if done is not None:
+                    return done
+        return None
+
+    def _loop_items(self, loop: ast.For, scope: Scope, depth: int) -> Optional[List[Any]]:
+        """The items a ``for`` goes through when they fold: the keys, values or pairs of a dict, or
+        the items of a list or tuple; ``None`` when they are not all known."""
+        node: ast.AST = loop.iter
+        method = None
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"items", "keys", "values"}
+            and not node.args
+            and not node.keywords
+        ):
+            method, node = node.func.attr, node.func.value
+        value = self.fold(node, scope, depth)
+        if not getattr(value, "complete", True):
+            return None
+        if isinstance(value, dict):
+            if method == "items":
+                return list(value.items())
+            return list(value.values() if method == "values" else value.keys())
+        if method is None and isinstance(value, list):
+            return list(value)
+        return None
 
     def _imported(self, name: str, origin: ast.AST, depth: int) -> Any:
         qualified = self.module.imports.get(name)
@@ -1336,7 +1590,12 @@ class Folder:
     def _binding_scope(self, name: str, scope: Optional[Scope]) -> Optional[Scope]:
         """The nearest scope that binds ``name``, or ``None``."""
         while scope is not None:
-            if name in scope.values or name in scope.blocked or name in scope.classes:
+            if (
+                name in scope.values
+                or name in scope.blocked
+                or name in scope.classes
+                or name in scope.recipes
+            ):
                 return scope
             scope = scope.parent
         return None

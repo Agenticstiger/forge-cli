@@ -447,6 +447,7 @@ class _Reader:
                 name.id in current.values
                 or name.id in current.blocked
                 or name.id in current.classes
+                or name.id in current.recipes
             ):
                 return None
             current = current.parent
@@ -556,7 +557,11 @@ class _Reader:
         while current is not None:
             if name.id in current.values:
                 return current.values[name.id]
-            if name.id in current.blocked or name.id in current.classes:
+            if (
+                name.id in current.blocked
+                or name.id in current.classes
+                or name.id in current.recipes
+            ):
                 return None
             current = current.parent
         return None
@@ -626,7 +631,11 @@ class _Reader:
                     if note not in self.facts.notes:
                         self.facts.notes.append(note)
                 return
-            if root.id in current.values or root.id in current.classes:
+            if (
+                root.id in current.values
+                or root.id in current.classes
+                or root.id in current.recipes
+            ):
                 return
             current = current.parent
 
