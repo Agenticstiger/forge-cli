@@ -97,9 +97,10 @@ import re
 import string
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from ._airflow_dags import SUBMIT_KINDS
+from ._pysource import clean_chars
 from ._spark_io import HelperSpec
 
 DOC = "https://agenticstiger.github.io/forge_docs/cli/import.html"
@@ -227,7 +228,9 @@ class Conventions:
 
 def _fail(path: Optional[Path], where: str, why: str) -> ConventionsError:
     at = f"{path.name}: " if path is not None else ""
-    return ConventionsError(f"{at}{where}: {why}")
+    # ``where`` holds the names the file gives: they are text from a file that came with a
+    # repository, and an escape sequence in one would reach the terminal
+    return ConventionsError(clean_chars(f"{at}{where}: {why}"))
 
 
 def _text(
@@ -341,7 +344,7 @@ def _local(
     try:
         root = base.resolve()
         resolved = (base / text).resolve()
-    except (OSError, RuntimeError) as exc:  # a link loop
+    except (OSError, RuntimeError, ValueError) as exc:  # a link loop, a NUL in the name
         raise _fail(path, where, f"{text!r} cannot be resolved ({type(exc).__name__})") from None
     if not any(resolved == inside or inside in resolved.parents for inside in (root, *named)):
         raise _fail(
@@ -743,6 +746,44 @@ def parse_conventions(
     )
 
 
+def duplicate_key(text: str) -> Optional[str]:
+    """The path of the first key a mapping of the YAML ``text`` gives twice, else ``None``. YAML
+    keeps the last of two equal keys, so a declared consumer or a driver would go unseen. The
+    document is composed, not constructed: an alias is one more reference to a node, never a
+    copy."""
+    import yaml
+
+    from fluid_build.util.safe_yaml import compose_yaml_safe
+
+    try:
+        root = compose_yaml_safe(text)
+    except Exception:  # noqa: BLE001 - the caller has read it as YAML already
+        return None
+    if root is None:
+        return None
+    seen: Set[int] = set()
+    stack: List[Tuple[Any, str]] = [(root, "")]
+    while stack:
+        node, where = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, yaml.MappingNode):
+            keys: Set[Tuple[str, str]] = set()
+            for key, value in node.value:
+                if not isinstance(key, yaml.ScalarNode):
+                    stack.append((value, f"{where}.?"))
+                    continue
+                here = f"{where}.{key.value}".lstrip(".")
+                if key.value != "<<" and (key.tag, key.value) in keys:  # ``<<`` merges, in turn
+                    return here
+                keys.add((key.tag, key.value))
+                stack.append((value, here))
+        elif isinstance(node, yaml.SequenceNode):
+            stack.extend((item, f"{where}[{index}]") for index, item in enumerate(node.value))
+    return None
+
+
 def load_conventions(
     path: Optional[Union[str, Path]], *, roots: Sequence[Union[str, Path]] = ()
 ) -> Conventions:
@@ -785,11 +826,18 @@ def load_conventions(
             f"the conventions file {file.name} is too large", f"it is over {MAX_BYTES:,} bytes"
         )
     try:
-        document = load_yaml_safe(data.decode("utf-8"), max_bytes=MAX_BYTES)
+        text = data.decode("utf-8")
+        document = load_yaml_safe(text, max_bytes=MAX_BYTES)
     except Exception as exc:  # noqa: BLE001 - UnsafeYamlError, yaml's own errors, bad UTF-8
         raise refusal(
             f"the conventions file {file.name} is not valid YAML", type(exc).__name__
         ) from exc
+    twice = duplicate_key(text)
+    if twice is not None:
+        raise refusal(
+            f"the conventions file {file.name} has a problem",
+            clean_chars(f"{twice}: the key is given twice (YAML would keep the last)"),
+        )
     try:
         return parse_conventions(document, file.resolve(), roots=roots)
     except ConventionsError as exc:

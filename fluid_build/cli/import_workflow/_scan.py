@@ -308,8 +308,7 @@ def _driven(
     found: Dict[Path, JobRecord] = {}
     missing: List[str] = []
     for name in dict.fromkeys(names):
-        path = job_file(driver, name)
-        job = by_path.get(path) if path is not None else None
+        job = by_path.get(job_file(driver, name))
         if job is None:
             missing.append(name)
         else:

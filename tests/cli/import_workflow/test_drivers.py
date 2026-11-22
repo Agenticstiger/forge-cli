@@ -322,10 +322,21 @@ def test_a_list_that_is_a_pipe_is_not_waited_for(tmp_path):
     assert "there is no job list" in reader.names(driver, "a")  # not a regular file
 
 
-def test_a_list_over_the_size_limit_is_not_read(tmp_path, monkeypatch):
-    monkeypatch.setattr(_pysource, "MAX_FILE_BYTES", 10)
-    reader, driver = lists(tmp_path, {"pkg/job_lists/a.yaml": "jobs: [" + "x, " * 20 + "y]\n"})
-    assert "was not read" in reader.names(driver, "a")
+def test_a_list_over_the_size_limit_is_not_read(tmp_path):
+    big = "jobs: [" + "x, " * 12_000 + "y]\n"  # 36 KB
+    assert len(big) > D.MAX_LIST_BYTES
+    reader, driver = lists(tmp_path, {"pkg/job_lists/a.yaml": big})
+    assert "is larger than 32 KB" in reader.names(driver, "a")
+
+
+def test_the_lists_of_one_scan_are_bounded_in_bytes_too(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "MAX_LIST_BYTES_TOTAL", 20)
+    reader, driver = lists(
+        tmp_path, {f"pkg/job_lists/{n}.yaml": "jobs: [x, y, z]\n" for n in ("a", "b", "c")}
+    )
+    assert reader.names(driver, "a") == ["x", "y", "z"]
+    assert reader.names(driver, "b") == ["x", "y", "z"]  # the first one over the limit is read
+    assert "the most it reads" in reader.names(driver, "c")
 
 
 def test_a_list_is_counted_against_the_budget_of_the_scan(tmp_path):
@@ -336,10 +347,14 @@ def test_a_list_is_counted_against_the_budget_of_the_scan(tmp_path):
 
 
 def test_a_list_is_read_once_however_many_tasks_name_it(tmp_path, monkeypatch):
+    from fluid_build.util import safe_yaml
+
     reader, driver = lists(tmp_path, {"pkg/job_lists/a.yaml": "jobs: [x]\n"})
     reads: List[Path] = []
-    original = D.read_source
-    monkeypatch.setattr(D, "read_source", lambda p, b=None: reads.append(p) or original(p, b))
+    original = safe_yaml.read_bounded_file
+    monkeypatch.setattr(
+        safe_yaml, "read_bounded_file", lambda p, n: reads.append(p) or original(p, n)
+    )
     for _ in range(5):
         assert reader.names(driver, "a") == ["x"]
     assert len(reads) == 1
@@ -354,15 +369,27 @@ def test_the_lists_one_scan_reads_are_bounded(tmp_path, monkeypatch):
     assert "at most 2 job lists" in reader.names(driver, "c")
 
 
-def test_a_job_file_is_a_file_inside_the_jobs_directory(tmp_path):
-    reader, driver = lists(tmp_path, {"pkg/jobs/x.py": "", "outside.py": ""})
-    (tmp_path / "pkg" / "jobs" / "linked.py").symlink_to(tmp_path / "outside.py")
+def test_a_job_file_is_where_the_template_puts_it_and_nothing_is_looked_at(tmp_path):
+    reader, driver = lists(tmp_path, {})
+    assert D.job_file(driver, "x") == driver.jobs_dir / "x.py"
+    assert D.job_file(driver, "missing") == driver.jobs_dir / "missing.py"
+
+
+def test_a_job_that_is_a_link_to_a_file_elsewhere_or_a_directory_is_not_joined(
+    tmp_path, monkeypatch
+):
+    project(
+        tmp_path,
+        {
+            "pkg/job_lists/silver.yaml": "jobs: [customers, linked, dir, missing]\n",
+            "elsewhere/other.py": spark_job("other"),
+        },
+    )
+    (tmp_path / "pkg" / "jobs" / "linked.py").symlink_to(tmp_path / "elsewhere" / "other.py")
     (tmp_path / "pkg" / "jobs" / "dir.py").mkdir()
-    assert D.job_file(driver, "x") == (tmp_path / "pkg" / "jobs" / "x.py").resolve()
-    assert D.job_file(driver, "missing") is None
-    assert D.job_file(driver, "linked") is None  # a link out
-    assert D.job_file(driver, "dir") is None  # not a file
-    assert D.job_file(driver, "../outside") is None  # not a plain name never gets here, still safe
+    contracts, report = run(tmp_path, monkeypatch)
+    assert dag_ids(contracts) == {"silver.customers": "load", "silver.orders": None}
+    assert any("names 3 job(s) with no job file" in note for note in report.notes), report.notes
 
 
 # ── the importer ──────────────────────────────────────────────────────
@@ -541,3 +568,108 @@ def test_a_build_depends_on_every_build_the_task_before_it_ran(tmp_path, monkeyp
         {"buildId": "orders", "condition": "success"},
     ]
     assert "dependencies" not in builds["customers"]
+
+
+# ── what a review of the first version found ─────────────────────────────────
+
+
+def test_two_drivers_that_share_a_directory_do_not_share_their_lists(tmp_path):
+    reader, first = lists(
+        tmp_path, {"pkg/job_lists/silver.yaml": "jobs: [customers]\nsteps: [orders]\n"}
+    )
+    second = driver_of(
+        tmp_path, script="other.py", job_lists={**DRIVER["job_lists"], "key": "steps"}
+    )
+    assert reader.names(first, "silver") == ["customers"]
+    assert reader.names(second, "silver") == ["orders"]
+    third = driver_of(
+        tmp_path, script="x.py", job_lists={**DRIVER["job_lists"], "file": "{value}.yml"}
+    )
+    assert "there is no job list silver.yml" in reader.names(third, "silver")
+
+
+def test_a_name_that_is_not_plain_does_not_use_up_a_list_slot(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "MAX_LISTS", 2)
+    reader, driver = lists(tmp_path, {"pkg/job_lists/a.yaml": "jobs: [x]\n"})
+    for index in range(10):
+        assert "is not a plain name" in reader.names(driver, f"../x{index}")
+    assert reader.names(driver, "a") == ["x"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can enter any directory")
+def test_a_directory_that_cannot_be_entered_leaves_the_task_not_joined(tmp_path):
+    reader, driver = lists(tmp_path, {"pkg/job_lists/a.yaml": "jobs: [x]\n"})
+    locked = tmp_path / "pkg" / "job_lists"
+    locked.chmod(0)
+    try:
+        assert "could not be" in reader.names(driver, "a") or "no job list" in reader.names(
+            driver, "a"
+        )
+    finally:
+        locked.chmod(0o755)
+
+
+def test_a_file_name_the_system_refuses_leaves_the_task_not_joined(tmp_path):
+    long_prefix = "p" * 250
+    reader, driver = lists(
+        tmp_path,
+        {},
+        job_lists={**DRIVER["job_lists"], "file": long_prefix + "{value}.yaml"},
+    )
+    got = reader.names(driver, "a" * 100)
+    assert isinstance(got, str) and ("could not be looked at" in got or "no job list" in got)
+
+
+def test_a_nul_in_a_path_of_the_conventions_is_refused_with_the_key_named(tmp_path):
+    with pytest.raises(C.ConventionsError) as refused:
+        parse(
+            """
+            drivers:
+              - script: driver.py
+                argument: --job-list
+                job_lists: {dir: "pkg\\0x", file: "{value}.yaml"}
+                jobs: {dir: pkg/jobs, file: "{job}.py"}
+            """,
+            source=tmp_path / "c.yaml",
+        )
+    assert "drivers[0].job_lists.dir" in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "text, key",
+    [
+        ("external_consumers: [a.b]\nexternal_consumers: [c.d]\n", "external_consumers"),
+        ("environment: prod\nenvironment: dev\n", "environment"),
+        ("airflow_variables:\n  prod:\n    a: '1'\n    a: '2'\n", "airflow_variables.prod.a"),
+        (
+            "drivers:\n  - script: driver.py\n    script: other.py\n    argument: --j\n",
+            "drivers[0].script",
+        ),
+    ],
+)
+def test_a_key_given_twice_is_refused_with_its_path(tmp_path, text, key):
+    path = tmp_path / "c.yaml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(Exception) as refused:
+        C.load_conventions(path)
+    why = getattr(refused.value, "why", str(refused.value))
+    assert "given twice" in why and key in why
+
+
+def test_a_list_that_gives_a_key_twice_is_not_read(tmp_path):
+    reader, driver = lists(tmp_path, {"pkg/job_lists/a.yaml": "jobs: [x]\njobs: [y]\n"})
+    assert "gives a key twice" in reader.names(driver, "a")
+
+
+def test_a_merge_key_and_a_repeated_key_in_two_mappings_are_not_duplicates(tmp_path):
+    text = "base: &b {a: 1}\nx: {<<: *b, c: 2}\ny: {c: 3}\n"
+    assert C.duplicate_key(text) is None
+    assert C.duplicate_key("a: 1\nb: {a: 1}\nc: [{a: 1}, {a: 2}]\n") is None
+    assert C.duplicate_key("a: 1\nb: [{a: 1, a: 2}]\n") == "b[0].a"
+
+
+def test_an_escape_sequence_in_a_key_does_not_reach_the_refusal(tmp_path):
+    for text in ('"x\\e[2Jy": 1', 'drivers:\n  - "x\\e[31mRED": 1'):
+        with pytest.raises(C.ConventionsError) as refused:
+            C.parse_conventions(__import__("yaml").safe_load(text))
+        assert "\x1b" not in str(refused.value) and "unknown key" in str(refused.value)

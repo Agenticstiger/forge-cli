@@ -12,8 +12,9 @@ file (bounded and safe YAML, never run), and the job file of each name in it.
 
 Nothing is guessed and nothing runs. A value or a name that is not a plain file name is refused
 before any path is made of it, a path that leaves the directory it is looked for in (a link out
-included) is not read, and a list is a file of at most 300 KB read once, counted against the same
-budget as the source of the scan.
+included) is not read, a list is a file of at most 32 KB read once (all of them together at most
+256 KB), counted against the same budget as the source of the scan, and a job is joined only when
+it is one of the job files the scan found.
 """
 
 from __future__ import annotations
@@ -22,14 +23,17 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
-from ._conventions import Driver
-from ._pysource import SourceBudget, SourceUnreadable, read_source
+from ._conventions import Driver, duplicate_key
+from ._pysource import SourceBudget
 
 #: A job list's name, and a job's: a plain file name stem.
 _NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127}")
-#: Names one list may hold, and lists one scan reads: a hostile repository does not get more.
+#: Names one list may hold, lists one scan reads, and the bytes of them: a hostile repository does
+#: not get more. A list of 500 names of 40 characters is 20 KB.
 MAX_JOBS_PER_LIST = 500
 MAX_LISTS = 1_000
+MAX_LIST_BYTES = 32_768
+MAX_LIST_BYTES_TOTAL = 262_144
 
 
 def _segments(script: str) -> List[str]:
@@ -82,14 +86,14 @@ def _names_in(document: object, driver: Driver) -> Union[List[str], str]:
         found = document[driver.list_key]
     if not isinstance(found, list):
         return "the jobs are not a list"
+    if len(found) > MAX_JOBS_PER_LIST:
+        return f"the list has more than {MAX_JOBS_PER_LIST} jobs"
     names: List[str] = []
-    for item in found[:MAX_JOBS_PER_LIST]:
+    for item in found:
         if isinstance(item, str) and _NAME.fullmatch(item) and ".." not in item:
             names.append(item)
         else:
             return "a job in the list is not a plain name"
-    if len(found) > MAX_JOBS_PER_LIST:
-        return f"the list has more than {MAX_JOBS_PER_LIST} jobs"
     return names
 
 
@@ -98,11 +102,16 @@ class Lists:
 
     def __init__(self, budget: Optional[SourceBudget] = None) -> None:
         self.budget = budget
-        self._read: Dict[Tuple[str, str], Union[List[str], str]] = {}
+        self._read: Dict[Tuple[str, str, Optional[str], str], Union[List[str], str]] = {}
+        self._bytes = 0
 
     def names(self, driver: Driver, value: str) -> Union[List[str], str]:
         """The job names list ``value`` holds, or why they could not be read."""
-        key = (str(driver.lists_dir), value)
+        if not _NAME.fullmatch(value) or ".." in value:
+            return f"{value!r} is not a plain name for a job list"
+        # what the file is called and where its names are, not only the name asked for: two
+        # drivers may share a directory and name their lists differently
+        key = (str(driver.lists_dir), driver.list_file, driver.list_key, value)
         if key in self._read:
             return self._read[key]
         if len(self._read) >= MAX_LISTS:
@@ -111,32 +120,45 @@ class Lists:
         return result
 
     def _load(self, driver: Driver, value: str) -> Union[List[str], str]:
-        if not _NAME.fullmatch(value) or ".." in value:
-            return f"{value!r} is not a plain name for a job list"
         path = driver.lists_dir / driver.list_file.replace("{value}", value)
         if not _inside(path, driver.lists_dir):
             return "the list is not inside the directory the conventions name"
-        if not path.is_file():
-            return f"there is no job list {path.name} in the directory the conventions name"
         try:
-            data = read_source(path, self.budget)
-        except SourceUnreadable as exc:
-            return f"the job list {path.name} was not read ({exc})"
-        from fluid_build.util.safe_yaml import load_yaml_safe
+            regular = path.is_file()
+        except OSError:  # a directory that cannot be entered, a name the system refuses
+            return f"the job list {path.name} could not be looked at"
+        if not regular:
+            return f"there is no job list {path.name} in the directory the conventions name"
+        if self._bytes >= MAX_LIST_BYTES_TOTAL:
+            return (
+                f"the scan has read {MAX_LIST_BYTES_TOTAL // 1024} KB of job lists, the most it "
+                "reads"
+            )
+        from fluid_build.util.safe_yaml import load_yaml_safe, read_bounded_file
 
         try:
-            document = load_yaml_safe(data.decode("utf-8"), max_bytes=len(data) + 1)
+            data = read_bounded_file(path, MAX_LIST_BYTES)
+        except OSError as exc:
+            return f"the job list {path.name} was not read ({type(exc).__name__})"
+        if data is None:
+            return f"the job list {path.name} is larger than {MAX_LIST_BYTES // 1024} KB"
+        if self.budget is not None and not self.budget.take(len(data)):
+            return "the scan has read all the source it reads, so the job list was not read"
+        self._bytes += len(data)
+        try:
+            text = data.decode("utf-8")
+            document = load_yaml_safe(text, max_bytes=len(data) + 1)
         except Exception:  # noqa: BLE001 - UnsafeYamlError, yaml's own errors, bad UTF-8
             return f"the job list {path.name} is not valid YAML"
+        if duplicate_key(text) is not None:
+            return f"the job list {path.name} gives a key twice"
         return _names_in(document, driver)
 
 
-def job_file(driver: Driver, name: str) -> Optional[Path]:
-    """The file of job ``name``, when it is a file inside the jobs directory; else ``None``."""
-    path = driver.jobs_dir / driver.job_file.replace("{job}", name)
-    if _inside(path, driver.jobs_dir) and path.is_file():
-        return path.resolve()
-    return None
+def job_file(driver: Driver, name: str) -> Path:
+    """Where the job file of ``name`` is. Nothing is looked at: the scan found the job files, and
+    a job joins a task only when it is one of them, at exactly this path."""
+    return driver.jobs_dir / driver.job_file.replace("{job}", name)
 
 
 def argument_value(driver: Driver, args: Sequence[str]) -> Union[str, Tuple[str]]:
