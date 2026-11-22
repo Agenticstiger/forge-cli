@@ -36,8 +36,9 @@ indirectly, so this module settles it from what both majors report (measured on 
 
 Files whose DAG ids cannot be read from the source (a factory, a loop) are judged by the
 DAGs Airflow lists for them and by their import errors, and the wait is for them too.
-A file that builds no DAG at module level (a helper module) is not waited for; an import
-error Airflow shows for it during the wait still fails the check.
+A module whose import makes no call and which never names ``globals`` (a helper module) is
+not waited for; an import error Airflow shows for it during the wait still fails the
+check. Any other file forge reads no DAG id from is waited for like a factory.
 
 Every comparison is between stamps of Airflow's DAG processors: a parse or an import
 error counts when it is newer than what Airflow had recorded at the first read after the
@@ -84,9 +85,9 @@ class DagFile:
     """A pushed file Airflow will parse: its path under ``--dags-dir`` and its DAG ids.
 
     ``dynamic`` means the file builds DAGs whose ids could not be read from the source
-    (a factory, a loop); Airflow decides. ``helper`` means it builds no DAG at module
-    level (a module DAG files import), so it is not expected to show one. ``source`` is
-    the text Airflow stores for the file once a processor has read it.
+    (a factory, a loop); Airflow decides. ``helper`` means importing it makes no call and
+    it never names ``globals`` (a module DAG files import), so it is not expected to show
+    a DAG. ``source`` is the text Airflow stores for the file once a processor has read it.
     """
 
     path: str
@@ -138,23 +139,34 @@ def normal_source(text: str) -> str:
 
 
 def _builds_dags(source: bytes) -> bool:
-    """Whether module-level code calls something named like a DAG builder.
+    """Whether importing the module may build a DAG: anything but a plain helper module.
 
-    ``DAG(...)``, ``create_dag(...)``, ``build_dags()``: a call whose name holds ``dag``,
-    outside function and class bodies. A module that only defines helpers builds none.
-    A source that does not parse counts as building DAGs: Airflow will report on it.
+    A factory can build its DAGs through any call (``build(cfg)``, ``create_pipeline(c)``,
+    ``make(**spec)``, ``Builder.from_yaml(...).register(globals())``), so no call name is
+    trusted. A helper is a module whose import makes no call at all (imports, function and
+    class definitions, literal constants) and which never names ``globals``. Decorators,
+    default values and class bodies run at import, so their calls count. A source that
+    does not parse counts as building DAGs: Airflow will report on it.
     """
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return True
+    if any(isinstance(node, ast.Name) and node.id == "globals" for node in ast.walk(tree)):
+        return True
     stack: List[ast.AST] = list(tree.body)
     while stack:
         node = stack.pop()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            continue
-        if isinstance(node, ast.Call) and "dag" in (_callee(node.func) or "").lower():
+        if isinstance(node, ast.Call):
             return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            # The body runs when the function is called; its decorators and defaults now.
+            arguments = node.args
+            stack.extend(arguments.defaults)
+            stack.extend(d for d in arguments.kw_defaults if d is not None)
+            if not isinstance(node, ast.Lambda):
+                stack.extend(node.decorator_list)
+            continue
         stack.extend(ast.iter_child_nodes(node))
     return False
 
@@ -709,7 +721,7 @@ class _Wait:
                 result.detail = f"import error: {result.error}" if result.error else "import error"
             else:
                 result.state = "unchecked"
-                result.detail = "builds no DAG at module level (a helper module): not waited for"
+                result.detail = "makes no call at import (a helper module): not waited for"
             return
         if failing:
             result.state, result.evidence = "broken", ""
@@ -878,7 +890,8 @@ def _conclude(
         return done(
             False,
             E_NOT_PARSED,
-            "nothing was checked: every synced file builds no DAG at module level.",
+            "nothing was checked: every synced file is a helper module (importing it makes "
+            "no call).",
         )
     total = len(blocking)
     pending = [fs.result for fs in blocking if fs.result.state not in ("clean", "unproven")]
@@ -895,7 +908,8 @@ def _conclude(
             "(min_file_process_interval)"
             + (
                 "; Airflow lists a new file only every dag_dir_list_interval (Airflow 2) or "
-                "refresh_interval (Airflow 3), 300 s by default"
+                "refresh_interval (Airflow 3), 300 s by default, and never lists a module "
+                "that runs code at import but builds no DAG"
                 if unlisted
                 else ""
             )
@@ -933,7 +947,7 @@ def _notes(wait: _Wait) -> List[str]:
     helpers = [_one_line(fs.result.path) for fs in wait.files if fs.file.helper]
     if helpers:
         notes.append(
-            "Not checked, as they build no DAG at module level (helper modules): "
+            "Not waited for, as importing them makes no call (helper modules): "
             + ", ".join(helpers)
             + "."
         )

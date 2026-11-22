@@ -938,6 +938,9 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
             "On an Airflow 3 Git bundle, check that it tracks the branch the push went to",
             "Where a file waits for Airflow's stored source, check that Airflow parses the "
             "folder or bucket the push wrote to",
+            "A file forge reads no DAG id from is waited for like a DAG factory when its "
+            "import makes any call; move a helper module like that out of --dags-dir "
+            "(plugins/, or a package installed with Airflow)",
         ],
         None,
     ),

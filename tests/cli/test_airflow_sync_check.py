@@ -631,16 +631,113 @@ def test_a_dag_id_forge_cannot_read_makes_the_file_dynamic(tmp_path: Path):
     assert files["f/built.py"].dynamic and not files["f/built.py"].helper
 
 
-def test_a_module_that_builds_no_dag_at_module_level_is_a_helper(tmp_path: Path):
-    _write(tmp_path, "c/common.py", "from airflow.models import Variable  # dag helpers\n")
-    _write(
-        tmp_path,
-        "c/lib.py",
-        "from airflow import DAG\n\ndef build_dag(name):\n    return DAG(name)\n",
-    )
-    files = {f.path: f for f in chk.dag_files(tmp_path)}
-    for path in ("c/common.py", "c/lib.py"):
-        assert files[path].helper and not files[path].dynamic and files[path].dag_ids == ()
+#: Shapes real DAG factories take (dag-factory, Cosmos, the dynamic-DAG examples in
+#: Airflow's docs, team-local builders), and modules whose import runs code: none is a
+#: helper, so each is waited for like a factory.
+_FACTORY_SHAPES = {
+    "globals_loop.py": (
+        "from airflow import DAG\nfrom mylib import build, configs\n"
+        "for cfg in configs:\n    globals()[cfg.id] = build(cfg)\n"
+    ),
+    "create_pipeline.py": (
+        "from airflow.sdk import dag\nfrom pipelines import create_pipeline, CONFIGS\n"
+        "pipelines = [create_pipeline(c) for c in CONFIGS]\n"
+    ),
+    "yaml_factory_make.py": (
+        "import yaml\nfrom airflow.models import DAG\nfrom factory import make\n"
+        "for spec in yaml.safe_load(open('x.yaml')):\n    globals()[spec['id']] = make(**spec)\n"
+    ),
+    "class_builder.py": (
+        "from airflow import DAG\nfrom builders import PipelineBuilder\n"
+        "PipelineBuilder.from_yaml('x.yaml').register(globals())\n"
+    ),
+    "dagfactory_lib.py": (
+        "# airflow dag-factory\nfrom dagfactory import load_yaml_dags\n"
+        "load_yaml_dags(globals_dict=globals())\n"
+    ),
+    "docs_example.py": (
+        "from airflow import DAG\ndef create_dag(dag_id):\n    return DAG(dag_id)\n"
+        "for n in range(3):\n    globals()[f'd{n}'] = create_dag(f'd{n}')\n"
+    ),
+    "loop_with_dag.py": (
+        "from airflow import DAG\nfor name in ['a', 'b']:\n"
+        "    with DAG(dag_id=name) as d:\n        globals()[name] = d\n"
+    ),
+    "cosmos.py": (
+        "from airflow import DAG\nfrom cosmos import DbtDag\n"
+        "my = DbtDag(dag_id=NAME, project_config=cfg)\n"
+    ),
+    "call_named_like_a_dag.py": '"""dag utils for airflow"""\nDAG_DEFAULTS = make_dag_defaults()\n',
+    "logger.py": '"""airflow dag helpers"""\nimport logging\nlog = logging.getLogger(__name__)\n',
+    "registers_later.py": (
+        '"""airflow dag registry"""\ndef register(dags):\n    globals().update(dags)\n'
+    ),
+    "decorated.py": (
+        '"""airflow dag helpers"""\nimport functools\n'
+        "@functools.lru_cache(maxsize=1)\ndef config():\n    return {}\n"
+    ),
+}
+#: Modules whose import makes no call and which never name ``globals``.
+_HELPER_SHAPES = {
+    "defaults.py": (
+        '"""airflow dag helpers"""\nfrom airflow.models import Variable\n'
+        "def default_args():\n    return {}\n"
+    ),
+    "constants.py": (
+        '"""airflow dag defaults"""\nOWNER = "data"\nRETRIES = 2\n'
+        'ARGS = {"owner": OWNER, "retries": RETRIES, "tags": ["a", "b"]}\n'
+    ),
+    "builders.py": (
+        "from airflow import DAG\n\ndef build_dag(name):\n    return DAG(name)\n\n"
+        "class Spec:\n    name = 'x'\n\n    def make(self):\n        return build_dag(self.name)\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_FACTORY_SHAPES))
+def test_a_file_whose_import_makes_any_call_is_waited_for_like_a_factory(tmp_path, name):
+    _write(tmp_path, name, _FACTORY_SHAPES[name])
+    (only,) = chk.dag_files(tmp_path)
+    assert only.dynamic and not only.helper and only.dag_ids == ()
+
+
+@pytest.mark.parametrize("name", sorted(_HELPER_SHAPES))
+def test_a_module_whose_import_makes_no_call_is_a_helper(tmp_path: Path, name: str):
+    _write(tmp_path, name, _HELPER_SHAPES[name])
+    (only,) = chk.dag_files(tmp_path)
+    assert only.helper and not only.dynamic and only.dag_ids == ()
+
+
+def test_a_new_broken_factory_airflow_has_not_listed_yet_holds_the_wait(tmp_path: Path):
+    """A factory whose builder has no "dag" in its name, pushed broken: the wait lasts
+    until Airflow shows its import error."""
+    _write(tmp_path, "sales/orders.py", "from airflow import DAG\nDAG(dag_id='sales__orders')\n")
+    _write(tmp_path, "sales/factory.py", _FACTORY_SHAPES["globals_loop.py"])
+    files = chk.dag_files(tmp_path)
+    assert [(f.path, f.dynamic) for f in files] == [
+        ("sales/factory.py", True),
+        ("sales/orders.py", False),
+    ]
+    with FakeAirflow(2) as fake:
+        fake.land_dir(tmp_path)
+        steps = every_30s(ok("sales__orders", "sales/orders.py"), 3) + every_30s(
+            fail("sales/factory.py"), 3
+        )
+        result = _run(fake, steps, files=files, wait_s=300)
+    assert not result.passed and _state(result) == ["broken", "clean"]
+    assert result.event == "schedule_sync_airflow_import_errors"
+
+
+def test_a_module_that_runs_code_at_import_but_builds_no_dag_fails_closed(tmp_path: Path):
+    _write(tmp_path, "common/log.py", _FACTORY_SHAPES["logger.py"])
+    _write(tmp_path, "sales/orders.py", "from airflow import DAG\nDAG(dag_id='sales__orders')\n")
+    files = chk.dag_files(tmp_path)
+    with FakeAirflow(2) as fake:
+        fake.land_dir(tmp_path)
+        result = _run(fake, every_30s(ok("sales__orders", "sales/orders.py"), 3), files=files)
+    assert not result.passed and result.event == "schedule_sync_airflow_not_parsed"
+    assert _state(result) == ["pending", "clean"]
+    assert "never lists a module that runs code at import" in result.message
 
 
 # ── where the files landed: another directory's file of the same name is not ours ──
