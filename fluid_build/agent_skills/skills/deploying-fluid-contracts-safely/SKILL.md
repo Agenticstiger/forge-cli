@@ -57,6 +57,8 @@ Ask, in the chat, before any of these, and say what each one risks:
 - `--no-verify-plan-binding` or `--no-verify-federation`: they skip the checks that
   the plan, its bundle and its upstreams are the ones that were reviewed.
 - `--adopt-shared-container`: it takes ownership of a shared container.
+- `--adopt-tables`: it takes over existing tables another process made (each only
+  if it matches the contract); plan it first with `fluid plan --tofu --adopt-tables`.
 - `--yes` on apply, or an environment other than `dev`.
 
 ## When a gate fails

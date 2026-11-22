@@ -17,17 +17,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no state before the apply. The saved plan is read back with `tofu show -json` before
   the data-loss gate: a table that matches is imported unreplaced, its Lake Formation
   permissions kept, and what the apply still changes in place (a description, an owner,
-  column comments, the columns of older Iceberg schemas Glue lists) is printed and
-  audited at WARNING (`table_adoption_accepted`). A table that differs refuses the run
-  (`table_adoption_mismatch`), naming each column missing, added, of another type, case
-  or order, and each property: location, Iceberg or not, input and output format, SerDe
-  and storage parameters, partition keys, table type, any other storage setting, or the
-  replace OpenTofu would plan; nothing is imported or applied. The saved plan records
+  column comments, a column name's case, the columns of older Iceberg schemas Glue
+  lists) is printed. A table that differs refuses the run (`table_adoption_mismatch`),
+  naming each column missing, added, of another type (spacing aside, as the data-loss
+  gate reads types) or in another order, and each property: location, Iceberg or not,
+  input and output format, SerDe and storage parameters, partition keys, table type, any
+  other storage setting, or the replace OpenTofu would plan; nothing is imported or
+  applied. The run that applies the take-over audits it at WARNING
+  (`table_adoption_accepted`); a dry run or a refusal does not. The saved plan records
   the adopted tables in `opentofuPlan.adoptedTables`, under `planDigest`, and `fluid
-  apply plan.json` names them. With the flag a table whose look-up fails for any reason
-  but "no such object" stops the run, and one it cannot look for (no AWS account id)
-  is refused (`table_adoption_unavailable`); `fluid plan --adopt-tables` needs `--tofu`
-  (`plan_adopt_tables_needs_tofu`). A partitioned Hive table cannot be adopted yet: its
+  apply plan.json` names them. `fluid ship --adopt-tables` passes the flag to its apply
+  stage. With the flag a table whose look-up fails for any reason but "no such object"
+  stops the run, and one it cannot look for (no AWS account id) is refused
+  (`table_adoption_unavailable`); `fluid plan --adopt-tables` needs `--tofu`
+  (`plan_adopt_tables_needs_tofu`). The match is checked when the plan is made: a saved
+  plan applies what it planned. A partitioned Hive table cannot be adopted yet: its
   partition trigger is new to the state, so OpenTofu plans its replacement, and the run
   is refused saying so.
 
@@ -178,13 +182,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **An existing Glue table is no longer taken over without being asked.** A table the
-  contract names that already exists and that the OpenTofu state does not manage used
-  to be imported on every `fluid apply` and rewritten to the contract in place. It is
-  now refused before the plan (`table_adoption_requires_flag`), naming each table;
-  `--adopt-tables` adopts it after the match check. S3 buckets, Glue databases, Kinesis
-  streams and the other brownfield resources are adopted as before, and so are tables
-  on the other clouds.
+- **An existing Glue table forge did not make is no longer taken over without being
+  asked.** A table the contract names that already exists and that the OpenTofu state
+  does not manage used to be imported on every `fluid apply` and rewritten to the
+  contract in place. It is now refused before the plan (`table_adoption_requires_flag`),
+  naming each table; `--adopt-tables` adopts it after the match check. A table forge
+  made (it carries the `managed_by: fluid` parameter forge's module sets on create) is
+  re-attached as before when its state was lost or is kept nowhere, so an apply that
+  starts from an empty state on every run keeps working. S3 buckets, Glue databases,
+  Kinesis streams and the other brownfield resources are adopted as before, and so are
+  tables on the other clouds. The look-up now also covers a Glue binding without a
+  `format`, which the module declares as Parquet and the look-up used to skip.
 
 - **`--fail-on-breaking` fails on a changed product id.** The changelog did not compare ids, so a
   contract that only changed its id passed the gate; it is a breaking change now, as it is in the
