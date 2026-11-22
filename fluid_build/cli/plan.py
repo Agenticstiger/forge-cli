@@ -1006,8 +1006,18 @@ def _gate_contract_for_plan_or_apply(
             },
         )
 
-    if not result.is_valid:
-        errors = list(result.errors)
+    # Gate 3 — the alert routes (``fluid validate`` runs the same check): a route that names a
+    # secret, an unknown kind or a bad connection is refused here, so it is not planned and
+    # copied into plan.json. The schema's own errors under ``alerts`` quote the value that was
+    # written (``'ops:<secret>@mail.example.org' does not match``), so they are replaced
+    # by messages that do not, before anything logs or prints them.
+    alert_errors: List[str] = []
+    if command in ("plan", "apply"):
+        alert_errors = _alert_route_errors(contract, result)
+    schema_errors = _without_alert_values(result)
+
+    if not result.is_valid or alert_errors:
+        errors = schema_errors + alert_errors
         for err in errors:
             error(logger, "contract_schema_error", command=command, detail=err)
         event = (
@@ -1027,6 +1037,48 @@ def _gate_contract_for_plan_or_apply(
                 ),
             },
         )
+
+
+def _alert_route_errors(contract: Dict[str, Any], result: Any) -> List[str]:
+    """What the contract's alert routes get wrong, as messages that never quote a value. The
+    schema errors ``result`` holds at a place such a message is about are dropped from it (the
+    message covers the field and its items). Fails closed: a check that cannot run is an error."""
+    from fluid_build._validation_issues import message_pointer
+    from fluid_build.alerts import contract_alert_findings
+
+    try:
+        found, _warnings = contract_alert_findings(contract)
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        return [
+            f"Alert route check could not run ({type(exc).__name__}); the contract's alert "
+            "routes were NOT checked"
+        ]
+    for message in found:
+        pointer = message_pointer(message, contract)
+        if not pointer:
+            continue
+        for schema_message in list(result.errors):
+            _event, at, _fix = result.issue_meta.get(schema_message, ("", "", ""))
+            if at == pointer or at.startswith(pointer + "/"):
+                result.errors.remove(schema_message)
+                result.issue_meta.pop(schema_message, None)
+    return list(found)
+
+
+def _without_alert_values(result: Any) -> List[str]:
+    """``result``'s errors with each one under ``/alerts`` reduced to where it is: the schema's
+    message quotes the value that did not match, and an alert option can hold a secret."""
+    out: List[str] = []
+    for message in result.errors:
+        _event, at, _fix = result.issue_meta.get(message, ("", "", ""))
+        if at == "/alerts" or at.startswith("/alerts/"):
+            out.append(
+                f"{at} does not match the contract schema (value not shown); "
+                "run `fluid validate` for the check that names it"
+            )
+        else:
+            out.append(message)
+    return out
 
 
 def _warn_unusable_build_ids(contract: Dict[str, Any]) -> None:

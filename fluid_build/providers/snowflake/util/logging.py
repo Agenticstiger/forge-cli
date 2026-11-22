@@ -70,6 +70,21 @@ SENSITIVE_PATTERNS = [
     # Opsgenie's API key as its Authorization header carries it, ahead of the assignment
     # pattern, which would take ``GenieKey`` for the value: mirrors the global layer.
     re.compile(r"(?i)\bGenieKey\s{1,8}[A-Za-z0-9-]{20,128}"),
+    # An AWS Signature Version 4 ``Authorization`` value, ahead of the assignment pattern for the
+    # same reason (it would take the scheme for the value and leave the signature), and the Teams
+    # and Discord incoming webhooks, whose URL is the secret (the global layer's shapes).
+    re.compile(
+        r"(?i)\bAWS4-HMAC-SHA256\s{1,8}Credential=[^\s,'\"]{1,256}"
+        r"(?:,\s{0,8}SignedHeaders=[^\s,'\"]{1,512})?(?:,\s{0,8}Signature=[0-9a-f]{16,128})?"
+    ),
+    re.compile(
+        r"(?i)\bhttps?://[a-z0-9.\-]{1,100}\.webhook\.office(?:365)?\.com/[A-Za-z0-9/_@.\-]{8,512}"
+    ),
+    re.compile(r"(?i)\bhttps?://outlook\.office(?:365)?\.com/webhook/[A-Za-z0-9/_@.\-]{8,512}"),
+    re.compile(
+        r"(?i)\bhttps?://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/api(?:/v\d{1,2})?/webhooks/"
+        r"\d{5,25}/[A-Za-z0-9_\-]{20,128}"
+    ),
     # Snowflake passwords and connection strings.
     # NOTE: the bare ``password=...`` shape is handled by the named-group
     # assignment pattern below (it keeps the ``password=`` key prefix); a
@@ -129,7 +144,7 @@ SENSITIVE_PATTERNS = [
         r"api[_-]?key|authorization|secret[_.-]access[_.-]key|secret[_.-]key|client_secret|"
         r"oauth[_-]?token|password|session[_-]token|secret|token|passphrase|"
         # PagerDuty's Events API key, by its two names (mirrors the global layer)
-        r"routing[_-]?key|integration[_-]?key|"
+        r"routing[_-]?key|integration[_-]?key|genie[_-]?key|"
         # the short and run-together spellings of a password, and the keys that sign (mirrors
         # the global layer)
         r"passwd|signing[_-]?key|hmac[_-]?key|"
@@ -253,6 +268,11 @@ SENSITIVE_KEYS = {
     # PagerDuty's Events API key (mirrors the global layer)
     "routing_key",
     "integration_key",
+    # The camelCase spellings of those, and Opsgenie's key (mirrors the global layer)
+    "routingkey",
+    "integrationkey",
+    "genie_key",
+    "geniekey",
     # The short and run-together spellings, and the whole-name keys of the global layer
     # (``secret_redactor._SENSITIVE_KEY_NAMES``): matched here as exact names.
     "passwd",
@@ -335,6 +355,20 @@ def redact_string(text: str) -> str:
     return redacted
 
 
+def _redact_object(value: Any) -> Any:
+    """``value`` itself, or its masked text when it is an object whose own text holds a secret
+    (the global layer's rule for a log argument that is an object): numbers, booleans and
+    ``None`` are returned as they are."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    try:
+        rendered = str(value)
+    except Exception:  # noqa: BLE001 - redaction must never fail on a value's own text
+        return value
+    masked = redact_string(rendered)
+    return value if masked == rendered else masked
+
+
 def redact_dict(data: Dict[str, Any], max_depth: int = 10) -> Dict[str, Any]:
     """
     Recursively redact sensitive information from a dictionary.
@@ -368,7 +402,7 @@ def redact_dict(data: Dict[str, Any], max_depth: int = 10) -> Dict[str, Any]:
         elif isinstance(value, str):
             redacted[key] = redact_string(value)
         else:
-            redacted[key] = value
+            redacted[key] = _redact_object(value)
 
     return redacted
 
@@ -400,7 +434,7 @@ def redact_list(data: List[Any], max_depth: int = 10) -> List[Any]:
         elif isinstance(item, str):
             redacted.append(redact_string(item))
         else:
-            redacted.append(item)
+            redacted.append(_redact_object(item))
 
     return redacted
 

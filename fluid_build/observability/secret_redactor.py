@@ -46,7 +46,7 @@ _CREDENTIAL_KEY_WORDS = (
     r"client_secret|credentials?|oauth[_-]?token|password|passphrase|"
     r"private[_-]?key(?:_passphrase)?|session[_-]token|secret|token|"
     # PagerDuty's Events API key, by its two names
-    r"routing[_-]?key|integration[_-]?key|"
+    r"routing[_-]?key|integration[_-]?key|genie[_-]?key|"
     # the short spelling of a password, and the keys that sign (``pwd`` is a dict-key name only:
     # as an assignment it would eat the text after ``MYSQL_PWD=<value>``)
     r"passwd|signing[_-]?key|hmac[_-]?key"
@@ -79,8 +79,13 @@ _SENSITIVE_KEY_PARTS = (
     "credential",
     "hmac_key",
     "hmackey",
+    # Opsgenie's key, and the camelCase spellings of PagerDuty's two (a JSON body's
+    # ``routingKey``, an options map's ``integrationKey``)
+    "genie_key",
+    "geniekey",
     # PagerDuty's Events API key (``routing_key`` in the request, the integration key)
     "integration_key",
+    "integrationkey",
     # ``sasl.jaas.config`` (incl. the connector's ``iceberg.kafka.sasl.jaas.config``)
     # carries the SASL password/token inside the value, but the key name has no
     # other sensitive substring — so the substring matcher misses it without this
@@ -93,6 +98,7 @@ _SENSITIVE_KEY_PARTS = (
     "passphrase",
     "private_key",
     "routing_key",
+    "routingkey",
     "secret",
     "session_token",
     "signing_key",
@@ -184,6 +190,22 @@ _PROVIDER_KEY_RES = (
     ),
     # Opsgenie's API key as its Authorization header carries it.
     re.compile(r"(?i)\bGenieKey\s{1,8}[A-Za-z0-9-]{20,128}"),
+    # Incoming webhooks whose URL is the secret: Microsoft Teams (the Workflows and the
+    # Office 365 connector forms) and Discord.
+    re.compile(
+        r"(?i)\bhttps?://[a-z0-9.\-]{1,100}\.webhook\.office(?:365)?\.com/[A-Za-z0-9/_@.\-]{8,512}"
+    ),
+    re.compile(r"(?i)\bhttps?://outlook\.office(?:365)?\.com/webhook/[A-Za-z0-9/_@.\-]{8,512}"),
+    re.compile(
+        r"(?i)\bhttps?://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/api(?:/v\d{1,2})?/webhooks/"
+        r"\d{5,25}/[A-Za-z0-9_\-]{20,128}"
+    ),
+    # An AWS Signature Version 4 ``Authorization`` value: the access key id, the signed headers
+    # and the signature, which a request object's ``repr`` prints with the header.
+    re.compile(
+        r"(?i)\bAWS4-HMAC-SHA256\s{1,8}Credential=[^\s,'\"]{1,256}"
+        r"(?:,\s{0,8}SignedHeaders=[^\s,'\"]{1,512})?(?:,\s{0,8}Signature=[0-9a-f]{16,128})?"
+    ),
     re.compile(r"\bhf_[A-Za-z0-9]{30,}"),  # HuggingFace
     re.compile(r"\br8_[A-Za-z0-9]{30,}"),  # Replicate
     re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"),  # GitLab PAT
@@ -869,7 +891,23 @@ def redact_value(value: Any) -> Any:
         # rendered text like any other string so a credential in the exception
         # body can't leak.
         return redact_secret_text(str(value))
-    return value
+    return _redact_object(value)
+
+
+def _redact_object(value: Any) -> Any:
+    """``value`` itself, or its masked text when it is an object whose own text holds a secret
+    (a request object whose ``repr`` prints its ``Authorization`` header): a log call that binds
+    one as an argument shows that text, not a string this module would have scanned. Numbers,
+    booleans and ``None`` are returned as they are; an object whose text cannot be made, or that
+    holds nothing to mask, is too."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    try:
+        rendered = str(value)
+    except Exception:  # noqa: BLE001 - a log call must never fail on an argument's own text
+        return value
+    masked = redact_secret_text(rendered)
+    return value if masked == rendered else masked
 
 
 def _scan_sensitive_placeholders(msg: str) -> tuple[set[int], set[str]]:
@@ -921,9 +959,9 @@ def _redact_positional_args(args: Any, sensitive_indices: set[int]) -> Any:
             # rendered text through the same redactor as any other string.
             redacted_items.append(redact_secret_text(str(arg)))
         else:
-            # Non-string scalars (int, float, bool, None, custom objects) are
-            # preserved so observability metrics aren't clobbered.
-            redacted_items.append(arg)
+            # Numbers, booleans and ``None`` are preserved so observability metrics
+            # aren't clobbered; an object is too, unless its own text holds a secret.
+            redacted_items.append(_redact_object(arg))
     return tuple(redacted_items) if isinstance(args, tuple) else redacted_items
 
 
@@ -943,7 +981,7 @@ def _redact_named_args(args: Mapping[str, Any], sensitive_names: set[str]) -> di
             # embedded in a logged exception body doesn't leak.
             redacted[key] = redact_secret_text(str(value))
         else:
-            redacted[key] = value
+            redacted[key] = _redact_object(value)
     return redacted
 
 

@@ -683,7 +683,7 @@ class TestOptionProblems:
 
     @pytest.mark.parametrize("secret", SECRETS)
     def test_secret_shaped_values_are_refused_without_the_value(self, secret):
-        problems = option_problems({"token": secret}, "o")
+        problems = option_problems({"note": secret}, "o")
         assert len(problems) == 1
         assert "looks like a secret" in problems[0]
         assert secret not in problems[0]

@@ -364,7 +364,10 @@ def _read_orphans(
 
 def option_problems(value: Any, where: str, depth: int = 0) -> List[str]:
     """What keeps a plugin action's ``options`` from reaching the job config: JSON values only,
-    no control character, no ``${`` and nothing the redactor masks. A value is never quoted."""
+    no control character, no ``${``, nothing the redactor masks, and no key the redactor reads as
+    a credential's (``password``, ``apiKey``, ``routing_key``, in any case or spelling), whatever
+    its value is. A value is never quoted."""
+    from fluid_build.alerts.routes import secret_option_key
     from fluid_build.observability.secret_redactor import redact_secret_text
 
     if depth > 4:
@@ -394,6 +397,12 @@ def option_problems(value: Any, where: str, depth: int = 0) -> List[str]:
         for key, item in list(value.items())[:50]:
             if not isinstance(key, str) or not _OPTION_KEY.match(key):
                 out.append(f"{where} has a key that is not a plain name (key not shown)")
+                continue
+            if secret_option_key(key):
+                out.append(
+                    f"{where}.{key} is named like a secret; a plugin reads its secrets itself, "
+                    "never from the contract (value not shown)"
+                )
                 continue
             out += option_problems(item, f"{where}.{key}", depth + 1)
         return out + ([f"{where} has more than 50 keys"] if len(value) > 50 else [])

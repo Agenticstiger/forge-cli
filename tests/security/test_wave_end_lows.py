@@ -10,6 +10,7 @@ built from parts so no file holds a whole one.
 
 from __future__ import annotations
 
+import io
 import logging
 import textwrap
 from typing import Any
@@ -145,18 +146,18 @@ def test_a_short_credential_that_is_a_key_word_is_still_refused(clean_registry) 
     ],
 )
 def test_an_option_key_that_names_a_credential_is_refused(key: str) -> None:
-    from fluid_build.alerts.routes import _secret_key
+    from fluid_build.alerts.routes import secret_option_key
 
-    assert _secret_key(key), key
+    assert secret_option_key(key), key
 
 
 @pytest.mark.parametrize(
     "key", ["max_tokens", "tokenizer", "author", "authority", "dedup_key", "monkey", "secretary"]
 )
 def test_an_option_key_that_only_holds_a_part_is_not(key: str) -> None:
-    from fluid_build.alerts.routes import _secret_key
+    from fluid_build.alerts.routes import secret_option_key
 
-    assert not _secret_key(key), key
+    assert not secret_option_key(key), key
 
 
 def test_an_alert_route_refuses_the_credential_option_and_keeps_the_harmless_one() -> None:
@@ -415,3 +416,204 @@ def test_validate_reports_the_dot_segment_as_an_error() -> None:
     clean = ValidationResult(True, [], [])
     _check_location_dot_segments(clean, _contract_with_path("wh/x/"))
     assert not clean.errors
+
+
+# ── a maintenance action's options ──────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "key", ["password", "apiKey", "routing_key", "signingKey", "access_token", "Secret"]
+)
+def test_a_maintenance_option_named_like_a_secret_is_refused_whatever_its_value(key: str) -> None:
+    from fluid_build.maintenance.spec import option_problems
+
+    problems = option_problems({key: "plain-value", "mode": "fast"}, "options")
+    assert len(problems) == 1 and key in problems[0] and "named like a secret" in problems[0]
+    assert "plain-value" not in " ".join(problems)
+
+
+def test_a_nested_maintenance_option_named_like_a_secret_is_refused() -> None:
+    from fluid_build.maintenance.spec import option_problems
+
+    problems = option_problems({"outer": [{"password": "x"}]}, "options")
+    assert len(problems) == 1 and "options.outer[0].password" in problems[0]
+
+
+def test_a_harmless_maintenance_option_still_passes() -> None:
+    from fluid_build.maintenance.spec import option_problems
+
+    options = {"max_tokens": 5, "author": "retail", "retain": "30d", "dedup_key": "a"}
+    assert option_problems(options, "options") == []
+
+
+def test_a_contract_with_a_secret_named_action_option_does_not_validate() -> None:
+    from fluid_build.maintenance.spec import read_maintenance
+    from tests.maintenance.conftest import maintained, spark_block
+
+    action = {"name": "erase", "kind": "erase-rows", "options": {"password": TOKEN}}
+    _tables, errors = read_maintenance(maintained(spark_block(actions=[action])))
+    assert any("actions[0].options.password is named like a secret" in e for e in errors)
+    assert TOKEN not in " ".join(errors)
+
+
+# ── the alert routes in plan and apply ──────────────────────────────────
+
+
+def _alerting_contract(routes: list) -> dict:
+    import copy
+
+    from tests.cli.test_apply_build_ids_before_tofu import _CONTRACT
+
+    contract = copy.deepcopy(_CONTRACT)
+    contract["fluidVersion"] = "0.7.7"
+    contract["alerts"] = {"routes": routes}
+    return contract
+
+
+def _gate(contract: dict, command: str = "plan"):
+    from fluid_build.cli._common import CLIError
+    from fluid_build.cli.plan import _gate_contract_for_plan_or_apply
+
+    sink = io.StringIO()
+    log = logging.getLogger(f"test.wave_end_lows.{id(contract)}")
+    log.addHandler(logging.StreamHandler(sink))
+    log.setLevel(logging.DEBUG)
+    try:
+        _gate_contract_for_plan_or_apply(contract, log, command=command)
+    except CLIError as exc:
+        return exc, sink.getvalue()
+    return None, sink.getvalue()
+
+
+@pytest.mark.parametrize("command", ["plan", "apply"])
+def test_a_route_that_names_a_secret_is_refused_by_plan_and_apply(command: str) -> None:
+    route = {"name": "x", "kind": "slack", "options": {"password": PW}}
+    refusal, logged = _gate(_alerting_contract([route]), command)
+    assert refusal is not None
+    assert PW not in logged and PW not in repr(refusal.__dict__)
+
+
+def test_a_clean_route_plans() -> None:
+    refusal, _logged = _gate(_alerting_contract([{"name": "x", "kind": "slack"}]))
+    assert refusal is None
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        {"name": "x", "kind": "email", "to": ["ops:" + PW + "@mail.example.org"]},
+        {"name": "x", "kind": "webhook", "connection": "https://hooks.example.org/" + PW},
+    ],
+)
+def test_the_schema_errors_under_alerts_are_not_logged_with_the_value(route: dict) -> None:
+    refusal, logged = _gate(_alerting_contract([route]))
+    assert refusal is not None
+    assert PW not in logged and PW not in repr(refusal.__dict__)
+
+
+# ── a log argument that is an object ────────────────────────────────────
+
+SIGV4 = (
+    "AWS4-HMAC-SHA256 Credential=AKIA" + "ABCDEFGH23456789"
+    "/20261122/eu-west-1/s3/aws4_request, "
+    "SignedHeaders=host;x-amz-date, Signature=" + "ab12cd34" * 8
+)
+
+
+class _Request:
+    """An object whose own text prints a credential, as a prepared HTTP request does."""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def __repr__(self) -> str:
+        return self._text
+
+    __str__ = __repr__
+
+
+def _record(msg: str, args: Any) -> logging.LogRecord:
+    record = logging.LogRecord("x", logging.DEBUG, "p", 1, msg, None, None)
+    record.args = args
+    return record
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<AWSPreparedRequest url=https://s3.example.test, "
+        f"headers={{'Authorization': b'{SIGV4}'}}>",
+        f"<Request password={PW} method=GET>",
+    ],
+)
+def test_the_filter_masks_an_object_argument_whose_text_holds_a_secret(text: str) -> None:
+    record = _record("Sending http request: %s", (_Request(text),))
+    sr.SecretRedactingFilter().filter(record)
+    shown = record.getMessage()
+    assert PW not in shown and "ab12cd34" not in shown and "ABCDEFGH23456789" not in shown
+    assert shown.startswith("Sending http request: ")
+
+
+def test_the_filter_masks_a_named_object_argument() -> None:
+    record = _record("sent %(req)s", {"req": _Request(f"<Request password={PW}>")})
+    sr.SecretRedactingFilter().filter(record)
+    assert PW not in record.getMessage()
+
+
+def test_the_filter_leaves_an_object_with_nothing_to_mask_and_numbers_alone() -> None:
+    request = _Request("<Request method=GET url=https://s3.example.test/key>")
+    record = _record("%s took %d ms (%.1f)", (request, 12, 0.5))
+    sr.SecretRedactingFilter().filter(record)
+    assert record.args == (request, 12, 0.5)
+    assert record.getMessage() == (
+        "<Request method=GET url=https://s3.example.test/key> took 12 ms (0.5)"
+    )
+
+
+def test_the_snowflake_layer_masks_an_object_value_whose_text_holds_a_secret() -> None:
+    request = _Request(f"<AWSPreparedRequest headers={{'Authorization': b'{SIGV4}'}}>")
+    for redacted in (redact_dict({"request": request}), redact_dict({"r": [request]})["r"][0]):
+        assert "ab12cd34" not in str(redacted) and "ABCDEFGH23456789" not in str(redacted)
+    untouched = _Request("<Request method=GET>")
+    assert redact_dict({"request": untouched})["request"] is untouched
+
+
+def test_a_sigv4_authorization_value_is_masked_by_both_layers() -> None:
+    line = f"Authorization: {SIGV4}"
+    for out in (redact_secret_text(line), redact_string(line)):
+        assert "ab12cd34" not in out and "ABCDEFGH23456789" not in out
+
+
+# ── the camelCase key names and the chat webhooks ───────────────────────
+
+
+@pytest.mark.parametrize("key", ["routingKey", "integrationKey", "genieKey", "GenieKey"])
+def test_the_camel_case_alert_key_names_are_masked_by_both_layers(key: str) -> None:
+    payload = {key: TOKEN, "summary": "kept"}
+    for redacted in (redact_value(payload), redact_dict(payload)):
+        assert TOKEN not in str(redacted) and redacted["summary"] == "kept", key
+    for out in (redact_secret_text(f"{key}={TOKEN}"), redact_string(f"{key}={TOKEN}")):
+        assert TOKEN not in out
+
+
+WEBHOOKS = {
+    "teams workflows": "https://contoso.webhook.office.com/webhookb2/"
+    f"{TOKEN}@{TOKEN}/IncomingWebhook/{TOKEN}",
+    "teams connector": f"https://outlook.office.com/webhook/{TOKEN}@{TOKEN}/IncomingWebhook/{TOKEN}",
+    "discord": "https://discord.com/api/webhooks/123456789012345678/" + "AbCd_" * 12,
+    "discord app": "https://discordapp.com/api/v10/webhooks/123456789012345678/" + "AbCd_" * 12,
+}
+
+
+@pytest.mark.parametrize("name", sorted(WEBHOOKS))
+def test_a_chat_webhook_url_is_masked_by_both_layers(name: str) -> None:
+    url = WEBHOOKS[name]
+    line = f"posting to {url} (end)"
+    secret = url.rsplit("/", 1)[-1]
+    for out in (redact_secret_text(line), redact_string(line)):
+        assert secret not in out and out.endswith("(end)"), name
+
+
+def test_an_ordinary_office_or_discord_url_stays() -> None:
+    line = "see https://learn.microsoft.com/office and https://discord.com/channels/1/2"
+    assert redact_secret_text(line) == line and redact_string(line) == line

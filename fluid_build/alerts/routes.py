@@ -203,7 +203,7 @@ def _option_problems(value: Any, where: str, depth: int = 0) -> List[str]:
             if not isinstance(key, str) or not _OPTION_KEY.match(key):
                 out.append(f"{where} has a key that is not a plain name {NOT_SHOWN}")
                 continue
-            if _secret_key(key):
+            if secret_option_key(key):
                 out.append(
                     f"{where}.{key} is named like a secret; a kind's secret belongs in the "
                     f"Airflow connection the route names, never in the DAG {NOT_SHOWN}"
@@ -227,7 +227,7 @@ _SECRET_WORDS = frozenset(
 _SECRET_ENDINGS = ("secret", "token", "password", "passwd", "passphrase", "apikey", "credential")
 
 
-def _secret_key(key: str) -> bool:
+def secret_option_key(key: str) -> bool:
     """Whether an option key names a credential, as the redactor reads key names, but by whole
     words: its parts (``api_key``, ``password``, ``routing_key``, ``token``, ``signingKey``, ...)
     in any case and spelling (``apiKey``, ``routing-key``), and the names that are a credential's
@@ -707,4 +707,5 @@ __all__ = [
     "plugin_alert_findings",
     "read_alert_plan",
     "requirements",
+    "secret_option_key",
 ]
