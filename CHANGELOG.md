@@ -83,6 +83,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose `table` is `a`, though the spread can replace it when the code runs: that key is now
   unknown, so what it names is reported as not read instead of taken as `a`. A key written after
   the spread (`{**unknown, "table": "a"}`) is still read.
+- **The 0.7.7 preview schema takes Airflow's own DAG ids and task ids.** `airflowOrchestration.dagId`
+  and `airflowTask.taskId` took lowercase only, so a DAG called `Sales_Daily_V2` could not be
+  written down as Airflow spells it. They now follow Airflow's rule for these ids (ASCII letters of
+  either case, digits, underscore, dot and dash, at most 250 characters), so every id the lowercase
+  rule took is still taken, and `fluid validate` refuses an empty id, a space, a slash and an id
+  over 250 characters. The pattern is an explicit ASCII class rather than `\w`, so every JSON Schema
+  validator gives the same answer. 0.7.6 and the older released schemas are unchanged: a contract
+  written for them keeps lowercase ids.
 
 ### Fixed
 
