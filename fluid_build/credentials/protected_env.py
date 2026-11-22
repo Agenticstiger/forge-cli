@@ -216,6 +216,10 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         # (Airflow's own AIRFLOW_CTX_* names are protected by prefix)
         "FLUID_SCHEDULER_JOB",
         "FLUID_SCHEDULER_RUN_ID",
+        # marks a change-request build (util/change_request.py): the pipeline says which
+        # build it runs, never the checkout (fluid ship and generate artifacts, which read
+        # it, load no project .env anyway)
+        "FLUID_CHANGE_REQUEST",
         "FLUID_STORE_BACKEND",
         "FLUID_STORE_DSN",
         "FLUID_STORE_PATH",
@@ -701,9 +705,6 @@ _FLUID_PROTECTED_FRAGMENTS: Tuple[str, ...] = (
 #: feature and tuning switches.
 DOTENV_LOADABLE: FrozenSet[str] = frozenset(
     {
-        # marks a change-request build (util/change_request.py); it can only make a run
-        # refuse or leave out code a contract names, never allow it, so a project may set it
-        "FLUID_CHANGE_REQUEST",
         # credentials
         "FLUID_API_KEY",
         "FLUID_BEARER_TOKEN",

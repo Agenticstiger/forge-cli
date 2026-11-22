@@ -110,3 +110,12 @@ def test_every_variable_read_is_listed() -> None:
     requests too."""
     assert CHANGE_REQUEST_ENV in CHANGE_REQUEST_VARIABLES
     assert {"CHANGE_ID", "GITHUB_EVENT_NAME", "CI_PULL_REQUEST"} <= set(CHANGE_REQUEST_VARIABLES)
+
+
+def test_a_checkout_never_sets_the_pipelines_own_variable() -> None:
+    """The pipeline says which build it runs, never a project ``.env`` (and the two
+    commands that read it load none)."""
+    from fluid_build.credentials.protected_env import DOTENV_LOADABLE, is_protected_env_key
+
+    assert is_protected_env_key(CHANGE_REQUEST_ENV)
+    assert CHANGE_REQUEST_ENV not in DOTENV_LOADABLE
