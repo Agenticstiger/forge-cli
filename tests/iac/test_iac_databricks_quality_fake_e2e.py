@@ -20,6 +20,7 @@ HONESTLY_TESTED.md).
 from __future__ import annotations
 
 import copy
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterator
@@ -179,11 +180,11 @@ def test_a_destroy_deletes_the_monitor_before_its_schema(workspace, fake, capfd)
     sid = fake.schemas["main.sales"]["schema_id"]
     fake.requests.clear()
 
-    result = runner.tofu_destroy(str(workdir))
+    result = runner.tofu_destroy(str(workdir), env=dict(os.environ))
     if not result.ok and _TRANSPORT.search(result.stdout + result.stderr):
         # The stand-in closes every connection (HTTP/1.0); under load the provider can
         # write to one it closed. State keeps what went, so the order holds across runs.
-        result = runner.tofu_destroy(str(workdir))
+        result = runner.tofu_destroy(str(workdir), env=dict(os.environ))
     assert result.ok, result.stderr or result.stdout
     deletes = [path for method, path in fake.requests if method == "DELETE"]
     monitor = deletes.index(f"/api/data-quality/v1/monitors/schema/{sid}")

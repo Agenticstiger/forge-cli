@@ -302,6 +302,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generators write goes through the table, and that every entry is one line
   `scripts/check_pinned_actions.py` can read.
 
+- **`tofu` never runs with this process's whole environment.** The `tofu --version` probe that
+  runs before every cloud apply and `fluid diff` handed tofu every variable this process holds.
+  It now gets `PATH`, `HOME`, what a Go binary needs on Windows, and the `TOFU_CLI_PATH` and
+  `GITHUB_OUTPUT` that setup-opentofu's wrapper needs in GitHub Actions. Every other tofu run
+  already got the `build_tofu_env()` allowlist. `env` is now a required keyword of the OpenTofu
+  runner and each of its `tofu_*` helpers, and `env=None`, which inherited everything, is
+  refused. A test checks that every call in `fluid_build/` passes it.
+
 ## [0.36.0] — 2026-11-19
 
 ### Added

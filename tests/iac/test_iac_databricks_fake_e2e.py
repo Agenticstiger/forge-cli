@@ -42,6 +42,7 @@ provider cache or a filesystem mirror for ``databricks/databricks``.
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 from typing import Iterator, List
 
@@ -448,7 +449,7 @@ def test_a_dry_run_leaves_the_state_as_it_found_it(workspace, fake, capfd):
 def _tables_in_state(workspace: Path) -> List[str]:
     workdirs = list((workspace / ".fluid" / "iac" / "databricks").iterdir())
     assert len(workdirs) == 1, workdirs
-    listed = runner.tofu_state_list(str(workdirs[0]))
+    listed = runner.tofu_state_list(str(workdirs[0]), env=dict(os.environ))
     return [address for address in listed if address.startswith("databricks_sql_table.")]
 
 
