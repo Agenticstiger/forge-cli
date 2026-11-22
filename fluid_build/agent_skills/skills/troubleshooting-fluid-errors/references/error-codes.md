@@ -107,7 +107,7 @@ Docs pages are relative to https://agenticstiger.github.io/forge_docs/
 | `ERR_SCHEDULE_SYNC_DAGS_DIR_MISSING` | Pass --dags-dir pointing at your Airflow DAGs directory. | advanced/production-troubleshooting.html |
 | `ERR_SCHEDULE_SYNC_DAGS_DIR_NOT_DIRECTORY` | The --dags-dir value must be an existing directory. Create it (mkdir -p) or point --dags-dir at your Airflow dags/ folder. | advanced/production-troubleshooting.html |
 | `ERR_SCHEDULE_SYNC_UNHANDLED_SCHEME` | Use a supported destination scheme (file / scp / git+ssh) for --to. | advanced/production-troubleshooting.html |
-| `ERR_SCHEDULE_SYNC_AIRFLOW_FLAGS` | Add --airflow-url <Airflow API server URL> to run the Airflow check, or drop the --airflow-* / --check-only flags. --airflow-bundle and --airflow-bundle-version need Airflow 3 (Dag bundles). | advanced/production-troubleshooting.html |
+| `ERR_SCHEDULE_SYNC_AIRFLOW_FLAGS` | Add --airflow-url <Airflow API server URL> to run the Airflow check, or drop the --airflow-* / --check-only flags. --airflow-bundle and --airflow-bundle-version need Airflow 3 (DAG bundles). | advanced/production-troubleshooting.html |
 | `ERR_SCHEDULE_SYNC_AIRFLOW_UNSUPPORTED_SCHEDULER` | Run the Airflow check with --scheduler airflow, astronomer or composer. | advanced/production-troubleshooting.html |
 | `ERR_SCHEDULE_SYNC_AIRFLOW_NO_DAG_FILES` | Point --dags-dir at the DAG files fluid generate schedule wrote. | advanced/production-troubleshooting.html |
 | `ERR_SCHEDULE_SYNC_AIRFLOW_BAD_URL` | Pass --airflow-url as https://<host>[/<prefix>], with no user name, password, query or fragment. | advanced/production-troubleshooting.html |
@@ -118,7 +118,7 @@ Docs pages are relative to https://agenticstiger.github.io/forge_docs/
 | `ERR_SCHEDULE_SYNC_AIRFLOW_API_MISMATCH` | Leave --airflow-api at auto, or pass v2 for Airflow 3 and v1 for Airflow 2. | advanced/production-troubleshooting.html |
 | `ERR_SCHEDULE_SYNC_AIRFLOW_UNSUPPORTED_VERSION` | Check that --airflow-url is an Airflow 2.x or 3.x API server. | advanced/production-troubleshooting.html |
 | `ERR_SCHEDULE_SYNC_AIRFLOW_AUTH_FAILED` | Check the secret behind FLUID_AIRFLOW_CREDENTIAL_REF or FLUID_AIRFLOW_TOKEN_REF. Airflow 2 takes a password only with airflow.api.auth.backend.basic_auth in [api] auth_backends; Airflow 3 issues a token from POST /auth/token. | advanced/production-troubleshooting.html |
-| `ERR_SCHEDULE_SYNC_AIRFLOW_FORBIDDEN` | Give the Airflow user or token read access to Dags and import errors (Viewer). | advanced/production-troubleshooting.html |
+| `ERR_SCHEDULE_SYNC_AIRFLOW_FORBIDDEN` | Give the Airflow user or token read access to DAGs and import errors (Viewer). | advanced/production-troubleshooting.html |
 | `ERR_SCHEDULE_SYNC_AIRFLOW_REDIRECT` | Pass the URL the redirect points at as --airflow-url; a sign-in page means a proxy sits in front of Airflow. | advanced/production-troubleshooting.html |
 | `ERR_SCHEDULE_SYNC_AIRFLOW_BAD_RESPONSE` | Check that --airflow-url points at Airflow's API server, not another service. | advanced/production-troubleshooting.html |
 | `ERR_SCHEDULE_SYNC_AIRFLOW_IMPORT_ERRORS` | Fix the import error the report names, then re-run fluid schedule-sync. Parse the DAG locally against the same Airflow major before pushing. | advanced/production-troubleshooting.html |

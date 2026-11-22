@@ -449,3 +449,11 @@ def test_the_credential_variables_are_operator_only():
 
     for name in (TOKEN_REF_ENV, CREDENTIAL_REF_ENV, "FLUID_AIRFLOW_ALLOW_INSECURE_HTTP"):
         assert is_protected_env_key(name), name
+
+
+def test_a_dry_run_does_not_say_the_check_passed(dags_dir: Path, capsys):
+    with FakeAirflow(3) as fake:
+        rc, out = _main(_base(dags_dir, fake, "--check-only", "--dry-run"), capsys)
+        assert fake.requests == []
+    assert rc == 0
+    assert "check passed" not in out and "not run" in out

@@ -91,6 +91,8 @@ class FakeAirflow:
     #: ``False`` plays a token without ``IMPORT_ERRORS_ALL`` on Airflow 3: an import
     #: error of a file that has no registered Dag is left out of ``/importErrors``.
     sees_unregistered_errors: bool = True
+    #: ``True`` plays a token that may read DAGs but no import error at all.
+    hide_errors: bool = False
     #: Paths (prefix match) answered 403.
     forbidden: Tuple[str, ...] = ()
     dags_folder: str = "/opt/airflow/dags"
@@ -355,7 +357,9 @@ class FakeAirflow:
                 )
             return 200, self._v2_dag(dag), "application/json"
         if path == "/api/v2/dags":
-            items = [self._v2_dag(d) for d in self.dags.values()]
+            # exclude_stale defaults to true: a DAG whose file failed to parse drops out.
+            keep_stale = (request.query.get("exclude_stale") or ["true"])[0].lower() == "false"
+            items = [self._v2_dag(d) for d in self.dags.values() if keep_stale or not d.stale]
             return 200, self._page(request, items, "dags"), "application/json"
         if path == "/api/v2/importErrors":
             registered = {(d.bundle, d.rel) for d in self.dags.values()}
@@ -369,7 +373,7 @@ class FakeAirflow:
                     "stack_trace": e.stack,
                 }
                 for key, e in self.errors.items()
-                if self.sees_unregistered_errors or key in registered
+                if not self.hide_errors and (self.sees_unregistered_errors or key in registered)
             ]
             return 200, self._page(request, items, "import_errors"), "application/json"
         if path == "/api/v2/dagBundles" and self.bundles_endpoint:

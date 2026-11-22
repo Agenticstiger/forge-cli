@@ -290,7 +290,6 @@ def _dag_and_error(major: int) -> Dict[str, Any]:
             "dag": client.dag("sales__dev__orders"),
             "missing": client.dag("nope__missing"),
             "errors": client.import_errors(),
-            "now": client.server_now(),
             "fake_now": fake.now,
         }
 
@@ -306,7 +305,6 @@ def test_dag_state_and_import_errors_read_the_same_on_both_majors(major: int):
     (error,) = got["errors"]
     assert error.path_matches("sales__dev/broken.py") and error.timestamp == got["fake_now"]
     assert error.stack_trace.endswith("ModuleNotFoundError: nope")
-    assert got["now"] == got["fake_now"].replace(microsecond=0)
     if major == 3:
         assert (dag.bundle_name, dag.bundle_version, error.bundle_name) == (
             "dags-folder",
@@ -381,5 +379,47 @@ def test_an_unreadable_timestamp_is_none(text):
     assert af.parse_timestamp(text) is None
 
 
-def test_server_now_is_none_before_any_response():
-    assert AirflowApi("http://127.0.0.1:9", Credentials.none()).server_now() is None
+# ── what the scan of the first version turned up ────────────────────────
+
+
+@pytest.mark.parametrize("body", ["[" * 200000, '{"a":' * 100000], ids=["list", "object"])
+@pytest.mark.parametrize("major", [2, 3])
+def test_a_deeply_nested_body_is_a_bad_response_not_a_crash(major: int, body: str):
+    with FakeAirflow(major) as fake:
+        client = _connect(fake, Credentials.from_password("admin", "admin"))
+        fake.answer_next = [(200, {"Content-Type": "application/json"}, body)]
+        _raises(client.import_errors, "schedule_sync_airflow_bad_response")
+        fake.answer_next = [(404, {"Content-Type": "application/json"}, body)]
+        _raises(client.import_errors, "schedule_sync_airflow_bad_response")
+
+
+@pytest.mark.parametrize(
+    "raw", ["https://airflow..example.org", "https://.example.org", "https://a" + "a" * 70 + ".org"]
+)
+def test_a_host_name_dns_cannot_hold_is_a_bad_url(raw: str):
+    _raises(lambda: af.normalize_url(raw, environ={}), "schedule_sync_airflow_bad_url")
+
+
+def test_a_host_name_idna_refuses_at_request_time_is_a_bad_url():
+    client = AirflowApi("https://xn--.example.org", Credentials.none(), sleep=lambda s: None)
+    _raises(lambda: client.connect("auto"), "schedule_sync_airflow_bad_url")
+
+
+@pytest.mark.parametrize(
+    "text", ["0001-01-01T00:00:00+05:00", "9999-12-31T23:59:59-05:00", "0001-01-01T00:00:00Z"]
+)
+def test_a_timestamp_out_of_range_is_none_not_a_crash(text: str):
+    stamp = af.parse_timestamp(text)
+    assert stamp is None or stamp.year in (1, 9999)
+
+
+def test_the_basic_header_form_of_the_password_is_redacted(monkeypatch: pytest.MonkeyPatch):
+    import base64
+
+    from fluid_build.observability.secret_redactor import redact_secret_text
+
+    monkeypatch.setenv("AF_PASS", "deploy:s3cret-pw-77")
+    af.credentials_from_env({af.CREDENTIAL_REF_ENV: "env://AF_PASS"})
+    encoded = base64.b64encode(b"deploy:s3cret-pw-77").decode()
+    assert encoded not in redact_secret_text(f"echo: Authorization: Basic {encoded}")
+    assert encoded not in redact_secret_text(f"{encoded}")

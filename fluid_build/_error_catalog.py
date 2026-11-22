@@ -767,7 +767,7 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         [
             "Add --airflow-url <Airflow API server URL> to run the Airflow check, or drop the "
             "--airflow-* / --check-only flags",
-            "--airflow-bundle and --airflow-bundle-version need Airflow 3 (Dag bundles)",
+            "--airflow-bundle and --airflow-bundle-version need Airflow 3 (DAG bundles)",
         ],
         None,
     ),
@@ -833,7 +833,7 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         None,
     ),
     "schedule_sync_airflow_forbidden": (
-        ["Give the Airflow user or token read access to Dags and import errors (Viewer)"],
+        ["Give the Airflow user or token read access to DAGs and import errors (Viewer)"],
         None,
     ),
     "schedule_sync_airflow_redirect": (

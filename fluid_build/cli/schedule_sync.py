@@ -70,7 +70,7 @@ CLI surface::
                         [--airflow-url <url>]                # then wait until Airflow parsed them
                         [--airflow-api {auto|v1|v2}]         # REST dialect, default auto-detect
                         [--airflow-wait <seconds>]           # default 600, cap 3600
-                        [--airflow-bundle <name>]            # Airflow 3 Dag bundle
+                        [--airflow-bundle <name>]            # Airflow 3 DAG bundle
                         [--airflow-bundle-version <version>] # default: the commit a git+ssh push made
                         [--check-only]                       # check, push nothing
 
@@ -78,7 +78,7 @@ The Airflow check (``--airflow-url``, ``cli/_schedule_sync_airflow.py``) works o
 2 (``/api/v1``, HTTP Basic or a bearer token) and Airflow 3 (``/api/v2``, a JWT from
 ``/auth/token`` or a bearer token). It runs a preflight before the push (version,
 sign-in, one read), so a check that cannot run pushes nothing, then waits until each
-pushed file is parsed with no import error: on an Airflow 3 Git bundle, its Dags at the
+pushed file is parsed with no import error: on an Airflow 3 Git bundle, its DAGs at the
 pushed commit; otherwise two parses after the sync. Exit 1 when a file fails to import
 or is not parsed in time; the report's ``airflow_check`` block names each file.
 """
@@ -199,7 +199,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "  fluid schedule-sync --scheduler dagster --dags-dir dist/artifacts/schedule/ \\\n"
             "                      --workspace prod-deployment\n\n"
             "  # Push, then wait until Airflow (2 or 3, detected) has parsed the files; on an\n"
-            "  # Airflow 3 Git Dag bundle, until their Dags are at the pushed commit\n"
+            "  # Airflow 3 Git DAG bundle, until their DAGs are at the pushed commit\n"
             "  fluid schedule-sync --scheduler airflow --dags-dir dags/ "
             "--airflow-url https://airflow.example.org \\\n"
             "                      --destination git+ssh://git@git.example.org/data/dags.git\n\n"
@@ -376,14 +376,14 @@ def _add_airflow_check_flags(p: argparse.ArgumentParser) -> None:
         "--airflow-api",
         choices=list(_AIRFLOW_API_CHOICES),
         default="auto",
-        help="REST dialect: v2 (Airflow 3), v1 (Airflow 2), or auto (detect; default).",
+        help="REST dialect: v2 (Airflow 3), v1 (Airflow 2), or auto to detect it.",
     )
     check.add_argument(
         "--airflow-wait",
         type=int,
         default=_DEFAULT_AIRFLOW_WAIT,
         help=(
-            f"Seconds to wait for the parse (default {_DEFAULT_AIRFLOW_WAIT}, cap 3600). "
+            "Seconds to wait for the parse (at most 3600). "
             "Airflow lists new files every dag_dir_list_interval (Airflow 2) or "
             "refresh_interval (Airflow 3), 300 s by default."
         ),
@@ -391,14 +391,15 @@ def _add_airflow_check_flags(p: argparse.ArgumentParser) -> None:
     check.add_argument(
         "--airflow-bundle",
         default=None,
-        help="Airflow 3 Dag bundle the files belong to: Dags and import errors of other bundles are ignored.",
+        help="Airflow 3 DAG bundle the files belong to: DAGs and import errors of other bundles are ignored.",
     )
     check.add_argument(
         "--airflow-bundle-version",
         default=None,
         help=(
-            "Wait until the pushed Dags report this bundle version (Airflow 3, a versioned "
-            "bundle). Default: the commit a git+ssh push made, where the bundle is versioned."
+            "Wait until the pushed DAGs report this bundle version (Airflow 3, a versioned "
+            "bundle; a commit may be abbreviated to 7 or more hex digits). Default: the "
+            "commit a git+ssh push made, where the bundle is versioned."
         ),
     )
     check.add_argument(
@@ -1075,7 +1076,7 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
             ]
         commit_argv = [git, *commit_author_argv, "commit", "-m", commit_message]
         # The Airflow check waits for the commit the push leaves the branch at (an
-        # Airflow 3 Git bundle reports it as each Dag's bundle_version).
+        # Airflow 3 Git bundle reports it as each DAG's bundle_version).
         head_argvs = [[git, "rev-parse", "HEAD"]] if getattr(args, "airflow_url", None) else []
         rsync_argvs = [
             [
@@ -1817,7 +1818,14 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
         cprint(f"[schedule-sync] report → {report_path}", markup=False)
 
     cprint(
-        _outcome_line(args.scheduler, len(results), overall_exit, airflow_report, check_only),
+        _outcome_line(
+            args.scheduler,
+            len(results),
+            overall_exit,
+            airflow_report,
+            check_only,
+            planned=airflow_check is not None and args.dry_run,
+        ),
         markup=False,
     )
     return overall_exit
@@ -1839,9 +1847,14 @@ def _outcome_line(
     overall_exit: int,
     airflow_report: Optional[Dict[str, Any]],
     check_only: bool,
+    *,
+    planned: bool = False,
 ) -> str:
     """The stage's last line: the push, and the Airflow check when one ran."""
     result = (airflow_report or {}).get("result")
+    if overall_exit == 0 and planned:
+        what = "nothing pushed" if check_only else f"{scheduler} sync planned"
+        return f"[schedule-sync] ✔ dry run: {what}; the Airflow check was not run"
     if overall_exit == 0 and check_only:
         return "[schedule-sync] ✔ Airflow check passed"
     if overall_exit == 0:

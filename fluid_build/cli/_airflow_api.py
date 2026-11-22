@@ -47,7 +47,7 @@ only when ``--airflow-url`` is set.
 
 from __future__ import annotations
 
-import email.utils
+import base64
 import ipaddress
 import os
 import re
@@ -70,7 +70,7 @@ _PAGE = 100
 #: 10,000 rows: far past any DAG folder, short of an unbounded read.
 _MAX_PAGES = 100
 _DETAIL_CHARS = 200
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _TRUE = {"1", "true", "yes", "on"}
 _TIMESTAMP = re.compile(
     r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|z|[+-]\d{2}:?\d{2})?"
@@ -163,6 +163,8 @@ def credentials_from_env(environ: Optional[Mapping[str, str]] = None) -> Credent
                 "value is not shown).",
             )
         _register(password)
+        # The form an HTTP Basic header carries, in case a proxy echoes request headers.
+        _register(base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii"))
         return Credentials.from_password(username, password)
     return Credentials.none()
 
@@ -229,6 +231,12 @@ def normalize_url(raw: str, environ: Optional[Mapping[str, str]] = None) -> str:
             f"{parts.scheme or 'none'!r}, {'a' if host else 'no'} host).",
             fix,
         )
+    if not _host_ok(host):
+        raise AirflowApiError(
+            _E_URL,
+            "--airflow-url has a host name DNS cannot hold (an empty or overlong label).",
+            fix,
+        )
     if "@" in parts.netloc:
         raise AirflowApiError(
             _E_URL,
@@ -251,6 +259,23 @@ def normalize_url(raw: str, environ: Optional[Mapping[str, str]] = None) -> str:
                 "for a network where plain HTTP is intended.",
             )
     return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
+
+
+def _host_ok(host: str) -> bool:
+    """A host name made of labels of 1-63 characters that IDNA can encode, or an IP."""
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    labels = host[:-1].split(".") if host.endswith(".") else host.split(".")
+    if len(host) > 253 or any(not label or len(label) > 63 for label in labels):
+        return False
+    try:
+        host.encode("idna")
+    except UnicodeError:
+        return False
+    return True
 
 
 def _loopback(host: str) -> bool:
@@ -296,10 +321,9 @@ def parse_timestamp(value: Any) -> Optional[datetime]:
     elif ":" not in zone:
         zone = f"{zone[:3]}:{zone[3:]}"
     try:
-        stamp = datetime.fromisoformat(f"{day}T{clock}.{micros}{zone}")
-    except ValueError:
+        return datetime.fromisoformat(f"{day}T{clock}.{micros}{zone}").astimezone(timezone.utc)
+    except (ValueError, OverflowError):  # a day out of range, or a year 1/9999 offset
         return None
-    return stamp.astimezone(timezone.utc)
 
 
 def _path_matches(name: str, rel: str) -> bool:
@@ -314,7 +338,7 @@ def _text(value: Any) -> Optional[str]:
 
 @dataclass(frozen=True)
 class DagState:
-    """A Dag as Airflow reports it, on either major."""
+    """A DAG as Airflow reports it, on either major."""
 
     dag_id: str
     active: bool
@@ -370,7 +394,7 @@ class ImportErrorRecord:
 
 @dataclass(frozen=True)
 class BundleState:
-    """An Airflow 3 Dag bundle (``/api/v2/dagBundles``, served from 3.4, not by 3.0)."""
+    """An Airflow 3 DAG bundle (``/api/v2/dagBundles``, served from 3.4, not by 3.0)."""
 
     name: str
     version: Optional[str]
@@ -403,7 +427,6 @@ class AirflowApi:
         self.version = ""
         self.major = 0
         self._token = credentials.token if credentials.style == "token" else ""
-        self._date: Optional[datetime] = None
         self._bundles_served: Optional[bool] = None
         self._probed_version = "2"
 
@@ -485,7 +508,7 @@ class AirflowApi:
             return False
         try:
             doc = resp.json()
-        except ValueError:
+        except (ValueError, RecursionError):
             return False
         version = doc.get("version") if isinstance(doc, dict) else None
         if isinstance(version, str):
@@ -545,18 +568,14 @@ class AirflowApi:
 
     # ── reading ──
 
-    def server_now(self) -> Optional[datetime]:
-        """The server's clock, from the ``Date`` header of the latest answer (1 s resolution)."""
-        return self._date
-
     def dag(self, dag_id: str) -> Optional[DagState]:
-        """The Dag ``dag_id``, or ``None`` while Airflow lists no such Dag."""
+        """The DAG ``dag_id``, or ``None`` while Airflow lists no such DAG."""
         path = f"/api/{self.dialect}/dags/{quote(dag_id, safe='')}"
         doc = self._get_json(path, allow_404=True)
         return None if doc is None else DagState.from_api(doc, self.dialect)
 
     def dags(self) -> List[DagState]:
-        """Every Dag Airflow lists (active ones: its own default filter)."""
+        """Every DAG Airflow lists (active ones: its own default filter)."""
         rows = self._paged(f"/api/{self.dialect}/dags", "dags")
         return [DagState.from_api(row, self.dialect) for row in rows]
 
@@ -566,7 +585,7 @@ class AirflowApi:
         return [ImportErrorRecord.from_api(row, self.dialect) for row in rows]
 
     def bundles(self) -> Optional[List[BundleState]]:
-        """The Dag bundles, or ``None`` where Airflow serves no ``/dagBundles``."""
+        """The DAG bundles, or ``None`` where Airflow serves no ``/dagBundles``."""
         if self.dialect != "v2" or self._bundles_served is False:
             return None
         doc = self._get_json("/api/v2/dagBundles", params={"limit": _PAGE}, allow_404=True)
@@ -639,7 +658,7 @@ class AirflowApi:
                 raise AirflowApiError(
                     _E_FORBIDDEN,
                     f"{what} answered 403 ({_detail(resp)}): the user may not read it.",
-                    "Give the user or token read access to Dags and import errors (the Viewer "
+                    "Give the user or token read access to DAGs and import errors (the Viewer "
                     "role reads both).",
                 )
             raise AirflowApiError(_E_RESPONSE, f"{what} answered {status} ({_detail(resp)}).")
@@ -699,6 +718,13 @@ class AirflowApi:
                 "Check that Airflow's API server is up and reachable from here.",
                 transient=True,
             ) from None
+        except UnicodeError:
+            # httpx encodes the host with IDNA when it sends (``xn--`` labels it refuses).
+            raise AirflowApiError(
+                _E_URL,
+                f"{what} could not be sent: --airflow-url has a host name IDNA refuses.",
+                "Check the host name in --airflow-url.",
+            ) from None
         except httpx.HTTPError as exc:
             raise AirflowApiError(
                 _E_UNREACHABLE,
@@ -706,7 +732,6 @@ class AirflowApi:
                 "Check that Airflow's API server is up and reachable from here.",
                 transient=True,
             ) from None
-        self._remember_date(resp)
         status = resp.status_code
         if 300 <= status < 400:
             raise AirflowApiError(
@@ -725,23 +750,11 @@ class AirflowApi:
             )
         return resp
 
-    def _remember_date(self, resp: Any) -> None:
-        value = resp.headers.get("date")
-        if not value:
-            return
-        try:
-            stamp = email.utils.parsedate_to_datetime(value)
-        except (TypeError, ValueError):
-            return
-        if stamp.tzinfo is None:
-            stamp = stamp.replace(tzinfo=timezone.utc)
-        self._date = stamp.astimezone(timezone.utc)
-
     @staticmethod
     def _json(resp: Any, what: str) -> Dict[str, Any]:
         try:
             doc = resp.json()
-        except ValueError:
+        except (ValueError, RecursionError):  # not JSON, or nested past the parser's depth
             doc = None
         if not isinstance(doc, dict):
             raise AirflowApiError(
@@ -762,7 +775,7 @@ def _detail(resp: Any) -> str:
     """What an error answer says: v2 ``detail``, v1 problem ``title``/``detail``, or text."""
     try:
         doc = resp.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         doc = None
     if isinstance(doc, dict):
         parts = [doc.get("title"), doc.get("detail"), doc.get("error")]

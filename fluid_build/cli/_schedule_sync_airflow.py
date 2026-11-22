@@ -6,7 +6,7 @@
 ``schedule_sync.run`` drives it in four steps:
 
 1. :meth:`AirflowCheck.from_args` checks the ``--airflow-*`` flags and ``--airflow-url``
-   (exit 2 on a bad combination), reads the Dag ids of the files to push, and returns
+   (exit 2 on a bad combination), reads the DAG ids of the files to push, and returns
    ``None`` when ``--airflow-url`` is not set: the stage then behaves as before.
 2. :meth:`AirflowCheck.preflight`, BEFORE anything is pushed: resolve the credential,
    find the Airflow major, sign in and make one authorized read. A failure pushes
@@ -149,7 +149,7 @@ class AirflowCheck:
             _say(f"--airflow-wait {wait_s}s is above the cap; waiting at most {MAX_WAIT}s.")
             wait_s = MAX_WAIT
         if bundle is not None and not _BUNDLE_NAME.fullmatch(bundle):
-            raise _flags("--airflow-bundle must be a Dag bundle name (letters, digits, _ . -).")
+            raise _flags("--airflow-bundle must be a DAG bundle name (letters, digits, _ . -).")
         if bundle_version is not None and not _BUNDLE_VERSION.fullmatch(bundle_version):
             raise _flags("--airflow-bundle-version must be a version with no space (a commit).")
         try:
@@ -202,8 +202,8 @@ class AirflowCheck:
         dynamic = [f.path for f in self.files if f.dynamic]
         _say(
             f"would check {self.base_url} (API {self.api}, auth {auth}) and would wait up to "
-            f"{self.wait_s}s for {len(self.files)} DAG file(s): {', '.join(ids) or 'no Dag id read'}"
-            + (f"; Dag ids read by Airflow only: {', '.join(dynamic)}" if dynamic else "")
+            f"{self.wait_s}s for {len(self.files)} DAG file(s): {', '.join(ids) or 'no DAG id read'}"
+            + (f"; DAG ids read by Airflow only: {', '.join(dynamic)}" if dynamic else "")
         )
 
     # 2 ── before the push ───────────────────────────────────────────────
@@ -224,7 +224,7 @@ class AirflowCheck:
             raise _as_cli_error(exc) from None
         if client.dialect == "v1" and (self.bundle or self.bundle_version):
             raise _flags(
-                f"This is Airflow {client.version}, and Airflow 2 has no Dag bundles: "
+                f"This is Airflow {client.version}, and Airflow 2 has no DAG bundles: "
                 "--airflow-bundle and --airflow-bundle-version need Airflow 3."
             )
         self.client = client
@@ -256,20 +256,23 @@ class AirflowCheck:
             expected = pushed_git_head(results)
         ids = sum(len(f.dag_ids) for f in self.files)
         _say(
-            f"waiting up to {self.wait_s}s for {len(self.files)} DAG file(s), {ids} Dag id(s)"
+            f"waiting up to {self.wait_s}s for {len(self.files)} DAG file(s), {ids} DAG id(s)"
             + (f", at bundle version {expected[:12]}" if expected else "")
         )
-        outcome = chk.wait_for_parse(
-            client,
-            self.files,
-            wait_s=self.wait_s,
-            expected_version=expected,
-            version_explicit=self.bundle_version is not None,
-            bundle=self.bundle,
-            indirect=self.indirect,
-            on_change=self._file_line,
-        )
-        client.close()
+        try:
+            outcome = chk.wait_for_parse(
+                client,
+                self.files,
+                wait_s=self.wait_s,
+                expected_version=expected,
+                version_explicit=self.bundle_version is not None,
+                bundle=self.bundle,
+                indirect=self.indirect,
+                on_change=self._file_line,
+                on_progress=_say,
+            )
+        finally:
+            client.close()
         if outcome.passed:
             _say(f"✔ {outcome.message}")
         else:

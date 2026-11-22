@@ -169,7 +169,7 @@ def test_a_dag_that_never_appears_is_pending(major: int):
     with FakeAirflow(major) as fake:
         result = _run(fake, [idle] * 10, wait_s=40)
     assert not result.passed and _state(result) == ["pending"]
-    assert "no Dag sales__dev__orders" in result.files[0].detail
+    assert "no DAG sales__dev__orders" in result.files[0].detail
     assert result.waited_s >= 40
 
 
@@ -292,11 +292,11 @@ def test_errors_hidden_from_the_token_leave_a_new_file_pending_with_a_hint():
 
 
 def test_a_dag_flagged_with_an_import_error_is_named_when_its_error_is_hidden():
-    with FakeAirflow(3, sees_unregistered_errors=False) as fake:
+    with FakeAirflow(3, hide_errors=True) as fake:
         fake.parse_ok("sales__dev__orders", ORDERS.path)
-        fake.dags["sales__dev__orders"].rel = "elsewhere.py"  # error row no longer joins
-        result = _run(fake, [fail("elsewhere.py")] * 5, wait_s=30)
-    assert "import error" in result.files[0].detail
+        result = _run(fake, [fail(ORDERS.path)] * 5, wait_s=30)
+    assert _state(result) == ["pending"]
+    assert "import error for the file of DAG sales__dev__orders" in result.files[0].detail
 
 
 def test_a_transient_outage_during_the_wait_is_ridden_out():
@@ -492,3 +492,148 @@ def test_a_dynamic_file_is_not_given_the_dags_of_a_same_named_file_elsewhere():
         ]
         result = _run(fake, steps, files=[ORDERS, dyn])
     assert _state(result) == ["clean", "unchecked"] and result.files[1].dag_ids == ()
+
+
+# ── what the scan of the first version turned up ────────────────────────
+
+
+GEN = chk.DagFile(path="factory/gen.py", dag_ids=(), dynamic=True)
+STATIC = chk.DagFile(path="team/s.py", dag_ids=("team__s",))
+
+
+def test_a_dynamic_file_with_a_visible_import_error_holds_the_wait():
+    """Versioned: the static file is clean after one poll; the factory file is broken."""
+    with FakeAirflow(3) as fake:
+        fake.set_bundle("dags-folder", V2)
+        fake.advance(5)
+        fake.parse_ok("team__s", STATIC.path, version=V2)
+        fake.parse_fail(GEN.path)
+        steps = [fail(GEN.path), fail(GEN.path), fail(GEN.path)]
+        result = _run(fake, steps, files=[STATIC, GEN], expected_version=V2, version_explicit=True)
+    assert not result.passed and _state(result) == ["clean", "broken"]
+
+
+def test_a_dynamic_file_whose_dags_go_stale_still_holds_the_wait():
+    """Airflow 3 lists no stale Dag; the factory's Dag drops out when its file breaks."""
+    with FakeAirflow(3) as fake:
+        fake.parse_ok("gen__1", GEN.path)
+        steps = [
+            both(ok("team__s", STATIC.path), fail(GEN.path)),
+            both(ok("team__s", STATIC.path), fail(GEN.path)),
+            both(ok("team__s", STATIC.path), fail(GEN.path)),
+        ]
+        result = _run(fake, steps, files=[STATIC, GEN])
+    assert not result.passed and _state(result) == ["clean", "broken"]
+    assert result.files[1].dag_ids == ("gen__1",)
+
+
+def test_the_fake_lists_no_stale_dag_like_airflow_3():
+    with FakeAirflow(3) as fake:
+        fake.parse_ok("gen__1", GEN.path)
+        fake.parse_fail(GEN.path)
+        client = AirflowApi(
+            fake.url, Credentials.from_password("admin", "admin"), sleep=lambda s: 0
+        )
+        client.connect("auto")
+        assert client.dags() == [] and client.dag("gen__1") is not None
+
+
+@pytest.mark.parametrize("major", [2, 3])
+def test_a_dag_parsed_from_another_file_does_not_count_for_the_pushed_one(major: int):
+    """The same dag_id in a copy left at an old path: Airflow keeps parsing that one."""
+    with FakeAirflow(major) as fake:
+        fake.parse_ok("sales__dev__orders", "old/orders.py")
+        steps = [ok("sales__dev__orders", "old/orders.py")] * 5
+        result = _run(fake, steps, wait_s=40)
+    assert not result.passed and _state(result) == ["pending"]
+    assert "old/orders.py" in result.files[0].detail
+
+
+def test_on_an_indirect_destination_a_fix_that_lands_late_is_not_called_broken():
+    """S3 or Composer: the previous, broken file is parsed twice before the fix lands."""
+    with FakeAirflow(2) as fake:
+        fake.parse_ok("sales__dev__orders", ORDERS.path)
+        fake.parse_fail(ORDERS.path)
+        steps = [
+            fail(ORDERS.path),
+            fail(ORDERS.path),
+            ok("sales__dev__orders", ORDERS.path),
+            ok("sales__dev__orders", ORDERS.path),
+        ]
+        result = _run(fake, steps, indirect=True, wait_s=120)
+    assert result.passed, result.message
+
+
+def test_on_an_indirect_destination_a_file_still_broken_at_the_deadline_fails():
+    with FakeAirflow(2) as fake:
+        result = _run(fake, [fail(ORDERS.path)] * 10, indirect=True, wait_s=60)
+    assert not result.passed and _state(result) == ["broken"]
+    assert result.waited_s >= 60
+
+
+def test_an_abbreviated_commit_matches_the_full_bundle_version():
+    with FakeAirflow(3) as fake:
+        steps = [
+            ok("sales__dev__orders", ORDERS.path, bundle="git-dags", version="abc1234" + "0" * 33)
+        ]
+        result = _run(fake, steps, expected_version="ABC1234", version_explicit=True)
+    assert result.passed and result.files[0].evidence == "bundle-version"
+
+
+def test_a_short_prefix_is_not_a_commit():
+    with FakeAirflow(3) as fake:
+        steps = [
+            ok("sales__dev__orders", ORDERS.path, bundle="git-dags", version="abc1234" + "0" * 33)
+        ] * 3
+        result = _run(fake, steps, expected_version="abc", version_explicit=True, wait_s=20)
+    assert not result.passed
+
+
+def test_a_long_wait_says_what_it_still_waits_for():
+    lines: List[str] = []
+    with FakeAirflow(2) as fake:
+        processor = Processor(fake, [idle] * 20)
+        client = AirflowApi(
+            fake.url, Credentials.from_password("admin", "admin"), sleep=lambda s: 0
+        )
+        client.connect("auto")
+        chk.wait_for_parse(
+            client,
+            [ORDERS],
+            wait_s=150,
+            poll_s=10,
+            sleep=processor.sleep,
+            monotonic=processor.monotonic,
+            on_progress=lines.append,
+        )
+    assert len(lines) == 2 and all(ORDERS.path in line for line in lines)
+    assert "still waiting" in lines[0]
+
+
+def test_server_text_with_a_newline_cannot_forge_a_console_line():
+    with FakeAirflow(3) as fake:
+        steps = [ok("sales__dev__orders", ORDERS.path, bundle="b\n[schedule-sync] airflow: x")] * 3
+        result = _run(fake, steps, bundle="mine", wait_s=20)
+    assert "\n" not in result.files[0].detail and "\n" not in result.message
+
+
+def test_a_dag_id_airflow_would_refuse_is_not_read(tmp_path: Path):
+    _write(tmp_path, "n/bad.py", "from airflow import DAG\nDAG(dag_id='x\\n[schedule-sync] ok')\n")
+    _write(tmp_path, "n/long.py", f"from airflow import DAG\nDAG(dag_id='{'a' * 251}')\n")
+    files = {f.path: f for f in chk.dag_files(tmp_path)}
+    assert files["n/bad.py"].dag_ids == () and files["n/bad.py"].dynamic
+    assert files["n/long.py"].dag_ids == ()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        b"from airflow import DAG\nX = " + b" + ".join([b'"a"'] * 2000) + b"\nDAG('x')\n",
+        b"from airflow import DAG\nX = " + b"a+" * 30000 + b"a\nDAG('x')\n",
+        b"from airflow import DAG\n" + b"lambda: " * 3000 + b"1\n",
+    ],
+)
+def test_a_dag_file_too_deep_to_read_is_dynamic_not_a_crash(tmp_path: Path, source: bytes):
+    (tmp_path / "deep.py").write_bytes(source)
+    (only,) = chk.dag_files(tmp_path)
+    assert only.dynamic
