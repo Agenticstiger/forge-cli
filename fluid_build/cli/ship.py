@@ -1393,14 +1393,37 @@ def _write_reports(
     return str(body["written_at"])
 
 
+def _stage_bootstrap(module: str) -> str:
+    """``python -c`` code that runs ``module`` as ``python -m`` would, without
+    the working directory on ``sys.path``.
+
+    A stage runs in the contract's directory, and ``-m`` puts that directory
+    first, so a module in the checkout (a ``yaml.py``, a ``fluid_build/``)
+    would run inside every stage, before ``main()``, with the operator's
+    environment. ``-c`` puts it first too, as ``''``, so the entry goes before
+    any import: ``sys`` is built in, and ``runpy`` (a file on 3.10) and what it
+    loads (``types``, ``warnings``, ``importlib`` on 3.11 and later) come after.
+    ``-P`` would do the same, but only from Python 3.11.
+    """
+    return (
+        "import sys; sys.path[:1] == [''] and sys.path.pop(0); "
+        f"import runpy; runpy.run_module({module!r}, run_name='__main__', alter_sys=True)"
+    )
+
+
+#: How a stage starts (:func:`_stage_bootstrap` of the CLI).
+_STAGE_BOOTSTRAP = _stage_bootstrap("fluid_build.cli")
+
+
 def _resolve_fluid_bin() -> List[str]:
     """Resolve the ``fluid`` entry-point invocation for subprocesses.
 
-    Prefer ``sys.executable -m fluid_build.cli`` over the bare ``fluid`` shim:
-    an editable install may not have ``fluid`` on PATH, and ``sys.executable``
-    guarantees the same Python (and venv) the runner is in.
+    ``sys.executable`` rather than the bare ``fluid`` shim: an editable install
+    may not have ``fluid`` on PATH, and ``sys.executable`` guarantees the same
+    Python (and venv) the runner is in. :data:`_STAGE_BOOTSTRAP` runs the CLI as
+    ``-m`` would, with the checkout kept off ``sys.path``.
     """
-    return [sys.executable, "-m", "fluid_build.cli"]
+    return [sys.executable, "-c", _STAGE_BOOTSTRAP]
 
 
 def _run_stage(

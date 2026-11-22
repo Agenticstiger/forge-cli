@@ -327,6 +327,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runner and each of its `tofu_*` helpers, and `env=None`, which inherited everything, is
   refused. A test checks that every call in `fluid_build/` passes it.
 
+- **A `fluid ship` stage no longer imports modules from the checkout.** Ship runs each stage as
+  `python -m fluid_build.cli` in the contract's directory, and `-m` puts that directory first on
+  `sys.path`. So a `yaml.py` or a `fluid_build/` in the checkout ran inside every stage, before the
+  CLI started, with the operator's environment. Stages now start through a bootstrap that runs the
+  CLI as `-m` does, without that directory on the path.
+
 ## [0.36.0] — 2026-11-19
 
 ### Added
