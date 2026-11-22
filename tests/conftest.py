@@ -407,6 +407,21 @@ def pytest_runtest_teardown(item, nextitem):
     return result
 
 
+@pytest.fixture(autouse=True)
+def _not_a_change_request_build(monkeypatch):
+    """No CI change-request marker is set (``fluid_build.util.change_request``).
+
+    CI runs this suite on pull requests too, where GitHub sets
+    ``GITHUB_EVENT_NAME=pull_request``; ``fluid ship`` and ``fluid generate
+    artifacts`` treat such a build differently, so every test starts from a
+    default-branch build and one that needs a change request sets it.
+    """
+    from fluid_build.util.change_request import CHANGE_REQUEST_VARIABLES
+
+    for name in CHANGE_REQUEST_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def no_llm_key_variables(monkeypatch):
     """No provider key variable or LLM selector is set.

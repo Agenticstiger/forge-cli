@@ -599,6 +599,14 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         None,
     ),
+    "custom_scaffold_change_request": (
+        [
+            "Leave custom-scaffold out of --emit on pull and merge request builds: fluid ship "
+            "does that by itself",
+            "Pass --allow-scaffold-on-change-request only when the build's changes are trusted",
+        ],
+        None,
+    ),
     "custom_scaffold_engine_broken": (
         [
             "The engine is installed but one of its own dependencies is missing or broken: "
