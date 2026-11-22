@@ -627,7 +627,7 @@ def register(subparsers: argparse._SubParsersAction):
         default=None,  # resolved by parse_mode; None = amend
         help=(
             "dry-run | create-only | amend (default) | amend-and-build | replace | "
-            "replace-and-build | reconcile (deploys nothing). See docs/apply.md."
+            "replace-and-build | reconcile | maintain (both deploy nothing). See docs/apply.md."
         ),
     )
     mode_group.add_argument(
@@ -821,12 +821,14 @@ def register(subparsers: argparse._SubParsersAction):
         "--build-id",
         dest="build_id",
         help=(
-            "Filter build execution to a specific build job by ID "
-            "(from the contract's ``builds[]``). Combine with "
-            "``--mode amend-and-build`` (additive) or "
-            "``--mode replace-and-build`` (destructive). When unset "
-            "and the mode requires builds, every build runs."
+            "The builds[] id to run (--mode amend-and-build, replace-and-build) or keep "
+            "running (--mode reconcile). Unset, a build mode runs every build."
         ),
+    )
+    build_group.add_argument(
+        "--expose-id",
+        dest="expose_id",
+        help="With --mode maintain: the Iceberg expose whose iceberg.maintenance runs.",
     )
     build_group.add_argument(
         "--delay",
@@ -1450,9 +1452,85 @@ def _run_reconcile_mode(
     )
 
 
+def _check_expose_id_mode(expose_id: Optional[str], resolved_mode) -> None:
+    """``--expose-id`` names the table ``--mode maintain`` maintains; any other mode has no
+    use for it, and taking it silently would run something the operator did not ask for."""
+    from fluid_build.forge.core.apply_modes import is_maintain
+
+    if isinstance(expose_id, str) and expose_id and not is_maintain(resolved_mode):
+        raise CLIError(
+            1,
+            "apply_expose_id_requires_maintain_mode",
+            {
+                "expose_id": expose_id,
+                "mode": resolved_mode.value,
+                "hint": (
+                    "--expose-id names the Iceberg table --mode maintain maintains. Pass "
+                    "--mode maintain, or drop --expose-id."
+                ),
+            },
+        )
+
+
+def _run_maintain_mode(
+    args: argparse.Namespace,
+    logger: logging.Logger,
+    *,
+    start_time: float,
+    expose_id: Optional[str],
+    dry_run: bool,
+) -> int:
+    """``fluid apply --mode maintain``: run an Iceberg table's maintenance (backend spark) once,
+    with the job config the last apply deployed (``cli/_spark_apply.py::maintain_only``).
+
+    Like ``--mode reconcile`` it runs no ``tofu``, no DDL and no build, and takes no plan: a
+    ``plan.json`` is refused, and the contract goes through the same schema gate and apply-time
+    hooks as any apply before a run is started.
+
+    Raises:
+        CLIError: ``apply_maintain_needs_contract``, or a gate's error.
+    """
+    if str(args.contract or "").endswith(".json"):
+        raise CLIError(
+            1,
+            "apply_maintain_needs_contract",
+            {
+                "path": str(args.contract),
+                "hint": (
+                    "--mode maintain applies no plan: it reads the contract and the job config "
+                    "the last fluid apply deployed. Pass the contract (contract.fluid.yaml)."
+                ),
+            },
+        )
+    try:
+        contract = _load_apply_source(args, None, logger)
+        _gate_contract_for_apply(contract, logger)
+    except CLIError as exc:
+        _log_apply_failure(logger, start_time, exc)
+        raise
+    hook_rc = _run_apply_hooks_for_source(args, contract, logger)
+    if hook_rc:
+        return hook_rc
+    from fluid_build.cli import _spark_apply as _spark
+    from fluid_build.observability.run_id import get_or_create_run_id
+
+    # As reconcile asks: at a terminal, before a run that may delete rows and files (--yes and
+    # the maintenance DAG, which passes it, skip the question).
+    ask = None if args.yes or dry_run or not os.isatty(0) else _confirm_reconcile
+    return _spark.maintain_only(
+        contract,
+        logger,
+        expose_id=expose_id,
+        dry_run=dry_run,
+        workspace=_spark_workspace(args, None),
+        run_id=get_or_create_run_id(),
+        confirm=ask,
+    )
+
+
 def _confirm_reconcile(question: str) -> bool:
-    """Ask on the terminal before ``--mode reconcile`` starts or cancels a run (``--yes``
-    skips it, as it skips apply's own prompt). An empty or closed input is a no; Ctrl-C
+    """Ask on the terminal before ``--mode reconcile`` starts or cancels a run, or ``--mode
+    maintain`` starts one (``--yes`` skips it, as it skips apply's own prompt). An empty or closed input is a no; Ctrl-C
     stops the command, as it stops any apply."""
     prompt = f"{question} [y/N]: "
     try:
@@ -2315,6 +2393,8 @@ def run(args, logger: logging.Logger) -> int:
 
     resolved_build_id = getattr(args, "build_id", None)
     _check_build_id_mode(resolved_build_id, resolved_mode)
+    resolved_expose_id = getattr(args, "expose_id", None)
+    _check_expose_id_mode(resolved_expose_id, resolved_mode)
 
     # ``--dry-run`` flag still supported as a CLI ergonomic alias for
     # ``--mode dry-run``; the canonical form is the mode value. Normalize
@@ -2344,7 +2424,7 @@ def run(args, logger: logging.Logger) -> int:
         mode=resolved_mode.value,
     )
 
-    from fluid_build.forge.core.apply_modes import is_reconcile
+    from fluid_build.forge.core.apply_modes import is_maintain, is_reconcile
 
     if is_reconcile(resolved_mode):
         return _run_reconcile_mode(
@@ -2352,6 +2432,14 @@ def run(args, logger: logging.Logger) -> int:
             logger,
             start_time=start_time,
             build_id=resolved_build_id,
+            dry_run=effective_dry_run,
+        )
+    if is_maintain(resolved_mode):
+        return _run_maintain_mode(
+            args,
+            logger,
+            start_time=start_time,
+            expose_id=resolved_expose_id if isinstance(resolved_expose_id, str) else None,
             dry_run=effective_dry_run,
         )
 

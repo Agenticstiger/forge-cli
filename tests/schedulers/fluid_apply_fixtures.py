@@ -275,11 +275,40 @@ def kept_alive_stream() -> Dict[str, Any]:
     return contract
 
 
+def _maintained(contract: Dict[str, Any], expose_id: str, **block: Any) -> Dict[str, Any]:
+    """``contract`` with a Spark maintenance block on the expose ``expose_id``."""
+    maintenance: Dict[str, Any] = {
+        "schedule": "0 3 * * *",
+        "compaction": {},
+        "expireSnapshots": {"olderThan": "P5D"},
+    }
+    maintenance.update(block)
+    for expose in contract["exposes"]:
+        if expose["exposeId"] == expose_id:
+            expose["iceberg"] = {"maintenance": maintenance}
+    return contract
+
+
+def kept_alive_stream_maintained() -> Dict[str, Any]:
+    """The kept-alive stream's table also declares maintenance: a keepalive DAG, the daily
+    batch's DAG and the table's maintenance DAG, on its own schedule and timezone."""
+    return _maintained(
+        kept_alive_stream(), "events_raw", schedule="30 4 * * 0", timezone="Europe/Zurich"
+    )
+
+
+def batch_maintained() -> Dict[str, Any]:
+    """The daily batch's table declares maintenance: the batch's DAG and the table's."""
+    return _maintained(copy.deepcopy(SPARK_CONTRACT), "events_daily")
+
+
 #: Contracts that use ``builds[].dependencies``, dataset triggers or a kept-alive stream.
 GRAPH_CASES: Dict[str, Tuple[Dict[str, Any], Optional[str], str]] = {
     "events_pipeline": (events_pipeline(), None, "contracts/events/contract.fluid.yaml"),
     "rules_and_any": (rules_and_any(), "aws", "contract.fluid.yaml"),
     "kept_alive_stream": (kept_alive_stream(), "aws", "native.fluid.yaml"),
+    "kept_alive_stream_maintained": (kept_alive_stream_maintained(), "aws", "native.fluid.yaml"),
+    "batch_maintained": (batch_maintained(), None, "native.fluid.yaml"),
 }
 
 

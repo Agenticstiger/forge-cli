@@ -2709,13 +2709,18 @@ ACCESS_ONLY_RESOURCE_TYPES = frozenset(
 #: from the contract removes them, ungated, with a line saying so (founder
 #: decision for the Databricks provider, 2026-10-29). A schema's data quality
 #: monitor is one too: deleting it deletes its hidden scan job and what it has
-#: learned, never a row (``iac/providers/databricks_quality.py``).
+#: learned, never a row (``iac/providers/databricks_quality.py``). So is a Glue table
+#: optimizer, which schedules an Iceberg table's maintenance (``fluid_build/maintenance``).
 RUN_DEFINITION_RESOURCE_TYPES = frozenset(
     {
         "databricks_job",
         "databricks_workspace_file",
         "databricks_directory",
         "databricks_data_quality_monitor",
+        # A Glue Data Catalog table optimizer (``exposes[].iceberg.maintenance``, backend
+        # glue): a schedule of compaction, retention or orphan deletion. Deleting it stops
+        # that upkeep and deletes no file and no row.
+        "aws_glue_catalog_table_optimizer",
     }
 )
 

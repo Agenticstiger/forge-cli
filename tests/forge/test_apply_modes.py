@@ -22,6 +22,7 @@ from fluid_build.forge.core.apply_modes import (
     full_refresh_required,
     is_destructive,
     is_dry_run,
+    is_maintain,
     is_reconcile,
     needs_build,
     parse_mode,
@@ -35,14 +36,14 @@ from fluid_build.forge.core.apply_modes import (
 class TestApplyMode:
     def test_six_deploy_modes_and_reconcile(self):
         """Plan Part 1 specifies exactly six deploy modes, and ``reconcile``
-        deploys nothing. Regression guard — if someone adds another without
-        updating the matrix docstring, this test fires first."""
-        assert len(list(ApplyMode)) == 7
+        and ``maintain`` deploy nothing. Regression guard — if someone adds
+        another without updating the matrix docstring, this test fires first."""
+        assert len(list(ApplyMode)) == 8
 
     def test_canonical_choices_order(self):
         """Order is least-destructive → most-destructive, matching the
         argparse ``choices=`` list operators see in ``--help``, then
-        ``reconcile``, which deploys nothing."""
+        ``reconcile`` and ``maintain``, which deploy nothing."""
         assert CANONICAL_CHOICES == [
             "dry-run",
             "create-only",
@@ -51,7 +52,18 @@ class TestApplyMode:
             "replace",
             "replace-and-build",
             "reconcile",
+            "maintain",
         ]
+
+    def test_maintain_deploys_nothing(self):
+        """``maintain`` runs a table's maintenance with the config the last apply
+        deployed: neither destructive nor a build mode nor a dry run."""
+        assert is_maintain(ApplyMode.MAINTAIN)
+        assert not is_destructive(ApplyMode.MAINTAIN)
+        assert not needs_build(ApplyMode.MAINTAIN)
+        assert not is_dry_run(ApplyMode.MAINTAIN)
+        assert not is_reconcile(ApplyMode.MAINTAIN)
+        assert not is_maintain(ApplyMode.RECONCILE)
 
     def test_reconcile_deploys_nothing(self):
         """``reconcile`` is neither destructive nor a build mode nor a dry

@@ -1056,9 +1056,31 @@ class EmrEc2(Adapter):
             f"--role-name {role} --policy-arn {arn}"
         )
 
+    def _refuse_one_step_at_a_time(self) -> None:
+        """A maintenance step needs a cluster that runs steps side by side: with
+        ``StepConcurrencyLevel`` 1, EMR runs one step at a time, and a step that is running (a
+        stream's never ends) would hold the maintenance step PENDING for as long as it runs. A
+        cluster this identity cannot read is left to EMR."""
+        cluster = self._described()
+        level = (cluster or {}).get("StepConcurrencyLevel")
+        if not isinstance(level, int) or level > 1:
+            return
+        running = self.client.list_steps(ClusterId=self.cluster, StepStates=["RUNNING"])
+        busy = [s for s in running.get("Steps") or [] if s.get("Name") != self.run.run_name]
+        if busy:
+            raise SparkRunError(
+                f"not started: EMR cluster {self.cluster} runs one step at a time "
+                f"(StepConcurrencyLevel 1) and step {busy[0].get('Id')} is running, so the "
+                "maintenance step would wait behind it for as long as it runs. Let the cluster "
+                f"run steps side by side: aws emr modify-cluster --cluster-id {self.cluster} "
+                "--step-concurrency-level 2"
+            )
+
     def start(self, token: str, restart_of: Optional[str] = None) -> str:
         try:
             self._refuse_unless_attached()
+            if self.run.maintains:
+                self._refuse_one_step_at_a_time()
         finally:
             self._cluster_read = None  # a later start reads the cluster again
         r = self.checked()
@@ -1187,7 +1209,7 @@ class Local(Adapter):
         require_posix()
         super().__init__(run, None)
         self.host = host if host is not None else default_host()
-        self._runs = LocalRuns(self.host, run.product, run.build)
+        self._runs = LocalRuns(self.host, run.product, run.run_key)
 
     def where(self) -> str:
         return self._runs.where()

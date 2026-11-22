@@ -1051,7 +1051,7 @@ def start_run(
     publish(sub, bound, runner_text)
     # What publish wrote, which the runner checks before it reads anything.
     bound = dataclasses.replace(bound, job_sha256=config_digest(bound.job_text))
-    runs = LocalRuns(host, run.product, run.build)
+    runs = LocalRuns(host, run.product, run.run_key)
     _confined(host.workspace, runs.dir)  # before anything is created through a link
     with _locked(runs.dir / "start.lock"):
         going = [r for r in runs.runs() if r.active and r.config_hash == run.config_hash]

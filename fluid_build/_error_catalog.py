@@ -1401,6 +1401,25 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "validate",
     ),
+    "contract_iceberg_maintenance": (
+        [
+            "Fix the exposes[].iceberg.maintenance field the message names: backend spark "
+            + "needs a schedule and runs on the engine: spark build that writes the table (name "
+            + "it with build when several do); backend glue needs a roleArn and takes whole "
+            + "days; orphans older than P1D, snapshots older than PT1H",
+        ],
+        "validate",
+    ),
+    "contract_maintenance_actions": (
+        [
+            "Install the package that registers the action's kind under the "
+            + "fluid_build.maintenance_actions entry points, let FLUID_PLUGINS_ALLOWLIST load "
+            + "it, or fix the action's options as the message says",
+            "Each statement the kind returns must be one DELETE, UPDATE or MERGE whose target "
+            + "is the expose's own table, named fluid.<database>.<table>",
+        ],
+        "validate",
+    ),
     "contract_confluent_binding": (
         [
             "Fix the Confluent (Tableflow) binding field the message names; the message gives "
@@ -1616,6 +1635,8 @@ _EXAMPLES: Dict[str, str] = {
     "contract_secret_ref": _VERBOSE,
     "contract_alerts": _VERBOSE,
     "contract_alert_plugins": _VERBOSE,
+    "contract_iceberg_maintenance": _VERBOSE,
+    "contract_maintenance_actions": _VERBOSE,
     "contract_confluent_binding": _VERBOSE,
     "contract_databricks_binding": (
         "# exposes[].binding\nplatform: databricks\nformat: delta_table\nlocation:\n"

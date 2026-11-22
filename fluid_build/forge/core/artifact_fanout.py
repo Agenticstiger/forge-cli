@@ -378,7 +378,7 @@ def _schedule_skip_reason(contract: Optional[Dict[str, Any]]) -> Optional[str]:
         return None
     from fluid_build.schedulers.airflow.fluid_apply import has_scheduled_builds
 
-    if has_scheduled_builds(contract):
+    if has_scheduled_builds(contract, maintenance=True):
         return None
     return "generate_artifacts_skip_schedule_no_engine"
 

@@ -31,6 +31,9 @@ from fluid_build.spark import names as _names
 
 #: The action ``fluid plan`` lists for each Spark build; ``fluid apply`` reconciles it.
 ACTION = "spark.reconcile"
+#: The action ``fluid plan`` lists for each backend-spark Iceberg table maintenance
+#: (``exposes[].iceberg.maintenance``); ``fluid apply --mode maintain`` runs it.
+MAINTAIN_ACTION = "spark.maintain"
 #: The AWS account in a run's names until it is started: plans, hashes and the bound-plan
 #: check never need credentials, and a plan made anywhere matches the apply's.
 ACCOUNT_TOKEN = "${aws_account_id}"
@@ -259,6 +262,10 @@ class DesiredRun:
     package_sha256: Optional[str] = None
     package_entry_point: Optional[str] = None
     package_uri: Optional[str] = None
+    #: A maintenance run's (``fluid_build/maintenance``): the Iceberg expose whose table it
+    #: maintains, on its writer build's runtime and role. Its own run name, job config and run
+    #: history keep it apart from the build's runs. None for a build's run.
+    maintains: Optional[str] = None
     #: What the runner stamps on each Iceberg commit beside the product, build and job config
     #: digest: the version of the build's output, the contract's digest, the release the deploy
     #: names and the pipeline's run id (``--fluid-*``). They are sent as runner arguments,
@@ -294,6 +301,12 @@ class DesiredRun:
     def local(self) -> bool:
         """A run of ``runtime: local``: spark-submit on the machine ``fluid apply`` runs on."""
         return self.runtime == "local"
+
+    @property
+    def run_key(self) -> str:
+        """Where a local run's history lives under the product's runtime directory: the
+        build's, or a maintenance run's own beneath it (``<build>/maintenance/<expose>``)."""
+        return f"{self.build}/maintenance/{self.maintains}" if self.maintains else self.build
 
     @property
     def needs_local_root(self) -> bool:
@@ -393,6 +406,8 @@ class DesiredRun:
             tags["fluid_source"] = self.source_id
         if self.checkpoint_id:
             tags["fluid_checkpoint"] = self.checkpoint_id
+        if self.maintains:
+            tags["fluid_maintains"] = self.maintains
         return tags
 
     def plan_action(self, step: int) -> Dict[str, Any]:
@@ -412,6 +427,8 @@ class DesiredRun:
         return action
 
     def _plan_action(self, step: int) -> Dict[str, Any]:
+        if self.maintains:
+            return self._maintain_action(step)
         return {
             "step": step,
             "action_id": f"spark_{self.build}",
@@ -445,6 +462,36 @@ class DesiredRun:
                     "in that time is replaced by the last good config (not when the release moved "
                     "the checkpoint over the same output); a new source on that "
                     "checkpoint is refused"
+                ),
+            },
+        }
+
+    def _maintain_action(self, step: int) -> Dict[str, Any]:
+        """A backend-spark table maintenance's plan action (:data:`MAINTAIN_ACTION`)."""
+        return {
+            "step": step,
+            "action_id": f"spark_maintain_{self.maintains}",
+            "provider": "local" if self.local else "aws",
+            "depends_on": [],
+            "op": MAINTAIN_ACTION,
+            "action_type": MAINTAIN_ACTION,
+            "id": self.maintains,
+            "payload": {
+                "product": self.product,
+                "expose": self.maintains,
+                "build": self.build,
+                "runtime": self.runtime,
+                "region": self.region,
+                "target": dict(self.target),
+                "executionRoleArn": self.role_arn or None,
+                "artifacts": {"jobConfig": self.job_uri, "runner": self.runner_uri},
+                "jobConfigDigest": self.job_digest,
+                "runnerSha256": self.runner_sha256,
+                "configHash": self.config_hash,
+                "stateImpact": (
+                    "started by the table's maintenance DAG (fluid apply --mode maintain "
+                    f"--expose-id {self.maintains}) on build {self.build}'s runtime, beside its "
+                    "runs; a plain fluid apply only deploys its job config"
                 ),
             },
         }

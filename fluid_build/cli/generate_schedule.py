@@ -160,7 +160,7 @@ def run(args: Any, logger: logging.Logger) -> int:
         if not scheduler_name:
             orchestration = contract.get("orchestration", {})
             scheduler_name = orchestration.get("engine", "")
-        if not scheduler_name and fluid_apply.has_scheduled_builds(contract):
+        if not scheduler_name and fluid_apply.has_scheduled_builds(contract, maintenance=True):
             # A build that declares a trigger has said WHEN it runs. The
             # artifact is inert until schedule-sync pushes it to a scheduler
             # the operator names, so defaulting WHO renders it commits nothing.
@@ -174,6 +174,16 @@ def run(args: Any, logger: logging.Logger) -> int:
         # so on another scheduler a stream that declares execution.retries has
         # nothing to schedule either.
         keepalive = (scheduler_name or fluid_apply.DEFAULT_ENGINE) == fluid_apply.DEFAULT_ENGINE
+        if fluid_apply.declares_spark_maintenance(contract) and not (
+            fluid_apply.uses_fluid_apply_dags(contract, engine=scheduler_name)
+        ):
+            # Said, never dropped: only the fluid apply DAGs carry a table's maintenance.
+            cprint(
+                "Note: a table's iceberg.maintenance (backend spark) runs from its maintenance "
+                "DAG, which only the Airflow fluid apply DAGs carry (--scheduler airflow, with "
+                "no hand-declared orchestration.tasks). Here none is written: run fluid apply "
+                "--mode maintain --expose-id <expose> on the table's schedule yourself."
+            )
         if fluid_apply.runs_only_outside_schedulers(contract, keepalive=keepalive) and not (
             fluid_apply.has_explicit_tasks(contract)
         ):

@@ -351,3 +351,106 @@ def test_each_batch_run_commits_its_own_runs_stamps(
     assert summaries[1]["fluid.scheduler-run-id"] == "scheduled__2026-11-22T02:00:00+00:00"
     assert summaries[1]["fluid.product-version"] == "2.0.0"
     assert [tuple(r) for r in spark.table(table).collect()] == [(datetime.date(2026, 11, 20), 1)]
+
+
+# --- table maintenance ------------------------------------------------------------------
+
+
+class _EraseSku:
+    """A maintenance action kind, as a package's ``fluid_build.maintenance_actions`` entry
+    point gives it: it deletes the rows of one sku."""
+
+    def statements(self, table: str, options: Dict[str, Any]) -> List[str]:
+        from fluid_build.maintenance import sql_literal
+
+        return [f"DELETE FROM {table} WHERE sku = {sql_literal(options['sku'])}"]
+
+
+def _maintained_contract() -> Dict[str, Any]:
+    contract = copy.deepcopy(CONTRACT)
+    contract["exposes"][0]["iceberg"] = {
+        "maintenance": {
+            "schedule": "0 3 * * *",
+            "actions": [{"name": "erase", "kind": "erase-sku", "options": {"sku": "gone"}}],
+            "compaction": {"minInputFiles": 2},
+            "rewriteManifests": {},
+            "expireSnapshots": {"olderThan": "P1D", "retainLast": 2},
+            "removeOrphanFiles": {"olderThan": "P1D"},
+        }
+    }
+    return contract
+
+
+def test_maintenance_runs_beside_a_stream_that_keeps_committing(
+    spark: Any, runner: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The maintenance job forge compiles, run by the runner while a stream appends to the same
+    table every second: each step commits (stamped) or reports, and the stream is still running
+    afterwards, with every row it wrote but the ones the action deleted."""
+    import time as _time
+
+    from fluid_build.build_runners.spark._maintenance import maintenance_runs
+
+    contract = _maintained_contract()
+    (run,) = maintenance_runs(contract, account=ACCOUNT, load=lambda _kind: _EraseSku())
+    config = json.loads(run.job_text)
+    table = f"{config['sink']['catalog']}.{config['sink']['table']}"
+    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {table.rsplit('.', 1)[0]}")
+    spark.sql(f"DROP TABLE IF EXISTS {table}")
+    spark.sql(
+        f"CREATE TABLE {table} (order_id STRING, customer_id STRING, email_hash STRING, "
+        "sku STRING, qty INT, event_time TIMESTAMP) USING iceberg "
+        "TBLPROPERTIES ('format-version' = '2')"
+    )
+    for batch in range(6):  # small files, one commit each: something to compact
+        spark.sql(
+            f"INSERT INTO {table} VALUES ('o{batch}', 'c', NULL, "
+            f"'{'gone' if batch == 0 else 'kept'}', {batch}, TIMESTAMP '2026-11-20 10:00:00')"
+        )
+    # The build's stream, standing in: one row a second, a commit a second.
+    stream = (
+        spark.readStream.format("rate")
+        .option("rowsPerSecond", 1)
+        .load()
+        .selectExpr(
+            "concat('r', CAST(value AS STRING)) AS order_id",
+            "'c' AS customer_id",
+            "CAST(NULL AS STRING) AS email_hash",
+            "'stream' AS sku",
+            "CAST(value AS INT) AS qty",
+            "timestamp AS event_time",
+        )
+        .writeStream.format("iceberg")
+        .outputMode("append")
+        .trigger(processingTime="1 second")
+        .option("checkpointLocation", str(tmp_path / "stream-checkpoint"))
+        .toTable(table)
+    )
+    try:
+        deadline = _time.monotonic() + 60
+        while len(_summaries(spark, table)) < 9 and _time.monotonic() < deadline:
+            _time.sleep(0.5)
+        args = _forge_args(contract, "c0ffeec0ffee", "scheduled__2026-11-22T03:00:00+00:00")
+        text = _run(runner, config, tmp_path, args)
+        _time.sleep(3)  # the stream's next commits, after maintenance
+        assert stream.isActive, stream.exception()
+        assert stream.exception() is None
+    finally:
+        stream.stop()
+
+    summaries = _summaries(spark, table)
+    stamped = [s for s in summaries if "fluid.maintenance" in s]
+    steps = {s["fluid.maintenance"] for s in stamped}
+    assert {"statement:erase", "rewrite_data_files", "rewrite_manifests"} <= steps, steps
+    for summary in stamped:
+        assert summary["fluid.product"] == "commerce.orders-stream"
+        assert summary["fluid.build"] == "ingest-orders"
+        assert summary["fluid.job-sha256"] == runner.config_digest(text)
+        assert summary["fluid.run-id"] == "c0ffeec0ffee"
+    # The stream committed after the maintenance did.
+    last_maintenance = max(i for i, s in enumerate(summaries) if "fluid.maintenance" in s)
+    assert any("spark.sql.streaming.queryId" in s for s in summaries[last_maintenance + 1 :])
+    rows = spark.table(table).collect()
+    assert not [r for r in rows if r["sku"] == "gone"]
+    assert len([r for r in rows if r["sku"] == "kept"]) == 5
+    assert [r for r in rows if r["sku"] == "stream"]

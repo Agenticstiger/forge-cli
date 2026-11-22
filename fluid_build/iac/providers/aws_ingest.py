@@ -442,6 +442,7 @@ def _emit_build(
     content, cluster, iam = _job_content(blocks, b)
     bucket_ref = _bucket_ref(contract, expose, loc, bucket, ctx)
     _emit_artifacts(blocks, b, bucket_ref, content, runner_source())
+    maintenance_keys = _emit_maintenance(blocks, contract, b, bucket_ref)
     if config.get("package"):
         _emit_package(blocks, b, bucket_ref, build)
     log_name = names.log_group_name(ctx.product, bid)
@@ -527,6 +528,7 @@ def _emit_build(
         objects=(
             aws_identity._join(bucket_arn, "/", names.job_config_key(ctx.product, bid)),
             aws_identity._join(bucket_arn, "/", b.runner_key),
+            *(aws_identity._join(bucket_arn, "/", key) for key in maintenance_keys),
         ),
         lookup_application=b.runtime == "emr-serverless" and not b.cfg.get("applicationId"),
         bucket=bucket_arn,
@@ -774,6 +776,54 @@ def _emit_artifacts(
         "content_type": "application/json",
         "tags": b.tags,
     }
+
+
+def _emit_maintenance(
+    blocks: SparkBlocks, contract: Mapping[str, Any], b: _Build, bucket_ref: Any
+) -> Tuple[str, ...]:
+    """The maintenance job configs (``exposes[].iceberg.maintenance``, backend spark) of the
+    table this build writes, beside its own job config, where the build's role reads them: the
+    bytes ``fluid apply --mode maintain`` checks before it starts a run
+    (``build_runners/spark/_maintenance.py`` compiles the same). Their keys, for the scheduler's
+    policy."""
+    from fluid_build.maintenance.job import action_statements, maintenance_config, table_name
+    from fluid_build.maintenance.plugins import MaintenanceActionError
+    from fluid_build.maintenance.spec import declares_maintenance, read_maintenance
+    from fluid_build.spark.compiler import SparkJob
+
+    if not declares_maintenance(contract):
+        return ()
+    tables, errors = read_maintenance(contract)
+    if errors:
+        raise UnsupportedBindingError(
+            "iceberg-maintenance",
+            f"{errors[0]}.",
+            ("Fix the field the message names; fluid validate reports the same.",),
+        )
+    objects = blocks.resources.setdefault("aws_s3_object", {})
+    keys: List[str] = []
+    for tm in tables:
+        if tm.backend != "spark" or tm.build_id != b.build_id:
+            continue
+        try:
+            statements = action_statements(tm, table_name(b.config))
+        except MaintenanceActionError as exc:
+            raise UnsupportedBindingError(
+                "iceberg-maintenance-action",
+                f"{exc}.",
+                ("Fix the action the message names; fluid validate reports the same.",),
+            ) from None
+        text = SparkJob(maintenance_config(tm, b.config, statements)).text
+        key = names.maintenance_config_key(b.ctx.product, b.build_id, tm.expose_id)
+        objects[f"{b.key}_maintain_{safe_ident(tm.expose_id)}"] = {
+            "bucket": bucket_ref,
+            "key": key,
+            "content": _expression(text, {b.ctx.account_marker: str(b.ctx.account)}),
+            "content_type": "application/json",
+            "tags": b.tags,
+        }
+        keys.append(key)
+    return tuple(keys)
 
 
 def _emit_role(
@@ -1473,7 +1523,8 @@ def _emit_caller_policy(
 #: ``_kms`` and stays gated, and a grant the binding's ``governance.lakeFormation`` declares
 #: (``_lf_grant_*``) is not the build's.
 _SPARK_DEFINITIONS: Dict[str, "re.Pattern[str]"] = {
-    "aws_s3_object": re.compile(r"_spark_(runner|config)$"),
+    # The runner, the job config and each table's maintenance job config (_emit_maintenance).
+    "aws_s3_object": re.compile(r"_spark_(runner|config|maintain_[A-Za-z0-9_]+)$"),
     "aws_s3_object_copy": re.compile(r"_spark_(jar_[0-9]+|package)$"),
     "aws_cloudwatch_log_group": re.compile(r"_spark$"),
     "aws_kms_key": re.compile(r"_spark_logs$"),

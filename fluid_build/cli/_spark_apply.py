@@ -14,6 +14,11 @@ it (:func:`plan_posture`, :func:`warn_cluster_posture`).
 ``fluid apply --mode reconcile`` reconciles the streams alone (:func:`reconcile_only`): no
 ``tofu``, no plan, and a stream starts again only with the config the last apply deployed.
 
+A backend-spark Iceberg table maintenance (``exposes[].iceberg.maintenance``) is planned as a
+``spark.maintain`` action (:func:`planned_actions`), its job config deployed beside its writer
+build's, and run by ``fluid apply --mode maintain`` (:func:`maintain_only`): no ``tofu``, no
+plan, one run on the writer build's runtime with the config the last apply deployed.
+
 A build of ``runtime: local`` runs on the machine ``fluid apply`` runs on, with nothing for
 OpenTofu to provision: the native engine (outputs on ``platform: local``) reconciles it the
 same way, and :func:`refuse_without_opentofu` refuses only the AWS runtimes there.
@@ -25,7 +30,10 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from fluid_build.build_runners.spark._desired import ACTION, DesiredRun
+from fluid_build.build_runners.spark._desired import ACTION, MAINTAIN_ACTION, DesiredRun
+
+#: The plan actions this module lists and checks: a build's run and a table's maintenance.
+_SPARK_OPS = (ACTION, MAINTAIN_ACTION)
 
 
 def _cli_error(event: str, context: Dict[str, Any]) -> Exception:
@@ -34,17 +42,23 @@ def _cli_error(event: str, context: Dict[str, Any]) -> Exception:
     return CLIError(1, event, context)
 
 
-def _desired(contract: Mapping[str, Any], event: str, **kwargs: Any) -> List[DesiredRun]:
-    """The runs, or ``CLIError`` ``<event>_refused`` (policy) / ``<event>_invalid``."""
+def _desired(
+    contract: Mapping[str, Any], event: str, *, maintenance: bool = False, **kwargs: Any
+) -> List[DesiredRun]:
+    """The runs (``maintenance``: the tables' maintenance runs), or ``CLIError``
+    ``<event>_refused`` (policy) / ``<event>_invalid``."""
     import copy
 
     from fluid_build._errors import FluidUserError
     from fluid_build.build_runners.spark._desired import desired_runs
+    from fluid_build.build_runners.spark._maintenance import maintenance_runs
     from fluid_build.cli._common import resolve_env_templates_in_contract
 
     try:
         # As the OpenTofu engine reads it: ``{{ env.* }}`` resolved, the same at plan and apply.
         resolved = resolve_env_templates_in_contract(copy.deepcopy(dict(contract)))
+        if maintenance:
+            return maintenance_runs(resolved, **kwargs)
         return desired_runs(resolved, **kwargs)
     except FluidUserError as exc:
         raise _cli_error(
@@ -92,7 +106,8 @@ def _has_spark(contract: Mapping[str, Any]) -> bool:
 
 
 def planned_actions(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    """``fluid plan``'s ``spark.reconcile`` actions (steps renumbered by the caller).
+    """``fluid plan``'s ``spark.reconcile`` actions, then its ``spark.maintain`` ones (steps
+    renumbered by the caller).
 
     Raises:
         CLIError: ``plan_spark_invalid`` / ``plan_spark_refused``.
@@ -104,7 +119,15 @@ def planned_actions(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     # FLUID_SPARK_GLUE_JARS_URL do change it (where the run loads code from), so the plan
     # binds them: apply refuses a plan made with other values.
     runs = _desired(contract, "plan_spark", policy=False)
+    if _has_spark_maintenance(contract):
+        runs += _desired(contract, "plan_spark", maintenance=True, policy=False)
     return [dict(_comparable(run.plan_action(0))) for run in runs]
+
+
+def _has_spark_maintenance(contract: Mapping[str, Any]) -> bool:
+    from fluid_build.maintenance.spec import declares_maintenance
+
+    return declares_maintenance(contract)
 
 
 def _comparable(action: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -131,7 +154,7 @@ def prepare(
     """
     if not _has_spark(contract):
         if verified_plan and any(
-            a.get("op") == ACTION
+            a.get("op") in _SPARK_OPS
             for a in verified_plan.get("actions") or []
             if isinstance(a, Mapping)
         ):
@@ -145,19 +168,27 @@ def prepare(
         return []
     stamps = _stamps(contract, run_id, verified_plan=verified_plan)
     runs = _desired(contract, "apply_spark", stamps=stamps)
+    # The tables' maintenance runs: this apply deploys their job configs (OpenTofu uploads
+    # them beside the builds'), and fluid apply --mode maintain runs them.
+    maintained = (
+        _desired(contract, "apply_spark", maintenance=True, stamps=stamps)
+        if _has_spark_maintenance(contract)
+        else []
+    )
     if verified_plan is not None:
         planned = [
             _comparable(a)
             for a in verified_plan.get("actions") or []
-            if isinstance(a, Mapping) and a.get("op") == ACTION
+            if isinstance(a, Mapping) and a.get("op") in _SPARK_OPS
         ]
-        if planned != [_comparable(r.plan_action(0)) for r in runs]:
+        if planned != [_comparable(r.plan_action(0)) for r in [*runs, *maintained]]:
             raise _cli_error(
                 "apply_spark_artifact_mismatch",
                 {
                     "error": "the Spark runs compiled now differ from the bound plan's "
-                    "spark.reconcile actions (job config, runner, a prebuilt package's source "
-                    "or run settings, which include FLUID_SPARK_MAVEN_REPOSITORY and "
+                    "spark.reconcile and spark.maintain actions (job config, runner, a "
+                    "maintenance action's statements, a prebuilt package's source or run "
+                    "settings, which include FLUID_SPARK_MAVEN_REPOSITORY and "
                     "FLUID_SPARK_GLUE_JARS_URL); regenerate it with the same environment as "
                     "apply"
                 },
@@ -418,6 +449,146 @@ def reconcile_only(
         cprint(out.line(), markup=False)
         logger.info("spark_reconcile", extra={"spark": out.as_dict()})
     return _result(outcomes)
+
+
+def maintain_only(
+    contract: Mapping[str, Any],
+    logger: logging.Logger,
+    *,
+    expose_id: Optional[str],
+    dry_run: bool,
+    workspace: Optional[Path] = None,
+    clients: Any = None,
+    run_id: Optional[str] = None,
+    confirm: Any = None,
+) -> int:
+    """``fluid apply --mode maintain``: one run of each backend-spark table maintenance (with
+    ``expose_id``, that table's), started on its writer build's runtime and waited for; 1 when
+    any run did not succeed.
+
+    It runs no ``tofu``: the job config it starts is the one the last ``fluid apply`` deployed,
+    refused unless it is the one the contract compiles to now (``_adapters.checked_run``). A
+    retried task finds its run going and waits for it. A dry run says what it would start and
+    reads nothing from AWS. A backend-glue table has nothing to start: AWS runs its optimizers.
+    ``confirm`` (a terminal's ``[y/N]``) is asked before each run starts; a no starts nothing.
+
+    Raises:
+        CLIError: ``apply_maintain_not_declared`` (``expose_id`` declares no maintenance),
+            ``apply_maintain_invalid``, ``apply_spark_invalid`` / ``apply_spark_refused``,
+            ``apply_spark_local_unavailable``, ``apply_aws_sdk_missing``.
+        KeyboardInterrupt: Ctrl-C, SIGTERM or SIGHUP while a run was waited on; the run was
+            cancelled.
+    """
+    from fluid_build.build_runners.spark._local import LocalHost
+    from fluid_build.build_runners.spark._reconcile import DEFAULT_RUN_WAIT_S, run_once
+    from fluid_build.cli.console import cprint
+    from fluid_build.maintenance.spec import read_maintenance
+
+    def say(line: str) -> None:
+        cprint(line, markup=False)
+
+    tables, errors = read_maintenance(contract)
+    if errors:
+        raise _cli_error("apply_maintain_invalid", {"error": f"{errors[0]}; nothing was started"})
+    chosen = [t for t in tables if expose_id is None or t.expose_id == expose_id]
+    if expose_id is not None and not chosen:
+        raise _cli_error(
+            "apply_maintain_not_declared",
+            {
+                "expose_id": expose_id,
+                "error": f"expose {expose_id} declares no iceberg.maintenance; nothing was started",
+                "hint": "Name an expose that declares it, or leave --expose-id out to run the "
+                "maintenance of every table that does.",
+            },
+        )
+    for table in chosen:
+        if table.backend == "glue":
+            say(
+                f"Iceberg {table.expose_id}: the Glue Data Catalog's table optimizers maintain "
+                "it (fluid apply provisions them, AWS runs them); nothing to start"
+            )
+    if not any(t.backend == "spark" for t in chosen):
+        if not chosen:
+            say("No exposes[].iceberg.maintenance in the contract: nothing to run.")
+        return 0
+    stamps = _stamps(contract, run_id, refuse_release=False)
+    runs = _desired(contract, "apply_spark", maintenance=True, expose_id=expose_id, stamps=stamps)
+    if any(r.local for r in runs) and not dry_run:
+        _check_local(runs, workspace)
+    if any(not r.local for r in runs) and not dry_run:
+        _require_boto3()
+    host = LocalHost(Path(workspace)) if workspace is not None else None
+    failed = False
+    for run in runs:
+        head = f"Iceberg {run.maintains} maintenance (build {run.build}, {run.runtime})"
+        if dry_run:
+            say(
+                f"{head}: would start one run and wait up to {int(DEFAULT_RUN_WAIT_S)} s for it "
+                "to end, which would:"
+            )
+            for line in _maintenance_steps(contract, run):
+                say(f"  {line}")
+            continue
+        if confirm is not None and not confirm(
+            f"Start {run.maintains}'s maintenance on {run.runtime} as build {run.build}'s role? "
+            "It may delete rows, snapshots and files"
+        ):
+            say(f"{head}: not started")
+            continue
+        say(f"{head}:")
+        outcome = run_once(
+            run, clients=clients, local_host=host, timeout=DEFAULT_RUN_WAIT_S, say=say
+        )
+        say(outcome.line())
+        logger.info(
+            "spark_maintain", extra={"spark": {**outcome.as_dict(), "expose": run.maintains}}
+        )
+        if outcome.action == "cancelled":
+            raise KeyboardInterrupt  # the run was cancelled; stop the apply, as Ctrl-C does
+        failed = failed or bool(outcome.error)
+    return 1 if failed else 0
+
+
+def _ago(seconds: int) -> str:
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds % size == 0:
+            count = seconds // size
+            return f"{count} {unit}{'' if count == 1 else 's'}"
+    return f"{seconds} seconds"
+
+
+def _maintenance_steps(contract: Mapping[str, Any], run: DesiredRun) -> List[str]:
+    """What a maintenance run would do, step by step, from the job config it would start with:
+    what a dry run of ``--mode maintain`` shows before anything deletes rows or files."""
+    import json
+
+    from fluid_build.maintenance.spec import table_location
+
+    config = json.loads(run.job_text)
+    sink = config["sink"]
+    table = f"{sink['catalog']}.{sink['table']}"
+    location = table_location(contract, str(run.maintains)) or "the table's location"
+    lines: List[str] = []
+    for step in config["maintenance"]["steps"]:
+        kind = step["step"]
+        if kind == "statement":
+            lines.append(f"run action {step['name']} on {table}: {step['sql']}")
+        elif kind == "rewrite_data_files":
+            options = ", ".join(f"{k}={v}" for k, v in sorted(step["options"].items()))
+            lines.append(f"compact {table} ({step['strategy']}; {options})")
+        elif kind == "rewrite_manifests":
+            lines.append(f"rewrite the manifests of {table}")
+        elif kind == "expire_snapshots":
+            lines.append(
+                f"expire the snapshots of {table} older than {_ago(step['olderThanSeconds'])}, "
+                f"keeping the last {step['retainLast']}, and delete the files only they held"
+            )
+        else:
+            lines.append(
+                f"delete the files under {location} that no snapshot of {table} references, "
+                f"older than {_ago(step['olderThanSeconds'])}"
+            )
+    return lines
 
 
 def _removed_of(

@@ -376,6 +376,8 @@ class TestDataLossGate:
             "databricks_workspace_file",
             "databricks_directory",
             "databricks_data_quality_monitor",
+            # An Iceberg table's maintenance schedule on Glue (exposes[].iceberg.maintenance).
+            "aws_glue_catalog_table_optimizer",
         }
 
     def test_removed_jobs_and_files_are_not_data_bearing(self):
