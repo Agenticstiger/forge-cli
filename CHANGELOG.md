@@ -62,6 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that roll back at once keep the older rollback run. An apply that changes nothing keeps a
   stream's release record only when it is missing or different, and a read that fails once no
   longer ends the probation's watch.
+- **`fluid describe --commands` prints every command as JSON, plugins included.** The document
+  has a `schema_version` (1) and lists each command with its aliases, positional arguments and
+  flags (names, type, choices, default, nargs, help). Commands added by `fluid_build.commands`
+  plugins are loaded for this call, under the allow/block policy, and carry a `plugin` key; the
+  `importers` list names the built-in importers and the `fluid_build.importers` plugins, read from
+  entry-point metadata without loading them. `fluid describe --self --json` gains `type` and
+  `nargs` on each flag. Plain `--help` and every other command still load no plugin.
 - **`fluid schedule-sync --airflow-url` waits until Airflow has parsed the pushed DAG files, on
   Airflow 2 and Airflow 3.** It finds the API major itself (`/api/v2` on Airflow 3, `/api/v1` on
   Airflow 2; `--airflow-api v1|v2` pins it) and signs in the way each major takes a credential: a
