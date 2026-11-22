@@ -375,7 +375,19 @@ def test_a_stream_sink_of_an_unknown_format_that_names_a_topic_is_still_a_write(
     assert any("no path is given" in line for line in report.unsupported), report.unsupported
 
 
-@pytest.mark.parametrize("option", ["path", "table", "dbtable", "url", "kafka.bootstrap.servers"])
+@pytest.mark.parametrize(
+    "option",
+    [
+        "path",
+        "table",
+        "dbtable",
+        "url",
+        "topic",
+        "kafka.bootstrap.servers",
+        "es.resource",
+        "collection",
+    ],
+)
 def test_a_stream_sink_of_an_unknown_format_with_a_target_option_is_not_taken_for_a_memory_sink(
     tmp_path, monkeypatch, option
 ):

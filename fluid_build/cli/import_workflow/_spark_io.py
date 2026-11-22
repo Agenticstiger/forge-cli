@@ -109,8 +109,10 @@ _FRAME_METHODS = frozenset(
 #: Methods (Spark 4) called ON a DataFrame to make a value from it: a subquery. What they are
 #: called on is data, not a value.
 _FRAME_RECEIVERS = frozenset({"exists", "scalar", "asTable"})
-#: Options that name where a stream sink writes (lower case, as :meth:`_Reader._options` has them).
-_SINK_TARGETS = frozenset({"path", "topic", "table", "dbtable", "url", "kafka.bootstrap.servers"})
+#: Options a stream sink may have without naming anything it writes to (lower case, as
+#: :meth:`_Reader._options` has them): a connector's own options (``topic``, ``es.resource``,
+#: ``collection``, ``url``) are where a persistent sink says where it writes.
+_SINK_PLAIN_OPTIONS = frozenset({"checkpointlocation", "queryname", "numrows", "truncate"})
 #: Methods that run a function over the rows: what the function reads is not known.
 _FUNCTION_METHODS = frozenset(
     {"transform", "mapInPandas", "mapInArrow", "applyInPandas", "cogroup", "foreach"}
@@ -1462,14 +1464,14 @@ class _Reader:
             and name == "start"
             and not self._sink_format(call, own[:-1])[1]
             and self._arg(call, 0, "path") is None
-            and not _SINK_TARGETS.intersection(options)
+            and set(options) <= _SINK_PLAIN_OPTIONS
         ):
-            # a format that is not a constant and nothing to write to (no path, topic, table or
-            # url): as far as the code says, a memory, console or foreach sink. Nothing
-            # persistent, so the reads stay unowned
+            # a format that is not a constant and nothing to write to (no path, and no option
+            # that names a target): as far as the code says, a memory, console or foreach sink.
+            # Nothing persistent, so the reads stay unowned
             note = (
                 f"{self.file}:{call.lineno} writes a stream whose format is not a constant and "
-                "that names no path, topic or table: it is taken for a memory or console sink"
+                "that names nothing it writes to: it is taken for a memory or console sink"
             )
             if note not in self.facts.remarks and len(self.facts.remarks) < MAX_NOTES_PER_JOB:
                 self.facts.remarks.append(note)
