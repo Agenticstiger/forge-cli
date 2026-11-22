@@ -160,3 +160,22 @@ def test_a_keyword_string_without_a_host_key_shows_no_part_of_it():
         refuse_unless_allowed("env://PG", connection={"connection_string": text}, environ={})
     assert "hunter2" not in str(info.value)
     assert "Database" not in str(info.value)
+
+
+@pytest.mark.unit
+def test_apply_quotes_a_written_host_whose_password_is_a_placeholder():
+    written = {"uri": "postgresql://u:{{ env.FLUID_TEST_RENDERED }}@db.example.com:5432/db"}
+    with _as_written(written):
+        refusal = _apply_refusal({"uri": f"postgresql://u:{SECRET_VALUE}@db.example.com:5432/db"})
+    assert SECRET_VALUE not in str(refusal)
+    assert "host 'db.example.com' (connection.uri)" in refusal.what
+    assert "PG@db.example.com" in refusal.fix
+
+
+@pytest.mark.unit
+def test_apply_names_an_untraced_host_without_quoting_it():
+    with secret_run("apply"):
+        with pytest.raises(AcquisitionSecretPolicyError) as info:
+            resolve_secret("env://PG", host=SECRET_VALUE)
+    assert SECRET_VALUE not in str(info.value)
+    assert "to the host it is sent to as a credential" in info.value.what

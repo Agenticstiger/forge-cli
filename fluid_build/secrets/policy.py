@@ -676,18 +676,22 @@ def _tunnel_targets(connection: Mapping[str, Any]) -> List[_Target]:
     non-empty string is a destination this policy cannot read.
     """
     out: List[_Target] = []
+    for field_name, host_key, tunnel in _tunnels_in_use(connection):
+        raw = tunnel.get(host_key) if isinstance(tunnel, Mapping) else None
+        host = raw.strip() if isinstance(raw, str) and raw.strip() else None
+        out.append(_Target(host, f"{field_name}.{host_key}", tunnel=True))
+    return out
+
+
+def _tunnels_in_use(connection: Mapping[str, Any]) -> Iterator[Tuple[str, str, Any]]:
+    """Each SSH tunnel ``connection`` connects through, as ``(field, host key, tunnel)``."""
     for field_name, host_key, (off_key, off_value) in _TUNNELS:
         tunnel = connection.get(field_name)
         if not tunnel:
             continue
-        raw: Any = None
-        if isinstance(tunnel, Mapping):
-            if _switched_off(tunnel, off_key, off_value):
-                continue
-            raw = tunnel.get(host_key)
-        host = raw.strip() if isinstance(raw, str) and raw.strip() else None
-        out.append(_Target(host, f"{field_name}.{host_key}", tunnel=True))
-    return out
+        if isinstance(tunnel, Mapping) and _switched_off(tunnel, off_key, off_value):
+            continue
+        yield field_name, host_key, tunnel
 
 
 def _switched_off(tunnel: Mapping[str, Any], off_key: str, off_value: Any) -> bool:
@@ -1012,7 +1016,7 @@ def _shown_host(target: _Target, rendered: bool) -> Tuple[Optional[str], bool]:
     written = _AS_WRITTEN.get()
     if written is None:
         return None, False
-    if any(not _ENV_PLACEHOLDER.search(text) and _names(target, text) for text in written):
+    if any(_names_as_written(target, text) for text in written):
         return quoted, False
     for text in written:
         if _ENV_PLACEHOLDER.search(text) and _names(target, _render(text)):
@@ -1027,6 +1031,25 @@ def _names(target: _Target, text: str) -> bool:
     if target.keyword_text is not None:
         return text.strip() == target.keyword_text.strip()
     return (target.host or "").strip().lower().rstrip(".") in _host_readings(text)
+
+
+def _names_as_written(target: _Target, text: str) -> bool:
+    """Whether the contract's ``text`` names ``target`` with no placeholder deciding it.
+
+    A placeholder in a URI's user name, password or path leaves its host as
+    written: only one in the scheme or the host part decides the host
+    (:func:`_deciding_parts`), and a rendered password that would move it
+    leaves a host this policy cannot read, never quoted.
+    """
+    if not _ENV_PLACEHOLDER.search(text):
+        return _names(target, text)
+    if target.keyword_text is not None:
+        return False
+    scheme, host = _deciding_parts("uri", text)
+    if _ENV_PLACEHOLDER.search(scheme) or _ENV_PLACEHOLDER.search(host):
+        return False
+    wanted = (target.host or "").strip().lower().rstrip(".")
+    return wanted in [h.rstrip(".") for h in _field_hosts("uri", text) if h]
 
 
 @dataclass(frozen=True)
@@ -1057,7 +1080,7 @@ def _shown(target: _Target, rendered: bool) -> _Shown:
 def _refusal_place(shown: _Shown, label: str) -> str:
     """Where a destination refusal says the value would go."""
     if shown.kind == "untraced":
-        return f"the host in {label}" if label else "the host this build sends it to"
+        return f"the host in {label}" if label else "the host it is sent to"
     if shown.kind == "keyword":
         where = f"a keyword string naming host {shown.text!r}" if shown.text else "a keyword string"
     elif shown.kind == "placeholder":
@@ -1346,11 +1369,26 @@ def destinations_rendered_at_apply(connection: Mapping[str, Any]) -> List[str]:
         for field_name in _HOST_FIELDS
         if renders_at_apply(field_name, connection.get(field_name))
     ]
-    for field_name, host_key, _off in _TUNNELS:
-        tunnel = connection.get(field_name)
+    for field_name, host_key, tunnel in _tunnels_in_use(connection):
         if isinstance(tunnel, Mapping) and renders_at_apply("host", tunnel.get(host_key)):
             waiting.append(f"{field_name}.{host_key}")
     return waiting
+
+
+def literal_destinations(connection: Mapping[str, Any], waiting: List[str]) -> Dict[str, Any]:
+    """``connection`` without the destinations ``waiting`` names, for the lint to judge now.
+
+    A tunnel whose host waits for apply (``ssh_tunnel.host``) is still in use:
+    its host is replaced by a loopback stand-in, which needs no entry, so the
+    hosts behind the tunnel are judged now, from its side, as apply judges them.
+    """
+    literal = {key: value for key, value in connection.items() if key not in waiting}
+    for name in waiting:
+        field_name, _, host_key = name.partition(".")
+        tunnel = connection.get(field_name)
+        if host_key and isinstance(tunnel, Mapping):
+            literal[field_name] = {**tunnel, host_key: "localhost"}
+    return literal
 
 
 def deferred_destination_notice(

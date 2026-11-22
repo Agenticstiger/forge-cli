@@ -47,6 +47,7 @@ from .policy import (
     connection_hosts,
     deferred_destination_notice,
     destinations_rendered_at_apply,
+    literal_destinations,
     refuse_destination_overrides,
     refuse_unless_allowed,
     renders_at_apply,
@@ -196,9 +197,7 @@ def _check_destinations(
     if not waiting:
         refuse_unless_allowed(ref, connection=site.connection, environ=environ)
         return None
-    # A tunnel's host (``ssh_tunnel.host``) takes its tunnel with it: apply judges both.
-    drop = {name.partition(".")[0] for name in waiting}
-    literal = {key: value for key, value in site.connection.items() if key not in drop}
+    literal = literal_destinations(site.connection, waiting)
     if connection_hosts(literal):
         refuse_unless_allowed(ref, connection=literal, environ=environ)
     if allows_any_host(ref, environ):

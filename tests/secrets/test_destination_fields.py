@@ -288,6 +288,34 @@ def test_a_schemeless_uri_with_a_query_host_is_refused():
     assert "query string" in refusal.what
 
 
+# ── the lint and a tunnel whose host waits for apply ─────────────────────────
+
+
+@pytest.mark.unit
+def test_validate_leaves_nothing_to_apply_for_a_tunnel_switched_off():
+    connection = {"host": REMOTE, "ssh_tunnel": {"enable": False, "host": "{{ env.BASTION }}"}}
+    sent = {**connection, "secretRef": "env://PG"}  # pragma: allowlist secret
+    contract = {"builds": [{"properties": {"source": {"connection": sent}}}]}
+    (finding,) = lint_secret_refs(contract, environ={ALLOWLIST_ENV: f"PG@{REMOTE}"})
+    assert finding.ok
+    assert finding.deferred is None
+
+
+@pytest.mark.unit
+def test_validate_judges_the_hosts_behind_a_tunnel_whose_host_waits():
+    """A loopback host behind the tunnel needs an entry at apply, so validate says so now."""
+    connection = {"host": "localhost", "ssh_tunnel": {"enable": True, "host": "{{ env.BASTION }}"}}
+    sent = {**connection, "secretRef": "env://PG"}  # pragma: allowlist secret
+    contract = {"builds": [{"properties": {"source": {"connection": sent}}}]}
+    (finding,) = lint_secret_refs(contract, environ={})
+    assert not finding.ok
+    assert "localhost" in finding.error.what
+    (finding,) = lint_secret_refs(contract, environ={ALLOWLIST_ENV: "PG@localhost"})
+    assert finding.ok
+    assert finding.deferred is not None
+    assert "connection.ssh_tunnel.host" in finding.deferred.what
+
+
 @pytest.mark.unit
 def test_a_windows_domain_user_part_is_read_as_a_user():
     """``DOMAIN\\user`` is a SQL Server login: every parser reads the host after its ``@``."""
