@@ -444,3 +444,24 @@ def test_an_ignore_pattern_is_matched_against_a_bounded_text():
     assert not conv.ignores_path(long)
     assert conv.ignores_table(["a" * 10 + "b"]) and conv.ignores_path("a" * 10 + "b")
     assert not conv.ignores_table([])
+
+
+def test_an_environment_value_named_like_a_credential_is_not_kept(tmp_path):
+    conv = C.load_conventions(
+        write(
+            tmp_path,
+            """
+            environments:
+              only: {DB_PASSWORD: hunter2hunter2, API_TOKEN: abc123abc123, RETAIL_REGION: eu}
+            airflow_variables:
+              only: {db_password: hunter2hunter2, retail_region: eu}
+            """,
+        )
+    )
+    assert dict(conv.variables) == {"RETAIL_REGION": "eu"}
+    assert dict(conv.airflow_variables) == {"retail_region": "eu"}
+    assert sorted(conv.withheld) == [
+        "airflow_variables.only.db_password",
+        "environments.only.API_TOKEN",
+        "environments.only.DB_PASSWORD",
+    ]

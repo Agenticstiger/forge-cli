@@ -16,6 +16,7 @@ import textwrap
 from typing import Any
 
 import pytest
+import yaml
 
 from fluid_build.cli.import_workflow import _conventions as C
 from fluid_build.cli.import_workflow._airflow_dags import fill_variable_templates, read_dags
@@ -374,3 +375,114 @@ def test_a_name_imported_from_two_places_is_not_airflows_unless_both_are():
 def test_a_star_import_may_define_the_name_so_it_is_not_airflows():
     source = f'{AF2}from mylib import *\nx = Variable.get("environment")\n'
     assert isinstance(fold(source, environment="prod"), Unresolved)
+
+
+# ── a Variable whose name says it is a credential is not substituted ─────────────────
+
+#: ``DEFAULT_SENSITIVE_FIELDS`` of ``airflow.utils.log.secrets_masker`` (Airflow 2.x and 3.x): the
+#: names Airflow hides in its own logs and UI. The importer must treat each as a credential.
+AIRFLOW_SENSITIVE_FIELDS = (
+    "access_token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "passphrase",
+    "passwd",
+    "password",
+    "private_key",
+    "secret",
+    "token",
+    "keyfile_dict",
+    "service_account",
+    "access_key",
+)
+
+
+@pytest.mark.parametrize("field", AIRFLOW_SENSITIVE_FIELDS)
+@pytest.mark.parametrize("shape", ["{}", "db_{}", "{}_prod", "DB_{}"])
+def test_the_names_airflow_hides_are_not_substituted(field, shape):
+    name = shape.format(field)
+    conv = load(f"airflow_variables: {{only: {{{name}: 'Q-secret-value', retail_region: eu}}}}")
+    assert dict(conv.airflow_variables) == {"retail_region": "eu"}
+    assert conv.withheld == (f"airflow_variables.only.{name}",)
+    # the code's reference stays as written: nothing is filled in for the name
+    assert fill_variable_templates(
+        f"{{{{ var.value.{name} }}}}", conv.airflow_variables
+    ) == f"{{{{ var.value.{name} }}}}"
+
+
+def test_a_name_that_is_no_credential_is_substituted_as_before():
+    conv = load("airflow_variables: {only: {retail_region: eu, bucket_name: tb, keyspace: ks}}")
+    assert dict(conv.airflow_variables) == {
+        "retail_region": "eu",
+        "bucket_name": "tb",
+        "keyspace": "ks",
+    }
+    assert conv.withheld == ()
+    assert fill_variable_templates("{{ var.value.retail_region }}", conv.airflow_variables) == "eu"
+
+
+def test_an_environment_value_with_a_credential_name_is_not_substituted():
+    conv = load(
+        "environments: {only: {DB_PASSWORD: Q-secret-value, API_TOKEN: Q-token, REGION: eu}}"
+    )
+    assert dict(conv.variables) == {"REGION": "eu"}
+    assert set(conv.withheld) == {"environments.only.DB_PASSWORD", "environments.only.API_TOKEN"}
+
+
+def test_only_the_selected_environment_is_judged():
+    conv = load(
+        """
+        environment: dev
+        airflow_variables:
+          prod: {db_password: Q1, region: eu}
+          dev: {region: us}
+        """
+    )
+    assert dict(conv.airflow_variables) == {"region": "us"} and conv.withheld == ()
+
+
+def test_a_variable_read_in_code_for_a_credential_name_stays_unresolved():
+    conv = load("airflow_variables: {only: {db_password: Q-secret-value}}")
+    value = fold(f'{AF2}x = Variable.get("db_password")\n', **conv.airflow_variables)
+    assert "db_password" in why(value)
+
+
+def test_the_report_says_which_values_are_left_out_and_nothing_of_them(tmp_path, monkeypatch):
+    from fluid_build.cli.import_workflow.pyspark import PySparkImporter
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "jobs").mkdir()
+    (tmp_path / "dags").mkdir()
+    (tmp_path / "jobs" / "job.py").write_text(
+        "from pyspark.sql import SparkSession\n"
+        "spark = SparkSession.builder.getOrCreate()\n"
+        "spark.read.parquet('s3://src/in').write.parquet('s3://b/out')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "dags" / "d.py").write_text(
+        "from airflow import DAG\n"
+        "from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator\n"
+        "with DAG('d1'):\n"
+        "    SparkSubmitOperator(task_id='t', application='jobs/job.py',\n"
+        "        application_args=['--region', '{{ var.value.retail_region }}',\n"
+        "                          '--conn', '{{ var.value.db_password }}'])\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "c.yaml").write_text(
+        "airflow_variables:\n  only: {retail_region: eu, db_password: Q-secret-value}\n",
+        encoding="utf-8",
+    )
+    contracts, report = PySparkImporter().import_to_contracts(
+        str(tmp_path / "jobs"),
+        options={"dags": str(tmp_path / "dags"), "conventions": str(tmp_path / "c.yaml")},
+    )
+    text = yaml.safe_dump(contracts) + "\n".join(report.required_defaults)
+    assert "Q-secret-value" not in text
+    assert "{{ var.value.db_password }}" in text  # the reference is kept
+    assert "eu" in yaml.safe_dump(contracts) and "var.value.retail_region" not in text
+    assert [
+        x
+        for x in report.required_defaults
+        if "airflow_variables.only.db_password" in x and "credentials" in x
+    ]

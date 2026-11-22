@@ -179,6 +179,10 @@ def topic_schema_reader(options: Mapping[str, Any]) -> Optional[TopicSchema]:
     return read
 
 
+#: Conventions values left out for their names, listed one by one in the report; the rest counted.
+MAX_WITHHELD_NAMES = 10
+
+
 def run_import(
     tool: str, source: str, options: Mapping[str, Any]
 ) -> Tuple[List[Dict[str, Any]], ImportReport]:
@@ -188,6 +192,16 @@ def run_import(
         options.get("conventions"), roots=_named_directories(tool, source, options)
     )
     report = ImportReport()
+    if conv.withheld:
+        shown = ", ".join(safe_text(name, 80) for name in conv.withheld[:MAX_WITHHELD_NAMES])
+        more = len(conv.withheld) - MAX_WITHHELD_NAMES
+        report.required_defaults.append(
+            f"{len(conv.withheld)} value(s) in the conventions are not used, because their names "
+            f"say they are credentials ({shown}{f', and {more} more' if more > 0 else ''}): "
+            "the code's own reference (`{{ var.value.name }}`, `Variable.get(...)`, "
+            "`os.environ[...]`) is kept as written, so set the real value where the job runs "
+            "(a secret store or the environment), not in a contract"
+        )
     root = _directory(
         source, "DAGs directory" if tool == "airflow" else "jobs directory", f"fluid import {tool}"
     )

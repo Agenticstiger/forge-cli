@@ -101,6 +101,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Uni
 
 from ._airflow_dags import SUBMIT_KINDS
 from ._pysource import clean_chars
+from ._redact import sensitive_name
 from ._spark_io import HelperSpec
 
 DOC = "https://agenticstiger.github.io/forge_docs/cli/import.html"
@@ -204,6 +205,9 @@ class Conventions:
     variables: Mapping[str, str] = field(default_factory=dict)
     #: What each Airflow Variable holds in the selected environment.
     airflow_variables: Mapping[str, str] = field(default_factory=dict)
+    #: The ``environments`` and ``airflow_variables`` entries of the selected environment that are
+    #: not used, as ``section.name`` (see :func:`_not_credentials`).
+    withheld: Tuple[str, ...] = ()
     default_database: Optional[str] = None
     domain: Optional[str] = None
     runtime_platform: Optional[str] = None
@@ -378,6 +382,29 @@ def _env_value(value: Any, path: Optional[Path], where: str) -> str:
     if len(value) > MAX_TEXT:
         raise _fail(path, where, f"longer than {MAX_TEXT} characters")
     return value
+
+
+#: Names of ``DEFAULT_SENSITIVE_FIELDS`` in Airflow's secrets masker that the importer's own
+#: judgement of a name (:func:`sensitive_name`) does not know. Airflow hides a name that contains
+#: one of them.
+_AIRFLOW_HIDDEN = ("keyfile_dict", "service_account")
+
+
+def _not_credentials(values: Mapping[str, str], section: str) -> Tuple[Dict[str, str], List[str]]:
+    """``values`` without the ones whose name says they are a credential (``db_password``,
+    ``API_TOKEN``: the judgement the rest of the importer uses for a name, which covers the names
+    Airflow itself hides in its logs), and ``section.name`` of each one left out. A value kept in
+    the conventions is written into the contracts where the code reads it; a credential is not,
+    so the code's own reference (``{{ var.value.db_password }}``, ``Variable.get(...)``) stays
+    as it is and the report says what to set."""
+    kept: Dict[str, str] = {}
+    left: List[str] = []
+    for name, value in values.items():
+        if sensitive_name(name) or any(part in name.lower() for part in _AIRFLOW_HIDDEN):
+            left.append(f"{section}.{name}")
+        else:
+            kept[name] = value
+    return kept, left
 
 
 _SCRIPT = re.compile(r"[A-Za-z0-9_.\-]+(/[A-Za-z0-9_.\-]+)*")
@@ -645,6 +672,15 @@ def parse_conventions(
     elif named:
         raise _fail(source, "environment", f"name the one to use ({', '.join(named)})")
 
+    chosen = environment or ""
+    used_variables, withheld = _not_credentials(
+        environments.get(chosen, {}), f"environments.{chosen}"
+    )
+    used_airflow, withheld_airflow = _not_credentials(
+        airflow_variables.get(chosen, {}), f"airflow_variables.{chosen}"
+    )
+    withheld = [*withheld, *withheld_airflow]
+
     defaults = _mapping(
         top.get("defaults", {}), source, "defaults", frozenset({"database", "domain", "platform"})
     )
@@ -728,8 +764,9 @@ def parse_conventions(
         session_names=sessions,
         config_modules=modules,
         environment=environment,
-        variables=dict(environments.get(environment or "", {})),
-        airflow_variables=dict(airflow_variables.get(environment or "", {})),
+        variables=used_variables,
+        airflow_variables=used_airflow,
+        withheld=tuple(withheld),
         default_database=(
             _text(defaults["database"], source, "defaults.database", pattern=_NAME).lower()
             if "database" in defaults
