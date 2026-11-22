@@ -62,7 +62,7 @@ MAX_SQL_STRING = 262_144
 #: ``.format``, a join): a long string built over and over from a long literal is as costly as
 #: it is long, and this is the bound that keeps SQL, which may be long, as cheap as any other
 #: text. A module that builds more is told so, as one that takes too many steps is.
-MAX_STRING_WORK = 64_000_000
+MAX_STRING_WORK = 4_000_000
 #: Most containers elements folded in one literal.
 MAX_ITEMS = 2_000
 #: Most nodes one top-level :meth:`Folder.fold` call may visit, and one module in all: the work a
@@ -963,6 +963,9 @@ class Folder:
         if self._steps_call > MAX_STEPS_PER_FOLD or self._steps_module > MAX_STEPS_PER_MODULE:
             self.exhausted = True
             return Unresolved("it takes too much work to fold", snippet(node), transient=True)
+        if self._work > MAX_STRING_WORK:  # a module that has built its share builds no more
+            self.exhausted = True
+            return Unresolved("it takes too much work to fold", snippet(node), transient=True)
         key = id(node)
         if key in self._active:
             return Unresolved("it refers to itself", snippet(node))
@@ -982,9 +985,8 @@ class Folder:
             self._active.discard(key)
             self._nesting -= 1
         if isinstance(value, str) and isinstance(node, (ast.JoinedStr, ast.BinOp, ast.Call)):
-            self._work += len(value)  # a string this fold built, not one it found
-            if self._work > MAX_STRING_WORK:
-                self.exhausted = True
+            # a string this fold built, not one it found
+            if self._spend(len(value)) is not None:
                 value = Unresolved("it takes too much work to fold", snippet(node), transient=True)
         if remember and not (isinstance(value, Unresolved) and value.transient):
             weight = _text_size(value)
@@ -1030,6 +1032,15 @@ class Folder:
 
     def _too_long(self, text: str) -> Optional[Unresolved]:
         return _too_long(text, self._limit)
+
+    def _spend(self, chars: int) -> Optional[Unresolved]:
+        """Charge ``chars`` characters of string work to this module: ``None`` while it is within
+        :data:`MAX_STRING_WORK`, else why not (and the module is :attr:`exhausted`)."""
+        self._work += chars
+        if self._work > MAX_STRING_WORK:
+            self.exhausted = True
+            return Unresolved("it takes too much work to fold", "", transient=True)
+        return None
 
     def _hole(self, described: str) -> str:
         assert self._holes is not None
@@ -1183,6 +1194,8 @@ class Folder:
                 )
                 if isinstance(key, ast.Constant) and isinstance(key.value, str)
             }
+            if (over := self._spend(len(left))) is not None:  # it reads the template char by char
+                return over
             return percent_template(
                 left,
                 self.fold(right, scope, depth),
@@ -1399,6 +1412,10 @@ class Folder:
                     return Unresolved("a format call with **arguments", snippet(node))
                 kwargs[keyword.arg] = self.fold(keyword.value, scope, depth)
             keyed_nodes = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+            if (
+                over := self._spend(len(receiver))
+            ) is not None:  # it reads the template char by char
+                return over
             return format_template(
                 receiver, args, kwargs, self._hole_for(list(node.args), keyed_nodes), self._limit
             )

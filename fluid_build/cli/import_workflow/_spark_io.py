@@ -108,6 +108,9 @@ _PLACEHOLDER = re.compile(
 
 
 _IDENTIFIER_CALL = re.compile(r"(?i)\bIDENTIFIER\s*\(")
+#: ``IDENTIFIER(`` calls of one statement turned into holes; the rest are left as written. Each
+#: costs up to 500 characters of scanning for its closing parenthesis, and a statement may be 256 KB.
+_MAX_IDENTIFIER_CALLS = 500
 
 
 def _closing_paren(text: str, open_at: int) -> int:
@@ -135,11 +138,13 @@ def _identifier_calls_to_holes(text: str, holes: Dict[str, str]) -> str:
     called ``identifier``."""
     out: List[str] = []
     index = 0
+    seen = 0
     while True:
-        match = _IDENTIFIER_CALL.search(text, index)
+        match = _IDENTIFIER_CALL.search(text, index) if seen < _MAX_IDENTIFIER_CALLS else None
         if match is None:
             out.append(text[index:])
             return "".join(out)
+        seen += 1
         end = _closing_paren(text, match.end() - 1)
         if end < 0:
             out.append(text[index : match.end()])
@@ -654,10 +659,12 @@ class _Reader:
                     f"constant ({value.why})"
                 )
             return
-        prepared = _placeholders_to_holes(value, holes)
-        key = (prepared, tuple(sorted(holes.items())))
+        # Looked up before the text is read for placeholders: the same constant passed to a
+        # thousand ``spark.sql`` calls is read once.
+        key = (value, tuple(sorted(holes.items())))
         sql = self._sql_cache.get(key)
         if sql is None:
+            prepared = _placeholders_to_holes(value, holes)
             sql = self._sql_cache[key] = self._analyze_sql(prepared, holes)
         self.temp_views.update(sql.temp_views)
         for note in sql.notes:

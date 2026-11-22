@@ -146,3 +146,87 @@ def test_the_work_a_module_spends_building_strings_is_bounded(tmp_path, monkeypa
     _contracts, report = propose(tmp_path, monkeypatch, {"jobs/j.py": source})
     assert time.perf_counter() - started < 20
     assert "too much work to fold" in said(report)
+
+
+# --- what a long statement costs ---------------------------------------------------------
+
+
+def test_the_same_constant_passed_to_many_calls_is_read_for_placeholders_once(
+    tmp_path, monkeypatch
+):
+    from fluid_build.cli.import_workflow import _spark_io
+
+    reads = []
+    original = _spark_io._placeholders_to_holes
+    monkeypatch.setattr(
+        _spark_io,
+        "_placeholders_to_holes",
+        lambda text, holes: reads.append(len(text)) or original(text, holes),
+    )
+    source = HEAD + f'Q = """{statement(20_000)}"""\n' + "spark.sql(Q)\n" * 300
+    contracts, _report = propose(tmp_path, monkeypatch, {"jobs/j.py": source})
+    assert mapped(contracts)
+    assert reads == [reads[0]]  # once, not three hundred times
+
+
+def test_a_statement_full_of_identifier_calls_is_scanned_for_a_limited_number_of_them(
+    tmp_path, monkeypatch
+):
+    from fluid_build.cli.import_workflow import _spark_io
+
+    scans = []
+    original = _spark_io._closing_paren
+    monkeypatch.setattr(
+        _spark_io, "_closing_paren", lambda text, at: scans.append(at) or original(text, at)
+    )
+    body = "SELECT a FROM IDENTIFIER( " * 5_000  # none of them closes
+    source = HEAD + f'spark.sql("""{body}""")\n'
+    propose(tmp_path, monkeypatch, {"jobs/j.py": source})
+    assert 0 < len(scans) <= _spark_io._MAX_IDENTIFIER_CALLS
+
+
+def test_a_template_read_character_by_character_is_charged_before_it_is_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(_fold, "MAX_STRING_WORK", 300_000)
+    formats = []
+    original = _fold.format_template
+    monkeypatch.setattr(
+        _fold,
+        "format_template",
+        lambda fmt, *a, **k: formats.append(len(fmt)) or original(fmt, *a, **k),
+    )
+    template = statement(60_000, target="{}")
+    calls = "".join(f'spark.sql(TPL.format("t{n}"))\n' for n in range(30))
+    source = HEAD + f'TPL = """{template}"""\n' + calls
+    _contracts, report = propose(tmp_path, monkeypatch, {"jobs/j.py": source})
+    assert 0 < len(formats) <= 300_000 // 60_000 + 1  # the rest were refused unread
+    assert "too much work to fold" in said(report)
+
+
+def test_a_template_longer_than_the_work_left_is_not_read_at_all(tmp_path, monkeypatch):
+    monkeypatch.setattr(_fold, "MAX_STRING_WORK", 100_000)
+    formats = []
+    original = _fold.format_template
+    monkeypatch.setattr(
+        _fold,
+        "format_template",
+        lambda fmt, *a, **k: formats.append(len(fmt)) or original(fmt, *a, **k),
+    )
+    template = statement(150_000, target="{}")
+    source = HEAD + f'TPL = """{template}"""\nspark.sql(TPL.format("t0"))\n'
+    _contracts, report = propose(tmp_path, monkeypatch, {"jobs/j.py": source})
+    assert formats == []  # charged for its length first, and refused before the loop ran
+    assert "too much work to fold" in said(report)
+
+
+def test_a_module_that_has_spent_its_work_folds_no_more(tmp_path, monkeypatch):
+    monkeypatch.setattr(_fold, "MAX_STRING_WORK", 150_000)
+    big = statement(100_000, target="db.t0")
+    source = (
+        HEAD
+        + f'BIG = """{big}"""\n'
+        + 'spark.sql(BIG + " -- a")\nspark.sql(BIG + " -- b")\n'
+        + 'spark.sql("INSERT OVERWRITE TABLE db.after SELECT 1 FROM db.src")\n'
+    )
+    contracts, report = propose(tmp_path, monkeypatch, {"jobs/j.py": source})
+    assert "db.after" not in [c["id"] for c in contracts]  # nothing is folded past the budget
+    assert "too much work to fold" in said(report)
