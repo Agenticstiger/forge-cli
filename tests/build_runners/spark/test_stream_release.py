@@ -43,18 +43,28 @@ class Releasing(FakeAdapter):
     def __init__(self, *args, answers=(), refuse=None, **kw):
         super().__init__(*args, **kw)
         self.answers, self.refuse = set(answers), refuse
-        self.requests, self.withdrawn = [], []
+        self.requests, self.withdrawn, self.pending = [], [], {}
 
-    def request_stop(self, run_info):
+    def stop_request_for(self, run_info):
         if not run_info.stop_key:
             return None
+        uri = f"s3://commerce-lake/_fluid/spark/p/b/stop/{run_info.stop_key}"
+        self.pending[uri] = run_info
+        return uri
+
+    def put_stop_request(self, uri):
         if self.refuse:
             raise SparkRunError(self.refuse)
-        uri = f"s3://commerce-lake/_fluid/spark/p/b/stop/{run_info.stop_key}"
+        run_info = self.pending[uri]
         self.calls.append(f"ask {run_info.run_id}")
         self.requests.append(uri)
         if run_info.run_id in self.answers:
             self.scripts[run_info.run_id] = ["RUNNING", "RUNNING", "SUCCEEDED"]
+
+    def request_stop(self, run_info):
+        uri = self.stop_request_for(run_info)
+        if uri is not None:
+            self.put_stop_request(uri)
         return uri
 
     def withdraw_stop(self, uri):
@@ -135,7 +145,8 @@ def test_a_stop_request_that_cannot_be_written_falls_back_to_a_cancel(run, clock
     use(fake)
     out = go(run, clock)
     assert (out.action, out.error, out.cancelled) == ("restarted", False, ["old1"])
-    assert fake.calls == ["cancel old1", "start"]
+    # Tracked before the write, so removed even though the write failed.
+    assert fake.calls == ["withdraw", "cancel old1", "start"]
     assert "AccessDenied" in out.message and "cancelled" in out.message
 
 
@@ -164,17 +175,50 @@ def test_a_dry_run_says_which_runs_would_stop_between_batches(run, clock, use):
 def test_ctrl_c_while_a_stop_is_awaited_withdraws_the_request(run, clock, use):
     fake = Releasing([stale_of(run)])
     use(fake)
-    original = fake.request_stop
+    original = fake.put_stop_request
 
-    def then_interrupted(run_info):
-        uri = original(run_info)
-        fake.scripts[run_info.run_id] = ["RUNNING", "INTERRUPT"]
-        return uri
+    def then_interrupted(uri):
+        original(uri)
+        fake.scripts[fake.pending[uri].run_id] = ["RUNNING", "INTERRUPT"]
 
-    fake.request_stop = then_interrupted
+    fake.put_stop_request = then_interrupted
     with pytest.raises(KeyboardInterrupt):
         go(run, clock)
     assert fake.withdrawn == fake.requests and "start" not in fake.calls
+
+
+def test_a_ctrl_c_as_the_request_is_written_still_withdraws_it(run, clock, use):
+    """The request is tracked before it is written: one whose write landed as the Ctrl-C came
+    is removed too, so the old stream is not left to stop on its own."""
+    fake = Releasing([stale_of(run)])
+    use(fake)
+    original = fake.put_stop_request
+
+    def landed_then_interrupted(uri):
+        original(uri)
+        raise KeyboardInterrupt
+
+    fake.put_stop_request = landed_then_interrupted
+    with pytest.raises(KeyboardInterrupt):
+        go(run, clock)
+    assert fake.withdrawn == fake.requests == [fake.requests[0]]
+
+
+def test_a_second_ctrl_c_while_requests_are_withdrawn_still_withdraws_the_rest(run, clock, use):
+    fake = Releasing([stale_of(run), stale_of(run, "old2", key="fluid-k2")])
+    use(fake)
+    withdrawn = []
+
+    def interrupted_once(uri):
+        withdrawn.append(uri)
+        if len(withdrawn) == 1:
+            raise KeyboardInterrupt
+
+    fake.withdraw_stop = interrupted_once
+    fake.scripts["old1"] = ["RUNNING", "INTERRUPT"]
+    with pytest.raises(KeyboardInterrupt):
+        go(run, clock)
+    assert withdrawn == fake.requests and len(withdrawn) == 2
 
 
 def test_a_moved_checkpoint_is_said_to_start_from_starting_offsets(run, clock, use):

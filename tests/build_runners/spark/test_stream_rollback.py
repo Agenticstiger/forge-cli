@@ -71,6 +71,12 @@ class Rolling(Releasing):
         self.rolled_back.append(run)
         return self
 
+    def runs(self, since=None):  # as a runtime lists them: each run in its state now
+        listed = super().runs(since)
+        return [
+            dataclasses.replace(h, state=self.scripts.get(h.run_id, [h.state])[0]) for h in listed
+        ]
+
     def start(self, token, restart_of=None):
         if "start" in self.calls:  # the rollback's
             self.calls.append("start rollback")
@@ -122,11 +128,20 @@ def test_a_release_that_fails_its_probation_is_rolled_back_to_the_last_good_conf
     # The last good job config, with the shipped runner and the settings this apply compiled.
     assert back.job_uri == ad.release_config_uri(run.job_uri, OLD_DIGEST)
     assert (back.job_text, back.job_sha256) == (OLD_JOB, OLD_DIGEST)
-    assert (back.config_hash, back.source_id, back.checkpoint_id) == (
-        "stale",
-        run.source_id,
-        run.checkpoint_id,
+    assert (back.source_id, back.checkpoint_id) == (run.source_id, run.checkpoint_id)
+    # Neither config: the old job config with this apply's runner and settings.
+    import hashlib
+
+    label = hashlib.sha256(f"rollback:stale:{run.config_hash}".encode()).hexdigest()
+    assert back.config_hash == label
+    # The failed release's own stamps are not the rolled-back run's; this apply's run id is.
+    assert (back.release_id, back.contract_digest, back.bundle_digest, back.product_version) == (
+        None,
+        None,
+        None,
+        None,
     )
+    assert back.run_id == run.run_id
     assert back.checkpoint == "s3://lake/_checkpoints/p/b/"
     assert (back.runner_uri, back.role_arn, back.target) == (
         run.runner_uri,
@@ -312,3 +327,136 @@ def test_a_local_record_is_a_file_under_the_artifact_root(tmp_path, monkeypatch)
     assert adapter.release_config(old).decode("utf-8") == local.job_text.replace(
         "${fluid_spark_local_root}", str(root)
     )
+
+
+# --- what a probation does in the cases around it ---------------------------------------------
+
+
+def _failing_reads(fake, run_id, after):
+    """``fake.get`` that raises for ``run_id`` from its ``after``-th read on."""
+    seen = {"n": 0}
+    original = fake.get
+
+    def get(read_id):
+        if read_id == run_id:
+            seen["n"] += 1
+            if seen["n"] > after:
+                raise RuntimeError("Throttling")
+        return original(read_id)
+
+    fake.get = get
+
+
+def test_a_probation_read_that_fails_keeps_the_release_and_names_the_run(run, clock, use):
+    fake = Rolling([last_good(run)], answers={"old1"}, records={OLD_DIGEST: OLD_JOB})
+    use(fake)
+    _failing_reads(fake, "new", after=1)  # the start's read works, the probation's do not
+    out = go(run, clock)
+    assert (out.action, out.run_id, out.error, out.stopped) == ("restarted", "new", True, ["old1"])
+    assert "during its probation failed" in out.message and "left going" in out.message
+    assert fake.rolled_back == []
+
+
+def test_a_rollback_run_that_cannot_be_read_back_is_still_named(run, clock, use):
+    fake = Rolling(
+        [last_good(run)], answers={"old1"}, start_states=("FAILED",), records={OLD_DIGEST: OLD_JOB}
+    )
+    use(fake)
+    _failing_reads(fake, "rb", after=0)
+    out = go(run, clock)
+    assert (out.action, out.run_id, out.error) == ("rolled-back", "rb", True)
+    assert "run rb was started from its release record, but checking on it failed" in out.message
+
+
+def test_a_new_config_over_a_previous_one_that_died_is_watched_and_rolled_back(run, clock, use):
+    dead = dataclasses.replace(last_good(run), state="FAILED", raw_state="FAILED")
+    fake = Rolling([dead], start_states=("FAILED",), records={OLD_DIGEST: OLD_JOB})
+    use(fake)
+    out = go(run, clock)
+    assert (out.action, out.run_id) == ("rolled-back", "rb")
+    cancelled = dataclasses.replace(dead, state="CANCELLED", raw_state="CANCELLED")
+    fake = Rolling([cancelled], start_states=("FAILED",), records={OLD_DIGEST: OLD_JOB})
+    use(fake)
+    out = go(run, clock)  # an operator's cancel is no config to go back to
+    assert out.action == "started" and fake.rolled_back == []
+
+
+def test_a_release_that_changed_only_settings_or_the_runner_rolls_nothing_back(run, clock, use):
+    same = dataclasses.replace(last_good(run), job_sha256=started(run).job_sha256)
+    fake = Rolling([same], answers={"old1"}, start_states=("FAILED",), records={})
+    use(fake)
+    out = go(run, clock)
+    assert (out.action, out.error, fake.rolled_back) == ("failed", True, [])
+    assert "changed only the run's settings or runner" in out.message
+
+
+@pytest.mark.parametrize("stop", ["CANCELLED", "SUCCEEDED"])
+def test_a_run_stopped_from_outside_during_its_probation_is_not_rolled_back(run, clock, use, stop):
+    fake = Rolling(
+        [last_good(run)],
+        answers={"old1"},
+        start_states=("RUNNING", "RUNNING", stop),
+        records={OLD_DIGEST: OLD_JOB},
+    )
+    use(fake)
+    out = go(run, clock)
+    assert (out.action, out.state, fake.rolled_back) == ("restarted", stop, [])
+    assert "stopped during its probation" in out.message
+
+
+def test_no_rollback_starts_beside_a_run_another_apply_started(run, clock, use):
+    other = info("c1", "RUNNING", hash_="config-c", created=WALL)
+    fake = Rolling(
+        [last_good(run)],
+        answers={"old1"},
+        start_states=("FAILED",),
+        records={OLD_DIGEST: OLD_JOB},
+        later=[other, last_good(run)],
+    )
+    use(fake)
+    out = go(run, clock)
+    assert (out.action, fake.rolled_back) == ("failed", [])
+    assert "run c1 is going on the checkpoint" in out.message
+
+
+def test_an_unchanged_run_gets_the_record_a_pending_start_did_not_keep(run, clock, use):
+    fake = Rolling([info("jr1", "RUNNING", hash_=run.config_hash)])
+    use(fake)
+    out = go(run, clock)
+    assert (out.action, fake.kept) == ("unchanged", [started(run).job_sha256])
+    fake = Rolling([info("jr1", "RUNNING", hash_=run.config_hash)])
+    use(fake)
+    go(run, clock, only=True)  # --mode reconcile keeps none: its role may not write one
+    assert fake.kept == []
+
+
+def test_a_reconcile_restart_keeps_no_record(run, clock, use):
+    from tests.build_runners.spark.conftest import variant
+
+    ec2 = variant(run, "emr-ec2", {"clusterId": "j-1"}, restarts_per_hour=5)
+    died = info("s-1", "FAILED", hash_=ec2.config_hash, created=WALL - 60)
+    fake = Rolling([died])
+    fake.uploads_job = False
+    use(fake)
+    out = go(ec2, clock, only=True)
+    assert out.action == "restarted" and fake.kept == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "seconds"), [("86400", 3600.0), ("1e12", 3600.0), ("3599", 3599.0)]
+)
+def test_a_grace_or_probation_from_a_project_file_is_capped_at_an_hour(raw, seconds):
+    assert rc.stop_grace({rc.STOP_GRACE_ENV: raw}) == seconds
+    assert rc.release_probation({rc.PROBATION_ENV: raw}) == seconds
+
+
+def test_a_scheduled_run_never_starts_beside_a_continuous_run_still_stopping(run, clock, use):
+    """A stream moved to trigger.availableNow: while fluid apply waits for the old continuous run
+    to stop between batches, its scheduler's run must not become a second writer."""
+    available_now = dataclasses.replace(run, scheduled=True)
+    continuous = info("old1", "RUNNING", hash_="stale", checkpoint=run.checkpoint_id)
+    fake = Rolling([continuous])
+    use(fake)
+    out = rc.run_once(available_now, sleep=clock.sleep, now=clock.now, say=lambda _t: None)
+    assert (out.action, out.error, out.run_id, fake.calls) == ("refused", True, "old1", [])
+    assert "still going on the checkpoint" in out.message

@@ -330,8 +330,9 @@ def test_fluid_apply_rolls_a_failing_stream_release_back_to_the_last_good_config
         out = _said(capsys)
         assert "rolled-back" in out and "rolled back to config" in out
         back = runs.runs()[0]
-        assert (back.state, back.config_hash) == ("RUNNING", first.config_hash)
-        assert "/releases/" in str(back.config_uri)
+        # The last good job config (its digest, its record) under a hash of its own.
+        assert (back.state, back.job_sha256) == ("RUNNING", first.job_sha256)
+        assert back.config_hash != first.config_hash and "/releases/" in str(back.config_uri)
     finally:
         data["builds"] = []
         write(tmp_path, data)

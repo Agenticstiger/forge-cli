@@ -10,23 +10,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **A released Spark stream that fails is rolled back to the last good config.** After `fluid
-  apply` replaces a running stream's config, it watches the new run for
-  `FLUID_SPARK_RELEASE_PROBATION_SECONDS` (default 300, `0` keeps it at once): a run that ends, or
-  that its runtime retries (EMR Serverless, EMR on EKS, Glue), in that time failed. Forge then
-  cancels it if it is still going and starts the previous config again on its checkpoint, and the
-  apply fails with `spark_release_rolled_back` and an outcome that names both runs, both configs and
-  why. The previous config comes from its release record: after every start of a stream, forge
-  keeps the job config the run read beside the build's (`releases/<digest16>/job.json`, the bytes
-  with the MSK brokers OpenTofu fills in; on `runtime: local` under `FLUID_SPARK_LOCAL_ROOT`). A
-  record is used only when its digest is the one the runtime recorded for the run that ran it
-  (`--fluid-job-sha256`), so bytes put there since start nothing. Only the job config is rolled
-  back: the run gets the runner and the settings (role, target, Spark configuration, retries) this
-  apply compiled, as the Flink Kubernetes operator's rollback restores only its own resource. A
-  run started before this change has no record: the outcome then says the old config cannot be
-  started again, and the failing run is left as it is. A record that cannot be kept is a note on
-  the outcome, never the start's error. `--mode reconcile` watches nothing and rolls nothing back,
-  and a rolled-back stream is asked to stop between batches beside its record by the next
-  release.
+  apply` starts a stream's new config over a previous one (a running run it replaced, or one that
+  ended other than by an operator's cancel), it watches the new run for
+  `FLUID_SPARK_RELEASE_PROBATION_SECONDS` (default 300, `0` keeps it at once, at most 3600): a run
+  that fails in that time, or that its runtime retries (EMR Serverless and EMR on EKS do; the Glue
+  job forge emits never retries), failed its probation. Forge then cancels it if it is still going
+  and starts the previous job config again on its checkpoint, and the apply fails with
+  `spark_release_rolled_back` and an outcome that names both runs, both configs and why. A run
+  stopped from outside during its probation (an operator's cancel, another apply's stop) is no
+  failure and nothing is rolled back; neither is a rollback started beside a run another apply has
+  started since. The previous job config comes from its release record: after every start of a
+  stream (and on a later apply that finds the run going without one), forge keeps the job config the
+  run read beside the build's (`releases/<digest16>/job.json`, the bytes with the MSK brokers
+  OpenTofu fills in; on `runtime: local` under `FLUID_SPARK_LOCAL_ROOT`). A record is used only when
+  its digest is the one the runtime recorded for the run that ran it (`--fluid-job-sha256`), so bytes
+  put there since start nothing. Only the job config is rolled back: the run gets the runner and the
+  settings (role, target, Spark configuration, retries) this apply compiled, as the Flink Kubernetes
+  operator's rollback restores only its own resource, so a release that changed only settings or the
+  runner rolls nothing back and says so. The rolled-back run gets a config hash of its own (a
+  contract put back to the old config then replaces it with the old settings too), and carries this
+  apply's run id but not the failed release's release id, contract digest, product version or bundle
+  stamps. A run started before this change has no record: the outcome says the old config cannot be
+  started again, and the failing run is left as it is. A record that cannot be kept is a note on the
+  outcome. `--mode reconcile` keeps no record, watches nothing and rolls nothing back, and while a
+  rolled-back run goes it reports the stream as not what the last apply deployed until the next
+  `fluid apply`; applying the same contract again tries the release again. A scheduled run of a
+  stream moved to `trigger.availableNow` does not start while the old continuous run is still on
+  the checkpoint, `FLUID_SPARK_STOP_GRACE_SECONDS` is capped at 3600 too, a stop request is withdrawn
+  even when a Ctrl-C lands as it is written (or a second Ctrl-C as requests are withdrawn), and the
+  runner also refuses a checkpoint whose offsets name partitions the topic no longer has.
 - **A changed Spark stream stops between batches before `fluid apply` replaces it.** Where a
   changed config used to cancel the running stream, `fluid apply` now asks it to stop: each
   stream's run is started with a stop key (`--fluid-stop-key`, the start's own token), and the

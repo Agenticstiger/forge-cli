@@ -43,6 +43,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -542,8 +543,13 @@ def write_stop_request(
         SparkRunError: the root is unusable, or the request cannot be written.
     """
     uri = stop_request_uri(beside or bound_job_uri(host, run), key)
-    _write_artifact(host, uri, stop_request_body(run))
+    put_stop_request(host, run, uri)
     return uri
+
+
+def put_stop_request(host: LocalHost, run: DesiredRun, uri: str) -> None:
+    """Write the stop request at ``uri`` (beside a job config at this machine's root)."""
+    _write_artifact(host, uri, stop_request_body(run))
 
 
 def _write_artifact(host: LocalHost, uri: str, body: bytes) -> None:
@@ -606,8 +612,10 @@ def remove_stop_request(host: LocalHost, uri: str) -> None:
             _s3_client(host.env).delete_object(Bucket=bucket, Key=key)
         else:
             Path(uri).unlink(missing_ok=True)
-    except Exception:  # noqa: BLE001,S110 - best effort, as the docstring says
-        pass
+    except Exception as exc:  # noqa: BLE001 - best effort, as the docstring says
+        logging.getLogger(__name__).warning(
+            "spark_stop_request_left", extra={"uri": uri, "error": type(exc).__name__}
+        )
 
 
 def _replace(path: Path, body: bytes) -> None:

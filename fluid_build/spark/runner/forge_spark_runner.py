@@ -918,7 +918,7 @@ def topic_partitions(spark, config: dict) -> list | None:
         finally:
             consumer.close()
     except Exception as exc:  # noqa: BLE001 - Py4J's error: logged, the seed stays as read
-        log("dead_letters_partitions_unknown", error=type(exc).__name__)
+        log("topic_partitions_unknown", error=type(exc).__name__)
         return None
 
 
@@ -1037,14 +1037,15 @@ def stop_between_batches(queries, sleep=time.sleep) -> dict:
     return last
 
 
-def checkpoint_topics(spark, checkpoint: str) -> set | None:
-    """The topics the newest batch in ``checkpoint``'s offset log read; None for a new
-    checkpoint, or an entry this runner cannot read (Spark has the last word on it)."""
+def checkpoint_offsets(spark, checkpoint: str) -> dict | None:
+    """The offsets the newest batch in ``checkpoint``'s offset log read
+    (``{topic: {partition: offset}}``); None for a new checkpoint, or an entry this runner cannot
+    read (Spark has the last word on it)."""
     batches = [int(n) for n in _names(spark, f"{checkpoint}offsets") if n.isdigit()]
     if not batches:
         return None
     found = source_offsets(_read_small(spark, f"{checkpoint}offsets/{max(batches)}"), 2)
-    return set(json.loads(found)) if found else None
+    return json.loads(found) if found else None
 
 
 def check_checkpoint_fits(spark, config: dict) -> None:
@@ -1054,17 +1055,37 @@ def check_checkpoint_fits(spark, config: dict) -> None:
 
     fluid apply refuses a new source on the old checkpoint before it stops the run reading
     it, from the runs' history; this check also covers a checkpoint no known run of the build
-    used (a prefix copied from another stream, a new EMR cluster with no step history).
+    used (a prefix copied from another stream, a new EMR cluster with no step history). It
+    also refuses a checkpoint that names partitions the topic no longer has (the topic was
+    deleted and made again with fewer). The cluster is not in the offsets: the history check
+    is what refuses a new cluster on the old checkpoint.
 
     Raises:
-        JobConfigError: a checkpoint holds another topic's position."""
+        JobConfigError: a checkpoint holds another topic's position, or partitions the topic
+            no longer has."""
     topic = config["source"]["topic"]
     places = [config["checkpoint"]]
     if config.get("deadLetter"):
         places.append(config["deadLetter"]["checkpoint"])
+    partitions = None  # the topic's, read once, when a checkpoint names any
     for checkpoint in places:
-        topics = checkpoint_topics(spark, checkpoint)
-        if topics is not None and topics != {topic}:
+        offsets = checkpoint_offsets(spark, checkpoint)
+        if offsets is None:
+            continue
+        topics = set(offsets)
+        if topics == {topic}:
+            if partitions is None:
+                partitions = topic_partitions(spark, config) or []
+            gone = sorted(int(p) for p in offsets[topic] if partitions and int(p) not in partitions)
+            if gone:
+                raise JobConfigError(
+                    f"the checkpoint at {checkpoint} holds offsets of partition(s) "
+                    f"{', '.join(map(str, gone))} of topic {topic}, which it no longer has (the "
+                    "topic was made again?); nothing was read. Set properties.stream.checkpoint "
+                    "to a new prefix: the job then starts from properties.stream.startingOffsets"
+                )
+            continue
+        if topics != {topic}:
             raise JobConfigError(
                 f"the checkpoint at {checkpoint} holds the position of topic "
                 f"{', '.join(sorted(topics))}, and this job reads {topic}; nothing was read. "

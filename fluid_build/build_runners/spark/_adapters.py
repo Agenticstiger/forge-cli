@@ -228,6 +228,16 @@ def stop_location(info: RunInfo, job_uri: str) -> str:
     )
 
 
+def _left_behind(uri: str, exc: BaseException) -> None:
+    """Log a stop request that could not be removed (it stops no other run)."""
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "spark_stop_request_left",
+        extra={"uri": uri, "error": _error_code(exc) or type(exc).__name__},
+    )
+
+
 def stop_request_body(run: DesiredRun) -> bytes:
     """What a stop request holds, for whoever reads it: the runner only looks for the file."""
     import json
@@ -421,9 +431,28 @@ class Adapter:
             SparkRunError: the request could not be written, or the run looks for one beside
                 another job config (:func:`stop_location`; the message names it).
         """
+        uri = self.stop_request_for(info)
+        if uri is not None:
+            self.put_stop_request(uri)
+        return uri
+
+    def stop_request_for(self, info: RunInfo) -> Optional[str]:
+        """Where :meth:`request_stop` writes ``info``'s request, without writing it: None when
+        the run cannot be asked (no stop key).
+
+        Raises:
+            SparkRunError: the run looks for one beside another job config.
+        """
         if not usable_stop_key(info.stop_key):
             return None
-        uri = stop_request_uri(stop_location(info, self.run.job_uri), str(info.stop_key))
+        return stop_request_uri(stop_location(info, self.run.job_uri), str(info.stop_key))
+
+    def put_stop_request(self, uri: str) -> None:
+        """Write the stop request at ``uri`` (:meth:`stop_request_for`).
+
+        Raises:
+            SparkRunError: the request could not be written (the message names it).
+        """
         bucket, _, key = uri.removeprefix("s3://").partition("/")
         try:
             (self.clients or default_clients)("s3", self.run.region).put_object(
@@ -435,7 +464,6 @@ class Adapter:
         except Exception as exc:  # noqa: BLE001 - botocore's errors; named, then raised
             code = _error_code(exc) or type(exc).__name__
             raise SparkRunError(f"the stop request {uri} could not be written: {code}") from exc
-        return uri
 
     def sibling(self, run: DesiredRun) -> "Adapter":
         """An adapter for ``run``, another run of this build (a rollback's), with this one's
@@ -492,8 +520,8 @@ class Adapter:
             (self.clients or default_clients)("s3", self.run.region).delete_object(
                 Bucket=bucket, Key=key
             )
-        except Exception:  # noqa: BLE001,S110 - best effort, as the docstring says
-            pass
+        except Exception as exc:  # noqa: BLE001 - best effort, as the docstring says
+            _left_behind(uri, exc)
 
     def where(self) -> str:
         return ", ".join(f"{k} {v}" for k, v in self.run.target.items())
@@ -1071,10 +1099,23 @@ class Local(Adapter):
         ``s3://`` object): :meth:`Adapter.request_stop`."""
         from fluid_build.build_runners.spark._local import bound_job_uri, write_stop_request
 
+        uri = self.stop_request_for(info)
+        if uri is not None:
+            self.put_stop_request(uri)
+        return uri
+
+    def stop_request_for(self, info: RunInfo) -> Optional[str]:
+        from fluid_build.build_runners.spark._local import bound_job_uri
+
         if not usable_stop_key(info.stop_key):
             return None
         where = stop_location(info, bound_job_uri(self.host, self.run))
-        return write_stop_request(self.host, self.run, str(info.stop_key), beside=where)
+        return stop_request_uri(where, str(info.stop_key))
+
+    def put_stop_request(self, uri: str) -> None:
+        from fluid_build.build_runners.spark._local import put_stop_request
+
+        put_stop_request(self.host, self.run, uri)
 
     def withdraw_stop(self, uri: str) -> None:
         from fluid_build.build_runners.spark._local import remove_stop_request

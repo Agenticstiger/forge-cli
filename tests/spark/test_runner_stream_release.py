@@ -381,3 +381,23 @@ def test_a_stream_checks_its_checkpoint_before_it_creates_or_reads_anything(
     with pytest.raises(runner.JobConfigError, match="payments.events"):
         runner.run(None, config)
     assert done == []
+
+
+def test_a_checkpoint_of_partitions_the_topic_no_longer_has_is_refused(
+    runner, contract, monkeypatch
+):
+    """A topic deleted and made again with fewer partitions: Spark would resume offsets of
+    partitions that are not there."""
+    config = _stream_config(runner, contract)
+    checkpoints(
+        runner,
+        monkeypatch,
+        {f"{CHECKPOINT}offsets/7": 'v1\n{}\n{"commerce.orders":{"0":5,"1":9,"4":2}}'},
+    )
+    monkeypatch.setattr(runner, "topic_partitions", lambda spark, cfg: [0, 1])
+    with pytest.raises(runner.JobConfigError, match=r"partition\(s\) 4 of topic commerce.orders"):
+        runner.check_checkpoint_fits(None, config)
+    monkeypatch.setattr(runner, "topic_partitions", lambda spark, cfg: [0, 1, 4, 5])
+    runner.check_checkpoint_fits(None, config)  # partitions added since are the stream's to find
+    monkeypatch.setattr(runner, "topic_partitions", lambda spark, cfg: None)
+    runner.check_checkpoint_fits(None, config)  # unknown: Spark has the last word
