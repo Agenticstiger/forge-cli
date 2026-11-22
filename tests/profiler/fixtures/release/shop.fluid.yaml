@@ -1,0 +1,47 @@
+fluidVersion: "0.7.7"
+kind: DataProduct
+id: shop.related
+name: Shop with customers
+metadata:
+  owner:
+    team: shop-team
+exposes:
+  - exposeId: customers
+    kind: table
+    binding:
+      platform: local
+      format: parquet
+      location: { path: ./out/customers.parquet }
+    contract:
+      schema:
+        - { name: customer_id, type: INT, required: true }
+        - { name: region, type: "enum('east','north','west')", required: true }
+    semantics:
+      entities:
+        - { name: customer, type: primary, expr: customer_id }
+  - exposeId: orders
+    kind: table
+    binding:
+      platform: local
+      format: parquet
+      location: { path: ./out/orders.parquet }
+    contract:
+      schema:
+        - { name: order_id, type: INT, required: true }
+        - { name: customer_id, type: INT, required: true }
+        - { name: status, type: "enum('paid','placed','returned','shipped')", required: true }
+        - { name: channel, type: "enum('online','store')", required: true }
+        - name: amount
+          type: "decimal(10,2)"
+          required: true
+          validationRules:
+            - { type: range, constraint: "between 0 and 1000" }
+    semantics:
+      entities:
+        - { name: order, type: primary, expr: order_id }
+      relationships:
+        - name: placed_by
+          to: customers
+          fromColumns: [customer_id]
+          toColumns: [customer_id]
+          cardinality: many_to_one

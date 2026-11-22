@@ -1,0 +1,169 @@
+"_schemaURL": "https://agenticstiger.github.io/flux/engine/spec/profile-request/1-0-0/FluxProfileRequest.json"
+"contract":
+  "digest": "sha256:fabb520518ca2c12de17bf3f3446629b6d9ab6ecc55f6c90098a71179bf13fb4"
+"encoding":
+  "fractionalBits": 16
+  "rounding": "floor"
+"tables":
+  "customers":
+    "columns":
+      "customer_id":
+        "domain": "number"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "max"
+          - "min"
+          - "nullCount"
+          - "quantiles"
+          - "sum"
+        "statistics":
+          - "mean/1"
+          - "marginalHistogram/1"
+          - "quantile/2"
+      "region":
+        "domain": "category"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "nullCount"
+        "statistics":
+          - "levelHistogram/1"
+          - "support/1"
+    "rowCount": true
+  "orders":
+    "columns":
+      "amount":
+        "domain": "number"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "max"
+          - "min"
+          - "nullCount"
+          - "quantiles"
+          - "sum"
+        "statistics":
+          - "mean/1"
+          - "marginalHistogram/1"
+          - "quantile/2"
+      "customer_id":
+        "domain": "number"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "max"
+          - "min"
+          - "nullCount"
+          - "quantiles"
+          - "sum"
+        "statistics":
+          - "mean/1"
+          - "marginalHistogram/1"
+          - "quantile/2"
+      "note":
+        "domain": "category"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "nullCount"
+      "order_id":
+        "domain": "number"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "max"
+          - "min"
+          - "nullCount"
+          - "quantiles"
+          - "sum"
+        "statistics":
+          - "mean/1"
+          - "marginalHistogram/1"
+          - "quantile/2"
+      "paid":
+        "domain": "category"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "nullCount"
+      "placed_at":
+        "domain": "timestamp"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "max"
+          - "min"
+          - "nullCount"
+          - "quantiles"
+        "statistics":
+          - "mean/1"
+          - "marginalHistogram/1"
+          - "quantile/2"
+      "quantity":
+        "domain": "number"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "max"
+          - "min"
+          - "nullCount"
+          - "quantiles"
+          - "sum"
+        "statistics":
+          - "mean/1"
+          - "marginalHistogram/1"
+          - "quantile/2"
+      "status":
+        "domain": "category"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "nullCount"
+        "statistics":
+          - "levelHistogram/1"
+          - "support/1"
+      "units":
+        "domain": "number"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "max"
+          - "min"
+          - "nullCount"
+          - "quantiles"
+          - "sum"
+        "statistics":
+          - "mean/1"
+          - "marginalHistogram/1"
+          - "quantile/2"
+    "rowCount": true
+"relationships":
+  - "parent":
+      "table": "customers"
+      "columns":
+        - "customer_id"
+    "child":
+      "table": "orders"
+      "columns":
+        - "customer_id"
+    "statistics":
+      - "mean/1"
+      - "marginalHistogram/1"
+      - "quantile/2"
+"facts":
+  - "name": "orders.quantity_not_above_units"
+    "table": "orders"
+    "rule": "quantity_not_above_units"
+  - "name": "orders.paid_has_amount"
+    "table": "orders"
+    "rule": "paid_has_amount"
+  - "name": "orders.units_follow_quantity"
+    "table": "orders"
+    "rule": "units_follow_quantity"
+  - "name": "orders.lines_counted"
+    "table": "orders"
+    "rule": "lines_counted"
+  - "name": "orders.customer_fixes_status"
+    "table": "orders"
+    "rule": "customer_fixes_status"

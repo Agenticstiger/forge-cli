@@ -67,6 +67,13 @@ __all__ = [
     "MeasuredStatistic",
     "MetricDefinition",
     "ReadRefused",
+    "Request",
+    "RequestColumn",
+    "RequestEnd",
+    "RequestFact",
+    "RequestRefused",
+    "RequestRelationship",
+    "RequestTable",
     "StatisticDefinition",
     "StatisticsBackend",
     "StatisticsUnavailable",
@@ -121,6 +128,84 @@ class BundleTextRefused(ValueError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(f"{message} ({code})")
         self.code = code
+
+
+class RequestRefused(ValueError):
+    """The registry refused a profile request, or a contract the request is checked against.
+
+    ``code`` is the ``FLX-nnnn`` code (``FLX-5038`` for a request) and the message the
+    registry's own words, which name where in the text the problem is and never quote a
+    value.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{message} ({code})")
+        self.code = code
+
+
+@dataclass(frozen=True)
+class RequestColumn:
+    """One column a request lists: its domain, and the metrics and statistics it asks of it."""
+
+    name: str
+    domain: str
+    metrics: Tuple[str, ...] = ()
+    statistics: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RequestTable:
+    """One table (an exposeId) a request lists, whether it asks the row count, and its columns."""
+
+    expose_id: str
+    row_count: bool
+    columns: Tuple[RequestColumn, ...]
+
+    def column(self, name: str) -> Optional[RequestColumn]:
+        return next((each for each in self.columns if each.name == name), None)
+
+
+@dataclass(frozen=True)
+class RequestEnd:
+    """One side of a listed relationship: a table and its key columns."""
+
+    table: str
+    columns: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RequestRelationship:
+    """A listed relationship: the statistics asked over each parent's number of children."""
+
+    parent: RequestEnd
+    child: RequestEnd
+    statistics: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RequestFact:
+    """A listed fact share: the rows of a table that satisfy one of the contract's rules."""
+
+    name: str
+    table: str
+    rule: str
+
+
+@dataclass(frozen=True)
+class Request:
+    """A profile request as the registry reads it: what a profile may measure and publish.
+
+    ``contract_digest`` is ``None`` when the request names none.
+    """
+
+    contract_digest: Optional[str]
+    fractional_bits: int
+    tables: Tuple[RequestTable, ...]
+    relationships: Tuple[RequestRelationship, ...] = ()
+    facts: Tuple[RequestFact, ...] = ()
+
+    def table(self, expose_id: str) -> Optional[RequestTable]:
+        return next((each for each in self.tables if each.expose_id == expose_id), None)
 
 
 class MeasureRefused(ValueError):
@@ -405,6 +490,18 @@ class StatisticsBackend(Protocol):
         bins' whole-number edges, placed on the grid as the registry places any edge.
         """
 
+    def bin_cells(
+        self, values: Sequence[Any], edges: Sequence[Fraction], fractional_bits: int
+    ) -> List[int]:
+        """The bin of each value of a number or timestamp column, as ``marginalHistogram/1`` places it.
+
+        *values* are values as :meth:`read_value` returns them (none is ``None``) and *edges* the
+        declared bin edges, exact and strictly increasing. Each value and each edge is placed on
+        the grid of ``2**-fractional_bits`` steps, and a bin is half-open, ``[e_i, e_{i+1})``,
+        except the last, which is closed at the top. A value outside the edges is the caller's to
+        refuse: it is placed in the nearest end bin.
+        """
+
     def check_edge_counts(
         self,
         statistics: Sequence[EdgeStatistic],
@@ -438,6 +535,21 @@ class StatisticsBackend(Protocol):
 
         Every key is an NFC string, every string NFC, a decimal its string spelling.
         Raises :class:`BundleTextRefused`, naming *name*, for a value with no canonical form.
+        """
+
+    def read_request(self, text: str, *, name: str) -> Request:
+        """The profile request in *text*, read whole as flux-stats reads one (FLUX PROFILE-REQUEST-SPEC).
+
+        Raises :class:`RequestRefused` (``FLX-5038``) for text it refuses, naming *name*
+        and where in it the problem is, never a value.
+        """
+
+    def contract_digest(self, text: str, *, name: str) -> str:
+        """The digest a request names its contract by, of the contract in *text*.
+
+        As ``fluxsim init`` takes it: ``sha256:`` and the hex of the RFC 8785 bytes of the
+        canonical form of the one FLUID contract the exact YAML reader finds. Raises
+        :class:`RequestRefused` for text that holds no such contract, or not exactly one.
         """
 
 
@@ -604,6 +716,67 @@ class _FluxStatsBackend:
                 else (error.detail or error.code.title)
             )
             raise BundleTextRefused(error.code.code, f"{name}: {detail}") from None
+
+    def read_request(self, text: str, *, name: str) -> Request:
+        try:
+            from flux_stats.request import load_request_text
+
+            asked = load_request_text(text, name=name)
+        except ImportError as error:
+            raise _unavailable(error) from None
+        except self._refused as error:
+            raise RequestRefused(error.code.code, error.detail or error.code.title) from None
+        return Request(
+            contract_digest=asked.contract_digest,
+            fractional_bits=asked.fractional_bits,
+            tables=tuple(
+                RequestTable(
+                    expose_id=table.expose_id,
+                    row_count=table.row_count,
+                    columns=tuple(
+                        RequestColumn(
+                            name=column.name,
+                            domain=column.domain,
+                            metrics=tuple(column.metrics),
+                            statistics=tuple(column.statistics),
+                        )
+                        for column in table.columns
+                    ),
+                )
+                for table in asked.tables
+            ),
+            relationships=tuple(
+                RequestRelationship(
+                    parent=RequestEnd(link.parent.table, tuple(link.parent.columns)),
+                    child=RequestEnd(link.child.table, tuple(link.child.columns)),
+                    statistics=tuple(link.statistics),
+                )
+                for link in asked.relationships
+            ),
+            facts=tuple(RequestFact(fact.name, fact.table, fact.rule) for fact in asked.facts),
+        )
+
+    def contract_digest(self, text: str, *, name: str) -> str:
+        import hashlib
+
+        import rfc8785
+
+        try:
+            documents = self._exact_yaml.load_documents(
+                text, name=name, budget=self._exact_yaml.ReadBudget()
+            )
+            contracts = [
+                each for each in documents if isinstance(each, Mapping) and "exposes" in each
+            ]
+            if len(contracts) != 1:
+                raise RequestRefused(
+                    "FLX-3105",
+                    f"{name} holds {len(contracts)} FLUID contracts; a request names exactly one",
+                )
+            canonical = rfc8785.dumps(self._canonical.canonicalise(contracts[0]))
+        except self._refused as error:
+            raise RequestRefused(error.code.code, error.detail or error.code.title) from None
+        return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
     def check_document(self, text: str) -> None:
         try:
@@ -854,6 +1027,18 @@ class _FluxStatsBackend:
             cells=tuple(state.cell_counts("marginalHistogram")),
         )
 
+    def bin_cells(
+        self, values: Sequence[Any], edges: Sequence[Fraction], fractional_bits: int
+    ) -> List[int]:
+        # flux_stats.definitions.bin_index takes the first bin whose upper edge is above the
+        # value; with the inner edges that is the number of them at or below the value, and
+        # tests/profiler/test_release_seam.py keeps the two equal at every edge.
+        from bisect import bisect_right
+
+        grid = self._grid(fractional_bits)
+        inner = [grid.quantise(Fraction(edge), subject="bin edge") for edge in edges[1:-1]]
+        return [bisect_right(inner, grid.quantise(Fraction(v), subject="value")) for v in values]
+
     def check_edge_counts(
         self,
         statistics: Sequence[EdgeStatistic],
@@ -956,9 +1141,10 @@ def load_backend() -> StatisticsBackend:
 #: The flux-stats range ``[profile]`` names in ``pyproject.toml``. The CLI cannot read
 #: that file once installed, so the install message repeats it;
 #: ``tests/profiler/test_flux_stats_pin.py`` keeps the two equal.
-#: 0.7.0 is the first flux-stats release that holds ``edge_counts``, ``exact_yaml`` and
-#: ``quantile/2``.
-FLUX_STATS_REQUIREMENT = "flux-stats[yaml]>=0.7.0,<0.8"
+#: From 0.9 on flux-stats is versioned by its own formats and API, so the range runs to the
+#: next major. 0.9.0 is the first release that holds ``flux_stats.request``, a boolean read
+#: as a category, and profile format 1-2-0 with ``flux_stats.noise``.
+FLUX_STATS_REQUIREMENT = "flux-stats[yaml]>=0.9,<1"
 #: The extra carries the range, and pip replaces a copy outside it (the 0.0.1
 #: placeholder, or a release newer than this module knows).
 FLUX_STATS_INSTALL_COMMAND = "pip install 'data-product-forge[profile]'"

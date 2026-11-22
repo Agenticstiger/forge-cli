@@ -13,10 +13,14 @@ column's edges (FLUX ADR 0012) and the ACRO rules for the rest.
 - **A column typed** ``enum(...)``: ``levelHistogram/1`` over every level the type
   declares. A level no record holds is a cell of none, which the check withholds as
   ``C``, so the levels listed never depend on the records.
+- **A column typed** ``boolean``, ``bool`` or ``bit``: the same, over the two levels
+  ``false`` and ``true``, which flux-stats reads a boolean as. The grammar takes a
+  ``support`` of written-out values on any column, so a boolean is declared as an enum of
+  those two levels, and a level no record holds is a withheld cell as for an enum.
 - **A number whose** ``validationRules`` **declare both ends of a range** inside its
-  type: ``marginalHistogram/1`` over about ten bins of one width, exact at both ends (an
-  integer range ends half a unit past its top, a whole unit on a grid of whole steps, so
-  each value has a bin of its own). A side at or past the type's own bound declares
+  type: ``marginalHistogram/1`` over about ten bins of one width, exact at both ends: the
+  first edge is the declared minimum and the last the declared maximum, which the last bin,
+  closed at the top, holds. A side at or past the type's own bound declares
   nothing the type does not, and a range of one side is not closed: ten bins over the rest
   of the type would hold every record in one of them, so such a number takes the ladder.
 - **Any other number of a bounded type, a date or a timestamp**: ``quantile/2`` at the
@@ -28,9 +32,10 @@ column's edges (FLUX ADR 0012) and the ACRO rules for the rest.
   and counts, a histogram on the ladder published nothing, and the quantiles beside it
   nothing.
 - **A grouping the contract declares**, a categorical ``semantics.dimensions`` entry on
-  an ``enum`` column: each other ``enum`` column's level histogram per level of the
-  grouping. Every declared level is a group, one that no record holds included, so the
-  groups listed never depend on the records either; such a group withholds its siblings.
+  an ``enum`` or boolean column: each other ``enum`` or boolean column's level histogram
+  per level of the grouping. Every declared level is a group, one that no record holds
+  included, so the groups listed never depend on the records either; such a group
+  withholds its siblings.
   One column's groupings hold at most :data:`MOST_GROUPED_CELLS` cells together: one past
   that is left out, and named.
 
@@ -94,6 +99,10 @@ _LADDER_YEARS = range(1900, 2101)
 
 #: The smallest sub-unit edge a decimal's ladder takes: 2^-10, and never below the grid.
 _FINEST_SUB_UNIT = 10
+
+#: The types flux-engine reads as a boolean, and the two levels flux-stats reads one as.
+BOOLEAN_TYPES = frozenset({"boolean", "bool", "bit"})
+BOOLEAN_LEVELS: Tuple[str, str] = ("false", "true")
 
 #: The most cells one column's grouped level histograms hold together, every declared level
 #: of each grouping a group. Checking them together costs about the cube of the levels, so
@@ -239,18 +248,19 @@ def range_bins(
     The edges are the range's two ends and the multiples of one width strictly between
     them: the narrowest of 2^-k (on the grid), 1, 2, 5, 10, 20, 50 ... that cuts the range
     into at most :data:`RANGE_BINS` bins. An *integral* column (an integer type, or a
-    decimal of scale 0) takes whole widths only, and its range ends half a unit past
-    ``high`` (a whole unit on a grid of whole steps, which holds no half), so the last
-    value is not alone with the one below it in the last bin, which is closed at the top:
-    ``between 1 and 5`` gets one bin per value. The ends are rounded outward to the grid.
+    decimal of scale 0) takes whole widths only. The last edge is ``high``, the column's
+    maximum, and the last bin is closed at the top, so it holds the maximum: an edge past
+    it would leave the declared range, which flux-engine refuses (``FLX-5032``), and a
+    bundle made from such a profile would read a maximum the contract never declared.
+    ``between 1 and 5`` gets the edges 1, 2, 3, 4 and 5, the last bin holding 4 and 5. The
+    ends are rounded outward to the grid.
     The grid can be coarser than the column's own scale, so an end bin can reach past a
     bound: the runner checks each value against the range itself before it is counted
     (:class:`DeclaredRange`).
     """
     step = Fraction(1, 2**fractional_bits)
     first = math.floor(low / step) * step
-    top = high + (Fraction(1, 2) if fractional_bits >= 1 else 1) if integral else high
-    last = math.ceil(top / step) * step
+    last = math.ceil(high / step) * step
     span = high - low
     widths: List[Fraction] = (
         [] if integral else [Fraction(1, 2**power) for power in range(fractional_bits, 0, -1)]
@@ -331,6 +341,13 @@ def default_plan(
         entry = schema.get(column.name, {})
         declared_type = entry.get("type")
         if column.domain == "category":
+            if _is_boolean(declared_type):
+                levels[column.name] = len(BOOLEAN_LEVELS)
+                declared[column.name] = {
+                    "support": {"values": list(BOOLEAN_LEVELS)},
+                    "maxCardinality": len(BOOLEAN_LEVELS),
+                }
+                continue
             try:
                 found = _levels(enum_levels, declared_type)
             except ValueError as refused:  # the registry's FLX-3001: a list it cannot read
@@ -424,6 +441,12 @@ def default_plan(
         "properties": properties,
     }
     return DefaultPlan(block=block, uncovered=tuple(uncovered), ranges=ranges)
+
+
+def _is_boolean(declared_type: Any) -> bool:
+    """Whether a column's declared type is one of flux-engine's BOOL types."""
+    text = re.sub(r"\s+", " ", str(declared_type or "").strip().lower())
+    return re.sub(r"\s*\(.*\)$", "", text) in BOOLEAN_TYPES
 
 
 def _levels(enum_levels: Callable[[str], Sequence[str]], declared_type: Any) -> int:

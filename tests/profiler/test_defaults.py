@@ -94,19 +94,18 @@ def test_a_declared_range_gets_a_histogram_on_bins_of_one_width(tmp_path):
     )
     rows = [{"score": str(n % 101)} for n in range(400)]
     result = _profile(tmp_path, _contract([score]), rows)
-    bins = [*(str(edge) for edge in range(0, 101, 10)), "100.5"]  # 100 alone in the last bin
+    bins = [str(edge) for edge in range(0, 101, 10)]  # the last bin ends at the maximum, 100
     assert _one(result, "score", "marginalHistogram/1")["bins"] == bins
     # The histogram alone: checked beside quantiles on the same bins, the two let a reader
     # who knows the check tell worlds apart (tests/profiler/test_disclosure_oracle.py).
     definitions = [s["definition"] for s in _statistics(result, "score")]
     assert definitions == ["marginalHistogram/1"]
     (group,) = _one(result, "score", "marginalHistogram/1")["groups"]
-    # 0 to 96 are held 4 times each and 97 to 100 three times: every bin of ten publishes,
-    # and 100, alone in the last bin with 3 records, is withheld with the bin beside it.
+    # 0 to 96 are held 4 times each and 97 to 100 three times: the nine bins of ten values
+    # hold 40 each, and the last bin, 90 to 100 closed at the top, 7 * 4 + 4 * 3 = 40 too.
     assert group["status"] == "F"
-    assert group["binCounts"][:9] == [40] * 9
-    assert group["binCounts"][9:] == [None, None]
-    assert group["cellStatus"][9:] == ["C", "C"]
+    assert group["binCounts"] == [40] * 10
+    assert "cellStatus" not in group
     # Its sum, distinct count and quantiles are withheld, and it has no mean/1: each would
     # give a withheld bin back from the published ones.
     metrics = result.document["tables"]["t"]["columns"]["score"]["metrics"]
@@ -116,7 +115,7 @@ def test_a_declared_range_gets_a_histogram_on_bins_of_one_width(tmp_path):
     assert metrics["count"]["status"] == "F"
 
 
-@pytest.mark.parametrize("bits", [16, 0])  # at 0 the last bin, [5, 6], holds 6 too
+@pytest.mark.parametrize("bits", [16, 0])  # each value is checked against the range itself
 def test_a_value_outside_the_declared_range_refuses_the_profile(tmp_path, bits):
     score = (
         "score",
@@ -350,6 +349,129 @@ def test_with_a_bundle_no_default_statistic_is_declared(tmp_path):
     assert [s["definition"] for s in _statistics(result, "age")] == ["mean/1"]
 
 
+# -- a boolean column ---------------------------------------------------------------------
+
+PAID = ("paid", "boolean", {})
+
+
+def _profile_file(tmp_path: Path, contract, name: str, write, **options):
+    path = tmp_path / name
+    write(path)
+    return profile_expose(contract, "t", source=str(path), backend=FakeBackend(), **options)
+
+
+def _boolean_rows(trues=60, falses=40):
+    return [{"paid": True}] * trues + [{"paid": False}] * falses
+
+
+def _write_csv(path: Path):
+    path.write_text("paid\n" + "true\n" * 60 + "false\n" * 40, encoding="utf-8")
+
+
+def _write_parquet(path: Path):
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect()
+    con.execute(
+        "COPY (SELECT (range % 5 < 3) AS paid FROM range(100)) TO '"
+        + str(path)
+        + "' (FORMAT parquet)"
+    )
+    con.close()
+
+
+def _write_ndjson(path: Path):
+    path.write_text("".join(json.dumps(row) + "\n" for row in _boolean_rows()), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "name, write",
+    [("t.csv", _write_csv), ("t.ndjson", _write_ndjson), ("t.parquet", _write_parquet)],
+)
+def test_a_boolean_column_has_its_counts_and_a_histogram_over_false_and_true(tmp_path, name, write):
+    result = _profile_file(tmp_path, _contract([PAID]), name, write)
+    column = result.document["tables"]["t"]["columns"]["paid"]
+    assert column["domain"] == "category"
+    assert column["metrics"]["count"]["value"] == 100
+    assert column["metrics"]["nullCount"]["status"] == "A"  # no null: a zero is withheld
+    assert "distinctCount" not in column["metrics"] or (
+        column["metrics"]["distinctCount"].get("status") == "D"
+    )
+    histogram = _one(result, "paid", "levelHistogram/1")
+    assert histogram["levels"] == ["false", "true"]
+    (group,) = histogram["groups"]
+    assert group["levelCounts"] == [40, 60]
+
+
+def test_a_constant_boolean_column_withholds_its_empty_cell(tmp_path):
+    result = _profile(tmp_path, _contract([PAID]), _boolean_rows(trues=100, falses=0))
+    histogram = _one(result, "paid", "levelHistogram/1")
+    assert histogram["levels"] == ["false", "true"]
+    # 'false' holds no record: a cell of none is withheld, and the group with it, as for an enum.
+    assert histogram["groups"] == [{"group": "", "status": "C"}]
+
+
+def test_a_boolean_column_is_grouped_by_an_enum_dimension_and_groups_one(tmp_path):
+    region = ("region", "enum('north', 'south')", {})
+    rows = (
+        [{"paid": True, "region": "north"}] * 40
+        + [{"paid": False, "region": "north"}] * 20
+        + [{"paid": True, "region": "south"}] * 30
+        + [{"paid": False, "region": "south"}] * 30
+    )
+    result = _profile(tmp_path, _contract([PAID, region], dimensions=["region"]), rows)
+    grouped = _one(result, "paid", "levelHistogram/1", groupBy="region")
+    assert [group["levelCounts"] for group in grouped["groups"]] == [[20, 40], [30, 30]]
+    # And as the dimension itself: the enum column grouped by the boolean.
+    by_paid = _profile(tmp_path, _contract([PAID, region], dimensions=["paid"]), rows)
+    by_flag = _one(by_paid, "region", "levelHistogram/1", groupBy="paid")
+    assert [group["group"] for group in by_flag["groups"]] == ["false", "true"]
+    assert [group["levelCounts"] for group in by_flag["groups"]] == [[20, 30], [40, 30]]
+
+
+def test_a_boolean_arriving_as_text_reads_as_the_same_level(tmp_path):
+    rows = [{"paid": "true"}] * 30 + [{"paid": False}] * 40 + [{"paid": "false"}] * 30
+    result = _profile(tmp_path, _contract([PAID]), rows)
+    (group,) = _one(result, "paid", "levelHistogram/1")["groups"]
+    assert group["levelCounts"] == [70, 30]
+
+
+@pytest.mark.parametrize("value", ["True", "yes", "TRUE", "SECRETVALUE"])
+def test_a_value_outside_false_and_true_refuses_the_profile_without_showing_it(tmp_path, value):
+    rows = _boolean_rows() + [{"paid": value}]
+    with pytest.raises(ProfileError) as caught:
+        _profile(tmp_path, _contract([PAID]), rows)
+    assert caught.value.event == "profile_record_outside_declared_domain"
+    assert str(value) not in str(caught.value) and "paid" in str(caught.value)
+
+
+def test_a_simulation_may_declare_a_property_on_a_boolean_column(tmp_path):
+    from fluid_build.profiler.bundle import BundleBlock
+
+    block = {
+        "encoding": {"fractionalBits": 16},
+        "records": {"min": 1, "max": 1000},
+        "budget": {"maxChecksPerState": 1},
+        "columns": {"paid": {"support": {"values": ["false", "true"]}, "maxCardinality": 2}},
+        "properties": [
+            {
+                "property": "levelHistogram",
+                "column": "paid",
+                "tolerance": {"type": "distance", "measure": "totalVariation", "max": "1"},
+            },
+            {"property": "support", "column": "paid", "tolerance": {"type": "count", "max": 0}},
+        ],
+    }
+    result = _profile(
+        tmp_path,
+        _contract([PAID]),
+        _boolean_rows(),
+        bundle=BundleBlock(raw=block, simulation="s.flux.yml", expose_id="t"),
+    )
+    (group,) = _one(result, "paid", "levelHistogram/1")["groups"]
+    assert group["levelCounts"] == [40, 60]
+    assert _one(result, "paid", "support/1")
+
+
 # -- the pure parts -----------------------------------------------------------------------
 
 
@@ -396,20 +518,30 @@ def test_a_declared_range_is_cut_into_about_ten_bins_on_the_grid(low, high, bits
 @pytest.mark.parametrize(
     "low, high, edges",
     [
-        (1, 5, [1, 2, 3, 4, 5, Fraction(11, 2)]),  # one bin per value, 5 not beside 4
-        (0, 100, [*range(0, 101, 10), Fraction(201, 2)]),
-        (-3, 3, [-3, -2, -1, 0, 1, 2, 3, Fraction(7, 2)]),
+        (1, 5, [1, 2, 3, 4, 5]),  # the last bin, closed at the top, holds 4 and 5
+        (0, 100, [*range(0, 101, 10)]),
+        (-3, 3, [-3, -2, -1, 0, 1, 2, 3]),
+        (0, 7, [0, 1, 2, 3, 4, 5, 6, 7]),
     ],
 )
-def test_an_integral_range_gets_whole_bins_and_half_a_unit_past_its_top(low, high, edges):
+def test_an_integral_range_gets_whole_bins_and_ends_at_its_maximum(low, high, edges):
     got = defaults.range_bins(Fraction(low), Fraction(high), 16, integral=True)
     assert list(got) == [Fraction(edge) for edge in edges]
+    # The top edge is the declared maximum: flux-engine refuses bins that leave the range.
+    assert got[-1] == Fraction(high)
 
 
-def test_on_a_grid_of_whole_steps_an_integral_range_ends_a_whole_unit_past_its_top():
-    # Half a unit is off that grid; a whole one keeps 5 out of 4's bin.
+def test_on_a_grid_of_whole_steps_an_integral_range_ends_at_its_maximum_too():
     got = defaults.range_bins(Fraction(1), Fraction(5), 0, integral=True)
-    assert list(got) == [Fraction(edge) for edge in (1, 2, 3, 4, 5, 6)]
+    assert list(got) == [Fraction(edge) for edge in (1, 2, 3, 4, 5)]
+
+
+@pytest.mark.parametrize("integral", [True, False])
+@pytest.mark.parametrize("low, high", [(0, 100), (-50, 3), (1, 2), (0, 10**12)])
+def test_no_edge_leaves_the_declared_range_on_the_grid(low, high, integral):
+    got = defaults.range_bins(Fraction(low), Fraction(high), 16, integral=integral)
+    assert got[0] == Fraction(low) and got[-1] == Fraction(high)
+    assert all(a < b for a, b in zip(got, got[1:], strict=False))
 
 
 def test_a_range_off_the_grid_is_rounded_outward_to_it():

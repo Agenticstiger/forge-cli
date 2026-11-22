@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid profile --privacy-unit` releases a table under differential privacy.** With `--request`,
+  `--rho R` and `--release-record PATH`, the profile is a release of one table's requested statistics
+  under zero-concentrated differential privacy: a profile of format 1-2-0 that flux-engine grades P3.
+  It holds a noisy `levelHistogram/1` of each required enum column the request lists, a noisy
+  `marginalHistogram/1` of each required number, date or timestamp column on public bins (the
+  declared range, else the type's ladder), and noisy clique marginals over categorical columns,
+  chosen with OpenDP's AIM (the `[privacy]` extra, needed only when a selection runs). The privacy
+  unit is an entity: one row of `--privacy-unit`, or with `--release-table` a child table through one
+  declared relationship, or with `--unit-key COL[,COL]` the rows of one table that share a key. Each
+  entity contributes at most `--max-rows-per-unit` rows and counts at most `--max-rows-per-cell` in
+  one cell, so the stated loss holds for each entity and for each row of it. A tenth of `rho` chooses
+  the cliques, the rest is split equally over the count tables, each table gets exact discrete
+  Gaussian noise at the least scale that spends no more than its share, and the tables are made to
+  agree exactly. The noise is drawn from a seeded randomness source recorded in `--release-record`,
+  created readable by its owner alone, so the release can be re-derived inside the data owner's
+  boundary with `--rederive`, which writes the profile only when its digest is the recorded one; the
+  record must stay there, since with it and the profile the noise can be taken off. Nothing that
+  depends on the records is printed, logged or recorded outside the noise: a refusal names a column
+  and a row and never a value or a count. The report names the unit, the loss and its split, each
+  table's scale, the cliques, an informational conversion to (epsilon, delta), and every requested
+  item that is not released, with the reason. A release of a table that has relationships lists the
+  other tables with their domains only and cannot ship on flux-engine 0.9 until it skips a table the
+  release holds no statistic for.
+
+- **`fluid profile --request FILE` answers a FLUX profile request.** The request is the list of
+  statistics, column metrics and relationships `fluxsim init --contract` writes for a contract, and
+  the profile measures what it lists and nothing else, under the same output checks: per listed
+  table only the listed columns, metrics and statistics (the contract's default statistics,
+  ungrouped), the row count only when asked, and children per parent only for a listed relationship
+  the contract declares. Each listed item the profile cannot answer is named in the report as
+  `Not measured`, with its reason (for example a histogram over a number with no declared range, or
+  quantiles beside a histogram on one set of bins). A listed fact, a rule of the contract's
+  `invariants`, is measured on the table's records as the rows the rule covers that do not and do
+  satisfy it, two counts that pass the output checks as cells do (either withheld withholds both),
+  and written as an `invariants` entry, which makes the profile format 1-2-0; a column a rule reads
+  is read and never profiled, and a rule over an aggregate, a dependency or a related row is
+  reported as not measured, with why. The request's
+  grid is the profile's. Refused before any record is read, each with its own event code: a request
+  beside `--bundle`, `--env` or `--expose`, a stage-1 bundle archive as the contract, a request file
+  that is not a regular file, is too large, is not UTF-8 or that flux-stats refuses, a contract digest
+  that is not the contract file's (run `fluxsim init` again), a table, column or domain the contract
+  and profile do not share, a `--fractional-bits` that differs from the request's, and a listed table
+  with no `--source` or a `--source` for one the request does not list.
+
+- **`fluid profile` profiles boolean columns.** A column typed `boolean`, `bool` or `bit` is read as
+  the category `false` or `true`, as flux-stats reads one, so it has `count`, `nullCount` and
+  `distinctCount` like any category column. Without `--bundle` it also gets a `levelHistogram/1` over
+  the levels `false` and `true`, declared from the contract and never from the records, so a level no
+  record holds is a withheld cell as for an enum, and it joins the grouped histograms under a
+  categorical `semantics.dimensions` entry as an enum of those two levels. A value that is neither
+  (such as the text `yes`) refuses the profile without naming it, as a value outside an enum's levels
+  does. A Simulation's fidelity block under `--bundle` may declare a property on a boolean column.
+
 - **`fluid import airflow` finds the Spark jobs a DAG submits through a Python task's function.**
   A `PythonOperator` (and a TaskFlow `@task`) used to be read no further, so a DAG that submits its
   jobs from Python proposed nothing. Now the function it runs is followed, statically: nothing is
@@ -116,6 +169,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`[profile]` takes flux-stats 0.9 and every later 0.x release.** From 0.9 flux-stats is
+  versioned by its own formats and API (flux-engine ADR 0009, as amended), so a minor release no
+  longer renames what the profiler imports, and the range is `>=0.9,<1`. 0.9.0 is the first
+  release that holds the profile request reader, a boolean read as a category and profile
+  format 1-2-0. A flux-stats below 0.9 is replaced when the extra is installed.
+
 - **A dict key written before a `**spread` that does not fold is no longer taken as known.**
   `fluid import pyspark` and `fluid import airflow` read `{"table": "a", **unknown}` as a dict
   whose `table` is `a`, though the spread can replace it when the code runs: that key is now
@@ -134,6 +193,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schema today), the id is still recorded under its lower case identifier, as before.
 
 ### Fixed
+
+- **A histogram over a declared range ends at the column's maximum.** `fluid profile` gave an
+  integer range's histogram a top edge half a unit past the declared maximum (a whole unit on
+  a grid of whole steps), so a bundle `fluxsim init` wrote from the profile read a maximum the
+  contract never declared, and flux-engine refuses bins that leave a column's range
+  (`FLX-5032`). The last edge is now the maximum itself, and the last bin, closed at the top,
+  holds it: `between 1 and 5` gets the edges 1, 2, 3, 4 and 5.
 
 - **`fluid import airflow|pyspark` keeps the DAG of an Airflow id with capitals.** Airflow takes
   `Nightly_Orders` as a `dag_id`; the contract's `dagId` and `taskId` take only lower case letters,

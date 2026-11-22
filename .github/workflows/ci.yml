@@ -688,6 +688,33 @@ jobs:
         run: python scripts/cleanup_local_test_artifacts.py
 
   # ──────────────────────────────────────────────────────────────
+  # fluid profile's release under differential privacy, with the [privacy]
+  # extra (OpenDP, mbi, Polars, JAX). The plain test install leaves the extra
+  # out, so the tests that need it skip in the matrix above; here
+  # FLUID_REQUIRE_OPENDP=1 turns a missing package into a failure, so this
+  # lane cannot pass by skipping them. One Python: the extra pins exact
+  # versions, and the rest of the profiler runs on every version above.
+  # ──────────────────────────────────────────────────────────────
+  profile-privacy:
+    name: Profile release under differential privacy
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install with the privacy extra
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,privacy]"
+      - name: Run the profiler's tests with OpenDP
+        env:
+          FLUID_REQUIRE_OPENDP: "1"
+        run: python -m pytest tests/profiler -q -p no:randomly
+
+  # ──────────────────────────────────────────────────────────────
   # OpenBao round trip. The vault:// secret resolver against a real OpenBao
   # 2.7.2 dev server (in memory, a throwaway root token): KV v2 reads with
   # #field and ?version=, metadata existence, a JWT login and an unwrapped

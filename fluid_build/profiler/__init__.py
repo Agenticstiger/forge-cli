@@ -30,6 +30,11 @@ The package has six parts, each its own module:
   ``--bundle``.
 * :mod:`~fluid_build.profiler.runner` puts them in order for one expose.
 
+A private release is a seventh part, the :mod:`~fluid_build.profiler.dp` package, with
+``fluid profile --privacy-unit``: the noisy counts of one table, bounded by privacy unit, in
+profile format 1-2-0. The noise is drawn from a seeded randomness source recorded inside the data
+owner's boundary, so the release can be re-derived there; the record must stay there.
+
 Nothing here is imported on the ``fluid --help`` path; ``cli/profile_cmd.py``
 imports the runner only when ``fluid profile`` runs.
 """

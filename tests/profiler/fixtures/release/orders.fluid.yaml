@@ -1,0 +1,31 @@
+fluidVersion: "0.7.7"
+kind: DataProduct
+id: shop.orders
+name: Shop orders
+metadata:
+  owner:
+    team: shop-team
+exposes:
+  - exposeId: orders
+    kind: table
+    binding:
+      platform: local
+      format: parquet
+      location: { path: ./out/orders.parquet }
+    contract:
+      schema:
+        - { name: order_id, type: INT, required: true }
+        - { name: customer_id, type: INT, required: true }
+        - { name: status, type: "enum('paid','placed','returned','shipped')", required: true }
+        - { name: channel, type: "enum('online','store')", required: true }
+        - name: amount
+          type: "decimal(10,2)"
+          required: true
+          validationRules:
+            - { type: range, constraint: "between 0 and 1000" }
+        - { name: note, type: string }
+    semantics:
+      entities:
+        - { name: order, type: primary, expr: order_id }
+      dimensions:
+        - { name: channel, type: categorical, expr: channel }

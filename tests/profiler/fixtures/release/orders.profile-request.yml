@@ -1,0 +1,76 @@
+"_schemaURL": "https://agenticstiger.github.io/flux/engine/spec/profile-request/1-0-0/FluxProfileRequest.json"
+"contract":
+  "digest": "sha256:a729b97cf2f74de5f3b78f78f82e11e6d0fe6853c657f7485834e3abec4e601e"
+"encoding":
+  "fractionalBits": 16
+  "rounding": "floor"
+"tables":
+  "orders":
+    "columns":
+      "amount":
+        "domain": "number"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "max"
+          - "min"
+          - "nullCount"
+          - "quantiles"
+          - "sum"
+        "statistics":
+          - "mean/1"
+          - "marginalHistogram/1"
+          - "quantile/2"
+      "channel":
+        "domain": "category"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "nullCount"
+        "statistics":
+          - "levelHistogram/1"
+          - "support/1"
+      "customer_id":
+        "domain": "number"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "max"
+          - "min"
+          - "nullCount"
+          - "quantiles"
+          - "sum"
+        "statistics":
+          - "mean/1"
+          - "marginalHistogram/1"
+          - "quantile/2"
+      "note":
+        "domain": "category"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "nullCount"
+      "order_id":
+        "domain": "number"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "max"
+          - "min"
+          - "nullCount"
+          - "quantiles"
+          - "sum"
+        "statistics":
+          - "mean/1"
+          - "marginalHistogram/1"
+          - "quantile/2"
+      "status":
+        "domain": "category"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "nullCount"
+        "statistics":
+          - "levelHistogram/1"
+          - "support/1"
+    "rowCount": true

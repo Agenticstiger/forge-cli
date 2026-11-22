@@ -218,7 +218,7 @@ def test_a_document_flux_stats_cannot_read_is_refused(backend):
         backend.check_document('{"rowCount": 1.5}')
 
 
-def test_a_boolean_column_is_left_out_as_flux_stats_reads_none(tmp_path, backend):
+def test_a_boolean_column_is_read_as_the_levels_false_and_true(tmp_path, backend):
     contract = {
         "exposes": [
             {
@@ -234,7 +234,10 @@ def test_a_boolean_column_is_left_out_as_flux_stats_reads_none(tmp_path, backend
     }
     rows = [{"attempts": n % 4, "paid": n % 2 == 0} for n in range(40)]
     result = profile_expose(contract, "payment", source=_slice(tmp_path, rows), backend=backend)
-    assert [name for name, _ in result.tables[0].plan.skipped] == ["paid"]
+    assert not result.tables[0].plan.skipped
+    column = json.loads(result.canonical)["tables"]["payment"]["columns"]["paid"]
+    (histogram,) = [s for s in column["statistics"] if s["definition"] == "levelHistogram/1"]
+    assert histogram["levels"] == ["false", "true"]
     load_profile_text(result.canonical.decode("utf-8"))
 
 

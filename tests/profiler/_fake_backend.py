@@ -19,8 +19,8 @@ CI lane, so this double cannot drift from it unnoticed.
 The fidelity grammar has no stand-in: it is flux-stats' own (ADR 0009), and the
 profile every run answers without ``--bundle`` is a fidelity block the profiler
 declares from the contract (``fluid_build/profiler/defaults.py``). So ``read_block``,
-``measure``, ``check_edge_counts``, ``count_histogram`` and ``enum_levels`` hand the work
-to flux-stats.
+``measure``, ``bin_cells``, ``check_edge_counts``, ``count_histogram`` and ``enum_levels``
+hand the work to flux-stats.
 """
 
 from __future__ import annotations
@@ -205,6 +205,9 @@ class FakeBackend:
     def measure(self, block: Any, statistic: Any, rows: Any) -> Any:
         return self._real().measure(block, statistic, rows)
 
+    def bin_cells(self, values: Any, edges: Any, fractional_bits: int) -> Any:
+        return self._real().bin_cells(values, edges, fractional_bits)
+
     def check_edge_counts(self, statistics: Any, **checks: Any) -> Any:
         return self._real().check_edge_counts(statistics, **checks)
 
@@ -228,7 +231,9 @@ class FakeBackend:
             return _exact(value, where)
         if domain == "timestamp":
             return _milliseconds(value, where)
-        if not isinstance(value, str):  # a boolean included, as the engine's reader refuses one
+        if isinstance(value, bool):  # a boolean reads as the category it names, as flux-stats does
+            return "true" if value else "false"
+        if not isinstance(value, str):
             raise ReadRefused(f"{where}: value class {type(value).__name__!r}")
         return unicodedata.normalize("NFC", value)
 
@@ -265,3 +270,10 @@ class FakeBackend:
 
     def canonicalise(self, value: Any, *, name: str) -> Any:
         return value
+
+    def read_request(self, text: str, *, name: str) -> Any:
+        return self._real().read_request(text, name=name)
+
+    def contract_digest(self, text: str, *, name: str) -> str:
+        digest: str = self._real().contract_digest(text, name=name)
+        return digest

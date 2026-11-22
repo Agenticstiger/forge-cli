@@ -958,7 +958,7 @@ def test_a_flux_stats_without_the_grammar_refuses_before_reading(tmp_path, monke
     assert rc == 1
     assert "profile_statistics_unavailable" in out
     assert "reads the fidelity block with flux-stats, and the installed flux-stats" in out
-    assert "lacks flux_stats.fidelity. It needs flux-stats[yaml]>=0.7.0,<0.8" in out
+    assert "lacks flux_stats.fidelity. It needs flux-stats[yaml]>=0.9,<1" in out
     assert "next: pip install 'data-product-forge[profile]'" in out
 
 

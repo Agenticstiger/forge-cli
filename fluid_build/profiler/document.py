@@ -38,6 +38,7 @@ __all__ = [
     "PRODUCER_REPOSITORY",
     "SCHEMA_URL",
     "SCHEMA_URL_1_1_0",
+    "SCHEMA_URL_1_2_0",
     "build_document",
     "canonical_bytes",
     "check_fractional_bits",
@@ -53,6 +54,9 @@ SCHEMA_URL = "https://agenticstiger.github.io/flux/engine/spec/profile/1-0-0/Flu
 #: Format 1-1-0 adds the ``quantile/2`` statistic and changes nothing 1-0-0 says
 #: (``flux_stats.profile.SCHEMA_URL_1_1_0``; a test keeps the two equal).
 SCHEMA_URL_1_1_0 = "https://agenticstiger.github.io/flux/engine/spec/profile/1-1-0/FluxProfile.json"
+#: Format 1-2-0, which adds the ``invariants`` section (``flux_stats.profile.SCHEMA_URL_1_2_0``;
+#: a test keeps the two equal).
+SCHEMA_URL_1_2_0 = "https://agenticstiger.github.io/flux/engine/spec/profile/1-2-0/FluxProfile.json"
 
 #: The statistics only format 1-1-0 holds.
 _ADDED_IN_1_1_0 = frozenset({"quantile/2"})
@@ -87,8 +91,10 @@ def producer_uri(version: str) -> str:
     return f"{PRODUCER_REPOSITORY}/tree/v{version}/fluid_build/profiler"
 
 
-def schema_url_for(tables: Mapping[str, Mapping[str, Any]]) -> str:
-    """The format *tables* need: 1-1-0 when any statistic is ``quantile/2``, else 1-0-0."""
+def schema_url_for(tables: Mapping[str, Mapping[str, Any]], *, invariants: bool = False) -> str:
+    """The format *tables* need: 1-2-0 with ``invariants``, 1-1-0 when any statistic is ``quantile/2``, else 1-0-0."""
+    if invariants:
+        return SCHEMA_URL_1_2_0
     for table in tables.values():
         for column in table.get("columns", {}).values():
             for statistic in column.get("statistics", ()):
@@ -104,8 +110,12 @@ def build_document(
     tables: Mapping[str, Mapping[str, Any]],
     fractional_bits: int = DEFAULT_FRACTIONAL_BITS,
     relationships: Sequence[Mapping[str, Any]] = (),
+    invariants: Sequence[Mapping[str, Any]] = (),
 ) -> Dict[str, Any]:
     """Assemble a document from tables already checked by *rule*, in the format they need.
+
+    *invariants* are PROFILE-SPEC §5's facts' shares, checked by *rule*; a document that
+    holds any names format 1-2-0.
 
     *relationships* are PROFILE-SPEC §5's children per parent, also checked by *rule*;
     a document without any has no ``relationships`` key, as before there were any.
@@ -115,13 +125,15 @@ def build_document(
         raise DocumentError("tables holds at least one table")
     built: Dict[str, Any] = {
         "_producer": producer,
-        "_schemaURL": schema_url_for(tables),
+        "_schemaURL": schema_url_for(tables, invariants=bool(invariants)),
         "encoding": {"fractionalBits": fractional_bits, "rounding": "floor"},
         "disclosureRules": {rule.name: rule.to_document()},
         "tables": {expose_id: dict(table) for expose_id, table in tables.items()},
     }
     if relationships:
         built["relationships"] = [dict(each) for each in relationships]
+    if invariants:
+        built["invariants"] = [dict(each) for each in invariants]
     return built
 
 

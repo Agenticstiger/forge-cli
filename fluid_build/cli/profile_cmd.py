@@ -58,6 +58,9 @@ fidelity block FLUX's grammar reads (so `fluxsim init` can start from them):
   - for each enum(...) column, a levelHistogram over every declared level; a
     level no record holds is a withheld cell, and the column's distinctCount
     is withheld (D);
+  - for each boolean column (boolean, bool, bit), the same over the two levels
+    false and true, which a boolean is read as; a level no record holds is a
+    withheld cell, and a value that is neither false nor true refuses the profile;
   - for a number whose validationRules declare both ends of a range inside
     its type, a marginalHistogram over about ten bins of it; its sum, min,
     max, quantiles and distinctCount are then withheld (D), and it has no
@@ -66,8 +69,8 @@ fidelity block FLUX's grammar reads (so `fluxsim init` can start from them):
     quantile/2 at 0.25, 0.5 and 0.75 on a ladder fixed by the type (0, 1, 2,
     5, 10, 20, 50 ... for a number, one bin per year from 1900 to 2100 for a
     date or a timestamp);
-  - for each categorical semantics.dimensions entry on an enum column, the
-    other enum columns' histograms per level of it, every declared level a
+  - for each categorical semantics.dimensions entry on an enum or boolean
+    column, the other enum and boolean columns' histograms per level of it, every declared level a
     group, up to 10,000 cells for one column's groupings;
   - for each semantics.relationships entry between two exposes of the call,
     children per parent: how many child rows each parent row has, counted on
@@ -117,6 +120,29 @@ max shows that no record lies below or above it. A quantile whose value is the
 column's smallest or largest shows the same, and is withheld for it, as a zero
 is.
 
+With --request FILE the profile answers a FLUX profile request, the list of
+statistics, column metrics and relationships `fluxsim init --contract` writes
+for a contract, and measures what it lists and nothing else, under the same
+checks. Give each listed table its records as --source <exposeId>=<location>
+(one table may take a bare --source); there is no --expose, --env or --bundle,
+and the request's grid is the profile's. The request's contract digest, when it
+has one, must be the contract file's (run `fluxsim init` again otherwise). Per
+table it holds only the columns, metrics and statistics listed, and the row
+count only when asked; of the statistics, those the contract's declarations give
+and the request lists, ungrouped (a request asks for no grouping). Children per
+parent are counted for a listed relationship the contract declares, as a
+histogram. Each listed item the profile does not answer is named in the report
+with its reason (for example a histogram over a number with no declared range,
+quantiles beside a histogram on one set of bins, a mean of a timestamp, a key
+column of a counted relationship). A listed fact, a rule of the contract's
+invariants, is measured on the table's records as the share of the rows it covers
+that satisfy it: two counts (the rows that do not, the rows that do) that pass the
+checks as cells do, and either withheld withholds both (format 1-2-0, the
+invariants section); a rule over an aggregate, a dependency or a related row is
+not measured, and the report says why. A boolean
+column is asked only its counts by `fluxsim init`, so it gets no level
+histogram this way.
+
 These are output-checking conventions only. No privacy or anonymity guarantee
 is made or implied: read the document before you share it.
 """
@@ -147,6 +173,13 @@ fluid profile contract.fluid.yaml --source customers=./customers.csv \\
 # FLUX Simulation.
 # Each number column also gets mean/1, which FLUX compares a mean property with, on the
 # grid --fractional-bits names (16 unless given): the fidelity block must declare it.
+
+# answer a profile request: `fluxsim init --contract` writes it, the profile measures
+# what it lists and nothing else; one --source <exposeId>=<location> per listed table
+fluxsim init payment-bundle --contract contract.fluid.yaml
+fluid profile contract.fluid.yaml --request payment-bundle.profile-request.yml \\
+    --source customers=./customers.csv --source orders=./orders.parquet \\
+    --out product.profile.json
 
 # answer a Simulation's fidelity block: the bundle directory `fluxsim init` wrote holds
 # the Simulation and the contract; the grid is the block's, so leave --fractional-bits out
@@ -226,7 +259,19 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
             "is compared with"
         ),
     )
+    p.add_argument(
+        "--request",
+        metavar="FILE",
+        help=(
+            "a FLUX profile request `fluxsim init --contract` wrote: measure what it lists "
+            "and nothing else, under the same output checks (not with --bundle, --env or "
+            "--expose: the request names the tables, and its grid is the profile's)"
+        ),
+    )
     p.add_argument("--env", help="environment overlay to apply to the contract first")
+    from fluid_build.cli import _profile_release
+
+    _profile_release.add_flags(p)
     p.set_defaults(func=run)
 
 
@@ -259,12 +304,22 @@ def _refusal(event: str, detail: str, context: Dict[str, str]) -> Any:
 
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Profile the expose and write the document; return the exit code."""
+    from fluid_build.cli import _profile_release
+
+    if _profile_release.wanted(args):
+        return _profile_release.run(args, logger)
     from fluid_build._console import cprint_literal
     from fluid_build._contract_loader import load_contract_with_overlay
     from fluid_build.cli.security import validate_cli_path
     from fluid_build.profiler import _stats, bundle, runner, sources
+    from fluid_build.profiler import request as asked_for
     from fluid_build.profiler.document import DocumentError
 
+    if getattr(args, "request", None) is not None:
+        try:
+            asked_for.check_flags(bundle=args.bundle, env=args.env, exposes=args.expose_id)
+        except runner.ProfileError as exc:
+            raise _as_refusal(exc, args.source) from None
     try:
         backend = _stats.load_backend()
     except _stats.StatisticsUnavailable as exc:
@@ -279,9 +334,24 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
     contract_path = validate_cli_path(args.contract, mode="read", file_type="contract")
     bundle_dir = _bundle_dir(args.bundle)
+    request_file = getattr(args, "request", None)
+    asked = None
+    digest_matched: Optional[bool] = None
+    if request_file is not None:
+        try:
+            asked_for.check_flags(bundle=args.bundle, env=args.env, exposes=args.expose_id)
+            asked = asked_for.read_request_file(
+                validate_cli_path(request_file, mode="read", file_type="request"), backend
+            )
+            digest_matched = asked_for.check_contract_file(contract_path, asked, backend)
+        except (runner.ProfileError, _stats.StatisticsUnavailable) as exc:
+            raise _as_refusal(exc, args.source) from None
     contract = load_contract_with_overlay(str(contract_path), args.env, logger)
     try:
-        exposes = _expose_sources(contract, args.expose_id, args.source, args.table)
+        if asked is not None:
+            exposes = _request_sources(contract, asked, args.source, args.table)
+        else:
+            exposes = _expose_sources(contract, args.expose_id, args.source, args.table)
         out = _out_path(
             args.out, _document_name(contract, exposes), [each.source for each in exposes]
         )
@@ -300,6 +370,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             backend=backend,
             fractional_bits=args.fractional_bits,
             bundles=blocks,
+            request=asked,
         )
         _write(out, result.canonical)
     except (
@@ -313,8 +384,32 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         _stats.DocumentRefused,
     ) as exc:
         raise _as_refusal(exc, args.source) from None
-    _report(cprint_literal, result, out, answered_block=blocks is not None)
+    _report(
+        cprint_literal,
+        result,
+        out,
+        answered_block=blocks is not None,
+        request=None if asked is None else (Path(str(request_file)).name, digest_matched),
+    )
     return 0
+
+
+def _request_sources(
+    contract: Any, request: Any, given_sources: List[str], given_tables: Optional[List[str]]
+) -> List[Any]:
+    """Pair each table the request lists with its ``--source``, before any read.
+
+    One listed table may take a bare ``--source``; otherwise each is written
+    ``--source <exposeId>=<location>``, one for every listed table and none for another.
+    """
+    from fluid_build.profiler import request as asked_for
+    from fluid_build.profiler import runner
+
+    listed = [table.expose_id for table in request.tables]
+    pairs = [_paired(runner.expose_ids(contract), value) for value in given_sources]
+    if not (len(listed) == 1 and len(pairs) == 1 and pairs[0][0] is None):
+        asked_for.check_sources(request, [expose_id for expose_id, _ in pairs if expose_id])
+    return _expose_sources(contract, listed, given_sources, given_tables)
 
 
 def _paired(contract_ids: Sequence[str], value: str) -> Tuple[Optional[str], str]:
@@ -703,11 +798,29 @@ def _named_partly(statistics: Any) -> List[str]:
     ]
 
 
-def _report(say: Any, result: Any, out: Path, *, answered_block: bool = False) -> None:
+def _report(
+    say: Any,
+    result: Any,
+    out: Path,
+    *,
+    answered_block: bool = False,
+    request: Optional[Tuple[str, Optional[bool]]] = None,
+) -> None:
     """Tell the owner what the document holds, then print the pin.
 
-    A profile of several exposes names each line about a table by its expose.
+    A profile of several exposes names each line about a table by its expose. *request* is
+    the file name of the request the profile answers and whether its contract digest matched.
     """
+    if request is not None:
+        say(
+            f"The profile answers the request {request[0]}: "
+            + (
+                "its contract digest is this contract's."
+                if request[1]
+                else "it names no contract digest."
+            ),
+            soft_wrap=True,
+        )
     tables = result.tables
     several = len(tables) > 1
     withheld: Dict[str, int] = dict(result.withheld)
@@ -734,10 +847,14 @@ def _report(say: Any, result: Any, out: Path, *, answered_block: bool = False) -
             soft_wrap=True,
         )
     grid = (
-        f"on the fidelity block's fractionalBits {result.fractional_bits}"
-        if answered_block
-        else f"on fractionalBits {result.fractional_bits} "
-        "(the fidelity block must declare the same)"
+        f"on the request's fractionalBits {result.fractional_bits}"
+        if request is not None
+        else (
+            f"on the fidelity block's fractionalBits {result.fractional_bits}"
+            if answered_block
+            else f"on fractionalBits {result.fractional_bits} "
+            "(the fidelity block must declare the same)"
+        )
     )
     for table in tables:
         _report_table(say, table, f"exposes[{table.plan.expose_id}]: " if several else "", grid)
@@ -755,6 +872,18 @@ def _report(say: Any, result: Any, out: Path, *, answered_block: bool = False) -
         )
     for child, name, reason in result.relationships_left_out:
         say(f"No children per parent for exposes[{child}] {name!r}: {reason}.", soft_wrap=True)
+    for fact in result.facts:
+        say(
+            (
+                f"Fact {fact.name}: its share is published, as rounded counts."
+                if fact.published
+                else f"Fact {fact.name}: withheld by the check "
+                f"({fact.code}, {_CODE_MEANING.get(str(fact.code), 'withheld')})."
+            ),
+            soft_wrap=True,
+        )
+    for what, reason in result.not_measured:
+        say(f"Not measured: {what}: {reason}.", soft_wrap=True)
     if not result.published:
         say("Every value was withheld: the document says nothing about the records.")
     say(f"Wrote {out} (readable by you alone; read it before you share it).", soft_wrap=True)

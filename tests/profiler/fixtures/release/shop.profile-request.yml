@@ -1,0 +1,109 @@
+"_schemaURL": "https://agenticstiger.github.io/flux/engine/spec/profile-request/1-0-0/FluxProfileRequest.json"
+"contract":
+  "digest": "sha256:9f11e456fe5385672d12ad2cd64c41c4bcbc0168f3e12dfa214e47ebe4c55a74"
+"encoding":
+  "fractionalBits": 16
+  "rounding": "floor"
+"tables":
+  "customers":
+    "columns":
+      "customer_id":
+        "domain": "number"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "max"
+          - "min"
+          - "nullCount"
+          - "quantiles"
+          - "sum"
+        "statistics":
+          - "mean/1"
+          - "marginalHistogram/1"
+          - "quantile/2"
+      "region":
+        "domain": "category"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "nullCount"
+        "statistics":
+          - "levelHistogram/1"
+          - "support/1"
+    "rowCount": true
+  "orders":
+    "columns":
+      "amount":
+        "domain": "number"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "max"
+          - "min"
+          - "nullCount"
+          - "quantiles"
+          - "sum"
+        "statistics":
+          - "mean/1"
+          - "marginalHistogram/1"
+          - "quantile/2"
+      "channel":
+        "domain": "category"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "nullCount"
+        "statistics":
+          - "levelHistogram/1"
+          - "support/1"
+      "customer_id":
+        "domain": "number"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "max"
+          - "min"
+          - "nullCount"
+          - "quantiles"
+          - "sum"
+        "statistics":
+          - "mean/1"
+          - "marginalHistogram/1"
+          - "quantile/2"
+      "order_id":
+        "domain": "number"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "max"
+          - "min"
+          - "nullCount"
+          - "quantiles"
+          - "sum"
+        "statistics":
+          - "mean/1"
+          - "marginalHistogram/1"
+          - "quantile/2"
+      "status":
+        "domain": "category"
+        "metrics":
+          - "count"
+          - "distinctCount"
+          - "nullCount"
+        "statistics":
+          - "levelHistogram/1"
+          - "support/1"
+    "rowCount": true
+"relationships":
+  - "parent":
+      "table": "customers"
+      "columns":
+        - "customer_id"
+    "child":
+      "table": "orders"
+      "columns":
+        - "customer_id"
+    "statistics":
+      - "mean/1"
+      - "marginalHistogram/1"
+      - "quantile/2"

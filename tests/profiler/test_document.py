@@ -16,6 +16,7 @@ from fluid_build.profiler.disclosure import ACRO_DEFAULT
 from fluid_build.profiler.document import (
     SCHEMA_URL,
     SCHEMA_URL_1_1_0,
+    SCHEMA_URL_1_2_0,
     DocumentError,
     build_document,
     canonical_bytes,
@@ -96,10 +97,23 @@ def test_a_quantile_with_bins_needs_format_1_1_0_and_nothing_else_does():
     assert _document()["_schemaURL"] == SCHEMA_URL
 
 
+def test_a_document_with_invariants_needs_format_1_2_0():
+    fact = {"name": "orders.rule", "statistics": []}
+    built = build_document(
+        producer="p",
+        rule=ACRO_DEFAULT,
+        tables={"orders": _with_statistic("quantile/2")},
+        invariants=[fact],
+    )
+    assert built["_schemaURL"] == SCHEMA_URL_1_2_0 and built["invariants"] == [fact]
+    assert "invariants" not in _document()
+
+
 def test_the_formats_are_the_ones_flux_stats_reads():
     profile = pytest.importorskip("flux_stats.profile")
     assert SCHEMA_URL == profile.SCHEMA_URL
     assert SCHEMA_URL_1_1_0 == profile.SCHEMA_URL_1_1_0
+    assert SCHEMA_URL_1_2_0 == profile.SCHEMA_URL_1_2_0
 
 
 def test_the_producer_names_this_repository_at_the_release():
