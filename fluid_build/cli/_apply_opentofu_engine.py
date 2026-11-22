@@ -68,6 +68,7 @@ from fluid_build.iac.state_migration import (
 from fluid_build.iac.state_migration import reconcile_state_key as _reconcile_state
 from fluid_build.observability.secret_redactor import redact_secret_text
 
+from . import _apply_table_adoption as _table_adoption
 from ._apply_cc_report import current_report
 from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
 from ._logging import info, warn
@@ -176,19 +177,34 @@ def _apply_via_opentofu(
         reconcile_state_key(eng.target, eng.provider, eng.env, logger, migrate=True)
 
     _guard_before_plan(eng, args, logger)
+    _table_adoption.before_lookup(eng.plugin, eng.provider, eng.contract, eng.actions, args)
 
     # What this run imports stays in state only once its ``tofu apply`` starts
     # (:func:`_imports_kept_only_by_an_apply`).
     with _imports_kept_only_by_an_apply(eng.workdir, eng.env, logger) as imported:
-        _adopt_existing(
-            eng.plugin, eng.contract, eng.actions, eng.workdir, eng.env, logger, imported.addresses
+        # A table's look-up is strict under --adopt-tables (see _adopt_existing).
+        adopted = _adopt_existing(
+            eng.plugin,
+            eng.contract,
+            eng.actions,
+            eng.workdir,
+            eng.env,
+            logger,
+            imported.addresses,
+            strict_tables=_table_adoption.asked(args),
         )
+        tables = _tables_through_import_blocks(eng, args, adopted, imported)
 
         plan = runner.tofu_plan(eng.workdir, env=eng.env)
         if not plan.ok:
             raise _plan_failure(eng.plugin, eng.contract, plan, eng.workdir, eng.env)
         changes = runner.change_summary(plan)
         cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
+        # Before the data-loss gate: a table that differs is refused naming what differs.
+        adoption = _table_adoption.check_plan(
+            eng.plugin, eng.module, tables, _shown_for_adoption(eng, tables), logger
+        )
+        plan, changes, _ = _plan_holding_adopted_tables(eng, adoption, plan, changes)
         _record_planned(eng, changes, dry_run)
         destroyed = _review_plan(eng, args, logger, changes, runner.planned_removals(plan))
         if dry_run:
@@ -202,7 +218,77 @@ def _apply_via_opentofu(
         _prepare_destroys(eng.plugin, eng.contract, destroyed)
         imported.keep()
 
+    _table_adoption.audit_take_over(logger, adoption.reviews)
     return _finish_apply(eng, logger, changes, destroyed, applied_state)
+
+
+def _tables_through_import_blocks(
+    eng: _Engine, args, adopted: List[Any], imported: Any
+) -> List[Any]:
+    """The existing tables forge did not make that ``fluid apply`` found, moved from state
+    into ``import`` blocks.
+
+    The brownfield look-up (:func:`_adopt_existing`) imports a table to learn that it
+    exists. Without ``--adopt-tables`` the run stops here (``_apply_table_adoption``);
+    with it the table goes back out of state and into the module as an ``import`` block,
+    so the plan shows its import and the check reads it from the saved plan. The other
+    imports, a table forge made among them, stay in state for the apply, as before.
+    """
+    found = _table_adoption.foreign_tables(eng.plugin, adopted, eng.workdir, eng.env, eng.contract)
+    _table_adoption.refuse_unless_asked(args, found, eng.contract)
+    tables = found.tables
+    if not tables:
+        return []
+    addresses = [block.to for block in tables]
+    released = runner.tofu_state_rm(eng.workdir, addresses, env=eng.env)
+    if not released.ok:
+        # Still held, so the run's own hand-back tries again as it stops.
+        raise CLIError(
+            1,
+            "plan_tofu_adoption_not_released",
+            {
+                "error": "the tables to adopt could not be released from state for their "
+                "import blocks: " + _tail(released.stderr or released.stdout, 200),
+                "remediation": [
+                    f"tofu -chdir={shlex.quote(eng.workdir)} state rm " + " ".join(addresses),
+                    "then re-run",
+                ],
+            },
+        )
+    for address in addresses:
+        imported.addresses.remove(address)
+    _table_adoption.write_import_blocks(eng.module_path, tables)
+    return tables
+
+
+def _plan_holding_adopted_tables(
+    eng: _Engine, adoption: Any, plan: Any, changes: Dict[str, int]
+) -> Tuple[Any, Dict[str, int], Optional[Dict[str, Any]]]:
+    """``(plan, changes, shown)`` the run goes on with: the same plan, or, when an adopted
+    table the plugin keeps as it is would be updated in place (an Iceberg table), the
+    plan made again with that table's own drift left alone and checked to import it with
+    no change at all. ``shown`` is the new plan as ``tofu show -json`` prints it, ``None``
+    when the plan was not made again."""
+    if not _table_adoption.hold_still(eng.module_path, adoption):
+        return plan, changes, None
+    again = runner.tofu_plan(eng.workdir, out_file=_WORKDIR_PLAN, env=eng.env)
+    if not again.ok:
+        raise _plan_failure(eng.plugin, eng.contract, again, eng.workdir, eng.env)
+    changes = runner.change_summary(again)
+    cprint(
+        f"  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']} "
+        "(again: adopted Iceberg tables left as they are)"
+    )
+    shown = runner.tofu_show_plan(eng.workdir, plan_file=_WORKDIR_PLAN, env=eng.env)
+    _table_adoption.check_held(shown, adoption)
+    return again, changes, shown
+
+
+def _shown_for_adoption(eng: _Engine, tables: List[Any]) -> Optional[Dict[str, Any]]:
+    """The saved plan as ``tofu show -json`` prints it, when there are tables to check."""
+    if not tables:
+        return None
+    return runner.tofu_show_plan(eng.workdir, plan_file=_WORKDIR_PLAN, env=eng.env)
 
 
 def _verify_registry_at_apply(
@@ -575,23 +661,38 @@ def _plan_with_opentofu(
     args, logger: logging.Logger, contract: Mapping[str, Any], out: Path
 ) -> Dict[str, Any]:
     from fluid_build.forge.core.plan_digest import sha256_bytes
-    from fluid_build.iac.importer import ImportBlock, import_section
+    from fluid_build.iac.importer import ImportBlock
 
     # Before anything reads or writes state: the files go next to plan.json.
     out.parent.mkdir(parents=True, exist_ok=True)
     eng = _open_engine(args, logger, contract)
     reconcile_state_key(eng.target, eng.provider, eng.env, logger, migrate=True)
     _guard_before_plan(eng, args, logger)
+    _table_adoption.before_lookup(eng.plugin, eng.provider, eng.contract, eng.actions, args)
 
     with _imports_kept_only_by_an_apply(eng.workdir, eng.env, logger) as imported:
+        # A table's look-up is strict under --adopt-tables (see _adopt_existing).
         adopted: List[ImportBlock] = _adopt_existing(
-            eng.plugin, eng.contract, eng.actions, eng.workdir, eng.env, logger, imported.addresses
+            eng.plugin,
+            eng.contract,
+            eng.actions,
+            eng.workdir,
+            eng.env,
+            logger,
+            imported.addresses,
+            strict_tables=_table_adoption.asked(args),
         )
+        # Read while the look-up's imports are in state: a table forge did not make stops
+        # the plan unless it was asked to adopt it; the hand-back runs first, as it stops.
+        found = _table_adoption.foreign_tables(
+            eng.plugin, adopted, eng.workdir, eng.env, eng.contract
+        )
+        _table_adoption.refuse_unless_asked(args, found, eng.contract)
+        tables = found.tables
     _refuse_unreleased_imports(eng, adopted)
     if adopted:
-        document = json.loads(eng.module_path.read_text(encoding="utf-8"))
-        document.setdefault("import", []).extend(import_section(adopted).get("import", []))
-        eng.module_path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+        # Escaped as the module is: an import id carries contract text.
+        _table_adoption.write_import_blocks(eng.module_path, adopted)
         cprint(f"  brownfield:  the saved plan adopts {len(adopted)} pre-existing resource(s)")
 
     plan = runner.tofu_plan(eng.workdir, out_file=_WORKDIR_PLAN, env=eng.env)
@@ -599,10 +700,6 @@ def _plan_with_opentofu(
         raise _plan_failure(eng.plugin, eng.contract, plan, eng.workdir, eng.env)
     changes = runner.change_summary(plan)
     cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
-    _review_plan(eng, args, logger, changes, runner.planned_removals(plan), enforce=False)
-
-    saved = (Path(eng.workdir) / _WORKDIR_PLAN).read_bytes()
-    os.chmod(Path(eng.workdir) / _WORKDIR_PLAN, 0o600)
     shown = runner.tofu_show_plan(eng.workdir, plan_file=_WORKDIR_PLAN, env=eng.env)
     if shown is None:
         raise CLIError(
@@ -610,6 +707,15 @@ def _plan_with_opentofu(
             "plan_tofu_show_failed",
             {"error": f"`tofu show -json {_WORKDIR_PLAN}` failed in {eng.workdir}"},
         )
+    # Before the data-loss reading, and before any file is written next to plan.json.
+    adoption = _table_adoption.check_plan(eng.plugin, eng.module, tables, shown, logger)
+    plan, changes, held = _plan_holding_adopted_tables(eng, adoption, plan, changes)
+    if held is not None:
+        shown = held
+    _review_plan(eng, args, logger, changes, runner.planned_removals(plan), enforce=False)
+
+    saved = (Path(eng.workdir) / _WORKDIR_PLAN).read_bytes()
+    os.chmod(Path(eng.workdir) / _WORKDIR_PLAN, 0o600)
     target = _target_record(eng)
     cprint_literal(f"  target:      {target_identity.describe(eng.provider, target['identity'])}")
     for field_name, why in sorted(target["unread"].items()):
@@ -645,6 +751,12 @@ def _plan_with_opentofu(
         **_state_version(eng),
         "changes": changes,
         "imports": sorted(block.to for block in adopted),
+        # Under planDigest: an approval of plan.json is an approval of these take-overs.
+        **(
+            {"adoptedTables": sorted(review.table for review in adoption.reviews)}
+            if adoption.reviews
+            else {}
+        ),
         "target": target,
     }
 
@@ -989,6 +1101,7 @@ def _apply_bound_plan(
         f"\n  saved plan {record['planFile']} ({str(record['sha256'])[:19]}…): "
         f"+{changes['add']} ~{changes['change']} -{changes['remove']}"
     )
+    _table_adoption.say_bound(record)
     _record_planned(eng, changes, dry_run)
     destroyed = _review_plan(eng, args, logger, changes, runner.saved_plan_removals(shown))
     if dry_run:
@@ -996,6 +1109,10 @@ def _apply_bound_plan(
         return 0
     _enforce_access(eng.plugin, "pre_apply", eng.contract)
     _prepare_destroys(eng.plugin, eng.contract, destroyed)
+    adopted_tables = record.get("adoptedTables")
+    _table_adoption.audit_take_over(
+        logger, adopted_tables if isinstance(adopted_tables, list) else []
+    )
     return _finish_apply(eng, logger, changes, destroyed, applied_state, bound=True)
 
 
@@ -1905,10 +2022,16 @@ def _adopt_existing(
     env: Mapping[str, str],
     logger: logging.Logger,
     held: Optional[List[str]] = None,
+    *,
+    strict_tables: bool = False,
 ) -> List[Any]:
     """Brownfield adoption — ``tofu import`` each declared resource that
     already exists in the cloud, so ``tofu apply`` reconciles it instead of
     failing "already exists" against pre-provisioned infrastructure.
+
+    A table's import (``ImportBlock.table``) is only a look-up, which the caller refuses or
+    turns into an ``import`` block (``cli/_apply_table_adoption.py``); ``strict_tables``
+    (``--adopt-tables``) makes it strict, as ``strict_adoption`` makes every import.
 
     Best-effort: a candidate already in state is skipped; one that does not
     exist in the cloud fails to import and is left for ``tofu apply`` to
@@ -1942,7 +2065,9 @@ def _adopt_existing(
             adopted.append(replace(block, id=import_id, id_from=None))
             if held is not None:
                 held.append(block.to)
-        elif strict and not block.best_effort:
+        elif (strict or (strict_tables and getattr(block, "table", None))) and not (
+            block.best_effort
+        ):
             _refuse_unadopted(plugin, contract, block, result, workdir, env)
         else:
             logger.debug(
@@ -2054,14 +2179,22 @@ def _refuse_unadopted(
     explained = _explained_failure(plugin, contract, output, workdir, env)
     if explained is not None:
         raise explained
+    why = (
+        "the provider replaces an existing object it creates over; "
+        "applying now could replace it, with the plan showing a plain create"
+    )
+    if getattr(block, "table", None) and not getattr(plugin, "strict_adoption", False):
+        why = (
+            "--adopt-tables adopts a table only once it is known to exist; planned as new, "
+            "an existing table would fail the apply after the resources before it"
+        )
     raise CLIError(
         1,
         "opentofu_adoption_failed",
         {
             "error": f"could not tell whether {block.id} already exists, so it was not "
             f"adopted into {block.to}: {_first_error(output)}",
-            "why": "the provider replaces an existing object it creates over; "
-            "applying now could replace it, with the plan showing a plain create",
+            "why": why,
         },
     )
 
