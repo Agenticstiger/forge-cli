@@ -126,6 +126,10 @@ ACCEPTED: Dict[str, str] = {
     "fluid_build.api.catalog_backend:CatalogBackendSpec.env_vars": (
         "each catalog setting's variable names, never their values"
     ),
+    "fluid_build.cli._airflow_api:DagState.file_token": (
+        "the signed id Airflow 2 lists for a DAG's file; reading the source by it still takes "
+        "the caller's own sign-in"
+    ),
     "fluid_build.cli._welcome_scan:WelcomeFindings.cloud_credentials": (
         "the names of the clouds whose credentials the welcome scan found"
     ),
