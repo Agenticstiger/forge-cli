@@ -397,7 +397,8 @@ def test_the_new_stamps_never_change_the_config_hash_either(contract):
     stamped = runs_of(contract, stamps=given)[0]
     assert stamped.config_hash == plain.config_hash and stamped == plain
     assert stamped.plan_action(0) == plain.plan_action(0)
-    assert set(_identity(stamped.entry_args())) <= {"config_hash", "source_id", "checkpoint_id"}
+    allowed = {"config_hash", "source_id", "checkpoint_id", "config_uri"}  # never a stamp
+    assert set(_identity(stamped.entry_args())) <= allowed
 
 
 def test_prepare_stamps_the_bundle_the_bound_plan_names(contract):

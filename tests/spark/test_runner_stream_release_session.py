@@ -34,13 +34,18 @@ def spark():
 
     os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
     os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
-    session = (
+    builder = (
         SparkSession.builder.master("local[2]")
         .appName("fluid-stream-release-test")
         .config("spark.ui.enabled", "false")
         .config("spark.sql.shuffle.partitions", "2")
-        .getOrCreate()
     )
+    # PySpark keeps one JVM per process, whose classpath the first session sets: the Iceberg
+    # tests that may share this process need their jar on it, whichever module starts first.
+    jar = os.environ.get("FLUID_SPARK_ICEBERG_JAR", "")
+    if jar and Path(jar).is_file():
+        builder = builder.config("spark.jars", jar)
+    session = builder.getOrCreate()
     yield session
     session.stop()
 
