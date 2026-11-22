@@ -408,8 +408,11 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
             + "(_fluid/spark/<product>/<build>/): forge reads the failed-release marker and the "
             + "job config there, and refused to start anything it cannot check",
             "Also grant s3:ListBucket on that prefix: without it S3 answers a missing object "
-            + "with AccessDenied, which forge can only read as missing when the job config "
-            + "beside it reads",
+            + "with AccessDenied, and a refused marker cannot be told from a missing one",
+            "Only the marker refused while the job config reads: set "
+            + "FLUID_SPARK_ACCEPT_FAILED_RELEASE=1 for one fluid apply (the operator's "
+            + "environment, not a project .env) to start without knowing whether the config "
+            + "failed its probation",
         ],
         None,
     ),
