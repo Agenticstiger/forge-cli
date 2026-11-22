@@ -30,12 +30,15 @@ extractor by operator class; unlike an extractor, nothing named is imported.
 
 Bounded: a function is followed at most :data:`MAX_DEPTH` calls deep and never into itself, one
 DAG file goes through at most :data:`MAX_VISITS` calls and lists of the bodies it follows (and the
-nodes walked to find them, and the parameters of each call: the file's own functions are walked
-once, another file's each time, so that no syntax of a file the module index let go is kept), and
-a task's function given the same arguments again is read once. Every value is folded
-(:mod:`._fold`); the folding of the bodies is lent by the folders and counted against one budget
-per DAG file, as large as a module's, so that neither the file's own operators nor another file's
-tasks lose to it.
+nodes walked to find them, the parameters of each call, and two characters of each command line
+read: the file's own functions are walked once, another file's each time, so that no syntax of a
+file the module index let go is kept), and a task's function given the same arguments again is
+read once, whichever DAG file of the scan runs it. Every value is folded (:mod:`._fold`); the
+folding of the bodies is lent by the folders and counted against one budget per DAG file, as large
+as a module's, so that neither the file's own operators nor another file's tasks lose to it. The
+DAG files of one scan spend at most :data:`MAX_VISITS_PER_SCAN` visits and
+:data:`MAX_LENT_STEPS_PER_SCAN` lent steps between them (:class:`FollowBudget`), so many small
+files that run one heavy function do not add up.
 """
 
 from __future__ import annotations
@@ -73,6 +76,17 @@ MAX_DEPTH = 3
 #: Calls and argument lists of the bodies one DAG file's tasks run, gone through in all (and the
 #: syntax nodes walked to find them, once per function, and the parameters of each call).
 MAX_VISITS = 200_000
+#: What the DAG files of one scan spend between them: visits, and the steps and characters of
+#: string of the folding lent to their functions' bodies. A file's own bound keeps one file from
+#: taking it all; this one keeps many files from adding up.
+MAX_VISITS_PER_SCAN = 500_000
+MAX_LENT_STEPS_PER_SCAN = 500_000
+MAX_LENT_CHARS_PER_SCAN = 16_000_000
+#: What tasks' functions submitted, kept between the files of a scan.
+MAX_SHARED_RESULTS = 20_000
+#: The characters of a command line read for the cost of one visit (a visit and two characters
+#: of a command take about as long).
+_CHARS_PER_VISIT = 2
 #: A set of arguments larger than this (values, characters of text) is not a key of what was
 #: read with it: a task with one is read on its own.
 _MAX_KEY_ITEMS = 256
@@ -224,21 +238,48 @@ def _key(arguments: _Arguments) -> Optional[Tuple[Any, ...]]:
         return None
 
 
+class FollowBudget:
+    """What the followers of one scan (one for each DAG file) spend between them, so that many
+    files do not add up past what one scan may cost: visits and lent folding, each also bounded
+    per file. It also keeps what a task's function submitted, by where the function is and what
+    it was given, so the files that run one function with the same arguments read it once (a read
+    that stopped early is not kept)."""
+
+    def __init__(self) -> None:
+        self.visits_left = MAX_VISITS_PER_SCAN
+        self.lent_left = [MAX_LENT_STEPS_PER_SCAN, MAX_LENT_CHARS_PER_SCAN]
+        #: The DAG files whose tasks were cut short by this budget, not by their own.
+        self.cut_files = 0
+        self.read: Dict[Tuple[Any, ...], List[Submit]] = {}
+
+
 class Follower:
     """Reads what the Python tasks of one DAG file submit (see the module docstring)."""
 
-    def __init__(self, module: Module, folder: Folder, helpers: Mapping[str, SubmitHelper]) -> None:
+    def __init__(
+        self,
+        module: Module,
+        folder: Folder,
+        helpers: Mapping[str, SubmitHelper],
+        budget: Optional[FollowBudget] = None,
+    ) -> None:
         self.module = module
         self.folder = folder
+        #: What the scan's followers spend between them (a file read alone has its own).
+        self.budget = budget if budget is not None else FollowBudget()
         #: The helpers by the last part of their name; the longest name that matches wins.
         self._by_last: Dict[str, List[Tuple[str, SubmitHelper]]] = {}
         for name, helper in helpers.items():
             self._by_last.setdefault(name.rsplit(".", 1)[-1], []).append((name, helper))
         for found in self._by_last.values():
             found.sort(key=lambda item: -len(item[0]))
-        #: What is left of :data:`MAX_VISITS`; once it runs out, ``cut_short`` is set.
+        #: What is left of :data:`MAX_VISITS`; once it (or the scan's) runs out, ``cut_short`` is
+        #: set, and ``scan_cut`` when it was the scan's.
         self.visits_left = MAX_VISITS
         self.cut_short = False
+        self.scan_cut = False
+        #: How many times following stopped: a read that stopped is not kept for other tasks.
+        self._cuts = 0
         #: The functions the tasks run that are not read, as written, with how many tasks run each.
         self.unread: Dict[str, int] = {}
         #: The files of other modules whose folding ran out while their functions were followed.
@@ -254,12 +295,30 @@ class Follower:
         #: a key that is its syntax would keep the whole function alive after the module index
         #: lets the file go.
         self._bodies: Dict[ast.AST, List[ast.AST]] = {}
-        #: What a task's function submitted, and what a top-level function's defaults hold, by
-        #: where the function is (``(file, line, column)``: a key that keeps no syntax alive).
-        self._read: Dict[Tuple[Any, ...], List[Submit]] = {}
+        #: What a top-level function's defaults hold, by where the function is (``(file, line,
+        #: column)``: a key that keeps no syntax alive). What a task's function submitted is kept
+        #: on the scan's budget, by the same key and its arguments.
         self._defaults: Dict[Tuple[str, int, int], List[Tuple[str, Any]]] = {}
         #: A command line (with its holes) to the spark-submits in it: read once.
         self._commands: Dict[Any, List[Tuple[Any, List[Any]]]] = {}
+
+    # ── what it may spend ───────────────────────────────────────────
+
+    def _visits(self) -> int:
+        return min(self.visits_left, self.budget.visits_left)
+
+    def _charge(self, visits: int) -> None:
+        self.visits_left -= visits
+        self.budget.visits_left -= visits
+
+    def _cut(self, scan: bool) -> None:
+        """Stop following: ``scan`` when the scan's budget ran out before this file's did."""
+        self.cut_short = True
+        self.scan_cut = self.scan_cut or scan
+        self._cuts += 1
+
+    def _out_of_visits(self) -> None:
+        self._cut(self.budget.visits_left < self.visits_left)
 
     # ── entry points ────────────────────────────────────────────────
 
@@ -522,12 +581,17 @@ class Follower:
         # down submits also depends on how deep it is and on what called it: those are not kept)
         where = (module.rel, function.lineno, function.col_offset)  # type: ignore[attr-defined]
         key = (*where, _key(arguments)) if depth == 0 else None
-        if key is not None and key[-1] is not None and key in self._read:
-            return [replace(submit, line=line) for submit in self._read[key]]
-        lend = id(folder) not in self._lent  # a body inside one already lent is counted there
-        if lend and min(self._lent_left) <= 0:
-            self.cut_short = True
+        kept = self.budget.read
+        if key is not None and key[-1] is not None and key in kept:
+            return [replace(submit, line=line) for submit in kept[key]]
+        if self._visits() <= 0:  # nothing left to read it with
+            self._out_of_visits()
             return []
+        lend = id(folder) not in self._lent  # a body inside one already lent is counted there
+        if lend and (min(self._lent_left) <= 0 or min(self.budget.lent_left) <= 0):
+            self._cut(min(self.budget.lent_left) <= 0 < min(self._lent_left))
+            return []
+        cuts, exhausted = self._cuts, False
         nodes = self._body(function, own=folder is self.folder)
         if not lend:
             found = self._read_body(function, nodes, module, folder, arguments, line, depth, stack)
@@ -538,14 +602,20 @@ class Follower:
                     found = self._read_body(
                         function, nodes, module, folder, arguments, line, depth, stack
                     )
-                    if folder.exhausted and folder is not self.folder:  # this file's: cut_short
+                    exhausted = folder.exhausted
+                    if exhausted and folder is not self.folder:  # this file's: cut_short
                         self.tired.add(module.index_rel or module.rel)
             finally:
                 self._lent.discard(id(folder))
             self._lent_left[0] -= spent[0]
             self._lent_left[1] -= spent[1]
-        if key is not None and key[-1] is not None:
-            self._read[key] = found
+            self.budget.lent_left[0] -= spent[0]
+            self.budget.lent_left[1] -= spent[1]
+        # what a read that stopped found is this file's to say: another file's tasks read the
+        # function again, with their own budget
+        whole = self._cuts == cuts and not exhausted
+        if key is not None and key[-1] is not None and whole and len(kept) < MAX_SHARED_RESULTS:
+            kept[key] = found
         return found
 
     def _read_body(
@@ -574,7 +644,7 @@ class Follower:
         stack: List[ast.AST] = list(reversed(body)) if isinstance(body, list) else [body]
         out: List[ast.AST] = []
         walked = 0
-        while stack and walked <= self.visits_left:
+        while stack and walked <= self._visits():
             node = stack.pop()
             walked += 1
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
@@ -585,8 +655,8 @@ class Follower:
                 out.append(node)
             stack.extend(reversed(list(ast.iter_child_nodes(node))))
         if stack:
-            self.cut_short = True
-        self.visits_left -= walked
+            self._out_of_visits()
+        self._charge(walked)
         out.sort(key=lambda n: (n.lineno, n.col_offset))  # type: ignore[attr-defined]
         if own:
             self._bodies[function] = out
@@ -607,9 +677,9 @@ class Follower:
         spec: ast.arguments = function.args  # type: ignore[attr-defined]
         frame: Dict[str, Any] = {}
         positional = [*spec.posonlyargs, *spec.args]
-        self.visits_left -= len(positional) + len(spec.kwonlyargs) + 2
-        if self.visits_left <= 0:
-            self.cut_short = True
+        self._charge(len(positional) + len(spec.kwonlyargs) + 2)
+        if self._visits() <= 0:
+            self._out_of_visits()
             return frame
         for param, value in zip(positional, arguments.positional, strict=False):
             frame[param.arg] = value
@@ -674,10 +744,10 @@ class Follower:
         from_calls: List[Submit] = []
         from_lists: List[Submit] = []
         for node in nodes:
-            if self.visits_left <= 0:
-                self.cut_short = True
+            if self._visits() <= 0:
+                self._out_of_visits()
                 break
-            self.visits_left -= 1
+            self._charge(1)
             if isinstance(node, ast.Call):
                 from_calls.extend(self._call(node, module, folder, line, depth, stack))
             else:
@@ -790,6 +860,12 @@ class Follower:
         key = (text, tuple(sorted(holes.items())))
         found = self._commands.get(key)
         if found is None:
+            # reading a command line costs what a visit does for every two of its characters
+            cost = 1 + len(text) // _CHARS_PER_VISIT
+            if self._visits() < cost:
+                self._out_of_visits()
+                return []
+            self._charge(cost)
             found = self._commands[key] = spark_submits_in_text(text, holes)
         return [make_submit("spark-submit", s, a, line) for s, a in found]
 
@@ -813,4 +889,13 @@ class Follower:
         return [s for s in found if not s.why.startswith(NO_SCRIPT)]
 
 
-__all__ = ["HELPER_KINDS", "MAX_DEPTH", "MAX_VISITS", "Follower", "SubmitHelper", "place_text"]
+__all__ = [
+    "HELPER_KINDS",
+    "MAX_DEPTH",
+    "MAX_VISITS",
+    "MAX_VISITS_PER_SCAN",
+    "FollowBudget",
+    "Follower",
+    "SubmitHelper",
+    "place_text",
+]

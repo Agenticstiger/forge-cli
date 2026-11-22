@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from ._airflow_dags import Dag, Submit, Task, read_dags
+from ._callables import MAX_LENT_STEPS_PER_SCAN, MAX_VISITS_PER_SCAN, FollowBudget
 from ._catalogs import module_settings
 from ._conventions import Conventions, Driver
 from ._drivers import Lists, argument_value, driver_for, job_file, segments
@@ -208,6 +209,7 @@ def scan_dags(
     walk = find_python_files(root, ignore=conventions.ignore_files)
     scan = DagScan(root=Path(root), notes=list(walk.notes))
     tired: Set[str] = set()
+    follow = FollowBudget()
     index = ModuleIndex(
         walk.files,
         variables=conventions.variables,
@@ -238,6 +240,7 @@ def scan_dags(
             folder,
             operators=conventions.operators,
             submit_helpers=conventions.submit_helpers,
+            follow=follow,
         )
         scan.catalogs.extend(module_settings(module, folder))
         scan.dags.extend(found.dags)
@@ -245,6 +248,14 @@ def scan_dags(
         for name, count in found.unread_callables.items():
             scan.unread_callables[name] = scan.unread_callables.get(name, 0) + count
         tired.update(found.tired_modules)
+    if follow.cut_files:
+        scan.notes.append(
+            "stopped following the functions Python tasks run once the DAG files had spent "
+            f"{MAX_VISITS_PER_SCAN:,} visits of their bodies or {MAX_LENT_STEPS_PER_SCAN:,} "
+            "steps of folding them between them (the scan asks for too much work): what the "
+            f"tasks of {follow.cut_files} DAG file(s) submit is not all read; scan fewer DAG "
+            "files at a time to read them all"
+        )
     for rel in sorted(tired):
         # the path a person can open, as every other note of the scan names its file
         scan.notes.append(

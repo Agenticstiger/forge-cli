@@ -55,7 +55,7 @@ from ._fold import ABSENT, FoldedDict, FoldedList, FoldedTuple, Folder, Unresolv
 from ._pysource import Module, ancestors, qualified_name, snippet
 
 if TYPE_CHECKING:  # the follower is imported where it is first used: it builds on this module
-    from ._callables import Follower, SubmitHelper
+    from ._callables import FollowBudget, Follower, SubmitHelper
 
 #: Known operator class names to the kind of work they submit.
 OPERATOR_KINDS: Dict[str, str] = {
@@ -237,11 +237,14 @@ class _Reader:
         folder: Folder,
         operators: Mapping[str, str],
         submit_helpers: Optional[Mapping[str, "SubmitHelper"]] = None,
+        follow: Optional["FollowBudget"] = None,
     ) -> None:
         self.module = module
         self.folder = folder
         self.operators = dict(operators)
         self.submit_helpers = submit_helpers or {}
+        #: What following the tasks' functions may spend, shared with the scan's other files.
+        self._budget = follow
         #: Reads what a Python task's function submits (:mod:`._callables`), once one is met.
         self._follower: Optional["Follower"] = None
         self.result = ModuleDags()
@@ -633,7 +636,9 @@ class _Reader:
             return
         self.result.unread_callables = dict(follower.unread)
         self.result.tired_modules = sorted(follower.tired)
-        if follower.cut_short:
+        if follower.scan_cut:  # said once for the whole scan (see scan_dags)
+            follower.budget.cut_files += 1
+        elif follower.cut_short:
             self.result.notes.append(
                 f"{self.module.rel}: stopped following the functions its Python tasks run "
                 "(the file asks for too much work): some of what they submit is not read"
@@ -643,7 +648,7 @@ class _Reader:
         if self._follower is None:
             from ._callables import Follower  # it builds its submits with this module's readers
 
-            self._follower = Follower(self.module, self.folder, self.submit_helpers)
+            self._follower = Follower(self.module, self.folder, self.submit_helpers, self._budget)
         return self._follower
 
     def _python_task(self, call: ast.Call, python: ast.expr) -> Tuple[Optional[str], List[Submit]]:
@@ -1327,11 +1332,13 @@ def read_dags(
     *,
     operators: Optional[Mapping[str, str]] = None,
     submit_helpers: Optional[Mapping[str, "SubmitHelper"]] = None,
+    follow: Optional["FollowBudget"] = None,
 ) -> ModuleDags:
     """The DAGs of ``module``. ``operators`` maps a project's own operator class name to one
     of :data:`SUBMIT_KINDS`, and ``submit_helpers`` a project's own function to where its script
-    is among its arguments (both from the conventions)."""
-    return _Reader(module, folder, operators or {}, submit_helpers).run()
+    is among its arguments (both from the conventions). ``follow`` is what following the Python
+    tasks' functions may spend, shared by the files of one scan (a file read alone has its own)."""
+    return _Reader(module, folder, operators or {}, submit_helpers, follow).run()
 
 
 __all__ = [

@@ -1062,6 +1062,125 @@ def test_what_one_file_may_spend_in_other_modules_is_bounded_and_said(tmp_path, 
     assert any("stopped following the functions its Python tasks run" in n for n in scan.notes)
 
 
+def test_the_dag_files_of_a_scan_share_one_follow_budget_and_it_is_said_once(tmp_path, monkeypatch):
+    # each file's tasks fit the file's own budget; thirty files' do not fit the scan's
+    monkeypatch.setattr(_callables, "MAX_VISITS_PER_SCAN", 2_000)
+    spent = [0]
+    charge = Follower._charge
+
+    def counted(self: Follower, visits: int) -> None:
+        spent[0] += visits
+        charge(self, visits)
+
+    monkeypatch.setattr(Follower, "_charge", counted)
+    _shared_helper_project(tmp_path, files=30, per_file=10)
+    scan = scan_dags(tmp_path, Conventions())
+    read = [t for d in scan.dags for t in d.tasks if t.submits]
+    assert 0 < len(read) < 300
+    # past the budget nothing more is spent but the one charge that crossed it
+    assert 2_000 <= spent[0] < 2_000 + 10
+    cut = {d.file for d in scan.dags if any(not t.submits for t in d.tasks)}
+    (note,) = [n for n in scan.notes if "scan fewer DAG files at a time" in n]
+    assert f"what the tasks of {len(cut)} DAG file(s) submit is not all read" in note
+    assert not any("stopped following the functions its Python tasks run" in n for n in scan.notes)
+
+
+_EMR_SUBMIT = """
+import boto3
+
+def submit(script, **kwargs):
+    args = ["spark-submit", "--deploy-mode", "cluster", script]
+    boto3.client("emr").add_job_flow_steps(JobFlowId="j", Steps=[{"HadoopJarStep": {"Args": args}}])
+"""
+
+
+def _same_task_in_each(root: Path, files: int, function: str) -> None:
+    sources = {"common/__init__.py": "", "common/emr.py": function}
+    for f in range(files):
+        sources[f"d{f}/dag.py"] = (
+            "from airflow import DAG\n"
+            "from airflow.operators.python import PythonOperator\n"
+            "from common.emr import submit\n"
+            f"with DAG('d{f}', schedule=None) as dag:\n"
+            "    PythonOperator(task_id='t', python_callable=submit, "
+            "op_kwargs={'script': 's3://jobs/same.py'})\n"
+        )
+    _write(root, sources)
+
+
+def test_a_function_the_tasks_of_many_files_run_alike_is_read_once(tmp_path, monkeypatch):
+    reads: List[str] = []
+    read_body = Follower._read_body
+
+    def counted(self: Follower, function: Any, *args: Any) -> Any:
+        reads.append(function.name)
+        return read_body(self, function, *args)
+
+    monkeypatch.setattr(Follower, "_read_body", counted)
+    _same_task_in_each(tmp_path, 3, _EMR_SUBMIT)
+    scan = scan_dags(tmp_path, Conventions())
+    scripts = [s.script for d in scan.dags for t in d.tasks for s in t.submits]
+    assert scripts == ["s3://jobs/same.py"] * 3
+    assert reads == ["submit"]
+
+
+def test_what_a_file_that_ran_out_read_of_a_function_is_not_handed_to_the_next(
+    tmp_path, monkeypatch
+):
+    # the first file runs out partway through the function; the next one, with room to spare,
+    # reads it whole instead of taking the first one's part for the whole
+    prints = "".join(f"    print('step {i}')\n" for i in range(30))
+    function = (
+        "import subprocess\n\ndef submit(script, **kwargs):\n"
+        + prints
+        + "    subprocess.run(['spark-submit', script])\n"
+    )
+    _same_task_in_each(tmp_path, 2, function)
+    made: List[Follower] = []
+    init = Follower.__init__
+
+    def small_first(self: Follower, *args: Any, **kwargs: Any) -> None:
+        init(self, *args, **kwargs)
+        if not made:
+            self.visits_left = 60
+        made.append(self)
+
+    monkeypatch.setattr(Follower, "__init__", small_first)
+    scan = scan_dags(tmp_path, Conventions())
+    by_file = {
+        Path(d.file).parent.name: [s.script for t in d.tasks for s in t.submits] for d in scan.dags
+    }
+    assert by_file == {"d0": [], "d1": ["s3://jobs/same.py"]}
+    (note,) = [n for n in scan.notes if "stopped following the functions its" in n]
+    assert note.startswith("d0/dag.py: ")
+
+
+def test_a_command_line_is_charged_by_its_length(monkeypatch):
+    monkeypatch.setattr(_callables, "MAX_VISITS", 300)
+    heavy = "spark-submit " + " ".join(f"--conf k{i}=v" for i in range(100)) + " s3://jobs/b.py"
+    found = dags(
+        _dag(
+            f"""
+import os
+
+def light(**kwargs):
+    os.system("spark-submit s3://jobs/a.py")
+
+def heavy(**kwargs):
+    os.system("{heavy}")
+
+PythonOperator(task_id="light", python_callable=light, dag=dag)
+PythonOperator(task_id="heavy", python_callable=heavy, dag=dag)
+"""
+        )
+    )
+    by_id = {t.task_id: t for d in found.dags for t in d.tasks}
+    assert [s.script for s in by_id["light"].submits] == ["s3://jobs/a.py"]
+    # about 600 visits' worth of command line, with 300 to spend in the file
+    assert by_id["heavy"].submits == []
+    assert any("stopped following the functions its Python tasks run" in n for n in found.notes)
+
+
 def test_the_note_on_a_module_that_ran_out_names_the_file_a_person_opens(tmp_path, monkeypatch):
     from fluid_build.cli.import_workflow import _fold
 
