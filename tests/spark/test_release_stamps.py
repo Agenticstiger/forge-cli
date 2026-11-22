@@ -10,7 +10,9 @@ config digest, version, contract digest, release and run on the write options of
 builds, and in the job's own Spark conf.
 
 The writers run without Spark here, against recorders. That Iceberg keeps the options as
-summary entries is read off a real table by the opt-in run on Spark 3.5
+summary entries is read off real tables in a local Spark 3.5 session with Iceberg 1.6
+(``test_runner_local_iceberg.py``: a stream, its dead letters and two batch runs), and by the
+opt-in run on Docker
 (``test_runner_integration.py::test_every_commit_the_runner_makes_carries_the_runs_stamps``).
 """
 
