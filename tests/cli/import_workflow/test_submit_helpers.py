@@ -506,6 +506,7 @@ PythonOperator(task_id="loop", python_callable=loop, op_kwargs={"script": "s3://
             'os.system(f"spark-submit --deploy-mode cluster {script} --y")',
             [("s3://a.py", ("--y",))],
         ),
+        ('subprocess.getoutput("spark-submit " + script)', [("s3://a.py", ())]),
         ('cmd = ["spark-submit", script]\n    subprocess.Popen(cmd)', [("s3://a.py", ())]),
         ('print("spark-submit s3://not-run.py")', []),
         ('log.info(f"running spark-submit {script}")', []),
@@ -533,7 +534,7 @@ def test_emr_on_eks_serverless_run_job_flow_and_the_emr_hook():
     found = tasks(
         _dag(
             """
-            from airflow.providers.amazon.aws.hooks.emr import EmrHook
+            from airflow.providers.amazon.aws.hooks.emr import EmrContainerHook, EmrHook
 
             def eks(**kwargs):
                 boto3.client("emr-containers").start_job_run(
@@ -553,6 +554,11 @@ def test_emr_on_eks_serverless_run_job_flow_and_the_emr_hook():
             def new_cluster(**kwargs):
                 boto3.client("emr").run_job_flow(Name="c", Steps=[{"HadoopJarStep": {"Args": ["spark-submit", f"{CODE}/flow.py"]}}])
 
+            def eks_hook(**kwargs):
+                EmrContainerHook(virtual_cluster_id="vc").submit_job(
+                    "n", "role", "emr-7", {"sparkSubmitJobDriver": {"entryPoint": f"{CODE}/eks_hook.py"}}
+                )
+
             def hook(**kwargs):
                 emr = EmrHook(aws_conn_id="aws")
                 emr.add_job_flow_steps("j-1", [{"HadoopJarStep": {"Args": ["spark-submit", f"{CODE}/hook.py"]}}])
@@ -563,12 +569,14 @@ def test_emr_on_eks_serverless_run_job_flow_and_the_emr_hook():
             PythonOperator(task_id="glue", python_callable=glue, dag=dag)
             PythonOperator(task_id="new_cluster", python_callable=new_cluster, dag=dag)
             PythonOperator(task_id="hook", python_callable=hook, dag=dag)
+            PythonOperator(task_id="eks_hook", python_callable=eks_hook, dag=dag)
             """
         )
     )
     assert submits(found["eks"]) == [("emr-eks", "s3://acme-code/jobs/eks.py", ("--a",))]
     assert submits(found["serverless"]) == [("emr-serverless", "s3://acme-code/jobs/srv.py", ())]
     assert found["glue"].submits == []
+    assert submits(found["eks_hook"]) == [("emr-eks", "s3://acme-code/jobs/eks_hook.py", ())]
     assert submits(found["new_cluster"]) == [("emr-step", "s3://acme-code/jobs/flow.py", ())]
     assert submits(found["hook"]) == [
         ("emr-step", "s3://acme-code/jobs/hook.py", ()),

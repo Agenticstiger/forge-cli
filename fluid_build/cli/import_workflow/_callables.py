@@ -96,6 +96,8 @@ _RUNNERS = frozenset(
         "subprocess.check_call",
         "subprocess.check_output",
         "subprocess.Popen",
+        "subprocess.getoutput",
+        "subprocess.getstatusoutput",
         "os.system",
         "os.popen",
     }
@@ -665,6 +667,10 @@ class Follower:
             return [] if steps is ABSENT else self._steps(steps, line)
         if method in ("start_job_run", "submit_job"):
             driver = _keyword(node, "jobDriver", "job_driver")
+            if driver is None and method == "submit_job" and len(node.args) >= 4:
+                driver = node.args[
+                    3
+                ]  # the EMR on EKS hook's submit_job(name, role, release, driver)
             return [] if driver is None else self._driver(folder.fold(driver), line)
         if qualified in _RUNNERS:
             command = node.args[0] if node.args else _keyword(node, "args", "command", "cmd")
