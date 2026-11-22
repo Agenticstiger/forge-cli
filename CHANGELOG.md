@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.0] — 2026-11-22
+
 ### Added
 
 - **`fluid profile --privacy-unit` releases a table under differential privacy.** With `--request`,
@@ -166,6 +168,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   strategy, `minInputFiles` or `deleteFileThreshold` needs hashicorp/aws 6.58.0, and
   `runEveryHours` needs 6.13.0. New validate checks: `contract_iceberg_maintenance` and
   `contract_maintenance_actions`.
+- **Generated Airflow DAGs can serialize the writers of a table (opt-in).** With
+  `orchestration.airflow.poolPerOutputTable: true` in the 0.7.7 preview, each task of a `fluid apply`
+  DAG that writes an output table runs in a one-slot Airflow pool named after that table, so two DAGs
+  that write the same table never run together. A build that writes more than one table is refused,
+  by validate and by the DAG renderer: declare one output per build, or split the build.
+  `fluid schedule-sync --airflow-url` creates the pools Airflow lacks, before it pushes any DAG, and
+  never changes a pool that already exists. Without `--airflow-url`, `fluid generate schedule` and
+  `fluid schedule-sync` print the `airflow pools set` lines. Off by default.
 
 ### Changed
 
@@ -191,6 +201,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fluidVersion` it declares: when that schema takes the id, the DAG and task are recorded exactly
   as Airflow spells it and the report says nothing about ids; when it does not (every released
   schema today), the id is still recorded under its lower case identifier, as before.
+- **The Spark stream rollback guard fails closed when it cannot read its failed-release marker.**
+  When the job config reads but the marker read is refused, the start is refused with
+  `apply_spark_artifact_read_denied`, naming the marker's key. Without `s3:ListBucket`, S3 answers a missing key with 403, so
+  grant `s3:ListBucket` limited to the release prefix (`_fluid/spark/<product>/<build>`). A throttle
+  or timeout while reading the job config beside the marker is reported as a read failure, not as
+  a denial.
+- **`airflowOrchestration.dagId` is optional in the 0.7.7 preview**, so a contract can set
+  `poolPerOutputTable` without a placeholder id. A `dagId` that is given is still checked.
+- **The DAGs `fluid generate schedule` writes for AWS, GCP and Snowflake set `max_active_runs=1`**,
+  as the `fluid apply` DAGs already did, so two runs of one DAG never write the same tables at the
+  same time.
+- **`fluid datamesh-manager publish|promote|status --format json` print a typed error on stderr**,
+  so stdout stays one JSON document.
 
 ### Fixed
 
@@ -248,6 +271,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`iceberg_table_update_in_place`), and `fluid plan --allow-iceberg-update` needs `--tofu`
   (`plan_allow_iceberg_update_needs_tofu`). Hive tables keep their in-place updates, and a
   replace stays with the data-loss gate.
+- **Generated CI:** the Jenkins `GENERATE_EMIT` default includes `opds`, the same list stage 3
+  uses. GitHub Actions uploads of the carried bundle and reports keep their dot folders.
+- **A `parquet_variant` column is treated as a variant** by the live `fluid diff` of a DuckDB table
+  and by local validation.
+- **The Airflow client bounds the whole time it takes to read an answer.** A server that sends a
+  byte now and then can no longer keep a request open past its timeout.
+- **`fluid import airflow` asks the schema manager which schemas are bundled**, and a dry run no
+  longer creates the schema cache folder under the home directory.
+- **Data Mesh Manager:** a product list that is not a list is refused, a wipe whose final recount
+  fails says how many it deleted, and the duplicate-id error shows each file name on one line.
+- **The importer caps its list of unsupported items at 100**, and counts the rest.
+- **The generated Glue table helper leaves Iceberg tables alone**: it no longer rewrites their
+  storage descriptor.
+- **Generated DAG file names that differ only in case are refused**, so one cannot replace another
+  on a case-insensitive file system.
 
 ### Security
 
@@ -257,6 +295,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name, in `observability/secret_redactor.py` and the Snowflake provider's `redact_string`. The
   Snowflake twin checks `GenieKey` before its `authorization=` rule, which would otherwise take the
   word for the value and leave the key.
+- **Both redaction layers mask more:**
+  - a short credential under a credential-named key, as a whole word (a longer one is masked
+    anywhere, as before);
+  - a token of 16 or more characters that is the only user info of a URL;
+  - AWS SigV4 `Authorization` values;
+  - camelCase alert keys (`routingKey`, `integrationKey`, `genieKey`);
+  - Teams and Discord webhook URLs;
+  - the `sig=` signature of a signed URL, such as a Teams Workflows webhook or an Azure SAS URL;
+  - a credential key spelled with hyphens, such as `x-api-key`.
+
+  A log argument that is an object, not a string, is masked too.
+- **The importer's command-line scrubber masks `--login user/pw`, a split `--conf <secret.key>
+  <value>` and a provider token in a path segment.**
+- **An exported ODCS `catalogUrl` never carries a password**, even one that holds `#`, `?` or a
+  full-width `＠`: the URL loses its user info, or is left out when it cannot be cut safely.
+- **A Data Mesh Manager error body that echoes the API key no longer shows it**, even when the key
+  straddles the 500-character cut.
+- **`cprint_json` masks the value under a credential-named key** and runs every other string
+  through the redactors, while keeping the output valid JSON.
+- **A maintenance action option whose key names a credential is refused**, whatever its value.
+  Before, such a value reached `plan.json` and the deployed job config.
+- **`fluid plan` and `fluid apply` run the alert-route checks**, and no longer quote a field's value
+  in a schema error under `alerts`.
+- **A `.` or `..` segment in an object-store binding location, or in a Data Mesh Manager product
+  id, is refused.** The Spark runner also refuses an orphan-removal location holding `#`, `?` or a
+  control character.
 
 ### Upgrade notes
 
@@ -271,6 +335,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release that updates a live Iceberg table in place is refused by `fluid apply plan.json`: make
   the plan again. On AWS, a plan that `tofu show -json` cannot read back is now refused when it
   changes anything in place, even with `--allow-data-loss`: make the plan again.
+- A stream whose runtime identity lacks `s3:ListBucket` on its release prefix no longer starts.
+  Grant it, limited to the prefix. `FLUID_SPARK_ACCEPT_FAILED_RELEASE=1` lets one start through,
+  but it also skips a real failed-release marker, so never set it permanently, least of all in a
+  keepalive.
+- Move a secret from a maintenance action option into a connection or a secret reference: options
+  whose keys name a credential are now refused.
+- Short passwords and tokens under a credential-named key are now masked in logs and output
+  (`***REDACTED***`, or `[REDACTED]` in the Snowflake provider's logs).
 
 ## [0.37.0] — 2026-11-22
 
