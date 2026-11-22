@@ -1489,5 +1489,9 @@ def test_tekton_runs_carry_the_change_request_marker_into_ship(install_mode):
     ] == "true"
     env = {e["name"]: e["value"] for e in task["spec"]["steps"][0]["env"]}
     assert env["FLUID_CHANGE_REQUEST"] == "$(params.FLUID_CHANGE_REQUEST)"
+    # The header's example of a default-branch run passes false; forge writes no Triggers
+    # resources, so this is where an operator reads it.
     header = " ".join(files["tekton/pipeline.yaml"].split())
-    assert "-p FLUID_CHANGE_REQUEST=false" in header
+    start = header.index("tkn pipeline start fluid-plan")
+    plan_example = header[start : header.index("tkn pipeline start fluid-apply")]
+    assert "-p FLUID_CHANGE_REQUEST=false" in plan_example
