@@ -243,6 +243,11 @@ def test_the_names_agree_with_the_modules_that_read_them() -> None:
         # application.properties refers to as ${FLUID_DBZ_<PROPERTY>}
         "FLUID_DBZ_SOURCE_DATABASE_PASSWORD",
         "fluid_dbz_sink_iceberg_s3_secret_access_key",
+        # the scheduler run a command belongs to: fluid's names and Airflow's task context
+        "FLUID_SCHEDULER_JOB",
+        "FLUID_SCHEDULER_RUN_ID",
+        "AIRFLOW_CTX_DAG_ID",
+        "AIRFLOW_CTX_DAG_RUN_ID",
     ],
 )
 def test_protected(name: str) -> None:

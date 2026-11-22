@@ -78,7 +78,9 @@ Rendering rules:
   :data:`PASSTHROUGH_NAMES`); a name starting ``AIRFLOW`` never passes, even
   when the contract asks for it, so the Airflow worker's own secrets
   (``AIRFLOW__*``, ``AIRFLOW_CONN_*``, the Fernet key) never reach the fluid
-  process.
+  process. The DAG id and run id of Airflow's task context reach it under
+  fluid's names (:data:`SCHEDULER_RUN_LINES`), which the Spark runner stamps
+  on each commit.
 * The cron is checked to the grammar croniter, Airflow's cron parser,
   accepts (see :func:`_validate_schedule`), so a schedule Airflow would
   refuse fails generation instead of the DAG import.
@@ -102,6 +104,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from fluid_build.build_runners._ids import IdentifierViolation, validate_identifier
+from fluid_build.observability.run_id import SCHEDULER_JOB_ENV, SCHEDULER_RUN_ID_ENV
 from fluid_build.providers.common.codegen_utils import py_str_literal
 from fluid_build.schedulers.airflow._assets import (
     NotAddressable,
@@ -1338,6 +1341,19 @@ _PREFIX_PATTERN = "|".join(f"{prefix}*" for prefix in PASSTHROUGH_PREFIXES)
 # ``pass``: unsetting the rest instead would miss environment entries whose
 # names are not shell identifiers (``db.password``, which Kubernetes allows),
 # because bash hands those to its children without listing them.
+#
+#: The run of the task, as Airflow's task context names it (``AIRFLOW_CTX_DAG_ID`` and
+#: ``AIRFLOW_CTX_DAG_RUN_ID``, which Airflow 2 and 3 add to every BashOperator's environment),
+#: handed to fluid under fluid's names (``observability.run_id.scheduler_run``): no ``AIRFLOW*``
+#: name passes. They come after the worker's own variables, and env(1) keeps the last of two
+#: values of one name, so a value the worker's environment holds under those names never stands
+#: in for the run Airflow names.
+SCHEDULER_RUN_LINES = (
+    f'if [ -n "${{AIRFLOW_CTX_DAG_ID:-}}" ]; then '
+    f'pass+=("{SCHEDULER_JOB_ENV}=$AIRFLOW_CTX_DAG_ID"); fi',
+    f'if [ -n "${{AIRFLOW_CTX_DAG_RUN_ID:-}}" ]; then '
+    f'pass+=("{SCHEDULER_RUN_ID_ENV}=$AIRFLOW_CTX_DAG_RUN_ID"); fi',
+)
 _SCRIPT_HEAD = (
     "set -euo pipefail",
     ': "${FLUID_PROJECT_DIR:?set FLUID_PROJECT_DIR on the Airflow worker to the '
@@ -1355,6 +1371,7 @@ _SCRIPT_HEAD = (
     "  esac",
     '  pass+=("$name=${!name}")',
     "done",
+    *SCHEDULER_RUN_LINES,
     'cd -- "$FLUID_PROJECT_DIR"',
     'contract="$PWD/$FLUID_DAG_CONTRACT"',
     'if [ ! -f "$contract" ]; then',
@@ -1819,6 +1836,7 @@ def render_fluid_apply_dags(
 __all__ = [
     "APPLY_MODE",
     "BASH_SCRIPT_LINES",
+    "SCHEDULER_RUN_LINES",
     "DEFAULT_CONTRACT_PATH",
     "DEFAULT_ENGINE",
     "PASSTHROUGH_NAMES",

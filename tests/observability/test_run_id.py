@@ -26,9 +26,21 @@ import pytest
 from fluid_build.observability.run_id import (
     RUN_ID_ENV_VAR,
     RUN_ID_FILE,
+    SCHEDULER_JOB_ENV,
+    SCHEDULER_RUN_ID_ENV,
+    SchedulerRun,
     clear_run_id,
     get_or_create_run_id,
     run_id_span_attribute,
+    scheduler_run,
+)
+
+#: Every variable that names a scheduler's run: fluid's own, then Airflow's task context.
+_SCHEDULER_NAMES = (
+    SCHEDULER_JOB_ENV,
+    SCHEDULER_RUN_ID_ENV,
+    "AIRFLOW_CTX_DAG_ID",
+    "AIRFLOW_CTX_DAG_RUN_ID",
 )
 
 
@@ -36,6 +48,8 @@ from fluid_build.observability.run_id import (
 def workspace(tmp_path: Path, monkeypatch) -> Path:
     """Hermetic workspace with no env / persisted state."""
     monkeypatch.delenv(RUN_ID_ENV_VAR, raising=False)
+    for name in _SCHEDULER_NAMES:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.chdir(tmp_path)
     return tmp_path
 
@@ -105,3 +119,80 @@ class TestSpanAttribute:
         monkeypatch.setenv(RUN_ID_ENV_VAR, "ci-id-99")
         attr = run_id_span_attribute(workspace)
         assert attr == {"fluid.run_id": "ci-id-99"}
+
+
+def _scheduled(monkeypatch, job, run, *, airflow: bool = False) -> None:
+    names = ("AIRFLOW_CTX_DAG_ID", "AIRFLOW_CTX_DAG_RUN_ID") if airflow else _SCHEDULER_NAMES[:2]
+    for name, value in zip(names, (job, run), strict=True):
+        monkeypatch.setenv(name, value)
+
+
+class TestUnderAScheduler:
+    """A command a scheduler started (an Airflow task) is that scheduler run's: a worker's
+    checkout keeps ``.fluid/run-id.txt`` from run to run, so reading it would give every
+    scheduled run of every day one id."""
+
+    def test_a_scheduled_run_has_an_id_of_its_own(self, workspace, monkeypatch):
+        _scheduled(monkeypatch, "orders__load", "scheduled__2026-11-21T00:00:00+00:00")
+        first = get_or_create_run_id(workspace)
+        assert len(first) == 12 and all(c in "0123456789abcdef" for c in first)
+        assert get_or_create_run_id(workspace) == first  # every command of the run shares it
+        _scheduled(monkeypatch, "orders__load", "scheduled__2026-11-22T00:00:00+00:00")
+        assert get_or_create_run_id(workspace) != first
+        _scheduled(monkeypatch, "clicks__load", "scheduled__2026-11-21T00:00:00+00:00")
+        assert get_or_create_run_id(workspace) != first  # a run id is unique per DAG only
+
+    def test_the_persisted_id_is_neither_read_nor_written(self, workspace, monkeypatch):
+        persisted = get_or_create_run_id(workspace)
+        path = workspace / ".fluid" / RUN_ID_FILE
+        _scheduled(monkeypatch, "orders__load", "manual__2026-11-21T10:15:30+00:00")
+        assert get_or_create_run_id(workspace) != persisted
+        assert path.read_text(encoding="utf-8").strip() == persisted
+        path.unlink()
+        get_or_create_run_id(workspace)
+        assert not path.exists()
+
+    def test_fluid_run_id_still_wins(self, workspace, monkeypatch):
+        _scheduled(monkeypatch, "orders__load", "scheduled__2026-11-21T00:00:00+00:00")
+        monkeypatch.setenv(RUN_ID_ENV_VAR, "ci-build-42")
+        assert get_or_create_run_id(workspace) == "ci-build-42"
+
+    def test_airflows_own_task_context_names_the_run(self, workspace, monkeypatch):
+        _scheduled(monkeypatch, "orders__load", "scheduled__2026-11-21T00:00:00+00:00")
+        named_by_fluid = get_or_create_run_id(workspace)
+        for name in _SCHEDULER_NAMES[:2]:
+            monkeypatch.delenv(name)
+        _scheduled(
+            monkeypatch, "orders__load", "scheduled__2026-11-21T00:00:00+00:00", airflow=True
+        )
+        assert get_or_create_run_id(workspace) == named_by_fluid
+
+    def test_a_job_with_no_run_is_no_scheduler_run(self, workspace, monkeypatch):
+        monkeypatch.setenv(SCHEDULER_JOB_ENV, "orders__load")
+        monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "orders__load")
+        assert scheduler_run() is None
+        assert get_or_create_run_id(workspace) == get_or_create_run_id(workspace)
+        assert (workspace / ".fluid" / RUN_ID_FILE).exists()
+
+
+@pytest.mark.parametrize(
+    "environ, expected",
+    [
+        ({}, None),
+        ({SCHEDULER_RUN_ID_ENV: "  "}, None),
+        ({SCHEDULER_RUN_ID_ENV: " r1 ", SCHEDULER_JOB_ENV: " dag "}, SchedulerRun("dag", "r1")),
+        ({SCHEDULER_RUN_ID_ENV: "r1"}, SchedulerRun(None, "r1")),
+        ({"AIRFLOW_CTX_DAG_RUN_ID": "r2", "AIRFLOW_CTX_DAG_ID": "dag"}, SchedulerRun("dag", "r2")),
+        # A pair is taken whole from one source: fluid's run id never takes Airflow's DAG id.
+        (
+            {
+                SCHEDULER_RUN_ID_ENV: "r1",
+                "AIRFLOW_CTX_DAG_ID": "d2",
+                "AIRFLOW_CTX_DAG_RUN_ID": "r2",
+            },
+            SchedulerRun(None, "r1"),
+        ),
+    ],
+)
+def test_the_scheduler_run_comes_whole_from_fluids_names_else_airflows(environ, expected):
+    assert scheduler_run(environ) == expected
