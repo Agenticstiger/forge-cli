@@ -38,6 +38,7 @@ from typing import Any, Dict, List
 import pytest
 
 from fluid_build.iac import runner
+from fluid_build.iac.providers import aws_adoption
 
 from .conftest import (
     AWS_LIVE_ENABLED,
@@ -159,6 +160,73 @@ def test_real_iceberg_on_glue_round_trip(aws_real_project, aws_account):
     (recorded,) = applied["values"]["open_table_format_input"]
     (iceberg,) = recorded["iceberg_input"]
     assert (iceberg["metadata_operation"], iceberg["version"]) == ("CREATE", "2")
+
+
+def _glue_to_state_shape(table: Dict[str, Any]) -> Dict[str, Any]:
+    """``glue get-table``'s ``Table`` as ``tofu show -json`` prints a Glue table, the shape
+    the Iceberg update hold reads: snake_case names, nested blocks as one-item lists."""
+    descriptor = table.get("StorageDescriptor") or {}
+    serde = descriptor.get("SerdeInfo") or {}
+    return {
+        "database_name": table.get("DatabaseName"),
+        "name": table.get("Name"),
+        "parameters": dict(table.get("Parameters") or {}),
+        "storage_descriptor": [
+            {
+                "location": descriptor.get("Location"),
+                "input_format": descriptor.get("InputFormat"),
+                "output_format": descriptor.get("OutputFormat"),
+                "ser_de_info": [{"serialization_library": serde.get("SerializationLibrary")}],
+                "columns": [
+                    {
+                        "name": column.get("Name"),
+                        "type": column.get("Type"),
+                        "parameters": dict(column.get("Parameters") or {}),
+                    }
+                    for column in descriptor.get("Columns") or []
+                ],
+            }
+        ],
+    }
+
+
+def test_real_iceberg_glue_table_has_no_hive_storage(aws_real_project, aws_account):
+    """A table made through ``open_table_format_input.iceberg_input`` has no Hive storage.
+
+    The Iceberg update hold (``aws_adoption.live_iceberg``) reads a table with no
+    ``InputFormat``, ``OutputFormat`` or SerDe as an Iceberg one and one with any of them
+    as a Hive table (``_hive_storage``). This checks that against what Glue stores, not a
+    mock: the ``StorageDescriptor`` Glue returns for a table the module created, and that
+    the hold classifies the table as live Iceberg from the contract's own declaration
+    alone, with its ``table_type`` and Iceberg metadata left out."""
+    bucket = aws_real_project.name("iceberg-sd")
+    glue_db = aws_real_project.name("iceberg_sd").replace("-", "_")
+    aws_real_project.apply_ok(aws_iceberg_contract(bucket, database=glue_db, table="events"))
+
+    table = aws_real_boto("glue").get_table(DatabaseName=glue_db, Name="events")["Table"]
+    assert table["Parameters"]["table_type"] == "ICEBERG"
+    descriptor = table["StorageDescriptor"]
+    serde = descriptor.get("SerdeInfo") or {}
+    assert not descriptor.get("InputFormat"), descriptor.get("InputFormat")
+    assert not descriptor.get("OutputFormat"), descriptor.get("OutputFormat")
+    assert not serde.get("SerializationLibrary"), serde.get("SerializationLibrary")
+
+    before = _glue_to_state_shape(table)
+    assert not aws_adoption._hive_storage(before)
+    emitted = json.loads((aws_real_project.workdir / "main.tf.json").read_text())
+    (declared,) = emitted["resource"]["aws_glue_catalog_table"].values()
+    assert "open_table_format_input" in declared
+
+    # What a plan shows with nothing else to go on: no table_type, no metadata location,
+    # no field ids on the columns and no Iceberg create in the state.
+    bare = {**before, "parameters": {}}
+    bare["storage_descriptor"] = [
+        {**before["storage_descriptor"][0], "columns": [{"name": "event_id", "type": "string"}]}
+    ]
+    assert aws_adoption.live_iceberg(bare, declared) == (
+        "the contract declares it an Iceberg table, and forge made it one"
+    )
+    assert aws_adoption.iceberg_update_hold({"before": before, "after": before}, declared)
 
 
 def test_real_kinesis_stream_round_trip(aws_real_project, aws_account):

@@ -1459,8 +1459,10 @@ def _aws_live_ready() -> Tuple[bool, str]:
 
 
 AWS_LIVE_ENABLED, AWS_LIVE_SKIP_REASON = _aws_live_ready()
-# Throwaway resource-name prefix so the sweeper can find leftovers.
-AWS_LIVE_PREFIX = "fluid-iactest"
+# Throwaway resource-name prefix so the sweeper can find leftovers. An ad-hoc run of one
+# test can name its own prefix (``FLUID_IAC_LIVE_NAME_PREFIX``); the session sweeper then
+# deletes only what carries it, never another run's ``fluid-iactest-*`` resources.
+AWS_LIVE_PREFIX = os.environ.get("FLUID_IAC_LIVE_NAME_PREFIX", "").strip() or "fluid-iactest"
 
 
 def aws_real_boto(service: str) -> Any:
