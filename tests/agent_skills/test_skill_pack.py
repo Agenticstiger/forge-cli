@@ -93,6 +93,7 @@ def test_the_pack_ships_its_skills() -> None:
         "authoring-fluid-contracts",
         "composing-fluid-data-products",
         "deploying-fluid-contracts-safely",
+        "publishing-to-data-mesh-manager",
         "releasing-streaming-products",
         "troubleshooting-fluid-errors",
     ]
