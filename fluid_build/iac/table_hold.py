@@ -22,6 +22,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
+from fluid_build.iac.adoption import event_fields
+
 #: The flag of ``fluid apply``, ``fluid plan --tofu`` and ``fluid ship`` that lets a run
 #: update a live Iceberg table in place.
 ALLOW_ICEBERG_UPDATE_FLAG = "--allow-iceberg-update"
@@ -42,9 +44,4 @@ class TableHold:
 
     def as_event(self) -> Dict[str, Any]:
         """The hold for a structured log event or an error's context (lists, as JSON)."""
-        return {
-            "table": self.table,
-            "attributes": list(self.attributes),
-            "drift": list(self.drift),
-            "why": self.why,
-        }
+        return event_fields(self)

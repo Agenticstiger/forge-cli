@@ -290,6 +290,39 @@ transformations, access grants, and orchestration tasks.
     p.set_defaults(cmd=COMMAND, func=run)
 
 
+def _refuse_flags_that_need_tofu(args) -> None:
+    """The flags whose decision is made in OpenTofu's plan, which a plan without ``--tofu``
+    does not make: it must not look as if it had."""
+    if getattr(args, "tofu", False):
+        return
+    # The tables are compared with the contract in OpenTofu's plan of them.
+    if getattr(args, "adopt_tables", False):
+        raise CLIError(
+            1,
+            "plan_adopt_tables_needs_tofu",
+            {
+                "error": "--adopt-tables checks each existing table against the contract "
+                "in OpenTofu's plan of it, so it needs --tofu",
+                "remediation": ["fluid plan <contract> --tofu --adopt-tables"],
+            },
+        )
+    # A plan without --tofu is planned again by ``fluid apply``, which takes the flag itself.
+    if getattr(args, "allow_iceberg_update", False):
+        raise CLIError(
+            1,
+            "plan_allow_iceberg_update_needs_tofu",
+            {
+                "error": "--allow-iceberg-update decides what OpenTofu's plan updates in "
+                "place, so it needs --tofu; a plan without it is planned again by "
+                "`fluid apply`, which takes the flag itself",
+                "remediation": [
+                    "fluid plan <contract> --tofu --allow-iceberg-update",
+                    "or: fluid apply plan.json --allow-iceberg-update",
+                ],
+            },
+        )
+
+
 @_traced_stage("plan")
 def run(args, logger: logging.Logger) -> int:
     """
@@ -300,34 +333,7 @@ def run(args, logger: logging.Logger) -> int:
     given by ``--out``).
     """
     try:
-        # The tables are compared with the contract in OpenTofu's plan of them: a plan
-        # without --tofu cannot check one, and must not look as if it had.
-        if getattr(args, "adopt_tables", False) and not getattr(args, "tofu", False):
-            raise CLIError(
-                1,
-                "plan_adopt_tables_needs_tofu",
-                {
-                    "error": "--adopt-tables checks each existing table against the contract "
-                    "in OpenTofu's plan of it, so it needs --tofu",
-                    "remediation": ["fluid plan <contract> --tofu --adopt-tables"],
-                },
-            )
-        # The hold is made in OpenTofu's plan, which a plan without --tofu does not make:
-        # its apply plans again, and takes the flag itself.
-        if getattr(args, "allow_iceberg_update", False) and not getattr(args, "tofu", False):
-            raise CLIError(
-                1,
-                "plan_allow_iceberg_update_needs_tofu",
-                {
-                    "error": "--allow-iceberg-update decides what OpenTofu's plan updates in "
-                    "place, so it needs --tofu; a plan without it is planned again by "
-                    "`fluid apply`, which takes the flag itself",
-                    "remediation": [
-                        "fluid plan <contract> --tofu --allow-iceberg-update",
-                        "or: fluid apply plan.json --allow-iceberg-update",
-                    ],
-                },
-            )
+        _refuse_flags_that_need_tofu(args)
 
         # UX hardening — accept bare ``fluid plan`` when CWD has a contract.
         from fluid_build.cli._common import auto_find_contract

@@ -30,6 +30,7 @@ from tests.iac.test_iac_table_adoption_engine import (  # noqa: F401 - tofu is a
     _args,
     _glue_state,
     _held_attributes,
+    _imported,
     _plan,
     tofu,
 )
@@ -43,22 +44,10 @@ ONE_UPDATE = {"add": 0, "change": 1, "remove": 0}
 
 
 def _in_state(actions: List[str], before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
-    """The table the state holds, as the plan changes it (no import)."""
-    return {
-        "resource_changes": [
-            {
-                "address": TABLE,
-                "mode": "managed",
-                "type": "aws_glue_catalog_table",
-                "change": {
-                    "actions": actions,
-                    "before": before,
-                    "after": after,
-                    "after_unknown": {},
-                },
-            }
-        ]
-    }
+    """The table the state holds, as the plan changes it: no import."""
+    change = _imported(actions, before, after)
+    del change["change"]["importing"]
+    return {"resource_changes": [change]}
 
 
 def _described(text: str) -> Dict[str, Any]:
@@ -83,14 +72,22 @@ def planned(tofu):
 
 
 def _events(caplog: pytest.LogCaptureFixture, event: str) -> List[logging.LogRecord]:
-    return [record for record in caplog.records if f'"message": "{event}"' in record.getMessage()]
+    found = [r for r in caplog.records if f'"message": "{event}"' in r.getMessage()]
+    assert all(record.levelno == logging.WARNING for record in found)
+    return found
+
+
+def _applied(tmp_path, capfd, caplog, **over: Any) -> str:
+    """``fluid apply <contract>`` succeeds; what it printed."""
+    with caplog.at_level(logging.WARNING, logger=_LOG.name):
+        assert engine.apply_via_opentofu(_args(tmp_path, **over), _LOG) == 0
+    return " ".join(capfd.readouterr().out.split())
 
 
 def test_a_live_iceberg_table_the_state_holds_is_left_as_it_is(planned, tmp_path, capfd, caplog):
     planned["shown"] = [UPDATE, HELD]
 
-    with caplog.at_level(logging.WARNING, logger=_LOG.name):
-        assert engine.apply_via_opentofu(_args(tmp_path), _LOG) == 0
+    out = _applied(tmp_path, capfd, caplog)
 
     first, again = planned["plans"]
     assert _held_attributes(first) == ["parameters", "open_table_format_input"]
@@ -101,13 +98,11 @@ def test_a_live_iceberg_table_the_state_holds_is_left_as_it_is(planned, tmp_path
         "storage_descriptor",
     ]
     assert planned["apply"] == 1
-    out = " ".join(capfd.readouterr().out.split())
     assert "(again: live Iceberg tables left as they are)" in out
     assert "sales.orders is a live Iceberg table" in out
     assert "description: none in the table, Order events in the contract" in out
     assert "re-run with --allow-iceberg-update" in out
-    (held,) = _events(caplog, "iceberg_table_update_held")
-    assert held.levelno == logging.WARNING
+    assert len(_events(caplog, "iceberg_table_update_held")) == 1
     assert not _events(caplog, "iceberg_table_update_accepted")
 
 
@@ -116,18 +111,13 @@ def test_with_the_flag_the_plan_updates_it_and_the_apply_audits_it(
 ):
     planned["shown"] = [UPDATE]
 
-    with caplog.at_level(logging.WARNING, logger=_LOG.name):
-        assert engine.apply_via_opentofu(_args(tmp_path, allow_iceberg_update=True), _LOG) == 0
+    out = _applied(tmp_path, capfd, caplog, allow_iceberg_update=True)
 
     (only,) = planned["plans"]
-    assert _held_attributes(only) == ["parameters", "open_table_format_input"]
-    assert planned["apply"] == 1
-    out = " ".join(capfd.readouterr().out.split())
+    assert "storage_descriptor" not in _held_attributes(only) and planned["apply"] == 1
     assert "sales.orders is updated in place (--allow-iceberg-update)" in out
     (accepted,) = _events(caplog, "iceberg_table_update_accepted")
-    assert (
-        accepted.levelno == logging.WARNING and '"table": "sales.orders"' in accepted.getMessage()
-    )
+    assert '"table": "sales.orders"' in accepted.getMessage()
     assert not _events(caplog, "iceberg_table_update_held")
 
 

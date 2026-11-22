@@ -116,14 +116,19 @@ def test_plan_tofu_binds_the_update_and_applying_that_plan_audits_it(planned, tm
     assert planned["apply"] == 1
 
 
-def test_an_edited_update_record_is_refused_as_plan_tamper(planned, tmp_path, capsys):
+def _plan_without_its_update_record(planned, tmp_path: Path, *, bind_again: bool) -> None:
+    """``fluid plan --tofu --allow-iceberg-update``, then its record of the update removed:
+    as an edit (the digest no longer matches), or bound again (a plan made before the hold)."""
     planned["shown"] = UPDATE
-    contract = _contract(tmp_path)
-    assert _main("plan", str(contract), "--tofu", FLAG) == 0
+    assert _main("plan", str(_contract(tmp_path)), "--tofu", FLAG) == 0
     path = tmp_path / "plan.json"
     plan = json.loads(path.read_text(encoding="utf-8"))
     del plan[TOFU_PLAN_FIELD]["icebergUpdates"]
-    path.write_text(json.dumps(plan), encoding="utf-8")
+    path.write_text(json.dumps(inject_digests(plan, force=True) if bind_again else plan))
+
+
+def test_an_edited_update_record_is_refused_as_plan_tamper(planned, tmp_path, capsys):
+    _plan_without_its_update_record(planned, tmp_path, bind_again=False)
     capsys.readouterr()
 
     assert _main("apply", "plan.json", "--yes") == 1
@@ -137,13 +142,7 @@ def test_a_saved_plan_that_updates_a_table_its_record_does_not_name_is_refused(
 ):
     """A saved plan made by a release before the hold, bound again: it updates the table in
     place with no record of it, and the apply's own flag cannot add one."""
-    planned["shown"] = UPDATE
-    contract = _contract(tmp_path)
-    assert _main("plan", str(contract), "--tofu", FLAG) == 0
-    path = tmp_path / "plan.json"
-    plan = json.loads(path.read_text(encoding="utf-8"))
-    del plan[TOFU_PLAN_FIELD]["icebergUpdates"]
-    path.write_text(json.dumps(inject_digests(plan, force=True)), encoding="utf-8")
+    _plan_without_its_update_record(planned, tmp_path, bind_again=True)
     capsys.readouterr()
 
     assert _main("apply", "plan.json", "--yes", FLAG) == 1

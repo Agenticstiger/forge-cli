@@ -77,6 +77,10 @@ def _module(body: Dict[str, Any] = ICEBERG) -> str:
     return json.dumps({"resource": {"aws_glue_catalog_table": {"sales_orders_sales_orders": body}}})
 
 
+#: The change counts of a plan that updates something in place.
+CHANGED = {"add": 0, "change": 1, "remove": 0}
+
+
 def _args(**over: Any) -> argparse.Namespace:
     return argparse.Namespace(**{"allow_iceberg_update": False, **over})
 
@@ -188,11 +192,11 @@ def test_the_note_names_each_held_attribute_with_the_tables_value_and_the_contra
     assert lines == [
         "description: written by the stream in the table, Order events in the contract",
         "owner: hadoop in the table, none in the contract",
+        "column note (string): in the contract, not in the table",
+        "column dropped (string): in the table, not in the contract",
         "column id: bigint in the table, string in the contract",
         "column Amount: written amount in the contract",
         "comment of column amount: old in the table, the amount in the contract",
-        "column note (string): in the contract, not in the table",
-        "column dropped (string): in the table, not in the contract",
         "columns of older Iceberg schemas (legacy): listed by the table, not by the contract "
         "(Iceberg keeps listing them)",
         f"location: {LOCATION} in the table, {LOCATION}/v2 in the contract",
@@ -353,12 +357,12 @@ def test_the_backstop_refuses_an_update_the_hold_missed_unless_the_run_asked():
     plugin, update = get_iac_plugin("aws"), _plan(_update(LIVE_ICEBERG, description="new"))
 
     with pytest.raises(CLIError) as raised:
-        hold.review(plugin, _module(), update, _args())
+        hold.review(plugin, _module(), update, _args(), CHANGED)
     assert raised.value.event == "iceberg_table_update_in_place"
     assert raised.value.context["tables"][0]["table"] == "sales.orders"
     assert "no VersionId" in raised.value.context["error"]
 
-    (allowed,) = hold.review(plugin, _module(), update, _args(allow_iceberg_update=True))
+    (allowed,) = hold.review(plugin, _module(), update, _args(allow_iceberg_update=True), CHANGED)
     assert allowed.table == "sales.orders"
 
 
@@ -366,12 +370,12 @@ def test_a_saved_plan_may_update_only_the_tables_its_record_names(capfd):
     plugin, update = get_iac_plugin("aws"), _plan(_update(LIVE_ICEBERG, description="new"))
     asked = _args(allow_iceberg_update=True)
 
-    (allowed,) = hold.review(plugin, _module(), update, _args(), recorded=["sales.orders"])
+    (allowed,) = hold.review(plugin, _module(), update, _args(), CHANGED, recorded=["sales.orders"])
     assert allowed.table == "sales.orders"
     for recorded in ([], ["sales.other"]):
         with pytest.raises(CLIError) as raised:
             # The apply's own flag decides nothing for a saved plan.
-            hold.review(plugin, _module(), update, asked, recorded=recorded)
+            hold.review(plugin, _module(), update, asked, CHANGED, recorded=recorded)
         assert raised.value.event == "iceberg_table_update_in_place"
         assert "its record does not name" in raised.value.context["error"]
         assert "fluid plan --tofu" in raised.value.context["remediation"][0]
@@ -380,16 +384,26 @@ def test_a_saved_plan_may_update_only_the_tables_its_record_names(capfd):
 def test_a_plan_not_read_back_is_refused_whatever_the_flags():
     for args in (_args(), _args(allow_iceberg_update=True)):
         with pytest.raises(CLIError) as raised:
-            hold.review(get_iac_plugin("aws"), _module(), None, args)
+            hold.review(get_iac_plugin("aws"), _module(), None, args, CHANGED)
         assert "could not be read back" in raised.value.context["error"]
 
 
 def test_plan_tofu_only_says_the_apply_will_refuse(capfd):
     update = _plan(_update(LIVE_ICEBERG, description="new"))
 
-    assert hold.review(get_iac_plugin("aws"), _module(), update, _args(), enforce=False) == []
+    assert (
+        hold.review(get_iac_plugin("aws"), _module(), update, _args(), CHANGED, enforce=False) == []
+    )
 
     assert "`fluid apply` will refuse it" in " ".join(capfd.readouterr().out.split())
+
+
+def test_a_plan_that_updates_nothing_in_place_is_not_reviewed():
+    """Nothing to hold, so nothing to read back either, readable or not."""
+    nothing = {"add": 1, "change": 0, "remove": 0}
+
+    assert hold.review(get_iac_plugin("aws"), _module(), None, _args(), nothing) == []
+    assert hold.review(object(), _module(), None, _args(), CHANGED) == []
 
 
 def test_a_plan_with_no_held_update_passes_the_backstop():
@@ -397,7 +411,10 @@ def test_a_plan_with_no_held_update_passes_the_backstop():
     noop["change"]["actions"] = ["no-op"]
     hive = _update(_table([_column("id", "bigint")], **HIVE_PARQUET), description="new")
 
-    assert hold.review(get_iac_plugin("aws"), _module(PARQUET), _plan(noop, hive), _args()) == []
+    assert (
+        hold.review(get_iac_plugin("aws"), _module(PARQUET), _plan(noop, hive), _args(), CHANGED)
+        == []
+    )
 
 
 # ── the record and the audit ────────────────────────────────────────────────

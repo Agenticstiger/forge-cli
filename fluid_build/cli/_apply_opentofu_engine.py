@@ -31,7 +31,7 @@ import tempfile
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.iac import build_module, get_iac_plugin, runner, target_identity
@@ -201,7 +201,7 @@ def _apply_via_opentofu(
             raise _plan_failure(eng.plugin, eng.contract, plan, eng.workdir, eng.env)
         changes = runner.change_summary(plan)
         cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
-        shown = _shown_for_review(eng, tables, changes)
+        shown = _shown_for_review(eng, changes, tables=tables)
         # A live Iceberg table the plan would update in place is left as it is, unless
         # --allow-iceberg-update (``_apply_table_hold``), whatever brought it in.
         held = _table_hold.to_hold(args, _table_hold.planned_updates(eng.plugin, eng.module, shown))
@@ -305,12 +305,15 @@ def _plan_holding_tables(
 _UNREAD: Any = object()
 
 
-def _shown_for_review(eng: _Engine, tables: List[Any], changes: Mapping[str, int]) -> Any:
+def _shown_for_review(
+    eng: _Engine, changes: Mapping[str, int], shown: Any = _UNREAD, *, tables: Sequence[Any] = ()
+) -> Any:
     """The saved plan as ``tofu show -json`` prints it, read once for the reviews that need
     it: the tables to adopt, and an in-place update the plugin may hold
-    (``_apply_table_hold.may_hold``). :data:`_UNREAD` when neither does."""
-    if not tables and not _table_hold.may_hold(eng.plugin, changes):
-        return _UNREAD
+    (``_apply_table_hold.may_hold``). ``shown`` as it is when a review read it already, and
+    :data:`_UNREAD` when none needs it."""
+    if shown is not _UNREAD or not (tables or _table_hold.may_hold(eng.plugin, changes)):
+        return shown
     return runner.tofu_show_plan(eng.workdir, plan_file=_WORKDIR_PLAN, env=eng.env)
 
 
@@ -525,12 +528,9 @@ def _review_plan(
     """What the saved plan in the workdir does beyond its counts, then the data-loss gate.
 
     Returns the plan's deletes for the plugin's ``prepare_destroys``, and the in-place
-    updates of live Iceberg tables the run may make (``_apply_table_hold.review``: the
-    plan's own ``--allow-iceberg-update``, or the tables a saved plan's record names,
-    ``recorded``). With ``enforce=False`` (``fluid plan --tofu``) the gate only says
-    whether the apply will need ``--allow-data-loss``: the flag belongs to the apply that
-    runs it. ``shown`` is the saved plan as ``tofu show -json`` printed it, when the run
-    has read it already.
+    updates of live Iceberg tables the run may make (``_apply_table_hold.review``;
+    ``recorded``: those a saved plan's record names). With ``enforce=False`` (``fluid plan
+    --tofu``) the gates only say what the apply will refuse: the flags belong to the apply.
     """
     # Revoking a grant destroys a member resource and loses no data: only the
     # removals of data-bearing resources reach the data-loss gate.
@@ -555,8 +555,7 @@ def _review_plan(
             + ", ".join(built)
         )
     _report_plan_notices(eng.plugin, eng.contract, logger)
-    if shown is _UNREAD and _table_hold.may_hold(eng.plugin, changes):
-        shown = runner.tofu_show_plan(eng.workdir, plan_file=_WORKDIR_PLAN, env=eng.env)
+    shown = _shown_for_review(eng, changes, shown)
     # In-place updates that delete data — a dropped column — which the destroy
     # count above never sees (``~`` in the summary, not ``-``).
     lost_in_place = _in_place_changes(eng.plugin, changes, eng.workdir, eng.env, shown)
@@ -567,23 +566,24 @@ def _review_plan(
     # destructive ``--mode replace``, where the operator reasonably reads
     # "apply complete" as "the table now matches the contract".
     _report_suppressed_drift(eng.plugin, eng.contract, eng.workdir, eng.env, args, logger)
-    # The backstop of the Iceberg hold: an in-place update of a live Iceberg table still in
-    # the plan is refused unless the run may make it (``_apply_table_hold``).
-    updated: List[Any] = []
-    if _table_hold.may_hold(eng.plugin, changes):
-        updated = _table_hold.review(
-            eng.plugin, eng.module, shown, args, recorded=recorded, enforce=enforce
-        )
-
+    # The backstop of the Iceberg hold: a live Iceberg table the plan still updates in place.
+    updated = _table_hold.review(
+        eng.plugin, eng.module, shown, args, changes, recorded=recorded, enforce=enforce
+    )
     if not enforce:
-        if _data_loss_blocked(data_changes, False) or lost_in_place:
-            cprint(
-                "  ⚠️  this plan destroys or changes existing data: `fluid apply` will refuse "
-                "it unless given --allow-data-loss"
-            )
+        _say_data_loss_ahead(data_changes, lost_in_place)
         return [], updated
     _enforce_data_loss_gate(args, logger, eng.provider, changes, data_changes, lost_in_place)
     return _planned_destroys(eng.plugin, changes, eng.workdir, eng.env), updated
+
+
+def _say_data_loss_ahead(data_changes: Mapping[str, int], lost_in_place: List[str]) -> None:
+    """``fluid plan --tofu``: say whether the apply will need ``--allow-data-loss``."""
+    if _data_loss_blocked(data_changes, False) or lost_in_place:
+        cprint(
+            "  ⚠️  this plan destroys or changes existing data: `fluid apply` will refuse "
+            "it unless given --allow-data-loss"
+        )
 
 
 def _preview_outside_opentofu(
@@ -1127,19 +1127,7 @@ def _apply_bound_plan(
     _write_private(plan_path, saved)
     shown = runner.tofu_show_plan(eng.workdir, plan_file=_WORKDIR_PLAN, env=eng.env)
     if shown is None:
-        raise CLIError(
-            1,
-            "apply_tofu_plan_unreadable",
-            {
-                "error": f"`tofu show -json` could not read the saved plan {record['planFile']}",
-                "remediation": [
-                    "The plan needs the OpenTofu version and providers it was made with; "
-                    + "re-run `fluid plan --tofu` where you apply.",
-                    "A plan made with FLUID_STATE_ENCRYPTION set is read only with the same "
-                    + "setting, and one made without it only without it.",
-                ],
-            },
-        )
+        raise _unreadable_saved_plan(record)
     # Before the hooks: a stale plan is refused before anything outside OpenTofu runs.
     _refuse_stale_before_hooks(eng, record)
     changes = runner.saved_plan_changes(shown)
@@ -1148,16 +1136,11 @@ def _apply_bound_plan(
         f"+{changes['add']} ~{changes['change']} -{changes['remove']}"
     )
     _table_adoption.say_bound(record)
-    _table_hold.say_bound(args, record)
+    recorded = _table_hold.say_bound(args, record)
     _record_planned(eng, changes, dry_run)
+    removals = runner.saved_plan_removals(shown)
     destroyed, updated = _review_plan(
-        eng,
-        args,
-        logger,
-        changes,
-        runner.saved_plan_removals(shown),
-        shown=shown,
-        recorded=_table_hold.recorded(record),
+        eng, args, logger, changes, removals, shown=shown, recorded=recorded
     )
     if dry_run:
         _preview_outside_opentofu(eng, logger, destroyed, changes)
@@ -1170,6 +1153,23 @@ def _apply_bound_plan(
     )
     _table_hold.audit_updated(logger, updated)
     return _finish_apply(eng, logger, changes, destroyed, applied_state, bound=True)
+
+
+def _unreadable_saved_plan(record: Mapping[str, Any]) -> CLIError:
+    """``fluid apply plan.json``: ``tofu show -json`` could not read the saved plan."""
+    return CLIError(
+        1,
+        "apply_tofu_plan_unreadable",
+        {
+            "error": f"`tofu show -json` could not read the saved plan {record['planFile']}",
+            "remediation": [
+                "The plan needs the OpenTofu version and providers it was made with; "
+                + "re-run `fluid plan --tofu` where you apply.",
+                "A plan made with FLUID_STATE_ENCRYPTION set is read only with the same "
+                + "setting, and one made without it only without it.",
+            ],
+        },
+    )
 
 
 def _check_plan_target(record: Mapping[str, Any], provider: str, target: "StateTarget") -> None:

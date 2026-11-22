@@ -36,7 +36,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Collection, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build._contract_loader import CLIError
 from fluid_build.cli.console import cprint_literal
@@ -96,19 +96,26 @@ def planned_updates(plugin: Any, module: str, shown: Any) -> Dict[str, Held]:
         return {}
     declared = declared_resources(module)
     found: Dict[str, Held] = {}
-    for change in shown.get("resource_changes") or []:
-        if not isinstance(change, Mapping) or change.get("mode", "managed") != "managed":
-            continue
-        detail = change.get("change")
-        if not isinstance(detail, Mapping):
-            continue
-        if [str(action) for action in detail.get("actions") or []] != ["update"]:
-            continue
-        address = str(change.get("address") or "")
+    for address, change, detail in _in_place(shown):
         table_hold = hold(change, declared.get(address) or {})
         if isinstance(table_hold, TableHold) and table_hold.attributes:
             found[address] = Held(address, table_hold, detail.get("importing") is not None)
     return found
+
+
+def _in_place(
+    shown: Mapping[str, Any],
+) -> Iterator[Tuple[str, Mapping[str, Any], Mapping[str, Any]]]:
+    """``(address, resource change, change)`` of each managed resource the plan updates in
+    place."""
+    for change in shown.get("resource_changes") or []:
+        if not isinstance(change, Mapping) or change.get("mode", "managed") != "managed":
+            continue
+        detail = change.get("change")
+        if isinstance(detail, Mapping) and [str(a) for a in detail.get("actions") or []] == [
+            "update"
+        ]:
+            yield str(change.get("address") or ""), change, detail
 
 
 def to_hold(args: Any, updates: Mapping[str, Held]) -> Dict[str, Held]:
@@ -186,6 +193,7 @@ def review(
     module: str,
     shown: Any,
     args: Any,
+    changes: Mapping[str, int],
     *,
     recorded: Optional[Sequence[str]] = None,
     enforce: bool = True,
@@ -199,8 +207,11 @@ def review(
     with ``--allow-iceberg-update``. A saved plan (``fluid apply plan.json``, ``recorded``
     its record's ``icebergUpdates``) may make only those its record names, whatever the
     apply's flags. ``shown`` is ``None`` when the plan could not be read back: refused
-    whatever the flags, as nothing can say which tables it updates.
+    whatever the flags, as nothing can say which tables it updates. A plan that updates
+    nothing in place, or a plugin that keeps no table from it, passes (:func:`may_hold`).
     """
+    if not may_hold(plugin, changes):
+        return []
     if shown is None:
         _refuse(
             "the saved plan could not be read back, so an in-place update of a live Iceberg "
@@ -247,9 +258,9 @@ def record_field(updated: Sequence[Held]) -> Dict[str, Any]:
     return {"icebergUpdates": sorted(entry.table for entry in updated)} if updated else {}
 
 
-def say_bound(args: Any, record: Mapping[str, Any]) -> None:
+def say_bound(args: Any, record: Mapping[str, Any]) -> List[str]:
     """``fluid apply plan.json``: name the tables the saved plan updates in place, and say
-    that the apply's own flag decides nothing there."""
+    that the apply's own flag decides nothing there. Returns those names (:func:`recorded`)."""
     names = recorded(record)
     if names:
         cprint_literal(
@@ -264,6 +275,7 @@ def say_bound(args: Any, record: Mapping[str, Any]) -> None:
             "`fluid plan --tofu` instead",
             soft_wrap=True,
         )
+    return names
 
 
 def audit_updated(logger: logging.Logger, updated: Sequence[Held]) -> None:

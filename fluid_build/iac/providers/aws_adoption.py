@@ -37,7 +37,7 @@ The same reading decides which tables the plan never updates in place
 from __future__ import annotations
 
 import re
-from typing import Any, FrozenSet, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 from fluid_build.iac.table_hold import TableHold
 
@@ -179,53 +179,12 @@ def held_drift(change: Mapping[str, Any]) -> List[str]:
 
 
 def _column_drift(live_descriptor: Mapping[str, Any], planned: Mapping[str, Any]) -> List[str]:
-    every = _columns(live_descriptor)
-    live = [column for column in every if _current(column)]
-    older = [column for column in every if not _current(column)]
-    wanted = _columns(planned)
-    live_by = {_name(column).lower(): column for column in live}
-    wanted_by = {_name(column).lower(): column for column in wanted}
-    lines: List[str] = []
-    for key, column in wanted_by.items():
-        name, found = _say(_name(column)), live_by.get(key)
-        if found is None:
-            lines.append(
-                f"column {name} ({_say(_type(column))}): in the contract, not in the table"
-            )
-            continue
-        if _name(found) != _name(column):
-            lines.append(f"column {_say(_name(found))}: written {name} in the contract")
-        if _type(found) != _type(column):
-            lines.append(
-                f"column {name}: {_say(_type(found))} in the table, "
-                f"{_say(_type(column))} in the contract"
-            )
-        if _text(found.get("comment")) != _text(column.get("comment")):
-            lines.append(
-                f"comment of column {name}: {_show(found.get('comment'))} in the table, "
-                f"{_show(column.get('comment'))} in the contract"
-            )
-    for key, column in live_by.items():
-        if key not in wanted_by:
-            lines.append(
-                f"column {_say(_name(column))} ({_say(_type(column))}): in the table, "
-                "not in the contract"
-            )
-    if set(live_by) == set(wanted_by) and list(live_by) != list(wanted_by):
-        lines.append(
-            "column order: ("
-            + ", ".join(_say(_name(column)) for column in live)
-            + ") in the table, ("
-            + ", ".join(_say(_name(column)) for column in wanted)
-            + ") in the contract"
-        )
-    if older:
-        lines.append(
-            "columns of older Iceberg schemas ("
-            + ", ".join(_say(_name(column)) for column in older)
-            + "): listed by the table, not by the contract (Iceberg keeps listing them)"
-        )
-    return lines
+    """:func:`_column_changes` for the note on a held table: the table's value, then the
+    contract's (:data:`_DRIFT_WORDS`)."""
+    return [
+        _DRIFT_WORDS[kind](found, wanted)
+        for kind, found, wanted in _column_changes(live_descriptor, planned)
+    ]
 
 
 def _hive_storage(before: Mapping[str, Any]) -> bool:
@@ -315,59 +274,128 @@ def _review_columns(
     differences: List[str],
     updates: List[str],
 ) -> None:
+    for kind, found, wanted in _column_changes(live_descriptor, planned_descriptor):
+        if kind == "type" and _canonical(_type(found)) == _canonical(_type(wanted)):
+            updates.append(
+                f"writes the type of column {_say(_name(wanted))} as {_say(_type(wanted))} "
+                f"(the table spells it {_say(_type(found))})"
+            )
+            continue
+        refuses, words = _REVIEW_WORDS[kind]
+        (differences if refuses else updates).append(words(found, wanted))
+
+
+def _column_changes(
+    live_descriptor: Mapping[str, Any], planned_descriptor: Mapping[str, Any]
+) -> List[Tuple[str, Any, Any]]:
+    """Each way the table's columns differ from the contract's, as ``(kind, found,
+    wanted)``: ``missing`` and ``extra`` columns, then per contract column its ``name``
+    (case), ``type`` and ``comment``, then their ``order`` (both lists), and the columns of
+    older Iceberg schemas the table lists (``older``, ``found`` is the list). Columns are
+    matched by name whatever its case."""
     every = _columns(live_descriptor)
     live = [column for column in every if _current(column)]
     older = [column for column in every if not _current(column)]
-    planned = _columns(planned_descriptor)
     live_by = {_name(column).lower(): column for column in live}
-    planned_by = {_name(column).lower(): column for column in planned}
-
-    missing = [column for key, column in planned_by.items() if key not in live_by]
-    extra = [column for key, column in live_by.items() if key not in planned_by]
-    for column in missing:
-        differences.append(
-            f"column {_say(_name(column))} ({_say(_type(column))}): in the contract, "
-            "not in the table"
-        )
-    for column in extra:
-        differences.append(
-            f"column {_say(_name(column))} ({_say(_type(column))}): in the table, "
-            "not in the contract"
-        )
-    for key, wanted in planned_by.items():
+    wanted_by = {_name(column).lower(): column for column in _columns(planned_descriptor)}
+    changes: List[Tuple[str, Any, Any]] = [
+        ("missing", None, column) for key, column in wanted_by.items() if key not in live_by
+    ]
+    changes += [("extra", column, None) for key, column in live_by.items() if key not in wanted_by]
+    for key, wanted in wanted_by.items():
         found = live_by.get(key)
         if found is None:
             continue
-        name = _say(_name(wanted))
-        if _name(found) != _name(wanted):
-            # Glue, Hive and Athena resolve a column's name whatever its case.
-            updates.append(f"writes the name of column {_say(_name(found))} as {name}")
-        if _canonical(_type(found)) != _canonical(_type(wanted)):
-            differences.append(
-                f"column {name}: {_say(_type(found))} in the table, "
-                f"{_say(_type(wanted))} in the contract"
-            )
-        elif _type(found) != _type(wanted):
-            updates.append(
-                f"writes the type of column {name} as {_say(_type(wanted))} (the table "
-                f"spells it {_say(_type(found))})"
-            )
-        if _text(found.get("comment")) != _text(wanted.get("comment")):
-            updates.append(f"sets the comment of column {name}")
-    if not missing and not extra and list(live_by) != list(planned_by):
-        differences.append(
-            "column order: the table has ("
-            + ", ".join(_say(_name(column)) for column in live)
-            + "), the contract ("
-            + ", ".join(_say(_name(column)) for column in planned)
-            + ")"
-        )
+        for kind, same in (
+            ("name", _name(found) == _name(wanted)),
+            ("type", _type(found) == _type(wanted)),
+            ("comment", _text(found.get("comment")) == _text(wanted.get("comment"))),
+        ):
+            if not same:
+                changes.append((kind, found, wanted))
+    if set(live_by) == set(wanted_by) and list(live_by) != list(wanted_by):
+        changes.append(("order", live, list(wanted_by.values())))
     if older:
-        updates.append(
-            "drops from Glue the columns of older Iceberg schemas it lists ("
-            + ", ".join(_say(_name(column)) for column in older)
-            + "); Iceberg lists them again at its next commit"
-        )
+        changes.append(("older", older, None))
+    return changes
+
+
+def _column(column: Mapping[str, Any]) -> str:
+    return f"{_say(_name(column))} ({_say(_type(column))})"
+
+
+def _names(columns: Any) -> str:
+    return "(" + ", ".join(_say(_name(column)) for column in columns) + ")"
+
+
+def _missing(_found: Any, wanted: Any) -> str:
+    return f"column {_column(wanted)}: in the contract, not in the table"
+
+
+def _extra(found: Any, _wanted: Any) -> str:
+    return f"column {_column(found)}: in the table, not in the contract"
+
+
+def _retyped(found: Any, wanted: Any) -> str:
+    return (
+        f"column {_say(_name(wanted))}: {_say(_type(found))} in the table, "
+        f"{_say(_type(wanted))} in the contract"
+    )
+
+
+_Words = Callable[[Any, Any], str]
+
+#: The adoption review's words for each column change (:func:`_column_changes`), and
+#: whether it refuses the adoption (a difference) or is made in place (an update). A type
+#: written with other spacing is an update of its own (:func:`_review_columns`).
+_REVIEW_WORDS: Dict[str, Tuple[bool, _Words]] = {
+    "missing": (True, _missing),
+    "extra": (True, _extra),
+    # Glue, Hive and Athena resolve a column's name whatever its case.
+    "name": (
+        False,
+        lambda found, wanted: (
+            f"writes the name of column {_say(_name(found))} as {_say(_name(wanted))}"
+        ),
+    ),
+    "type": (True, _retyped),
+    "comment": (False, lambda _found, wanted: f"sets the comment of column {_say(_name(wanted))}"),
+    "order": (
+        True,
+        lambda found, wanted: (
+            f"column order: the table has {_names(found)}, the contract {_names(wanted)}"
+        ),
+    ),
+    "older": (
+        False,
+        lambda found, _wanted: (
+            f"drops from Glue the columns of older Iceberg schemas it lists {_names(found)}; "
+            "Iceberg lists them again at its next commit"
+        ),
+    ),
+}
+
+#: The note's words for each column change of a held table: the table's value, then the
+#: contract's.
+_DRIFT_WORDS: Dict[str, _Words] = {
+    "missing": _missing,
+    "extra": _extra,
+    "name": lambda found, wanted: (
+        f"column {_say(_name(found))}: written {_say(_name(wanted))} in the contract"
+    ),
+    "type": _retyped,
+    "comment": lambda found, wanted: (
+        f"comment of column {_say(_name(wanted))}: {_show(found.get('comment'))} in the "
+        f"table, {_show(wanted.get('comment'))} in the contract"
+    ),
+    "order": lambda found, wanted: (
+        f"column order: {_names(found)} in the table, {_names(wanted)} in the contract"
+    ),
+    "older": lambda found, _wanted: (
+        f"columns of older Iceberg schemas {_names(found)}: listed by the table, not by the "
+        "contract (Iceberg keeps listing them)"
+    ),
+}
 
 
 def _current(column: Mapping[str, Any]) -> bool:
