@@ -333,8 +333,8 @@ def _wrap_plugin_parser_funcs(parser: argparse.ArgumentParser) -> None:
 
 
 def _register_command_plugins(
-    sp: argparse._SubParsersAction, argv: Optional[List[str]] = None
-) -> None:
+    sp: argparse._SubParsersAction, argv: Optional[List[str]] = None, *, force: bool = False
+) -> Dict[str, List[str]]:
     """Register external ``fluid_build.commands`` plugins LAZILY.
 
     A plugin's module + ``register()`` is imported only when its command is
@@ -344,24 +344,32 @@ def _register_command_plugins(
     entry-point metadata. Discovery and per-plugin load failures are fully
     isolated and logged by exception TYPE only, so a broken plugin can never
     crash the CLI and a credential-shaped substring can never leak.
+
+    ``force`` loads every allowed plugin regardless of the invoked command; only
+    ``fluid describe --commands`` sets it. Returns ``{plugin name: [commands it added]}``.
     """
+    # Idempotent per subparsers object: a plugin already registered (the invoked
+    # command was a plugin's) is not loaded twice, and keeps its attribution.
+    added: Dict[str, List[str]] = sp.__dict__.setdefault("_fluid_plugin_commands", {})
     try:
         eps = _command_plugin_entry_points()
     except Exception as e:  # noqa: BLE001 - discovery must never break the CLI
         LOG.warning("CLI plugin discovery failed: %s", type(e).__name__)
-        return
+        return added
     if not eps:
-        return
+        return added
 
     core_names = set(sp.choices)
     requested = _requested_command(sys.argv[1:] if argv is None else argv)
     # Import the real subparsers ONLY when a non-core command is being invoked
     # (i.e. plausibly a plugin command). ``--help`` / a core command / no
     # command all keep the cold path free of plugin imports.
-    if not (requested and requested not in core_names):
-        return
+    if not force and not (requested and requested not in core_names):
+        return added
 
     for ep in eps:
+        if ep.name in added:
+            continue
         before = set(sp.choices)
         try:
             ep.load()(sp)
@@ -370,8 +378,11 @@ def _register_command_plugins(
             LOG.warning("Failed to load CLI plugin %s: %s", ep.name, type(e).__name__)
             continue
         # Bridge any newly-registered command funcs to ``func(args, logger)``.
-        for name in set(sp.choices) - before:
+        new = [n for n in sp.choices if n not in before]
+        added[ep.name] = new
+        for name in new:
             _wrap_plugin_parser_funcs(sp.choices[name])
+    return added
 
 
 # ────────────────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@
 `fluid describe --self` — machine-readable self-description.
 
 Pattern adapted from `pulumi about -j/--json`.
-Usage: fluid describe --self [--json]
+Usage: fluid describe --self [--json] | --commands
 """
 # ruff: noqa: T201 — this CLI command owns user-facing print() output by design;
 # the canonical migration to console.cprint is tracked separately.
@@ -35,6 +35,12 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
         help="Describe this installation (providers, engines, schema version)",
     )
     p.add_argument(
+        "--commands",
+        dest="describe_commands",
+        action="store_true",
+        help="Print every command, flag and plugin-added command or importer as JSON",
+    )
+    p.add_argument(
         "-j",
         "--json",
         dest="as_json",
@@ -46,8 +52,13 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace, *_extra) -> int:
+    if getattr(args, "describe_commands", False):
+        from fluid_build.describe import command_tree_document
+
+        print(json.dumps(command_tree_document(), indent=2))
+        return 0
     if not args.describe_self:
-        print("Usage: fluid describe --self [--json]")
+        print("Usage: fluid describe --self [--json] | --commands")
         return 1
 
     from fluid_build.describe import self_describe

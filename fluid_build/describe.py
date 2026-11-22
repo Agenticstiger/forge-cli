@@ -46,6 +46,26 @@ def _detect_capabilities() -> Dict[str, bool]:
     return detected
 
 
+#: Version of the document ``command_tree_document`` returns. Bump it when a key is
+#: renamed or removed; adding a key keeps the version.
+COMMAND_TREE_SCHEMA_VERSION = 1
+
+
+def _type_name(action: argparse.Action) -> str:
+    """The value type a flag takes: ``bool`` for a switch, else the converter's name."""
+    if isinstance(
+        action,
+        (argparse._StoreTrueAction, argparse._StoreFalseAction, argparse.BooleanOptionalAction),
+    ):
+        return "bool"
+    if isinstance(action, argparse._CountAction):
+        return "count"
+    conv = action.type
+    if conv is None:
+        return "str"
+    return getattr(conv, "__name__", type(conv).__name__)
+
+
 def _describe_action(action: argparse.Action) -> Dict[str, Any]:
     """One argparse option/positional -> a JSON-safe flag descriptor."""
     default = action.default
@@ -60,6 +80,8 @@ def _describe_action(action: argparse.Action) -> Dict[str, Any]:
         "choices": [str(c) for c in action.choices] if action.choices else None,
         "default": default,
         "metavar": action.metavar,
+        "type": _type_name(action),
+        "nargs": action.nargs,
     }
 
 
@@ -151,4 +173,44 @@ def self_describe() -> Dict[str, Any]:
         "provider_engine_compatibility": matrix.get("provider_engine_compatibility", {}),
         "capabilities": _detect_capabilities(),
         "warnings": matrix.get("warnings", []),
+    }
+
+
+def command_tree_document() -> Dict[str, Any]:
+    """The versioned command-tree document behind ``fluid describe --commands``.
+
+    Every ``build_parser()`` command with its aliases, positionals and flags, plus what
+    plugins add: commands from the ``fluid_build.commands`` group (loaded on purpose
+    here, under the operator allow/block policy, and marked with ``plugin``) and
+    importer names from the ``fluid_build.importers`` group (read from metadata, never
+    loaded).
+    """
+    from fluid_build.cli import build_parser
+    from fluid_build.cli.bootstrap import _register_command_plugins
+    from fluid_build.cli.import_workflow import registry
+
+    parser = build_parser()
+    plugin_commands: Dict[str, List[str]] = {}
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            plugin_commands = _register_command_plugins(action, force=True)
+            break
+    tree = _command_tree(parser)
+    for plugin, names in plugin_commands.items():
+        for name in names:
+            if name in tree["subcommands"]:
+                tree["subcommands"][name]["plugin"] = plugin
+    builtin = registry.importer_names(plugins=False)
+    importers = [
+        {"name": n, "source": "builtin" if n in registry.BUILTIN_IMPORTERS else "registered"}
+        for n in builtin
+    ]
+    importers += [
+        {"name": n, "source": "plugin"} for n in registry.importer_names() if n not in builtin
+    ]
+    return {
+        "schema_version": COMMAND_TREE_SCHEMA_VERSION,
+        "fluid_version": _fluid_version,
+        "commands": tree,
+        "importers": importers,
     }
