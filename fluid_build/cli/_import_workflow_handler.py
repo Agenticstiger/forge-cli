@@ -42,7 +42,7 @@ from fluid_build.util.safe_yaml import read_bounded_file
 #: The importers that propose products from code (one per output by default).
 PROPOSING_TOOLS = ("airflow", "pyspark")
 #: The ``--split-by`` values that are about code, and so for those importers only.
-CODE_SPLITS = ("table", "job", "dag")
+CODE_SPLITS = ("table", "job", "dag", "task")
 #: File states ``--force`` replaces: a file that differs, and one that cannot be read.
 _REPLACEABLE = ("different", "unreadable")
 

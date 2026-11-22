@@ -26,6 +26,11 @@ be silently ignored), and a size cap and the alias limits of
       write_table: {writes: table, arg: 1, format: iceberg}
     operators:                       # project operator classes that submit Spark work
       AcmeSparkOperator: spark_submit
+    drivers:                         # a script a task submits that runs jobs by name
+      - script: driver.py            #   (its file name, or its last segments)
+        argument: --job-list         #   the flag whose value names the list (or a position, 0..)
+        job_lists: {dir: libs/job_lists, file: "{value}.yaml", key: jobs}
+        jobs: {dir: libs/jobs, file: "{job}.py"}
     session_names: [spark, session]  # names whose .sql() and .table() are Spark's
     config_modules:                  # constants kept outside the scanned tree
       - {module: acme_config.settings, path: libs/acme_config/settings.py}
@@ -42,6 +47,7 @@ be silently ignored), and a size cap and the alias limits of
     layers: {raw: Bronze, curated: Silver, marts: Gold}   # database -> layer
     owners:                          # the owner label a DAG uses -> the contract's owner
       data-eng: {team: data-engineering, email: data-eng@example.com}
+    consumers: [gold.revenue_daily]  # outputs read outside the scanned code (a dashboard, a team)
     ignore:
       tables: ["^tmp_", "_staging$"]   # regular expressions
       paths: ["^s3://lake/tmp/"]
@@ -54,6 +60,19 @@ and ``--dags``): a path that leaves them all (``..``, an absolute path, a link t
 refused, checked on the resolved path. So a conventions file cannot make the scan read a file from
 somewhere the user did not point it at, and it may sit in a folder of its own beside the
 repositories it describes (``config/conventions.yaml``).
+
+``consumers`` names the outputs that something outside the scanned code reads (a dashboard, another
+team's job): a table (``db.table`` or ``catalog.db.table``, in any case), a topic or a path as the
+code names it, or the product id the proposal gives it. The report flags an output that no scanned
+job reads and no consumer is declared for ("retire it, or name its consumer"); declaring one clears
+the flag on the next import.
+
+``drivers`` says how a submitted script that runs jobs by name is read: ``driver.py --job-list
+silver_orders`` runs the jobs the file ``silver_orders.yaml`` lists, each the module ``{job}.py``.
+Only data is read: the list is a YAML file in ``dir`` (bounded, safe, never run) whose ``key`` holds
+the job names (without ``key``, the file is the list), and each name is a file name in the jobs
+``dir``. The task is then joined to every job file the list names. A name or a value that is not a
+plain file name (a ``/``, a ``..``) and a path that leaves its ``dir`` are refused.
 
 ``airflow_variables`` is read like ``environments``: the names of an Airflow Variable and what each
 holds in an environment. ``Variable.get("x")``, ``Variable.get("x", default_var=...)`` (Airflow 2),
@@ -98,6 +117,8 @@ _TOP_KEYS = frozenset(
         "paths",
         "helpers",
         "operators",
+        "drivers",
+        "consumers",
         "session_names",
         "config_modules",
         "environment",
@@ -143,6 +164,24 @@ class CatalogRule:
 
 
 @dataclass(frozen=True)
+class Driver:
+    """A script that runs jobs by name, picked by an argument (see the module docstring)."""
+
+    #: The submitted script's file name, or its trailing segments (``driver.py``, ``pkg/driver.py``).
+    script: str
+    #: The flag whose value names the job list (``--job-list``), or the argument's position.
+    argument: Union[int, str]
+    #: The directory of the job lists, and a list's file name with ``{value}`` where the argument's
+    #: value goes; ``key`` is where the names are in the file (the file itself when ``None``).
+    lists_dir: Path
+    list_file: str
+    list_key: Optional[str]
+    #: The directory of the job files, and a job file's name with ``{job}`` for a name.
+    jobs_dir: Path
+    job_file: str
+
+
+@dataclass(frozen=True)
 class Conventions:
     """The parsed conventions. ``Conventions()`` is the file with nothing in it."""
 
@@ -153,6 +192,9 @@ class Conventions:
     paths: Tuple[PathRule, ...] = ()
     helpers: Mapping[str, HelperSpec] = field(default_factory=dict)
     operators: Mapping[str, str] = field(default_factory=dict)
+    drivers: Tuple[Driver, ...] = ()
+    #: Outputs something outside the scanned code reads, lower case (see the module docstring).
+    consumers: Tuple[str, ...] = ()
     session_names: Tuple[str, ...] = ()
     #: ``{dotted module name: file}`` for constants kept outside the scanned tree.
     config_modules: Mapping[str, Path] = field(default_factory=dict)
@@ -329,6 +371,68 @@ def _env_value(value: Any, path: Optional[Path], where: str) -> str:
     return text
 
 
+_SCRIPT = re.compile(r"[A-Za-z0-9_.\-]+(/[A-Za-z0-9_.\-]+)*")
+_FLAG = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9_\-]*")
+_FILE_TEMPLATE = re.compile(r"[A-Za-z0-9_.\-]*\{(?P<name>value|job)\}[A-Za-z0-9_.\-]*")
+
+
+def _file_template(value: Any, path: Optional[Path], where: str, placeholder: str) -> str:
+    """A file name with ``{placeholder}`` in it once: a plain name, never a path."""
+    text = _text(value, path, where)
+    found = _FILE_TEMPLATE.fullmatch(text)
+    if found is None or found.group("name") != placeholder or ".." in text:
+        raise _fail(
+            path,
+            where,
+            f"{text!r} is not a file name with {{{placeholder}}} in it (letters, digits, "
+            "'_', '-' and '.', no '/')",
+        )
+    return text
+
+
+def _argument(value: Any, path: Optional[Path], where: str) -> Union[int, str]:
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value < 0 or value > 1_000:
+            raise _fail(path, where, "a position is 0 or more")
+        return value
+    text = _text(value, path, where)
+    if not _FLAG.fullmatch(text):
+        raise _fail(path, where, f"{text!r} is not a flag such as --job-list, or a position")
+    return text
+
+
+def _driver(
+    raw: Any, base: Path, source: Optional[Path], where: str, named: Sequence[Path]
+) -> Driver:
+    entry = _mapping(raw, source, where, frozenset({"script", "argument", "job_lists", "jobs"}))
+    missing = sorted({"script", "argument", "job_lists", "jobs"} - set(entry))
+    if missing:
+        raise _fail(source, where, f"give {', '.join(missing)}")
+    script = _text(entry["script"], source, f"{where}.script", pattern=_SCRIPT)
+    if ".." in script.split("/"):
+        raise _fail(source, f"{where}.script", f"{script!r} has a '..' in it")
+    lists = _mapping(
+        entry["job_lists"], source, f"{where}.job_lists", frozenset({"dir", "file", "key"})
+    )
+    jobs = _mapping(entry["jobs"], source, f"{where}.jobs", frozenset({"dir", "file"}))
+    for block, needed in ((lists, "job_lists"), (jobs, "jobs")):
+        if not {"dir", "file"} <= set(block):
+            raise _fail(source, f"{where}.{needed}", "give dir and file")
+    return Driver(
+        script=script,
+        argument=_argument(entry["argument"], source, f"{where}.argument"),
+        lists_dir=_local(base, lists["dir"], source, f"{where}.job_lists.dir", named),
+        list_file=_file_template(lists["file"], source, f"{where}.job_lists.file", "value"),
+        list_key=(
+            _text(lists["key"], source, f"{where}.job_lists.key", pattern=_IDENT)
+            if "key" in lists
+            else None
+        ),
+        jobs_dir=_local(base, jobs["dir"], source, f"{where}.jobs.dir", named),
+        job_file=_file_template(jobs["file"], source, f"{where}.jobs.file", "job"),
+    )
+
+
 def _template(value: Any, path: Optional[Path], where: str) -> str:
     text = _text(value, path, where)
     try:
@@ -468,6 +572,18 @@ def parse_conventions(
             )
         operators[name] = text
 
+    drivers = tuple(
+        _driver(raw, base, source, f"drivers[{index}]", named)
+        for index, raw in enumerate(_list(top.get("drivers", []), source, "drivers"))
+    )
+
+    consumers = tuple(
+        dict.fromkeys(
+            _text(item, source, f"consumers[{i}]").lower()
+            for i, item in enumerate(_list(top.get("consumers", []), source, "consumers"))
+        )
+    )
+
     sessions = tuple(
         _text(item, source, f"session_names[{i}]", pattern=_IDENT)
         for i, item in enumerate(_list(top.get("session_names", []), source, "session_names"))
@@ -596,6 +712,8 @@ def parse_conventions(
         paths=tuple(rules),
         helpers=helpers,
         operators=operators,
+        drivers=drivers,
+        consumers=consumers,
         session_names=sessions,
         config_modules=modules,
         environment=environment,

@@ -290,3 +290,173 @@ with DAG(dag_id="bash", schedule="@daily", default_args={"owner": "orders-team"}
     task = task_of(contract)
     assert task["params"]["script"] == "s3://code/jobs/merge.py"
     assert task["params"]["args"] == ["--env", "prod"]
+
+
+# ── G5: an output nobody reads ────────────────────────────────────────
+
+
+def unread_lines(report) -> List[str]:
+    return [line for line in report.unsupported if "is read by no scanned job" in line]
+
+
+READS_A = """
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+spark.table("raw.events").write.saveAsTable("silver.a")
+"""
+READS_B = """
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+spark.table("silver.a").write.saveAsTable("gold.b")
+"""
+PLAIN = "defaults: {domain: retail, platform: aws}\n"
+
+
+def test_an_output_no_scanned_job_reads_is_still_proposed_and_flagged(tmp_path, monkeypatch):
+    contracts, report = run_pyspark(
+        tmp_path,
+        monkeypatch,
+        {
+            "jobs/a.py": READS_A,
+            "jobs/b.py": READS_B,
+            "conventions.yaml": PLAIN,
+            "dags/x.py": "x=1\n",
+        },
+    )
+    assert {c["id"] for c in contracts} == {"silver.a", "gold.b"}  # both are proposed
+    flagged = unread_lines(report)
+    assert len(flagged) == 1 and flagged[0].startswith("gold.b (")  # silver.a is read by b.py
+    assert "retire it, or name its consumer under `consumers`" in flagged[0]
+
+
+@pytest.mark.parametrize(
+    "declared",
+    ["gold.b", "GOLD.B", "glue.gold.b", "retail.b", "gold.b "],
+)
+def test_a_declared_consumer_clears_the_flag_by_table_or_product_id(
+    tmp_path, monkeypatch, declared
+):
+    contracts, report = run_pyspark(
+        tmp_path,
+        monkeypatch,
+        {
+            "jobs/a.py": READS_A,
+            "jobs/b.py": READS_B.replace('"gold.b"', '"glue.gold.b"'),
+            "conventions.yaml": PLAIN
+            + f"consumers: ['{declared}']\n"
+            + "catalogs: {glue: {platform: aws, format: iceberg, catalog: glue}}\n"
+            + "products: {id: '{database}.{table}'}\n",
+            "dags/x.py": "x=1\n",
+        },
+    )
+    if declared == "retail.b":  # a product id the proposal does not give it: no effect
+        assert len(unread_lines(report)) == 1
+    else:
+        assert unread_lines(report) == []
+
+
+def test_a_job_reading_its_own_output_does_not_make_it_read(tmp_path, monkeypatch):
+    _, report = run_pyspark(
+        tmp_path,
+        monkeypatch,
+        {
+            "jobs/a.py": READS_A + 'spark.table("silver.a")\n',
+            "conventions.yaml": PLAIN,
+            "dags/x.py": "x=1\n",
+        },
+    )
+    assert len(unread_lines(report)) == 1
+
+
+def test_a_product_is_read_when_any_one_of_its_outputs_is(tmp_path, monkeypatch):
+    _, report = run_pyspark(
+        tmp_path,
+        monkeypatch,
+        {
+            "jobs/a.py": READS_A + 'spark.table("raw.more").write.saveAsTable("silver.a2")\n',
+            "jobs/b.py": READS_B,
+            "conventions.yaml": PLAIN,
+            "dags/x.py": "x=1\n",
+        },
+        split_by="job",
+    )
+    # one product holds silver.a and silver.a2; only silver.a is read: the product is read
+    assert [line.split(" (")[0] for line in unread_lines(report)] == ["retail.b"]
+
+
+def test_the_flags_are_listed_up_to_a_limit_and_the_rest_counted(tmp_path, monkeypatch):
+    from fluid_build.cli.import_workflow import _proposal
+
+    monkeypatch.setattr(_proposal, "MAX_UNREAD_LINES", 2)
+    jobs = {f"jobs/j{n}.py": READS_A.replace("silver.a", f"silver.t{n}") for n in range(5)}
+    _, report = run_pyspark(
+        tmp_path,
+        monkeypatch,
+        {**jobs, "conventions.yaml": PLAIN, "dags/x.py": "x=1\n"},
+    )
+    assert len(unread_lines(report)) == 2
+    assert any(
+        "3 more product(s) are read by no scanned job" in line for line in report.unsupported
+    )
+
+
+def test_a_topic_written_and_read_by_nobody_here_is_flagged_too(tmp_path, monkeypatch):
+    _, report = run_pyspark(
+        tmp_path,
+        monkeypatch,
+        {
+            "jobs/s.py": """
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+df = spark.readStream.format("kafka").option("subscribe", "in").load()
+df.writeStream.format("kafka").option("topic", "out").option(
+    "checkpointLocation", "s3://c/x").start()
+""",
+            "conventions.yaml": PLAIN,
+            "dags/x.py": "x=1\n",
+        },
+    )
+    assert any("out" in line for line in unread_lines(report))
+
+
+def test_the_consumers_must_be_text_and_are_bounded(tmp_path):
+    import yaml
+
+    with pytest.raises(Exception) as refused:
+        C = __import__(
+            "fluid_build.cli.import_workflow._conventions", fromlist=["parse_conventions"]
+        )
+        C.parse_conventions(yaml.safe_load("consumers: [1, {a: b}]"))
+    assert "consumers[0]" in str(refused.value)
+
+
+def test_a_consumer_may_be_named_by_the_product_id_or_by_the_table_alone(tmp_path, monkeypatch):
+    files = {"jobs/a.py": READS_A, "jobs/b.py": READS_B, "dags/x.py": "x=1\n"}
+    # by the product id (the job split names it retail.b), though no table is called that
+    _, report = run_pyspark(
+        tmp_path / "none", monkeypatch, {**files, "conventions.yaml": PLAIN}, split_by="job"
+    )
+    assert [line.split(" (")[0] for line in unread_lines(report)] == ["retail.b"]
+    _, report = run_pyspark(
+        tmp_path / "id",
+        monkeypatch,
+        {**files, "conventions.yaml": PLAIN + "consumers: [retail.b]\n"},
+        split_by="job",
+    )
+    assert unread_lines(report) == []
+    # by database.table, when the table is in a catalog and the product id is the table alone
+    _, report = run_pyspark(
+        tmp_path / "table",
+        monkeypatch,
+        {
+            **files,
+            "jobs/b.py": READS_B.replace('"gold.b"', '"glue.gold.b"'),
+            "conventions.yaml": PLAIN
+            + "consumers: [gold.b]\nproducts: {id: '{table}'}\n"
+            + "catalogs: {glue: {platform: aws, format: iceberg, catalog: glue}}\n",
+        },
+    )
+    assert unread_lines(report) == []

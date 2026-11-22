@@ -10,6 +10,8 @@ directory that might hold a DAG (:func:`._pysource.might_contain_dag`) with
 
 How a submitted script is matched to a job file, in order:
 
+0. the conventions' ``drivers``: a script that runs jobs by name (``driver.py --job-list
+   silver_orders``) is joined to every job file the named list holds (:mod:`._drivers`);
 1. the conventions' ``script_roots``: ``s3://code/jobs/orders.py`` under the root
    ``s3://code/jobs/ -> jobs`` is the local file ``jobs/orders.py``;
 2. a relative path that exists inside the project (the DAGs directory's parent);
@@ -30,7 +32,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from ._airflow_dags import Dag, Submit, Task, read_dags
 from ._catalogs import module_settings
-from ._conventions import Conventions
+from ._conventions import Conventions, Driver
+from ._drivers import Lists, argument_value, driver_for, job_file
 from ._fold import ModuleIndex
 from ._pysource import (
     MAX_TOTAL_BYTES,
@@ -67,7 +70,8 @@ class LinkedTask:
     dag: Dag
     task: Task
     submit: Submit
-    #: ``script_root``, ``project``, ``path`` (more than the file name matched) or ``name``.
+    #: ``script_root``, ``project``, ``path`` (more than the file name matched), ``name``, or
+    #: ``driver`` (the task runs a driver whose job list names this job).
     how: str
 
 
@@ -286,16 +290,56 @@ def local_script(
     return None
 
 
+def _driven(
+    driver: Driver,
+    submit: Submit,
+    lists: Lists,
+    by_path: Dict[Path, JobRecord],
+    notes: Optional[List[str]],
+    reported: set,
+) -> "List[JobRecord] | str":
+    """The job files the job list a driver is given names, or why the task is not joined."""
+    value = argument_value(driver, submit.args)
+    if isinstance(value, tuple):
+        return value[0]
+    names = lists.names(driver, value)
+    if isinstance(names, str):
+        return names
+    found: Dict[Path, JobRecord] = {}
+    missing: List[str] = []
+    for name in dict.fromkeys(names):
+        path = job_file(driver, name)
+        job = by_path.get(path) if path is not None else None
+        if job is None:
+            missing.append(name)
+        else:
+            found.setdefault(job.path, job)
+    if missing and notes is not None and (driver.script, value) not in reported:
+        reported.add((driver.script, value))
+        shown = ", ".join(clean_chars(m) for m in missing[:10]) + (
+            ", ..." if len(missing) > 10 else ""
+        )
+        notes.append(
+            f"the job list {clean_chars(value)} names {len(missing)} job(s) with no job file that "
+            f"does Spark reads or writes here: {shown}"
+        )
+    if not found:
+        return f"no job of the list {clean_chars(value)} is a job file read here"
+    return list(found.values())
+
+
 def link_tasks(
     dags: Sequence[Dag],
     scans: Sequence[JobScan],
     conventions: Conventions,
     project_root: Optional[Path],
     notes: Optional[List[str]] = None,
+    budget: Optional[SourceBudget] = None,
 ) -> Tuple[List[LinkedTask], List[Tuple[Dag, Task, Submit, str]]]:
     """Join every submit of every task to a job file of ``scans``. Returns ``(linked,
     unlinked)``; an unlinked submit comes with why. A job records at most
-    :data:`MAX_TASKS_PER_JOB` tasks (the rest are counted in ``notes``)."""
+    :data:`MAX_TASKS_PER_JOB` tasks (the rest are counted in ``notes``). ``budget`` is what the
+    job lists the conventions' ``drivers`` name are read against."""
     jobs = [job for scan in scans for job in scan.jobs]
     by_path = {job.path: job for job in jobs}
     by_name: Dict[str, List[JobRecord]] = {}
@@ -306,11 +350,33 @@ def link_tasks(
     over: Dict[str, int] = {}
     linked: List[LinkedTask] = []
     unlinked: List[Tuple[Dag, Task, Submit, str]] = []
+    lists = Lists(budget) if conventions.drivers else None
+    driven: Dict[Tuple[str, Tuple[str, ...]], "List[JobRecord] | str"] = {}
+    reported: set = set()
     for dag in dags:
         for task in dag.tasks:
             for submit in task.submits:
                 if submit.script is None:
                     unlinked.append((dag, task, submit, submit.why or "no script"))
+                    continue
+                driver = driver_for(submit.script, conventions.drivers) if lists else None
+                if driver is not None and lists is not None:
+                    key = (submit.script, submit.args)
+                    runs = driven.get(key)
+                    if runs is None:
+                        runs = driven[key] = _driven(
+                            driver, submit, lists, by_path, notes, reported
+                        )
+                    if isinstance(runs, str):
+                        unlinked.append((dag, task, submit, runs))
+                        continue
+                    for job in runs:
+                        if len(job.tasks) >= MAX_TASKS_PER_JOB:
+                            over[job.shown] = over.get(job.shown, 0) + 1
+                            continue
+                        link = LinkedTask(dag, task, submit, "driver")
+                        job.tasks.append(link)
+                        linked.append(link)
                     continue
                 found = answers.get(submit.script)
                 if found is None:

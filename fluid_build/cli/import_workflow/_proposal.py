@@ -50,7 +50,7 @@ from ._scan import JobRecord, LinkedTask
 from ._spark_io import TRIGGER_SEPARATOR, Ref, Write
 from .registry import ImportReport
 
-SPLITS = ("table", "job", "dag", "folder", "project")
+SPLITS = ("table", "job", "dag", "task", "folder", "project")
 #: Distinct outputs, and products, one proposal holds. Every product is validated against the
 #: schema and written as a file; a project has hundreds, and a directory of generated code that
 #: names a table per line is not what this reads.
@@ -78,6 +78,8 @@ MAX_LINK_VISITS = 1_000_000
 MAX_TASK_LINES = 20
 #: Reads of one product named one by one in the report; the rest are counted.
 MAX_READ_LINES = 20
+#: Outputs nobody reads, named one by one in the report; the rest are counted.
+MAX_UNREAD_LINES = 20
 
 
 class ProposalTooLarge(Exception):
@@ -438,6 +440,15 @@ def _groups(outputs: List[Output], split_by: str, conv: Conventions, root_name: 
                 key, label = ("dag", dag_ids[0]), ident(dag_ids[0])
             else:
                 key, label = ("job", str(job.path)), labels[str(job.path)]
+        elif split_by == "task":
+            first = _first_links(job)
+            if first and first[0].task.task_id and first[0].dag.dag_id:
+                # the outputs of every job one task runs are one product (a driver's job list)
+                link = first[0]
+                key = ("task", link.dag.file, link.dag.line, link.task.key)
+                label = ident(f"{link.dag.dag_id}.{link.task.task_id}")
+            else:
+                key, label = ("job", str(job.path)), labels[str(job.path)]
         elif split_by == "folder":
             head = job.rel.split("/")[0] if "/" in job.rel else None
             key = ("folder", head)
@@ -715,6 +726,8 @@ def build_proposal(
                 "lists all of the job's inputs in consumes[]"
             )
 
+    _flag_unread(groups, group_ids, produced, ordered, conv, report)
+
     ctx = _Ctx(
         version=version,
         conv=conv,
@@ -737,6 +750,61 @@ def build_proposal(
             f"consumes[] names them under the id the id rule gives: {listed}{more}"
         )
     return Proposal(contracts=contracts, report=report)
+
+
+def _flag_unread(
+    groups: Sequence[Group],
+    group_ids: Dict[int, str],
+    produced: Dict[Tuple[str, ...], Tuple[str, str]],
+    jobs: Sequence[JobRecord],
+    conv: Conventions,
+    report: ImportReport,
+) -> None:
+    """Flag each product none of whose outputs is read by a scanned job (the jobs that write it do
+    not count) or declared as read by a consumer: the code cannot see a dashboard or another
+    team's job, so the contract is still proposed, and a person decides: retire the output, or
+    name its consumer under ``consumers``. Listed one by one up to :data:`MAX_UNREAD_LINES`."""
+    readers: Dict[Tuple[str, ...], Set[str]] = {}
+    for job in jobs:
+        for read in job.facts.reads:
+            if not read.resolved or read.kind == "topic_pattern":
+                continue
+            identity = identity_of(read, conv)
+            if identity is not None:
+                readers.setdefault(identity.key, set()).add(str(job.path))
+    declared = set(conv.consumers)
+    unread: List[str] = []
+    for index, group in enumerate(groups):
+        pid = group_ids[index]
+        writers: Set[str] = set()
+        for output in group.outputs:
+            writers.add(str(output.writer.path))
+            writers.update(str(j.path) for j, _ in output.others)
+        names = {pid.lower()}
+        used = False
+        for output in group.outputs:
+            identity = output.identity
+            names.add(identity.shown.lower())
+            if identity.kind == "table":
+                names.add(f"{identity.database or ''}.{identity.name}".strip(".").lower())
+            if readers.get(identity.key, set()) - writers:
+                used = True
+                break
+        if used or names & declared:
+            continue
+        shown = ", ".join(safe_text(o.identity.shown, 60) for o in group.outputs[:5])
+        more = f" and {len(group.outputs) - 5} more" if len(group.outputs) > 5 else ""
+        unread.append(
+            f"{pid} ({shown}{more}) is read by no scanned job and no declared consumer: retire "
+            "it, or name its consumer under `consumers` in the conventions"
+        )
+    for line in unread[:MAX_UNREAD_LINES]:
+        report.unsupported.append(line)
+    if len(unread) > MAX_UNREAD_LINES:
+        report.unsupported.append(
+            f"{len(unread) - MAX_UNREAD_LINES} more product(s) are read by no scanned job and no "
+            "declared consumer"
+        )
 
 
 def _unmapped_catalog(pid: str, alias: str, eids: Sequence[str], catalogs: CatalogKinds) -> str:
@@ -826,10 +894,12 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
     labels = _job_labels(writer_jobs)
     for job in writer_jobs:
         build_ids[id(job)] = _unique(labels[str(job.path)], taken, "-")
-    task_build: Dict[Tuple[str, int, str], str] = {}
+    task_build: Dict[Tuple[str, int, str], List[str]] = {}
     for job in writer_jobs:
         for link in job.tasks:
-            task_build[(link.dag.file, link.dag.line, link.task.key)] = build_ids[id(job)]
+            task_build.setdefault((link.dag.file, link.dag.line, link.task.key), []).append(
+                build_ids[id(job)]
+            )
     for job in writer_jobs:
         builds.append(
             _build(job, group, build_ids, task_build, expose_by_key, conv, report, pid, ctx)
@@ -945,7 +1015,7 @@ def _build(
     job: JobRecord,
     group: Group,
     build_ids: Dict[int, str],
-    task_build: Dict[Tuple[str, int, str], str],
+    task_build: Dict[Tuple[str, int, str], List[str]],
     expose_by_key: Dict[Tuple[str, ...], str],
     conv: Conventions,
     report: ImportReport,
@@ -985,14 +1055,14 @@ def _build(
 
 
 def _dependencies(
-    links: Sequence[LinkedTask], task_build: Dict[Tuple[str, int, str], str], own: str
+    links: Sequence[LinkedTask], task_build: Dict[Tuple[str, int, str], List[str]], own: str
 ) -> List[Dict[str, str]]:
     deps: List[str] = []
     for link in links:
         for up in _dag_index(link.dag).upstream.get(link.task.key, ()):
-            upstream = task_build.get((link.dag.file, link.dag.line, up))
-            if upstream and upstream != own and upstream not in deps:
-                deps.append(upstream)
+            for upstream in task_build.get((link.dag.file, link.dag.line, up), ()):
+                if upstream != own and upstream not in deps:
+                    deps.append(upstream)
     return [{"buildId": d, "condition": "success"} for d in deps]
 
 
@@ -1066,7 +1136,7 @@ def _copy_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
 
 def _orchestration(
     links: Sequence[LinkedTask],
-    task_build: Dict[Tuple[str, int, str], str],
+    task_build: Dict[Tuple[str, int, str], List[str]],
     build_id: str,
     report: ImportReport,
     pid: str,

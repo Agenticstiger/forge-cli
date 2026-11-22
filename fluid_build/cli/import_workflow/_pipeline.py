@@ -212,6 +212,7 @@ def run_import(
                 conv,
                 project_root=dags_root.resolve().parent,
                 notes=report.notes,
+                budget=budget,
             )
     else:
         dag_scan = scan_dags(root, conv, budget)
@@ -222,7 +223,7 @@ def run_import(
             )
         scans = [scan_jobs(directory, conv, budget) for directory in roots]
         linked, unlinked = link_tasks(
-            dag_scan.dags, scans, conv, project_root=None, notes=report.notes
+            dag_scan.dags, scans, conv, project_root=None, notes=report.notes, budget=budget
         )
 
     _scan_report(tool, scans, dag_scan, linked, unlinked, report)
@@ -389,20 +390,25 @@ def _scan_report(
                         f"({task.file}:{task.line}): {safe_text(note, 200)}"
                     )
         by_how: Dict[str, int] = {}
+        seen_submits: set = set()
         for link in linked:
-            by_how[link.how] = by_how.get(link.how, 0) + 1
+            if id(link.submit) not in seen_submits:  # a driver's one script joins several jobs
+                seen_submits.add(id(link.submit))
+                by_how[link.how] = by_how.get(link.how, 0) + 1
             if link.how == "name":
                 report.unsupported.append(
                     f"DAG {safe_text(link.dag.shown, 60)} task {safe_text(link.task.shown, 60)} submits "
                     f"{safe_command(link.submit.script or '', 100)}: joined to a job file by file name only"
                 )
+        through_driver = sum(1 for link in linked if link.how == "driver")
         report.notes.append(
-            f"{len(linked)} submitted script(s) joined to a job file"
+            f"{len(seen_submits)} submitted script(s) joined to a job file"
             + (
                 f" ({', '.join(f'{n} by {how}' for how, n in sorted(by_how.items()))})"
                 if by_how
                 else ""
             )
+            + (f"; {through_driver} job file(s) run through a driver" if through_driver else "")
             + f"; {len(unlinked)} not joined"
         )
         for dag, task, submit, why in unlinked:

@@ -249,7 +249,12 @@ def test_the_report_says_what_mapped_what_defaulted_and_what_was_not_read(projec
     assert "read 2 DAG file(s)" in notes and "2 DAG(s), 3 task(s), 3 submit a script" in notes
     assert "3 submitted script(s) joined to a job file (3 by script_root); 0 not joined" in notes
     assert "3 upstream table(s) or topic(s) are read but written by no scanned job" in notes
-    assert report.unsupported == []
+    # what the code cannot say is the only thing listed: the last outputs of the pipelines are
+    # read by nothing in the scanned code, so each is flagged (a person retires it, or names who
+    # reads it)
+    flags = [x for x in report.unsupported if "is read by no scanned job" in x]
+    assert [x.split(" (")[0] for x in flags] == ["clicks_clean", "retail.orders_daily"]
+    assert report.unsupported == flags
 
 
 def test_the_airflow_importer_reads_the_same_jobs_through_script_roots(project):
@@ -258,7 +263,7 @@ def test_the_airflow_importer_reads_the_same_jobs_through_script_roots(project):
         "dags", options={"conventions": "conventions.yaml"}
     )
     assert from_dags == from_jobs
-    assert report.unsupported == []
+    assert [x for x in report.unsupported if "is read by no scanned job" not in x] == []
 
 
 def test_airflow_without_script_roots_lists_each_task_and_the_way_out(project):
@@ -337,6 +342,18 @@ def test_split_by_job_dag_folder_and_project(project):
     assert all(c["productId"] != "retail.orders_daily" for c in orders["consumes"])
     assert [c["productId"] for c in orders["consumes"]] == ["retail.orders_raw", "retail.customers"]
 
+    task, _ = pyspark({"split_by": "task"})
+    assert {c["id"] for c in task} == {
+        "retail.orders_daily.clean_orders",  # a task of the DAG, and the jobs it runs
+        "retail.orders_daily.orders_daily",
+        "retail.clicks_stream.start_clicks",
+        "retail.two_outputs",  # no task runs it: the job
+        "retail.load_a",
+        "retail.build_b",
+    }
+    for contract in task:
+        assert_valid(contract)
+
     folder, _ = pyspark({"split_by": "folder"})
     # the files at the top of the scanned directory are named after it, like the project split
     assert {c["id"] for c in folder} == {"retail.jobs", "retail.ingest", "retail.serve"}
@@ -352,7 +369,7 @@ def test_a_boundary_that_is_not_for_code_is_refused_with_the_valid_ones(project)
     with pytest.raises(FluidUserError) as refused:
         pyspark({"split_by": "group"})
     assert "--split-by group does not apply" in refused.value.what
-    assert "table | job | dag | folder | project" in refused.value.fix
+    assert "table | job | dag | task | folder | project" in refused.value.fix
 
 
 # ── single writer, one owner ──────────────────────────────────────────
@@ -760,7 +777,7 @@ def test_the_help_names_both_importers_and_the_new_flags(capsys):
         "--dags",
         "--dry-run",
         "--force",
-        "{project,folder,group,table,job,dag}",
+        "{project,folder,group,table,job,dag,task}",
     ):
         assert word in out.replace("\n", " ") or word in out
 
@@ -872,6 +889,9 @@ def test_several_products_into_an_existing_file_is_refused_before_anything_is_wr
         (("dbt", "x", "--split-by", "folder"), True),
         (("pyspark", "jobs", "--split-by", "job"), True),
         (("airflow", "dags", "--split-by", "dag"), True),
+        (("pyspark", "jobs", "--split-by", "task"), True),
+        (("dbt", "x", "--split-by", "task"), False),
+        (("--split-by", "task"), False),
     ],
 )
 def test_the_splits_about_code_belong_to_the_importers_that_read_code(project, argv, ok):

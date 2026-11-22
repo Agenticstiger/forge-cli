@@ -94,14 +94,15 @@ def _add_code_importer_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--split-by",
         dest="split_by",
-        choices=["project", "folder", "group", "table", "job", "dag"],
+        choices=["project", "folder", "group", "table", "job", "dag", "task"],
         default=None,
         help=(
             "Product boundary. dbt: one contract per project (default), per top-level "
             "models/ subfolder (folder), or per dbt group (group; cross-split refs become "
             "cross-product consumes[]). airflow and pyspark: one product per output table or "
-            "topic (table, the default), per job file (job), per Airflow DAG (dag), per top-level "
-            "folder (folder) or one for everything (project)"
+            "topic (table, the default), per job file (job), per Airflow DAG (dag), per DAG "
+            "task (task: the outputs of every job one task runs, a driver's job list included), "
+            "per top-level folder (folder) or one for everything (project)"
         ),
     )
     parser.add_argument(
