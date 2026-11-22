@@ -20,6 +20,7 @@ from fluid_build.profiler.dp.release import ReleaseRefused
 from tests.profiler._fake_backend import FakeBackend
 from tests.profiler.dp import _release_data as data
 from tests.profiler.dp import _release_run as run
+from tests.profiler.dp._privacy import need
 from tests.profiler.dp._release_run import SEED, columns, contract, draw, request
 
 pytestmark = pytest.mark.unit
@@ -465,14 +466,20 @@ def test_a_key_is_read_in_its_domain_so_one_entity_is_never_two_units():
     assert encoded.units[0] is not None
 
 
-def test_a_null_key_part_is_a_unit_of_its_own():
+def test_rows_with_no_key_value_are_one_unit_and_every_other_key_is_a_unit_of_its_own():
     plan = run.keyed_plan()
-    rows = _orders(4)
+    rows = _orders(6)
     base = columns(rows)
     values = {name: list(each) for name, each in base.values.items()}
     values["customer_id"][1] = None
+    values["customer_id"][4] = None
     encoded = release.encode_rows(plan, dataclasses.replace(base, values=values), FakeBackend())
-    assert encoded.units[1] is None and encoded.units[0] is not None
+    assert encoded.units[1] == encoded.units[4] == bounding.NULL_KEY
+    assert encoded.units[0] != bounding.NULL_KEY and encoded.units[0] is not None
+    related = release.encode_rows(
+        run.related_plan(), dataclasses.replace(base, values=values), FakeBackend()
+    )
+    assert related.units[1] == related.units[4] == bounding.NULL_KEY
 
 
 # ---- the release ------------------------------------------------------------------------------
@@ -695,6 +702,45 @@ def test_a_set_of_tables_with_no_junction_forest_is_refused_before_any_agreement
     assert not called
 
 
+def test_a_structure_too_large_refuses_after_the_selection_and_names_what_was_spent():
+    plan = run.keyed_plan()
+    backend = FakeBackend()
+    encoded = release.encode_rows(plan, columns(_orders()), backend)
+
+    def too_big(*a: Any, **k: Any) -> Any:
+        raise ValueError("the maximal cliques hold 99999 cells, more than the 65,536 allowed")
+
+    with pytest.raises(ReleaseRefused) as info:
+        release.draw(
+            plan, encoded, SEED, backend, cliques=None, select=run.choose, structure=too_big
+        )
+    refused = info.value
+    assert refused.event == "profile_release_structure_too_large"
+    message = " ".join(str(refused).split())
+    assert "more cells than a release may measure" in message
+    assert (
+        "spent the selection share of this release's budget, rho 0.1, on these records" in message
+    )
+    assert "nothing was written" in message and "99999" not in message
+    assert refused.context["written"] == "nothing"
+    assert "list fewer categorical columns" in refused.context["next"]
+
+
+def test_the_real_structure_refuses_cliques_that_hold_too_many_cells(monkeypatch):
+    need("mbi")
+    real = selection.release_structure
+
+    def small(names: Any, sizes: Any, cliques: Any, **_: Any) -> Any:
+        return real(names, sizes, cliques, max_cells=7)  # status x channel holds 8
+
+    plan = run.keyed_plan()
+    backend = FakeBackend()
+    encoded = release.encode_rows(plan, columns(_orders()), backend)
+    with pytest.raises(ReleaseRefused) as info:
+        release.draw(plan, encoded, SEED, backend, cliques=None, select=run.choose, structure=small)
+    assert info.value.event == "profile_release_structure_too_large"
+
+
 # ---- the guarantee: removing an entity ---------------------------------------------------------
 
 
@@ -791,6 +837,202 @@ def test_an_entity_with_many_rows_keeps_the_same_rows_whoever_else_is_in_the_dat
     assert [rows[i] for i in sorted(kept & heavy)] == [
         rest[i] for i in sorted(kept_rest & heavy_rest)
     ]
+
+
+# ---- the guarantee in closed form ---------------------------------------------------------------
+#
+# Every number asserted here is written in the test: none is computed by ``sensitivity_squared``.
+# The orders fixture releases two tables, the clique status x channel (8 cells) and a histogram of
+# amount; a row is ``(order_id, customer_id, status, channel, amount)``.
+
+_FIRST, _SECOND, _THIRD = ("paid", "online"), ("placed", "online"), ("returned", "store")
+_SEEDS = [bytes([n]) * 32 for n in range(1, 61)]
+_ENTITY = 1000  # a customer the background orders (customers 1 to 400) never hold
+
+
+def _row(order_id: int, customer: int, cell: Any = _FIRST, amount: str = "10.00") -> data.Order:
+    return (order_id, customer, cell[0], cell[1], amount)
+
+
+def _background() -> List[data.Order]:
+    return data.orders()[:60]
+
+
+def _run(plan, rows, *, seed=SEED, null_rows=()):
+    """The release drawn, and each table's exact counts before noise, as ``draw`` counts them."""
+    base = columns(rows)
+    values = {name: list(each) for name, each in base.values.items()}
+    for index in null_rows:
+        values["customer_id"][index] = None
+    backend = FakeBackend()
+    encoded = release.encode_rows(plan, dataclasses.replace(base, values=values), backend)
+    drawn = release.draw(plan, encoded, seed, backend, cliques=run.CLIQUES)
+    unit = plan.unit
+    kept = bounding.bound_rows(encoded.units, encoded.contents, seed, unit.max_rows_per_unit)
+    kept_units = [encoded.units[i] for i in kept]
+    exact: List[List[int]] = []
+    for table in drawn.tables:
+        cell = [0] * len(kept)
+        for name, size in zip(table.columns, table.sizes, strict=True):
+            cell = [v * size + encoded.cells[name][i] for v, i in zip(cell, kept, strict=True)]
+        exact.append(bounding.capped_counts(kept_units, cell, table.cells, unit.max_rows_per_cell))
+    return drawn, exact
+
+
+def _moves(one: List[List[int]], two: List[List[int]]) -> List[int]:
+    """The squared L2 distance between two sets of tables, one number per table."""
+    return [
+        sum((x - y) ** 2 for x, y in zip(a, b, strict=True)) for a, b in zip(one, two, strict=True)
+    ]
+
+
+def test_the_exact_counts_are_the_noisy_counts_less_the_noise():
+    plan = run.keyed_plan(c=2)
+    rows = _background() + [_row(9001, _ENTITY), _row(9002, _ENTITY, _SECOND)]
+    one, exact_one = _run(plan, rows)
+    two, exact_two = _run(plan, rows[:-1])
+    # one seed gives one noise stream per table, so the noisy tables differ as the exact ones do
+    for position in range(len(one.tables)):
+        shift = [x - y for x, y in zip(one.noisy[position], two.noisy[position], strict=True)]
+        assert shift == [
+            Fraction(x - y) for x, y in zip(exact_one[position], exact_two[position], strict=True)
+        ]
+
+
+@pytest.mark.parametrize(
+    "plan_of",
+    [lambda: run.keyed_plan(c=1), lambda: run.related_plan(c=1)],
+    ids=["keyed", "related"],
+)
+def test_one_more_row_for_an_entity_with_one_kept_row_moves_the_counts_by_two_and_no_more(plan_of):
+    plan = plan_of()
+    rows = _background() + [_row(9001, _ENTITY, _FIRST)]
+    more = rows + [_row(9002, _ENTITY, _SECOND)]  # the same amount: the histogram never moves
+    seen = set()
+    for seed in _SEEDS:
+        _, before = _run(plan, rows, seed=seed)
+        _, after = _run(plan, more, seed=seed)
+        clique, histogram = _moves(before, after)
+        assert clique in (0, 2) and histogram == 0
+        seen.add(clique)
+    assert seen == {0, 2}  # the new row is dropped, or it takes the place of the kept one
+
+
+@pytest.mark.parametrize(
+    "plan_of, cells, clique, histogram",
+    [
+        # c rows in one cell: removing the entity moves a table by c * c
+        (lambda: run.keyed_plan(c=3), [_FIRST] * 5, 9, 9),
+        (lambda: run.related_plan(c=3), [_FIRST] * 5, 9, 9),
+        (lambda: run.keyed_plan(c=2), [_THIRD] * 2, 4, 4),
+        # k < c: an entity with c rows in one cell moves a table by k * k
+        (lambda: run.keyed_plan(c=4, k=2), [_FIRST] * 4, 4, 4),
+        (lambda: run.related_plan(c=6, k=3), [_SECOND] * 6, 9, 9),
+        # q cells full and one holding the remainder: q * k * k + r * r = 2 * 4 + 1
+        (
+            lambda: run.keyed_plan(c=5, k=2),
+            [_FIRST, _FIRST, _SECOND, _SECOND, _THIRD],
+            9,
+            4,  # the histogram of amount sees one bin: k * k
+        ),
+        # 3 full cells of 3 and a remainder of 2: 3 * 9 + 4
+        (
+            lambda: run.related_plan(c=11, k=3),
+            [_FIRST] * 3 + [_SECOND] * 3 + [_THIRD] * 3 + [("shipped", "store")] * 2,
+            31,
+            9,
+        ),
+    ],
+    ids=[
+        "keyed-3",
+        "related-3",
+        "keyed-2",
+        "keyed-4-2",
+        "related-6-3",
+        "keyed-5-2",
+        "related-11-3",
+    ],
+)
+def test_removing_an_entity_moves_a_table_by_the_closed_form_number(
+    plan_of, cells, clique, histogram
+):
+    plan = plan_of()
+    background = _background()
+    entity = [_row(9000 + i, _ENTITY, cell) for i, cell in enumerate(cells)]
+    for seed in _SEEDS[:5]:
+        _, with_it = _run(plan, background + entity, seed=seed)
+        _, without = _run(plan, background, seed=seed)
+        assert _moves(with_it, without) == [clique, histogram]
+
+
+def _pool(size: int) -> List[data.Order]:
+    cells = [_FIRST, _SECOND, _THIRD, ("shipped", "store"), ("paid", "store"), ("placed", "store")]
+    return [_row(8000 + i, 0, cells[i % len(cells)], f"{(i * 37) % 1000}.00") for i in range(size)]
+
+
+@pytest.mark.parametrize("plan_of", [run.keyed_plan, run.related_plan], ids=["keyed", "related"])
+def test_fifty_rows_with_no_key_value_move_the_counts_by_no_more_than_one_entity(plan_of):
+    plan = plan_of(c=1)
+    background = _background()
+    pool = _pool(50)
+    everyone = background + pool
+    nulls = set(range(len(background), len(everyone)))
+    for seed in _SEEDS[:20]:
+        _, base = _run(plan, everyone, seed=seed, null_rows=nulls)
+        # one more row with no key value
+        extra = everyone + [_row(8999, 0, _THIRD, "999.00")]
+        _, added = _run(plan, extra, seed=seed, null_rows=nulls | {len(everyone)})
+        assert max(_moves(base, added)) <= 2
+        # the whole pool gone: only its one kept row leaves each table
+        _, gone = _run(plan, background, seed=seed)
+        assert _moves(base, gone) == [1, 1]
+    # one row of the pool gone, each in turn
+    for index in sorted(nulls)[::7]:
+        rest = everyone[:index] + everyone[index + 1 :]
+        shifted = {n if n < index else n - 1 for n in nulls if n != index}
+        _, base = _run(plan, everyone, null_rows=nulls)
+        _, removed = _run(plan, rest, null_rows=shifted)
+        assert max(_moves(base, removed)) <= 2
+
+
+def test_rows_with_no_key_value_are_kept_to_c_and_k_like_any_unit():
+    plan = run.keyed_plan(c=3, k=2)
+    background = _background()
+    pool = _pool(50)
+    everyone = background + pool
+    nulls = set(range(len(background), len(everyone)))
+    _, base = _run(plan, everyone, null_rows=nulls)
+    _, gone = _run(plan, background)
+    # three kept rows, at most two to a cell: no more than 2 * 2 + 1 * 1 in a table
+    assert max(_moves(base, gone)) <= 5
+    assert sum(sum(table) for table in base) - sum(sum(table) for table in gone) == 3 + 3
+
+
+def test_a_swap_in_a_unit_of_one_row_reaches_the_floor_of_two_and_the_share_covers_it():
+    plan = run.keyed_plan(c=1)
+    assert plan.sensitivity == 2  # not 1: c = 1 leaves a swap, which one row can cause
+    rows = _background() + [_row(9001, _ENTITY, _FIRST)]
+    more = rows + [_row(9002, _ENTITY, _SECOND)]
+    reached = 0
+    for seed in _SEEDS:
+        one, before = _run(plan, rows, seed=seed)
+        two, after = _run(plan, more, seed=seed)
+        squared = _moves(before, after)
+        for table, move in zip(one.tables, squared, strict=True):
+            # the loss of this move at this table's scale is within the table's stated share
+            weighted = Fraction(move) / (2 * Fraction(table.scale_units**2, 10**12))
+            assert weighted <= Fraction(table.share)
+        assert max(squared) <= 2
+        reached = max(reached, max(squared))
+        if max(squared) == 2:
+            # a scale sized for a change of 1 would not cover the swap: at the least scale that
+            # spends no more than a table's share on 1, a move of 2 costs more than the share
+            for table in one.tables:
+                share = Fraction(table.share)
+                smaller = Fraction(release.scale_units(share, 1), 10**6)
+                assert smaller < Fraction(table.scale_units, 10**6)
+                assert Fraction(2) / (2 * smaller**2) > share
+    assert reached == 2
 
 
 # ---- the record ---------------------------------------------------------------------------------
@@ -924,3 +1166,79 @@ def test_nothing_in_the_release_or_its_refusals_holds_a_count_of_the_records(key
     text = json.dumps(drawn.document) + repr(drawn) + repr(plan.not_released)
     for secret in (len(rows), len(rows) - units):
         assert f'"{secret}"' not in text
+
+
+# ---- what the null-key pool does not cover at the stated loss -------------------------------
+#
+# The pool is one unit, so the stated loss holds for it as a whole and for each of its rows. A
+# real entity that holds only part of the pool, or rows both with and without a key value, can
+# move a table further than one unit: removing it changes the pool's rows (two unit changes) and
+# perhaps a keyed unit (one more). By group privacy for zero-concentrated DP its squared move is
+# then at most 4 or 9 times one unit's, which is what the help and the report state.
+
+_POOL_SEED = bytes(range(1, 33))
+
+
+def _pool_priority(content: bytes) -> bytes:
+    from fluid_build.profiler.dp.randomness import priority
+
+    key = bounding.NULL_KEY
+    return priority(_POOL_SEED, "bound", len(key).to_bytes(8, "big") + key + content)
+
+
+def _pool_move(rows: List[Any], without: List[Any], c: int, k: int, size: int) -> int:
+    def counts(each: List[Any]) -> List[int]:
+        units = [unit for unit, _, _ in each]
+        kept = bounding.bound_rows(units, [content for _, content, _ in each], _POOL_SEED, c)
+        return bounding.capped_counts([units[i] for i in kept], [each[i][2] for i in kept], size, k)
+
+    return sum((a - b) ** 2 for a, b in zip(counts(rows), counts(without), strict=True))
+
+
+def test_an_entity_that_holds_part_of_the_pool_moves_a_table_past_one_unit_and_within_four():
+    candidates = sorted((bounding.encode_values([f"r{i}"]) for i in range(400)), key=_pool_priority)
+    cells = {content: position % 2 for position, content in enumerate(candidates)}
+    first = [content for content in candidates if cells[content] == 0][:3]
+    last = [content for content in candidates if cells[content] == 1][-3:]
+    pool = bounding.NULL_KEY
+    rows = [(pool, content, cells[content]) for content in first + last]
+    plan = run.keyed_plan(c=3, k=3)
+    bound = bounding.sensitivity_squared(plan.unit)
+    moved = _pool_move(rows, rows[3:], 3, 3, 2)  # remove the entity of the first three rows
+    assert bound == 9 and moved == 18  # past one unit: the help says so
+    assert moved <= 4 * bound
+
+
+def test_an_entity_with_rows_in_and_out_of_the_pool_moves_a_table_within_nine_units():
+    candidates = sorted((bounding.encode_values([f"r{i}"]) for i in range(50)), key=_pool_priority)
+    mine, other = candidates[0], candidates[1]
+    keyed = bounding.encode_values([42])
+    pool = bounding.NULL_KEY
+    rows = [(keyed, b"k", 0), (pool, mine, 0), (pool, other, 1)]
+    plan = run.keyed_plan(c=1)
+    bound = bounding.sensitivity_squared(plan.unit)
+    moved = _pool_move(rows, rows[2:], 1, 1, 2)  # remove the entity of the keyed and pooled row
+    assert bound == 2 and moved == 5  # past one unit
+    assert moved <= 9 * bound
+
+
+def test_too_many_cells_after_the_selection_names_the_share_it_spent(monkeypatch):
+    plan = run.keyed_plan()
+    backend = FakeBackend()
+    encoded = release.encode_rows(plan, columns(_orders()), backend)
+    monkeypatch.setattr(selection, "MOST_RELEASE_CELLS", 9)  # status x channel holds 8
+    with pytest.raises(ReleaseRefused) as info:
+        release.draw(
+            plan,
+            encoded,
+            SEED,
+            backend,
+            cliques=None,
+            select=lambda *a, **k: (("status", "channel"),),
+            structure=lambda names, sizes, cliques, **_: cliques,
+        )
+    refused = info.value
+    message = " ".join(str(refused).split())
+    assert refused.event == "profile_release_too_many_cells"
+    assert "spent the selection share of this release's budget, rho 0.1" in message
+    assert refused.context["written"] == "nothing"

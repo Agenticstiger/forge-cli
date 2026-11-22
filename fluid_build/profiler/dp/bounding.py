@@ -21,6 +21,16 @@ a dependency.
    unit: the ``c`` with the smallest keyed priority. A unit's kept rows depend
    only on its own rows and the seed, never on another unit or on row order, so
    removing a unit changes no other unit's rows.
+
+   A row with no key value (a null in any key column) has no entity to name. The
+   rows of one table that have no key value are taken together as one entity, the
+   null-key pool, under the reserved key :data:`NULL_KEY`, and the pool is bounded
+   like any other unit. Treating each such row as an entity of its own would leave
+   them unbounded: 50 of them could move a table by 2500 in squared L2 against a
+   stated bound of 2 if they are one entity. Grouped as one, the stated loss holds
+   for the pool as a whole and for each of its rows. An entity that holds only part
+   of the pool, or rows both in and out of it, is covered at a larger loss: by group
+   privacy at most 4 times rho, or 9 times rho with rows of both kinds.
 2. Per cell, :func:`capped_counts` lets a unit count at most ``k`` rows in any
    one cell of a count table.
 
@@ -42,6 +52,7 @@ from fluid_build.profiler.dp.randomness import priority
 __all__ = [
     "KEYED",
     "MOST_ROWS_PER_UNIT",
+    "NULL_KEY",
     "RELATED",
     "ROWS",
     "UnitPlan",
@@ -66,6 +77,14 @@ KEYED = "keyed"
 
 MOST_ROWS_PER_UNIT = 1000
 """The largest number of rows a unit may contribute."""
+
+NULL_KEY = b"P"
+"""The unit key shared by every row that has no key value (a null in any key column).
+
+Every :func:`encode_values` output starts with a tag byte (``N``, ``S``, ``I`` or ``F``) followed
+by an 8-byte length, so it is at least nine bytes long; a single byte can never equal one, and
+the null-key pool can never be confused with an entity whose key has a value.
+"""
 
 _LABEL = "bound"
 
@@ -215,6 +234,12 @@ def plan_unit(
 
     With *unit_key* (distinct column names of the unit expose) the release table is the
     unit expose itself and a row belongs to the unit its key values name (:data:`KEYED`).
+
+    In :data:`KEYED` and :data:`RELATED` modes the rows that have a null in any key column
+    belong to one shared unit, the null-key pool (:data:`NULL_KEY`), bounded like any other
+    unit: at most ``c`` of them are kept and a table counts at most ``k`` of them in a cell.
+    In :data:`ROWS` mode each row is a unit and a null primary key is refused when the
+    records are read.
     """
     exposes = _expose_map(contract)
     table = unit_expose if release_table is None else release_table
@@ -367,7 +392,8 @@ def bound_rows(
     """The indices of the rows kept, ascending: at most *max_rows* per unit.
 
     Row ``i`` belongs to unit ``units[i]``; ``None`` is a unit of its own and always
-    keeps its row.
+    keeps its row (own-rows mode). Rows with no key value are given :data:`NULL_KEY`, one
+    shared unit, by whoever builds *units*.
     """
     if len(units) != len(contents):
         raise ValueError("units and contents must have one entry per row")

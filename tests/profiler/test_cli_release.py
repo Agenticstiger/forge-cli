@@ -24,6 +24,8 @@ from tests.profiler.dp import _release_data as data
 from tests.profiler.dp import _release_run as run
 from tests.profiler.dp._privacy import need
 
+NULL_POOL_SENTENCE = "Rows with no key value (a null in a key column) are taken together as one entity, bounded the same way: the stated loss holds for that entity as a whole and for each of its rows. An entity that holds only some of those rows, or rows both with and without a key value, is covered at a larger loss: by group privacy at most 4 times rho, or 9 times rho when it holds rows of both kinds."
+
 pytestmark = pytest.mark.unit
 
 pytest.importorskip("flux_stats.noise")
@@ -146,6 +148,21 @@ def test_a_release_writes_its_record_then_its_profile_and_prints_the_pin(
     assert "Keep the release record inside the data owner's boundary" in out
     assert "the noise can be taken off" in out
     assert "cannot ship on flux-engine" not in out
+    assert " ".join(NULL_POOL_SENTENCE.split()) in " ".join(out.split())
+    assert (
+        "The noise is pseudorandom, drawn from HMAC-SHA256 keyed by the recorded seed, so the "
+        "guarantee holds as long as HMAC-SHA256 behaves as a pseudorandom function." in out
+    )
+    assert (
+        "Choosing the cliques uses OpenDP's AIM, which OpenDP ships behind its contrib flag." in out
+    )
+    assert (
+        "The guarantee covers data that meets the contract (required columns hold a value, "
+        "values lie in their declared levels and ranges, and in rows mode the primary key is "
+        "unique); data that does not is refused, releases nothing, and the refusal is for the "
+        "data owner (it names a column and a row): a refusal is not covered by the guarantee."
+        in out
+    )
 
 
 def test_the_profile_the_release_writes_reads_back_through_flux_stats(
@@ -599,6 +616,37 @@ def test_a_repeated_primary_key_refuses_a_release_of_each_row(
     assert not (workspace / "rec.json").exists()
 
 
+def test_cliques_that_hold_too_many_cells_refuse_after_the_selection_and_write_nothing(
+    workspace, registry, selected, capsys, monkeypatch
+):
+    from fluid_build.profiler.dp import selection
+
+    def too_big(*a, **k):
+        raise ValueError("the maximal cliques hold more cells than allowed")
+
+    monkeypatch.setattr(selection, "release_structure", too_big)
+    assert main(_argv()) == 1
+    out = " ".join(_out(capsys).split())
+    assert "profile_release_structure_too_large" in out
+    assert "more cells than a release may measure" in out
+    assert "spent the selection share of this release's budget, rho 0.1, on these records" in out
+    assert "list fewer categorical columns" in out
+    assert not (workspace / "orders.profile.json").exists()
+    assert not (workspace / "rec.json").exists()
+
+
+def test_a_null_key_row_is_bounded_with_the_others_and_the_report_says_so(
+    workspace, registry, selected, capsys
+):
+    _csv(
+        workspace,
+        lambda lines: [lines.__setitem__(n, _field(lines[n], 1, "")) for n in range(2, 12)],
+    )
+    assert main(_argv()) == 0
+    out = " ".join(_out(capsys).split())
+    assert "are taken together as one entity" in out
+
+
 def test_the_extra_is_needed_to_choose_cliques_and_nothing_is_read_without_it(
     workspace, registry, capsys, monkeypatch
 ):
@@ -657,6 +705,22 @@ def test_the_help_has_a_section_on_the_private_release():
     assert "for which unit" in text.lower()
     assert "recorded inside the data owner's boundary" in text
     assert "with it and the profile the noise can be taken off" in text
+    assert " ".join(NULL_POOL_SENTENCE.split()) in " ".join(text.split())
+    assert "What the guarantee rests on" in text
+    assert (
+        "the noise is pseudorandom, drawn from HMAC-SHA256 keyed by the recorded seed, so the "
+        "guarantee holds as long as HMAC-SHA256 behaves as a pseudorandom function" in text
+    )
+    assert (
+        "Choosing the cliques uses OpenDP's AIM, which OpenDP ships behind its contrib flag" in text
+    )
+    assert (
+        "The guarantee covers data that meets the contract (required columns hold a value, "
+        "values lie in their declared levels and ranges, and in rows mode the primary key is "
+        "unique); data that does not is refused, releases nothing, and the refusal is for the "
+        "data owner (it names a column and a row): a refusal is not covered by the guarantee"
+        in " ".join(text.split())
+    )
 
 
 def test_the_text_of_the_release_holds_no_en_or_em_dash():
@@ -665,9 +729,11 @@ def test_the_text_of_the_release_holds_no_en_or_em_dash():
     files = [
         root / "fluid_build" / "cli" / "_profile_release.py",
         root / "fluid_build" / "profiler" / "dp" / "release.py",
+        root / "fluid_build" / "profiler" / "dp" / "bounding.py",
         here,
         here.with_name("test_release_seam.py"),
         here.parent / "dp" / "test_release.py",
+        here.parent / "dp" / "test_bounding.py",
     ]
     for path in files:
         text = path.read_text(encoding="utf-8")

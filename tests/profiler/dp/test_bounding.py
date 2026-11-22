@@ -13,6 +13,7 @@ import pytest
 
 from fluid_build.profiler.dp.bounding import (
     KEYED,
+    NULL_KEY,
     RELATED,
     ROWS,
     UnitPlan,
@@ -103,6 +104,89 @@ def test_differencing_property():
             j = rng.randint(0, len(rows))
             assert _distance2(base, _release(rows[:j] + [extra] + rows[j:], size, c, k)) <= bound
     assert widest_unbounded > 0, "without bounding the largest unit must move the counts further"
+
+
+def _kept_rows(
+    rows: Sequence[Tuple[Optional[bytes], bytes]], c: int, seed: bytes
+) -> Dict[Tuple[Optional[bytes], bytes], int]:
+    """The multiset of ``(unit, content)`` the bounding keeps."""
+    kept = bound_rows([unit for unit, _ in rows], [content for _, content in rows], seed, c)
+    found: Dict[Tuple[Optional[bytes], bytes], int] = {}
+    for i in kept:
+        found[rows[i]] = found.get(rows[i], 0) + 1
+    return found
+
+
+def _symmetric_distance(
+    a: Dict[Tuple[Optional[bytes], bytes], int], b: Dict[Tuple[Optional[bytes], bytes], int]
+) -> int:
+    return sum(abs(a.get(key, 0) - b.get(key, 0)) for key in set(a) | set(b))
+
+
+def test_the_selection_distance_bounds_the_kept_rows_of_neighbouring_datasets():
+    widest = 0
+    for case in range(CASES):
+        rng = random.Random(20000 + case)
+        c = rng.randint(1, 8)
+        k = rng.randint(1, c)
+        distance = selection_distance(_plan(c, k, rng.choice([RELATED, KEYED])))
+        assert distance == max(c, 2)
+        units: List[Optional[bytes]] = [f"unit-{n}".encode() for n in range(rng.randint(1, 5))]
+        units.append(NULL_KEY)  # the pool of rows with no key value is a unit like the others
+        rows: List[Tuple[Optional[bytes], bytes]] = []
+        for unit in units:
+            for _ in range(rng.randint(1, 25)):
+                # a short content repeats, so identical rows occur
+                rows.append((unit, rng.randbytes(rng.choice([1, 2, 4]))))
+        rng.shuffle(rows)
+        seed = rng.randbytes(32)
+        base = _kept_rows(rows, c, seed)
+        # one unit removed
+        victim = rng.choice(units)
+        rest = [row for row in rows if row[0] != victim]
+        gone = _symmetric_distance(base, _kept_rows(rest, c, seed))
+        assert gone <= distance
+        widest = max(widest, gone)
+        for _ in range(4):
+            i = rng.randrange(len(rows))
+            # one row removed
+            removed = _kept_rows(rows[:i] + rows[i + 1 :], c, seed)
+            assert _symmetric_distance(base, removed) <= distance
+            # one row added, to any unit and anywhere
+            extra = (rng.choice(units), rng.randbytes(rng.choice([1, 2, 4])))
+            j = rng.randint(0, len(rows))
+            added = _kept_rows(rows[:j] + [extra] + rows[j:], c, seed)
+            assert _symmetric_distance(base, added) <= distance
+    assert widest > 0
+
+
+def test_the_null_key_is_one_unit_bounded_like_any_other():
+    pool = [NULL_KEY] * 50
+    contents = [bytes([i]) for i in range(50)]
+    for c in (1, 3, 7):
+        assert len(bound_rows(pool, contents, SEED, c)) == c
+    # one row per cell for each of 50 cells: a unit of 50 moves a table by 50, the pool by 1
+    cells = list(range(50))
+    kept = bound_rows(pool, contents, SEED, 1)
+    counts = capped_counts([pool[i] for i in kept], [cells[i] for i in kept], 50, 1)
+    assert sum(counts) == 1 and max(counts) == 1
+
+
+def test_no_encoding_of_values_equals_the_null_key():
+    assert NULL_KEY == b"P" and len(NULL_KEY) == 1
+    rng = random.Random(77)
+    pools: List[List[Any]] = [[None], [""], ["P"], [0], [Fraction(1, 2)], ["S"], ["N"], []]
+    for _ in range(500):
+        pools.append(
+            [
+                rng.choice([None, "", "P", "S", rng.randbytes(2).hex(), rng.randint(-9, 9)])
+                for _ in range(rng.randint(0, 4))
+            ]
+        )
+    for values in pools:
+        encoded = encode_values(values)
+        assert encoded != NULL_KEY
+        assert len(encoded) == 0 or (len(encoded) >= 9 and encoded[:1] in (b"N", b"S", b"I", b"F"))
 
 
 def test_rows_mode_one_row_moves_counts_by_one():

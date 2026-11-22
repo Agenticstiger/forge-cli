@@ -68,10 +68,22 @@ delta) at delta = 1e-6.
 For which unit: each entity contributes at most --max-rows-per-unit N rows of the release
 table (default 1) and counts at most --max-rows-per-cell K rows in one cell of a table
 (default N), so the stated loss holds for each entity and for each row of it. Which rows an
-entity keeps is decided by a keyed priority, never by the other entities. With the release
-table equal to the privacy unit and no --unit-key, each row is an entity, nothing is
-dropped and N and K are not accepted; a primary key the contract declares must then be
-unique.
+entity keeps is decided by a keyed priority, never by the other entities. Rows with no key
+value (a null in a key column) are taken together as one entity, bounded the same way: the
+stated loss holds for that entity as a whole and for each of its rows. An entity that holds
+only some of those rows, or rows both with and without a key value, is covered at a larger
+loss: by group privacy at most 4 times rho, or 9 times rho when it holds rows of both kinds.
+With the release table equal to the privacy unit and no --unit-key, each row is an entity,
+nothing is dropped and N and K are not accepted; a primary key the contract declares must
+then be unique, and a null in it refuses the release.
+
+What the guarantee rests on: the noise is pseudorandom, drawn from HMAC-SHA256 keyed by the
+recorded seed, so the guarantee holds as long as HMAC-SHA256 behaves as a pseudorandom
+function. Choosing the cliques uses OpenDP's AIM, which OpenDP ships behind its contrib
+flag. The guarantee covers data that meets the contract (required columns hold a value,
+values lie in their declared levels and ranges, and in rows mode the primary key is
+unique); data that does not is refused, releases nothing, and the refusal is for the data
+owner (it names a column and a row): a refusal is not covered by the guarantee.
 
 What it does not do: it states nothing about a second release of the same records, which
 spends its own loss; it does not make the contract, the request or the levels and bins
@@ -575,7 +587,12 @@ def _words(plan: Any) -> List[str]:
     if unit.mode == "rows":
         return [f"Privacy unit: {words}, so the stated loss holds for each row."]
     return [
-        f"Privacy unit: {words}, so the stated loss holds for each entity and for each row of it."
+        f"Privacy unit: {words}, so the stated loss holds for each entity and for each row of it.",
+        "Rows with no key value (a null in a key column) are taken together as one entity, "
+        "bounded the same way: the stated loss holds for that entity as a whole and for "
+        "each of its rows. An entity that holds only some of those rows, or rows both with "
+        "and without a key value, is covered at a larger loss: by group privacy at most 4 "
+        "times rho, or 9 times rho when it holds rows of both kinds.",
     ]
 
 
@@ -624,6 +641,21 @@ def _report(
         "stated loss is rho.",
         soft_wrap=True,
     )
+    rests = (
+        "The noise is pseudorandom, drawn from HMAC-SHA256 keyed by the recorded seed, so the "
+        "guarantee holds as long as HMAC-SHA256 behaves as a pseudorandom function."
+    )
+    if plan.selects:
+        rests += (
+            " Choosing the cliques uses OpenDP's AIM, which OpenDP ships behind its contrib flag."
+        )
+    rests += (
+        " The guarantee covers data that meets the contract (required columns hold a value, "
+        "values lie in their declared levels and ranges, and in rows mode the primary key is "
+        "unique); data that does not is refused, releases nothing, and the refusal is for the "
+        "data owner (it names a column and a row): a refusal is not covered by the guarantee."
+    )
+    say(rests, soft_wrap=True)
     for table in drawn.tables:
         say(
             f"  {_KIND[table.kind]} {', '.join(table.columns)}: noise scale {table.scale}, "

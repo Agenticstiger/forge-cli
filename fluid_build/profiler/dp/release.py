@@ -618,7 +618,8 @@ class EncodedRows:
 
     #: Per released column, the level or bin each row falls in.
     cells: Mapping[str, Sequence[int]]
-    #: Each row's unit key, ``None`` for a row that is a unit of its own.
+    #: Each row's unit key: ``bounding.NULL_KEY`` for a row with a null in a key column (the
+    #: null-key pool, one shared unit), ``None`` for a row that is a unit of its own (own rows).
     units: Sequence[Optional[bytes]]
     #: Each row's content, for the priority that decides which rows of a unit are kept.
     contents: Sequence[bytes]
@@ -702,6 +703,9 @@ def encode_rows(
             keyed[index] = (
                 None if any(part is None for part in parts) else bounding.encode_values(parts)
             )
+    if unit.mode != ROWS:
+        # no key value: the row joins the null-key pool, one unit bounded like any other
+        keyed = [bounding.NULL_KEY if key is None else key for key in keyed]
     if unit.mode == ROWS and unit.key_columns:
         for index, key in enumerate(keyed):
             if key is None:
@@ -972,17 +976,40 @@ def draw(
     elif plan.selects:
         chosen = _selected(plan, rows, kept, select)
         wide = structure if structure is not None else selection.release_structure
-        released = tuple(
-            tuple(clique)
-            for clique in wide(
+        try:
+            joined = wide(
                 [each.name for each in plan.categorical],
                 [each.size for each in plan.categorical],
                 chosen,
             )
-        )
+        except ValueError:
+            raise ReleaseRefused(
+                "profile_release_structure_too_large",
+                "the cliques chosen hold more cells than a release may measure "
+                f"({selection.MOST_RELEASE_CELLS:,}). Choosing them spent the selection share of "
+                f"this release's budget, rho {decimal_text(selection_share(plan))}, on these "
+                "records, and nothing was written",
+                {
+                    "next": "list fewer categorical columns in the request, so the cliques "
+                    "chosen hold fewer cells; releasing again spends a new loss on the records"
+                },
+            ) from None
+        released = tuple(tuple(clique) for clique in joined)
     else:
         released = ()
-    share, tables = _describe(plan, released)
+    try:
+        share, tables = _describe(plan, released)
+    except ReleaseRefused as refused:
+        if chosen is None or refused.event != "profile_release_too_many_cells":
+            raise
+        # The cells are known only once the cliques are; the selection has run by now.
+        raise ReleaseRefused(
+            refused.event,
+            f"{refused}. Choosing the cliques spent the selection share of this release's "
+            f"budget, rho {decimal_text(selection_share(plan))}, on these records, and nothing "
+            "was written",
+            dict(refused.context),
+        ) from None
     sigma2 = Fraction(tables[0].scale_units ** 2, 10 ** (2 * _SCALE_PLACES))
 
     kept_units = [rows.units[i] for i in kept]
