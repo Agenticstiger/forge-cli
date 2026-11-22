@@ -102,7 +102,7 @@ class FakeRun:
         self.stderrs: List[object] = []
 
     def __call__(self, cmd: List[str], **kwargs: object) -> subprocess.CompletedProcess:
-        assert cmd[1:3] == ["-m", "fluid_build.cli"]
+        assert cmd[:3] == ship._resolve_fluid_bin()
         argv = cmd[3:]
         self.calls.append(argv)
         env = kwargs.get("env")

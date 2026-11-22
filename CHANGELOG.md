@@ -540,6 +540,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The repository's redactor, the importer and the Snowflake, local and GCP provider loggers share
   the Oracle rule's one regex, which also reads a user name in double quotes.
 
+- **`fluid ship` unwraps a wrapped store token once and hands it to every stage.** A
+  response-wrapped OpenBao or Vault token (`FLUID_VAULT_WRAPPED_TOKEN`) unwraps once, and ship runs
+  each stage as its own process, so only the first stage that reached the store could use it: with
+  OpenBao state encryption, `diff` spent it and `apply` failed. A ship of two or more stages now
+  unwraps it before the first stage and hands every stage the token through a pipe, which the stage
+  reads as it starts (`FLUID_VAULT_SHIP_TOKEN_FD` names it). Windows has no inherited pipes, so
+  there the token travels in `FLUID_VAULT_SHIP_TOKEN`, which the stage takes out of its environment
+  at once. The token is in no process's environment, so tofu, dbt and a project's build steps
+  cannot reach it, and the store resolver reads it before any other token. No stage revokes it:
+  ship does when the run ends, also after a failed stage and after Ctrl-C. A wrapper that cannot be
+  unwrapped (a spent one, no store address, a store that cannot be reached) stops the run before
+  any stage, with exit 2. Ship unwraps whenever two or more stages run, so a wrapper now serves one
+  `fluid ship` invocation: a run split over several invocations needs one for each. A ship of one
+  stage (`--stage 7`, as a pipeline with one stage per CI step runs it) leaves the wrapper to that
+  stage, and a single `fluid apply` uses it, as before. A ship that SIGTERM or SIGKILL ends does
+  not revoke the token, which then lasts until its TTL.
+
 - **Entropy Data's product list is read whole or not at all.** A page after the first that was
   not a list (a rate-limit answer, say) used to hand back the pages before it as if they were
   every product the server holds, and an answer that was not JSON was a bare `ValueError`. Both
@@ -602,6 +619,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - In `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, `NAME@*` now sends `env://NAME` to any host, as
   a bare `NAME` and `env://NAME@*` already did. It used to name a literal host `*`, which no
   destination matches. A refusal's fix names both forms.
+
+- **No dataclass prints a secret in its repr.** A dataclass's generated repr prints every field,
+  so a debug line, an f-string with `!r` or a traceback that shows locals would put a credential
+  in a log. 24 fields that hold one are now `field(repr=False)`:
+  - the environments an OpenTofu apply, a build runner, a local Spark run and `fluid ship`'s
+    stages get, which hold `BAO_TOKEN` and the state passphrase;
+  - API keys and tokens for LLM providers, DataHub, Entropy Data, OpenMetadata, Airbyte and
+    lineage, plus the lineage endpoint, which may carry a token in its query;
+  - Snowflake's password, key passphrase, OAuth token and monitoring keys;
+  - the PII hook's HMAC key, the masked values of a `--discover` URI, deployment secrets and GCP
+    credentials.
+
+  A static test walks every dataclass in `fluid_build/`. It fails when a field named for a secret,
+  or an environment held as a mapping, stays in the repr; fields whose names hold no secret are
+  listed with the reason.
+
+- **Generated CI pins current GitHub Actions, and an action the pin table lacks stops the
+  generation.** `fluid generate ci` pins `actions/checkout` v4.4.0, `osv-scanner-action` v2.7.1,
+  `codeql-action/upload-sarif` v3.39.4 and `anchore/sbom-action` v0.24.3, each by commit (#686).
+  A generator that asked for an action the table does not hold used to get the tag back, and a
+  tag can move; that now raises. A test checks that every action the `fluid generate ci`
+  generators write goes through the table, and that every entry is one line
+  `scripts/check_pinned_actions.py` can read.
+
+- **`tofu` never runs with this process's whole environment.** The `tofu --version` probe that
+  runs before every cloud apply and `fluid diff` handed tofu every variable this process holds.
+  It now gets `PATH`, `HOME`, what a Go binary needs on Windows, and the `TOFU_CLI_PATH` and
+  `GITHUB_OUTPUT` that setup-opentofu's wrapper needs in GitHub Actions. Every other tofu run
+  already got the `build_tofu_env()` allowlist. `env` is now a required keyword of the OpenTofu
+  runner and each of its `tofu_*` helpers, and `env=None`, which inherited everything, is
+  refused. A test checks that every call in `fluid_build/` passes it.
+
+- **A `fluid ship` stage no longer imports modules from the checkout.** Ship runs each stage as
+  `python -m fluid_build.cli` in the contract's directory, and `-m` puts that directory first on
+  `sys.path`. So a `yaml.py` or a `fluid_build/` in the checkout ran inside every stage, before the
+  CLI started, with the operator's environment. Stages now start through a bootstrap that runs the
+  CLI as `-m` does, without that directory on the path.
 
 ### Upgrade notes
 

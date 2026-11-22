@@ -113,7 +113,7 @@ class _Engine:
     module_path: Path
     module: str
     actions: Any
-    env: Dict[str, str]
+    env: Dict[str, str] = field(repr=False)
     report: Any
 
     @property

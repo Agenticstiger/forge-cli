@@ -36,22 +36,38 @@ from . import _keyless
 # SHAs verified via GitHub API (git/ref/tags/<version>).
 # Update these when upgrading action versions.
 PINNED_ACTIONS = {
-    "actions/checkout@v4": "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",  # v4.3.1
+    "actions/checkout@v4": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",  # v4.4.0
     "actions/setup-python@v5": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",  # v5.6.0
     "actions/upload-artifact@v4": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",  # v4.6.2
     "actions/download-artifact@v4": "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",  # v4.3.0
-    "google/osv-scanner-action/osv-scanner-action@v2": "google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2",  # v2.3.8
-    "github/codeql-action/upload-sarif@v3": "github/codeql-action/upload-sarif@d77b13a0df3134d64a457ea9003f600b09fa1c8a",  # v3.36.1
+    "google/osv-scanner-action/osv-scanner-action@v2": "google/osv-scanner-action/osv-scanner-action@32d3cd482bdadfb38b186c0ad1b031902d55d932",  # v2.7.1
+    "github/codeql-action/upload-sarif@v3": "github/codeql-action/upload-sarif@d2aacf54c2fbc910db8d7ec338fdb54ea48c692d",  # v3.39.4
     "google-github-actions/auth@v3": "google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093",  # v3.0.0
     "aws-actions/configure-aws-credentials@v6": "aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd",  # v6.3.0
-    "anchore/sbom-action@v0": "anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610",  # v0.24.0
+    "anchore/sbom-action@v0": "anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c",  # v0.24.3
     "actions/attest-build-provenance@v2": "actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be",  # v2.4.0
 }
 
 
+class UnpinnedActionError(LookupError):
+    """A generator asked for an action that ``PINNED_ACTIONS`` does not pin: a bug in forge."""
+
+
 def _pin_action(action_ref: str) -> str:
-    """Pin a GitHub Action reference to its SHA for supply chain security."""
-    return PINNED_ACTIONS.get(action_ref, action_ref)
+    """Pin a GitHub Action reference to its commit SHA, for supply-chain security.
+
+    A reference the table does not hold raises :class:`UnpinnedActionError`: written
+    as given, it would ship a tag that can move into every pipeline generated from it.
+    """
+    try:
+        return PINNED_ACTIONS[action_ref]
+    except KeyError:
+        raise UnpinnedActionError(
+            f"{action_ref} has no commit in PINNED_ACTIONS "
+            "(fluid_build/forge/core/pipeline_systems/_base.py). Add it on one line, pinned "
+            "to the commit of its newest release in that major, with the version in a "
+            "# vX.Y.Z comment."
+        ) from None
 
 
 # Digest-pinned container images, for the same reason: a tag moves. Each entry

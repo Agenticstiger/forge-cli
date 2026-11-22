@@ -305,7 +305,8 @@ def _openbao_env() -> Dict[str, str]:
     # secret value is read here, only the token tofu sends to the transit engine
     # the operator named. The address (BAO_ADDR / VAULT_ADDR) and the CA bundle
     # are protected names, so a project file cannot redirect the token, and a
-    # token the resolver minted is revoked when the run ends.
+    # token the resolver minted is revoked when the run ends. Under `fluid
+    # ship` this is the token ship unwrapped for every stage: ship revokes it.
     from fluid_build.secrets import _vault
     from fluid_build.secrets.run import state_for_lookup
 

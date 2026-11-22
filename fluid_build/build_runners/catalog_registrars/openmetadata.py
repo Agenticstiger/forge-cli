@@ -45,7 +45,7 @@ entry point builds a payload from its args and delegates to
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from fluid_build.api.catalog import CatalogRegistrar, RegistrationResult
@@ -73,7 +73,7 @@ class OpenMetadataRegistrar(CatalogRegistrar):
     # ``base_url=`` by keyword, so the reorder is source-compatible.
     base_url: str
     target: str = "openmetadata"
-    api_token: Optional[str] = None
+    api_token: Optional[str] = field(default=None, repr=False)
     timeout_seconds: int = 30
 
     def register_payload(self, payload: CatalogPublicationPayload) -> RegistrationResult:

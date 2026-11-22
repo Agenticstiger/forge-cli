@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 try:
@@ -26,7 +26,7 @@ SCOPES = [
 
 @dataclass
 class GcpAuthResult:
-    credentials: object
+    credentials: object = field(repr=False)
     project_id: Optional[str]
     mode: str
 

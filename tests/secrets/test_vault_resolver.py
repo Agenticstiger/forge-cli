@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import socket
 import ssl
 from dataclasses import dataclass, field
@@ -569,6 +570,26 @@ def test_wrapped_beats_jwt_beats_env_token(store, wrapped_env, jwt_env, monkeypa
     assert len(store.seen("POST", "/v1/auth/jwt/login")) == 1
     monkeypatch.delenv("FLUID_VAULT_JWT_ROLE")
     assert _vault.auth_method() == "token:BAO_TOKEN"
+
+
+# ── the token fluid ship handed this stage ───────────────────────────────────
+
+
+def test_a_ship_token_comes_first_and_is_never_revoked(store, wrapped_env, jwt_env, monkeypatch):
+    monkeypatch.setenv("FLUID_VAULT_SHIP_TOKEN", MINTED_TOKEN)
+    monkeypatch.setenv("BAO_TOKEN", OPERATOR_TOKEN)
+    assert _vault.auth_method() == "ship-token"
+    serve_unwrap(store)
+    serve_login(store)
+    serve_kv(store, token=MINTED_TOKEN)
+    assert resolve() == SECRET_VALUE
+    assert resolve() == SECRET_VALUE  # a second run of the same stage uses it too
+    assert store.seen("POST", "/v1/sys/wrapping/unwrap") == []
+    assert store.seen("POST", "/v1/auth/jwt/login") == []
+    assert store.seen("POST", "/v1/auth/token/revoke-self") == []
+    assert store.seen("GET", KV_DATA)[0].headers["x-vault-token"] == MINTED_TOKEN
+    assert "FLUID_VAULT_SHIP_TOKEN" not in os.environ
+    assert MINTED_TOKEN not in redact_secret_text(f"a {MINTED_TOKEN} b")
 
 
 # ── operator tokens and redaction ────────────────────────────────────────────

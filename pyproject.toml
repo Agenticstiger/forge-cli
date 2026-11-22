@@ -960,6 +960,7 @@ module = [
     "fluid_build.secrets._env",
     "fluid_build.secrets._file",
     "fluid_build.secrets._vault",
+    "fluid_build.secrets._ship_token",
     "fluid_build.secrets._aws_sm",
     "fluid_build.secrets.contract",
     "fluid_build.secrets.handoff",
