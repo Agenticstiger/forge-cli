@@ -154,6 +154,35 @@ def test_a_saved_plan_that_updates_a_table_its_record_does_not_name_is_refused(
     assert planned["apply"] == 0
 
 
+@pytest.mark.parametrize("flag", [False, True])
+def test_under_the_binding_escape_hatch_an_edited_record_lets_nothing_through(
+    planned, tmp_path, capsys, flag
+):
+    """``--no-verify-plan-binding`` skips the digest that would refuse an edited record, so
+    the record is ignored: the update is refused and nothing is applied, unless the apply's
+    own command line carries the flag, which then makes it and audits it."""
+    _plan_without_its_update_record(planned, tmp_path, bind_again=False)
+    path = tmp_path / "plan.json"
+    plan = json.loads(path.read_text(encoding="utf-8"))
+    plan[TOFU_PLAN_FIELD]["icebergUpdates"] = ["sales.orders"]
+    path.write_text(json.dumps(plan), encoding="utf-8")
+    capsys.readouterr()
+
+    argv = ["apply", "plan.json", "--yes", "--no-verify-plan-binding", *([FLAG] if flag else [])]
+    code = _main(*argv)
+
+    captured = capsys.readouterr()
+    out = " ".join(captured.out.split())
+    assert "iceberg_table_update_record_ignored" in captured.err + captured.out
+    assert "is not bound to it, so it is ignored" in out
+    if flag:
+        assert code == 0 and planned["apply"] == 1
+        assert "iceberg_table_update_accepted" in captured.err + captured.out
+    else:
+        assert code == 1 and planned["apply"] == 0
+        assert "ERR_ICEBERG_TABLE_UPDATE_IN_PLACE" in out
+
+
 def test_ship_passes_the_flag_to_its_apply_stage_only(tmp_path: Path):
     """``fluid ship --allow-iceberg-update`` reaches ``fluid apply`` (stage 7), never the
     plan of stage 6; a flag only: no environment variable sets it."""

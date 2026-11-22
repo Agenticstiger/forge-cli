@@ -467,8 +467,45 @@ def test_an_update_the_run_makes_is_audited_at_warning(capfd, caplog):
 
 
 def test_the_bound_apply_names_what_its_plan_updates_and_that_its_flag_changes_nothing(capfd):
-    hold.say_bound(_args(allow_iceberg_update=True), {"icebergUpdates": ["sales.orders"]})
+    record = {"icebergUpdates": ["sales.orders"]}
 
+    names = hold.say_bound(_args(allow_iceberg_update=True), record, _LOG)
+
+    assert names == ["sales.orders"]
     out = " ".join(capfd.readouterr().out.split())
     assert "the saved plan updates in place, as its plan asked" in out and "sales.orders" in out
     assert "--allow-iceberg-update changes nothing here" in out
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_an_unbound_saved_plans_record_is_ignored_and_the_apply_decides(capfd, caplog, flag):
+    """Under --no-verify-plan-binding nothing ties the record to the plan that was
+    reviewed: it is ignored and logged, and only the apply's own flag lets an update
+    through."""
+    plugin, update = get_iac_plugin("aws"), _plan(_update(LIVE_ICEBERG, description="new"))
+    args = _args(no_verify_plan_binding=True, allow_iceberg_update=flag)
+
+    with caplog.at_level(logging.WARNING, logger=_LOG.name):
+        recorded = hold.say_bound(args, {"icebergUpdates": ["sales.orders"]}, _LOG)
+
+    assert recorded is None
+    out = " ".join(capfd.readouterr().out.split())
+    assert "is not bound to it, so it is ignored" in out and "changes nothing here" not in out
+    (ignored,) = [
+        r for r in caplog.records if "iceberg_table_update_record_ignored" in r.getMessage()
+    ]
+    assert ignored.levelno == logging.WARNING and "sales.orders" in ignored.getMessage()
+    if flag:
+        (allowed,) = hold.review(plugin, _module(), update, args, CHANGED, recorded=recorded)
+        assert allowed.table == "sales.orders"
+    else:
+        with pytest.raises(CLIError) as raised:
+            hold.review(plugin, _module(), update, args, CHANGED, recorded=recorded)
+        assert raised.value.event == "iceberg_table_update_in_place"
+
+
+def test_an_unbound_saved_plan_with_no_record_logs_nothing(caplog):
+    with caplog.at_level(logging.WARNING, logger=_LOG.name):
+        assert hold.say_bound(_args(no_verify_plan_binding=True), {}, _LOG) is None
+
+    assert not [r for r in caplog.records if "record_ignored" in r.getMessage()]

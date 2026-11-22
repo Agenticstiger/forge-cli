@@ -271,6 +271,35 @@ def test_a_saved_plan_whose_record_names_no_update_is_refused(
     _assert_left_alone(moto_endpoint, written)
 
 
+@pytest.mark.parametrize("flag", [False, True])
+def test_an_edited_record_under_the_binding_escape_hatch_is_ignored(
+    moto_endpoint: str, tmp_path: Path, flag: bool
+) -> None:
+    """A plan made before the hold updates the table with no record; an edit adds one, and
+    ``--no-verify-plan-binding`` skips the digest that would refuse the edit. The record is
+    ignored: nothing is sent unless the apply itself passes ``--allow-iceberg-update``."""
+    cid, bucket = f"iac.hold.unbound-{int(flag)}", f"hold-unbound-{int(flag)}-lake"
+    _made_and_written(moto_endpoint, tmp_path, cid, bucket)
+    written = _table(moto_endpoint)
+    plan = _saved_plan(tmp_path, _changed(bucket, cid), allow_iceberg_update=True)
+    document = json.loads(plan.read_text(encoding="utf-8"))
+    del document[TOFU_PLAN_FIELD]["icebergUpdates"]
+    plan.write_text(json.dumps(inject_digests(document, force=True)), encoding="utf-8")
+    edited = json.loads(plan.read_text(encoding="utf-8"))
+    edited[TOFU_PLAN_FIELD]["icebergUpdates"] = [f"{DATABASE}.{TABLE}"]
+    plan.write_text(json.dumps(edited), encoding="utf-8")
+    args = _apply_args(plan, tmp_path, no_verify_plan_binding=True, allow_iceberg_update=flag)
+
+    if flag:
+        assert engine.apply_via_opentofu(args, _LOG) == 0
+        assert _table(moto_endpoint)["VersionId"] != written["VersionId"]
+        return
+    with pytest.raises(CLIError) as raised:
+        engine.apply_via_opentofu(args, _LOG)
+    assert raised.value.event == "iceberg_table_update_in_place"
+    _assert_left_alone(moto_endpoint, written)
+
+
 def test_a_hive_table_keeps_its_in_place_update(moto_endpoint: str, tmp_path: Path) -> None:
     cid, bucket = "iac.hold.hive", "hold-hive-lake"
     _sidecar(tmp_path, cid, moto_endpoint)

@@ -21,7 +21,8 @@ adopts.
 4. :func:`review`, the backstop of the data-loss review: an in-place update of such a
    table still in the plan is refused (``iceberg_table_update_in_place``), unless the run
    asked for it; a saved plan only when its record names the table (``icebergUpdates``,
-   under ``planDigest``), so an approved ``plan.json`` cannot gain one later;
+   under ``planDigest``), so an approved ``plan.json`` cannot gain one later, and under
+   ``--no-verify-plan-binding`` only when the apply itself asks (:func:`say_bound`);
 5. :func:`audit_updated`: a run that applies such an update audits it at WARNING
    (``iceberg_table_update_accepted``).
 
@@ -266,10 +267,28 @@ def record_field(updated: Sequence[Held]) -> Dict[str, Any]:
     return {"icebergUpdates": sorted(entry.table for entry in updated)} if updated else {}
 
 
-def say_bound(args: Any, record: Mapping[str, Any]) -> List[str]:
-    """``fluid apply plan.json``: name the tables the saved plan updates in place, and say
-    that the apply's own flag decides nothing there. Returns those names (:func:`recorded`)."""
+def say_bound(args: Any, record: Mapping[str, Any], logger: logging.Logger) -> Optional[List[str]]:
+    """``fluid apply plan.json``: what decides which live Iceberg tables the saved plan may
+    update in place (``recorded`` for :func:`review`).
+
+    A bound plan's record does (``icebergUpdates``, under ``planDigest``): the tables are
+    named, and the apply's own flag changes nothing. Under ``--no-verify-plan-binding``
+    nothing binds the record to the plan that was reviewed, so it is ignored, logged at
+    WARNING (``iceberg_table_update_record_ignored``), and ``None`` lets the apply's own
+    ``--allow-iceberg-update`` decide, as for a run that plans.
+    """
     names = recorded(record)
+    if getattr(args, "no_verify_plan_binding", False):
+        if names:
+            cprint_literal(
+                "  iceberg:     --no-verify-plan-binding: the saved plan's record of the "
+                "tables it updates in place (" + ", ".join(names) + ") is not bound to it, so "
+                "it is ignored; they are refused unless this apply passes "
+                f"{ALLOW_ICEBERG_UPDATE_FLAG}",
+                soft_wrap=True,
+            )
+            warn(logger, "iceberg_table_update_record_ignored", tables=names)
+        return None
     if names:
         cprint_literal(
             "  iceberg:     the saved plan updates in place, as its plan asked "

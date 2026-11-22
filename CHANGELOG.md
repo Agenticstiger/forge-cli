@@ -21,7 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fluid apply`, `fluid plan --tofu` and `fluid ship` makes the update, audited at WARNING
   (`iceberg_table_update_accepted`); `fluid plan --tofu` records those tables in
   `opentofuPlan.icebergUpdates`, under `planDigest`, and `fluid apply plan.json` updates only
-  them. Any other in-place update of a live Iceberg table left in a plan is refused
+  them. Under `--no-verify-plan-binding` nothing binds that record to the reviewed plan, so it is
+  ignored (logged at WARNING as `iceberg_table_update_record_ignored`), and only the apply's own
+  `--allow-iceberg-update` lets such an update through. Any other in-place update of a live
+  Iceberg table left in a plan is refused
   (`iceberg_table_update_in_place`), and `fluid plan --allow-iceberg-update` needs `--tofu`
   (`plan_allow_iceberg_update_needs_tofu`). Hive tables keep their in-place updates, and a
   replace stays with the data-loss gate.
@@ -37,7 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schema changed outside the contract (a column a writer added, or a dropped one Iceberg keeps
   listing) gets the note on every apply while the two differ. A saved plan made before this
   release that updates a live Iceberg table in place is refused by `fluid apply plan.json`: make
-  the plan again.
+  the plan again. On AWS, a plan that `tofu show -json` cannot read back is now refused when it
+  changes anything in place, even with `--allow-data-loss`: make the plan again.
 
 ## [0.37.0] — 2026-11-22
 

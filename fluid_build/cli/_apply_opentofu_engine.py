@@ -1136,7 +1136,8 @@ def _apply_bound_plan(
         f"+{changes['add']} ~{changes['change']} -{changes['remove']}"
     )
     _table_adoption.say_bound(record)
-    recorded = _table_hold.say_bound(args, record)
+    # None under --no-verify-plan-binding: the record is unbound, and the apply's own flag decides.
+    recorded = _table_hold.say_bound(args, record, logger)
     _record_planned(eng, changes, dry_run)
     removals = runner.saved_plan_removals(shown)
     destroyed, updated = _review_plan(
