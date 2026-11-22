@@ -1667,7 +1667,7 @@ class _Reader:
                         walk(each, depth + 1, True, scalar) for each in found_all[1]
                     )
                 if how in {"parameter", "imported", "unbound"}:
-                    return scalar and not self._is_callable_of_file(node)
+                    return scalar  # a function or a class of the file is ``other``, above
                 return (
                     False  # unpacked, a loop variable, changed in place: what it holds is unknown
                 )
