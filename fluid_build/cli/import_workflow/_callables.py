@@ -69,6 +69,7 @@ from ._fold import (
     Unresolved,
     is_scalar,
     lookup,
+    node_position,
 )
 from ._pysource import Module, qualified_name, snippet
 
@@ -395,14 +396,28 @@ class Follower:
     @staticmethod
     def _local(node: ast.Name, folder: Folder) -> Optional[ast.AST]:
         """The ``def`` the name ``node`` is bound to where it is used, when that is the only way
-        it is bound there."""
+        it is bound there, or when the one other way is an assignment the use comes before (or is
+        in the value of: ``extract = PythonOperator(..., python_callable=extract)``)."""
         name = node.id
         if folder.rebound(name):
             return None
         scope: Optional[Scope] = folder.scope_of(node)
+        used_in = scope
         while scope is not None:
             if name in scope.functions:
                 return scope.functions[name]
+            shadowed = scope.shadowed_functions.get(name)
+            if shadowed is not None:
+                # a function or a lambda runs later, when the name may be the assigned value
+                function, value = shadowed
+                after_def = node_position(function, end=True) <= node_position(node)
+                if (
+                    scope is used_in
+                    and after_def
+                    and node_position(node) < node_position(value, end=True)
+                ):
+                    return function
+                return None
             if (
                 name in scope.values
                 or name in scope.blocked

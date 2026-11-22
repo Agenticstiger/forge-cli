@@ -626,12 +626,75 @@ def test_a_name_bound_more_than_one_way_is_not_taken_for_a_function():
             def twice():
                 boto3.client("emr").add_job_flow_steps(JobFlowId="j", Steps=[{"HadoopJarStep": {"Args": ["spark-submit", "s3://b.py"]}}])
 
+            def imported():
+                boto3.client("emr").add_job_flow_steps(JobFlowId="j", Steps=[{"HadoopJarStep": {"Args": ["spark-submit", "s3://c.py"]}}])
+            from acme_lib.emr_tasks import imported
+            imported = PythonOperator(task_id="c", python_callable=imported, dag=dag)
+
             PythonOperator(task_id="a", python_callable=submit, dag=dag)
             PythonOperator(task_id="b", python_callable=twice, dag=dag)
             """
         )
     )
-    assert found["a"].submits == [] and found["b"].submits == []
+    # `imported` is the library's function by the time the task is made, not the def above it
+    assert found["a"].submits == [] and found["b"].submits == [] and found["c"].submits == []
+
+
+def test_a_function_whose_name_a_task_takes_later_is_the_function_until_then():
+    found = dags(
+        _dag(
+            """
+            import subprocess
+
+            early = PythonOperator(task_id="early", python_callable=extract, dag=dag)
+
+            def extract(**kwargs):
+                subprocess.run(["spark-submit", "s3://jobs/extract.py"])
+
+            def load(**kwargs):
+                subprocess.run(["spark-submit", "s3://jobs/load.py"])
+
+            first = PythonOperator(task_id="first", python_callable=extract, dag=dag)
+            extract = PythonOperator(task_id="extract", python_callable=extract, dag=dag)
+            later = PythonOperator(task_id="later", python_callable=extract, dag=dag)
+            late = PythonOperator(task_id="late", python_callable=lambda: extract(), dag=dag)
+            load = PythonOperator(task_id="load", python_callable=lambda: load(), dag=dag)
+            first >> extract >> later
+            """
+        )
+    )
+    (dag,) = found.dags
+    by_id = {t.task_id: t for t in dag.tasks}
+    for task_id in ("first", "extract"):  # before the assignment, and in its own value
+        assert [s.script for s in by_id[task_id].submits] == ["s3://jobs/extract.py"]
+        assert by_id[task_id].callable == "extract"
+    # past it the name is the task, and a lambda runs when it already is, even one written in
+    # that value; before the def, the name is nothing yet
+    for task_id in ("later", "late", "load", "early"):
+        assert by_id[task_id].submits == [], task_id
+    assert found.unread_callables == {"extract": 2}
+    keys = {t.task_id: t.key for t in dag.tasks}
+    assert set(dag.edges) == {(keys["first"], keys["extract"]), (keys["extract"], keys["later"])}
+
+
+def test_a_function_a_task_in_a_loop_takes_the_name_of_is_not_taken_for_it():
+    found = tasks(
+        _dag(
+            """
+            import subprocess
+
+            def extract(**kwargs):
+                subprocess.run(["spark-submit", "s3://jobs/extract.py"])
+
+            for name in ("a", "b"):
+                print(name)
+            for day in ("mon", "tue"):
+                extract = PythonOperator(task_id=f"extract_{day}", python_callable=extract, dag=dag)
+            """
+        )
+    )
+    # the second time round, `extract` is the first task: neither is said to run the function
+    assert all(t.submits == [] for t in found.values())
 
 
 def test_the_functions_tasks_run_that_are_not_read_are_counted():
