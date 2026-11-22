@@ -627,3 +627,36 @@ def test_maintenance_is_not_a_write_and_a_rollback_is(
     monkeypatch.setattr(runner, "_main_snapshot", lambda spark, table: main_now)
     main_before = max(known) if known else None
     assert runner.changed_since(None, "fluid.db.t", (frozenset(known), main_before)) is changed
+
+
+@pytest.fixture
+def made_dirs(runner, monkeypatch):
+    """The directories fetch_package makes, to see none outlives a refusal."""
+    made = []
+    real = runner.tempfile.mkdtemp
+
+    def mkdtemp(**kw):
+        made.append(real(**kw))
+        return made[-1]
+
+    monkeypatch.setattr(runner.tempfile, "mkdtemp", mkdtemp)
+    return made
+
+
+@pytest.mark.parametrize(
+    "body", [package_zip({"orders_pkg/__init__.py": "x = 1\n"}), b"pinned, but not a zip"]
+)
+def test_a_refused_package_leaves_no_copy_behind(runner, tmp_path, made_dirs, body):
+    sha = SHA if body.startswith(b"PK") else hashlib.sha256(body).hexdigest()
+    with pytest.raises(runner.PackageError):
+        runner.fetch_package(None, str(_copy(tmp_path, body)), sha)
+    assert made_dirs and not any(os.path.exists(d) for d in made_dirs)
+
+
+def test_a_zip_python_cannot_open_is_refused_by_name(runner, tmp_path, monkeypatch):
+    def unsupported(*args, **kwargs):
+        raise NotImplementedError("zip file version 23.6")
+
+    monkeypatch.setattr(runner.zipfile, "ZipFile", unsupported)
+    with pytest.raises(runner.PackageError, match=r"not a readable zip \(NotImplementedError\)"):
+        runner.fetch_package(None, str(_copy(tmp_path)), SHA)

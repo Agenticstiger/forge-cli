@@ -1005,20 +1005,24 @@ def fetch_package(spark, location: str, sha256: str) -> str:
     """A copy of the package at ``location`` of the runner's own (owner-only, in a new
     directory nobody else can enter), once its bytes are the pinned ones and it is a zip
     Python can import from; its path."""
-    target = os.path.join(tempfile.mkdtemp(prefix="fluid-package-"), f"{sha256[:16]}.zip")
-    if "://" not in location or location.startswith("file://"):
-        _copy_local(location.removeprefix("file://"), target)
-    else:
-        _copy_remote(spark, location, target)
-    found = _file_sha256(target)
-    if found != sha256:
-        os.unlink(target)
-        raise PackageError(
-            f"the package at {location} is not the one the job config pins (its sha256 is "
-            f"{found}, the pin {sha256}); nothing was imported. Run fluid apply again: it "
-            "copies the pinned package"
-        )
-    _check_archive(target, location)
+    directory = tempfile.mkdtemp(prefix="fluid-package-")
+    target = os.path.join(directory, f"{sha256[:16]}.zip")
+    try:
+        if "://" not in location or location.startswith("file://"):
+            _copy_local(location.removeprefix("file://"), target)
+        else:
+            _copy_remote(spark, location, target)
+        found = _file_sha256(target)
+        if found != sha256:
+            raise PackageError(
+                f"the package at {location} is not the one the job config pins (its sha256 is "
+                f"{found}, the pin {sha256}); nothing was imported. Run fluid apply again: it "
+                "copies the pinned package"
+            )
+        _check_archive(target, location)
+    except BaseException:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
     log("package_verified", sha256=sha256, bytes=os.path.getsize(target))
     return target
 
@@ -1098,7 +1102,9 @@ def _check_archive(path: str, where: str) -> None:
     try:
         with zipfile.ZipFile(path) as archive:
             names = archive.namelist()
-    except (zipfile.BadZipFile, OSError, ValueError) as exc:
+    except (
+        Exception
+    ) as exc:  # noqa: BLE001 - zipfile's own errors: BadZipFile, NotImplementedError, ...
         raise PackageError(
             f"the package at {where} is not a readable zip ({type(exc).__name__}); build and "
             "publish it again, and pin the new digest"
@@ -1603,13 +1609,17 @@ def _add_package(spark, location: str, sha: str) -> list:
     from pyspark import SparkFiles
 
     path = fetch_package(spark, location, sha)
-    spark.sparkContext.addPyFile(path)
-    # addPyFile copies the file into Spark's own directory and puts that copy on the path.
-    copy = os.path.join(SparkFiles.getRootDirectory(), os.path.basename(path))
-    if os.path.exists(copy) and _file_sha256(copy) != sha:
-        raise PackageError(
-            "Spark's copy of the package is not the pinned one; nothing was imported"
-        )
+    try:
+        spark.sparkContext.addPyFile(path)
+        # addPyFile copies the file into Spark's own directory and puts that copy on the path.
+        copy = os.path.join(SparkFiles.getRootDirectory(), os.path.basename(path))
+        if os.path.exists(copy) and _file_sha256(copy) != sha:
+            raise PackageError(
+                "Spark's copy of the package is not the pinned one; nothing was imported"
+            )
+    except BaseException:
+        shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+        raise
     return [path, copy]
 
 
