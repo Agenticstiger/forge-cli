@@ -705,6 +705,51 @@ def test_a_full_name_that_starts_with_the_names_of_the_scanned_directory_is_a_fi
     assert "is not in the scanned files" in _why(values["c"])
 
 
+def test_a_name_of_too_many_parts_is_not_looked_for_below_the_import_root(tmp_path):
+    long = ".".join(["pkg"] * 30)
+    _write(
+        tmp_path,
+        {
+            "dags/nightly/dag.py": (
+                "from teamx.nightly.settings import T\n"
+                f"from {long}.nightly.settings import T as LONG\n"
+                "a = T\nb = LONG\n"
+            ),
+            "dags/nightly/settings.py": "T = 'found'\n",
+        },
+    )
+    walk = P.find_python_files(tmp_path / "dags")
+    index = ModuleIndex(walk.files)
+    module = index.load(next(f for f in walk.files if f.rel == "nightly/dag.py"))
+    assert module is not None
+    folder = index.folder(module)
+    first, second = (n.value for n in module.tree.body if isinstance(n, ast.Assign))
+    assert folder.fold(first) == "found"
+    assert "is not in the scanned files" in _why(folder.fold(second))
+
+
+def test_folding_lent_to_another_file_is_given_back_to_the_module(monkeypatch):
+    from fluid_build.cli.import_workflow import _fold
+
+    # a list of 40 folds in 41 steps: two of them do not fit a budget of 60
+    monkeypatch.setattr(_fold, "MAX_STEPS_PER_MODULE", 60)
+    words = ", ".join(f"'w{i}'" for i in range(40))
+    module = P.parse_module("m.py", f"A = [{words}]\nB = [{words}]\n".encode("utf-8"))
+    first, second = (n.value for n in module.tree.body)  # type: ignore[attr-defined]
+
+    alone = Folder(module)
+    alone.fold(first)
+    assert any(isinstance(item, Unresolved) for item in alone.fold(second))
+    assert alone.exhausted
+
+    lent = Folder(module)
+    with lent.lent() as spent:
+        assert all(isinstance(item, str) for item in lent.fold(first))
+    assert spent[0] >= 41
+    assert all(isinstance(item, str) for item in lent.fold(second))
+    assert not lent.exhausted
+
+
 @pytest.mark.parametrize("where", ["project", "dags", "outside"])
 def test_a_dag_files_imports_resolve_whatever_the_working_directory(tmp_path, monkeypatch, where):
     """A DAG file is shown by its path from the working directory, and its imports are resolved

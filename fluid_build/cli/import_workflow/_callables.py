@@ -50,7 +50,9 @@ from ._airflow_dags import (
 )
 from ._fold import (
     ABSENT,
+    MAX_STEPS_PER_MODULE,
     MAX_STRING,
+    MAX_STRING_WORK,
     FoldedDict,
     FoldedTuple,
     Folder,
@@ -67,8 +69,8 @@ MAX_DEPTH = 3
 MAX_VISITS = 200_000
 #: A set of arguments larger than this (values, characters of text) is not a key of what was
 #: read with it: a task with one is read on its own.
-_MAX_KEY_ITEMS = 2_000
-_MAX_KEY_CHARS = 100_000
+_MAX_KEY_ITEMS = 256
+_MAX_KEY_CHARS = 20_000
 
 #: What a submit helper submits to, by the kind the conventions give it (the operators' kinds).
 HELPER_KINDS: Dict[str, str] = {
@@ -173,6 +175,8 @@ def _keyword(call: ast.Call, *names: str) -> Optional[ast.expr]:
 def _key(arguments: _Arguments) -> Optional[Tuple[Any, ...]]:
     """``arguments`` as a key of what a function was read with, or ``None`` when they are too
     large to be one."""
+    if len(arguments.positional) + len(arguments.keywords) > _MAX_KEY_ITEMS:
+        return None
     left = [_MAX_KEY_ITEMS, _MAX_KEY_CHARS]
 
     def freeze(value: Any) -> Any:
@@ -222,8 +226,14 @@ class Follower:
         self.unread: Dict[str, int] = {}
         #: The files of other modules whose folding ran out while their functions were followed.
         self.tired: Set[str] = set()
+        #: What folding in other modules may still cost while this file's tasks are read: it is
+        #: this file's to spend (see :meth:`Folder.lent`), as much as its own module may.
+        self._foreign_left = [MAX_STEPS_PER_MODULE, MAX_STRING_WORK]
+        self._lent: Set[int] = set()
         self._bodies: Dict[ast.AST, List[ast.AST]] = {}
         self._read: Dict[Tuple[ast.AST, Any], List[Submit]] = {}
+        #: A command line (with its holes) to the spark-submits in it: read once.
+        self._commands: Dict[Any, List[Tuple[Any, List[Any]]]] = {}
 
     # ── entry points ────────────────────────────────────────────────
 
@@ -486,15 +496,44 @@ class Follower:
         key = (function, _key(arguments)) if depth == 0 else None
         if key is not None and key[1] is not None and key in self._read:
             return [replace(submit, line=line) for submit in self._read[key]]
+        foreign = folder is not self.folder and id(folder) not in self._lent
+        if foreign and min(self._foreign_left) <= 0:
+            self.cut_short = True
+            return []
         nodes = self._body(function)
-        frame = self._frame(function, folder, arguments, task=depth == 0)
-        with folder.bound(function, frame):
-            found = self._scan(nodes, module, folder, line, depth, (*stack, function))
-        if folder is not self.folder and folder.exhausted:
-            self.tired.add(module.rel)
+        if not foreign:
+            found = self._read_body(function, nodes, module, folder, arguments, line, depth, stack)
+        else:
+            self._lent.add(id(folder))
+            try:
+                with folder.lent() as spent:
+                    found = self._read_body(
+                        function, nodes, module, folder, arguments, line, depth, stack
+                    )
+                    if folder.exhausted:
+                        self.tired.add(module.rel)
+            finally:
+                self._lent.discard(id(folder))
+            self._foreign_left[0] -= spent[0]
+            self._foreign_left[1] -= spent[1]
         if key is not None and key[1] is not None:
             self._read[key] = found
         return found
+
+    def _read_body(
+        self,
+        function: ast.AST,
+        nodes: Sequence[ast.AST],
+        module: Module,
+        folder: Folder,
+        arguments: _Arguments,
+        line: int,
+        depth: int,
+        stack: Tuple[ast.AST, ...],
+    ) -> List[Submit]:
+        frame = self._frame(function, folder, arguments, task=depth == 0)
+        with folder.bound(function, frame):
+            return self._scan(nodes, module, folder, line, depth, (*stack, function))
 
     def _body(self, function: ast.AST) -> List[ast.AST]:
         """The calls and the argument lists of ``function``'s own body (not of a function or a
@@ -677,8 +716,7 @@ class Follower:
                 )
         return out
 
-    @staticmethod
-    def _command(node: ast.expr, folder: Folder, line: int) -> List[Submit]:
+    def _command(self, node: ast.expr, folder: Folder, line: int) -> List[Submit]:
         """A command a function runs: words (``["spark-submit", ...]``) or a line."""
         if isinstance(node, (ast.List, ast.Tuple)):
             return []  # an argument list written out: read as one (see _argv)
@@ -693,9 +731,11 @@ class Follower:
         text, holes = folder.fold_sql(node)
         if not isinstance(text, str):
             return []
-        return [
-            make_submit("spark-submit", s, a, line) for s, a in spark_submits_in_text(text, holes)
-        ]
+        key = (text, tuple(sorted(holes.items())))
+        found = self._commands.get(key)
+        if found is None:
+            found = self._commands[key] = spark_submits_in_text(text, holes)
+        return [make_submit("spark-submit", s, a, line) for s, a in found]
 
     @staticmethod
     def _argv(node: ast.AST, folder: Folder, line: int) -> List[Submit]:

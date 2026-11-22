@@ -835,6 +835,97 @@ def test_a_wide_and_deep_call_graph_is_read_in_bounded_time():
     assert len(found) == 200
 
 
+def _shared_helper_project(root: Path, files: int, per_file: int) -> None:
+    sources = {
+        "common/__init__.py": "",
+        "common/emr.py": """
+            import boto3
+
+            def submit(script, conf="a=b", **kwargs):
+                args = ["spark-submit", "--conf", conf, "--deploy-mode", "cluster", script]
+                steps = [{"Name": "s", "HadoopJarStep": {"Jar": "command-runner.jar", "Args": args}}]
+                boto3.client("emr").add_job_flow_steps(JobFlowId="j", Steps=steps)
+        """,
+    }
+    for f in range(files):
+        tasks_ = "\n".join(
+            f'    PythonOperator(task_id="t{i}", python_callable=submit, op_kwargs={{"script": "s3://jobs/{f}_{i}.py"}})'
+            for i in range(per_file)
+        )
+        sources[f"d{f}/dag.py"] = (
+            "from airflow import DAG\n"
+            "from airflow.operators.python import PythonOperator\n"
+            "from common.emr import submit\n"
+            f"with DAG('d{f}', schedule=None) as dag:\n{tasks_}\n"
+        )
+    _write(root, sources)
+
+
+def test_a_module_the_tasks_of_many_files_reach_does_not_run_out_for_the_last(
+    tmp_path, monkeypatch
+):
+    from fluid_build.cli.import_workflow import _fold
+
+    # one file's tasks fit the module's budget; thirty files' do not
+    monkeypatch.setattr(_fold, "MAX_STEPS_PER_MODULE", 3_000)
+    _shared_helper_project(tmp_path, files=30, per_file=10)
+    scan = scan_dags(tmp_path, Conventions())
+    scripts = [s.script for d in scan.dags for t in d.tasks for s in t.submits]
+    assert len(scripts) == 300 and None not in scripts
+    assert not any("folding stopped early" in n for n in scan.notes)
+
+
+def test_what_one_file_may_spend_in_other_modules_is_bounded_and_said(tmp_path, monkeypatch):
+    monkeypatch.setattr(_callables, "MAX_STEPS_PER_MODULE", 200)
+    _shared_helper_project(tmp_path, files=1, per_file=40)
+    scan = scan_dags(tmp_path, Conventions())
+    found = [t.submits for d in scan.dags for t in d.tasks]
+    read = [s for s in found if s]
+    assert 0 < len(read) < 40
+    assert any("stopped following the functions its Python tasks run" in n for n in scan.notes)
+
+
+def test_a_command_line_many_tasks_run_is_read_once(monkeypatch):
+    calls: List[int] = []
+    original = _callables.spark_submits_in_text
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(_callables, "spark_submits_in_text", counting)
+    many = "\n".join(
+        f'PythonOperator(task_id="t{i}", python_callable=run, op_kwargs={{"day": "d{i}"}}, dag=dag)'
+        for i in range(100)
+    )
+    found = tasks(
+        _dag(
+            """
+import os
+CMD = "spark-submit --deploy-mode cluster s3://acme-code/jobs/a.py --full"
+
+def run(day, **kwargs):
+    os.system(CMD)
+"""
+            + many
+        )
+    )
+    assert all(
+        submits(t) == [("spark-submit", "s3://acme-code/jobs/a.py", ("--full",))]
+        for t in found.values()
+    )
+    assert len(calls) == 1
+
+
+def test_a_large_set_of_arguments_is_read_on_its_own_not_kept(monkeypatch):
+    from fluid_build.cli.import_workflow._callables import _Arguments, _key
+
+    assert _key(_Arguments(keywords={f"k{i}": "v" for i in range(10)})) is not None
+    assert _key(_Arguments(keywords={f"k{i}": "v" for i in range(300)})) is None
+    assert _key(_Arguments(keywords={"k": ["v"] * 300})) is None
+    assert _key(_Arguments(keywords={"k": "v" * 30_000})) is None
+
+
 # ── the import, end to end ────────────────────────────────────────────
 
 

@@ -68,9 +68,11 @@ from ._pysource import (
     snippet,
 )
 
-#: Directory names above the scanned files a dotted name may start with (see
-#: :meth:`ModuleIndex._below_the_import_root`).
+#: Directory names above the scanned files a dotted name may start with, and the most parts a
+#: name may have to be looked for below the import root (see
+#: :meth:`ModuleIndex._below_the_import_root`): a real import has a few.
 MAX_ROOT_NAMES = 12
+MAX_NAME_PARTS = 24
 #: Deepest expression :meth:`Folder.fold` follows, and the longest string it builds.
 MAX_FOLD_DEPTH = 40
 MAX_STRING = 4096
@@ -1206,7 +1208,10 @@ class ModuleIndex:
           (``teamx.dags`` for a scan of ``.../teamx/dags``), and the rest is a file of the scan.
 
         A name that fits neither is not guessed at (``teamx.weekly.settings`` from
-        ``nightly/dag.py`` of a scan of a directory named otherwise)."""
+        ``nightly/dag.py`` of a scan of a directory named otherwise), nor is one of more than
+        :data:`MAX_NAME_PARTS` parts."""
+        if len(parts) > MAX_NAME_PARTS:
+            return None
         here = from_rel.split("/")[:-1]
         for depth in range(len(here), 0, -1):  # the importing file's directory, then its parents
             package = here[:depth]
@@ -1348,6 +1353,20 @@ class Folder:
             yield
         finally:
             self._env.pop()
+
+    @contextmanager
+    def lent(self) -> Iterator[List[int]]:
+        """Fold for another file's reader, which counts the cost: the steps and characters of
+        string the folds take meanwhile are given back to this module afterwards, so a module
+        that the tasks of many files reach does not run out for the files read last. Yields
+        ``[steps, characters]``, filled in once the block ends."""
+        steps, work, exhausted = self._steps_module, self._work, self.exhausted
+        spent = [0, 0]
+        try:
+            yield spent
+        finally:
+            spent[0], spent[1] = self._steps_module - steps, self._work - work
+            self._steps_module, self._work, self.exhausted = steps, work, exhausted
 
     def how_bound(self, node: ast.Name) -> str:
         """How the name ``node`` is bound where it is used: ``"once"`` (one assignment),
