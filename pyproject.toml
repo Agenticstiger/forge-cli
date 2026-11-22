@@ -926,6 +926,7 @@ module = [
     # silent unchecked file.
     "fluid_build.forge.core.custom_scaffold_artifacts",
     "fluid_build.util.atomic_write",
+    "fluid_build.util.change_request",
     "fluid_build.observability.secret_redactor",
     # The agentPolicy gate: it decides whether an agent may read production
     # data, so a silent Any is a silent allow.

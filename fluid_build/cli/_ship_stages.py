@@ -131,6 +131,9 @@ class ShipOptions:
     require_artifacts: Tuple[str, ...] = ()
     # --release-dir: stage 9 verifies every port (verify --require-every-port).
     verify_every_port: bool = False
+    # What marks this build as a change request, when custom-scaffold was left out of
+    # stage 3 for it (leave_scaffold_out_on_change_request); "" otherwise.
+    scaffold_left_out: str = ""
 
 
 @dataclass
@@ -303,6 +306,46 @@ def resolve_options(args: object, contract: str, env: Mapping[str, str]) -> Ship
         policy_mode=_resolve_policy_mode(get("policy_mode"), env),
         require_artifacts=_resolve_required_artifacts(get("require_artifacts")),
         verify_every_port=bool(get("release_dir")),
+    )
+
+
+#: The stage-3 key that runs code the contract names: never on a change-request build.
+SCAFFOLD_KEY = "custom-scaffold"
+
+
+def leave_scaffold_out_on_change_request(opts: ShipOptions, env: Mapping[str, str]) -> None:
+    """Drop ``custom-scaffold`` from stage 3's ``--emit`` (and ``--require-artifacts``) on a
+    build its CI marks as a change request.
+
+    A generated pipeline shares one ``GENERATE_EMIT`` between its pull or merge request
+    builds and its default-branch builds and runs stage 3 on both, and the custom-scaffold
+    engine renders the contract's bundle templates in the ``fluid`` process: naming the key
+    for releases would run a change's templates, before anyone merged it, with the job's
+    credentials. The markers are the CI system's own variables
+    (:mod:`fluid_build.util.change_request`), read here rather than in
+    :func:`resolve_options`, which reads only the knobs a wrapper passes through. When the
+    key was all stage 3 had to do, stage 3 is switched off.
+    """
+    from fluid_build.util.change_request import change_request_marker
+
+    named = [part.strip() for part in opts.emit.split(",") if part.strip()]
+    if SCAFFOLD_KEY not in named:
+        return
+    marker = change_request_marker(env)
+    if marker is None:
+        return
+    rest = [part for part in named if part != SCAFFOLD_KEY]
+    opts.scaffold_left_out = marker
+    opts.emit = ",".join(rest)
+    opts.require_artifacts = tuple(k for k in opts.require_artifacts if k != SCAFFOLD_KEY)
+    if not rest:
+        opts.generate_artifacts = False
+
+
+def _change_request_note(o: ShipOptions) -> str:
+    return (
+        f"{SCAFFOLD_KEY} left out of --emit: this is a change-request build "
+        f"({o.scaffold_left_out}), and its bundle templates run only on default-branch builds"
     )
 
 
@@ -607,7 +650,11 @@ def _generate_artifacts(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
     # but its ODCS, ODPS and policy artifacts do not depend on where it runs
     # (``generate artifacts`` itself drops no key for one; schedule has its own gate).
     if not o.generate_artifacts:
-        a.skip_reason = "--no-generate-artifacts"
+        a.skip_reason = (
+            _change_request_note(o) + ", and it was all stage 3 had to do"
+            if o.scaffold_left_out
+            else "--no-generate-artifacts"
+        )
     else:
         a.argv = [
             "generate",
@@ -620,6 +667,8 @@ def _generate_artifacts(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
             ARTIFACTS_DIR,
             *(["--emit", o.emit] if o.emit else []),
         ]
+        if o.scaffold_left_out:
+            a.notes.append(_change_request_note(o))
         if o.require_artifacts:
             a.notes.append(
                 f"--require-artifacts {','.join(o.require_artifacts)}: this stage fails unless "
@@ -868,7 +917,9 @@ def check_required_artifacts(
         return
     keys = ",".join(opts.require_artifacts)
     if 3 not in selected or not opts.generate_artifacts:
-        why = not_selected.get(3) or "--no-generate-artifacts"
+        why = not_selected.get(3) or (
+            _change_request_note(opts) if opts.scaffold_left_out else "--no-generate-artifacts"
+        )
         raise ShipUsageError(
             f"--require-artifacts {keys} needs stage 3 generate-artifacts in this invocation, "
             f"and it does not run ({why})"

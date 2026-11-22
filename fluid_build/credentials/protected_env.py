@@ -701,6 +701,9 @@ _FLUID_PROTECTED_FRAGMENTS: Tuple[str, ...] = (
 #: feature and tuning switches.
 DOTENV_LOADABLE: FrozenSet[str] = frozenset(
     {
+        # marks a change-request build (util/change_request.py); it can only make a run
+        # refuse or leave out code a contract names, never allow it, so a project may set it
+        "FLUID_CHANGE_REQUEST",
         # credentials
         "FLUID_API_KEY",
         "FLUID_BEARER_TOKEN",
