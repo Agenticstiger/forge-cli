@@ -938,6 +938,11 @@ module = [
     # silent Any is a silent grant or a silent leak.
     "fluid_build.policy.lakekeeper",
     "fluid_build.policy.lakekeeper_apply",
+    # schedule-sync --airflow-url: resolves the operator's Airflow credential, sends it to
+    # the URL, and decides whether a deploy is live, so a silent Any is a leak or a pass.
+    "fluid_build.cli._airflow_api",
+    "fluid_build.cli._airflow_sync_check",
+    "fluid_build.cli._schedule_sync_airflow",
     # sink.catalogAuth: decides what a streaming sink's catalog credential
     # becomes in the config forge-cli pushes, so a silent Any is a silent leak.
     "fluid_build.providers._iceberg_catalog_auth",

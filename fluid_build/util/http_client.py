@@ -268,12 +268,14 @@ def new_client(
     response_hooks: Iterable[Callable[[httpx.Response], Any]] = (),
     retry: Optional[Mapping[str, Any]] = None,
     follow_redirects: bool = True,
+    trust_env: bool = True,
     **kwargs: Any,
 ) -> httpx.Client:
     """An ``httpx.Client`` that behaves like a ``requests`` session.
 
     Follows redirects (``follow_redirects=False`` where the site did not),
-    trusts the proxy environment, verifies TLS (:func:`tls_verify`), and runs
+    trusts the proxy environment (``trust_env=False`` where a request must never
+    reach a proxy), verifies TLS (:func:`tls_verify`), and runs
     each ``response_hooks`` entry on every hop before it is followed. ``retry``
     is the keyword arguments of :class:`RetryTransport` (``total``,
     ``backoff_factor``, ``status_forcelist``, ``allowed_methods``, ``sleep``).
@@ -286,7 +288,7 @@ def new_client(
         max_redirects=MAX_REDIRECTS,
         verify=tls_verify(),
         event_hooks={"response": list(response_hooks)},
-        trust_env=True,
+        trust_env=trust_env,
         **kwargs,
     )
 
