@@ -495,7 +495,13 @@ def publish(sub: Submitter, run: DesiredRun, runner_text: str) -> None:
             f"Spark build {run.build}: the runner changed after the run was compiled; "
             "run fluid apply again"
         )
-    files = ((run.job_uri, run.job_text.encode("utf-8")), (run.runner_uri, runner))
+    files: Tuple[Tuple[str, bytes], ...] = (
+        (run.job_uri, run.job_text.encode("utf-8")),
+        (run.runner_uri, runner),
+    )
+    if run.package_sha256 and run.package_uri:
+        # Beside the job config, where the runner looks, as OpenTofu copies it on AWS.
+        files += ((run.package_uri, local_package(run, sub.env)),)
     if sub.on_s3:
         _put_s3(files, sub.env)
         return
@@ -560,6 +566,45 @@ def remove_stop_request(host: LocalHost, uri: str) -> None:
             Path(uri).unlink(missing_ok=True)
     except Exception:  # noqa: BLE001,S110 - best effort, as the docstring says
         pass
+
+
+def local_package(run: DesiredRun, env: Mapping[str, str]) -> bytes:
+    """A local package build's package: the file its ``file://`` URI names, once the file it
+    resolves to sits under a place :data:`~fluid_build.spark.package.PACKAGE_ALLOWLIST_ENV`
+    lists and its sha256 is the pin (the runner checks it again before importing it).
+
+    Raises:
+        SparkRunError: the file is missing, unlisted, too large, or other bytes.
+    """
+    from fluid_build.spark.package import MAX_PACKAGE_BYTES, PACKAGE_ALLOWLIST_ENV, listed
+
+    where = f"Spark build {run.build}: properties.package.uri"
+    path = Path(str(run.package_source or "").removeprefix("file://"))
+    try:
+        real = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        reason = getattr(exc, "strerror", None) or type(exc).__name__
+        raise SparkRunError(f"{where}: {path} cannot be read: {reason}") from exc
+    if not listed(f"file://{real}", env):
+        raise SparkRunError(
+            f"{where}: {real} is not under a place {PACKAGE_ALLOWLIST_ENV} lists (a link counts "
+            "as the file it names); the operator lists the folders local packages come from"
+        )
+    if not real.is_file():
+        raise SparkRunError(f"{where}: {real} is not a file")
+    if real.stat().st_size > MAX_PACKAGE_BYTES:
+        raise SparkRunError(f"{where}: {real} is larger than {MAX_PACKAGE_BYTES} bytes")
+    try:
+        body = real.read_bytes()
+    except OSError as exc:
+        raise SparkRunError(f"{where}: {real} cannot be read: {exc.strerror}") from exc
+    found = hashlib.sha256(body).hexdigest()
+    if found != run.package_sha256:
+        raise SparkRunError(
+            f"{where}: {path} is not the pinned package (its sha256 is {found}, the pin "
+            f"{run.package_sha256}); build the pinned version, or pin this one"
+        )
+    return body
 
 
 def _replace(path: Path, body: bytes) -> None:
