@@ -17,17 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FLUID_SPARK_LOCAL_ROOT`). The runner looks for it every 10 s, stops each of its queries once no
   batch is running in it (or right after a batch commits, when batches run back to back), and ends
   cleanly; the new config then starts on the same checkpoint. A run that has not stopped within
-  `FLUID_SPARK_STOP_GRACE_SECONDS` (default 300, `0` cancels at once), or was started by an older
-  `fluid apply` without a key, is cancelled as before, and the request is removed whatever
+  `FLUID_SPARK_STOP_GRACE_SECONDS` (default 300, `0` cancels at once), was started by an older
+  `fluid apply` without a key, or was started on another job config (the output's location moved,
+  so it would never see the request), is cancelled as before, and the request is removed whatever
   happens, Ctrl-C included. The outcome names the config the stream moved from and to, and how
   each old run stopped; a dry run and the plan's `stateImpact` say which runs would stop between
   batches. A stream that moves to `trigger.availableNow` has its continuous run stopped the same
-  way. A second copy of the same config is still cancelled at once, and `--mode reconcile`, which
-  never replaces a config, writes no request. Before a stream reads anything, the runner refuses a
+  way. A second writer on the checkpoint (a second copy of the same config, or a run of another config
+  beside one of the new config) is still cancelled at once, and `--mode reconcile`, which never
+  replaces a config, writes no request. Before a stream reads anything, the runner refuses a
   checkpoint (or the dead letters' checkpoint) whose newest offsets name another topic, which also
   catches a checkpoint no recorded run used (a prefix copied from another stream, a new EMR
   cluster with no step history). Moving `properties.stream.checkpoint` still starts the job from
-  `startingOffsets`, as the 0.7.7 schema says, and the outcome now says so. The runner changed, so
+  `startingOffsets`, as the 0.7.7 schema says, unless the new prefix already holds a position
+  (Spark resumes it); the outcome now says which, from the runs' history. The runner changed, so
   the first `fluid apply` after the upgrade replaces each running stream once, by a cancel (those
   runs have no key), and a plan made before the upgrade is refused at apply: plan again.
 - **The Spark runner stamps every Iceberg commit with the run's identity.** Each commit the
