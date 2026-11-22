@@ -20,6 +20,9 @@ credential).
 - batch: the contract's own SELECT over catalog tables -> overwrite the partitions it
   computes. A topic is landed by a stream (``availableNow`` for a scheduled run), never
   by a batch read, which sees only what Kafka still retains.
+- a release: ``fluid apply`` asks a stream it replaces to stop between two batches
+  (``--fluid-stop-key``, :func:`stop_request_uri`), and a stream refuses a checkpoint that
+  holds another topic's position before it reads (:func:`check_checkpoint_fits`).
 
 Every commit the runner makes (a batch's overwrite, the stream's append, a dead-letter table's
 append) carries ``fluid.*`` entries in its Iceberg snapshot summary: the product and build, the
@@ -93,6 +96,12 @@ STAMP_FLAGS = (
 #: starts with a letter or a digit, so it is never read as an option of the command line.
 _STAMP_IDENT = re.compile(r"[A-Za-z0-9._:+@/=~-]{1,256}")
 _STAMP_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+@/=~-]{0,255}")
+#: What ``--fluid-stop-key`` may hold: it names a file (``stop/<key>``), so never a ``/`` or a dot.
+_STOP_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+#: How often a stream looks for its stop request (one request to the store each time), and how
+#: often it looks at its queries once one has come.
+STOP_CHECK_S = 10.0
+_BETWEEN_BATCHES_S = 0.1
 GLUE_CATALOG_IMPL = "org.apache.iceberg.aws.glue.GlueCatalog"
 S3_FILE_IO = "org.apache.iceberg.aws.s3.S3FileIO"
 #: Session settings the generated SQL relies on.
@@ -566,7 +575,8 @@ def build_output(spark, config: dict):
     return spark.sql(queries["select"])
 
 
-def run(spark, config: dict, stamps: dict | None = None) -> None:
+def run(spark, config: dict, stamps: dict | None = None, stop=None) -> None:
+    """Run the job; ``stop`` (a :class:`StopWatch`) is a stream's stop request, if it has one."""
     configure_session(spark, config)
     stamps = stamps or {}
     stamp_conf(spark, stamps)
@@ -586,6 +596,8 @@ def run(spark, config: dict, stamps: dict | None = None) -> None:
         if not mask.get("secretArn"):
             raise JobConfigError("maskAtIngest columns need maskKey.secretArn")
         register_mask(spark, load_mask_key(mask["secretArn"]))
+    if config["mode"] != "batch":
+        check_checkpoint_fits(spark, config)
     create_sink_table(spark, config)
     output = build_output(spark, config)
     if config["mode"] == "batch":
@@ -617,16 +629,23 @@ def run(spark, config: dict, stamps: dict | None = None) -> None:
         if seed is None and not _names(spark, f"{dead['checkpoint']}offsets"):
             seed = await_initial_offsets(spark, config["checkpoint"], query)
         queries.append(start_dead_letters(spark, config, trigger, seed, stamps))
-    await_queries(spark, queries)
+    await_queries(spark, queries, stop)
     log("done", table=table)
 
 
-def await_queries(spark, queries) -> None:
+def await_queries(spark, queries, stop=None) -> None:
     """Wait for every query; when one fails, stop the others and raise its error (an
-    availableNow run ends when all have ended)."""
+    availableNow run ends when all have ended). With ``stop`` (a :class:`StopWatch`), a stop
+    request ends the run once each query is between batches (:func:`stop_between_batches`)."""
     try:
         while any(q.isActive for q in queries):
-            spark.streams.awaitAnyTermination()
+            if stop is not None and stop.requested():
+                stop_between_batches(queries)
+                break
+            if stop is None:
+                spark.streams.awaitAnyTermination()
+            elif not spark.streams.awaitAnyTermination(stop.every):
+                continue  # nothing ended: look for the request again
             spark.streams.resetTerminated()
         for q in queries:
             q.awaitTermination()  # raises the error of one that failed after the reset
@@ -912,6 +931,142 @@ def await_initial_offsets(spark, checkpoint: str, query, timeout: float = 300.0)
     return None
 
 
+# --- stream releases -----------------------------------------------------------------
+#
+# fluid apply replaces a running stream whose config changed: it asks the old run to stop
+# between two batches, then starts the new one on the same checkpoint. The request is an
+# object at ``stop/<key>`` beside the job config the run read, ``<key>`` being the one
+# ``--fluid-stop-key`` gave this run when it was started, so a request for one run never
+# stops another (a later run of the same config included). Spark's ``query.stop()``
+# interrupts a batch that is running (it cancels the query's jobs) and Spark has no stop
+# that waits for one, so the runner waits for the gap between batches itself, as Apache
+# Flink's stop-with-savepoint ends a job at a consistent point. A batch interrupted anyway
+# (one that started as the last committed) is planned again from the offset log by the next
+# run, as after any stop. A run that never answers is cancelled by fluid apply.
+
+
+def stop_key_flag(args) -> str | None:
+    """``--fluid-stop-key``, checked before Spark starts; None when it is not given.
+
+    Raises:
+        JobConfigError: the key could name a file outside ``stop/``."""
+    key = getattr(args, "fluid_stop_key", None)
+    if not key:
+        return None
+    if not _STOP_KEY.fullmatch(key):
+        raise JobConfigError(
+            f"--fluid-stop-key: {key[:60]!r} is not a stop key (a letter or a digit, then at "
+            "most 63 letters, digits, _ or -); the job was not run"
+        )
+    return key
+
+
+def stop_request_uri(config_uri: str, key: str) -> str:
+    """Where fluid apply asks the run started with ``key`` to stop: ``stop/<key>`` beside the
+    job config it read. ``fluid_build/build_runners/spark/_adapters.py`` has the same function."""
+    return f"{config_uri.rsplit('/', 1)[0]}/stop/{key}"
+
+
+def _exists(spark, uri: str) -> bool:
+    """Whether ``uri`` names a file: on this machine (a path, ``file://``), or on any file
+    system Spark reads."""
+    if "://" not in uri or uri.startswith("file://"):
+        return os.path.isfile(uri.removeprefix("file://"))
+    jvm = spark.sparkContext._jvm
+    path = jvm.org.apache.hadoop.fs.Path(uri)
+    return bool(path.getFileSystem(spark.sparkContext._jsc.hadoopConfiguration()).exists(path))
+
+
+class StopWatch:
+    """Whether fluid apply has asked this run to stop (:func:`stop_request_uri`), looked for
+    at most every ``every`` seconds: each look is a request to the store. A look that fails
+    (a role that may not list the job's prefix) is logged once, and the stream goes on."""
+
+    def __init__(self, spark, uri: str, every: float = STOP_CHECK_S, now=time.monotonic) -> None:
+        self.spark, self.uri, self.every, self._now = spark, uri, every, now
+        self._next: float | None = None
+        self._failed = False
+
+    def requested(self) -> bool:
+        now = self._now()
+        if self._next is not None and now < self._next:
+            return False
+        self._next = now + self.every
+        try:
+            return _exists(self.spark, self.uri)
+        except Exception as exc:  # noqa: BLE001 - Py4J's error: the stream keeps going
+            if not self._failed:
+                self._failed = True
+                log("stop_check_failed", uri=self.uri, error=type(exc).__name__)
+            return False
+
+
+def _last_batch(query):
+    """The batch id of the query's last progress report, or None before its first."""
+    progress = query.lastProgress
+    return progress.get("batchId") if progress else None
+
+
+def stop_between_batches(queries, sleep=time.sleep) -> dict:
+    """Stop each of ``queries`` once it is between batches: no trigger is running in it, or a
+    batch has committed since the request came (with no trigger interval the next batch
+    starts as the last one commits, so it is stopped as it starts). Each query's last
+    reported batch id, by query id, logged and returned."""
+    started = {str(q.id): _last_batch(q) for q in queries}
+    going = [q for q in queries if q.isActive]
+    while going:
+        for query in list(going):
+            if (
+                query.isActive
+                and query.status.get("isTriggerActive")
+                and _last_batch(query) == started[str(query.id)]
+            ):
+                continue
+            query.stop()
+            going.remove(query)
+        if going:
+            sleep(_BETWEEN_BATCHES_S)
+    last = {str(q.id): _last_batch(q) for q in queries}
+    log("stopped_on_request", lastBatch=last)
+    return last
+
+
+def checkpoint_topics(spark, checkpoint: str) -> set | None:
+    """The topics the newest batch in ``checkpoint``'s offset log read; None for a new
+    checkpoint, or an entry this runner cannot read (Spark has the last word on it)."""
+    batches = [int(n) for n in _names(spark, f"{checkpoint}offsets") if n.isdigit()]
+    if not batches:
+        return None
+    found = source_offsets(_read_small(spark, f"{checkpoint}offsets/{max(batches)}"), 2)
+    return set(json.loads(found)) if found else None
+
+
+def check_checkpoint_fits(spark, config: dict) -> None:
+    """Refuse, before the stream reads anything, a checkpoint that holds another topic's
+    position: Spark would resume this job at offsets that belong to that topic. The stream's
+    checkpoint and its dead letters' are checked; a new checkpoint fits any job.
+
+    fluid apply refuses a new source on the old checkpoint before it stops the run reading
+    it, from the runs' history; this check also covers a checkpoint no known run of the build
+    used (a prefix copied from another stream, a new EMR cluster with no step history).
+
+    Raises:
+        JobConfigError: a checkpoint holds another topic's position."""
+    topic = config["source"]["topic"]
+    places = [config["checkpoint"]]
+    if config.get("deadLetter"):
+        places.append(config["deadLetter"]["checkpoint"])
+    for checkpoint in places:
+        topics = checkpoint_topics(spark, checkpoint)
+        if topics is not None and topics != {topic}:
+            raise JobConfigError(
+                f"the checkpoint at {checkpoint} holds the position of topic "
+                f"{', '.join(sorted(topics))}, and this job reads {topic}; nothing was read. "
+                "To read the new topic, set properties.stream.checkpoint to a new prefix: the "
+                "job then starts from properties.stream.startingOffsets"
+            )
+
+
 def read_text(spark, path: str) -> str:
     """The config file's text, from any file system Spark reads (s3://, file://, a path)."""
     if "://" not in path or path.startswith("file://"):
@@ -931,15 +1086,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     for flag, key in STAMP_FLAGS:
         parser.add_argument(flag, help=f"stamped on every commit as {key}")
+    parser.add_argument(
+        "--fluid-stop-key", help="a stream's key: fluid apply asks it to stop at stop/<key>"
+    )
     # Glue passes its own --JOB_NAME and friends; they are not this runner's.
     args, _ = parser.parse_known_args(argv)
     flags = stamp_flags(args)  # before Spark starts: a value a stamp may not hold runs nothing
+    key = stop_key_flag(args)  # likewise
     from pyspark.sql import SparkSession
 
     spark = SparkSession.builder.getOrCreate()
     text = checked_text(read_text(spark, args.config), args.fluid_job_sha256, args.config)
     config = parse_config(text)
-    run(spark, config, release_stamps(config, text, flags))
+    stop = StopWatch(spark, stop_request_uri(args.config, key)) if key else None
+    run(spark, config, release_stamps(config, text, flags), stop)
     return 0
 
 
