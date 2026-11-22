@@ -368,16 +368,45 @@ def test_a_rollback_run_that_cannot_be_read_back_is_still_named(run, clock, use)
     assert "run rb was started from its release record, but checking on it failed" in out.message
 
 
-@pytest.mark.parametrize("ended", ["CANCELLED", "SUCCEEDED"])
-def test_a_previous_config_that_ended_cleanly_is_watched_and_rolled_back_to(run, clock, use, ended):
-    """Cancelled (forge's stop or an operator's) or SUCCEEDED: the config ended as it was
-    asked, so it is a config to go back to."""
-    previous = dataclasses.replace(last_good(run), state=ended, raw_state=ended)
+def test_a_previous_config_that_ended_succeeded_is_watched_and_rolled_back_to(run, clock, use):
+    previous = dataclasses.replace(last_good(run), state="SUCCEEDED", raw_state="SUCCEEDED")
     fake = Rolling([previous], start_states=("FAILED",), records={OLD_DIGEST: OLD_JOB})
     use(fake)
     out = go(run, clock)
     assert (out.action, out.run_id, out.code) == ("rolled-back", "rb", None)
     assert len(fake.rolled_back) == 1
+
+
+def test_a_previous_config_this_apply_stopped_is_rolled_back_to(run, clock, use):
+    """Running when this apply replaced it (asked to stop between batches, or cancelled): the
+    release's own stop does not make it a config to leave."""
+    for grace, answers in (("30", {"old1"}), ("0", set())):
+        fake = Rolling(
+            [last_good(run)], answers=answers, start_states=("FAILED",),
+            records={OLD_DIGEST: OLD_JOB},
+        )  # fmt: skip
+        use(fake)
+        out = go(run, clock, env={rc.STOP_GRACE_ENV: grace})
+        assert (out.action, out.code, len(fake.rolled_back)) == ("rolled-back", None, 1)
+
+
+def test_a_previous_config_cancelled_before_this_apply_is_no_config_to_go_back_to(run, clock, use):
+    """An operator may have cancelled it because it wrote bad data: the new run is watched, and
+    when it fails nothing is rolled back and the stream is down."""
+    gone = dataclasses.replace(last_good(run), state="CANCELLED", raw_state="CANCELLED")
+    fake = Rolling(
+        [gone], start_states=("RUNNING", "RUNNING", "FAILED"), records={OLD_DIGEST: OLD_JOB}
+    )
+    use(fake)
+    out = go(run, clock)
+    assert (out.action, out.error, out.code, fake.rolled_back) == (
+        "failed",
+        True,
+        rc.NO_GOOD_CONFIG,
+        [],
+    )
+    assert "ended CANCELLED before this apply, which is no config to go back to" in out.message
+    assert "the stream is down" in out.message and run.config_hash in fake.failed
 
 
 @pytest.mark.parametrize("ended", ["FAILED", "LOST"])
@@ -400,7 +429,7 @@ def test_a_previous_config_that_died_is_no_config_to_go_back_to(run, clock, use,
         [],
     )
     assert "start rollback" not in fake.calls and "cancel new" not in fake.calls
-    assert f"ended {ended}, which is no config to go back to" in out.message
+    assert f"ended {ended} before this apply, which is no config to go back to" in out.message
     assert "the stream is down" in out.message
     assert run.config_hash in fake.failed  # the config that failed is marked all the same
 
@@ -409,7 +438,7 @@ def test_a_previous_config_that_failed_its_own_probation_is_no_config_to_go_back
     run, clock, use
 ):
     gone = dataclasses.replace(
-        last_good(run), state="CANCELLED", raw_state="CANCELLED", config_hash="b" * 64
+        last_good(run), state="SUCCEEDED", raw_state="SUCCEEDED", config_hash="b" * 64
     )
     fake = Rolling([gone], start_states=("FAILED",), records={OLD_DIGEST: OLD_JOB})
     fake.failed["b" * 64] = b"{}"

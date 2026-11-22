@@ -644,31 +644,32 @@ def _rollback_target(
     adapter: Adapter, run: DesiredRun, stale: Sequence[RunInfo], last: Optional[RunInfo]
 ) -> Tuple[Optional[RunInfo], str]:
     """The run whose config a new config that fails its probation goes back to, and why none:
-    a config is good when its run was going when it was replaced (``stale``), or ended
-    cancelled (forge's stop or an operator's) or SUCCEEDED, and did not fail a probation of its
-    own. One whose last run failed, or was lost, is no config to go back to: it would start
-    again past its restart budget."""
+    a config is good when its run was going when this apply replaced it (``stale``: forge's own
+    stop or cancel during the release counts), or its last run ended SUCCEEDED, and it did not
+    fail a probation of its own. One whose last run failed, was lost, or was cancelled before
+    this apply is no config to go back to: a failed run would start again past its restart
+    budget, and an operator may have cancelled one because it wrote bad data."""
     replaced = [s for s in stale if s.config_hash != run.config_hash]
-    if replaced:
-        return replaced[0], ""
-    if last is None or last.config_hash == run.config_hash:
+    previous = replaced[0] if replaced else last
+    if previous is None or previous.config_hash == run.config_hash:
         return None, ""  # nothing came before it
-    older = _clean(last.config_hash)[:12] or "?"
-    if last.state not in (CANCELLED, SUCCEEDED):
+    older = _clean(previous.config_hash)[:12] or "?"
+    if not replaced and previous.state != SUCCEEDED:
         return None, (
-            f"the config before it ({older}, run {last.run_id}) ended "
-            f"{_clean(last.raw_state or last.state)}, which is no config to go back to"
+            f"the config before it ({older}, run {previous.run_id}) ended "
+            f"{_clean(previous.raw_state or previous.state)} before this apply, which is no "
+            "config to go back to"
         )
     try:
-        failed_before = adapter.failed_release(last.config_hash) is not None
+        failed_before = adapter.failed_release(previous.config_hash) is not None
     except Exception:  # noqa: BLE001 - a marker that cannot be read is no good news
         failed_before = True
     if failed_before:
         return None, (
-            f"the config before it ({older}, run {last.run_id}) failed its own probation, which "
-            "is no config to go back to"
+            f"the config before it ({older}, run {previous.run_id}) failed its own probation, "
+            "which is no config to go back to"
         )
-    return last, ""
+    return previous, ""
 
 
 def _after_start(

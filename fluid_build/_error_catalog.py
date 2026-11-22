@@ -384,8 +384,9 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     ),
     "apply_spark_no_known_good_config": (
         [
-            "The config this release replaced did not end cleanly (its last run failed or was "
-            + "lost), so it is no config to go back to, and the stream is down. Fix the "
+            "The config this release replaced did not end well (its last run failed, was "
+            + "cancelled before the apply, or was lost), so it is no config to go back to, "
+            + "and the stream is down. Fix the "
             + "contract and run fluid apply",
             "The failed run's outcome names its error; its logs are in the run's runtime",
         ],

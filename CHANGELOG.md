@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A released Spark stream that fails is rolled back to the last good config.** After `fluid
   apply` starts a stream's new config over a previous one (a running run it replaced, or one that
-  ended cancelled or SUCCEEDED), it watches the new run for
+  ended SUCCEEDED), it watches the new run for
   `FLUID_SPARK_RELEASE_PROBATION_SECONDS` (default 300, `0` keeps it at once, at most 3600): a run
   that fails in that time, or that its runtime retries (EMR Serverless and EMR on EKS do; the Glue
   job forge emits never retries), failed its probation. Forge then cancels it if it is still going
@@ -48,8 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   those records into that output a second time. The failed run is cancelled, the stream is down,
   and the apply fails with `apply_spark_rollback_unsafe`; applying the previous contract again is
   the deliberate way back, and it expects those records twice. A config is a config to go back
-  to only when its run was going when it was replaced, or ended cancelled or SUCCEEDED, and did
-  not fail a probation itself: a release over a config whose last run failed is watched, and when
+  to only when its run was going when it was replaced, or ended SUCCEEDED, and did
+  not fail a probation itself: a release over a config whose last run failed or was cancelled before the apply is watched, and when
   it fails the apply fails with `apply_spark_no_known_good_config` and says the stream is down.
   Every config that fails its probation is marked beside the build's job config
   (`releases/<hash16>/failed`; under `FLUID_SPARK_LOCAL_ROOT` on `runtime: local`), so no later
