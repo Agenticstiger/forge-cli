@@ -1153,10 +1153,10 @@ def test_the_note_on_unread_functions_does_not_offer_submit_helpers_for_the_stan
         (only,) = report.notes
         return only
 
-    mixed = note({"subprocess.run": 2, "acme_lib.emr_tasks.create_cluster": 1, "os.system": 1})
+    mixed = note({"subprocess.run": 2, "acme_lib.emr_tasks.start_cluster": 1, "os.system": 1})
     assert mixed == (
         "4 Python task(s) run a function that is not read here: subprocess.run (2), "
-        + "acme_lib.emr_tasks.create_cluster (1), os.system (1). Name one that submits Spark "
+        + "acme_lib.emr_tasks.start_cluster (1), os.system (1). Name one that submits Spark "
         + "work under `submit_helpers` in the conventions, with where its script is among its "
         + "arguments; subprocess.run, os.system are the standard library's, Airflow's or "
         + "PySpark's, which `submit_helpers` does not take: call it from a function of the DAG "

@@ -278,11 +278,11 @@ SAMPLE = {
         from teamx.dags.OneDomain.Clicks_Streaming_Dag.settings import STREAM_KWARGS
 
         dag = DAG("Clicks_Streaming_Dag", schedule=None, default_args={"owner": "retail"})
-        create_cluster = PythonOperator(task_id="create_cluster", python_callable=tasks.create_emr, dag=dag)
-        wait_for_cluster = PythonOperator(task_id="wait_for_cluster", python_callable=tasks.wait_for_completion, dag=dag)
+        start = PythonOperator(task_id="start_cluster", python_callable=tasks.start_cluster, dag=dag)
+        poll = PythonOperator(task_id="cluster_ready", python_callable=tasks.wait_until_ready, dag=dag)
         clicks_streaming = PythonOperator(task_id="clicks_streaming", python_callable=tasks.run_step, op_kwargs=STREAM_KWARGS, dag=dag)
-        terminate_cluster = PythonOperator(task_id="terminate_cluster", python_callable=tasks.terminate_emr, dag=dag)
-        create_cluster >> wait_for_cluster >> clicks_streaming >> terminate_cluster
+        stop = PythonOperator(task_id="stop_cluster", python_callable=tasks.stop_cluster, dag=dag)
+        start >> poll >> clicks_streaming >> stop
     """,
     "OneDomain/Clicks_Streaming_Dag/settings.py": """
         STREAM_KWARGS = {"additional_params": {"script_path": "s3://acme-code/jobs/clicks.py", "config_path": "s3://acme-conf/clicks.yaml"}}
@@ -310,7 +310,7 @@ def test_the_shape_of_a_python_task_estate_keeps_its_dags_tasks_and_dependencies
     airflow = _airflow(contracts)["retail.clicks"]
     assert airflow["dagId"] == "clicks_streaming_dag"
     (task,) = airflow["tasks"]
-    assert task["taskId"] == "clicks_streaming" and task["dependencies"] == ["wait_for_cluster"]
+    assert task["taskId"] == "clicks_streaming" and task["dependencies"] == ["cluster_ready"]
     assert task["params"]["python_callable"] == "acme_lib.emr_tasks.run_step"
     assert task["params"]["config"] == "s3://acme-conf/clicks.yaml"
     assert _mapped(report) == [
