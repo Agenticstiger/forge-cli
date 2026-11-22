@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import shutil
 import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Tuple
@@ -85,9 +86,10 @@ def _docs(skill: Path) -> Iterator[Path]:
             yield skill / rel
 
 
-def test_the_pack_ships_four_skills() -> None:
+def test_the_pack_ships_its_skills() -> None:
     """Guard the guard: a green run must not mean 'found no skills'."""
     assert _ids(SKILLS) == [
+        "adopting-existing-pipelines",
         "authoring-fluid-contracts",
         "composing-fluid-data-products",
         "deploying-fluid-contracts-safely",
@@ -311,3 +313,29 @@ def test_example_contracts_validate(contract: Path, cli) -> None:
     doc = yaml.safe_load(contract.read_text(encoding="utf-8"))
     assert doc["fluidVersion"] == FluidSchemaManager.latest_bundled_version()
     assert "email" not in doc["metadata"]["owner"], "an example must not invent an email"
+
+
+# ---------------------------------------------------------------------------
+# The conventions file the adopting skill shows is one the import reads
+# ---------------------------------------------------------------------------
+
+_JOB = """\
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+orders = spark.read.table("raw.orders")
+orders.write.mode("overwrite").saveAsTable("curated.orders")
+"""
+
+
+def test_the_conventions_example_is_read_by_the_import(tmp_path: Path, cli) -> None:
+    """``fluid import pyspark --conventions`` takes the example as written: a key it does not
+    know refuses the import, so the skill can only show keys forge reads."""
+    skill = next(s for s in SKILLS if s.name == "adopting-existing-pipelines")
+    shutil.copy(skill / "references" / "conventions.example.yaml", tmp_path / "conventions.yaml")
+    (tmp_path / "jobs").mkdir()
+    (tmp_path / "jobs" / "orders.py").write_text(_JOB, encoding="utf-8")
+    code, out = cli("import", "pyspark", "jobs", "--conventions", "conventions.yaml", "--dry-run")
+    assert code == 0, out
+    assert "curated.orders" in out
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["conventions.yaml", "jobs"]
