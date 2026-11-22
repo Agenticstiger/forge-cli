@@ -159,6 +159,11 @@ def _add_apply_options(g: argparse._ArgumentGroup) -> None:
         "--allow-data-loss", action="store_true", help="Pass --allow-data-loss to apply."
     )
     g.add_argument(
+        "--adopt-tables",
+        action="store_true",
+        help="Pass --adopt-tables to apply (take over the existing tables that match).",
+    )
+    g.add_argument(
         "--no-verify-digest",
         action="store_true",
         help="Pass --no-verify-plan-binding --no-verify-federation to apply.",

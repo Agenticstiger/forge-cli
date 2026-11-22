@@ -136,8 +136,31 @@ def test_plan_tofu_binds_the_adoption_and_applying_that_plan_runs_it(tofu, tmp_p
 
     assert _main("apply", "plan.json", "--yes") == 0
 
-    assert "the saved plan adopts sales.orders" in _out(capsys)
+    captured = capsys.readouterr()
+    assert "the saved plan adopts sales.orders" in " ".join(captured.out.split())
     assert tofu["apply"] == 1
+    # The run that applies the saved plan audits the take-over (the CLI logs it to stderr).
+    assert "table_adoption_accepted" in captured.err + captured.out
+
+
+def test_ship_passes_the_flag_to_its_apply_stage_only(tmp_path: Path):
+    """``fluid ship --adopt-tables`` reaches ``fluid apply`` (stage 7), never the plan of
+    stage 6, which runs without ``--tofu``; a flag only, as ``--yes`` is."""
+    from fluid_build.cli import _ship_stages as st
+    from fluid_build.cli import build_parser
+
+    parser = build_parser()
+    ws = st.Workspace(tmp_path)
+    on = st.resolve_options(
+        parser.parse_args(["ship", "c.fluid.yaml", "--adopt-tables"]), "c.fluid.yaml", {}
+    )
+    off = st.resolve_options(
+        parser.parse_args(["ship", "c.fluid.yaml"]), "c.fluid.yaml", {"ADOPT_TABLES": "true"}
+    )
+
+    assert "--adopt-tables" in (st.build_stage(7, on, ws).argv or [])
+    assert "--adopt-tables" not in (st.build_stage(6, on, ws).argv or [])
+    assert "--adopt-tables" not in (st.build_stage(7, off, ws).argv or [])
 
 
 def test_an_edited_adoption_record_is_refused_as_plan_tamper(tofu, tmp_path, capsys):
