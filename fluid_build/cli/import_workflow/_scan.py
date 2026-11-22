@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from ._airflow_dags import Dag, Submit, Task, read_dags
-from ._callables import MAX_LENT_STEPS_PER_SCAN, MAX_VISITS_PER_SCAN, FollowBudget
+from ._callables import FollowBudget
 from ._catalogs import module_settings
 from ._conventions import Conventions, Driver
 from ._drivers import Lists, argument_value, driver_for, job_file, segments
@@ -275,10 +275,10 @@ def scan_dags(
     if follow.cut_files:
         scan.notes.append(
             "stopped following the functions Python tasks run once the DAG files had spent "
-            f"{MAX_VISITS_PER_SCAN:,} visits of their bodies or {MAX_LENT_STEPS_PER_SCAN:,} "
-            "steps of folding them between them (the scan asks for too much work): what the "
-            f"tasks of {follow.cut_files} DAG file(s) submit is not all read; scan fewer DAG "
-            "files at a time to read them all"
+            f"{follow.allowed_visits:,} visits of their bodies or {follow.allowed_steps:,} steps "
+            "of folding them between them, the scan's share and each Python task's (the scan "
+            f"asks for too much work): what the tasks of {follow.cut_files} DAG file(s) submit "
+            "is not all read; scan fewer DAG files at a time to read them all"
         )
     for rel in sorted(tired):
         # the path a person can open, as every other note of the scan names its file

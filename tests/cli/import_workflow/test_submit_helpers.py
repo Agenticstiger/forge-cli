@@ -1142,9 +1142,41 @@ def test_what_one_file_may_spend_in_other_modules_is_bounded_and_said(tmp_path, 
     assert any("stopped following the functions its Python tasks run" in n for n in scan.notes)
 
 
+def test_the_note_on_unread_functions_does_not_offer_submit_helpers_for_the_standard_library():
+    from fluid_build.cli.import_workflow._pipeline import _report_unread_callables
+    from fluid_build.cli.import_workflow._scan import DagScan
+    from fluid_build.cli.import_workflow.registry import ImportReport
+
+    def note(unread: Dict[str, int]) -> str:
+        report = ImportReport()
+        _report_unread_callables(DagScan(root=Path("."), unread_callables=unread), report)
+        (only,) = report.notes
+        return only
+
+    mixed = note({"subprocess.run": 2, "acme_lib.emr_tasks.start_cluster": 1, "os.system": 1})
+    assert mixed == (
+        "4 Python task(s) run a function that is not read here: subprocess.run (2), "
+        + "acme_lib.emr_tasks.start_cluster (1), os.system (1). Name one that submits Spark "
+        + "work under `submit_helpers` in the conventions, with where its script is among its "
+        + "arguments; subprocess.run, os.system are the standard library's, Airflow's or "
+        + "PySpark's, which `submit_helpers` does not take: call it from a function of the DAG "
+        + "files, and what that function runs is read"
+    )
+    library = note({"subprocess.run": 1})
+    assert "Name one that submits" not in library
+    assert library.endswith(
+        "subprocess.run (1). subprocess.run is the standard library's, Airflow's or PySpark's, "
+        + "which `submit_helpers` does not take: call it from a function of the DAG files, and "
+        + "what that function runs is read"
+    )
+    # a function of the project named like a module of the standard library is the project's
+    assert "Name one that submits" in note({"queue": 1})
+
+
 def test_the_dag_files_of_a_scan_share_one_follow_budget_and_it_is_said_once(tmp_path, monkeypatch):
     # each file's tasks fit the file's own budget; thirty files' do not fit the scan's
     monkeypatch.setattr(_callables, "MAX_VISITS_PER_SCAN", 2_000)
+    monkeypatch.setattr(_callables, "VISITS_PER_TASK", 0)
     spent = [0]
     charge = Follower._charge
 
@@ -1163,6 +1195,33 @@ def test_the_dag_files_of_a_scan_share_one_follow_budget_and_it_is_said_once(tmp
     (note,) = [n for n in scan.notes if "scan fewer DAG files at a time" in n]
     assert f"what the tasks of {len(cut)} DAG file(s) submit is not all read" in note
     assert not any("stopped following the functions its Python tasks run" in n for n in scan.notes)
+
+
+def test_each_python_task_followed_brings_its_share_of_the_scans_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr(_callables, "MAX_VISITS_PER_SCAN", 2_000)
+    monkeypatch.setattr(_callables, "VISITS_PER_TASK", 100)
+    spent = [0]
+    charge = Follower._charge
+
+    def counted(self: Follower, visits: int) -> None:
+        spent[0] += visits
+        charge(self, visits)
+
+    monkeypatch.setattr(Follower, "_charge", counted)
+    # many light tasks: each takes less than its share, and all are read
+    _shared_helper_project(tmp_path / "light", files=30, per_file=10)
+    scan = scan_dags(tmp_path / "light", Conventions())
+    assert all(t.submits for d in scan.dags for t in d.tasks)
+    assert not [n for n in scan.notes if "scan fewer DAG files at a time" in n]
+    # one-task files that each run a heavy function: they spend no more than their shares
+    heavy = "".join(f"    print('step {i}')\n" for i in range(2_000))
+    function = "import subprocess\n\ndef submit(script, **kwargs):\n" + heavy
+    _same_task_in_each(tmp_path / "heavy", 30, function)
+    spent[0] = 0
+    scan = scan_dags(tmp_path / "heavy", Conventions())
+    assert spent[0] < 2_000 + 30 * 100 + 10
+    (note,) = [n for n in scan.notes if "scan fewer DAG files at a time" in n]
+    assert "had spent 5,000 visits of their bodies" in note
 
 
 _EMR_SUBMIT = """
@@ -1202,6 +1261,31 @@ def test_a_function_the_tasks_of_many_files_run_alike_is_read_once(tmp_path, mon
     scripts = [s.script for d in scan.dags for t in d.tasks for s in t.submits]
     assert scripts == ["s3://jobs/same.py"] * 3
     assert reads == ["submit"]
+
+
+def test_a_dag_file_and_a_module_shown_by_the_same_path_are_kept_apart(tmp_path, monkeypatch):
+    # run from above the scan, the DAG file dags/x.py is shown as `dags/x.py`, which is also the
+    # path the scan knows dags/dags/x.py by: what one's function submitted is not the other's
+    head = "import subprocess\nfrom airflow import DAG\nfrom airflow.operators.python import PythonOperator\n"
+    _write(
+        tmp_path,
+        {
+            "dags/x.py": head
+            + "def f(script):\n    subprocess.run(['spark-submit', 's3://a/' + script])\n"
+            + "with DAG('a', schedule=None) as dag:\n"
+            + "    PythonOperator(task_id='t', python_callable=f, op_args=['one.py'])\n",
+            "dags/dags/x.py": head
+            + "def f(script):\n    subprocess.run(['spark-submit', 's3://b/' + script])\n",
+            "dags/y.py": head
+            + "from dags.x import f\n"
+            + "with DAG('b', schedule=None) as dag:\n"
+            + "    PythonOperator(task_id='t', python_callable=f, op_args=['one.py'])\n",
+        },
+    )
+    monkeypatch.chdir(tmp_path)
+    scan = scan_dags(Path("dags"), Conventions())
+    scripts = {d.dag_id: [s.script for t in d.tasks for s in t.submits] for d in scan.dags}
+    assert scripts == {"a": ["s3://a/one.py"], "b": ["s3://b/one.py"]}
 
 
 def test_what_a_file_that_ran_out_read_of_a_function_is_not_handed_to_the_next(
@@ -1259,6 +1343,37 @@ PythonOperator(task_id="heavy", python_callable=heavy, dag=dag)
     # about 600 visits' worth of command line, with 300 to spend in the file
     assert by_id["heavy"].submits == []
     assert any("stopped following the functions its Python tasks run" in n for n in found.notes)
+
+
+def test_an_emr_step_a_function_builds_is_that_functions_step():
+    found = tasks(
+        _dag(
+            """
+            import os
+
+            def _steps(script, args):
+                return [{"Name": "run", "HadoopJarStep": {"Jar": "command-runner.jar", "Args": ["spark-submit", "--deploy-mode", "cluster", script, *args]}}]
+
+            def submit(script, args=(), **kwargs):
+                client = boto3.client("emr")
+                client.add_job_flow_steps(JobFlowId="j", Steps=_steps(script, args))
+
+            def unread(script, **kwargs):
+                boto3.client("emr").add_job_flow_steps(JobFlowId="j", Steps=tasks.build_steps(script))
+                os.system("spark-submit s3://jobs/c.py")
+
+            PythonOperator(task_id="built", python_callable=submit, op_kwargs={"script": "s3://jobs/a.py", "args": ["--day", "1"]}, dag=dag)
+            PythonOperator(task_id="unread", python_callable=unread, op_kwargs={"script": "s3://jobs/b.py"}, dag=dag)
+            """
+        )
+    )
+    # the step the function builds is the step, submitted to EMR: no step of unknown script
+    assert submits(found["built"]) == [("emr-step", "s3://jobs/a.py", ("--day", "1"))]
+    # a step a function that is not read builds stays one whose script is not known, and a
+    # command run after the call is not taken for it
+    step, command = found["unread"].submits
+    assert step.runtime == "emr-step" and step.script is None
+    assert (command.runtime, command.script) == ("spark-submit", "s3://jobs/c.py")
 
 
 def test_a_helper_never_takes_a_name_of_the_standard_library():

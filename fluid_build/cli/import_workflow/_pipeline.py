@@ -18,7 +18,7 @@ from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ._catalogs import CatalogKinds
 from ._conventions import Conventions, load_conventions
-from ._fold import missing_value
+from ._fold import NOT_THE_PROJECT, missing_value
 from ._proposal import (
     SPLITS,
     ProposalTooLarge,
@@ -553,8 +553,10 @@ _WAITING_HINT = {
 
 
 def _report_unread_callables(dag_scan: DagScan, report: ImportReport) -> None:
-    """The note on the functions Python tasks run that are not read: the ones that submit Spark
-    work can be described in the conventions."""
+    """The note on the functions Python tasks run that are not read: the project's that submit
+    Spark work can be described in the conventions; one of the standard library, Airflow or
+    PySpark cannot (``submit_helpers`` never takes such a name), and is read when a function of
+    the DAG files calls it."""
     unread = dag_scan.unread_callables
     if not unread:
         return
@@ -563,12 +565,33 @@ def _report_unread_callables(dag_scan: DagScan, report: ImportReport) -> None:
         f"{safe_text(name, 80)} ({count})" for name, count in ranked[:MAX_UNREAD_CALLABLES]
     )
     more = len(ranked) - MAX_UNREAD_CALLABLES
+    library = [name for name, _ in ranked if _not_the_projects(name)]
+    advice = []
+    if len(library) < len(ranked):
+        advice.append(
+            "Name one that submits Spark work under `submit_helpers` in the conventions, with "
+            "where its script is among its arguments"
+        )
+    if library:
+        named = ", ".join(safe_text(name, 80) for name in library[:MAX_UNREAD_CALLABLES])
+        advice.append(
+            f"{named} {'is' if len(library) == 1 else 'are'} the standard library's, Airflow's "
+            "or PySpark's, which `submit_helpers` does not take: call it from a function of the "
+            "DAG files, and what that function runs is read"
+        )
     report.notes.append(
         f"{sum(unread.values())} Python task(s) run a function that is not read here: {shown}"
         + (f", and {more} more" if more > 0 else "")
-        + ". Name one that submits Spark work under `submit_helpers` in the conventions, with "
-        "where its script is among its arguments"
+        + ". "
+        + "; ".join(advice)
     )
+
+
+def _not_the_projects(name: str) -> bool:
+    """Whether the function ``name`` (as a task names it) is imported from the standard library,
+    Airflow or PySpark."""
+    head, dot, _ = name.partition(".")
+    return bool(dot) and head in NOT_THE_PROJECT
 
 
 def _waiting_for(submit: Any) -> List[Tuple[str, str]]:

@@ -33,8 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `d.get(key, default)` and a function's parameters from its caller, and a function whose name a
   task takes later (`extract = PythonOperator(..., python_callable=extract)`) is the function
   until then. The DAG files of one scan go through at most 500,000 calls and lists of the bodies
-  they follow between them (200,000 for one file), and a function the tasks of any of them run
-  with the same arguments is read once.
+  they follow between them, plus 250 for each Python task followed (200,000 for one file), and a
+  function the tasks of any of them run with the same arguments is read once.
 
 - **The Airflow DAGs forge generates alert on failure, retry, success and a missed SLA, through
   Airflow's own notifiers, from routes the contract declares (schema 0.7.7 `alerts`).** A route
@@ -93,6 +93,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written for them keeps lowercase ids.
 
 ### Fixed
+
+- **`fluid import airflow|pyspark` keeps the DAG of an Airflow id with capitals.** Airflow takes
+  `Nightly_Orders` as a `dag_id`; the contract's `dagId` and `taskId` take only lower case letters,
+  digits, `_`, `.` and `-`, so such a DAG was left off the builds it runs (its schedule, its tasks
+  and their params) and such a task was not recorded. Each is now recorded under the importer's
+  identifier of its id (`nightly_orders`), made unique among the import's DAG ids (a task's among
+  its DAG's task ids) with a number after it, in file order; an id that fits is never changed, and
+  a task's dependencies name the recorded ids, as do the products `--split-by dag` and `task` make.
+  Used defaults lists each id recorded under another,
+  with the Airflow id it stands for: the running DAG keeps its own id.
 
 - **A conventions file away from the repositories it describes says what its paths name.** A
   path in the file is relative to the file's own folder, so a file moved beside or away from the

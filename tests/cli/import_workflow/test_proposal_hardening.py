@@ -307,7 +307,9 @@ def test_a_read_that_gets_the_products_own_id_is_not_listed_as_its_dependency(
     assert any("own id" in n for n in report.notes)
 
 
-def test_a_dag_id_that_does_not_match_is_reported_once_for_all_its_jobs(tmp_path, monkeypatch):
+def test_a_dag_id_that_does_not_match_is_recorded_and_said_once_for_all_its_jobs(
+    tmp_path, monkeypatch
+):
     monkeypatch.chdir(tmp_path)
     write(
         tmp_path,
@@ -331,8 +333,16 @@ def test_a_dag_id_that_does_not_match_is_reported_once_for_all_its_jobs(tmp_path
     )
     contracts, report = propose(tmp_path, dags=str(tmp_path / "dags"))
     assert len(contracts) == 2
-    lines = [n for n in report.unsupported if "DAG id" in n and "does not match" in n]
-    assert len(lines) == 1 and lines[0].startswith("dags/bad.py:")
+    recorded = [c["builds"][0]["execution"]["orchestration"]["airflow"] for c in contracts]
+    assert {a["dagId"] for a in recorded} == {"bad-dag-id"}  # both builds keep the DAG
+    assert sorted(t["taskId"] for a in recorded for t in a["tasks"]) == ["bad-task", "bad-task-two"]
+    lines = [n for n in report.required_defaults if "is recorded as dagId" in n]
+    assert lines == [
+        "DAG 'Bad DAG Id' (dags/bad.py:4) is recorded as dagId 'bad-dag-id': a FLUID dagId or "
+        + "taskId has only lower case letters, digits, '_', '.' and '-'. The running DAG keeps "
+        + "its own id"
+    ]
+    assert not [n for n in report.unsupported if "DAG id" in n or "task id" in n]
 
 
 # ── a script path in a DAG file does not get to look at the file system ──
