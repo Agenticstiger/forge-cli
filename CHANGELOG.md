@@ -59,11 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   3's other subdirectories of `--out`, `custom-scaffold/` is cleared on every run, whatever
   `--emit` names, so a scaffold an earlier run wrote never outlives a run without the key (it would
   not be in that run's MANIFEST); one that holds `fluid-scaffold.yaml` (a bundle, with `--out` at
-  the contract's directory) is refused rather than cleared. A refused run (this one, an unknown
-  `--emit` key, a change-request build) changes nothing in `--out`: every check runs before the
-  first output is removed. `--out`'s help says which subdirectories stage 3 owns. Git bundles
-  keep the engine's own credential model: a credential goes only to a host the operator lists in
-  `FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS`, and a contract's `secret_ref` may only name a
+  the contract's directory) is refused rather than cleared. That bundle, an unknown `--emit` key
+  and a change-request build refuse the run before anything in `--out` changes; the engine's own
+  refusals still come after the clear. `--out`'s help says which subdirectories stage 3 owns. Git
+  bundles keep the engine's own credential model: a credential goes only to a host the operator
+  lists in `FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS`, and a contract's `secret_ref` may only name a
   `FLUID_SCAFFOLD_` variable; the engine's operator settings (`FLUID_CUSTOM_SCAFFOLD_*`) cannot
   come from a project `.env` file. `fluid generate ci` installs the `custom-scaffold` extra in the
   pipeline when the contract declares the block, so a pipeline that names the key in
@@ -72,25 +72,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GENERATE_EMIT` between its pull or merge request builds and its default-branch builds and runs
   stage 3 on both, so naming the key for releases would run a change's bundle templates before
   anyone merged it, often with the job's credentials. On a build its CI marks as a change request,
-  `fluid ship` leaves `custom-scaffold` out of stage 3's `--emit` and `--require-artifacts` and
-  says so in the stage's notes (stage 3 is skipped when the key was all it had to do); a
-  default-branch build keeps it. Every generated system runs `fluid ship`, so this covers all
-  seven in both install modes. `fluid generate artifacts --emit custom-scaffold` refuses such a
-  build itself (`custom_scaffold_change_request`) before anything in `--out` is removed or
-  written and before the engine is imported, unless `--allow-scaffold-on-change-request` is
-  passed; no variable or `.env` file stands in for the flag. The markers are each CI system's own
-  variables: Jenkins `CHANGE_ID` (and `ghprbPullId`, `gitlabMergeRequestId`), GitHub Actions
-  `GITHUB_EVENT_NAME` `pull_request`, `pull_request_target`, `pull_request_review` or
-  `pull_request_review_comment`, GitLab `CI_MERGE_REQUEST_IID` / `CI_MERGE_REQUEST_ID` or
-  `CI_PIPELINE_SOURCE` `merge_request_event` (and the external pull request variables), Azure
-  Pipelines `BUILD_REASON` `PullRequest` (and `SYSTEM_PULLREQUEST_PULLREQUESTID` /
-  `_PULLREQUESTNUMBER`), Bitbucket `BITBUCKET_PR_ID`, CircleCI `CIRCLE_PULL_REQUEST` /
-  `CIRCLE_PR_NUMBER` / `CI_PULL_REQUEST`. Tekton sets none, so the generated Tekton Pipelines and
-  Task take a `FLUID_CHANGE_REQUEST` parameter that defaults to `true`: every run counts as a
-  change request unless the Triggers binding of a default-branch run passes `false`, so a binding
-  that forgets it leaves the scaffold out. Any other pipeline may set `FLUID_CHANGE_REQUEST` too:
-  any value but blank, `0`, `false`, `no` or `off` marks the build, and only its name is printed.
-  A marker only ever marks a build: `FLUID_CHANGE_REQUEST=false` never clears a CI system's own.
+  `fluid ship` leaves `custom-scaffold` out of stage 3's `--emit` and `--require-artifacts` and says
+  so in the stage's notes (stage 3 is skipped when the key was all it had to do); a default-branch
+  build keeps it. A run that would seal a release (`--release-dir`) or publish while
+  `--require-artifacts` names `custom-scaffold` is refused instead (exit 2), so a build marked by
+  mistake never ships without it. Every generated system runs `fluid ship`, so this covers all seven
+  in both install modes. `fluid generate artifacts --emit custom-scaffold` refuses such a build
+  itself (`custom_scaffold_change_request`) before anything in `--out` is removed or written and
+  before the engine is imported, unless `--allow-scaffold-on-change-request` is passed; no variable
+  or `.env` file stands in for the flag. The markers are each CI system's own variables: Jenkins
+  `CHANGE_ID` (and `ghprbPullId`, `gitlabMergeRequestId`), GitHub Actions `GITHUB_EVENT_NAME`
+  `pull_request`, `pull_request_target`, `pull_request_review` or `pull_request_review_comment`,
+  GitLab `CI_MERGE_REQUEST_IID` / `CI_MERGE_REQUEST_ID` or `CI_PIPELINE_SOURCE`
+  `merge_request_event` (and the external pull request variables), Azure Pipelines `BUILD_REASON`
+  `PullRequest` (and `SYSTEM_PULLREQUEST_PULLREQUESTID` / `_PULLREQUESTNUMBER`), Bitbucket
+  `BITBUCKET_PR_ID`, CircleCI `CIRCLE_PULL_REQUEST` / `CIRCLE_PR_NUMBER` / `CI_PULL_REQUEST`. Tekton
+  sets none, so the generated Tekton Pipelines and Task take a `FLUID_CHANGE_REQUEST` parameter that
+  defaults to `true`: every run counts as a change request unless a default-branch run passes
+  `false` (the header's `tkn` example shows it), so a run that forgets it leaves the scaffold out.
+  Any other pipeline may set `FLUID_CHANGE_REQUEST` too, never a project `.env`: any value but
+  blank, `0`, `false`, `no` or `off` marks the build, and only its name is printed. A marker only
+  ever marks a build: `FLUID_CHANGE_REQUEST=false` never clears a CI system's own.
 - **`fluid generate artifacts --emit pyspark-schema` puts the PySpark schema modules in the
   MANIFEST.** It writes `pyspark-schema/<port>_schema.py`, the module `fluid generate
   pyspark-schema` writes, byte for byte (same loader, renderer and writer), for each output port

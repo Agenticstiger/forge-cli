@@ -1333,7 +1333,8 @@ def run_fanout(
             # removed or written, so an earlier run's artifacts and MANIFEST stay as they
             # were (emit() checks again).
             custom_scaffold_artifacts.refuse_on_change_request(_load_contract(resolved_contract))
-        # Every check that refuses the run is behind us: from here on, out_dir changes.
+        # The checks that need no engine are behind us: from here on, out_dir changes (a
+        # refusal by the engine itself, or a failure while it runs, comes after the clear).
         _clear_outputs(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         run = _Inputs(
