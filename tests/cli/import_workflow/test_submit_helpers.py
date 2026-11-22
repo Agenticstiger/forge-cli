@@ -1198,6 +1198,33 @@ PythonOperator(task_id="heavy", python_callable=heavy, dag=dag)
     assert any("stopped following the functions its Python tasks run" in n for n in found.notes)
 
 
+def test_a_helper_never_takes_a_name_of_the_standard_library():
+    found = tasks(
+        _dag(
+            """
+            import os
+            import subprocess
+
+            def go(**kwargs):
+                subprocess.run(["spark-submit", "s3://jobs/run.py"])
+                os.system("spark-submit s3://jobs/system.py")
+
+            PythonOperator(task_id="t", python_callable=go, dag=dag)
+            PythonOperator(task_id="s", python_callable=os.system, op_args=["s3://jobs/s.py"], dag=dag)
+            PythonOperator(task_id="h", python_callable=tasks.run, op_kwargs={"script": "s3://jobs/h.py"}, dag=dag)
+            """
+        ),
+        {"run": {"script": "script"}, "system": {"script": 0}},
+    )
+    # the commands are read as the commands they are, not as the helpers `run` and `system`
+    assert sorted(s.script for s in found["t"].submits) == [
+        "s3://jobs/run.py",
+        "s3://jobs/system.py",
+    ]
+    assert found["s"].submits == []
+    assert [s.script for s in found["h"].submits] == ["s3://jobs/h.py"]
+
+
 def test_the_note_on_a_module_that_ran_out_names_the_file_a_person_opens(tmp_path, monkeypatch):
     from fluid_build.cli.import_workflow import _fold
 

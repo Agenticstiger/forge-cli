@@ -61,6 +61,7 @@ from ._fold import (
     MAX_STEPS_PER_MODULE,
     MAX_STRING,
     MAX_STRING_WORK,
+    NOT_THE_PROJECT,
     FoldedDict,
     FoldedTuple,
     Folder,
@@ -349,7 +350,13 @@ class Follower:
     # ── what is called ──────────────────────────────────────────────
 
     def _helper(self, qualified: Optional[str]) -> Optional[Tuple[str, SubmitHelper]]:
+        """The conventions' helper ``qualified`` names, by its last dotted parts: never a name
+        imported from the standard library, Airflow or PySpark (``subprocess.run`` is not a
+        helper named ``run``)."""
         if not qualified or not self._by_last:
+            return None
+        head, dot, _ = qualified.partition(".")
+        if dot and head in NOT_THE_PROJECT:
             return None
         for name, helper in self._by_last.get(qualified.rsplit(".", 1)[-1], ()):
             if qualified == name or qualified.endswith("." + name):
@@ -768,6 +775,9 @@ class Follower:
         """What one call of a followed body submits: a helper the conventions name, an EMR call,
         a command it runs, or what the function it calls submits."""
         qualified = qualified_name(node.func, module.imports)
+        if qualified in _RUNNERS:
+            command = node.args[0] if node.args else _keyword(node, "args", "command", "cmd")
+            return [] if command is None else self._command(command, folder, line)
         found = self._helper(qualified)
         if found is not None:
             target = _Target(found[0], helper=found[1], helper_name=found[0])
@@ -777,9 +787,6 @@ class Follower:
             emr = self._emr_call(node.func.attr, node, folder, line)
             if emr is not None:
                 return emr
-        if qualified in _RUNNERS:
-            command = node.args[0] if node.args else _keyword(node, "args", "command", "cmd")
-            return [] if command is None else self._command(command, folder, line)
         if depth >= MAX_DEPTH:
             return []
         target = self._target(node.func, module, folder)

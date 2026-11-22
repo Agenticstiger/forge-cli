@@ -77,7 +77,7 @@ MAX_ROOT_NAMES = 12
 MAX_NAME_PARTS = 24
 #: Names a dotted name starting with which is never a module of the scanned project: the standard
 #: library's and the frameworks the scanned code runs on.
-_NOT_THE_PROJECT = frozenset(sys.stdlib_module_names) | {"airflow", "pyspark"}
+NOT_THE_PROJECT = frozenset(sys.stdlib_module_names) | {"airflow", "pyspark"}
 #: Deepest expression :meth:`Folder.fold` follows, and the longest string it builds.
 MAX_FOLD_DEPTH = 40
 MAX_STRING = 4096
@@ -1210,7 +1210,7 @@ class ModuleIndex:
         A name that fits neither is not guessed at (``teamx.weekly.settings`` from
         ``nightly/dag.py`` of a scan of a directory named otherwise), nor is one of more than
         :data:`MAX_NAME_PARTS` parts."""
-        if len(parts) > MAX_NAME_PARTS or parts[0] in _NOT_THE_PROJECT:
+        if len(parts) > MAX_NAME_PARTS or parts[0] in NOT_THE_PROJECT:
             return None
         return self._in_own_package(parts, from_rel) or self._under_the_root_names(parts)
 
