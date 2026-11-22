@@ -38,10 +38,10 @@ def _refusal(
     return None
 
 
-def _lint(connection: Dict[str, Any]) -> Any:
+def _lint(connection: Dict[str, Any], environ: Optional[Dict[str, str]] = None) -> Any:
     sent = {**connection, "secretRef": "env://PG"}  # pragma: allowlist secret
     contract = {"builds": [{"properties": {"source": {"connection": sent}}}]}
-    (finding,) = lint_secret_refs(contract, environ={})
+    (finding,) = lint_secret_refs(contract, environ=environ or {})
     return finding
 
 
@@ -57,7 +57,7 @@ QUERY_HOSTS = [
     {"uri": "postgresql://localhost/db?service=prod"},
     {"connection_string": f"mongodb://localhost:27017/db?proxyHost={ELSEWHERE}"},
     {"uri": f"mssql+pyodbc://localhost/db?odbc_connect=DRIVER%3Dx%3BSERVER%3D{ELSEWHERE}"},
-    {"uri": f"mysql+pymysql://u@localhost/db?unix_socket=/tmp/{ELSEWHERE}.sock"},
+    {"uri": f"mysql+pymysql://u@localhost/db?unix_socket=//{ELSEWHERE}/mysql"},
     {"uri": f"snowflake://u@{REMOTE}/db?account={ELSEWHERE}"},
     {"sqlalchemy_url": f"postgresql+psycopg2://u@localhost/db?host={ELSEWHERE}"},
     {"host": "localhost", "jdbc_url_params": f"ssl=true&host={ELSEWHERE}"},

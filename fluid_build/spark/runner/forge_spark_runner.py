@@ -930,7 +930,7 @@ def topic_partitions(spark, config: dict) -> list | None:
         finally:
             consumer.close()
     except Exception as exc:  # noqa: BLE001 - Py4J's error: logged, the seed stays as read
-        log("dead_letters_partitions_unknown", error=type(exc).__name__)
+        log("topic_partitions_unknown", error=type(exc).__name__)
         return None
 
 
@@ -1049,14 +1049,15 @@ def stop_between_batches(queries, sleep=time.sleep) -> dict:
     return last
 
 
-def checkpoint_topics(spark, checkpoint: str) -> set | None:
-    """The topics the newest batch in ``checkpoint``'s offset log read; None for a new
-    checkpoint, or an entry this runner cannot read (Spark has the last word on it)."""
+def checkpoint_offsets(spark, checkpoint: str) -> dict | None:
+    """The offsets the newest batch in ``checkpoint``'s offset log read
+    (``{topic: {partition: offset}}``); None for a new checkpoint, or an entry this runner cannot
+    read (Spark has the last word on it)."""
     batches = [int(n) for n in _names(spark, f"{checkpoint}offsets") if n.isdigit()]
     if not batches:
         return None
     found = source_offsets(_read_small(spark, f"{checkpoint}offsets/{max(batches)}"), 2)
-    return set(json.loads(found)) if found else None
+    return json.loads(found) if found else None
 
 
 def check_checkpoint_fits(spark, config: dict) -> None:
@@ -1066,17 +1067,37 @@ def check_checkpoint_fits(spark, config: dict) -> None:
 
     fluid apply refuses a new source on the old checkpoint before it stops the run reading
     it, from the runs' history; this check also covers a checkpoint no known run of the build
-    used (a prefix copied from another stream, a new EMR cluster with no step history).
+    used (a prefix copied from another stream, a new EMR cluster with no step history). It
+    also refuses a checkpoint that names partitions the topic no longer has (the topic was
+    deleted and made again with fewer). The cluster is not in the offsets: the history check
+    is what refuses a new cluster on the old checkpoint.
 
     Raises:
-        JobConfigError: a checkpoint holds another topic's position."""
+        JobConfigError: a checkpoint holds another topic's position, or partitions the topic
+            no longer has."""
     topic = config["source"]["topic"]
     places = [config["checkpoint"]]
     if config.get("deadLetter"):
         places.append(config["deadLetter"]["checkpoint"])
+    partitions = None  # the topic's, read once, when a checkpoint names any
     for checkpoint in places:
-        topics = checkpoint_topics(spark, checkpoint)
-        if topics is not None and topics != {topic}:
+        offsets = checkpoint_offsets(spark, checkpoint)
+        if offsets is None:
+            continue
+        topics = set(offsets)
+        if topics == {topic}:
+            if partitions is None:
+                partitions = topic_partitions(spark, config) or []
+            gone = sorted(int(p) for p in offsets[topic] if partitions and int(p) not in partitions)
+            if gone:
+                raise JobConfigError(
+                    f"the checkpoint at {checkpoint} holds offsets of partition(s) "
+                    f"{', '.join(map(str, gone))} of topic {topic}, which it no longer has (the "
+                    "topic was made again?); nothing was read. Set properties.stream.checkpoint "
+                    "to a new prefix: the job then starts from properties.stream.startingOffsets"
+                )
+            continue
+        if topics != {topic}:
             raise JobConfigError(
                 f"the checkpoint at {checkpoint} holds the position of topic "
                 f"{', '.join(sorted(topics))}, and this job reads {topic}; nothing was read. "
@@ -1186,9 +1207,11 @@ def _nfc(value):
 # value is null goes to the dead letters (``sql.check`` says why), and the rest replace
 # the partitions they hold. While the function runs, PySpark's writes are refused and
 # spark.sql runs reads only (WriteGuard); a commit to the output or its dead letters that
-# the runner did not make fails the run (table_marker). Code in the same process can
-# reach the JVM itself, so these stop a write the package makes through PySpark and catch
-# one it makes around it; the job's role is what keeps it from other tables.
+# the runner did not make fails the run, checked before the runner writes and again after
+# (table_marker). Code in the same process can reach the JVM itself, or start a thread that
+# outlives the call, so the guard refuses the PySpark calls it sees and the checks detect a
+# commit made around it, up to the last check; neither prevents one. The job's role is what
+# keeps a package from other tables.
 
 #: Where fluid apply puts a package beside the job config (``names.PACKAGE_DIR`` and
 #: ``names.PACKAGE_FILE``): a ``.zip`` name, as PySpark puts only a ``.zip`` on the path.
@@ -1523,6 +1546,8 @@ _WRITE_CALLS = (
     ("pyspark.sql.catalog", "Catalog", ("createTable", "createExternalTable", "recoverPartitions")),
     ("pyspark.context", "SparkContext", ("addFile", "addPyFile", "addArchive", "addJar")),
     ("pyspark.sql.session", "SparkSession", ("addArtifact", "addArtifacts")),
+    # The session's settings: substitution back on, a catalog the runner's write would use.
+    ("pyspark.sql.conf", "RuntimeConfig", ("set", "unset")),
 )
 
 
@@ -1598,7 +1623,6 @@ _SQL_READS = frozenset(
         "DESC",
         "EXPLAIN",
         "SET",
-        "RESET",
         "USE",
         "CACHE",
         "UNCACHE",
@@ -1610,6 +1634,9 @@ _SQL_READS = frozenset(
 #: A read with a prefix (``WITH ... AS (...)``, ``FROM t``, a parenthesis) that a write can
 #: follow, as in ``WITH a AS (...) INSERT INTO ...``: refused when one does, at the top level.
 _SQL_PREFIXES = frozenset({"WITH", "FROM", "("})
+#: The words after ``SET`` that make it a statement that sets a value (``SET TIME ZONE x``,
+#: ``SET CATALOG x``, ``SET VAR x``), as ``SET k = v`` does.
+_SET_FORMS = frozenset({"TIME", "CATALOG", "VAR", "VARIABLE"})
 _SQL_PREFIXED_WRITES = frozenset({"INSERT", "MERGE", "UPDATE", "DELETE"})
 
 
@@ -1620,6 +1647,8 @@ def sql_write(text) -> str | None:
     not start as a read is refused, so a verb nobody listed is refused too."""
     if not isinstance(text, str):
         return None  # spark.sql refuses it itself
+    if "${" in text:  # what spark.sql would put there is not what the runner read
+        return "a ${...} variable"
     try:
         tokens = _sql_tokens(text)
     except ValueError:
@@ -1627,6 +1656,10 @@ def sql_write(text) -> str | None:
     if not tokens:
         return "no statement"
     head = tokens[0]
+    # A setting changed, not read: SET k=v, SET TIME ZONE x, SET CATALOG x, SET VAR[IABLE] x.
+    # SET, SET k and SET -v read (RESET is refused too).
+    if head == "SET" and ("=" in text or (len(tokens) > 1 and tokens[1] in _SET_FORMS)):
+        return "SET"
     if head in _SQL_READS:
         return None
     if head == "CREATE":
@@ -1926,10 +1959,10 @@ def _reasons(failures: dict) -> str:
 
 def write_package_dead_letters(
     spark, checked, table: str, columns, run_id: str, sha: str, stamps: dict | None = None
-) -> None:
+) -> bool:
     """Append the rows the checks refused, once per run: a re-attempt of the run finds its
     own snapshot, which carries the run's id, as a stream's dead letters keep their batch. The
-    commit carries the run's ``stamps`` too."""
+    commit carries the run's ``stamps`` too. Whether it committed."""
     from pyspark.sql.functions import col, current_timestamp, lit, struct, to_json
 
     done = (
@@ -1939,7 +1972,7 @@ def write_package_dead_letters(
         .collect()
     )
     if done:
-        return
+        return False
     rows = checked.where(f"`{ERROR_COLUMN}` IS NOT NULL").select(
         col(f"`{ERROR_COLUMN}`").alias("error"),
         to_json(struct(*columns)).alias("row_json"),
@@ -1954,6 +1987,7 @@ def write_package_dead_letters(
         .option("check-nullability", "false"),
         stamps,
     ).append()
+    return True
 
 
 def write_package_output(
@@ -2016,16 +2050,37 @@ def _land(spark, config: dict, checked, columns, run_id: str, before: dict, stam
             "package wrote"
         )
     land, write = package_outcome(failed, dead)
+    ours = {table: 0}
     if land:
         dead_table = f"{sink['catalog']}.{dead['table']}"
-        write_package_dead_letters(
+        committed = write_package_dead_letters(
             spark, checked, dead_table, columns, run_id, package["sha256"], stamps
         )
+        ours[dead_table] = 1 if committed else 0
         log("dead_letters", table=dead_table, records=failed, reasons=failures)
     if not write:
         raise PackageError(_not_written(failed, failures, dead))
     write_package_output(checked, table, columns, package["sha256"], stamps)
+    ours[table] = 1  # at most: an empty output may commit nothing
+    foreign = _foreign_commits(spark, before, ours)
+    if foreign:
+        raise PackageError(
+            f"{', '.join(foreign)} took a commit the runner did not make while it wrote (a "
+            "thread the package started, say), so the run fails; read the table's snapshots "
+            "and roll back what the package wrote"
+        )
     log("done", table=table, rows=sum(counts.values()) - failed, dead_letters=failed)
+
+
+def _foreign_commits(spark, before: dict, ours: dict) -> list:
+    """The tables of ``before`` that took more new commits since its marker than ``ours``
+    says the runner made (a compaction's ``replace`` does not count)."""
+    found = []
+    for table, (known, _main) in before.items():
+        new = [op for i, op in _snapshots(spark, table).items() if i not in known]
+        if len([op for op in new if op != "replace"]) > ours.get(table, 0):
+            found.append(table)
+    return found
 
 
 def run_package(spark, config: dict, config_uri: str, stamps: dict | None = None) -> None:

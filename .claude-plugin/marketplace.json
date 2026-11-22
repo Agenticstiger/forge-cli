@@ -8,7 +8,7 @@
     {
       "name": "fluid",
       "source": "./fluid_build/agent_skills",
-      "description": "Author, compose, deploy and troubleshoot FLUID data product contracts with the fluid CLI.",
+      "description": "Author, compose, adopt, deploy, release, publish and troubleshoot FLUID data products with the fluid CLI.",
       "category": "data"
     }
   ]

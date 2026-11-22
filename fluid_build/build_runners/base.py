@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from fluid_build._console import cprint, success
 from fluid_build._console import error as console_error
 from fluid_build._contract_loader import CLIError, load_contract_with_overlay
-from fluid_build.util.binding_paths import ENV_PLACEHOLDER_RE
+from fluid_build.util.binding_paths import ENV_PLACEHOLDER_RE, resolve_env_placeholders
 from fluid_build.util.contract import (
     SCHEDULER_TRIGGER_TYPES,
     describe_externally_run_build,
@@ -62,15 +62,10 @@ def _resolve_env_placeholders(value: Any) -> Any:
     Recurses into lists and dicts. Non-string/list/dict values are returned
     unchanged. A missing env var resolves to the empty string (not ``None``)
     so downstream YAML dumps and command-line args don't carry a literal
-    ``None`` token.
+    ``None`` token. The secret policy renders the contract as written the same
+    way (``util.binding_paths.resolve_env_placeholders``) to trace a host.
     """
-    if isinstance(value, str):
-        return ENV_PLACEHOLDER_RE.sub(lambda m: os.getenv(m.group(1), ""), value)
-    if isinstance(value, list):
-        return [_resolve_env_placeholders(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _resolve_env_placeholders(item) for key, item in value.items()}
-    return value
+    return resolve_env_placeholders(value)
 
 
 def is_dbt_build(build: Dict[str, Any]) -> bool:

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import shutil
 import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Tuple
@@ -85,14 +86,34 @@ def _docs(skill: Path) -> Iterator[Path]:
             yield skill / rel
 
 
-def test_the_pack_ships_four_skills() -> None:
+def test_the_pack_ships_its_skills() -> None:
     """Guard the guard: a green run must not mean 'found no skills'."""
     assert _ids(SKILLS) == [
+        "adopting-existing-pipelines",
         "authoring-fluid-contracts",
         "composing-fluid-data-products",
         "deploying-fluid-contracts-safely",
+        "publishing-to-data-mesh-manager",
+        "releasing-streaming-products",
         "troubleshooting-fluid-errors",
     ]
+
+
+#: The skills for one workflow each, which show only the commands of that workflow: each says
+#: where every other command and flag is listed.
+WORKFLOW_SKILLS = (
+    "adopting-existing-pipelines",
+    "publishing-to-data-mesh-manager",
+    "releasing-streaming-products",
+)
+
+
+@pytest.mark.parametrize("name", WORKFLOW_SKILLS)
+def test_a_workflow_skill_points_at_the_command_tree(name: str) -> None:
+    """``fluid describe --commands`` lists every command and flag, plugins included;
+    ``test_fluid_commands_in_skills_exist`` proves the pointer runs."""
+    (skill,) = [s for s in SKILLS if s.name == name]
+    assert "`fluid describe --commands`" in _body(skill / "SKILL.md")
 
 
 @pytest.mark.parametrize("skill", SKILLS, ids=_ids(SKILLS))
@@ -170,6 +191,53 @@ def test_fluid_commands_in_skills_exist(skill: Path) -> None:
             if found and found[0] != "missing required argument":
                 defects.append(f"{doc.name}: `{command}` -> {found[0]}: {found[1]}")
     assert not defects, "\n".join(defects)
+
+
+#: The event a table row or a list item of a skill starts with: lower case, with an underscore.
+_EVENT_ROW = re.compile(r"^(?:\| |- )`([a-z]+(?:_[a-z0-9]+)+)`", re.M)
+
+
+#: An event built from a prefix and an error's kind: ``apply_plan_digest_`` and the kind of a
+#: ``PlanBindingError`` (``packet-mismatch``), with ``-`` read as ``_``.
+_KIND_PREFIXES = ("apply_plan_digest_",)
+
+
+def _emitted(event: str, source: str) -> bool:
+    from fluid_build import _error_catalog
+
+    if event in _error_catalog.catalogued_events() or f'"{event}"' in source:
+        return True
+    return any(
+        event.startswith(prefix) and f'"{event[len(prefix):].replace("_", "-")}"' in source
+        for prefix in _KIND_PREFIXES
+    )
+
+
+def test_every_event_a_skill_tabulates_is_one_fluid_emits() -> None:
+    """A skill's event tables name events from the error catalog or the code that raises them,
+    so a renamed or invented event fails here instead of sending an agent after it."""
+    source = "\n".join(
+        p.read_text(encoding="utf-8", errors="replace")
+        for p in sorted((REPO_ROOT / "fluid_build").rglob("*.py"))
+    )
+    named = sorted(
+        {
+            (skill.name, event)
+            for skill in SKILLS
+            for doc in _docs(skill)
+            for event in _EVENT_ROW.findall(doc.read_text(encoding="utf-8"))
+        }
+    )
+    assert len(named) >= 10, named
+    unknown = [f"{skill}: {event}" for skill, event in named if not _emitted(event, source)]
+    assert not unknown, unknown
+
+
+def test_an_invented_event_is_caught() -> None:
+    assert not _emitted("table_adoption_wished_for", 'raise CLIError("table_adoption_mismatch")')
+    assert _emitted("table_adoption_mismatch", "")
+    assert _emitted("apply_plan_digest_packet_mismatch", 'kind="packet-mismatch"')
+    assert not _emitted("apply_plan_digest_packet_lost", 'kind="packet-mismatch"')
 
 
 def test_retired_commands_and_flags_are_not_taught() -> None:
@@ -264,3 +332,29 @@ def test_example_contracts_validate(contract: Path, cli) -> None:
     doc = yaml.safe_load(contract.read_text(encoding="utf-8"))
     assert doc["fluidVersion"] == FluidSchemaManager.latest_bundled_version()
     assert "email" not in doc["metadata"]["owner"], "an example must not invent an email"
+
+
+# ---------------------------------------------------------------------------
+# The conventions file the adopting skill shows is one the import reads
+# ---------------------------------------------------------------------------
+
+_JOB = """\
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+orders = spark.read.table("raw.orders")
+orders.write.mode("overwrite").saveAsTable("curated.orders")
+"""
+
+
+def test_the_conventions_example_is_read_by_the_import(tmp_path: Path, cli) -> None:
+    """``fluid import pyspark --conventions`` takes the example as written: a key it does not
+    know refuses the import, so the skill can only show keys forge reads."""
+    skill = next(s for s in SKILLS if s.name == "adopting-existing-pipelines")
+    shutil.copy(skill / "references" / "conventions.example.yaml", tmp_path / "conventions.yaml")
+    (tmp_path / "jobs").mkdir()
+    (tmp_path / "jobs" / "orders.py").write_text(_JOB, encoding="utf-8")
+    code, out = cli("import", "pyspark", "jobs", "--conventions", "conventions.yaml", "--dry-run")
+    assert code == 0, out
+    assert "curated.orders" in out
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["conventions.yaml", "jobs"]

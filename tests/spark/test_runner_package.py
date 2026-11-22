@@ -331,7 +331,10 @@ def test_the_context_is_read_only(runner):
         "SHOW TABLES",
         "DESCRIBE TABLE t",
         "EXPLAIN INSERT INTO t SELECT 1",
-        "SET spark.sql.shuffle.partitions = 8",
+        "SET spark.sql.shuffle.partitions",  # a setting read, not changed
+        "SET",
+        "SET -v",  # lists the settings
+        "set spark.sql.session.timeZone",
         "CACHE TABLE c AS SELECT * FROM t",
         "UNCACHE TABLE c",
         "REFRESH TABLE t",
@@ -374,6 +377,19 @@ def test_reads_pass_the_sql_check(runner, sql):
         ("FROM v -- c\rINSERT INTO t SELECT *", "INSERT"),
         # Spark reads a backslash-newline as more comment; reading the line as SQL refuses.
         ("WITH a AS (SELECT 1) -- c\\\n INSERT INTO t SELECT * FROM a", "INSERT"),
+        # A setting changed while the package runs: substitution back on, then a variable.
+        ("SET spark.sql.variable.substitute=true", "SET"),
+        ("SET spark.sql.shuffle.partitions = 8", "SET"),
+        # Every other form that sets a value, not only the ones with an equals sign.
+        ("SET TIME ZONE 'America/New_York'", "SET"),
+        ("set time zone local", "SET"),
+        ("SET TIME ZONE INTERVAL 10 HOURS", "SET"),
+        ("SET CATALOG other_catalog", "SET"),
+        ("/* c */ SET CATALOG other_catalog", "SET"),
+        ("SET VAR x = 1", "SET"),
+        ("SET VARIABLE x = 1", "SET"),
+        ("RESET", "RESET"),
+        ("WITH a AS (SELECT 1 AS id) ${w}", "${...} variable"),
         ("SELECT 'unterminated", "cannot read"),
         ("SELECT /* unterminated", "cannot read"),
         ("", "no statement"),
@@ -404,7 +420,15 @@ def fake_pyspark(monkeypatch):
     readwriter.DataFrameWriterV2 = type("DataFrameWriterV2", (), {"append": _Writer.append})
     session = types.ModuleType("pyspark.sql.session")
     session.SparkSession = type("SparkSession", (), {"sql": _Session.sql})
-    for name, module in (("pyspark.sql.readwriter", readwriter), ("pyspark.sql.session", session)):
+    conf = types.ModuleType("pyspark.sql.conf")
+    conf.RuntimeConfig = type(
+        "RuntimeConfig", (), {"set": lambda self, k, v: ("set", k), "unset": lambda self, k: k}
+    )
+    for name, module in (
+        ("pyspark.sql.readwriter", readwriter),
+        ("pyspark.sql.session", session),
+        ("pyspark.sql.conf", conf),
+    ):
         monkeypatch.setitem(sys.modules, name, module)
     return readwriter, session
 
@@ -424,6 +448,35 @@ def test_writes_are_refused_while_the_package_runs_and_allowed_after(runner, fak
     assert guard.refused == ["DataFrameWriter.save", "DataFrameWriterV2.append", "spark.sql INSERT"]
     assert writer.save() == "saved"  # the runner's own writes, after
     assert spark.sql("INSERT INTO t SELECT 1") == ("ran", "INSERT INTO t SELECT 1")
+
+
+def test_the_session_s_settings_are_the_runner_s_while_the_package_runs(runner, fake_pyspark):
+    """spark.conf.set could turn substitution back on, or point a catalog the runner writes
+    through somewhere else."""
+    conf = sys.modules["pyspark.sql.conf"].RuntimeConfig()
+    with runner.WriteGuard() as guard:
+        with pytest.raises(runner.PackageError, match="RuntimeConfig.set is refused"):
+            conf.set("spark.sql.variable.substitute", "true")
+        with pytest.raises(runner.PackageError, match="RuntimeConfig.unset"):
+            conf.unset("spark.sql.variable.substitute")
+    assert guard.refused == ["RuntimeConfig.set", "RuntimeConfig.unset"]
+    assert conf.set("k", "v") == ("set", "k")  # the runner's own, after
+
+
+def test_a_commit_that_lands_while_the_runner_writes_fails_the_run(runner, monkeypatch):
+    """A thread the package started commits after the function returned: the check after the
+    runner's own write sees one more commit than the runner made."""
+    known = {"glue.db.orders": {1: "append"}, "glue.db.orders__dead_letter": {7: "append"}}
+    before = {t: (frozenset(s), max(s)) for t, s in known.items()}
+    monkeypatch.setattr(runner, "_snapshots", lambda spark, t: dict(known[t]))
+    known["glue.db.orders"].update({2: "overwrite"})  # the runner's own
+    assert runner._foreign_commits(None, before, {"glue.db.orders": 1}) == []
+    known["glue.db.orders"].update({3: "append", 4: "replace"})  # another, and a compaction
+    assert runner._foreign_commits(None, before, {"glue.db.orders": 1}) == ["glue.db.orders"]
+    known["glue.db.orders__dead_letter"].update({8: "append"})
+    assert runner._foreign_commits(None, before, {"glue.db.orders": 2}) == [
+        "glue.db.orders__dead_letter"
+    ]
 
 
 def test_the_guard_comes_off_when_the_package_raises(runner, fake_pyspark):

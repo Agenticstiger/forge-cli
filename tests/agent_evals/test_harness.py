@@ -1185,9 +1185,22 @@ SKILL = harness.FLUID_SKILLS[0]
 CONTROLS = [s for s in SCENARIOS if not s.should_trigger]
 
 
+#: The skills this file's transcripts and commands name.
+NAMED_SKILLS = (
+    "authoring-fluid-contracts",
+    "composing-fluid-data-products",
+    "deploying-fluid-contracts-safely",
+    "troubleshooting-fluid-errors",
+)
+
+
 def test_the_skill_names_this_file_relies_on_exist() -> None:
-    assert "authoring-fluid-contracts" in harness.FLUID_SKILLS
-    assert len(harness.FLUID_SKILLS) == 4
+    """FLUID_SKILLS is the pack's own list, and the skills the tests below name are in it: a
+    skill the pack adds needs no edit here, and one renamed under them fails here first."""
+    from fluid_build.agent_skills import skill_dirs
+
+    assert harness.FLUID_SKILLS == tuple(d.name for d in skill_dirs())
+    assert set(NAMED_SKILLS) <= set(harness.FLUID_SKILLS)
 
 
 @pytest.mark.parametrize(

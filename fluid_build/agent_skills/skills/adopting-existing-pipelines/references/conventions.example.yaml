@@ -1,0 +1,36 @@
+# The organisation's layout, as data, for
+#   fluid import pyspark <jobs-dir> --conventions conventions.yaml
+#   fluid import airflow <dags-dir> --conventions conventions.yaml
+# No code in it runs, and a key fluid does not know is refused. Every key is optional:
+# keep the ones that describe the project and delete the rest.
+version: 1
+script_roots:                        # deployed script prefix -> directory in this checkout,
+  "s3://code-bucket/jobs/": jobs     #   relative to this file
+paths:                               # what a data path prefix holds
+  - prefix: "s3://lake/curated/"
+    database: curated
+    platform: aws
+    format: iceberg
+helpers:                             # project functions that wrap Spark reads and writes
+  read_table: {reads: table, arg: 0}
+  write_table: {writes: table, arg: 1, format: iceberg}
+operators:                           # project operator classes that submit Spark work
+  ProjectSparkOperator: spark_submit
+session_names: [spark, session]      # names whose .sql() and .table() are Spark's
+config_modules:                      # constants kept outside the scanned directory
+  - {module: project_config.settings, path: libs/project_config/settings.py}
+environment: prod                    # the environment the values below are read for
+environments:                        # what os.environ[...] holds in each environment
+  prod: {ENV: prod, TABLE_PREFIX: ""}
+  dev: {ENV: dev, TABLE_PREFIX: dev_}
+defaults: {database: retail, domain: retail, platform: aws}
+catalogs:                            # the first part of a three-part table name
+  glue: {platform: aws, format: iceberg, catalog: glue}
+layers: {raw: Bronze, curated: Silver, marts: Gold}   # database -> metadata.layer
+owners:                              # the owner a DAG names -> the contract's owner
+  data-eng: {team: data-engineering}
+ignore:
+  tables: ["^tmp_", "_staging$"]     # regular expressions
+  paths: ["^s3://lake/tmp/"]
+  files: ["jobs/legacy/*"]           # globs, relative to the scanned directory
+products: {id: "{database}.{table}"} # how a product id is made
