@@ -479,8 +479,8 @@ def test_a_shared_mapping_is_judged_outside_stream_maps():
     "extra",
     [
         {"streams": [{"name": "users", "endpoint": "/v1/users"}]},
-        {"kafka": {"server": "kafka-1"}},
         {"column_types": {"host": "varchar"}},
+        {"column_types": {"host": "character varying(255)"}},
         {"rename": {"hostname": "host_name"}},
     ],
 )
@@ -508,3 +508,72 @@ def test_a_remote_uri_in_a_credential_list_is_judged_and_never_quoted():
 )
 def test_an_embedded_jdbc_url_names_no_host(uri):
     assert _refusal({"host": "localhost", "cfg": {"u": uri}}) is None
+
+
+# ── every host spelling a client dials, and every name a client reads as one ─
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"jdbc_url": f"jdbc:postgresql:db?host={ELSEWHERE}"},
+        {"cfg": {"url": f"jdbc:postgresql:db?PGHOST={ELSEWHERE}"}},
+        {"cfg": {"url": f"jdbc:sybase:Tds:{ELSEWHERE}:5000/db"}},
+        {"cfg": {"url": f"jdbc:firebirdsql:{ELSEWHERE}/3050:/db.fdb"}},
+        {"cfg": {"url": f"jdbc:h2:mem:x;serverName={ELSEWHERE}"}},
+        {"instance_type": {"host": "134744072"}},
+        {"instance_type": {"host": "0x08080808"}},
+        {"replica": {"hostname": "elsewhere\u3002example"}},
+        {"instance_type": {"server_addresses": f"localhost:27017, {ELSEWHERE}:27017"}},
+        {"db": {"host": f"u@{ELSEWHERE}"}},
+        {"db": {"host": f"{ELSEWHERE}/x"}},
+        {"db": {"hostname": f"{ELSEWHERE}:5432/db"}},
+        {"kafka": {"server": f"kafka.{ELSEWHERE}:9092"}},
+        {"s": {"endpoint": f"api.{ELSEWHERE}"}},
+        {"s": {"endpoint": f"//{ELSEWHERE}/x"}},
+        {"s": {"uri": f"api.{ELSEWHERE}:5432/db"}},
+    ],
+)
+def test_every_spelling_of_a_host_under_another_setting_is_judged(extra):
+    assert _refusal({"host": "localhost", **extra}) is not None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"cfg": {"url": "jdbc:h2:mem:test;MODE=PostgreSQL;DB_CLOSE_DELAY=-1"}},
+        {"cfg": {"url": "jdbc:h2:~/test"}},
+        {"cfg": {"url": "jdbc:derby:memory:db;create=true"}},
+        {"cfg": {"url": "jdbc:hsqldb:mem:db"}},
+        {"mongo_query": {"$match": {"status": "active"}}},
+        {"filter_query": {"@timestamp": "x"}},
+        {"jdbc_url_params": "encrypt=true; trustServerCertificate=true"},
+        {"uri": "redis://localhost/0?x/y=1"},
+        {"uri": "postgresql://localhost/db?sslmode=require#note about it"},
+    ],
+)
+def test_names_and_values_no_client_reads_as_a_host_are_fine(extra):
+    assert _refusal({"host": "localhost", **extra}) is None
+
+
+@pytest.mark.unit
+def test_a_block_whose_shared_settings_repeat_without_end_cannot_be_cleared():
+    import time
+
+    shared: Any = ["x"]
+    for _ in range(40):
+        shared = [shared, shared]
+    started = time.monotonic()
+    refusal = _refusal({"host": "localhost", "top": shared})
+    assert refusal is not None
+    assert time.monotonic() - started < 10
+
+
+@pytest.mark.unit
+def test_validate_names_a_credential_field_that_waits_without_quoting_it():
+    finding = _lint({"host": "localhost", "tokens": ["postgres://{{ env.H }}.example.com/x"]})
+    assert finding.deferred is not None
+    assert "connection.tokens[0]" in finding.deferred.what
+    assert "example.com" not in finding.deferred.what

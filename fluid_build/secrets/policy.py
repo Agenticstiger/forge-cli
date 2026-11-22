@@ -266,23 +266,35 @@ _URL_SYNTAX = "?#;&@\\"
 #: Control characters (Unicode Cc), as ``providers/_sql_safety.py`` refuses them.
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 #: Fields that name a host by their name wherever the block holds them, and how
-#: each is read: as a bare host, or as a host list (Airbyte's older MongoDB
-#: source holds ``instance_type.host``, ``server_addresses`` and ``cluster_url``).
-#: The other destination names (``uri``, ``server``, ``endpoint``) are judged
-#: under another setting only as a URI: a REST stream's ``endpoint: /v1/users``
-#: is a path.
+#: each is read: as a bare host, or as a URI or a host list. The top-level
+#: destination names, and the host lists of Airbyte's older MongoDB source
+#: (``instance_type.host``, ``server_addresses``, ``cluster_url``).
 _NAMED_HOST_FIELDS: Dict[str, str] = {
+    **{name: "uri" for name in _HOST_FIELDS},
     "host": "host",
     "hostname": "host",
     "hosts": "uri",
     "server_addresses": "uri",
     "cluster_url": "uri",
 }
-#: A host or a host list as such a field holds it: a dotted name, an address, a
-#: ``host:port``, a list of them. A single word (``varchar``, ``host_name``) is a
-#: column's type or name in a map, and a name without a dot resolves only on the
-#: operator's own network.
-_HOST_SHAPE = re.compile(r"[\w.\-%:\[\],]+")
+#: What such a field holds when it names no host: a path (a REST stream's
+#: ``endpoint: /v1/users``, never ``//host/...``), or words with an optional type
+#: expression (a column map's ``host: varchar``, ``hostname: host_name``,
+#: ``character varying(255)``). Anything else is judged, digits and non-ASCII
+#: included: a resolver reads ``134744072`` and ``evil\u3002example`` as hosts. A
+#: single word resolves only on the operator's own network.
+_NOT_A_HOST = re.compile(r"/(?!/).*|[A-Za-z_]+(?:\s+[A-Za-z_]+)*\s*(?:\([^()]*\))?", re.DOTALL)
+#: Embedded or local JDBC databases, which name no host while their settings name
+#: none: SQLite, H2 in memory or in a file, embedded Derby, HSQLDB in memory, in
+#: a file or in a resource.
+_EMBEDDED_JDBC = re.compile(
+    r"[\s\x00-\x1f\x7f-\x9f]*jdbc:"
+    r"(?:sqlite:|h2:(?:mem:|file:|~|\.|/)|derby:(?!//)|hsqldb:(?:mem|file|res):)",
+    re.IGNORECASE,
+)
+#: How many values the walk for a destination elsewhere reads at most. A block
+#: whose shared settings repeat past it is a destination this policy cannot read.
+_WALK_LIMIT = 10_000
 #: Singer SDK settings whose keys name a stream's fields, not where a connector
 #: connects (``stream_maps: {users: {host: __NULL__}}``): a URI there is a
 #: destination, a key is not.
@@ -721,6 +733,9 @@ def _elsewhere_targets(connection: Mapping[str, Any], behind: bool) -> List[_Tar
     """The destinations :func:`_destinations_elsewhere` finds, read as :func:`_field_targets` reads them."""
     out: List[_Target] = []
     for path, reading, text in _destinations_elsewhere(connection):
+        if reading == "unreadable":
+            out.append(_Target(None, _label(path), path=path))
+            continue
         secret = reading == "secret"
         out.extend(_field_targets("uri" if secret else reading, text, path, behind, quiet=secret))
     return out
@@ -830,14 +845,15 @@ _QueryPair = Tuple[str, List[Any], str]
 def _query_pairs(query: str) -> List[_QueryPair]:
     """Each parameter of query string ``query`` that names a host, with its value's readings.
 
-    Parameters are split on ``&``, on ``;`` (SQL Server's JDBC properties) and
-    on ``#``. A value is read percent-decoded, as libpq decodes it, and once
+    Parameters are split on ``&`` and on ``;`` (SQL Server's JDBC properties); a
+    ``#`` ends none, as no client the runners use reads a fragment there, and
+    SQLAlchemy and libpq keep it in the value. A value is read percent-decoded, as libpq decodes it, and once
     more with ``+`` read as a space, as SQLAlchemy's ``parse_qsl`` reads it. A
     refusal names the key as :data:`_QUERY_HOST_KEYS` spells it: at apply the
     query string may have been rendered from a placeholder.
     """
     pairs: List[_QueryPair] = []
-    for part in re.split(r"[&;#]", query):
+    for part in re.split(r"[&;]", query):
         key, _, value = part.partition("=")
         name = _host_key_name(key)
         if name is not None:
@@ -858,14 +874,14 @@ def _mapping_pairs(mapping: Mapping[Any, Any]) -> List[_QueryPair]:
     return pairs
 
 
-#: What a parameter's name may hold, in each reading: letters, digits, ``_``,
-#: ``.`` and ``-``. A driver builds its connection string from the names as they
-#: are written (psycopg's DSN builder and SQLAlchemy's pyodbc dialect quote the
-#: values only), so a name that holds ``=``, a blank, ``;`` or a quote adds
-#: settings of its own, a host among them.
-_PARAMETER_NAME = re.compile(r"[A-Za-z0-9_.\-]+")
-#: What :func:`_host_key_name` calls a parameter whose name holds more than
-#: :data:`_PARAMETER_NAME` allows. A refusal never quotes such a name.
+#: What a parameter's name may not hold, in either reading, blanks around it
+#: aside: ``=``, ``;``, a brace, a quote, a blank or a control character. A
+#: driver builds its connection string from the names as they are written
+#: (psycopg's DSN builder and SQLAlchemy's pyodbc dialect quote the values only),
+#: so such a name adds settings of its own, a host among them.
+_SYNTAX_CHARS = re.compile(r"[=;{}'\"\s\x00-\x1f\x7f-\x9f]")
+#: What :func:`_host_key_name` calls a parameter whose name holds
+#: :data:`_SYNTAX_CHARS`. A refusal never quotes such a name.
 _SYNTAX_KEY = "connection-string syntax"
 
 
@@ -876,11 +892,11 @@ def _host_key_name(key: str) -> Optional[str]:
     and once more with ``+`` read as a space, as SQLAlchemy's ``parse_qsl``
     reads it; in any case; and with everything but letters and digits left
     out, so ``HOST``, ``%68ost`` and ``unix_socket`` are ``host``, ``host`` and
-    ``unixsocket``. A key that holds more than :data:`_PARAMETER_NAME` allows,
-    in either reading, is :data:`_SYNTAX_KEY`.
+    ``unixsocket``. A key that holds :data:`_SYNTAX_CHARS` in either reading
+    is :data:`_SYNTAX_KEY`.
     """
-    spellings = (unquote(key), unquote_plus(key))
-    if any(spelling and not _PARAMETER_NAME.fullmatch(spelling) for spelling in spellings):
+    spellings = (unquote(key).strip(), unquote_plus(key).strip())
+    if any(_SYNTAX_CHARS.search(spelling) for spelling in spellings):
         return _SYNTAX_KEY
     for spelling in spellings:
         name = re.sub(r"[^a-z0-9]", "", spelling.lower())
@@ -942,14 +958,20 @@ def _destinations_elsewhere(
     is reached by, and never twice on one path, so a cycle ends. Each is yielded
     with its reading, ``host`` or ``uri``; a URI under a field that may hold a
     credential (:data:`_CREDENTIAL_FIELD`) is ``secret``, judged as a URI but
-    never quoted. A ``secretRef`` is never read.
+    never quoted. A ``secretRef`` is never read, and past :data:`_WALK_LIMIT`
+    values the rest is ``unreadable``.
     """
     pending: List[Tuple[Tuple[Any, ...], Any, Tuple[int, ...]]] = [
         ((key,), value, ()) for key, value in connection.items() if key not in _JUDGED_BY_NAME
     ]
     pending.reverse()
+    visited = 0
     while pending:
         path, value, outer = pending.pop()
+        visited += 1
+        if visited > _WALK_LIMIT:
+            yield path, "unreadable", ""
+            return
         if path[-1] == "secretRef":
             continue
         if isinstance(value, str):
@@ -966,16 +988,15 @@ def _reading_elsewhere(path: Tuple[Any, ...], text: str) -> Optional[str]:
     """How string ``text`` at ``path`` is read as a destination, or ``None`` when it is not one.
 
     A URI of an object store or a local file names no host (:data:`_UNJUDGED_SCHEMES`),
-    and nor does a JDBC URL with neither ``://`` nor ``@``, an embedded or local
-    database (``jdbc:h2:mem:``, ``jdbc:sqlite:``). A field named for a host is
-    one only when what it holds has the shape of a host (:data:`_HOST_SHAPE`).
+    and nor does an embedded JDBC URL whose settings name none (:data:`_EMBEDDED_JDBC`).
+    A field named for a host is one unless it plainly holds none (:data:`_NOT_A_HOST`).
     """
     name = _nearest_key(path)
     shape = _URI_SHAPE.match(text)
     if shape is not None:
         scheme = shape.group("scheme")
         if scheme is None:
-            if "://" not in text and "@" not in text:
+            if _EMBEDDED_JDBC.match(text) and not _settings_name_a_host(text):
                 return None
         elif re.split(r"[+:]", scheme.lower())[0] in _UNJUDGED_SCHEMES:
             return None
@@ -983,7 +1004,13 @@ def _reading_elsewhere(path: Tuple[Any, ...], text: str) -> Optional[str]:
     if not isinstance(name, str) or path[0] in _FIELD_MAP_SETTINGS:
         return None
     reading = _NAMED_HOST_FIELDS.get(name)
-    return reading if reading is not None and _host_shaped(text) else None
+    return reading if reading is not None and _may_be_a_host(text) else None
+
+
+def _settings_name_a_host(text: str) -> bool:
+    """Whether the settings of JDBC URL ``text``, after its first ``?`` or ``;``, name a host."""
+    parts = re.split(r"[?;]", text, maxsplit=1)
+    return len(parts) == 2 and bool(_query_pairs(parts[1]))
 
 
 def _nearest_key(path: Tuple[Any, ...]) -> Any:
@@ -994,12 +1021,10 @@ def _nearest_key(path: Tuple[Any, ...]) -> Any:
     return path[-1]
 
 
-def _host_shaped(text: str) -> bool:
-    """Whether ``text`` reads as a host or a host list (:data:`_HOST_SHAPE`), or is a placeholder."""
-    if _ENV_PLACEHOLDER.search(text):
-        return True
+def _may_be_a_host(text: str) -> bool:
+    """Whether a field named for a host holds what may be one: anything but :data:`_NOT_A_HOST`."""
     value = text.strip()
-    return _HOST_SHAPE.fullmatch(value) is not None and ("." in value or ":" in value)
+    return bool(value) and _NOT_A_HOST.fullmatch(value) is None
 
 
 def _credential_field(key: Any) -> bool:
@@ -1749,7 +1774,7 @@ def _syntax_key_refusal(parsed: SecretRef, target: _Target) -> AcquisitionSecret
             "allowed."
         ),
         fix=(
-            f"Write each parameter name in {label} with letters, digits, '_', '.' and '-' only. "
+            f"Write each parameter name in {label} without '=', ';', a brace, a quote or a blank. "
             f"To send the value regardless, set it in {_OPERATOR_ONLY}: {_any_host_fix(parsed)}."
         ),
         doc=doc_url("secrets"),
@@ -1952,6 +1977,11 @@ def _without_port(host: str) -> str:
     return host.partition(":")[0]
 
 
+def _holds_a_credential(name: str) -> bool:
+    """Whether destination field ``name`` (``connection.tokens[0]``) may hold a credential."""
+    return _credential_field(re.sub(r"(?:\[\d+\])+$", "", name).rpartition(".")[2])
+
+
 def allows_any_host(
     ref: Union[SecretRef, str], environ: Optional[Mapping[str, str]] = None
 ) -> bool:
@@ -2057,7 +2087,8 @@ def deferred_destination_notice(
     """
     parsed = parse_secret_ref(ref) if isinstance(ref, str) else ref
     fields = ", ".join(
-        f"{name} ({_shown_destination(name, value)!r})" for name, value in written.items()
+        name if _holds_a_credential(name) else f"{name} ({_shown_destination(name, value)!r})"
+        for name, value in written.items()
     )
     variables = sorted(
         {
