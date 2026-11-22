@@ -873,6 +873,7 @@ NOT_PROCESS_ENV: FrozenSet[str] = frozenset(
         "FLUID_REDSHIFT_DATABASE",
         "FLUID_REDSHIFT_SQL",
         "FLUID_REDSHIFT_WORKGROUP",
+        "FLUID_TABLE_POOLS",  # a constant in a generated DAG: the pools it declares
         # a model reply token, and placeholders in prose and messages
         "FLUID_OK",
         "FLUID_X",

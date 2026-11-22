@@ -27,7 +27,11 @@ def test_a_value_under_a_credential_key_is_masked_whatever_it_is():
         {
             "password": "x",
             "api_key": 12345,
-            "nested": {"client_secret": "s3cr3t-value", "name": "orders", "token": None},
+            "nested": {
+                "client_secret": "s3cr3t-value",  # pragma: allowlist secret
+                "name": "orders",
+                "token": None,
+            },
             "list": [{"access_token": True}],
         },
         indent=2,
@@ -40,23 +44,24 @@ def test_a_value_under_a_credential_key_is_masked_whatever_it_is():
     assert parsed["nested"]["client_secret"] == "***REDACTED***"
     assert parsed["nested"]["name"] == "orders" and parsed["nested"]["token"] is None
     assert parsed["list"][0]["access_token"] == "***REDACTED***"
-    assert "s3cr3t-value" not in out
+    assert "s3cr3t-value" not in out  # pragma: allowlist secret
 
 
 def test_a_url_with_user_info_and_a_bearer_token_are_masked_in_a_string_value():
     document = json.dumps(
         {
-            "url": "postgresql://scott:tiger-pw@db.example:5432/orders",
-            "header": "Authorization: Bearer abcdefghijklmnop1234567890",
-            "list": ["https://u:pw-1234@h/x"],
+            "url": "postgresql://scott:tiger-pw@db.example:5432/orders",  # pragma: allowlist secret
+            "header": "Authorization: Bearer abcdefghijklmnop1234567890",  # pragma: allowlist secret
+            "list": ["https://u:pw-1234@h/x"],  # pragma: allowlist secret
         }
     )
 
     out = _emit(document)
 
     parsed = json.loads(out)
-    assert "tiger-pw" not in out and "abcdefghijklmnop1234567890" not in out
-    assert "pw-1234" not in out
+    assert "tiger-pw" not in out  # pragma: allowlist secret
+    assert "abcdefghijklmnop1234567890" not in out  # pragma: allowlist secret
+    assert "pw-1234" not in out  # pragma: allowlist secret
     assert parsed["url"].startswith("postgresql://scott:") and "@db.example" in parsed["url"]
 
 

@@ -26,9 +26,9 @@ def _emit(document: str) -> str:
     [
         "password=hunter2",
         'token: "abc def"',
-        'api_key=abc"}',
-        'secret="abcdef\\"gh" tail',
-        "note with password=x\\y and more",
+        'api_key=abc"}',  # pragma: allowlist secret
+        'secret="abcdef\\"gh" tail',  # pragma: allowlist secret
+        "note with password=x\\y and more",  # pragma: allowlist secret
     ],
 )
 def test_a_credential_shaped_string_is_masked_and_the_document_still_parses(value):
