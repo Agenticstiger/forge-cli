@@ -151,6 +151,14 @@ def dotted(parts: Sequence[Any]) -> str:
     return text
 
 
+def nearest_key(parts: Sequence[Any]) -> str:
+    """The nearest mapping key on ``parts`` (``commands`` for ``commands[2]``)."""
+    for part in reversed(parts):
+        if isinstance(part, str):
+            return part
+    return ""
+
+
 def anchor(document: Any, *parts: Any) -> str:
     """The pointer to ``parts`` when ``document`` has them, else to the whole document."""
     node = document

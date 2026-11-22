@@ -90,6 +90,7 @@ from urllib.parse import unquote, unquote_plus, urlsplit
 from fluid_build._errors import doc_url
 from fluid_build._net import is_loopback_host
 from fluid_build._validation_issues import dotted as _label
+from fluid_build._validation_issues import nearest_key as _nearest_key
 from fluid_build.util.binding_paths import resolve_env_placeholders
 
 from .errors import SecretPolicyError, SecretRefError
@@ -1011,14 +1012,6 @@ def _settings_name_a_host(text: str) -> bool:
     """Whether the settings of JDBC URL ``text``, after its first ``?`` or ``;``, name a host."""
     parts = re.split(r"[?;]", text, maxsplit=1)
     return len(parts) == 2 and bool(_query_pairs(parts[1]))
-
-
-def _nearest_key(path: Tuple[Any, ...]) -> Any:
-    """The key a value at ``path`` is held under; a list entry's is its list's."""
-    for part in reversed(path):
-        if isinstance(part, str):
-            return part
-    return path[-1]
 
 
 def _may_be_a_host(text: str) -> bool:
