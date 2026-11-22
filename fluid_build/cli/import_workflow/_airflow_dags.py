@@ -47,7 +47,7 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-from ._fold import ABSENT, Folder, Unresolved, lookup
+from ._fold import ABSENT, FoldedDict, FoldedList, FoldedTuple, Folder, Unresolved, lookup
 from ._pysource import Module, ancestors, qualified_name, snippet
 
 #: Known operator class names to the kind of work they submit.
@@ -95,6 +95,40 @@ _MAX_OPERAND_NOTES = 10
 _MAX_COMMAND = 50_000
 #: Submits kept for one task: a command that holds a hundred ``spark-submit`` lines is a script.
 _MAX_SUBMITS_PER_TASK = 20
+
+
+#: ``{{ var.value.name }}`` and ``{{ var.value["name"] }}``: the Airflow Variable a template reads.
+_VARIABLE_TEMPLATE = re.compile(
+    r"\{\{\s*var\.value\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}"
+    r"|\{\{\s*var\.value\[\s*(?:'([^'\"{}]{1,200})'|\"([^'\"{}]{1,200})\")\s*\]\s*\}\}"
+)
+
+
+def fill_variable_templates(value: Any, variables: Mapping[str, str]) -> Any:
+    """``value`` with each ``{{ var.value.name }}`` that ``variables`` names replaced by what it
+    holds, in a string or in the strings of a list, a tuple or a dict (their kind and their
+    ``complete`` mark kept). A template for a Variable nobody named, and every other template
+    (``{{ ds }}``, ``{{ var.json.x }}``, one with a filter), stays as written."""
+    if not variables:
+        return value
+    if isinstance(value, str):
+        if "{{" not in value:
+            return value
+        return _VARIABLE_TEMPLATE.sub(
+            lambda m: variables.get(m.group(1) or m.group(2) or m.group(3), m.group(0)), value
+        )
+    if isinstance(value, (list, tuple)):
+        kind = FoldedTuple if isinstance(value, FoldedTuple) else FoldedList
+        filled = kind(fill_variable_templates(item, variables) for item in value)
+        filled.complete = getattr(value, "complete", True)
+        return filled
+    if isinstance(value, dict):
+        mapped = FoldedDict(
+            (key, fill_variable_templates(item, variables)) for key, item in value.items()
+        )
+        mapped.complete = getattr(value, "complete", True)
+        return mapped
+    return value
 
 
 @dataclass(frozen=True)
@@ -278,6 +312,16 @@ class _Reader:
 
     def _text(self, node: Optional[ast.expr]) -> Any:
         return None if node is None else self.folder.fold(node)
+
+    def _templated(self, node: Optional[ast.expr]) -> Any:
+        """What an argument folds to when Airflow renders it as a template (a field in the
+        operator's ``template_fields``: the script, its arguments, a command, the steps), with the
+        Airflow Variables its templates read filled in (the conventions' ``airflow_variables``).
+        A DAG's id, schedule, tags and owner, and a task's id, are not rendered: a template there
+        is the text written."""
+        if node is None:
+            return None
+        return fill_variable_templates(self.folder.fold(node), self.folder.airflow_variables)
 
     def _add_dag_call(self, call: ast.Call) -> None:
         id_node = self._kw(call, "dag_id", 0)
@@ -578,13 +622,13 @@ class _Reader:
         return Submit(runtime, None, why, text, _arg_texts(args), call.lineno, command)
 
     def _spark_submit(self, call: ast.Call) -> List[Submit]:
-        script = self._text(self._kw(call, "application"))
-        args = self._text(self._kw(call, "application_args"))
+        script = self._templated(self._kw(call, "application"))
+        args = self._templated(self._kw(call, "application_args"))
         return [self._submit("spark-submit", script, args, call, "application")]
 
     def _glue(self, call: ast.Call) -> List[Submit]:
-        script = self._text(self._kw(call, "script_location"))
-        raw = self._text(self._kw(call, "script_args"))
+        script = self._templated(self._kw(call, "script_location"))
+        raw = self._templated(self._kw(call, "script_args"))
         args: List[Any] = []
         if isinstance(raw, dict):
             for key, value in raw.items():
@@ -592,9 +636,9 @@ class _Reader:
         return [self._submit("glue", script, args, call, "script_location")]
 
     def _databricks(self, call: ast.Call) -> List[Submit]:
-        task = self._text(self._kw(call, "spark_python_task"))
+        task = self._templated(self._kw(call, "spark_python_task"))
         if task is None:
-            body = self._text(self._kw(call, "json"))
+            body = self._templated(self._kw(call, "json"))
             task = lookup(body, "spark_python_task") if isinstance(body, dict) else None
         if not isinstance(task, dict):
             return []
@@ -617,6 +661,7 @@ class _Reader:
         # A field that does not fold is a hole, not the end of the command: a script written
         # out in full beside it is still read.
         value, holes = self.folder.fold_sql(node)
+        value = fill_variable_templates(value, self.folder.airflow_variables)
         if isinstance(value, Unresolved):
             # A command too long to fold is said, not dropped: nothing of it was read, so
             # whether it runs a spark-submit is not known.
@@ -666,10 +711,10 @@ class _Reader:
         return out
 
     def _emr_steps(self, call: ast.Call) -> List[Submit]:
-        return self._steps_of(self._text(self._kw(call, "steps")), call, "emr-step")
+        return self._steps_of(self._templated(self._kw(call, "steps")), call, "emr-step")
 
     def _emr_job_flow(self, call: ast.Call) -> List[Submit]:
-        overrides = self._text(self._kw(call, "job_flow_overrides"))
+        overrides = self._templated(self._kw(call, "job_flow_overrides"))
         if isinstance(overrides, str):
             return self._steps_of(overrides, call, "emr-step")
         if not isinstance(overrides, dict):
@@ -678,7 +723,7 @@ class _Reader:
         return [] if steps is ABSENT else self._steps_of(steps, call, "emr-step")
 
     def _driver(self, call: ast.Call, name: str, runtime: str) -> List[Submit]:
-        driver = self._text(self._kw(call, "job_driver"))
+        driver = self._templated(self._kw(call, "job_driver"))
         spark = lookup(driver, name) if isinstance(driver, dict) else None
         if not isinstance(spark, dict):
             return []

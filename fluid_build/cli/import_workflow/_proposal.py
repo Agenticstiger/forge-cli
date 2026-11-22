@@ -47,10 +47,10 @@ from ._catalogs import CatalogKinds
 from ._conventions import Conventions, PathRule
 from ._redact import safe_args, safe_command, safe_text
 from ._scan import JobRecord, LinkedTask
-from ._spark_io import Ref, Write
+from ._spark_io import TRIGGER_SEPARATOR, Read, Ref, Write, read_key
 from .registry import ImportReport
 
-SPLITS = ("table", "job", "dag", "folder", "project")
+SPLITS = ("table", "job", "dag", "task", "folder", "project")
 #: Distinct outputs, and products, one proposal holds. Every product is validated against the
 #: schema and written as a file; a project has hundreds, and a directory of generated code that
 #: names a table per line is not what this reads.
@@ -60,9 +60,13 @@ MAX_PRODUCTS = 10_000
 #: output): a product lists at most ``MAX_CONSUMES_PER_PRODUCT`` of them (the rest are counted in
 #: the report), a proposal lists ``MAX_FANOUT`` in all, and it goes through ``MAX_READ_VISITS``
 #: reads in all (products times reads).
-MAX_FANOUT = 200_000
+MAX_FANOUT = 40_000
 MAX_READ_VISITS = 1_000_000
 MAX_CONSUMES_PER_PRODUCT = 500
+#: Past ``MAX_FANOUT`` the products list fewer reads each, down to this many: a product whose
+#: feeders the code does not say lists all the job's reads, which costs the schema check and the
+#: contract rules a fraction of a millisecond for each one.
+MIN_CONSUMES_PER_PRODUCT = 5
 _SPLIT_BY_JOB = (
     "Propose one product per job with `--split-by job` (every product of a job repeats the job's "
     "reads and tasks), or import a smaller directory."
@@ -74,10 +78,17 @@ _SPLIT_BY_JOB = (
 MAX_ARGS_PER_TASK = 100
 MAX_TASK_TEXT = 16_000_000
 MAX_LINK_VISITS = 1_000_000
+#: A build lists the streaming writes of the outputs it owns in its description: at most this many
+#: (the rest are counted), and a proposal writes at most ``MAX_STREAM_TEXT`` characters of them in
+#: all.
+MAX_STREAMS_LISTED = 20
+MAX_STREAM_TEXT = 16_000_000
 #: Tasks of one product named one by one in the report; the rest are counted.
 MAX_TASK_LINES = 20
 #: Reads of one product named one by one in the report; the rest are counted.
 MAX_READ_LINES = 20
+#: Outputs nobody reads, named one by one in the report; the rest are counted.
+MAX_UNREAD_LINES = 20
 
 
 class ProposalTooLarge(Exception):
@@ -360,6 +371,25 @@ class Output:
     write: Write
     #: Other job files that write the same output.
     others: List[Tuple[JobRecord, Write]] = field(default_factory=list)
+    #: The reads (their :func:`read_key`) that feed it, when every write of it by the writer says
+    #: so; ``loose`` is True when any of them does not (then any read of the job that no single
+    #: write owns may feed it).
+    feeds: Set[Tuple[Any, ...]] = field(default_factory=set)
+    loose: bool = False
+    #: Every write of it by the writer (``write`` is the first): the build of the product that
+    #: owns the output says how its streams run from these.
+    writes: List[Write] = field(default_factory=list, repr=False)
+
+    def __post_init__(self) -> None:
+        self.add(self.write)
+
+    def add(self, write: Write) -> None:
+        """Note one more write of this output by the writer."""
+        self.writes.append(write)
+        if write.feeds is None:
+            self.loose = True
+        else:
+            self.feeds.update(write.feeds)
 
 
 @dataclass
@@ -396,6 +426,11 @@ class _Ctx:
     #: The entry of each task link as a build lists it, by ``id(link)``: a job that feeds a
     #: hundred products is rendered (and read for credentials) once, not a hundred times.
     entries: Dict[int, Optional[Dict[str, Any]]] = field(default_factory=dict)
+    #: The most reads a product lists in ``consumes[]`` (see :data:`MAX_FANOUT`).
+    max_consumes: int = MAX_CONSUMES_PER_PRODUCT
+    #: ``(text, trigger)`` of the streaming writes of the outputs a product owns of a job, by
+    #: ``(id(group), id(job))``: worked out once, where the proposal is held to its size.
+    streams: Dict[Tuple[int, int], Tuple[str, str]] = field(default_factory=dict)
 
 
 def _job_labels(jobs: Sequence[JobRecord]) -> Dict[str, str]:
@@ -423,27 +458,9 @@ def _groups(outputs: List[Output], split_by: str, conv: Conventions, root_name: 
     are (a job's absolute path, a DAG id, a folder, ``None`` for files at the top), never by
     the label made from it, so two jobs named alike are two products."""
     keyed: Dict[Tuple[Any, ...], Group] = {}
-    writers = list({str(o.writer.path): o.writer for o in outputs}.values())
-    labels = _job_labels(writers)
+    labels = _job_labels(list({str(o.writer.path): o.writer for o in outputs}.values()))
     for output in outputs:
-        job = output.writer
-        key: Tuple[Any, ...]
-        if split_by == "table":
-            key, label = ("table", *output.identity.key), product_id(output.identity, conv)
-        elif split_by == "job":
-            key, label = ("job", str(job.path)), labels[str(job.path)]
-        elif split_by == "dag":
-            dag_ids = sorted({link.dag.dag_id for link in job.tasks if link.dag.dag_id})
-            if dag_ids:
-                key, label = ("dag", dag_ids[0]), ident(dag_ids[0])
-            else:
-                key, label = ("job", str(job.path)), labels[str(job.path)]
-        elif split_by == "folder":
-            head = job.rel.split("/")[0] if "/" in job.rel else None
-            key = ("folder", head)
-            label = ident(head if head is not None else root_name, fallback="root")
-        else:  # project
-            key, label = ("project",), ident(root_name, fallback="project")
+        key, label = _key_and_label(split_by, output, conv, root_name, labels)
         if conv.domain and split_by != "table":
             label = ident(f"{conv.domain}.{label}")
         group = keyed.get(key)
@@ -451,6 +468,33 @@ def _groups(outputs: List[Output], split_by: str, conv: Conventions, root_name: 
             group = keyed[key] = Group(label=label)
         group.outputs.append(output)
     return list(keyed.values())
+
+
+def _key_and_label(
+    split_by: str, output: Output, conv: Conventions, root_name: str, labels: Dict[str, str]
+) -> Tuple[Tuple[Any, ...], str]:
+    """The key of the product ``output`` goes to, and the name that product gets."""
+    job = output.writer
+    if split_by == "table":
+        return ("table", *output.identity.key), product_id(output.identity, conv)
+    own = ("job", str(job.path)), labels[str(job.path)]  # a job's own product
+    if split_by == "job":
+        return own
+    if split_by == "dag":
+        dag_ids = sorted({link.dag.dag_id for link in job.tasks if link.dag.dag_id})
+        return (("dag", dag_ids[0]), ident(dag_ids[0])) if dag_ids else own
+    if split_by == "task":
+        first = _first_links(job)
+        if first and first[0].task.task_id and first[0].dag.dag_id:
+            # the outputs of every job one task runs are one product (a driver's job list)
+            link = first[0]
+            key = ("task", link.dag.file, link.dag.line, link.task.key)
+            return key, ident(f"{link.dag.dag_id}.{link.task.task_id}")
+        return own
+    if split_by == "folder":
+        head = job.rel.split("/")[0] if "/" in job.rel else None
+        return ("folder", head), ident(head if head is not None else root_name, fallback="root")
+    return ("project",), ident(root_name, fallback="project")
 
 
 def _first_links(job: JobRecord) -> List[LinkedTask]:
@@ -462,6 +506,221 @@ def _first_links(job: JobRecord) -> List[LinkedTask]:
         kept = (len(job.tasks), ordered)
         job._first_links = kept  # type: ignore[attr-defined]
     return kept[1]
+
+
+def _bridge_key(ref: Any) -> Tuple[str, str]:
+    """What a read and a write of one table or topic have in common, whatever qualifies the name
+    (a catalog, a database): the kind and the last part, lower case."""
+    return ref.kind, (ref.parts[-1] if ref.parts else "").lower().rstrip("/")
+
+
+#: Directories of a path that are kept: past this a path is known by where it starts.
+_MAX_PATH_SEGMENTS = 40
+#: A scheme another spells: the two name one location.
+_SCHEME_FAMILY = {
+    "s3a": "s3",
+    "s3n": "s3",
+    "gcs": "gs",
+    "abfss": "abfs",
+    "wasbs": "wasb",
+    "file": "",
+}
+
+
+def _path_key(text: str) -> Tuple[str, ...]:
+    """A path as ``(scheme family, bucket or host, *directories)``, lower case: ``s3://b/x``,
+    ``s3a://b/x`` and ``s3://b/x/*`` are one key, ``file:///d/x`` and ``/d/x`` are one, and a
+    partition (``/d/x/dt=1``) has the key of ``/d/x`` as its start. A glob cuts the path where it
+    starts (what is before it is the directory the glob is in)."""
+    text = text[:4_096].lower().split("?")[0].split("#")[0].replace("\\", "/")
+    scheme = authority = ""
+    if "://" in text:
+        scheme, text = text.split("://", 1)
+        authority, _, text = text.partition("/")
+    elif text.startswith("file:"):
+        scheme, text = "file", text[5:]
+    directories: List[str] = []
+    for segment in text.split("/"):
+        if not segment or segment == ".":
+            continue
+        if any(mark in segment for mark in "*?[{"):
+            break
+        directories.append(segment)
+        if len(directories) == _MAX_PATH_SEGMENTS:
+            break
+    return (_SCHEME_FAMILY.get(scheme, scheme), authority, *directories)
+
+
+@dataclass
+class _Feed:
+    """What feeds the writes of one ignored name: the keys of the reads that feed any of them, and
+    whether one of them does not say (any read of the job may feed it)."""
+
+    keys: Set[Tuple[Any, ...]] = field(default_factory=set)
+    unknown: bool = False
+
+
+class _Bridges:
+    """What feeds the writes of one job that the conventions ignore (a staging table, path or topic).
+
+    A write like that is an intermediate: what feeds it feeds what reads it, so a product that
+    reads it takes its feeds. A table or a topic is found by its last part (:func:`_bridge_key`), a
+    path by the directories it goes through (:func:`_path_key`): the other spellings of one
+    location (``s3a`` for ``s3``, ``file:///``, a trailing glob) and a read of a partition below
+    the written directory find the write. Writes of one name are one entry: the union of what
+    feeds them, and whether any of them does not say.
+    """
+
+    __slots__ = ("exact", "paths", "keys", "ignored_paths")
+
+    def __init__(self) -> None:
+        self.exact: Dict[Tuple[str, str], _Feed] = {}
+        self.paths: Dict[Tuple[str, ...], _Feed] = {}
+        #: The key of every read that feeds one of them.
+        self.keys: Set[Tuple[Any, ...]] = set()
+        #: The keys of the reads of a path the conventions ignore.
+        self.ignored_paths: Set[Tuple[Any, ...]] = set()
+
+    def add(self, write: Write) -> None:
+        if write.kind == "path":
+            feed = self.paths.setdefault(_path_key(write.name), _Feed())
+        else:
+            feed = self.exact.setdefault(_bridge_key(write), _Feed())
+        if write.feeds is None:
+            feed.unknown = True
+        else:
+            feed.keys.update(write.feeds)
+            self.keys.update(write.feeds)
+
+    def note_reads(self, reads: Sequence[Read], conv: Conventions) -> None:
+        """Remember which reads are of a path the conventions ignore: one of them that no written
+        path matches was written some way the keys do not see."""
+        if self.paths:
+            self.ignored_paths = {
+                read_key(read)
+                for read in reads
+                if read.kind == "path" and read.resolved and identity_of(read, conv) is None
+            }
+
+    def feeds_of(self, read: Read) -> Tuple[List[_Feed], bool]:
+        """The entries of the writes that make what ``read`` reads, and whether it is a read of
+        an ignored path that none of the written ones matches."""
+        if read.kind != "path":
+            feed = self.exact.get(_bridge_key(read))
+            return ([feed] if feed is not None else []), False
+        if not read.resolved:
+            return [], False
+        key = _path_key(read.name)
+        found = [self.paths[key[:n]] for n in range(len(key), 1, -1) if key[:n] in self.paths]
+        return found, not found and read_key(read) in self.ignored_paths
+
+
+def _bridge(job: JobRecord, write: Write) -> None:
+    """A write the conventions ignore (a staging table) is an intermediate: what feeds it feeds
+    what reads it (see :class:`_Bridges`)."""
+    bridges = getattr(job, "_bridges", None)
+    if bridges is None:
+        bridges = job._bridges = _Bridges()  # type: ignore[attr-defined]
+    bridges.add(write)
+
+
+def _through_bridges(
+    owned: Set[Tuple[Any, ...]], loose: bool, job: JobRecord
+) -> Tuple[Set[Tuple[Any, ...]], bool]:
+    """``owned`` and everything that feeds a read among them through a write the conventions
+    ignore, and whether one of those writes does not say what feeds it (or a read of an ignored
+    path matches none of the paths the job wrote)."""
+    bridges = getattr(job, "_bridges", None)
+    if bridges is None:
+        return owned, loose
+    pools = _pools(job)
+    owned = set(owned)
+    queue = list(owned)
+    while queue:
+        read = pools.by_key.get(queue.pop())
+        if read is None:
+            continue
+        feeds, unmatched = bridges.feeds_of(read)
+        loose = loose or unmatched
+        for feed in feeds:
+            loose = loose or feed.unknown
+            for fed in feed.keys - owned:
+                owned.add(fed)
+                queue.append(fed)
+    return owned, loose
+
+
+class _Pools:
+    """The reads of one job, by what they can feed: a read that one write owns (``exclusive``: a
+    closed SQL statement's, or one written inside a DataFrame's expression) feeds that write and
+    nothing else; ``loose`` is every other read, which may feed any write whose reads the code
+    does not say. ``by_key`` and ``index`` find a read, and its place among the job's reads, by
+    its key, so a product asks for what it lists, not for all that the job reads."""
+
+    __slots__ = ("reads", "loose", "loose_keys", "by_key", "index")
+
+    def __init__(self, job: JobRecord) -> None:
+        self.reads = job.facts.reads
+        self.by_key = {read_key(read): read for read in self.reads}
+        self.index = {read_key(read): place for place, read in enumerate(self.reads)}
+        # a read that only feeds a write the conventions ignore may feed what reads that write,
+        # which a product that does not say what feeds it may be
+        bridges = getattr(job, "_bridges", None)
+        bridged = bridges.keys if bridges is not None else frozenset()
+        self.loose = [
+            read for read in self.reads if not read.exclusive or read_key(read) in bridged
+        ]
+        self.loose_keys = {read_key(read) for read in self.loose}
+
+
+def _pools(job: JobRecord) -> _Pools:
+    """The pools of ``job``, made once (every product of the job asks)."""
+    kept = getattr(job, "_pools", None)
+    if kept is None or kept[0] != len(job.facts.reads):
+        kept = (len(job.facts.reads), _Pools(job))
+        job._pools = kept  # type: ignore[attr-defined]
+    return kept[1]
+
+
+def _feeding(group: Group, job: JobRecord) -> Tuple[Set[Tuple[Any, ...]], bool]:
+    """The keys of the reads that feed the outputs of ``group`` that ``job`` writes, and whether
+    the ones no write owns feed some of them."""
+    owned: Set[Tuple[Any, ...]] = set()
+    loose = False
+    for output in group.outputs:
+        if output.writer is job:
+            loose = loose or output.loose
+            owned.update(output.feeds)
+    if owned:
+        owned, loose = _through_bridges(owned, loose, job)
+    return owned, loose
+
+
+def _keys_of(group: Group, job: JobRecord, pools: _Pools) -> Set[Tuple[Any, ...]]:
+    owned, loose = _feeding(group, job)
+    keys = {key for key in owned if key in pools.by_key}
+    if loose:
+        keys |= pools.loose_keys
+    return keys
+
+
+def _reads_of(group: Group, job: JobRecord) -> Sequence[Read]:
+    """The reads of ``job`` that can feed the outputs of ``group`` that ``job`` writes, in the
+    order the job reads in: the reads their writes name, and every read that no single write owns
+    when any of them is written some way that does not say what feeds it."""
+    pools = _pools(job)
+    owned, loose = _feeding(group, job)
+    if loose and not any(key in pools.by_key for key in owned):
+        return pools.loose
+    keys = {key for key in owned if key in pools.by_key}
+    if loose:
+        keys |= pools.loose_keys
+    return [pools.by_key[key] for key in sorted(keys, key=pools.index.__getitem__)]
+
+
+def _read_count(group: Group, job: JobRecord) -> int:
+    """``len(_reads_of(group, job))`` without making the list."""
+    return len(_keys_of(group, job, _pools(job)))
 
 
 class _DagIndex:
@@ -547,18 +806,27 @@ def _owner(
     return _owner_block(labels[0], conv)
 
 
+#: Triggers that end by themselves: the query drains what is there and stops.
+_ONE_SHOT = frozenset({"availableNow", "once"})
+
+
 def _trigger(writes: Sequence[Write]) -> str:
+    """``continuous`` when a streaming write may keep running (any trigger it can have, when the
+    code picks one by a branch, is not a one-shot), else ``manual``."""
     long_running = [
-        w for w in writes if w.streaming and (w.trigger or "") not in {"availableNow", "once"}
+        w
+        for w in writes
+        if w.streaming
+        and any(t not in _ONE_SHOT for t in (w.trigger or "").split(TRIGGER_SEPARATOR))
     ]
     return "continuous" if long_running else "manual"
 
 
 def _stream_text(writes: Sequence[Write]) -> str:
+    """The streaming writes, ``MAX_STREAMS_LISTED`` of them one by one and the rest counted."""
+    streams = [w for w in writes if w.streaming]
     parts = []
-    for w in writes:
-        if not w.streaming:
-            continue
+    for w in streams[:MAX_STREAMS_LISTED]:
         bits = []
         if w.checkpoint:
             bits.append(f"checkpoint {safe_text(w.checkpoint, 120)}")
@@ -567,7 +835,75 @@ def _stream_text(writes: Sequence[Write]) -> str:
         if w.query_name:
             bits.append(f"query {safe_text(w.query_name, 60)}")
         parts.append(f"{safe_text(w.shown, 80)}: " + (", ".join(bits) or "streaming write"))
+    if len(streams) > MAX_STREAMS_LISTED:
+        parts.append(f"... and {len(streams) - MAX_STREAMS_LISTED:,} more")
     return "; ".join(parts)
+
+
+def _owned_writes(outputs: Sequence[Output]) -> List[Write]:
+    """The writes of the outputs a product owns (one job's): a job that writes a thousand tables
+    describes to each product the streams of the tables it owns, not the job's thousand."""
+    return [w for output in outputs for w in output.writes]
+
+
+def _collect_outputs(
+    ordered: Sequence[JobRecord], conv: Conventions, report: ImportReport
+) -> Dict[Tuple[str, ...], Output]:
+    """The outputs the jobs write, by identity. A write whose name did not resolve is reported; one
+    the conventions ignore is a bridge (what feeds it feeds what reads it), and an output that
+    more than one job writes keeps the first writer and is reported."""
+    outputs: Dict[Tuple[str, ...], Output] = {}
+    seen_notes: Set[Tuple[Any, ...]] = set()
+    ignored = 0
+    for job in ordered:
+        job._bridges = None  # type: ignore[attr-defined]  # what a repeat call left is stale
+        job._pools = None  # type: ignore[attr-defined]
+        for write in job.facts.writes:
+            if not write.resolved:
+                report.unsupported.append(
+                    f"{write.file}:{write.line} writes {safe_text(write.shown or '(no name)', 80)}: "
+                    f"{safe_text(write.why)}; name it in the conventions, or declare the product by hand"
+                )
+                continue
+            identity = identity_of(write, conv)
+            if identity is None:
+                ignored += 1
+                _bridge(job, write)
+                continue
+            existing = outputs.get(identity.key)
+            if existing is None:
+                if len(outputs) >= MAX_OUTPUTS:
+                    raise ProposalTooLarge(
+                        f"the code writes more than {MAX_OUTPUTS:,} distinct outputs"
+                    )
+                outputs[identity.key] = Output(identity, job, write)
+            elif existing.writer is job:
+                existing.add(write)
+                mark = ("catalogs", job.shown, identity.key)
+                if existing.identity.catalog != identity.catalog and mark not in seen_notes:
+                    seen_notes.add(mark)
+                    report.notes.append(
+                        f"{safe_text(job.shown, 80)} writes {safe_text(existing.identity.shown, 80)} "
+                        f"and {safe_text(identity.shown, 80)}, which differ only by catalog: they "
+                        "are proposed as one output"
+                    )
+                continue
+            else:
+                existing.others.append((job, write))
+        bridges = getattr(job, "_bridges", None)
+        if bridges is not None:
+            bridges.note_reads(job.facts.reads, conv)
+    if ignored:
+        report.notes.append(f"{ignored} write(s) ignored by the conventions' ignore rules")
+    for output in outputs.values():
+        if output.others:
+            names = ", ".join(sorted({safe_text(j.shown, 80) for j, _ in output.others}))
+            report.unsupported.append(
+                f"{safe_text(output.identity.shown, 80)} is written by more than one job "
+                f"({safe_text(output.writer.shown, 80)}, {names}); a product has a single writer, "
+                f"so it is proposed with {safe_text(output.writer.shown, 80)}: choose the writer, or split the output"
+            )
+    return outputs
 
 
 def build_proposal(
@@ -591,51 +927,7 @@ def build_proposal(
     report = report or ImportReport()
     ordered = sorted(jobs, key=lambda j: j.shown)
 
-    # ── outputs, and what has no identity ─────────────────────────
-    outputs: Dict[Tuple[str, ...], Output] = {}
-    seen_notes: Set[Tuple[Any, ...]] = set()
-    ignored = 0
-    for job in ordered:
-        for write in job.facts.writes:
-            if not write.resolved:
-                report.unsupported.append(
-                    f"{write.file}:{write.line} writes {safe_text(write.shown or '(no name)', 80)}: "
-                    f"{safe_text(write.why)}; name it in the conventions, or declare the product by hand"
-                )
-                continue
-            identity = identity_of(write, conv)
-            if identity is None:
-                ignored += 1
-                continue
-            existing = outputs.get(identity.key)
-            if existing is None:
-                if len(outputs) >= MAX_OUTPUTS:
-                    raise ProposalTooLarge(
-                        f"the code writes more than {MAX_OUTPUTS:,} distinct outputs"
-                    )
-                outputs[identity.key] = Output(identity, job, write)
-            elif existing.writer is job:
-                mark = ("catalogs", job.shown, identity.key)
-                if existing.identity.catalog != identity.catalog and mark not in seen_notes:
-                    seen_notes.add(mark)
-                    report.notes.append(
-                        f"{safe_text(job.shown, 80)} writes {safe_text(existing.identity.shown, 80)} "
-                        f"and {safe_text(identity.shown, 80)}, which differ only by catalog: they "
-                        "are proposed as one output"
-                    )
-                continue
-            else:
-                existing.others.append((job, write))
-    if ignored:
-        report.notes.append(f"{ignored} write(s) ignored by the conventions' ignore rules")
-    for output in outputs.values():
-        if output.others:
-            names = ", ".join(sorted({safe_text(j.shown, 80) for j, _ in output.others}))
-            report.unsupported.append(
-                f"{safe_text(output.identity.shown, 80)} is written by more than one job "
-                f"({safe_text(output.writer.shown, 80)}, {names}); a product has a single writer, "
-                f"so it is proposed with {safe_text(output.writer.shown, 80)}: choose the writer, or split the output"
-            )
+    outputs = _collect_outputs(ordered, conv, report)
 
     flat = sorted(outputs.values(), key=lambda o: (o.writer.shown, o.write.line, o.identity.shown))
     groups = _groups(flat, split_by, conv, root_name)
@@ -643,17 +935,27 @@ def build_proposal(
         raise ProposalTooLarge(
             f"the proposal would hold {len(groups):,} products (the most is {MAX_PRODUCTS:,})"
         )
-    fanout = visits = 0
+    visits = 0
+    counts: List[int] = []
     for group in groups:
         jobs = {str(output.writer.path): output.writer for output in group.outputs}
-        reads = sum(len(job.facts.reads) for job in jobs.values())
+        reads = sum(_read_count(group, job) for job in jobs.values())
+        counts.append(reads)
         visits += reads
-        fanout += min(reads, MAX_CONSUMES_PER_PRODUCT)
+    fanout = sum(min(c, MAX_CONSUMES_PER_PRODUCT) for c in counts)
+    listed = MAX_CONSUMES_PER_PRODUCT
     if fanout > MAX_FANOUT:
-        raise ProposalTooLarge(
-            f"the products would list {fanout:,} reads between them (the most is {MAX_FANOUT:,}): "
-            "every product of a job lists all the job's reads",
-            hint=_SPLIT_BY_JOB,
+        listed = _fewer_reads(counts)
+        if listed is None:
+            raise ProposalTooLarge(
+                f"the products would list {fanout:,} reads between them (the most is "
+                f"{MAX_FANOUT:,}): every product of a job lists all the job's reads",
+                hint=_SPLIT_BY_JOB,
+            )
+        report.notes.append(
+            f"the products would list {fanout:,} reads between them (the most is "
+            f"{MAX_FANOUT:,}), because the code does not say which input feeds which output: "
+            f"each lists at most {listed} of its reads in consumes[]. {_SPLIT_BY_JOB}"
         )
     if visits > MAX_READ_VISITS:
         raise ProposalTooLarge(
@@ -682,6 +984,24 @@ def build_proposal(
             "job, with their arguments",
             hint=_SPLIT_BY_JOB,
         )
+    streams: Dict[Tuple[int, int], Tuple[str, str]] = {}
+    stream_text = 0
+    for group in groups:
+        by_job: Dict[int, List[Output]] = {}
+        for output in group.outputs:
+            by_job.setdefault(id(output.writer), []).append(output)
+        for job_id, owned in by_job.items():
+            writes = _owned_writes(owned)
+            text = _stream_text(writes)
+            stream_text += len(text)
+            if stream_text > MAX_STREAM_TEXT:
+                raise ProposalTooLarge(
+                    f"the products would describe {stream_text:,} characters of Structured "
+                    f"Streaming writes between them (the most is {MAX_STREAM_TEXT:,}): every "
+                    "product lists the streams of the outputs it owns",
+                    hint=_SPLIT_BY_JOB,
+                )
+            streams[(id(group), job_id)] = (text, _trigger(writes))
 
     # who produces what, for consumes[]: an id is handed out once, whatever the names look like
     produced: Dict[Tuple[str, ...], Tuple[str, str]] = {}
@@ -696,15 +1016,20 @@ def build_proposal(
             eid = _unique(expose_id(output.identity), taken_eids, "_")
             produced[output.identity.key] = (pid, eid)
             groups_of_job.setdefault(str(output.writer.path), set()).add(index)
+    loose_jobs = {str(o.writer.path) for g in groups for o in g.outputs if o.loose}
     for job in ordered:
-        if len(groups_of_job.get(str(job.path), ())) > 1 and any(
-            r.resolved for r in job.facts.reads
+        if (
+            len(groups_of_job.get(str(job.path), ())) > 1
+            and str(job.path) in loose_jobs
+            and any(r.resolved for r in _pools(job).loose)
         ):
             report.notes.append(
                 f"{safe_text(job.shown, 80)} writes outputs that are in different products: the "
                 "code does not say which input feeds which output, so each of those products "
                 "lists all of the job's inputs in consumes[]"
             )
+
+    _flag_unread(groups, group_ids, produced, ordered, conv, report)
 
     ctx = _Ctx(
         version=version,
@@ -713,6 +1038,8 @@ def build_proposal(
         produced=produced,
         topic_schema=topic_schema,
         catalogs=catalogs or CatalogKinds(),
+        max_consumes=listed,
+        streams=streams,
     )
     contracts = [_product(group, group_ids[index], ctx) for index, group in enumerate(groups)]
 
@@ -728,6 +1055,88 @@ def build_proposal(
             f"consumes[] names them under the id the id rule gives: {listed}{more}"
         )
     return Proposal(contracts=contracts, report=report)
+
+
+def _fewer_reads(counts: Sequence[int]) -> Optional[int]:
+    """The most reads each product may list so that all of them list at most :data:`MAX_FANOUT`
+    (never fewer than :data:`MIN_CONSUMES_PER_PRODUCT`), or ``None`` when even that is too many."""
+    low, high = MIN_CONSUMES_PER_PRODUCT, MAX_CONSUMES_PER_PRODUCT
+    if sum(min(c, low) for c in counts) > MAX_FANOUT:
+        return None
+    while low < high:
+        middle = (low + high + 1) // 2
+        if sum(min(c, middle) for c in counts) <= MAX_FANOUT:
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
+def _flag_unread(
+    groups: Sequence[Group],
+    group_ids: Dict[int, str],
+    produced: Dict[Tuple[str, ...], Tuple[str, str]],
+    jobs: Sequence[JobRecord],
+    conv: Conventions,
+    report: ImportReport,
+) -> None:
+    """Flag each product none of whose outputs is read by a scanned job (the jobs that write it do
+    not count) or declared as read by a consumer: the code cannot see a dashboard or another
+    team's job, so the contract is still proposed, and a person decides: retire the output, or
+    name its consumer under ``external_consumers``. Listed one by one up to :data:`MAX_UNREAD_LINES`.
+    """
+    readers: Dict[Tuple[str, ...], Set[str]] = {}
+    for job in jobs:
+        for read in job.facts.reads:
+            if not read.resolved or read.kind == "topic_pattern":
+                continue
+            identity = identity_of(read, conv)
+            if identity is not None:
+                readers.setdefault(identity.key, set()).add(str(job.path))
+    declared = set(conv.external_consumers)
+    #: The products each job writes an output of: a job that writes one product and reads its
+    #: output to make another is a reader of it.
+    written: Dict[str, Set[int]] = {}
+    for index, group in enumerate(groups):
+        for output in group.outputs:
+            written.setdefault(str(output.writer.path), set()).add(index)
+            for other, _ in output.others:
+                written.setdefault(str(other.path), set()).add(index)
+    unread: List[str] = []
+    for index, group in enumerate(groups):
+        pid = group_ids[index]
+        writers: Set[str] = set()
+        for output in group.outputs:
+            writers.add(str(output.writer.path))
+            writers.update(str(j.path) for j, _ in output.others)
+        names = {pid.lower()}
+        used = False
+        for output in group.outputs:
+            identity = output.identity
+            names.add(identity.shown.lower())
+            if identity.kind == "table":
+                names.add(f"{identity.database or ''}.{identity.name}".strip(".").lower())
+            if any(
+                job not in writers or written.get(job, set()) - {index}
+                for job in readers.get(identity.key, ())
+            ):
+                used = True
+                break
+        if used or names & declared:
+            continue
+        shown = ", ".join(safe_text(o.identity.shown, 60) for o in group.outputs[:5])
+        more = f" and {len(group.outputs) - 5} more" if len(group.outputs) > 5 else ""
+        unread.append(
+            f"{pid} ({shown}{more}) is read by no scanned job and no declared consumer: retire "
+            "it, or name its consumer under `external_consumers` in the conventions"
+        )
+    for line in unread[:MAX_UNREAD_LINES]:
+        report.unsupported.append(line)
+    if len(unread) > MAX_UNREAD_LINES:
+        report.unsupported.append(
+            f"{len(unread) - MAX_UNREAD_LINES} more product(s) are read by no scanned job and no "
+            "declared consumer"
+        )
 
 
 def _unmapped_catalog(pid: str, alias: str, eids: Sequence[str], catalogs: CatalogKinds) -> str:
@@ -817,10 +1226,12 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
     labels = _job_labels(writer_jobs)
     for job in writer_jobs:
         build_ids[id(job)] = _unique(labels[str(job.path)], taken, "-")
-    task_build: Dict[Tuple[str, int, str], str] = {}
+    task_build: Dict[Tuple[str, int, str], List[str]] = {}
     for job in writer_jobs:
         for link in job.tasks:
-            task_build[(link.dag.file, link.dag.line, link.task.key)] = build_ids[id(job)]
+            task_build.setdefault((link.dag.file, link.dag.line, link.task.key), []).append(
+                build_ids[id(job)]
+            )
     for job in writer_jobs:
         builds.append(
             _build(job, group, build_ids, task_build, expose_by_key, conv, report, pid, ctx)
@@ -831,7 +1242,7 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
     seen: set = set()
     unlisted = more_reads = 0
     for job in writer_jobs:
-        for read in job.facts.reads:
+        for read in _reads_of(group, job):
             seen_read = (read.file, read.line, read.shown, read.kind)
             if not read.resolved:
                 if seen_read not in ctx.reported:
@@ -876,7 +1287,7 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
             if (other_pid, other_eid) in seen:
                 continue
             seen.add((other_pid, other_eid))
-            if len(consumes) >= MAX_CONSUMES_PER_PRODUCT:
+            if len(consumes) >= ctx.max_consumes:
                 unlisted += 1
                 continue
             consumes.append({"productId": other_pid, "exposeId": other_eid, "purpose": purpose})
@@ -893,7 +1304,7 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
         )
     if unlisted:
         report.notes.append(
-            f"{pid}: lists {MAX_CONSUMES_PER_PRODUCT} reads in consumes[]; {unlisted} more are "
+            f"{pid}: lists {ctx.max_consumes} reads in consumes[]; {unlisted} more are "
             "not listed"
         )
 
@@ -936,17 +1347,20 @@ def _build(
     job: JobRecord,
     group: Group,
     build_ids: Dict[int, str],
-    task_build: Dict[Tuple[str, int, str], str],
+    task_build: Dict[Tuple[str, int, str], List[str]],
     expose_by_key: Dict[Tuple[str, ...], str],
     conv: Conventions,
     report: ImportReport,
     pid: str,
     ctx: _Ctx,
 ) -> Dict[str, Any]:
-    writes = [w for w in job.facts.writes if w.resolved]
     mine = [o for o in group.outputs if o.writer is job]
+    cached = ctx.streams.get((id(group), id(job)))
+    if cached is None:
+        owned = _owned_writes(mine)
+        cached = (_stream_text(owned), _trigger(owned))
+    stream, trigger = cached
     description = f"Existing job {safe_text(job.shown, 120)}; it keeps running where it runs today."
-    stream = _stream_text(writes)
     if stream:
         description += f" Structured Streaming: {stream}."
     build: Dict[str, Any] = {
@@ -957,7 +1371,7 @@ def _build(
         "properties": {"model": safe_text(job.shown, 300)},
         "outputs": [expose_by_key[o.identity.key] for o in mine],
     }
-    execution: Dict[str, Any] = {"trigger": {"type": _trigger(writes)}}
+    execution: Dict[str, Any] = {"trigger": {"type": trigger}}
     links = _first_links(job)
     platform = conv.runtime_platform
     if platform is None and links:
@@ -976,14 +1390,14 @@ def _build(
 
 
 def _dependencies(
-    links: Sequence[LinkedTask], task_build: Dict[Tuple[str, int, str], str], own: str
+    links: Sequence[LinkedTask], task_build: Dict[Tuple[str, int, str], List[str]], own: str
 ) -> List[Dict[str, str]]:
     deps: List[str] = []
     for link in links:
         for up in _dag_index(link.dag).upstream.get(link.task.key, ()):
-            upstream = task_build.get((link.dag.file, link.dag.line, up))
-            if upstream and upstream != own and upstream not in deps:
-                deps.append(upstream)
+            for upstream in task_build.get((link.dag.file, link.dag.line, up), ()):
+                if upstream != own and upstream not in deps:
+                    deps.append(upstream)
     return [{"buildId": d, "condition": "success"} for d in deps]
 
 
@@ -1057,7 +1471,7 @@ def _copy_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
 
 def _orchestration(
     links: Sequence[LinkedTask],
-    task_build: Dict[Tuple[str, int, str], str],
+    task_build: Dict[Tuple[str, int, str], List[str]],
     build_id: str,
     report: ImportReport,
     pid: str,

@@ -44,10 +44,12 @@ from __future__ import annotations
 import ast
 import json
 import re
+from bisect import bisect_right
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from . import _spark_sql
+from ._flow import MAX_SOURCES, Flow, TooMuch
 from ._fold import MAX_SQL_STRING, FoldedDict, Folder, Unresolved
 from ._pysource import MAX_TOTAL_SQL_CHARS, Module, clean_chars, qualified_name, snippet
 from ._redact import scrub_host, scrub_path
@@ -98,6 +100,38 @@ _TERMINALS = frozenset(
 )
 
 _PLAIN_TABLE = re.compile(r"[A-Za-z0-9_$`.\-]+")
+
+#: DataFrame methods that take another DataFrame, so a name given to them is data, not a value.
+_FRAME_METHODS = frozenset(
+    {"join", "crossJoin", "union", "unionAll", "unionByName", "intersect", "intersectAll"}
+    | {"subtract", "exceptAll", "broadcast", "createDataFrame", "sql", "lateralJoin"}
+)
+#: Methods (Spark 4) called ON a DataFrame to make a value from it: a subquery. What they are
+#: called on is data, not a value.
+_FRAME_RECEIVERS = frozenset({"exists", "scalar", "asTable"})
+#: Options a stream sink may have without naming anything it writes to (lower case, as
+#: :meth:`_Reader._options` has them): a connector's own options (``topic``, ``es.resource``,
+#: ``collection``, ``url``) are where a persistent sink says where it writes.
+_SINK_PLAIN_OPTIONS = frozenset({"checkpointlocation", "queryname", "numrows", "truncate"})
+#: Methods that run a function over the rows: what the function reads is not known.
+_FUNCTION_METHODS = frozenset(
+    {"transform", "mapInPandas", "mapInArrow", "applyInPandas", "cogroup", "foreach"}
+    | {"foreachBatch", "foreachPartition", "map", "flatMap", "mapPartitions", "udf", "pandas_udf"}
+    | {"rdd", "toPandas", "collect"}
+)
+#: Options that say WHAT a source or a sink is (where it reads or writes, and its state). A
+#: variable's later assignment may add other options, never one of these: it would be a different
+#: source or sink in each branch.
+_IDENTITY_OPTIONS = frozenset(
+    {"path", "paths", "topic", "subscribe", "subscribepattern", "assign", "table", "dbtable"}
+    | {"url", "query", "kafka.bootstrap.servers", "checkpointlocation"}
+)
+#: Joins the triggers a stream may have when the code picks one by a branch.
+TRIGGER_SEPARATOR = " | "
+#: How many assignments of one variable may be the last to set a stream's trigger at one use.
+MAX_CHAIN_SOURCES = MAX_SOURCES
+#: Statements the flow of the variables of one file may read in all.
+MAX_FLOW_VISITS_PER_FILE = 300_000
 
 #: A placeholder a templating layer fills in later, in SQL that is not an f-string: ``${db}``,
 #: ``{db}``, ``{{ db }}``, ``%(db)s``. The SQL parser would read the text around it as a name.
@@ -170,6 +204,30 @@ def _placeholders_to_holes(text: str, holes: Dict[str, str]) -> str:
     return _PLACEHOLDER.sub(token, text)
 
 
+def path_root(known: str, rules: Sequence[Tuple[str, bool]]) -> Optional[str]:
+    """The table a path names when only its beginning is known (``known``, the text before the
+    first part that does not fold), by the first of the conventions' path ``rules`` it falls
+    under: the rule's prefix and the segment after it (the rule's prefix alone when the rule gives
+    a fixed table). ``None`` when no rule applies, or when the segment that names the table is not
+    complete in what is known (it may go on in the part that does not fold). ``rules`` are
+    ``(prefix, the rule names a table)``, in the order the conventions give them."""
+    path = known.split("?")[0].split("#")[0]
+    for prefix, fixed in rules:
+        base = prefix.rstrip("/")
+        if not path.startswith(base + "/"):  # the text may go on past ``base``: a longer name
+            continue
+        if fixed:
+            return base
+        rest = path[len(base) :].lstrip("/")
+        if "/" not in rest:
+            return None  # the segment may go on where the text stops being known
+        segment = rest.split("/")[0]
+        if segment in {"", ".", ".."} or "%" in segment or ".." in rest.split("/"):
+            return None  # a path that goes up, or an encoded one, is not the table it starts with
+        return base + "/" + segment
+    return None
+
+
 @dataclass(frozen=True)
 class HelperSpec:
     """A project function the operator declared as Spark IO, in the conventions:
@@ -213,6 +271,9 @@ class Read(Ref):
     streaming: bool = False
     #: Kafka bootstrap servers, when given as a constant.
     host: Optional[str] = None
+    #: True for a read that feeds one write and nothing else: one a closed SQL statement makes
+    #: (see :meth:`_Reader._on_sql`), or one written inside the expression of a write.
+    exclusive: bool = False
 
 
 @dataclass(frozen=True)
@@ -225,6 +286,10 @@ class Write(Ref):
     query_name: Optional[str] = None
     output_mode: Optional[str] = None
     host: Optional[str] = None
+    #: The keys (:func:`read_key`) of every read that feeds this write, when the code says (a SQL
+    #: statement that names all it reads, a DataFrame built from reads and nothing the reader
+    #: cannot follow); ``None`` when any read of the job may feed it.
+    feeds: Optional[Tuple[Tuple[Any, ...], ...]] = None
 
 
 @dataclass(frozen=True)
@@ -242,6 +307,12 @@ class Stream:
     batch_function: Optional[Tuple[int, int]] = None
 
 
+def read_key(read: "Read") -> Tuple[Any, ...]:
+    """What identifies a read among the reads of one job: two reads with this key are one read
+    (a chain that two calls both reach), and a write names the reads that feed it by it."""
+    return (read.kind, read.parts, read.shown, read.line)
+
+
 @dataclass
 class JobFacts:
     """What one file does with Spark."""
@@ -252,6 +323,9 @@ class JobFacts:
     streams: List[Stream] = field(default_factory=list)
     #: Job-level lines for the report: SQL that did not parse, JDBC, names from parameters.
     notes: List[str] = field(default_factory=list)
+    #: Lines for the report that are about what was read, not about what was not: a person checks
+    #: them, nothing has to be re-authored.
+    remarks: List[str] = field(default_factory=list)
     #: The file imports pyspark or builds a session.
     is_spark: bool = False
 
@@ -273,6 +347,22 @@ class _Link:
     name: str
     call: Optional[ast.Call]  # None for a plain attribute (``.read``, ``.write``)
     node: ast.AST
+    #: 0 for a link every run goes through. ``k`` for a link added by the ``k``-th later
+    #: assignment of the variable the chain started from (``if a: w = w.trigger(x)``): one branch.
+    branch: int = 0
+    #: For a link of a branch: every path to the use goes through one of the branches, so the
+    #: trigger the chain had before them does not apply.
+    covered: bool = False
+
+
+@dataclass
+class _Chain:
+    """A variable that later assignments only add to: the assignment that starts it, the links each
+    later one adds (by number), and what the flow of its body says about each use."""
+
+    base: ast.expr
+    additions: Dict[int, List[_Link]]
+    flow: Flow
 
 
 def split_table_name(text: str) -> List[str]:
@@ -305,20 +395,49 @@ class _Reader:
         helpers: Mapping[str, HelperSpec],
         session_names: Iterable[str],
         shown: Optional[str] = None,
+        path_rules: Sequence[Tuple[str, bool]] = (),
     ) -> None:
         self.module = module
         self.folder = folder
         self.helpers = helpers
+        self.path_rules = tuple(path_rules)
         self.sessions: Set[str] = set(session_names)
         self.file = shown or module.rel
         self.facts = JobFacts(rel=module.rel)
         self.temp_views: Set[str] = set()
+        #: A view the file registers under a name that is not a constant (a helper's parameter, the
+        #: environment): a name with no database in front of it may be that view.
+        self._views_uncertain = False
+        #: Whether the file has a ``writeStream`` anywhere; ``None`` until asked.
+        self._stream_writer: Optional[bool] = None
         self.default_checkpoint: Optional[str] = None
+        #: What feeds what: the reads each call made (positions in ``facts.reads``), the calls
+        #: whose reads are not all in ``facts.reads`` (a name that did not fold, a temporary view,
+        #: SQL that did not parse), the call being read, and the expression the write being read
+        #: is made of.
+        self._produced: Dict[int, List[int]] = {}
+        self._open: Set[int] = set()
+        self._current: Optional[ast.Call] = None
+        self._expression: Optional[ast.AST] = None
+        self._write_exprs: List[Tuple[int, ast.AST]] = []
         self.parameter_named = 0
         self._handled: Set[int] = set()
         #: What the SQL parser found in a statement, by the statement (and its holes): the same
         #: text passed to ``spark.sql`` a thousand times is parsed once.
         self._sql_cache: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], _spark_sql.SqlFacts] = {}
+        #: The SQL text of a ``spark.sql`` call, folded once (the views it registers are read
+        #: before any statement is, and the statement itself after).
+        self._sql_folds: Dict[int, Optional[Tuple[Any, Dict[str, str]]]] = {}
+        #: The variables that later assignments only add to, by the scope and the name (``None``:
+        #: not one that can be followed).
+        self._chains: Dict[Tuple[int, str], Optional[_Chain]] = {}
+        self._flow_left = MAX_FLOW_VISITS_PER_FILE
+        #: The loads of each name in the file, and the first line of each statement of a body.
+        self._name_loads: Optional[Dict[str, List[ast.Name]]] = None
+        #: The statements that load a name, by the name and the scope they are in (``id`` of
+        #: the scope and of the statement): worked out once per name.
+        self._uses: Dict[str, Dict[int, Dict[int, ast.stmt]]] = {}
+        self._body_starts: Dict[int, List[int]] = {}
 
     # ── entry ───────────────────────────────────────────────────────
 
@@ -344,11 +463,13 @@ class _Reader:
                 self.facts.is_spark = True
                 for parent in self._assignment_targets(call):
                     self.sessions.add(parent)
-            elif func.attr in _TEMP_VIEW_METHODS and call.args:
-                name = self.folder.string(call.args[0])
+            elif func.attr in _TEMP_VIEW_METHODS:
+                node = self._arg(call, 0, "name")
+                name = self.folder.string(node) if node is not None else None
                 if isinstance(name, str):
                     self.temp_views.add(name.lower())
                 else:
+                    self._views_uncertain = True
                     self.facts.notes.append(
                         f"{self.file}:{call.lineno} registers a temporary view under a name that "
                         "is not a constant: a read of a table this file does not name may be "
@@ -360,6 +481,125 @@ class _Reader:
                     value = self.folder.string(call.args[1])
                     if isinstance(value, str):
                         self.default_checkpoint = value
+        self._register_views(calls)
+
+    def _register_views(self, calls: Sequence[ast.Call]) -> None:
+        """Every view the file registers is known before any statement is read: a statement above
+        the one that registers a view (in a function defined first) may read it."""
+        for call in calls:
+            func = call.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr == "sql" and self._on_session(func.value):
+                self._views_of_sql(call)
+            elif func.attr in {"start", "toTable"}:
+                self._views_of_sink(call)
+
+    def _views_of_sql(self, call: ast.Call) -> None:
+        """The temporary views a ``spark.sql`` call registers (``CREATE TEMP VIEW``, ``CACHE
+        TABLE v AS``)."""
+        sql = self._sql_facts(call)
+        if sql is None:
+            return
+        for view in sql.temp_views:
+            if "__fluidhole" in view:
+                self._views_uncertain = True  # a view named by a field that did not fold
+            else:
+                self.temp_views.add(view)
+
+    def _views_of_sink(self, call: ast.Call) -> None:
+        """A ``memory`` sink registers a table named by its ``queryName``: a view, to SQL.
+
+        A sink that cannot be read to the end leaves the file's views uncertain: a writer kept in a
+        name that is assigned more than once, in a container or picked by a condition (the chain
+        does not lead back to ``writeStream``), or a format that is not a constant. Both only
+        matter in a file that writes a stream.
+        """
+        links, _root = self._links(call)
+        marker = self._marker(links)
+        if marker is None:
+            if self._writes_streams():
+                self._views_uncertain = True
+            return
+        if links[marker].call is not None or links[marker].name != "writeStream":
+            return
+        fmt, fmt_known = self._sink_format(call, links[marker + 1 :])
+        if not fmt_known:
+            self._views_uncertain = True  # it may be a memory sink
+            return
+        if fmt != "memory":
+            return
+        name = self._literal(self._sink_query_name(call, links[marker + 1 :]))
+        if name:
+            self.temp_views.add(name.lower())
+        else:
+            self._views_uncertain = True
+
+    def _sink_format(self, call: ast.Call, links: Sequence[_Link]) -> Tuple[str, bool]:
+        """``(format, whether it is a constant)`` of a sink: the last ``format`` link wins, and
+        ``start(format=...)`` is the one before it."""
+        node = self._arg(call, 1, "format")
+        fmt: Optional[str] = None if node is None else self._literal(node)
+        known = node is None or fmt is not None
+        for link in links:
+            if link.name == "format" and link.call is not None and link.call.args:
+                fmt = self._literal(link.call.args[0])
+                known = fmt is not None
+        return (fmt or "").lower(), known
+
+    def _sink_query_name(self, call: ast.Call, links: Sequence[_Link]) -> Optional[ast.expr]:
+        """The expression that names the sink's query: ``queryName(...)``, ``option("queryName",
+        ...)``, ``options(queryName=...)`` or ``start(queryName=...)``, the last one given."""
+        name = self._arg(call, 4, "queryName")
+        for link in links:
+            inner = link.call
+            if inner is None:
+                continue
+            if link.name == "queryName" and inner.args:
+                name = inner.args[0]
+            elif (
+                link.name == "option"
+                and len(inner.args) >= 2
+                and (self._literal(inner.args[0]) or "").lower() == "queryname"
+            ):
+                name = inner.args[1]
+            elif link.name == "options":
+                for kw in inner.keywords:
+                    if (kw.arg or "").lower() == "queryname":
+                        name = kw.value
+        return name
+
+    def _writes_streams(self) -> bool:
+        """Whether the file has a ``writeStream`` anywhere (a stream is written in it)."""
+        if self._stream_writer is None:
+            self._stream_writer = any(
+                isinstance(n, ast.Attribute) and n.attr == "writeStream"
+                for n in ast.walk(self.module.tree)
+            )
+        return self._stream_writer
+
+    def _sql_facts(self, call: ast.Call) -> Optional[_spark_sql.SqlFacts]:
+        """What the SQL of a ``spark.sql`` call holds, when its text folds; read once for each
+        text. ``None`` when it does not fold (it is said when the statement is read)."""
+        folded = self._sql_text(call)
+        if folded is None or isinstance(folded[0], Unresolved):
+            return None
+        value, holes = folded
+        key = (value, tuple(sorted(holes.items())))
+        sql = self._sql_cache.get(key)
+        if sql is None:
+            prepared = _placeholders_to_holes(value, holes)
+            sql = self._sql_cache[key] = self._analyze_sql(prepared, holes)
+        return sql
+
+    def _sql_text(self, call: ast.Call) -> Optional[Tuple[Any, Dict[str, str]]]:
+        key = id(call)
+        if key not in self._sql_folds:
+            node = self._arg(call, 0, "sqlQuery")
+            self._sql_folds[key] = (
+                None if node is None else self.folder.fold_sql(node, limit=MAX_SQL_STRING)
+            )
+        return self._sql_folds[key]
 
     def _assignment_targets(self, call: ast.Call) -> List[str]:
         """Names a chain ending in ``call`` is assigned to (``spark = ....getOrCreate()``)."""
@@ -378,9 +618,10 @@ class _Reader:
 
     # ── chains ──────────────────────────────────────────────────────
 
-    def _links(self, node: ast.AST, depth: int = 0) -> Tuple[List[_Link], ast.AST]:
+    @staticmethod
+    def _plain_links(node: ast.AST) -> Tuple[List[_Link], ast.AST]:
         """The method and attribute links of a fluent expression, root first, and the root
-        expression. A root variable assigned once to another chain is followed (three levels)."""
+        expression, as written (a root variable is not followed)."""
         links: List[_Link] = []
         current = node
         while True:
@@ -393,25 +634,224 @@ class _Reader:
             else:
                 break
         links.reverse()
-        if isinstance(current, ast.Name) and depth < 3:
-            bound = self._bound_expression(current)
-            if bound is not None and not any(
-                link.name in _READER_MARKERS | _WRITER_MARKERS | {"writeTo"} for link in links
-            ):
-                earlier, root = self._links(bound, depth + 1)
-                return earlier + links, root
         return links, current
 
-    def _bound_expression(self, name: ast.Name) -> Optional[ast.expr]:
-        scope = self.folder.scope_of(name)
-        current: Optional[Any] = scope
+    def _links(self, node: ast.AST, depth: int = 0) -> Tuple[List[_Link], ast.AST]:
+        """The method and attribute links of a fluent expression, root first, and the root
+        expression. A root variable assigned once to another chain is followed (three levels), and
+        so is one that later assignments only add to (:meth:`_extended`)."""
+        links, current = self._plain_links(node)
+        if isinstance(current, ast.Name) and depth < 3:
+            started = any(
+                link.name in _READER_MARKERS | _WRITER_MARKERS | {"writeTo"} for link in links
+            )
+            bound = self._bound_expression(current)
+            if bound is not None and not started:
+                earlier, root = self._links(bound, depth + 1)
+                return earlier + links, root
+            if bound is None and not started:
+                extended = self._extended(current, depth)
+                if extended is not None:
+                    earlier, root = extended
+                    return earlier + links, root
+        return links, current
+
+    def _binding(self, name: ast.Name) -> Optional[Tuple[Any, str]]:
+        """The scope that binds ``name`` where it is used, and how: ``"values"`` (assigned once) or
+        ``"assignments"`` (more than once, by plain assignments only). ``None`` when the file
+        changes the name some other way (``global``, ``:=``, a match capture, ``del``), makes it a
+        function, a class or a recipe, or does not bind it."""
+        if self.folder.rebound(name.id):
+            return None
+        current: Optional[Any] = self.folder.scope_of(name)
         while current is not None:
-            if name.id in current.values:
-                return current.values[name.id]
-            if name.id in current.blocked or name.id in current.classes:
+            for how in ("values", "assignments"):
+                if name.id in getattr(current, how):
+                    return current, how
+            if (
+                name.id in current.blocked
+                or name.id in current.classes
+                or name.id in current.recipes
+            ):
                 return None
             current = current.parent
         return None
+
+    def _assignments(self, name: ast.Name) -> Optional[Tuple[Any, List[ast.expr]]]:
+        """The scope that holds ``name`` and every assignment of it, by position, when it is
+        assigned more than once and only by plain assignments, else ``None``."""
+        found = self._binding(name)
+        if found is None or found[1] != "assignments":
+            return None
+        return found[0], found[0].assignments[name.id]
+
+    def _extended(self, name: ast.Name, depth: int) -> Optional[Tuple[List[_Link], ast.AST]]:
+        """The chain a variable assigned more than once holds at ``name``, when the first
+        assignment starts it and every later one only adds to it: ``w = a.writeStream.format(..)``
+        then ``w = w.trigger(x)`` in one branch and ``w = w.trigger(y)`` in the other. The links
+        of the additions that can be the last to set the trigger by the time ``name`` is used are
+        kept, each tagged as a branch of its own (:class:`_flow.Flow` says which). ``None`` when a
+        later assignment does anything else (starts another chain, changes what the sink or
+        source is), when the use is not in the body that holds the variable (a function that
+        runs later), or when it takes too much to tell: which assignment is meant then depends on
+        the order the code runs in, and the read or write is not followed."""
+        found = self._assignments(name)
+        if found is None:
+            return None
+        scope, expressions = found
+        chain = self._chain(scope, name.id, expressions)
+        if chain is None:
+            return None
+        statement = self._statement_of(name)
+        state = chain.flow.before.get(id(statement)) if statement is not None else None
+        if not state or len(state) > MAX_CHAIN_SOURCES:
+            return None
+        earlier, root = self._links(chain.base, depth + 1)
+        if not any(
+            link.name in _READER_MARKERS | _WRITER_MARKERS | {"writeTo"} for link in earlier
+        ):
+            return None
+        covered = 0 not in state
+        added = [
+            replace(link, branch=number, covered=covered)
+            for number in sorted(state - {0})
+            for link in chain.additions[number]
+        ]
+        return earlier + added, root
+
+    def _chain(self, scope: Any, name: str, expressions: List[ast.expr]) -> Optional[_Chain]:
+        """The chain of ``name`` in ``scope``, worked out once."""
+        key = (id(scope), name)
+        if key not in self._chains:
+            self._chains[key] = self._build_chain(scope, name, expressions)
+        return self._chains[key]
+
+    def _build_chain(self, scope: Any, name: str, expressions: List[ast.expr]) -> Optional[_Chain]:
+        owner = scope.owner
+        body = getattr(owner, "body", None)
+        if not isinstance(owner, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        if not isinstance(body, list):
+            return None
+        parents = self.module.parents
+        base, later = expressions[0], expressions[1:]
+        base_statement = parents.get(base)
+        if not isinstance(base_statement, (ast.Assign, ast.AnnAssign)):
+            return None
+        _, base_root = self._plain_links(base)
+        if isinstance(base_root, ast.Name) and base_root.id == name:
+            return None  # the first one adds to a chain nobody started
+        if self._flow_left <= 0:
+            return None  # the variables of this file have cost all the flow it may read
+        additions: Dict[int, List[_Link]] = {}
+        setters: Dict[int, int] = {}
+        setter_statements: List[ast.stmt] = []
+        for number, expression in enumerate(later, start=1):
+            more, more_root = self._plain_links(expression)
+            if not (isinstance(more_root, ast.Name) and more_root.id == name and more):
+                return None
+            if not all(self._adds_nothing_to_identity(link) for link in more):
+                return None
+            statement = parents.get(expression)
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                return None
+            additions[number] = more
+            if any(link.name == "trigger" for link in more):
+                setters[id(statement)] = number
+                setter_statements.append(statement)
+        uses = self._statements_using(name, scope)
+        if uses is None:
+            return None  # telling where the variable is used would cost all the flow left
+        # only from the statement that starts the variable to the last that sets or uses it
+        starts = self._starts_of(body)
+        spans = [self._top_of(starts, s) for s in (base_statement, *setter_statements, *uses)]
+        flow = Flow(base_statement, setters, {id(s) for s in uses})
+        try:
+            flow.run(body, min(spans), max(spans))
+        except TooMuch:
+            return None
+        finally:
+            self._flow_left -= flow.visits
+        return _Chain(base, additions, flow)
+
+    def _statements_using(self, name: str, scope: Any) -> Optional[List[ast.stmt]]:
+        """The statements of the body of ``scope`` that load ``name``; ``None`` when finding
+        them would cost more than the flow this file may still read (the chain is not followed).
+
+        The loads of a name are sorted into their scopes once, the first time the name is asked
+        about: a file with many chains and many loads is read once per load, not once per
+        chain and load. The pass is charged to the same budget as the flow itself."""
+        if self._name_loads is None:
+            index: Dict[str, List[ast.Name]] = {}
+            for node in ast.walk(self.module.tree):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                    index.setdefault(node.id, []).append(node)
+            self._name_loads = index
+        by_scope = self._uses.get(name)
+        if by_scope is None:
+            loads = self._name_loads.get(name, ())
+            if len(loads) > self._flow_left:
+                return None
+            self._flow_left -= len(loads)
+            by_scope = self._uses[name] = {}
+            for load in loads:
+                statement = self._statement_of(load)
+                if statement is not None:
+                    owner = id(self.folder.scope_of(load))
+                    by_scope.setdefault(owner, {})[id(statement)] = statement
+        return list(by_scope.get(id(scope), {}).values())
+
+    def _starts_of(self, body: List[ast.stmt]) -> List[int]:
+        starts = self._body_starts.get(id(body))
+        if starts is None:
+            starts = self._body_starts[id(body)] = [statement.lineno for statement in body]
+        return starts
+
+    @staticmethod
+    def _top_of(starts: List[int], statement: ast.stmt) -> int:
+        """The place in the body of the statement of it that holds ``statement``."""
+        return max(0, bisect_right(starts, statement.lineno) - 1)
+
+    def _statement_of(self, node: ast.AST) -> Optional[ast.stmt]:
+        """The statement ``node`` is evaluated in, ``None`` when it is in a ``lambda`` or a
+        generator expression: it runs when it is called, which the flow does not say."""
+        parents = self.module.parents
+        current = parents.get(node)
+        while current is not None:
+            if isinstance(current, (ast.Lambda, ast.GeneratorExp)):
+                return None
+            if isinstance(current, ast.stmt):
+                return current
+            current = parents.get(current)
+        return None
+
+    def _adds_nothing_to_identity(self, link: _Link) -> bool:
+        """Whether a link a later assignment adds is one that leaves the source or sink what it
+        is: a trigger, or an option that is not one of :data:`_IDENTITY_OPTIONS`."""
+        call = link.call
+        if call is None:
+            return False
+        if link.name == "trigger":
+            return True
+        if link.name == "option" and len(call.args) >= 2:
+            key = self._literal(call.args[0])
+            return key is not None and key.lower() not in _IDENTITY_OPTIONS
+        if link.name == "options":
+            return (
+                all(
+                    kw.arg is not None and kw.arg.lower() not in _IDENTITY_OPTIONS
+                    for kw in call.keywords
+                )
+                and not call.args
+            )
+        return False
+
+    def _bound_expression(self, name: ast.Name) -> Optional[ast.expr]:
+        """What ``name`` is assigned, when it is assigned once and nothing else changes it."""
+        found = self._binding(name)
+        if found is None or found[1] != "values":
+            return None
+        return found[0].values[name.id]
 
     @staticmethod
     def _marker(links: Sequence[_Link]) -> Optional[int]:
@@ -427,6 +867,17 @@ class _Reader:
     # ── dispatch ────────────────────────────────────────────────────
 
     def _on_call(self, call: ast.Call) -> None:
+        """Read one call, and remember which reads it made."""
+        before = len(self.facts.reads)
+        self._current = call
+        try:
+            self._dispatch(call)
+        finally:
+            self._current = None
+        if len(self.facts.reads) > before:
+            self._produced[id(call)] = list(range(before, len(self.facts.reads)))
+
+    def _dispatch(self, call: ast.Call) -> None:
         func = call.func
         helper = self._helper_for(call)
         if helper is not None:
@@ -478,7 +929,11 @@ class _Reader:
                     if note not in self.facts.notes:
                         self.facts.notes.append(note)
                 return
-            if root.id in current.values or root.id in current.classes:
+            if (
+                root.id in current.values
+                or root.id in current.classes
+                or root.id in current.recipes
+            ):
                 return
             current = current.parent
 
@@ -510,9 +965,47 @@ class _Reader:
             return None
         return self.folder.string(node)
 
+    def _path_text(self, node: Optional[ast.expr]) -> Union[str, Unresolved, None]:
+        """:meth:`_text` for a path: when it does not fold, the table root a conventions rule
+        gives it if the beginning of it does (:meth:`_rooted`)."""
+        value = self._text(node)
+        if isinstance(value, Unresolved) and node is not None:
+            rooted = self._rooted(node)
+            if rooted is not None:
+                return rooted
+        return value
+
+    def _rooted(self, node: ast.expr) -> Optional[str]:
+        """The table root of a path such as ``f"{LANDING}/orders/dt={run_date}/"``, whose end is
+        not a constant (a run date, a parameter) but whose beginning is the prefix of one of the
+        conventions' path rules and runs past the segment that names the table."""
+        if not self.path_rules:
+            return None
+        text, holes = self.folder.fold_sql(node)
+        if not isinstance(text, str) or not holes:
+            return None
+        cut = text.find(_spark_sql.HOLE.split("{")[0])
+        root = path_root(text if cut < 0 else text[:cut], self.path_rules)
+        if root is not None:
+            note = (
+                f"{self.file}:{getattr(node, 'lineno', 0)} reads or writes a path that is not a "
+                f"constant past {scrub_path(root)}: it is taken as that table"
+            )
+            if note not in self.facts.remarks and len(self.facts.remarks) < MAX_NOTES_PER_JOB:
+                self.facts.remarks.append(note)
+        return root
+
     def _literal(self, node: Optional[ast.expr]) -> Optional[str]:
         value = self._text(node)
         return value if isinstance(value, str) else None
+
+    def _option_value(self, key: str, node: ast.expr) -> Any:
+        """The folded value of an option; a ``path`` that only folds at its beginning is the
+        table root the conventions give it (:meth:`_rooted`)."""
+        value = self.folder.fold(node)
+        if isinstance(value, Unresolved) and key.lower() == "path":
+            return self._rooted(node) or value
+        return value
 
     def _options(self, links: Sequence[_Link]) -> Tuple[Dict[str, Any], Optional[str]]:
         """``({option key: folded value}, format)`` from the ``option``, ``options`` and
@@ -528,11 +1021,11 @@ class _Reader:
             elif link.name == "option" and len(call.args) >= 2:
                 key = self._literal(call.args[0])
                 if key is not None:
-                    options[key.lower()] = self.folder.fold(call.args[1])
+                    options[key.lower()] = self._option_value(key, call.args[1])
             elif link.name == "options":
                 for kw in call.keywords:
                     if kw.arg is not None:
-                        options[kw.arg.lower()] = self.folder.fold(kw.value)
+                        options[kw.arg.lower()] = self._option_value(kw.arg, kw.value)
                     else:
                         spread = self.folder.fold(kw.value)
                         if isinstance(spread, FoldedDict):
@@ -576,7 +1069,7 @@ class _Reader:
     def _path_or_table(self, node: Optional[ast.expr], at: ast.AST, fmt: Optional[str]) -> Ref:
         """The target of ``load``/``save``: for Iceberg a bare name is a table identifier (the
         Iceberg docs write ``save("glue.db.t")``); anything with a slash or a scheme is a path."""
-        value = self._text(node)
+        value = self._path_text(node)
         if (
             fmt == "iceberg"
             and isinstance(value, str)
@@ -588,17 +1081,31 @@ class _Reader:
 
     # ── records ─────────────────────────────────────────────────────
 
-    def _add_read(self, ref: Ref, *, streaming: bool, host: Optional[str] = None) -> None:
+    def _drop(self) -> None:
+        """A read the call makes is not recorded: the reads of the call are not all known."""
+        if self._current is not None:
+            self._open.add(id(self._current))
+
+    def _add_read(
+        self, ref: Ref, *, streaming: bool, host: Optional[str] = None, exclusive: bool = False
+    ) -> Optional[int]:
+        """Record a read; its position in ``facts.reads``, or ``None`` when it was not recorded."""
         if not ref.resolved and _PARAMETER in ref.why:
             self.parameter_named += 1
-            return
+            self._drop()
+            return None
         if ref.kind == "table" and ref.resolved and self._is_temp_view(ref):
-            return
+            self._drop()
+            return None
         if len(self.facts.reads) >= MAX_REFS_PER_JOB:
             self._too_many("reads")
-            return
+            self._drop()
+            return None
         host = scrub_host(host) if host else host
-        self.facts.reads.append(Read(**_fields(ref), streaming=streaming, host=host))
+        self.facts.reads.append(
+            Read(**_fields(ref), streaming=streaming, host=host, exclusive=exclusive)
+        )
+        return len(self.facts.reads) - 1
 
     def _add_write(self, ref: Ref, **extra: Any) -> None:
         if not ref.resolved and _PARAMETER in ref.why:
@@ -610,11 +1117,18 @@ class _Reader:
         if extra.get("host"):
             extra["host"] = scrub_host(extra["host"])
         self.facts.writes.append(Write(**_fields(ref), **extra))
+        if self._expression is not None and "feeds" not in extra:
+            self._write_exprs.append((len(self.facts.writes) - 1, self._expression))
 
     def _too_many(self, kind: str) -> None:
         note = f"{self.file}: more than {MAX_REFS_PER_JOB:,} {kind}: the rest are not listed"
         if note not in self.facts.notes:
             self.facts.notes.append(note)
+
+    def _is_table(self, ref: Ref) -> bool:
+        """Whether ``ref`` is surely a table: when the file registers a view under a name it does
+        not give, a name with no database in front of it may be that view."""
+        return not self._views_uncertain or len(ref.parts) >= 2
 
     def _is_temp_view(self, ref: Ref) -> bool:
         if len(ref.parts) == 1:
@@ -636,7 +1150,11 @@ class _Reader:
         keyword = spec.arg if isinstance(spec.arg, str) else None
         node = self._arg(call, position, keyword)
         ref = self._ref(
-            spec.kind, self._text(node), call, spec.fmt, missing="the argument is not given"
+            spec.kind,
+            self._path_text(node) if spec.kind == "path" else self._text(node),
+            call,
+            spec.fmt,
+            missing="the argument is not given",
         )
         if spec.direction == "reads":
             self._add_read(ref, streaming=False)
@@ -646,11 +1164,12 @@ class _Reader:
     # ── SQL ─────────────────────────────────────────────────────────
 
     def _on_sql(self, call: ast.Call) -> None:
-        node = self._arg(call, 0, "sqlQuery")
-        if node is None:
+        folded = self._sql_text(call)
+        if folded is None:
             return
-        value, holes = self.folder.fold_sql(node, limit=MAX_SQL_STRING)
+        value, _holes = folded
         if isinstance(value, Unresolved):
+            self._drop()  # what it reads is not known
             if _PARAMETER in value.why:
                 self.parameter_named += 1
             else:
@@ -659,22 +1178,55 @@ class _Reader:
                     f"constant ({value.why})"
                 )
             return
-        # Looked up before the text is read for placeholders: the same constant passed to a
-        # thousand ``spark.sql`` calls is read once.
-        key = (value, tuple(sorted(holes.items())))
-        sql = self._sql_cache.get(key)
-        if sql is None:
-            prepared = _placeholders_to_holes(value, holes)
-            sql = self._sql_cache[key] = self._analyze_sql(prepared, holes)
-        self.temp_views.update(sql.temp_views)
+        # the same constant passed to a thousand ``spark.sql`` calls is read once
+        sql = self._sql_facts(call)
+        assert sql is not None
+        self.temp_views.update(v for v in sql.temp_views if "__fluidhole" not in v)
         for note in sql.notes:
+            self._drop()  # SQL that was not read whole
             self.facts.notes.append(f"{self.file}:{call.lineno} {note}")
+        self._record_sql(call, sql)
+
+    def _record_sql(self, call: ast.Call, sql: _spark_sql.SqlFacts) -> None:
+        """The reads and the writes of a statement that was read, each write with the reads that
+        feed it when the statement says so."""
+        refs = {id(name): self._from_sql_name(name, call) for name in sql.reads}
+        #: A statement is closed when everything it reads is a table or a path that is named:
+        #: nothing it reads is a temporary view (which something else built) or a name with a
+        #: hole, so the tables it names are all that feed what it writes. Its reads feed that
+        #: write and nothing else, and the proposal lists only them for the product.
+        closed: Dict[int, bool] = {}
+        owned: Set[int] = set()
+        for index, write in enumerate(sql.writes):
+            sources = [refs[id(s)] for s in write.sources if id(s) in refs]
+            closed[index] = all(
+                r.resolved and not self._is_temp_view(r) and self._is_table(r) for r in sources
+            )
+            if closed[index]:
+                owned.update(id(s) for s in write.sources)
+        position: Dict[int, Optional[int]] = {}
         for name in sql.reads:
-            ref = self._from_sql_name(name, call)
-            self._add_read(ref, streaming=False)
-        for write in sql.writes:
+            position[id(name)] = self._add_read(
+                refs[id(name)], streaming=False, exclusive=id(name) in owned
+            )
+        for index, write in enumerate(sql.writes):
             ref = self._from_sql_name(write.name, call)
-            self._add_write(ref, mode=write.mode)
+            feeds = None
+            if closed[index] and not self._unrecorded(write.sources, position):
+                feeds = tuple(
+                    sorted(
+                        {
+                            read_key(self.facts.reads[p])
+                            for s in write.sources
+                            if (p := position.get(id(s))) is not None
+                        }
+                    )
+                )
+            self._add_write(ref, mode=write.mode, feeds=feeds)
+
+    @staticmethod
+    def _unrecorded(sources: Sequence[Any], position: Dict[int, Optional[int]]) -> bool:
+        return any(position.get(id(s)) is None for s in sources)
 
     def _analyze_sql(self, prepared: str, holes: Dict[str, str]) -> _spark_sql.SqlFacts:
         """What the parser finds in a statement, unless this import has parsed all the SQL it
@@ -720,6 +1272,8 @@ class _Reader:
                     )
                     continue
                 value = self.folder.fold(node)
+                if isinstance(value, Unresolved):
+                    value = self._rooted(node) or value
                 items = value if isinstance(value, list) else [value]
                 for item in items:
                     self._add_read(
@@ -734,7 +1288,8 @@ class _Reader:
             keyword_path = self._arg(call, None, "path")
             if keyword_path is not None:
                 self._add_read(
-                    self._ref("path", self._text(keyword_path), call, name), streaming=streaming
+                    self._ref("path", self._path_text(keyword_path), call, name),
+                    streaming=streaming,
                 )
         elif name == "jdbc":
             self.facts.notes.append(
@@ -859,13 +1414,24 @@ class _Reader:
         terminal = own[-1] if own else None
         if terminal is None or terminal.call is not call:
             return
+        self._expression = getattr(start.node, "value", None)
+        try:
+            self._write(call, own, streaming=streaming)
+        finally:
+            self._expression = None
+
+    def _write(self, call: ast.Call, own: Sequence[_Link], *, streaming: bool) -> None:
+        terminal = own[-1]
         options, fmt = self._options(own[:-1])
         mode = None
-        trigger = None
+        triggers: Dict[int, str] = {}  # by branch; the last one of a branch wins
+        #: A trigger set after every branch (where the writer is used): it replaces what they set.
+        late: Optional[str] = None
+        after = max((i for i, link in enumerate(own[:-1]) if link.branch), default=-1)
         query_name = None
         output_mode = None
         foreach: Optional[ast.expr] = None
-        for link in own[:-1]:
+        for position, link in enumerate(own[:-1]):
             if link.call is None:
                 continue
             args = link.call.args
@@ -876,11 +1442,16 @@ class _Reader:
             elif link.name == "queryName" and args:
                 query_name = self._literal(args[0]) or query_name
             elif link.name == "trigger":
-                trigger = self._trigger(link.call) or trigger
+                found = self._trigger(link.call)
+                if found:
+                    triggers[link.branch] = found
+                if position > after >= 0:
+                    late = found or "default"
             elif link.name == "foreachBatch" and args:
                 foreach = args[0]
             elif link.name == "foreach":
                 fmt = fmt or "foreach"
+        trigger = self._trigger_of_write(call, own, triggers, late) if streaming else None
         name = terminal.name
         kwargs = {kw.arg: kw.value for kw in call.keywords if kw.arg}
         checkpoint = self._checkpoint(options, kwargs)
@@ -903,6 +1474,23 @@ class _Reader:
         fmt = (fmt_arg or fmt or "").lower() or None
         if foreach is not None:
             self._foreach_batch(call, foreach, extra)
+            return
+        if (
+            streaming
+            and name == "start"
+            and not self._sink_format(call, own[:-1])[1]
+            and self._arg(call, 0, "path") is None
+            and set(options) <= _SINK_PLAIN_OPTIONS
+        ):
+            # a format that is not a constant and nothing to write to (no path, and no option
+            # that names a target): as far as the code says, a memory, console or foreach sink.
+            # Nothing persistent, so the reads stay unowned
+            note = (
+                f"{self.file}:{call.lineno} writes a stream whose format is not a constant and "
+                "that names nothing it writes to: it is taken for a memory or console sink"
+            )
+            if note not in self.facts.remarks and len(self.facts.remarks) < MAX_NOTES_PER_JOB:
+                self.facts.remarks.append(note)
             return
         if fmt in _NON_PERSISTENT:
             return
@@ -946,7 +1534,7 @@ class _Reader:
             extra["mode"] = (
                 self._literal(self._arg(call, mode_at, "mode")) or mode or ""
             ).lower() or None
-            self._add_write(self._ref("path", self._text(node), call, name), **extra)
+            self._add_write(self._ref("path", self._path_text(node), call, name), **extra)
 
     def _on_write_v2(self, call: ast.Call, own: Sequence[_Link], start: _Link) -> None:
         terminal = own[-1] if own else None
@@ -958,7 +1546,12 @@ class _Reader:
             if link.name == "using" and link.call is not None and link.call.args:
                 fmt = (self._literal(link.call.args[0]) or "").lower() or None
         ref = self._table_ref(self._arg(start.call, 0, "table"), start.call, fmt)
-        self._add_write(ref, mode=_V2_TERMINALS[terminal.name])
+        func = start.call.func
+        self._expression = func.value if isinstance(func, ast.Attribute) else None
+        try:
+            self._add_write(ref, mode=_V2_TERMINALS[terminal.name])
+        finally:
+            self._expression = None
 
     def _kafka_write(self, call: ast.Call, options: Dict[str, Any], extra: Dict[str, Any]) -> None:
         topic = options.get("topic")
@@ -987,6 +1580,42 @@ class _Reader:
         if isinstance(value, str):
             return value
         return f"(not a constant: {value.why})" if isinstance(value, Unresolved) else None
+
+    def _trigger_of_write(
+        self,
+        call: ast.Call,
+        own: Sequence[_Link],
+        triggers: Mapping[int, str],
+        late: Optional[str] = None,
+    ) -> Optional[str]:
+        """The trigger of a stream. When the code picks it by a branch (``if a: w = w.trigger(x)``
+        ``else: w = w.trigger(y)``) it is every one that can apply, joined by
+        :data:`TRIGGER_SEPARATOR`: the path through no branch counts too (the trigger set before
+        it, else Spark's default) unless every path goes through one. A stream that may keep
+        running is then not taken for a one-shot. A trigger set after the branches (``w.trigger(
+        availableNow=True).toTable(...)``) is the one the stream has, whichever branch ran."""
+        if late is not None:
+            return late
+        if not triggers:
+            return None
+        branches = sorted({link.branch for link in own if link.branch})
+        if not branches:
+            return triggers.get(0)
+        # a branch whose trigger the code does not read may be anything: not a one-shot
+        chosen = [triggers.get(branch, "default") for branch in branches]
+        if not all(link.covered for link in own if link.branch):
+            chosen.append(triggers.get(0, "default"))
+        # the separator inside a trigger would be read as two
+        alternatives = list(dict.fromkeys(v.replace(TRIGGER_SEPARATOR, " / ") for v in chosen))
+        if len(alternatives) > 1:
+            note = (
+                f"{self.file}:{call.lineno} the trigger of this stream is picked by a branch of "
+                f"the code ({', '.join(alternatives)}): it is `continuous` unless every one of "
+                "them ends by itself"
+            )
+            if note not in self.facts.remarks:
+                self.facts.remarks.append(note)
+        return TRIGGER_SEPARATOR.join(alternatives)
 
     def _trigger(self, call: ast.Call) -> Optional[str]:
         """``processingTime=1 minute``, ``availableNow``, ``once``, ``continuous=1 second``."""
@@ -1031,7 +1660,149 @@ class _Reader:
 
     # ── the end ─────────────────────────────────────────────────────
 
+    # ── what feeds what ─────────────────────────────────────────────
+
+    #: Nodes one expression is followed through, and the names it is followed through.
+    _MAX_LINEAGE_NODES = 400
+    _MAX_LINEAGE_DEPTH = 6
+
+    def _lineage(self) -> None:
+        """Tie each write that is made of a DataFrame to the reads that DataFrame is made of."""
+        facts = self.facts
+        for index, expression in self._write_exprs:
+            found = self._made_of(expression)
+            if found is None:
+                continue
+            keys = tuple(sorted({read_key(facts.reads[position]) for position in found}))
+            facts.writes[index] = replace(facts.writes[index], feeds=keys)
+            for position, inline in found.items():
+                if inline and not facts.reads[position].exclusive:
+                    facts.reads[position] = replace(facts.reads[position], exclusive=True)
+
+    def _made_of(self, expression: ast.AST) -> Optional[Dict[int, bool]]:
+        """The reads an expression is made of, as ``{position: written inside the expression}``
+        (not reached through a name, so nothing else uses it), or ``None`` when part of it that
+        carries data is not understood: a name that is not a session, a pyspark import or assigned
+        once, a call to anything but a method, a pyspark function or a session, a lambda, a
+        comprehension, a read whose name did not fold. What only gives a value (a name inside an
+        f-string, a comparison or a pyspark function's argument) need not be understood, unless it
+        is a function or class of the file, which may read anything."""
+        found: Dict[int, bool] = {}
+        budget = [self._MAX_LINEAGE_NODES]
+
+        def walk(node: ast.AST, depth: int, shared: bool, scalar: bool) -> bool:
+            budget[0] -= 1
+            if budget[0] < 0 or depth > self._MAX_LINEAGE_DEPTH:
+                return False
+            if isinstance(node, ast.Constant):
+                return True
+            if isinstance(node, ast.Name):
+                if node.id in self.sessions or self._is_pyspark(node.id):
+                    return True
+                how = self.folder.how_bound(node)
+                if how == "once":
+                    bound = self._bound_expression(node)
+                    return bound is not None and walk(bound, depth + 1, True, scalar)
+                if how == "many":  # every one of its assignments is what it may hold
+                    found_all = self._assignments(node)
+                    return found_all is not None and all(
+                        walk(each, depth + 1, True, scalar) for each in found_all[1]
+                    )
+                if how in {"parameter", "imported", "unbound"}:
+                    return scalar  # a function or a class of the file is ``other``, above
+                return (
+                    False  # unpacked, a loop variable, changed in place: what it holds is unknown
+                )
+            if isinstance(node, ast.Attribute):
+                return walk(node.value, depth, shared, scalar)
+            if isinstance(node, ast.Call):
+                if id(node) in self._open:
+                    return False
+                for position in self._produced.get(id(node), ()):
+                    found[position] = found.get(position, True) and not shared
+                func = node.func
+                inner = scalar
+                if isinstance(func, ast.Attribute):
+                    if func.attr in _FUNCTION_METHODS:
+                        return False
+                    ok = walk(
+                        func.value, depth, shared, scalar and func.attr not in _FRAME_RECEIVERS
+                    )
+                    inner = scalar or func.attr not in _FRAME_METHODS
+                elif isinstance(func, ast.Name):
+                    callee = (qualified_name(func, self.module.imports) or func.id).rsplit(".", 1)[
+                        -1
+                    ]
+                    if self._is_pyspark(func.id):
+                        ok = True
+                    elif self.folder.how_bound(func) in {"once", "many"}:
+                        # a name that holds a function (an alias, a lambda, a partial): what it
+                        # holds is what is called, and a lambda or a function of the file is not
+                        # understood
+                        ok = scalar and walk(func, depth + 1, shared, True)
+                    else:
+                        ok = scalar and not self._is_callable_of_file(func)
+                    inner = scalar or callee not in _FRAME_METHODS
+                else:
+                    ok = False
+                return ok and all(
+                    walk(argument, depth, shared, inner)
+                    for argument in (*node.args, *(k.value for k in node.keywords))
+                )
+            if isinstance(node, ast.Starred):
+                return walk(node.value, depth, shared, scalar)
+            if isinstance(node, ast.Subscript):
+                return walk(node.value, depth, shared, scalar) and walk(
+                    node.slice, depth, shared, True
+                )
+            if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+                return all(walk(item, depth, shared, scalar) for item in node.elts)
+            if isinstance(node, ast.Dict):
+                return all(
+                    walk(part, depth, shared, scalar)
+                    for part in (*node.keys, *node.values)
+                    if part is not None
+                )
+            if isinstance(node, (ast.JoinedStr, ast.BoolOp, ast.Compare, ast.BinOp, ast.UnaryOp)):
+                return all(walk(child, depth, shared, True) for child in ast.iter_child_nodes(node))
+            if isinstance(node, ast.FormattedValue):
+                return walk(node.value, depth, shared, True)
+            if isinstance(node, ast.Slice):
+                return all(
+                    walk(part, depth, shared, True)
+                    for part in (node.lower, node.upper, node.step)
+                    if part is not None
+                )
+            if isinstance(node, ast.IfExp):
+                return walk(node.test, depth, shared, True) and all(
+                    walk(n, depth, shared, scalar) for n in (node.body, node.orelse)
+                )
+            if isinstance(node, (ast.operator, ast.cmpop, ast.boolop, ast.unaryop)):
+                return True
+            return False
+
+        return found if walk(expression, 0, False, False) else None
+
+    def _is_callable_of_file(self, node: ast.Name) -> bool:
+        """Whether ``node`` is a function or a class defined in the file (it may read anything)."""
+        current: Optional[Any] = self.folder.scope_of(node)
+        while current is not None:
+            why = current.blocked.get(node.id)
+            if why is not None:
+                return "is a function" in why or "is a class" in why
+            if node.id in current.classes:
+                return True
+            if node.id in current.values or node.id in current.recipes:
+                return False
+            current = current.parent
+        return False
+
+    def _is_pyspark(self, name: str) -> bool:
+        """Whether ``name`` is an import from pyspark (``F``, ``col``, ``Window``)."""
+        return self.module.imports.get(name, "").split(".")[0] == "pyspark"
+
     def _finish(self) -> None:
+        self._lineage()
         facts = self.facts
         # A write inside a foreachBatch function is a streaming write, with the query's facts.
         for stream in facts.streams:
@@ -1065,6 +1836,17 @@ class _Reader:
             )
         facts.reads = _unique(facts.reads)
         facts.writes = _unique(facts.writes)
+        # a read is one write's own only while a write names it (two writes that were one and
+        # said different things are one write that may be fed by anything)
+        owned = {key for write in facts.writes if write.feeds for key in write.feeds}
+        facts.reads = [
+            (
+                replace(read, exclusive=False)
+                if read.exclusive and read_key(read) not in owned
+                else read
+            )
+            for read in facts.reads
+        ]
         if len(facts.notes) > MAX_NOTES_PER_JOB:
             more = len(facts.notes) - MAX_NOTES_PER_JOB
             facts.notes = [*facts.notes[:MAX_NOTES_PER_JOB], f"{self.file}: and {more} more notes"]
@@ -1095,8 +1877,10 @@ def _fields(ref: Ref) -> Dict[str, Any]:
 
 
 def _unique(items: Sequence[Any]) -> List[Any]:
-    """The same refs seen twice (a chain that two calls both reach) once, in line order."""
-    seen: Set[Tuple[Any, ...]] = set()
+    """The same refs seen twice (a chain that two calls both reach) once, in line order. Of two
+    that are one, a read is its own to a write only if both are, and a write's feeds are the
+    reads of both (``None``, any read may feed it, if either says so)."""
+    seen: Dict[Tuple[Any, ...], int] = {}
     out: List[Any] = []
     for item in sorted(items, key=lambda r: (r.line, r.kind, r.shown)):
         key = (
@@ -1107,9 +1891,19 @@ def _unique(items: Sequence[Any]) -> List[Any]:
             item.line,
             getattr(item, "mode", None),
         )
-        if key not in seen:
-            seen.add(key)
+        at = seen.get(key)
+        if at is None:
+            seen[key] = len(out)
             out.append(item)
+        elif isinstance(item, Read) and out[at].exclusive and not item.exclusive:
+            out[at] = replace(out[at], exclusive=False)
+        elif isinstance(item, Write) and out[at].feeds != item.feeds:
+            both = (
+                None
+                if out[at].feeds is None or item.feeds is None
+                else tuple(sorted({*out[at].feeds, *item.feeds}))
+            )
+            out[at] = replace(out[at], feeds=both)
     return out
 
 
@@ -1133,10 +1927,13 @@ def read_job(
     helpers: Optional[Mapping[str, HelperSpec]] = None,
     session_names: Iterable[str] = DEFAULT_SESSION_NAMES,
     shown: Optional[str] = None,
+    path_rules: Sequence[Tuple[str, bool]] = (),
 ) -> JobFacts:
     """What ``module`` reads, writes and streams. See the module docstring. ``shown`` is the
-    path reports name the file by (default: the module's own relative path)."""
-    return _Reader(module, folder, helpers or {}, session_names, shown).run()
+    path reports name the file by (default: the module's own relative path). ``path_rules`` are
+    the conventions' data path rules as ``(prefix, names a table)``: a path of which only the
+    beginning folds is read as the table such a rule gives it (:func:`path_root`)."""
+    return _Reader(module, folder, helpers or {}, session_names, shown, path_rules).run()
 
 
 __all__ = [
@@ -1147,6 +1944,7 @@ __all__ = [
     "Ref",
     "Stream",
     "Write",
+    "path_root",
     "read_job",
     "split_table_name",
 ]
