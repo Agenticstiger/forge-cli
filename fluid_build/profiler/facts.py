@@ -287,6 +287,8 @@ def _date(value: Any) -> datetime.date:
             if _DATE_TEXT.fullmatch(value):
                 return datetime.date.fromisoformat(value)
     except ValueError:
+        # Not a date. The refusal below is raised outside this handler, so it carries no
+        # ValueError, whose message would hold the value.
         pass
     raise _Unreadable
 

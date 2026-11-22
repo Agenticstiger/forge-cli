@@ -249,6 +249,8 @@ def _same_file(a: Path, b: Path) -> bool:
         if a.exists() and b.exists():
             return a.samefile(b)
     except OSError:
+        # A path that cannot be examined (no permission, say) is compared by its resolved name
+        # below instead, so a release record named as the profile or a source is still refused.
         pass
     return a.resolve() == b.resolve()
 

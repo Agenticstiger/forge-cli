@@ -10,7 +10,7 @@ import math
 import random
 import time
 from fractions import Fraction
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence
 
 import pytest
 

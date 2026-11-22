@@ -216,6 +216,8 @@ def _remove(path: Path) -> None:
     try:
         os.unlink(path)
     except OSError:
+        # Best effort: the caller is already raising the error that stopped the write, and a
+        # file left behind is readable by its owner alone.
         pass
 
 

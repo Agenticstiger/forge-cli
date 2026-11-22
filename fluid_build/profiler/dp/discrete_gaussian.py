@@ -29,7 +29,8 @@ from typing import Protocol
 class RandomSource(Protocol):
     """Where the randomness comes from: a uniform integer below ``n``."""
 
-    def below(self, n: int) -> int: ...
+    def below(self, n: int) -> int:
+        """Return an integer drawn uniformly from 0 to ``n - 1``."""
 
 
 def _check_fraction(value: object, name: str) -> Fraction:
