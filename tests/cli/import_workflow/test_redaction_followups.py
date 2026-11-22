@@ -16,7 +16,7 @@ import pytest
 
 from fluid_build.cli.import_workflow import _redact as R
 
-SECRET = "SEKRT9"
+SECRET = "SEKRT9"  # pragma: allowlist secret
 LOGIN = "jdbc:oracle:thin:scott/" + SECRET + "@dbhost:1521/ORCL"
 MASK = "***REDACTED***"
 
