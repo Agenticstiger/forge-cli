@@ -237,7 +237,7 @@ def _tables_through_import_blocks(
     so the plan shows its import and the check reads it from the saved plan. The other
     imports, a table forge made among them, stay in state for the apply, as before.
     """
-    tables = _table_adoption.foreign_tables(eng.plugin, adopted, eng.workdir, eng.env)
+    tables = _table_adoption.foreign_tables(eng.plugin, adopted, eng.workdir, eng.env, eng.contract)
     _table_adoption.refuse_unless_asked(args, tables)
     if not tables:
         return []
@@ -653,7 +653,9 @@ def _plan_with_opentofu(
         adopted: List[ImportBlock] = _look_up_existing(eng, args, logger, imported)
         # Read while the look-up's imports are in state: a table forge did not make stops
         # the plan unless it was asked to adopt it; the hand-back runs first, as it stops.
-        tables = _table_adoption.foreign_tables(eng.plugin, adopted, eng.workdir, eng.env)
+        tables = _table_adoption.foreign_tables(
+            eng.plugin, adopted, eng.workdir, eng.env, eng.contract
+        )
         _table_adoption.refuse_unless_asked(args, tables)
     _refuse_unreleased_imports(eng, adopted)
     if adopted:
@@ -1068,7 +1070,10 @@ def _apply_bound_plan(
         return 0
     _enforce_access(eng.plugin, "pre_apply", eng.contract)
     _prepare_destroys(eng.plugin, eng.contract, destroyed)
-    _table_adoption.audit_take_over(logger, list(record.get("adoptedTables") or []))
+    adopted_tables = record.get("adoptedTables")
+    _table_adoption.audit_take_over(
+        logger, adopted_tables if isinstance(adopted_tables, list) else []
+    )
     return _finish_apply(eng, logger, changes, destroyed, applied_state, bound=True)
 
 

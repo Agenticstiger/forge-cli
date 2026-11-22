@@ -15,7 +15,7 @@ The rules are :mod:`fluid_build.iac.adoption`'s; this module applies them to a r
 3. :func:`write_import_blocks`: with the flag, each found table goes into the module as
    an OpenTofu ``import`` block, so the plan shows its import and writes no state;
 4. :func:`check_plan`: the saved plan must import each one unreplaced, and the plugin's
-   reviewer must find it matching the contract, or the run stops naming the differences.
+   comparison must find it matching the contract, or the run stops naming the differences.
 """
 
 from __future__ import annotations
@@ -51,16 +51,20 @@ def tables_of(blocks: Sequence[Any]) -> List[Any]:
     return [block for block in blocks if getattr(block, "table", None)]
 
 
-def foreign_tables(plugin: Any, adopted: Sequence[Any], workdir: str, env: Any) -> List[Any]:
-    """The tables among ``adopted`` that forge did not make: the ones ``--adopt-tables`` is for.
+def foreign_tables(
+    plugin: Any, adopted: Sequence[Any], workdir: str, env: Any, contract: Mapping[str, Any]
+) -> List[Any]:
+    """The tables among ``adopted`` that forge did not make for this product: the ones
+    ``--adopt-tables`` is for.
 
-    A table that carries forge's own marker (``table_made_by_forge``: on AWS the Glue
-    parameter ``managed_by: fluid`` its module sets when it creates the table, kept by
-    ``ignore_changes``) is forge's, met again because its state was lost or kept nowhere
-    (a fresh workspace on every run). It is re-attached as before, without the flag and
-    without the check, so such a run can still change the table to the contract. Read
-    from the state the look-up imported the tables into; a plugin without the capability,
-    or a state that cannot be read, makes every table foreign.
+    A table that carries forge's own marker for this contract (``table_made_by_forge``: on
+    AWS the Glue parameters ``managed_by: fluid`` and the recorded contract its module
+    sets when it creates the table, kept by ``ignore_changes``) is this product's, met
+    again because its state was lost or kept nowhere (a fresh workspace on every run). It
+    is re-attached as before, without the flag and without the check, so such a run can
+    still change the table to the contract. Read from the state the look-up imported the
+    tables into; a plugin without the capability, or a state that cannot be read, makes
+    every table foreign.
     """
     tables = tables_of(adopted)
     made_by_forge = getattr(plugin, "table_made_by_forge", None)
@@ -71,7 +75,7 @@ def foreign_tables(plugin: Any, adopted: Sequence[Any], workdir: str, env: Any) 
         for resource in runner.tofu_state_resources(workdir, env=env)
         if isinstance(resource, Mapping)
     }
-    return [block for block in tables if not made_by_forge(values.get(block.to) or {})]
+    return [block for block in tables if not made_by_forge(values.get(block.to) or {}, contract)]
 
 
 def before_lookup(

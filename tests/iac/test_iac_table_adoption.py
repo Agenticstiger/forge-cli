@@ -669,4 +669,22 @@ def test_the_rendered_import_block_carries_only_its_address_and_id():
 def test_a_table_is_forge_made_only_with_forge_s_marker(parameters, made):
     values = {} if parameters is None else {"parameters": parameters}
 
-    assert get_iac_plugin("aws").table_made_by_forge(values) is made
+    assert get_iac_plugin("aws").table_made_by_forge(values, {"id": "sales.orders"}) is made
+
+
+@pytest.mark.parametrize(
+    "recorded, made",
+    [
+        ("fluidVersion: 0.7.7\nid: sales.orders\nname: Orders\n", True),
+        ("id: 'sales.orders'\nexposes:\n- id: other\n", True),
+        ("fluidVersion: 0.7.7\nid: billing.invoices\n", False),
+        ("description: |\n  id: sales.orders\nid: billing.invoices\n", False),
+        ("fluidVersion: 0.7.7\n", True),
+    ],
+)
+def test_a_forge_made_table_belongs_to_the_product_its_recorded_contract_names(recorded, made):
+    """Forge records the contract a table was made from; another product's table is not
+    this contract's to re-attach, and a record without an id leaves the marker alone."""
+    values = {"parameters": {"managed_by": "fluid", "fluid_contract": recorded}}
+
+    assert get_iac_plugin("aws").table_made_by_forge(values, {"id": "sales.orders"}) is made

@@ -1,7 +1,7 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""Is an existing Glue table the table the contract declares? The AWS reviewer of
+"""Is an existing Glue table the table the contract declares? The AWS comparison behind
 ``--adopt-tables`` (:mod:`fluid_build.iac.adoption`).
 
 It reads one ``aws_glue_catalog_table`` change of a saved plan, as ``tofu show -json``

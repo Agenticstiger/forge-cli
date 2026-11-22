@@ -13,14 +13,14 @@ on ``--adopt-tables``:
 * the table goes into the plan through an OpenTofu ``import`` block, so the plan shows
   the import and writes no state before the apply does;
 * the plan, read back with ``tofu show -json``, must import it without replacing it, and
-  the plugin's reviewer must find no difference between the table as it is and the
+  the plugin's comparison must find no difference between the table as it is and the
   table the contract declares (:func:`review_tables`). Any difference refuses the run,
   naming it.
 
 The rule is Pulumi's ``import`` resource option: an import whose desired state differs
 from the actual one fails, the attributes the program does not manage
 (``ignoreChanges``) excepted (pulumi/pulumi developer docs, "Importing resources").
-OpenTofu does the reading and the diffing; this module only judges the plan.
+OpenTofu does the reading and the diffing; this module only decides from the plan.
 """
 
 from __future__ import annotations
@@ -32,11 +32,11 @@ from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
 #: The flag of ``fluid plan --tofu`` and ``fluid apply`` that lets a run take over tables.
 ADOPT_TABLES_FLAG = "--adopt-tables"
 
-#: What a plugin's reviewer makes of one imported resource change: ``(differences,
+#: What a plugin's comparison makes of one imported resource change: ``(differences,
 #: updates)``. A difference refuses the adoption; an update is what the apply still
 #: changes in place on the adopted table, holding no data (a comment, a description).
 #: The second argument is the resource's body as the module declares it.
-Reviewer = Callable[[Mapping[str, Any], Mapping[str, Any]], Tuple[List[str], List[str]]]
+Comparison = Callable[[Mapping[str, Any], Mapping[str, Any]], Tuple[List[str], List[str]]]
 
 #: ``action_reason`` of a replace (opentofu.org/docs/internals/json-format), in words.
 _REPLACE_REASONS = {
@@ -104,11 +104,11 @@ def review_tables(
     shown: Mapping[str, Any],
     tables: Mapping[str, str],
     declared: Mapping[str, Mapping[str, Any]],
-    review: Reviewer,
+    review: Comparison,
 ) -> List[TableReview]:
     """One :class:`TableReview` per table in ``tables`` (``{address: name}``), sorted.
 
-    A table the plan does not import, or replaces, differs whatever the reviewer says:
+    A table the plan does not import, or replaces, differs whatever the comparison says:
     replacing a Glue table drops it and the Lake Formation permissions granted on it.
     """
     imports = planned_imports(shown)

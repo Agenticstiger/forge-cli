@@ -209,6 +209,24 @@ def _resolve_catalog_id() -> str:
 
 _CATALOG_ID_CACHE: Dict[str, str] = {}
 
+#: A top-level ``id:`` line of the contract YAML :func:`_emit_glue` records in a table's
+#: ``fluid_contract`` parameter (``yaml.safe_dump``: a top-level key starts its line).
+_RECORDED_ID_RE = re.compile(r"^id:[ \t]*(.*?)[ \t]*$", re.MULTILINE)
+
+
+def _recorded_product_id(recorded: Any) -> Optional[str]:
+    """The product id in a table's recorded contract, or ``None`` when there is none."""
+    if not isinstance(recorded, str):
+        return None
+    found = _RECORDED_ID_RE.search(recorded)
+    if found is None:
+        return None
+    value = found.group(1)
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    return value
+
+
 # FLUID column type → Hive/Glue column type, keyed on the lower-cased base name
 # (``varchar(255)`` is ``varchar``). Only a type Hive holds without loss is here;
 # ``_hive_outcome`` classifies every other one.
@@ -988,15 +1006,25 @@ class AwsIacPlugin:
                 tables[f"aws_glue_catalog_table.{key}"] = f"{database}.{table}"
         return tables
 
-    def table_made_by_forge(self, values: Mapping[str, Any]) -> bool:
-        """Did forge make this Glue table? Its module sets ``managed_by: fluid`` among the
-        table's parameters on create (:func:`_emit_glue`), and ``ignore_changes`` keeps
-        whatever the table holds since; Iceberg's commits keep it too. ``values`` is the
-        table in state, as the brownfield look-up imported it."""
+    def table_made_by_forge(self, values: Mapping[str, Any], contract: Mapping[str, Any]) -> bool:
+        """Did forge make this Glue table, for this product? Its module sets ``managed_by:
+        fluid`` among the table's parameters on create (:func:`_emit_glue`), with the
+        contract it was made from in ``fluid_contract``; ``ignore_changes`` keeps them,
+        and Iceberg's commits do too. ``values`` is the table in state, as the brownfield
+        look-up imported it.
+
+        A table another product made is not this contract's to re-attach. The product is
+        read from the recorded contract's top-level ``id:`` line (no YAML parse of
+        catalog text); a table with no record (made before forge wrote one, or from a
+        contract over the record's 50 KB) is judged by the marker alone.
+        """
         parameters = values.get("parameters")
         if not isinstance(parameters, Mapping):
             return False
-        return str(parameters.get("managed_by") or "").strip().lower() == "fluid"
+        if str(parameters.get("managed_by") or "").strip().lower() != "fluid":
+            return False
+        recorded = _recorded_product_id(parameters.get("fluid_contract"))
+        return recorded is None or recorded == str(contract.get("id") or "")
 
     def review_table_adoption(
         self, change: Mapping[str, Any], declared: Mapping[str, Any]

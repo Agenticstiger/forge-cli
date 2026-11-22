@@ -371,10 +371,20 @@ def test_the_flag_on_a_provider_without_table_adoption_says_so(tofu, tmp_path, m
     assert "--adopt-tables" in out and "adopts no tables" in out
 
 
-def _made_by_forge(monkeypatch) -> None:
-    """The table in state carries the marker forge's module sets on create."""
-    state = [{"address": TABLE, "values": {"parameters": {"managed_by": "fluid"}}}]
+def _made_by_forge(monkeypatch, product: str = "sales.orders") -> None:
+    """The table in state carries the marker forge's module sets on create, for ``product``."""
+    parameters = {"managed_by": "fluid", "fluid_contract": f"id: {product}\nname: Orders\n"}
+    state = [{"address": TABLE, "values": {"parameters": parameters}}]
     monkeypatch.setattr(engine.runner, "tofu_state_resources", lambda *a, **k: state)
+
+
+def test_a_table_another_product_made_still_needs_the_flag(tofu, tmp_path, monkeypatch):
+    _made_by_forge(monkeypatch, product="billing.invoices")
+
+    with pytest.raises(CLIError) as raised:
+        engine.apply_via_opentofu(_args(tmp_path), _LOG)
+
+    assert raised.value.event == "table_adoption_requires_flag" and tofu["apply"] == 0
 
 
 def test_a_table_forge_made_is_re_attached_as_before_without_the_flag(tofu, tmp_path, monkeypatch):
