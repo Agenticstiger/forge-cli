@@ -22,7 +22,6 @@ from ._proposal import (
     ProposalTooLarge,
     TopicSchema,
     build_proposal,
-    safe_command,
     safe_text,
 )
 from ._pysource import SourceBudget

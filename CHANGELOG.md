@@ -32,11 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text: YAML turns an unquoted `1.10`, `007` or `yes` into another value, so such a value is
   refused, with the key named, until it is quoted. A product lists the reads that feed it when the
   code says (the statement that writes it, the DataFrame it is made of, followed through names
-  assigned once or more, and through a write the conventions ignore), not all of its job's: a job of
-  440 `INSERT ... SELECT` took 49 s to check and takes 2.5 s, and one of 2,000 writes over 99 reads
-  took 67 s and takes 5 s. Where the code does not say, the products list every read no single write
-  owns as before, and past 40,000 listed reads in all each lists fewer (500 down to 5) and the
-  report says so.
+  assigned once or more, and through a write the conventions ignore, a staging path being found by
+  any spelling of it: `s3a` for `s3`, `file:///`, a glob, a partition below it), not all of its
+  job's: a job of 440 `INSERT ... SELECT` took 49 s to check and takes 2.5 s, and one of 2,000
+  writes over 99 reads took 67 s and takes 5 s. Where the code does not say, the products list
+  every read no single write owns as before, and past 40,000 listed reads in all each lists fewer
+  (500 down to 5) and the report says so.
 
 - **`fluid describe --commands` prints every command as JSON, plugins included.** The document
   has a `schema_version` (1) and lists each command with its aliases, positional arguments and

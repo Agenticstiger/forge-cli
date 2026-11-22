@@ -326,10 +326,10 @@ def test_two_apostrophes_on_one_line_do_not_hide_a_credential_between_them(text)
 @pytest.mark.parametrize(
     "script",
     [
-        "cat > conf.ini <<EOF\n[db]\npassword = QZXV7391\nuser=bob\nEOF",
-        'python - <<EOF\nimport x\npassword = "QZXV7391"\nEOF',
+        "cat > conf.ini <<EOF\n[db]\npassword = QZXV7391\nuser=bob\nEOF",  # pragma: allowlist secret
+        'python - <<EOF\nimport x\npassword = "QZXV7391"\nEOF',  # pragma: allowlist secret
         "cat > c <<EOF\naws_secret_access_key = QZXV7391\nEOF",
-        "psql <<EOF\nCREATE USER bob WITH PASSWORD 'QZXV7391';\nEOF",
+        "psql <<EOF\nCREATE USER bob WITH PASSWORD 'QZXV7391';\nEOF",  # pragma: allowlist secret
         "mysql <<EOF\nCREATE USER bob IDENTIFIED BY 'QZXV7391';\nEOF",
         "cat > ~/.netrc <<EOF\nmachine h login u password QZXV7391\nEOF",
         "cat > c <<EOF\nspark.hadoop.fs.s3a.secret.key QZXV7391\nEOF",
