@@ -33,7 +33,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from ._airflow_dags import Dag, Submit, Task, read_dags
 from ._catalogs import module_settings
 from ._conventions import Conventions, Driver
-from ._drivers import Lists, argument_value, driver_for, job_file
+from ._drivers import Lists, argument_value, driver_for, job_file, segments
 from ._fold import ModuleIndex
 from ._pysource import (
     MAX_TOTAL_BYTES,
@@ -262,13 +262,6 @@ def _stays_inside(relative: str) -> bool:
     return ".." not in text.split("/")
 
 
-def _segments(script: str) -> List[str]:
-    text = script.split("?")[0]
-    if "://" in text:
-        text = text.split("://", 1)[1]
-    return [s for s in text.replace("\\", "/").split("/") if s and s not in {".", ".."}]
-
-
 def local_script(
     script: str, conventions: Conventions, project_root: Optional[Path]
 ) -> Optional[Path]:
@@ -427,7 +420,7 @@ def _match(
         if job is not None:
             mapped = any(script.startswith(prefix) for prefix, _ in conventions.script_roots)
             return job, "script_root" if mapped else "project"
-    wanted = _segments(script)
+    wanted = segments(script)
     if not wanted:
         return "the script path is empty"
     scored: List[Tuple[int, JobRecord]] = []

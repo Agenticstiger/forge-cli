@@ -826,28 +826,12 @@ def _stream_text(writes: Sequence[Write]) -> str:
     return "; ".join(parts)
 
 
-def build_proposal(
-    *,
-    tool: str,
-    version: str,
-    jobs: Sequence[JobRecord],
-    conv: Conventions,
-    split_by: str,
-    root_name: str,
-    topic_schema: Optional[TopicSchema] = None,
-    report: Optional[ImportReport] = None,
-    catalogs: Optional[CatalogKinds] = None,
-) -> Proposal:
-    """The contracts the jobs (and the DAG tasks joined to them) propose, and the report.
-
-    ``jobs`` are the job files, in path order, each with its ``tasks`` joined already.
-    ``catalogs`` is what the scanned code says each Spark catalog is (the kind a table's
-    ``binding.location.catalog`` names).
-    """
-    report = report or ImportReport()
-    ordered = sorted(jobs, key=lambda j: j.shown)
-
-    # ── outputs, and what has no identity ─────────────────────────
+def _collect_outputs(
+    ordered: Sequence[JobRecord], conv: Conventions, report: ImportReport
+) -> Dict[Tuple[str, ...], Output]:
+    """The outputs the jobs write, by identity. A write whose name did not resolve is reported; one
+    the conventions ignore is a bridge (what feeds it feeds what reads it), and an output that
+    more than one job writes keeps the first writer and is reported."""
     outputs: Dict[Tuple[str, ...], Output] = {}
     seen_notes: Set[Tuple[Any, ...]] = set()
     ignored = 0
@@ -899,6 +883,31 @@ def build_proposal(
                 f"({safe_text(output.writer.shown, 80)}, {names}); a product has a single writer, "
                 f"so it is proposed with {safe_text(output.writer.shown, 80)}: choose the writer, or split the output"
             )
+    return outputs
+
+
+def build_proposal(
+    *,
+    tool: str,
+    version: str,
+    jobs: Sequence[JobRecord],
+    conv: Conventions,
+    split_by: str,
+    root_name: str,
+    topic_schema: Optional[TopicSchema] = None,
+    report: Optional[ImportReport] = None,
+    catalogs: Optional[CatalogKinds] = None,
+) -> Proposal:
+    """The contracts the jobs (and the DAG tasks joined to them) propose, and the report.
+
+    ``jobs`` are the job files, in path order, each with its ``tasks`` joined already.
+    ``catalogs`` is what the scanned code says each Spark catalog is (the kind a table's
+    ``binding.location.catalog`` names).
+    """
+    report = report or ImportReport()
+    ordered = sorted(jobs, key=lambda j: j.shown)
+
+    outputs = _collect_outputs(ordered, conv, report)
 
     flat = sorted(outputs.values(), key=lambda o: (o.writer.shown, o.write.line, o.identity.shown))
     groups = _groups(flat, split_by, conv, root_name)

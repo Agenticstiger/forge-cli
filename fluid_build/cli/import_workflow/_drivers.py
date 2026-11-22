@@ -36,7 +36,9 @@ MAX_LIST_BYTES = 16_384
 MAX_LIST_BYTES_TOTAL = 131_072
 
 
-def _segments(script: str) -> List[str]:
+def segments(script: str) -> List[str]:
+    """The directories and the file name of a submitted script (a scheme, a query string and the
+    ``.`` and ``..`` parts are dropped)."""
     text = script.split("?")[0]
     if "://" in text:
         text = text.split("://", 1)[1]
@@ -45,7 +47,7 @@ def _segments(script: str) -> List[str]:
 
 def driver_for(script: str, drivers: Sequence[Driver]) -> Optional[Driver]:
     """The driver whose ``script`` ends the submitted script's path (by whole segments)."""
-    have = _segments(script)
+    have = segments(script)
     for driver in drivers:
         wanted = driver.script.split("/")
         if have[-len(wanted) :] == wanted:
