@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A Spark build can run the team's own prebuilt PySpark package by its sha256 digest, and
+  forge's runner owns the write.** `builds[].properties.package` (0.7.7 preview) on an
+  `engine: spark` embedded-logic batch build names a `.whl` or `.zip` (`uri`), its `sha256` and an
+  `entryPoint` (`module:function`, an entry-point object reference), with optional string
+  `arguments` and `deadLetter`. `fluid apply` copies the package beside the job config, keyed by
+  its digest: on AWS OpenTofu copies the S3 object only when S3's SHA-256 checksum of it is the pin
+  (publish it single-part with `--checksum-algorithm SHA256`), and on `runtime: local` forge copies
+  the file after hashing it. The runner hashes its copy again and imports the entry point only from
+  those bytes (a module of that name elsewhere on the Python path, or a compiled extension in the
+  package, is refused), calls it as `fn(spark, context)` and writes the DataFrame it returns: its
+  columns and their types must be the output's `contract.schema`, a row whose required value is
+  null at any depth goes to `<output>__dead_letter` (the reason, the row as JSON, the run id and the
+  package's sha256, landed once per run: the scheduler's run id when `fluid apply` passes one, else
+  the Spark application id) or, without dead letters, fails the run with nothing written, and the
+  passing rows replace the partitions they hold. Each commit carries the run's stamps, as every
+  runner commit does, and `fluid.package.sha256`. While the function runs, PySpark's write calls are refused and `spark.sql`
+  runs reads only, and a commit to the output or its dead letters that the runner did not make
+  fails the run. The operator lists where packages may come from in `FLUID_SPARK_PACKAGE_ALLOWLIST`
+  (unset allows none; `fluid validate` warns, apply refuses). As for a SQL batch build, a runtime
+  where forge would create the role needs `executionRoleArn`. `fluid plan` shows and binds the
+  package's source, digest and entry point.
 - **`fluid generate artifacts --emit custom-scaffold` generates a contract's custom scaffold, so
   its files are in the stage-3 MANIFEST and in a sealed release.** The new emit key passes the
   contract to the custom-scaffold engine's library entry point and writes the files its
