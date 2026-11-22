@@ -419,8 +419,10 @@ def refuse_config_expressions(value: Any, *, where: str) -> None:
     Either sends what it read, a variable or a file, on to wherever the
     connector connects. forge puts no expression into contract text (its own
     ``${FLUID_DBZ_...}`` lines hold credentials it moved to the environment),
-    so a value or a key that holds ``${`` is refused. The error names where it
-    is, ``where`` and the path below it, and never the value.
+    so a value or a key that holds ``${`` is refused, a value of any type read
+    as the text a properties file would get (``str``: a YAML ``!!binary`` is
+    ``b'...'``). The error names where it is, ``where`` and the path below it,
+    and never the value.
     """
     from fluid_build._validation_issues import dotted
     from fluid_build.providers._iceberg_catalog_auth import EXPRESSION_RE
@@ -429,10 +431,10 @@ def refuse_config_expressions(value: Any, *, where: str) -> None:
     seen: Set[int] = set()
     while pending:
         path, item = pending.pop()
-        if isinstance(item, str):
-            if EXPRESSION_RE.search(item):
+        if not isinstance(item, (Mapping, list, tuple)):
+            if item is not None and EXPRESSION_RE.search(str(item)):
                 raise ValueError(_expression_refusal(where, dotted(path)))
-        elif isinstance(item, (Mapping, list, tuple)) and id(item) not in seen:
+        elif id(item) not in seen:
             seen.add(id(item))
             items = item.items() if isinstance(item, Mapping) else enumerate(item)
             for key, child in items:
@@ -453,16 +455,43 @@ def _expression_refusal(where: str, below: str, *, in_key: bool = False) -> str:
     )
 
 
-def refuse_contract_expressions(ctx: Any, engine_props: Mapping[str, Any], *, engine: str) -> None:
+def refuse_contract_expressions(
+    source: Mapping[str, Any], engine_props: Mapping[str, Any], *, engine: str
+) -> None:
     """:func:`refuse_config_expressions` for the contract text a connector run reads.
 
-    The source connection (its ``secretRef`` aside: the secret it names is the
-    operator's, not contract text), the streams, and ``properties.<engine>``.
+    The build's whole ``properties.source`` (its connection's ``secretRef``
+    aside: the secret it names is the operator's, not contract text), and
+    ``properties.<engine>``.
     """
-    connection = {k: v for k, v in ctx.source.connection.raw.items() if k != "secretRef"}
-    refuse_config_expressions(connection, where="properties.source.connection")
-    refuse_config_expressions(list(ctx.source.streams or []), where="properties.source.streams")
+    block = dict(source)
+    connection = block.get("connection")
+    if isinstance(connection, Mapping):
+        block["connection"] = {k: v for k, v in connection.items() if k != "secretRef"}
+    refuse_config_expressions(block, where="properties.source")
     refuse_config_expressions(engine_props, where=f"properties.{engine}")
+
+
+#: The connector settings a resolved secret is written to (``resolve_connection_secrets``
+#: fills ``password``, which the runners map to these).
+_RESOLVED_SECRET_KEYS = ("database.password", "connection.password")
+
+
+def refuse_sent_config_expressions(
+    config: Mapping[str, Any], connection: Mapping[str, Any], *, where: str
+) -> None:
+    """:func:`refuse_config_expressions` for a connector config as it is sent.
+
+    The last check before a REST call, over everything the config holds: a
+    setting forge derives from another part of the contract included. The one
+    value left out is the secret the operator's store resolved, which is not
+    contract text: a connection with a ``secretRef`` and no password of its own.
+    """
+    resolved = bool(connection.get("secretRef")) and not connection.get("password")
+    skipped = _RESOLVED_SECRET_KEYS if resolved else ()
+    refuse_config_expressions(
+        {key: value for key, value in config.items() if key not in skipped}, where=where
+    )
 
 
 def _default_succeeded_states() -> Tuple:

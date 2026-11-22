@@ -330,7 +330,7 @@ def _execute(ctx: RunContext, runner: DebeziumRunner) -> RunResult:
     try:
         # Before any secret is read or config written: Debezium Server and a
         # Kafka Connect worker expand ${...} where they run.
-        refuse_contract_expressions(ctx, dbz_props, engine="debezium")
+        refuse_contract_expressions(props.get("source") or {}, dbz_props, engine="debezium")
     except ValueError as exc:
         return _failed(ctx, started_at, t_start, str(exc))
 
@@ -410,6 +410,14 @@ def _execute_kafka_connect(
     )
     if late_arrival_policy.get("enabled"):
         config.update(late_arrival_policy["connector_config"])
+    from .._acquisition_common import refuse_sent_config_expressions
+
+    try:
+        refuse_sent_config_expressions(
+            config, ctx.source.connection.raw, where="the Debezium connector config"
+        )
+    except ValueError as exc:
+        return _failed(ctx, started_at, t_start, str(exc))
     client = KafkaConnectRestClient(server_url, engine="debezium")
     try:
         existing = client.get_connector(connector_name)
@@ -492,6 +500,15 @@ def _properties_line(key: str, value: object) -> str:
     for token in (key, text_value):
         if any(ch in token for ch in "\r\n\f\x00"):
             raise ValueError(f"debezium config entry contains a control character: {token!r}")
+    if "${" in key or "${" in text_value:
+        # SmallRye Config would expand it where Debezium Server runs: the last
+        # check, on the text the file gets. forge's own ${FLUID_DBZ_...} lines
+        # are not written through here.
+        raise ValueError(
+            f"debezium config entry {key} holds a ${{...}} expression (the value is not "
+            "shown), which Debezium Server would expand from its environment. Write the "
+            "value itself; a secret belongs in a secretRef."
+        )
     return f"{_escape_properties_key(key)}={_escape_properties_value(text_value)}"
 
 

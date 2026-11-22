@@ -82,7 +82,9 @@ def test_forges_own_credential_line_keeps_its_expression():
 # ── the runners refuse before anything is built or sent ──────────────────────
 
 
-def _kc_contract(connection: Dict[str, Any], **kc_extra: Any) -> Dict[str, Any]:
+def _kc_contract(
+    connection: Dict[str, Any], source_extra: Any = None, **kc_extra: Any
+) -> Dict[str, Any]:
     from tests.build_runners.test_kafka_connect_full_matrix import _base_contract
 
     return _base_contract(
@@ -91,6 +93,7 @@ def _kc_contract(connection: Dict[str, Any], **kc_extra: Any) -> Dict[str, Any]:
             "connection": connection,
             "mode": "full_refresh",
             "streams": ["public.orders"],
+            **(source_extra or {}),
         },
         kc_props={
             "deployment": {"server_url": "http://kafka-connect.test:8083"},
@@ -127,6 +130,9 @@ def _dbz_contract(connection: Dict[str, Any], **dbz_extra: Any) -> Dict[str, Any
     "contract",
     [
         lambda: _kc_contract({**BASE, "database": "${env:BAO_TOKEN}"}),
+        lambda: _kc_contract(
+            BASE, {"mode": "incremental_append", "cursor_field": "${env:BAO_TOKEN}"}
+        ),
         lambda: _kc_contract(
             BASE,
             sink_connector_config={
@@ -190,3 +196,22 @@ def test_a_secret_whose_value_holds_dollar_brace_still_connects(
     assert rc == 0
     sent = kafka_connect_mock.connectors["expr"]["config"]
     assert sent["database.password"] == "p${x}"  # pragma: allowlist secret
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "value", [b"${BAO_TOKEN}", {"x": frozenset({"${BAO_TOKEN}"})}, {"x": ("a", "${BAO_TOKEN}")}]
+)
+def test_a_value_of_any_type_is_read_as_the_text_it_is_written_as(value):
+    with pytest.raises(ValueError) as caught:
+        refuse_config_expressions(value, where="sink")
+    assert "BAO_TOKEN" not in str(caught.value)
+
+
+@pytest.mark.unit
+def test_the_properties_file_never_gets_an_expression_whatever_its_source():
+    """The last check, on the text written: a YAML !!binary value is b'...' there."""
+    with pytest.raises(ValueError) as caught:
+        render_application_properties({"plugin.name": b"${BAO_TOKEN}"}, "iceberg", {})
+    assert "debezium.source.plugin.name" in str(caught.value)
+    assert "BAO_TOKEN" not in str(caught.value)

@@ -291,12 +291,16 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
     deployment = kc_props.get("deployment", {}) or {}
     server_url = deployment.get("server_url")
 
-    from .._acquisition_common import refuse_config_expressions, refuse_contract_expressions
+    from .._acquisition_common import (
+        refuse_config_expressions,
+        refuse_contract_expressions,
+        refuse_sent_config_expressions,
+    )
 
     try:
         # Before any secret is read or REST call made: the worker resolves
         # ${provider:path:key} in a connector config with its config providers.
-        refuse_contract_expressions(ctx, kc_props, engine="kafka-connect")
+        refuse_contract_expressions(props.get("source") or {}, kc_props, engine="kafka-connect")
     except ValueError as exc:
         return _failed(ctx, started_at, t_start, str(exc))
     if not server_url:
@@ -456,14 +460,18 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
                 derived.pop("iceberg.catalog.warehouse", None)
             sink_config = {**derived, **(sink_config or {})}
 
-    if sink_config:
-        try:
-            # The derived part comes from the contract's binding, not from kc_props.
+    try:
+        # The last check before the REST calls, over the configs as they are
+        # sent: settings derived from the contract's binding included.
+        refuse_sent_config_expressions(
+            base_config, ctx.source.connection.raw, where="the source connector config"
+        )
+        if sink_config:
             refuse_config_expressions(
                 sink_config, where="properties.kafka-connect.sink_connector_config"
             )
-        except ValueError as exc:
-            return _failed(ctx, started_at, t_start, str(exc))
+    except ValueError as exc:
+        return _failed(ctx, started_at, t_start, str(exc))
 
     connector_name = kc_props.get("connector_name") or f"forge-{ctx.product_id.replace('.', '-')}"
     client = KafkaConnectRestClient(server_url)
