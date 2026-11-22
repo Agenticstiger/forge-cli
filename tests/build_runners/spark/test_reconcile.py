@@ -71,9 +71,26 @@ class FakeAdapter:
         self.calls = []
         self.restart_of = []
         self.since = []
+        #: Failed-probation markers by config hash (the bytes kept), and the hashes cleared.
+        self.failed, self.cleared = {}, []
 
     def where(self):
         return "fake cluster"
+
+    def failed_release(self, config_hash):
+        return self.failed.get(config_hash)
+
+    def mark_failed(self, config_hash, run_id, reason):
+        import json
+
+        self.failed[config_hash] = json.dumps(
+            {"configHash": config_hash, "runId": run_id, "reason": reason, "failedAt": "T"}
+        ).encode("utf-8")
+        return f"s3://bucket/_fluid/spark/p/b/releases/{config_hash[:16]}/failed"
+
+    def clear_failed(self, config_hash):
+        self.cleared.append(config_hash)
+        self.failed.pop(config_hash, None)
 
     def checked(self):
         return self.run

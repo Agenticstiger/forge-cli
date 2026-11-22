@@ -325,6 +325,22 @@ def reconcile_after_apply(
         logger.info("spark_reconcile", extra={"spark": out.as_dict()})
         if out.action == "rolled-back":
             logger.error("spark_release_rolled_back", extra={"spark": out.as_dict()})
+    return _result(outcomes)
+
+
+def _result(outcomes: List[Any]) -> int:
+    """The apply's exit code once every outcome is said: 1 when any build failed. An outcome
+    with an error-catalog event (a release that was not rolled back, or a config that is not
+    started again) raises it as ``CLIError``, so its guidance and docs link are printed too;
+    one a Ctrl-C cut short stops the apply as an interrupt does."""
+    if any(o.interrupted for o in outcomes):
+        raise KeyboardInterrupt
+    coded = next((o for o in outcomes if o.code), None)
+    if coded is not None:
+        raise _cli_error(
+            str(coded.code),
+            {"build": coded.build, "runtime": coded.runtime, "run": coded.run_id or "-"},
+        )
     return 1 if any(o.error for o in outcomes) else 0
 
 
@@ -401,7 +417,7 @@ def reconcile_only(
     for out in outcomes:
         cprint(out.line(), markup=False)
         logger.info("spark_reconcile", extra={"spark": out.as_dict()})
-    return 1 if any(o.error for o in outcomes) else 0
+    return _result(outcomes)
 
 
 def _removed_of(

@@ -56,6 +56,9 @@ STOP_GRACE_ENV = "FLUID_SPARK_STOP_GRACE_SECONDS"
 #: How long a released stream's new run is watched before it is kept; one that ends or is retried
 #: in that time is replaced by the last good config (``_reconcile``).
 PROBATION_ENV = "FLUID_SPARK_RELEASE_PROBATION_SECONDS"
+#: Operator-only: set to ``1`` to start a config that failed its probation again (``_reconcile``
+#: refuses it otherwise). A project file cannot set it (``credentials.protected_env``).
+ACCEPT_FAILED_ENV = "FLUID_SPARK_ACCEPT_FAILED_RELEASE"
 #: Names the release a deploy belongs to (a tag, a build number, a release's identity digest):
 #: the runner stamps it on every commit as ``fluid.release-id`` when set.
 RELEASE_ID_ENV = "FLUID_RELEASE_ID"
@@ -439,7 +442,8 @@ class DesiredRun:
                     else "a changed config asks the running job to stop between batches "
                     f"(cancelling it after {STOP_GRACE_ENV}) and starts it again on the same "
                     f"checkpoint, watched for {PROBATION_ENV}: a new run that ends or is retried "
-                    "in that time is replaced by the last good config; a new source on that "
+                    "in that time is replaced by the last good config (not when the release moved "
+                    "the checkpoint over the same output); a new source on that "
                     "checkpoint is refused"
                 ),
             },

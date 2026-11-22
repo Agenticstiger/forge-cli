@@ -66,6 +66,7 @@ from fluid_build.build_runners.spark._adapters import (
     SUCCEEDED,
     RunInfo,
     SparkRunError,
+    failed_release_uri,
     release_config_uri,
     stop_request_body,
     stop_request_uri,
@@ -589,7 +590,15 @@ def read_release(host: LocalHost, run: DesiredRun, job_sha256: str) -> Optional[
     Raises:
         SparkRunError: the record exists but cannot be read.
     """
-    uri = release_config_uri(bound_job_uri(host, run), job_sha256)
+    return _read_artifact(host, release_config_uri(bound_job_uri(host, run), job_sha256))
+
+
+def _read_artifact(host: LocalHost, uri: str) -> Optional[bytes]:
+    """The bytes at ``uri`` under this machine's artifact root, or None when there are none.
+
+    Raises:
+        SparkRunError: the artifact exists but cannot be read.
+    """
     if uri.startswith("s3://"):
         bucket, _, key = uri.removeprefix("s3://").partition("/")
         try:
@@ -609,19 +618,50 @@ def read_release(host: LocalHost, run: DesiredRun, job_sha256: str) -> Optional[
         raise SparkRunError(f"{uri} cannot be read: {exc.strerror}") from exc
 
 
+def keep_failed(host: LocalHost, run: DesiredRun, config_hash: str, body: bytes) -> str:
+    """Mark the config with ``config_hash`` as one that failed its probation, beside the job
+    config at this machine's artifact root (``_adapters.failed_release_uri``). Its URI.
+
+    Raises:
+        SparkRunError: the root is unusable, or the marker cannot be written.
+    """
+    uri = failed_release_uri(bound_job_uri(host, run), config_hash)
+    _write_artifact(host, uri, body)
+    return uri
+
+
+def read_failed(host: LocalHost, run: DesiredRun, config_hash: str) -> Optional[bytes]:
+    """The failed-probation marker of ``config_hash``, or None when there is none.
+
+    Raises:
+        SparkRunError: the marker exists but cannot be read.
+    """
+    return _read_artifact(host, failed_release_uri(bound_job_uri(host, run), config_hash))
+
+
+def clear_failed(host: LocalHost, run: DesiredRun, config_hash: str) -> None:
+    """Remove a failed-probation marker. Best effort: one left behind only asks for the
+    operator's go-ahead again."""
+    _remove_artifact(
+        host, failed_release_uri(bound_job_uri(host, run), config_hash), "spark_marker_left"
+    )
+
+
 def remove_stop_request(host: LocalHost, uri: str) -> None:
     """Delete a stop request :func:`write_stop_request` wrote. Best effort: one left behind
     stops no other run, since its key is that run's own."""
+    _remove_artifact(host, uri, "spark_stop_request_left")
+
+
+def _remove_artifact(host: LocalHost, uri: str, event: str) -> None:
     try:
         if uri.startswith("s3://"):
             bucket, _, key = uri.removeprefix("s3://").partition("/")
             _s3_client(host.env).delete_object(Bucket=bucket, Key=key)
         else:
             Path(uri).unlink(missing_ok=True)
-    except Exception as exc:  # noqa: BLE001 - best effort, as the docstring says
-        logging.getLogger(__name__).warning(
-            "spark_stop_request_left", extra={"uri": uri, "error": type(exc).__name__}
-        )
+    except Exception as exc:  # noqa: BLE001 - best effort
+        logging.getLogger(__name__).warning(event, extra={"uri": uri, "error": type(exc).__name__})
 
 
 def local_package(run: DesiredRun, env: Mapping[str, str]) -> bytes:

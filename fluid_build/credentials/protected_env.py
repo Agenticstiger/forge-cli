@@ -291,6 +291,9 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST",
         # the Maven repository a Spark run loads its jars from
         "FLUID_SPARK_MAVEN_REPOSITORY",
+        # the go-ahead to start a Spark config again that failed its probation: a project
+        # file must not give it on the operator's behalf
+        "FLUID_SPARK_ACCEPT_FAILED_RELEASE",
         # Both rewrite a contract-declared loopback host to a reachable one,
         # AFTER the secretRef policy has cleared the send as local-only
         # (fluid_build/secrets/policy). A project file that could set either

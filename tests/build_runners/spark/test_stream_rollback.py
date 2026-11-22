@@ -368,17 +368,63 @@ def test_a_rollback_run_that_cannot_be_read_back_is_still_named(run, clock, use)
     assert "run rb was started from its release record, but checking on it failed" in out.message
 
 
-def test_a_new_config_over_a_previous_one_that_died_is_watched_and_rolled_back(run, clock, use):
-    dead = dataclasses.replace(last_good(run), state="FAILED", raw_state="FAILED")
-    fake = Rolling([dead], start_states=("FAILED",), records={OLD_DIGEST: OLD_JOB})
+@pytest.mark.parametrize("ended", ["CANCELLED", "SUCCEEDED"])
+def test_a_previous_config_that_ended_cleanly_is_watched_and_rolled_back_to(run, clock, use, ended):
+    """Cancelled (forge's stop or an operator's) or SUCCEEDED: the config ended as it was
+    asked, so it is a config to go back to."""
+    previous = dataclasses.replace(last_good(run), state=ended, raw_state=ended)
+    fake = Rolling([previous], start_states=("FAILED",), records={OLD_DIGEST: OLD_JOB})
     use(fake)
     out = go(run, clock)
-    assert (out.action, out.run_id) == ("rolled-back", "rb")
-    cancelled = dataclasses.replace(dead, state="CANCELLED", raw_state="CANCELLED")
-    fake = Rolling([cancelled], start_states=("FAILED",), records={OLD_DIGEST: OLD_JOB})
+    assert (out.action, out.run_id, out.code) == ("rolled-back", "rb", None)
+    assert len(fake.rolled_back) == 1
+
+
+@pytest.mark.parametrize("ended", ["FAILED", "LOST"])
+def test_a_previous_config_that_died_is_no_config_to_go_back_to(run, clock, use, ended):
+    """A run that failed (or was lost with its machine) would otherwise be started again past
+    its restart budget by a release that failed: the new run is watched, nothing is rolled
+    back, and the apply fails with a typed error that says the stream is down."""
+    dead = dataclasses.replace(
+        last_good(run), state="FAILED", raw_state=ended, lost=ended == "LOST"
+    )
+    fake = Rolling(
+        [dead], start_states=("RUNNING", "RUNNING", "FAILED"), records={OLD_DIGEST: OLD_JOB}
+    )
     use(fake)
-    out = go(run, clock)  # an operator's cancel is no config to go back to
-    assert out.action == "started" and fake.rolled_back == []
+    out = go(run, clock)
+    assert (out.action, out.error, out.code, fake.rolled_back) == (
+        "failed",
+        True,
+        rc.NO_GOOD_CONFIG,
+        [],
+    )
+    assert "start rollback" not in fake.calls and "cancel new" not in fake.calls
+    assert f"ended {ended}, which is no config to go back to" in out.message
+    assert "the stream is down" in out.message
+    assert run.config_hash in fake.failed  # the config that failed is marked all the same
+
+
+def test_a_previous_config_that_failed_its_own_probation_is_no_config_to_go_back_to(
+    run, clock, use
+):
+    gone = dataclasses.replace(
+        last_good(run), state="CANCELLED", raw_state="CANCELLED", config_hash="b" * 64
+    )
+    fake = Rolling([gone], start_states=("FAILED",), records={OLD_DIGEST: OLD_JOB})
+    fake.failed["b" * 64] = b"{}"
+    use(fake)
+    out = go(run, clock)
+    assert (out.action, out.code, fake.rolled_back) == ("failed", rc.NO_GOOD_CONFIG, [])
+    assert "failed its own probation" in out.message
+
+
+def test_a_first_release_of_a_stream_with_no_previous_config_is_not_watched(run, clock, use):
+    fake = Rolling(start_states=("RUNNING", "RUNNING", "FAILED"))
+    use(fake)
+    out = go(run, clock)
+    assert (out.action, out.code, out.error) == ("started", None, False)
+    assert sum(clock.slept) == 0 and fake.failed == {}
 
 
 def test_a_release_that_changed_only_settings_or_the_runner_rolls_nothing_back(run, clock, use):

@@ -44,6 +44,10 @@ class ConfigBucket:
 
     def get_object(self, Bucket, Key):  # noqa: N803 - boto3's names
         self.read.append(f"s3://{Bucket}/{Key}")
+        if Key.endswith("/failed"):  # no config has failed its probation
+            from botocore.exceptions import ClientError
+
+            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "no"}}, "GetObject")
         if Key.endswith(RUNNER_FILE):
             return {"Body": io.BytesIO(self.runner or runner_source().encode("utf-8"))}
         return {"Body": io.BytesIO(self.body)}

@@ -207,6 +207,33 @@ def release_config_uri(job_uri: str, job_sha256: str) -> str:
     return f"{job_uri.rsplit('/', 1)[0]}/releases/{job_sha256[:16]}/job.json"
 
 
+#: A config hash as forge records it on a run (``--fluid-config-hash``): lower-case hex.
+_CONFIG_HASH = re.compile(r"[0-9a-f]{16,64}")
+
+
+def failed_release_uri(job_uri: str, config_hash: str) -> str:
+    """Where forge marks a config that failed its probation (``releases/<hash16>/failed``),
+    beside the build's job config: a later ``fluid apply`` will not start that config again
+    unless the operator says so."""
+    return f"{job_uri.rsplit('/', 1)[0]}/releases/{config_hash[:16]}/failed"
+
+
+def failed_release_body(config_hash: str, run_id: str, reason: str) -> bytes:
+    """What a failed-probation marker holds, for whoever reads it."""
+    import json
+    import time
+
+    return json.dumps(
+        {
+            "configHash": config_hash,
+            "runId": run_id,
+            "reason": reason[:400],
+            "failedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+
 def stop_location(info: RunInfo, job_uri: str) -> str:
     """The job config ``info`` looks for its stop request beside: ``job_uri`` (the build's),
     or a release record of the build a rollback started it on. A run whose arguments do not
@@ -515,6 +542,59 @@ class Adapter:
     def withdraw_stop(self, uri: str) -> None:
         """Delete a stop request once its run has ended or been cancelled. Best effort: one
         left behind stops no other run, since its key is that run's own."""
+        bucket, _, key = uri.removeprefix("s3://").partition("/")
+        try:
+            (self.clients or default_clients)("s3", self.run.region).delete_object(
+                Bucket=bucket, Key=key
+            )
+        except Exception as exc:  # noqa: BLE001 - best effort, as the docstring says
+            _left_behind(uri, exc)
+
+    def mark_failed(self, config_hash: str, run_id: str, reason: str) -> str:
+        """Mark the config with ``config_hash`` as one that failed its probation
+        (:func:`failed_release_uri`). Its URI.
+
+        Raises:
+            SparkRunError: the marker could not be written (the message names it).
+        """
+        uri = failed_release_uri(self.run.job_uri, config_hash)
+        bucket, _, key = uri.removeprefix("s3://").partition("/")
+        try:
+            (self.clients or default_clients)("s3", self.run.region).put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=failed_release_body(config_hash, run_id, reason),
+                ContentType="application/json",
+            )
+        except Exception as exc:  # noqa: BLE001 - botocore's errors; named, then raised
+            code = _error_code(exc) or type(exc).__name__
+            raise SparkRunError(f"{uri} could not be written: {code}") from exc
+        return uri
+
+    def failed_release(self, config_hash: Optional[str]) -> Optional[bytes]:
+        """The marker of a config that failed its probation, or None when there is none (or
+        ``config_hash`` is no hash forge records).
+
+        Raises:
+            SparkRunError: the marker cannot be read (the message names it and the code).
+        """
+        if not config_hash or not _CONFIG_HASH.fullmatch(config_hash):
+            return None
+        uri = failed_release_uri(self.run.job_uri, config_hash)
+        try:
+            return _read_back(self.clients or default_clients, self.run.region, uri)
+        except Exception as exc:  # noqa: BLE001 - botocore's errors; named, then raised
+            code = _error_code(exc) or type(exc).__name__
+            if code in ("NoSuchKey", "404", "NotFound"):
+                return None
+            raise SparkRunError(f"the marker {uri} cannot be read: {code}") from exc
+
+    def clear_failed(self, config_hash: str) -> None:
+        """Remove a failed-probation marker once the operator has started its config again.
+        Best effort: a marker left behind only asks for the same go-ahead again."""
+        if not _CONFIG_HASH.fullmatch(config_hash):
+            return
+        uri = failed_release_uri(self.run.job_uri, config_hash)
         bucket, _, key = uri.removeprefix("s3://").partition("/")
         try:
             (self.clients or default_clients)("s3", self.run.region).delete_object(
@@ -1138,6 +1218,26 @@ class Local(Adapter):
         if not info.job_sha256 or not _SHA256.fullmatch(info.job_sha256):
             return None
         return read_release(self.host, self.run, info.job_sha256)
+
+    def mark_failed(self, config_hash: str, run_id: str, reason: str) -> str:
+        from fluid_build.build_runners.spark._local import keep_failed
+
+        return keep_failed(
+            self.host, self.run, config_hash, failed_release_body(config_hash, run_id, reason)
+        )
+
+    def failed_release(self, config_hash: Optional[str]) -> Optional[bytes]:
+        from fluid_build.build_runners.spark._local import read_failed
+
+        if not config_hash or not _CONFIG_HASH.fullmatch(config_hash):
+            return None
+        return read_failed(self.host, self.run, config_hash)
+
+    def clear_failed(self, config_hash: str) -> None:
+        from fluid_build.build_runners.spark._local import clear_failed
+
+        if _CONFIG_HASH.fullmatch(config_hash):
+            clear_failed(self.host, self.run, config_hash)
 
     def retry_hint(self) -> str:
         """How to start a stream whose restarts are spent sooner, when the cause was this
