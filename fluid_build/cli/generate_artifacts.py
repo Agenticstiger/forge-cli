@@ -50,8 +50,9 @@ _EPILOG = (
     "It renders the bundles' templates in this process, so name it only where the\n"
     "contract's bundles are trusted (not on a build of an untrusted pull request).\n"
     "A git bundle that authenticates needs its host in\n"
-    "FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS and a secret_ref that starts with the prefix\n"
-    "FLUID_SCAFFOLD_, both set where the command runs, never in the contract.\n\n"
+    "FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS and a secret_ref that starts with\n"
+    "the prefix FLUID_SCAFFOLD_, both set where the command runs, never in the\n"
+    "contract.\n\n"
     "Note: --emit dbt is NOT supported. dbt projects are execution artifacts;\n"
     "use `fluid generate speed-transformation` instead.\n"
 )
