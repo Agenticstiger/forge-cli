@@ -16,9 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `import` block in the module's `main.tf.json`, so the plan shows the import and writes
   no state before the apply. The saved plan is read back with `tofu show -json` before
   the data-loss gate: a table that matches is imported unreplaced, its Lake Formation
-  permissions kept, and what the apply still changes in place (a description, an owner,
-  column comments, a column name's case, the columns of older Iceberg schemas Glue
-  lists) is printed. A table that differs refuses the run (`table_adoption_mismatch`),
+  permissions kept. What it holds of its own that the contract does not declare (a
+  description, an owner, column comments, a column name's case, the columns of older
+  Iceberg schemas Glue lists) is printed: an Iceberg table keeps it, as the adoption
+  never updates an Iceberg table in place (the plan is made again with that drift left
+  alone, and must import the table with no change); a Hive table is updated in place. A table that differs refuses the run (`table_adoption_mismatch`),
   naming each column missing, added, of another type (spacing aside, as the data-loss
   gate reads types) or in another order, and each property: location, Iceberg or not,
   input and output format, SerDe and storage parameters, partition keys, table type, any
