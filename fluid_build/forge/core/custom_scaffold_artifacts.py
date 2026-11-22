@@ -169,7 +169,7 @@ def emit(
         )
         return []
     if not allow_change_request:
-        _refuse_on_change_request()
+        refuse_on_change_request(contract)
     engine = _engine()
     _check_block(engine, contract)
     _check_plugins(block)
@@ -197,7 +197,16 @@ def emit(
 # ── the engine ────────────────────────────────────────────────────────────
 
 
-def _refuse_on_change_request() -> None:
+def refuse_on_change_request(contract: Mapping[str, Any]) -> None:
+    """Refuse a change-request build of a contract that declares the block.
+
+    Such a build runs the change's code before anyone merged it, and the engine would
+    render the change's bundle templates in this process. The caller has checked
+    ``--allow-scaffold-on-change-request``. Stage 3 calls this before anything under
+    ``--out`` is removed or written, and :func:`emit` calls it again.
+    """
+    if scaffold_block(contract) is None:
+        return
     from fluid_build.util.change_request import change_request_marker
 
     marker = change_request_marker(os.environ)
@@ -543,5 +552,6 @@ __all__ = [
     "SUBDIR",
     "clear",
     "emit",
+    "refuse_on_change_request",
     "scaffold_block",
 ]

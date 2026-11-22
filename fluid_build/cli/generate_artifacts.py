@@ -94,8 +94,8 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
             "Output directory for emitted artifacts. Default: dist/artifacts. Stage 3 owns its "
             "subdirectories there (odcs/, odps-bitol/, opds/, schedule/, policy/, spark/, "
             "pyspark-schema/, custom-scaffold/) and replaces what an earlier run wrote in them "
-            "on every run, whatever --emit names; a custom-scaffold/ that holds "
-            "fluid-scaffold.yaml (a scaffold bundle) stops the run instead."
+            "on every run, whatever --emit names; a refused run changes nothing there, and a "
+            "custom-scaffold/ that holds fluid-scaffold.yaml (a scaffold bundle) refuses it."
         ),
     )
     p.add_argument(

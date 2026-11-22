@@ -353,12 +353,16 @@ def test_a_scaffold_bundle_kept_at_the_output_name_is_never_deleted(
     bundle = out / "custom-scaffold"
     bundle.mkdir(parents=True)
     (bundle / "fluid-scaffold.yaml").write_text("apiVersion: fluid.dev/custom-scaffold.v1\n")
+    earlier = out / "odcs" / "earlier.yaml"
+    earlier.parent.mkdir()
+    earlier.write_text("an earlier run's output\n")
     contract = _write(out, _contract())
     with pytest.raises(FanoutError) as raised:
         _fanout(contract, out, emit="odcs")
     assert raised.value.code == "custom_scaffold_output_failed"
     assert "fluid-scaffold.yaml" in str(raised.value)
     assert (bundle / "fluid-scaffold.yaml").is_file()
+    assert earlier.is_file()  # refused before any other output was removed
 
 
 # ── change-request builds ─────────────────────────────────────────────────
@@ -391,6 +395,33 @@ def test_a_change_request_build_refuses_the_scaffold_and_runs_no_template(
     assert "--allow-scaffold-on-change-request" in str(raised.value)
     assert "calls" not in stub.HOOKS
     assert not (out / "custom-scaffold").exists()
+
+
+def _tree_bytes(root: Path) -> Dict[str, bytes]:
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+def test_a_refused_change_request_run_leaves_the_output_directory_as_it_was(
+    tmp_path: Path, stub: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refused before anything under ``--out`` is removed or written: an earlier run's
+    artifacts and its MANIFEST stay as they were, and a first run writes nothing."""
+    contract = _write(tmp_path / "p", _contract(_block()))
+    out = tmp_path / "out"
+    _fanout(contract, out, emit="odcs,policies")
+    before = _tree_bytes(out)
+    assert "MANIFEST.json" in before and any(k.startswith("policy/") for k in before)
+    monkeypatch.setenv("CHANGE_ID", "42")
+    for emit in ("odcs,policies,custom-scaffold", "custom-scaffold"):
+        with pytest.raises(FanoutError) as raised:
+            _fanout(contract, out, emit=emit)
+        assert raised.value.code == "custom_scaffold_change_request"
+        assert _tree_bytes(out) == before
+    first = tmp_path / "first"
+    with pytest.raises(FanoutError):
+        _fanout(contract, first, emit="policies,custom-scaffold")
+    assert not first.exists()
+    assert "calls" not in stub.HOOKS
 
 
 def test_the_flag_lets_a_trusted_change_request_build_run_it(

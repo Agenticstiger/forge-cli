@@ -1177,15 +1177,17 @@ def _clear_outputs(out_dir: Path) -> None:
     The caller owns ``out_dir``: only the subdirectories this module generates into are
     touched, and in ``spark/`` and ``pyspark-schema/`` only the files it writes there.
     """
+    from fluid_build.forge.core import custom_scaffold_artifacts
+
+    # First: it refuses a custom-scaffold/ that is a scaffold bundle, and nothing else may
+    # have been removed by then.
+    custom_scaffold_artifacts.clear(out_dir)
     for sub in ("odps", "odps-bitol", "odcs", "opds", "schedule", "policy"):
         target = out_dir / sub
         if target.exists():
             shutil.rmtree(target)
     _clear_spark(out_dir / "spark")
     _clear_pyspark_schema(out_dir / "pyspark-schema")
-    from fluid_build.forge.core import custom_scaffold_artifacts
-
-    custom_scaffold_artifacts.clear(out_dir)
 
 
 def _emit_key(key: str, subdir: Path, run: _Inputs, logger: logging.Logger) -> List[Path]:
@@ -1288,8 +1290,6 @@ def run_fanout(
     except fluid_apply.ScheduleRenderError as exc:
         raise FanoutError(str(exc), key="schedule") from exc
 
-    _clear_outputs(out_dir)
-
     dag_contract_path = contract_path
     if dag_contract_path is None:
         # A raw contract locates itself, as does the one a temporary --env
@@ -1326,6 +1326,15 @@ def run_fanout(
             logger.info(schedule_skip, extra={"hint": _SCHEDULE_SKIP_HINTS[schedule_skip]})
             emits = [k for k in emits if k != "schedule"]
 
+        from fluid_build.forge.core import custom_scaffold_artifacts
+
+        if custom_scaffold_artifacts.EMIT_KEY in emits and not allow_scaffold_on_change_request:
+            # A change-request build is refused here, before anything under out_dir is
+            # removed or written, so an earlier run's artifacts and MANIFEST stay as they
+            # were (emit() checks again).
+            custom_scaffold_artifacts.refuse_on_change_request(_load_contract(resolved_contract))
+        # Every check that refuses the run is behind us: from here on, out_dir changes.
+        _clear_outputs(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         run = _Inputs(
             source=bundle_or_contract,
