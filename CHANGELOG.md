@@ -187,9 +187,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does not manage used to be imported on every `fluid apply` and rewritten to the
   contract in place. It is now refused before the plan (`table_adoption_requires_flag`),
   naming each table; `--adopt-tables` adopts it after the match check. A table forge
-  made (it carries the `managed_by: fluid` parameter forge's module sets on create) is
-  re-attached as before when its state was lost or is kept nowhere, so an apply that
-  starts from an empty state on every run keeps working. S3 buckets, Glue databases,
+  made for the same product (it carries the `managed_by: fluid` parameter forge's module
+  sets on create, and the contract it was made from names the same id) is re-attached as
+  before when its state was lost or is kept nowhere, so an apply that starts from an
+  empty state on every run keeps working; another product's table needs the flag. S3 buckets, Glue databases,
   Kinesis streams and the other brownfield resources are adopted as before, and so are
   tables on the other clouds. The look-up now also covers a Glue binding without a
   `format`, which the module declares as Parquet and the look-up used to skip.
