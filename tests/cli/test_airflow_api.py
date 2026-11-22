@@ -557,3 +557,20 @@ def test_a_remote_airflow_keeps_the_proxy_from_the_environment():
     finally:
         remote.close()
         local.close()
+
+
+def test_an_https_airflow_whose_certificate_is_not_trusted_gets_nothing(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    from tests._loopback_tls_support import self_signed
+
+    monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
+    monkeypatch.delenv("CURL_CA_BUNDLE", raising=False)
+    with FakeAirflow(3, tls=self_signed(tmp_path)) as fake:
+        assert fake.url.startswith("https://")
+        error = _raises(
+            lambda: _connect(fake, Credentials.from_password("admin", "admin"), attempts=1),
+            "schedule_sync_airflow_unreachable",
+        )
+        assert fake.requests == []
+    assert "admin" not in error.message

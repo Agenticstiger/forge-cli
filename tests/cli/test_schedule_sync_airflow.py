@@ -22,6 +22,8 @@ import pytest
 from fluid_build.cli import _airflow_sync_check as chk
 from fluid_build.cli import schedule_sync
 from fluid_build.cli._airflow_api import CREDENTIAL_REF_ENV, TOKEN_REF_ENV
+from fluid_build.secrets.policy import ALLOWLIST_ENV, PREFIXES_ENV, SCHEMES_ENV, STAGES_ENV
+from tests._loopback_tls_support import self_signed
 from tests.cli._fake_airflow import FakeAirflow
 
 pytestmark = pytest.mark.unit
@@ -201,6 +203,87 @@ def test_a_token_reference_is_sent_as_a_bearer(dags_dir: Path, monkeypatch, caps
         sent = {r.authorization for r in fake.requests if r.path.startswith("/api/v2/dags")}
     assert rc == 0, out
     assert sent == {"Bearer issued-by-ci-7c1e"} and "issued-by-ci-7c1e" not in out
+
+
+# ── the operator's credential under the secret policy ───────────────────
+#
+# ``secrets.resolve_secret`` decides where a reference a contract names may be sent (the
+# destination allowlist) and in which stage it may be read. The Airflow credential is
+# the operator's: its reference sits in a protected FLUID_AIRFLOW_* variable and its
+# destination is --airflow-url, so it resolves through ``resolve_credential``, as the
+# Lakekeeper credential does, where the scheme and locator-prefix rules apply.
+
+
+@pytest.mark.parametrize("tls", [False, True], ids=["loopback-http", "https"])
+@pytest.mark.parametrize(
+    "major, style", [(2, "password"), (3, "password"), (3, "token")], ids=["2-pw", "3-pw", "3-tok"]
+)
+def test_the_operator_credential_reaches_airflow_under_the_secret_policy(
+    major: int, style: str, tls: bool, dags_dir: Path, tmp_path: Path, monkeypatch, capsys
+):
+    """A destination allowlist that names only another host, and the default stage gate,
+    leave it alone; it reaches Airflow over loopback HTTP and over HTTPS."""
+    monkeypatch.setenv(ALLOWLIST_ENV, "env://AF_TEST_CREDENTIAL@db.example.org")
+    monkeypatch.setenv(STAGES_ENV, "apply")
+    tokens: Tuple[str, ...] = ()
+    if style == "token":
+        monkeypatch.delenv(CREDENTIAL_REF_ENV)
+        monkeypatch.setenv(TOKEN_REF_ENV, "env://AF_TEST_TOKEN")
+        monkeypatch.setenv("AF_TEST_TOKEN", "operator-issued-0d9a")
+        tokens = ("operator-issued-0d9a",)
+    tls_files = None
+    if tls:
+        tls_files = self_signed(tmp_path)
+        monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(tls_files[0]))
+    with FakeAirflow(major, static_tokens=tokens, tls=tls_files) as fake:
+        _drive(monkeypatch, fake, _live(fake, dags_dir))
+        rc, out = _main(_base(dags_dir, fake, "--check-only"), capsys)
+        url = fake.url
+        sent = {r.authorization.split(" ")[0] for r in fake.requests if r.authorization}
+        logins = [r.body for r in fake.requests if r.path == "/auth/token"]
+    assert rc == 0, out
+    assert url.startswith("https://" if tls else "http://")
+    if style == "token":
+        assert sent == {"Bearer"} and not logins
+    elif major == 2:
+        assert sent == {"Basic"}
+    else:
+        login = {"username": "admin", "password": "admin"}  # pragma: allowlist secret
+        assert logins == [login] and sent == {"Bearer"}
+
+
+@pytest.mark.parametrize("scheme_off", [True, False], ids=["scheme-not-enabled", "file-prefix"])
+def test_the_secret_policy_refuses_the_credential_before_anything_is_sent(
+    scheme_off: bool, dags_dir: Path, tmp_path: Path, monkeypatch, capsys
+):
+    stored = tmp_path / "airflow" / "credential"
+    stored.parent.mkdir()
+    stored.write_text("admin:admin", encoding="utf-8")
+    if scheme_off:
+        monkeypatch.setenv(SCHEMES_ENV, "vault")  # env:// is off
+    else:
+        monkeypatch.setenv(CREDENTIAL_REF_ENV, f"file://{stored}")  # outside /run/secrets/
+    with FakeAirflow(3) as fake:
+        rc, out = _main(_base(dags_dir, fake, "--check-only"), capsys)
+        assert fake.requests == []
+    assert rc == 2 and "ERR_SCHEDULE_SYNC_AIRFLOW_CREDENTIALS" in out
+    assert ("env:// scheme is not enabled" if scheme_off else str(stored)) in out
+
+
+def test_a_file_reference_under_a_prefix_the_operator_allows_reaches_airflow(
+    dags_dir: Path, tmp_path: Path, monkeypatch, capsys
+):
+    stored = tmp_path / "airflow" / "credential"
+    stored.parent.mkdir()
+    stored.write_text("admin:admin\n", encoding="utf-8")
+    monkeypatch.setenv(PREFIXES_ENV, f"file://{stored.parent}/")
+    monkeypatch.setenv(CREDENTIAL_REF_ENV, f"file://{stored}")
+    with FakeAirflow(2) as fake:
+        _drive(monkeypatch, fake, _live(fake, dags_dir))
+        rc, out = _main(_base(dags_dir, fake, "--check-only"), capsys)
+        sent = {r.authorization.split(" ")[0] for r in fake.requests if r.authorization}
+    assert rc == 0, out
+    assert sent == {"Basic"} and "admin:admin" not in out
 
 
 # ── push, then check ────────────────────────────────────────────────────

@@ -32,6 +32,7 @@ from __future__ import annotations
 import base64
 import email.utils
 import json
+import ssl
 import threading
 import time
 from dataclasses import dataclass, field
@@ -116,6 +117,8 @@ class FakeAirflow:
     delay_s: float = 0.0
     #: Paths answered ``200 {}``, to play a server that is not Airflow's API.
     empty: Tuple[str, ...] = ()
+    #: ``(certificate, key)`` files to serve HTTPS with (``tests/_loopback_tls_support``).
+    tls: Optional[Tuple[Path, Path]] = None
 
     def __post_init__(self) -> None:
         self.version = self.version or ("2.10.5" if self.major == 2 else "3.4.0")
@@ -199,7 +202,8 @@ class FakeAirflow:
     @property
     def url(self) -> str:
         assert self._server is not None, "use FakeAirflow as a context manager"
-        return f"http://127.0.0.1:{self._server.server_address[1]}"
+        scheme = "https" if self.tls else "http"
+        return f"{scheme}://127.0.0.1:{self._server.server_address[1]}"
 
     def paths(self) -> List[str]:
         return [f"{r.method} {r.path}" for r in self.requests]
@@ -226,6 +230,10 @@ class FakeAirflow:
                 return email.utils.format_datetime(fake.now, usegmt=True)
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        if self.tls:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(*self.tls)
+            self._server.socket = context.wrap_socket(self._server.socket, server_side=True)
         self._thread = threading.Thread(
             target=self._server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
         )
