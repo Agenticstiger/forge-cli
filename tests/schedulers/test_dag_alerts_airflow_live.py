@@ -93,7 +93,7 @@ os.environ["AIRFLOW_CONN_OPSGENIE_ALERTS"] = json.dumps(
     {"conn_type": "http", "host": base + "/v2/alerts",
      "extra": {"Authorization": "GenieKey 00000000-0000-0000-0000-000000000000"}})
 os.environ["AIRFLOW_CONN_SLACK_ALERTS"] = json.dumps(
-    {"conn_type": "slackwebhook", "host": base + "/services", "password": "T0/B0/X0"})
+    {"conn_type": "slackwebhook", "host": base + "/services", "password": "T0/B0/X0"})  # pragma: allowlist secret
 if mode == "succeed":
     os.environ["FLUID_BIN"] = "/usr/bin/true"
     os.environ["FLUID_PROJECT_DIR"] = os.environ["LIVE_PROJECT_DIR"]

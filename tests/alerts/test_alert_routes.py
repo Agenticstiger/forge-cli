@@ -116,7 +116,7 @@ class TestRefusals:
             ZENDUTY_URL,
             "https://hooks.example.com/services/T0/B0/X",
             "ops:" + "pa55" + "@smtp.example.com",
-            "0123456789abcdef0123456789abcdef",  # a PagerDuty routing key
+            "0123456789abcdef0123456789abcdef",  # a PagerDuty routing key  # pragma: allowlist secret
             "0f8fad5b-d9cb-469f-a165-70867728950e",  # an Opsgenie API key
             "with space",
             "{{ conn.x.password }}",
