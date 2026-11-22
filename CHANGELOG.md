@@ -665,16 +665,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An address with an IPv6 zone id, such as `::1%lo0`, is no longer read as this machine. The
   secret destination policy judges it like any other host, and an OpenBao or Vault address on
   it needs https.
-- The secret destination policy judges every host a connection names. Beside a `secretRef`,
-  a query-string parameter that names a host (`host` or `hostaddr` in a libpq URI, a host in
-  `jdbc_url_params` or in a Singer tap's `sqlalchemy_url`) is refused unless the reference may
-  go to any host, and so is a database name that holds `?`, `#`, `;`, `&`, `@`, `\` or a
-  control character. The host of an SSH tunnel in use (a tap's `ssh_tunnel`, Airbyte's
-  `tunnel_method`) needs an allowlist entry of its own, and so does a loopback host behind
-  it. A Debezium `extra_config` may no longer set `database.port`, `database.dbname`,
-  `database.names` or `connector.class` beside a `secretRef`. A URI whose authority a
-  database client could read as naming a host the policy does not read is a destination the
-  policy cannot read, and is refused unless the reference may go to any host.
+- Through 0.36.0, a contract could send a secret to a host the destination policy did not read
+  (a host in a URI's query string or in a database name). Beside a `secretRef`, the policy now
+  judges `host`, the host part of each URI field, the host of an SSH tunnel in use (a tap's
+  `ssh_tunnel` with `enable: true`, Airbyte's `tunnel_method` other than `NO_TUNNEL`), and,
+  under any other setting of the connection block at any depth, a URI, or a field named for a
+  host (`host`, `hostname`, `hosts`, `server_addresses`, `cluster_url` and the top-level
+  destination names) unless it holds a path or a word. A loopback host behind a tunnel needs an
+  allowlist entry too. A URI of an object store or a local file names no host, nor does an
+  embedded JDBC URL whose settings name none, and a URI under a credential-named field is judged
+  by its host and never quoted. A parameter that names a host, in a query string (`host` or
+  `hostaddr` in a libpq URI, a host in `jdbc_url_params` or in a Singer tap's `sqlalchemy_url`)
+  or in a mapping a connector reads as one (a Singer tap's `sqlalchemy_url_query` or
+  `sqlalchemy_options`, `connect_args` under `sqlalchemy_eng_params`, any other `*_query`
+  mapping), is refused unless the reference may go to any host, and so are a parameter whose
+  name holds connection-string syntax (`=`, a blank, `;` or a quote), a driver argument in
+  `connect_args` that holds `;`, `{` or `}`, and a database name that holds `?`, `#`, `;`, `&`,
+  `@`, `\` or a control character. An absolute socket path in libpq's `host` or in MySQL's
+  `unix_socket` is this machine. A URI whose authority a database client could read as naming a
+  host the policy does not read is refused unless the reference may go to any host.
+- A Debezium `extra_config` may no longer set, beside a `secretRef`, the host, port, database,
+  password, JDBC protocol or connector class, under `database.` or `driver.`, nor a JDBC driver
+  property that names a host, such as `failoverPartner` or `socketFactory`, nor Oracle's
+  `rac.nodes`.
 - A runner that builds a connection URL keeps each field in its own part. dlt's
   `sql_database` source refuses a host, database or `drivername` that would change how its
   connection URL is read back, and `drivername` must be a SQLAlchemy dialect name with an
@@ -682,8 +695,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that holds URL syntax, and a port that is not a number.
 - A secret-policy refusal no longer prints a value it cannot trace to the contract. At
   `fluid apply`, where `{{ env.NAME }}` placeholders are rendered, a refusal quotes a host only
-  when the contract wrote it as it stands, and names the placeholder of one it rendered. A
-  keyword connection string (`Server=...;Database=...`) shows its host part only.
+  when the connection block the contract wrote holds it as it stands in the same field, and
+  names the placeholder of one it rendered. A keyword connection string
+  (`Server=...;Database=...`) shows its host part only, and only when the host comes before any
+  key that may hold a secret. A host field written as `user:password@host` is not quoted, and at
+  apply no character of a rendered database name is.
 - In `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, `NAME@*` now sends `env://NAME` to any host, as
   a bare `NAME` and `env://NAME@*` already did. It used to name a literal host `*`, which no
   destination matches. A refusal's fix names both forms.

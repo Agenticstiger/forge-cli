@@ -130,7 +130,9 @@ def test_the_acquisition_dispatcher_hands_the_policy_the_contract_as_written(
     assert base._execute_acquisition_build(build, {"builds": [build]}, tmp_path, dry_run=False) == 0
     assert SECRET_VALUE not in str(seen[SECRET_VALUE])
     assert "{{ env.FLUID_TEST_RENDERED }}" in seen[SECRET_VALUE].what
-    assert REMOTE in seen[REMOTE].what
+    # The build writes REMOTE elsewhere, not in a block that renders to this one.
+    assert REMOTE not in seen[REMOTE].what
+    assert "the host in connection.host" in seen[REMOTE].what
 
 
 # ── a keyword connection string ──────────────────────────────────────────────
@@ -154,6 +156,40 @@ def test_a_keyword_string_shows_only_its_host_part(text):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "text",
+    [
+        "user=u password='abc host=hunter3' dbname=d",  # pragma: allowlist secret
+        "Pwd=x host=hunter3",  # pragma: allowlist secret
+        "Uid=u;Pwd={a;Server=hunter3};Database=d",  # pragma: allowlist secret
+        "AccountKey=abc server=hunter3;Database=d",  # pragma: allowlist secret
+        "password=a;host=hunter3 dbname=d",  # pragma: allowlist secret
+        "user=u password=abc\\ host=hunter3",  # pragma: allowlist secret
+    ],
+)
+def test_a_keyword_string_never_shows_part_of_a_password(text):
+    with pytest.raises(AcquisitionSecretPolicyError) as info:
+        refuse_unless_allowed("env://PG", connection={"connection_string": text}, environ={})
+    assert "hunter3" not in str(info.value)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"host={REMOTE} port=5432 password=x",  # pragma: allowlist secret
+        f"Driver={{ODBC Driver 18}};Server=tcp:{REMOTE},1433;Uid=u;Pwd=x",  # pragma: allowlist secret
+        f"App=x host=y;Server={REMOTE};Pwd=p",  # pragma: allowlist secret
+        f"host='{REMOTE}' dbname=d",
+    ],
+)
+def test_a_keyword_string_shows_the_host_its_grammar_reads(text):
+    with pytest.raises(AcquisitionSecretPolicyError) as info:
+        refuse_unless_allowed("env://PG", connection={"connection_string": text}, environ={})
+    assert f"naming host {REMOTE!r}" in info.value.what
+
+
+@pytest.mark.unit
 def test_a_keyword_string_without_a_host_key_shows_no_part_of_it():
     text = "Database=d;Password=hunter2"
     with pytest.raises(AcquisitionSecretPolicyError) as info:
@@ -173,6 +209,38 @@ def test_apply_quotes_a_written_host_whose_password_is_a_placeholder():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("guess", [SECRET_VALUE, "wrong-guess.example"])
+def test_apply_does_not_confirm_a_rendered_host_another_field_guesses(guess):
+    """A refusal reads the same whether or not a string elsewhere matches the rendered host."""
+    from fluid_build.secrets.policy import destinations_as_written
+
+    written = {"host": "{{ env.FLUID_TEST_RENDERED }}", "application_name": guess}
+    contract = {
+        "metadata": {"owner": guess},
+        "builds": [{"properties": {"source": {"connection": written}}}],
+    }
+    with destinations_as_written(contract):
+        refusal = _apply_refusal({"host": SECRET_VALUE, "application_name": guess})
+    assert SECRET_VALUE not in refusal.what
+    assert "the host '{{ env.FLUID_TEST_RENDERED }}' renders to (connection.host)" in refusal.what
+
+
+@pytest.mark.unit
+def test_apply_quotes_a_host_as_written_only_when_every_matching_block_wrote_it():
+    from fluid_build.secrets.policy import destinations_as_written
+
+    contract = {
+        "builds": [
+            {"properties": {"source": {"connection": {"host": "{{ env.FLUID_TEST_RENDERED }}"}}}},
+            {"properties": {"source": {"connection": {"host": SECRET_VALUE}}}},
+        ]
+    }
+    with destinations_as_written(contract):
+        refusal = _apply_refusal({"host": SECRET_VALUE})
+    assert SECRET_VALUE not in refusal.what
+
+
+@pytest.mark.unit
 def test_apply_names_an_untraced_host_without_quoting_it():
     with secret_run("apply"):
         with pytest.raises(AcquisitionSecretPolicyError) as info:
@@ -189,3 +257,10 @@ def test_a_long_keyword_string_is_shown_in_linear_time():
     with pytest.raises(AcquisitionSecretPolicyError):
         refuse_unless_allowed("env://PG", connection={"server": "=" + " " * 3000}, environ={})
     assert time.perf_counter() - started < 0.5
+
+
+@pytest.mark.unit
+def test_apply_names_no_character_of_a_rendered_database_name():
+    refusal = _apply_refusal({"host": "localhost", "database": "abc@def"})
+    assert "'@'" not in refusal.what
+    assert "holds a character" in refusal.what
