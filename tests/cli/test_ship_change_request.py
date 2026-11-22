@@ -88,7 +88,27 @@ def test_an_emit_of_only_the_scaffold_switches_stage_three_off_on_a_change_reque
     reason = str(action.skip_reason)
     assert "change-request build" in reason and "BITBUCKET_PR_ID" in reason
     four = st.build_stage(4, opts, st.Workspace(tmp_path))
-    assert four.argv is None and four.skip_reason
+    assert four.argv is None
+    assert "change-request build" in str(four.skip_reason)
+    assert "--no-generate-artifacts" not in str(four.skip_reason)
+
+
+def test_a_release_run_says_the_change_request_switched_stage_three_off(
+    tmp_path: Path,
+) -> None:
+    from fluid_build.cli import _ship_release
+
+    opts = _opts(["--emit", "custom-scaffold"], JENKINS_PR)
+    why = _ship_release.refusal(tmp_path / "release", [1, 2, 3, 4], {}, opts)
+    assert why is not None and "change-request build" in why
+    assert "--no-generate-artifacts" not in why
+
+
+def test_a_stage_three_that_is_off_already_keeps_its_own_reason(tmp_path: Path) -> None:
+    opts = _opts(["--no-generate-artifacts", "--emit", "odcs,custom-scaffold"], JENKINS_PR)
+    assert opts.scaffold_left_out == "" and opts.emit == "odcs,custom-scaffold"
+    action = _stage3(opts, tmp_path)
+    assert action.argv is None and action.skip_reason == "--no-generate-artifacts"
 
 
 def test_a_contract_marker_variable_marks_a_tekton_build(tmp_path: Path) -> None:

@@ -181,7 +181,7 @@ def refusal(
         if num not in selected:
             why = not_selected.get(num, "not selected")
         elif num == 3 and not opts.generate_artifacts:
-            why = "--no-generate-artifacts"
+            why = st.scaffold_drop_reason(opts) or "--no-generate-artifacts"
         else:
             continue
         return (

@@ -324,10 +324,14 @@ def leave_scaffold_out_on_change_request(opts: ShipOptions, env: Mapping[str, st
     credentials. The markers are the CI system's own variables
     (:mod:`fluid_build.util.change_request`), read here rather than in
     :func:`resolve_options`, which reads only the knobs a wrapper passes through. When the
-    key was all stage 3 had to do, stage 3 is switched off.
+    key was all stage 3 had to do, stage 3 is switched off. A stage 3 that is off already
+    (``--no-generate-artifacts``, its ``RUN_STAGE_`` switch) is left as it is, and so is
+    its reason.
     """
     from fluid_build.util.change_request import change_request_marker
 
+    if not opts.generate_artifacts:
+        return
     named = [part.strip() for part in opts.emit.split(",") if part.strip()]
     if SCAFFOLD_KEY not in named:
         return
@@ -347,6 +351,14 @@ def _change_request_note(o: ShipOptions) -> str:
         f"{SCAFFOLD_KEY} left out of --emit: this is a change-request build "
         f"({o.scaffold_left_out}), and its bundle templates run only on default-branch builds"
     )
+
+
+def scaffold_drop_reason(o: ShipOptions) -> Optional[str]:
+    """Why stage 3 does not run when :func:`leave_scaffold_out_on_change_request` switched
+    it off (custom-scaffold was all it had to do), else ``None``."""
+    if o.scaffold_left_out and not o.generate_artifacts:
+        return _change_request_note(o) + ", and it was all stage 3 had to do"
+    return None
 
 
 def _resolve_required_artifacts(flag: object) -> Tuple[str, ...]:
@@ -650,11 +662,7 @@ def _generate_artifacts(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
     # but its ODCS, ODPS and policy artifacts do not depend on where it runs
     # (``generate artifacts`` itself drops no key for one; schedule has its own gate).
     if not o.generate_artifacts:
-        a.skip_reason = (
-            _change_request_note(o) + ", and it was all stage 3 had to do"
-            if o.scaffold_left_out
-            else "--no-generate-artifacts"
-        )
+        a.skip_reason = scaffold_drop_reason(o) or "--no-generate-artifacts"
     else:
         a.argv = [
             "generate",
@@ -685,10 +693,8 @@ def _validate_artifacts(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
                 f"{ARTIFACTS_DIR} does not exist, but stage 3 generate-artifacts was to write "
                 "it; pass --no-generate-artifacts when this pipeline generates no artifacts"
             )
-        a.skip_reason = (
-            f"{ARTIFACTS_DIR} does not exist (stage 3 is off: --no-generate-artifacts "
-            f"or {STAGE_TOGGLES[3]}=false)"
-        )
+        off = scaffold_drop_reason(o) or f"--no-generate-artifacts or {STAGE_TOGGLES[3]}=false"
+        a.skip_reason = f"{ARTIFACTS_DIR} does not exist (stage 3 is off: {off})"
         return
     a.argv = [
         "validate-artifacts",
@@ -917,9 +923,7 @@ def check_required_artifacts(
         return
     keys = ",".join(opts.require_artifacts)
     if 3 not in selected or not opts.generate_artifacts:
-        why = not_selected.get(3) or (
-            _change_request_note(opts) if opts.scaffold_left_out else "--no-generate-artifacts"
-        )
+        why = not_selected.get(3) or scaffold_drop_reason(opts) or "--no-generate-artifacts"
         raise ShipUsageError(
             f"--require-artifacts {keys} needs stage 3 generate-artifacts in this invocation, "
             f"and it does not run ({why})"
