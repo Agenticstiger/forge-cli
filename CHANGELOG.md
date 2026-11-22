@@ -701,7 +701,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer hold `${`, in a value of any type and whatever the run's secrets: the build fails
   before anything is written or sent, naming the key and never the value. forge's own
   `${FLUID_DBZ_...}` lines, which carry the credentials it moves to the environment, are
-  unchanged. A secret belongs in a `secretRef`.
+  unchanged. A credential that holds `${`, one the operator's store resolved included, is not
+  handed to Debezium Server, which would expand it from its environment too. A secret belongs in
+  a `secretRef`.
 - A runner that builds a connection URL keeps each field in its own part. dlt's
   `sql_database` source refuses a host, database or `drivername` that would change how its
   connection URL is read back, and `drivername` must be a SQLAlchemy dialect name with an
