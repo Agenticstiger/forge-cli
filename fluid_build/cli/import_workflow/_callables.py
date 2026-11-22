@@ -29,9 +29,13 @@ The conventions name a project's own submit functions as OpenLineage's configura
 extractor by operator class; unlike an extractor, nothing named is imported.
 
 Bounded: a function is followed at most :data:`MAX_DEPTH` calls deep and never into itself, one
-DAG file goes through at most :data:`MAX_VISITS` calls and lists of the bodies it follows (each
-body's syntax is walked once), and a task's function given the same arguments again is read once.
-Every value is folded (:mod:`._fold`), under the folder's own budgets.
+DAG file goes through at most :data:`MAX_VISITS` calls and lists of the bodies it follows (and the
+nodes walked to find them, and the parameters of each call: the file's own functions are walked
+once, another file's each time, so that no syntax of a file the module index let go is kept), and
+a task's function given the same arguments again is read once. Every value is folded
+(:mod:`._fold`); the folding of the bodies is lent by the folders and counted against one budget
+per DAG file, as large as a module's, so that neither the file's own operators nor another file's
+tasks lose to it.
 """
 
 from __future__ import annotations
@@ -67,7 +71,7 @@ from ._pysource import Module, qualified_name, snippet
 #: Calls a body is followed through into another function: the task's own function is depth 0.
 MAX_DEPTH = 3
 #: Calls and argument lists of the bodies one DAG file's tasks run, gone through in all (and the
-#: syntax nodes walked to find them, once per function).
+#: syntax nodes walked to find them, once per function, and the parameters of each call).
 MAX_VISITS = 200_000
 #: A set of arguments larger than this (values, characters of text) is not a key of what was
 #: read with it: a task with one is read on its own.
@@ -239,12 +243,21 @@ class Follower:
         self.unread: Dict[str, int] = {}
         #: The files of other modules whose folding ran out while their functions were followed.
         self.tired: Set[str] = set()
-        #: What folding in other modules may still cost while this file's tasks are read: it is
-        #: this file's to spend (see :meth:`Folder.lent`), as much as its own module may.
-        self._foreign_left = [MAX_STEPS_PER_MODULE, MAX_STRING_WORK]
+        #: What folding the bodies of the functions may still cost, in this file and in the
+        #: others its tasks reach: it is the reading file's to spend (see :meth:`Folder.lent`),
+        #: as much as a module may, so neither its own operators nor another file's tasks lose
+        #: to it.
+        self._lent_left = [MAX_STEPS_PER_MODULE, MAX_STRING_WORK]
         self._lent: Set[int] = set()
+        #: The calls and lists of each body walked, by the function: kept for this file's own
+        #: functions only. Another file's body is walked each time it is read (charged as visits):
+        #: a key that is its syntax would keep the whole function alive after the module index
+        #: lets the file go.
         self._bodies: Dict[ast.AST, List[ast.AST]] = {}
-        self._read: Dict[Tuple[ast.AST, Any], List[Submit]] = {}
+        #: What a task's function submitted, and what a top-level function's defaults hold, by
+        #: where the function is (``(file, line, column)``: a key that keeps no syntax alive).
+        self._read: Dict[Tuple[Any, ...], List[Submit]] = {}
+        self._defaults: Dict[Tuple[str, int, int], List[Tuple[str, Any]]] = {}
         #: A command line (with its holes) to the spark-submits in it: read once.
         self._commands: Dict[Any, List[Tuple[Any, List[Any]]]] = {}
 
@@ -507,15 +520,16 @@ class Follower:
             return []
         # a task's function given the same arguments again is read once (what a function deeper
         # down submits also depends on how deep it is and on what called it: those are not kept)
-        key = (function, _key(arguments)) if depth == 0 else None
-        if key is not None and key[1] is not None and key in self._read:
+        where = (module.rel, function.lineno, function.col_offset)  # type: ignore[attr-defined]
+        key = (*where, _key(arguments)) if depth == 0 else None
+        if key is not None and key[-1] is not None and key in self._read:
             return [replace(submit, line=line) for submit in self._read[key]]
-        foreign = folder is not self.folder and id(folder) not in self._lent
-        if foreign and min(self._foreign_left) <= 0:
+        lend = id(folder) not in self._lent  # a body inside one already lent is counted there
+        if lend and min(self._lent_left) <= 0:
             self.cut_short = True
             return []
-        nodes = self._body(function)
-        if not foreign:
+        nodes = self._body(function, own=folder is self.folder)
+        if not lend:
             found = self._read_body(function, nodes, module, folder, arguments, line, depth, stack)
         else:
             self._lent.add(id(folder))
@@ -524,13 +538,13 @@ class Follower:
                     found = self._read_body(
                         function, nodes, module, folder, arguments, line, depth, stack
                     )
-                    if folder.exhausted:
-                        self.tired.add(module.rel)
+                    if folder.exhausted and folder is not self.folder:  # this file's: cut_short
+                        self.tired.add(module.index_rel or module.rel)
             finally:
                 self._lent.discard(id(folder))
-            self._foreign_left[0] -= spent[0]
-            self._foreign_left[1] -= spent[1]
-        if key is not None and key[1] is not None:
+            self._lent_left[0] -= spent[0]
+            self._lent_left[1] -= spent[1]
+        if key is not None and key[-1] is not None:
             self._read[key] = found
         return found
 
@@ -545,13 +559,14 @@ class Follower:
         depth: int,
         stack: Tuple[ast.AST, ...],
     ) -> List[Submit]:
-        frame = self._frame(function, folder, arguments, task=depth == 0)
+        frame = self._frame(function, module, folder, arguments, task=depth == 0)
         with folder.bound(function, frame):
             return self._scan(nodes, module, folder, line, depth, (*stack, function))
 
-    def _body(self, function: ast.AST) -> List[ast.AST]:
+    def _body(self, function: ast.AST, own: bool) -> List[ast.AST]:
         """The calls and the argument lists of ``function``'s own body (not of a function or a
-        class inside it, which run only when called), in source order: walked once."""
+        class inside it, which run only when called), in source order: walked once for this
+        file's own functions, each time for another file's (see ``_bodies``)."""
         found = self._bodies.get(function)
         if found is not None:
             return found
@@ -573,19 +588,29 @@ class Follower:
             self.cut_short = True
         self.visits_left -= walked
         out.sort(key=lambda n: (n.lineno, n.col_offset))  # type: ignore[attr-defined]
-        self._bodies[function] = out
+        if own:
+            self._bodies[function] = out
         return out
 
-    @staticmethod
     def _frame(
-        function: ast.AST, folder: Folder, arguments: _Arguments, task: bool
+        self,
+        function: ast.AST,
+        module: Module,
+        folder: Folder,
+        arguments: _Arguments,
+        task: bool,
     ) -> Dict[str, Any]:
         """What each parameter of ``function`` holds when it is called with ``arguments``. A
         task's function is also given the run's context by Airflow, so what it takes as
-        ``**kwargs`` is not all known and a default may be the context's value: none is read."""
+        ``**kwargs`` is not all known and a default may be the context's value: none is read.
+        Each parameter costs a visit."""
         spec: ast.arguments = function.args  # type: ignore[attr-defined]
         frame: Dict[str, Any] = {}
         positional = [*spec.posonlyargs, *spec.args]
+        self.visits_left -= len(positional) + len(spec.kwonlyargs) + 2
+        if self.visits_left <= 0:
+            self.cut_short = True
+            return frame
         for param, value in zip(positional, arguments.positional, strict=False):
             frame[param.arg] = value
         if spec.vararg is not None:
@@ -603,18 +628,8 @@ class Follower:
             rest.complete = arguments.complete and not task
             frame[spec.kwarg.arg] = rest
         if arguments.complete and not task:
-            enclosing = folder.scope_of(function)
-            with_defaults = list(
-                zip(positional[len(positional) - len(spec.defaults) :], spec.defaults, strict=True)
-            )
-            with_defaults += [
-                (p, d)
-                for p, d in zip(spec.kwonlyargs, spec.kw_defaults, strict=True)
-                if d is not None
-            ]
-            for param, default in with_defaults:
-                if param.arg not in frame:
-                    frame[param.arg] = folder.fold(default, enclosing)
+            for name, default in self._defaults_of(function, module, folder):
+                frame.setdefault(name, default)
         # a parameter the body binds again holds what the caller passed only until it does
         scope = folder.function_scope(function)
         return {
@@ -622,6 +637,30 @@ class Follower:
             for name, value in frame.items()
             if name not in scope.rebound_parameters and not folder.rebound(name)
         }
+
+    def _defaults_of(
+        self, function: ast.AST, module: Module, folder: Folder
+    ) -> List[Tuple[str, Any]]:
+        """What the defaults of ``function``'s parameters fold to. A def's defaults are evaluated
+        once, where it is defined: those of a top-level def are folded once per file; a def
+        inside a function may see that function's parameters, so its are folded each time."""
+        spec: ast.arguments = function.args  # type: ignore[attr-defined]
+        positional = [*spec.posonlyargs, *spec.args]
+        enclosing = folder.scope_of(function)
+        where = (module.rel, function.lineno, function.col_offset)  # type: ignore[attr-defined]
+        top = enclosing.owner is module.tree
+        if top and where in self._defaults:
+            return self._defaults[where]
+        pairs = list(
+            zip(positional[len(positional) - len(spec.defaults) :], spec.defaults, strict=True)
+        )
+        pairs += [
+            (p, d) for p, d in zip(spec.kwonlyargs, spec.kw_defaults, strict=True) if d is not None
+        ]
+        found = [(param.arg, folder.fold(default, enclosing)) for param, default in pairs]
+        if top:
+            self._defaults[where] = found
+        return found
 
     def _scan(
         self,

@@ -10,6 +10,7 @@ of the DAG file that calls EMR itself. Nothing here is imported or run.
 
 from __future__ import annotations
 
+import ast
 import textwrap
 import time
 from pathlib import Path
@@ -1102,6 +1103,64 @@ def run(day, **kwargs):
         for t in found.values()
     )
     assert len(calls) == 1
+
+
+def test_the_parameters_of_every_call_are_charged_and_the_defaults_folded_once():
+    params = ", ".join(f"a{i}=1" for i in range(3_000))
+    calls = "".join("    g()\n" for _ in range(3_000))
+    start = time.process_time()
+    found = dags(
+        _dag(
+            f"def g({params}):\n    pass\n"
+            "def f():\n" + calls + 'PythonOperator(task_id="t", python_callable=f, dag=dag)\n'
+        )
+    )
+    assert time.process_time() - start < 10
+    assert any("stopped following the functions its Python tasks run" in n for n in found.notes)
+
+
+def test_a_heavy_function_does_not_take_the_folding_the_files_operators_need():
+    chain = "    a0 = p\n" + "".join(
+        f"    a{i} = {{'x': a{i - 1}, 'y': a{i - 1}}}\n" for i in range(1, 26)
+    )
+    heavy = "import subprocess\ndef f(p):\n" + chain + "    subprocess.run(a25)\n" * 100
+    tasks_ = "".join(
+        f"    PythonOperator(task_id='t{i}', python_callable=f, op_kwargs={{'p': 'v{i}'}})\n"
+        for i in range(60)
+    )
+    found = dags(
+        _dag(
+            "from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator\n"
+            "BASE = 's3://acme-code/jobs'\n"
+            + heavy
+            + "with dag:\n"
+            + tasks_
+            + "    SparkSubmitOperator(task_id='last', application=BASE + '/job.py')\n"
+        )
+    )
+    last = [t for d in found.dags for t in d.tasks if t.task_id == "last"]
+    assert [s.script for s in last[0].submits] == ["s3://acme-code/jobs/job.py"]
+
+
+def test_another_files_function_syntax_is_not_kept_by_the_reader(tmp_path):
+    from fluid_build.cli.import_workflow._airflow_dags import _Reader
+    from fluid_build.cli.import_workflow._fold import ModuleIndex
+    from fluid_build.cli.import_workflow._pysource import find_python_files
+
+    _shared_helper_project(tmp_path / "dags", files=1, per_file=3)
+    walk = find_python_files(tmp_path / "dags")
+    index = ModuleIndex(walk.files)
+    source = next(f for f in walk.files if f.rel == "d0/dag.py")
+    module = parse_module("d0/dag.py", source.path.read_bytes())
+    module.index_rel = source.rel
+    reader = _Reader(module, index.folder(module), {}, {})
+    result = reader.run()
+    assert [s.script for d in result.dags for t in d.tasks for s in t.submits] == [
+        f"s3://jobs/0_{i}.py" for i in range(3)
+    ]
+    own = {id(node) for node in ast.walk(module.tree)}
+    follower = reader._follower
+    assert follower is not None and all(id(f) in own for f in follower._bodies)
 
 
 def test_a_large_set_of_arguments_is_read_on_its_own_not_kept(monkeypatch):
