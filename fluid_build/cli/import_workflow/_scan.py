@@ -120,6 +120,29 @@ MAX_REFS_PER_SCAN = 200_000
 MAX_TASKS_PER_JOB = 1_000
 
 
+#: The module names read through the importing file's own package, said one by one up to this many.
+MAX_OWN_PACKAGE_LINES = 20
+
+
+def own_package_notes(index: ModuleIndex, root: Path) -> List[str]:
+    """A note for each module name only the importing file's own package vouches for (see
+    :meth:`ModuleIndex._below_the_import_root`): another library of the same names would be read
+    in its place, so a person can check which file each one was read as."""
+    taken = sorted(index.own_package_names.items())
+    notes = [
+        f"{_display(root / importer, importer)}: `{name}` is read as "
+        f"{_display(root / found, found)}, the module of that name in the file's own package "
+        "(check that it is not another library's)"
+        for (importer, name), found in taken[:MAX_OWN_PACKAGE_LINES]
+    ]
+    if len(taken) > MAX_OWN_PACKAGE_LINES:
+        notes.append(
+            f"{len(taken) - MAX_OWN_PACKAGE_LINES} more module name(s) are read through the "
+            "importing file's own package"
+        )
+    return notes
+
+
 def budget_note(skipped: int, notes: List[str], sql_skipped: int = 0) -> None:
     """Say how many files the source budget left unread, and how many SQL statements the SQL
     budget left alone (nothing when it left none)."""
@@ -192,6 +215,7 @@ def scan_jobs(
             scan.other_files += 1
             # a helper's note (a name from a parameter) still matters to the person reading
             scan.notes.extend(facts.notes)
+    scan.notes.extend(own_package_notes(index, Path(root)))
     if budget is None:
         budget_note(index.budget.skipped, scan.notes, index.budget.sql_skipped)
     return scan
@@ -263,6 +287,7 @@ def scan_dags(
             "tasks run were read (the file asks for too much work): some of what they submit is "
             "not read"
         )
+    scan.notes.extend(own_package_notes(index, Path(root)))
     scan.dags.sort(key=lambda d: (d.file, d.line))
     if budget is None:
         budget_note(index.budget.skipped, scan.notes, index.budget.sql_skipped)

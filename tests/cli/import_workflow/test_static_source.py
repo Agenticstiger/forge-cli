@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional
 import pytest
 
 from fluid_build.cli.import_workflow import _pysource as P
+from fluid_build.cli.import_workflow._conventions import Conventions
 from fluid_build.cli.import_workflow._fold import (
     ABSENT,
     FoldedDict,
@@ -27,6 +28,11 @@ from fluid_build.cli.import_workflow._fold import (
     ModuleIndex,
     Unresolved,
     lookup,
+)
+from fluid_build.cli.import_workflow._scan import (
+    MAX_OWN_PACKAGE_LINES,
+    own_package_notes,
+    scan_dags,
 )
 
 
@@ -692,6 +698,49 @@ def test_a_module_of_the_importing_files_own_package_is_found_by_its_full_name(t
     assert top is not None
     node = next(n for n in top.tree.body if isinstance(n, ast.Assign))
     assert "is not in the scanned files" in _why(index.folder(top).fold(node.value))
+
+
+OWN_PACKAGE_DAG = (
+    "from airflow import DAG\n"
+    "from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator\n"
+    "from teamx.dags.nightly.settings import SCRIPT\n"
+    "with DAG('nightly', schedule=None) as dag:\n"
+    "    SparkSubmitOperator(task_id='t', application=SCRIPT)\n"
+)
+
+
+def test_a_name_only_the_importing_files_own_package_vouches_for_is_said(tmp_path):
+    """Another library with a directory and a module of the same names would be read in its
+    place, so the scan says which file it read such a name as."""
+    files = {
+        "nightly/dag.py": OWN_PACKAGE_DAG,
+        "nightly/settings.py": "SCRIPT = 's3://code/a.py'\n",
+    }
+    _write(tmp_path / "dags", files)
+    scan = scan_dags(tmp_path / "dags", Conventions())
+    assert [s.script for d in scan.dags for t in d.tasks for s in t.submits] == ["s3://code/a.py"]
+    said = [n for n in scan.notes if "the module of that name in the file's own package" in n]
+    assert said == [
+        "nightly/dag.py: `teamx.dags.nightly.settings` is read as nightly/settings.py, the "
+        "module of that name in the file's own package (check that it is not another library's)"
+    ]
+    # a scan of `.../teamx/dags`: the directories' names say so too, and nothing is said
+    _write(tmp_path / "teamx" / "dags", files)
+    scan = scan_dags(tmp_path / "teamx" / "dags", Conventions())
+    assert [s.script for d in scan.dags for t in d.tasks for s in t.submits] == ["s3://code/a.py"]
+    assert not [n for n in scan.notes if "own package" in n]
+
+
+def test_the_names_read_through_the_own_package_are_said_one_by_one_up_to_a_bound(tmp_path):
+    index = ModuleIndex([])
+    for i in range(MAX_OWN_PACKAGE_LINES + 3):
+        index.own_package_names[(f"d{i:02d}/dag.py", f"teamx.d{i:02d}.settings")] = (
+            f"d{i:02d}/settings.py"
+        )
+    notes = own_package_notes(index, tmp_path)
+    assert len(notes) == MAX_OWN_PACKAGE_LINES + 1
+    assert notes[0].startswith("d00/dag.py: `teamx.d00.settings` is read as d00/settings.py")
+    assert notes[-1] == ("3 more module name(s) are read through the importing file's own package")
 
 
 def test_a_full_name_that_starts_with_the_names_of_the_scanned_directory_is_a_file_of_it(tmp_path):

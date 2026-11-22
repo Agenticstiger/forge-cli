@@ -1065,6 +1065,10 @@ class ModuleIndex:
         #: The names of the scanned directory and the directories above it, nearest last (see
         #: :meth:`_below_the_import_root`).
         self._root_names: Tuple[str, ...] = ()
+        #: The module names only the importing file's own package vouches for, by ``(importing
+        #: file, name)``, with the file each is read as: another library of the same names would
+        #: be read in its place, so the report says each one.
+        self.own_package_names: Dict[Tuple[str, str], str] = {}
         for source in files:
             parts = source.rel[: -len(".py")].split("/")
             if not self._root_names:
@@ -1212,7 +1216,13 @@ class ModuleIndex:
         :data:`MAX_NAME_PARTS` parts."""
         if len(parts) > MAX_NAME_PARTS or parts[0] in NOT_THE_PROJECT:
             return None
-        return self._in_own_package(parts, from_rel) or self._under_the_root_names(parts)
+        own = self._in_own_package(parts, from_rel)
+        if own is None:
+            return self._under_the_root_names(parts)
+        if self._under_the_root_names(parts) != own:  # the directories' names do not vouch for it
+            name = ".".join(parts[: len(parts) - len(own[1])])
+            self.own_package_names[(from_rel, name)] = own[0].rel
+        return own
 
     def _in_own_package(
         self, parts: Sequence[str], from_rel: str
