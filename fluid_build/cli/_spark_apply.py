@@ -54,6 +54,26 @@ def _desired(contract: Mapping[str, Any], event: str, **kwargs: Any) -> List[Des
         raise _cli_error(f"{event}_invalid", {"error": str(exc)}) from exc
 
 
+def _stamps(
+    contract: Mapping[str, Any], run_id: Optional[str], *, refuse_release: bool = True
+) -> Dict[str, str]:
+    """What the runner stamps on each commit besides the job config's own: the contract's
+    digest, the pipeline's ``run_id`` and ``FLUID_RELEASE_ID`` (``_desired.run_stamps``). A
+    deploy refuses a release a stamp may not hold; ``--mode reconcile`` (``refuse_release``
+    off) leaves it off with a warning, so a mis-set variable cannot stop the keepalive from
+    restarting a dead stream.
+
+    Raises:
+        CLIError: ``apply_spark_invalid`` (``FLUID_RELEASE_ID`` holds a character a stamp may not).
+    """
+    from fluid_build.build_runners.spark._desired import run_stamps
+
+    try:
+        return run_stamps(contract, run_id=run_id, refuse_release=refuse_release)
+    except ValueError as exc:
+        raise _cli_error("apply_spark_invalid", {"error": f"{exc}; nothing was started"}) from exc
+
+
 def _has_spark(contract: Mapping[str, Any]) -> bool:
     from fluid_build.build_runners.spark._desired import spark_builds
 
@@ -90,9 +110,11 @@ def prepare(
     verified_plan: Optional[Mapping[str, Any]],
     dry_run: bool,
     workspace: Optional[Path] = None,
+    run_id: Optional[str] = None,
 ) -> List[DesiredRun]:
     """The runs ``fluid apply`` reconciles, checked before ``tofu apply``. A local run's
     settings are checked against ``workspace``, the contract's directory, which holds it.
+    ``run_id`` is the pipeline's, which the runner stamps on each commit of a run started here.
 
     Raises:
         CLIError: ``apply_spark_invalid`` / ``apply_spark_refused`` (the build does not
@@ -113,7 +135,7 @@ def prepare(
                 },
             )
         return []
-    runs = _desired(contract, "apply_spark")
+    runs = _desired(contract, "apply_spark", stamps=_stamps(contract, run_id))
     if verified_plan is not None:
         planned = [
             _comparable(a)
@@ -303,6 +325,7 @@ def reconcile_only(
     workspace: Optional[Path] = None,
     confirm: Any = None,
     clients: Any = None,
+    run_id: Optional[str] = None,
 ) -> int:
     """``fluid apply --mode reconcile``: keep the always-on Spark streams running (with
     ``build_id``, that one stream); 1 when any build is an error.
@@ -323,7 +346,10 @@ def reconcile_only(
     from fluid_build.build_runners.spark._reconcile import reconcile
     from fluid_build.cli.console import cprint
 
-    runs = _desired(contract, "apply_spark", build_id=build_id) if _has_spark(contract) else []
+    runs: List[DesiredRun] = []
+    if _has_spark(contract):
+        stamps = _stamps(contract, run_id, refuse_release=False)
+        runs = _desired(contract, "apply_spark", build_id=build_id, stamps=stamps)
     if build_id and not runs:
         raise _cli_error(
             "apply_reconcile_not_a_stream",

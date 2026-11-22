@@ -819,6 +819,7 @@ DOTENV_LOADABLE: FrozenSet[str] = frozenset(
         "FLUID_OPENAI_STRICT_SCHEMA",
         "FLUID_PROMPT_PROFILE",
         "FLUID_PROVIDER",
+        "FLUID_RELEASE_ID",  # a label the runner stamps on each commit; checked before it is used
         "FLUID_RUN_ID",
         "FLUID_TIERED",
         "FLUID_TOKEN_COUNTER",

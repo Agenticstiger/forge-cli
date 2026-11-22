@@ -96,7 +96,9 @@ spark.sql(
     f"sku STRING, qty INT, event_time TIMESTAMP) USING iceberg"
 )
 try:
-    sys.argv = ["forge_spark_runner.py", "--config", config_path, "--JOB_NAME", "ignored"]
+    # What fluid apply passes the runner besides --config (/w/stamp_args.json), and Glue's own.
+    stamp_args = json.load(open("/w/stamp_args.json"))
+    sys.argv = ["forge_spark_runner.py", "--config", config_path, "--JOB_NAME", "ignored", *stamp_args]
     runpy.run_path("/w/forge_spark_runner.py", run_name="__main__")
 except SystemExit as exit_:
     assert exit_.code in (0, None), exit_.code
@@ -104,6 +106,9 @@ rows = [r.asDict() for r in spark.table(table).orderBy("order_id", "sku").collec
 for r in rows:
     r["event_time"] = None if r["event_time"] is None else r["event_time"].isoformat()
 json.dump(rows, open("/w/rows.json", "w"))
+# The summary of every commit the run made: what the stamps are read back from.
+summaries = spark.sql(f"SELECT summary FROM {table}.snapshots").collect()
+json.dump([dict(r["summary"]) for r in summaries], open("/w/snapshots.json", "w"))
 """
 
 
@@ -209,6 +214,13 @@ WRITER_SCHEMA = {
     ],
 }
 EVENT_MILLIS = 1_794_823_200_123  # 2026-11-16T10:00:00.123Z
+#: The flags ``fluid apply`` adds to the runner's arguments, and the snapshot summary key of each.
+STAMPS = {
+    "--fluid-product-version": ("fluid.product-version", "1.4.0"),
+    "--fluid-contract-digest": ("fluid.contract-digest", "sha256:" + "ab" * 32),
+    "--fluid-release-id": ("fluid.release-id", "v1.4.0"),
+    "--fluid-run-id": ("fluid.run-id", "scheduled__2026-11-21T00:00:00+00:00"),
+}
 
 
 def _avro(order) -> bytes:
@@ -251,6 +263,8 @@ def _run(stack, contract, values, *, writer_schema=None, packages=(), repositori
     if writer_schema is not None:
         (work / "writer_schema.json").write_text(json.dumps(writer_schema), encoding="utf-8")
     (work / "driver.py").write_text(DRIVER, encoding="utf-8")
+    stamp_args = [part for flag, (_key, value) in STAMPS.items() for part in (flag, value)]
+    (work / "stamp_args.json").write_text(json.dumps(stamp_args), encoding="utf-8")
     (work / "mask_key").write_text(MASK_KEY, encoding="utf-8")
     shutil.copy(RUNNER_PATH, work / "forge_spark_runner.py")
     os.chmod(work, 0o777)
@@ -318,6 +332,25 @@ def test_the_runner_lands_nested_json_records_in_iceberg(stack):
     assert [e["forge_spark_runner"] for e in events] == ["start", "streaming", "done"]
     assert events[0]["masked_columns"] == ["email_hash"]
     assert rows == EXPECTED
+
+
+def test_every_commit_the_runner_makes_carries_the_runs_stamps(stack):
+    """A ``snapshot-property.<key>`` write option of a stream is ``<key>`` in the summary of the
+    snapshot it commits (Iceberg 1.6.1): the product and build, the digest of the job config as
+    it ran, and what ``fluid apply`` passed. Run it with ``FLUID_SPARK_LIVE=1``."""
+    work, _names = stack
+    values = [json.dumps(order).encode() for order in ORDERS]
+    events, _rows = _run(stack, _contract(), values)
+    summaries = json.loads((work / "snapshots.json").read_text(encoding="utf-8"))
+    config = json.loads((work / "job.json").read_text(encoding="utf-8"))
+    assert summaries, "the stream committed nothing"
+    for summary in summaries:
+        assert summary["fluid.product"] == config["product"]
+        assert summary["fluid.build"] == config["build"]
+        assert re.fullmatch(r"[0-9a-f]{64}", summary["fluid.job-sha256"])
+        for key, value in STAMPS.values():
+            assert summary[key] == value
+    assert events[0]["stamps"]["fluid.run-id"] == STAMPS["--fluid-run-id"][1]
 
 
 def test_the_runner_decodes_confluent_avro_by_field_name(stack):
