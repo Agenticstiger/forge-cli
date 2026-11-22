@@ -64,6 +64,9 @@ SENSITIVE_PATTERNS = [
     re.compile(r'"refresh_token":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r"Authorization:\s*Bearer\s+[^\s]+", re.IGNORECASE),
     re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=\-]{8,}", re.IGNORECASE),
+    # Opsgenie's API key as its Authorization header carries it, ahead of the assignment
+    # pattern, which would take ``GenieKey`` for the value: mirrors the global layer.
+    re.compile(r"(?i)\bGenieKey\s{1,8}[A-Za-z0-9-]{20,128}"),
     # Snowflake passwords and connection strings.
     # NOTE: the bare ``password=...`` shape is handled by the named-group
     # assignment pattern below (it keeps the ``password=`` key prefix); a
@@ -122,6 +125,8 @@ SENSITIVE_PATTERNS = [
         r"(?i)\b(?P<key>(?:[A-Za-z0-9_]{,128}_)?(?:"
         r"api[_-]?key|authorization|secret[_.-]access[_.-]key|secret[_.-]key|client_secret|"
         r"oauth[_-]?token|password|session[_-]token|secret|token|passphrase|"
+        # PagerDuty's Events API key, by its two names (mirrors the global layer)
+        r"routing[_-]?key|integration[_-]?key|"
         # an Iceberg REST catalog's OAuth2 ``credential`` (``<client id>:<secret>``), as a
         # local Spark run's configuration sets it (build_runners/spark/_local.py)
         r"credentials?"
@@ -164,6 +169,14 @@ SENSITIVE_PATTERNS = [
     # A Slack incoming webhook: the URL is the secret.
     re.compile(
         r"(?i)\bhttps?://hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9/_-]{8,256}"
+    ),
+    # Zenduty and PagerDuty integration URLs, the key in the path: mirrors the global layer.
+    re.compile(
+        r"(?i)\bhttps?://(?:events\.zenduty\.com/integration|(?:www\.)?zenduty\.com/api/events)"
+        r"/[A-Za-z0-9/_-]{8,256}"
+    ),
+    re.compile(
+        r"(?i)\bhttps?://events(?:\.eu)?\.pagerduty\.com/(?:x-ere|integration)/[A-Za-z0-9/_-]{8,256}"
     ),
     re.compile(r"\bhf_[A-Za-z0-9]{30,}"),  # HuggingFace
     re.compile(r"\br8_[A-Za-z0-9]{30,}"),  # Replicate
@@ -231,6 +244,9 @@ SENSITIVE_KEYS = {
     # invariant) — these were present globally but missing from this twin.
     "auth_token",
     "session_token",
+    # PagerDuty's Events API key (mirrors the global layer)
+    "routing_key",
+    "integration_key",
 }
 
 

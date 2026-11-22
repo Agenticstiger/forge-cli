@@ -484,6 +484,7 @@ def schedule_sync_acquisition(
         schedule = _validate_cron(schedule)
 
         if "airflow" in chosen:
+            _warn_alerts_not_carried(contract, bid)
             dag_path = _safe_subpath(artifacts_root, f"{bid}_dag.py")
             dag_path.write_text(
                 _render_airflow_dag(contract_id, bid, build, schedule), encoding="utf-8"
@@ -549,6 +550,20 @@ def _python_safe_name(s: str) -> str:
     map both to ``_``.
     """
     return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in s)
+
+
+def _warn_alerts_not_carried(contract: Dict[str, Any], build_id: str) -> None:
+    """Say, never drop silently: the acquisition DAG schedule-sync writes runs one ``fluid
+    apply`` and carries no alert callbacks; the contract's ``alerts`` routes are wired into the
+    DAGs ``fluid generate schedule`` writes (``schedulers/airflow/_alerts.py``)."""
+    alerts = contract.get("alerts")
+    routes = alerts.get("routes") if isinstance(alerts, dict) else None
+    if routes:
+        LOG.warning(
+            "Acquisition build %s: the Airflow DAG schedule-sync writes carries no alerts; the "
+            "contract's alerts.routes are in the DAGs fluid generate schedule writes.",
+            build_id,
+        )
 
 
 def _render_airflow_dag(

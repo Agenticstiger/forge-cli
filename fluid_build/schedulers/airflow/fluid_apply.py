@@ -103,9 +103,16 @@ from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
+from fluid_build.alerts.model import AlertRouteError
+from fluid_build.alerts.routes import AlertPlan
 from fluid_build.build_runners._ids import IdentifierViolation, validate_identifier
 from fluid_build.observability.run_id import SCHEDULER_JOB_ENV, SCHEDULER_RUN_ID_ENV
 from fluid_build.providers.common.codegen_utils import py_str_literal
+from fluid_build.schedulers.airflow._alerts import (
+    RenderedAlerts,
+    alert_plan_or_none,
+    render_alerts,
+)
 from fluid_build.schedulers.airflow._assets import (
     NotAddressable,
     expose_asset_uri,
@@ -1675,16 +1682,18 @@ _IMPORTS = (
 )
 
 
-def _dag_doc(product_id: str, dag: ScheduledDag) -> Tuple[str, str]:
-    """The DAG file's docstring and the DAG's ``description``."""
+def _dag_doc(product_id: str, dag: ScheduledDag, extra: Tuple[str, ...] = ()) -> Tuple[str, str]:
+    """The DAG file's docstring and the DAG's ``description``. ``extra`` are notes of fluid's
+    own text (the alerts' notes) that go after the others."""
     if dag.keepalive:
         return (
-            _doc("Scheduled fluid build", _KEEPALIVE_RUN, []),
+            _doc("Scheduled fluid build", _KEEPALIVE_RUN, list(extra)),
             f"keep fluid stream {product_id} {dag.build_id} running",
         )
     only = len(dag.tasks) == 1
     notes = [] if only else [_TRIGGER_RULES_NOTE]
     notes += [n for n in (_schedule_note(dag.schedule), _unwaited_note(dag.unwaited)) if n]
+    notes += list(extra)
     if only:
         return (
             _doc("Scheduled fluid build", _ONE_BUILD_RUN, notes),
@@ -1732,11 +1741,29 @@ def render_scheduled_dag(
     env: Optional[str],
     contract_path: str,
     env_names: List[str],
+    alerts: Optional[AlertPlan] = None,
 ) -> str:
-    """Render one DAG file (:func:`scheduled_dags`). Inputs must already be validated."""
+    """Render one DAG file (:func:`scheduled_dags`). Inputs must already be validated.
+
+    ``alerts`` is the product's alert plan (:func:`fluid_build.alerts.read_alert_plan`): its
+    notifiers go on the DAG's callbacks (:mod:`fluid_build.schedulers.airflow._alerts`).
+    """
     lit = py_str_literal
-    doc, description = _dag_doc(product_id, dag)
+    dag_id = dag_id_for(product_id, dag.build_id, env)
+    rendered = (
+        render_alerts(alerts, dag_id=dag_id, product_id=product_id)
+        if alerts is not None
+        else RenderedAlerts()
+    )
+    doc, description = _dag_doc(product_id, dag, rendered.notes)
     default_args, body = _dag_tasks(dag)
+    alert_imports = alert_definitions = alert_dag_args = ""
+    if rendered.active:
+        default_args += "        **ALERT_TASK_ARGS,\n"
+        alert_imports = ("import logging\n\n" if rendered.needs_logging else "") + rendered.imports
+        alert_imports += "\n"
+        alert_definitions = rendered.definitions + "\n"
+        alert_dag_args = "    **ALERT_DAG_ARGS,\n"
     uses_assets = bool(dag.schedule.datasets) or any(t.outlets for t in dag.tasks)
     lines = KEEPALIVE_SCRIPT_LINES if dag.keepalive else BASH_SCRIPT_LINES
     script = "".join(f"        {lit(line)},\n" for line in lines)
@@ -1745,6 +1772,7 @@ def render_scheduled_dag(
         "\n"
         f"{_IMPORTS}"
         f"{_asset_imports(dag.schedule) if uses_assets else ''}"
+        f"{alert_imports}"
         f"PRODUCT_ID = {lit(product_id)}\n"
         f"BUILD_ID = {lit(dag.build_id)}\n"
         f"CONTRACT_PATH = {lit(contract_path)}\n"
@@ -1758,8 +1786,9 @@ def render_scheduled_dag(
         "    ]\n"
         ")\n"
         "\n"
+        f"{alert_definitions}"
         "with DAG(\n"
-        f"    dag_id={lit(dag_id_for(product_id, dag.build_id, env))},\n"
+        f"    dag_id={lit(dag_id)},\n"
         f"    description={lit(description)},\n"
         f"    schedule={_schedule_expr(dag.schedule)},\n"
         "    start_date=pendulum.datetime(2026, 1, 1, tz=TIMEZONE),\n"
@@ -1770,6 +1799,7 @@ def render_scheduled_dag(
         "    },\n"
         '    tags=["fluid", PRODUCT_ID[:100]],\n'
         "    doc_md=__doc__,\n"
+        f"{alert_dag_args}"
         ") as dag:\n"
         f"{body}"
     )
@@ -1814,6 +1844,10 @@ def render_fluid_apply_dags(
     env_value = validate_env_name(env) if env else None
     rel_path = validate_contract_path(contract_path)
     env_names = contract_env_names(contract)
+    try:
+        alerts = alert_plan_or_none(contract)
+    except AlertRouteError as exc:
+        raise ScheduleRenderError(str(exc)) from None
 
     files: Dict[str, str] = {}
     for dag in scheduled_dags(contract):
@@ -1823,13 +1857,17 @@ def render_fluid_apply_dags(
                 f"builds {dag.build_id!r} and another scheduled build map to the same "
                 f"DAG file {name!r}; give them ids that differ in more than '.' or '-'"
             )
-        files[name] = render_scheduled_dag(
-            product_id=product_id,
-            dag=dag,
-            env=env_value,
-            contract_path=rel_path,
-            env_names=env_names,
-        )
+        try:
+            files[name] = render_scheduled_dag(
+                product_id=product_id,
+                dag=dag,
+                env=env_value,
+                contract_path=rel_path,
+                env_names=env_names,
+                alerts=alerts,
+            )
+        except AlertRouteError as exc:
+            raise ScheduleRenderError(str(exc)) from None
     return files
 
 

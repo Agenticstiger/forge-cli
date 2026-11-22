@@ -281,3 +281,77 @@ GRAPH_CASES: Dict[str, Tuple[Dict[str, Any], Optional[str], str]] = {
     "rules_and_any": (rules_and_any(), "aws", "contract.fluid.yaml"),
     "kept_alive_stream": (kept_alive_stream(), "aws", "native.fluid.yaml"),
 }
+
+
+#: The four built-in alert kinds, every event, an SLA (``alerts`` block, 0.7.7).
+ALL_KINDS_ALERTS: Dict[str, Any] = {
+    "sla": "PT4H",
+    "routes": [
+        {
+            "name": "oncall",
+            "kind": "webhook",
+            "format": "zenduty",
+            "connection": "zenduty_oncall",
+            "events": ["failure", "success", "sla_miss"],
+        },
+        {
+            "name": "team",
+            "kind": "email",
+            "to": ["data-platform@corp.example"],
+            "from": "fluid@corp.example",
+            "events": ["failure", "retry"],
+        },
+        {"name": "pager", "kind": "pagerduty", "events": ["failure", "success"]},
+        {"name": "chat", "kind": "slack", "connection": "slack_data_alerts"},
+        {
+            "name": "ops",
+            "kind": "webhook",
+            "format": "opsgenie",
+            "connection": "opsgenie_alerts",
+            "severity": "error",
+            "events": ["failure", "success"],
+        },
+        {"name": "audit", "kind": "webhook", "connection": "alerts_audit", "events": ["retry"]},
+    ],
+}
+
+
+def _alerting(contract: Dict[str, Any], alerts: Dict[str, Any]) -> Dict[str, Any]:
+    out = copy.deepcopy(contract)
+    out["alerts"] = copy.deepcopy(alerts)
+    return out
+
+
+#: Contracts with an ``alerts`` block: the notifiers on the DAG's callbacks.
+ALERT_CASES: Dict[str, Tuple[Dict[str, Any], Optional[str], str]] = {
+    "alerts_all_kinds": (
+        _alerting(yaml.safe_load(DEMO_CONTRACT), ALL_KINDS_ALERTS),
+        None,
+        DEMO_CONTRACT_PATH,
+    ),
+    "alerts_graph_and_keepalive": (
+        _alerting(
+            kept_alive_stream(),
+            {"routes": [{"name": "oncall", "kind": "webhook", "connection": "alerts_hook"}]},
+        ),
+        "aws",
+        "native.fluid.yaml",
+    ),
+    "alerts_pipeline": (
+        _alerting(
+            events_pipeline(),
+            {
+                "sla": "PT90M",
+                "routes": [
+                    {
+                        "name": "chat",
+                        "kind": "slack",
+                        "events": ["failure", "sla_miss"],
+                    }
+                ],
+            },
+        ),
+        None,
+        "contracts/events/contract.fluid.yaml",
+    ),
+}

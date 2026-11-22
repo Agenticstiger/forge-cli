@@ -393,6 +393,10 @@ def run(args, logger: logging.Logger) -> int:
         # findings fail validation, warnings surface as warnings.
         _run_role_validators(contract, validation_result, logger)
 
+        # The alert routes that need plugins: a package's route kind, and the org packs'
+        # default routes, which the contract's DAGs take unless alerts.defaults is false.
+        _check_alert_plugins(contract, validation_result, logger)
+
         # Log metrics
         duration = time.time() - start_time
         log_metric(logger, "validation_duration", duration, unit="seconds")
@@ -1073,6 +1077,9 @@ def _run_contract_rules(
         # Secret references against the grammar and the operator's policy.
         _check_secret_refs(validation_result, contract)
 
+        # The DAGs' alert routes (alerts.routes): kinds, Airflow connections, no secret.
+        _check_alerts(validation_result, contract)
+
         # forge Spark builds, compiled to their job config under the operator's broker,
         # registry and secrets policy (an unlisted host warns here, refuses at run time).
         from fluid_build.spark import compiler as _spark
@@ -1512,6 +1519,69 @@ def _check_secret_refs(validation_result: ValidationResult, contract: Mapping[st
                 pointer=pointer,
                 fix=problem.fix,
             )
+
+
+def _check_alerts(validation_result: ValidationResult, contract: Mapping[str, Any]) -> None:
+    """Record what the contract's ``alerts`` block gets wrong (``fluid_build.alerts``).
+
+    The kinds a route names are loaded (a plugin's included); the org packs' default routes
+    are :func:`_check_alert_defaults`'s, in the plugin phase. A schema error at a pointer this
+    check reports is dropped for its message, which never quotes a value: the schema's own
+    quotes it, and a webhook URL pasted into ``connection`` is a secret. Fails closed.
+    """
+    from fluid_build._validation_issues import message_pointer
+    from fluid_build.alerts import contract_alert_findings
+
+    try:
+        errors, warnings = contract_alert_findings(contract)
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        validation_result.add_error(
+            f"Alert route check could not run ({type(exc).__name__}); the contract's alert "
+            "routes were NOT checked",
+            event="contract_check_failed",
+            pointer="",
+        )
+        return
+    for message in errors:
+        _drop_schema_errors_under(validation_result, message_pointer(message, contract))
+    _add_findings(validation_result, contract, "contract_alerts", errors, warnings, anchor="alerts")
+
+
+def _check_alert_plugins(
+    contract: Mapping[str, Any], validation_result: ValidationResult, logger: logging.Logger
+) -> None:
+    """What needs the alert plugins: the routes whose kind a package ships
+    (``fluid_build.alert_notifiers``) and the org packs' default routes this contract takes
+    (``fluid_build.alert_defaults``), as its DAGs will get them. Run with the plugin
+    validators. Fails closed."""
+    from fluid_build._validation_issues import message_pointer
+    from fluid_build.alerts import plugin_alert_findings
+
+    try:
+        errors, warnings = plugin_alert_findings(contract)
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        validation_result.add_error(
+            f"Alert plugin check could not run ({type(exc).__name__}); the plugin kinds and "
+            "the org packs' default alert routes were NOT checked",
+            event="contract_check_failed",
+            pointer="",
+        )
+        return
+    for message in errors:
+        _drop_schema_errors_under(validation_result, message_pointer(message, contract))
+    _add_findings(validation_result, contract, "contract_alert_plugins", errors, warnings)
+
+
+def _drop_schema_errors_under(validation_result: ValidationResult, pointer: str) -> None:
+    """Remove the JSON-Schema errors at ``pointer`` and below it: an alert check's message
+    covers the field and its items (``/to`` and ``/to/0``) without quoting what was written."""
+    if not pointer:
+        return
+    for message in list(validation_result.errors):
+        event, at, _fix = validation_result.issue_meta.get(message, ("", "", ""))
+        if event.startswith("contract_schema_") and (at == pointer or at.startswith(pointer + "/")):
+            validation_result.errors.remove(message)
+            validation_result.issue_meta.pop(message, None)
 
 
 def _drop_schema_errors_at(validation_result: ValidationResult, pointer: str) -> None:
@@ -2388,6 +2458,7 @@ def _run_rules_into(
     if plugins:
         _run_extension_validators(contract, result, log)
         _run_role_validators(contract, result, log)
+        _check_alert_plugins(contract, result, log)
     result.is_valid = result.is_valid and not result.errors
 
 
@@ -2743,6 +2814,7 @@ def _bundle_contract_rule_issues(
     _run_contract_rules(contract, target_version, result, rule_args, logger)
     _run_extension_validators(contract, result, logger)
     _run_role_validators(contract, result, logger)
+    _check_alert_plugins(contract, result, logger)
 
     from fluid_build._validation_issues import build_issues
 
