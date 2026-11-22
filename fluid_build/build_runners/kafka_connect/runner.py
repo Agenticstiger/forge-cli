@@ -290,6 +290,20 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
     kc_props = props.get("kafka-connect", {}) or {}
     deployment = kc_props.get("deployment", {}) or {}
     server_url = deployment.get("server_url")
+
+    from .._acquisition_common import (
+        refuse_config_expressions,
+        refuse_contract_expressions,
+        refuse_sent_config_expressions,
+        secret_resolved,
+    )
+
+    try:
+        # Before any secret is read or REST call made: the worker resolves
+        # ${provider:path:key} in a connector config with its config providers.
+        refuse_contract_expressions(ctx.source, kc_props, engine="kafka-connect")
+    except ValueError as exc:
+        return _failed(ctx, started_at, t_start, str(exc))
     if not server_url:
         return _failed(ctx, started_at, t_start, "kafka-connect requires deployment.server_url")
 
@@ -447,6 +461,28 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
                 derived.pop("iceberg.catalog.warehouse", None)
             sink_config = {**derived, **(sink_config or {})}
 
+    try:
+        # The last check before the REST calls, over the configs as they are
+        # sent: settings derived from the contract's binding included.
+        store_secret = secret_resolved(ctx.source.connection.raw) and (
+            is_debezium or ctx.source.kind in _JDBC_KINDS
+        )
+        refuse_sent_config_expressions(
+            base_config,
+            where="the source connector config",
+            secret_keys=(
+                ("database.password" if is_debezium else "connection.password",)
+                if store_secret
+                else ()
+            ),
+        )
+        if sink_config:
+            refuse_config_expressions(
+                sink_config, where="properties.kafka-connect.sink_connector_config"
+            )
+    except ValueError as exc:
+        return _failed(ctx, started_at, t_start, str(exc))
+
     connector_name = kc_props.get("connector_name") or f"forge-{ctx.product_id.replace('.', '-')}"
     client = KafkaConnectRestClient(server_url)
     try:
@@ -572,9 +608,14 @@ def _debezium_config(
     return cfg
 
 
+#: The source kinds :func:`_jdbc_config` builds a JDBC config for, resolving the
+#: connection's secret; any other kind passes its connection through as written.
+_JDBC_KINDS = ("jdbc", "postgres", "mysql", "sqlserver", "oracle")
+
+
 def _jdbc_config(connection: Dict[str, Any], kind: str) -> Dict[str, Any]:
     """Translate a connection dict into Kafka Connect JDBC config keys."""
-    if kind in ("jdbc", "postgres", "mysql", "sqlserver", "oracle"):
+    if kind in _JDBC_KINDS:
         # Resolve secretRef → password ONLY when we're about to consume it.
         # Non-JDBC kinds (s3, gcs, http, …) fall through to the passthrough
         # branch below and don't need credential resolution; eagerly resolving

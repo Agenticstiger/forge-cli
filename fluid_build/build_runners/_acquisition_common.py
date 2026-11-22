@@ -27,7 +27,7 @@ import secrets
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fluid_build._net import is_loopback_host as _is_loopback_host
 
@@ -405,6 +405,97 @@ def resolve_connection_secrets(
     value = resolve_secret(str(secret_ref), connection=out)
     out[target_field] = value.get_secret_value()
     return out
+
+
+def refuse_config_expressions(value: Any, *, where: str) -> None:
+    """Raise ``ValueError`` when contract text bound for a connector's config holds ``${``.
+
+    Debezium Server reads ``application.properties`` through SmallRye Config,
+    which expands a ``${...}`` expression in a value from every config source,
+    its environment included (``ExpressionConfigSourceInterceptor``); its one
+    escape, ``\\${``, changes how the rest of the value is read. A Kafka Connect
+    worker resolves ``${provider:path:key}`` in a connector config with the
+    config providers it declares (``ConfigTransformer``), which has no escape.
+    Either sends what it read, a variable or a file, on to wherever the
+    connector connects. forge puts no expression into contract text (its own
+    ``${FLUID_DBZ_...}`` lines hold credentials it moved to the environment),
+    so a value or a key that holds ``${`` is refused, a value of any type read
+    as the text a properties file would get (``str``: a YAML ``!!binary`` is
+    ``b'...'``). The error names where it is, ``where`` and the path below it,
+    and never the value.
+    """
+    from fluid_build._validation_issues import dotted
+    from fluid_build.providers._iceberg_catalog_auth import EXPRESSION_RE
+
+    pending: List[Tuple[Tuple[Any, ...], Any]] = [((), value)]
+    seen: Set[int] = set()
+    while pending:
+        path, item = pending.pop()
+        if not isinstance(item, (Mapping, list, tuple)):
+            if item is not None and EXPRESSION_RE.search(str(item)):
+                raise ValueError(_expression_refusal(where, dotted(path)))
+        elif id(item) not in seen:
+            seen.add(id(item))
+            items = item.items() if isinstance(item, Mapping) else enumerate(item)
+            for key, child in items:
+                if EXPRESSION_RE.search(str(key)):
+                    raise ValueError(_expression_refusal(where, dotted(path), in_key=True))
+                pending.append(((*path, key), child))
+
+
+def _expression_refusal(where: str, below: str, *, in_key: bool = False) -> str:
+    label = f"{where}{'' if not below or below.startswith('[') else '.'}{below}"
+    what = f"a key under {label}" if in_key else label
+    return (
+        f"{what} holds a ${{...}} expression (the value is not shown). The connector "
+        "expands it where it runs, Debezium Server from its environment and a Kafka "
+        "Connect worker through its config providers, so it could carry a variable or a "
+        "file of that machine to a host the contract chose. Write the value itself; a "
+        "secret belongs in a secretRef."
+    )
+
+
+def refuse_contract_expressions(
+    source: Any, engine_props: Mapping[str, Any], *, engine: str
+) -> None:
+    """:func:`refuse_config_expressions` for the contract text a connector run reads.
+
+    ``source`` is the run's own source (``ctx.source``, read from the build the
+    dispatcher passed in, which another build may share an id with), every field
+    of it, its connection's ``secretRef`` aside: the secret it names is the
+    operator's, not contract text. Then ``properties.<engine>``.
+    """
+    spec = {
+        "kind": source.kind,
+        "mode": source.mode,
+        "connection": {k: v for k, v in source.connection.raw.items() if k != "secretRef"},
+        "cursor_field": source.cursor_field,
+        "watermark": source.watermark,
+        "streams": list(source.streams or []),
+        "reader": source.reader,
+    }
+    refuse_config_expressions(spec, where="properties.source")
+    refuse_config_expressions(engine_props, where=f"properties.{engine}")
+
+
+def secret_resolved(connection: Mapping[str, Any]) -> bool:
+    """Whether :func:`resolve_connection_secrets` fills ``password`` from the store."""
+    return bool(connection.get("secretRef")) and not connection.get("password")
+
+
+def refuse_sent_config_expressions(
+    config: Mapping[str, Any], *, where: str, secret_keys: Sequence[str] = ()
+) -> None:
+    """:func:`refuse_config_expressions` for a connector config as it is sent.
+
+    The last check before a REST call, over everything the config holds: a
+    setting forge derives from another part of the contract included. Left out
+    are only ``secret_keys``, the settings the caller wrote the store's resolved
+    secret to, which is the operator's and not contract text.
+    """
+    refuse_config_expressions(
+        {key: value for key, value in config.items() if key not in secret_keys}, where=where
+    )
 
 
 def _default_succeeded_states() -> Tuple:

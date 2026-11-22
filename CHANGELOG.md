@@ -615,8 +615,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unwraps it before the first stage and hands every stage the token through a pipe, which the stage
   reads as it starts (`FLUID_VAULT_SHIP_TOKEN_FD` names it). Windows has no inherited pipes, so
   there the token travels in `FLUID_VAULT_SHIP_TOKEN`, which the stage takes out of its environment
-  at once. The token is in no process's environment, so tofu, dbt and a project's build steps
-  cannot reach it, and the store resolver reads it before any other token. No stage revokes it:
+  at once. The token stays out of the environment of the stage's other children, so dbt and a
+  project's build steps cannot reach it; tofu gets it as `BAO_TOKEN` when the stage encrypts
+  state with OpenBao. The store resolver reads it before any other token. No stage revokes it:
   ship does when the run ends, also after a failed stage and after Ctrl-C. A wrapper that cannot be
   unwrapped (a spent one, no store address, a store that cannot be reached) stops the run before
   any stage, with exit 2. Ship unwraps whenever two or more stages run, so a wrapper now serves one
@@ -671,8 +672,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ssh_tunnel` with `enable: true`, Airbyte's `tunnel_method` other than `NO_TUNNEL`), and,
   under any other setting of the connection block at any depth, a URI, or a field named for a
   host (`host`, `hostname`, `hosts`, `server_addresses`, `cluster_url` and the top-level
-  destination names) unless it holds a path or a word. A loopback host behind a tunnel needs an
-  allowlist entry too. A URI of an object store or a local file names no host, nor does an
+  destination names) unless it holds a path, or one or more words with an optional type whose
+  brackets hold one or two numbers (`varchar`, `numeric(10, 2)`). A loopback host behind a tunnel
+  needs an allowlist entry too. A URI of an object store or a local file names no host, nor does an
   embedded JDBC URL whose settings name none, and a URI under a credential-named field is judged
   by its host and never quoted. A parameter that names a host, in a query string (`host` or
   `hostaddr` in a libpq URI, a host in `jdbc_url_params` or in a Singer tap's `sqlalchemy_url`)
@@ -681,13 +683,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mapping), is refused unless the reference may go to any host, and so are a parameter whose
   name holds connection-string syntax (`=`, a blank, `;` or a quote), a driver argument in
   `connect_args` that holds `;`, `{` or `}`, and a database name that holds `?`, `#`, `;`, `&`,
-  `@`, `\` or a control character. An absolute socket path in libpq's `host` or in MySQL's
-  `unix_socket` is this machine. A URI whose authority a database client could read as naming a
-  host the policy does not read is refused unless the reference may go to any host.
-- A Debezium `extra_config` may no longer set, beside a `secretRef`, the host, port, database,
-  password, JDBC protocol or connector class, under `database.` or `driver.`, nor a JDBC driver
-  property that names a host, such as `failoverPartner` or `socketFactory`, nor Oracle's
-  `rac.nodes`.
+  `@`, `\` or a control character. An absolute socket path that a query string or a query
+  mapping gives libpq's `host` or MySQL's `unix_socket` is this machine; one in
+  `connection.host` itself is still refused. A URI whose authority a database client could read
+  as naming a host the policy does not read is refused unless the reference may go to any host,
+  and so is a connection block of more than 10,000 values, more than the policy reads.
+- A Debezium `extra_config` may no longer set, beside a `secretRef`, `connector.class`, nor the
+  host, port, database, URL, password or JDBC protocol under `database.` or `driver.`, nor a
+  JDBC driver property that names a host, such as `failoverPartner` or `socketFactory`, nor
+  Oracle's `rac.nodes`.
+- Through 0.36.0, a contract could have Debezium Server or a Kafka Connect worker read a variable
+  of its environment, or a file its config providers reach, and send it to a host the contract
+  chose: Debezium Server reads `application.properties` through SmallRye Config, which expands a
+  `${...}` expression in any value, and a Kafka Connect worker resolves `${provider:path:key}` in a
+  connector config. Contract text a connector reads (the whole source block, `properties.debezium`,
+  `properties.kafka-connect` and the sink's config) may no longer hold `${`, in a value of any
+  type, with or without a `secretRef`: the build fails before anything is written or sent, naming
+  the key and never the value. forge's own `${FLUID_DBZ_...}` lines, which carry the credentials it
+  moves to the environment, are unchanged. A credential that holds `${`, one the operator's store
+  resolved included, is not handed to Debezium Server, which would expand it from its environment
+  too. A secret belongs in a `secretRef`.
 - A runner that builds a connection URL keeps each field in its own part. dlt's
   `sql_database` source refuses a host, database or `drivername` that would change how its
   connection URL is read back, and `drivername` must be a SQLAlchemy dialect name with an
@@ -746,6 +761,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
+- A contract that applies today can be refused after this upgrade: beside a `secretRef`, every host
+  its connection block names is now judged, among them a URI anywhere in the block, a field named
+  for a host under another setting, and the host of an SSH tunnel in use. Before upgrading, add a
+  `NAME@host` entry to `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` for each such host. A host in a
+  query string or in a query mapping is refused unless the reference may go to any host, so move it
+  into the URI's host part or the connection's `host` field, where a `NAME@host` entry judges it. A
+  Debezium or Kafka Connect build whose contract text holds `${` fails too: write the value itself,
+  and a secret as a `secretRef`.
 - A Glue table that forge made before this release from a contract over 50 KB carries forge's
   `managed_by: fluid` marker but no product id: forge dropped its record of the contract, and
   `fluid_product_id` did not exist yet. `fluid apply` now refuses it with
