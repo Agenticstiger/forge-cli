@@ -28,6 +28,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
+from fluid_build.maintenance.statements import sql_literal
+
 
 class MaintenanceAction:
     """Base class of a maintenance action kind: the SDK surface of
@@ -54,8 +56,9 @@ class MaintenanceAction:
         table as its target, which may read others. Called when the job config is compiled
         (``fluid plan`` and ``fluid apply``): the statements are part of the config, which the
         plan binds, and forge's Spark runner executes them in order, before compaction, each
-        commit stamped as the runner stamps its writes."""
+        commit stamped as the runner stamps its writes. A statement holds no comment and no
+        backslash; write an option's value into it with :func:`sql_literal`."""
         raise NotImplementedError(f"{type(self).__name__}.statements")
 
 
-__all__ = ["MaintenanceAction"]
+__all__ = ["MaintenanceAction", "sql_literal"]

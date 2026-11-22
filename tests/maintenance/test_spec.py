@@ -228,7 +228,7 @@ class TestLegacyDefaults:
             spark_block(compaction=None, expireSnapshots={}),
             legacy={"snapshotRetention": {"maxSnapshotAgeMs": 60_000}},
         )
-        assert has(errors, "maxSnapshotAgeMs must be at least 3600000")
+        assert has(errors, "maxSnapshotAgeMs must be at least 86400000")
 
     def test_legacy_compaction_disabled_with_a_compaction_block(self):
         errors = errors_of(spark_block(compaction={}), legacy={"compaction": {"enabled": False}})
@@ -285,17 +285,17 @@ class TestFloorsAndValues:
         tm = one(spark_block(removeOrphanFiles={"olderThan": "PT24H"}))
         assert tm.orphans.older_than_seconds == 86400
 
-    @pytest.mark.parametrize("age", ["PT59M", "PT3599S", "P0D", "forever", 7])
-    def test_snapshot_expiry_under_an_hour_or_unreadable(self, age):
+    @pytest.mark.parametrize("age", ["PT23H59M", "PT1H", "PT86399S", "P0D", "forever", 7])
+    def test_snapshot_expiry_under_a_day_or_unreadable(self, age):
+        """An incremental reader, and a stream looking up its last epoch, may still be on a
+        snapshot younger than a day."""
         errors = errors_of(spark_block(expireSnapshots={"olderThan": age}))
-        assert has(
-            errors, "expireSnapshots.olderThan must be an ISO-8601 duration of at least PT1H"
-        )
+        assert has(errors, "expireSnapshots.olderThan must be an ISO-8601 duration of at least P1D")
 
-    def test_snapshot_expiry_of_an_hour_passes(self):
+    def test_snapshot_expiry_of_a_day_passes(self):
         assert (
-            one(spark_block(expireSnapshots={"olderThan": "PT1H"})).expire.older_than_seconds
-            == 3600
+            one(spark_block(expireSnapshots={"olderThan": "P1D"})).expire.older_than_seconds
+            == 86400
         )
 
     def test_huge_digit_durations_are_refused(self):

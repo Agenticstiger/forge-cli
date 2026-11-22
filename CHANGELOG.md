@@ -79,8 +79,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A contract declares each Iceberg table's maintenance, and forge runs it beside the table's
   stream (schema 0.7.7 `exposes[].iceberg.maintenance`, additive).** The steps are a package's
   `actions` (such as a GDPR erasure), `compaction` (`rewrite_data_files`), `rewriteManifests`,
-  `expireSnapshots` (`olderThan`, `retainLast`) and `removeOrphanFiles` (`olderThan`, P1D at the
-  least), run in that order. `iceberg.compaction.targetFileSizeMb` and `iceberg.snapshotRetention`,
+  `expireSnapshots` (`olderThan`, `retainLast`, P1D at the least) and `removeOrphanFiles`
+  (`olderThan`, P1D at the least), run in that order. Removing orphans deletes every file under the
+  table's location that no snapshot of it references, so `fluid validate` refuses it on a bucket
+  root and on a location that holds, or sits inside, another expose's (compared segment by
+  segment); the location must not hold a table outside the contract either. `iceberg.compaction.targetFileSizeMb` and `iceberg.snapshotRetention`,
   which nothing read before, are their defaults. `backend: spark` (the default) runs them with
   forge's Spark runner, on the runtime and as the role of the `engine: spark` build that writes
   the table:
@@ -98,8 +101,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   action kind comes from the new `fluid_build.maintenance_actions` entry points (SDK base class
   `fluid_build.maintenance.MaintenanceAction`), read by name and loaded only when a contract names
   it, under the allow/block policy. Its statements are asked for when the config is compiled: each
-  must be one `DELETE`, `UPDATE` or `MERGE` whose target is the table, and they are part of the job
-  config the plan binds. A writer on AWS Glue is refused (its one job runs one run at a time), and
+  must be one `DELETE`, `UPDATE` or `MERGE` whose target is the table, with no comment and no
+  backslash (Spark and sqlglot read some of each differently), and what ships is sqlglot's own
+  rendering of the statement it checked, part of the job config the plan binds;
+  `fluid_build.maintenance.sql_literal` writes an option's value as a literal that passes.
+  `--mode maintain --dry-run` lists each step and what it would delete. A writer on AWS Glue is refused (its one job runs one run at a time), and
   so is an EMR on EC2 cluster that runs one step at a time while another step runs. `backend: glue`
   provisions the Glue Data Catalog's table optimizers instead (`aws_glue_catalog_table_optimizer`:
   compaction, retention, orphan file deletion, run as `roleArn`). A non-default compaction

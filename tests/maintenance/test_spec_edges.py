@@ -50,7 +50,7 @@ def test_a_bad_legacy_default_names_the_legacy_field() -> None:
     errors = _errors(
         maintained(
             glue_block(expireSnapshots={}),
-            legacy={"snapshotRetention": {"maxSnapshotAgeMs": 2 * 3600 * 1000}},
+            legacy={"snapshotRetention": {"maxSnapshotAgeMs": 36 * 3600 * 1000}},
         )
     )
     assert any(

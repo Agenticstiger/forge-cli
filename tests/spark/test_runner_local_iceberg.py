@@ -361,7 +361,9 @@ class _EraseSku:
     point gives it: it deletes the rows of one sku."""
 
     def statements(self, table: str, options: Dict[str, Any]) -> List[str]:
-        return [f"DELETE FROM {table} WHERE sku = '{options['sku']}'"]
+        from fluid_build.maintenance import sql_literal
+
+        return [f"DELETE FROM {table} WHERE sku = {sql_literal(options['sku'])}"]
 
 
 def _maintained_contract() -> Dict[str, Any]:
@@ -372,7 +374,7 @@ def _maintained_contract() -> Dict[str, Any]:
             "actions": [{"name": "erase", "kind": "erase-sku", "options": {"sku": "gone"}}],
             "compaction": {"minInputFiles": 2},
             "rewriteManifests": {},
-            "expireSnapshots": {"olderThan": "PT1H", "retainLast": 2},
+            "expireSnapshots": {"olderThan": "P1D", "retainLast": 2},
             "removeOrphanFiles": {"olderThan": "P1D"},
         }
     }

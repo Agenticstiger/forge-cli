@@ -84,9 +84,10 @@ STRATEGIES: Mapping[str, Tuple[str, ...]] = {
 #: deleting it corrupts the table (Iceberg's maintenance guide). Iceberg's default is 3 days.
 MIN_ORPHAN_SECONDS = 86400
 DEFAULT_ORPHAN_SECONDS = 3 * 86400
-#: The shortest snapshot age a contract may expire: a reader or a stream's next commit may
-#: still be on a younger one.
-MIN_EXPIRE_SECONDS = 3600
+#: The shortest snapshot age a contract may expire: an incremental reader may still be on a
+#: younger one, and a stream finds its last committed epoch in recent snapshots. A day, as
+#: Glue's retention optimizer allows no less.
+MIN_EXPIRE_SECONDS = 86400
 #: Iceberg's defaults for expire_snapshots: older than five days, keeping the last one.
 DEFAULT_EXPIRE_SECONDS = 5 * 86400
 DEFAULT_RETAIN_LAST = 1
@@ -290,7 +291,7 @@ def _read_expire(
     if block.get("olderThan") is not None:
         parsed = parse_duration(block.get("olderThan"))
         if parsed is None or parsed < MIN_EXPIRE_SECONDS:
-            errors.append(f"{where}.olderThan must be an ISO-8601 duration of at least PT1H")
+            errors.append(f"{where}.olderThan must be an ISO-8601 duration of at least P1D")
         else:
             older = parsed
             if _whole(legacy_ms, 0, 2**63) and legacy_ms != parsed * 1000:
@@ -301,7 +302,7 @@ def _read_expire(
     elif legacy_ms is not None:
         if not _whole(legacy_ms, MIN_EXPIRE_SECONDS * 1000, 2**63):
             errors.append(
-                "iceberg.snapshotRetention.maxSnapshotAgeMs must be at least 3600000 (an hour) "
+                "iceberg.snapshotRetention.maxSnapshotAgeMs must be at least 86400000 (a day) "
                 f"for {where} to expire by it"
             )
         else:
@@ -441,6 +442,73 @@ def _read_actions(
         if not problems:
             out.append(CustomAction(name=name, kind=kind, options=dict(options)))
     return tuple(out)
+
+
+def _object_location(expose: Mapping[str, Any]) -> Optional[Tuple[str, Tuple[str, ...]]]:
+    """``(bucket, path segments)`` of an AWS expose's S3 location, as forge places it
+    (``providers/aws/util/warehouse.normalize_location``: the binding's ``bucket`` and ``path``,
+    ``<database>/<table>/`` by default); None for an expose with no S3 location (another
+    platform, or a REST catalog's table, whose location that catalog assigns)."""
+    from fluid_build.providers._iceberg_catalog import is_glue_cataloged
+    from fluid_build.providers.aws.util.warehouse import normalize_location
+
+    binding = _mapping(expose.get("binding"))
+    loc = _mapping(binding.get("location"))
+    if str(binding.get("platform") or "") != "aws":
+        return None
+    named = bool(loc.get("bucket")) or loc.get("path") is not None
+    if not named and not (loc.get("database") and loc.get("table")):
+        return None
+    iceberg = str(binding.get("format") or "").lower() == "iceberg"
+    if iceberg and not named and not is_glue_cataloged(binding):
+        return None
+    bucket, path = normalize_location(loc, account_ref="<account>")
+    return bucket, tuple(part for part in path.split("/") if part)
+
+
+def table_location(contract: Mapping[str, Any], expose_id: str) -> Optional[str]:
+    """``s3://<bucket>/<path>/`` of the expose's table as forge places it, or None when the
+    catalog assigns it (an unnamed bucket reads ``<account>-fluid-data``)."""
+    for expose in contract.get("exposes") or []:
+        if isinstance(expose, Mapping) and str(expose.get("exposeId")) == expose_id:
+            found = _object_location(expose)
+            if found is not None:
+                return f"s3://{found[0]}/{'/'.join(found[1])}/"
+    return None
+
+
+def _orphan_scope_problem(contract: Mapping[str, Any], expose: Mapping[str, Any]) -> str:
+    """Why removing orphan files under the expose's table location would reach files that are
+    not the table's, or ``""``. Iceberg (and Glue's optimizer) deletes every file under the
+    location that no snapshot of this table references, so the location must be the table's
+    alone: never a bucket root, never the parent or the child of another expose's location
+    (compared segment by segment, so ``pre`` and ``prefix-other`` do not nest). Tables outside
+    the contract cannot be seen here: the location must not hold theirs either."""
+    mine = _object_location(expose)
+    if mine is None:
+        return ""
+    bucket, parts = mine
+    if not parts:
+        return (
+            f"the table's location is the root of bucket {bucket}, so removing orphan files "
+            "would delete every file there that this table does not reference; give the table "
+            "a prefix of its own (binding.location.path)"
+        )
+    for other in contract.get("exposes") or []:
+        if not isinstance(other, Mapping) or other is expose:
+            continue
+        theirs = _object_location(other)
+        if theirs is None or theirs[0] != bucket:
+            continue
+        shorter = min(len(parts), len(theirs[1]))
+        if parts[:shorter] == theirs[1][:shorter]:
+            return (
+                f"the table's location s3://{bucket}/{'/'.join(parts)}/ and expose "
+                f"{other.get('exposeId')}'s s3://{bucket}/{'/'.join(theirs[1])}/ hold one "
+                "another, so removing orphan files would delete the other's files; give each "
+                "table a prefix of its own"
+            )
+    return ""
 
 
 def _iceberg_location(expose: Mapping[str, Any]) -> Tuple[Optional[str], Optional[str], str]:
@@ -640,6 +708,10 @@ def read_table(
     orphans = _read_orphans(
         raw.get("removeOrphanFiles"), backend, f"{where}.removeOrphanFiles", errors
     )
+    if orphans is not None:
+        scope = _orphan_scope_problem(contract, expose)
+        if scope:
+            errors.append(f"{where}.removeOrphanFiles: {scope}")
     manifests = _block(
         raw.get("rewriteManifests"), _MANIFEST_KEYS, f"{where}.rewriteManifests", errors
     )
@@ -751,4 +823,5 @@ __all__ = [
     "read_maintenance",
     "read_table",
     "spark_tables",
+    "table_location",
 ]

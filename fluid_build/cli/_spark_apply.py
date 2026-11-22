@@ -524,8 +524,10 @@ def maintain_only(
         if dry_run:
             say(
                 f"{head}: would start one run and wait up to {int(DEFAULT_RUN_WAIT_S)} s for it "
-                "to end"
+                "to end, which would:"
             )
+            for line in _maintenance_steps(contract, run):
+                say(f"  {line}")
             continue
         if confirm is not None and not confirm(
             f"Start {run.maintains}'s maintenance on {run.runtime} as build {run.build}'s role? "
@@ -545,6 +547,48 @@ def maintain_only(
             raise KeyboardInterrupt  # the run was cancelled; stop the apply, as Ctrl-C does
         failed = failed or bool(outcome.error)
     return 1 if failed else 0
+
+
+def _ago(seconds: int) -> str:
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds % size == 0:
+            count = seconds // size
+            return f"{count} {unit}{'' if count == 1 else 's'}"
+    return f"{seconds} seconds"
+
+
+def _maintenance_steps(contract: Mapping[str, Any], run: DesiredRun) -> List[str]:
+    """What a maintenance run would do, step by step, from the job config it would start with:
+    what a dry run of ``--mode maintain`` shows before anything deletes rows or files."""
+    import json
+
+    from fluid_build.maintenance.spec import table_location
+
+    config = json.loads(run.job_text)
+    sink = config["sink"]
+    table = f"{sink['catalog']}.{sink['table']}"
+    location = table_location(contract, str(run.maintains)) or "the table's location"
+    lines: List[str] = []
+    for step in config["maintenance"]["steps"]:
+        kind = step["step"]
+        if kind == "statement":
+            lines.append(f"run action {step['name']} on {table}: {step['sql']}")
+        elif kind == "rewrite_data_files":
+            options = ", ".join(f"{k}={v}" for k, v in sorted(step["options"].items()))
+            lines.append(f"compact {table} ({step['strategy']}; {options})")
+        elif kind == "rewrite_manifests":
+            lines.append(f"rewrite the manifests of {table}")
+        elif kind == "expire_snapshots":
+            lines.append(
+                f"expire the snapshots of {table} older than {_ago(step['olderThanSeconds'])}, "
+                f"keeping the last {step['retainLast']}, and delete the files only they held"
+            )
+        else:
+            lines.append(
+                f"delete the files under {location} that no snapshot of {table} references, "
+                f"older than {_ago(step['olderThanSeconds'])}"
+            )
+    return lines
 
 
 def _removed_of(

@@ -13,7 +13,9 @@ Each statement must parse (Spark SQL, through sqlglot) as exactly one ``DELETE``
 ``MERGE`` whose target is the action's own table, named as the runner's catalog holds it
 (``fluid.<database>.<table>``); it may read other tables. Nothing else is
 written: no DDL, no second statement, no ``${...}`` variable (Spark would substitute it after
-this check).
+this check), and, since Spark and sqlglot read them differently, no comment and no backslash.
+What ships is sqlglot's own rendering of the statement it checked; :func:`sql_literal` writes a
+plugin's option value as a literal that passes.
 """
 
 from __future__ import annotations
@@ -75,6 +77,16 @@ def canonical_statement(sql: Any, table: str) -> Tuple[str, str]:
         return "", "holds a ${...} variable"
     if any(ch in _CONTROL for ch in sql):
         return "", "holds a control character"
+    if "--" in sql or "/*" in sql:
+        return "", (
+            "holds '--' or '/*': a statement carries no comment, not even inside a string "
+            "(Spark and sqlglot end some comments in different places)"
+        )
+    if "\\" in sql:
+        return "", (
+            "holds a backslash: Spark and sqlglot read some escapes differently, so a literal "
+            "is written without one (fluid_build.maintenance.sql_literal)"
+        )
     try:
         import sqlglot  # noqa: F401 - a core dependency
     except ImportError:  # pragma: no cover
@@ -87,9 +99,30 @@ def canonical_statement(sql: Any, table: str) -> Tuple[str, str]:
         return "", f"must write the action's own table, named {table}"
     shipped = statement.sql(dialect="spark", comments=False)
     again, why = _parsed(shipped)
-    if again is None or _target_parts(again) != wanted or "${" in shipped:
+    unsafe = any(mark in shipped for mark in ("${", "--", "/*", "\\"))
+    if again is None or _target_parts(again) != wanted or unsafe:
         return "", "does not read back as the statement it was checked as"
     return shipped, ""
+
+
+def sql_literal(value: str) -> str:
+    """``value`` as a Spark SQL string literal a maintenance statement may carry, for a plugin
+    that builds its statement from its options. Spark reads ``''`` as two literals side by side,
+    not as an escaped quote, and a backslash escape is read differently by sqlglot, so a value
+    holding ``'`` or a backslash cannot be written safely and is refused, as are a control
+    character, ``${`` and a comment marker.
+
+    Raises:
+        ValueError: ``value`` cannot be written as such a literal (it is not quoted back).
+    """
+    if not isinstance(value, str):
+        raise ValueError("a literal is a string")
+    if any(ch in _CONTROL or ch in "\t\n\r" for ch in value):
+        raise ValueError("a literal holds no control character or line break")
+    for mark in ("'", "\\", "${", "--", "/*"):
+        if mark in value:
+            raise ValueError(f"a literal holds no {mark!r}")
+    return f"'{value}'"
 
 
 def statement_problem(sql: Any, table: str) -> str:
@@ -116,4 +149,10 @@ def checked_statements(statements: Any, table: str, where: str) -> List[str]:
     return out
 
 
-__all__ = ["WRITES", "canonical_statement", "checked_statements", "statement_problem"]
+__all__ = [
+    "WRITES",
+    "canonical_statement",
+    "checked_statements",
+    "sql_literal",
+    "statement_problem",
+]

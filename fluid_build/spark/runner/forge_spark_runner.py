@@ -2200,7 +2200,7 @@ _STATEMENT_WRITES = ("DELETE", "UPDATE", "MERGE")
 #: The shortest ages the runner expires or removes at, whatever its config says: a file younger
 #: than the longest write is not an orphan yet (Iceberg's maintenance guide).
 _MIN_ORPHAN_SECONDS = 86400
-_MIN_EXPIRE_SECONDS = 3600
+_MIN_EXPIRE_SECONDS = 86400
 #: The stamp that says which maintenance step made a commit.
 MAINTENANCE_STAMP = "fluid.maintenance"
 
@@ -2222,6 +2222,10 @@ def _check_statement(step: dict, table: str) -> None:
         raise JobConfigError(
             f"statement step {name}: each is one DELETE, UPDATE or MERGE, with no ${{...}}"
         )
+    if "--" in sql or "/*" in sql or "\\" in sql:
+        # forge ships none: Spark and the checker that read the statement end some comments
+        # and read some escapes differently.
+        raise JobConfigError(f"statement step {name}: no comment and no backslash")
     try:
         separated = _has_separator(sql)
     except ValueError:
@@ -2230,12 +2234,42 @@ def _check_statement(step: dict, table: str) -> None:
         raise JobConfigError(f"statement step {name}: one statement, with no ';'")
     head = _STATEMENT_HEADS[sql_write(sql)]
     words = sql.split(" ", len(head) + 1)
-    written = words[len(head)].replace("`", "") if len(words) > len(head) else ""
-    if tuple(words[: len(head)]) != head or written.lower() != table.lower():
+    written = _name_parts(words[len(head)]) if len(words) > len(head) else None
+    wanted = tuple(table.lower().split("."))
+    if tuple(words[: len(head)]) != head or written != wanted:
         raise JobConfigError(
             f"statement step {name}: it must start {' '.join(head)} {table}, as forge renders "
             "it: a statement writes the job's own table"
         )
+
+
+def _name_parts(text: str):
+    """The parts of a dotted name as written (``fluid.silver.orders``, a part backquoted where
+    it must be, a doubled backquote standing for one), lower case; None for anything else. A
+    part that holds a dot is refused: `` `fluid.silver`.orders `` names another table."""
+    parts, i, n = [], 0, len(text)
+    while i <= n:
+        if i < n and text[i] == "`":
+            try:
+                end = _end_of_name(text, i)
+            except ValueError:
+                return None
+            part = text[i + 1 : end - 1].replace("``", "`")
+            i = end
+        else:
+            j = i
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            part, i = text[i:j], j
+        if not part or "." in part or "`" in part:
+            return None
+        parts.append(part.lower())
+        if i == n:
+            return tuple(parts)
+        if text[i] != ".":
+            return None
+        i += 1
+    return None
 
 
 def _has_separator(text: str) -> bool:
@@ -2424,8 +2458,15 @@ def run_maintenance(spark, config: dict, stamps: dict | None = None, now=None) -
                 "deleted_manifest_lists": _count(result, "deletedManifestListsCount"),
             }
         else:  # remove_orphan_files
+            maintained = table()
+            location = str(maintained.location())
+            if not urllib.parse.urlsplit(location).path.strip("/"):
+                # Every file in the bucket that this table does not reference would go.
+                raise JobConfigError(
+                    f"remove_orphan_files: {name}'s location {location} is a bucket root"
+                )
             cutoff = int((clock() - step["olderThanSeconds"]) * 1000)
-            result = actions.deleteOrphanFiles(table()).olderThan(cutoff).execute()
+            result = actions.deleteOrphanFiles(maintained).olderThan(cutoff).execute()
             out = {"deleted": _iterated(result.orphanFileLocations())}
         out = {"step": kind, **out, "seconds": round(clock() - started, 1)}
         log("maintenance_step", table=name, **out)
