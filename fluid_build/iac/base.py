@@ -63,6 +63,27 @@ class IacProviderPlugin(Protocol):
     * ``strict_adoption``: ``True`` when the provider replaces an object it
       creates over, so an import that fails for any reason but "no such
       object" must stop the apply (:meth:`discover_imports`).
+    * ``adoptable_tables(contract)``: ``{address: name}`` of every table the
+      contract names, for a plugin whose table imports carry
+      ``ImportBlock.table``: such a table is taken over only on
+      ``--adopt-tables`` (``iac/adoption.py``), and a run with the flag that
+      found no import for one of them is refused (``table_adoption_hint`` says
+      why). A plugin without it adopts what it finds, as before.
+    * ``table_made_by_forge(values, contract)``: whether a found table (its values in
+      state) carries the marker forge's module sets on create together with this
+      contract's exact product id; such a table is this product's own, re-attached as
+      before without ``--adopt-tables``. A table with no product id is not. Without the
+      capability every found table needs the flag.
+    * ``table_names_no_product(values)``: whether a found table carries that marker but
+      names no product (made before forge recorded the id), so the refusal names the
+      one-time remedy of recording it. Optional.
+    * ``adoption_hold(declared)``: the attributes an adopted table keeps as it is in
+      the run that adopts it (its body in the module); the engine plans that table again
+      with them in ``ignore_changes`` and refuses a plan that still updates it in place.
+      ``()`` (or no capability) lets the adoption update it.
+    * ``review_table_adoption(change, declared)``: ``(differences, updates)`` of
+      one table the saved plan imports (a ``tofu show -json`` resource change,
+      and the table's body in the module); any difference refuses the run.
     * ``plan_data_changes(plan)``: what the saved plan's in-place updates do to
       existing data (``tofu show -json``), one line each; any line needs
       ``--allow-data-loss``, as a destroy does. It raises

@@ -402,6 +402,12 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
     ),
     **_register(
         NOT_A_CONTRACT,
+        "the OpenTofu module the engine emitted (main.tf.json), given its import blocks and "
+        "the ignore_changes of an adopted Iceberg table for --adopt-tables",
+        *_site("cli/_apply_table_adoption.py", "write_import_blocks", "hold_still"),
+    ),
+    **_register(
+        NOT_A_CONTRACT,
         "config, run records and dbt schema files of the verify and Command Center paths",
         *_site("cli/_command_center.py", "_load_from_config"),
         *_site("cli/_verify_athena.py", "_run_records"),
