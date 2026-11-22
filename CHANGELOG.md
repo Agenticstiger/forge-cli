@@ -34,9 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_apply_failed`, `_output_failed`, `_plugin_blocked`, `_engine_missing`, `_engine_too_old`,
   `_engine_broken`, `_failed`), with the message redacted; a file-system error is
   `custom_scaffold_output_failed`, not a traceback. A relative `path:` bundle is read from the
-  contract's directory (a bundle's recorded source contract, else `--contract-path`), and a
-  `custom-scaffold/` in `--out` that holds `fluid-scaffold.yaml` (a bundle, with `--out` at the
-  contract's directory) is refused rather than cleared. Git bundles keep the engine's own
+  contract's directory (a bundle's recorded source contract, else `--contract-path`). Like stage
+  3's other subdirectories of `--out`, `custom-scaffold/` is cleared on every run, whatever
+  `--emit` names, so a scaffold an earlier run wrote never outlives a run without the key (it would
+  not be in that run's MANIFEST); one that holds `fluid-scaffold.yaml` (a bundle, with `--out` at
+  the contract's directory) is refused rather than cleared. `--out`'s help says which
+  subdirectories stage 3 owns. Git bundles keep the engine's own
   credential model: a credential goes only to a host the operator lists in
   `FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS`, and a contract's `secret_ref` may only name a
   `FLUID_SCAFFOLD_` variable; the engine's operator settings (`FLUID_CUSTOM_SCAFFOLD_*`) cannot

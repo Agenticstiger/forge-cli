@@ -90,7 +90,13 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--out",
         default="dist/artifacts",
-        help="Output directory for emitted artifacts. Default: dist/artifacts",
+        help=(
+            "Output directory for emitted artifacts. Default: dist/artifacts. Stage 3 owns its "
+            "subdirectories there (odcs/, odps-bitol/, opds/, schedule/, policy/, spark/, "
+            "pyspark-schema/, custom-scaffold/) and replaces what an earlier run wrote in them "
+            "on every run, whatever --emit names; a custom-scaffold/ that holds "
+            "fluid-scaffold.yaml (a scaffold bundle) stops the run instead."
+        ),
     )
     p.add_argument(
         "--emit",

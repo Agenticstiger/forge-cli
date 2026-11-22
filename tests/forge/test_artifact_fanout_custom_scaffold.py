@@ -443,6 +443,30 @@ def test_the_cli_refuses_on_a_change_request_and_the_flag_overrides(
     assert "custom-scaffold/README.md" in _manifest(tmp_path / "b")["files"]
 
 
+def test_a_run_that_does_not_name_the_key_still_clears_an_earlier_scaffold(
+    tmp_path: Path, stub: Any
+) -> None:
+    """Stage 3 owns ``<out>/custom-scaffold/`` as it owns ``odcs/``: an earlier run's scaffold
+    never survives a run, whatever its ``--emit`` (its MANIFEST would not list it)."""
+    out = tmp_path / "out"
+    contract = _write(tmp_path / "p", _contract(_block()))
+    _fanout(contract, out)
+    assert (out / "custom-scaffold" / "README.md").is_file()
+    manifest = _fanout(contract, out, emit="odcs")
+    assert not (out / "custom-scaffold").exists()
+    assert _scaffold_rows(manifest) == []
+
+
+def test_the_out_help_says_stage_three_owns_its_subdirectories(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    with pytest.raises(SystemExit):
+        _main("generate", "artifacts", "--help")
+    text = " ".join(capsys.readouterr().out.split())
+    assert "custom-scaffold/" in text and "fluid-scaffold.yaml" in text
+    assert "--allow-scaffold-on-change-request" in text
+
+
 # ── refusals: nothing half-written is left behind ─────────────────────────
 
 
