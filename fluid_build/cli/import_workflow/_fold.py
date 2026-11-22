@@ -561,12 +561,7 @@ def _spread_to_aliases(
 
     for left, right, _line in aliases:
         parent[find(left)] = find(right)
-    last_addition: Dict[str, int] = {}
-    members = {name for left, right, _line in aliases for name in (left, right)}
-    for name, line in augmented:
-        if name in members:
-            root = find(name)
-            last_addition[root] = max(last_addition.get(root, 0), line)
+    last_addition = _last_additions(aliases, augmented, find)
     changed = {find(name) for name, why in out.items() if in_place in why}
     if not changed and not last_addition:
         return
@@ -578,6 +573,21 @@ def _spread_to_aliases(
             changed_by_addition = before_an_addition and (name not in added_to or other in added_to)
             if changed_by_addition or find(name) in changed:
                 out.setdefault(name, f"`{name}` {in_place}")
+
+
+def _last_additions(
+    aliases: List[Tuple[str, str, int]],
+    augmented: Sequence[Tuple[str, int]],
+    find: Callable[[str], str],
+) -> Dict[str, int]:
+    """The line of the last ``+=`` on a name of each group of aliases, by the group."""
+    members = {name for left, right, _line in aliases for name in (left, right)}
+    last: Dict[str, int] = {}
+    for name, line in augmented:
+        if name in members:
+            root = find(name)
+            last[root] = max(last.get(root, 0), line)
+    return last
 
 
 def _target_names(target: ast.AST) -> List[str]:
@@ -1511,12 +1521,20 @@ class Folder:
             current = parents.get(current)
         return None
 
-    def name_value(self, name: str, scope: Scope, depth: int, origin: ast.AST) -> Any:
+    def _loop_item(self, name: str, scope: Scope) -> Any:
+        """What the loop being unrolled gives ``name`` in ``scope``, else :data:`ABSENT`: the
+        item, when the name is the loop's own variable (the scope that binds it is the loop's)."""
         if self._env:
             binder = self._binding_scope(name, scope)
             for owner, frame in reversed(self._env):
                 if name in frame and owner is binder:
                     return frame[name]
+        return ABSENT
+
+    def name_value(self, name: str, scope: Scope, depth: int, origin: ast.AST) -> Any:
+        item = self._loop_item(name, scope)
+        if item is not ABSENT:
+            return item
         current: Optional[Scope] = scope
         while current is not None:
             if name in current.recipes:

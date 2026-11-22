@@ -584,6 +584,36 @@ def _unquote(raw: str) -> str:
     return parts[0] if len(parts) == 1 else raw
 
 
+def _redact_words(text: str, depth: int) -> str:
+    """``text``, the words of a command (the comments, the here-documents and the template fields
+    already put aside), with the value of each credential masked."""
+    words = _Words(depth)
+    words.boundary()
+    out: List[str] = []
+    position = 0
+    first = True
+    for match in _SHELL_TOKEN.finditer(text):
+        gap = text[position : match.start()]
+        if not first and _COMMAND_BOUNDARY.search(gap):
+            words.boundary()
+        out.append(gap)
+        first = False
+        position = match.end()
+        if match.group("comment") is not None:
+            out.append(_scan(match.group(0)))
+            continue
+        raw = match.group("word")
+        value = _unquote(raw)
+        shown = words.show(value)
+        if shown == value:
+            out.append(raw)
+        else:
+            quote = _NEEDS_QUOTES.search(shown.replace(_REDACTED, ""))
+            out.append(shlex.quote(shown) if quote else shown)
+    out.append(text[position:])
+    return "".join(out)
+
+
 def _redact_command(command: str, depth: int = 0) -> str:
     """``command`` with the values of credentials masked, word by word, keeping what is not
     one exactly as written (lines, quoting, operators, ``$VAR``, ``{{ ds }}``)."""
@@ -624,32 +654,7 @@ def _redact_command(command: str, depth: int = 0) -> str:
     text = _JINJA.sub(hide, command.replace("\r\n", "\n"))
     if "<<" in text:
         text = _HEREDOC.sub(keep_body, text)
-    text = _mask_json(_mask_dsn(text))
-    words = _Words(depth)
-    words.boundary()
-    out: List[str] = []
-    position = 0
-    first = True
-    for match in _SHELL_TOKEN.finditer(text):
-        gap = text[position : match.start()]
-        if not first and _COMMAND_BOUNDARY.search(gap):
-            words.boundary()
-        out.append(gap)
-        first = False
-        position = match.end()
-        if match.group("comment") is not None:
-            out.append(_scan(match.group(0)))
-            continue
-        raw = match.group("word")
-        value = _unquote(raw)
-        shown = words.show(value)
-        if shown == value:
-            out.append(raw)
-        else:
-            quote = _NEEDS_QUOTES.search(shown.replace(_REDACTED, ""))
-            out.append(shlex.quote(shown) if quote else shown)
-    out.append(text[position:])
-    result = "".join(out)
+    result = _redact_words(_mask_json(_mask_dsn(text)), depth)
     if bodies:
         result = _HEREDOC_TOKEN.sub(body_back, result)
     return _JINJA_TOKEN.sub(back, result) if fields else result

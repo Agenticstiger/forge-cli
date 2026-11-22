@@ -391,21 +391,20 @@ def link_tasks(
     over: Dict[str, int] = {}
     linked: List[LinkedTask] = []
     unlinked: List[Tuple[Dag, Task, Submit, str]] = []
-    for dag in dags:
-        for task in dag.tasks:
-            for submit in task.submits:
-                found = resolver.resolve(submit)
-                if isinstance(found, str):
-                    unlinked.append((dag, task, submit, found))
-                    continue
-                targets, how = found
-                for job in targets:
-                    if len(job.tasks) >= MAX_TASKS_PER_JOB:
-                        over[job.shown] = over.get(job.shown, 0) + 1
-                        continue
-                    link = LinkedTask(dag, task, submit, how)
-                    job.tasks.append(link)
-                    linked.append(link)
+    submits = ((dag, task, submit) for dag in dags for task in dag.tasks for submit in task.submits)
+    for dag, task, submit in submits:
+        found = resolver.resolve(submit)
+        if isinstance(found, str):
+            unlinked.append((dag, task, submit, found))
+            continue
+        targets, how = found
+        for job in targets:
+            if len(job.tasks) >= MAX_TASKS_PER_JOB:
+                over[job.shown] = over.get(job.shown, 0) + 1
+                continue
+            link = LinkedTask(dag, task, submit, how)
+            job.tasks.append(link)
+            linked.append(link)
     if notes is not None:
         for shown, count in sorted(over.items()):
             notes.append(

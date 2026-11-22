@@ -458,8 +458,11 @@ class _Reader:
                     value = self.folder.string(call.args[1])
                     if isinstance(value, str):
                         self.default_checkpoint = value
-        # every view the file registers is known before any statement is read: a statement above
-        # the one that registers a view (in a function defined first) may read it
+        self._register_views(calls)
+
+    def _register_views(self, calls: Sequence[ast.Call]) -> None:
+        """Every view the file registers is known before any statement is read: a statement above
+        the one that registers a view (in a function defined first) may read it."""
         for call in calls:
             func = call.func
             if not isinstance(func, ast.Attribute):
