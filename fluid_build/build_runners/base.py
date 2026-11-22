@@ -605,11 +605,14 @@ def _execute_spark_build(
     *,
     dry_run: bool,
     workspace: Optional[Path] = None,
+    as_written: Optional[Dict[str, Any]] = None,
+    bundle_digest: Optional[str] = None,
 ) -> Optional[int]:
     """Run a Spark job build on its runtime (``build_runners/spark``): 0 when its run
     succeeded, 1 when it failed or was refused, None for a stream ``fluid apply`` keeps
     running. A local run (``runtime: local``) keeps its state in ``workspace``, the
-    source contract's directory."""
+    source contract's directory. ``as_written`` (the contract before ``{{ env.* }}`` was
+    resolved) and ``bundle_digest`` (the bundle a plan binds) are what the runner stamps."""
     from fluid_build._errors import FluidUserError
     from fluid_build.observability.run_id import get_or_create_run_id
 
@@ -627,6 +630,8 @@ def _execute_spark_build(
             local_host=LocalHost(Path(workspace)) if workspace is not None else None,
             # the pipeline's run id, as apply, plan and verify read it: stamped on each commit
             run_id=get_or_create_run_id(),
+            as_written=as_written,
+            bundle_digest=bundle_digest,
         )
     except FluidUserError as exc:
         _print_typed_error(exc)
@@ -1471,6 +1476,8 @@ def run_builds_from_args(
     global LOG
     LOG = logger
 
+    # The bundle a verified plan binds, stamped on each Spark commit; never a plan read below.
+    verified_bundle = plan_data.get("bundleDigest") if plan_data is not None else None
     contract_path = Path(args.contract)
 
     if not contract_path.exists():
@@ -1728,7 +1735,13 @@ def run_builds_from_args(
             # run of a scheduled build, waited for. A stream is kept running by this apply's
             # spark.reconcile action, not run here.
             spark_result = _execute_spark_build(
-                contract, build, dry_run=args.dry_run, workspace=contract_path.resolve().parent
+                contract,
+                build,
+                dry_run=args.dry_run,
+                workspace=contract_path.resolve().parent,
+                # stamped on each commit: the contract's digest as written, and a plan's bundle
+                as_written=contract_as_written,
+                bundle_digest=verified_bundle,
             )
             if spark_result is None:
                 _report_spark_stream(build_id, report)

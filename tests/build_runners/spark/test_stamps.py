@@ -11,9 +11,12 @@ or a running stream would be replaced by every deploy.
 
 from __future__ import annotations
 
+import copy
 import datetime
 import logging
 import re
+import sys
+import types
 
 import pytest
 
@@ -43,6 +46,17 @@ def _account(monkeypatch):
     monkeypatch.delenv(_desired.RELEASE_ID_ENV, raising=False)
     for name in (*SCHEDULED, "AIRFLOW_CTX_DAG_ID", "AIRFLOW_CTX_DAG_RUN_ID"):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
+def no_aws(monkeypatch):
+    """Nothing here reaches AWS: boto3 is a module that fails the test on any use."""
+
+    class Refused(types.ModuleType):
+        def __getattr__(self, name):
+            raise AssertionError(f"the test reached AWS (boto3.{name})")
+
+    monkeypatch.setitem(sys.modules, "boto3", Refused("boto3"))
 
 
 def stamps(**given):
@@ -274,6 +288,7 @@ def test_a_contract_without_a_spark_build_never_reads_the_release_variable(contr
     assert _apply.prepare(contract, build_id=None, verified_plan=None, dry_run=True) == []
 
 
+@pytest.mark.usefixtures("no_aws")
 def test_the_keepalive_leaves_a_release_a_stamp_may_not_hold_off_and_still_runs(
     contract, monkeypatch, caplog
 ):
@@ -297,6 +312,7 @@ def test_the_keepalive_leaves_a_release_a_stamp_may_not_hold_off_and_still_runs(
     assert "carries no release stamp" in caplog.text
 
 
+@pytest.mark.usefixtures("no_aws")
 def test_reconcile_only_stamps_the_runs_it_starts(contract, monkeypatch):
     seen = []
     monkeypatch.setattr(
@@ -390,6 +406,7 @@ def test_prepare_stamps_the_bundle_the_bound_plan_names(contract):
     assert unbound.bundle_digest is None and "--fluid-bundle-digest" not in unbound.stamp_args()
 
 
+@pytest.mark.usefixtures("no_aws")
 def test_prepare_and_the_keepalive_stamp_the_schedulers_run(contract, monkeypatch):
     for name, value in SCHEDULED.items():
         monkeypatch.setenv(name, value)
@@ -418,3 +435,70 @@ def test_the_flags_come_in_one_order(contract):
         "--fluid-scheduler-job",
         "--fluid-scheduler-run-id",
     ]
+
+
+# --- a scheduled build started from a plan ----------------------------------------------
+
+
+def _captured_stamps(monkeypatch):
+    """The stamps each ``desired_runs`` call is handed, as ``run_build`` hands them."""
+    seen = []
+    real = _desired.desired_runs
+
+    def spy(contract, **kwargs):
+        seen.append(kwargs.get("stamps"))
+        return real(contract, account=ACCOUNT_FOR_RUNS, **kwargs)
+
+    monkeypatch.setattr(_desired, "desired_runs", spy)
+    return seen
+
+
+ACCOUNT_FOR_RUNS = "123456789012"
+
+
+def test_a_build_from_a_plan_hashes_the_contract_as_written_and_stamps_the_plans_bundle(
+    contract, monkeypatch
+):
+    from fluid_build.build_runners.spark._reconcile import run_build
+
+    contract["exposes"][0]["description"] = "{{ env.REGION_NAME }}"
+    monkeypatch.setenv("REGION_NAME", "eu-west-1")
+    resolved = copy.deepcopy(contract)
+    resolved["exposes"][0]["description"] = "eu-west-1"  # as run_builds_from_args resolves it
+    seen = _captured_stamps(monkeypatch)
+    build = resolved["builds"][0]
+    assert (
+        run_build(resolved, build, dry_run=True, as_written=contract, bundle_digest=BUNDLE) is None
+    )
+    (stamped,) = seen
+    assert stamped["contract_digest"] == compute_contract_digest(contract)
+    assert stamped["bundle_digest"] == BUNDLE
+    seen.clear()
+    run_build(contract, contract["builds"][0], dry_run=True)  # a contract file: no plan, no bundle
+    assert seen[0]["contract_digest"] == compute_contract_digest(contract)
+    assert "bundle_digest" not in seen[0]
+
+
+def test_run_builds_hands_a_plans_spark_build_the_contract_as_written_and_its_bundle(
+    contract, monkeypatch, tmp_path
+):
+    import argparse
+
+    from fluid_build.build_runners import base
+
+    contract["exposes"][0]["description"] = "{{ env.REGION_NAME }}"
+    monkeypatch.setenv("REGION_NAME", "eu-west-1")
+    plan = tmp_path / "plan.json"
+    plan.write_text("{}", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(base, "_execute_spark_build", lambda *a, **k: calls.append((a, k)) or 0)
+    args = argparse.Namespace(
+        contract=str(plan), build_id=None, dry_run=True, delay=0, no_output=True,
+        fail_fast=False, env=None,
+    )  # fmt: skip
+    plan_data = {"contract": copy.deepcopy(contract), "bundleDigest": BUNDLE, "planDigest": "x"}
+    base.run_builds_from_args(args, logging.getLogger("test"), plan_data=plan_data)
+    ((positional, keywords),) = calls
+    assert positional[0]["exposes"][0]["description"] == "eu-west-1"  # the run is resolved
+    assert keywords["as_written"] == contract  # the digest is the contract's as written
+    assert keywords["bundle_digest"] == BUNDLE
