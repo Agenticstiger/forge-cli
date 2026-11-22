@@ -23,6 +23,9 @@ from __future__ import annotations
 
 import ast
 import logging
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -319,3 +322,128 @@ def test_a_task_named_like_an_imported_name_does_not_shadow_it(task_id: str):
     }
     assert assigned.count("dag") == 1, "a task variable rebinds the DAG"
     assert not set(assigned) & imported, "a task variable shadows an import"
+
+
+# ── Ruff's Airflow 3 rules over every generated DAG ─────────────────────
+#
+# Ruff's AIR3 rules (AIR301 removed in Airflow 3, AIR302 moved to a provider, AIR311 and
+# AIR312 deprecated with a newer home) know the whole Airflow 3 removal map and skip an
+# Airflow 2 import that sits in an ``except ImportError`` fallback behind its Airflow 3
+# path (ruff ``crates/ruff_linter/src/rules/airflow``, MIT). They need ruff 0.13 or later.
+# They do not skip other code in such a fallback, such as the ``datasets=`` keyword of the
+# Airflow 2 half of ``asset_or_time_schedule``, so a finding there is allowed: that branch
+# never runs on Airflow 3 (the live tests load both halves on 2.10 and 3.x).
+
+
+def _ruff() -> str:
+    ruff = shutil.which("ruff") or str(Path(sys.executable).with_name("ruff"))
+    if not Path(ruff).exists():
+        pytest.skip("ruff is not installed")
+    out = subprocess.run([ruff, "--version"], capture_output=True, text=True, check=False).stdout
+    parts = [int(p) for p in out.split()[-1].split(".")[:2]] if out.split() else [0, 0]
+    if parts < [0, 13]:
+        pytest.skip(f"ruff {out.strip()} predates the AIR3 rules")
+    return ruff
+
+
+def _air3(ruff: str, folder: Path) -> "subprocess.CompletedProcess[str]":
+    return subprocess.run(  # noqa: S603 - the repo's own dev tool
+        [
+            ruff,
+            "check",
+            "--isolated",
+            "--no-cache",
+            "--select",
+            "AIR3",
+            "--output-format",
+            "concise",
+            str(folder),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_ruff_finds_no_airflow_3_migration_issue_in_any_generated_dag(tmp_path: Path):
+    from fluid_build.schedulers.airflow import fluid_apply
+    from tests.schedulers.fluid_apply_fixtures import CASES, GRAPH_CASES
+
+    ruff = _ruff()
+    out = tmp_path / "dags"
+    out.mkdir()
+    for name, render in sorted(RENDERS.items()):
+        workdir = tmp_path / "work" / name.replace(" ", "_")
+        workdir.mkdir(parents=True)
+        (out / f"{name.replace(' ', '_').replace('-', '_')}.py").write_text(
+            render(workdir), encoding="utf-8"
+        )
+    for case, (contract, env, path) in {**CASES, **GRAPH_CASES}.items():
+        rendered = fluid_apply.render_fluid_apply_dags(contract, env=env, contract_path=path)
+        for file_name, source in rendered.items():
+            (out / f"{case}__{file_name}").write_text(source, encoding="utf-8")
+    proc = _air3(ruff, out)
+    assert proc.returncode in (0, 1), proc.stderr
+    outside = _outside_fallbacks(proc.stdout)
+    assert not outside, "\n".join(outside)
+
+
+def _fallback_lines(tree: ast.AST) -> set:
+    """Lines inside an ``except ImportError`` body whose ``try`` imports an Airflow 3 home."""
+    lines: set = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        imports_airflow3 = any(
+            isinstance(n, ast.ImportFrom) and (n.module or "").startswith(AIRFLOW3_HOMES)
+            for stmt in node.body
+            for n in ast.walk(stmt)
+        )
+        for handler in node.handlers:
+            if imports_airflow3 and _catches_import_error(handler):
+                for stmt in handler.body:
+                    lines.update(range(stmt.lineno, (stmt.end_lineno or stmt.lineno) + 1))
+    return lines
+
+
+def _outside_fallbacks(report: str) -> list:
+    """Ruff's concise findings that are not inside an Airflow 2 fallback branch."""
+    import re
+
+    found = []
+    for line in report.splitlines():
+        match = re.match(r"(.+?\.py):(\d+):\d+: (AIR\d+)", line)
+        if not match:
+            continue
+        path, number = Path(match.group(1)), int(match.group(2))
+        if number not in _fallback_lines(ast.parse(path.read_text(encoding="utf-8"))):
+            found.append(line)
+    return found
+
+
+def test_the_ruff_check_can_fail(tmp_path: Path):
+    ruff = _ruff()
+    (tmp_path / "old.py").write_text(
+        "from airflow.operators.bash import BashOperator\n"
+        "from airflow.utils.dates import days_ago\n"
+        "BashOperator(task_id='t', bash_command='true', start_date=days_ago(1))\n",
+        encoding="utf-8",
+    )
+    proc = _air3(ruff, tmp_path)
+    outside = _outside_fallbacks(proc.stdout)
+    assert any("AIR301" in f for f in outside) and any("AIR312" in f for f in outside)
+
+
+def test_a_finding_inside_an_airflow_2_fallback_is_allowed(tmp_path: Path):
+    ruff = _ruff()
+    (tmp_path / "shim.py").write_text(
+        "try:\n"
+        "    from airflow.sdk import Asset\n"
+        "except ImportError:\n"
+        "    from airflow.datasets import Dataset as Asset\n"
+        "    from airflow.timetables.datasets import DatasetOrTimeSchedule\n\n"
+        "    def schedule(timetable, assets):\n"
+        "        return DatasetOrTimeSchedule(timetable=timetable, datasets=assets)\n",
+        encoding="utf-8",
+    )
+    assert _outside_fallbacks(_air3(ruff, tmp_path).stdout) == []
