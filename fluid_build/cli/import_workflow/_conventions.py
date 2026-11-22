@@ -26,6 +26,11 @@ be silently ignored), and a size cap and the alias limits of
       write_table: {writes: table, arg: 1, format: iceberg}
     operators:                       # project operator classes that submit Spark work
       AcmeSparkOperator: spark_submit
+    drivers:                         # a script a task submits that runs jobs by name
+      - script: driver.py            #   (its file name, or its last segments)
+        argument: --job-list         #   the flag whose value names the list (or a position, 0..)
+        job_lists: {dir: libs/job_lists, file: "{value}.yaml", key: jobs}
+        jobs: {dir: libs/jobs, file: "{job}.py"}
     session_names: [spark, session]  # names whose .sql() and .table() are Spark's
     config_modules:                  # constants kept outside the scanned tree
       - {module: acme_config.settings, path: libs/acme_config/settings.py}
@@ -33,12 +38,16 @@ be silently ignored), and a size cap and the alias limits of
     environments:                    # what os.environ[...] holds in each
       prod: {ENV: prod}
       dev:  {ENV: dev}
+    airflow_variables:               # what Variable.get("x") and {{ var.value.x }} hold in each
+      prod: {environment: prod}
+      dev:  {environment: dev}
     defaults: {database: retail, domain: retail, platform: aws}
     catalogs:                        # the first part of a three-part table name
       glue: {platform: aws, format: iceberg, catalog: glue}
     layers: {raw: Bronze, curated: Silver, marts: Gold}   # database -> layer
     owners:                          # the owner label a DAG uses -> the contract's owner
       data-eng: {team: data-engineering, email: data-eng@example.com}
+    external_consumers: [gold.revenue_daily]  # read outside the scanned code (a dashboard, a team)
     ignore:
       tables: ["^tmp_", "_staging$"]   # regular expressions
       paths: ["^s3://lake/tmp/"]
@@ -52,6 +61,26 @@ refused, checked on the resolved path. So a conventions file cannot make the sca
 somewhere the user did not point it at, and it may sit in a folder of its own beside the
 repositories it describes (``config/conventions.yaml``).
 
+``external_consumers`` names the outputs that something outside the scanned code reads (a
+dashboard, another team's job): a table (``db.table`` or ``catalog.db.table``, in any case), a topic or a path as the
+code names it, or the product id the proposal gives it. The report flags an output that no scanned
+job reads and no consumer is declared for ("retire it, or name its consumer"); declaring one clears
+the flag on the next import.
+
+``drivers`` says how a submitted script that runs jobs by name is read: ``driver.py --job-list
+silver_orders`` runs the jobs the file ``silver_orders.yaml`` lists, each the module ``{job}.py``.
+Only data is read: the list is a YAML file in ``dir`` (bounded, safe, never run) whose ``key`` holds
+the job names (without ``key``, the file is the list), and each name is a file name in the jobs
+``dir``. The task is then joined to every job file the list names. A name or a value that is not a
+plain file name (a ``/``, a ``..``) and a path that leaves its ``dir`` are refused.
+
+``airflow_variables`` is read like ``environments``: the names of an Airflow Variable and what each
+holds in an environment. ``Variable.get("x")``, ``Variable.get("x", default_var=...)`` (Airflow 2),
+``Variable.get("x", default=...)`` (Airflow 3, ``airflow.sdk``) and ``{{ var.value.x }}`` in an
+operator's arguments are read as what the selected environment holds for ``x``. A Variable the file
+does not name stays unresolved: the default of ``get`` is not assumed, as it is not for
+``os.environ.get``. A Variable read as JSON is not read.
+
 An ``environments`` value is text and may be empty (``PREFIX: ""``, a table prefix that is empty
 in production): a variable the file names with an empty value has that value, and one it does not
 name is unresolved. A YAML null is refused, as it is neither of the two.
@@ -63,14 +92,16 @@ text each is matched against is cut at 256 characters.
 
 from __future__ import annotations
 
-import datetime
+import functools
 import re
 import string
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from ._airflow_dags import SUBMIT_KINDS
+from ._pysource import clean_chars
+from ._redact import sensitive_name
 from ._spark_io import HelperSpec
 
 DOC = "https://agenticstiger.github.io/forge_docs/cli/import.html"
@@ -88,10 +119,13 @@ _TOP_KEYS = frozenset(
         "paths",
         "helpers",
         "operators",
+        "drivers",
+        "external_consumers",
         "session_names",
         "config_modules",
         "environment",
         "environments",
+        "airflow_variables",
         "defaults",
         "catalogs",
         "layers",
@@ -132,6 +166,24 @@ class CatalogRule:
 
 
 @dataclass(frozen=True)
+class Driver:
+    """A script that runs jobs by name, picked by an argument (see the module docstring)."""
+
+    #: The submitted script's file name, or its trailing segments (``driver.py``, ``pkg/driver.py``).
+    script: str
+    #: The flag whose value names the job list (``--job-list``), or the argument's position.
+    argument: Union[int, str]
+    #: The directory of the job lists, and a list's file name with ``{value}`` where the argument's
+    #: value goes; ``key`` is where the names are in the file (the file itself when ``None``).
+    lists_dir: Path
+    list_file: str
+    list_key: Optional[str]
+    #: The directory of the job files, and a job file's name with ``{job}`` for a name.
+    jobs_dir: Path
+    job_file: str
+
+
+@dataclass(frozen=True)
 class Conventions:
     """The parsed conventions. ``Conventions()`` is the file with nothing in it."""
 
@@ -142,12 +194,20 @@ class Conventions:
     paths: Tuple[PathRule, ...] = ()
     helpers: Mapping[str, HelperSpec] = field(default_factory=dict)
     operators: Mapping[str, str] = field(default_factory=dict)
+    drivers: Tuple[Driver, ...] = ()
+    #: Outputs something outside the scanned code reads, lower case (see the module docstring).
+    external_consumers: Tuple[str, ...] = ()
     session_names: Tuple[str, ...] = ()
     #: ``{dotted module name: file}`` for constants kept outside the scanned tree.
     config_modules: Mapping[str, Path] = field(default_factory=dict)
     environment: Optional[str] = None
     #: What ``os.environ[...]`` holds in the selected environment.
     variables: Mapping[str, str] = field(default_factory=dict)
+    #: What each Airflow Variable holds in the selected environment.
+    airflow_variables: Mapping[str, str] = field(default_factory=dict)
+    #: The ``environments`` and ``airflow_variables`` entries of the selected environment that are
+    #: not used, as ``section.name`` (see :func:`_not_credentials`).
+    withheld: Tuple[str, ...] = ()
     default_database: Optional[str] = None
     domain: Optional[str] = None
     runtime_platform: Optional[str] = None
@@ -172,7 +232,12 @@ class Conventions:
 
 def _fail(path: Optional[Path], where: str, why: str) -> ConventionsError:
     at = f"{path.name}: " if path is not None else ""
-    return ConventionsError(f"{at}{where}: {why}")
+    # ``where`` holds the names the file gives: they are text from a file that came with a
+    # repository, an escape sequence in one would reach the terminal, and a key of 250 KB would
+    # make a message of that size. The names are cut so that the reason stays in the message.
+    named = where if len(where) <= 200 else where[:197] + "..."
+    message = clean_chars(f"{at}{named}: {why}")
+    return ConventionsError(message if len(message) <= 400 else message[:397] + "...")
 
 
 def _text(
@@ -182,6 +247,8 @@ def _text(
         raise _fail(path, where, "expected a non-empty string")
     if len(value) > MAX_TEXT:
         raise _fail(path, where, f"longer than {MAX_TEXT} characters")
+    if clean_chars(value) != value:  # these values reach the contracts and the terminal
+        raise _fail(path, where, "has a control or invisible character in it")
     if pattern is not None and not pattern.fullmatch(value.strip()):
         raise _fail(path, where, f"{value!r} is not an acceptable name")
     return value.strip()
@@ -286,7 +353,7 @@ def _local(
     try:
         root = base.resolve()
         resolved = (base / text).resolve()
-    except (OSError, RuntimeError) as exc:  # a link loop
+    except (OSError, RuntimeError, ValueError) as exc:  # a link loop, a NUL in the name
         raise _fail(path, where, f"{text!r} cannot be resolved ({type(exc).__name__})") from None
     if not any(resolved == inside or inside in resolved.parents for inside in (root, *named)):
         raise _fail(
@@ -299,21 +366,107 @@ def _local(
 
 
 def _env_value(value: Any, path: Optional[Path], where: str) -> str:
-    """What an environment variable holds, as written. The empty string is a value (a prefix that
-    is empty in production) and not the same as a variable the file does not name, which is
-    unresolved. A number or a date is the text it is written as; a null, a list or a mapping is
-    refused: none of them is a value the code could have read from the environment."""
-    if isinstance(value, str):
-        text = value
-    elif isinstance(value, (int, float, datetime.date)):  # a bool is an int
-        text = str(value)
-    else:
+    """What an environment variable or an Airflow Variable holds, as written. The empty string is
+    a value (a prefix that is empty in production) and not the same as one the file does not name,
+    which is unresolved. It must be text: YAML reads an unquoted ``1.10``, ``007``, ``yes`` or
+    ``2020-1-1`` as a number, a bool or a date, and the text it was written as is gone, so a
+    value that is not text is refused (a null, a list and a mapping too: none of them is a value
+    the code could have read)."""
+    if not isinstance(value, str):
         raise _fail(
-            path, where, 'expected text: write "" for an empty value, or leave the variable out'
+            path,
+            where,
+            'expected text: write "" for an empty value, put anything YAML would read as a number, '
+            "a yes/no or a date in quotes, or leave the variable out",
         )
-    if len(text) > MAX_TEXT:
+    if len(value) > MAX_TEXT:
         raise _fail(path, where, f"longer than {MAX_TEXT} characters")
+    return value
+
+
+#: Names of ``DEFAULT_SENSITIVE_FIELDS`` in Airflow's secrets masker that the importer's own
+#: judgement of a name (:func:`sensitive_name`) does not know. Airflow hides a name that contains
+#: one of them.
+_AIRFLOW_HIDDEN = ("keyfile_dict", "service_account")
+
+
+def _not_credentials(values: Mapping[str, str], section: str) -> Tuple[Dict[str, str], List[str]]:
+    """``values`` without the ones whose name says they are a credential (``db_password``,
+    ``API_TOKEN``: the judgement the rest of the importer uses for a name, which covers the names
+    Airflow itself hides in its logs), and ``section.name`` of each one left out. A value kept in
+    the conventions is written into the contracts where the code reads it; a credential is not,
+    so the code's own reference (``{{ var.value.db_password }}``, ``Variable.get(...)``) stays
+    as it is and the report says what to set."""
+    kept: Dict[str, str] = {}
+    left: List[str] = []
+    for name, value in values.items():
+        if sensitive_name(name) or any(part in name.lower() for part in _AIRFLOW_HIDDEN):
+            left.append(f"{section}.{name}")
+        else:
+            kept[name] = value
+    return kept, left
+
+
+_SCRIPT = re.compile(r"[A-Za-z0-9_.\-]+(/[A-Za-z0-9_.\-]+)*")
+_FLAG = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9_\-]*")
+_FILE_TEMPLATE = re.compile(r"[A-Za-z0-9_.\-]*\{(?P<name>value|job)\}[A-Za-z0-9_.\-]*")
+
+
+def _file_template(value: Any, path: Optional[Path], where: str, placeholder: str) -> str:
+    """A file name with ``{placeholder}`` in it once: a plain name, never a path."""
+    text = _text(value, path, where)
+    found = _FILE_TEMPLATE.fullmatch(text)
+    if found is None or found.group("name") != placeholder or ".." in text:
+        raise _fail(
+            path,
+            where,
+            f"{text!r} is not a file name with {{{placeholder}}} in it (letters, digits, "
+            "'_', '-' and '.', no '/')",
+        )
     return text
+
+
+def _argument(value: Any, path: Optional[Path], where: str) -> Union[int, str]:
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value < 0 or value > 1_000:
+            raise _fail(path, where, "a position is 0 or more")
+        return value
+    text = _text(value, path, where)
+    if not _FLAG.fullmatch(text):
+        raise _fail(path, where, f"{text!r} is not a flag such as --job-list, or a position")
+    return text
+
+
+def _driver(
+    raw: Any, base: Path, source: Optional[Path], where: str, named: Sequence[Path]
+) -> Driver:
+    entry = _mapping(raw, source, where, frozenset({"script", "argument", "job_lists", "jobs"}))
+    missing = sorted({"script", "argument", "job_lists", "jobs"} - set(entry))
+    if missing:
+        raise _fail(source, where, f"give {', '.join(missing)}")
+    script = _text(entry["script"], source, f"{where}.script", pattern=_SCRIPT)
+    if ".." in script.split("/"):
+        raise _fail(source, f"{where}.script", f"{script!r} has a '..' in it")
+    lists = _mapping(
+        entry["job_lists"], source, f"{where}.job_lists", frozenset({"dir", "file", "key"})
+    )
+    jobs = _mapping(entry["jobs"], source, f"{where}.jobs", frozenset({"dir", "file"}))
+    for block, needed in ((lists, "job_lists"), (jobs, "jobs")):
+        if not {"dir", "file"} <= set(block):
+            raise _fail(source, f"{where}.{needed}", "give dir and file")
+    return Driver(
+        script=script,
+        argument=_argument(entry["argument"], source, f"{where}.argument"),
+        lists_dir=_local(base, lists["dir"], source, f"{where}.job_lists.dir", named),
+        list_file=_file_template(lists["file"], source, f"{where}.job_lists.file", "value"),
+        list_key=(
+            _text(lists["key"], source, f"{where}.job_lists.key", pattern=_IDENT)
+            if "key" in lists
+            else None
+        ),
+        jobs_dir=_local(base, jobs["dir"], source, f"{where}.jobs.dir", named),
+        job_file=_file_template(jobs["file"], source, f"{where}.jobs.file", "job"),
+    )
 
 
 def _template(value: Any, path: Optional[Path], where: str) -> str:
@@ -455,6 +608,20 @@ def parse_conventions(
             )
         operators[name] = text
 
+    drivers = tuple(
+        _driver(raw, base, source, f"drivers[{index}]", named)
+        for index, raw in enumerate(_list(top.get("drivers", []), source, "drivers"))
+    )
+
+    external = tuple(
+        dict.fromkeys(
+            _text(item, source, f"external_consumers[{i}]").lower().rstrip("/")
+            for i, item in enumerate(
+                _list(top.get("external_consumers", []), source, "external_consumers")
+            )
+        )
+    )
+
     sessions = tuple(
         _text(item, source, f"session_names[{i}]", pattern=_IDENT)
         for i, item in enumerate(_list(top.get("session_names", []), source, "session_names"))
@@ -479,17 +646,40 @@ def parse_conventions(
             )
             for k, v in env.items()
         }
+    airflow_variables: Dict[str, Dict[str, str]] = {}
+    for name, raw in _mapping(
+        top.get("airflow_variables", {}), source, "airflow_variables"
+    ).items():
+        found = _mapping(raw, source, f"airflow_variables.{name}")
+        airflow_variables[name] = {
+            _text(k, source, f"airflow_variables.{name}", pattern=_NAME): _env_value(
+                v, source, f"airflow_variables.{name}.{k}"
+            )
+            for k, v in found.items()
+        }
+    named = sorted({*environments, *airflow_variables})
     environment = top.get("environment")
     if environment is not None:
         environment = _text(environment, source, "environment")
-        if environment not in environments:
-            raise _fail(source, "environment", f"{environment!r} is not named under environments")
-    elif len(environments) == 1:
-        environment = next(iter(environments))
-    elif environments:
-        raise _fail(
-            source, "environment", f"name the one to use ({', '.join(sorted(environments))})"
-        )
+        if environment not in named:
+            raise _fail(
+                source,
+                "environment",
+                f"{environment!r} is not named under environments or airflow_variables",
+            )
+    elif len(named) == 1:
+        environment = named[0]
+    elif named:
+        raise _fail(source, "environment", f"name the one to use ({', '.join(named)})")
+
+    chosen = environment or ""
+    used_variables, withheld = _not_credentials(
+        environments.get(chosen, {}), f"environments.{chosen}"
+    )
+    used_airflow, withheld_airflow = _not_credentials(
+        airflow_variables.get(chosen, {}), f"airflow_variables.{chosen}"
+    )
+    withheld = [*withheld, *withheld_airflow]
 
     defaults = _mapping(
         top.get("defaults", {}), source, "defaults", frozenset({"database", "domain", "platform"})
@@ -569,10 +759,14 @@ def parse_conventions(
         paths=tuple(rules),
         helpers=helpers,
         operators=operators,
+        drivers=drivers,
+        external_consumers=external,
         session_names=sessions,
         config_modules=modules,
         environment=environment,
-        variables=dict(environments.get(environment or "", {})),
+        variables=used_variables,
+        airflow_variables=used_airflow,
+        withheld=tuple(withheld),
         default_database=(
             _text(defaults["database"], source, "defaults.database", pattern=_NAME).lower()
             if "database" in defaults
@@ -592,6 +786,47 @@ def parse_conventions(
         ignore_files=ignore_files,
         id_template=id_template,
     )
+
+
+@functools.lru_cache(maxsize=1)
+def unique_key_loader() -> Any:
+    """A YAML loader that refuses a mapping that gives a key twice (YAML keeps the last, so a
+    declared consumer or a driver would go unseen), in the one pass that builds the value: its
+    ``DuplicateKey`` is what it raises, with the key and the line. A merge key (``<<``) may come
+    twice; a quoted ``"<<"`` is an ordinary key, and ``1`` and ``"1"`` are two."""
+    import yaml
+
+    class DuplicateKey(yaml.constructor.ConstructorError):
+        pass
+
+    class UniqueKeys(yaml.SafeLoader):
+        def construct_mapping(self, node: Any, deep: bool = False) -> Any:
+            if isinstance(node, yaml.MappingNode):
+                seen: Set[Any] = set()
+                for key_node, _value in node.value:
+                    if key_node.tag == "tag:yaml.org,2002:merge":
+                        continue
+                    try:
+                        key = self.construct_object(key_node, deep=True)
+                        known = key in seen
+                    except Exception:  # noqa: BLE001 - not a key; the loader says why
+                        continue
+                    if known:
+                        raise DuplicateKey(
+                            None, None, f"the key {key!r} is given twice", key_node.start_mark
+                        )
+                    seen.add(key)
+            return super().construct_mapping(node, deep=deep)
+
+    UniqueKeys.DuplicateKey = DuplicateKey  # type: ignore[attr-defined]
+    return UniqueKeys
+
+
+def duplicate_key_text(exc: Exception) -> str:
+    """What a :meth:`unique_key_loader` refusal says: the key, and the line it is on."""
+    mark = getattr(exc, "problem_mark", None)
+    line = f" (line {mark.line + 1})" if mark is not None else ""
+    return clean_chars(f"{getattr(exc, 'problem', 'a key is given twice')}{line}")[:200]
 
 
 def load_conventions(
@@ -635,8 +870,14 @@ def load_conventions(
         raise refusal(
             f"the conventions file {file.name} is too large", f"it is over {MAX_BYTES:,} bytes"
         )
+    loader = unique_key_loader()
     try:
-        document = load_yaml_safe(data.decode("utf-8"), max_bytes=MAX_BYTES)
+        document = load_yaml_safe(data.decode("utf-8"), max_bytes=MAX_BYTES, loader=loader)
+    except loader.DuplicateKey as exc:
+        raise refusal(
+            f"the conventions file {file.name} has a problem",
+            f"{duplicate_key_text(exc)}: YAML would keep the last",
+        ) from exc
     except Exception as exc:  # noqa: BLE001 - UnsafeYamlError, yaml's own errors, bad UTF-8
         raise refusal(
             f"the conventions file {file.name} is not valid YAML", type(exc).__name__

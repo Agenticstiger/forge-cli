@@ -22,7 +22,6 @@ from ._proposal import (
     ProposalTooLarge,
     TopicSchema,
     build_proposal,
-    safe_command,
     safe_text,
 )
 from ._pysource import SourceBudget
@@ -180,6 +179,10 @@ def topic_schema_reader(options: Mapping[str, Any]) -> Optional[TopicSchema]:
     return read
 
 
+#: Conventions values left out for their names, listed one by one in the report; the rest counted.
+MAX_WITHHELD_NAMES = 10
+
+
 def run_import(
     tool: str, source: str, options: Mapping[str, Any]
 ) -> Tuple[List[Dict[str, Any]], ImportReport]:
@@ -189,6 +192,16 @@ def run_import(
         options.get("conventions"), roots=_named_directories(tool, source, options)
     )
     report = ImportReport()
+    if conv.withheld:
+        shown = ", ".join(safe_text(name, 80) for name in conv.withheld[:MAX_WITHHELD_NAMES])
+        more = len(conv.withheld) - MAX_WITHHELD_NAMES
+        report.required_defaults.append(
+            f"{len(conv.withheld)} value(s) in the conventions are not used, because their names "
+            f"say they are credentials ({shown}{f', and {more} more' if more > 0 else ''}): "
+            "the code's own reference (`{{ var.value.name }}`, `Variable.get(...)`, "
+            "`os.environ[...]`) is kept as written, so set the real value where the job runs "
+            "(a secret store or the environment), not in a contract"
+        )
     root = _directory(
         source, "DAGs directory" if tool == "airflow" else "jobs directory", f"fluid import {tool}"
     )
@@ -212,6 +225,7 @@ def run_import(
                 conv,
                 project_root=dags_root.resolve().parent,
                 notes=report.notes,
+                budget=budget,
             )
     else:
         dag_scan = scan_dags(root, conv, budget)
@@ -222,7 +236,7 @@ def run_import(
             )
         scans = [scan_jobs(directory, conv, budget) for directory in roots]
         linked, unlinked = link_tasks(
-            dag_scan.dags, scans, conv, project_root=None, notes=report.notes
+            dag_scan.dags, scans, conv, project_root=None, notes=report.notes, budget=budget
         )
 
     _scan_report(tool, scans, dag_scan, linked, unlinked, report)
@@ -275,8 +289,10 @@ def _drop_tasks(contract: Dict[str, Any]) -> bool:
     return dropped
 
 
-#: ``fluid validate`` findings listed one by one in the report; the rest are counted.
+#: ``fluid validate`` findings listed one by one in the report; the rest are counted, and the
+#: products they are on are named (up to ``MAX_UNLISTED_PRODUCTS`` of them).
 MAX_RULE_LINES = 100
+MAX_UNLISTED_PRODUCTS = 30
 
 
 def _check_valid(contracts: Sequence[Dict[str, Any]], report: ImportReport) -> None:
@@ -304,6 +320,7 @@ def _check_valid(contracts: Sequence[Dict[str, Any]], report: ImportReport) -> N
         )
 
     listed = more = 0
+    unlisted: Dict[str, None] = {}  # the products with findings that are not listed, in order
     for contract in contracts:
         result = schema(contract)
         if not result.is_valid:
@@ -332,6 +349,7 @@ def _check_valid(contracts: Sequence[Dict[str, Any]], report: ImportReport) -> N
         for message in contract_rule_findings(contract, manager=manager, plugins=False).errors:
             if listed >= MAX_RULE_LINES:
                 more += 1
+                unlisted[str(contract["id"])] = None
                 continue
             listed += 1
             report.required_defaults.append(
@@ -339,9 +357,60 @@ def _check_valid(contracts: Sequence[Dict[str, Any]], report: ImportReport) -> N
                 f"person completes it: {safe_text(message, 400)}"
             )
     if more:
+        names = ", ".join(safe_text(pid, 80) for pid in list(unlisted)[:MAX_UNLISTED_PRODUCTS])
+        rest = len(unlisted) - MAX_UNLISTED_PRODUCTS
         report.required_defaults.append(
-            f"{more} more `fluid validate` finding(s) on these products are not listed"
+            f"{more} more `fluid validate` finding(s) are not listed, on {len(unlisted)} "
+            f"product(s): {names}" + (f" and {rest} more" if rest > 0 else "")
         )
+
+
+def _report_joins(linked: Sequence[LinkedTask], not_joined: int, report: ImportReport) -> None:
+    """The note on how many submitted scripts were joined to a job file, and by what, and a line
+    for each task joined by the file name alone."""
+    by_how: Dict[str, int] = {}
+    seen_submits: set = set()
+    for link in linked:
+        if id(link.submit) not in seen_submits:  # a driver's one script joins several jobs
+            seen_submits.add(id(link.submit))
+            by_how[link.how] = by_how.get(link.how, 0) + 1
+        if link.how == "name":
+            report.unsupported.append(
+                f"DAG {safe_text(link.dag.shown, 60)} task {safe_text(link.task.shown, 60)} submits "
+                f"{safe_text(link.submit.script or '', 100)}: joined to a job file by file name only"
+            )
+    through_driver = sum(1 for link in linked if link.how == "driver")
+    report.notes.append(
+        f"{len(seen_submits)} submitted script(s) joined to a job file"
+        + (
+            f" ({', '.join(f'{n} by {how}' for how, n in sorted(by_how.items()))})"
+            if by_how
+            else ""
+        )
+        + (f"; {through_driver} job file(s) run through a driver" if through_driver else "")
+        + f"; {not_joined} not joined"
+    )
+
+
+def _report_unlinked(
+    tool: str, unlinked: Sequence[Tuple[Any, Any, Any, str]], report: ImportReport
+) -> None:
+    """A line for each task whose script was not joined to a job file."""
+    for dag, task, submit, why in unlinked:
+        line = (
+            f"DAG {safe_text(dag.shown, 60)} task {safe_text(task.shown, 60)} "
+            f"({task.file}:{submit.line}) submits "
+            f"{safe_text(submit.script or submit.shown or '(no script)', 100)}: not joined ({safe_text(why, 120)})"
+        )
+        if tool == "airflow" and submit.script:
+            report.unsupported.append(
+                line + "; map its prefix under `script_roots` in the conventions, or run "
+                "`fluid import pyspark <jobs-dir> --dags <dags-dir>`"
+            )
+        elif tool == "airflow":
+            report.unsupported.append(line)
+        else:
+            report.notes.append(line)
 
 
 def _scan_report(
@@ -365,6 +434,7 @@ def _scan_report(
     for job in jobs:
         for note in job.facts.notes:
             report.unsupported.append(safe_text(note, 300))
+        report.notes.extend(safe_text(n, 300) for n in job.facts.remarks)
 
     if dag_scan is not None:
         tasks = [t for d in dag_scan.dags for t in d.tasks]
@@ -387,38 +457,8 @@ def _scan_report(
                         f"DAG {safe_text(dag.shown, 60)} task {safe_text(task.shown, 60)} "
                         f"({task.file}:{task.line}): {safe_text(note, 200)}"
                     )
-        by_how: Dict[str, int] = {}
-        for link in linked:
-            by_how[link.how] = by_how.get(link.how, 0) + 1
-            if link.how == "name":
-                report.unsupported.append(
-                    f"DAG {safe_text(link.dag.shown, 60)} task {safe_text(link.task.shown, 60)} submits "
-                    f"{safe_command(link.submit.script or '', 100)}: joined to a job file by file name only"
-                )
-        report.notes.append(
-            f"{len(linked)} submitted script(s) joined to a job file"
-            + (
-                f" ({', '.join(f'{n} by {how}' for how, n in sorted(by_how.items()))})"
-                if by_how
-                else ""
-            )
-            + f"; {len(unlinked)} not joined"
-        )
-        for dag, task, submit, why in unlinked:
-            line = (
-                f"DAG {safe_text(dag.shown, 60)} task {safe_text(task.shown, 60)} "
-                f"({task.file}:{submit.line}) submits "
-                f"{safe_command(submit.script or submit.shown or '(no script)', 100)}: not joined ({safe_text(why, 120)})"
-            )
-            if tool == "airflow" and submit.script:
-                report.unsupported.append(
-                    line + "; map its prefix under `script_roots` in the conventions, or run "
-                    "`fluid import pyspark <jobs-dir> --dags <dags-dir>`"
-                )
-            elif tool == "airflow":
-                report.unsupported.append(line)
-            else:
-                report.notes.append(line)
+        _report_joins(linked, len(unlinked), report)
+        _report_unlinked(tool, unlinked, report)
         no_dag = [j for j in jobs if not j.tasks]
         if tool == "pyspark" and no_dag:
             report.notes.append(f"{len(no_dag)} job(s) are submitted by no DAG task read here")

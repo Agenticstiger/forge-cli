@@ -279,3 +279,15 @@ def test_callers_report_a_refused_file_as_unreadable(
     monkeypatch.setattr(validators, "_openapi_validator_available", lambda: True)
     issues = validators.validate_openapi("api.yaml", bomb.encode(), strict=True)
     assert [issue.code for issue in issues] == ["OAS-PARSE"]
+
+
+def test_a_loader_subclass_builds_the_value_with_or_without_aliases() -> None:
+    class Upper(yaml.SafeLoader):
+        pass
+
+    Upper.add_constructor(
+        "tag:yaml.org,2002:str", lambda loader, node: loader.construct_scalar(node).upper()
+    )
+    assert load_yaml_safe("a: x", loader=Upper) == {"A": "X"}
+    assert load_yaml_safe("a: &v x\nb: *v", loader=Upper) == {"A": "X", "B": "X"}
+    assert load_yaml_safe("a: x") == {"a": "x"}  # the default loader is the safe one

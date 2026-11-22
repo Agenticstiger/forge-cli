@@ -10,6 +10,8 @@ directory that might hold a DAG (:func:`._pysource.might_contain_dag`) with
 
 How a submitted script is matched to a job file, in order:
 
+0. the conventions' ``drivers``: a script that runs jobs by name (``driver.py --job-list
+   silver_orders``) is joined to every job file the named list holds (:mod:`._drivers`);
 1. the conventions' ``script_roots``: ``s3://code/jobs/orders.py`` under the root
    ``s3://code/jobs/ -> jobs`` is the local file ``jobs/orders.py``;
 2. a relative path that exists inside the project (the DAGs directory's parent);
@@ -30,7 +32,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from ._airflow_dags import Dag, Submit, Task, read_dags
 from ._catalogs import module_settings
-from ._conventions import Conventions
+from ._conventions import Conventions, Driver
+from ._drivers import Lists, argument_value, driver_for, job_file, segments
 from ._fold import ModuleIndex
 from ._pysource import (
     MAX_TOTAL_BYTES,
@@ -67,7 +70,8 @@ class LinkedTask:
     dag: Dag
     task: Task
     submit: Submit
-    #: ``script_root``, ``project``, ``path`` (more than the file name matched) or ``name``.
+    #: ``script_root``, ``project``, ``path`` (more than the file name matched), ``name``, or
+    #: ``driver`` (the task runs a driver whose job list names this job).
     how: str
 
 
@@ -142,10 +146,12 @@ def scan_jobs(
     index = ModuleIndex(
         walk.files,
         variables=conventions.variables,
+        airflow_variables=conventions.airflow_variables,
         extra=conventions.config_modules,
         budget=budget,
     )
     sessions = set(DEFAULT_SESSION_NAMES) | set(conventions.session_names)
+    path_rules = tuple((rule.prefix, rule.table is not None) for rule in conventions.paths)
     kept = 0
     for position, source in enumerate(walk.files):
         if kept > MAX_REFS_PER_SCAN:
@@ -166,6 +172,7 @@ def scan_jobs(
             helpers=conventions.helpers,
             session_names=sessions,
             shown=shown,
+            path_rules=path_rules,
         )
         scan.catalogs.extend(module_settings(module, folder))
         kept += len(facts.reads) + len(facts.writes)
@@ -201,6 +208,7 @@ def scan_dags(
     index = ModuleIndex(
         walk.files,
         variables=conventions.variables,
+        airflow_variables=conventions.airflow_variables,
         extra=conventions.config_modules,
         budget=budget,
     )
@@ -254,13 +262,6 @@ def _stays_inside(relative: str) -> bool:
     return ".." not in text.split("/")
 
 
-def _segments(script: str) -> List[str]:
-    text = script.split("?")[0]
-    if "://" in text:
-        text = text.split("://", 1)[1]
-    return [s for s in text.replace("\\", "/").split("/") if s and s not in {".", ".."}]
-
-
 def local_script(
     script: str, conventions: Conventions, project_root: Optional[Path]
 ) -> Optional[Path]:
@@ -282,47 +283,121 @@ def local_script(
     return None
 
 
+def _driven(
+    driver: Driver,
+    submit: Submit,
+    lists: Lists,
+    by_path: Dict[Path, JobRecord],
+    notes: Optional[List[str]],
+    reported: set,
+) -> "List[JobRecord] | str":
+    """The job files the job list a driver is given names, or why the task is not joined."""
+    value = argument_value(driver, submit.args)
+    if isinstance(value, tuple):
+        return value[0]
+    names = lists.names(driver, value)
+    if isinstance(names, str):
+        return names
+    found: Dict[Path, JobRecord] = {}
+    missing: List[str] = []
+    for name in dict.fromkeys(names):
+        job = by_path.get(job_file(driver, name))
+        if job is None:
+            missing.append(name)
+        else:
+            found.setdefault(job.path, job)
+    if missing and notes is not None and (driver.script, value) not in reported:
+        reported.add((driver.script, value))
+        shown = ", ".join(clean_chars(m) for m in missing[:10]) + (
+            ", ..." if len(missing) > 10 else ""
+        )
+        notes.append(
+            f"the job list {clean_chars(value)} names {len(missing)} job(s) with no job file that "
+            f"does Spark reads or writes here: {shown}"
+        )
+    if not found:
+        return f"no job of the list {clean_chars(value)} is a job file read here"
+    return list(found.values())
+
+
+class _Resolver:
+    """What a submit runs: the job files it names and how it was matched, or why it is not joined.
+    A script text answers the same every time (the tasks of a project share a few), and so does a
+    driver run, so each is worked out once."""
+
+    def __init__(
+        self,
+        jobs: Sequence[JobRecord],
+        conventions: Conventions,
+        project_root: Optional[Path],
+        notes: Optional[List[str]],
+        budget: Optional[SourceBudget],
+    ) -> None:
+        self._conventions = conventions
+        self._project_root = project_root
+        self._notes = notes
+        self._by_path = {job.path: job for job in jobs}
+        self._by_name: Dict[str, List[JobRecord]] = {}
+        for job in jobs:
+            self._by_name.setdefault(job.rel.rsplit("/", 1)[-1], []).append(job)
+        self._lists = Lists(budget) if conventions.drivers else None
+        self._answers: Dict[str, "Tuple[JobRecord, str] | str"] = {}
+        self._driven: Dict[Tuple[str, Tuple[str, ...]], "List[JobRecord] | str"] = {}
+        self._reported: set = set()
+
+    def resolve(self, submit: Submit) -> "Tuple[Sequence[JobRecord], str] | str":
+        script = submit.script
+        if script is None:
+            return submit.why or "no script"
+        driver = driver_for(script, self._conventions.drivers) if self._lists else None
+        if driver is not None and self._lists is not None:
+            key = (script, submit.args)
+            runs = self._driven.get(key)
+            if runs is None:
+                runs = self._driven[key] = _driven(
+                    driver, submit, self._lists, self._by_path, self._notes, self._reported
+                )
+            return runs if isinstance(runs, str) else (runs, "driver")
+        found = self._answers.get(script)
+        if found is None:
+            found = self._answers[script] = _match(
+                script, self._by_name, self._by_path, self._conventions, self._project_root
+            )
+        return found if isinstance(found, str) else ([found[0]], found[1])
+
+
 def link_tasks(
     dags: Sequence[Dag],
     scans: Sequence[JobScan],
     conventions: Conventions,
     project_root: Optional[Path],
     notes: Optional[List[str]] = None,
+    budget: Optional[SourceBudget] = None,
 ) -> Tuple[List[LinkedTask], List[Tuple[Dag, Task, Submit, str]]]:
-    """Join every submit of every task to a job file of ``scans``. Returns ``(linked,
+    """Join every submit of every task to the job files of ``scans`` it runs. Returns ``(linked,
     unlinked)``; an unlinked submit comes with why. A job records at most
-    :data:`MAX_TASKS_PER_JOB` tasks (the rest are counted in ``notes``)."""
-    jobs = [job for scan in scans for job in scan.jobs]
-    by_path = {job.path: job for job in jobs}
-    by_name: Dict[str, List[JobRecord]] = {}
-    for job in jobs:
-        by_name.setdefault(job.rel.rsplit("/", 1)[-1], []).append(job)
-    #: A script text answers the same every time: the tasks of a project share a few.
-    answers: Dict[str, "Tuple[JobRecord, str] | str"] = {}
+    :data:`MAX_TASKS_PER_JOB` tasks (the rest are counted in ``notes``). ``budget`` is what the
+    job lists the conventions' ``drivers`` name are read against."""
+    resolver = _Resolver(
+        [job for scan in scans for job in scan.jobs], conventions, project_root, notes, budget
+    )
     over: Dict[str, int] = {}
     linked: List[LinkedTask] = []
     unlinked: List[Tuple[Dag, Task, Submit, str]] = []
-    for dag in dags:
-        for task in dag.tasks:
-            for submit in task.submits:
-                if submit.script is None:
-                    unlinked.append((dag, task, submit, submit.why or "no script"))
-                    continue
-                found = answers.get(submit.script)
-                if found is None:
-                    found = answers[submit.script] = _match(
-                        submit.script, by_name, by_path, conventions, project_root
-                    )
-                if isinstance(found, str):
-                    unlinked.append((dag, task, submit, found))
-                    continue
-                job, how = found
-                if len(job.tasks) >= MAX_TASKS_PER_JOB:
-                    over[job.shown] = over.get(job.shown, 0) + 1
-                    continue
-                link = LinkedTask(dag, task, submit, how)
-                job.tasks.append(link)
-                linked.append(link)
+    submits = ((dag, task, submit) for dag in dags for task in dag.tasks for submit in task.submits)
+    for dag, task, submit in submits:
+        found = resolver.resolve(submit)
+        if isinstance(found, str):
+            unlinked.append((dag, task, submit, found))
+            continue
+        targets, how = found
+        for job in targets:
+            if len(job.tasks) >= MAX_TASKS_PER_JOB:
+                over[job.shown] = over.get(job.shown, 0) + 1
+                continue
+            link = LinkedTask(dag, task, submit, how)
+            job.tasks.append(link)
+            linked.append(link)
     if notes is not None:
         for shown, count in sorted(over.items()):
             notes.append(
@@ -345,7 +420,7 @@ def _match(
         if job is not None:
             mapped = any(script.startswith(prefix) for prefix, _ in conventions.script_roots)
             return job, "script_root" if mapped else "project"
-    wanted = _segments(script)
+    wanted = segments(script)
     if not wanted:
         return "the script path is empty"
     scored: List[Tuple[int, JobRecord]] = []

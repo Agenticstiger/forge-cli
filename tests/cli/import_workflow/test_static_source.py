@@ -316,7 +316,7 @@ def test_names_are_read_when_assigned_once_in_their_scope():
         "C = 'two'\n"
         "D: str = 'typed'\n"
         "for E in ['p']:\n    pass\n"
-        "F = 'f'\nF += 'g'\n"
+        "F = 'f'\nif 1:\n    F += 'g'\n"
         "G, H = 'g', 'h'\n"
         "def fn():\n    pass\n"
         "class K:\n    pass\n"

@@ -30,7 +30,7 @@ import unicodedata
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 #: A source file larger than this is not read (300 KB: a job or a DAG file is a few KB, and a
 #: dense one costs about a kilobyte and a half of memory per byte of source once it is parsed).
@@ -254,6 +254,10 @@ class Module:
     tree: ast.Module
     imports: Dict[str, str]
     _parents: Optional[Dict[ast.AST, ast.AST]] = None
+    #: The places a name is imported from, for each name the file imports from more than one (the
+    #: table keeps the last), and ``"*"`` (no places) when it has a star import: any name may come
+    #: from it.
+    ambiguous: Dict[str, FrozenSet[str]] = field(default_factory=dict)
     #: Bytes of source it was parsed from.
     size: int = 0
     #: How many syntax-tree nodes it has: what keeping it parsed costs.
@@ -303,6 +307,7 @@ def parse_module(rel: str, data: bytes) -> Module:
         rel=rel,
         tree=tree,
         imports=import_table(tree),
+        ambiguous=ambiguous_imports(tree),
         size=len(data),
         nodes=sum(1 for _ in ast.walk(tree)),
     )
@@ -335,6 +340,32 @@ def import_table(tree: ast.AST) -> Dict[str, str]:
                     full = f"{base}.{alias.name}"
                 table[alias.asname or alias.name] = full
     return table
+
+
+def ambiguous_imports(tree: ast.AST) -> Dict[str, FrozenSet[str]]:
+    """The places each name that ``tree`` imports from more than one is imported from, and ``"*"``
+    when it has a star import (see :attr:`Module.ambiguous`)."""
+    places: Dict[str, set] = {}
+    star = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            pairs = [((a.asname or a.name.split(".")[0]), a.name) for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            base = "." * node.level + (node.module or "")
+            pairs = []
+            for alias in node.names:
+                if alias.name == "*":
+                    star = True
+                else:
+                    pairs.append((alias.asname or alias.name, f"{base}.{alias.name}"))
+        else:
+            continue
+        for name, target in pairs:
+            places.setdefault(name, set()).add(target)
+    found = {name: frozenset(where) for name, where in places.items() if len(where) > 1}
+    if star:
+        found["*"] = frozenset()
+    return found
 
 
 def qualified_name(node: ast.AST, imports: Dict[str, str]) -> Optional[str]:

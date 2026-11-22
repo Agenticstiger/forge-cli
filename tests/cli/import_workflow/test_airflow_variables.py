@@ -1,0 +1,489 @@
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
+
+"""Airflow Variables read from the conventions: ``Variable.get(...)`` and ``{{ var.value.x }}``.
+
+A DAG that takes its environment from a Variable at parse time, or an operator argument that is a
+``{{ var.value.x }}`` template, depends on what the Airflow deployment holds. The operator says
+what the environment being read holds, per environment, as it does for ``os.environ``; a Variable
+nobody named stays unresolved and nothing is invented.
+"""
+
+from __future__ import annotations
+
+import ast
+import textwrap
+from typing import Any
+
+import pytest
+import yaml
+
+from fluid_build.cli.import_workflow import _conventions as C
+from fluid_build.cli.import_workflow._airflow_dags import fill_variable_templates, read_dags
+from fluid_build.cli.import_workflow._fold import (
+    FoldedDict,
+    FoldedList,
+    FoldedTuple,
+    Folder,
+    Unresolved,
+)
+from fluid_build.cli.import_workflow._pysource import parse_module
+
+AF2 = "from airflow.models import Variable\n"
+
+
+def fold(source: str, **variables: str) -> Any:
+    module = parse_module("dag.py", textwrap.dedent(source).encode("utf-8"))
+    folder = Folder(module, airflow_variables=variables)
+    found = None
+    for node in module.tree.body:
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == "x":
+            found = node
+    assert found is not None
+    return folder.fold(found.value)
+
+
+def why(value: Any) -> str:
+    assert isinstance(value, Unresolved), value
+    return value.why
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        'Variable.get("environment")',
+        'Variable.get("environment", "dev")',  # the default is not assumed: the name is declared
+        'Variable.get("environment", default_var="dev")',  # Airflow 2
+        'Variable.get("environment", default="dev")',  # Airflow 3, airflow.sdk
+        'Variable.get(key="environment")',
+        'Variable.get("environment", None, False)',
+        'Variable.get("environment", deserialize_json=False)',
+    ],
+)
+def test_a_variable_the_conventions_name_is_what_they_say(call):
+    assert fold(f"{AF2}x = {call}\n", environment="prod") == "prod"
+
+
+@pytest.mark.parametrize(
+    "imports",
+    [
+        "from airflow.models import Variable",
+        "from airflow.models.variable import Variable",
+        "from airflow.sdk import Variable",
+        "from airflow.sdk.definitions.variable import Variable",
+        "from airflow.models import Variable as V\nVariable = V",
+        "import airflow.models\nVariable = airflow.models.Variable",
+        "try:\n    from airflow.sdk import Variable\nexcept ImportError:\n    from airflow.models import Variable",
+    ],
+)
+def test_the_variable_class_is_found_by_where_it_is_imported_from(imports):
+    source = f'{imports}\nx = Variable.get("environment")\n'
+    value = fold(source, environment="prod")
+    if "Variable = " in imports:  # an assignment is a name assigned once: not a class import
+        assert isinstance(value, Unresolved)
+    else:
+        assert value == "prod"
+
+
+def test_an_alias_of_the_import_is_the_variable_class_too():
+    assert (
+        fold(
+            'from airflow.sdk import Variable as V\nx = V.get("environment")\n', environment="prod"
+        )
+        == "prod"
+    )
+    assert (
+        fold('import airflow.sdk as sdk\nx = sdk.Variable.get("environment")\n', environment="prod")
+        == "prod"
+    )
+
+
+def test_a_variable_nobody_named_stays_unresolved_and_its_default_is_not_assumed():
+    value = fold(f'{AF2}x = Variable.get("other", "dev")\n', environment="prod")
+    assert why(value) == "the Airflow Variable other"
+    assert (
+        why(fold(f'{AF2}x = Variable.get("environment")\n')) == "the Airflow Variable environment"
+    )
+
+
+def test_a_value_that_is_empty_is_a_value():
+    assert fold(f'{AF2}x = Variable.get("prefix")\n', prefix="") == ""
+
+
+@pytest.mark.parametrize(
+    "call, reason",
+    [
+        ('Variable.get("environment", deserialize_json=True)', "read as JSON"),
+        ('Variable.get("environment", None, True)', "read as JSON"),
+        ('Variable.get("environment", deserialize_json=flag)', "read as JSON"),
+        ("Variable.get(name)", "name is not a constant"),
+        ("Variable.get()", "with no name"),
+    ],
+)
+def test_a_variable_that_cannot_be_read_says_why(call, reason):
+    assert reason in why(fold(f"{AF2}x = {call}\n", environment="prod"))
+
+
+def test_a_class_of_the_project_named_variable_is_not_airflows():
+    source = 'from acme.settings import Variable\nx = Variable.get("environment")\n'
+    assert "call" in why(fold(source, environment="prod"))
+
+
+def test_a_variable_is_part_of_what_a_string_is_built_from():
+    value = fold(f"{AF2}x = f\"{{Variable.get('environment')}}_orders\"\n", environment="prod")
+    assert value == "prod_orders"
+    value = fold(
+        f'{AF2}ENV = Variable.get("environment")\nx = {{"dev": 1, "prod": 2}}[ENV]\n',
+        environment="prod",
+    )
+    assert value == 2
+
+
+# ── {{ var.value.x }} in a string ─────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("{{ var.value.env }}", "prod"),
+        ("{{var.value.env}}", "prod"),
+        ("{{   var.value.env   }}", "prod"),
+        ('{{ var.value["env"] }}', "prod"),
+        ("{{ var.value['env'] }}", "prod"),
+        ("s3://{{ var.value.env }}-bucket/{{ var.value.env }}", "s3://prod-bucket/prod"),
+        ("{{ var.value.missing }}", "{{ var.value.missing }}"),  # nobody named it: as written
+        ("{{ ds }} {{ var.value.env }}", "{{ ds }} prod"),
+        ("{{ var.json.env }}", "{{ var.json.env }}"),
+        ("{{ var.value.env | upper }}", "{{ var.value.env | upper }}"),
+        ("{{ var.value.env ~ 'x' }}", "{{ var.value.env ~ 'x' }}"),
+        ("{{ var.value.get('env') }}", "{{ var.value.get('env') }}"),
+        ("no template", "no template"),
+        ("{{ var.value.a-b }}", "{{ var.value.a-b }}"),
+    ],
+)
+def test_a_variable_template_is_filled_in_where_the_name_is_declared(text, expected):
+    assert fill_variable_templates(text, {"env": "prod"}) == expected
+
+
+def test_a_template_is_filled_once_not_again_in_what_it_was_filled_with():
+    assert (
+        fill_variable_templates("{{ var.value.a }}", {"a": "{{ var.value.b }}", "b": "x"})
+        == "{{ var.value.b }}"
+    )
+
+
+def test_templates_are_filled_in_what_a_list_a_tuple_and_a_dict_hold():
+    pieces = FoldedList(["{{ var.value.env }}", 3, None, ["{{ var.value.env }}"]])
+    pieces.complete = False
+    filled = fill_variable_templates(pieces, {"env": "prod"})
+    assert filled == ["prod", 3, None, ["prod"]]
+    assert isinstance(filled, FoldedList) and filled.complete is False
+    assert isinstance(
+        fill_variable_templates(FoldedTuple(["{{ var.value.env }}"]), {"env": "prod"}), FoldedTuple
+    )
+    mapped = FoldedDict({"a": "{{ var.value.env }}", "b": {"c": "{{ var.value.env }}"}})
+    assert fill_variable_templates(mapped, {"env": "prod"}) == {"a": "prod", "b": {"c": "prod"}}
+    unresolved = Unresolved("why", "text")
+    assert fill_variable_templates(unresolved, {"env": "prod"}) is unresolved
+    assert fill_variable_templates(["{{ var.value.env }}"], {"env": "prod"}) == ["prod"]
+
+
+def test_with_no_variables_nothing_is_copied_or_changed():
+    value = ["{{ var.value.env }}"]
+    assert fill_variable_templates(value, {}) is value
+
+
+# ── the conventions file ──────────────────────────────────────────────
+
+
+def load(text: str) -> C.Conventions:
+    return C.parse_conventions(__import__("yaml").safe_load(textwrap.dedent(text)))
+
+
+def test_the_variables_of_the_selected_environment_are_kept():
+    conv = load(
+        """
+        environment: prod
+        environments: {prod: {ENV: prod}}
+        airflow_variables:
+          prod: {environment: prod, prefix: ""}
+          dev: {environment: dev}
+        """
+    )
+    assert dict(conv.airflow_variables) == {"environment": "prod", "prefix": ""}
+    assert dict(conv.variables) == {"ENV": "prod"}
+
+
+def test_an_environment_may_be_named_by_the_variables_alone():
+    assert dict(load("airflow_variables: {only: {a: b}}").airflow_variables) == {"a": "b"}
+    conv = load("environment: dev\nairflow_variables: {prod: {a: p}, dev: {a: d}}")
+    assert conv.environment == "dev" and dict(conv.airflow_variables) == {"a": "d"}
+
+
+def test_an_environment_without_variables_has_none():
+    conv = load(
+        "environment: dev\nenvironments: {dev: {X: '1'}}\nairflow_variables: {prod: {a: p}}"
+    )
+    assert dict(conv.airflow_variables) == {}
+
+
+@pytest.mark.parametrize(
+    "text, expect",
+    [
+        ("airflow_variables: {a: {x: '1'}, b: {x: '2'}}", "name the one to use (a, b)"),
+        (
+            "environment: c\nairflow_variables: {a: {x: '1'}}",
+            "not named under environments or airflow_variables",
+        ),
+        ("airflow_variables: {a: {x: }}", 'write ""'),
+        ("airflow_variables: {a: {x: [1]}}", 'write ""'),
+        ("airflow_variables: {a: {'a b': x}}", "not an acceptable name"),
+        ("airflow_variables: [a]", "expected a mapping"),
+        ("airflow_variables: {a: [x]}", "expected a mapping"),
+    ],
+)
+def test_a_variables_block_that_is_wrong_is_refused_with_the_key_named(text, expect):
+    with pytest.raises(C.ConventionsError) as refused:
+        load(text)
+    assert expect in str(refused.value)
+
+
+def test_the_names_of_the_two_blocks_are_chosen_among_together():
+    conv = load("environments: {a: {X: '1'}}\nairflow_variables: {b: {y: '2'}}\nenvironment: b")
+    assert (
+        conv.environment == "b"
+        and dict(conv.variables) == {}
+        and dict(conv.airflow_variables) == {"y": "2"}
+    )
+    with pytest.raises(C.ConventionsError):
+        load(
+            "environments: {a: {X: '1'}}\nairflow_variables: {b: {y: '2'}}"
+        )  # two names, none chosen
+
+
+# ── what a review of the first version found ─────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "shadow",
+    [
+        "class Variable:\n    @staticmethod\n    def get(key):\n        return 'other'",
+        "Variable = Foo()",
+        "def Variable():\n    pass",
+        "for Variable in []:\n    pass",
+    ],
+)
+def test_a_variable_the_file_defines_itself_is_not_airflows(shadow):
+    source = f'{AF2}{shadow}\nx = Variable.get("environment")\n'
+    assert isinstance(fold(source, environment="prod"), Unresolved)
+
+
+def test_a_parameter_named_variable_is_not_airflows():
+    source = f'{AF2}\n\ndef f(Variable):\n    return Variable.get("environment")\n'
+    module = parse_module("dag.py", textwrap.dedent(source).encode("utf-8"))
+    folder = Folder(module, airflow_variables={"environment": "prod"})
+    call = next(n for n in ast.walk(module.tree) if isinstance(n, ast.Call))
+    assert isinstance(folder.fold(call), Unresolved)
+
+
+def test_an_import_that_is_not_shadowed_still_works_inside_a_function():
+    source = f'{AF2}\n\ndef f():\n    return Variable.get("environment")\n'
+    module = parse_module("dag.py", textwrap.dedent(source).encode("utf-8"))
+    folder = Folder(module, airflow_variables={"environment": "prod"})
+    call = next(n for n in ast.walk(module.tree) if isinstance(n, ast.Call))
+    assert folder.fold(call) == "prod"
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        'Variable.get("environment", **{"deserialize_json": True})',
+        'Variable.get("environment", **options)',
+        "Variable.get(*args)",
+        'Variable.get("environment", *rest)',
+    ],
+)
+def test_a_variable_read_through_star_arguments_is_not_read(call):
+    assert "arguments" in why(fold(f"{AF2}options = {{}}\nx = {call}\n", environment="prod"))
+
+
+def test_a_template_is_filled_only_where_airflow_renders_one():
+    module = parse_module(
+        "dag.py",
+        textwrap.dedent(
+            """
+            from airflow import DAG
+            from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+
+            with DAG(
+                dag_id="{{ var.value.env }}_orders",
+                schedule="{{ var.value.cron }}",
+                tags=["{{ var.value.env }}"],
+                description="{{ var.value.env }}",
+                default_args={"owner": "{{ var.value.own }}"},
+            ):
+                SparkSubmitOperator(
+                    task_id="load_{{ var.value.env }}",
+                    owner="{{ var.value.own }}",
+                    application="s3://{{ var.value.env }}/job.py",
+                    application_args=["--env", "{{ var.value.env }}"],
+                )
+            """
+        ).encode("utf-8"),
+    )
+    folder = Folder(module, airflow_variables={"env": "prod", "cron": "0 1 * * *", "own": "alice"})
+    dag = read_dags(module, folder).dags[0]
+    assert dag.dag_id == "{{ var.value.env }}_orders"
+    assert dag.schedule == "{{ var.value.cron }}"
+    assert list(dag.tags) == ["{{ var.value.env }}"]
+    task = dag.tasks[0]
+    assert task.task_id == "load_{{ var.value.env }}"
+    assert task.owner == "{{ var.value.own }}"
+    submit = task.submits[0]
+    assert submit.script == "s3://prod/job.py"
+    assert list(submit.args) == ["--env", "prod"]
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        "def f():\n    global Variable\n    Variable = None",
+        "(Variable := object)",
+        "match 1:\n    case Variable:\n        pass",
+        "del Variable",
+        "globals()['Variable'] = object",
+    ],
+)
+def test_a_variable_the_file_rebinds_in_a_way_that_is_not_an_assignment_is_not_airflows(setup):
+    source = f'{AF2}{setup}\nx = Variable.get("environment")\n'
+    assert isinstance(fold(source, environment="prod"), Unresolved)
+
+
+def test_a_name_imported_from_two_places_is_not_airflows_unless_both_are():
+    source = (
+        "import sys\nif sys.version_info[0] > 5:\n    from mylib import Variable\n"
+        'else:\n    from airflow.models import Variable\nx = Variable.get("environment")\n'
+    )
+    assert isinstance(fold(source, environment="prod"), Unresolved)
+    both = (
+        "try:\n    from airflow.sdk import Variable\nexcept ImportError:\n"
+        '    from airflow.models import Variable\nx = Variable.get("environment")\n'
+    )
+    assert fold(both, environment="prod") == "prod"
+
+
+def test_a_star_import_may_define_the_name_so_it_is_not_airflows():
+    source = f'{AF2}from mylib import *\nx = Variable.get("environment")\n'
+    assert isinstance(fold(source, environment="prod"), Unresolved)
+
+
+# ── a Variable whose name says it is a credential is not substituted ─────────────────
+
+#: ``DEFAULT_SENSITIVE_FIELDS`` of ``airflow.utils.log.secrets_masker`` (Airflow 2.x and 3.x): the
+#: names Airflow hides in its own logs and UI. The importer must treat each as a credential.
+AIRFLOW_SENSITIVE_FIELDS = (
+    "access_token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "passphrase",
+    "passwd",
+    "password",
+    "private_key",
+    "secret",
+    "token",
+    "keyfile_dict",
+    "service_account",
+    "access_key",
+)
+
+
+@pytest.mark.parametrize("field", AIRFLOW_SENSITIVE_FIELDS)
+@pytest.mark.parametrize("shape", ["{}", "db_{}", "{}_prod", "DB_{}"])
+def test_the_names_airflow_hides_are_not_substituted(field, shape):
+    name = shape.format(field)
+    conv = load(f"airflow_variables: {{only: {{{name}: 'Q-secret-value', retail_region: eu}}}}")
+    assert dict(conv.airflow_variables) == {"retail_region": "eu"}
+    assert conv.withheld == (f"airflow_variables.only.{name}",)
+    # the code's reference stays as written: nothing is filled in for the name
+    assert (
+        fill_variable_templates(f"{{{{ var.value.{name} }}}}", conv.airflow_variables)
+        == f"{{{{ var.value.{name} }}}}"
+    )
+
+
+def test_a_name_that_is_no_credential_is_substituted_as_before():
+    conv = load("airflow_variables: {only: {retail_region: eu, bucket_name: tb, keyspace: ks}}")
+    assert dict(conv.airflow_variables) == {
+        "retail_region": "eu",
+        "bucket_name": "tb",
+        "keyspace": "ks",
+    }
+    assert conv.withheld == ()
+    assert fill_variable_templates("{{ var.value.retail_region }}", conv.airflow_variables) == "eu"
+
+
+def test_an_environment_value_with_a_credential_name_is_not_substituted():
+    conv = load(
+        "environments: {only: {DB_PASSWORD: Q-secret-value, API_TOKEN: Q-token, REGION: eu}}"
+    )
+    assert dict(conv.variables) == {"REGION": "eu"}
+    assert set(conv.withheld) == {"environments.only.DB_PASSWORD", "environments.only.API_TOKEN"}
+
+
+def test_only_the_selected_environment_is_judged():
+    conv = load(
+        """
+        environment: dev
+        airflow_variables:
+          prod: {db_password: Q1, region: eu}
+          dev: {region: us}
+        """
+    )
+    assert dict(conv.airflow_variables) == {"region": "us"} and conv.withheld == ()
+
+
+def test_a_variable_read_in_code_for_a_credential_name_stays_unresolved():
+    conv = load("airflow_variables: {only: {db_password: Q-secret-value}}")
+    value = fold(f'{AF2}x = Variable.get("db_password")\n', **conv.airflow_variables)
+    assert "db_password" in why(value)
+
+
+def test_the_report_says_which_values_are_left_out_and_nothing_of_them(tmp_path, monkeypatch):
+    from fluid_build.cli.import_workflow.pyspark import PySparkImporter
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "jobs").mkdir()
+    (tmp_path / "dags").mkdir()
+    (tmp_path / "jobs" / "job.py").write_text(
+        "from pyspark.sql import SparkSession\n"
+        "spark = SparkSession.builder.getOrCreate()\n"
+        "spark.read.parquet('s3://src/in').write.parquet('s3://b/out')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "dags" / "d.py").write_text(
+        "from airflow import DAG\n"
+        "from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator\n"
+        "with DAG('d1'):\n"
+        "    SparkSubmitOperator(task_id='t', application='jobs/job.py',\n"
+        "        application_args=['--region', '{{ var.value.retail_region }}',\n"
+        "                          '--conn', '{{ var.value.db_password }}'])\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "c.yaml").write_text(
+        "airflow_variables:\n  only: {retail_region: eu, db_password: Q-secret-value}\n",
+        encoding="utf-8",
+    )
+    contracts, report = PySparkImporter().import_to_contracts(
+        str(tmp_path / "jobs"),
+        options={"dags": str(tmp_path / "dags"), "conventions": str(tmp_path / "c.yaml")},
+    )
+    text = yaml.safe_dump(contracts) + "\n".join(report.required_defaults)
+    assert "Q-secret-value" not in text
+    assert "{{ var.value.db_password }}" in text  # the reference is kept
+    assert "eu" in yaml.safe_dump(contracts) and "var.value.retail_region" not in text
+    assert [
+        x
+        for x in report.required_defaults
+        if "airflow_variables.only.db_password" in x and "credentials" in x
+    ]

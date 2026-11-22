@@ -7,7 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.37.0] — 2026-11-22
+
 ### Added
+
+- **`fluid import airflow|pyspark` reads an estate whose code builds its commands in loops, picks
+  its jobs by name, takes its environment from Airflow Variables, and groups its products by DAG
+  task.** What a measured sample estate lost, each read without running anything: a writer or reader
+  held in a variable that later assignments only add to (`writer = writer.trigger(a)` in one arm of
+  an `if`, `writer = writer.trigger(b)` in the other) is followed by the flow of its body (a use
+  after the `if` has had either arm or none, a use inside an arm only that arm's), the stream is
+  proposed and its trigger is every one that can apply, `continuous` when any keeps running; `ARGS
+  += [...]` (also inside a `for` over a dict or list that folds, up to 500 items) builds a list or a
+  string, read after the last addition; a path that only folds at its beginning
+  (`f"{LANDING}/orders/dt={run_date}/"`) is the table the first `paths` rule gives its prefix and
+  first segment; `Variable.get("x")` (Airflow 2 `default_var`, Airflow 3 `default`) and `{{
+  var.value.x }}` in an operator's script, arguments or `bash_command` are read from the new
+  conventions key `airflow_variables` (per environment, like `environments`; a Variable nobody named
+  stays unresolved and its default is not assumed); the new key `drivers` joins a task that submits
+  a script running jobs by name (`driver.py --job-list silver_orders`) to every job file the list
+  names (a safe YAML file of at most 16 KB, read once; a name or a value that is not a plain file
+  name and a path that leaves its directory are refused); `--split-by task` makes one product of the
+  outputs of every job a DAG task runs; and a product that no scanned job reads and no new
+  `external_consumers` entry names is flagged in the report ("retire it, or name its consumer")
+  while its contract is still proposed. An environment or Variable value in the conventions must be
+  text: YAML turns an unquoted `1.10`, `007` or `yes` into another value, so such a value is
+  refused, with the key named, until it is quoted. A product lists the reads that feed it when the
+  code says (the statement that writes it, the DataFrame it is made of, followed through names
+  assigned once or more, and through a write the conventions ignore, a staging path being found by
+  any spelling of it: `s3a` for `s3`, `file:///`, a glob, a partition below it), not all of its
+  job's: a job of 440 `INSERT ... SELECT` took 49 s to check and takes 2.5 s, and one of 2,000
+  writes over 99 reads took 67 s and takes 5 s. Where the code does not say, the products list
+  every read no single write owns as before, and past 40,000 listed reads in all each lists fewer
+  (500 down to 5) and the report says so. A product describes only the streams of the outputs it
+  owns (at most 20 listed, the rest counted, and a proposal whose stream text is past 16,000,000
+  characters is refused with the `--split-by job` hint), the loads of a name are sorted into their
+  scopes once per file and charged to the flow budget, a conventions value whose name says it is a
+  credential (`db_password`, `API_TOKEN`, the names Airflow hides in its own logs) is not
+  substituted (the code's reference stays as written and the report lists the names), and a bare
+  Oracle login with a service name (`scott/pw@ORCL`) is masked after an Oracle client, `userid=`,
+  `-u` or `--dsn`, and as an argument of its own when the user and the service read like names
+  (`pkg/mod@v1.2.3` and `org/repo@main` are left alone).
 
 - **A released Spark stream that fails is rolled back to the last good config.** After `fluid
   apply` starts a stream's new config over a previous one (a running run it replaced, or one that
@@ -175,6 +215,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plan applies what it planned. A partitioned Hive table cannot be adopted yet: its
   partition trigger is new to the state, so OpenTofu plans its replacement, and the run
   is refused saying so.
+
 - **A Spark build can run the team's own prebuilt PySpark package by its sha256 digest, and
   forge's runner owns the write.** `builds[].properties.package` (0.7.7 preview) on an
   `engine: spark` embedded-logic batch build names a `.whl` or `.zip` (`uri`), its `sha256` and an
@@ -586,6 +627,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid import` no longer shows part of a credential that it could not read whole, masks a bare
+  Oracle login, and names the products whose findings it does not list.** An argument or a command
+  too long to read (4,096 and 20,000 characters) was cut and what was left shown, so a credential
+  the cut had split (an Oracle login, a long URL password, a key without its `-----END`) could be
+  shown in part; only its size is shown now. Characters that hide a credential from a rule (a
+  zero-width one) are removed before the rules read the text, not after. An apostrophe in a comment
+  or a here-document no longer pairs with a quote lines below it and hides a `--password` there; a
+  script in a quoted word is read line by line; a credential nested deeper than the words are read
+  is hidden with its word; a long JSON secret is masked whole. A login written as a plain word or
+  an option's value (`scott/tiger@db:1521/ORCL`, `scott/tiger@//db/ORCL`, a password in double
+  quotes, an IPv6 host) has its password masked; it leaked when it was not a JDBC URL, and an
+  image digest, a time or a dotted path is not taken for one. Past 100 `fluid validate` findings
+  the report named no product: it names up to 30 of those that have findings left over. A
+  conventions file that gives a key twice is refused (YAML kept the last), and an escape sequence
+  in a key does not reach the terminal.
 - **`fluid validate-artifacts` no longer reports a declared dotfile as missing.** A file the
   MANIFEST lists whose name starts with `.` (a scaffold's `.gitlab-ci.yml`) was skipped when the
   directory was read, so stage 4 failed with `MANIFEST-MISSING-FILE`; only an undeclared hidden
