@@ -134,6 +134,9 @@ class ShipOptions:
     # What marks this build as a change request, when custom-scaffold was left out of
     # stage 3 for it (leave_scaffold_out_on_change_request); "" otherwise.
     scaffold_left_out: str = ""
+    # --require-artifacts named custom-scaffold when it was left out: such a run may check
+    # the change, never seal a release or publish (check_withheld_requirement).
+    scaffold_required_left_out: bool = False
 
 
 @dataclass
@@ -341,6 +344,7 @@ def leave_scaffold_out_on_change_request(opts: ShipOptions, env: Mapping[str, st
     rest = [part for part in named if part != SCAFFOLD_KEY]
     opts.scaffold_left_out = marker
     opts.emit = ",".join(rest)
+    opts.scaffold_required_left_out = SCAFFOLD_KEY in opts.require_artifacts
     opts.require_artifacts = tuple(k for k in opts.require_artifacts if k != SCAFFOLD_KEY)
     if not rest:
         opts.generate_artifacts = False
@@ -911,6 +915,33 @@ def check_preconditions(
             produced.add(PLAN_PATH)
         if num == 3 and opts.generate_artifacts:
             produced.add(ARTIFACTS_DIR.rstrip("/"))
+
+
+def check_withheld_requirement(
+    selected: Collection[int], opts: ShipOptions, *, releases: bool
+) -> None:
+    """Refuse a run that would seal a release (``releases``: ``--release-dir``) or publish
+    while the ``custom-scaffold`` it requires was left out for a change-request build.
+
+    A build that only checks a change cannot meet the requirement, so it is dropped there;
+    but a build marked by mistake (a Tekton run without ``-p FLUID_CHANGE_REQUEST=false``, a
+    misspelt value) would otherwise seal or publish a release without an artifact the
+    pipeline requires.
+    """
+    if not opts.scaffold_required_left_out:
+        return
+    if releases:
+        what = "seals no release"
+    elif 10 in selected and not dry_run_applied_nothing(opts):
+        what = "publishes nothing"
+    else:
+        return
+    raise ShipUsageError(
+        f"--require-artifacts {SCAFFOLD_KEY} cannot be met on a change-request build "
+        f"({opts.scaffold_left_out}), where its bundle templates never run, so this run "
+        f"{what}: run it from a default-branch build (a Tekton run passes "
+        f"-p FLUID_CHANGE_REQUEST=false), or leave {SCAFFOLD_KEY} out of --require-artifacts"
+    )
 
 
 def check_required_artifacts(

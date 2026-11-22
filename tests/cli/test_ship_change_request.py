@@ -203,3 +203,81 @@ def test_fluid_ship_runs_stage_three_without_the_scaffold_on_a_merge_request(
     assert argv[argv.index("--emit") + 1] == "odcs"
     out = capsys.readouterr().out
     assert "custom-scaffold" in out and "CI_MERGE_REQUEST_IID" in out
+
+
+# ── a required scaffold, and a release or a publish ───────────────────────
+
+REQUIRE_SCAFFOLD = ["--emit", "odcs,custom-scaffold", "--require-artifacts", "custom-scaffold"]
+
+
+def test_a_marked_release_run_that_requires_the_scaffold_is_refused() -> None:
+    """A build marked by mistake (a Tekton default-branch run that left out
+    ``-p FLUID_CHANGE_REQUEST=false``, a misspelt value) never seals a release without the
+    artifact the pipeline requires."""
+    opts = _opts(REQUIRE_SCAFFOLD, {"FLUID_CHANGE_REQUEST": "true"})
+    with pytest.raises(st.ShipUsageError) as raised:
+        st.check_withheld_requirement([1, 2, 3, 4], opts, releases=True)
+    message = str(raised.value)
+    assert "cannot be met" in message and "seals no release" in message
+    assert "-p FLUID_CHANGE_REQUEST=false" in message
+
+
+def test_a_marked_run_that_publishes_is_refused_too() -> None:
+    opts = _opts(REQUIRE_SCAFFOLD, JENKINS_PR)
+    with pytest.raises(st.ShipUsageError, match="publishes nothing"):
+        st.check_withheld_requirement(list(st.STAGE_NUMBERS), opts, releases=False)
+    dry = _opts([*REQUIRE_SCAFFOLD, "--dry-run"], JENKINS_PR)
+    st.check_withheld_requirement(list(st.STAGE_NUMBERS), dry, releases=False)  # no publish
+
+
+def test_a_merge_request_check_still_drops_the_requirement() -> None:
+    """A genuine change-request build that seals and publishes nothing only checks the
+    change: the requirement it can never meet is dropped, and the run goes on."""
+    argv = ["--emit", "odcs,custom-scaffold", "--require-artifacts", "odcs,custom-scaffold"]
+    opts = _opts(argv, {"CI_MERGE_REQUEST_IID": "12"})
+    ship._check_run([1, 2, 3, 4, 5, 6], {}, opts, None)
+    assert opts.require_artifacts == ("odcs",) and opts.scaffold_required_left_out
+
+
+def test_a_default_branch_release_keeps_the_requirement() -> None:
+    opts = _opts(REQUIRE_SCAFFOLD, {})
+    st.check_withheld_requirement([1, 2, 3, 4], opts, releases=True)
+    assert opts.require_artifacts == ("custom-scaffold",)
+    assert not opts.scaffold_required_left_out
+
+
+def _ship_here(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _RecordStages:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "contract.fluid.yaml").write_text(yaml.safe_dump(_contract(), sort_keys=False))
+    for name in ("FLUID_ENV", "GENERATE_EMIT", "FLUID_RUN_ID", *st.STAGE_TOGGLES.values()):
+        monkeypatch.delenv(name, raising=False)
+    fake = _RecordStages()
+    monkeypatch.setattr(ship.subprocess, "run", fake)
+    return fake
+
+
+def test_fluid_ship_seals_no_release_on_a_mis_marked_default_branch_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake = _ship_here(tmp_path, monkeypatch)
+    monkeypatch.setenv("FLUID_CHANGE_REQUEST", "true")
+    release = tmp_path / "rel"
+    argv = ["--stage", "1-4", *REQUIRE_SCAFFOLD, "--release-dir", str(release)]
+    with caplog.at_level(logging.ERROR):
+        rc = ship.run(_parse([*argv, "--ci-output", "plain"]), LOG)
+    assert rc == ship.report.EXIT_USAGE
+    assert fake.calls == [] and not release.exists()
+    assert "cannot be met on a change-request build" in caplog.text
+
+
+def test_fluid_ship_still_checks_a_merge_request_that_requires_the_scaffold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _ship_here(tmp_path, monkeypatch)
+    monkeypatch.setenv("CI_MERGE_REQUEST_IID", "12")
+    (tmp_path / "runtime").mkdir()
+    (tmp_path / st.BUNDLE_PATH).write_bytes(b"stage 1 output stand-in")
+    ship.run(_parse(["--stage", "3", *REQUIRE_SCAFFOLD, "--ci-output", "plain"]), LOG)
+    argv = fake.calls[0]
+    assert argv[:2] == ["generate", "artifacts"]
+    assert argv[argv.index("--emit") + 1] == "odcs"

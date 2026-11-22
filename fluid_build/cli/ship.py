@@ -387,6 +387,7 @@ def _check_run(
     """Every refusal a run makes once it knows its stages (exit 2, no report)."""
     st.check_preconditions(selected, opts)
     st.check_required_artifacts(selected, not_selected, opts)
+    st.check_withheld_requirement(selected, opts, releases=release_dir is not None)
     problem = release.refusal(release_dir, selected, not_selected, opts)
     if problem:
         raise st.ShipUsageError(problem)
