@@ -59,6 +59,9 @@ Ask, in the chat, before any of these, and say what each one risks:
 - `--adopt-shared-container`: it takes ownership of a shared container.
 - `--adopt-tables`: it takes over existing tables another process made (each only
   if it matches the contract); plan it first with `fluid plan --tofu --adopt-tables`.
+- `--allow-iceberg-update`: it updates a live Iceberg table in place, which can revert a
+  commit its writers make meanwhile; the user pauses the writers first, and plans it with
+  `fluid plan --tofu --allow-iceberg-update`.
 - `--yes` on apply, or an environment other than `dev`.
 
 ## When a gate fails
@@ -77,6 +80,11 @@ Ask, in the chat, before any of these, and say what each one risks:
 | `apply_plan_digest_tofu_plan_target` | another state backend than the plan's | apply with the plan's `--state-backend` |
 | `apply_plan_digest_tofu_plan_state_missing` | the plan was made on state this runner does not have (local state) | apply where it was planned, or use a remote state backend |
 | data-loss refusal | the change would drop data | stop and ask the user |
+| `iceberg_table_update_in_place` | the plan would update a live Iceberg table in place | plan again with `fluid plan --tofu`, which leaves it as it is; ask the user before `--allow-iceberg-update` |
 
 A `…target_field_unbound` or `…target_provider_unbound` warning is not a failure: the plan is
 not bound to that account, project, region or host. Tell the user which one before you apply.
+
+An `iceberg_table_update_held` warning is not a failure either: the apply left a live Iceberg
+table as it is, and the contract's change to it waits. Tell the user what waits and the note's
+remedy (a change through the table's Iceberg catalog, or the flag with the writers paused).

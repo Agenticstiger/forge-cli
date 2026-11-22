@@ -31,7 +31,7 @@ import tempfile
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.iac import build_module, get_iac_plugin, runner, target_identity
@@ -69,6 +69,7 @@ from fluid_build.iac.state_migration import reconcile_state_key as _reconcile_st
 from fluid_build.observability.secret_redactor import redact_secret_text
 
 from . import _apply_table_adoption as _table_adoption
+from . import _apply_table_hold as _table_hold
 from ._apply_cc_report import current_report
 from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
 from ._logging import info, warn
@@ -200,13 +201,21 @@ def _apply_via_opentofu(
             raise _plan_failure(eng.plugin, eng.contract, plan, eng.workdir, eng.env)
         changes = runner.change_summary(plan)
         cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
+        shown = _shown_for_review(eng, changes, tables=tables)
+        # A live Iceberg table the plan would update in place is left as it is, unless
+        # --allow-iceberg-update (``_apply_table_hold``), whatever brought it in.
+        held = _table_hold.to_hold(args, _table_hold.planned_updates(eng.plugin, eng.module, shown))
         # Before the data-loss gate: a table that differs is refused naming what differs.
         adoption = _table_adoption.check_plan(
-            eng.plugin, eng.module, tables, _shown_for_adoption(eng, tables), logger
+            eng.plugin, eng.module, tables, _read(shown), logger, held=held
         )
-        plan, changes, _ = _plan_holding_adopted_tables(eng, adoption, plan, changes)
+        plan, changes, shown = _plan_holding_tables(
+            eng, logger, held, adoption, plan, changes, shown
+        )
         _record_planned(eng, changes, dry_run)
-        destroyed = _review_plan(eng, args, logger, changes, runner.planned_removals(plan))
+        destroyed, updated = _review_plan(
+            eng, args, logger, changes, runner.planned_removals(plan), shown=shown
+        )
         if dry_run:
             _preview_outside_opentofu(eng, logger, destroyed, changes)
             return 0
@@ -219,6 +228,7 @@ def _apply_via_opentofu(
         imported.keep()
 
     _table_adoption.audit_take_over(logger, adoption.reviews)
+    _table_hold.audit_updated(logger, updated)
     return _finish_apply(eng, logger, changes, destroyed, applied_state)
 
 
@@ -261,34 +271,55 @@ def _tables_through_import_blocks(
     return tables
 
 
-def _plan_holding_adopted_tables(
-    eng: _Engine, adoption: Any, plan: Any, changes: Dict[str, int]
-) -> Tuple[Any, Dict[str, int], Optional[Dict[str, Any]]]:
-    """``(plan, changes, shown)`` the run goes on with: the same plan, or, when an adopted
-    table the plugin keeps as it is would be updated in place (an Iceberg table), the
-    plan made again with that table's own drift left alone and checked to import it with
-    no change at all. ``shown`` is the new plan as ``tofu show -json`` prints it, ``None``
-    when the plan was not made again."""
-    if not _table_adoption.hold_still(eng.module_path, adoption):
-        return plan, changes, None
+def _plan_holding_tables(
+    eng: _Engine,
+    logger: logging.Logger,
+    held: Mapping[str, Any],
+    adoption: Any,
+    plan: Any,
+    changes: Dict[str, int],
+    shown: Any,
+) -> Tuple[Any, Dict[str, int], Any]:
+    """``(plan, changes, shown)`` the run goes on with: the same plan, or, when it would
+    update in place a table the plugin keeps as it is (a live Iceberg table), the plan made
+    again with the held attributes in that table's ``ignore_changes``, checked to leave it
+    with no change at all (``_apply_table_hold``). ``shown`` is the plan the run goes on
+    with as ``tofu show -json`` prints it (:func:`_shown_for_review`)."""
+    if not _table_hold.hold_still(eng.module_path, held):
+        return plan, changes, shown
     again = runner.tofu_plan(eng.workdir, out_file=_WORKDIR_PLAN, env=eng.env)
     if not again.ok:
         raise _plan_failure(eng.plugin, eng.contract, again, eng.workdir, eng.env)
     changes = runner.change_summary(again)
     cprint(
         f"  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']} "
-        "(again: adopted Iceberg tables left as they are)"
+        "(again: live Iceberg tables left as they are)"
     )
     shown = runner.tofu_show_plan(eng.workdir, plan_file=_WORKDIR_PLAN, env=eng.env)
-    _table_adoption.check_held(shown, adoption)
+    _table_hold.check_held(shown, held, adopted=adoption.addresses)
+    _table_hold.say_held(logger, held)
     return again, changes, shown
 
 
-def _shown_for_adoption(eng: _Engine, tables: List[Any]) -> Optional[Dict[str, Any]]:
-    """The saved plan as ``tofu show -json`` prints it, when there are tables to check."""
-    if not tables:
-        return None
+#: A plan no review has read back yet (``None`` is one ``tofu show -json`` could not read).
+_UNREAD: Any = object()
+
+
+def _shown_for_review(
+    eng: _Engine, changes: Mapping[str, int], shown: Any = _UNREAD, *, tables: Sequence[Any] = ()
+) -> Any:
+    """The saved plan as ``tofu show -json`` prints it, read once for the reviews that need
+    it: the tables to adopt, and an in-place update the plugin may hold
+    (``_apply_table_hold.may_hold``). ``shown`` as it is when a review read it already, and
+    :data:`_UNREAD` when none needs it."""
+    if shown is not _UNREAD or not (tables or _table_hold.may_hold(eng.plugin, changes)):
+        return shown
     return runner.tofu_show_plan(eng.workdir, plan_file=_WORKDIR_PLAN, env=eng.env)
+
+
+def _read(shown: Any) -> Optional[Dict[str, Any]]:
+    """``shown`` for a reader that takes a plan or ``None``."""
+    return None if shown is _UNREAD else shown
 
 
 def _verify_registry_at_apply(
@@ -491,12 +522,15 @@ def _review_plan(
     removals: List[Tuple[str, str]],
     *,
     enforce: bool = True,
-) -> List[Dict[str, Any]]:
+    shown: Any = _UNREAD,
+    recorded: Optional[List[str]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Any]]:
     """What the saved plan in the workdir does beyond its counts, then the data-loss gate.
 
-    Returns the plan's deletes for the plugin's ``prepare_destroys``. With
-    ``enforce=False`` (``fluid plan --tofu``) the gate only says whether the apply
-    will need ``--allow-data-loss``: the flag belongs to the apply that runs it.
+    Returns the plan's deletes for the plugin's ``prepare_destroys``, and the in-place
+    updates of live Iceberg tables the run may make (``_apply_table_hold.review``;
+    ``recorded``: those a saved plan's record names). With ``enforce=False`` (``fluid plan
+    --tofu``) the gates only say what the apply will refuse: the flags belong to the apply.
     """
     # Revoking a grant destroys a member resource and loses no data: only the
     # removals of data-bearing resources reach the data-loss gate.
@@ -521,9 +555,10 @@ def _review_plan(
             + ", ".join(built)
         )
     _report_plan_notices(eng.plugin, eng.contract, logger)
+    shown = _shown_for_review(eng, changes, shown)
     # In-place updates that delete data — a dropped column — which the destroy
     # count above never sees (``~`` in the summary, not ``-``).
-    lost_in_place = _in_place_changes(eng.plugin, changes, eng.workdir, eng.env)
+    lost_in_place = _in_place_changes(eng.plugin, changes, eng.workdir, eng.env, shown)
 
     # Report what the plan's ``lifecycle.ignore_changes`` deliberately hides.
     # Without this, a contract whose column types no longer match the live
@@ -531,16 +566,24 @@ def _review_plan(
     # destructive ``--mode replace``, where the operator reasonably reads
     # "apply complete" as "the table now matches the contract".
     _report_suppressed_drift(eng.plugin, eng.contract, eng.workdir, eng.env, args, logger)
-
+    # The backstop of the Iceberg hold: a live Iceberg table the plan still updates in place.
+    updated = _table_hold.review(
+        eng.plugin, eng.module, shown, args, changes, recorded=recorded, enforce=enforce
+    )
     if not enforce:
-        if _data_loss_blocked(data_changes, False) or lost_in_place:
-            cprint(
-                "  ⚠️  this plan destroys or changes existing data: `fluid apply` will refuse "
-                "it unless given --allow-data-loss"
-            )
-        return []
+        _say_data_loss_ahead(data_changes, lost_in_place)
+        return [], updated
     _enforce_data_loss_gate(args, logger, eng.provider, changes, data_changes, lost_in_place)
-    return _planned_destroys(eng.plugin, changes, eng.workdir, eng.env)
+    return _planned_destroys(eng.plugin, changes, eng.workdir, eng.env), updated
+
+
+def _say_data_loss_ahead(data_changes: Mapping[str, int], lost_in_place: List[str]) -> None:
+    """``fluid plan --tofu``: say whether the apply will need ``--allow-data-loss``."""
+    if _data_loss_blocked(data_changes, False) or lost_in_place:
+        cprint(
+            "  ⚠️  this plan destroys or changes existing data: `fluid apply` will refuse "
+            "it unless given --allow-data-loss"
+        )
 
 
 def _preview_outside_opentofu(
@@ -707,12 +750,13 @@ def _plan_with_opentofu(
             "plan_tofu_show_failed",
             {"error": f"`tofu show -json {_WORKDIR_PLAN}` failed in {eng.workdir}"},
         )
+    held = _table_hold.to_hold(args, _table_hold.planned_updates(eng.plugin, eng.module, shown))
     # Before the data-loss reading, and before any file is written next to plan.json.
-    adoption = _table_adoption.check_plan(eng.plugin, eng.module, tables, shown, logger)
-    plan, changes, held = _plan_holding_adopted_tables(eng, adoption, plan, changes)
-    if held is not None:
-        shown = held
-    _review_plan(eng, args, logger, changes, runner.planned_removals(plan), enforce=False)
+    adoption = _table_adoption.check_plan(eng.plugin, eng.module, tables, shown, logger, held=held)
+    plan, changes, shown = _plan_holding_tables(eng, logger, held, adoption, plan, changes, shown)
+    _, updated = _review_plan(
+        eng, args, logger, changes, runner.planned_removals(plan), enforce=False, shown=shown
+    )
 
     saved = (Path(eng.workdir) / _WORKDIR_PLAN).read_bytes()
     os.chmod(Path(eng.workdir) / _WORKDIR_PLAN, 0o600)
@@ -757,6 +801,8 @@ def _plan_with_opentofu(
             if adoption.reviews
             else {}
         ),
+        # Under planDigest too: the live Iceberg tables it updates in place, as asked.
+        **_table_hold.record_field(updated),
         "target": target,
     }
 
@@ -1081,19 +1127,7 @@ def _apply_bound_plan(
     _write_private(plan_path, saved)
     shown = runner.tofu_show_plan(eng.workdir, plan_file=_WORKDIR_PLAN, env=eng.env)
     if shown is None:
-        raise CLIError(
-            1,
-            "apply_tofu_plan_unreadable",
-            {
-                "error": f"`tofu show -json` could not read the saved plan {record['planFile']}",
-                "remediation": [
-                    "The plan needs the OpenTofu version and providers it was made with; "
-                    + "re-run `fluid plan --tofu` where you apply.",
-                    "A plan made with FLUID_STATE_ENCRYPTION set is read only with the same "
-                    + "setting, and one made without it only without it.",
-                ],
-            },
-        )
+        raise _unreadable_saved_plan(record)
     # Before the hooks: a stale plan is refused before anything outside OpenTofu runs.
     _refuse_stale_before_hooks(eng, record)
     changes = runner.saved_plan_changes(shown)
@@ -1102,8 +1136,13 @@ def _apply_bound_plan(
         f"+{changes['add']} ~{changes['change']} -{changes['remove']}"
     )
     _table_adoption.say_bound(record)
+    # None under --no-verify-plan-binding: the record is unbound, and the apply's own flag decides.
+    recorded = _table_hold.say_bound(args, record, logger)
     _record_planned(eng, changes, dry_run)
-    destroyed = _review_plan(eng, args, logger, changes, runner.saved_plan_removals(shown))
+    removals = runner.saved_plan_removals(shown)
+    destroyed, updated = _review_plan(
+        eng, args, logger, changes, removals, shown=shown, recorded=recorded
+    )
     if dry_run:
         _preview_outside_opentofu(eng, logger, destroyed, changes)
         return 0
@@ -1113,7 +1152,25 @@ def _apply_bound_plan(
     _table_adoption.audit_take_over(
         logger, adopted_tables if isinstance(adopted_tables, list) else []
     )
+    _table_hold.audit_updated(logger, updated)
     return _finish_apply(eng, logger, changes, destroyed, applied_state, bound=True)
+
+
+def _unreadable_saved_plan(record: Mapping[str, Any]) -> CLIError:
+    """``fluid apply plan.json``: ``tofu show -json`` could not read the saved plan."""
+    return CLIError(
+        1,
+        "apply_tofu_plan_unreadable",
+        {
+            "error": f"`tofu show -json` could not read the saved plan {record['planFile']}",
+            "remediation": [
+                "The plan needs the OpenTofu version and providers it was made with; "
+                + "re-run `fluid plan --tofu` where you apply.",
+                "A plan made with FLUID_STATE_ENCRYPTION set is read only with the same "
+                + "setting, and one made without it only without it.",
+            ],
+        },
+    )
 
 
 def _check_plan_target(record: Mapping[str, Any], provider: str, target: "StateTarget") -> None:
@@ -2200,7 +2257,11 @@ def _refuse_unadopted(
 
 
 def _in_place_changes(
-    plugin: Any, changes: Mapping[str, int], workdir: str, env: Mapping[str, str]
+    plugin: Any,
+    changes: Mapping[str, int],
+    workdir: str,
+    env: Mapping[str, str],
+    shown: Any = _UNREAD,
 ) -> List[str]:
     """What the plan's in-place updates do to existing data, one line per change.
 
@@ -2216,7 +2277,8 @@ def _in_place_changes(
     review = getattr(plugin, "plan_data_changes", None)
     if not callable(review) or not int(changes.get("change", 0)):
         return []
-    shown = runner.tofu_show_plan(workdir, plan_file="tfplan", env=env)
+    if shown is _UNREAD:
+        shown = runner.tofu_show_plan(workdir, plan_file="tfplan", env=env)
     if shown is None:
         return ["the saved plan could not be read back, so a dropped column cannot be ruled out"]
     try:

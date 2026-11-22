@@ -402,9 +402,10 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
     ),
     **_register(
         NOT_A_CONTRACT,
-        "the OpenTofu module the engine emitted (main.tf.json), given its import blocks and "
-        "the ignore_changes of an adopted Iceberg table for --adopt-tables",
-        *_site("cli/_apply_table_adoption.py", "write_import_blocks", "hold_still"),
+        "the OpenTofu module the engine emitted (main.tf.json), given its import blocks for "
+        "--adopt-tables and the ignore_changes of a live Iceberg table it leaves as it is",
+        *_site("cli/_apply_table_adoption.py", "write_import_blocks"),
+        *_site("cli/_apply_table_hold.py", "hold_still"),
     ),
     **_register(
         NOT_A_CONTRACT,

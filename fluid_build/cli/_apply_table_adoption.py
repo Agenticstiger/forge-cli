@@ -16,10 +16,10 @@ The rules are :mod:`fluid_build.iac.adoption`'s; this module applies them to a r
    an OpenTofu ``import`` block, so the plan shows its import and writes no state;
 4. :func:`check_plan`: the saved plan must import each one unreplaced, and the plugin's
    comparison must find it matching the contract, or the run stops naming the differences;
-5. :func:`hold_still` and :func:`check_held`: a table the plugin keeps as it is while it is
-   adopted (an Iceberg table on AWS) and that the plan would still update in place is
-   planned again with those attributes in ``ignore_changes``, and must then be imported
-   with no change at all.
+5. an adopted table the plan would update in place that the plugin keeps as it is (a live
+   Iceberg table on AWS) is held as any other such table is (``cli/_apply_table_hold.py``):
+   planned again with those attributes in ``ignore_changes``, and then imported with no
+   change at all.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build._contract_loader import CLIError
 from fluid_build.cli.console import cprint_literal
@@ -38,7 +38,6 @@ from fluid_build.iac.adoption import (
     TableReview,
     declared_resources,
     difference_lines,
-    planned_imports,
     review_tables,
 )
 from fluid_build.iac.importer import ImportBlock, import_section
@@ -49,11 +48,13 @@ from ._logging import warn
 
 @dataclass(frozen=True)
 class Adoption:
-    """What a run's adoption check found: the reviews of the tables it adopts, and the ones
-    it keeps as they are while adopting them (``{address: attributes}``)."""
+    """What a run's adoption check found: the reviews of the tables it adopts."""
 
     reviews: Tuple[TableReview, ...] = ()
-    held: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
+
+    @property
+    def addresses(self) -> Tuple[str, ...]:
+        return tuple(review.address for review in self.reviews)
 
 
 @dataclass(frozen=True)
@@ -232,12 +233,14 @@ def check_plan(
     tables: Sequence[Any],
     shown: Optional[Mapping[str, Any]],
     logger: logging.Logger,
+    held: Collection[str] = (),
 ) -> Adoption:
     """Review each table the saved plan adopts; refuse the run on any difference.
 
     ``shown`` is the saved plan as ``tofu show -json`` prints it, ``module`` the module
-    text the tables are declared in. Returns what a run that goes on adopts, with the
-    tables it keeps as they are (:func:`hold_still`).
+    text the tables are declared in, ``held`` the addresses the run leaves as they are
+    (``_apply_table_hold``), which say what they keep themselves. Returns what a run that
+    goes on adopts.
     """
     if not tables:
         return Adoption()
@@ -266,87 +269,17 @@ def check_plan(
                 ],
             },
         )
-    held = _held(plugin, shown, declared, reviews)
     for entry in reviews:
         # soft_wrap: a piped run (a CI log) keeps each line whole, as Rich would cut it at 80.
         cprint_literal(
             f"  adoption:    {entry.table} matches the contract: the plan imports it",
             soft_wrap=True,
         )
-        if entry.updates and entry.address in held:
-            cprint_literal(
-                "               and leaves as it is (an adopted Iceberg table is not updated "
-                "in place): " + "; ".join(entry.updates),
-                soft_wrap=True,
-            )
-        elif entry.updates:
+        if entry.updates and entry.address not in held:
             cprint_literal(
                 "               and changes in place: " + "; ".join(entry.updates), soft_wrap=True
             )
-    return Adoption(tuple(reviews), held)
-
-
-def _held(
-    plugin: Any,
-    shown: Mapping[str, Any],
-    declared: Mapping[str, Mapping[str, Any]],
-    reviews: Sequence[TableReview],
-) -> Dict[str, Tuple[str, ...]]:
-    """The adopted tables the plan updates in place that the plugin keeps as they are."""
-    hold = getattr(plugin, "adoption_hold", None)
-    if not callable(hold):
-        return {}
-    imports = planned_imports(shown)
-    held: Dict[str, Tuple[str, ...]] = {}
-    for entry in reviews:
-        change = (imports.get(entry.address) or {}).get("change") or {}
-        attributes = tuple(hold(declared.get(entry.address) or {}))
-        if attributes and list(change.get("actions") or []) != ["no-op"]:
-            held[entry.address] = attributes
-    return held
-
-
-def hold_still(module_path: Path, adoption: Adoption) -> bool:
-    """Add each held table's attributes to its ``ignore_changes`` in the module at
-    ``module_path``, for this run's plan only (the module is written again on every run).
-    Returns whether there was anything to hold."""
-    if not adoption.held:
-        return False
-    document = json.loads(module_path.read_text(encoding="utf-8"))
-    resources = document.get("resource") or {}
-    for address, attributes in sorted(adoption.held.items()):
-        kind, _, name = address.partition(".")
-        body = (resources.get(kind) or {}).get(name)
-        if not isinstance(body, dict):
-            raise _not_held(address, "the module does not declare it")
-        lifecycle = body.setdefault("lifecycle", {})
-        ignored = list(lifecycle.get("ignore_changes") or [])
-        lifecycle["ignore_changes"] = ignored + [a for a in attributes if a not in ignored]
-    module_path.write_text(json.dumps(document, indent=2), encoding="utf-8")
-    return True
-
-
-def check_held(shown: Optional[Mapping[str, Any]], adoption: Adoption) -> None:
-    """The plan made again must import every held table with no change at all."""
-    imports = planned_imports(shown or {})
-    for address in sorted(adoption.held):
-        change = (imports.get(address) or {}).get("change") or {}
-        actions = [str(action) for action in change.get("actions") or []]
-        if actions != ["no-op"]:
-            raise _not_held(address, f"the plan still {'/'.join(actions) or 'leaves it out'}")
-
-
-def _not_held(address: str, why: str) -> CLIError:
-    return CLIError(
-        1,
-        "table_adoption_mismatch",
-        {
-            "error": f"{address} could not be planned to be adopted without an in-place "
-            f"update ({why}); an adopted Iceberg table is never updated in place, so "
-            "nothing was adopted",
-            "tables": [{"address": address}],
-        },
-    )
+    return Adoption(tuple(reviews))
 
 
 def audit_take_over(logger: logging.Logger, tables: Sequence[Any]) -> None:

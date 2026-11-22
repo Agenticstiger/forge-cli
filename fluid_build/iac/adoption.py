@@ -63,7 +63,13 @@ class TableReview:
 
     def as_event(self) -> Dict[str, Any]:
         """The review for a structured log event or an error's context (lists, as JSON)."""
-        return {key: list(v) if isinstance(v, tuple) else v for key, v in asdict(self).items()}
+        return event_fields(self)
+
+
+def event_fields(record: Any) -> Dict[str, Any]:
+    """A frozen dataclass's fields for a structured log event or an error's context: its
+    tuples as lists, as JSON has them."""
+    return {key: list(v) if isinstance(v, tuple) else v for key, v in asdict(record).items()}
 
 
 def planned_imports(shown: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:

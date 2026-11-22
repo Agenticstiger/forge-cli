@@ -106,6 +106,7 @@ class ShipOptions:
     strict: bool = True
     allow_data_loss: bool = False
     adopt_tables: bool = False
+    allow_iceberg_update: bool = False
     no_verify_digest: bool = False
     no_verify_strict: bool = False
     # False: --no-generate-artifacts, or RUN_STAGE_3_GENERATE_ARTIFACTS=false (stage 3
@@ -290,6 +291,9 @@ def resolve_options(args: object, contract: str, env: Mapping[str, str]) -> Ship
         allow_data_loss=_truth(bool(get("allow_data_loss")), env, "ALLOW_DATA_LOSS"),
         # A flag only, as --yes is: a take-over is asked for on the command line.
         adopt_tables=bool(get("adopt_tables")),
+        # A flag only too: no environment variable or .env file updates a live Iceberg
+        # table in place.
+        allow_iceberg_update=bool(get("allow_iceberg_update")),
         no_verify_digest=_truth(bool(get("no_verify_digest")), env, "NO_VERIFY_DIGEST"),
         no_verify_strict=not _on_unless_false(get("verify_strict"), env, "VERIFY_STRICT"),
         generate_artifacts=not get("no_generate_artifacts") and 3 not in switched_off,
@@ -773,6 +777,8 @@ def _apply(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
         argv.append("--allow-data-loss")
     if o.adopt_tables:
         argv.append("--adopt-tables")
+    if o.allow_iceberg_update:
+        argv.append("--allow-iceberg-update")
     if o.no_verify_digest:
         argv += ["--no-verify-plan-binding", "--no-verify-federation"]
     a.argv = argv

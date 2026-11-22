@@ -17,7 +17,8 @@ and output formats and SerDe), then a contract names them:
   differences, with nothing in state and the table as it was;
 * without the flag an existing table is refused, unless forge made it for this product:
   a table that carries forge's marker and this product's id, met again after its state
-  was lost, is imported as before, also when forge kept no record of a contract over
+  was lost, is imported as before (an Iceberg one left as it is rather than updated in
+  place, a Hive one changed to the contract), also when forge kept no record of a contract over
   50 KB; another product that names the table is refused;
 * the Lake Formation grants the contract declares are planned beside the adopted
   table, which is imported, not replaced;
@@ -275,26 +276,54 @@ def test_a_matching_iceberg_table_is_adopted_and_keeps_its_metadata(
     assert _summary(capfd.readouterr().out) == ("0", "0", "0")
 
 
+GROWN_SCHEMA = (
+    {"name": "id", "type": "bigint", "required": True},
+    {"name": "note", "type": "string"},
+)
+
+
 def test_a_table_forge_made_is_re_attached_after_its_state_is_lost(
-    moto_endpoint: str, tmp_path: Path
+    moto_endpoint: str, tmp_path: Path, capfd
 ) -> None:
     """A fresh workspace on every run keeps no state: the next apply meets the table forge
-    made and imports it as before, with no flag, and can still change it."""
+    made and imports it as before, with no flag. An Iceberg table it would update in place
+    is left as it is, before any engine wrote to it too (Glue's ``VersionId`` does not
+    move), and the note names the column the contract added."""
     cid = "iac.adopt.own"
     bucket = "adopt-own-lake"
     workdir = _sidecar(tmp_path, cid, moto_endpoint)
     plan = _write_plan(tmp_path / "contract.json", _contract(bucket, cid))
     assert engine.apply_via_opentofu(_apply_args(plan, tmp_path), _LOG) == 0
     (workdir / "terraform.tfstate").unlink()
-    grown = _contract(
-        bucket,
-        cid,
-        schema=[
-            {"name": "id", "type": "bigint", "required": True},
-            {"name": "note", "type": "string"},
-        ],
-    )
+    glue = _boto("glue", moto_endpoint)
+    made = glue.get_table(DatabaseName=DATABASE, Name=TABLE)["Table"]
+    capfd.readouterr()
 
+    again = _write_plan(tmp_path / "contract.json", _contract(bucket, cid, schema=GROWN_SCHEMA))
+    assert engine.apply_via_opentofu(_apply_args(again, tmp_path), _LOG) == 0
+
+    assert _table_address(cid) in _state_addresses(workdir)
+    live = glue.get_table(DatabaseName=DATABASE, Name=TABLE)["Table"]
+    assert [column["Name"] for column in live["StorageDescriptor"]["Columns"]] == ["id"]
+    assert live["VersionId"] == made["VersionId"]
+    out = " ".join(capfd.readouterr().out.split())
+    assert f"{DATABASE}.{TABLE} is a live Iceberg table" in out
+    assert "column note (string): in the contract, not in the table" in out
+
+
+def test_a_hive_table_forge_made_is_re_attached_and_still_changed_in_place(
+    moto_endpoint: str, tmp_path: Path
+) -> None:
+    """The same run on a Hive table: no metadata pointer for a commit to move, so the apply
+    changes it to the contract in place, as before."""
+    cid = "iac.adopt.own-hive"
+    bucket = "adopt-own-hive-lake"
+    workdir = _sidecar(tmp_path, cid, moto_endpoint)
+    plan = _write_plan(tmp_path / "contract.json", _contract(bucket, cid, format_="parquet"))
+    assert engine.apply_via_opentofu(_apply_args(plan, tmp_path), _LOG) == 0
+    (workdir / "terraform.tfstate").unlink()
+
+    grown = _contract(bucket, cid, format_="parquet", schema=GROWN_SCHEMA)
     again = _write_plan(tmp_path / "contract.json", grown)
     assert engine.apply_via_opentofu(_apply_args(again, tmp_path), _LOG) == 0
 
@@ -380,7 +409,10 @@ def test_an_adopted_iceberg_table_with_its_own_drift_plans_no_update_and_keeps_i
         if address.startswith("aws_glue_catalog_table.") and "update" in planned["actions"]
     ]
     out = " ".join(capfd.readouterr().out.split())
-    assert "leaves as it is (an adopted Iceberg table is not updated in place)" in out
+    assert f"{DATABASE}.{TABLE} is a live Iceberg table" in out
+    assert "the plan leaves it as it is" in out
+    assert "description: written by the stream in the table, none in the contract" in out
+    assert "owner: hadoop in the table, none in the contract" in out
 
     assert (
         engine.apply_via_opentofu(_apply_args(plan, tmp_path, no_verify_plan_binding=False), _LOG)
