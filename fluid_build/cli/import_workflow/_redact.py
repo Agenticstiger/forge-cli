@@ -207,6 +207,16 @@ _COMMAND_PREFIX = frozenset(
     {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time", "exec", "sudo", "env"}
     | {"nohup", "nice"}
 )
+#: Commands whose own options carry a credential. One named after a wrapper (``sudo -u app mysql``,
+#: ``timeout 10 mysql``, ``xargs docker login``, ``docker run img mysql``) is the command the words
+#: after it belong to.
+_CLIENT_COMMANDS = (
+    _GLUED_PASSWORD_COMMANDS
+    | _GLUED_UPPER_P_COMMANDS
+    | _ORACLE_COMMANDS
+    | frozenset(_SHORT_PASSWORD_BY_COMMAND)
+    | {command for command, _ in _LOGIN_COMMANDS}
+)
 #: Schemes whose ``container@account`` is a place, not a ``user:password`` (Azure storage).
 _CONTAINER_SCHEMES = frozenset({"abfs", "abfss", "wasb", "wasbs", "adl"})
 
@@ -406,16 +416,29 @@ class _Words:
         self.subcommand: Optional[str] = None
         self._at_start = False
         self._expect_subcommand = False
+        #: A ``set`` came in this command: the name of a credential after it is followed by its
+        #: value (``aws configure set --profile p aws_secret_access_key <value>``).
+        self._set = False
 
     def boundary(self) -> None:
         """A new command begins."""
         self.command, self.subcommand, self._at_start = None, None, True
         self._expect_subcommand = False
+        self._set = False
 
     def _start_of(self, value: str) -> None:
+        name = value.rsplit("/", 1)[-1]
         if self._at_start and not _ASSIGNMENT.match(value) and value not in _COMMAND_PREFIX:
-            self.command, self._at_start = value.rsplit("/", 1)[-1], False
+            self.command, self._at_start = name, False
             self._expect_subcommand = True
+        elif (
+            name in _CLIENT_COMMANDS
+            and self.command is not None
+            and name != self.command
+            and not value.startswith("-")
+        ):
+            # a client named after a wrapper: the words that follow are its own
+            self.command, self.subcommand, self._expect_subcommand = name, None, True
         elif self._expect_subcommand:
             self._expect_subcommand = False
             if not value.startswith("-"):
@@ -456,6 +479,11 @@ class _Words:
             if glued:
                 return f"-H{self._header(glued)}"
         name, equals, rest = value.partition("=")
+        if self._set and not equals and not value.startswith("-") and sensitive_name(value):
+            self._mask_next = True  # ``aws configure set aws_secret_access_key <value>``
+            return value
+        if value == "set":
+            self._set = True
         if value.startswith("-") and len(value) > 1 and not any(c.isspace() for c in name):
             return self._flag(value, name, equals, rest)
         if _ASSIGNMENT.match(value) and sensitive_name(name):
