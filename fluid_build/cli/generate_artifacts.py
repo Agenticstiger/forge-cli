@@ -90,7 +90,14 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--out",
         default="dist/artifacts",
-        help="Output directory for emitted artifacts. Default: dist/artifacts",
+        help=(
+            "Output directory for emitted artifacts. Default: dist/artifacts. Stage 3 owns its "
+            "subdirectories there (odcs/, odps-bitol/, opds/, schedule/, policy/, spark/, "
+            "pyspark-schema/, custom-scaffold/) and replaces what an earlier run wrote in them "
+            "on every run, whatever --emit names. An unknown key, a change-request build or a "
+            "scaffold bundle in custom-scaffold/ (fluid-scaffold.yaml) refuses the run before "
+            "anything there changes."
+        ),
     )
     p.add_argument(
         "--emit",
@@ -142,6 +149,18 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
             "DAGs append to $FLUID_PROJECT_DIR on the Airflow worker. Default: the "
             "input's path relative to the current directory for a raw contract; "
             "contract.fluid.yaml (with a warning) for a bundle."
+        ),
+    )
+    p.add_argument(
+        "--allow-scaffold-on-change-request",
+        action="store_true",
+        default=False,
+        help=(
+            "Run custom-scaffold on a change-request build too. By default stage 3 refuses it "
+            "when the CI marks the build as a pull or merge request (CHANGE_ID, "
+            "GITHUB_EVENT_NAME=pull_request, CI_MERGE_REQUEST_IID, ...): the bundles' "
+            "templates would run the change's code with the job's credentials. Only this "
+            "flag overrides it, never a variable."
         ),
     )
     p.set_defaults(generate_sub="artifacts", func=_run_from_generate)
@@ -223,6 +242,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 # A temporary --env bundle records no location; the DAGs still
                 # run the contract that was given.
                 source_path=None if fanout_input == bundle_path else bundle_path,
+                allow_scaffold_on_change_request=bool(
+                    getattr(args, "allow_scaffold_on_change_request", False)
+                ),
             )
     except FanoutError as exc:
         # Surface emit-key context so the operator knows which generator failed; an
