@@ -693,7 +693,7 @@ def test_a_function_that_calls_itself_back_is_read_once():
             import subprocess
 
             def f(script):
-                subprocess.run(["spark-submit", script])
+                boto3.client("emr").add_job_flow_steps(JobFlowId="j", Steps=[{"HadoopJarStep": {"Args": ["spark-submit", script]}}])
                 g(script)
 
             def g(script):
@@ -703,7 +703,7 @@ def test_a_function_that_calls_itself_back_is_read_once():
             """
         )
     )
-    assert submits(found["t"]) == [("spark-submit", "s3://a.py", ())]
+    assert submits(found["t"]) == [("emr-step", "s3://a.py", ())]
 
 
 def test_op_args_with_a_spread_that_does_not_fold_give_no_positions():
