@@ -30,9 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catches a checkpoint no recorded run used (a prefix copied from another stream, a new EMR
   cluster with no step history). Moving `properties.stream.checkpoint` still starts the job from
   `startingOffsets`, as the 0.7.7 schema says, unless the new prefix already holds a position
-  (Spark resumes it); the outcome now says which, from the runs' history. The runner changed, so
-  the first `fluid apply` after the upgrade replaces each running stream once, by a cancel (those
-  runs have no key), and a plan made before the upgrade is refused at apply: plan again.
+  (Spark resumes it); the outcome now says which, from the runs' history. The first apply after
+  the upgrade still cancels each running stream once (see Upgrade notes).
 - **`fluid generate artifacts --emit custom-scaffold` generates a contract's custom scaffold, so
   its files are in the stage-3 MANIFEST and in a sealed release.** The new emit key passes the
   contract to the custom-scaffold engine's library entry point and writes the files its
@@ -350,6 +349,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrote `type: parquet_variant` into a contract that `fluid validate` then rejected. It maps to
   `variant`, as DuckDB's `UNION` already does, and the schema-drift gate reads the two as one
   type family, so a contract written that way does not fail at apply.
+
+### Upgrade notes
+
+- Every Spark stream running when forge is upgraded is replaced once by the first `fluid apply`
+  after the upgrade, by a cancel, as before: the runner changed, so the config hash did, and a run
+  started before the upgrade has no stop key, so it cannot be asked to stop between batches. From
+  then on a changed stream stops between batches (see Added). A plan made before the upgrade is
+  refused at `fluid apply` (`apply_spark_artifact_mismatch`): plan again with the new version.
 
 ## [0.36.0] — 2026-11-19
 
