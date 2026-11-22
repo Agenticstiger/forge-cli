@@ -91,6 +91,7 @@ from fluid_build.build_runners.spark._adapters import (
     TERMINAL,
     Adapter,
     ClientFactory,
+    MarkerReadDenied,
     RunInfo,
     SparkRunError,
     adapter_for,
@@ -128,6 +129,7 @@ DEFAULT_PROBATION_S = 300
 ROLLBACK_UNSAFE = "apply_spark_rollback_unsafe"
 NO_GOOD_CONFIG = "apply_spark_no_known_good_config"
 FAILED_EARLIER = "apply_spark_release_failed_earlier"
+READ_DENIED = "apply_spark_artifact_read_denied"
 
 
 @dataclass
@@ -570,7 +572,12 @@ def _reconcile_one(
         if decided is None:
             return out
         start = decided
-    earlier = None if matching else _earlier_failure(adapter, run)
+    try:
+        earlier = None if matching else _earlier_failure(adapter, run)
+    except MarkerReadDenied as exc:
+        out.action, out.error, out.code = "refused", True, READ_DENIED
+        out.message = f"{_clean(exc)}; nothing was started"
+        return out
     if earlier is not None and not accept_failed:
         # Stopped before anything is: a run of another config keeps going.
         out.action, out.error, out.code = "refused", True, FAILED_EARLIER
@@ -644,16 +651,26 @@ def _rollback_target(
     adapter: Adapter, run: DesiredRun, stale: Sequence[RunInfo], last: Optional[RunInfo]
 ) -> Tuple[Optional[RunInfo], str]:
     """The run whose config a new config that fails its probation goes back to, and why none:
-    a config is good when its run was going when this apply replaced it (``stale``: forge's own
-    stop or cancel during the release counts), or its last run ended SUCCEEDED, and it did not
-    fail a probation of its own. One whose last run failed, was lost, or was cancelled before
-    this apply is no config to go back to: a failed run would start again past its restart
-    budget, and an operator may have cancelled one because it wrote bad data."""
+    a config is good when its run was RUNNING on its first attempt when this apply replaced it
+    (``stale``: forge's own stop or cancel during the release counts), or its last run ended
+    SUCCEEDED, and it did not fail a probation of its own. One whose last run failed, was lost,
+    or was cancelled before this apply, or that never ran (PENDING), was being retried by its
+    runtime or was being cancelled when replaced, is no config to go back to: a failed run would
+    start again past its restart budget, and an operator may have cancelled one because it
+    wrote bad data."""
     replaced = [s for s in stale if s.config_hash != run.config_hash]
-    previous = replaced[0] if replaced else last
+    sound = [s for s in replaced if s.state == RUNNING and (s.attempt or 1) <= 1]
+    previous = sound[0] if sound else (replaced[0] if replaced else last)
     if previous is None or previous.config_hash == run.config_hash:
         return None, ""  # nothing came before it
     older = _clean(previous.config_hash)[:12] or "?"
+    if replaced and not sound:
+        attempt = f" on attempt {previous.attempt}" if (previous.attempt or 1) > 1 else ""
+        return None, (
+            f"the config before it ({older}, run {previous.run_id}) was "
+            f"{_clean(previous.raw_state or previous.state)}{attempt} when this apply replaced "
+            "it, which is no config to go back to"
+        )
     if not replaced and previous.state != SUCCEEDED:
         return None, (
             f"the config before it ({older}, run {previous.run_id}) ended "
@@ -979,9 +996,15 @@ def _rollback_plan(current: DesiredRun, text: str, last_good: RunInfo, new_id: s
     old_table, new_table = _sink_table(old), _sink_table(new)
     old_dead, new_dead = _dead_letter(old), _dead_letter(new)
     shared = ""
-    if old_table is None or new_table is None or old_table == new_table:
+    # Glue and Spark resolve names without regard to case, so a case-only difference is the
+    # same table.
+    if old_table is None or new_table is None or old_table.casefold() == new_table.casefold():
         shared = f"the output {old_table or new_table or '(unknown)'}"
-    elif old_dead is not None and old_dead == new_dead:
+    elif (
+        old_dead is not None
+        and new_dead is not None
+        and (old_dead[0], old_dead[1].casefold()) == (new_dead[0], new_dead[1].casefold())
+    ):
         shared = f"the dead-letter {old_dead[0]} {old_dead[1]}"
     old_ck, new_ck = str(old.get("checkpoint") or ""), str(new.get("checkpoint") or "")
     if shared:

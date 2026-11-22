@@ -635,8 +635,31 @@ def read_failed(host: LocalHost, run: DesiredRun, config_hash: str) -> Optional[
 
     Raises:
         SparkRunError: the marker exists but cannot be read.
+        MarkerReadDenied: an ``s3://`` root refuses the marker and the job config beside it.
     """
-    return _read_artifact(host, failed_release_uri(bound_job_uri(host, run), config_hash))
+    from fluid_build.build_runners.spark._adapters import MarkerReadDenied, warn_no_list_bucket
+
+    job_uri = bound_job_uri(host, run)
+    uri = failed_release_uri(job_uri, config_hash)
+    try:
+        return _read_artifact(host, uri)
+    except SparkRunError as exc:
+        if not (uri.startswith("s3://") and "AccessDenied" in str(exc)):
+            raise
+        # Without s3:ListBucket a missing key answers AccessDenied: the job config beside it
+        # reads when the marker is only missing.
+        try:
+            probe = _read_artifact(host, job_uri)
+        except SparkRunError:
+            probe = None
+        if probe is None:
+            raise MarkerReadDenied(
+                f"the marker {uri} and the job config {job_uri} cannot be read: the identity "
+                "that reconciles needs s3:GetObject on the build's prefix, and s3:ListBucket on "
+                "it so a missing object reads as missing"
+            ) from exc
+        warn_no_list_bucket(uri)
+        return None
 
 
 def clear_failed(host: LocalHost, run: DesiredRun, config_hash: str) -> None:

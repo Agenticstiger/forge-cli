@@ -402,6 +402,17 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         None,
     ),
+    "apply_spark_artifact_read_denied": (
+        [
+            "Grant the identity that runs fluid apply s3:GetObject on the build's prefix "
+            + "(_fluid/spark/<product>/<build>/): forge reads the failed-release marker and the "
+            + "job config there, and refused to start anything it cannot check",
+            "Also grant s3:ListBucket on that prefix: without it S3 answers a missing object "
+            + "with AccessDenied, which forge can only read as missing when the job config "
+            + "beside it reads",
+        ],
+        None,
+    ),
     "output_write_failed": (
         ["Check that the --out path is writable and the parent directory exists"],
         None,

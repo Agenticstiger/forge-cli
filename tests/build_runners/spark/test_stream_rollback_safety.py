@@ -487,12 +487,12 @@ def test_a_marker_that_cannot_be_written_or_read_names_the_object_and_the_code(r
     with pytest.raises(ad.SparkRunError, match="could not be written: AccessDenied"):
         adapter.mark_failed(run.config_hash, "r1", "x")
 
-    class Denied(Bucket):
+    class Broken(Bucket):
         def get_object(self, Bucket, Key):  # noqa: N803 - boto3's names
-            raise _client_error("AccessDenied")
+            raise _client_error("InternalError")
 
-    with pytest.raises(ad.SparkRunError, match="cannot be read: AccessDenied"):
-        _serverless(run, Denied()).failed_release(run.config_hash)
+    with pytest.raises(ad.SparkRunError, match="cannot be read: InternalError"):
+        _serverless(run, Broken()).failed_release(run.config_hash)
 
 
 def test_a_local_marker_is_a_file_under_the_artifact_root(tmp_path, monkeypatch):

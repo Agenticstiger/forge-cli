@@ -48,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   those records into that output a second time. The failed run is cancelled, the stream is down,
   and the apply fails with `apply_spark_rollback_unsafe`; applying the previous contract again is
   the deliberate way back, and it expects those records twice. A config is a config to go back
-  to only when its run was going when it was replaced, or ended SUCCEEDED, and did
+  to only when its run was RUNNING on its first attempt when it was replaced (not PENDING, retried or being cancelled), or ended SUCCEEDED, and did
   not fail a probation itself: a release over a config whose last run failed or was cancelled before the apply is watched, and when
   it fails the apply fails with `apply_spark_no_known_good_config` and says the stream is down.
   Every config that fails its probation is marked beside the build's job config
@@ -61,7 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream may be down, and the marker keeps the failed config from being restarted. Two applies
   that roll back at once keep the older rollback run. An apply that changes nothing keeps a
   stream's release record only when it is missing or different, and a read that fails once no
-  longer ends the probation's watch.
+  longer ends the probation's watch. Output and dead-letter names are compared without regard to case. The failed-release marker is read with `s3:GetObject`; where the identity lacks `s3:ListBucket` a missing marker answers AccessDenied, which forge reads as missing when the job config beside it reads (with a warning naming the grant), and a prefix it cannot read at all refuses the start with `apply_spark_artifact_read_denied`, naming the grants.
 - **`fluid describe --commands` prints every command as JSON, plugins included.** The document
   has a `schema_version` (1) and lists each command with its aliases, positional arguments and
   flags (names, type, choices, default, nargs, help). Commands added by `fluid_build.commands`
