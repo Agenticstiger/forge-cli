@@ -106,14 +106,16 @@ class TektonTemplate(BasePipelineTemplate):
             (knob, "", f"Passed to fluid ship ({knob}); blank keeps ship's default.")
             for knob in STAGE_KNOBS
         ]
-        # Tekton marks no pull-request run itself: the Triggers binding of one sets it, and
-        # ship then leaves custom-scaffold out of stage 3 (util/change_request.py).
+        # Tekton marks no pull-request run itself, so a run counts as one unless the
+        # Triggers binding of a default-branch run says otherwise (util/change_request.py):
+        # a binding that forgets it leaves custom-scaffold out of stage 3 instead of running
+        # a change's bundle templates.
         values.append(
             (
                 CHANGE_REQUEST_ENV,
-                "false",
-                "true on a run for a pull or merge request (set it in its Triggers binding): "
-                "fluid ship then leaves custom-scaffold out of stage 3.",
+                "true",
+                "false only on a run that builds the default branch (set it in that Triggers "
+                "binding); while true, fluid ship leaves custom-scaffold out of stage 3.",
             )
         )
         return values
@@ -337,9 +339,9 @@ class TektonTemplate(BasePipelineTemplate):
             "checkout (for example a git-clone Task before fluid-plan, on a PVC). Start the",
             "plan, for example from a Tekton Triggers binding on a pull request or a push:",
             f"  tkn pipeline start fluid-plan -w name={WORKSPACE},claimName=<pvc>",
-            f"A run for a pull or merge request passes -p {CHANGE_REQUEST_ENV}=true: Tekton sets",
-            "nothing of its own there, and ship then leaves custom-scaffold (the contract's",
-            "bundle templates) out of stage 3.",
+            f"A run that builds the default branch passes -p {CHANGE_REQUEST_ENV}=false. Tekton",
+            "marks no pull or merge request run itself, so every other run counts as one, and",
+            "ship leaves custom-scaffold (the contract's bundle templates) out of its stage 3.",
             "",
             "Tekton has no approval step. Apply is a separate Pipeline that nothing starts",
             "by itself: when the plan is reviewed, start it on the SAME workspace with the",

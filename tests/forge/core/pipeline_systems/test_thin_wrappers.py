@@ -1469,17 +1469,25 @@ def test_the_gitlab_header_says_who_may_override_the_install() -> None:
 
 @pytest.mark.parametrize("install_mode", ["pypi", "dev-source"])
 def test_tekton_runs_carry_the_change_request_marker_into_ship(install_mode):
-    """Tekton sets no variable of its own on a pull-request run, so its plan Pipeline takes
-    one: the Triggers binding of a pull or merge request sets it, and ship leaves
-    custom-scaffold out of stage 3 (``fluid_build/util/change_request.py``)."""
+    """Tekton sets no variable of its own on a pull-request run, so every run counts as one
+    unless the Triggers binding of a default-branch run passes false: a binding that forgets
+    it leaves custom-scaffold out of stage 3 (``fluid_build/util/change_request.py``)."""
     files = _files(P.TEKTON, install_mode=install_mode)
     documents = [doc for _, doc in _documents(files)]
     pipelines = {d["metadata"]["name"]: d for d in documents if d["kind"] == "Pipeline"}
-    plan = {p["name"]: p for p in pipelines["fluid-plan"]["spec"]["params"]}
-    assert plan["FLUID_CHANGE_REQUEST"]["default"] == "false"
+    for name in ("fluid-plan", "fluid-apply"):
+        params = {p["name"]: p for p in pipelines[name]["spec"]["params"]}
+        assert params["FLUID_CHANGE_REQUEST"]["default"] == "true"
+        (ship,) = [t for t in pipelines[name]["spec"]["tasks"] if t["name"] == "ship"]
+        passed = {p["name"]: p["value"] for p in ship["params"]}
+        assert passed["FLUID_CHANGE_REQUEST"] == "$(params.FLUID_CHANGE_REQUEST)"
     task = next(
         d for d in documents if d["kind"] == "Task" and d["metadata"]["name"] == "fluid-ship"
     )
+    assert {p["name"]: p for p in task["spec"]["params"]}["FLUID_CHANGE_REQUEST"][
+        "default"
+    ] == "true"
     env = {e["name"]: e["value"] for e in task["spec"]["steps"][0]["env"]}
     assert env["FLUID_CHANGE_REQUEST"] == "$(params.FLUID_CHANGE_REQUEST)"
-    assert "FLUID_CHANGE_REQUEST" in files["tekton/pipeline.yaml"]
+    header = " ".join(files["tekton/pipeline.yaml"].split())
+    assert "-p FLUID_CHANGE_REQUEST=false" in header
