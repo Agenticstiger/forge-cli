@@ -1,0 +1,551 @@
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
+
+"""A contract's ``alerts`` block, read and checked, with the organisation's default routes.
+
+::
+
+    alerts:
+      sla: PT4H                    # optional: a run not done this long after it started is late
+      defaults: true               # take the org pack's default routes (the default)
+      routes:
+        - name: oncall
+          kind: webhook            # email | slack | webhook | pagerduty | a plugin's kind
+          format: zenduty          # webhook only: generic (default) | zenduty | opsgenie
+          connection: zenduty_oncall
+          events: [failure, sla_miss]
+          severity: critical
+        - name: team
+          kind: email
+          to: [data-team@corp.example]
+
+``fluid validate`` reports what :func:`contract_alert_findings` and
+:func:`default_alert_findings` find; ``fluid generate schedule`` renders
+:func:`read_alert_plan`, which refuses the same problems.
+
+A route never carries a secret. ``connection`` names the Airflow connection that holds the
+address, URL or key, and is held to Airflow's connection-id characters: a URL, an address
+with a password or something shaped like a key is refused, and the message never shows the
+value. Every other string a route gives (``options`` included) is held to no template syntax
+(``{`` or ``}``, which Airflow's Jinja would read in a notifier's template fields), no URL
+and nothing the secret redactor would mask.
+"""
+
+from __future__ import annotations
+
+import keyword
+import math
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+
+from fluid_build.alerts.builtin import BUILTIN_KINDS, KIND_KEYS, make_alert
+from fluid_build.alerts.model import (
+    DEFAULT_EVENTS,
+    EVENTS,
+    SEVERITIES,
+    AlertRoute,
+    AlertRouteError,
+    NotifierCall,
+)
+from fluid_build.alerts.plugins import default_routes, kind_for, normalise_kind
+
+_ROUTE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}\Z")
+_KIND = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
+#: Airflow connection ids, in the characters every secrets backend keeps.
+_CONNECTION = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,249}\Z")
+#: A value that is a key rather than a name: 20 or more hex digits, or a UUID.
+_KEY_SHAPED = re.compile(
+    r"(?:[0-9a-fA-F]{20,}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{12})\Z"
+)
+_EMAIL = re.compile(r"[A-Za-z0-9._+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})+\Z")
+#: ISO-8601 durations without years or months, whose length depends on the calendar.
+_DURATION = re.compile(
+    r"P(?=\d|T\d)(?:(\d+)W)?(?:(\d+)D)?(?:T(?=\d)(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?\Z"
+)
+_OPTION_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+_ALERTS_KEYS = frozenset({"routes", "sla", "defaults"})
+_ROUTE_KEYS = frozenset(
+    {"name", "kind", "events", "connection", "to", "from", "format", "severity", "options"}
+)
+
+#: How many routes a product may have, its own and the defaults together.
+MAX_ROUTES = 20
+#: The longest SLA a contract may set.
+MAX_SLA_SECONDS = 30 * 86400
+_MAX_ADDRESSES = 50
+_MAX_TEXT = 1000
+_MAX_ITEMS = 50
+_MAX_DEPTH = 4
+
+#: Kwargs a notifier call may not set: ``context`` is Airflow's (its deadline alerts pass it).
+_RESERVED_KWARGS = frozenset({"context"})
+
+#: How a refusal stands in for a value that may be a pasted secret.
+NOT_SHOWN = "(value not shown)"
+
+
+@dataclass(frozen=True)
+class AlertPlan:
+    """The routes a product's DAGs alert through, and the SLA its ``sla_miss`` routes watch."""
+
+    routes: Tuple[AlertRoute, ...] = ()
+    sla_seconds: Optional[int] = None
+
+    def listens(self, event: str) -> bool:
+        """Whether any route alerts on ``event`` (``sla_miss`` only with an SLA)."""
+        if event == "sla_miss" and self.sla_seconds is None:
+            return False
+        return any(event in route.events for route in self.routes)
+
+
+# ── reading ──────────────────────────────────────────────────────────────────
+
+
+def _block(contract: Mapping[str, Any]) -> Any:
+    return contract.get("alerts") if isinstance(contract, Mapping) else None
+
+
+def parse_duration(value: Any) -> Optional[int]:
+    """Seconds in an ISO-8601 duration (weeks to seconds), or ``None`` when it is not one."""
+    if not isinstance(value, str):
+        return None
+    match = _DURATION.match(value.strip())
+    if not match:
+        return None
+    weeks, days, hours, minutes, seconds = (int(part or 0) for part in match.groups())
+    return (((weeks * 7 + days) * 24 + hours) * 60 + minutes) * 60 + seconds
+
+
+def _redacted(text: str) -> bool:
+    """Whether the secret redactor would mask part of ``text``."""
+    from fluid_build.observability.secret_redactor import redact_secret_text
+
+    return redact_secret_text(text) != text
+
+
+def _text_problem(value: str) -> str:
+    """Why a string a route gives may not go into a DAG, or ``""``."""
+    if len(value) > _MAX_TEXT:
+        return f"is longer than {_MAX_TEXT} characters"
+    if "{" in value or "}" in value:
+        return "holds '{' or '}', which Airflow's templates would read"
+    if _CONTROL.search(value):
+        return "holds a control character"
+    if "://" in value:
+        return "holds a URL; a URL belongs in the Airflow connection the route names"
+    if _redacted(value):
+        return "holds what looks like a secret; secrets belong in the Airflow connection"
+    return ""
+
+
+def _option_problems(value: Any, where: str, depth: int = 0) -> List[str]:
+    """What keeps a plugin route's ``options`` value from being written into a DAG."""
+    if depth > _MAX_DEPTH:
+        return [f"{where} is nested deeper than {_MAX_DEPTH} levels"]
+    if value is None or isinstance(value, bool):
+        return []
+    if isinstance(value, int):
+        return []
+    if isinstance(value, float):
+        return [] if math.isfinite(value) else [f"{where} is not a finite number"]
+    if isinstance(value, str):
+        problem = _text_problem(value)
+        return [f"{where} {problem} {NOT_SHOWN}"] if problem else []
+    if isinstance(value, (list, tuple)):
+        if len(value) > _MAX_ITEMS:
+            return [f"{where} has more than {_MAX_ITEMS} items"]
+        out: List[str] = []
+        for index, item in enumerate(value):
+            out += _option_problems(item, f"{where}[{index}]", depth + 1)
+        return out
+    if isinstance(value, Mapping):
+        if len(value) > _MAX_ITEMS:
+            return [f"{where} has more than {_MAX_ITEMS} keys"]
+        out = []
+        for key, item in value.items():
+            if not isinstance(key, str) or not _OPTION_KEY.match(key):
+                out.append(f"{where} has a key that is not a plain name {NOT_SHOWN}")
+                continue
+            out += _option_problems(item, f"{where}.{key}", depth + 1)
+        return out
+    return [f"{where} is a {type(value).__name__}, not a JSON value"]
+
+
+def _connection_problem(value: Any) -> str:
+    if not isinstance(value, str) or not _CONNECTION.match(value):
+        return (
+            "is not an Airflow connection id (letters, digits, '_', '.' and '-'); a URL, an "
+            "address or a key belongs IN that connection, which the route names"
+        )
+    if _KEY_SHAPED.match(value) or _redacted(value):
+        return "looks like a key, not a connection id; put the key in an Airflow connection"
+    return ""
+
+
+def _read_route(raw: Any, where: str, origin: str, errors: List[str]) -> Optional[AlertRoute]:
+    """One route, or ``None`` with its problems added to ``errors``."""
+    if not isinstance(raw, Mapping):
+        errors.append(f"{where} is not a mapping")
+        return None
+    before = len(errors)
+    unknown = sorted(str(k) for k in raw if k not in _ROUTE_KEYS)
+    if unknown:
+        errors.append(
+            f"{where} has keys a route does not read: {', '.join(unknown)} (a route reads "
+            f"{', '.join(sorted(_ROUTE_KEYS))})"
+        )
+    name = raw.get("name")
+    if not isinstance(name, str) or not _ROUTE_NAME.match(name):
+        errors.append(
+            f"{where}.name must be a plain name (a letter or '_', then letters, digits, '_' "
+            "and '-', at most 64)"
+        )
+    kind_raw = raw.get("kind")
+    kind = normalise_kind(kind_raw) if isinstance(kind_raw, str) else ""
+    if not isinstance(kind_raw, str) or not _KIND.match(kind_raw):
+        errors.append(
+            f"{where}.kind must name a kind: {', '.join(BUILTIN_KINDS)}, or a plugin's "
+            "(lower case letters, digits, '_' and '-')"
+        )
+    events_raw = raw.get("events", list(DEFAULT_EVENTS))
+    events: Tuple[str, ...] = ()
+    if (
+        not isinstance(events_raw, (list, tuple))
+        or not events_raw
+        or not all(isinstance(e, str) and e in EVENTS for e in events_raw)
+        or len(set(events_raw)) != len(events_raw)
+    ):
+        errors.append(f"{where}.events must be a list of distinct events from {', '.join(EVENTS)}")
+    else:
+        events = tuple(e for e in EVENTS if e in events_raw)
+    connection = raw.get("connection")
+    if connection is not None:
+        problem = _connection_problem(connection)
+        if problem:
+            errors.append(f"{where}.connection {problem} {NOT_SHOWN}")
+    to_raw = raw.get("to", [])
+    to: Tuple[str, ...] = ()
+    if not isinstance(to_raw, (list, tuple)) or len(to_raw) > _MAX_ADDRESSES:
+        errors.append(f"{where}.to must be a list of at most {_MAX_ADDRESSES} email addresses")
+    elif not all(isinstance(a, str) and _EMAIL.match(a) for a in to_raw):
+        errors.append(f"{where}.to holds something that is not a plain email address")
+    else:
+        to = tuple(to_raw)
+    sender = raw.get("from")
+    if sender is not None and not (isinstance(sender, str) and _EMAIL.match(sender)):
+        errors.append(f"{where}.from must be a plain email address")
+    fmt = raw.get("format")
+    if fmt is not None and not isinstance(fmt, str):
+        errors.append(f"{where}.format must be a string")
+    severity = raw.get("severity")
+    if severity is not None and severity not in SEVERITIES:
+        errors.append(f"{where}.severity must be one of {', '.join(SEVERITIES)}")
+    options_raw = raw.get("options", {})
+    if not isinstance(options_raw, Mapping):
+        errors.append(f"{where}.options must be a mapping")
+        options_raw = {}
+    else:
+        errors += _option_problems(options_raw, f"{where}.options")
+    for key, kinds in KIND_KEYS.items():
+        if key in raw and kind and kind not in kinds:
+            errors.append(f"{where}.{key} is read by a {' or '.join(sorted(kinds))} route only")
+    if options_raw and kind in BUILTIN_KINDS:
+        errors.append(f"{where}.options is read by a plugin's kind only, not by {kind!r}")
+    if len(errors) > before:
+        return None
+    return AlertRoute(
+        name=str(name),
+        kind=kind,
+        events=events,
+        connection=connection,
+        to=to,
+        sender=sender,
+        format=fmt,
+        severity=severity,
+        options=dict(options_raw),
+        origin=origin,
+    )
+
+
+def _check_kind(route: AlertRoute, where: str, errors: List[str], warnings: List[str]) -> None:
+    """What the route's kind (a built-in or a plugin, loaded now) says about the route."""
+    try:
+        kind = kind_for(route.kind)
+    except AlertRouteError as exc:
+        errors.append(f"{where}.kind: {exc}")
+        return
+    if getattr(kind, "requires_connection", True) and not route.connection:
+        errors.append(
+            f"{where}.connection is required for a {route.kind} route: it names the Airflow "
+            "connection that holds the URL or key"
+        )
+    served = set(getattr(kind, "events", EVENTS))
+    missing = [e for e in route.events if e not in served]
+    if missing:
+        errors.append(f"{where}.events: a {route.kind} route cannot send {', '.join(missing)}")
+    try:
+        found = kind.check(route) if callable(getattr(kind, "check", None)) else ()
+        problems = [found] if isinstance(found, str) else list(found or ())
+    except Exception as exc:  # noqa: BLE001 - a plugin bug is a finding, named by type only
+        errors.append(f"{where}: the {route.kind} kind's check raised {type(exc).__name__}")
+        return
+    errors += [f"{where}: {problem}" for problem in problems if isinstance(problem, str)]
+    if "sla_miss" in route.events and not getattr(kind, "supports_async", False):
+        warnings.append(
+            f"{where} alerts on sla_miss, but its {route.kind} notifier has no async_notify: "
+            "Airflow 3 has no SLAs and runs a deadline alert's notifier in the triggerer, so "
+            "this route alerts on a missed SLA on Airflow 2 only"
+        )
+
+
+def _read_contract(
+    contract: Mapping[str, Any],
+) -> Tuple[List[AlertRoute], Optional[int], bool, List[str], List[str]]:
+    """``(routes, sla seconds, take defaults, errors, warnings)`` of the contract's block."""
+    errors: List[str] = []
+    warnings: List[str] = []
+    block = _block(contract)
+    if block is None:
+        return [], None, True, errors, warnings
+    if not isinstance(block, Mapping):
+        return [], None, True, ["alerts must be a mapping"], warnings
+    unknown = sorted(str(k) for k in block if k not in _ALERTS_KEYS)
+    if unknown:
+        errors.append(f"alerts has keys it does not read: {', '.join(unknown)}")
+    take_defaults = block.get("defaults", True)
+    if not isinstance(take_defaults, bool):
+        errors.append("alerts.defaults must be true or false")
+        take_defaults = True
+    sla: Optional[int] = None
+    if block.get("sla") is not None:
+        sla = parse_duration(block.get("sla"))
+        if sla is None or sla <= 0 or sla > MAX_SLA_SECONDS:
+            errors.append(
+                "alerts.sla must be an ISO-8601 duration from PT1S to P30D, in weeks, days, "
+                "hours, minutes and seconds (PT4H, P1DT6H)"
+            )
+            sla = None
+    raw_routes = block.get("routes", [])
+    if not isinstance(raw_routes, (list, tuple)):
+        return [], sla, take_defaults, errors + ["alerts.routes must be a list"], warnings
+    routes: List[AlertRoute] = []
+    seen: Dict[str, int] = {}
+    for index, raw in enumerate(raw_routes):
+        where = f"alerts.routes[{index}]"
+        route = _read_route(raw, where, "contract", errors)
+        if route is None:
+            continue
+        if route.name in seen:
+            errors.append(f"{where}.name {route.name!r} is also alerts.routes[{seen[route.name]}]")
+            continue
+        seen[route.name] = index
+        _check_kind(route, where, errors, warnings)
+        if "sla_miss" in route.events and block.get("sla") is None:
+            errors.append(
+                f"{where} alerts on sla_miss, but alerts.sla is not set: set the SLA the "
+                "route watches (alerts.sla: PT4H)"
+            )
+        routes.append(route)
+    return routes, sla, take_defaults, errors, warnings
+
+
+def _read_defaults(
+    taken: Sequence[AlertRoute],
+) -> Tuple[List[AlertRoute], List[str], List[str]]:
+    """The org packs' default routes the contract does not replace: ``(routes, errors,
+    warnings)``. A contract route of the same name replaces a default."""
+    errors: List[str] = []
+    warnings: List[str] = []
+    try:
+        packs = default_routes()
+    except AlertRouteError as exc:
+        return [], [str(exc)], warnings
+    own = {route.name for route in taken}
+    routes: List[AlertRoute] = []
+    seen: Dict[str, str] = {}
+    for entry, raw_routes in packs:
+        origin = f"org default {entry}"
+        for index, raw in enumerate(raw_routes):
+            where = f"the default alert routes {entry!r}: routes[{index}]"
+            route = _read_route(raw, where, origin, errors)
+            if route is None:
+                continue
+            if route.name in seen:
+                errors.append(
+                    f"{where}: the route name {route.name!r} is also one of the default alert "
+                    f"routes {seen[route.name]!r}"
+                )
+                continue
+            seen[route.name] = entry
+            if route.name in own:
+                continue
+            _check_kind(route, where, errors, warnings)
+            routes.append(route)
+    return routes, errors, warnings
+
+
+def _sla_warning(routes: Sequence[AlertRoute], sla: Optional[int]) -> List[str]:
+    if sla is not None and not any("sla_miss" in route.events for route in routes):
+        return ["alerts.sla is set, but no route alerts on sla_miss, so a missed SLA alerts no one"]
+    return []
+
+
+def contract_alert_findings(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
+    """``(errors, warnings)`` about the contract's own ``alerts`` block.
+
+    Loads the plugin of each kind a route names. The org packs' defaults are
+    :func:`default_alert_findings`'s.
+    """
+    routes, sla, take_defaults, errors, warnings = _read_contract(contract)
+    if not take_defaults:
+        warnings += _sla_warning(routes, sla)
+    return errors, warnings
+
+
+def default_alert_findings(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
+    """``(errors, warnings)`` about the org packs' default routes this contract takes.
+
+    Runs the ``fluid_build.alert_defaults`` entry points (and the plugin of each kind they
+    name): ``fluid validate``'s plugin phase.
+    """
+    routes, sla, take_defaults, _errors, _warnings = _read_contract(contract)
+    if not take_defaults:
+        return [], []
+    defaults, errors, warnings = _read_defaults(routes)
+    if not _errors:
+        warnings += _sla_warning([*routes, *defaults], sla)
+    return errors, warnings
+
+
+def read_alert_plan(contract: Mapping[str, Any], *, defaults: bool = True) -> AlertPlan:
+    """The routes the contract's DAGs alert through: its own, then the org packs' defaults
+    it takes (``defaults=False`` leaves those out). Raises :class:`AlertRouteError` naming
+    every problem :func:`contract_alert_findings` and :func:`default_alert_findings` find."""
+    routes, sla, take_defaults, errors, _warnings = _read_contract(contract)
+    if defaults and take_defaults:
+        extra, default_errors, _ = _read_defaults(routes)
+        routes += extra
+        errors += default_errors
+    if len(routes) > MAX_ROUTES:
+        errors.append(f"a product may have at most {MAX_ROUTES} alert routes, defaults included")
+    if errors:
+        raise AlertRouteError("the alert routes cannot be rendered: " + "; ".join(errors))
+    return AlertPlan(routes=tuple(routes), sla_seconds=sla)
+
+
+# ── the calls one DAG makes ──────────────────────────────────────────────────
+
+
+def _literal_problem(value: Any, depth: int = 0) -> str:
+    """Why a notifier keyword argument cannot be written into a DAG as a literal, or ``""``."""
+    if depth > 8:
+        return "is nested too deep"
+    if value is None or isinstance(value, (bool, int, str)):
+        return ""
+    if isinstance(value, float):
+        return "" if math.isfinite(value) else "is not a finite number"
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            problem = _literal_problem(item, depth + 1)
+            if problem:
+                return problem
+        return ""
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                return "has a key that is not a string"
+            problem = _literal_problem(item, depth + 1)
+            if problem:
+                return problem
+        return ""
+    return f"holds a {type(value).__name__}, which is not a literal"
+
+
+def notifier_calls(
+    plan: AlertPlan, event: str, *, dag_id: str, product_id: str
+) -> List[NotifierCall]:
+    """The notifier each route of ``plan`` sends ``event`` of the DAG ``dag_id`` through.
+
+    ``dag_id`` and ``product_id`` must be validated identifiers. Raises
+    :class:`AlertRouteError` when a kind's ``kwargs`` raises or returns what cannot be
+    written into the DAG as literals.
+    """
+    if not plan.listens(event):
+        return []
+    calls: List[NotifierCall] = []
+    for route in plan.routes:
+        if event not in route.events:
+            continue
+        kind = kind_for(route.kind)
+        alert = make_alert(
+            event,
+            dag_id=dag_id,
+            product_id=product_id,
+            severity=route.severity_for(event),
+            sla_seconds=plan.sla_seconds,
+        )
+        try:
+            kwargs = dict(kind.kwargs(route, alert))
+        except Exception as exc:  # noqa: BLE001 - a plugin bug refuses the DAG, type only
+            raise AlertRouteError(
+                f"alert route {route.name!r}: its {route.kind} kind raised "
+                f"{type(exc).__name__} building the notifier's arguments"
+            ) from None
+        for key, value in kwargs.items():
+            if not isinstance(key, str) or not key.isidentifier() or keyword.iskeyword(key):
+                raise AlertRouteError(
+                    f"alert route {route.name!r}: its {route.kind} kind returned an argument "
+                    "name that is not a Python identifier"
+                )
+            if key in _RESERVED_KWARGS:
+                raise AlertRouteError(
+                    f"alert route {route.name!r}: its {route.kind} kind sets {key!r}, which "
+                    "Airflow passes itself"
+                )
+            problem = _literal_problem(value)
+            if problem:
+                raise AlertRouteError(
+                    f"alert route {route.name!r}: its {route.kind} kind's argument {key!r} "
+                    f"{problem}"
+                )
+        module, _, name = str(kind.notifier).partition(":")
+        calls.append(
+            NotifierCall(
+                module=module,
+                name=name,
+                kwargs=kwargs,
+                route=route.name,
+                supports_async=bool(getattr(kind, "supports_async", False)),
+            )
+        )
+    return calls
+
+
+def requirements(plan: AlertPlan) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """``(requirements, deadline requirements)`` of the kinds ``plan`` uses, each sorted."""
+    need: Set[str] = set()
+    deadline: Set[str] = set()
+    for route in plan.routes:
+        kind = kind_for(route.kind)
+        need.update(getattr(kind, "requirements", ()) or ())
+        if "sla_miss" in route.events and plan.sla_seconds is not None:
+            deadline.update(getattr(kind, "async_requirements", ()) or ())
+    return tuple(sorted(need)), tuple(sorted(deadline))
+
+
+__all__ = [
+    "AlertPlan",
+    "MAX_ROUTES",
+    "MAX_SLA_SECONDS",
+    "NOT_SHOWN",
+    "contract_alert_findings",
+    "default_alert_findings",
+    "notifier_calls",
+    "parse_duration",
+    "read_alert_plan",
+    "requirements",
+]

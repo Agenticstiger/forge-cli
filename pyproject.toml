@@ -645,6 +645,10 @@ databricks = "fluid_build.providers.databricks:DatabricksProvider"
 # ``fluid import <tool>`` sources are a discovered plugin group (``fluid_build.importers``), declared
 # by THIRD-PARTY packages only; ``cli/import_workflow/registry.py`` documents its shape and policy.
 
+# Alert route kinds (``fluid_build.alert_notifiers``) and an organisation's default alert routes
+# (``fluid_build.alert_defaults``) for the DAGs forge generates are discovered plugin groups,
+# declared by THIRD-PARTY packages only; ``alerts/plugins.py`` documents their shape and policy.
+
 [project.urls]
 Homepage = "https://agenticstiger.github.io/forge_docs/"
 Repository = "https://github.com/Agenticstiger/forge-cli"
@@ -991,6 +995,15 @@ module = [
     # tables the plan holds, and the refusal of one it still updates.
     "fluid_build.iac.table_hold",
     "fluid_build.cli._apply_table_hold",
+    # Alerts in the generated DAGs: which plugin kind may load, what a route may carry into a
+    # DAG (no secret, no template syntax) and what code the DAG imports and calls, so a silent
+    # Any is a silent leak or a silent missing alert.
+    "fluid_build.alerts.__init__",
+    "fluid_build.alerts.builtin",
+    "fluid_build.alerts.model",
+    "fluid_build.alerts.plugins",
+    "fluid_build.alerts.routes",
+    "fluid_build.schedulers.airflow._alerts",
 ]
 strict = true
 

@@ -356,6 +356,10 @@
       "$ref": "#/$defs/orchestration",
       "description": "Top-level orchestration configuration for scheduling and workflow engines."
     },
+    "alerts": {
+      "$ref": "#/$defs/alerts",
+      "description": "NEW in v0.7.7: Who hears about the failures, retries, successes and missed SLAs of the DAGs forge generates for this product, and how. Each route names a kind and the scheduler connection that holds the address, URL or key; the secret is never in the contract."
+    },
     "retention": {
       "$ref": "#/$defs/retention",
       "description": "NEW in v0.7.3: Retention durations for run state, run logs, lineage events, and DLQ records. Honored by the retention sweeper invoked from policy-apply."
@@ -6460,6 +6464,108 @@
         },
         "prefect": {
           "type": "object"
+        }
+      }
+    },
+    "alerts": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "NEW in v0.7.7: The alert routes of the product's DAGs. The Airflow DAG renderers put each route's notifier on the DAG's callbacks: a task that failed for good (failure) or will retry (retry), a run that succeeded (success) and a run not done in time (sla_miss). An organisation's pack can add default routes; defaults: false leaves them out, and a route of the same name replaces one.",
+      "properties": {
+        "sla": {
+          "type": "string",
+          "pattern": "^P(?=\\d|T\\d)(\\d+W)?(\\d+D)?(T(?=\\d)(\\d+H)?(\\d+M)?(\\d+S)?)?$",
+          "description": "How long a run may take before its sla_miss routes alert, as an ISO-8601 duration in weeks, days, hours, minutes and seconds (PT4H, P1DT6H), at most P30D. On Airflow 2 it is every task's sla; on Airflow 3.1+, which has no SLAs, a deadline alert that long after the run was queued."
+        },
+        "defaults": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether the product takes the default routes of the organisation's installed packs (the fluid_build.alert_defaults entry points)."
+        },
+        "routes": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "$ref": "#/$defs/alertRoute"
+          }
+        }
+      }
+    },
+    "alertRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "kind"
+      ],
+      "description": "NEW in v0.7.7: One alert route. A route carries no secret: connection names the scheduler connection that holds it.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+        },
+        "kind": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "description": "email (SmtpNotifier), slack (SlackWebhookNotifier), webhook (HttpNotifier, see format), pagerduty (PagerdutyNotifier), or a kind an installed package registers under the fluid_build.alert_notifiers entry points."
+        },
+        "events": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "failure",
+              "retry",
+              "success",
+              "sla_miss"
+            ]
+          },
+          "default": [
+            "failure"
+          ],
+          "description": "What the route alerts on. success resolves an incident a failure opened (zenduty and opsgenie formats, pagerduty). sla_miss needs alerts.sla."
+        },
+        "connection": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,249}$",
+          "description": "The Airflow connection id that holds the address, URL or key: the scheduler's secrets backend serves it. Required for webhook; email, slack and pagerduty default to smtp_default, slack_default and pagerduty_events_default."
+        },
+        "to": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._+-]{1,64}@[A-Za-z0-9-]{1,63}(\\.[A-Za-z0-9-]{1,63})+$"
+          },
+          "description": "email only: the addresses to send to."
+        },
+        "from": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._+-]{1,64}@[A-Za-z0-9-]{1,63}(\\.[A-Za-z0-9-]{1,63})+$",
+          "description": "email only: the sender; without it the SMTP connection's from_email (or Airflow 2's [smtp] smtp_mail_from)."
+        },
+        "format": {
+          "enum": [
+            "generic",
+            "zenduty",
+            "opsgenie"
+          ],
+          "description": "webhook only: the JSON the route posts. generic is forge's own document; zenduty a Zenduty Generic Integration event (the integration URL is the connection's host); opsgenie an Opsgenie Alert API request (the alerts URL is the host, the GenieKey header is in the connection's extra)."
+        },
+        "severity": {
+          "enum": [
+            "critical",
+            "error",
+            "warning",
+            "info"
+          ],
+          "description": "The severity of the route's failure, retry and sla_miss alerts; by default critical for failure and warning for retry and sla_miss."
+        },
+        "options": {
+          "type": "object",
+          "description": "A plugin kind's own settings: JSON values whose strings hold no '{' or '}', no URL and no secret."
         }
       }
     },

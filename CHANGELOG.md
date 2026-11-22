@@ -47,6 +47,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The Airflow DAGs forge generates alert on failure, retry, success and a missed SLA, through
+  Airflow's own notifiers, from routes the contract declares (schema 0.7.7 `alerts`).** A route
+  names a kind and the Airflow connection that holds the address, URL or key: `email`
+  (`SmtpNotifier`, `to`, optional `from`), `slack` (`SlackWebhookNotifier`), `webhook`
+  (`HttpNotifier`, http provider 5.5.0+: `format: generic`, forge's own JSON; `zenduty`, a Generic
+  Integration event whose URL is the connection's host; `opsgenie`, an Alert API request whose
+  `GenieKey` header is in the connection's extra) and `pagerduty` (`PagerdutyNotifier`: Events API
+  v2 puts the routing key in the request body, so a generic webhook would have written it into the
+  DAG). `events` picks `failure` (the default: a task failed for good), `retry`, `success` (the
+  run succeeded; it resolves the incident in Zenduty, Opsgenie and PagerDuty, one dedup key per
+  DAG) and `sla_miss` with `alerts.sla` (an ISO duration up to P30D): on Airflow 2 every task's
+  `sla` and the DAG's `sla_miss_callback`; on Airflow 3.1+, which has no SLAs, a `DeadlineAlert`
+  on the run's queued time whose `AsyncCallback` runs the notifier in the triggerer, built inside
+  `try` because the API is experimental, so a change to it costs a DAG its deadline alerts and
+  never its import; Airflow 3.0 has neither, as the DAG's documentation says. Both renderers carry
+  them (`fluid generate schedule` and `generate artifacts` for scheduled builds and keepalives,
+  and the `orchestration` renderer): `ALERT_TASK_ARGS` merged into `default_args`,
+  `ALERT_DAG_ARGS` passed to `DAG`, and an `alert(notifier, **kwargs)` callback that builds a new
+  notifier from a copy of its arguments each time, since `BaseNotifier` renders its template fields
+  in place. A contract without routes renders the same file as before. A route never holds a
+  secret: a URL, an address with a password or a key-shaped value in `connection` is refused at
+  `fluid validate` and at render without being shown (the schema's own message, which quotes the
+  value, is dropped for it), and every string a route gives holds no `{` or `}`, no URL and nothing
+  the redactor masks. An organisation's pack adds default routes to every product through the new
+  `fluid_build.alert_defaults` entry points (a contract replaces one by its name, or leaves them
+  out with `alerts.defaults: false`), and a package adds a kind through `fluid_build.alert_notifiers`
+  with the base class `fluid_build.alerts.AlertNotifier` or any object with its attributes: read by
+  name and loaded only when a route names the kind, under `FLUID_PLUGINS_ALLOWLIST` /
+  `FLUID_PLUGINS_BLOCKLIST`, a built-in name reserved, two distributions of one name both refused,
+  and a missing or failing kind refusing the route (by exception type only) rather than leaving it
+  out. `fluid plugins` lists both groups without importing them. Checked live: the generated DAGs
+  sent each route's alert on Airflow 2.10.5 and 3.4.0 (`dag.test()` for failure, retry and
+  success; the SLA miss and the deadline alert as Airflow calls them). New validate checks
+  `contract_alerts` and `contract_alert_defaults`.
+
 - **`fluid import airflow|pyspark` reads an estate whose code builds its commands in loops, picks
   its jobs by name, takes its environment from Airflow Variables, and groups its products by DAG
   task.** What a measured sample estate lost, each read without running anything: a writer or reader
@@ -754,6 +789,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   type family, so a contract written that way does not fail at apply.
 
 ### Security
+
+- **Both redaction layers mask the secrets of an alert route's connection**: Zenduty Generic
+  Integration and events-API URLs and PagerDuty integration URLs (US and EU), whose paths hold the
+  key, Opsgenie's `GenieKey` header value, and PagerDuty's `routing_key` / `integration_key` by
+  name, in `observability/secret_redactor.py` and the Snowflake provider's `redact_string`. The
+  Snowflake twin checks `GenieKey` before its `authorization=` rule, which would otherwise take the
+  word for the value and leave the key.
 
 - An address with an IPv6 zone id, such as `::1%lo0`, is no longer read as this machine. The
   secret destination policy judges it like any other host, and an OpenBao or Vault address on
