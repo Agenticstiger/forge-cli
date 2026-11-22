@@ -395,6 +395,144 @@ def test_dicts_lists_and_incomplete_containers():
     assert isinstance(lookup("text", "k"), Unresolved)
 
 
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        ("x = dict(script='a.py', day=1)", {"script": "a.py", "day": 1}),
+        ("B = {'k': 'v'}\nx = dict(B, j='w')", {"k": "v", "j": "w"}),
+        ("B = {'k': 'v'}\nx = dict(**B, j='w')", {"k": "v", "j": "w"}),
+        ("x = dict()", {}),
+        ("D = {'k': 'v'}\nx = D.get('k')", "v"),
+        ("D = {'k': 'v'}\nx = D.get('nope', 'dflt')", "dflt"),
+        ("D = {'k': 'v'}\nx = D.get('nope')", None),
+        ("D = dict(k='v')\nx = D.get('k') + '!'", "v!"),
+        ("D = {1: 'one'}\nx = D.get(1)", "one"),
+    ],
+)
+def test_dict_calls_and_get_fold_as_the_literal_they_build(source, expected):
+    value = _fold(source)
+    assert value == expected and getattr(value, "complete", True)
+
+
+@pytest.mark.parametrize(
+    "source, why",
+    [
+        ("def dict(**kw):\n    return kw\nx = dict(k='v')", "the result of a call"),
+        ("dict = lambda **kw: kw\nx = dict(k='v')", "the result of a call"),
+        ("from acme import dict\nx = dict(k='v')", "the result of a call"),
+        ("x = dict([('k', 'v')])", "not a dict"),
+        ("x = dict({'a': 1}, {'b': 2})", "more than one mapping"),
+        ("import os\nD = {**os.environ}\nx = D.get('k', 'dflt')", "not a literal"),
+        ("D = {'k': 'v'}\nx = D.get(key)", "not defined"),
+        ("D = {'k': 'v'}\nx = D.get('k', default='d')", "dict.get with other arguments"),
+        ("D = {'k': 'v'}\nD['k'] = 'changed'\nx = D.get('k')", "the result of a call"),
+    ],
+)
+def test_a_dict_call_or_get_that_is_not_known_is_unresolved(source, why):
+    assert why in _why(_fold(source))
+
+
+def test_an_incomplete_dict_call_keeps_what_it_knows_and_says_it_is_not_whole():
+    value = _fold("import os\nx = dict(**os.environ, k='v')")
+    assert isinstance(value, FoldedDict) and value["k"] == "v" and not value.complete
+    assert isinstance(lookup(value, "other"), Unresolved)
+
+
+def test_a_scope_knows_the_names_bound_by_one_def_and_the_parameters_bound_again():
+    module = P.parse_module(
+        "m.py",
+        (
+            "def once():\n    pass\n"
+            "def twice():\n    pass\n"
+            "def twice():\n    pass\n"
+            "def then_assigned():\n    pass\n"
+            "then_assigned = 1\n"
+            "with ctx:\n    def under_with():\n        pass\n"
+            "if flag:\n    def under_if():\n        pass\n"
+            "class Cls:\n    pass\n"
+            "def run(kept, again, added, looped, imported, *rest, **kwargs):\n"
+            "    again = again.strip()\n"
+            "    added += 1\n"
+            "    for looped in []:\n        pass\n"
+            "    import imported\n"
+            "    def inner():\n        pass\n"
+            "    return kept\n"
+        ).encode("utf-8"),
+    )
+    folder = Folder(module)
+    top = folder.scope_of(module.tree)
+    assert set(top.functions) == {"once", "under_with", "under_if", "run"}
+    run = top.functions["run"]
+    scope = folder.function_scope(run)
+    assert scope.parameters == {"kept", "again", "added", "looped", "imported", "rest", "kwargs"}
+    assert scope.rebound_parameters == {"again", "added", "looped", "imported"}
+    assert set(scope.functions) == {"inner"}
+
+
+def test_a_function_folded_with_what_its_caller_passes():
+    module = P.parse_module(
+        "m.py",
+        (
+            "ROOT = 's3://code'\n"
+            "def submit(script, day, **kwargs):\n"
+            "    path = f'{ROOT}/{script}'\n"
+            "    args = [path, kwargs['env'], day]\n"
+            "    def inner():\n        return script\n"
+            "    return args\n"
+        ).encode("utf-8"),
+    )
+    folder = Folder(module)
+    submit = module.tree.body[1]
+    assign = submit.body[1]  # args = [...]
+    inner_return = submit.body[2].body[0].value  # the `script` that inner() returns
+    assert "is a parameter" in _why(folder.fold(assign.value)[0])
+    env = FoldedDict({"env": "prod"})
+    with folder.bound(submit, {"script": "jobs/a.py", "kwargs": env}):
+        value = folder.fold(assign.value)
+        assert value[:2] == ["s3://code/jobs/a.py", "prod"]
+        assert "is a parameter" in _why(value[2])  # `day` is not passed
+        assert folder.fold(inner_return) == "jobs/a.py"  # a function inside sees it too
+    # nothing folded meanwhile is remembered for later
+    assert "is a parameter" in _why(folder.fold(assign.value)[0])
+    assert "is a parameter" in _why(folder.fold(inner_return))
+
+
+@pytest.mark.parametrize(
+    "why, expected",
+    [
+        ("`cfg.paths.ROOT` is not in the scanned files", ("module", "cfg.paths.ROOT")),
+        ("`ROOT` is imported from outside the scanned files", ("module", "ROOT")),
+        ("the environment variable ENV", ("environment", "ENV")),
+        ("the Airflow Variable region", ("airflow_variable", "region")),
+        ("the Airflow Variable region is read as JSON", None),
+        ("`day` is a parameter of the function", None),
+        ("the result of a call to f()", None),
+        ("an environment variable", None),
+    ],
+)
+def test_the_reasons_that_name_a_value_the_conventions_can_give(why, expected):
+    from fluid_build.cli.import_workflow._fold import missing_value
+
+    assert missing_value(why) == expected
+
+
+def test_the_reasons_the_folder_gives_are_the_ones_it_classifies(tmp_path):
+    from fluid_build.cli.import_workflow._fold import missing_value
+
+    _write(tmp_path, {"job.py": "from acme_cfg import ROOT\nx = f'{ROOT}/a.py'\n"})
+    walk = P.find_python_files(tmp_path)
+    index = ModuleIndex(walk.files)
+    module = index.load(walk.files[0])
+    assert module is not None
+    node = next(n for n in module.tree.body if isinstance(n, ast.Assign))
+    assert missing_value(_why(index.folder(module).fold(node.value))) == (
+        "module",
+        "acme_cfg.ROOT",
+    )
+    environment = _fold("import os\nx = os.environ['STAGE']")
+    assert missing_value(_why(environment)) == ("environment", "STAGE")
+
+
 def test_a_tuple_and_a_list_differ_as_percent_operands():
     assert _fold("x = '%s' % ('a',)") == "a"
     assert "not text" in _why(_fold("x = '%s' % ['a']"))
