@@ -68,9 +68,11 @@ def test_a_staging_path_is_found_through_another_spelling_of_it(
         spark.table("raw.a").write.parquet("{written}")
         spark.read.parquet("{read}").write.saveAsTable("mart.y")
         spark.table("raw.other").write.saveAsTable("mart.z")
+        spark.table("raw.third").count()
         """,
         IGNORE_PATHS,
     )
+    # found by its spelling: not by listing everything the job reads
     assert got == {"mart.y": ["raw.a"], "mart.z": ["raw.other"]}
 
 
@@ -120,6 +122,22 @@ def test_a_read_of_an_ignored_path_that_no_written_path_matches_makes_the_produc
         IGNORE_PATHS,
     )
     assert got == {"mart.y": ["raw.a"], "mart.z": ["raw.other"]}
+
+
+def test_a_path_that_does_not_fold_is_not_the_root_path_a_job_wrote(tmp_path, monkeypatch):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        """
+        import os
+
+        spark.table("raw.a").write.parquet("/")
+        spark.read.parquet(os.environ["X"]).write.saveAsTable("mart.y")
+        spark.table("raw.other").write.saveAsTable("mart.z")
+        """,
+        "defaults: {domain: retail, platform: aws}\nignore: {paths: ['^/$']}\n",
+    )
+    assert "raw.a" not in got["mart.y"] and got["mart.z"] == ["raw.other"]
 
 
 def test_a_read_of_a_path_that_is_listed_is_not_loose_for_want_of_a_bridge(tmp_path, monkeypatch):
@@ -279,8 +297,17 @@ spark.table("raw.d").write.saveAsTable("mart.z")
         'fmt = "console"\nif c:\n    fmt = "memory"\n'
         'spark.readStream.table("raw.a").writeStream.format(fmt).queryName("m1").start()\n',
         'spark.readStream.table("raw.a").writeStream.format("memory").queryName(name).start()\n',
+        'import os\nspark.readStream.table("raw.a").writeStream.queryName("m1")'
+        '.start(format=os.environ["F"])\n',
     ],
-    ids=["reassigned writer", "picked by a condition", "in a container", "format", "name"],
+    ids=[
+        "reassigned writer",
+        "picked by a condition",
+        "in a container",
+        "format",
+        "name",
+        "format argument",
+    ],
 )
 def test_a_memory_sink_the_reader_cannot_follow_leaves_a_bare_name_uncertain(
     tmp_path, monkeypatch, sink
@@ -301,9 +328,10 @@ def test_a_start_in_a_file_that_writes_no_stream_does_not_make_a_name_uncertain(
         threading.Thread(target=print).start()
         spark.sql("INSERT INTO mart.y SELECT * FROM m1")
         spark.table("raw.d").write.saveAsTable("mart.z")
+        spark.table("raw.third").count()
         """,
     )
-    assert got == {"mart.y": ["m1"], "mart.z": ["raw.d"]}
+    assert got == {"mart.y": ["m1"], "mart.z": ["raw.d"]}  # closed: no read of raw.third
 
 
 @pytest.mark.parametrize(
@@ -325,6 +353,24 @@ def test_the_query_name_of_a_memory_sink_is_a_view_however_it_is_given(tmp_path,
     got = consumed(tmp_path, monkeypatch, sink + AFTER_SINK)
     # the statement reads a view: it is not closed, and the view is not listed as a table
     assert got["mart.y"] == ["raw.s"] and got["mart.z"] == ["raw.d"]
+
+
+def test_a_sink_with_a_path_and_a_format_that_is_not_a_constant_is_still_a_write(
+    tmp_path, monkeypatch
+):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        """
+        import os
+
+        spark.readStream.table("raw.s").writeStream.format(os.environ["F"]).option(
+            "path", "s3://out/x"
+        ).option("checkpointLocation", "s3://cp/x").start()
+        spark.table("raw.d").write.saveAsTable("mart.z")
+        """,
+    )
+    assert got["out.x"] == ["raw.s"] and got["mart.z"] == ["raw.d"]
 
 
 def test_a_sink_whose_last_format_is_not_memory_names_no_view(tmp_path, monkeypatch):
@@ -418,6 +464,7 @@ def reads_of(text: str) -> List[str]:
         ),
         ("WITH RECURSIVE r AS (SELECT 1 UNION ALL SELECT * FROM r) SELECT * FROM r", []),
         ("WITH X AS (SELECT * FROM raw.a) SELECT * FROM x", ["raw.a"]),
+        ("WITH x AS (SELECT * FROM raw.a) SELECT * FROM X", ["raw.a"]),
         ("WITH x AS (SELECT * FROM raw.a) SELECT * FROM db.x", ["raw.a", "db.x"]),
     ],
     ids=[
@@ -429,7 +476,8 @@ def reads_of(text: str) -> List[str]:
         "nested",
         "both branches of the query",
         "recursive",
-        "case",
+        "case of the definition",
+        "case of the reference",
         "qualified name is a table",
     ],
 )
