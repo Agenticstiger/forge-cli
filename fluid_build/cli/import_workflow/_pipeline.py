@@ -351,6 +351,54 @@ def _check_valid(contracts: Sequence[Dict[str, Any]], report: ImportReport) -> N
         )
 
 
+def _report_joins(linked: Sequence[LinkedTask], not_joined: int, report: ImportReport) -> None:
+    """The note on how many submitted scripts were joined to a job file, and by what, and a line
+    for each task joined by the file name alone."""
+    by_how: Dict[str, int] = {}
+    seen_submits: set = set()
+    for link in linked:
+        if id(link.submit) not in seen_submits:  # a driver's one script joins several jobs
+            seen_submits.add(id(link.submit))
+            by_how[link.how] = by_how.get(link.how, 0) + 1
+        if link.how == "name":
+            report.unsupported.append(
+                f"DAG {safe_text(link.dag.shown, 60)} task {safe_text(link.task.shown, 60)} submits "
+                f"{safe_text(link.submit.script or '', 100)}: joined to a job file by file name only"
+            )
+    through_driver = sum(1 for link in linked if link.how == "driver")
+    report.notes.append(
+        f"{len(seen_submits)} submitted script(s) joined to a job file"
+        + (
+            f" ({', '.join(f'{n} by {how}' for how, n in sorted(by_how.items()))})"
+            if by_how
+            else ""
+        )
+        + (f"; {through_driver} job file(s) run through a driver" if through_driver else "")
+        + f"; {not_joined} not joined"
+    )
+
+
+def _report_unlinked(
+    tool: str, unlinked: Sequence[Tuple[Any, Any, Any, str]], report: ImportReport
+) -> None:
+    """A line for each task whose script was not joined to a job file."""
+    for dag, task, submit, why in unlinked:
+        line = (
+            f"DAG {safe_text(dag.shown, 60)} task {safe_text(task.shown, 60)} "
+            f"({task.file}:{submit.line}) submits "
+            f"{safe_text(submit.script or submit.shown or '(no script)', 100)}: not joined ({safe_text(why, 120)})"
+        )
+        if tool == "airflow" and submit.script:
+            report.unsupported.append(
+                line + "; map its prefix under `script_roots` in the conventions, or run "
+                "`fluid import pyspark <jobs-dir> --dags <dags-dir>`"
+            )
+        elif tool == "airflow":
+            report.unsupported.append(line)
+        else:
+            report.notes.append(line)
+
+
 def _scan_report(
     tool: str,
     scans: Sequence[JobScan],
@@ -395,43 +443,8 @@ def _scan_report(
                         f"DAG {safe_text(dag.shown, 60)} task {safe_text(task.shown, 60)} "
                         f"({task.file}:{task.line}): {safe_text(note, 200)}"
                     )
-        by_how: Dict[str, int] = {}
-        seen_submits: set = set()
-        for link in linked:
-            if id(link.submit) not in seen_submits:  # a driver's one script joins several jobs
-                seen_submits.add(id(link.submit))
-                by_how[link.how] = by_how.get(link.how, 0) + 1
-            if link.how == "name":
-                report.unsupported.append(
-                    f"DAG {safe_text(link.dag.shown, 60)} task {safe_text(link.task.shown, 60)} submits "
-                    f"{safe_text(link.submit.script or '', 100)}: joined to a job file by file name only"
-                )
-        through_driver = sum(1 for link in linked if link.how == "driver")
-        report.notes.append(
-            f"{len(seen_submits)} submitted script(s) joined to a job file"
-            + (
-                f" ({', '.join(f'{n} by {how}' for how, n in sorted(by_how.items()))})"
-                if by_how
-                else ""
-            )
-            + (f"; {through_driver} job file(s) run through a driver" if through_driver else "")
-            + f"; {len(unlinked)} not joined"
-        )
-        for dag, task, submit, why in unlinked:
-            line = (
-                f"DAG {safe_text(dag.shown, 60)} task {safe_text(task.shown, 60)} "
-                f"({task.file}:{submit.line}) submits "
-                f"{safe_text(submit.script or submit.shown or '(no script)', 100)}: not joined ({safe_text(why, 120)})"
-            )
-            if tool == "airflow" and submit.script:
-                report.unsupported.append(
-                    line + "; map its prefix under `script_roots` in the conventions, or run "
-                    "`fluid import pyspark <jobs-dir> --dags <dags-dir>`"
-                )
-            elif tool == "airflow":
-                report.unsupported.append(line)
-            else:
-                report.notes.append(line)
+        _report_joins(linked, len(unlinked), report)
+        _report_unlinked(tool, unlinked, report)
         no_dag = [j for j in jobs if not j.tasks]
         if tool == "pyspark" and no_dag:
             report.notes.append(f"{len(no_dag)} job(s) are submitted by no DAG task read here")
