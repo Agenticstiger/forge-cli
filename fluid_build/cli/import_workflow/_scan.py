@@ -328,6 +328,52 @@ def _driven(
     return list(found.values())
 
 
+class _Resolver:
+    """What a submit runs: the job files it names and how it was matched, or why it is not joined.
+    A script text answers the same every time (the tasks of a project share a few), and so does a
+    driver run, so each is worked out once."""
+
+    def __init__(
+        self,
+        jobs: Sequence[JobRecord],
+        conventions: Conventions,
+        project_root: Optional[Path],
+        notes: Optional[List[str]],
+        budget: Optional[SourceBudget],
+    ) -> None:
+        self._conventions = conventions
+        self._project_root = project_root
+        self._notes = notes
+        self._by_path = {job.path: job for job in jobs}
+        self._by_name: Dict[str, List[JobRecord]] = {}
+        for job in jobs:
+            self._by_name.setdefault(job.rel.rsplit("/", 1)[-1], []).append(job)
+        self._lists = Lists(budget) if conventions.drivers else None
+        self._answers: Dict[str, "Tuple[JobRecord, str] | str"] = {}
+        self._driven: Dict[Tuple[str, Tuple[str, ...]], "List[JobRecord] | str"] = {}
+        self._reported: set = set()
+
+    def resolve(self, submit: Submit) -> "Tuple[Sequence[JobRecord], str] | str":
+        script = submit.script
+        if script is None:
+            return submit.why or "no script"
+        driver = driver_for(script, self._conventions.drivers) if self._lists else None
+        if driver is not None and self._lists is not None:
+            key = (script, submit.args)
+            runs = self._driven.get(key)
+            if runs is None:
+                runs = self._driven[key] = _driven(
+                    driver, submit, self._lists, self._by_path, self._notes, self._reported
+                )
+            return runs if isinstance(runs, str) else (runs, "driver")
+        found = self._answers.get(script)
+        if found is None:
+            found = self._answers[script] = _match(
+                script, self._by_name, self._by_path, self._conventions, self._project_root
+            )
+        return found if isinstance(found, str) else ([found[0]], found[1])
+
+
 def link_tasks(
     dags: Sequence[Dag],
     scans: Sequence[JobScan],
@@ -336,63 +382,31 @@ def link_tasks(
     notes: Optional[List[str]] = None,
     budget: Optional[SourceBudget] = None,
 ) -> Tuple[List[LinkedTask], List[Tuple[Dag, Task, Submit, str]]]:
-    """Join every submit of every task to a job file of ``scans``. Returns ``(linked,
+    """Join every submit of every task to the job files of ``scans`` it runs. Returns ``(linked,
     unlinked)``; an unlinked submit comes with why. A job records at most
     :data:`MAX_TASKS_PER_JOB` tasks (the rest are counted in ``notes``). ``budget`` is what the
     job lists the conventions' ``drivers`` name are read against."""
-    jobs = [job for scan in scans for job in scan.jobs]
-    by_path = {job.path: job for job in jobs}
-    by_name: Dict[str, List[JobRecord]] = {}
-    for job in jobs:
-        by_name.setdefault(job.rel.rsplit("/", 1)[-1], []).append(job)
-    #: A script text answers the same every time: the tasks of a project share a few.
-    answers: Dict[str, "Tuple[JobRecord, str] | str"] = {}
+    resolver = _Resolver(
+        [job for scan in scans for job in scan.jobs], conventions, project_root, notes, budget
+    )
     over: Dict[str, int] = {}
     linked: List[LinkedTask] = []
     unlinked: List[Tuple[Dag, Task, Submit, str]] = []
-    lists = Lists(budget) if conventions.drivers else None
-    driven: Dict[Tuple[str, Tuple[str, ...]], "List[JobRecord] | str"] = {}
-    reported: set = set()
     for dag in dags:
         for task in dag.tasks:
             for submit in task.submits:
-                if submit.script is None:
-                    unlinked.append((dag, task, submit, submit.why or "no script"))
-                    continue
-                driver = driver_for(submit.script, conventions.drivers) if lists else None
-                if driver is not None and lists is not None:
-                    key = (submit.script, submit.args)
-                    runs = driven.get(key)
-                    if runs is None:
-                        runs = driven[key] = _driven(
-                            driver, submit, lists, by_path, notes, reported
-                        )
-                    if isinstance(runs, str):
-                        unlinked.append((dag, task, submit, runs))
-                        continue
-                    for job in runs:
-                        if len(job.tasks) >= MAX_TASKS_PER_JOB:
-                            over[job.shown] = over.get(job.shown, 0) + 1
-                            continue
-                        link = LinkedTask(dag, task, submit, "driver")
-                        job.tasks.append(link)
-                        linked.append(link)
-                    continue
-                found = answers.get(submit.script)
-                if found is None:
-                    found = answers[submit.script] = _match(
-                        submit.script, by_name, by_path, conventions, project_root
-                    )
+                found = resolver.resolve(submit)
                 if isinstance(found, str):
                     unlinked.append((dag, task, submit, found))
                     continue
-                job, how = found
-                if len(job.tasks) >= MAX_TASKS_PER_JOB:
-                    over[job.shown] = over.get(job.shown, 0) + 1
-                    continue
-                link = LinkedTask(dag, task, submit, how)
-                job.tasks.append(link)
-                linked.append(link)
+                targets, how = found
+                for job in targets:
+                    if len(job.tasks) >= MAX_TASKS_PER_JOB:
+                        over[job.shown] = over.get(job.shown, 0) + 1
+                        continue
+                    link = LinkedTask(dag, task, submit, how)
+                    job.tasks.append(link)
+                    linked.append(link)
     if notes is not None:
         for shown, count in sorted(over.items()):
             notes.append(

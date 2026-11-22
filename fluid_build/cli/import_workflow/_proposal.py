@@ -446,36 +446,9 @@ def _groups(outputs: List[Output], split_by: str, conv: Conventions, root_name: 
     are (a job's absolute path, a DAG id, a folder, ``None`` for files at the top), never by
     the label made from it, so two jobs named alike are two products."""
     keyed: Dict[Tuple[Any, ...], Group] = {}
-    writers = list({str(o.writer.path): o.writer for o in outputs}.values())
-    labels = _job_labels(writers)
+    labels = _job_labels(list({str(o.writer.path): o.writer for o in outputs}.values()))
     for output in outputs:
-        job = output.writer
-        key: Tuple[Any, ...]
-        if split_by == "table":
-            key, label = ("table", *output.identity.key), product_id(output.identity, conv)
-        elif split_by == "job":
-            key, label = ("job", str(job.path)), labels[str(job.path)]
-        elif split_by == "dag":
-            dag_ids = sorted({link.dag.dag_id for link in job.tasks if link.dag.dag_id})
-            if dag_ids:
-                key, label = ("dag", dag_ids[0]), ident(dag_ids[0])
-            else:
-                key, label = ("job", str(job.path)), labels[str(job.path)]
-        elif split_by == "task":
-            first = _first_links(job)
-            if first and first[0].task.task_id and first[0].dag.dag_id:
-                # the outputs of every job one task runs are one product (a driver's job list)
-                link = first[0]
-                key = ("task", link.dag.file, link.dag.line, link.task.key)
-                label = ident(f"{link.dag.dag_id}.{link.task.task_id}")
-            else:
-                key, label = ("job", str(job.path)), labels[str(job.path)]
-        elif split_by == "folder":
-            head = job.rel.split("/")[0] if "/" in job.rel else None
-            key = ("folder", head)
-            label = ident(head if head is not None else root_name, fallback="root")
-        else:  # project
-            key, label = ("project",), ident(root_name, fallback="project")
+        key, label = _key_and_label(split_by, output, conv, root_name, labels)
         if conv.domain and split_by != "table":
             label = ident(f"{conv.domain}.{label}")
         group = keyed.get(key)
@@ -483,6 +456,33 @@ def _groups(outputs: List[Output], split_by: str, conv: Conventions, root_name: 
             group = keyed[key] = Group(label=label)
         group.outputs.append(output)
     return list(keyed.values())
+
+
+def _key_and_label(
+    split_by: str, output: Output, conv: Conventions, root_name: str, labels: Dict[str, str]
+) -> Tuple[Tuple[Any, ...], str]:
+    """The key of the product ``output`` goes to, and the name that product gets."""
+    job = output.writer
+    if split_by == "table":
+        return ("table", *output.identity.key), product_id(output.identity, conv)
+    own = ("job", str(job.path)), labels[str(job.path)]  # a job's own product
+    if split_by == "job":
+        return own
+    if split_by == "dag":
+        dag_ids = sorted({link.dag.dag_id for link in job.tasks if link.dag.dag_id})
+        return (("dag", dag_ids[0]), ident(dag_ids[0])) if dag_ids else own
+    if split_by == "task":
+        first = _first_links(job)
+        if first and first[0].task.task_id and first[0].dag.dag_id:
+            # the outputs of every job one task runs are one product (a driver's job list)
+            link = first[0]
+            key = ("task", link.dag.file, link.dag.line, link.task.key)
+            return key, ident(f"{link.dag.dag_id}.{link.task.task_id}")
+        return own
+    if split_by == "folder":
+        head = job.rel.split("/")[0] if "/" in job.rel else None
+        return ("folder", head), ident(head if head is not None else root_name, fallback="root")
+    return ("project",), ident(root_name, fallback="project")
 
 
 def _first_links(job: JobRecord) -> List[LinkedTask]:

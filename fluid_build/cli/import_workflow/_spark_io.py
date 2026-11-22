@@ -953,6 +953,11 @@ class _Reader:
         for note in sql.notes:
             self._drop()  # SQL that was not read whole
             self.facts.notes.append(f"{self.file}:{call.lineno} {note}")
+        self._record_sql(call, sql)
+
+    def _record_sql(self, call: ast.Call, sql: _spark_sql.SqlFacts) -> None:
+        """The reads and the writes of a statement that was read, each write with the reads that
+        feed it when the statement says so."""
         refs = {id(name): self._from_sql_name(name, call) for name in sql.reads}
         #: A statement is closed when everything it reads is a table or a path that is named:
         #: nothing it reads is a temporary view (which something else built) or a name with a
