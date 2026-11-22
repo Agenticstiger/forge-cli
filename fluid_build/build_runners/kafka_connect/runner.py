@@ -464,14 +464,16 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
     try:
         # The last check before the REST calls, over the configs as they are
         # sent: settings derived from the contract's binding included.
-        resolved = secret_resolved(ctx.source.connection.raw) and (
+        store_secret = secret_resolved(ctx.source.connection.raw) and (
             is_debezium or ctx.source.kind in _JDBC_KINDS
         )
         refuse_sent_config_expressions(
             base_config,
             where="the source connector config",
             secret_keys=(
-                ("database.password" if is_debezium else "connection.password",) if resolved else ()
+                ("database.password" if is_debezium else "connection.password",)
+                if store_secret
+                else ()
             ),
         )
         if sink_config:
