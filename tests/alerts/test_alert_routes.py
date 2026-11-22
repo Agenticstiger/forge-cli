@@ -331,3 +331,43 @@ class TestWhatTheScanFound:
     def test_more_routes_than_the_cap_in_the_contract_alone(self) -> None:
         routes = [{"name": f"r{i}", "kind": "slack"} for i in range(MAX_ROUTES + 1)]
         assert any(f"more than {MAX_ROUTES} routes" in e for e in _errors(_contract(routes)))
+
+
+class TestKeysThatAreNotHex:
+    """A random alphanumeric token in ``connection`` or ``name`` is a key, not an id: it
+    switches between letters and digits, or between cases, far more often than words do.
+    Long camelCase and snake_case ids pass."""
+
+    TOKENS = [
+        "R02B5ZEAAD5Y9VBR29Q3CW5ADCQSHEWI",  # pragma: allowlist secret
+        "n4g2eu76jvpsIAwgGrszkqErrXexKfD2Il1kmrjV",  # pragma: allowlist secret
+        "I6KSDDICR7R7160UFWLEU3BNCNN4PB25",  # pragma: allowlist secret
+    ]
+    IDS = [
+        "pagerduty_events_default",
+        "PagerDutyProductionAlertsConnection2024",
+        "slackAlertsDataPlatformTeamChannel01",
+        "SlackWebhookDataPlatformTeam2024Q4Prod",
+        "httpZendutyIncidentsEuWest1Production",
+        "AWSGlueOptimizerRole2024RunnerXYZ",
+    ]
+
+    @pytest.mark.parametrize("token", TOKENS)
+    def test_a_token_in_connection_is_refused_unshown(self, token: str) -> None:
+        errors = _errors(_contract([{"name": "pd", "kind": "pagerduty", "connection": token}]))
+        assert any("looks like a key, not a connection id" in e for e in errors), errors
+        assert not any(token in e for e in errors)
+
+    @pytest.mark.parametrize("token", TOKENS)
+    def test_a_key_shaped_route_name_is_refused_unshown(self, token: str) -> None:
+        name = "k" + token[1:]  # a route name starts with a letter or '_'
+        errors = _errors(_contract([{"name": name, "kind": "slack", "connection": "slack_x"}]))
+        assert any(".name must be a plain name" in e for e in errors), errors
+        assert not any(name in e for e in errors)
+        hexed = "deadbeefdeadbeefdeadbeef"
+        errors = _errors(_contract([{"name": hexed, "kind": "slack", "connection": "slack_x"}]))
+        assert any(".name must be a plain name" in e for e in errors), errors
+
+    @pytest.mark.parametrize("conn", IDS)
+    def test_a_long_id_is_not_a_key(self, conn: str) -> None:
+        assert _errors(_contract([{"name": "pd", "kind": "pagerduty", "connection": conn}])) == []

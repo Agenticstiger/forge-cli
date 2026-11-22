@@ -28,7 +28,8 @@ address, URL or key, and is held to Airflow's connection-id characters: a URL, a
 with a password or something shaped like a key is refused, and the message never shows the
 value. Every other string a route gives (``options`` included) is held to no template syntax
 (``{`` or ``}``, which Airflow's Jinja would read in a notifier's template fields), no URL
-and nothing the secret redactor would mask.
+and nothing the secret redactor would mask, and an option named like a secret (``api_key``,
+``password``, ``routingKey``) is refused whatever its value.
 """
 
 from __future__ import annotations
@@ -67,6 +68,29 @@ _KEY_SHAPED = re.compile(
     r"(?:[0-9a-fA-F]{20,}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
     r"-[0-9a-fA-F]{12})\Z"
 )
+#: A random alphanumeric token (an API or routing key) rather than an id: 24 or more letters and
+#: digits with no separator, switching between letters and digits, or between upper and lower
+#: case, far more often than words do. Ids use separators or camelCase words; measured on
+#: random tokens it catches most, and on long camelCase ids none.
+_MIN_TOKEN = 24
+
+
+def _token_shaped(value: str) -> bool:
+    if len(value) < _MIN_TOKEN or not value.isascii() or not value.isalnum():
+        return False
+    pairs = list(zip(value, value[1:], strict=False))
+    digit_switches = sum(1 for a, b in pairs if a.isdigit() != b.isdigit())
+    case_switches = sum(
+        1 for a, b in pairs if a.isalpha() and b.isalpha() and a.isupper() != b.isupper()
+    )
+    return digit_switches >= 8 or case_switches >= 0.45 * len(value)
+
+
+def _key_shaped(value: str) -> bool:
+    """Whether ``value`` looks like a key, not a name: hex, a UUID or a random token."""
+    return bool(_KEY_SHAPED.match(value)) or _token_shaped(value)
+
+
 _EMAIL = re.compile(r"[A-Za-z0-9._+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})+\Z")
 #: ISO-8601 durations without years or months, whose length depends on the calendar.
 _DURATION = re.compile(
@@ -179,9 +203,30 @@ def _option_problems(value: Any, where: str, depth: int = 0) -> List[str]:
             if not isinstance(key, str) or not _OPTION_KEY.match(key):
                 out.append(f"{where} has a key that is not a plain name {NOT_SHOWN}")
                 continue
+            if _secret_key(key):
+                out.append(
+                    f"{where}.{key} is named like a secret; a kind's secret belongs in the "
+                    f"Airflow connection the route names, never in the DAG {NOT_SHOWN}"
+                )
+                continue
             out += _option_problems(item, f"{where}.{key}", depth + 1)
         return out
     return [f"{where} is a {type(value).__name__}, not a JSON value"]
+
+
+def _secret_key(key: str) -> bool:
+    """Whether an option key names a credential, as the redactor reads key names: its parts
+    (``api_key``, ``password``, ``routing_key``, ``token``, ...) in any case and spelling
+    (``apiKey``, ``routing-key``)."""
+    from fluid_build.observability.secret_redactor import (
+        _SENSITIVE_KEY_PARTS,
+        is_sensitive_key_name,
+    )
+
+    folded = re.sub(r"[^a-z0-9]", "", key.lower())
+    return is_sensitive_key_name(key) or any(
+        re.sub(r"[^a-z0-9]", "", part) in folded for part in _SENSITIVE_KEY_PARTS
+    )
 
 
 def _connection_problem(value: Any) -> str:
@@ -190,7 +235,7 @@ def _connection_problem(value: Any) -> str:
             "is not an Airflow connection id (letters, digits, '_', '.' and '-'); a URL, an "
             "address or a key belongs IN that connection, which the route names"
         )
-    if _KEY_SHAPED.match(value) or _redacted(value):
+    if _key_shaped(value) or _redacted(value):
         return "looks like a key, not a connection id; put the key in an Airflow connection"
     return ""
 
@@ -208,7 +253,12 @@ def _read_route(raw: Any, where: str, origin: str, errors: List[str]) -> Optiona
             f"{', '.join(sorted(_ROUTE_KEYS))})"
         )
     name = raw.get("name")
-    if not isinstance(name, str) or not _ROUTE_NAME.match(name) or _redacted(name):
+    if (
+        not isinstance(name, str)
+        or not _ROUTE_NAME.match(name)
+        or _key_shaped(name)
+        or _redacted(name)
+    ):
         errors.append(
             f"{where}.name must be a plain name (a letter or '_', then letters, digits, '_' "
             f"and '-', at most 64) {NOT_SHOWN}"

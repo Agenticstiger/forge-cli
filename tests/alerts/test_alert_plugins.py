@@ -430,3 +430,57 @@ class TestValidateFindsWhatRenderRefuses:
         )
         assert "def alert(notifier, /, **kwargs):" in rendered.definitions
         assert "notifier='teams'" in rendered.definitions
+
+
+class TestNoSecretInARoutesOptionsOrItsKind:
+    """A plugin route's ``options`` may reach the DAG source (a kind passes them as kwargs), so
+    an option named like a secret is refused whatever its value, and a kind's
+    ``default_connection``, which the DAG's notes and kwargs carry, is a plain connection id."""
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "api_key",
+            "password",
+            "routing_key",
+            "apiKey",
+            "routingKey",
+            "Integration_Key",
+            "auth_token",
+            "clientSecret",
+        ],
+    )
+    def test_an_option_named_like_a_secret_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, key: str
+    ) -> None:
+        _install(monkeypatch, kinds=[FakeEP("teams", TeamsKind)])
+        value = "Zx81kQp0aLm3Rt7v"  # pragma: allowlist secret
+        errors, _ = _findings(_contract(_route("teams", options={key: value})))
+        assert any(f"options.{key} is named like a secret" in e for e in errors), errors
+        assert not any(value in e for e in errors)
+
+    def test_a_harmless_option_still_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install(monkeypatch, kinds=[FakeEP("teams", TeamsKind)])
+        options = {"mention": "@oncall", "priority": "P2", "channel": "#data-ops"}
+        assert _findings(_contract(_route("teams", options=options))) == ([], [])
+
+    @pytest.mark.parametrize(
+        "default",
+        ['teams"""; import os; """', "https://hooks.example.com/x", "a" * 300, 12],
+    )
+    def test_a_kinds_default_connection_must_be_a_plain_id(
+        self, monkeypatch: pytest.MonkeyPatch, default: Any
+    ) -> None:
+        class Defaulted(TeamsKind):
+            default_connection = default
+
+        _install(monkeypatch, kinds=[FakeEP("teams", Defaulted)])
+        errors, _ = _findings(_contract(_route("teams")))
+        assert any("default_connection` is not a plain Airflow connection id" in e for e in errors)
+
+    def test_a_plain_default_connection_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class Defaulted(TeamsKind):
+            default_connection = "teams_default"
+
+        _install(monkeypatch, kinds=[FakeEP("teams", Defaulted)])
+        assert _findings(_contract(_route("teams"))) == ([], [])

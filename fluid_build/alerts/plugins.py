@@ -149,6 +149,13 @@ def _kind_problem(obj: Any) -> str:
             isinstance(v, str) and _REQUIREMENT.match(v) for v in values
         ):
             return f"its `{attr}` is not a list of plain pip requirements"
+    default = getattr(obj, "default_connection", None)
+    if default is not None:
+        from fluid_build.alerts.routes import _connection_problem
+
+        if _connection_problem(default):
+            # It reaches the DAG (its notes, and a route that names no connection).
+            return "its `default_connection` is not a plain Airflow connection id"
     events = getattr(obj, "events", EVENTS)
     try:
         unknown = sorted(set(events) - set(EVENTS))

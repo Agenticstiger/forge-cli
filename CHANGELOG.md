@@ -29,10 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ALERT_DAG_ARGS` passed to `DAG`, and an `alert(notifier, **kwargs)` callback that builds a new
   notifier from a copy of its arguments each time, since `BaseNotifier` renders its template fields
   in place. A contract without routes renders the same file as before. A route never holds a
-  secret: a URL, an address with a password or a key-shaped value in `connection` is refused at
-  `fluid validate` and at render without being shown (the schema's own message, which quotes the
-  value, is dropped for it), and every string a route gives holds no `{` or `}`, no URL and nothing
-  the redactor masks. An organisation's pack adds default routes to every product through the new
+  secret: a URL, an address with a password or a key-shaped value (hex, a UUID, a random token)
+  in `connection` or `name` is refused at `fluid validate` and at render without being shown (the
+  schema's own message, which quotes the value, is dropped for it), every string a route gives
+  holds no `{` or `}`, no URL and nothing the redactor masks, and a plugin route's option named
+  like a secret (`api_key`, `password`, `routingKey`) is refused whatever its value. A plugin
+  kind's `default_connection` must be a plain connection id. The acquisition DAGs
+  `fluid schedule-sync` writes carry no alerts, and say so. An organisation's pack adds default routes to every product through the new
   `fluid_build.alert_defaults` entry points (a contract replaces one by its name, or leaves them
   out with `alerts.defaults: false`), and a package adds a kind through `fluid_build.alert_notifiers`
   with the base class `fluid_build.alerts.AlertNotifier` or any object with its attributes: read by
