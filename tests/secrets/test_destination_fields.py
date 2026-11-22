@@ -259,6 +259,17 @@ def test_an_override_may_not_replace_a_setting_the_url_is_built_from(key):
         {"sqlalchemy_url": f"postgresql://localhost:1/@{ELSEWHERE}/db"},
         {"uri": f"postgresql://{REMOTE}:1/x@{ELSEWHERE}/db"},
         {"uri": f"postgresql://localhost:5432/db?application_name=a@{ELSEWHERE}"},
+        {"uri": f"postgresql://u@localhost#,{ELSEWHERE}/db"},
+        {"uri": f"postgresql://u@{ELSEWHERE},x@localhost/db"},
+        {"connection_string": f"mongodb://localhost#,{ELSEWHERE}:27017/db"},
+        {"connection_string": f"mongodb://localhost?,{ELSEWHERE}/db"},
+        {"endpoint": f"https://{ELSEWHERE}\\@localhost/"},
+        {"connection_string": f"mongodb://localhost?x.{ELSEWHERE}/db"},
+        {"connection_string": f"mongodb://{REMOTE}?x.{ELSEWHERE}/db"},
+        {"connection_string": f"mongodb://localhost?%2C{ELSEWHERE}/db"},
+        {"connection_string": f"mongodb+srv://localhost?x.{ELSEWHERE}/db"},
+        {"connection_string": f"mongodb://u@localhost%2C{ELSEWHERE}/db"},
+        {"server": f"localhost?x.{ELSEWHERE}"},
     ],
 )
 def test_a_user_part_a_client_reads_past_a_query_or_fragment_cannot_be_cleared(connection):
@@ -321,3 +332,20 @@ def test_a_windows_domain_user_part_is_read_as_a_user():
     """``DOMAIN\\user`` is a SQL Server login: every parser reads the host after its ``@``."""
     connection = {"uri": f"mssql+pyodbc://DOMAIN\\user:pw@{REMOTE}/db"}  # pragma: allowlist secret
     assert _refusal(connection, {ALLOWLIST_ENV: f"PG@{REMOTE}"}) is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "connection",
+    [
+        {"uri": "postgresql://localhost?sslmode=require#x"},
+        {"uri": "postgresql://u:p%23w@localhost/db#x"},  # pragma: allowlist secret
+        {"endpoint": "https://localhost#frag"},
+        {"connection_string": "mongodb://u@localhost:27017,127.0.0.1:27018/db?replicaSet=rs0"},
+        {"uri": "mongodb://u:p%40s@localhost/db?authSource=admin"},  # pragma: allowlist secret
+        {"server": "localhost"},
+    ],
+)
+def test_a_uri_every_client_reads_alike_is_judged_as_written(connection):
+    """A fragment after the query, an encoded #, and an http fragment move no host."""
+    assert _refusal(connection) is None

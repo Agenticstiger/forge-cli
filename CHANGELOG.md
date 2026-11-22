@@ -289,9 +289,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   control character. The host of an SSH tunnel in use (a tap's `ssh_tunnel`, Airbyte's
   `tunnel_method`) needs an allowlist entry of its own, and so does a loopback host behind
   it. A Debezium `extra_config` may no longer set `database.port`, `database.dbname`,
-  `database.names` or `connector.class` beside a `secretRef`. A URI whose user part a client
-  reads past a `/`, `?` or `#` to an `@` is a destination the policy cannot read, and is
-  refused unless the reference may go to any host.
+  `database.names` or `connector.class` beside a `secretRef`. A URI whose authority a
+  database client could read as naming a host the policy does not read is a destination the
+  policy cannot read, and is refused unless the reference may go to any host.
 - A runner that builds a connection URL keeps each field in its own part. dlt's
   `sql_database` source refuses a host, database or `drivername` that would change how its
   connection URL is read back, and `drivername` must be a SQLAlchemy dialect name with an

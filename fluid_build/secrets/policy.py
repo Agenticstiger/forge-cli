@@ -714,7 +714,7 @@ def _field_hosts(field_name: str, raw: Any) -> List[Optional[str]]:
     text = raw.strip()
     if _is_object_store_uri(text):
         return []
-    if _user_part_hides_host(text):
+    if _hosts_read_differently(text):
         return [None]
     try:
         parsed = urlsplit(text if "//" in text else f"//{text}")
@@ -728,19 +728,44 @@ def _field_hosts(field_name: str, raw: Any) -> List[Optional[str]]:
 _SQLALCHEMY_USER_PART = re.compile(r"[^:/]*(?::[^@]*)?@")
 
 
-def _user_part_hides_host(text: str) -> bool:
-    """Whether a client could read a host in ``text`` that ``urlsplit`` never sees.
+def _hosts_read_differently(text: str) -> bool:
+    """Whether a client could connect to a host in URI ``text`` that this policy does not read.
 
-    ``urlsplit`` ends the authority at the first ``/``, ``?`` or ``#`` and takes
-    the host after its last ``@``. The MongoDB drivers take the last ``@``
-    before the first ``/``, and SQLAlchemy's ``make_url`` reads a password
-    through ``/``, ``?`` and ``#`` to the first ``@``; both then connect to the
-    host after that ``@``. A user part either of them reads past where
-    ``urlsplit`` stops is a destination this policy cannot read.
+    The policy reads a URI's hosts as ``urlsplit`` does: the authority ends at
+    the first ``/``, ``?`` or ``#``, and the host list follows its last ``@``.
+    The clients a runner hands a URI to read some URIs otherwise:
+
+    * libpq (``conninfo_uri_parse_options``) ends the user part at its first
+      ``@`` and reads ``#`` as part of a host;
+    * the MongoDB drivers take everything before the first ``/`` as the user
+      part and the host list, ``?`` and ``#`` included, split at the last ``@``,
+      and pymongo percent-decodes the host list before splitting it at ``,``;
+    * a connector given a value without a scheme may read it whole as a host
+      name, ``?`` included;
+    * SQLAlchemy's ``make_url`` reads a password through ``/``, ``?`` and ``#``
+      to the first ``@`` after it, and a host through ``#`` and ``,``;
+    * a WHATWG URL reader (urllib3, requests) ends an http(s) authority at ``\\``.
+
+    Where any of them could read a host the policy does not, the URI is a
+    destination this policy cannot read.
     """
-    rest = text.partition("://")[2] if "://" in text else text.lstrip("/")
-    head, at, _hosts = rest.split("/", 1)[0].rpartition("@")
-    if at and ("?" in head or "#" in head):
+    scheme, sep, rest = text.partition("://")
+    if not sep:
+        scheme, rest = "", text.lstrip("/")
+    before_path = rest.split("/", 1)[0]
+    if scheme.strip().lower() in _UNROUTED_QUERY_SCHEMES:
+        return "\\" in before_path
+    if before_path.count("@") > 1:
+        return True
+    user_part, at, hosts = before_path.rpartition("@")
+    if at and ("?" in user_part or "#" in user_part):
+        return True
+    if "#" in re.split(r"[/?]", rest, maxsplit=1)[0] or "," in before_path.partition("?")[2]:
+        return True
+    mongodb = scheme.strip().lower() in ("mongodb", "mongodb+srv")
+    if (mongodb or not sep) and "?" in before_path:
+        return True
+    if mongodb and "%" in hosts:
         return True
     match = _SQLALCHEMY_USER_PART.match(rest)
     return match is not None and any(char in match.group(0) for char in "/?#")
@@ -1275,7 +1300,7 @@ def renders_at_apply(field_name: str, value: Any) -> bool:
         return False
     if field_name != "host" and _is_object_store_uri(value.strip()):
         return False
-    if field_name != "host" and (_uri_query_host_keys(value) or _user_part_hides_host(value)):
+    if field_name != "host" and (_uri_query_host_keys(value) or _hosts_read_differently(value)):
         return False
     scheme, host = _deciding_parts(field_name, value)
     if not _reads_as_destination(scheme, host):
