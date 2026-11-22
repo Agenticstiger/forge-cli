@@ -759,16 +759,13 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
     #: Each plain assignment of a name, and the names written in any other way.
     plain: Dict[str, List[ast.expr]] = {}
     other: Set[str] = set()
-    #: The ``def`` statements of each name, and the names bound in any way but a ``def``.
+    #: The ``def`` statements of each name, and how many times each name is bound in all.
     defs: Dict[str, List[ast.AST]] = {}
-    not_defs: Set[str] = set()
+    bindings: Dict[str, int] = {}
 
-    def block(name: str, why: str, by_def: bool = False) -> None:
+    def block(name: str, why: str) -> None:
         other.add(name)
-        if not by_def:
-            not_defs.add(name)
-        if name in scope.parameters:
-            scope.rebound_parameters.add(name)
+        bindings[name] = bindings.get(name, 0) + 1
         scope.values.pop(name, None)
         if scope.blocked.get(name) == "imported":  # imported, then bound some other way here
             scope.blocked[name] = why
@@ -777,9 +774,7 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
 
     def record(name: str, value: ast.expr) -> None:
         plain.setdefault(name, []).append(value)
-        not_defs.add(name)
-        if name in scope.parameters:
-            scope.rebound_parameters.add(name)
+        bindings[name] = bindings.get(name, 0) + 1
         if name in scope.blocked:
             if scope.blocked[name] == "imported":
                 scope.blocked[name] = f"`{name}` is assigned after it is imported"
@@ -808,7 +803,7 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
     while stack:
         node = stack.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            block(node.name, f"`{node.name}` is a function", by_def=True)
+            block(node.name, f"`{node.name}` is a function")
             defs.setdefault(node.name, []).append(node)
         elif isinstance(node, ast.ClassDef):
             scope.classes[node.name] = node
@@ -850,9 +845,7 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
                 name = (alias.asname or alias.name).split(".")[0]
                 if name != "*":
                     other.add(name)
-                    not_defs.add(name)
-                    if name in scope.parameters:
-                        scope.rebound_parameters.add(name)
+                    bindings[name] = bindings.get(name, 0) + 1
                     scope.blocked.setdefault(name, "imported")
                     scope.values.pop(name, None)
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
@@ -873,9 +866,9 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
         for name, values in plain.items()
         if len(values) > 1 and name not in other
     }
-    scope.functions = {
-        name: found[0] for name, found in defs.items() if len(found) == 1 and name not in not_defs
-    }
+    # a parameter is bound once by the call; a def once by itself
+    scope.rebound_parameters = {name for name in scope.parameters if bindings[name] > 1}
+    scope.functions = {name: found[0] for name, found in defs.items() if bindings[name] == 1}
     return scope
 
 
@@ -1212,6 +1205,11 @@ class ModuleIndex:
         :data:`MAX_NAME_PARTS` parts."""
         if len(parts) > MAX_NAME_PARTS:
             return None
+        return self._in_own_package(parts, from_rel) or self._under_the_root_names(parts)
+
+    def _in_own_package(
+        self, parts: Sequence[str], from_rel: str
+    ) -> Optional[Tuple[SourceFile, List[str]]]:
         here = from_rel.split("/")[:-1]
         for depth in range(len(here), 0, -1):  # the importing file's directory, then its parents
             package = here[:depth]
@@ -1226,6 +1224,9 @@ class ModuleIndex:
                     found = self._file(package, parts[at + 1 : cut])
                     if found is not None:
                         return found, list(parts[cut:])
+        return None
+
+    def _under_the_root_names(self, parts: Sequence[str]) -> Optional[Tuple[SourceFile, List[str]]]:
         names = self._root_names
         for size in range(min(len(names), len(parts) - 1), 0, -1):
             if list(parts[:size]) != list(names[len(names) - size :]):
@@ -2042,12 +2043,19 @@ class Folder:
         if qualified == "dict" and self._is_builtin("dict", scope):
             return self._dict_call(node, scope, depth)
         if isinstance(func, ast.Attribute):
-            receiver = self.fold(func.value, scope, depth)
-            if isinstance(receiver, str):
-                return self._str_method(receiver, func.attr, node, scope, depth)
-            if isinstance(receiver, dict) and func.attr == "get":
-                return self._dict_get(receiver, node, scope, depth)
+            found = self._method(func, node, scope, depth)
+            if found is not ABSENT:
+                return found
         return Unresolved(f"the result of a call to {snippet(func, 40)}()", snippet(node))
+
+    def _method(self, func: ast.Attribute, node: ast.Call, scope: Scope, depth: int) -> Any:
+        """A method of a string or a dict that folds; :data:`ABSENT` for any other call."""
+        receiver = self.fold(func.value, scope, depth)
+        if isinstance(receiver, str):
+            return self._str_method(receiver, func.attr, node, scope, depth)
+        if isinstance(receiver, dict) and func.attr == "get":
+            return self._dict_get(receiver, node, scope, depth)
+        return ABSENT
 
     def _is_builtin(self, name: str, scope: Scope) -> bool:
         """Whether ``name`` here is Python's own: nothing in the file binds, imports or rebinds

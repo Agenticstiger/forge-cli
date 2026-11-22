@@ -289,14 +289,7 @@ class _Reader:
         self._edges()
         for dag_def in self.defs:
             self.result.dags.append(dag_def.dag)
-        if self._follower is not None:
-            self.result.unread_callables = dict(self._follower.unread)
-            self.result.tired_modules = sorted(self._follower.tired)
-            if self._follower.cut_short:
-                self.result.notes.append(
-                    f"{self.module.rel}: stopped following the functions its Python tasks run "
-                    "(the file asks for too much work): some of what they submit is not read"
-                )
+        self._follower_facts()
         if self.folder.exhausted:
             self.result.notes.append(
                 f"{self.module.rel}: folding stopped early (the file asks for too much work): "
@@ -633,6 +626,19 @@ class _Reader:
 
     # ── what a Python task's function submits ───────────────────────
 
+    def _follower_facts(self) -> None:
+        """What following the Python tasks' functions found out about the file as a whole."""
+        follower = self._follower
+        if follower is None:
+            return
+        self.result.unread_callables = dict(follower.unread)
+        self.result.tired_modules = sorted(follower.tired)
+        if follower.cut_short:
+            self.result.notes.append(
+                f"{self.module.rel}: stopped following the functions its Python tasks run "
+                "(the file asks for too much work): some of what they submit is not read"
+            )
+
     def _follow(self) -> "Follower":
         if self._follower is None:
             from ._callables import Follower  # it builds its submits with this module's readers
@@ -751,7 +757,7 @@ class _Reader:
         ]
 
     def _steps_of(self, steps: Any, call: ast.Call, runtime: str) -> List[Submit]:
-        return [self._submit(runtime, script, args, call) for script, args in step_commands(steps)]
+        return step_submits(steps, call.lineno, runtime)
 
     def _emr_steps(self, call: ast.Call) -> List[Submit]:
         return self._steps_of(self._templated(self._kw(call, "steps")), call, "emr-step")
@@ -1059,6 +1065,11 @@ def step_commands(steps: Any) -> List[Tuple[Any, List[Any]]]:
     return out
 
 
+def step_submits(steps: Any, line: int, runtime: str = "emr-step") -> List[Submit]:
+    """The :class:`Submit` of each ``spark-submit`` the EMR steps run (see :func:`step_commands`)."""
+    return [make_submit(runtime, script, args, line) for script, args in step_commands(steps)]
+
+
 def starts_a_submit(word: Any) -> bool:
     """Whether a command given as words that starts with ``word`` may run a ``spark-submit``:
     ``spark-submit`` itself, or a shell (``bash -c "spark-submit ..."``)."""
@@ -1194,12 +1205,7 @@ def _application(words: Sequence[Any], start: int) -> Optional[Tuple[Any, List[A
     while index < len(words):
         word = words[index]
         if isinstance(word, Unresolved):
-            # a word folded from the code says what it waits for (a constant of a module that is
-            # not scanned, a Variable); a hole in a command line only that it is one
-            why = (
-                word.why if word.why and word.why != _HOLE_WORD else "the script is not a constant"
-            )
-            return Unresolved(why, word.text), list(words[index + 1 :])
+            return Unresolved(_script_why(word), word.text), list(words[index + 1 :])
         if word.startswith("-") and len(word) > 1:
             if word in _SUBMIT_NO_JOB:
                 return None
@@ -1235,6 +1241,15 @@ def _application(words: Sequence[Any], start: int) -> Optional[Tuple[Any, List[A
             return expansion, []  # a template: kept as written, and marked
         return Unresolved("the script is a shell variable or substitution", expansion), []
     return Unresolved("the spark-submit command names no Python script", ""), []
+
+
+def _script_why(word: Unresolved) -> str:
+    """Why a script that is the word ``word`` is not known: what a word folded from the code waits
+    for (a constant of a module that is not scanned, a Variable); a hole in a command line only
+    says that it is one."""
+    if word.why and word.why != _HOLE_WORD:
+        return word.why
+    return "the script is not a constant"
 
 
 def _is_python(word: Any) -> bool:

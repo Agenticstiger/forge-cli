@@ -46,7 +46,7 @@ from ._airflow_dags import (
     spark_submits_in_text,
     spark_submits_in_tokens,
     starts_a_submit,
-    step_commands,
+    step_submits,
 )
 from ._fold import (
     ABSENT,
@@ -166,6 +166,15 @@ class _TooBig(Exception):
 
 def _why(value: Any, otherwise: str) -> str:
     return value.why if isinstance(value, Unresolved) else otherwise
+
+
+def _as_text(value: Any) -> Optional[str]:
+    """A folded value as the text it is in a path: a string or a number; ``None`` otherwise."""
+    if isinstance(value, str):
+        return value
+    if is_scalar(value) and value is not None and not isinstance(value, bool):
+        return str(value)
+    return None
 
 
 def _keyword(call: ast.Call, *names: str) -> Optional[ast.expr]:
@@ -435,41 +444,41 @@ class Follower:
         """The text ``template`` stands for: a string, or an :class:`Unresolved` that says why and
         shows what is known."""
         if len(template) == 1 and not isinstance(template[0], str):
-            place = template[0]
-            value = self._at(place, arguments, name)
-            if isinstance(value, Unresolved):
-                return (
-                    value if value.text else Unresolved(value.why, f"{place_text(place)} of {name}")
-                )
-            if isinstance(value, str):
-                return value
-            if is_scalar(value) and value is not None and not isinstance(value, bool):
-                return str(value)
-            return Unresolved("it is not text", f"{place_text(place)} of {name}")
+            return self._render_place(template[0], arguments, name)
         pieces: List[str] = []
         why = ""
         size = 0
         for part in template:
-            if isinstance(part, str):
-                piece = part
-            else:
-                value = self._at(part, arguments, name)
-                if isinstance(value, str) or (
-                    is_scalar(value) and value is not None and not isinstance(value, bool)
-                ):
-                    piece = str(value)
-                else:
-                    why = why or _why(value, "it is not text")
-                    # what did not resolve shows in braces, as an f-string field does (a text
-                    # that is a template of its own already has them)
-                    shown = value.text if isinstance(value, Unresolved) else ""
-                    piece = shown if "{" in shown else "{" + (shown or place_text(part)) + "}"
+            piece, missing = (
+                (part, "") if isinstance(part, str) else self._piece(part, arguments, name)
+            )
+            why = why or missing
             size += len(piece)
             if size > MAX_STRING:
                 return Unresolved(f"it is longer than {MAX_STRING} characters", "")
             pieces.append(piece)
         text = "".join(pieces)
         return Unresolved(why, text) if why else text
+
+    def _render_place(self, place: Place, arguments: _Arguments, name: str) -> Any:
+        value = self._at(place, arguments, name)
+        shown = f"{place_text(place)} of {name}"
+        if isinstance(value, Unresolved):
+            return value if value.text else Unresolved(value.why, shown)
+        text = _as_text(value)
+        return text if text is not None else Unresolved("it is not text", shown)
+
+    def _piece(self, place: Place, arguments: _Arguments, name: str) -> Tuple[str, str]:
+        """The text of one place of a template, and why it is not known (empty when it is)."""
+        value = self._at(place, arguments, name)
+        text = _as_text(value)
+        if text is not None:
+            return text, ""
+        # what did not resolve shows in braces, as an f-string field does (a text that is a
+        # template of its own already has them)
+        shown = value.text if isinstance(value, Unresolved) else ""
+        piece = shown if "{" in shown else "{" + (shown or place_text(place)) + "}"
+        return piece, _why(value, "it is not text")
 
     def _helper_submits(self, target: _Target, arguments: _Arguments, line: int) -> List[Submit]:
         helper, name = target.helper, target.helper_name
@@ -645,56 +654,55 @@ class Follower:
         depth: int,
         stack: Tuple[ast.AST, ...],
     ) -> List[Submit]:
-        func = node.func
-        qualified = qualified_name(func, module.imports)
+        """What one call of a followed body submits: a helper the conventions name, an EMR call,
+        a command it runs, or what the function it calls submits."""
+        qualified = qualified_name(node.func, module.imports)
         found = self._helper(qualified)
         if found is not None:
             target = _Target(found[0], helper=found[1], helper_name=found[0])
-            return self._helper_submits(
-                target, self._arguments(node.args, node.keywords, folder), line
-            )
-        method = func.attr if isinstance(func, ast.Attribute) else None
+            arguments = self._arguments(node.args, node.keywords, folder)
+            return self._helper_submits(target, arguments, line)
+        if isinstance(node.func, ast.Attribute):
+            emr = self._emr_call(node.func.attr, node, folder, line)
+            if emr is not None:
+                return emr
+        if qualified in _RUNNERS:
+            command = node.args[0] if node.args else _keyword(node, "args", "command", "cmd")
+            return [] if command is None else self._command(command, folder, line)
+        if depth >= MAX_DEPTH:
+            return []
+        target = self._target(node.func, module, folder)
+        if target.helper is None and target.function is None:
+            return []
+        arguments = self._arguments(node.args, node.keywords, folder)
+        if target.bound is not None:
+            arguments = target.bound.then(arguments)
+        if target.helper is not None:
+            return self._helper_submits(target, arguments, line)
+        return self._function_submits(target, arguments, line, depth + 1, stack)
+
+    def _emr_call(
+        self, method: str, node: ast.Call, folder: Folder, line: int
+    ) -> Optional[List[Submit]]:
+        """An EMR call, by its method's name (boto3's, and the Airflow EMR hooks'); ``None`` for a
+        call that is not one."""
         if method in ("add_job_flow_steps", "run_job_flow"):
             steps = _keyword(node, "Steps", "steps")
             if steps is None and method == "add_job_flow_steps" and len(node.args) >= 2:
                 steps = node.args[1]  # the EMR hook's add_job_flow_steps(job_flow_id, steps)
-            if steps is None:
-                return []
-            return self._steps(folder.fold(steps), line)
+            return [] if steps is None else step_submits(folder.fold(steps), line)
         if method == "create_job_flow":  # the EMR hook's create_job_flow(job_flow_overrides)
             given = _keyword(node, "job_flow_overrides") or (node.args[0] if node.args else None)
             overrides = folder.fold(given) if given is not None else None
             listed = lookup(overrides, "Steps") if isinstance(overrides, dict) else ABSENT
-            return [] if listed is ABSENT else self._steps(listed, line)
+            return [] if listed is ABSENT else step_submits(listed, line)
         if method in ("start_job_run", "submit_job"):
             driver = _keyword(node, "jobDriver", "job_driver")
             if driver is None and method == "submit_job" and len(node.args) >= 4:
                 # the EMR on EKS hook's submit_job(name, role, release, driver)
                 driver = node.args[3]
             return [] if driver is None else self._driver(folder.fold(driver), line)
-        if qualified in _RUNNERS:
-            command = node.args[0] if node.args else _keyword(node, "args", "command", "cmd")
-            return [] if command is None else self._command(command, folder, line)
-        if depth >= MAX_DEPTH:
-            return []
-        target = self._target(func, module, folder)
-        if target.helper is not None:
-            arguments = self._arguments(node.args, node.keywords, folder)
-            if target.bound is not None:
-                arguments = target.bound.then(arguments)
-            return self._helper_submits(target, arguments, line)
-        if target.function is None:
-            return []
-        arguments = self._arguments(node.args, node.keywords, folder)
-        if target.bound is not None:
-            arguments = target.bound.then(arguments)
-        return self._function_submits(target, arguments, line, depth + 1, stack)
-
-    @staticmethod
-    def _steps(steps: Any, line: int) -> List[Submit]:
-        return [
-            make_submit("emr-step", script, args, line) for script, args in step_commands(steps)
-        ]
+        return None
 
     @staticmethod
     def _driver(driver: Any, line: int) -> List[Submit]:

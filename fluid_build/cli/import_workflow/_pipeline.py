@@ -447,37 +447,43 @@ def _report_unread_callables(dag_scan: DagScan, report: ImportReport) -> None:
     )
 
 
+def _waiting_for(submit: Any) -> List[Tuple[str, str]]:
+    """The values a submit's script and config file wait for that the conventions can give. A name
+    that says it is a credential is left out: the conventions do not use such a value."""
+    whys = (submit.why if submit.script is None else "", submit.config_why)
+    found = [missing_value(why) for why in whys if why]
+    return [m for m in found if m is not None and not sensitive_name(m[1].rsplit(".", 1)[-1])]
+
+
+def _waiting_line(kind: str, name: str, tasks: Sequence[str]) -> str:
+    what = {
+        "module": f"`{safe_text(name, 120)}`, which is not in the scanned files",
+        "environment": f"the environment variable {safe_text(name, 80)}",
+        "airflow_variable": f"the Airflow Variable {safe_text(name, 80)}",
+    }[kind]
+    named = ", ".join(tasks[:MAX_WAITING_TASKS])
+    if len(tasks) > MAX_WAITING_TASKS:
+        named += f", and {len(tasks) - MAX_WAITING_TASKS} more"
+    return (
+        f"{len(tasks)} task(s) submit a script or name a config file that depends on {what} "
+        f"({named}): {_WAITING_HINT[kind]}"
+    )
+
+
 def _report_waiting(dag_scan: DagScan, report: ImportReport) -> None:
     """A line for each value that a submitted script or a config file waits for and the conventions
     can give (a constant of a module outside the scan, an environment variable, an Airflow
-    Variable), with the tasks that wait for it. A name that says it is a credential is left out:
-    the conventions do not use such a value."""
-    waiting: Dict[Tuple[str, str], List[str]] = {}
+    Variable), with the tasks that wait for it."""
+    waiting: Dict[Tuple[str, str], Dict[str, None]] = {}
     for dag in dag_scan.dags:
         for task in dag.tasks:
             label = f"DAG {safe_text(dag.shown, 60)} task {safe_text(task.shown, 60)}"
             for submit in task.submits:
-                for why in (submit.why if submit.script is None else "", submit.config_why):
-                    missing = missing_value(why) if why else None
-                    if missing is None or sensitive_name(missing[1].rsplit(".", 1)[-1]):
-                        continue
-                    tasks = waiting.setdefault(missing, [])
-                    if label not in tasks:
-                        tasks.append(label)
+                for missing in _waiting_for(submit):
+                    waiting.setdefault(missing, {})[label] = None
     ranked = sorted(waiting.items(), key=lambda item: (-len(item[1]), item[0]))
     for (kind, name), tasks in ranked[:MAX_WAITING_LINES]:
-        what = {
-            "module": f"`{safe_text(name, 120)}`, which is not in the scanned files",
-            "environment": f"the environment variable {safe_text(name, 80)}",
-            "airflow_variable": f"the Airflow Variable {safe_text(name, 80)}",
-        }[kind]
-        named = ", ".join(tasks[:MAX_WAITING_TASKS]) + (
-            f", and {len(tasks) - MAX_WAITING_TASKS} more" if len(tasks) > MAX_WAITING_TASKS else ""
-        )
-        report.required_defaults.append(
-            f"{len(tasks)} task(s) submit a script or name a config file that depends on {what} "
-            f"({named}): {_WAITING_HINT[kind]}"
-        )
+        report.required_defaults.append(_waiting_line(kind, name, list(tasks)))
     if len(ranked) > MAX_WAITING_LINES:
         report.required_defaults.append(
             f"{len(ranked) - MAX_WAITING_LINES} more value(s) that submitted scripts or config "
