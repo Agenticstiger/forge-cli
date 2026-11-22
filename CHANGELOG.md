@@ -53,6 +53,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anything that is not a hex commit, a URL or `user@host:org/repo`, or a ref name, is left out: a
   credential or a path on the runner is no part of a release record).
 
+- **Each Iceberg commit also names the bundle and the scheduler run behind it.** The Spark
+  runner stamps `fluid.bundle-digest`, the `bundleDigest` of the plan `fluid apply` verified (the
+  `identity.bundle.manifest_digest` of the sealed release, which `fluid runs status --release-dir`
+  now shows on a `bundle` line), and `fluid.scheduler-job` and `fluid.scheduler-run-id`, the job and
+  run of the scheduler that started `fluid apply`, beside `fluid.run-id`. They come from
+  `FLUID_SCHEDULER_JOB` and `FLUID_SCHEDULER_RUN_ID`, else from the task context Airflow 2 and 3
+  give every task (`AIRFLOW_CTX_DAG_ID`, `AIRFLOW_CTX_DAG_RUN_ID`), and the DAGs `fluid generate
+  schedule` writes hand Airflow's DAG id and run id to `fluid apply` under fluid's names, so still
+  no `AIRFLOW*` variable reaches it. A scheduler's value is made safe as a run id is and never
+  refuses a run, and a project `.env` may not set either variable. Like the other stamps they are
+  runner arguments, so they restart no stream. A local Spark 3.5 session with Iceberg 1.6 now
+  checks on real tables that the stamps reach the snapshot summary of a stream's commits, of its
+  dead letters' and of a batch overwrite. `fluid runs status --release-dir` keeps each line whole
+  when its output is piped: it was cut at 80 columns, which split a release's digest from its line.
+
 - **`fluid generate pyspark-schema` writes a PySpark `StructType` module for each output
   port.** For every output port that declares `contract.schema` columns it writes
   `<port>_schema.py` with a `SCHEMA` a Spark job imports (`spark.read.schema(SCHEMA)`). forge-cli
@@ -205,6 +220,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--impact` report.
 
 ### Fixed
+
+- **A scheduled run no longer shares its run id with every other scheduled run.** A command a
+  scheduler started took the run id a worker's checkout keeps in `.fluid/run-id.txt`, so every
+  scheduled `fluid apply` of a product, on every day, had one id in its OpenTelemetry spans, its
+  run records and the `fluid.run-id` stamp. Under a scheduler (`FLUID_SCHEDULER_RUN_ID`, or
+  Airflow's `AIRFLOW_CTX_DAG_RUN_ID`) the run id is now derived from the scheduler's job and run:
+  the same for each command of one run, another for the next, and the file is neither read nor
+  written. `FLUID_RUN_ID` still wins.
 
 - **Entropy Data's product list is read whole or not at all.** A page after the first that was
   not a list (a rate-limit answer, say) used to hand back the pages before it as if they were
