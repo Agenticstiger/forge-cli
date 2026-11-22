@@ -1732,6 +1732,10 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
     if airflow_check is not None:
         airflow_check.before_push(dry_run=args.dry_run)
     results, superseded = _push(dispatcher, dags_dir, args, check_only)
+    # No Airflow check, so nobody ensures the pools the DAG files use: say how.
+    pool_commands = [] if airflow_check is not None else _pool_commands(dags_dir)
+    for command in pool_commands:
+        cprint(f"[schedule-sync] pool: {command}", markup=False)
 
     # ── Acquisition pattern: emit per-orchestrator artifacts ────────────
     # When the contract carries a Bronze ``pattern: acquisition`` build,
@@ -1808,6 +1812,8 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
     }
     if airflow_report is not None:
         report["airflow_check"] = airflow_report
+    if pool_commands:
+        report["pools"] = {"commands": pool_commands}
 
     if args.report:
         report_path = Path(args.report).resolve()
@@ -1829,6 +1835,26 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
         markup=False,
     )
     return overall_exit
+
+
+def _pool_commands(dags_dir: Path) -> List[str]:
+    """The ``airflow pools set`` lines for the pools the DAG files under ``dags_dir`` use
+    (``FLUID_TABLE_POOLS``, written when a contract sets ``poolPerOutputTable``)."""
+    from fluid_build.util import airflow_pools
+
+    pools: Dict[str, str] = {}
+    for path in sorted(dags_dir.rglob("*.py")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            if path.stat().st_size > 2_000_000:
+                continue
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if airflow_pools.CONSTANT in text:
+            pools.update(airflow_pools.declared_pools(text))
+    return airflow_pools.set_commands(pools)
 
 
 def _push(

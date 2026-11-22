@@ -21,7 +21,7 @@ Imported only when ``--airflow-url`` is set (``httpx`` comes with it).
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -37,6 +37,7 @@ from fluid_build.cli._airflow_api import (
     credentials_from_env,
     normalize_url,
 )
+from fluid_build.util import airflow_pools
 
 #: Schedulers whose Airflow REST API forge can reach with a token or a password. MWAA's
 #: API is reached through AWS (a web login token, or InvokeRestApi), which this does not do.
@@ -89,6 +90,10 @@ class AirflowCheck:
     indirect: bool
     files: List[chk.DagFile]
     client: Optional[AirflowApi] = None
+    #: ``{name: description}`` of the pools the DAG files declare (``FLUID_TABLE_POOLS``).
+    pools: Dict[str, str] = field(default_factory=dict)
+    #: The report's ``pools`` block, once :meth:`ensure_pools` has run.
+    pools_report: Optional[Dict[str, Any]] = None
 
     # 1 ── flags ─────────────────────────────────────────────────────────
 
@@ -183,6 +188,7 @@ class AirflowCheck:
             scheme=scheme,
             indirect=indirect,
             files=files,
+            pools=pools_of(files),
         )
 
     def plan(self) -> None:
@@ -209,11 +215,17 @@ class AirflowCheck:
     # 2 ── before the push ───────────────────────────────────────────────
 
     def before_push(self, *, dry_run: bool) -> None:
-        """``--dry-run`` plans the check; otherwise sign in and read once, or raise."""
+        """``--dry-run`` plans the check; otherwise sign in and read once, make the pools the
+        DAG files use, or raise. The pools come before the push: a DAG that names a pool
+        Airflow lacks is never left running."""
         if dry_run:
             self.plan()
+            if self.pools and not self.check_only:
+                self.plan_pools()
         else:
             self.preflight()
+            if self.pools and not self.check_only:
+                self.pools_report = self.ensure_pools()
 
     def preflight(self) -> None:
         try:
@@ -244,7 +256,73 @@ class AirflowCheck:
             return None
         if not pushed:
             return skipped_report("The push failed, so Airflow was not checked.")
-        return self.wait(results)
+        report = self.wait(results)
+        if self.pools_report is not None:
+            report["pools"] = self.pools_report
+        return report
+
+    def ensure_pools(self) -> Dict[str, Any]:
+        """Create each pool the DAG files declare that Airflow does not hold yet.
+
+        A pool that exists is left as it is, whoever made it and however many slots it
+        has: this never shrinks or edits one. The block is the report's ``pools``.
+        """
+        client = self.client
+        if client is None:  # preflight() raised, or was never called
+            raise RuntimeError("AirflowCheck.ensure_pools() before a successful preflight()")
+        created: List[str] = []
+        existing: List[Dict[str, Any]] = []
+        try:
+            held = client.pools()
+            for name, description in sorted(self.pools.items()):
+                if name not in held and client.create_pool(
+                    name, airflow_pools.POOL_SLOTS, description
+                ):
+                    created.append(name)
+                    _say(f"pool {name} created with {airflow_pools.POOL_SLOTS} slot")
+                    continue
+                slots = held.get(name)
+                existing.append({"name": name, "slots": slots})
+                said = f"pool {name} exists" + (
+                    f" with {slots} slots; left as it is (its writers may overlap)"
+                    if slots not in (None, airflow_pools.POOL_SLOTS)
+                    else "; left as it is"
+                )
+                _say(said)
+        except AirflowApiError as exc:
+            commands = airflow_pools.set_commands(self.pools)
+            _say(f"✘ [{slug_for(exc.event)}] {exc.message}")
+            for command in commands:
+                _say(f"with Airflow's CLI: {command}")
+            error = _as_cli_error(exc)
+            error.context["error"] = (
+                f"The pools could not be made, so nothing was pushed: {exc.message}"
+            )
+            raise error from None
+        return {"result": "passed", "created": created, "existing": existing}
+
+    def plan_pools(self) -> None:
+        """``--dry-run``: which pools Airflow holds and which a real run would create. One read
+        of ``/pools``, nothing written; a read that cannot be made is said, not guessed."""
+        try:
+            client = AirflowApi(self.base_url, credentials_from_env())
+            try:
+                client.connect(self.api)
+                held = client.pools()
+            finally:
+                client.close()
+        except AirflowApiError as exc:
+            _say(
+                f"the pools were not read ({exc.message}); a real run would make each one that "
+                f"is missing: {', '.join(sorted(self.pools))}"
+            )
+            return
+        have = sorted(n for n in self.pools if n in held)
+        missing = sorted(n for n in self.pools if n not in held)
+        _say(
+            f"pools: {len(have)} exist ({', '.join(have) or 'none'}), would create "
+            f"{len(missing)} with {airflow_pools.POOL_SLOTS} slot ({', '.join(missing) or 'none'})"
+        )
 
     def wait(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Wait for the parse; the report's ``airflow_check`` block (``result`` says pass)."""
@@ -303,6 +381,15 @@ class AirflowCheck:
             return
         mark = "✔" if result.state == "clean" else "✘"
         _say(f"{mark} {result.path}: {result.detail}")
+
+
+def pools_of(files: List[chk.DagFile]) -> Dict[str, str]:
+    """``{name: description}`` of the pools the DAG files declare."""
+    pools: Dict[str, str] = {}
+    for file in files:
+        if file.source and airflow_pools.CONSTANT in file.source:
+            pools.update(airflow_pools.declared_pools(file.source))
+    return pools
 
 
 def skipped_report(reason: str) -> Dict[str, Any]:

@@ -630,36 +630,59 @@ def keep_failed(host: LocalHost, run: DesiredRun, config_hash: str, body: bytes)
     return uri
 
 
+def _read_code(exc: BaseException) -> str:
+    """The S3 code a failed :func:`_read_artifact` carries: botocore's, else the last word of
+    the message it names it in (``<uri> cannot be read: <code>``)."""
+    cause = exc.__cause__
+    code = str((getattr(cause, "response", None) or {}).get("Error", {}).get("Code") or "")
+    return code or str(exc).rsplit(": ", 1)[-1]
+
+
 def read_failed(host: LocalHost, run: DesiredRun, config_hash: str) -> Optional[bytes]:
     """The failed-probation marker of ``config_hash``, or None when there is none.
 
     Raises:
         SparkRunError: the marker exists but cannot be read.
-        MarkerReadDenied: an ``s3://`` root refuses the marker and the job config beside it.
+        MarkerReadDenied: an ``s3://`` root refuses the marker: the job config beside it is
+            refused too, or reads (``job_config_readable``), which leaves a missing marker and
+            a refused one indistinguishable.
     """
-    from fluid_build.build_runners.spark._adapters import MarkerReadDenied, warn_no_list_bucket
+    from fluid_build.build_runners.spark._adapters import MarkerReadDenied, is_denied_code
 
     job_uri = bound_job_uri(host, run)
     uri = failed_release_uri(job_uri, config_hash)
     try:
         return _read_artifact(host, uri)
     except SparkRunError as exc:
-        if not (uri.startswith("s3://") and "AccessDenied" in str(exc)):
+        code = _read_code(exc)
+        if not (uri.startswith("s3://") and is_denied_code(code)):
             raise
-        # Without s3:ListBucket a missing key answers AccessDenied: the job config beside it
-        # reads when the marker is only missing.
+        # Without s3:ListBucket a missing key answers AccessDenied, so a refused marker and a
+        # missing one look alike: the job config beside it tells the two cases apart.
         try:
             probe = _read_artifact(host, job_uri)
-        except SparkRunError:
+        except SparkRunError as failed:
+            probe_code = _read_code(failed)
+            if not is_denied_code(probe_code):
+                raise SparkRunError(
+                    f"the marker {uri} is refused ({code}) and the job config {job_uri} could "
+                    f"not be read to tell why ({probe_code}): nothing was checked"
+                ) from failed
             probe = None
         if probe is None:
             raise MarkerReadDenied(
                 f"the marker {uri} and the job config {job_uri} cannot be read: the identity "
                 "that reconciles needs s3:GetObject on the build's prefix, and s3:ListBucket on "
-                "it so a missing object reads as missing"
+                "it so a missing object reads as missing",
+                uri=uri,
             ) from exc
-        warn_no_list_bucket(uri)
-        return None
+        raise MarkerReadDenied(
+            f"the marker {uri} is refused ({code}) while the job config beside it reads: the "
+            "identity lacks s3:GetObject on it, or s3:ListBucket on the build's prefix, which "
+            "makes a missing marker answer the same way",
+            uri=uri,
+            job_config_readable=True,
+        ) from exc
 
 
 def clear_failed(host: LocalHost, run: DesiredRun, config_hash: str) -> None:

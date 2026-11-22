@@ -241,6 +241,15 @@ def _one_line(value: Any) -> str:
     return text if len(text) <= _DETAIL_MAX else text[: _DETAIL_MAX - 1] + "…"
 
 
+def _label_text(label: str) -> str:
+    """A file label as one clipped line with its control characters spelled: it is a path the
+    user typed or a folder held, and a line break in it would start a line of its own in the
+    error."""
+    from fluid_build._console import _show_controls
+
+    return _show_controls(_one_line(label))
+
+
 def refuse_duplicate_ids(items: Sequence[BatchItem]) -> None:
     """Two files declaring one product id would publish over each other: refuse before any send."""
     from fluid_build.cli._common import CLIError
@@ -251,7 +260,8 @@ def refuse_duplicate_ids(items: Sequence[BatchItem]) -> None:
     dupes = {pid: labels for pid, labels in seen.items() if len(labels) > 1}
     if dupes:
         listing = "; ".join(
-            f"{pid} in {', '.join(labels)}" for pid, labels in sorted(dupes.items())
+            f"{pid} in {', '.join(_label_text(label) for label in labels)}"
+            for pid, labels in sorted(dupes.items())
         )
         raise CLIError(
             1,

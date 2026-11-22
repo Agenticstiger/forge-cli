@@ -96,6 +96,7 @@ from fluid_build.build_runners.spark._adapters import (
     SparkRunError,
     adapter_for,
     usable_stop_key,
+    warn_no_list_bucket,
 )
 from fluid_build.build_runners.spark._desired import (
     ACCEPT_FAILED_ENV,
@@ -575,9 +576,19 @@ def _reconcile_one(
     try:
         earlier = None if matching else _earlier_failure(adapter, run)
     except MarkerReadDenied as exc:
-        out.action, out.error, out.code = "refused", True, READ_DENIED
-        out.message = f"{_clean(exc)}; nothing was started"
-        return out
+        if not (exc.job_config_readable and accept_failed):
+            out.action, out.error, out.code = "refused", True, READ_DENIED
+            out.message = f"{_clean(exc)}; nothing was started"
+            if exc.job_config_readable:
+                # A refused marker cannot be told from a missing one: grant the read, or take
+                # the risk for one apply.
+                out.message += (
+                    f". Grant the read, or set {ACCEPT_FAILED_ENV}=1 for one fluid apply to "
+                    "start it without knowing whether this config failed its probation"
+                )
+            return out
+        warn_no_list_bucket(exc.uri)  # the operator went ahead: the marker is read as missing
+        earlier = None
     if earlier is not None and not accept_failed:
         # Stopped before anything is: a run of another config keeps going.
         out.action, out.error, out.code = "refused", True, FAILED_EARLIER

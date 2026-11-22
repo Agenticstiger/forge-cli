@@ -418,5 +418,6 @@ dag = DAG(
     schedule={py_str_literal(airflow_schedule)},
     start_date=datetime(2026, 1, 1, tzinfo=ZoneInfo({py_str_literal(timezone)})),
     catchup=False,
+    max_active_runs=1,
     tags={tags!r},
 {dag_args})"""
