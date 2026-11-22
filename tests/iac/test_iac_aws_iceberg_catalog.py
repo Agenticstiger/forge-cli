@@ -164,7 +164,7 @@ class TestNonGlueIcebergCatalog:
 #: The emit of an Iceberg expose with no ``catalog`` (minus the contract YAML
 #: parameter), as forge-cli emitted it before ``location.catalog`` was read, plus the
 #: first metadata Glue writes for a new table (``_add_iceberg_metadata``), which leaves
-#: ``table_type`` to Glue.
+#: ``table_type`` to Glue, and the product id forge writes on every table it makes.
 ABSENT_CATALOG_GOLDEN: Dict[str, Any] = {
     "aws_glue_catalog_database": {
         "analytics_lake_sales": {"name": "sales", "lifecycle": {"ignore_changes": ["parameters"]}}
@@ -174,7 +174,11 @@ ABSENT_CATALOG_GOLDEN: Dict[str, Any] = {
             "name": "orders",
             "database_name": "${aws_glue_catalog_database.analytics_lake_sales.name}",
             "table_type": "EXTERNAL_TABLE",
-            "parameters": {"classification": "iceberg", "managed_by": "fluid"},
+            "parameters": {
+                "classification": "iceberg",
+                "fluid_product_id": "analytics.lake",
+                "managed_by": "fluid",
+            },
             "storage_descriptor": {
                 "columns": [{"name": "order_id", "type": "string"}, {"name": "qty", "type": "int"}],
                 # Iceberg keeps its location without the trailing slash.

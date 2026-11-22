@@ -259,6 +259,15 @@ transformations, access grants, and orchestration tasks.
         help="with --tofu: as on apply (take ownership of a shared pool; audited)",
     )
     p.add_argument(
+        "--adopt-tables",
+        action="store_true",
+        default=False,
+        help=(
+            "with --tofu: as on apply (take over the existing tables the contract names, "
+            "each only if it matches the contract; the saved plan imports them)"
+        ),
+    )
+    p.add_argument(
         "--ensure-opentofu",
         action="store_true",
         default=False,
@@ -285,6 +294,19 @@ def run(args, logger: logging.Logger) -> int:
     given by ``--out``).
     """
     try:
+        # The tables are compared with the contract in OpenTofu's plan of them: a plan
+        # without --tofu cannot check one, and must not look as if it had.
+        if getattr(args, "adopt_tables", False) and not getattr(args, "tofu", False):
+            raise CLIError(
+                1,
+                "plan_adopt_tables_needs_tofu",
+                {
+                    "error": "--adopt-tables checks each existing table against the contract "
+                    "in OpenTofu's plan of it, so it needs --tofu",
+                    "remediation": ["fluid plan <contract> --tofu --adopt-tables"],
+                },
+            )
+
         # UX hardening — accept bare ``fluid plan`` when CWD has a contract.
         from fluid_build.cli._common import auto_find_contract
 

@@ -214,6 +214,16 @@ jobs:
             require: |
               Glue partition moto=tests/iac/test_iac_aws_partition_plan_moto.py
               Iceberg location moto=tests/iac/test_iac_aws_iceberg_location_moto.py
+          # Taking over an existing Glue table (--adopt-tables): what the provider reads
+          # back from a table Iceberg or Hive wrote, whether its import plans no change,
+          # and what a partition trigger new to the state does, only a real plan against
+          # a real table proves.
+          - name: "Glue table adoption (tofu vs moto, creds-free)"
+            tests: tests/iac/test_iac_aws_table_adoption_moto.py
+            pytest-args: ""
+            junit: glue-table-adoption-moto.xml
+            require: |
+              Glue table adoption moto=tests/iac/test_iac_aws_table_adoption_moto.py
           # `fluid diff` refreshes the apply's OpenTofu state: a real apply,
           # then the refresh plan, against moto. Whether a clean apply reads as
           # no drift depends on what the provider reads back, so only a real
