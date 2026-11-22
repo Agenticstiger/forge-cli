@@ -486,6 +486,55 @@ def test_a_config_module_outside_the_tree_is_found_by_name(tmp_path):
     assert index.folder(module).fold(node.value) == "outside"
 
 
+def test_a_module_of_the_importing_files_own_package_is_found_by_its_full_name(tmp_path):
+    """The scanned directory may sit below the import root (Airflow puts the DAGs folder on the
+    path, and the files import ``teamx.dags.<dag>.settings``): a name that runs through the
+    importing file's own directory and goes on to a file there is that file."""
+    _write(
+        tmp_path,
+        {
+            "dags/nightly/dag.py": (
+                "from teamx.dags.nightly.settings import STEP\n"
+                "from teamx.dags.nightly import pkg\n"
+                "from teamx.dags.nightly.pkg.inner import DEEP\n"
+                "import teamx.dags.nightly.settings as cfg\n"
+                "from teamx.weekly.settings import WEEKLY\n"
+                "from teamx.dags.nightly.missing import GONE\n"
+                "a = STEP['script']\nb = pkg.X\nc = DEEP\nd = cfg.STEP['config']\n"
+                "e = WEEKLY\nf = GONE\n"
+            ),
+            "dags/nightly/settings.py": (
+                "STEP = {'script': 's3://code/a.py', 'config': 's3://code/a.yaml'}\n"
+            ),
+            "dags/nightly/pkg/__init__.py": "X = 'from the package'\n",
+            "dags/nightly/pkg/inner.py": "DEEP = 'deeper'\n",
+            "dags/weekly/settings.py": "WEEKLY = 'not next door'\n",
+            "dags/top.py": "from teamx.dags.settings import T\nt = T\n",
+            "dags/settings.py": "T = 'at the root'\n",
+        },
+    )
+    walk = P.find_python_files(tmp_path / "dags")
+    index = ModuleIndex(walk.files)
+    module = index.load(next(f for f in walk.files if f.rel == "nightly/dag.py"))
+    assert module is not None
+    folder = index.folder(module)
+    values = {
+        stmt.targets[0].id: folder.fold(stmt.value)  # type: ignore[attr-defined]
+        for stmt in module.tree.body
+        if isinstance(stmt, ast.Assign)
+    }
+    assert values["a"] == "s3://code/a.py" and values["d"] == "s3://code/a.yaml"
+    assert values["b"] == "from the package" and values["c"] == "deeper"
+    # a name that does not run through the importing file's directory is not guessed at
+    assert "is not in the scanned files" in _why(values["e"])
+    assert "is not in the scanned files" in _why(values["f"])
+    # a file at the root of the scan has no directory of its own to go by
+    top = index.load(next(f for f in walk.files if f.rel == "top.py"))
+    assert top is not None
+    node = next(n for n in top.tree.body if isinstance(n, ast.Assign))
+    assert "is not in the scanned files" in _why(index.folder(top).fold(node.value))
+
+
 @pytest.mark.parametrize("where", ["project", "dags", "outside"])
 def test_a_dag_files_imports_resolve_whatever_the_working_directory(tmp_path, monkeypatch, where):
     """A DAG file is shown by its path from the working directory, and its imports are resolved

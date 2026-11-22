@@ -1095,7 +1095,40 @@ class ModuleIndex:
                 return f"more than one scanned file answers to the module name `{dotted}`"
             if len(candidates) == 1:
                 return candidates[0], parts[cut:]
+        own = self._in_own_package(parts, from_rel)
+        if own is not None:
+            return own
         return f"`{qualified}` is not in the scanned files"
+
+    def _in_own_package(
+        self, parts: Sequence[str], from_rel: str
+    ) -> Optional[Tuple[SourceFile, List[str]]]:
+        """``teamx.dags.nightly.settings.STEP`` imported by ``nightly/dag.py`` of a scan of
+        ``dags/``: the scanned directory sits below the import root, so the leading parts of the
+        name are packages the scan does not see. When the name runs through the importing file's
+        own directory (or one of its parents inside the scan: ``nightly``) and goes on to a file
+        there (``nightly/settings.py``), it is that file: the package the importing file is in
+        is the one the name ends in. A name that does not run through those directories is not
+        guessed at (``teamx.weekly.settings`` from ``nightly/dag.py``)."""
+        here = from_rel.split("/")[:-1]
+        for depth in range(len(here), 0, -1):  # the importing file's directory, then its parents
+            package = here[:depth]
+            for at in range(len(parts) - 2, -1, -1):
+                if parts[at] != package[-1]:
+                    continue
+                head = parts[: at + 1]
+                common = min(len(head), len(package))
+                if list(head[-common:]) != package[-common:]:
+                    continue
+                for cut in range(len(parts) - 1, at, -1):
+                    rel = "/".join([*package, *parts[at + 1 : cut]])
+                    dotted = ".".join([*package, *parts[at + 1 : cut]])
+                    for source in self._dotted.get(dotted, ()):
+                        if source.rel == f"{rel}/__init__.py" or (
+                            cut > at + 1 and source.rel == f"{rel}.py"
+                        ):
+                            return source, list(parts[cut:])
+        return None
 
 
 # ── the folder ────────────────────────────────────────────────────────
