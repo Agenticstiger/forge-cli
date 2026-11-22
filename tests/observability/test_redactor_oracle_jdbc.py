@@ -5,9 +5,9 @@
 (``jdbc:oracle:thin:user/password@host``), a Slack incoming webhook, a Google API key glued to
 a word.
 
-The two redaction layers must mask the same shapes (CLAUDE.md: extend both), so each case runs
-through the global layer and through the Snowflake twin, and the twin is asserted to share the
-Oracle rule's regex object.
+The redaction layers must mask the same shapes (a new shape goes into every one), so each case runs
+through the global layer and the Snowflake, local and GCP loggers, and the Snowflake one is asserted
+to share the Oracle rule's regex object.
 
 Every credential-shaped value is assembled at run time, so no source line holds a literal a
 secret scanner would take for one.
