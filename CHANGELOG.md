@@ -440,14 +440,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (a host in a URI's query string or in a database name). Beside a `secretRef`, the policy now
   judges `host`, the host part of each URI field, the host of an SSH tunnel in use (a tap's
   `ssh_tunnel` with `enable: true`, Airbyte's `tunnel_method` other than `NO_TUNNEL`), and,
-  under any other setting of the connection block at any depth, a URI or a field named for a
-  host (`host`, `hostname`, `hosts`, `server_addresses`, `cluster_url`). A loopback host behind
-  a tunnel needs an allowlist entry too. A URI of an object store or a local file names no host.
-  A parameter that names a host, in a query string (`host` or `hostaddr` in a libpq URI, a host
-  in `jdbc_url_params` or in a Singer tap's `sqlalchemy_url`) or in a mapping a connector reads
-  as one (a Singer tap's `sqlalchemy_url_query` or `sqlalchemy_options`, `connect_args` under
+  under any other setting of the connection block at any depth, a URI, or a field named for a
+  host (`host`, `hostname`, `hosts`, `server_addresses`, `cluster_url`) that holds a dotted
+  name, an address or a host list. A loopback host behind a tunnel needs an allowlist entry too.
+  A URI of an object store or a local file names no host, nor does an embedded JDBC URL, and a
+  URI under a credential-named field is judged by its host and never quoted. A parameter that
+  names a host, in a query string (`host` or `hostaddr` in a libpq URI, a host in
+  `jdbc_url_params` or in a Singer tap's `sqlalchemy_url`) or in a mapping a connector reads as
+  one (a Singer tap's `sqlalchemy_url_query` or `sqlalchemy_options`, `connect_args` under
   `sqlalchemy_eng_params`, any other `*_query` mapping), is refused unless the reference may go
-  to any host, and so are a driver argument in `connect_args` that holds `;`, `{` or `}` and a
+  to any host, and so are a parameter whose name holds connection-string syntax (`=`, a blank,
+  `;` or a quote), a driver argument in `connect_args` that holds `;`, `{` or `}`, and a
   database name that holds `?`, `#`, `;`, `&`, `@`, `\` or a control character. An absolute
   socket path in libpq's `host` or in MySQL's `unix_socket` is this machine. A URI whose
   authority a database client could read as naming a host the policy does not read is refused
