@@ -399,6 +399,56 @@ def test_a_finally_that_was_read_is_not_run_by_a_jump_after_its_try():
     assert got == {"after": {0, 2}}
 
 
+def test_a_jump_in_a_finally_leaves_through_the_ones_outside_it_only():
+    got = states(
+        """
+        w = base
+        for i in x:
+            try:
+                pass
+            finally:
+                w = w.trigger(1)
+                break
+        use("after")
+        """
+    )
+    assert got == {"after": {0, 1}}
+
+
+def test_a_jump_in_a_finally_that_a_jump_runs_does_not_run_it_again():
+    got = states(
+        """
+        w = base
+        for i in x:
+            try:
+                break
+            finally:
+                break
+        use("after")
+        """
+    )
+    assert got == {"after": {0}}
+
+
+def test_a_jump_in_nested_finally_bodies_runs_each_once():
+    got = states(
+        """
+        w = base
+        for i in x:
+            try:
+                try:
+                    break
+                finally:
+                    w = w.trigger(1)
+                    continue
+            finally:
+                w = w.trigger(2)
+        use("after")
+        """
+    )
+    assert got == {"after": {0, 2}}
+
+
 def test_a_jump_through_two_finally_bodies_runs_both_innermost_first():
     got = states(
         """

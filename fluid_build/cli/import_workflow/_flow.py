@@ -165,9 +165,7 @@ class Flow:
             return None
         if isinstance(statement, (ast.Break, ast.Continue)) and self._loops:
             loop = self._loops[-1]
-            left: State = state
-            for final in reversed(self._finals[loop.finals :]):  # the ones this jump leaves
-                left = self._block(final, left)
+            left = self._through_finals(state, loop.finals)
             if left is not None:
                 if isinstance(statement, ast.Break):
                     loop.breaks = loop.breaks | left
@@ -175,6 +173,26 @@ class Flow:
                     loop.continues = loop.continues | left
             return None
         return state
+
+    def _through_finals(self, state: FrozenSet[int], open_before: int) -> State:
+        """What a jump out of a loop holds once it has run the ``finally`` bodies it leaves (the
+        ones opened since the loop began, innermost first). While one runs it is no longer open: a
+        jump in it leaves through the ones outside it only."""
+        left: State = state
+        leaving = self._finals[open_before:]
+        del self._finals[open_before:]
+        try:
+            for position in range(len(leaving) - 1, -1, -1):
+                self._finals.extend(leaving[:position])
+                try:
+                    left = self._block(leaving[position], left)
+                finally:
+                    del self._finals[open_before:]
+                if left is None:
+                    break
+        finally:
+            self._finals.extend(leaving)
+        return left
 
     def _loop(self, loop: ast.stmt, state: FrozenSet[int]) -> State:
         frame = _Loop(len(self._finals))
