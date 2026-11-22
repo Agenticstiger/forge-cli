@@ -497,34 +497,129 @@ def _first_links(job: JobRecord) -> List[LinkedTask]:
 
 
 def _bridge_key(ref: Any) -> Tuple[str, str]:
-    """What a read and a write of one table, path or topic have in common, whatever qualifies the
-    name (a catalog, a database): the kind and the last part, lower case."""
+    """What a read and a write of one table or topic have in common, whatever qualifies the name
+    (a catalog, a database): the kind and the last part, lower case."""
     return ref.kind, (ref.parts[-1] if ref.parts else "").lower().rstrip("/")
+
+
+#: Directories of a path that are kept: past this a path is known by where it starts.
+_MAX_PATH_SEGMENTS = 40
+#: A scheme another spells: the two name one location.
+_SCHEME_FAMILY = {
+    "s3a": "s3",
+    "s3n": "s3",
+    "gcs": "gs",
+    "abfss": "abfs",
+    "wasbs": "wasb",
+    "file": "",
+}
+
+
+def _path_key(text: str) -> Tuple[str, ...]:
+    """A path as ``(scheme family, bucket or host, *directories)``, lower case: ``s3://b/x``,
+    ``s3a://b/x`` and ``s3://b/x/*`` are one key, ``file:///d/x`` and ``/d/x`` are one, and a
+    partition (``/d/x/dt=1``) has the key of ``/d/x`` as its start. A glob cuts the path where it
+    starts (what is before it is the directory the glob is in)."""
+    text = text[:4_096].lower().split("?")[0].split("#")[0].replace("\\", "/")
+    scheme = authority = ""
+    if "://" in text:
+        scheme, text = text.split("://", 1)
+        authority, _, text = text.partition("/")
+    elif text.startswith("file:"):
+        scheme, text = "file", text[5:]
+    directories: List[str] = []
+    for segment in text.split("/"):
+        if not segment or segment == ".":
+            continue
+        if any(mark in segment for mark in "*?[{"):
+            break
+        directories.append(segment)
+        if len(directories) == _MAX_PATH_SEGMENTS:
+            break
+    return (_SCHEME_FAMILY.get(scheme, scheme), authority, *directories)
+
+
+@dataclass
+class _Feed:
+    """What feeds the writes of one ignored name: the keys of the reads that feed any of them, and
+    whether one of them does not say (any read of the job may feed it)."""
+
+    keys: Set[Tuple[Any, ...]] = field(default_factory=set)
+    unknown: bool = False
+
+
+class _Bridges:
+    """What feeds the writes of one job that the conventions ignore (a staging table, path or topic).
+
+    A write like that is an intermediate: what feeds it feeds what reads it, so a product that
+    reads it takes its feeds. A table or a topic is found by its last part (:func:`_bridge_key`), a
+    path by the directories it goes through (:func:`_path_key`): the other spellings of one
+    location (``s3a`` for ``s3``, ``file:///``, a trailing glob) and a read of a partition below
+    the written directory find the write. Writes of one name are one entry: the union of what
+    feeds them, and whether any of them does not say.
+    """
+
+    __slots__ = ("exact", "paths", "keys", "ignored_paths")
+
+    def __init__(self) -> None:
+        self.exact: Dict[Tuple[str, str], _Feed] = {}
+        self.paths: Dict[Tuple[str, ...], _Feed] = {}
+        #: The key of every read that feeds one of them.
+        self.keys: Set[Tuple[Any, ...]] = set()
+        #: The keys of the reads of a path the conventions ignore.
+        self.ignored_paths: Set[Tuple[Any, ...]] = set()
+
+    def add(self, write: Write) -> None:
+        if write.kind == "path":
+            feed = self.paths.setdefault(_path_key(write.name), _Feed())
+        else:
+            feed = self.exact.setdefault(_bridge_key(write), _Feed())
+        if write.feeds is None:
+            feed.unknown = True
+        else:
+            feed.keys.update(write.feeds)
+            self.keys.update(write.feeds)
+
+    def note_reads(self, reads: Sequence[Read], conv: Conventions) -> None:
+        """Remember which reads are of a path the conventions ignore: one of them that no written
+        path matches was written some way the keys do not see."""
+        if self.paths:
+            self.ignored_paths = {
+                read_key(read)
+                for read in reads
+                if read.kind == "path" and read.resolved and identity_of(read, conv) is None
+            }
+
+    def feeds_of(self, read: Read) -> Tuple[List[_Feed], bool]:
+        """The entries of the writes that make what ``read`` reads, and whether it is a read of
+        an ignored path that none of the written ones matches."""
+        if read.kind != "path":
+            feed = self.exact.get(_bridge_key(read))
+            return ([feed] if feed is not None else []), False
+        if not read.resolved:
+            return [], False
+        key = _path_key(read.name)
+        found = [self.paths[key[:n]] for n in range(len(key), 1, -1) if key[:n] in self.paths]
+        return found, not found and read_key(read) in self.ignored_paths
 
 
 def _bridge(job: JobRecord, write: Write) -> None:
     """A write the conventions ignore (a staging table) is an intermediate: what feeds it feeds
-    what reads it, so the products that read it take its feeds (``None`` when they are not
-    said)."""
-    bridges: Dict[Tuple[str, str], Optional[Set[Tuple[Any, ...]]]] = (
-        getattr(job, "_bridges", None) or {}
-    )
-    key = _bridge_key(write)
-    feeds = None if write.feeds is None else set(write.feeds)
-    if key in bridges:
-        before = bridges[key]
-        feeds = None if before is None or feeds is None else before | feeds
-    bridges[key] = feeds
-    job._bridges = bridges  # type: ignore[attr-defined]
+    what reads it (see :class:`_Bridges`)."""
+    bridges = getattr(job, "_bridges", None)
+    if bridges is None:
+        bridges = job._bridges = _Bridges()  # type: ignore[attr-defined]
+    bridges.add(write)
 
 
 def _through_bridges(
     owned: Set[Tuple[Any, ...]], loose: bool, job: JobRecord
 ) -> Tuple[Set[Tuple[Any, ...]], bool]:
     """``owned`` and everything that feeds a read among them through a write the conventions
-    ignore, and whether one of those writes does not say what feeds it."""
+    ignore, and whether one of those writes does not say what feeds it (or a read of an ignored
+    path matches none of the paths the job wrote)."""
     bridges = getattr(job, "_bridges", None)
-    if not bridges:
+    if bridges is None:
         return owned, loose
     pools = _pools(job)
     owned = set(owned)
@@ -533,16 +628,13 @@ def _through_bridges(
         read = pools.by_key.get(queue.pop())
         if read is None:
             continue
-        key = _bridge_key(read)
-        if key not in bridges:
-            continue
-        feeds = bridges[key]
-        if feeds is None:
-            loose = True
-            continue
-        for fed in feeds - owned:
-            owned.add(fed)
-            queue.append(fed)
+        feeds, unmatched = bridges.feeds_of(read)
+        loose = loose or unmatched
+        for feed in feeds:
+            loose = loose or feed.unknown
+            for fed in feed.keys - owned:
+                owned.add(fed)
+                queue.append(fed)
     return owned, loose
 
 
@@ -561,9 +653,8 @@ class _Pools:
         self.index = {read_key(read): place for place, read in enumerate(self.reads)}
         # a read that only feeds a write the conventions ignore may feed what reads that write,
         # which a product that does not say what feeds it may be
-        bridged = {
-            key for feeds in (getattr(job, "_bridges", None) or {}).values() for key in feeds or ()
-        }
+        bridges = getattr(job, "_bridges", None)
+        bridged = bridges.keys if bridges is not None else frozenset()
         self.loose = [
             read for read in self.reads if not read.exclusive or read_key(read) in bridged
         ]
@@ -761,6 +852,8 @@ def build_proposal(
     seen_notes: Set[Tuple[Any, ...]] = set()
     ignored = 0
     for job in ordered:
+        job._bridges = None  # type: ignore[attr-defined]  # what a repeat call left is stale
+        job._pools = None  # type: ignore[attr-defined]
         for write in job.facts.writes:
             if not write.resolved:
                 report.unsupported.append(
@@ -793,6 +886,9 @@ def build_proposal(
                 continue
             else:
                 existing.others.append((job, write))
+        bridges = getattr(job, "_bridges", None)
+        if bridges is not None:
+            bridges.note_reads(job.facts.reads, conv)
     if ignored:
         report.notes.append(f"{ignored} write(s) ignored by the conventions' ignore rules")
     for output in outputs.values():

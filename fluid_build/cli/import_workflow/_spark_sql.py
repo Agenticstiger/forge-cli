@@ -9,9 +9,11 @@ dependency) and never executed.
 
 What is a table, and what is not:
 
-* a name in a ``FROM`` or ``JOIN`` is a read, except a CTE of the same statement
-  (sqlglot answers a CTE in ``FROM`` with a table node, so the CTE names are collected and left
-  out), a name registered as a temporary view and a table function (``range(10)``); a
+* a name in a ``FROM`` or ``JOIN`` is a read, except a CTE (sqlglot answers a CTE in ``FROM`` with
+  a table node, so a name is left out only where a CTE of that name is in scope: in the CTEs
+  defined after it and in the query its ``WITH`` belongs to, not in its own body, where the name
+  is the table of the catalog, and not outside that query), a name registered as a temporary view
+  and a table function (``range(10)``); a name in a hint (``/*+ BROADCAST(b) */``) is not a read; a
   ``global_temp`` name and a name the statement caches (``CACHE TABLE v AS SELECT ...``) are views
   the reader of the job drops, and a statement that reads one is not closed;
 * ``INSERT INTO|OVERWRITE``, ``CREATE TABLE|VIEW ... AS``, ``MERGE INTO``, ``UPDATE`` and
@@ -167,10 +169,60 @@ def _target_node(statement: Any) -> Optional[Any]:
     return this if isinstance(this, exp.Table) else None
 
 
-def _cte_names(statement: Any) -> Set[str]:
+#: The CTEs in scope at a node: ``(name -> index in its WITH, how many of them are in scope, the
+#: scope outside)``, ``None`` outside every WITH.
+_Visible = Optional[Tuple[Dict[str, int], int, Any]]
+
+
+def _sees(visible: _Visible, name: str) -> bool:
+    while visible is not None:
+        names, limit, visible = visible
+        if names.get(name, limit) < limit:
+            return True
+    return False
+
+
+def _cte_references(statement: Any) -> Set[int]:
+    """The ``id`` of each table node of ``statement`` that names a CTE in scope where it stands.
+
+    The CTEs of a ``WITH`` are in scope in the ones after them and in the query the ``WITH``
+    belongs to (a recursive one is also in scope in its own body). Anywhere else the name is a
+    table of the catalog: inside the CTE of the same name, or in another branch of a union whose
+    ``WITH`` is in a subquery. The tree is walked without recursion (a long chain of unions is a
+    deep tree).
+    """
     from sqlglot import exp
 
-    return {cte.alias.lower() for cte in statement.find_all(exp.CTE) if cte.alias}
+    found: Set[int] = set()
+    stack: List[Tuple[Any, _Visible]] = [(statement, None)]
+    while stack:
+        node, visible = stack.pop()
+        inner = visible
+        with_ = next((v for v in node.args.values() if isinstance(v, exp.With)), None)
+        if with_ is not None:
+            ctes = [cte for cte in with_.expressions if isinstance(cte, exp.CTE)]
+            names: Dict[str, int] = {}
+            for index, cte in enumerate(ctes):
+                if cte.alias:
+                    names.setdefault(cte.alias.lower(), index)
+            own = 1 if with_.args.get("recursive") else 0
+            for index, cte in enumerate(ctes):
+                if isinstance(cte.this, exp.Expression):
+                    stack.append((cte.this, (names, index + own, visible)))
+            inner = (names, len(ctes), visible)
+        if (
+            isinstance(node, exp.Table)
+            and not node.args.get("db")
+            and not node.args.get("catalog")
+            and node.name
+            and _sees(visible, node.name.lower())
+        ):
+            found.add(id(node))
+        for child in node.args.values():
+            for item in child if isinstance(child, list) else (child,):
+                if isinstance(item, exp.Expression) and not isinstance(item, exp.With):
+                    stack.append((item, inner))
+    return found
 
 
 def _reads(
@@ -180,16 +232,15 @@ def _reads(
     from sqlglot import exp
 
     found: List[SqlName] = []
-    ctes = _cte_names(statement)
+    skipped = _cte_references(statement)
+    # ``/*+ BROADCAST(b) */`` names an alias, not a table
+    skipped.update(id(t) for hint in statement.find_all(exp.Hint) for t in hint.find_all(exp.Table))
     for table in statement.find_all(exp.Table):
-        if table is target:
+        if table is target or id(table) in skipped:
             continue
         name = _name_of(table, holes)
         if name is None:
             continue
-        if name.kind == "table":
-            if len(name.parts) == 1 and name.parts[0] in ctes:
-                continue
         facts.reads.append(name)
         found.append(name)
     return found

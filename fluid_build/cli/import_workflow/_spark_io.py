@@ -401,6 +401,8 @@ class _Reader:
         #: A view the file registers under a name that is not a constant (a helper's parameter, the
         #: environment): a name with no database in front of it may be that view.
         self._views_uncertain = False
+        #: Whether the file has a ``writeStream`` anywhere; ``None`` until asked.
+        self._stream_writer: Optional[bool] = None
         self.default_checkpoint: Optional[str] = None
         #: What feeds what: the reads each call made (positions in ``facts.reads``), the calls
         #: whose reads are not all in ``facts.reads`` (a name that did not fold, a temporary view,
@@ -451,8 +453,9 @@ class _Reader:
                 self.facts.is_spark = True
                 for parent in self._assignment_targets(call):
                     self.sessions.add(parent)
-            elif func.attr in _TEMP_VIEW_METHODS and call.args:
-                name = self.folder.string(call.args[0])
+            elif func.attr in _TEMP_VIEW_METHODS:
+                node = self._arg(call, 0, "name")
+                name = self.folder.string(node) if node is not None else None
                 if isinstance(name, str):
                     self.temp_views.add(name.lower())
                 else:
@@ -495,27 +498,75 @@ class _Reader:
                 self.temp_views.add(view)
 
     def _views_of_sink(self, call: ast.Call) -> None:
-        """A ``memory`` sink registers a table named by its ``queryName``: a view, to SQL."""
+        """A ``memory`` sink registers a table named by its ``queryName``: a view, to SQL.
+
+        A sink that cannot be read to the end leaves the file's views uncertain: a writer kept in a
+        name that is assigned more than once, in a container or picked by a condition (the chain
+        does not lead back to ``writeStream``), or a format that is not a constant. Both only
+        matter in a file that writes a stream.
+        """
         links, _root = self._links(call)
         marker = self._marker(links)
-        if marker is None or links[marker].call is not None or links[marker].name != "writeStream":
+        if marker is None:
+            if self._writes_streams():
+                self._views_uncertain = True
             return
-        fmt = self._literal(self._arg(call, 1, "format"))
-        name_node = self._arg(call, 4, "queryName")
-        for link in links[marker + 1 :]:
-            if link.call is None or not link.call.args:
-                continue
-            if link.name == "format":
-                fmt = self._literal(link.call.args[0]) or fmt
-            elif link.name == "queryName":
-                name_node = link.call.args[0]
-        if (fmt or "").lower() != "memory":
+        if links[marker].call is not None or links[marker].name != "writeStream":
             return
-        name = self._literal(name_node)
+        fmt, fmt_known = self._sink_format(call, links[marker + 1 :])
+        if not fmt_known:
+            self._views_uncertain = True  # it may be a memory sink
+            return
+        if fmt != "memory":
+            return
+        name = self._literal(self._sink_query_name(call, links[marker + 1 :]))
         if name:
             self.temp_views.add(name.lower())
         else:
             self._views_uncertain = True
+
+    def _sink_format(self, call: ast.Call, links: Sequence[_Link]) -> Tuple[str, bool]:
+        """``(format, whether it is a constant)`` of a sink: the last ``format`` link wins, and
+        ``start(format=...)`` is the one before it."""
+        node = self._arg(call, 1, "format")
+        fmt: Optional[str] = None if node is None else self._literal(node)
+        known = node is None or fmt is not None
+        for link in links:
+            if link.name == "format" and link.call is not None and link.call.args:
+                fmt = self._literal(link.call.args[0])
+                known = fmt is not None
+        return (fmt or "").lower(), known
+
+    def _sink_query_name(self, call: ast.Call, links: Sequence[_Link]) -> Optional[ast.expr]:
+        """The expression that names the sink's query: ``queryName(...)``, ``option("queryName",
+        ...)``, ``options(queryName=...)`` or ``start(queryName=...)``, the last one given."""
+        name = self._arg(call, 4, "queryName")
+        for link in links:
+            inner = link.call
+            if inner is None:
+                continue
+            if link.name == "queryName" and inner.args:
+                name = inner.args[0]
+            elif (
+                link.name == "option"
+                and len(inner.args) >= 2
+                and (self._literal(inner.args[0]) or "").lower() == "queryname"
+            ):
+                name = inner.args[1]
+            elif link.name == "options":
+                for kw in inner.keywords:
+                    if (kw.arg or "").lower() == "queryname":
+                        name = kw.value
+        return name
+
+    def _writes_streams(self) -> bool:
+        """Whether the file has a ``writeStream`` anywhere (a stream is written in it)."""
+        if self._stream_writer is None:
+            self._stream_writer = any(
+                isinstance(n, ast.Attribute) and n.attr == "writeStream"
+                for n in ast.walk(self.module.tree)
+            )
+        return self._stream_writer
 
     def _sql_facts(self, call: ast.Call) -> Optional[_spark_sql.SqlFacts]:
         """What the SQL of a ``spark.sql`` call holds, when its text folds; read once for each
@@ -1396,6 +1447,16 @@ class _Reader:
         if foreach is not None:
             self._foreach_batch(call, foreach, extra)
             return
+        if (
+            streaming
+            and name == "start"
+            and not self._sink_format(call, own[:-1])[1]
+            and self._arg(call, 0, "path") is None
+            and "path" not in options
+        ):
+            # a format that is not a constant and nothing to write to: as far as the code says, a
+            # memory, console or foreach sink. Nothing persistent, so the reads stay unowned
+            return
         if fmt in _NON_PERSISTENT:
             return
         if fmt == "jdbc" or name == "jdbc":
@@ -1628,9 +1689,15 @@ class _Reader:
                     callee = (qualified_name(func, self.module.imports) or func.id).rsplit(".", 1)[
                         -1
                     ]
-                    ok = self._is_pyspark(func.id) or (
-                        scalar and not self._is_callable_of_file(func)
-                    )
+                    if self._is_pyspark(func.id):
+                        ok = True
+                    elif self.folder.how_bound(func) in {"once", "many"}:
+                        # a name that holds a function (an alias, a lambda, a partial): what it
+                        # holds is what is called, and a lambda or a function of the file is not
+                        # understood
+                        ok = scalar and walk(func, depth + 1, shared, True)
+                    else:
+                        ok = scalar and not self._is_callable_of_file(func)
                     inner = scalar or callee not in _FRAME_METHODS
                 else:
                     ok = False
