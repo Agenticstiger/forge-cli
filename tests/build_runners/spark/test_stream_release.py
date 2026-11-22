@@ -19,7 +19,7 @@ pytest.importorskip("botocore")
 
 from fluid_build.build_runners.spark import _adapters as ad
 from fluid_build.build_runners.spark import _reconcile as rc
-from fluid_build.build_runners.spark._adapters import RunInfo, SparkRunError
+from fluid_build.build_runners.spark._adapters import SparkRunError
 from fluid_build.build_runners.spark._desired import STOP_KEY_FLAG
 from tests.build_runners.spark.conftest import runs_of, variant
 from tests.build_runners.spark.test_reconcile import ENV, WALL, FakeAdapter, info
