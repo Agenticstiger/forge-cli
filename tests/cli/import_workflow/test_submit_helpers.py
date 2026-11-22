@@ -19,7 +19,7 @@ import pytest
 import yaml
 
 from fluid_build.cli.import_workflow import _callables
-from fluid_build.cli.import_workflow._airflow_dags import Dag, ModuleDags, Task, read_dags
+from fluid_build.cli.import_workflow._airflow_dags import ModuleDags, Task, read_dags
 from fluid_build.cli.import_workflow._callables import HELPER_KINDS, Follower, SubmitHelper
 from fluid_build.cli.import_workflow._conventions import (
     Conventions,

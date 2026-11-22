@@ -56,6 +56,7 @@ from ._fold import (
     FoldedDict,
     FoldedTuple,
     Folder,
+    Scope,
     Unresolved,
     is_scalar,
     lookup,
@@ -309,7 +310,7 @@ class Follower:
         name = node.id
         if folder.rebound(name):
             return None
-        scope: Any = folder.scope_of(node)
+        scope: Optional[Scope] = folder.scope_of(node)
         while scope is not None:
             if name in scope.functions:
                 return scope.functions[name]
@@ -663,14 +664,13 @@ class Follower:
         if method == "create_job_flow":  # the EMR hook's create_job_flow(job_flow_overrides)
             given = _keyword(node, "job_flow_overrides") or (node.args[0] if node.args else None)
             overrides = folder.fold(given) if given is not None else None
-            steps = lookup(overrides, "Steps") if isinstance(overrides, dict) else ABSENT
-            return [] if steps is ABSENT else self._steps(steps, line)
+            listed = lookup(overrides, "Steps") if isinstance(overrides, dict) else ABSENT
+            return [] if listed is ABSENT else self._steps(listed, line)
         if method in ("start_job_run", "submit_job"):
             driver = _keyword(node, "jobDriver", "job_driver")
             if driver is None and method == "submit_job" and len(node.args) >= 4:
-                driver = node.args[
-                    3
-                ]  # the EMR on EKS hook's submit_job(name, role, release, driver)
+                # the EMR on EKS hook's submit_job(name, role, release, driver)
+                driver = node.args[3]
             return [] if driver is None else self._driver(folder.fold(driver), line)
         if qualified in _RUNNERS:
             command = node.args[0] if node.args else _keyword(node, "args", "command", "cmd")
