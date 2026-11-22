@@ -27,10 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   config file waits for that the conventions can give, with the tasks that wait for it (a constant
   of a module outside the scan: name it under `config_modules`; an environment variable; an Airflow
   Variable). Settings a DAG imports from the module next to it by its full package name
-  (`teamx.dags.nightly.settings`, the DAGs folder being on Airflow's path) are read, and the folder
-  reads `dict(...)`, `d.get(key, default)` and a function's parameters from its caller. A DAG file
-  goes through at most 200,000 calls and lists of the bodies it follows, and a function many tasks
-  run with the same arguments is read once.
+  (`teamx.dags.nightly.settings`, the DAGs folder being on Airflow's path) are read, and the report
+  names the file each such name was read as when only the importing file's own package says so
+  (another library of the same names would be read in its place). The folder reads `dict(...)`,
+  `d.get(key, default)` and a function's parameters from its caller, and a function whose name a
+  task takes later (`extract = PythonOperator(..., python_callable=extract)`) is the function
+  until then. The DAG files of one scan go through at most 500,000 calls and lists of the bodies
+  they follow between them (200,000 for one file), and a function the tasks of any of them run
+  with the same arguments is read once.
+
+### Changed
+
+- **A dict key written before a `**spread` that does not fold is no longer taken as known.**
+  `fluid import pyspark` and `fluid import airflow` read `{"table": "a", **unknown}` as a dict
+  whose `table` is `a`, though the spread can replace it when the code runs: that key is now
+  unknown, so what it names is reported as not read instead of taken as `a`. A key written after
+  the spread (`{**unknown, "table": "a"}`) is still read.
 
 ### Fixed
 
