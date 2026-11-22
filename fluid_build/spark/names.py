@@ -33,6 +33,8 @@ CONFIG_FILE = "job.json"
 #: ``.egg``) on the Python path.
 PACKAGE_DIR = "package"
 PACKAGE_FILE = "package.zip"
+#: The directory, beside the job config, of the maintenance job configs of the build's table.
+MAINTENANCE_DIR = "maintenance"
 #: Tag keys on every Spark resource (the same keys as the Databricks jobs).
 PRODUCT_TAG = "fluid_product"
 BUILD_TAG = "fluid_build"
@@ -129,6 +131,23 @@ def package_key(product: str, build: str, sha256: str) -> str:
 
 def package_uri(root: str, product: str, build: str, sha256: str) -> str:
     return f"{root}/{package_key(product, build, sha256)}"
+
+
+def maintenance_config_key(product: str, build: str, expose: str) -> str:
+    """Where an Iceberg expose's maintenance job config sits: beside the job config of the
+    build that writes the table, whose role reads it (``fluid_build/maintenance``)."""
+    return f"{artifact_prefix(product, build)}{MAINTENANCE_DIR}/{expose}/{CONFIG_FILE}"
+
+
+def maintenance_config_uri(root: str, product: str, build: str, expose: str) -> str:
+    return f"{root}/{maintenance_config_key(product, build, expose)}"
+
+
+def maintenance_run_name(product: str, expose: str) -> str:
+    """A maintenance run's name on every runtime. It ends in ``-maintain``, which no build's
+    run name does (those end in 8 hex characters), so a build's runs and the maintenance runs
+    of its table are never taken for each other."""
+    return _named(product, expose, "-maintain", 64)
 
 
 def run_name(product: str, build: str) -> str:

@@ -3,9 +3,9 @@
 
 """Apply-mode matrix for ``fluid apply --mode``.
 
-Six modes express every realistic deploy decision a team makes, and a
-seventh, ``reconcile``, deploys nothing (below the table). Per the plan
-(Part 1):
+Six modes express every realistic deploy decision a team makes, and two
+more, ``reconcile`` and ``maintain``, deploy nothing (below the table). Per
+the plan (Part 1):
 
     ┌──────────────────────┬───────────────────────┬────────────┬───────────────────┐
     │ Mode                 │ DDL                   │ DML        │ Existing data     │
@@ -31,6 +31,12 @@ within its restart budget (``build_runners/spark/_reconcile.py``). A
 keepalive, a scheduler task every few minutes, runs it with
 ``--build-id <stream>``.
 
+``maintain`` likewise runs no DDL, no ``tofu`` and no build, and takes no
+plan: it runs an Iceberg table's maintenance (``exposes[].iceberg.maintenance``,
+backend spark) once, on the runtime of the build that writes the table, with
+the job config the last apply deployed. The table's maintenance DAG runs it
+with ``--expose-id <expose>``.
+
 Destructive modes (``replace*``) require ``--allow-data-loss`` when the
 environment is not dev OR the target has rows. ``create-only`` hard-fails
 when the target already exists. ``dry-run`` renders DDL but makes zero
@@ -50,7 +56,7 @@ from typing import Optional
 class ApplyMode(str, Enum):
     """The canonical apply modes. Order matches ``--mode`` flag's choice list
     (least-destructive → most-destructive, then build-augmented variants),
-    then ``reconcile``, which deploys nothing.
+    then ``reconcile`` and ``maintain``, which deploy nothing.
     """
 
     DRY_RUN = "dry-run"
@@ -60,6 +66,7 @@ class ApplyMode(str, Enum):
     REPLACE = "replace"
     REPLACE_AND_BUILD = "replace-and-build"
     RECONCILE = "reconcile"
+    MAINTAIN = "maintain"
 
     @classmethod
     def default(cls) -> "ApplyMode":
@@ -100,6 +107,12 @@ def is_reconcile(mode: ApplyMode) -> bool:
     """``reconcile`` deploys nothing: it restarts the contract's Spark streams that died,
     with the config the last apply deployed."""
     return mode is ApplyMode.RECONCILE
+
+
+def is_maintain(mode: ApplyMode) -> bool:
+    """``maintain`` deploys nothing: it runs an Iceberg table's maintenance once, with the
+    job config the last apply deployed."""
+    return mode is ApplyMode.MAINTAIN
 
 
 def full_refresh_required(mode: ApplyMode) -> bool:
@@ -244,6 +257,7 @@ __all__ = [
     "full_refresh_required",
     "is_destructive",
     "is_dry_run",
+    "is_maintain",
     "is_reconcile",
     "needs_build",
     "parse_mode",

@@ -23,6 +23,11 @@ credential).
 - a prebuilt package (``package``): the team's own PySpark, by digest. The runner imports
   the pinned bytes, calls the entry point, checks the DataFrame it returns, and writes it
   as a batch run does; the package computes rows and never writes (:func:`run_package`).
+- maintenance (``mode: maintenance``, ``fluid_build/maintenance``): an Iceberg table's
+  maintenance steps, in order (:func:`run_maintenance`): a plugin's statements, compaction
+  (``rewrite_data_files``, with partial progress), ``rewrite_manifests``, ``expire_snapshots``
+  and ``remove_orphan_files``, through Iceberg's Spark actions. The table's stream keeps
+  running: a rewrite commits each file group on its own and retries on a concurrent append.
 - a release: ``fluid apply`` asks a stream it replaces to stop between two batches
   (``--fluid-stop-key``, :func:`stop_request_uri`), and a stream refuses a checkpoint that
   holds another topic's position before it reads (:func:`check_checkpoint_fits`).
@@ -223,11 +228,17 @@ def parse_config(text: str) -> dict:
     config = json.loads(text)
     if not isinstance(config, dict) or config.get("configVersion") != CONFIG_VERSION:
         raise JobConfigError(f"this runner reads configVersion {CONFIG_VERSION} only")
-    missing = [k for k in ("product", "build", "mode", "sql", "sink") if not config.get(k)]
+    maintenance = config.get("mode") == "maintenance"
+    needed = ("product", "build", "mode", "sink") if maintenance else _REQUIRED
+    missing = [k for k in needed if not config.get(k)]
     if missing:
         raise JobConfigError(f"the job config lacks {missing}")
+    if maintenance:
+        _check_sink(config["sink"])
+        _check_maintenance(config)
+        return config
     if config["mode"] not in ("streaming", "batch"):
-        raise JobConfigError("mode must be streaming or batch")
+        raise JobConfigError("mode must be streaming, batch or maintenance")
     if config["mode"] == "streaming" and not (config.get("source") and config.get("checkpoint")):
         raise JobConfigError("a streaming job reads a source and keeps a checkpoint")
     if config["mode"] == "batch" and config.get("source"):
@@ -243,6 +254,9 @@ def parse_config(text: str) -> dict:
     if config.get("deadLetter") is not None:
         _check_dead_letters(config, config["deadLetter"])
     return config
+
+
+_REQUIRED = ("product", "build", "mode", "sql", "sink")
 
 
 def _check_sink(sink) -> None:
@@ -1138,7 +1152,9 @@ def main(argv: list[str] | None = None) -> int:
     text = checked_text(read_text(spark, args.config), args.fluid_job_sha256, args.config)
     config = parse_config(text)
     stamps = release_stamps(config, text, flags)
-    if config.get("package"):
+    if config["mode"] == "maintenance":
+        run_maintenance(spark, config, stamps)
+    elif config.get("package"):
         # The package's copy sits beside the job config: found from where it was read.
         run_package(spark, config, args.config, stamps)
     else:
@@ -2146,3 +2162,258 @@ def run_package(spark, config: dict, config_uri: str, stamps: dict | None = None
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# --- table maintenance ----------------------------------------------------------------
+#
+# A maintenance config (``mode: maintenance``, compiled by fluid_build/maintenance/job.py)
+# names one Iceberg table (its ``sink``, never created here) and the steps to run on it, in
+# the order below. It runs on the runtime, and as the role, of the build that writes the
+# table, beside that build's stream: Iceberg commits optimistically, an append and a rewrite of
+# other files do not conflict, and with partial progress each rewritten file group is its own
+# commit, so a group a concurrent commit did conflict with fails alone and the next run takes
+# it again. Expiring snapshots and removing orphans commit no snapshot: their counts are in the
+# run's log. A statement (a plugin's DELETE, UPDATE or MERGE, checked by forge when the config
+# was compiled) commits with the run's stamps through Iceberg's CommitMetadata.
+
+#: The steps a maintenance config may list, in the only order the runner takes them.
+MAINTENANCE_STEPS = (
+    "statement",
+    "rewrite_data_files",
+    "rewrite_manifests",
+    "expire_snapshots",
+    "remove_orphan_files",
+)
+#: The rewrite_data_files options a maintenance config may set (Iceberg's RewriteDataFiles).
+_REWRITE_OPTIONS = frozenset(
+    {
+        "partial-progress.enabled",
+        "partial-progress.max-commits",
+        "target-file-size-bytes",
+        "min-input-files",
+        "delete-file-threshold",
+        "max-concurrent-file-group-rewrites",
+    }
+)
+_STRATEGIES = ("binpack", "sort")
+_STATEMENT_WRITES = ("DELETE", "UPDATE", "MERGE")
+#: The shortest ages the runner expires or removes at, whatever its config says: a file younger
+#: than the longest write is not an orphan yet (Iceberg's maintenance guide).
+_MIN_ORPHAN_SECONDS = 86400
+_MIN_EXPIRE_SECONDS = 3600
+#: The stamp that says which maintenance step made a commit.
+MAINTENANCE_STAMP = "fluid.maintenance"
+
+
+def _whole(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_statement(step: dict) -> None:
+    sql = step.get("sql")
+    name = step.get("name")
+    if not isinstance(name, str) or not _STAMP_IDENT.fullmatch(f"statement:{name}"):
+        raise JobConfigError("a statement step names the action it comes from")
+    if not isinstance(sql, str) or sql_write(sql) not in _STATEMENT_WRITES:
+        raise JobConfigError(
+            f"statement step {name}: each is one DELETE, UPDATE or MERGE, with no ${{...}}"
+        )
+    try:
+        separated = _has_separator(sql)
+    except ValueError:
+        raise JobConfigError(f"statement step {name}: SQL the runner cannot read") from None
+    if separated:
+        raise JobConfigError(f"statement step {name}: one statement, with no ';'")
+
+
+def _has_separator(text: str) -> bool:
+    """Whether ``text`` holds a ``;`` outside its comments, strings and quoted names, read as
+    :func:`_sql_tokens` reads them."""
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith(("--", "/*"), i):
+            i = _end_of_comment(text, i)
+        elif c in "'\"":
+            raw = i > 0 and text[i - 1] in "rR" and (i < 2 or not text[i - 2].isalnum())
+            i = _end_of_string(text, i, raw=raw)
+        elif c == "`":
+            i = _end_of_name(text, i)
+        elif c == ";":
+            return True
+        else:
+            i += 1
+    return False
+
+
+def _check_maintenance(config: dict) -> None:
+    """A maintenance config's steps, checked before Spark does anything."""
+    for key in ("source", "sql", "package", "deadLetter", "checkpoint"):
+        if config.get(key):
+            raise JobConfigError(f"a maintenance job reads no {key}: it maintains its sink table")
+    if (config["sink"] or {}).get("create"):
+        raise JobConfigError("a maintenance job creates no table: its sink must exist")
+    steps = (config.get("maintenance") or {}).get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise JobConfigError("a maintenance job lists its steps (maintenance.steps)")
+    kinds = [s.get("step") if isinstance(s, dict) else None for s in steps]
+    if any(k not in MAINTENANCE_STEPS for k in kinds):
+        raise JobConfigError(f"a maintenance step is one of {', '.join(MAINTENANCE_STEPS)}")
+    order = [MAINTENANCE_STEPS.index(k) for k in kinds]
+    if order != sorted(order) or len(set(k for k in kinds if k != "statement")) != len(
+        [k for k in kinds if k != "statement"]
+    ):
+        raise JobConfigError(
+            "maintenance steps run once each, in the order " + ", ".join(MAINTENANCE_STEPS)
+        )
+    for step in steps:
+        kind = step["step"]
+        if kind == "statement":
+            _check_statement(step)
+        elif kind == "rewrite_data_files":
+            if step.get("strategy", "binpack") not in _STRATEGIES:
+                raise JobConfigError(f"rewrite_data_files strategy is one of {_STRATEGIES}")
+            options = step.get("options") or {}
+            if not isinstance(options, dict) or set(options) - _REWRITE_OPTIONS:
+                raise JobConfigError(
+                    f"rewrite_data_files options are among {sorted(_REWRITE_OPTIONS)}"
+                )
+            if any(
+                not isinstance(v, str) or not v.isdigit() and v != "true" for v in options.values()
+            ):
+                raise JobConfigError("rewrite_data_files options are whole numbers or true")
+        elif kind in ("expire_snapshots", "remove_orphan_files"):
+            age = step.get("olderThanSeconds")
+            low = _MIN_ORPHAN_SECONDS if kind == "remove_orphan_files" else _MIN_EXPIRE_SECONDS
+            if not _whole(age) or age < low:
+                raise JobConfigError(f"{kind} olderThanSeconds is a whole number, at least {low}")
+            keep = step.get("retainLast", 1)
+            if kind == "expire_snapshots" and (not _whole(keep) or keep < 1):
+                raise JobConfigError("expire_snapshots retainLast is a whole number, at least 1")
+
+
+class _Callable:
+    """A Java ``Callable`` the JVM calls back into Python: what ``CommitMetadata`` runs."""
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def call(self):
+        self.fn()
+
+    class Java:
+        implements = ["java.util.concurrent.Callable"]
+
+
+def stamped_sql(spark, sql: str, stamps: dict) -> None:
+    """Run one DML statement with ``stamps`` in the summary of the snapshot it commits.
+    Iceberg's ``CommitMetadata.withCommitProperties`` holds them in a thread-local of the JVM
+    thread that commits, the one py4j pins to this Python thread."""
+    if not stamps:
+        spark.sql(sql).collect()
+        return
+    from pyspark.java_gateway import ensure_callback_server_started
+
+    jvm = spark._jvm
+    ensure_callback_server_started(spark.sparkContext._gateway)
+    props = jvm.java.util.HashMap()
+    for key, value in stamps.items():
+        props.put(key, value)
+    jvm.org.apache.iceberg.spark.CommitMetadata.withCommitProperties(
+        props,
+        _Callable(lambda: spark.sql(sql).collect()),
+        jvm.java.lang.RuntimeException._java_lang_class,
+    )
+
+
+def _count(result, method: str):
+    """A Java result's count, or None when this Iceberg has no such method."""
+    try:
+        return int(getattr(result, method)())
+    except Exception:  # noqa: BLE001 - Py4J's error for a method this Iceberg lacks
+        return None
+
+
+def _iterated(value) -> int:
+    return sum(1 for _ in value)
+
+
+def run_maintenance(spark, config: dict, stamps: dict | None = None, now=None) -> list:
+    """One maintenance run of the config's table: its steps in order, through Iceberg's Spark
+    actions, each commit a step makes stamped (a rewrite's ``snapshotProperty``, a statement's
+    commit properties) with the run's stamps and the step (:data:`MAINTENANCE_STAMP`). Returns
+    what each step did."""
+    configure_session(spark, config)
+    stamps = dict(stamps or {})
+    stamp_conf(spark, stamps)
+    sink = config["sink"]
+    name = f"{sink['catalog']}.{sink['table']}"
+    jvm, jss = spark._jvm, spark._jsparkSession
+    actions = jvm.org.apache.iceberg.spark.actions.SparkActions.get(jss)
+    clock = now or time.time
+
+    def table():
+        return jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(jss, name)
+
+    log(
+        "start",
+        product=config["product"],
+        build=config["build"],
+        mode="maintenance",
+        table=name,
+        expose=(config.get("maintenance") or {}).get("expose"),
+        stamps=stamps,
+    )
+    done = []
+    for step in config["maintenance"]["steps"]:
+        kind = step["step"]
+        started = clock()
+        if kind == "statement":
+            label = f"statement:{step['name']}"
+            stamped_sql(spark, step["sql"], {**stamps, MAINTENANCE_STAMP: label})
+            out = {"name": step["name"]}
+        elif kind == "rewrite_data_files":
+            action = actions.rewriteDataFiles(table())
+            if step.get("strategy") == "sort":
+                action = action.sort()
+            for key, value in (step.get("options") or {}).items():
+                action = action.option(key, str(value))
+            for key, value in {**stamps, MAINTENANCE_STAMP: kind}.items():
+                action = action.snapshotProperty(key, value)
+            result = action.execute()
+            out = {
+                "rewritten": _count(result, "rewrittenDataFilesCount"),
+                "added": _count(result, "addedDataFilesCount"),
+                "failed": _count(result, "failedDataFilesCount"),
+            }
+        elif kind == "rewrite_manifests":
+            action = actions.rewriteManifests(table())
+            for key, value in {**stamps, MAINTENANCE_STAMP: kind}.items():
+                action = action.snapshotProperty(key, value)
+            result = action.execute()
+            out = {
+                "rewritten": _iterated(result.rewrittenManifests()),
+                "added": _iterated(result.addedManifests()),
+            }
+        elif kind == "expire_snapshots":
+            cutoff = int((clock() - step["olderThanSeconds"]) * 1000)
+            result = (
+                actions.expireSnapshots(table())
+                .expireOlderThan(cutoff)
+                .retainLast(int(step.get("retainLast") or 1))
+                .execute()
+            )
+            out = {
+                "deleted_data_files": _count(result, "deletedDataFilesCount"),
+                "deleted_manifests": _count(result, "deletedManifestsCount"),
+                "deleted_manifest_lists": _count(result, "deletedManifestListsCount"),
+            }
+        else:  # remove_orphan_files
+            cutoff = int((clock() - step["olderThanSeconds"]) * 1000)
+            result = actions.deleteOrphanFiles(table()).olderThan(cutoff).execute()
+            out = {"deleted": _iterated(result.orphanFileLocations())}
+        out = {"step": kind, **out, "seconds": round(clock() - started, 1)}
+        log("maintenance_step", table=name, **out)
+        done.append(out)
+    log("done", table=name)
+    return done

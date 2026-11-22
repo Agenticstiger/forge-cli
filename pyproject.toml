@@ -649,6 +649,10 @@ databricks = "fluid_build.providers.databricks:DatabricksProvider"
 # (``fluid_build.alert_defaults``) for the DAGs forge generates are discovered plugin groups,
 # declared by THIRD-PARTY packages only; ``alerts/plugins.py`` documents their shape and policy.
 
+# Iceberg table maintenance actions (``fluid_build.maintenance_actions``) are a discovered plugin
+# group, declared by THIRD-PARTY packages only; ``maintenance/plugins.py`` documents its shape and
+# policy.
+
 [project.urls]
 Homepage = "https://agenticstiger.github.io/forge_docs/"
 Repository = "https://github.com/Agenticstiger/forge-cli"
@@ -1004,6 +1008,15 @@ module = [
     "fluid_build.alerts.plugins",
     "fluid_build.alerts.routes",
     "fluid_build.schedulers.airflow._alerts",
+    # Iceberg table maintenance: which plugin kind may load, the SQL it may hand the runner (one
+    # write on the table's own name) and the job config the plan binds, so a silent Any is a
+    # silent write to another table or a silently skipped step.
+    "fluid_build.maintenance.__init__",
+    "fluid_build.maintenance.job",
+    "fluid_build.maintenance.plugins",
+    "fluid_build.maintenance.spec",
+    "fluid_build.maintenance.statements",
+    "fluid_build.build_runners.spark._maintenance",
 ]
 strict = true
 
