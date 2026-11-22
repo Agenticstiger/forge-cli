@@ -657,6 +657,174 @@ def test_the_functions_tasks_run_that_are_not_read_are_counted():
     }
 
 
+def test_a_dotted_helper_name_matches_whole_parts_only():
+    found = tasks(
+        _dag(
+            """
+            import acme_lib.myemr as other
+            import acme_lib.emr as emr
+            PythonOperator(task_id="near", python_callable=other.run_step, op_kwargs={"script_path": "s3://n.py"}, dag=dag)
+            PythonOperator(task_id="exact", python_callable=emr.run_step, op_kwargs={"script_path": "s3://e.py"}, dag=dag)
+            """
+        ),
+        {"emr.run_step": {"script": "script_path"}},
+    )
+    assert found["near"].submits == []  # `myemr` is not `emr`
+    assert [s.script for s in found["exact"].submits] == ["s3://e.py"]
+
+
+def test_nested_partials_put_the_inner_arguments_first():
+    found = tasks(
+        _dag(
+            """
+            from functools import partial
+            PythonOperator(task_id="t", python_callable=partial(partial(tasks.run_positional, "s3://a.py"), ["--x"]), dag=dag)
+            """
+        )
+    )
+    assert submits(found["t"]) == [("spark-submit", "s3://a.py", ("--x",))]
+
+
+def test_a_function_that_calls_itself_back_is_read_once():
+    found = tasks(
+        _dag(
+            """
+            import subprocess
+
+            def f(script):
+                subprocess.run(["spark-submit", script])
+                g(script)
+
+            def g(script):
+                f(script)
+
+            PythonOperator(task_id="t", python_callable=f, op_kwargs={"script": "s3://a.py"}, dag=dag)
+            """
+        )
+    )
+    assert submits(found["t"]) == [("spark-submit", "s3://a.py", ())]
+
+
+def test_op_args_with_a_spread_that_does_not_fold_give_no_positions():
+    found = tasks(
+        _dag(
+            """
+            import acme_cfg
+            import subprocess
+
+            def go(script):
+                subprocess.run(["spark-submit", script])
+
+            PythonOperator(task_id="helper", python_callable=tasks.run_positional, op_args=[*acme_cfg.ARGS, "y.py"], dag=dag)
+            PythonOperator(task_id="function", python_callable=go, op_args=[*acme_cfg.ARGS, "y.py"], dag=dag)
+            """
+        )
+    )
+    # at run time the script is the spread's first item, not "y.py"
+    (helper,) = found["helper"].submits
+    assert helper.script is None and helper.why == "op_args is not all known"
+    (function,) = found["function"].submits
+    assert function.script is None and "is a parameter" in function.why
+
+
+def test_a_key_of_op_kwargs_a_later_spread_may_replace_is_not_known():
+    found = tasks(
+        _dag(
+            """
+            import acme_cfg
+            PythonOperator(task_id="before", python_callable=tasks.run_stream_step, op_kwargs={"script_path": "s3://a.py", **acme_cfg.KW}, dag=dag)
+            PythonOperator(task_id="after", python_callable=tasks.run_stream_step, op_kwargs={**acme_cfg.KW, "script_path": "s3://b.py"}, dag=dag)
+            """
+        )
+    )
+    assert [s.script for s in found["before"].submits] == [None]
+    assert [s.script for s in found["after"].submits] == ["s3://b.py"]
+
+
+def test_a_function_named_like_an_emr_method_but_called_otherwise_is_followed(tmp_path):
+    _write(
+        tmp_path,
+        {
+            "dags/emr_lib.py": """
+                import subprocess
+
+                def submit_job(script):
+                    subprocess.run(["spark-submit", script])
+
+                def add_job_flow_steps(script, cluster=None):
+                    subprocess.run(["spark-submit", "--deploy-mode", "cluster", script])
+            """,
+            "dags/dag.py": """
+                from airflow import DAG
+                from airflow.operators.python import PythonOperator
+                import emr_lib
+
+                def go():
+                    emr_lib.submit_job(script="s3://acme-code/jobs/a.py")
+                    emr_lib.add_job_flow_steps("s3://acme-code/jobs/b.py")
+
+                with DAG("d", schedule=None) as dag:
+                    PythonOperator(task_id="t", python_callable=go)
+            """,
+        },
+    )
+    scan = scan_dags(tmp_path / "dags", Conventions())
+    (task,) = [t for d in scan.dags for t in d.tasks]
+    assert submits(task) == [
+        ("spark-submit", "s3://acme-code/jobs/a.py", ()),
+        ("spark-submit", "s3://acme-code/jobs/b.py", ()),
+    ]
+
+
+def test_a_script_that_is_a_number_is_not_a_script():
+    found = tasks(
+        _dag(
+            """
+            PythonOperator(task_id="t", python_callable=tasks.run_positional, op_args=[7], dag=dag)
+            PythonOperator(task_id="u", python_callable=tasks.run_stream_step, op_kwargs={"script_path": "s3://a.py", "config_bucket": "b", "config_key": 7}, dag=dag)
+            """
+        )
+    )
+    (t,) = found["t"].submits
+    assert t.script is None and t.why == "it is not text"
+    (u,) = found["u"].submits
+    assert u.config == "s3://b/7"  # in a text, a number is written out as an f-string would
+
+
+def test_a_list_that_is_a_piece_of_a_command_is_not_a_submit_of_its_own():
+    found = tasks(
+        _dag(
+            """
+            import subprocess
+
+            def go(script):
+                cmd = ["spark-submit", "--master", "yarn"]
+                cmd += ["--deploy-mode", "cluster", script]
+                subprocess.run(cmd)
+
+            PythonOperator(task_id="t", python_callable=go, op_kwargs={"script": "s3://a.py"}, dag=dag)
+            """
+        )
+    )
+    assert submits(found["t"]) == [("spark-submit", "s3://a.py", ())]
+
+
+def test_a_lambda_given_the_tasks_arguments():
+    found = tasks(
+        _dag(
+            """
+            import subprocess
+
+            def go(script):
+                subprocess.run(["spark-submit", script])
+
+            PythonOperator(task_id="t", python_callable=lambda script, **ctx: go(script), op_args=["s3://a.py"], dag=dag)
+            """
+        )
+    )
+    assert submits(found["t"]) == [("spark-submit", "s3://a.py", ())]
+
+
 # ── other files of the scan ───────────────────────────────────────────
 
 
@@ -891,6 +1059,17 @@ def test_what_one_file_may_spend_in_other_modules_is_bounded_and_said(tmp_path, 
     read = [s for s in found if s]
     assert 0 < len(read) < 40
     assert any("stopped following the functions its Python tasks run" in n for n in scan.notes)
+
+
+def test_the_note_on_a_module_that_ran_out_names_the_file_a_person_opens(tmp_path, monkeypatch):
+    from fluid_build.cli.import_workflow import _fold
+
+    monkeypatch.setattr(_fold, "MAX_STEPS_PER_MODULE", 12)
+    _shared_helper_project(tmp_path / "proj" / "dags", files=1, per_file=5)
+    monkeypatch.chdir(tmp_path / "proj")
+    scan = scan_dags(Path("dags"), Conventions())
+    tired = [n for n in scan.notes if "while the functions DAG tasks run were read" in n]
+    assert tired == [tired[0]] and tired[0].startswith("dags/common/emr.py: ")
 
 
 def test_a_command_line_many_tasks_run_is_read_once(monkeypatch):

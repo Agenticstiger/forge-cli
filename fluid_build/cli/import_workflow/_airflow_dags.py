@@ -962,6 +962,8 @@ _JINJA_TOKEN = re.compile(r"__fluidjinja(\d+)__")
 _SHELL_PUNCTUATION = "();<>|&"
 #: Why a word of a command line that holds a field that did not fold is not read.
 _HOLE_WORD = "the word is not a constant"
+#: Why a ``spark-submit`` runs no script this reader reads (the start of the reason).
+NO_SCRIPT = "the spark-submit command names no Python script"
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
 #: Shell keywords that come before a command on the same line: ``then spark-submit ...``.
@@ -1231,7 +1233,7 @@ def _application(words: Sequence[Any], start: int) -> Optional[Tuple[Any, List[A
             return expansion, list(words[index:])  # a template stands where the script goes
         return (
             Unresolved(
-                f"the spark-submit command names no Python script (the application is `{word}`)",
+                f"{NO_SCRIPT} (the application is `{word}`)",
                 word,
             ),
             list(words[index + 1 :]),
@@ -1240,7 +1242,7 @@ def _application(words: Sequence[Any], start: int) -> Optional[Tuple[Any, List[A
         if "{{" in expansion or "{%" in expansion:
             return expansion, []  # a template: kept as written, and marked
         return Unresolved("the script is a shell variable or substitution", expansion), []
-    return Unresolved("the spark-submit command names no Python script", ""), []
+    return Unresolved(NO_SCRIPT, ""), []
 
 
 def _script_why(word: Unresolved) -> str:

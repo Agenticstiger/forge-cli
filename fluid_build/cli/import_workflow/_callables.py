@@ -41,6 +41,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from ._airflow_dags import (
+    NO_SCRIPT,
     Submit,
     make_submit,
     spark_submits_in_text,
@@ -398,12 +399,12 @@ class Follower:
         """What Airflow calls a task's function with: ``op_args``, then ``op_kwargs``."""
         out = _Arguments()
         if op_args is not None:
-            if isinstance(op_args, (list, tuple)):
-                out.positional = list(op_args)
-                if not getattr(op_args, "complete", True):
-                    out.complete, out.why = False, "op_args is not all known"
-            else:
+            if not isinstance(op_args, (list, tuple)):
                 out.complete, out.why = False, _why(op_args, "op_args is not a list")
+            elif getattr(op_args, "complete", True):
+                out.positional = list(op_args)
+            else:  # a *spread that does not fold: what follows it is at a place not known
+                out.complete, out.why = False, "op_args is not all known"
         if op_kwargs is not None:
             if isinstance(op_kwargs, dict):
                 out.keywords = {k: v for k, v in op_kwargs.items() if isinstance(k, str)}
@@ -465,8 +466,9 @@ class Follower:
         shown = f"{place_text(place)} of {name}"
         if isinstance(value, Unresolved):
             return value if value.text else Unresolved(value.why, shown)
-        text = _as_text(value)
-        return text if text is not None else Unresolved("it is not text", shown)
+        if isinstance(value, str):
+            return value
+        return Unresolved("it is not text", shown)
 
     def _piece(self, place: Place, arguments: _Arguments, name: str) -> Tuple[str, str]:
         """The text of one place of a template, and why it is not known (empty when it is)."""
@@ -684,24 +686,25 @@ class Follower:
     def _emr_call(
         self, method: str, node: ast.Call, folder: Folder, line: int
     ) -> Optional[List[Submit]]:
-        """An EMR call, by its method's name (boto3's, and the Airflow EMR hooks'); ``None`` for a
-        call that is not one."""
+        """An EMR call, by its method's name and the argument that holds the work (boto3's, and
+        the Airflow EMR hooks'); ``None`` for a call that is not one, which is read like any
+        other (a project function of that name is followed)."""
         if method in ("add_job_flow_steps", "run_job_flow"):
             steps = _keyword(node, "Steps", "steps")
             if steps is None and method == "add_job_flow_steps" and len(node.args) >= 2:
                 steps = node.args[1]  # the EMR hook's add_job_flow_steps(job_flow_id, steps)
-            return [] if steps is None else step_submits(folder.fold(steps), line)
+            return None if steps is None else step_submits(folder.fold(steps), line)
         if method == "create_job_flow":  # the EMR hook's create_job_flow(job_flow_overrides)
             given = _keyword(node, "job_flow_overrides") or (node.args[0] if node.args else None)
             overrides = folder.fold(given) if given is not None else None
             listed = lookup(overrides, "Steps") if isinstance(overrides, dict) else ABSENT
-            return [] if listed is ABSENT else step_submits(listed, line)
+            return None if listed is ABSENT else step_submits(listed, line)
         if method in ("start_job_run", "submit_job"):
             driver = _keyword(node, "jobDriver", "job_driver")
             if driver is None and method == "submit_job" and len(node.args) >= 4:
                 # the EMR on EKS hook's submit_job(name, role, release, driver)
                 driver = node.args[3]
-            return [] if driver is None else self._driver(folder.fold(driver), line)
+            return None if driver is None else self._driver(folder.fold(driver), line)
         return None
 
     @staticmethod
@@ -765,7 +768,10 @@ class Follower:
         if not isinstance(value, (list, tuple)):
             return []
         words = [w for w in value if isinstance(w, (str, Unresolved))]
-        return [make_submit("spark-submit", s, a, line) for s, a in spark_submits_in_tokens(words)]
+        found = [make_submit("spark-submit", s, a, line) for s, a in spark_submits_in_tokens(words)]
+        # `cmd = ["spark-submit", "--master", "yarn"]` that is added to later is a piece of the
+        # command, not one: a list that names no script at all is left to what it is added to
+        return [s for s in found if not s.why.startswith(NO_SCRIPT)]
 
 
 __all__ = ["HELPER_KINDS", "MAX_DEPTH", "MAX_VISITS", "Follower", "SubmitHelper", "place_text"]

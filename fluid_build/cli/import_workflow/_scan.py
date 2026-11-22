@@ -246,9 +246,11 @@ def scan_dags(
             scan.unread_callables[name] = scan.unread_callables.get(name, 0) + count
         tired.update(found.tired_modules)
     for rel in sorted(tired):
+        # the path a person can open, as every other note of the scan names its file
         scan.notes.append(
-            f"{clean_chars(rel)}: folding stopped early while the functions DAG tasks run were "
-            "read (the file asks for too much work): some of what they submit is not read"
+            f"{_display(Path(root) / rel, rel)}: folding stopped early while the functions DAG "
+            "tasks run were read (the file asks for too much work): some of what they submit is "
+            "not read"
         )
     scan.dags.sort(key=lambda d: (d.file, d.line))
     if budget is None:
