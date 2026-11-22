@@ -456,3 +456,55 @@ def test_validate_refuses_a_parameter_name_with_connection_string_syntax():
     finding = _lint({"host": "localhost", "sqlalchemy_options": {"ssl mode": "x"}})
     assert not finding.ok
     assert "connection.sqlalchemy_options" in finding.error.what
+
+
+# ── shared settings, host names by shape, credentials, embedded databases ────
+
+
+@pytest.mark.unit
+def test_a_shared_list_is_judged_where_it_names_a_host():
+    shared = [f"{ELSEWHERE}:27017"]
+    finding = _lint({"host": "localhost", "notes": shared, "hosts": shared})
+    assert not finding.ok
+
+
+@pytest.mark.unit
+def test_a_shared_mapping_is_judged_outside_stream_maps():
+    shared = {"users": {"host": ELSEWHERE}}
+    assert _refusal({"host": "localhost", "stream_maps": shared, "replica": shared}) is not None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"streams": [{"name": "users", "endpoint": "/v1/users"}]},
+        {"kafka": {"server": "kafka-1"}},
+        {"column_types": {"host": "varchar"}},
+        {"rename": {"hostname": "host_name"}},
+    ],
+)
+def test_a_setting_that_holds_no_host_is_not_judged_by_its_name(extra):
+    assert _refusal({"host": "localhost", **extra}) is None
+
+
+@pytest.mark.unit
+def test_a_loopback_uri_under_a_credential_field_needs_no_entry():
+    assert _refusal({"host": "localhost", "credentials": "postgresql://u@localhost:5432/d"}) is None
+
+
+@pytest.mark.unit
+def test_a_remote_uri_in_a_credential_list_is_judged_and_never_quoted():
+    connection = {"host": "localhost", "tokens": [f"postgres://u@{ELSEWHERE}/x"]}
+    refusal = _refusal(connection)
+    assert refusal is not None
+    assert ELSEWHERE not in str(refusal)
+    assert _refusal(connection, {ALLOWLIST_ENV: f"PG@{ELSEWHERE}"}) is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "uri", ["jdbc:h2:mem:test", "jdbc:sqlite:/tmp/x.db", "jdbc:derby:memory:db"]
+)
+def test_an_embedded_jdbc_url_names_no_host(uri):
+    assert _refusal({"host": "localhost", "cfg": {"u": uri}}) is None
