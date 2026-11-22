@@ -167,3 +167,79 @@ def test_dlt_url_parses_back_to_exactly_the_connection(captured):
         "orders",
         {},
     )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "fields",
+    [{"password": 12345}, {"password": True}, {"host": ""}],
+    ids=["numeric-password", "boolean-password", "empty-host"],
+)
+def test_dlt_keeps_a_field_the_url_reads_back_alike(captured, fields):
+    """A YAML number is rendered as its text, and an empty host is the local socket."""
+    _dlt_source({**BASE, "database": "orders", **fields})
+    assert captured["credentials"].startswith("postgresql+psycopg://u:")
+
+
+# ── a refused field is a failed build, not an unexpected error ───────────────
+
+
+def _kc_contract(database: str) -> Dict[str, Any]:
+    from tests.build_runners.test_kafka_connect_full_matrix import _base_contract
+
+    return _base_contract(
+        source={
+            "kind": "postgres",
+            "connection": {**BASE, "database": database},
+            "mode": "full_refresh",
+            "streams": ["public.orders"],
+        },
+        kc_props={
+            "deployment": {"server_url": "http://kafka-connect.test:8083"},
+            "connector_name": "url-syntax",
+        },
+    )
+
+
+@pytest.mark.unit
+def test_kafka_connect_reports_url_syntax_as_a_failed_build(kafka_connect_mock, tmp_path):
+    from fluid_build.build_runners.kafka_connect.runner import execute_kafka_connect_build
+
+    contract = _kc_contract(f"orders?host={ELSEWHERE}")
+    rc = execute_kafka_connect_build(contract["builds"][0], contract, tmp_path, dry_run=False)
+    assert rc != 0
+    assert "url-syntax" not in kafka_connect_mock.connectors
+
+
+@pytest.mark.unit
+def test_debezium_reports_url_syntax_as_a_failed_build(kafka_connect_mock, tmp_path):
+    from fluid_build.build_runners.debezium.runner import execute_debezium_build
+    from tests.build_runners.test_debezium_full_matrix import _base_contract
+
+    contract = _base_contract(
+        source={
+            "kind": "postgres",
+            "connection": {**BASE, "database": f"orders?host={ELSEWHERE}"},
+            "mode": "cdc",
+            "streams": ["public.orders"],
+        },
+        dbz_props={
+            "deployment": {
+                "mode": "bring-your-own",
+                "server_url": "http://kafka-connect.test:8083",
+            },
+            "snapshot_mode": "initial",
+            "connector_name": "url-syntax",
+        },
+    )
+    rc = execute_debezium_build(contract["builds"][0], contract, tmp_path, dry_run=False)
+    assert rc != 0
+    assert "url-syntax" not in kafka_connect_mock.connectors
+
+
+@pytest.mark.unit
+def test_a_sql_server_instance_name_in_the_host_is_kept():
+    connection = {**BASE, "host": "db.internal\\SQLEXPRESS", "database": "orders"}
+    assert _jdbc_config(connection, "sqlserver")["connection.url"].startswith(
+        "jdbc:sqlserver://db.internal\\SQLEXPRESS:5432/"
+    )

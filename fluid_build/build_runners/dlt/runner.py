@@ -111,16 +111,25 @@ def _require_same_url(url: Any, rendered: str) -> None:
         parsed = make_url(rendered)
     except Exception:  # noqa: BLE001 — sqlalchemy.exc.ArgumentError and friends
         parsed = None
-    password = url.password if url.username is not None else None
+    # A YAML number is rendered as its text, and an empty host as no host.
+    password = str(url.password) if url.username is not None and url.password is not None else None
     no_query: Dict[str, Any] = {}
-    expected = (url.drivername, url.username, password, url.host, url.port, url.database, no_query)
+    expected = (
+        url.drivername,
+        url.username,
+        password,
+        url.host or None,
+        url.port,
+        url.database,
+        no_query,
+    )
     if (
         parsed is None
         or (
             parsed.drivername,
             parsed.username,
             parsed.password,
-            parsed.host,
+            parsed.host or None,
             parsed.port,
             parsed.database,
             dict(parsed.query),

@@ -320,17 +320,20 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
     connector_name_for_topic = (
         kc_props.get("connector_name") or f"forge-{ctx.product_id.replace('.', '-')}"
     )
-    if is_debezium:
-        base_config.update(
-            _debezium_config(
+    try:
+        if is_debezium:
+            source_config = _debezium_config(
                 ctx.source.connection.raw,
                 ctx.source.kind,
                 topic_prefix=kc_props.get("topic_prefix") or connector_name_for_topic,
                 streams=list(ctx.source.streams or []),
             )
-        )
-    else:
-        base_config.update(_jdbc_config(ctx.source.connection.raw, ctx.source.kind))
+        else:
+            source_config = _jdbc_config(ctx.source.connection.raw, ctx.source.kind)
+    except ValueError as exc:  # reject_url_syntax: a field that would not stay in its part
+        return _failed(ctx, started_at, t_start, str(exc))
+    base_config.update(source_config)
+    if not is_debezium:
         # Confluent JDBC source needs a topic prefix or it 400s. Default
         # to the connector name with dashes-as-underscores so the topic
         # is a valid Kafka name.

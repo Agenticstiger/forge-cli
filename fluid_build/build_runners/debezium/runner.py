@@ -372,14 +372,17 @@ def _execute_kafka_connect(
         return _failed(ctx, started_at, t_start, str(exc))
 
     server_name = dbz_props.get("server_name") or ctx.product_id.replace(".", "_")
-    config = build_connector_config(
-        ctx.source.kind,
-        connection=ctx.source.connection.raw,
-        streams=list(ctx.source.streams),
-        server_name=server_name,
-        snapshot_mode=snapshot_mode,
-        extra=dbz_props.get("extra_config") or {},
-    )
+    try:
+        config = build_connector_config(
+            ctx.source.kind,
+            connection=ctx.source.connection.raw,
+            streams=list(ctx.source.streams),
+            server_name=server_name,
+            snapshot_mode=snapshot_mode,
+            extra=dbz_props.get("extra_config") or {},
+        )
+    except ValueError as exc:  # reject_url_syntax: a field that would not stay in its part
+        return _failed(ctx, started_at, t_start, str(exc))
     config["connector.class"] = connector_class
 
     connector_name = (
@@ -610,13 +613,16 @@ def _execute_debezium_server(
     except ValueError as exc:
         return _failed(ctx, started_at, t_start, str(exc))
 
-    source_config = build_connector_config(
-        ctx.source.kind,
-        connection=ctx.source.connection.raw,
-        streams=list(ctx.source.streams),
-        server_name=server_name,
-        snapshot_mode=snapshot_mode,
-    )
+    try:
+        source_config = build_connector_config(
+            ctx.source.kind,
+            connection=ctx.source.connection.raw,
+            streams=list(ctx.source.streams),
+            server_name=server_name,
+            snapshot_mode=snapshot_mode,
+        )
+    except ValueError as exc:  # reject_url_syntax: a field that would not stay in its part
+        return _failed(ctx, started_at, t_start, str(exc))
     sink_block = (dbz_props.get("server") or {}).get("sink") or {}
     sink_type = sink_block.get("type", "iceberg")
     handwritten = dict(sink_block.get("config") or {})

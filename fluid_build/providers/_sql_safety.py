@@ -381,7 +381,8 @@ def build_mysql_dsn(connection: Mapping[str, Any], *, database_key: str = "datab
 #: name: ``?`` starts the connection properties (pgjdbc reads ``host=`` there,
 #: after the URL's own host), ``;`` starts SQL Server's, ``&`` and ``#`` delimit
 #: them, and ``@`` and ``\`` end a part in other parsers. A host may not hold a
-#: ``/`` either, which ends it, nor whitespace.
+#: ``/`` either, which ends it, nor whitespace; it may hold a ``\``, which names a
+#: SQL Server instance (``host\SQLEXPRESS``).
 _URL_NAME_SYNTAX = "?#;&@\\"
 
 
@@ -413,7 +414,7 @@ def reject_url_syntax(connection: Mapping[str, Any], *, where: str) -> None:
 
 def _url_syntax_in(text: str, *, host: bool) -> Optional[str]:
     """The first character of ``text`` a URL would read as more than a name, described."""
-    refused = _URL_NAME_SYNTAX + ("/" if host else "")
+    refused = _URL_NAME_SYNTAX.replace("\\", "/") if host else _URL_NAME_SYNTAX
     for char in text:
         if _CONTROL_CHARS.match(char):
             return "a control character"
