@@ -1142,6 +1142,37 @@ def test_what_one_file_may_spend_in_other_modules_is_bounded_and_said(tmp_path, 
     assert any("stopped following the functions its Python tasks run" in n for n in scan.notes)
 
 
+def test_the_note_on_unread_functions_does_not_offer_submit_helpers_for_the_standard_library():
+    from fluid_build.cli.import_workflow._pipeline import _report_unread_callables
+    from fluid_build.cli.import_workflow._scan import DagScan
+    from fluid_build.cli.import_workflow.registry import ImportReport
+
+    def note(unread: Dict[str, int]) -> str:
+        report = ImportReport()
+        _report_unread_callables(DagScan(root=Path("."), unread_callables=unread), report)
+        (only,) = report.notes
+        return only
+
+    mixed = note({"subprocess.run": 2, "acme_lib.emr_tasks.create_cluster": 1, "os.system": 1})
+    assert mixed == (
+        "4 Python task(s) run a function that is not read here: subprocess.run (2), "
+        + "acme_lib.emr_tasks.create_cluster (1), os.system (1). Name one that submits Spark "
+        + "work under `submit_helpers` in the conventions, with where its script is among its "
+        + "arguments; subprocess.run, os.system are the standard library's, Airflow's or "
+        + "PySpark's, which `submit_helpers` does not take: call it from a function of the DAG "
+        + "files, and what that function runs is read"
+    )
+    library = note({"subprocess.run": 1})
+    assert "Name one that submits" not in library
+    assert library.endswith(
+        "subprocess.run (1). subprocess.run is the standard library's, Airflow's or PySpark's, "
+        + "which `submit_helpers` does not take: call it from a function of the DAG files, and "
+        + "what that function runs is read"
+    )
+    # a function of the project named like a module of the standard library is the project's
+    assert "Name one that submits" in note({"queue": 1})
+
+
 def test_the_dag_files_of_a_scan_share_one_follow_budget_and_it_is_said_once(tmp_path, monkeypatch):
     # each file's tasks fit the file's own budget; thirty files' do not fit the scan's
     monkeypatch.setattr(_callables, "MAX_VISITS_PER_SCAN", 2_000)
