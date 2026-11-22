@@ -14,6 +14,7 @@ Catalog. Those contracts are written and the report says what ``fluid validate``
 from __future__ import annotations
 
 import copy
+import re
 import textwrap
 from pathlib import Path
 from typing import Any, Dict, List
@@ -115,19 +116,64 @@ def test_a_proposal_the_schema_does_not_accept_is_refused_before_anything_is_wri
     assert "is not a valid contract" in str(refused.value.what)
 
 
-def test_findings_past_the_limit_are_counted_not_listed(tmp_path, monkeypatch):
-    base = propose(
-        tmp_path, monkeypatch, "catalogs:\n  main: {platform: databricks, format: delta_table}\n"
-    )[0][0]
+DATABRICKS = "catalogs:\n  main: {platform: databricks, format: delta_table}\n"
+NOT_LISTED = re.compile(
+    r"^(\d+) more `fluid validate` finding\(s\) are not listed, on (\d+) product\(s\): (.*)$"
+)
+
+
+def products_like(base: Dict[str, Any], count: int) -> List[Dict[str, Any]]:
     contracts = []
-    for number in range(60):
+    for number in range(count):
         contract = copy.deepcopy(base)
         contract["id"] = f"cur.t{number}"
         contracts.append(contract)
+    return contracts
+
+
+def test_findings_past_the_limit_are_counted_not_listed(tmp_path, monkeypatch):
+    base = propose(tmp_path, monkeypatch, DATABRICKS)[0][0]
     report = ImportReport()
-    _pipeline._check_valid(contracts, report)
+    _pipeline._check_valid(products_like(base, 60), report)
     lines = [x for x in report.required_defaults if MARK in x]
     assert len(lines) == _pipeline.MAX_RULE_LINES
-    last = report.required_defaults[-1]
-    assert last.endswith("`fluid validate` finding(s) on these products are not listed")
-    assert int(last.split()[0]) >= 1
+    last = NOT_LISTED.match(report.required_defaults[-1])
+    assert last and int(last.group(1)) >= 1
+
+
+def test_the_products_with_findings_that_are_not_listed_are_named(tmp_path, monkeypatch):
+    base = propose(tmp_path, monkeypatch, DATABRICKS)[0][0]
+    contracts = products_like(base, 6)
+    everything = ImportReport()
+    _pipeline._check_valid(contracts, everything)
+    total = len([x for x in everything.required_defaults if MARK in x])
+    assert total >= 12  # at least two findings on each product: the limit below cuts mid-product
+    limit = total // 6 + 1  # the first product, and one finding of the second, are listed
+    monkeypatch.setattr(_pipeline, "MAX_RULE_LINES", limit)
+    monkeypatch.setattr(_pipeline, "MAX_UNLISTED_PRODUCTS", 2)
+    report = ImportReport()
+    _pipeline._check_valid(contracts, report)
+    last = NOT_LISTED.match(report.required_defaults[-1])
+    assert last, report.required_defaults[-1]
+    assert int(last.group(1)) == total - limit
+    assert int(last.group(2)) == 5  # the second product still has findings to name
+    assert last.group(3) == "cur.t1, cur.t2 and 3 more"
+
+
+def test_every_product_with_findings_not_listed_is_named_when_they_are_few(tmp_path, monkeypatch):
+    base = propose(tmp_path, monkeypatch, DATABRICKS)[0][0]
+    contracts = products_like(base, 4)
+    monkeypatch.setattr(_pipeline, "MAX_RULE_LINES", 1)
+    monkeypatch.setattr(_pipeline, "MAX_UNLISTED_PRODUCTS", 4)  # as many as there are: no tail
+    report = ImportReport()
+    _pipeline._check_valid(contracts, report)
+    last = NOT_LISTED.match(report.required_defaults[-1])
+    assert last and last.group(3) == "cur.t0, cur.t1, cur.t2, cur.t3"
+    assert int(last.group(2)) == 4
+
+
+def test_nothing_is_said_about_findings_that_were_all_listed(tmp_path, monkeypatch):
+    base = propose(tmp_path, monkeypatch, DATABRICKS)[0][0]
+    report = ImportReport()
+    _pipeline._check_valid(products_like(base, 2), report)
+    assert not [x for x in report.required_defaults if "are not listed" in x]

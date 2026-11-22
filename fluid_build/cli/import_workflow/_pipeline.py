@@ -276,8 +276,10 @@ def _drop_tasks(contract: Dict[str, Any]) -> bool:
     return dropped
 
 
-#: ``fluid validate`` findings listed one by one in the report; the rest are counted.
+#: ``fluid validate`` findings listed one by one in the report; the rest are counted, and the
+#: products they are on are named (up to ``MAX_UNLISTED_PRODUCTS`` of them).
 MAX_RULE_LINES = 100
+MAX_UNLISTED_PRODUCTS = 30
 
 
 def _check_valid(contracts: Sequence[Dict[str, Any]], report: ImportReport) -> None:
@@ -305,6 +307,7 @@ def _check_valid(contracts: Sequence[Dict[str, Any]], report: ImportReport) -> N
         )
 
     listed = more = 0
+    unlisted: Dict[str, None] = {}  # the products with findings that are not listed, in order
     for contract in contracts:
         result = schema(contract)
         if not result.is_valid:
@@ -333,6 +336,7 @@ def _check_valid(contracts: Sequence[Dict[str, Any]], report: ImportReport) -> N
         for message in contract_rule_findings(contract, manager=manager, plugins=False).errors:
             if listed >= MAX_RULE_LINES:
                 more += 1
+                unlisted[str(contract["id"])] = None
                 continue
             listed += 1
             report.required_defaults.append(
@@ -340,8 +344,11 @@ def _check_valid(contracts: Sequence[Dict[str, Any]], report: ImportReport) -> N
                 f"person completes it: {safe_text(message, 400)}"
             )
     if more:
+        names = ", ".join(safe_text(pid, 80) for pid in list(unlisted)[:MAX_UNLISTED_PRODUCTS])
+        rest = len(unlisted) - MAX_UNLISTED_PRODUCTS
         report.required_defaults.append(
-            f"{more} more `fluid validate` finding(s) on these products are not listed"
+            f"{more} more `fluid validate` finding(s) are not listed, on {len(unlisted)} "
+            f"product(s): {names}" + (f" and {rest} more" if rest > 0 else "")
         )
 
 

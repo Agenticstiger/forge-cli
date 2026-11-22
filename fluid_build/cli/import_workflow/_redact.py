@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import re
 import shlex
-from typing import Any, List, Optional, Sequence, Union
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
 from ._pysource import clean_chars
 
@@ -79,7 +79,13 @@ _S3_USERINFO = re.compile(
 _S3_SECRET = re.compile(r"(s3[an]?://[^/:@\s?#'\"]{0,512}:)[^@\s?#'\"]{1,512}@", re.I)
 _MAX_COMMAND_TEXT = 20_000
 #: Characters of one argument read for credentials (an argument is shown at 200).
-_MAX_ARG = 2_000
+_MAX_ARG = 4_096
+#: Of a text that was cut before it was read, the last characters are not kept: a credential that
+#: the cut split (its end, the ``@host`` that names it, is not there) is then not shown whole or in
+#: part, even when what is masked before it shrinks the text so that it comes within the limit. More
+#: than the longest login the Oracle JDBC rule reads (a 128-character user, a 512-character
+#: password); a text that masks down to fewer characters than this shows nothing.
+_CUT_TAIL = 700
 #: How many levels of quoting inside quoting (``bash -c "bash -c ..."``) are looked into.
 _MAX_DEPTH = 5
 
@@ -303,6 +309,18 @@ def _oracle_jdbc(text: str) -> str:
     return _ORACLE_JDBC_RE.sub(lambda m: f"{m.group(1)}{_REDACTED}{m.group(2)}", text)
 
 
+#: ``user/password@host:port`` or ``user/password@//host[:port]``, the start of an Oracle Easy Connect
+#: login written as a plain word or as the value of an option (``--dsn scott/tiger@db:1521/ORCL``);
+#: what follows is kept. The password may be in double quotes (it then may hold ``@``). The port,
+#: or the ``//``, is what makes it one: a ``a/b@c`` is a path or an address. It does not follow a
+#: ``/`` (a path, or the middle of a URL).
+_ORACLE_DSN = re.compile(
+    r"(?<![\w/])([A-Za-z_][A-Za-z0-9_$#.\-]{0,63})/"
+    r"(\"[^\"\r\n]{1,128}\"|[^@\s'\":]{1,128})"
+    r"(@(?://[A-Za-z0-9_.\-]+(?::\d{2,5})?|[A-Za-z0-9_.\-]+:\d{2,5}))"
+)
+
+
 def _scan(text: str) -> str:
     """One word, or one value, read for credentials: the free-text scan of the repository, the
     secret in the user information of an ``s3a`` URL (it holds ``/``, which the scan stops at), the
@@ -311,6 +329,7 @@ def _scan(text: str) -> str:
     if "@" in text:
         text = _S3_SECRET.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
         text = _oracle_jdbc(text)
+        text = _ORACLE_DSN.sub(lambda m: f"{m.group(1)}/{_REDACTED}{m.group(3)}", text)
     return _mask_pairs(_free_text(text))
 
 
@@ -559,11 +578,14 @@ def _redact_command(command: str, depth: int = 0) -> str:
     return _JINJA_TOKEN.sub(back, result) if fields else result
 
 
-def _bounded(text: str) -> str:
-    """``text`` cut at :data:`_MAX_ARG` characters, white space collapsed first when it is longer:
+def _bounded(text: str) -> Tuple[str, bool]:
+    """``text`` cut at :data:`_MAX_ARG` characters (white space collapsed first when it is longer:
     a cut that falls inside a long run of spaces must not be able to drop the end of a credential
-    that the collapsed text then shows."""
-    return text if len(text) <= _MAX_ARG else " ".join(text.split())[:_MAX_ARG]
+    that the collapsed text then shows), and whether it was cut: the end of a text that was cut is
+    not shown (:data:`_CUT_TAIL`)."""
+    if len(text) <= _MAX_ARG:
+        return text, False
+    return " ".join(text.split())[:_MAX_ARG], True
 
 
 def safe_args(args: Sequence[str], limit: int = 200) -> List[str]:
@@ -572,14 +594,22 @@ def safe_args(args: Sequence[str], limit: int = 200) -> List[str]:
     ``--conf spark.hadoop.fs.s3a.secret.key=abc``), the value of ``NAME=value`` when the name is,
     and a secret in a JSON value or a connection string."""
     words = _Words()
-    return [safe_text(words.show(_bounded(str(arg))), limit) for arg in args]
+    out: List[str] = []
+    for arg in args:
+        text, cut = _bounded(str(arg))
+        shown = words.show(text)
+        out.append(safe_text(shown[:-_CUT_TAIL] if cut else shown, limit))
+    return out
 
 
 def safe_command(command: str, limit: int = 2000) -> str:
     """A command line, safe to write: each word is looked at as :func:`safe_args` does (a word
     that holds white space, a header or a JSON value in quotes, is read whole), and the words
     that are nothing to hide stay as written, lines, operators and quoting included."""
+    cut = len(command) > _MAX_COMMAND_TEXT
     text = clean_chars(_redact_command(command[:_MAX_COMMAND_TEXT]), keep="\n\t").strip()
+    if cut:
+        text = text[:-_CUT_TAIL]
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
