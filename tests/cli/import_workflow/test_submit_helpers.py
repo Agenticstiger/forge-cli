@@ -1145,6 +1145,7 @@ def test_what_one_file_may_spend_in_other_modules_is_bounded_and_said(tmp_path, 
 def test_the_dag_files_of_a_scan_share_one_follow_budget_and_it_is_said_once(tmp_path, monkeypatch):
     # each file's tasks fit the file's own budget; thirty files' do not fit the scan's
     monkeypatch.setattr(_callables, "MAX_VISITS_PER_SCAN", 2_000)
+    monkeypatch.setattr(_callables, "VISITS_PER_TASK", 0)
     spent = [0]
     charge = Follower._charge
 
@@ -1163,6 +1164,33 @@ def test_the_dag_files_of_a_scan_share_one_follow_budget_and_it_is_said_once(tmp
     (note,) = [n for n in scan.notes if "scan fewer DAG files at a time" in n]
     assert f"what the tasks of {len(cut)} DAG file(s) submit is not all read" in note
     assert not any("stopped following the functions its Python tasks run" in n for n in scan.notes)
+
+
+def test_each_python_task_followed_brings_its_share_of_the_scans_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr(_callables, "MAX_VISITS_PER_SCAN", 2_000)
+    monkeypatch.setattr(_callables, "VISITS_PER_TASK", 100)
+    spent = [0]
+    charge = Follower._charge
+
+    def counted(self: Follower, visits: int) -> None:
+        spent[0] += visits
+        charge(self, visits)
+
+    monkeypatch.setattr(Follower, "_charge", counted)
+    # many light tasks: each takes less than its share, and all are read
+    _shared_helper_project(tmp_path / "light", files=30, per_file=10)
+    scan = scan_dags(tmp_path / "light", Conventions())
+    assert all(t.submits for d in scan.dags for t in d.tasks)
+    assert not [n for n in scan.notes if "scan fewer DAG files at a time" in n]
+    # one-task files that each run a heavy function: they spend no more than their shares
+    heavy = "".join(f"    print('step {i}')\n" for i in range(2_000))
+    function = "import subprocess\n\ndef submit(script, **kwargs):\n" + heavy
+    _same_task_in_each(tmp_path / "heavy", 30, function)
+    spent[0] = 0
+    scan = scan_dags(tmp_path / "heavy", Conventions())
+    assert spent[0] < 2_000 + 30 * 100 + 10
+    (note,) = [n for n in scan.notes if "scan fewer DAG files at a time" in n]
+    assert "had spent 5,000 visits of their bodies" in note
 
 
 _EMR_SUBMIT = """

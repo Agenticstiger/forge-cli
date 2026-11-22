@@ -37,8 +37,9 @@ read once, whichever DAG file of the scan runs it. Every value is folded (:mod:`
 folding of the bodies is lent by the folders and counted against one budget per DAG file, as large
 as a module's, so that neither the file's own operators nor another file's tasks lose to it. The
 DAG files of one scan spend at most :data:`MAX_VISITS_PER_SCAN` visits and
-:data:`MAX_LENT_STEPS_PER_SCAN` lent steps between them (:class:`FollowBudget`), so many small
-files that run one heavy function do not add up.
+:data:`MAX_LENT_STEPS_PER_SCAN` lent steps between them, and each Python task followed adds its
+share (:class:`FollowBudget`): many small files that run one heavy function do not add up, and an
+estate of many light tasks is read whole.
 """
 
 from __future__ import annotations
@@ -84,6 +85,11 @@ MAX_VISITS = 200_000
 MAX_VISITS_PER_SCAN = 500_000
 MAX_LENT_STEPS_PER_SCAN = 500_000
 MAX_LENT_CHARS_PER_SCAN = 16_000_000
+#: What each Python task a scan follows adds to those visits and steps: an estate of many light
+#: tasks is read whole (a task that runs a shared EMR helper takes about 100 visits and 30
+#: steps), while files that run a heavy function cost no more than their tasks' share.
+VISITS_PER_TASK = 250
+LENT_STEPS_PER_TASK = 250
 #: What tasks' functions submitted, kept between the files of a scan.
 MAX_SHARED_RESULTS = 20_000
 #: The characters of a command line read for the cost of one visit (a visit and two characters
@@ -250,9 +256,20 @@ class FollowBudget:
     def __init__(self) -> None:
         self.visits_left = MAX_VISITS_PER_SCAN
         self.lent_left = [MAX_LENT_STEPS_PER_SCAN, MAX_LENT_CHARS_PER_SCAN]
+        #: What it was given in all: the scan's, and each Python task's share.
+        self.allowed_visits = MAX_VISITS_PER_SCAN
+        self.allowed_steps = MAX_LENT_STEPS_PER_SCAN
         #: The DAG files whose tasks were cut short by this budget, not by their own.
         self.cut_files = 0
         self.read: Dict[Tuple[Any, ...], List[Submit]] = {}
+
+    def add_task(self) -> None:
+        """A Python task to follow brings its share (:data:`VISITS_PER_TASK`,
+        :data:`LENT_STEPS_PER_TASK`)."""
+        self.visits_left += VISITS_PER_TASK
+        self.lent_left[0] += LENT_STEPS_PER_TASK
+        self.allowed_visits += VISITS_PER_TASK
+        self.allowed_steps += LENT_STEPS_PER_TASK
 
 
 class Follower:
@@ -335,6 +352,7 @@ class Follower:
         if target.helper is not None:
             return target.shown, self._helper_submits(target, arguments, call.lineno)
         if target.function is not None:
+            self.budget.add_task()
             return target.shown, self._function_submits(target, arguments, call.lineno, 0, ())
         if target.named:
             self.unread[target.shown] = self.unread.get(target.shown, 0) + 1
@@ -346,6 +364,7 @@ class Follower:
         name = getattr(function, "name", "lambda")
         target = _Target(name, function=function, module=self.module, folder=self.folder)
         arguments = _Arguments(complete=False, why=f"`{name}` is given its values when it runs")
+        self.budget.add_task()
         return self._function_submits(target, arguments, function.lineno, 0, ())  # type: ignore[attr-defined]
 
     # ── what is called ──────────────────────────────────────────────
@@ -922,6 +941,7 @@ __all__ = [
     "MAX_DEPTH",
     "MAX_VISITS",
     "MAX_VISITS_PER_SCAN",
+    "VISITS_PER_TASK",
     "FollowBudget",
     "Follower",
     "SubmitHelper",

@@ -33,8 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `d.get(key, default)` and a function's parameters from its caller, and a function whose name a
   task takes later (`extract = PythonOperator(..., python_callable=extract)`) is the function
   until then. The DAG files of one scan go through at most 500,000 calls and lists of the bodies
-  they follow between them (200,000 for one file), and a function the tasks of any of them run
-  with the same arguments is read once.
+  they follow between them, plus 250 for each Python task followed (200,000 for one file), and a
+  function the tasks of any of them run with the same arguments is read once.
 
 ### Changed
 
