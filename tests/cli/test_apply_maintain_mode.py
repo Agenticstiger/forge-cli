@@ -312,7 +312,7 @@ def test_a_retried_call_waits_for_the_run_that_is_going(tmp_path, capsys, monkey
     first.start()
     runs = local_runs(tmp_path)
     try:
-        assert wait_for(lambda: runs.runs(), lambda found: any(r.active for r in found))
+        assert wait_for(runs.runs, lambda found: any(r.active for r in found))
         capsys.readouterr()
         assert maintain(path) == 0
         assert "already going" in said(capsys)

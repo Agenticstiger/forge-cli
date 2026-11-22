@@ -380,7 +380,7 @@ def option_problems(value: Any, where: str, depth: int = 0) -> List[str]:
         if redact_secret_text(value) != value:
             return [
                 f"{where} holds what looks like a secret (value not shown); a plugin reads "
-                "its secrets itself"
+                + "its secrets itself"
             ]
         return []
     if isinstance(value, (list, tuple)):

@@ -46,7 +46,7 @@ def test_what_ships_is_the_checked_statement_without_its_comments() -> None:
         f"DELETE FROM {TABLE} WHERE customer_id IN (SELECT id FROM fluid.gdpr.requests)",
         f"UPDATE {TABLE} AS t SET t.email_hash = NULL WHERE t.customer_id = 'c1'",
         f"MERGE INTO {TABLE} AS t USING fluid.gdpr.requests AS r ON t.customer_id = r.id "
-        "WHEN MATCHED THEN DELETE",
+        + "WHEN MATCHED THEN DELETE",
     ],
 )
 def test_a_plain_statement_reads_back_as_itself(sql: str) -> None:
@@ -114,7 +114,7 @@ def _config(sql: str) -> str:
         "DELETE FROM fluid.gold.secret WHERE TRUE",
         "UPDATE fluid.gold.secret SET x = 1",
         "MERGE INTO fluid.gold.secret AS t USING fluid.commerce.order_lines AS s ON t.a = s.a "
-        "WHEN MATCHED THEN DELETE",
+        + "WHEN MATCHED THEN DELETE",
         SPLIT_COMMENT,
         f"DELETE  FROM {TABLE} WHERE TRUE",  # not as forge renders it
     ],

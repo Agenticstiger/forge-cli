@@ -20,6 +20,11 @@ from fluid_build.maintenance.plugins import (
 from tests.maintenance.conftest import FakeEntryPoint
 
 
+def _bare_object_factory() -> object:
+    """An entry point may name a function: this one returns an object without statements."""
+    return object()
+
+
 class Erasure:
     """A kind that does not subclass the SDK base: forge calls the same methods on any object."""
 
@@ -297,7 +302,7 @@ class TestFailures:
         assert "building it raised OSError" in message
         assert "factory_marker" not in message
 
-    @pytest.mark.parametrize("target", [object, object(), lambda: object(), 5, "text", None])
+    @pytest.mark.parametrize("target", [object, object(), _bare_object_factory, 5, "text", None])
     def test_an_object_without_statements_is_not_an_action(self, entry_points, target):
         entry_points(FakeEntryPoint("odd", target))
         assert "it is not a maintenance action: it has no statements(table, options)" in refusal(

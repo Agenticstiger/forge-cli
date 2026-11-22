@@ -155,7 +155,8 @@ def test_the_block_adds_resources_and_changes_nothing_else(plain, maintained):
     assert "/maintenance/order_lines" not in json.dumps(base)
     document = json.loads(build_module(get_iac_plugin("aws"), maintained))
     objects = document["resource"]["aws_s3_object"]
-    assert objects.pop(MAINTAIN_KEY)["key"] == MAINTAIN_OBJECT
+    maintenance_object = objects.pop(MAINTAIN_KEY)
+    assert maintenance_object["key"] == MAINTAIN_OBJECT
     caller = document["data"]["aws_iam_policy_document"][CALLER]
     for statement in caller["statement"]:
         for field in ("resources", "values"):
