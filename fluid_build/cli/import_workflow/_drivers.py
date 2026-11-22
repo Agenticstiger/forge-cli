@@ -113,7 +113,7 @@ class Lists:
     def _load(self, driver: Driver, value: str) -> Union[List[str], str]:
         if not _NAME.fullmatch(value) or ".." in value:
             return f"{value!r} is not a plain name for a job list"
-        path = driver.lists_dir / driver.list_file.format(value=value)
+        path = driver.lists_dir / driver.list_file.replace("{value}", value)
         if not _inside(path, driver.lists_dir):
             return "the list is not inside the directory the conventions name"
         if not path.is_file():
@@ -133,7 +133,7 @@ class Lists:
 
 def job_file(driver: Driver, name: str) -> Optional[Path]:
     """The file of job ``name``, when it is a file inside the jobs directory; else ``None``."""
-    path = driver.jobs_dir / driver.job_file.format(job=name)
+    path = driver.jobs_dir / driver.job_file.replace("{job}", name)
     if _inside(path, driver.jobs_dir) and path.is_file():
         return path.resolve()
     return None
