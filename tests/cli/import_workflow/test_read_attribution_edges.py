@@ -277,6 +277,23 @@ def test_a_scalar_made_by_calling_a_name_that_holds_a_value_is_still_a_value(tmp
     assert got == {"mart.y": ["raw.a"], "mart.z": ["raw.c"]}
 
 
+def test_a_frame_made_by_sql_that_does_not_fold_leaves_its_write_loose(tmp_path, monkeypatch):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        """
+        import os
+
+        df = spark.sql(os.environ["Q"])
+        df.join(spark.table("raw.b"), "k").write.saveAsTable("mart.y")
+        spark.table("raw.c").write.saveAsTable("mart.z")
+        spark.table("raw.d").count()
+        """,
+    )
+    # what the text reads is not known: the product lists what no write owns, not only raw.b
+    assert got == {"mart.y": ["raw.b", "raw.d"], "mart.z": ["raw.c"]}
+
+
 # ── a sink the reader cannot follow, and the name of a memory sink given as an option ─────────
 
 AFTER_SINK = """
