@@ -605,10 +605,14 @@ def validate_custom_scaffold_file(path: str, content: bytes) -> List[ValidationI
     mapping."""
     if path != f"custom-scaffold/{_SCAFFOLD_LOCK}":
         return []
+    # The size, depth and alias caps of every other YAML artifact here: the lock is the
+    # bundle's output, so a hostile one must be an issue, not a crash.
+    from fluid_build.util.safe_yaml import UnsafeYamlError, load_yaml_safe
+
     try:
-        doc = yaml.safe_load(content.decode("utf-8"))
-    except (UnicodeDecodeError, yaml.YAMLError) as exc:
-        doc, why = None, f"parse failure: {exc}"
+        doc = load_yaml_safe(content)
+    except (UnicodeDecodeError, yaml.YAMLError, UnsafeYamlError, RecursionError) as exc:
+        doc, why = None, f"parse failure: {type(exc).__name__}: {str(exc)[:200]}"
     else:
         why = f"expected a mapping at root, got {type(doc).__name__}"
     if isinstance(doc, dict):

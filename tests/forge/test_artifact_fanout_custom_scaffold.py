@@ -269,6 +269,19 @@ def test_stage_four_checks_that_the_lock_is_yaml(tmp_path: Path, stub: Any) -> N
     issues = validate_custom_scaffold_file("custom-scaffold/fluid-scaffold.lock", b"a: [\n")
     assert [i.code for i in issues] == ["CUSTOM-SCAFFOLD-LOCK"]
     assert validate_custom_scaffold_file("custom-scaffold/run.sh", b"\x00\x01") == []
+    # A hostile lock is refused as an issue, not with a crash (nesting past the YAML depth
+    # cap, an alias bomb).
+    deep = ("[" * 100_000 + "]" * 100_000).encode()
+    assert [
+        i.code for i in validate_custom_scaffold_file("custom-scaffold/fluid-scaffold.lock", deep)
+    ] == ["CUSTOM-SCAFFOLD-LOCK"]
+    bomb = b"a: &a [x, x, x, x, x, x, x, x, x]\n" + b"".join(
+        f"{chr(98 + i)}: &{chr(98 + i)} [*{chr(97 + i)}, *{chr(97 + i)}, *{chr(97 + i)}, *{chr(97 + i)}]\n".encode()
+        for i in range(20)
+    )
+    assert [
+        i.code for i in validate_custom_scaffold_file("custom-scaffold/fluid-scaffold.lock", bomb)
+    ] == ["CUSTOM-SCAFFOLD-LOCK"]
 
 
 def test_the_engine_gets_the_contracts_directory_for_relative_path_sources(
@@ -446,7 +459,17 @@ def test_a_row_that_does_not_describe_the_file_on_disk_is_refused(
 
 
 @pytest.mark.parametrize(
-    "path", ["../escape.txt", "/abs.txt", "a/./b.txt", "a//b.txt", "a\\b.txt", "line\nbreak.txt"]
+    "path",
+    [
+        "../escape.txt",
+        "/abs.txt",
+        "a/./b.txt",
+        "a//b.txt",
+        "a\\b.txt",
+        "line\nbreak.txt",
+        "line" + chr(0x2028) + "separator.txt",
+        "",
+    ],
 )
 def test_a_reported_path_that_is_not_a_plain_relative_name_is_refused(
     tmp_path: Path, stub: Any, path: str
@@ -487,6 +510,142 @@ def test_a_symlink_in_the_output_is_refused(tmp_path: Path, stub: Any, target: s
         _fanout(_write(tmp_path / "p", _contract(_block())), tmp_path / "out")
     assert raised.value.code == "custom_scaffold_unsafe_path"
     assert (secret / "key").read_text() == "do-not-copy\n"
+
+
+def test_a_row_whose_name_the_output_does_not_hold_is_refused(tmp_path: Path, stub: Any) -> None:
+    """Two spellings of one file (``README.md`` and ``readme.md`` on a case-insensitive file
+    system) are one file on disk, so a MANIFEST with both rows would fail stage 4."""
+
+    def respell(rows: Any) -> Any:
+        return tuple(
+            type(row)("readme.md", row.sha256, row.size) if row.path == "README.md" else row
+            for row in rows
+        )
+
+    stub.HOOKS["report"] = respell
+    out = tmp_path / "out"
+    with pytest.raises(FanoutError) as raised:
+        _fanout(_write(tmp_path / "p", _contract(_block())), out)
+    assert raised.value.code == "custom_scaffold_output_failed"
+    assert "readme.md" in str(raised.value)
+    assert not (out / "custom-scaffold").exists()
+
+
+def test_a_file_list_that_is_not_one_is_refused(
+    tmp_path: Path, stub: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = stub.generate
+
+    def odd(*args: Any, **kwargs: Any) -> Any:
+        result = real(*args, **kwargs)
+        return type(result)(5, result.dry_run)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(stub, "generate", odd)
+    out = tmp_path / "out"
+    with pytest.raises(FanoutError) as raised:
+        _fanout(_write(tmp_path / "p", _contract(_block())), out)
+    assert raised.value.code == "custom_scaffold_output_failed"
+    assert not list(out.glob(".custom-scaffold.partial-*"))
+
+
+def test_a_reported_name_too_long_for_the_file_system_is_a_typed_error(
+    tmp_path: Path, stub: Any
+) -> None:
+    def long_name(rows: Any) -> Any:
+        first = rows[0]
+        return (type(first)("x" * 300 + ".txt", first.sha256, first.size), *rows[1:])
+
+    stub.HOOKS["report"] = long_name
+    with pytest.raises(FanoutError) as raised:
+        _fanout(_write(tmp_path / "p", _contract(_block())), tmp_path / "out")
+    assert raised.value.code == "custom_scaffold_output_failed"
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="needs POSIX modes, not root")
+def test_staging_that_cannot_be_removed_keeps_the_typed_error_and_names_the_leftover(
+    tmp_path: Path, stub: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    def plant_and_fail(root: Path) -> None:
+        locked = root / "locked"
+        locked.mkdir()
+        (locked / "inside.txt").write_text("x")
+        locked.chmod(0o000)
+        raise KeyError("boom")
+
+    stub.HOOKS["after"] = plant_and_fail
+    out = tmp_path / "out"
+    try:
+        with caplog.at_level(logging.WARNING), pytest.raises(FanoutError) as raised:
+            _fanout(_write(tmp_path / "p", _contract(_block())), out)
+        assert raised.value.code == "custom_scaffold_failed"
+        leftovers = list(out.glob(".custom-scaffold.partial-*"))
+        assert len(leftovers) == 1
+        assert leftovers[0].name in " ".join(r.getMessage() for r in caplog.records)
+    finally:
+        for locked in out.glob(".custom-scaffold.partial-*/locked"):
+            locked.chmod(0o700)
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="needs POSIX modes, not root")
+@pytest.mark.parametrize("earlier", [True, False])
+def test_an_output_directory_that_cannot_be_written_is_a_typed_error(
+    tmp_path: Path, stub: Any, earlier: bool
+) -> None:
+    out = tmp_path / "out"
+    contract = _write(tmp_path / "p", _contract(_block()))
+    if earlier:
+        _fanout(contract, out)
+    out.mkdir(exist_ok=True)
+    out.chmod(0o555)
+    try:
+        with pytest.raises(FanoutError) as raised:
+            _fanout(contract, out)
+        assert raised.value.code == "custom_scaffold_output_failed"
+    finally:
+        out.chmod(0o755)
+
+
+def _install_broken_engine(root: Path) -> Path:
+    package = root / ENGINE
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("import a_dependency_that_is_not_installed_anywhere\n")
+    return root
+
+
+@pytest.fixture
+def broken_engine(tmp_path: Path) -> Iterator[None]:
+    """An engine that is installed but does not import (a missing dependency of its own)."""
+    root = _install_broken_engine(tmp_path / "broken-engine")
+    saved = _drop_engine_modules()
+    sys.path.insert(0, str(root))
+    importlib.invalidate_caches()
+    try:
+        yield
+    finally:
+        sys.path.remove(str(root))
+        _drop_engine_modules()
+        sys.modules.update(saved)
+        importlib.invalidate_caches()
+
+
+def test_an_engine_that_does_not_import_is_skipped_by_the_default_run(
+    tmp_path: Path, broken_engine: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        manifest = _fanout(_write(tmp_path / "p", _contract(_block())), tmp_path / "out", emit=None)
+    assert _scaffold_rows(manifest) == []
+    assert "a_dependency_that_is_not_installed_anywhere" in " ".join(
+        r.getMessage() for r in caplog.records
+    )
+
+
+def test_an_engine_that_does_not_import_is_a_typed_error_when_asked_for(
+    tmp_path: Path, broken_engine: None
+) -> None:
+    with pytest.raises(FanoutError) as raised:
+        _fanout(_write(tmp_path / "p", _contract(_block())), tmp_path / "out")
+    assert raised.value.code == "custom_scaffold_engine_broken"
+    assert INSTALL_HINT.replace("install", "install --force-reinstall") in str(raised.value)
 
 
 # ── the CLI ───────────────────────────────────────────────────────────────

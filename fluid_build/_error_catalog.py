@@ -565,6 +565,14 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         None,
     ),
+    "custom_scaffold_engine_broken": (
+        [
+            "The engine is installed but one of its own dependencies is missing or broken: "
+            "pip install --force-reinstall 'data-product-forge[custom-scaffold]'",
+            "Or leave custom-scaffold out of --emit to generate the other artifacts",
+        ],
+        None,
+    ),
     "custom_scaffold_engine_too_old": (
         ["Upgrade the engine: pip install --upgrade 'data-product-forge[custom-scaffold]'"],
         None,

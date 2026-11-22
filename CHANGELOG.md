@@ -18,18 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`data-product-forge-custom-scaffold>=0.5.0,<1`, also in `[all]`), imported only when a
   contract declares the block, so `fluid --help` loads what it did before. The key is in the
   default emit set and does nothing for a contract without the block. Without the engine (or with
-  one older than 0.5.0), the default run writes no scaffold and warns with the install line;
+  one older than 0.5.0, or one that does not import), the default run writes no scaffold and warns
+  with the install line;
   `--emit custom-scaffold` is then an error that names the extra, and `fluid ship
   --require-artifacts custom-scaffold` fails a release run that wrote none. Before the engine
   runs, its own validator checks the block and every `entrypoint` bundle is held to
   `FLUID_PLUGINS_ALLOWLIST` / `FLUID_PLUGINS_BLOCKLIST` as every other plugin is (the
   `custom_scaffold` plugin role is listed as dispatched by `fluid plugins` now). The engine
   writes into a hidden directory beside `custom-scaffold/`; every file it reports must be a
-  regular file there with the reported sha256 and size, nothing unreported and no link may be
-  there, and only then is the directory moved into place, so a refused run leaves no scaffold
-  behind. Each engine error is its own code (`custom_scaffold_contract_invalid`, `_bundle_failed`,
-  `_plan_failed`, `_unsafe_path`, `_apply_failed`, `_output_failed`, `_plugin_blocked`,
-  `_engine_missing`, `_engine_too_old`, `_failed`), with the message redacted. A relative `path:`
+  regular file there with the reported sha256 and size under the exact name the directory lists
+  (two spellings of one file on a case-insensitive file system are refused), nothing unreported
+  and no link may be there, and only then is the directory moved into place, so a refused run
+  leaves no scaffold behind. Each engine error is its own code (`custom_scaffold_contract_invalid`,
+  `_bundle_failed`, `_plan_failed`, `_unsafe_path`, `_apply_failed`, `_output_failed`,
+  `_plugin_blocked`, `_engine_missing`, `_engine_too_old`, `_engine_broken`, `_failed`), with the
+  message redacted; a file-system error is `custom_scaffold_output_failed`, not a traceback. A relative `path:`
   bundle is read from the contract's directory (a bundle's recorded source contract, else
   `--contract-path`). Git bundles keep the engine's own credential model: a credential goes only
   to a host the operator lists in `FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS`, and a contract's

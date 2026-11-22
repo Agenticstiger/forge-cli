@@ -56,7 +56,7 @@ import secrets
 import shutil
 import stat
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, NoReturn, Optional, Tuple
+from typing import Any, Iterable, List, Mapping, NamedTuple, NoReturn, Optional, Set, Tuple
 
 from fluid_build.forge.core.artifact_fanout import FanoutError
 
@@ -109,11 +109,17 @@ def scaffold_block(contract: Mapping[str, Any]) -> Optional[Any]:
 def clear(out_root: Path) -> None:
     """Remove what an earlier run left in ``out_root``: ``custom-scaffold/`` (a link there is
     removed, never followed) and any staging directory a killed run did not remove."""
-    _remove(out_root / SUBDIR)
-    if not out_root.is_dir():
-        return
-    for leftover in sorted(out_root.glob(f"{_STAGING_PREFIX}*")):
-        _remove(leftover)
+    try:
+        _remove(out_root / SUBDIR)
+        if out_root.is_dir():
+            for leftover in sorted(out_root.glob(f"{_STAGING_PREFIX}*")):
+                _remove(leftover)
+    except OSError as exc:
+        _refuse(
+            f"custom scaffold: an earlier run's output in {out_root} could not be removed "
+            f"({_reason(exc)})",
+            _OUTPUT,
+        )
 
 
 def emit(
@@ -163,8 +169,7 @@ def emit(
         if rows:
             _publish(staging, out_dir)
     finally:
-        if os.path.lexists(staging):
-            _remove(staging)
+        _discard(staging, logger)
     logger.info("generate_artifacts_custom_scaffold_ok: %d file(s) in %s", len(rows), out_dir)
     return [out_dir / rel for rel in rows]
 
@@ -190,7 +195,19 @@ def _engine(required: bool, logger: logging.Logger) -> Optional[Any]:
             INSTALL_LINE,
         )
         return None
-    engine = _optional.require(ENGINE_MODULE, ENGINE_EXTRA, _FEATURE)
+    try:
+        engine = _optional.require(ENGINE_MODULE, ENGINE_EXTRA, _FEATURE)
+    except Exception as exc:  # noqa: BLE001 - installed, but its import fails (a dependency)
+        cause = exc.__cause__ if exc.__cause__ is not None else exc
+        message = (
+            "the custom-scaffold engine is installed but does not import "
+            f"({type(cause).__name__}: {cause}); reinstall it: "
+            f"{INSTALL_LINE.replace('install', 'install --force-reinstall', 1)}"
+        )
+        if required:
+            _refuse(message, "custom_scaffold_engine_broken")
+        logger.warning("generate_artifacts_skip_custom_scaffold: %s", message)
+        return None
     if _has_the_api(engine):
         return engine
     message = (
@@ -284,38 +301,58 @@ def _is_instance(exc: BaseException, cls: Any) -> bool:
 
 def _verified_rows(staging: Path, files: Optional[Iterable[Any]]) -> List[str]:
     """The paths the engine reported, each checked against the file in ``staging``."""
-    if files is None:
-        _refuse("custom scaffold: the engine returned no file list", _OUTPUT)
-    reported: Dict[str, Any] = {}
-    for item in files:
-        rel = getattr(item, "path", None)
-        if not isinstance(rel, str):
-            _refuse(
-                f"custom scaffold: the engine reported a file without a path ({rel!r})", _UNSAFE
-            )
-        problem = _path_problem(rel)
-        if problem is not None:
-            _refuse(
-                f"custom scaffold: the engine reported the file {rel!r}, which {problem}", _UNSAFE
-            )
+    reported: Set[str] = set()
+    for item in _items(files):
+        rel = _checked_row(staging, item)
         if rel in reported:
             _refuse(f"custom scaffold: the engine reported {rel!r} twice", _OUTPUT)
-        digest, size = _digest_of(staging, rel)
-        if digest != getattr(item, "sha256", None) or size != getattr(item, "size", None):
-            _refuse(
-                f"custom scaffold: {rel!r} on disk is not the file the engine reported "
-                "(its sha256 or size differs)",
-                _OUTPUT,
-            )
-        reported[rel] = item
-    unreported = sorted(set(_tree(staging)) - set(reported))
-    if unreported:
-        listed = ", ".join(unreported[:_MAX_LISTED])
-        more = f" (+{len(unreported) - _MAX_LISTED} more)" if len(unreported) > _MAX_LISTED else ""
-        _refuse(
-            f"custom scaffold: the engine left files it did not report: {listed}{more}", _OUTPUT
-        )
+        reported.add(rel)
+    on_disk = set(_tree(staging))
+    # Two spellings of one file (``README.md`` and ``readme.md`` on a case-insensitive or
+    # normalising file system) both read as that file: only names the directory lists count.
+    _refuse_names(
+        sorted(reported - on_disk),
+        "the engine reported {}, which the output does not hold under that name (two "
+        "spellings of one file on a case-insensitive file system?)",
+    )
+    _refuse_names(sorted(on_disk - reported), "the engine left files it did not report: {}")
     return sorted(reported)
+
+
+def _items(files: Optional[Iterable[Any]]) -> List[Any]:
+    if files is None:
+        _refuse("custom scaffold: the engine returned no file list", _OUTPUT)
+    try:
+        return list(files)
+    except TypeError:
+        _refuse("custom scaffold: the engine returned a file list that is not a list", _OUTPUT)
+
+
+def _checked_row(staging: Path, item: Any) -> str:
+    """The row's path, once it names a regular file in ``staging`` with the row's digest."""
+    rel = getattr(item, "path", None)
+    if not isinstance(rel, str):
+        _refuse(f"custom scaffold: the engine reported a file without a path ({rel!r})", _UNSAFE)
+    problem = _path_problem(rel)
+    if problem is not None:
+        _refuse(f"custom scaffold: the engine reported the file {rel!r}, which {problem}", _UNSAFE)
+    digest, size = _digest_of(staging, rel)
+    if digest != getattr(item, "sha256", None) or size != getattr(item, "size", None):
+        _refuse(
+            f"custom scaffold: {rel!r} on disk is not the file the engine reported "
+            "(its sha256 or size differs)",
+            _OUTPUT,
+        )
+    return rel
+
+
+def _refuse_names(names: List[str], template: str) -> None:
+    """Refuse with ``template`` naming the first few of ``names``, when there are any."""
+    if not names:
+        return
+    shown = ", ".join(names[:_MAX_LISTED])
+    more = f" (+{len(names) - _MAX_LISTED} more)" if len(names) > _MAX_LISTED else ""
+    _refuse("custom scaffold: " + template.format(shown + more), _OUTPUT)
 
 
 def _path_problem(rel: str) -> Optional[str]:
@@ -326,7 +363,7 @@ def _path_problem(rel: str) -> Optional[str]:
     empty, ``.`` or ``..`` segment."""
     if not rel:
         return "is not a path"
-    if any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F or ch in "  " for ch in rel):
+    if any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F or ch in "\u2028\u2029" for ch in rel):
         return "holds a control character"
     if "\\" in rel:
         return "holds a backslash"
@@ -350,6 +387,8 @@ def _digest_of(staging: Path, rel: str) -> Tuple[str, int]:
         mode = os.lstat(path).st_mode
     except FileNotFoundError:
         _refuse(f"custom scaffold: the engine reported {rel!r}, which is not on disk", _OUTPUT)
+    except OSError as exc:  # a name too long for the file system, a directory it cannot read
+        _refuse(f"custom scaffold: {rel!r} could not be read ({_reason(exc)})", _OUTPUT)
     if not stat.S_ISREG(mode):
         _refuse(f"custom scaffold: {rel!r} is a link or not a regular file", _UNSAFE)
     try:
@@ -367,6 +406,8 @@ def _digest_of(staging: Path, rel: str) -> Tuple[str, int]:
                 break
             digest.update(chunk)
             size += len(chunk)
+    except OSError as exc:
+        _refuse(f"custom scaffold: {rel!r} could not be read ({_reason(exc)})", _OUTPUT)
     finally:
         os.close(descriptor)
     return digest.hexdigest(), size
@@ -376,13 +417,16 @@ def _tree(staging: Path) -> List[str]:
     """Every file under ``staging``, as ``/``-separated relative paths; a link is refused."""
 
     def _unreadable(error: OSError) -> NoReturn:
-        _refuse(f"custom scaffold: the output could not be read ({error.strerror})", _OUTPUT)
+        _refuse(f"custom scaffold: the output could not be read ({_reason(error)})", _OUTPUT)
 
     found: List[str] = []
     for directory, dirnames, filenames in os.walk(staging, onerror=_unreadable):
         base = Path(directory)
         for name in [*dirnames, *filenames]:
-            mode = os.lstat(base / name).st_mode
+            try:
+                mode = os.lstat(base / name).st_mode
+            except OSError as exc:
+                _unreadable(exc)
             if stat.S_ISLNK(mode) or not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
                 rel = (base / name).relative_to(staging).as_posix()
                 _refuse(
@@ -420,6 +464,8 @@ def _new_staging(parent: Path) -> Path:
             staging.mkdir()
         except FileExistsError:
             continue
+        except OSError as exc:
+            _refuse(f"custom scaffold: {parent} could not be written ({_reason(exc)})", _OUTPUT)
         return staging
     _refuse("custom scaffold: no staging directory could be created", _GENERIC_CODE)
 
@@ -430,7 +476,30 @@ def _publish(staging: Path, out_dir: Path) -> None:
         _remove(out_dir)
         os.rename(staging, out_dir)
     except OSError as exc:
-        _refuse(f"custom scaffold: {out_dir} could not be written ({exc.strerror})", _OUTPUT)
+        _refuse(f"custom scaffold: {out_dir} could not be written ({_reason(exc)})", _OUTPUT)
+
+
+def _discard(staging: Path, logger: logging.Logger) -> None:
+    """Remove the staging directory without raising: a failure to clean up must not replace
+    the error that ended the run. What cannot be removed is named, and the next run's
+    :func:`clear` removes it or says why it cannot."""
+    if not os.path.lexists(staging):
+        return
+    try:
+        _remove(staging)
+    except OSError as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        if os.path.lexists(staging):
+            logger.warning(
+                "generate_artifacts_custom_scaffold_leftover: %s could not be removed (%s); "
+                "delete it",
+                staging,
+                _reason(exc),
+            )
+
+
+def _reason(exc: OSError) -> str:
+    return exc.strerror or type(exc).__name__
 
 
 def _remove(path: Path) -> None:
