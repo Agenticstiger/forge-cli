@@ -4044,6 +4044,10 @@
           "$ref": "#/$defs/recordMapping",
           "description": "NEW in v0.7.7 (preview): How the stream's records become the output's rows. Requires stream, and replaces sql."
         },
+        "package": {
+          "$ref": "#/$defs/sparkPackage",
+          "description": "NEW in v0.7.7 (preview): A prebuilt PySpark package a batch Spark build runs by its sha256 digest, in place of sql, stream and mapping."
+        },
         "tags": {
           "$ref": "#/$defs/tags"
         },
@@ -4051,6 +4055,59 @@
           "$ref": "#/$defs/labels"
         }
       },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "package"
+            ]
+          },
+          "then": {
+            "required": [
+              "parameters"
+            ],
+            "properties": {
+              "language": {
+                "const": "pyspark"
+              },
+              "parameters": {
+                "required": [
+                  "spark"
+                ],
+                "properties": {
+                  "spark": {
+                    "properties": {
+                      "mode": {
+                        "const": "batch"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "sql"
+                  ]
+                },
+                {
+                  "required": [
+                    "mapping"
+                  ]
+                },
+                {
+                  "required": [
+                    "stream"
+                  ]
+                }
+              ]
+            },
+            "description": "a package runs PySpark in a batch Spark build (parameters.spark), in place of sql, mapping and stream"
+          }
+        }
+      ],
       "if": {
         "not": {
           "anyOf": [
@@ -4087,6 +4144,19 @@
                   ]
                 }
               }
+            },
+            {
+              "required": [
+                "package",
+                "parameters"
+              ],
+              "properties": {
+                "parameters": {
+                  "required": [
+                    "spark"
+                  ]
+                }
+              }
             }
           ]
         }
@@ -4102,10 +4172,77 @@
         ]
       }
     },
+    "sparkPackage": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "NEW in v0.7.7 (preview): A prebuilt PySpark package a Spark build runs in place of sql or a mapping, at builds[].properties.package of an embedded-logic build with engine: spark and parameters.spark, a batch build. forge's runner reads the copy fluid apply made beside the job config, refuses it unless its sha256 is the pin, puts it on the Python path and calls the entry point as fn(spark, context), context.arguments holding arguments. The function returns a DataFrame and the runner writes it: the columns and their types must be the output's contract.schema, a row whose required value is null goes to the dead letters (without them it fails the run), and the run replaces the partitions its rows hold, as a SQL batch build does. While the function runs the session refuses writes, and a commit to the output or its dead letters that the runner did not make fails the run. Pure Python only: Python imports no compiled extension from a zip, so a dependency with one belongs in the runtime's image or environment.",
+      "required": [
+        "uri",
+        "sha256",
+        "entryPoint"
+      ],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "pattern": "^(?:s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/|file:///)(?:(?!\\.{1,2}/)[A-Za-z0-9._=+-]+/)*[A-Za-z0-9._=+-]+\\.(?:whl|zip)(?![\\s\\S])",
+          "maxLength": 1024,
+          "description": "The package as its team published it, a .whl or a .zip: s3://<bucket>/<key> for the AWS runtimes, file:///<path> on the machine fluid apply runs on for runtime local. On AWS fluid apply copies the object into the build's artifact prefix only when S3's SHA-256 checksum of it is the pin, so publish it single-part with --checksum-algorithm SHA256 (aws s3api put-object). The operator lists where packages may come from in FLUID_SPARK_PACKAGE_ALLOWLIST."
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}(?![\\s\\S])",
+          "description": "The package's sha256, as sha256sum prints it: 64 lowercase hex characters. The run refuses any other bytes."
+        },
+        "entryPoint": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?![\\s\\S])",
+          "maxLength": 512,
+          "description": "The function the runner calls, as an entry-point object reference, <module>:<attribute>[.<attribute>] (orders_pkg.jobs:merge_orders). The module must come from the package."
+        },
+        "arguments": {
+          "type": "object",
+          "maxProperties": 64,
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]{0,127}(?![\\s\\S])"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "description": "Strings the function reads as context.arguments, name to value (source: commerce.orders_raw)."
+        },
+        "deadLetter": {
+          "$ref": "#/$defs/sparkPackageDeadLetter"
+        }
+      }
+    },
+    "sparkPackageDeadLetter": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "NEW in v0.7.7 (preview): What forge's Spark runner does with a row of a package's output that fails the contract's checks: a required value that is null, at any depth. With deadLetter, each such row goes to an Iceberg table beside the output, with the reason, the row as JSON, the run and the package's sha256, and the run writes the other rows; without it, or with enabled: false, any such row fails the run and nothing is written. The keys follow properties.stream.deadLetter.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "false: no dead letters; a row that fails the checks fails the run (an overlay can switch it off per environment)."
+        },
+        "table": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,254}(?![\\s\\S])",
+          "description": "The table's name in the output's database. Absent: <output table>__dead_letter."
+        },
+        "maxRecordsBeforeAbort": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 10000,
+          "description": "The run fails, after its dead letters have landed and before the output is written, once more rows than this fail the checks (0: any one)."
+        }
+      }
+    },
     "sparkParameters": {
       "type": "object",
       "additionalProperties": false,
-      "description": "NEW in v0.7.7 (preview): Where and how a Spark build runs, at builds[].properties.parameters.spark of an embedded-logic build with engine: spark. forge runs one versioned PySpark runner with a generated job config; the build declares what it computes, either properties.stream with properties.mapping, or properties.sql as Spark SQL. There is no user PySpark entry point. The split with builds[].execution: this block says where Spark runs (runtime, application or cluster, release, role, Spark configuration); execution keeps when the build runs and what happens when it fails (trigger, retries, notifications). execution.runtime is the orchestrator's generic runtime (platform, image, resources) and does not choose a Spark runtime.",
+      "description": "NEW in v0.7.7 (preview): Where and how a Spark build runs, at builds[].properties.parameters.spark of an embedded-logic build with engine: spark. forge runs one versioned PySpark runner with a generated job config; the build declares what it computes: properties.stream with properties.mapping, properties.sql as Spark SQL, or properties.package, a prebuilt PySpark package whose output the runner checks and writes. The split with builds[].execution: this block says where Spark runs (runtime, application or cluster, release, role, Spark configuration); execution keeps when the build runs and what happens when it fails (trigger, retries, notifications). execution.runtime is the orchestrator's generic runtime (platform, image, resources) and does not choose a Spark runtime.",
       "required": [
         "runtime"
       ],

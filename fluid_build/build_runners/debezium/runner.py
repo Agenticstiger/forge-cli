@@ -38,6 +38,7 @@ from fluid_build.api.schema import SchemaFingerprint
 from fluid_build.build_runners._deployment_host_policy import (
     refuse_unless_host_allowed,
 )
+from fluid_build.providers._sql_safety import reject_url_syntax
 
 from .._acquisition_common import (
     extract_source_schemas,
@@ -157,6 +158,10 @@ def build_connector_config(
     passed verbatim under the ``database.*`` namespace.
     """
     connector_class = resolve_debezium_class(kind)
+    # Debezium builds its JDBC URL (or MongoDB's ``mongodb://host:port`` here)
+    # from the host, port and database: refused before the secret is read when
+    # one would not stay in its part.
+    reject_url_syntax(connection, where="the Debezium connector")
     if extra and connection.get("secretRef"):
         # extra_config is merged last, so a host or credential key in it would
         # move the resolved secret past the destination policy, which only saw
@@ -367,14 +372,17 @@ def _execute_kafka_connect(
         return _failed(ctx, started_at, t_start, str(exc))
 
     server_name = dbz_props.get("server_name") or ctx.product_id.replace(".", "_")
-    config = build_connector_config(
-        ctx.source.kind,
-        connection=ctx.source.connection.raw,
-        streams=list(ctx.source.streams),
-        server_name=server_name,
-        snapshot_mode=snapshot_mode,
-        extra=dbz_props.get("extra_config") or {},
-    )
+    try:
+        config = build_connector_config(
+            ctx.source.kind,
+            connection=ctx.source.connection.raw,
+            streams=list(ctx.source.streams),
+            server_name=server_name,
+            snapshot_mode=snapshot_mode,
+            extra=dbz_props.get("extra_config") or {},
+        )
+    except ValueError as exc:  # reject_url_syntax: a field that would not stay in its part
+        return _failed(ctx, started_at, t_start, str(exc))
     config["connector.class"] = connector_class
 
     connector_name = (
@@ -605,13 +613,16 @@ def _execute_debezium_server(
     except ValueError as exc:
         return _failed(ctx, started_at, t_start, str(exc))
 
-    source_config = build_connector_config(
-        ctx.source.kind,
-        connection=ctx.source.connection.raw,
-        streams=list(ctx.source.streams),
-        server_name=server_name,
-        snapshot_mode=snapshot_mode,
-    )
+    try:
+        source_config = build_connector_config(
+            ctx.source.kind,
+            connection=ctx.source.connection.raw,
+            streams=list(ctx.source.streams),
+            server_name=server_name,
+            snapshot_mode=snapshot_mode,
+        )
+    except ValueError as exc:  # reject_url_syntax: a field that would not stay in its part
+        return _failed(ctx, started_at, t_start, str(exc))
     sink_block = (dbz_props.get("server") or {}).get("sink") or {}
     sink_type = sink_block.get("type", "iceberg")
     handwritten = dict(sink_block.get("config") or {})

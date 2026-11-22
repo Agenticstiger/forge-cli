@@ -15,6 +15,9 @@ validators:
     odps/*.opds.json       → (back-compat alias of opds/) same OPDS v4.1 check
     schedule/<product-id>/*.py → py_compile (DAGs and flows)
     policy/bindings.json   → key-check + OPA conftest (optional)
+    spark/<build-id>/job.json → structural check of the forge Spark job config
+    pyspark-schema/*_schema.py → the PySpark schema module allowlist
+    custom-scaffold/**     → MANIFEST only; fluid-scaffold.lock must be YAML
     <dir>/dbt/             → dbt parse (optional, for speed-transformation output)
 
 Reuses ``ValidationIssue`` / ``BundleValidationReport`` from Phase 3's
@@ -166,7 +169,9 @@ def validate_manifest_dir(
     expected_paths = set(declared.keys())
 
     # Actual files on disk (recursive, relative to artifacts_dir; exclude
-    # MANIFEST.json itself and anything starting with .).
+    # MANIFEST.json itself). A hidden file (.DS_Store etc.) is never reported
+    # as undeclared, but one the MANIFEST declares (a scaffold's .gitlab-ci.yml)
+    # must be there like any other.
     actual_paths: set = set()
     for fp in artifacts_dir.rglob("*"):
         if not fp.is_file():
@@ -174,12 +179,12 @@ def validate_manifest_dir(
         rel = fp.relative_to(artifacts_dir).as_posix()
         if rel == manifest_path.relative_to(artifacts_dir).as_posix():
             continue
-        if rel.startswith(".") or "/." in rel:
-            continue  # hidden files (.DS_Store etc.)
         actual_paths.add(rel)
 
     missing = expected_paths - actual_paths
-    extra = actual_paths - expected_paths
+    extra = {
+        rel for rel in actual_paths - expected_paths if not (rel.startswith(".") or "/." in rel)
+    }
     for path in sorted(missing):
         issues.append(
             ValidationIssue(
@@ -556,6 +561,73 @@ def validate_spark_job_json(path: str, content: bytes) -> List[ValidationIssue]:
     ]
 
 
+def validate_pyspark_schema_module(path: str, content: bytes) -> List[ValidationIssue]:
+    """``pyspark-schema/<port>_schema.py`` is a module the PySpark schema emitter could
+    have written: UTF-8, its fixed first lines, and nothing but one ``StructType`` (the
+    allowlist :func:`fluid_build.spark.pyspark_schema.check_module` applies). A job imports
+    the module, so anything else in it would run there."""
+    from fluid_build.spark import pyspark_schema
+
+    parts = path.split("/")
+    if len(parts) != 2 or not parts[1].endswith(f"{pyspark_schema.SUFFIX}.py"):
+        problem: Optional[Tuple[str, str]] = (
+            f"expected pyspark-schema/<port>{pyspark_schema.SUFFIX}.py",
+            "PYSPARK-SCHEMA-PATH",
+        )
+    else:
+        problem = None
+        try:
+            pyspark_schema.check_module(content.decode("utf-8"), parts[1])
+        except UnicodeDecodeError as exc:
+            problem = (f"not UTF-8: {exc}", "PYSPARK-SCHEMA-ENCODING")
+        except ValueError as exc:
+            problem = (str(exc), "PYSPARK-SCHEMA-SHAPE")
+    if problem is None:
+        return []
+    return [
+        ValidationIssue(
+            file=path,
+            validator="pyspark-schema",
+            severity="error",
+            message=problem[0],
+            code=problem[1],
+        )
+    ]
+
+
+#: The file the custom-scaffold engine records what generated a scaffold in.
+_SCAFFOLD_LOCK = "fluid-scaffold.lock"
+
+
+def validate_custom_scaffold_file(path: str, content: bytes) -> List[ValidationIssue]:
+    """A ``custom-scaffold/`` file: its bytes are the bundle's, in any format, so the
+    MANIFEST digest is the check; the engine's ``fluid-scaffold.lock`` must parse as a YAML
+    mapping."""
+    if path != f"custom-scaffold/{_SCAFFOLD_LOCK}":
+        return []
+    # The size, depth and alias caps of every other YAML artifact here: the lock is the
+    # bundle's output, so a hostile one must be an issue, not a crash.
+    from fluid_build.util.safe_yaml import UnsafeYamlError, load_yaml_safe
+
+    try:
+        doc = load_yaml_safe(content)
+    except (UnicodeDecodeError, yaml.YAMLError, UnsafeYamlError, RecursionError) as exc:
+        doc, why = None, f"parse failure: {type(exc).__name__}: {str(exc)[:200]}"
+    else:
+        why = f"expected a mapping at root, got {type(doc).__name__}"
+    if isinstance(doc, dict):
+        return []
+    return [
+        ValidationIssue(
+            file=path,
+            validator="custom-scaffold",
+            severity="error",
+            message=why,
+            code="CUSTOM-SCAFFOLD-LOCK",
+        )
+    ]
+
+
 def validate_bindings_json(path: str, content: bytes) -> List[ValidationIssue]:
     """Structural key-check on ``policy/bindings.json``.
 
@@ -877,6 +949,10 @@ def _dispatch_by_prefix(path: str, content: bytes) -> Callable[[str, bytes], Lis
         return validate_bindings_json
     if path.startswith("spark/"):
         return validate_spark_job_json
+    if path.startswith("pyspark-schema/"):
+        return validate_pyspark_schema_module
+    if path.startswith("custom-scaffold/"):
+        return validate_custom_scaffold_file
     # Unknown — bind a no-op validator that flags it as a warning.
     return _flag_unexpected
 
@@ -998,5 +1074,7 @@ __all__ = [
     "validate_odps_bitol",
     "validate_opa_conftest",
     "validate_opds",
+    "validate_custom_scaffold_file",
+    "validate_pyspark_schema_module",
     "validate_spark_job_json",
 ]

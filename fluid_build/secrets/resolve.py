@@ -182,7 +182,11 @@ def resolve_secret(
         check_prefix(parsed, environ)
         check_stage(parsed, current_stage(), environ)
         if not unsent:
-            refuse_unless_allowed(parsed, connection=connection, host=host, environ=environ)
+            # Its destinations went through apply's placeholder rendering, so a
+            # refusal quotes only what the contract wrote.
+            refuse_unless_allowed(
+                parsed, connection=connection, host=host, environ=environ, rendered=True
+            )
         # Only now is anything read: the run-secrets file, else the store.
         with state_for_lookup() as state:
             return _fetch(parsed, state)

@@ -12,7 +12,7 @@ consistent event formatting.
 import re
 from typing import Any, Dict, List
 
-from fluid_build.observability.secret_redactor import is_sensitive_key_name
+from fluid_build.observability.secret_redactor import _ORACLE_JDBC_RE, is_sensitive_key_name
 
 # Patterns for sensitive data that should be redacted
 SENSITIVE_PATTERNS = [
@@ -27,6 +27,11 @@ SENSITIVE_PATTERNS = [
     # API keys
     re.compile(r'"api_key":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r"key=AIza[A-Za-z0-9_-]+"),
+    re.compile(r"AIza[0-9A-Za-z_\-]{35}"),  # a Google key after a word character too
+    # A Slack incoming webhook: the URL is the secret.
+    re.compile(
+        r"(?i)\bhttps?://hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9/_-]{8,256}"
+    ),
     # Database passwords and connection strings
     re.compile(r'"password":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r"password=[^\s;&]+", re.IGNORECASE),
@@ -65,7 +70,7 @@ def redact_string(text: str) -> str:
     if not isinstance(text, str):
         return text
 
-    redacted = text
+    redacted = _ORACLE_JDBC_RE.sub(r"\1[REDACTED]\2", text)  # jdbc:oracle:thin:user/pw@host
 
     for pattern in SENSITIVE_PATTERNS:
         redacted = pattern.sub("[REDACTED]", redacted)

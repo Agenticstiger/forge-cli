@@ -442,6 +442,8 @@ def _emit_build(
     content, cluster, iam = _job_content(blocks, b)
     bucket_ref = _bucket_ref(contract, expose, loc, bucket, ctx)
     _emit_artifacts(blocks, b, bucket_ref, content, runner_source())
+    if config.get("package"):
+        _emit_package(blocks, b, bucket_ref, build)
     log_name = names.log_group_name(ctx.product, bid)
     blocks.resources.setdefault("aws_cloudwatch_log_group", {})[b.key] = {
         "name": log_name,
@@ -586,55 +588,118 @@ def _glue_jars(blocks: SparkBlocks, b: _Build, bucket_ref: Any) -> Tuple[TofuExp
             ),
         )
     uris = []
-    sources = blocks.data.setdefault("aws_s3_object", {})
-    copies = blocks.resources.setdefault("aws_s3_object_copy", {})
     for index, jar in enumerate(needed):
         name = f"{b.key}_jar_{index}"
-        where = f"s3://{location.bucket}/{location.key(jar)}"
-        sources[name] = {
-            "bucket": location.bucket,
-            "key": location.key(jar),
-            "checksum_mode": "ENABLED",
-        }
         key = aws_glue_jars.copy_key(b.ctx.product, b.build_id, jar)
-        copies[name] = {
-            "bucket": bucket_ref,
-            "key": key,
-            "source": f"{location.bucket}/{location.key(jar)}",
-            "copy_if_match": tofu_ref(f"data.aws_s3_object.{name}.etag"),
-            "checksum_algorithm": "SHA256",
-            # The product's tags, not the platform object's (S3 copies a source's tags
-            # unless told to replace them).
-            "tagging_directive": "REPLACE",
-            "tags": dict(b.tags),
-            "lifecycle": {
-                "precondition": [
-                    {
-                        "condition": TofuExpr(
-                            f"${{data.aws_s3_object.{name}.checksum_sha256 == "
-                            f'"{jar.sha256_b64}"}}'
-                        ),
-                        "error_message": (
-                            f"{where} is not the pinned {jar.coordinate} (sha256 "
-                            f"{jar.sha256}), or was uploaded without a single-part SHA-256 "
-                            "checksum."
-                        ),
-                    }
-                ],
-                "postcondition": [
-                    {
-                        "condition": TofuExpr(f'${{self.checksum_sha256 == "{jar.sha256_b64}"}}'),
-                        "error_message": (
-                            f"The copy of {jar.coordinate} is not the pinned bytes (sha256 "
-                            f"{jar.sha256})."
-                        ),
-                    }
-                ],
-            },
-        }
+        _pinned_copy(
+            blocks,
+            b,
+            name,
+            source=(location.bucket, location.key(jar)),
+            bucket_ref=bucket_ref,
+            key=key,
+            sha256_b64=jar.sha256_b64,
+            refused=(
+                f"s3://{location.bucket}/{location.key(jar)} is not the pinned {jar.coordinate} "
+                f"(sha256 {jar.sha256}), or was uploaded without a single-part SHA-256 checksum."
+            ),
+            copied=f"The copy of {jar.coordinate} is not the pinned bytes (sha256 {jar.sha256}).",
+        )
         bucket = tofu_ref(f"aws_s3_object_copy.{name}.bucket")
         uris.append(TofuExpr(f"s3://{bucket}/{_escape(key)}"))
     return tuple(uris)
+
+
+def _pinned_copy(
+    blocks: SparkBlocks,
+    b: _Build,
+    name: str,
+    *,
+    source: Tuple[str, str],
+    bucket_ref: Any,
+    key: str,
+    sha256_b64: str,
+    refused: str,
+    copied: str,
+) -> None:
+    """Copy the object at ``source`` (bucket, key) to ``key`` in the build's own artifact
+    prefix, only as the bytes pinned by ``sha256_b64`` (S3's ``checksum_sha256``):
+
+    - the read's ``checksum_mode`` asks S3 for the source's SHA-256, and the copy's
+      ``precondition`` compares it with the pin, at plan;
+    - ``copy_if_match`` is the ETag that plan read, so S3 copies those bytes or nothing;
+    - the copy is written with a SHA-256 checksum, and its ``postcondition`` checks it.
+
+    The copy is not re-made while its pin and source are unchanged, and a new pin is a new
+    key, so a later swap at the source never reaches a run: the job role reads its own
+    prefix only. ``refused`` and ``copied`` are the two checks' messages."""
+    bucket, source_key = source
+    blocks.data.setdefault("aws_s3_object", {})[name] = {
+        "bucket": bucket,
+        "key": source_key,
+        "checksum_mode": "ENABLED",
+    }
+    blocks.resources.setdefault("aws_s3_object_copy", {})[name] = {
+        "bucket": bucket_ref,
+        "key": key,
+        "source": f"{bucket}/{source_key}",
+        "copy_if_match": tofu_ref(f"data.aws_s3_object.{name}.etag"),
+        "checksum_algorithm": "SHA256",
+        # The product's tags, not the source object's (S3 copies a source's tags unless
+        # told to replace them).
+        "tagging_directive": "REPLACE",
+        "tags": dict(b.tags),
+        "lifecycle": {
+            "precondition": [
+                {
+                    "condition": TofuExpr(
+                        f'${{data.aws_s3_object.{name}.checksum_sha256 == "{sha256_b64}"}}'
+                    ),
+                    "error_message": refused,
+                }
+            ],
+            "postcondition": [
+                {
+                    "condition": TofuExpr(f'${{self.checksum_sha256 == "{sha256_b64}"}}'),
+                    "error_message": copied,
+                }
+            ],
+        },
+    }
+
+
+def _emit_package(
+    blocks: SparkBlocks, b: _Build, bucket_ref: Any, build: Mapping[str, Any]
+) -> None:
+    """A package build's package, copied beside the job config where the runner looks for
+    it (:func:`fluid_build.spark.names.package_key`), as the Glue jars are pinned: the job
+    role reads that copy, never the team's store (``spark/package.py``)."""
+    from fluid_build.spark import package as _package
+
+    spec = _package.parse_package(_package.declared(build), b.runtime, b.where)
+    source = f"s3://{spec.bucket}/{spec.key}"
+    name = f"{b.key}_package"
+    _pinned_copy(
+        blocks,
+        b,
+        name,
+        source=(str(spec.bucket), str(spec.key)),
+        bucket_ref=bucket_ref,
+        key=names.package_key(b.ctx.product, b.build_id, spec.sha256),
+        sha256_b64=spec.sha256_b64,
+        refused=(
+            f"{source} is not the pinned package (sha256 {spec.sha256}), or was uploaded "
+            "without a single-part SHA-256 checksum: publish it with aws s3api put-object "
+            "--checksum-algorithm SHA256."
+        ),
+        copied=f"The copy of {source} is not the pinned bytes (sha256 {spec.sha256}).",
+    )
+    # A release switches in order: the new copy exists, then job.json names it, then the old
+    # copy goes. A run started at any point reads a job config whose package is there.
+    blocks.resources["aws_s3_object_copy"][name]["lifecycle"]["create_before_destroy"] = True
+    blocks.resources["aws_s3_object"][f"{b.key}_config"]["depends_on"] = [
+        f"aws_s3_object_copy.{name}"
+    ]
 
 
 def _job_content(
@@ -911,7 +976,13 @@ def _dead_letters(
     b: _Build, contract: Mapping[str, Any], expose: Mapping[str, Any], data_prefix: str, iam: bool
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """The stream's dead letters on AWS: ``(table, its prefix, topic)``. The topic only on
-    MSK with IAM, where the role needs a grant to write it."""
+    MSK with IAM, where the role needs a grant to write it. A package build's are a table
+    (``properties.package.deadLetter``)."""
+    package_dead = (b.config.get("package") or {}).get("deadLetter")
+    if package_dead:
+        table = str(package_dead["table"]).split(".", 1)[1]
+        _refuse_unsupported_dead_letter_table(b, contract, expose, data_prefix)
+        return table, _dead_letter_prefix(data_prefix, table), None
     dead = b.config.get("deadLetter") or {}
     if dead.get("sink") == "topic":
         return None, None, (dead.get("topic") if iam else None)
@@ -972,15 +1043,55 @@ def _refuse_unsupported_dead_letter_table(
             "letters' table, which holds the records' raw bytes"
         )
     if problem:
+        shape = _dead_letter_shape(b)
         raise UnsupportedBindingError(
             "spark-dead-letters-table-unsupported",
-            f"{b.where}: properties.stream.deadLetter writes a table of its own beside the "
-            f"output, and {problem}.",
-            (
-                "Send the dead letters to a topic (deadLetter.sink: topic), whose retention is "
-                "the topic's.",
+            f"{b.where}: {shape.field} writes a table of its own beside the output, and "
+            f"{problem}.",
+            (shape.fix,),
+        )
+
+
+@dataclass(frozen=True)
+class _DeadLetterShape:
+    """A build's dead letters as the emitters below name and hold them."""
+
+    field: str
+    schema: Tuple[Mapping[str, Any], ...]
+    fix: str
+    description: str
+
+
+def _dead_letter_shape(b: _Build) -> _DeadLetterShape:
+    """A stream's dead letters (records with their topic and offset), or a package build's
+    (rows of its output: ``properties.package.deadLetter``)."""
+    from fluid_build.spark.dead_letter import BATCH_SCHEMA, SCHEMA
+
+    if b.config.get("package"):
+        return _DeadLetterShape(
+            field="properties.package.deadLetter",
+            schema=BATCH_SCHEMA,
+            fix=(
+                "Set properties.package.deadLetter.enabled: false: a row that fails the checks "
+                "then fails the run, and nothing is written."
+            ),
+            description=(
+                f"The rows of the forge Spark build {b.build_id}'s package that failed the "
+                "checks for {table}, with why, the run and the package's sha256"
             ),
         )
+    return _DeadLetterShape(
+        field="properties.stream.deadLetter",
+        schema=SCHEMA,
+        fix=(
+            "Send the dead letters to a topic (deadLetter.sink: topic), whose retention is the "
+            "topic's."
+        ),
+        description=(
+            f"The records the forge Spark build {b.build_id} could not land in {{table}}, with "
+            "why and where they were read"
+        ),
+    )
 
 
 def _emit_dead_letter_table(
@@ -997,10 +1108,11 @@ def _emit_dead_letter_table(
     always under the output's ``governance.lakeFormation``, and without one where the
     account's Lake Formation settings govern new tables (``_lake_formation_default``)."""
     from fluid_build.iac.governance_labels import governance_labels
-    from fluid_build.spark.dead_letter import SCHEMA
 
     from . import aws as _aws  # imported here: aws imports this module
 
+    # A package build's dead letters are rows of its output, with no topic or offset.
+    shape = _dead_letter_shape(b)
     binding = expose.get("binding") or {}
     loc = dict(binding.get("location") or {})
     database = str(loc.get("database"))
@@ -1010,7 +1122,7 @@ def _emit_dead_letter_table(
     emitted: Dict[str, Dict[str, Any]] = {}
     _aws._emit_glue(
         emitted,
-        [dict(column) for column in SCHEMA],
+        [dict(column) for column in shape.schema],
         b.ctx.cid,
         tags,
         # The output's binding, at the dead letters' own table and prefix; unpartitioned
@@ -1027,15 +1139,12 @@ def _emit_dead_letter_table(
     )
     key = safe_ident(f"{b.ctx.cid}_{database}_{dead_table}")
     body = emitted["aws_glue_catalog_table"][key]
-    body["description"] = (
-        f"The records the forge Spark build {b.build_id} could not land in "
-        f"{database}.{loc.get('table')}, with why and where they were read"
-    )
+    body["description"] = shape.description.format(table=f"{database}.{loc.get('table')}")
     tables = blocks.resources.setdefault("aws_glue_catalog_table", {})
     if key in tables:
         raise UnsupportedBindingError(
             "spark-address-conflict",
-            f"{b.where}: properties.stream.deadLetter.table {database}.{dead_table} is another "
+            f"{b.where}: {shape.field}.table {database}.{dead_table} is another "
             "Spark build's dead-letter table.",
             ("Give each build's dead letters a table of their own.",),
         )
@@ -1365,7 +1474,7 @@ def _emit_caller_policy(
 #: (``_lf_grant_*``) is not the build's.
 _SPARK_DEFINITIONS: Dict[str, "re.Pattern[str]"] = {
     "aws_s3_object": re.compile(r"_spark_(runner|config)$"),
-    "aws_s3_object_copy": re.compile(r"_spark_jar_[0-9]+$"),
+    "aws_s3_object_copy": re.compile(r"_spark_(jar_[0-9]+|package)$"),
     "aws_cloudwatch_log_group": re.compile(r"_spark$"),
     "aws_kms_key": re.compile(r"_spark_logs$"),
     "aws_iam_role": re.compile(r"(_spark|_lf_writer_[0-9a-f]{8})$"),

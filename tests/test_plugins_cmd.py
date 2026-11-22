@@ -167,9 +167,8 @@ def test_detailed_plugins_isolates_metadata_error(monkeypatch):
 # `fluid plugins` is an operator inspection/security command, so what it does
 # NOT say matters as much as what it does:
 #
-#  * `custom_scaffold` is in ROLE_GROUPS but nothing in the package ever walks
-#    `fluid_build.custom_scaffolds` — a plugin registered there was rendered
-#    exactly like a live one ("allowed", with metadata).
+#  * a role in ROLE_GROUPS that nothing walks must not render like a live one
+#    (`custom_scaffold` was such a role until stage 3 ran its engine).
 #  * declared PluginMetadata is self-reported and unverifiable: a probe
 #    declaring version 9.9.9 was printed verbatim while the distribution that
 #    actually ships the entry point was `mprobekit 1.0.0`, and nothing named it.
@@ -177,33 +176,33 @@ def test_detailed_plugins_isolates_metadata_error(monkeypatch):
 #    even though FLUID_PLUGIN_STRICT_COMPAT=1 refuses to register it.
 
 
-def test_custom_scaffold_is_the_only_declared_role_without_a_dispatch_site():
-    """If a dispatch site lands, delete the entry — don't grow the exception list."""
-    assert PM.UNDISPATCHED_GROUPS == frozenset({"custom_scaffold"})
-    assert PM.is_dispatched("custom_scaffold") is False
-    for key in ("provider", "validator", "catalog", "iac_provider"):
+def test_every_declared_role_has_a_dispatch_site():
+    """A role without one goes in UNDISPATCHED_GROUPS until it has one."""
+    assert PM.UNDISPATCHED_GROUPS == frozenset()
+    for key in ("provider", "validator", "catalog", "iac_provider", "custom_scaffold"):
         assert PM.is_dispatched(key) is True
 
 
-def test_the_custom_scaffolds_group_really_has_no_walk_site():
-    """The pin that makes the flag above a fact rather than a claim."""
-    import re
-    from pathlib import Path
+def test_the_custom_scaffold_role_is_dispatched_by_stage_three_under_the_policy(
+    tmp_path, monkeypatch
+):
+    """``fluid generate artifacts`` runs the engine, whose ``entrypoint`` bundles are this
+    group's plugins, and checks each against the policy before the engine loads it."""
+    import pytest
 
-    import fluid_build
+    from fluid_build.forge.core import custom_scaffold_artifacts as scaffold
+    from fluid_build.forge.core.artifact_fanout import FanoutError
 
-    root = Path(fluid_build.__file__).resolve().parent
-    pattern = re.compile(r"fluid_build\.custom_scaffolds")
-    hits = [
-        path.relative_to(root).as_posix()
-        for path in root.rglob("*.py")
-        if path.name != "plugin_manager.py" and pattern.search(path.read_text(encoding="utf-8"))
-    ]
-    assert hits == [], f"custom_scaffolds now has a reader ({hits}) — update UNDISPATCHED_GROUPS"
+    monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "scaf")
+    block = {"libraries": [{"id": "ci", "source": {"kind": "entrypoint", "name": "scaf"}}]}
+    with pytest.raises(FanoutError) as raised:
+        scaffold._check_plugins(block)
+    assert raised.value.code == "custom_scaffold_plugin_blocked"
 
 
 def test_installed_plugins_marks_an_undispatched_role(monkeypatch):
     monkeypatch.setattr(PM, "_entry_points", lambda group: [_FakeEP("scaf")])
+    monkeypatch.setattr(PM, "UNDISPATCHED_GROUPS", frozenset({"custom_scaffold"}))
     monkeypatch.delenv("FLUID_PLUGINS_ALLOWLIST", raising=False)
     monkeypatch.delenv("FLUID_PLUGINS_BLOCKLIST", raising=False)
     assert PM.installed_plugins("custom_scaffold")["custom_scaffold"][0]["dispatched"] is False

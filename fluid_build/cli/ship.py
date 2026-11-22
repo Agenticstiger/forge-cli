@@ -174,7 +174,7 @@ def _add_artifact_options(g: argparse._ArgumentGroup) -> None:
         "--emit",
         default=None,
         metavar="LIST",
-        help="Stage 3 --emit, comma-separated (default: $GENERATE_EMIT, all).",
+        help="Stage 3 --emit, comma-separated (default: $GENERATE_EMIT, else stage 3's own).",
     )
     g.add_argument(
         "--require-artifacts",
@@ -182,8 +182,8 @@ def _add_artifact_options(g: argparse._ArgumentGroup) -> None:
         default=None,
         metavar="LIST",
         help=(
-            "Stage 3 fails unless this run writes each (repeatable, comma-separated): odcs "
-            "(one per port), odps-bitol, opds, policies, schedule. Earlier runs' files never count."
+            "Stage 3 fails unless this run writes each (repeatable, comma-separated): any "
+            "--emit key but spark, odcs one per port. Earlier runs' files never count."
         ),
     )
 
