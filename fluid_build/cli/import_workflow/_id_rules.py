@@ -16,7 +16,6 @@ without a change here.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -71,7 +70,12 @@ def id_rules(version: str) -> IdRules:
 
 def _declared(version: str) -> "tuple[Dict[str, Any], Dict[str, Any]]":
     """The sub-schemas of the two ids in the bundled schema of ``version``."""
-    if not re.fullmatch(r"[0-9]+(\.[0-9]+)*", version):
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    # Which versions are bundled is the schema manager's to say (one list for every command);
+    # a manager itself is not built here: it opens the user's schema cache, which a dry run
+    # must not touch.
+    if version not in FluidSchemaManager.BUNDLED_VERSIONS:
         return _LOWER_CASE_ONLY, _LOWER_CASE_ONLY
     try:
         defs = json.loads((_SCHEMAS / f"fluid-schema-{version}.json").read_text(encoding="utf-8"))[

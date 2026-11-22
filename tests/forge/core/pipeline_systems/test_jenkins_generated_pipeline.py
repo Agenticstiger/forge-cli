@@ -108,9 +108,9 @@ def _environment_fallbacks(content: str) -> Dict[str, str]:
     )
 
 
-def test_the_default_emit_list_holds_every_default_key_but_opds():
+def test_the_default_emit_list_holds_every_default_key():
     """``GENERATE_EMIT`` is the stage-3 ``--emit`` a run gets: a key that joins stage 3's
-    default set joins it here (``opds`` was never in it). ``custom-scaffold`` is not in
+    default set joins it here. ``custom-scaffold`` is not in
     either: it runs the contract's bundle templates, which a pull-request build must not do
     unless the pipeline names it."""
     from fluid_build.forge.core.artifact_fanout import DEFAULT_EMIT
@@ -119,7 +119,7 @@ def test_the_default_emit_list_holds_every_default_key_but_opds():
     listed = _declared(content)["GENERATE_EMIT"]
     assert _environment_fallbacks(content)["GENERATE_EMIT"] == listed
     assert "custom-scaffold" not in listed.split(",")
-    assert set(DEFAULT_EMIT) - set(listed.split(",")) == {"opds"}
+    assert set(DEFAULT_EMIT) - set(listed.split(",")) == set()
 
 
 @pytest.fixture

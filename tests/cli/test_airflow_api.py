@@ -574,3 +574,34 @@ def test_an_https_airflow_whose_certificate_is_not_trusted_gets_nothing(
         )
         assert fake.requests == []
     assert "admin" not in error.message
+
+
+# ── a trickling answer ──────────────────────────────────────────────────
+
+
+def test_an_answer_that_trickles_in_is_cut_off_at_the_request_timeout():
+    import time
+
+    import httpx
+
+    class _Trickle(httpx.SyncByteStream):
+        def __iter__(self):
+            for _ in range(40):
+                time.sleep(0.05)  # each wait is short, so no single read times out
+                yield b" "
+
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, stream=_Trickle()))
+    client = AirflowApi(
+        "https://airflow.example.org",
+        Credentials.none(),
+        timeout=0.3,
+        attempts=1,
+        sleep=lambda s: None,
+        client=httpx.Client(transport=transport),
+    )
+
+    started = time.monotonic()
+    error = _raises(lambda: client.connect("v1"), "schedule_sync_airflow_unreachable")
+
+    assert time.monotonic() - started < 1.5, "the read ran past the request timeout"
+    assert error.transient

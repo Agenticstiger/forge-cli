@@ -80,7 +80,7 @@ class LocalValidationProvider(ValidationProvider):
         ],
         "TIME": ["TIME"],
         "BLOB": ["BLOB", "BINARY", "BYTES", "VARBINARY"],
-        "JSON": ["JSON", "JSONB", "VARIANT"],
+        "JSON": ["JSON", "JSONB", "VARIANT", "PARQUET_VARIANT"],
         "LIST": ["LIST", "ARRAY"],
         "STRUCT": ["STRUCT", "OBJECT", "RECORD"],
     }

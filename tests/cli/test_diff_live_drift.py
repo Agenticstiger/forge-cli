@@ -1667,3 +1667,9 @@ def test_a_missing_state_file_falls_back_to_the_live_comparison(workspace, caplo
     assert (rc, event) == (1, None), "live drift, not a missing-file error"
     assert report["drift_source"] == "live"
     assert "diff_state_not_found" in caplog.text
+
+
+def test_a_parquet_variant_column_is_in_the_family_of_a_variant_one():
+    from fluid_build.cli._diff_live import _local_family
+
+    assert _local_family("parquet_variant") == _local_family("variant") == "STRUCTURED"

@@ -327,16 +327,20 @@ def test_h01_error_lookup_cost_is_linear_in_the_number_of_errors(tmp_path: Path)
     manager = FluidSchemaManager()
     manager.validate_contract(composed.document, offline_only=True)  # warm the schema cache
 
-    start = time.perf_counter()
-    plain = manager.validate_contract(composed.document, offline_only=True)
-    without_lines = time.perf_counter() - start
-    start = time.perf_counter()
-    located = manager.validate_contract(
-        composed.document, offline_only=True, locate=composed.origins.describe
-    )
-    with_lines = time.perf_counter() - start
+    # CPU time, best of three: a loaded CI machine stretches wall-clock time but not the
+    # work done, and a quadratic lookup still shows at this size.
+    def best_cpu(**kwargs: object) -> float:
+        best = float("inf")
+        for _ in range(3):
+            start = time.process_time()
+            result = manager.validate_contract(composed.document, offline_only=True, **kwargs)
+            best = min(best, time.process_time() - start)
+            assert len(result.errors) == errors
+        return best
 
-    assert len(plain.errors) == len(located.errors) == errors
+    without_lines = best_cpu()
+    with_lines = best_cpu(locate=composed.origins.describe)
+
     assert with_lines <= 10 * without_lines + 1.0, (without_lines, with_lines)
 
 

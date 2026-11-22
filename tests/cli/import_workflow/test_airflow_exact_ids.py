@@ -176,8 +176,17 @@ class TestIdRules:
     def test_a_schema_that_holds_no_id_rule_gets_the_lower_case_rule(self, monkeypatch, tmp_path):
         (tmp_path / "fluid-schema-0.0.1.json").write_text('{"$defs": {}}', encoding="utf-8")
         monkeypatch.setattr(_id_rules, "_SCHEMAS", tmp_path)
+        monkeypatch.setattr(FluidSchemaManager, "BUNDLED_VERSIONS", ["0.0.1"])
         id_rules.cache_clear()
         try:
             assert id_rules("0.0.1").lower_case_only
+        finally:
+            id_rules.cache_clear()
+
+    def test_which_schemas_are_bundled_is_the_schema_managers_to_say(self, monkeypatch):
+        monkeypatch.setattr(FluidSchemaManager, "BUNDLED_VERSIONS", ["0.7.6"])
+        id_rules.cache_clear()
+        try:
+            assert id_rules("0.7.7").lower_case_only, "0.7.7 is not in the manager's list"
         finally:
             id_rules.cache_clear()

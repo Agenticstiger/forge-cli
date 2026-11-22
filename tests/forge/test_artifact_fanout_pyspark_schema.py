@@ -342,3 +342,13 @@ def test_the_cli_reports_a_column_spark_cannot_hold(
     text = " ".join(capsys.readouterr().out.split())
     assert rc == 1
     assert "unsupported_binding" in text and "where" in text
+
+
+def test_another_products_modules_are_replaced_not_refused(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    _fanout(_write(tmp_path / "p", ORDERS), out)
+    other = out / "pyspark-schema" / "orders_schema.py"
+    other.write_text(other.read_text().replace("acme.sales.orders", "acme.other.product"))
+    manifest = _fanout(_write(tmp_path / "q", ORDERS), out)
+    assert _rows(manifest) == ["pyspark-schema/orders_schema.py"]
+    assert "acme.other.product" not in other.read_text()

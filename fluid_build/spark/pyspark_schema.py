@@ -101,8 +101,9 @@ _STRUCT_NAMES = frozenset({"struct", "object", "record", "row"})
 #
 # Where the choice is not obvious: ``char`` and ``varchar`` are ``StringType()`` because a
 # DataFrame cannot hold ``CharType`` or ``VarcharType`` (Spark's migration guide: table schemas
-# only), so the length is a quality check, not a type; the ``timestamp`` family that carries a
-# zone is ``TimestampType()``, an instant, and the one that does not is
+# only), so the length is a quality check, not a type; ``TimestampType()`` (an instant) is the
+# ``timestamp`` family that carries a zone plus ``timestamp``, ``datetime``, ``datetime2`` and
+# ``smalldatetime`` as Glue reads them; only the explicit no-zone spellings are
 # ``TimestampNTZType()`` (Spark 3.3 and later); ``money`` is SQL Server's ``decimal(19,4)``;
 # ``year`` is MySQL's four-digit number, so ``smallint``; ``bit`` is the SQL Server 0/1 flag.
 _SPARK_TYPES = column_types.expand(

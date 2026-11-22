@@ -1495,3 +1495,18 @@ def test_tekton_runs_carry_the_change_request_marker_into_ship(install_mode):
     start = header.index("tkn pipeline start fluid-plan")
     plan_example = header[start : header.index("tkn pipeline start fluid-apply")]
     assert "-p FLUID_CHANGE_REQUEST=false" in plan_example
+
+
+def test_github_carried_files_upload_with_their_dot_folders():
+    workflow = next(
+        d for p, d in _documents(_files(P.GITHUB_ACTIONS)) if p.endswith("fluid-pipeline.yml")
+    )
+    uploads = [
+        s
+        for job in workflow["jobs"].values()
+        for s in job["steps"]
+        if "upload-artifact" in s.get("uses", "")
+    ]
+    assert uploads
+    for step in uploads:
+        assert step["with"].get("include-hidden-files") is True, step
