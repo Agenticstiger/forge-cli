@@ -1697,7 +1697,7 @@ class Folder:
     def _foreign(self, qualified: str, origin: ast.AST, depth: int) -> Any:
         """A constant of another module of the tree."""
         assert self.index is not None
-        found = self.index.resolve(qualified, self.module.rel)
+        found = self.index.resolve(qualified, self.module.index_rel or self.module.rel)
         if isinstance(found, str):
             return Unresolved(found, snippet(origin))
         module, chain = found

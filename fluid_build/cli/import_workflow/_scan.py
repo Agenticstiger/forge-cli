@@ -226,6 +226,8 @@ def scan_dags(
         except SourceUnreadable as exc:
             scan.unreadable[source.rel] = str(exc)
             continue
+        # ... and the one the index knows it by, which its imports are resolved from
+        module.index_rel = source.rel
         scan.files += 1
         folder = index.folder(module)
         found = read_dags(module, folder, operators=conventions.operators)

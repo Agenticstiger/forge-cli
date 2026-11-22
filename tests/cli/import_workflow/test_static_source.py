@@ -486,6 +486,46 @@ def test_a_config_module_outside_the_tree_is_found_by_name(tmp_path):
     assert index.folder(module).fold(node.value) == "outside"
 
 
+@pytest.mark.parametrize("where", ["project", "dags", "outside"])
+def test_a_dag_files_imports_resolve_whatever_the_working_directory(tmp_path, monkeypatch, where):
+    """A DAG file is shown by its path from the working directory, and its imports are resolved
+    from the path the scan knows it by: a relative import (and the file next door winning a name
+    two files answer to) does not depend on where the command runs."""
+    from fluid_build.cli.import_workflow._conventions import Conventions
+    from fluid_build.cli.import_workflow._scan import scan_dags
+
+    dag = (
+        "from airflow import DAG\n"
+        "from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator\n"
+        "from .settings import SCRIPT\n"
+        "from config import ARGS\n"
+        "with DAG('{name}', schedule=None) as dag:\n"
+        "    SparkSubmitOperator(task_id='t', application=SCRIPT, application_args=ARGS)\n"
+    )
+    _write(
+        tmp_path,
+        {
+            "proj/dags/a/dag.py": dag.format(name="a"),
+            "proj/dags/a/settings.py": "SCRIPT = 's3://code/jobs/a.py'\n",
+            "proj/dags/a/config.py": "ARGS = ['--from-a']\n",
+            "proj/dags/b/dag.py": dag.format(name="b"),
+            "proj/dags/b/settings.py": "SCRIPT = 's3://code/jobs/b.py'\n",
+            "proj/dags/b/config.py": "ARGS = ['--from-b']\n",
+        },
+    )
+    (tmp_path / "elsewhere").mkdir()
+    cwd = {"project": "proj", "dags": "proj/dags", "outside": "elsewhere"}[where]
+    monkeypatch.chdir(tmp_path / cwd)
+    scan = scan_dags(tmp_path / "proj" / "dags", Conventions())
+    got = {d.dag_id: [(s.script, s.args) for t in d.tasks for s in t.submits] for d in scan.dags}
+    assert got == {
+        "a": [("s3://code/jobs/a.py", ("--from-a",))],
+        "b": [("s3://code/jobs/b.py", ("--from-b",))],
+    }
+    if where == "project":
+        assert {d.file for d in scan.dags} == {"dags/a/dag.py", "dags/b/dag.py"}
+
+
 def test_an_unreadable_module_is_unresolved_and_remembered(tmp_path):
     _write(tmp_path, {"job.py": "from broken import T\nx = T\n", "broken.py": "def (:\n"})
     walk = P.find_python_files(tmp_path)
