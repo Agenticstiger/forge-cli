@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`fluid import airflow` finds the Spark jobs a DAG submits through a Python task's function.**
+  A `PythonOperator` (and a TaskFlow `@task`) used to be read no further, so a DAG that submits its
+  jobs from Python proposed nothing. Now the function it runs is followed, statically: nothing is
+  imported or run. A function of the project's own library is described by the new conventions key
+  `submit_helpers`: where its script is among its arguments (a keyword, a position, or a key path
+  into a dict argument such as `additional_params.script_path`), where its config file and the
+  script's arguments are, and what it submits to (the operators' kinds), read from the task's
+  `op_kwargs` and `op_args` (templated fields, so `{{ var.value.x }}` in them is filled), through
+  `functools.partial` and a `lambda` too. A function of the DAG files, or of another file of the
+  scan, is read without an entry: its body's `add_job_flow_steps` and `run_job_flow` steps (boto3
+  and the EMR hook), `start_job_run` with a `jobDriver` (EMR on EKS, EMR Serverless), a command it
+  runs through `subprocess` or `os.system`, and a `spark-submit` argument list it writes out, with
+  its parameters holding what the task passes and a function it calls followed (three calls deep).
+  A task's params record the function (`python_callable`) and the config file. The report counts
+  the functions tasks run that it could not read, and lists once each value a submitted script or
+  config file waits for that the conventions can give, with the tasks that wait for it (a constant
+  of a module outside the scan: name it under `config_modules`; an environment variable; an Airflow
+  Variable). Settings a DAG imports from the module next to it by its full package name
+  (`teamx.dags.nightly.settings`, the DAGs folder being on Airflow's path) are read, and the folder
+  reads `dict(...)`, `d.get(key, default)` and a function's parameters from its caller. A DAG file
+  goes through at most 200,000 calls and lists of the bodies it follows, and a function many tasks
+  run with the same arguments is read once.
+
 ### Fixed
+
+- **A relative import in a DAG file resolves whatever the working directory.** A DAG file is
+  shown by its path from the working directory, and its imports were resolved from that path too:
+  run from the repository root, `from .settings import SCRIPT` in `dags/pipe/dag.py` was looked up
+  as `dags.pipe.settings`, which the scan of `dags/` does not hold, and the file next door no
+  longer won a name two files answer to. Imports are now resolved from the path the scan knows the
+  file by.
 
 - **`fluid apply` no longer updates a live Iceberg table in place.** hashicorp/aws updates an
   `aws_glue_catalog_table` with an `UpdateTable` that carries no `VersionId`, after re-reading
@@ -46,29 +78,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.37.0] — 2026-11-22
 
 ### Added
-
-- **`fluid import airflow` finds the Spark jobs a DAG submits through a Python task's function.**
-  A `PythonOperator` (and a TaskFlow `@task`) used to be read no further, so a DAG that submits its
-  jobs from Python proposed nothing. Now the function it runs is followed, statically: nothing is
-  imported or run. A function of the project's own library is described by the new conventions key
-  `submit_helpers`: where its script is among its arguments (a keyword, a position, or a key path
-  into a dict argument such as `additional_params.script_path`), where its config file and the
-  script's arguments are, and what it submits to (the operators' kinds), read from the task's
-  `op_kwargs` and `op_args` (templated fields, so `{{ var.value.x }}` in them is filled), through
-  `functools.partial` and a `lambda` too. A function of the DAG files, or of another file of the
-  scan, is read without an entry: its body's `add_job_flow_steps` and `run_job_flow` steps (boto3
-  and the EMR hook), `start_job_run` with a `jobDriver` (EMR on EKS, EMR Serverless), a command it
-  runs through `subprocess` or `os.system`, and a `spark-submit` argument list it writes out, with
-  its parameters holding what the task passes and a function it calls followed (three calls deep).
-  A task's params record the function (`python_callable`) and the config file. The report counts
-  the functions tasks run that it could not read, and lists once each value a submitted script or
-  config file waits for that the conventions can give, with the tasks that wait for it (a constant
-  of a module outside the scan: name it under `config_modules`; an environment variable; an Airflow
-  Variable). Settings a DAG imports from the module next to it by its full package name
-  (`teamx.dags.nightly.settings`, the DAGs folder being on Airflow's path) are read, and the folder
-  reads `dict(...)`, `d.get(key, default)` and a function's parameters from its caller. A DAG file
-  goes through at most 200,000 calls and lists of the bodies it follows, and a function many tasks
-  run with the same arguments is read once.
 
 - **`fluid import airflow|pyspark` reads an estate whose code builds its commands in loops, picks
   its jobs by name, takes its environment from Airflow Variables, and groups its products by DAG
@@ -685,13 +694,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--impact` report.
 
 ### Fixed
-
-- **A relative import in a DAG file resolves whatever the working directory.** A DAG file is
-  shown by its path from the working directory, and its imports were resolved from that path too:
-  run from the repository root, `from .settings import SCRIPT` in `dags/pipe/dag.py` was looked up
-  as `dags.pipe.settings`, which the scan of `dags/` does not hold, and the file next door no
-  longer won a name two files answer to. Imports are now resolved from the path the scan knows the
-  file by.
 
 - **`fluid import` no longer shows part of a credential that it could not read whole, masks a bare
   Oracle login, and names the products whose findings it does not list.** An argument or a command
