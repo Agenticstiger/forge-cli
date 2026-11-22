@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional
 import pytest
 
 from fluid_build.cli.import_workflow import _pysource as P
+from fluid_build.cli.import_workflow._conventions import Conventions
 from fluid_build.cli.import_workflow._fold import (
     ABSENT,
     FoldedDict,
@@ -27,6 +28,11 @@ from fluid_build.cli.import_workflow._fold import (
     ModuleIndex,
     Unresolved,
     lookup,
+)
+from fluid_build.cli.import_workflow._scan import (
+    MAX_OWN_PACKAGE_LINES,
+    own_package_notes,
+    scan_dags,
 )
 
 
@@ -380,7 +386,10 @@ def test_dicts_lists_and_incomplete_containers():
     spread = _fold("x = {'a': 'b', **unknown}")
     assert not spread.complete
     assert isinstance(lookup(spread, "q"), Unresolved)  # might be in the spread
-    assert lookup(spread, "a") == "b"
+    # ... and so might `a`, which the spread then replaces
+    assert isinstance(lookup(spread, "a"), Unresolved)
+    after = _fold("x = {**unknown, 'a': 'b'}")
+    assert lookup(after, "a") == "b" and not after.complete
 
     merged = _fold("base = {'k': 'v'}\nx = {**base, 'o': 'p'}")
     assert merged == {"k": "v", "o": "p"} and merged.complete
@@ -393,6 +402,162 @@ def test_dicts_lists_and_incomplete_containers():
     assert "not in the dict" in _why(_fold("D = {'k': 'v'}\nx = D['z']"))
     assert isinstance(lookup(Unresolved("w"), "k"), Unresolved)
     assert isinstance(lookup("text", "k"), Unresolved)
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        ("x = dict(script='a.py', day=1)", {"script": "a.py", "day": 1}),
+        ("B = {'k': 'v'}\nx = dict(B, j='w')", {"k": "v", "j": "w"}),
+        ("B = {'k': 'v'}\nx = dict(**B, j='w')", {"k": "v", "j": "w"}),
+        ("x = dict()", {}),
+        ("D = {'k': 'v'}\nx = D.get('k')", "v"),
+        ("D = {'k': 'v'}\nx = D.get('nope', 'dflt')", "dflt"),
+        ("D = {'k': 'v'}\nx = D.get('nope')", None),
+        ("D = dict(k='v')\nx = D.get('k') + '!'", "v!"),
+        ("D = {1: 'one'}\nx = D.get(1)", "one"),
+    ],
+)
+def test_dict_calls_and_get_fold_as_the_literal_they_build(source, expected):
+    value = _fold(source)
+    assert value == expected and getattr(value, "complete", True)
+
+
+@pytest.mark.parametrize(
+    "source, why",
+    [
+        ("def dict(**kw):\n    return kw\nx = dict(k='v')", "the result of a call"),
+        ("dict = lambda **kw: kw\nx = dict(k='v')", "the result of a call"),
+        ("from acme import dict\nx = dict(k='v')", "the result of a call"),
+        ("x = dict([('k', 'v')])", "not a dict"),
+        ("x = dict({'a': 1}, {'b': 2})", "more than one mapping"),
+        ("import os\nD = {**os.environ}\nx = D.get('k', 'dflt')", "not a literal"),
+        ("D = {'k': 'v'}\nx = D.get(key)", "not defined"),
+        ("D = {'k': 'v'}\nx = D.get('k', default='d')", "dict.get with other arguments"),
+        ("D = {'k': 'v'}\nD['k'] = 'changed'\nx = D.get('k')", "the result of a call"),
+    ],
+)
+def test_a_dict_call_or_get_that_is_not_known_is_unresolved(source, why):
+    assert why in _why(_fold(source))
+
+
+@pytest.mark.parametrize(
+    "source, known, unknown",
+    [
+        ("x = {'a': 1, **{'b': 2}}", {"a": 1, "b": 2}, []),
+        ("x = {'a': 1, **unknown, 'c': 3}", {"c": 3}, ["a"]),
+        ("P = {**unknown, 'p': 0}\nx = {'a': 1, **P, 'c': 3}", {"p": 0, "c": 3}, ["a"]),
+        ("B = {'k': 'v'}\nx = dict(B, **unknown, j='w')", {"j": "w"}, ["k"]),
+        ("B = {'k': 'v'}\nx = dict(B, **{'m': 1}, j='w')", {"k": "v", "m": 1, "j": "w"}, []),
+    ],
+)
+def test_a_key_written_before_a_spread_that_is_not_all_known_is_not_known(source, known, unknown):
+    value = _fold(source)
+    assert isinstance(value, FoldedDict)
+    assert {k: lookup(value, k) for k in known} == known
+    for key in unknown:
+        assert isinstance(lookup(value, key), Unresolved)
+
+
+def test_an_incomplete_dict_call_keeps_what_it_knows_and_says_it_is_not_whole():
+    value = _fold("import os\nx = dict(**os.environ, k='v')")
+    assert isinstance(value, FoldedDict) and value["k"] == "v" and not value.complete
+    assert isinstance(lookup(value, "other"), Unresolved)
+
+
+def test_a_scope_knows_the_names_bound_by_one_def_and_the_parameters_bound_again():
+    module = P.parse_module(
+        "m.py",
+        (
+            "def once():\n    pass\n"
+            "def twice():\n    pass\n"
+            "def twice():\n    pass\n"
+            "def then_assigned():\n    pass\n"
+            "then_assigned = 1\n"
+            "with ctx:\n    def under_with():\n        pass\n"
+            "if flag:\n    def under_if():\n        pass\n"
+            "class Cls:\n    pass\n"
+            "def run(kept, again, added, looped, imported, *rest, **kwargs):\n"
+            "    again = again.strip()\n"
+            "    added += 1\n"
+            "    for looped in []:\n        pass\n"
+            "    import imported\n"
+            "    def inner():\n        pass\n"
+            "    return kept\n"
+        ).encode("utf-8"),
+    )
+    folder = Folder(module)
+    top = folder.scope_of(module.tree)
+    assert set(top.functions) == {"once", "under_with", "under_if", "run"}
+    run = top.functions["run"]
+    scope = folder.function_scope(run)
+    assert scope.parameters == {"kept", "again", "added", "looped", "imported", "rest", "kwargs"}
+    assert scope.rebound_parameters == {"again", "added", "looped", "imported"}
+    assert set(scope.functions) == {"inner"}
+
+
+def test_a_function_folded_with_what_its_caller_passes():
+    module = P.parse_module(
+        "m.py",
+        (
+            "ROOT = 's3://code'\n"
+            "def submit(script, day, **kwargs):\n"
+            "    path = f'{ROOT}/{script}'\n"
+            "    args = [path, kwargs['env'], day]\n"
+            "    def inner():\n        return script\n"
+            "    return args\n"
+        ).encode("utf-8"),
+    )
+    folder = Folder(module)
+    submit = module.tree.body[1]
+    assign = submit.body[1]  # args = [...]
+    inner_return = submit.body[2].body[0].value  # the `script` that inner() returns
+    assert "is a parameter" in _why(folder.fold(assign.value)[0])
+    env = FoldedDict({"env": "prod"})
+    with folder.bound(submit, {"script": "jobs/a.py", "kwargs": env}):
+        value = folder.fold(assign.value)
+        assert value[:2] == ["s3://code/jobs/a.py", "prod"]
+        assert "is a parameter" in _why(value[2])  # `day` is not passed
+        assert folder.fold(inner_return) == "jobs/a.py"  # a function inside sees it too
+    # nothing folded meanwhile is remembered for later
+    assert "is a parameter" in _why(folder.fold(assign.value)[0])
+    assert "is a parameter" in _why(folder.fold(inner_return))
+
+
+@pytest.mark.parametrize(
+    "why, expected",
+    [
+        ("`cfg.paths.ROOT` is not in the scanned files", ("module", "cfg.paths.ROOT")),
+        ("`ROOT` is imported from outside the scanned files", ("module", "ROOT")),
+        ("the environment variable ENV", ("environment", "ENV")),
+        ("the Airflow Variable region", ("airflow_variable", "region")),
+        ("the Airflow Variable region is read as JSON", None),
+        ("`day` is a parameter of the function", None),
+        ("the result of a call to f()", None),
+        ("an environment variable", None),
+    ],
+)
+def test_the_reasons_that_name_a_value_the_conventions_can_give(why, expected):
+    from fluid_build.cli.import_workflow._fold import missing_value
+
+    assert missing_value(why) == expected
+
+
+def test_the_reasons_the_folder_gives_are_the_ones_it_classifies(tmp_path):
+    from fluid_build.cli.import_workflow._fold import missing_value
+
+    _write(tmp_path, {"job.py": "from acme_cfg import ROOT\nx = f'{ROOT}/a.py'\n"})
+    walk = P.find_python_files(tmp_path)
+    index = ModuleIndex(walk.files)
+    module = index.load(walk.files[0])
+    assert module is not None
+    node = next(n for n in module.tree.body if isinstance(n, ast.Assign))
+    assert missing_value(_why(index.folder(module).fold(node.value))) == (
+        "module",
+        "acme_cfg.ROOT",
+    )
+    environment = _fold("import os\nx = os.environ['STAGE']")
+    assert missing_value(_why(environment)) == ("environment", "STAGE")
 
 
 def test_a_tuple_and_a_list_differ_as_percent_operands():
@@ -484,6 +649,296 @@ def test_a_config_module_outside_the_tree_is_found_by_name(tmp_path):
     assert module is not None
     node = next(n for n in module.tree.body if isinstance(n, ast.Assign))
     assert index.folder(module).fold(node.value) == "outside"
+
+
+def test_a_module_of_the_importing_files_own_package_is_found_by_its_full_name(tmp_path):
+    """The scanned directory may sit below the import root (Airflow puts the DAGs folder on the
+    path, and the files import ``teamx.dags.<dag>.settings``): a name that runs through the
+    importing file's own directory and goes on to a file there is that file."""
+    _write(
+        tmp_path,
+        {
+            "dags/nightly/dag.py": (
+                "from teamx.dags.nightly.settings import STEP\n"
+                "from teamx.dags.nightly import pkg\n"
+                "from teamx.dags.nightly.pkg.inner import DEEP\n"
+                "import teamx.dags.nightly.settings as cfg\n"
+                "from teamx.weekly.settings import WEEKLY\n"
+                "from teamx.dags.nightly.missing import GONE\n"
+                "a = STEP['script']\nb = pkg.X\nc = DEEP\nd = cfg.STEP['config']\n"
+                "e = WEEKLY\nf = GONE\n"
+            ),
+            "dags/nightly/settings.py": (
+                "STEP = {'script': 's3://code/a.py', 'config': 's3://code/a.yaml'}\n"
+            ),
+            "dags/nightly/pkg/__init__.py": "X = 'from the package'\n",
+            "dags/nightly/pkg/inner.py": "DEEP = 'deeper'\n",
+            "dags/weekly/settings.py": "WEEKLY = 'not next door'\n",
+            "dags/top.py": "from teamx.dags.settings import T\nt = T\n",
+            "dags/settings.py": "T = 'at the root'\n",
+        },
+    )
+    walk = P.find_python_files(tmp_path / "dags")
+    index = ModuleIndex(walk.files)
+    module = index.load(next(f for f in walk.files if f.rel == "nightly/dag.py"))
+    assert module is not None
+    folder = index.folder(module)
+    values = {
+        stmt.targets[0].id: folder.fold(stmt.value)  # type: ignore[attr-defined]
+        for stmt in module.tree.body
+        if isinstance(stmt, ast.Assign)
+    }
+    assert values["a"] == "s3://code/a.py" and values["d"] == "s3://code/a.yaml"
+    assert values["b"] == "from the package" and values["c"] == "deeper"
+    # a name that does not run through the importing file's directory is not guessed at
+    assert "is not in the scanned files" in _why(values["e"])
+    assert "is not in the scanned files" in _why(values["f"])
+    # a file at the root of the scan has no directory of its own to go by
+    top = index.load(next(f for f in walk.files if f.rel == "top.py"))
+    assert top is not None
+    node = next(n for n in top.tree.body if isinstance(n, ast.Assign))
+    assert "is not in the scanned files" in _why(index.folder(top).fold(node.value))
+
+
+OWN_PACKAGE_DAG = (
+    "from airflow import DAG\n"
+    "from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator\n"
+    "from teamx.dags.nightly.settings import SCRIPT\n"
+    "with DAG('nightly', schedule=None) as dag:\n"
+    "    SparkSubmitOperator(task_id='t', application=SCRIPT)\n"
+)
+
+
+def test_a_name_only_the_importing_files_own_package_vouches_for_is_said(tmp_path):
+    """Another library with a directory and a module of the same names would be read in its
+    place, so the scan says which file it read such a name as."""
+    files = {
+        "nightly/dag.py": OWN_PACKAGE_DAG,
+        "nightly/settings.py": "SCRIPT = 's3://code/a.py'\n",
+    }
+    _write(tmp_path / "dags", files)
+    scan = scan_dags(tmp_path / "dags", Conventions())
+    assert [s.script for d in scan.dags for t in d.tasks for s in t.submits] == ["s3://code/a.py"]
+    said = [n for n in scan.notes if "the module of that name in the file's own package" in n]
+    assert said == [
+        "nightly/dag.py: `teamx.dags.nightly.settings` is read as nightly/settings.py, the "
+        "module of that name in the file's own package (check that it is not another library's)"
+    ]
+    # a scan of `.../teamx/dags`: the directories' names say so too, and nothing is said
+    _write(tmp_path / "teamx" / "dags", files)
+    scan = scan_dags(tmp_path / "teamx" / "dags", Conventions())
+    assert [s.script for d in scan.dags for t in d.tasks for s in t.submits] == ["s3://code/a.py"]
+    assert not [n for n in scan.notes if "own package" in n]
+
+
+def test_the_names_read_through_the_own_package_are_said_one_by_one_up_to_a_bound(tmp_path):
+    index = ModuleIndex([])
+    for i in range(MAX_OWN_PACKAGE_LINES + 3):
+        index.own_package_names[(f"d{i:02d}/dag.py", f"teamx.d{i:02d}.settings")] = (
+            f"d{i:02d}/settings.py"
+        )
+    notes = own_package_notes(index, tmp_path)
+    assert len(notes) == MAX_OWN_PACKAGE_LINES + 1
+    assert notes[0].startswith("d00/dag.py: `teamx.d00.settings` is read as d00/settings.py")
+    assert notes[-1] == ("3 more module name(s) are read through the importing file's own package")
+
+
+def test_a_full_name_that_starts_with_the_names_of_the_scanned_directory_is_a_file_of_it(tmp_path):
+    """A scan of ``.../teamx/dags``: ``teamx.dags.common.paths`` is ``common/paths.py``, from any
+    file of the scan; a name that starts otherwise is not guessed at."""
+    _write(
+        tmp_path,
+        {
+            "teamx/dags/nightly/dag.py": (
+                "from teamx.dags.common.paths import ROOT\n"
+                "from dags.common.paths import ROOT as SHORT\n"
+                "from other.dags.common.paths import ROOT as OTHER\n"
+                "from teamx.dags.common import pkg_value\n"
+                "a = ROOT\nb = SHORT\nc = OTHER\nd = pkg_value\n"
+            ),
+            "teamx/dags/common/__init__.py": "pkg_value = 'from the package'\n",
+            "teamx/dags/common/paths.py": "ROOT = 's3://code'\n",
+        },
+    )
+    walk = P.find_python_files(tmp_path / "teamx" / "dags")
+    index = ModuleIndex(walk.files)
+    module = index.load(next(f for f in walk.files if f.rel == "nightly/dag.py"))
+    assert module is not None
+    folder = index.folder(module)
+    values = {
+        stmt.targets[0].id: folder.fold(stmt.value)  # type: ignore[attr-defined]
+        for stmt in module.tree.body
+        if isinstance(stmt, ast.Assign)
+    }
+    assert values["a"] == "s3://code" and values["b"] == "s3://code"
+    assert values["d"] == "from the package"
+    assert "is not in the scanned files" in _why(values["c"])
+
+
+def test_a_library_name_is_not_taken_for_a_module_of_the_scan(tmp_path):
+    """A directory of the scan named like a part of a library's name (``sql`` of
+    ``pyspark.sql``, ``conf`` of ``vendor.conf``) is not that library's package: its own
+    ``__init__.py`` is never what the name stands for, and a name that starts with the standard
+    library's or the scanned code's frameworks (``airflow``, ``pyspark``) is never the project's."""
+    _write(
+        tmp_path,
+        {
+            "jobs/sql/job.py": (
+                "from pyspark.sql import functions\n"
+                "from vendor.sql import TABLE\n"
+                "from airflow.sql.helpers import run_it\n"
+                "from logging.sql.helpers import run_it as other\n"
+                "a = functions\nb = TABLE\nc = run_it\nd = other\n"
+            ),
+            "jobs/sql/__init__.py": "functions = 'local'\nTABLE = 'retail.local'\n",
+            "jobs/sql/helpers.py": "run_it = 'local helper'\n",
+        },
+    )
+    walk = P.find_python_files(tmp_path / "jobs")
+    index = ModuleIndex(walk.files)
+    module = index.load(next(f for f in walk.files if f.rel == "sql/job.py"))
+    assert module is not None
+    folder = index.folder(module)
+    for node in (n.value for n in module.tree.body if isinstance(n, ast.Assign)):
+        assert "is not in the scanned files" in _why(folder.fold(node))
+
+
+def test_a_name_through_a_deeper_directory_must_match_all_of_its_path(tmp_path):
+    """From ``a/b/dag.py``, ``teamx.c.b.mod`` runs through a ``b`` that is not under ``a``: it is
+    not ``a/b/mod.py``; and the file next to the importing one is the one named, not a deeper
+    file whose path ends the same way."""
+    _write(
+        tmp_path,
+        {
+            "dags/a/b/dag.py": (
+                "from teamx.c.b.mod import X\n"
+                "from teamx.a.b.mod import X as Y\n"
+                "from teamx.a.b.settings import Z\n"
+                "x = X\ny = Y\nz = Z\n"
+            ),
+            "dags/a/b/mod.py": "X = 'here'\n",
+            "dags/old/a/b/settings.py": "Z = 'elsewhere'\n",
+        },
+    )
+    walk = P.find_python_files(tmp_path / "dags")
+    index = ModuleIndex(walk.files)
+    module = index.load(next(f for f in walk.files if f.rel == "a/b/dag.py"))
+    assert module is not None
+    folder = index.folder(module)
+    x, y, z = (n.value for n in module.tree.body if isinstance(n, ast.Assign))
+    assert "is not in the scanned files" in _why(folder.fold(x))
+    assert folder.fold(y) == "here"
+    assert "is not in the scanned files" in _why(folder.fold(z))
+
+
+@pytest.mark.parametrize("spelled", ["absolute", "dot", "relative"])
+def test_the_scanned_directory_names_do_not_depend_on_how_it_is_spelled(
+    tmp_path, monkeypatch, spelled
+):
+    _write(
+        tmp_path,
+        {
+            "teamx/dags/common/paths.py": "ROOT = 's3://code'\n",
+            "teamx/dags/nightly/dag.py": "from teamx.dags.common.paths import ROOT\nx = ROOT\n",
+        },
+    )
+    root = {
+        "absolute": tmp_path / "teamx" / "dags",
+        "dot": Path("."),
+        "relative": Path("dags"),
+    }[spelled]
+    monkeypatch.chdir(tmp_path / "teamx" / "dags" if spelled == "dot" else tmp_path / "teamx")
+    walk = P.find_python_files(root)
+    index = ModuleIndex(walk.files)
+    module = index.load(next(f for f in walk.files if f.rel == "nightly/dag.py"))
+    assert module is not None
+    node = next(n.value for n in module.tree.body if isinstance(n, ast.Assign))
+    assert index.folder(module).fold(node) == "s3://code"
+
+
+def test_a_name_of_too_many_parts_is_not_looked_for_below_the_import_root(tmp_path):
+    long = ".".join(["pkg"] * 30)
+    _write(
+        tmp_path,
+        {
+            "dags/nightly/dag.py": (
+                "from teamx.nightly.settings import T\n"
+                f"from {long}.nightly.settings import T as LONG\n"
+                "a = T\nb = LONG\n"
+            ),
+            "dags/nightly/settings.py": "T = 'found'\n",
+        },
+    )
+    walk = P.find_python_files(tmp_path / "dags")
+    index = ModuleIndex(walk.files)
+    module = index.load(next(f for f in walk.files if f.rel == "nightly/dag.py"))
+    assert module is not None
+    folder = index.folder(module)
+    first, second = (n.value for n in module.tree.body if isinstance(n, ast.Assign))
+    assert folder.fold(first) == "found"
+    assert "is not in the scanned files" in _why(folder.fold(second))
+
+
+def test_folding_lent_to_another_file_is_given_back_to_the_module(monkeypatch):
+    from fluid_build.cli.import_workflow import _fold
+
+    # a list of 40 folds in 41 steps: two of them do not fit a budget of 60
+    monkeypatch.setattr(_fold, "MAX_STEPS_PER_MODULE", 60)
+    words = ", ".join(f"'w{i}'" for i in range(40))
+    module = P.parse_module("m.py", f"A = [{words}]\nB = [{words}]\n".encode("utf-8"))
+    first, second = (n.value for n in module.tree.body)  # type: ignore[attr-defined]
+
+    alone = Folder(module)
+    alone.fold(first)
+    assert any(isinstance(item, Unresolved) for item in alone.fold(second))
+    assert alone.exhausted
+
+    lent = Folder(module)
+    with lent.lent() as spent:
+        assert all(isinstance(item, str) for item in lent.fold(first))
+    assert spent[0] >= 41
+    assert all(isinstance(item, str) for item in lent.fold(second))
+    assert not lent.exhausted
+
+
+@pytest.mark.parametrize("where", ["project", "dags", "outside"])
+def test_a_dag_files_imports_resolve_whatever_the_working_directory(tmp_path, monkeypatch, where):
+    """A DAG file is shown by its path from the working directory, and its imports are resolved
+    from the path the scan knows it by: a relative import (and the file next door winning a name
+    two files answer to) does not depend on where the command runs."""
+    from fluid_build.cli.import_workflow._conventions import Conventions
+    from fluid_build.cli.import_workflow._scan import scan_dags
+
+    dag = (
+        "from airflow import DAG\n"
+        "from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator\n"
+        "from .settings import SCRIPT\n"
+        "from config import ARGS\n"
+        "with DAG('{name}', schedule=None) as dag:\n"
+        "    SparkSubmitOperator(task_id='t', application=SCRIPT, application_args=ARGS)\n"
+    )
+    _write(
+        tmp_path,
+        {
+            "proj/dags/a/dag.py": dag.format(name="a"),
+            "proj/dags/a/settings.py": "SCRIPT = 's3://code/jobs/a.py'\n",
+            "proj/dags/a/config.py": "ARGS = ['--from-a']\n",
+            "proj/dags/b/dag.py": dag.format(name="b"),
+            "proj/dags/b/settings.py": "SCRIPT = 's3://code/jobs/b.py'\n",
+            "proj/dags/b/config.py": "ARGS = ['--from-b']\n",
+        },
+    )
+    (tmp_path / "elsewhere").mkdir()
+    cwd = {"project": "proj", "dags": "proj/dags", "outside": "elsewhere"}[where]
+    monkeypatch.chdir(tmp_path / cwd)
+    scan = scan_dags(tmp_path / "proj" / "dags", Conventions())
+    got = {d.dag_id: [(s.script, s.args) for t in d.tasks for s in t.submits] for d in scan.dags}
+    assert got == {
+        "a": [("s3://code/jobs/a.py", ("--from-a",))],
+        "b": [("s3://code/jobs/b.py", ("--from-b",))],
+    }
+    if where == "project":
+        assert {d.file for d in scan.dags} == {"dags/a/dag.py", "dags/b/dag.py"}
 
 
 def test_an_unreadable_module_is_unresolved_and_remembered(tmp_path):

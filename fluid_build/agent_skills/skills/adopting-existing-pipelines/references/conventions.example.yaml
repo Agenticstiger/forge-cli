@@ -16,6 +16,13 @@ helpers:                             # project functions that wrap Spark reads a
   write_table: {writes: table, arg: 1, format: iceberg}
 operators:                           # project operator classes that submit Spark work
   ProjectSparkOperator: spark_submit
+submit_helpers:                      # project functions a PythonOperator calls to submit Spark work
+  run_spark_step:                    #   its name (or the end of its dotted path)
+    script: script_path              #   the argument that holds the script (or 0, 1, ...)
+    config: "s3://{config_bucket}/{config_key}"  # the job's config file, built from arguments
+    kind: emr_add_steps              #   what it submits to, as under operators
+  run_spark_step_from_settings:
+    script: settings.script_path     #   a key inside a dict argument
 session_names: [spark, session]      # names whose .sql() and .table() are Spark's
 config_modules:                      # constants kept outside the scanned directory
   - {module: project_config.settings, path: libs/project_config/settings.py}

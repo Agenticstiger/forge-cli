@@ -11,8 +11,9 @@ show it and nothing is guessed.
 
 What it folds, and nothing else:
 
-* literals, tuples, lists, sets and dicts (a ``**spread`` or a ``*star`` that does not fold
-  leaves the container marked incomplete: :func:`lookup` then answers "unknown", never "absent");
+* literals, tuples, lists, sets and dicts, ``dict(...)`` of keywords and ``d.get(key, default)``
+  (a ``**spread`` or a ``*star`` that does not fold leaves the container marked incomplete:
+  :func:`lookup` then answers "unknown", never "absent", and ``get`` never its default);
 * f-strings with plain fields, ``+``, ``"%s" % x`` and ``"{}".format(x)`` with plain fields,
   and a few pure ``str`` methods. These run on this module's own code, never on ``str.format``
   or ``%`` of the project's text, so a hostile format string (``{:>999999999}``) cannot spend
@@ -35,12 +36,27 @@ There is no ``eval``, no ``ast.literal_eval`` and no import of anything the proj
 from __future__ import annotations
 
 import ast
+import os
 import posixpath
 import re
+import sys
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 from ._pysource import (
     MAX_CACHED_NODES,
@@ -54,6 +70,14 @@ from ._pysource import (
     snippet,
 )
 
+#: Directory names above the scanned files a dotted name may start with, and the most parts a
+#: name may have to be looked for below the import root (see
+#: :meth:`ModuleIndex._below_the_import_root`): a real import has a few.
+MAX_ROOT_NAMES = 12
+MAX_NAME_PARTS = 24
+#: Names a dotted name starting with which is never a module of the scanned project: the standard
+#: library's and the frameworks the scanned code runs on.
+NOT_THE_PROJECT = frozenset(sys.stdlib_module_names) | {"airflow", "pyspark"}
 #: Deepest expression :meth:`Folder.fold` follows, and the longest string it builds.
 MAX_FOLD_DEPTH = 40
 MAX_STRING = 4096
@@ -119,6 +143,41 @@ class Unresolved:
 
     def __repr__(self) -> str:
         return f"Unresolved({self.why!r}, {self.text!r})"
+
+
+#: The reasons that name a value the operator can give in the conventions, kept beside the code
+#: that gives them (see :func:`missing_value`).
+WHY_NOT_SCANNED = "`{}` is not in the scanned files"
+WHY_OUTSIDE = "`{}` is imported from outside the scanned files"
+WHY_ENVIRONMENT = "the environment variable {}"
+WHY_VARIABLE = "the Airflow Variable {}"
+WHY_VARIABLE_JSON = "the Airflow Variable {} is read as JSON"
+
+
+def _why_pattern(template: str) -> "re.Pattern[str]":
+    return re.compile(re.escape(template).replace(re.escape("{}"), "(.{1,500})"), re.DOTALL)
+
+
+_MISSING = (
+    (_why_pattern(WHY_VARIABLE_JSON), None),
+    (_why_pattern(WHY_NOT_SCANNED), "module"),
+    (_why_pattern(WHY_OUTSIDE), "module"),
+    (_why_pattern(WHY_ENVIRONMENT), "environment"),
+    (_why_pattern(WHY_VARIABLE), "airflow_variable"),
+)
+
+
+def missing_value(why: str) -> Optional[Tuple[str, str]]:
+    """What ``why`` says a value waits for, when the conventions can give it: ``("module",
+    "cfg.paths.ROOT")`` for a name of a module outside the scanned files (``config_modules``),
+    ``("environment", "ENV")`` for an environment variable (``environments``), ``("airflow_variable",
+    "region")`` for an Airflow Variable (``airflow_variables``); ``None`` for any other reason (a
+    parameter, the result of a call, a Variable read as JSON)."""
+    for pattern, kind in _MISSING:
+        found = pattern.fullmatch(why)
+        if found:
+            return None if kind is None else (kind, found.group(1))
+    return None
 
 
 class FoldedList(list):
@@ -249,6 +308,16 @@ class Scope:
     recipes: Dict[str, Recipe] = field(default_factory=dict)
     #: The parameters of the function: values that come from the caller.
     parameters: Set[str] = field(default_factory=set)
+    #: The parameters the body binds again (``script = script.strip()``, a loop over one, ``+=``):
+    #: past that binding the name no longer holds what the caller passed.
+    rebound_parameters: Set[str] = field(default_factory=set)
+    #: Names bound by exactly one ``def`` here and in no other way: the function a call of the
+    #: name runs.
+    functions: Dict[str, ast.AST] = field(default_factory=dict)
+    #: Names bound by one ``def`` and one plain assignment outside any loop, in no other way
+    #: (``extract = PythonOperator(..., python_callable=extract)``), with the function and the
+    #: assigned value: between the two, and in that value, the name is the function.
+    shadowed_functions: Dict[str, Tuple[ast.AST, ast.expr]] = field(default_factory=dict)
 
 
 #: Called with no argument, these are the names of the module (or class) body they are in; inside a
@@ -699,9 +768,14 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
     #: Each plain assignment of a name, and the names written in any other way.
     plain: Dict[str, List[ast.expr]] = {}
     other: Set[str] = set()
+    #: The ``def`` statements of each name, and how many times each name is bound in all.
+    defs: Dict[str, List[ast.AST]] = {}
+    bindings: Dict[str, int] = {}
+    loops: List[ast.stmt] = []
 
     def block(name: str, why: str) -> None:
         other.add(name)
+        bindings[name] = bindings.get(name, 0) + 1
         scope.values.pop(name, None)
         if scope.blocked.get(name) == "imported":  # imported, then bound some other way here
             scope.blocked[name] = why
@@ -710,6 +784,7 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
 
     def record(name: str, value: ast.expr) -> None:
         plain.setdefault(name, []).append(value)
+        bindings[name] = bindings.get(name, 0) + 1
         if name in scope.blocked:
             if scope.blocked[name] == "imported":
                 scope.blocked[name] = f"`{name}` is assigned after it is imported"
@@ -739,6 +814,7 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
         node = stack.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             block(node.name, f"`{node.name}` is a function")
+            defs.setdefault(node.name, []).append(node)
         elif isinstance(node, ast.ClassDef):
             scope.classes[node.name] = node
             block(node.name, f"`{node.name}` is a class")
@@ -757,6 +833,7 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
                 for name in _target_names(node.target):
                     block(name, f"`{name}` is changed in place")
         elif isinstance(node, (ast.For, ast.AsyncFor)):
+            loops.append(node)
             for name in _target_names(node.target):
                 block(name, f"`{name}` is a loop variable")
             stack.extend(reversed(node.body + node.orelse))
@@ -767,6 +844,8 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
                         block(name, f"`{name}` is a context-manager result")
             stack.extend(reversed(node.body))
         elif isinstance(node, (ast.If, ast.While)):
+            if isinstance(node, ast.While):
+                loops.append(node)
             stack.extend(reversed(node.body + node.orelse))
         elif isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
             for handler in node.handlers:
@@ -779,6 +858,7 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
                 name = (alias.asname or alias.name).split(".")[0]
                 if name != "*":
                     other.add(name)
+                    bindings[name] = bindings.get(name, 0) + 1
                     scope.blocked.setdefault(name, "imported")
                     scope.values.pop(name, None)
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
@@ -799,7 +879,26 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
         for name, values in plain.items()
         if len(values) > 1 and name not in other
     }
+    # a parameter is bound once by the call; a def once by itself
+    scope.rebound_parameters = {name for name in scope.parameters if bindings[name] > 1}
+    scope.functions = {name: found[0] for name, found in defs.items() if bindings[name] == 1}
+    for name, written in defs.items():
+        values = plain.get(name, [])
+        if bindings[name] == 2 and len(values) == 1:  # the def and the assignment
+            function, value = written[0], values[0]
+            if not any(
+                node_position(loop) <= node_position(value) <= node_position(loop, end=True)
+                for loop in loops
+            ):
+                scope.shadowed_functions[name] = (function, value)
     return scope
+
+
+def node_position(node: ast.AST, end: bool = False) -> Tuple[int, int]:
+    """Where ``node`` starts (or ends) in its file, as ``(line, column)``."""
+    if end:
+        return (node.end_lineno or 0, node.end_col_offset or 0)  # type: ignore[attr-defined]
+    return (node.lineno, node.col_offset)  # type: ignore[attr-defined]
 
 
 # ── formatting, on this module's own code ─────────────────────────────
@@ -987,8 +1086,19 @@ class ModuleIndex:
         self.unreadable: Dict[str, str] = {}
         #: What this scan has read, in all: every read of a source file counts against it.
         self.budget = budget if budget is not None else SourceBudget()
+        #: The names of the scanned directory and the directories above it, nearest last (see
+        #: :meth:`_below_the_import_root`).
+        self._root_names: Tuple[str, ...] = ()
+        #: The module names only the importing file's own package vouches for, by ``(importing
+        #: file, name)``, with the file each is read as: another library of the same names would
+        #: be read in its place, so the report says each one.
+        self.own_package_names: Dict[Tuple[str, str], str] = {}
         for source in files:
             parts = source.rel[: -len(".py")].split("/")
+            if not self._root_names:
+                # absolute (without following links): `.` and `dags` name the same directory
+                absolute = Path(os.path.abspath(source.path)).parts
+                self._root_names = tuple(absolute[: -len(parts)])[-MAX_ROOT_NAMES:]
             if parts[-1] == "__init__":
                 parts = parts[:-1]
             for start in range(len(parts)):
@@ -1095,7 +1205,80 @@ class ModuleIndex:
                 return f"more than one scanned file answers to the module name `{dotted}`"
             if len(candidates) == 1:
                 return candidates[0], parts[cut:]
-        return f"`{qualified}` is not in the scanned files"
+        below = self._below_the_import_root(parts, from_rel)
+        if below is not None:
+            return below
+        return WHY_NOT_SCANNED.format(qualified)
+
+    def _file(self, package: Sequence[str], rest: Sequence[str]) -> Optional[SourceFile]:
+        """The scanned file ``package/rest...`` (a module, or a package's ``__init__.py``)."""
+        names = [*package, *rest]
+        if not names:
+            return None
+        rel = "/".join(names)
+        for source in self._dotted.get(".".join(names), ()):
+            if source.rel == f"{rel}/__init__.py" or (rest and source.rel == f"{rel}.py"):
+                return source
+        return None
+
+    def _below_the_import_root(
+        self, parts: Sequence[str], from_rel: str
+    ) -> Optional[Tuple[SourceFile, List[str]]]:
+        """A name whose leading parts are packages the scan does not see, because the scanned
+        directory sits below the import root (Airflow puts the DAGs folder on the path, and the
+        files import ``teamx.dags.nightly.settings``). It is a file of the scan, by two anchors:
+
+        * the name runs through the importing file's own directory, or a parent of it inside the
+          scan (``nightly`` for ``nightly/dag.py``), and goes on to a file there
+          (``nightly/settings.py``): the package the importing file is in is the one the name
+          ends in;
+        * its leading parts are the names of the scanned directory and the directories above it
+          (``teamx.dags`` for a scan of ``.../teamx/dags``), and the rest is a file of the scan.
+
+        A name that fits neither is not guessed at (``teamx.weekly.settings`` from
+        ``nightly/dag.py`` of a scan of a directory named otherwise), nor is one of more than
+        :data:`MAX_NAME_PARTS` parts."""
+        if len(parts) > MAX_NAME_PARTS or parts[0] in NOT_THE_PROJECT:
+            return None
+        own = self._in_own_package(parts, from_rel)
+        if own is None:
+            return self._under_the_root_names(parts)
+        if self._under_the_root_names(parts) != own:  # the directories' names do not vouch for it
+            name = ".".join(parts[: len(parts) - len(own[1])])
+            self.own_package_names[(from_rel, name)] = own[0].rel
+        return own
+
+    def _in_own_package(
+        self, parts: Sequence[str], from_rel: str
+    ) -> Optional[Tuple[SourceFile, List[str]]]:
+        here = from_rel.split("/")[:-1]
+        for depth in range(len(here), 0, -1):  # the importing file's directory, then its parents
+            package = here[:depth]
+            for at in range(len(parts) - 2, -1, -1):
+                if parts[at] != package[-1]:
+                    continue
+                head = parts[: at + 1]
+                common = min(len(head), len(package))
+                if list(head[-common:]) != package[-common:]:
+                    continue
+                # a module of the package, not the package itself: ``pyspark.sql.functions`` from
+                # ``sql/job.py`` is not ``sql/__init__.py``'s ``functions``
+                for cut in range(len(parts) - 1, at + 1, -1):
+                    found = self._file(package, parts[at + 1 : cut])
+                    if found is not None:
+                        return found, list(parts[cut:])
+        return None
+
+    def _under_the_root_names(self, parts: Sequence[str]) -> Optional[Tuple[SourceFile, List[str]]]:
+        names = self._root_names
+        for size in range(min(len(names), len(parts) - 1), 0, -1):
+            if list(parts[:size]) != list(names[len(names) - size :]):
+                continue
+            for cut in range(len(parts) - 1, size, -1):
+                found = self._file((), parts[size:cut])
+                if found is not None:
+                    return found, list(parts[cut:])
+        return None
 
 
 # ── the folder ────────────────────────────────────────────────────────
@@ -1194,6 +1377,40 @@ class Folder:
         for owner in reversed(chain):
             scope = self._scope(owner, scope)
         return scope
+
+    def function_scope(self, function: ast.AST) -> Scope:
+        """The scope of the body of ``function`` (a ``def`` or a ``lambda`` of this module)."""
+        return self._scope(function, self.scope_of(function))
+
+    @contextmanager
+    def bound(self, function: ast.AST, values: Mapping[str, Any]) -> Iterator[None]:
+        """Fold with the parameters of ``function`` holding ``values``, what a caller passes: in
+        its body (and the functions inside it) such a name is that value, as a loop variable is
+        the item of the pass being read. Nothing is remembered meanwhile (see :meth:`fold`). A
+        parameter the body binds again is the caller's to leave out (see
+        :attr:`Scope.rebound_parameters`)."""
+        if not values:
+            yield
+            return
+        self._env.append((self.function_scope(function), dict(values)))
+        try:
+            yield
+        finally:
+            self._env.pop()
+
+    @contextmanager
+    def lent(self) -> Iterator[List[int]]:
+        """Fold for another file's reader, which counts the cost: the steps and characters of
+        string the folds take meanwhile are given back to this module afterwards, so a module
+        that the tasks of many files reach does not run out for the files read last. Yields
+        ``[steps, characters]``, filled in once the block ends."""
+        steps, work, exhausted = self._steps_module, self._work, self.exhausted
+        spent = [0, 0]
+        try:
+            yield spent
+        finally:
+            spent[0], spent[1] = self._steps_module - steps, self._work - work
+            self._steps_module, self._work, self.exhausted = steps, work, exhausted
 
     def how_bound(self, node: ast.Name) -> str:
         """How the name ``node`` is bound where it is used: ``"once"`` (one assignment),
@@ -1388,11 +1605,13 @@ class Folder:
         for key_node, value_node in list(zip(node.keys, node.values, strict=True))[:MAX_ITEMS]:
             if key_node is None:  # **spread
                 spread = self.fold(value_node, scope, depth)
+                if not isinstance(spread, dict) or not getattr(spread, "complete", True):
+                    # what it holds is not all known, and any of it replaces a key written
+                    # before it: those are not known either
+                    result.clear()
+                    complete = False
                 if isinstance(spread, dict):
                     result.update(spread)
-                    complete = complete and getattr(spread, "complete", True)
-                else:
-                    complete = False
                 continue
             key = self.fold(key_node, scope, depth)
             if isinstance(key, (str, int)) and not isinstance(key, bool):
@@ -1529,12 +1748,21 @@ class Folder:
                 names = [a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)]
                 names += [a.arg for a in (args.vararg, args.kwarg) if a is not None]
                 if node.id in names:
+                    if self._is_bound(current, node.id):
+                        return None  # a caller's value, folded through the lambda's scope
                     return f"`{node.id}` is a parameter of a lambda"
             elif isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 break
             child = current
             current = parents.get(current)
         return None
+
+    def _is_bound(self, function: ast.AST, name: str) -> bool:
+        """Whether a caller's value is bound to the parameter ``name`` of ``function``."""
+        scope = self._scopes.get(function)
+        return scope is not None and any(
+            owner is scope and name in frame for owner, frame in self._env
+        )
 
     def _loop_item(self, name: str, scope: Scope) -> Any:
         """What the loop being unrolled gives ``name`` in ``scope``, else :data:`ABSENT`: the
@@ -1689,15 +1917,13 @@ class Folder:
     def _imported(self, name: str, origin: ast.AST, depth: int) -> Any:
         qualified = self.module.imports.get(name)
         if qualified is None or self.index is None:
-            return Unresolved(
-                f"`{name}` is imported from outside the scanned files", snippet(origin)
-            )
+            return Unresolved(WHY_OUTSIDE.format(name), snippet(origin))
         return self._foreign(qualified, origin, depth)
 
     def _foreign(self, qualified: str, origin: ast.AST, depth: int) -> Any:
         """A constant of another module of the tree."""
         assert self.index is not None
-        found = self.index.resolve(qualified, self.module.rel)
+        found = self.index.resolve(qualified, self.module.index_rel or self.module.rel)
         if isinstance(found, str):
             return Unresolved(found, snippet(origin))
         module, chain = found
@@ -1817,7 +2043,7 @@ class Folder:
             return Unresolved("an environment variable", snippet(origin))
         if key in self.variables:
             return self.variables[key]
-        return Unresolved(f"the environment variable {key}", snippet(origin))
+        return Unresolved(WHY_ENVIRONMENT.format(key), snippet(origin))
 
     def _airflow_variable(self, node: ast.Call, scope: Scope, depth: int) -> Any:
         """``Variable.get("name", ...)`` from the operator's ``airflow_variables``, else
@@ -1842,10 +2068,10 @@ class Folder:
         if len(node.args) >= 3:
             as_json.append(node.args[2])
         if any(not (isinstance(v, ast.Constant) and v.value is False) for v in as_json):
-            return Unresolved(f"the Airflow Variable {name} is read as JSON", snippet(node))
+            return Unresolved(WHY_VARIABLE_JSON.format(name), snippet(node))
         if name in self.airflow_variables:
             return self.airflow_variables[name]
-        return Unresolved(f"the Airflow Variable {name}", snippet(node))
+        return Unresolved(WHY_VARIABLE.format(name), snippet(node))
 
     def _fold_Call(self, node: ast.Call, scope: Scope, depth: int) -> Any:
         func = node.func
@@ -1868,11 +2094,84 @@ class Folder:
             return Unresolved(
                 value.why if isinstance(value, Unresolved) else "not text", snippet(node)
             )
+        if qualified == "dict" and self._is_builtin("dict", scope):
+            return self._dict_call(node, scope, depth)
         if isinstance(func, ast.Attribute):
-            receiver = self.fold(func.value, scope, depth)
-            if isinstance(receiver, str):
-                return self._str_method(receiver, func.attr, node, scope, depth)
+            found = self._method(func, node, scope, depth)
+            if found is not ABSENT:
+                return found
         return Unresolved(f"the result of a call to {snippet(func, 40)}()", snippet(node))
+
+    def _method(self, func: ast.Attribute, node: ast.Call, scope: Scope, depth: int) -> Any:
+        """A method of a string or a dict that folds; :data:`ABSENT` for any other call."""
+        receiver = self.fold(func.value, scope, depth)
+        if isinstance(receiver, str):
+            return self._str_method(receiver, func.attr, node, scope, depth)
+        if isinstance(receiver, dict) and func.attr == "get":
+            return self._dict_get(receiver, node, scope, depth)
+        return ABSENT
+
+    def _is_builtin(self, name: str, scope: Scope) -> bool:
+        """Whether ``name`` here is Python's own: nothing in the file binds, imports or rebinds
+        it."""
+        return (
+            self._binding_scope(name, scope) is None
+            and name not in self.module.imports
+            and not self.rebound(name)
+        )
+
+    def _dict_call(self, node: ast.Call, scope: Scope, depth: int) -> Any:
+        """``dict(...)`` as the dict literal it builds: its keywords, a mapping given first and
+        ``**spreads`` (one that does not fold leaves it incomplete, as in a literal)."""
+        if len(node.args) > 1 or any(isinstance(arg, ast.Starred) for arg in node.args):
+            return Unresolved("a call to dict() with more than one mapping", snippet(node))
+        result = FoldedDict()
+        complete = True
+        if node.args:
+            first = self.fold(node.args[0], scope, depth)
+            if not isinstance(first, dict):
+                why = (
+                    first.why
+                    if isinstance(first, Unresolved)
+                    else "dict() of a value that is not a dict"
+                )
+                return Unresolved(why, snippet(node))
+            result.update(first)
+            complete = getattr(first, "complete", True)
+        named: Dict[str, Any] = {}  # a keyword cannot be passed twice: these are as written
+        for keyword in node.keywords[:MAX_ITEMS]:
+            if keyword.arg is None:
+                spread = self.fold(keyword.value, scope, depth)
+                if not isinstance(spread, dict) or not getattr(spread, "complete", True):
+                    result.clear()  # the mapping's keys may be replaced by what it holds
+                    complete = False
+                if isinstance(spread, dict):
+                    result.update(spread)
+            else:
+                named[keyword.arg] = self.fold(keyword.value, scope, depth)
+        result.update(named)
+        result.complete = complete and len(node.keywords) <= MAX_ITEMS
+        return result
+
+    def _dict_get(self, receiver: Dict[Any, Any], node: ast.Call, scope: Scope, depth: int) -> Any:
+        """``d.get(key)`` and ``d.get(key, default)`` of a dict that folds: the default is the
+        answer only when a whole dict does not hold the key."""
+        if (
+            node.keywords
+            or not 1 <= len(node.args) <= 2
+            or any(isinstance(arg, ast.Starred) for arg in node.args)
+        ):
+            return Unresolved("a call to dict.get with other arguments", snippet(node))
+        key = self.fold(node.args[0], scope, depth)
+        if not isinstance(key, (str, int)) or isinstance(key, bool):
+            why = key.why if isinstance(key, Unresolved) else "a key that is not text or a number"
+            return Unresolved(why, snippet(node))
+        found = lookup(receiver, key)
+        if found is ABSENT:
+            return self.fold(node.args[1], scope, depth) if len(node.args) == 2 else None
+        if isinstance(found, Unresolved) and not found.text:
+            return Unresolved(found.why, snippet(node))
+        return found
 
     def _str_method(
         self, receiver: str, method: str, node: ast.Call, scope: Scope, depth: int

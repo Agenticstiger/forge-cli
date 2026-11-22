@@ -26,6 +26,12 @@ be silently ignored), and a size cap and the alias limits of
       write_table: {writes: table, arg: 1, format: iceberg}
     operators:                       # project operator classes that submit Spark work
       AcmeSparkOperator: spark_submit
+    submit_helpers:                  # project functions a Python task calls to submit Spark work
+      run_spark_step:                #   its name (or the end of its dotted path: emr.run_spark_step)
+        script: script_path          #   where the script is among its arguments
+        args: job_args               #   where the script's arguments are (a list), if anywhere
+        config: "s3://{bucket}/{key}"  #   where the job's config file is, if anywhere
+        kind: emr_add_steps          #   what it submits to, as under operators (spark_submit)
     drivers:                         # a script a task submits that runs jobs by name
       - script: driver.py            #   (its file name, or its last segments)
         argument: --job-list         #   the flag whose value names the list (or a position, 0..)
@@ -59,7 +65,9 @@ file's own directory or inside a directory the user named on the command line (t
 and ``--dags``): a path that leaves them all (``..``, an absolute path, a link that points out) is
 refused, checked on the resolved path. So a conventions file cannot make the scan read a file from
 somewhere the user did not point it at, and it may sit in a folder of its own beside the
-repositories it describes (``config/conventions.yaml``).
+repositories it describes (``config/conventions.yaml``). A path that names nothing where it
+resolves (a file moved away from the folder its paths were written from) is a line of the report,
+with the tasks it leaves unjoined.
 
 ``external_consumers`` names the outputs that something outside the scanned code reads (a
 dashboard, another team's job): a table (``db.table`` or ``catalog.db.table``, in any case), a topic or a path as the
@@ -73,6 +81,18 @@ Only data is read: the list is a YAML file in ``dir`` (bounded, safe, never run)
 the job names (without ``key``, the file is the list), and each name is a file name in the jobs
 ``dir``. The task is then joined to every job file the list names. A name or a value that is not a
 plain file name (a ``/``, a ``..``) and a path that leaves its ``dir`` are refused.
+
+``submit_helpers`` names the project's own functions that submit Spark work, which a
+``PythonOperator`` runs (``python_callable=emr.run_spark_step``, ``op_kwargs={...}``) or another
+function of the scan calls. Their own code is not read (it is usually in a library outside the
+scan); each entry says where the script is among the arguments the function is given: a keyword
+(``script_path``), a position (``0``), or a key path into one (``additional_params.script_path``,
+for a function given a whole dict of settings), and ``config`` likewise for the config file the job
+reads. Either may be a text with arguments in braces (``"s3://{bucket}/{key}"``). ``kind`` is what
+the function submits to, one of the operators' kinds (``spark_submit`` when not given). A name
+matches the function a task names by its last parts: ``run_spark_step`` matches
+``tasks.emr.run_spark_step``. A function of the DAG files themselves needs no entry: its body is
+read (an EMR step list, a ``spark-submit`` it runs).
 
 ``airflow_variables`` is read like ``environments``: the names of an Airflow Variable and what each
 holds in an environment. ``Variable.get("x")``, ``Variable.get("x", default_var=...)`` (Airflow 2),
@@ -100,6 +120,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from ._airflow_dags import SUBMIT_KINDS
+from ._callables import HELPER_KINDS, Place, SubmitHelper, Template
 from ._pysource import clean_chars
 from ._redact import sensitive_name
 from ._spark_io import HelperSpec
@@ -119,6 +140,7 @@ _TOP_KEYS = frozenset(
         "paths",
         "helpers",
         "operators",
+        "submit_helpers",
         "drivers",
         "external_consumers",
         "session_names",
@@ -194,6 +216,8 @@ class Conventions:
     paths: Tuple[PathRule, ...] = ()
     helpers: Mapping[str, HelperSpec] = field(default_factory=dict)
     operators: Mapping[str, str] = field(default_factory=dict)
+    #: A project's own functions that submit Spark work, by name (see the module docstring).
+    submit_helpers: Mapping[str, SubmitHelper] = field(default_factory=dict)
     drivers: Tuple[Driver, ...] = ()
     #: Outputs something outside the scanned code reads, lower case (see the module docstring).
     external_consumers: Tuple[str, ...] = ()
@@ -360,7 +384,9 @@ def _local(
             path,
             where,
             f"{text!r} leaves the directory of the conventions file and the directories named on "
-            "the command line: keep what the scan reads inside one of them",
+            "the command line: keep what the scan reads inside one of them (put the conventions "
+            "file in the folder that holds the repositories it names, or name the directory on "
+            "the command line: `fluid import pyspark <jobs-dir> --dags <dags-dir>`)",
         )
     return resolved
 
@@ -466,6 +492,70 @@ def _driver(
         ),
         jobs_dir=_local(base, jobs["dir"], source, f"{where}.jobs.dir", named),
         job_file=_file_template(jobs["file"], source, f"{where}.jobs.file", "job"),
+    )
+
+
+#: Where a submit helper's value is: a keyword or a position, then keys into it.
+_PLACE = re.compile(r"(?:[0-9]{1,4}|[A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z0-9_\-]+)*")
+_PLACE_FIELD = re.compile(r"\{([^{}]*)\}")
+_PLACE_HELP = (
+    "expected an argument: a keyword (script_path), a position (0, 1, ...) or a key path into "
+    "one (additional_params.script_path)"
+)
+
+
+def _place(value: Any, path: Optional[Path], where: str) -> Place:
+    if isinstance(value, int) and not isinstance(value, bool):
+        if not 0 <= value <= 1_000:
+            raise _fail(path, where, "a position is 0 or more")
+        return value, ()
+    text = _text(value, path, where)
+    if not _PLACE.fullmatch(text):
+        raise _fail(path, where, f"{text!r}: {_PLACE_HELP}")
+    head, *keys = text.split(".")
+    return (int(head) if head.isdigit() else head), tuple(keys)
+
+
+def _helper_text(value: Any, path: Optional[Path], where: str) -> Template:
+    """A submit helper's script or config: an argument, or a text with arguments in braces
+    (``s3://{bucket}/{key}``)."""
+    if not isinstance(value, str) or ("{" not in value and "}" not in value):
+        return (_place(value, path, where),)
+    text = _text(value, path, where)
+    parts: List[Any] = []
+    at = 0
+    for found in _PLACE_FIELD.finditer(text):
+        literal = text[at : found.start()]
+        if "{" in literal or "}" in literal:
+            break
+        if literal:
+            parts.append(literal)
+        parts.append(_place(found.group(1), path, f"{where} {{{found.group(1)}}}"))
+        at = found.end()
+    else:
+        if "{" not in text[at:] and "}" not in text[at:]:
+            if text[at:]:
+                parts.append(text[at:])
+            return tuple(parts)
+    raise _fail(path, where, f"{text!r} has a brace that is not around an argument")
+
+
+def _submit_helper(raw: Any, path: Optional[Path], where: str) -> SubmitHelper:
+    entry = _mapping(raw, path, where, frozenset({"script", "args", "config", "kind"}))
+    if "script" not in entry:
+        raise _fail(path, where, "the script is required: where it is among the arguments")
+    kind = _text(entry.get("kind", "spark_submit"), path, f"{where}.kind")
+    if kind not in HELPER_KINDS:
+        raise _fail(
+            path, f"{where}.kind", f"{kind!r} is not one of {', '.join(sorted(HELPER_KINDS))}"
+        )
+    return SubmitHelper(
+        script=_helper_text(entry["script"], path, f"{where}.script"),
+        runtime=HELPER_KINDS[kind],
+        args=_place(entry["args"], path, f"{where}.args") if "args" in entry else None,
+        config=(
+            _helper_text(entry["config"], path, f"{where}.config") if "config" in entry else None
+        ),
     )
 
 
@@ -607,6 +697,13 @@ def parse_conventions(
                 f"{text!r} is not one of {', '.join(sorted(SUBMIT_KINDS))}",
             )
         operators[name] = text
+
+    submit_helpers: Dict[str, SubmitHelper] = {}
+    for name, raw in _mapping(top.get("submit_helpers", {}), source, "submit_helpers").items():
+        where = f"submit_helpers.{name}"
+        submit_helpers[_text(name, source, where, pattern=_DOTTED)] = _submit_helper(
+            raw, source, where
+        )
 
     drivers = tuple(
         _driver(raw, base, source, f"drivers[{index}]", named)
@@ -759,6 +856,7 @@ def parse_conventions(
         paths=tuple(rules),
         helpers=helpers,
         operators=operators,
+        submit_helpers=submit_helpers,
         drivers=drivers,
         external_consumers=external,
         session_names=sessions,

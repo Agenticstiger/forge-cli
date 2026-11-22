@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid import airflow` finds the Spark jobs a DAG submits through a Python task's function.**
+  A `PythonOperator` (and a TaskFlow `@task`) used to be read no further, so a DAG that submits its
+  jobs from Python proposed nothing. Now the function it runs is followed, statically: nothing is
+  imported or run. A function of the project's own library is described by the new conventions key
+  `submit_helpers`: where its script is among its arguments (a keyword, a position, or a key path
+  into a dict argument such as `additional_params.script_path`), where its config file and the
+  script's arguments are, and what it submits to (the operators' kinds), read from the task's
+  `op_kwargs` and `op_args` (templated fields, so `{{ var.value.x }}` in them is filled), through
+  `functools.partial` and a `lambda` too. A function of the DAG files, or of another file of the
+  scan, is read without an entry: its body's `add_job_flow_steps` and `run_job_flow` steps (boto3
+  and the EMR hook), `start_job_run` with a `jobDriver` (EMR on EKS, EMR Serverless), a command it
+  runs through `subprocess` or `os.system`, and a `spark-submit` argument list it writes out, with
+  its parameters holding what the task passes and a function it calls followed (three calls deep).
+  A task's params record the function (`python_callable`) and the config file. The report counts
+  the functions tasks run that it could not read, and lists once each value a submitted script or
+  config file waits for that the conventions can give, with the tasks that wait for it (a constant
+  of a module outside the scan: name it under `config_modules`; an environment variable; an Airflow
+  Variable). Settings a DAG imports from the module next to it by its full package name
+  (`teamx.dags.nightly.settings`, the DAGs folder being on Airflow's path) are read, and the report
+  names the file each such name was read as when only the importing file's own package says so
+  (another library of the same names would be read in its place). The folder reads `dict(...)`,
+  `d.get(key, default)` and a function's parameters from its caller, and a function whose name a
+  task takes later (`extract = PythonOperator(..., python_callable=extract)`) is the function
+  until then. The DAG files of one scan go through at most 500,000 calls and lists of the bodies
+  they follow between them (200,000 for one file), and a function the tasks of any of them run
+  with the same arguments is read once.
+
 - **The Airflow DAGs forge generates alert on failure, retry, success and a missed SLA, through
   Airflow's own notifiers, from routes the contract declares (schema 0.7.7 `alerts`).** A route
   names a kind and the Airflow connection that holds the address, URL or key: `email`
@@ -49,7 +76,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retry and success; the SLA miss and the deadline alert as Airflow calls them). New validate checks
   `contract_alerts` and, in the plugin phase, `contract_alert_plugins`.
 
+### Changed
+
+- **A dict key written before a `**spread` that does not fold is no longer taken as known.**
+  `fluid import pyspark` and `fluid import airflow` read `{"table": "a", **unknown}` as a dict
+  whose `table` is `a`, though the spread can replace it when the code runs: that key is now
+  unknown, so what it names is reported as not read instead of taken as `a`. A key written after
+  the spread (`{**unknown, "table": "a"}`) is still read.
+
 ### Fixed
+
+- **A conventions file away from the repositories it describes says what its paths name.** A
+  path in the file is relative to the file's own folder, so a file moved beside or away from the
+  folder that holds the repositories, with its paths written from there, named directories that do
+  not exist: `fluid import airflow` said only that a directory (cut to 100 characters) did not
+  exist, and `fluid import pyspark` said nothing and joined the scripts by file name alone. Each
+  `script_roots` directory, `config_modules` file and `drivers` directory that names nothing is now
+  one line in the report, with the path as written and as resolved, the tasks it leaves unjoined,
+  and, when the path names something from a folder above a directory named on the command line,
+  that folder ("put the conventions file there"). A path that leaves every allowed directory is
+  still refused, and the refusal now says how to bring it in.
+
+- **A relative import in a DAG file resolves whatever the working directory.** A DAG file is
+  shown by its path from the working directory, and its imports were resolved from that path too:
+  run from the repository root, `from .settings import SCRIPT` in `dags/pipe/dag.py` was looked up
+  as `dags.pipe.settings`, which the scan of `dags/` does not hold, and the file next door no
+  longer won a name two files answer to. Imports are now resolved from the path the scan knows the
+  file by.
 
 - **`fluid apply` no longer updates a live Iceberg table in place.** hashicorp/aws updates an
   `aws_glue_catalog_table` with an `UpdateTable` that carries no `VersionId`, after re-reading

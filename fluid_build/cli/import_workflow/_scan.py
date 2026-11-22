@@ -28,9 +28,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from ._airflow_dags import Dag, Submit, Task, read_dags
+from ._callables import MAX_LENT_STEPS_PER_SCAN, MAX_VISITS_PER_SCAN, FollowBudget
 from ._catalogs import module_settings
 from ._conventions import Conventions, Driver
 from ._drivers import Lists, argument_value, driver_for, job_file, segments
@@ -95,6 +96,8 @@ class DagScan:
     files: int = 0
     notes: List[str] = field(default_factory=list)
     unreadable: Dict[str, str] = field(default_factory=dict)
+    #: The functions Python tasks run that are not read, with how many tasks run each.
+    unread_callables: Dict[str, int] = field(default_factory=dict)
     #: ``(alias, kind)`` of each Spark catalog any DAG file sets to a kind of catalog.
     catalogs: List[Tuple[str, str]] = field(default_factory=list)
 
@@ -115,6 +118,29 @@ def _display(path: Path, rel: str) -> str:
 MAX_REFS_PER_SCAN = 200_000
 #: Tasks recorded against one job file: a script that hundreds of tasks submit is one job.
 MAX_TASKS_PER_JOB = 1_000
+
+
+#: The module names read through the importing file's own package, said one by one up to this many.
+MAX_OWN_PACKAGE_LINES = 20
+
+
+def own_package_notes(index: ModuleIndex, root: Path) -> List[str]:
+    """A note for each module name only the importing file's own package vouches for (see
+    :meth:`ModuleIndex._below_the_import_root`): another library of the same names would be read
+    in its place, so a person can check which file each one was read as."""
+    taken = sorted(index.own_package_names.items())
+    notes = [
+        f"{_display(root / importer, importer)}: `{name}` is read as "
+        f"{_display(root / found, found)}, the module of that name in the file's own package "
+        "(check that it is not another library's)"
+        for (importer, name), found in taken[:MAX_OWN_PACKAGE_LINES]
+    ]
+    if len(taken) > MAX_OWN_PACKAGE_LINES:
+        notes.append(
+            f"{len(taken) - MAX_OWN_PACKAGE_LINES} more module name(s) are read through the "
+            "importing file's own package"
+        )
+    return notes
 
 
 def budget_note(skipped: int, notes: List[str], sql_skipped: int = 0) -> None:
@@ -189,6 +215,7 @@ def scan_jobs(
             scan.other_files += 1
             # a helper's note (a name from a parameter) still matters to the person reading
             scan.notes.extend(facts.notes)
+    scan.notes.extend(own_package_notes(index, Path(root)))
     if budget is None:
         budget_note(index.budget.skipped, scan.notes, index.budget.sql_skipped)
     return scan
@@ -205,6 +232,8 @@ def scan_dags(
     """
     walk = find_python_files(root, ignore=conventions.ignore_files)
     scan = DagScan(root=Path(root), notes=list(walk.notes))
+    tired: Set[str] = set()
+    follow = FollowBudget()
     index = ModuleIndex(
         walk.files,
         variables=conventions.variables,
@@ -226,12 +255,39 @@ def scan_dags(
         except SourceUnreadable as exc:
             scan.unreadable[source.rel] = str(exc)
             continue
+        # ... and the one the index knows it by, which its imports are resolved from
+        module.index_rel = source.rel
         scan.files += 1
         folder = index.folder(module)
-        found = read_dags(module, folder, operators=conventions.operators)
+        found = read_dags(
+            module,
+            folder,
+            operators=conventions.operators,
+            submit_helpers=conventions.submit_helpers,
+            follow=follow,
+        )
         scan.catalogs.extend(module_settings(module, folder))
         scan.dags.extend(found.dags)
         scan.notes.extend(found.notes)
+        for name, count in found.unread_callables.items():
+            scan.unread_callables[name] = scan.unread_callables.get(name, 0) + count
+        tired.update(found.tired_modules)
+    if follow.cut_files:
+        scan.notes.append(
+            "stopped following the functions Python tasks run once the DAG files had spent "
+            f"{MAX_VISITS_PER_SCAN:,} visits of their bodies or {MAX_LENT_STEPS_PER_SCAN:,} "
+            "steps of folding them between them (the scan asks for too much work): what the "
+            f"tasks of {follow.cut_files} DAG file(s) submit is not all read; scan fewer DAG "
+            "files at a time to read them all"
+        )
+    for rel in sorted(tired):
+        # the path a person can open, as every other note of the scan names its file
+        scan.notes.append(
+            f"{_display(Path(root) / rel, rel)}: folding stopped early while the functions DAG "
+            "tasks run were read (the file asks for too much work): some of what they submit is "
+            "not read"
+        )
+    scan.notes.extend(own_package_notes(index, Path(root)))
     scan.dags.sort(key=lambda d: (d.file, d.line))
     if budget is None:
         budget_note(index.budget.skipped, scan.notes, index.budget.sql_skipped)
@@ -262,6 +318,15 @@ def _stays_inside(relative: str) -> bool:
     return ".." not in text.split("/")
 
 
+def path_is(path: Path, directory: bool) -> bool:
+    """Whether ``path`` is a directory (``directory``) or a file. A name too long for the system,
+    or one it cannot encode, is neither: before Python 3.14, asking raises for it."""
+    try:
+        return path.is_dir() if directory else path.is_file()
+    except (OSError, ValueError):
+        return False
+
+
 def local_script(
     script: str, conventions: Conventions, project_root: Optional[Path]
 ) -> Optional[Path]:
@@ -273,12 +338,12 @@ def local_script(
             if not _stays_inside(rest):
                 return None
             candidate = directory / rest
-            if _inside(candidate, [directory]) and candidate.is_file():
+            if _inside(candidate, [directory]) and path_is(candidate, False):
                 return candidate
             return None
     if "://" not in script and project_root is not None and _stays_inside(script):
         candidate = project_root / script
-        if _inside(candidate, [project_root]) and candidate.is_file():
+        if _inside(candidate, [project_root]) and path_is(candidate, False):
             return candidate
     return None
 
