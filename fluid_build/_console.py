@@ -179,6 +179,32 @@ def cprint(*args: Any, **kwargs: Any) -> None:
         stream.flush()
 
 
+_JSON_STRING = re.compile(r'"(?:[^"\\\x00-\x1f]|\\.)*"')
+
+
+def _redact_json_text(document: str) -> str:
+    """:func:`_redact_str` for a document, one JSON string at a time when it is JSON.
+
+    The ``key=value`` pattern runs to the next space, comma or semicolon, so over the whole
+    text it takes the closing quote of a string such as ``"password=hunter2"`` with the value
+    and the document no longer parses. Each string literal is redacted on its own, so what a
+    match can reach ends at the literal's closing quote. A document that is not JSON (YAML,
+    XML) is redacted as one text.
+    """
+    import json
+
+    try:
+        json.loads(document)
+    except ValueError:
+        return _redact_str(document)
+
+    def one(match: "re.Match[str]") -> str:
+        literal = match.group(0)
+        return '"' + _redact_str(literal[1:-1]) + '"'
+
+    return _JSON_STRING.sub(one, document)
+
+
 def cprint_json(document: str, **kwargs: Any) -> None:
     """Emit a machine-readable document (JSON / YAML / XML) verbatim.
 
@@ -193,7 +219,7 @@ def cprint_json(document: str, **kwargs: Any) -> None:
     already-correct ``_output_json``. The redaction pass that :func:`cprint`
     applies is kept — a credential must not reach stdout on either path.
     """
-    text = _redact_str(document)
+    text = _redact_json_text(document)
     end = kwargs.get("end", "\n")
     stream = kwargs.get("file") or sys.stdout
     # ``text`` is redacted above; same suppression rationale as ``cprint``.

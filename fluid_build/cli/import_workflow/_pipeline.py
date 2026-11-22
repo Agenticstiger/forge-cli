@@ -402,7 +402,23 @@ def run_import(
             path=safe_text(str(root), 120),
         ) from exc
     _check_valid(proposal.contracts, proposal.report)
+    _cap_unsupported(proposal.report)
     return proposal.contracts, proposal.report
+
+
+#: Lines of "unsupported" the report lists one by one; the rest are counted. A large estate has
+#: a line for each task that was not joined, and printing thousands of them hides the others.
+MAX_UNSUPPORTED_LINES = 100
+
+
+def _cap_unsupported(report: ImportReport) -> None:
+    """Keep the first ``MAX_UNSUPPORTED_LINES`` unsupported lines and count the rest."""
+    lines = report.unsupported
+    if len(lines) <= MAX_UNSUPPORTED_LINES:
+        return
+    more = len(lines) - MAX_UNSUPPORTED_LINES
+    del lines[MAX_UNSUPPORTED_LINES:]
+    lines.append(f"{more} more line(s) like these are not listed")
 
 
 def _drop_tasks(contract: Dict[str, Any]) -> bool:

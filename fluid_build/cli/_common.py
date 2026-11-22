@@ -192,6 +192,47 @@ def read_json(path: str) -> Any:
         return json.load(f)
 
 
+def print_cli_error_to_stderr(error: CLIError) -> int:
+    """Show a typed ``CLIError`` on stderr, as the top-level handler shows it on stdout, and
+    return its exit code.
+
+    For a command that writes a machine-readable document (``--format json``) on stdout: the
+    handler's box would land in that stream and ``| jq`` would stop at its first line. The
+    message, the context values and the suggestions are data, so they are redacted and printed
+    literally (no markup, control characters spelled out).
+    """
+    from rich.console import Console
+    from rich.text import Text
+
+    from fluid_build._console import _redact_error_str, _redact_str, literal_text
+    from fluid_build.observability.secret_redactor import redact_secret_text
+
+    console = Console(stderr=True)
+    slug = getattr(error, "error_slug", None)
+    message = literal_text(_redact_error_str(f"❌ {error.message}"), "red")
+    if slug:
+        message.append(f"  [{slug}]", style="dim")
+    console.print(message)
+    for key, value in (error.context or {}).items():
+        console.print(
+            Text.assemble(
+                "  ",
+                (f"{key}:", "dim"),
+                literal_text(_redact_str(redact_secret_text(f" {value}"))),
+            ),
+            soft_wrap=True,
+        )
+    suggestions = getattr(error, "suggestions", None) or []
+    if suggestions:
+        console.print(Text("\n💡 Suggestions:", style="yellow"))
+        for suggestion in suggestions:
+            console.print(literal_text(_redact_str(redact_secret_text(f"  • {suggestion}"))))
+    docs_url = getattr(error, "docs_url", None)
+    if docs_url:
+        console.print(Text(f"\n📖 Documentation: {docs_url}", style="cyan"), soft_wrap=True)
+    return int(error.exit_code)
+
+
 def resolve_provider_from_contract(contract: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
     """Extract provider name and location from the contract's binding.
 

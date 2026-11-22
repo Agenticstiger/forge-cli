@@ -57,6 +57,7 @@ dag = DAG(
     schedule='0 2 * * *',
     start_date=datetime(2026, 1, 1, tzinfo=ZoneInfo('Europe/Zurich')),
     catchup=False,
+    max_active_runs=1,
     tags=['fluid', 'auto-generated', 'gcp', 'golden.gcp_pipeline'],
 )
 
