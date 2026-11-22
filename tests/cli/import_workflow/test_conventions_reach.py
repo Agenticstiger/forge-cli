@@ -166,6 +166,116 @@ def test_airflow_names_the_dags_directory_only_so_a_repository_beside_it_is_not_
     assert "script_roots" in refused.value.why  # the one path the DAGs directory does not hold
 
 
+def run_airflow(conventions_at: str):
+    return AirflowImporter().import_to_contracts(
+        "repos/dags", options={"conventions": conventions_at}
+    )
+
+
+@pytest.mark.parametrize("run", [run_pyspark, run_airflow], ids=["pyspark", "airflow"])
+def test_a_conventions_file_inside_the_repositories_folder_joins_the_scripts(
+    tmp_path, monkeypatch, run
+):
+    monkeypatch.chdir(tmp_path)
+    lay_out(
+        tmp_path, "repos/conventions.yaml", "spark-scripts/jobs", "dags/acme_config/settings.py"
+    )
+    contracts, report = run("repos/conventions.yaml")
+    assert [c["id"] for c in contracts] == ["retail.orders"]
+    assert (
+        "1 submitted script(s) joined to a job file (1 by script_root); 0 not joined"
+        in report.notes
+    )
+    assert not [x for x in report.unsupported if "no such" in x]
+
+
+@pytest.mark.parametrize("run", [run_pyspark, run_airflow], ids=["pyspark", "airflow"])
+@pytest.mark.parametrize(
+    "placement", ["config", "elsewhere/deep"], ids=["beside the folder", "outside it"]
+)
+def test_a_conventions_file_moved_away_from_the_repositories_says_what_its_paths_name(
+    tmp_path, monkeypatch, run, placement
+):
+    """The same file, with its paths written from the repositories' folder, moved beside it or
+    elsewhere: each path names nothing there, and the report says so, with the tasks it leaves
+    unjoined and the folder the paths were written for, instead of joining by file name alone or
+    not at all without a word."""
+    monkeypatch.chdir(tmp_path)
+    lay_out(
+        tmp_path,
+        f"{placement}/conventions.yaml",
+        "spark-scripts/jobs",
+        "dags/acme_config/settings.py",
+    )
+    _contracts, report = run(f"{placement}/conventions.yaml")
+    (roots,) = [x for x in report.unsupported if x.startswith("script_roots ")]
+    assert roots == (
+        f"script_roots `s3://acme-code/jobs/` in conventions.yaml names `spark-scripts/jobs`, "
+        f"which is {placement}/spark-scripts/jobs: no such directory. A path in the conventions "
+        f"file is relative to the file's own folder ({placement}); 1 task(s) submit a script "
+        "under s3://acme-code/jobs/ and are not joined through it (DAG orders_daily task "
+        "orders). `spark-scripts/jobs` is in repos: put the conventions file there, in the "
+        "folder that holds the repositories it names, or name the directory on the command "
+        "line (`fluid import pyspark <jobs-dir> --dags <dags-dir>` names the jobs directory)"
+    )
+    (modules,) = [x for x in report.unsupported if x.startswith("config_modules ")]
+    assert f"names `dags/acme_config/settings.py`, which is {placement}/dags/" in modules
+    assert "no such file" in modules and "`dags/acme_config/settings.py` is in repos" in modules
+    assert "what the scanned code imports from it is not read" in modules
+
+
+def test_a_conventions_file_beside_the_folder_with_paths_from_its_own_folder(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    lay_out(
+        tmp_path,
+        "config/conventions.yaml",
+        "../repos/spark-scripts/jobs",
+        "../repos/dags/acme_config/settings.py",
+    )
+    contracts, report = run_pyspark("config/conventions.yaml")
+    assert [c["id"] for c in contracts] == ["retail.orders"]
+    assert not [x for x in report.unsupported if "no such" in x]
+    # `fluid import airflow` names only the DAGs directory: the jobs are out of reach, and the
+    # refusal says how to bring them in
+    with pytest.raises(FluidUserError) as refused:
+        run_airflow("config/conventions.yaml")
+    assert "put the conventions file in the folder that holds the repositories" in refused.value.why
+    assert "fluid import pyspark <jobs-dir> --dags <dags-dir>" in refused.value.why
+
+
+def test_a_path_no_task_uses_and_a_drivers_directory_that_names_nothing_are_said_too(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    lay_out(
+        tmp_path, "repos/conventions.yaml", "spark-scripts/jobs", "dags/acme_config/settings.py"
+    )
+    path = tmp_path / "repos" / "conventions.yaml"
+    conventions = yaml.safe_load(path.read_text("utf-8"))
+    conventions["script_roots"]["s3://acme-code/old/"] = "spark-scripts/old"
+    conventions["drivers"] = [
+        {
+            "script": "driver.py",
+            "argument": "--job-list",
+            "job_lists": {"dir": "spark-scripts/lists", "file": "{value}.yaml"},
+            "jobs": {"dir": "spark-scripts/jobs", "file": "{job}.py"},
+        }
+    ]
+    path.write_text(yaml.safe_dump(conventions), encoding="utf-8")
+    _contracts, report = run_pyspark("repos/conventions.yaml")
+    lines = [x for x in report.unsupported if "no such" in x]
+    assert len(lines) == 2
+    lists, old = sorted(lines)  # drivers[...] before script_roots
+    assert lists.startswith(
+        "drivers[0].job_lists.dir in conventions.yaml names `spark-scripts/lists`"
+    )
+    assert "a task that runs driver.py is not joined to its jobs" in lists
+    assert old.startswith(
+        "script_roots `s3://acme-code/old/` in conventions.yaml names `spark-scripts/old`"
+    )
+    assert "task(s) submit" not in old  # no task uses it: nothing is said to be left unjoined
+
+
 def test_the_directories_named_are_the_one_scanned_and_for_pyspark_the_dags_one():
     named = _pipeline._named_directories
     assert named("pyspark", "jobs", {"dags": "dags"}) == ["jobs", "dags"]

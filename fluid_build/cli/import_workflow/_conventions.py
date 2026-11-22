@@ -65,7 +65,9 @@ file's own directory or inside a directory the user named on the command line (t
 and ``--dags``): a path that leaves them all (``..``, an absolute path, a link that points out) is
 refused, checked on the resolved path. So a conventions file cannot make the scan read a file from
 somewhere the user did not point it at, and it may sit in a folder of its own beside the
-repositories it describes (``config/conventions.yaml``).
+repositories it describes (``config/conventions.yaml``). A path that names nothing where it
+resolves (a file moved away from the folder its paths were written from) is a line of the report,
+with the tasks it leaves unjoined.
 
 ``external_consumers`` names the outputs that something outside the scanned code reads (a
 dashboard, another team's job): a table (``db.table`` or ``catalog.db.table``, in any case), a topic or a path as the
@@ -382,7 +384,9 @@ def _local(
             path,
             where,
             f"{text!r} leaves the directory of the conventions file and the directories named on "
-            "the command line: keep what the scan reads inside one of them",
+            "the command line: keep what the scan reads inside one of them (put the conventions "
+            "file in the folder that holds the repositories it names, or name the directory on "
+            "the command line: `fluid import pyspark <jobs-dir> --dags <dags-dir>`)",
         )
     return resolved
 

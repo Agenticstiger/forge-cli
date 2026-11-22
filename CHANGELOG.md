@@ -34,6 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A conventions file away from the repositories it describes says what its paths name.** A
+  path in the file is relative to the file's own folder, so a file moved beside or away from the
+  folder that holds the repositories, with its paths written from there, named directories that do
+  not exist: `fluid import airflow` said only that a directory (cut to 100 characters) did not
+  exist, and `fluid import pyspark` said nothing and joined the scripts by file name alone. Each
+  `script_roots` directory, `config_modules` file and `drivers` directory that names nothing is now
+  one line in the report, with the path as written and as resolved, the tasks it leaves unjoined,
+  and, when the path names something from a folder above a directory named on the command line,
+  that folder ("put the conventions file there"). A path that leaves every allowed directory is
+  still refused, and the refusal now says how to bring it in.
+
 - **A relative import in a DAG file resolves whatever the working directory.** A DAG file is
   shown by its path from the working directory, and its imports were resolved from that path too:
   run from the repository root, `from .settings import SCRIPT` in `dags/pipe/dag.py` was looked up

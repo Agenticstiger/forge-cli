@@ -11,6 +11,7 @@ when ``--registry`` is given.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -109,11 +110,11 @@ def _named_directories(tool: str, source: str, options: Mapping[str, Any]) -> Li
     return named
 
 
-def _referenced_roots(dag_scan: DagScan, conv: Conventions) -> Tuple[List[Path], List[str]]:
+def _referenced_roots(dag_scan: DagScan, conv: Conventions) -> List[Path]:
     """The local directories the DAGs' scripts live in, by the conventions' ``script_roots``:
-    only those a task actually submits from, outer directories before the ones inside them."""
+    only those a task actually submits from (and that exist: one that does not is reported by
+    :func:`_report_conventions_paths`), outer directories before the ones inside them."""
     used: Dict[Path, None] = {}
-    missing: List[str] = []
     for dag in dag_scan.dags:
         for task in dag.tasks:
             for submit in task.submits:
@@ -123,15 +124,135 @@ def _referenced_roots(dag_scan: DagScan, conv: Conventions) -> Tuple[List[Path],
                     if submit.script.startswith(prefix):
                         if directory.is_dir():
                             used.setdefault(directory, None)
-                        elif str(directory) not in missing:
-                            missing.append(str(directory))
                         break
     roots = sorted(used, key=lambda p: len(p.parts))
     kept: List[Path] = []
     for root in roots:
         if not any(root == other or other in root.parents for other in kept):
             kept.append(root)
-    return kept, missing
+    return kept
+
+
+#: Directories above the ones named on the command line looked in for a path of the conventions
+#: file that names nothing where it was written: the folder that holds the repositories, often.
+_HINT_LEVELS = 4
+#: Tasks named on the line of a ``script_roots`` entry that names nothing.
+MAX_PATH_TASKS = 3
+
+
+def _where_it_is(written: str, named: Sequence[Path], want_dir: bool) -> Optional[Path]:
+    """The folder above a directory named on the command line (or that directory) from which the
+    path ``written`` names a directory (``want_dir``) or a file: where the conventions file was
+    written for. Only ``is_dir``/``is_file`` is asked, of paths below the named directories'
+    parents; nothing is read."""
+    if not written or written.startswith("..") or Path(written).is_absolute():
+        return None
+    seen: Dict[Path, None] = {}
+    for directory in named:
+        for above in [directory, *list(directory.parents)[:_HINT_LEVELS]]:
+            if above in seen:
+                continue
+            seen[above] = None
+            candidate = above / written
+            try:
+                if candidate.is_dir() if want_dir else candidate.is_file():
+                    return above
+            except OSError:
+                continue
+    return None
+
+
+def _shown(path: Path) -> str:
+    """A path as the report shows it: from the working directory when it is under it."""
+    try:
+        text = path.relative_to(Path.cwd().resolve()).as_posix() or "."
+    except (ValueError, OSError):
+        text = str(path)
+    return safe_text(text, 400)
+
+
+def _report_conventions_paths(
+    conv: Conventions, dag_scan: Optional[DagScan], named: Sequence[Path], report: ImportReport
+) -> None:
+    """A line for each directory or file the conventions name that is not there (a
+    ``script_roots`` directory, a ``config_modules`` file, a ``drivers`` directory): a path in the
+    file is relative to the file's own folder, so a file moved away from the repositories it
+    describes, or written for another folder, names nothing and the joins it was meant for are
+    not made. The line names the entry, the path as written and as resolved, the tasks it leaves
+    unjoined, and, when the path names something from a folder above a directory named on the
+    command line, that folder."""
+    if conv.source is None:
+        return
+    home = conv.source.resolve().parent
+    name = safe_text(conv.source.name, 80)
+    uses: Dict[str, Dict[str, None]] = {}
+    for dag in dag_scan.dags if dag_scan is not None else ():
+        for task in dag.tasks:
+            for submit in task.submits:
+                for prefix, _directory in conv.script_roots if submit.script else ():
+                    if (submit.script or "").startswith(prefix):
+                        label = f"DAG {safe_text(dag.shown, 60)} task {safe_text(task.shown, 60)}"
+                        uses.setdefault(prefix, {})[label] = None
+                        break
+
+    def line(entry: str, target: Path, want_dir: bool, consequence: str) -> str:
+        try:
+            written = os.path.relpath(target, home)
+        except ValueError:  # another drive
+            written = str(target)
+        found = _where_it_is(written, named, want_dir)
+        kind = "directory" if want_dir else "file"
+        fix = (
+            f"`{safe_text(written, 120)}` is in {_shown(found)}: put the conventions file there, "
+            "in the folder that holds the repositories it names"
+            if found is not None
+            else "write the path from the conventions file's folder"
+        )
+        return (
+            f"{entry} in {name} names `{safe_text(written, 120)}`, which is {_shown(target)}: no "
+            f"such {kind}. A path in the conventions file is relative to the file's own folder "
+            f"({_shown(home)}){consequence}. "
+            f"{fix}, or name the {kind} on the command line (`fluid import pyspark <jobs-dir> "
+            "--dags <dags-dir>` names the jobs directory)"
+        )
+
+    for prefix, directory in conv.script_roots:
+        if directory.is_dir():
+            continue
+        tasks = list(uses.get(prefix, {}))
+        consequence = ""
+        if tasks:
+            shown = ", ".join(tasks[:MAX_PATH_TASKS])
+            if len(tasks) > MAX_PATH_TASKS:
+                shown += f", and {len(tasks) - MAX_PATH_TASKS} more"
+            consequence = (
+                f"; {len(tasks)} task(s) submit a script under {safe_text(prefix, 120)} and are "
+                f"not joined through it ({shown})"
+            )
+        report.unsupported.append(
+            line(f"script_roots `{safe_text(prefix, 120)}`", directory, True, consequence)
+        )
+    for module, path in conv.config_modules.items():
+        if not path.is_file():
+            report.unsupported.append(
+                line(
+                    f"config_modules `{safe_text(module, 120)}`",
+                    path,
+                    False,
+                    "; what the scanned code imports from it is not read",
+                )
+            )
+    for index, driver in enumerate(conv.drivers):
+        for what, directory in (("job_lists", driver.lists_dir), ("jobs", driver.jobs_dir)):
+            if not directory.is_dir():
+                report.unsupported.append(
+                    line(
+                        f"drivers[{index}].{what}.dir",
+                        directory,
+                        True,
+                        f"; a task that runs {safe_text(driver.script, 80)} is not joined to its jobs",
+                    )
+                )
 
 
 def topic_schema_reader(options: Mapping[str, Any]) -> Optional[TopicSchema]:
@@ -231,16 +352,14 @@ def run_import(
             )
     else:
         dag_scan = scan_dags(root, conv, budget)
-        roots, missing = _referenced_roots(dag_scan, conv)
-        for path in missing:
-            report.unsupported.append(
-                f"script_roots names the directory {safe_text(path, 100)}, which does not exist"
-            )
+        roots = _referenced_roots(dag_scan, conv)
         scans = [scan_jobs(directory, conv, budget) for directory in roots]
         linked, unlinked = link_tasks(
             dag_scan.dags, scans, conv, project_root=None, notes=report.notes, budget=budget
         )
 
+    named = [Path(p).resolve() for p in _named_directories(tool, source, options)]
+    _report_conventions_paths(conv, dag_scan, named, report)
     _scan_report(tool, scans, dag_scan, linked, unlinked, report)
     budget_note(budget.skipped, report.notes, budget.sql_skipped)
     jobs = [job for scan in scans for job in scan.jobs]
