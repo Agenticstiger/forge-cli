@@ -406,9 +406,10 @@ def test_the_names_airflow_hides_are_not_substituted(field, shape):
     assert dict(conv.airflow_variables) == {"retail_region": "eu"}
     assert conv.withheld == (f"airflow_variables.only.{name}",)
     # the code's reference stays as written: nothing is filled in for the name
-    assert fill_variable_templates(
-        f"{{{{ var.value.{name} }}}}", conv.airflow_variables
-    ) == f"{{{{ var.value.{name} }}}}"
+    assert (
+        fill_variable_templates(f"{{{{ var.value.{name} }}}}", conv.airflow_variables)
+        == f"{{{{ var.value.{name} }}}}"
+    )
 
 
 def test_a_name_that_is_no_credential_is_substituted_as_before():

@@ -1144,9 +1144,7 @@ def _build_description(contract: Dict[str, Any]) -> str:
     return contract["builds"][0]["description"]
 
 
-def test_a_product_describes_the_streams_of_the_outputs_it_owns_not_the_jobs(
-    tmp_path, monkeypatch
-):
+def test_a_product_describes_the_streams_of_the_outputs_it_owns_not_the_jobs(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _streams_project(tmp_path, 6)
     contracts, _ = propose(tmp_path)  # one product per table
