@@ -37,7 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--contract-path`). Git bundles keep the engine's own credential model: a credential goes only
   to a host the operator lists in `FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS`, and a contract's
   `secret_ref` may only name a `FLUID_SCAFFOLD_` variable; the engine's operator settings
-  (`FLUID_CUSTOM_SCAFFOLD_*`) cannot come from a project `.env` file.
+  (`FLUID_CUSTOM_SCAFFOLD_*`) cannot come from a project `.env` file. `fluid generate ci` installs
+  the `custom-scaffold` extra in the pipeline when the contract declares the block, and the
+  Jenkins template's default `GENERATE_EMIT` names the key.
 - **`fluid generate artifacts --emit pyspark-schema` puts the PySpark schema modules in the
   MANIFEST.** It writes `pyspark-schema/<port>_schema.py`, the module `fluid generate
   pyspark-schema` writes, byte for byte (same loader, renderer and writer), for each output port

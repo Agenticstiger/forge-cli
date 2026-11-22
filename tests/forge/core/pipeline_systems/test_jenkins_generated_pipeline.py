@@ -108,6 +108,18 @@ def _environment_fallbacks(content: str) -> Dict[str, str]:
     )
 
 
+def test_the_default_emit_list_holds_every_default_key_but_opds():
+    """``GENERATE_EMIT`` is the stage-3 ``--emit`` a run gets: a key that joins stage 3's
+    default set joins it here (``opds`` was never in it)."""
+    from fluid_build.forge.core.artifact_fanout import DEFAULT_EMIT
+
+    content = _jenkinsfile()
+    listed = _declared(content)["GENERATE_EMIT"]
+    assert _environment_fallbacks(content)["GENERATE_EMIT"] == listed
+    assert "custom-scaffold" in listed.split(",")
+    assert set(DEFAULT_EMIT) - set(listed.split(",")) == {"opds"}
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     """A git repository holding the product under contracts/customer_subscriptions/."""
@@ -177,6 +189,19 @@ def test_the_package_spec_pins_this_version_with_the_extras_of_every_overlay(rep
     spec = f"data-product-forge[aws,gcp,local]=={__version__}"
     assert f"name: 'FLUID_PACKAGE_SPEC', defaultValue: '{spec}'" in content
     assert f'-- "${{FLUID_PACKAGE_SPEC:-{spec}}}"' in content
+
+
+def test_a_contract_with_a_custom_scaffold_installs_its_engine(repo, monkeypatch):
+    product = repo / "contracts" / "customer_subscriptions"
+    contract = product / "contract.fluid.yaml"
+    block = (
+        "extensions:\n  customScaffold:\n    libraries:\n      - id: ci\n"
+        "        source: {kind: path, path: ./bundle}\n    patterns:\n      - use: ci:basic\n"
+    )
+    contract.write_text(contract.read_text(encoding="utf-8") + block, encoding="utf-8")
+    content = _generate(product, "contract.fluid.yaml", monkeypatch)
+    spec = f"data-product-forge[aws,custom-scaffold,gcp,local]=={__version__}"
+    assert f"name: 'FLUID_PACKAGE_SPEC', defaultValue: '{spec}'" in content
 
 
 def test_the_package_spec_option_overrides_and_an_option_shaped_value_is_refused(repo, monkeypatch):
