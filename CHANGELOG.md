@@ -294,6 +294,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or an environment held as a mapping, stays in the repr; fields whose names hold no secret are
   listed with the reason.
 
+- **Generated CI pins current GitHub Actions, and an action the pin table lacks stops the
+  generation.** `fluid generate ci` pins `actions/checkout` v4.4.0, `osv-scanner-action` v2.7.1,
+  `codeql-action/upload-sarif` v3.39.4 and `anchore/sbom-action` v0.24.3, each by commit (#686).
+  A generator that asked for an action the table does not hold used to get the tag back, and a
+  tag can move; that now raises. A test checks that every action the `fluid generate ci`
+  generators write goes through the table, and that every entry is one line
+  `scripts/check_pinned_actions.py` can read.
+
 ## [0.36.0] — 2026-11-19
 
 ### Added
