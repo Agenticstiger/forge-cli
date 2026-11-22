@@ -146,6 +146,7 @@ def scan_jobs(
         budget=budget,
     )
     sessions = set(DEFAULT_SESSION_NAMES) | set(conventions.session_names)
+    path_rules = tuple((rule.prefix, rule.table is not None) for rule in conventions.paths)
     kept = 0
     for position, source in enumerate(walk.files):
         if kept > MAX_REFS_PER_SCAN:
@@ -166,6 +167,7 @@ def scan_jobs(
             helpers=conventions.helpers,
             session_names=sessions,
             shown=shown,
+            path_rules=path_rules,
         )
         scan.catalogs.extend(module_settings(module, folder))
         kept += len(facts.reads) + len(facts.writes)

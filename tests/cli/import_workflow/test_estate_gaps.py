@@ -136,3 +136,41 @@ with DAG(dag_id="copy", schedule="@daily", default_args={"owner": "orders-team"}
         },
     )[0]
     assert built == written
+
+
+# ── G6: a landing path with a run date in it ──────────────────────────
+
+LANDING_CONVENTIONS = """
+paths:
+  - prefix: "s3://lake/landing/retail/"
+    database: landing
+    platform: aws
+    format: json
+defaults: {domain: retail, platform: aws}
+"""
+
+
+def test_a_landing_read_with_a_run_date_is_a_consumed_source(tmp_path, monkeypatch):
+    contracts, report = run_pyspark(
+        tmp_path,
+        monkeypatch,
+        {
+            "conventions.yaml": LANDING_CONVENTIONS,
+            "dags/none.py": "x = 1\n",
+            "jobs/orders.py": """
+                from pyspark.sql import SparkSession
+
+                LANDING = "s3://lake/landing/retail"
+
+                def run(spark, run_date):
+                    orders = spark.read.json(f"{LANDING}/orders/dt={run_date}/")
+                    orders.write.saveAsTable("silver.orders")
+            """,
+        },
+    )
+    (contract,) = contracts
+    assert [(c["productId"], c["exposeId"]) for c in contract["consumes"]] == [
+        ("landing.orders", "orders")
+    ]
+    assert not any("function parameter" in line for line in report.unsupported)
+    assert any("is taken as that table" in line for line in report.notes)

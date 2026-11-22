@@ -180,6 +180,27 @@ def _placeholders_to_holes(text: str, holes: Dict[str, str]) -> str:
     return _PLACEHOLDER.sub(token, text)
 
 
+def path_root(known: str, rules: Sequence[Tuple[str, bool]]) -> Optional[str]:
+    """The table a path names when only its beginning is known (``known``, the text before the
+    first part that does not fold), by the first of the conventions' path ``rules`` it falls
+    under: the rule's prefix and the segment after it (the rule's prefix alone when the rule gives
+    a fixed table). ``None`` when no rule applies, or when the segment that names the table is not
+    complete in what is known (it may go on in the part that does not fold). ``rules`` are
+    ``(prefix, the rule names a table)``, in the order the conventions give them."""
+    path = known.split("?")[0].split("#")[0]
+    for prefix, fixed in rules:
+        base = prefix.rstrip("/")
+        if not (path == base or path.startswith(base + "/")):
+            continue
+        if fixed:
+            return base
+        rest = path[len(base) :].lstrip("/")
+        if "/" not in rest:
+            return None  # the segment may go on where the text stops being known
+        return base + "/" + rest.split("/")[0]
+    return None
+
+
 @dataclass(frozen=True)
 class HelperSpec:
     """A project function the operator declared as Spark IO, in the conventions:
@@ -323,10 +344,12 @@ class _Reader:
         helpers: Mapping[str, HelperSpec],
         session_names: Iterable[str],
         shown: Optional[str] = None,
+        path_rules: Sequence[Tuple[str, bool]] = (),
     ) -> None:
         self.module = module
         self.folder = folder
         self.helpers = helpers
+        self.path_rules = tuple(path_rules)
         self.sessions: Set[str] = set(session_names)
         self.file = shown or module.rel
         self.facts = JobFacts(rel=module.rel)
@@ -667,9 +690,47 @@ class _Reader:
             return None
         return self.folder.string(node)
 
+    def _path_text(self, node: Optional[ast.expr]) -> Union[str, Unresolved, None]:
+        """:meth:`_text` for a path: when it does not fold, the table root a conventions rule
+        gives it if the beginning of it does (:meth:`_rooted`)."""
+        value = self._text(node)
+        if isinstance(value, Unresolved) and node is not None:
+            rooted = self._rooted(node)
+            if rooted is not None:
+                return rooted
+        return value
+
+    def _rooted(self, node: ast.expr) -> Optional[str]:
+        """The table root of a path such as ``f"{LANDING}/orders/dt={run_date}/"``, whose end is
+        not a constant (a run date, a parameter) but whose beginning is the prefix of one of the
+        conventions' path rules and runs past the segment that names the table."""
+        if not self.path_rules:
+            return None
+        text, holes = self.folder.fold_sql(node)
+        if not isinstance(text, str) or not holes:
+            return None
+        cut = text.find(_spark_sql.HOLE.split("{")[0])
+        root = path_root(text if cut < 0 else text[:cut], self.path_rules)
+        if root is not None:
+            note = (
+                f"{self.file}:{getattr(node, 'lineno', 0)} reads or writes a path that is not a "
+                f"constant past {scrub_path(root)}: it is taken as that table"
+            )
+            if note not in self.facts.remarks and len(self.facts.remarks) < MAX_NOTES_PER_JOB:
+                self.facts.remarks.append(note)
+        return root
+
     def _literal(self, node: Optional[ast.expr]) -> Optional[str]:
         value = self._text(node)
         return value if isinstance(value, str) else None
+
+    def _option_value(self, key: str, node: ast.expr) -> Any:
+        """The folded value of an option; a ``path`` that only folds at its beginning is the
+        table root the conventions give it (:meth:`_rooted`)."""
+        value = self.folder.fold(node)
+        if isinstance(value, Unresolved) and key.lower() == "path":
+            return self._rooted(node) or value
+        return value
 
     def _options(self, links: Sequence[_Link]) -> Tuple[Dict[str, Any], Optional[str]]:
         """``({option key: folded value}, format)`` from the ``option``, ``options`` and
@@ -685,11 +746,11 @@ class _Reader:
             elif link.name == "option" and len(call.args) >= 2:
                 key = self._literal(call.args[0])
                 if key is not None:
-                    options[key.lower()] = self.folder.fold(call.args[1])
+                    options[key.lower()] = self._option_value(key, call.args[1])
             elif link.name == "options":
                 for kw in call.keywords:
                     if kw.arg is not None:
-                        options[kw.arg.lower()] = self.folder.fold(kw.value)
+                        options[kw.arg.lower()] = self._option_value(kw.arg, kw.value)
                     else:
                         spread = self.folder.fold(kw.value)
                         if isinstance(spread, FoldedDict):
@@ -733,7 +794,7 @@ class _Reader:
     def _path_or_table(self, node: Optional[ast.expr], at: ast.AST, fmt: Optional[str]) -> Ref:
         """The target of ``load``/``save``: for Iceberg a bare name is a table identifier (the
         Iceberg docs write ``save("glue.db.t")``); anything with a slash or a scheme is a path."""
-        value = self._text(node)
+        value = self._path_text(node)
         if (
             fmt == "iceberg"
             and isinstance(value, str)
@@ -793,7 +854,11 @@ class _Reader:
         keyword = spec.arg if isinstance(spec.arg, str) else None
         node = self._arg(call, position, keyword)
         ref = self._ref(
-            spec.kind, self._text(node), call, spec.fmt, missing="the argument is not given"
+            spec.kind,
+            self._path_text(node) if spec.kind == "path" else self._text(node),
+            call,
+            spec.fmt,
+            missing="the argument is not given",
         )
         if spec.direction == "reads":
             self._add_read(ref, streaming=False)
@@ -877,6 +942,8 @@ class _Reader:
                     )
                     continue
                 value = self.folder.fold(node)
+                if isinstance(value, Unresolved):
+                    value = self._rooted(node) or value
                 items = value if isinstance(value, list) else [value]
                 for item in items:
                     self._add_read(
@@ -891,7 +958,8 @@ class _Reader:
             keyword_path = self._arg(call, None, "path")
             if keyword_path is not None:
                 self._add_read(
-                    self._ref("path", self._text(keyword_path), call, name), streaming=streaming
+                    self._ref("path", self._path_text(keyword_path), call, name),
+                    streaming=streaming,
                 )
         elif name == "jdbc":
             self.facts.notes.append(
@@ -1106,7 +1174,7 @@ class _Reader:
             extra["mode"] = (
                 self._literal(self._arg(call, mode_at, "mode")) or mode or ""
             ).lower() or None
-            self._add_write(self._ref("path", self._text(node), call, name), **extra)
+            self._add_write(self._ref("path", self._path_text(node), call, name), **extra)
 
     def _on_write_v2(self, call: ast.Call, own: Sequence[_Link], start: _Link) -> None:
         terminal = own[-1] if own else None
@@ -1321,10 +1389,13 @@ def read_job(
     helpers: Optional[Mapping[str, HelperSpec]] = None,
     session_names: Iterable[str] = DEFAULT_SESSION_NAMES,
     shown: Optional[str] = None,
+    path_rules: Sequence[Tuple[str, bool]] = (),
 ) -> JobFacts:
     """What ``module`` reads, writes and streams. See the module docstring. ``shown`` is the
-    path reports name the file by (default: the module's own relative path)."""
-    return _Reader(module, folder, helpers or {}, session_names, shown).run()
+    path reports name the file by (default: the module's own relative path). ``path_rules`` are
+    the conventions' data path rules as ``(prefix, names a table)``: a path of which only the
+    beginning folds is read as the table such a rule gives it (:func:`path_root`)."""
+    return _Reader(module, folder, helpers or {}, session_names, shown, path_rules).run()
 
 
 __all__ = [
@@ -1335,6 +1406,7 @@ __all__ = [
     "Ref",
     "Stream",
     "Write",
+    "path_root",
     "read_job",
     "split_table_name",
 ]
