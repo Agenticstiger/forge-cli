@@ -251,8 +251,11 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _JUDGED_BY_NAME = frozenset({*_HOST_FIELDS, *_QUERY_STRING_FIELDS, *_DATABASE_FIELDS, "port"})
 
 #: The SSH tunnels a client can connect through, as ``(field, host key, off)``:
-#: the Singer taps' ``ssh_tunnel`` (``enable: false`` is off) and Airbyte's
-#: ``tunnel_method`` (``tunnel_method: NO_TUNNEL`` is off).
+#: the Singer taps' ``ssh_tunnel``, on only when ``enable`` is set and true
+#: (MeltanoLabs tap-postgres and tap-mysql read ``.get("enable", False)``), and
+#: Airbyte's ``tunnel_method``, off for ``tunnel_method: NO_TUNNEL`` in any case
+#: (its connectors read no other spelling as no tunnel, and refuse one they do
+#: not know).
 _TUNNELS: Tuple[Tuple[str, str, Tuple[str, Any]], ...] = (
     ("ssh_tunnel", "host", ("enable", False)),
     ("tunnel_method", "tunnel_host", ("tunnel_method", "NO_TUNNEL")),
@@ -897,12 +900,16 @@ def _tunnels_in_use(connection: Mapping[str, Any]) -> Iterator[Tuple[str, str, A
 
 
 def _switched_off(tunnel: Mapping[str, Any], off_key: str, off_value: Any) -> bool:
-    """``enable`` present and false (the taps read it so), or ``tunnel_method: NO_TUNNEL``."""
-    if off_key not in tunnel:
-        return False
+    """``enable`` absent or false (the taps read ``.get("enable", False)``), or ``NO_TUNNEL``.
+
+    ``tunnel_method`` is compared in any case and without blanks: Airbyte reads
+    ``NO_TUNNEL`` as no tunnel and refuses any value it does not know, so no
+    other spelling connects anywhere.
+    """
     if off_value is False:
-        return not tunnel[off_key]
-    return bool(tunnel[off_key] == off_value)
+        return not tunnel.get(off_key)
+    value = tunnel.get(off_key)
+    return isinstance(value, str) and value.strip().upper() == off_value
 
 
 def _field_hosts(field_name: str, raw: Any) -> List[Optional[str]]:

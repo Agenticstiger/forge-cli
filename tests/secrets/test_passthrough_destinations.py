@@ -232,3 +232,41 @@ def test_a_socket_is_this_machine_behind_a_tunnel_too():
         "ssh_tunnel": {"enable": True, "host": "bastion.example"},
     }
     assert _refusal(connection, {ALLOWLIST_ENV: "PG@bastion.example"}) is None
+
+
+# ── a tunnel its connector leaves off ────────────────────────────────────────
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "tunnel",
+    [
+        {"ssh_tunnel": {"host": ELSEWHERE, "port": 22}},
+        {"ssh_tunnel": {"enable": None, "host": ELSEWHERE}},
+        {"tunnel_method": {"tunnel_method": "no_tunnel", "tunnel_host": ELSEWHERE}},
+        {"tunnel_method": {"tunnel_method": " No_Tunnel ", "tunnel_host": ELSEWHERE}},
+    ],
+)
+def test_a_tunnel_its_connector_leaves_off_is_not_judged(tunnel):
+    assert _refusal({"host": "localhost", **tunnel}) is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "tunnel",
+    [
+        {"ssh_tunnel": {"enable": "false", "host": ELSEWHERE}},
+        {"ssh_tunnel": {"enable": 1, "host": ELSEWHERE}},
+        {"tunnel_method": {"tunnel_host": ELSEWHERE}},
+        {"tunnel_method": {"tunnel_method": "SSH_KEY_AUTH", "tunnel_host": ELSEWHERE}},
+    ],
+)
+def test_a_tunnel_its_connector_may_use_is_judged(tunnel):
+    assert _refusal({"host": "localhost", **tunnel}) is not None
+
+
+@pytest.mark.unit
+def test_validate_leaves_a_tunnel_without_enable_alone():
+    finding = _lint({"host": "localhost", "ssh_tunnel": {"host": "{{ env.BASTION }}"}})
+    assert finding.ok
+    assert finding.deferred is None
