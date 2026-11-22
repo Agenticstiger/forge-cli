@@ -200,6 +200,10 @@ _PROVIDER_KEY_RES = (
         r"(?i)\bhttps?://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/api(?:/v\d{1,2})?/webhooks/"
         r"\d{5,25}/[A-Za-z0-9_\-]{20,128}"
     ),
+    # A signed URL's signature (``sig=``): it alone lets the holder post to a Teams Workflows
+    # webhook (``*.logic.azure.com/workflows/...``, ``*.api.powerplatform.com/...``) or read an
+    # Azure SAS URL. The URL around it is kept.
+    re.compile(r"(?i)(?<=[?&]sig=)[A-Za-z0-9%_\-]{16,256}"),
     # An AWS Signature Version 4 ``Authorization`` value: the access key id, the signed headers
     # and the signature, which a request object's ``repr`` prints with the header.
     re.compile(
@@ -853,7 +857,8 @@ def _is_secret_holding_key(key: Any) -> bool:
 def _is_sensitive_key(key: Any) -> bool:
     if not isinstance(key, str):
         return False
-    lowered = key.lower()
+    # ``x-api-key`` and ``routing-key`` are read as ``x_api_key`` and ``routing_key``.
+    lowered = key.lower().replace("-", "_")
     return any(part in lowered for part in _SENSITIVE_KEY_PARTS) or (
         _NON_ALNUM_RE.sub("", lowered) in _SENSITIVE_KEY_NAMES
     )

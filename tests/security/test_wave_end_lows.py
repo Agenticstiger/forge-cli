@@ -25,6 +25,7 @@ from fluid_build.providers.snowflake.util.logging import redact_dict, redact_str
 pytestmark = pytest.mark.unit
 
 TOKEN = "0f8fad5b" + "d9cb469f" + "a1657086" + "7728950e"
+SIG = "Zx9" + "Qw7Lp" * 6 + "%3D"
 GH = "gh" + "p_" + "A1b2C3d4" * 5
 PW = "Pa" + "ss-w0rd-X"
 
@@ -48,7 +49,9 @@ def test_the_short_and_signing_key_names_are_masked_by_both_layers(key: str) -> 
         assert PW not in str(redacted) and redacted["region"] == "eu", key
 
 
-@pytest.mark.parametrize("name", ["monkey", "primary_key", "signature", "keyspace", "sigma"])
+@pytest.mark.parametrize(
+    "name", ["monkey", "primary_key", "signature", "keyspace", "sigma", "primary-key", "sort-key"]
+)
 def test_a_name_that_only_holds_key_or_sig_is_not_masked(name: str) -> None:
     payload = {name: "value-kept"}
     assert redact_value(payload) == payload and redact_dict(payload) == payload
@@ -113,6 +116,7 @@ def test_a_short_value_with_no_credential_key_stays_visible(clean_registry) -> N
 
 
 def test_a_short_credential_in_the_env_is_registered(clean_registry) -> None:
+    # pragma: allowlist nextline secret
     assert sr.register_secrets_from_environ({"DB_PASSWORD": "pw", "REGION": "eu"}) == 1
     assert redact_secret_text("login pw ok in eu") == "login ***REDACTED*** ok in eu"
     assert redact_string("login pw ok in eu") == "login [REDACTED] ok in eu"
@@ -143,6 +147,12 @@ def test_a_short_credential_that_is_a_key_word_is_still_refused(clean_registry) 
         "apiKey",
         "routing-key",
         "accesstoken",
+        "password2",
+        "tokenvalue",
+        "secretvalue",
+        "passwordhash",
+        "apikeyvalue",
+        "secretkeyid",
     ],
 )
 def test_an_option_key_that_names_a_credential_is_refused(key: str) -> None:
@@ -152,7 +162,17 @@ def test_an_option_key_that_names_a_credential_is_refused(key: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "key", ["max_tokens", "tokenizer", "author", "authority", "dedup_key", "monkey", "secretary"]
+    "key",
+    [
+        "max_tokens",
+        "tokens",
+        "tokenizer",
+        "author",
+        "authority",
+        "dedup_key",
+        "monkey",
+        "secretary",
+    ],
 )
 def test_an_option_key_that_only_holds_a_part_is_not(key: str) -> None:
     from fluid_build.alerts.routes import secret_option_key
@@ -244,6 +264,7 @@ def test_a_path_segment_that_is_a_provider_token_is_masked(path: str) -> None:
 
     shown = scrub_path(path)
     assert "REDACTED" in shown and shown.split("/")[-1] in ("x", "y")
+    # pragma: allowlist nextline secret
     assert GH not in shown and "ABCDEFGH23456789" not in shown and "a1B2c3D4e5" not in shown
 
 
@@ -597,9 +618,9 @@ def test_the_camel_case_alert_key_names_are_masked_by_both_layers(key: str) -> N
 
 
 WEBHOOKS = {
-    "teams workflows": "https://contoso.webhook.office.com/webhookb2/"
+    "teams connector": "https://contoso.webhook.office.com/webhookb2/"
     f"{TOKEN}@{TOKEN}/IncomingWebhook/{TOKEN}",
-    "teams connector": f"https://outlook.office.com/webhook/{TOKEN}@{TOKEN}/IncomingWebhook/{TOKEN}",
+    "teams connector (outlook)": f"https://outlook.office.com/webhook/{TOKEN}@{TOKEN}/IncomingWebhook/{TOKEN}",
     "discord": "https://discord.com/api/webhooks/123456789012345678/" + "AbCd_" * 12,
     "discord app": "https://discordapp.com/api/v10/webhooks/123456789012345678/" + "AbCd_" * 12,
 }
@@ -612,6 +633,36 @@ def test_a_chat_webhook_url_is_masked_by_both_layers(name: str) -> None:
     secret = url.rsplit("/", 1)[-1]
     for out in (redact_secret_text(line), redact_string(line)):
         assert secret not in out and out.endswith("(end)"), name
+
+
+#: Signed URLs, whose ``sig=`` alone lets the holder post or read.
+SIGNED = {
+    "teams workflows (logic apps)": "https://prod-12.westeurope.logic.azure.com:443/workflows/"
+    f"{TOKEN}/triggers/manual/paths/invoke?api-version=2016-06-01&sv=1.0&sig={SIG}",
+    "teams workflows (power platform)": "https://default0a1b.2c.environment.api.powerplatform.com"
+    f"/powerautomate/automations/direct/workflows/{TOKEN}/triggers/manual/paths/invoke"
+    f"?api-version=1&sv=1.0&sig={SIG}",
+    "azure sas": f"https://acct.blob.core.windows.net/c/f.csv?sv=2022-11-02&sig={SIG}&se=2030",
+}
+
+
+@pytest.mark.parametrize("name", sorted(SIGNED))
+def test_a_signed_url_loses_its_signature_and_keeps_its_address_in_both_layers(name: str) -> None:
+    line = f"posting to {SIGNED[name]} (end)"
+    for out in (redact_secret_text(line), redact_string(line)):
+        assert SIG not in out and "sig=" in out and out.endswith("(end)"), name
+
+
+def test_a_short_sig_parameter_is_not_a_signature() -> None:
+    line = "https://example.org/search?sig=abc&q=1"
+    assert redact_secret_text(line) == line and redact_string(line) == line
+
+
+@pytest.mark.parametrize("key", ["x-api-key", "X-Api-Key", "routing-key", "private-key"])
+def test_a_hyphenated_credential_key_is_masked_by_both_layers(key: str, clean_registry) -> None:
+    payload = {key: PW, "summary": "kept"}
+    for redacted in (redact_value(payload), redact_dict(payload)):
+        assert PW not in str(redacted) and redacted["summary"] == "kept", key
 
 
 def test_an_ordinary_office_or_discord_url_stays() -> None:

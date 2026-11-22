@@ -214,25 +214,32 @@ def _option_problems(value: Any, where: str, depth: int = 0) -> List[str]:
     return [f"{where} is a {type(value).__name__}, not a JSON value"]
 
 
-#: A key is read as words: a ``_``, ``-``, ``.`` or a change of case ends one (``signingKey``).
-_KEY_WORDS = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
+#: A key is read as words: a ``_``, ``-``, ``.``, a change of case (``signingKey``) or a digit
+#: after a letter (``password2``) ends one.
+_KEY_WORDS = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Za-z])(?=[0-9])")
 #: Names of a credential that the redactor's parts do not spell as one word.
 _SECRET_WORDS = frozenset(
     {"credentials", "secrets", "passwords", "passphrases", "oauth", "secretkey", "accesskey"}
     | {"secretaccesskey"}
 )
-#: A word that ends in one of these is a credential's (``accesstoken``, ``dbpassword``), and one
-#: that only starts with one is not (``tokenizer``, ``secretary``); ``tokens`` (``max_tokens``)
-#: counts a quantity.
+#: A word that ends or starts with one of these is a credential's (``accesstoken``, ``dbpassword``,
+#: ``tokenvalue``, ``passwordhash``), unless it is one of :data:`_NOT_SECRET_WORDS`.
 _SECRET_ENDINGS = ("secret", "token", "password", "passwd", "passphrase", "apikey", "credential")
+#: Ordinary words that start with a credential's name: ``tokens`` (``max_tokens``) counts a
+#: quantity.
+_NOT_SECRET_WORDS = frozenset(
+    {"tokens", "tokenize", "tokenized", "tokenizer", "tokenizers", "tokenization"}
+    | {"secretary", "secretaries", "secretariat"}
+)
 
 
 def secret_option_key(key: str) -> bool:
     """Whether an option key names a credential, as the redactor reads key names, but by whole
     words: its parts (``api_key``, ``password``, ``routing_key``, ``token``, ``signingKey``, ...)
     in any case and spelling (``apiKey``, ``routing-key``), and the names that are a credential's
-    only as the whole key (``key``, ``pwd``, ``sig``). A word that only holds a part is not one
-    (``author``, ``tokenizer``, ``max_tokens``), so a harmless option is not refused."""
+    only as the whole key (``key``, ``pwd``, ``sig``), and a word that starts with one
+    (``tokenvalue``, ``password2``). A word that only holds a part is not one (``author``,
+    ``tokenizer``, ``max_tokens``), so a harmless option is not refused."""
     from fluid_build.observability.secret_redactor import (
         _SENSITIVE_KEY_NAMES,
         _SENSITIVE_KEY_PARTS,
@@ -250,7 +257,11 @@ def secret_option_key(key: str) -> bool:
             joined += word
             if joined in known:
                 return True
-    return any(word.endswith(_SECRET_ENDINGS) for word in words)
+    return any(
+        word.endswith(_SECRET_ENDINGS)
+        or (word.startswith(_SECRET_ENDINGS) and word not in _NOT_SECRET_WORDS)
+        for word in words
+    )
 
 
 def _connection_problem(value: Any) -> str:

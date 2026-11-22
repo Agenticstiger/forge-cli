@@ -85,6 +85,10 @@ SENSITIVE_PATTERNS = [
         r"(?i)\bhttps?://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/api(?:/v\d{1,2})?/webhooks/"
         r"\d{5,25}/[A-Za-z0-9_\-]{20,128}"
     ),
+    # A signed URL's signature, as in the global layer (``sig=``): it alone lets the holder post to a Teams Workflows
+    # webhook (``*.logic.azure.com/workflows/...``, ``*.api.powerplatform.com/...``) or read an
+    # Azure SAS URL. The URL around it is kept.
+    re.compile(r"(?i)(?<=[?&]sig=)[A-Za-z0-9%_\-]{16,256}"),
     # Snowflake passwords and connection strings.
     # NOTE: the bare ``password=...`` shape is handled by the named-group
     # assignment pattern below (it keeps the ``password=`` key prefix); a
