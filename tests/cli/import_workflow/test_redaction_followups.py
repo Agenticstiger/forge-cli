@@ -251,3 +251,9 @@ def test_a_setting_too_deep_to_read_is_hidden_when_it_names_a_credential():
     deep = R._Words(R._MAX_DEPTH)
     assert deep._setting("run --password QZXV7391", "-c") == MASK
     assert deep._setting("run --table orders", "-c") == "run --table orders"
+
+
+def test_a_word_too_deep_to_read_is_hidden_whole_when_it_names_a_credential():
+    deep = R._Words(R._MAX_DEPTH)
+    assert deep._multi_word("mysql --password QZXV7391 -e select") == MASK
+    assert deep._multi_word("mysql --table orders -e select") == "mysql --table orders -e select"
