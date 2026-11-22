@@ -46,7 +46,10 @@ _CREDENTIAL_KEY_WORDS = (
     r"client_secret|credentials?|oauth[_-]?token|password|passphrase|"
     r"private[_-]?key(?:_passphrase)?|session[_-]token|secret|token|"
     # PagerDuty's Events API key, by its two names
-    r"routing[_-]?key|integration[_-]?key"
+    r"routing[_-]?key|integration[_-]?key|genie[_-]?key|"
+    # the short spelling of a password, and the keys that sign (``pwd`` is a dict-key name only:
+    # as an assignment it would eat the text after ``MYSQL_PWD=<value>``)
+    r"passwd|signing[_-]?key|hmac[_-]?key"
 )
 
 _REDACTED = "***REDACTED***"
@@ -74,8 +77,15 @@ _SENSITIVE_KEY_PARTS = (
     "connection_string",
     "connection_url",
     "credential",
+    "hmac_key",
+    "hmackey",
+    # Opsgenie's key, and the camelCase spellings of PagerDuty's two (a JSON body's
+    # ``routingKey``, an options map's ``integrationKey``)
+    "genie_key",
+    "geniekey",
     # PagerDuty's Events API key (``routing_key`` in the request, the integration key)
     "integration_key",
+    "integrationkey",
     # ``sasl.jaas.config`` (incl. the connector's ``iceberg.kafka.sasl.jaas.config``)
     # carries the SASL password/token inside the value, but the key name has no
     # other sensitive substring — so the substring matcher misses it without this
@@ -83,14 +93,27 @@ _SENSITIVE_KEY_PARTS = (
     "jaas",
     "jwt",
     "oauth_token",
+    "passwd",
     "password",
     "passphrase",
     "private_key",
     "routing_key",
+    "routingkey",
     "secret",
     "session_token",
+    "signing_key",
+    "signingkey",
     "token",
 )
+# Names that are a credential's only as the WHOLE key (lower case, every character that is not a
+# letter or a digit dropped): as parts they would match ``monkey``, ``primary_key`` and
+# ``signature``. ``pwd`` is the short spelling of a password; ``key`` and ``sig`` alone name the
+# secret in a signed request.
+_SENSITIVE_KEY_NAMES = frozenset({"key", "pwd", "sig"})
+# Of those, the ones whose value is NOT registered as a secret literal: a bare ``key`` holds an
+# identifier as often as a secret, and every later line would have that identifier masked.
+_AMBIGUOUS_KEY_NAMES = frozenset({"key", "sig"})
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]")
 # A JWT, JWS or JWE in compact form (RFC 7519, RFC 7515 §7.1, RFC 7516 §7.1):
 # base64url segments joined by ``.``, the first of them the protected header, a JSON
 # object. Every JOSE library writes that object as ``{"``, which base64url-encodes to
@@ -167,6 +190,26 @@ _PROVIDER_KEY_RES = (
     ),
     # Opsgenie's API key as its Authorization header carries it.
     re.compile(r"(?i)\bGenieKey\s{1,8}[A-Za-z0-9-]{20,128}"),
+    # Incoming webhooks whose URL is the secret: Microsoft Teams (the Workflows and the
+    # Office 365 connector forms) and Discord.
+    re.compile(
+        r"(?i)\bhttps?://[a-z0-9.\-]{1,100}\.webhook\.office(?:365)?\.com/[A-Za-z0-9/_@.\-]{8,512}"
+    ),
+    re.compile(r"(?i)\bhttps?://outlook\.office(?:365)?\.com/webhook/[A-Za-z0-9/_@.\-]{8,512}"),
+    re.compile(
+        r"(?i)\bhttps?://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/api(?:/v\d{1,2})?/webhooks/"
+        r"\d{5,25}/[A-Za-z0-9_\-]{20,128}"
+    ),
+    # A signed URL's signature (``sig=``): it alone lets the holder post to a Teams Workflows
+    # webhook (``*.logic.azure.com/workflows/...``, ``*.api.powerplatform.com/...``) or read an
+    # Azure SAS URL. The URL around it is kept.
+    re.compile(r"(?i)(?<=[?&]sig=)[A-Za-z0-9%_\-]{16,256}"),
+    # An AWS Signature Version 4 ``Authorization`` value: the access key id, the signed headers
+    # and the signature, which a request object's ``repr`` prints with the header.
+    re.compile(
+        r"(?i)\bAWS4-HMAC-SHA256\s{1,8}Credential=[^\s,'\"]{1,256}"
+        r"(?:,\s{0,8}SignedHeaders=[^\s,'\"]{1,512})?(?:,\s{0,8}Signature=[0-9a-f]{16,128})?"
+    ),
     re.compile(r"\bhf_[A-Za-z0-9]{30,}"),  # HuggingFace
     re.compile(r"\br8_[A-Za-z0-9]{30,}"),  # Replicate
     re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"),  # GitLab PAT
@@ -205,6 +248,17 @@ _FERNET_TOKEN_RE = re.compile(r"\bgAAAAA[A-Za-z0-9_-]{20,}")
 # turned ``postgres://u:***@db/x`` into ``postgres://u:***REDACTED***@db/x``.
 _URL_USERINFO_RE = re.compile(
     r"([A-Za-z][A-Za-z0-9+.\-]{0,40}://[^/?#@:\s]{0,256}:)(?!\*{3}@)[^/?#@\s]{1,4096}(@)"
+)
+# The other userinfo shape: a token as the ONLY userinfo, ``https://<token>@host`` (a ``git clone``
+# URL, a personal access token or an API key), with no ``:`` for :data:`_URL_USERINFO_RE` to
+# start at. A user name is no secret and stays (``https://alice@host``), so only a run of 16 or
+# more characters of a token's alphabet that holds both a letter and a digit is masked. Two
+# unnamed groups (the text up to the token, and the ``@``), rendered like the rule above, and
+# shared with the Snowflake twin. Every repeat is length-bounded.
+_URL_TOKEN_USERINFO_RE = re.compile(
+    r"([A-Za-z][A-Za-z0-9+.\-]{0,40}://)"
+    r"(?=[A-Za-z0-9_.~%\-]{0,256}\d)(?=[A-Za-z0-9_.~%\-]{0,256}[A-Za-z])"
+    r"[A-Za-z0-9_.~%\-]{16,256}(@)"
 )
 # Oracle JDBC thin / OCI URL with the login in it, ``jdbc:oracle:thin:user/password@host:1521/svc``
 # (``@//host`` too; ``oci``, ``oci8``, ``kprb``; any case). The password is what stands between
@@ -388,8 +442,19 @@ def _warn_once(key: str, message: str, *args: Any) -> None:
     _registry_log.warning(message, *args)
 
 
-def _acceptable_secret(value: Any) -> str | None:
-    """Return ``value`` when it is safe to register as an exact-match secret."""
+_KEY_VOCABULARY_WORDS = frozenset(
+    word for entry in _KEY_VOCABULARY for word in re.split(r"[^a-z0-9]+", entry) if word
+)
+
+
+def _acceptable_secret(value: Any, *, credential_key: bool = False) -> str | None:
+    """Return ``value`` when it is safe to register as an exact-match secret.
+
+    ``credential_key``: the value is held under a key that names a credential (``password``,
+    ``token``, ...), so it is a secret whatever its length, and a short one is accepted: it is
+    then masked only where it stands as a whole word (:func:`redact_known_values`), never inside
+    another word. The length rule is for a value with no such key to vouch for it.
+    """
     if not isinstance(value, str) or not value.strip():
         # Empty / non-string: nothing to mask, and masking "" would replace
         # every character boundary in every log line.
@@ -400,6 +465,10 @@ def _acceptable_secret(value: Any) -> str | None:
         # IaC env-template guard deliberately leaves literal so operators can
         # see which variable was refused.
         return None
+    if credential_key and len(value) < _MIN_REGISTERED_SECRET_LEN:
+        # Held under a credential's key: kept at any length. Only a value that is a whole word
+        # of a key name is refused (masking ``key`` would rewrite ``api-key`` in every line).
+        return None if value.lower() in _KEY_VOCABULARY_WORDS else value
     if len(value) < _MIN_REGISTERED_SECRET_LEN:
         _warn_once(
             "short-secret",
@@ -425,8 +494,12 @@ def _acceptable_secret(value: Any) -> str | None:
     return value
 
 
-def register_secret(value: Any) -> bool:
+def register_secret(value: Any, *, credential_key: bool = False) -> bool:
     """Register one literal credential for exact-match redaction.
+
+    ``credential_key``: the value comes from a key that names a credential (an env variable
+    ending in ``_PASSWORD``, a ``password:`` field), so it is registered at any length (see
+    :func:`_acceptable_secret`). Without it, a value under 6 characters is refused.
 
     Call this wherever a credential is resolved — env var, keyring adapter,
     contract literal — so every later log line, traceback and published
@@ -436,7 +509,7 @@ def register_secret(value: Any) -> bool:
     Registration is idempotent and process-wide; the registry is never
     persisted or serialized.
     """
-    secret = _acceptable_secret(value)
+    secret = _acceptable_secret(value, credential_key=credential_key)
     if secret is None:
         return False
     global _known_secrets
@@ -462,9 +535,9 @@ def register_secret(value: Any) -> bool:
     return True
 
 
-def register_secrets(values: Iterable[Any]) -> int:
+def register_secrets(values: Iterable[Any], *, credential_key: bool = False) -> int:
     """Register several literals; returns how many were accepted."""
-    return sum(1 for value in values if register_secret(value))
+    return sum(1 for value in values if register_secret(value, credential_key=credential_key))
 
 
 def collect_secret_values(payload: Any, *, max_depth: int = 12) -> tuple[str, ...]:
@@ -487,7 +560,7 @@ def collect_secret_values(payload: Any, *, max_depth: int = 12) -> tuple[str, ..
         if depth <= 0:
             return
         if isinstance(node, str):
-            if key_is_sensitive and _acceptable_secret(node) is not None:
+            if key_is_sensitive and _acceptable_secret(node, credential_key=True) is not None:
                 found.append(node)
             return
         if isinstance(node, Mapping):
@@ -495,7 +568,7 @@ def collect_secret_values(payload: Any, *, max_depth: int = 12) -> tuple[str, ..
                 return
             seen.add(id(node))
             for key, item in node.items():
-                _walk(item, depth - 1, _is_sensitive_key(key))
+                _walk(item, depth - 1, _is_secret_holding_key(key))
             return
         if isinstance(node, (list, tuple, set, frozenset)):
             if id(node) in seen:
@@ -510,8 +583,11 @@ def collect_secret_values(payload: Any, *, max_depth: int = 12) -> tuple[str, ..
 
 
 def register_secrets_from_payload(payload: Any, *, max_depth: int = 12) -> int:
-    """Register every credential-shaped literal found in ``payload``."""
-    return register_secrets(collect_secret_values(payload, max_depth=max_depth))
+    """Register every credential-shaped literal found in ``payload``: each is held under a key
+    that names a credential, so a short one is registered too."""
+    return register_secrets(
+        collect_secret_values(payload, max_depth=max_depth), credential_key=True
+    )
 
 
 # Env harvesting is governed by an ALLOWLIST of name suffixes, deliberately
@@ -568,7 +644,8 @@ def register_secrets_from_environ(environ: Mapping[str, str] | None = None) -> i
     for name, value in env.items():
         if not name.upper().endswith(_SECRET_ENV_SUFFIXES):
             continue
-        accepted += int(register_secret(value))
+        # the name vouches for the value: kept at any length
+        accepted += int(register_secret(value, credential_key=True))
     return accepted
 
 
@@ -603,13 +680,22 @@ def redact_known_values(
         return text
     candidates: tuple[str, ...] = _known_secrets
     if extra:
-        accepted = [s for s in (_acceptable_secret(e) for e in extra) if s is not None]
+        # What a caller passes it holds as a credential, so a short one counts too.
+        accepted = [
+            s for s in (_acceptable_secret(e, credential_key=True) for e in extra) if s is not None
+        ]
         if accepted:
             candidates = tuple(sorted(set(candidates).union(accepted), key=lambda s: (-len(s), s)))
     if not candidates:
         return text
     for secret in candidates:
-        if secret in text:
+        if len(secret) < _MIN_REGISTERED_SECRET_LEN:
+            # Held under a credential's key, at any length: masked where it stands as a whole
+            # word (never inside ``development``), so the line around it survives.
+            text = re.sub(
+                r"(?<![A-Za-z0-9_])" + re.escape(secret) + r"(?![A-Za-z0-9_])", placeholder, text
+            )
+        elif secret in text:
             text = text.replace(secret, placeholder)
     return text
 
@@ -705,6 +791,21 @@ def redact_jose_tokens(text: str, *, placeholder: str = _REDACTED) -> str:
     return _JWT_TWO_SEGMENT_RE.sub(placeholder, text)
 
 
+def redact_provider_tokens(text: str, *, placeholder: str = _REDACTED) -> str:
+    """``text`` with every provider-specific token shape masked (Stripe, GitHub, the cloud and
+    model-provider API keys, Slack, GitLab, Fernet, ...): shapes distinctive enough that a
+    match is a leak wherever it stands, with no ``key=`` in front. For callers that read a
+    value that is no log line, a data path for one, where the assignment rules would misread
+    ``a=b`` segments."""
+    if not isinstance(text, str) or not text:
+        return text
+    text = _STRIPE_KEY_RE.sub(placeholder, text)
+    text = _GITHUB_TOKEN_RE.sub(placeholder, text)
+    for provider_re in _PROVIDER_KEY_RES:
+        text = provider_re.sub(placeholder, text)
+    return _FERNET_TOKEN_RE.sub(placeholder, text)
+
+
 def redact_secret_text(text: str, *, extra_secrets: Iterable[str] = ()) -> str:
     """Redact secret-like substrings in plain text.
 
@@ -727,16 +828,14 @@ def redact_secret_text(text: str, *, extra_secrets: Iterable[str] = ()) -> str:
     # S-010: provider-token shapes run before the assignment regex so
     # ``api_key=sk_live_...`` hits the Stripe pattern in addition to the
     # assignment pattern, which also works.
-    redacted = _STRIPE_KEY_RE.sub(_REDACTED, redacted)
-    redacted = _GITHUB_TOKEN_RE.sub(_REDACTED, redacted)
-    for provider_re in _PROVIDER_KEY_RES:
-        redacted = provider_re.sub(_REDACTED, redacted)
-    redacted = _FERNET_TOKEN_RE.sub(_REDACTED, redacted)
+    redacted = redact_provider_tokens(redacted)
     # Mask the password in any ``scheme://user:password@host`` URL (scheme/user/  # pragma: allowlist secret
     # host preserved). Runs before the assignment regex so a credentialed URL is
     # scrubbed even when its key name isn't credential-shaped (``uri=https://u:p@h``,
     # ``connection_url=...``).
     redacted = _URL_USERINFO_RE.sub(r"\1" + _REDACTED + r"\2", redacted)
+    # A token as the only userinfo (``https://<token>@host``), which has no ``:`` to start at.
+    redacted = _URL_TOKEN_USERINFO_RE.sub(r"\1" + _REDACTED + r"\2", redacted)
     # The same for an Oracle JDBC URL, whose login has no ``://`` and no ``:`` before the password.
     redacted = _ORACLE_JDBC_RE.sub(r"\1" + _REDACTED + r"\2", redacted)
     # Mask the whole sasl.jaas.config value BEFORE the assignment regex (which
@@ -746,11 +845,23 @@ def redact_secret_text(text: str, *, extra_secrets: Iterable[str] = ()) -> str:
     return redacted
 
 
+def _is_secret_holding_key(key: Any) -> bool:
+    """A credential-shaped key whose value is a secret to register as a literal: not a bare
+    ``key`` or ``sig``, which hold an identifier as often as a secret (they are masked where
+    they stand, not everywhere their value appears)."""
+    if not _is_sensitive_key(key):
+        return False
+    return _NON_ALNUM_RE.sub("", str(key).lower()) not in _AMBIGUOUS_KEY_NAMES
+
+
 def _is_sensitive_key(key: Any) -> bool:
     if not isinstance(key, str):
         return False
-    lowered = key.lower()
-    return any(part in lowered for part in _SENSITIVE_KEY_PARTS)
+    # ``x-api-key`` and ``routing-key`` are read as ``x_api_key`` and ``routing_key``.
+    lowered = key.lower().replace("-", "_")
+    return any(part in lowered for part in _SENSITIVE_KEY_PARTS) or (
+        _NON_ALNUM_RE.sub("", lowered) in _SENSITIVE_KEY_NAMES
+    )
 
 
 def is_sensitive_key_name(name: str) -> bool:
@@ -785,7 +896,23 @@ def redact_value(value: Any) -> Any:
         # rendered text like any other string so a credential in the exception
         # body can't leak.
         return redact_secret_text(str(value))
-    return value
+    return _redact_object(value)
+
+
+def _redact_object(value: Any) -> Any:
+    """``value`` itself, or its masked text when it is an object whose own text holds a secret
+    (a request object whose ``repr`` prints its ``Authorization`` header): a log call that binds
+    one as an argument shows that text, not a string this module would have scanned. Numbers,
+    booleans and ``None`` are returned as they are; an object whose text cannot be made, or that
+    holds nothing to mask, is too."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    try:
+        rendered = str(value)
+    except Exception:  # noqa: BLE001 - a log call must never fail on an argument's own text
+        return value
+    masked = redact_secret_text(rendered)
+    return value if masked == rendered else masked
 
 
 def _scan_sensitive_placeholders(msg: str) -> tuple[set[int], set[str]]:
@@ -837,9 +964,9 @@ def _redact_positional_args(args: Any, sensitive_indices: set[int]) -> Any:
             # rendered text through the same redactor as any other string.
             redacted_items.append(redact_secret_text(str(arg)))
         else:
-            # Non-string scalars (int, float, bool, None, custom objects) are
-            # preserved so observability metrics aren't clobbered.
-            redacted_items.append(arg)
+            # Numbers, booleans and ``None`` are preserved so observability metrics
+            # aren't clobbered; an object is too, unless its own text holds a secret.
+            redacted_items.append(_redact_object(arg))
     return tuple(redacted_items) if isinstance(args, tuple) else redacted_items
 
 
@@ -859,7 +986,7 @@ def _redact_named_args(args: Mapping[str, Any], sensitive_names: set[str]) -> di
             # embedded in a logged exception body doesn't leak.
             redacted[key] = redact_secret_text(str(value))
         else:
-            redacted[key] = value
+            redacted[key] = _redact_object(value)
     return redacted
 
 

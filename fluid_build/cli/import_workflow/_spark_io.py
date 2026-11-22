@@ -382,6 +382,28 @@ def split_table_name(text: str) -> List[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+def _setting_pairs(call: ast.Call) -> List[Tuple[ast.expr, ast.expr]]:
+    """The ``(key, value)`` expressions a Spark settings call sets: ``config(key, value)``,
+    ``set(key, value)``, either with ``key=`` and ``value=``, and ``setAll([(key, value), ...])``.
+    """
+    attr = call.func.attr if isinstance(call.func, ast.Attribute) else ""
+    if attr == "setAll":
+        pairs = call.args[0] if call.args else None
+        if not isinstance(pairs, (ast.List, ast.Tuple)):
+            return []
+        return [
+            (item.elts[0], item.elts[1])
+            for item in pairs.elts
+            if isinstance(item, (ast.List, ast.Tuple)) and len(item.elts) == 2
+        ]
+    if len(call.args) >= 2:
+        return [(call.args[0], call.args[1])]
+    named = {kw.arg: kw.value for kw in call.keywords if kw.arg}
+    key = call.args[0] if call.args else named.get("key")
+    value = named.get("value")
+    return [(key, value)] if key is not None and value is not None else []
+
+
 def _normalise_table(value: str) -> Tuple[Tuple[str, ...], str]:
     parts = tuple(p.lower() for p in split_table_name(value))
     return parts, value.strip()
@@ -475,12 +497,14 @@ class _Reader:
                         "is not a constant: a read of a table this file does not name may be "
                         "that view"
                     )
-            elif func.attr in {"config", "set"} and len(call.args) >= 2:
-                key = self.folder.string(call.args[0])
-                if key == "spark.sql.streaming.checkpointLocation":
-                    value = self.folder.string(call.args[1])
-                    if isinstance(value, str):
-                        self.default_checkpoint = value
+            elif func.attr in {"config", "set", "setAll"}:
+                for key_node, value_node in _setting_pairs(call):
+                    # only this one setting is kept: the value of any other (a credential among
+                    # them) is never read, so it can reach neither a contract nor the report
+                    if self.folder.string(key_node) == "spark.sql.streaming.checkpointLocation":
+                        value = self.folder.string(value_node)
+                        if isinstance(value, str):
+                            self.default_checkpoint = value
         self._register_views(calls)
 
     def _register_views(self, calls: Sequence[ast.Call]) -> None:

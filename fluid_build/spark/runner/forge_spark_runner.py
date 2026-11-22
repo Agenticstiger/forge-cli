@@ -2390,7 +2390,11 @@ def _iterated(value) -> int:
 def orphan_location_problem(location: str) -> str:
     """Why removing orphan files under ``location`` could reach files that are not the table's,
     or ``""``: a bucket root, or a ``.`` / ``..`` segment, which Iceberg keeps as written and the
-    file listing resolves (``s3://b/x/..`` lists the whole bucket)."""
+    file listing resolves (``s3://b/x/..`` lists the whole bucket). A ``#``, a ``?`` or a control
+    character is refused before the location is parsed: a parser would end the path there, and
+    what follows (``x#/..``) is part of the location as Iceberg keeps it."""
+    if any(char in "#?" or ord(char) < 0x20 or ord(char) == 0x7F for char in location):
+        return "holds a '#', a '?' or a control character"
     path = urllib.parse.urlsplit(location).path
     if any(part in (".", "..") for part in path.split("/")):
         return "holds a '.' or '..' segment"

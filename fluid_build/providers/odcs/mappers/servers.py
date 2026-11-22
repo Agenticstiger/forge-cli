@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
@@ -334,6 +335,13 @@ _QUERY_OR_FRAGMENT_RE = re.compile(r"[?#]")
 _USERINFO_PASSES = 3
 
 
+def _authority(url: str) -> str:
+    """What stands between ``//`` and the next ``/``, a ``?`` or a ``#`` included: a password
+    may hold either, and a ``?`` or ``#`` in it does not end the part that holds an ``@``."""
+    found = re.match(r"^(?:[A-Za-z][A-Za-z0-9+.\-]*:)?//([^/]*)", url)
+    return found.group(1) if found else ""
+
+
 def _without_userinfo(url: str) -> str:
     """``url`` without a ``user:password@`` part: the catalogUrl is published, a credential is not.
 
@@ -359,7 +367,9 @@ def _without_userinfo(url: str) -> str:
             "the Iceberg catalog uri holds a user and password that cannot be cut: not written"
         )
         return ""
-    if "@" in _QUERY_OR_FRAGMENT_RE.split(url, maxsplit=1)[0]:
+    if "@" in _QUERY_OR_FRAGMENT_RE.split(url, maxsplit=1)[0] or any(
+        "@" in _authority(form) for form in (url, unicodedata.normalize("NFKC", url))
+    ):
         LOG.warning(
             "the Iceberg catalog uri holds a user and password that cannot be cut: not written"
         )

@@ -203,7 +203,7 @@ def _option_problems(value: Any, where: str, depth: int = 0) -> List[str]:
             if not isinstance(key, str) or not _OPTION_KEY.match(key):
                 out.append(f"{where} has a key that is not a plain name {NOT_SHOWN}")
                 continue
-            if _secret_key(key):
+            if secret_option_key(key):
                 out.append(
                     f"{where}.{key} is named like a secret; a kind's secret belongs in the "
                     f"Airflow connection the route names, never in the DAG {NOT_SHOWN}"
@@ -214,18 +214,53 @@ def _option_problems(value: Any, where: str, depth: int = 0) -> List[str]:
     return [f"{where} is a {type(value).__name__}, not a JSON value"]
 
 
-def _secret_key(key: str) -> bool:
-    """Whether an option key names a credential, as the redactor reads key names: its parts
-    (``api_key``, ``password``, ``routing_key``, ``token``, ...) in any case and spelling
-    (``apiKey``, ``routing-key``)."""
+#: A key is read as words: a ``_``, ``-``, ``.``, a change of case (``signingKey``) or a digit
+#: after a letter (``password2``) ends one.
+_KEY_WORDS = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Za-z])(?=[0-9])")
+#: Names of a credential that the redactor's parts do not spell as one word.
+_SECRET_WORDS = frozenset(
+    {"credentials", "secrets", "passwords", "passphrases", "oauth", "secretkey", "accesskey"}
+    | {"secretaccesskey"}
+)
+#: A word that ends or starts with one of these is a credential's (``accesstoken``, ``dbpassword``,
+#: ``tokenvalue``, ``passwordhash``), unless it is one of :data:`_NOT_SECRET_WORDS`.
+_SECRET_ENDINGS = ("secret", "token", "password", "passwd", "passphrase", "apikey", "credential")
+#: Ordinary words that start with a credential's name: ``tokens`` (``max_tokens``) counts a
+#: quantity.
+_NOT_SECRET_WORDS = frozenset(
+    {"tokens", "tokenize", "tokenized", "tokenizer", "tokenizers", "tokenization"}
+    | {"secretary", "secretaries", "secretariat"}
+)
+
+
+def secret_option_key(key: str) -> bool:
+    """Whether an option key names a credential, as the redactor reads key names, but by whole
+    words: its parts (``api_key``, ``password``, ``routing_key``, ``token``, ``signingKey``, ...)
+    in any case and spelling (``apiKey``, ``routing-key``), and the names that are a credential's
+    only as the whole key (``key``, ``pwd``, ``sig``), and a word that starts with one
+    (``tokenvalue``, ``password2``). A word that only holds a part is not one (``author``,
+    ``tokenizer``, ``max_tokens``), so a harmless option is not refused."""
     from fluid_build.observability.secret_redactor import (
+        _SENSITIVE_KEY_NAMES,
         _SENSITIVE_KEY_PARTS,
-        is_sensitive_key_name,
     )
 
-    folded = re.sub(r"[^a-z0-9]", "", key.lower())
-    return is_sensitive_key_name(key) or any(
-        re.sub(r"[^a-z0-9]", "", part) in folded for part in _SENSITIVE_KEY_PARTS
+    if re.sub(r"[^a-z0-9]", "", key.lower()) in _SENSITIVE_KEY_NAMES:
+        return True
+    known = {re.sub(r"[^a-z0-9]", "", part) for part in _SENSITIVE_KEY_PARTS} | _SECRET_WORDS
+    words = [word.lower() for word in _KEY_WORDS.split(key) if word]
+    for start in range(len(words)):
+        joined = ""
+        for word in words[
+            start : start + 3
+        ]:  # ``api`` + ``key``, ``secret`` + ``access`` + ``key``
+            joined += word
+            if joined in known:
+                return True
+    return any(
+        word.endswith(_SECRET_ENDINGS)
+        or (word.startswith(_SECRET_ENDINGS) and word not in _NOT_SECRET_WORDS)
+        for word in words
     )
 
 
@@ -683,4 +718,5 @@ __all__ = [
     "plugin_alert_findings",
     "read_alert_plan",
     "requirements",
+    "secret_option_key",
 ]

@@ -327,6 +327,27 @@ _SESSION_ENV_VARS = (
 
 
 @pytest.fixture(autouse=True)
+def _environ_and_secrets_are_restored():
+    """No test sees an environment variable or a secret another test left behind.
+
+    The redactor masks every literal it has registered in every later line of the
+    process, and a short credential is masked as a whole word. A dotenv test left
+    ``SECRET=42`` in ``os.environ``; a later ``fluid validate`` registered it from the
+    environment, and a ``42`` in that test's validation message read as a secret. So the
+    environment is put back as the test found it, and the registered secrets are
+    forgotten.
+    """
+    saved = dict(os.environ)
+    yield
+    if dict(os.environ) != saved:
+        os.environ.clear()
+        os.environ.update(saved)
+    from fluid_build.observability import secret_redactor
+
+    secret_redactor.forget_known_secrets()
+
+
+@pytest.fixture(autouse=True)
 def _session_env_is_restored(monkeypatch):
     """No test leaves a provider key or ``OLLAMA_HOST`` behind for the next one.
 

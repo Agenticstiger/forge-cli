@@ -364,7 +364,10 @@ def _read_orphans(
 
 def option_problems(value: Any, where: str, depth: int = 0) -> List[str]:
     """What keeps a plugin action's ``options`` from reaching the job config: JSON values only,
-    no control character, no ``${`` and nothing the redactor masks. A value is never quoted."""
+    no control character, no ``${``, nothing the redactor masks, and no key the redactor reads as
+    a credential's (``password``, ``apiKey``, ``routing_key``, in any case or spelling), whatever
+    its value is. A value is never quoted."""
+    from fluid_build.alerts.routes import secret_option_key
     from fluid_build.observability.secret_redactor import redact_secret_text
 
     if depth > 4:
@@ -394,6 +397,12 @@ def option_problems(value: Any, where: str, depth: int = 0) -> List[str]:
         for key, item in list(value.items())[:50]:
             if not isinstance(key, str) or not _OPTION_KEY.match(key):
                 out.append(f"{where} has a key that is not a plain name (key not shown)")
+                continue
+            if secret_option_key(key):
+                out.append(
+                    f"{where}.{key} is named like a secret; a plugin reads its secrets itself, "
+                    "never from the contract (value not shown)"
+                )
                 continue
             out += option_problems(item, f"{where}.{key}", depth + 1)
         return out + ([f"{where} has more than 50 keys"] if len(value) > 50 else [])
@@ -446,6 +455,39 @@ def _read_actions(
 
 #: Path segments a listing resolves (``x/..`` is ``x``'s parent) that Iceberg keeps as written.
 _DOT_SEGMENTS = frozenset({".", ".."})
+
+
+def location_dot_segment_errors(contract: Mapping[str, Any]) -> List[str]:
+    """One message for each expose whose ``binding.location.path`` holds a ``.`` or ``..``
+    segment, whether or not it declares maintenance (an object-store location: one with a
+    bucket, or on AWS; a local file's path is left alone). Neither Iceberg
+    nor an IAM policy resolves one: the table is kept at ``<warehouse>/x/..`` as written, and a
+    listing, a grant or a write that does resolve it reaches the neighbour (``x/..`` is the
+    parent of ``x``)."""
+    errors: List[str] = []
+    for index, expose in enumerate(contract.get("exposes") or []):
+        if not isinstance(expose, Mapping):
+            continue
+        binding = _mapping(expose.get("binding"))
+        location = _mapping(binding.get("location"))
+        path = location.get("path")
+        # an object-store key (a bucket, or AWS, where the bucket may be derived): a local
+        # file's ``./out/x.parquet`` is a path on a disk, where the dots mean what they say
+        if not isinstance(path, str) or not (
+            location.get("bucket") or str(binding.get("platform") or "").lower() == "aws"
+        ):
+            continue
+        # a backslash is a separator to some parsers, so it splits a segment as ``/`` does
+        parts = path.replace("\\", "/").split("/")
+        if any(part.strip() in _DOT_SEGMENTS for part in parts):
+            name = expose.get("exposeId") or index
+            errors.append(
+                f"exposes[{name}] binding.location.path holds a '.' or '..' segment, which a "
+                "table's location keeps as written and a listing, a grant or a write resolves "
+                "(x/.. is the parent of x), so it can reach files that are not the table's; "
+                "write the path without one"
+            )
+    return errors
 
 
 def _object_location(expose: Mapping[str, Any]) -> Optional[Tuple[str, Tuple[str, ...]]]:

@@ -693,7 +693,8 @@ class TestDryRun:
         details = result["details"]
         assert details["dry_run"] is True and details["valid"] is True
         assert details["organization_id"] == ORG_A["id"]
-        assert details["headers"]["X-API-Key"] == "<redacted>"
+        # The provider writes its own placeholder; the console masks an x-api-key value too.
+        assert details["headers"]["X-API-Key"] in ("<redacted>", "***REDACTED***")
         assert details["headers"]["X-Organization-Id"] == ORG_A["id"]
         assert details["lookup"]["params"] == {
             "fluid_contract_id": "silver.subscription_status_summary",
