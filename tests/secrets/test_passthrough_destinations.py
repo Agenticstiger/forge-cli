@@ -298,10 +298,9 @@ def test_a_uri_in_any_container_is_a_destination(extra):
         {"docker": "unix:///var/run/docker.sock"},
         {"staging": "abfs://c@acct.dfs.core.windows.net/p"},
         {"warehouse": "hdfs://namenode:8020/wh"},
-        {"credentials": {"password": f"postgres://{ELSEWHERE}/x"}},  # pragma: allowlist secret
     ],
 )
-def test_storage_local_files_and_credentials_are_not_read(extra):
+def test_storage_and_local_files_name_no_host(extra):
     assert _refusal({"host": "localhost", **extra}) is None
 
 
@@ -351,3 +350,96 @@ def test_validate_leaves_a_uri_under_a_key_that_is_not_text_to_apply():
     finding = _lint({"host": "localhost", 5: "postgres://{{ env.H }}/db"})
     assert finding.ok
     assert finding.deferred is not None
+
+
+# ── a field named for a host, every URI spelling, and what is never quoted ───
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "extra, field",
+    [
+        (
+            {"instance_type": {"instance": "standalone", "host": ELSEWHERE, "port": 27017}},
+            "connection.instance_type.host",
+        ),
+        (
+            {"instance_type": {"server_addresses": f"{ELSEWHERE}:27017"}},
+            "connection.instance_type.server_addresses",
+        ),
+        ({"hosts": [f"{ELSEWHERE}:27017"]}, "connection.hosts[0]"),
+        ({"proxy": {"hostname": ELSEWHERE}}, "connection.proxy.hostname"),
+    ],
+)
+def test_a_field_named_for_a_host_is_a_destination_anywhere(extra, field):
+    connection = {"host": "localhost", **extra}
+    refusal = _refusal(connection)
+    assert refusal is not None
+    assert field in refusal.what
+    assert _refusal(connection, {ALLOWLIST_ENV: f"PG@{ELSEWHERE}"}) is None
+
+
+@pytest.mark.unit
+def test_a_loopback_or_empty_named_host_needs_no_entry():
+    connection = {"host": "localhost", "proxy": {"host": "127.0.0.1"}, "replica": {"host": ""}}
+    assert _refusal(connection) is None
+
+
+@pytest.mark.unit
+def test_a_switched_off_tunnel_is_not_judged_by_its_field_names():
+    tunnel = {"ssh_tunnel": {"enable": False, "host": ELSEWHERE, "hostname": ELSEWHERE}}
+    assert _refusal({"host": "localhost", **tunnel}) is None
+
+
+@pytest.mark.unit
+def test_validate_leaves_a_named_host_placeholder_to_apply():
+    finding = _lint({"host": "localhost", "instance_type": {"host": "{{ env.MONGO_HOST }}"}})
+    assert finding.ok
+    assert finding.deferred is not None
+    assert "connection.instance_type.host ('{{ env.MONGO_HOST }}')" in finding.deferred.what
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "uri",
+    [
+        f"ibm_db_sa://u@{ELSEWHERE}/db",
+        f"\x00postgres://{ELSEWHERE}/db",
+        f"jdbc:mysql:replication://{ELSEWHERE}/db",
+    ],
+)
+def test_every_uri_spelling_is_read_as_one(uri):
+    assert _refusal({"host": "localhost", "cfg": {"u": uri}}) is not None
+
+
+@pytest.mark.unit
+def test_a_uri_under_a_credential_field_is_judged_and_never_quoted():
+    secret_uri = f"postgres://u:QUOTED@{ELSEWHERE}/x"  # pragma: allowlist secret
+    refusal = _refusal({"host": "localhost", "credentials": {"password": secret_uri}})
+    assert refusal is not None
+    assert "QUOTED" not in str(refusal)
+    assert ELSEWHERE not in str(refusal)
+
+
+@pytest.mark.unit
+def test_a_driver_argument_that_extends_the_connection_string_is_refused():
+    arguments = {"Encrypt": f"yes;Address=tcp:{ELSEWHERE},1433"}
+    connection = {"host": "localhost", "sqlalchemy_eng_params": {"connect_args": arguments}}
+    refusal = _refusal(connection)
+    assert refusal is not None
+    assert "connection.sqlalchemy_eng_params.connect_args" in refusal.what
+    assert ELSEWHERE not in str(refusal)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "host",
+    [
+        f"u:QUOTED@{ELSEWHERE}",  # pragma: allowlist secret
+        f"postgres://u:QUOTED@{ELSEWHERE}/db",  # pragma: allowlist secret
+    ],
+)
+def test_a_host_field_written_with_a_password_is_not_quoted(host):
+    refusal = _refusal({"host": host})
+    assert refusal is not None
+    assert "QUOTED" not in str(refusal)

@@ -257,3 +257,10 @@ def test_a_long_keyword_string_is_shown_in_linear_time():
     with pytest.raises(AcquisitionSecretPolicyError):
         refuse_unless_allowed("env://PG", connection={"server": "=" + " " * 3000}, environ={})
     assert time.perf_counter() - started < 0.5
+
+
+@pytest.mark.unit
+def test_apply_names_no_character_of_a_rendered_database_name():
+    refusal = _apply_refusal({"host": "localhost", "database": "abc@def"})
+    assert "'@'" not in refusal.what
+    assert "holds a character" in refusal.what

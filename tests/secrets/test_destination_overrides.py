@@ -111,6 +111,7 @@ def test_an_override_without_a_secret_is_not_this_policy_s_business():
         "driver.password",
         "database.protocol",
         "driver.protocol",
+        "rac.nodes",
     ],
 )
 def test_a_driver_setting_that_moves_the_host_is_refused(key):
