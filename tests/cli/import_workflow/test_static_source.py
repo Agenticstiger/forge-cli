@@ -673,6 +673,38 @@ def test_a_module_of_the_importing_files_own_package_is_found_by_its_full_name(t
     assert "is not in the scanned files" in _why(index.folder(top).fold(node.value))
 
 
+def test_a_full_name_that_starts_with_the_names_of_the_scanned_directory_is_a_file_of_it(tmp_path):
+    """A scan of ``.../teamx/dags``: ``teamx.dags.common.paths`` is ``common/paths.py``, from any
+    file of the scan; a name that starts otherwise is not guessed at."""
+    _write(
+        tmp_path,
+        {
+            "teamx/dags/nightly/dag.py": (
+                "from teamx.dags.common.paths import ROOT\n"
+                "from dags.common.paths import ROOT as SHORT\n"
+                "from other.dags.common.paths import ROOT as OTHER\n"
+                "from teamx.dags.common import pkg_value\n"
+                "a = ROOT\nb = SHORT\nc = OTHER\nd = pkg_value\n"
+            ),
+            "teamx/dags/common/__init__.py": "pkg_value = 'from the package'\n",
+            "teamx/dags/common/paths.py": "ROOT = 's3://code'\n",
+        },
+    )
+    walk = P.find_python_files(tmp_path / "teamx" / "dags")
+    index = ModuleIndex(walk.files)
+    module = index.load(next(f for f in walk.files if f.rel == "nightly/dag.py"))
+    assert module is not None
+    folder = index.folder(module)
+    values = {
+        stmt.targets[0].id: folder.fold(stmt.value)  # type: ignore[attr-defined]
+        for stmt in module.tree.body
+        if isinstance(stmt, ast.Assign)
+    }
+    assert values["a"] == "s3://code" and values["b"] == "s3://code"
+    assert values["d"] == "from the package"
+    assert "is not in the scanned files" in _why(values["c"])
+
+
 @pytest.mark.parametrize("where", ["project", "dags", "outside"])
 def test_a_dag_files_imports_resolve_whatever_the_working_directory(tmp_path, monkeypatch, where):
     """A DAG file is shown by its path from the working directory, and its imports are resolved

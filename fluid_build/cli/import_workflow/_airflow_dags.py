@@ -31,10 +31,14 @@ over a list, dynamic task mapping, a DAG under a condition, a schedule that is n
   ``GlueJobOperator``                 ``script_location``, ``script_args``
   ``DatabricksSubmitRunOperator``     ``spark_python_task.python_file|parameters``
   ``BashOperator``                    a ``spark-submit ... script.py`` in ``bash_command``
+  ``PythonOperator``, ``@task``       the function it runs: one the conventions name under
+                                      ``submit_helpers``, or one of the scan's own whose body
+                                      submits the work (:mod:`._callables`)
   ==================================  =====================================================
 
-  Any other Airflow operator is listed as a task of kind ``other`` and read no further. An
-  operator class of the project's own is read as one of these when the conventions say so.
+  Any other Airflow operator is listed as a task of kind ``other`` and read no further (its
+  ``python_callable``, when it has one, is read as a ``PythonOperator``'s is). An operator class
+  of the project's own is read as one of these when the conventions say so.
 * Dependencies: ``a >> b``, ``a << b`` (also with lists), ``set_downstream``, ``set_upstream``,
   ``chain`` and ``cross_downstream``, between tasks bound to names or written inline.
 """
@@ -45,10 +49,13 @@ import ast
 import re
 import shlex
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from ._fold import ABSENT, FoldedDict, FoldedList, FoldedTuple, Folder, Unresolved, lookup
 from ._pysource import Module, ancestors, qualified_name, snippet
+
+if TYPE_CHECKING:  # the follower is imported where it is first used: it builds on this module
+    from ._callables import Follower, SubmitHelper
 
 #: Known operator class names to the kind of work they submit.
 OPERATOR_KINDS: Dict[str, str] = {
@@ -147,6 +154,10 @@ class Submit:
     line: int
     #: The command line, for a ``BashOperator`` (what ``bash_command`` says, as text).
     command: Optional[str] = None
+    #: The config file the job is given, for a submit helper the conventions say takes one: the
+    #: path, or (when ``config_why`` says why it did not resolve) what a person reads.
+    config: Optional[str] = None
+    config_why: str = ""
 
     @property
     def templated(self) -> bool:
@@ -166,6 +177,8 @@ class Task:
     line: int
     submits: List[Submit] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    #: The function a Python task runs (``python_callable``, a ``@task`` function), as written.
+    callable: Optional[str] = None
 
 
 @dataclass
@@ -195,6 +208,11 @@ class ModuleDags:
     dags: List[Dag] = field(default_factory=list)
     #: Findings that belong to the file, not to one DAG.
     notes: List[str] = field(default_factory=list)
+    #: The functions its Python tasks run that are not read (outside the scanned files, or not a
+    #: function), with how many tasks run each.
+    unread_callables: Dict[str, int] = field(default_factory=dict)
+    #: Other files of the scan whose folding ran out while the functions its tasks run were read.
+    tired_modules: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -213,10 +231,19 @@ def _last(qualified: str) -> str:
 
 
 class _Reader:
-    def __init__(self, module: Module, folder: Folder, operators: Mapping[str, str]) -> None:
+    def __init__(
+        self,
+        module: Module,
+        folder: Folder,
+        operators: Mapping[str, str],
+        submit_helpers: Optional[Mapping[str, "SubmitHelper"]] = None,
+    ) -> None:
         self.module = module
         self.folder = folder
         self.operators = dict(operators)
+        self.submit_helpers = submit_helpers or {}
+        #: Reads what a Python task's function submits (:mod:`._callables`), once one is met.
+        self._follower: Optional["Follower"] = None
         self.result = ModuleDags()
         self.defs: List[_DagDef] = []
         self.tasks_by_node: Dict[int, Tuple[Task, _DagDef]] = {}
@@ -262,6 +289,14 @@ class _Reader:
         self._edges()
         for dag_def in self.defs:
             self.result.dags.append(dag_def.dag)
+        if self._follower is not None:
+            self.result.unread_callables = dict(self._follower.unread)
+            self.result.tired_modules = sorted(self._follower.tired)
+            if self._follower.cut_short:
+                self.result.notes.append(
+                    f"{self.module.rel}: stopped following the functions its Python tasks run "
+                    "(the file asks for too much work): some of what they submit is not read"
+                )
         if self.folder.exhausted:
             self.result.notes.append(
                 f"{self.module.rel}: folding stopped early (the file asks for too much work): "
@@ -535,6 +570,9 @@ class _Reader:
                 break
         if kind in SUBMIT_KINDS:
             task.submits = self._submits(kind, call)
+        elif (python := self._kw(call, "python_callable")) is not None:
+            task.callable, task.submits = self._python_task(call, python)
+        if task.submits:
             if len(task.submits) > _MAX_SUBMITS_PER_TASK:
                 task.notes.append(
                     f"it submits {len(task.submits)} scripts; the first {_MAX_SUBMITS_PER_TASK} "
@@ -568,6 +606,13 @@ class _Reader:
             file=self.module.rel,
             line=function.lineno,
         )
+        task.callable = function.name
+        task.submits = self._function_task(function)
+        if len(task.submits) > _MAX_SUBMITS_PER_TASK:
+            task.notes.append(
+                f"it submits {len(task.submits)} scripts; the first {_MAX_SUBMITS_PER_TASK} are read"
+            )
+            task.submits = task.submits[:_MAX_SUBMITS_PER_TASK]
         dag_def.dag.tasks.append(task)
         self.tasks_by_node[id(function)] = (task, dag_def)
         self.taskflow_by_name[function.name] = task
@@ -585,6 +630,32 @@ class _Reader:
             self._call_targets = targets
         for target in self._call_targets.get(function.name, ()):
             self.tasks_by_var[target] = task
+
+    # ── what a Python task's function submits ───────────────────────
+
+    def _follow(self) -> "Follower":
+        if self._follower is None:
+            from ._callables import Follower  # it builds its submits with this module's readers
+
+            self._follower = Follower(self.module, self.folder, self.submit_helpers)
+        return self._follower
+
+    def _python_task(self, call: ast.Call, python: ast.expr) -> Tuple[Optional[str], List[Submit]]:
+        """The function a Python task runs (as written) and what it submits: ``op_args`` and
+        ``op_kwargs`` are templated fields, what the function is called with."""
+        op_args = self._templated(self._kw(call, "op_args"))
+        op_kwargs = self._templated(self._kw(call, "op_kwargs"))
+        try:
+            return self._follow().task(call, python, op_args, op_kwargs)
+        except RecursionError:
+            return snippet(python, 60), []
+
+    def _function_task(self, function: ast.AST) -> List[Submit]:
+        """What a TaskFlow ``@task`` function submits: its body is read as a task's function is."""
+        try:
+            return self._follow().function(function)
+        except RecursionError:
+            return []
 
     # ── what a task submits ─────────────────────────────────────────
 
@@ -613,13 +684,7 @@ class _Reader:
         shown: str = "",
         command: Optional[str] = None,
     ) -> Submit:
-        if isinstance(script, str) and script.strip():
-            return Submit(
-                runtime, script.strip(), "", script.strip(), _arg_texts(args), call.lineno, command
-            )
-        why = script.why if isinstance(script, Unresolved) else "no script is named"
-        text = script.text if isinstance(script, Unresolved) else shown
-        return Submit(runtime, None, why, text, _arg_texts(args), call.lineno, command)
+        return make_submit(runtime, script, args, call.lineno, shown, command)
 
     def _spark_submit(self, call: ast.Call) -> List[Submit]:
         script = self._templated(self._kw(call, "application"))
@@ -676,7 +741,7 @@ class _Reader:
         cached = self._read_commands.get(key)
         if cached is None:
             cached = self._read_commands[key] = (
-                _spark_submits_in_text(value, holes),
+                spark_submits_in_text(value, holes),
                 _restore(value, holes),
             )
         found, command = cached
@@ -686,29 +751,7 @@ class _Reader:
         ]
 
     def _steps_of(self, steps: Any, call: ast.Call, runtime: str) -> List[Submit]:
-        if isinstance(steps, str):
-            return [
-                self._submit(
-                    runtime,
-                    Unresolved("the steps are in a file, which is not read", steps),
-                    None,
-                    call,
-                )
-            ]
-        if not isinstance(steps, list):
-            if isinstance(steps, Unresolved):
-                return [self._submit(runtime, Unresolved(steps.why, steps.text), None, call)]
-            return []
-        out: List[Submit] = []
-        for step in steps[:_MAX_STEPS]:
-            hadoop = lookup(step, "HadoopJarStep") if isinstance(step, dict) else None
-            argv = lookup(hadoop, "Args") if isinstance(hadoop, dict) else None
-            if not isinstance(argv, list):
-                continue
-            tokens = [a for a in argv if isinstance(a, (str, Unresolved))]
-            for script, args in _spark_submits_in_tokens(tokens):
-                out.append(self._submit(runtime, script, args, call))
-        return out
+        return [self._submit(runtime, script, args, call) for script, args in step_commands(steps)]
 
     def _emr_steps(self, call: ast.Call) -> List[Submit]:
         return self._steps_of(self._templated(self._kw(call, "steps")), call, "emr-step")
@@ -911,6 +954,8 @@ _HOLE = re.compile(r"__fluidhole\d+__")
 _JINJA = re.compile(r"\{\{.{0,1000}?\}\}|\{%.{0,1000}?%\}|\{#.{0,1000}?#\}", re.DOTALL)
 _JINJA_TOKEN = re.compile(r"__fluidjinja(\d+)__")
 _SHELL_PUNCTUATION = "();<>|&"
+#: Why a word of a command line that holds a field that did not fold is not read.
+_HOLE_WORD = "the word is not a constant"
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
 #: Shell keywords that come before a command on the same line: ``then spark-submit ...``.
@@ -956,6 +1001,70 @@ def _arg_texts(args: Any) -> Tuple[str, ...]:
         else:
             out.append("<not constant>")
     return tuple(out)
+
+
+def make_submit(
+    runtime: str,
+    script: Any,
+    args: Any,
+    line: int,
+    shown: str = "",
+    command: Optional[str] = None,
+    config: Any = None,
+) -> Submit:
+    """The :class:`Submit` of a folded script and arguments (and config file, when one is
+    named): a script that did not resolve keeps why and what a person reads."""
+    config_text: Optional[str] = None
+    config_why = ""
+    if isinstance(config, str) and config.strip():
+        config_text = config.strip()
+    elif isinstance(config, Unresolved):
+        config_text, config_why = config.text or None, config.why or "it is not a constant"
+    if isinstance(script, str) and script.strip():
+        return Submit(
+            runtime,
+            script.strip(),
+            "",
+            script.strip(),
+            _arg_texts(args),
+            line,
+            command,
+            config_text,
+            config_why,
+        )
+    why = script.why if isinstance(script, Unresolved) else "no script is named"
+    text = script.text if isinstance(script, Unresolved) else shown
+    return Submit(
+        runtime, None, why, text, _arg_texts(args), line, command, config_text, config_why
+    )
+
+
+def step_commands(steps: Any) -> List[Tuple[Any, List[Any]]]:
+    """``(script, args)`` of each ``spark-submit`` the EMR steps run (``Steps[].HadoopJarStep.Args``,
+    the shape of ``add_job_flow_steps`` and ``run_job_flow``); steps given as a file name, or that
+    do not fold, are one entry whose script says why."""
+    if isinstance(steps, str):
+        return [(Unresolved("the steps are in a file, which is not read", steps), [])]
+    if not isinstance(steps, list):
+        if isinstance(steps, Unresolved):
+            return [(Unresolved(steps.why, steps.text), [])]
+        return []
+    out: List[Tuple[Any, List[Any]]] = []
+    for step in steps[:_MAX_STEPS]:
+        hadoop = lookup(step, "HadoopJarStep") if isinstance(step, dict) else None
+        argv = lookup(hadoop, "Args") if isinstance(hadoop, dict) else None
+        if not isinstance(argv, list):
+            continue
+        out.extend(spark_submits_in_tokens([a for a in argv if isinstance(a, (str, Unresolved))]))
+    return out
+
+
+def starts_a_submit(word: Any) -> bool:
+    """Whether a command given as words that starts with ``word`` may run a ``spark-submit``:
+    ``spark-submit`` itself, or a shell (``bash -c "spark-submit ..."``)."""
+    return isinstance(word, str) and bool(
+        _SPARK_SUBMIT.search(word) or word.rsplit("/", 1)[-1] in _SHELLS
+    )
 
 
 def _restore(text: str, holes: Mapping[str, str]) -> str:
@@ -1048,7 +1157,7 @@ def _shell_commands(command: str, holes: Mapping[str, str]) -> List[List[Any]]:
 
         text = _JINJA_TOKEN.sub(back, raw) if jinja else raw
         if _HOLE.search(text):
-            return Unresolved("the word is not a constant", _restore(text, holes))
+            return Unresolved(_HOLE_WORD, _restore(text, holes))
         return text
 
     text = _JINJA.sub(hide, command[:_MAX_COMMAND])
@@ -1085,7 +1194,12 @@ def _application(words: Sequence[Any], start: int) -> Optional[Tuple[Any, List[A
     while index < len(words):
         word = words[index]
         if isinstance(word, Unresolved):
-            return Unresolved("the script is not a constant", word.text), list(words[index + 1 :])
+            # a word folded from the code says what it waits for (a constant of a module that is
+            # not scanned, a Variable); a hole in a command line only that it is one
+            why = (
+                word.why if word.why and word.why != _HOLE_WORD else "the script is not a constant"
+            )
+            return Unresolved(why, word.text), list(words[index + 1 :])
         if word.startswith("-") and len(word) > 1:
             if word in _SUBMIT_NO_JOB:
                 return None
@@ -1169,18 +1283,18 @@ def _in_shell(rest: Sequence[Any], depth: int) -> List[Tuple[Any, List[Any]]]:
                     return [(Unresolved("the shell command is not a constant", text.text), [])]
                 return []
             if isinstance(text, str) and depth < 3:
-                return _spark_submits_in_text(text, {}, depth + 1)
+                return spark_submits_in_text(text, {}, depth + 1)
             return []
     return []
 
 
-def _spark_submits_in_tokens(tokens: Sequence[Any]) -> List[Tuple[Any, List[Any]]]:
+def spark_submits_in_tokens(tokens: Sequence[Any]) -> List[Tuple[Any, List[Any]]]:
     """``(script, args)`` of the ``spark-submit`` a command given as words runs (an EMR step's
     ``Args``); an empty list when the command is not a ``spark-submit``."""
     return _spark_submits_in_words(tokens)
 
 
-def _spark_submits_in_text(
+def spark_submits_in_text(
     command: str, holes: Mapping[str, str], depth: int = 0
 ) -> List[Tuple[Any, List[Any]]]:
     """Every ``spark-submit`` a command line runs, in order."""
@@ -1191,11 +1305,16 @@ def _spark_submits_in_text(
 
 
 def read_dags(
-    module: Module, folder: Folder, *, operators: Optional[Mapping[str, str]] = None
+    module: Module,
+    folder: Folder,
+    *,
+    operators: Optional[Mapping[str, str]] = None,
+    submit_helpers: Optional[Mapping[str, "SubmitHelper"]] = None,
 ) -> ModuleDags:
     """The DAGs of ``module``. ``operators`` maps a project's own operator class name to one
-    of :data:`SUBMIT_KINDS` (from the conventions)."""
-    return _Reader(module, folder, operators or {}).run()
+    of :data:`SUBMIT_KINDS`, and ``submit_helpers`` a project's own function to where its script
+    is among its arguments (both from the conventions)."""
+    return _Reader(module, folder, operators or {}, submit_helpers).run()
 
 
 __all__ = [

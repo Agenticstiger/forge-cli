@@ -756,6 +756,8 @@ def _link_cost(link: LinkedTask) -> int:
         + args
         + min(len(submit.command or ""), 2_000)
         + min(len(submit.script or ""), 300)
+        + min(len(submit.config or ""), 300)
+        + min(len(link.task.callable or ""), 200)
         + 24 * upstream
     )
 
@@ -1434,6 +1436,11 @@ def _task_entry(link: LinkedTask, report: ImportReport, ctx: _Ctx) -> Optional[D
         if link.submit.command:
             # the schema's own rule for a Bash task asks for the command
             params["bash_command"] = safe_command(link.submit.command)
+        if task.callable:
+            # ... and its rule for a Python task the function the task runs
+            params["python_callable"] = safe_text(task.callable, 200)
+        if link.submit.config and not link.submit.config_why:
+            params["config"] = safe_text(link.submit.config, 300)
         # ``type`` and ``operator`` at the task level: the schema's task rules (fluid_execute,
         # bash, python) key on them, and a task that lacks either is held to the fluid_execute
         # rule and refused for want of a contract_path. ``custom`` is the type that names

@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from ._airflow_dags import Dag, Submit, Task, read_dags
 from ._catalogs import module_settings
@@ -95,6 +95,8 @@ class DagScan:
     files: int = 0
     notes: List[str] = field(default_factory=list)
     unreadable: Dict[str, str] = field(default_factory=dict)
+    #: The functions Python tasks run that are not read, with how many tasks run each.
+    unread_callables: Dict[str, int] = field(default_factory=dict)
     #: ``(alias, kind)`` of each Spark catalog any DAG file sets to a kind of catalog.
     catalogs: List[Tuple[str, str]] = field(default_factory=list)
 
@@ -205,6 +207,7 @@ def scan_dags(
     """
     walk = find_python_files(root, ignore=conventions.ignore_files)
     scan = DagScan(root=Path(root), notes=list(walk.notes))
+    tired: Set[str] = set()
     index = ModuleIndex(
         walk.files,
         variables=conventions.variables,
@@ -230,10 +233,23 @@ def scan_dags(
         module.index_rel = source.rel
         scan.files += 1
         folder = index.folder(module)
-        found = read_dags(module, folder, operators=conventions.operators)
+        found = read_dags(
+            module,
+            folder,
+            operators=conventions.operators,
+            submit_helpers=conventions.submit_helpers,
+        )
         scan.catalogs.extend(module_settings(module, folder))
         scan.dags.extend(found.dags)
         scan.notes.extend(found.notes)
+        for name, count in found.unread_callables.items():
+            scan.unread_callables[name] = scan.unread_callables.get(name, 0) + count
+        tired.update(found.tired_modules)
+    for rel in sorted(tired):
+        scan.notes.append(
+            f"{clean_chars(rel)}: folding stopped early while the functions DAG tasks run were "
+            "read (the file asks for too much work): some of what they submit is not read"
+        )
     scan.dags.sort(key=lambda d: (d.file, d.line))
     if budget is None:
         budget_note(index.budget.skipped, scan.notes, index.budget.sql_skipped)

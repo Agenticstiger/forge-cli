@@ -17,6 +17,7 @@ from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ._catalogs import CatalogKinds
 from ._conventions import Conventions, load_conventions
+from ._fold import missing_value
 from ._proposal import (
     SPLITS,
     ProposalTooLarge,
@@ -25,6 +26,7 @@ from ._proposal import (
     safe_text,
 )
 from ._pysource import SourceBudget
+from ._redact import sensitive_name
 from ._scan import DagScan, JobScan, LinkedTask, budget_note, link_tasks, scan_dags, scan_jobs
 from .registry import Importer, ImportReport
 
@@ -413,6 +415,76 @@ def _report_unlinked(
             report.notes.append(line)
 
 
+#: Functions Python tasks run that are not read, named one by one in the report; the rest counted.
+MAX_UNREAD_CALLABLES = 10
+#: Values submitted scripts and config files wait for, listed one by one; the rest counted. Each
+#: line names at most ``MAX_WAITING_TASKS`` of the tasks that wait for it.
+MAX_WAITING_LINES = 20
+MAX_WAITING_TASKS = 3
+_WAITING_HINT = {
+    "module": "name the file of its module under `config_modules` in the conventions",
+    "environment": "set what it holds under `environments` in the conventions",
+    "airflow_variable": "set what it holds under `airflow_variables` in the conventions",
+}
+
+
+def _report_unread_callables(dag_scan: DagScan, report: ImportReport) -> None:
+    """The note on the functions Python tasks run that are not read: the ones that submit Spark
+    work can be described in the conventions."""
+    unread = dag_scan.unread_callables
+    if not unread:
+        return
+    ranked = sorted(unread.items(), key=lambda item: (-item[1], item[0]))
+    shown = ", ".join(
+        f"{safe_text(name, 80)} ({count})" for name, count in ranked[:MAX_UNREAD_CALLABLES]
+    )
+    more = len(ranked) - MAX_UNREAD_CALLABLES
+    report.notes.append(
+        f"{sum(unread.values())} Python task(s) run a function that is not read here: {shown}"
+        + (f", and {more} more" if more > 0 else "")
+        + ". Name one that submits Spark work under `submit_helpers` in the conventions, with "
+        "where its script is among its arguments"
+    )
+
+
+def _report_waiting(dag_scan: DagScan, report: ImportReport) -> None:
+    """A line for each value that a submitted script or a config file waits for and the conventions
+    can give (a constant of a module outside the scan, an environment variable, an Airflow
+    Variable), with the tasks that wait for it. A name that says it is a credential is left out:
+    the conventions do not use such a value."""
+    waiting: Dict[Tuple[str, str], List[str]] = {}
+    for dag in dag_scan.dags:
+        for task in dag.tasks:
+            label = f"DAG {safe_text(dag.shown, 60)} task {safe_text(task.shown, 60)}"
+            for submit in task.submits:
+                for why in (submit.why if submit.script is None else "", submit.config_why):
+                    missing = missing_value(why) if why else None
+                    if missing is None or sensitive_name(missing[1].rsplit(".", 1)[-1]):
+                        continue
+                    tasks = waiting.setdefault(missing, [])
+                    if label not in tasks:
+                        tasks.append(label)
+    ranked = sorted(waiting.items(), key=lambda item: (-len(item[1]), item[0]))
+    for (kind, name), tasks in ranked[:MAX_WAITING_LINES]:
+        what = {
+            "module": f"`{safe_text(name, 120)}`, which is not in the scanned files",
+            "environment": f"the environment variable {safe_text(name, 80)}",
+            "airflow_variable": f"the Airflow Variable {safe_text(name, 80)}",
+        }[kind]
+        named = ", ".join(tasks[:MAX_WAITING_TASKS]) + (
+            f", and {len(tasks) - MAX_WAITING_TASKS} more" if len(tasks) > MAX_WAITING_TASKS else ""
+        )
+        report.required_defaults.append(
+            f"{len(tasks)} task(s) submit a script or name a config file that depends on {what} "
+            f"({named}): {_WAITING_HINT[kind]}"
+        )
+    if len(ranked) > MAX_WAITING_LINES:
+        report.required_defaults.append(
+            f"{len(ranked) - MAX_WAITING_LINES} more value(s) that submitted scripts or config "
+            "files depend on are not listed"
+        )
+
+
 def _scan_report(
     tool: str,
     scans: Sequence[JobScan],
@@ -459,6 +531,8 @@ def _scan_report(
                     )
         _report_joins(linked, len(unlinked), report)
         _report_unlinked(tool, unlinked, report)
+        _report_unread_callables(dag_scan, report)
+        _report_waiting(dag_scan, report)
         no_dag = [j for j in jobs if not j.tasks]
         if tool == "pyspark" and no_dag:
             report.notes.append(f"{len(no_dag)} job(s) are submitted by no DAG task read here")

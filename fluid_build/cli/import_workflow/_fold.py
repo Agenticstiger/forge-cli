@@ -68,6 +68,9 @@ from ._pysource import (
     snippet,
 )
 
+#: Directory names above the scanned files a dotted name may start with (see
+#: :meth:`ModuleIndex._below_the_import_root`).
+MAX_ROOT_NAMES = 12
 #: Deepest expression :meth:`Folder.fold` follows, and the longest string it builds.
 MAX_FOLD_DEPTH = 40
 MAX_STRING = 4096
@@ -1059,8 +1062,13 @@ class ModuleIndex:
         self.unreadable: Dict[str, str] = {}
         #: What this scan has read, in all: every read of a source file counts against it.
         self.budget = budget if budget is not None else SourceBudget()
+        #: The names of the scanned directory and the directories above it, nearest last (see
+        #: :meth:`_below_the_import_root`).
+        self._root_names: Tuple[str, ...] = ()
         for source in files:
             parts = source.rel[: -len(".py")].split("/")
+            if not self._root_names:
+                self._root_names = tuple(source.path.parts[: -len(parts)])[-MAX_ROOT_NAMES:]
             if parts[-1] == "__init__":
                 parts = parts[:-1]
             for start in range(len(parts)):
@@ -1167,21 +1175,38 @@ class ModuleIndex:
                 return f"more than one scanned file answers to the module name `{dotted}`"
             if len(candidates) == 1:
                 return candidates[0], parts[cut:]
-        own = self._in_own_package(parts, from_rel)
-        if own is not None:
-            return own
+        below = self._below_the_import_root(parts, from_rel)
+        if below is not None:
+            return below
         return WHY_NOT_SCANNED.format(qualified)
 
-    def _in_own_package(
+    def _file(self, package: Sequence[str], rest: Sequence[str]) -> Optional[SourceFile]:
+        """The scanned file ``package/rest...`` (a module, or a package's ``__init__.py``)."""
+        names = [*package, *rest]
+        if not names:
+            return None
+        rel = "/".join(names)
+        for source in self._dotted.get(".".join(names), ()):
+            if source.rel == f"{rel}/__init__.py" or (rest and source.rel == f"{rel}.py"):
+                return source
+        return None
+
+    def _below_the_import_root(
         self, parts: Sequence[str], from_rel: str
     ) -> Optional[Tuple[SourceFile, List[str]]]:
-        """``teamx.dags.nightly.settings.STEP`` imported by ``nightly/dag.py`` of a scan of
-        ``dags/``: the scanned directory sits below the import root, so the leading parts of the
-        name are packages the scan does not see. When the name runs through the importing file's
-        own directory (or one of its parents inside the scan: ``nightly``) and goes on to a file
-        there (``nightly/settings.py``), it is that file: the package the importing file is in
-        is the one the name ends in. A name that does not run through those directories is not
-        guessed at (``teamx.weekly.settings`` from ``nightly/dag.py``)."""
+        """A name whose leading parts are packages the scan does not see, because the scanned
+        directory sits below the import root (Airflow puts the DAGs folder on the path, and the
+        files import ``teamx.dags.nightly.settings``). It is a file of the scan, by two anchors:
+
+        * the name runs through the importing file's own directory, or a parent of it inside the
+          scan (``nightly`` for ``nightly/dag.py``), and goes on to a file there
+          (``nightly/settings.py``): the package the importing file is in is the one the name
+          ends in;
+        * its leading parts are the names of the scanned directory and the directories above it
+          (``teamx.dags`` for a scan of ``.../teamx/dags``), and the rest is a file of the scan.
+
+        A name that fits neither is not guessed at (``teamx.weekly.settings`` from
+        ``nightly/dag.py`` of a scan of a directory named otherwise)."""
         here = from_rel.split("/")[:-1]
         for depth in range(len(here), 0, -1):  # the importing file's directory, then its parents
             package = here[:depth]
@@ -1193,13 +1218,17 @@ class ModuleIndex:
                 if list(head[-common:]) != package[-common:]:
                     continue
                 for cut in range(len(parts) - 1, at, -1):
-                    rel = "/".join([*package, *parts[at + 1 : cut]])
-                    dotted = ".".join([*package, *parts[at + 1 : cut]])
-                    for source in self._dotted.get(dotted, ()):
-                        if source.rel == f"{rel}/__init__.py" or (
-                            cut > at + 1 and source.rel == f"{rel}.py"
-                        ):
-                            return source, list(parts[cut:])
+                    found = self._file(package, parts[at + 1 : cut])
+                    if found is not None:
+                        return found, list(parts[cut:])
+        names = self._root_names
+        for size in range(min(len(names), len(parts) - 1), 0, -1):
+            if list(parts[:size]) != list(names[len(names) - size :]):
+                continue
+            for cut in range(len(parts) - 1, size, -1):
+                found = self._file((), parts[size:cut])
+                if found is not None:
+                    return found, list(parts[cut:])
         return None
 
 
