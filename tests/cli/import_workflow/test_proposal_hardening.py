@@ -1125,3 +1125,106 @@ def test_one_long_argument_is_not_read_to_its_end():
     shown = safe_args(["a b " * 50_000, "--x"])
     assert time.monotonic() - started < 1.0
     assert len(shown[0]) <= 200 and shown[1] == "--x"
+
+
+# ── the streams a build describes ─────────────────────────────────────────────────────
+
+
+def _streams_project(root: Path, count: int) -> None:
+    """One job with ``count`` streaming writes, each to a table of its own."""
+    lines = "\n".join(
+        f'spark.readStream.table("s.t{i}").writeStream.option("checkpointLocation", "s3://c/{i}")'
+        f'.toTable("a.o{i}")'
+        for i in range(count)
+    )
+    write(root, {"jobs/j.py": "spark = SparkSession.builder.getOrCreate()\n" + lines + "\n"})
+
+
+def _build_description(contract: Dict[str, Any]) -> str:
+    return contract["builds"][0]["description"]
+
+
+def test_a_product_describes_the_streams_of_the_outputs_it_owns_not_the_jobs(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    _streams_project(tmp_path, 6)
+    contracts, _ = propose(tmp_path)  # one product per table
+    assert len(contracts) == 6
+    for number, contract in enumerate(contracts):
+        description = _build_description(contract)
+        assert f"s3://c/{number}" in description
+        assert description.count("checkpoint") == 1
+    (whole,), _ = propose(tmp_path, split_by="job")
+    assert _build_description(whole).count("checkpoint") == 6
+
+
+def test_a_job_that_writes_many_streams_lists_some_and_counts_the_rest(tmp_path, monkeypatch):
+    from fluid_build.cli.import_workflow import _proposal
+
+    monkeypatch.chdir(tmp_path)
+    _streams_project(tmp_path, 30)
+    monkeypatch.setattr(_proposal, "MAX_STREAMS_LISTED", 4)
+    (contract,), _ = propose(tmp_path, split_by="job")
+    description = _build_description(contract)
+    assert description.count("checkpoint") == 4
+    assert "... and 26 more" in description
+    for i in range(4):
+        assert f"s3://c/{i}" in description
+    assert "s3://c/29" not in description
+
+
+def test_the_trigger_of_a_build_is_the_trigger_of_the_outputs_it_owns(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    write(
+        tmp_path,
+        {
+            "jobs/mixed.py": """
+            spark = SparkSession.builder.getOrCreate()
+            spark.readStream.table("s.a").writeStream.trigger(availableNow=True).toTable("a.once")
+            spark.readStream.table("s.b").writeStream.trigger(processingTime="1 minute").toTable("a.live")
+            spark.table("s.c").write.saveAsTable("a.batch")
+            """
+        },
+    )
+    contracts, _ = propose(tmp_path)
+    kinds = {
+        c["builds"][0]["outputs"][0]: c["builds"][0]["execution"]["trigger"]["type"]
+        for c in contracts
+    }
+    assert kinds == {"once": "manual", "live": "continuous", "batch": "manual"}
+
+
+def test_the_text_of_the_streams_a_proposal_writes_is_bounded(tmp_path, monkeypatch):
+    from fluid_build._errors import FluidUserError
+    from fluid_build.cli.import_workflow import _proposal
+
+    monkeypatch.chdir(tmp_path)
+    _streams_project(tmp_path, 8)
+    monkeypatch.setattr(_proposal, "MAX_STREAM_TEXT", 100)  # 8 products x ~25 characters is more
+    with pytest.raises(FluidUserError) as refused:
+        propose(tmp_path)
+    assert "characters of Structured Streaming writes between them (the most is 100)" in (
+        refused.value.why
+    )
+    assert "--split-by job" in refused.value.fix
+
+
+def test_streams_are_not_described_again_for_every_product_of_a_job(tmp_path, monkeypatch):
+    from fluid_build.cli.import_workflow import _proposal
+
+    monkeypatch.chdir(tmp_path)
+    calls: List[int] = []
+    real = _proposal.safe_text
+    monkeypatch.setattr(_proposal, "safe_text", lambda *a, **k: calls.append(1) or real(*a, **k))
+
+    def count(streams: int) -> int:
+        _streams_project(tmp_path, streams)
+        calls.clear()
+        contracts, _ = propose(tmp_path)
+        assert len(contracts) == streams
+        return len(calls)
+
+    small, large = count(40), count(160)
+    # four times the streams (and the products): about four times the work, not sixteen
+    assert large < small * 6, (small, large)

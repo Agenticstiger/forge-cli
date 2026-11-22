@@ -78,6 +78,11 @@ _SPLIT_BY_JOB = (
 MAX_ARGS_PER_TASK = 100
 MAX_TASK_TEXT = 16_000_000
 MAX_LINK_VISITS = 1_000_000
+#: A build lists the streaming writes of the outputs it owns in its description: at most this many
+#: (the rest are counted), and a proposal writes at most ``MAX_STREAM_TEXT`` characters of them in
+#: all.
+MAX_STREAMS_LISTED = 20
+MAX_STREAM_TEXT = 16_000_000
 #: Tasks of one product named one by one in the report; the rest are counted.
 MAX_TASK_LINES = 20
 #: Reads of one product named one by one in the report; the rest are counted.
@@ -371,12 +376,16 @@ class Output:
     #: write owns may feed it).
     feeds: Set[Tuple[Any, ...]] = field(default_factory=set)
     loose: bool = False
+    #: Every write of it by the writer (``write`` is the first): the build of the product that
+    #: owns the output says how its streams run from these.
+    writes: List[Write] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         self.add(self.write)
 
     def add(self, write: Write) -> None:
         """Note one more write of this output by the writer."""
+        self.writes.append(write)
         if write.feeds is None:
             self.loose = True
         else:
@@ -419,6 +428,9 @@ class _Ctx:
     entries: Dict[int, Optional[Dict[str, Any]]] = field(default_factory=dict)
     #: The most reads a product lists in ``consumes[]`` (see :data:`MAX_FANOUT`).
     max_consumes: int = MAX_CONSUMES_PER_PRODUCT
+    #: ``(text, trigger)`` of the streaming writes of the outputs a product owns of a job, by
+    #: ``(id(group), id(job))``: worked out once, where the proposal is held to its size.
+    streams: Dict[Tuple[int, int], Tuple[str, str]] = field(default_factory=dict)
 
 
 def _job_labels(jobs: Sequence[JobRecord]) -> Dict[str, str]:
@@ -811,10 +823,10 @@ def _trigger(writes: Sequence[Write]) -> str:
 
 
 def _stream_text(writes: Sequence[Write]) -> str:
+    """The streaming writes, ``MAX_STREAMS_LISTED`` of them one by one and the rest counted."""
+    streams = [w for w in writes if w.streaming]
     parts = []
-    for w in writes:
-        if not w.streaming:
-            continue
+    for w in streams[:MAX_STREAMS_LISTED]:
         bits = []
         if w.checkpoint:
             bits.append(f"checkpoint {safe_text(w.checkpoint, 120)}")
@@ -823,7 +835,15 @@ def _stream_text(writes: Sequence[Write]) -> str:
         if w.query_name:
             bits.append(f"query {safe_text(w.query_name, 60)}")
         parts.append(f"{safe_text(w.shown, 80)}: " + (", ".join(bits) or "streaming write"))
+    if len(streams) > MAX_STREAMS_LISTED:
+        parts.append(f"... and {len(streams) - MAX_STREAMS_LISTED:,} more")
     return "; ".join(parts)
+
+
+def _owned_writes(outputs: Sequence[Output]) -> List[Write]:
+    """The writes of the outputs a product owns (one job's): a job that writes a thousand tables
+    describes to each product the streams of the tables it owns, not the job's thousand."""
+    return [w for output in outputs for w in output.writes]
 
 
 def _collect_outputs(
@@ -964,6 +984,24 @@ def build_proposal(
             "job, with their arguments",
             hint=_SPLIT_BY_JOB,
         )
+    streams: Dict[Tuple[int, int], Tuple[str, str]] = {}
+    stream_text = 0
+    for group in groups:
+        by_job: Dict[int, List[Output]] = {}
+        for output in group.outputs:
+            by_job.setdefault(id(output.writer), []).append(output)
+        for job_id, owned in by_job.items():
+            writes = _owned_writes(owned)
+            text = _stream_text(writes)
+            stream_text += len(text)
+            if stream_text > MAX_STREAM_TEXT:
+                raise ProposalTooLarge(
+                    f"the products would describe {stream_text:,} characters of Structured "
+                    f"Streaming writes between them (the most is {MAX_STREAM_TEXT:,}): every "
+                    "product lists the streams of the outputs it owns",
+                    hint=_SPLIT_BY_JOB,
+                )
+            streams[(id(group), job_id)] = (text, _trigger(writes))
 
     # who produces what, for consumes[]: an id is handed out once, whatever the names look like
     produced: Dict[Tuple[str, ...], Tuple[str, str]] = {}
@@ -1001,6 +1039,7 @@ def build_proposal(
         topic_schema=topic_schema,
         catalogs=catalogs or CatalogKinds(),
         max_consumes=listed,
+        streams=streams,
     )
     contracts = [_product(group, group_ids[index], ctx) for index, group in enumerate(groups)]
 
@@ -1315,10 +1354,13 @@ def _build(
     pid: str,
     ctx: _Ctx,
 ) -> Dict[str, Any]:
-    writes = [w for w in job.facts.writes if w.resolved]
     mine = [o for o in group.outputs if o.writer is job]
+    cached = ctx.streams.get((id(group), id(job)))
+    if cached is None:
+        owned = _owned_writes(mine)
+        cached = (_stream_text(owned), _trigger(owned))
+    stream, trigger = cached
     description = f"Existing job {safe_text(job.shown, 120)}; it keeps running where it runs today."
-    stream = _stream_text(writes)
     if stream:
         description += f" Structured Streaming: {stream}."
     build: Dict[str, Any] = {
@@ -1329,7 +1371,7 @@ def _build(
         "properties": {"model": safe_text(job.shown, 300)},
         "outputs": [expose_by_key[o.identity.key] for o in mine],
     }
-    execution: Dict[str, Any] = {"trigger": {"type": _trigger(writes)}}
+    execution: Dict[str, Any] = {"trigger": {"type": trigger}}
     links = _first_links(job)
     platform = conv.runtime_platform
     if platform is None and links:
