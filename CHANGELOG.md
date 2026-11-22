@@ -673,8 +673,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under any other setting of the connection block at any depth, a URI, or a field named for a
   host (`host`, `hostname`, `hosts`, `server_addresses`, `cluster_url` and the top-level
   destination names) unless it holds a path, or one or more words with an optional type whose
-  brackets hold digits only (`varchar`, `numeric(10, 2)`). A loopback host behind a tunnel needs
-  an allowlist entry too. A URI of an object store or a local file names no host, nor does an
+  brackets hold one or two numbers (`varchar`, `numeric(10, 2)`). A loopback host behind a tunnel
+  needs an allowlist entry too. A URI of an object store or a local file names no host, nor does an
   embedded JDBC URL whose settings name none, and a URI under a credential-named field is judged
   by its host and never quoted. A parameter that names a host, in a query string (`host` or
   `hostaddr` in a libpq URI, a host in `jdbc_url_params` or in a Singer tap's `sqlalchemy_url`)
@@ -692,18 +692,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   host, port, database, URL, password or JDBC protocol under `database.` or `driver.`, nor a
   JDBC driver property that names a host, such as `failoverPartner` or `socketFactory`, nor
   Oracle's `rac.nodes`.
-- Through 0.36.0, a contract could have Debezium Server or a Kafka Connect worker read a
-  variable of its environment, or a file its config providers reach, and send it to a host the
-  contract chose: Debezium Server reads `application.properties` through SmallRye Config, which
-  expands a `${...}` expression in any value, and a Kafka Connect worker resolves
-  `${provider:path:key}` in a connector config. Contract text a connector reads (the whole
-  source block, `properties.debezium`, `properties.kafka-connect` and the sink's config) may no
-  longer hold `${`, in a value of any type and whatever the run's secrets: the build fails
-  before anything is written or sent, naming the key and never the value. forge's own
-  `${FLUID_DBZ_...}` lines, which carry the credentials it moves to the environment, are
-  unchanged. A credential that holds `${`, one the operator's store resolved included, is not
-  handed to Debezium Server, which would expand it from its environment too. A secret belongs in
-  a `secretRef`.
+- Through 0.36.0, a contract could have Debezium Server or a Kafka Connect worker read a variable
+  of its environment, or a file its config providers reach, and send it to a host the contract
+  chose: Debezium Server reads `application.properties` through SmallRye Config, which expands a
+  `${...}` expression in any value, and a Kafka Connect worker resolves `${provider:path:key}` in a
+  connector config. Contract text a connector reads (the whole source block, `properties.debezium`,
+  `properties.kafka-connect` and the sink's config) may no longer hold `${`, in a value of any
+  type, with or without a `secretRef`: the build fails before anything is written or sent, naming
+  the key and never the value. forge's own `${FLUID_DBZ_...}` lines, which carry the credentials it
+  moves to the environment, are unchanged. A credential that holds `${`, one the operator's store
+  resolved included, is not handed to Debezium Server, which would expand it from its environment
+  too. A secret belongs in a `secretRef`.
 - A runner that builds a connection URL keeps each field in its own part. dlt's
   `sql_database` source refuses a host, database or `drivername` that would change how its
   connection URL is read back, and `drivername` must be a SQLAlchemy dialect name with an
@@ -762,15 +761,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
-- A contract that applies today can be refused after this upgrade: beside a `secretRef`, every
-  host its connection block names is now judged, among them a host in a query string or in a
-  mapping a connector reads as one, a URI anywhere in the block, a field named for a host under
-  another setting, and the host of an SSH tunnel in use. Before upgrading, add a `NAME@host`
-  entry to `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` for each such host. A host in a query string
-  or in a query mapping is refused unless the reference may go to any host, so move it into the
-  URI's host part or the connection's `host` field, where a `NAME@host` entry judges it. A
-  Debezium or Kafka Connect build whose contract text holds `${` fails too: write the value
-  itself, and a secret as a `secretRef`.
+- A contract that applies today can be refused after this upgrade: beside a `secretRef`, every host
+  its connection block names is now judged, among them a URI anywhere in the block, a field named
+  for a host under another setting, and the host of an SSH tunnel in use. Before upgrading, add a
+  `NAME@host` entry to `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` for each such host. A host in a
+  query string or in a query mapping is refused unless the reference may go to any host, so move it
+  into the URI's host part or the connection's `host` field, where a `NAME@host` entry judges it. A
+  Debezium or Kafka Connect build whose contract text holds `${` fails too: write the value itself,
+  and a secret as a `secretRef`.
 - A Glue table that forge made before this release from a contract over 50 KB carries forge's
   `managed_by: fluid` marker but no product id: forge dropped its record of the contract, and
   `fluid_product_id` did not exist yet. `fluid apply` now refuses it with
