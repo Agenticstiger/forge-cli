@@ -149,6 +149,16 @@ KEEPALIVE_SCHEDULE = "*/5 * * * *"
 #: How long one keepalive run may take before Airflow stops it; the next run tries again.
 KEEPALIVE_TASK_TIMEOUT_S = 30 * 60
 
+#: What a maintenance DAG passes to ``fluid apply`` after the contract and ``--env``, before
+#: ``--expose-id <expose> --yes``. The mode starts forge's Spark runner on the writer build's
+#: runtime and deploys nothing. The one place a maintenance apply's arguments are named.
+MAINTENANCE_APPLY_ARGS: Tuple[str, ...] = ("--mode", "maintain")
+
+#: How long one maintenance run may take before Airflow stops it. The run waits up to six hours
+#: (``build_runners.spark._reconcile.DEFAULT_RUN_WAIT_S``, not imported here: this module stays
+#: light) and the task outlives that wait by half an hour.
+MAINTENANCE_TASK_TIMEOUT_S = 6 * 3600 + 30 * 60
+
 #: Contract path baked into the DAG when the caller cannot know the real one
 #: (a bundle carries no source path). Matches fluid's own discovery default
 #: and the generated CI pipelines' ``CONTRACT`` default.
@@ -364,6 +374,14 @@ class ScheduledDag:
     unwaited: Tuple[Tuple[str, str], ...] = ()
     #: A keepalive DAG: its one task reconciles an always-on stream (:data:`KEEPALIVE_APPLY_ARGS`).
     keepalive: bool = False
+    #: A maintenance DAG: the expose id of the Iceberg table its one task maintains
+    #: (:data:`MAINTENANCE_APPLY_ARGS`). ``build_id`` is then the build that writes the table.
+    maintains: Optional[str] = None
+
+    @property
+    def key(self) -> str:
+        """What names the DAG and its file: the build id, or ``maintain_<expose>``."""
+        return f"maintain_{self.maintains}" if self.maintains is not None else self.build_id
 
 
 # Where a build stands in the schedule (:func:`_classify`).
@@ -531,9 +549,54 @@ def _keepalive_dags(
     return out
 
 
-def has_scheduled_builds(contract: Dict[str, Any]) -> bool:
+def _maintenance_dags(contract: Dict[str, Any]) -> List[ScheduledDag]:
+    """One maintenance DAG per Iceberg table whose maintenance runs on ``backend: spark``.
+
+    Its one task runs ``fluid apply --mode maintain --expose-id <expose>`` on the table's
+    ``schedule``. The DAG is the writer build's, so it has no outlets and no datasets, and it
+    never retries: the next scheduled run is the retry.
+    """
+    from fluid_build.maintenance.spec import spark_tables
+
+    try:
+        tables = spark_tables(contract)
+    except ValueError as exc:
+        raise ScheduleRenderError(str(exc)) from None
+    out: List[ScheduledDag] = []
+    for table in tables:
+        build_id = validate_id(table.build_id, kind="build id")
+        expose = validate_id(table.expose_id, kind="exposeId")
+        _check_spark_ids(contract, build_id)
+        out.append(
+            ScheduledDag(
+                build_id=build_id,
+                schedule=DagSchedule(cron=table.schedule, timezone=table.timezone),
+                tasks=(BuildTask(build_id, 0, MAINTENANCE_TASK_TIMEOUT_S),),
+                maintains=expose,
+            )
+        )
+    return out
+
+
+def _declares_spark_maintenance(contract: Mapping[str, Any]) -> bool:
+    """Whether an expose declares ``iceberg.maintenance`` that runs on forge's Spark runner (no
+    validation; ``backend`` defaults to ``spark``)."""
+    for expose in contract.get("exposes") or []:
+        iceberg = expose.get("iceberg") if isinstance(expose, Mapping) else None
+        block = iceberg.get("maintenance") if isinstance(iceberg, Mapping) else None
+        if block is not None and (
+            not isinstance(block, Mapping) or block.get("backend") in (None, "", "spark")
+        ):
+            return True
+    return False
+
+
+def has_scheduled_builds(contract: Dict[str, Any], *, maintenance: bool = False) -> bool:
     """True when at least one build declares a trigger a DAG runs on (no validation): a cron,
-    datasets, or both."""
+    datasets, or both. ``maintenance=True`` counts a table's Spark maintenance too, which has
+    a DAG of its own (:func:`_maintenance_dags`)."""
+    if maintenance and _declares_spark_maintenance(contract):
+        return True
     builds = contract.get("builds")
     if not isinstance(builds, list):
         return False
@@ -550,8 +613,11 @@ def runs_only_outside_schedulers(contract: Dict[str, Any], *, keepalive: bool = 
     ``fluid apply`` keeps running, runs continuously, or runs on its own platform.
 
     A stream that declares ``execution.retries`` has a keepalive DAG, so it counts as scheduled.
-    ``keepalive=False`` is for a renderer that has no keepalive DAG (``scaffold-composer``).
+    A table's Spark maintenance has a DAG too. ``keepalive=False`` is for a renderer that has
+    neither DAG (``scaffold-composer``).
     """
+    if keepalive and _declares_spark_maintenance(contract):
+        return False
     builds = [b for b in get_builds(contract) if isinstance(b, dict)]
     if not builds:
         return False
@@ -579,7 +645,7 @@ def uses_fluid_apply_dags(contract: Dict[str, Any], *, engine: Optional[str]) ->
     return (
         (engine or DEFAULT_ENGINE) == DEFAULT_ENGINE
         and not has_explicit_tasks(contract)
-        and has_scheduled_builds(contract)
+        and has_scheduled_builds(contract, maintenance=True)
     )
 
 
@@ -1162,7 +1228,7 @@ def scheduled_dags(contract: Dict[str, Any]) -> List[ScheduledDag]:
     """
     raw_builds = contract.get("builds")
     if not isinstance(raw_builds, list):
-        return []
+        raw_builds = []
     graph = _BuildGraph(contract, [b for b in raw_builds if isinstance(b, dict)])
     dags = [dag for members in graph.groups() if (dag := graph.dag(members)) is not None]
     dags += _keepalive_dags(contract, graph.builds, graph.managed)
@@ -1177,6 +1243,12 @@ def scheduled_dags(contract: Dict[str, Any]) -> List[ScheduledDag]:
         seen.add(task.build_id)
     graph.check_expose_refs(dags)
     _check_asset_loops(dags)
+    # After the checks: a maintenance task carries its writer's build id, which has its own DAG
+    # (or keepalive), and it writes no asset.
+    from fluid_build.maintenance.spec import declares_maintenance
+
+    if declares_maintenance(contract):
+        dags += _maintenance_dags(contract)
     return dags
 
 
@@ -1196,6 +1268,7 @@ def scheduled_builds(contract: Dict[str, Any]) -> List[ScheduledBuild]:
             task_timeout_s=task.task_timeout_s,
         )
         for dag in scheduled_dags(contract)
+        if dag.maintains is None
         for task in dag.tasks
     ]
 
@@ -1303,6 +1376,14 @@ def dag_filename_for(build_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", build_id) + "_dag.py"
 
 
+#: How the docstring of a DAG file this module renders opens (:func:`_dag_doc`).
+_DAG_DOC_OPENINGS = (
+    "Scheduled fluid build, ",
+    "Scheduled fluid builds, ",
+    "Scheduled fluid table maintenance, ",
+)
+
+
 def rendered_dag_of(path: Path) -> Optional[Tuple[str, str]]:
     """``(PRODUCT_ID, FLUID_ENV_NAME)`` of a DAG file this module rendered, else ``None``.
 
@@ -1316,7 +1397,7 @@ def rendered_dag_of(path: Path) -> Optional[Tuple[str, str]]:
     except (OSError, SyntaxError, ValueError):
         return None
     doc = ast.get_docstring(tree, clean=False) or ""
-    if not doc.startswith(("Scheduled fluid build, ", "Scheduled fluid builds, ")):
+    if not doc.startswith(_DAG_DOC_OPENINGS):
         return None
     facts: Dict[str, str] = {}
     for node in tree.body:
@@ -1409,6 +1490,15 @@ def _apply_args(args: Tuple[str, ...], build_ref: str) -> str:
     return " ".join((*args, "--build-id", build_ref, "--yes"))
 
 
+_MAINTENANCE_TAIL = (
+    'set -- apply "$contract"',
+    'if [ -n "$FLUID_DAG_ENV" ]; then set -- "$@" --env "$FLUID_DAG_ENV"; fi',
+    'set -- "$@" ' + " ".join(MAINTENANCE_APPLY_ARGS) + ' --expose-id "$FLUID_DAG_EXPOSE_ID" --yes',
+)
+
+#: The script of a maintenance DAG's task: :data:`BASH_SCRIPT_LINES` but for the apply arguments.
+MAINTENANCE_SCRIPT_LINES = _SCRIPT_HEAD + _MAINTENANCE_TAIL + _SCRIPT_END
+
 _KEEPALIVE_TAIL = (
     'set -- apply "$contract"',
     'if [ -n "$FLUID_DAG_ENV" ]; then set -- "$@" --env "$FLUID_DAG_ENV"; fi',
@@ -1475,6 +1565,25 @@ _KEEPALIVE_RUN = (
     "A run cancelled on purpose stays stopped until fluid apply starts it. It\n"
     "runs on SCHEDULE, one run at a time, with no catch-up. The build's\n"
     "execution.orchestration.airflow.dagConfig.schedule sets SCHEDULE.\n"
+)
+
+_MAINTENANCE_RUN = (
+    "Every run maintains one Iceberg table on the Airflow worker, with the\n"
+    "constants below filled in (`--env` is left out when FLUID_ENV_NAME is empty):\n"
+    "\n"
+    '    cd "$FLUID_PROJECT_DIR"\n'
+    '    fluid apply "$FLUID_PROJECT_DIR/$CONTRACT_PATH" --env "$FLUID_ENV_NAME" \\\\\n'
+    "        " + " ".join(MAINTENANCE_APPLY_ARGS) + ' --expose-id "$EXPOSE_ID" --yes\n'
+    "\n"
+    "It runs no tofu apply. It starts one run of forge's Spark runner on the runtime\n"
+    "of the build that writes the table (BUILD_ID), as that build's role, with the\n"
+    "maintenance job config the last fluid apply deployed. It refuses a config that\n"
+    "differs from what the contract compiles to now: run fluid apply first. The\n"
+    "build's stream keeps running. The run takes the steps the table declares: a\n"
+    "package's actions, compaction, manifests, snapshot expiry and orphan files.\n"
+    "It runs on SCHEDULE, one run at a time, with no catch-up, and the task never\n"
+    "retries: the next scheduled run is the retry. exposes[].iceberg.maintenance.\n"
+    "schedule sets SCHEDULE.\n"
 )
 
 _BUILDS_RUN = (
@@ -1607,7 +1716,9 @@ def _schedule_expr(schedule: DagSchedule) -> str:
     )
 
 
-def render_build_task(task: BuildTask, *, only: bool, keepalive: bool = False) -> str:
+def render_build_task(
+    task: BuildTask, *, only: bool, keepalive: bool = False, maintains: bool = False
+) -> str:
     """The source of one build's node: a BashOperator that runs ``fluid apply --build-id``.
 
     This is the one function that decides what runs a build; the DAG's schedule and its edges
@@ -1619,11 +1730,14 @@ def render_build_task(task: BuildTask, *, only: bool, keepalive: bool = False) -
     lit = py_str_literal
     if only:
         name = '"fluid_keepalive"' if keepalive else '"fluid_apply"'
+        if maintains:
+            name = '"fluid_maintain"'
         head, task_id, build_id = "    BashOperator(\n", name, "BUILD_ID"
     else:
         head = f"    tasks[{lit(task.build_id)}] = BashOperator(\n"
         task_id = build_id = lit(task.build_id)
     extra = ""
+    expose_env = '            "FLUID_DAG_EXPOSE_ID": EXPOSE_ID,\n' if maintains else ""
     if not only:
         extra += f"        retries={int(task.retries)},\n"
         extra += f"        execution_timeout={_timeout_expr(task.task_timeout_s)},\n"
@@ -1644,6 +1758,7 @@ def render_build_task(task: BuildTask, *, only: bool, keepalive: bool = False) -
         '            "FLUID_DAG_ENV": FLUID_ENV_NAME,\n'
         f'            "FLUID_DAG_BUILD_ID": {build_id},\n'
         '            "FLUID_DAG_CONTRACT_ENV": CONTRACT_ENV_NAMES,\n'
+        f"{expose_env}"
         "        },\n"
         "        append_env=True,\n"
         "        skip_on_exit_code=None,\n"
@@ -1685,6 +1800,11 @@ _IMPORTS = (
 def _dag_doc(product_id: str, dag: ScheduledDag, extra: Tuple[str, ...] = ()) -> Tuple[str, str]:
     """The DAG file's docstring and the DAG's ``description``. ``extra`` are notes of fluid's
     own text (the alerts' notes) that go after the others."""
+    if dag.maintains is not None:
+        return (
+            _doc("Scheduled fluid table maintenance", _MAINTENANCE_RUN, list(extra)),
+            f"maintain fluid table {product_id} {dag.maintains}",
+        )
     if dag.keepalive:
         return (
             _doc("Scheduled fluid build", _KEEPALIVE_RUN, list(extra)),
@@ -1728,7 +1848,9 @@ def _dag_tasks(dag: ScheduledDag) -> Tuple[str, str]:
             '        "retry_delay": timedelta(minutes=5),\n'
             f'        "execution_timeout": {_timeout_expr(task.task_timeout_s)},\n'
         )
-        return default_args, render_build_task(task, only=True, keepalive=dag.keepalive)
+        return default_args, render_build_task(
+            task, only=True, keepalive=dag.keepalive, maintains=dag.maintains is not None
+        )
     nodes = "".join(render_build_task(t, only=False) for t in dag.tasks)
     default_args = '        "owner": "fluid",\n        "retry_delay": timedelta(minutes=5),\n'
     return default_args, f"    tasks = {{}}\n{nodes}\n{_edges(dag.tasks)}"
@@ -1749,7 +1871,7 @@ def render_scheduled_dag(
     notifiers go on the DAG's callbacks (:mod:`fluid_build.schedulers.airflow._alerts`).
     """
     lit = py_str_literal
-    dag_id = dag_id_for(product_id, dag.build_id, env)
+    dag_id = dag_id_for(product_id, dag.key, env)
     rendered = (
         render_alerts(alerts, dag_id=dag_id, product_id=product_id)
         if alerts is not None
@@ -1765,7 +1887,14 @@ def render_scheduled_dag(
         alert_definitions = rendered.definitions + "\n"
         alert_dag_args = "    **ALERT_DAG_ARGS,\n"
     uses_assets = bool(dag.schedule.datasets) or any(t.outlets for t in dag.tasks)
-    lines = KEEPALIVE_SCRIPT_LINES if dag.keepalive else BASH_SCRIPT_LINES
+    lines = BASH_SCRIPT_LINES
+    if dag.keepalive:
+        lines = KEEPALIVE_SCRIPT_LINES
+    if dag.maintains is not None:
+        lines = MAINTENANCE_SCRIPT_LINES
+    expose = (
+        f"EXPOSE_ID = {lit(validate_id(dag.maintains, kind='exposeId'))}\n" if dag.maintains else ""
+    )
     script = "".join(f"        {lit(line)},\n" for line in lines)
     return (
         f"{doc}\n"
@@ -1775,6 +1904,7 @@ def render_scheduled_dag(
         f"{alert_imports}"
         f"PRODUCT_ID = {lit(product_id)}\n"
         f"BUILD_ID = {lit(dag.build_id)}\n"
+        f"{expose}"
         f"CONTRACT_PATH = {lit(contract_path)}\n"
         f"FLUID_ENV_NAME = {lit(env or '')}\n"
         f"CONTRACT_ENV_NAMES = {lit(' '.join(env_names))}\n"
@@ -1851,10 +1981,10 @@ def render_fluid_apply_dags(
 
     files: Dict[str, str] = {}
     for dag in scheduled_dags(contract):
-        name = dag_filename_for(dag.build_id)
+        name = dag_filename_for(dag.key)
         if name in files:
             raise ScheduleRenderError(
-                f"builds {dag.build_id!r} and another scheduled build map to the same "
+                f"builds {dag.key!r} and another scheduled build map to the same "
                 f"DAG file {name!r}; give them ids that differ in more than '.' or '-'"
             )
         try:
@@ -1900,6 +2030,9 @@ __all__ = [
     "KEEPALIVE_SCHEDULE",
     "KEEPALIVE_SCRIPT_LINES",
     "KEEPALIVE_TASK_TIMEOUT_S",
+    "MAINTENANCE_APPLY_ARGS",
+    "MAINTENANCE_SCRIPT_LINES",
+    "MAINTENANCE_TASK_TIMEOUT_S",
     "runs_only_outside_schedulers",
     "schedule_scope_for",
     "scheduled_builds",

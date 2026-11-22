@@ -49,6 +49,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retry and success; the SLA miss and the deadline alert as Airflow calls them). New validate checks
   `contract_alerts` and, in the plugin phase, `contract_alert_plugins`.
 
+- **A contract declares each Iceberg table's maintenance, and forge runs it beside the table's
+  stream (schema 0.7.7 `exposes[].iceberg.maintenance`, additive).** The steps are a package's
+  `actions` (such as a GDPR erasure), `compaction` (`rewrite_data_files`), `rewriteManifests`,
+  `expireSnapshots` (`olderThan`, `retainLast`) and `removeOrphanFiles` (`olderThan`, P1D at the
+  least), run in that order. `iceberg.compaction.targetFileSizeMb` and `iceberg.snapshotRetention`,
+  which nothing read before, are their defaults. `backend: spark` (the default) runs them with
+  forge's Spark runner, on the runtime and as the role of the `engine: spark` build that writes
+  the table:
+  - `fluid plan` lists a `spark.maintain` action per table, which `planDigest` covers;
+  - `fluid apply` uploads its job config beside the build's;
+  - `fluid generate schedule` writes a maintenance DAG per table, on its `schedule` and
+    `timezone`;
+  - the DAG's task runs `fluid apply --mode maintain --expose-id <expose>`, a new mode that
+    deploys nothing. It starts one run with the config the last apply deployed, refused unless it
+    is the one the contract compiles to now, and waits for it.
+
+  Every commit a run makes carries the runner's stamps plus `fluid.maintenance` (the step).
+  Compaction commits with partial progress, so the stream keeps appending: a file group a
+  concurrent commit conflicts with fails alone, and the next run takes it again. A package's
+  action kind comes from the new `fluid_build.maintenance_actions` entry points (SDK base class
+  `fluid_build.maintenance.MaintenanceAction`), read by name and loaded only when a contract names
+  it, under the allow/block policy. Its statements are asked for when the config is compiled: each
+  must be one `DELETE`, `UPDATE` or `MERGE` whose target is the table, and they are part of the job
+  config the plan binds. A writer on AWS Glue is refused (its one job runs one run at a time), and
+  so is an EMR on EC2 cluster that runs one step at a time while another step runs. `backend: glue`
+  provisions the Glue Data Catalog's table optimizers instead (`aws_glue_catalog_table_optimizer`:
+  compaction, retention, orphan file deletion, run as `roleArn`). A non-default compaction
+  strategy, `minInputFiles` or `deleteFileThreshold` needs hashicorp/aws 6.58.0, and
+  `runEveryHours` needs 6.13.0. New validate checks: `contract_iceberg_maintenance` and
+  `contract_maintenance_actions`.
+
 ### Fixed
 
 - **`fluid apply` no longer updates a live Iceberg table in place.** hashicorp/aws updates an

@@ -160,7 +160,7 @@ def run(args: Any, logger: logging.Logger) -> int:
         if not scheduler_name:
             orchestration = contract.get("orchestration", {})
             scheduler_name = orchestration.get("engine", "")
-        if not scheduler_name and fluid_apply.has_scheduled_builds(contract):
+        if not scheduler_name and fluid_apply.has_scheduled_builds(contract, maintenance=True):
             # A build that declares a trigger has said WHEN it runs. The
             # artifact is inert until schedule-sync pushes it to a scheduler
             # the operator names, so defaulting WHO renders it commits nothing.
