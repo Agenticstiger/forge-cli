@@ -1196,17 +1196,17 @@ def _file_sha256(path: str) -> str:
 
 
 def _check_archive(path: str, where: str) -> None:
-    if not zipfile.is_zipfile(path):
-        raise PackageError(f"the package at {where} is not a wheel or a zip")
+    # is_zipfile reads only the archive's end, and how much it checks there changed in Python
+    # 3.14: a zip that either it or ZipFile refuses is refused the same way.
     try:
+        if not zipfile.is_zipfile(path):
+            raise zipfile.BadZipFile("no end of central directory record")
         with zipfile.ZipFile(path) as archive:
             names = archive.namelist()
-    except (
-        Exception
-    ) as exc:  # noqa: BLE001 - zipfile's own errors: BadZipFile, NotImplementedError, ...
+    except Exception as exc:  # noqa: BLE001 - zipfile's errors: BadZipFile, NotImplementedError
         raise PackageError(
-            f"the package at {where} is not a readable zip ({type(exc).__name__}); build and "
-            "publish it again, and pin the new digest"
+            f"the package at {where} is not a readable wheel or zip ({type(exc).__name__}); "
+            "build and publish it again, and pin the new digest"
         ) from None
     compiled = sorted(
         name

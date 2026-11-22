@@ -146,7 +146,7 @@ def test_an_oversized_package_is_refused_before_it_is_hashed(runner, tmp_path, m
 
 def test_a_file_that_is_no_zip_is_refused(runner, tmp_path):
     body = b"not a zip"
-    with pytest.raises(runner.PackageError, match="not a wheel or a zip"):
+    with pytest.raises(runner.PackageError, match="not a readable wheel or zip"):
         runner.fetch_package(None, str(_copy(tmp_path, body)), hashlib.sha256(body).hexdigest())
 
 
@@ -562,10 +562,10 @@ def test_the_jobs_fixture_is_a_real_module():
 
 def test_a_pinned_zip_that_does_not_read_is_refused(runner, tmp_path):
     body = bytearray(package_zip({"orders_pkg/__init__.py": "x = 1\n"}))
-    at = body.find(b"PK\x01\x02")  # the central directory: is_zipfile still says yes
-    body[at : at + 4] = b"XXXX"
+    at = body.find(b"PK\x01\x02")  # the central directory: Python 3.14's is_zipfile says
+    body[at : at + 4] = b"XXXX"  # no, and 3.11 to 3.13 leave it to ZipFile; refused the same
     body = bytes(body)
-    with pytest.raises(runner.PackageError, match="not a readable zip"):
+    with pytest.raises(runner.PackageError, match=r"not a readable wheel or zip \(BadZipFile\)"):
         runner.fetch_package(None, str(_copy(tmp_path, body)), hashlib.sha256(body).hexdigest())
 
 
@@ -658,7 +658,9 @@ def test_a_zip_python_cannot_open_is_refused_by_name(runner, tmp_path, monkeypat
         raise NotImplementedError("zip file version 23.6")
 
     monkeypatch.setattr(runner.zipfile, "ZipFile", unsupported)
-    with pytest.raises(runner.PackageError, match=r"not a readable zip \(NotImplementedError\)"):
+    with pytest.raises(
+        runner.PackageError, match=r"not a readable wheel or zip \(NotImplementedError\)"
+    ):
         runner.fetch_package(None, str(_copy(tmp_path)), SHA)
 
 
