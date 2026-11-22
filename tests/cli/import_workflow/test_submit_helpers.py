@@ -1589,15 +1589,21 @@ def test_the_values_the_scripts_wait_for_are_listed_once_with_the_tasks_and_the_
     report = ImportReport()
     _report_waiting(scan_dags(tmp_path / "dags", conventions), report)
     assert report.required_defaults == [
-        "6 task(s) submit a script or name a config file that depends on `acme_cfg.ROOT`, which is "
-        "not in the scanned files (DAG d task t0, DAG d task t1, DAG d task t2, and 3 more): name "
-        "the file of its module under `config_modules` in the conventions",
-        "3 task(s) submit a script or name a config file that depends on the environment "
-        "variable CONF_0 (DAG d task t0, DAG d task t2, DAG d task t4): set what it holds under "
-        "`environments` in the conventions",
-        "3 task(s) submit a script or name a config file that depends on the environment "
-        "variable CONF_1 (DAG d task t1, DAG d task t3, DAG d task t5): set what it holds under "
-        "`environments` in the conventions",
+        (
+            "6 task(s) submit a script or name a config file that depends on `acme_cfg.ROOT`, "
+            + "which is not in the scanned files (DAG d task t0, DAG d task t1, DAG d task t2, "
+            + "and 3 more): name the file of its module under `config_modules` in the conventions"
+        ),
+        (
+            "3 task(s) submit a script or name a config file that depends on the environment "
+            + "variable CONF_0 (DAG d task t0, DAG d task t2, DAG d task t4): set what it holds "
+            + "under `environments` in the conventions"
+        ),
+        (
+            "3 task(s) submit a script or name a config file that depends on the environment "
+            + "variable CONF_1 (DAG d task t1, DAG d task t3, DAG d task t5): set what it holds "
+            + "under `environments` in the conventions"
+        ),
     ]  # the Variable whose name says it is a credential is not one to set in the conventions
 
 
