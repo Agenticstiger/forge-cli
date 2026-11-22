@@ -533,6 +533,10 @@ def test_an_embedded_jdbc_url_names_no_host(uri):
         {"s": {"endpoint": f"api.{ELSEWHERE}"}},
         {"s": {"endpoint": f"//{ELSEWHERE}/x"}},
         {"s": {"uri": f"api.{ELSEWHERE}:5432/db"}},
+        {"instance_type": {"host": f"a(,{ELSEWHERE}:27017,b)"}},
+        {"instance_type": {"server_addresses": f"a(,{ELSEWHERE}:27017,b)"}},
+        {"cfg": {"url": f"jdbc:derby:net://{ELSEWHERE}:1527/db"}},
+        {"cfg": {"url": f"JDBC:DERBY:NET://{ELSEWHERE}:1527/db"}},
     ],
 )
 def test_every_spelling_of_a_host_under_another_setting_is_judged(extra):

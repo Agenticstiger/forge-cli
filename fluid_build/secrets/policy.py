@@ -280,11 +280,13 @@ _NAMED_HOST_FIELDS: Dict[str, str] = {
 }
 #: What such a field holds when it names no host: a path (a REST stream's
 #: ``endpoint: /v1/users``, never ``//host/...``), or words with an optional type
-#: expression (a column map's ``host: varchar``, ``hostname: host_name``,
-#: ``character varying(255)``). Anything else is judged, digits and non-ASCII
+#: expression with digits only in its brackets (a column map's ``host: varchar``,
+#: ``hostname: host_name``, ``numeric(10, 2)``). Anything else is judged, digits and non-ASCII
 #: included: a resolver reads ``134744072`` and ``evil\u3002example`` as hosts. A
 #: single word resolves only on the operator's own network.
-_NOT_A_HOST = re.compile(r"/(?!/).*|[A-Za-z_]+(?:\s+[A-Za-z_]+)*\s*(?:\([^()]*\))?", re.DOTALL)
+_NOT_A_HOST = re.compile(
+    r"/(?!/).*|[A-Za-z_]+(?:\s+[A-Za-z_]+)*\s*(?:\(\s*\d+(?:\s*,\s*\d+)?\s*\))?", re.DOTALL
+)
 #: Embedded or local JDBC databases, which name no host while their settings name
 #: none: SQLite, H2 in memory or in a file, embedded Derby, HSQLDB in memory, in
 #: a file or in a resource.
@@ -997,7 +999,7 @@ def _reading_elsewhere(path: Tuple[Any, ...], text: str) -> Optional[str]:
     if shape is not None:
         scheme = shape.group("scheme")
         if scheme is None:
-            if _EMBEDDED_JDBC.match(text) and not _settings_name_a_host(text):
+            if _embedded_jdbc(text):
                 return None
         elif re.split(r"[+:]", scheme.lower())[0] in _UNJUDGED_SCHEMES:
             return None
@@ -1006,6 +1008,20 @@ def _reading_elsewhere(path: Tuple[Any, ...], text: str) -> Optional[str]:
         return None
     reading = _NAMED_HOST_FIELDS.get(name)
     return reading if reading is not None and _may_be_a_host(text) else None
+
+
+def _embedded_jdbc(text: str) -> bool:
+    """Whether JDBC URL ``text`` is an embedded database (:data:`_EMBEDDED_JDBC`) naming no host.
+
+    Not when its location holds ``://`` (``jdbc:derby:net://`` is IBM's network
+    driver), nor when its settings name a host.
+    """
+    location = re.split(r"[?;]", text, maxsplit=1)[0]
+    return (
+        bool(_EMBEDDED_JDBC.match(text))
+        and "://" not in location
+        and not (_settings_name_a_host(text))
+    )
 
 
 def _settings_name_a_host(text: str) -> bool:
