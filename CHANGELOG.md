@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conventions key `airflow_variables` (per environment, like `environments`; a Variable nobody named
   stays unresolved and its default is not assumed); the new key `drivers` joins a task that submits
   a script running jobs by name (`driver.py --job-list silver_orders`) to every job file the list
-  names (a safe YAML file of at most 32 KB, read once; a name or a value that is not a plain file
+  names (a safe YAML file of at most 16 KB, read once; a name or a value that is not a plain file
   name and a path that leaves its directory are refused); `--split-by task` makes one product of the
   outputs of every job a DAG task runs; and a product that no scanned job reads and no new
   `external_consumers` entry names is flagged in the report ("retire it, or name its consumer")

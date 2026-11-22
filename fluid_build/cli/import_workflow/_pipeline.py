@@ -405,7 +405,7 @@ def _scan_report(
             if link.how == "name":
                 report.unsupported.append(
                     f"DAG {safe_text(link.dag.shown, 60)} task {safe_text(link.task.shown, 60)} submits "
-                    f"{safe_command(link.submit.script or '', 100)}: joined to a job file by file name only"
+                    f"{safe_text(link.submit.script or '', 100)}: joined to a job file by file name only"
                 )
         through_driver = sum(1 for link in linked if link.how == "driver")
         report.notes.append(
@@ -422,7 +422,7 @@ def _scan_report(
             line = (
                 f"DAG {safe_text(dag.shown, 60)} task {safe_text(task.shown, 60)} "
                 f"({task.file}:{submit.line}) submits "
-                f"{safe_command(submit.script or submit.shown or '(no script)', 100)}: not joined ({safe_text(why, 120)})"
+                f"{safe_text(submit.script or submit.shown or '(no script)', 100)}: not joined ({safe_text(why, 120)})"
             )
             if tool == "airflow" and submit.script:
                 report.unsupported.append(

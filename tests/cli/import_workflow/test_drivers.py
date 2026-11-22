@@ -326,17 +326,31 @@ def test_a_list_over_the_size_limit_is_not_read(tmp_path):
     big = "jobs: [" + "x, " * 12_000 + "y]\n"  # 36 KB
     assert len(big) > D.MAX_LIST_BYTES
     reader, driver = lists(tmp_path, {"pkg/job_lists/a.yaml": big})
-    assert "is larger than 32 KB" in reader.names(driver, "a")
+    assert "is larger than 16 KB" in reader.names(driver, "a")
 
 
 def test_the_lists_of_one_scan_are_bounded_in_bytes_too(tmp_path, monkeypatch):
-    monkeypatch.setattr(D, "MAX_LIST_BYTES_TOTAL", 20)
+    monkeypatch.setattr(D, "MAX_LIST_BYTES_TOTAL", 40)
     reader, driver = lists(
         tmp_path, {f"pkg/job_lists/{n}.yaml": "jobs: [x, y, z]\n" for n in ("a", "b", "c")}
-    )
+    )  # 16 bytes each
     assert reader.names(driver, "a") == ["x", "y", "z"]
-    assert reader.names(driver, "b") == ["x", "y", "z"]  # the first one over the limit is read
-    assert "the most it reads" in reader.names(driver, "c")
+    assert reader.names(driver, "b") == ["x", "y", "z"]
+    assert "would pass it" in reader.names(driver, "c")  # 48 bytes would pass the 40
+
+
+def test_a_list_that_would_pass_the_total_is_refused_before_it_is_read(tmp_path, monkeypatch):
+    from fluid_build.util import safe_yaml
+
+    monkeypatch.setattr(D, "MAX_LIST_BYTES_TOTAL", 10)
+    reader, driver = lists(tmp_path, {"pkg/job_lists/a.yaml": "jobs: [x, y, z]\n"})
+    reads = []
+    original = safe_yaml.read_bounded_file
+    monkeypatch.setattr(
+        safe_yaml, "read_bounded_file", lambda p, n: reads.append(p) or original(p, n)
+    )
+    assert "would pass it" in reader.names(driver, "a")
+    assert reads == []
 
 
 def test_a_list_is_counted_against_the_budget_of_the_scan(tmp_path):
@@ -640,20 +654,22 @@ def test_a_nul_in_a_path_of_the_conventions_is_refused_with_the_key_named(tmp_pa
     [
         ("external_consumers: [a.b]\nexternal_consumers: [c.d]\n", "external_consumers"),
         ("environment: prod\nenvironment: dev\n", "environment"),
-        ("airflow_variables:\n  prod:\n    a: '1'\n    a: '2'\n", "airflow_variables.prod.a"),
+        ("airflow_variables:\n  prod:\n    a: '1'\n    a: '2'\n", "'a'"),
         (
             "drivers:\n  - script: driver.py\n    script: other.py\n    argument: --j\n",
-            "drivers[0].script",
+            "'script'",
         ),
+        ('layers:\n  "<<": gold\n  "<<": silver\n', "'<<'"),
+        ("env: {a: 1, a: 2}\n", "'a'"),
     ],
 )
-def test_a_key_given_twice_is_refused_with_its_path(tmp_path, text, key):
+def test_a_key_given_twice_is_refused_with_the_key_and_the_line(tmp_path, text, key):
     path = tmp_path / "c.yaml"
     path.write_text(text, encoding="utf-8")
     with pytest.raises(Exception) as refused:
         C.load_conventions(path)
     why = getattr(refused.value, "why", str(refused.value))
-    assert "given twice" in why and key in why
+    assert "given twice" in why and key in why and "(line " in why
 
 
 def test_a_list_that_gives_a_key_twice_is_not_read(tmp_path):
@@ -661,14 +677,47 @@ def test_a_list_that_gives_a_key_twice_is_not_read(tmp_path):
     assert "gives a key twice" in reader.names(driver, "a")
 
 
-def test_a_merge_key_and_a_repeated_key_in_two_mappings_are_not_duplicates(tmp_path):
-    text = "base: &b {a: 1}\nx: {<<: *b, c: 2}\ny: {c: 3}\n"
-    assert C.duplicate_key(text) is None
+def load_unique(text):
+    from fluid_build.util.safe_yaml import load_yaml_safe
+
+    return load_yaml_safe(text, loader=C.unique_key_loader())
+
+
+def test_a_merge_key_and_a_repeated_key_in_two_mappings_are_not_duplicates():
+    assert load_unique("base: &b {a: 1}\nx: {<<: *b, c: 2}\ny: {c: 3}\n")["x"] == {"a": 1, "c": 2}
     two_merges = "base: &b {a: 1}\nc: &c {d: 2}\ny: {<<: *b, <<: *c}\n"
-    assert C.duplicate_key(two_merges) is None  # a merge key may come twice
-    assert C.duplicate_key("1: a\n'1': b\n") is None  # a number and a text are two keys
-    assert C.duplicate_key("a: 1\nb: {a: 1}\nc: [{a: 1}, {a: 2}]\n") is None
-    assert C.duplicate_key("a: 1\nb: [{a: 1, a: 2}]\n") == "b[0].a"
+    assert load_unique(two_merges)["y"] == {"a": 1, "d": 2}  # a merge key may come twice
+    assert load_unique("1: a\n'1': b\n") == {1: "a", "1": "b"}  # a number and a text are two keys
+    assert load_unique("a: 1\nb: {a: 1}\nc: [{a: 1}, {a: 2}]\n")["c"] == [{"a": 1}, {"a": 2}]
+
+
+def test_a_key_given_twice_in_a_nested_mapping_names_the_key_and_the_line():
+    with pytest.raises(C.unique_key_loader().DuplicateKey) as refused:
+        load_unique("a: 1\nb: [{a: 1, a: 2}]\n")
+    assert C.duplicate_key_text(refused.value) == "the key 'a' is given twice (line 2)"
+
+
+def test_true_and_the_same_key_written_twice_are_one_key():
+    for text in ("true: 1\nTrue: 2\n", "1: a\n01: b\n", 'a: 1\n"a": 2\n'):
+        with pytest.raises(C.unique_key_loader().DuplicateKey):
+            load_unique(text)
+
+
+def test_a_long_key_does_not_make_a_long_refusal():
+    with pytest.raises(C.ConventionsError) as refused:
+        C.parse_conventions({"layers": {"k" * 100_000: "purple"}})
+    assert len(str(refused.value)) <= 400 and "expected Bronze, Silver or Gold" in str(
+        refused.value
+    )
+
+
+def test_a_control_character_in_a_text_value_of_the_conventions_is_refused():
+    for value in ("t\\e[31mx", "a\\nb", "x\\u202ey"):
+        with pytest.raises(C.ConventionsError) as refused:
+            C.parse_conventions(
+                __import__("yaml").safe_load(f'owners: {{orders-team: {{team: "{value}"}}}}')
+            )
+        assert "control or invisible" in str(refused.value) and "\x1b" not in str(refused.value)
 
 
 def test_an_escape_sequence_in_a_key_does_not_reach_the_refusal(tmp_path):

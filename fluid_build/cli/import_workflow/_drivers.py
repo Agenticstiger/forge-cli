@@ -12,8 +12,8 @@ file (bounded and safe YAML, never run), and the job file of each name in it.
 
 Nothing is guessed and nothing runs. A value or a name that is not a plain file name is refused
 before any path is made of it, a path that leaves the directory it is looked for in (a link out
-included) is not read, a list is a file of at most 32 KB read once (all of them together at most
-256 KB), counted against the same budget as the source of the scan, and a job is joined only when
+included) is not read, a list is a file of at most 16 KB read once (all of them together at most
+128 KB), counted against the same budget as the source of the scan, and a job is joined only when
 it is one of the job files the scan found.
 """
 
@@ -23,7 +23,7 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
-from ._conventions import Driver, duplicate_key
+from ._conventions import Driver, unique_key_loader
 from ._pysource import SourceBudget
 
 #: A job list's name, and a job's: a plain file name stem.
@@ -32,8 +32,8 @@ _NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127}")
 #: not get more. A list of 500 names of 40 characters is 20 KB.
 MAX_JOBS_PER_LIST = 500
 MAX_LISTS = 1_000
-MAX_LIST_BYTES = 32_768
-MAX_LIST_BYTES_TOTAL = 262_144
+MAX_LIST_BYTES = 16_384
+MAX_LIST_BYTES_TOTAL = 131_072
 
 
 def _segments(script: str) -> List[str]:
@@ -129,10 +129,14 @@ class Lists:
             return f"the job list {path.name} could not be looked at"
         if not regular:
             return f"there is no job list {path.name} in the directory the conventions name"
-        if self._bytes >= MAX_LIST_BYTES_TOTAL:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return f"the job list {path.name} could not be looked at"
+        if self._bytes + size > MAX_LIST_BYTES_TOTAL:
             return (
-                f"the scan has read {MAX_LIST_BYTES_TOTAL // 1024} KB of job lists, the most it "
-                "reads"
+                f"the scan has read {self._bytes // 1024} of the {MAX_LIST_BYTES_TOTAL // 1024} KB "
+                "of job lists it reads, and this one would pass it"
             )
         from fluid_build.util.safe_yaml import load_yaml_safe, read_bounded_file
 
@@ -145,13 +149,13 @@ class Lists:
         if self.budget is not None and not self.budget.take(len(data)):
             return "the scan has read all the source it reads, so the job list was not read"
         self._bytes += len(data)
+        loader = unique_key_loader()
         try:
-            text = data.decode("utf-8")
-            document = load_yaml_safe(text, max_bytes=len(data) + 1)
+            document = load_yaml_safe(data.decode("utf-8"), max_bytes=len(data) + 1, loader=loader)
+        except loader.DuplicateKey:
+            return f"the job list {path.name} gives a key twice"
         except Exception:  # noqa: BLE001 - UnsafeYamlError, yaml's own errors, bad UTF-8
             return f"the job list {path.name} is not valid YAML"
-        if duplicate_key(text) is not None:
-            return f"the job list {path.name} gives a key twice"
         return _names_in(document, driver)
 
 

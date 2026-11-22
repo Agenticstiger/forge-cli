@@ -85,8 +85,12 @@ def load_yaml_safe(
     max_alias_expansion: int = MAX_YAML_ALIAS_EXPANSION,
     max_alias_expansion_chars: int = MAX_YAML_ALIAS_EXPANSION_CHARS,
     max_depth: int = MAX_YAML_DEPTH,
+    loader: type = yaml.SafeLoader,
 ) -> Any:
     """``yaml.safe_load`` with billion-laughs (anchor-expansion) protection.
+
+    ``loader`` is a :class:`yaml.SafeLoader` or a subclass of it (one that refuses a key given
+    twice, for example): what builds the value, once the document has passed the caps.
 
     Accepts a ``str``, ``bytes``, or a readable stream; ``max_bytes`` counts
     UTF-8 bytes for all three. ``yaml.parse`` does not resolve aliases, so the
@@ -101,9 +105,13 @@ def load_yaml_safe(
         return None
     source = _bounded_text(source, max_bytes)
     if _count_aliases(source, max_aliases, max_depth) == 0:
-        return yaml.safe_load(source)
+        instance = loader(source)  # what ``yaml.load(source, loader)`` does
+        try:
+            return instance.get_single_data()
+        finally:
+            instance.dispose()
     return _checked_document(
-        source, True, max_alias_expansion, max_alias_expansion_chars, construct=True
+        source, True, max_alias_expansion, max_alias_expansion_chars, construct=True, loader=loader
     )
 
 
@@ -130,20 +138,21 @@ def _checked_document(
     max_alias_expansion_chars: int,
     *,
     construct: bool = False,
+    loader: type = yaml.SafeLoader,
 ) -> Any:
     """The single document in ``source``: its node, or its value when
     ``construct``; ``None`` when empty. A document with aliases is refused
     when they expand it past the caps (:func:`_check_alias_expansion`)."""
-    loader = yaml.SafeLoader(source)
+    instance = loader(source)
     try:
-        node = loader.get_single_node()
+        node = instance.get_single_node()
         if node is None:
             return None
         if has_aliases:
             _check_alias_expansion(node, max_alias_expansion, max_alias_expansion_chars)
-        return loader.construct_document(node) if construct else node
+        return instance.construct_document(node) if construct else node
     finally:
-        loader.dispose()
+        instance.dispose()
 
 
 def _bounded_text(source: Any, max_bytes: int) -> str:

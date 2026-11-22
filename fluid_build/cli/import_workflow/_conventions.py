@@ -92,6 +92,7 @@ text each is matched against is cut at 256 characters.
 
 from __future__ import annotations
 
+import functools
 import re
 import string
 from dataclasses import dataclass, field
@@ -228,8 +229,11 @@ class Conventions:
 def _fail(path: Optional[Path], where: str, why: str) -> ConventionsError:
     at = f"{path.name}: " if path is not None else ""
     # ``where`` holds the names the file gives: they are text from a file that came with a
-    # repository, and an escape sequence in one would reach the terminal
-    return ConventionsError(clean_chars(f"{at}{where}: {why}"))
+    # repository, an escape sequence in one would reach the terminal, and a key of 250 KB would
+    # make a message of that size. The names are cut so that the reason stays in the message.
+    named = where if len(where) <= 200 else where[:197] + "..."
+    message = clean_chars(f"{at}{named}: {why}")
+    return ConventionsError(message if len(message) <= 400 else message[:397] + "...")
 
 
 def _text(
@@ -239,6 +243,8 @@ def _text(
         raise _fail(path, where, "expected a non-empty string")
     if len(value) > MAX_TEXT:
         raise _fail(path, where, f"longer than {MAX_TEXT} characters")
+    if clean_chars(value) != value:  # these values reach the contracts and the terminal
+        raise _fail(path, where, "has a control or invisible character in it")
     if pattern is not None and not pattern.fullmatch(value.strip()):
         raise _fail(path, where, f"{value!r} is not an acceptable name")
     return value.strip()
@@ -745,42 +751,45 @@ def parse_conventions(
     )
 
 
-def duplicate_key(text: str) -> Optional[str]:
-    """The path of the first key a mapping of the YAML ``text`` gives twice, else ``None``. YAML
-    keeps the last of two equal keys, so a declared consumer or a driver would go unseen. The
-    document is composed, not constructed: an alias is one more reference to a node, never a
-    copy."""
+@functools.lru_cache(maxsize=1)
+def unique_key_loader() -> Any:
+    """A YAML loader that refuses a mapping that gives a key twice (YAML keeps the last, so a
+    declared consumer or a driver would go unseen), in the one pass that builds the value: its
+    ``DuplicateKey`` is what it raises, with the key and the line. A merge key (``<<``) may come
+    twice; a quoted ``"<<"`` is an ordinary key, and ``1`` and ``"1"`` are two."""
     import yaml
 
-    from fluid_build.util.safe_yaml import compose_yaml_safe
+    class DuplicateKey(yaml.constructor.ConstructorError):
+        pass
 
-    try:
-        root = compose_yaml_safe(text)
-    except Exception:  # noqa: BLE001 - the caller has read it as YAML already
-        return None
-    if root is None:
-        return None
-    seen: Set[int] = set()
-    stack: List[Tuple[Any, str]] = [(root, "")]
-    while stack:
-        node, where = stack.pop()
-        if id(node) in seen:
-            continue
-        seen.add(id(node))
-        if isinstance(node, yaml.MappingNode):
-            keys: Set[Tuple[str, str]] = set()
-            for key, value in node.value:
-                if not isinstance(key, yaml.ScalarNode):
-                    stack.append((value, f"{where}.?"))
-                    continue
-                here = f"{where}.{key.value}".lstrip(".")
-                if key.value != "<<" and (key.tag, key.value) in keys:  # ``<<`` merges, in turn
-                    return here
-                keys.add((key.tag, key.value))
-                stack.append((value, here))
-        elif isinstance(node, yaml.SequenceNode):
-            stack.extend((item, f"{where}[{index}]") for index, item in enumerate(node.value))
-    return None
+    class UniqueKeys(yaml.SafeLoader):
+        def construct_mapping(self, node: Any, deep: bool = False) -> Any:
+            if isinstance(node, yaml.MappingNode):
+                seen: Set[Any] = set()
+                for key_node, _value in node.value:
+                    if key_node.tag == "tag:yaml.org,2002:merge":
+                        continue
+                    try:
+                        key = self.construct_object(key_node, deep=True)
+                        known = key in seen
+                    except Exception:  # noqa: BLE001 - not a key; the loader says why
+                        continue
+                    if known:
+                        raise DuplicateKey(
+                            None, None, f"the key {key!r} is given twice", key_node.start_mark
+                        )
+                    seen.add(key)
+            return super().construct_mapping(node, deep=deep)
+
+    UniqueKeys.DuplicateKey = DuplicateKey  # type: ignore[attr-defined]
+    return UniqueKeys
+
+
+def duplicate_key_text(exc: Exception) -> str:
+    """What a :meth:`unique_key_loader` refusal says: the key, and the line it is on."""
+    mark = getattr(exc, "problem_mark", None)
+    line = f" (line {mark.line + 1})" if mark is not None else ""
+    return clean_chars(f"{getattr(exc, 'problem', 'a key is given twice')}{line}")[:200]
 
 
 def load_conventions(
@@ -824,19 +833,18 @@ def load_conventions(
         raise refusal(
             f"the conventions file {file.name} is too large", f"it is over {MAX_BYTES:,} bytes"
         )
+    loader = unique_key_loader()
     try:
-        text = data.decode("utf-8")
-        document = load_yaml_safe(text, max_bytes=MAX_BYTES)
+        document = load_yaml_safe(data.decode("utf-8"), max_bytes=MAX_BYTES, loader=loader)
+    except loader.DuplicateKey as exc:
+        raise refusal(
+            f"the conventions file {file.name} has a problem",
+            f"{duplicate_key_text(exc)}: YAML would keep the last",
+        ) from exc
     except Exception as exc:  # noqa: BLE001 - UnsafeYamlError, yaml's own errors, bad UTF-8
         raise refusal(
             f"the conventions file {file.name} is not valid YAML", type(exc).__name__
         ) from exc
-    twice = duplicate_key(text)
-    if twice is not None:
-        raise refusal(
-            f"the conventions file {file.name} has a problem",
-            clean_chars(f"{twice}: the key is given twice (YAML would keep the last)"),
-        )
     try:
         return parse_conventions(document, file.resolve(), roots=roots)
     except ConventionsError as exc:
