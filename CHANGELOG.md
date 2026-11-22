@@ -34,6 +34,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   products list every read no single write owns as before, and past 40,000 listed reads in all
   each lists fewer (500 down to 5) and the report says so.
 
+- **`fluid describe --commands` prints every command as JSON, plugins included.** The document
+  has a `schema_version` (1) and lists each command with its aliases, positional arguments and
+  flags (names, type, choices, default, nargs, help). Commands added by `fluid_build.commands`
+  plugins are loaded for this call, under the allow/block policy, and carry a `plugin` key; the
+  `importers` list names the built-in importers and the `fluid_build.importers` plugins, read from
+  entry-point metadata without loading them. `fluid describe --self --json` gains `type` and
+  `nargs` on each flag. Plain `--help` and every other command still load no plugin.
+- **`fluid schedule-sync --airflow-url` waits until Airflow has parsed the pushed DAG files, on
+  Airflow 2 and Airflow 3.** It finds the API major itself (`/api/v2` on Airflow 3, `/api/v1` on
+  Airflow 2; `--airflow-api v1|v2` pins it) and signs in the way each major takes a credential: a
+  token in `FLUID_AIRFLOW_TOKEN_REF`, sent as a bearer token to both, or `user:password` in
+  `FLUID_AIRFLOW_CREDENTIAL_REF`, sent as HTTP Basic to Airflow 2 and exchanged for a token at
+  `POST /auth/token` on Airflow 3. Both variables hold a secret reference (`env://`, `file://`,
+  `vault://`, `aws-sm://`), and a project `.env` cannot set them. The version check, the sign-in
+  and the two reads the wait depends on (import errors and DAGs) run before anything is pushed,
+  so a check that cannot run leaves nothing pushed. After the push, every pushed file must be
+  parsed with no import error within `--airflow-wait` seconds (default 600, cap 3600). On an
+  Airflow 3 Git DAG bundle, its DAGs must report the commit the `git+ssh` push made (or
+  `--airflow-bundle-version`). Elsewhere, the source Airflow stores for the file (`dagSources`)
+  must be the pushed file, and Airflow must then save two clean parses of it, the later at
+  least 60 s after the parse it showed when the source first matched: a parse that was already
+  running when the files landed read the old file, Airflow runs one such parse per DAG processor,
+  and it stops a parse after `dag_file_processor_timeout` (50 s by default). A user who may not
+  read DAG code gets a pass marked not proven (`schedule_sync_airflow_unproven`, exit 0) after two
+  clean parses 60 s apart. A failure counts from two stamps of the file's import error and stands
+  once they are 60 s apart. On Airflow 3.4, `/api/v2/dagBundles` shows when the bundle reached
+  the pushed commit. A DAG that never appears is reported as not parsed: Airflow 3 shows the
+  import error of a file with no registered DAG only to a user who may read all import errors.
+  A file whose DAG ids forge cannot read holds the wait until Airflow lists a DAG from it or
+  shows its import error, unless it is a helper module: one whose import makes no call and that
+  never names `globals`. A helper is not waited for, but an import error Airflow shows for it
+  fails the check. `--airflow-bundle` limits the check to one bundle. `--check-only` checks the files under `--dags-dir` without pushing, for a deploy that
+  puts them in place itself. A file that fails to import, or is not parsed in time, exits 1 with
+  `schedule_sync_airflow_import_errors` or `schedule_sync_airflow_not_parsed`, and the report's
+  `airflow_check` block names each file. Typed errors cover an unreachable server, a refused
+  credential, a forbidden read, a redirect (never followed) and a mismatched major. Plain HTTP is
+  refused for any host but loopback unless `FLUID_AIRFLOW_ALLOW_INSECURE_HTTP` is set, and a
+  loopback host is never sent through a proxy. No request outlives `--airflow-wait`. MWAA,
+  Prefect and Dagster are refused with `--airflow-url`. Without `--airflow-url` the stage behaves
+  as before.
+- `fluid_build.util.http_client.new_client` takes `trust_env=False` for a request that must not
+  reach a proxy, like `new_async_client`.
+- **Every DAG forge generates is loaded by a real Airflow in a gated test.**
+  `tests/schedulers/test_generated_dags_airflow_live.py` loads each generator's DAG in the
+  `DagBag` of the Airflow 2 and 3 named by `FLUID_AIRFLOW2_PYTHON` / `FLUID_AIRFLOW3_PYTHON`. It
+  checks that there is no import error and no Airflow removal or deprecation warning, and that
+  the DAG ids match what the new check reads from the files. A unit test runs Ruff's Airflow 3
+  rules (AIR3) over every generated DAG, the `fluid apply` DAGs included. It allows a finding
+  only inside an Airflow 2 `except ImportError` fallback.
+- **A changed Spark stream stops between batches before `fluid apply` replaces it.** Where a
+  changed config used to cancel the running stream, `fluid apply` now asks it to stop: each
+  stream's run is started with a stop key (`--fluid-stop-key`, the start's own token), and the
+  request is an object at `stop/<key>` beside the build's job config (`_fluid/spark/<product>/
+  <build>/`, which the job's role already reads and lists; on `runtime: local`, under
+  `FLUID_SPARK_LOCAL_ROOT`). The runner looks for it every 10 s, stops each of its queries once no
+  batch is running in it (or right after a batch commits, when batches run back to back), and ends
+  cleanly; the new config then starts on the same checkpoint. A run that has not stopped within
+  `FLUID_SPARK_STOP_GRACE_SECONDS` (default 300, `0` cancels at once), was started by an older
+  `fluid apply` without a key, or was started on another job config (the output's location moved,
+  so it would never see the request), is cancelled as before, and the request is removed whatever
+  happens, Ctrl-C included. The outcome names the config the stream moved from and to, and how
+  each old run stopped; a dry run and the plan's `stateImpact` say which runs would stop between
+  batches. A stream that moves to `trigger.availableNow` has its continuous run stopped the same
+  way. A second writer on the checkpoint (a second copy of the same config, or a run of another config
+  beside one of the new config) is still cancelled at once, and `--mode reconcile`, which never
+  replaces a config, writes no request. Before a stream reads anything, the runner refuses a
+  checkpoint (or the dead letters' checkpoint) whose newest offsets name another topic, which also
+  catches a checkpoint no recorded run used (a prefix copied from another stream, a new EMR
+  cluster with no step history). Moving `properties.stream.checkpoint` still starts the job from
+  `startingOffsets`, as the 0.7.7 schema says, unless the new prefix already holds a position
+  (Spark resumes it); the outcome now says which, from the runs' history. The first apply after
+  the upgrade still cancels each running stream once (see Upgrade notes).
+- **`--adopt-tables` takes existing Glue tables over into the OpenTofu state, each only
+  when it matches the contract.** `fluid plan <contract> --tofu --adopt-tables` (and
+  `fluid apply <contract> --adopt-tables`) finds the tables the contract names that
+  already exist and that the state does not hold, and plans each through an OpenTofu
+  `import` block in the module's `main.tf.json`, so the plan shows the import and writes
+  no state before the apply. The saved plan is read back with `tofu show -json` before
+  the data-loss gate: a table that matches is imported unreplaced, its Lake Formation
+  permissions kept. What it holds of its own that the contract does not declare (a
+  description, an owner, column comments, a column name's case, the columns of older
+  Iceberg schemas Glue lists) is printed: an Iceberg table keeps it, as the adoption
+  never updates an Iceberg table in place (the plan is made again with that drift left
+  alone, and must import the table with no change); a Hive table is updated in place. A table that differs refuses the run (`table_adoption_mismatch`),
+  naming each column missing, added, of another type (spacing aside, as the data-loss
+  gate reads types) or in another order, and each property: location, Iceberg or not,
+  input and output format, SerDe and storage parameters, partition keys, table type, any
+  other storage setting, or the replace OpenTofu would plan; nothing is imported or
+  applied. The run that applies the take-over audits it at WARNING
+  (`table_adoption_accepted`); a dry run or a refusal does not. The saved plan records
+  the adopted tables in `opentofuPlan.adoptedTables`, under `planDigest`, and `fluid
+  apply plan.json` names them. `fluid ship --adopt-tables` passes the flag to its apply
+  stage. With the flag a table whose look-up fails for any reason but "no such object"
+  stops the run, and one it cannot look for (no AWS account id) is refused
+  (`table_adoption_unavailable`); `fluid plan --adopt-tables` needs `--tofu`
+  (`plan_adopt_tables_needs_tofu`). The match is checked when the plan is made: a saved
+  plan applies what it planned. A partitioned Hive table cannot be adopted yet: its
+  partition trigger is new to the state, so OpenTofu plans its replacement, and the run
+  is refused saying so.
+
 - **A Spark build can run the team's own prebuilt PySpark package by its sha256 digest, and
   forge's runner owns the write.** `builds[].properties.package` (0.7.7 preview) on an
   `engine: spark` embedded-logic batch build names a `.whl` or `.zip` (`uri`), its `sha256` and an
@@ -64,8 +164,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[all]`), imported only when a run names the key and the contract declares the block, so
   `fluid --help` loads what it did before. The key is requested by name, never part of the
   default set: the engine renders the bundles' templates in this process, so a pipeline names it
-  only where it trusts the contract's bundles (not on a build of an untrusted pull request, which
-  reaches stage 3). A default run on a contract with the block says how to ask for it. Without the
+  only where it trusts the contract's bundles, and it never runs on a change-request build (next
+  entry). A default run on a contract with the block says how to ask for it. Without the
   engine (or with one older than 0.5.0, or one that does not import) the run fails with an error
   that names the extra, and `fluid ship --require-artifacts custom-scaffold` fails a release run
   that wrote none. Before the engine runs, its own validator checks the block and every
@@ -80,15 +180,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_apply_failed`, `_output_failed`, `_plugin_blocked`, `_engine_missing`, `_engine_too_old`,
   `_engine_broken`, `_failed`), with the message redacted; a file-system error is
   `custom_scaffold_output_failed`, not a traceback. A relative `path:` bundle is read from the
-  contract's directory (a bundle's recorded source contract, else `--contract-path`), and a
-  `custom-scaffold/` in `--out` that holds `fluid-scaffold.yaml` (a bundle, with `--out` at the
-  contract's directory) is refused rather than cleared. Git bundles keep the engine's own
-  credential model: a credential goes only to a host the operator lists in
-  `FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS`, and a contract's `secret_ref` may only name a
+  contract's directory (a bundle's recorded source contract, else `--contract-path`). Like stage
+  3's other subdirectories of `--out`, `custom-scaffold/` is cleared on every run, whatever
+  `--emit` names, so a scaffold an earlier run wrote never outlives a run without the key (it would
+  not be in that run's MANIFEST); one that holds `fluid-scaffold.yaml` (a bundle, with `--out` at
+  the contract's directory) is refused rather than cleared. That bundle, an unknown `--emit` key
+  and a change-request build refuse the run before anything in `--out` changes; the engine's own
+  refusals still come after the clear. `--out`'s help says which subdirectories stage 3 owns. Git
+  bundles keep the engine's own credential model: a credential goes only to a host the operator
+  lists in `FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS`, and a contract's `secret_ref` may only name a
   `FLUID_SCAFFOLD_` variable; the engine's operator settings (`FLUID_CUSTOM_SCAFFOLD_*`) cannot
   come from a project `.env` file. `fluid generate ci` installs the `custom-scaffold` extra in the
   pipeline when the contract declares the block, so a pipeline that names the key in
   `GENERATE_EMIT` can run it.
+- **`custom-scaffold` never runs on a change-request build.** A generated pipeline shares one
+  `GENERATE_EMIT` between its pull or merge request builds and its default-branch builds and runs
+  stage 3 on both, so naming the key for releases would run a change's bundle templates before
+  anyone merged it, often with the job's credentials. On a build its CI marks as a change request,
+  `fluid ship` leaves `custom-scaffold` out of stage 3's `--emit` and `--require-artifacts` and says
+  so in the stage's notes (stage 3 is skipped when the key was all it had to do); a default-branch
+  build keeps it. A run that would seal a release (`--release-dir`) or publish while
+  `--require-artifacts` names `custom-scaffold` is refused instead (exit 2), so a build marked by
+  mistake never ships without it. Every generated system runs `fluid ship`, so this covers all seven
+  in both install modes. `fluid generate artifacts --emit custom-scaffold` refuses such a build
+  itself (`custom_scaffold_change_request`) before anything in `--out` is removed or written and
+  before the engine is imported, unless `--allow-scaffold-on-change-request` is passed; no variable
+  or `.env` file stands in for the flag. The markers are each CI system's own variables: Jenkins
+  `CHANGE_ID` (and `ghprbPullId`, `gitlabMergeRequestId`), GitHub Actions `GITHUB_EVENT_NAME`
+  `pull_request`, `pull_request_target`, `pull_request_review` or `pull_request_review_comment`,
+  GitLab `CI_MERGE_REQUEST_IID` / `CI_MERGE_REQUEST_ID` or `CI_PIPELINE_SOURCE`
+  `merge_request_event` (and the external pull request variables), Azure Pipelines `BUILD_REASON`
+  `PullRequest` (and `SYSTEM_PULLREQUEST_PULLREQUESTID` / `_PULLREQUESTNUMBER`), Bitbucket
+  `BITBUCKET_PR_ID`, CircleCI `CIRCLE_PULL_REQUEST` / `CIRCLE_PR_NUMBER` / `CI_PULL_REQUEST`. Tekton
+  sets none, so the generated Tekton Pipelines and Task take a `FLUID_CHANGE_REQUEST` parameter that
+  defaults to `true`: every run counts as a change request unless a default-branch run passes
+  `false` (the header's `tkn` example shows it), so a run that forgets it leaves the scaffold out.
+  Any other pipeline may set `FLUID_CHANGE_REQUEST` too, never a project `.env`: any value but
+  blank, `0`, `false`, `no` or `off` marks the build, and only its name is printed. A marker only
+  ever marks a build: `FLUID_CHANGE_REQUEST=false` never clears a CI system's own.
 - **`fluid generate artifacts --emit pyspark-schema` puts the PySpark schema modules in the
   MANIFEST.** It writes `pyspark-schema/<port>_schema.py`, the module `fluid generate
   pyspark-schema` writes, byte for byte (same loader, renderer and writer), for each output port
@@ -393,6 +522,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **An existing Glue table forge did not make is no longer taken over without being
+  asked.** A table the contract names that already exists and that the OpenTofu state
+  does not manage used to be imported on every `fluid apply` and rewritten to the
+  contract in place. It is now refused before the plan (`table_adoption_requires_flag`),
+  naming each table; `--adopt-tables` adopts it after the match check. A table forge
+  made for the same product is re-attached as before when its state was lost or is kept
+  nowhere, so an apply that starts from an empty state on every run keeps working. Such
+  a table carries the `managed_by: fluid` parameter and the product id in a new
+  `fluid_product_id` parameter, which forge's module sets on every Glue table it
+  creates, whatever the contract's size. A table made before that is matched by the id
+  in the contract it records (`fluid_contract`, dropped for a contract over 50 KB). A
+  table with neither, or with another product's id, needs the flag. S3 buckets, Glue databases,
+  Kinesis streams and the other brownfield resources are adopted as before, and so are
+  tables on the other clouds. The look-up now also covers a Glue binding without a
+  `format`, which the module declares as Parquet and the look-up used to skip.
+
 - **`--fail-on-breaking` fails on a changed product id.** The changelog did not compare ids, so a
   contract that only changed its id passed the gate; it is a breaking change now, as it is in the
   `--impact` report.
@@ -430,6 +575,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The repository's redactor, the importer and the Snowflake, local and GCP provider loggers share
   the Oracle rule's one regex, which also reads a user name in double quotes.
 
+- **`fluid ship` unwraps a wrapped store token once and hands it to every stage.** A
+  response-wrapped OpenBao or Vault token (`FLUID_VAULT_WRAPPED_TOKEN`) unwraps once, and ship runs
+  each stage as its own process, so only the first stage that reached the store could use it: with
+  OpenBao state encryption, `diff` spent it and `apply` failed. A ship of two or more stages now
+  unwraps it before the first stage and hands every stage the token through a pipe, which the stage
+  reads as it starts (`FLUID_VAULT_SHIP_TOKEN_FD` names it). Windows has no inherited pipes, so
+  there the token travels in `FLUID_VAULT_SHIP_TOKEN`, which the stage takes out of its environment
+  at once. The token is in no process's environment, so tofu, dbt and a project's build steps
+  cannot reach it, and the store resolver reads it before any other token. No stage revokes it:
+  ship does when the run ends, also after a failed stage and after Ctrl-C. A wrapper that cannot be
+  unwrapped (a spent one, no store address, a store that cannot be reached) stops the run before
+  any stage, with exit 2. Ship unwraps whenever two or more stages run, so a wrapper now serves one
+  `fluid ship` invocation: a run split over several invocations needs one for each. A ship of one
+  stage (`--stage 7`, as a pipeline with one stage per CI step runs it) leaves the wrapper to that
+  stage, and a single `fluid apply` uses it, as before. A ship that SIGTERM or SIGKILL ends does
+  not revoke the token, which then lasts until its TTL.
+
 - **Entropy Data's product list is read whole or not at all.** A page after the first that was
   not a list (a rate-limit answer, say) used to hand back the pages before it as if they were
   every product the server holds, and an answer that was not JSON was a bare `ValueError`. Both
@@ -464,6 +626,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrote `type: parquet_variant` into a contract that `fluid validate` then rejected. It maps to
   `variant`, as DuckDB's `UNION` already does, and the schema-drift gate reads the two as one
   type family, so a contract written that way does not fail at apply.
+
+### Security
+
+- An address with an IPv6 zone id, such as `::1%lo0`, is no longer read as this machine. The
+  secret destination policy judges it like any other host, and an OpenBao or Vault address on
+  it needs https.
+- The secret destination policy judges every host a connection names. Beside a `secretRef`,
+  a query-string parameter that names a host (`host` or `hostaddr` in a libpq URI, a host in
+  `jdbc_url_params` or in a Singer tap's `sqlalchemy_url`) is refused unless the reference may
+  go to any host, and so is a database name that holds `?`, `#`, `;`, `&`, `@`, `\` or a
+  control character. The host of an SSH tunnel in use (a tap's `ssh_tunnel`, Airbyte's
+  `tunnel_method`) needs an allowlist entry of its own, and so does a loopback host behind
+  it. A Debezium `extra_config` may no longer set `database.port`, `database.dbname`,
+  `database.names` or `connector.class` beside a `secretRef`. A URI whose authority a
+  database client could read as naming a host the policy does not read is a destination the
+  policy cannot read, and is refused unless the reference may go to any host.
+- A runner that builds a connection URL keeps each field in its own part. dlt's
+  `sql_database` source refuses a host, database or `drivername` that would change how its
+  connection URL is read back, and `drivername` must be a SQLAlchemy dialect name with an
+  optional `+driver`. The Kafka Connect JDBC source and Debezium refuse a host or database
+  that holds URL syntax, and a port that is not a number.
+- A secret-policy refusal no longer prints a value it cannot trace to the contract. At
+  `fluid apply`, where `{{ env.NAME }}` placeholders are rendered, a refusal quotes a host only
+  when the contract wrote it as it stands, and names the placeholder of one it rendered. A
+  keyword connection string (`Server=...;Database=...`) shows its host part only.
+- In `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, `NAME@*` now sends `env://NAME` to any host, as
+  a bare `NAME` and `env://NAME@*` already did. It used to name a literal host `*`, which no
+  destination matches. A refusal's fix names both forms.
+
+- **No dataclass prints a secret in its repr.** A dataclass's generated repr prints every field,
+  so a debug line, an f-string with `!r` or a traceback that shows locals would put a credential
+  in a log. 24 fields that hold one are now `field(repr=False)`:
+  - the environments an OpenTofu apply, a build runner, a local Spark run and `fluid ship`'s
+    stages get, which hold `BAO_TOKEN` and the state passphrase;
+  - API keys and tokens for LLM providers, DataHub, Entropy Data, OpenMetadata, Airbyte and
+    lineage, plus the lineage endpoint, which may carry a token in its query;
+  - Snowflake's password, key passphrase, OAuth token and monitoring keys;
+  - the PII hook's HMAC key, the masked values of a `--discover` URI, deployment secrets and GCP
+    credentials.
+
+  A static test walks every dataclass in `fluid_build/`. It fails when a field named for a secret,
+  or an environment held as a mapping, stays in the repr; fields whose names hold no secret are
+  listed with the reason.
+
+- **Generated CI pins current GitHub Actions, and an action the pin table lacks stops the
+  generation.** `fluid generate ci` pins `actions/checkout` v4.4.0, `osv-scanner-action` v2.7.1,
+  `codeql-action/upload-sarif` v3.39.4 and `anchore/sbom-action` v0.24.3, each by commit (#686).
+  A generator that asked for an action the table does not hold used to get the tag back, and a
+  tag can move; that now raises. A test checks that every action the `fluid generate ci`
+  generators write goes through the table, and that every entry is one line
+  `scripts/check_pinned_actions.py` can read.
+
+- **`tofu` never runs with this process's whole environment.** The `tofu --version` probe that
+  runs before every cloud apply and `fluid diff` handed tofu every variable this process holds.
+  It now gets `PATH`, `HOME`, what a Go binary needs on Windows, and the `TOFU_CLI_PATH` and
+  `GITHUB_OUTPUT` that setup-opentofu's wrapper needs in GitHub Actions. Every other tofu run
+  already got the `build_tofu_env()` allowlist. `env` is now a required keyword of the OpenTofu
+  runner and each of its `tofu_*` helpers, and `env=None`, which inherited everything, is
+  refused. A test checks that every call in `fluid_build/` passes it.
+
+- **A `fluid ship` stage no longer imports modules from the checkout.** Ship runs each stage as
+  `python -m fluid_build.cli` in the contract's directory, and `-m` puts that directory first on
+  `sys.path`. So a `yaml.py` or a `fluid_build/` in the checkout ran inside every stage, before the
+  CLI started, with the operator's environment. Stages now start through a bootstrap that runs the
+  CLI as `-m` does, without that directory on the path.
+
+### Upgrade notes
+
+- A Glue table that forge made before this release from a contract over 50 KB carries forge's
+  `managed_by: fluid` marker but no product id: forge dropped its record of the contract, and
+  `fluid_product_id` did not exist yet. `fluid apply` now refuses it with
+  `table_adoption_requires_flag`, in a message of its own that names the one-time remedy. If the
+  table is that product's, add the table parameter `fluid_product_id=<product id>` once, with the
+  table's writers paused, through `aws glue update-table` with `--version-id` from a fresh
+  `aws glue get-table`, so a concurrent commit fails the update instead of being reverted. Where
+  the run can pass flags and keeps its state, `--adopt-tables` once also works; adopting does not
+  write the id, so a run that keeps no state needs the parameter.
+- Every Spark stream running when forge is upgraded is replaced once by the first `fluid apply`
+  after the upgrade, by a cancel, as before: the runner changed, so the config hash did, and a run
+  started before the upgrade has no stop key, so it cannot be asked to stop between batches. From
+  then on a changed stream stops between batches (see Added). A plan made before the upgrade is
+  refused at `fluid apply` (`apply_spark_artifact_mismatch`): plan again with the new version.
 
 ## [0.36.0] — 2026-11-19
 

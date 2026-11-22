@@ -216,6 +216,7 @@ def stamped_run(runner, contract, monkeypatch, **config_changes):
     calls = []
     frame = Frame(calls)
     monkeypatch.setattr(runner, "build_output", lambda spark, cfg: frame)
+    monkeypatch.setattr(runner, "_names", lambda spark, directory: [])  # a new checkpoint
     session = Session()
     stamps = stamps_of(runner, config, text, **everything())
     runner.run(session, config, stamps)
@@ -311,7 +312,9 @@ def main_with(runner, monkeypatch, contract, argv, events=None):
     text = config_text(contract)
     monkeypatch.setattr(runner, "read_text", lambda spark, path: events.append("read") or text)
     monkeypatch.setattr(
-        runner, "run", lambda spark, config, stamps: events.append("run") or seen.append(stamps)
+        runner,
+        "run",
+        lambda spark, config, stamps, stop=None: events.append("run") or seen.append(stamps),
     )
     code = runner.main(["--config", "s3://b/_fluid/job.json", *argv])
     return code, seen, text

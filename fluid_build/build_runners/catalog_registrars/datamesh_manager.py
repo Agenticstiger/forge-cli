@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -56,7 +56,7 @@ _MAX_PRODUCT_PAGES = 1000
 class DataMeshManagerRegistrar(CatalogRegistrar):
     target: str = "datamesh_manager"
     api_url: Optional[str] = None
-    api_token: Optional[str] = None
+    api_token: Optional[str] = field(default=None, repr=False)
     timeout_seconds: int = 30
     # When True, POST ``/api/access/{id}/approve`` after PUTting each
     # access agreement. DMM only renders lineage from APPROVED agreements

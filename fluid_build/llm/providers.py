@@ -203,7 +203,7 @@ class LlmConfig:
     provider: str
     model: str
     endpoint: str
-    api_key: Optional[str]
+    api_key: Optional[str] = field(repr=False)
     timeout_seconds: int = 120
     # Slice UX-I: opt-in/out of server-sent-event streaming on
     # supported providers.  Defaults to True so the user sees tokens

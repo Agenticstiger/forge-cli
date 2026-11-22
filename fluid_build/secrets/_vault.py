@@ -26,19 +26,24 @@ never replaces the operator's.
   switched off; ``*_SKIP_VERIFY`` is not read.
 * The token, the first that applies:
 
-  1. ``FLUID_VAULT_WRAPPED_TOKEN``: a response-wrapped token, Command Center's
+  1. The token ``fluid ship`` unwrapped from ``FLUID_VAULT_WRAPPED_TOKEN`` for
+     its stages: a stage reads it from the pipe ``FLUID_VAULT_SHIP_TOKEN_FD``
+     names (``FLUID_VAULT_SHIP_TOKEN`` on Windows) when it starts
+     (:mod:`._ship_token`), so it is in no process's environment.
+  2. ``FLUID_VAULT_WRAPPED_TOKEN``: a response-wrapped token, Command Center's
      per-run handoff. Unwrapped once; a wrapping token works once, so a
      refused unwrap means it expired or someone else used it.
-  2. ``FLUID_VAULT_JWT_ROLE``: a JWT login for CI, with the JWT from
+  3. ``FLUID_VAULT_JWT_ROLE``: a JWT login for CI, with the JWT from
      ``FLUID_VAULT_JWT`` or the file ``FLUID_VAULT_JWT_FILE``, at the auth mount
      ``FLUID_VAULT_JWT_MOUNT`` (default ``jwt``).
-  3. ``BAO_TOKEN``, else ``VAULT_TOKEN``.
-  4. The default token helper's file, ``~/.vault-token`` (``bao login`` and
+  4. ``BAO_TOKEN``, else ``VAULT_TOKEN``.
+  5. The default token helper's file, ``~/.vault-token`` (``bao login`` and
      ``vault login`` write it).
 
-  A token forge obtained (1 or 2) is revoked when the run ends
-  (``auth/token/revoke-self``); a token the operator supplied (3 or 4) is
-  theirs, and is left alone.
+  A token forge obtained (2 or 3) is revoked when the run ends
+  (``auth/token/revoke-self``); a token the operator supplied (4 or 5) is
+  theirs, and is left alone. So is ship's (1): ship revokes it when its own
+  run ends.
 
 Requests carry ``X-Vault-Request: true``, go through ``util.safe_http`` (the
 address is resolved once and the connection pinned to it) and never follow a
@@ -61,6 +66,7 @@ from urllib.parse import quote, urlsplit
 
 from fluid_build._net import is_loopback_host
 
+from . import _ship_token
 from .errors import SecretResolveError, resolve_failure
 from .ref import SecretRef
 from .registry import Existence
@@ -467,6 +473,8 @@ def _revoke_later(config: VaultConfig, run: RunState, token: str) -> None:
 
 def auth_method() -> str:
     """Which token source applies, for messages and ``fluid doctor``. No secrets."""
+    if _ship_token.take():
+        return "ship-token"
     if _env(WRAPPED_TOKEN_ENV):
         return "wrapped-token"
     if _env(JWT_ROLE_ENV):
@@ -486,9 +494,12 @@ def token_for(ref: Optional[SecretRef], config: VaultConfig, run: RunState) -> s
     cached = tokens.get(config.key)
     if cached is not None:
         return cached
+    shipped = _ship_token.take()
     wrapped = _env(WRAPPED_TOKEN_ENV)
     role = _env(JWT_ROLE_ENV)
-    if wrapped is not None:
+    if shipped is not None:
+        token = shipped  # fluid ship unwrapped it, and revokes it when its run ends
+    elif wrapped is not None:
         token = _unwrap(ref, config, run, wrapped)
         _revoke_later(config, run, token)
     elif role is not None:

@@ -274,13 +274,19 @@ def is_loopback_host(host: object) -> bool:
     - The IPv6 loopback ``::1``.
 
     Anything else (real hostnames, public IPs, link-local addresses) is
-    treated as non-loopback and left untouched by callers.
+    treated as non-loopback and left untouched by callers. So is an address
+    with an IPv6 zone id (``::1%lo0``): :mod:`ipaddress` takes every character
+    after the ``%`` as the zone, commas included, so ``::1%x,db.example.com``
+    would read as loopback while libpq, which splits a host list on commas,
+    connects to ``db.example.com``. Loopback needs no zone.
     """
     if not isinstance(host, str) or not host.strip():
         return False
     h = host.strip().lower()
     if h == "localhost":
         return True
+    if "%" in h:
+        return False
     # Strip ``[`` / ``]`` for bracketed IPv6 forms like ``[::1]``.
     candidate = h.lstrip("[").rstrip("]")
     try:

@@ -314,6 +314,13 @@ def _render_missing_optional(e: Any, args: argparse.Namespace, context: Any, cli
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Enhanced main entry point with production features and comprehensive error handling"""
+    # First, before anything can start a subprocess: read the store token
+    # `fluid ship` handed this stage from its pipe (and take the variables
+    # naming it out of the environment), so no child of this process (tofu,
+    # dbt, a project's build step) can reach it.
+    from fluid_build.secrets._ship_token import take as take_ship_token
+
+    take_ship_token()
     # Must run before ANY output: the banner below is Unicode-heavy and would
     # crash on a cp1252 console otherwise (xsdOYJ6E).
     _force_utf8_streams()

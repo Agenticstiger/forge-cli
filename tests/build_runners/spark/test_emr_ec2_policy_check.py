@@ -115,7 +115,7 @@ def _role_reads(clients, run, attached):
 
 def _step_added(emr, run):
     args = ["spark-submit", "--deploy-mode", "client", *ad._conf_params(run.spark_conf)]
-    args += [run.runner_uri, *started(run).entry_args()]
+    args += [run.runner_uri, *started(run).entry_args(stop_key="tok")]
     emr.add_response(
         "add_job_flow_steps",
         {"StepIds": ["s-1"]},

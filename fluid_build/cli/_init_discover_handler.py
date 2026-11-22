@@ -14,7 +14,7 @@ import builtins
 import json
 import logging
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from itertools import groupby
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -91,14 +91,14 @@ class _UriView:
     # The masked values, in every form a driver may print them, to mask again by
     # value in driver errors; not one too short to mask by value, nor one the
     # shown rest of the URI also spells out.
-    secrets: Tuple[str, ...]
+    secrets: Tuple[str, ...] = field(repr=False)
     ambiguous: bool  # urlsplit reads a different user:password part than we do
     # What the display does with each character of the URI (_SHOWN, _LEFT_OUT,
     # _MASKED), to mask a copy of it a driver quotes cut short. Empty for a path.
     marks: Tuple[int, ...] = ()
     # Every form of every masked value, however short and wherever else it is
     # spelled out: masked where a driver prints it as a DSN's password field.
-    hidden: Tuple[str, ...] = ()
+    hidden: Tuple[str, ...] = field(default=(), repr=False)
     # The user name is a database login, shown, not a possible token.
     database: bool = False
     # ``safe`` before the shared redactor masks known secret shapes in it (which

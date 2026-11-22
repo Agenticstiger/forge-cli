@@ -94,7 +94,7 @@ class DataHubRegistrar(CatalogRegistrar):
     # of the missing FLUID_CATALOG_DATAHUB_URL / DATAHUB_GMS_URL setting.
     base_url: str
     target: str = "datahub"
-    api_token: Optional[str] = None
+    api_token: Optional[str] = field(default=None, repr=False)
     timeout_seconds: int = 30
     # Base URL for spec source-of-truth documents. When set, the
     # registrar emits ``institutionalMemory`` links + a

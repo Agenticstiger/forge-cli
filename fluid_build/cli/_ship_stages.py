@@ -105,6 +105,7 @@ class ShipOptions:
     yes: bool = False
     strict: bool = True
     allow_data_loss: bool = False
+    adopt_tables: bool = False
     no_verify_digest: bool = False
     no_verify_strict: bool = False
     # False: --no-generate-artifacts, or RUN_STAGE_3_GENERATE_ARTIFACTS=false (stage 3
@@ -131,6 +132,12 @@ class ShipOptions:
     require_artifacts: Tuple[str, ...] = ()
     # --release-dir: stage 9 verifies every port (verify --require-every-port).
     verify_every_port: bool = False
+    # What marks this build as a change request, when custom-scaffold was left out of
+    # stage 3 for it (leave_scaffold_out_on_change_request); "" otherwise.
+    scaffold_left_out: str = ""
+    # --require-artifacts named custom-scaffold when it was left out: such a run may check
+    # the change, never seal a release or publish (check_withheld_requirement).
+    scaffold_required_left_out: bool = False
 
 
 @dataclass
@@ -281,6 +288,8 @@ def resolve_options(args: object, contract: str, env: Mapping[str, str]) -> Ship
         yes=bool(get("yes")),
         strict=_on_unless_false(get("strict"), env, "VALIDATE_STRICT"),
         allow_data_loss=_truth(bool(get("allow_data_loss")), env, "ALLOW_DATA_LOSS"),
+        # A flag only, as --yes is: a take-over is asked for on the command line.
+        adopt_tables=bool(get("adopt_tables")),
         no_verify_digest=_truth(bool(get("no_verify_digest")), env, "NO_VERIFY_DIGEST"),
         no_verify_strict=not _on_unless_false(get("verify_strict"), env, "VERIFY_STRICT"),
         generate_artifacts=not get("no_generate_artifacts") and 3 not in switched_off,
@@ -304,6 +313,59 @@ def resolve_options(args: object, contract: str, env: Mapping[str, str]) -> Ship
         require_artifacts=_resolve_required_artifacts(get("require_artifacts")),
         verify_every_port=bool(get("release_dir")),
     )
+
+
+#: The stage-3 key that runs code the contract names: never on a change-request build.
+SCAFFOLD_KEY = "custom-scaffold"
+
+
+def leave_scaffold_out_on_change_request(opts: ShipOptions, env: Mapping[str, str]) -> None:
+    """Drop ``custom-scaffold`` from stage 3's ``--emit`` (and ``--require-artifacts``) on a
+    build its CI marks as a change request.
+
+    A generated pipeline shares one ``GENERATE_EMIT`` between its pull or merge request
+    builds and its default-branch builds and runs stage 3 on both, and the custom-scaffold
+    engine renders the contract's bundle templates in the ``fluid`` process: naming the key
+    for releases would run a change's templates, before anyone merged it, with the job's
+    credentials. The markers are the CI system's own variables
+    (:mod:`fluid_build.util.change_request`), read here rather than in
+    :func:`resolve_options`, which reads only the knobs a wrapper passes through. When the
+    key was all stage 3 had to do, stage 3 is switched off. A stage 3 that is off already
+    (``--no-generate-artifacts``, its ``RUN_STAGE_`` switch) is left as it is, and so is
+    its reason.
+    """
+    from fluid_build.util.change_request import change_request_marker
+
+    if not opts.generate_artifacts:
+        return
+    named = [part.strip() for part in opts.emit.split(",") if part.strip()]
+    if SCAFFOLD_KEY not in named:
+        return
+    marker = change_request_marker(env)
+    if marker is None:
+        return
+    rest = [part for part in named if part != SCAFFOLD_KEY]
+    opts.scaffold_left_out = marker
+    opts.emit = ",".join(rest)
+    opts.scaffold_required_left_out = SCAFFOLD_KEY in opts.require_artifacts
+    opts.require_artifacts = tuple(k for k in opts.require_artifacts if k != SCAFFOLD_KEY)
+    if not rest:
+        opts.generate_artifacts = False
+
+
+def _change_request_note(o: ShipOptions) -> str:
+    return (
+        f"{SCAFFOLD_KEY} left out of --emit: this is a change-request build "
+        f"({o.scaffold_left_out}), and its bundle templates run only on default-branch builds"
+    )
+
+
+def scaffold_drop_reason(o: ShipOptions) -> Optional[str]:
+    """Why stage 3 does not run when :func:`leave_scaffold_out_on_change_request` switched
+    it off (custom-scaffold was all it had to do), else ``None``."""
+    if o.scaffold_left_out and not o.generate_artifacts:
+        return _change_request_note(o) + ", and it was all stage 3 had to do"
+    return None
 
 
 def _resolve_required_artifacts(flag: object) -> Tuple[str, ...]:
@@ -607,7 +669,7 @@ def _generate_artifacts(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
     # but its ODCS, ODPS and policy artifacts do not depend on where it runs
     # (``generate artifacts`` itself drops no key for one; schedule has its own gate).
     if not o.generate_artifacts:
-        a.skip_reason = "--no-generate-artifacts"
+        a.skip_reason = scaffold_drop_reason(o) or "--no-generate-artifacts"
     else:
         a.argv = [
             "generate",
@@ -620,6 +682,8 @@ def _generate_artifacts(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
             ARTIFACTS_DIR,
             *(["--emit", o.emit] if o.emit else []),
         ]
+        if o.scaffold_left_out:
+            a.notes.append(_change_request_note(o))
         if o.require_artifacts:
             a.notes.append(
                 f"--require-artifacts {','.join(o.require_artifacts)}: this stage fails unless "
@@ -636,10 +700,8 @@ def _validate_artifacts(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
                 f"{ARTIFACTS_DIR} does not exist, but stage 3 generate-artifacts was to write "
                 "it; pass --no-generate-artifacts when this pipeline generates no artifacts"
             )
-        a.skip_reason = (
-            f"{ARTIFACTS_DIR} does not exist (stage 3 is off: --no-generate-artifacts "
-            f"or {STAGE_TOGGLES[3]}=false)"
-        )
+        off = scaffold_drop_reason(o) or f"--no-generate-artifacts or {STAGE_TOGGLES[3]}=false"
+        a.skip_reason = f"{ARTIFACTS_DIR} does not exist (stage 3 is off: {off})"
         return
     a.argv = [
         "validate-artifacts",
@@ -709,6 +771,8 @@ def _apply(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
         )
     if o.allow_data_loss:
         argv.append("--allow-data-loss")
+    if o.adopt_tables:
+        argv.append("--adopt-tables")
     if o.no_verify_digest:
         argv += ["--no-verify-plan-binding", "--no-verify-federation"]
     a.argv = argv
@@ -858,6 +922,33 @@ def check_preconditions(
             produced.add(ARTIFACTS_DIR.rstrip("/"))
 
 
+def check_withheld_requirement(
+    selected: Collection[int], opts: ShipOptions, *, releases: bool
+) -> None:
+    """Refuse a run that would seal a release (``releases``: ``--release-dir``) or publish
+    while the ``custom-scaffold`` it requires was left out for a change-request build.
+
+    A build that only checks a change cannot meet the requirement, so it is dropped there;
+    but a build marked by mistake (a Tekton run without ``-p FLUID_CHANGE_REQUEST=false``, a
+    misspelt value) would otherwise seal or publish a release without an artifact the
+    pipeline requires.
+    """
+    if not opts.scaffold_required_left_out:
+        return
+    if releases:
+        what = "seals no release"
+    elif 10 in selected and not dry_run_applied_nothing(opts):
+        what = "publishes nothing"
+    else:
+        return
+    raise ShipUsageError(
+        f"--require-artifacts {SCAFFOLD_KEY} cannot be met on a change-request build "
+        f"({opts.scaffold_left_out}), where its bundle templates never run, so this run "
+        f"{what}: run it from a default-branch build (a Tekton run passes "
+        f"-p FLUID_CHANGE_REQUEST=false), or leave {SCAFFOLD_KEY} out of --require-artifacts"
+    )
+
+
 def check_required_artifacts(
     selected: Sequence[int], not_selected: Mapping[int, str], opts: ShipOptions
 ) -> None:
@@ -868,7 +959,7 @@ def check_required_artifacts(
         return
     keys = ",".join(opts.require_artifacts)
     if 3 not in selected or not opts.generate_artifacts:
-        why = not_selected.get(3) or "--no-generate-artifacts"
+        why = not_selected.get(3) or scaffold_drop_reason(opts) or "--no-generate-artifacts"
         raise ShipUsageError(
             f"--require-artifacts {keys} needs stage 3 generate-artifacts in this invocation, "
             f"and it does not run ({why})"

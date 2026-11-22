@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 
@@ -164,7 +165,7 @@ class TestTofuTimeout:
     def _run_with(self, monkeypatch, child):
         monkeypatch.setattr(runner, "_require_tofu", lambda: "tofu")
         monkeypatch.setattr(runner.subprocess, "Popen", lambda *a, **k: child)
-        return runner._run(["apply"], workdir=".", env=None, command="apply")
+        return runner._run(["apply"], workdir=".", env={}, command="apply")
 
     def test_run_returns_124_on_timeout_after_a_graceful_interrupt(self, monkeypatch):
         """A timeout sends SIGINT, so tofu releases its lock and exits; the result
@@ -190,7 +191,7 @@ class TestTofuTimeout:
         body = "import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\ntime.sleep(60)\n"
         wd = self._fake_tofu(monkeypatch, tmp_path, body)
         monkeypatch.setattr(runner, "_TIMEOUT_GRACE_SECONDS", 1)
-        result = runner._run(["apply"], workdir=wd, env=None, command="apply")
+        result = runner._run(["apply"], workdir=wd, env={}, command="apply")
         assert result.returncode == 124
 
 
@@ -211,10 +212,10 @@ def test_runner_init_and_validate_on_emitted_module(tmp_path):
     }
     (tmp_path / "main.tf.json").write_text(build_module(get_iac_plugin("gcp"), contract))
 
-    init = runner.tofu_init(str(tmp_path), backend=False)
+    init = runner.tofu_init(str(tmp_path), backend=False, env=dict(os.environ))
     assert init.ok, init.stderr or init.stdout
 
-    validate = runner.tofu_validate(str(tmp_path))
+    validate = runner.tofu_validate(str(tmp_path), env=dict(os.environ))
     assert validate.ok, validate.stderr or validate.stdout
 
 
@@ -229,14 +230,17 @@ class TestStateList:
                 "state-list", 0, "snowflake_database.x\nsnowflake_schema.y\n\n", ""
             ),
         )
-        assert runner.tofu_state_list("/wd") == ["snowflake_database.x", "snowflake_schema.y"]
+        assert runner.tofu_state_list("/wd", env={}) == [
+            "snowflake_database.x",
+            "snowflake_schema.y",
+        ]
 
     def test_state_list_empty_when_no_state(self, monkeypatch):
         # `tofu state list` exits non-zero when there is no state yet.
         monkeypatch.setattr(
             runner, "_run", lambda *a, **k: runner.TofuResult("state-list", 1, "", "no state")
         )
-        assert runner.tofu_state_list("/wd") == []
+        assert runner.tofu_state_list("/wd", env={}) == []
 
 
 class TestS3Lockfile:
@@ -252,7 +256,7 @@ class TestS3Lockfile:
         seen = {}
         monkeypatch.setattr(runner, "tofu_version", lambda: version)
         monkeypatch.setattr(runner, "_run", lambda args, **kw: seen.setdefault("args", args))
-        runner.tofu_init(str(tmp_path))
+        runner.tofu_init(str(tmp_path), env={})
         return seen["args"]
 
     S3 = {"s3": {"bucket": "b", "key": "k"}}
@@ -309,7 +313,7 @@ class TestLockfileReconfigure:
         seen = {}
         monkeypatch.setattr(runner, "tofu_version", lambda: (1, 12, 1))
         monkeypatch.setattr(runner, "_run", lambda args, **kw: seen.setdefault("args", args))
-        runner.tofu_init(str(tmp_path))
+        runner.tofu_init(str(tmp_path), env={})
         return seen["args"]
 
     def test_same_backend_without_lockfile_reconfigures(self, monkeypatch, tmp_path):
@@ -362,7 +366,7 @@ class TestLockfileOptOutOnKeptWorkdir:
         seen = {}
         monkeypatch.setattr(runner, "tofu_version", lambda: version)
         monkeypatch.setattr(runner, "_run", lambda args, **kw: seen.setdefault("args", args))
-        runner.tofu_init(str(tmp_path), force_copy=force_copy)
+        runner.tofu_init(str(tmp_path), force_copy=force_copy, env={})
         return seen["args"]
 
     def test_opt_out_reconfigures(self, monkeypatch, tmp_path):

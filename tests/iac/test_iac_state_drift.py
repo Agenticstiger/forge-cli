@@ -348,7 +348,7 @@ def test_tofu_plan_detailed_asks_for_the_detailed_exit_code(monkeypatch, tmp_pat
     calls: List[List[str]] = []
     monkeypatch.setattr(runner, "tofu_path", lambda: "/bin/tofu")
     monkeypatch.setattr(runner.subprocess, "Popen", _fake_popen(calls, returncode=2))
-    result = runner.tofu_plan_detailed(str(tmp_path), out_file="fluid-drift.tfplan")
+    result = runner.tofu_plan_detailed(str(tmp_path), out_file="fluid-drift.tfplan", env={})
     assert calls[0][1:] == [
         "plan",
         "-input=false",
@@ -375,5 +375,5 @@ def test_tofu_show_plan(monkeypatch, tmp_path, returncode, stdout, expected):
     monkeypatch.setattr(
         runner.subprocess, "Popen", _fake_popen(calls, returncode=returncode, stdout=stdout)
     )
-    assert runner.tofu_show_plan(str(tmp_path), plan_file="p") == expected
+    assert runner.tofu_show_plan(str(tmp_path), plan_file="p", env={}) == expected
     assert calls[0][1:] == ["show", "-json", "p"]

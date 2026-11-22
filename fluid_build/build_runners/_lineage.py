@@ -357,9 +357,9 @@ class HttpLineageEmitter(LineageEmitter):
     makes it resistant to DNS rebinding.
     """
 
-    endpoint: str
+    endpoint: str = field(repr=False)  # may carry a token in its query
     timeout_seconds: float = 5.0
-    api_key: Optional[str] = None
+    api_key: Optional[str] = field(default=None, repr=False)
     allow_private: bool = True
 
     def emit(self, event: RunEvent) -> None:

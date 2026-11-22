@@ -123,7 +123,7 @@ class RunContext:
     lineage: "LineageEmitter"
     cost_tracker: "CostTracker"
     workdir: str
-    env: Dict[str, str] = field(default_factory=dict)
+    env: Dict[str, str] = field(default_factory=dict, repr=False)
     sample_rows: Optional[int] = None
     backfill_window: Optional[Dict[str, str]] = None  # {"from": ISO, "to": ISO}
     extras: Dict[str, Any] = field(default_factory=dict)

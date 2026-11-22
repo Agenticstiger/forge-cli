@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
+from .credentials import TOFU_WRAPPER_ENV_NAMES
+
 # Per-command wall-clock cap. A hung ``tofu`` (e.g., an unauthenticated
 # interactive auth prompt that ``-input=false`` did not catch, or a cloud
 # API that hangs the keepalive) is a real prod-risk; CI workflow timeouts
@@ -93,6 +95,19 @@ def _require_tofu() -> str:
     return path
 
 
+#: All a ``tofu --version`` probe gets: where programs are, the home directory,
+#: what a Go binary needs on Windows, and the names setup-opentofu's wrapper
+#: needs (``TOFU_CLI_PATH``, ``GITHUB_OUTPUT``), without which it fails in GitHub
+#: Actions. No credential, proxy or OpenTofu setting: a version check needs none.
+VERSION_PROBE_ENV_NAMES: Tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "SYSTEMROOT",
+    "USERPROFILE",
+    "PATHEXT",
+    *sorted(TOFU_WRAPPER_ENV_NAMES),
+)
+
 _VERSION_RE = re.compile(r"OpenTofu\s+v?(\d+)\.(\d+)\.(\d+)", re.IGNORECASE)
 
 
@@ -101,13 +116,20 @@ def tofu_version() -> Optional[tuple]:
 
     Cheap probe (``tofu --version``) called once per CLI invocation and
     cached on the process; intended for the engine's startup gate, not
-    for hot-path use.
+    for hot-path use. It runs with :data:`VERSION_PROBE_ENV_NAMES` only, never
+    this process's whole environment.
     """
     path = tofu_path()
     if path is None:
         return None
     try:
-        proc = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10)
+        proc = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env={n: os.environ[n] for n in VERSION_PROBE_ENV_NAMES if n in os.environ},
+        )
     except (subprocess.TimeoutExpired, OSError):
         return None
     match = _VERSION_RE.search(proc.stdout) or _VERSION_RE.search(proc.stderr)
@@ -156,15 +178,20 @@ def _run(
     args: List[str],
     *,
     workdir: str,
-    env: Optional[Mapping[str, str]],
+    env: Mapping[str, str],
     command: str,
 ) -> TofuResult:
+    if env is None:  # Popen(env=None) hands tofu this process's whole environment
+        raise TypeError(
+            "tofu needs an explicit environment (iac.credentials.build_tofu_env): "
+            "env=None would hand it this process's whole environment"
+        )
     tofu = _require_tofu()
     timeout = _resolve_timeout()
     child = subprocess.Popen(
         [tofu, *args],
         cwd=workdir,
-        env=dict(env) if env is not None else None,
+        env=dict(env),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -305,7 +332,7 @@ def tofu_init(
     workdir: str,
     *,
     backend: bool = True,
-    env: Optional[Mapping[str, str]] = None,
+    env: Mapping[str, str],
     reconfigure: bool = False,
     force_copy: bool = False,
     plugin_dir: Optional[str] = None,
@@ -336,7 +363,7 @@ def tofu_init(
     return _run(args, workdir=workdir, env=env, command="init")
 
 
-def tofu_state_pull(workdir: str, *, env: Optional[Mapping[str, str]] = None) -> TofuResult:
+def tofu_state_pull(workdir: str, *, env: Mapping[str, str]) -> TofuResult:
     """``tofu state pull`` — the backend's current state document, as JSON text.
 
     A key that holds no state prints a document with an empty ``lineage``
@@ -346,14 +373,12 @@ def tofu_state_pull(workdir: str, *, env: Optional[Mapping[str, str]] = None) ->
     return _run(["state", "pull"], workdir=workdir, env=env, command="state-pull")
 
 
-def tofu_validate(workdir: str, *, env: Optional[Mapping[str, str]] = None) -> TofuResult:
+def tofu_validate(workdir: str, *, env: Mapping[str, str]) -> TofuResult:
     """``tofu validate`` — check config syntax + provider-schema correctness."""
     return _run(["validate", "-no-color"], workdir=workdir, env=env, command="validate")
 
 
-def tofu_plan(
-    workdir: str, *, out_file: str = "tfplan", env: Optional[Mapping[str, str]] = None
-) -> TofuResult:
+def tofu_plan(workdir: str, *, out_file: str = "tfplan", env: Mapping[str, str]) -> TofuResult:
     """``tofu plan`` — write a binary plan to ``out_file`` for later apply."""
     return _run(
         ["plan", "-input=false", "-no-color", "-json", f"-out={out_file}"],
@@ -367,9 +392,7 @@ def tofu_plan(
 PLAN_HAS_CHANGES = 2
 
 
-def tofu_plan_detailed(
-    workdir: str, *, out_file: str, env: Optional[Mapping[str, str]] = None
-) -> TofuResult:
+def tofu_plan_detailed(workdir: str, *, out_file: str, env: Mapping[str, str]) -> TofuResult:
     """``tofu plan -detailed-exitcode -out=<out_file>``, for reading, not applying.
 
     The exit code is 0 for no changes, 1 for an error and
@@ -387,7 +410,7 @@ def tofu_plan_detailed(
 
 
 def tofu_show_plan(
-    workdir: str, *, plan_file: str, env: Optional[Mapping[str, str]] = None
+    workdir: str, *, plan_file: str, env: Mapping[str, str]
 ) -> Optional[Dict[str, Any]]:
     """The saved plan as ``tofu show -json`` prints it, or ``None``.
 
@@ -404,9 +427,7 @@ def tofu_show_plan(
     return payload if isinstance(payload, dict) else None
 
 
-def tofu_apply(
-    workdir: str, *, plan_file: str = "tfplan", env: Optional[Mapping[str, str]] = None
-) -> TofuResult:
+def tofu_apply(workdir: str, *, plan_file: str = "tfplan", env: Mapping[str, str]) -> TofuResult:
     """``tofu apply`` — apply a previously-saved plan file (no re-prompt)."""
     return _run(
         ["apply", "-input=false", "-no-color", "-json", plan_file],
@@ -416,7 +437,7 @@ def tofu_apply(
     )
 
 
-def tofu_destroy(workdir: str, *, env: Optional[Mapping[str, str]] = None) -> TofuResult:
+def tofu_destroy(workdir: str, *, env: Mapping[str, str]) -> TofuResult:
     """``tofu destroy`` — tear down everything in state (used by rollback)."""
     return _run(
         ["destroy", "-input=false", "-no-color", "-json", "-auto-approve"],
@@ -426,7 +447,7 @@ def tofu_destroy(workdir: str, *, env: Optional[Mapping[str, str]] = None) -> To
     )
 
 
-def tofu_state_list(workdir: str, *, env: Optional[Mapping[str, str]] = None) -> List[str]:
+def tofu_state_list(workdir: str, *, env: Mapping[str, str]) -> List[str]:
     """``tofu state list`` — resource addresses currently tracked in state.
 
     Returns an empty list when there is no state yet (fresh workdir) or the
@@ -438,9 +459,7 @@ def tofu_state_list(workdir: str, *, env: Optional[Mapping[str, str]] = None) ->
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
-def tofu_state_resources(
-    workdir: str, *, env: Optional[Mapping[str, str]] = None
-) -> List[Dict[str, Any]]:
+def tofu_state_resources(workdir: str, *, env: Mapping[str, str]) -> List[Dict[str, Any]]:
     """Resources in the CURRENT state, from ``tofu show -json`` (no refresh).
 
     Read before planning, so a caller can compare what state recorded with what
@@ -467,7 +486,7 @@ def tofu_prior_state_resources(
     workdir: str,
     *,
     plan_file: str = "tfplan",
-    env: Optional[Mapping[str, str]] = None,
+    env: Mapping[str, str],
 ) -> List[Dict[str, Any]]:
     """Resources in the refreshed pre-apply state, from ``tofu show -json``.
 
@@ -497,7 +516,7 @@ def tofu_import(
     address: str,
     resource_id: str,
     *,
-    env: Optional[Mapping[str, str]] = None,
+    env: Mapping[str, str],
 ) -> TofuResult:
     """``tofu import`` — adopt one pre-existing cloud resource into state.
 
@@ -513,9 +532,7 @@ def tofu_import(
     )
 
 
-def tofu_state_rm(
-    workdir: str, addresses: List[str], *, env: Optional[Mapping[str, str]] = None
-) -> TofuResult:
+def tofu_state_rm(workdir: str, addresses: List[str], *, env: Mapping[str, str]) -> TofuResult:
     """``tofu state rm`` — stop tracking resources in state. The cloud objects
     stay as they are: this only forgets them (OpenTofu's ``state rm``)."""
     return _run(["state", "rm", *addresses], workdir=workdir, env=env, command="state-rm")

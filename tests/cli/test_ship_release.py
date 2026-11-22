@@ -693,11 +693,10 @@ def test_an_offline_release_run_calls_no_provider_installs_nothing_and_publishes
     assert len({e[1] for e in events if e[0] == "boot"}) >= 7
     assert [e for e in events if e[0] in ("net", "dns")] == []  # no connection, no lookup
     procs = [e[1] for e in events if e[0] == "proc"]
-    stages = [
-        p[3] if p[3] != "generate" else p[4] for p in procs if p[1:3] == ["-m", "fluid_build.cli"]
-    ]
+    stage_start = ship._resolve_fluid_bin()[1:]  # how ship starts a stage
+    stages = [p[3] if p[3] != "generate" else p[4] for p in procs if p[1:3] == stage_start]
     assert stages == ["bundle", "validate", "artifacts", "validate-artifacts", "diff", "plan"]
-    others = [p for p in procs if p[1:3] != ["-m", "fluid_build.cli"]]
+    others = [p for p in procs if p[1:3] != stage_start]
     forbidden = ("pip", "uv", "tofu", "terraform", "dbt", "databricks", "docker", "curl", "git")
     assert [p for p in others if any(Path(str(p[0])).name.startswith(f) for f in forbidden)] == []
 

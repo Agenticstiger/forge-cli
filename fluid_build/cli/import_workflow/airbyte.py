@@ -15,7 +15,7 @@ before any client exists, so a missing setting costs no socket.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from fluid_build.cli._errors import SchemaValidationError
@@ -41,7 +41,7 @@ class AirbyteImporter(Importer):
     # ``""`` keeps "never configured" distinguishable from "the caller passed
     # an empty string".
     server_url: Optional[str] = None
-    api_token: Optional[str] = None
+    api_token: Optional[str] = field(default=None, repr=False)
     timeout_seconds: int = 30
 
     def can_import(self, source: str) -> bool:

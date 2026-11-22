@@ -231,7 +231,7 @@ class Space:
     #: ``serialized_space``, without the metric views (those are read at apply time).
     serialized: Dict[str, Any]
     #: The marker its description ends with, when it is not the product's (an estate's).
-    token: str = ""
+    token: str = field(default="", repr=False)
     #: The workspace folder the space lives in (``parentPath``, as :func:`workspace_folder`
     #: writes it), or ``""``: the deploying identity's own folder, where the API puts a space
     #: when the create names none.

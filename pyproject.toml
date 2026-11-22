@@ -929,6 +929,7 @@ module = [
     # silent unchecked file.
     "fluid_build.forge.core.custom_scaffold_artifacts",
     "fluid_build.util.atomic_write",
+    "fluid_build.util.change_request",
     "fluid_build.observability.secret_redactor",
     # The agentPolicy gate: it decides whether an agent may read production
     # data, so a silent Any is a silent allow.
@@ -938,6 +939,11 @@ module = [
     # silent Any is a silent grant or a silent leak.
     "fluid_build.policy.lakekeeper",
     "fluid_build.policy.lakekeeper_apply",
+    # schedule-sync --airflow-url: resolves the operator's Airflow credential, sends it to
+    # the URL, and decides whether a deploy is live, so a silent Any is a leak or a pass.
+    "fluid_build.cli._airflow_api",
+    "fluid_build.cli._airflow_sync_check",
+    "fluid_build.cli._schedule_sync_airflow",
     # sink.catalogAuth: decides what a streaming sink's catalog credential
     # becomes in the config forge-cli pushes, so a silent Any is a silent leak.
     "fluid_build.providers._iceberg_catalog_auth",
@@ -954,6 +960,7 @@ module = [
     "fluid_build.secrets._env",
     "fluid_build.secrets._file",
     "fluid_build.secrets._vault",
+    "fluid_build.secrets._ship_token",
     "fluid_build.secrets._aws_sm",
     "fluid_build.secrets.contract",
     "fluid_build.secrets.handoff",
@@ -975,6 +982,11 @@ module = [
     "fluid_build.profiler.runner",
     "fluid_build.profiler.sources",
     "fluid_build.cli.profile_cmd",
+    # --adopt-tables: whether forge takes over a table a team's jobs made and fill,
+    # read from the saved plan. A silent Any is a silent take-over.
+    "fluid_build.iac.adoption",
+    "fluid_build.iac.providers.aws_adoption",
+    "fluid_build.cli._apply_table_adoption",
 ]
 strict = true
 
