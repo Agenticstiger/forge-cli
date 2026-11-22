@@ -44,7 +44,9 @@ from typing import Any
 _CREDENTIAL_KEY_WORDS = (
     r"api[_-]?key|authorization|aws_secret_access_key|secret[_.-]access[_.-]key|secret[_.-]key|"
     r"client_secret|credentials?|oauth[_-]?token|password|passphrase|"
-    r"private[_-]?key(?:_passphrase)?|session[_-]token|secret|token"
+    r"private[_-]?key(?:_passphrase)?|session[_-]token|secret|token|"
+    # PagerDuty's Events API key, by its two names
+    r"routing[_-]?key|integration[_-]?key"
 )
 
 _REDACTED = "***REDACTED***"
@@ -72,6 +74,8 @@ _SENSITIVE_KEY_PARTS = (
     "connection_string",
     "connection_url",
     "credential",
+    # PagerDuty's Events API key (``routing_key`` in the request, the integration key)
+    "integration_key",
     # ``sasl.jaas.config`` (incl. the connector's ``iceberg.kafka.sasl.jaas.config``)
     # carries the SASL password/token inside the value, but the key name has no
     # other sensitive substring — so the substring matcher misses it without this
@@ -82,6 +86,7 @@ _SENSITIVE_KEY_PARTS = (
     "password",
     "passphrase",
     "private_key",
+    "routing_key",
     "secret",
     "session_token",
     "token",
@@ -150,6 +155,18 @@ _PROVIDER_KEY_RES = (
     re.compile(
         r"(?i)\bhttps?://hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9/_-]{8,256}"
     ),
+    # Incident-service integration URLs, whose path holds the integration key (an alert
+    # route's webhook connection): Zenduty's Generic Integration and its legacy events API,
+    # PagerDuty's Events integration URLs (US and EU).
+    re.compile(
+        r"(?i)\bhttps?://(?:events\.zenduty\.com/integration|(?:www\.)?zenduty\.com/api/events)"
+        r"/[A-Za-z0-9/_-]{8,256}"
+    ),
+    re.compile(
+        r"(?i)\bhttps?://events(?:\.eu)?\.pagerduty\.com/(?:x-ere|integration)/[A-Za-z0-9/_-]{8,256}"
+    ),
+    # Opsgenie's API key as its Authorization header carries it.
+    re.compile(r"(?i)\bGenieKey\s{1,8}[A-Za-z0-9-]{20,128}"),
     re.compile(r"\bhf_[A-Za-z0-9]{30,}"),  # HuggingFace
     re.compile(r"\br8_[A-Za-z0-9]{30,}"),  # Replicate
     re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"),  # GitLab PAT
