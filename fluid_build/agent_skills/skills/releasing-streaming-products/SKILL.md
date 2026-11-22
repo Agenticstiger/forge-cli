@@ -13,6 +13,9 @@ compatibility: Needs the fluid CLI on PATH (pip install data-product-forge). The
 between two batches, so no batch is cut in half, and the new config resumes from the same
 checkpoint.
 
+`fluid describe --commands` prints every command and flag as JSON. Check a command
+or flag there before you use one this skill does not show.
+
 ## Roll out a change
 
 Plan and apply as the deploying-fluid-contracts-safely skill says, and stop for the user's

@@ -27,7 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `publishing-to-data-mesh-manager` publishes a batch as drafts, promotes the drafts a `fluid
   verify` report shows clean and reads a migration's status. `fluid scaffold-ide` installs them
   with the others (`.agents/skills/`, which Codex reads, for `generic`, `cursor` and `cline`). A
-  test now checks that every event a skill's table or list names is one `fluid` emits.
+  test now checks that every event a skill's table or list names is one `fluid` emits. Each of
+  the three points an agent at `fluid describe --commands` for every command and flag.
 - **`fluid schedule-sync --airflow-url` waits until Airflow has parsed the pushed DAG files, on
   Airflow 2 and Airflow 3.** It finds the API major itself (`/api/v2` on Airflow 3, `/api/v1` on
   Airflow 2; `--airflow-api v1|v2` pins it) and signs in the way each major takes a credential: a

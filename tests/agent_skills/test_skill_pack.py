@@ -99,6 +99,23 @@ def test_the_pack_ships_its_skills() -> None:
     ]
 
 
+#: The skills for one workflow each, which show only the commands of that workflow: each says
+#: where every other command and flag is listed.
+WORKFLOW_SKILLS = (
+    "adopting-existing-pipelines",
+    "publishing-to-data-mesh-manager",
+    "releasing-streaming-products",
+)
+
+
+@pytest.mark.parametrize("name", WORKFLOW_SKILLS)
+def test_a_workflow_skill_points_at_the_command_tree(name: str) -> None:
+    """``fluid describe --commands`` lists every command and flag, plugins included;
+    ``test_fluid_commands_in_skills_exist`` proves the pointer runs."""
+    (skill,) = [s for s in SKILLS if s.name == name]
+    assert "`fluid describe --commands`" in _body(skill / "SKILL.md")
+
+
 @pytest.mark.parametrize("skill", SKILLS, ids=_ids(SKILLS))
 def test_frontmatter_follows_the_agent_skills_spec(skill: Path) -> None:
     meta = frontmatter(skill / "SKILL.md")

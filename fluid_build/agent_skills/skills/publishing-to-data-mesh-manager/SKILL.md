@@ -10,6 +10,9 @@ compatibility: Needs the fluid CLI on PATH (pip install data-product-forge) and 
 `fluid datamesh-manager` (or `fluid dmm`) writes to a catalog other teams read. Read before you
 write, publish only what the user asked for, and publish drafts first.
 
+`fluid describe --commands` prints every command and flag as JSON. Check a command
+or flag there before you use one this skill does not show.
+
 ## Where the products stand
 
 `status` is read-only: it reads the product list once and sends nothing else.

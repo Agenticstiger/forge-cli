@@ -11,6 +11,9 @@ compatibility: Needs the fluid CLI on PATH (pip install data-product-forge). Tak
 imports or runs them: no job starts and Airflow is never loaded. A person completes and
 reviews each contract before anything is applied.
 
+`fluid describe --commands` prints every command and flag as JSON, the importers installed
+here included. Check a command or flag there before you use one this skill does not show.
+
 ## 1. Propose, then write
 
 Run the dry run first. It prints each proposed product (its writer, outputs and upstreams),
