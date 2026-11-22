@@ -667,6 +667,51 @@ def test_many_additions_and_uses_cost_in_proportion():
     assert elapsed < 20, elapsed  # it took minutes when each use went through every addition
 
 
+def _many_chains(functions: int, loads: int = 1) -> str:
+    """``functions`` functions that each hold a chain in the same name ``w`` (added to once, then
+    written), ``loads`` of ``w`` in each."""
+    return "".join(
+        f"def f{i}(x):\n"
+        f"    w = raw.writeStream.format('iceberg').option('checkpointLocation', 's3://s/{i}')\n"
+        f"    w = w.trigger(availableNow=True)\n"
+        + "".join(f"    print(w, {n})\n" for n in range(loads - 1))
+        + f"    w.toTable('glue.a.t{i}')\n"
+        for i in range(functions)
+    )
+
+
+def test_finding_where_the_chains_are_used_reads_each_load_once(monkeypatch):
+    calls = []
+    original = Folder.scope_of
+
+    def counting(self, node):
+        calls.append(node)
+        return original(self, node)
+
+    monkeypatch.setattr(Folder, "scope_of", counting)
+
+    def scope_calls(functions: int) -> int:
+        calls.clear()
+        facts = job(_many_chains(functions, loads=3))
+        assert len(facts.writes) == functions
+        return len(calls)
+
+    small = scope_calls(50)
+    large = scope_calls(200)
+    # four times the functions, so four times the chains and four times the loads of ``w``:
+    # calls grow in proportion (it was the square: each chain went through every load)
+    assert large < small * 5, (small, large)
+
+
+def test_a_file_whose_loads_cost_more_than_the_flow_left_follows_no_chain(monkeypatch):
+    from fluid_build.cli.import_workflow import _spark_io
+
+    monkeypatch.setattr(_spark_io, "MAX_FLOW_VISITS_PER_FILE", 50)
+    assert job(_many_chains(40, loads=3)).writes == []
+    monkeypatch.setattr(_spark_io, "MAX_FLOW_VISITS_PER_FILE", 50_000)
+    assert len(job(_many_chains(40, loads=3)).writes) == 40
+
+
 def test_too_many_ways_to_reach_a_use_is_not_followed():
     from fluid_build.cli.import_workflow._spark_io import MAX_CHAIN_SOURCES
 

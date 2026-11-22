@@ -434,6 +434,9 @@ class _Reader:
         self._flow_left = MAX_FLOW_VISITS_PER_FILE
         #: The loads of each name in the file, and the first line of each statement of a body.
         self._name_loads: Optional[Dict[str, List[ast.Name]]] = None
+        #: The statements that load a name, by the name and the scope they are in (``id`` of
+        #: the scope and of the statement): worked out once per name.
+        self._uses: Dict[str, Dict[int, Dict[int, ast.stmt]]] = {}
         self._body_starts: Dict[int, List[int]] = {}
 
     # ── entry ───────────────────────────────────────────────────────
@@ -757,6 +760,8 @@ class _Reader:
                 setters[id(statement)] = number
                 setter_statements.append(statement)
         uses = self._statements_using(name, scope)
+        if uses is None:
+            return None  # telling where the variable is used would cost all the flow left
         # only from the statement that starts the variable to the last that sets or uses it
         starts = self._starts_of(body)
         spans = [self._top_of(starts, s) for s in (base_statement, *setter_statements, *uses)]
@@ -769,21 +774,32 @@ class _Reader:
             self._flow_left -= flow.visits
         return _Chain(base, additions, flow)
 
-    def _statements_using(self, name: str, scope: Any) -> List[ast.stmt]:
-        """The statements of the body of ``scope`` that load ``name``."""
+    def _statements_using(self, name: str, scope: Any) -> Optional[List[ast.stmt]]:
+        """The statements of the body of ``scope`` that load ``name``; ``None`` when finding
+        them would cost more than the flow this file may still read (the chain is not followed).
+
+        The loads of a name are sorted into their scopes once, the first time the name is asked
+        about: a file with many chains and many loads is read once per load, not once per
+        chain and load. The pass is charged to the same budget as the flow itself."""
         if self._name_loads is None:
             index: Dict[str, List[ast.Name]] = {}
             for node in ast.walk(self.module.tree):
                 if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
                     index.setdefault(node.id, []).append(node)
             self._name_loads = index
-        found: Dict[int, ast.stmt] = {}
-        for load in self._name_loads.get(name, ()):
-            if self.folder.scope_of(load) is scope:
+        by_scope = self._uses.get(name)
+        if by_scope is None:
+            loads = self._name_loads.get(name, ())
+            if len(loads) > self._flow_left:
+                return None
+            self._flow_left -= len(loads)
+            by_scope = self._uses[name] = {}
+            for load in loads:
                 statement = self._statement_of(load)
                 if statement is not None:
-                    found[id(statement)] = statement
-        return list(found.values())
+                    owner = id(self.folder.scope_of(load))
+                    by_scope.setdefault(owner, {})[id(statement)] = statement
+        return list(by_scope.get(id(scope), {}).values())
 
     def _starts_of(self, body: List[ast.stmt]) -> List[int]:
         starts = self._body_starts.get(id(body))
