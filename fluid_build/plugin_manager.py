@@ -67,6 +67,9 @@ EXTRA_GROUPS: Dict[str, str] = {
     # Third-party sources for `fluid import <tool>`. Read by name, loaded only when that tool
     # is asked for (``cli/import_workflow/registry.py``); the policy governs it like the rest.
     "importer": "fluid_build.importers",
+    # Iceberg table maintenance actions (``exposes[].iceberg.maintenance.actions[].kind``).
+    # Read by name, loaded only when a contract names the kind (``maintenance/plugins.py``).
+    "maintenance_action": "fluid_build.maintenance_actions",
     # Third-party LLM providers for `fluid forge --llm-provider <name>`. Loaded +
     # registered lazily in ``cli/_llm_provider_plugins.py``; listed here so
     # ``fluid plugins`` surfaces them and the allow/block policy governs them.
@@ -84,8 +87,11 @@ EXTRA_GROUPS: Dict[str, str] = {
 }
 
 #: Groups whose plugins load only when a command asks for one by name (``fluid import
-#: <tool>``, a route's ``kind``) or renders with them: listing plugins never imports them.
-LOADED_ON_USE: frozenset = frozenset({"importer", "alert_notifier", "alert_defaults"})
+#: <tool>``, a route's ``kind``, a maintenance action's ``kind``) or renders with them: listing
+#: plugins never imports them.
+LOADED_ON_USE: frozenset = frozenset(
+    {"importer", "alert_notifier", "alert_defaults", "maintenance_action"}
+)
 
 
 #: Groups that have **no dispatch site** in this build of the CLI: the role is
@@ -419,7 +425,8 @@ def detailed_plugins(
                 entry["reserved"] = True
                 allowed = False
             # Only ALLOWED plugins are ever loaded, and a plugin of a group loaded on use (an
-            # importer, an alert kind or defaults) is imported when it is used, not by listing it.
+            # importer, an alert kind or defaults, a maintenance action) is imported when it is
+            # used, not by listing it.
             if allowed and k not in LOADED_ON_USE:
                 try:
                     obj = ep.load()

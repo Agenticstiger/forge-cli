@@ -397,6 +397,10 @@ def run(args, logger: logging.Logger) -> int:
         # default routes, which the contract's DAGs take unless alerts.defaults is false.
         _check_alert_plugins(contract, validation_result, logger)
 
+        # The maintenance actions a package ships (fluid_build.maintenance_actions): each
+        # kind loaded and its statements checked, as fluid plan compiles them.
+        _check_maintenance_plugins(contract, validation_result, logger)
+
         # Log metrics
         duration = time.time() - start_time
         log_metric(logger, "validation_duration", duration, unit="seconds")
@@ -1080,6 +1084,10 @@ def _run_contract_rules(
         # The DAGs' alert routes (alerts.routes): kinds, Airflow connections, no secret.
         _check_alerts(validation_result, contract)
 
+        # Iceberg table maintenance (exposes[].iceberg.maintenance): the build whose runtime
+        # runs it, the retention floors and each backend's limits.
+        _check_maintenance(validation_result, contract)
+
         # forge Spark builds, compiled to their job config under the operator's broker,
         # registry and secrets policy (an unlisted host warns here, refuses at run time).
         from fluid_build.spark import compiler as _spark
@@ -1582,6 +1590,67 @@ def _drop_schema_errors_under(validation_result: ValidationResult, pointer: str)
         if event.startswith("contract_schema_") and (at == pointer or at.startswith(pointer + "/")):
             validation_result.errors.remove(message)
             validation_result.issue_meta.pop(message, None)
+
+
+def _check_maintenance(validation_result: ValidationResult, contract: Mapping[str, Any]) -> None:
+    """Each ``exposes[].iceberg.maintenance`` against the contract and its backend's limits
+    (``fluid_build/maintenance/spec.py``). Its plugin actions are the plugin phase's
+    (:func:`_check_maintenance_plugins`). Fails closed."""
+    from fluid_build.maintenance.spec import declares_maintenance, read_maintenance
+
+    if not declares_maintenance(contract):
+        return
+    try:
+        _tables, errors = read_maintenance(contract)
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        validation_result.add_error(
+            f"Iceberg maintenance check could not run ({type(exc).__name__}); "
+            "exposes[].iceberg.maintenance was NOT checked",
+            event="contract_check_failed",
+            pointer="",
+        )
+        return
+    _add_findings(
+        validation_result, contract, "contract_iceberg_maintenance", errors, anchor="exposes"
+    )
+
+
+def _check_maintenance_plugins(
+    contract: Mapping[str, Any], validation_result: ValidationResult, logger: logging.Logger
+) -> None:
+    """The maintenance actions of backend-spark tables: each kind loaded by name
+    (``fluid_build.maintenance_actions``), its ``check`` run and the statements it returns
+    checked, as ``fluid plan`` compiles them into the job config. Run with the plugin
+    validators. Fails closed."""
+    from fluid_build.maintenance.spec import declares_maintenance, read_maintenance
+
+    if not declares_maintenance(contract):
+        return
+    problems: List[str] = []
+    try:
+        from fluid_build.maintenance.job import action_statements
+        from fluid_build.maintenance.plugins import MaintenanceActionError
+        from fluid_build.spark.compiler import CATALOG
+
+        tables, errors = read_maintenance(contract)
+        for table in tables if not errors else []:
+            if not table.actions:
+                continue
+            try:
+                action_statements(table, f"{CATALOG}.{table.database}.{table.table}")
+            except MaintenanceActionError as exc:
+                problems.append(str(exc))
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        validation_result.add_error(
+            f"Maintenance action check could not run ({type(exc).__name__}); the plugin "
+            "actions of exposes[].iceberg.maintenance were NOT checked",
+            event="contract_check_failed",
+            pointer="",
+        )
+        return
+    _add_findings(
+        validation_result, contract, "contract_maintenance_actions", problems, anchor="exposes"
+    )
 
 
 def _drop_schema_errors_at(validation_result: ValidationResult, pointer: str) -> None:
@@ -2459,6 +2528,7 @@ def _run_rules_into(
         _run_extension_validators(contract, result, log)
         _run_role_validators(contract, result, log)
         _check_alert_plugins(contract, result, log)
+        _check_maintenance_plugins(contract, result, log)
     result.is_valid = result.is_valid and not result.errors
 
 
@@ -2815,6 +2885,7 @@ def _bundle_contract_rule_issues(
     _run_extension_validators(contract, result, logger)
     _run_role_validators(contract, result, logger)
     _check_alert_plugins(contract, result, logger)
+    _check_maintenance_plugins(contract, result, logger)
 
     from fluid_build._validation_issues import build_issues
 

@@ -642,7 +642,7 @@ def _contract_rules(
         quiet=True, verbose=False, offline=True, strict=False, contract=contract_path, env=env
     )
     # What ``fluid validate`` runs after the schema: the contract rules, then the
-    # installed extension and role validators and the alert plugins.
+    # installed extension and role validators, the alert plugins and the maintenance actions.
     for name, call in (
         (
             "the contract rules",
@@ -661,6 +661,10 @@ def _contract_rules(
         (
             "the alert plugins",
             lambda: _validate._check_alert_plugins(dict(contract), result, logger),
+        ),
+        (
+            "the maintenance actions",
+            lambda: _validate._check_maintenance_plugins(dict(contract), result, logger),
         ),
     ):
         try:

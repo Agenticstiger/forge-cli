@@ -851,12 +851,206 @@
                   "description": "Target file size in MB after compaction."
                 }
               }
+            },
+            "maintenance": {
+              "$ref": "#/$defs/icebergMaintenance",
+              "description": "NEW in v0.7.7: The table's maintenance: compaction, manifests, snapshot expiry, orphan files and a package's actions, on a schedule (backend spark) or by the Glue Data Catalog's table optimizers (backend glue)."
             }
           }
         },
         "mcp": {
           "$ref": "#/$defs/exposeMcp",
           "description": "NEW in v0.7.4: Declares this expose as agent-consumable over MCP, with per-expose overrides for the consumer-side output-port server (`fluid mcp output-port serve`). Its presence opts the expose into the Fluid MCP gateway, where `policy.agentPolicy.allowedModels` / `allowedUseCases` are enforced at every read."
+        }
+      }
+    },
+    "icebergMaintenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "NEW in v0.7.7: What keeps the Iceberg table healthy, run on a schedule. backend spark (the default) runs it with forge's Spark runner, on the runtime and as the role of the engine: spark build that writes the table, from the table's maintenance DAG (fluid apply --mode maintain --expose-id <expose>), while that build's stream keeps running; fluid plan binds its job config. backend glue has fluid apply provision the AWS Glue Data Catalog's table optimizers, which AWS runs. A run takes actions, compaction, rewriteManifests, expireSnapshots and removeOrphanFiles in that order. iceberg.compaction.targetFileSizeMb and iceberg.snapshotRetention are the defaults of the same settings here.",
+      "properties": {
+        "backend": {
+          "type": "string",
+          "enum": [
+            "spark",
+            "glue"
+          ],
+          "default": "spark",
+          "description": "spark: forge's Spark runner, on the writer build's runtime. glue: the Glue Data Catalog's table optimizers (compaction, retention, orphan file deletion), for a Glue Data Catalog table."
+        },
+        "schedule": {
+          "type": "string",
+          "minLength": 1,
+          "description": "backend spark, required: the cron (or Airflow preset) the table's maintenance DAG runs on."
+        },
+        "timezone": {
+          "type": "string",
+          "minLength": 1,
+          "default": "UTC",
+          "description": "backend spark: the IANA zone the schedule is read in."
+        },
+        "build": {
+          "type": "string",
+          "minLength": 1,
+          "description": "backend spark: the id of the engine: spark build whose output this expose is, when more than one is; its runtime and role run the maintenance."
+        },
+        "roleArn": {
+          "type": "string",
+          "pattern": "^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,512}$",
+          "description": "backend glue, required: the IAM role Glue's optimizers run as."
+        },
+        "runEveryHours": {
+          "type": "integer",
+          "minimum": 3,
+          "maximum": 168,
+          "default": 24,
+          "description": "backend glue: the hours between the retention and orphan file deletion optimizers' runs."
+        },
+        "compaction": {
+          "$ref": "#/$defs/icebergMaintenanceCompaction"
+        },
+        "rewriteManifests": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "backend spark: rewrite the table's manifests (Iceberg's rewrite_manifests).",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "false declares the block and runs nothing."
+            }
+          }
+        },
+        "expireSnapshots": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Expire the snapshots older than olderThan, keeping the last retainLast (Iceberg's expire_snapshots, or Glue's retention optimizer).",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "false declares the block and runs nothing."
+            },
+            "olderThan": {
+              "type": "string",
+              "pattern": "^P(?=\\d|T\\d)(\\d{1,7}W)?(\\d{1,7}D)?(T(?=\\d)(\\d{1,7}H)?(\\d{1,7}M)?(\\d{1,7}S)?)?$",
+              "description": "An ISO-8601 duration of at least PT1H (whole days on backend glue); default P5D, or iceberg.snapshotRetention.maxSnapshotAgeMs."
+            },
+            "retainLast": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100000,
+              "description": "Snapshots kept whatever their age; default 1, or iceberg.snapshotRetention.minSnapshotsToKeep."
+            },
+            "cleanExpiredFiles": {
+              "type": "boolean",
+              "default": true,
+              "description": "backend glue: false keeps the files the expired snapshots held. forge's runner always deletes them."
+            }
+          }
+        },
+        "removeOrphanFiles": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Delete the files under the table's location that no snapshot references and that are older than olderThan (Iceberg's remove_orphan_files, or Glue's orphan file deletion optimizer).",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "false declares the block and runs nothing."
+            },
+            "olderThan": {
+              "type": "string",
+              "pattern": "^P(?=\\d|T\\d)(\\d{1,7}W)?(\\d{1,7}D)?(T(?=\\d)(\\d{1,7}H)?(\\d{1,7}M)?(\\d{1,7}S)?)?$",
+              "description": "An ISO-8601 duration of at least P1D (whole days on backend glue), default P3D: a file younger than the longest write is not an orphan yet."
+            }
+          }
+        },
+        "actions": {
+          "type": "array",
+          "maxItems": 20,
+          "description": "backend spark: a package's maintenance actions (the fluid_build.maintenance_actions entry points), run first.",
+          "items": {
+            "$ref": "#/$defs/icebergMaintenanceAction"
+          }
+        }
+      }
+    },
+    "icebergMaintenanceCompaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "NEW in v0.7.7: Rewrite small files into larger ones (Iceberg's rewrite_data_files with partial progress, or Glue's compaction optimizer).",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "false declares the block and runs nothing."
+        },
+        "strategy": {
+          "type": "string",
+          "enum": [
+            "binpack",
+            "sort",
+            "z-order"
+          ],
+          "default": "binpack",
+          "description": "sort orders by the table's sort order; z-order is backend glue's."
+        },
+        "targetFileSizeMb": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576,
+          "description": "backend spark: the size files are rewritten to; default iceberg.compaction.targetFileSizeMb, else the table's write.target-file-size-bytes."
+        },
+        "minInputFiles": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000,
+          "description": "The fewest files a group must hold to be rewritten."
+        },
+        "deleteFileThreshold": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000,
+          "description": "The delete files that make a data file worth rewriting."
+        },
+        "maxCommits": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "default": 10,
+          "description": "backend spark: the most commits one run makes (Iceberg's partial-progress.max-commits)."
+        },
+        "maxConcurrentRewrites": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "description": "backend spark: the file groups rewritten at once."
+        }
+      }
+    },
+    "icebergMaintenanceAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "kind"
+      ],
+      "description": "NEW in v0.7.7: One maintenance action of a package's kind, such as a GDPR erasure. When fluid plan compiles the job config, the kind returns its statements (each one DELETE, UPDATE or MERGE on this table), which the plan binds and forge's Spark runner executes.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_-]{0,63}$",
+          "description": "The action's name, unique on the table; its commits are stamped with it."
+        },
+        "kind": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "description": "The kind's name under the fluid_build.maintenance_actions entry points."
+        },
+        "options": {
+          "type": "object",
+          "description": "JSON values the kind reads. No secret: a kind reads its own."
         }
       }
     },
