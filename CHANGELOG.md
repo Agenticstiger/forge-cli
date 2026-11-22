@@ -77,9 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package's sha256, landed once per run: the scheduler's run id when `fluid apply` passes one, else
   the Spark application id) or, without dead letters, fails the run with nothing written, and the
   passing rows replace the partitions they hold. Each commit carries the run's stamps, as every
-  runner commit does, and `fluid.package.sha256`. While the function runs, PySpark's write calls are refused and `spark.sql`
-  runs reads only, and a commit to the output or its dead letters that the runner did not make
-  fails the run. The operator lists where packages may come from in `FLUID_SPARK_PACKAGE_ALLOWLIST`
+  runner commit does, and `fluid.package.sha256`. While the function runs, PySpark's write calls and `spark.conf.set`/`unset` are refused and
+  `spark.sql` runs reads only (a `SET` that changes a setting, `RESET` and a `${...}` variable are
+  refused too), and a commit to the output or its dead letters that the runner did not make,
+  checked before the runner writes and again after, fails the run. The operator lists where packages may come from in `FLUID_SPARK_PACKAGE_ALLOWLIST`
   (unset allows none; `fluid validate` warns, apply refuses). As for a SQL batch build, a runtime
   where forge would create the role needs `executionRoleArn`. `fluid plan` shows and binds the
   package's source, digest and entry point.

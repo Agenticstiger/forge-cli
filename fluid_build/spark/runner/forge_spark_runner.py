@@ -1207,9 +1207,11 @@ def _nfc(value):
 # value is null goes to the dead letters (``sql.check`` says why), and the rest replace
 # the partitions they hold. While the function runs, PySpark's writes are refused and
 # spark.sql runs reads only (WriteGuard); a commit to the output or its dead letters that
-# the runner did not make fails the run (table_marker). Code in the same process can
-# reach the JVM itself, so these stop a write the package makes through PySpark and catch
-# one it makes around it; the job's role is what keeps it from other tables.
+# the runner did not make fails the run, checked before the runner writes and again after
+# (table_marker). Code in the same process can reach the JVM itself, or start a thread that
+# outlives the call, so the guard refuses the PySpark calls it sees and the checks detect a
+# commit made around it, up to the last check; neither prevents one. The job's role is what
+# keeps a package from other tables.
 
 #: Where fluid apply puts a package beside the job config (``names.PACKAGE_DIR`` and
 #: ``names.PACKAGE_FILE``): a ``.zip`` name, as PySpark puts only a ``.zip`` on the path.
@@ -1544,6 +1546,8 @@ _WRITE_CALLS = (
     ("pyspark.sql.catalog", "Catalog", ("createTable", "createExternalTable", "recoverPartitions")),
     ("pyspark.context", "SparkContext", ("addFile", "addPyFile", "addArchive", "addJar")),
     ("pyspark.sql.session", "SparkSession", ("addArtifact", "addArtifacts")),
+    # The session's settings: substitution back on, a catalog the runner's write would use.
+    ("pyspark.sql.conf", "RuntimeConfig", ("set", "unset")),
 )
 
 
@@ -1619,7 +1623,6 @@ _SQL_READS = frozenset(
         "DESC",
         "EXPLAIN",
         "SET",
-        "RESET",
         "USE",
         "CACHE",
         "UNCACHE",
@@ -1641,6 +1644,8 @@ def sql_write(text) -> str | None:
     not start as a read is refused, so a verb nobody listed is refused too."""
     if not isinstance(text, str):
         return None  # spark.sql refuses it itself
+    if "${" in text:  # what spark.sql would put there is not what the runner read
+        return "a ${...} variable"
     try:
         tokens = _sql_tokens(text)
     except ValueError:
@@ -1648,6 +1653,8 @@ def sql_write(text) -> str | None:
     if not tokens:
         return "no statement"
     head = tokens[0]
+    if head == "SET" and "=" in text:  # a setting changed, not read (RESET is refused too)
+        return "SET"
     if head in _SQL_READS:
         return None
     if head == "CREATE":
@@ -1947,10 +1954,10 @@ def _reasons(failures: dict) -> str:
 
 def write_package_dead_letters(
     spark, checked, table: str, columns, run_id: str, sha: str, stamps: dict | None = None
-) -> None:
+) -> bool:
     """Append the rows the checks refused, once per run: a re-attempt of the run finds its
     own snapshot, which carries the run's id, as a stream's dead letters keep their batch. The
-    commit carries the run's ``stamps`` too."""
+    commit carries the run's ``stamps`` too. Whether it committed."""
     from pyspark.sql.functions import col, current_timestamp, lit, struct, to_json
 
     done = (
@@ -1960,7 +1967,7 @@ def write_package_dead_letters(
         .collect()
     )
     if done:
-        return
+        return False
     rows = checked.where(f"`{ERROR_COLUMN}` IS NOT NULL").select(
         col(f"`{ERROR_COLUMN}`").alias("error"),
         to_json(struct(*columns)).alias("row_json"),
@@ -1975,6 +1982,7 @@ def write_package_dead_letters(
         .option("check-nullability", "false"),
         stamps,
     ).append()
+    return True
 
 
 def write_package_output(
@@ -2037,16 +2045,37 @@ def _land(spark, config: dict, checked, columns, run_id: str, before: dict, stam
             "package wrote"
         )
     land, write = package_outcome(failed, dead)
+    ours = {table: 0}
     if land:
         dead_table = f"{sink['catalog']}.{dead['table']}"
-        write_package_dead_letters(
+        committed = write_package_dead_letters(
             spark, checked, dead_table, columns, run_id, package["sha256"], stamps
         )
+        ours[dead_table] = 1 if committed else 0
         log("dead_letters", table=dead_table, records=failed, reasons=failures)
     if not write:
         raise PackageError(_not_written(failed, failures, dead))
     write_package_output(checked, table, columns, package["sha256"], stamps)
+    ours[table] = 1  # at most: an empty output may commit nothing
+    foreign = _foreign_commits(spark, before, ours)
+    if foreign:
+        raise PackageError(
+            f"{', '.join(foreign)} took a commit the runner did not make while it wrote (a "
+            "thread the package started, say), so the run fails; read the table's snapshots "
+            "and roll back what the package wrote"
+        )
     log("done", table=table, rows=sum(counts.values()) - failed, dead_letters=failed)
+
+
+def _foreign_commits(spark, before: dict, ours: dict) -> list:
+    """The tables of ``before`` that took more new commits since its marker than ``ours``
+    says the runner made (a compaction's ``replace`` does not count)."""
+    found = []
+    for table, (known, _main) in before.items():
+        new = [op for i, op in _snapshots(spark, table).items() if i not in known]
+        if len([op for op in new if op != "replace"]) > ours.get(table, 0):
+            found.append(table)
+    return found
 
 
 def run_package(spark, config: dict, config_uri: str, stamps: dict | None = None) -> None:
