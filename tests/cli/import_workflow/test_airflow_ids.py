@@ -318,6 +318,47 @@ def test_the_shape_of_a_python_task_estate_keeps_its_dags_tasks_and_dependencies
     ]
 
 
+def test_a_task_named_after_the_function_it_runs_keeps_both_under_its_recorded_id(
+    tmp_path, monkeypatch
+):
+    """``extract = PythonOperator(task_id="Extract", python_callable=extract)``: the function is
+    read from the def above (the name is the task only once the assignment is made), the task is
+    recorded under its own FLUID id, numbered when another task holds that id, and the task after
+    it depends on that recorded id through the variable."""
+    _project(
+        tmp_path,
+        {
+            "nightly.py": """
+            import subprocess
+            from airflow.operators.python import PythonOperator
+
+            def extract(**kwargs):
+                subprocess.run(["spark-submit", "s3://acme-code/jobs/orders.py"])
+
+            with DAG("Nightly_ETL", schedule=None, default_args={"owner": "retail"}) as dag:
+                start = EmptyOperator(task_id="Start")
+                extract = PythonOperator(task_id="Extract", python_callable=extract)
+                daily = SparkSubmitOperator(task_id="extract", application="s3://acme-code/jobs/daily.py")
+                start >> extract >> daily
+            """
+        },
+        ["orders", "daily"],
+    )
+    contracts, report = _import(tmp_path, monkeypatch)
+    airflow = _airflow(contracts)
+    assert {a["dagId"] for a in airflow.values()} == {"nightly_etl"}
+    (task,) = airflow["retail.orders"]["tasks"]
+    assert task["taskId"] == "extract_2" and task["dependencies"] == ["start"]
+    assert task["params"]["python_callable"] == "extract"
+    assert _tasks(airflow["retail.daily"]) == {"extract": ["extract_2"]}
+    lines = _mapped(report)
+    assert (
+        "task 'Extract' of DAG 'Nightly_ETL' (dags/nightly.py:14) is recorded as taskId "
+        "'extract_2' ('extract' is the recorded id of task 'extract' of the same DAG)" + SUFFIX
+    ) in lines
+    assert not any(x.startswith("task 'extract'") for x in lines)
+
+
 @pytest.mark.parametrize(
     "airflow_id, recorded",
     [
