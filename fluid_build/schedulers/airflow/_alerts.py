@@ -285,7 +285,7 @@ def render_alerts(plan: AlertPlan, *, dag_id: str, product_id: str) -> RenderedA
     dag_args = {"on_success_callback": by_event["success"]} if by_event["success"] else {}
     out: List[str] = [
         "# Alerts (alerts.routes): Airflow's notifiers, one new instance per callback. The\n"
-        "# connections they name hold the URLs, keys and passwords.\n",
+        + "# connections they name hold the URLs, keys and passwords.\n",
         _ALERT_HELPER,
         "\n",
     ]

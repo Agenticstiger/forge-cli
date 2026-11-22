@@ -150,7 +150,7 @@ def _python(major: str) -> str:
             "-I",
             "-c",
             "import airflow.providers.http.notifications.http, "
-            "airflow.providers.slack.notifications.slack_webhook",
+            + "airflow.providers.slack.notifications.slack_webhook",
         ],
         capture_output=True,
         text=True,

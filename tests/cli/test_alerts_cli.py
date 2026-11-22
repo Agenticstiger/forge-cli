@@ -15,7 +15,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import pytest
 import yaml
 
 from tests.cli._schedule_dag_fixtures import DEMO_CONTRACT, DEMO_CONTRACT_PATH

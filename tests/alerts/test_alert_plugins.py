@@ -83,6 +83,11 @@ class DuckKind:
         return {"conn_id": route.connection, "text": alert.title}
 
 
+def _teams_factory() -> TeamsKind:
+    """An entry point may name a function that returns a kind, as well as a class."""
+    return TeamsKind()
+
+
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("FLUID_PLUGINS_ALLOWLIST", raising=False)
@@ -133,9 +138,7 @@ class TestAKind:
         assert "from acme_alerts.notifiers import TeamsNotifier\n" in rendered.imports
         assert "acme-alerts>=1.2" in " ".join(rendered.notes)
 
-    @pytest.mark.parametrize(
-        "obj", [TeamsKind, TeamsKind(), lambda: TeamsKind(), DuckKind, DuckKind()]
-    )
+    @pytest.mark.parametrize("obj", [TeamsKind, TeamsKind(), _teams_factory, DuckKind, DuckKind()])
     def test_a_class_an_instance_or_a_factory(
         self, monkeypatch: pytest.MonkeyPatch, obj: Any
     ) -> None:
