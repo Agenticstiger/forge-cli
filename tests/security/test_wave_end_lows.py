@@ -290,7 +290,7 @@ def _job(source: str) -> Any:
     [
         'SparkConf().setAll([("spark.sql.streaming.checkpointLocation", "s3a://b/ckpt")])',
         'SparkSession.builder.config(key="spark.sql.streaming.checkpointLocation", '
-        'value="s3a://b/ckpt")',
+        + 'value="s3a://b/ckpt")',
         'SparkSession.builder.config("spark.sql.streaming.checkpointLocation", "s3a://b/ckpt")',
     ],
 )
@@ -368,7 +368,8 @@ def test_a_dot_segment_is_not_a_product_id(bad: str) -> None:
 def test_an_ordinary_id_still_reaches_the_request() -> None:
     provider = _dmm()
     provider._session_instance.request.return_value = MagicMock(status_code=204, text="")
-    assert provider.delete("silver.orders") is True
+    deleted = provider.delete("silver.orders")
+    assert deleted is True
     assert provider._session_instance.request.call_args.args[1].endswith(
         "/api/dataproducts/silver.orders"
     )
