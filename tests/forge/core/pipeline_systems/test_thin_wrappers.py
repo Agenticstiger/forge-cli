@@ -1465,3 +1465,21 @@ def test_the_gitlab_header_says_who_may_override_the_install() -> None:
     text = _files(P.GITLAB_CI)[".gitlab-ci.yml"]
     header = text[: text.index("\nworkflow:")]
     assert "Minimum role to use" in header and "pipeline variables" in header
+
+
+@pytest.mark.parametrize("install_mode", ["pypi", "dev-source"])
+def test_tekton_runs_carry_the_change_request_marker_into_ship(install_mode):
+    """Tekton sets no variable of its own on a pull-request run, so its plan Pipeline takes
+    one: the Triggers binding of a pull or merge request sets it, and ship leaves
+    custom-scaffold out of stage 3 (``fluid_build/util/change_request.py``)."""
+    files = _files(P.TEKTON, install_mode=install_mode)
+    documents = [doc for _, doc in _documents(files)]
+    pipelines = {d["metadata"]["name"]: d for d in documents if d["kind"] == "Pipeline"}
+    plan = {p["name"]: p for p in pipelines["fluid-plan"]["spec"]["params"]}
+    assert plan["FLUID_CHANGE_REQUEST"]["default"] == "false"
+    task = next(
+        d for d in documents if d["kind"] == "Task" and d["metadata"]["name"] == "fluid-ship"
+    )
+    env = {e["name"]: e["value"] for e in task["spec"]["steps"][0]["env"]}
+    assert env["FLUID_CHANGE_REQUEST"] == "$(params.FLUID_CHANGE_REQUEST)"
+    assert "FLUID_CHANGE_REQUEST" in files["tekton/pipeline.yaml"]
