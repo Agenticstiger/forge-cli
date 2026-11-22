@@ -49,6 +49,22 @@ def resolve_env_placeholders_in_path(path: str) -> str:
     return ENV_PLACEHOLDER_RE.sub(lambda m: os.getenv(m.group(1), ""), path)
 
 
+def resolve_env_placeholders(value: Any) -> Any:
+    """``value`` with every ``{{ env.NAME }}`` in its strings rendered, through lists and dicts.
+
+    How ``fluid apply`` renders a contract before a runner reads it: a variable
+    that is not set becomes the empty string, and any value other than a
+    string, a list or a dict is returned as it is.
+    """
+    if isinstance(value, str):
+        return resolve_env_placeholders_in_path(value)
+    if isinstance(value, list):
+        return [resolve_env_placeholders(item) for item in value]
+    if isinstance(value, dict):
+        return {key: resolve_env_placeholders(item) for key, item in value.items()}
+    return value
+
+
 def is_remote_uri(path: str) -> bool:
     """True when ``path`` carries a URI scheme (``s3://``, ``gs://`` ...)."""
     return "://" in str(path)

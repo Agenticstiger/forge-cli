@@ -38,10 +38,10 @@ def _refusal(
     return None
 
 
-def _lint(connection: Dict[str, Any]) -> Any:
+def _lint(connection: Dict[str, Any], environ: Optional[Dict[str, str]] = None) -> Any:
     sent = {**connection, "secretRef": "env://PG"}  # pragma: allowlist secret
     contract = {"builds": [{"properties": {"source": {"connection": sent}}}]}
-    (finding,) = lint_secret_refs(contract, environ={})
+    (finding,) = lint_secret_refs(contract, environ=environ or {})
     return finding
 
 

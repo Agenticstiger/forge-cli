@@ -45,7 +45,7 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any, Iterator, List, Mapping, Optional, Tuple
 
-from fluid_build._validation_issues import json_pointer
+from fluid_build._validation_issues import dotted, json_pointer
 
 Path = Tuple[Any, ...]
 
@@ -90,13 +90,7 @@ def _strings(node: Any, parts: Path = ()) -> Iterator[Tuple[Path, str]]:
 
 def _dotted(parts: Path) -> str:
     """``exposes[0].contract.schema[1].type``: a path as ``fluid validate`` prints one."""
-    text = ""
-    for part in parts:
-        if isinstance(part, int):
-            text += f"[{part}]"
-        else:
-            text += f".{part}" if text else str(part)
-    return text or "root"
+    return dotted(parts) or "root"
 
 
 def _key(parts: Path) -> str:

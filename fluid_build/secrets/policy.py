@@ -89,6 +89,8 @@ from urllib.parse import unquote, unquote_plus, urlsplit
 
 from fluid_build._errors import doc_url
 from fluid_build._net import is_loopback_host
+from fluid_build._validation_issues import dotted as _label
+from fluid_build.util.binding_paths import resolve_env_placeholders
 
 from .errors import SecretPolicyError, SecretRefError
 from .ref import ALIASES, CORE_SCHEMES, SecretRef, parse_secret_ref
@@ -736,17 +738,6 @@ def _field_targets(field_name: str, raw: Any, path: Tuple[Any, ...], behind: boo
     return out
 
 
-def _label(path: Tuple[Any, ...]) -> str:
-    """``path`` as a refusal names it: ``a.b``, and ``a[0]`` for a list entry."""
-    label = ""
-    for part in path:
-        if isinstance(part, int) and not isinstance(part, bool):
-            label += f"[{part}]"
-        else:
-            label += f".{part}" if label else str(part)
-    return label
-
-
 def _is_keyword_string(text: str) -> bool:
     """Whether ``text`` is a keyword connection string, not a URI or a host.
 
@@ -1352,16 +1343,27 @@ def _odbc_value_end(text: str, index: int) -> int:
         if placeholder:
             index = placeholder.end()
         elif text[index] in "{\"'":
-            close = "}" if text[index] == "{" else text[index]
-            index += 1
-            while index < len(text) and (
-                text[index] != close or text[index + 1 : index + 2] == close
-            ):
-                index += 2 if text[index] == close else 1
-            index += 1
+            index = _quoted_end(text, index)
         else:
             index += 1
     return min(index, len(text))
+
+
+def _quoted_end(text: str, index: int) -> int:
+    """Past the ``{...}``, ``"..."`` or ``'...'`` that opens at ``index``.
+
+    A doubled closing character inside it stands for itself.
+    """
+    close = "}" if text[index] == "{" else text[index]
+    index += 1
+    while index < len(text):
+        if text[index] != close:
+            index += 1
+        elif text[index + 1 : index + 2] == close:
+            index += 2
+        else:
+            return index + 1
+    return index
 
 
 def _unquoted(value: str) -> str:
@@ -1414,17 +1416,6 @@ def _mappings_in(value: Any) -> Iterator[Mapping[str, Any]]:
             pending.extend(item)
 
 
-def _render_value(value: Any) -> Any:
-    """``value`` with its placeholders rendered, as ``build_runners/base.py`` renders a contract."""
-    if isinstance(value, str):
-        return _render(value)
-    if isinstance(value, list):
-        return [_render_value(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _render_value(item) for key, item in value.items()}
-    return value
-
-
 def _written_blocks(connection: Optional[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
     """The connection blocks the contract wrote that render to ``connection``.
 
@@ -1440,7 +1431,7 @@ def _written_blocks(connection: Optional[Mapping[str, Any]]) -> List[Mapping[str
     blocks: List[Mapping[str, Any]] = []
     for block in _mappings_in(written):
         own = {key: value for key, value in block.items() if key != "secretRef"}
-        if own.keys() == wanted.keys() and _render_value(own) == wanted:
+        if own.keys() == wanted.keys() and resolve_env_placeholders(own) == wanted:
             blocks.append(block)
     return blocks
 
@@ -1488,10 +1479,17 @@ def _shown_host(
     texts = [_value_at(block, target.path) for block in _written_blocks(connection)]
     if texts and all(isinstance(text, str) and _names_as_written(target, text) for text in texts):
         return quoted, False
+    return _placeholder_shown(target, texts)
+
+
+def _placeholder_shown(target: _Target, texts: List[Any]) -> Tuple[Optional[str], bool]:
+    """The contract's text that a placeholder rendered into ``target``, of ``texts``."""
     for text in texts:
-        if not isinstance(text, str):
-            continue
-        if _ENV_PLACEHOLDER.search(text) and _names(target, _render(text)):
+        if (
+            isinstance(text, str)
+            and _ENV_PLACEHOLDER.search(text)
+            and _names(target, _render(text))
+        ):
             if target.keyword_text is not None:
                 return text, True
             return _shown_destination(f"connection.{target.field or 'host'}", text), True

@@ -11,36 +11,15 @@ or a URI under a setting of the connector's own.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict
 
 import pytest
 
-from fluid_build.secrets.contract import lint_secret_refs
-from fluid_build.secrets.policy import (
-    ALLOWLIST_ENV,
-    AcquisitionSecretPolicyError,
-    refuse_unless_allowed,
-)
+from fluid_build.secrets.policy import ALLOWLIST_ENV, AcquisitionSecretPolicyError
+from tests.secrets.test_destination_fields import _lint, _refusal
 
 ELSEWHERE = "elsewhere.example"
 ANY_HOST = {ALLOWLIST_ENV: "PG"}
-
-
-def _refusal(
-    connection: Mapping[str, Any], environ: Optional[Dict[str, str]] = None
-) -> Optional[AcquisitionSecretPolicyError]:
-    try:
-        refuse_unless_allowed("env://PG", connection=connection, environ=environ or {})
-    except AcquisitionSecretPolicyError as exc:
-        return exc
-    return None
-
-
-def _lint(connection: Dict[str, Any], environ: Optional[Dict[str, str]] = None) -> Any:
-    sent = {**connection, "secretRef": "env://PG"}  # pragma: allowlist secret
-    contract = {"builds": [{"properties": {"source": {"connection": sent}}}]}
-    (finding,) = lint_secret_refs(contract, environ=environ or {})
-    return finding
 
 
 # ── a mapping merged into a connection URL's query or a driver's arguments ───

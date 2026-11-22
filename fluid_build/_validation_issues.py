@@ -140,6 +140,17 @@ def _message_pointer(message: str, document: Any, default: str) -> str:
     return default
 
 
+def dotted(parts: Sequence[Any]) -> str:
+    """``exposes[0].contract.schema[1].type``: a path as ``fluid validate`` prints one."""
+    text = ""
+    for part in parts:
+        if isinstance(part, int):
+            text += f"[{part}]"
+        else:
+            text += f".{part}" if text else str(part)
+    return text
+
+
 def anchor(document: Any, *parts: Any) -> str:
     """The pointer to ``parts`` when ``document`` has them, else to the whole document."""
     node = document
