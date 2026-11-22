@@ -28,10 +28,10 @@ import pytest
 
 from fluid_build.providers.common.codegen_utils import py_str_literal
 from fluid_build.schedulers.airflow import fluid_apply
-from tests.schedulers.fluid_apply_fixtures import CASES, GRAPH_CASES
+from tests.schedulers.fluid_apply_fixtures import ALERT_CASES, CASES, GRAPH_CASES
 
 GOLDEN = Path(__file__).parent / "golden" / "fluid_apply"
-ALL_CASES = {**CASES, **GRAPH_CASES}
+ALL_CASES = {**CASES, **GRAPH_CASES, **ALERT_CASES}
 
 #: The two places outlets reach a DAG of one build: the ``Asset`` import and the task's list.
 _ASSET_IMPORT = (
@@ -116,6 +116,8 @@ def test_every_snapshot_is_python_that_binds_every_name_it_reads(case: str) -> N
                 bound.add(node.name if isinstance(node, ast.FunctionDef) else node.arg)
             elif isinstance(node, ast.comprehension) and isinstance(node.target, ast.Name):
                 bound.add(node.target.id)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                bound.add(node.name)
         loaded = {
             n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
         }

@@ -76,7 +76,16 @@ EXTRA_GROUPS: Dict[str, str] = {
     # ``ENTRY_POINT_GROUP``); a resolver receives secret values, so the
     # allow/block policy governs it like every other plugin.
     "secret_resolver": "fluid_build.secret_resolvers",  # pragma: allowlist secret
+    # Alert route kinds for the generated DAGs (``alerts.routes[].kind``), read by name and
+    # loaded only when a route names one, and an organisation's default routes, loaded when a
+    # DAG is rendered or a contract validated (``alerts/plugins.py``).
+    "alert_notifier": "fluid_build.alert_notifiers",
+    "alert_defaults": "fluid_build.alert_defaults",
 }
+
+#: Groups whose plugins load only when a command asks for one by name (``fluid import
+#: <tool>``, a route's ``kind``) or renders with them: listing plugins never imports them.
+LOADED_ON_USE: frozenset = frozenset({"importer", "alert_notifier", "alert_defaults"})
 
 
 #: Groups that have **no dispatch site** in this build of the CLI: the role is
@@ -409,9 +418,9 @@ def detailed_plugins(
                 entry["allowed"] = False
                 entry["reserved"] = True
                 allowed = False
-            # Only ALLOWED plugins are ever loaded, and an importer plugin is imported when its
-            # tool is asked for (``fluid import <name>``), not by listing it.
-            if allowed and k != "importer":
+            # Only ALLOWED plugins are ever loaded, and a plugin of a group loaded on use (an
+            # importer, an alert kind or defaults) is imported when it is used, not by listing it.
+            if allowed and k not in LOADED_ON_USE:
                 try:
                     obj = ep.load()
                 except Exception as e:  # noqa: BLE001 - isolate a bad plugin; type only

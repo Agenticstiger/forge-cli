@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The Airflow DAGs forge generates alert on failure, retry, success and a missed SLA, through
+  Airflow's own notifiers, from routes the contract declares (schema 0.7.7 `alerts`).** A route
+  names a kind and the Airflow connection that holds the address, URL or key: `email`
+  (`SmtpNotifier`, `to`, optional `from`), `slack` (`SlackWebhookNotifier`), `webhook`
+  (`HttpNotifier`, http provider 5.5.0+: `format: generic`, forge's own JSON; `zenduty`, a Generic
+  Integration event whose URL is the connection's host; `opsgenie`, an Alert API request whose
+  `GenieKey` header is in the connection's extra) and `pagerduty` (`PagerdutyNotifier`: Events API
+  v2 puts the routing key in the request body, so a generic webhook would have written it into the
+  DAG). `events` picks `failure` (the default: a task failed for good), `retry`, `success` (the
+  run succeeded; it resolves the incident in Zenduty, Opsgenie and PagerDuty, one dedup key per
+  DAG) and `sla_miss` with `alerts.sla` (an ISO duration up to P30D): on Airflow 2 every task's
+  `sla` and the DAG's `sla_miss_callback`; on Airflow 3.1+, which has no SLAs, a `DeadlineAlert`
+  on the run's queued time whose `AsyncCallback` runs the notifier in the triggerer, built inside
+  `try` because the API is experimental, so a change to it costs a DAG its deadline alerts and
+  never its import; Airflow 3.0 has neither, as the DAG's documentation says. Both renderers carry
+  them (`fluid generate schedule` and `generate artifacts` for scheduled builds and keepalives,
+  and the `orchestration` renderer): `ALERT_TASK_ARGS` merged into `default_args`,
+  `ALERT_DAG_ARGS` passed to `DAG`, and an `alert(notifier, **kwargs)` callback that builds a new
+  notifier from a copy of its arguments each time, since `BaseNotifier` renders its template fields
+  in place. A contract without routes renders the same file as before. A route never holds a
+  secret: a URL, an address with a password or a key-shaped value (hex, a UUID, a random token)
+  in `connection` or `name` is refused at `fluid validate` and at render without being shown (the
+  schema's own message, which quotes the value, is dropped for it), every string a route gives
+  holds no `{` or `}`, no URL and nothing the redactor masks, and a plugin route's option named
+  like a secret (`api_key`, `password`, `routingKey`) is refused whatever its value. A plugin
+  kind's `default_connection` must be a plain connection id. The acquisition DAGs
+  `fluid schedule-sync` writes carry no alerts, and say so. An organisation's pack adds default routes to every product through the new
+  `fluid_build.alert_defaults` entry points (a contract replaces one by its name, or leaves them
+  out with `alerts.defaults: false`), and a package adds a kind through `fluid_build.alert_notifiers`
+  with the base class `fluid_build.alerts.AlertNotifier` or any object with its attributes: read by
+  name and loaded only when a route names the kind, under `FLUID_PLUGINS_ALLOWLIST` /
+  `FLUID_PLUGINS_BLOCKLIST`, a built-in name reserved, two distributions of one name both refused,
+  and a missing or failing kind refusing the route (by exception type only) rather than leaving it
+  out. `fluid plugins` lists both groups without importing them. An installed pack the
+  allow/block policy leaves out is named, never dropped silently. Airflow 2.6 gets no SLA wiring
+  (its `BaseNotifier` takes one argument, not `sla_miss_callback`'s five). Checked live: the
+  generated DAGs sent each route's alert on Airflow 2.10.5 and 3.4.0 (`dag.test()` for failure,
+  retry and success; the SLA miss and the deadline alert as Airflow calls them). New validate checks
+  `contract_alerts` and, in the plugin phase, `contract_alert_plugins`.
+
 ### Fixed
 
 - **`fluid apply` no longer updates a live Iceberg table in place.** hashicorp/aws updates an
@@ -28,6 +70,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`iceberg_table_update_in_place`), and `fluid plan --allow-iceberg-update` needs `--tofu`
   (`plan_allow_iceberg_update_needs_tofu`). Hive tables keep their in-place updates, and a
   replace stays with the data-loss gate.
+
+### Security
+
+- **Both redaction layers mask the secrets of an alert route's connection**: Zenduty Generic
+  Integration and events-API URLs and PagerDuty integration URLs (US and EU), whose paths hold the
+  key, Opsgenie's `GenieKey` header value, and PagerDuty's `routing_key` / `integration_key` by
+  name, in `observability/secret_redactor.py` and the Snowflake provider's `redact_string`. The
+  Snowflake twin checks `GenieKey` before its `authorization=` rule, which would otherwise take the
+  word for the value and leave the key.
 
 ### Upgrade notes
 

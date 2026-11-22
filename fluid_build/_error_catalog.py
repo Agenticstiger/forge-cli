@@ -1383,6 +1383,24 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "validate",
     ),
+    "contract_alerts": (
+        [
+            "Fix the alert route the message names: name the Airflow connection that holds "
+            + "the URL, key or password, never the value itself; give an email route its to; "
+            + "set alerts.sla for an sla_miss route",
+        ],
+        "validate",
+    ),
+    "contract_alert_plugins": (
+        [
+            "For a plugin's kind, fix the route as the message says, or install the package "
+            + "that registers the kind under the fluid_build.alert_notifiers entry points",
+            "For an organisation's default routes, fix them in its pack (the "
+            + "fluid_build.alert_defaults entry point), let FLUID_PLUGINS_ALLOWLIST load the "
+            + "pack, or leave the routes out with alerts.defaults: false",
+        ],
+        "validate",
+    ),
     "contract_confluent_binding": (
         [
             "Fix the Confluent (Tableflow) binding field the message names; the message gives "
@@ -1596,6 +1614,8 @@ _EXAMPLES: Dict[str, str] = {
     ),
     "contract_iceberg_sink": _VERBOSE,
     "contract_secret_ref": _VERBOSE,
+    "contract_alerts": _VERBOSE,
+    "contract_alert_plugins": _VERBOSE,
     "contract_confluent_binding": _VERBOSE,
     "contract_databricks_binding": (
         "# exposes[].binding\nplatform: databricks\nformat: delta_table\nlocation:\n"
