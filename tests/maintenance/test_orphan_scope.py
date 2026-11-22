@@ -105,3 +105,59 @@ def test_the_default_location_counts_too() -> None:
 def test_the_table_location_names_the_place() -> None:
     assert table_location(_with(spark_block()), "order_lines") == f"s3://{BUCKET}/{PATH}"
     assert table_location(_with(spark_block()), "nothing") is None
+
+
+#: Dot segments Iceberg keeps as written and a file listing resolves: a table at ``<wh>/x/..``
+#: deleted every file of its sibling ``<wh>/y`` (Spark 3.5, Iceberg 1.6) before they were refused.
+@pytest.mark.parametrize("backend", sorted(BLOCKS))
+@pytest.mark.parametrize(
+    ("path", "other"),
+    [
+        (".", None),  # the bucket root, spelled with a dot
+        ("x/..", None),  # likewise
+        ("x/./t", "x/t/y"),  # holds x/t/y once resolved
+        ("q/../x", "x/t"),  # holds x/t once resolved
+    ],
+)
+def test_a_dot_segment_in_the_tables_location_is_refused(
+    backend: str, path: str, other: Optional[str]
+) -> None:
+    (error,) = _scope_errors(_with(BLOCKS[backend](), path=path, other_path=other))
+    assert "the table's location holds a '.' or '..' segment" in error
+
+
+@pytest.mark.parametrize("backend", sorted(BLOCKS))
+@pytest.mark.parametrize("other", ["q/../iceberg/commerce/order_lines/x", "./iceberg"])
+def test_a_dot_segment_in_another_exposes_location_is_refused(backend: str, other: str) -> None:
+    (error,) = _scope_errors(_with(BLOCKS[backend](), other_path=other))
+    assert "expose archive's location in bucket commerce-lake holds a '.' or '..' segment" in error
+
+
+def _runner() -> Any:
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "fluid_build/spark/runner/forge_spark_runner.py"
+    spec = importlib.util.spec_from_file_location("forge_spark_runner_orphans", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    ("location", "problem"),
+    [
+        ("s3://lake", "is a bucket root"),
+        ("s3://lake/", "is a bucket root"),
+        ("s3://lake//", "is a bucket root"),
+        ("s3://lake/x/..", "holds a '.' or '..' segment"),
+        ("s3://lake/.", "holds a '.' or '..' segment"),
+        ("s3://lake/x/./t", "holds a '.' or '..' segment"),
+        ("s3://lake/q/../x", "holds a '.' or '..' segment"),
+        ("s3://lake/iceberg/commerce/order_lines", ""),
+        ("file:/tmp/wh/commerce/order_lines", ""),
+        ("s3://lake/x/..t/y", ""),  # a name that starts with dots is a name
+    ],
+)
+def test_the_runner_refuses_a_root_or_a_dot_segment(location: str, problem: str) -> None:
+    assert _runner().orphan_location_problem(location) == problem

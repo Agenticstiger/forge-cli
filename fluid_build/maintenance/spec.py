@@ -444,6 +444,10 @@ def _read_actions(
     return tuple(out)
 
 
+#: Path segments a listing resolves (``x/..`` is ``x``'s parent) that Iceberg keeps as written.
+_DOT_SEGMENTS = frozenset({".", ".."})
+
+
 def _object_location(expose: Mapping[str, Any]) -> Optional[Tuple[str, Tuple[str, ...]]]:
     """``(bucket, path segments)`` of an AWS expose's S3 location, as forge places it
     (``providers/aws/util/warehouse.normalize_location``: the binding's ``bucket`` and ``path``,
@@ -488,6 +492,12 @@ def _orphan_scope_problem(contract: Mapping[str, Any], expose: Mapping[str, Any]
     if mine is None:
         return ""
     bucket, parts = mine
+    if any(part in _DOT_SEGMENTS for part in parts):
+        return (
+            "the table's location holds a '.' or '..' segment, which Iceberg keeps as written "
+            "and the file listing resolves (x/.. is the bucket root), so what removing orphan "
+            "files would reach cannot be told; write binding.location.path without one"
+        )
     if not parts:
         return (
             f"the table's location is the root of bucket {bucket}, so removing orphan files "
@@ -500,6 +510,12 @@ def _orphan_scope_problem(contract: Mapping[str, Any], expose: Mapping[str, Any]
         theirs = _object_location(other)
         if theirs is None or theirs[0] != bucket:
             continue
+        if any(part in _DOT_SEGMENTS for part in theirs[1]):
+            return (
+                f"expose {other.get('exposeId')}'s location in bucket {bucket} holds a '.' or "
+                "'..' segment, so whether removing orphan files here would reach its files "
+                "cannot be told; write its binding.location.path without one"
+            )
         shorter = min(len(parts), len(theirs[1]))
         if parts[:shorter] == theirs[1][:shorter]:
             return (

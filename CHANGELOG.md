@@ -82,8 +82,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `expireSnapshots` (`olderThan`, `retainLast`, P1D at the least) and `removeOrphanFiles`
   (`olderThan`, P1D at the least), run in that order. Removing orphans deletes every file under the
   table's location that no snapshot of it references, so `fluid validate` refuses it on a bucket
-  root and on a location that holds, or sits inside, another expose's (compared segment by
-  segment); the location must not hold a table outside the contract either. `iceberg.compaction.targetFileSizeMb` and `iceberg.snapshotRetention`,
+  root, on a location that holds, or sits inside, another expose's (compared segment by
+  segment), and on a location with a `.` or `..` segment, which Iceberg keeps as written and a
+  file listing resolves; the location must not hold a table outside the contract either. `iceberg.compaction.targetFileSizeMb` and `iceberg.snapshotRetention`,
   which nothing read before, are their defaults. `backend: spark` (the default) runs them with
   forge's Spark runner, on the runtime and as the role of the `engine: spark` build that writes
   the table:

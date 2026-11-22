@@ -952,7 +952,7 @@
         "removeOrphanFiles": {
           "type": "object",
           "additionalProperties": false,
-          "description": "Delete the files under the table's location that no snapshot references and that are older than olderThan (Iceberg's remove_orphan_files, or Glue's orphan file deletion optimizer). The location must be the table's alone: fluid validate refuses a bucket root and a location that holds, or sits inside, another expose's, and it must not hold the files of a table outside the contract either.",
+          "description": "Delete the files under the table's location that no snapshot references and that are older than olderThan (Iceberg's remove_orphan_files, or Glue's orphan file deletion optimizer). The location must be the table's alone: fluid validate refuses a bucket root, a location that holds, or sits inside, another expose's, and a '.' or '..' path segment, and it must not hold the files of a table outside the contract either.",
           "properties": {
             "enabled": {
               "type": "boolean",

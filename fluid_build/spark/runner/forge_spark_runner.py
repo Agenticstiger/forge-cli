@@ -2387,6 +2387,18 @@ def _iterated(value) -> int:
     return sum(1 for _ in value)
 
 
+def orphan_location_problem(location: str) -> str:
+    """Why removing orphan files under ``location`` could reach files that are not the table's,
+    or ``""``: a bucket root, or a ``.`` / ``..`` segment, which Iceberg keeps as written and the
+    file listing resolves (``s3://b/x/..`` lists the whole bucket)."""
+    path = urllib.parse.urlsplit(location).path
+    if any(part in (".", "..") for part in path.split("/")):
+        return "holds a '.' or '..' segment"
+    if not path.strip("/"):
+        return "is a bucket root"
+    return ""
+
+
 def run_maintenance(spark, config: dict, stamps: dict | None = None, now=None) -> list:
     """One maintenance run of the config's table: its steps in order, through Iceberg's Spark
     actions, each commit a step makes stamped (a rewrite's ``snapshotProperty``, a statement's
@@ -2460,11 +2472,9 @@ def run_maintenance(spark, config: dict, stamps: dict | None = None, now=None) -
         else:  # remove_orphan_files
             maintained = table()
             location = str(maintained.location())
-            if not urllib.parse.urlsplit(location).path.strip("/"):
-                # Every file in the bucket that this table does not reference would go.
-                raise JobConfigError(
-                    f"remove_orphan_files: {name}'s location {location} is a bucket root"
-                )
+            problem = orphan_location_problem(location)
+            if problem:
+                raise JobConfigError(f"remove_orphan_files: {name}'s location {location} {problem}")
             cutoff = int((clock() - step["olderThanSeconds"]) * 1000)
             result = actions.deleteOrphanFiles(maintained).olderThan(cutoff).execute()
             out = {"deleted": _iterated(result.orphanFileLocations())}
