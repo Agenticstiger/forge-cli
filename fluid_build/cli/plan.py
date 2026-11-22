@@ -268,6 +268,12 @@ transformations, access grants, and orchestration tasks.
         ),
     )
     p.add_argument(
+        "--allow-iceberg-update",
+        action="store_true",
+        default=False,
+        help="with --tofu: as on apply (the saved plan updates live Iceberg tables in place)",
+    )
+    p.add_argument(
         "--ensure-opentofu",
         action="store_true",
         default=False,
@@ -304,6 +310,22 @@ def run(args, logger: logging.Logger) -> int:
                     "error": "--adopt-tables checks each existing table against the contract "
                     "in OpenTofu's plan of it, so it needs --tofu",
                     "remediation": ["fluid plan <contract> --tofu --adopt-tables"],
+                },
+            )
+        # The hold is made in OpenTofu's plan, which a plan without --tofu does not make:
+        # its apply plans again, and takes the flag itself.
+        if getattr(args, "allow_iceberg_update", False) and not getattr(args, "tofu", False):
+            raise CLIError(
+                1,
+                "plan_allow_iceberg_update_needs_tofu",
+                {
+                    "error": "--allow-iceberg-update decides what OpenTofu's plan updates in "
+                    "place, so it needs --tofu; a plan without it is planned again by "
+                    "`fluid apply`, which takes the flag itself",
+                    "remediation": [
+                        "fluid plan <contract> --tofu --allow-iceberg-update",
+                        "or: fluid apply plan.json --allow-iceberg-update",
+                    ],
                 },
             )
 

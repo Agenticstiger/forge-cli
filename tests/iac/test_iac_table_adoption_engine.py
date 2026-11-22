@@ -101,7 +101,8 @@ DIFFERING = {
 
 @pytest.fixture
 def tofu(monkeypatch, tmp_path):
-    """A faked ``tofu``: ``exists`` is what the cloud holds, ``shown`` the saved plan."""
+    """A faked ``tofu``: ``exists`` is what the cloud holds, ``shown`` the saved plan,
+    ``summary`` the change counts each plan reports."""
     calls: Dict[str, Any] = {
         "exists": {TABLE, BUCKET},
         "in_state": [],
@@ -111,6 +112,7 @@ def tofu(monkeypatch, tmp_path):
         "apply": 0,
         "shown": MATCHING,
         "import_error": "Error: Cannot import non-existent remote object",
+        "summary": {"add": 2, "change": 0, "remove": 0},
     }
     for name in ("FLUID_STATE_BACKEND", "OPENLINEAGE_URL", "AWS_ENDPOINT_URL"):
         monkeypatch.delenv(name, raising=False)
@@ -138,7 +140,7 @@ def tofu(monkeypatch, tmp_path):
         module = json.loads((Path(workdir) / "main.tf.json").read_text(encoding="utf-8"))
         calls["plans"].append(module)
         (Path(workdir) / out_file).write_bytes(b"saved plan")
-        summary = {"type": "change_summary", "changes": {"add": 2, "change": 0, "remove": 0}}
+        summary = {"type": "change_summary", "changes": dict(calls["summary"])}
         return ok("plan", [summary])
 
     def tofu_apply(*a, **k):
@@ -466,22 +468,31 @@ def test_a_table_made_before_the_product_id_is_re_attached_by_its_record(
     assert tofu["apply"] == 1
 
 
+#: A plan that updates the table in place (what the contract now declares), then the plan
+#: made again with the Iceberg table left as it is.
+UPDATED_THEN_HELD = [DIFFERING, MATCHING]
+
+
 def test_a_table_forge_made_is_re_attached_as_before_without_the_flag(tofu, tmp_path, monkeypatch):
     """Its state was lost, or kept nowhere (a fresh workspace on every run): the table is
-    forge's own, so the apply imports it as it always did and may change it in place."""
+    forge's own, so the apply imports it as it always did, without checking it; an Iceberg
+    table it would update in place is left as it is (``_apply_table_hold``)."""
     _made_by_forge(monkeypatch)
-    tofu["shown"] = DIFFERING  # what the contract now declares; never checked for it
+    tofu["summary"] = {"add": 0, "change": 1, "remove": 0}
+    tofu["shown"] = list(UPDATED_THEN_HELD)  # what the contract now declares; not checked
 
     assert engine.apply_via_opentofu(_args(tmp_path), _LOG) == 0
 
-    (module,) = tofu["plans"]
-    assert _imports(module) == []
+    first, again = tofu["plans"]
+    assert _imports(first) == [] and _imports(again) == []
+    assert "storage_descriptor" in _held_attributes(again)
     assert tofu["state_rm"] == [] and tofu["apply"] == 1
 
 
 def test_with_the_flag_a_table_forge_made_is_not_checked_either(tofu, tmp_path, monkeypatch):
     _made_by_forge(monkeypatch)
-    tofu["shown"] = DIFFERING
+    tofu["summary"] = {"add": 0, "change": 1, "remove": 0}
+    tofu["shown"] = list(UPDATED_THEN_HELD)
 
     assert engine.apply_via_opentofu(_args(tmp_path, adopt_tables=True), _LOG) == 0
 
@@ -492,13 +503,14 @@ def test_plan_tofu_re_attaches_a_table_forge_made_without_recording_an_adoption(
     tofu, tmp_path, monkeypatch
 ):
     _made_by_forge(monkeypatch)
-    tofu["shown"] = DIFFERING
+    tofu["shown"] = list(UPDATED_THEN_HELD)
 
     record = _plan(tmp_path)
 
-    assert "adoptedTables" not in record
-    (module,) = tofu["plans"]
-    assert {"to": TABLE, "id": f"{ACCOUNT}:sales:orders"} in _imports(module)
+    assert "adoptedTables" not in record and "icebergUpdates" not in record
+    first, again = tofu["plans"]
+    assert {"to": TABLE, "id": f"{ACCOUNT}:sales:orders"} in _imports(first)
+    assert "storage_descriptor" in _held_attributes(again)
 
 
 def _own_drift() -> Dict[str, Any]:
@@ -534,8 +546,11 @@ def test_an_adopted_iceberg_table_is_planned_again_with_its_own_drift_left_alone
     ]
     assert tofu["apply"] == 1
     out = " ".join(capfd.readouterr().out.split())
-    assert "leaves as it is (an adopted Iceberg table is not updated in place)" in out
-    assert "clears the description" in out and "clears the owner hadoop" in out
+    assert "sales.orders matches the contract: the plan imports it" in out
+    assert "sales.orders is a live Iceberg table" in out and "the plan leaves it as it is" in out
+    assert "description: written by the stream in the table, none in the contract" in out
+    assert "owner: hadoop in the table, none in the contract" in out
+    assert "and changes in place" not in out
 
 
 def test_an_iceberg_table_the_plan_made_again_still_updates_is_refused(tofu, tmp_path):

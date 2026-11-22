@@ -640,6 +640,15 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
     mode_group.add_argument(
+        "--allow-iceberg-update",
+        action="store_true",
+        default=False,
+        help=(
+            "Update live Iceberg tables in place (pause their writers first); without it "
+            "the plan leaves them as they are."
+        ),
+    )
+    mode_group.add_argument(
         "--adopt-shared-container",
         action="store_true",
         default=False,

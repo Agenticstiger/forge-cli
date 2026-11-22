@@ -92,6 +92,7 @@ from ..principals import (
 )
 from ..provider_match import is_cloud
 from ..row_access import RowFilter, row_filters_for
+from ..table_hold import TableHold
 from ..versions import required_providers
 from . import aws_ingest, aws_layout, aws_storage
 from .aws_schema_registry import emit_schema_registry, emit_schema_registry_data
@@ -1058,12 +1059,19 @@ class AwsIacPlugin:
         parameters = _forge_parameters(values)
         return parameters is not None and _named_product(parameters) is None
 
-    def adoption_hold(self, declared: Mapping[str, Any]) -> Tuple[str, ...]:
-        """The attributes an adopted table keeps as it is in the run that adopts it
-        (``aws_adoption.held_still``): an Iceberg table is never updated in place."""
-        from .aws_adoption import held_still
+    def update_hold(
+        self, change: Mapping[str, Any], declared: Mapping[str, Any]
+    ) -> Optional[TableHold]:
+        """The hold on a resource the saved plan updates in place: a live Iceberg Glue
+        table is never updated in place, whatever brought it into the plan
+        (``aws_adoption.iceberg_update_hold``). ``change`` is the resource's change as
+        ``tofu show -json`` prints it, ``declared`` its body in the module."""
+        if change.get("type") != "aws_glue_catalog_table":
+            return None
+        from .aws_adoption import iceberg_update_hold
 
-        return held_still(declared)
+        detail = change.get("change")
+        return iceberg_update_hold(detail if isinstance(detail, Mapping) else {}, declared)
 
     def review_table_adoption(
         self, change: Mapping[str, Any], declared: Mapping[str, Any]
