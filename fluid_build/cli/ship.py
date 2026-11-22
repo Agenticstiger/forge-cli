@@ -174,7 +174,10 @@ def _add_artifact_options(g: argparse._ArgumentGroup) -> None:
         "--emit",
         default=None,
         metavar="LIST",
-        help="Stage 3 --emit, comma-separated (default: $GENERATE_EMIT, else all but pyspark-schema).",
+        help=(
+            "Stage 3 --emit, comma-separated (default: $GENERATE_EMIT, else every key but "
+            "pyspark-schema and custom-scaffold)."
+        ),
     )
     g.add_argument(
         "--require-artifacts",

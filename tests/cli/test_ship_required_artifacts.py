@@ -268,7 +268,7 @@ def test_a_required_custom_scaffold_written_passes(
 ) -> None:
     outputs = {**_ALL_OUTPUTS, "custom-scaffold/.gitlab-ci.yml": b"stages: []\n"}
     _install(monkeypatch, FakeStages(outputs))
-    keys = ["--require-artifacts", "custom-scaffold"]
+    keys = ["--emit", "odcs,custom-scaffold", "--require-artifacts", "custom-scaffold"]
     assert _ship(["--until", "validate-artifacts", *keys]) == 0
     assert _stage3(work)["status"] == "passed"
 
@@ -277,11 +277,20 @@ def test_a_required_custom_scaffold_stage_three_did_not_write_fails_and_says_why
     work: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _install(monkeypatch, FakeStages(dict(_ALL_OUTPUTS)))
-    keys = ["--require-artifacts", "custom-scaffold"]
+    keys = ["--emit", "odcs,custom-scaffold", "--require-artifacts", "custom-scaffold"]
     assert _ship(["--until", "validate-artifacts", *keys]) == 1
     reason = str(_stage3(work)["reason"])
     assert "custom-scaffold: stage 3 wrote no custom-scaffold file" in reason
-    assert "data-product-forge[custom-scaffold]" in reason
+    assert "extensions.customScaffold" in reason
+
+
+def test_custom_scaffold_is_not_in_the_default_emit_set_so_requiring_it_is_refused(
+    work: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake = _install(monkeypatch, FakeStages(dict(_ALL_OUTPUTS)))
+    assert _ship(["--until", "validate-artifacts", "--require-artifacts", "custom-scaffold"]) == 2
+    assert fake.calls == []
+    assert "custom-scaffold is not in stage 3's default --emit set" in caplog.text
 
 
 def test_blank_emit_means_the_default_set() -> None:
@@ -290,6 +299,7 @@ def test_blank_emit_means_the_default_set() -> None:
     opts = st.ShipOptions(contract="c.fluid.yaml")
     assert [k for k in EMIT_KEYS if st.emits(opts, k)] == list(DEFAULT_EMIT)
     assert not st.emits(opts, "pyspark-schema")
+    assert not st.emits(opts, "custom-scaffold")
 
 
 def test_a_missing_odps_product_fails(work: Path, monkeypatch: pytest.MonkeyPatch) -> None:

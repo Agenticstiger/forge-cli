@@ -120,16 +120,16 @@ EMIT_KEYS: Tuple[str, ...] = (
 # - policies     → compiled IAM bindings; shape is internal
 # - spark        → each forge Spark build's job.json, the bytes OpenTofu uploads
 #                  (nothing for a contract without one)
-# - custom-scaffold → the files the contract's ``extensions.customScaffold`` block
-#                  generates, through the optional custom-scaffold engine (nothing for
-#                  a contract without the block; skipped with a warning when the
-#                  engine is not installed)
 #
-# Seven of the eight emit keys are on by default. ``pyspark-schema`` (a PySpark
-# ``StructType`` module per output port, ``fluid generate pyspark-schema``'s) is
-# requested by name: on by default it would fail stage 3 for every contract with a
-# column Spark has no type for, whether or not a Spark job reads the product. Order
-# matches ``EMIT_KEYS`` because ``parse_emit_set`` canonicalises every resolved set
+# Six of the eight emit keys are on by default; two are requested by name:
+# - ``pyspark-schema`` (a PySpark ``StructType`` module per output port, ``fluid generate
+#   pyspark-schema``'s): on by default it would fail stage 3 for every contract with a
+#   column Spark has no type for, whether or not a Spark job reads the product;
+# - ``custom-scaffold`` (the files the contract's ``extensions.customScaffold`` block
+#   generates, through the optional custom-scaffold engine): the engine renders the
+#   bundles' templates in this process, so it runs only where a pipeline names it, never
+#   on a build (a pull request's, say) that never asked for the contract's bundles to run.
+# Order matches ``EMIT_KEYS`` because ``parse_emit_set`` canonicalises every resolved set
 # into ``EMIT_KEYS`` order — so ``parse_emit_set(None) == DEFAULT_EMIT``.
 DEFAULT_EMIT: Tuple[str, ...] = (
     "odps-bitol",
@@ -138,7 +138,6 @@ DEFAULT_EMIT: Tuple[str, ...] = (
     "schedule",
     "policies",
     "spark",
-    "custom-scaffold",
 )
 
 # Emit keys auto-skipped purely on the basis of the build *pattern*.
@@ -1107,12 +1106,29 @@ def _emit_custom_scaffold(run: "_Inputs", out_dir: Path, logger: logging.Logger)
         *_scaffold_contract_dir(run.source, run.source_path, run.contract_path)
     )
     return custom_scaffold_artifacts.emit(
-        _load_contract(run.resolved_contract),
-        out_dir,
-        logger,
-        required=run.explicit,
-        anchor=anchor,
+        _load_contract(run.resolved_contract), out_dir, logger, anchor=anchor
     )
+
+
+def _note_unrequested_scaffold(
+    resolved_contract: Path, emits: List[str], logger: logging.Logger
+) -> None:
+    """Say, in a run that did not name ``custom-scaffold``, that the contract declares a
+    scaffold and how to generate it."""
+    if "custom-scaffold" in emits:
+        return
+    from fluid_build.forge.core import custom_scaffold_artifacts
+
+    try:
+        declared = custom_scaffold_artifacts.scaffold_block(_load_contract(resolved_contract))
+    except FanoutError:  # an unreadable contract is reported by the emitters that read it
+        return
+    if declared is not None:
+        logger.info(
+            "generate_artifacts_custom_scaffold_not_requested: the contract declares "
+            "extensions.customScaffold; name custom-scaffold in --emit to generate it (its "
+            "bundles' templates run in this process: name it where they are trusted)"
+        )
 
 
 _DISPATCH = {
@@ -1145,8 +1161,6 @@ class _Inputs:
     env: Optional[str]
     dag_contract_path: Optional[str]
     schedule_contract: Optional[Dict[str, Any]]
-    #: ``--emit`` named the keys, so an optional engine that is missing is an error.
-    explicit: bool
     source_path: Optional[Path]
     contract_path: Optional[str]
 
@@ -1313,14 +1327,13 @@ def run_fanout(
             env=env,
             dag_contract_path=dag_contract_path,
             schedule_contract=schedule_contract,
-            # Named in --emit: a missing optional engine is an error, not a skip.
-            explicit=bool(emit_raw and emit_raw.strip()),
             source_path=source_path,
             contract_path=contract_path,
         )
         written: List[Path] = []
         for key in emits:
             written.extend(_emit_key(key, out_dir / _DISPATCH[key][0], run, logger))
+        _note_unrequested_scaffold(resolved_contract, emits, logger)
 
     # Build MANIFEST across all emitted files (bytes from disk — matches
     # the bundle's hash-what-you-wrote model).

@@ -563,8 +563,8 @@ def _contract_documents(contract_path: str) -> List[Dict[str, Any]]:
 def _contract_package_extras(contract_path: str) -> List[str]:
     """``data-product-forge`` extras the contract's bindings and engines need,
     across its base and every overlay (a pipeline can run any of them), and the
-    custom-scaffold engine when it declares ``extensions.customScaffold`` (stage 3
-    generates that scaffold, and the Jenkins ``GENERATE_EMIT`` names the key)."""
+    custom-scaffold engine when it declares ``extensions.customScaffold``, so a pipeline
+    that names ``custom-scaffold`` in ``GENERATE_EMIT`` has the engine stage 3 runs."""
     from fluid_build.forge.core.custom_scaffold_artifacts import ENGINE_EXTRA, scaffold_block
 
     extras = set()

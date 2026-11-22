@@ -6,18 +6,23 @@
 A contract's ``extensions.customScaffold`` block names scaffold bundles (a ``path``, ``git``
 or ``entrypoint`` source) and the patterns to render from them: CI files, job settings, a
 README. The engine that renders them, ``data-product-forge-custom-scaffold``, is an optional
-extra (``pip install 'data-product-forge[custom-scaffold]'``), imported only when a contract
-declares the block. Its library entry point, ``generate(contract, out_dir, ...)``, returns
-every file it wrote with its sha256 and size, the shape of a wheel ``RECORD`` row.
+extra (``pip install 'data-product-forge[custom-scaffold]'``), imported only when a run names
+the key and the contract declares the block. Its library entry point,
+``generate(contract, out_dir, ...)``, returns every file it wrote with its sha256 and size, the
+shape of a wheel ``RECORD`` row.
+
+The key is requested by name, never part of stage 3's default set: the engine renders a
+bundle's templates inside this process (Jinja2's standard environment, so a template can run
+Python), and an ``entrypoint`` bundle is installed code. A scaffold bundle therefore has the
+trust of the contract that names it, as a build's code does, and a pipeline names
+``custom-scaffold`` only where it trusts the contract's bundles (not on a build of a pull
+request it does not trust, which reaches stage 3 but never the builds of stage 7).
 
 A run, in order:
 
 1. No block: nothing, and the engine is not imported.
-2. A missing engine, or one older than 0.5.0 (no ``generate()``), stops a run that named
-   ``custom-scaffold`` in ``--emit`` with an error that names the extra. The default run
-   logs a warning and writes no scaffold, so a pipeline that never asked for one keeps
-   working; ``fluid ship --require-artifacts custom-scaffold`` makes a release run fail
-   instead.
+2. A missing engine, one older than 0.5.0 (no ``generate()``) or one that does not import
+   stops the run with an error that names the extra.
 3. The engine's own validator checks the block, and the operator's plugin policy
    (``FLUID_PLUGINS_ALLOWLIST`` / ``FLUID_PLUGINS_BLOCKLIST``, as
    :func:`fluid_build.plugin_manager.is_allowed` reads it, names compared without regard to
@@ -42,9 +47,6 @@ and a contract's ``auth.secret_ref`` may only name a ``FLUID_SCAFFOLD_``-prefixe
 runs without prompts (``GIT_TERMINAL_PROMPT=0``, and ``ssh -o BatchMode=yes`` for an ssh url
 unless ssh is configured), so a CI stage cannot hang on one.
 
-Trust: the engine renders a bundle's templates inside this process, and an ``entrypoint``
-bundle is installed Python code, so a scaffold bundle has the trust of the contract that
-names it, as a build's code does.
 """
 
 from __future__ import annotations
@@ -72,6 +74,8 @@ INSTALL_LINE = f"pip install 'data-product-forge[{ENGINE_EXTRA}]'"
 
 _STAGING_PREFIX = f".{SUBDIR}.partial-"
 _FEATURE = "fluid generate artifacts --emit custom-scaffold"
+#: The clean slate's refusal: a directory holding this file is a scaffold bundle.
+_BUNDLE_MANIFEST = "fluid-scaffold.yaml"
 _ALTERNATIVES = "Or leave custom-scaffold out of --emit to generate the other artifacts."
 _READ_CHUNK = 1 << 16
 _MAX_LISTED = 10
@@ -108,9 +112,20 @@ def scaffold_block(contract: Mapping[str, Any]) -> Optional[Any]:
 
 def clear(out_root: Path) -> None:
     """Remove what an earlier run left in ``out_root``: ``custom-scaffold/`` (a link there is
-    removed, never followed) and any staging directory a killed run did not remove."""
+    removed, never followed) and any staging directory a killed run did not remove.
+
+    A ``custom-scaffold/`` that holds ``fluid-scaffold.yaml`` is a scaffold bundle (``--out``
+    at the contract's own directory, beside a bundle of that name), not this stage's output:
+    it is refused, never deleted."""
+    target = out_root / SUBDIR
+    if not target.is_symlink() and (target / _BUNDLE_MANIFEST).exists():
+        _refuse(
+            f"custom scaffold: {target} holds {_BUNDLE_MANIFEST}, so it is a scaffold bundle, "
+            "not this stage's output, and is left alone: choose another --out",
+            _OUTPUT,
+        )
     try:
-        _remove(out_root / SUBDIR)
+        _remove(target)
         if out_root.is_dir():
             for leftover in sorted(out_root.glob(f"{_STAGING_PREFIX}*")):
                 _remove(leftover)
@@ -127,30 +142,25 @@ def emit(
     out_dir: Path,
     logger: logging.Logger,
     *,
-    required: bool,
     anchor: ContractAnchor,
 ) -> List[Path]:
     """Generate the scaffold ``contract`` declares into ``out_dir`` (``<out>/custom-scaffold``).
 
-    ``required`` is ``True`` when ``--emit`` named the key: then a missing or too old engine
-    raises instead of being skipped with a warning. ``anchor`` says where a relative
-    ``path:`` source is read from (no directory: the current one, with a warning when the
-    block has such a source). Returns the files written, each under ``out_dir``; raises
+    Runs only when ``--emit`` named the key. ``anchor`` says where a relative ``path:``
+    source is read from (no directory: the current one, with a warning when the block has
+    such a source). Returns the files written, each under ``out_dir``; raises
     :class:`FanoutError` (or the optional-dependency error) and leaves nothing under
     ``out_dir`` when the run is refused.
     """
     block = scaffold_block(contract)
     if block is None:
-        if required:
-            logger.info(
-                "generate_artifacts_custom_scaffold_none: the contract has no extensions.%s "
-                "block, so there is no scaffold to generate",
-                EXTENSION_KEY,
-            )
+        logger.info(
+            "generate_artifacts_custom_scaffold_none: the contract has no extensions.%s "
+            "block, so there is no scaffold to generate",
+            EXTENSION_KEY,
+        )
         return []
-    engine = _engine(required, logger)
-    if engine is None:
-        return []
+    engine = _engine()
     _check_block(engine, contract)
     _check_plugins(block)
     if anchor.directory is None and _has_relative_path_source(block):
@@ -177,48 +187,30 @@ def emit(
 # ── the engine ────────────────────────────────────────────────────────────
 
 
-def _engine(required: bool, logger: logging.Logger) -> Optional[Any]:
-    """The engine module, or ``None`` (warned) when the default run cannot use it."""
+def _engine() -> Any:
+    """The engine module; an error that names the extra when it cannot be used."""
     from fluid_build import _optional
 
-    try:
-        _optional.ensure_installed(ENGINE_MODULE, ENGINE_EXTRA, _FEATURE, _ALTERNATIVES)
-    except _optional.MissingOptionalDependency:
-        if required:
-            raise
-        logger.warning(
-            "generate_artifacts_skip_custom_scaffold: the contract declares "
-            "extensions.%s, but the custom-scaffold engine is not installed, so no scaffold "
-            "was generated. Install it with: %s (name custom-scaffold in --emit, or pass "
-            "fluid ship --require-artifacts custom-scaffold, to make this an error)",
-            EXTENSION_KEY,
-            INSTALL_LINE,
-        )
-        return None
+    _optional.ensure_installed(ENGINE_MODULE, ENGINE_EXTRA, _FEATURE, _ALTERNATIVES)
     try:
         engine = _optional.require(ENGINE_MODULE, ENGINE_EXTRA, _FEATURE)
     except Exception as exc:  # noqa: BLE001 - installed, but its import fails (a dependency)
         cause = exc.__cause__ if exc.__cause__ is not None else exc
-        message = (
+        _refuse(
             "the custom-scaffold engine is installed but does not import "
             f"({type(cause).__name__}: {cause}); reinstall it: "
-            f"{INSTALL_LINE.replace('install', 'install --force-reinstall', 1)}"
+            f"{INSTALL_LINE.replace('install', 'install --force-reinstall', 1)}",
+            "custom_scaffold_engine_broken",
         )
-        if required:
-            _refuse(message, "custom_scaffold_engine_broken")
-        logger.warning("generate_artifacts_skip_custom_scaffold: %s", message)
-        return None
-    if _has_the_api(engine):
-        return engine
-    message = (
-        f"the installed custom-scaffold engine ({getattr(engine, '__version__', 'unknown')}) "
-        f"is older than {MIN_ENGINE_VERSION}, which added the generate() entry point this "
-        f"stage calls; upgrade it: {INSTALL_LINE}"
-    )
-    if required:
-        raise FanoutError(message, key=EMIT_KEY, code="custom_scaffold_engine_too_old")
-    logger.warning("generate_artifacts_skip_custom_scaffold: %s", message)
-    return None
+    if not _has_the_api(engine):
+        raise FanoutError(
+            f"the installed custom-scaffold engine ({getattr(engine, '__version__', 'unknown')})"
+            f" is older than {MIN_ENGINE_VERSION}, which added the generate() entry point this "
+            f"stage calls; upgrade it: {INSTALL_LINE}",
+            key=EMIT_KEY,
+            code="custom_scaffold_engine_too_old",
+        )
+    return engine
 
 
 def _has_the_api(engine: Any) -> bool:

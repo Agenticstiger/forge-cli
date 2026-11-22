@@ -116,6 +116,10 @@ def _scaffold_rows(manifest: Dict[str, Any]) -> List[str]:
     return sorted(p for p in manifest["files"] if p.startswith("custom-scaffold/"))
 
 
+#: Stage 3's default set plus the scaffold, as a pipeline that asks for it names it.
+WITH_SCAFFOLD = ",".join([*DEFAULT_EMIT, "custom-scaffold"])
+
+
 def _fanout(contract: Path, out: Path, emit: Optional[str] = "custom-scaffold") -> Dict[str, Any]:
     return run_fanout(contract, out, emit_raw=emit, manifest_path=None, logger=LOG)
 
@@ -123,25 +127,28 @@ def _fanout(contract: Path, out: Path, emit: Optional[str] = "custom-scaffold") 
 # ── the emit key ──────────────────────────────────────────────────────────
 
 
-def test_custom_scaffold_is_an_emit_key_and_in_the_default_set() -> None:
+def test_custom_scaffold_is_an_emit_key_requested_by_name() -> None:
+    """The engine renders a bundle's templates in this process, so the default run never
+    does: a pipeline names the key where it trusts the contract's bundles."""
     assert "custom-scaffold" in EMIT_KEYS
-    assert "custom-scaffold" in DEFAULT_EMIT
+    assert "custom-scaffold" not in DEFAULT_EMIT
 
 
-# ── engine absent ─────────────────────────────────────────────────────────
-
-
-def test_without_the_engine_the_default_run_skips_the_scaffold_and_says_how_to_add_it(
-    tmp_path: Path, no_engine: None, caplog: pytest.LogCaptureFixture
+def test_the_default_run_never_runs_the_engine_and_says_how_to_ask_for_it(
+    tmp_path: Path, stub: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
     contract = _write(tmp_path / "p", _contract(_block()))
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         manifest = _fanout(contract, tmp_path / "out", emit=None)
     assert _scaffold_rows(manifest) == []
     assert manifest["files"], "the other emitters still ran"
-    warned = " ".join(r.getMessage() for r in caplog.records)
-    assert "extensions.customScaffold" in warned and INSTALL_HINT in warned
+    assert "calls" not in stub.HOOKS
+    noted = " ".join(r.getMessage() for r in caplog.records)
+    assert "extensions.customScaffold" in noted and "--emit" in noted
     assert not (tmp_path / "out" / "custom-scaffold").exists()
+
+
+# ── engine absent ─────────────────────────────────────────────────────────
 
 
 def test_without_the_engine_an_explicit_emit_is_a_typed_error_naming_the_extra(
@@ -165,8 +172,8 @@ def test_a_contract_without_the_block_never_imports_the_engine(
     assert _scaffold_rows(_fanout(contract, tmp_path / "out2", emit=None)) == []
 
 
-def test_an_engine_older_than_the_library_api_is_refused_when_asked_for(
-    tmp_path: Path, stub: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_an_engine_older_than_the_library_api_is_refused(
+    tmp_path: Path, stub: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delattr(stub, "generate")
     monkeypatch.setattr(stub, "__version__", "0.4.1")
@@ -175,10 +182,6 @@ def test_an_engine_older_than_the_library_api_is_refused_when_asked_for(
         _fanout(contract, tmp_path / "out")
     assert raised.value.code == "custom_scaffold_engine_too_old"
     assert "0.4.1" in str(raised.value) and "0.5.0" in str(raised.value)
-    with caplog.at_level(logging.WARNING):
-        manifest = _fanout(contract, tmp_path / "out2", emit=None)
-    assert _scaffold_rows(manifest) == []
-    assert "0.4.1" in " ".join(r.getMessage() for r in caplog.records)
 
 
 def test_an_engine_whose_error_class_is_not_an_exception_is_treated_as_too_old(
@@ -216,12 +219,12 @@ def test_every_file_the_engine_wrote_is_in_the_manifest_with_its_digest(
     assert sorted(p.name for p in out.iterdir()) == ["MANIFEST.json", "custom-scaffold"]
 
 
-def test_the_default_run_includes_the_scaffold_and_stage_four_raises_nothing_about_it(
+def test_the_scaffold_beside_every_default_key_leaves_stage_four_nothing_to_say_about_it(
     tmp_path: Path, stub: Any
 ) -> None:
     contract = _write(tmp_path / "p", _contract(_block()))
     out = tmp_path / "out"
-    manifest = _fanout(contract, out, emit=None)
+    manifest = _fanout(contract, out, emit=WITH_SCAFFOLD)
     assert "custom-scaffold/.gitlab-ci.yml" in manifest["files"]
     report = validate_artifacts(out, strict=True)
     about_it = [
@@ -339,6 +342,23 @@ def test_a_symlink_planted_at_the_output_directory_is_removed_not_followed(
     assert (elsewhere / "keep.txt").read_text() == "mine\n"
     assert not (out / "custom-scaffold").is_symlink()
     assert "custom-scaffold/README.md" in manifest["files"]
+
+
+def test_a_scaffold_bundle_kept_at_the_output_name_is_never_deleted(
+    tmp_path: Path, stub: Any
+) -> None:
+    """With ``--out`` at the contract's own directory, ``./custom-scaffold`` can be the
+    contract's bundle (it holds ``fluid-scaffold.yaml``): the clean slate refuses to remove it."""
+    out = tmp_path / "p"
+    bundle = out / "custom-scaffold"
+    bundle.mkdir(parents=True)
+    (bundle / "fluid-scaffold.yaml").write_text("apiVersion: fluid.dev/custom-scaffold.v1\n")
+    contract = _write(out, _contract())
+    with pytest.raises(FanoutError) as raised:
+        _fanout(contract, out, emit="odcs")
+    assert raised.value.code == "custom_scaffold_output_failed"
+    assert "fluid-scaffold.yaml" in str(raised.value)
+    assert (bundle / "fluid-scaffold.yaml").is_file()
 
 
 # ── refusals: nothing half-written is left behind ─────────────────────────
@@ -628,15 +648,12 @@ def broken_engine(tmp_path: Path) -> Iterator[None]:
         importlib.invalidate_caches()
 
 
-def test_an_engine_that_does_not_import_is_skipped_by_the_default_run(
-    tmp_path: Path, broken_engine: None, caplog: pytest.LogCaptureFixture
+def test_the_default_run_never_imports_an_engine_that_would_fail(
+    tmp_path: Path, broken_engine: None
 ) -> None:
-    with caplog.at_level(logging.WARNING):
-        manifest = _fanout(_write(tmp_path / "p", _contract(_block())), tmp_path / "out", emit=None)
+    manifest = _fanout(_write(tmp_path / "p", _contract(_block())), tmp_path / "out", emit=None)
     assert _scaffold_rows(manifest) == []
-    assert "a_dependency_that_is_not_installed_anywhere" in " ".join(
-        r.getMessage() for r in caplog.records
-    )
+    assert manifest["files"]
 
 
 def test_an_engine_that_does_not_import_is_a_typed_error_when_asked_for(
@@ -740,7 +757,7 @@ def test_a_scaffold_bundles_files_are_in_the_sealed_releases_manifest(
     root = tmp_path / "checkout"
     contract = _write(root, _contract(_block()))
     monkeypatch.chdir(root)
-    manifest = _fanout(contract, root / st.ARTIFACTS_DIR, emit=None)
+    manifest = _fanout(contract, root / st.ARTIFACTS_DIR, emit=WITH_SCAFFOLD)
     staging = tmp_path / "staging"
     release._copy_artifacts(root, staging)
     sealed = json.loads((staging / "artifacts" / "MANIFEST.json").read_text())
@@ -964,6 +981,8 @@ def _ship_release(project: Path, python_path: List[str]) -> "subprocess.Complete
             "--no-strict",
             "--ci-output",
             "plain",
+            "--emit",
+            "odps-bitol,odcs,opds,policies,custom-scaffold",
             "--require-artifacts",
             "custom-scaffold",
             "--release-dir",
@@ -1015,7 +1034,7 @@ def _engine_distribution_installed() -> bool:
 
 
 @pytest.mark.integration
-def test_a_release_run_without_the_engine_fails_its_required_scaffold(tmp_path: Path) -> None:
+def test_a_release_run_that_names_the_scaffold_fails_without_the_engine(tmp_path: Path) -> None:
     if _engine_distribution_installed():
         # Its entry points stay registered however the module is hidden, so stage 2
         # would fail on them first; the in-process tests above hide it fully.
@@ -1030,7 +1049,7 @@ def test_a_release_run_without_the_engine_fails_its_required_scaffold(tmp_path: 
     output = done.stdout + done.stderr
     assert done.returncode != 0
     assert not (project / "rel").exists()
-    assert "custom-scaffold: stage 3 wrote no custom-scaffold file" in output
+    assert "ERR_CUSTOM_SCAFFOLD_ENGINE_MISSING" in output
     assert "data-product-forge[custom-scaffold]" in output
 
 

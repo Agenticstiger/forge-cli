@@ -535,7 +535,7 @@ def _quiet_probe() -> Iterator[None]:
 
 def emits(opts: ShipOptions, key: str) -> bool:
     """Whether stage 3's ``--emit`` (blank: ``generate artifacts``' default set, every
-    key but ``pyspark-schema``) includes ``key``.
+    key but ``pyspark-schema`` and ``custom-scaffold``) includes ``key``.
     ``odps`` is ``generate artifacts``' deprecated spelling of ``opds``."""
     if not opts.emit.strip():
         from fluid_build.forge.core.artifact_fanout import DEFAULT_EMIT
@@ -1010,11 +1010,7 @@ def _key_problems(key: str, root: Path, files: Mapping[str, object]) -> List[str
         module = _top_level("pyspark-schema", "_schema.py")
         return _one_or_more(root, files, key, "PySpark schema module (pyspark-schema/*.py)", module)
     if key == "custom-scaffold":
-        what = (
-            "custom-scaffold file (the contract declares no extensions.customScaffold, or the "
-            "custom-scaffold engine is not installed: pip install "
-            "'data-product-forge[custom-scaffold]')"
-        )
+        what = "custom-scaffold file (the contract declares no extensions.customScaffold)"
         return _one_or_more(root, files, key, what, lambda rel: rel.startswith("custom-scaffold/"))
     what = (
         "schedule file (orchestration.engine is none, or it is unset and no build has a "

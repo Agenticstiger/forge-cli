@@ -9,37 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`fluid generate artifacts` generates a contract's custom scaffold, so its files are in the
-  stage-3 MANIFEST and in a sealed release.** The new emit key `custom-scaffold` passes the
+- **`fluid generate artifacts --emit custom-scaffold` generates a contract's custom scaffold, so
+  its files are in the stage-3 MANIFEST and in a sealed release.** The new emit key passes the
   contract to the custom-scaffold engine's library entry point and writes the files its
   `extensions.customScaffold` block declares (CI files, job settings, a README) to
-  `custom-scaffold/`. The
-  engine is a new optional extra, `pip install 'data-product-forge[custom-scaffold]'`
-  (`data-product-forge-custom-scaffold>=0.5.0,<1`, also in `[all]`), imported only when a
-  contract declares the block, so `fluid --help` loads what it did before. The key is in the
-  default emit set and does nothing for a contract without the block. Without the engine (or with
-  one older than 0.5.0, or one that does not import), the default run writes no scaffold and warns
-  with the install line;
-  `--emit custom-scaffold` is then an error that names the extra, and `fluid ship
-  --require-artifacts custom-scaffold` fails a release run that wrote none. Before the engine
-  runs, its own validator checks the block and every `entrypoint` bundle is held to
-  `FLUID_PLUGINS_ALLOWLIST` / `FLUID_PLUGINS_BLOCKLIST` as every other plugin is (the
-  `custom_scaffold` plugin role is listed as dispatched by `fluid plugins` now). The engine
-  writes into a hidden directory beside `custom-scaffold/`; every file it reports must be a
-  regular file there with the reported sha256 and size under the exact name the directory lists
-  (two spellings of one file on a case-insensitive file system are refused), nothing unreported
-  and no link may be there, and only then is the directory moved into place, so a refused run
-  leaves no scaffold behind. Each engine error is its own code (`custom_scaffold_contract_invalid`,
-  `_bundle_failed`, `_plan_failed`, `_unsafe_path`, `_apply_failed`, `_output_failed`,
-  `_plugin_blocked`, `_engine_missing`, `_engine_too_old`, `_engine_broken`, `_failed`), with the
-  message redacted; a file-system error is `custom_scaffold_output_failed`, not a traceback. A relative `path:`
-  bundle is read from the contract's directory (a bundle's recorded source contract, else
-  `--contract-path`). Git bundles keep the engine's own credential model: a credential goes only
-  to a host the operator lists in `FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS`, and a contract's
-  `secret_ref` may only name a `FLUID_SCAFFOLD_` variable; the engine's operator settings
-  (`FLUID_CUSTOM_SCAFFOLD_*`) cannot come from a project `.env` file. `fluid generate ci` installs
-  the `custom-scaffold` extra in the pipeline when the contract declares the block, and the
-  Jenkins template's default `GENERATE_EMIT` names the key.
+  `custom-scaffold/`. The engine is a new optional extra, `pip install
+  'data-product-forge[custom-scaffold]'` (`data-product-forge-custom-scaffold>=0.5.0,<1`, also in
+  `[all]`), imported only when a run names the key and the contract declares the block, so
+  `fluid --help` loads what it did before. The key is requested by name, never part of the
+  default set: the engine renders the bundles' templates in this process, so a pipeline names it
+  only where it trusts the contract's bundles (not on a build of an untrusted pull request, which
+  reaches stage 3). A default run on a contract with the block says how to ask for it. Without the
+  engine (or with one older than 0.5.0, or one that does not import) the run fails with an error
+  that names the extra, and `fluid ship --require-artifacts custom-scaffold` fails a release run
+  that wrote none. Before the engine runs, its own validator checks the block and every
+  `entrypoint` bundle is held to `FLUID_PLUGINS_ALLOWLIST` / `FLUID_PLUGINS_BLOCKLIST` as every
+  other plugin is (the `custom_scaffold` plugin role is listed as dispatched by `fluid plugins`
+  now). The engine writes into a hidden directory beside `custom-scaffold/`; every file it reports
+  must be a regular file there with the reported sha256 and size under the exact name the
+  directory lists (two spellings of one file on a case-insensitive file system are refused),
+  nothing unreported and no link may be there, and only then is the directory moved into place,
+  so a refused run leaves no scaffold behind. Each engine error is its own code
+  (`custom_scaffold_contract_invalid`, `_bundle_failed`, `_plan_failed`, `_unsafe_path`,
+  `_apply_failed`, `_output_failed`, `_plugin_blocked`, `_engine_missing`, `_engine_too_old`,
+  `_engine_broken`, `_failed`), with the message redacted; a file-system error is
+  `custom_scaffold_output_failed`, not a traceback. A relative `path:` bundle is read from the
+  contract's directory (a bundle's recorded source contract, else `--contract-path`), and a
+  `custom-scaffold/` in `--out` that holds `fluid-scaffold.yaml` (a bundle, with `--out` at the
+  contract's directory) is refused rather than cleared. Git bundles keep the engine's own
+  credential model: a credential goes only to a host the operator lists in
+  `FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS`, and a contract's `secret_ref` may only name a
+  `FLUID_SCAFFOLD_` variable; the engine's operator settings (`FLUID_CUSTOM_SCAFFOLD_*`) cannot
+  come from a project `.env` file. `fluid generate ci` installs the `custom-scaffold` extra in the
+  pipeline when the contract declares the block, so a pipeline that names the key in
+  `GENERATE_EMIT` can run it.
 - **`fluid generate artifacts --emit pyspark-schema` puts the PySpark schema modules in the
   MANIFEST.** It writes `pyspark-schema/<port>_schema.py`, the module `fluid generate
   pyspark-schema` writes, byte for byte (same loader, renderer and writer), for each output port
