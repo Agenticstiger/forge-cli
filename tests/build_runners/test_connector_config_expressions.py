@@ -59,9 +59,8 @@ def test_text_without_an_expression_passes(value):
 @pytest.mark.unit
 def test_a_sink_value_with_an_expression_is_not_written_to_application_properties():
     with pytest.raises(ValueError) as caught:
-        render_application_properties(
-            {"database.password": "pw"}, "http", {"url": f"https://sink.example/{EXPRESSION}"}
-        )
+        source = {"database.password": "pw"}  # pragma: allowlist secret
+        render_application_properties(source, "http", {"url": f"https://sink.example/{EXPRESSION}"})
     assert "properties.debezium.server.sink.config.url" in str(caught.value)
     assert "FLUID_DBZ" not in str(caught.value)
 
@@ -74,9 +73,8 @@ def test_a_sink_type_with_an_expression_is_refused():
 
 @pytest.mark.unit
 def test_forges_own_credential_line_keeps_its_expression():
-    properties, env = render_application_properties(
-        {"database.password": "p${x}"}, "iceberg", {"catalog-name": "c"}
-    )
+    source = {"database.password": "p${x}"}  # pragma: allowlist secret
+    properties, env = render_application_properties(source, "iceberg", {"catalog-name": "c"})
     assert "debezium.source.database.password=${FLUID_DBZ_SOURCE_DATABASE_PASSWORD}" in properties
     assert env["FLUID_DBZ_SOURCE_DATABASE_PASSWORD"] == "p${x}"  # pragma: allowlist secret
 
@@ -190,4 +188,5 @@ def test_a_secret_whose_value_holds_dollar_brace_still_connects(
     with secret_run("apply"):
         rc = execute_debezium_build(contract["builds"][0], contract, tmp_path, dry_run=False)
     assert rc == 0
-    assert kafka_connect_mock.connectors["expr"]["config"]["database.password"] == "p${x}"
+    sent = kafka_connect_mock.connectors["expr"]["config"]
+    assert sent["database.password"] == "p${x}"  # pragma: allowlist secret

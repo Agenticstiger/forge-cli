@@ -590,4 +590,3 @@ def test_a_block_past_the_walk_limit_is_refused_by_the_limit_not_an_element():
     assert refusal is not None
     assert "more than 10,000 values" in refusal.what
     assert "tables[" not in refusal.what
-
