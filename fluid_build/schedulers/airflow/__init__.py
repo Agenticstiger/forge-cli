@@ -18,6 +18,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from fluid_build.alerts.routes import AlertPlan
 from fluid_build.engines.base import Severity, ValidationIssue
 from fluid_build.providers.common.codegen_utils import (
     airflow_dag_import,
@@ -28,6 +29,11 @@ from fluid_build.providers.common.codegen_utils import (
     py_str_literal,
     sanitize_identifier,
     unique_task_identifiers,
+)
+from fluid_build.schedulers.airflow._alerts import (
+    RenderedAlerts,
+    alert_plan_or_none,
+    render_alerts,
 )
 from fluid_build.schedulers.airflow._operators import (
     EMITTERS,
@@ -104,6 +110,7 @@ class AirflowScheduler(ScheduleEngine):
             provider_tasks,
             allow_unmapped=allow_unmapped,
             dag_id=dag_id,
+            alerts=alert_plan_or_none(contract),
         )
         dag_filename = f"{sanitize_identifier(dag_id or contract_id)}_dag.py"
         return {dag_filename: dag_code}
@@ -209,13 +216,15 @@ def _render(
     *,
     allow_unmapped: bool = False,
     dag_id: Optional[str] = None,
+    alerts: Optional[AlertPlan] = None,
 ) -> str:
-    """Assemble one DAG file: header, imports, DAG, helpers, tasks, edges.
+    """Assemble one DAG file: header, imports, alerts, DAG, helpers, tasks, edges.
 
     A task whose action no emitter maps would render as a log line and run green
     without doing what the contract says. That is refused (``ValueError`` naming
     every such task) unless ``allow_unmapped``, which renders the log lines and
-    logs a WARNING listing them.
+    logs a WARNING listing them. ``alerts`` is the product's alert plan
+    (:mod:`fluid_build.schedulers.airflow._alerts`).
     """
     provider_lower = (provider or "").lower()
     emit = EMITTERS.get(provider_lower)
@@ -270,9 +279,21 @@ def _render(
         timezone=timezone,
         **header_kwargs,
     )
-    dag_code += "\n\n" + _generate_imports(uses)
+    rendered = RenderedAlerts()
+    if alerts is not None:
+        rendered = render_alerts(
+            alerts,
+            dag_id=sanitize_identifier(dag_id or contract_id),
+            product_id=_plain_product_id(contract_id),
+        )
+    dag_code += "\n\n" + _generate_imports(uses, extra=rendered.imports)
+    if rendered.active:
+        notes = "\n#\n".join(
+            "\n".join(f"# {line}" for line in _comment_lines(note)) for note in rendered.notes
+        )
+        dag_code += "\n\n" + notes + "\n\n" + rendered.definitions.rstrip("\n")
     dag_code += "\n\n" + _generate_dag_definition(
-        contract_id, contract_name, schedule, timezone, provider, dag_id
+        contract_id, contract_name, schedule, timezone, provider, dag_id, alerts=rendered.active
     )
     helpers = [HELPERS[name] for name in HELPER_NAMES if name in uses]
     if helpers:
@@ -282,8 +303,9 @@ def _render(
     return dag_code
 
 
-def _generate_imports(uses: set) -> str:
-    """The shared imports plus one line per operator the tasks use."""
+def _generate_imports(uses: set, extra: str = "") -> str:
+    """The shared imports plus one line per operator the tasks use, then ``extra`` (the
+    alerts' notifier imports)."""
     base = (
         "from datetime import datetime, timedelta\n"
         "from zoneinfo import ZoneInfo\n"
@@ -294,6 +316,8 @@ def _generate_imports(uses: set) -> str:
     operators = [IMPORTS[name] for name in IMPORTS if name in uses]
     if operators:
         base += "\n".join(operators) + "\n"
+    if extra:
+        base += "\n" + extra.rstrip("\n") + "\n"
     return base + "\nlogger = logging.getLogger(__name__)"
 
 
@@ -322,6 +346,32 @@ def _generate_dependencies(tasks: List[Dict[str, Any]], identifiers: Dict[str, s
     return "\n".join(lines)
 
 
+def _plain_product_id(contract_id: str) -> str:
+    """``contract_id`` when it is a plain identifier, else its sanitised form: alert text puts
+    it into Jinja templates, which nothing but an identifier may reach."""
+    from fluid_build.build_runners._ids import IdentifierViolation, validate_identifier
+
+    try:
+        return validate_identifier(contract_id, kind="contract.id")
+    except IdentifierViolation:
+        return sanitize_identifier(contract_id)
+
+
+def _comment_lines(text: str, width: int = 76) -> List[str]:
+    """``text`` wrapped into comment lines (no ``#``), at most ``width`` wide."""
+    lines: List[str] = []
+    current = ""
+    for word in text.split():
+        if current and len(current) + 1 + len(word) > width:
+            lines.append(current)
+            current = word
+        else:
+            current = f"{current} {word}" if current else word
+    if current:
+        lines.append(current)
+    return lines
+
+
 def _generate_dag_definition(
     contract_id: str,
     contract_name: str,
@@ -329,10 +379,14 @@ def _generate_dag_definition(
     timezone: str,
     provider: Optional[str],
     dag_id: Optional[str] = None,
+    *,
+    alerts: bool = False,
 ) -> str:
     """Generate DAG definition with default arguments.
 
     ``dag_id`` overrides only the id; the tags and the description keep the contract id.
+    ``alerts``: the file defines ``ALERT_TASK_ARGS`` and ``ALERT_DAG_ARGS``, which this merges
+    into ``default_args`` and passes to ``DAG``.
     """
     airflow_schedule = convert_schedule_to_airflow(schedule)
     tags = ["fluid", "auto-generated"]
@@ -340,6 +394,8 @@ def _generate_dag_definition(
         tags.append(provider.lower())
     tags.append(contract_id)
 
+    task_args = "    **ALERT_TASK_ARGS,\n" if alerts else ""
+    dag_args = "    **ALERT_DAG_ARGS,\n" if alerts else ""
     # All contract-derived values are emitted as repr()-escaped literals so a
     # malicious name/timezone/schedule cannot break out and inject code that
     # Airflow would run at DAG-parse time. dag_id is an identifier (no quotes).
@@ -352,7 +408,7 @@ default_args = {{
     'retries': 3,
     'retry_delay': timedelta(minutes=5),
     'execution_timeout': timedelta(hours=2),
-}}
+{task_args}}}
 
 # DAG definition
 dag = DAG(
@@ -363,4 +419,4 @@ dag = DAG(
     start_date=datetime(2026, 1, 1, tzinfo=ZoneInfo({py_str_literal(timezone)})),
     catchup=False,
     tags={tags!r},
-)"""
+{dag_args})"""
