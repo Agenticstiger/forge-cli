@@ -150,6 +150,12 @@ REBINDINGS = [
     "for d['k'] in ('lp',):\n    pass",
     "with ctx as d['k']:\n    pass",
     "d |= {'k': 'dor'}",
+    "s = d.get('k')",
+    "t = d.get('nope', 'tg')",
+    "s = d.get('k', 'sg') + 'x'",
+    "d = dict(k='dk')",
+    "d = dict(**d, j='dj')",
+    "d = dict({'k': 'dm'}, j=s)",
     "vars()['s'] = 'vr'",
     "def deco(f):\n    return f\n@deco\ndef s():\n    pass",
 ]

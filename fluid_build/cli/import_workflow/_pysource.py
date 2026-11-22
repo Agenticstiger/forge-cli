@@ -262,6 +262,10 @@ class Module:
     size: int = 0
     #: How many syntax-tree nodes it has: what keeping it parsed costs.
     nodes: int = 0
+    #: The path the module index knows the file by (relative to the scanned directory), when
+    #: ``rel`` is the path shown to a person instead (a DAG file: relative to the working
+    #: directory). Its imports, relative ones above all, are resolved from this one.
+    index_rel: Optional[str] = None
 
     @property
     def parents(self) -> Dict[ast.AST, ast.AST]:

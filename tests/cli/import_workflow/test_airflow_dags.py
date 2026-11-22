@@ -703,6 +703,7 @@ def test_a_field_that_did_not_fold_is_a_hole_the_rest_of_the_command_is_still_re
     assert (first.script, first.args) == ("/jobs/main.py", ("--day", "<not constant>"))
     assert first.command == "spark-submit --master {master} /jobs/main.py --day {day}"
     assert second.script is None and second.shown == "{script}"
+    assert second.why == "the script is not a constant"  # a hole says only that it is one
 
 
 def test_a_command_the_file_does_not_define_but_that_mentions_spark_submit_is_reported():

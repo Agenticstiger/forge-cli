@@ -11,12 +11,14 @@ when ``--registry`` is given.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ._catalogs import CatalogKinds
 from ._conventions import Conventions, load_conventions
+from ._fold import missing_value
 from ._proposal import (
     SPLITS,
     ProposalTooLarge,
@@ -25,7 +27,17 @@ from ._proposal import (
     safe_text,
 )
 from ._pysource import SourceBudget
-from ._scan import DagScan, JobScan, LinkedTask, budget_note, link_tasks, scan_dags, scan_jobs
+from ._redact import sensitive_name
+from ._scan import (
+    DagScan,
+    JobScan,
+    LinkedTask,
+    budget_note,
+    link_tasks,
+    path_is,
+    scan_dags,
+    scan_jobs,
+)
 from .registry import Importer, ImportReport
 
 DOC = "https://agenticstiger.github.io/forge_docs/cli/import.html"
@@ -107,11 +119,11 @@ def _named_directories(tool: str, source: str, options: Mapping[str, Any]) -> Li
     return named
 
 
-def _referenced_roots(dag_scan: DagScan, conv: Conventions) -> Tuple[List[Path], List[str]]:
+def _referenced_roots(dag_scan: DagScan, conv: Conventions) -> List[Path]:
     """The local directories the DAGs' scripts live in, by the conventions' ``script_roots``:
-    only those a task actually submits from, outer directories before the ones inside them."""
+    only those a task actually submits from (and that exist: one that does not is reported by
+    :func:`_report_conventions_paths`), outer directories before the ones inside them."""
     used: Dict[Path, None] = {}
-    missing: List[str] = []
     for dag in dag_scan.dags:
         for task in dag.tasks:
             for submit in task.submits:
@@ -119,17 +131,133 @@ def _referenced_roots(dag_scan: DagScan, conv: Conventions) -> Tuple[List[Path],
                     continue
                 for prefix, directory in conv.script_roots:
                     if submit.script.startswith(prefix):
-                        if directory.is_dir():
+                        if path_is(directory, True):
                             used.setdefault(directory, None)
-                        elif str(directory) not in missing:
-                            missing.append(str(directory))
                         break
     roots = sorted(used, key=lambda p: len(p.parts))
     kept: List[Path] = []
     for root in roots:
         if not any(root == other or other in root.parents for other in kept):
             kept.append(root)
-    return kept, missing
+    return kept
+
+
+#: Directories above the ones named on the command line looked in for a path of the conventions
+#: file that names nothing where it was written: the folder that holds the repositories, often.
+_HINT_LEVELS = 4
+#: Tasks named on the line of a ``script_roots`` entry that names nothing.
+MAX_PATH_TASKS = 3
+
+
+def _where_it_is(written: str, named: Sequence[Path], want_dir: bool) -> Optional[Path]:
+    """The folder above a directory named on the command line (or that directory) from which the
+    path ``written`` names a directory (``want_dir``) or a file: where the conventions file was
+    written for. Only ``is_dir``/``is_file`` is asked, of paths below the named directories'
+    parents; nothing is read."""
+    if not written or written.startswith("..") or Path(written).is_absolute():
+        return None
+    seen: Dict[Path, None] = {}
+    for directory in named:
+        for above in [directory, *list(directory.parents)[:_HINT_LEVELS]]:
+            if above in seen:
+                continue
+            seen[above] = None
+            if path_is(above / written, want_dir):
+                return above
+    return None
+
+
+def _shown(path: Path) -> str:
+    """A path as the report shows it: from the working directory when it is under it."""
+    try:
+        text = path.relative_to(Path.cwd().resolve()).as_posix() or "."
+    except (ValueError, OSError):
+        text = str(path)
+    return safe_text(text, 400)
+
+
+def _report_conventions_paths(
+    conv: Conventions, dag_scan: Optional[DagScan], named: Sequence[Path], report: ImportReport
+) -> None:
+    """A line for each directory or file the conventions name that is not there (a
+    ``script_roots`` directory, a ``config_modules`` file, a ``drivers`` directory): a path in the
+    file is relative to the file's own folder, so a file moved away from the repositories it
+    describes, or written for another folder, names nothing and the joins it was meant for are
+    not made. The line names the entry, the path as written and as resolved, the tasks it leaves
+    unjoined, and, when the path names something from a folder above a directory named on the
+    command line, that folder."""
+    if conv.source is None:
+        return
+    home = conv.source.resolve().parent
+    name = safe_text(conv.source.name, 80)
+    uses: Dict[str, Dict[str, None]] = {}
+    for dag in dag_scan.dags if dag_scan is not None else ():
+        for task in dag.tasks:
+            for submit in task.submits:
+                for prefix, _directory in conv.script_roots if submit.script else ():
+                    if (submit.script or "").startswith(prefix):
+                        label = f"DAG {safe_text(dag.shown, 60)} task {safe_text(task.shown, 60)}"
+                        uses.setdefault(prefix, {})[label] = None
+                        break
+
+    def line(entry: str, target: Path, want_dir: bool, consequence: str) -> str:
+        try:
+            written = os.path.relpath(target, home)
+        except ValueError:  # another drive
+            written = str(target)
+        found = _where_it_is(written, named, want_dir)
+        kind = "directory" if want_dir else "file"
+        fix = (
+            f"`{safe_text(written, 120)}` is in {_shown(found)}: put the conventions file there, "
+            "in the folder that holds the repositories it names"
+            if found is not None
+            else "write the path from the conventions file's folder"
+        )
+        return (
+            f"{entry} in {name} names `{safe_text(written, 120)}`, which is {_shown(target)}: no "
+            f"such {kind}. A path in the conventions file is relative to the file's own folder "
+            f"({_shown(home)}){consequence}. "
+            f"{fix}, or name the {kind} on the command line (`fluid import pyspark <jobs-dir> "
+            "--dags <dags-dir>` names the jobs directory)"
+        )
+
+    for prefix, directory in conv.script_roots:
+        if path_is(directory, True):
+            continue
+        tasks = list(uses.get(prefix, {}))
+        consequence = ""
+        if tasks:
+            shown = ", ".join(tasks[:MAX_PATH_TASKS])
+            if len(tasks) > MAX_PATH_TASKS:
+                shown += f", and {len(tasks) - MAX_PATH_TASKS} more"
+            consequence = (
+                f"; {len(tasks)} task(s) submit a script under {safe_text(prefix, 120)} and are "
+                f"not joined through it ({shown})"
+            )
+        report.unsupported.append(
+            line(f"script_roots `{safe_text(prefix, 120)}`", directory, True, consequence)
+        )
+    for module, path in conv.config_modules.items():
+        if not path_is(path, False):
+            report.unsupported.append(
+                line(
+                    f"config_modules `{safe_text(module, 120)}`",
+                    path,
+                    False,
+                    "; what the scanned code imports from it is not read",
+                )
+            )
+    for index, driver in enumerate(conv.drivers):
+        for what, directory in (("job_lists", driver.lists_dir), ("jobs", driver.jobs_dir)):
+            if not path_is(directory, True):
+                report.unsupported.append(
+                    line(
+                        f"drivers[{index}].{what}.dir",
+                        directory,
+                        True,
+                        f"; a task that runs {safe_text(driver.script, 80)} is not joined to its jobs",
+                    )
+                )
 
 
 def topic_schema_reader(options: Mapping[str, Any]) -> Optional[TopicSchema]:
@@ -229,16 +357,14 @@ def run_import(
             )
     else:
         dag_scan = scan_dags(root, conv, budget)
-        roots, missing = _referenced_roots(dag_scan, conv)
-        for path in missing:
-            report.unsupported.append(
-                f"script_roots names the directory {safe_text(path, 100)}, which does not exist"
-            )
+        roots = _referenced_roots(dag_scan, conv)
         scans = [scan_jobs(directory, conv, budget) for directory in roots]
         linked, unlinked = link_tasks(
             dag_scan.dags, scans, conv, project_root=None, notes=report.notes, budget=budget
         )
 
+    named = [Path(p).resolve() for p in _named_directories(tool, source, options)]
+    _report_conventions_paths(conv, dag_scan, named, report)
     _scan_report(tool, scans, dag_scan, linked, unlinked, report)
     budget_note(budget.skipped, report.notes, budget.sql_skipped)
     jobs = [job for scan in scans for job in scan.jobs]
@@ -413,6 +539,82 @@ def _report_unlinked(
             report.notes.append(line)
 
 
+#: Functions Python tasks run that are not read, named one by one in the report; the rest counted.
+MAX_UNREAD_CALLABLES = 10
+#: Values submitted scripts and config files wait for, listed one by one; the rest counted. Each
+#: line names at most ``MAX_WAITING_TASKS`` of the tasks that wait for it.
+MAX_WAITING_LINES = 20
+MAX_WAITING_TASKS = 3
+_WAITING_HINT = {
+    "module": "name the file of its module under `config_modules` in the conventions",
+    "environment": "set what it holds under `environments` in the conventions",
+    "airflow_variable": "set what it holds under `airflow_variables` in the conventions",
+}
+
+
+def _report_unread_callables(dag_scan: DagScan, report: ImportReport) -> None:
+    """The note on the functions Python tasks run that are not read: the ones that submit Spark
+    work can be described in the conventions."""
+    unread = dag_scan.unread_callables
+    if not unread:
+        return
+    ranked = sorted(unread.items(), key=lambda item: (-item[1], item[0]))
+    shown = ", ".join(
+        f"{safe_text(name, 80)} ({count})" for name, count in ranked[:MAX_UNREAD_CALLABLES]
+    )
+    more = len(ranked) - MAX_UNREAD_CALLABLES
+    report.notes.append(
+        f"{sum(unread.values())} Python task(s) run a function that is not read here: {shown}"
+        + (f", and {more} more" if more > 0 else "")
+        + ". Name one that submits Spark work under `submit_helpers` in the conventions, with "
+        "where its script is among its arguments"
+    )
+
+
+def _waiting_for(submit: Any) -> List[Tuple[str, str]]:
+    """The values a submit's script and config file wait for that the conventions can give. A name
+    that says it is a credential is left out: the conventions do not use such a value."""
+    whys = (submit.why if submit.script is None else "", submit.config_why)
+    found = [missing_value(why) for why in whys if why]
+    return [m for m in found if m is not None and not sensitive_name(m[1].rsplit(".", 1)[-1])]
+
+
+def _waiting_line(kind: str, name: str, tasks: Sequence[str]) -> str:
+    what = {
+        "module": f"`{safe_text(name, 120)}`, which is not in the scanned files",
+        "environment": f"the environment variable {safe_text(name, 80)}",
+        "airflow_variable": f"the Airflow Variable {safe_text(name, 80)}",
+    }[kind]
+    named = ", ".join(tasks[:MAX_WAITING_TASKS])
+    if len(tasks) > MAX_WAITING_TASKS:
+        named += f", and {len(tasks) - MAX_WAITING_TASKS} more"
+    return (
+        f"{len(tasks)} task(s) submit a script or name a config file that depends on {what} "
+        f"({named}): {_WAITING_HINT[kind]}"
+    )
+
+
+def _report_waiting(dag_scan: DagScan, report: ImportReport) -> None:
+    """A line for each value that a submitted script or a config file waits for and the conventions
+    can give (a constant of a module outside the scan, an environment variable, an Airflow
+    Variable), with the tasks that wait for it."""
+    waiting: Dict[Tuple[str, str], Dict[str, None]] = {}
+    for dag in dag_scan.dags:
+        for task in dag.tasks:
+            label = f"DAG {safe_text(dag.shown, 60)} task {safe_text(task.shown, 60)}"
+            for submit in task.submits:
+                for missing in _waiting_for(submit):
+                    waiting.setdefault(missing, {})[label] = None
+    ranked = sorted(waiting.items(), key=lambda item: (-len(item[1]), item[0]))
+    for (kind, name), tasks in ranked[:MAX_WAITING_LINES]:
+        report.required_defaults.append(_waiting_line(kind, name, list(tasks)))
+    if len(ranked) > MAX_WAITING_LINES:
+        report.required_defaults.append(
+            f"{len(ranked) - MAX_WAITING_LINES} more value(s) that submitted scripts or config "
+            "files depend on are not listed"
+        )
+
+
 def _scan_report(
     tool: str,
     scans: Sequence[JobScan],
@@ -459,6 +661,8 @@ def _scan_report(
                     )
         _report_joins(linked, len(unlinked), report)
         _report_unlinked(tool, unlinked, report)
+        _report_unread_callables(dag_scan, report)
+        _report_waiting(dag_scan, report)
         no_dag = [j for j in jobs if not j.tasks]
         if tool == "pyspark" and no_dag:
             report.notes.append(f"{len(no_dag)} job(s) are submitted by no DAG task read here")

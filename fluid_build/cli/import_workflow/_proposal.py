@@ -756,6 +756,8 @@ def _link_cost(link: LinkedTask) -> int:
         + args
         + min(len(submit.command or ""), 2_000)
         + min(len(submit.script or ""), 300)
+        + min(len(submit.config or ""), 300)
+        + min(len(link.task.callable or ""), 200)
         + 24 * upstream
     )
 
@@ -1401,6 +1403,17 @@ def _dependencies(
     return [{"buildId": d, "condition": "success"} for d in deps]
 
 
+def _python_params(link: LinkedTask) -> Dict[str, str]:
+    """The function a Python task runs (the schema's rule for a Python task asks for it) and the
+    config file its submit names, when that resolved."""
+    params: Dict[str, str] = {}
+    if link.task.callable:
+        params["python_callable"] = safe_text(link.task.callable, 200)
+    if link.submit.config and not link.submit.config_why:
+        params["config"] = safe_text(link.submit.config, 300)
+    return params
+
+
 def _task_entry(link: LinkedTask, report: ImportReport, ctx: _Ctx) -> Optional[Dict[str, Any]]:
     """The entry a build lists for one task link: ``None`` when the task cannot be recorded
     (its id does not fit the contract's pattern; said once). Read once per link, whatever the
@@ -1434,6 +1447,7 @@ def _task_entry(link: LinkedTask, report: ImportReport, ctx: _Ctx) -> Optional[D
         if link.submit.command:
             # the schema's own rule for a Bash task asks for the command
             params["bash_command"] = safe_command(link.submit.command)
+        params.update(_python_params(link))
         # ``type`` and ``operator`` at the task level: the schema's task rules (fluid_execute,
         # bash, python) key on them, and a task that lacks either is held to the fluid_execute
         # rule and refused for want of a contract_path. ``custom`` is the type that names

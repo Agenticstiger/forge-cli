@@ -27,6 +27,10 @@ fluid import airflow dags/ --dry-run
 - `pyspark` reads the jobs; `--dags` joins each DAG task to the script it submits, which adds
   the schedule, the owner and the dependencies. `airflow` reads a DAGs directory and finds
   the scripts through the conventions file's `script_roots`.
+- A `PythonOperator` that submits through a function of the DAG files (an EMR step list, a
+  `spark-submit` it runs) is read as it is. One that calls the project's own library is read
+  once the conventions name the function under `submit_helpers`: the report lists the functions
+  tasks run that it could not read, with how many tasks run each.
 - The default is one product per output table or topic, with one writer. `--split-by` also
   takes `job`, `dag`, `folder` and `project`.
 - Show the user the proposal and the report, and write only when they agree:
@@ -64,8 +68,8 @@ fluid validate contracts/<file>.fluid.yaml --offline
 ## 3. The conventions file
 
 The organisation's layout is data in one YAML file: where scripts and data live, the helper
-functions that wrap Spark reads and writes, the operator classes that submit Spark work, the
-values of environment variables, layers, owners and what to ignore. Start from
+functions that wrap Spark reads and writes, the operator classes and functions that submit Spark
+work, the values of environment variables, layers, owners and what to ignore. Start from
 [references/conventions.example.yaml](references/conventions.example.yaml) and keep only the
 keys that describe the project.
 
@@ -75,6 +79,11 @@ keys that describe the project.
   line (the jobs directory, `--dags`).
 - An `environments` value may be empty (`TABLE_PREFIX: ""`); a variable the file does not
   name stays unresolved and is reported.
+- A `submit_helpers` entry says where the function's script is among its arguments: a keyword,
+  a position, or a key inside a dict argument (`settings.script_path`). Ask the user which
+  argument it is, or read the function's code with them; never guess it.
+- A script that depends on a constant of a module outside the scanned directory is listed
+  under Used defaults: name that module's file under `config_modules`.
 
 ## 4. Importer plugins
 
