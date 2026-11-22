@@ -27,12 +27,22 @@ from __future__ import annotations
 import copy
 from typing import Any, Collection, Dict, Mapping, Optional
 
+from fluid_build.providers.base import ProviderError
+
 __all__ = ["dmm_product_id", "needs_existing_ids", "with_dmm_product_ids"]
 
 
 def dmm_product_id(value: str) -> str:
-    """The id Entropy knows a product by: stripped, lower case, spaces and ``/`` as ``-``."""
-    return str(value).strip().lower().replace(" ", "-").replace("/", "-")
+    """The id Entropy knows a product by: stripped, lower case, spaces and ``/`` as ``-``.
+
+    ``.`` and ``..`` are refused (:class:`ProviderError`): as a path segment they name the
+    collection, not a product, and a request for one reaches what is above it."""
+    slug = str(value).strip().lower().replace(" ", "-").replace("/", "-")
+    if slug in (".", ".."):
+        raise ProviderError(
+            f"{value!r} cannot be a data product id: '.' and '..' are path segments, not ids"
+        )
+    return slug
 
 
 def _consumes(fluid: Mapping[str, Any]) -> list:

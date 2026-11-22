@@ -31,7 +31,7 @@ import uuid
 from collections.abc import Collection, Mapping
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from fluid_build.providers.base import BaseProvider, ProviderError
 from fluid_build.util.contract import (
@@ -72,6 +72,19 @@ _SECRET_ERROR_PATTERNS = (
     re.compile(r"(?i)(x-api-key|api[_-]?key|password|token|secret)([\"'\s:=]+)([^\"'\s,;}]+)"),
     re.compile(r"ed_live_[A-Za-z0-9_]+"),
 )
+
+
+def _refuse_dot_segments(path: str) -> None:
+    """Refuse a request path with a ``.`` or ``..`` segment, spelled plainly or percent-encoded.
+    ``quote`` keeps dots and the HTTP client resolves them, so ``DELETE /api/dataproducts/..``
+    would reach the collection above the product."""
+    segments = unquote(path.split("?", 1)[0].split("#", 1)[0]).split("/")
+    if any(segment in (".", "..") for segment in segments):
+        raise ProviderError(
+            "Refusing a request path with a '.' or '..' segment: an id that is a dot segment "
+            "would reach a different resource than the one it names."
+        )
+
 
 _ODPS_LINEAGE_MODE_ALIASES: Dict[str, str] = {
     "contract": "contract",
@@ -346,15 +359,21 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             )
         return url
 
-    @staticmethod
-    def _redact_error_body(body: str) -> str:
-        redacted = body[:500]
+    def _redact_error_body(self, body: str) -> str:
+        """An error body cut to 500 characters, with the configured key masked wherever the
+        server echoed it (a ``401`` that quotes the key it was sent) and every key-shaped pair
+        and token masked as well. The key goes first and from a longer read than the cut leaves,
+        so one that straddles the cut is not shown in part."""
+        redacted = body[:4000]
+        key = (self.api_key or "").strip()
+        if key:
+            redacted = redacted.replace(key, "***REDACTED***")
         for pattern in _SECRET_ERROR_PATTERNS:
             if pattern.groups >= 3:
                 redacted = pattern.sub(r"\1\2***REDACTED***", redacted)
             else:
                 redacted = pattern.sub("***REDACTED***", redacted)
-        return redacted
+        return redacted[:500]
 
     @staticmethod
     def _normalize_odps_lineage_mode(value: Optional[str]) -> str:
@@ -1476,6 +1495,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
 
         from fluid_build.observability.reporter import CredentialRedirectRefused
 
+        _refuse_dot_segments(path)
         url = f"{self.api_url}{path}"
         self._log.debug("%s %s", method, url)
         try:

@@ -213,7 +213,23 @@ _REF_ALIASES = frozenset(
 )
 _VERSION_ALIAS = re.compile(r"v?\d|(?:release|rel|rc|r)[-_.]?\d", re.IGNORECASE)
 #: Flags whose value is a database login (``--dsn scott/tiger@orcl``, ``-u scott/tiger@orcl``).
-_LOGIN_FLAGS = frozenset({"--dsn", "--userid", "-u"})
+_LOGIN_FLAGS = frozenset({"--dsn", "--userid", "--login", "-u"})
+#: Of those, flags whose value is ``user/password`` with or without a service after it.
+_BARE_LOGIN_FLAGS = frozenset({"--login"})
+#: Commands whose ``--login`` is a switch (a login shell) and takes no value.
+_LOGIN_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "fish", "tcsh", "csh", "su"})
+#: ``user/password`` after a flag that says it is a login: a plain user name (or one in double
+#: quotes), then the password up to a ``/``, an ``@`` or white space. A path (``./run.sh``) is
+#: not one: the user starts with a letter or ``_``.
+_BARE_LOGIN = re.compile(
+    r"(\"[^\"\s/]{1,64}\"|[^\W\d][\w$#]{0,63})/(\"[^\"\r\n]{1,128}\"|[^@\s/\"]{1,128})"
+)
+#: ``user/"password"`` (and ``@service`` after it) where the password is in double quotes and may
+#: hold white space: what a shell hands over when the quotes were around the whole word.
+_QUOTED_LOGIN = re.compile(r"(\"[^\"\r\n/]{1,64}\"|[^/\s@=\"]{1,64})/\"[^\"\r\n]{1,128}\"(@\S*)?")
+#: The quoted password of a word as written (``"scott"/"pa ss"@db``), which splitting the word
+#: removes the quotes from.
+_QUOTED_PASSWORD_WORD = re.compile(r"/\"[^\"\r\n]{1,128}\"(?:@|$)")
 #: Commands whose ``-P<value>``, with no space, is the password.
 _GLUED_UPPER_P_COMMANDS = frozenset({"bcp", "sqlcmd"})
 #: Commands whose ``-p<value>``, with no space, is the password.
@@ -255,7 +271,10 @@ def sensitive_name(name: str) -> bool:
     kept = [part for part in listed if part not in _NOT_CREDENTIAL_WORDS]
     if not kept:
         return False
-    if is_sensitive_key_name("_".join(kept)):
+    joined = "_".join(kept)
+    # a bare ``key`` is a column in a data job (``--key col``): it counts only beside a qualifier,
+    # below, though the redactor masks a dict key of that name
+    if joined != "key" and is_sensitive_key_name(joined):
         return True
     if any(part in "".join(kept) for part in _SECRET_SUBSTRINGS):
         return True
@@ -457,6 +476,8 @@ class _Words:
         self._user_next = False
         #: After ``-u``, ``--dsn`` or ``--userid``: the next word may be a login.
         self._login_next = False
+        #: The flag that set it takes ``user/password`` with no service too (``--login``).
+        self._login_bare = False
         #: The command the word belongs to (its first word, without a path); ``None`` in an
         #: argument list, which has no command.
         self.command: Optional[str] = None
@@ -520,7 +541,8 @@ class _Words:
                 return _mask_user(value)
         if self._login_next:
             self._login_next = False
-            login = self._oracle_login(value, named=True)
+            bare, self._login_bare = self._login_bare, False
+            login = self._oracle_login(value, named=True, bare=bare)
             if login is not None:
                 return login
         if self.command in _ORACLE_COMMANDS or value[:7].lower() == "userid=":
@@ -561,20 +583,33 @@ class _Words:
         return _scan(value)
 
     @staticmethod
-    def _oracle_login(value: str, *, named: bool = False) -> Optional[str]:
+    def _oracle_login(value: str, *, named: bool = False, bare: bool = False) -> Optional[str]:
         """``user/password@service`` (or ``userid=user/password@service``) with the password
         masked, or ``None`` when the word is not one. ``named``: the word follows a flag that
-        takes a login, so a service of any shape, and ``as sysdba`` after it, is one."""
+        takes a login, so a service of any shape, and ``as sysdba`` after it, is one. ``bare``:
+        that flag takes ``user/password`` with no service too (``--login scott/tiger``)."""
         head, equals, rest = value.partition("=")
         if equals and head.lower() == "userid":
             masked = _Words._oracle_login(rest, named=True)
             return f"{head}={masked}" if masked is not None else None
         if value.startswith("-"):
             return None
+        quoted = _QUOTED_LOGIN.fullmatch(value)
+        if quoted is not None:  # ``scott/"pa ss"@db``: the password runs to its closing quote
+            return f"{quoted.group(1)}/{_REDACTED}{quoted.group(2) or ''}"
         found = None if named else _ORACLE_LOGIN.fullmatch(value)
         if found is not None:
             return f"{found.group(1)}/{_REDACTED}{found.group(3) or ''}"
-        return _mask_login(value, named=True)
+        masked_login = _mask_login(value, named=True)
+        if masked_login is None and named and bare:
+            plain = _BARE_LOGIN.fullmatch(value)
+            if plain is not None:
+                return f"{plain.group(1)}/{_REDACTED}"
+        return masked_login
+
+    def reads_login(self) -> bool:
+        """Whether the next word may be a login: a client's argument, or what a login flag takes."""
+        return self._login_next or self.command in _ORACLE_COMMANDS
 
     def _header(self, match: "re.Match[str]") -> str:
         """``Name: value`` with the value masked when the header carries a credential."""
@@ -612,13 +647,18 @@ class _Words:
                 return f"{flag}={self._setting(rest, flag)}"
             self._setting_next = flag
             return value
-        if flag in _LOGIN_FLAGS and self.command not in _USER_FLAG_NOT_CREDENTIALS:
+        if (
+            flag in _LOGIN_FLAGS
+            and self.command not in _USER_FLAG_NOT_CREDENTIALS
+            and not (flag in _BARE_LOGIN_FLAGS and self.command in _LOGIN_SHELLS)
+        ):
+            bare = flag in _BARE_LOGIN_FLAGS
             if equals:
-                login = self._oracle_login(rest, named=True)
+                login = self._oracle_login(rest, named=True, bare=bare)
                 if login is not None:
                     return f"{flag}={login}"
             else:
-                self._login_next = True
+                self._login_next, self._login_bare = True, bare
         if flag in _USER_FLAGS:
             if equals:
                 return f"{flag}={_mask_user(rest) if _is_user_credential(rest, self.command) else rest}"
@@ -673,6 +713,16 @@ class _Words:
             if self.depth < _MAX_DEPTH and (rest.lstrip().startswith("-") or " " in rest.strip()):
                 return f"{key}={_redact_command(rest, self.depth + 1)}"
             return self._unread(value)
+        if (
+            not equals
+            and "." in value
+            and not any(c.isspace() for c in value)
+            and not value.startswith("-")
+            and sensitive_name(value)
+        ):
+            # ``--conf spark.hadoop.fs.s3a.secret.key <value>``: the key and its value as two words
+            self._mask_next = True
+            return value
         if self.depth < _MAX_DEPTH and any(c.isspace() for c in value):
             if value.lstrip().startswith(("{", "[")):
                 return self._multi_word(value)  # JSON is data, not a command line
@@ -689,7 +739,7 @@ class _Words:
     def skip(self) -> None:
         """A word that was not read (too long) is the end of what a flag before it waited for."""
         self._mask_next, self._setting_next, self._user_next = False, None, False
-        self._login_next = False
+        self._login_next = self._login_bare = False
 
 
 def _names_a_credential(text: str) -> bool:
@@ -730,10 +780,15 @@ def _redact_words(text: str, depth: int) -> str:
             out.append("#" + _redact_words(_scan(match.group(0))[1:], depth))
             continue
         raw = match.group("word")
-        value = _unquote(raw)
+        # A login with its password in double quotes keeps them: splitting the word would drop
+        # the quotes, and the password (it may hold white space) would no longer be one word.
+        keep_quotes = words.reads_login() and _QUOTED_PASSWORD_WORD.search(raw) is not None
+        value = raw if keep_quotes else _unquote(raw)
         shown = words.show(value)
         if shown == value:
             out.append(raw)
+        elif keep_quotes:
+            out.append(shown)
         else:
             quote = _NEEDS_QUOTES.search(shown.replace(_REDACTED, ""))
             out.append(shlex.quote(shown) if quote else shown)
@@ -932,7 +987,10 @@ def scrub_path(path: str) -> str:
         query = "&".join(_scrub_pair(pair, query=True) for pair in query.split("&"))
     if "=" in path:
         path = "/".join(_scrub_pair(segment) for segment in path.split("/"))
-    return path + question + query
+    # a segment that is a provider's token (``/ghp_.../``, ``/AKIA.../``) has no key before it
+    from fluid_build.observability.secret_redactor import redact_provider_tokens
+
+    return redact_provider_tokens(path + question + query, placeholder="REDACTED")
 
 
 def _scrub_pair(pair: str, *, query: bool = False) -> str:

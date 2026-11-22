@@ -1410,6 +1410,14 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "validate",
     ),
+    "contract_location_path": (
+        [
+            "Write exposes[].binding.location.path without a '.' or '..' segment: a table's "
+            + "location keeps it as written while a listing, a grant or a write resolves it, so "
+            + "x/.. reaches the parent of x",
+        ],
+        "validate",
+    ),
     "contract_maintenance_actions": (
         [
             "Install the package that registers the action's kind under the "
@@ -1636,6 +1644,10 @@ _EXAMPLES: Dict[str, str] = {
     "contract_alerts": _VERBOSE,
     "contract_alert_plugins": _VERBOSE,
     "contract_iceberg_maintenance": _VERBOSE,
+    "contract_location_path": (
+        "# exposes[].binding\nplatform: aws\nformat: iceberg\nlocation:\n"
+        "  bucket: acme-lake\n  path: warehouse/sales/orders/\n"
+    ),
     "contract_maintenance_actions": _VERBOSE,
     "contract_confluent_binding": _VERBOSE,
     "contract_databricks_binding": (

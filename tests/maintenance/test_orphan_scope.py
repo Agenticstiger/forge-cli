@@ -157,6 +157,11 @@ def _runner() -> Any:
         ("s3://lake/iceberg/commerce/order_lines", ""),
         ("file:/tmp/wh/commerce/order_lines", ""),
         ("s3://lake/x/..t/y", ""),  # a name that starts with dots is a name
+        # a parser ends the path at ``#`` and ``?``: what follows is still the location's own
+        ("s3://lake/x#/..", "holds a '#', a '?' or a control character"),
+        ("s3://lake/x?/../", "holds a '#', a '?' or a control character"),
+        ("s3://lake/x\n/..", "holds a '#', a '?' or a control character"),
+        ("s3://lake/x\x00/y", "holds a '#', a '?' or a control character"),
     ],
 )
 def test_the_runner_refuses_a_root_or_a_dot_segment(location: str, problem: str) -> None:

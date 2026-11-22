@@ -1088,6 +1088,9 @@ def _run_contract_rules(
         # runs it, the retention floors and each backend's limits.
         _check_maintenance(validation_result, contract)
 
+        # A '.' or '..' segment in a table's binding.location.path, for every table.
+        _check_location_dot_segments(validation_result, contract)
+
         # forge Spark builds, compiled to their job config under the operator's broker,
         # registry and secrets policy (an unlisted host warns here, refuses at run time).
         from fluid_build.spark import compiler as _spark
@@ -1613,6 +1616,27 @@ def _check_maintenance(validation_result: ValidationResult, contract: Mapping[st
     _add_findings(
         validation_result, contract, "contract_iceberg_maintenance", errors, anchor="exposes"
     )
+
+
+def _check_location_dot_segments(
+    validation_result: ValidationResult, contract: Mapping[str, Any]
+) -> None:
+    """Refuse a ``.`` or ``..`` segment in any ``exposes[].binding.location.path``: nothing
+    resolves it where the table is kept, and a grant, a listing or a write that does reaches
+    the neighbouring table. Fails closed."""
+    from fluid_build.maintenance.spec import location_dot_segment_errors
+
+    try:
+        errors = location_dot_segment_errors(contract)
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        validation_result.add_error(
+            f"Table location check could not run ({type(exc).__name__}); "
+            "exposes[].binding.location.path was NOT checked",
+            event="contract_check_failed",
+            pointer="",
+        )
+        return
+    _add_findings(validation_result, contract, "contract_location_path", errors, anchor="exposes")
 
 
 def _check_maintenance_plugins(

@@ -448,6 +448,39 @@ def _read_actions(
 _DOT_SEGMENTS = frozenset({".", ".."})
 
 
+def location_dot_segment_errors(contract: Mapping[str, Any]) -> List[str]:
+    """One message for each expose whose ``binding.location.path`` holds a ``.`` or ``..``
+    segment, whether or not it declares maintenance (an object-store location: one with a
+    bucket, or on AWS; a local file's path is left alone). Neither Iceberg
+    nor an IAM policy resolves one: the table is kept at ``<warehouse>/x/..`` as written, and a
+    listing, a grant or a write that does resolve it reaches the neighbour (``x/..`` is the
+    parent of ``x``)."""
+    errors: List[str] = []
+    for index, expose in enumerate(contract.get("exposes") or []):
+        if not isinstance(expose, Mapping):
+            continue
+        binding = _mapping(expose.get("binding"))
+        location = _mapping(binding.get("location"))
+        path = location.get("path")
+        # an object-store key (a bucket, or AWS, where the bucket may be derived): a local
+        # file's ``./out/x.parquet`` is a path on a disk, where the dots mean what they say
+        if not isinstance(path, str) or not (
+            location.get("bucket") or str(binding.get("platform") or "").lower() == "aws"
+        ):
+            continue
+        # a backslash is a separator to some parsers, so it splits a segment as ``/`` does
+        parts = path.replace("\\", "/").split("/")
+        if any(part.strip() in _DOT_SEGMENTS for part in parts):
+            name = expose.get("exposeId") or index
+            errors.append(
+                f"exposes[{name}] binding.location.path holds a '.' or '..' segment, which a "
+                "table's location keeps as written and a listing, a grant or a write resolves "
+                "(x/.. is the parent of x), so it can reach files that are not the table's; "
+                "write the path without one"
+            )
+    return errors
+
+
 def _object_location(expose: Mapping[str, Any]) -> Optional[Tuple[str, Tuple[str, ...]]]:
     """``(bucket, path segments)`` of an AWS expose's S3 location, as forge places it
     (``providers/aws/util/warehouse.normalize_location``: the binding's ``bucket`` and ``path``,

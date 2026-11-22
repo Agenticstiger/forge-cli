@@ -16,6 +16,7 @@ from typing import Any, Dict, List
 
 from fluid_build.observability.secret_redactor import (
     _ORACLE_JDBC_RE,
+    _URL_TOKEN_USERINFO_RE,
     _URL_USERINFO_RE,
     is_sensitive_key_name,
     redact_jose_tokens,
@@ -50,6 +51,8 @@ SENSITIVE_PATTERNS = [
     # mask the identical shape and cannot drift (CLAUDE.md "extend both"). The
     # generic 2-group branch in redact_string() renders it as \1[REDACTED]\2.
     _URL_USERINFO_RE,
+    # A token as the only userinfo (``https://<token>@host``): shared object, two groups.
+    _URL_TOKEN_USERINFO_RE,
     # An Oracle JDBC URL with the login in it (``jdbc:oracle:thin:user/password@host``): shared
     # object, two groups, rendered the same way.
     _ORACLE_JDBC_RE,
@@ -127,6 +130,9 @@ SENSITIVE_PATTERNS = [
         r"oauth[_-]?token|password|session[_-]token|secret|token|passphrase|"
         # PagerDuty's Events API key, by its two names (mirrors the global layer)
         r"routing[_-]?key|integration[_-]?key|"
+        # the short and run-together spellings of a password, and the keys that sign (mirrors
+        # the global layer)
+        r"passwd|signing[_-]?key|hmac[_-]?key|"
         # an Iceberg REST catalog's OAuth2 ``credential`` (``<client id>:<secret>``), as a
         # local Spark run's configuration sets it (build_runners/spark/_local.py)
         r"credentials?"
@@ -247,6 +253,16 @@ SENSITIVE_KEYS = {
     # PagerDuty's Events API key (mirrors the global layer)
     "routing_key",
     "integration_key",
+    # The short and run-together spellings, and the whole-name keys of the global layer
+    # (``secret_redactor._SENSITIVE_KEY_NAMES``): matched here as exact names.
+    "passwd",
+    "pwd",
+    "key",
+    "sig",
+    "signing_key",
+    "signingkey",
+    "hmac_key",
+    "hmackey",
 }
 
 

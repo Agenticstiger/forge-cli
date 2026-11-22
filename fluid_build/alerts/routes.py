@@ -214,19 +214,43 @@ def _option_problems(value: Any, where: str, depth: int = 0) -> List[str]:
     return [f"{where} is a {type(value).__name__}, not a JSON value"]
 
 
+#: A key is read as words: a ``_``, ``-``, ``.`` or a change of case ends one (``signingKey``).
+_KEY_WORDS = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
+#: Names of a credential that the redactor's parts do not spell as one word.
+_SECRET_WORDS = frozenset(
+    {"credentials", "secrets", "passwords", "passphrases", "oauth", "secretkey", "accesskey"}
+    | {"secretaccesskey"}
+)
+#: A word that ends in one of these is a credential's (``accesstoken``, ``dbpassword``), and one
+#: that only starts with one is not (``tokenizer``, ``secretary``); ``tokens`` (``max_tokens``)
+#: counts a quantity.
+_SECRET_ENDINGS = ("secret", "token", "password", "passwd", "passphrase", "apikey", "credential")
+
+
 def _secret_key(key: str) -> bool:
-    """Whether an option key names a credential, as the redactor reads key names: its parts
-    (``api_key``, ``password``, ``routing_key``, ``token``, ...) in any case and spelling
-    (``apiKey``, ``routing-key``)."""
+    """Whether an option key names a credential, as the redactor reads key names, but by whole
+    words: its parts (``api_key``, ``password``, ``routing_key``, ``token``, ``signingKey``, ...)
+    in any case and spelling (``apiKey``, ``routing-key``), and the names that are a credential's
+    only as the whole key (``key``, ``pwd``, ``sig``). A word that only holds a part is not one
+    (``author``, ``tokenizer``, ``max_tokens``), so a harmless option is not refused."""
     from fluid_build.observability.secret_redactor import (
+        _SENSITIVE_KEY_NAMES,
         _SENSITIVE_KEY_PARTS,
-        is_sensitive_key_name,
     )
 
-    folded = re.sub(r"[^a-z0-9]", "", key.lower())
-    return is_sensitive_key_name(key) or any(
-        re.sub(r"[^a-z0-9]", "", part) in folded for part in _SENSITIVE_KEY_PARTS
-    )
+    if re.sub(r"[^a-z0-9]", "", key.lower()) in _SENSITIVE_KEY_NAMES:
+        return True
+    known = {re.sub(r"[^a-z0-9]", "", part) for part in _SENSITIVE_KEY_PARTS} | _SECRET_WORDS
+    words = [word.lower() for word in _KEY_WORDS.split(key) if word]
+    for start in range(len(words)):
+        joined = ""
+        for word in words[
+            start : start + 3
+        ]:  # ``api`` + ``key``, ``secret`` + ``access`` + ``key``
+            joined += word
+            if joined in known:
+                return True
+    return any(word.endswith(_SECRET_ENDINGS) for word in words)
 
 
 def _connection_problem(value: Any) -> str:
