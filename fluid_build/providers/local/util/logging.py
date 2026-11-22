@@ -13,6 +13,7 @@ import re
 from typing import Any, Dict, List
 
 from fluid_build.observability.secret_redactor import (
+    _ORACLE_JDBC_RE,
     _URL_USERINFO_RE,
     is_sensitive_key_name,
     redact_known_values,
@@ -31,6 +32,11 @@ SENSITIVE_PATTERNS = [
     # API keys
     re.compile(r'"api_key":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r"key=AIza[A-Za-z0-9_-]+"),  # Google API keys
+    re.compile(r"AIza[0-9A-Za-z_\-]{35}"),  # a Google key after a word character too
+    # A Slack incoming webhook: the URL is the secret.
+    re.compile(
+        r"(?i)\bhttps?://hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9/_-]{8,256}"
+    ),
     re.compile(r"key=AKIA[A-Za-z0-9]+"),  # AWS access keys
     # Database passwords and connection strings
     re.compile(r'"password":\s*"[^"]*"', re.IGNORECASE),
@@ -86,6 +92,7 @@ def redact_string(text: str) -> str:
     # full shared redactor where the provider logs it (``local.py``).
     redacted = redact_known_values(text, placeholder="[REDACTED]")
     redacted = _URL_USERINFO_RE.sub(r"\1[REDACTED]\2", redacted)
+    redacted = _ORACLE_JDBC_RE.sub(r"\1[REDACTED]\2", redacted)  # jdbc:oracle:thin:user/pw@host
 
     for pattern in SENSITIVE_PATTERNS:
         redacted = pattern.sub("[REDACTED]", redacted)
