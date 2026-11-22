@@ -1029,20 +1029,20 @@ def _emit_pyspark_schema(source: Path, out_dir: Path, logger: logging.Logger) ->
 
 
 def _refuse_unowned_modules(planned: Sequence[Any]) -> None:
-    """Refuse the run when a module's path holds a file the emitter did not write (or one
-    another product's run wrote), as ``fluid generate pyspark-schema`` refuses it."""
-    for status, code, what in (
-        ("foreign", "generate_pyspark_schema_foreign_file", "not written by this emitter"),
-        ("other_product", "generate_pyspark_schema_other_product", "generated for another product"),
-    ):
-        refused = [str(item.path) for item in planned if item.status == status]
-        if refused:
-            raise FanoutError(
-                f"{', '.join(refused)}: a file at a module's path is {what}, so it is left alone",
-                key="pyspark-schema",
-                code=code,
-                context={"files": ", ".join(refused)},
-            )
+    """Refuse the run when a module's path holds a file the emitter did not write.
+
+    Another product's generated module never reaches this check: the fanout clears every
+    generated module in ``pyspark-schema/`` first (see ``_clear_pyspark_schema``), so what
+    is left at a module's path is a file the emitter did not write."""
+    refused = [str(item.path) for item in planned if item.status == "foreign"]
+    if refused:
+        raise FanoutError(
+            f"{', '.join(refused)}: a file at a module's path is not written by this emitter, "
+            "so it is left alone",
+            key="pyspark-schema",
+            code="generate_pyspark_schema_foreign_file",
+            context={"files": ", ".join(refused)},
+        )
 
 
 def _clear_pyspark_schema(directory: Path) -> None:

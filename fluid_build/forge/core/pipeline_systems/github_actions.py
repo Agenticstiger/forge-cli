@@ -367,6 +367,8 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                     "name": RUNTIME_ARTIFACT,
                     "path": _keyless.LiteralStr(self._carried(config)),
                     "overwrite": True,
+                    # upload-artifact@v4 skips dot-prefixed files and folders by default
+                    "include-hidden-files": True,
                 },
             },
         ]
@@ -413,6 +415,8 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                     "name": REPORTS_ARTIFACT,
                     "path": _keyless.LiteralStr(self._carried(config)),
                     "overwrite": True,
+                    # upload-artifact@v4 skips dot-prefixed files and folders by default
+                    "include-hidden-files": True,
                 },
             },
         ]

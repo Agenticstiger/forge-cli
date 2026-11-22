@@ -158,6 +158,7 @@ _DUCKDB_FAMILIES = {
     "enum": "TEXT",
     "list": "STRUCTURED",
     "union": "STRUCTURED",
+    "parquet_variant": "STRUCTURED",
 }
 
 # The AWS region environment variables in the order the AWS SDKs read them

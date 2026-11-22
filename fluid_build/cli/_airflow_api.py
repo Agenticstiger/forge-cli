@@ -759,14 +759,14 @@ class AirflowApi:
             if self.dialect == "v1" or (not self.dialect and basic):
                 auth = httpx.BasicAuth(self.credentials.username, self.credentials.password)
         try:
-            resp = self._client.request(
+            resp = self._request_within(
                 method,
                 self.base_url + path,
+                timeout,
                 params=params,
                 json=json_body,
                 headers=headers,
                 auth=auth,
-                timeout=timeout,
             )
         except httpx.TimeoutException:
             raise AirflowApiError(
@@ -806,6 +806,33 @@ class AirflowApi:
                 transient=True,
             )
         return resp
+
+    def _request_within(self, method: str, url: str, timeout: float, **kwargs: Any) -> Any:
+        """Send one request and read its whole answer within about ``timeout`` seconds.
+
+        httpx's timeout limits each wait on the socket, so a server that sends a byte now and
+        then keeps one read going indefinitely. The body is read in chunks here, and the read
+        stops with a timeout once the total has passed ``timeout``."""
+        import httpx
+
+        started = time.monotonic()
+        with self._client.stream(method, url, timeout=timeout, **kwargs) as resp:
+            chunks = []
+            for chunk in resp.iter_bytes():
+                chunks.append(chunk)
+                if time.monotonic() - started > timeout:
+                    raise httpx.ReadTimeout("the answer took longer than the request timeout")
+            headers = [
+                (k, v)
+                for k, v in resp.headers.multi_items()
+                if k.lower() not in ("content-encoding", "content-length", "transfer-encoding")
+            ]
+            return httpx.Response(
+                resp.status_code,
+                headers=headers,
+                content=b"".join(chunks),
+                request=resp.request,
+            )
 
     @staticmethod
     def _json(resp: Any, what: str) -> Dict[str, Any]:

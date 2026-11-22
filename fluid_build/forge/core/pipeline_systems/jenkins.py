@@ -330,14 +330,14 @@ class JenkinsTemplate(BasePipelineTemplate):
             ),
             toggle(
                 3,
-                "Stage 3: ODCS + ODPS-Bitol + schedule + policy + Spark job config fanout "
+                "Stage 3: ODCS + ODPS-Bitol + OPDS + schedule + policy + Spark job config fanout "
                 "from the bundle. "
                 "Off by default when the file was generated with --no-generate-artifacts.",
             ),
             _Param(
                 "GENERATE_EMIT",
                 "string",
-                "odcs,odps-bitol,schedule,policies,spark",
+                "odcs,odps-bitol,opds,schedule,policies,spark",
                 "Stage 3 --emit list (comma-separated). dbt excluded by design (execution artifact).",
             ),
             toggle(4, "Stage 4: re-verify MANIFEST SHA-256 + per-format schema validators."),
