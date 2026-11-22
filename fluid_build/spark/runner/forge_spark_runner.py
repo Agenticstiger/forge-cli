@@ -26,10 +26,12 @@ credential).
 
 Every commit the runner makes (a batch's overwrite, the stream's append, a dead-letter table's
 append) carries ``fluid.*`` entries in its Iceberg snapshot summary: the product and build, the
-digest of the job config as it ran, and the product version, contract digest, release id and run
-id that ``fluid apply`` passes (``--fluid-product-version``, ``--fluid-contract-digest``,
-``--fluid-release-id``, ``--fluid-run-id``). The job's Spark conf holds the same as
-``spark.fluid.*``. Any of them missing is left out: a plain spark-submit runs the job too.
+digest of the job config as it ran, and what ``fluid apply`` passes: the product version, the
+contract digest, the digest of the bundle its plan binds, the release id, the run id, and the job
+and run of the scheduler that started it (``--fluid-product-version``, ``--fluid-contract-digest``,
+``--fluid-bundle-digest``, ``--fluid-release-id``, ``--fluid-run-id``, ``--fluid-scheduler-job``,
+``--fluid-scheduler-run-id``). The job's Spark conf holds the same as ``spark.fluid.*``. Any of
+them missing is left out: a plain spark-submit runs the job too.
 
 The submitter puts on the classpath what the job uses: the Iceberg Spark runtime and
 its AWS bundle (EMR: the release's Iceberg; Glue: ``--datalake-formats iceberg``),
@@ -94,8 +96,12 @@ _DL_BATCH_PROPERTY = "fluid.dead-letter.batch"
 STAMP_FLAGS = (
     ("--fluid-product-version", "fluid.product-version"),
     ("--fluid-contract-digest", "fluid.contract-digest"),
+    ("--fluid-bundle-digest", "fluid.bundle-digest"),
     ("--fluid-release-id", "fluid.release-id"),
     ("--fluid-run-id", "fluid.run-id"),
+    # the scheduler's job and run (Airflow's DAG id and run id), beside forge's own run id
+    ("--fluid-scheduler-job", "fluid.scheduler-job"),
+    ("--fluid-scheduler-run-id", "fluid.scheduler-run-id"),
 )
 #: What a stamp may hold: an identifier, a version, a digest, or the run id a scheduler names
 #: (``scheduled__2026-11-21T00:00:00+00:00``); never a space or a control character, so a value

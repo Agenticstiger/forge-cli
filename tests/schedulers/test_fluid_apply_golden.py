@@ -7,7 +7,8 @@
 declares neither ``builds[].dependencies`` nor a dataset trigger (:data:`CASES`), the file is
 also what the renderer wrote before it learned either, but for the ``outlets`` of the exposes a
 build writes: ``<file>.before.txt`` holds that earlier output, rendered at forge-cli 003e4b08,
-and the test holds everything else in the file to it byte for byte. To regenerate the current
+and the test holds everything else in the file to it byte for byte, but for the lines that hand
+fluid Airflow's run (``fluid_apply.SCHEDULER_RUN_LINES``), added later. To regenerate the current
 snapshots after an intended change::
 
     UPDATE_FLUID_APPLY_GOLDEN=1 pytest tests/schedulers/test_fluid_apply_golden.py
@@ -25,6 +26,7 @@ from typing import Dict
 
 import pytest
 
+from fluid_build.providers.common.codegen_utils import py_str_literal
 from fluid_build.schedulers.airflow import fluid_apply
 from tests.schedulers.fluid_apply_fixtures import CASES, GRAPH_CASES
 
@@ -49,8 +51,17 @@ def _render(case: str) -> Dict[str, str]:
     return fluid_apply.render_fluid_apply_dags(contract, env=env, contract_path=path)
 
 
+def _without_scheduler_run(source: str) -> str:
+    """``source`` without the script lines that hand fluid Airflow's run, each held once."""
+    for line in fluid_apply.SCHEDULER_RUN_LINES:
+        rendered = f"        {py_str_literal(line)},\n"
+        assert source.count(rendered) == 1, line
+        source = source.replace(rendered, "", 1)
+    return source
+
+
 def _without_outlets(source: str) -> str:
-    return _OUTLETS.sub("", source.replace(_ASSET_IMPORT, "", 1))
+    return _OUTLETS.sub("", _without_scheduler_run(source).replace(_ASSET_IMPORT, "", 1))
 
 
 @pytest.mark.parametrize("case", sorted(ALL_CASES))
@@ -82,7 +93,8 @@ def test_the_cases_cover_files_with_and_without_outlets() -> None:
         f"{case}/{name}"
         for case in CASES
         for name, source in _render(case).items()
-        if source != (GOLDEN / case / f"{name}.before.txt").read_text(encoding="utf-8")
+        if _without_scheduler_run(source)
+        != (GOLDEN / case / f"{name}.before.txt").read_text(encoding="utf-8")
     )
     assert changed == ["spark/daily_curated_dag.py"]
     befores = {p.relative_to(GOLDEN).as_posix() for p in GOLDEN.glob("*/*.before.txt")}

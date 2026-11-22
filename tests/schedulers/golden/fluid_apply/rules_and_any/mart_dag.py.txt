@@ -81,6 +81,8 @@ BASH_COMMAND = "\n".join(
         '  esac',
         '  pass+=("$name=${!name}")',
         'done',
+        'if [ -n "${AIRFLOW_CTX_DAG_ID:-}" ]; then pass+=("FLUID_SCHEDULER_JOB=$AIRFLOW_CTX_DAG_ID"); fi',
+        'if [ -n "${AIRFLOW_CTX_DAG_RUN_ID:-}" ]; then pass+=("FLUID_SCHEDULER_RUN_ID=$AIRFLOW_CTX_DAG_RUN_ID"); fi',
         'cd -- "$FLUID_PROJECT_DIR"',
         'contract="$PWD/$FLUID_DAG_CONTRACT"',
         'if [ ! -f "$contract" ]; then',

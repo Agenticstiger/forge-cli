@@ -11,9 +11,12 @@ or a running stream would be replaced by every deploy.
 
 from __future__ import annotations
 
+import copy
 import datetime
 import logging
 import re
+import sys
+import types
 
 import pytest
 
@@ -26,6 +29,12 @@ from fluid_build.spark import runner_source
 from tests.build_runners.spark.conftest import runs_of
 
 DIGEST = "sha256:" + "ab" * 32
+BUNDLE = "sha256:" + "cd" * 32
+#: What a DAG ``fluid generate schedule`` wrote hands ``fluid apply`` from Airflow's task context.
+SCHEDULED = {
+    "FLUID_SCHEDULER_JOB": "orders__ingest-orders",
+    "FLUID_SCHEDULER_RUN_ID": "scheduled__2026-11-21T00:00:00+00:00",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -35,6 +44,19 @@ def _account(monkeypatch):
         lambda *a, **k: ("123456789012", "eu-west-1"),
     )
     monkeypatch.delenv(_desired.RELEASE_ID_ENV, raising=False)
+    for name in (*SCHEDULED, "AIRFLOW_CTX_DAG_ID", "AIRFLOW_CTX_DAG_RUN_ID"):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
+def no_aws(monkeypatch):
+    """Nothing here reaches AWS: boto3 is a module that fails the test on any use."""
+
+    class Refused(types.ModuleType):
+        def __getattr__(self, name):
+            raise AssertionError(f"the test reached AWS (boto3.{name})")
+
+    monkeypatch.setitem(sys.modules, "boto3", Refused("boto3"))
 
 
 def stamps(**given):
@@ -96,7 +118,9 @@ def test_the_runner_reads_the_flags_these_runs_pass():
     source = runner_source()
     for flag in ("--fluid-product-version", "--fluid-contract-digest"):
         assert f'"{flag}"' in source
-    for flag in ("--fluid-release-id", "--fluid-run-id"):
+    for flag in ("--fluid-release-id", "--fluid-run-id", "--fluid-bundle-digest"):
+        assert f'"{flag}"' in source
+    for flag in ("--fluid-scheduler-job", "--fluid-scheduler-run-id"):
         assert f'"{flag}"' in source
 
 
@@ -264,6 +288,7 @@ def test_a_contract_without_a_spark_build_never_reads_the_release_variable(contr
     assert _apply.prepare(contract, build_id=None, verified_plan=None, dry_run=True) == []
 
 
+@pytest.mark.usefixtures("no_aws")
 def test_the_keepalive_leaves_a_release_a_stamp_may_not_hold_off_and_still_runs(
     contract, monkeypatch, caplog
 ):
@@ -287,6 +312,7 @@ def test_the_keepalive_leaves_a_release_a_stamp_may_not_hold_off_and_still_runs(
     assert "carries no release stamp" in caplog.text
 
 
+@pytest.mark.usefixtures("no_aws")
 def test_reconcile_only_stamps_the_runs_it_starts(contract, monkeypatch):
     seen = []
     monkeypatch.setattr(
@@ -302,3 +328,176 @@ def test_reconcile_only_stamps_the_runs_it_starts(contract, monkeypatch):
         run_id="3f9a3f9a3f9a",
     )
     assert seen and all(run.run_id == "3f9a3f9a3f9a" for run in seen)
+
+
+# --- the scheduler's run and the bundle -----------------------------------------------
+
+
+def test_a_run_a_scheduler_started_is_stamped_with_its_job_and_run(contract):
+    got = _desired.run_stamps(contract, environ=SCHEDULED)
+    assert got["scheduler_job"] == "orders__ingest-orders"
+    assert got["scheduler_run_id"] == "scheduled__2026-11-21T00:00:00+00:00"
+    flags = flag_values(runs_of(contract, stamps=got)[0])
+    assert flags["--fluid-scheduler-job"] == "orders__ingest-orders"
+    assert flags["--fluid-scheduler-run-id"] == "scheduled__2026-11-21T00:00:00+00:00"
+
+
+def test_airflows_task_context_names_the_run_when_fluids_names_do_not(contract):
+    env = {
+        "AIRFLOW_CTX_DAG_ID": "orders__ingest-orders",
+        "AIRFLOW_CTX_DAG_RUN_ID": "manual__2026-11-21T10:15:30.123456+00:00",
+    }
+    got = _desired.run_stamps(contract, environ=env)
+    assert got["scheduler_job"] == "orders__ingest-orders"
+    assert got["scheduler_run_id"] == "manual__2026-11-21T10:15:30.123456+00:00"
+
+
+def test_a_run_no_scheduler_started_carries_no_scheduler_stamp(contract):
+    got = _desired.run_stamps(contract, environ={"FLUID_SCHEDULER_JOB": "a-job-and-no-run"})
+    assert "scheduler_job" not in got and "scheduler_run_id" not in got
+
+
+def test_a_scheduler_value_a_stamp_may_not_hold_is_made_safe_never_refused(contract):
+    env = {"FLUID_SCHEDULER_JOB": "my dag;x", "FLUID_SCHEDULER_RUN_ID": "--run 1\nx"}
+    got = _desired.run_stamps(contract, environ=env)
+    assert got["scheduler_job"] == "my_dag_x" and got["scheduler_run_id"] == "run_1_x"
+    assert all(
+        _desired.STAMP_VALUE.fullmatch(got[k]) for k in ("scheduler_job", "scheduler_run_id")
+    )
+    assert (
+        len(
+            _desired.run_stamps(contract, environ={"FLUID_SCHEDULER_RUN_ID": "r" * 400})[
+                "scheduler_run_id"
+            ]
+        )
+        == 256
+    )
+    assert "scheduler_run_id" not in _desired.run_stamps(
+        contract, environ={"FLUID_SCHEDULER_RUN_ID": "-- "}
+    )
+
+
+def test_the_bundle_is_the_one_the_verified_plan_binds(contract):
+    assert _desired.run_stamps(contract, bundle_digest=BUNDLE)["bundle_digest"] == BUNDLE
+    assert "bundle_digest" not in _desired.run_stamps(contract)
+
+
+@pytest.mark.parametrize("value", ["", "two words", "x" * 300, "-sha256:ab", 7])
+def test_a_bundle_digest_a_stamp_may_not_hold_is_left_off(contract, value, caplog):
+    with caplog.at_level(logging.WARNING):
+        got = _desired.run_stamps(contract, bundle_digest=value)
+    assert "bundle_digest" not in got and "contract_digest" in got
+
+
+def test_the_new_stamps_never_change_the_config_hash_either(contract):
+    plain = runs_of(contract)[0]
+    given = _desired.run_stamps(contract, environ=SCHEDULED, bundle_digest=BUNDLE)
+    stamped = runs_of(contract, stamps=given)[0]
+    assert stamped.config_hash == plain.config_hash and stamped == plain
+    assert stamped.plan_action(0) == plain.plan_action(0)
+    assert set(_identity(stamped.entry_args())) <= {"config_hash", "source_id", "checkpoint_id"}
+
+
+def test_prepare_stamps_the_bundle_the_bound_plan_names(contract):
+    plan = {"actions": _apply.planned_actions(contract), "planDigest": "x", "bundleDigest": BUNDLE}
+    (run,) = _apply.prepare(contract, build_id=None, verified_plan=plan, dry_run=True, run_id="r1")
+    assert run.bundle_digest == BUNDLE and flag_values(run)["--fluid-bundle-digest"] == BUNDLE
+    (unbound,) = _apply.prepare(contract, build_id=None, verified_plan=None, dry_run=True)
+    assert unbound.bundle_digest is None and "--fluid-bundle-digest" not in unbound.stamp_args()
+
+
+@pytest.mark.usefixtures("no_aws")
+def test_prepare_and_the_keepalive_stamp_the_schedulers_run(contract, monkeypatch):
+    for name, value in SCHEDULED.items():
+        monkeypatch.setenv(name, value)
+    (run,) = _apply.prepare(contract, build_id=None, verified_plan=None, dry_run=True)
+    assert (run.scheduler_job, run.scheduler_run_id) == tuple(SCHEDULED.values())
+    seen = []
+    monkeypatch.setattr(
+        "fluid_build.build_runners.spark._reconcile.reconcile",
+        lambda runs, *a, **k: seen.extend(runs) or [],
+    )
+    monkeypatch.setattr(_apply, "_require_boto3", lambda: None)
+    _apply.reconcile_only(contract, logging.getLogger("test"), build_id=None, dry_run=True)
+    assert seen and all(r.scheduler_run_id == SCHEDULED["FLUID_SCHEDULER_RUN_ID"] for r in seen)
+
+
+def test_the_flags_come_in_one_order(contract):
+    given = {**stamps(), **_desired.run_stamps(contract, environ=SCHEDULED, bundle_digest=BUNDLE)}
+    contract["exposes"][0]["version"] = "1.4.0"
+    args = runs_of(contract, stamps=given)[0].stamp_args()
+    assert args[::2] == [
+        "--fluid-product-version",
+        "--fluid-contract-digest",
+        "--fluid-bundle-digest",
+        "--fluid-release-id",
+        "--fluid-run-id",
+        "--fluid-scheduler-job",
+        "--fluid-scheduler-run-id",
+    ]
+
+
+# --- a scheduled build started from a plan ----------------------------------------------
+
+
+def _captured_stamps(monkeypatch):
+    """The stamps each ``desired_runs`` call is handed, as ``run_build`` hands them."""
+    seen = []
+    real = _desired.desired_runs
+
+    def spy(contract, **kwargs):
+        seen.append(kwargs.get("stamps"))
+        return real(contract, account=ACCOUNT_FOR_RUNS, **kwargs)
+
+    monkeypatch.setattr(_desired, "desired_runs", spy)
+    return seen
+
+
+ACCOUNT_FOR_RUNS = "123456789012"
+
+
+def test_a_build_from_a_plan_hashes_the_contract_as_written_and_stamps_the_plans_bundle(
+    contract, monkeypatch
+):
+    from fluid_build.build_runners.spark._reconcile import run_build
+
+    contract["exposes"][0]["description"] = "{{ env.REGION_NAME }}"
+    monkeypatch.setenv("REGION_NAME", "eu-west-1")
+    resolved = copy.deepcopy(contract)
+    resolved["exposes"][0]["description"] = "eu-west-1"  # as run_builds_from_args resolves it
+    seen = _captured_stamps(monkeypatch)
+    build = resolved["builds"][0]
+    source = _desired.StampSource(contract, BUNDLE)
+    assert run_build(resolved, build, dry_run=True, stamp_source=source) is None
+    (stamped,) = seen
+    assert stamped["contract_digest"] == compute_contract_digest(contract)
+    assert stamped["bundle_digest"] == BUNDLE
+    seen.clear()
+    run_build(contract, contract["builds"][0], dry_run=True)  # a contract file: no plan, no bundle
+    assert seen[0]["contract_digest"] == compute_contract_digest(contract)
+    assert "bundle_digest" not in seen[0]
+
+
+def test_run_builds_hands_a_plans_spark_build_the_contract_as_written_and_its_bundle(
+    contract, monkeypatch, tmp_path
+):
+    import argparse
+
+    from fluid_build.build_runners import base
+
+    contract["exposes"][0]["description"] = "{{ env.REGION_NAME }}"
+    monkeypatch.setenv("REGION_NAME", "eu-west-1")
+    plan = tmp_path / "plan.json"
+    plan.write_text("{}", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(base, "_execute_spark_build", lambda *a, **k: calls.append((a, k)) or 0)
+    args = argparse.Namespace(
+        contract=str(plan), build_id=None, dry_run=True, delay=0, no_output=True,
+        fail_fast=False, env=None,
+    )  # fmt: skip
+    plan_data = {"contract": copy.deepcopy(contract), "bundleDigest": BUNDLE, "planDigest": "x"}
+    base.run_builds_from_args(args, logging.getLogger("test"), plan_data=plan_data)
+    ((positional, keywords),) = calls
+    assert positional[0]["exposes"][0]["description"] == "eu-west-1"  # the run is resolved
+    # the digest is the contract's as written, and the bundle the verified plan's
+    assert keywords["stamp_source"] == _desired.StampSource(contract, BUNDLE)

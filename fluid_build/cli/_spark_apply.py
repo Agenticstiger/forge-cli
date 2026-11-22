@@ -55,21 +55,29 @@ def _desired(contract: Mapping[str, Any], event: str, **kwargs: Any) -> List[Des
 
 
 def _stamps(
-    contract: Mapping[str, Any], run_id: Optional[str], *, refuse_release: bool = True
+    contract: Mapping[str, Any],
+    run_id: Optional[str],
+    *,
+    refuse_release: bool = True,
+    verified_plan: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, str]:
     """What the runner stamps on each commit besides the job config's own: the contract's
-    digest, the pipeline's ``run_id`` and ``FLUID_RELEASE_ID`` (``_desired.run_stamps``). A
-    deploy refuses a release a stamp may not hold; ``--mode reconcile`` (``refuse_release``
-    off) leaves it off with a warning, so a mis-set variable cannot stop the keepalive from
-    restarting a dead stream.
+    digest, the bundle ``verified_plan`` binds (its ``bundleDigest``, checked before this runs),
+    the pipeline's ``run_id``, ``FLUID_RELEASE_ID`` and the scheduler's run
+    (``_desired.run_stamps``). A deploy refuses a release a stamp may not hold;
+    ``--mode reconcile`` (``refuse_release`` off) leaves it off with a warning, so a mis-set
+    variable cannot stop the keepalive from restarting a dead stream.
 
     Raises:
         CLIError: ``apply_spark_invalid`` (``FLUID_RELEASE_ID`` holds a character a stamp may not).
     """
     from fluid_build.build_runners.spark._desired import run_stamps
 
+    bundle = verified_plan.get("bundleDigest") if verified_plan is not None else None
     try:
-        return run_stamps(contract, run_id=run_id, refuse_release=refuse_release)
+        return run_stamps(
+            contract, run_id=run_id, refuse_release=refuse_release, bundle_digest=bundle
+        )
     except ValueError as exc:
         raise _cli_error("apply_spark_invalid", {"error": f"{exc}; nothing was started"}) from exc
 
@@ -135,7 +143,8 @@ def prepare(
                 },
             )
         return []
-    runs = _desired(contract, "apply_spark", stamps=_stamps(contract, run_id))
+    stamps = _stamps(contract, run_id, verified_plan=verified_plan)
+    runs = _desired(contract, "apply_spark", stamps=stamps)
     if verified_plan is not None:
         planned = [
             _comparable(a)
