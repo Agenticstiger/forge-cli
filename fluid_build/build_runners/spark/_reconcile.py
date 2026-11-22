@@ -41,6 +41,12 @@ run match the contract, idempotently:
      ``StartLimitIntervalSec`` (a clean stop is never restarted). Unlike both, a spent
      budget is not final: a restart is allowed again once the oldest is an hour old.
 
+A new config that replaced another is watched for ``FLUID_SPARK_RELEASE_PROBATION_SECONDS``
+(:func:`_probation`); one that fails it is marked (:func:`_mark_failed`: no later apply starts it
+again without ``FLUID_SPARK_ACCEPT_FAILED_RELEASE``) and replaced by the config it replaced
+(:func:`_roll_back`), when that one is a config to go back to (:func:`_rollback_target`) and the
+rollback does not write records into an output a second time (:func:`_rollback_plan`).
+
 ``fluid apply --mode reconcile`` (``only``) runs no ``tofu`` and applies no plan: it starts a
 stream again only when what the last apply deployed (the job config it uploaded, and the
 config hash its runs carry) is what the contract compiles to, and otherwise starts nothing
@@ -64,6 +70,7 @@ poll a second longer each time, at most :data:`MAX_POLL_S`.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 import re
@@ -78,20 +85,25 @@ from fluid_build.build_runners.spark._adapters import (
     CANCELLING,
     FAILED,
     PENDING,
+    RUNNING,
     SERVICE_RETRIES,
     SUCCEEDED,
     TERMINAL,
     Adapter,
     ClientFactory,
+    MarkerReadDenied,
     RunInfo,
     SparkRunError,
     adapter_for,
     usable_stop_key,
 )
 from fluid_build.build_runners.spark._desired import (
+    ACCEPT_FAILED_ENV,
+    PROBATION_ENV,
     RESTART_WINDOW_S,
     STOP_GRACE_ENV,
     DesiredRun,
+    config_digest,
 )
 
 MAX_POLL_S = 15.0
@@ -107,6 +119,17 @@ WAIT_ENV = "FLUID_SPARK_WAIT_SECONDS"
 #: How long a stream asked to stop between batches has before it is cancelled
 #: (``STOP_GRACE_ENV``); 0 cancels at once.
 DEFAULT_STOP_GRACE_S = 300
+#: How long a released stream's new run is watched (``PROBATION_ENV``); 0 keeps it at once. Five
+#: minutes, as the Flink Kubernetes operator waits for an upgrade to be stable.
+DEFAULT_PROBATION_S = 300
+#: The error-catalog events a release that failed its probation ends with (``fluid_build/
+#: _error_catalog.py``): nothing was rolled back because the old checkpoint would write the
+#: same records again, because the config before it did not end cleanly, or a config that
+#: failed its probation earlier is not started again.
+ROLLBACK_UNSAFE = "apply_spark_rollback_unsafe"
+NO_GOOD_CONFIG = "apply_spark_no_known_good_config"
+FAILED_EARLIER = "apply_spark_release_failed_earlier"
+READ_DENIED = "apply_spark_artifact_read_denied"
 
 
 @dataclass
@@ -126,6 +149,10 @@ class Outcome:
     cancelled: List[str] = field(default_factory=list)
     #: The runs of another config that ended once asked to stop between batches.
     stopped: List[str] = field(default_factory=list)
+    #: The error-catalog event the apply fails with (:data:`ROLLBACK_UNSAFE` and its kin).
+    code: Optional[str] = None
+    #: A Ctrl-C, SIGTERM or SIGHUP cut the rollback short: the apply stops as an interrupt does.
+    interrupted: bool = False
 
     def line(self) -> str:
         run = f" run {self.run_id}" if self.run_id else ""
@@ -146,6 +173,7 @@ class Outcome:
             "error": self.error,
             "cancelled": list(self.cancelled),
             "stopped": list(self.stopped),
+            "code": self.code,
         }
 
 
@@ -169,14 +197,38 @@ def wait_budget(env: Optional[Mapping[str, str]] = None) -> float:
     return value if value > 0 else DEFAULT_WAIT_S
 
 
+#: The most a grace or a probation may be (a project's .env may set either): an hour.
+MAX_WAIT_SETTING_S = 3600.0
+
+
+def _seconds(env: Optional[Mapping[str, str]], name: str, default: float) -> float:
+    """A number of seconds that ``name`` sets, from 0 to :data:`MAX_WAIT_SETTING_S`; else
+    ``default``."""
+    raw = (os.environ if env is None else env).get(name)
+    try:
+        value = float(raw) if raw else float(default)
+    except ValueError:
+        return float(default)
+    if not math.isfinite(value) or value < 0:
+        return float(default)
+    return min(value, MAX_WAIT_SETTING_S)
+
+
 def stop_grace(env: Optional[Mapping[str, str]] = None) -> float:
     """``FLUID_SPARK_STOP_GRACE_SECONDS``: a number from 0, else :data:`DEFAULT_STOP_GRACE_S`."""
-    raw = (os.environ if env is None else env).get(STOP_GRACE_ENV)
-    try:
-        value = float(raw) if raw else float(DEFAULT_STOP_GRACE_S)
-    except ValueError:
-        return float(DEFAULT_STOP_GRACE_S)
-    return value if math.isfinite(value) and value >= 0 else float(DEFAULT_STOP_GRACE_S)
+    return _seconds(env, STOP_GRACE_ENV, DEFAULT_STOP_GRACE_S)
+
+
+def release_probation(env: Optional[Mapping[str, str]] = None) -> float:
+    """``FLUID_SPARK_RELEASE_PROBATION_SECONDS``: from 0, else :data:`DEFAULT_PROBATION_S`."""
+    return _seconds(env, PROBATION_ENV, DEFAULT_PROBATION_S)
+
+
+def accept_failed_release(env: Optional[Mapping[str, str]] = None) -> bool:
+    """``FLUID_SPARK_ACCEPT_FAILED_RELEASE``: the operator's go-ahead to start a config that
+    failed its probation again. Only ``1``, ``true`` or ``yes``."""
+    raw = (os.environ if env is None else env).get(ACCEPT_FAILED_ENV)
+    return str(raw or "").strip().lower() in ("1", "true", "yes")
 
 
 class _Clock:
@@ -188,24 +240,29 @@ class _Clock:
     ) -> RunInfo:
         """Poll ``read`` until ``done`` or the budget is spent; the last read either way.
 
-        A read that fails (a throttled call) is tried again; :data:`MAX_FAILED_READS` in a
-        row raise the last error, and the run is left as it is (a retried build adopts
-        it), as the Databricks job-run waiter does."""
+        A read that fails (a throttled call), the first one included, is tried again;
+        :data:`MAX_FAILED_READS` in a row raise the last error, and the run is left as it is
+        (a retried build adopts it), as the Databricks job-run waiter does."""
         deadline = self.now() + budget
         delay = 1.0
-        info = read()
+        info: Optional[RunInfo] = None
         failures = 0
-        while not done(info) and self.now() < deadline:
-            self.sleep(min(delay, max(0.0, deadline - self.now())))
-            delay = min(delay + 1.0, MAX_POLL_S)
+        while True:
             try:
                 info = read()
                 failures = 0
+                if done(info) or self.now() >= deadline:
+                    return info
             except Exception:  # noqa: BLE001 - counted; the last one is raised
                 failures += 1
                 if failures >= MAX_FAILED_READS:
                     raise
-        return info
+                if info is not None and self.now() >= deadline:
+                    return info
+            # Nothing read yet: a pause of its own, whatever the budget.
+            pause = delay if info is None else min(delay, max(0.0, deadline - self.now()))
+            self.sleep(pause)
+            delay = min(delay + 1.0, MAX_POLL_S)
 
 
 def _token(run: DesiredRun) -> str:
@@ -472,6 +529,8 @@ def _reconcile_one(
     wall: Callable[[], float] = time.time,
     confirm: Optional[Callable[[str], bool]] = None,
     grace: float = DEFAULT_STOP_GRACE_S,
+    probation: float = 0.0,
+    accept_failed: bool = False,
 ) -> Outcome:
     out = Outcome(run.build, run.runtime, "unchanged", where=adapter.where())
     now = wall()
@@ -496,6 +555,8 @@ def _reconcile_one(
         out.run_id, out.state = current.run_id, current.state
         if current.attempt and current.attempt > 1:
             out.message = f"attempt {current.attempt}: the job has restarted after failures"
+        if not only and not dry_run and current.state == RUNNING:
+            _keep_record(adapter, out, current)  # a start that was still pending had none kept
         return out
     start = _Start()
     if last is not None and last.config_hash == run.config_hash:
@@ -511,6 +572,22 @@ def _reconcile_one(
         if decided is None:
             return out
         start = decided
+    try:
+        earlier = None if matching else _earlier_failure(adapter, run)
+    except MarkerReadDenied as exc:
+        out.action, out.error, out.code = "refused", True, READ_DENIED
+        out.message = f"{_clean(exc)}; nothing was started"
+        return out
+    if earlier is not None and not accept_failed:
+        # Stopped before anything is: a run of another config keeps going.
+        out.action, out.error, out.code = "refused", True, FAILED_EARLIER
+        out.message = (
+            f"this config ({run.config_hash[:12]}) failed its probation earlier ({earlier}), so "
+            "fluid apply does not start it again: change the contract to fix it, or set "
+            f"{ACCEPT_FAILED_ENV}=1 for one fluid apply to start it anyway"
+            + (f"; run {stale[0].run_id} of another config was left running" if stale else "")
+        )
+        return out
     # With the new config already writing the checkpoint, a run of another config there is a
     # second writer: it is cancelled at once, never asked and waited for.
     grace = 0.0 if matching else grace
@@ -528,7 +605,537 @@ def _reconcile_one(
         out.run_id, out.state = matching[0].run_id, matching[0].state
         return out
     start.release = _release_text(run, stale or ([last] if last else []), notes, history)
-    return _start(run, adapter, start, out, clock=clock, budget=budget, since=since)
+    out = _start(run, adapter, start, out, clock=clock, budget=budget, since=since)
+    if earlier is not None and out.action in ("started", "restarted"):
+        adapter.clear_failed(run.config_hash)  # the operator went ahead: it is on trial again
+        out.message = _joined(
+            out.message,
+            f"started although it failed its probation earlier ({earlier}): {ACCEPT_FAILED_ENV} "
+            "was set",
+        )
+    target, no_good = _rollback_target(adapter, run, stale, last)
+    return _after_start(
+        adapter,
+        out,
+        target,
+        only=only,
+        clock=clock,
+        budget=budget,
+        window=probation,
+        no_good=no_good,
+    )
+
+
+def _earlier_failure(adapter: Adapter, run: DesiredRun) -> Optional[str]:
+    """What the failed-probation marker of ``run``'s config says (the run and when), or None
+    when the config has not failed one.
+
+    Raises:
+        SparkRunError: the marker cannot be read: nothing is started.
+    """
+    import json
+
+    body = adapter.failed_release(run.config_hash)
+    if body is None:
+        return None
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        data = None
+    if not isinstance(data, Mapping):
+        return "a marker without details"
+    return f"run {_clean(data.get('runId')) or '?'} at {_clean(data.get('failedAt')) or '?'}"
+
+
+def _rollback_target(
+    adapter: Adapter, run: DesiredRun, stale: Sequence[RunInfo], last: Optional[RunInfo]
+) -> Tuple[Optional[RunInfo], str]:
+    """The run whose config a new config that fails its probation goes back to, and why none:
+    a config is good when its run was RUNNING on its first attempt when this apply replaced it
+    (``stale``: forge's own stop or cancel during the release counts), or its last run ended
+    SUCCEEDED, and it did not fail a probation of its own. One whose last run failed, was lost,
+    or was cancelled before this apply, or that never ran (PENDING), was being retried by its
+    runtime or was being cancelled when replaced, is no config to go back to: a failed run would
+    start again past its restart budget, and an operator may have cancelled one because it
+    wrote bad data."""
+    replaced = [s for s in stale if s.config_hash != run.config_hash]
+    sound = [s for s in replaced if s.state == RUNNING and (s.attempt or 1) <= 1]
+    previous = sound[0] if sound else (replaced[0] if replaced else last)
+    if previous is None or previous.config_hash == run.config_hash:
+        return None, ""  # nothing came before it
+    older = _clean(previous.config_hash)[:12] or "?"
+    if replaced and not sound:
+        attempt = f" on attempt {previous.attempt}" if (previous.attempt or 1) > 1 else ""
+        return None, (
+            f"the config before it ({older}, run {previous.run_id}) was "
+            f"{_clean(previous.raw_state or previous.state)}{attempt} when this apply replaced "
+            "it, which is no config to go back to"
+        )
+    if not replaced and previous.state != SUCCEEDED:
+        return None, (
+            f"the config before it ({older}, run {previous.run_id}) ended "
+            f"{_clean(previous.raw_state or previous.state)} before this apply, which is no "
+            "config to go back to"
+        )
+    try:
+        failed_before = adapter.failed_release(previous.config_hash) is not None
+    except Exception:  # noqa: BLE001 - a marker that cannot be read is no good news
+        failed_before = True
+    if failed_before:
+        return None, (
+            f"the config before it ({older}, run {previous.run_id}) failed its own probation, "
+            "which is no config to go back to"
+        )
+    return previous, ""
+
+
+def _after_start(
+    adapter: Adapter,
+    out: Outcome,
+    last_good: Optional[RunInfo],
+    *,
+    only: bool = False,
+    clock: _Clock,
+    budget: float,
+    window: float,
+    no_good: str = "",
+) -> Outcome:
+    """What follows a start: the started run's release record is kept, for a later release to
+    roll back to; and when the start released a new config over ``last_good``, the run that
+    replaced it is watched for ``window`` seconds (:func:`_probation`), and one that fails is
+    marked as failed (:func:`_mark_failed`) and replaced by ``last_good``'s config again
+    (:func:`_roll_back`). ``no_good`` says why the config it replaced is none to go back to
+    (:func:`_rollback_target`): the run is watched all the same, and a failure is reported."""
+    if out.action not in ("started", "restarted") or out.run_id is None or only:
+        return out  # --mode reconcile keeps no record (its role may not write one) and rolls back nothing
+    if out.state == RUNNING:
+        _keep_record(adapter, out)
+    if (last_good is None and not no_good) or window <= 0:
+        return out
+    new_id = str(out.run_id)
+    if out.state in (FAILED, SUCCEEDED):  # it ended at once: the outcome already says how
+        failed: Optional[RunInfo] = RunInfo(new_id, str(out.state), str(out.state))
+        head = out.message
+    elif out.state == RUNNING:
+        try:
+            failed = _probation(adapter, out, clock, window)
+        except Exception as exc:  # noqa: BLE001 - the run is going: say so with the error
+            out.error = True
+            out.message = _joined(
+                out.message,
+                f"checking on run {new_id} during its probation failed: {_error_text(exc)}. It "
+                "is left going, and the next fluid apply reports it",
+            )
+            return out
+        if failed is None:
+            out.message = _joined(out.message, f"it ran through its probation ({int(window)} s)")
+            return out
+        if failed.state in (CANCELLED, SUCCEEDED):
+            # Stopped from outside (an operator's cancel, another fluid apply's stop): no failure
+            # of the new config, and no rollback against that stop.
+            out.state = failed.state
+            out.message = _joined(
+                out.message,
+                f"run {new_id} was stopped during its probation ({failed.raw_state}), so nothing "
+                "was rolled back",
+            )
+            return out
+        if failed.state in TERMINAL:
+            reason = _failure_text(failed)
+        else:
+            reason = f"run {new_id} was retried by the runtime (attempt {failed.attempt})"
+        head = _joined(out.message, f"run {new_id} failed its probation: {reason}")
+    else:  # still starting or cancelled at once: the next fluid apply reports it
+        return out
+    head = _joined(head, _mark_failed(adapter, out, head))
+    if last_good is None:
+        return _no_good_config(out, failed, head, no_good)
+    return _roll_back(adapter, out, failed, last_good, head, clock=clock, budget=budget)
+
+
+def _joined(*parts: str) -> str:
+    return "; ".join(p for p in parts if p)
+
+
+def _mark_failed(adapter: Adapter, out: Outcome, reason: str) -> str:
+    """Mark the config of the run that failed its probation, so no later ``fluid apply`` starts
+    it again as it stands (:func:`_earlier_failure`); a note when the marker cannot be kept."""
+    try:
+        adapter.mark_failed(adapter.run.config_hash, str(out.run_id), reason)
+    except Exception as exc:  # noqa: BLE001 - a note: the rollback goes on
+        return (
+            f"no failed-release marker was kept ({_error_text(exc)}), so a later fluid apply "
+            "may start this config again"
+        )
+    return ""
+
+
+def _no_good_config(out: Outcome, failed: RunInfo, head: str, no_good: str) -> Outcome:
+    """A new config failed its probation over one that is none to go back to: nothing is
+    rolled back, and the outcome says the stream is down (the run that failed is left as it
+    is when the runtime still retries it)."""
+    out.action, out.error, out.code = "failed", True, NO_GOOD_CONFIG
+    down = (
+        "the stream is down"
+        if failed.state in TERMINAL
+        else f"run {out.run_id} is left as the runtime retries it"
+    )
+    out.message = (
+        f"{head}; {no_good}; nothing was rolled back, and {down}. Fix the contract and run "
+        "fluid apply"
+    )
+    return out
+
+
+def _keep_record(adapter: Adapter, out: Outcome, current: Optional[RunInfo] = None) -> None:
+    """Keep the started run's job config as a release record; a record that cannot be kept is a
+    note: the run is going, and only a later rollback to it needs the record. ``current``, a run
+    that already goes (an apply that changes nothing), is left alone when its record is there and
+    is the job config it ran (the digest the run carries, else the one this apply compiled):
+    nothing is read back or written."""
+    if current is not None:
+        digest = current.job_sha256 or _job_digest(adapter.run)
+        try:
+            body = adapter.release_config(dataclasses.replace(current, job_sha256=digest))
+            if body is not None and config_digest(body.decode("utf-8")) == digest:
+                return
+        except Exception:  # noqa: BLE001 - unreadable: written again below
+            pass
+    try:
+        adapter.keep_release(adapter.checked())
+    except Exception as exc:  # noqa: BLE001 - a note, never the start's error
+        out.message = _joined(
+            out.message,
+            f"no release record was kept ({_error_text(exc)}), so a later release cannot roll "
+            "back to this config",
+        )
+
+
+def _probation(adapter: Adapter, out: Outcome, clock: _Clock, window: float) -> Optional[RunInfo]:
+    """Watch the new run for ``window`` seconds: the read that shows it failed (it ended, or the
+    service retried it, a higher attempt than it started with), or None when it ran through.
+    Borrowed: the Flink Kubernetes operator rolls an upgrade back unless the job is seen running
+    within ``kubernetes.operator.deployment.readiness.timeout``; a stream that reaches RUNNING
+    often fails in its first batches, so forge watches the whole window."""
+    run_id = str(out.run_id)
+    first = clock.until(lambda: adapter.get(run_id), lambda _seen: True, 0.0)  # reads are retried
+    base = first.attempt or 1
+
+    def failed(seen: RunInfo) -> bool:
+        return seen.state in TERMINAL or (seen.attempt or 1) > base
+
+    if failed(first):
+        return first
+    seen = clock.until(lambda: adapter.get(run_id), failed, window)
+    return seen if failed(seen) else None
+
+
+def _roll_back(
+    adapter: Adapter,
+    out: Outcome,
+    failed: RunInfo,
+    last_good: RunInfo,
+    head: str,
+    *,
+    clock: _Clock,
+    budget: float,
+) -> Outcome:
+    """Replace the new run that failed its probation by ``last_good``'s config: its job config
+    from the release record (checked against the digest the runtime recorded when forge started
+    ``last_good``), with the runner and settings this apply compiled, on its checkpoint. The
+    outcome is an error either way: the release did not hold."""
+    new_id = str(out.run_id)
+    older = _clean(last_good.config_hash)[:12] or "?"
+    out.action, out.error = "failed", True
+    current = adapter.checked()
+    if last_good.job_sha256 and last_good.job_sha256 == _job_digest(current):
+        out.message = (
+            f"{head}; the release changed only the run's settings or runner, not its job config, "
+            "and forge rolls back the job config only, so nothing was rolled back. Fix the "
+            "contract and run fluid apply"
+        )
+        return out
+    text, why = _record_text(adapter, last_good)
+    if text is None:
+        out.message = (
+            f"{head}; config {older} of run {last_good.run_id} cannot be started again: {why}. "
+            "Fix the contract and run fluid apply"
+        )
+        return out
+    plan = _rollback_plan(current, text, last_good, new_id)
+    # Stage of the window an interrupt cut: the failed run still going, being cancelled, ended
+    # with nothing started, or the rollback started (:func:`_interrupted`).
+    stage = ["going" if failed.state not in TERMINAL else "ended"]
+    rb_ids: List[str] = []
+    try:
+        from fluid_build.build_runners._databricks_job_run import interrupt_guard
+
+        # A SIGTERM or SIGHUP is a Ctrl-C here, so the window ends in an outcome that says where
+        # it stopped, never in silence: the failed config is marked, so no later apply restarts it.
+        with interrupt_guard(lambda: None):
+            if failed.state not in TERMINAL:
+                stage[0] = "cancelling"
+                adapter.cancel(new_id)
+                out.cancelled.append(new_id)
+                ended = clock.until(
+                    lambda: adapter.get(new_id), lambda i: i.state in TERMINAL, budget
+                )
+                if ended.state not in TERMINAL:
+                    out.message = (
+                        f"{head}; it was cancelled but is still {ended.raw_state} after "
+                        f"{int(budget)} s ({WAIT_ENV}), so config {older} was not started again"
+                    )
+                    return out
+            stage[0] = "ended"
+            if plan.unsafe:
+                out.code = ROLLBACK_UNSAFE
+                out.message = f"{head}; {plan.unsafe_text(older, new_id)}"
+                return out
+            others = [h for h in adapter.runs() if h.active and h.run_id != new_id]
+            if others:  # another fluid apply has started a run since: one writer on the checkpoint
+                out.message = (
+                    f"{head}; run {others[0].run_id} is going on the checkpoint (another fluid "
+                    f"apply), so config {older} was not started again"
+                )
+                return out
+            stage[0] = "starting"
+            back = _rollback_run(current, last_good, text)
+            again = adapter.sibling(back)
+            rb_id = again.start(_token(back))
+            rb_ids.append(rb_id)
+            stage[0] = "started"
+            out.action, out.run_id, out.state = "rolled-back", rb_id, None
+            out.message = _joined(
+                f"{head}; rolled back to config {older}: run {rb_id} started from its release "
+                "record on its checkpoint",
+                plan.note,
+            )
+            first = _first_copy(adapter, back, rb_id)
+            if first is not None:
+                again.cancel(rb_id)
+                out.cancelled.append(rb_id)
+                out.run_id, out.state = first.run_id, first.state
+                out.message = _joined(
+                    f"{head}; rolled back to config {older}: run {first.run_id} of it started "
+                    f"first (another fluid apply at the same time); run {rb_id}, which this "
+                    "one started, was cancelled",
+                    plan.note,
+                )
+                return out
+            try:
+                rb = clock.until(lambda: again.get(rb_id), lambda i: i.state != PENDING, budget)
+            except Exception as exc:  # noqa: BLE001 - the run is going: say so with the error
+                out.message = _joined(
+                    f"{head}; rolled back to config {older}: run {rb_id} was started from its "
+                    f"release record, but checking on it failed: {_error_text(exc)}",
+                    plan.note,
+                )
+                return out
+            out.state = rb.state
+            if rb.state in TERMINAL:
+                out.message = _joined(f"{out.message}, and {_failure_text(rb)}")
+            return out
+    except KeyboardInterrupt:
+        return _interrupted(out, head, older, new_id, stage[0], rb_ids)
+    except Exception as exc:  # noqa: BLE001 - the rollback's error is the outcome, with the rest
+        if rb_ids:  # a read of the rollback run failed after it started
+            out.message = (
+                f"{head}; rolled back to config {older}: run {rb_ids[0]} was started from its "
+                f"release record, but checking on it failed: {_error_text(exc)}"
+            )
+            return out
+        out.message = f"{head}; rolling back to config {older} failed: {_error_text(exc)}"
+        return out
+
+
+@dataclass(frozen=True)
+class _Plan:
+    """Whether a rollback is safe for the data, and what it leaves behind: ``unsafe`` when the
+    release moved the checkpoint and the old config writes an output the failed run wrote, so
+    its old checkpoint would write those records a second time; ``note`` is what the outcome
+    says about what the failed release's batches left in the sink."""
+
+    unsafe: bool
+    note: str
+    old_checkpoint: str = ""
+    new_checkpoint: str = ""
+    shared: str = ""
+
+    def unsafe_text(self, older: str, new_id: str) -> str:
+        return (
+            f"config {older} was not started again, and run {new_id} is not running: the release "
+            f"moved the checkpoint (from {self.old_checkpoint or '?'} to "
+            f"{self.new_checkpoint or '?'}), and config {older} writes {self.shared}, which run "
+            f"{new_id} wrote as well. On its old checkpoint it would resume from an offset before "
+            f"the ones run {new_id} already processed and write those records into it a second "
+            "time. The stream is down. To go back on purpose, apply the previous contract again "
+            "and expect those records twice; to go on, fix the contract and run fluid apply"
+        )
+
+
+def _rollback_plan(current: DesiredRun, text: str, last_good: RunInfo, new_id: str) -> _Plan:
+    """:class:`_Plan` for rolling ``current``'s release (run ``new_id``) back to the config
+    ``text`` is the job config of. The checkpoint moved when the two runs' checkpoint ids
+    differ; the outputs are the sink table and the dead-letter table or topic of each job
+    config, and an output one of them does not name is taken to be shared."""
+    import json
+
+    moved = last_good.checkpoint_id != current.checkpoint_id
+    try:
+        old, new = json.loads(text), json.loads(current.job_text)
+    except ValueError:
+        old, new = {}, {}
+    if not isinstance(old, Mapping) or not isinstance(new, Mapping):
+        old, new = {}, {}
+    if not moved:
+        return _Plan(
+            False,
+            f"the batches run {new_id} committed to the sink stay there, and the rolled-back run "
+            f"resumes the checkpoint after them, so it does not read them again",
+        )
+    old_table, new_table = _sink_table(old), _sink_table(new)
+    old_dead, new_dead = _dead_letter(old), _dead_letter(new)
+    shared = ""
+    # Glue and Spark resolve names without regard to case, so a case-only difference is the
+    # same table.
+    if old_table is None or new_table is None or old_table.casefold() == new_table.casefold():
+        shared = f"the output {old_table or new_table or '(unknown)'}"
+    elif (
+        old_dead is not None
+        and new_dead is not None
+        and (old_dead[0], old_dead[1].casefold()) == (new_dead[0], new_dead[1].casefold())
+    ):
+        shared = f"the dead-letter {old_dead[0]} {old_dead[1]}"
+    old_ck, new_ck = str(old.get("checkpoint") or ""), str(new.get("checkpoint") or "")
+    if shared:
+        return _Plan(True, "", old_ck, new_ck, shared)
+    return _Plan(
+        False,
+        f"the checkpoint moved with the release, so run {new_id}'s sink {new_table} keeps what it "
+        f"wrote and the rolled-back run writes {old_table} from its old checkpoint",
+        old_ck,
+        new_ck,
+    )
+
+
+def _sink_table(config: Mapping[str, Any]) -> Optional[str]:
+    sink = config.get("sink")
+    table = sink.get("table") if isinstance(sink, Mapping) else None
+    return str(table) if table else None
+
+
+def _dead_letter(config: Mapping[str, Any]) -> Optional[Tuple[str, str]]:
+    """The dead-letter output of a job config: ``("table" | "topic", name)``, or None."""
+    block = config.get("deadLetter")
+    if not isinstance(block, Mapping):
+        return None
+    for kind in ("table", "topic"):
+        if block.get(kind):
+            return kind, str(block[kind])
+    return None
+
+
+def _first_copy(adapter: Adapter, back: DesiredRun, rb_id: str) -> Optional[RunInfo]:
+    """The run of the rollback config that started before ``rb_id`` (two applies that rolled
+    back at once start a pair: the younger cancels itself, as :func:`_start` does), or None."""
+    first = _oldest(
+        [
+            h
+            for h in adapter.runs()
+            if h.active and h.config_hash == back.config_hash and h.state != CANCELLING
+        ]
+    )
+    return first[0] if first and first[0].run_id != rb_id else None
+
+
+def _interrupted(
+    out: Outcome, head: str, older: str, new_id: str, stage: str, rb_ids: Sequence[str]
+) -> Outcome:
+    """The outcome of a rollback a Ctrl-C, SIGTERM or SIGHUP cut short: where it stopped, and
+    that the failed config is marked, so a later ``fluid apply`` does not start it again."""
+    out.interrupted, out.error = True, True
+    out.action = "failed"
+    if stage == "started" and rb_ids:
+        out.action, out.run_id, out.state = "rolled-back", rb_ids[0], None
+        what = (
+            f"interrupted: rolled back to config {older}, run {rb_ids[0]} was started from its "
+            "release record and was not checked on"
+        )
+    elif stage == "going":
+        what = (
+            f"interrupted before run {new_id} was cancelled: it is still going, and config "
+            f"{older} was not started"
+        )
+    else:
+        started = (
+            " (a start may have been sent: look at the build's runs)" if stage == "starting" else ""
+        )
+        what = (
+            f"interrupted: run {new_id} was cancelled, and config {older} was not started"
+            f"{started}, so the stream may be down. Apply the previous contract again to start "
+            f"it; this config is marked as failed, and fluid apply starts it again only with "
+            f"{ACCEPT_FAILED_ENV}=1"
+        )
+    out.message = f"{head}; {what}"
+    return out
+
+
+def _record_text(adapter: Adapter, last_good: RunInfo) -> Tuple[Optional[str], str]:
+    """The last good config's job config from its release record, once its digest is the one
+    the runtime recorded for ``last_good`` (``--fluid-job-sha256``); else None and why."""
+    try:
+        body = adapter.release_config(last_good)
+    except Exception as exc:  # noqa: BLE001 - why it cannot roll back
+        return None, _error_text(exc)
+    if body is None:
+        return None, (
+            "no release record of its job config (it was started by an older fluid apply, or "
+            "the record was not kept)"
+        )
+    try:
+        text = body.decode("utf-8")
+        matches = config_digest(text) == last_good.job_sha256
+    except (UnicodeDecodeError, ValueError):
+        matches = False
+    if not matches:
+        return None, f"its release record is not the job config run {last_good.run_id} ran"
+    return text, ""
+
+
+def _job_digest(run: DesiredRun) -> str:
+    """The digest of the job config ``run`` starts with (a local run's is not read back)."""
+    return run.job_sha256 or config_digest(run.job_text)
+
+
+def _rollback_run(run: DesiredRun, last_good: RunInfo, text: str) -> DesiredRun:
+    """``run`` (this apply's, checked) with ``last_good``'s job config: its record as the job
+    config, its identity, and the checkpoint and topic that config names."""
+    import hashlib
+    import json
+
+    from fluid_build.build_runners.spark._adapters import release_config_uri
+
+    config = json.loads(text)
+    source = config.get("source") if isinstance(config.get("source"), Mapping) else {}
+    # A hash of its own: the old job config with this apply's runner and settings is neither
+    # config, so a contract put back to the old config replaces it with the old settings too.
+    label = hashlib.sha256(f"rollback:{last_good.config_hash}:{run.config_hash}".encode())
+    return dataclasses.replace(
+        run,
+        config_hash=label.hexdigest(),
+        # The failed release's own stamps name a release this run is not; the run id stays.
+        product_version=None,
+        contract_digest=None,
+        bundle_digest=None,
+        release_id=None,
+        source_id=last_good.source_id,
+        checkpoint_id=last_good.checkpoint_id,
+        job_uri=release_config_uri(run.job_uri, str(last_good.job_sha256)),
+        job_text=text,
+        job_sha256=last_good.job_sha256,
+        checkpoint=config.get("checkpoint"),
+        topic=source.get("topic") if isinstance(source, Mapping) else None,
+    )
 
 
 def _stops_reconcile_only(
@@ -659,6 +1266,7 @@ def _stop_between_batches(
     left: List[RunInfo] = []
     notes: List[str] = []
     requests: List[Tuple[RunInfo, str]] = []
+    written: List[RunInfo] = []
     try:
         for old in stale:
             if not _askable(run, old, grace):
@@ -670,7 +1278,7 @@ def _stop_between_batches(
                 left.append(old)
                 continue
             try:
-                uri = adapter.request_stop(old)
+                uri = adapter.stop_request_for(old)
             except SparkRunError as exc:
                 notes.append(f"{what} {old.run_id} was cancelled: {_clean(exc)}")
                 left.append(old)
@@ -678,9 +1286,17 @@ def _stop_between_batches(
             if uri is None:
                 left.append(old)
                 continue
+            # Withdrawn whatever happens from here, a Ctrl-C during the write included.
             requests.append((old, uri))
+            try:
+                adapter.put_stop_request(uri)
+            except SparkRunError as exc:
+                notes.append(f"{what} {old.run_id} was cancelled: {_clean(exc)}")
+                left.append(old)
+                continue
+            written.append(old)
         deadline = clock.now() + grace
-        for old, _uri in requests:
+        for old in written:
             ended = clock.until(
                 partial(adapter.get, old.run_id),
                 lambda i: i.state in TERMINAL,
@@ -699,8 +1315,14 @@ def _stop_between_batches(
                 )
                 left.append(old)
     finally:
+        interrupted: Optional[BaseException] = None
         for _old, uri in requests:
-            adapter.withdraw_stop(uri)
+            try:
+                adapter.withdraw_stop(uri)
+            except KeyboardInterrupt as exc:  # a second Ctrl-C: withdraw the rest, then stop
+                interrupted = exc
+        if interrupted is not None:
+            raise interrupted
     return left, notes
 
 
@@ -858,6 +1480,7 @@ def reconcile(
     runs of any other build of that product (:func:`stop_removed`); never with ``only``.
     """
     clock, budget, grace = _Clock(sleep, now), wait_budget(env), stop_grace(env)
+    probation, accept_failed = release_probation(env), accept_failed_release(env)
     outcomes = []
     for run in runs:
         if run.scheduled and (only or not run.checkpoint):
@@ -880,8 +1503,12 @@ def reconcile(
                     wall=wall,
                     confirm=confirm,
                     grace=grace,
+                    probation=0.0 if only else probation,
+                    accept_failed=accept_failed,
                 )
             )
+            if outcomes[-1].interrupted:  # a Ctrl-C: no other build is touched
+                return outcomes
         except Exception as exc:  # noqa: BLE001 - one build's AWS error is its outcome
             outcomes.append(_error_outcome(run, exc))
     if stop_removed_of is not None and not only:
@@ -1066,7 +1693,25 @@ def run_once(
             with interrupt_guard(cancel):
                 # A retried task (its worker killed before it could cancel) finds its run
                 # going: wait for that one rather than start a second writer of the table.
-                going = [h for h in adapter.runs() if h.active and h.config_hash == run.config_hash]
+                listed = [h for h in adapter.runs() if h.active]
+                going = [h for h in listed if h.config_hash == run.config_hash]
+                # A stream's continuous run of another config still on the checkpoint (fluid
+                # apply is stopping it between batches): a second writer must not start.
+                other = [
+                    h
+                    for h in listed
+                    if run.checkpoint_id
+                    and h.config_hash != run.config_hash
+                    and h.checkpoint_id == run.checkpoint_id
+                ]
+                if other and not going:
+                    out.action, out.error, out.run_id = "refused", True, other[0].run_id
+                    out.message = (
+                        f"run {other[0].run_id} of another config is still going on the "
+                        "checkpoint (fluid apply is stopping it): nothing was started; the "
+                        "next scheduled run starts once it has stopped"
+                    )
+                    return out
                 if going:
                     started.append(going[0].run_id)
                     out.action = "adopted"

@@ -309,6 +309,36 @@ def test_fluid_apply_stops_a_changed_local_stream_between_batches(tmp_path, caps
         assert main(["apply", str(path), "--yes"]) == 0
 
 
+def test_fluid_apply_rolls_a_failing_stream_release_back_to_the_last_good_config(
+    tmp_path, capsys, monkeypatch
+):
+    """The new config fails on its first batch: the last good config is started again from its
+    release record, on the same checkpoint, and the apply fails."""
+    from fluid_build.cli import main
+
+    monkeypatch.setenv("STUB_FAIL_CONFIG", "7770001")
+    monkeypatch.setenv("FLUID_SPARK_RELEASE_PROBATION_SECONDS", "5")
+    data = stream_contract()
+    path = write(tmp_path, data)
+    runs = _runs(tmp_path, data)
+    try:
+        assert main(["apply", str(path), "--yes"]) == 0
+        (first,) = runs.runs()
+        data["builds"][0]["properties"]["stream"]["maxOffsetsPerTrigger"] = 7770001
+        write(tmp_path, data)
+        assert main(["apply", str(path), "--yes"]) != 0
+        out = _said(capsys)
+        assert "rolled-back" in out and "rolled back to config" in out
+        back = runs.runs()[0]
+        # The last good job config (its digest, its record) under a hash of its own.
+        assert (back.state, back.job_sha256) == ("RUNNING", first.job_sha256)
+        assert back.config_hash != first.config_hash and "/releases/" in str(back.config_uri)
+    finally:
+        data["builds"] = []
+        write(tmp_path, data)
+        assert main(["apply", str(path), "--yes"]) == 0
+
+
 def test_a_declined_apply_starts_no_local_run(tmp_path, monkeypatch):
     """No at apply's prompt applies nothing, and starts no local Spark run either."""
     from fluid_build.cli import apply as apply_cli

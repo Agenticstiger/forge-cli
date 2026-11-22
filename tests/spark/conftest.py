@@ -127,6 +127,8 @@ def operator_policy(monkeypatch):
     monkeypatch.delenv(SECRET_REF_ALLOWLIST_ENV, raising=False)
     monkeypatch.delenv("FLUID_SPARK_LOCAL_NAMESPACE_ALLOWLIST", raising=False)
     monkeypatch.setenv(HOST_ALLOWLIST_ENV, "msk.example,example.internal")
+    # A released stream is kept at once: a test of the probation sets its own window.
+    monkeypatch.setenv("FLUID_SPARK_RELEASE_PROBATION_SECONDS", "0")
 
 
 @pytest.fixture(scope="session")

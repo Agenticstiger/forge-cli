@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A released Spark stream that fails is rolled back to the last good config.** After `fluid
+  apply` starts a stream's new config over a previous one (a running run it replaced, or one that
+  ended SUCCEEDED), it watches the new run for
+  `FLUID_SPARK_RELEASE_PROBATION_SECONDS` (default 300, `0` keeps it at once, at most 3600): a run
+  that fails in that time, or that its runtime retries (EMR Serverless and EMR on EKS do; the Glue
+  job forge emits never retries), failed its probation. Forge then cancels it if it is still going
+  and starts the previous job config again on its checkpoint, and the apply fails with
+  `spark_release_rolled_back` and an outcome that names both runs, both configs and why. A run
+  stopped from outside during its probation (an operator's cancel, another apply's stop) is no
+  failure and nothing is rolled back; neither is a rollback started beside a run another apply has
+  started since. The previous job config comes from its release record: after every start of a
+  stream (and on a later apply that finds the run going without one), forge keeps the job config the
+  run read beside the build's (`releases/<digest16>/job.json`, the bytes with the MSK brokers
+  OpenTofu fills in; on `runtime: local` under `FLUID_SPARK_LOCAL_ROOT`). A record is used only when
+  its digest is the one the runtime recorded for the run that ran it (`--fluid-job-sha256`), so bytes
+  put there since start nothing. Only the job config is rolled back: the run gets the runner and the
+  settings (role, target, Spark configuration, retries) this apply compiled, as the Flink Kubernetes
+  operator's rollback restores only its own resource, so a release that changed only settings or the
+  runner rolls nothing back and says so. The rolled-back run gets a config hash of its own (a
+  contract put back to the old config then replaces it with the old settings too), and carries this
+  apply's run id but not the failed release's release id, contract digest, product version or bundle
+  stamps. A run started before this change has no record: the outcome says the old config cannot be
+  started again, and the failing run is left as it is. A record that cannot be kept is a note on the
+  outcome. `--mode reconcile` keeps no record, watches nothing and rolls nothing back, and while a
+  rolled-back run goes it reports the stream as not what the last apply deployed until the next
+  `fluid apply`. A scheduled run of a stream moved to `trigger.availableNow` does not start while
+  the old continuous run is still on the checkpoint, `FLUID_SPARK_STOP_GRACE_SECONDS` is capped at
+  3600 too, a stop request is withdrawn even when a Ctrl-C lands as it is written (or a second
+  Ctrl-C as requests are withdrawn), and the runner also refuses a checkpoint whose offsets name
+  partitions the topic no longer has. What a rollback leaves in the sink is part of the outcome:
+  on a shared checkpoint, the batches the failed run committed stay in the sink and the
+  rolled-back run resumes after them, so it does not read them again; when the release moved the
+  checkpoint (`properties.stream.checkpoint`) to another output, the failed run's sink keeps what
+  it wrote and the old config goes on writing its own. When the release moved the checkpoint and
+  the old config writes the same output or dead-letter table, nothing is rolled back: the old
+  checkpoint would resume from an offset before the ones the failed run processed, and write
+  those records into that output a second time. The failed run is cancelled, the stream is down,
+  and the apply fails with `apply_spark_rollback_unsafe`; applying the previous contract again is
+  the deliberate way back, and it expects those records twice. A config is a config to go back
+  to only when its run was RUNNING on its first attempt when it was replaced (not PENDING, retried or being cancelled), or ended SUCCEEDED, and did
+  not fail a probation itself: a release over a config whose last run failed or was cancelled before the apply is watched, and when
+  it fails the apply fails with `apply_spark_no_known_good_config` and says the stream is down.
+  Every config that fails its probation is marked beside the build's job config
+  (`releases/<hash16>/failed`; under `FLUID_SPARK_LOCAL_ROOT` on `runtime: local`), so no later
+  `fluid apply` or `--mode reconcile` starts it again as it stands: it fails with
+  `apply_spark_release_failed_earlier`, before a running config is stopped, until the contract
+  changes or the operator sets `FLUID_SPARK_ACCEPT_FAILED_RELEASE=1` for one apply (a project
+  `.env` cannot set it). A Ctrl-C, SIGTERM or SIGHUP between cancelling the failed run and
+  starting the old config ends the apply with an outcome that says where it stopped and that the
+  stream may be down, and the marker keeps the failed config from being restarted. Two applies
+  that roll back at once keep the older rollback run. An apply that changes nothing keeps a
+  stream's release record only when it is missing or different, and a read that fails once no
+  longer ends the probation's watch. Output and dead-letter names are compared without regard to case. The failed-release marker is read with `s3:GetObject`; where the identity lacks `s3:ListBucket` a missing marker answers AccessDenied, which forge reads as missing when the job config beside it reads (with a warning naming the grant), and a prefix it cannot read at all refuses the start with `apply_spark_artifact_read_denied`, naming the grants.
 - **`fluid describe --commands` prints every command as JSON, plugins included.** The document
   has a `schema_version` (1) and lists each command with its aliases, positional arguments and
   flags (names, type, choices, default, nargs, help). Commands added by `fluid_build.commands`
@@ -123,9 +176,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package's sha256, landed once per run: the scheduler's run id when `fluid apply` passes one, else
   the Spark application id) or, without dead letters, fails the run with nothing written, and the
   passing rows replace the partitions they hold. Each commit carries the run's stamps, as every
-  runner commit does, and `fluid.package.sha256`. While the function runs, PySpark's write calls are refused and `spark.sql`
-  runs reads only, and a commit to the output or its dead letters that the runner did not make
-  fails the run. The operator lists where packages may come from in `FLUID_SPARK_PACKAGE_ALLOWLIST`
+  runner commit does, and `fluid.package.sha256`. While the function runs, PySpark's write calls and `spark.conf.set`/`unset` are refused and
+  `spark.sql` runs reads only (a `SET` that changes a setting, `RESET` and a `${...}` variable are
+  refused too), and a commit to the output or its dead letters that the runner did not make,
+  checked before the runner writes and again after, fails the run. The operator lists where packages may come from in `FLUID_SPARK_PACKAGE_ALLOWLIST`
   (unset allows none; `fluid validate` warns, apply refuses). As for a SQL batch build, a runtime
   where forge would create the role needs `executionRoleArn`. `fluid plan` shows and binds the
   package's source, digest and entry point.
@@ -619,6 +673,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - In `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, `NAME@*` now sends `env://NAME` to any host, as
   a bare `NAME` and `env://NAME@*` already did. It used to name a literal host `*`, which no
   destination matches. A refusal's fix names both forms.
+- The Spark runner's SQL guard for a package refuses every statement that sets a value: `SET
+  TIME ZONE x`, `SET CATALOG x` and `SET VAR x` now join `SET k = v`. `SET`, `SET k` and `SET -v`
+  still read.
 
 - **No dataclass prints a secret in its repr.** A dataclass's generated repr prints every field,
   so a debug line, an f-string with `!r` or a traceback that shows locals would put a credential
@@ -673,6 +730,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   started before the upgrade has no stop key, so it cannot be asked to stop between batches. From
   then on a changed stream stops between batches (see Added). A plan made before the upgrade is
   refused at `fluid apply` (`apply_spark_artifact_mismatch`): plan again with the new version.
+- `fluid apply` now waits on a Spark stream it has released over a previous config: it watches
+  the new run for up to `FLUID_SPARK_RELEASE_PROBATION_SECONDS` (300 s unless set, `0` turns it
+  off) per changed stream, one stream after another, before it returns, so an apply of several
+  changed streams can take that many times longer than it did. A run that fails in that time is
+  cancelled and the previous job config is started again on its checkpoint by `fluid apply`
+  itself, without a prompt, and the apply fails; a config that failed is not started again by a
+  later `fluid apply` unless `FLUID_SPARK_ACCEPT_FAILED_RELEASE=1` is set for that apply. Set the
+  probation to `0` where a scheduler's timeout is shorter than the wait.
 
 ## [0.36.0] — 2026-11-19
 

@@ -369,6 +369,50 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         None,
     ),
+    "apply_spark_rollback_unsafe": (
+        [
+            "The release moved the stream's checkpoint (properties.stream.checkpoint) and the "
+            + "previous config writes the same output, so forge did not start it again: it "
+            + "would resume its old checkpoint from before the offsets the new run reached, "
+            + "and write those records into the output a second time. The failed run is "
+            + "cancelled and the stream is down",
+            "To go back on purpose, apply the previous contract again (fluid apply "
+            + "<previous contract>) and expect the records between the two checkpoints twice; "
+            + "to go on, fix the contract and run fluid apply",
+        ],
+        None,
+    ),
+    "apply_spark_no_known_good_config": (
+        [
+            "The config this release replaced did not end well (its last run failed, was "
+            + "cancelled before the apply, or was lost), so it is no config to go back to, "
+            + "and the stream is down. Fix the "
+            + "contract and run fluid apply",
+            "The failed run's outcome names its error; its logs are in the run's runtime",
+        ],
+        None,
+    ),
+    "apply_spark_release_failed_earlier": (
+        [
+            "This config failed its probation on an earlier fluid apply and is not started "
+            + "again as it stands: change the contract to fix it, and run fluid apply",
+            "When the cause was the environment, not the config, set "
+            + "FLUID_SPARK_ACCEPT_FAILED_RELEASE=1 for one fluid apply (the operator's "
+            + "environment, not a project .env) to start it again",
+        ],
+        None,
+    ),
+    "apply_spark_artifact_read_denied": (
+        [
+            "Grant the identity that runs fluid apply s3:GetObject on the build's prefix "
+            + "(_fluid/spark/<product>/<build>/): forge reads the failed-release marker and the "
+            + "job config there, and refused to start anything it cannot check",
+            "Also grant s3:ListBucket on that prefix: without it S3 answers a missing object "
+            + "with AccessDenied, which forge can only read as missing when the job config "
+            + "beside it reads",
+        ],
+        None,
+    ),
     "output_write_failed": (
         ["Check that the --out path is writable and the parent directory exists"],
         None,

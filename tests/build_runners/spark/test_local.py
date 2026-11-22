@@ -90,6 +90,11 @@ if os.environ.get("STUB_IGNORE_TERM"):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 else:
     signal.signal(signal.SIGTERM, lambda *a: stop.append(1))
+# A job config holding STUB_FAIL_CONFIG fails on its first batch, as a bad release would.
+fail = os.environ.get("STUB_FAIL_CONFIG")
+if fail and fail in open(config).read():
+    print("stub: the stream failed on its first batch", flush=True)
+    sys.exit(1)
 # As the runner does: a stop request beside the job config ends the run (STUB_IGNORE_STOP: a
 # run that never answers one).
 request = None
@@ -600,7 +605,9 @@ def test_a_stream_that_does_not_answer_its_stop_request_is_cancelled_after_the_g
     started.append((runs, out.run_id))
     changed = the_run(local_contract(trigger={"processingTime": "PT2M"}))
     (restart,) = rc.reconcile(
-        [changed], local_host=quiet, env={rc.WAIT_ENV: "30", rc.STOP_GRACE_ENV: "1"}
+        [changed],
+        local_host=quiet,
+        env={rc.WAIT_ENV: "30", rc.STOP_GRACE_ENV: "1", rc.PROBATION_ENV: "0"},
     )
     started.append((runs, restart.run_id))
     assert (restart.action, restart.stopped, restart.cancelled) == (

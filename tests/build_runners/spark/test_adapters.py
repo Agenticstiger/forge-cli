@@ -44,6 +44,10 @@ class ConfigBucket:
 
     def get_object(self, Bucket, Key):  # noqa: N803 - boto3's names
         self.read.append(f"s3://{Bucket}/{Key}")
+        if Key.endswith("/failed"):  # no config has failed its probation
+            from botocore.exceptions import ClientError
+
+            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "no"}}, "GetObject")
         if Key.endswith(RUNNER_FILE):
             return {"Body": io.BytesIO(self.runner or runner_source().encode("utf-8"))}
         return {"Body": io.BytesIO(self.body)}
@@ -66,6 +70,7 @@ def identity_of(run):
         "source_id": run.source_id,
         "checkpoint_id": run.checkpoint_id,
         "config_uri": run.job_uri,
+        **({"job_sha256": run.job_sha256} if run.job_sha256 else {}),
     }
 
 
@@ -790,7 +795,7 @@ def test_the_arguments_carry_the_config_s_identity_then_its_sha256(serverless):
     assert args[:2] == ["--config", serverless.job_uri]
     assert args[-2:] == ["--fluid-job-sha256", started(serverless).job_sha256]
     # The identity a run is read back by stays where it was.
-    assert ad._identity(args) == identity_of(serverless)
+    assert ad._identity(args) == identity_of(started(serverless))
 
 
 @pytest.mark.parametrize(
