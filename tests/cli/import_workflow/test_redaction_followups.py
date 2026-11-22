@@ -257,3 +257,167 @@ def test_a_word_too_deep_to_read_is_hidden_whole_when_it_names_a_credential():
     deep = R._Words(R._MAX_DEPTH)
     assert deep._multi_word("mysql --password QZXV7391 -e select") == MASK
     assert deep._multi_word("mysql --table orders -e select") == "mysql --table orders -e select"
+
+
+# ── what the second round of review found ───────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "echo hi # old: spark-submit --password QZXV7391",
+        "# curl -u admin:QZXV7391 http://x\nrun",
+        "run # --token QZXV7391",
+        "# mysql -uroot -pQZXV7391 -h db\nrun",
+        "cat > c <<EOF\n# run --password QZXV7391\nEOF",
+        "# curl -H 'X-Api-Key: QZXV7391' https://x",
+        "# Authorization: Bearer QZXV7391",
+    ],
+)
+def test_a_command_that_is_commented_out_keeps_no_credential(text):
+    assert "QZXV7391" not in R.safe_command(text)
+
+
+def test_a_comment_is_otherwise_shown_as_written():
+    text = "echo a # a note, it's fine\nls # --verbose --table orders\n"
+    assert R.safe_command(text) == text.strip()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'bash -lc "run --password QZXV7391"',
+        'eval "run --password QZXV7391"',
+        "ssh host 'run --password QZXV7391'",
+        "sh -ec 'mysql -pQZXV7391 db'",
+        'su -c "run --password QZXV7391" app',
+    ],
+)
+def test_a_command_line_in_one_quoted_word_is_read_whatever_carries_it(command):
+    assert "QZXV7391" not in R.safe_command(command)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["bash", "-lc", "run --password QZXV7391"],
+        ["sh", "-ec", "mysql -pQZXV7391 db"],
+        ["ssh", "host", "run --password QZXV7391"],
+        ["eval", "run --password QZXV7391"],
+    ],
+)
+def test_the_same_in_an_argument_list(args):
+    assert "QZXV7391" not in " ".join(R.safe_args(args))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "echo $'it\\'s'x --password QZXV7391; echo 'y'",
+        "cat <<EOF\nit's fine --password QZXV7391 and it's ok\nEOF",
+        "echo it's; run --password QZXV7391 ; echo it's",
+        "echo \"it's\" don't --password QZXV7391 isn't",
+    ],
+)
+def test_two_apostrophes_on_one_line_do_not_hide_a_credential_between_them(text):
+    assert "QZXV7391" not in R.safe_command(text)
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "cat > conf.ini <<EOF\n[db]\npassword = QZXV7391\nuser=bob\nEOF",
+        'python - <<EOF\nimport x\npassword = "QZXV7391"\nEOF',
+        "cat > c <<EOF\naws_secret_access_key = QZXV7391\nEOF",
+        "psql <<EOF\nCREATE USER bob WITH PASSWORD 'QZXV7391';\nEOF",
+        "mysql <<EOF\nCREATE USER bob IDENTIFIED BY 'QZXV7391';\nEOF",
+        "cat > ~/.netrc <<EOF\nmachine h login u password QZXV7391\nEOF",
+        "cat > c <<EOF\nspark.hadoop.fs.s3a.secret.key QZXV7391\nEOF",
+        "cat > c.yaml <<EOF\ndb:\n  password: QZXV7391\nEOF",
+    ],
+)
+def test_a_file_written_by_a_here_document_keeps_no_credential(script):
+    assert "QZXV7391" not in R.safe_command(script)
+
+
+def test_a_here_document_is_otherwise_shown_as_written():
+    script = "cat > c.ini <<EOF\n[db]\nuser = bob\nhost = localhost\ntimeout: 30\nEOF"
+    assert R.safe_command(script) == script
+
+
+@pytest.mark.parametrize("size", [4_200, 10_000, 19_000])
+def test_a_url_password_longer_than_the_shared_rule_reads_is_masked(size):
+    url = "postgres://u:ZZQZXV7391" + "x" * size + "@h/db"
+    assert "ZZQZXV7391" not in R.safe_command("run " + url)
+    assert "ZZQZXV7391" not in R.safe_text(url, 100_000)
+
+
+def test_a_url_password_that_the_shared_rule_reads_is_still_masked_whole():
+    assert R.safe_command("run postgres://u:abcdef@h/db") == f"run postgres://u:{MASK}@h/db"
+
+
+def test_a_login_glued_to_a_one_letter_flag_is_masked():
+    assert R.safe_command("run -uscott/QZXV7391@db:1521/ORCL") == f"run -uscott/{MASK}@db:1521/ORCL"
+    assert R.safe_args(["-uscott/QZXV7391@db:1521"]) == [f"-uscott/{MASK}@db:1521"]
+    assert R.safe_args(["a-scott/tiger@db:1521"]) == ["a-scott/tiger@db:1521"]  # not a flag
+
+
+def test_a_here_document_inside_a_quoted_script_keeps_the_quoting_valid():
+    import shlex
+
+    shown = R.safe_command('bash -c "cat <<EOF\nit\'s\nEOF\nrun --password QZXV7391"')
+    assert "QZXV7391" not in shown
+    inner = shlex.split(shown)[-1]
+    assert "it's" in inner and inner.startswith("cat <<EOF")
+
+
+def apart(text):
+    seen = []
+    shown = R._set_heredocs_apart(text, lambda body: seen.append(body) or "BODY")
+    return shown, seen
+
+
+def test_a_here_document_is_set_apart_to_its_terminator():
+    assert apart("cat <<EOF\nline 1\nline 2\nEOF\nafter") == (
+        "cat <<EOF\nBODY\nEOF\nafter",
+        ["line 1\nline 2"],
+    )
+    assert apart("cat <<-EOF\n\tbody\n\tEOF\n")[1] == ["\tbody"]
+    assert apart("cat <<'EOF'\nbody\nEOF  \n")[1] == ["body"]
+    assert apart('cat <<"EOF"\nbody\nEOF')[1] == ["body"]
+    assert apart("cat <<EOF\nEOF\n")[1] == [""]  # an empty body
+    assert apart("cat <<EOF\nthe word EOF is here\nEOF_NOT\nEOF")[1] == [
+        "the word EOF is here\nEOF_NOT"
+    ]
+
+
+def test_two_here_documents_and_one_that_never_ends():
+    assert apart("a <<A\n1\nA\nb <<B\n2\nB\n")[1] == ["1", "2"]
+    assert apart("a <<A\n1\n")[1] == []
+    assert apart("a <<A\nx <<A\n")[1] == []
+
+
+def test_a_start_in_quotes_or_in_a_comment_or_a_shift_is_not_a_here_document():
+    assert apart("echo '<<EOF\nx\nEOF'")[1] == []
+    assert apart('echo "<<EOF\nx\nEOF"')[1] == []
+    assert apart("# cat <<EOF\nx\nEOF\n")[1] == []
+    assert apart("x <<< word\n")[1] == []
+    assert apart("echo $((1 <<2))\n")[1] == []
+
+
+def test_the_number_of_here_documents_set_apart_is_bounded():
+    text = "".join(f"c <<D{i}\nx\nD{i}\n" for i in range(R._MAX_HEREDOCS + 10))
+    assert len(apart(text)[1]) == R._MAX_HEREDOCS
+
+
+def test_the_here_documents_of_a_script_nested_in_quotes_cost_in_proportion():
+    import time
+
+    started = time.perf_counter()
+    for text in (
+        'bash -c "' + "<<a\n" * 4_700 + '"',
+        "".join(f"<<E{i}\nx\n" for i in range(1_500)),
+    ):
+        R.safe_command(text)
+        R.safe_args([text])
+    assert time.perf_counter() - started < 5

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import re
 import shlex
-from typing import Any, List, Optional, Sequence, Union
+from typing import Any, Callable, List, Optional, Sequence, Union
 
 from ._pysource import clean_chars
 
@@ -47,17 +47,18 @@ def safe_text(text: Any, limit: int = 200) -> str:
 #: A shell word: unquoted characters that are not an operator, escapes and quoted parts, as
 #: written. An operator (``;``, ``&``, ``|``, ``(``, ``)``, ``<``, ``>``, a backtick) ends a word
 #: and stays as written, so masking a value never removes the operator beside it.
-_SHELL_WORD = re.compile(r"""(?:[^\s'"\\;&|()<>`]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+""")
+_SHELL_WORD = re.compile(
+    r"""(?:[^\s'"\\;&|()<>`]|\\.|\$'(?:[^'\\]|\\.)*'|'[^']*'|"(?:[^"\\]|\\.)*")+"""
+)
 #: A comment (``#`` where a word would begin, to the end of the line) is not shell: an apostrophe in
 #: one is no quote, and must not pair with the next one, some lines below.
 _SHELL_TOKEN = re.compile(
     r"(?P<comment>(?:^|(?<=[\s;&|()]))\#[^\n]*)|(?P<word>" + _SHELL_WORD.pattern + ")", re.M
 )
 #: A here-document (``<<EOF``, ``<<-'EOF'``): its body is text, not words, up to the delimiter.
-_HEREDOC = re.compile(
-    r"""(?<!<)<<(?!<)-?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1[^\n]*\n(.*?)(?=\n[ \t]*\2[ \t]*(?:\n|\Z))""",
-    re.DOTALL,
-)
+_HEREDOC_START = re.compile(r"""(?<!<)<<(?!<)-?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1[^\n]*\n""")
+#: How many here-documents of one text are set apart: a text that opens more is read as it comes.
+_MAX_HEREDOCS = 64
 _HEREDOC_TOKEN = re.compile(r"__fluidheredoc(\d+)x(\d+)__")
 #: Where one command ends and the next begins.
 _COMMAND_BOUNDARY = re.compile(r"[;&|()\n]")
@@ -330,7 +331,7 @@ _DSN_HOST = r"(?:\[[0-9A-Fa-f:.]{2,45}\]|(?![0-9]+(?:[:/]|$))[A-Za-z0-9_.\-]+)"
 #: digest, ``img@sha256:1234abcd``, is not a port). It does not follow a ``/`` (a path, or the middle
 #: of a URL).
 _ORACLE_DSN = re.compile(
-    r"(?<![\w/.\-])(\"[^\"\s/]{1,64}\"|[^\W\d][\w$#]{0,63})/"
+    r"(?:(?<![\w/.\-])|(?<=\s-[A-Za-z])|(?<=^-[A-Za-z]))(\"[^\"\s/]{1,64}\"|[^\W\d][\w$#]{0,63})/"
     r"(\"[^\"\r\n]{1,128}\"|\S{1,128})"
     r"(@(?://" + _DSN_HOST + r"(?::\d{2,5})?|" + _DSN_HOST + r":\d{2,5}(?!\w)))"
 )
@@ -343,12 +344,42 @@ def _mask_dsn(text: str) -> str:
     return _ORACLE_DSN.sub(lambda m: f"{m.group(1)}/{_REDACTED}{m.group(3)}", text)
 
 
+_AUTHORITY_END = re.compile(r"""[ \t\r\n/?#'"]""")
+#: The user information the shared URL rule reads has a password of up to this many characters.
+_URL_PASSWORD_READ = 4_000
+
+
+def _mask_long_url_password(text: str) -> str:
+    """The password of a URL that is longer than the shared rule reads (``://user:<5,000 characters>@
+    host``), masked: a text can be longer than that rule's cap, and what it leaves would be shown.
+    """
+    if len(text) <= _URL_PASSWORD_READ or "://" not in text:
+        return text
+    out: List[str] = []
+    position = 0
+    for start in re.finditer(r"://", text):
+        if start.start() < position:
+            continue
+        begin = start.end()
+        found = _AUTHORITY_END.search(text, begin)
+        authority = text[begin : found.start() if found else len(text)]
+        at = authority.rfind("@")
+        colon = authority.find(":")
+        if at > colon >= 0 and at - colon - 1 > _URL_PASSWORD_READ:
+            out.append(text[position : begin + colon + 1])
+            out.append(_REDACTED)
+            position = begin + at
+    out.append(text[position:])
+    return "".join(out)
+
+
 def _scan(text: str) -> str:
     """One word, or one value, read for credentials: the free-text scan of the repository, the
     secret in the user information of an ``s3a`` URL (it holds ``/``, which the scan stops at), the
     password of an Oracle JDBC URL (``user/password@host``, no ``://``), and the pairs a
     connection string, a query string or JSON holds."""
     if "@" in text:
+        text = _mask_long_url_password(text)
         text = _S3_SECRET.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
         text = _oracle_jdbc(text)
         text = _mask_dsn(text)
@@ -474,20 +505,19 @@ class _Words:
 
     def _multi_word(self, value: str) -> str:
         """A word that holds white space: JSON, a header, SQL, a script, or a command line in
-        quotes. The free-text scan reads the whole of it (it knows ``"password": "x"`` and
-        ``Bearer x``); one that starts like a command line (a flag, ``NAME=value``) is then read
-        word by word, and one of several lines line by line (a quote that opens in one line
-        closes in it, as far as this goes). Too deep for that, a word that names a credential is
-        hidden whole."""
+        quotes (``bash -lc "..."``, ``eval "..."``, ``ssh host "..."``). The free-text scan reads
+        the whole of it (it knows ``"password": "x"`` and ``Bearer x``); what is not JSON is then
+        read word by word as a command line, and one of several lines line by line (a quote that
+        opens in one line closes in it, as far as this goes). Too deep for that, a word that
+        names a credential is hidden whole."""
         masked = _scan(value)
-        stripped = masked.lstrip()
         if self.depth >= _MAX_DEPTH:
             return _REDACTED if _names_a_credential(masked) else masked
-        if stripped.startswith("-") or _ASSIGNMENT.match(stripped):
-            return _redact_command(masked, self.depth + 1)
+        if masked.lstrip().startswith(("{", "[")):
+            return masked  # JSON is data, not a command line
         if "\n" in masked:
             return "\n".join(_redact_command(line, self.depth + 1) for line in masked.split("\n"))
-        return masked
+        return _redact_command(masked, self.depth + 1)
 
     def _flag(self, value: str, flag: str, equals: str, rest: str) -> str:
         if flag in {"--conf", "-c"}:
@@ -600,7 +630,9 @@ def _redact_words(text: str, depth: int) -> str:
         first = False
         position = match.end()
         if match.group("comment") is not None:
-            out.append(_scan(match.group(0)))
+            # a comment is text, with no quote pairing across lines, but a command that is
+            # commented out still holds its credential: its words are read
+            out.append("#" + _redact_words(_scan(match.group(0))[1:], depth))
             continue
         raw = match.group("word")
         value = _unquote(raw)
@@ -632,32 +664,117 @@ def _redact_command(command: str, depth: int = 0) -> str:
             return fields[index]
         return match.group(0)
 
-    def keep_body(match: "re.Match[str]") -> str:
+    def keep_body(body: str) -> str:
         # the body of a here-document is text, read apart: an apostrophe in it is no quote
-        bodies.append(match.group(3))
-        at = match.start()
-        return (
-            match.group(0)[: match.start(3) - at]
-            + f"__fluidheredoc{depth}x{len(bodies) - 1}__"
-            + match.group(0)[match.end(3) - at :]
-        )
+        bodies.append(body)
+        return f"__fluidheredoc{depth}x{len(bodies) - 1}__"
 
     def body_back(match: "re.Match[str]") -> str:
         index = int(match.group(2))
         if int(match.group(1)) != depth or index >= len(bodies):
             return match.group(0)
-        body = _mask_json(_mask_dsn(bodies[index]))
+        lines = _mask_json(_mask_dsn(bodies[index])).split("\n")
         if depth >= _MAX_DEPTH:
-            return "\n".join(_scan(line) for line in body.split("\n"))
-        return "\n".join(_redact_command(line, depth + 1) for line in body.split("\n"))
+            return "\n".join(_scan(_mask_config_line(line)) for line in lines)
+        return "\n".join(_redact_command(_mask_config_line(line), depth + 1) for line in lines)
 
     text = _JINJA.sub(hide, command.replace("\r\n", "\n"))
     if "<<" in text:
-        text = _HEREDOC.sub(keep_body, text)
+        text = _set_heredocs_apart(text, keep_body)
     result = _redact_words(_mask_json(_mask_dsn(text)), depth)
     if bodies:
         result = _HEREDOC_TOKEN.sub(body_back, result)
     return _JINJA_TOKEN.sub(back, result) if fields else result
+
+
+class _Quotes:
+    """Whether a place of a text is in quotes or in a comment, read forward and once: the here-
+    documents of one text are asked about in order."""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self._at = 0
+        self._quote = ""
+        self._comment = False
+
+    def inside(self, index: int) -> bool:
+        text, quote, comment = self._text, self._quote, self._comment
+        at = self._at
+        while at < index:
+            char = text[at]
+            if comment:
+                comment = char != "\n"
+            elif quote == "'":
+                quote = "" if char == "'" else quote
+            elif char == "\\":
+                at += 1  # the next character is escaped (also in double quotes)
+            elif quote == '"':
+                quote = "" if char == '"' else quote
+            elif char in "'\"":
+                quote = char
+            elif char == "#" and (at == 0 or text[at - 1] in " \t\n;&|()"):
+                comment = True
+            at += 1
+        self._at, self._quote, self._comment = at, quote, comment
+        return bool(quote) or comment
+
+
+def _set_heredocs_apart(text: str, keep: Callable[[str], str]) -> str:
+    """``text`` with the body of each here-document (``<<EOF`` ... ``EOF``) replaced by what
+    ``keep(body)`` returns. A start in quotes or in a comment is not one (a quoted script is read
+    again when it is), a body has no end that is looked for again once one delimiter had none,
+    and at most :data:`_MAX_HEREDOCS` are set apart."""
+    out: List[str] = []
+    position = 0
+    missing = set()
+    taken = 0
+    quotes = _Quotes(text)
+    for start in _HEREDOC_START.finditer(text):
+        if start.start() < position or taken >= _MAX_HEREDOCS:
+            continue
+        delimiter = start.group(2)
+        if delimiter in missing or quotes.inside(start.start()):
+            continue
+        ends = re.compile(r"^[ \t]*" + re.escape(delimiter) + r"[ \t]*$", re.M).search(
+            text, start.end()
+        )
+        if ends is None:
+            missing.add(delimiter)
+            continue
+        end = max(start.end(), ends.start() - 1)  # the newline before the terminator is the text's
+        out.append(text[position : start.end()])
+        out.append(keep(text[start.end() : end]))
+        position = end
+        taken += 1
+    out.append(text[position:])
+    return "".join(out)
+
+
+#: A credential in a file written by a here-document: ``password = x``, ``key: x``, ``password x``
+#: (a ``.netrc``), ``PASSWORD 'x'`` and ``IDENTIFIED BY 'x'`` in SQL.
+_CONFIG_PAIR = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_.\-]{0,64})(\s*[=:]\s*)(\S.*?)\s*$")
+_SQL_SECRET = re.compile(r"""(?i)\b(IDENTIFIED\s+BY|PASSWORD)(\s+)('(?:[^']|'')*'|"[^"]*")""")
+
+
+def _mask_config_line(line: str) -> str:
+    """A line of the body of a here-document with the secret of a configuration or SQL line
+    masked."""
+    line = _SQL_SECRET.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", line)
+    found = _CONFIG_PAIR.match(line)
+    if found and sensitive_name(found.group(2)) and not _plain_value(found.group(4)):
+        return f"{found.group(1)}{found.group(2)}{found.group(3)}{_REDACTED}"
+    words = line.split()
+    for index in range(len(words) - 1):
+        word = words[index]
+        if sensitive_name(word) and not word.endswith(("=", ":")) and "=" not in word:
+            if not _plain_value(words[index + 1]):
+                return re.sub(
+                    r"(\b" + re.escape(word) + r"\s+)\S+",
+                    lambda m: m.group(1) + _REDACTED,
+                    line,
+                    count=1,
+                )
+    return line
 
 
 def _too_long(what: str, size: int) -> str:
