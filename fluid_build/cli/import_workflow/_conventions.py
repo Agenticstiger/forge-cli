@@ -92,7 +92,6 @@ text each is matched against is cut at 256 characters.
 
 from __future__ import annotations
 
-import datetime
 import re
 import string
 from dataclasses import dataclass, field

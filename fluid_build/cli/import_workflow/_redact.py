@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import re
 import shlex
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, List, Optional, Sequence, Union
 
 from ._pysource import clean_chars
 

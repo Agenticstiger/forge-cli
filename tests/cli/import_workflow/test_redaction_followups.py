@@ -194,9 +194,9 @@ def test_a_script_in_a_quoted_word_is_read_line_by_line():
 @pytest.mark.parametrize("size", [100, 300, 600, 3_000])
 @pytest.mark.parametrize("compact", [False, True])
 def test_a_long_json_secret_is_masked_whole(size, compact):
-    secret = "QZX" + "ab1" * (size // 3)
+    blob = "QZX" + "ab1" * (size // 3)
     sep = '":"' if compact else '": "'
-    text = '{"password' + sep + secret + '"}'
+    text = '{"password' + sep + blob + '"}'
     for shown in (R.safe_text(text, 10_000), R.safe_args([text], limit=10_000)[0]):
         assert "QZX" not in shown and MASK in shown
 
