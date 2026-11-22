@@ -30,7 +30,7 @@ from fluid_build.secrets.policy import (
 
 REMOTE = "db.example.com"
 #: What a variable the contract names might hold: it must never reach a message.
-SECRET_VALUE = "s3cr3t-value-7f2a9c"
+SECRET_VALUE = "s3cr3t-value-7f2a9c"  # pragma: allowlist secret
 
 
 @pytest.fixture(autouse=True)
@@ -117,13 +117,13 @@ def test_the_acquisition_dispatcher_hands_the_policy_the_contract_as_written(
     monkeypatch.setitem(
         base._ACQUISITION_RUNNER_REGISTRY, "policy-test", ("fluid_test_policy_runner", "run")
     )
+    written_connection = {"host": "{{ env.FLUID_TEST_RENDERED }}"}
+    written_connection["secretRef"] = "env://PG"  # pragma: allowlist secret
     build = {
         "id": "b",
         "engine": "policy-test",
         "properties": {
-            "source": {
-                "connection": {"host": "{{ env.FLUID_TEST_RENDERED }}", "secretRef": "env://PG"}
-            },
+            "source": {"connection": written_connection},
             "note": REMOTE,
         },
     }

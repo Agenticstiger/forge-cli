@@ -157,7 +157,7 @@ def test_dlt_refuses_a_field_that_would_change_the_url(captured, fields):
 def test_dlt_url_parses_back_to_exactly_the_connection(captured):
     from sqlalchemy.engine import make_url
 
-    password = "p@ss/w?rd#;&%"
+    password = "p@ss/w?rd#;&%"  # pragma: allowlist secret
     _dlt_source({**BASE, "password": password, "database": "orders", "host": "db.internal"})
     url = make_url(captured["credentials"])
     assert (url.drivername, url.username, url.password) == ("postgresql+psycopg", "u", password)
