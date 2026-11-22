@@ -48,6 +48,17 @@ def safe_text(text: Any, limit: int = 200) -> str:
 #: written. An operator (``;``, ``&``, ``|``, ``(``, ``)``, ``<``, ``>``, a backtick) ends a word
 #: and stays as written, so masking a value never removes the operator beside it.
 _SHELL_WORD = re.compile(r"""(?:[^\s'"\\;&|()<>`]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+""")
+#: A comment (``#`` where a word would begin, to the end of the line) is not shell: an apostrophe in
+#: one is no quote, and must not pair with the next one, some lines below.
+_SHELL_TOKEN = re.compile(
+    r"(?P<comment>(?:^|(?<=[\s;&|()]))\#[^\n]*)|(?P<word>" + _SHELL_WORD.pattern + ")", re.M
+)
+#: A here-document (``<<EOF``, ``<<-'EOF'``): its body is text, not words, up to the delimiter.
+_HEREDOC = re.compile(
+    r"""(?<!<)<<(?!<)-?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1[^\n]*\n(.*?)(?=\n[ \t]*\2[ \t]*(?:\n|\Z))""",
+    re.DOTALL,
+)
+_HEREDOC_TOKEN = re.compile(r"__fluidheredoc(\d+)x(\d+)__")
 #: Where one command ends and the next begins.
 _COMMAND_BOUNDARY = re.compile(r"[;&|()\n]")
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*=")
@@ -63,7 +74,7 @@ _PAIR = re.compile(r"(^|[;&,?\s])([A-Za-z_][A-Za-z0-9_.\-]{0,64})=([^;&,\s]*)")
 #: ``"key": "value"`` in JSON, as ``json.dumps`` writes it (a space after the colon) or compact,
 #: and ``["KEY"] = "value"`` in code.
 _JSON_PAIR = re.compile(
-    r"""(["'])([A-Za-z_][A-Za-z0-9_.\-]{0,64})\1(\]?\s*[:=]\s*)(["'])([^"']{0,512})\4"""
+    r"""(["'])([A-Za-z_][A-Za-z0-9_.\-]{0,64})\1(\]?\s*[:=]\s*)(["'])([^"']{0,20000})\4"""
 )
 #: What makes a masked word need quotes again: white space, an operator, a quote, a backslash.
 _NEEDS_QUOTES = re.compile(r"""[\s;&|()<>`$\\'"]""")
@@ -77,15 +88,13 @@ _S3_USERINFO = re.compile(
     r"^((?:[A-Za-z][A-Za-z0-9+.\-]{0,40}:)*s3[an]?://)([^/:@?#]{0,512}:[^@?#]{0,512})@", re.I
 )
 _S3_SECRET = re.compile(r"(s3[an]?://[^/:@\s?#'\"]{0,512}:)[^@\s?#'\"]{1,512}@", re.I)
+#: A command longer than this is not read, and so is not shown (:func:`safe_command`).
 _MAX_COMMAND_TEXT = 20_000
-#: Characters of one argument read for credentials (an argument is shown at 200).
+#: An argument longer than this, once its white space is collapsed, is not read, and so is not shown
+#: (:func:`safe_args`). A text cut where it is too long to read can split a credential (the
+#: ``@host`` that ends it, or the ``-----END`` of a key, is past the cut), and what is left of it
+#: would be shown; no part of what could not be read is.
 _MAX_ARG = 4_096
-#: Of a text that was cut before it was read, the last characters are not kept: a credential that
-#: the cut split (its end, the ``@host`` that names it, is not there) is then not shown whole or in
-#: part, even when what is masked before it shrinks the text so that it comes within the limit. More
-#: than the longest login the Oracle JDBC rule reads (a 128-character user, a 512-character
-#: password); a text that masks down to fewer characters than this shows nothing.
-_CUT_TAIL = 700
 #: How many levels of quoting inside quoting (``bash -c "bash -c ..."``) are looked into.
 _MAX_DEPTH = 5
 
@@ -309,16 +318,29 @@ def _oracle_jdbc(text: str) -> str:
     return _ORACLE_JDBC_RE.sub(lambda m: f"{m.group(1)}{_REDACTED}{m.group(2)}", text)
 
 
+#: A host in a login: a name or an IPv4 address (not digits alone: ``12:30`` is a time), or an IPv6
+#: address in brackets.
+_DSN_HOST = r"(?:\[[0-9A-Fa-f:.]{2,45}\]|(?![0-9]+(?:[:/]|$))[A-Za-z0-9_.\-]+)"
 #: ``user/password@host:port`` or ``user/password@//host[:port]``, the start of an Oracle Easy Connect
 #: login written as a plain word or as the value of an option (``--dsn scott/tiger@db:1521/ORCL``);
-#: what follows is kept. The password may be in double quotes (it then may hold ``@``). The port,
-#: or the ``//``, is what makes it one: a ``a/b@c`` is a path or an address. It does not follow a
-#: ``/`` (a path, or the middle of a URL).
+#: what follows is kept. The user is a name Oracle takes unquoted (letters, digits, ``_``, ``$``,
+#: ``#``, the first one not a digit) or one in double quotes; the password is in double quotes or
+#: anything up to the last ``@host:port`` (it may hold ``/``, ``:``, ``@``). The port, or the ``//``,
+#: is what makes it one: a ``a/b@c`` is a path or an address, and the port ends the word (an image
+#: digest, ``img@sha256:1234abcd``, is not a port). It does not follow a ``/`` (a path, or the middle
+#: of a URL).
 _ORACLE_DSN = re.compile(
-    r"(?<![\w/])([A-Za-z_][A-Za-z0-9_$#.\-]{0,63})/"
-    r"(\"[^\"\r\n]{1,128}\"|[^@\s'\":]{1,128})"
-    r"(@(?://[A-Za-z0-9_.\-]+(?::\d{2,5})?|[A-Za-z0-9_.\-]+:\d{2,5}))"
+    r"(?<![\w/.\-])(\"[^\"\s/]{1,64}\"|[^\W\d][\w$#]{0,63})/"
+    r"(\"[^\"\r\n]{1,128}\"|\S{1,128})"
+    r"(@(?://" + _DSN_HOST + r"(?::\d{2,5}(?!\w))?|" + _DSN_HOST + r":\d{2,5}(?!\w)))"
 )
+
+
+def _mask_dsn(text: str) -> str:
+    """``text`` with the password of each Oracle Easy Connect login masked."""
+    if "@" not in text:
+        return text
+    return _ORACLE_DSN.sub(lambda m: f"{m.group(1)}/{_REDACTED}{m.group(3)}", text)
 
 
 def _scan(text: str) -> str:
@@ -329,8 +351,10 @@ def _scan(text: str) -> str:
     if "@" in text:
         text = _S3_SECRET.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
         text = _oracle_jdbc(text)
-        text = _ORACLE_DSN.sub(lambda m: f"{m.group(1)}/{_REDACTED}{m.group(3)}", text)
-    return _mask_pairs(_free_text(text))
+        text = _mask_dsn(text)
+    # the pairs first: the free-text rule masks what follows ``"password":`` up to the first quote
+    # and leaves a long value that comes after it
+    return _free_text(_mask_pairs(text))
 
 
 class _Words:
@@ -449,13 +473,20 @@ class _Words:
         return f"{head}{_REDACTED}"
 
     def _multi_word(self, value: str) -> str:
-        """A word that holds white space: JSON, a header, SQL, or a command line in quotes. The
-        free-text scan reads the whole of it (it knows ``"password": "x"`` and ``Bearer x``); one
-        that starts like a command line (a flag, ``NAME=value``) is then read word by word."""
+        """A word that holds white space: JSON, a header, SQL, a script, or a command line in
+        quotes. The free-text scan reads the whole of it (it knows ``"password": "x"`` and
+        ``Bearer x``); one that starts like a command line (a flag, ``NAME=value``) is then read
+        word by word, and one of several lines line by line (a quote that opens in one line
+        closes in it, as far as this goes). Too deep for that, a word that names a credential is
+        hidden whole."""
         masked = _scan(value)
         stripped = masked.lstrip()
-        if self.depth < _MAX_DEPTH and (stripped.startswith("-") or _ASSIGNMENT.match(stripped)):
+        if self.depth >= _MAX_DEPTH:
+            return _REDACTED if _names_a_credential(masked) else masked
+        if stripped.startswith("-") or _ASSIGNMENT.match(stripped):
             return _redact_command(masked, self.depth + 1)
+        if "\n" in masked:
+            return "\n".join(_redact_command(line, self.depth + 1) for line in masked.split("\n"))
         return masked
 
     def _flag(self, value: str, flag: str, equals: str, rest: str) -> str:
@@ -517,12 +548,30 @@ class _Words:
                 return value if _plain_value(rest) else f"{key}={_REDACTED}"
             if self.depth < _MAX_DEPTH and (rest.lstrip().startswith("-") or " " in rest.strip()):
                 return f"{key}={_redact_command(rest, self.depth + 1)}"
-            return _scan(value)
+            return self._unread(value)
         if self.depth < _MAX_DEPTH and any(c.isspace() for c in value):
             if value.lstrip().startswith(("{", "[")):
                 return self._multi_word(value)  # JSON is data, not a command line
             return _redact_command(value, self.depth + 1)
+        return self._unread(value)
+
+    def _unread(self, value: str) -> str:
+        """``value`` as the free-text scan leaves it; too deep to read word by word, one that
+        holds a word that names a credential is hidden whole."""
+        if self.depth >= _MAX_DEPTH and any(c.isspace() for c in value):
+            return _REDACTED if _names_a_credential(value) else _scan(value)
         return _scan(value)
+
+    def skip(self) -> None:
+        """A word that was not read (too long) is the end of what a flag before it waited for."""
+        self._mask_next, self._setting_next, self._user_next = False, None, False
+
+
+def _names_a_credential(text: str) -> bool:
+    """Whether a word of ``text`` is a flag, a name or a setting that holds a credential."""
+    return any(
+        sensitive_name(word.partition("=")[0]) for word in text.split() if word.lstrip("-")[:1]
+    )
 
 
 def _unquote(raw: str) -> str:
@@ -539,6 +588,7 @@ def _redact_command(command: str, depth: int = 0) -> str:
     """``command`` with the values of credentials masked, word by word, keeping what is not
     one exactly as written (lines, quoting, operators, ``$VAR``, ``{{ ds }}``)."""
     fields: List[str] = []
+    bodies: List[str] = []
 
     def hide(match: "re.Match[str]") -> str:
         # the field stays a reference as written, but a default it holds is read like any text
@@ -552,19 +602,45 @@ def _redact_command(command: str, depth: int = 0) -> str:
             return fields[index]
         return match.group(0)
 
-    text = _mask_json(_JINJA.sub(hide, command.replace("\r\n", "\n")))
+    def keep_body(match: "re.Match[str]") -> str:
+        # the body of a here-document is text, read apart: an apostrophe in it is no quote
+        bodies.append(match.group(3))
+        at = match.start()
+        return (
+            match.group(0)[: match.start(3) - at]
+            + f"__fluidheredoc{depth}x{len(bodies) - 1}__"
+            + match.group(0)[match.end(3) - at :]
+        )
+
+    def body_back(match: "re.Match[str]") -> str:
+        index = int(match.group(2))
+        if int(match.group(1)) != depth or index >= len(bodies):
+            return match.group(0)
+        body = _mask_json(_mask_dsn(bodies[index]))
+        if depth >= _MAX_DEPTH:
+            return "\n".join(_scan(line) for line in body.split("\n"))
+        return "\n".join(_redact_command(line, depth + 1) for line in body.split("\n"))
+
+    text = _JINJA.sub(hide, command.replace("\r\n", "\n"))
+    if "<<" in text:
+        text = _HEREDOC.sub(keep_body, text)
+    text = _mask_json(_mask_dsn(text))
     words = _Words(depth)
     words.boundary()
     out: List[str] = []
     position = 0
     first = True
-    for match in _SHELL_WORD.finditer(text):
+    for match in _SHELL_TOKEN.finditer(text):
         gap = text[position : match.start()]
         if not first and _COMMAND_BOUNDARY.search(gap):
             words.boundary()
         out.append(gap)
         first = False
-        raw = match.group(0)
+        position = match.end()
+        if match.group("comment") is not None:
+            out.append(_scan(match.group(0)))
+            continue
+        raw = match.group("word")
         value = _unquote(raw)
         shown = words.show(value)
         if shown == value:
@@ -572,44 +648,48 @@ def _redact_command(command: str, depth: int = 0) -> str:
         else:
             quote = _NEEDS_QUOTES.search(shown.replace(_REDACTED, ""))
             out.append(shlex.quote(shown) if quote else shown)
-        position = match.end()
     out.append(text[position:])
     result = "".join(out)
+    if bodies:
+        result = _HEREDOC_TOKEN.sub(body_back, result)
     return _JINJA_TOKEN.sub(back, result) if fields else result
 
 
-def _bounded(text: str) -> Tuple[str, bool]:
-    """``text`` cut at :data:`_MAX_ARG` characters (white space collapsed first when it is longer:
-    a cut that falls inside a long run of spaces must not be able to drop the end of a credential
-    that the collapsed text then shows), and whether it was cut: the end of a text that was cut is
-    not shown (:data:`_CUT_TAIL`)."""
-    if len(text) <= _MAX_ARG:
-        return text, False
-    return " ".join(text.split())[:_MAX_ARG], True
+def _too_long(what: str, size: int) -> str:
+    return f"<{what} of {size:,} characters, too long to show>"
 
 
 def safe_args(args: Sequence[str], limit: int = 200) -> List[str]:
     """Arguments of a submitted job, safe to write: a credential-shaped value is masked, and so is
     the value after a flag whose name is one (``--password hunter2``, ``-p hunter2``, ``--token=abc``,
     ``--conf spark.hadoop.fs.s3a.secret.key=abc``), the value of ``NAME=value`` when the name is,
-    and a secret in a JSON value or a connection string."""
+    and a secret in a JSON value or a connection string. An argument too long to read whole (over
+    :data:`_MAX_ARG` characters once its white space is collapsed) is not shown: only its size."""
     words = _Words()
     out: List[str] = []
     for arg in args:
-        text, cut = _bounded(str(arg))
-        shown = words.show(text)
-        out.append(safe_text(shown[:-_CUT_TAIL] if cut else shown, limit))
+        text = clean_chars(str(arg), keep="\n\t")  # the lines of a script are read as lines
+        if len(text) > _MAX_ARG:
+            text = " ".join(text.split())
+        if len(text) > _MAX_ARG:
+            words.skip()
+            out.append(_too_long("an argument", len(text)))
+            continue
+        out.append(safe_text(words.show(text), limit))
     return out
 
 
 def safe_command(command: str, limit: int = 2000) -> str:
     """A command line, safe to write: each word is looked at as :func:`safe_args` does (a word
     that holds white space, a header or a JSON value in quotes, is read whole), and the words
-    that are nothing to hide stay as written, lines, operators and quoting included."""
-    cut = len(command) > _MAX_COMMAND_TEXT
-    text = clean_chars(_redact_command(command[:_MAX_COMMAND_TEXT]), keep="\n\t").strip()
-    if cut:
-        text = text[:-_CUT_TAIL]
+    that are nothing to hide stay as written, lines, operators and quoting included. A command
+    over :data:`_MAX_COMMAND_TEXT` characters is not shown: only its size."""
+    if len(command) > _MAX_COMMAND_TEXT:
+        return _too_long("a command", len(command))
+    # the characters that can hide a credential from a rule (a zero-width one inside a name or a
+    # host) go before the rules read it, not after
+    cleaned = clean_chars(command.replace("\r\n", "\n"), keep="\n\t")
+    text = clean_chars(_redact_command(cleaned), keep="\n\t").strip()
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
