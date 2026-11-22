@@ -26,22 +26,22 @@ SHAPES = {
     "pw-quoted-dq": 'run.sh --password "{S}"',
     "pw-quoted-sq": "run.sh --password '{S}'",
     "mysql-p": "mysql -u root -p{S} db",
-    "pgpassword": "PGPASSWORD={S} psql -h h db",
+    "pgpassword": "PGPASSWORD={S} psql -h h db",  # pragma: allowlist secret
     "export-token": "export API_TOKEN={S}",
     "bearer": "curl -H 'Authorization: Bearer {S}' https://h/x",
     "url-userinfo": "curl https://user:{S}@host/path",
     "jdbc-oracle": "run.sh --jdbc-url jdbc:oracle:thin:scott/{S}@h:1521/svc",
     "sqlplus": "sqlplus scott/{S}@h:1521/svc",
-    "s3a-secret": "run.sh --conf spark.hadoop.fs.s3a.secret.key={S}",
+    "s3a-secret": "run.sh --conf spark.hadoop.fs.s3a.secret.key={S}",  # pragma: allowlist secret
     "token-flag": "run.sh --token {S}",
     "api-key": "run.sh --api-key {S}",
-    "json-password": 'run.sh --config \'{{"password": "{S}"}}\'',
+    "json-password": 'run.sh --config \'{{"password": "{S}"}}\'',  # pragma: allowlist secret
     "aws-configure": "aws configure set aws_secret_access_key {S}",
     "secret-eq": "run.sh --secret={S} --user bob",
     "x-api-key": 'run.sh -H "X-Api-Key: {S}"',
     "psql-url": 'psql "postgresql://u:{S}@h/db"',
     "docker-login": "docker login -u u -p {S}",
-    "client-secret": "run.sh --client-secret {S}",
+    "client-secret": "run.sh --client-secret {S}",  # pragma: allowlist secret
     "env-assign": "DB_PASSWORD={S} ./run.sh",
 }
 
