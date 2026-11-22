@@ -134,6 +134,16 @@ def recorded_regions(resources: Iterable[Mapping[str, Any]]) -> set:
 _CALLER_ACCOUNT_TOKEN = str(tofu_ref("data.aws_caller_identity.fluid_lf_caller.account_id"))
 
 
+def _has_glue_maintenance(contract: Mapping[str, Any]) -> bool:
+    """Whether an expose's ``iceberg.maintenance`` is ``backend: glue`` (no validation)."""
+    for expose in contract.get("exposes") or []:
+        iceberg = expose.get("iceberg") if isinstance(expose, Mapping) else None
+        block = iceberg.get("maintenance") if isinstance(iceberg, Mapping) else None
+        if isinstance(block, Mapping) and block.get("backend") == "glue":
+            return True
+    return False
+
+
 def _has_custom_aws_endpoint() -> bool:
     """True when an ``AWS_ENDPOINT_URL`` override targets a non-AWS endpoint.
 
@@ -851,11 +861,13 @@ class AwsIacPlugin:
         storage = _storage_by_bucket(contract, cid)
         # ...and on an emulator, where it is every Glue resource's catalog id
         # (see :func:`_emulator_catalog_id`).
+        # ...and when a table's maintenance is Glue's optimizers, whose catalog id it is.
         if (
             _contract_uses_lakeformation(contract)
             or _references_caller_account(contract)
             or any(s.product_key for s in storage.values())
             or _has_custom_aws_endpoint()
+            or _has_glue_maintenance(contract)
         ):
             data.setdefault("aws_caller_identity", {})["fluid_lf_caller"] = {}
         # A ``cross-account`` LF bucket policy filters its grantees at plan
@@ -1554,6 +1566,102 @@ def _emit_glue(
     if table_layout.keys:
         _partition_table(resources, table_body, table_key, table_layout)
     resources.setdefault("aws_glue_catalog_table", {})[table_key] = table_body
+    if contract is not None:
+        _emit_table_optimizers(resources, contract, expose, table_key)
+
+
+#: Glue's own defaults, which an optimizer is emitted without: an argument a newer
+#: ``hashicorp/aws`` added (``compaction_configuration`` 6.58.0, ``run_rate_in_hours``
+#: 6.13.0) is written only when the contract asks for something else.
+_GLUE_COMPACTION_DEFAULT = "binpack"
+_GLUE_RUN_RATE_DEFAULT = 24
+
+
+def _emit_table_optimizers(
+    resources: Dict[str, Any], contract: Mapping[str, Any], expose: str, table_key: str
+) -> None:
+    """The Glue Data Catalog's table optimizers of an expose whose
+    ``iceberg.maintenance`` is ``backend: glue`` (``fluid_build/maintenance``): one
+    ``aws_glue_catalog_table_optimizer`` per declared step, compaction, retention (the
+    snapshots' expiry) and orphan file deletion, each run by AWS as ``roleArn``."""
+    from fluid_build.maintenance.spec import declares_maintenance, read_maintenance
+
+    if not declares_maintenance(contract):
+        return
+    tables, errors = read_maintenance(contract)
+    tm = next((t for t in tables if t.expose_id == expose and t.backend == "glue"), None)
+    if errors and tm is None:
+        mine = [e for e in errors if e.startswith(f"exposes[{expose}].")]
+        if mine:
+            raise UnsupportedBindingError(
+                "iceberg-maintenance",
+                f"{mine[0]}.",
+                ("Fix the field the message names; fluid validate reports the same.",),
+            )
+    if tm is None:
+        return
+    table = f"aws_glue_catalog_table.{table_key}"
+    base = {
+        "catalog_id": tofu_ref("data.aws_caller_identity.fluid_lf_caller.account_id"),
+        "database_name": tofu_ref(f"{table}.database_name"),
+        "table_name": tofu_ref(f"{table}.name"),
+    }
+    optimizers = resources.setdefault("aws_glue_catalog_table_optimizer", {})
+    if tm.compaction is not None:
+        configuration: Dict[str, Any] = {"role_arn": tm.role_arn, "enabled": True}
+        iceberg: Dict[str, Any] = {}
+        if tm.compaction.strategy != _GLUE_COMPACTION_DEFAULT:
+            iceberg["strategy"] = tm.compaction.strategy
+        if tm.compaction.min_input_files is not None:
+            iceberg["min_input_files"] = tm.compaction.min_input_files
+        if tm.compaction.delete_file_threshold is not None:
+            iceberg["delete_file_threshold"] = tm.compaction.delete_file_threshold
+        if iceberg:
+            configuration["compaction_configuration"] = {"iceberg_configuration": iceberg}
+        optimizers[f"{table_key}_compaction"] = {
+            **base,
+            "type": "compaction",
+            "configuration": configuration,
+        }
+    rate = (
+        {"run_rate_in_hours": tm.run_every_hours}
+        if tm.run_every_hours != _GLUE_RUN_RATE_DEFAULT
+        else {}
+    )
+    if tm.expire is not None:
+        optimizers[f"{table_key}_retention"] = {
+            **base,
+            "type": "retention",
+            "configuration": {
+                "role_arn": tm.role_arn,
+                "enabled": True,
+                "retention_configuration": {
+                    "iceberg_configuration": {
+                        "snapshot_retention_period_in_days": tm.expire.older_than_seconds // 86400,
+                        "number_of_snapshots_to_retain": tm.expire.retain_last,
+                        "clean_expired_files": tm.expire.clean_expired_files,
+                        **rate,
+                    }
+                },
+            },
+        }
+    if tm.orphans is not None:
+        optimizers[f"{table_key}_orphan_file_deletion"] = {
+            **base,
+            "type": "orphan_file_deletion",
+            "configuration": {
+                "role_arn": tm.role_arn,
+                "enabled": True,
+                "orphan_file_deletion_configuration": {
+                    "iceberg_configuration": {
+                        "orphan_file_retention_period_in_days": (
+                            tm.orphans.older_than_seconds // 86400
+                        ),
+                        **rate,
+                    }
+                },
+            },
+        }
 
 
 def _partition_table(
