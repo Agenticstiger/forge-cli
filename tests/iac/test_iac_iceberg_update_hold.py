@@ -31,6 +31,7 @@ from fluid_build.iac.providers.aws_adoption import (
     ICEBERG_HELD,
     held_drift,
     iceberg_update_hold,
+    review_glue_table,
 )
 from fluid_build.iac.table_hold import TableHold
 from tests.iac.test_iac_table_adoption import (
@@ -217,6 +218,22 @@ def test_the_note_quotes_catalog_text_safely_and_skips_what_the_plan_does_not_kn
     assert len(line) < 500 and line.endswith("… in the contract")
 
 
+def test_the_adoption_reviews_column_order_lists_every_contract_column():
+    """Two contract columns whose names differ only in case are matched once, and the
+    order difference still names every column the contract lists, as before."""
+    before = _table([_column("b", "int", field_id=1), _column("a", "int", field_id=2)])
+    after = copy.deepcopy(before)
+    after["storage_descriptor"][0]["columns"] = [
+        _column("a", "int"),
+        _column("B", "int"),
+        _column("b", "int"),
+    ]
+
+    differences, _updates = review_glue_table(_change(before, after)["change"], ICEBERG)
+
+    assert "column order: the table has (b, a), the contract (a, B, b)" in differences
+
+
 def test_the_order_of_the_same_columns_is_a_line_of_its_own():
     before = _table([_column("a", "int", field_id=1), _column("b", "int", field_id=2)])
     after = copy.deepcopy(before)
@@ -372,6 +389,8 @@ def test_a_saved_plan_may_update_only_the_tables_its_record_names(capfd):
 
     (allowed,) = hold.review(plugin, _module(), update, _args(), CHANGED, recorded=["sales.orders"])
     assert allowed.table == "sales.orders"
+    # The bound apply named the table already (say_bound), and its audit names it again.
+    assert "is updated in place" not in capfd.readouterr().out
     for recorded in ([], ["sales.other"]):
         with pytest.raises(CLIError) as raised:
             # The apply's own flag decides nothing for a saved plan.
@@ -386,6 +405,10 @@ def test_a_plan_not_read_back_is_refused_whatever_the_flags():
         with pytest.raises(CLIError) as raised:
             hold.review(get_iac_plugin("aws"), _module(), None, args, CHANGED)
         assert "could not be read back" in raised.value.context["error"]
+        # Its remedy is to read the plan again, never the flag that cannot let it through.
+        (remedy,) = raised.value.context["remediation"]
+        assert remedy.startswith("Re-run the apply") and "no flag lets" in remedy
+        assert "re-run with --allow-iceberg-update" not in remedy
 
 
 def test_plan_tofu_only_says_the_apply_will_refuse(capfd):

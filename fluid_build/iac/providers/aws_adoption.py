@@ -314,7 +314,7 @@ def _column_changes(
             if not same:
                 changes.append((kind, found, wanted))
     if set(live_by) == set(wanted_by) and list(live_by) != list(wanted_by):
-        changes.append(("order", live, list(wanted_by.values())))
+        changes.append(("order", live, _columns(planned_descriptor)))
     if older:
         changes.append(("older", older, None))
     return changes

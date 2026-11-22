@@ -218,6 +218,11 @@ def review(
             "table cannot be ruled out",
             [],
             enforce=enforce,
+            remediation=[
+                "Re-run the apply: its plan is made again. If `tofu show -json` still cannot "
+                "read it, check that the OpenTofu version and providers in the workdir can "
+                "read their own plan; no flag lets an unread plan through"
+            ],
         )
         return []
     updates = planned_updates(plugin, module, shown)
@@ -228,7 +233,8 @@ def review(
     else:
         named = set(recorded)
         allowed = {address for address, entry in updates.items() if entry.table in named}
-    for address in sorted(allowed):
+    # A saved plan named its tables already (:func:`say_bound`), and the apply audits them.
+    for address in sorted(allowed) if recorded is None else ():
         entry = updates[address]
         cprint_literal(
             f"  iceberg:     {entry.table} is updated in place ({ALLOW_ICEBERG_UPDATE_FLAG}); "
@@ -299,16 +305,21 @@ def audit_updated(logger: logging.Logger, updated: Sequence[Held]) -> None:
     )
 
 
-def _refuse(why: str, refused: Sequence[Held], *, enforce: bool, bound: bool = False) -> None:
+def _refuse(
+    why: str,
+    refused: Sequence[Held],
+    *,
+    enforce: bool,
+    bound: bool = False,
+    remediation: Optional[List[str]] = None,
+) -> None:
     if not enforce:
-        cprint_literal(
-            f"  ⚠️  {why}: `fluid apply` will refuse it unless the plan is made with "
-            f"{ALLOW_ICEBERG_UPDATE_FLAG}",
-            soft_wrap=True,
-        )
+        unless = "" if remediation else f" unless the plan is made with {ALLOW_ICEBERG_UPDATE_FLAG}"
+        cprint_literal(f"  ⚠️  {why}: `fluid apply` will refuse it{unless}", soft_wrap=True)
         return
     names = [entry.table for entry in refused]
-    remediation = [REMEDY]
+    if remediation is None:
+        remediation = [REMEDY]
     if bound:
         remediation = [
             "Make the plan again with `fluid plan --tofu`: it leaves these tables as they "
