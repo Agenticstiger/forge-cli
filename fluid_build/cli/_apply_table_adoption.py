@@ -56,6 +56,17 @@ class Adoption:
     held: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class Foreign:
+    """The found tables forge did not make for this product (``tables``: their import
+    blocks), and the names (``<database>.<table>``) of those among them that carry forge's
+    marker but name no product (``unnamed``): made before forge recorded the product id on
+    a table, they may be this product's or another's."""
+
+    tables: List[Any] = field(default_factory=list)
+    unnamed: Tuple[str, ...] = ()
+
+
 def asked(args: Any) -> bool:
     """Did the run ask to adopt existing tables?"""
     return bool(getattr(args, "adopt_tables", False))
@@ -68,9 +79,10 @@ def tables_of(blocks: Sequence[Any]) -> List[Any]:
 
 def foreign_tables(
     plugin: Any, adopted: Sequence[Any], workdir: str, env: Any, contract: Mapping[str, Any]
-) -> List[Any]:
+) -> Foreign:
     """The tables among ``adopted`` that forge did not make for this product: the ones
-    ``--adopt-tables`` is for.
+    ``--adopt-tables`` is for, with those that carry forge's marker but name no product
+    (``table_names_no_product``), for which the refusal names a remedy of their own.
 
     A table that carries forge's own marker for this contract (``table_made_by_forge``: on
     AWS the Glue parameters ``managed_by: fluid`` and ``fluid_product_id`` its module
@@ -84,13 +96,26 @@ def foreign_tables(
     tables = tables_of(adopted)
     made_by_forge = getattr(plugin, "table_made_by_forge", None)
     if not tables or not callable(made_by_forge):
-        return tables
+        return Foreign(tables)
     values: Dict[str, Any] = {
         str(resource.get("address") or ""): resource.get("values") or {}
         for resource in runner.tofu_state_resources(workdir, env=env)
         if isinstance(resource, Mapping)
     }
-    return [block for block in tables if not made_by_forge(values.get(block.to) or {}, contract)]
+    foreign = [block for block in tables if not made_by_forge(values.get(block.to) or {}, contract)]
+    names_no_product = getattr(plugin, "table_names_no_product", None)
+    unnamed = (
+        tuple(
+            sorted(
+                str(block.table)
+                for block in foreign
+                if names_no_product(values.get(block.to) or {})
+            )
+        )
+        if callable(names_no_product)
+        else ()
+    )
+    return Foreign(foreign, unnamed)
 
 
 def before_lookup(
@@ -128,29 +153,60 @@ def before_lookup(
     )
 
 
-def refuse_unless_asked(args: Any, tables: Sequence[Any]) -> None:
+def refuse_unless_asked(args: Any, found: Foreign, contract: Mapping[str, Any]) -> None:
     """Stop a run that found existing tables the state does not hold, unless it asked
     to adopt them. Raised inside ``_imports_kept_only_by_an_apply``, or after it, so
-    nothing the look-up imported stays in state."""
-    if not tables or asked(args):
+    nothing the look-up imported stays in state.
+
+    A table that carries forge's marker but names no product gets a message of its own,
+    under the same event: forge cannot tell whose it is, and the remedy is to record the
+    product id on it once (a run that keeps no state meets it again on every run, and
+    adopting it does not write the id).
+    """
+    if not found.tables or asked(args):
         return
-    names = sorted(str(block.table) for block in tables)
-    raise CLIError(
-        1,
-        "table_adoption_requires_flag",
-        {
-            "error": f"{len(names)} table(s) the contract names already exist, and this "
-            f"OpenTofu state does not manage them: {', '.join(names)}. forge takes over an "
-            "existing table only when asked",
-            "tables": names,
-            "remediation": [
-                f"To bring them under forge, re-run with {ADOPT_TABLES_FLAG}: each is adopted "
-                "only if it matches the contract (its columns, location and format), and "
-                "one that differs is refused with its differences",
-                "If a state that manages them was lost or moved, point --state-backend at it",
-                "To leave a table outside forge, remove it from the contract's exposes",
-            ],
-        },
+    names = sorted(str(block.table) for block in found.tables)
+    error = (
+        f"{len(names)} table(s) the contract names already exist, and this OpenTofu state "
+        f"does not manage them: {', '.join(names)}. forge takes over an existing table only "
+        "when asked"
+    )
+    remediation = [
+        f"To bring them under forge, re-run with {ADOPT_TABLES_FLAG}: each is adopted "
+        "only if it matches the contract (its columns, location and format), and "
+        "one that differs is refused with its differences",
+        "If a state that manages them was lost or moved, point --state-backend at it",
+        "To leave a table outside forge, remove it from the contract's exposes",
+    ]
+    if found.unnamed:
+        error += (
+            f". forge made {', '.join(found.unnamed)} but recorded no product id on it "
+            "(a table made from a contract over 50 KB before forge recorded one), so it "
+            "cannot tell whether it is this product's"
+        )
+        remediation = [
+            _record_the_product_id(str(contract.get("id") or "<product id>")),
+            "Or, where the run can pass flags and keeps its OpenTofu state, run once with "
+            f"{ADOPT_TABLES_FLAG}: the table is adopted only if it matches the contract",
+            *remediation[1:],
+        ]
+    context: Dict[str, Any] = {"error": error, "tables": names}
+    if found.unnamed:
+        context["unnamed"] = list(found.unnamed)
+    context["remediation"] = remediation
+    raise CLIError(1, "table_adoption_requires_flag", context)
+
+
+def _record_the_product_id(product: str) -> str:
+    """The one-time remedy for a forge-made table that names no product: the id written as
+    a table parameter, with the write bound to the version it read."""
+    return (
+        "If it is this product's, record the id on it once: with the table's writers "
+        f"paused, read it with 'aws glue get-table', add fluid_product_id={product} to its "
+        "Parameters, and write it back with 'aws glue update-table --table-input <the "
+        "table, without its read-only fields> --version-id <the VersionId it read>', so a "
+        "commit that lands in between fails the update instead of being reverted. Every "
+        "later run re-attaches the table"
     )
 
 

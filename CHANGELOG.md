@@ -321,6 +321,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `variant`, as DuckDB's `UNION` already does, and the schema-drift gate reads the two as one
   type family, so a contract written that way does not fail at apply.
 
+### Upgrade notes
+
+- A Glue table that forge made before this release from a contract over 50 KB carries forge's
+  `managed_by: fluid` marker but no product id: forge dropped its record of the contract, and
+  `fluid_product_id` did not exist yet. `fluid apply` now refuses it with
+  `table_adoption_requires_flag`, in a message of its own that names the one-time remedy. If the
+  table is that product's, add the table parameter `fluid_product_id=<product id>` once, with the
+  table's writers paused, through `aws glue update-table` with `--version-id` from a fresh
+  `aws glue get-table`, so a concurrent commit fails the update instead of being reverted. Where
+  the run can pass flags and keeps its state, `--adopt-tables` once also works; adopting does not
+  write the id, so a run that keeps no state needs the parameter.
+
 ## [0.36.0] — 2026-11-19
 
 ### Added

@@ -74,6 +74,9 @@ class IacProviderPlugin(Protocol):
       contract's exact product id; such a table is this product's own, re-attached as
       before without ``--adopt-tables``. A table with no product id is not. Without the
       capability every found table needs the flag.
+    * ``table_names_no_product(values)``: whether a found table carries that marker but
+      names no product (made before forge recorded the id), so the refusal names the
+      one-time remedy of recording it. Optional.
     * ``adoption_hold(declared)``: the attributes an adopted table keeps as it is in
       the run that adopts it (its body in the module); the engine plans that table again
       with them in ``ignore_changes`` and refuses a plan that still updates it in place.

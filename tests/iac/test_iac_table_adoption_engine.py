@@ -393,26 +393,56 @@ def _made_by_forge(
     monkeypatch.setattr(engine.runner, "tofu_state_resources", lambda *a, **k: state)
 
 
+def _plain_refusal(error: CLIError) -> None:
+    """The refusal of a table forge did not make for this product, with no remedy of
+    recording an id on it: a table that names another product, or carries no marker."""
+    assert error.event == "table_adoption_requires_flag"
+    assert "recorded no product id" not in error.context["error"]
+    assert "unnamed" not in error.context
+    assert not [line for line in error.context["remediation"] if "fluid_product_id" in line]
+
+
 def test_a_table_another_product_made_still_needs_the_flag(tofu, tmp_path, monkeypatch):
     _made_by_forge(monkeypatch, product="billing.invoices")
 
     with pytest.raises(CLIError) as raised:
         engine.apply_via_opentofu(_args(tmp_path), _LOG)
 
-    assert raised.value.event == "table_adoption_requires_flag" and tofu["apply"] == 0
+    _plain_refusal(raised.value)
+    assert tofu["apply"] == 0
 
 
-def test_a_table_with_the_marker_and_no_product_id_or_record_needs_the_flag(
+def test_a_foreign_table_without_the_marker_keeps_the_plain_refusal(tofu, tmp_path, monkeypatch):
+    state = [{"address": TABLE, "values": {"parameters": {"classification": "iceberg"}}}]
+    monkeypatch.setattr(engine.runner, "tofu_state_resources", lambda *a, **k: state)
+
+    with pytest.raises(CLIError) as raised:
+        engine.apply_via_opentofu(_args(tmp_path), _LOG)
+
+    _plain_refusal(raised.value)
+    assert raised.value.context["tables"] == ["sales.orders"] and tofu["apply"] == 0
+
+
+def test_a_forge_made_table_that_names_no_product_is_refused_with_the_one_time_remedy(
     tofu, tmp_path, monkeypatch
 ):
-    """Another product made it from a contract over 50 KB, before forge set the product
-    id: nothing names whose it is, so it is not this product's."""
+    """Made from a contract over 50 KB before forge recorded the product id: nothing names
+    whose it is, so it is not this product's, and the refusal, under the same code, says
+    how to record the id once without reverting a concurrent commit."""
     _made_by_forge(monkeypatch, product=None)
 
     with pytest.raises(CLIError) as raised:
         engine.apply_via_opentofu(_args(tmp_path), _LOG)
 
+    context = raised.value.context
     assert raised.value.event == "table_adoption_requires_flag" and tofu["apply"] == 0
+    assert context["unnamed"] == ["sales.orders"]
+    assert "forge made sales.orders but recorded no product id on it" in context["error"]
+    remedy, adopt_once = context["remediation"][:2]
+    assert "fluid_product_id=sales.orders" in remedy
+    assert "'aws glue get-table'" in remedy and "'aws glue update-table" in remedy
+    assert "--version-id <the VersionId it read>" in remedy and "writers paused" in remedy
+    assert "--adopt-tables" in adopt_once and "keeps its OpenTofu state" in adopt_once
 
 
 def test_with_the_flag_a_table_with_no_product_id_is_compared(tofu, tmp_path, monkeypatch):

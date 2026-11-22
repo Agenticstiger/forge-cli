@@ -232,6 +232,28 @@ def _recorded_product_id(recorded: Any) -> Optional[str]:
     return value
 
 
+def _forge_parameters(values: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    """A Glue table's parameters (its values in state) when they carry forge's marker,
+    ``managed_by: fluid``; ``None`` otherwise."""
+    parameters = values.get("parameters")
+    if not isinstance(parameters, Mapping):
+        return None
+    if str(parameters.get("managed_by") or "").strip().lower() != "fluid":
+        return None
+    return parameters
+
+
+def _named_product(parameters: Mapping[str, Any]) -> Optional[str]:
+    """The product a forge-made table names: its ``fluid_product_id`` or, only for a table
+    without that parameter, the id of the contract it records. ``None`` when it names none
+    (no record, a record with no readable top-level id, or an empty value)."""
+    if PRODUCT_ID_PARAMETER in parameters:
+        named = parameters.get(PRODUCT_ID_PARAMETER)
+    else:
+        named = _recorded_product_id(parameters.get("fluid_contract"))
+    return named if isinstance(named, str) and named else None
+
+
 # FLUID column type → Hive/Glue column type, keyed on the lower-cased base name
 # (``varchar(255)`` is ``varchar``). Only a type Hive holds without loss is here;
 # ``_hive_outcome`` classifies every other one.
@@ -1025,19 +1047,16 @@ class AwsIacPlugin:
         that names no id or another one, is not this product's: ``--adopt-tables``
         compares it like any table forge did not make.
         """
-        parameters = values.get("parameters")
-        if not isinstance(parameters, Mapping):
-            return False
-        if str(parameters.get("managed_by") or "").strip().lower() != "fluid":
-            return False
+        parameters = _forge_parameters(values)
         product = str(contract.get("id") or "")
-        if not product:
-            return False
-        if PRODUCT_ID_PARAMETER in parameters:
-            made_for = parameters.get(PRODUCT_ID_PARAMETER)
-        else:
-            made_for = _recorded_product_id(parameters.get("fluid_contract"))
-        return isinstance(made_for, str) and made_for == product
+        return parameters is not None and bool(product) and _named_product(parameters) == product
+
+    def table_names_no_product(self, values: Mapping[str, Any]) -> bool:
+        """Does this Glue table carry forge's marker but name no product? Forge made it
+        before it set ``fluid_product_id``, from a contract over 50 KB, whose record it
+        dropped: it may be any product's. ``values`` is the table in state."""
+        parameters = _forge_parameters(values)
+        return parameters is not None and _named_product(parameters) is None
 
     def adoption_hold(self, declared: Mapping[str, Any]) -> Tuple[str, ...]:
         """The attributes an adopted table keeps as it is in the run that adopts it

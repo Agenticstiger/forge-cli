@@ -24,6 +24,7 @@ from tests.iac.test_iac_table_adoption_engine import (  # noqa: F401 - tofu is a
     CONTRACT,
     DIFFERING,
     TABLE,
+    _made_by_forge,
     tofu,
 )
 
@@ -96,6 +97,23 @@ def test_apply_refuses_an_existing_table_without_the_flag(tofu, tmp_path, capsys
     out = _out(capsys)
     assert "ERR_TABLE_ADOPTION_REQUIRES_FLAG" in out
     assert "sales.orders" in out and "--adopt-tables" in out
+    assert "recorded no product id" not in out and "fluid_product_id=sales.orders" not in out
+    assert tofu["plans"] == [] and tofu["apply"] == 0
+
+
+def test_apply_names_the_one_time_remedy_for_a_forge_made_table_without_a_product_id(
+    tofu, tmp_path, capsys, monkeypatch
+):
+    _made_by_forge(monkeypatch, product=None)
+    contract = _contract(tmp_path)
+
+    assert _main("apply", str(contract), "--yes") == 1
+
+    out = _out(capsys)
+    assert "ERR_TABLE_ADOPTION_REQUIRES_FLAG" in out
+    assert "forge made sales.orders but recorded no product id on it" in out
+    assert "add fluid_product_id=sales.orders to its Parameters" in out
+    assert "--version-id <the VersionId it read>" in out
     assert tofu["plans"] == [] and tofu["apply"] == 0
 
 

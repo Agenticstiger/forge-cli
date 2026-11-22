@@ -411,6 +411,12 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
             + "checks each table against the contract and saves the plan",
             "Then apply that plan with 'fluid apply plan.json', or re-run this apply "
             + "with --adopt-tables",
+            "A table forge made that names no product (from a contract over 50 KB, before "
+            + "forge recorded the id): if it is this product's, add the Glue table parameter "
+            + "fluid_product_id=<the contract's id> once, with the table's writers paused, "
+            + "through 'aws glue update-table' with --version-id from a fresh 'aws glue "
+            + "get-table', so a concurrent commit fails instead of being reverted; or, where "
+            + "the run can pass flags and keeps its state, run once with --adopt-tables",
         ],
         None,
     ),

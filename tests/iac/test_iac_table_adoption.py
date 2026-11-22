@@ -738,6 +738,28 @@ def test_the_product_id_parameter_decides_before_the_recorded_contract(product_i
     assert made_by_forge is made
 
 
+@pytest.mark.parametrize(
+    "parameters, unnamed",
+    [
+        ({"managed_by": "fluid"}, True),
+        ({"managed_by": "fluid", "fluid_contract": "fluidVersion: 0.7.7\n"}, True),
+        ({"managed_by": "fluid", "fluid_contract": '{"id": "sales.orders"}'}, True),
+        ({"managed_by": "fluid", "fluid_product_id": ""}, True),
+        ({"managed_by": "fluid", "fluid_product_id": "billing.invoices"}, False),
+        ({"managed_by": "fluid", "fluid_contract": "id: billing.invoices\n"}, False),
+        ({"managed_by": "fluid", "fluid_product_id": "sales.orders"}, False),
+        ({"classification": "iceberg"}, False),
+        (None, False),
+    ],
+)
+def test_a_table_names_no_product_only_with_forge_s_marker_and_no_readable_id(parameters, unnamed):
+    """Only such a table gets the remedy of recording the id: one that names another
+    product is that product's, and one without the marker is not forge's."""
+    values = {} if parameters is None else {"parameters": parameters}
+
+    assert get_iac_plugin("aws").table_names_no_product(values) is unnamed
+
+
 def test_a_contract_without_an_id_makes_no_table_its_own():
     parameters = {"managed_by": "fluid", "fluid_product_id": "", "fluid_contract": "name: x\n"}
 

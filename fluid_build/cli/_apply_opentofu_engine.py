@@ -234,8 +234,9 @@ def _tables_through_import_blocks(
     so the plan shows its import and the check reads it from the saved plan. The other
     imports, a table forge made among them, stay in state for the apply, as before.
     """
-    tables = _table_adoption.foreign_tables(eng.plugin, adopted, eng.workdir, eng.env, eng.contract)
-    _table_adoption.refuse_unless_asked(args, tables)
+    found = _table_adoption.foreign_tables(eng.plugin, adopted, eng.workdir, eng.env, eng.contract)
+    _table_adoption.refuse_unless_asked(args, found, eng.contract)
+    tables = found.tables
     if not tables:
         return []
     addresses = [block.to for block in tables]
@@ -683,10 +684,11 @@ def _plan_with_opentofu(
         )
         # Read while the look-up's imports are in state: a table forge did not make stops
         # the plan unless it was asked to adopt it; the hand-back runs first, as it stops.
-        tables = _table_adoption.foreign_tables(
+        found = _table_adoption.foreign_tables(
             eng.plugin, adopted, eng.workdir, eng.env, eng.contract
         )
-        _table_adoption.refuse_unless_asked(args, tables)
+        _table_adoption.refuse_unless_asked(args, found, eng.contract)
+        tables = found.tables
     _refuse_unreleased_imports(eng, adopted)
     if adopted:
         # Escaped as the module is: an import id carries contract text.
