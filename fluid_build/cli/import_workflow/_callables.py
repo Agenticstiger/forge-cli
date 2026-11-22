@@ -117,6 +117,10 @@ Place = Tuple[Union[int, str], Tuple[str, ...]]
 Template = Tuple[Union[str, Place], ...]
 
 #: Calls that run a command: the first argument is the command, as words or as a line.
+#: The EMR methods whose argument holds the work (see :meth:`Follower._emr_call`).
+_EMR_METHODS = frozenset(
+    {"add_job_flow_steps", "run_job_flow", "create_job_flow", "start_job_run", "submit_job"}
+)
 _RUNNERS = frozenset(
     {
         "subprocess.run",
@@ -202,6 +206,38 @@ def _as_text(value: Any) -> Optional[str]:
     if is_scalar(value) and value is not None and not isinstance(value, bool):
         return str(value)
     return None
+
+
+def _steps_built_by_calls(calls: Sequence[Tuple[ast.Call, List[Submit]]]) -> List[Submit]:
+    """What the calls of a body submitted, in order. An EMR call whose work a function builds
+    (``add_job_flow_steps(Steps=steps(script))``) does not fold, and says a step whose script is
+    not known; when a call inside it submitted a script that is known, that is the step: it is
+    submitted as the EMR call submits (``emr-step``), and the unknown one is dropped. The calls
+    are in the order they are written, so those inside one follow it."""
+    found = [list(submits) for _, submits in calls]
+    for k, (node, submits) in enumerate(calls):
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr in _EMR_METHODS):
+            continue
+        unknown = [s for s in submits if not isinstance(s.script, str)]
+        if not unknown:
+            continue
+        end = node_position(node, end=True)
+        inside = []
+        for j in range(k + 1, len(calls)):
+            if node_position(calls[j][0]) >= end:
+                break
+            if any(isinstance(s.script, str) for s in found[j]):
+                inside.append(j)
+        if not inside:
+            continue
+        found[k] = [s for s in submits if isinstance(s.script, str)]
+        for j in inside:
+            found[j] = [
+                replace(s, runtime=unknown[0].runtime) if isinstance(s.script, str) else s
+                for s in found[j]
+            ]
+    return [submit for submits in found for submit in submits]
 
 
 def _keyword(call: ast.Call, *names: str) -> Optional[ast.expr]:
@@ -788,7 +824,7 @@ class Follower:
         depth: int,
         stack: Tuple[ast.AST, ...],
     ) -> List[Submit]:
-        from_calls: List[Submit] = []
+        calls: List[Tuple[ast.Call, List[Submit]]] = []
         from_lists: List[Submit] = []
         for node in nodes:
             if self._visits() <= 0:
@@ -796,9 +832,10 @@ class Follower:
                 break
             self._charge(1)
             if isinstance(node, ast.Call):
-                from_calls.extend(self._call(node, module, folder, line, depth, stack))
+                calls.append((node, self._call(node, module, folder, line, depth, stack)))
             else:
                 from_lists.extend(self._argv(node, folder, line))
+        from_calls = _steps_built_by_calls(calls)
         # an argument list the body hands to a call that was read is that call's submit
         seen = {(s.script, s.shown, s.args) for s in from_calls}
         return from_calls + [s for s in from_lists if (s.script, s.shown, s.args) not in seen]

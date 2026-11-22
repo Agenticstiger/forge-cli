@@ -1314,6 +1314,37 @@ PythonOperator(task_id="heavy", python_callable=heavy, dag=dag)
     assert any("stopped following the functions its Python tasks run" in n for n in found.notes)
 
 
+def test_an_emr_step_a_function_builds_is_that_functions_step():
+    found = tasks(
+        _dag(
+            """
+            import os
+
+            def _steps(script, args):
+                return [{"Name": "run", "HadoopJarStep": {"Jar": "command-runner.jar", "Args": ["spark-submit", "--deploy-mode", "cluster", script, *args]}}]
+
+            def submit(script, args=(), **kwargs):
+                client = boto3.client("emr")
+                client.add_job_flow_steps(JobFlowId="j", Steps=_steps(script, args))
+
+            def unread(script, **kwargs):
+                boto3.client("emr").add_job_flow_steps(JobFlowId="j", Steps=tasks.build_steps(script))
+                os.system("spark-submit s3://jobs/c.py")
+
+            PythonOperator(task_id="built", python_callable=submit, op_kwargs={"script": "s3://jobs/a.py", "args": ["--day", "1"]}, dag=dag)
+            PythonOperator(task_id="unread", python_callable=unread, op_kwargs={"script": "s3://jobs/b.py"}, dag=dag)
+            """
+        )
+    )
+    # the step the function builds is the step, submitted to EMR: no step of unknown script
+    assert submits(found["built"]) == [("emr-step", "s3://jobs/a.py", ("--day", "1"))]
+    # a step a function that is not read builds stays one whose script is not known, and a
+    # command run after the call is not taken for it
+    step, command = found["unread"].submits
+    assert step.runtime == "emr-step" and step.script is None
+    assert (command.runtime, command.script) == ("spark-submit", "s3://jobs/c.py")
+
+
 def test_a_helper_never_takes_a_name_of_the_standard_library():
     found = tasks(
         _dag(
