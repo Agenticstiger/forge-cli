@@ -48,6 +48,11 @@ _MAX_STREAMING_ATTEMPTS_PER_HOUR = 10
 RESTART_WINDOW_S = 3600.0
 #: The runner argument that marks a run started again after another one died.
 RESTART_FLAG = "--fluid-restart-of"
+#: The runner argument that gives a stream's run its stop key: the request ``fluid apply``
+#: writes to stop that run between batches is named by it (``_adapters.stop_request_uri``).
+STOP_KEY_FLAG = "--fluid-stop-key"
+#: How long a stream asked to stop between batches has before it is cancelled (``_reconcile``).
+STOP_GRACE_ENV = "FLUID_SPARK_STOP_GRACE_SECONDS"
 #: Names the release a deploy belongs to (a tag, a build number, a release's identity digest):
 #: the runner stamps it on every commit as ``fluid.release-id`` when set.
 RELEASE_ID_ENV = "FLUID_RELEASE_ID"
@@ -317,13 +322,19 @@ class DesiredRun:
             args += ["--fluid-checkpoint", self.checkpoint_id]
         return args
 
-    def entry_args(self, restart_of: Optional[str] = None) -> List[str]:
+    def entry_args(
+        self, restart_of: Optional[str] = None, stop_key: Optional[str] = None
+    ) -> List[str]:
         """The runner's arguments. ``restart_of`` marks a run started again after the run it
-        names died: the reconcile counts those marks against :attr:`restarts_per_hour`."""
+        names died: the reconcile counts those marks against :attr:`restarts_per_hour`.
+        ``stop_key``, the start's own token, names the request a later ``fluid apply`` writes
+        to stop a stream's run between batches (:data:`STOP_KEY_FLAG`); a batch run has none."""
         args = ["--config", self.job_uri, *self.identity_args()]
         if self.job_sha256:
             args += ["--fluid-job-sha256", self.job_sha256]
         args += self.stamp_args()
+        if stop_key and self.checkpoint:
+            args += [STOP_KEY_FLAG, stop_key]
         if restart_of:
             args += [RESTART_FLAG, restart_of]
         return args
@@ -390,8 +401,9 @@ class DesiredRun:
                     "started by a scheduler (fluid apply --mode amend-and-build); a plain "
                     "fluid apply does not run it"
                     if self.scheduled
-                    else "a changed config cancels the running job and starts it again on "
-                    "the same checkpoint; a new source on that checkpoint is refused"
+                    else "a changed config asks the running job to stop between batches "
+                    f"(cancelling it after {STOP_GRACE_ENV}) and starts it again on the same "
+                    "checkpoint; a new source on that checkpoint is refused"
                 ),
             },
         }

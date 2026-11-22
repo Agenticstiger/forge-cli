@@ -24,10 +24,11 @@ boto3 is the ``[aws]`` extra and is imported only by :func:`default_clients`.
 from __future__ import annotations
 
 import datetime as _dt
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
-from fluid_build.build_runners.spark._desired import RESTART_FLAG, DesiredRun
+from fluid_build.build_runners.spark._desired import RESTART_FLAG, STOP_KEY_FLAG, DesiredRun
 from fluid_build.spark import names as _names
 
 PENDING, RUNNING, CANCELLING = "PENDING", "RUNNING", "CANCELLING"
@@ -88,6 +89,9 @@ EC2_ROLE_READS = ("iam:GetInstanceProfile", "iam:ListAttachedRolePolicies")
 
 #: ``(service, region) -> boto3 client``
 ClientFactory = Callable[[str, str], Any]
+#: A stop key as the runner takes it (``forge_spark_runner._STOP_KEY``; a test checks they
+#: agree): it names a file, so never a ``/`` or a dot.
+STOP_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
 
 class SparkRunError(RuntimeError):
@@ -111,6 +115,10 @@ class RunInfo:
     #: The run this one was started again after (``--fluid-restart-of``): a restart, which
     #: counts against the stream's budget.
     restart_of: Optional[str] = None
+    #: The key a stream's run was started with (``--fluid-stop-key``): ``fluid apply`` asks it
+    #: to stop between batches through the request it names (:func:`stop_request_uri`). None
+    #: for a run an older ``fluid apply`` started: it can only be cancelled.
+    stop_key: Optional[str] = None
 
     @property
     def active(self) -> bool:
@@ -154,6 +162,7 @@ def _identity(args: Sequence[Any], tags: Optional[Mapping[str, Any]] = None) -> 
         ("--fluid-source", "source_id"),
         ("--fluid-checkpoint", "checkpoint_id"),
         (RESTART_FLAG, "restart_of"),
+        (STOP_KEY_FLAG, "stop_key"),
     ):
         if flag in items[:-1]:
             found[key] = items[items.index(flag) + 1]
@@ -165,6 +174,33 @@ def _identity(args: Sequence[Any], tags: Optional[Mapping[str, Any]] = None) -> 
         if tags and tags.get(tag):
             found[key] = str(tags[tag])
     return found
+
+
+def usable_stop_key(key: Optional[str]) -> bool:
+    """Whether ``key`` is a stop key the runner takes, so a request may be named by it."""
+    return bool(key) and STOP_KEY.fullmatch(str(key)) is not None
+
+
+def stop_request_uri(job_uri: str, key: str) -> str:
+    """Where the run started with stop key ``key`` looks for its stop request: ``stop/<key>``
+    beside the job config it reads (``forge_spark_runner.stop_request_uri``)."""
+    return f"{job_uri.rsplit('/', 1)[0]}/stop/{key}"
+
+
+def stop_request_body(run: DesiredRun) -> bytes:
+    """What a stop request holds, for whoever reads it: the runner only looks for the file."""
+    import json
+    import time
+
+    return json.dumps(
+        {
+            "stop": "between batches",
+            "requestedBy": "fluid apply",
+            "configHash": run.config_hash,
+            "requestedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+        sort_keys=True,
+    ).encode("utf-8")
 
 
 def _conf_params(conf: Mapping[str, str]) -> List[str]:
@@ -326,6 +362,42 @@ class Adapter:
     def cancel(self, run_id: str) -> None:
         raise NotImplementedError
 
+    def request_stop(self, info: RunInfo) -> Optional[str]:
+        """Ask ``info``, a stream's run of this build, to stop between batches: the object
+        :func:`stop_request_uri` names beside this build's job config, in the bucket
+        ``fluid apply`` uploads the job config to. Its URI, or None when the run cannot be
+        asked (no stop key: an older ``fluid apply`` started it).
+
+        Raises:
+            SparkRunError: the request could not be written (the message names it).
+        """
+        if not usable_stop_key(info.stop_key):
+            return None
+        uri = stop_request_uri(self.run.job_uri, str(info.stop_key))
+        bucket, _, key = uri.removeprefix("s3://").partition("/")
+        try:
+            (self.clients or default_clients)("s3", self.run.region).put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=stop_request_body(self.run),
+                ContentType="application/json",
+            )
+        except Exception as exc:  # noqa: BLE001 - botocore's errors; named, then raised
+            code = _error_code(exc) or type(exc).__name__
+            raise SparkRunError(f"the stop request {uri} could not be written: {code}") from exc
+        return uri
+
+    def withdraw_stop(self, uri: str) -> None:
+        """Delete a stop request once its run has ended or been cancelled. Best effort: one
+        left behind stops no other run, since its key is that run's own."""
+        bucket, _, key = uri.removeprefix("s3://").partition("/")
+        try:
+            (self.clients or default_clients)("s3", self.run.region).delete_object(
+                Bucket=bucket, Key=key
+            )
+        except Exception:  # noqa: BLE001,S110 - best effort, as the docstring says
+            pass
+
     def where(self) -> str:
         return ", ".join(f"{k} {v}" for k, v in self.run.target.items())
 
@@ -472,7 +544,7 @@ class EmrServerless(Adapter):
             "jobDriver": {
                 "sparkSubmit": {
                     "entryPoint": r.runner_uri,
-                    "entryPointArguments": r.entry_args(restart_of),
+                    "entryPointArguments": r.entry_args(restart_of, stop_key=token),
                     "sparkSubmitParameters": _submit_parameters(r.spark_conf),
                 }
             },
@@ -557,7 +629,7 @@ class Glue(Adapter):
 
     def start(self, token: str, restart_of: Optional[str] = None) -> str:
         r = self.checked()
-        args = r.entry_args(restart_of)
+        args = r.entry_args(restart_of, stop_key=token)
         arguments = {args[i]: args[i + 1] for i in range(0, len(args), 2)}
         if r.spark_conf:
             # Glue takes Spark settings as one --conf argument: "a=b --conf c=d".
@@ -750,7 +822,7 @@ class EmrEc2(Adapter):
             "client",
             *_conf_params(r.spark_conf),
             r.runner_uri,
-            *r.entry_args(restart_of),
+            *r.entry_args(restart_of, stop_key=token),
         ]
         out = self.client.add_job_flow_steps(
             JobFlowId=self.cluster,
@@ -833,7 +905,7 @@ class EmrEks(Adapter):
             "jobDriver": {
                 "sparkSubmitJobDriver": {
                     "entryPoint": r.runner_uri,
-                    "entryPointArguments": r.entry_args(restart_of),
+                    "entryPointArguments": r.entry_args(restart_of, stop_key=token),
                     "sparkSubmitParameters": _submit_parameters(r.spark_conf),
                 }
             },
@@ -896,6 +968,20 @@ class Local(Adapter):
 
     def cancel(self, run_id: str) -> None:
         self._runs.cancel(run_id)
+
+    def request_stop(self, info: RunInfo) -> Optional[str]:
+        """The request beside the job config at this machine's artifact root (a file, or an
+        ``s3://`` object): :meth:`Adapter.request_stop`."""
+        from fluid_build.build_runners.spark._local import write_stop_request
+
+        if not usable_stop_key(info.stop_key):
+            return None
+        return write_stop_request(self.host, self.run, str(info.stop_key))
+
+    def withdraw_stop(self, uri: str) -> None:
+        from fluid_build.build_runners.spark._local import remove_stop_request
+
+        remove_stop_request(self.host, uri)
 
     def retry_hint(self) -> str:
         """How to start a stream whose restarts are spent sooner, when the cause was this

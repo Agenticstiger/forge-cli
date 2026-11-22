@@ -9,12 +9,20 @@ run match the contract, idempotently:
 1. Find the build's runs (:mod:`._adapters`), each marked with the config hash it started
    with.
 2. A running job with this hash: nothing to do.
-3. A running job with another hash: cancel it, wait until it has stopped, and start the new
-   one on the SAME checkpoint, so it resumes where the old one stopped. Spark's checkpoint
-   holds the offsets of one topic on one cluster, so a new source on the old checkpoint is
-   refused before anything is cancelled; moving ``properties.stream.checkpoint`` to a new
-   prefix is how a stream changes source. A start the deployed job config or runner would
-   refuse (``_adapters.checked_run``) is refused before anything is cancelled too.
+3. A running job with another hash: stop it between two batches, wait until it has stopped,
+   and start the new one on the SAME checkpoint, so it resumes where the old one stopped
+   (:func:`_stop_between_batches`). The old run is asked through a request beside the job
+   config that names it by the stop key it was started with (``--fluid-stop-key``), and
+   stops once no batch is running in it; one that has not stopped within
+   ``FLUID_SPARK_STOP_GRACE_SECONDS``, or was started without a key, is cancelled. Spark's
+   checkpoint holds the offsets of one topic on one cluster, so a new source on the old
+   checkpoint is refused before anything is stopped, and the runner refuses at start a
+   checkpoint whose offsets name another topic; moving ``properties.stream.checkpoint`` to a
+   new prefix is how a stream changes source, and the job then starts from
+   ``startingOffsets``. A start the deployed job config or runner would refuse
+   (``_adapters.checked_run``) is refused before anything is stopped too. Borrowed: Apache
+   Flink's stop-with-savepoint (a job ends at a consistent point before its upgrade) and
+   the Flink Kubernetes operator's upgrade, which waits a while for that stop.
 4. No running job: start one. When the newest run of this config ended, how it ended
    decides (:func:`_after_end`):
 
@@ -56,11 +64,13 @@ poll a second longer each time, at most :data:`MAX_POLL_S`.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build.build_runners.spark._adapters import (
@@ -76,8 +86,13 @@ from fluid_build.build_runners.spark._adapters import (
     RunInfo,
     SparkRunError,
     adapter_for,
+    usable_stop_key,
 )
-from fluid_build.build_runners.spark._desired import RESTART_WINDOW_S, DesiredRun
+from fluid_build.build_runners.spark._desired import (
+    RESTART_WINDOW_S,
+    STOP_GRACE_ENV,
+    DesiredRun,
+)
 
 MAX_POLL_S = 15.0
 #: Failed reads in a row before a wait gives up (the run is never cancelled for them).
@@ -89,6 +104,9 @@ DEFAULT_WAIT_S = 900
 #: (``execution.runtime.timeout``).
 DEFAULT_RUN_WAIT_S = 6 * 3600
 WAIT_ENV = "FLUID_SPARK_WAIT_SECONDS"
+#: How long a stream asked to stop between batches has before it is cancelled
+#: (``STOP_GRACE_ENV``); 0 cancels at once.
+DEFAULT_STOP_GRACE_S = 300
 
 
 @dataclass
@@ -106,6 +124,8 @@ class Outcome:
     message: str = ""
     error: bool = False
     cancelled: List[str] = field(default_factory=list)
+    #: The runs of another config that ended once asked to stop between batches.
+    stopped: List[str] = field(default_factory=list)
 
     def line(self) -> str:
         run = f" run {self.run_id}" if self.run_id else ""
@@ -125,6 +145,7 @@ class Outcome:
             "message": self.message,
             "error": self.error,
             "cancelled": list(self.cancelled),
+            "stopped": list(self.stopped),
         }
 
 
@@ -146,6 +167,16 @@ def wait_budget(env: Optional[Mapping[str, str]] = None) -> float:
     except ValueError:
         value = DEFAULT_WAIT_S
     return value if value > 0 else DEFAULT_WAIT_S
+
+
+def stop_grace(env: Optional[Mapping[str, str]] = None) -> float:
+    """``FLUID_SPARK_STOP_GRACE_SECONDS``: a number from 0, else :data:`DEFAULT_STOP_GRACE_S`."""
+    raw = (os.environ if env is None else env).get(STOP_GRACE_ENV)
+    try:
+        value = float(raw) if raw else float(DEFAULT_STOP_GRACE_S)
+    except ValueError:
+        return float(DEFAULT_STOP_GRACE_S)
+    return value if math.isfinite(value) and value >= 0 else float(DEFAULT_STOP_GRACE_S)
 
 
 class _Clock:
@@ -368,12 +399,15 @@ class _Start:
     restart_of: Optional[str] = None
     ended: str = ""
     count: str = ""
+    #: How the runs of the config it replaces were stopped (:func:`_release_text`).
+    release: str = ""
 
     @property
     def message(self) -> str:
-        if not self.restart_of:
-            return ""
-        return f"{self.ended}; started again on the same checkpoint ({self.count})"
+        parts = [self.release] if self.release else []
+        if self.restart_of:
+            parts.append(f"{self.ended}; started again on the same checkpoint ({self.count})")
+        return "; ".join(parts)
 
 
 def _after_end(
@@ -437,6 +471,7 @@ def _reconcile_one(
     only: bool = False,
     wall: Callable[[], float] = time.time,
     confirm: Optional[Callable[[str], bool]] = None,
+    grace: float = DEFAULT_STOP_GRACE_S,
 ) -> Outcome:
     out = Outcome(run.build, run.runtime, "unchanged", where=adapter.where())
     now = wall()
@@ -477,17 +512,19 @@ def _reconcile_one(
             return out
         start = decided
     if dry_run:
-        return _planned(out, stale, matching, start)
+        return _planned(run, out, stale, matching, start, grace)
     if only and confirm is not None and not confirm(_question(run, out, stale, matching, start)):
         out.action, out.message = "declined", _declined_text(stale, start)
         return out
     if stale and not matching and not _checked_first(adapter, stale, out):
         return out
-    if not _cancel_and_wait(adapter, stale, out, clock, budget):
+    left, notes = _stop_between_batches(run, adapter, stale, out, clock, grace)
+    if not _cancel_and_wait(adapter, left, out, clock, budget):
         return out
     if matching:  # the new config already runs; the stale runs were extra
         out.run_id, out.state = matching[0].run_id, matching[0].state
         return out
+    start.release = _release_text(run, stale or ([last] if last else []), notes)
     return _start(run, adapter, start, out, clock=clock, budget=budget, since=since)
 
 
@@ -518,11 +555,16 @@ def _stops_reconcile_only(
 
 
 def _planned(
-    out: Outcome, stale: Sequence[RunInfo], matching: Sequence[RunInfo], start: _Start
+    run: DesiredRun,
+    out: Outcome,
+    stale: Sequence[RunInfo],
+    matching: Sequence[RunInfo],
+    start: _Start,
+    grace: float,
 ) -> Outcome:
     out.action = "planned"
     if stale:
-        out.message = f"would cancel {', '.join(s.run_id for s in stale)}" + (
+        out.message = f"would {_stop_plan(run, stale, grace)}" + (
             "" if matching else " and start the new config"
         )
     elif start.restart_of:
@@ -568,6 +610,113 @@ def _checked_first(adapter: Adapter, stale: Sequence[RunInfo], out: Outcome) -> 
         out.message = f"{_clean(exc)}; {they} left running"
         return False
     return True
+
+
+def _askable(run: DesiredRun, info: RunInfo, grace: float) -> bool:
+    """Whether ``info`` is asked to stop between batches rather than cancelled: a run of
+    another config (a second copy of this one is a second writer, cancelled at once) that
+    was started with a stop key, while the operator allows a grace."""
+    return (
+        grace > 0
+        and info.config_hash != run.config_hash
+        and info.state != CANCELLING
+        and usable_stop_key(info.stop_key)
+    )
+
+
+def _stop_plan(run: DesiredRun, stale: Sequence[RunInfo], grace: float) -> str:
+    """What a dry run says it would do with ``stale``."""
+    asked = [s.run_id for s in stale if _askable(run, s, grace)]
+    cancelled = [s.run_id for s in stale if not _askable(run, s, grace)]
+    parts = []
+    if asked:
+        parts.append(
+            f"stop {', '.join(asked)} between batches (cancelling a run still going after "
+            f"{int(grace)} s)"
+        )
+    if cancelled:
+        parts.append(f"cancel {', '.join(cancelled)}")
+    return " and ".join(parts)
+
+
+def _stop_between_batches(
+    run: DesiredRun,
+    adapter: Adapter,
+    stale: Sequence[RunInfo],
+    out: Outcome,
+    clock: _Clock,
+    grace: float,
+    what: str = "run",
+) -> Tuple[List[RunInfo], List[str]]:
+    """Ask each run of ``stale`` that can be asked (:func:`_askable`) to stop between
+    batches, and wait up to ``grace`` seconds for them to end (``out.stopped``). Returns the
+    runs left to cancel (the others, and those still going) and what happened to each run of
+    another config, each named ``what <id>``. The requests are withdrawn whatever happens, a
+    Ctrl-C included: a run that has not acted on its request yet keeps going."""
+    left: List[RunInfo] = []
+    notes: List[str] = []
+    requests: List[Tuple[RunInfo, str]] = []
+    try:
+        for old in stale:
+            if not _askable(run, old, grace):
+                if grace > 0 and old.config_hash != run.config_hash and old.state != CANCELLING:
+                    notes.append(
+                        f"{what} {old.run_id} was cancelled: it was started without a stop key "
+                        "(by an older fluid apply), so it cannot be asked to stop between batches"
+                    )
+                left.append(old)
+                continue
+            try:
+                uri = adapter.request_stop(old)
+            except SparkRunError as exc:
+                notes.append(f"{what} {old.run_id} was cancelled: {_clean(exc)}")
+                left.append(old)
+                continue
+            if uri is None:
+                left.append(old)
+                continue
+            requests.append((old, uri))
+        deadline = clock.now() + grace
+        for old, _uri in requests:
+            ended = clock.until(
+                partial(adapter.get, old.run_id),
+                lambda i: i.state in TERMINAL,
+                max(0.0, deadline - clock.now()),
+            )
+            if ended.state == SUCCEEDED:
+                out.stopped.append(old.run_id)
+                notes.append(f"{what} {old.run_id} stopped between batches")
+            elif ended.state in TERMINAL:
+                out.stopped.append(old.run_id)
+                notes.append(f"{what} {old.run_id} ended {ended.raw_state} as it was asked to stop")
+            else:
+                notes.append(
+                    f"{what} {old.run_id} did not stop between batches within {int(grace)} s "
+                    f"({STOP_GRACE_ENV}) and was cancelled"
+                )
+                left.append(old)
+    finally:
+        for _old, uri in requests:
+            adapter.withdraw_stop(uri)
+    return left, notes
+
+
+def _release_text(run: DesiredRun, previous: Sequence[RunInfo], notes: Sequence[str]) -> str:
+    """The configs a start moves the stream between, how the old runs stopped, and, when the
+    contract moved the checkpoint, where the new run starts reading."""
+    older = [p for p in previous if p.config_hash != run.config_hash]
+    if not older:
+        return "; ".join(notes)
+    hashes = sorted({_clean(p.config_hash)[:12] or "?" for p in older})
+    parts = [f"config {', '.join(hashes)} -> {run.config_hash[:12]}", *notes]
+    if run.checkpoint_id and any(
+        p.checkpoint_id and p.checkpoint_id != run.checkpoint_id for p in older
+    ):
+        parts.append(
+            "the checkpoint moved (properties.stream.checkpoint): the new run starts from "
+            "properties.stream.startingOffsets, and the old checkpoint is left as it is"
+        )
+    return "; ".join(parts)
 
 
 def _cancel_and_wait(
@@ -622,7 +771,7 @@ def _start(
     pending states."""
     adapter.check_target()
     run_id = adapter.start(_token(run), restart_of=start.restart_of)
-    out.action = "restarted" if out.cancelled or start.restart_of else "started"
+    out.action = "restarted" if out.cancelled or out.stopped or start.restart_of else "started"
     out.run_id = run_id
     try:
         # Two reconciles that found the stream dead at once both started it: the younger
@@ -691,7 +840,7 @@ def reconcile(
     ``stop_removed_of`` (product id, the builds it runs locally) also stops this machine's
     runs of any other build of that product (:func:`stop_removed`); never with ``only``.
     """
-    clock, budget = _Clock(sleep, now), wait_budget(env)
+    clock, budget, grace = _Clock(sleep, now), wait_budget(env), stop_grace(env)
     outcomes = []
     for run in runs:
         if run.scheduled and (only or not run.checkpoint):
@@ -700,7 +849,7 @@ def reconcile(
         try:
             if run.scheduled:  # an availableNow stream: stop a job left from a continuous one
                 adapter = adapter_for(run, clients, local_host)
-                outcomes.append(_stop_continuous(run, adapter, clock, budget, dry_run))
+                outcomes.append(_stop_continuous(run, adapter, clock, budget, dry_run, grace))
                 continue
             adapter = adapter_for(run, clients, local_host)
             outcomes.append(
@@ -713,6 +862,7 @@ def reconcile(
                     only=only,
                     wall=wall,
                     confirm=confirm,
+                    grace=grace,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - one build's AWS error is its outcome
@@ -799,20 +949,29 @@ def _scheduled(run: DesiredRun) -> Outcome:
 
 
 def _stop_continuous(
-    run: DesiredRun, adapter: Adapter, clock: _Clock, budget: float, dry_run: bool
+    run: DesiredRun,
+    adapter: Adapter,
+    clock: _Clock,
+    budget: float,
+    dry_run: bool,
+    grace: float = DEFAULT_STOP_GRACE_S,
 ) -> Outcome:
     """A stream that moved to ``trigger.availableNow``: its scheduler starts it from now on,
-    so an active run with another config (the old continuous job) is cancelled, or the
-    scheduled runs would share its checkpoint."""
+    so an active run with another config (the old continuous job) is stopped between batches
+    (:func:`_stop_between_batches`; cancelled when it does not stop), or the scheduled runs
+    would share its checkpoint."""
     out = _scheduled(run)
     out.where = adapter.where()
     old = [h for h in adapter.runs() if h.active and h.config_hash != run.config_hash]
     if not old:
         return out
     if dry_run:
-        out.message += f"; would cancel {', '.join(h.run_id for h in old)}"
+        out.message += f"; would {_stop_plan(run, old, grace)}"
         return out
-    for h in old:
+    left, notes = _stop_between_batches(run, adapter, old, out, clock, grace, "the continuous run")
+    if notes:
+        out.message += "; " + "; ".join(notes)
+    for h in left:
         if h.state != CANCELLING:
             adapter.cancel(h.run_id)
         out.cancelled.append(h.run_id)
@@ -823,7 +982,8 @@ def _stop_continuous(
             out.action, out.error, out.run_id, out.state = "failed", True, h.run_id, ended.state
             out.message = f"run {h.run_id} was cancelled but is still {ended.raw_state}"
             return out
-    out.message += f"; cancelled the continuous run {', '.join(out.cancelled)}"
+    if out.cancelled and not notes:  # a grace of 0: nothing was asked
+        out.message += f"; cancelled the continuous run {', '.join(out.cancelled)}"
     return out
 
 

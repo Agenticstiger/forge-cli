@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A changed Spark stream stops between batches before `fluid apply` replaces it.** Where a
+  changed config used to cancel the running stream, `fluid apply` now asks it to stop: each
+  stream's run is started with a stop key (`--fluid-stop-key`, the start's own token), and the
+  request is an object at `stop/<key>` beside the build's job config (`_fluid/spark/<product>/
+  <build>/`, which the job's role already reads and lists; on `runtime: local`, under
+  `FLUID_SPARK_LOCAL_ROOT`). The runner looks for it every 10 s, stops each of its queries once no
+  batch is running in it (or right after a batch commits, when batches run back to back), and ends
+  cleanly; the new config then starts on the same checkpoint. A run that has not stopped within
+  `FLUID_SPARK_STOP_GRACE_SECONDS` (default 300, `0` cancels at once), or was started by an older
+  `fluid apply` without a key, is cancelled as before, and the request is removed whatever
+  happens, Ctrl-C included. The outcome names the config the stream moved from and to, and how
+  each old run stopped; a dry run and the plan's `stateImpact` say which runs would stop between
+  batches. A stream that moves to `trigger.availableNow` has its continuous run stopped the same
+  way. A second copy of the same config is still cancelled at once, and `--mode reconcile`, which
+  never replaces a config, writes no request. Before a stream reads anything, the runner refuses a
+  checkpoint (or the dead letters' checkpoint) whose newest offsets name another topic, which also
+  catches a checkpoint no recorded run used (a prefix copied from another stream, a new EMR
+  cluster with no step history). Moving `properties.stream.checkpoint` still starts the job from
+  `startingOffsets`, as the 0.7.7 schema says, and the outcome now says so. The runner changed, so
+  the first `fluid apply` after the upgrade replaces each running stream once, by a cancel (those
+  runs have no key), and a plan made before the upgrade is refused at apply: plan again.
 - **The Spark runner stamps every Iceberg commit with the run's identity.** Each commit the
   runner makes (a batch overwrite, a stream's append, a dead-letter table's append) carries
   `fluid.product`, `fluid.build` and `fluid.job-sha256` (the digest of the job config as it ran) in

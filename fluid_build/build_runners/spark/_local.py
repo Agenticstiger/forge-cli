@@ -65,8 +65,15 @@ from fluid_build.build_runners.spark._adapters import (
     SUCCEEDED,
     RunInfo,
     SparkRunError,
+    stop_request_body,
+    stop_request_uri,
 )
-from fluid_build.build_runners.spark._desired import RESTART_WINDOW_S, DesiredRun, config_digest
+from fluid_build.build_runners.spark._desired import (
+    RESTART_WINDOW_S,
+    STOP_KEY_FLAG,
+    DesiredRun,
+    config_digest,
+)
 from fluid_build.spark.names import RUNNER_FILE
 
 #: Operator-only: the spark-submit to run, an absolute path or a name on ``PATH``.
@@ -425,13 +432,17 @@ def _union(first: str, second: str, *, by_artifact: bool) -> str:
 
 
 def submit_argv(
-    sub: Submitter, run: DesiredRun, runner: Optional[str] = None, restart_of: Optional[str] = None
+    sub: Submitter,
+    run: DesiredRun,
+    runner: Optional[str] = None,
+    restart_of: Optional[str] = None,
+    stop_key: Optional[str] = None,
 ) -> List[str]:
     """spark-submit's argv for ``run`` (bound to the artifact root): client mode, so the
     driver is the run's own process and stopping the run stops the job, as the EMR on EC2
     adapter submits a step. ``runner`` is the runner spark-submit runs (:func:`pull_runner`),
-    else the one at the artifact root; ``restart_of`` marks a restart
-    (:meth:`DesiredRun.entry_args`)."""
+    else the one at the artifact root; ``restart_of`` marks a restart, and ``stop_key`` names
+    a stream's stop request (:meth:`DesiredRun.entry_args`)."""
     argv = [sub.executable, "--name", run.run_name, "--deploy-mode", "client"]
     if sub.properties_file is not None:
         argv += ["--properties-file", str(sub.properties_file)]
@@ -440,7 +451,7 @@ def submit_argv(
         conf["spark.redaction.regex"] = REDACTION_REGEX
     for name in sorted(conf):
         argv += ["--conf", f"{name}={conf[name]}"]
-    return [*argv, runner or run.runner_uri, *run.entry_args(restart_of)]
+    return [*argv, runner or run.runner_uri, *run.entry_args(restart_of, stop_key=stop_key)]
 
 
 def pull_runner(sub: Submitter, run: DesiredRun, where: Path) -> Optional[str]:
@@ -489,18 +500,60 @@ def publish(sub: Submitter, run: DesiredRun, runner_text: str) -> None:
         _put_s3(files, sub.env)
         return
     for uri, body in files:
-        path = Path(uri)
-        if sub.confine is not None:
-            _confined(sub.confine, path.parent)  # no link under the default root leads out
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if sub.confine is not None:
-                _confined(sub.confine, path.parent)
-            if path.is_file() and not path.is_symlink() and path.read_bytes() == body:
-                continue
-            _replace(path, body)
-        except OSError as exc:
-            raise SparkRunError(f"{path} cannot be written: {exc.strerror}") from exc
+        _write_local_file(Path(uri), body, sub.confine)
+
+
+def _write_local_file(path: Path, body: bytes, confine: Optional[Path]) -> None:
+    """Write ``path`` under a directory root, unless it already holds ``body``; under the
+    default root (``confine``, the workspace) no link may lead out of ``.fluid``.
+
+    Raises:
+        SparkRunError: it cannot be written, or a link leads out (the message names it).
+    """
+    if confine is not None:
+        _confined(confine, path.parent)  # no link under the default root leads out
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if confine is not None:
+            _confined(confine, path.parent)
+        if path.is_file() and not path.is_symlink() and path.read_bytes() == body:
+            return
+        _replace(path, body)
+    except OSError as exc:
+        raise SparkRunError(f"{path} cannot be written: {exc.strerror}") from exc
+
+
+def write_stop_request(host: LocalHost, run: DesiredRun, key: str) -> str:
+    """Ask the local run started with stop key ``key`` to stop between batches: the request
+    beside ``run``'s job config at this machine's artifact root (:data:`LOCAL_ROOT_ENV`), a
+    file or an ``s3://`` object, where the runner looks (``_adapters.stop_request_uri``).
+
+    Raises:
+        SparkRunError: the root is unusable, or the request cannot be written.
+    """
+    env = host.env
+    root = _root(env, Path(host.workspace))
+    uri = stop_request_uri(run.bind(local_root=root).job_uri, key)
+    body = stop_request_body(run)
+    if root.startswith("s3://"):
+        _put_s3(((uri, body),), env)
+    else:
+        confine = None if (env.get(LOCAL_ROOT_ENV) or "").strip() else Path(host.workspace)
+        _write_local_file(Path(uri), body, confine)
+    return uri
+
+
+def remove_stop_request(host: LocalHost, uri: str) -> None:
+    """Delete a stop request :func:`write_stop_request` wrote. Best effort: one left behind
+    stops no other run, since its key is that run's own."""
+    try:
+        if uri.startswith("s3://"):
+            bucket, _, key = uri.removeprefix("s3://").partition("/")
+            _s3_client(host.env).delete_object(Bucket=bucket, Key=key)
+        else:
+            Path(uri).unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001,S110 - best effort, as the docstring says
+        pass
 
 
 def _replace(path: Path, body: bytes) -> None:
@@ -522,11 +575,11 @@ def _replace(path: Path, body: bytes) -> None:
         raise
 
 
-def _put_s3(files: Any, env: Mapping[str, str]) -> None:
-    """Upload with boto3 (the ``[aws]`` extra): its own endpoint settings
-    (``AWS_ENDPOINT_URL_S3``, ``AWS_ENDPOINT_URL``) reach SeaweedFS or MinIO, which want
-    path-style requests, and ignore the region the SDK insists on. The client is the Spark
-    adapters' (``_adapters.default_clients``), so boto3 stays their one lazy import
+def _s3_client(env: Mapping[str, str]) -> Any:
+    """A boto3 S3 client (the ``[aws]`` extra) for an ``s3://`` root: its own endpoint
+    settings (``AWS_ENDPOINT_URL_S3``, ``AWS_ENDPOINT_URL``) reach SeaweedFS or MinIO, which
+    want path-style requests, and ignore the region the SDK insists on. The client is the
+    Spark adapters' (``_adapters.default_clients``), so boto3 stays their one lazy import
     (``.importlinter-external``)."""
     missing = (
         f"{LOCAL_ROOT_ENV} is an s3:// root, and uploading to it needs boto3: "
@@ -558,6 +611,12 @@ def _put_s3(files: Any, env: Mapping[str, str]) -> None:
             f"{LOCAL_ROOT_ENV} is an s3:// root, and no S3 client could be made for it: "
             f"{type(exc).__name__}"
         ) from exc
+    return client
+
+
+def _put_s3(files: Any, env: Mapping[str, str]) -> None:
+    """Upload ``files`` (``(uri, body)`` pairs) to an ``s3://`` root (:func:`_s3_client`)."""
+    client = _s3_client(env)
     for uri, body in files:
         bucket, _, key = uri.removeprefix("s3://").partition("/")
         try:
@@ -700,6 +759,7 @@ class LocalRuns:
             created=float(record.get("created") or 0),
             lost=lost,
             restart_of=record.get("restartOf") or None,
+            stop_key=record.get("stopKey") or None,
         )
 
     def cancel(
@@ -822,7 +882,7 @@ def start_run(
         run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(created)) + "-" + uuid.uuid4().hex[:8]
         where = runs.dir / "runs" / run_id
         where.mkdir(parents=True, mode=0o700)  # owner-only, as the supervisor's files
-        argv = submit_argv(sub, bound, pull_runner(sub, bound, where), restart_of)
+        argv = submit_argv(sub, bound, pull_runner(sub, bound, where), restart_of, stop_key=token)
         record = {
             "runId": run_id,
             "product": run.product,
@@ -838,6 +898,8 @@ def start_run(
         }
         if restart_of:
             record["restartOf"] = restart_of
+        if STOP_KEY_FLAG in argv:
+            record["stopKey"] = token
         fd = os.open(where / LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             # Taken before the supervisor exists and handed to it: the run is never seen
