@@ -373,12 +373,30 @@ def test_a_break_does_not_run_the_finally_of_a_try_around_its_loop():
         try:
             for i in x:
                 break
+            use("between")
         finally:
             w = w.trigger(1)
         use("after")
         """
     )
-    assert got == {"after": {1}}
+    assert got == {"between": {0}, "after": {1}}
+
+
+def test_a_finally_that_was_read_is_not_run_by_a_jump_after_its_try():
+    got = states(
+        """
+        w = base
+        for i in x:
+            try:
+                pass
+            finally:
+                w = w.trigger(1)
+            w = w.trigger(2)
+            break
+        use("after")
+        """
+    )
+    assert got == {"after": {0, 2}}
 
 
 def test_a_jump_through_two_finally_bodies_runs_both_innermost_first():
@@ -441,11 +459,49 @@ def test_a_use_in_finally_has_what_the_else_set():
             pass
         else:
             w = w.trigger(1)
+            raise E2
         finally:
             use("final")
         """
     )
     assert got == {"final": {0, 1}}
+
+
+@pytest.mark.parametrize(
+    "nested",
+    [
+        "if a:\n    w = w.trigger(1)",
+        "if a:\n    pass\nelse:\n    w = w.trigger(1)",
+        "for i in x:\n    w = w.trigger(1)",
+        "for i in x:\n    pass\nelse:\n    w = w.trigger(1)",
+        "while a:\n    w = w.trigger(1)",
+        "while a:\n    pass\nelse:\n    w = w.trigger(1)",
+        "try:\n    f()\nexcept E:\n    w = w.trigger(1)",
+        "try:\n    f()\nexcept E:\n    pass\nelse:\n    w = w.trigger(1)",
+        "try:\n    f()\nfinally:\n    w = w.trigger(1)",
+        "with c:\n    w = w.trigger(1)",
+        "match a:\n    case 1:\n        w = w.trigger(1)",
+        "if a:\n    for i in x:\n        with c:\n            w = w.trigger(1)",
+    ],
+    ids=[
+        "if",
+        "else",
+        "for",
+        "for else",
+        "while",
+        "while else",
+        "inner handler",
+        "inner else",
+        "inner finally",
+        "with",
+        "match",
+        "deep",
+    ],
+)
+def test_a_handler_starts_from_what_any_statement_nested_in_the_body_may_have_set(nested):
+    body = textwrap.indent(nested, "    ")
+    source = f"w = base\ntry:\n{body}\nexcept E2:\n    use('handler')\n"
+    assert states(source) == {"handler": {0, 1}}
 
 
 def test_what_a_body_sets_is_found_once_however_often_the_body_is_read(monkeypatch):
@@ -500,10 +556,12 @@ def test_what_a_body_sets_is_found_among_statements_not_expressions(monkeypatch)
 
 
 def test_a_body_whose_statements_cost_too_much_to_look_at_is_not_read(monkeypatch):
-    monkeypatch.setattr(_flow, "MAX_VISITS", 30)
     source = "w = base\ntry:\n" + "    pass\n" * 40 + "except E:\n    pass\nuse('after')\n"
+    monkeypatch.setattr(_flow, "MAX_VISITS", 60)  # the flow reads 44 statements, the look 40 more
     with pytest.raises(_flow.TooMuch):
         states(source)
+    monkeypatch.setattr(_flow, "MAX_VISITS", 100)
+    assert states(source) == {"after": {0}}
 
 
 def test_a_break_skips_the_else_of_its_loop():

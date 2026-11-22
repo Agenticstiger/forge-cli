@@ -410,17 +410,26 @@ def test_a_stream_sink_of_an_unknown_format_with_a_target_option_is_not_taken_fo
     assert not any("taken for a memory or console sink" in line for line in report.notes)
 
 
+@pytest.mark.parametrize(
+    "options",
+    ["", '.option("checkpointLocation", "/chk/x")', '.option("queryName", "q")']
+    + [
+        '.option("numRows", "5")',
+        '.option("truncate", "false")',
+        '.option("checkpointLocation", "/chk/x").option("queryName", "q")',
+    ],
+)
 def test_a_stream_sink_of_an_unknown_format_with_no_target_is_taken_for_a_memory_sink_and_said(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, options
 ):
     (tmp_path / "jobs").mkdir()
     (tmp_path / "jobs" / "j.py").write_text(
         HEAD
         + textwrap.dedent(
-            """
+            f"""
             import os
 
-            spark.readStream.table("raw.events").writeStream.format(os.environ["F"]).start()
+            spark.readStream.table("raw.events").writeStream.format(os.environ["F"]){options}.start()
             """
         ),
         encoding="utf-8",

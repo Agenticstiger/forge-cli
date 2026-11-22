@@ -29,7 +29,7 @@ from ._pysource import SourceBudget
 #: A job list's name, and a job's: a plain file name stem.
 _NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127}")
 #: Names one list may hold, lists one scan reads, and the bytes of them: a hostile repository does
-#: not get more. A list of 500 names of 40 characters is 20 KB.
+#: not get more. A list of 500 names of about 30 characters fills the 16 KB.
 MAX_JOBS_PER_LIST = 500
 MAX_LISTS = 1_000
 MAX_LIST_BYTES = 16_384
