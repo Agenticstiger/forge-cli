@@ -90,7 +90,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule took is still taken, and `fluid validate` refuses an empty id, a space, a slash and an id
   over 250 characters. The pattern is an explicit ASCII class rather than `\w`, so every JSON Schema
   validator gives the same answer. 0.7.6 and the older released schemas are unchanged: a contract
-  written for them keeps lowercase ids.
+  written for them keeps lowercase ids. `fluid import airflow` asks the schema of the
+  `fluidVersion` it declares: when that schema takes the id, the DAG and task are recorded exactly
+  as Airflow spells it and the report says nothing about ids; when it does not (every released
+  schema today), the id is still recorded under its lower case identifier, as before.
 
 ### Fixed
 

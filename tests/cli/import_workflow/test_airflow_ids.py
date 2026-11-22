@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Mapping
 import pytest
 
 from fluid_build.cli.import_workflow import _proposal
+from fluid_build.cli.import_workflow._id_rules import id_rules
 from fluid_build.cli.import_workflow.airflow import AirflowImporter
 from fluid_build.schema_manager import FluidSchemaManager
 
@@ -374,4 +375,6 @@ def test_a_task_named_after_the_function_it_runs_keeps_both_under_its_recorded_i
 )
 def test_the_recorded_id_is_the_importers_identifier_of_the_airflow_id(airflow_id, recorded):
     assert _proposal.ident(airflow_id, "dag") == recorded
-    assert _proposal._AIRFLOW_ID.fullmatch(recorded)
+    # the released schemas, which the importer declares by default, take it as a DAG id and a task id
+    rules = id_rules("0.7.6")
+    assert rules.dag(recorded) and rules.task(recorded)

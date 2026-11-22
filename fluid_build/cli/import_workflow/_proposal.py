@@ -47,6 +47,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 from ._airflow_dags import Dag, Task
 from ._catalogs import CatalogKinds
 from ._conventions import Conventions, PathRule
+from ._id_rules import IdRules, id_rules
 from ._redact import safe_args, safe_command, safe_text
 from ._scan import JobRecord, LinkedTask
 from ._spark_io import TRIGGER_SEPARATOR, Read, Ref, Write, read_key
@@ -102,8 +103,6 @@ class ProposalTooLarge(Exception):
         self.hint = hint
 
 
-#: The id pattern of ``airflowOrchestration.dagId`` and ``airflowTask.taskId`` (lower case only).
-_AIRFLOW_ID = re.compile(r"[a-z0-9_][a-z0-9_.-]*[a-z0-9_]|[a-z0-9_]")
 _BAD = re.compile(r"[^a-z0-9_.-]+")
 _SCHEME_PLATFORM = {
     "s3": "aws",
@@ -183,15 +182,17 @@ MAX_ID_LINES = 20
 
 
 class _AirflowIds:
-    """The ``dagId`` and ``taskId`` each DAG and task is recorded under. An Airflow id that fits
-    the contract's pattern is recorded as it is; one that does not (``Nightly_Orders``: Airflow
-    takes capitals, the contract does not) is recorded as :func:`ident` of it, made unique among
-    the DAG ids of the import (a task's among the task ids of its DAG) with a number after it.
-    Ids that fit are taken first and never change; the others are mapped in source order, so one
-    import of the same code always records the same ids. The running DAG keeps its own ids: the
-    report says what each recorded id stands for."""
+    """The ``dagId`` and ``taskId`` each DAG and task is recorded under. An Airflow id that the
+    schema of the declared ``fluidVersion`` takes is recorded exactly as Airflow spells it (the
+    preview schemas take Airflow's own rule); one that it does not (``Nightly_Orders`` under a
+    schema of lower case ids) is recorded as :func:`ident` of it, made unique among the DAG ids of
+    the import (a task's among the task ids of its DAG) with a number after it. Ids that fit are
+    taken first and never change; the others are mapped in source order, so one import of the same
+    code always records the same ids. The running DAG keeps its own ids: the report says what each
+    recorded id stands for."""
 
-    def __init__(self, dags: Sequence[Dag]) -> None:
+    def __init__(self, dags: Sequence[Dag], rules: Optional[IdRules] = None) -> None:
+        self._rules = rules or id_rules("")
         self._dag: Dict[int, str] = {}
         self._task: Dict[Tuple[int, str], str] = {}
         #: Who holds each recorded DAG id, and each task id per DAG: said when an id is taken.
@@ -204,7 +205,7 @@ class _AirflowIds:
         #: Airflow DAG id -> the recorded id of the first DAG of that id.
         self._by_airflow_id: Dict[str, str] = {}
         for dag in ordered:
-            if dag.dag_id and _AIRFLOW_ID.fullmatch(dag.dag_id):
+            if dag.dag_id and self._rules.dag(dag.dag_id):
                 self._dag[id(dag)] = dag.dag_id
                 taken.add(dag.dag_id)
                 self._dag_holders.setdefault(
@@ -238,7 +239,7 @@ class _AirflowIds:
         taken = _Names()
         holders: Dict[str, str] = {}
         for task in dag.tasks:
-            if task.task_id and _AIRFLOW_ID.fullmatch(task.task_id):
+            if task.task_id and self._rules.task(task.task_id):
                 self._task[(id(dag), task.key)] = task.task_id
                 taken.add(task.task_id)
                 holders.setdefault(task.task_id, f"task {task.task_id!r} of the same DAG")
@@ -284,8 +285,8 @@ class _AirflowIds:
         lines = [self._explain[key] for key in sorted(self._used, key=lambda k: self._explain[k])]
         for line in lines[:MAX_ID_LINES]:
             report.required_defaults.append(
-                f"{line}: a FLUID dagId or taskId has only lower case letters, digits, '_', '.' "
-                "and '-'. The running DAG keeps its own id"
+                f"{line}: a FLUID dagId or taskId has only {self._rules.spelling}. The running DAG "
+                "keeps its own id"
             )
         if len(lines) > MAX_ID_LINES:
             report.required_defaults.append(
@@ -1068,7 +1069,8 @@ def build_proposal(
     flat = sorted(outputs.values(), key=lambda o: (o.writer.shown, o.write.line, o.identity.shown))
     # the ids every DAG and task is recorded under: what a DAG's or a task's product is named after
     airflow_ids = _AirflowIds(
-        list({id(link.dag): link.dag for job in ordered for link in job.tasks}.values())
+        list({id(link.dag): link.dag for job in ordered for link in job.tasks}.values()),
+        id_rules(version),
     )
     groups = _groups(flat, split_by, conv, root_name, airflow_ids)
     if len(groups) > MAX_PRODUCTS:
