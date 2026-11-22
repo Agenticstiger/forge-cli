@@ -193,6 +193,27 @@ _LOGIN_COMMANDS = frozenset({("docker", "login"), ("podman", "login"), ("nerdctl
 #: of ``userid=``.
 _ORACLE_COMMANDS = frozenset({"sqlplus", "sqlldr", "expdp", "impdp", "rman", "sqlcl"})
 _ORACLE_LOGIN = re.compile(r"([^/\s@=]+)/([^@\s/]+)(@\S*)?")
+#: ``user/password@alias`` where the alias is a name from ``tnsnames.ora`` (no port, no ``//``),
+#: with what follows it (``as sysdba``) kept. The password is in double quotes or has no ``/``,
+#: ``@`` or white space. Where a flag or a command says it is a login, the alias may be anything;
+#: as a word with nothing around it, the user is a plain name and the alias too (see
+#: :func:`_mask_login`).
+_LOGIN_WITH_ALIAS = re.compile(
+    r"(?P<user>[^/\s@=]{1,64})/"
+    r"(?P<password>\"[^\"\r\n]{1,128}\"|[^@\s/\"]{1,128})"
+    r"@(?P<alias>\S+?)(?P<rest>\s.*)?",
+    re.DOTALL,
+)
+_PLAIN_USER = re.compile(r"\"?[^\W\d][\w$#]{0,63}\"?")
+_PLAIN_ALIAS = re.compile(r"[A-Za-z_][\w.\-]*")
+#: What follows ``@`` in ``pkg/mod@v1.2.3``, ``org/repo@main``, ``img/name@latest``: a version or a
+#: ref, not a service name.
+_REF_ALIASES = frozenset(
+    {"main", "master", "latest", "head", "develop", "dev", "stable", "next", "canary", "nightly"}
+)
+_VERSION_ALIAS = re.compile(r"v?\d|(?:release|rel|rc|r)[-_.]?\d", re.IGNORECASE)
+#: Flags whose value is a database login (``--dsn scott/tiger@orcl``, ``-u scott/tiger@orcl``).
+_LOGIN_FLAGS = frozenset({"--dsn", "--userid", "-u"})
 #: Commands whose ``-P<value>``, with no space, is the password.
 _GLUED_UPPER_P_COMMANDS = frozenset({"bcp", "sqlcmd"})
 #: Commands whose ``-p<value>``, with no space, is the password.
@@ -354,6 +375,31 @@ def _mask_dsn(text: str) -> str:
     return _ORACLE_DSN.sub(lambda m: f"{m.group(1)}/{_REDACTED}{m.group(3)}", text)
 
 
+def _mask_login(value: str, *, named: bool) -> Optional[str]:
+    """``user/password@alias`` (a bare Oracle login with a name from ``tnsnames.ora``) with the
+    password masked, or ``None`` when ``value`` is not one.
+
+    ``named`` is True where the flag or the command in front says it is a login (``-u``,
+    ``--dsn``, ``userid=``, ``sqlplus``): the alias may be anything and ``as sysdba`` may follow.
+    A word with nothing around it is one only when it reads like one (a plain user name, an alias
+    that is a name and neither a version nor a ref), so ``pkg/mod@v1.2.3`` and ``org/repo@main``
+    are left as they are."""
+    found = _LOGIN_WITH_ALIAS.fullmatch(value)
+    if found is None:
+        return None
+    if not named:
+        alias = found.group("alias")
+        if (
+            found.group("rest")
+            or not _PLAIN_USER.fullmatch(found.group("user"))
+            or not _PLAIN_ALIAS.fullmatch(alias)
+            or alias.lower() in _REF_ALIASES
+            or _VERSION_ALIAS.match(alias)
+        ):
+            return None
+    return f"{found.group('user')}/{_REDACTED}@{found.group('alias')}{found.group('rest') or ''}"
+
+
 _AUTHORITY_END = re.compile(r"""[ \t\r\n/?#'"]""")
 #: The user information the shared URL rule reads has a password of up to this many characters.
 _URL_PASSWORD_READ = 4_000
@@ -409,6 +455,8 @@ class _Words:
         self._mask_next: Union[bool, str] = False
         self._setting_next: Optional[str] = None
         self._user_next = False
+        #: After ``-u``, ``--dsn`` or ``--userid``: the next word may be a login.
+        self._login_next = False
         #: The command the word belongs to (its first word, without a path); ``None`` in an
         #: argument list, which has no command.
         self.command: Optional[str] = None
@@ -470,7 +518,12 @@ class _Words:
             self._user_next = False
             if _is_user_credential(value, self.command):
                 return _mask_user(value)
-        if self.command in _ORACLE_COMMANDS:
+        if self._login_next:
+            self._login_next = False
+            login = self._oracle_login(value, named=True)
+            if login is not None:
+                return login
+        if self.command in _ORACLE_COMMANDS or value[:7].lower() == "userid=":
             login = self._oracle_login(value)
             if login is not None:
                 return login
@@ -502,20 +555,26 @@ class _Words:
             return value
         if any(c.isspace() for c in value):
             return self._multi_word(value)
+        login = _mask_login(value, named=False)  # ``etl/pw@dwh`` as an argument of its own
+        if login is not None:
+            return login
         return _scan(value)
 
     @staticmethod
-    def _oracle_login(value: str) -> Optional[str]:
+    def _oracle_login(value: str, *, named: bool = False) -> Optional[str]:
         """``user/password@service`` (or ``userid=user/password@service``) with the password
-        masked, or ``None`` when the word is not one."""
+        masked, or ``None`` when the word is not one. ``named``: the word follows a flag that
+        takes a login, so a service of any shape, and ``as sysdba`` after it, is one."""
         head, equals, rest = value.partition("=")
         if equals and head.lower() == "userid":
-            masked = _Words._oracle_login(rest)
+            masked = _Words._oracle_login(rest, named=True)
             return f"{head}={masked}" if masked is not None else None
-        found = _ORACLE_LOGIN.fullmatch(value) if not value.startswith("-") else None
-        if found is None:
+        if value.startswith("-"):
             return None
-        return f"{found.group(1)}/{_REDACTED}{found.group(3) or ''}"
+        found = None if named else _ORACLE_LOGIN.fullmatch(value)
+        if found is not None:
+            return f"{found.group(1)}/{_REDACTED}{found.group(3) or ''}"
+        return _mask_login(value, named=True)
 
     def _header(self, match: "re.Match[str]") -> str:
         """``Name: value`` with the value masked when the header carries a credential."""
@@ -553,6 +612,13 @@ class _Words:
                 return f"{flag}={self._setting(rest, flag)}"
             self._setting_next = flag
             return value
+        if flag in _LOGIN_FLAGS and self.command not in _USER_FLAG_NOT_CREDENTIALS:
+            if equals:
+                login = self._oracle_login(rest, named=True)
+                if login is not None:
+                    return f"{flag}={login}"
+            else:
+                self._login_next = True
         if flag in _USER_FLAGS:
             if equals:
                 return f"{flag}={_mask_user(rest) if _is_user_credential(rest, self.command) else rest}"
@@ -623,6 +689,7 @@ class _Words:
     def skip(self) -> None:
         """A word that was not read (too long) is the end of what a flag before it waited for."""
         self._mask_next, self._setting_next, self._user_next = False, None, False
+        self._login_next = False
 
 
 def _names_a_credential(text: str) -> bool:

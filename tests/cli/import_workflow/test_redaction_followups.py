@@ -126,8 +126,6 @@ def test_a_login_in_a_command_is_masked():
 @pytest.mark.parametrize(
     "arg",
     [
-        "a/b@c.com",  # no port: an address or a path
-        "scott/tiger@db",  # no port
         "s3://bucket/key@2:80",  # a URL: the user part follows a slash
         "/data/scott/tiger@db:1521",  # a path
         "user@host:22",
@@ -146,6 +144,14 @@ def test_a_login_in_a_command_is_masked():
 )
 def test_what_is_not_a_login_is_left_alone(arg):
     assert R.safe_args([arg]) == [arg]
+
+
+@pytest.mark.parametrize("arg", ["a/b@c.com", "scott/tiger@db", "scott/tiger@ORCL"])
+def test_a_bare_login_with_a_service_name_is_masked_as_an_argument(arg):
+    # ``user/password@alias`` with a name from tnsnames.ora and no port: nothing else has this
+    # shape but a path with a ref, and those are kept (see the redaction matrix)
+    (shown,) = R.safe_args([arg])
+    assert shown == f"{arg.split('/')[0]}/{MASK}@{arg.split('@')[1]}"
 
 
 def test_a_url_with_user_information_is_still_the_url_rules_business():

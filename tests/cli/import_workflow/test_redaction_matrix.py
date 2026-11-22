@@ -32,6 +32,15 @@ SHAPES = {
     "url-userinfo": "curl https://user:{S}@host/path",
     "jdbc-oracle": "run.sh --jdbc-url jdbc:oracle:thin:scott/{S}@h:1521/svc",
     "sqlplus": "sqlplus scott/{S}@h:1521/svc",
+    "sqlplus-alias": "sqlplus scott/{S}@ORCL @x.sql",
+    "sqlplus-sysdba": "sqlplus sys/{S}@h as sysdba",
+    "sqlplus-quoted": 'sqlplus scott/"{S}"@h',
+    "dsn-flag-alias": "run.sh --dsn scott/{S}@ORCL",
+    "dsn-flag-sysdba": "run.sh --dsn 'sys/{S}@h as sysdba'",
+    "dsn-flag-quoted": "run.sh --dsn 'scott/\"{S}\"@h'",
+    "u-flag-alias": "run.sh -u scott/{S}@h",
+    "userid-alias": "sqlldr userid=scott/{S}@h control=x.ctl",
+    "bare-login-arg": "run.sh --src hr/{S}@prod_db",
     "s3a-secret": "run.sh --conf spark.hadoop.fs.s3a.secret.key={S}",  # pragma: allowlist secret
     "token-flag": "run.sh --token {S}",
     "api-key": "run.sh --api-key {S}",
@@ -118,3 +127,59 @@ def test_a_client_after_a_wrapper_and_a_name_set_to_a_value_are_masked(command):
 )
 def test_a_wrapper_and_set_do_not_hide_what_is_no_credential(command):
     assert R.safe_command(command) == command
+
+
+@pytest.mark.parametrize(
+    "word",
+    [
+        "git@github.com:org/repo",
+        "pkg/mod@v1.2.3",
+        "s3://b/k@x",
+        "user@host:/path",
+        "org/repo@main",
+        "actions/checkout@v4",
+        "registry/img@sha256:0123abcd",
+        "data/in@2024",
+        "node/pkg@1.0.0",
+        "org/repo@release-1.2",
+        "gs://bucket/path@x",
+        "/abs/path@x",
+    ],
+)
+def test_a_path_a_module_a_ref_and_an_address_are_not_a_login(word):
+    assert R.safe_args([word]) == [word]
+    assert R.safe_command(f"run.sh {word}") == f"run.sh {word}"
+    assert R.safe_command(f"clone {word}") == f"clone {word}"
+
+
+@pytest.mark.parametrize(
+    "words, masked",
+    [
+        (["scott/QZXV7391k@ORCL"], ["scott/***REDACTED***@ORCL"]),
+        (["hr/QZXV7391k@prod_db"], ["hr/***REDACTED***@prod_db"]),
+        (["--dsn", "scott/QZXV7391k@ORCL"], ["--dsn", "scott/***REDACTED***@ORCL"]),
+        (["--dsn=scott/QZXV7391k@ORCL"], ["--dsn=scott/***REDACTED***@ORCL"]),
+        (["-u", "scott/QZXV7391k@ORCL"], ["-u", "scott/***REDACTED***@ORCL"]),
+        (["userid=scott/QZXV7391k@ORCL"], ["userid=scott/***REDACTED***@ORCL"]),
+        (["--dsn", "sys/QZXV7391k@h as sysdba"], ["--dsn", "sys/***REDACTED***@h as sysdba"]),
+        (["--dsn", 'scott/"QZXV7391k"@h'], ["--dsn", "scott/***REDACTED***@h"]),
+    ],
+)
+def test_a_bare_oracle_login_with_a_service_name_loses_its_password(words, masked):
+    assert R.safe_args(words) == masked
+
+
+@pytest.mark.parametrize(
+    "command, masked",
+    [
+        ("sqlplus sys/QZXV7391k@h as sysdba", "sqlplus sys/***REDACTED***@h as sysdba"),
+        ('sqlplus scott/"QZXV7391k"@h', "sqlplus scott/***REDACTED***@h"),
+        ("sqlplus -s scott/QZXV7391k@h @x.sql", "sqlplus -s scott/***REDACTED***@h @x.sql"),
+        ("sqlplus / as sysdba", "sqlplus / as sysdba"),
+        ("sqlplus scott@h", "sqlplus scott@h"),
+        ("docker run -u 1000:1000 img", "docker run -u 1000:1000 img"),
+        ("run.sh --dsn postgresql://u@h/db", "run.sh --dsn postgresql://u@h/db"),
+    ],
+)
+def test_a_client_login_is_masked_and_what_is_none_is_left(command, masked):
+    assert R.safe_command(command) == masked
