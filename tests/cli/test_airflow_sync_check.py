@@ -632,8 +632,10 @@ def test_a_dag_id_airflow_would_refuse_is_not_read(tmp_path: Path):
         b"from airflow import DAG\nX = " + b"a+" * 30000 + b"a\nDAG('x')\n",
         b"from airflow import DAG\n" + b"lambda: " * 3000 + b"1\n",
     ],
+    ids=["long-sum", "deep-sum", "nested-lambdas"],
 )
-def test_a_dag_file_too_deep_to_read_is_dynamic_not_a_crash(tmp_path: Path, source: bytes):
+def test_a_dag_file_too_deep_to_read_does_not_crash_the_check(tmp_path: Path, source: bytes):
+    """Read, or left to Airflow when too deep: how deep depends on the recursion limit."""
     (tmp_path / "deep.py").write_bytes(source)
     (only,) = chk.dag_files(tmp_path)
-    assert only.dynamic
+    assert only.dynamic or only.dag_ids == ("x",)

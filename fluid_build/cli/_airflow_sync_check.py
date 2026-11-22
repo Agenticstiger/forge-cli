@@ -513,6 +513,7 @@ class _Wait:
     def _dag_clean(self, dag_id: str) -> Tuple[bool, str, str]:
         """``(clean, evidence, why not)`` for one DAG, from what has been seen of it."""
         seen = self.dags.get(dag_id)
+        dag_id = _one_line(dag_id)  # a DAG Airflow listed for a dynamic file: its own text
         state = seen.last if seen else None
         if seen is None or state is None:
             return False, "", f"Airflow lists no DAG {dag_id} yet"
