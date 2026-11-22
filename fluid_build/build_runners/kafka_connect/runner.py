@@ -290,6 +290,15 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
     kc_props = props.get("kafka-connect", {}) or {}
     deployment = kc_props.get("deployment", {}) or {}
     server_url = deployment.get("server_url")
+
+    from .._acquisition_common import refuse_config_expressions, refuse_contract_expressions
+
+    try:
+        # Before any secret is read or REST call made: the worker resolves
+        # ${provider:path:key} in a connector config with its config providers.
+        refuse_contract_expressions(ctx, kc_props, engine="kafka-connect")
+    except ValueError as exc:
+        return _failed(ctx, started_at, t_start, str(exc))
     if not server_url:
         return _failed(ctx, started_at, t_start, "kafka-connect requires deployment.server_url")
 
@@ -446,6 +455,15 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
             if unresolved_bucket_vars_at_run(binding, resolved.kind, sink_plan):
                 derived.pop("iceberg.catalog.warehouse", None)
             sink_config = {**derived, **(sink_config or {})}
+
+    if sink_config:
+        try:
+            # The derived part comes from the contract's binding, not from kc_props.
+            refuse_config_expressions(
+                sink_config, where="properties.kafka-connect.sink_connector_config"
+            )
+        except ValueError as exc:
+            return _failed(ctx, started_at, t_start, str(exc))
 
     connector_name = kc_props.get("connector_name") or f"forge-{ctx.product_id.replace('.', '-')}"
     client = KafkaConnectRestClient(server_url)

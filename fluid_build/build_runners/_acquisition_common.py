@@ -27,7 +27,7 @@ import secrets
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fluid_build._net import is_loopback_host as _is_loopback_host
 
@@ -405,6 +405,64 @@ def resolve_connection_secrets(
     value = resolve_secret(str(secret_ref), connection=out)
     out[target_field] = value.get_secret_value()
     return out
+
+
+def refuse_config_expressions(value: Any, *, where: str) -> None:
+    """Raise ``ValueError`` when contract text bound for a connector's config holds ``${``.
+
+    Debezium Server reads ``application.properties`` through SmallRye Config,
+    which expands a ``${...}`` expression in a value from every config source,
+    its environment included (``ExpressionConfigSourceInterceptor``); its one
+    escape, ``\\${``, changes how the rest of the value is read. A Kafka Connect
+    worker resolves ``${provider:path:key}`` in a connector config with the
+    config providers it declares (``ConfigTransformer``), which has no escape.
+    Either sends what it read, a variable or a file, on to wherever the
+    connector connects. forge puts no expression into contract text (its own
+    ``${FLUID_DBZ_...}`` lines hold credentials it moved to the environment),
+    so a value or a key that holds ``${`` is refused. The error names where it
+    is, ``where`` and the path below it, and never the value.
+    """
+    from fluid_build._validation_issues import dotted
+    from fluid_build.providers._iceberg_catalog_auth import EXPRESSION_RE
+
+    pending: List[Tuple[Tuple[Any, ...], Any]] = [((), value)]
+    seen: Set[int] = set()
+    while pending:
+        path, item = pending.pop()
+        if isinstance(item, str):
+            if EXPRESSION_RE.search(item):
+                raise ValueError(_expression_refusal(where, dotted(path)))
+        elif isinstance(item, (Mapping, list, tuple)) and id(item) not in seen:
+            seen.add(id(item))
+            items = item.items() if isinstance(item, Mapping) else enumerate(item)
+            for key, child in items:
+                if EXPRESSION_RE.search(str(key)):
+                    raise ValueError(_expression_refusal(where, dotted(path), in_key=True))
+                pending.append(((*path, key), child))
+
+
+def _expression_refusal(where: str, below: str, *, in_key: bool = False) -> str:
+    label = f"{where}{'' if not below or below.startswith('[') else '.'}{below}"
+    what = f"a key under {label}" if in_key else label
+    return (
+        f"{what} holds a ${{...}} expression (the value is not shown). The connector "
+        "expands it where it runs, Debezium Server from its environment and a Kafka "
+        "Connect worker through its config providers, so it could carry a variable or a "
+        "file of that machine to a host the contract chose. Write the value itself; a "
+        "secret belongs in a secretRef."
+    )
+
+
+def refuse_contract_expressions(ctx: Any, engine_props: Mapping[str, Any], *, engine: str) -> None:
+    """:func:`refuse_config_expressions` for the contract text a connector run reads.
+
+    The source connection (its ``secretRef`` aside: the secret it names is the
+    operator's, not contract text), the streams, and ``properties.<engine>``.
+    """
+    connection = {k: v for k, v in ctx.source.connection.raw.items() if k != "secretRef"}
+    refuse_config_expressions(connection, where="properties.source.connection")
+    refuse_config_expressions(list(ctx.source.streams or []), where="properties.source.streams")
+    refuse_config_expressions(engine_props, where=f"properties.{engine}")
 
 
 def _default_succeeded_states() -> Tuple:

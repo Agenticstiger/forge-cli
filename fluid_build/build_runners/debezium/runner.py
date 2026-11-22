@@ -325,6 +325,15 @@ def _execute(ctx: RunContext, runner: DebeziumRunner) -> RunResult:
     deployment = dbz_props.get("deployment", {}) or {}
     mode = deployment.get("mode", "bring-your-own")
 
+    from .._acquisition_common import refuse_contract_expressions
+
+    try:
+        # Before any secret is read or config written: Debezium Server and a
+        # Kafka Connect worker expand ${...} where they run.
+        refuse_contract_expressions(ctx, dbz_props, engine="debezium")
+    except ValueError as exc:
+        return _failed(ctx, started_at, t_start, str(exc))
+
     try:
         snapshot_mode = resolve_snapshot_mode(dbz_props.get("snapshot_mode"))
     except ValueError as exc:
@@ -556,9 +565,15 @@ def render_application_properties(
     with ``env:`` still goes to the environment.
 
     Raises ``ValueError`` for a control character in a key or value
-    (:func:`_properties_line`), or for two properties whose names map to the
-    same environment variable.
+    (:func:`_properties_line`), for two properties whose names map to the same
+    environment variable, or for a ``${`` in the sink's type or config, which
+    SmallRye Config would expand (:func:`refuse_config_expressions`). The source
+    config is checked as contract text before its secret is resolved.
     """
+    from .._acquisition_common import refuse_config_expressions
+
+    refuse_config_expressions(sink_type, where="properties.debezium.server.sink.type")
+    refuse_config_expressions(sink_config, where="properties.debezium.server.sink.config")
     env: Dict[str, str] = {}
 
     def line(key: str, value: object, *, env_refs: bool = False) -> str:
