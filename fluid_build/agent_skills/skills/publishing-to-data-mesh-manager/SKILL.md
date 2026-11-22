@@ -1,6 +1,6 @@
 ---
 name: publishing-to-data-mesh-manager
-description: Publishes FLUID data products to Data Mesh Manager (Entropy Data) as one batch in dependency order, as drafts first, promotes the drafts whose fluid verify report is clean, and reports where a migration's products stand. Use when asked to publish, register or catalogue data products in Data Mesh Manager or Entropy Data, to move drafts to active, to check how far a migration has got, or when fluid datamesh-manager fails with a dmm_batch_ or dmm_promote_ error.
+description: Publishes FLUID products to Data Mesh Manager (Entropy Data) as draft batches, promotes verified drafts and reports a migration's status. Use when asked to publish, register or catalogue data products in Data Mesh Manager or Entropy Data, to move drafts to active, to check how far a migration has got, or when fluid datamesh-manager fails with a dmm_batch_ or dmm_promote_ error.
 license: Apache-2.0
 compatibility: Needs the fluid CLI on PATH (pip install data-product-forge) and an Entropy Data API key in DMM_API_KEY.
 ---

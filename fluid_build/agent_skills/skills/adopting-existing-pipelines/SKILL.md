@@ -1,6 +1,6 @@
 ---
 name: adopting-existing-pipelines
-description: Proposes FLUID contracts from PySpark jobs and Airflow DAG files that already run, with fluid import pyspark and fluid import airflow (the code is read, never run), a conventions file for the organisation's layout and importer plugins, then takes existing Glue tables into the OpenTofu state with --adopt-tables only where each matches its contract. Use when asked to adopt, migrate, onboard or import an existing Spark job, Airflow DAG or data platform, to write a conventions file or an importer plugin, or when a plan or apply fails with table_adoption_requires_flag, table_adoption_mismatch, table_adoption_unavailable or plan_adopt_tables_needs_tofu.
+description: Proposes contracts from running PySpark jobs and Airflow DAGs with fluid import, and takes existing Glue tables over with --adopt-tables. Use when asked to adopt, migrate, onboard or import an existing Spark job, Airflow DAG or data platform, to write a conventions file or an importer plugin, or when a plan or apply fails with table_adoption_requires_flag, table_adoption_mismatch, table_adoption_unavailable or plan_adopt_tables_needs_tofu.
 license: Apache-2.0
 compatibility: Needs the fluid CLI on PATH (pip install data-product-forge). Taking tables over also needs OpenTofu and AWS credentials.
 ---

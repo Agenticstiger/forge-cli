@@ -1,6 +1,6 @@
 ---
 name: releasing-streaming-products
-description: Rolls a change out to a running Spark stream so that it stops between two batches instead of being cancelled, and traces each Iceberg commit to the release, contract, bundle and scheduler run that wrote it, through the commit stamps, fluid ship --release-dir and fluid runs status --release-dir. Use when asked to deploy, release or roll out a change to a streaming product or a kept-alive stream, to find which release or run wrote a table's snapshot or was in force on a day, or when apply fails with apply_spark_artifact_mismatch.
+description: Releases a change to a running Spark stream so it stops between batches, and traces each Iceberg commit to the release that wrote it. Use when asked to deploy, release or roll out a change to a streaming product or a kept-alive stream, to read a commit's stamps, to seal releases with fluid ship --release-dir, to find which release or run wrote a table's snapshot or was in force on a day (fluid runs status --release-dir), or when apply fails with apply_spark_artifact_mismatch.
 license: Apache-2.0
 compatibility: Needs the fluid CLI on PATH (pip install data-product-forge). The streams run on Spark and write Iceberg tables.
 ---
