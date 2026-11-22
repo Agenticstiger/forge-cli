@@ -405,6 +405,40 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "troubleshooting#connectivity",
     ),
+    "table_adoption_requires_flag": (
+        [
+            "Review the take-over first: 'fluid plan <contract> --tofu --adopt-tables' "
+            + "checks each table against the contract and saves the plan",
+            "Then apply that plan with 'fluid apply plan.json', or re-run this apply "
+            + "with --adopt-tables",
+            "A table forge made that names no product (from a contract over 50 KB, before "
+            + "forge recorded the id): if it is this product's, add the Glue table parameter "
+            + "fluid_product_id=<the contract's id> once, with the table's writers paused, "
+            + "through 'aws glue update-table' with --version-id from a fresh 'aws glue "
+            + "get-table', so a concurrent commit fails instead of being reverted; or, where "
+            + "the run can pass flags and keeps its state, run once with --adopt-tables",
+        ],
+        None,
+    ),
+    "table_adoption_mismatch": (
+        [
+            "Nothing was imported or applied: the tables are as they were",
+            "Align exposes[].contract.schema and binding.location with each table named "
+            + "above, then re-run with --adopt-tables",
+        ],
+        None,
+    ),
+    "table_adoption_unavailable": (
+        [
+            "Set AWS_ACCOUNT_ID to the account that holds the tables, or run with "
+            + "credentials sts:GetCallerIdentity accepts, then re-run with --adopt-tables",
+        ],
+        "troubleshooting#connectivity",
+    ),
+    "plan_adopt_tables_needs_tofu": (
+        ["Run 'fluid plan <contract> --tofu --adopt-tables'"],
+        None,
+    ),
     "opentofu_region_moved": (
         [
             "If the resources should stay where they are, set the binding's location.region "
@@ -837,6 +871,120 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     ),
     "schedule_sync_unhandled_scheme": (
         ["Use a supported destination scheme (file / scp / git+ssh) for --to"],
+        None,
+    ),
+    # ── schedule-sync --airflow-url (the Airflow check, Airflow 2 and 3) ─────
+    "schedule_sync_airflow_flags": (
+        [
+            "Add --airflow-url <Airflow API server URL> to run the Airflow check, or drop the "
+            "--airflow-* / --check-only flags",
+            "--airflow-bundle and --airflow-bundle-version need Airflow 3 (DAG bundles)",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_unsupported_scheduler": (
+        ["Run the Airflow check with --scheduler airflow, astronomer or composer"],
+        None,
+    ),
+    "schedule_sync_airflow_no_dag_files": (
+        ["Point --dags-dir at the DAG files fluid generate schedule wrote"],
+        None,
+    ),
+    "schedule_sync_airflow_bad_url": (
+        [
+            "Pass --airflow-url as https://<host>[/<prefix>], with no user name, password, "
+            "query or fragment",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_insecure_url": (
+        [
+            "Use an https:// --airflow-url",
+            "Or set FLUID_AIRFLOW_ALLOW_INSECURE_HTTP=true in the operator environment where "
+            "plain HTTP is intended",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_credentials": (
+        [
+            "Set FLUID_AIRFLOW_TOKEN_REF (a token) or FLUID_AIRFLOW_CREDENTIAL_REF "
+            "(user:password) to a secret reference such as env://NAME, not both",
+            "Run fluid secrets check to see why a reference does not resolve",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_unreachable": (
+        [
+            "Check that the Airflow API server answers at --airflow-url from this machine",
+            "A restarting server answers 502/503 for a while: raise --airflow-wait or re-run",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_api_not_found": (
+        [
+            "Pass the root URL of Airflow's API server (Airflow 2: the webserver); include a "
+            "path prefix it is served under",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_api_mismatch": (
+        ["Leave --airflow-api at auto, or pass v2 for Airflow 3 and v1 for Airflow 2"],
+        None,
+    ),
+    "schedule_sync_airflow_unsupported_version": (
+        ["Check that --airflow-url is an Airflow 2.x or 3.x API server"],
+        None,
+    ),
+    "schedule_sync_airflow_auth_failed": (
+        [
+            "Check the secret behind FLUID_AIRFLOW_CREDENTIAL_REF or FLUID_AIRFLOW_TOKEN_REF",
+            "Airflow 2 takes a password only with airflow.api.auth.backend.basic_auth in "
+            "[api] auth_backends; Airflow 3 issues a token from POST /auth/token",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_forbidden": (
+        ["Give the Airflow user or token read access to DAGs and import errors (Viewer)"],
+        None,
+    ),
+    "schedule_sync_airflow_redirect": (
+        [
+            "Pass the URL the redirect points at as --airflow-url; a sign-in page means a "
+            "proxy sits in front of Airflow",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_bad_response": (
+        ["Check that --airflow-url points at Airflow's API server, not another service"],
+        None,
+    ),
+    "schedule_sync_airflow_import_errors": (
+        [
+            "Fix the import error the report names, then re-run fluid schedule-sync",
+            "Parse the DAG locally against the same Airflow major before pushing",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_not_parsed": (
+        [
+            "Raise --airflow-wait: Airflow lists new files every dag_dir_list_interval "
+            "(Airflow 2) or refresh_interval (Airflow 3), 300 s by default",
+            "On an Airflow 3 Git bundle, check that it tracks the branch the push went to",
+            "Where a file waits for Airflow's stored source, check that Airflow parses the "
+            "folder or bucket the push wrote to",
+            "A file forge reads no DAG id from is waited for like a DAG factory when its "
+            "import makes any call; move a helper module like that out of --dags-dir "
+            "(plugins/, or a package installed with Airflow)",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_unproven": (
+        [
+            "Let the Airflow user read DAG code (the 'can read on DAG Code' permission with "
+            "the FAB auth manager), so the check can compare the source Airflow stores with "
+            "the pushed file",
+            "On Airflow 2, keep [core] store_dag_code on (the default)",
+        ],
         None,
     ),
     # ── rollback ───────────────────────────────────────────────────────────

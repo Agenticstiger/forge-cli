@@ -9,6 +9,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid schedule-sync --airflow-url` waits until Airflow has parsed the pushed DAG files, on
+  Airflow 2 and Airflow 3.** It finds the API major itself (`/api/v2` on Airflow 3, `/api/v1` on
+  Airflow 2; `--airflow-api v1|v2` pins it) and signs in the way each major takes a credential: a
+  token in `FLUID_AIRFLOW_TOKEN_REF`, sent as a bearer token to both, or `user:password` in
+  `FLUID_AIRFLOW_CREDENTIAL_REF`, sent as HTTP Basic to Airflow 2 and exchanged for a token at
+  `POST /auth/token` on Airflow 3. Both variables hold a secret reference (`env://`, `file://`,
+  `vault://`, `aws-sm://`), and a project `.env` cannot set them. The version check, the sign-in
+  and the two reads the wait depends on (import errors and DAGs) run before anything is pushed,
+  so a check that cannot run leaves nothing pushed. After the push, every pushed file must be
+  parsed with no import error within `--airflow-wait` seconds (default 600, cap 3600). On an
+  Airflow 3 Git DAG bundle, its DAGs must report the commit the `git+ssh` push made (or
+  `--airflow-bundle-version`). Elsewhere, the source Airflow stores for the file (`dagSources`)
+  must be the pushed file, and Airflow must then save two clean parses of it, the later at
+  least 60 s after the parse it showed when the source first matched: a parse that was already
+  running when the files landed read the old file, Airflow runs one such parse per DAG processor,
+  and it stops a parse after `dag_file_processor_timeout` (50 s by default). A user who may not
+  read DAG code gets a pass marked not proven (`schedule_sync_airflow_unproven`, exit 0) after two
+  clean parses 60 s apart. A failure counts from two stamps of the file's import error and stands
+  once they are 60 s apart. On Airflow 3.4, `/api/v2/dagBundles` shows when the bundle reached
+  the pushed commit. A DAG that never appears is reported as not parsed: Airflow 3 shows the
+  import error of a file with no registered DAG only to a user who may read all import errors.
+  A file whose DAG ids forge cannot read holds the wait until Airflow lists a DAG from it or
+  shows its import error, unless it is a helper module: one whose import makes no call and that
+  never names `globals`. A helper is not waited for, but an import error Airflow shows for it
+  fails the check. `--airflow-bundle` limits the check to one bundle. `--check-only` checks the files under `--dags-dir` without pushing, for a deploy that
+  puts them in place itself. A file that fails to import, or is not parsed in time, exits 1 with
+  `schedule_sync_airflow_import_errors` or `schedule_sync_airflow_not_parsed`, and the report's
+  `airflow_check` block names each file. Typed errors cover an unreachable server, a refused
+  credential, a forbidden read, a redirect (never followed) and a mismatched major. Plain HTTP is
+  refused for any host but loopback unless `FLUID_AIRFLOW_ALLOW_INSECURE_HTTP` is set, and a
+  loopback host is never sent through a proxy. No request outlives `--airflow-wait`. MWAA,
+  Prefect and Dagster are refused with `--airflow-url`. Without `--airflow-url` the stage behaves
+  as before.
+- `fluid_build.util.http_client.new_client` takes `trust_env=False` for a request that must not
+  reach a proxy, like `new_async_client`.
+- **Every DAG forge generates is loaded by a real Airflow in a gated test.**
+  `tests/schedulers/test_generated_dags_airflow_live.py` loads each generator's DAG in the
+  `DagBag` of the Airflow 2 and 3 named by `FLUID_AIRFLOW2_PYTHON` / `FLUID_AIRFLOW3_PYTHON`. It
+  checks that there is no import error and no Airflow removal or deprecation warning, and that
+  the DAG ids match what the new check reads from the files. A unit test runs Ruff's Airflow 3
+  rules (AIR3) over every generated DAG, the `fluid apply` DAGs included. It allows a finding
+  only inside an Airflow 2 `except ImportError` fallback.
+- **A changed Spark stream stops between batches before `fluid apply` replaces it.** Where a
+  changed config used to cancel the running stream, `fluid apply` now asks it to stop: each
+  stream's run is started with a stop key (`--fluid-stop-key`, the start's own token), and the
+  request is an object at `stop/<key>` beside the build's job config (`_fluid/spark/<product>/
+  <build>/`, which the job's role already reads and lists; on `runtime: local`, under
+  `FLUID_SPARK_LOCAL_ROOT`). The runner looks for it every 10 s, stops each of its queries once no
+  batch is running in it (or right after a batch commits, when batches run back to back), and ends
+  cleanly; the new config then starts on the same checkpoint. A run that has not stopped within
+  `FLUID_SPARK_STOP_GRACE_SECONDS` (default 300, `0` cancels at once), was started by an older
+  `fluid apply` without a key, or was started on another job config (the output's location moved,
+  so it would never see the request), is cancelled as before, and the request is removed whatever
+  happens, Ctrl-C included. The outcome names the config the stream moved from and to, and how
+  each old run stopped; a dry run and the plan's `stateImpact` say which runs would stop between
+  batches. A stream that moves to `trigger.availableNow` has its continuous run stopped the same
+  way. A second writer on the checkpoint (a second copy of the same config, or a run of another config
+  beside one of the new config) is still cancelled at once, and `--mode reconcile`, which never
+  replaces a config, writes no request. Before a stream reads anything, the runner refuses a
+  checkpoint (or the dead letters' checkpoint) whose newest offsets name another topic, which also
+  catches a checkpoint no recorded run used (a prefix copied from another stream, a new EMR
+  cluster with no step history). Moving `properties.stream.checkpoint` still starts the job from
+  `startingOffsets`, as the 0.7.7 schema says, unless the new prefix already holds a position
+  (Spark resumes it); the outcome now says which, from the runs' history. The first apply after
+  the upgrade still cancels each running stream once (see Upgrade notes).
+- **`--adopt-tables` takes existing Glue tables over into the OpenTofu state, each only
+  when it matches the contract.** `fluid plan <contract> --tofu --adopt-tables` (and
+  `fluid apply <contract> --adopt-tables`) finds the tables the contract names that
+  already exist and that the state does not hold, and plans each through an OpenTofu
+  `import` block in the module's `main.tf.json`, so the plan shows the import and writes
+  no state before the apply. The saved plan is read back with `tofu show -json` before
+  the data-loss gate: a table that matches is imported unreplaced, its Lake Formation
+  permissions kept. What it holds of its own that the contract does not declare (a
+  description, an owner, column comments, a column name's case, the columns of older
+  Iceberg schemas Glue lists) is printed: an Iceberg table keeps it, as the adoption
+  never updates an Iceberg table in place (the plan is made again with that drift left
+  alone, and must import the table with no change); a Hive table is updated in place. A table that differs refuses the run (`table_adoption_mismatch`),
+  naming each column missing, added, of another type (spacing aside, as the data-loss
+  gate reads types) or in another order, and each property: location, Iceberg or not,
+  input and output format, SerDe and storage parameters, partition keys, table type, any
+  other storage setting, or the replace OpenTofu would plan; nothing is imported or
+  applied. The run that applies the take-over audits it at WARNING
+  (`table_adoption_accepted`); a dry run or a refusal does not. The saved plan records
+  the adopted tables in `opentofuPlan.adoptedTables`, under `planDigest`, and `fluid
+  apply plan.json` names them. `fluid ship --adopt-tables` passes the flag to its apply
+  stage. With the flag a table whose look-up fails for any reason but "no such object"
+  stops the run, and one it cannot look for (no AWS account id) is refused
+  (`table_adoption_unavailable`); `fluid plan --adopt-tables` needs `--tofu`
+  (`plan_adopt_tables_needs_tofu`). The match is checked when the plan is made: a saved
+  plan applies what it planned. A partitioned Hive table cannot be adopted yet: its
+  partition trigger is new to the state, so OpenTofu plans its replacement, and the run
+  is refused saying so.
 - **A Spark build can run the team's own prebuilt PySpark package by its sha256 digest, and
   forge's runner owns the write.** `builds[].properties.package` (0.7.7 preview) on an
   `engine: spark` embedded-logic batch build names a `.whl` or `.zip` (`uri`), its `sha256` and an
@@ -368,6 +460,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **An existing Glue table forge did not make is no longer taken over without being
+  asked.** A table the contract names that already exists and that the OpenTofu state
+  does not manage used to be imported on every `fluid apply` and rewritten to the
+  contract in place. It is now refused before the plan (`table_adoption_requires_flag`),
+  naming each table; `--adopt-tables` adopts it after the match check. A table forge
+  made for the same product is re-attached as before when its state was lost or is kept
+  nowhere, so an apply that starts from an empty state on every run keeps working. Such
+  a table carries the `managed_by: fluid` parameter and the product id in a new
+  `fluid_product_id` parameter, which forge's module sets on every Glue table it
+  creates, whatever the contract's size. A table made before that is matched by the id
+  in the contract it records (`fluid_contract`, dropped for a contract over 50 KB). A
+  table with neither, or with another product's id, needs the flag. S3 buckets, Glue databases,
+  Kinesis streams and the other brownfield resources are adopted as before, and so are
+  tables on the other clouds. The look-up now also covers a Glue binding without a
+  `format`, which the module declares as Parquet and the look-up used to skip.
+
 - **`--fail-on-breaking` fails on a changed product id.** The changelog did not compare ids, so a
   contract that only changed its id passed the gate; it is a breaking change now, as it is in the
   `--impact` report.
@@ -512,6 +620,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sys.path`. So a `yaml.py` or a `fluid_build/` in the checkout ran inside every stage, before the
   CLI started, with the operator's environment. Stages now start through a bootstrap that runs the
   CLI as `-m` does, without that directory on the path.
+
+### Upgrade notes
+
+- A Glue table that forge made before this release from a contract over 50 KB carries forge's
+  `managed_by: fluid` marker but no product id: forge dropped its record of the contract, and
+  `fluid_product_id` did not exist yet. `fluid apply` now refuses it with
+  `table_adoption_requires_flag`, in a message of its own that names the one-time remedy. If the
+  table is that product's, add the table parameter `fluid_product_id=<product id>` once, with the
+  table's writers paused, through `aws glue update-table` with `--version-id` from a fresh
+  `aws glue get-table`, so a concurrent commit fails the update instead of being reverted. Where
+  the run can pass flags and keeps its state, `--adopt-tables` once also works; adopting does not
+  write the id, so a run that keeps no state needs the parameter.
+- Every Spark stream running when forge is upgraded is replaced once by the first `fluid apply`
+  after the upgrade, by a cancel, as before: the runner changed, so the config hash did, and a run
+  started before the upgrade has no stop key, so it cannot be asked to stop between batches. From
+  then on a changed stream stops between batches (see Added). A plan made before the upgrade is
+  refused at `fluid apply` (`apply_spark_artifact_mismatch`): plan again with the new version.
 
 ## [0.36.0] — 2026-11-19
 

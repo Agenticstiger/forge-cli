@@ -107,7 +107,7 @@ def _add_run_options(p: argparse.ArgumentParser) -> None:
         "contract",
         nargs="?",
         default=None,
-        help="Path to contract.fluid.yaml (auto-found in the current directory when omitted).",
+        help="Path to contract.fluid.yaml (default: found in the current directory).",
     )
     p.add_argument("--env", default=None, help="Environment overlay (default: $FLUID_ENV, dev).")
     p.add_argument(
@@ -157,6 +157,11 @@ def _add_apply_options(g: argparse._ArgumentGroup) -> None:
     )
     g.add_argument(
         "--allow-data-loss", action="store_true", help="Pass --allow-data-loss to apply."
+    )
+    g.add_argument(
+        "--adopt-tables",
+        action="store_true",
+        help="Pass --adopt-tables to apply (take over existing tables that match).",
     )
     g.add_argument(
         "--no-verify-digest",
