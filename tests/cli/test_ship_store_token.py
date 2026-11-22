@@ -403,7 +403,7 @@ def _pipe_holding(data: bytes) -> int:
 
 def _main_first_step(monkeypatch: pytest.MonkeyPatch) -> Dict[str, Optional[str]]:
     """Run main() up to its first call before this change, and what it saw there."""
-    import fluid_build.cli as cli
+    from fluid_build import cli
 
     seen: Dict[str, Optional[str]] = {}
 
