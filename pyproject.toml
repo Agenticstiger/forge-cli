@@ -980,6 +980,11 @@ module = [
     "fluid_build.profiler.runner",
     "fluid_build.profiler.sources",
     "fluid_build.cli.profile_cmd",
+    # --adopt-tables: whether forge takes over a table a team's jobs made and fill,
+    # read from the saved plan. A silent Any is a silent take-over.
+    "fluid_build.iac.adoption",
+    "fluid_build.iac.providers.aws_adoption",
+    "fluid_build.cli._apply_table_adoption",
 ]
 strict = true
 

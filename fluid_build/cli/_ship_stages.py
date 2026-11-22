@@ -105,6 +105,7 @@ class ShipOptions:
     yes: bool = False
     strict: bool = True
     allow_data_loss: bool = False
+    adopt_tables: bool = False
     no_verify_digest: bool = False
     no_verify_strict: bool = False
     # False: --no-generate-artifacts, or RUN_STAGE_3_GENERATE_ARTIFACTS=false (stage 3
@@ -281,6 +282,8 @@ def resolve_options(args: object, contract: str, env: Mapping[str, str]) -> Ship
         yes=bool(get("yes")),
         strict=_on_unless_false(get("strict"), env, "VALIDATE_STRICT"),
         allow_data_loss=_truth(bool(get("allow_data_loss")), env, "ALLOW_DATA_LOSS"),
+        # A flag only, as --yes is: a take-over is asked for on the command line.
+        adopt_tables=bool(get("adopt_tables")),
         no_verify_digest=_truth(bool(get("no_verify_digest")), env, "NO_VERIFY_DIGEST"),
         no_verify_strict=not _on_unless_false(get("verify_strict"), env, "VERIFY_STRICT"),
         generate_artifacts=not get("no_generate_artifacts") and 3 not in switched_off,
@@ -709,6 +712,8 @@ def _apply(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
         )
     if o.allow_data_loss:
         argv.append("--allow-data-loss")
+    if o.adopt_tables:
+        argv.append("--adopt-tables")
     if o.no_verify_digest:
         argv += ["--no-verify-plan-binding", "--no-verify-federation"]
     a.argv = argv
