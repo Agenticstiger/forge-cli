@@ -522,7 +522,9 @@ def _redact_command(command: str, depth: int = 0) -> str:
     fields: List[str] = []
 
     def hide(match: "re.Match[str]") -> str:
-        fields.append(match.group(0))
+        # the field stays a reference as written, but a default it holds is read like any text
+        # (``{{ var.value.get('u', 'jdbc:oracle:thin:user/password@host') }}``)
+        fields.append(_scan(match.group(0)))
         return f"__fluidjinja{depth}x{len(fields) - 1}__"
 
     def back(match: "re.Match[str]") -> str:
@@ -557,13 +559,20 @@ def _redact_command(command: str, depth: int = 0) -> str:
     return _JINJA_TOKEN.sub(back, result) if fields else result
 
 
+def _bounded(text: str) -> str:
+    """``text`` cut at :data:`_MAX_ARG` characters, white space collapsed first when it is longer:
+    a cut that falls inside a long run of spaces must not be able to drop the end of a credential
+    that the collapsed text then shows."""
+    return text if len(text) <= _MAX_ARG else " ".join(text.split())[:_MAX_ARG]
+
+
 def safe_args(args: Sequence[str], limit: int = 200) -> List[str]:
     """Arguments of a submitted job, safe to write: a credential-shaped value is masked, and so is
     the value after a flag whose name is one (``--password hunter2``, ``-p hunter2``, ``--token=abc``,
     ``--conf spark.hadoop.fs.s3a.secret.key=abc``), the value of ``NAME=value`` when the name is,
     and a secret in a JSON value or a connection string."""
     words = _Words()
-    return [safe_text(words.show(str(arg)[:_MAX_ARG]), limit) for arg in args]
+    return [safe_text(words.show(_bounded(str(arg))), limit) for arg in args]
 
 
 def safe_command(command: str, limit: int = 2000) -> str:

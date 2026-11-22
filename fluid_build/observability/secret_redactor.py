@@ -193,12 +193,13 @@ _URL_USERINFO_RE = re.compile(
 # (``@//host`` too; ``oci``, ``oci8``, ``kprb``; any case). The password is what stands between
 # the ``/`` after the user and the LAST ``@`` of the word, so one that holds an ``@`` is masked
 # whole; one in double quotes (``scott/"p@ss"@h``, or with the quotes backslash-escaped) is read to
-# its closing quote. ``thin:@host`` and ``thin:user@host`` have no password: no match. Two unnamed
+# its closing quote, and so is a user name in double quotes (``"SCOTT"/pw@h``). ``thin:@host``
+# and ``thin:user@host`` have no password: no match. Two unnamed
 # groups (the text up to the password, and the ``@``), so the Snowflake twin renders it as
 # ``\1[REDACTED]\2`` and imports THIS object, as it does :data:`_URL_USERINFO_RE`. Every repeat
 # is length-bounded: the cost is linear in the line.
 _ORACLE_JDBC_RE = re.compile(
-    r"(?i)(jdbc:oracle:(?:thin|oci8?|kprb):[^/@\s'\"]{1,128}/)"
+    r"(?i)(jdbc:oracle:(?:thin|oci8?|kprb):(?:\\?\"[^\"\r\n]{1,128}\\?\"|[^/@\s'\"]{1,128})/)"
     r"(?:\\?\"[^\"\r\n]{0,512}\"|[^\s'\"]{1,512})(@)"
 )
 # PEM private-key block (RSA / EC / OPENSSH / DSA / bare PKCS#8 ...).

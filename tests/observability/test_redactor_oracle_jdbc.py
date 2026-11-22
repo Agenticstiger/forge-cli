@@ -53,6 +53,19 @@ def twin(text: str) -> str:
             "JDBC:ORACLE:THIN:SCOTT/" + PHRASE.upper() + "@H:1521/S",
             f"JDBC:ORACLE:THIN:SCOTT/{MASK}@H:1521/S",
         ),
+        # a user name in double quotes (Oracle's case-sensitive name), with the password quoted or not
+        (
+            'jdbc:oracle:thin:"SCOTT"/' + PHRASE + "@dbhost:1521/ORCL",
+            f'jdbc:oracle:thin:"SCOTT"/{MASK}@dbhost:1521/ORCL',
+        ),
+        (
+            'jdbc:oracle:thin:"SCOTT"/"p@' + PHRASE + '"@h:1521/S',
+            f'jdbc:oracle:thin:"SCOTT"/{MASK}@h:1521/S',
+        ),
+        (
+            'jdbc:oracle:thin:\\"SCOTT\\"/' + PHRASE + "@h:1521/S",
+            f'jdbc:oracle:thin:\\"SCOTT\\"/{MASK}@h:1521/S',
+        ),
         # a password that holds an @: quoted, quoted with escaped quotes, and not quoted at all
         (
             'jdbc:oracle:thin:scott/"p@' + PHRASE + '"@h:1521/S',
@@ -129,6 +142,29 @@ def test_a_long_hostile_line_is_scanned_in_linear_time():
             started = time.perf_counter()
             scan(hostile)
             assert time.perf_counter() - started < 5  # it takes a fraction of a second
+
+
+# --- every logging layer ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("layer", ["snowflake", "local", "gcp"])
+def test_each_provider_logging_layer_masks_the_three_shapes(layer):
+    import importlib
+
+    module = importlib.import_module(f"fluid_build.providers.{layer}.util.logging")
+    for text in (
+        thin(),
+        'jdbc:oracle:thin:"SCOTT"/' + PHRASE + "@h",
+        slack_webhook(),
+        "k" + GOOGLE_KEY,
+    ):
+        out = module.redact_string(f"connect {text} now")
+        assert PHRASE not in out and "abcdEFGH" not in out and GOOGLE_BODY[:8] not in out, (
+            layer,
+            text,
+        )
+        assert "[REDACTED]" in out
+    assert module.redact_string(thin()) == "jdbc:oracle:thin:scott/[REDACTED]@dbhost:1521/ORCL"
 
 
 # --- a Slack incoming webhook ---------------------------------------------------------

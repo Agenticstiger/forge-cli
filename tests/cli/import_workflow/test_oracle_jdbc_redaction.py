@@ -44,6 +44,8 @@ SHAPES = [
     thin("ORCL", kind="oci8"),
     thin("//h/S", kind="oci"),
     "JDBC:ORACLE:THIN:SCOTT/" + PHRASE + "@H:1521/S",
+    'jdbc:oracle:thin:"SCOTT"/' + PHRASE + "@dbhost:1521/ORCL",
+    'jdbc:oracle:thin:"SCOTT"/"p@' + PHRASE + '"@h:1521/S',
     'jdbc:oracle:thin:scott/"p@' + PHRASE + '"@h:1521/S',
     "jdbc:oracle:thin:scott/p@" + PHRASE + "@h:1521/S",
 ]
@@ -61,6 +63,22 @@ def test_every_way_the_importer_reads_text_masks_the_password(url):
     assert hidden(safe_command("spark-submit --conf spark.jdbc.url=" + url))
     assert hidden(safe_command('spark-submit --src "' + url + '"'))
     assert hidden(scrub_path(url))
+
+
+def test_a_url_in_a_template_field_is_read_like_any_text():
+    command = "spark-submit --url {{ var.value.get('u', '" + thin() + "') }} --day {{ ds }} job.py"
+    shown = safe_command(command)
+    assert hidden(shown) and "{{ ds }}" in shown and MASK in shown
+    assert "{{ var.value.get(" in shown  # the field is still the field
+
+
+def test_a_long_argument_cannot_be_cut_inside_the_password_by_the_white_space_before_it():
+    secret = PHRASE * 3
+    head = "jdbc:oracle:thin:scott/"
+    padded = " " * (2_000 - len(head) - 10) + head + secret + "@dbhost:1521/ORCL"  # cut: 10 in
+    shown = safe_args([padded])[0]
+    assert PHRASE[:8].lower() not in shown.lower() and MASK in shown
+    assert PHRASE[:8].lower() not in safe_args(["--src", padded])[1].lower()
 
 
 def test_the_host_and_the_user_stay_so_the_url_still_says_where_it_goes():
@@ -132,11 +150,11 @@ def whole_import(root: Path, monkeypatch) -> str:
     return "\n".join(lines)
 
 
-@pytest.mark.parametrize("url", [thin(), thin("//dbhost:1521/ORCL"), SHAPES[6]])
+@pytest.mark.parametrize("url", [thin(), thin("//dbhost:1521/ORCL"), SHAPES[6], SHAPES[8]])
 def test_an_import_of_a_job_with_the_url_in_a_task_a_conf_and_an_option_writes_no_password(
     tmp_path, monkeypatch, url
 ):
     project(tmp_path, url)
     written = whole_import(tmp_path, monkeypatch)
     assert PHRASE not in written
-    assert "scott/" + MASK + "@" in written  # the task's argument is recorded, masked
+    assert "/" + MASK + "@" in written  # the task's argument is recorded, masked
