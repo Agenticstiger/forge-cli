@@ -361,6 +361,88 @@ def test_a_scaffold_bundle_kept_at_the_output_name_is_never_deleted(
     assert (bundle / "fluid-scaffold.yaml").is_file()
 
 
+# ── change-request builds ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        {"CHANGE_ID": "42"},
+        {"GITHUB_EVENT_NAME": "pull_request"},
+        {"GITHUB_EVENT_NAME": "pull_request_target"},
+        {"CI_MERGE_REQUEST_IID": "3"},
+        {"CI_PIPELINE_SOURCE": "merge_request_event"},
+        {"BUILD_REASON": "PullRequest"},
+        {"BITBUCKET_PR_ID": "9"},
+        {"CIRCLE_PULL_REQUEST": "https://example.invalid/o/r/pull/9"},
+        {"FLUID_CHANGE_REQUEST": "true"},
+    ],
+)
+def test_a_change_request_build_refuses_the_scaffold_and_runs_no_template(
+    tmp_path: Path, stub: Any, monkeypatch: pytest.MonkeyPatch, marker: Dict[str, str]
+) -> None:
+    for name, value in marker.items():
+        monkeypatch.setenv(name, value)
+    out = tmp_path / "out"
+    with pytest.raises(FanoutError) as raised:
+        _fanout(_write(tmp_path / "p", _contract(_block())), out)
+    assert raised.value.code == "custom_scaffold_change_request"
+    assert next(iter(marker)) in str(raised.value)
+    assert "--allow-scaffold-on-change-request" in str(raised.value)
+    assert "calls" not in stub.HOOKS
+    assert not (out / "custom-scaffold").exists()
+
+
+def test_the_flag_lets_a_trusted_change_request_build_run_it(
+    tmp_path: Path, stub: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CHANGE_ID", "42")
+    manifest = run_fanout(
+        _write(tmp_path / "p", _contract(_block())),
+        tmp_path / "out",
+        emit_raw="custom-scaffold",
+        manifest_path=None,
+        logger=LOG,
+        allow_scaffold_on_change_request=True,
+    )
+    assert "custom-scaffold/README.md" in manifest["files"]
+
+
+def test_no_variable_can_stand_in_for_the_flag(
+    tmp_path: Path, stub: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CHANGE_ID", "42")
+    for name in (
+        "FLUID_ALLOW_SCAFFOLD_ON_CHANGE_REQUEST",
+        "ALLOW_SCAFFOLD_ON_CHANGE_REQUEST",
+        "FLUID_CHANGE_REQUEST",
+    ):
+        monkeypatch.setenv(name, "false" if name == "FLUID_CHANGE_REQUEST" else "true")
+    with pytest.raises(FanoutError) as raised:
+        _fanout(_write(tmp_path / "p", _contract(_block())), tmp_path / "out")
+    assert raised.value.code == "custom_scaffold_change_request"
+
+
+def test_a_change_request_build_without_the_block_is_not_refused(
+    tmp_path: Path, no_engine: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CHANGE_ID", "42")
+    assert _scaffold_rows(_fanout(_write(tmp_path / "p", _contract()), tmp_path / "out")) == []
+
+
+def test_the_cli_refuses_on_a_change_request_and_the_flag_overrides(
+    tmp_path: Path, stub: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    contract = _write(tmp_path / "p", _contract(_block()))
+    base = ["generate", "artifacts", str(contract), "--emit", "custom-scaffold"]
+    assert _main(*base, "--out", str(tmp_path / "a")) == 1
+    text = " ".join(capsys.readouterr().out.split())
+    assert "custom_scaffold_change_request" in text and "GITHUB_EVENT_NAME" in text
+    assert _main(*base, "--out", str(tmp_path / "b"), "--allow-scaffold-on-change-request") == 0
+    assert "custom-scaffold/README.md" in _manifest(tmp_path / "b")["files"]
+
+
 # ── refusals: nothing half-written is left behind ─────────────────────────
 
 

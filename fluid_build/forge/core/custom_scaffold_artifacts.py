@@ -21,13 +21,19 @@ request it does not trust, which reaches stage 3 but never the builds of stage 7
 A run, in order:
 
 1. No block: nothing, and the engine is not imported.
-2. A missing engine, one older than 0.5.0 (no ``generate()``) or one that does not import
+2. On a build its CI marks as a change request (a pull or merge request:
+   :func:`fluid_build.util.change_request.change_request_marker`) the run is refused,
+   unless ``--allow-scaffold-on-change-request`` was passed: such a build runs the change's
+   code before anyone merged it, often with the credentials a default-branch build has, and
+   a generated pipeline shares one ``GENERATE_EMIT`` between both (``fluid ship`` leaves the
+   key out on such a build). Only the flag overrides it, never a variable.
+3. A missing engine, one older than 0.5.0 (no ``generate()``) or one that does not import
    stops the run with an error that names the extra.
-3. The engine's own validator checks the block, and the operator's plugin policy
+4. The engine's own validator checks the block, and the operator's plugin policy
    (``FLUID_PLUGINS_ALLOWLIST`` / ``FLUID_PLUGINS_BLOCKLIST``, as
    :func:`fluid_build.plugin_manager.is_allowed` reads it, names compared without regard to
    case or ``-``/``_``) every ``entrypoint`` source, before the engine runs.
-4. The engine writes into a new hidden directory beside ``custom-scaffold/``
+5. The engine writes into a new hidden directory beside ``custom-scaffold/``
    (``.custom-scaffold.partial-<hex>``). Each row it reports must name a plain relative path
    to a regular file there with the reported sha256 and size, nothing it did not report may
    be there, and no link; only then is the directory renamed to ``custom-scaffold/``. A
@@ -36,7 +42,7 @@ A run, in order:
    No code generator surveyed records digests (OpenAPI Generator's ``.openapi-generator/FILES``
    and projen's ``.projen/files.json`` list paths only), so the rows are checked against the
    bytes on disk rather than trusted.
-5. Each engine error class has its own error code (``custom_scaffold_*``); the message,
+6. Each engine error class has its own error code (``custom_scaffold_*``); the message,
    which can quote contract text, is redacted first. An exception outside the engine's
    hierarchy is reported by its type only.
 
@@ -143,14 +149,16 @@ def emit(
     logger: logging.Logger,
     *,
     anchor: ContractAnchor,
+    allow_change_request: bool = False,
 ) -> List[Path]:
     """Generate the scaffold ``contract`` declares into ``out_dir`` (``<out>/custom-scaffold``).
 
     Runs only when ``--emit`` named the key. ``anchor`` says where a relative ``path:``
     source is read from (no directory: the current one, with a warning when the block has
-    such a source). Returns the files written, each under ``out_dir``; raises
-    :class:`FanoutError` (or the optional-dependency error) and leaves nothing under
-    ``out_dir`` when the run is refused.
+    such a source). ``allow_change_request`` (only ``--allow-scaffold-on-change-request``
+    sets it) runs the scaffold on a change-request build too. Returns the files written,
+    each under ``out_dir``; raises :class:`FanoutError` (or the optional-dependency error)
+    and leaves nothing under ``out_dir`` when the run is refused.
     """
     block = scaffold_block(contract)
     if block is None:
@@ -160,6 +168,8 @@ def emit(
             EXTENSION_KEY,
         )
         return []
+    if not allow_change_request:
+        _refuse_on_change_request()
     engine = _engine()
     _check_block(engine, contract)
     _check_plugins(block)
@@ -185,6 +195,20 @@ def emit(
 
 
 # ── the engine ────────────────────────────────────────────────────────────
+
+
+def _refuse_on_change_request() -> None:
+    from fluid_build.util.change_request import change_request_marker
+
+    marker = change_request_marker(os.environ)
+    if marker is not None:
+        _refuse(
+            f"custom scaffold: this is a change-request build ({marker}), and the contract's "
+            "bundle templates run in this process, so they do not run here: leave "
+            "custom-scaffold out of --emit on change-request builds (fluid ship does), or pass "
+            "--allow-scaffold-on-change-request when this build's changes are trusted",
+            "custom_scaffold_change_request",
+        )
 
 
 def _engine() -> Any:

@@ -1106,7 +1106,11 @@ def _emit_custom_scaffold(run: "_Inputs", out_dir: Path, logger: logging.Logger)
         *_scaffold_contract_dir(run.source, run.source_path, run.contract_path)
     )
     return custom_scaffold_artifacts.emit(
-        _load_contract(run.resolved_contract), out_dir, logger, anchor=anchor
+        _load_contract(run.resolved_contract),
+        out_dir,
+        logger,
+        anchor=anchor,
+        allow_change_request=run.allow_scaffold_on_change_request,
     )
 
 
@@ -1163,6 +1167,8 @@ class _Inputs:
     schedule_contract: Optional[Dict[str, Any]]
     source_path: Optional[Path]
     contract_path: Optional[str]
+    #: ``--allow-scaffold-on-change-request``: custom-scaffold runs on a change-request build.
+    allow_scaffold_on_change_request: bool = False
 
 
 def _clear_outputs(out_dir: Path) -> None:
@@ -1230,6 +1236,7 @@ def run_fanout(
     env: Optional[str] = None,
     contract_path: Optional[str] = None,
     source_path: Optional[Path] = None,
+    allow_scaffold_on_change_request: bool = False,
 ) -> Dict[str, Any]:
     """Top-level orchestrator called from the ``generate-artifacts`` CLI.
 
@@ -1329,6 +1336,7 @@ def run_fanout(
             schedule_contract=schedule_contract,
             source_path=source_path,
             contract_path=contract_path,
+            allow_scaffold_on_change_request=allow_scaffold_on_change_request,
         )
         written: List[Path] = []
         for key in emits:
