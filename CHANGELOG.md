@@ -53,6 +53,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anything that is not a hex commit, a URL or `user@host:org/repo`, or a ref name, is left out: a
   credential or a path on the runner is no part of a release record).
 
+- **Each Iceberg commit also names the bundle and the scheduler run behind it.** The Spark
+  runner stamps `fluid.bundle-digest`, the `bundleDigest` of the plan `fluid apply` verified (the
+  `identity.bundle.manifest_digest` of the sealed release), and `fluid.scheduler-job` and
+  `fluid.scheduler-run-id`, the job and run of the scheduler that started `fluid apply`, beside
+  `fluid.run-id`. The scheduler's come from `FLUID_SCHEDULER_JOB` and `FLUID_SCHEDULER_RUN_ID`,
+  else from the task context Airflow 2 and 3 give every task (`AIRFLOW_CTX_DAG_ID`,
+  `AIRFLOW_CTX_DAG_RUN_ID`). The DAGs `fluid generate schedule` writes hand Airflow's DAG id and run
+  id to `fluid apply` under fluid's names, so still no `AIRFLOW*` variable reaches it. A
+  scheduler's value is made safe as a run id is and never refuses a run. A project `.env` may set
+  neither the scheduler's variables nor Airflow's. Only a run started from a verified plan carries
+  the bundle: a scheduled DAG run and the keepalive apply the contract, not a plan, so set
+  `FLUID_RELEASE_ID` on the worker to name the release there. `fluid.contract-digest` is the
+  contract's as written on every start path, a scheduled build from a `plan.json` included (it
+  hashed that plan's resolved copy). Like the other stamps these are runner arguments, so they
+  restart no stream. A local Spark 3.5 session with Iceberg 1.6 now checks on real tables that the
+  stamps reach the snapshot summary of a stream's commits, of its dead letters' and of a batch
+  overwrite.
+
+- **`fluid runs status --release-dir` matches a commit to its release and trusts only intact
+  records.** Each release shows its `bundle` line, the `fluid.bundle-digest` a commit names. The
+  release in force is the latest intact one: a later record whose `identity_digest` no longer
+  matches its identity is listed under "Not in force" (`not_intact` in `--json`), never in force,
+  and with no intact release nothing is (exit 1). A long root no longer makes two releases look
+  alike (a path is cut from its start, and releases sealed in one second are ordered by their whole
+  paths); piped output keeps each line whole (it was cut at 80 columns); a `--release-dir` this
+  user may not read is a usage error (exit 2) with a plain message; and the "not read" line counts
+  every entry past the 2,000 read in a directory.
+
 - **`fluid import pyspark` and `fluid import airflow` propose products from the code that already
   runs.** `fluid import pyspark <jobs-dir> [--dags <dags-dir>]` reads PySpark jobs and
   `fluid import airflow <dags-dir>` reads Airflow DAG files, both statically: the files are parsed
@@ -121,7 +149,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the permission bits of a file it replaces. `--out` that names an existing file is refused when
   several products are written, and `--split-by table`, `job` and `dag` are refused for the
   importers that do not read code.
-
 
 - **`fluid generate pyspark-schema` writes a PySpark `StructType` module for each output
   port.** For every output port that declares `contract.schema` columns it writes
@@ -276,6 +303,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A scheduled run no longer shares its run id with every other scheduled run.** A command a
+  scheduler started took the run id a worker's checkout keeps in `.fluid/run-id.txt`, so every
+  scheduled `fluid apply` of a product, on every day, had one id in its OpenTelemetry spans, its
+  run records and the `fluid.run-id` stamp. Under a scheduler (`FLUID_SCHEDULER_RUN_ID`, or
+  Airflow's `AIRFLOW_CTX_DAG_RUN_ID`) the run id is now derived from the scheduler's job and run:
+  the same for each command of one run, another for the next, and the file is neither read nor
+  written. `FLUID_RUN_ID` still wins.
+
 - **The redactor masks the password of an Oracle JDBC URL, a Slack incoming webhook, and a
   Google API key that follows a word character.** `jdbc:oracle:thin:user/password@host` (also
   `@//host`, `oci`, `oci8` and `kprb`, in any case, with a password that holds an `@`, quoted
@@ -283,7 +318,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nor the `user:password` one saw it, and it was logged and written as it stood while the
   PostgreSQL form was masked. A Slack webhook URL is a secret by itself and is masked whole, and
   `GOOGLE_AIza...` and `%3DAIza...` leaked because the key rule wanted a word boundary before it.
-  The global redactor and the Snowflake provider's own share the Oracle rule's one regex.
+  The repository's redactor, the importer and the Snowflake, local and GCP provider loggers share
+  the Oracle rule's one regex, which also reads a user name in double quotes.
 
 - **Entropy Data's product list is read whole or not at all.** A page after the first that was
   not a list (a rate-limit answer, say) used to hand back the pages before it as if they were
