@@ -51,7 +51,7 @@ def states(source: str) -> Dict[str, FrozenSet[int]]:
             and getattr(node.value.func, "id", None) == "use"
         ):
             uses[node.value.args[0].value] = node  # type: ignore[attr-defined]
-    flow = _flow.Flow(base, setters)
+    flow = _flow.Flow(base, setters, {id(stmt) for stmt in uses.values()})
     only = tree.body[0] if len(tree.body) == 1 else None
     # the body of a function is read as its own: the flow does not go into a nested one
     flow.run(only.body if isinstance(only, ast.FunctionDef) else tree.body)
@@ -166,7 +166,7 @@ def test_a_loop_else_runs_unless_the_loop_breaks():
         use("after")
         """
     )
-    assert got == {"after": {0, 1}}  # no pass: the else still runs, and a pass leaves 0 too
+    assert got == {"after": {1}}  # with no break the else always runs, after no pass or many
 
 
 def test_a_while_loop_is_read_like_a_for_loop():
@@ -270,3 +270,110 @@ def test_a_body_that_costs_too_much_is_not_read(monkeypatch):
     source = "w = base\n" + "pass\n" * 30
     with pytest.raises(_flow.TooMuch):
         states(source)
+
+
+def test_a_break_takes_what_was_set_before_it_out_of_the_loop():
+    got = states(
+        """
+        w = base
+        for i in x:
+            w = w.trigger(1)
+            if i:
+                break
+            w = w.trigger(2)
+        use("after")
+        """
+    )
+    # the break leaves 1; a pass that ends leaves 2; no pass leaves 0
+    assert got == {"after": {0, 1, 2}}
+
+
+def test_a_continue_ends_the_pass_with_what_was_set_before_it():
+    got = states(
+        """
+        w = base
+        for i in x:
+            use("top")
+            if i:
+                w = w.trigger(1)
+                continue
+            w = w.trigger(2)
+        use("after")
+        """
+    )
+    assert got == {"top": {0, 1, 2}, "after": {0, 1, 2}}
+
+
+def test_what_follows_a_break_in_its_block_is_not_reached():
+    got = states(
+        """
+        w = base
+        while True:
+            break
+            w = w.trigger(1)
+        use("after")
+        """
+    )
+    assert got == {"after": {0}}
+
+
+def test_a_break_skips_the_else_of_its_loop():
+    got = states(
+        """
+        w = base
+        for i in x:
+            w = w.trigger(1)
+            break
+        else:
+            w = w.trigger(2)
+        use("after")
+        """
+    )
+    assert got == {"after": {1, 2}}  # a pass that breaks leaves 1; no pass runs the else: 2
+
+
+def test_a_with_that_may_swallow_an_exception_may_leave_before_its_body_is_done():
+    got = states(
+        """
+        w = base
+        with contextlib.suppress(E):
+            f()
+            w = w.trigger(1)
+        use("after")
+        """
+    )
+    assert got == {"after": {0, 1}}
+    got = states(
+        """
+        w = base
+        with open(x):
+            w = w.trigger(1)
+        use("after")
+        """
+    )
+    assert got == {"after": {1}}
+
+
+def test_only_the_statements_from_the_variable_to_its_last_use_are_read():
+    source = "pass\n" * 500 + "w = base\nuse('a')\n" + "pass\n" * 500
+    flow_source = textwrap.dedent(source)
+    tree = ast.parse(flow_source)
+    base = next(n for n in tree.body if isinstance(n, ast.Assign))
+    use = next(n for n in tree.body if isinstance(n, ast.Expr))
+    flow = _flow.Flow(base, {}, {id(use)})
+    flow.run(tree.body, 500, 501)
+    assert flow.visits == 2 and flow.before == {id(use): {0}}
+
+
+def test_a_state_is_kept_only_before_the_statements_that_use_the_variable():
+    tree = ast.parse("w = base\nx = 1\nuse('a')\n")
+    base, other, use = tree.body
+    flow = _flow.Flow(base, {}, {id(use)})
+    flow.run(tree.body)
+    assert set(flow.before) == {id(use)}
+
+
+def test_more_ways_to_a_use_than_the_limit_is_not_read():
+    ifs = "".join(f"if c{i}:\n    w = w.trigger({i})\n" for i in range(_flow.MAX_SOURCES + 2))
+    with pytest.raises(_flow.TooMuch):
+        states("w = base\n" + ifs + "use('a')\n")

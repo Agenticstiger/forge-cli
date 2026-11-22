@@ -412,6 +412,8 @@ def _rebound_names(tree: ast.AST) -> Dict[str, str]:
             else:
                 targets = [node.target]
             for target in targets:
+                if isinstance(node, ast.AugAssign) and not isinstance(target, ast.Name):
+                    touch(target, owner)  # ``D["k"] += [...]`` adds to the list D holds
                 for item in _target_exprs(target):
                     touch(item.value, owner)  # type: ignore[attr-defined]
                 if isinstance(target, ast.Name) and isinstance(node, ast.Delete):
@@ -427,6 +429,8 @@ def _rebound_names(tree: ast.AST) -> Dict[str, str]:
                 else:
                     for n in names:
                         held.setdefault(n, []).extend(_contents(node.value))
+                # ``A = B = [...]``: both names are for the one list
+                aliases.extend((names[0], other, node.lineno) for other in names[1:])
         elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
             for item in _target_exprs(node.target):
                 touch(item.value, owner)  # type: ignore[attr-defined]
@@ -639,6 +643,12 @@ def _rebinds(loop: ast.For, names: Sequence[str]) -> bool:
             elif isinstance(node, (ast.Global, ast.Nonlocal)):
                 if wanted.intersection(node.names):
                     return True
+            elif isinstance(node, (ast.MatchAs, ast.MatchStar)):  # ``case i:``, ``case [*i]``
+                if node.name in wanted:
+                    return True
+            elif isinstance(node, ast.MatchMapping):  # ``case {**i}``
+                if node.rest in wanted:
+                    return True
     return False
 
 
@@ -785,7 +795,9 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
         else:
             block(name, f"`{name}` is changed in place")
     scope.assignments = {
-        name: values for name, values in plain.items() if len(values) > 1 and name not in other
+        name: sorted(values, key=lambda e: (e.lineno, e.col_offset))
+        for name, values in plain.items()
+        if len(values) > 1 and name not in other
     }
     return scope
 
@@ -1102,6 +1114,9 @@ _VARIABLE_GET = frozenset(
         "airflow.sdk.definitions.variable.Variable.get",
     }
 )
+#: The calls a file may import a name from two places for and still mean them (a ``try`` that
+#: imports ``Variable`` from Airflow 3 and falls back to Airflow 2).
+_READ_THROUGH_IMPORT = _ENV_GET | _VARIABLE_GET
 
 
 class Folder:
@@ -1628,7 +1643,7 @@ class Folder:
                     del acc.value[MAX_ITEMS:]
                 continue
             items = self._loop_items(step.loop, scope, depth)
-            if items is None:
+            if items is None or any(self.rebound(n) for n in _target_names(step.loop.target)):
                 acc.complete = False
                 continue
             if len(items) > MAX_LOOP_ITERATIONS:
@@ -1736,6 +1751,15 @@ class Folder:
             head = head.value
         if not isinstance(head, ast.Name):
             return False
+        if self.rebound(head.id) or "*" in self.module.ambiguous:
+            return False  # ``global``, ``:=``, a match capture, a star import
+        places = self.module.ambiguous.get(head.id)
+        if places is not None:  # imported from two places: both must be the one that is meant
+            last = self.module.imports.get(head.id, head.id)
+            qualified = qualified_name(func, self.module.imports) or ""
+            rest = qualified[len(last) :] if qualified.startswith(last) else ""
+            if not all(place + rest in _READ_THROUGH_IMPORT for place in places):
+                return False
         bound = self._binding_scope(head.id, scope)
         if bound is None:
             return head.id in self.module.imports

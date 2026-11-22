@@ -487,3 +487,57 @@ def test_a_set_has_no_order_and_no_duplicates_to_add_or_to_loop_over():
         """
     )
     assert looped.complete is False
+
+
+@pytest.mark.parametrize(
+    "rebinding",
+    [
+        "match 5:\n    case i:\n        pass",
+        "match [1, 2]:\n    case [_, *i]:\n        pass",
+        "match 5:\n    case int() as i:\n        pass",
+        "match {}:\n    case {**i}:\n        pass",
+    ],
+)
+def test_a_loop_whose_body_binds_its_variable_in_a_match_is_not_unrolled(rebinding):
+    body = textwrap.indent(rebinding, "    ")
+    value = fold("ARGS = ['a']\nfor i in [1, 2]:\n" + body + "\n    ARGS += [str(i)]\nx = ARGS\n")
+    assert isinstance(value, Unresolved), value
+
+
+def test_a_loop_variable_that_a_function_of_the_file_sets_through_global_is_not_the_item():
+    value = fold(
+        """
+        ARGS = []
+
+
+        def f():
+            global i
+            i = 99
+
+
+        for i in [1, 2]:
+            f()
+            ARGS += [str(i)]
+        x = ARGS
+        """
+    )
+    assert getattr(value, "complete", False) is False or isinstance(value, Unresolved)
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        "A = B = ['a']\nB += ['b']\nx = A",
+        "BASE = ['a']\nD = {'k': BASE}\nD['k'] += ['b']\nx = BASE",
+    ],
+)
+def test_a_list_changed_through_another_name_for_it_is_not_what_it_was(setup):
+    assert isinstance(fold(setup), Unresolved)
+
+
+@pytest.mark.parametrize(
+    "copy",
+    ["list(BASE)", "BASE[:]", "BASE.copy()", "[*BASE]", "BASE + []"],
+)
+def test_a_real_copy_of_a_list_is_not_changed_by_an_addition_to_the_copy(copy):
+    assert fold(f"BASE = ['a']\nARGS = {copy}\nARGS += ['b']\nx = BASE") == ["a"]

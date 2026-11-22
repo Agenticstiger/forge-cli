@@ -619,3 +619,132 @@ def test_too_many_ways_to_reach_a_use_is_not_followed():
         for i in range(MAX_CHAIN_SOURCES + 1)
     )
     assert job(BASE + ifs + 'writer.toTable("glue.a.t")\n').writes == []
+
+
+# ── what the second round of review found ───────────────────────────────────────────────
+
+
+def test_a_trigger_set_before_a_break_is_still_one_the_stream_can_have():
+    write = only_write(
+        job(
+            """
+writer = (
+    raw.writeStream.format("iceberg")
+    .option("checkpointLocation", "s3://state/clicks")
+    .trigger(availableNow=True)
+)
+for x in range(3):
+    writer = writer.trigger(processingTime="1 minute")
+    if x:
+        break
+    writer = writer.trigger(availableNow=True)
+writer.toTable("glue.b.c")
+"""
+        )
+    )
+    assert "processingTime=1 minute" in write.trigger.split(TRIGGER_SEPARATOR)
+    assert _proposal._trigger([write]) == "continuous"
+
+
+def test_a_trigger_set_before_a_continue_in_a_try_is_one_too():
+    write = only_write(
+        job(
+            BASE
+            + """
+writer = writer.trigger(availableNow=True)
+while cond:
+    try:
+        writer = writer.trigger(processingTime="1 minute")
+        continue
+    finally:
+        pass
+    writer = writer.trigger(availableNow=True)
+writer.toTable("glue.b.c")
+"""
+        )
+    )
+    assert "processingTime=1 minute" in write.trigger.split(TRIGGER_SEPARATOR)
+
+
+@pytest.mark.parametrize(
+    "rebinding",
+    [
+        "def setup():\n    global writer\n    writer = writer.trigger(processingTime='1 minute')\n\nsetup()",
+        "(writer := writer.trigger(processingTime='1 minute'))",
+        "match 1:\n    case writer:\n        pass",
+        "del writer\nwriter = raw.writeStream.format('iceberg')",
+    ],
+)
+def test_a_writer_the_file_rebinds_outside_its_assignments_is_not_followed(rebinding):
+    source = (
+        BASE
+        + "writer = writer.trigger(availableNow=True)\n"
+        + rebinding
+        + '\nwriter.toTable("glue.b.c")\n'
+    )
+    assert job(source).writes == []
+    single = (
+        BASE.replace("writer = (", "writer = (").rstrip("\n")
+        + "\n"
+        + rebinding
+        + '\nwriter.toTable("glue.b.c")\n'
+    )
+    assert job(single).writes == []
+
+
+def test_a_writer_that_is_assigned_once_and_not_rebound_is_still_followed():
+    assert only_write(job(BASE + 'writer.toTable("glue.b.c")\n')).name == "glue.b.c"
+
+
+def test_the_flow_of_many_variables_in_a_long_file_costs_in_proportion(monkeypatch):
+    import time
+
+    filler = "".join(f"y{i} = 1\n" for i in range(10_000))
+    blocks = "".join(
+        f"""
+w{i} = raw.writeStream.format("iceberg").option("checkpointLocation", "s3://c/{i}")
+w{i} = w{i}.trigger(availableNow=True)
+w{i}.toTable("g.b.t{i}")
+"""
+        for i in range(500)
+    )
+    started = time.perf_counter()
+    facts = job(filler + blocks)
+    assert len(facts.writes) == 500
+    assert time.perf_counter() - started < 20
+
+
+def test_the_flow_one_file_may_read_in_all_is_bounded(monkeypatch):
+    from fluid_build.cli.import_workflow import _spark_io
+
+    monkeypatch.setattr(_spark_io, "MAX_FLOW_VISITS_PER_FILE", 10)
+    blocks = "".join(
+        f"""
+w{i} = raw.writeStream.format("iceberg").option("checkpointLocation", "s3://c/{i}")
+w{i} = w{i}.trigger(availableNow=True)
+w{i}.toTable("g.b.t{i}")
+"""
+        for i in range(20)
+    )
+    got = len(job(blocks).writes)
+    assert 0 < got < 20  # the variables read before the budget ran out are followed
+
+
+def test_thousands_of_setters_in_try_blocks_cost_in_proportion():
+    import time
+
+    body = "".join(
+        f"""
+try:
+    writer = writer.trigger(processingTime="{i} seconds")
+except Exception:
+    pass
+finally:
+    pass
+"""
+        for i in range(3_000)
+    )
+    started = time.perf_counter()
+    facts = job(BASE + body + 'writer.toTable("glue.b.c")\n')
+    assert time.perf_counter() - started < 15
+    assert facts.writes == []  # more ways to the use than the limit: not followed

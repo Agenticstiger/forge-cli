@@ -59,6 +59,10 @@ def job(source: str, *, rules=RULES, helpers=None) -> JobFacts:
         ("s3://lake/curated", [("s3://lake/curated/fixed/", True)], None),
         ("s3://lake/curated/fixed", [("s3://lake/curated/fixed/", True)], None),  # a longer name
         ("", RULES, None),
+        ("s3://lake/landing/retail/../secret/x/", RULES, None),  # a path that goes up
+        ("s3://lake/landing/retail/./orders/x", RULES, None),
+        ("s3://lake/landing/retail/%2e%2e/orders/x", RULES, None),
+        ("s3://lake/landing/retail/orders/../x/", RULES, None),
         # the first rule that applies is the one: a later, longer one is not looked at
         (
             "s3://lake/a/b/x/",

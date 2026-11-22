@@ -44,11 +44,12 @@ from __future__ import annotations
 import ast
 import json
 import re
+from bisect import bisect_right
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from . import _spark_sql
-from ._flow import Flow, TooMuch
+from ._flow import MAX_SOURCES, Flow, TooMuch
 from ._fold import MAX_SQL_STRING, FoldedDict, Folder, Unresolved
 from ._pysource import MAX_TOTAL_SQL_CHARS, Module, clean_chars, qualified_name, snippet
 from ._redact import scrub_host, scrub_path
@@ -121,7 +122,9 @@ _IDENTITY_OPTIONS = frozenset(
 #: Joins the triggers a stream may have when the code picks one by a branch.
 TRIGGER_SEPARATOR = " | "
 #: How many assignments of one variable may be the last to set a stream's trigger at one use.
-MAX_CHAIN_SOURCES = 20
+MAX_CHAIN_SOURCES = MAX_SOURCES
+#: Statements the flow of the variables of one file may read in all.
+MAX_FLOW_VISITS_PER_FILE = 300_000
 
 #: A placeholder a templating layer fills in later, in SQL that is not an f-string: ``${db}``,
 #: ``{db}``, ``{{ db }}``, ``%(db)s``. The SQL parser would read the text around it as a name.
@@ -211,7 +214,10 @@ def path_root(known: str, rules: Sequence[Tuple[str, bool]]) -> Optional[str]:
         rest = path[len(base) :].lstrip("/")
         if "/" not in rest:
             return None  # the segment may go on where the text stops being known
-        return base + "/" + rest.split("/")[0]
+        segment = rest.split("/")[0]
+        if segment in {"", ".", ".."} or "%" in segment or ".." in rest.split("/"):
+            return None  # a path that goes up, or an encoded one, is not the table it starts with
+        return base + "/" + segment
     return None
 
 
@@ -416,6 +422,10 @@ class _Reader:
         #: The variables that later assignments only add to, by the scope and the name (``None``:
         #: not one that can be followed).
         self._chains: Dict[Tuple[int, str], Optional[_Chain]] = {}
+        self._flow_left = MAX_FLOW_VISITS_PER_FILE
+        #: The loads of each name in the file, and the first line of each statement of a body.
+        self._name_loads: Optional[Dict[str, List[ast.Name]]] = None
+        self._body_starts: Dict[int, List[int]] = {}
 
     # ── entry ───────────────────────────────────────────────────────
 
@@ -593,8 +603,7 @@ class _Reader:
         current: Optional[Any] = self.folder.scope_of(name)
         while current is not None:
             if name.id in current.assignments:
-                found = sorted(current.assignments[name.id], key=lambda e: (e.lineno, e.col_offset))
-                return current, found
+                return current, current.assignments[name.id]
             if (
                 name.id in current.values
                 or name.id in current.blocked
@@ -661,8 +670,11 @@ class _Reader:
         _, base_root = self._plain_links(base)
         if isinstance(base_root, ast.Name) and base_root.id == name:
             return None  # the first one adds to a chain nobody started
+        if self._flow_left <= 0:
+            return None  # the variables of this file have cost all the flow it may read
         additions: Dict[int, List[_Link]] = {}
         setters: Dict[int, int] = {}
+        setter_statements: List[ast.stmt] = []
         for number, expression in enumerate(later, start=1):
             more, more_root = self._plain_links(expression)
             if not (isinstance(more_root, ast.Name) and more_root.id == name and more):
@@ -675,12 +687,46 @@ class _Reader:
             additions[number] = more
             if any(link.name == "trigger" for link in more):
                 setters[id(statement)] = number
-        flow = Flow(base_statement, setters)
+                setter_statements.append(statement)
+        uses = self._statements_using(name, scope)
+        # only from the statement that starts the variable to the last that sets or uses it
+        starts = self._starts_of(body)
+        spans = [self._top_of(starts, s) for s in (base_statement, *setter_statements, *uses)]
+        flow = Flow(base_statement, setters, {id(s) for s in uses})
         try:
-            flow.run(body)
+            flow.run(body, min(spans), max(spans))
         except TooMuch:
             return None
+        finally:
+            self._flow_left -= flow.visits
         return _Chain(base, additions, flow)
+
+    def _statements_using(self, name: str, scope: Any) -> List[ast.stmt]:
+        """The statements of the body of ``scope`` that load ``name``."""
+        if self._name_loads is None:
+            index: Dict[str, List[ast.Name]] = {}
+            for node in ast.walk(self.module.tree):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                    index.setdefault(node.id, []).append(node)
+            self._name_loads = index
+        found: Dict[int, ast.stmt] = {}
+        for load in self._name_loads.get(name, ()):
+            if self.folder.scope_of(load) is scope:
+                statement = self._statement_of(load)
+                if statement is not None:
+                    found[id(statement)] = statement
+        return list(found.values())
+
+    def _starts_of(self, body: List[ast.stmt]) -> List[int]:
+        starts = self._body_starts.get(id(body))
+        if starts is None:
+            starts = self._body_starts[id(body)] = [statement.lineno for statement in body]
+        return starts
+
+    @staticmethod
+    def _top_of(starts: List[int], statement: ast.stmt) -> int:
+        """The place in the body of the statement of it that holds ``statement``."""
+        return max(0, bisect_right(starts, statement.lineno) - 1)
 
     def _statement_of(self, node: ast.AST) -> Optional[ast.stmt]:
         """The statement ``node`` is evaluated in, ``None`` when it is in a ``lambda`` or a
@@ -717,6 +763,8 @@ class _Reader:
         return False
 
     def _bound_expression(self, name: ast.Name) -> Optional[ast.expr]:
+        if self.folder.rebound(name.id):  # ``global``, ``:=``, a match capture, ``del``...
+            return None
         scope = self.folder.scope_of(name)
         current: Optional[Any] = scope
         while current is not None:

@@ -341,3 +341,36 @@ def test_a_template_is_filled_only_where_airflow_renders_one():
     submit = task.submits[0]
     assert submit.script == "s3://prod/job.py"
     assert list(submit.args) == ["--env", "prod"]
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        "def f():\n    global Variable\n    Variable = None",
+        "(Variable := object)",
+        "match 1:\n    case Variable:\n        pass",
+        "del Variable",
+        "globals()['Variable'] = object",
+    ],
+)
+def test_a_variable_the_file_rebinds_in_a_way_that_is_not_an_assignment_is_not_airflows(setup):
+    source = f'{AF2}{setup}\nx = Variable.get("environment")\n'
+    assert isinstance(fold(source, environment="prod"), Unresolved)
+
+
+def test_a_name_imported_from_two_places_is_not_airflows_unless_both_are():
+    source = (
+        "import sys\nif sys.version_info[0] > 5:\n    from mylib import Variable\n"
+        'else:\n    from airflow.models import Variable\nx = Variable.get("environment")\n'
+    )
+    assert isinstance(fold(source, environment="prod"), Unresolved)
+    both = (
+        "try:\n    from airflow.sdk import Variable\nexcept ImportError:\n"
+        '    from airflow.models import Variable\nx = Variable.get("environment")\n'
+    )
+    assert fold(both, environment="prod") == "prod"
+
+
+def test_a_star_import_may_define_the_name_so_it_is_not_airflows():
+    source = f'{AF2}from mylib import *\nx = Variable.get("environment")\n'
+    assert isinstance(fold(source, environment="prod"), Unresolved)
