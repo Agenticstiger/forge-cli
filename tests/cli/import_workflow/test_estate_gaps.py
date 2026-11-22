@@ -12,11 +12,10 @@ from __future__ import annotations
 
 import textwrap
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pytest
 
-from fluid_build.cli.import_workflow.airflow import AirflowImporter
 from fluid_build.cli.import_workflow.pyspark import PySparkImporter
 
 DAG_HEAD = """

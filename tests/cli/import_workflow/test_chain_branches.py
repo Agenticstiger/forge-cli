@@ -13,7 +13,6 @@ still not followed: which assignment is meant depends on the order the code runs
 from __future__ import annotations
 
 import textwrap
-from typing import Any, Dict, List
 
 import pytest
 

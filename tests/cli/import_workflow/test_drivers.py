@@ -17,7 +17,6 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from fluid_build._errors import FluidUserError
 from fluid_build.cli.import_workflow import _conventions as C
 from fluid_build.cli.import_workflow import _drivers as D
 from fluid_build.cli.import_workflow import _pysource

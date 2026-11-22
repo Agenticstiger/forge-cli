@@ -17,7 +17,6 @@ from typing import Any
 
 import pytest
 
-from fluid_build._errors import FluidUserError
 from fluid_build.cli.import_workflow import _conventions as C
 from fluid_build.cli.import_workflow._airflow_dags import fill_variable_templates
 from fluid_build.cli.import_workflow._fold import (
