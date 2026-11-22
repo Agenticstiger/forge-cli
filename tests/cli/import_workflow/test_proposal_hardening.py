@@ -339,8 +339,8 @@ def test_a_dag_id_that_does_not_match_is_recorded_and_said_once_for_all_its_jobs
     lines = [n for n in report.required_defaults if "is recorded as dagId" in n]
     assert lines == [
         "DAG 'Bad DAG Id' (dags/bad.py:4) is recorded as dagId 'bad-dag-id': a FLUID dagId or "
-        "taskId has only lower case letters, digits, '_', '.' and '-'. The running DAG keeps "
-        "its own id"
+        + "taskId has only lower case letters, digits, '_', '.' and '-'. The running DAG keeps "
+        + "its own id"
     ]
     assert not [n for n in report.unsupported if "DAG id" in n or "task id" in n]
 

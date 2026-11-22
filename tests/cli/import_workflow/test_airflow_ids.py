@@ -146,9 +146,11 @@ def test_two_ids_that_map_to_one_are_told_apart_in_file_order_and_said(tmp_path,
     }
     assert _mapped(report) == [
         "DAG 'ORDERS' (dags/b.py:6) is recorded as dagId 'orders_3' ('orders' is the recorded id "
-        "of DAG 'orders' (dags/c.py:6))" + SUFFIX,
+        + "of DAG 'orders' (dags/c.py:6))"
+        + SUFFIX,
         "DAG 'Orders' (dags/a.py:6) is recorded as dagId 'orders_2' ('orders' is the recorded id "
-        "of DAG 'orders' (dags/c.py:6))" + SUFFIX,
+        + "of DAG 'orders' (dags/c.py:6))"
+        + SUFFIX,
     ]
 
 
@@ -313,8 +315,9 @@ def test_the_shape_of_a_python_task_estate_keeps_its_dags_tasks_and_dependencies
     assert task["params"]["config"] == "s3://acme-conf/clicks.yaml"
     assert _mapped(report) == [
         "DAG 'Clicks_Streaming_Dag' "
-        "(dags/OneDomain/Clicks_Streaming_Dag/clicks_streaming_dag.py:10) "
-        "is recorded as dagId 'clicks_streaming_dag'" + SUFFIX
+        + "(dags/OneDomain/Clicks_Streaming_Dag/clicks_streaming_dag.py:10) "
+        + "is recorded as dagId 'clicks_streaming_dag'"
+        + SUFFIX
     ]
 
 
