@@ -133,6 +133,26 @@ class TestValidateManifestDir:
         codes = [i.code for i in issues]
         assert "MANIFEST-UNDECLARED-FILE" not in codes
 
+    def test_a_declared_dotfile_is_present_not_missing(self, tmp_path):
+        """A generated ``.gitlab-ci.yml`` the MANIFEST lists is a file like any other."""
+        _write_manifest(
+            tmp_path, {"scaffold/.gitlab-ci.yml": b"stages: []\n", "scaffold/.ci/run.sh": b"x"}
+        )
+        (tmp_path / "scaffold" / ".DS_Store").write_text("apple-metadata")
+        assert validate_manifest_dir(tmp_path) == []
+
+    def test_a_declared_dotfile_that_is_gone_is_missing(self, tmp_path):
+        _write_manifest(tmp_path, {"scaffold/.gitlab-ci.yml": b"stages: []\n"})
+        (tmp_path / "scaffold" / ".gitlab-ci.yml").unlink()
+        codes = [i.code for i in validate_manifest_dir(tmp_path)]
+        assert codes == ["MANIFEST-MISSING-FILE"]
+
+    def test_a_changed_declared_dotfile_is_a_mismatch(self, tmp_path):
+        _write_manifest(tmp_path, {"scaffold/.gitlab-ci.yml": b"stages: []\n"})
+        (tmp_path / "scaffold" / ".gitlab-ci.yml").write_bytes(b"stages: [deploy]\n")
+        codes = [i.code for i in validate_manifest_dir(tmp_path)]
+        assert "MANIFEST-SHA-MISMATCH" in codes
+
 
 # ---------------------------------------------------------------------------
 # validate_dag_python — py_compile
