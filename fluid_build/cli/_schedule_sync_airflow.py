@@ -273,8 +273,10 @@ class AirflowCheck:
             )
         finally:
             client.close()
-        if outcome.passed:
+        if outcome.passed and outcome.proven:
             _say(f"✔ {outcome.message}")
+        elif outcome.passed:
+            _say(f"✔ [{slug_for(outcome.event or '')}] {outcome.message}")
         else:
             _say(f"✘ [{slug_for(outcome.event or '')}] {outcome.message}")
         for note in outcome.notes:
@@ -296,6 +298,9 @@ class AirflowCheck:
 
     @staticmethod
     def _file_line(result: chk.FileResult) -> None:
+        if result.state == "unproven":
+            _say(f"✔ {result.path} (not proven): {result.detail}")
+            return
         mark = "✔" if result.state == "clean" else "✘"
         _say(f"{mark} {result.path}: {result.detail}")
 

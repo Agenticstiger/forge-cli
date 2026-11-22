@@ -11,27 +11,39 @@ indirectly, so this module settles it from what both majors report (measured on 
 * every clean parse of a file stamps its DAGs' ``last_parsed_time`` and, on Airflow 3,
   ``bundle_version``; a failed parse leaves both, flags the DAGs ``has_import_errors``
   (and stale, on Airflow 3) and stamps the file's import error again;
-* Airflow 3.4 can take ~10 s to parse a file, re-parsed every ``min_file_process_interval``
-  seconds, so a parse that was already running when the files landed is common. It read
-  the old file. A DAG therefore counts as parsed from the synced file once two clean
-  parses that ended after the sync started have been seen: the second began after the
-  first ended. A failure counts the same way, from two import-error stamps.
-* Where the DAGs report a bundle version (an Airflow 3 Git bundle) and the pushed version
+* a parse that was already running when the files landed read the old file, and Airflow
+  runs one per DAG processor (each HA scheduler on Airflow 2, each DAG processor on
+  Airflow 3). When a processor saves a clean parse, Airflow stores the file's source as
+  it is on disk at that moment and serves it at ``dagSources``. A file is live once that
+  stored source is the pushed file and Airflow has saved two clean parses since, the
+  later at least 60 s after the parse it showed when the source first matched: Airflow
+  stops a parse after ``dag_file_processor_timeout`` (50 s by default), so that parse
+  began after the push. Two parses also cover a second processor that finishes an old
+  parse late where that timeout was raised;
+* where the stored source cannot be read (the user may not read DAG code), two clean
+  parses 60 s apart pass the file as ``unproven``: parsed with no import error, but not
+  shown to be the pushed file;
+* a failure counts from two stamps of the file's import error, and is final once they are
+  60 s apart;
+* where the DAGs report a bundle version (an Airflow 3 Git bundle) and the pushed version
   is known (the commit a ``git+ssh`` push made, or ``--airflow-bundle-version``), the DAG
   at that version is the proof, after one parse. Import errors count from the moment the
   bundle is known to be at that version: from ``/api/v2/dagBundles`` (Airflow 3.4), or the
-  earliest parse of a pushed DAG at that version.
+  earliest parse of a pushed DAG at that version;
 * Airflow 3 shows the import error of a file with no registered DAG only to a user who may
   read all import errors, so a DAG that never appears is reported as not parsed, never
   taken for a clean file.
 
 Files whose DAG ids cannot be read from the source (a factory, a loop) are judged by the
-DAGs Airflow lists for them and by their import errors; they never hold the wait open.
+DAGs Airflow lists for them and by their import errors, and the wait is for them too.
+A file that builds no DAG at module level (a helper module) is not waited for; an import
+error Airflow shows for it during the wait still fails the check.
 
-Every comparison is between stamps of Airflow's DAG processor: a parse or an import
+Every comparison is between stamps of Airflow's DAG processors: a parse or an import
 error counts when it is newer than what Airflow had recorded at the first read after the
-push, so a clock skew between hosts cannot make an old parse look new. ``_sleep`` and
-``_monotonic`` are module attributes so tests can drive the wait on a simulated clock.
+push, so a clock skew between this machine and Airflow cannot make an old parse look new.
+``_sleep`` and ``_monotonic`` are module attributes so tests can drive the wait on a
+simulated clock.
 """
 
 from __future__ import annotations
@@ -40,7 +52,7 @@ import ast
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -52,10 +64,16 @@ _monotonic: Callable[[], float] = time.monotonic
 DEFAULT_POLL_S = 10.0
 #: A DAG file larger than this is not read for its DAG ids (Airflow parses it regardless).
 _MAX_SOURCE_BYTES = 4 * 1024 * 1024
+#: Airflow stops a parse after ``dag_file_processor_timeout`` (50 s by default on both
+#: majors). A parse stamped this long after a stamp that came after the push began after
+#: the push; the 10 s on top absorb a clock skew between DAG-processor hosts.
+PARSE_SPAN_S = 60.0
+_PARSE_SPAN = timedelta(seconds=PARSE_SPAN_S)
 
 E_IMPORT_ERRORS = "schedule_sync_airflow_import_errors"
 E_NOT_PARSED = "schedule_sync_airflow_not_parsed"
 E_UNREACHABLE = "schedule_sync_airflow_unreachable"
+E_UNPROVEN = "schedule_sync_airflow_unproven"
 
 
 # ── the files ────────────────────────────────────────────────────────────
@@ -65,12 +83,17 @@ E_UNREACHABLE = "schedule_sync_airflow_unreachable"
 class DagFile:
     """A pushed file Airflow will parse: its path under ``--dags-dir`` and its DAG ids.
 
-    ``dynamic`` means no DAG id could be read from the source; Airflow decides.
+    ``dynamic`` means the file builds DAGs whose ids could not be read from the source
+    (a factory, a loop); Airflow decides. ``helper`` means it builds no DAG at module
+    level (a module DAG files import), so it is not expected to show one. ``source`` is
+    the text Airflow stores for the file once a processor has read it.
     """
 
     path: str
     dag_ids: Tuple[str, ...] = ()
     dynamic: bool = False
+    helper: bool = False
+    source: Optional[str] = None
 
 
 def dag_files(dags_dir: Path) -> List[DagFile]:
@@ -94,9 +117,46 @@ def dag_files(dags_dir: Path) -> List[DagFile]:
         lowered = data.lower()
         if b"airflow" not in lowered or b"dag" not in lowered:
             continue
-        ids = _dag_ids(data) if len(data) <= _MAX_SOURCE_BYTES else ()
-        found.append(DagFile(path="/".join(parts), dag_ids=ids, dynamic=not ids))
+        small = len(data) <= _MAX_SOURCE_BYTES
+        ids = _dag_ids(data) if small else ()
+        helper = not ids and small and not _builds_dags(data)
+        found.append(
+            DagFile(
+                path="/".join(parts),
+                dag_ids=ids,
+                dynamic=not ids and not helper,
+                helper=helper,
+                source=normal_source(data.decode("utf-8", "replace")),
+            )
+        )
     return found
+
+
+def normal_source(text: str) -> str:
+    """Source text as Airflow stores it: read in text mode, so every line ends in ``\\n``."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _builds_dags(source: bytes) -> bool:
+    """Whether module-level code calls something named like a DAG builder.
+
+    ``DAG(...)``, ``create_dag(...)``, ``build_dags()``: a call whose name holds ``dag``,
+    outside function and class bodies. A module that only defines helpers builds none.
+    A source that does not parse counts as building DAGs: Airflow will report on it.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return True
+    stack: List[ast.AST] = list(tree.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.Call) and "dag" in (_callee(node.func) or "").lower():
+            return True
+        stack.extend(ast.iter_child_nodes(node))
+    return False
 
 
 #: Airflow's dag_id grammar (``KEY_REGEX``) and length cap; anything else is no DAG id.
@@ -197,12 +257,13 @@ def _literal(node: Any, constants: Dict[str, str]) -> Optional[str]:
 
 @dataclass
 class FileResult:
-    """One file's outcome: ``clean``, ``broken``, ``pending`` or ``unchecked``."""
+    """One file's outcome: ``clean``, ``unproven``, ``broken``, ``pending`` or ``unchecked``
+    (a helper module, not waited for)."""
 
     path: str
     dag_ids: Tuple[str, ...]
     state: str = "pending"
-    #: ``bundle-version`` or ``parse-time``, for a clean file.
+    #: ``bundle-version`` or ``source`` for a clean file, ``parse-time`` for an unproven one.
     evidence: str = ""
     detail: str = ""
     #: The last line of the latest import error Airflow showed for the file.
@@ -230,12 +291,15 @@ class CheckResult:
     notes: List[str] = field(default_factory=list)
     polls: int = 0
     waited_s: float = 0.0
+    #: ``False`` for a pass where some file parsed cleanly but its source could not be
+    #: read back, so the parse is not proven to be of the pushed file.
+    proven: bool = True
 
     def to_report(self) -> Dict[str, Any]:
         from fluid_build.observability.secret_redactor import redact_secret_text
 
         return {
-            "result": "passed" if self.passed else "failed",
+            "result": ("passed" if self.proven else "unproven") if self.passed else "failed",
             "event": self.event,
             "message": redact_secret_text(self.message),
             "notes": [redact_secret_text(note) for note in self.notes],
@@ -259,6 +323,10 @@ class _DagSeen:
     read: bool = False
     absent: bool = False
     clean_parses: Set[datetime] = field(default_factory=set)
+    #: The parse recorded when Airflow's stored source was first seen to be the pushed
+    #: file, and the clean parses after it.
+    match_baseline: Optional[datetime] = None
+    clean_after_match: Set[datetime] = field(default_factory=set)
 
 
 @dataclass
@@ -268,11 +336,14 @@ class _FileSeen:
     failed_parses: Set[datetime] = field(default_factory=set)
     error_now: Optional[ImportErrorRecord] = None
     latest_error: Optional[ImportErrorRecord] = None
-    #: A decision that stands: clean, or broken where the files landed before the wait.
+    #: A decision that stands: clean, unproven, or broken from failures far enough apart.
     final: bool = False
     #: The import error Airflow had already stamped when the wait first read the file.
     error_baseline: Optional[datetime] = None
     errors_read: bool = False
+    #: Airflow's stored source for the file: ``unread``, ``match`` (the pushed file),
+    #: ``differs`` or ``unreadable``.
+    source_state: str = "unread"
 
 
 _NEVER = datetime.min.replace(tzinfo=timezone.utc)
@@ -310,6 +381,18 @@ def _version_matches(reported: Optional[str], expected: str) -> bool:
         and _HEX.fullmatch(reported) is not None
         and reported.lower().startswith(expected.lower())
     )
+
+
+def _spans(stamps: Set[datetime]) -> bool:
+    """Two stamps or more, the latest at least :data:`PARSE_SPAN_S` after the earliest."""
+    return len(stamps) >= 2 and max(stamps) - min(stamps) >= _PARSE_SPAN
+
+
+def _proven_after_match(seen: _DagSeen) -> bool:
+    """Two clean parses after the one Airflow showed when the stored source first matched,
+    the later at least :data:`PARSE_SPAN_S` after it."""
+    after, since = seen.clean_after_match, seen.match_baseline
+    return since is not None and len(after) >= 2 and max(after) - since >= _PARSE_SPAN
 
 
 class _Wait:
@@ -352,15 +435,17 @@ class _Wait:
         # Files with known DAG ids first: their DAGs show where the files landed, which
         # then tells a file of ours from a same-named one in another directory.
         for fs in sorted(open_files, key=lambda f: f.file.dynamic):
+            if fs.file.helper:
+                continue
             if fs.file.dynamic:
                 self._attribute(fs, listing)
             for dag_id in fs.result.dag_ids:
-                if self._dag_clean(dag_id)[0]:
-                    continue
                 state = self.client.dag(dag_id)
                 self._observe(dag_id, state, fs.file.path)
                 if state is not None and not fs.file.dynamic and self.dags[dag_id].ours:
                     self._learn_anchor(fs.file.path, state)
+            if self._needs_source(fs):
+                self._read_source(fs)
         self._read_errors(errors, open_files)
         for fs in open_files:
             self._decide(fs)
@@ -454,6 +539,58 @@ class _Wait:
         newer = seen.baseline is None or stamp > seen.baseline
         if seen.ours and newer and state.active and not state.has_import_errors:
             seen.clean_parses.add(stamp)
+            if seen.match_baseline is not None and stamp > seen.match_baseline:
+                seen.clean_after_match.add(stamp)
+
+    def _needs_source(self, fs: _FileSeen) -> bool:
+        """Whether this file's proof now hangs on Airflow's stored source."""
+        if fs.file.source is None or fs.source_state == "unreadable" or not fs.result.dag_ids:
+            return False
+        verdicts = [self._dag_clean(dag_id) for dag_id in fs.result.dag_ids]
+        if all(evidence == "bundle-version" for _, evidence, _ in verdicts):
+            return False
+        return any(
+            (seen := self.dags.get(dag_id)) is not None and bool(seen.clean_parses)
+            for dag_id in fs.result.dag_ids
+        )
+
+    def _read_source(self, fs: _FileSeen) -> None:
+        """Compare the source Airflow stored for the file with the pushed file.
+
+        Airflow stores a file's source when a processor syncs a clean parse: 2.x reads it
+        from disk at that moment, so a parse that began before the file landed can store
+        the new source. The parses that count as proof are therefore the ones after the
+        parse Airflow showed when the stored source was first seen to be the pushed file.
+        It is read again at every poll: a source that changes again resets the count.
+        """
+        state = next(
+            (
+                seen.last
+                for seen in (self.dags.get(dag_id) for dag_id in fs.result.dag_ids)
+                if seen is not None and seen.last is not None and seen.ours
+            ),
+            None,
+        )
+        if state is None:
+            return
+        stored = self.client.dag_source(state)
+        if stored is None:
+            fs.source_state = "unreadable"
+            return
+        matched = normal_source(stored) == fs.file.source
+        fs.source_state = "match" if matched else "differs"
+        for dag_id in fs.result.dag_ids:
+            seen = self.dags.get(dag_id)
+            if seen is None:
+                continue
+            if not matched:
+                seen.match_baseline, seen.clean_after_match = None, set()
+            elif seen.match_baseline is None:
+                # The parse Airflow shows now may have begun before the push: count after it.
+                # A DAG Airflow does not list yet gets every parse counted: the previous
+                # file never registered it, so no parse of that file can show it clean.
+                stamp = seen.last.last_parsed_time if seen.last is not None else None
+                seen.match_baseline = stamp or _NEVER
 
     def _read_errors(self, errors: List[ImportErrorRecord], open_files: List[_FileSeen]) -> None:
         """Record this poll's import errors of the pushed files.
@@ -560,45 +697,83 @@ class _Wait:
         result = fs.result
         if fs.latest_error is not None:
             result.error = _last_line(fs.latest_error.stack_trace)
-        if fs.error_now is not None and len(fs.failed_parses) >= 2:
+        failing = fs.error_now is not None and len(fs.failed_parses) >= 2
+        # Failures further apart than a parse can run are not all parses of the previous
+        # file that were still running when the files landed.
+        fresh_failure = failing and _spans(fs.failed_parses)
+        if fs.file.helper:
+            # A module DAG files import shows no DAG of its own, so the wait is not for it;
+            # an import error Airflow shows for it meanwhile still fails the check.
+            if fresh_failure:
+                result.state, result.evidence, fs.final = "broken", "", True
+                result.detail = f"import error: {result.error}" if result.error else "import error"
+            else:
+                result.state = "unchecked"
+                result.detail = "builds no DAG at module level (a helper module): not waited for"
+            return
+        if failing:
             result.state, result.evidence = "broken", ""
             result.detail = f"import error: {result.error}" if result.error else "import error"
             # Where Airflow reads the destination on its own schedule, the failures may be
             # the previous file's: that verdict waits for the deadline, a fix may land.
-            fs.final = not (self.indirect and not self._versioned())
+            fs.final = fresh_failure and not (self.indirect and not self._versioned())
             return
         if not result.dag_ids:
-            if fs.error_now is not None:
-                result.state = "pending"
-                result.detail = f"Airflow shows an import error for it: {result.error}"
-            else:
-                result.state = "unchecked"
-                result.detail = "forge read no DAG id from the file and Airflow lists none for it"
+            result.state = "pending"
+            result.detail = (
+                f"Airflow shows an import error for it: {result.error}"
+                if fs.error_now is not None
+                else "Airflow lists no DAG from it and shows no import error for it yet"
+            )
             return
         verdicts = [self._dag_clean(dag_id) for dag_id in result.dag_ids]
         waiting = [why for clean, _, why in verdicts if not clean]
         if waiting:
             result.state, result.detail = "pending", "; ".join(waiting)
             return
-        evidence = {e for _, e, _ in verdicts}
-        result.state, fs.final = "clean", True
-        result.evidence = "bundle-version" if evidence == {"bundle-version"} else "parse-time"
-        result.detail = "; ".join(dict.fromkeys(v[2] for v in verdicts))
+        if all(evidence == "bundle-version" for _, evidence, _ in verdicts):
+            result.state, result.evidence, fs.final = "clean", "bundle-version", True
+            result.detail = "; ".join(dict.fromkeys(v[2] for v in verdicts))
+            return
+        parse_time = [
+            self.dags[dag_id]
+            for dag_id, (_, evidence, _) in zip(result.dag_ids, verdicts, strict=True)
+            if evidence != "bundle-version"
+        ]
+        span = f"{PARSE_SPAN_S:.0f}s"
+        result.state = "pending"
+        if fs.source_state == "match":
+            if all(_proven_after_match(seen) for seen in parse_time):
+                result.state, result.evidence, fs.final = "clean", "source", True
+                result.detail = "Airflow stores the pushed file and has parsed it since"
+            else:
+                result.detail = (
+                    "Airflow stores the pushed file; waiting for two parses after that, the "
+                    f"later at least {span} on"
+                )
+            return
+        if fs.source_state == "unreadable" or fs.file.source is None:
+            if all(_spans(seen.clean_parses) for seen in parse_time):
+                result.state, result.evidence, fs.final = "unproven", "parse-time", True
+                result.detail = (
+                    "parsed with no import error, but Airflow's stored source could not be "
+                    "read (the user may not read DAG code), so the parse is not proven to be "
+                    "of the pushed file"
+                )
+            else:
+                result.detail = (
+                    f"parsed twice since the sync; waiting for a parse at least {span} after "
+                    "the first, which cannot be one that began before the push"
+                )
+            return
+        result.detail = "Airflow's stored source is not the pushed file yet"
 
     def blocking(self) -> List[_FileSeen]:
-        """The files the wait is for. A dynamic file Airflow lists no DAG for holds it open
-        only while Airflow shows that file a current import error."""
-        return [
-            fs
-            for fs in self.files
-            if not fs.file.dynamic or fs.result.dag_ids or fs.error_now is not None
-        ]
+        """Every file the wait is for: all but helper modules."""
+        return [fs for fs in self.files if not fs.file.helper]
 
     def done(self) -> bool:
-        # With nothing to wait for yet (every file dynamic, none listed by Airflow), keep
-        # polling: Airflow may still list DAGs for them before the deadline.
-        blocking = self.blocking()
-        return bool(blocking) and all(fs.final for fs in blocking)
+        return all(fs.final for fs in self.blocking())
 
     def progress(self, elapsed: float) -> str:
         waiting = [fs.result for fs in self.blocking() if not fs.final]
@@ -635,11 +810,13 @@ def wait_for_parse(
     )
     start = monotonic()
     deadline = start + wait_s
+    # A request never outlives the wait: its timeout is capped to the time left.
+    client.set_deadline(deadline, monotonic)
     polls = 0
     last_progress = start
     transient: Optional[AirflowApiError] = None
     fatal: Optional[AirflowApiError] = None
-    reported: Dict[str, str] = {}
+    announced: Set[str] = set()
     while True:
         polls += 1
         try:
@@ -649,12 +826,13 @@ def wait_for_parse(
             if not exc.transient:
                 fatal = exc
                 break
+            if exc.out_of_time:
+                break  # the wait ran out: the last poll's outcome stands
             transient = exc
         for fs in wait.files:
-            state = fs.result.state
-            if on_change and reported.get(fs.result.path) != state and state in ("clean", "broken"):
+            if on_change and fs.final and fs.result.path not in announced:
                 on_change(fs.result)
-            reported[fs.result.path] = state
+                announced.add(fs.result.path)
         if wait.done():
             break
         now = monotonic()
@@ -665,7 +843,8 @@ def wait_for_parse(
         if remaining <= 0:
             break
         sleep(min(poll_s, remaining))
-    return _conclude(wait, polls, monotonic() - start, wait_s, fatal, transient, indirect)
+    client.set_deadline(None, monotonic)
+    return _conclude(wait, polls, monotonic() - start, wait_s, fatal, transient)
 
 
 def _conclude(
@@ -675,10 +854,9 @@ def _conclude(
     wait_s: float,
     fatal: Optional[AirflowApiError],
     transient: Optional[AirflowApiError],
-    indirect: bool,
 ) -> CheckResult:
     results = [fs.result for fs in wait.files]
-    notes = _notes(wait, indirect)
+    notes = _notes(wait)
 
     def done(passed: bool, event: Optional[str], message: str) -> CheckResult:
         return CheckResult(passed, results, event, message, notes, polls, waited)
@@ -700,34 +878,46 @@ def _conclude(
         return done(
             False,
             E_NOT_PARSED,
-            "nothing was checked: forge read no DAG id from any synced file and Airflow lists "
-            "no DAG for them.",
+            "nothing was checked: every synced file builds no DAG at module level.",
         )
-    pending = [fs.result for fs in blocking if fs.result.state != "clean"]
+    total = len(blocking)
+    pending = [fs.result for fs in blocking if fs.result.state not in ("clean", "unproven")]
     if pending and transient is not None:
         return done(False, E_UNREACHABLE, f"Airflow stopped answering: {transient.message}")
     if pending:
         listed = "; ".join(f"{_one_line(r.path)} ({r.detail})" for r in pending)
+        unlisted = any(not r.dag_ids for r in pending)
         return done(
             False,
             E_NOT_PARSED,
-            f"Airflow did not finish parsing {len(pending)} of {len(results)} synced DAG "
-            f"file(s) within {wait_s:.0f}s: {listed}. Raise --airflow-wait if Airflow parses "
-            "slowly here (min_file_process_interval, and the folder listing interval for new "
-            "files).",
+            f"Airflow did not show {len(pending)} of {total} synced DAG file(s) live within "
+            f"{wait_s:.0f}s: {listed}. Raise --airflow-wait if Airflow parses slowly here "
+            "(min_file_process_interval)"
+            + (
+                "; Airflow lists a new file only every dag_dir_list_interval (Airflow 2) or "
+                "refresh_interval (Airflow 3), 300 s by default"
+                if unlisted
+                else ""
+            )
+            + ".",
         )
-    return done(True, None, f"{len(results)} synced DAG file(s) are live in Airflow.")
+    live = [r for r in results if r.state == "clean"]
+    unproven = [r for r in results if r.state == "unproven"]
+    if unproven:
+        listed = "; ".join(f"{_one_line(r.path)} ({r.detail})" for r in unproven)
+        result = done(
+            True,
+            E_UNPROVEN,
+            f"{len(live)} of {total} synced DAG file(s) are live in Airflow; {len(unproven)} "
+            f"parsed with no import error but not proven: {listed}.",
+        )
+        result.proven = False
+        return result
+    return done(True, None, f"{len(live)} synced DAG file(s) are live in Airflow.")
 
 
-def _notes(wait: _Wait, indirect: bool) -> List[str]:
+def _notes(wait: _Wait) -> List[str]:
     notes: List[str] = []
-    results = [fs.result for fs in wait.files]
-    if indirect and any(r.evidence != "bundle-version" for r in results if r.state == "clean"):
-        notes.append(
-            "Airflow reads this destination on its own schedule, so a parse after the sync can "
-            "still be of the previous files. A versioned DAG bundle (an Airflow 3 Git bundle) "
-            "makes the check exact; otherwise run --check-only once the files have landed."
-        )
     hidden = [
         fs.result.path
         for fs in wait.blocking()
@@ -740,10 +930,11 @@ def _notes(wait: _Wait, indirect: bool) -> List[str]:
             + ", ".join(_one_line(h) for h in hidden)
             + " fails to import, this user may not see why."
         )
-    for fs in wait.files:
-        if fs.result.state == "unchecked":
-            notes.append(
-                f"{_one_line(fs.result.path)}: forge read no DAG id from it and Airflow lists no DAG for "
-                "it, so it was checked for import errors only."
-            )
+    helpers = [_one_line(fs.result.path) for fs in wait.files if fs.file.helper]
+    if helpers:
+        notes.append(
+            "Not checked, as they build no DAG at module level (helper modules): "
+            + ", ".join(helpers)
+            + "."
+        )
     return notes

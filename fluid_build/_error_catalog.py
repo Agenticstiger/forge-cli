@@ -859,6 +859,17 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
             "Raise --airflow-wait: Airflow lists new files every dag_dir_list_interval "
             "(Airflow 2) or refresh_interval (Airflow 3), 300 s by default",
             "On an Airflow 3 Git bundle, check that it tracks the branch the push went to",
+            "Where a file waits for Airflow's stored source, check that Airflow parses the "
+            "folder or bucket the push wrote to",
+        ],
+        None,
+    ),
+    "schedule_sync_airflow_unproven": (
+        [
+            "Let the Airflow user read DAG code (the 'can read on DAG Code' permission with "
+            "the FAB auth manager), so the check can compare the source Airflow stores with "
+            "the pushed file",
+            "On Airflow 2, keep [core] store_dag_code on (the default)",
         ],
         None,
     ),

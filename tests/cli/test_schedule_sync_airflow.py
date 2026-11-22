@@ -81,6 +81,21 @@ def _parsed(fake: FakeAirflow, **kw: Any) -> Callable[[FakeAirflow], None]:
     return lambda f: f.parse_ok(DAG_ID, REL, **kw)
 
 
+def _idle(fake: FakeAirflow) -> None:
+    pass
+
+
+def _every_30s(step: Callable[[FakeAirflow], None], times: int) -> List[Callable]:
+    """``times`` parses 30 s apart; the check polls every 10 s."""
+    return [s for _ in range(times) for s in (step, _idle, _idle)]
+
+
+def _live(fake: FakeAirflow, dags_dir: Path) -> List[Callable]:
+    """The pushed files land on Airflow's host, then it parses them every 30 s."""
+    fake.land_dir(dags_dir)
+    return _every_30s(_parsed(fake), 3)
+
+
 def _base(dags_dir: Path, fake: FakeAirflow, *extra: str) -> List[str]:
     return [
         "schedule-sync",
@@ -98,12 +113,12 @@ def _base(dags_dir: Path, fake: FakeAirflow, *extra: str) -> List[str]:
 
 
 @pytest.mark.parametrize("major, api", [(2, "v1"), (3, "v2")])
-def test_check_only_passes_when_airflow_parsed_the_files_twice(
+def test_check_only_passes_when_airflow_stores_and_parsed_the_pushed_files(
     major: int, api: str, dags_dir: Path, tmp_path: Path, monkeypatch, capsys
 ):
     report = tmp_path / "report.json"
     with FakeAirflow(major) as fake:
-        _drive(monkeypatch, fake, [_parsed(fake), _parsed(fake)])
+        _drive(monkeypatch, fake, _live(fake, dags_dir))
         rc, out = _main(_base(dags_dir, fake, "--check-only", "--report", str(report)), capsys)
     assert rc == 0, out
     assert f"Airflow {fake.version}" in out and api in out
@@ -120,7 +135,7 @@ def test_check_only_passes_when_airflow_parsed_the_files_twice(
             "path": REL,
             "dag_ids": [DAG_ID],
             "state": "clean",
-            "evidence": "parse-time",
+            "evidence": "source",
             "detail": check["files"][0]["detail"],
             "error": "",
         }
@@ -134,7 +149,7 @@ def test_a_broken_dag_fails_the_stage_with_exit_1_and_a_report(
     report = tmp_path / "report.json"
     stack = "Traceback\nModuleNotFoundError: No module named 'pyspark_helpers'"
     with FakeAirflow(3) as fake:
-        _drive(monkeypatch, fake, [lambda f: f.parse_fail(REL, stack=stack)] * 2)
+        _drive(monkeypatch, fake, _every_30s(lambda f: f.parse_fail(REL, stack=stack), 3))
         rc, out = _main(_base(dags_dir, fake, "--check-only", "--report", str(report)), capsys)
     assert rc == 1
     assert "ERR_SCHEDULE_SYNC_AIRFLOW_IMPORT_ERRORS" in out
@@ -151,12 +166,37 @@ def test_files_airflow_never_parses_fail_at_the_deadline(dags_dir: Path, monkeyp
     assert "--airflow-wait" in out
 
 
+@pytest.mark.parametrize("major", [2, 3])
+def test_a_parse_airflow_cannot_tie_to_the_pushed_file_passes_as_not_proven(
+    major: int, dags_dir: Path, tmp_path: Path, monkeypatch, capsys
+):
+    report = tmp_path / "report.json"
+    with FakeAirflow(major, forbidden=("/api/v1/dagSources", "/api/v2/dagSources")) as fake:
+        _drive(monkeypatch, fake, _live(fake, dags_dir))
+        rc, out = _main(_base(dags_dir, fake, "--check-only", "--report", str(report)), capsys)
+    assert rc == 0, out
+    assert "ERR_SCHEDULE_SYNC_AIRFLOW_UNPROVEN" in out and "(not proven)" in out
+    assert "check passed (not proven to be these files; see above)" in out
+    check = json.loads(report.read_text(encoding="utf-8"))["airflow_check"]
+    assert check["result"] == "unproven" and check["files"][0]["state"] == "unproven"
+
+
+def test_a_folder_airflow_does_not_read_fails_as_not_parsed(dags_dir: Path, monkeypatch, capsys):
+    """The push went somewhere Airflow does not parse: it keeps parsing its old copy."""
+    with FakeAirflow(2) as fake:
+        fake.land(REL, "from airflow.sdk import DAG  # the copy Airflow has\n")
+        _drive(monkeypatch, fake, _every_30s(_parsed(fake), 5))
+        rc, out = _main(_base(dags_dir, fake, "--check-only", "--airflow-wait", "120"), capsys)
+    assert rc == 1 and "ERR_SCHEDULE_SYNC_AIRFLOW_NOT_PARSED" in out
+    assert "stored source is not the pushed file" in out
+
+
 def test_a_token_reference_is_sent_as_a_bearer(dags_dir: Path, monkeypatch, capsys):
     monkeypatch.delenv(CREDENTIAL_REF_ENV)
     monkeypatch.setenv(TOKEN_REF_ENV, "env://AF_TEST_TOKEN")
     monkeypatch.setenv("AF_TEST_TOKEN", "issued-by-ci-7c1e")
     with FakeAirflow(3, static_tokens=("issued-by-ci-7c1e",)) as fake:
-        _drive(monkeypatch, fake, [_parsed(fake), _parsed(fake)])
+        _drive(monkeypatch, fake, _live(fake, dags_dir))
         rc, out = _main(_base(dags_dir, fake, "--check-only"), capsys)
         sent = {r.authorization for r in fake.requests if r.path.startswith("/api/v2/dags")}
     assert rc == 0, out
@@ -192,7 +232,7 @@ def _which(binary: str) -> str:
 def test_the_preflight_runs_before_the_push(dags_dir: Path, tmp_path: Path, monkeypatch, capsys):
     with FakeAirflow(2) as fake:
         recorder = _Recorder(fake)
-        _drive(monkeypatch, fake, [_parsed(fake), _parsed(fake)])
+        _drive(monkeypatch, fake, _live(fake, dags_dir))
         with (
             patch.object(schedule_sync, "_which_or_raise", side_effect=_which),
             patch.object(schedule_sync.subprocess, "run", side_effect=recorder),
@@ -217,6 +257,22 @@ def test_a_preflight_failure_pushes_nothing(dags_dir: Path, tmp_path: Path, monk
                 _base(dags_dir, fake, "--destination", str(tmp_path / "airflow" / "dags")), capsys
             )
     assert rc == 2 and "ERR_SCHEDULE_SYNC_AIRFLOW_AUTH_FAILED" in out
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize("path", ["/api/v1/importErrors", "/api/v1/dags"])
+def test_a_preflight_answer_without_its_list_pushes_nothing(
+    dags_dir: Path, tmp_path: Path, path: str, capsys
+):
+    with FakeAirflow(2, empty=(path,)) as fake:
+        with (
+            patch.object(schedule_sync, "_which_or_raise", side_effect=_which),
+            patch.object(schedule_sync.subprocess, "run") as run,
+        ):
+            rc, out = _main(
+                _base(dags_dir, fake, "--destination", str(tmp_path / "airflow" / "dags")), capsys
+            )
+    assert rc == 2 and "ERR_SCHEDULE_SYNC_AIRFLOW_BAD_RESPONSE" in out and path in out
     run.assert_not_called()
 
 

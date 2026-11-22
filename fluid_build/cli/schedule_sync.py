@@ -1855,10 +1855,15 @@ def _outcome_line(
     if overall_exit == 0 and planned:
         what = "nothing pushed" if check_only else f"{scheduler} sync planned"
         return f"[schedule-sync] ✔ dry run: {what}; the Airflow check was not run"
+    unproven = " (not proven to be these files; see above)" if result == "unproven" else ""
     if overall_exit == 0 and check_only:
-        return "[schedule-sync] ✔ Airflow check passed"
+        return f"[schedule-sync] ✔ Airflow check passed{unproven}"
     if overall_exit == 0:
-        checked = "; Airflow parsed the pushed files" if result == "passed" else ""
+        checked = (
+            f"; Airflow parsed the pushed files{unproven}"
+            if result in ("passed", "unproven")
+            else ""
+        )
         return (
             f"[schedule-sync] ✔ {scheduler} sync complete ({subprocesses} subprocess(es)){checked}"
         )

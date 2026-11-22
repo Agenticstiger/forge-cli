@@ -16,24 +16,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FLUID_AIRFLOW_CREDENTIAL_REF`, sent as HTTP Basic to Airflow 2 and exchanged for a token at
   `POST /auth/token` on Airflow 3. Both variables hold a secret reference (`env://`, `file://`,
   `vault://`, `aws-sm://`), and a project `.env` cannot set them. The version check, the sign-in
-  and one read run before anything is pushed, so a check that cannot run leaves nothing pushed.
-  After the push, every pushed file must be parsed with no import error within `--airflow-wait`
-  seconds (default 600, cap 3600). On an Airflow 3 Git DAG bundle, its DAGs must report the
-  commit the `git+ssh` push made (or `--airflow-bundle-version`). Elsewhere, Airflow must parse
-  each DAG twice after the sync: a parse that was already running when the files landed read the
-  old file, and Airflow 3 can take several seconds per file. A failure counts the same way, from
-  two stamps of the file's import error. On Airflow 3.4, `/api/v2/dagBundles` shows when the
-  bundle reached the pushed commit, so a broken push fails within a parse or two. A DAG that never
-  appears is reported as not parsed: Airflow 3 shows the import error of a file with no
-  registered DAG only to a user who may read all import errors. `--airflow-bundle` limits the
-  check to one bundle. `--check-only` checks the files under `--dags-dir` without pushing, for a
-  deploy that puts them in place itself. A file that fails to import, or is not parsed in time,
-  exits 1 with `schedule_sync_airflow_import_errors` or `schedule_sync_airflow_not_parsed`, and
-  the report's `airflow_check` block names each file. Typed errors cover an unreachable server, a
-  refused credential, a forbidden read, a redirect (never followed) and a mismatched major. Plain
-  HTTP is refused for any host but loopback unless `FLUID_AIRFLOW_ALLOW_INSECURE_HTTP` is set.
-  MWAA, Prefect and Dagster are refused with `--airflow-url`. Without `--airflow-url` the stage
-  behaves as before.
+  and the two reads the wait depends on (import errors and DAGs) run before anything is pushed,
+  so a check that cannot run leaves nothing pushed. After the push, every pushed file must be
+  parsed with no import error within `--airflow-wait` seconds (default 600, cap 3600). On an
+  Airflow 3 Git DAG bundle, its DAGs must report the commit the `git+ssh` push made (or
+  `--airflow-bundle-version`). Elsewhere, the source Airflow stores for the file (`dagSources`)
+  must be the pushed file, and Airflow must then save two clean parses of it, the later at
+  least 60 s after the parse it showed when the source first matched: a parse that was already
+  running when the files landed read the old file, Airflow runs one such parse per DAG processor,
+  and it stops a parse after `dag_file_processor_timeout` (50 s by default). A user who may not
+  read DAG code gets a pass marked not proven (`schedule_sync_airflow_unproven`, exit 0) after two
+  clean parses 60 s apart. A failure counts from two stamps of the file's import error and stands
+  once they are 60 s apart. On Airflow 3.4, `/api/v2/dagBundles` shows when the bundle reached
+  the pushed commit. A DAG that never appears is reported as not parsed: Airflow 3 shows the
+  import error of a file with no registered DAG only to a user who may read all import errors.
+  A file whose DAG ids forge cannot read holds the wait until Airflow lists a DAG from it or
+  shows its import error; a module that builds no DAG at module level is not waited for, but an
+  import error Airflow shows for it fails the check. `--airflow-bundle` limits the check to one
+  bundle. `--check-only` checks the files under `--dags-dir` without pushing, for a deploy that
+  puts them in place itself. A file that fails to import, or is not parsed in time, exits 1 with
+  `schedule_sync_airflow_import_errors` or `schedule_sync_airflow_not_parsed`, and the report's
+  `airflow_check` block names each file. Typed errors cover an unreachable server, a refused
+  credential, a forbidden read, a redirect (never followed) and a mismatched major. Plain HTTP is
+  refused for any host but loopback unless `FLUID_AIRFLOW_ALLOW_INSECURE_HTTP` is set, and a
+  loopback host is never sent through a proxy. No request outlives `--airflow-wait`. MWAA,
+  Prefect and Dagster are refused with `--airflow-url`. Without `--airflow-url` the stage behaves
+  as before.
+- `fluid_build.util.http_client.new_client` takes `trust_env=False` for a request that must not
+  reach a proxy, like `new_async_client`.
 - **Every DAG forge generates is loaded by a real Airflow in a gated test.**
   `tests/schedulers/test_generated_dags_airflow_live.py` loads each generator's DAG in the
   `DagBag` of the Airflow 2 and 3 named by `FLUID_AIRFLOW2_PYTHON` / `FLUID_AIRFLOW3_PYTHON`. It
