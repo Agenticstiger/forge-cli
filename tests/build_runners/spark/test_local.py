@@ -90,7 +90,16 @@ if os.environ.get("STUB_IGNORE_TERM"):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 else:
     signal.signal(signal.SIGTERM, lambda *a: stop.append(1))
+# As the runner does: a stop request beside the job config ends the run (STUB_IGNORE_STOP: a
+# run that never answers one).
+request = None
+if not os.environ.get("STUB_IGNORE_STOP") and "--fluid-stop-key" in argv:
+    key = argv[argv.index("--fluid-stop-key") + 1]
+    request = os.path.join(os.path.dirname(config), "stop", key)
 while not stop:
+    if request and os.path.isfile(request):
+        print("stub: stopped between batches", flush=True)
+        sys.exit(0)
     time.sleep(0.05)
 print("stub: stopped", flush=True)
 sys.exit(143)
@@ -563,15 +572,16 @@ def test_a_stream_is_started_left_alone_restarted_and_stopped(host, started):
     assert changed.config_hash != first.config_hash
     assert changed.checkpoint == first.checkpoint
     (restart,) = rc.reconcile([changed], local_host=host)
-    assert (restart.action, restart.cancelled, restart.error) == (
+    assert (restart.action, restart.stopped, restart.cancelled, restart.error) == (
         "restarted",
         [out.run_id],
+        [],
         False,
     ), restart.message
     started.append((runs, restart.run_id))
-    assert runs.get(out.run_id).state == CANCELLED
+    assert runs.get(out.run_id).state == SUCCEEDED  # it ended cleanly when asked
     assert runs.get(restart.run_id).state == RUNNING
-    assert "stub: stopped" in log_path.read_text(encoding="utf-8")  # SIGTERM, not SIGKILL
+    assert "stub: stopped between batches" in log_path.read_text(encoding="utf-8")
 
     outcomes = rc.reconcile([], local_host=host, stop_removed_of=(first.product, set()))
     assert [(o.build, o.action, o.cancelled, o.error) for o in outcomes] == [
@@ -580,6 +590,27 @@ def test_a_stream_is_started_left_alone_restarted_and_stopped(host, started):
     assert f"stopped run {restart.run_id} CANCELLED on this machine" in outcomes[0].line()
     assert runs.get(restart.run_id).state == CANCELLED
     assert rc.reconcile([], local_host=host, stop_removed_of=(first.product, set())) == []
+
+
+def test_a_stream_that_does_not_answer_its_stop_request_is_cancelled_after_the_grace(host, started):
+    quiet = with_env(host, STUB_IGNORE_STOP="1")
+    first = the_run(local_contract())
+    (out,) = rc.reconcile([first], local_host=quiet)
+    runs = LocalRuns(host, first.product, first.build)
+    started.append((runs, out.run_id))
+    changed = the_run(local_contract(trigger={"processingTime": "PT2M"}))
+    (restart,) = rc.reconcile(
+        [changed], local_host=quiet, env={rc.WAIT_ENV: "30", rc.STOP_GRACE_ENV: "1"}
+    )
+    started.append((runs, restart.run_id))
+    assert (restart.action, restart.stopped, restart.cancelled) == (
+        "restarted",
+        [],
+        [out.run_id],
+    ), restart.message
+    assert "did not stop between batches within 1 s" in restart.message
+    assert runs.get(out.run_id).state == CANCELLED
+    assert not list(runs.host.workspace.joinpath(".fluid").rglob("stop/*"))  # withdrawn
 
 
 def test_a_build_kept_locally_is_not_stopped(host, started):
