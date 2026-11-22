@@ -396,22 +396,10 @@ def reject_url_syntax(connection: Mapping[str, Any], *, where: str) -> None:
     connection, so it is refused before the URL is built. ``port`` must be
     ASCII digits. The message names the field and never its value.
     """
-    for key, refused, name in (
-        ("host", _URL_NAME_SYNTAX + "/", "host name"),
-        ("database", _URL_NAME_SYNTAX, "database name"),
-    ):
+    for key, name in (("host", "host name"), ("database", "database name")):
         value = connection.get(key)
-        if value is None:
-            continue
-        for char in str(value):
-            if _CONTROL_CHARS.match(char):
-                shown = "a control character"
-            elif key == "host" and char.isspace():
-                shown = "whitespace"
-            elif char in refused:
-                shown = repr(char)
-            else:
-                continue
+        shown = None if value is None else _url_syntax_in(str(value), host=key == "host")
+        if shown is not None:
             raise ValueError(
                 f"Invalid {key} for {where}: {shown} is not permitted, because the "
                 f"connection URL would read it as more than a {name}."
@@ -421,6 +409,19 @@ def reject_url_syntax(connection: Mapping[str, Any], *, where: str) -> None:
         text = str(port)
         if not (text.isascii() and text.isdigit()):
             raise ValueError(f"Invalid port for {where}: connection.port must be a port number.")
+
+
+def _url_syntax_in(text: str, *, host: bool) -> Optional[str]:
+    """The first character of ``text`` a URL would read as more than a name, described."""
+    refused = _URL_NAME_SYNTAX + ("/" if host else "")
+    for char in text:
+        if _CONTROL_CHARS.match(char):
+            return "a control character"
+        if host and char.isspace():
+            return "whitespace"
+        if char in refused:
+            return repr(char)
+    return None
 
 
 def mask_dsn_password(text: str, password: Optional[str]) -> str:
