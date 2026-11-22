@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A Spark build can run the team's own prebuilt PySpark package by its sha256 digest, and
+  forge's runner owns the write.** `builds[].properties.package` (0.7.7 preview) on an
+  `engine: spark` embedded-logic batch build names a `.whl` or `.zip` (`uri`), its `sha256` and an
+  `entryPoint` (`module:function`, an entry-point object reference), with optional string
+  `arguments` and `deadLetter`. `fluid apply` copies the package beside the job config, keyed by
+  its digest: on AWS OpenTofu copies the S3 object only when S3's SHA-256 checksum of it is the pin
+  (publish it single-part with `--checksum-algorithm SHA256`), and on `runtime: local` forge copies
+  the file after hashing it. The runner hashes its copy again and imports the entry point only from
+  those bytes (a module of that name elsewhere on the Python path, or a compiled extension in the
+  package, is refused), calls it as `fn(spark, context)` and writes the DataFrame it returns: its
+  columns and their types must be the output's `contract.schema`, a row whose required value is
+  null at any depth goes to `<output>__dead_letter` (the reason, the row as JSON, the run id and the
+  package's sha256, landed once per run: the scheduler's run id when `fluid apply` passes one, else
+  the Spark application id) or, without dead letters, fails the run with nothing written, and the
+  passing rows replace the partitions they hold. Each commit carries the run's stamps, as every
+  runner commit does, and `fluid.package.sha256`. While the function runs, PySpark's write calls are refused and `spark.sql`
+  runs reads only, and a commit to the output or its dead letters that the runner did not make
+  fails the run. The operator lists where packages may come from in `FLUID_SPARK_PACKAGE_ALLOWLIST`
+  (unset allows none; `fluid validate` warns, apply refuses). As for a SQL batch build, a runtime
+  where forge would create the role needs `executionRoleArn`. `fluid plan` shows and binds the
+  package's source, digest and entry point.
 - **`fluid generate artifacts --emit custom-scaffold` generates a contract's custom scaffold, so
   its files are in the stage-3 MANIFEST and in a sealed release.** The new emit key passes the
   contract to the custom-scaffold engine's library entry point and writes the files its
@@ -153,6 +174,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   paths); piped output keeps each line whole (it was cut at 80 columns); a `--release-dir` this
   user may not read is a usage error (exit 2) with a plain message; and the "not read" line counts
   every entry past the 2,000 read in a directory.
+
+- **`fluid import pyspark` and `fluid import airflow` propose products from the code that already
+  runs.** `fluid import pyspark <jobs-dir> [--dags <dags-dir>]` reads PySpark jobs and
+  `fluid import airflow <dags-dir>` reads Airflow DAG files, both statically: the files are parsed
+  with `ast` and never imported or run, so Airflow is never loaded and no job executes. A job's
+  tables, paths and Kafka topics (read and written), a stream's checkpoint and trigger, and the SQL
+  in `spark.sql(...)` (CTE names and temporary views left out; an f-string field that does not fold
+  leaves the rest of the statement readable) become **one product per output table or topic, with a
+  single writer and one owner**, and the upstream reads become `consumes[]`. A table written by two
+  jobs is proposed once and reported; a name that is not a constant is reported with the reason,
+  never guessed. With `--dags` (or through `script_roots` for `airflow`), each task is joined to the
+  script it submits: the standard Spark-submitting operators are read (SparkSubmit, EMR add steps
+  and create job flow, EMR on EKS and Serverless job drivers, Glue, Databricks `spark_python_task`,
+  and a `spark-submit` in a `BashOperator`) and the DAG's schedule, tags, owner, tasks and
+  dependencies land on the build under `execution.orchestration` with `mode: manual`; the trigger
+  is `manual`, or `continuous` for a long-running stream, never `schedule`, because
+  `fluid generate schedule` would render a second DAG for it. `--split-by` takes `table` (the
+  default), `job`, `dag`, `folder` and `project` for these importers. `--conventions <file>` holds
+  the organisation's layout as data (script prefixes, data path prefixes, helper function names,
+  config modules, environment names, owners, layers, what to ignore, the product id rule); it is
+  read strictly and no code in it runs. A path in it may point into the file's own folder or into
+  a directory named on the command line (the jobs directory, `--dags`), checked after the path is
+  resolved, so the file can sit beside the repositories it describes (`config/conventions.yaml`);
+  an `environments` value may be empty (a table prefix that is empty in production), which is not
+  the same as a variable the file does not name. `--registry` reads a written topic's columns through the
+  existing schema-registry importer, only when asked. Every proposal is checked against the
+  schema before anything is written (a schema error stops the import), and `fluid validate`'s
+  contract rules are run on it: what they find that no code can give (the columns, a Databricks
+  schema, a Snowflake warehouse) is listed in the report and the contract is still written. A
+  table in a Spark
+  catalog (`glue_catalog.raw.orders`) gets `binding.location.catalog` only when its kind is
+  known: the alias is a kind FLUID knows, a conventions rule maps it, or the scanned code sets
+  `spark.sql.catalog.<alias>.type` or a `catalog-impl` (Glue, REST, Hive, Nessie, Hadoop) in
+  `builder.config`, `conf.set`, a dict or a `--conf`; otherwise the binding has none and the
+  report says to set it, because an alias is no kind and `fluid validate` refuses it.
+  Credentials in command lines and argument lists are masked
+  word by word, with the command's lines, comments and quoting kept (`NAME=value`, `--password`,
+  `-uUSER:PASS`, `mysql -pSECRET`, a header or a cookie, a JSON value, a `sig=`, `key=` or `code=`
+  in a URL, `bash -c`, the password of an Oracle JDBC URL), the user information of a data path or a host (an AWS secret with a slash
+  included) never reaches an id, a file name or a binding, and a second import never replaces a
+  file that differs from what it would write unless `--force` is given. The reading is bounded: a
+  file over 300 KB, or with more than 50,000 `{` characters (in the encoding Python reads it in:
+  CPython parses a long f-string in time that grows with the square of its fields), is not
+  parsed; one import reads at most 64 MB of source, keeps at most 200,000 syntax-tree nodes parsed
+  at once and spends at most 2 MB on reading dropped modules again; the work spent folding a name,
+  the text a module's memo keeps and the size of a string are capped (4,096 characters, 262,144
+  for the statement a `spark.sql` takes, and 4,000,000 for what a module builds in all); one import
+  parses at most
+  1,500,000 characters of SQL (a statement once per file); a table or path name over 512
+  characters is not kept; a job records at most 1,000 of its tasks, a command keeps its first 20
+  submits and a task lists at most 100 arguments; one proposal holds at most 50,000 outputs and
+  10,000 products, lists at most 200,000 reads in consumes[] between its products (each lists at
+  most 500), goes through at most 1,000,000 reads and 1,000,000 task links, and writes at most
+  16,000,000 characters of DAG tasks, with `--split-by job` as the way out; and a script path in a
+  DAG file is judged on its text (no `..`, not absolute) before any file is looked at.
+  Product, expose and build ids are unique whatever the names look like, two jobs with one file
+  name are two products, and what the reader cannot follow (a reader variable assigned twice, a
+  task group in a dependency, a placeholder in SQL that is not an f-string) is said in the report.
+
+- **`fluid import` takes a generic `--dry-run`, and importers can be added by packages.** `--dry-run`
+  prints the proposal (each product, its writer, outputs and upstreams) and the report and writes
+  nothing, for every importer. The importer names come from a registry now, and a package adds
+  `fluid import <tool>` through the `fluid_build.importers` entry-point group: a duck-typed object
+  with `import_to_contract` or `import_to_contracts` and no forge import, any report object with the
+  report's four lists, read by name and loaded only when its tool is asked for, held to
+  `FLUID_PLUGINS_ALLOWLIST` and `FLUID_PLUGINS_BLOCKLIST`, unable to take a built-in's name, and
+  refused when two distributions ship one name. `fluid --help` stays cold. A dry run labels each
+  file as new, unchanged, replacing the existing file (with `--force`) or refused. For every
+  importer an output path that is a symbolic link, a directory or a device is refused, with or
+  without `--force`, and a file is written whole beside its target and renamed over it, keeping
+  the permission bits of a file it replaces. `--out` that names an existing file is refused when
+  several products are written, and `--split-by table`, `job` and `dag` are refused for the
+  importers that do not read code.
 
 - **`fluid generate pyspark-schema` writes a PySpark `StructType` module for each output
   port.** For every output port that declares `contract.schema` columns it writes
@@ -319,6 +413,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same for each command of one run, another for the next, and the file is neither read nor
   written. `FLUID_RUN_ID` still wins.
 
+- **The redactor masks the password of an Oracle JDBC URL, a Slack incoming webhook, and a
+  Google API key that follows a word character.** `jdbc:oracle:thin:user/password@host` (also
+  `@//host`, `oci`, `oci8` and `kprb`, in any case, with a password that holds an `@`, quoted
+  or not) has no `://` and no `:` before the password, so neither the URL user-information rule
+  nor the `user:password` one saw it, and it was logged and written as it stood while the
+  PostgreSQL form was masked. A Slack webhook URL is a secret by itself and is masked whole, and
+  `GOOGLE_AIza...` and `%3DAIza...` leaked because the key rule wanted a word boundary before it.
+  The repository's redactor, the importer and the Snowflake, local and GCP provider loggers share
+  the Oracle rule's one regex, which also reads a user name in double quotes.
+
 - **Entropy Data's product list is read whole or not at all.** A page after the first that was
   not a list (a rate-limit answer, say) used to hand back the pages before it as if they were
   every product the server holds, and an answer that was not JSON was a bare `ValueError`. Both
@@ -353,6 +457,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrote `type: parquet_variant` into a contract that `fluid validate` then rejected. It maps to
   `variant`, as DuckDB's `UNION` already does, and the schema-drift gate reads the two as one
   type family, so a contract written that way does not fail at apply.
+
+### Security
+
+- An address with an IPv6 zone id, such as `::1%lo0`, is no longer read as this machine. The
+  secret destination policy judges it like any other host, and an OpenBao or Vault address on
+  it needs https.
+- The secret destination policy judges every host a connection names. Beside a `secretRef`,
+  a query-string parameter that names a host (`host` or `hostaddr` in a libpq URI, a host in
+  `jdbc_url_params` or in a Singer tap's `sqlalchemy_url`) is refused unless the reference may
+  go to any host, and so is a database name that holds `?`, `#`, `;`, `&`, `@`, `\` or a
+  control character. The host of an SSH tunnel in use (a tap's `ssh_tunnel`, Airbyte's
+  `tunnel_method`) needs an allowlist entry of its own, and so does a loopback host behind
+  it. A Debezium `extra_config` may no longer set `database.port`, `database.dbname`,
+  `database.names` or `connector.class` beside a `secretRef`. A URI whose authority a
+  database client could read as naming a host the policy does not read is a destination the
+  policy cannot read, and is refused unless the reference may go to any host.
+- A runner that builds a connection URL keeps each field in its own part. dlt's
+  `sql_database` source refuses a host, database or `drivername` that would change how its
+  connection URL is read back, and `drivername` must be a SQLAlchemy dialect name with an
+  optional `+driver`. The Kafka Connect JDBC source and Debezium refuse a host or database
+  that holds URL syntax, and a port that is not a number.
+- A secret-policy refusal no longer prints a value it cannot trace to the contract. At
+  `fluid apply`, where `{{ env.NAME }}` placeholders are rendered, a refusal quotes a host only
+  when the contract wrote it as it stands, and names the placeholder of one it rendered. A
+  keyword connection string (`Server=...;Database=...`) shows its host part only.
+- In `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, `NAME@*` now sends `env://NAME` to any host, as
+  a bare `NAME` and `env://NAME@*` already did. It used to name a literal host `*`, which no
+  destination matches. A refusal's fix names both forms.
 
 ## [0.36.0] — 2026-11-19
 

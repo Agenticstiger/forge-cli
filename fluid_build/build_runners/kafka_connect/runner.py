@@ -35,6 +35,7 @@ from fluid_build.build_runners._deployment_host_policy import (
     DeploymentHostError,
     refuse_unless_host_allowed,
 )
+from fluid_build.providers._sql_safety import reject_url_syntax
 
 from .._acquisition_common import (
     extract_source_schemas,
@@ -319,17 +320,20 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
     connector_name_for_topic = (
         kc_props.get("connector_name") or f"forge-{ctx.product_id.replace('.', '-')}"
     )
-    if is_debezium:
-        base_config.update(
-            _debezium_config(
+    try:
+        if is_debezium:
+            source_config = _debezium_config(
                 ctx.source.connection.raw,
                 ctx.source.kind,
                 topic_prefix=kc_props.get("topic_prefix") or connector_name_for_topic,
                 streams=list(ctx.source.streams or []),
             )
-        )
-    else:
-        base_config.update(_jdbc_config(ctx.source.connection.raw, ctx.source.kind))
+        else:
+            source_config = _jdbc_config(ctx.source.connection.raw, ctx.source.kind)
+    except ValueError as exc:  # reject_url_syntax: a field that would not stay in its part
+        return _failed(ctx, started_at, t_start, str(exc))
+    base_config.update(source_config)
+    if not is_debezium:
         # Confluent JDBC source needs a topic prefix or it 400s. Default
         # to the connector name with dashes-as-underscores so the topic
         # is a valid Kafka name.
@@ -541,6 +545,9 @@ def _debezium_config(
     Postgres we also default ``plugin.name=pgoutput``. Per-source-stream
     filtering uses ``table.include.list`` (Postgres / MySQL / SQL Server).
     """
+    # Debezium builds its JDBC URL from the host, port and database: refused
+    # before the secret is read when one would not stay in its part.
+    reject_url_syntax(connection, where="the Debezium connector")
     # Resolve secretRef → password before any connection.get("password") read.
     connection = resolve_connection_secrets(dict(connection))
     host = connection.get("host", "localhost")
@@ -572,7 +579,9 @@ def _jdbc_config(connection: Dict[str, Any], kind: str) -> Dict[str, Any]:
         # Non-JDBC kinds (s3, gcs, http, …) fall through to the passthrough
         # branch below and don't need credential resolution; eagerly resolving
         # there would force the secret backend to be available even when the
-        # secret isn't used.
+        # secret isn't used. The URL is built from host, port and database, so a
+        # field that would not stay in its part is refused before the secret is read.
+        reject_url_syntax(connection, where="the Kafka Connect JDBC source")
         connection = resolve_connection_secrets(dict(connection))
         host = connection.get("host", "localhost")
         port = connection.get("port", "")

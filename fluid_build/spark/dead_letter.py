@@ -85,6 +85,41 @@ SCHEMA = (
     {"name": "kafka_timestamp", "type": "timestamp"},
     {"name": "dead_lettered_at", "type": "timestamp", "required": True},
 )
+#: The view a prebuilt package's output is checked under (``properties.package``).
+OUTPUT_VIEW = "package_output"
+#: A batch build's dead letter, a row of a package's output that failed the checks: the
+#: reason, the row as JSON, the run (Spark's application id) and the package's sha256.
+#: A table of its own shape: a row has no topic, partition or offset.
+BATCH_COLUMNS = (
+    ("error", "STRING", True),
+    ("row_json", "STRING", False),
+    ("run_id", "STRING", True),
+    ("package_sha256", "STRING", True),
+    ("dead_lettered_at", "TIMESTAMP", True),
+)
+#: The same columns as contract schema fields, for the Glue table OpenTofu emits on AWS.
+BATCH_SCHEMA = (
+    {
+        "name": "error",
+        "type": "string",
+        "required": True,
+        "description": "Why the row is a dead letter: the first check it failed",
+    },
+    {"name": "row_json", "type": "string", "description": "The row as the package returned it"},
+    {
+        "name": "run_id",
+        "type": "string",
+        "required": True,
+        "description": "The Spark application id of the run that refused the row",
+    },
+    {
+        "name": "package_sha256",
+        "type": "string",
+        "required": True,
+        "description": "The sha256 of the package that returned the row",
+    },
+    {"name": "dead_lettered_at", "type": "timestamp", "required": True},
+)
 SINKS = ("table", "topic")
 ALERTS = ("schema_violation",)
 DEFAULT_MAX_RECORDS = 10_000
@@ -217,12 +252,32 @@ def check_select(stream: Any, decoders: Mapping[str, Any]) -> str:
     return f"SELECT *,\n  {error} AS `{ERROR_COLUMN}`\nFROM `{DECODED_TABLE}`"
 
 
-def create_statements(catalog: str, database: str, table: str) -> list[str]:
+def output_check_select(fields: Any) -> str:
+    """The query that gives each row of a prebuilt package's output its dead-letter reason,
+    or null: :data:`ERROR_COLUMN` over :data:`OUTPUT_VIEW`, the first required value that is
+    null, in the declared order, at any depth (a struct's own fields, each array element and
+    map value), as :func:`check_select` checks a stream's records."""
+    checks: list[tuple[str, str]] = []
+    for name, dtype in fields:
+        checks += _violations(f"`{validate_ident(name)}`", dtype, name)
+    if checks:
+        cases = "\n    ".join(f"WHEN {c} THEN {_quote(r)}" for c, r in checks)
+        error = f"CASE\n    {cases}\n  END"
+    else:
+        error = "CAST(NULL AS STRING)"
+    return f"SELECT *,\n  {error} AS `{ERROR_COLUMN}`\nFROM `{OUTPUT_VIEW}`"
+
+
+def create_statements(
+    catalog: str, database: str, table: str, columns_of: Any = COLUMNS
+) -> list[str]:
     """The statements a local run creates its dead-letter table with, when nothing has
-    (on AWS, OpenTofu creates it): Iceberg v2, :data:`COLUMNS`."""
+    (on AWS, OpenTofu creates it): Iceberg v2, :data:`COLUMNS` (a batch build's:
+    :data:`BATCH_COLUMNS`)."""
     name = f"`{catalog}`.`{validate_ident(database)}`"
     columns = ",\n  ".join(
-        f"`{column}` {kind}{' NOT NULL' if required else ''}" for column, kind, required in COLUMNS
+        f"`{column}` {kind}{' NOT NULL' if required else ''}"
+        for column, kind, required in columns_of
     )
     return [
         f"CREATE NAMESPACE IF NOT EXISTS {name}",

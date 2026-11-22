@@ -64,6 +64,9 @@ EXTRA_GROUPS: Dict[str, str] = {
     "extension_validator": "fluid_build.extension_validators",
     "modeling_technique": "fluid_build.modeling_techniques",
     "source_adapter": "fluid_build.source_adapters",
+    # Third-party sources for `fluid import <tool>`. Read by name, loaded only when that tool
+    # is asked for (``cli/import_workflow/registry.py``); the policy governs it like the rest.
+    "importer": "fluid_build.importers",
     # Third-party LLM providers for `fluid forge --llm-provider <name>`. Loaded +
     # registered lazily in ``cli/_llm_provider_plugins.py``; listed here so
     # ``fluid plugins`` surfaces them and the allow/block policy governs them.
@@ -406,7 +409,9 @@ def detailed_plugins(
                 entry["allowed"] = False
                 entry["reserved"] = True
                 allowed = False
-            if allowed:  # only ALLOWED plugins are ever loaded
+            # Only ALLOWED plugins are ever loaded, and an importer plugin is imported when its
+            # tool is asked for (``fluid import <name>``), not by listing it.
+            if allowed and k != "importer":
                 try:
                     obj = ep.load()
                 except Exception as e:  # noqa: BLE001 - isolate a bad plugin; type only

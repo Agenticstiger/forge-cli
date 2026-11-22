@@ -642,6 +642,9 @@ databricks = "fluid_build.providers.databricks:DatabricksProvider"
 # aliases, local) are reserved: an entry point claiming one is skipped before it
 # is imported. Declared by THIRD-PARTY packages only.
 
+# ``fluid import <tool>`` sources are a discovered plugin group (``fluid_build.importers``), declared
+# by THIRD-PARTY packages only; ``cli/import_workflow/registry.py`` documents its shape and policy.
+
 [project.urls]
 Homepage = "https://agenticstiger.github.io/forge_docs/"
 Repository = "https://github.com/Agenticstiger/forge-cli"
