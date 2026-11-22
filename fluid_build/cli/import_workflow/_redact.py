@@ -425,7 +425,7 @@ class _Words:
         self._start_of(value)
         if _JINJA_TOKEN.fullmatch(value):
             # a template reference, not a value: nothing to mask, and a flag before it is spent
-            self._mask_next, self._setting_next, self._user_next = False, None, False
+            self.skip()
             return value
         if self._mask_next == "header":
             # ``Authorization: Bearer <credential>`` as separate words: the scheme stays
