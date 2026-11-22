@@ -37,7 +37,7 @@ config_modules:
   - {module: acme_config.settings, path: libs/settings.py}
 environment: prod
 environments:
-  prod: {ENV: prod, N: 3}
+  prod: {ENV: prod, N: '3'}
   dev: {ENV: dev}
 defaults: {database: Retail, domain: retail, platform: aws}
 catalogs:
@@ -132,7 +132,7 @@ def test_a_full_file(tmp_path):
         ("config_modules: [{module: a.b}]", "give both module and path"),
         ("config_modules: [{module: 'a b', path: x}]", "not an acceptable name"),
         ("environment: nope", "is not named under environments"),
-        ("environments: {a: {X: 1}, b: {X: 2}}", "name the one to use"),
+        ("environments: {a: {X: '1'}, b: {X: '2'}}", "name the one to use"),
         ("environments: {a: {X: }}", 'write ""'),
         ("environments: {a: {X: null}}", 'write ""'),
         ("environments: {a: {X: [1]}}", 'write ""'),
@@ -411,19 +411,23 @@ def test_an_environment_value_may_be_empty_and_that_is_not_a_missing_one(
 
 def test_an_environment_value_is_kept_as_written(tmp_path):
     conv = C.load_conventions(
-        write(
-            tmp_path,
-            "environments: {only: {A: ' a b ', N: 3, F: 1.5, Q: ' ', E: '', D: 2026-01-01}}",
-        )
+        write(tmp_path, "environments: {only: {A: ' a b ', N: '3', F: '1.10', Q: ' ', E: ''}}")
     )
-    assert dict(conv.variables) == {
-        "A": " a b ",
-        "N": "3",
-        "F": "1.5",
-        "Q": " ",
-        "E": "",
-        "D": "2026-01-01",  # YAML reads an unquoted date as one: it is the text it was written as
-    }
+    assert dict(conv.variables) == {"A": " a b ", "N": "3", "F": "1.10", "Q": " ", "E": ""}
+
+
+@pytest.mark.parametrize(
+    "scalar", ["3", "1.10", "007", "0x1F", "yes", "true", "on", "2026-01-01", ".nan", "1_000"]
+)
+@pytest.mark.parametrize("block", ["environments", "airflow_variables"])
+def test_a_value_yaml_reads_as_something_else_than_text_is_refused(tmp_path, block, scalar):
+    # the text it was written as is gone once YAML has read it: 1.10 is 1.1, 007 is 7, yes is True
+    text = f"{block}: {{only: {{X: {scalar}}}}}"
+    assert (
+        "expected text" in refusal(tmp_path, text).why
+        and "in quotes" in refusal(tmp_path, text).why
+    )
+    assert C.load_conventions(write(tmp_path, f"{block}: {{only: {{X: '{scalar}'}}}}"))
 
 
 def test_an_environment_value_is_bounded(tmp_path):

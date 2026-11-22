@@ -879,7 +879,8 @@ def _flag_unread(
     """Flag each product none of whose outputs is read by a scanned job (the jobs that write it do
     not count) or declared as read by a consumer: the code cannot see a dashboard or another
     team's job, so the contract is still proposed, and a person decides: retire the output, or
-    name its consumer under ``consumers``. Listed one by one up to :data:`MAX_UNREAD_LINES`."""
+    name its consumer under ``external_consumers``. Listed one by one up to :data:`MAX_UNREAD_LINES`.
+    """
     readers: Dict[Tuple[str, ...], Set[str]] = {}
     for job in jobs:
         for read in job.facts.reads:
@@ -888,7 +889,7 @@ def _flag_unread(
             identity = identity_of(read, conv)
             if identity is not None:
                 readers.setdefault(identity.key, set()).add(str(job.path))
-    declared = set(conv.consumers)
+    declared = set(conv.external_consumers)
     unread: List[str] = []
     for index, group in enumerate(groups):
         pid = group_ids[index]
@@ -912,7 +913,7 @@ def _flag_unread(
         more = f" and {len(group.outputs) - 5} more" if len(group.outputs) > 5 else ""
         unread.append(
             f"{pid} ({shown}{more}) is read by no scanned job and no declared consumer: retire "
-            "it, or name its consumer under `consumers` in the conventions"
+            "it, or name its consumer under `external_consumers` in the conventions"
         )
     for line in unread[:MAX_UNREAD_LINES]:
         report.unsupported.append(line)

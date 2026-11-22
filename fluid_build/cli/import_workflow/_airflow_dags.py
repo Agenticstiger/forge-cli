@@ -311,8 +311,14 @@ class _Reader:
         return None
 
     def _text(self, node: Optional[ast.expr]) -> Any:
-        """What an operator's argument folds to, with the Airflow Variables its templates read
-        filled in (the conventions' ``airflow_variables``)."""
+        return None if node is None else self.folder.fold(node)
+
+    def _templated(self, node: Optional[ast.expr]) -> Any:
+        """What an argument folds to when Airflow renders it as a template (a field in the
+        operator's ``template_fields``: the script, its arguments, a command, the steps), with the
+        Airflow Variables its templates read filled in (the conventions' ``airflow_variables``).
+        A DAG's id, schedule, tags and owner, and a task's id, are not rendered: a template there
+        is the text written."""
         if node is None:
             return None
         return fill_variable_templates(self.folder.fold(node), self.folder.airflow_variables)
@@ -616,13 +622,13 @@ class _Reader:
         return Submit(runtime, None, why, text, _arg_texts(args), call.lineno, command)
 
     def _spark_submit(self, call: ast.Call) -> List[Submit]:
-        script = self._text(self._kw(call, "application"))
-        args = self._text(self._kw(call, "application_args"))
+        script = self._templated(self._kw(call, "application"))
+        args = self._templated(self._kw(call, "application_args"))
         return [self._submit("spark-submit", script, args, call, "application")]
 
     def _glue(self, call: ast.Call) -> List[Submit]:
-        script = self._text(self._kw(call, "script_location"))
-        raw = self._text(self._kw(call, "script_args"))
+        script = self._templated(self._kw(call, "script_location"))
+        raw = self._templated(self._kw(call, "script_args"))
         args: List[Any] = []
         if isinstance(raw, dict):
             for key, value in raw.items():
@@ -630,9 +636,9 @@ class _Reader:
         return [self._submit("glue", script, args, call, "script_location")]
 
     def _databricks(self, call: ast.Call) -> List[Submit]:
-        task = self._text(self._kw(call, "spark_python_task"))
+        task = self._templated(self._kw(call, "spark_python_task"))
         if task is None:
-            body = self._text(self._kw(call, "json"))
+            body = self._templated(self._kw(call, "json"))
             task = lookup(body, "spark_python_task") if isinstance(body, dict) else None
         if not isinstance(task, dict):
             return []
@@ -705,10 +711,10 @@ class _Reader:
         return out
 
     def _emr_steps(self, call: ast.Call) -> List[Submit]:
-        return self._steps_of(self._text(self._kw(call, "steps")), call, "emr-step")
+        return self._steps_of(self._templated(self._kw(call, "steps")), call, "emr-step")
 
     def _emr_job_flow(self, call: ast.Call) -> List[Submit]:
-        overrides = self._text(self._kw(call, "job_flow_overrides"))
+        overrides = self._templated(self._kw(call, "job_flow_overrides"))
         if isinstance(overrides, str):
             return self._steps_of(overrides, call, "emr-step")
         if not isinstance(overrides, dict):
@@ -717,7 +723,7 @@ class _Reader:
         return [] if steps is ABSENT else self._steps_of(steps, call, "emr-step")
 
     def _driver(self, call: ast.Call, name: str, runtime: str) -> List[Submit]:
-        driver = self._text(self._kw(call, "job_driver"))
+        driver = self._templated(self._kw(call, "job_driver"))
         spark = lookup(driver, name) if isinstance(driver, dict) else None
         if not isinstance(spark, dict):
             return []

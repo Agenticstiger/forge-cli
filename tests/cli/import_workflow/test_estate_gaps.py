@@ -327,7 +327,7 @@ def test_an_output_no_scanned_job_reads_is_still_proposed_and_flagged(tmp_path, 
     assert {c["id"] for c in contracts} == {"silver.a", "gold.b"}  # both are proposed
     flagged = unread_lines(report)
     assert len(flagged) == 1 and flagged[0].startswith("gold.b (")  # silver.a is read by b.py
-    assert "retire it, or name its consumer under `consumers`" in flagged[0]
+    assert "retire it, or name its consumer under `external_consumers`" in flagged[0]
 
 
 @pytest.mark.parametrize(
@@ -344,7 +344,7 @@ def test_a_declared_consumer_clears_the_flag_by_table_or_product_id(
             "jobs/a.py": READS_A,
             "jobs/b.py": READS_B.replace('"gold.b"', '"glue.gold.b"'),
             "conventions.yaml": PLAIN
-            + f"consumers: ['{declared}']\n"
+            + f"external_consumers: ['{declared}']\n"
             + "catalogs: {glue: {platform: aws, format: iceberg, catalog: glue}}\n"
             + "products: {id: '{database}.{table}'}\n",
             "dags/x.py": "x=1\n",
@@ -421,15 +421,15 @@ df.writeStream.format("kafka").option("topic", "out").option(
     assert any("out" in line for line in unread_lines(report))
 
 
-def test_the_consumers_must_be_text_and_are_bounded(tmp_path):
+def test_the_external_consumers_must_be_text_and_are_bounded(tmp_path):
     import yaml
 
     with pytest.raises(Exception) as refused:
         C = __import__(
             "fluid_build.cli.import_workflow._conventions", fromlist=["parse_conventions"]
         )
-        C.parse_conventions(yaml.safe_load("consumers: [1, {a: b}]"))
-    assert "consumers[0]" in str(refused.value)
+        C.parse_conventions(yaml.safe_load("external_consumers: [1, {a: b}]"))
+    assert "external_consumers[0]" in str(refused.value)
 
 
 def test_a_consumer_may_be_named_by_the_product_id_or_by_the_table_alone(tmp_path, monkeypatch):
@@ -442,7 +442,7 @@ def test_a_consumer_may_be_named_by_the_product_id_or_by_the_table_alone(tmp_pat
     _, report = run_pyspark(
         tmp_path / "id",
         monkeypatch,
-        {**files, "conventions.yaml": PLAIN + "consumers: [retail.b]\n"},
+        {**files, "conventions.yaml": PLAIN + "external_consumers: [retail.b]\n"},
         split_by="job",
     )
     assert unread_lines(report) == []
@@ -454,7 +454,7 @@ def test_a_consumer_may_be_named_by_the_product_id_or_by_the_table_alone(tmp_pat
             **files,
             "jobs/b.py": READS_B.replace('"gold.b"', '"glue.gold.b"'),
             "conventions.yaml": PLAIN
-            + "consumers: [gold.b]\nproducts: {id: '{table}'}\n"
+            + "external_consumers: [gold.b]\nproducts: {id: '{table}'}\n"
             + "catalogs: {glue: {platform: aws, format: iceberg, catalog: glue}}\n",
         },
     )

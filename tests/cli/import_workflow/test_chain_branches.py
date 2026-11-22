@@ -280,9 +280,9 @@ else:
 writer.toTable("glue.bronze.clicks")
 """
     )
-    # three arms are not "the two arms of one if": the path through no arm stays possible
+    # an if, an elif and an else each set one: every path goes through an arm
     parts = only_write(facts).trigger.split(TRIGGER_SEPARATOR)
-    assert parts == ["availableNow", "processingTime=1 minute", "continuous=1 second", "default"]
+    assert parts == ["availableNow", "processingTime=1 minute", "continuous=1 second"]
 
 
 def test_two_ifs_in_a_row_are_not_the_two_arms_of_one():
@@ -340,9 +340,10 @@ if 1:
 writer.toTable("glue.bronze.clicks")
 """
     )
+    # in the order the code sets them
     assert only_write(facts).trigger.split(TRIGGER_SEPARATOR) == [
-        "availableNow",
         "processingTime=1 minute",
+        "availableNow",
     ]
 
 
@@ -373,3 +374,248 @@ writer.toTable("glue.bronze.clicks")
     )
     # the addition runs on one path only: the other keeps the stream's default trigger
     assert only_write(facts).trigger.split(TRIGGER_SEPARATOR) == ["availableNow", "default"]
+
+
+# ── which assignments can be the last when the use runs ──────────────────────────────────
+
+
+def triggers(source: str):
+    return only_write(job(BASE + source)).trigger.split(TRIGGER_SEPARATOR)
+
+
+def test_an_elif_with_no_else_leaves_the_path_through_no_arm():
+    got = triggers(
+        """
+if a:
+    writer = writer.trigger(availableNow=True)
+elif b:
+    writer = writer.trigger(once=True)
+writer.toTable("glue.a.t")
+"""
+    )
+    assert got == ["availableNow", "once", "default"]
+    write = only_write(
+        job(
+            BASE
+            + "if a:\n    writer = writer.trigger(once=True)\n"
+            + "elif b:\n    writer = writer.trigger(once=True)\n"
+            + 'writer.toTable("glue.a.t")\n'
+        )
+    )
+    assert _proposal._trigger([write]) == "continuous"
+
+
+def test_an_addition_nested_in_an_arm_does_not_cover_the_arm():
+    assert (
+        triggers(
+            """
+if a:
+    if b:
+        writer = writer.trigger(availableNow=True)
+else:
+    writer = writer.trigger(once=True)
+writer.toTable("glue.a.t")
+"""
+        )
+        == ["availableNow", "once", "default"]
+    )
+
+
+def test_an_if_in_a_loop_that_may_not_run_leaves_the_path_through_no_arm():
+    assert (
+        triggers(
+            """
+for item in items:
+    if item:
+        writer = writer.trigger(availableNow=True)
+    else:
+        writer = writer.trigger(once=True)
+writer.toTable("glue.a.t")
+"""
+        )
+        == ["availableNow", "once", "default"]
+    )
+
+
+def test_a_trigger_the_code_does_not_read_is_not_a_one_shot():
+    for unread in ("trigger(**cfg)", "trigger(once=False)", "trigger(processingTime=x)"):
+        write = only_write(
+            job(
+                BASE
+                + f"""
+writer = writer.trigger(availableNow=True)
+if a:
+    writer = writer.{unread}
+writer.toTable("glue.a.t")
+"""
+            )
+        )
+        assert _proposal._trigger([write]) == "continuous", unread
+
+
+def test_a_use_inside_an_arm_has_only_that_arms_trigger():
+    facts = job(
+        BASE
+        + """
+if flag:
+    writer = writer.trigger(availableNow=True)
+    writer.toTable("glue.a.one")
+else:
+    writer = writer.trigger(processingTime="1 minute")
+    writer.toTable("glue.a.two")
+"""
+    )
+    got = {w.name: w.trigger for w in facts.writes}
+    assert got == {"glue.a.one": "availableNow", "glue.a.two": "processingTime=1 minute"}
+    assert _proposal._trigger([w for w in facts.writes if w.name == "glue.a.one"]) == "manual"
+
+
+def test_an_arm_that_returns_does_not_reach_a_use_after_the_if():
+    facts = job(
+        BASE.replace("writer = (", "def run(flag):\n    writer = (", 1).replace(
+            "\n    raw.", "\n        raw."
+        )
+        if False
+        else """
+def run(flag):
+    writer = raw.writeStream.format("iceberg").option("checkpointLocation", "s3://c")
+    if flag:
+        writer = writer.trigger(availableNow=True)
+        writer.toTable("glue.a.one")
+        return
+    writer = writer.trigger(processingTime="1 minute")
+    writer.toTable("glue.a.two")
+"""
+    )
+    got = {w.name: w.trigger for w in facts.writes}
+    assert got == {"glue.a.one": "availableNow", "glue.a.two": "processingTime=1 minute"}
+
+
+def test_a_later_unconditional_trigger_replaces_the_ones_before_it():
+    assert (
+        triggers(
+            """
+if a:
+    writer = writer.trigger(availableNow=True)
+writer = writer.trigger(processingTime="5 seconds")
+writer.toTable("glue.a.t")
+"""
+        )
+        == ["processingTime=5 seconds"]
+    )
+
+
+def test_the_separator_inside_a_trigger_does_not_make_two():
+    got = triggers(
+        """
+if a:
+    writer = writer.trigger(processingTime="1 minute | availableNow")
+else:
+    writer = writer.trigger(once=True)
+writer.toTable("glue.a.t")
+"""
+    )
+    assert got == ["processingTime=1 minute / availableNow", "once"]
+
+
+def test_a_try_body_may_stop_before_its_addition():
+    assert (
+        triggers(
+            """
+try:
+    writer = writer.trigger(availableNow=True)
+except Exception:
+    pass
+writer.toTable("glue.a.t")
+"""
+        )
+        == ["availableNow", "default"]
+    )
+
+
+def test_a_handler_that_sets_a_trigger_replaces_what_the_body_may_have_set():
+    assert (
+        triggers(
+            """
+try:
+    writer = writer.trigger(availableNow=True)
+except Exception:
+    writer = writer.trigger(once=True)
+writer.toTable("glue.a.t")
+"""
+        )
+        == ["availableNow", "once"]
+    )
+
+
+def test_a_while_loop_that_breaks_after_its_addition_keeps_it():
+    assert (
+        triggers(
+            """
+while True:
+    writer = writer.trigger(availableNow=True)
+    break
+writer.toTable("glue.a.t")
+"""
+        )
+        == ["availableNow", "default"]
+    )
+
+
+def test_a_lambda_that_uses_the_variable_is_not_followed():
+    facts = job(
+        BASE
+        + """
+writer = writer.trigger(availableNow=True)
+writer = writer.trigger(once=True)
+run = lambda: writer.toTable("glue.a.t")
+"""
+    )
+    assert facts.writes == []
+
+
+def test_a_use_in_a_function_the_variable_is_not_local_to_is_not_followed():
+    facts = job(
+        BASE
+        + """
+writer = writer.trigger(availableNow=True)
+
+
+def later():
+    writer.toTable("glue.a.t")
+"""
+    )
+    assert facts.writes == []
+
+
+def test_a_body_that_takes_too_long_to_read_is_not_followed():
+    loops = "".join(" " * (4 * level) + "for i in x:\n" for level in range(30))
+    body = loops + " " * (4 * 30) + "writer = writer.trigger(once=True)\n"
+    facts = job(BASE + body + 'writer.toTable("glue.a.t")\n')
+    assert facts.writes == []
+
+
+def test_many_additions_and_uses_cost_in_proportion():
+    count = 1_500
+    lines = "".join(
+        f'writer = writer.trigger(processingTime="{i} seconds")\nwriter.toTable("glue.a.t{i}")\n'
+        for i in range(count)
+    )
+    import time
+
+    started = time.perf_counter()
+    facts = job(BASE + lines)
+    elapsed = time.perf_counter() - started
+    assert len(facts.writes) == count
+    assert facts.writes[7].trigger == "processingTime=7 seconds"
+    assert elapsed < 20, elapsed  # it took minutes when each use went through every addition
+
+
+def test_too_many_ways_to_reach_a_use_is_not_followed():
+    from fluid_build.cli.import_workflow._spark_io import MAX_CHAIN_SOURCES
+
+    ifs = "".join(
+        f'if c{i}:\n    writer = writer.trigger(processingTime="{i} seconds")\n'
+        for i in range(MAX_CHAIN_SOURCES + 1)
+    )
+    assert job(BASE + ifs + 'writer.toTable("glue.a.t")\n').writes == []

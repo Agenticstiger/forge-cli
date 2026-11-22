@@ -57,6 +57,7 @@ def job(source: str, *, rules=RULES, helpers=None) -> JobFacts:
             "s3://lake/curated/fixed",
         ),
         ("s3://lake/curated", [("s3://lake/curated/fixed/", True)], None),
+        ("s3://lake/curated/fixed", [("s3://lake/curated/fixed/", True)], None),  # a longer name
         ("", RULES, None),
         # the first rule that applies is the one: a later, longer one is not looked at
         (
@@ -209,3 +210,14 @@ def run(d):
 """
     )
     assert len(facts.remarks) == 1 and len(facts.reads) == 2
+
+
+def test_a_fixed_rule_does_not_take_a_name_that_only_starts_like_its_prefix():
+    facts = job(
+        """
+sfx = spark.conf.get("suffix")
+spark.read.parquet(f"s3://lake/curated/fixed{sfx}/part")
+""",
+        rules=[("s3://lake/curated/fixed/", True)],
+    )
+    assert [r.resolved for r in facts.reads] == [False]

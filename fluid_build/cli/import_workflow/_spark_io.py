@@ -48,6 +48,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from . import _spark_sql
+from ._flow import Flow, TooMuch
 from ._fold import MAX_SQL_STRING, FoldedDict, Folder, Unresolved
 from ._pysource import MAX_TOTAL_SQL_CHARS, Module, clean_chars, qualified_name, snippet
 from ._redact import scrub_host, scrub_path
@@ -119,6 +120,8 @@ _IDENTITY_OPTIONS = frozenset(
 )
 #: Joins the triggers a stream may have when the code picks one by a branch.
 TRIGGER_SEPARATOR = " | "
+#: How many assignments of one variable may be the last to set a stream's trigger at one use.
+MAX_CHAIN_SOURCES = 20
 
 #: A placeholder a templating layer fills in later, in SQL that is not an f-string: ``${db}``,
 #: ``{db}``, ``{{ db }}``, ``%(db)s``. The SQL parser would read the text around it as a name.
@@ -201,7 +204,7 @@ def path_root(known: str, rules: Sequence[Tuple[str, bool]]) -> Optional[str]:
     path = known.split("?")[0].split("#")[0]
     for prefix, fixed in rules:
         base = prefix.rstrip("/")
-        if not (path == base or path.startswith(base + "/")):
+        if not path.startswith(base + "/"):  # the text may go on past ``base``: a longer name
             continue
         if fixed:
             return base
@@ -334,8 +337,19 @@ class _Link:
     #: 0 for a link every run goes through. ``k`` for a link added by the ``k``-th later
     #: assignment of the variable the chain started from (``if a: w = w.trigger(x)``): one branch.
     branch: int = 0
-    #: For a link of a branch: the branches are the two arms of one ``if``, so one of them runs.
-    either: bool = False
+    #: For a link of a branch: every path to the use goes through one of the branches, so the
+    #: trigger the chain had before them does not apply.
+    covered: bool = False
+
+
+@dataclass
+class _Chain:
+    """A variable that later assignments only add to: the assignment that starts it, the links each
+    later one adds (by number), and what the flow of its body says about each use."""
+
+    base: ast.expr
+    additions: Dict[int, List[_Link]]
+    flow: Flow
 
 
 def split_table_name(text: str) -> List[str]:
@@ -393,6 +407,9 @@ class _Reader:
         #: What the SQL parser found in a statement, by the statement (and its holes): the same
         #: text passed to ``spark.sql`` a thousand times is parsed once.
         self._sql_cache: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], _spark_sql.SqlFacts] = {}
+        #: The variables that later assignments only add to, by the scope and the name (``None``:
+        #: not one that can be followed).
+        self._chains: Dict[Tuple[int, str], Optional[_Chain]] = {}
 
     # ── entry ───────────────────────────────────────────────────────
 
@@ -490,15 +507,16 @@ class _Reader:
                     return earlier + links, root
         return links, current
 
-    def _assignments(self, name: ast.Name) -> Optional[List[ast.expr]]:
-        """Every assignment of the variable ``name`` is when it is assigned more than once and
-        only by plain assignments, else ``None``."""
+    def _assignments(self, name: ast.Name) -> Optional[Tuple[Any, List[ast.expr]]]:
+        """The scope that holds ``name`` and every assignment of it, by position, when it is
+        assigned more than once and only by plain assignments, else ``None``."""
         if self.folder.rebound(name.id):
             return None
         current: Optional[Any] = self.folder.scope_of(name)
         while current is not None:
             if name.id in current.assignments:
-                return sorted(current.assignments[name.id], key=lambda e: (e.lineno, e.col_offset))
+                found = sorted(current.assignments[name.id], key=lambda e: (e.lineno, e.col_offset))
+                return current, found
             if (
                 name.id in current.values
                 or name.id in current.blocked
@@ -513,78 +531,91 @@ class _Reader:
         """The chain a variable assigned more than once holds at ``name``, when the first
         assignment starts it and every later one only adds to it: ``w = a.writeStream.format(..)``
         then ``w = w.trigger(x)`` in one branch and ``w = w.trigger(y)`` in the other. The links
-        of each addition that comes before ``name`` are kept, each tagged as a branch of its own.
-        ``None`` when a later assignment does anything else (starts another chain, changes what
-        the sink or source is): which assignment is meant then depends on the order the code runs
-        in, and the read or write is not followed."""
+        of the additions that can be the last to set the trigger by the time ``name`` is used are
+        kept, each tagged as a branch of its own (:class:`_flow.Flow` says which). ``None`` when a
+        later assignment does anything else (starts another chain, changes what the sink or
+        source is), when the use is not in the body that holds the variable (a function that
+        runs later), or when it takes too much to tell: which assignment is meant then depends on
+        the order the code runs in, and the read or write is not followed."""
         found = self._assignments(name)
-        if not found or found[0].lineno >= name.lineno:
+        if found is None:
             return None
-        base, later = found[0], found[1:]
-        base_links, base_root = self._plain_links(base)
-        if isinstance(base_root, ast.Name) and base_root.id == name.id:
-            return None  # the first one adds to a chain nobody started
-        earlier, root = self._links(base, depth + 1)
+        scope, expressions = found
+        chain = self._chain(scope, name.id, expressions)
+        if chain is None:
+            return None
+        statement = self._statement_of(name)
+        state = chain.flow.before.get(id(statement)) if statement is not None else None
+        if not state or len(state) > MAX_CHAIN_SOURCES:
+            return None
+        earlier, root = self._links(chain.base, depth + 1)
         if not any(
             link.name in _READER_MARKERS | _WRITER_MARKERS | {"writeTo"} for link in earlier
         ):
             return None
-        kept: List[Tuple[int, ast.expr, List[_Link]]] = []
-        for branch, expression in enumerate(later, start=1):
-            more, more_root = self._plain_links(expression)
-            if not (isinstance(more_root, ast.Name) and more_root.id == name.id and more):
-                return None
-            if not all(self._adds_nothing_to_identity(link) for link in more):
-                return None
-            if expression.lineno < name.lineno:
-                # one in the block of the first assignment runs on every path to the use: it is
-                # a plain step of the chain, not a branch
-                kept.append((0 if self._same_block(base, expression) else branch, expression, more))
-        conditional = [expression for branch, expression, _ in kept if branch]
-        either = len(conditional) == 2 and self._arms_of_one_if(conditional[0], conditional[1])
+        covered = 0 not in state
         added = [
-            replace(link, branch=branch, either=either)
-            for branch, _expression, more in kept
-            for link in more
+            replace(link, branch=number, covered=covered)
+            for number in sorted(state - {0})
+            for link in chain.additions[number]
         ]
         return earlier + added, root
 
-    def _same_block(self, first: ast.AST, second: ast.AST) -> bool:
-        """Whether the statements that assign ``first`` and ``second`` are in one block (one list
-        of statements of one parent): the later one runs whenever the earlier one does."""
-        parents = self.module.parents
+    def _chain(self, scope: Any, name: str, expressions: List[ast.expr]) -> Optional[_Chain]:
+        """The chain of ``name`` in ``scope``, worked out once."""
+        key = (id(scope), name)
+        if key not in self._chains:
+            self._chains[key] = self._build_chain(scope, name, expressions)
+        return self._chains[key]
 
-        def block(expression: ast.AST) -> Optional[Tuple[int, str]]:
-            statement = parents.get(expression)
-            owner = parents.get(statement) if statement is not None else None
-            if owner is None:
-                return None
-            for name, value in ast.iter_fields(owner):
-                if isinstance(value, list) and any(item is statement for item in value):
-                    return id(owner), name
+    def _build_chain(self, scope: Any, name: str, expressions: List[ast.expr]) -> Optional[_Chain]:
+        owner = scope.owner
+        body = getattr(owner, "body", None)
+        if not isinstance(owner, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef)):
             return None
-
-        found = block(first)
-        return found is not None and found == block(second)
-
-    def _arms_of_one_if(self, first: ast.AST, second: ast.AST) -> bool:
-        """Whether ``first`` and ``second`` sit in the two different arms of one ``if``: exactly
-        one of them runs."""
+        if not isinstance(body, list):
+            return None
         parents = self.module.parents
+        base, later = expressions[0], expressions[1:]
+        base_statement = parents.get(base)
+        if not isinstance(base_statement, (ast.Assign, ast.AnnAssign)):
+            return None
+        _, base_root = self._plain_links(base)
+        if isinstance(base_root, ast.Name) and base_root.id == name:
+            return None  # the first one adds to a chain nobody started
+        additions: Dict[int, List[_Link]] = {}
+        setters: Dict[int, int] = {}
+        for number, expression in enumerate(later, start=1):
+            more, more_root = self._plain_links(expression)
+            if not (isinstance(more_root, ast.Name) and more_root.id == name and more):
+                return None
+            if not all(self._adds_nothing_to_identity(link) for link in more):
+                return None
+            statement = parents.get(expression)
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                return None
+            additions[number] = more
+            if any(link.name == "trigger" for link in more):
+                setters[id(statement)] = number
+        flow = Flow(base_statement, setters)
+        try:
+            flow.run(body)
+        except TooMuch:
+            return None
+        return _Chain(base, additions, flow)
 
-        def arms(node: ast.AST) -> Dict[int, str]:
-            found: Dict[int, str] = {}
-            child, current = node, parents.get(node)
-            while current is not None:
-                if isinstance(current, ast.If):
-                    found[id(current)] = "body" if child in current.body else "orelse"
-                elif isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
-                    break
-                child, current = current, parents.get(current)
-            return found
-
-        left, right = arms(first), arms(second)
-        return any(key in right and right[key] != arm for key, arm in left.items())
+    def _statement_of(self, node: ast.AST) -> Optional[ast.stmt]:
+        """The statement ``node`` is evaluated in, ``None`` when it is in a ``lambda`` or a
+        generator expression: it runs when it is called, which the flow does not say."""
+        parents = self.module.parents
+        current = parents.get(node)
+        while current is not None:
+            if isinstance(current, (ast.Lambda, ast.GeneratorExp)):
+                return None
+            if isinstance(current, ast.stmt):
+                return current
+            current = parents.get(current)
+        return None
 
     def _adds_nothing_to_identity(self, link: _Link) -> bool:
         """Whether a link a later assignment adds is one that leaves the source or sink what it
@@ -1208,6 +1239,8 @@ class _Reader:
                 found = self._trigger(link.call)
                 if found:
                     triggers[link.branch] = found
+                elif link.branch:
+                    triggers[link.branch] = "default"  # one the code does not read: not a one-shot
             elif link.name == "foreachBatch" and args:
                 foreach = args[0]
             elif link.name == "foreach":
@@ -1331,18 +1364,18 @@ class _Reader:
         """The trigger of a stream. When the code picks it by a branch (``if a: w = w.trigger(x)``
         ``else: w = w.trigger(y)``) it is every one that can apply, joined by
         :data:`TRIGGER_SEPARATOR`: the path through no branch counts too (the trigger set before
-        it, else Spark's default) unless the branches are the two arms of one ``if`` and each
-        sets one. A stream that may keep running is then not taken for a one-shot."""
+        it, else Spark's default) unless every path goes through one. A stream that may keep
+        running is then not taken for a one-shot."""
         if not triggers:
             return None
-        branches = {link.branch for link in own if link.branch}
+        branches = sorted({link.branch for link in own if link.branch})
         if not branches:
             return triggers.get(0)
-        chosen = [value for branch, value in triggers.items() if branch]
-        covered = any(link.either for link in own) and len(chosen) == len(branches)
-        if not covered:
+        chosen = [triggers.get(branch, "default") for branch in branches]
+        if not all(link.covered for link in own if link.branch):
             chosen.append(triggers.get(0, "default"))
-        alternatives = list(dict.fromkeys(chosen))
+        # the separator inside a trigger would be read as two
+        alternatives = list(dict.fromkeys(v.replace(TRIGGER_SEPARATOR, " / ") for v in chosen))
         if len(alternatives) > 1:
             note = (
                 f"{self.file}:{call.lineno} the trigger of this stream is picked by a branch of "

@@ -47,7 +47,7 @@ be silently ignored), and a size cap and the alias limits of
     layers: {raw: Bronze, curated: Silver, marts: Gold}   # database -> layer
     owners:                          # the owner label a DAG uses -> the contract's owner
       data-eng: {team: data-engineering, email: data-eng@example.com}
-    consumers: [gold.revenue_daily]  # outputs read outside the scanned code (a dashboard, a team)
+    external_consumers: [gold.revenue_daily]  # read outside the scanned code (a dashboard, a team)
     ignore:
       tables: ["^tmp_", "_staging$"]   # regular expressions
       paths: ["^s3://lake/tmp/"]
@@ -61,8 +61,8 @@ refused, checked on the resolved path. So a conventions file cannot make the sca
 somewhere the user did not point it at, and it may sit in a folder of its own beside the
 repositories it describes (``config/conventions.yaml``).
 
-``consumers`` names the outputs that something outside the scanned code reads (a dashboard, another
-team's job): a table (``db.table`` or ``catalog.db.table``, in any case), a topic or a path as the
+``external_consumers`` names the outputs that something outside the scanned code reads (a
+dashboard, another team's job): a table (``db.table`` or ``catalog.db.table``, in any case), a topic or a path as the
 code names it, or the product id the proposal gives it. The report flags an output that no scanned
 job reads and no consumer is declared for ("retire it, or name its consumer"); declaring one clears
 the flag on the next import.
@@ -118,7 +118,7 @@ _TOP_KEYS = frozenset(
         "helpers",
         "operators",
         "drivers",
-        "consumers",
+        "external_consumers",
         "session_names",
         "config_modules",
         "environment",
@@ -194,7 +194,7 @@ class Conventions:
     operators: Mapping[str, str] = field(default_factory=dict)
     drivers: Tuple[Driver, ...] = ()
     #: Outputs something outside the scanned code reads, lower case (see the module docstring).
-    consumers: Tuple[str, ...] = ()
+    external_consumers: Tuple[str, ...] = ()
     session_names: Tuple[str, ...] = ()
     #: ``{dotted module name: file}`` for constants kept outside the scanned tree.
     config_modules: Mapping[str, Path] = field(default_factory=dict)
@@ -354,21 +354,22 @@ def _local(
 
 
 def _env_value(value: Any, path: Optional[Path], where: str) -> str:
-    """What an environment variable holds, as written. The empty string is a value (a prefix that
-    is empty in production) and not the same as a variable the file does not name, which is
-    unresolved. A number or a date is the text it is written as; a null, a list or a mapping is
-    refused: none of them is a value the code could have read from the environment."""
-    if isinstance(value, str):
-        text = value
-    elif isinstance(value, (int, float, datetime.date)):  # a bool is an int
-        text = str(value)
-    else:
+    """What an environment variable or an Airflow Variable holds, as written. The empty string is
+    a value (a prefix that is empty in production) and not the same as one the file does not name,
+    which is unresolved. It must be text: YAML reads an unquoted ``1.10``, ``007``, ``yes`` or
+    ``2020-1-1`` as a number, a bool or a date, and the text it was written as is gone, so a
+    value that is not text is refused (a null, a list and a mapping too: none of them is a value
+    the code could have read)."""
+    if not isinstance(value, str):
         raise _fail(
-            path, where, 'expected text: write "" for an empty value, or leave the variable out'
+            path,
+            where,
+            'expected text: write "" for an empty value, put anything YAML would read as a number, '
+            "a yes/no or a date in quotes, or leave the variable out",
         )
-    if len(text) > MAX_TEXT:
+    if len(value) > MAX_TEXT:
         raise _fail(path, where, f"longer than {MAX_TEXT} characters")
-    return text
+    return value
 
 
 _SCRIPT = re.compile(r"[A-Za-z0-9_.\-]+(/[A-Za-z0-9_.\-]+)*")
@@ -577,10 +578,12 @@ def parse_conventions(
         for index, raw in enumerate(_list(top.get("drivers", []), source, "drivers"))
     )
 
-    consumers = tuple(
+    external = tuple(
         dict.fromkeys(
-            _text(item, source, f"consumers[{i}]").lower()
-            for i, item in enumerate(_list(top.get("consumers", []), source, "consumers"))
+            _text(item, source, f"external_consumers[{i}]").lower()
+            for i, item in enumerate(
+                _list(top.get("external_consumers", []), source, "external_consumers")
+            )
         )
     )
 
@@ -713,7 +716,7 @@ def parse_conventions(
         helpers=helpers,
         operators=operators,
         drivers=drivers,
-        consumers=consumers,
+        external_consumers=external,
         session_names=sessions,
         config_modules=modules,
         environment=environment,

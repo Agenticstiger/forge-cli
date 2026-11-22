@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 
 from fluid_build.cli.import_workflow import _conventions as C
-from fluid_build.cli.import_workflow._airflow_dags import fill_variable_templates
+from fluid_build.cli.import_workflow._airflow_dags import fill_variable_templates, read_dags
 from fluid_build.cli.import_workflow._fold import (
     FoldedDict,
     FoldedList,
@@ -220,16 +220,18 @@ def test_an_environment_may_be_named_by_the_variables_alone():
 
 
 def test_an_environment_without_variables_has_none():
-    conv = load("environment: dev\nenvironments: {dev: {X: 1}}\nairflow_variables: {prod: {a: p}}")
+    conv = load(
+        "environment: dev\nenvironments: {dev: {X: '1'}}\nairflow_variables: {prod: {a: p}}"
+    )
     assert dict(conv.airflow_variables) == {}
 
 
 @pytest.mark.parametrize(
     "text, expect",
     [
-        ("airflow_variables: {a: {x: 1}, b: {x: 2}}", "name the one to use (a, b)"),
+        ("airflow_variables: {a: {x: '1'}, b: {x: '2'}}", "name the one to use (a, b)"),
         (
-            "environment: c\nairflow_variables: {a: {x: 1}}",
+            "environment: c\nairflow_variables: {a: {x: '1'}}",
             "not named under environments or airflow_variables",
         ),
         ("airflow_variables: {a: {x: }}", 'write ""'),
@@ -246,11 +248,96 @@ def test_a_variables_block_that_is_wrong_is_refused_with_the_key_named(text, exp
 
 
 def test_the_names_of_the_two_blocks_are_chosen_among_together():
-    conv = load("environments: {a: {X: 1}}\nairflow_variables: {b: {y: 2}}\nenvironment: b")
+    conv = load("environments: {a: {X: '1'}}\nairflow_variables: {b: {y: '2'}}\nenvironment: b")
     assert (
         conv.environment == "b"
         and dict(conv.variables) == {}
         and dict(conv.airflow_variables) == {"y": "2"}
     )
     with pytest.raises(C.ConventionsError):
-        load("environments: {a: {X: 1}}\nairflow_variables: {b: {y: 2}}")  # two names, none chosen
+        load(
+            "environments: {a: {X: '1'}}\nairflow_variables: {b: {y: '2'}}"
+        )  # two names, none chosen
+
+
+# ── what a review of the first version found ─────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "shadow",
+    [
+        "class Variable:\n    @staticmethod\n    def get(key):\n        return 'other'",
+        "Variable = Foo()",
+        "def Variable():\n    pass",
+        "for Variable in []:\n    pass",
+    ],
+)
+def test_a_variable_the_file_defines_itself_is_not_airflows(shadow):
+    source = f'{AF2}{shadow}\nx = Variable.get("environment")\n'
+    assert isinstance(fold(source, environment="prod"), Unresolved)
+
+
+def test_a_parameter_named_variable_is_not_airflows():
+    source = f'{AF2}\n\ndef f(Variable):\n    return Variable.get("environment")\n'
+    module = parse_module("dag.py", textwrap.dedent(source).encode("utf-8"))
+    folder = Folder(module, airflow_variables={"environment": "prod"})
+    call = next(n for n in ast.walk(module.tree) if isinstance(n, ast.Call))
+    assert isinstance(folder.fold(call), Unresolved)
+
+
+def test_an_import_that_is_not_shadowed_still_works_inside_a_function():
+    source = f'{AF2}\n\ndef f():\n    return Variable.get("environment")\n'
+    module = parse_module("dag.py", textwrap.dedent(source).encode("utf-8"))
+    folder = Folder(module, airflow_variables={"environment": "prod"})
+    call = next(n for n in ast.walk(module.tree) if isinstance(n, ast.Call))
+    assert folder.fold(call) == "prod"
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        'Variable.get("environment", **{"deserialize_json": True})',
+        'Variable.get("environment", **options)',
+        "Variable.get(*args)",
+        'Variable.get("environment", *rest)',
+    ],
+)
+def test_a_variable_read_through_star_arguments_is_not_read(call):
+    assert "arguments" in why(fold(f"{AF2}options = {{}}\nx = {call}\n", environment="prod"))
+
+
+def test_a_template_is_filled_only_where_airflow_renders_one():
+    module = parse_module(
+        "dag.py",
+        textwrap.dedent(
+            """
+            from airflow import DAG
+            from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+
+            with DAG(
+                dag_id="{{ var.value.env }}_orders",
+                schedule="{{ var.value.cron }}",
+                tags=["{{ var.value.env }}"],
+                description="{{ var.value.env }}",
+                default_args={"owner": "{{ var.value.own }}"},
+            ):
+                SparkSubmitOperator(
+                    task_id="load_{{ var.value.env }}",
+                    owner="{{ var.value.own }}",
+                    application="s3://{{ var.value.env }}/job.py",
+                    application_args=["--env", "{{ var.value.env }}"],
+                )
+            """
+        ).encode("utf-8"),
+    )
+    folder = Folder(module, airflow_variables={"env": "prod", "cron": "0 1 * * *", "own": "alice"})
+    dag = read_dags(module, folder).dags[0]
+    assert dag.dag_id == "{{ var.value.env }}_orders"
+    assert dag.schedule == "{{ var.value.cron }}"
+    assert list(dag.tags) == ["{{ var.value.env }}"]
+    task = dag.tasks[0]
+    assert task.task_id == "load_{{ var.value.env }}"
+    assert task.owner == "{{ var.value.own }}"
+    submit = task.submits[0]
+    assert submit.script == "s3://prod/job.py"
+    assert list(submit.args) == ["--env", "prod"]

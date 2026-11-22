@@ -362,7 +362,10 @@ def _rebound_names(tree: ast.AST) -> Dict[str, str]:
     ``"{x}".format(**locals())`` in a function) changes no constant, and is not that. One pass
     over the tree, without recursion. ``{name: why}``."""
     out: Dict[str, str] = {}
-    aliases: List[Tuple[str, str]] = []
+    aliases: List[Tuple[str, str, int]] = []  # (name, the name it is another name for, line)
+    #: Names with a ``+=`` on them, and the line: a list is changed in place, so a name for the
+    #: same list made before is changed too.
+    augmented: List[Tuple[str, int]] = []
     held: Dict[str, List[str]] = {}
     #: Names changed in place inside each function, by the function.
     touched: Dict[int, Set[str]] = {}
@@ -411,10 +414,14 @@ def _rebound_names(tree: ast.AST) -> Dict[str, str]:
                     touch(item.value, owner)  # type: ignore[attr-defined]
                 if isinstance(target, ast.Name) and isinstance(node, ast.Delete):
                     out.setdefault(target.id, f"`{target.id}` is deleted elsewhere in the file")
+                if isinstance(target, ast.Name) and isinstance(node, ast.AugAssign):
+                    augmented.append((target.id, node.lineno))
+                    if owner is not None:  # ``def add(args): args += [...]`` changes what it gets
+                        touched.setdefault(id(owner), set()).add(target.id)
             if isinstance(node, ast.Assign) and all(isinstance(t, ast.Name) for t in node.targets):
                 names = [t.id for t in node.targets]  # type: ignore[attr-defined]
                 if isinstance(node.value, ast.Name):
-                    aliases.extend((n, node.value.id) for n in names)
+                    aliases.extend((n, node.value.id, node.lineno) for n in names)
                 else:
                     for n in names:
                         held.setdefault(n, []).extend(_contents(node.value))
@@ -447,7 +454,7 @@ def _rebound_names(tree: ast.AST) -> Dict[str, str]:
     for obj, owner in pending:
         apply(obj, owner)
     _follow_parameters(calls, defs, touched, apply)
-    _spread_to_aliases(out, aliases, in_place)
+    _spread_to_aliases(out, aliases, in_place, augmented)
     return out
 
 
@@ -531,9 +538,17 @@ def _follow_parameters(
             return
 
 
-def _spread_to_aliases(out: Dict[str, str], aliases: List[Tuple[str, str]], in_place: str) -> None:
+def _spread_to_aliases(
+    out: Dict[str, str],
+    aliases: List[Tuple[str, str, int]],
+    in_place: str,
+    augmented: Sequence[Tuple[str, int]] = (),
+) -> None:
     """``D = C`` makes ``D`` another name for the same object: a change through either is a change
-    to both. Names joined by an alias are one group, and a group with a changed name is changed."""
+    to both. Names joined by an alias are one group, and a group with a changed name is changed.
+    A name that has a ``+=`` on it (a list is added to in place) changes every name for the same
+    list made before that line: ``ARGS = BASE`` then ``ARGS += [...]`` changes ``BASE`` too, while
+    ``OUT = ARGS`` after the last addition only reads the finished list."""
     parent: Dict[str, str] = {}
 
     def find(name: str) -> str:
@@ -542,14 +557,24 @@ def _spread_to_aliases(out: Dict[str, str], aliases: List[Tuple[str, str]], in_p
             name = parent[name]
         return name
 
-    for left, right in aliases:
+    for left, right, _line in aliases:
         parent[find(left)] = find(right)
+    last_addition: Dict[str, int] = {}
+    members = {name for left, right, _line in aliases for name in (left, right)}
+    for name, line in augmented:
+        if name in members:
+            root = find(name)
+            last_addition[root] = max(last_addition.get(root, 0), line)
     changed = {find(name) for name, why in out.items() if in_place in why}
-    if not changed:
+    if not changed and not last_addition:
         return
-    for left, right in aliases:
-        for name in (left, right):
-            if find(name) in changed:
+    added_to = {name for name, _line in augmented}
+    for left, right, line in aliases:
+        before_an_addition = line < last_addition.get(find(left), 0)
+        for name, other in ((left, right), (right, left)):
+            # the name that is added to builds its own value; the other one changes under it
+            changed_by_addition = before_an_addition and (name not in added_to or other in added_to)
+            if changed_by_addition or find(name) in changed:
                 out.setdefault(name, f"`{name}` {in_place}")
 
 
@@ -579,6 +604,32 @@ def _plain_target(target: ast.AST) -> bool:
 _LEAVES = (ast.Break, ast.Continue, ast.Return, ast.Raise, ast.Yield, ast.YieldFrom, ast.Await)
 
 
+def _rebinds(loop: ast.For, names: Sequence[str]) -> bool:
+    """Whether the body of ``loop`` binds any of ``names`` (its own variables) again: each pass
+    would then work with a value other than the item."""
+    wanted = set(names)
+    for statement in loop.body:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                if node.id in wanted:
+                    return True
+            elif isinstance(node, ast.ExceptHandler):
+                if node.name in wanted:
+                    return True
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name in wanted:
+                    return True
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                if any(
+                    (alias.asname or alias.name).split(".")[0] in wanted for alias in node.names
+                ):
+                    return True
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                if wanted.intersection(node.names):
+                    return True
+    return False
+
+
 def _increment_steps(
     body: Sequence[ast.stmt], covered: Set[int]
 ) -> Dict[str, List[Union[_Add, _Loop]]]:
@@ -601,6 +652,7 @@ def _increment_steps(
             and not stmt.orelse
             and _plain_target(stmt.target)
             and not any(isinstance(node, _LEAVES) for node in ast.walk(stmt))
+            and not _rebinds(stmt, _target_names(stmt.target))
         ):
             for name, steps in _increment_steps(stmt.body, covered).items():
                 out.setdefault(name, []).append(_Loop(stmt, steps))
@@ -629,11 +681,16 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
     def block(name: str, why: str) -> None:
         other.add(name)
         scope.values.pop(name, None)
-        scope.blocked.setdefault(name, why)
+        if scope.blocked.get(name) == "imported":  # imported, then bound some other way here
+            scope.blocked[name] = why
+        else:
+            scope.blocked.setdefault(name, why)
 
     def record(name: str, value: ast.expr) -> None:
         plain.setdefault(name, []).append(value)
         if name in scope.blocked:
+            if scope.blocked[name] == "imported":
+                scope.blocked[name] = f"`{name}` is assigned after it is imported"
             return
         counts[name] = counts.get(name, 0) + 1
         if counts[name] > 1:
@@ -1080,7 +1137,9 @@ class Folder:
         self._rebound = _rebound_names(module.tree)
         #: The loop variables of the recipe being applied, innermost last: a name that is one of
         #: them is what the loop holds on this pass. Nothing is remembered while one is set.
-        self._env: List[Dict[str, Any]] = []
+        #: The loop variables of the steps being folded, each with the scope the loop is in: a
+        #: name of that spelling that another scope binds is not the loop's.
+        self._env: List[Tuple[Scope, Dict[str, Any]]] = []
         #: What a recipe came to, by ``id(recipe)``.
         self._recipe_values: Dict[int, Any] = {}
 
@@ -1265,7 +1324,13 @@ class Folder:
         result.complete = complete
         return result
 
-    _fold_Set = _fold_List
+    def _fold_Set(self, node: ast.Set, scope: Scope, depth: int) -> Any:
+        """A set holds each item once and in no order a ``+=`` or a ``for`` may rely on: it is a
+        list of its distinct items that says it is not whole."""
+        items, complete = self._items(node.elts, scope, depth)
+        result = FoldedList(item for index, item in enumerate(items) if item not in items[:index])
+        result.complete = False
+        return result
 
     def _fold_Dict(self, node: ast.Dict, scope: Scope, depth: int) -> Any:
         result = FoldedDict()
@@ -1422,9 +1487,11 @@ class Folder:
         return None
 
     def name_value(self, name: str, scope: Scope, depth: int, origin: ast.AST) -> Any:
-        for frame in reversed(self._env):
-            if name in frame:
-                return frame[name]
+        if self._env:
+            binder = self._binding_scope(name, scope)
+            for owner, frame in reversed(self._env):
+                if name in frame and owner is binder:
+                    return frame[name]
         current: Optional[Scope] = scope
         while current is not None:
             if name in current.recipes:
@@ -1528,7 +1595,7 @@ class Folder:
                 if frame is None:
                     acc.complete = False
                     break
-                self._env.append(frame)
+                self._env.append((scope, frame))
                 try:
                     done = self._apply(step.body, acc, scope, depth)
                 finally:
@@ -1618,6 +1685,19 @@ class Folder:
             scope = scope.parent
         return None
 
+    def _is_import(self, func: ast.AST, scope: Scope) -> bool:
+        """Whether the name a call starts from (``Variable`` in ``Variable.get(...)``) is the one
+        the file imports: not a parameter, a class, a function or an assignment of its own."""
+        head = func
+        while isinstance(head, ast.Attribute):
+            head = head.value
+        if not isinstance(head, ast.Name):
+            return False
+        bound = self._binding_scope(head.id, scope)
+        if bound is None:
+            return head.id in self.module.imports
+        return bound.blocked.get(head.id) == "imported"
+
     def _fold_Attribute(self, node: ast.Attribute, scope: Scope, depth: int) -> Any:
         head: ast.AST = node
         while isinstance(head, ast.Attribute):
@@ -1676,6 +1756,12 @@ class Folder:
         """``Variable.get("name", ...)`` from the operator's ``airflow_variables``, else
         unresolved: the default (``default_var`` in Airflow 2, ``default`` in Airflow 3, or the
         second argument) is not assumed, and a Variable read as JSON is not read."""
+        if any(isinstance(arg, ast.Starred) for arg in node.args) or any(
+            keyword.arg is None for keyword in node.keywords
+        ):
+            return Unresolved(
+                "an Airflow Variable read with *arguments or **arguments", snippet(node)
+            )
         name_node = node.args[0] if node.args else None
         for keyword in node.keywords:
             if keyword.arg == "key":
@@ -1697,9 +1783,9 @@ class Folder:
     def _fold_Call(self, node: ast.Call, scope: Scope, depth: int) -> Any:
         func = node.func
         qualified = qualified_name(func, self.module.imports)
-        if qualified in _ENV_GET and node.args:
+        if qualified in _ENV_GET and node.args and self._is_import(func, scope):
             return self._environment(node.args[0], scope, depth, node)
-        if qualified in _VARIABLE_GET:
+        if qualified in _VARIABLE_GET and self._is_import(func, scope):
             return self._airflow_variable(node, scope, depth)
         if qualified in _JOINS and node.args and not node.keywords:
             parts = [self.fold(arg, scope, depth) for arg in node.args]

@@ -350,3 +350,140 @@ def test_a_list_built_by_additions_is_as_long_as_a_literal_may_be(monkeypatch):
         """
     )
     assert value == [1, 2, 3, 4, 5] and value.complete is False
+
+
+# ── what a review of the first version found ─────────────────────────────────
+
+
+def fold_in_main(source: str, name: str = "OUT") -> Any:
+    """The value of the last assignment to ``name`` inside ``def main()``."""
+    module = parse_module("m.py", textwrap.dedent(source).encode("utf-8"))
+    folder = Folder(module)
+    main = next(n for n in module.tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+    found = [
+        n
+        for n in ast.walk(main)
+        if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", None) == name
+    ][-1]
+    return folder.fold(found.value)
+
+
+@pytest.mark.parametrize(
+    "rebinding",
+    [
+        "name = name.lower()",
+        "name += '_v2'",
+        "if name == 'Orders':\n    name = 'z'",
+        "name, extra = name + '1', 2",
+        "with open('x') as name:\n    pass",
+        "for name in ['q']:\n    pass",
+        "(name := name.lower())",
+        "def name():\n    pass",
+        "import name",
+        "try:\n    pass\nexcept Exception as name:\n    pass",
+        "del name",
+    ],
+)
+def test_a_loop_that_binds_its_own_variable_again_is_not_unrolled(rebinding):
+    # each pass would add what the body made of the item, not the item
+    body = textwrap.indent(rebinding, "    ")
+    value = fold(
+        "TABLES = ['Orders', 'Users']\nARGS = []\nfor name in TABLES:\n"
+        + body
+        + "\n    ARGS += ['--table', name]\nx = ARGS\n"
+    )
+    assert isinstance(value, Unresolved), value
+
+
+def test_a_loop_variable_is_not_the_value_of_a_module_constant_of_the_same_spelling():
+    value = fold_in_main(
+        """
+        x = "global"
+        CONST = f"{x}/data"
+
+
+        def main():
+            ARGS = []
+            for x in ["a", "b"]:
+                ARGS += [CONST]
+            OUT = ARGS
+        """
+    )
+    assert value == ["global/data", "global/data"]
+
+
+def test_a_loop_variable_is_still_the_item_where_the_step_uses_it():
+    value = fold_in_main(
+        """
+        def main():
+            ARGS = []
+            for x in ["a", "b"]:
+                ARGS += [f"{x}/data"]
+            OUT = ARGS
+        """
+    )
+    assert value == ["a/data", "b/data"]
+
+
+def test_a_list_that_is_another_name_for_one_that_is_added_to_changes_too():
+    # ARGS += [...] changes the list BASE names
+    assert isinstance(
+        fold(
+            """
+            BASE = ["--a"]
+            ARGS = BASE
+            ARGS += ["--b"]
+            x = BASE
+            """
+        ),
+        Unresolved,
+    )
+    # a name made after the last addition only reads the finished list
+    assert (
+        fold(
+            """
+        ARGS = ["--a"]
+        ARGS += ["--b"]
+        BASE = ARGS
+        x = BASE
+        """
+        )
+        == ["--a", "--b"]
+    )
+
+
+def test_a_list_given_to_a_helper_that_adds_to_its_parameter_changes():
+    assert isinstance(
+        fold(
+            """
+            def extend(args):
+                args += ["--x"]
+
+
+            BASE = ["--a"]
+            extend(BASE)
+            x = BASE
+            """
+        ),
+        Unresolved,
+    )
+
+
+def test_a_set_has_no_order_and_no_duplicates_to_add_or_to_loop_over():
+    added = fold(
+        """
+        ARGS = ["--x"]
+        ARGS += {"a", "a"}
+        x = ARGS
+        """
+    )
+    assert added == ["--x", "a"] and added.complete is False
+    looped = fold(
+        """
+        ARGS = ["--x"]
+        for item in {"a", "b"}:
+            ARGS += [item]
+        x = ARGS
+        """
+    )
+    assert looped.complete is False
