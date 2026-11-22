@@ -315,6 +315,24 @@ class TestRunFanout:
                 logger=logger,
             )
 
+    def test_a_refused_run_leaves_an_earlier_runs_output_as_it_was(
+        self, bundle_tgz, tmp_path, logger
+    ):
+        """Every check that refuses the run comes before stage 3 removes anything: an
+        earlier run's artifacts and its MANIFEST stay as they were."""
+        out = tmp_path / "art"
+
+        def tree():
+            files = (p for p in out.rglob("*") if p.is_file())
+            return {p.relative_to(out).as_posix(): p.read_bytes() for p in files}
+
+        run_fanout(bundle_tgz, out, emit_raw="odcs", manifest_path=None, logger=logger)
+        before = tree()
+        assert "MANIFEST.json" in before and any(k.startswith("odcs/") for k in before)
+        with pytest.raises(FanoutError):
+            run_fanout(bundle_tgz, out, emit_raw="odcs,bogus", manifest_path=None, logger=logger)
+        assert tree() == before
+
     @pytest.mark.parametrize(
         "content", [b"not: valid: yaml: [\n", b"id: \xff\xfe\n"], ids=["malformed", "latin-1"]
     )

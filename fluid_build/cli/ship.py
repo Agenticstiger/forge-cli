@@ -392,6 +392,7 @@ def _check_run(
     """Every refusal a run makes once it knows its stages (exit 2, no report)."""
     st.check_preconditions(selected, opts)
     st.check_required_artifacts(selected, not_selected, opts)
+    st.check_withheld_requirement(selected, opts, releases=release_dir is not None)
     problem = release.refusal(release_dir, selected, not_selected, opts)
     if problem:
         raise st.ShipUsageError(problem)
@@ -778,6 +779,9 @@ def _prepare(
     project_dir, args.contract = st.project_location(args.contract)
     st.check_contract_path(os.path.join(project_dir, args.contract))
     opts = st.resolve_options(args, args.contract, os.environ)
+    # A pull or merge request build never runs the contract's bundle templates (stage 3's
+    # custom-scaffold): the CI system's own variables say which build this is.
+    st.leave_scaffold_out_on_change_request(opts, os.environ)
     # RUN_STAGE_<N>_<NAME>: the switches a generated pipeline passes through.
     # An explicit --publish or --schedule-sync beats its own switch; a true
     # switch adds its stage only to a run that does not name its stages, so a
