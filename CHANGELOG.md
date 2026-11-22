@@ -32,6 +32,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `startingOffsets`, as the 0.7.7 schema says, unless the new prefix already holds a position
   (Spark resumes it); the outcome now says which, from the runs' history. The first apply after
   the upgrade still cancels each running stream once (see Upgrade notes).
+- **`--adopt-tables` takes existing Glue tables over into the OpenTofu state, each only
+  when it matches the contract.** `fluid plan <contract> --tofu --adopt-tables` (and
+  `fluid apply <contract> --adopt-tables`) finds the tables the contract names that
+  already exist and that the state does not hold, and plans each through an OpenTofu
+  `import` block in the module's `main.tf.json`, so the plan shows the import and writes
+  no state before the apply. The saved plan is read back with `tofu show -json` before
+  the data-loss gate: a table that matches is imported unreplaced, its Lake Formation
+  permissions kept. What it holds of its own that the contract does not declare (a
+  description, an owner, column comments, a column name's case, the columns of older
+  Iceberg schemas Glue lists) is printed: an Iceberg table keeps it, as the adoption
+  never updates an Iceberg table in place (the plan is made again with that drift left
+  alone, and must import the table with no change); a Hive table is updated in place. A table that differs refuses the run (`table_adoption_mismatch`),
+  naming each column missing, added, of another type (spacing aside, as the data-loss
+  gate reads types) or in another order, and each property: location, Iceberg or not,
+  input and output format, SerDe and storage parameters, partition keys, table type, any
+  other storage setting, or the replace OpenTofu would plan; nothing is imported or
+  applied. The run that applies the take-over audits it at WARNING
+  (`table_adoption_accepted`); a dry run or a refusal does not. The saved plan records
+  the adopted tables in `opentofuPlan.adoptedTables`, under `planDigest`, and `fluid
+  apply plan.json` names them. `fluid ship --adopt-tables` passes the flag to its apply
+  stage. With the flag a table whose look-up fails for any reason but "no such object"
+  stops the run, and one it cannot look for (no AWS account id) is refused
+  (`table_adoption_unavailable`); `fluid plan --adopt-tables` needs `--tofu`
+  (`plan_adopt_tables_needs_tofu`). The match is checked when the plan is made: a saved
+  plan applies what it planned. A partitioned Hive table cannot be adopted yet: its
+  partition trigger is new to the state, so OpenTofu plans its replacement, and the run
+  is refused saying so.
+
 - **A Spark build can run the team's own prebuilt PySpark package by its sha256 digest, and
   forge's runner owns the write.** `builds[].properties.package` (0.7.7 preview) on an
   `engine: spark` embedded-logic batch build names a `.whl` or `.zip` (`uri`), its `sha256` and an
@@ -391,6 +419,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **An existing Glue table forge did not make is no longer taken over without being
+  asked.** A table the contract names that already exists and that the OpenTofu state
+  does not manage used to be imported on every `fluid apply` and rewritten to the
+  contract in place. It is now refused before the plan (`table_adoption_requires_flag`),
+  naming each table; `--adopt-tables` adopts it after the match check. A table forge
+  made for the same product is re-attached as before when its state was lost or is kept
+  nowhere, so an apply that starts from an empty state on every run keeps working. Such
+  a table carries the `managed_by: fluid` parameter and the product id in a new
+  `fluid_product_id` parameter, which forge's module sets on every Glue table it
+  creates, whatever the contract's size. A table made before that is matched by the id
+  in the contract it records (`fluid_contract`, dropped for a contract over 50 KB). A
+  table with neither, or with another product's id, needs the flag. S3 buckets, Glue databases,
+  Kinesis streams and the other brownfield resources are adopted as before, and so are
+  tables on the other clouds. The look-up now also covers a Glue binding without a
+  `format`, which the module declares as Parquet and the look-up used to skip.
+
 - **`--fail-on-breaking` fails on a changed product id.** The changelog did not compare ids, so a
   contract that only changed its id passed the gate; it is a breaking change now, as it is in the
   `--impact` report.
@@ -454,13 +498,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `variant`, as DuckDB's `UNION` already does, and the schema-drift gate reads the two as one
   type family, so a contract written that way does not fail at apply.
 
-### Upgrade notes
-
-- Every Spark stream running when forge is upgraded is replaced once by the first `fluid apply`
-  after the upgrade, by a cancel, as before: the runner changed, so the config hash did, and a run
-  started before the upgrade has no stop key, so it cannot be asked to stop between batches. From
-  then on a changed stream stops between batches (see Added). A plan made before the upgrade is
-  refused at `fluid apply` (`apply_spark_artifact_mismatch`): plan again with the new version.
 ### Security
 
 - An address with an IPv6 zone id, such as `::1%lo0`, is no longer read as this machine. The
@@ -488,6 +525,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - In `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, `NAME@*` now sends `env://NAME` to any host, as
   a bare `NAME` and `env://NAME@*` already did. It used to name a literal host `*`, which no
   destination matches. A refusal's fix names both forms.
+
+### Upgrade notes
+
+- A Glue table that forge made before this release from a contract over 50 KB carries forge's
+  `managed_by: fluid` marker but no product id: forge dropped its record of the contract, and
+  `fluid_product_id` did not exist yet. `fluid apply` now refuses it with
+  `table_adoption_requires_flag`, in a message of its own that names the one-time remedy. If the
+  table is that product's, add the table parameter `fluid_product_id=<product id>` once, with the
+  table's writers paused, through `aws glue update-table` with `--version-id` from a fresh
+  `aws glue get-table`, so a concurrent commit fails the update instead of being reverted. Where
+  the run can pass flags and keeps its state, `--adopt-tables` once also works; adopting does not
+  write the id, so a run that keeps no state needs the parameter.
+- Every Spark stream running when forge is upgraded is replaced once by the first `fluid apply`
+  after the upgrade, by a cancel, as before: the runner changed, so the config hash did, and a run
+  started before the upgrade has no stop key, so it cannot be asked to stop between batches. From
+  then on a changed stream stops between batches (see Added). A plan made before the upgrade is
+  refused at `fluid apply` (`apply_spark_artifact_mismatch`): plan again with the new version.
 
 ## [0.36.0] — 2026-11-19
 

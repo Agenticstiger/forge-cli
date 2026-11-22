@@ -209,6 +209,51 @@ def _resolve_catalog_id() -> str:
 
 _CATALOG_ID_CACHE: Dict[str, str] = {}
 
+#: The Glue table parameter naming the product a table was made for. :func:`_emit_glue`
+#: sets it on every table it creates, whatever the contract's size, and
+#: :meth:`AwsIacPlugin.table_made_by_forge` reads it.
+PRODUCT_ID_PARAMETER = "fluid_product_id"
+
+#: A top-level ``id:`` line of the contract YAML :func:`_emit_glue` records in a table's
+#: ``fluid_contract`` parameter (``yaml.safe_dump``: a top-level key starts its line).
+_RECORDED_ID_RE = re.compile(r"^id:[ \t]*(.*?)[ \t]*$", re.MULTILINE)
+
+
+def _recorded_product_id(recorded: Any) -> Optional[str]:
+    """The product id in a table's recorded contract, or ``None`` when there is none."""
+    if not isinstance(recorded, str):
+        return None
+    found = _RECORDED_ID_RE.search(recorded)
+    if found is None:
+        return None
+    value = found.group(1)
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    return value
+
+
+def _forge_parameters(values: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    """A Glue table's parameters (its values in state) when they carry forge's marker,
+    ``managed_by: fluid``; ``None`` otherwise."""
+    parameters = values.get("parameters")
+    if not isinstance(parameters, Mapping):
+        return None
+    if str(parameters.get("managed_by") or "").strip().lower() != "fluid":
+        return None
+    return parameters
+
+
+def _named_product(parameters: Mapping[str, Any]) -> Optional[str]:
+    """The product a forge-made table names: its ``fluid_product_id`` or, only for a table
+    without that parameter, the id of the contract it records. ``None`` when it names none
+    (no record, a record with no readable top-level id, or an empty value)."""
+    if PRODUCT_ID_PARAMETER in parameters:
+        named = parameters.get(PRODUCT_ID_PARAMETER)
+    else:
+        named = _recorded_product_id(parameters.get("fluid_contract"))
+    return named if isinstance(named, str) and named else None
+
+
 # FLUID column type → Hive/Glue column type, keyed on the lower-cased base name
 # (``varchar(255)`` is ``varchar``). Only a type Hive holds without loss is here;
 # ``_hive_outcome`` classifies every other one.
@@ -871,18 +916,21 @@ class AwsIacPlugin:
         blocks: List[ImportBlock] = []
         seen: set[str] = set()
 
-        def _add(address: str, resource_id: str) -> None:
+        def _add(address: str, resource_id: str, table: Optional[str] = None) -> None:
             if address not in seen:
                 seen.add(address)
-                blocks.append(ImportBlock(to=address, id=resource_id))
+                blocks.append(ImportBlock(to=address, id=resource_id, table=table))
 
-        # Resolve catalog_id once — only when needed (Glue catalog refs). The
-        # raw format here, not the emit's parquet default: unchanged from before
-        # the catalog half of the gate was added.
+        # Resolve catalog_id once — only when needed (Glue catalog refs), under the
+        # emitter's own parquet default: a binding without a format still declares its
+        # Glue table (``_emit_glue``), so its import is looked for too (and
+        # ``adoptable_tables`` names it the same way).
         contract_needs_catalog_id = any(
             is_cloud(b.get("binding") or {}, "aws")
             and ((b.get("binding") or {}).get("location") or {}).get("database")
-            and _glue_cataloged(b.get("binding") or {}, (b.get("binding") or {}).get("format"))
+            and _glue_cataloged(
+                b.get("binding") or {}, (b.get("binding") or {}).get("format") or "parquet"
+            )
             for b in contract.get("exposes") or []
         )
         catalog_id = _resolve_catalog_id() if contract_needs_catalog_id else ""
@@ -914,10 +962,13 @@ class AwsIacPlugin:
                     )
                 if table:
                     table_key = safe_ident(f"{cid}_{database}_{table}")
-                    # provider id: ``{catalog_id}:{database}:{name}``
+                    # provider id: ``{catalog_id}:{database}:{name}``. A table holds a
+                    # team's data: it is taken over only on --adopt-tables, and only
+                    # when it matches the contract (``iac/adoption.py``).
                     _add(
                         f"aws_glue_catalog_table.{table_key}",
                         f"{catalog_id}:{database}:{table}",
+                        table=f"{database}.{table}",
                     )
 
             # S3 bucket — provider id is the bucket name.
@@ -954,6 +1005,74 @@ class AwsIacPlugin:
                 )
 
         return blocks
+
+    #: Why a Glue table could not be looked for, when ``discover_imports`` offers none for
+    #: a table the contract names: its import id needs the account.
+    table_adoption_hint = (
+        "A Glue table's import id names the AWS account: set AWS_ACCOUNT_ID, or run with "
+        "credentials sts:GetCallerIdentity accepts."
+    )
+
+    def adoptable_tables(self, contract: Mapping[str, Any]) -> Dict[str, str]:
+        """``{address: "<database>.<table>"}`` of every Glue table the contract names.
+
+        The tables :meth:`discover_imports` looks for, under the same gate
+        (``_glue_cataloged``), whether or not the account id is known: ``--adopt-tables``
+        refuses a run that could not look for one of them.
+        """
+        cid = safe_ident(contract.get("id") or contract.get("name") or "product")
+        tables: Dict[str, str] = {}
+        for exposure in contract.get("exposes") or []:
+            binding = exposure.get("binding") or {}
+            if not is_cloud(binding, "aws"):
+                continue
+            loc = binding.get("location") or {}
+            database, table = loc.get("database"), loc.get("table")
+            if database and table and _glue_cataloged(binding, binding.get("format") or "parquet"):
+                key = safe_ident(f"{cid}_{database}_{table}")
+                tables[f"aws_glue_catalog_table.{key}"] = f"{database}.{table}"
+        return tables
+
+    def table_made_by_forge(self, values: Mapping[str, Any], contract: Mapping[str, Any]) -> bool:
+        """Did forge make this Glue table, for this product? Its module sets ``managed_by:
+        fluid`` among the table's parameters on create (:func:`_emit_glue`), with the
+        product id in ``fluid_product_id`` and, up to 50 KB, the contract in
+        ``fluid_contract``; ``ignore_changes`` keeps them, and Iceberg's commits do too.
+        ``values`` is the table in state, as the brownfield look-up imported it.
+
+        Only the marker and the exact product id together make the table this product's.
+        The id is read from ``fluid_product_id``; only a table without that parameter
+        (made before forge set it) falls back to the recorded contract's top-level ``id:``
+        line, with no YAML parse of catalog text. A table with neither, or with a record
+        that names no id or another one, is not this product's: ``--adopt-tables``
+        compares it like any table forge did not make.
+        """
+        parameters = _forge_parameters(values)
+        product = str(contract.get("id") or "")
+        return parameters is not None and bool(product) and _named_product(parameters) == product
+
+    def table_names_no_product(self, values: Mapping[str, Any]) -> bool:
+        """Does this Glue table carry forge's marker but name no product? Forge made it
+        before it set ``fluid_product_id``, from a contract over 50 KB, whose record it
+        dropped: it may be any product's. ``values`` is the table in state."""
+        parameters = _forge_parameters(values)
+        return parameters is not None and _named_product(parameters) is None
+
+    def adoption_hold(self, declared: Mapping[str, Any]) -> Tuple[str, ...]:
+        """The attributes an adopted table keeps as it is in the run that adopts it
+        (``aws_adoption.held_still``): an Iceberg table is never updated in place."""
+        from .aws_adoption import held_still
+
+        return held_still(declared)
+
+    def review_table_adoption(
+        self, change: Mapping[str, Any], declared: Mapping[str, Any]
+    ) -> Tuple[List[str], List[str]]:
+        """``(differences, updates)`` of adopting the Glue table one saved-plan change
+        imports (``aws_adoption.review_glue_table``)."""
+        from .aws_adoption import review_glue_table
+
+        return review_glue_table(change, declared)
 
     def provider_block(self) -> Dict[str, Any]:
         """Static provider configuration for the ``hashicorp/aws`` provider.
@@ -1337,6 +1456,13 @@ def _emit_glue(
     # Contract-driven enrichments (absorbed from the retired registrar).
     description = ""
     if contract is not None:
+        # The product this table is made for, whatever the contract's size (the
+        # ``fluid_contract`` record below is dropped over 50 KB): a later run of the same
+        # product re-attaches the table by it (``table_made_by_forge``). Set before the
+        # governance labels, which never overwrite a parameter set here.
+        product_id = contract.get("id")
+        if product_id:
+            parameters[PRODUCT_ID_PARAMETER] = str(product_id)
         meta = contract.get("metadata") or {}
         layer = meta.get("layer")
         product_type = meta.get("productType") or meta.get("product_type")
