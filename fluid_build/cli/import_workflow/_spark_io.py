@@ -99,6 +99,17 @@ _TERMINALS = frozenset(
 
 _PLAIN_TABLE = re.compile(r"[A-Za-z0-9_$`.\-]+")
 
+#: DataFrame methods that take another DataFrame, so a name given to them is data, not a value.
+_FRAME_METHODS = frozenset(
+    {"join", "crossJoin", "union", "unionAll", "unionByName", "intersect", "intersectAll"}
+    | {"subtract", "exceptAll", "broadcast", "createDataFrame"}
+)
+#: Methods that run a function over the rows: what the function reads is not known.
+_FUNCTION_METHODS = frozenset(
+    {"transform", "mapInPandas", "mapInArrow", "applyInPandas", "cogroup", "foreach"}
+    | {"foreachBatch", "foreachPartition", "map", "flatMap", "mapPartitions", "udf", "pandas_udf"}
+    | {"rdd", "toPandas", "collect"}
+)
 #: Options that say WHAT a source or a sink is (where it reads or writes, and its state). A
 #: variable's later assignment may add other options, never one of these: it would be a different
 #: source or sink in each branch.
@@ -244,6 +255,9 @@ class Read(Ref):
     streaming: bool = False
     #: Kafka bootstrap servers, when given as a constant.
     host: Optional[str] = None
+    #: True for a read that feeds one write and nothing else: one a closed SQL statement makes
+    #: (see :meth:`_Reader._on_sql`), or one written inside the expression of a write.
+    exclusive: bool = False
 
 
 @dataclass(frozen=True)
@@ -256,6 +270,10 @@ class Write(Ref):
     query_name: Optional[str] = None
     output_mode: Optional[str] = None
     host: Optional[str] = None
+    #: The keys (:func:`read_key`) of every read that feeds this write, when the code says (a SQL
+    #: statement that names all it reads, a DataFrame built from reads and nothing the reader
+    #: cannot follow); ``None`` when any read of the job may feed it.
+    feeds: Optional[Tuple[Tuple[Any, ...], ...]] = None
 
 
 @dataclass(frozen=True)
@@ -271,6 +289,12 @@ class Stream:
     output_mode: Optional[str]
     #: First and last line of the ``foreachBatch`` function, when the sink is one and it was found.
     batch_function: Optional[Tuple[int, int]] = None
+
+
+def read_key(read: "Read") -> Tuple[Any, ...]:
+    """What identifies a read among the reads of one job: two reads with this key are one read
+    (a chain that two calls both reach), and a write names the reads that feed it by it."""
+    return (read.kind, read.parts, read.shown, read.line)
 
 
 @dataclass
@@ -355,6 +379,15 @@ class _Reader:
         self.facts = JobFacts(rel=module.rel)
         self.temp_views: Set[str] = set()
         self.default_checkpoint: Optional[str] = None
+        #: What feeds what: the reads each call made (positions in ``facts.reads``), the calls
+        #: whose reads are not all in ``facts.reads`` (a name that did not fold, a temporary view,
+        #: SQL that did not parse), the call being read, and the expression the write being read
+        #: is made of.
+        self._produced: Dict[int, List[int]] = {}
+        self._open: Set[int] = set()
+        self._current: Optional[ast.Call] = None
+        self._expression: Optional[ast.AST] = None
+        self._write_exprs: List[Tuple[int, ast.AST]] = []
         self.parameter_named = 0
         self._handled: Set[int] = set()
         #: What the SQL parser found in a statement, by the statement (and its holes): the same
@@ -603,6 +636,17 @@ class _Reader:
     # ── dispatch ────────────────────────────────────────────────────
 
     def _on_call(self, call: ast.Call) -> None:
+        """Read one call, and remember which reads it made."""
+        before = len(self.facts.reads)
+        self._current = call
+        try:
+            self._dispatch(call)
+        finally:
+            self._current = None
+        if len(self.facts.reads) > before:
+            self._produced[id(call)] = list(range(before, len(self.facts.reads)))
+
+    def _dispatch(self, call: ast.Call) -> None:
         func = call.func
         helper = self._helper_for(call)
         if helper is not None:
@@ -806,17 +850,31 @@ class _Reader:
 
     # ── records ─────────────────────────────────────────────────────
 
-    def _add_read(self, ref: Ref, *, streaming: bool, host: Optional[str] = None) -> None:
+    def _drop(self) -> None:
+        """A read the call makes is not recorded: the reads of the call are not all known."""
+        if self._current is not None:
+            self._open.add(id(self._current))
+
+    def _add_read(
+        self, ref: Ref, *, streaming: bool, host: Optional[str] = None, exclusive: bool = False
+    ) -> Optional[int]:
+        """Record a read; its position in ``facts.reads``, or ``None`` when it was not recorded."""
         if not ref.resolved and _PARAMETER in ref.why:
             self.parameter_named += 1
-            return
+            self._drop()
+            return None
         if ref.kind == "table" and ref.resolved and self._is_temp_view(ref):
-            return
+            self._drop()
+            return None
         if len(self.facts.reads) >= MAX_REFS_PER_JOB:
             self._too_many("reads")
-            return
+            self._drop()
+            return None
         host = scrub_host(host) if host else host
-        self.facts.reads.append(Read(**_fields(ref), streaming=streaming, host=host))
+        self.facts.reads.append(
+            Read(**_fields(ref), streaming=streaming, host=host, exclusive=exclusive)
+        )
+        return len(self.facts.reads) - 1
 
     def _add_write(self, ref: Ref, **extra: Any) -> None:
         if not ref.resolved and _PARAMETER in ref.why:
@@ -828,6 +886,8 @@ class _Reader:
         if extra.get("host"):
             extra["host"] = scrub_host(extra["host"])
         self.facts.writes.append(Write(**_fields(ref), **extra))
+        if self._expression is not None and "feeds" not in extra:
+            self._write_exprs.append((len(self.facts.writes) - 1, self._expression))
 
     def _too_many(self, kind: str) -> None:
         note = f"{self.file}: more than {MAX_REFS_PER_JOB:,} {kind}: the rest are not listed"
@@ -873,6 +933,7 @@ class _Reader:
             return
         value, holes = self.folder.fold_sql(node, limit=MAX_SQL_STRING)
         if isinstance(value, Unresolved):
+            self._drop()  # what it reads is not known
             if _PARAMETER in value.why:
                 self.parameter_named += 1
             else:
@@ -890,13 +951,43 @@ class _Reader:
             sql = self._sql_cache[key] = self._analyze_sql(prepared, holes)
         self.temp_views.update(sql.temp_views)
         for note in sql.notes:
+            self._drop()  # SQL that was not read whole
             self.facts.notes.append(f"{self.file}:{call.lineno} {note}")
+        refs = {id(name): self._from_sql_name(name, call) for name in sql.reads}
+        #: A statement is closed when everything it reads is a table or a path that is named:
+        #: nothing it reads is a temporary view (which something else built) or a name with a
+        #: hole, so the tables it names are all that feed what it writes. Its reads feed that
+        #: write and nothing else, and the proposal lists only them for the product.
+        closed: Dict[int, bool] = {}
+        owned: Set[int] = set()
+        for index, write in enumerate(sql.writes):
+            sources = [refs[id(s)] for s in write.sources if id(s) in refs]
+            closed[index] = all(r.resolved and not self._is_temp_view(r) for r in sources)
+            if closed[index]:
+                owned.update(id(s) for s in write.sources)
+        position: Dict[int, Optional[int]] = {}
         for name in sql.reads:
-            ref = self._from_sql_name(name, call)
-            self._add_read(ref, streaming=False)
-        for write in sql.writes:
+            position[id(name)] = self._add_read(
+                refs[id(name)], streaming=False, exclusive=id(name) in owned
+            )
+        for index, write in enumerate(sql.writes):
             ref = self._from_sql_name(write.name, call)
-            self._add_write(ref, mode=write.mode)
+            feeds = None
+            if closed[index] and not self._unrecorded(write.sources, position):
+                feeds = tuple(
+                    sorted(
+                        {
+                            read_key(self.facts.reads[p])
+                            for s in write.sources
+                            if (p := position.get(id(s))) is not None
+                        }
+                    )
+                )
+            self._add_write(ref, mode=write.mode, feeds=feeds)
+
+    @staticmethod
+    def _unrecorded(sources: Sequence[Any], position: Dict[int, Optional[int]]) -> bool:
+        return any(position.get(id(s)) is None for s in sources)
 
     def _analyze_sql(self, prepared: str, holes: Dict[str, str]) -> _spark_sql.SqlFacts:
         """What the parser finds in a statement, unless this import has parsed all the SQL it
@@ -1084,6 +1175,14 @@ class _Reader:
         terminal = own[-1] if own else None
         if terminal is None or terminal.call is not call:
             return
+        self._expression = getattr(start.node, "value", None)
+        try:
+            self._write(call, own, streaming=streaming)
+        finally:
+            self._expression = None
+
+    def _write(self, call: ast.Call, own: Sequence[_Link], *, streaming: bool) -> None:
+        terminal = own[-1]
         options, fmt = self._options(own[:-1])
         mode = None
         triggers: Dict[int, str] = {}  # by branch; the last one of a branch wins
@@ -1186,7 +1285,12 @@ class _Reader:
             if link.name == "using" and link.call is not None and link.call.args:
                 fmt = (self._literal(link.call.args[0]) or "").lower() or None
         ref = self._table_ref(self._arg(start.call, 0, "table"), start.call, fmt)
-        self._add_write(ref, mode=_V2_TERMINALS[terminal.name])
+        func = start.call.func
+        self._expression = func.value if isinstance(func, ast.Attribute) else None
+        try:
+            self._add_write(ref, mode=_V2_TERMINALS[terminal.name])
+        finally:
+            self._expression = None
 
     def _kafka_write(self, call: ast.Call, options: Dict[str, Any], extra: Dict[str, Any]) -> None:
         topic = options.get("topic")
@@ -1287,7 +1391,128 @@ class _Reader:
 
     # ── the end ─────────────────────────────────────────────────────
 
+    # ── what feeds what ─────────────────────────────────────────────
+
+    #: Nodes one expression is followed through, and the names it is followed through.
+    _MAX_LINEAGE_NODES = 400
+    _MAX_LINEAGE_DEPTH = 6
+
+    def _lineage(self) -> None:
+        """Tie each write that is made of a DataFrame to the reads that DataFrame is made of."""
+        facts = self.facts
+        for index, expression in self._write_exprs:
+            found = self._made_of(expression)
+            if found is None:
+                continue
+            keys = tuple(sorted({read_key(facts.reads[position]) for position in found}))
+            facts.writes[index] = replace(facts.writes[index], feeds=keys)
+            for position, inline in found.items():
+                if inline and not facts.reads[position].exclusive:
+                    facts.reads[position] = replace(facts.reads[position], exclusive=True)
+
+    def _made_of(self, expression: ast.AST) -> Optional[Dict[int, bool]]:
+        """The reads an expression is made of, as ``{position: written inside the expression}``
+        (not reached through a name, so nothing else uses it), or ``None`` when part of it that
+        carries data is not understood: a name that is not a session, a pyspark import or assigned
+        once, a call to anything but a method, a pyspark function or a session, a lambda, a
+        comprehension, a read whose name did not fold. What only gives a value (a name inside an
+        f-string, a comparison or a pyspark function's argument) need not be understood, unless it
+        is a function or class of the file, which may read anything."""
+        found: Dict[int, bool] = {}
+        budget = [self._MAX_LINEAGE_NODES]
+
+        def walk(node: ast.AST, depth: int, shared: bool, scalar: bool) -> bool:
+            budget[0] -= 1
+            if budget[0] < 0 or depth > self._MAX_LINEAGE_DEPTH:
+                return False
+            if isinstance(node, ast.Constant):
+                return True
+            if isinstance(node, ast.Name):
+                if node.id in self.sessions or self._is_pyspark(node.id):
+                    return True
+                bound = self._bound_expression(node)
+                if bound is not None and not self.folder.rebound(node.id):
+                    return walk(bound, depth + 1, True, scalar)
+                return scalar and not self._is_callable_of_file(node)
+            if isinstance(node, ast.Attribute):
+                return walk(node.value, depth, shared, scalar)
+            if isinstance(node, ast.Call):
+                if id(node) in self._open:
+                    return False
+                for position in self._produced.get(id(node), ()):
+                    found[position] = found.get(position, True) and not shared
+                func = node.func
+                inner = scalar
+                if isinstance(func, ast.Attribute):
+                    if func.attr in _FUNCTION_METHODS:
+                        return False
+                    ok = walk(func.value, depth, shared, scalar)
+                    inner = scalar or func.attr not in _FRAME_METHODS
+                elif isinstance(func, ast.Name):
+                    ok = self._is_pyspark(func.id) or (
+                        scalar and not self._is_callable_of_file(func)
+                    )
+                    inner = True
+                else:
+                    ok = False
+                return ok and all(
+                    walk(argument, depth, shared, inner)
+                    for argument in (*node.args, *(k.value for k in node.keywords))
+                )
+            if isinstance(node, ast.Starred):
+                return walk(node.value, depth, shared, scalar)
+            if isinstance(node, ast.Subscript):
+                return walk(node.value, depth, shared, scalar) and walk(
+                    node.slice, depth, shared, True
+                )
+            if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+                return all(walk(item, depth, shared, scalar) for item in node.elts)
+            if isinstance(node, ast.Dict):
+                return all(
+                    walk(part, depth, shared, scalar)
+                    for part in (*node.keys, *node.values)
+                    if part is not None
+                )
+            if isinstance(node, (ast.JoinedStr, ast.BoolOp, ast.Compare, ast.BinOp, ast.UnaryOp)):
+                return all(walk(child, depth, shared, True) for child in ast.iter_child_nodes(node))
+            if isinstance(node, ast.FormattedValue):
+                return walk(node.value, depth, shared, True)
+            if isinstance(node, ast.Slice):
+                return all(
+                    walk(part, depth, shared, True)
+                    for part in (node.lower, node.upper, node.step)
+                    if part is not None
+                )
+            if isinstance(node, ast.IfExp):
+                return walk(node.test, depth, shared, True) and all(
+                    walk(n, depth, shared, scalar) for n in (node.body, node.orelse)
+                )
+            if isinstance(node, (ast.operator, ast.cmpop, ast.boolop, ast.unaryop)):
+                return True
+            return False
+
+        return found if walk(expression, 0, False, False) else None
+
+    def _is_callable_of_file(self, node: ast.Name) -> bool:
+        """Whether ``node`` is a function or a class defined in the file (it may read anything)."""
+        current: Optional[Any] = self.folder.scope_of(node)
+        while current is not None:
+            why = current.blocked.get(node.id)
+            if why is not None:
+                return "is a function" in why or "is a class" in why
+            if node.id in current.classes:
+                return True
+            if node.id in current.values or node.id in current.recipes:
+                return False
+            current = current.parent
+        return False
+
+    def _is_pyspark(self, name: str) -> bool:
+        """Whether ``name`` is an import from pyspark (``F``, ``col``, ``Window``)."""
+        return self.module.imports.get(name, "").split(".")[0] == "pyspark"
+
     def _finish(self) -> None:
+        self._lineage()
         facts = self.facts
         # A write inside a foreachBatch function is a streaming write, with the query's facts.
         for stream in facts.streams:
@@ -1321,6 +1546,17 @@ class _Reader:
             )
         facts.reads = _unique(facts.reads)
         facts.writes = _unique(facts.writes)
+        # a read is one write's own only while a write names it (two writes that were one and
+        # said different things are one write that may be fed by anything)
+        owned = {key for write in facts.writes if write.feeds for key in write.feeds}
+        facts.reads = [
+            (
+                replace(read, exclusive=False)
+                if read.exclusive and read_key(read) not in owned
+                else read
+            )
+            for read in facts.reads
+        ]
         if len(facts.notes) > MAX_NOTES_PER_JOB:
             more = len(facts.notes) - MAX_NOTES_PER_JOB
             facts.notes = [*facts.notes[:MAX_NOTES_PER_JOB], f"{self.file}: and {more} more notes"]
@@ -1351,8 +1587,10 @@ def _fields(ref: Ref) -> Dict[str, Any]:
 
 
 def _unique(items: Sequence[Any]) -> List[Any]:
-    """The same refs seen twice (a chain that two calls both reach) once, in line order."""
-    seen: Set[Tuple[Any, ...]] = set()
+    """The same refs seen twice (a chain that two calls both reach) once, in line order. Of two
+    that are one, a read is its own to a write only if both are, and a write's feeds are the
+    reads of both (``None``, any read may feed it, if either says so)."""
+    seen: Dict[Tuple[Any, ...], int] = {}
     out: List[Any] = []
     for item in sorted(items, key=lambda r: (r.line, r.kind, r.shown)):
         key = (
@@ -1363,9 +1601,19 @@ def _unique(items: Sequence[Any]) -> List[Any]:
             item.line,
             getattr(item, "mode", None),
         )
-        if key not in seen:
-            seen.add(key)
+        at = seen.get(key)
+        if at is None:
+            seen[key] = len(out)
             out.append(item)
+        elif isinstance(item, Read) and out[at].exclusive and not item.exclusive:
+            out[at] = replace(out[at], exclusive=False)
+        elif isinstance(item, Write) and out[at].feeds != item.feeds:
+            both = (
+                None
+                if out[at].feeds is None or item.feeds is None
+                else tuple(sorted({*out[at].feeds, *item.feeds}))
+            )
+            out[at] = replace(out[at], feeds=both)
     return out
 
 

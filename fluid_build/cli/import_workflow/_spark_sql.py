@@ -68,6 +68,9 @@ class SqlWrite:
     name: SqlName
     #: ``append``, ``overwrite``, ``merge``, ``update``, ``delete``, ``create`` or ``view``.
     mode: str
+    #: The names the statement that writes it reads (the same objects as in ``SqlFacts.reads``):
+    #: a statement takes nothing but what its own ``FROM``, ``JOIN`` and ``USING`` name.
+    sources: Tuple[SqlName, ...] = ()
 
 
 @dataclass
@@ -167,9 +170,13 @@ def _cte_names(statement: Any) -> Set[str]:
     return {cte.alias.lower() for cte in statement.find_all(exp.CTE) if cte.alias}
 
 
-def _reads(statement: Any, target: Optional[Any], holes: Dict[str, str], facts: SqlFacts) -> None:
+def _reads(
+    statement: Any, target: Optional[Any], holes: Dict[str, str], facts: SqlFacts
+) -> List[SqlName]:
+    """Add the tables ``statement`` reads to ``facts.reads``, and return them."""
     from sqlglot import exp
 
+    found: List[SqlName] = []
     ctes = _cte_names(statement)
     for table in statement.find_all(exp.Table):
         if table is target:
@@ -183,6 +190,8 @@ def _reads(statement: Any, target: Optional[Any], holes: Dict[str, str], facts: 
             if len(name.parts) >= 2 and name.parts[-2] == "global_temp":
                 continue
         facts.reads.append(name)
+        found.append(name)
+    return found
 
 
 def _dml(statement: Any, holes: Dict[str, str], facts: SqlFacts) -> None:
@@ -193,6 +202,7 @@ def _dml(statement: Any, holes: Dict[str, str], facts: SqlFacts) -> None:
         facts.notes.append("a statement whose target is not a table was skipped")
         return
     name = _name_of(target, holes)
+    sources = _reads(statement, target, holes, facts)
     if name is not None:
         if isinstance(statement, exp.Insert):
             mode = "overwrite" if statement.args.get("overwrite") else "append"
@@ -202,8 +212,7 @@ def _dml(statement: Any, holes: Dict[str, str], facts: SqlFacts) -> None:
             mode = "update"
         else:
             mode = "delete"
-        facts.writes.append(SqlWrite(name, mode))
-    _reads(statement, target, holes, facts)
+        facts.writes.append(SqlWrite(name, mode, tuple(sources)))
 
 
 def _create(statement: Any, holes: Dict[str, str], facts: SqlFacts) -> None:
@@ -225,6 +234,6 @@ def _create(statement: Any, holes: Dict[str, str], facts: SqlFacts) -> None:
     if statement.args.get("expression") is None:
         return  # DDL only: no data moves
     name = _name_of(target, holes)
+    sources = _reads(statement, target, holes, facts)
     if name is not None:
-        facts.writes.append(SqlWrite(name, "view" if kind == "VIEW" else "create"))
-    _reads(statement, target, holes, facts)
+        facts.writes.append(SqlWrite(name, "view" if kind == "VIEW" else "create", tuple(sources)))

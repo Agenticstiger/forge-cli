@@ -47,7 +47,7 @@ from ._catalogs import CatalogKinds
 from ._conventions import Conventions, PathRule
 from ._redact import safe_args, safe_command, safe_text
 from ._scan import JobRecord, LinkedTask
-from ._spark_io import TRIGGER_SEPARATOR, Ref, Write
+from ._spark_io import TRIGGER_SEPARATOR, Read, Ref, Write, read_key
 from .registry import ImportReport
 
 SPLITS = ("table", "job", "dag", "task", "folder", "project")
@@ -60,9 +60,13 @@ MAX_PRODUCTS = 10_000
 #: output): a product lists at most ``MAX_CONSUMES_PER_PRODUCT`` of them (the rest are counted in
 #: the report), a proposal lists ``MAX_FANOUT`` in all, and it goes through ``MAX_READ_VISITS``
 #: reads in all (products times reads).
-MAX_FANOUT = 200_000
+MAX_FANOUT = 40_000
 MAX_READ_VISITS = 1_000_000
 MAX_CONSUMES_PER_PRODUCT = 500
+#: Past ``MAX_FANOUT`` the products list fewer reads each, down to this many: a product whose
+#: feeders the code does not say lists all the job's reads, which costs the schema check and the
+#: contract rules a fraction of a millisecond for each one.
+MIN_CONSUMES_PER_PRODUCT = 5
 _SPLIT_BY_JOB = (
     "Propose one product per job with `--split-by job` (every product of a job repeats the job's "
     "reads and tasks), or import a smaller directory."
@@ -362,6 +366,21 @@ class Output:
     write: Write
     #: Other job files that write the same output.
     others: List[Tuple[JobRecord, Write]] = field(default_factory=list)
+    #: The reads (their :func:`read_key`) that feed it, when every write of it by the writer says
+    #: so; ``loose`` is True when any of them does not (then any read of the job that no single
+    #: write owns may feed it).
+    feeds: Set[Tuple[Any, ...]] = field(default_factory=set)
+    loose: bool = False
+
+    def __post_init__(self) -> None:
+        self.add(self.write)
+
+    def add(self, write: Write) -> None:
+        """Note one more write of this output by the writer."""
+        if write.feeds is None:
+            self.loose = True
+        else:
+            self.feeds.update(write.feeds)
 
 
 @dataclass
@@ -398,6 +417,8 @@ class _Ctx:
     #: The entry of each task link as a build lists it, by ``id(link)``: a job that feeds a
     #: hundred products is rendered (and read for credentials) once, not a hundred times.
     entries: Dict[int, Optional[Dict[str, Any]]] = field(default_factory=dict)
+    #: The most reads a product lists in ``consumes[]`` (see :data:`MAX_FANOUT`).
+    max_consumes: int = MAX_CONSUMES_PER_PRODUCT
 
 
 def _job_labels(jobs: Sequence[JobRecord]) -> Dict[str, str]:
@@ -473,6 +494,71 @@ def _first_links(job: JobRecord) -> List[LinkedTask]:
         kept = (len(job.tasks), ordered)
         job._first_links = kept  # type: ignore[attr-defined]
     return kept[1]
+
+
+class _Pools:
+    """The reads of one job, by what they can feed: a read that one write owns (``exclusive``: a
+    closed SQL statement's, or one written inside a DataFrame's expression) feeds that write and
+    nothing else; ``loose`` is every other read, which may feed any write whose reads the code
+    does not say. ``by_key`` and ``index`` find a read, and its place among the job's reads, by
+    its key, so a product asks for what it lists, not for all that the job reads."""
+
+    __slots__ = ("reads", "loose", "loose_keys", "by_key", "index")
+
+    def __init__(self, job: JobRecord) -> None:
+        self.reads = job.facts.reads
+        self.by_key = {read_key(read): read for read in self.reads}
+        self.index = {read_key(read): place for place, read in enumerate(self.reads)}
+        self.loose = [read for read in self.reads if not read.exclusive]
+        self.loose_keys = {read_key(read) for read in self.loose}
+
+
+def _pools(job: JobRecord) -> _Pools:
+    """The pools of ``job``, made once (every product of the job asks)."""
+    kept = getattr(job, "_pools", None)
+    if kept is None or kept[0] != len(job.facts.reads):
+        kept = (len(job.facts.reads), _Pools(job))
+        job._pools = kept  # type: ignore[attr-defined]
+    return kept[1]
+
+
+def _feeding(group: Group, job: JobRecord) -> Tuple[Set[Tuple[Any, ...]], bool]:
+    """The keys of the reads that feed the outputs of ``group`` that ``job`` writes, and whether
+    the ones no write owns feed some of them."""
+    owned: Set[Tuple[Any, ...]] = set()
+    loose = False
+    for output in group.outputs:
+        if output.writer is job:
+            loose = loose or output.loose
+            owned.update(output.feeds)
+    return owned, loose
+
+
+def _keys_of(group: Group, job: JobRecord, pools: _Pools) -> Set[Tuple[Any, ...]]:
+    owned, loose = _feeding(group, job)
+    keys = {key for key in owned if key in pools.by_key}
+    if loose:
+        keys |= pools.loose_keys
+    return keys
+
+
+def _reads_of(group: Group, job: JobRecord) -> Sequence[Read]:
+    """The reads of ``job`` that can feed the outputs of ``group`` that ``job`` writes, in the
+    order the job reads in: the reads their writes name, and every read that no single write owns
+    when any of them is written some way that does not say what feeds it."""
+    pools = _pools(job)
+    owned, loose = _feeding(group, job)
+    if loose and not any(key in pools.by_key for key in owned):
+        return pools.loose
+    keys = {key for key in owned if key in pools.by_key}
+    if loose:
+        keys |= pools.loose_keys
+    return [pools.by_key[key] for key in sorted(keys, key=pools.index.__getitem__)]
+
+
+def _read_count(group: Group, job: JobRecord) -> int:
+    """``len(_reads_of(group, job))`` without making the list."""
+    return len(_keys_of(group, job, _pools(job)))
 
 
 class _DagIndex:
@@ -635,6 +721,7 @@ def build_proposal(
                     )
                 outputs[identity.key] = Output(identity, job, write)
             elif existing.writer is job:
+                existing.add(write)
                 mark = ("catalogs", job.shown, identity.key)
                 if existing.identity.catalog != identity.catalog and mark not in seen_notes:
                     seen_notes.add(mark)
@@ -663,17 +750,27 @@ def build_proposal(
         raise ProposalTooLarge(
             f"the proposal would hold {len(groups):,} products (the most is {MAX_PRODUCTS:,})"
         )
-    fanout = visits = 0
+    visits = 0
+    counts: List[int] = []
     for group in groups:
         jobs = {str(output.writer.path): output.writer for output in group.outputs}
-        reads = sum(len(job.facts.reads) for job in jobs.values())
+        reads = sum(_read_count(group, job) for job in jobs.values())
+        counts.append(reads)
         visits += reads
-        fanout += min(reads, MAX_CONSUMES_PER_PRODUCT)
+    fanout = sum(min(c, MAX_CONSUMES_PER_PRODUCT) for c in counts)
+    listed = MAX_CONSUMES_PER_PRODUCT
     if fanout > MAX_FANOUT:
-        raise ProposalTooLarge(
-            f"the products would list {fanout:,} reads between them (the most is {MAX_FANOUT:,}): "
-            "every product of a job lists all the job's reads",
-            hint=_SPLIT_BY_JOB,
+        listed = _fewer_reads(counts)
+        if listed is None:
+            raise ProposalTooLarge(
+                f"the products would list {fanout:,} reads between them (the most is "
+                f"{MAX_FANOUT:,}): every product of a job lists all the job's reads",
+                hint=_SPLIT_BY_JOB,
+            )
+        report.notes.append(
+            f"the products would list {fanout:,} reads between them (the most is "
+            f"{MAX_FANOUT:,}), because the code does not say which input feeds which output: "
+            f"each lists at most {listed} of its reads in consumes[]. {_SPLIT_BY_JOB}"
         )
     if visits > MAX_READ_VISITS:
         raise ProposalTooLarge(
@@ -716,9 +813,12 @@ def build_proposal(
             eid = _unique(expose_id(output.identity), taken_eids, "_")
             produced[output.identity.key] = (pid, eid)
             groups_of_job.setdefault(str(output.writer.path), set()).add(index)
+    loose_jobs = {str(o.writer.path) for g in groups for o in g.outputs if o.loose}
     for job in ordered:
-        if len(groups_of_job.get(str(job.path), ())) > 1 and any(
-            r.resolved for r in job.facts.reads
+        if (
+            len(groups_of_job.get(str(job.path), ())) > 1
+            and str(job.path) in loose_jobs
+            and any(r.resolved for r in _pools(job).loose)
         ):
             report.notes.append(
                 f"{safe_text(job.shown, 80)} writes outputs that are in different products: the "
@@ -735,6 +835,7 @@ def build_proposal(
         produced=produced,
         topic_schema=topic_schema,
         catalogs=catalogs or CatalogKinds(),
+        max_consumes=listed,
     )
     contracts = [_product(group, group_ids[index], ctx) for index, group in enumerate(groups)]
 
@@ -750,6 +851,21 @@ def build_proposal(
             f"consumes[] names them under the id the id rule gives: {listed}{more}"
         )
     return Proposal(contracts=contracts, report=report)
+
+
+def _fewer_reads(counts: Sequence[int]) -> Optional[int]:
+    """The most reads each product may list so that all of them list at most :data:`MAX_FANOUT`
+    (never fewer than :data:`MIN_CONSUMES_PER_PRODUCT`), or ``None`` when even that is too many."""
+    low, high = MIN_CONSUMES_PER_PRODUCT, MAX_CONSUMES_PER_PRODUCT
+    if sum(min(c, low) for c in counts) > MAX_FANOUT:
+        return None
+    while low < high:
+        middle = (low + high + 1) // 2
+        if sum(min(c, middle) for c in counts) <= MAX_FANOUT:
+            low = middle
+        else:
+            high = middle - 1
+    return low
 
 
 def _flag_unread(
@@ -910,7 +1026,7 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
     seen: set = set()
     unlisted = more_reads = 0
     for job in writer_jobs:
-        for read in job.facts.reads:
+        for read in _reads_of(group, job):
             seen_read = (read.file, read.line, read.shown, read.kind)
             if not read.resolved:
                 if seen_read not in ctx.reported:
@@ -955,7 +1071,7 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
             if (other_pid, other_eid) in seen:
                 continue
             seen.add((other_pid, other_eid))
-            if len(consumes) >= MAX_CONSUMES_PER_PRODUCT:
+            if len(consumes) >= ctx.max_consumes:
                 unlisted += 1
                 continue
             consumes.append({"productId": other_pid, "exposeId": other_eid, "purpose": purpose})
@@ -972,7 +1088,7 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
         )
     if unlisted:
         report.notes.append(
-            f"{pid}: lists {MAX_CONSUMES_PER_PRODUCT} reads in consumes[]; {unlisted} more are "
+            f"{pid}: lists {ctx.max_consumes} reads in consumes[]; {unlisted} more are "
             "not listed"
         )
 

@@ -268,9 +268,10 @@ def test_a_job_whose_outputs_are_in_different_products_says_its_lineage_is_per_j
         tmp_path,
         {
             "jobs/fan.py": """
-                src = spark.table("retail.src")
-                src.write.saveAsTable("retail.o1")
-                src.write.saveAsTable("retail.o2")
+                a = spark.table("retail.a")
+                b = spark.table("retail.b")
+                combine(a, b).write.saveAsTable("retail.o1")
+                combine(b, a).write.saveAsTable("retail.o2")
             """,
         },
     )
@@ -648,13 +649,18 @@ def test_a_job_with_many_outputs_and_reads_is_refused_before_it_is_listed_everyw
     from fluid_build.cli.import_workflow import _proposal
 
     monkeypatch.chdir(tmp_path)
-    body = "\n".join(f'spark.table("t{i}").write.saveAsTable("o{i}")' for i in range(8))
+    body = "\n".join(f'spark.table("t{i}")' for i in range(8))
+    body += "\n" + "\n".join(f'combine(spark).write.saveAsTable("o{i}")' for i in range(8))
     write(tmp_path, {"jobs/fan.py": body + "\n"})
     monkeypatch.setattr(_proposal, "MAX_FANOUT", 50)  # 8 products x 8 reads = 64
+    contracts, report = propose(tmp_path)  # each lists fewer: 8 x 6 = 48
+    assert len(contracts) == 8 and all(len(c["consumes"]) == 6 for c in contracts)
+    assert [n for n in report.notes if "64 reads between them (the most is 50)" in n]
+    monkeypatch.setattr(_proposal, "MAX_FANOUT", 30)  # 8 products x 5 reads = 40: too many
     with pytest.raises(FluidUserError) as refused:
         propose(tmp_path)
     assert "too much to propose" in refused.value.what
-    assert "64 reads between them (the most is 50)" in refused.value.why
+    assert "64 reads between them (the most is 30)" in refused.value.why
     contracts, _ = propose(tmp_path, split_by="job")  # one product: 8 reads
     assert len(contracts) == 1 and len(contracts[0]["consumes"]) == 8
 
@@ -679,7 +685,8 @@ def test_the_reads_a_proposal_goes_through_are_counted_too(tmp_path, monkeypatch
     from fluid_build.cli.import_workflow import _proposal
 
     monkeypatch.chdir(tmp_path)
-    body = "\n".join(f'spark.table("t{i}").write.saveAsTable("o{i}")' for i in range(8))
+    body = "\n".join(f'spark.table("t{i}")' for i in range(8))
+    body += "\n" + "\n".join(f'combine(spark).write.saveAsTable("o{i}")' for i in range(8))
     write(tmp_path, {"jobs/fan.py": body + "\n"})
     monkeypatch.setattr(_proposal, "MAX_READ_VISITS", 50)  # 8 products x 8 reads = 64
     with pytest.raises(FluidUserError) as refused:
