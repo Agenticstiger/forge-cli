@@ -154,6 +154,40 @@ def test_a_keyword_string_shows_only_its_host_part(text):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "text",
+    [
+        "user=u password='abc host=hunter3' dbname=d",  # pragma: allowlist secret
+        "Pwd=x host=hunter3",  # pragma: allowlist secret
+        "Uid=u;Pwd={a;Server=hunter3};Database=d",  # pragma: allowlist secret
+        "AccountKey=abc server=hunter3;Database=d",  # pragma: allowlist secret
+        "password=a;host=hunter3 dbname=d",  # pragma: allowlist secret
+        "user=u password=abc\\ host=hunter3",  # pragma: allowlist secret
+    ],
+)
+def test_a_keyword_string_never_shows_part_of_a_password(text):
+    with pytest.raises(AcquisitionSecretPolicyError) as info:
+        refuse_unless_allowed("env://PG", connection={"connection_string": text}, environ={})
+    assert "hunter3" not in str(info.value)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"host={REMOTE} port=5432 password=x",  # pragma: allowlist secret
+        f"Driver={{ODBC Driver 18}};Server=tcp:{REMOTE},1433;Uid=u;Pwd=x",  # pragma: allowlist secret
+        f"App=x host=y;Server={REMOTE};Pwd=p",  # pragma: allowlist secret
+        f"host='{REMOTE}' dbname=d",
+    ],
+)
+def test_a_keyword_string_shows_the_host_its_grammar_reads(text):
+    with pytest.raises(AcquisitionSecretPolicyError) as info:
+        refuse_unless_allowed("env://PG", connection={"connection_string": text}, environ={})
+    assert f"naming host {REMOTE!r}" in info.value.what
+
+
+@pytest.mark.unit
 def test_a_keyword_string_without_a_host_key_shows_no_part_of_it():
     text = "Database=d;Password=hunter2"
     with pytest.raises(AcquisitionSecretPolicyError) as info:

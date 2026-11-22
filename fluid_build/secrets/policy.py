@@ -1188,34 +1188,106 @@ def _any_host_fix(parsed: SecretRef) -> str:
 
 
 #: The keys a keyword connection string names its host with: libpq's
-#: ``host=... dbname=...`` and ADO.NET's or ODBC's ``Server=...;Database=...``
-#: (``Data Source=tcp:host,1433``). The value runs to the next ``;`` or blank,
-#: a whole ``{{ env.NAME }}`` placeholder included. The key is found by a
-#: look-behind rather than by consuming the blanks before it, so a long run of
-#: blanks costs linear time.
-_KEYWORD_HOST = re.compile(
-    r"(?<![^;\s])(?:host|hostaddr|server|address|addr|network\s+address|data\s+source)"
-    r"\s*=\s*((?:\{\{[^{}]*\}\}|[^;\s])+)",
-    re.IGNORECASE,
+#: The keys whose value a keyword connection string connects to, as
+#: :func:`_keyword_pairs` spells them: libpq's, ADO.NET's and ODBC's
+#: (``Data Source=tcp:host,1433``).
+_KEYWORD_HOST_KEYS = frozenset(
+    {"host", "hostaddr", "server", "address", "addr", "network address", "data source"}
 )
+#: A key whose value may be a secret. A keyword string's host is looked for only
+#: before the first one, since what follows it may be read as part of its value.
+_SECRET_KEY = re.compile(r"pass|pwd|secret|key|token|signature|credential")
+#: One key and its ``=``: words separated by blanks, so a long run of blanks
+#: costs linear time.
+_KEYWORD_KEY = re.compile(r"\s*([A-Za-z][A-Za-z0-9_]*(?:[ \t]+[A-Za-z0-9_]+)*)\s*=\s*")
 #: What a refusal may quote as a host: a name, an address, a port, a placeholder.
 _QUOTABLE_HOST = re.compile(r"(?:\{\{\s*env\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}|[A-Za-z0-9._%:\[\]\-])+")
 
 
 def _keyword_host(text: str) -> Optional[str]:
-    """The host part of keyword connection string ``text``, or ``None`` when it names none.
+    """The host part of keyword connection string ``text``, or ``None`` when it shows none.
 
-    Never anything else of the string: a password written beside the host stays
-    out of every message.
+    Never anything else of the string. The host is looked for only where the
+    string's own grammar reads a key (:func:`_keyword_pairs`), and only before
+    the first key that may hold a secret (:data:`_SECRET_KEY`), so a password
+    that holds ``host=...`` stays out of every message.
     """
-    match = _KEYWORD_HOST.search(text)
-    if match is None:
-        return None
-    host = match.group(1).strip("'\"")
-    if host[:4].lower() == "tcp:":
-        host = host[4:]
-    host = host.split(",")[0]
-    return host if _QUOTABLE_HOST.fullmatch(host) else None
+    for key, value in _keyword_pairs(text):
+        if key in _KEYWORD_HOST_KEYS:
+            host = _unquoted(value.strip())
+            if host[:4].lower() == "tcp:":
+                host = host[4:]
+            host = host.split(",")[0]
+            return host if _QUOTABLE_HOST.fullmatch(host) else None
+        if _SECRET_KEY.search(key.replace(" ", "")):
+            return None
+    return None
+
+
+def _keyword_pairs(text: str) -> Iterator[Tuple[str, str]]:
+    """Each ``key=value`` of keyword string ``text`` in order, its key in lower case.
+
+    With a ``;`` it reads as an ODBC or ADO.NET string, whose values end at a
+    ``;`` outside ``{...}``, ``"..."`` or ``'...'`` (a doubled closing character
+    stands for itself). Without one it reads as a libpq string, whose values end
+    at a blank outside ``'...'``, a ``\\`` escaping the next character
+    (``conninfo_parse``). A ``{{ env.NAME }}`` placeholder is part of a value.
+    Reading stops where no key follows.
+    """
+    odbc = ";" in text
+    index = 0
+    while True:
+        while index < len(text) and (text[index] == ";" or text[index].isspace()):
+            index += 1
+        match = _KEYWORD_KEY.match(text, index)
+        if match is None:
+            return
+        start = match.end()
+        index = _odbc_value_end(text, start) if odbc else _libpq_value_end(text, start)
+        yield " ".join(match.group(1).lower().split()), text[start:index]
+
+
+def _libpq_value_end(text: str, index: int) -> int:
+    """Where the libpq value that starts at ``index`` ends."""
+    if text.startswith("'", index):
+        index += 1
+        while index < len(text) and text[index] != "'":
+            index += 2 if text[index] == "\\" else 1
+        return min(index + 1, len(text))
+    while index < len(text) and not text[index].isspace():
+        placeholder = _ENV_PLACEHOLDER.match(text, index)
+        if placeholder:
+            index = placeholder.end()
+        else:
+            index += 2 if text[index] == "\\" else 1
+    return min(index, len(text))
+
+
+def _odbc_value_end(text: str, index: int) -> int:
+    """Where the ODBC or ADO.NET value that starts at ``index`` ends."""
+    while index < len(text) and text[index] != ";":
+        placeholder = _ENV_PLACEHOLDER.match(text, index)
+        if placeholder:
+            index = placeholder.end()
+        elif text[index] in "{\"'":
+            close = "}" if text[index] == "{" else text[index]
+            index += 1
+            while index < len(text) and (
+                text[index] != close or text[index + 1 : index + 2] == close
+            ):
+                index += 2 if text[index] == close else 1
+            index += 1
+        else:
+            index += 1
+    return min(index, len(text))
+
+
+def _unquoted(value: str) -> str:
+    """``value`` without one pair of quotes or braces around it; a placeholder stays whole."""
+    pairs = (("'", "'"), ('"', '"'), ("{", "}"))
+    if len(value) >= 2 and (value[0], value[-1]) in pairs and not _ENV_PLACEHOLDER.fullmatch(value):
+        return value[1:-1]
+    return value
 
 
 #: Every string the running contract wrote, before ``fluid apply`` rendered its
