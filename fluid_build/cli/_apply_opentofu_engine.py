@@ -276,7 +276,7 @@ def _plan_holding_adopted_tables(
     changes = runner.change_summary(again)
     cprint(
         f"  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']} "
-        "(made again, leaving the adopted Iceberg tables as they are)"
+        "(again: adopted Iceberg tables left as they are)"
     )
     shown = runner.tofu_show_plan(eng.workdir, plan_file=_WORKDIR_PLAN, env=eng.env)
     _table_adoption.check_held(shown, adoption)
