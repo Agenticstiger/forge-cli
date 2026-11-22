@@ -77,7 +77,7 @@ MAX_ROOT_NAMES = 12
 MAX_NAME_PARTS = 24
 #: Names a dotted name starting with which is never a module of the scanned project: the standard
 #: library's and the frameworks the scanned code runs on.
-_NOT_THE_PROJECT = frozenset(sys.stdlib_module_names) | {"airflow", "pyspark"}
+NOT_THE_PROJECT = frozenset(sys.stdlib_module_names) | {"airflow", "pyspark"}
 #: Deepest expression :meth:`Folder.fold` follows, and the longest string it builds.
 MAX_FOLD_DEPTH = 40
 MAX_STRING = 4096
@@ -314,6 +314,10 @@ class Scope:
     #: Names bound by exactly one ``def`` here and in no other way: the function a call of the
     #: name runs.
     functions: Dict[str, ast.AST] = field(default_factory=dict)
+    #: Names bound by one ``def`` and one plain assignment outside any loop, in no other way
+    #: (``extract = PythonOperator(..., python_callable=extract)``), with the function and the
+    #: assigned value: between the two, and in that value, the name is the function.
+    shadowed_functions: Dict[str, Tuple[ast.AST, ast.expr]] = field(default_factory=dict)
 
 
 #: Called with no argument, these are the names of the module (or class) body they are in; inside a
@@ -767,6 +771,7 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
     #: The ``def`` statements of each name, and how many times each name is bound in all.
     defs: Dict[str, List[ast.AST]] = {}
     bindings: Dict[str, int] = {}
+    loops: List[ast.stmt] = []
 
     def block(name: str, why: str) -> None:
         other.add(name)
@@ -828,6 +833,7 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
                 for name in _target_names(node.target):
                     block(name, f"`{name}` is changed in place")
         elif isinstance(node, (ast.For, ast.AsyncFor)):
+            loops.append(node)
             for name in _target_names(node.target):
                 block(name, f"`{name}` is a loop variable")
             stack.extend(reversed(node.body + node.orelse))
@@ -838,6 +844,8 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
                         block(name, f"`{name}` is a context-manager result")
             stack.extend(reversed(node.body))
         elif isinstance(node, (ast.If, ast.While)):
+            if isinstance(node, ast.While):
+                loops.append(node)
             stack.extend(reversed(node.body + node.orelse))
         elif isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
             for handler in node.handlers:
@@ -874,7 +882,23 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
     # a parameter is bound once by the call; a def once by itself
     scope.rebound_parameters = {name for name in scope.parameters if bindings[name] > 1}
     scope.functions = {name: found[0] for name, found in defs.items() if bindings[name] == 1}
+    for name, written in defs.items():
+        values = plain.get(name, [])
+        if bindings[name] == 2 and len(values) == 1:  # the def and the assignment
+            function, value = written[0], values[0]
+            if not any(
+                node_position(loop) <= node_position(value) <= node_position(loop, end=True)
+                for loop in loops
+            ):
+                scope.shadowed_functions[name] = (function, value)
     return scope
+
+
+def node_position(node: ast.AST, end: bool = False) -> Tuple[int, int]:
+    """Where ``node`` starts (or ends) in its file, as ``(line, column)``."""
+    if end:
+        return (node.end_lineno or 0, node.end_col_offset or 0)  # type: ignore[attr-defined]
+    return (node.lineno, node.col_offset)  # type: ignore[attr-defined]
 
 
 # ── formatting, on this module's own code ─────────────────────────────
@@ -1065,6 +1089,10 @@ class ModuleIndex:
         #: The names of the scanned directory and the directories above it, nearest last (see
         #: :meth:`_below_the_import_root`).
         self._root_names: Tuple[str, ...] = ()
+        #: The module names only the importing file's own package vouches for, by ``(importing
+        #: file, name)``, with the file each is read as: another library of the same names would
+        #: be read in its place, so the report says each one.
+        self.own_package_names: Dict[Tuple[str, str], str] = {}
         for source in files:
             parts = source.rel[: -len(".py")].split("/")
             if not self._root_names:
@@ -1210,9 +1238,15 @@ class ModuleIndex:
         A name that fits neither is not guessed at (``teamx.weekly.settings`` from
         ``nightly/dag.py`` of a scan of a directory named otherwise), nor is one of more than
         :data:`MAX_NAME_PARTS` parts."""
-        if len(parts) > MAX_NAME_PARTS or parts[0] in _NOT_THE_PROJECT:
+        if len(parts) > MAX_NAME_PARTS or parts[0] in NOT_THE_PROJECT:
             return None
-        return self._in_own_package(parts, from_rel) or self._under_the_root_names(parts)
+        own = self._in_own_package(parts, from_rel)
+        if own is None:
+            return self._under_the_root_names(parts)
+        if self._under_the_root_names(parts) != own:  # the directories' names do not vouch for it
+            name = ".".join(parts[: len(parts) - len(own[1])])
+            self.own_package_names[(from_rel, name)] = own[0].rel
+        return own
 
     def _in_own_package(
         self, parts: Sequence[str], from_rel: str

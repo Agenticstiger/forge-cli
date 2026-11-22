@@ -276,6 +276,38 @@ def test_a_path_no_task_uses_and_a_drivers_directory_that_names_nothing_are_said
     assert "task(s) submit" not in old  # no task uses it: nothing is said to be left unjoined
 
 
+@pytest.mark.parametrize("run", [run_pyspark, run_airflow], ids=["pyspark", "airflow"])
+def test_a_path_too_long_for_the_system_names_nothing_and_is_said(tmp_path, monkeypatch, run):
+    """A name longer than a file system allows is no directory and no file: before Python 3.14,
+    asking whether it is one raises instead of answering."""
+    monkeypatch.chdir(tmp_path)
+    long_name = "x" * 300
+    lay_out(
+        tmp_path,
+        "repos/conventions.yaml",
+        f"spark-scripts/{long_name}",
+        f"dags/acme_config/{long_name}.py",
+    )
+    path = tmp_path / "repos" / "conventions.yaml"
+    conventions = yaml.safe_load(path.read_text("utf-8"))
+    conventions["drivers"] = [
+        {
+            "script": "driver.py",
+            "argument": "--job-list",
+            "job_lists": {"dir": f"spark-scripts/{long_name}", "file": "{value}.yaml"},
+            "jobs": {"dir": "spark-scripts/jobs", "file": "{job}.py"},
+        }
+    ]
+    path.write_text(yaml.safe_dump(conventions), encoding="utf-8")
+    _contracts, report = run("repos/conventions.yaml")
+    lines = [x for x in report.unsupported if "no such" in x]
+    assert [x.split(" in conventions.yaml")[0] for x in sorted(lines)] == [
+        "config_modules `acme_config.settings`",
+        "drivers[0].job_lists.dir",
+        "script_roots `s3://acme-code/jobs/`",
+    ]
+
+
 def test_the_directories_named_are_the_one_scanned_and_for_pyspark_the_dags_one():
     named = _pipeline._named_directories
     assert named("pyspark", "jobs", {"dags": "dags"}) == ["jobs", "dags"]

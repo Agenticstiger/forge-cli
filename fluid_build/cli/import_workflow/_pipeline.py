@@ -28,7 +28,16 @@ from ._proposal import (
 )
 from ._pysource import SourceBudget
 from ._redact import sensitive_name
-from ._scan import DagScan, JobScan, LinkedTask, budget_note, link_tasks, scan_dags, scan_jobs
+from ._scan import (
+    DagScan,
+    JobScan,
+    LinkedTask,
+    budget_note,
+    link_tasks,
+    path_is,
+    scan_dags,
+    scan_jobs,
+)
 from .registry import Importer, ImportReport
 
 DOC = "https://agenticstiger.github.io/forge_docs/cli/import.html"
@@ -122,7 +131,7 @@ def _referenced_roots(dag_scan: DagScan, conv: Conventions) -> List[Path]:
                     continue
                 for prefix, directory in conv.script_roots:
                     if submit.script.startswith(prefix):
-                        if directory.is_dir():
+                        if path_is(directory, True):
                             used.setdefault(directory, None)
                         break
     roots = sorted(used, key=lambda p: len(p.parts))
@@ -153,12 +162,8 @@ def _where_it_is(written: str, named: Sequence[Path], want_dir: bool) -> Optiona
             if above in seen:
                 continue
             seen[above] = None
-            candidate = above / written
-            try:
-                if candidate.is_dir() if want_dir else candidate.is_file():
-                    return above
-            except OSError:
-                continue
+            if path_is(above / written, want_dir):
+                return above
     return None
 
 
@@ -217,7 +222,7 @@ def _report_conventions_paths(
         )
 
     for prefix, directory in conv.script_roots:
-        if directory.is_dir():
+        if path_is(directory, True):
             continue
         tasks = list(uses.get(prefix, {}))
         consequence = ""
@@ -233,7 +238,7 @@ def _report_conventions_paths(
             line(f"script_roots `{safe_text(prefix, 120)}`", directory, True, consequence)
         )
     for module, path in conv.config_modules.items():
-        if not path.is_file():
+        if not path_is(path, False):
             report.unsupported.append(
                 line(
                     f"config_modules `{safe_text(module, 120)}`",
@@ -244,7 +249,7 @@ def _report_conventions_paths(
             )
     for index, driver in enumerate(conv.drivers):
         for what, directory in (("job_lists", driver.lists_dir), ("jobs", driver.jobs_dir)):
-            if not directory.is_dir():
+            if not path_is(directory, True):
                 report.unsupported.append(
                     line(
                         f"drivers[{index}].{what}.dir",
