@@ -164,6 +164,11 @@ def _add_apply_options(g: argparse._ArgumentGroup) -> None:
         help="Pass --adopt-tables to apply (take over existing tables that match).",
     )
     g.add_argument(
+        "--allow-iceberg-update",
+        action="store_true",
+        help="Pass --allow-iceberg-update to apply.",
+    )
+    g.add_argument(
         "--no-verify-digest",
         action="store_true",
         help="Pass --no-verify-plan-binding --no-verify-federation to apply.",
@@ -295,7 +300,7 @@ def _add_output_options(g: argparse._ArgumentGroup) -> None:
         "--ci-output",
         choices=_ci_output.MODES,
         default="auto",
-        help="Log grouping for the CI system (default: detect from the environment).",
+        help="Log grouping for the CI system, detected unless set.",
     )
     g.add_argument(
         "--report-dir",

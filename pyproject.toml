@@ -987,6 +987,10 @@ module = [
     "fluid_build.iac.adoption",
     "fluid_build.iac.providers.aws_adoption",
     "fluid_build.cli._apply_table_adoption",
+    # A live Iceberg table left as it is, never updated in place without the flag: which
+    # tables the plan holds, and the refusal of one it still updates.
+    "fluid_build.iac.table_hold",
+    "fluid_build.cli._apply_table_hold",
 ]
 strict = true
 

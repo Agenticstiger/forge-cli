@@ -640,6 +640,12 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
     mode_group.add_argument(
+        "--allow-iceberg-update",
+        action="store_true",
+        default=False,
+        help="Update live Iceberg tables in place (pause their writers first).",
+    )
+    mode_group.add_argument(
         "--adopt-shared-container",
         action="store_true",
         default=False,
@@ -672,7 +678,7 @@ def register(subparsers: argparse._SubParsersAction):
         "--no-verify-plan-binding",
         action="store_true",
         default=False,
-        help="Skip plan/bundle digest verification (DR escape hatch). Logged at WARNING for audit.",
+        help="Skip plan/bundle digest checks (DR escape hatch; logged at WARNING).",
     )
     mode_group.add_argument(
         "--no-verify-federation",

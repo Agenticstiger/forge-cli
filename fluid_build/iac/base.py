@@ -77,10 +77,13 @@ class IacProviderPlugin(Protocol):
     * ``table_names_no_product(values)``: whether a found table carries that marker but
       names no product (made before forge recorded the id), so the refusal names the
       one-time remedy of recording it. Optional.
-    * ``adoption_hold(declared)``: the attributes an adopted table keeps as it is in
-      the run that adopts it (its body in the module); the engine plans that table again
-      with them in ``ignore_changes`` and refuses a plan that still updates it in place.
-      ``()`` (or no capability) lets the adoption update it.
+    * ``update_hold(change, declared)``: a ``TableHold`` (``iac/table_hold.py``) for a
+      resource the saved plan updates in place that the run must leave as it is (a live
+      Iceberg table on AWS), whatever brought it into the plan: ``change`` is its
+      ``tofu show -json`` resource change, ``declared`` its body in the module. The engine
+      plans it again with the hold's attributes in ``ignore_changes`` and refuses a plan
+      that still updates it, unless ``--allow-iceberg-update``. ``None`` (or no
+      capability) lets the plan update it.
     * ``review_table_adoption(change, declared)``: ``(differences, updates)`` of
       one table the saved plan imports (a ``tofu show -json`` resource change,
       and the table's body in the module); any difference refuses the run.

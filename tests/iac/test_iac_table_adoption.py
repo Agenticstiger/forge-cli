@@ -648,18 +648,6 @@ def test_adoptable_tables_are_every_glue_table_the_contract_names_account_or_not
     }
 
 
-def test_an_iceberg_table_is_held_still_on_adoption_and_a_hive_table_is_not():
-    plugin = get_iac_plugin("aws")
-
-    assert plugin.adoption_hold(ICEBERG) == (
-        "description",
-        "owner",
-        "retention",
-        "storage_descriptor",
-    )
-    assert plugin.adoption_hold(PARQUET) == ()
-
-
 def test_the_rendered_import_block_carries_only_its_address_and_id():
     block = ImportBlock(to=ADDRESS, id="123456789012:sales:orders", table="sales.orders")
 

@@ -483,6 +483,26 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ["Run 'fluid plan <contract> --tofu --adopt-tables'"],
         None,
     ),
+    "iceberg_table_update_in_place": (
+        [
+            "Nothing was applied: the tables are as they were",
+            "Change the table through its Iceberg catalog (an ALTER TABLE in Spark or "
+            + "Athena): Iceberg's commit updates Glue with the version it read, so a "
+            + "concurrent commit fails instead of being reverted",
+            "Or change the contract to describe the table as it is",
+            "Or pause the table's writers and re-run with --allow-iceberg-update; for a "
+            + "saved plan, make it again with 'fluid plan <contract> --tofu' (it leaves the "
+            + "table as it is) or add --allow-iceberg-update there",
+        ],
+        None,
+    ),
+    "plan_allow_iceberg_update_needs_tofu": (
+        [
+            "Run 'fluid plan <contract> --tofu --allow-iceberg-update', or give the flag "
+            + "to the 'fluid apply' that plans again"
+        ],
+        None,
+    ),
     "opentofu_region_moved": (
         [
             "If the resources should stay where they are, set the binding's location.region "

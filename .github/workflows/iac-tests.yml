@@ -224,6 +224,16 @@ jobs:
             junit: glue-table-adoption-moto.xml
             require: |
               Glue table adoption moto=tests/iac/test_iac_aws_table_adoption_moto.py
+          # A live Iceberg table the plan would update in place is left as it is: whether
+          # the plan made again sends no UpdateTable (Glue's VersionId stays), with the
+          # state kept or lost, after an engine's commit, through a saved plan too, only a
+          # real plan against a real table proves.
+          - name: "Iceberg in-place update hold (tofu vs moto, creds-free)"
+            tests: tests/iac/test_iac_aws_iceberg_update_hold_moto.py
+            pytest-args: ""
+            junit: iceberg-update-hold-moto.xml
+            require: |
+              Iceberg update hold moto=tests/iac/test_iac_aws_iceberg_update_hold_moto.py
           # `fluid diff` refreshes the apply's OpenTofu state: a real apply,
           # then the refresh plan, against moto. Whether a clean apply reads as
           # no drift depends on what the provider reads back, so only a real

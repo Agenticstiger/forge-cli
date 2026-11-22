@@ -29,12 +29,17 @@ other storage setting. What holds no data and the contract may not declare (the
 description, the owner, a column comment, a type written with other spacing, a column
 name in another case) is an update the apply makes in place, reported, never refused. An attribute no rule names
 is a difference: the review fails closed.
+
+The same reading decides which tables the plan never updates in place
+(:func:`iceberg_update_hold`): a live Iceberg table, whatever brought it into the plan.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any, FrozenSet, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
+
+from fluid_build.iac.table_hold import TableHold
 
 _ICEBERG_FIELD = "iceberg.field."
 _ICEBERG_CURRENT = "iceberg.field.current"
@@ -81,20 +86,117 @@ _SERDE_REVIEWED = frozenset({"serialization_library", "parameters"})
 #: The longest piece of catalog text a message quotes.
 _MAX_SHOWN = 200
 
-#: What an adopted Iceberg table keeps as it is in the run that adopts it: every attribute
-#: the comparison lets differ. An in-place update of a live Iceberg table is an
-#: ``UpdateTable`` that hashicorp/aws sends without a ``VersionId``, after re-reading the
-#: table's ``metadata_location`` (``internal/service/glue/catalog_table.go``,
+#: What a live Iceberg table keeps as it is in a run that would update it in place: every
+#: attribute the plan can still change (``parameters`` and ``open_table_format_input``
+#: are already in the module's ``ignore_changes``). An in-place update of a live Iceberg
+#: table is an ``UpdateTable`` that hashicorp/aws sends without a ``VersionId``, after
+#: re-reading the table's ``metadata_location`` (``internal/service/glue/catalog_table.go``,
 #: ``resourceCatalogTableUpdate``), so a commit an engine makes in between could be lost.
-#: The adoption itself never opens that window: what the table holds of its own is
-#: reported, and left alone.
+#: The Glue columns and description are Iceberg's mirror of its own metadata anyway: each
+#: commit writes them again from the table's schema (``IcebergToGlueConverter``).
 ICEBERG_HELD = ("description", "owner", "retention", "storage_descriptor")
 
 
-def held_still(declared: Mapping[str, Any]) -> Tuple[str, ...]:
-    """The attributes an adopted table keeps as it is, as the module declares the table:
-    :data:`ICEBERG_HELD` for an Iceberg table, ``()`` for any other."""
-    return ICEBERG_HELD if "open_table_format_input" in declared else ()
+def iceberg_update_hold(
+    change: Mapping[str, Any], declared: Mapping[str, Any]
+) -> Optional[TableHold]:
+    """The hold on a Glue table the saved plan updates in place, when it is a live Iceberg
+    table: :data:`ICEBERG_HELD`, with what the contract wants of them. ``None`` for any
+    other table: a Hive table keeps its in-place updates (its catalog entry holds no
+    metadata pointer for a commit to move).
+
+    ``change`` is the table's ``change`` in the plan as ``tofu show -json`` prints it,
+    ``declared`` its body in the module (``aws._emit_glue``).
+    """
+    before = _mapping(change.get("before"))
+    why = live_iceberg(before, declared)
+    if not why:
+        return None
+    table = f"{_text(before.get('database_name'))}.{_text(before.get('name'))}"
+    return TableHold(
+        table=_say(table), attributes=ICEBERG_HELD, drift=tuple(held_drift(change)), why=why
+    )
+
+
+def live_iceberg(before: Mapping[str, Any], declared: Mapping[str, Any]) -> str:
+    """Why the table the plan read (``before``) is a live Iceberg table, or ``""``.
+
+    The provider hides the ``table_type`` and ``metadata_location`` of an ICEBERG table
+    (``flattenNonManagedParameters``) and never reads ``open_table_format_input`` back, so
+    this reads what the plan shows, as measured against moto:
+
+    * a ``table_type`` the provider did show, in any case;
+    * what an engine's commit leaves: Iceberg field ids on the columns, a metadata
+      location (:func:`_iceberg_evidence`);
+    * the Iceberg create the state recorded: ``open_table_format_input`` reaches the state
+      only from the create that made the table (``aws._add_iceberg_metadata``);
+    * the module's own Iceberg declaration, for a table forge made through Glue's Iceberg
+      create and re-attached by an import before any engine wrote to it, unless the table
+      has a Hive input format or SerDe: Iceberg's Glue catalog writes neither
+      (``IcebergToGlueConverter``), so such a table is a Hive one.
+    """
+    if _text(_mapping(before.get("parameters")).get("table_type")).upper() == "ICEBERG":
+        return "its table_type is ICEBERG"
+    why = _iceberg_evidence(before)
+    if why:
+        return why
+    if _normalised(before.get("open_table_format_input")) is not None:
+        return "the state records its Iceberg create"
+    if "open_table_format_input" in declared and not _hive_storage(before):
+        return "the contract declares it an Iceberg table, and forge made it one"
+    return ""
+
+
+def held_drift(change: Mapping[str, Any]) -> List[str]:
+    """What the contract wants of a held table's :data:`ICEBERG_HELD` attributes that the
+    table does not have, one line each: the table's value, then the contract's."""
+    before = _mapping(change.get("before"))
+    after = _mapping(change.get("after"))
+    unknown = _mapping(change.get("after_unknown"))
+    lines: List[str] = []
+    for attribute in ("description", "owner", "retention"):
+        if unknown.get(attribute) is True or _same(before.get(attribute), after.get(attribute)):
+            continue
+        lines.append(
+            f"{attribute}: {_show(before.get(attribute))} in the table, "
+            f"{_show(after.get(attribute))} in the contract"
+        )
+    live, planned, planned_unknown = _descriptor(before), _descriptor(after), _descriptor(unknown)
+    if planned_unknown.get("columns") is not True:
+        lines.extend(_column_drift(live, planned))
+    found, wanted = _text(live.get("location")), _text(planned.get("location"))
+    if planned_unknown.get("location") is not True and found != wanted:
+        lines.append(
+            f"location: {_say(found or 'none')} in the table, {_say(wanted or 'none')} in the "
+            "contract"
+        )
+    lines.extend(
+        _sweep(
+            live, planned, planned_unknown, frozenset({"columns", "location"}), "storage setting "
+        )
+    )
+    return lines
+
+
+def _column_drift(live_descriptor: Mapping[str, Any], planned: Mapping[str, Any]) -> List[str]:
+    """:func:`_column_changes` for the note on a held table: the table's value, then the
+    contract's (:data:`_DRIFT_WORDS`)."""
+    return [
+        _DRIFT_WORDS[kind](found, wanted)
+        for kind, found, wanted in _column_changes(live_descriptor, planned)
+    ]
+
+
+def _hive_storage(before: Mapping[str, Any]) -> bool:
+    """Does the table have the input format or SerDe Hive and Athena read a Hive table
+    through?"""
+    live = _descriptor(before)
+    serde = _block(live, "ser_de_info")
+    return bool(
+        _text(live.get("input_format"))
+        or _text(live.get("output_format"))
+        or _text(serde.get("serialization_library"))
+    )
 
 
 def review_glue_table(
@@ -172,59 +274,128 @@ def _review_columns(
     differences: List[str],
     updates: List[str],
 ) -> None:
+    for kind, found, wanted in _column_changes(live_descriptor, planned_descriptor):
+        if kind == "type" and _canonical(_type(found)) == _canonical(_type(wanted)):
+            updates.append(
+                f"writes the type of column {_say(_name(wanted))} as {_say(_type(wanted))} "
+                f"(the table spells it {_say(_type(found))})"
+            )
+            continue
+        refuses, words = _REVIEW_WORDS[kind]
+        (differences if refuses else updates).append(words(found, wanted))
+
+
+def _column_changes(
+    live_descriptor: Mapping[str, Any], planned_descriptor: Mapping[str, Any]
+) -> List[Tuple[str, Any, Any]]:
+    """Each way the table's columns differ from the contract's, as ``(kind, found,
+    wanted)``: ``missing`` and ``extra`` columns, then per contract column its ``name``
+    (case), ``type`` and ``comment``, then their ``order`` (both lists), and the columns of
+    older Iceberg schemas the table lists (``older``, ``found`` is the list). Columns are
+    matched by name whatever its case."""
     every = _columns(live_descriptor)
     live = [column for column in every if _current(column)]
     older = [column for column in every if not _current(column)]
-    planned = _columns(planned_descriptor)
     live_by = {_name(column).lower(): column for column in live}
-    planned_by = {_name(column).lower(): column for column in planned}
-
-    missing = [column for key, column in planned_by.items() if key not in live_by]
-    extra = [column for key, column in live_by.items() if key not in planned_by]
-    for column in missing:
-        differences.append(
-            f"column {_say(_name(column))} ({_say(_type(column))}): in the contract, "
-            "not in the table"
-        )
-    for column in extra:
-        differences.append(
-            f"column {_say(_name(column))} ({_say(_type(column))}): in the table, "
-            "not in the contract"
-        )
-    for key, wanted in planned_by.items():
+    wanted_by = {_name(column).lower(): column for column in _columns(planned_descriptor)}
+    changes: List[Tuple[str, Any, Any]] = [
+        ("missing", None, column) for key, column in wanted_by.items() if key not in live_by
+    ]
+    changes += [("extra", column, None) for key, column in live_by.items() if key not in wanted_by]
+    for key, wanted in wanted_by.items():
         found = live_by.get(key)
         if found is None:
             continue
-        name = _say(_name(wanted))
-        if _name(found) != _name(wanted):
-            # Glue, Hive and Athena resolve a column's name whatever its case.
-            updates.append(f"writes the name of column {_say(_name(found))} as {name}")
-        if _canonical(_type(found)) != _canonical(_type(wanted)):
-            differences.append(
-                f"column {name}: {_say(_type(found))} in the table, "
-                f"{_say(_type(wanted))} in the contract"
-            )
-        elif _type(found) != _type(wanted):
-            updates.append(
-                f"writes the type of column {name} as {_say(_type(wanted))} (the table "
-                f"spells it {_say(_type(found))})"
-            )
-        if _text(found.get("comment")) != _text(wanted.get("comment")):
-            updates.append(f"sets the comment of column {name}")
-    if not missing and not extra and list(live_by) != list(planned_by):
-        differences.append(
-            "column order: the table has ("
-            + ", ".join(_say(_name(column)) for column in live)
-            + "), the contract ("
-            + ", ".join(_say(_name(column)) for column in planned)
-            + ")"
-        )
+        for kind, same in (
+            ("name", _name(found) == _name(wanted)),
+            ("type", _type(found) == _type(wanted)),
+            ("comment", _text(found.get("comment")) == _text(wanted.get("comment"))),
+        ):
+            if not same:
+                changes.append((kind, found, wanted))
+    if set(live_by) == set(wanted_by) and list(live_by) != list(wanted_by):
+        changes.append(("order", live, _columns(planned_descriptor)))
     if older:
-        updates.append(
-            "drops from Glue the columns of older Iceberg schemas it lists ("
-            + ", ".join(_say(_name(column)) for column in older)
-            + "); Iceberg lists them again at its next commit"
-        )
+        changes.append(("older", older, None))
+    return changes
+
+
+def _column(column: Mapping[str, Any]) -> str:
+    return f"{_say(_name(column))} ({_say(_type(column))})"
+
+
+def _names(columns: Any) -> str:
+    return "(" + ", ".join(_say(_name(column)) for column in columns) + ")"
+
+
+def _missing(_found: Any, wanted: Any) -> str:
+    return f"column {_column(wanted)}: in the contract, not in the table"
+
+
+def _extra(found: Any, _wanted: Any) -> str:
+    return f"column {_column(found)}: in the table, not in the contract"
+
+
+def _retyped(found: Any, wanted: Any) -> str:
+    return (
+        f"column {_say(_name(wanted))}: {_say(_type(found))} in the table, "
+        f"{_say(_type(wanted))} in the contract"
+    )
+
+
+_Words = Callable[[Any, Any], str]
+
+#: The adoption review's words for each column change (:func:`_column_changes`), and
+#: whether it refuses the adoption (a difference) or is made in place (an update). A type
+#: written with other spacing is an update of its own (:func:`_review_columns`).
+_REVIEW_WORDS: Dict[str, Tuple[bool, _Words]] = {
+    "missing": (True, _missing),
+    "extra": (True, _extra),
+    # Glue, Hive and Athena resolve a column's name whatever its case.
+    "name": (
+        False,
+        lambda found, wanted: (
+            f"writes the name of column {_say(_name(found))} as {_say(_name(wanted))}"
+        ),
+    ),
+    "type": (True, _retyped),
+    "comment": (False, lambda _found, wanted: f"sets the comment of column {_say(_name(wanted))}"),
+    "order": (
+        True,
+        lambda found, wanted: (
+            f"column order: the table has {_names(found)}, the contract {_names(wanted)}"
+        ),
+    ),
+    "older": (
+        False,
+        lambda found, _wanted: (
+            f"drops from Glue the columns of older Iceberg schemas it lists {_names(found)}; "
+            "Iceberg lists them again at its next commit"
+        ),
+    ),
+}
+
+#: The note's words for each column change of a held table: the table's value, then the
+#: contract's.
+_DRIFT_WORDS: Dict[str, _Words] = {
+    "missing": _missing,
+    "extra": _extra,
+    "name": lambda found, wanted: (
+        f"column {_say(_name(found))}: written {_say(_name(wanted))} in the contract"
+    ),
+    "type": _retyped,
+    "comment": lambda found, wanted: (
+        f"comment of column {_say(_name(wanted))}: {_show(found.get('comment'))} in the "
+        f"table, {_show(wanted.get('comment'))} in the contract"
+    ),
+    "order": lambda found, wanted: (
+        f"column order: {_names(found)} in the table, {_names(wanted)} in the contract"
+    ),
+    "older": lambda found, _wanted: (
+        f"columns of older Iceberg schemas {_names(found)}: listed by the table, not by the "
+        "contract (Iceberg keeps listing them)"
+    ),
+}
 
 
 def _current(column: Mapping[str, Any]) -> bool:
