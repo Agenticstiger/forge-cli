@@ -72,7 +72,7 @@ def check_import_flags(args, tool: Optional[str]) -> None:
     ):
         raise _flag_refusal(
             f"--split-by {split} applies to `fluid import airflow` and `fluid import pyspark`",
-            f"{split} splits by what code writes (a table, a job file, a DAG); "
+            f"{split} splits by what code writes (a table, a job file, a DAG, a DAG task); "
             + (
                 "the directory scan has no such thing."
                 if tool is None

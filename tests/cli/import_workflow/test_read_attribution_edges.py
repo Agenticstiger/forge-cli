@@ -294,6 +294,130 @@ def test_a_frame_made_by_sql_that_does_not_fold_leaves_its_write_loose(tmp_path,
     assert got == {"mart.y": ["raw.b", "raw.d"], "mart.z": ["raw.c"]}
 
 
+# ── a DataFrame given to a method that takes one ────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "use",
+    [
+        "spark.table('raw.a').lateralJoin(extra)",
+        "spark.table('raw.a').join(extra, 'k')",
+        "spark.table('raw.a').where(extra.exists())",
+        "spark.table('raw.a').where(F.col('k') == extra.scalar())",
+        "spark.table('raw.a').select(extra.asTable())",
+    ],
+)
+def test_a_dataframe_that_a_parameter_brings_is_data_for_the_methods_that_take_one(
+    tmp_path, monkeypatch, use
+):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        f"""
+        def build(extra):
+            out = {use}
+            out.write.saveAsTable("mart.m")
+            spark.table("raw.c").write.saveAsTable("mart.n")
+
+
+        build(spark.read.parquet("s3://b/raw/b"))
+        """,
+    )
+    # the frame comes from the caller: the product lists what no write owns, which has its reads
+    assert "b.raw.b" in got["mart.m"] and got["mart.n"] == ["raw.c"]
+
+
+def test_a_parameter_that_is_a_value_stays_a_value(tmp_path, monkeypatch):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        """
+        def build(n, column):
+            spark.table("raw.a").limit(n).select(column).write.saveAsTable("mart.m")
+            spark.table("raw.c").write.saveAsTable("mart.n")
+
+
+        build(10, "k")
+        """,
+    )
+    assert got == {"mart.m": ["raw.a"], "mart.n": ["raw.c"]}
+
+
+# ── a stream sink whose format is not a constant ────────────────────────────────────────
+
+
+def test_a_stream_sink_of_an_unknown_format_that_names_a_topic_is_still_a_write(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "jobs").mkdir()
+    (tmp_path / "jobs" / "j.py").write_text(
+        HEAD
+        + textwrap.dedent(
+            """
+            import os
+
+            FMT = os.environ["SINK_FORMAT"]
+            (
+                spark.readStream.table("raw.events")
+                .writeStream.format(FMT)
+                .option("kafka.bootstrap.servers", "broker:9092")
+                .option("topic", "orders_out")
+                .option("checkpointLocation", "/chk/x")
+                .start()
+            )
+            """
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    _contracts, report = PySparkImporter().import_to_contracts("jobs", options={})
+    # not dropped: the unresolved write is reported, as it was before the format was looked at
+    assert any("no path is given" in line for line in report.unsupported), report.unsupported
+
+
+@pytest.mark.parametrize("option", ["path", "table", "dbtable", "url", "kafka.bootstrap.servers"])
+def test_a_stream_sink_of_an_unknown_format_with_a_target_option_is_not_taken_for_a_memory_sink(
+    tmp_path, monkeypatch, option
+):
+    (tmp_path / "jobs").mkdir()
+    (tmp_path / "jobs" / "j.py").write_text(
+        HEAD
+        + textwrap.dedent(
+            f"""
+            import os
+
+            spark.readStream.table("raw.events").writeStream.format(os.environ["F"]).option(
+                "{option}", "x"
+            ).start()
+            """
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    _contracts, report = PySparkImporter().import_to_contracts("jobs", options={})
+    assert not any("taken for a memory or console sink" in line for line in report.notes)
+
+
+def test_a_stream_sink_of_an_unknown_format_with_no_target_is_taken_for_a_memory_sink_and_said(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "jobs").mkdir()
+    (tmp_path / "jobs" / "j.py").write_text(
+        HEAD
+        + textwrap.dedent(
+            """
+            import os
+
+            spark.readStream.table("raw.events").writeStream.format(os.environ["F"]).start()
+            """
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    _contracts, report = PySparkImporter().import_to_contracts("jobs", options={})
+    assert any("taken for a memory or console sink" in line for line in report.notes), report.notes
+
+
 # ── a sink the reader cannot follow, and the name of a memory sink given as an option ─────────
 
 AFTER_SINK = """

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import textwrap
+import types
 from typing import Dict, FrozenSet
 
 import pytest
@@ -315,6 +316,194 @@ def test_what_follows_a_break_in_its_block_is_not_reached():
         """
     )
     assert got == {"after": {0}}
+
+
+def test_a_break_runs_the_finally_it_leaves():
+    got = states(
+        """
+        w = base
+        for i in x:
+            try:
+                break
+            finally:
+                w = w.trigger(1)
+        use("after")
+        """
+    )
+    assert got == {"after": {0, 1}}  # no pass leaves 0; the break went through the finally
+
+
+def test_a_continue_runs_the_finally_it_leaves_and_the_next_pass_starts_after_it():
+    got = states(
+        """
+        w = base
+        for i in x:
+            use("top")
+            try:
+                continue
+            finally:
+                w = w.trigger(1)
+        use("after")
+        """
+    )
+    assert got == {"top": {0, 1}, "after": {0, 1}}
+
+
+def test_a_break_in_a_handler_runs_the_finally_too():
+    got = states(
+        """
+        w = base
+        for i in x:
+            try:
+                raise E
+            except E:
+                break
+            finally:
+                w = w.trigger(1)
+        use("after")
+        """
+    )
+    assert got == {"after": {0, 1}}  # no pass leaves 0; the break in the handler left 1
+
+
+def test_a_break_does_not_run_the_finally_of_a_try_around_its_loop():
+    got = states(
+        """
+        w = base
+        try:
+            for i in x:
+                break
+        finally:
+            w = w.trigger(1)
+        use("after")
+        """
+    )
+    assert got == {"after": {1}}
+
+
+def test_a_jump_through_two_finally_bodies_runs_both_innermost_first():
+    got = states(
+        """
+        w = base
+        for i in x:
+            try:
+                try:
+                    break
+                finally:
+                    w = w.trigger(1)
+            finally:
+                w = w.trigger(2)
+        use("after")
+        """
+    )
+    assert got == {"after": {0, 2}}
+
+
+def test_a_finally_that_ends_the_path_leaves_nothing_after_the_jump():
+    got = states(
+        """
+        w = base
+        for i in x:
+            w = w.trigger(1)
+            try:
+                break
+            finally:
+                return
+        use("after")
+        """
+    )
+    assert got == {"after": {0}}  # the break never gets out: only the loop that ran no pass
+
+
+def test_a_use_in_finally_has_what_a_handler_that_raises_set():
+    got = states(
+        """
+        w = base
+        try:
+            f()
+        except E:
+            w = w.trigger(1)
+            raise
+        finally:
+            use("final")
+        """
+    )
+    assert got == {"final": {0, 1}}
+
+
+def test_a_use_in_finally_has_what_the_else_set():
+    got = states(
+        """
+        w = base
+        try:
+            f()
+        except E:
+            pass
+        else:
+            w = w.trigger(1)
+        finally:
+            use("final")
+        """
+    )
+    assert got == {"final": {0, 1}}
+
+
+def test_what_a_body_sets_is_found_once_however_often_the_body_is_read(monkeypatch):
+    calls = []
+    real = _flow._nested
+
+    def counting(statement):
+        calls.append(statement)
+        return real(statement)
+
+    monkeypatch.setattr(_flow, "_nested", counting)
+    depth = 8
+    loops = "".join("    " * level + f"for i{level} in x:\n" for level in range(depth))
+    pad = "    " * depth
+    source = (
+        "w = base\n"
+        + loops
+        + f"{pad}try:\n{pad}    y = 1\n{pad}except E:\n{pad}    pass\n{pad}w = w.trigger(1)\n"
+        + 'use("after")\n'
+    )
+    assert states(source) == {"after": {0, 1}}
+    # the try is read 2 ** 8 times (a loop's body twice); what it holds is looked at once
+    assert len(calls) < 12, len(calls)
+
+
+def test_what_a_body_sets_is_found_among_statements_not_expressions(monkeypatch):
+    tree = ast.parse(
+        textwrap.dedent(
+            f"""
+            w = base
+            try:
+                y = [{", ".join("1" for _ in range(2_000))}]
+            except E:
+                pass
+            w = w.trigger(1)
+            use("after")
+            """
+        )
+    )
+    base, setter, use = tree.body[0], tree.body[2], tree.body[3]
+    flow = _flow.Flow(base, {id(setter): 1}, {id(use)})
+
+    def boom(*_):
+        raise AssertionError("the expressions of a statement are not walked")
+
+    # the flow's own view of ``ast``, not the module: the test runner reads source with it too
+    fake = types.SimpleNamespace(**{name: getattr(ast, name) for name in dir(ast)})
+    fake.walk = boom
+    monkeypatch.setattr(_flow, "ast", fake)
+    flow.run(tree.body)
+    assert flow.before[id(use)] == {1} and flow.visits < 20
+
+
+def test_a_body_whose_statements_cost_too_much_to_look_at_is_not_read(monkeypatch):
+    monkeypatch.setattr(_flow, "MAX_VISITS", 30)
+    source = "w = base\ntry:\n" + "    pass\n" * 40 + "except E:\n    pass\nuse('after')\n"
+    with pytest.raises(_flow.TooMuch):
+        states(source)
 
 
 def test_a_break_skips_the_else_of_its_loop():

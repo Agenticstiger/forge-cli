@@ -104,8 +104,13 @@ _PLAIN_TABLE = re.compile(r"[A-Za-z0-9_$`.\-]+")
 #: DataFrame methods that take another DataFrame, so a name given to them is data, not a value.
 _FRAME_METHODS = frozenset(
     {"join", "crossJoin", "union", "unionAll", "unionByName", "intersect", "intersectAll"}
-    | {"subtract", "exceptAll", "broadcast", "createDataFrame", "sql"}
+    | {"subtract", "exceptAll", "broadcast", "createDataFrame", "sql", "lateralJoin"}
 )
+#: Methods (Spark 4) called ON a DataFrame to make a value from it: a subquery. What they are
+#: called on is data, not a value.
+_FRAME_RECEIVERS = frozenset({"exists", "scalar", "asTable"})
+#: Options that name where a stream sink writes (lower case, as :meth:`_Reader._options` has them).
+_SINK_TARGETS = frozenset({"path", "topic", "table", "dbtable", "url", "kafka.bootstrap.servers"})
 #: Methods that run a function over the rows: what the function reads is not known.
 _FUNCTION_METHODS = frozenset(
     {"transform", "mapInPandas", "mapInArrow", "applyInPandas", "cogroup", "foreach"}
@@ -1402,10 +1407,13 @@ class _Reader:
         options, fmt = self._options(own[:-1])
         mode = None
         triggers: Dict[int, str] = {}  # by branch; the last one of a branch wins
+        #: A trigger set after every branch (where the writer is used): it replaces what they set.
+        late: Optional[str] = None
+        after = max((i for i, link in enumerate(own[:-1]) if link.branch), default=-1)
         query_name = None
         output_mode = None
         foreach: Optional[ast.expr] = None
-        for link in own[:-1]:
+        for position, link in enumerate(own[:-1]):
             if link.call is None:
                 continue
             args = link.call.args
@@ -1419,11 +1427,13 @@ class _Reader:
                 found = self._trigger(link.call)
                 if found:
                     triggers[link.branch] = found
+                if position > after >= 0:
+                    late = found or "default"
             elif link.name == "foreachBatch" and args:
                 foreach = args[0]
             elif link.name == "foreach":
                 fmt = fmt or "foreach"
-        trigger = self._trigger_of_write(call, own, triggers) if streaming else None
+        trigger = self._trigger_of_write(call, own, triggers, late) if streaming else None
         name = terminal.name
         kwargs = {kw.arg: kw.value for kw in call.keywords if kw.arg}
         checkpoint = self._checkpoint(options, kwargs)
@@ -1452,10 +1462,17 @@ class _Reader:
             and name == "start"
             and not self._sink_format(call, own[:-1])[1]
             and self._arg(call, 0, "path") is None
-            and "path" not in options
+            and not _SINK_TARGETS.intersection(options)
         ):
-            # a format that is not a constant and nothing to write to: as far as the code says, a
-            # memory, console or foreach sink. Nothing persistent, so the reads stay unowned
+            # a format that is not a constant and nothing to write to (no path, topic, table or
+            # url): as far as the code says, a memory, console or foreach sink. Nothing
+            # persistent, so the reads stay unowned
+            note = (
+                f"{self.file}:{call.lineno} writes a stream whose format is not a constant and "
+                "that names no path, topic or table: it is taken for a memory or console sink"
+            )
+            if note not in self.facts.remarks and len(self.facts.remarks) < MAX_NOTES_PER_JOB:
+                self.facts.remarks.append(note)
             return
         if fmt in _NON_PERSISTENT:
             return
@@ -1547,13 +1564,20 @@ class _Reader:
         return f"(not a constant: {value.why})" if isinstance(value, Unresolved) else None
 
     def _trigger_of_write(
-        self, call: ast.Call, own: Sequence[_Link], triggers: Mapping[int, str]
+        self,
+        call: ast.Call,
+        own: Sequence[_Link],
+        triggers: Mapping[int, str],
+        late: Optional[str] = None,
     ) -> Optional[str]:
         """The trigger of a stream. When the code picks it by a branch (``if a: w = w.trigger(x)``
         ``else: w = w.trigger(y)``) it is every one that can apply, joined by
         :data:`TRIGGER_SEPARATOR`: the path through no branch counts too (the trigger set before
         it, else Spark's default) unless every path goes through one. A stream that may keep
-        running is then not taken for a one-shot."""
+        running is then not taken for a one-shot. A trigger set after the branches (``w.trigger(
+        availableNow=True).toTable(...)``) is the one the stream has, whichever branch ran."""
+        if late is not None:
+            return late
         if not triggers:
             return None
         branches = sorted({link.branch for link in own if link.branch})
@@ -1683,7 +1707,9 @@ class _Reader:
                 if isinstance(func, ast.Attribute):
                     if func.attr in _FUNCTION_METHODS:
                         return False
-                    ok = walk(func.value, depth, shared, scalar)
+                    ok = walk(
+                        func.value, depth, shared, scalar and func.attr not in _FRAME_RECEIVERS
+                    )
                     inner = scalar or func.attr not in _FRAME_METHODS
                 elif isinstance(func, ast.Name):
                     callee = (qualified_name(func, self.module.imports) or func.id).rsplit(".", 1)[

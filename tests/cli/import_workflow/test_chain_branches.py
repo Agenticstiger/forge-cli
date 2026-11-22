@@ -562,6 +562,62 @@ writer.toTable("glue.a.t")
     )
 
 
+def test_a_trigger_set_where_the_writer_is_used_replaces_every_alternative():
+    got = triggers(
+        """
+if a:
+    writer = writer.trigger(processingTime="1 minute")
+else:
+    writer = writer.trigger(processingTime="5 minutes")
+writer.trigger(availableNow=True).toTable("glue.a.t")
+"""
+    )
+    assert got == ["availableNow"]
+
+
+def test_a_trigger_set_where_the_writer_is_used_and_not_read_is_the_default():
+    got = triggers(
+        """
+if a:
+    writer = writer.trigger(availableNow=True)
+else:
+    writer = writer.trigger(processingTime="1 minute")
+writer.trigger(**options).toTable("glue.a.t")
+"""
+    )
+    assert got == ["default"]
+
+
+def test_a_trigger_set_before_the_branches_is_replaced_by_the_one_of_the_branch():
+    got = triggers(
+        """
+writer = writer.trigger(once=True)
+if a:
+    writer = writer.trigger(availableNow=True)
+else:
+    writer = writer.trigger(processingTime="1 minute")
+writer.toTable("glue.a.t")
+"""
+    )
+    assert sorted(got) == ["availableNow", "processingTime=1 minute"]
+
+
+def test_a_trigger_set_in_the_finally_of_a_try_that_a_break_leaves_is_one_the_stream_may_have():
+    got = triggers(
+        """
+writer = writer.trigger(processingTime="1 minute")
+for attempt in retries:
+    try:
+        ok = True
+        break
+    finally:
+        writer = writer.trigger(availableNow=True)
+writer.toTable("glue.a.t")
+"""
+    )
+    assert sorted(got) == ["availableNow", "processingTime=1 minute"]
+
+
 def test_a_lambda_that_uses_the_variable_is_not_followed():
     facts = job(
         BASE

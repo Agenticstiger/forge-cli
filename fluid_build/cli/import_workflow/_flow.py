@@ -14,7 +14,8 @@ nothing it set, since it may not have run.
 Nothing runs. The statements of one body are read in order (``if``, ``for``, ``while``, ``try``,
 ``with``, ``match``; a loop's body twice, so that what the first pass leaves is what the second
 starts from), a path that ends in ``return``, ``raise``, ``break`` or ``continue`` ends, and what
-it held goes where the jump goes (the exit of the loop, the next pass). Only the statements from
+it held goes where the jump goes (the exit of the loop, the next pass), through the ``finally``
+bodies it leaves on the way. Only the statements from
 the one that starts the variable to the last that uses it are read, and the state is kept only
 before the statements that use it. The reading is bounded (:data:`MAX_VISITS` statements, no more
 than :data:`MAX_SOURCES` assignments at once); past it nothing is said, and the variable is not
@@ -57,6 +58,25 @@ def _join(left: State, right: State) -> State:
     return left | right
 
 
+def _nested(statement: ast.stmt) -> List[ast.stmt]:
+    """The statements nested in a compound ``statement``: not those of a function or a class
+    defined in it, which are other scopes."""
+    if isinstance(statement, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+        return [*statement.body, *statement.orelse]
+    if isinstance(statement, _TRY_NODES):
+        return [
+            *statement.body,  # type: ignore[attr-defined]
+            *(s for handler in statement.handlers for s in handler.body),  # type: ignore[attr-defined]
+            *statement.orelse,  # type: ignore[attr-defined]
+            *statement.finalbody,  # type: ignore[attr-defined]
+        ]
+    if isinstance(statement, (ast.With, ast.AsyncWith)):
+        return list(statement.body)
+    if type(statement).__name__ == "Match":
+        return [s for case in statement.cases for s in case.body]  # type: ignore[attr-defined]
+    return []
+
+
 def _may_swallow(expression: ast.expr) -> bool:
     if not isinstance(expression, ast.Call):
         return False
@@ -69,11 +89,14 @@ class _Loop:
     """What a loop's body leaves at its jumps: at each ``break`` (the exit of the loop) and each
     ``continue`` (the end of a pass)."""
 
-    __slots__ = ("breaks", "continues")
+    __slots__ = ("breaks", "continues", "finals")
 
-    def __init__(self) -> None:
+    def __init__(self, finals: int) -> None:
         self.breaks: FrozenSet[int] = _EMPTY
         self.continues: FrozenSet[int] = _EMPTY
+        #: How many ``finally`` bodies were open when the loop began: a jump out of the loop runs
+        #: the ones opened since.
+        self.finals = finals
 
 
 class Flow:
@@ -87,6 +110,10 @@ class Flow:
         self._setters = setters
         self._uses = uses
         self._loops: List[_Loop] = []
+        #: The ``finally`` bodies of the ``try`` statements being read, the innermost last.
+        self._finals: List[Sequence[ast.stmt]] = []
+        #: The numbers of the assignments in a body, by the body: made once, whatever state asks.
+        self._numbers: Dict[int, FrozenSet[int]] = {}
         #: Statements read, for the caller's budget.
         self.visits = 0
         #: ``id(statement) -> the numbers that can be the last when the statement starts``, for a
@@ -138,15 +165,19 @@ class Flow:
             return None
         if isinstance(statement, (ast.Break, ast.Continue)) and self._loops:
             loop = self._loops[-1]
-            if isinstance(statement, ast.Break):
-                loop.breaks = loop.breaks | state
-            else:
-                loop.continues = loop.continues | state
+            left: State = state
+            for final in reversed(self._finals[loop.finals :]):  # the ones this jump leaves
+                left = self._block(final, left)
+            if left is not None:
+                if isinstance(statement, ast.Break):
+                    loop.breaks = loop.breaks | left
+                else:
+                    loop.continues = loop.continues | left
             return None
         return state
 
     def _loop(self, loop: ast.stmt, state: FrozenSet[int]) -> State:
-        frame = _Loop()
+        frame = _Loop(len(self._finals))
         self._loops.append(frame)
         try:
             first = self._block(loop.body, state)  # type: ignore[attr-defined]
@@ -161,32 +192,57 @@ class Flow:
 
     def _try(self, statement: ast.stmt, state: FrozenSet[int]) -> State:
         body = statement.body  # type: ignore[attr-defined]
-        ended = self._block(body, state)
-        # an exception can come after any statement of the body: a handler starts from whatever
-        # the body may have set, or from nothing of it
-        anywhere = state | self._numbers_in(body)
-        handled: State = None
-        for handler in statement.handlers:  # type: ignore[attr-defined]
-            handled = _join(handled, self._block(handler.body, anywhere))
-        normal = ended
-        if ended is not None and statement.orelse:  # type: ignore[attr-defined]
-            normal = self._block(statement.orelse, ended)  # type: ignore[attr-defined]
-        normal = _join(normal, handled)
+        handlers = statement.handlers  # type: ignore[attr-defined]
+        orelse = statement.orelse  # type: ignore[attr-defined]
         final = statement.finalbody  # type: ignore[attr-defined]
+        if final:
+            self._finals.append(final)  # a jump out of the body, a handler or the else runs it
+        try:
+            ended = self._block(body, state)
+            # an exception can come after any statement of the body: a handler starts from
+            # whatever the body may have set, or from nothing of it
+            anywhere = state | self._numbers_in(body)
+            handled: State = None
+            for handler in handlers:
+                handled = _join(handled, self._block(handler.body, anywhere))
+            normal = ended
+            if ended is not None and orelse:
+                normal = self._block(orelse, ended)
+        finally:
+            if final:
+                self._finals.pop()
+        normal = _join(normal, handled)
         if not final:
             return normal
-        # ``finally`` also runs on the path that raised: a use in it can have had any of them
-        self._block(final, anywhere if normal is None else normal | anywhere)
+        # ``finally`` also runs on the path that raised, from the body or from a handler: a use
+        # in it can have had any of the assignments of the ``try``
+        raised = anywhere
+        for handler in handlers:
+            raised = raised | self._numbers_in(handler.body)
+        raised = raised | self._numbers_in(orelse)
+        self._block(final, raised if normal is None else normal | raised)
         return None if normal is None else self._block(final, normal)
 
     def _numbers_in(self, statements: Sequence[ast.stmt]) -> FrozenSet[int]:
-        """The numbers of the assignments that are among ``statements``, nested ones included."""
-        found = set()
-        for statement in statements:
-            for node in ast.walk(statement):
-                if id(node) == self._base:
-                    found.add(0)
-                number = self._setters.get(id(node))
+        """The numbers of the assignments that are among ``statements``, nested ones included.
+        It does not depend on the state, so it is made once for each body; and it goes through
+        the statements, not the expressions in them (an assignment is a statement), charging
+        what it reads to :attr:`visits` like the flow does."""
+        key = id(statements)
+        found = self._numbers.get(key)
+        if found is None:
+            numbers = set()
+            stack = list(statements)
+            while stack:
+                statement = stack.pop()
+                self.visits += 1
+                if self.visits > MAX_VISITS:
+                    raise TooMuch
+                if id(statement) == self._base:
+                    numbers.add(0)
+                number = self._setters.get(id(statement))
                 if number is not None:
-                    found.add(number)
-        return frozenset(found)
+                    numbers.add(number)
+                stack.extend(_nested(statement))
+            found = self._numbers[key] = frozenset(numbers)
+        return found
