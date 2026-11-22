@@ -133,6 +133,11 @@ def test_a_full_file(tmp_path):
         ("config_modules: [{module: 'a b', path: x}]", "not an acceptable name"),
         ("environment: nope", "is not named under environments"),
         ("environments: {a: {X: 1}, b: {X: 2}}", "name the one to use"),
+        ("environments: {a: {X: }}", 'write ""'),
+        ("environments: {a: {X: null}}", 'write ""'),
+        ("environments: {a: {X: [1]}}", 'write ""'),
+        ("environments: {a: {X: {y: 1}}}", 'write ""'),
+        ("environments: {a: {'not a name': x}}", "not an acceptable name"),
         ("defaults: {unknown: 1}", "unknown key"),
         ("defaults: {platform: mars}", "is not one of"),
         ("catalogs: {x: {platform: mars}}", "is not one of"),
@@ -261,6 +266,171 @@ def test_paths_inside_the_directory_are_kept(tmp_path):
     root = tmp_path.resolve()
     assert dict(conv.script_roots) == {"s3://c/": root / "jobs", "s3://d/": root / "deep" / "jobs"}
     assert conv.config_modules == {"m.settings": root / "libs" / "settings.py"}
+
+
+# ── the directories named on the command line ──
+
+
+def beside(tmp_path: Path) -> Path:
+    """``config/`` and two repositories next to each other; returns ``config/``."""
+    for name in ("config", "spark-scripts", "dags", "elsewhere"):
+        (tmp_path / name).mkdir(exist_ok=True)
+    return tmp_path / "config"
+
+
+def load_beside(tmp_path: Path, text: str, *named: str) -> C.Conventions:
+    """The conventions in ``config/``, read as if ``named`` (names beside it) were the
+    directories given on the command line."""
+    return C.load_conventions(
+        write(beside(tmp_path), text), roots=[tmp_path / name for name in named]
+    )
+
+
+def test_a_path_may_reach_into_a_directory_named_on_the_command_line(tmp_path):
+    conv = load_beside(
+        tmp_path,
+        """
+        script_roots: {"s3://c/": ../spark-scripts, "s3://d/": "../dags/jobs/../jobs", "s3://e/": here}
+        config_modules: [{module: m.settings, path: ../dags/libs/settings.py}]
+        """,
+        "spark-scripts",
+        "dags",
+    )
+    root = tmp_path.resolve()
+    assert dict(conv.script_roots) == {
+        "s3://c/": root / "spark-scripts",  # the directory itself
+        "s3://d/": root / "dags" / "jobs",
+        "s3://e/": root / "config" / "here",  # the file's own folder still counts
+    }
+    assert conv.config_modules == {"m.settings": root / "dags" / "libs" / "settings.py"}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../elsewhere",  # a sibling nobody named
+        "../spark-scripts-old",  # a name that only starts like a named one
+        "..",  # the directory above the named ones
+        "../dags/../elsewhere",  # into a named directory, then out of it
+        "../../outside",  # past the directory they sit in
+        "/etc",  # an absolute path somewhere else
+    ],
+)
+def test_a_path_outside_the_file_and_the_named_directories_is_refused(tmp_path, path):
+    (tmp_path / "spark-scripts-old").mkdir()
+    with pytest.raises(FluidUserError) as refused:
+        load_beside(tmp_path, f'script_roots: {{"s3://c/": "{path}"}}', "spark-scripts", "dags")
+    assert "leaves the directory of the conventions file" in refused.value.why, refused.value.why
+    assert refused.value.extras == {"conventions": "conventions.yaml"}
+
+
+def test_a_config_module_outside_the_named_directories_is_refused_too(tmp_path):
+    with pytest.raises(FluidUserError) as refused:
+        load_beside(
+            tmp_path,
+            "config_modules: [{module: m.settings, path: ../elsewhere/settings.py}]",
+            "spark-scripts",
+        )
+    assert "config_modules[0].path" in refused.value.why
+
+
+def test_without_named_directories_the_file_keeps_to_its_own_folder(tmp_path):
+    with pytest.raises(FluidUserError) as refused:
+        load_beside(tmp_path, 'script_roots: {"s3://c/": ../spark-scripts}')
+    assert "leaves the directory of the conventions file" in refused.value.why
+
+
+def test_a_link_inside_a_named_directory_that_points_out_is_refused(tmp_path):
+    folder = beside(tmp_path)
+    (tmp_path / "spark-scripts" / "jobs").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(FluidUserError) as refused:
+        C.load_conventions(
+            write(folder, 'script_roots: {"s3://c/": ../spark-scripts/jobs}'),
+            roots=[tmp_path / "spark-scripts"],
+        )
+    assert "leaves the directory of the conventions file" in refused.value.why
+
+
+def test_a_link_in_the_conventions_folder_that_points_into_a_named_directory_is_followed(tmp_path):
+    folder = beside(tmp_path)
+    (folder / "jobs").symlink_to(tmp_path / "spark-scripts")
+    conv = C.load_conventions(
+        write(folder, 'script_roots: {"s3://c/": jobs}'), roots=[tmp_path / "spark-scripts"]
+    )
+    assert dict(conv.script_roots) == {"s3://c/": tmp_path.resolve() / "spark-scripts"}
+
+
+def test_a_directory_named_through_a_link_is_the_directory_it_points_to(tmp_path):
+    folder = beside(tmp_path)
+    (tmp_path / "linked-scripts").symlink_to(tmp_path / "spark-scripts")
+    conv = C.load_conventions(
+        write(folder, 'script_roots: {"s3://c/": ../spark-scripts}'),
+        roots=[str(tmp_path / "linked-scripts")],  # the command line gives text
+    )
+    assert dict(conv.script_roots) == {"s3://c/": tmp_path.resolve() / "spark-scripts"}
+
+
+def test_a_named_directory_that_cannot_be_resolved_adds_nothing_and_stops_nothing(tmp_path):
+    folder = beside(tmp_path)
+    (tmp_path / "loop").symlink_to(tmp_path / "loop")  # a link loop
+    unusable = [tmp_path / "loop", "bad\0name"]  # and a name the system refuses
+    conv = C.load_conventions(write(folder, 'script_roots: {"s3://c/": here}'), roots=unusable)
+    assert dict(conv.script_roots) == {"s3://c/": tmp_path.resolve() / "config" / "here"}
+    with pytest.raises(FluidUserError) as refused:
+        C.load_conventions(write(folder, 'script_roots: {"s3://c/": ../elsewhere}'), roots=unusable)
+    assert "leaves the directory" in refused.value.why
+
+
+# ── an environment value ──
+
+
+@pytest.mark.parametrize(
+    "selected, expected",
+    [("prod", {"PREFIX": ""}), ("dev", {"PREFIX": "dev_"}), ("other", {"SUFFIX": "x"})],
+)
+def test_an_environment_value_may_be_empty_and_that_is_not_a_missing_one(
+    tmp_path, selected, expected
+):
+    conv = C.load_conventions(
+        write(
+            tmp_path,
+            f"""
+            environment: {selected}
+            environments:
+              prod: {{PREFIX: ""}}
+              dev: {{PREFIX: dev_}}
+              other: {{SUFFIX: x}}
+            """,
+        )
+    )
+    assert conv.environment == selected
+    assert dict(conv.variables) == expected
+    # named, even when empty, in prod and dev; not named in "other"
+    assert ("PREFIX" in conv.variables) == (selected != "other")
+
+
+def test_an_environment_value_is_kept_as_written(tmp_path):
+    conv = C.load_conventions(
+        write(
+            tmp_path,
+            "environments: {only: {A: ' a b ', N: 3, F: 1.5, Q: ' ', E: '', D: 2026-01-01}}",
+        )
+    )
+    assert dict(conv.variables) == {
+        "A": " a b ",
+        "N": "3",
+        "F": "1.5",
+        "Q": " ",
+        "E": "",
+        "D": "2026-01-01",  # YAML reads an unquoted date as one: it is the text it was written as
+    }
+
+
+def test_an_environment_value_is_bounded(tmp_path):
+    too_long = "environments: {only: {X: '" + "x" * (C.MAX_TEXT + 1) + "'}}"
+    assert f"longer than {C.MAX_TEXT} characters" in refusal(tmp_path, too_long).why
+    longest = "environments: {only: {X: '" + "x" * C.MAX_TEXT + "'}}"
+    assert C.load_conventions(write(tmp_path, longest)).variables == {"X": "x" * C.MAX_TEXT}
 
 
 def test_an_ignore_pattern_is_matched_against_a_bounded_text():

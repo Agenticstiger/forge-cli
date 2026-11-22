@@ -100,7 +100,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default), `job`, `dag`, `folder` and `project` for these importers. `--conventions <file>` holds
   the organisation's layout as data (script prefixes, data path prefixes, helper function names,
   config modules, environment names, owners, layers, what to ignore, the product id rule); it is
-  read strictly and no code in it runs. `--registry` reads a written topic's columns through the
+  read strictly and no code in it runs. A path in it may point into the file's own folder or into
+  a directory named on the command line (the jobs directory, `--dags`), checked after the path is
+  resolved, so the file can sit beside the repositories it describes (`config/conventions.yaml`);
+  an `environments` value may be empty (a table prefix that is empty in production), which is not
+  the same as a variable the file does not name. `--registry` reads a written topic's columns through the
   existing schema-registry importer, only when asked. Every proposal is checked against the
   schema before anything is written (a schema error stops the import), and `fluid validate`'s
   contract rules are run on it: what they find that no code can give (the columns, a Databricks

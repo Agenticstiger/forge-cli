@@ -98,6 +98,16 @@ def _directory(path: str, what: str, flag: str) -> Path:
     return directory
 
 
+def _named_directories(tool: str, source: str, options: Mapping[str, Any]) -> List[str]:
+    """The directories the user named on the command line, which a path in the conventions file
+    may reach into as well as the file's own: the one to scan and, for pyspark, ``--dags``. The
+    conventions are read before these are checked, so each is only a name here."""
+    named = [source]
+    if tool == "pyspark" and options.get("dags"):
+        named.append(str(options["dags"]))
+    return named
+
+
 def _referenced_roots(dag_scan: DagScan, conv: Conventions) -> Tuple[List[Path], List[str]]:
     """The local directories the DAGs' scripts live in, by the conventions' ``script_roots``:
     only those a task actually submits from, outer directories before the ones inside them."""
@@ -175,7 +185,9 @@ def run_import(
 ) -> Tuple[List[Dict[str, Any]], ImportReport]:
     """The contracts ``fluid import <tool> <source>`` proposes, and the report."""
     split_by = _split(tool, options)
-    conv = load_conventions(options.get("conventions"))
+    conv = load_conventions(
+        options.get("conventions"), roots=_named_directories(tool, source, options)
+    )
     report = ImportReport()
     root = _directory(
         source, "DAGs directory" if tool == "airflow" else "jobs directory", f"fluid import {tool}"

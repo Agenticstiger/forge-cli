@@ -45,9 +45,16 @@ be silently ignored), and a size cap and the alias limits of
       files: ["jobs/legacy/*"]         # globs, relative to the scanned directory
     products: {id: "{database}.{table}"}   # how a product id is made
 
-Every key is optional. A path in the file is relative to the file and stays inside the file's
-directory: a path that leaves it (``..``, an absolute path, a link that points out) is refused,
-so a conventions file cannot make the scan read a file from somewhere else.
+Every key is optional. A path in the file is relative to the file and must end up inside the
+file's own directory or inside a directory the user named on the command line (the one to scan,
+and ``--dags``): a path that leaves them all (``..``, an absolute path, a link that points out) is
+refused, checked on the resolved path. So a conventions file cannot make the scan read a file from
+somewhere the user did not point it at, and it may sit in a folder of its own beside the
+repositories it describes (``config/conventions.yaml``).
+
+An ``environments`` value is text and may be empty (``PREFIX: ""``, a table prefix that is empty
+in production): a variable the file names with an empty value has that value, and one it does not
+name is unresolved. A YAML null is refused, as it is neither of the two.
 
 The file is the operator's own, and is trusted as input to the tool: its regular expressions
 are compiled as written (a pattern that backtracks badly is the operator's to avoid), and the
@@ -56,6 +63,7 @@ text each is matched against is cut at 256 characters.
 
 from __future__ import annotations
 
+import datetime
 import re
 import string
 from dataclasses import dataclass, field
@@ -256,22 +264,56 @@ def _pattern(value: Any, path: Optional[Path], where: str) -> "re.Pattern[str]":
         raise _fail(path, where, f"not a regular expression ({exc})") from None
 
 
-def _local(base: Path, value: Any, path: Optional[Path], where: str) -> Path:
-    """A path in the file: relative to the file's directory, and inside it."""
+def _named(directories: Sequence[Union[str, Path]]) -> Tuple[Path, ...]:
+    """The directories the user named on the command line, resolved: one named through a link is
+    the directory it points to. One that cannot be resolved is left out (the import refuses a
+    directory that is not one where it reads it)."""
+    found: List[Path] = []
+    for item in directories:
+        try:
+            found.append(Path(item).resolve())
+        except (OSError, RuntimeError, ValueError):  # a link loop, a name the system refuses
+            continue
+    return tuple(found)
+
+
+def _local(
+    base: Path, value: Any, path: Optional[Path], where: str, named: Sequence[Path] = ()
+) -> Path:
+    """A path in the file: relative to the file's directory, and (once resolved, so a link counts
+    for where it points) inside that directory or one of ``named``."""
     text = _text(value, path, where)
     try:
         root = base.resolve()
         resolved = (base / text).resolve()
     except (OSError, RuntimeError) as exc:  # a link loop
         raise _fail(path, where, f"{text!r} cannot be resolved ({type(exc).__name__})") from None
-    if resolved != root and root not in resolved.parents:
+    if not any(resolved == inside or inside in resolved.parents for inside in (root, *named)):
         raise _fail(
             path,
             where,
-            f"{text!r} leaves the directory of the conventions file: keep what the scan reads "
-            "inside it",
+            f"{text!r} leaves the directory of the conventions file and the directories named on "
+            "the command line: keep what the scan reads inside one of them",
         )
     return resolved
+
+
+def _env_value(value: Any, path: Optional[Path], where: str) -> str:
+    """What an environment variable holds, as written. The empty string is a value (a prefix that
+    is empty in production) and not the same as a variable the file does not name, which is
+    unresolved. A number or a date is the text it is written as; a null, a list or a mapping is
+    refused: none of them is a value the code could have read from the environment."""
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, (int, float, datetime.date)):  # a bool is an int
+        text = str(value)
+    else:
+        raise _fail(
+            path, where, 'expected text: write "" for an empty value, or leave the variable out'
+        )
+    if len(text) > MAX_TEXT:
+        raise _fail(path, where, f"longer than {MAX_TEXT} characters")
+    return text
 
 
 def _template(value: Any, path: Optional[Path], where: str) -> str:
@@ -292,8 +334,16 @@ def _template(value: Any, path: Optional[Path], where: str) -> str:
     return text
 
 
-def parse_conventions(document: Any, source: Optional[Path] = None) -> Conventions:
+def parse_conventions(
+    document: Any,
+    source: Optional[Path] = None,
+    *,
+    roots: Sequence[Union[str, Path]] = (),
+) -> Conventions:
     """The :class:`Conventions` a loaded YAML document describes.
+
+    ``roots`` are the directories the user named on the command line: a path in the document may
+    point into one of them as well as into the directory of ``source``.
 
     Raises:
         ConventionsError: a key is unknown or a value has the wrong shape.
@@ -301,6 +351,7 @@ def parse_conventions(document: Any, source: Optional[Path] = None) -> Conventio
     base = source.parent if source is not None else Path.cwd()
     if document is None:
         return Conventions(source=source)
+    named = _named(roots)
     top = _mapping(document, source, "the file", _TOP_KEYS)
     if "version" in top and top["version"] != 1:
         raise _fail(
@@ -321,7 +372,7 @@ def parse_conventions(document: Any, source: Optional[Path] = None) -> Conventio
         script_roots.append(
             (
                 _text(prefix, source, "script_roots"),
-                _local(base, local, source, f"script_roots.{prefix}"),
+                _local(base, local, source, f"script_roots.{prefix}", named),
             )
         )
     script_roots.sort(key=lambda item: -len(item[0]))
@@ -416,15 +467,15 @@ def parse_conventions(document: Any, source: Optional[Path] = None) -> Conventio
         if set(entry) != {"module", "path"}:
             raise _fail(source, where, "give both module and path")
         modules[_text(entry["module"], source, f"{where}.module", pattern=_DOTTED)] = _local(
-            base, entry["path"], source, f"{where}.path"
+            base, entry["path"], source, f"{where}.path", named
         )
 
     environments: Dict[str, Dict[str, str]] = {}
     for name, raw in _mapping(top.get("environments", {}), source, "environments").items():
         env = _mapping(raw, source, f"environments.{name}")
         environments[name] = {
-            _text(k, source, f"environments.{name}", pattern=_IDENT): _text(
-                v if isinstance(v, str) else str(v), source, f"environments.{name}.{k}"
+            _text(k, source, f"environments.{name}", pattern=_IDENT): _env_value(
+                v, source, f"environments.{name}.{k}"
             )
             for k, v in env.items()
         }
@@ -543,8 +594,14 @@ def parse_conventions(document: Any, source: Optional[Path] = None) -> Conventio
     )
 
 
-def load_conventions(path: Optional[Union[str, Path]]) -> Conventions:
+def load_conventions(
+    path: Optional[Union[str, Path]], *, roots: Sequence[Union[str, Path]] = ()
+) -> Conventions:
     """Read and parse a conventions file; with no path, the empty conventions.
+
+    ``roots`` are the directories the user named on the command line (the one to scan, and
+    ``--dags``): a path in the file may point into one of them as well as into the directory of
+    the file.
 
     Raises:
         FluidUserError: (a ``SchemaValidationError``) the file cannot be read, is not safe YAML
@@ -585,6 +642,6 @@ def load_conventions(path: Optional[Union[str, Path]]) -> Conventions:
             f"the conventions file {file.name} is not valid YAML", type(exc).__name__
         ) from exc
     try:
-        return parse_conventions(document, file.resolve())
+        return parse_conventions(document, file.resolve(), roots=roots)
     except ConventionsError as exc:
         raise refusal(f"the conventions file {file.name} has a problem", str(exc)) from exc
