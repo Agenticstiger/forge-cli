@@ -407,9 +407,15 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
             "Grant the identity that runs fluid apply s3:GetObject on the build's prefix "
             + "(_fluid/spark/<product>/<build>/): forge reads the failed-release marker and the "
             + "job config there, and refused to start anything it cannot check",
-            "Also grant s3:ListBucket on that prefix: without it S3 answers a missing object "
-            + "with AccessDenied, which forge can only read as missing when the job config "
-            + "beside it reads",
+            "Also grant s3:ListBucket, scoped to the release prefix (the build's "
+            + "_fluid/spark/<product>/<build>/ and nothing wider): without it S3 answers a "
+            + "missing object with AccessDenied, and a refused marker cannot be told from a "
+            + "missing one",
+            "Only the marker refused while the job config reads: set "
+            + "FLUID_SPARK_ACCEPT_FAILED_RELEASE=1 for one fluid apply (the operator's "
+            + "environment, not a project .env) to start without knowing whether the config "
+            + "failed its probation. That override also skips a real failed-release marker, so "
+            + "never set it permanently, in a keepalive's environment least of all",
         ],
         None,
     ),
@@ -1418,6 +1424,14 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "validate",
     ),
+    "contract_table_pools": (
+        [
+            "orchestration.airflow.poolPerOutputTable gives a task one pool, so a build that "
+            + "writes several tables cannot be serialized with it: declare one output per build "
+            + "(builds[].outputs) or split the build",
+        ],
+        "validate",
+    ),
     "contract_maintenance_actions": (
         [
             "Install the package that registers the action's kind under the "
@@ -1648,6 +1662,7 @@ _EXAMPLES: Dict[str, str] = {
         "# exposes[].binding\nplatform: aws\nformat: iceberg\nlocation:\n"
         "  bucket: acme-lake\n  path: warehouse/sales/orders/\n"
     ),
+    "contract_table_pools": _VERBOSE,
     "contract_maintenance_actions": _VERBOSE,
     "contract_confluent_binding": _VERBOSE,
     "contract_databricks_binding": (

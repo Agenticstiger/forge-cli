@@ -181,8 +181,19 @@ HELPERS: Dict[str, str] = {
         table_input['Description'] = description
 
     try:
-        client.get_table(DatabaseName=database, Name=table)
-        client.update_table(DatabaseName=database, TableInput=table_input)
+        existing = client.get_table(DatabaseName=database, Name=table)['Table']
+        parameters = existing.get('Parameters') or {}
+        if str(parameters.get('table_type', '')).upper() == 'ICEBERG':
+            # A Hive TableInput would drop table_type and metadata_location: the table
+            # stops being an Iceberg table. The engine that writes it owns its definition.
+            logger.info(f"Glue table {database}.{table} is an Iceberg table: left as it is")
+            return
+        # Keep what is already on the table (a crawler's or a job's parameters).
+        table_input['Parameters'] = parameters
+        update = {'DatabaseName': database, 'TableInput': table_input}
+        if existing.get('VersionId'):
+            update['VersionId'] = existing['VersionId']
+        client.update_table(**update)
         logger.info(f"Updated Glue table: {database}.{table}")
     except client.exceptions.EntityNotFoundException:
         client.create_table(DatabaseName=database, TableInput=table_input)

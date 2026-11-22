@@ -686,8 +686,11 @@ class SchemaCache:
     """Manages local caching of FLUID schemas."""
 
     def __init__(self, cache_dir: Optional[Path] = None):
+        # The ``schema_cache`` folder is made when the first schema is written, not here: a
+        # command that only validates against the bundled schemas (``fluid import --dry-run``)
+        # creates no cache folder. ``~/.fluid`` itself is still made by the CLI on every run
+        # (``cli/__init__.py::_ensure_fluid_home``).
         self.cache_dir = cache_dir or Path.home() / ".fluid" / "schema_cache"
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_index_file = self.cache_dir / "index.json"
         self._cache_index: Dict[str, Dict[str, Any]] = {}
         self._load_cache_index()
@@ -748,6 +751,7 @@ class SchemaCache:
         cached_file = self.cache_dir / filename
 
         try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
             with open(cached_file, "w", encoding="utf-8") as f:
                 json.dump(schema, f, indent=2)
 

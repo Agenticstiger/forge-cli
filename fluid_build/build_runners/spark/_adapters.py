@@ -99,13 +99,36 @@ class SparkRunError(RuntimeError):
 
 
 class MarkerReadDenied(SparkRunError):
-    """The failed-probation marker cannot be read, and neither can the job config under the same
-    prefix: ``s3:GetObject`` is missing there, so forge cannot tell whether a config failed."""
+    """The failed-probation marker is refused, so forge cannot tell whether a config failed.
+
+    Either the job config under the same prefix is refused too (``s3:GetObject`` is missing
+    there), or only the marker is (``job_config_readable``): without ``s3:ListBucket`` a missing
+    marker answers the same way, and the two cannot be told apart. ``uri`` is the marker's.
+    """
+
+    def __init__(self, message: str, *, uri: str = "", job_config_readable: bool = False) -> None:
+        super().__init__(message)
+        self.uri = uri
+        self.job_config_readable = job_config_readable
 
 
 #: The S3 codes for a request the identity may not make (a missing key reads as one without
 #: ``s3:ListBucket``).
 _DENIED = ("AccessDenied", "403", "Forbidden")
+#: The S3 codes for a key that is not there.
+_MISSING = ("NoSuchKey", "404", "NotFound")
+
+
+def is_denied_code(code: str) -> bool:
+    """Whether an S3 error code is a refused request (:data:`_DENIED`)."""
+    return code in _DENIED
+
+
+def is_missing_code(code: str) -> bool:
+    """Whether an S3 error code is a key that is not there (:data:`_MISSING`)."""
+    return code in _MISSING
+
+
 _WARNED_PREFIXES: set = set()
 
 
@@ -615,22 +638,36 @@ class Adapter:
             return _read_back(self.clients or default_clients, self.run.region, uri)
         except Exception as exc:  # noqa: BLE001 - botocore's errors; named, then raised
             code = _error_code(exc) or type(exc).__name__
-            if code in ("NoSuchKey", "404", "NotFound"):
+            if is_missing_code(code):
                 return None
-            if code in _DENIED:
-                # Without s3:ListBucket a missing key answers 403: when the job config under the
-                # same prefix (which must exist) reads, the marker is missing, not refused.
+            if is_denied_code(code):
+                # Without s3:ListBucket a missing key answers 403, so a refused marker and a
+                # missing one look alike. The job config under the same prefix (which must
+                # exist) tells the two cases apart, and neither is read as "no marker".
                 try:
                     _read_back(self.clients or default_clients, self.run.region, self.run.job_uri)
                 except Exception as probe:  # noqa: BLE001 - botocore's errors
+                    probe_code = _error_code(probe) or type(probe).__name__
+                    if not (is_denied_code(probe_code) or is_missing_code(probe_code)):
+                        raise SparkRunError(
+                            f"the marker {uri} is refused ({code}) and the job config "
+                            f"{self.run.job_uri} could not be read to tell why ({probe_code}): "
+                            "nothing was checked"
+                        ) from probe
                     raise MarkerReadDenied(
                         f"the marker {uri} and the job config {self.run.job_uri} cannot be read "
-                        f"({_error_code(probe) or type(probe).__name__}): the identity that "
-                        "reconciles needs s3:GetObject on the build's prefix, and s3:ListBucket "
-                        "on it so a missing object reads as missing"
+                        f"({probe_code}): the identity that reconciles needs s3:GetObject on the "
+                        "build's prefix, and s3:ListBucket on it so a missing object reads as "
+                        "missing",
+                        uri=uri,
                     ) from probe
-                warn_no_list_bucket(uri)
-                return None
+                raise MarkerReadDenied(
+                    f"the marker {uri} is refused ({code}) while the job config beside it reads: "
+                    "the identity lacks s3:GetObject on it, or s3:ListBucket on the build's "
+                    "prefix, which makes a missing marker answer the same way",
+                    uri=uri,
+                    job_config_readable=True,
+                ) from exc
             raise SparkRunError(f"the marker {uri} cannot be read: {code}") from exc
 
     def clear_failed(self, config_hash: str) -> None:

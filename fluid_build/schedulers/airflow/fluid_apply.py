@@ -118,6 +118,7 @@ from fluid_build.schedulers.airflow._assets import (
     expose_asset_uri,
     normalize_dataset_uri,
 )
+from fluid_build.util import airflow_pools
 from fluid_build.util.contract import (
     builds_writing_expose,
     get_builds,
@@ -359,6 +360,11 @@ class BuildTask:
     trigger_rule: Optional[str] = None
     #: The asset URIs of the exposes the build writes, declared as the task's ``outlets``.
     outlets: Tuple[str, ...] = ()
+    #: The one-slot Airflow pool of the table the build writes (``poolPerOutputTable``), or
+    #: ``None``. A build that writes several tables is refused when the pools are on.
+    pool: Optional[str] = None
+    #: What the pool is for, kept with it for the DAG's ``FLUID_TABLE_POOLS``.
+    pool_description: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -936,6 +942,7 @@ class _BuildGraph:
     def __init__(self, contract: Dict[str, Any], builds: List[Dict[str, Any]]) -> None:
         self.contract = contract
         self.builds = builds
+        self.pool_per_table = _pool_per_output_table(contract)
         self.managed = _managed_lane(contract)
         self.kinds = [_classify(b, self.managed) for b in builds]
         self.in_dags = [i for i, (k, _) in enumerate(self.kinds) if k not in (_OUTSIDE, _ELSEWHERE)]
@@ -955,6 +962,8 @@ class _BuildGraph:
             (expose_asset_uri(e)[0], builds_writing_expose(_expose_id(e), builds))
             for e in _exposes(contract)
         ]
+        #: The expose id of each entry of :attr:`assets`, for messages.
+        self.asset_exposes: List[Any] = [_expose_id(e) for e in _exposes(contract)]
         for i in self.in_dags:
             self._link(i)
 
@@ -1187,13 +1196,22 @@ class _BuildGraph:
         if spark:
             _check_spark_ids(self.contract, build_id)
         upstream_ids = {j for j, _ in self.upstream.get(i, [])}
+        outlets = self._outlets(build)
+        pool = description = None
+        if self.pool_per_table and len(outlets) > 1:
+            raise ScheduleRenderError(self.several_tables_message(build_id, build))
+        if self.pool_per_table and outlets:
+            pool = airflow_pools.pool_name(outlets[0])
+            description = airflow_pools.pool_description(outlets[0])
         return BuildTask(
             build_id=build_id,
             retries=_retries(build),
             task_timeout_s=_task_timeout_s(build, build_id) if spark else None,
             upstream=tuple(self.name(j) for j in order if j in upstream_ids),
             trigger_rule=TRIGGER_RULES[conditions.pop()] if conditions else None,
-            outlets=self._outlets(build),
+            outlets=outlets,
+            pool=pool,
+            pool_description=description,
         )
 
     def _outlets(self, build: Dict[str, Any]) -> Tuple[str, ...]:
@@ -1204,6 +1222,61 @@ class _BuildGraph:
             if uri and uri not in uris and any(w is build for w in writers):
                 uris.append(uri)
         return tuple(uris)
+
+    def written_tables(self, build: Dict[str, Any]) -> List[str]:
+        """``exposeId (asset URI)`` of each table the build writes, in the contract's order."""
+        seen: List[str] = []
+        out: List[str] = []
+        for (uri, writers), expose_id in zip(self.assets, self.asset_exposes, strict=False):
+            if uri and uri not in seen and any(w is build for w in writers):
+                seen.append(uri)
+                out.append(f"{expose_id} ({uri})")
+        return out
+
+    def several_tables_message(self, build_id: Any, build: Dict[str, Any]) -> str:
+        tables = self.written_tables(build)
+        return (
+            f"build {build_id!r} writes {len(tables)} tables ({', '.join(tables)}), and "
+            "orchestration.airflow.poolPerOutputTable gives a task one pool, so a DAG that "
+            "writes one of the others would not wait for it. Declare one output per build "
+            "(builds[].outputs lists the exposes a build writes; a build with none writes "
+            "every expose) or split the build"
+        )
+
+
+def table_pool_errors(contract: Dict[str, Any]) -> List[str]:
+    """What ``orchestration.airflow.poolPerOutputTable`` gets wrong in ``contract``: a value that
+    is not a boolean, and each build that runs in a DAG and writes more than one table. ``fluid
+    validate`` reports these; :func:`scheduled_dags` refuses the same builds."""
+    try:
+        if not _pool_per_output_table(contract):
+            return []
+    except ScheduleRenderError as exc:
+        return [str(exc)]
+    raw = contract.get("builds")
+    graph = _BuildGraph(
+        contract, [b for b in raw if isinstance(b, dict)] if isinstance(raw, list) else []
+    )
+    return [
+        graph.several_tables_message(graph.name(i), graph.builds[i])
+        for i in graph.in_dags
+        if len(graph._outlets(graph.builds[i])) > 1
+    ]
+
+
+def _pool_per_output_table(contract: Mapping[str, Any]) -> bool:
+    """``orchestration.airflow.poolPerOutputTable``: off unless the contract says ``true``."""
+    orchestration = contract.get("orchestration")
+    airflow = orchestration.get("airflow") if isinstance(orchestration, Mapping) else None
+    value = airflow.get("poolPerOutputTable") if isinstance(airflow, Mapping) else None
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ScheduleRenderError(
+            "orchestration.airflow.poolPerOutputTable must be true or false, not "
+            f"{type(value).__name__}"
+        )
+    return value
 
 
 def _expose_writer_id(build: Mapping[str, Any]) -> Optional[str]:
@@ -1749,6 +1822,8 @@ def render_build_task(
             + "".join(f"            Asset({lit(uri)}),\n" for uri in task.outlets)
             + "        ],\n"
         )
+    if task.pool:
+        extra += f"        pool={lit(task.pool)},\n        pool_slots={airflow_pools.POOL_SLOTS},\n"
     return (
         f"{head}"
         f"        task_id={task_id},\n"
@@ -1833,6 +1908,12 @@ def _schedule_constants(dag: ScheduledDag) -> str:
     if schedule.datasets:
         out += "DATASETS = [\n" + "".join(f"    {lit(uri)},\n" for uri in schedule.datasets) + "]\n"
     out += f"TIMEZONE = {lit(schedule.timezone)}\n"
+    pools = {t.pool: t.pool_description or "" for t in dag.tasks if t.pool}
+    if pools:
+        # Read back by ``fluid schedule-sync`` (util/airflow_pools.declared_pools).
+        out += f"{airflow_pools.CONSTANT} = {{\n"
+        out += "".join(f"    {lit(name)}: {lit(pools[name])},\n" for name in sorted(pools))
+        out += "}\n"
     if len(dag.tasks) == 1:
         out += f"RETRIES = {int(dag.tasks[0].retries)}\n"
     return out
@@ -1980,13 +2061,19 @@ def render_fluid_apply_dags(
         raise ScheduleRenderError(str(exc)) from None
 
     files: Dict[str, str] = {}
+    # File names are compared without regard to case: on a case-insensitive file system
+    # (macOS, Windows) ``Orders_dag.py`` and ``orders_dag.py`` are one file, and the later
+    # write replaces the earlier DAG.
+    taken: Dict[str, str] = {}
     for dag in scheduled_dags(contract):
         name = dag_filename_for(dag.key)
-        if name in files:
+        if name.lower() in taken:
             raise ScheduleRenderError(
                 f"builds {dag.key!r} and another scheduled build map to the same "
-                f"DAG file {name!r}; give them ids that differ in more than '.' or '-'"
+                f"DAG file {name!r} (file names are compared without regard to case); "
+                "give them ids that differ in more than '.', '-' or letter case"
             )
+        taken[name.lower()] = name
         try:
             files[name] = render_scheduled_dag(
                 product_id=product_id,

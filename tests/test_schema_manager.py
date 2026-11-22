@@ -140,10 +140,11 @@ class TestValidationResult:
 
 
 class TestSchemaCache:
-    def test_init_creates_dir(self, tmp_path):
+    def test_init_makes_no_dir(self, tmp_path):
+        # The folder is made by the first write: see tests/test_schema_cache_lazy.py.
         cache_dir = tmp_path / "cache"
         SchemaCache(cache_dir)
-        assert cache_dir.exists()
+        assert not cache_dir.exists()
 
     def test_cache_and_retrieve(self, tmp_path):
         cache = SchemaCache(tmp_path / "cache")

@@ -488,6 +488,16 @@ def _publish_kwargs(args) -> dict:
     }
 
 
+def _typed_error(exc: CLIError, args) -> int:
+    """Let a typed error reach the CLI's top-level handler, which prints it on stdout; under
+    ``--format json`` print it on stderr instead and return its exit code."""
+    if getattr(args, "format", "text") != "json":
+        raise exc
+    from fluid_build.cli._common import print_cli_error_to_stderr
+
+    return print_cli_error_to_stderr(exc)
+
+
 def _cmd_publish(args, logger=None):
     """Execute publish command: one contract as before, several as an upstream-first batch."""
     log = logger or logging.getLogger(__name__)
@@ -547,8 +557,10 @@ def _cmd_publish(args, logger=None):
         _print_publish_result(result)
         return _publish_exit_code(result, args)
 
-    except CLIError:
-        raise  # typed: the CLI's top-level handler shows its slug and what to do
+    except CLIError as exc:
+        # typed: the CLI's top-level handler shows its slug and what to do; under
+        # ``--format json`` that box goes to stderr, so stdout stays the JSON report's.
+        return _typed_error(exc, args)
     except ProviderError as exc:
         console_error(f"Error: {exc}")
         return 1
@@ -564,8 +576,8 @@ def _cmd_promote(args, logger=None):
         from fluid_build.cli._dmm_promote import run_promote
 
         return run_promote(args, log)
-    except CLIError:
-        raise
+    except CLIError as exc:
+        return _typed_error(exc, args)
     except ProviderError as exc:
         console_error(f"Error: {exc}")
         return 1
@@ -581,8 +593,8 @@ def _cmd_status(args, logger=None):
         from fluid_build.cli._dmm_status import run_status
 
         return run_status(args, log)
-    except CLIError:
-        raise
+    except CLIError as exc:
+        return _typed_error(exc, args)
     except ProviderError as exc:
         console_error(f"Error: {exc}")
         return 1
@@ -695,11 +707,25 @@ def _print_publish_result(result):
                 cprint_literal(f"   Error: {odcs['error']}")
 
 
+def _product_list(provider: DataMeshManagerProvider) -> list:
+    """Every data product the tenant holds, as a list of products.
+
+    A reply that is not a list (an error object, a proxy's JSON) is not a product list: read as
+    one, ``list`` would print it and exit 0, and ``wipe`` would fail on it with nothing deleted.
+    """
+    products = provider.list_products()
+    if not isinstance(products, list):
+        raise ProviderError(
+            "Entropy Data answered the product list with something other than a list"
+        )
+    return products
+
+
 def _cmd_list(args, logger=None):
     """List all data products."""
     try:
         provider = _make_provider(args)
-        products = provider.list_products()
+        products = _product_list(provider)
         fmt = getattr(args, "format", "table")
 
         if fmt == "json":
@@ -766,7 +792,7 @@ def _find_consumers(provider: DataMeshManagerProvider, product_id: str) -> list[
     """
     consumers: list[str] = []
     try:
-        for prod in provider.list_products():
+        for prod in _product_list(provider):
             for ip in prod.get("inputPorts") or []:
                 cid = ip.get("contractId") or ""
                 if cid == product_id or cid.startswith(f"{product_id}."):
@@ -833,7 +859,7 @@ def _cmd_wipe(args, logger=None):
                 return 0
 
         provider = _make_provider(args)
-        products = provider.list_products()
+        products = _product_list(provider)
         if not products:
             cprint("(tenant already empty)")
             return 0
@@ -875,7 +901,12 @@ def _cmd_wipe(args, logger=None):
                 break
             remaining = next_round
 
-        final = len(provider.list_products())
+        try:
+            final = len(_product_list(provider))
+        except Exception as exc:  # noqa: BLE001 - the deletes are done; say so before failing
+            cprint(f"Done: {deleted} deleted, remaining unknown.")
+            console_error(f"Could not recount the products that remain: {exc}")
+            return 1
         cprint(f"Done: {deleted} deleted, {final} remain.")
         return 0 if final == 0 else 1
     except ProviderError as exc:

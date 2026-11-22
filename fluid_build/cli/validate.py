@@ -1090,6 +1090,9 @@ def _run_contract_rules(
 
         # A '.' or '..' segment in a table's binding.location.path, for every table.
         _check_location_dot_segments(validation_result, contract)
+        # Airflow pools per output table (orchestration.airflow.poolPerOutputTable): a build
+        # that writes several tables cannot be serialized with one pool.
+        _check_table_pools(validation_result, contract)
 
         # forge Spark builds, compiled to their job config under the operator's broker,
         # registry and secrets policy (an unlisted host warns here, refuses at run time).
@@ -1637,6 +1640,31 @@ def _check_location_dot_segments(
         )
         return
     _add_findings(validation_result, contract, "contract_location_path", errors, anchor="exposes")
+
+
+def _check_table_pools(validation_result: ValidationResult, contract: Mapping[str, Any]) -> None:
+    """``orchestration.airflow.poolPerOutputTable`` against the builds
+    (``schedulers/airflow/fluid_apply.py``): off unless the contract sets it, and nothing is
+    imported then. Fails closed."""
+    orchestration = contract.get("orchestration")
+    airflow = orchestration.get("airflow") if isinstance(orchestration, Mapping) else None
+    if not isinstance(airflow, Mapping) or airflow.get("poolPerOutputTable") is None:
+        return
+    try:
+        from fluid_build.schedulers.airflow.fluid_apply import table_pool_errors
+
+        errors = table_pool_errors(dict(contract))
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        validation_result.add_error(
+            f"Airflow table pool check could not run ({type(exc).__name__}); "
+            "orchestration.airflow.poolPerOutputTable was NOT checked",
+            event="contract_check_failed",
+            pointer="",
+        )
+        return
+    _add_findings(
+        validation_result, contract, "contract_table_pools", errors, anchor="orchestration"
+    )
 
 
 def _check_maintenance_plugins(

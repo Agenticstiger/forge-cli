@@ -24,7 +24,7 @@ from fluid_build.build_runners.spark import _adapters as ad
 from fluid_build.build_runners.spark import _reconcile as rc
 from fluid_build.build_runners.spark._desired import config_digest
 from fluid_build.cli import _spark_apply
-from tests.build_runners.spark.test_reconcile import ENV, WALL, info
+from tests.build_runners.spark.test_reconcile import WALL, info
 from tests.build_runners.spark.test_stream_release import S3, _client_error
 from tests.build_runners.spark.test_stream_rollback import (
     OLD_DIGEST,
