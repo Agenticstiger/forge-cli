@@ -954,7 +954,23 @@ def submit(script):
     assert {t.submits[0].line for t in found.values()} == {t.line for t in found.values()}
 
 
-def test_many_tasks_with_their_own_arguments_cost_in_proportion():
+def test_many_tasks_with_their_own_arguments_cost_in_proportion(monkeypatch):
+    # counted, not timed: the folds and the visits a file's reading makes grow with its tasks
+    # (a busy CI runner's clock does not say that)
+    work = {"folds": 0, "visits": 0}
+    fold, charge = Folder.fold, Follower._charge
+
+    def counted_fold(self: Folder, *args: Any, **kwargs: Any) -> Any:
+        work["folds"] += 1
+        return fold(self, *args, **kwargs)
+
+    def counted_charge(self: Follower, visits: int) -> None:
+        work["visits"] += visits
+        charge(self, visits)
+
+    monkeypatch.setattr(Folder, "fold", counted_fold)
+    monkeypatch.setattr(Follower, "_charge", counted_charge)
+
     def source(count: int) -> str:
         many = "\n".join(
             f'PythonOperator(task_id="t{i}", python_callable=submit, op_kwargs={{"script": "s3://jobs/{i}.py"}}, dag=dag)'
@@ -970,14 +986,15 @@ def submit(script, **kwargs):
             + many
         )
 
-    timings = []
+    counts = []
     for count in (250, 1_000):
-        start = time.process_time()
+        work.update(folds=0, visits=0)
         found = tasks(source(count))
-        timings.append(time.process_time() - start)
+        counts.append(dict(work))
         assert len(found) == count
         assert found[f"t{count - 1}"].submits[0].script == f"s3://jobs/{count - 1}.py"
-    assert timings[1] < 15 * max(timings[0], 0.01), timings
+    for kind in ("folds", "visits"):  # four times the tasks
+        assert 0 < counts[1][kind] <= 4.5 * counts[0][kind], counts
 
 
 def test_a_body_that_asks_for_too_much_work_is_cut_and_said_so(monkeypatch):
