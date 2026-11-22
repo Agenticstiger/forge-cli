@@ -601,7 +601,10 @@ class Follower:
             return []
         # a task's function given the same arguments again is read once (what a function deeper
         # down submits also depends on how deep it is and on what called it: those are not kept)
-        where = (module.rel, function.lineno, function.col_offset)  # type: ignore[attr-defined]
+        # by the path the index knows the file by: the one a DAG file is shown by can be another
+        # file's path in the index
+        rel = module.index_rel or module.rel
+        where = (rel, function.lineno, function.col_offset)  # type: ignore[attr-defined]
         key = (*where, _key(arguments)) if depth == 0 else None
         kept = self.budget.read
         if key is not None and key[-1] is not None and key in kept:
@@ -739,7 +742,10 @@ class Follower:
         spec: ast.arguments = function.args  # type: ignore[attr-defined]
         positional = [*spec.posonlyargs, *spec.args]
         enclosing = folder.scope_of(function)
-        where = (module.rel, function.lineno, function.col_offset)  # type: ignore[attr-defined]
+        # by the path the index knows the file by: the one a DAG file is shown by can be another
+        # file's path in the index
+        rel = module.index_rel or module.rel
+        where = (rel, function.lineno, function.col_offset)  # type: ignore[attr-defined]
         top = enclosing.owner is module.tree
         if top and where in self._defaults:
             return self._defaults[where]

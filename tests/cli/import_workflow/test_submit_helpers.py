@@ -1204,6 +1204,31 @@ def test_a_function_the_tasks_of_many_files_run_alike_is_read_once(tmp_path, mon
     assert reads == ["submit"]
 
 
+def test_a_dag_file_and_a_module_shown_by_the_same_path_are_kept_apart(tmp_path, monkeypatch):
+    # run from above the scan, the DAG file dags/x.py is shown as `dags/x.py`, which is also the
+    # path the scan knows dags/dags/x.py by: what one's function submitted is not the other's
+    head = "import subprocess\nfrom airflow import DAG\nfrom airflow.operators.python import PythonOperator\n"
+    _write(
+        tmp_path,
+        {
+            "dags/x.py": head
+            + "def f(script):\n    subprocess.run(['spark-submit', 's3://a/' + script])\n"
+            + "with DAG('a', schedule=None) as dag:\n"
+            + "    PythonOperator(task_id='t', python_callable=f, op_args=['one.py'])\n",
+            "dags/dags/x.py": head
+            + "def f(script):\n    subprocess.run(['spark-submit', 's3://b/' + script])\n",
+            "dags/y.py": head
+            + "from dags.x import f\n"
+            + "with DAG('b', schedule=None) as dag:\n"
+            + "    PythonOperator(task_id='t', python_callable=f, op_args=['one.py'])\n",
+        },
+    )
+    monkeypatch.chdir(tmp_path)
+    scan = scan_dags(Path("dags"), Conventions())
+    scripts = {d.dag_id: [s.script for t in d.tasks for s in t.submits] for d in scan.dags}
+    assert scripts == {"a": ["s3://a/one.py"], "b": ["s3://b/one.py"]}
+
+
 def test_what_a_file_that_ran_out_read_of_a_function_is_not_handed_to_the_next(
     tmp_path, monkeypatch
 ):
