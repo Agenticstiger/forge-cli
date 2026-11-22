@@ -467,9 +467,8 @@ def test_a_build_from_a_plan_hashes_the_contract_as_written_and_stamps_the_plans
     resolved["exposes"][0]["description"] = "eu-west-1"  # as run_builds_from_args resolves it
     seen = _captured_stamps(monkeypatch)
     build = resolved["builds"][0]
-    assert (
-        run_build(resolved, build, dry_run=True, as_written=contract, bundle_digest=BUNDLE) is None
-    )
+    source = _desired.StampSource(contract, BUNDLE)
+    assert run_build(resolved, build, dry_run=True, stamp_source=source) is None
     (stamped,) = seen
     assert stamped["contract_digest"] == compute_contract_digest(contract)
     assert stamped["bundle_digest"] == BUNDLE
@@ -500,5 +499,5 @@ def test_run_builds_hands_a_plans_spark_build_the_contract_as_written_and_its_bu
     base.run_builds_from_args(args, logging.getLogger("test"), plan_data=plan_data)
     ((positional, keywords),) = calls
     assert positional[0]["exposes"][0]["description"] == "eu-west-1"  # the run is resolved
-    assert keywords["as_written"] == contract  # the digest is the contract's as written
-    assert keywords["bundle_digest"] == BUNDLE
+    # the digest is the contract's as written, and the bundle the verified plan's
+    assert keywords["stamp_source"] == _desired.StampSource(contract, BUNDLE)

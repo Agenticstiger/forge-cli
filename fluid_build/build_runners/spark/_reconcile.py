@@ -946,15 +946,11 @@ def run_build(
     clients: Optional[ClientFactory] = None,
     local_host: Any = None,
     run_id: Optional[str] = None,
-    as_written: Optional[Mapping[str, Any]] = None,
-    bundle_digest: Optional[str] = None,
+    stamp_source: Any = None,
 ) -> Optional[int]:
     """The build phase of ``fluid apply --mode amend-and-build`` for one Spark build: how its
-    scheduler runs it. A local run lives in ``local_host`` (the contract's directory).
-    ``run_id`` is the pipeline's, which the runner stamps on each commit of the run.
-    ``as_written`` is the contract before ``{{ env.* }}`` was resolved, when ``contract`` is a
-    resolved copy (a plan's): its digest is the one every start path stamps. ``bundle_digest``
-    is the bundle the plan binds, stamped too.
+    scheduler runs it. A local run lives in ``local_host`` (the contract's directory). The
+    runner stamps ``run_id`` (the pipeline's) on each commit, and what ``stamp_source`` names.
 
     A scheduled build (batch, or a stream triggered ``availableNow``) gets one run, waited for
     until it ends or ``execution.runtime.timeout`` (:data:`DEFAULT_RUN_WAIT_S` when unset)
@@ -972,7 +968,7 @@ def run_build(
     import copy
 
     from fluid_build._contract_loader import resolve_contract_env_templates
-    from fluid_build.build_runners.spark._desired import desired_runs, run_stamps
+    from fluid_build.build_runners.spark._desired import desired_runs, stamps_from
     from fluid_build.spark.compiler import run_timeout_seconds
 
     bid = str(build.get("id"))
@@ -981,11 +977,7 @@ def run_build(
         raise ValueError(refusal)
     # As fluid plan and fluid apply read it: ``{{ env.* }}`` resolved.
     resolved = resolve_contract_env_templates(copy.deepcopy(dict(contract)))
-    stamps = run_stamps(
-        contract if as_written is None else as_written,
-        run_id=run_id,
-        bundle_digest=bundle_digest,
-    )
+    stamps = stamps_from(contract, run_id=run_id, source=stamp_source)
     runs = desired_runs(resolved, build_id=bid, stamps=stamps)
     if not runs:
         raise ValueError(

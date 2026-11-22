@@ -25,7 +25,7 @@ import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from fluid_build.spark import names as _names
 
@@ -1012,6 +1012,28 @@ def run_stamps(
             raise ValueError(why)
         logging.getLogger(__name__).warning("%s: this run carries no release stamp", why)
     return stamps
+
+
+class StampSource(NamedTuple):
+    """What a scheduled run's stamps are taken from when the contract it runs is a resolved copy
+    (a plan's embedded contract, ``{{ env.* }}`` resolved): the contract as written, whose digest
+    every start path stamps, and the bundle a plan the caller verified binds."""
+
+    contract: Mapping[str, Any]
+    bundle_digest: Optional[str] = None
+
+
+def stamps_from(
+    contract: Mapping[str, Any], *, run_id: Optional[str], source: Optional[StampSource]
+) -> Dict[str, str]:
+    """:func:`run_stamps` for a run of ``contract``, from ``source`` when it names one.
+
+    Raises:
+        ValueError: as :func:`run_stamps`.
+    """
+    if source is None:
+        return run_stamps(contract, run_id=run_id)
+    return run_stamps(source.contract, run_id=run_id, bundle_digest=source.bundle_digest)
 
 
 def plan_actions(contract: Mapping[str, Any], **kwargs: Any) -> List[Dict[str, Any]]:

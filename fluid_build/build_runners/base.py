@@ -605,14 +605,13 @@ def _execute_spark_build(
     *,
     dry_run: bool,
     workspace: Optional[Path] = None,
-    as_written: Optional[Dict[str, Any]] = None,
-    bundle_digest: Optional[str] = None,
+    stamp_source: Any = None,
 ) -> Optional[int]:
     """Run a Spark job build on its runtime (``build_runners/spark``): 0 when its run
     succeeded, 1 when it failed or was refused, None for a stream ``fluid apply`` keeps
     running. A local run (``runtime: local``) keeps its state in ``workspace``, the
-    source contract's directory. ``as_written`` (the contract before ``{{ env.* }}`` was
-    resolved) and ``bundle_digest`` (the bundle a plan binds) are what the runner stamps."""
+    source contract's directory. ``stamp_source`` (``spark._desired.StampSource``) is what
+    the runner stamps when ``contract`` is a resolved copy."""
     from fluid_build._errors import FluidUserError
     from fluid_build.observability.run_id import get_or_create_run_id
 
@@ -630,8 +629,7 @@ def _execute_spark_build(
             local_host=LocalHost(Path(workspace)) if workspace is not None else None,
             # the pipeline's run id, as apply, plan and verify read it: stamped on each commit
             run_id=get_or_create_run_id(),
-            as_written=as_written,
-            bundle_digest=bundle_digest,
+            stamp_source=stamp_source,
         )
     except FluidUserError as exc:
         _print_typed_error(exc)
@@ -1731,6 +1729,8 @@ def run_builds_from_args(
             continue
 
         if is_spark_job_build(build):
+            from .spark._desired import StampSource
+
             # forge's Spark runner, ahead of inline SQL (a Spark job's SQL is Spark's): one
             # run of a scheduled build, waited for. A stream is kept running by this apply's
             # spark.reconcile action, not run here.
@@ -1740,8 +1740,7 @@ def run_builds_from_args(
                 dry_run=args.dry_run,
                 workspace=contract_path.resolve().parent,
                 # stamped on each commit: the contract's digest as written, and a plan's bundle
-                as_written=contract_as_written,
-                bundle_digest=verified_bundle,
+                stamp_source=StampSource(contract_as_written, verified_bundle),
             )
             if spark_result is None:
                 _report_spark_stream(build_id, report)
