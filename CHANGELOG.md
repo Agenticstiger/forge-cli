@@ -69,6 +69,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `importers` list names the built-in importers and the `fluid_build.importers` plugins, read from
   entry-point metadata without loading them. `fluid describe --self --json` gains `type` and
   `nargs` on each flag. Plain `--help` and every other command still load no plugin.
+- **Three more Agent Skills: adopting existing pipelines, releasing streams and publishing to
+  Data Mesh Manager.** `adopting-existing-pipelines` proposes contracts with `fluid import
+  pyspark` and `fluid import airflow` (dry run first, then the report's defaults to complete),
+  carries a conventions file the import reads as written, describes importer plugins, and takes
+  existing Glue tables over with `--adopt-tables` through a reviewed plan.
+  `releasing-streaming-products` says how a changed Spark stream stops between batches, which
+  runs are cancelled instead, what each Iceberg commit's stamps hold and how `fluid ship
+  --release-dir` and `fluid runs status --release-dir` name the release in force.
+  `publishing-to-data-mesh-manager` publishes a batch as drafts, promotes the drafts a `fluid
+  verify` report shows clean and reads a migration's status. `fluid scaffold-ide` installs them
+  with the others (`.agents/skills/`, which Codex reads, for `generic`, `cursor` and `cline`). A
+  test now checks that every event a skill's table or list names is one `fluid` emits. Each of
+  the three points an agent at `fluid describe --commands` for every command and flag.
 - **`fluid schedule-sync --airflow-url` waits until Airflow has parsed the pushed DAG files, on
   Airflow 2 and Airflow 3.** It finds the API major itself (`/api/v2` on Airflow 3, `/api/v1` on
   Airflow 2; `--airflow-api v1|v2` pins it) and signs in the way each major takes a credential: a
