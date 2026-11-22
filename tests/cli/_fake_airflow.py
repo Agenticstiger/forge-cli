@@ -133,6 +133,10 @@ class FakeAirflow:
         #: The source Airflow stored at each file's last clean parse.
         self.stored: Dict[Tuple[str, str], str] = {}
         self._tokens: Dict[str, Tuple[str, str]] = {}
+        #: The pools Airflow holds, by name: ``{slots, description}``.
+        self.pools: Dict[str, Dict[str, Any]] = {
+            "default_pool": {"slots": 128, "description": "Default pool"}
+        }
         self.requests: List[Request] = []
         self.issued: List[str] = []
         self.answer_next: List[Tuple[int, Dict[str, str], str]] = []
@@ -344,6 +348,8 @@ class FakeAirflow:
             if text is None:
                 return self._problem(404, "Not Found", "Dag source not found")
             return 200, {"content": text}, "application/json"
+        if path == "/api/v1/pools":
+            return self._pools(request, created=200, v1=True)
         if path == "/api/v1/importErrors":
             items = [
                 {
@@ -436,6 +442,8 @@ class FakeAirflow:
             keep_stale = (request.query.get("exclude_stale") or ["true"])[0].lower() == "false"
             items = [self._v2_dag(d) for d in self.dags.values() if keep_stale or not d.stale]
             return 200, self._page(request, items, "dags"), "application/json"
+        if path == "/api/v2/pools":
+            return self._pools(request, created=201, v1=False)
         if path == "/api/v2/importErrors":
             registered = {(d.bundle, d.rel) for d in self.dags.values()}
             absolute = self.version.startswith("3.0.")
@@ -509,6 +517,25 @@ class FakeAirflow:
         return self.dags_folder if bundle == "dags-folder" else f"/opt/airflow/bundles/{bundle}"
 
     # ── shared ───────────────────────────────────────────────────────────
+
+    def _pools(self, request: Request, *, created: int, v1: bool) -> Tuple[int, Any, str]:
+        """``/pools`` on either major: list them, or create one (409 for a name that exists)."""
+        if request.method == "POST":
+            body = request.body if isinstance(request.body, dict) else {}
+            name = body.get("name")
+            if not isinstance(name, str) or not isinstance(body.get("slots"), int):
+                return 422, {"detail": "validation error"}, "application/json"
+            if name in self.pools:
+                if v1:
+                    return self._problem(409, "Conflict", f"Pool: {name} already exists")
+                return 409, {"detail": f"The Pool: {name} already exists"}, "application/json"
+            self.pools[name] = {
+                "slots": body["slots"],
+                "description": body.get("description") or "",
+            }
+            return created, {"name": name, **self.pools[name]}, "application/json"
+        items = [{"name": n, **p} for n, p in self.pools.items()]
+        return 200, self._page(request, items, "pools"), "application/json"
 
     def _page(self, request: Request, items: List[Any], key: str) -> Dict[str, Any]:
         limit = min(int((request.query.get("limit") or ["100"])[0]), self.page_cap)

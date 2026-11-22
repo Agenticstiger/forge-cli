@@ -303,8 +303,19 @@ def batch_maintained() -> Dict[str, Any]:
 
 
 #: Contracts that use ``builds[].dependencies``, dataset triggers or a kept-alive stream.
+def table_pools() -> Dict[str, Any]:
+    """``events_pipeline`` with a one-slot Airflow pool per output table (0.7.7)."""
+    contract = events_pipeline()
+    contract["orchestration"] = {
+        "engine": "airflow",
+        "airflow": {"dagId": "events", "poolPerOutputTable": True},
+    }
+    return contract
+
+
 GRAPH_CASES: Dict[str, Tuple[Dict[str, Any], Optional[str], str]] = {
     "events_pipeline": (events_pipeline(), None, "contracts/events/contract.fluid.yaml"),
+    "table_pools": (table_pools(), None, "contracts/events/contract.fluid.yaml"),
     "rules_and_any": (rules_and_any(), "aws", "contract.fluid.yaml"),
     "kept_alive_stream": (kept_alive_stream(), "aws", "native.fluid.yaml"),
     "kept_alive_stream_maintained": (kept_alive_stream_maintained(), "aws", "native.fluid.yaml"),

@@ -462,6 +462,22 @@ def _list_schedulers() -> int:
     return 0
 
 
+def _print_pools(files: Dict[str, str]) -> None:
+    """The pools the DAGs put each output table's writers in, and how to create them."""
+    from fluid_build.util import airflow_pools
+
+    pools: Dict[str, str] = {}
+    for source in files.values():
+        if airflow_pools.CONSTANT in source:
+            pools.update(airflow_pools.declared_pools(source))
+    if not pools:
+        return
+    cprint(f"\n{len(pools)} one-slot Airflow pool(s) serialize the writers of each output table.")
+    cprint("`fluid schedule-sync --airflow-url ...` creates the ones Airflow lacks; or run:")
+    for command in airflow_pools.set_commands(pools):
+        cprint(f"  {command}", markup=False)
+
+
 def _print_summary(output_dir: Path, files: Dict[str, str], scheduler_name: str) -> None:
     """Print a clean summary of generated files."""
     cprint(f"\nGenerated {len(files)} files ({scheduler_name} scheduler):\n")
@@ -469,4 +485,5 @@ def _print_summary(output_dir: Path, files: Dict[str, str], scheduler_name: str)
     for rel_path in sorted(files.keys()):
         cprint(f"  {output_dir / rel_path}")
 
+    _print_pools(files)
     cprint("\nTip: To regenerate after editing the contract: fluid generate schedule")

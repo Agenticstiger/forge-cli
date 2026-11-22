@@ -21,7 +21,7 @@ Imported only when ``--airflow-url`` is set (``httpx`` comes with it).
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -37,6 +37,7 @@ from fluid_build.cli._airflow_api import (
     credentials_from_env,
     normalize_url,
 )
+from fluid_build.util import airflow_pools
 
 #: Schedulers whose Airflow REST API forge can reach with a token or a password. MWAA's
 #: API is reached through AWS (a web login token, or InvokeRestApi), which this does not do.
@@ -89,6 +90,8 @@ class AirflowCheck:
     indirect: bool
     files: List[chk.DagFile]
     client: Optional[AirflowApi] = None
+    #: ``{name: description}`` of the pools the DAG files declare (``FLUID_TABLE_POOLS``).
+    pools: Dict[str, str] = field(default_factory=dict)
 
     # 1 ── flags ─────────────────────────────────────────────────────────
 
@@ -183,6 +186,7 @@ class AirflowCheck:
             scheme=scheme,
             indirect=indirect,
             files=files,
+            pools=pools_of(files),
         )
 
     def plan(self) -> None:
@@ -199,6 +203,11 @@ class AirflowCheck:
             )
         )
         ids = [dag_id for f in self.files for dag_id in f.dag_ids]
+        if self.pools and not self.check_only:
+            _say(
+                f"would create {len(self.pools)} one-slot pool(s) that do not exist: "
+                + ", ".join(sorted(self.pools))
+            )
         dynamic = [f.path for f in self.files if f.dynamic]
         _say(
             f"would check {self.base_url} (API {self.api}, auth {auth}) and would wait up to "
@@ -244,7 +253,57 @@ class AirflowCheck:
             return None
         if not pushed:
             return skipped_report("The push failed, so Airflow was not checked.")
-        return self.wait(results)
+        pools = self.ensure_pools() if self.pools and not self.check_only else None
+        report = self.wait(results)
+        if pools is not None:
+            report["pools"] = pools
+            if pools["result"] == "failed":
+                report["result"] = "failed"
+                report["message"] = f"{pools['message']} {report.get('message') or ''}".strip()
+        return report
+
+    def ensure_pools(self) -> Dict[str, Any]:
+        """Create each pool the DAG files declare that Airflow does not hold yet.
+
+        A pool that exists is left as it is, whoever made it and however many slots it
+        has: this never shrinks or edits one. The block is the report's ``pools``.
+        """
+        client = self.client
+        if client is None:  # preflight() raised, or was never called
+            raise RuntimeError("AirflowCheck.ensure_pools() before a successful preflight()")
+        created: List[str] = []
+        existing: List[Dict[str, Any]] = []
+        try:
+            held = client.pools()
+            for name, description in sorted(self.pools.items()):
+                if name not in held and client.create_pool(
+                    name, airflow_pools.POOL_SLOTS, description
+                ):
+                    created.append(name)
+                    _say(f"pool {name} created with {airflow_pools.POOL_SLOTS} slot")
+                    continue
+                slots = held.get(name)
+                existing.append({"name": name, "slots": slots})
+                said = f"pool {name} exists" + (
+                    f" with {slots} slots; left as it is (its writers may overlap)"
+                    if slots not in (None, airflow_pools.POOL_SLOTS)
+                    else "; left as it is"
+                )
+                _say(said)
+        except AirflowApiError as exc:
+            _say(f"✘ [{slug_for(exc.event)}] {exc.message}")
+            commands = airflow_pools.set_commands(self.pools)
+            for command in commands:
+                _say(f"with Airflow's CLI: {command}")
+            return {
+                "result": "failed",
+                "event": exc.event,
+                "message": f"The pools could not be ensured: {exc.message}",
+                "created": created,
+                "existing": existing,
+                "commands": commands,
+            }
+        return {"result": "passed", "created": created, "existing": existing}
 
     def wait(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Wait for the parse; the report's ``airflow_check`` block (``result`` says pass)."""
@@ -303,6 +362,15 @@ class AirflowCheck:
             return
         mark = "✔" if result.state == "clean" else "✘"
         _say(f"{mark} {result.path}: {result.detail}")
+
+
+def pools_of(files: List[chk.DagFile]) -> Dict[str, str]:
+    """``{name: description}`` of the pools the DAG files declare."""
+    pools: Dict[str, str] = {}
+    for file in files:
+        if file.source and airflow_pools.CONSTANT in file.source:
+            pools.update(airflow_pools.declared_pools(file.source))
+    return pools
 
 
 def skipped_report(reason: str) -> Dict[str, Any]:

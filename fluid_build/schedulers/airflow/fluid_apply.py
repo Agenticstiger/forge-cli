@@ -118,6 +118,7 @@ from fluid_build.schedulers.airflow._assets import (
     expose_asset_uri,
     normalize_dataset_uri,
 )
+from fluid_build.util import airflow_pools
 from fluid_build.util.contract import (
     builds_writing_expose,
     get_builds,
@@ -359,6 +360,11 @@ class BuildTask:
     trigger_rule: Optional[str] = None
     #: The asset URIs of the exposes the build writes, declared as the task's ``outlets``.
     outlets: Tuple[str, ...] = ()
+    #: The one-slot Airflow pool of the table the build writes (``poolPerOutputTable``), or
+    #: ``None``. A build that writes several tables takes the pool of the first.
+    pool: Optional[str] = None
+    #: What the pool is for, kept with it for the DAG's ``FLUID_TABLE_POOLS``.
+    pool_description: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -936,6 +942,7 @@ class _BuildGraph:
     def __init__(self, contract: Dict[str, Any], builds: List[Dict[str, Any]]) -> None:
         self.contract = contract
         self.builds = builds
+        self.pool_per_table = _pool_per_output_table(contract)
         self.managed = _managed_lane(contract)
         self.kinds = [_classify(b, self.managed) for b in builds]
         self.in_dags = [i for i, (k, _) in enumerate(self.kinds) if k not in (_OUTSIDE, _ELSEWHERE)]
@@ -1187,13 +1194,20 @@ class _BuildGraph:
         if spark:
             _check_spark_ids(self.contract, build_id)
         upstream_ids = {j for j, _ in self.upstream.get(i, [])}
+        outlets = self._outlets(build)
+        pool = description = None
+        if self.pool_per_table and outlets:
+            pool = airflow_pools.pool_name(outlets[0])
+            description = airflow_pools.pool_description(outlets[0])
         return BuildTask(
             build_id=build_id,
             retries=_retries(build),
             task_timeout_s=_task_timeout_s(build, build_id) if spark else None,
             upstream=tuple(self.name(j) for j in order if j in upstream_ids),
             trigger_rule=TRIGGER_RULES[conditions.pop()] if conditions else None,
-            outlets=self._outlets(build),
+            outlets=outlets,
+            pool=pool,
+            pool_description=description,
         )
 
     def _outlets(self, build: Dict[str, Any]) -> Tuple[str, ...]:
@@ -1204,6 +1218,21 @@ class _BuildGraph:
             if uri and uri not in uris and any(w is build for w in writers):
                 uris.append(uri)
         return tuple(uris)
+
+
+def _pool_per_output_table(contract: Mapping[str, Any]) -> bool:
+    """``orchestration.airflow.poolPerOutputTable``: off unless the contract says ``true``."""
+    orchestration = contract.get("orchestration")
+    airflow = orchestration.get("airflow") if isinstance(orchestration, Mapping) else None
+    value = airflow.get("poolPerOutputTable") if isinstance(airflow, Mapping) else None
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ScheduleRenderError(
+            "orchestration.airflow.poolPerOutputTable must be true or false, not "
+            f"{type(value).__name__}"
+        )
+    return value
 
 
 def _expose_writer_id(build: Mapping[str, Any]) -> Optional[str]:
@@ -1749,6 +1778,8 @@ def render_build_task(
             + "".join(f"            Asset({lit(uri)}),\n" for uri in task.outlets)
             + "        ],\n"
         )
+    if task.pool:
+        extra += f"        pool={lit(task.pool)},\n        pool_slots={airflow_pools.POOL_SLOTS},\n"
     return (
         f"{head}"
         f"        task_id={task_id},\n"
@@ -1833,6 +1864,12 @@ def _schedule_constants(dag: ScheduledDag) -> str:
     if schedule.datasets:
         out += "DATASETS = [\n" + "".join(f"    {lit(uri)},\n" for uri in schedule.datasets) + "]\n"
     out += f"TIMEZONE = {lit(schedule.timezone)}\n"
+    pools = {t.pool: t.pool_description or "" for t in dag.tasks if t.pool}
+    if pools:
+        # Read back by ``fluid schedule-sync`` (util/airflow_pools.declared_pools).
+        out += f"{airflow_pools.CONSTANT} = {{\n"
+        out += "".join(f"    {lit(name)}: {lit(pools[name])},\n" for name in sorted(pools))
+        out += "}\n"
     if len(dag.tasks) == 1:
         out += f"RETRIES = {int(dag.tasks[0].retries)}\n"
     return out

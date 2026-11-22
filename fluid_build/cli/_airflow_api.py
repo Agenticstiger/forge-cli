@@ -54,7 +54,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import quote, urlsplit, urlunsplit
 
 #: Operator-only: a secret reference resolving to a bearer token.
@@ -655,6 +655,33 @@ class AirflowApi:
             if isinstance(row, dict)
         ]
 
+    def pools(self) -> Dict[str, int]:
+        """``{name: slots}`` of every pool Airflow holds."""
+        rows = self._paged(f"/api/{self.dialect}/pools", "pools")
+        out: Dict[str, int] = {}
+        for row in rows:
+            name, slots = row.get("name"), row.get("slots")
+            if isinstance(name, str):
+                out[name] = slots if isinstance(slots, int) and not isinstance(slots, bool) else 0
+        return out
+
+    def create_pool(self, name: str, slots: int, description: str) -> bool:
+        """Create the pool ``name``; ``False`` when Airflow already holds one of that name.
+
+        A pool that exists is never changed here: ``POST /pools`` answers 409 for it and
+        nothing is sent to its own path. ``slots`` and ``description`` are Airflow's field names
+        on both majors.
+        """
+        path = f"/api/{self.dialect}/pools"
+        doc = self._call_json(
+            "POST",
+            path,
+            json_body={"name": name, "slots": slots, "description": description},
+            ok=(200, 201),
+            conflict_ok=True,
+        )
+        return doc is not None
+
     def _paged(self, path: str, key: str) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         offset = 0
@@ -675,14 +702,32 @@ class AirflowApi:
     def _get_json(
         self, path: str, *, params: Optional[Dict[str, Any]] = None, allow_404: bool = False
     ) -> Optional[Dict[str, Any]]:
-        what = f"GET {path}"
+        return self._call_json("GET", path, params=params, allow_404=allow_404)
+
+    def _call_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Any = None,
+        allow_404: bool = False,
+        ok: Tuple[int, ...] = (200,),
+        conflict_ok: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """One request answered with a JSON object: ``None`` for a 404 when ``allow_404``, and
+        for a 409 when ``conflict_ok`` (the object is already there)."""
+        what = f"{method} {path}"
+        reads = method == "GET"
         renewed = False
         while True:
-            resp = self._send("GET", path, what=what, params=params)
+            resp = self._send(method, path, what=what, params=params, json_body=json_body)
             status = resp.status_code
-            if status == 200:
+            if status in ok:
                 return self._json(resp, what)
             if status == 404 and allow_404:
+                return None
+            if status == 409 and conflict_ok:
                 return None
             refused = status == 401 or (
                 status == 403 and self.dialect == "v2" and _INVALID_JWT in _detail(resp)
@@ -704,9 +749,15 @@ class AirflowApi:
             if status == 403:
                 raise AirflowApiError(
                     _E_FORBIDDEN,
-                    f"{what} answered 403 ({_detail(resp)}): the user may not read it.",
-                    "Give the user or token read access to DAGs and import errors (the Viewer "
-                    "role reads both).",
+                    f"{what} answered 403 ({_detail(resp)}): the user may not "
+                    f"{'read it' if reads else 'change it'}.",
+                    (
+                        "Give the user or token read access to DAGs and import errors (the Viewer "
+                        "role reads both)."
+                        if reads
+                        else "Give the user or token permission to create pools (the Op role has it), "
+                        "or create them with the `airflow pools set` lines the report prints."
+                    ),
                 )
             raise AirflowApiError(_E_RESPONSE, f"{what} answered {status} ({_detail(resp)}).")
 
