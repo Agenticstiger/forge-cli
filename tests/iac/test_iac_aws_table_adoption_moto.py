@@ -13,7 +13,8 @@ and output formats and SerDe), then a contract names them:
   holds it, its metadata location is untouched, and the next plan is empty;
 * one that differs, or a Hive table under an Iceberg binding, is refused naming the
   differences, with nothing in state and the table as it was;
-* without the flag an existing table is refused;
+* without the flag an existing table is refused, unless forge made it: a table that
+  carries forge's marker, met again after its state was lost, is imported as before;
 * the Lake Formation grants the contract declares are planned beside the adopted
   table, which is imported, not replaced;
 * a partitioned Hive table cannot be adopted: its partition trigger is new to the state,
@@ -268,6 +269,34 @@ def test_a_matching_iceberg_table_is_adopted_and_keeps_its_metadata(
     again = _apply_args(_write_plan(tmp_path / "contract.json", contract), tmp_path, dry_run=True)
     assert engine.apply_via_opentofu(again, _LOG) == 0
     assert _summary(capfd.readouterr().out) == ("0", "0", "0")
+
+
+def test_a_table_forge_made_is_re_attached_after_its_state_is_lost(
+    moto_endpoint: str, tmp_path: Path
+) -> None:
+    """A fresh workspace on every run keeps no state: the next apply meets the table forge
+    made and imports it as before, with no flag, and can still change it."""
+    cid = "iac.adopt.own"
+    bucket = "adopt-own-lake"
+    workdir = _sidecar(tmp_path, cid, moto_endpoint)
+    plan = _write_plan(tmp_path / "contract.json", _contract(bucket, cid))
+    assert engine.apply_via_opentofu(_apply_args(plan, tmp_path), _LOG) == 0
+    (workdir / "terraform.tfstate").unlink()
+    grown = _contract(
+        bucket,
+        cid,
+        schema=[
+            {"name": "id", "type": "bigint", "required": True},
+            {"name": "note", "type": "string"},
+        ],
+    )
+
+    again = _write_plan(tmp_path / "contract.json", grown)
+    assert engine.apply_via_opentofu(_apply_args(again, tmp_path), _LOG) == 0
+
+    assert _table_address(cid) in _state_addresses(workdir)
+    live = _boto("glue", moto_endpoint).get_table(DatabaseName=DATABASE, Name=TABLE)["Table"]
+    assert [column["Name"] for column in live["StorageDescriptor"]["Columns"]] == ["id", "note"]
 
 
 def test_a_table_that_differs_is_refused_naming_its_columns_and_location(

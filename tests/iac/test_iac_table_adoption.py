@@ -619,3 +619,19 @@ def test_the_rendered_import_block_carries_only_its_address_and_id():
     assert import_section([block]) == {
         "import": [{"to": ADDRESS, "id": "123456789012:sales:orders"}]
     }
+
+
+@pytest.mark.parametrize(
+    "parameters, made",
+    [
+        ({"managed_by": "fluid", "classification": "iceberg"}, True),
+        ({"managed_by": " Fluid "}, True),
+        ({"managed_by": "airflow"}, False),
+        ({"classification": "parquet"}, False),
+        (None, False),
+    ],
+)
+def test_a_table_is_forge_made_only_with_forge_s_marker(parameters, made):
+    values = {} if parameters is None else {"parameters": parameters}
+
+    assert get_iac_plugin("aws").table_made_by_forge(values) is made

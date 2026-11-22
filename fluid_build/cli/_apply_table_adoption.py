@@ -8,9 +8,10 @@ The rules are :mod:`fluid_build.iac.adoption`'s; this module applies them to a r
 
 1. :func:`before_lookup`: with the flag, a table the contract names that the run cannot
    look for (no import id) is refused before anything is imported;
-2. :func:`refuse_unless_asked`: the brownfield look-up (``_adopt_existing``) found
-   tables that exist and that the state does not hold, and without the flag the run
-   stops there, naming them;
+2. :func:`foreign_tables`, then :func:`refuse_unless_asked`: the brownfield look-up
+   (``_adopt_existing``) found tables that exist and that the state does not hold;
+   one forge made is re-attached as before, and for any other the run stops without
+   the flag, naming them;
 3. :func:`write_import_blocks`: with the flag, each found table goes into the module as
    an OpenTofu ``import`` block, so the plan shows its import and writes no state;
 4. :func:`check_plan`: the saved plan must import each one unreplaced, and the plugin's
@@ -26,6 +27,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from fluid_build._contract_loader import CLIError
 from fluid_build.cli.console import cprint_literal
+from fluid_build.iac import runner
 from fluid_build.iac.adoption import (
     ADOPT_TABLES_FLAG,
     TableReview,
@@ -47,6 +49,29 @@ def asked(args: Any) -> bool:
 def tables_of(blocks: Sequence[Any]) -> List[Any]:
     """The imports among ``blocks`` that take over a table (``ImportBlock.table``)."""
     return [block for block in blocks if getattr(block, "table", None)]
+
+
+def foreign_tables(plugin: Any, adopted: Sequence[Any], workdir: str, env: Any) -> List[Any]:
+    """The tables among ``adopted`` that forge did not make: the ones ``--adopt-tables`` is for.
+
+    A table that carries forge's own marker (``table_made_by_forge``: on AWS the Glue
+    parameter ``managed_by: fluid`` its module sets when it creates the table, kept by
+    ``ignore_changes``) is forge's, met again because its state was lost or kept nowhere
+    (a fresh workspace on every run). It is re-attached as before, without the flag and
+    without the check, so such a run can still change the table to the contract. Read
+    from the state the look-up imported the tables into; a plugin without the capability,
+    or a state that cannot be read, makes every table foreign.
+    """
+    tables = tables_of(adopted)
+    made_by_forge = getattr(plugin, "table_made_by_forge", None)
+    if not tables or not callable(made_by_forge):
+        return tables
+    values: Dict[str, Any] = {
+        str(resource.get("address") or ""): resource.get("values") or {}
+        for resource in runner.tofu_state_resources(workdir, env=env)
+        if isinstance(resource, Mapping)
+    }
+    return [block for block in tables if not made_by_forge(values.get(block.to) or {})]
 
 
 def before_lookup(

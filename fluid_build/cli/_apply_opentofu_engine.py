@@ -227,15 +227,16 @@ def _look_up_existing(eng: _Engine, args, logger: logging.Logger, imported: Any)
 def _tables_through_import_blocks(
     eng: _Engine, args, adopted: List[Any], imported: Any
 ) -> List[Any]:
-    """The existing tables ``fluid apply`` found, moved from state into ``import`` blocks.
+    """The existing tables forge did not make that ``fluid apply`` found, moved from state
+    into ``import`` blocks.
 
     The brownfield look-up (:func:`_adopt_existing`) imports a table to learn that it
     exists. Without ``--adopt-tables`` the run stops here (``_apply_table_adoption``);
     with it the table goes back out of state and into the module as an ``import`` block,
     so the plan shows its import and the check reads it from the saved plan. The other
-    imports stay in state for the apply, as before.
+    imports, a table forge made among them, stay in state for the apply, as before.
     """
-    tables = _table_adoption.tables_of(adopted)
+    tables = _table_adoption.foreign_tables(eng.plugin, adopted, eng.workdir, eng.env)
     _table_adoption.refuse_unless_asked(args, tables)
     if not tables:
         return []
@@ -649,11 +650,11 @@ def _plan_with_opentofu(
 
     with _imports_kept_only_by_an_apply(eng.workdir, eng.env, logger) as imported:
         adopted: List[ImportBlock] = _look_up_existing(eng, args, logger, imported)
-        # An existing table the state does not hold stops the plan unless it was asked to
-        # adopt it; the hand-back runs first, as the run stops.
-        _table_adoption.refuse_unless_asked(args, _table_adoption.tables_of(adopted))
+        # Read while the look-up's imports are in state: a table forge did not make stops
+        # the plan unless it was asked to adopt it; the hand-back runs first, as it stops.
+        tables = _table_adoption.foreign_tables(eng.plugin, adopted, eng.workdir, eng.env)
+        _table_adoption.refuse_unless_asked(args, tables)
     _refuse_unreleased_imports(eng, adopted)
-    tables = _table_adoption.tables_of(adopted)
     if adopted:
         # Escaped as the module is: an import id carries contract text.
         _table_adoption.write_import_blocks(eng.module_path, adopted)

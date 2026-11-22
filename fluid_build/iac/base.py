@@ -69,6 +69,10 @@ class IacProviderPlugin(Protocol):
       ``--adopt-tables`` (``iac/adoption.py``), and a run with the flag that
       found no import for one of them is refused (``table_adoption_hint`` says
       why). A plugin without it adopts what it finds, as before.
+    * ``table_made_by_forge(values)``: whether a found table (its values in state)
+      carries the marker forge's module sets on create; such a table is forge's own,
+      re-attached as before without ``--adopt-tables``. Without the capability every
+      found table needs the flag.
     * ``review_table_adoption(change, declared)``: ``(differences, updates)`` of
       one table the saved plan imports (a ``tofu show -json`` resource change,
       and the table's body in the module); any difference refuses the run.

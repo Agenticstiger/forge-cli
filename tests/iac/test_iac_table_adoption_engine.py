@@ -313,6 +313,47 @@ def test_the_flag_on_a_provider_without_table_adoption_says_so(tofu, tmp_path, m
     assert "--adopt-tables" in out and "adopts no tables" in out
 
 
+def _made_by_forge(monkeypatch) -> None:
+    """The table in state carries the marker forge's module sets on create."""
+    state = [{"address": TABLE, "values": {"parameters": {"managed_by": "fluid"}}}]
+    monkeypatch.setattr(engine.runner, "tofu_state_resources", lambda *a, **k: state)
+
+
+def test_a_table_forge_made_is_re_attached_as_before_without_the_flag(tofu, tmp_path, monkeypatch):
+    """Its state was lost, or kept nowhere (a fresh workspace on every run): the table is
+    forge's own, so the apply imports it as it always did and may change it in place."""
+    _made_by_forge(monkeypatch)
+    tofu["shown"] = DIFFERING  # what the contract now declares; never checked for it
+
+    assert engine.apply_via_opentofu(_args(tmp_path), _LOG) == 0
+
+    (module,) = tofu["plans"]
+    assert _imports(module) == []
+    assert tofu["state_rm"] == [] and tofu["apply"] == 1
+
+
+def test_with_the_flag_a_table_forge_made_is_not_checked_either(tofu, tmp_path, monkeypatch):
+    _made_by_forge(monkeypatch)
+    tofu["shown"] = DIFFERING
+
+    assert engine.apply_via_opentofu(_args(tmp_path, adopt_tables=True), _LOG) == 0
+
+    assert tofu["apply"] == 1
+
+
+def test_plan_tofu_re_attaches_a_table_forge_made_without_recording_an_adoption(
+    tofu, tmp_path, monkeypatch
+):
+    _made_by_forge(monkeypatch)
+    tofu["shown"] = DIFFERING
+
+    record = _plan(tmp_path)
+
+    assert "adoptedTables" not in record
+    (module,) = tofu["plans"]
+    assert {"to": TABLE, "id": f"{ACCOUNT}:sales:orders"} in _imports(module)
+
+
 # ── fluid plan --tofu ───────────────────────────────────────────────────────
 
 

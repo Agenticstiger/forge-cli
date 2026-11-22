@@ -985,6 +985,16 @@ class AwsIacPlugin:
                 tables[f"aws_glue_catalog_table.{key}"] = f"{database}.{table}"
         return tables
 
+    def table_made_by_forge(self, values: Mapping[str, Any]) -> bool:
+        """Did forge make this Glue table? Its module sets ``managed_by: fluid`` among the
+        table's parameters on create (:func:`_emit_glue`), and ``ignore_changes`` keeps
+        whatever the table holds since; Iceberg's commits keep it too. ``values`` is the
+        table in state, as the brownfield look-up imported it."""
+        parameters = values.get("parameters")
+        if not isinstance(parameters, Mapping):
+            return False
+        return str(parameters.get("managed_by") or "").strip().lower() == "fluid"
+
     def review_table_adoption(
         self, change: Mapping[str, Any], declared: Mapping[str, Any]
     ) -> Tuple[List[str], List[str]]:
