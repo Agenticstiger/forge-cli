@@ -75,8 +75,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries a conventions file the import reads as written, describes importer plugins, and takes
   existing Glue tables over with `--adopt-tables` through a reviewed plan.
   `releasing-streaming-products` says how a changed Spark stream stops between batches, which
-  runs are cancelled instead, what each Iceberg commit's stamps hold and how `fluid ship
-  --release-dir` and `fluid runs status --release-dir` name the release in force.
+  runs are cancelled instead, what its probation watches and when a failed release is rolled
+  back or refused, what each Iceberg commit's stamps hold and how `fluid ship --release-dir`
+  and `fluid runs status --release-dir` name the release in force.
   `publishing-to-data-mesh-manager` publishes a batch as drafts, promotes the drafts a `fluid
   verify` report shows clean and reads a migration's status. `fluid scaffold-ide` installs them
   with the others (`.agents/skills/`, which Codex reads, for `generic`, `cursor` and `cline`). A

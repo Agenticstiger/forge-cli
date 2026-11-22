@@ -7,8 +7,6 @@ compatibility: Needs the fluid CLI on PATH (pip install data-product-forge). The
 
 # Releasing streaming products
 
-<!-- TODO: add the probation and rollback steps when they ship. -->
-
 `fluid apply` replaces a stream whose config changed. It asks the running stream to stop
 between two batches, so no batch is cut in half, and the new config resumes from the same
 checkpoint.
@@ -28,10 +26,11 @@ When the apply replaces a stream:
    (`_fluid/spark/<product>/<build>/`; on `runtime: local`, under `FLUID_SPARK_LOCAL_ROOT`).
 2. The runner looks for it every 10 s, stops each query once no batch is running in it, and
    ends cleanly. The new config starts on the same checkpoint.
-3. A run that has not stopped within `FLUID_SPARK_STOP_GRACE_SECONDS` (default 300; `0`
-   cancels at once) is cancelled. The request is removed whatever happens, Ctrl-C included.
+3. A run that has not stopped within `FLUID_SPARK_STOP_GRACE_SECONDS` (default 300, at most
+   3600; `0` cancels at once) is cancelled. The request is removed whatever happens, Ctrl-C
+   included.
 4. The outcome names the config hashes the stream moved from and to, and how each old run
-   stopped.
+   stopped. Then the apply watches the new run (see Probation and rollback).
 
 These runs are cancelled at once instead of asked:
 
@@ -49,10 +48,43 @@ nothing.
 - Moving `properties.stream.checkpoint`: the new run starts from `startingOffsets` unless
   the new location already holds a position. The outcome says which one happened.
 - Copying a checkpoint from another stream: the runner refuses a checkpoint whose newest
-  offsets name another topic, before it reads anything.
+  offsets name another topic, or partitions the topic no longer has, before it reads anything.
 - `apply_spark_artifact_mismatch`: the Spark runs compiled now differ from the plan's (a
   plan made before a fluid upgrade, or with other Spark settings in the environment). Plan
   again, in the environment the apply runs in.
+
+## Probation and rollback
+
+After `fluid apply` starts a stream's new config over a previous one, it watches the new run for
+`FLUID_SPARK_RELEASE_PROBATION_SECONDS` (default 300, at most 3600; `0` turns the watch off)
+before it returns. It watches each changed stream in turn, so an apply of several changed streams
+takes that much longer for each. Set `0` where a scheduler's timeout is shorter than the wait.
+
+A run that fails in that time, or that its runtime retries, has failed its probation. The apply
+cancels it, starts the previous job config again on its checkpoint, and fails with
+`spark_release_rolled_back`. Its outcome names both runs, both configs and the cause. Tell the
+user what it says the output now holds:
+
+- On a shared checkpoint, the batches the failed run committed stay in the output, and the
+  rolled-back run resumes after them.
+- When the release moved the checkpoint (`properties.stream.checkpoint`) and the old config
+  writes another output, the failed run's output keeps what it wrote, and the old config goes on
+  writing its own.
+
+Only the job config goes back: the rolled-back run keeps the runner and the settings this apply
+compiled, so a release that changed only those rolls nothing back and says so. A stream last
+started by a fluid that kept no release record cannot go back: the outcome says so and leaves the
+failing run as it is. `--mode reconcile` watches nothing and rolls nothing back.
+
+| Event | What it means | Do |
+|---|---|---|
+| `spark_release_rolled_back` | the new config failed its probation, and the previous one runs again | tell the user what the output holds; fix the contract, then plan and apply again |
+| `apply_spark_rollback_unsafe` | the release moved the checkpoint and the old config writes the same output or dead-letter table, so nothing went back: the failed run is cancelled and the stream is down | ask the user: fix the contract and apply, or apply the previous contract on purpose and expect the records between the two checkpoints twice |
+| `apply_spark_no_known_good_config` | the config the release replaced did not end well (its last run failed, was cancelled before the apply, or was lost), and the stream is down | fix the contract and apply; the failed run's outcome names its error |
+| `apply_spark_release_failed_earlier` | this config failed its probation on an earlier apply, and its marker (`releases/<hash16>/failed` beside the build's job config) keeps it from starting | change the contract to fix it; only when the cause was the environment, ask the user to set `FLUID_SPARK_ACCEPT_FAILED_RELEASE=1` for one apply |
+| `apply_spark_artifact_read_denied` | the identity that runs `fluid apply` cannot read the build's prefix (`_fluid/spark/<product>/<build>/`), so nothing was started | grant it `s3:GetObject` there, and `s3:ListBucket`: without it S3 answers a missing marker with AccessDenied |
+
+`FLUID_SPARK_ACCEPT_FAILED_RELEASE` is the operator's to give: a project `.env` cannot set it.
 
 ## What each commit records
 
