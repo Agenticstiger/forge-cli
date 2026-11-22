@@ -1290,9 +1290,9 @@ def _unquoted(value: str) -> str:
     return value
 
 
-#: Every string the running contract wrote, before ``fluid apply`` rendered its
+#: What the running contract wrote, before ``fluid apply`` rendered its
 #: placeholders, while :func:`destinations_as_written` is active; else ``None``.
-_AS_WRITTEN: ContextVar[Optional[Tuple[str, ...]]] = ContextVar(
+_AS_WRITTEN: ContextVar[Optional[Tuple[Any, ...]]] = ContextVar(
     "fluid_secret_destinations_as_written", default=None
 )
 
@@ -1305,27 +1305,70 @@ def destinations_as_written(written: Any) -> Iterator[None]:
     runner asks for a secret (``build_runners/base.py``), so a host judged there
     may be the value of any variable the contract named. The acquisition
     dispatcher passes the contract as written: a refusal then quotes a host the
-    contract wrote as it stands, names the placeholder of one it rendered, and
+    contract wrote as it stands, in the same field of the connection block that
+    renders to the judged one, names the placeholder of one it rendered, and
     quotes nothing it cannot trace (:func:`_shown_host`).
     """
-    token = _AS_WRITTEN.set(tuple(_strings_in(written)))
+    token = _AS_WRITTEN.set((written,))
     try:
         yield
     finally:
         _AS_WRITTEN.reset(token)
 
 
-def _strings_in(value: Any) -> Iterator[str]:
-    """Every string in ``value``, through its mappings and lists."""
+def _mappings_in(value: Any) -> Iterator[Mapping[str, Any]]:
+    """Every mapping in ``value``, through its mappings and lists."""
     pending = [value]
     while pending:
         item = pending.pop()
-        if isinstance(item, str):
+        if isinstance(item, Mapping):
             yield item
-        elif isinstance(item, Mapping):
             pending.extend(item.values())
         elif isinstance(item, (list, tuple)):
             pending.extend(item)
+
+
+def _render_value(value: Any) -> Any:
+    """``value`` with its placeholders rendered, as ``build_runners/base.py`` renders a contract."""
+    if isinstance(value, str):
+        return _render(value)
+    if isinstance(value, list):
+        return [_render_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _render_value(item) for key, item in value.items()}
+    return value
+
+
+def _written_blocks(connection: Optional[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
+    """The connection blocks the contract wrote that render to ``connection``.
+
+    ``connection`` is a block as a runner hands it to this policy: rendered,
+    its ``secretRef`` taken out. Only such a block shows how the contract wrote
+    one of its fields; a string elsewhere that equals a rendered host says
+    nothing about that host, and quoting it as written would confirm a guess.
+    """
+    written = _AS_WRITTEN.get()
+    if written is None or connection is None:
+        return []
+    wanted = {key: value for key, value in connection.items() if key != "secretRef"}
+    blocks: List[Mapping[str, Any]] = []
+    for block in _mappings_in(written):
+        own = {key: value for key, value in block.items() if key != "secretRef"}
+        if own.keys() == wanted.keys() and _render_value(own) == wanted:
+            blocks.append(block)
+    return blocks
+
+
+def _value_at(value: Any, path: Tuple[Any, ...]) -> Any:
+    """What ``value`` holds at ``path``, of keys and list indexes; ``None`` for nothing."""
+    for part in path:
+        if isinstance(value, Mapping):
+            value = value.get(part)
+        elif isinstance(value, list) and isinstance(part, int) and 0 <= part < len(value):
+            value = value[part]
+        else:
+            return None
+    return value
 
 
 def _host_readings(text: str) -> List[str]:
@@ -1340,25 +1383,28 @@ def _render(text: str) -> str:
     return _ENV_PLACEHOLDER.sub(lambda match: os.environ.get(match.group(1), ""), text)
 
 
-def _shown_host(target: _Target, rendered: bool) -> Tuple[Optional[str], bool]:
+def _shown_host(
+    target: _Target, rendered: bool, connection: Optional[Mapping[str, Any]] = None
+) -> Tuple[Optional[str], bool]:
     """What a refusal may quote of ``target``, and whether that is placeholder text.
 
     That is its host, or a keyword string whole (of which the refusal then shows
     the host part alone). Outside ``fluid apply`` it is the contract's own text,
-    and is quoted. At apply, where placeholders are rendered, it is quoted only
-    when the contract wrote it as it stands (:func:`destinations_as_written`);
-    for one a placeholder rendered, the contract's text is quoted with the
-    placeholder; one traced to neither is not quoted at all.
+    and is quoted. At apply, where placeholders are rendered, it is read from
+    the same field of each block the contract wrote that renders to
+    ``connection`` (:func:`_written_blocks`): quoted when every such block wrote
+    it as it stands; for one a placeholder rendered, the contract's text is
+    quoted with the placeholder; one traced to neither is not quoted at all.
     """
     quoted = target.keyword_text if target.keyword_text is not None else target.host
     if quoted is None or not rendered:
         return quoted, False
-    written = _AS_WRITTEN.get()
-    if written is None:
-        return None, False
-    if any(_names_as_written(target, text) for text in written):
+    texts = [_value_at(block, target.path) for block in _written_blocks(connection)]
+    if texts and all(isinstance(text, str) and _names_as_written(target, text) for text in texts):
         return quoted, False
-    for text in written:
+    for text in texts:
+        if not isinstance(text, str):
+            continue
         if _ENV_PLACEHOLDER.search(text) and _names(target, _render(text)):
             if target.keyword_text is not None:
                 return text, True
@@ -1406,8 +1452,10 @@ class _Shown:
     kind: str
 
 
-def _shown(target: _Target, rendered: bool) -> _Shown:
-    shown, placeholder = _shown_host(target, rendered)
+def _shown(
+    target: _Target, rendered: bool, connection: Optional[Mapping[str, Any]] = None
+) -> _Shown:
+    shown, placeholder = _shown_host(target, rendered, connection)
     if target.keyword_text is not None or (target.host is not None and "=" in target.host):
         return _Shown(_keyword_host(shown) if shown is not None else None, "keyword")
     if target.host is None:
@@ -1472,10 +1520,14 @@ def _refusal_fix(parsed: SecretRef, shown: _Shown, label: str) -> str:
 
 
 def _destination_refusal(
-    parsed: SecretRef, target: _Target, *, rendered: bool = False
+    parsed: SecretRef,
+    target: _Target,
+    *,
+    rendered: bool = False,
+    connection: Optional[Mapping[str, Any]] = None,
 ) -> AcquisitionSecretPolicyError:
     label = _field_label(target)
-    shown = _shown(target, rendered)
+    shown = _shown(target, rendered, connection)
     return AcquisitionSecretPolicyError(
         what=(
             f"the contract would send {_what_sent(parsed)} to {_refusal_place(shown, label)} "
@@ -1593,7 +1645,7 @@ def refuse_unless_allowed(
             raise _database_refusal(parsed, target)
         if target.host is None and connection is not None and _host_is_blank(connection):
             raise _blank_host_refusal(parsed)
-        raise _destination_refusal(parsed, target, rendered=rendered)
+        raise _destination_refusal(parsed, target, rendered=rendered, connection=connection)
 
 
 # ── destinations only fluid apply can read ───────────────────────────────────

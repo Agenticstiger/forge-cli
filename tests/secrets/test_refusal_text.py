@@ -130,7 +130,9 @@ def test_the_acquisition_dispatcher_hands_the_policy_the_contract_as_written(
     assert base._execute_acquisition_build(build, {"builds": [build]}, tmp_path, dry_run=False) == 0
     assert SECRET_VALUE not in str(seen[SECRET_VALUE])
     assert "{{ env.FLUID_TEST_RENDERED }}" in seen[SECRET_VALUE].what
-    assert REMOTE in seen[REMOTE].what
+    # The build writes REMOTE elsewhere, not in a block that renders to this one.
+    assert REMOTE not in seen[REMOTE].what
+    assert "the host in connection.host" in seen[REMOTE].what
 
 
 # ── a keyword connection string ──────────────────────────────────────────────
@@ -204,6 +206,38 @@ def test_apply_quotes_a_written_host_whose_password_is_a_placeholder():
     assert SECRET_VALUE not in str(refusal)
     assert "host 'db.example.com' (connection.uri)" in refusal.what
     assert "PG@db.example.com" in refusal.fix
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("guess", [SECRET_VALUE, "wrong-guess.example"])
+def test_apply_does_not_confirm_a_rendered_host_another_field_guesses(guess):
+    """A refusal reads the same whether or not a string elsewhere matches the rendered host."""
+    from fluid_build.secrets.policy import destinations_as_written
+
+    written = {"host": "{{ env.FLUID_TEST_RENDERED }}", "application_name": guess}
+    contract = {
+        "metadata": {"owner": guess},
+        "builds": [{"properties": {"source": {"connection": written}}}],
+    }
+    with destinations_as_written(contract):
+        refusal = _apply_refusal({"host": SECRET_VALUE, "application_name": guess})
+    assert SECRET_VALUE not in refusal.what
+    assert "the host '{{ env.FLUID_TEST_RENDERED }}' renders to (connection.host)" in refusal.what
+
+
+@pytest.mark.unit
+def test_apply_quotes_a_host_as_written_only_when_every_matching_block_wrote_it():
+    from fluid_build.secrets.policy import destinations_as_written
+
+    contract = {
+        "builds": [
+            {"properties": {"source": {"connection": {"host": "{{ env.FLUID_TEST_RENDERED }}"}}}},
+            {"properties": {"source": {"connection": {"host": SECRET_VALUE}}}},
+        ]
+    }
+    with destinations_as_written(contract):
+        refusal = _apply_refusal({"host": SECRET_VALUE})
+    assert SECRET_VALUE not in refusal.what
 
 
 @pytest.mark.unit
