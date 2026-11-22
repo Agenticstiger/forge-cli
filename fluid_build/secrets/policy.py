@@ -48,12 +48,21 @@ repository could grant itself the policy meant to constrain it.
 
   A host written with a port never matches: leave the port off.
 
-Every destination a connection names is judged (:func:`connection_hosts`):
-``host`` and the host part of every URI field, each host of a host list, and
-the host of an SSH tunnel in use. A driver can be pointed elsewhere by a
-query-string parameter that names a host, or by a database name a connection
+The destinations judged (:func:`connection_hosts`) are ``host``, the host part
+of every URI field, each host of a host list, the host of an SSH tunnel in
+use, and a URI anywhere else in the block: the Singer and Airbyte runners hand
+the whole block to a connector, whose own settings may hold one. A driver can
+be pointed elsewhere by a parameter that names a host, in a URI's query string
+or in a mapping a connector reads as one, or by a database name a connection
 URL reads as more than a name; this policy cannot judge either, so beside a
 secret both are refused unless the reference may go to any host.
+
+The settings that name a host are listed here, a denylist, rather than the
+settings a connector may hold, an allowlist: a connector's own settings cannot
+all be listed, and refusing each one this policy does not know would leave an
+operator only an entry for any host, which judges nothing. So a host that a
+connector reads from a setting of its own as a bare name, not a URI, is not
+judged.
 
 The destination policy used to cover ``env://`` only, on the reasoning that the
 other schemes name a store the operator provisioned. That left the same hole one
@@ -140,7 +149,7 @@ DESTINATION_OVERRIDE_KEYS: FrozenSet[str] = frozenset(
 )
 
 #: Query-string parameters that name the host a driver connects to, or a file or
-#: a connection string that does, spelled as :func:`_query_keys` compares them
+#: a connection string that does, spelled as :func:`_host_key_name` compares them
 #: (lower case, letters and digits only). A driver can take its host from the
 #: query string as well as from the URI's host part, and drivers differ on which
 #: wins: libpq lets the query win (``conninfo_uri_parse_params``), and
@@ -173,6 +182,7 @@ _QUERY_HOST_KEYS: FrozenSet[str] = frozenset(
         "networkaddress",
         "datasource",
         "failoverpartner",
+        "filedsn",
         # MongoDB's SOCKS5 proxy; Snowflake's account and region make its host
         "proxyhost",
         "account",
@@ -185,12 +195,44 @@ _QUERY_HOST_KEYS: FrozenSet[str] = frozenset(
         "uri",
         "endpoint",
         "connectionstring",
+        # a class that opens the driver's socket, to wherever it likes: pgjdbc's
+        # ``socketFactory``, mssql-jdbc's ``socketFactoryClass``
+        "socketfactory",
+        "socketfactoryclass",
     }
 )
 
 #: Connection fields that hold a query string of their own: Airbyte's JDBC
-#: sources append ``jdbc_url_params`` to the JDBC URL they build.
+#: sources read ``jdbc_url_params`` (``key=value&...``) into the properties they
+#: hand the JDBC driver. Written as a mapping, its keys are read the same way.
 _QUERY_STRING_FIELDS = ("jdbc_url_params",)
+
+#: Connection fields holding a mapping that a Singer tap merges into its
+#: connection URL's query string, which the SQLAlchemy dialect then passes to
+#: the driver as keyword arguments (``opts.update(url.query)``): BuzzCutNorman's
+#: tap-mssql ``sqlalchemy_url_query`` (``update_query_dict``) and MeltanoLabs
+#: tap-mysql's ``sqlalchemy_options`` (``URL.create(query=...)``). Any other
+#: field named ``*_query`` that holds a mapping is read the same way.
+_QUERY_MAPPING_FIELDS = ("sqlalchemy_url_query", "sqlalchemy_options")
+#: Mappings a tap hands its driver's connect call as keyword arguments:
+#: tap-mssql passes ``sqlalchemy_eng_params`` to ``engine_from_config``, whose
+#: ``connect_args`` reach the driver.
+_DRIVER_ARGUMENT_PATHS = (("sqlalchemy_eng_params", "connect_args"),)
+#: Query parameters that may name a Unix-domain socket on this machine rather
+#: than a host: libpq's ``host`` (a value that looks like an absolute path names
+#: the socket's directory) and the MySQL drivers' ``unix_socket``.
+_SOCKET_QUERY_KEYS = frozenset({"host", "unixsocket"})
+#: One absolute POSIX path: not a host list (``,``), not a UNC path (``//``,
+#: ``\``), nothing a driver could decode once more (``%``), no blank.
+_SOCKET_PATH = re.compile(r"/(?!/)[^\\,%\s\x00-\x1f\x7f-\x9f]*")
+#: A value read as a URI with an authority wherever the block holds it:
+#: ``scheme://`` (a placeholder scheme included) or JDBC's ``jdbc:sub://``.
+_URI_SHAPE = re.compile(r"\s*(?:jdbc:)?(?:[A-Za-z][A-Za-z0-9+.\-]*|\{\{[^{}]*\}\})://")
+#: A field whose value may be a credential, which the walk for a URI never
+#: reads, so a refusal never quotes any part of it (letters and digits only).
+_CREDENTIAL_FIELD = re.compile(
+    r"(?:password|passwd|pwd|passphrase|secret|token|apikey|privatekey|accesskey|credentials?)$"
+)
 
 #: URI schemes whose client never takes its host from the query string.
 _UNROUTED_QUERY_SCHEMES = frozenset({"http", "https", "ws", "wss"})
@@ -204,6 +246,9 @@ _DATABASE_FIELDS = ("database", "dbname")
 _URL_SYNTAX = "?#;&@\\"
 #: Control characters (Unicode Cc), as ``providers/_sql_safety.py`` refuses them.
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+#: Top-level fields judged by name, which the walk for a URI elsewhere leaves
+#: to their own rule.
+_JUDGED_BY_NAME = frozenset({*_HOST_FIELDS, *_QUERY_STRING_FIELDS, *_DATABASE_FIELDS, "port"})
 
 #: The SSH tunnels a client can connect through, as ``(field, host key, off)``:
 #: the Singer taps' ``ssh_tunnel`` (``enable: false`` is off) and Airbyte's
@@ -554,6 +599,10 @@ class _Target:
     parameter that names a host or URL syntax in a database name. ``tunnel``
     marks an SSH tunnel's host, and ``behind_tunnel`` a host the client reads
     from the tunnel host's side, where a loopback host is not this machine.
+    ``local`` marks a Unix-domain socket a query names, which is this machine
+    whatever tunnel the client uses. ``field`` is where the connection holds the
+    destination, as a refusal names it, and ``path`` the same place as keys and
+    list indexes.
     """
 
     host: Optional[str]
@@ -565,6 +614,10 @@ class _Target:
     #: The field's text, for a keyword connection string (``Server=...;...``):
     #: a destination this policy cannot read, whose host part a refusal shows.
     keyword_text: Optional[str] = None
+    local: bool = False
+    path: Tuple[Any, ...] = ()
+    #: For a ``query_key``: it is a key of a mapping, not of a URI's query string.
+    query_mapping: bool = False
 
     @property
     def has_reason(self) -> bool:
@@ -579,32 +632,56 @@ def _connection_targets(connection: Mapping[str, Any]) -> List[_Target]:
     behind = bool(tunnels)
     out: List[_Target] = list(tunnels)
     for field_name in _HOST_FIELDS:
-        if field_name not in connection:
-            continue
-        raw = connection[field_name]
-        if field_name != "host" and isinstance(raw, str):
-            if _is_keyword_string(raw):
-                out.append(_Target(None, field_name, keyword_text=raw))
-                continue
-            out.extend(
-                _Target(None, field_name, query_key=key) for key in _uri_query_host_keys(raw)
-            )
-        out.extend(
-            _Target(host, field_name, behind_tunnel=behind)
-            for host in _field_hosts(field_name, raw)
-        )
+        if field_name in connection:
+            out.extend(_field_targets(field_name, connection[field_name], (field_name,), behind))
     for field_name in _QUERY_STRING_FIELDS:
         raw = connection.get(field_name)
-        if isinstance(raw, str):
-            out.extend(
-                _Target(None, field_name, query_key=key) for key in _query_keys_naming_a_host(raw)
-            )
+        if isinstance(raw, (str, Mapping)):
+            out.extend(_query_targets(raw, (field_name,)))
         elif raw is not None:
-            out.append(_Target(None, field_name))
+            out.append(_Target(None, field_name, path=(field_name,)))
+    for path, raw in _query_mappings(connection):
+        if isinstance(raw, Mapping):
+            out.extend(_query_targets(raw, path))
+        else:
+            out.append(_Target(None, _label(path), path=path))
+    for path, text in _uris_elsewhere(connection):
+        out.extend(_field_targets("uri", text, path, behind))
     out.extend(_database_targets(connection))
     if not _port_is_readable(connection.get("port")):
-        out.append(_Target(None, "port"))
+        out.append(_Target(None, "port", path=("port",)))
     return out
+
+
+def _field_targets(field_name: str, raw: Any, path: Tuple[Any, ...], behind: bool) -> List[_Target]:
+    """The destinations of one field, read as ``host`` when ``field_name`` is, else as a URI."""
+    label = _label(path)
+    out: List[_Target] = []
+    if field_name != "host" and isinstance(raw, str):
+        if _is_keyword_string(raw):
+            return [_Target(None, label, keyword_text=raw, path=path)]
+        sockets, keys = _uri_query_hosts(raw)
+        out.extend(_Target(None, label, query_key=key, path=path) for key in keys)
+        out.extend(_Target(socket, label, local=True, path=path) for socket in sockets)
+        if sockets and _authority_names_no_host(raw):
+            # The client connects to the socket the query names, not to a host.
+            return out
+    out.extend(
+        _Target(host, label, behind_tunnel=behind, path=path)
+        for host in _field_hosts(field_name, raw)
+    )
+    return out
+
+
+def _label(path: Tuple[Any, ...]) -> str:
+    """``path`` as a refusal names it: ``a.b``, and ``a[0]`` for a list entry."""
+    label = ""
+    for part in path:
+        if isinstance(part, int) and not isinstance(part, bool):
+            label += f"[{part}]"
+        else:
+            label += f".{part}" if label else str(part)
+    return label
 
 
 def _is_keyword_string(text: str) -> bool:
@@ -617,8 +694,8 @@ def _is_keyword_string(text: str) -> bool:
     return "://" not in text and "=" in re.split(r"[/?#]", text, maxsplit=1)[0]
 
 
-def _uri_query_host_keys(text: str) -> List[str]:
-    """The query-string parameters of URI ``text`` that name a host.
+def _uri_query_hosts(text: str) -> Tuple[List[str], List[str]]:
+    """The Unix-domain sockets, and the other host-naming parameters, of URI ``text``'s query.
 
     Everything after the first ``?`` counts, a fragment included: libpq has no
     fragment, and reads a ``#`` as part of the query. Text without a scheme is
@@ -628,31 +705,154 @@ def _uri_query_host_keys(text: str) -> List[str]:
     """
     stripped = text.strip()
     if "?" not in stripped or _is_object_store_uri(stripped):
-        return []
+        return [], []
     scheme, sep, _rest = stripped.partition("://")
     if sep and scheme.strip().lower() in _UNROUTED_QUERY_SCHEMES:
-        return []
-    return _query_keys_naming_a_host(stripped.partition("?")[2])
+        return [], []
+    return _query_hosts(_query_pairs(stripped.partition("?")[2]))
 
 
-def _query_keys_naming_a_host(query: str) -> List[str]:
-    """The keys of query string ``query`` in :data:`_QUERY_HOST_KEYS`, as spelled there.
+def _uri_query_host_keys(text: str) -> List[str]:
+    """The parameters of URI ``text``'s query that name a host other than a socket here."""
+    return _uri_query_hosts(text)[1]
+
+
+def _authority_names_no_host(text: str) -> bool:
+    """Whether URI ``text``'s authority holds no host (``scheme:///db``, ``scheme://u@:5432/db``)."""
+    stripped = text.strip()
+    _scheme, sep, rest = stripped.partition("://")
+    if not sep or _hosts_read_differently(stripped):
+        return False
+    authority = re.split(r"[/?#]", rest, maxsplit=1)[0]
+    return re.fullmatch(r"(?::\d*)?", authority.rpartition("@")[2]) is not None
+
+
+def _query_targets(raw: Union[str, Mapping[Any, Any]], path: Tuple[Any, ...]) -> List[_Target]:
+    """The destinations a query string, or a mapping read as one, names."""
+    pairs = _query_pairs(raw) if isinstance(raw, str) else _mapping_pairs(raw)
+    sockets, keys = _query_hosts(pairs)
+    label = _label(path)
+    mapping = not isinstance(raw, str)
+    targets = [
+        _Target(None, label, query_key=key, path=path, query_mapping=mapping) for key in keys
+    ]
+    targets.extend(_Target(socket, label, local=True, path=path) for socket in sockets)
+    return targets
+
+
+def _query_pairs(query: str) -> List[Tuple[str, List[Any]]]:
+    """Each parameter of query string ``query`` that names a host, with its value's readings.
+
+    Parameters are split on ``&``, on ``;`` (SQL Server's JDBC properties) and
+    on ``#``. A value is read percent-decoded, as libpq decodes it, and once
+    more with ``+`` read as a space, as SQLAlchemy's ``parse_qsl`` reads it.
+    """
+    pairs: List[Tuple[str, List[Any]]] = []
+    for part in re.split(r"[&;#]", query):
+        key, _, value = part.partition("=")
+        name = _host_key_name(key)
+        if name is not None:
+            pairs.append((name, [unquote(value), unquote_plus(value)]))
+    return pairs
+
+
+def _mapping_pairs(mapping: Mapping[Any, Any]) -> List[Tuple[str, List[Any]]]:
+    """:func:`_query_pairs` for a mapping a connector reads as a query string's parameters."""
+    pairs: List[Tuple[str, List[Any]]] = []
+    for key, value in mapping.items():
+        name = _host_key_name(str(key))
+        if name is not None:
+            pairs.append((name, [value]))
+    return pairs
+
+
+def _host_key_name(key: str) -> Optional[str]:
+    """``key`` as :data:`_QUERY_HOST_KEYS` spells it, when it names a host there.
 
     A key is compared percent-decoded, as libpq decodes both keys and values,
     and once more with ``+`` read as a space, as SQLAlchemy's ``parse_qsl``
     reads it; in any case; and with everything but letters and digits left
     out, so ``HOST``, ``%68ost`` and ``unix_socket`` are ``host``, ``host`` and
-    ``unixsocket``. Parameters are split on ``&``, on ``;`` (SQL Server's JDBC
-    properties) and on ``#``.
+    ``unixsocket``.
     """
-    found: List[str] = []
-    for part in re.split(r"[&;#]", query):
-        key = part.partition("=")[0]
-        for spelling in (unquote(key), unquote_plus(key)):
-            name = re.sub(r"[^a-z0-9]", "", spelling.lower())
-            if name in _QUERY_HOST_KEYS and name not in found:
-                found.append(name)
-    return found
+    for spelling in (unquote(key), unquote_plus(key)):
+        name = re.sub(r"[^a-z0-9]", "", spelling.lower())
+        if name in _QUERY_HOST_KEYS:
+            return name
+    return None
+
+
+def _query_hosts(pairs: List[Tuple[str, List[Any]]]) -> Tuple[List[str], List[str]]:
+    """``pairs`` as the sockets on this machine they name, and the other keys, each key once.
+
+    A parameter names a socket only where it may (:data:`_SOCKET_QUERY_KEYS`)
+    and when every reading of its value is one absolute path (:data:`_SOCKET_PATH`).
+    """
+    sockets: List[str] = []
+    keys: List[str] = []
+    for name, readings in pairs:
+        if name in _SOCKET_QUERY_KEYS and all(
+            isinstance(reading, str) and _SOCKET_PATH.fullmatch(reading) for reading in readings
+        ):
+            sockets.append(str(readings[0]))
+        elif name not in keys:
+            keys.append(name)
+    return sockets, keys
+
+
+def _query_mappings(connection: Mapping[str, Any]) -> Iterator[Tuple[Tuple[Any, ...], Any]]:
+    """Each value ``connection`` holds that a connector reads as a query string's parameters.
+
+    The :data:`_QUERY_MAPPING_FIELDS`, whatever they hold (one that is not a
+    mapping is a destination this policy cannot read), any other ``*_query``
+    field that holds a mapping, and the :data:`_DRIVER_ARGUMENT_PATHS`.
+    """
+    for key, raw in connection.items():
+        name = str(key)
+        if name in _QUERY_MAPPING_FIELDS:
+            if not _blank(raw):
+                yield (key,), raw
+        elif name.lower().endswith("_query") and isinstance(raw, Mapping):
+            yield (key,), raw
+    for parent, child in _DRIVER_ARGUMENT_PATHS:
+        holder = connection.get(parent)
+        if isinstance(holder, Mapping) and isinstance(holder.get(child), Mapping):
+            yield (parent, child), holder[child]
+
+
+def _uris_elsewhere(connection: Mapping[str, Any]) -> Iterator[Tuple[Tuple[Any, ...], str]]:
+    """Each URI the block holds outside the fields judged by name, with where it holds it.
+
+    A pass-through runner (Singer, Airbyte) hands the whole block to a connector
+    whose settings this policy cannot list, so a URI under any setting is a
+    destination (``api_url``, Airbyte's ``database_config.connection_string``),
+    at any depth and in any list, in order. A ``secretRef``, and a field whose
+    value may be a credential (:data:`_CREDENTIAL_FIELD`), are never read.
+    """
+    pending: List[Tuple[Tuple[Any, ...], Any]] = [
+        ((key,), value)
+        for key, value in connection.items()
+        if key not in _JUDGED_BY_NAME and not _never_read(key)
+    ]
+    pending.reverse()
+    while pending:
+        path, value = pending.pop()
+        if isinstance(value, str):
+            if _URI_SHAPE.match(value) and not _is_object_store_uri(value.strip()):
+                yield path, value
+        elif isinstance(value, Mapping):
+            items = [((*path, key), item) for key, item in value.items() if not _never_read(key)]
+            pending.extend(reversed(items))
+        elif isinstance(value, (list, tuple)):
+            pending.extend(reversed([((*path, index), item) for index, item in enumerate(value)]))
+
+
+def _never_read(key: Any) -> bool:
+    """Whether the walk for a URI leaves field ``key`` unread: a reference, or a credential."""
+    name = str(key)
+    if name == "secretRef":
+        return True
+    return _CREDENTIAL_FIELD.search(re.sub(r"[^a-z0-9]", "", name.lower())) is not None
 
 
 def _database_targets(connection: Mapping[str, Any]) -> List[_Target]:
@@ -679,7 +879,9 @@ def _tunnel_targets(connection: Mapping[str, Any]) -> List[_Target]:
     for field_name, host_key, tunnel in _tunnels_in_use(connection):
         raw = tunnel.get(host_key) if isinstance(tunnel, Mapping) else None
         host = raw.strip() if isinstance(raw, str) and raw.strip() else None
-        out.append(_Target(host, f"{field_name}.{host_key}", tunnel=True))
+        out.append(
+            _Target(host, f"{field_name}.{host_key}", tunnel=True, path=(field_name, host_key))
+        )
     return out
 
 
@@ -1177,9 +1379,24 @@ def _destination_refusal(
 def _query_host_refusal(parsed: SecretRef, target: _Target) -> AcquisitionSecretPolicyError:
     """The refusal for a query-string parameter that names a host (:data:`_QUERY_HOST_KEYS`)."""
     label = _field_label(target)
+    why = (
+        "A driver can take its host from a query string as well as from the URI's host "
+        "part, and drivers differ on which one wins. This check judges the host part, so "
+        "a query parameter that names a host could send the value to a host the operator "
+        "never allowed."
+    )
     if target.field in _QUERY_STRING_FIELDS:
         where = f"{label}, the query string of the JDBC URL"
         fix = f"Name the host in connection.host and remove {target.query_key!r} from {label}."
+    elif target.query_mapping:
+        where = label
+        fix = f"Name the host in connection.host and remove {target.query_key!r} from {label}."
+        why = (
+            "The connector merges this mapping into its connection URL's query string or "
+            "into its driver's arguments, where a host can win over connection.host. This "
+            "check judges connection.host, so a key that names a host could send the value "
+            "to a host the operator never allowed."
+        )
     else:
         where = f"the query string of {label}"
         fix = (
@@ -1191,12 +1408,7 @@ def _query_host_refusal(parsed: SecretRef, target: _Target) -> AcquisitionSecret
             f"the contract would send {_what_sent(parsed)} to a host that {target.query_key!r} "
             f"names in {where}, which this check does not read"
         ),
-        why=(
-            "A driver can take its host from a query string as well as from the URI's host "
-            "part, and drivers differ on which one wins. This check judges the host part, so "
-            "a query parameter that names a host could send the value to a host the operator "
-            "never allowed."
-        ),
+        why=why,
         fix=(
             f"{fix} To send the value to any host instead, set it in {_OPERATOR_ONLY}: "
             f"{_any_host_fix(parsed)}."
@@ -1261,7 +1473,7 @@ def refuse_unless_allowed(
     grants = destination_grants(environ)
     # A reason first: it is what to change whatever the hosts are.
     for target in sorted(targets, key=lambda target: not target.has_reason):
-        exempt = not target.behind_tunnel and is_loopback(target.host)
+        exempt = target.local or (not target.behind_tunnel and is_loopback(target.host))
         if exempt or _grants_allow(parsed, target.host, grants):
             continue
         if target.query_key is not None:
@@ -1389,7 +1601,8 @@ def destinations_rendered_at_apply(connection: Mapping[str, Any]) -> List[str]:
     """The destination fields of ``connection`` whose host :func:`renders_at_apply`.
 
     A tunnel's host is named ``<tunnel>.<key>`` (``ssh_tunnel.host``) and read as
-    ``host`` is.
+    ``host`` is, and a URI elsewhere in the block (:func:`_uris_elsewhere`) by
+    where it is (``database_config.connection_string``, ``replicas[0]``).
     """
     waiting = [
         field_name
@@ -1399,6 +1612,9 @@ def destinations_rendered_at_apply(connection: Mapping[str, Any]) -> List[str]:
     for field_name, host_key, tunnel in _tunnels_in_use(connection):
         if isinstance(tunnel, Mapping) and renders_at_apply("host", tunnel.get(host_key)):
             waiting.append(f"{field_name}.{host_key}")
+    waiting.extend(
+        _label(path) for path, text in _uris_elsewhere(connection) if renders_at_apply("uri", text)
+    )
     return waiting
 
 
@@ -1408,14 +1624,53 @@ def literal_destinations(connection: Mapping[str, Any], waiting: List[str]) -> D
     A tunnel whose host waits for apply (``ssh_tunnel.host``) is still in use:
     its host is replaced by a loopback stand-in, which needs no entry, so the
     hosts behind the tunnel are judged now, from its side, as apply judges them.
+    A URI elsewhere in the block that waits is taken out where it is.
     """
-    literal = {key: value for key, value in connection.items() if key not in waiting}
+    literal: Dict[str, Any] = {
+        key: value for key, value in connection.items() if key not in waiting
+    }
+    tunnels = {
+        f"{field_name}.{host_key}": (field_name, host_key)
+        for field_name, host_key, tunnel in _tunnels_in_use(connection)
+        if isinstance(tunnel, Mapping)
+    }
+    nested = {_label(path): path for path, _ in _uris_elsewhere(connection)}
     for name in waiting:
-        field_name, _, host_key = name.partition(".")
-        tunnel = connection.get(field_name)
-        if host_key and isinstance(tunnel, Mapping):
-            literal[field_name] = {**tunnel, host_key: "localhost"}
+        if name in tunnels:
+            field_name, host_key = tunnels[name]
+            literal[field_name] = {**connection[field_name], host_key: "localhost"}
+        elif len(nested.get(name, ())) > 1:
+            literal = _without_path(literal, nested[name])
     return literal
+
+
+def _without_path(value: Any, path: Tuple[Any, ...]) -> Any:
+    """A copy of ``value`` without what it holds at ``path``; a list keeps its length."""
+    head, rest = path[0], path[1:]
+    if isinstance(value, Mapping) and head in value:
+        copy = dict(value)
+        if rest:
+            copy[head] = _without_path(value[head], rest)
+        else:
+            del copy[head]
+        return copy
+    if isinstance(value, list) and isinstance(head, int) and 0 <= head < len(value):
+        items = list(value)
+        items[head] = _without_path(value[head], rest) if rest else None
+        return items
+    return value
+
+
+def written_destination(connection: Mapping[str, Any], name: str) -> Any:
+    """The value of destination field ``name`` (:func:`destinations_rendered_at_apply`)."""
+    for path, text in _uris_elsewhere(connection):
+        if _label(path) == name:
+            return text
+    head, _, rest = name.partition(".")
+    value = connection.get(head)
+    if rest and isinstance(value, Mapping):
+        return value.get(rest)
+    return value
 
 
 def deferred_destination_notice(
