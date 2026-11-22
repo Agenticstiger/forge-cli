@@ -422,3 +422,37 @@ def test_a_host_field_written_with_a_password_is_not_quoted(host):
     refusal = _refusal({"host": host})
     assert refusal is not None
     assert "QUOTED" not in str(refusal)
+
+
+# ── a parameter name that holds connection-string syntax ─────────────────────
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "connection",
+    [
+        {
+            "sqlalchemy_url": f"postgresql://u@localhost:5432/db?sslmode%3Ddisable%20host={ELSEWHERE}"
+        },
+        {"host": "localhost", "url_query": {"sslmode=disable host": ELSEWHERE}},
+        {"host": "localhost", "sqlalchemy_url_query": {"Encrypt=yes;Address": f"{ELSEWHERE},1433"}},
+        {
+            "host": "localhost",
+            "sqlalchemy_eng_params": {"connect_args": {"sslmode=disable host": ELSEWHERE}},
+        },
+        {"uri": "postgresql://localhost/db?a+b=c"},
+    ],
+)
+def test_a_parameter_name_with_connection_string_syntax_is_refused(connection):
+    refusal = _refusal(connection)
+    assert refusal is not None
+    assert "parameter name with connection-string syntax" in refusal.what
+    assert ELSEWHERE not in str(refusal)
+    assert _refusal(connection, ANY_HOST) is None
+
+
+@pytest.mark.unit
+def test_validate_refuses_a_parameter_name_with_connection_string_syntax():
+    finding = _lint({"host": "localhost", "sqlalchemy_options": {"ssl mode": "x"}})
+    assert not finding.ok
+    assert "connection.sqlalchemy_options" in finding.error.what

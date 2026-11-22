@@ -725,6 +725,9 @@ def _field_targets(field_name: str, raw: Any, path: Tuple[Any, ...], behind: boo
     if field_name != "host" and isinstance(raw, str):
         if _is_keyword_string(raw):
             return [_Target(None, label, keyword_text=raw, path=path)]
+        if _hosts_read_differently(raw.strip()):
+            # Clients disagree on where its authority ends, so its query too.
+            return [_Target(None, label, path=path)]
         sockets, keys = _uri_query_hosts(raw)
         out.extend(_Target(None, label, query_key=key, path=path) for key in keys)
         out.extend(_Target(socket, label, local=True, path=path) for socket in sockets)
@@ -826,8 +829,19 @@ def _mapping_pairs(mapping: Mapping[Any, Any]) -> List[_QueryPair]:
     for key, value in mapping.items():
         name = _host_key_name(str(key))
         if name is not None:
-            pairs.append((name, [value], str(key)))
+            pairs.append((name, [value], name if name == _SYNTAX_KEY else str(key)))
     return pairs
+
+
+#: What a parameter's name may hold, in each reading: letters, digits, ``_``,
+#: ``.`` and ``-``. A driver builds its connection string from the names as they
+#: are written (psycopg's DSN builder and SQLAlchemy's pyodbc dialect quote the
+#: values only), so a name that holds ``=``, a blank, ``;`` or a quote adds
+#: settings of its own, a host among them.
+_PARAMETER_NAME = re.compile(r"[A-Za-z0-9_.\-]+")
+#: What :func:`_host_key_name` calls a parameter whose name holds more than
+#: :data:`_PARAMETER_NAME` allows. A refusal never quotes such a name.
+_SYNTAX_KEY = "connection-string syntax"
 
 
 def _host_key_name(key: str) -> Optional[str]:
@@ -837,9 +851,13 @@ def _host_key_name(key: str) -> Optional[str]:
     and once more with ``+`` read as a space, as SQLAlchemy's ``parse_qsl``
     reads it; in any case; and with everything but letters and digits left
     out, so ``HOST``, ``%68ost`` and ``unix_socket`` are ``host``, ``host`` and
-    ``unixsocket``.
+    ``unixsocket``. A key that holds more than :data:`_PARAMETER_NAME` allows,
+    in either reading, is :data:`_SYNTAX_KEY`.
     """
-    for spelling in (unquote(key), unquote_plus(key)):
+    spellings = (unquote(key), unquote_plus(key))
+    if any(spelling and not _PARAMETER_NAME.fullmatch(spelling) for spelling in spellings):
+        return _SYNTAX_KEY
+    for spelling in spellings:
         name = re.sub(r"[^a-z0-9]", "", spelling.lower())
         if name in _QUERY_HOST_KEYS:
             return name
@@ -1626,6 +1644,8 @@ def _destination_refusal(
 
 def _query_host_refusal(parsed: SecretRef, target: _Target) -> AcquisitionSecretPolicyError:
     """The refusal for a query-string parameter that names a host (:data:`_QUERY_HOST_KEYS`)."""
+    if target.query_key == _SYNTAX_KEY:
+        return _syntax_key_refusal(parsed, target)
     label = _field_label(target)
     why = (
         "A driver can take its host from a query string as well as from the URI's host "
@@ -1660,6 +1680,28 @@ def _query_host_refusal(parsed: SecretRef, target: _Target) -> AcquisitionSecret
         fix=(
             f"{fix} To send the value to any host instead, set it in {_OPERATOR_ONLY}: "
             f"{_any_host_fix(parsed)}."
+        ),
+        doc=doc_url("secrets"),
+    )
+
+
+def _syntax_key_refusal(parsed: SecretRef, target: _Target) -> AcquisitionSecretPolicyError:
+    """The refusal for a parameter whose name holds connection-string syntax (:data:`_SYNTAX_KEY`)."""
+    label = _field_label(target)
+    return AcquisitionSecretPolicyError(
+        what=(
+            f"the contract would send {_what_sent(parsed)} over a connection whose {label} "
+            "holds a parameter name with connection-string syntax, which this check does not read"
+        ),
+        why=(
+            "A driver builds its connection string from these parameters with each name as "
+            "written, so a name that holds '=', a blank, ';' or a quote adds settings of its "
+            "own, and a host among them could send the value to a host the operator never "
+            "allowed."
+        ),
+        fix=(
+            f"Write each parameter name in {label} with letters, digits, '_', '.' and '-' only. "
+            f"To send the value regardless, set it in {_OPERATOR_ONLY}: {_any_host_fix(parsed)}."
         ),
         doc=doc_url("secrets"),
     )
