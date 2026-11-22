@@ -677,6 +677,12 @@ def test_a_list_that_gives_a_key_twice_is_not_read(tmp_path):
     assert "gives a key twice" in reader.names(driver, "a")
 
 
+def test_a_directory_is_not_inside_itself_and_a_file_below_it_is(tmp_path):
+    assert not D._inside(tmp_path, tmp_path)
+    assert D._inside(tmp_path / "a" / "b.yaml", tmp_path)
+    assert not D._inside(tmp_path.parent / "b.yaml", tmp_path)
+
+
 def load_unique(text):
     from fluid_build.util.safe_yaml import load_yaml_safe
 
