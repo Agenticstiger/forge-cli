@@ -84,7 +84,7 @@ import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, Iterator, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, FrozenSet, Iterator, List, Mapping, Optional, Set, Tuple, Union
 from urllib.parse import unquote, unquote_plus, urlsplit
 
 from fluid_build._errors import doc_url
@@ -236,9 +236,12 @@ _SOCKET_QUERY_KEYS = frozenset({"host", "unixsocket"})
 #: One absolute POSIX path: not a host list (``,``), not a UNC path (``//``,
 #: ``\``), nothing a driver could decode once more (``%``), no blank.
 _SOCKET_PATH = re.compile(r"/(?!/)[^\\,%\s\x00-\x1f\x7f-\x9f]*")
-#: A value read as a URI with an authority wherever the block holds it:
-#: ``scheme://`` (a placeholder scheme included) or JDBC's ``jdbc:sub://``.
-_URI_SHAPE = re.compile(r"\s*(?:jdbc:)?(?:[A-Za-z][A-Za-z0-9+.\-]*|\{\{[^{}]*\}\})://")
+#: A value read as a URI wherever the block holds it: ``scheme://`` (a scheme of
+#: several parts, ``mysql:loadbalance://``, and a placeholder scheme included),
+#: and any JDBC URL, Oracle's ``jdbc:oracle:thin:@host`` too.
+_URI_SHAPE = re.compile(
+    r"\s*(?:jdbc:|(?:[A-Za-z][A-Za-z0-9+.\-:]*|\{\{[^{}]*\}\})://)", re.IGNORECASE
+)
 #: A field whose value may be a credential, which the walk for a URI never
 #: reads, so a refusal never quotes any part of it (letters and digits only).
 _CREDENTIAL_FIELD = re.compile(
@@ -259,7 +262,7 @@ _URL_SYNTAX = "?#;&@\\"
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 #: Top-level fields judged by name, which the walk for a URI elsewhere leaves
 #: to their own rule.
-_JUDGED_BY_NAME = frozenset({*_HOST_FIELDS, *_QUERY_STRING_FIELDS, *_DATABASE_FIELDS, "port"})
+_JUDGED_BY_NAME = frozenset({*_HOST_FIELDS, *_QUERY_STRING_FIELDS})
 
 #: The SSH tunnels a client can connect through, as ``(field, host key, off)``:
 #: the Singer taps' ``ssh_tunnel``, on only when ``enable`` is set and true
@@ -276,6 +279,13 @@ _TUNNELS: Tuple[Tuple[str, str, Tuple[str, Any]], ...] = (
 #: authority is a BUCKET, not a host, so reporting it as a destination both
 #: refuses working contracts and suggests an allowlist entry that is nonsense.
 _OBJECT_STORE_SCHEMES = frozenset({"s3", "s3a", "s3n", "gs", "gcs", "az", "azure", "abfss", "file"})
+#: Schemes the walk for a URI elsewhere passes over: an object store or a file
+#: system, whose authority is a bucket, an account or a name node rather than a
+#: database host (the duckdb runner's remote stores among them), and a local file
+#: or socket. A field judged by name still reads only :data:`_OBJECT_STORE_SCHEMES`.
+_UNJUDGED_SCHEMES = _OBJECT_STORE_SCHEMES | frozenset(
+    {"abfs", "wasb", "wasbs", "adl", "r2", "oss", "hdfs", "dbfs", "cos", "sqlite", "unix"}
+)
 
 #: One ``host[:port]`` of a URI authority: a bracketed IPv6 address or a name,
 #: then an optional numeric port. Anything else is a destination we cannot read.
@@ -754,29 +764,39 @@ def _query_targets(raw: Union[str, Mapping[Any, Any]], path: Tuple[Any, ...]) ->
     return targets
 
 
-def _query_pairs(query: str) -> List[Tuple[str, List[Any]]]:
+#: One parameter that names a host: its :func:`_host_key_name`, its value's
+#: readings, and the key as a refusal names it.
+_QueryPair = Tuple[str, List[Any], str]
+
+
+def _query_pairs(query: str) -> List[_QueryPair]:
     """Each parameter of query string ``query`` that names a host, with its value's readings.
 
     Parameters are split on ``&``, on ``;`` (SQL Server's JDBC properties) and
     on ``#``. A value is read percent-decoded, as libpq decodes it, and once
-    more with ``+`` read as a space, as SQLAlchemy's ``parse_qsl`` reads it.
+    more with ``+`` read as a space, as SQLAlchemy's ``parse_qsl`` reads it. A
+    refusal names the key as :data:`_QUERY_HOST_KEYS` spells it: at apply the
+    query string may have been rendered from a placeholder.
     """
-    pairs: List[Tuple[str, List[Any]]] = []
+    pairs: List[_QueryPair] = []
     for part in re.split(r"[&;#]", query):
         key, _, value = part.partition("=")
         name = _host_key_name(key)
         if name is not None:
-            pairs.append((name, [unquote(value), unquote_plus(value)]))
+            pairs.append((name, [unquote(value), unquote_plus(value)], name))
     return pairs
 
 
-def _mapping_pairs(mapping: Mapping[Any, Any]) -> List[Tuple[str, List[Any]]]:
-    """:func:`_query_pairs` for a mapping a connector reads as a query string's parameters."""
-    pairs: List[Tuple[str, List[Any]]] = []
+def _mapping_pairs(mapping: Mapping[Any, Any]) -> List[_QueryPair]:
+    """:func:`_query_pairs` for a mapping a connector reads as a query string's parameters.
+
+    A refusal names the key as the contract wrote it, which is what to remove.
+    """
+    pairs: List[_QueryPair] = []
     for key, value in mapping.items():
         name = _host_key_name(str(key))
         if name is not None:
-            pairs.append((name, [value]))
+            pairs.append((name, [value], str(key)))
     return pairs
 
 
@@ -796,7 +816,7 @@ def _host_key_name(key: str) -> Optional[str]:
     return None
 
 
-def _query_hosts(pairs: List[Tuple[str, List[Any]]]) -> Tuple[List[str], List[str]]:
+def _query_hosts(pairs: List[_QueryPair]) -> Tuple[List[str], List[str]]:
     """``pairs`` as the sockets on this machine they name, and the other keys, each key once.
 
     A parameter names a socket only where it may (:data:`_SOCKET_QUERY_KEYS`)
@@ -804,13 +824,15 @@ def _query_hosts(pairs: List[Tuple[str, List[Any]]]) -> Tuple[List[str], List[st
     """
     sockets: List[str] = []
     keys: List[str] = []
-    for name, readings in pairs:
+    names: Set[str] = set()
+    for name, readings, shown in pairs:
         if name in _SOCKET_QUERY_KEYS and all(
             isinstance(reading, str) and _SOCKET_PATH.fullmatch(reading) for reading in readings
         ):
             sockets.append(str(readings[0]))
-        elif name not in keys:
-            keys.append(name)
+        elif name not in names:
+            names.add(name)
+            keys.append(shown)
     return sockets, keys
 
 
@@ -840,33 +862,40 @@ def _uris_elsewhere(connection: Mapping[str, Any]) -> Iterator[Tuple[Tuple[Any, 
     A pass-through runner (Singer, Airbyte) hands the whole block to a connector
     whose settings this policy cannot list, so a URI under any setting is a
     destination (``api_url``, Airbyte's ``database_config.connection_string``),
-    at any depth and in any list, in order. A ``secretRef``, and a field whose
-    value may be a credential (:data:`_CREDENTIAL_FIELD`), are never read.
+    at any depth and in any list, in order, each container once. A ``secretRef``
+    is never read, nor is a string under a field that may hold a credential
+    (:data:`_CREDENTIAL_FIELD`); a mapping or a list there is. A URI of an object
+    store or a local file names no host (:data:`_UNJUDGED_SCHEMES`).
     """
     pending: List[Tuple[Tuple[Any, ...], Any]] = [
-        ((key,), value)
-        for key, value in connection.items()
-        if key not in _JUDGED_BY_NAME and not _never_read(key)
+        ((key,), value) for key, value in connection.items() if key not in _JUDGED_BY_NAME
     ]
     pending.reverse()
+    seen: Set[int] = set()
     while pending:
         path, value = pending.pop()
+        if path[-1] == "secretRef":
+            continue
         if isinstance(value, str):
-            if _URI_SHAPE.match(value) and not _is_object_store_uri(value.strip()):
+            if not _credential_field(path[-1]) and _names_a_host_elsewhere(value):
                 yield path, value
-        elif isinstance(value, Mapping):
-            items = [((*path, key), item) for key, item in value.items() if not _never_read(key)]
-            pending.extend(reversed(items))
-        elif isinstance(value, (list, tuple)):
-            pending.extend(reversed([((*path, index), item) for index, item in enumerate(value)]))
+        elif isinstance(value, (Mapping, list, tuple)) and id(value) not in seen:
+            seen.add(id(value))
+            items = value.items() if isinstance(value, Mapping) else enumerate(value)
+            pending.extend(reversed([((*path, key), item) for key, item in items]))
 
 
-def _never_read(key: Any) -> bool:
-    """Whether the walk for a URI leaves field ``key`` unread: a reference, or a credential."""
-    name = str(key)
-    if name == "secretRef":
-        return True
-    return _CREDENTIAL_FIELD.search(re.sub(r"[^a-z0-9]", "", name.lower())) is not None
+def _credential_field(key: Any) -> bool:
+    """Whether field ``key`` may hold a credential, so a string there is never read."""
+    return _CREDENTIAL_FIELD.search(re.sub(r"[^a-z0-9]", "", str(key).lower())) is not None
+
+
+def _names_a_host_elsewhere(text: str) -> bool:
+    """Whether ``text``, found outside the fields judged by name, is a URI that may name a host."""
+    if not _URI_SHAPE.match(text):
+        return False
+    scheme = text.strip().partition("://")[0].strip().lower()
+    return scheme.split("+")[0] not in _UNJUDGED_SCHEMES
 
 
 def _database_targets(connection: Mapping[str, Any]) -> List[_Target]:
@@ -1317,14 +1346,18 @@ def destinations_as_written(written: Any) -> Iterator[None]:
 
 
 def _mappings_in(value: Any) -> Iterator[Mapping[str, Any]]:
-    """Every mapping in ``value``, through its mappings and lists."""
+    """Every mapping in ``value``, through its mappings and lists, each once."""
     pending = [value]
+    seen: Set[int] = set()
     while pending:
         item = pending.pop()
+        if not isinstance(item, (Mapping, list, tuple)) or id(item) in seen:
+            continue
+        seen.add(id(item))
         if isinstance(item, Mapping):
             yield item
             pending.extend(item.values())
-        elif isinstance(item, (list, tuple)):
+        else:
             pending.extend(item)
 
 
@@ -1668,8 +1701,8 @@ def renders_at_apply(field_name: str, value: Any) -> bool:
     (``h1,{{ env.H }}``) is judged by apply alone, which judges every host. An
     object-store URI names a bucket, never a host, so it never waits, and nor
     does text that does not read as a destination (:func:`_reads_as_destination`)
-    or a URI whose query string names a host, which is refused whatever the
-    placeholder renders to.
+    or a URI whose query string names a host other than a socket on this
+    machine, which is refused whatever the placeholder renders to.
     """
     if not isinstance(value, str) or not _ENV_PLACEHOLDER.search(value):
         return False
@@ -1724,6 +1757,17 @@ def _authority_split(field_name: str, value: str) -> Tuple[str, str, str]:
     return scheme, authority, "".join(after)
 
 
+#: The destination fields that hold a bare host, not a URI, by the names
+#: :func:`destinations_rendered_at_apply` gives them.
+_BARE_HOST_FIELDS = frozenset({"host", *(f"{field}.{key}" for field, key, _off in _TUNNELS)})
+
+
+def _reading(name: str) -> str:
+    """``host`` when destination field ``name`` holds a bare host, else ``uri``."""
+    bare = name[len("connection.") :] if name.startswith("connection.") else name
+    return "host" if bare in _BARE_HOST_FIELDS else "uri"
+
+
 def _shown_destination(name: str, value: str) -> str:
     """What the deferred notice quotes of ``value``: its :func:`_deciding_parts`, without a port.
 
@@ -1731,7 +1775,7 @@ def _shown_destination(name: str, value: str) -> str:
     unencoded ``/``, ``?`` or ``#`` ends the authority inside itself, and an
     ``@`` then follows the authority: only the placeholders are quoted then.
     """
-    field_name = name.rpartition(".")[2]
+    field_name = _reading(name)
     scheme, authority, rest = _authority_split(field_name, value)
     host = authority.rpartition("@")[2]
     if "@" in rest and "@" not in authority:
@@ -1802,7 +1846,7 @@ def literal_destinations(connection: Mapping[str, Any], waiting: List[str]) -> D
         if name in tunnels:
             field_name, host_key = tunnels[name]
             literal[field_name] = {**connection[field_name], host_key: "localhost"}
-        elif len(nested.get(name, ())) > 1:
+        elif name in nested:
             literal = _without_path(literal, nested[name])
     return literal
 
@@ -1856,7 +1900,7 @@ def deferred_destination_notice(
         {
             match.group(1)
             for name, value in written.items()
-            for part in _deciding_parts(name.rpartition(".")[2], value)
+            for part in _deciding_parts(_reading(name), value)
             for match in _ENV_PLACEHOLDER.finditer(part)
         }
     )

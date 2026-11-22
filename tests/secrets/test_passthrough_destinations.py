@@ -270,3 +270,84 @@ def test_validate_leaves_a_tunnel_without_enable_alone():
     finding = _lint({"host": "localhost", "ssh_tunnel": {"host": "{{ env.BASTION }}"}})
     assert finding.ok
     assert finding.deferred is None
+
+
+# ── every container is read; storage and local files name no host ───────────
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"cfg": {"u": f"jdbc:mysql:loadbalance://{ELSEWHERE}/db"}},
+        {"cfg": {"u": f"JDBC:oracle:thin:@{ELSEWHERE}:1521:orcl"}},
+        {"database": {"url": f"postgres://{ELSEWHERE}/x"}},
+        {"credentials": {"auth_url": f"https://{ELSEWHERE}/x"}},
+    ],
+)
+def test_a_uri_in_any_container_is_a_destination(extra):
+    assert _refusal({"host": "localhost", **extra}) is not None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"catalog": {"url": "sqlite:///c.db"}},
+        {"catalog": {"url": "sqlite+pysqlite:///c.db"}},
+        {"docker": "unix:///var/run/docker.sock"},
+        {"staging": "abfs://c@acct.dfs.core.windows.net/p"},
+        {"warehouse": "hdfs://namenode:8020/wh"},
+        {"credentials": {"password": f"postgres://{ELSEWHERE}/x"}},  # pragma: allowlist secret
+    ],
+)
+def test_storage_local_files_and_credentials_are_not_read(extra):
+    assert _refusal({"host": "localhost", **extra}) is None
+
+
+@pytest.mark.unit
+def test_a_mapping_key_is_named_as_written():
+    refusal = _refusal({"host": "localhost", "sqlalchemy_options": {"unix_socket": "x/y"}})
+    assert refusal is not None
+    assert "'unix_socket' names in connection.sqlalchemy_options" in refusal.what
+    assert "remove 'unix_socket' from connection.sqlalchemy_options" in refusal.fix
+
+
+@pytest.mark.unit
+def test_a_cyclic_block_is_read_once():
+    connection: Dict[str, Any] = {"host": "localhost", "api_url": f"https://{ELSEWHERE}/"}
+    connection["self"] = connection
+    assert _refusal(connection) is not None
+
+
+@pytest.mark.unit
+def test_a_cyclic_contract_as_written_is_read_once(monkeypatch):
+    from fluid_build.secrets import resolve_secret, secret_run
+    from fluid_build.secrets.policy import destinations_as_written
+
+    monkeypatch.delenv(ALLOWLIST_ENV, raising=False)
+    contract: Dict[str, Any] = {"builds": []}
+    contract["self"] = contract
+    with destinations_as_written(contract), secret_run("apply"):
+        with pytest.raises(AcquisitionSecretPolicyError):
+            resolve_secret("env://PG", connection={"host": ELSEWHERE})
+
+
+@pytest.mark.unit
+def test_validate_quotes_a_uri_under_a_key_named_host_as_a_uri():
+    connection = {
+        "host": "localhost",
+        "replica": {"host": "postgres://{{ env.H }}/db?x=QUERYTEXT"},
+    }
+    finding = _lint(connection)
+    assert finding.ok
+    assert finding.deferred is not None
+    assert "('postgres://{{ env.H }}')" in finding.deferred.what
+    assert "QUERYTEXT" not in finding.deferred.what
+
+
+@pytest.mark.unit
+def test_validate_leaves_a_uri_under_a_key_that_is_not_text_to_apply():
+    finding = _lint({"host": "localhost", 5: "postgres://{{ env.H }}/db"})
+    assert finding.ok
+    assert finding.deferred is not None
