@@ -50,19 +50,24 @@ repository could grant itself the policy meant to constrain it.
 
 The destinations judged (:func:`connection_hosts`) are ``host``, the host part
 of every URI field, each host of a host list, the host of an SSH tunnel in
-use, and a URI anywhere else in the block: the Singer and Airbyte runners hand
-the whole block to a connector, whose own settings may hold one. A driver can
-be pointed elsewhere by a parameter that names a host, in a URI's query string
-or in a mapping a connector reads as one, or by a database name a connection
-URL reads as more than a name; this policy cannot judge either, so beside a
-secret both are refused unless the reference may go to any host.
+use, and, under any other setting of the block, a URI and a field named for a
+host (:data:`_NAMED_HOST_FIELDS`) unless it holds a path or words
+(:data:`_NOT_A_HOST`): the Singer and Airbyte runners hand the whole block to
+a connector, whose own settings may hold one. A driver can be pointed
+elsewhere by a parameter that names a host, in a URI's query string or in a
+mapping a connector reads as one, by a parameter name holding
+connection-string syntax, or by a database name a connection URL reads as more
+than a name; this policy cannot judge these, so beside a secret they are
+refused unless the reference may go to any host.
 
 The settings that name a host are listed here, a denylist, rather than the
 settings a connector may hold, an allowlist: a connector's own settings cannot
 all be listed, and refusing each one this policy does not know would leave an
-operator only an entry for any host, which judges nothing. So a host that a
-connector reads from a setting of its own as a bare name, not a URI, is not
-judged.
+operator only an entry for any host, which judges nothing. So a host is not
+judged when a connector reads it as a bare name, not a URI, from a setting not
+named for a host, nor when it is a single word of letters (``mongo``) under one
+that is. A block past :data:`_WALK_LIMIT` values is a destination this policy
+cannot read.
 
 The destination policy used to cover ``env://`` only, on the reasoning that the
 other schemes name a store the operator provisioned. That left the same hole one
@@ -689,11 +694,13 @@ class _Target:
     query_mapping: bool = False
     #: A destination under a field that may hold a credential: judged, never quoted.
     quiet: bool = False
+    #: The rest of a block past :data:`_WALK_LIMIT` values, which nobody read.
+    over_limit: bool = False
 
     @property
     def has_reason(self) -> bool:
         """Whether a query parameter or a database name is why this cannot be read."""
-        return self.query_key is not None or self.database_char is not None
+        return self.query_key is not None or self.database_char is not None or self.over_limit
 
 
 def _connection_targets(connection: Mapping[str, Any]) -> List[_Target]:
@@ -737,7 +744,7 @@ def _elsewhere_targets(connection: Mapping[str, Any], behind: bool) -> List[_Tar
     out: List[_Target] = []
     for path, reading, text in _destinations_elsewhere(connection):
         if reading == "unreadable":
-            out.append(_Target(None, _label(path), path=path))
+            out.append(_Target(None, _label(path), path=path, over_limit=True))
             continue
         secret = reading == "secret"
         out.extend(_field_targets("uri" if secret else reading, text, path, behind, quiet=secret))
@@ -1790,6 +1797,26 @@ def _syntax_key_refusal(parsed: SecretRef, target: _Target) -> AcquisitionSecret
     )
 
 
+def _walk_limit_refusal(parsed: SecretRef) -> AcquisitionSecretPolicyError:
+    """The refusal for a block this check stops reading at :data:`_WALK_LIMIT` values."""
+    return AcquisitionSecretPolicyError(
+        what=(
+            f"the contract would send {_what_sent(parsed)} over a connection block that holds "
+            f"more than {_WALK_LIMIT:,} values, more than this check reads"
+        ),
+        why=(
+            "A connector may take its host from any setting of the block, so a block this "
+            "check cannot read to its end is a destination it cannot clear. A setting reached "
+            "by two paths counts once on each."
+        ),
+        fix=(
+            "Hold fewer values in the connection block. To send the value regardless, set it "
+            f"in {_OPERATOR_ONLY}: {_any_host_fix(parsed)}."
+        ),
+        doc=doc_url("secrets"),
+    )
+
+
 def _database_refusal(
     parsed: SecretRef, target: _Target, *, rendered: bool = False
 ) -> AcquisitionSecretPolicyError:
@@ -1858,6 +1885,8 @@ def refuse_unless_allowed(
         exempt = target.local or (not target.behind_tunnel and is_loopback(target.host))
         if exempt or _grants_allow(parsed, target.host, grants):
             continue
+        if target.over_limit:
+            raise _walk_limit_refusal(parsed)
         if target.query_key is not None:
             raise _query_host_refusal(parsed, target)
         if target.database_char is not None:

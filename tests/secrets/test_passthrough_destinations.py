@@ -581,3 +581,13 @@ def test_validate_names_a_credential_field_that_waits_without_quoting_it():
     assert finding.deferred is not None
     assert "connection.tokens[0]" in finding.deferred.what
     assert "example.com" not in finding.deferred.what
+
+
+@pytest.mark.unit
+def test_a_block_past_the_walk_limit_is_refused_by_the_limit_not_an_element():
+    connection = {"host": "localhost", "tables": [f"t{i}" for i in range(10_005)]}
+    refusal = _refusal(connection)
+    assert refusal is not None
+    assert "more than 10,000 values" in refusal.what
+    assert "tables[" not in refusal.what
+
