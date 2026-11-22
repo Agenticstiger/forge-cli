@@ -678,9 +678,17 @@ def test_main_runs_a_package_config_by_its_location_with_the_run_s_stamps(
     monkeypatch.setattr(runner, "run", lambda *a: seen.append(("run", a)))
     monkeypatch.setattr(runner, "run_package", lambda *a: seen.append(("package", a)))
     uri = "s3://commerce-lake/_fluid/spark/commerce.orders-silver/merge-orders/job.json"
-    assert runner.main(["--config", uri, "--fluid-run-id", "scheduled__2026-11-21"]) == 0
+    bundle = "sha256:" + "ab" * 32
+    argv = ["--config", uri, "--fluid-run-id", "scheduled__2026-11-21"]
+    argv += ["--fluid-bundle-digest", bundle, "--fluid-scheduler-job", "orders_silver"]
+    argv += ["--fluid-scheduler-run-id", "scheduled__2026-11-21T00:00:00+00:00"]
+    assert runner.main(argv) == 0
     ((kind, (spark, config, where, stamps)),) = seen
     assert (kind, spark, where) == ("package", "spark", uri)
     assert config["package"]["sha256"] == SHA
     assert stamps["fluid.run-id"] == "scheduled__2026-11-21"
     assert stamps["fluid.job-sha256"] == runner.config_digest(text)
+    # The bundle and the scheduler's job and run reach a package's commits as they reach any run's.
+    assert stamps["fluid.bundle-digest"] == bundle
+    assert stamps["fluid.scheduler-job"] == "orders_silver"
+    assert stamps["fluid.scheduler-run-id"] == "scheduled__2026-11-21T00:00:00+00:00"
