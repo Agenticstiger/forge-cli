@@ -459,3 +459,67 @@ def test_a_consumer_may_be_named_by_the_product_id_or_by_the_table_alone(tmp_pat
         },
     )
     assert unread_lines(report) == []
+
+
+# ── what a review of the first version found ─────────────────────────────────
+
+
+def test_an_output_another_product_of_the_same_job_reads_is_not_unread(tmp_path, monkeypatch):
+    _, report = run_pyspark(
+        tmp_path,
+        monkeypatch,
+        {
+            "jobs/chain.py": """
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+spark.sql("INSERT INTO mart.t1 SELECT * FROM raw.x")
+spark.sql("INSERT INTO mart.t2 SELECT * FROM mart.t1")
+spark.sql("INSERT INTO mart.t3 SELECT * FROM mart.t2")
+""",
+            "conventions.yaml": PLAIN,
+            "dags/x.py": "x=1\n",
+        },
+    )
+    assert [line.split(" (")[0] for line in unread_lines(report)] == ["mart.t3"]
+
+
+def test_a_job_that_reads_only_its_own_output_is_not_its_reader(tmp_path, monkeypatch):
+    _, report = run_pyspark(
+        tmp_path,
+        monkeypatch,
+        {
+            "jobs/self.py": """
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+spark.sql("INSERT INTO mart.t1 SELECT * FROM mart.t1 UNION ALL SELECT * FROM raw.x")
+""",
+            "conventions.yaml": PLAIN,
+            "dags/x.py": "x=1\n",
+        },
+    )
+    assert [line.split(" (")[0] for line in unread_lines(report)] == ["mart.t1"]
+
+
+def test_a_declared_path_consumer_matches_with_or_without_the_trailing_slash(tmp_path, monkeypatch):
+    files = {
+        "jobs/a.py": """
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+spark.table("raw.x").write.parquet("s3://bucket/Out/Path/")
+""",
+        "dags/x.py": "x=1\n",
+    }
+    _, report = run_pyspark(tmp_path / "none", monkeypatch, {**files, "conventions.yaml": PLAIN})
+    assert len(unread_lines(report)) == 1
+    for index, declared in enumerate(
+        ("s3://bucket/Out/Path/", "s3://bucket/out/path", "S3://BUCKET/OUT/PATH//")
+    ):
+        _, report = run_pyspark(
+            tmp_path / f"d{index}",
+            monkeypatch,
+            {**files, "conventions.yaml": PLAIN + f"external_consumers: ['{declared}']\n"},
+        )
+        assert unread_lines(report) == [], declared

@@ -496,6 +496,58 @@ def _first_links(job: JobRecord) -> List[LinkedTask]:
     return kept[1]
 
 
+def _bridge_key(ref: Any) -> Tuple[str, str]:
+    """What a read and a write of one table, path or topic have in common, whatever qualifies the
+    name (a catalog, a database): the kind and the last part, lower case."""
+    return ref.kind, (ref.parts[-1] if ref.parts else "").lower().rstrip("/")
+
+
+def _bridge(job: JobRecord, write: Write) -> None:
+    """A write the conventions ignore (a staging table) is an intermediate: what feeds it feeds
+    what reads it, so the products that read it take its feeds (``None`` when they are not
+    said)."""
+    bridges: Dict[Tuple[str, str], Optional[Set[Tuple[Any, ...]]]] = (
+        getattr(job, "_bridges", None) or {}
+    )
+    key = _bridge_key(write)
+    feeds = None if write.feeds is None else set(write.feeds)
+    if key in bridges:
+        before = bridges[key]
+        feeds = None if before is None or feeds is None else before | feeds
+    bridges[key] = feeds
+    job._bridges = bridges  # type: ignore[attr-defined]
+
+
+def _through_bridges(
+    owned: Set[Tuple[Any, ...]], loose: bool, job: JobRecord
+) -> Tuple[Set[Tuple[Any, ...]], bool]:
+    """``owned`` and everything that feeds a read among them through a write the conventions
+    ignore, and whether one of those writes does not say what feeds it."""
+    bridges = getattr(job, "_bridges", None)
+    if not bridges:
+        return owned, loose
+    pools = _pools(job)
+    owned = set(owned)
+    queue = list(owned)
+    crossed: Set[Tuple[str, str]] = set()
+    while queue:
+        read = pools.by_key.get(queue.pop())
+        if read is None:
+            continue
+        key = _bridge_key(read)
+        if key not in bridges or key in crossed:
+            continue
+        crossed.add(key)
+        feeds = bridges[key]
+        if feeds is None:
+            loose = True
+            continue
+        for fed in feeds - owned:
+            owned.add(fed)
+            queue.append(fed)
+    return owned, loose
+
+
 class _Pools:
     """The reads of one job, by what they can feed: a read that one write owns (``exclusive``: a
     closed SQL statement's, or one written inside a DataFrame's expression) feeds that write and
@@ -509,7 +561,14 @@ class _Pools:
         self.reads = job.facts.reads
         self.by_key = {read_key(read): read for read in self.reads}
         self.index = {read_key(read): place for place, read in enumerate(self.reads)}
-        self.loose = [read for read in self.reads if not read.exclusive]
+        # a read that only feeds a write the conventions ignore may feed what reads that write,
+        # which a product that does not say what feeds it may be
+        bridged = {
+            key for feeds in (getattr(job, "_bridges", None) or {}).values() for key in feeds or ()
+        }
+        self.loose = [
+            read for read in self.reads if not read.exclusive or read_key(read) in bridged
+        ]
         self.loose_keys = {read_key(read) for read in self.loose}
 
 
@@ -531,6 +590,8 @@ def _feeding(group: Group, job: JobRecord) -> Tuple[Set[Tuple[Any, ...]], bool]:
         if output.writer is job:
             loose = loose or output.loose
             owned.update(output.feeds)
+    if owned:
+        owned, loose = _through_bridges(owned, loose, job)
     return owned, loose
 
 
@@ -712,6 +773,7 @@ def build_proposal(
             identity = identity_of(write, conv)
             if identity is None:
                 ignored += 1
+                _bridge(job, write)
                 continue
             existing = outputs.get(identity.key)
             if existing is None:
@@ -890,6 +952,14 @@ def _flag_unread(
             if identity is not None:
                 readers.setdefault(identity.key, set()).add(str(job.path))
     declared = set(conv.external_consumers)
+    #: The products each job writes an output of: a job that writes one product and reads its
+    #: output to make another is a reader of it.
+    written: Dict[str, Set[int]] = {}
+    for index, group in enumerate(groups):
+        for output in group.outputs:
+            written.setdefault(str(output.writer.path), set()).add(index)
+            for other, _ in output.others:
+                written.setdefault(str(other.path), set()).add(index)
     unread: List[str] = []
     for index, group in enumerate(groups):
         pid = group_ids[index]
@@ -904,7 +974,10 @@ def _flag_unread(
             names.add(identity.shown.lower())
             if identity.kind == "table":
                 names.add(f"{identity.database or ''}.{identity.name}".strip(".").lower())
-            if readers.get(identity.key, set()) - writers:
+            if any(
+                job not in writers or written.get(job, set()) - {index}
+                for job in readers.get(identity.key, ())
+            ):
                 used = True
                 break
         if used or names & declared:

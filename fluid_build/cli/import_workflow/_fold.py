@@ -247,6 +247,8 @@ class Scope:
     #: Names assigned once and then added to by ``+=`` statements (and nothing else): see
     #: :class:`Recipe`. Not in ``values``.
     recipes: Dict[str, Recipe] = field(default_factory=dict)
+    #: The parameters of the function: values that come from the caller.
+    parameters: Set[str] = field(default_factory=set)
 
 
 #: Called with no argument, these are the names of the module (or class) body they are in; inside a
@@ -708,6 +710,7 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
             params.append(args.kwarg)
         for param in params:
             block(param.arg, f"`{param.arg}` is a parameter of the function")
+            scope.parameters.add(param.arg)
     body = getattr(owner, "body", [])
     covered: Set[int] = set()
     steps = _increment_steps(body, covered) if isinstance(body, list) else {}
@@ -1166,6 +1169,28 @@ class Folder:
         for owner in reversed(chain):
             scope = self._scope(owner, scope)
         return scope
+
+    def how_bound(self, node: ast.Name) -> str:
+        """How the name ``node`` is bound where it is used: ``"once"`` (one assignment),
+        ``"many"`` (more than one, plain assignments only), ``"parameter"`` (a value from the
+        caller), ``"imported"``, ``"unbound"`` (nothing in the file binds it: a builtin), or
+        ``"other"`` (a loop variable, an unpacked name, one changed in place, a function or a
+        class, a name the file changes elsewhere)."""
+        name = node.id
+        if self.rebound(name):
+            return "other"
+        scope = self._binding_scope(name, self.scope_of(node))
+        if scope is None:
+            return "imported" if name in self.module.imports else "unbound"
+        if name in scope.values:
+            return "once"
+        if name in scope.recipes or name in scope.classes:
+            return "other"
+        if name in scope.assignments:
+            return "many"
+        if name in scope.parameters:
+            return "parameter"
+        return "imported" if scope.blocked.get(name) == "imported" else "other"
 
     def rebound(self, name: str) -> Optional[str]:
         """Why ``name`` cannot be trusted to hold what its assignments say: the file changes it

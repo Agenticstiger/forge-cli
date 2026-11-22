@@ -711,3 +711,251 @@ def test_a_key_a_write_names_that_the_job_does_not_read_is_not_counted(tmp_path)
     group = _proposal.Group("retail.t1", [output])
     assert [r.name for r in _proposal._reads_of(group, job)] == ["raw.a"]
     assert _proposal._read_count(group, job) == 1
+
+
+# ── what a review of the first version found ─────────────────────────────────
+
+
+def with_conventions(root: Path, monkeypatch, body: str, conventions: str, **options):
+    (root / "conventions.yaml").write_text(conventions, encoding="utf-8")
+    return consumed(root, monkeypatch, body, conventions="conventions.yaml", **options)
+
+
+def test_a_scalar_made_of_a_read_through_a_name_that_is_assigned_twice_still_feeds(
+    tmp_path, monkeypatch
+):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        """
+        cutoff = spark.table("raw.b").agg(F.max("d")).first()[0]
+        if x:
+            cutoff = spark.table("raw.b2").agg(F.max("d")).first()[0]
+        a = spark.table("raw.a")
+        a.where(F.col("d") > cutoff).write.saveAsTable("mart.t1")
+        spark.table("raw.c").write.saveAsTable("mart.t2")
+        """,
+    )
+    assert got == {"mart.t1": ["raw.a", "raw.b", "raw.b2"], "mart.t2": ["raw.c"]}
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        'keys = spark.table("raw.b").select("k").collect()\nkeys = [k[0] for k in keys]',
+        'lo, hi = spark.table("raw.b").agg(F.min("d"), F.max("d")).first()\nkeys = [lo, hi]',
+        'for k in spark.table("raw.b").select("k").collect():\n    keys = k',
+        'cfg = {}\ncfg["c"] = spark.table("raw.b").agg(F.max("d")).first()[0]\nkeys = cfg["c"]',
+    ],
+)
+def test_a_scalar_made_of_a_read_in_a_way_that_is_not_followed_lists_the_read_on_the_product(
+    tmp_path, monkeypatch, setup
+):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        setup
+        + """
+a = spark.table("raw.a")
+a.where(F.col("k").isin(keys)).write.saveAsTable("mart.t1")
+spark.table("raw.c").write.saveAsTable("mart.t2")
+""",
+    )
+    assert "raw.b" in got["mart.t1"] and "raw.a" in got["mart.t1"], got
+    assert got["mart.t2"] == ["raw.c"]
+
+
+def test_a_value_that_comes_in_as_a_parameter_or_is_not_bound_is_taken_as_a_value(
+    tmp_path, monkeypatch
+):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        """
+        def build(day):
+            spark.table("raw.a").where(F.col("d") == day).write.saveAsTable("mart.t1")
+
+
+        build(date.today())
+        spark.table("raw.c").write.saveAsTable("mart.t2")
+        """,
+    )
+    assert got == {"mart.t1": ["raw.a"], "mart.t2": ["raw.c"]}
+
+
+def test_a_statement_that_reads_a_global_temporary_view_is_not_closed(tmp_path, monkeypatch):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        """
+        spark.table("raw.b").createGlobalTempView("gv")
+        spark.sql("INSERT INTO mart.t1 SELECT * FROM global_temp.gv JOIN raw.a ON 1=1")
+        spark.sql("INSERT INTO mart.t2 SELECT * FROM raw.c")
+        """,
+    )
+    assert got == {"mart.t1": ["raw.a", "raw.b"], "mart.t2": ["raw.c"]}
+
+
+def test_a_statement_that_reads_a_view_a_statement_made_global_is_not_closed(tmp_path, monkeypatch):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        """
+        spark.sql("CREATE GLOBAL TEMPORARY VIEW gv AS SELECT * FROM raw.b")
+        spark.sql("INSERT INTO mart.t1 SELECT * FROM global_temp.gv JOIN raw.a ON 1=1")
+        spark.sql("INSERT INTO mart.t2 SELECT * FROM raw.c")
+        """,
+    )
+    assert got == {"mart.t1": ["raw.a", "raw.b"], "mart.t2": ["raw.c"]}
+
+
+def test_a_view_registered_under_a_name_the_file_does_not_give_may_be_read_by_a_bare_name(
+    tmp_path, monkeypatch
+):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        """
+        def reg(df, name):
+            df.createOrReplaceTempView(name)
+
+
+        reg(spark.table("raw.b"), "v")
+        spark.sql("INSERT INTO mart.t1 SELECT * FROM v JOIN raw.a ON 1=1")
+        spark.sql("INSERT INTO mart.t2 SELECT * FROM raw.c")
+        """,
+    )
+    assert {"raw.a", "raw.b"} <= set(got["mart.t1"]) and got["mart.t2"] == ["raw.c"]
+
+
+def test_a_view_the_file_registers_below_the_statement_that_reads_it_is_still_a_view(
+    tmp_path, monkeypatch
+):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        """
+        def go():
+            spark.sql("INSERT INTO mart.t1 SELECT * FROM v JOIN raw.a ON 1=1")
+
+
+        spark.sql("CREATE TEMP VIEW v AS SELECT * FROM raw.b")
+        spark.sql("INSERT INTO mart.t2 SELECT * FROM raw.c")
+        go()
+        """,
+    )
+    assert got == {"mart.t1": ["raw.a", "raw.b"], "mart.t2": ["raw.c"]}
+
+
+def test_a_table_a_memory_sink_or_a_cache_names_is_a_view_to_sql(tmp_path, monkeypatch):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        """
+        spark.readStream.table("raw.s").writeStream.format("memory").queryName("m").start()
+        spark.sql("INSERT INTO mart.t1 SELECT * FROM m JOIN raw.a ON 1=1")
+        spark.sql("CACHE TABLE v AS SELECT * FROM raw.b")
+        spark.sql("INSERT INTO mart.t2 SELECT * FROM v JOIN raw.c ON 1=1")
+        """,
+    )
+    # neither statement is closed (each reads a view), so each lists what no write owns; and
+    # neither view is listed as a table
+    assert got == {
+        "mart.t1": ["raw.a", "raw.b", "raw.c", "raw.s"],
+        "mart.t2": ["raw.a", "raw.b", "raw.c", "raw.s"],
+    }
+
+
+def test_broadcast_imported_by_name_does_not_hide_the_data_it_wraps(tmp_path, monkeypatch):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        """
+        from pyspark.sql.functions import broadcast as bc
+
+
+        def build(src):
+            spark.table("raw.a").join(bc(src), "k").write.saveAsTable("mart.t1")
+
+
+        build(spark.table("raw.b"))
+        spark.table("raw.c").write.saveAsTable("mart.t2")
+        """,
+    )
+    assert got == {"mart.t1": ["raw.a", "raw.b"], "mart.t2": ["raw.c"]}
+
+
+def test_the_keyword_frames_of_spark_sql_are_data(tmp_path, monkeypatch):
+    got = consumed(
+        tmp_path,
+        monkeypatch,
+        """
+        def build(src):
+            spark.sql("SELECT * FROM {s} JOIN raw.x ON 1=1", s=src).write.saveAsTable("mart.t1")
+
+
+        build(spark.table("raw.b"))
+        spark.table("raw.c").write.saveAsTable("mart.t2")
+        """,
+    )
+    assert "raw.b" in got["mart.t1"] and got["mart.t2"] == ["raw.c"]
+
+
+IGNORE = "defaults: {domain: retail, platform: aws}\nignore: {tables: ['^tmp_']}\n"
+
+
+def test_what_feeds_a_write_the_conventions_ignore_feeds_what_reads_it_sql(tmp_path, monkeypatch):
+    got = with_conventions(
+        tmp_path,
+        monkeypatch,
+        """
+        spark.sql("INSERT INTO tmp_stage SELECT * FROM raw.a")
+        spark.sql("INSERT INTO mart.t1 SELECT * FROM tmp_stage JOIN raw.b ON 1=1")
+        spark.sql("INSERT INTO mart.t2 SELECT * FROM raw.c")
+        """,
+        IGNORE,
+    )
+    assert got == {"mart.t1": ["raw.a", "raw.b"], "mart.t2": ["raw.c"]}
+
+
+def test_what_feeds_a_write_the_conventions_ignore_feeds_what_reads_it_dataframes(
+    tmp_path, monkeypatch
+):
+    got = with_conventions(
+        tmp_path,
+        monkeypatch,
+        """
+        spark.table("raw.a").write.saveAsTable("tmp_stage")
+        spark.table("tmp_stage").write.saveAsTable("mart.t1")
+        spark.table("raw.c").write.saveAsTable("mart.t2")
+        """,
+        IGNORE,
+    )
+    assert got == {"mart.t1": ["raw.a"], "mart.t2": ["raw.c"]}
+
+
+def test_a_chain_of_ignored_writes_is_followed_to_the_end(tmp_path, monkeypatch):
+    got = with_conventions(
+        tmp_path,
+        monkeypatch,
+        """
+        spark.sql("INSERT INTO tmp_a SELECT * FROM raw.a")
+        spark.sql("INSERT INTO tmp_b SELECT * FROM tmp_a")
+        spark.sql("INSERT INTO mart.t1 SELECT * FROM tmp_b")
+        """,
+        IGNORE,
+    )
+    assert got == {"mart.t1": ["raw.a"]}
+
+
+def test_what_only_feeds_an_ignored_write_nobody_reads_is_on_no_product(tmp_path, monkeypatch):
+    got = with_conventions(
+        tmp_path,
+        monkeypatch,
+        """
+        spark.sql("INSERT INTO tmp_export SELECT * FROM raw.a")
+        spark.sql("INSERT INTO mart.t1 SELECT * FROM raw.c")
+        """,
+        IGNORE,
+    )
+    assert got == {"mart.t1": ["raw.c"]}

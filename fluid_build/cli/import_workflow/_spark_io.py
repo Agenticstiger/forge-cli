@@ -103,7 +103,7 @@ _PLAIN_TABLE = re.compile(r"[A-Za-z0-9_$`.\-]+")
 #: DataFrame methods that take another DataFrame, so a name given to them is data, not a value.
 _FRAME_METHODS = frozenset(
     {"join", "crossJoin", "union", "unionAll", "unionByName", "intersect", "intersectAll"}
-    | {"subtract", "exceptAll", "broadcast", "createDataFrame"}
+    | {"subtract", "exceptAll", "broadcast", "createDataFrame", "sql"}
 )
 #: Methods that run a function over the rows: what the function reads is not known.
 _FUNCTION_METHODS = frozenset(
@@ -392,6 +392,9 @@ class _Reader:
         self.file = shown or module.rel
         self.facts = JobFacts(rel=module.rel)
         self.temp_views: Set[str] = set()
+        #: A view the file registers under a name that is not a constant (a helper's parameter, the
+        #: environment): a name with no database in front of it may be that view.
+        self._views_uncertain = False
         self.default_checkpoint: Optional[str] = None
         #: What feeds what: the reads each call made (positions in ``facts.reads``), the calls
         #: whose reads are not all in ``facts.reads`` (a name that did not fold, a temporary view,
@@ -407,6 +410,9 @@ class _Reader:
         #: What the SQL parser found in a statement, by the statement (and its holes): the same
         #: text passed to ``spark.sql`` a thousand times is parsed once.
         self._sql_cache: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], _spark_sql.SqlFacts] = {}
+        #: The SQL text of a ``spark.sql`` call, folded once (the views it registers are read
+        #: before any statement is, and the statement itself after).
+        self._sql_folds: Dict[int, Optional[Tuple[Any, Dict[str, str]]]] = {}
         #: The variables that later assignments only add to, by the scope and the name (``None``:
         #: not one that can be followed).
         self._chains: Dict[Tuple[int, str], Optional[_Chain]] = {}
@@ -440,6 +446,7 @@ class _Reader:
                 if isinstance(name, str):
                     self.temp_views.add(name.lower())
                 else:
+                    self._views_uncertain = True
                     self.facts.notes.append(
                         f"{self.file}:{call.lineno} registers a temporary view under a name that "
                         "is not a constant: a read of a table this file does not name may be "
@@ -451,6 +458,74 @@ class _Reader:
                     value = self.folder.string(call.args[1])
                     if isinstance(value, str):
                         self.default_checkpoint = value
+        # every view the file registers is known before any statement is read: a statement above
+        # the one that registers a view (in a function defined first) may read it
+        for call in calls:
+            func = call.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr == "sql" and self._on_session(func.value):
+                self._views_of_sql(call)
+            elif func.attr in {"start", "toTable"}:
+                self._views_of_sink(call)
+
+    def _views_of_sql(self, call: ast.Call) -> None:
+        """The temporary views a ``spark.sql`` call registers (``CREATE TEMP VIEW``, ``CACHE
+        TABLE v AS``)."""
+        sql = self._sql_facts(call)
+        if sql is None:
+            return
+        for view in sql.temp_views:
+            if "__fluidhole" in view:
+                self._views_uncertain = True  # a view named by a field that did not fold
+            else:
+                self.temp_views.add(view)
+
+    def _views_of_sink(self, call: ast.Call) -> None:
+        """A ``memory`` sink registers a table named by its ``queryName``: a view, to SQL."""
+        links, _root = self._links(call)
+        marker = self._marker(links)
+        if marker is None or links[marker].call is not None or links[marker].name != "writeStream":
+            return
+        fmt = self._literal(self._arg(call, 1, "format"))
+        name_node = self._arg(call, 4, "queryName")
+        for link in links[marker + 1 :]:
+            if link.call is None or not link.call.args:
+                continue
+            if link.name == "format":
+                fmt = self._literal(link.call.args[0]) or fmt
+            elif link.name == "queryName":
+                name_node = link.call.args[0]
+        if (fmt or "").lower() != "memory":
+            return
+        name = self._literal(name_node)
+        if name:
+            self.temp_views.add(name.lower())
+        else:
+            self._views_uncertain = True
+
+    def _sql_facts(self, call: ast.Call) -> Optional[_spark_sql.SqlFacts]:
+        """What the SQL of a ``spark.sql`` call holds, when its text folds; read once for each
+        text. ``None`` when it does not fold (it is said when the statement is read)."""
+        folded = self._sql_text(call)
+        if folded is None or isinstance(folded[0], Unresolved):
+            return None
+        value, holes = folded
+        key = (value, tuple(sorted(holes.items())))
+        sql = self._sql_cache.get(key)
+        if sql is None:
+            prepared = _placeholders_to_holes(value, holes)
+            sql = self._sql_cache[key] = self._analyze_sql(prepared, holes)
+        return sql
+
+    def _sql_text(self, call: ast.Call) -> Optional[Tuple[Any, Dict[str, str]]]:
+        key = id(call)
+        if key not in self._sql_folds:
+            node = self._arg(call, 0, "sqlQuery")
+            self._sql_folds[key] = (
+                None if node is None else self.folder.fold_sql(node, limit=MAX_SQL_STRING)
+            )
+        return self._sql_folds[key]
 
     def _assignment_targets(self, call: ast.Call) -> List[str]:
         """Names a chain ending in ``call`` is assigned to (``spark = ....getOrCreate()``)."""
@@ -925,6 +1000,11 @@ class _Reader:
         if note not in self.facts.notes:
             self.facts.notes.append(note)
 
+    def _is_table(self, ref: Ref) -> bool:
+        """Whether ``ref`` is surely a table: when the file registers a view under a name it does
+        not give, a name with no database in front of it may be that view."""
+        return not self._views_uncertain or len(ref.parts) >= 2
+
     def _is_temp_view(self, ref: Ref) -> bool:
         if len(ref.parts) == 1:
             return ref.parts[0] in self.temp_views
@@ -959,10 +1039,10 @@ class _Reader:
     # ── SQL ─────────────────────────────────────────────────────────
 
     def _on_sql(self, call: ast.Call) -> None:
-        node = self._arg(call, 0, "sqlQuery")
-        if node is None:
+        folded = self._sql_text(call)
+        if folded is None:
             return
-        value, holes = self.folder.fold_sql(node, limit=MAX_SQL_STRING)
+        value, _holes = folded
         if isinstance(value, Unresolved):
             self._drop()  # what it reads is not known
             if _PARAMETER in value.why:
@@ -973,14 +1053,10 @@ class _Reader:
                     f"constant ({value.why})"
                 )
             return
-        # Looked up before the text is read for placeholders: the same constant passed to a
-        # thousand ``spark.sql`` calls is read once.
-        key = (value, tuple(sorted(holes.items())))
-        sql = self._sql_cache.get(key)
-        if sql is None:
-            prepared = _placeholders_to_holes(value, holes)
-            sql = self._sql_cache[key] = self._analyze_sql(prepared, holes)
-        self.temp_views.update(sql.temp_views)
+        # the same constant passed to a thousand ``spark.sql`` calls is read once
+        sql = self._sql_facts(call)
+        assert sql is not None
+        self.temp_views.update(v for v in sql.temp_views if "__fluidhole" not in v)
         for note in sql.notes:
             self._drop()  # SQL that was not read whole
             self.facts.notes.append(f"{self.file}:{call.lineno} {note}")
@@ -998,7 +1074,9 @@ class _Reader:
         owned: Set[int] = set()
         for index, write in enumerate(sql.writes):
             sources = [refs[id(s)] for s in write.sources if id(s) in refs]
-            closed[index] = all(r.resolved and not self._is_temp_view(r) for r in sources)
+            closed[index] = all(
+                r.resolved and not self._is_temp_view(r) and self._is_table(r) for r in sources
+            )
             if closed[index]:
                 owned.update(id(s) for s in write.sources)
         position: Dict[int, Optional[int]] = {}
@@ -1468,10 +1546,20 @@ class _Reader:
             if isinstance(node, ast.Name):
                 if node.id in self.sessions or self._is_pyspark(node.id):
                     return True
-                bound = self._bound_expression(node)
-                if bound is not None and not self.folder.rebound(node.id):
-                    return walk(bound, depth + 1, True, scalar)
-                return scalar and not self._is_callable_of_file(node)
+                how = self.folder.how_bound(node)
+                if how == "once":
+                    bound = self._bound_expression(node)
+                    return bound is not None and walk(bound, depth + 1, True, scalar)
+                if how == "many":  # every one of its assignments is what it may hold
+                    found_all = self._assignments(node)
+                    return found_all is not None and all(
+                        walk(each, depth + 1, True, scalar) for each in found_all[1]
+                    )
+                if how in {"parameter", "imported", "unbound"}:
+                    return scalar and not self._is_callable_of_file(node)
+                return (
+                    False  # unpacked, a loop variable, changed in place: what it holds is unknown
+                )
             if isinstance(node, ast.Attribute):
                 return walk(node.value, depth, shared, scalar)
             if isinstance(node, ast.Call):
@@ -1487,10 +1575,13 @@ class _Reader:
                     ok = walk(func.value, depth, shared, scalar)
                     inner = scalar or func.attr not in _FRAME_METHODS
                 elif isinstance(func, ast.Name):
+                    callee = (qualified_name(func, self.module.imports) or func.id).rsplit(".", 1)[
+                        -1
+                    ]
                     ok = self._is_pyspark(func.id) or (
                         scalar and not self._is_callable_of_file(func)
                     )
-                    inner = True
+                    inner = scalar or callee not in _FRAME_METHODS
                 else:
                     ok = False
                 return ok and all(

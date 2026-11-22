@@ -11,8 +11,9 @@ What is a table, and what is not:
 
 * a name in a ``FROM`` or ``JOIN`` is a read, except a CTE of the same statement
   (sqlglot answers a CTE in ``FROM`` with a table node, so the CTE names are collected and left
-  out), a name registered as a temporary view, a ``global_temp`` name and a table function
-  (``range(10)``);
+  out), a name registered as a temporary view and a table function (``range(10)``); a
+  ``global_temp`` name and a name the statement caches (``CACHE TABLE v AS SELECT ...``) are views
+  the reader of the job drops, and a statement that reads one is not closed;
 * ``INSERT INTO|OVERWRITE``, ``CREATE TABLE|VIEW ... AS``, ``MERGE INTO``, ``UPDATE`` and
   ``DELETE FROM`` write the table they name; ``CREATE TEMPORARY VIEW`` registers a temporary
   view and writes nothing;
@@ -150,6 +151,8 @@ def analyze(sql: str, holes: Optional[Dict[str, str]] = None) -> SqlFacts:
             _create(statement, holes, facts)
         elif isinstance(statement, (exp.Insert, exp.Merge, exp.Update, exp.Delete)):
             _dml(statement, holes, facts)
+        elif isinstance(statement, exp.Cache):
+            _cache(statement, holes, facts)
         elif isinstance(statement, (exp.Select, exp.Union, exp.Subquery, exp.With)):
             _reads(statement, None, holes, facts)
     return facts
@@ -187,8 +190,6 @@ def _reads(
         if name.kind == "table":
             if len(name.parts) == 1 and name.parts[0] in ctes:
                 continue
-            if len(name.parts) >= 2 and name.parts[-2] == "global_temp":
-                continue
         facts.reads.append(name)
         found.append(name)
     return found
@@ -213,6 +214,16 @@ def _dml(statement: Any, holes: Dict[str, str], facts: SqlFacts) -> None:
         else:
             mode = "delete"
         facts.writes.append(SqlWrite(name, mode, tuple(sources)))
+
+
+def _cache(statement: Any, holes: Dict[str, str], facts: SqlFacts) -> None:
+    """``CACHE TABLE v AS SELECT ...`` registers a view named ``v`` and writes nothing."""
+    target = _target_node(statement)
+    if target is None or statement.args.get("expression") is None:
+        return
+    if target.name:
+        facts.temp_views.add(target.name.lower())
+    _reads(statement, target, holes, facts)
 
 
 def _create(statement: Any, holes: Dict[str, str], facts: SqlFacts) -> None:

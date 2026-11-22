@@ -583,7 +583,7 @@ def parse_conventions(
 
     external = tuple(
         dict.fromkeys(
-            _text(item, source, f"external_consumers[{i}]").lower()
+            _text(item, source, f"external_consumers[{i}]").lower().rstrip("/")
             for i, item in enumerate(
                 _list(top.get("external_consumers", []), source, "external_consumers")
             )
