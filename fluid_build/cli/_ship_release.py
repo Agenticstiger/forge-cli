@@ -28,6 +28,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import tarfile
@@ -60,6 +61,106 @@ _STAGE_REPORTS: Dict[int, Sequence[str]] = {
 
 class ReleaseError(Exception):
     """The release cannot be built or published; nothing is published."""
+
+
+#: What each CI system names as the revision, repository and ref it built, in the order
+#: ``_attestation._collect_run_metadata`` tries them (the first that is running wins):
+#: ``(variables that say it runs, revision, repository, ref)``. Environment variables only.
+_SOURCE_VARS = (
+    (("GITHUB_RUN_ID",), "GITHUB_SHA", "GITHUB_REPOSITORY", "GITHUB_REF"),
+    (("CI_JOB_ID",), "CI_COMMIT_SHA", "CI_PROJECT_URL", "CI_COMMIT_REF_NAME"),
+    (
+        ("CIRCLE_WORKFLOW_ID", "CIRCLE_BUILD_NUM"),
+        "CIRCLE_SHA1",
+        "CIRCLE_REPOSITORY_URL",
+        "CIRCLE_BRANCH",
+    ),
+    (("BUILD_BUILDID",), "BUILD_SOURCEVERSION", "BUILD_REPOSITORY_URI", "BUILD_SOURCEBRANCH"),
+    (
+        ("BITBUCKET_BUILD_NUMBER",),
+        "BITBUCKET_COMMIT",
+        "BITBUCKET_GIT_HTTP_ORIGIN",
+        "BITBUCKET_BRANCH",
+    ),
+    (("BUILD_ID",), "GIT_COMMIT", "GIT_URL", "GIT_BRANCH"),
+)
+_REVISION = re.compile(r"[0-9a-f]{7,64}")
+_REF = re.compile(r"[A-Za-z0-9._/@+#-]{1,200}")
+#: ``user@host:org/repo.git`` (the host may be a bare name such as ``gitserver``). The ``user@``
+#: and a path of at least two segments that does not start at a root make it one: ``user:token``
+#: (a CI variable set to a credential), a Windows drive (``C:/work``) and ``host:/etc/passwd``
+#: are none of that.
+_SCP_URL = re.compile(
+    r"[A-Za-z0-9._-]+@"
+    r"([A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)*)"
+    r":([A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)+)"
+)
+_GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+
+
+def _repository(value: Optional[str]) -> Optional[str]:
+    """A repository URL with no user, password, query or fragment (a CI's clone URL can carry a
+    token), or ``None`` for anything that is not an ``https``, ``http``, ``ssh`` or ``git`` URL
+    or a ``user@host:org/repo`` one, or is not printable ASCII: a path on the runner's disk is no
+    part of a release record."""
+    from urllib.parse import urlsplit
+
+    text = (value or "").strip()
+    if not text or len(text) > 256 or not all(32 < ord(c) < 127 for c in text):
+        return None
+    if "://" in text:
+        try:
+            parts = urlsplit(text)
+            port = f":{parts.port}" if parts.port else ""
+        except ValueError:
+            return None
+        host = parts.hostname
+        if parts.scheme not in ("https", "http", "ssh", "git") or not host:
+            return None
+        if ":" in host:  # an IPv6 literal: urlsplit took its brackets off
+            host = f"[{host}]"
+        return f"{parts.scheme}://{host}{port}{parts.path}"
+    scp = _SCP_URL.fullmatch(text)
+    if scp is None or ".." in scp.group(2).split("/"):
+        return None
+    return f"{scp.group(1)}:{scp.group(2)}"
+
+
+def _repository_value(env: Mapping[str, str], repository_var: str) -> Optional[str]:
+    """What the CI says the repository is: a URL, or for GitHub the ``org/repo`` on its server."""
+    repository = env.get(repository_var)
+    if repository_var != "GITHUB_REPOSITORY":
+        return repository
+    slug = (repository or "").strip()
+    server = (env.get("GITHUB_SERVER_URL") or "https://github.com").rstrip("/")
+    return f"{server}/{slug}" if _GITHUB_REPOSITORY.fullmatch(slug) else None
+
+
+def _source_of(
+    env: Mapping[str, str], revision_var: str, repository_var: str, ref_var: str
+) -> Dict[str, str]:
+    """``{"revision", "repository", "ref"}`` of one CI, each only when it is what it should be."""
+    found: Dict[str, str] = {}
+    revision = (env.get(revision_var) or "").strip().lower()
+    if _REVISION.fullmatch(revision):
+        found["revision"] = revision
+    repository = _repository(_repository_value(env, repository_var))
+    if repository:
+        found["repository"] = repository
+    ref = (env.get(ref_var) or "").strip()
+    if _REF.fullmatch(ref):
+        found["ref"] = ref
+    return found
+
+
+def source_revision(env: Mapping[str, str]) -> Optional[Dict[str, str]]:
+    """The code the run built, as its CI names it: ``{"revision", "repository", "ref"}``, each
+    only when the CI sets it and it is what it should be (a hex commit, a URL with no
+    credential in it, a ref name). Read from environment variables only, as the CI run is."""
+    for markers, *names in _SOURCE_VARS:
+        if any(env.get(name) for name in markers):
+            return _source_of(env, *names) or None
+    return None
 
 
 def refusal(
@@ -212,6 +313,16 @@ def build_identity(
         },
         "artifacts": {"manifest_digest": artifacts["digest"]},
     }
+    versions = {
+        str(e.get("exposeId")): e["version"].strip()
+        for e in contract.get("exposes") or []
+        if isinstance(e, Mapping)
+        and e.get("exposeId")
+        and isinstance(e.get("version"), str)
+        and e["version"].strip()
+    }
+    if versions:
+        identity["expose_versions"] = versions
     if with_plan:
         plan = _plan_digests(root)
         if plan["bundle_digest"] != manifest["digest"]:
@@ -378,10 +489,12 @@ def provenance(
     from fluid_build.cli._attestation import _collect_run_metadata
 
     ran = [r for r in records if r.started_at is not None]
+    source = source_revision(os.environ)
     return {
         "run_id": run_id,
         "started_at": ran[0].started_at if ran else None,
         "finished_at": ran[-1].finished_at if ran else None,
+        **({"source": source} if source else {}),
         "stages": [
             {
                 "number": r.number,

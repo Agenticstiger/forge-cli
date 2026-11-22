@@ -1430,6 +1430,7 @@ def _run_reconcile_mode(
     if hook_rc:
         return hook_rc
     from fluid_build.cli import _spark_apply as _spark
+    from fluid_build.observability.run_id import get_or_create_run_id
 
     ask = None if args.yes or dry_run or not os.isatty(0) else _confirm_reconcile
     return _spark.reconcile_only(
@@ -1439,6 +1440,7 @@ def _run_reconcile_mode(
         dry_run=dry_run,
         workspace=_spark_workspace(args, None),
         confirm=ask,
+        run_id=get_or_create_run_id(),
     )
 
 
@@ -2515,6 +2517,7 @@ def run(args, logger: logging.Logger) -> int:
             verified_plan=verified_plan_data,
             dry_run=effective_dry_run,
             workspace=spark_workspace,
+            run_id=run_id,
         )
     if apply_engine == "opentofu":
         # Apply-time plugin hooks run on EVERY engine. They used to be
@@ -2536,6 +2539,7 @@ def run(args, logger: logging.Logger) -> int:
             verified_plan=verified_plan_data,
             dry_run=effective_dry_run,
             workspace=spark_workspace,
+            run_id=run_id,
         )
         _spark.warn_cluster_posture(spark_runs, logger, dry_run=effective_dry_run)
         rc = apply_via_opentofu(args, logger, contract=source_contract, **engine_kwargs)
