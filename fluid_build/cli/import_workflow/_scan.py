@@ -318,6 +318,15 @@ def _stays_inside(relative: str) -> bool:
     return ".." not in text.split("/")
 
 
+def path_is(path: Path, directory: bool) -> bool:
+    """Whether ``path`` is a directory (``directory``) or a file. A name too long for the system,
+    or one it cannot encode, is neither: before Python 3.14, asking raises for it."""
+    try:
+        return path.is_dir() if directory else path.is_file()
+    except (OSError, ValueError):
+        return False
+
+
 def local_script(
     script: str, conventions: Conventions, project_root: Optional[Path]
 ) -> Optional[Path]:
@@ -329,12 +338,12 @@ def local_script(
             if not _stays_inside(rest):
                 return None
             candidate = directory / rest
-            if _inside(candidate, [directory]) and candidate.is_file():
+            if _inside(candidate, [directory]) and path_is(candidate, False):
                 return candidate
             return None
     if "://" not in script and project_root is not None and _stays_inside(script):
         candidate = project_root / script
-        if _inside(candidate, [project_root]) and candidate.is_file():
+        if _inside(candidate, [project_root]) and path_is(candidate, False):
             return candidate
     return None
 
