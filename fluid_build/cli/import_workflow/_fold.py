@@ -36,8 +36,10 @@ There is no ``eval``, no ``ast.literal_eval`` and no import of anything the proj
 from __future__ import annotations
 
 import ast
+import os
 import posixpath
 import re
+import sys
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -73,6 +75,9 @@ from ._pysource import (
 #: :meth:`ModuleIndex._below_the_import_root`): a real import has a few.
 MAX_ROOT_NAMES = 12
 MAX_NAME_PARTS = 24
+#: Names a dotted name starting with which is never a module of the scanned project: the standard
+#: library's and the frameworks the scanned code runs on.
+_NOT_THE_PROJECT = frozenset(sys.stdlib_module_names) | {"airflow", "pyspark"}
 #: Deepest expression :meth:`Folder.fold` follows, and the longest string it builds.
 MAX_FOLD_DEPTH = 40
 MAX_STRING = 4096
@@ -1063,7 +1068,9 @@ class ModuleIndex:
         for source in files:
             parts = source.rel[: -len(".py")].split("/")
             if not self._root_names:
-                self._root_names = tuple(source.path.parts[: -len(parts)])[-MAX_ROOT_NAMES:]
+                # absolute (without following links): `.` and `dags` name the same directory
+                absolute = Path(os.path.abspath(source.path)).parts
+                self._root_names = tuple(absolute[: -len(parts)])[-MAX_ROOT_NAMES:]
             if parts[-1] == "__init__":
                 parts = parts[:-1]
             for start in range(len(parts)):
@@ -1203,7 +1210,7 @@ class ModuleIndex:
         A name that fits neither is not guessed at (``teamx.weekly.settings`` from
         ``nightly/dag.py`` of a scan of a directory named otherwise), nor is one of more than
         :data:`MAX_NAME_PARTS` parts."""
-        if len(parts) > MAX_NAME_PARTS:
+        if len(parts) > MAX_NAME_PARTS or parts[0] in _NOT_THE_PROJECT:
             return None
         return self._in_own_package(parts, from_rel) or self._under_the_root_names(parts)
 
@@ -1220,7 +1227,9 @@ class ModuleIndex:
                 common = min(len(head), len(package))
                 if list(head[-common:]) != package[-common:]:
                     continue
-                for cut in range(len(parts) - 1, at, -1):
+                # a module of the package, not the package itself: ``pyspark.sql.functions`` from
+                # ``sql/job.py`` is not ``sql/__init__.py``'s ``functions``
+                for cut in range(len(parts) - 1, at + 1, -1):
                     found = self._file(package, parts[at + 1 : cut])
                     if found is not None:
                         return found, list(parts[cut:])
@@ -1562,11 +1571,13 @@ class Folder:
         for key_node, value_node in list(zip(node.keys, node.values, strict=True))[:MAX_ITEMS]:
             if key_node is None:  # **spread
                 spread = self.fold(value_node, scope, depth)
+                if not isinstance(spread, dict) or not getattr(spread, "complete", True):
+                    # what it holds is not all known, and any of it replaces a key written
+                    # before it: those are not known either
+                    result.clear()
+                    complete = False
                 if isinstance(spread, dict):
                     result.update(spread)
-                    complete = complete and getattr(spread, "complete", True)
-                else:
-                    complete = False
                 continue
             key = self.fold(key_node, scope, depth)
             if isinstance(key, (str, int)) and not isinstance(key, bool):
@@ -1703,12 +1714,21 @@ class Folder:
                 names = [a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)]
                 names += [a.arg for a in (args.vararg, args.kwarg) if a is not None]
                 if node.id in names:
+                    if self._is_bound(current, node.id):
+                        return None  # a caller's value, folded through the lambda's scope
                     return f"`{node.id}` is a parameter of a lambda"
             elif isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 break
             child = current
             current = parents.get(current)
         return None
+
+    def _is_bound(self, function: ast.AST, name: str) -> bool:
+        """Whether a caller's value is bound to the parameter ``name`` of ``function``."""
+        scope = self._scopes.get(function)
+        return scope is not None and any(
+            owner is scope and name in frame for owner, frame in self._env
+        )
 
     def _loop_item(self, name: str, scope: Scope) -> Any:
         """What the loop being unrolled gives ``name`` in ``scope``, else :data:`ABSENT`: the
@@ -2084,16 +2104,18 @@ class Folder:
                 return Unresolved(why, snippet(node))
             result.update(first)
             complete = getattr(first, "complete", True)
+        named: Dict[str, Any] = {}  # a keyword cannot be passed twice: these are as written
         for keyword in node.keywords[:MAX_ITEMS]:
             if keyword.arg is None:
                 spread = self.fold(keyword.value, scope, depth)
+                if not isinstance(spread, dict) or not getattr(spread, "complete", True):
+                    result.clear()  # the mapping's keys may be replaced by what it holds
+                    complete = False
                 if isinstance(spread, dict):
                     result.update(spread)
-                    complete = complete and getattr(spread, "complete", True)
-                else:
-                    complete = False
             else:
-                result[keyword.arg] = self.fold(keyword.value, scope, depth)
+                named[keyword.arg] = self.fold(keyword.value, scope, depth)
+        result.update(named)
         result.complete = complete and len(node.keywords) <= MAX_ITEMS
         return result
 
