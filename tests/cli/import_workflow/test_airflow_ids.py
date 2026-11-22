@@ -183,6 +183,35 @@ def test_task_ids_are_mapped_and_every_dependency_names_the_recorded_id(tmp_path
     assert not any(x.startswith("task 'load'") for x in lines)
 
 
+@pytest.mark.parametrize("split", ["dag", "task"])
+def test_a_product_made_of_a_dag_or_a_task_is_named_after_its_recorded_id(
+    tmp_path, monkeypatch, split
+):
+    _project(
+        tmp_path,
+        {
+            "a.py": """
+            with DAG("Orders", schedule=None, default_args={"owner": "retail"}) as dag:
+                SparkSubmitOperator(task_id="Run", application="s3://acme-code/jobs/first.py")
+            """,
+            "b.py": """
+            with DAG("orders", schedule=None, default_args={"owner": "retail"}) as dag:
+                SparkSubmitOperator(task_id="run", application="s3://acme-code/jobs/second.py")
+            """,
+        },
+        ["first", "second"],
+    )
+    monkeypatch.chdir(tmp_path)
+    contracts, _report = AirflowImporter().import_to_contracts(
+        "dags", options={"conventions": "conventions.yaml", "split_by": split}
+    )
+    named = {c["id"]: _airflow([c])[c["id"]]["dagId"] for c in contracts}
+    if split == "dag":
+        assert named == {"orders_2": "orders_2", "orders": "orders"}
+    else:
+        assert named == {"orders_2.run": "orders_2", "orders.run": "orders"}
+
+
 def test_a_re_import_records_the_same_ids_and_says_the_same(tmp_path, monkeypatch):
     _project(
         tmp_path,

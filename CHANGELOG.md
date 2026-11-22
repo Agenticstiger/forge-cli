@@ -40,7 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and their params) and such a task was not recorded. Each is now recorded under the importer's
   identifier of its id (`nightly_orders`), made unique among the import's DAG ids (a task's among
   its DAG's task ids) with a number after it, in file order; an id that fits is never changed, and
-  a task's dependencies name the recorded ids. Used defaults lists each id recorded under another,
+  a task's dependencies name the recorded ids, as do the products `--split-by dag` and `task` make.
+  Used defaults lists each id recorded under another,
   with the Airflow id it stands for: the running DAG keeps its own id.
 
 - **A conventions file away from the repositories it describes says what its paths name.** A
