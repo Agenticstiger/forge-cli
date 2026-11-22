@@ -37,7 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   job's: a job of 440 `INSERT ... SELECT` took 49 s to check and takes 2.5 s, and one of 2,000
   writes over 99 reads took 67 s and takes 5 s. Where the code does not say, the products list
   every read no single write owns as before, and past 40,000 listed reads in all each lists fewer
-  (500 down to 5) and the report says so.
+  (500 down to 5) and the report says so. A product describes only the streams of the outputs it
+  owns (at most 20 listed, the rest counted, and a proposal whose stream text is past 16,000,000
+  characters is refused with the `--split-by job` hint), the loads of a name are sorted into their
+  scopes once per file and charged to the flow budget, a conventions value whose name says it is a
+  credential (`db_password`, `API_TOKEN`, the names Airflow hides in its own logs) is not
+  substituted (the code's reference stays as written and the report lists the names), and a bare
+  Oracle login with a service name (`scott/pw@ORCL`) is masked after an Oracle client, `userid=`,
+  `-u` or `--dsn`, and as an argument of its own when the user and the service read like names
+  (`pkg/mod@v1.2.3` and `org/repo@main` are left alone).
 
 - **A released Spark stream that fails is rolled back to the last good config.** After `fluid
   apply` starts a stream's new config over a previous one (a running run it replaced, or one that
