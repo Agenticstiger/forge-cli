@@ -34,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid import airflow|pyspark` keeps the DAG of an Airflow id with capitals.** Airflow takes
+  `Nightly_Orders` as a `dag_id`; the contract's `dagId` and `taskId` take only lower case letters,
+  digits, `_`, `.` and `-`, so such a DAG was left off the builds it runs (its schedule, its tasks
+  and their params) and such a task was not recorded. Each is now recorded under the importer's
+  identifier of its id (`nightly_orders`), made unique among the import's DAG ids (a task's among
+  its DAG's task ids) with a number after it, in file order; an id that fits is never changed, and
+  a task's dependencies name the recorded ids. Used defaults lists each id recorded under another,
+  with the Airflow id it stands for: the running DAG keeps its own id.
+
 - **A conventions file away from the repositories it describes says what its paths name.** A
   path in the file is relative to the file's own folder, so a file moved beside or away from the
   folder that holds the repositories, with its paths written from there, named directories that do
