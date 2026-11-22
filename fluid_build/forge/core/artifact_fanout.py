@@ -75,7 +75,7 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import yaml
 
@@ -975,25 +975,28 @@ def _clear_spark(directory: Path) -> None:
         directory.rmdir()
 
 
-def _emit_pyspark_schema(
-    source: Path, out_dir: Path, logger: logging.Logger, *, overlay_env: Optional[str] = None
-) -> List[Path]:
+def _emit_pyspark_schema(source: Path, out_dir: Path, logger: logging.Logger) -> List[Path]:
     """A PySpark ``StructType`` module per output port at ``pyspark-schema/<port>_schema.py``.
 
     The modules ``fluid generate pyspark-schema`` writes, byte for byte: the contract is
     loaded as that command loads it (``source`` is the fanout's input, a bundle or a
     contract) and rendered, planned and written by the same functions
-    (:mod:`fluid_build.spark.pyspark_schema`). A file at a module's path that the emitter
-    did not write, or a link, is left alone and refused, as the command refuses it. A port
-    without ``contract.schema`` columns gets no module.
+    (:mod:`fluid_build.spark.pyspark_schema`). The input already carries an ``--env``
+    overlay (a raw contract with ``--env`` fans out through a bundle); ``$FLUID_ENV``, which
+    the DAGs and Spark job configs follow, is not applied, so the modules describe the
+    contract the run's ODCS describes. A file at a module's path that the emitter did not
+    write, or a link, is left alone and refused, as the command refuses it. A port without
+    ``contract.schema`` columns gets no module.
     """
     from fluid_build.cli._common import load_contract_with_overlay
     from fluid_build.iac.base import UnsupportedBindingError
     from fluid_build.spark import pyspark_schema
 
     key = "pyspark-schema"
+    if out_dir.is_symlink():  # cleared when the run started; one planted since is refused
+        raise FanoutError(f"{out_dir} is a link, so no module is written through it", key=key)
     try:
-        contract = load_contract_with_overlay(str(source), overlay_env, logger)
+        contract = load_contract_with_overlay(str(source), None, logger)
         rendered = pyspark_schema.render_contract(contract)
     except UnsupportedBindingError as exc:
         raise FanoutError(
@@ -1007,18 +1010,7 @@ def _emit_pyspark_schema(
             f"the PySpark schema of {source} could not be rendered: {exc}", key=key
         ) from None
     planned = pyspark_schema.plan(rendered.modules, out_dir)
-    for status, code, what in (
-        ("foreign", "generate_pyspark_schema_foreign_file", "not written by this emitter"),
-        ("other_product", "generate_pyspark_schema_other_product", "generated for another product"),
-    ):
-        refused = [str(item.path) for item in planned if item.status == status]
-        if refused:
-            raise FanoutError(
-                f"{', '.join(refused)}: a file at a module's path is {what}, so it is left alone",
-                key=key,
-                code=code,
-                context={"files": ", ".join(refused)},
-            )
+    _refuse_unowned_modules(planned)
     for module in rendered.modules:
         for warning in module.warnings:
             logger.warning("generate_artifacts_pyspark_schema_lossy: %s", warning)
@@ -1037,12 +1029,38 @@ def _emit_pyspark_schema(
     return [item.path for item in planned]
 
 
+def _refuse_unowned_modules(planned: Sequence[Any]) -> None:
+    """Refuse the run when a module's path holds a file the emitter did not write (or one
+    another product's run wrote), as ``fluid generate pyspark-schema`` refuses it."""
+    for status, code, what in (
+        ("foreign", "generate_pyspark_schema_foreign_file", "not written by this emitter"),
+        ("other_product", "generate_pyspark_schema_other_product", "generated for another product"),
+    ):
+        refused = [str(item.path) for item in planned if item.status == status]
+        if refused:
+            raise FanoutError(
+                f"{', '.join(refused)}: a file at a module's path is {what}, so it is left alone",
+                key="pyspark-schema",
+                code=code,
+                context={"files": ", ".join(refused)},
+            )
+
+
 def _clear_pyspark_schema(directory: Path) -> None:
     """Remove the modules an earlier fanout wrote (files that start with the emitter's
-    header line), and nothing else: not a link, not a file of the project's own."""
+    header line), and nothing else: not a link, not a file of the project's own.
+
+    A link at the directory's own name is removed, never followed: the modules are written
+    into ``<out>/pyspark-schema`` itself, so a link planted there would otherwise send them
+    (and the replacement of a module it finds there) to wherever it points. Like every
+    subdirectory of ``<out>``, it is one product's: another product's modules there are
+    removed too, as its ``odcs/`` or ``schedule/`` would be."""
     from fluid_build.spark import pyspark_schema
 
-    if not directory.is_dir() or directory.is_symlink():
+    if directory.is_symlink():
+        directory.unlink()
+        return
+    if not directory.is_dir():
         return
     for module in sorted(directory.glob(f"*{pyspark_schema.SUFFIX}.py")):
         if pyspark_schema.is_generated_module(module):
@@ -1169,7 +1187,7 @@ def _emit_key(key: str, subdir: Path, run: _Inputs, logger: logging.Logger) -> L
         return _emit_spark(run.source, subdir, logger, overlay_env=run.overlay_env)
     if key == "pyspark-schema":
         # The original input too: the contract as `generate pyspark-schema` loads it.
-        return _emit_pyspark_schema(run.source, subdir, logger, overlay_env=run.overlay_env)
+        return _emit_pyspark_schema(run.source, subdir, logger)
     if key == "custom-scaffold":
         return _emit_custom_scaffold(run, subdir, logger)
     emit: Any = _DISPATCH[key][1]

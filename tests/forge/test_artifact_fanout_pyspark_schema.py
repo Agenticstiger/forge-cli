@@ -159,6 +159,24 @@ def test_a_symlinked_module_left_in_the_directory_is_never_followed(tmp_path: Pa
     assert target.read_text() == pyspark_schema.HEADER + "\n"
 
 
+def test_a_link_planted_at_the_output_directory_is_removed_not_written_through(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    keep = victim / "orders_schema.py"
+    keep.write_text(pyspark_schema.HEADER + "\n# data product: acme.sales.orders\nmine\n")
+    (out / "pyspark-schema").symlink_to(victim, target_is_directory=True)
+    manifest = _fanout(_write(tmp_path / "p", ORDERS), out)
+    assert sorted(p.name for p in victim.iterdir()) == ["orders_schema.py"]
+    assert keep.read_text().endswith("mine\n")
+    assert not (out / "pyspark-schema").is_symlink()
+    assert (out / "pyspark-schema" / "orders_schema.py").is_file()
+    assert _rows(manifest) == ["pyspark-schema/orders_schema.py"]
+
+
 def test_a_bundle_gives_the_modules_its_raw_contract_gives(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -176,6 +194,55 @@ def test_a_bundle_gives_the_modules_its_raw_contract_gives(
     assert {k: v for k, v in from_bundle["files"].items() if k.startswith("pyspark-schema/")} == {
         k: v for k, v in from_contract["files"].items() if k.startswith("pyspark-schema/")
     }
+
+
+_PROD_OVERLAY = """\
+exposes:
+  - exposeId: orders
+    contract:
+      schema:
+        - name: order_id
+          type: string
+          required: true
+        - name: amount
+          type: decimal(12,2)
+        - name: placed_at
+          type: timestamp
+        - name: extra
+          type: timestamp
+"""
+
+
+def test_fluid_env_does_not_overlay_the_modules_and_env_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """$FLUID_ENV steers the DAGs and Spark job configs only; ``--env`` overlays the input, so
+    the modules match the run's ODCS and ``fluid generate pyspark-schema`` either way."""
+    from fluid_build.cli import main
+
+    contract = _write(tmp_path / "p", ORDERS)
+    (contract.parent / "overlays").mkdir()
+    (contract.parent / "overlays" / "prod.yaml").write_text(_PROD_OVERLAY, encoding="utf-8")
+    monkeypatch.chdir(contract.parent)
+    module = "orders_schema.py"
+
+    assert main(["generate", "pyspark-schema", str(contract), "--out", "base"]) == 0
+    assert (
+        main(["generate", "pyspark-schema", str(contract), "--env", "prod", "--out", "prod"]) == 0
+    )
+    base, prod = Path("base", module).read_bytes(), Path("prod", module).read_bytes()
+    assert base != prod and b"extra" in prod
+
+    monkeypatch.setenv("FLUID_ENV", "prod")
+    emit = ["--emit", "pyspark-schema,odcs"]
+    assert main(["generate", "artifacts", str(contract), "--out", "a1", *emit]) == 0
+    assert Path("a1", "pyspark-schema", module).read_bytes() == base
+    assert b"extra" not in Path("a1", "odcs", "product.odcs.orders.yaml").read_bytes()
+
+    assert (
+        main(["generate", "artifacts", str(contract), "--env", "prod", "--out", "a2", *emit]) == 0
+    )
+    assert Path("a2", "pyspark-schema", module).read_bytes() == prod
 
 
 # ── stage 4 ───────────────────────────────────────────────────────────────

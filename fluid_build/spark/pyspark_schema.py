@@ -728,14 +728,15 @@ def check_module(source: str, filename: str) -> None:
     """
     try:
         body = ast.parse(source.encode("utf-8"), filename).body
-    except (SyntaxError, ValueError) as exc:
-        raise ValueError(f"the module does not parse: {exc}") from None
-    imported: FrozenSet[str] = frozenset()
-    if len(body) > 1 and isinstance(body[1], ast.ImportFrom):
-        imported = frozenset(alias.name for alias in body[1].names)
-    if not imported or not imported <= TYPE_NAMES:
-        raise ValueError("the generated module holds more than its schema")
-    _verify(source, filename, imported)
+        imported: FrozenSet[str] = frozenset()
+        if len(body) > 1 and isinstance(body[1], ast.ImportFrom):
+            imported = frozenset(alias.name for alias in body[1].names)
+        if not imported or not imported <= TYPE_NAMES:
+            raise ValueError("the generated module holds more than its schema")
+        _verify(source, filename, imported)
+    except (SyntaxError, RecursionError, MemoryError) as exc:
+        # A generated module nests a few levels; one too deep to parse is not one of them.
+        raise ValueError(f"the module does not parse ({type(exc).__name__})") from None
 
 
 def is_generated_module(path: Path) -> bool:
