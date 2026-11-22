@@ -47,7 +47,7 @@ from ._catalogs import CatalogKinds
 from ._conventions import Conventions, PathRule
 from ._redact import safe_args, safe_command, safe_text
 from ._scan import JobRecord, LinkedTask
-from ._spark_io import Ref, Write
+from ._spark_io import TRIGGER_SEPARATOR, Ref, Write
 from .registry import ImportReport
 
 SPLITS = ("table", "job", "dag", "folder", "project")
@@ -547,9 +547,18 @@ def _owner(
     return _owner_block(labels[0], conv)
 
 
+#: Triggers that end by themselves: the query drains what is there and stops.
+_ONE_SHOT = frozenset({"availableNow", "once"})
+
+
 def _trigger(writes: Sequence[Write]) -> str:
+    """``continuous`` when a streaming write may keep running (any trigger it can have, when the
+    code picks one by a branch, is not a one-shot), else ``manual``."""
     long_running = [
-        w for w in writes if w.streaming and (w.trigger or "") not in {"availableNow", "once"}
+        w
+        for w in writes
+        if w.streaming
+        and any(t not in _ONE_SHOT for t in (w.trigger or "").split(TRIGGER_SEPARATOR))
     ]
     return "continuous" if long_running else "manual"
 

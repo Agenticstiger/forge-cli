@@ -365,6 +365,7 @@ def _scan_report(
     for job in jobs:
         for note in job.facts.notes:
             report.unsupported.append(safe_text(note, 300))
+        report.notes.extend(safe_text(n, 300) for n in job.facts.remarks)
 
     if dag_scan is not None:
         tasks = [t for d in dag_scan.dags for t in d.tasks]

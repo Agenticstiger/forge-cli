@@ -174,6 +174,11 @@ class Scope:
     values: Dict[str, ast.expr] = field(default_factory=dict)
     blocked: Dict[str, str] = field(default_factory=dict)
     classes: Dict[str, ast.ClassDef] = field(default_factory=dict)
+    #: Every assignment of a name assigned more than once, in source order, when each write to it
+    #: was a plain ``name = value`` (no ``+=``, unpacking, loop variable, import ...): what a later
+    #: assignment starts from (``writer = writer.trigger(...)``) can then be read. A name assigned
+    #: once is in ``values``; a name written in any other way is in neither.
+    assignments: Dict[str, List[ast.expr]] = field(default_factory=dict)
 
 
 #: Called with no argument, these are the names of the module (or class) body they are in; inside a
@@ -499,17 +504,23 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
     functions, classes or lambdas (each has a scope of its own)."""
     scope = Scope(owner=owner, parent=parent)
     counts: Dict[str, int] = {}
+    #: Each plain assignment of a name, and the names written in any other way.
+    plain: Dict[str, List[ast.expr]] = {}
+    other: Set[str] = set()
 
     def block(name: str, why: str) -> None:
+        other.add(name)
         scope.values.pop(name, None)
         scope.blocked.setdefault(name, why)
 
     def record(name: str, value: ast.expr) -> None:
+        plain.setdefault(name, []).append(value)
         if name in scope.blocked:
             return
         counts[name] = counts.get(name, 0) + 1
         if counts[name] > 1:
-            block(name, f"`{name}` is assigned more than once")
+            scope.values.pop(name, None)
+            scope.blocked.setdefault(name, f"`{name}` is assigned more than once")
         else:
             scope.values[name] = value
 
@@ -566,6 +577,7 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
             for alias in node.names:
                 name = (alias.asname or alias.name).split(".")[0]
                 if name != "*":
+                    other.add(name)
                     scope.blocked.setdefault(name, "imported")
                     scope.values.pop(name, None)
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
@@ -574,6 +586,9 @@ def build_scope(owner: ast.AST, parent: Optional[Scope] = None) -> Scope:
         elif type(node).__name__ == "Match":
             for case in node.cases:
                 stack.extend(reversed(case.body))
+    scope.assignments = {
+        name: values for name, values in plain.items() if len(values) > 1 and name not in other
+    }
     return scope
 
 
@@ -942,6 +957,12 @@ class Folder:
         for owner in reversed(chain):
             scope = self._scope(owner, scope)
         return scope
+
+    def rebound(self, name: str) -> Optional[str]:
+        """Why ``name`` cannot be trusted to hold what its assignments say: the file changes it
+        elsewhere or writes names by string (see :func:`_rebound_names`). ``None`` when nothing
+        does."""
+        return self._rebound.get(name) or self._rebound.get("*")
 
     # entry points
 

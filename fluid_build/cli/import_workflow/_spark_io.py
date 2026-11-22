@@ -99,6 +99,16 @@ _TERMINALS = frozenset(
 
 _PLAIN_TABLE = re.compile(r"[A-Za-z0-9_$`.\-]+")
 
+#: Options that say WHAT a source or a sink is (where it reads or writes, and its state). A
+#: variable's later assignment may add other options, never one of these: it would be a different
+#: source or sink in each branch.
+_IDENTITY_OPTIONS = frozenset(
+    {"path", "paths", "topic", "subscribe", "subscribepattern", "assign", "table", "dbtable"}
+    | {"url", "query", "kafka.bootstrap.servers", "checkpointlocation"}
+)
+#: Joins the triggers a stream may have when the code picks one by a branch.
+TRIGGER_SEPARATOR = " | "
+
 #: A placeholder a templating layer fills in later, in SQL that is not an f-string: ``${db}``,
 #: ``{db}``, ``{{ db }}``, ``%(db)s``. The SQL parser would read the text around it as a name.
 _PLACEHOLDER = re.compile(
@@ -252,6 +262,9 @@ class JobFacts:
     streams: List[Stream] = field(default_factory=list)
     #: Job-level lines for the report: SQL that did not parse, JDBC, names from parameters.
     notes: List[str] = field(default_factory=list)
+    #: Lines for the report that are about what was read, not about what was not: a person checks
+    #: them, nothing has to be re-authored.
+    remarks: List[str] = field(default_factory=list)
     #: The file imports pyspark or builds a session.
     is_spark: bool = False
 
@@ -273,6 +286,11 @@ class _Link:
     name: str
     call: Optional[ast.Call]  # None for a plain attribute (``.read``, ``.write``)
     node: ast.AST
+    #: 0 for a link every run goes through. ``k`` for a link added by the ``k``-th later
+    #: assignment of the variable the chain started from (``if a: w = w.trigger(x)``): one branch.
+    branch: int = 0
+    #: For a link of a branch: the branches are the two arms of one ``if``, so one of them runs.
+    either: bool = False
 
 
 def split_table_name(text: str) -> List[str]:
@@ -378,9 +396,10 @@ class _Reader:
 
     # ── chains ──────────────────────────────────────────────────────
 
-    def _links(self, node: ast.AST, depth: int = 0) -> Tuple[List[_Link], ast.AST]:
+    @staticmethod
+    def _plain_links(node: ast.AST) -> Tuple[List[_Link], ast.AST]:
         """The method and attribute links of a fluent expression, root first, and the root
-        expression. A root variable assigned once to another chain is followed (three levels)."""
+        expression, as written (a root variable is not followed)."""
         links: List[_Link] = []
         current = node
         while True:
@@ -393,14 +412,143 @@ class _Reader:
             else:
                 break
         links.reverse()
+        return links, current
+
+    def _links(self, node: ast.AST, depth: int = 0) -> Tuple[List[_Link], ast.AST]:
+        """The method and attribute links of a fluent expression, root first, and the root
+        expression. A root variable assigned once to another chain is followed (three levels), and
+        so is one that later assignments only add to (:meth:`_extended`)."""
+        links, current = self._plain_links(node)
         if isinstance(current, ast.Name) and depth < 3:
-            bound = self._bound_expression(current)
-            if bound is not None and not any(
+            started = any(
                 link.name in _READER_MARKERS | _WRITER_MARKERS | {"writeTo"} for link in links
-            ):
+            )
+            bound = self._bound_expression(current)
+            if bound is not None and not started:
                 earlier, root = self._links(bound, depth + 1)
                 return earlier + links, root
+            if bound is None and not started:
+                extended = self._extended(current, depth)
+                if extended is not None:
+                    earlier, root = extended
+                    return earlier + links, root
         return links, current
+
+    def _assignments(self, name: ast.Name) -> Optional[List[ast.expr]]:
+        """Every assignment of the variable ``name`` is when it is assigned more than once and
+        only by plain assignments, else ``None``."""
+        if self.folder.rebound(name.id):
+            return None
+        current: Optional[Any] = self.folder.scope_of(name)
+        while current is not None:
+            if name.id in current.assignments:
+                return sorted(current.assignments[name.id], key=lambda e: (e.lineno, e.col_offset))
+            if (
+                name.id in current.values
+                or name.id in current.blocked
+                or name.id in current.classes
+            ):
+                return None
+            current = current.parent
+        return None
+
+    def _extended(self, name: ast.Name, depth: int) -> Optional[Tuple[List[_Link], ast.AST]]:
+        """The chain a variable assigned more than once holds at ``name``, when the first
+        assignment starts it and every later one only adds to it: ``w = a.writeStream.format(..)``
+        then ``w = w.trigger(x)`` in one branch and ``w = w.trigger(y)`` in the other. The links
+        of each addition that comes before ``name`` are kept, each tagged as a branch of its own.
+        ``None`` when a later assignment does anything else (starts another chain, changes what
+        the sink or source is): which assignment is meant then depends on the order the code runs
+        in, and the read or write is not followed."""
+        found = self._assignments(name)
+        if not found or found[0].lineno >= name.lineno:
+            return None
+        base, later = found[0], found[1:]
+        base_links, base_root = self._plain_links(base)
+        if isinstance(base_root, ast.Name) and base_root.id == name.id:
+            return None  # the first one adds to a chain nobody started
+        earlier, root = self._links(base, depth + 1)
+        if not any(
+            link.name in _READER_MARKERS | _WRITER_MARKERS | {"writeTo"} for link in earlier
+        ):
+            return None
+        kept: List[Tuple[int, ast.expr, List[_Link]]] = []
+        for branch, expression in enumerate(later, start=1):
+            more, more_root = self._plain_links(expression)
+            if not (isinstance(more_root, ast.Name) and more_root.id == name.id and more):
+                return None
+            if not all(self._adds_nothing_to_identity(link) for link in more):
+                return None
+            if expression.lineno < name.lineno:
+                # one in the block of the first assignment runs on every path to the use: it is
+                # a plain step of the chain, not a branch
+                kept.append((0 if self._same_block(base, expression) else branch, expression, more))
+        conditional = [expression for branch, expression, _ in kept if branch]
+        either = len(conditional) == 2 and self._arms_of_one_if(conditional[0], conditional[1])
+        added = [
+            replace(link, branch=branch, either=either)
+            for branch, _expression, more in kept
+            for link in more
+        ]
+        return earlier + added, root
+
+    def _same_block(self, first: ast.AST, second: ast.AST) -> bool:
+        """Whether the statements that assign ``first`` and ``second`` are in one block (one list
+        of statements of one parent): the later one runs whenever the earlier one does."""
+        parents = self.module.parents
+
+        def block(expression: ast.AST) -> Optional[Tuple[int, str]]:
+            statement = parents.get(expression)
+            owner = parents.get(statement) if statement is not None else None
+            if owner is None:
+                return None
+            for name, value in ast.iter_fields(owner):
+                if isinstance(value, list) and any(item is statement for item in value):
+                    return id(owner), name
+            return None
+
+        found = block(first)
+        return found is not None and found == block(second)
+
+    def _arms_of_one_if(self, first: ast.AST, second: ast.AST) -> bool:
+        """Whether ``first`` and ``second`` sit in the two different arms of one ``if``: exactly
+        one of them runs."""
+        parents = self.module.parents
+
+        def arms(node: ast.AST) -> Dict[int, str]:
+            found: Dict[int, str] = {}
+            child, current = node, parents.get(node)
+            while current is not None:
+                if isinstance(current, ast.If):
+                    found[id(current)] = "body" if child in current.body else "orelse"
+                elif isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+                    break
+                child, current = current, parents.get(current)
+            return found
+
+        left, right = arms(first), arms(second)
+        return any(key in right and right[key] != arm for key, arm in left.items())
+
+    def _adds_nothing_to_identity(self, link: _Link) -> bool:
+        """Whether a link a later assignment adds is one that leaves the source or sink what it
+        is: a trigger, or an option that is not one of :data:`_IDENTITY_OPTIONS`."""
+        call = link.call
+        if call is None:
+            return False
+        if link.name == "trigger":
+            return True
+        if link.name == "option" and len(call.args) >= 2:
+            key = self._literal(call.args[0])
+            return key is not None and key.lower() not in _IDENTITY_OPTIONS
+        if link.name == "options":
+            return (
+                all(
+                    kw.arg is not None and kw.arg.lower() not in _IDENTITY_OPTIONS
+                    for kw in call.keywords
+                )
+                and not call.args
+            )
+        return False
 
     def _bound_expression(self, name: ast.Name) -> Optional[ast.expr]:
         scope = self.folder.scope_of(name)
@@ -861,7 +1009,7 @@ class _Reader:
             return
         options, fmt = self._options(own[:-1])
         mode = None
-        trigger = None
+        triggers: Dict[int, str] = {}  # by branch; the last one of a branch wins
         query_name = None
         output_mode = None
         foreach: Optional[ast.expr] = None
@@ -876,11 +1024,14 @@ class _Reader:
             elif link.name == "queryName" and args:
                 query_name = self._literal(args[0]) or query_name
             elif link.name == "trigger":
-                trigger = self._trigger(link.call) or trigger
+                found = self._trigger(link.call)
+                if found:
+                    triggers[link.branch] = found
             elif link.name == "foreachBatch" and args:
                 foreach = args[0]
             elif link.name == "foreach":
                 fmt = fmt or "foreach"
+        trigger = self._trigger_of_write(call, own, triggers) if streaming else None
         name = terminal.name
         kwargs = {kw.arg: kw.value for kw in call.keywords if kw.arg}
         checkpoint = self._checkpoint(options, kwargs)
@@ -987,6 +1138,34 @@ class _Reader:
         if isinstance(value, str):
             return value
         return f"(not a constant: {value.why})" if isinstance(value, Unresolved) else None
+
+    def _trigger_of_write(
+        self, call: ast.Call, own: Sequence[_Link], triggers: Mapping[int, str]
+    ) -> Optional[str]:
+        """The trigger of a stream. When the code picks it by a branch (``if a: w = w.trigger(x)``
+        ``else: w = w.trigger(y)``) it is every one that can apply, joined by
+        :data:`TRIGGER_SEPARATOR`: the path through no branch counts too (the trigger set before
+        it, else Spark's default) unless the branches are the two arms of one ``if`` and each
+        sets one. A stream that may keep running is then not taken for a one-shot."""
+        if not triggers:
+            return None
+        branches = {link.branch for link in own if link.branch}
+        if not branches:
+            return triggers.get(0)
+        chosen = [value for branch, value in triggers.items() if branch]
+        covered = any(link.either for link in own) and len(chosen) == len(branches)
+        if not covered:
+            chosen.append(triggers.get(0, "default"))
+        alternatives = list(dict.fromkeys(chosen))
+        if len(alternatives) > 1:
+            note = (
+                f"{self.file}:{call.lineno} the trigger of this stream is picked by a branch of "
+                f"the code ({', '.join(alternatives)}): it is `continuous` unless every one of "
+                "them ends by itself"
+            )
+            if note not in self.facts.remarks:
+                self.facts.remarks.append(note)
+        return TRIGGER_SEPARATOR.join(alternatives)
 
     def _trigger(self, call: ast.Call) -> Optional[str]:
         """``processingTime=1 minute``, ``availableNow``, ``once``, ``continuous=1 second``."""
