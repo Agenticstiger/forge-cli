@@ -174,6 +174,21 @@ def test_write_refuses_a_bad_seed_and_digest(tmp_path: Path) -> None:
         assert not (tmp_path / "r.json").exists()
 
 
+def test_write_fails_closed_on_a_value_that_cannot_be_built(tmp_path: Path) -> None:
+    deep: Any = {}
+    inner = deep
+    for _ in range(5000):
+        inner["x"] = {}
+        inner = inner["x"]
+    for record in (_record(unit=deep), _record(tables=5)):
+        path = tmp_path / "r.json"
+        with pytest.raises(RecordRefused) as info:
+            write_record(path, record)
+        assert info.value.event == "profile_record_invalid"
+        _no_seed(info.value)
+        assert not path.exists()
+
+
 def test_read_refuses_missing_file(tmp_path: Path) -> None:
     assert _refusal(tmp_path / "none.json").event == "profile_record_unreadable"
 

@@ -17,7 +17,10 @@ live here, each as its own module:
   measures, with OpenDP's AIM, from the optional ``[privacy]`` extra.
 * :mod:`~fluid_build.profiler.dp.record` writes and reads the owner-only release
   record, so a release can be re-derived inside the data owner's boundary.
+* :mod:`~fluid_build.profiler.dp.release` plans a release before any record is read, then
+  reads the table once, bounds, chooses the cliques, counts, adds noise, makes the tables
+  agree and builds the profile document (format 1-2-0).
 
-Nothing here reads a record, and nothing here imports a heavy package at module
-scope.
+Nothing here prints, logs or records anything that depends on the records, outside the
+noise, and nothing here imports a heavy package at module scope.
 """

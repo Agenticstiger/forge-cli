@@ -490,6 +490,18 @@ class StatisticsBackend(Protocol):
         bins' whole-number edges, placed on the grid as the registry places any edge.
         """
 
+    def bin_cells(
+        self, values: Sequence[Any], edges: Sequence[Fraction], fractional_bits: int
+    ) -> List[int]:
+        """The bin of each value of a number or timestamp column, as ``marginalHistogram/1`` places it.
+
+        *values* are values as :meth:`read_value` returns them (none is ``None``) and *edges* the
+        declared bin edges, exact and strictly increasing. Each value and each edge is placed on
+        the grid of ``2**-fractional_bits`` steps, and a bin is half-open, ``[e_i, e_{i+1})``,
+        except the last, which is closed at the top. A value outside the edges is the caller's to
+        refuse: it is placed in the nearest end bin.
+        """
+
     def check_edge_counts(
         self,
         statistics: Sequence[EdgeStatistic],
@@ -1014,6 +1026,18 @@ class _FluxStatsBackend:
             statistic=state,
             cells=tuple(state.cell_counts("marginalHistogram")),
         )
+
+    def bin_cells(
+        self, values: Sequence[Any], edges: Sequence[Fraction], fractional_bits: int
+    ) -> List[int]:
+        # flux_stats.definitions.bin_index takes the first bin whose upper edge is above the
+        # value; with the inner edges that is the number of them at or below the value, and
+        # tests/profiler/test_release_seam.py keeps the two equal at every edge.
+        from bisect import bisect_right
+
+        grid = self._grid(fractional_bits)
+        inner = [grid.quantise(Fraction(edge), subject="bin edge") for edge in edges[1:-1]]
+        return [bisect_right(inner, grid.quantise(Fraction(v), subject="value")) for v in values]
 
     def check_edge_counts(
         self,

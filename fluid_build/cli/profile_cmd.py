@@ -269,6 +269,9 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         ),
     )
     p.add_argument("--env", help="environment overlay to apply to the contract first")
+    from fluid_build.cli import _profile_release
+
+    _profile_release.add_flags(p)
     p.set_defaults(func=run)
 
 
@@ -301,6 +304,10 @@ def _refusal(event: str, detail: str, context: Dict[str, str]) -> Any:
 
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Profile the expose and write the document; return the exit code."""
+    from fluid_build.cli import _profile_release
+
+    if _profile_release.wanted(args):
+        return _profile_release.run(args, logger)
     from fluid_build._console import cprint_literal
     from fluid_build._contract_loader import load_contract_with_overlay
     from fluid_build.cli.security import validate_cli_path

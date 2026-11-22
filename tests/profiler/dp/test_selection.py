@@ -10,6 +10,7 @@ import math
 import random
 import sys
 from fractions import Fraction
+from types import SimpleNamespace
 
 import pytest
 from packaging.requirements import Requirement
@@ -18,6 +19,8 @@ from fluid_build.profiler.dp import selection
 from fluid_build.profiler.dp.selection import (
     MBI_REQUIREMENT,
     MOST_RELEASE_CELLS,
+    MOST_SELECTION_COLUMNS,
+    MOST_SELECTION_ROUNDS,
     OPENDP_REQUIREMENT,
     PRIVACY_INSTALL_COMMAND,
     SelectionUnavailable,
@@ -134,6 +137,54 @@ def _call(**changes):
 def test_inputs_that_break_the_rules_are_refused_first(opendp_is_never_touched, changes):
     with pytest.raises(ValueError):
         _call(**changes)
+
+
+def test_a_selection_over_too_many_columns_is_refused_before_opendp(opendp_is_never_touched):
+    names = tuple(f"c{i}" for i in range(MOST_SELECTION_COLUMNS + 1))
+    levels = {name: ("x", "y") for name in names}
+    weights = {pair: 1 for pair in itertools.combinations(names, 2)}
+    with pytest.raises(ValueError, match="at most 32 columns"):
+        select_cliques([], names, levels, weights, F(1, 10), 1)
+
+
+class _Stop(Exception):
+    pass
+
+
+def _fake_packages(seen):
+    """Stand-ins for opendp, polars and mbi that stop at AIM and keep what it was given."""
+
+    def aim(**arguments):
+        seen.update(arguments)
+        raise _Stop
+
+    frame = SimpleNamespace(lazy=lambda: None)
+    dp = SimpleNamespace(
+        enable_features=lambda *_: None,
+        unit_of=lambda **_: None,
+        loss_of=lambda **_: None,
+        mbi=SimpleNamespace(Count=lambda pair, weight: (pair, weight), AIM=aim),
+        Context=SimpleNamespace(
+            compositor=lambda **_: SimpleNamespace(
+                query=lambda: SimpleNamespace(contingency_table=lambda **kw: kw["algorithm"])
+            )
+        ),
+    )
+    pl = SimpleNamespace(DataFrame=lambda *_, **__: frame, String=str)
+    return dp, pl, None
+
+
+@pytest.mark.parametrize("width, rounds", [(3, 48), (8, 128), (32, 128)])
+def test_the_selection_runs_at_most_the_rounds_the_columns_allow(monkeypatch, width, rounds):
+    names = tuple(f"c{i}" for i in range(width))
+    levels = {name: ("x", "y") for name in names}
+    weights = {pair: 1 for pair in itertools.combinations(names, 2)}
+    seen = {}
+    monkeypatch.setattr(selection, "_import_selection_packages", lambda: _fake_packages(seen))
+    with pytest.raises(_Stop):
+        select_cliques([], names, levels, weights, F(1, 10), 1)
+    assert seen["rounds"] == rounds == min(16 * width, MOST_SELECTION_ROUNDS)
+    assert MOST_SELECTION_ROUNDS == 128
 
 
 # ---- select_cliques: the packages are missing -------------------------------------------------

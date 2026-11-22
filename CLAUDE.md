@@ -55,6 +55,12 @@ Drive-by changes here can break invariants. Read the surrounding comments first.
 - `cli/auth.py::_sanitize_argv` — strips credential-bearing flag values before DEBUG-logging the subprocess command. Extend `_SENSITIVE_FLAGS` / `_SENSITIVE_FLAG_SUFFIXES` for new provider-auth CLIs that use `--*-secret` / `--*-key` shapes.
 - `providers/snowflake/util/logging.py::SENSITIVE_KEYS` / `SENSITIVE_PATTERNS` — mirror additions into `observability/secret_redactor.py`.
 
+## Recent architectural changes worth knowing (2026-11-22, private profile release)
+
+- **`fluid profile --privacy-unit` releases one table under zero-concentrated differential privacy** (a format 1-2-0 profile, graded P3 by flux-engine). The flags, checks, dispatch and report are `cli/_profile_release.py` (stdlib at module scope; `profile_cmd.py` only adds its flags and branches early in `run`); the release is `profiler/dp/release.py` over `bounding`, `selection` (OpenDP's AIM, the `[privacy]` extra, imported only when a selection runs), `randomness`, `discrete_gaussian`, `consistency` and `record`. The seam `_stats.StatisticsBackend.bin_cells` places a value in a histogram bin as flux-stats does.
+- **Nothing that depends on the records leaves outside the noise.** No row, unit, dropped-row, distinct, null or cell count in stdout, stderr, a log, an error or the record; a refusal names a column and a row. `tests/profiler/test_cli_release.py` captures a release's output and asserts no true count appears. The seed never appears anywhere but the release record, and a seed is used for one release only. Keep new messages to names, the plan, the budget and file paths.
+- **The release record is owner-only** (`O_EXCL`, `0600`, no link). `--rederive` recomputes the plan and every table's label, columns, scale and share from the record's unit, rho and cliques and refuses unless each equals what the record states, then redraws and writes the profile only when its digest is the recorded one.
+
 ## Recent architectural changes worth knowing (2026-11-13, skills-first AI mode)
 
 The founder's rule that the AI setup be world-class AND lightweight. On #851's eval the embedded

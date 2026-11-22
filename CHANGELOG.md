@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid profile --privacy-unit` releases a table under differential privacy.** With `--request`,
+  `--rho R` and `--release-record PATH`, the profile is a release of one table's requested statistics
+  under zero-concentrated differential privacy: a profile of format 1-2-0 that flux-engine grades P3.
+  It holds a noisy `levelHistogram/1` of each required enum column the request lists, a noisy
+  `marginalHistogram/1` of each required number, date or timestamp column on public bins (the
+  declared range, else the type's ladder), and noisy clique marginals over categorical columns,
+  chosen with OpenDP's AIM (the `[privacy]` extra, needed only when a selection runs). The privacy
+  unit is an entity: one row of `--privacy-unit`, or with `--release-table` a child table through one
+  declared relationship, or with `--unit-key COL[,COL]` the rows of one table that share a key. Each
+  entity contributes at most `--max-rows-per-unit` rows and counts at most `--max-rows-per-cell` in
+  one cell, so the stated loss holds for each entity and for each row of it. A tenth of `rho` chooses
+  the cliques, the rest is split equally over the count tables, each table gets exact discrete
+  Gaussian noise at the least scale that spends no more than its share, and the tables are made to
+  agree exactly. The noise is drawn from a seeded randomness source recorded in `--release-record`,
+  created readable by its owner alone, so the release can be re-derived inside the data owner's
+  boundary with `--rederive`, which writes the profile only when its digest is the recorded one; the
+  record must stay there, since with it and the profile the noise can be taken off. Nothing that
+  depends on the records is printed, logged or recorded outside the noise: a refusal names a column
+  and a row and never a value or a count. The report names the unit, the loss and its split, each
+  table's scale, the cliques, an informational conversion to (epsilon, delta), and every requested
+  item that is not released, with the reason. A release of a table that has relationships lists the
+  other tables with their domains only and cannot ship on flux-engine 0.9 until it skips a table the
+  release holds no statistic for.
+
 - **`fluid profile --request FILE` answers a FLUX profile request.** The request is the list of
   statistics, column metrics and relationships `fluxsim init --contract` writes for a contract, and
   the profile measures what it lists and nothing else, under the same output checks: per listed

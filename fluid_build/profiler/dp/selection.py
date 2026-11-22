@@ -31,6 +31,8 @@ from typing import Any, Dict, Mapping, Sequence, Tuple
 __all__ = [
     "MBI_REQUIREMENT",
     "MOST_RELEASE_CELLS",
+    "MOST_SELECTION_COLUMNS",
+    "MOST_SELECTION_ROUNDS",
     "OPENDP_REQUIREMENT",
     "PRIVACY_INSTALL_COMMAND",
     "SelectionUnavailable",
@@ -41,6 +43,16 @@ __all__ = [
 
 #: The most cells the measured cliques of one release may hold in all.
 MOST_RELEASE_CELLS = 65_536
+
+#: The most rounds AIM may run, whatever the number of columns. AIM's default is the number of
+#: columns, and each round measures and re-fits a model; a select over many columns would run
+#: for as long as the data owner is willing to wait. The rounds are ``min(16 * columns, 128)``,
+#: which bounds the time the selection takes on a wide table.
+MOST_SELECTION_ROUNDS = 128
+
+#: The most categorical columns one selection is offered: AIM is given every pair of them as a
+#: query, so the queries grow with the square of the columns.
+MOST_SELECTION_COLUMNS = 32
 
 #: The pins ``[privacy]`` names in ``pyproject.toml``. The CLI cannot read that file once
 #: installed, so the install message repeats them; ``tests/profiler/dp/test_selection.py``
@@ -174,6 +186,11 @@ def select_cliques(
     :class:`SelectionUnavailable`.
     """
     names = _check_columns(columns)
+    if len(names) > MOST_SELECTION_COLUMNS:
+        raise ValueError(
+            f"choosing cliques is offered at most {MOST_SELECTION_COLUMNS} columns; release "
+            "fewer categorical columns (list fewer in the request)"
+        )
     pair_weights = _pair_weights(names, weights)
     loss = largest_float_not_above(rho)
     _check_count("contributions", contributions, 1)
@@ -221,6 +238,7 @@ def select_cliques(
                 queries=queries,
                 oneway="unkeyed",
                 max_size=max_cells * 8 / 2**20,
+                rounds=min(16 * len(names), MOST_SELECTION_ROUNDS),
             ),
         )
         .release()

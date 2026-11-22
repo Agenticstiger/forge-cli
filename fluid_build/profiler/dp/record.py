@@ -228,6 +228,12 @@ def write_record(path: Path, record: ReleaseRecord) -> None:
         raise RecordRefused(
             exc.event, f"the release record is not written to {path}: {exc.message}", where
         ) from None
+    except (RecursionError, TypeError):
+        raise RecordRefused(
+            "profile_record_invalid",
+            f"the release record is not written to {path}: it holds a value that is not JSON",
+            where,
+        ) from None
     try:
         data = (json.dumps(document, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode(
             "utf-8"
