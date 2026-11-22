@@ -98,12 +98,22 @@ class AirflowApiError(Exception):
     :meth:`AirflowApi.connect` tries again, and the wait for a parse rides it out.
     """
 
-    def __init__(self, event: str, message: str, fix: str = "", *, transient: bool = False):
+    def __init__(
+        self,
+        event: str,
+        message: str,
+        fix: str = "",
+        *,
+        transient: bool = False,
+        out_of_time: bool = False,
+    ):
         super().__init__(message)
         self.event = event
         self.message = message
         self.fix = fix
         self.transient = transient
+        #: The request was not sent because the caller's deadline had passed.
+        self.out_of_time = out_of_time
 
 
 # ── credentials ──────────────────────────────────────────────────────────
@@ -348,6 +358,8 @@ class DagState:
     relative_fileloc: str = ""
     bundle_name: Optional[str] = None
     bundle_version: Optional[str] = None
+    #: Airflow 2 reads a DAG file's stored source by this token.
+    file_token: str = ""
 
     @classmethod
     def from_api(cls, doc: Dict[str, Any], dialect: str) -> "DagState":
@@ -364,6 +376,7 @@ class DagState:
             relative_fileloc=str(doc.get("relative_fileloc") or ""),
             bundle_name=_text(doc.get("bundle_name")) if dialect == "v2" else None,
             bundle_version=_text(doc.get("bundle_version")) if dialect == "v2" else None,
+            file_token=str(doc.get("file_token") or ""),
         )
 
     def path_matches(self, rel: str) -> bool:
@@ -429,6 +442,12 @@ class AirflowApi:
         self._token = credentials.token if credentials.style == "token" else ""
         self._bundles_served: Optional[bool] = None
         self._probed_version = "2"
+        self._deadline: Optional[float] = None
+        self._clock: Callable[[], float] = time.monotonic
+
+    def set_deadline(self, deadline: Optional[float], clock: Callable[[], float]) -> None:
+        """Cap every later request's timeout to the time left until ``deadline``."""
+        self._deadline, self._clock = deadline, clock
 
     @property
     def auth_style(self) -> str:
@@ -452,7 +471,17 @@ class AirflowApi:
             try:
                 self._detect(api)
                 self._login()
-                self._get_json(f"/api/{self.dialect}/importErrors", params={"limit": 1})
+                # Both reads the wait depends on, with their shape checked: a token that
+                # cannot list DAGs, or a proxy that answers {} to everything, is refused
+                # before anything is pushed.
+                for path, key in (("importErrors", "import_errors"), ("dags", "dags")):
+                    doc = self._get_json(f"/api/{self.dialect}/{path}", params={"limit": 1})
+                    if not isinstance((doc or {}).get(key), list):
+                        raise AirflowApiError(
+                            _E_RESPONSE,
+                            f"GET /api/{self.dialect}/{path} answered no {key} list: "
+                            "is --airflow-url the Airflow API server?",
+                        )
                 return
             except AirflowApiError as exc:
                 if not exc.transient or attempt == self.attempts - 1:
@@ -574,6 +603,24 @@ class AirflowApi:
         doc = self._get_json(path, allow_404=True)
         return None if doc is None else DagState.from_api(doc, self.dialect)
 
+    def dag_source(self, dag: DagState) -> Optional[str]:
+        """The source Airflow stored for ``dag``'s file, or ``None`` when it cannot be read
+        (no permission to read DAG code, no file token, nothing stored)."""
+        if self.dialect == "v2":
+            path = f"/api/v2/dagSources/{quote(dag.dag_id, safe='')}"
+        elif dag.file_token:
+            path = f"/api/v1/dagSources/{quote(dag.file_token, safe='')}"
+        else:
+            return None
+        try:
+            doc = self._get_json(path, allow_404=True)
+        except AirflowApiError as exc:
+            if exc.event == _E_FORBIDDEN:
+                return None
+            raise
+        content = (doc or {}).get("content")
+        return content if isinstance(content, str) else None
+
     def dags(self) -> List[DagState]:
         """Every DAG Airflow lists (active ones: its own default filter)."""
         rows = self._paged(f"/api/{self.dialect}/dags", "dags")
@@ -692,9 +739,18 @@ class AirflowApi:
         import httpx
 
         if self._client is None:
-            from fluid_build.util.http_client import new_client
-
-            self._client = new_client(timeout=self.timeout, follow_redirects=False)
+            self._client = _http_client(self.base_url, self.timeout)
+        timeout = self.timeout
+        if self._deadline is not None:
+            left = self._deadline - self._clock()
+            if left <= 0:
+                raise AirflowApiError(
+                    _E_UNREACHABLE,
+                    f"{what} was not sent: --airflow-wait ran out.",
+                    transient=True,
+                    out_of_time=True,
+                )
+            timeout = max(min(timeout, left), 0.5)
         headers = {"Accept": "application/json"}
         auth = None
         if authorize and self._token:
@@ -710,11 +766,12 @@ class AirflowApi:
                 json=json_body,
                 headers=headers,
                 auth=auth,
+                timeout=timeout,
             )
         except httpx.TimeoutException:
             raise AirflowApiError(
                 _E_UNREACHABLE,
-                f"{what} timed out after {self.timeout:.0f}s.",
+                f"{what} timed out after {timeout:.0f}s.",
                 "Check that Airflow's API server is up and reachable from here.",
                 transient=True,
             ) from None
@@ -762,6 +819,18 @@ class AirflowApi:
                 f"{what} answered {resp.status_code} with a body that is not a JSON object.",
             )
         return doc
+
+
+def _http_client(base_url: str, timeout: float) -> Any:
+    """The repo's HTTP client, which never sends a loopback host through a proxy.
+
+    It honours the proxy environment otherwise, and ``HTTP_PROXY`` with no ``NO_PROXY``
+    would send a plain-HTTP request for localhost, credentials included, to the proxy.
+    """
+    from fluid_build.util.http_client import new_client
+
+    loopback = _loopback(urlsplit(base_url).hostname or "")
+    return new_client(timeout=timeout, follow_redirects=False, trust_env=not loopback)
 
 
 def _short(text: str) -> str:

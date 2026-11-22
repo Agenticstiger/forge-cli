@@ -427,3 +427,133 @@ def test_the_basic_header_form_of_the_password_is_redacted(monkeypatch: pytest.M
     encoded = base64.b64encode(b"deploy:s3cret-pw-77").decode()
     assert encoded not in redact_secret_text(f"echo: Authorization: Basic {encoded}")
     assert encoded not in redact_secret_text(f"{encoded}")
+
+
+# ── the source Airflow stored for a file ────────────────────────────────
+
+
+@pytest.mark.parametrize("major", [2, 3])
+def test_the_stored_source_is_read_by_file_token_or_dag_id(major: int):
+    with FakeAirflow(major) as fake:
+        fake.land("p/a.py", "from airflow.sdk import DAG\nDAG('p__a')\n")
+        fake.parse_ok("p__a", "p/a.py")
+        fake.parse_ok("p__b", "p/b.py")
+        client = _connect(fake, Credentials.from_password("admin", "admin"))
+        a, b = client.dag("p__a"), client.dag("p__b")
+        assert a is not None and b is not None and a.file_token != b.file_token
+        assert client.dag_source(a) == "from airflow.sdk import DAG\nDAG('p__a')\n"
+        assert client.dag_source(b) == fake.stored[("dags-folder", "p/b.py")]
+        read = [r.path for r in fake.requests if "/dagSources/" in r.path]
+    expected = f"/api/v1/dagSources/{a.file_token}" if major == 2 else "/api/v2/dagSources/p__a"
+    assert read[0] == expected
+
+
+@pytest.mark.parametrize("major", [2, 3])
+def test_a_source_the_user_may_not_read_is_none(major: int):
+    with FakeAirflow(major, forbidden=("/api/v1/dagSources", "/api/v2/dagSources")) as fake:
+        fake.parse_ok("p__a", "p/a.py")
+        client = _connect(fake, Credentials.from_password("admin", "admin"))
+        dag = client.dag("p__a")
+        assert dag is not None and client.dag_source(dag) is None
+
+
+def test_no_stored_source_or_no_file_token_is_none():
+    with FakeAirflow(2, store_code=False) as fake:
+        fake.parse_ok("p__a", "p/a.py")
+        client = _connect(fake, Credentials.from_password("admin", "admin"))
+        dag = client.dag("p__a")
+        assert dag is not None and client.dag_source(dag) is None
+        tokenless = af.DagState("p__a", active=True, has_import_errors=False, last_parsed_time=None)
+        assert client.dag_source(tokenless) is None
+
+
+# ── the preflight reads what the wait reads ─────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "major, path",
+    [
+        (2, "/api/v1/importErrors"),
+        (2, "/api/v1/dags"),
+        (3, "/api/v2/importErrors"),
+        (3, "/api/v2/dags"),
+    ],
+)
+def test_a_listing_without_its_list_is_refused_at_connect(major: int, path: str):
+    """A proxy or another app at --airflow-url answering ``200 {}``: refused before any
+    push, not found out in the middle of the wait."""
+    with FakeAirflow(major, empty=(path,)) as fake:
+        error = _raises(
+            lambda: _connect(fake, Credentials.from_password("admin", "admin")),
+            "schedule_sync_airflow_bad_response",
+        )
+    assert path in error.message
+
+
+# ── a loopback Airflow is never reached through a proxy ─────────────────
+
+
+class _Proxy:
+    """A forward proxy stand-in that records every request it is sent."""
+
+    def __init__(self) -> None:
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        seen = self.seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                seen.append((self.path, self.headers.get("Authorization")))
+                self.send_response(502)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            do_POST = do_GET
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+@pytest.mark.parametrize("major", [2, 3])
+def test_a_loopback_airflow_is_not_sent_through_a_proxy(
+    monkeypatch: pytest.MonkeyPatch, major: int, host: str
+):
+    proxy = _Proxy()
+    try:
+        for name in ("NO_PROXY", "no_proxy"):
+            monkeypatch.delenv(name, raising=False)
+        for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY"):
+            monkeypatch.setenv(name, proxy.url)
+        with FakeAirflow(major) as fake:
+            url = fake.url.replace("127.0.0.1", host)
+            client = AirflowApi(
+                url, Credentials.from_password("admin", "admin"), sleep=lambda s: None
+            )
+            client.connect("auto")
+            client.import_errors()
+            assert fake.requests
+    finally:
+        proxy.close()
+    assert proxy.seen == []
+
+
+def test_a_remote_airflow_keeps_the_proxy_from_the_environment():
+    """Only loopback skips the environment: a remote Airflow behind a corporate proxy
+    still goes through it."""
+    remote = af._http_client("https://airflow.example.org", 5.0)
+    local = af._http_client("http://127.0.0.1:8080", 5.0)
+    try:
+        assert remote.trust_env is True and local.trust_env is False
+    finally:
+        remote.close()
+        local.close()

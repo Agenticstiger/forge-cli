@@ -17,6 +17,11 @@ backend, Airflow 3.0.6 and 3.4.0 with the simple auth manager, recorded on local
   import error ``filename`` is absolute on 3.0 and relative to its bundle on 3.4;
   ``/api/v2/dagBundles`` exists on 3.4, not on 3.0 (404).
 
+Both majors serve the source Airflow stored for a file at ``dagSources`` (Airflow 2 by
+the Dag's ``file_token``, Airflow 3 by Dag id). Like real Airflow, a clean parse stores the
+file as it is on disk when the parse is saved, which may be newer than what the parse
+read: :attr:`FakeAirflow.disk` is that disk, :func:`pushed_source` its default content.
+
 Time is simulated: :attr:`FakeAirflow.now` is the server clock, sent in every ``Date``
 header and stamped on parses, and moves only when a test calls :meth:`advance`. A test
 plays the Dag processor with :meth:`parse_ok` and :meth:`parse_fail`.
@@ -28,17 +33,24 @@ import base64
 import email.utils
 import json
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 _V1_ERROR_TYPE = "https://airflow.apache.org/docs/apache-airflow/2.10.5/stable-rest-api-ref.html"
 _V1_REMOVED = (
     "/api/v1 has been removed in Airflow 3, please use its upgraded version /api/v2 instead."
 )
 _HTML_404 = '<!DOCTYPE html>\n<html lang="en"><head><title>Airflow 404</title></head></html>'
+
+
+def pushed_source(rel: str) -> str:
+    """What the fake's disk holds for ``rel`` unless a test lands something else."""
+    return f"# {rel}\nfrom airflow.sdk import DAG\n"
 
 
 @dataclass
@@ -97,6 +109,13 @@ class FakeAirflow:
     forbidden: Tuple[str, ...] = ()
     dags_folder: str = "/opt/airflow/dags"
     page_cap: int = 100
+    #: ``False`` plays Airflow 2 with ``[core] store_dag_code`` off and no file on the
+    #: webserver: ``dagSources`` answers 404.
+    store_code: bool = True
+    #: Seconds every answer waits (real time), to play a slow server.
+    delay_s: float = 0.0
+    #: Paths answered ``200 {}``, to play a server that is not Airflow's API.
+    empty: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         self.version = self.version or ("2.10.5" if self.major == 2 else "3.4.0")
@@ -106,6 +125,11 @@ class FakeAirflow:
         self.dags: Dict[str, _Dag] = {}
         self.errors: Dict[Tuple[str, str], _Error] = {}
         self.bundles: Dict[str, _Bundle] = {}
+        #: The files on the Airflow host, by ``(bundle, rel)``; :func:`pushed_source` if unset.
+        self.disk: Dict[Tuple[str, str], str] = {}
+        #: The source Airflow stored at each file's last clean parse.
+        self.stored: Dict[Tuple[str, str], str] = {}
+        self._tokens: Dict[str, Tuple[str, str]] = {}
         self.requests: List[Request] = []
         self.issued: List[str] = []
         self.answer_next: List[Tuple[int, Dict[str, str], str]] = []
@@ -123,13 +147,29 @@ class FakeAirflow:
     def parse_ok(
         self, dag_id: str, rel: str, *, bundle: str = "dags-folder", version: Optional[str] = None
     ) -> None:
-        """A clean parse of the file ``rel`` that defines ``dag_id``."""
+        """A clean parse of the file ``rel`` that defines ``dag_id``, saved now.
+
+        Airflow stores the file's source as it is on disk at that moment, so a parse that
+        read the previous file stores the new one when the push landed in between.
+        """
         with self._lock:
             dag = self.dags.get(dag_id) or _Dag(dag_id=dag_id, rel=rel, bundle=bundle)
             dag.rel, dag.bundle, dag.version = rel, bundle, version
             dag.last_parsed, dag.import_errors, dag.stale = self.now, False, False
             self.dags[dag_id] = dag
             self.errors.pop((bundle, rel), None)
+            self.stored[(bundle, rel)] = self.disk.get((bundle, rel), pushed_source(rel))
+
+    def land(self, rel: str, text: str, *, bundle: str = "dags-folder") -> None:
+        """A file lands on the Airflow host (a push, or another copy)."""
+        with self._lock:
+            self.disk[(bundle, rel)] = text
+
+    def land_dir(self, dags_dir: Path, *, bundle: str = "dags-folder") -> None:
+        """Every ``*.py`` under ``dags_dir`` lands, as a sync of the folder would."""
+        for path in sorted(dags_dir.rglob("*.py")):
+            rel = path.relative_to(dags_dir).as_posix()
+            self.land(rel, path.read_text(encoding="utf-8"), bundle=bundle)
 
     def parse_fail(
         self, rel: str, *, bundle: str = "dags-folder", stack: str = "ModuleNotFoundError: x"
@@ -219,6 +259,10 @@ class FakeAirflow:
         with self._lock:
             self.requests.append(request)
             canned = self.answer_next.pop(0) if self.answer_next else None
+        if self.delay_s:
+            time.sleep(self.delay_s)
+        if request.path in self.empty:
+            return self._send(handler, 200, "{}", "application/json")
         if canned is not None:
             status, headers, text = canned
             return self._send(handler, status, text, headers.get("Content-Type", "text/plain"))
@@ -244,8 +288,11 @@ class FakeAirflow:
         handler.send_header("Content-Length", str(len(data)))
         for key, value in (extra or {}).items():
             handler.send_header(key, value)
-        handler.end_headers()
-        handler.wfile.write(data)
+        try:
+            handler.end_headers()
+            handler.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the client gave up first (a timeout under test)
 
     # ── Airflow 2: /api/v1 ───────────────────────────────────────────────
 
@@ -283,6 +330,12 @@ class FakeAirflow:
         if path == "/api/v1/dags":
             items = [self._v1_dag(d) for d in self.dags.values()]
             return 200, self._page(request, items, "dags"), "application/json"
+        if path.startswith("/api/v1/dagSources/"):
+            key = self._tokens.get(unquote(path[len("/api/v1/dagSources/") :]))
+            text = self.stored.get(key) if key and self.store_code else None
+            if text is None:
+                return self._problem(404, "Not Found", "Dag source not found")
+            return 200, {"content": text}, "application/json"
         if path == "/api/v1/importErrors":
             items = [
                 {
@@ -309,7 +362,7 @@ class FakeAirflow:
             "dag_id": dag.dag_id,
             "dag_display_name": dag.dag_id,
             "fileloc": f"{self.dags_folder}/{dag.rel}",
-            "file_token": "Ii4uLiI.token",
+            "file_token": self._token(dag),
             "has_import_errors": dag.import_errors,
             "is_active": True,
             "is_paused": True,
@@ -356,6 +409,20 @@ class FakeAirflow:
                     "application/json",
                 )
             return 200, self._v2_dag(dag), "application/json"
+        if path.startswith("/api/v2/dagSources/"):
+            dag_id = unquote(path[len("/api/v2/dagSources/") :])
+            dag = self.dags.get(dag_id)
+            if dag is None:
+                return (
+                    404,
+                    {"detail": f"The Dag with ID: `{dag_id}` was not found"},
+                    "application/json",
+                )
+            text = self.stored.get((dag.bundle, dag.rel))
+            if text is None:
+                return 404, {"detail": "Code not found"}, "application/json"
+            doc = {"content": text, "dag_id": dag_id, "version_number": 1}
+            return 200, {**doc, "dag_display_name": dag_id}, "application/json"
         if path == "/api/v2/dags":
             # exclude_stale defaults to true: a DAG whose file failed to parse drops out.
             keep_stale = (request.query.get("exclude_stale") or ["true"])[0].lower() == "false"
@@ -417,8 +484,16 @@ class FakeAirflow:
             "has_import_errors": dag.import_errors,
             "timetable_summary": "0 2 * * *",
             "tags": [],
-            "file_token": "Ii4uLiI.token",
+            "file_token": self._token(dag),
         }
+
+    def _token(self, dag: _Dag) -> str:
+        """A file token per file, as Airflow signs the file's path into one."""
+        where = f"{self._root(dag.bundle)}/{dag.rel}"
+        token = base64.urlsafe_b64encode(json.dumps(where).encode()).decode().rstrip("=")
+        token += ".c2lnbmVk"
+        self._tokens[token] = (dag.bundle, dag.rel)
+        return token
 
     def _root(self, bundle: str) -> str:
         """Where a bundle's files are on the server: one name per file, for its Dags and
