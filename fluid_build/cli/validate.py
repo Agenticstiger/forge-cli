@@ -2316,6 +2316,81 @@ def run_on_contract_dict(
     return result, rc
 
 
+def validate_loaded_contract(
+    contract: Mapping[str, Any],
+    *,
+    logger: Optional[logging.Logger] = None,
+    offline_only: bool = True,
+    manager: Optional[FluidSchemaManager] = None,
+    plugins: bool = True,
+) -> ValidationResult:
+    """What ``fluid validate`` finds in a contract it has loaded, collected and not printed.
+
+    The JSON-Schema check against the contract's own ``fluidVersion``, then every contract rule
+    ``fluid validate`` runs after it (governance, metadata, binding prerequisites, packaging,
+    semantics): :func:`_run_contract_rules`, the path a bundle takes. For a command that writes
+    contracts and must write only ones ``fluid validate`` accepts. What needs the file or an
+    overlay (the composition rule's walk of the workspace, the overlay-packaging check) is left
+    out, as it is for a bundle with no source.
+
+    ``plugins`` also runs the validators plugins register (``contract.extensions`` and
+    ``Validator`` roles): finding them costs about 0.1 s a call, so a caller with thousands of
+    contracts leaves them out. ``manager`` is a schema manager to reuse.
+
+    A finding is in ``result.errors`` or ``result.warnings``; ``result.is_valid`` is false when
+    there is an error.
+    """
+    import copy
+
+    import fluid_build.cli.validate as _self
+
+    log = logger or logging.getLogger(__name__)
+    loaded = copy.deepcopy(dict(contract))  # a rule may normalise what it is given
+    manager = manager or _self.FluidSchemaManager()
+    version = manager.detect_version(loaded)
+    result = manager.validate_contract(loaded, schema_version=version, offline_only=offline_only)
+    _run_rules_into(result, loaded, version, log, plugins)
+    return result
+
+
+def contract_rule_findings(
+    contract: Mapping[str, Any],
+    *,
+    logger: Optional[logging.Logger] = None,
+    manager: Optional[FluidSchemaManager] = None,
+    plugins: bool = True,
+) -> ValidationResult:
+    """The contract rules of :func:`validate_loaded_contract` alone: what ``fluid validate`` finds
+    after the JSON-Schema check passes, for a caller that treats a schema error and a rule finding
+    differently (a rule may ask for what only a person knows: columns, a schema, a warehouse)."""
+    import copy
+
+    import fluid_build.cli.validate as _self
+
+    loaded = copy.deepcopy(dict(contract))
+    manager = manager or _self.FluidSchemaManager()
+    version = manager.detect_version(loaded)
+    result = _self.ValidationResult(is_valid=True, schema_version=version)
+    _run_rules_into(result, loaded, version, logger or logging.getLogger(__name__), plugins)
+    return result
+
+
+def _run_rules_into(
+    result: ValidationResult,
+    contract: dict,
+    version: Optional[SchemaVersion],
+    log: logging.Logger,
+    plugins: bool,
+) -> None:
+    """Run the contract rules (and the plugin validators, when asked) into ``result``."""
+    rule_args = SimpleNamespace(quiet=True, verbose=False, strict=False, contract=None, env=None)
+    _run_contract_rules(contract, version, result, rule_args, log)
+    if plugins:
+        _run_extension_validators(contract, result, log)
+        _run_role_validators(contract, result, log)
+    result.is_valid = result.is_valid and not result.errors
+
+
 # ---------------------------------------------------------------------------
 # Workspace-wide validation
 # ---------------------------------------------------------------------------

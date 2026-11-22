@@ -28,6 +28,11 @@ ARTIFACT_PREFIX = "_fluid/spark"
 RUNNER_FILE = "forge_spark_runner.py"
 #: The job config's file name in S3.
 CONFIG_FILE = "job.json"
+#: A prebuilt package's copy beside the job config (``properties.package``): the bytes of the
+#: team's ``.whl`` or ``.zip``, under a ``.zip`` name, as PySpark puts only a ``.zip`` (or
+#: ``.egg``) on the Python path.
+PACKAGE_DIR = "package"
+PACKAGE_FILE = "package.zip"
 #: Tag keys on every Spark resource (the same keys as the Databricks jobs).
 PRODUCT_TAG = "fluid_product"
 BUILD_TAG = "fluid_build"
@@ -112,6 +117,18 @@ def runner_key(product: str, build: str, sha256: str) -> str:
 
 def runner_uri(root: str, product: str, build: str, sha256: str) -> str:
     return f"{root}/{runner_key(product, build, sha256)}"
+
+
+def package_key(product: str, build: str, sha256: str) -> str:
+    """Where ``fluid apply`` puts a build's prebuilt package, beside its job config and keyed
+    by the package's digest, as the runner is: a new digest never overwrites the copy a run
+    reads. The runner finds it from the job config's own location
+    (``forge_spark_runner.package_location``)."""
+    return f"{artifact_prefix(product, build)}{PACKAGE_DIR}/{sha256[:16]}/{PACKAGE_FILE}"
+
+
+def package_uri(root: str, product: str, build: str, sha256: str) -> str:
+    return f"{root}/{package_key(product, build, sha256)}"
 
 
 def run_name(product: str, build: str) -> str:

@@ -205,7 +205,7 @@ def _run_release_status(args: argparse.Namespace, logger: logging.Logger) -> int
             return 2
     try:
         found = rs.find_releases(args.release_dirs, args.product_id)
-    except NotADirectoryError as exc:
+    except (NotADirectoryError, PermissionError) as exc:
         logger.error("%s", exc)
         return 2
     if args.env is not None and not args.env.strip():
@@ -225,6 +225,7 @@ def _run_release_status(args: argparse.Namespace, logger: logging.Logger) -> int
                         "environment": a.environment,
                         "in_force": a.at_start.as_dict() if a.at_start else None,
                         "during": [r.as_dict() for r in a.during],
+                        "not_intact": [r.as_dict() for r in a.not_intact],
                     }
                     for a in answers
                 ],
@@ -238,7 +239,8 @@ def _run_release_status(args: argparse.Namespace, logger: logging.Logger) -> int
         sys.stdout.write("\n")
     else:
         for line in rs.report(args.product_id, answers, found, on, environment):
-            cprint_literal(line)
+            # soft_wrap: piped (a CI log), the console is 80 columns and would cut a digest
+            cprint_literal(line, soft_wrap=True)
     return 0 if any(a.at_start or a.during for a in answers) else 1
 
 

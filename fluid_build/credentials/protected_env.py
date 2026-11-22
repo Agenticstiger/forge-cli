@@ -212,6 +212,11 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         "FLUID_STATE_ENCRYPTION",
         # =0 turns S3 state locking off: the operator's call, never a checkout's
         "FLUID_TOFU_S3_LOCKFILE",
+        # the scheduler run a command belongs to (observability/run_id.scheduler_run), which the
+        # scheduler sets per run: a checkout's .env would claim one scheduler run for every run
+        # (Airflow's own AIRFLOW_CTX_* names are protected by prefix)
+        "FLUID_SCHEDULER_JOB",
+        "FLUID_SCHEDULER_RUN_ID",
         "FLUID_STORE_BACKEND",
         "FLUID_STORE_DSN",
         "FLUID_STORE_PATH",
@@ -591,6 +596,13 @@ PROTECTED_ENV_PREFIXES: Tuple[str, ...] = (
     # choose which credential is sent, or whether it may travel unencrypted
     "FLUID_AIRFLOW_",
     "FLUID_MCP_JWT_",
+    # the custom-scaffold engine's operator settings, which ``fluid generate artifacts``
+    # runs it under (forge/core/custom_scaffold_artifacts.py): the hosts a bundle
+    # credential may be sent to (``_AUTH_HOSTS``), the variable prefixes a contract's
+    # ``secret_ref`` may name besides ``FLUID_SCAFFOLD_`` (``_SECRET_PREFIXES``) and
+    # where cloned bundles are cached (``_CACHE``). The ``FLUID_SCAFFOLD_*`` credentials
+    # themselves stay loadable.
+    "FLUID_CUSTOM_SCAFFOLD_",
     "FLUID_LLM_DEFAULT_MODEL_",
     # credentials the Debezium runner itself sets: it writes each credential
     # property of Debezium Server's application.properties as
@@ -632,6 +644,9 @@ PROTECTED_ENV_PREFIXES: Tuple[str, ...] = (
     # script a runner starts. The name is not an identifier, so the shape rule
     # in :func:`is_protected_env_key` refuses it as well.
     "BASH_FUNC_",
+    # Airflow's task context, which observability/run_id.scheduler_run reads when fluid's
+    # FLUID_SCHEDULER_* names are unset: Airflow sets it for each task, never a checkout
+    "AIRFLOW_CTX_",
 )
 
 #: A name every POSIX shell can hold as a variable (systemd's

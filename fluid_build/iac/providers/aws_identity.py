@@ -394,9 +394,9 @@ def runtime_errors(build: Mapping[str, Any]) -> List[str]:
     # user, so there is no role to require.
     if batch and not cfg.get("executionRoleArn") and cfg.get("runtime") not in ("emr-ec2", "local"):
         errors.append(
-            f"Spark build {bid}: a batch job reads tables its SQL names, which forge cannot "
-            "grant a role it derives; set parameters.spark.executionRoleArn to a role the "
-            "operator scoped to those tables"
+            f"Spark build {bid}: a batch job reads tables its SQL or package names, which forge "
+            "cannot grant a role it derives; set parameters.spark.executionRoleArn to a role "
+            "the operator scoped to those tables"
         )
     return errors
 

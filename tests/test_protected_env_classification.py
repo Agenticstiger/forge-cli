@@ -109,6 +109,12 @@ def test_the_names_agree_with_the_modules_that_read_them() -> None:
         "FLUID_VAULT_WRAPPED_TOKEN",
         "FLUID_RUN_SECRETS_FILE",
         "FLUID_CREDENTIAL_STORE",
+        # The custom-scaffold engine's operator settings (stage 3 runs it in-process):
+        # where a bundle credential may go, which variables a contract may name for one,
+        # and where cloned bundles are cached.
+        "FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS",
+        "FLUID_CUSTOM_SCAFFOLD_SECRET_PREFIXES",
+        "FLUID_CUSTOM_SCAFFOLD_CACHE",
         "BAO_ADDR",
         "BAO_NAMESPACE",
         "VAULT_NAMESPACE",
@@ -243,6 +249,11 @@ def test_the_names_agree_with_the_modules_that_read_them() -> None:
         # application.properties refers to as ${FLUID_DBZ_<PROPERTY>}
         "FLUID_DBZ_SOURCE_DATABASE_PASSWORD",
         "fluid_dbz_sink_iceberg_s3_secret_access_key",
+        # the scheduler run a command belongs to: fluid's names and Airflow's task context
+        "FLUID_SCHEDULER_JOB",
+        "FLUID_SCHEDULER_RUN_ID",
+        "AIRFLOW_CTX_DAG_ID",
+        "AIRFLOW_CTX_DAG_RUN_ID",
     ],
 )
 def test_protected(name: str) -> None:
@@ -268,6 +279,9 @@ def test_protected(name: str) -> None:
         "GIT_AUTHOR_NAME",
         "GIT_COMMITTER_EMAIL",
         "GIT_HTTP_LOW_SPEED_LIMIT",
+        # a token a scaffold bundle's auth.secret_ref names: a credential, which the
+        # engine sends only to a host the operator's FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS lists
+        "FLUID_SCAFFOLD_GITLAB_TOKEN",
     ],
 )
 def test_loadable(name: str) -> None:

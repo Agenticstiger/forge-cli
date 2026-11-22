@@ -133,6 +133,15 @@ sdk = [
   "data-product-forge-sdk>=0.9,<1",
 ]
 
+# The custom-scaffold engine. ``fluid generate artifacts`` (emit key
+# custom-scaffold) runs a contract's ``extensions.customScaffold`` block through
+# its library entry point, ``generate()``, which 0.5.0 added
+# (fluid_build/forge/core/custom_scaffold_artifacts.py). Imported only when a
+# contract declares the block; without it the default run skips the scaffold.
+custom-scaffold = [
+  "data-product-forge-custom-scaffold>=0.5.0,<1",
+]
+
 # Stricter ODCS validation via vowl (MIT, GovTech Data Practice).
 # Bitol vendor-listed validation engine that aggregates ALL violations
 # (no first-error-only), runs format checks (uuid/email/ipv4/...),
@@ -569,7 +578,7 @@ test-emulators-heavy = [
 
 # One-shot install for contributors
 all = [
-  "data-product-forge[local,aws,gcp,snowflake,viz,odps,tui,copilot,postgres,docs,litellm,mcp,lineage,profile,dev]"
+  "data-product-forge[local,aws,gcp,snowflake,viz,odps,tui,copilot,postgres,docs,litellm,mcp,lineage,profile,custom-scaffold,dev]"
 ]
 
 [project.scripts]
@@ -632,6 +641,9 @@ databricks = "fluid_build.providers.databricks:DatabricksProvider"
 # Built-in platform names (aws / gcp / snowflake / confluent / databricks, their
 # aliases, local) are reserved: an entry point claiming one is skipped before it
 # is imported. Declared by THIRD-PARTY packages only.
+
+# ``fluid import <tool>`` sources are a discovered plugin group (``fluid_build.importers``), declared
+# by THIRD-PARTY packages only; ``cli/import_workflow/registry.py`` documents its shape and policy.
 
 [project.urls]
 Homepage = "https://agenticstiger.github.io/forge_docs/"
@@ -826,12 +838,15 @@ snowflake-connector-python = "snowflake"
 databricks-sdk = "databricks"
 acryl-datahub = "datahub"
 data-product-forge-sdk = ["fluid_sdk", "fluid_provider_sdk"]
+data-product-forge-custom-scaffold = "data_product_forge_custom_scaffold"
 
 [tool.deptry.per_rule_ignores]
 # h11 is a security floor for a transitive dependency; nothing imports it.
 # dbt-bigquery / dbt-snowflake are dbt adapters: fluid runs dbt as a subprocess
 # and dbt-core loads the adapter by name, so no forge module imports them.
-DEP002 = ["h11", "dbt-bigquery", "dbt-snowflake"]
+# data-product-forge-custom-scaffold is imported by name through
+# ``fluid_build._optional`` (probed before it is imported), which deptry cannot see.
+DEP002 = ["h11", "dbt-bigquery", "dbt-snowflake", "data-product-forge-custom-scaffold"]
 # Optional integrations the user installs themselves. Each import is guarded
 # (try/except ImportError, MissingExtraError, or a feature probe) and no extra
 # owns the package, so declaring them would put them on every install:
@@ -909,6 +924,10 @@ module = [
     "fluid_build.build_runners._masking",
     "fluid_build.cli._verify_masking",
     "fluid_build.cli.security",
+    # Stage 3 running the custom-scaffold engine: which files reach the MANIFEST
+    # and a sealed release, and which plugin may load, so a silent Any is a
+    # silent unchecked file.
+    "fluid_build.forge.core.custom_scaffold_artifacts",
     "fluid_build.util.atomic_write",
     "fluid_build.observability.secret_redactor",
     # The agentPolicy gate: it decides whether an agent may read production

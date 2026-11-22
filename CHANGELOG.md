@@ -51,7 +51,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the DAG ids match what the new check reads from the files. A unit test runs Ruff's Airflow 3
   rules (AIR3) over every generated DAG, the `fluid apply` DAGs included. It allows a finding
   only inside an Airflow 2 `except ImportError` fallback.
-
+- **A Spark build can run the team's own prebuilt PySpark package by its sha256 digest, and
+  forge's runner owns the write.** `builds[].properties.package` (0.7.7 preview) on an
+  `engine: spark` embedded-logic batch build names a `.whl` or `.zip` (`uri`), its `sha256` and an
+  `entryPoint` (`module:function`, an entry-point object reference), with optional string
+  `arguments` and `deadLetter`. `fluid apply` copies the package beside the job config, keyed by
+  its digest: on AWS OpenTofu copies the S3 object only when S3's SHA-256 checksum of it is the pin
+  (publish it single-part with `--checksum-algorithm SHA256`), and on `runtime: local` forge copies
+  the file after hashing it. The runner hashes its copy again and imports the entry point only from
+  those bytes (a module of that name elsewhere on the Python path, or a compiled extension in the
+  package, is refused), calls it as `fn(spark, context)` and writes the DataFrame it returns: its
+  columns and their types must be the output's `contract.schema`, a row whose required value is
+  null at any depth goes to `<output>__dead_letter` (the reason, the row as JSON, the run id and the
+  package's sha256, landed once per run: the scheduler's run id when `fluid apply` passes one, else
+  the Spark application id) or, without dead letters, fails the run with nothing written, and the
+  passing rows replace the partitions they hold. Each commit carries the run's stamps, as every
+  runner commit does, and `fluid.package.sha256`. While the function runs, PySpark's write calls are refused and `spark.sql`
+  runs reads only, and a commit to the output or its dead letters that the runner did not make
+  fails the run. The operator lists where packages may come from in `FLUID_SPARK_PACKAGE_ALLOWLIST`
+  (unset allows none; `fluid validate` warns, apply refuses). As for a SQL batch build, a runtime
+  where forge would create the role needs `executionRoleArn`. `fluid plan` shows and binds the
+  package's source, digest and entry point.
+- **`fluid generate artifacts --emit custom-scaffold` generates a contract's custom scaffold, so
+  its files are in the stage-3 MANIFEST and in a sealed release.** The new emit key passes the
+  contract to the custom-scaffold engine's library entry point and writes the files its
+  `extensions.customScaffold` block declares (CI files, job settings, a README) to
+  `custom-scaffold/`. The engine is a new optional extra, `pip install
+  'data-product-forge[custom-scaffold]'` (`data-product-forge-custom-scaffold>=0.5.0,<1`, also in
+  `[all]`), imported only when a run names the key and the contract declares the block, so
+  `fluid --help` loads what it did before. The key is requested by name, never part of the
+  default set: the engine renders the bundles' templates in this process, so a pipeline names it
+  only where it trusts the contract's bundles (not on a build of an untrusted pull request, which
+  reaches stage 3). A default run on a contract with the block says how to ask for it. Without the
+  engine (or with one older than 0.5.0, or one that does not import) the run fails with an error
+  that names the extra, and `fluid ship --require-artifacts custom-scaffold` fails a release run
+  that wrote none. Before the engine runs, its own validator checks the block and every
+  `entrypoint` bundle is held to `FLUID_PLUGINS_ALLOWLIST` / `FLUID_PLUGINS_BLOCKLIST` as every
+  other plugin is (the `custom_scaffold` plugin role is listed as dispatched by `fluid plugins`
+  now). The engine writes into a hidden directory beside `custom-scaffold/`; every file it reports
+  must be a regular file there with the reported sha256 and size under the exact name the
+  directory lists (two spellings of one file on a case-insensitive file system are refused),
+  nothing unreported and no link may be there, and only then is the directory moved into place,
+  so a refused run leaves no scaffold behind. Each engine error is its own code
+  (`custom_scaffold_contract_invalid`, `_bundle_failed`, `_plan_failed`, `_unsafe_path`,
+  `_apply_failed`, `_output_failed`, `_plugin_blocked`, `_engine_missing`, `_engine_too_old`,
+  `_engine_broken`, `_failed`), with the message redacted; a file-system error is
+  `custom_scaffold_output_failed`, not a traceback. A relative `path:` bundle is read from the
+  contract's directory (a bundle's recorded source contract, else `--contract-path`), and a
+  `custom-scaffold/` in `--out` that holds `fluid-scaffold.yaml` (a bundle, with `--out` at the
+  contract's directory) is refused rather than cleared. Git bundles keep the engine's own
+  credential model: a credential goes only to a host the operator lists in
+  `FLUID_CUSTOM_SCAFFOLD_AUTH_HOSTS`, and a contract's `secret_ref` may only name a
+  `FLUID_SCAFFOLD_` variable; the engine's operator settings (`FLUID_CUSTOM_SCAFFOLD_*`) cannot
+  come from a project `.env` file. `fluid generate ci` installs the `custom-scaffold` extra in the
+  pipeline when the contract declares the block, so a pipeline that names the key in
+  `GENERATE_EMIT` can run it.
+- **`fluid generate artifacts --emit pyspark-schema` puts the PySpark schema modules in the
+  MANIFEST.** It writes `pyspark-schema/<port>_schema.py`, the module `fluid generate
+  pyspark-schema` writes, byte for byte (same loader, renderer and writer), for each output port
+  with columns. It is requested by name, not in the default set: on by default it would fail stage
+  3 for every contract with a column Spark has no type for. The modules describe the contract the
+  run's ODCS describes: `--env` overlays it, `$FLUID_ENV` (which the DAGs and Spark job configs
+  follow) does not. A file at a module's path that the emitter did not write is left alone and
+  refused, a link at `pyspark-schema/` itself is removed rather than written through, and a run
+  removes only the modules an earlier run wrote. `fluid validate-artifacts` checks each module
+  against the emitter's allowlist (one
+  `StructType`, nothing else), so a module changed after stage 3 fails stage 4 even with its
+  MANIFEST rewritten; `fluid ship --require-artifacts pyspark-schema` requires them.
 - **The Spark runner stamps every Iceberg commit with the run's identity.** Each commit the
   runner makes (a batch overwrite, a stream's append, a dead-letter table's append) carries
   `fluid.product`, `fluid.build` and `fluid.job-sha256` (the digest of the job config as it ran) in
@@ -95,6 +161,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from its environment variables; a clone URL loses its user, password, query and fragment, and
   anything that is not a hex commit, a URL or `user@host:org/repo`, or a ref name, is left out: a
   credential or a path on the runner is no part of a release record).
+
+- **Each Iceberg commit also names the bundle and the scheduler run behind it.** The Spark
+  runner stamps `fluid.bundle-digest`, the `bundleDigest` of the plan `fluid apply` verified (the
+  `identity.bundle.manifest_digest` of the sealed release), and `fluid.scheduler-job` and
+  `fluid.scheduler-run-id`, the job and run of the scheduler that started `fluid apply`, beside
+  `fluid.run-id`. The scheduler's come from `FLUID_SCHEDULER_JOB` and `FLUID_SCHEDULER_RUN_ID`,
+  else from the task context Airflow 2 and 3 give every task (`AIRFLOW_CTX_DAG_ID`,
+  `AIRFLOW_CTX_DAG_RUN_ID`). The DAGs `fluid generate schedule` writes hand Airflow's DAG id and run
+  id to `fluid apply` under fluid's names, so still no `AIRFLOW*` variable reaches it. A
+  scheduler's value is made safe as a run id is and never refuses a run. A project `.env` may set
+  neither the scheduler's variables nor Airflow's. Only a run started from a verified plan carries
+  the bundle: a scheduled DAG run and the keepalive apply the contract, not a plan, so set
+  `FLUID_RELEASE_ID` on the worker to name the release there. `fluid.contract-digest` is the
+  contract's as written on every start path, a scheduled build from a `plan.json` included (it
+  hashed that plan's resolved copy). Like the other stamps these are runner arguments, so they
+  restart no stream. A local Spark 3.5 session with Iceberg 1.6 now checks on real tables that the
+  stamps reach the snapshot summary of a stream's commits, of its dead letters' and of a batch
+  overwrite.
+
+- **`fluid runs status --release-dir` matches a commit to its release and trusts only intact
+  records.** Each release shows its `bundle` line, the `fluid.bundle-digest` a commit names. The
+  release in force is the latest intact one: a later record whose `identity_digest` no longer
+  matches its identity is listed under "Not in force" (`not_intact` in `--json`), never in force,
+  and with no intact release nothing is (exit 1). A long root no longer makes two releases look
+  alike (a path is cut from its start, and releases sealed in one second are ordered by their whole
+  paths); piped output keeps each line whole (it was cut at 80 columns); a `--release-dir` this
+  user may not read is a usage error (exit 2) with a plain message; and the "not read" line counts
+  every entry past the 2,000 read in a directory.
+
+- **`fluid import pyspark` and `fluid import airflow` propose products from the code that already
+  runs.** `fluid import pyspark <jobs-dir> [--dags <dags-dir>]` reads PySpark jobs and
+  `fluid import airflow <dags-dir>` reads Airflow DAG files, both statically: the files are parsed
+  with `ast` and never imported or run, so Airflow is never loaded and no job executes. A job's
+  tables, paths and Kafka topics (read and written), a stream's checkpoint and trigger, and the SQL
+  in `spark.sql(...)` (CTE names and temporary views left out; an f-string field that does not fold
+  leaves the rest of the statement readable) become **one product per output table or topic, with a
+  single writer and one owner**, and the upstream reads become `consumes[]`. A table written by two
+  jobs is proposed once and reported; a name that is not a constant is reported with the reason,
+  never guessed. With `--dags` (or through `script_roots` for `airflow`), each task is joined to the
+  script it submits: the standard Spark-submitting operators are read (SparkSubmit, EMR add steps
+  and create job flow, EMR on EKS and Serverless job drivers, Glue, Databricks `spark_python_task`,
+  and a `spark-submit` in a `BashOperator`) and the DAG's schedule, tags, owner, tasks and
+  dependencies land on the build under `execution.orchestration` with `mode: manual`; the trigger
+  is `manual`, or `continuous` for a long-running stream, never `schedule`, because
+  `fluid generate schedule` would render a second DAG for it. `--split-by` takes `table` (the
+  default), `job`, `dag`, `folder` and `project` for these importers. `--conventions <file>` holds
+  the organisation's layout as data (script prefixes, data path prefixes, helper function names,
+  config modules, environment names, owners, layers, what to ignore, the product id rule); it is
+  read strictly and no code in it runs. A path in it may point into the file's own folder or into
+  a directory named on the command line (the jobs directory, `--dags`), checked after the path is
+  resolved, so the file can sit beside the repositories it describes (`config/conventions.yaml`);
+  an `environments` value may be empty (a table prefix that is empty in production), which is not
+  the same as a variable the file does not name. `--registry` reads a written topic's columns through the
+  existing schema-registry importer, only when asked. Every proposal is checked against the
+  schema before anything is written (a schema error stops the import), and `fluid validate`'s
+  contract rules are run on it: what they find that no code can give (the columns, a Databricks
+  schema, a Snowflake warehouse) is listed in the report and the contract is still written. A
+  table in a Spark
+  catalog (`glue_catalog.raw.orders`) gets `binding.location.catalog` only when its kind is
+  known: the alias is a kind FLUID knows, a conventions rule maps it, or the scanned code sets
+  `spark.sql.catalog.<alias>.type` or a `catalog-impl` (Glue, REST, Hive, Nessie, Hadoop) in
+  `builder.config`, `conf.set`, a dict or a `--conf`; otherwise the binding has none and the
+  report says to set it, because an alias is no kind and `fluid validate` refuses it.
+  Credentials in command lines and argument lists are masked
+  word by word, with the command's lines, comments and quoting kept (`NAME=value`, `--password`,
+  `-uUSER:PASS`, `mysql -pSECRET`, a header or a cookie, a JSON value, a `sig=`, `key=` or `code=`
+  in a URL, `bash -c`, the password of an Oracle JDBC URL), the user information of a data path or a host (an AWS secret with a slash
+  included) never reaches an id, a file name or a binding, and a second import never replaces a
+  file that differs from what it would write unless `--force` is given. The reading is bounded: a
+  file over 300 KB, or with more than 50,000 `{` characters (in the encoding Python reads it in:
+  CPython parses a long f-string in time that grows with the square of its fields), is not
+  parsed; one import reads at most 64 MB of source, keeps at most 200,000 syntax-tree nodes parsed
+  at once and spends at most 2 MB on reading dropped modules again; the work spent folding a name,
+  the text a module's memo keeps and the size of a string are capped (4,096 characters, 262,144
+  for the statement a `spark.sql` takes, and 4,000,000 for what a module builds in all); one import
+  parses at most
+  1,500,000 characters of SQL (a statement once per file); a table or path name over 512
+  characters is not kept; a job records at most 1,000 of its tasks, a command keeps its first 20
+  submits and a task lists at most 100 arguments; one proposal holds at most 50,000 outputs and
+  10,000 products, lists at most 200,000 reads in consumes[] between its products (each lists at
+  most 500), goes through at most 1,000,000 reads and 1,000,000 task links, and writes at most
+  16,000,000 characters of DAG tasks, with `--split-by job` as the way out; and a script path in a
+  DAG file is judged on its text (no `..`, not absolute) before any file is looked at.
+  Product, expose and build ids are unique whatever the names look like, two jobs with one file
+  name are two products, and what the reader cannot follow (a reader variable assigned twice, a
+  task group in a dependency, a placeholder in SQL that is not an f-string) is said in the report.
+
+- **`fluid import` takes a generic `--dry-run`, and importers can be added by packages.** `--dry-run`
+  prints the proposal (each product, its writer, outputs and upstreams) and the report and writes
+  nothing, for every importer. The importer names come from a registry now, and a package adds
+  `fluid import <tool>` through the `fluid_build.importers` entry-point group: a duck-typed object
+  with `import_to_contract` or `import_to_contracts` and no forge import, any report object with the
+  report's four lists, read by name and loaded only when its tool is asked for, held to
+  `FLUID_PLUGINS_ALLOWLIST` and `FLUID_PLUGINS_BLOCKLIST`, unable to take a built-in's name, and
+  refused when two distributions ship one name. `fluid --help` stays cold. A dry run labels each
+  file as new, unchanged, replacing the existing file (with `--force`) or refused. For every
+  importer an output path that is a symbolic link, a directory or a device is refused, with or
+  without `--force`, and a file is written whole beside its target and renamed over it, keeping
+  the permission bits of a file it replaces. `--out` that names an existing file is refused when
+  several products are written, and `--split-by table`, `job` and `dag` are refused for the
+  importers that do not read code.
 
 - **`fluid generate pyspark-schema` writes a PySpark `StructType` module for each output
   port.** For every output port that declares `contract.schema` columns it writes
@@ -248,6 +415,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--impact` report.
 
 ### Fixed
+
+- **`fluid validate-artifacts` no longer reports a declared dotfile as missing.** A file the
+  MANIFEST lists whose name starts with `.` (a scaffold's `.gitlab-ci.yml`) was skipped when the
+  directory was read, so stage 4 failed with `MANIFEST-MISSING-FILE`; only an undeclared hidden
+  file (`.DS_Store`) is ignored now.
+- **A scheduled run no longer shares its run id with every other scheduled run.** A command a
+  scheduler started took the run id a worker's checkout keeps in `.fluid/run-id.txt`, so every
+  scheduled `fluid apply` of a product, on every day, had one id in its OpenTelemetry spans, its
+  run records and the `fluid.run-id` stamp. Under a scheduler (`FLUID_SCHEDULER_RUN_ID`, or
+  Airflow's `AIRFLOW_CTX_DAG_RUN_ID`) the run id is now derived from the scheduler's job and run:
+  the same for each command of one run, another for the next, and the file is neither read nor
+  written. `FLUID_RUN_ID` still wins.
+
+- **The redactor masks the password of an Oracle JDBC URL, a Slack incoming webhook, and a
+  Google API key that follows a word character.** `jdbc:oracle:thin:user/password@host` (also
+  `@//host`, `oci`, `oci8` and `kprb`, in any case, with a password that holds an `@`, quoted
+  or not) has no `://` and no `:` before the password, so neither the URL user-information rule
+  nor the `user:password` one saw it, and it was logged and written as it stood while the
+  PostgreSQL form was masked. A Slack webhook URL is a secret by itself and is masked whole, and
+  `GOOGLE_AIza...` and `%3DAIza...` leaked because the key rule wanted a word boundary before it.
+  The repository's redactor, the importer and the Snowflake, local and GCP provider loggers share
+  the Oracle rule's one regex, which also reads a user name in double quotes.
 
 - **Entropy Data's product list is read whole or not at all.** A page after the first that was
   not a list (a rate-limit answer, say) used to hand back the pages before it as if they were

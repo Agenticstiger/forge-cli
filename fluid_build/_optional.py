@@ -38,12 +38,14 @@ __all__ = ["MissingOptionalDependency", "ensure_installed", "is_available", "req
 
 # import name -> distribution name, where they differ (pandas' ``INSTALL_MAPPING``).
 _DISTRIBUTION = {
+    "data_product_forge_custom_scaffold": "data-product-forge-custom-scaffold",
     "openlineage": "openlineage-python",
     "yaml": "pyyaml",
 }
 
 # import name -> stable error code (see ``fluid_build/_error_catalog.py``).
 _EVENTS = {
+    "data_product_forge_custom_scaffold": "custom_scaffold_engine_missing",
     "litellm": "copilot_litellm_unavailable",
     "mcp": "mcp_sdk_unavailable",
 }

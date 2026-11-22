@@ -64,6 +64,9 @@ EXTRA_GROUPS: Dict[str, str] = {
     "extension_validator": "fluid_build.extension_validators",
     "modeling_technique": "fluid_build.modeling_techniques",
     "source_adapter": "fluid_build.source_adapters",
+    # Third-party sources for `fluid import <tool>`. Read by name, loaded only when that tool
+    # is asked for (``cli/import_workflow/registry.py``); the policy governs it like the rest.
+    "importer": "fluid_build.importers",
     # Third-party LLM providers for `fluid forge --llm-provider <name>`. Loaded +
     # registered lazily in ``cli/_llm_provider_plugins.py``; listed here so
     # ``fluid plugins`` surfaces them and the allow/block policy governs them.
@@ -80,15 +83,17 @@ EXTRA_GROUPS: Dict[str, str] = {
 #: declared and governed, but nothing ever walks the group to run a plugin.
 #:
 #: ``fluid plugins`` is an operator inspection/security surface, so it must not
-#: render an inert plugin the same way it renders an active one. Listing
-#: ``custom_scaffold`` as plain "allowed" told operators a plugin was live when
-#: no code path — across validate / plan / apply / publish / forge / providers —
-#: ever imported it. Removing the role instead would drop the allow/block
-#: governance and the audit visibility, so it stays listed and says what it is.
+#: render an inert plugin the same way it renders an active one. A role listed
+#: here is shown as not dispatched; removing the role instead would drop the
+#: allow/block governance and the audit visibility.
 #:
-#: Wire a dispatch site (the way ``iac_provider`` is wired in
-#: ``iac/registry.py``) and delete the entry in the same change.
-UNDISPATCHED_GROUPS: frozenset = frozenset({"custom_scaffold"})
+#: Empty in this build. ``custom_scaffold`` was listed until ``fluid generate
+#: artifacts`` (emit key ``custom-scaffold``) started running the custom-scaffold
+#: engine, whose ``entrypoint`` bundles are the plugins of that group; the stage
+#: checks each one against this module's policy first
+#: (``forge/core/custom_scaffold_artifacts.py``). A new role without a dispatch
+#: site goes here until it has one.
+UNDISPATCHED_GROUPS: frozenset = frozenset()
 
 
 def is_dispatched(group_key: str) -> bool:
@@ -404,7 +409,9 @@ def detailed_plugins(
                 entry["allowed"] = False
                 entry["reserved"] = True
                 allowed = False
-            if allowed:  # only ALLOWED plugins are ever loaded
+            # Only ALLOWED plugins are ever loaded, and an importer plugin is imported when its
+            # tool is asked for (``fluid import <name>``), not by listing it.
+            if allowed and k != "importer":
                 try:
                     obj = ep.load()
                 except Exception as e:  # noqa: BLE001 - isolate a bad plugin; type only
