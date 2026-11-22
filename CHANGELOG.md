@@ -280,8 +280,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - An address with an IPv6 zone id, such as `::1%lo0`, is no longer read as this machine. The
-  secret destination policy judges it like any other host, the MCP HTTP server needs
-  authentication to listen on it, and an OpenBao or Vault address on it needs https.
+  secret destination policy judges it like any other host, and an OpenBao or Vault address on
+  it needs https.
 - The secret destination policy judges every host a connection names. Beside a `secretRef`,
   a query-string parameter that names a host (`host` or `hostaddr` in a libpq URI, a host in
   `jdbc_url_params` or in a Singer tap's `sqlalchemy_url`) is refused unless the reference may
@@ -289,7 +289,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   control character. The host of an SSH tunnel in use (a tap's `ssh_tunnel`, Airbyte's
   `tunnel_method`) needs an allowlist entry of its own, and so does a loopback host behind
   it. A Debezium `extra_config` may no longer set `database.port`, `database.dbname`,
-  `database.names` or `connector.class` beside a `secretRef`.
+  `database.names` or `connector.class` beside a `secretRef`. A URI whose user part a client
+  reads past a `/`, `?` or `#` to an `@` is a destination the policy cannot read, and is
+  refused unless the reference may go to any host.
 - A runner that builds a connection URL keeps each field in its own part. dlt's
   `sql_database` source refuses a host, database or `drivername` that would change how its
   connection URL is read back, and `drivername` must be a SQLAlchemy dialect name with an

@@ -242,3 +242,54 @@ def test_an_override_may_not_replace_a_setting_the_url_is_built_from(key):
     with pytest.raises(AcquisitionSecretPolicyError) as info:
         refuse_destination_overrides({key: "x"}, where="properties.debezium.extra_config")
     assert "properties.debezium.extra_config" in info.value.what
+
+
+# ── a user part that hides a host from urlsplit ──────────────────────────────
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "connection",
+    [
+        {"connection_string": f"mongodb://localhost#@{ELSEWHERE}/db"},
+        {"connection_string": f"mongodb://127.0.0.1?@{ELSEWHERE}/db"},
+        {"uri": f"postgresql://{REMOTE}#@{ELSEWHERE}/db"},
+        {"sqlalchemy_url": f"postgresql://u@127.0.0.1?@{ELSEWHERE}/db"},
+        {"uri": f"localhost#@{ELSEWHERE}/db"},
+        {"sqlalchemy_url": f"postgresql://localhost:1/@{ELSEWHERE}/db"},
+        {"uri": f"postgresql://{REMOTE}:1/x@{ELSEWHERE}/db"},
+        {"uri": f"postgresql://localhost:5432/db?application_name=a@{ELSEWHERE}"},
+    ],
+)
+def test_a_user_part_a_client_reads_past_a_query_or_fragment_cannot_be_cleared(connection):
+    """urlsplit ends the authority at ``/``, ``?`` or ``#``; a client may read on to an ``@``.
+
+    The MongoDB drivers take the last ``@`` before the first ``/``, and SQLAlchemy's
+    ``make_url`` reads a password through ``/``, ``?`` and ``#`` to the first ``@``.
+    """
+    refusal = _refusal(connection, {ALLOWLIST_ENV: f"PG@{REMOTE}"})
+    assert refusal is not None
+    assert "could not be determined" in refusal.what
+    assert ELSEWHERE not in str(refusal)
+    assert _refusal(connection, ANY_HOST) is None
+
+
+@pytest.mark.unit
+def test_validate_refuses_a_user_part_that_hides_a_host_beside_a_placeholder():
+    finding = _lint({"uri": f"postgresql://{{{{ env.PGHOST }}}}#@{ELSEWHERE}/db"})
+    assert not finding.ok
+    assert finding.deferred is None
+
+
+@pytest.mark.unit
+def test_a_schemeless_uri_with_a_query_host_is_refused():
+    refusal = _refusal({"uri": f"localhost:27017/db?host={ELSEWHERE}"})
+    assert refusal is not None
+    assert "query string" in refusal.what
+
+
+@pytest.mark.unit
+def test_a_windows_domain_user_part_is_read_as_a_user():
+    """``DOMAIN\\user`` is a SQL Server login: every parser reads the host after its ``@``."""
+    connection = {"uri": f"mssql+pyodbc://DOMAIN\\user:pw@{REMOTE}/db"}  # pragma: allowlist secret
+    assert _refusal(connection, {ALLOWLIST_ENV: f"PG@{REMOTE}"}) is None

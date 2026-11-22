@@ -621,15 +621,16 @@ def _uri_query_host_keys(text: str) -> List[str]:
     """The query-string parameters of URI ``text`` that name a host.
 
     Everything after the first ``?`` counts, a fragment included: libpq has no
-    fragment, and reads a ``#`` as part of the query. An object-store URI, an
-    http(s) or ws(s) URI (its client never takes the host from the query) and
-    text that is not a URI have none.
+    fragment, and reads a ``#`` as part of the query. Text without a scheme is
+    read as :func:`_field_hosts` reads it, as a host part and what follows. An
+    object-store URI, and an http(s) or ws(s) URI (its client never takes the
+    host from the query), have none.
     """
     stripped = text.strip()
-    scheme, sep, _rest = stripped.partition("://")
-    if not sep or "?" not in stripped or _is_object_store_uri(stripped):
+    if "?" not in stripped or _is_object_store_uri(stripped):
         return []
-    if scheme.strip().lower() in _UNROUTED_QUERY_SCHEMES:
+    scheme, sep, _rest = stripped.partition("://")
+    if sep and scheme.strip().lower() in _UNROUTED_QUERY_SCHEMES:
         return []
     return _query_keys_naming_a_host(stripped.partition("?")[2])
 
@@ -709,11 +710,36 @@ def _field_hosts(field_name: str, raw: Any) -> List[Optional[str]]:
     text = raw.strip()
     if _is_object_store_uri(text):
         return []
+    if _user_part_hides_host(text):
+        return [None]
     try:
         parsed = urlsplit(text if "//" in text else f"//{text}")
     except ValueError:
         return [None]
     return _authority_hosts(parsed.netloc)
+
+
+#: SQLAlchemy's ``make_url`` reads a user part as a user name of ``[^:/]*`` and
+#: an optional password of ``[^@]*`` up to the first ``@`` (``_parse_url``).
+_SQLALCHEMY_USER_PART = re.compile(r"[^:/]*(?::[^@]*)?@")
+
+
+def _user_part_hides_host(text: str) -> bool:
+    """Whether a client could read a host in ``text`` that ``urlsplit`` never sees.
+
+    ``urlsplit`` ends the authority at the first ``/``, ``?`` or ``#`` and takes
+    the host after its last ``@``. The MongoDB drivers take the last ``@``
+    before the first ``/``, and SQLAlchemy's ``make_url`` reads a password
+    through ``/``, ``?`` and ``#`` to the first ``@``; both then connect to the
+    host after that ``@``. A user part either of them reads past where
+    ``urlsplit`` stops is a destination this policy cannot read.
+    """
+    rest = text.partition("://")[2] if "://" in text else text.lstrip("/")
+    head, at, _hosts = rest.split("/", 1)[0].rpartition("@")
+    if at and ("?" in head or "#" in head):
+        return True
+    match = _SQLALCHEMY_USER_PART.match(rest)
+    return match is not None and any(char in match.group(0) for char in "/?#")
 
 
 def connection_host(connection: Mapping[str, Any]) -> Optional[str]:
@@ -1224,7 +1250,7 @@ def renders_at_apply(field_name: str, value: Any) -> bool:
         return False
     if field_name != "host" and _is_object_store_uri(value.strip()):
         return False
-    if field_name != "host" and _uri_query_host_keys(value):
+    if field_name != "host" and (_uri_query_host_keys(value) or _user_part_hides_host(value)):
         return False
     scheme, host = _deciding_parts(field_name, value)
     if not _reads_as_destination(scheme, host):
