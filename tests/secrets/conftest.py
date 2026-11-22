@@ -23,6 +23,8 @@ SECRET_ENV = (
     "FLUID_RUN_SECRETS_FILE",
     "FLUID_CREDENTIAL_STORE",
     "FLUID_VAULT_WRAPPED_TOKEN",
+    "FLUID_VAULT_SHIP_TOKEN",
+    "FLUID_VAULT_SHIP_TOKEN_FD",
     "FLUID_VAULT_JWT_ROLE",
     "FLUID_VAULT_JWT",
     "FLUID_VAULT_JWT_FILE",
@@ -48,7 +50,7 @@ def _isolated_secret_env(monkeypatch, tmp_path):
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     from fluid_build.observability import secret_redactor
-    from fluid_build.secrets import _vault, registry, run
+    from fluid_build.secrets import _ship_token, _vault, registry, run
 
     monkeypatch.setattr(registry, "_LOADED", {})
     monkeypatch.setattr(registry, "_REGISTERED", {})
@@ -59,6 +61,7 @@ def _isolated_secret_env(monkeypatch, tmp_path):
     for name in ("FLUID_PLUGINS_ALLOWLIST", "FLUID_PLUGINS_BLOCKLIST"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(_vault, "_UNWRAPPED", set())
+    monkeypatch.setattr(_ship_token, "_TAKEN", None)
     # The state lookups share outside every stage lives for the process: give
     # each test its own, and close it (revoking what it minted) afterwards.
     # Resolving registers each value with the process-wide exact-value redactor.

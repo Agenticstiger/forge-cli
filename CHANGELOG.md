@@ -242,6 +242,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same for each command of one run, another for the next, and the file is neither read nor
   written. `FLUID_RUN_ID` still wins.
 
+- **`fluid ship` unwraps a wrapped store token once and hands it to every stage.** A
+  response-wrapped OpenBao or Vault token (`FLUID_VAULT_WRAPPED_TOKEN`) unwraps once, and ship runs
+  each stage as its own process, so only the first stage that reached the store could use it: with
+  OpenBao state encryption, `diff` spent it and `apply` failed. A ship of two or more stages now
+  unwraps it before the first stage and hands every stage the token through a pipe, which the stage
+  reads as it starts (`FLUID_VAULT_SHIP_TOKEN_FD` names it). Windows has no inherited pipes, so
+  there the token travels in `FLUID_VAULT_SHIP_TOKEN`, which the stage takes out of its environment
+  at once. The token is in no process's environment, so tofu, dbt and a project's build steps
+  cannot reach it, and the store resolver reads it before any other token. No stage revokes it:
+  ship does when the run ends, also after a failed stage and after Ctrl-C. A wrapper that cannot be
+  unwrapped (a spent one, no store address, a store that cannot be reached) stops the run before
+  any stage, with exit 2. Ship unwraps whenever two or more stages run, so a wrapper now serves one
+  `fluid ship` invocation: a run split over several invocations needs one for each. A ship of one
+  stage (`--stage 7`, as a pipeline with one stage per CI step runs it) leaves the wrapper to that
+  stage, and a single `fluid apply` uses it, as before. A ship that SIGTERM or SIGKILL ends does
+  not revoke the token, which then lasts until its TTL.
+
 - **Entropy Data's product list is read whole or not at all.** A page after the first that was
   not a list (a rate-limit answer, say) used to hand back the pages before it as if they were
   every product the server holds, and an answer that was not JSON was a bare `ValueError`. Both

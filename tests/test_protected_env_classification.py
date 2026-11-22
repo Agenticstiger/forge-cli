@@ -107,6 +107,9 @@ def test_the_names_agree_with_the_modules_that_read_them() -> None:
         "FLUID_SECRET_STAGES",
         "FLUID_VAULT_JWT_ROLE",
         "FLUID_VAULT_WRAPPED_TOKEN",
+        # the store token `fluid ship` hands its stages: a project file must not pick it
+        "FLUID_VAULT_SHIP_TOKEN",
+        "FLUID_VAULT_SHIP_TOKEN_FD",
         "FLUID_RUN_SECRETS_FILE",
         "FLUID_CREDENTIAL_STORE",
         "BAO_ADDR",

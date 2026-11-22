@@ -14,8 +14,9 @@ What it proves, each against the live API: a KV v2 read with ``#field`` and
 ``?version=``; a denied path; existence through the metadata endpoint, a
 deleted version included; a JWT login whose token is revoked when the run
 ends; a response-wrapped token unwrapped once, revoked at run end, and refused
-the second time; ``fluid secrets check --resolve`` reading no value; and the
-``fluid doctor`` store report.
+the second time; ``fluid ship`` unwrapping one for two stage processes and
+revoking it when it ends; ``fluid secrets check --resolve`` reading no value;
+and the ``fluid doctor`` store report.
 """
 
 from __future__ import annotations
@@ -274,6 +275,45 @@ def test_a_wrapped_token_works_once_and_is_revoked_at_run_end(store, monkeypatch
         with pytest.raises(SecretResolveError) as caught:
             resolve_secret(f"vault://{MOUNT}/{store['path']}#password", host="localhost")
     assert "exposed" in caught.value.why
+
+
+def test_ship_unwraps_once_for_stage_processes_and_revokes_at_its_end(store, monkeypatch):
+    """`fluid ship`'s hand-off with real processes: one unwrap, two stages, one revoke."""
+    from fluid_build.cli import ship
+
+    with _admin() as client:
+        wrapping = _token(client, wrap_ttl="60s")["wrap_info"]["token"]
+    monkeypatch.setenv("BAO_ADDR", ADDR)
+    monkeypatch.setenv("FLUID_VAULT_WRAPPED_TOKEN", wrapping)
+    for name in ("BAO_TOKEN", "VAULT_TOKEN", "FLUID_VAULT_JWT_ROLE"):
+        monkeypatch.delenv(name, raising=False)
+    # A stage as ship starts it: a new interpreter with ship's environment, which
+    # reads the token from its pipe first, as main() does, then reads the secret.
+    stage = textwrap.dedent(
+        f"""\
+        import os, subprocess, sys
+        from fluid_build.secrets._ship_token import take
+        take()
+        child = subprocess.run(
+            [sys.executable, "-c", "import os; print(sorted(os.environ))"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        assert "FLUID_VAULT_SHIP_TOKEN" not in child, "a stage's child got the token's channel"
+        assert "FLUID_VAULT_WRAPPED_TOKEN" not in child, "a stage got the wrapper"
+        from fluid_build.secrets import resolve_secret, secret_run
+        with secret_run("apply"):
+            value = resolve_secret("vault://{MOUNT}/{store['path']}#password", host="localhost")
+        sys.exit(0 if value.get_secret_value() == {store['v2']!r} else 3)
+        """
+    )
+    with ship._store_token_for_stages([5, 7]) as token:
+        assert token
+        env = ship._child_env("live-run", token)
+        for _ in ("diff", "apply"):
+            # ship's own spawn: the token reaches the stage through a pipe
+            assert ship._start_stage([sys.executable, "-c", stage], env, None, token) == 0
+        assert _lookup_status(token) == 200  # no stage revoked it
+    assert _lookup_status(token) == 403  # ship did, when the run ended
 
 
 def test_secrets_check_resolve_reads_no_value(store, operator_token, tmp_path):

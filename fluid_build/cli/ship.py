@@ -420,10 +420,62 @@ def _run_selected(
     try:
         if keep is not None:  # before any stage: one run at a time holds the target
             keep.hold(opts)
-        return _run_held(args, logger, opts, selected, not_selected, report_dir, release_dir, keep)
+        with _store_token_for_stages(selected) as store_token:
+            return _run_held(
+                args,
+                logger,
+                opts,
+                selected,
+                not_selected,
+                report_dir,
+                release_dir,
+                keep,
+                store_token,
+            )
     finally:
         if keep is not None:
             keep.close()
+
+
+@contextlib.contextmanager
+def _store_token_for_stages(selected: Sequence[int]) -> Iterator[Optional[str]]:
+    """Unwrap a wrapped store token once for every stage; revoke it when ship ends.
+
+    A response-wrapped token (``FLUID_VAULT_WRAPPED_TOKEN``, Command Center's
+    hand-off) unwraps once, and each stage is its own process, so only the
+    first stage that needed the store could use it. Ship unwraps it here,
+    before the first stage, and hands each stage the token
+    (``secrets/_ship_token.py``). A stage leaves that token alone; it is
+    revoked here, after the last stage, a failed stage or Ctrl-C. A refused
+    unwrap stops the run before any stage, with exit 2.
+
+    Nothing happens without a wrapped token (an operator's token reaches the
+    stages as it is), or when the run has one stage: that stage gets the
+    wrapper and uses it as the standalone command would, so a pipeline that
+    runs one stage per CI step works as before.
+    """
+    from fluid_build.secrets import _ship_token, _vault
+    from fluid_build.secrets.errors import SecretError
+    from fluid_build.secrets.run import RunState
+
+    if len(selected) < 2 or not os.environ.get(_vault.WRAPPED_TOKEN_ENV, "").strip():
+        yield None
+        return
+    state = RunState(keep_values=False)
+    try:
+        try:
+            token = _vault.token_for(None, _vault.load_config(None), state)
+        except SecretError as exc:
+            raise st.ShipUsageError(f"no stage ran: {exc.why} Fix: {exc.fix}") from None
+        if not _ship_token.can_hand(token):
+            raise st.ShipUsageError(
+                "no stage ran: the store unwrapped a token that is not printable ASCII of at "
+                "most 16 KiB, so it cannot be handed to the stages. Fix: check the store's "
+                "token settings."
+            )
+        yield token
+    finally:
+        state.close()  # revoke-self with the unwrapped token, when ship obtained it
 
 
 def _run_held(
@@ -435,6 +487,7 @@ def _run_held(
     report_dir: str,
     release_dir: Optional[Path],
     keep: Optional["_Journaling"],
+    store_token: Optional[str] = None,
 ) -> int:
     # A run that bundles is a new run; one that starts later picks up where the
     # last run in this directory stopped (one CI step per stage).
@@ -454,7 +507,7 @@ def _run_held(
         opts=opts,
         ci=_ci_output.CiOutput(_ci_output.detect(args.ci_output)),
         fluid_bin=_resolve_fluid_bin(),
-        child_env=_child_env(run_id),
+        child_env=_child_env(run_id, store_token),
         logger=logger,
         run_id=run_id,
         fresh=fresh,
@@ -463,6 +516,7 @@ def _run_held(
         release_dir=release_dir,
         staging=staging,
         keep=keep,
+        store_token=store_token,
     )
     records = {num: _unselected_record(num, not_selected.get(num)) for num in st.STAGE_NUMBERS}
     rows: List[Tuple[int, str, str, float]] = []
@@ -503,7 +557,7 @@ class _Context:
     opts: st.ShipOptions
     ci: _ci_output.CiOutput
     fluid_bin: List[str]
-    child_env: Dict[str, str] = field(repr=False)  # holds the store token ship hands on
+    child_env: Dict[str, str] = field(repr=False)  # the operator's environment, credentials too
     logger: logging.Logger
     run_id: str
     fresh: bool  # this run bundles: it starts a new report, never merges an old one
@@ -512,6 +566,8 @@ class _Context:
     release_dir: Optional[Path] = None  # --release-dir: published when every stage passed
     staging: Optional[Path] = None  # its staging directory, beside it
     keep: Optional["_Journaling"] = None  # the stage journal, when one is kept
+    # the store token ship unwrapped for every stage, handed to each through a pipe
+    store_token: Optional[str] = field(default=None, repr=False)
 
 
 class _Journaling:
@@ -834,6 +890,7 @@ def _attempt(num: int, rec: report.StageRecord, ctx: _Context) -> Optional[int]:
             env=ctx.child_env,
             ci=ctx.ci,
             killed=killed,
+            store_token=ctx.store_token,
         )
     except KeyboardInterrupt:
         rec.reason = "interrupted"
@@ -1273,11 +1330,17 @@ def _run_id(fresh: bool, logger: logging.Logger) -> str:
         return secrets.token_hex(6)
 
 
-def _child_env(run_id: str) -> Dict[str, str]:
+def _child_env(run_id: str, store_token: Optional[str] = None) -> Dict[str, str]:
     from fluid_build.credentials.dotenv_store import environment_for_project_code
 
     env = dict(environment_for_project_code())
     env["FLUID_RUN_ID"] = run_id
+    if store_token is not None:
+        from fluid_build.secrets import _vault
+
+        # The wrapper is spent: every stage gets the token it yielded instead,
+        # through a pipe of its own (_start_stage), never in this environment.
+        env.pop(_vault.WRAPPED_TOKEN_ENV, None)
     return env
 
 
@@ -1348,11 +1411,14 @@ def _run_stage(
     env: Optional[Dict[str, str]] = None,
     ci: Optional[_ci_output.CiOutput] = None,
     killed: Optional[List[int]] = None,
+    store_token: Optional[str] = None,
 ) -> int:
     """Subprocess one stage; return its exit code. Stream output through.
 
     A negative return code (killed by a signal) is reported as 1, and the
-    signal is appended to ``killed`` when it is given.
+    signal is appended to ``killed`` when it is given. ``store_token`` (the
+    token :func:`_store_token_for_stages` unwrapped) reaches the stage through
+    a pipe, never its environment.
     """
     cmd = fluid_bin + [stage] + argv
     # Sanitise argv before logging: a stage may carry credential-bearing
@@ -1377,7 +1443,7 @@ def _run_stage(
     try:
         with _patient_interrupts(say) as interrupts:
             try:
-                rc = subprocess.run(cmd, check=False, env=env, stderr=stderr).returncode
+                rc = _start_stage(cmd, env, stderr, store_token)
             except FileNotFoundError as exc:
                 logger.error("ship_subprocess_failed: %s", exc)
                 rc = 127
@@ -1389,6 +1455,24 @@ def _run_stage(
     if rc < 0 and killed is not None:
         killed.append(-rc)
     return 1 if rc < 0 else rc
+
+
+def _start_stage(
+    cmd: List[str], env: Dict[str, str], stderr: Optional[int], store_token: Optional[str]
+) -> int:
+    """Run one stage to its end and return its code; hand it ``store_token`` if given.
+
+    The token goes into a pipe whose read end only this child inherits, and is
+    read and closed when the stage starts (``secrets/_ship_token.py``).
+    """
+    if store_token is None:
+        return subprocess.run(cmd, check=False, env=env, stderr=stderr).returncode
+    from fluid_build.secrets._ship_token import handed_to_child
+
+    with handed_to_child(store_token, env) as (child_env, fds):
+        return subprocess.run(
+            cmd, check=False, env=child_env, stderr=stderr, pass_fds=fds
+        ).returncode
 
 
 @contextlib.contextmanager
