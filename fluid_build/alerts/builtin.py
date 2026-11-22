@@ -180,7 +180,10 @@ class WebhookNotifier(AlertNotifier):
     The connection's host is the whole URL (``HttpHook`` uses a host holding ``://`` as the
     base URL and adds nothing when the endpoint is empty), so a key in the URL's path stays in
     the connection. Headers that carry a key go in its extra, which ``HttpHook`` sends as
-    request headers. ``HttpHook`` logs the URL at DEBUG only.
+    request headers and Airflow's secrets masker hides. ``HttpHook`` logs the URL at DEBUG,
+    but a failed delivery's error quotes it, and the masker does not hide a connection's host:
+    put the URL's key in the connection's password as well (``HttpHook`` sends no password
+    without a login), and the masker hides it wherever it is logged.
     """
 
     notifier = "airflow.providers.http.notifications.http:HttpNotifier"
@@ -191,7 +194,7 @@ class WebhookNotifier(AlertNotifier):
 
     def check(self, route: AlertRoute) -> Sequence[str]:
         if route.format and route.format not in WEBHOOK_FORMATS:
-            return (f"format {route.format!r} is not one of {', '.join(WEBHOOK_FORMATS)}",)
+            return (f"format must be one of {', '.join(WEBHOOK_FORMATS)} (value not shown)",)
         return ()
 
     def kwargs(self, route: AlertRoute, alert: Alert) -> Mapping[str, Any]:
@@ -211,7 +214,10 @@ class WebhookNotifier(AlertNotifier):
                 call["json"] = {"source": "fluid", "note": f"{alert.title}. {alert.text}"}
             else:
                 call["json"] = {
-                    "message": alert.title,
+                    # Opsgenie keeps at most 130 characters of a message
+                    "message": "{% filter truncate(130, True, '...', 0) %}"
+                    + alert.title
+                    + "{% endfilter %}",
                     "alias": alias,
                     "description": alert.text,
                     "priority": _OPSGENIE_PRIORITY.get(alert.severity, "P3"),

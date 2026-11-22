@@ -213,6 +213,14 @@ def _load_kind(key: str) -> Tuple[Optional[Any], str]:
     return _build(obj)
 
 
+def refused_default_packs() -> List[str]:
+    """The installed ``fluid_build.alert_defaults`` entry points the operator's allow/block
+    policy leaves out, sorted. Names only: nothing is imported."""
+    from fluid_build.plugin_manager import is_allowed
+
+    return sorted(key for key in _index(DEFAULTS_GROUP) if not is_allowed(key))
+
+
 def default_routes() -> List[Tuple[str, Sequence[Any]]]:
     """``[(entry point name, routes)]`` of every allowed ``fluid_build.alert_defaults`` entry
     point, sorted by name. Raises :class:`AlertRouteError` when one cannot be read: the
@@ -249,5 +257,6 @@ __all__ = [
     "default_routes",
     "kind_for",
     "normalise_kind",
+    "refused_default_packs",
     "reset_alert_plugin_cache",
 ]

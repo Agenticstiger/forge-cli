@@ -66,16 +66,18 @@ _TAKEN = frozenset(
     }
 )
 
-_ALERT_HELPER = '''def alert(notifier, **kwargs):
+_ALERT_HELPER = '''def alert(notifier, /, **kwargs):
     """An Airflow callback that sends one alert through a new ``notifier(**kwargs)``.
 
     A notifier renders its template fields in place, so one instance shared by the tasks
     of this DAG would repeat the first alert's text; each call gets its own copy of the
-    arguments too.
+    arguments too. ``deepcopy`` is bound here, before a task of this file can take the
+    name ``copy``.
     """
+    deepcopy = copy.deepcopy
 
     def callback(*args):
-        notifier(**copy.deepcopy(kwargs))(*args)
+        notifier(**deepcopy(kwargs))(*args)
 
     return callback
 '''
@@ -235,13 +237,17 @@ def _notes(plan: AlertPlan, sla_calls: Sequence[NotifierCall]) -> Tuple[str, ...
         "file. The notifiers run where Airflow runs callbacks: the workers, the scheduler's "
         "DAG processor and, for deadline alerts, the triggerer, which all need "
         + ", ".join(need)
-        + "."
+        + ". A webhook URL that holds its key keeps it in the connection's host, which "
+        "Airflow's secrets masker does not hide: put the key in the connection's password too, "
+        "and the masker hides it wherever it is logged."
     ]
     if sla_calls:
         words = duration_words(int(plan.sla_seconds or 0))
         note = (
-            f"SLA: {words}. On Airflow 2 every task has that sla and a miss calls the DAG's "
-            "sla_miss_callback. Airflow 3 has no SLAs: on 3.1+ each route gets a deadline "
+            f"SLA: {words}. On Airflow 2.7+ every task has that sla, from the end of the run's "
+            "data interval, and a miss calls the DAG's sla_miss_callback (Airflow 2.6's "
+            "notifiers cannot take it). Airflow 3 has no "
+            "SLAs: on 3.1+ each route gets a deadline "
             f"alert {words} after the run was queued, which needs "
             + ", ".join(deadline or need)
             + " in the triggerer; on 3.0 a missed SLA alerts no one."
@@ -289,8 +295,9 @@ def render_alerts(plan: AlertPlan, *, dag_id: str, product_id: str) -> RenderedA
         async_calls = [c for c in sla_calls if c.supports_async]
         out.append(
             f"ALERT_SLA = timedelta(seconds={int(plan.sla_seconds or 0)})\n"
-            'if AIRFLOW_VERSION.startswith("2."):\n'
-            "    # Airflow 2: every task's SLA, and the DAG's sla_miss_callback.\n"
+            'if AIRFLOW_VERSION.startswith("2.") and not AIRFLOW_VERSION.startswith("2.6."):\n'
+            "    # Airflow 2.7+: every task's SLA, and the DAG's sla_miss_callback (2.6's\n"
+            "    # BaseNotifier takes one argument, not the callback's five).\n"
             '    ALERT_TASK_ARGS["sla"] = ALERT_SLA\n'
             f'    ALERT_DAG_ARGS["sla_miss_callback"] = {_callbacks(sla_calls, aliases, "    ")}\n'
         )
@@ -302,13 +309,13 @@ def render_alerts(plan: AlertPlan, *, dag_id: str, product_id: str) -> RenderedA
             out.append(
                 "elif DeadlineAlert is not None:\n"
                 "    # Airflow 3.1+ has no SLAs: a deadline alert per route, ALERT_SLA after the\n"
-                "    # run was queued. The API is experimental, so a change to it costs this\n"
-                "    # DAG its deadline alerts, never its import.\n"
+                "    # run was queued. The API is experimental, so a change to it (or a notifier\n"
+                "    # it refuses) costs this DAG its deadline alerts, never its import.\n"
                 "    try:\n"
                 '        ALERT_DAG_ARGS["deadline"] = [\n'
                 f"{deadlines}"
                 "        ]\n"
-                "    except (TypeError, ValueError) as exc:\n"
+                "    except Exception as exc:  # noqa: BLE001 - the API may change any way\n"
                 "        logging.getLogger(__name__).warning(\n"
                 '            "fluid: this Airflow refused the deadline alerts (%s); a missed SLA "\n'
                 '            "alerts no one",\n'

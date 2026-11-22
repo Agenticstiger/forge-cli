@@ -18,8 +18,8 @@ from fluid_build.alerts import (
     AlertRoute,
     AlertRouteError,
     contract_alert_findings,
-    default_alert_findings,
     notifier_calls,
+    plugin_alert_findings,
     read_alert_plan,
     reset_alert_plugin_cache,
 )
@@ -102,6 +102,13 @@ def _install(monkeypatch: pytest.MonkeyPatch, **groups: List[FakeEP]) -> None:
     reset_alert_plugin_cache()
 
 
+def _findings(contract: Dict[str, Any]) -> Any:
+    """Both of ``fluid validate``'s alert phases, as one ``(errors, warnings)``."""
+    c_errors, c_warnings = contract_alert_findings(contract)
+    p_errors, p_warnings = plugin_alert_findings(contract)
+    return c_errors + p_errors, c_warnings + p_warnings
+
+
 def _route(kind: str, **extra: Any) -> Dict[str, Any]:
     return {"name": "r", "kind": kind, "connection": "teams_hook", **extra}
 
@@ -133,19 +140,17 @@ class TestAKind:
         self, monkeypatch: pytest.MonkeyPatch, obj: Any
     ) -> None:
         _install(monkeypatch, kinds=[FakeEP("teams", obj)])
-        assert contract_alert_findings(_contract(_route("teams"))) == ([], [])
+        assert _findings(_contract(_route("teams"))) == ([], [])
 
     def test_the_kind_checks_its_route(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install(monkeypatch, kinds=[FakeEP("teams", TeamsKind)])
         route = {"name": "r", "kind": "teams"}
-        errors, _ = contract_alert_findings(_contract(route))
+        errors, _ = _findings(_contract(route))
         assert any("a teams route needs its webhook connection" in e for e in errors)
 
     def test_a_kind_without_async_warns_for_sla_miss(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install(monkeypatch, kinds=[FakeEP("teams", TeamsKind)])
-        errors, warnings = contract_alert_findings(
-            _contract(_route("teams", events=["sla_miss"]), sla="PT1H")
-        )
+        errors, warnings = _findings(_contract(_route("teams", events=["sla_miss"]), sla="PT1H"))
         assert errors == [] and any("Airflow 2 only" in w for w in warnings)
 
     @pytest.mark.parametrize(
@@ -158,7 +163,7 @@ class TestAKind:
         ep = FakeEP("teams", TeamsKind)
         _install(monkeypatch, kinds=[ep])
         monkeypatch.setenv(env, value)
-        errors, _ = contract_alert_findings(_contract(_route("teams")))
+        errors, _ = _findings(_contract(_route("teams")))
         assert any("FLUID_PLUGINS_ALLOWLIST / FLUID_PLUGINS_BLOCKLIST" in e for e in errors)
         assert ep.loads == 0
 
@@ -174,13 +179,13 @@ class TestAKind:
     ) -> None:
         a, b = FakeEP("teams", TeamsKind, "acme-a"), FakeEP("teams", TeamsKind, "acme-b")
         _install(monkeypatch, kinds=[a, b])
-        errors, _ = contract_alert_findings(_contract(_route("teams")))
+        errors, _ = _findings(_contract(_route("teams")))
         assert any("2 distributions ship it" in e for e in errors)
         assert a.loads == b.loads == 0
 
     def test_a_failing_import_names_the_type_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install(monkeypatch, kinds=[FakeEP("teams", RuntimeError("token=s3cr3t-value"))])
-        errors, _ = contract_alert_findings(_contract(_route("teams")))
+        errors, _ = _findings(_contract(_route("teams")))
         assert any("importing it raised RuntimeError" in e for e in errors)
         assert "s3cr3t" not in " ".join(errors)
 
@@ -210,7 +215,7 @@ class TestAKind:
     )
     def test_what_is_not_a_kind(self, monkeypatch: pytest.MonkeyPatch, bad: Any, why: str) -> None:
         _install(monkeypatch, kinds=[FakeEP("teams", bad)])
-        errors, _ = contract_alert_findings(_contract(_route("teams")))
+        errors, _ = _findings(_contract(_route("teams")))
         assert any("it is not an alert kind" in e and why in e for e in errors), errors
 
     @pytest.mark.parametrize(
@@ -229,9 +234,8 @@ class TestAKind:
     ) -> None:
         kind = type("K", (), {"notifier": "a.b:C", "kwargs": lambda s, r, a: kwargs})
         _install(monkeypatch, kinds=[FakeEP("teams", kind)])
-        plan = read_alert_plan(_contract(_route("teams")))
         with pytest.raises(AlertRouteError, match=why):
-            notifier_calls(plan, "failure", dag_id="d", product_id="p")
+            read_alert_plan(_contract(_route("teams")))
 
     def test_kwargs_that_raise_refuse_the_dag_by_type(
         self, monkeypatch: pytest.MonkeyPatch
@@ -242,9 +246,8 @@ class TestAKind:
         _install(
             monkeypatch, kinds=[FakeEP("teams", type("K", (), {"notifier": "a:B", "kwargs": boom}))]
         )
-        plan = read_alert_plan(_contract(_route("teams")))
         with pytest.raises(AlertRouteError, match="raised ValueError") as info:
-            notifier_calls(plan, "failure", dag_id="d", product_id="p")
+            read_alert_plan(_contract(_route("teams")))
         assert "abc" not in str(info.value)
 
     def test_a_notifier_class_named_like_a_dag_name_is_aliased(
@@ -296,7 +299,7 @@ class TestOrgDefaults:
         ep = FakeEP("acme", [self.ONCALL])
         _install(monkeypatch, defaults=[ep])
         assert read_alert_plan(_contract(defaults=False)).routes == ()
-        assert default_alert_findings(_contract(defaults=False)) == ([], [])
+        assert plugin_alert_findings(_contract(defaults=False)) == ([], [])
         assert ep.loads == 0
 
     def test_a_default_sla_miss_route_waits_for_the_contracts_sla(
@@ -305,7 +308,7 @@ class TestOrgDefaults:
         route = {**self.ONCALL, "events": ["failure", "sla_miss"]}
         _install(monkeypatch, defaults=[FakeEP("acme", [route])])
         assert contract_alert_findings({"id": "p"}) == ([], [])
-        assert default_alert_findings({"id": "p"}) == ([], [])
+        assert plugin_alert_findings({"id": "p"}) == ([], [])
         assert not read_alert_plan({"id": "p"}).listens("sla_miss")
         assert read_alert_plan(_contract(sla="PT1H")).listens("sla_miss")
 
@@ -321,7 +324,7 @@ class TestOrgDefaults:
         self, monkeypatch: pytest.MonkeyPatch, obj: Any, why: str
     ) -> None:
         _install(monkeypatch, defaults=[FakeEP("acme", obj)])
-        errors, _ = default_alert_findings({"id": "p"})
+        errors, _ = plugin_alert_findings({"id": "p"})
         assert any(why in e for e in errors), errors
         with pytest.raises(AlertRouteError, match="the alert routes cannot be rendered") as info:
             read_alert_plan({"id": "p"})
@@ -332,7 +335,7 @@ class TestOrgDefaults:
             monkeypatch,
             defaults=[FakeEP("acme", [self.ONCALL]), FakeEP("beta", [self.ONCALL], "beta-pack")],
         )
-        errors, _ = default_alert_findings({"id": "p"})
+        errors, _ = plugin_alert_findings({"id": "p"})
         assert any("is also one of the default alert routes 'acme'" in e for e in errors)
 
     def test_blocked_defaults_are_left_out(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -349,9 +352,81 @@ def test_a_check_that_returns_one_sentence(monkeypatch: pytest.MonkeyPatch) -> N
         {"notifier": "a:B", "kwargs": lambda s, r, a: {}, "check": lambda s, r: "needs a team"},
     )
     _install(monkeypatch, kinds=[FakeEP("teams", kind)])
-    errors, _ = contract_alert_findings(_contract(_route("teams")))
+    errors, _ = _findings(_contract(_route("teams")))
     assert errors == ["alerts.routes[0]: needs a team"]
 
 
 def test_a_route_hashes() -> None:
     assert hash(AlertRoute(name="r", kind="slack", options={"a": 1}))
+
+
+class TestValidateFindsWhatRenderRefuses:
+    """``fluid validate``'s two phases refuse what ``fluid generate schedule`` refuses."""
+
+    @pytest.mark.parametrize(
+        "kwargs, why",
+        [
+            ({"x": object()}, "is not a literal"),
+            ({"context": {}}, "which Airflow passes itself"),
+            ({"bad name": 1}, "not a Python identifier"),
+        ],
+    )
+    def test_a_plugin_kinds_kwargs_run_at_validate(
+        self, monkeypatch: pytest.MonkeyPatch, kwargs: Dict[str, Any], why: str
+    ) -> None:
+        kind = type("K", (), {"notifier": "a.b:C", "kwargs": lambda s, r, a: kwargs})
+        _install(monkeypatch, kinds=[FakeEP("teams", kind)])
+        errors, _ = plugin_alert_findings(_contract(_route("teams")))
+        assert any(why in e for e in errors), errors
+
+    def test_a_raising_kwargs_is_a_finding(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def boom(self: Any, route: Any, alert: Any) -> Dict[str, Any]:
+            raise RuntimeError("token=abc")
+
+        _install(
+            monkeypatch,
+            kinds=[FakeEP("teams", type("K", (), {"notifier": "a:B", "kwargs": boom}))],
+        )
+        errors, _ = plugin_alert_findings(_contract(_route("teams")))
+        assert any("raised RuntimeError" in e for e in errors) and "abc" not in str(errors)
+
+    def test_the_contract_phase_imports_no_plugin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ep = FakeEP("teams", TeamsKind)
+        _install(monkeypatch, kinds=[ep])
+        assert contract_alert_findings(_contract(_route("teams"))) == ([], [])
+        assert ep.loads == 0
+        assert plugin_alert_findings(_contract(_route("teams"))) == ([], [])
+        assert ep.loads == 1
+
+    def test_the_cap_counts_the_defaults_at_validate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        defaults = [{"name": f"d{i}", "kind": "slack"} for i in range(15)]
+        _install(monkeypatch, defaults=[FakeEP("acme", defaults)])
+        own = [{"name": f"r{i}", "kind": "slack"} for i in range(10)]
+        errors, _ = plugin_alert_findings(_contract(*own))
+        assert any("at most 20 alert routes, defaults included" in e for e in errors)
+
+    def test_a_pack_the_allowlist_leaves_out_is_named(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        ep = FakeEP("acme", [{"name": "oncall", "kind": "slack"}])
+        _install(monkeypatch, defaults=[ep])
+        monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "some_other_plugin")
+        errors, warnings = plugin_alert_findings({"id": "p"})
+        assert errors == [] and any("'acme' are installed, but" in w for w in warnings)
+        with caplog.at_level("WARNING", logger="fluid.alerts"):
+            assert read_alert_plan({"id": "p"}).routes == ()
+        assert any("alert_defaults_left_out" in r.getMessage() for r in caplog.records)
+        assert ep.loads == 0
+
+    def test_a_kwarg_named_like_the_helpers_parameter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        kind = type(
+            "K", (), {"notifier": "acme.n:N", "kwargs": lambda s, r, a: {"notifier": "teams"}}
+        )
+        _install(monkeypatch, kinds=[FakeEP("teams", kind)])
+        rendered = render_alerts(
+            read_alert_plan(_contract(_route("teams"))), dag_id="d", product_id="p"
+        )
+        assert "def alert(notifier, /, **kwargs):" in rendered.definitions
+        assert "notifier='teams'" in rendered.definitions

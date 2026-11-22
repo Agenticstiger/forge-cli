@@ -179,3 +179,15 @@ class TestGenerateSchedule:
         output = run.stdout + run.stderr
         assert "alerts.routes[0].connection" in output and PASTED not in output
         assert not list((tmp_path / "out").glob("*.py"))
+
+
+def test_a_secret_pasted_into_to_is_not_echoed_in_json(tmp_path: Path) -> None:
+    pasted = "ops:" + "Hunter2Secret" + "@mail.corp.example"
+    routes = [{"name": "team", "kind": "email", "to": [pasted], "events": ["failure", "bad"]}]
+    contract = _validate_contract(tmp_path, {"routes": routes})
+    run = _fluid(tmp_path, "validate", str(contract), "--offline", "--format", "json")
+    assert run.returncode == 1
+    assert "Hunter2Secret" not in run.stdout + run.stderr
+    report = json.loads(run.stdout[run.stdout.index("{") :])
+    pointers = {i["pointer"] for i in report["issues"] if i["code"] == "ERR_CONTRACT_ALERTS"}
+    assert {"/alerts/routes/0/to", "/alerts/routes/0/events"} <= pointers

@@ -8,7 +8,7 @@ Where it fits in the pipeline:
 * the contract declares the routes (``alerts.routes``) and the SLA (``alerts.sla``); an
   organisation's pack adds default routes through ``fluid_build.alert_defaults``;
 * ``fluid validate`` checks them (:func:`contract_alert_findings`, and in its plugin phase
-  :func:`default_alert_findings`);
+  :func:`plugin_alert_findings`);
 * ``fluid generate schedule`` (and ``fluid generate artifacts``) writes them into each DAG as
   Airflow's own notifiers on the DAG's callbacks: the DAG is the artifact ``fluid
   schedule-sync`` deploys, never edited by hand;
@@ -35,8 +35,8 @@ from fluid_build.alerts.plugins import DEFAULTS_GROUP, NOTIFIER_GROUP, reset_ale
 from fluid_build.alerts.routes import (
     AlertPlan,
     contract_alert_findings,
-    default_alert_findings,
     notifier_calls,
+    plugin_alert_findings,
     read_alert_plan,
 )
 
@@ -54,8 +54,8 @@ __all__ = [
     "NotifierCall",
     "SEVERITIES",
     "contract_alert_findings",
-    "default_alert_findings",
     "notifier_calls",
+    "plugin_alert_findings",
     "read_alert_plan",
     "reset_alert_plugin_cache",
 ]

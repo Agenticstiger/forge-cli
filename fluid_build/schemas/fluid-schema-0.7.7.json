@@ -6474,8 +6474,8 @@
       "properties": {
         "sla": {
           "type": "string",
-          "pattern": "^P(?=\\d|T\\d)(\\d+W)?(\\d+D)?(T(?=\\d)(\\d+H)?(\\d+M)?(\\d+S)?)?$",
-          "description": "How long a run may take before its sla_miss routes alert, as an ISO-8601 duration in weeks, days, hours, minutes and seconds (PT4H, P1DT6H), at most P30D. On Airflow 2 it is every task's sla; on Airflow 3.1+, which has no SLAs, a deadline alert that long after the run was queued."
+          "pattern": "^P(?=\\d|T\\d)(\\d{1,7}W)?(\\d{1,7}D)?(T(?=\\d)(\\d{1,7}H)?(\\d{1,7}M)?(\\d{1,7}S)?)?$",
+          "description": "How long a run may take before its sla_miss routes alert, as an ISO-8601 duration in weeks, days, hours, minutes and seconds (PT4H, P1DT6H), at most P30D. On Airflow 2 it is every task's sla, measured from the end of the run's data interval (its scheduled start); on Airflow 3.1+, which has no SLAs, a deadline alert that long after the run was queued."
         },
         "defaults": {
           "type": "boolean",

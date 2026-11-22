@@ -7,44 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **`fluid apply` no longer updates a live Iceberg table in place.** hashicorp/aws updates an
-  `aws_glue_catalog_table` with an `UpdateTable` that carries no `VersionId`, after re-reading
-  the table's `metadata_location`, so a commit an Iceberg writer made during the apply could be
-  reverted, and its data dropped from the table. A contract change or drift that would update a
-  live Iceberg Glue table in place now leaves it as it is, whatever brought the table into the
-  plan (a table the state holds, one a fresh state re-attaches, one `--adopt-tables` adopts): the
-  plan is made again with the table's description, owner, retention and storage descriptor left
-  alone, and must leave it with no change. The run prints what the contract wanted and how to
-  apply it, and logs it at WARNING (`iceberg_table_update_held`). `--allow-iceberg-update` on
-  `fluid apply`, `fluid plan --tofu` and `fluid ship` makes the update, audited at WARNING
-  (`iceberg_table_update_accepted`); `fluid plan --tofu` records those tables in
-  `opentofuPlan.icebergUpdates`, under `planDigest`, and `fluid apply plan.json` updates only
-  them. Under `--no-verify-plan-binding` nothing binds that record to the reviewed plan, so it is
-  ignored (logged at WARNING as `iceberg_table_update_record_ignored`), and only the apply's own
-  `--allow-iceberg-update` lets such an update through. Any other in-place update of a live
-  Iceberg table left in a plan is refused
-  (`iceberg_table_update_in_place`), and `fluid plan --allow-iceberg-update` needs `--tofu`
-  (`plan_allow_iceberg_update_needs_tofu`). Hive tables keep their in-place updates, and a
-  replace stays with the data-loss gate.
-
-### Upgrade notes
-
-- A contract change to a live Iceberg table's description, column comments or columns no longer
-  reaches Glue through `fluid apply`, Command Center's included: the table is left as it is, and
-  the run prints what waits. To apply it, change the table through its Iceberg catalog (for
-  example `ALTER TABLE ... SET TBLPROPERTIES ('comment' = '...')` or `ALTER TABLE ... ALTER
-  COLUMN ... COMMENT '...'` in Spark), whose commit writes Glue with the version it read; or pause
-  the table's writers and run `fluid apply --allow-iceberg-update` once. A table whose Iceberg
-  schema changed outside the contract (a column a writer added, or a dropped one Iceberg keeps
-  listing) gets the note on every apply while the two differ. A saved plan made before this
-  release that updates a live Iceberg table in place is refused by `fluid apply plan.json`: make
-  the plan again. On AWS, a plan that `tofu show -json` cannot read back is now refused when it
-  changes anything in place, even with `--allow-data-loss`: make the plan again.
-
-## [0.37.0] — 2026-11-22
-
 ### Added
 
 - **The Airflow DAGs forge generates alert on failure, retry, success and a missed SLA, through
@@ -77,10 +39,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name and loaded only when a route names the kind, under `FLUID_PLUGINS_ALLOWLIST` /
   `FLUID_PLUGINS_BLOCKLIST`, a built-in name reserved, two distributions of one name both refused,
   and a missing or failing kind refusing the route (by exception type only) rather than leaving it
-  out. `fluid plugins` lists both groups without importing them. Checked live: the generated DAGs
-  sent each route's alert on Airflow 2.10.5 and 3.4.0 (`dag.test()` for failure, retry and
-  success; the SLA miss and the deadline alert as Airflow calls them). New validate checks
-  `contract_alerts` and `contract_alert_defaults`.
+  out. `fluid plugins` lists both groups without importing them. An installed pack the
+  allow/block policy leaves out is named, never dropped silently. Airflow 2.6 gets no SLA wiring
+  (its `BaseNotifier` takes one argument, not `sla_miss_callback`'s five). Checked live: the
+  generated DAGs sent each route's alert on Airflow 2.10.5 and 3.4.0 (`dag.test()` for failure,
+  retry and success; the SLA miss and the deadline alert as Airflow calls them). New validate checks
+  `contract_alerts` and, in the plugin phase, `contract_alert_plugins`.
+
+### Fixed
+
+- **`fluid apply` no longer updates a live Iceberg table in place.** hashicorp/aws updates an
+  `aws_glue_catalog_table` with an `UpdateTable` that carries no `VersionId`, after re-reading
+  the table's `metadata_location`, so a commit an Iceberg writer made during the apply could be
+  reverted, and its data dropped from the table. A contract change or drift that would update a
+  live Iceberg Glue table in place now leaves it as it is, whatever brought the table into the
+  plan (a table the state holds, one a fresh state re-attaches, one `--adopt-tables` adopts): the
+  plan is made again with the table's description, owner, retention and storage descriptor left
+  alone, and must leave it with no change. The run prints what the contract wanted and how to
+  apply it, and logs it at WARNING (`iceberg_table_update_held`). `--allow-iceberg-update` on
+  `fluid apply`, `fluid plan --tofu` and `fluid ship` makes the update, audited at WARNING
+  (`iceberg_table_update_accepted`); `fluid plan --tofu` records those tables in
+  `opentofuPlan.icebergUpdates`, under `planDigest`, and `fluid apply plan.json` updates only
+  them. Under `--no-verify-plan-binding` nothing binds that record to the reviewed plan, so it is
+  ignored (logged at WARNING as `iceberg_table_update_record_ignored`), and only the apply's own
+  `--allow-iceberg-update` lets such an update through. Any other in-place update of a live
+  Iceberg table left in a plan is refused
+  (`iceberg_table_update_in_place`), and `fluid plan --allow-iceberg-update` needs `--tofu`
+  (`plan_allow_iceberg_update_needs_tofu`). Hive tables keep their in-place updates, and a
+  replace stays with the data-loss gate.
+
+### Security
+
+- **Both redaction layers mask the secrets of an alert route's connection**: Zenduty Generic
+  Integration and events-API URLs and PagerDuty integration URLs (US and EU), whose paths hold the
+  key, Opsgenie's `GenieKey` header value, and PagerDuty's `routing_key` / `integration_key` by
+  name, in `observability/secret_redactor.py` and the Snowflake provider's `redact_string`. The
+  Snowflake twin checks `GenieKey` before its `authorization=` rule, which would otherwise take the
+  word for the value and leave the key.
+
+### Upgrade notes
+
+- A contract change to a live Iceberg table's description, column comments or columns no longer
+  reaches Glue through `fluid apply`, Command Center's included: the table is left as it is, and
+  the run prints what waits. To apply it, change the table through its Iceberg catalog (for
+  example `ALTER TABLE ... SET TBLPROPERTIES ('comment' = '...')` or `ALTER TABLE ... ALTER
+  COLUMN ... COMMENT '...'` in Spark), whose commit writes Glue with the version it read; or pause
+  the table's writers and run `fluid apply --allow-iceberg-update` once. A table whose Iceberg
+  schema changed outside the contract (a column a writer added, or a dropped one Iceberg keeps
+  listing) gets the note on every apply while the two differ. A saved plan made before this
+  release that updates a live Iceberg table in place is refused by `fluid apply plan.json`: make
+  the plan again. On AWS, a plan that `tofu show -json` cannot read back is now refused when it
+  changes anything in place, even with `--allow-data-loss`: make the plan again.
+
+## [0.37.0] — 2026-11-22
+
+### Added
 
 - **`fluid import airflow|pyspark` reads an estate whose code builds its commands in loops, picks
   its jobs by name, takes its environment from Airflow Variables, and groups its products by DAG
@@ -789,13 +802,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   type family, so a contract written that way does not fail at apply.
 
 ### Security
-
-- **Both redaction layers mask the secrets of an alert route's connection**: Zenduty Generic
-  Integration and events-API URLs and PagerDuty integration URLs (US and EU), whose paths hold the
-  key, Opsgenie's `GenieKey` header value, and PagerDuty's `routing_key` / `integration_key` by
-  name, in `observability/secret_redactor.py` and the Snowflake provider's `redact_string`. The
-  Snowflake twin checks `GenieKey` before its `authorization=` rule, which would otherwise take the
-  word for the value and leave the key.
 
 - An address with an IPv6 zone id, such as `::1%lo0`, is no longer read as this machine. The
   secret destination policy judges it like any other host, and an OpenBao or Vault address on

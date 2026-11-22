@@ -67,8 +67,9 @@ def _module(name: str, **attrs: Any) -> types.ModuleType:
 
 
 def _load(source: str, monkeypatch: pytest.MonkeyPatch, airflow: str) -> Loaded:
-    """Import ``source`` against stub modules of Airflow ``airflow`` ("2.10.5", "3.0.6",
-    "3.1.0", "3.4.0" or "3.9.0-changed", whose DeadlineAlert refuses what it is given)."""
+    """Import ``source`` against stub modules of Airflow ``airflow`` ("2.6.3", "2.10.5",
+    "3.0.6", "3.1.0", "3.4.0", "3.9.0-changed", whose DeadlineAlert refuses what it is given,
+    or "3.9.0-renamed", whose DeadlineReference lacks DAGRUN_QUEUED_AT)."""
     loaded = Loaded()
 
     class _DAG:
@@ -148,6 +149,9 @@ def _load(source: str, monkeypatch: pytest.MonkeyPatch, airflow: str) -> Loaded:
 
         class _Reference:
             DAGRUN_QUEUED_AT = "DAGRUN_QUEUED_AT"
+
+        if airflow.endswith("-renamed"):
+            _Reference = type("_Reference", (), {})  # noqa: N806 - a renamed reference
 
         def _deadline(**kwargs: Any) -> Dict[str, Any]:
             if airflow.endswith("-changed"):
@@ -358,3 +362,41 @@ class TestTheOrchestrationDag:
         cb({"ti": "t"})
         assert loaded.notifiers[-1].kwargs["slack_webhook_conn_id"] == "slack_default"
         assert loaded.dag["dag_id"] == "ops_generic"
+
+
+class TestWhatTheScanFound:
+    """Regressions for what a review of this change found."""
+
+    def test_a_task_named_copy_does_not_break_the_alerts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        contract = {
+            "id": "ops.generic",
+            "name": "Generic",
+            "orchestration": {
+                "tasks": [{"taskId": "copy", "type": "provider_action", "action": "noop"}]
+            },
+            "alerts": {"routes": [{"name": "chat", "kind": "slack"}]},
+        }
+        source = render_dag(contract, allow_unmapped=True)
+        assert "\ncopy = " in source  # the task took the module's name
+        loaded = _load(source, monkeypatch, "3.4.0")
+        (callback,) = loaded.dag["default_args"]["on_failure_callback"]
+        callback({"ti": "t"})
+        assert type(loaded.notifiers[-1]).__name__ == "SlackWebhookNotifier"
+
+    def test_airflow_2_6_gets_no_sla_its_notifiers_cannot_take(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        loaded = _load(_all_kinds_dag(), monkeypatch, "2.6.3")
+        assert "sla" not in loaded.dag["default_args"]
+        assert "sla_miss_callback" not in loaded.dag and "deadline" not in loaded.dag
+        assert len(loaded.dag["default_args"]["on_failure_callback"]) == 5
+
+    def test_any_error_of_the_deadline_api_costs_only_the_deadline(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="generated_dag"):
+            loaded = _load(_all_kinds_dag(), monkeypatch, "3.9.0-renamed")
+        assert loaded.dag["dag_id"] and "deadline" not in loaded.dag
+        assert any("(AttributeError)" in r.message for r in caplog.records)

@@ -18,6 +18,7 @@ import pytest
 from fluid_build.alerts import (
     AlertRouteError,
     contract_alert_findings,
+    plugin_alert_findings,
     read_alert_plan,
     reset_alert_plugin_cache,
 )
@@ -151,7 +152,8 @@ class TestRefusals:
         errors = _errors(
             _contract([{"name": "x", "kind": "webhook", "connection": "c", "format": "teams"}])
         )
-        assert any("format 'teams' is not one of generic, zenduty, opsgenie" in e for e in errors)
+        assert any("format must be one of generic, zenduty, opsgenie" in e for e in errors)
+        assert "teams" not in " ".join(errors)
         errors = _errors(_contract([{"name": "x", "kind": "slack", "format": "zenduty"}]))
         assert any("format is read by a webhook route only" in e for e in errors)
 
@@ -215,7 +217,9 @@ class TestRefusals:
         assert any("alerts.routes[0].kind must name a kind" in e for e in errors)
 
     def test_a_kind_nothing_serves_is_refused_with_where_to_get_one(self) -> None:
-        errors = _errors(_contract([{"name": "x", "kind": "teams", "connection": "c"}]))
+        contract = _contract([{"name": "x", "kind": "teams", "connection": "c"}])
+        assert _errors(contract) == []  # the contract phase runs no plugin
+        errors = plugin_alert_findings(contract)[0]
         assert any(
             "no alert kind 'teams' can be used" in e and "fluid_build.alert_notifiers" in e
             for e in errors
@@ -223,7 +227,7 @@ class TestRefusals:
 
     def test_at_most_max_routes(self) -> None:
         routes = [{"name": f"r{i}", "kind": "slack"} for i in range(MAX_ROUTES + 1)]
-        with pytest.raises(AlertRouteError, match=f"at most {MAX_ROUTES} alert routes"):
+        with pytest.raises(AlertRouteError, match=f"more than {MAX_ROUTES} routes"):
             read_alert_plan(_contract(routes))
 
     def test_a_block_that_is_not_a_mapping(self) -> None:
@@ -295,3 +299,35 @@ def test_the_schema_matches_the_route_grammar() -> None:
     assert route["kind"]["pattern"] == "^" + routes._KIND.pattern[:-2] + "$"
     assert set(route["events"]["items"]["enum"]) == set(routes.EVENTS)
     assert schema["properties"]["alerts"]["$ref"] == "#/$defs/alerts"
+
+
+class TestWhatTheScanFound:
+    """Regressions for what a review of this change found."""
+
+    def test_an_sla_of_huge_digits_is_a_finding_not_a_crash(self) -> None:
+        contract = _contract([], sla="PT" + "9" * 5000 + "S")
+        assert any("alerts.sla must be an ISO-8601 duration" in e for e in _errors(contract))
+        assert parse_duration("PT" + "9" * 8 + "S") is None
+
+    @pytest.mark.parametrize(
+        "fmt",
+        ["ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789", "0f8fad5b-d9cb-469f-a165-70867728950e"],
+    )
+    def test_a_format_is_never_echoed(self, fmt: str) -> None:
+        route = {"name": "w", "kind": "webhook", "connection": "x", "format": fmt}
+        errors = _errors(_contract([route]))
+        assert errors and fmt not in " ".join(errors)
+        with pytest.raises(AlertRouteError) as info:
+            read_alert_plan(_contract([route]))
+        assert fmt not in str(info.value)
+
+    @pytest.mark.parametrize("field", ["name", "kind"])
+    def test_a_name_or_kind_shaped_like_a_secret(self, field: str) -> None:
+        token = "xox" + "b-1111111111-abcdefghij"
+        route = {"name": "w", "kind": "slack", field: token}
+        errors = _errors(_contract([route]))
+        assert any(f".{field} must" in e for e in errors) and token not in " ".join(errors)
+
+    def test_more_routes_than_the_cap_in_the_contract_alone(self) -> None:
+        routes = [{"name": f"r{i}", "kind": "slack"} for i in range(MAX_ROUTES + 1)]
+        assert any(f"more than {MAX_ROUTES} routes" in e for e in _errors(_contract(routes)))
