@@ -79,7 +79,15 @@ SCHEDULE_SYNC_REPORT = "runtime/schedule-sync-report.json"
 
 #: The ``generate artifacts --emit`` keys ``--require-artifacts`` accepts, in
 #: that command's canonical order (``artifact_fanout.EMIT_KEYS``).
-REQUIRABLE_ARTIFACTS: Tuple[str, ...] = ("odps-bitol", "odcs", "opds", "schedule", "policies")
+REQUIRABLE_ARTIFACTS: Tuple[str, ...] = (
+    "odps-bitol",
+    "odcs",
+    "opds",
+    "schedule",
+    "policies",
+    "pyspark-schema",
+    "custom-scaffold",
+)
 
 
 class ShipUsageError(Exception):
@@ -526,10 +534,13 @@ def _quiet_probe() -> Iterator[None]:
 
 
 def emits(opts: ShipOptions, key: str) -> bool:
-    """Whether stage 3's ``--emit`` (blank: every emitter) includes ``key``.
+    """Whether stage 3's ``--emit`` (blank: ``generate artifacts``' default set, every
+    key but ``pyspark-schema`` and ``custom-scaffold``) includes ``key``.
     ``odps`` is ``generate artifacts``' deprecated spelling of ``opds``."""
     if not opts.emit.strip():
-        return True
+        from fluid_build.forge.core.artifact_fanout import DEFAULT_EMIT
+
+        return key in DEFAULT_EMIT
     parts = {part.strip() for part in opts.emit.split(",")}
     return key in {"opds" if p == "odps" else p for p in parts}
 
@@ -864,8 +875,13 @@ def check_required_artifacts(
         )
     left_out = [k for k in opts.require_artifacts if not emits(opts, k)]
     if left_out:
+        where = (
+            f"--emit {opts.emit}"
+            if opts.emit.strip()
+            else "stage 3's default --emit set (name it in --emit)"
+        )
         raise ShipUsageError(
-            f"--require-artifacts {','.join(left_out)} is not in --emit {opts.emit}: "
+            f"--require-artifacts {','.join(left_out)} is not in {where}: "
             "stage 3 would not write it"
         )
 
@@ -990,6 +1006,12 @@ def _key_problems(key: str, root: Path, files: Mapping[str, object]) -> List[str
     if key == "policies":
         why = listed_file_problem(root, files, "policy/bindings.json")
         return [f"policies: {POLICY_BINDINGS} {why}"] if why else []
+    if key == "pyspark-schema":
+        module = _top_level("pyspark-schema", "_schema.py")
+        return _one_or_more(root, files, key, "PySpark schema module (pyspark-schema/*.py)", module)
+    if key == "custom-scaffold":
+        what = "custom-scaffold file (the contract declares no extensions.customScaffold)"
+        return _one_or_more(root, files, key, what, lambda rel: rel.startswith("custom-scaffold/"))
     what = (
         "schedule file (orchestration.engine is none, or it is unset and no build has a "
         "schedule trigger)"

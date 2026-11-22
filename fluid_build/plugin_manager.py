@@ -80,15 +80,17 @@ EXTRA_GROUPS: Dict[str, str] = {
 #: declared and governed, but nothing ever walks the group to run a plugin.
 #:
 #: ``fluid plugins`` is an operator inspection/security surface, so it must not
-#: render an inert plugin the same way it renders an active one. Listing
-#: ``custom_scaffold`` as plain "allowed" told operators a plugin was live when
-#: no code path — across validate / plan / apply / publish / forge / providers —
-#: ever imported it. Removing the role instead would drop the allow/block
-#: governance and the audit visibility, so it stays listed and says what it is.
+#: render an inert plugin the same way it renders an active one. A role listed
+#: here is shown as not dispatched; removing the role instead would drop the
+#: allow/block governance and the audit visibility.
 #:
-#: Wire a dispatch site (the way ``iac_provider`` is wired in
-#: ``iac/registry.py``) and delete the entry in the same change.
-UNDISPATCHED_GROUPS: frozenset = frozenset({"custom_scaffold"})
+#: Empty in this build. ``custom_scaffold`` was listed until ``fluid generate
+#: artifacts`` (emit key ``custom-scaffold``) started running the custom-scaffold
+#: engine, whose ``entrypoint`` bundles are the plugins of that group; the stage
+#: checks each one against this module's policy first
+#: (``forge/core/custom_scaffold_artifacts.py``). A new role without a dispatch
+#: site goes here until it has one.
+UNDISPATCHED_GROUPS: frozenset = frozenset()
 
 
 def is_dispatched(group_key: str) -> bool:
