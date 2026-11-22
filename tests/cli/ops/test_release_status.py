@@ -144,13 +144,15 @@ def test_a_release_reached_by_two_spellings_of_one_root_is_listed_once(
     assert len(found.releases) == 3 and found.skipped == {}
 
 
+@pytest.mark.parametrize("long_root", [False, True])
 def test_the_same_release_sealed_in_one_second_in_two_roots_is_ordered_by_path_not_by_root(
-    tmp_path,
+    tmp_path, long_root
 ):
+    top = _deep(tmp_path) if long_root else tmp_path  # a long one is cut where it is shown
     sealed = "2026-11-18T09:12:03+00:00"
-    seal(tmp_path / "b", "x", sealed=sealed, run_id="from-b")
-    seal(tmp_path / "a", "y", sealed=sealed, run_id="from-a")
-    found = rs.find_releases([str(tmp_path / "b"), str(tmp_path / "a")], PRODUCT)
+    seal(top / "b", "x", sealed=sealed, run_id="from-b")
+    seal(top / "a", "y", sealed=sealed, run_id="from-a")
+    found = rs.find_releases([str(top / "b"), str(top / "a")], PRODUCT)
     assert [r.run_id for r in found.releases] == ["from-a", "from-b"]  # one identity digest
 
 
@@ -569,15 +571,6 @@ def test_under_a_long_root_each_release_shows_the_end_of_its_path(tmp_path):
     assert [r.expose_versions["orders"] for r in found.releases] == ["1.0.0", "1.1.0"]
     assert paths[0].endswith(f"{os.sep}a") and paths[1].endswith(f"{os.sep}b"), paths
     assert all(p.startswith("...") and len(p) <= 200 for p in paths)
-
-
-def test_under_a_long_root_two_roots_still_order_by_path(tmp_path):
-    root = _deep(tmp_path)
-    sealed = "2026-11-18T09:12:03+00:00"
-    seal(root / "b", "x", sealed=sealed, run_id="from-b")
-    seal(root / "a", "y", sealed=sealed, run_id="from-a")
-    found = rs.find_releases([str(root / "b"), str(root / "a")], PRODUCT)
-    assert [r.run_id for r in found.releases] == ["from-a", "from-b"]
 
 
 def test_a_newer_record_that_is_not_intact_never_wins_over_an_older_intact_one(releases):

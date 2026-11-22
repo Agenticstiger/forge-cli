@@ -46,23 +46,15 @@ NOT_AUTHENTICATED = (
 )
 
 
-def _printable(value: Any) -> str:
+def clean(value: Any, limit: int = _TEXT, *, keep_end: bool = False) -> str:
     """``value`` as text with every non-printable character (a control character, a bidirectional
-    mark, a line separator) replaced by ``?``."""
-    return "".join(ch if ch.isprintable() else "?" for ch in str(value))
-
-
-def clean(value: Any, limit: int = _TEXT) -> str:
-    """``value`` as printable text (:func:`_printable`), cut at ``limit``."""
-    text = _printable(value)
-    return text if len(text) <= limit else text[: limit - 3] + "..."
-
-
-def clean_path(value: Any, limit: int = _TEXT) -> str:
-    """A path as printable text, cut from its start: its end names the release's directory, so
-    two releases under one long root never look alike."""
-    text = _printable(value)
-    return text if len(text) <= limit else "..." + text[len(text) - limit + 3 :]
+    mark, a line separator) replaced by ``?``, and cut at ``limit``: its end kept for a path
+    (``keep_end``), which names the release's directory, so two releases under one long root
+    never look alike."""
+    text = "".join(ch if ch.isprintable() else "?" for ch in str(value))
+    if len(text) <= limit:
+        return text
+    return "..." + text[len(text) - limit + 3 :] if keep_end else text[: limit - 3] + "..."
 
 
 @dataclass
@@ -202,7 +194,7 @@ def _release(shown: str, index: Mapping[str, Any]) -> Optional[Release]:
         if key in ("revision", "repository", "ref") and isinstance(value, str)
     }
     return Release(
-        path=clean_path(shown),
+        path=clean(shown, keep_end=True),
         product_id=clean(product, 120),
         sealed_at=sealed,
         release_id=clean(digest, 80),
