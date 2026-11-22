@@ -646,24 +646,34 @@ class _Reader:
                     return earlier + links, root
         return links, current
 
-    def _assignments(self, name: ast.Name) -> Optional[Tuple[Any, List[ast.expr]]]:
-        """The scope that holds ``name`` and every assignment of it, by position, when it is
-        assigned more than once and only by plain assignments, else ``None``."""
+    def _binding(self, name: ast.Name) -> Optional[Tuple[Any, str]]:
+        """The scope that binds ``name`` where it is used, and how: ``"values"`` (assigned once) or
+        ``"assignments"`` (more than once, by plain assignments only). ``None`` when the file
+        changes the name some other way (``global``, ``:=``, a match capture, ``del``), makes it a
+        function, a class or a recipe, or does not bind it."""
         if self.folder.rebound(name.id):
             return None
         current: Optional[Any] = self.folder.scope_of(name)
         while current is not None:
-            if name.id in current.assignments:
-                return current, current.assignments[name.id]
+            for how in ("values", "assignments"):
+                if name.id in getattr(current, how):
+                    return current, how
             if (
-                name.id in current.values
-                or name.id in current.blocked
+                name.id in current.blocked
                 or name.id in current.classes
                 or name.id in current.recipes
             ):
                 return None
             current = current.parent
         return None
+
+    def _assignments(self, name: ast.Name) -> Optional[Tuple[Any, List[ast.expr]]]:
+        """The scope that holds ``name`` and every assignment of it, by position, when it is
+        assigned more than once and only by plain assignments, else ``None``."""
+        found = self._binding(name)
+        if found is None or found[1] != "assignments":
+            return None
+        return found[0], found[0].assignments[name.id]
 
     def _extended(self, name: ast.Name, depth: int) -> Optional[Tuple[List[_Link], ast.AST]]:
         """The chain a variable assigned more than once holds at ``name``, when the first
@@ -814,21 +824,11 @@ class _Reader:
         return False
 
     def _bound_expression(self, name: ast.Name) -> Optional[ast.expr]:
-        if self.folder.rebound(name.id):  # ``global``, ``:=``, a match capture, ``del``...
+        """What ``name`` is assigned, when it is assigned once and nothing else changes it."""
+        found = self._binding(name)
+        if found is None or found[1] != "values":
             return None
-        scope = self.folder.scope_of(name)
-        current: Optional[Any] = scope
-        while current is not None:
-            if name.id in current.values:
-                return current.values[name.id]
-            if (
-                name.id in current.blocked
-                or name.id in current.classes
-                or name.id in current.recipes
-            ):
-                return None
-            current = current.parent
-        return None
+        return found[0].values[name.id]
 
     @staticmethod
     def _marker(links: Sequence[_Link]) -> Optional[int]:
