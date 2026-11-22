@@ -73,7 +73,7 @@ def foreign_tables(
     ``--adopt-tables`` is for.
 
     A table that carries forge's own marker for this contract (``table_made_by_forge``: on
-    AWS the Glue parameters ``managed_by: fluid`` and the recorded contract its module
+    AWS the Glue parameters ``managed_by: fluid`` and ``fluid_product_id`` its module
     sets when it creates the table, kept by ``ignore_changes``) is this product's, met
     again because its state was lost or kept nowhere (a fresh workspace on every run). It
     is re-attached as before, without the flag and without the check, so such a run can

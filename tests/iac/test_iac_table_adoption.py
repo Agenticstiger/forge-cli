@@ -671,14 +671,21 @@ def test_the_rendered_import_block_carries_only_its_address_and_id():
 @pytest.mark.parametrize(
     "parameters, made",
     [
-        ({"managed_by": "fluid", "classification": "iceberg"}, True),
-        ({"managed_by": " Fluid "}, True),
-        ({"managed_by": "airflow"}, False),
+        ({"managed_by": "fluid", "fluid_product_id": "sales.orders"}, True),
+        ({"managed_by": " Fluid ", "fluid_product_id": "sales.orders"}, True),
+        ({"managed_by": "fluid", "classification": "iceberg"}, False),
+        ({"managed_by": " Fluid "}, False),
+        ({"managed_by": "fluid", "fluid_product_id": "billing.invoices"}, False),
+        ({"managed_by": "fluid", "fluid_product_id": "Sales.Orders"}, False),
+        ({"managed_by": "fluid", "fluid_product_id": ""}, False),
+        ({"managed_by": "airflow", "fluid_product_id": "sales.orders"}, False),
+        ({"fluid_product_id": "sales.orders"}, False),
         ({"classification": "parquet"}, False),
         (None, False),
     ],
 )
-def test_a_table_is_forge_made_only_with_forge_s_marker(parameters, made):
+def test_a_table_is_forge_made_only_with_forge_s_marker_and_this_product_s_id(parameters, made):
+    """The marker alone is not enough: a table with no product id may be any product's."""
     values = {} if parameters is None else {"parameters": parameters}
 
     assert get_iac_plugin("aws").table_made_by_forge(values, {"id": "sales.orders"}) is made
@@ -691,12 +698,64 @@ def test_a_table_is_forge_made_only_with_forge_s_marker(parameters, made):
         ("id: 'sales.orders'\nexposes:\n- id: other\n", True),
         ("fluidVersion: 0.7.7\nid: billing.invoices\n", False),
         ("description: |\n  id: sales.orders\nid: billing.invoices\n", False),
-        ("fluidVersion: 0.7.7\n", True),
+        ("fluidVersion: 0.7.7\n", False),
+        ('{"id": "sales.orders", "name": "Orders"}', False),
+        ("id:\nname: Orders\n", False),
+        ("id: ''\nname: Orders\n", False),
+        ("metadata:\n  id: sales.orders\n", False),
+        ("", False),
     ],
 )
-def test_a_forge_made_table_belongs_to_the_product_its_recorded_contract_names(recorded, made):
-    """Forge records the contract a table was made from; another product's table is not
-    this contract's to re-attach, and a record without an id leaves the marker alone."""
+def test_a_table_made_before_the_product_id_belongs_to_the_product_its_record_names(recorded, made):
+    """A table forge made before it set ``fluid_product_id`` is matched by the id of the
+    contract it records. A record that names another id, or none it can read (JSON, an
+    empty or indented id, no id line at all), is not this product's."""
     values = {"parameters": {"managed_by": "fluid", "fluid_contract": recorded}}
 
     assert get_iac_plugin("aws").table_made_by_forge(values, {"id": "sales.orders"}) is made
+
+
+@pytest.mark.parametrize(
+    "product_id, recorded, made",
+    [
+        ("sales.orders", "id: billing.invoices\n", True),
+        ("billing.invoices", "id: sales.orders\n", False),
+        ("", "id: sales.orders\n", False),
+    ],
+)
+def test_the_product_id_parameter_decides_before_the_recorded_contract(product_id, recorded, made):
+    """The record is read only for a table without ``fluid_product_id``."""
+    parameters = {
+        "managed_by": "fluid",
+        "fluid_product_id": product_id,
+        "fluid_contract": recorded,
+    }
+
+    made_by_forge = get_iac_plugin("aws").table_made_by_forge(
+        {"parameters": parameters}, {"id": "sales.orders"}
+    )
+
+    assert made_by_forge is made
+
+
+def test_a_contract_without_an_id_makes_no_table_its_own():
+    parameters = {"managed_by": "fluid", "fluid_product_id": "", "fluid_contract": "name: x\n"}
+
+    assert get_iac_plugin("aws").table_made_by_forge({"parameters": parameters}, {}) is False
+
+
+@pytest.mark.parametrize("notes", ["", "n" * 60_000])
+def test_every_glue_table_forge_makes_names_its_product_whatever_the_contract_s_size(notes):
+    """The record of the contract is dropped over 50 KB; the product id never is."""
+    contract = _contract(ICEBERG_BINDING, PARQUET_BINDING)
+    if notes:
+        contract["metadata"] = {"notes": notes}
+
+    tables = get_iac_plugin("aws").emit(contract)["aws_glue_catalog_table"]
+
+    assert {key: body["parameters"]["fluid_product_id"] for key, body in tables.items()} == {
+        "sales_orders_sales_orders": "sales.orders",
+        "sales_orders_sales_refunds": "sales.orders",
+    }
+    recorded = ["fluid_contract" in body["parameters"] for body in tables.values()]
+    assert recorded == [not notes, not notes]

@@ -209,6 +209,11 @@ def _resolve_catalog_id() -> str:
 
 _CATALOG_ID_CACHE: Dict[str, str] = {}
 
+#: The Glue table parameter naming the product a table was made for. :func:`_emit_glue`
+#: sets it on every table it creates, whatever the contract's size, and
+#: :meth:`AwsIacPlugin.table_made_by_forge` reads it.
+PRODUCT_ID_PARAMETER = "fluid_product_id"
+
 #: A top-level ``id:`` line of the contract YAML :func:`_emit_glue` records in a table's
 #: ``fluid_contract`` parameter (``yaml.safe_dump``: a top-level key starts its line).
 _RECORDED_ID_RE = re.compile(r"^id:[ \t]*(.*?)[ \t]*$", re.MULTILINE)
@@ -1009,22 +1014,30 @@ class AwsIacPlugin:
     def table_made_by_forge(self, values: Mapping[str, Any], contract: Mapping[str, Any]) -> bool:
         """Did forge make this Glue table, for this product? Its module sets ``managed_by:
         fluid`` among the table's parameters on create (:func:`_emit_glue`), with the
-        contract it was made from in ``fluid_contract``; ``ignore_changes`` keeps them,
-        and Iceberg's commits do too. ``values`` is the table in state, as the brownfield
-        look-up imported it.
+        product id in ``fluid_product_id`` and, up to 50 KB, the contract in
+        ``fluid_contract``; ``ignore_changes`` keeps them, and Iceberg's commits do too.
+        ``values`` is the table in state, as the brownfield look-up imported it.
 
-        A table another product made is not this contract's to re-attach. The product is
-        read from the recorded contract's top-level ``id:`` line (no YAML parse of
-        catalog text); a table with no record (made before forge wrote one, or from a
-        contract over the record's 50 KB) is judged by the marker alone.
+        Only the marker and the exact product id together make the table this product's.
+        The id is read from ``fluid_product_id``; only a table without that parameter
+        (made before forge set it) falls back to the recorded contract's top-level ``id:``
+        line, with no YAML parse of catalog text. A table with neither, or with a record
+        that names no id or another one, is not this product's: ``--adopt-tables``
+        compares it like any table forge did not make.
         """
         parameters = values.get("parameters")
         if not isinstance(parameters, Mapping):
             return False
         if str(parameters.get("managed_by") or "").strip().lower() != "fluid":
             return False
-        recorded = _recorded_product_id(parameters.get("fluid_contract"))
-        return recorded is None or recorded == str(contract.get("id") or "")
+        product = str(contract.get("id") or "")
+        if not product:
+            return False
+        if PRODUCT_ID_PARAMETER in parameters:
+            made_for = parameters.get(PRODUCT_ID_PARAMETER)
+        else:
+            made_for = _recorded_product_id(parameters.get("fluid_contract"))
+        return isinstance(made_for, str) and made_for == product
 
     def adoption_hold(self, declared: Mapping[str, Any]) -> Tuple[str, ...]:
         """The attributes an adopted table keeps as it is in the run that adopts it
@@ -1424,6 +1437,13 @@ def _emit_glue(
     # Contract-driven enrichments (absorbed from the retired registrar).
     description = ""
     if contract is not None:
+        # The product this table is made for, whatever the contract's size (the
+        # ``fluid_contract`` record below is dropped over 50 KB): a later run of the same
+        # product re-attaches the table by it (``table_made_by_forge``). Set before the
+        # governance labels, which never overwrite a parameter set here.
+        product_id = contract.get("id")
+        if product_id:
+            parameters[PRODUCT_ID_PARAMETER] = str(product_id)
         meta = contract.get("metadata") or {}
         layer = meta.get("layer")
         product_type = meta.get("productType") or meta.get("product_type")

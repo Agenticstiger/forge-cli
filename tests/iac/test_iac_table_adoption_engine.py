@@ -378,9 +378,17 @@ def test_the_flag_on_a_provider_without_table_adoption_says_so(tofu, tmp_path, m
     assert "--adopt-tables" in out and "adopts no tables" in out
 
 
-def _made_by_forge(monkeypatch, product: str = "sales.orders") -> None:
-    """The table in state carries the marker forge's module sets on create, for ``product``."""
-    parameters = {"managed_by": "fluid", "fluid_contract": f"id: {product}\nname: Orders\n"}
+def _made_by_forge(
+    monkeypatch, product: Optional[str] = "sales.orders", *, recorded: Optional[str] = None
+) -> None:
+    """The table in state carries the marker forge's module sets on create: ``product`` as
+    its ``fluid_product_id`` (none when ``None``) and ``recorded`` as its record of the
+    contract (none when ``None``)."""
+    parameters = {"managed_by": "fluid"}
+    if product is not None:
+        parameters["fluid_product_id"] = product
+    if recorded is not None:
+        parameters["fluid_contract"] = recorded
     state = [{"address": TABLE, "values": {"parameters": parameters}}]
     monkeypatch.setattr(engine.runner, "tofu_state_resources", lambda *a, **k: state)
 
@@ -392,6 +400,40 @@ def test_a_table_another_product_made_still_needs_the_flag(tofu, tmp_path, monke
         engine.apply_via_opentofu(_args(tmp_path), _LOG)
 
     assert raised.value.event == "table_adoption_requires_flag" and tofu["apply"] == 0
+
+
+def test_a_table_with_the_marker_and_no_product_id_or_record_needs_the_flag(
+    tofu, tmp_path, monkeypatch
+):
+    """Another product made it from a contract over 50 KB, before forge set the product
+    id: nothing names whose it is, so it is not this product's."""
+    _made_by_forge(monkeypatch, product=None)
+
+    with pytest.raises(CLIError) as raised:
+        engine.apply_via_opentofu(_args(tmp_path), _LOG)
+
+    assert raised.value.event == "table_adoption_requires_flag" and tofu["apply"] == 0
+
+
+def test_with_the_flag_a_table_with_no_product_id_is_compared(tofu, tmp_path, monkeypatch):
+    _made_by_forge(monkeypatch, product=None)
+    tofu["shown"] = DIFFERING
+
+    with pytest.raises(CLIError) as raised:
+        engine.apply_via_opentofu(_args(tmp_path, adopt_tables=True), _LOG)
+
+    assert raised.value.event == "table_adoption_mismatch" and tofu["apply"] == 0
+
+
+def test_a_table_made_before_the_product_id_is_re_attached_by_its_record(
+    tofu, tmp_path, monkeypatch
+):
+    _made_by_forge(monkeypatch, product=None, recorded="id: sales.orders\nname: Orders\n")
+    tofu["shown"] = DIFFERING
+
+    assert engine.apply_via_opentofu(_args(tmp_path), _LOG) == 0
+
+    assert tofu["apply"] == 1
 
 
 def test_a_table_forge_made_is_re_attached_as_before_without_the_flag(tofu, tmp_path, monkeypatch):

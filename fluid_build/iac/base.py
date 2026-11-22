@@ -70,9 +70,10 @@ class IacProviderPlugin(Protocol):
       found no import for one of them is refused (``table_adoption_hint`` says
       why). A plugin without it adopts what it finds, as before.
     * ``table_made_by_forge(values, contract)``: whether a found table (its values in
-      state) carries the marker forge's module sets on create, for this contract's
-      product; such a table is this product's own, re-attached as before without
-      ``--adopt-tables``. Without the capability every found table needs the flag.
+      state) carries the marker forge's module sets on create together with this
+      contract's exact product id; such a table is this product's own, re-attached as
+      before without ``--adopt-tables``. A table with no product id is not. Without the
+      capability every found table needs the flag.
     * ``adoption_hold(declared)``: the attributes an adopted table keeps as it is in
       the run that adopts it (its body in the module); the engine plans that table again
       with them in ``ignore_changes`` and refuses a plan that still updates it in place.

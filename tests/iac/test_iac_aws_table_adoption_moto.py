@@ -15,8 +15,10 @@ and output formats and SerDe), then a contract names them:
   comments) is left as it is: the adoption updates no Iceberg table in place;
 * one that differs, or a Hive table under an Iceberg binding, is refused naming the
   differences, with nothing in state and the table as it was;
-* without the flag an existing table is refused, unless forge made it: a table that
-  carries forge's marker, met again after its state was lost, is imported as before;
+* without the flag an existing table is refused, unless forge made it for this product:
+  a table that carries forge's marker and this product's id, met again after its state
+  was lost, is imported as before, also when forge kept no record of a contract over
+  50 KB; another product that names the table is refused;
 * the Lake Formation grants the contract declares are planned beside the adopted
   table, which is imported, not replaced;
 * a partitioned Hive table cannot be adopted: its partition trigger is new to the state,
@@ -299,6 +301,42 @@ def test_a_table_forge_made_is_re_attached_after_its_state_is_lost(
     assert _table_address(cid) in _state_addresses(workdir)
     live = _boto("glue", moto_endpoint).get_table(DatabaseName=DATABASE, Name=TABLE)["Table"]
     assert [column["Name"] for column in live["StorageDescriptor"]["Columns"]] == ["id", "note"]
+
+
+def test_a_table_from_a_contract_over_50_kb_is_re_attached_by_its_product_id_alone(
+    moto_endpoint: str, tmp_path: Path
+) -> None:
+    """Forge keeps no record of a contract over 50 KB on the table, but always writes the
+    product id. After its state is lost, the product that made the table re-attaches it
+    by that id; another product naming the same table is refused, with nothing in its
+    state and the table as it was."""
+    cid = "iac.adopt.wide"
+    bucket = "adopt-wide-lake"
+    workdir = _sidecar(tmp_path, cid, moto_endpoint)
+    wide = dict(_contract(bucket, cid), metadata={"notes": "n" * 60_000})
+    plan = _write_plan(tmp_path / "contract.json", wide)
+    assert engine.apply_via_opentofu(_apply_args(plan, tmp_path), _LOG) == 0
+
+    glue = _boto("glue", moto_endpoint)
+    made = glue.get_table(DatabaseName=DATABASE, Name=TABLE)["Table"]["Parameters"]
+    assert made["managed_by"] == "fluid" and made["fluid_product_id"] == cid
+    assert "fluid_contract" not in made
+
+    (workdir / "terraform.tfstate").unlink()
+    assert engine.apply_via_opentofu(_apply_args(plan, tmp_path), _LOG) == 0
+    assert _table_address(cid) in _state_addresses(workdir)
+
+    other = "iac.adopt.neighbour"
+    other_workdir = _sidecar(tmp_path, other, moto_endpoint)
+    theirs = _write_plan(tmp_path / "other.json", _contract(bucket, other))
+    with pytest.raises(CLIError) as raised:
+        engine.apply_via_opentofu(_apply_args(theirs, tmp_path), _LOG)
+
+    assert raised.value.event == "table_adoption_requires_flag"
+    assert raised.value.context["tables"] == [f"{DATABASE}.{TABLE}"]
+    assert _state_addresses(other_workdir) == []
+    kept = glue.get_table(DatabaseName=DATABASE, Name=TABLE)["Table"]["Parameters"]
+    assert kept["fluid_product_id"] == cid
 
 
 def test_an_adopted_iceberg_table_with_its_own_drift_plans_no_update_and_keeps_it(
