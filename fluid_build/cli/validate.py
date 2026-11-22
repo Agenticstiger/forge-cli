@@ -1088,6 +1088,10 @@ def _run_contract_rules(
         # runs it, the retention floors and each backend's limits.
         _check_maintenance(validation_result, contract)
 
+        # Airflow pools per output table (orchestration.airflow.poolPerOutputTable): a build
+        # that writes several tables cannot be serialized with one pool.
+        _check_table_pools(validation_result, contract)
+
         # forge Spark builds, compiled to their job config under the operator's broker,
         # registry and secrets policy (an unlisted host warns here, refuses at run time).
         from fluid_build.spark import compiler as _spark
@@ -1612,6 +1616,31 @@ def _check_maintenance(validation_result: ValidationResult, contract: Mapping[st
         return
     _add_findings(
         validation_result, contract, "contract_iceberg_maintenance", errors, anchor="exposes"
+    )
+
+
+def _check_table_pools(validation_result: ValidationResult, contract: Mapping[str, Any]) -> None:
+    """``orchestration.airflow.poolPerOutputTable`` against the builds
+    (``schedulers/airflow/fluid_apply.py``): off unless the contract sets it, and nothing is
+    imported then. Fails closed."""
+    orchestration = contract.get("orchestration")
+    airflow = orchestration.get("airflow") if isinstance(orchestration, Mapping) else None
+    if not isinstance(airflow, Mapping) or airflow.get("poolPerOutputTable") is None:
+        return
+    try:
+        from fluid_build.schedulers.airflow.fluid_apply import table_pool_errors
+
+        errors = table_pool_errors(dict(contract))
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        validation_result.add_error(
+            f"Airflow table pool check could not run ({type(exc).__name__}); "
+            "orchestration.airflow.poolPerOutputTable was NOT checked",
+            event="contract_check_failed",
+            pointer="",
+        )
+        return
+    _add_findings(
+        validation_result, contract, "contract_table_pools", errors, anchor="orchestration"
     )
 
 

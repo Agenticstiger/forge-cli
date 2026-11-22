@@ -27,7 +27,7 @@ DAILY_TABLE = "s3://lake/iceberg/curated/events_daily"
 def _contract(**airflow: Any) -> Dict[str, Any]:
     contract = copy.deepcopy(SPARK_CONTRACT)
     if airflow:
-        contract["orchestration"] = {"engine": "airflow", "airflow": {"dagId": "x", **airflow}}
+        contract["orchestration"] = {"engine": "airflow", "airflow": dict(airflow)}
     return contract
 
 

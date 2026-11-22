@@ -92,6 +92,8 @@ class AirflowCheck:
     client: Optional[AirflowApi] = None
     #: ``{name: description}`` of the pools the DAG files declare (``FLUID_TABLE_POOLS``).
     pools: Dict[str, str] = field(default_factory=dict)
+    #: The report's ``pools`` block, once :meth:`ensure_pools` has run.
+    pools_report: Optional[Dict[str, Any]] = None
 
     # 1 ── flags ─────────────────────────────────────────────────────────
 
@@ -203,11 +205,6 @@ class AirflowCheck:
             )
         )
         ids = [dag_id for f in self.files for dag_id in f.dag_ids]
-        if self.pools and not self.check_only:
-            _say(
-                f"would create {len(self.pools)} one-slot pool(s) that do not exist: "
-                + ", ".join(sorted(self.pools))
-            )
         dynamic = [f.path for f in self.files if f.dynamic]
         _say(
             f"would check {self.base_url} (API {self.api}, auth {auth}) and would wait up to "
@@ -218,11 +215,17 @@ class AirflowCheck:
     # 2 ── before the push ───────────────────────────────────────────────
 
     def before_push(self, *, dry_run: bool) -> None:
-        """``--dry-run`` plans the check; otherwise sign in and read once, or raise."""
+        """``--dry-run`` plans the check; otherwise sign in and read once, make the pools the
+        DAG files use, or raise. The pools come before the push: a DAG that names a pool
+        Airflow lacks is never left running."""
         if dry_run:
             self.plan()
+            if self.pools and not self.check_only:
+                self.plan_pools()
         else:
             self.preflight()
+            if self.pools and not self.check_only:
+                self.pools_report = self.ensure_pools()
 
     def preflight(self) -> None:
         try:
@@ -253,13 +256,9 @@ class AirflowCheck:
             return None
         if not pushed:
             return skipped_report("The push failed, so Airflow was not checked.")
-        pools = self.ensure_pools() if self.pools and not self.check_only else None
         report = self.wait(results)
-        if pools is not None:
-            report["pools"] = pools
-            if pools["result"] == "failed":
-                report["result"] = "failed"
-                report["message"] = f"{pools['message']} {report.get('message') or ''}".strip()
+        if self.pools_report is not None:
+            report["pools"] = self.pools_report
         return report
 
     def ensure_pools(self) -> Dict[str, Any]:
@@ -291,19 +290,39 @@ class AirflowCheck:
                 )
                 _say(said)
         except AirflowApiError as exc:
-            _say(f"✘ [{slug_for(exc.event)}] {exc.message}")
             commands = airflow_pools.set_commands(self.pools)
+            _say(f"✘ [{slug_for(exc.event)}] {exc.message}")
             for command in commands:
                 _say(f"with Airflow's CLI: {command}")
-            return {
-                "result": "failed",
-                "event": exc.event,
-                "message": f"The pools could not be ensured: {exc.message}",
-                "created": created,
-                "existing": existing,
-                "commands": commands,
-            }
+            error = _as_cli_error(exc)
+            error.context["error"] = (
+                f"The pools could not be made, so nothing was pushed: {exc.message}"
+            )
+            raise error from None
         return {"result": "passed", "created": created, "existing": existing}
+
+    def plan_pools(self) -> None:
+        """``--dry-run``: which pools Airflow holds and which a real run would create. One read
+        of ``/pools``, nothing written; a read that cannot be made is said, not guessed."""
+        try:
+            client = AirflowApi(self.base_url, credentials_from_env())
+            try:
+                client.connect(self.api)
+                held = client.pools()
+            finally:
+                client.close()
+        except AirflowApiError as exc:
+            _say(
+                f"the pools were not read ({exc.message}); a real run would make each one that "
+                f"is missing: {', '.join(sorted(self.pools))}"
+            )
+            return
+        have = sorted(n for n in self.pools if n in held)
+        missing = sorted(n for n in self.pools if n not in held)
+        _say(
+            f"pools: {len(have)} exist ({', '.join(have) or 'none'}), would create "
+            f"{len(missing)} with {airflow_pools.POOL_SLOTS} slot ({', '.join(missing) or 'none'})"
+        )
 
     def wait(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Wait for the parse; the report's ``airflow_check`` block (``result`` says pass)."""

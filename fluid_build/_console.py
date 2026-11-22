@@ -179,30 +179,48 @@ def cprint(*args: Any, **kwargs: Any) -> None:
         stream.flush()
 
 
-_JSON_STRING = re.compile(r'"(?:[^"\\\x00-\x1f]|\\.)*"')
+_JSON_STRING_SRC = r'"(?:[^"\\\x00-\x1f]|\\.)*"'
+_JSON_STRING = re.compile(_JSON_STRING_SRC)
+#: A key and the scalar after it: a string, a number, ``true``, ``false`` or ``null``.
+_JSON_PAIR = re.compile(
+    rf"({_JSON_STRING_SRC})(\s*:\s*)({_JSON_STRING_SRC}|-?[0-9][0-9.eE+\-]*|true|false|null)"
+)
 
 
 def _redact_json_text(document: str) -> str:
-    """:func:`_redact_str` for a document, one JSON string at a time when it is JSON.
+    """A JSON document with its credentials masked, still JSON and laid out as it was.
 
-    The ``key=value`` pattern runs to the next space, comma or semicolon, so over the whole
-    text it takes the closing quote of a string such as ``"password=hunter2"`` with the value
-    and the document no longer parses. Each string literal is redacted on its own, so what a
-    match can reach ends at the literal's closing quote. A document that is not JSON (YAML,
-    XML) is redacted as one text.
+    Two passes over the text, never over the whole of it as one string: the ``key=value``
+    pattern runs to the next space or comma, so it can take the closing quote of a string
+    and break the document.
+
+    1. A key whose name looks like a credential (``password``, ``api_key``, ...) gets the
+       placeholder for its scalar value, whatever the value is.
+    2. Each string is decoded, run through both redactors (``key=value``, URL user info, bearer
+       and provider tokens, JWTs) and written back as a JSON string, so what a match can reach
+       ends at that string.
+
+    A document that is not JSON (YAML, XML) is redacted as one text.
     """
     import json
 
     try:
         json.loads(document)
     except ValueError:
-        return _redact_str(document)
+        return _redact_error_str(document)
 
-    def one(match: "re.Match[str]") -> str:
-        literal = match.group(0)
-        return '"' + _redact_str(literal[1:-1]) + '"'
+    from fluid_build.observability.secret_redactor import _REDACTED, is_sensitive_key_name
 
-    return _JSON_STRING.sub(one, document)
+    def pair(match: "re.Match[str]") -> str:
+        key, separator, value = match.groups()
+        if value != "null" and is_sensitive_key_name(json.loads(key)):
+            return f"{key}{separator}{json.dumps(_REDACTED)}"
+        return match.group(0)
+
+    def string(match: "re.Match[str]") -> str:
+        return json.dumps(_redact_error_str(json.loads(match.group(0))), ensure_ascii=False)
+
+    return _JSON_STRING.sub(string, _JSON_PAIR.sub(pair, document))
 
 
 def cprint_json(document: str, **kwargs: Any) -> None:

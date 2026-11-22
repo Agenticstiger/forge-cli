@@ -308,7 +308,7 @@ def table_pools() -> Dict[str, Any]:
     contract = events_pipeline()
     contract["orchestration"] = {
         "engine": "airflow",
-        "airflow": {"dagId": "events", "poolPerOutputTable": True},
+        "airflow": {"poolPerOutputTable": True},
     }
     return contract
 

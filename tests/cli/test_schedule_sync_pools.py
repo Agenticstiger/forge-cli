@@ -4,9 +4,9 @@
 """``fluid schedule-sync`` and the one-slot pools of the writers of an output table.
 
 A generated DAG lists its pools in ``FLUID_TABLE_POOLS``. With ``--airflow-url`` the sync
-creates the ones Airflow lacks, on Airflow 2 (``/api/v1/pools``) and Airflow 3
-(``/api/v2/pools``), and never changes one that exists; without it the report prints the
-``airflow pools set`` lines. A fake Airflow answers on 127.0.0.1; ``rsync`` is stubbed.
+makes the ones Airflow lacks before it pushes anything, on Airflow 2 (``/api/v1/pools``) and
+Airflow 3 (``/api/v2/pools``), and never changes one that exists; without it the report prints
+the ``airflow pools set`` lines. A fake Airflow answers on 127.0.0.1; ``rsync`` is stubbed.
 """
 
 from __future__ import annotations
@@ -38,6 +38,9 @@ TABLE = "s3://lake/iceberg/raw/events"
 POOL = airflow_pools.pool_name(TABLE)
 DESCRIPTION = airflow_pools.pool_description(TABLE)
 COMMAND = f'airflow pools set {POOL} 1 "{DESCRIPTION}"'
+OTHER_TABLE = "s3://lake/iceberg/curated/users"
+OTHER = airflow_pools.pool_name(OTHER_TABLE)
+OTHER_DESCRIPTION = airflow_pools.pool_description(OTHER_TABLE)
 
 
 @pytest.fixture(autouse=True)
@@ -48,17 +51,22 @@ def _env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AF_TEST_CREDENTIAL", "admin:admin")
 
 
-@pytest.fixture()
-def dags_dir(tmp_path: Path) -> Path:
+def _dag_dir(tmp_path: Path, pools: dict) -> Path:
     path = tmp_path / "schedule" / "sales__dev" / f"{DAG_ID}.py"
     path.parent.mkdir(parents=True)
+    body = "".join(f"    {name!r}: {text!r},\n" for name, text in pools.items())
     path.write_text(
         "from airflow.sdk import DAG\n\n"
-        f"FLUID_TABLE_POOLS = {{\n    {POOL!r}: {DESCRIPTION!r},\n}}\n\n"
+        f"FLUID_TABLE_POOLS = {{\n{body}}}\n\n"
         f"with DAG(dag_id={DAG_ID!r}, schedule='@daily') as dag:\n    pass\n",
         encoding="utf-8",
     )
     return tmp_path / "schedule"
+
+
+@pytest.fixture()
+def dags_dir(tmp_path: Path) -> Path:
+    return _dag_dir(tmp_path, {POOL: DESCRIPTION})
 
 
 def _push(dags_dir: Path, fake: FakeAirflow, tmp_path: Path, monkeypatch, capsys, *extra: str):
@@ -81,7 +89,8 @@ def _push(dags_dir: Path, fake: FakeAirflow, tmp_path: Path, monkeypatch, capsys
             ),
             capsys,
         )
-    return rc, out, json.loads(report.read_text(encoding="utf-8"))
+    doc = json.loads(report.read_text(encoding="utf-8")) if report.exists() else None
+    return rc, out, doc, recorder
 
 
 def _pool_posts(fake: FakeAirflow) -> List[str]:
@@ -89,14 +98,18 @@ def _pool_posts(fake: FakeAirflow) -> List[str]:
 
 
 @pytest.mark.parametrize("major, api", [(2, "v1"), (3, "v2")])
-def test_a_missing_pool_is_created_with_one_slot(
+def test_a_missing_pool_is_created_with_one_slot_before_anything_is_pushed(
     major, api, dags_dir: Path, tmp_path: Path, monkeypatch, capsys
 ):
     with FakeAirflow(major) as fake:
-        rc, out, doc = _push(dags_dir, fake, tmp_path, monkeypatch, capsys)
+        rc, out, doc, recorder = _push(dags_dir, fake, tmp_path, monkeypatch, capsys)
         assert fake.pools[POOL] == {"slots": 1, "description": DESCRIPTION}
         assert _pool_posts(fake) == [f"POST /api/{api}/pools"]
+        before_push = [
+            r.method + " " + r.path for r in fake.requests[: recorder.requests_at_first_call]
+        ]
     assert rc == 0, out
+    assert f"POST /api/{api}/pools" in before_push
     assert doc["airflow_check"]["pools"] == {"result": "passed", "created": [POOL], "existing": []}
     assert f"pool {POOL} created with 1 slot" in out
 
@@ -107,7 +120,7 @@ def test_a_pool_that_exists_is_left_as_it_is(
 ):
     with FakeAirflow(major) as fake:
         fake.pools[POOL] = {"slots": 5, "description": "made by hand"}
-        rc, out, doc = _push(dags_dir, fake, tmp_path, monkeypatch, capsys)
+        rc, out, doc, _ = _push(dags_dir, fake, tmp_path, monkeypatch, capsys)
         assert fake.pools[POOL] == {"slots": 5, "description": "made by hand"}
         assert _pool_posts(fake) == [] and not any(m.startswith("PATCH") for m in fake.paths())
     assert rc == 0, out
@@ -116,16 +129,46 @@ def test_a_pool_that_exists_is_left_as_it_is(
 
 
 @pytest.mark.parametrize("major, api", [(2, "v1"), (3, "v2")])
-def test_a_user_who_may_not_create_pools_fails_the_check_and_gets_the_commands(
+def test_a_pool_that_cannot_be_made_stops_the_sync_before_the_push(
     major, api, dags_dir: Path, tmp_path: Path, monkeypatch, capsys
 ):
     with FakeAirflow(major, forbidden=(f"/api/{api}/pools",)) as fake:
-        rc, out, doc = _push(dags_dir, fake, tmp_path, monkeypatch, capsys)
-    assert rc == 1, out
-    pools = doc["airflow_check"]["pools"]
-    assert pools["result"] == "failed" and pools["commands"] == [COMMAND]
-    assert doc["airflow_check"]["result"] == "failed"
-    assert COMMAND in out
+        rc, out, doc, recorder = _push(dags_dir, fake, tmp_path, monkeypatch, capsys)
+    assert rc != 0, out
+    assert recorder.argvs == []  # no DAG was pushed, so none points at a missing pool
+    assert COMMAND in out and "nothing was pushed" in out
+    assert doc is None
+
+
+@pytest.mark.parametrize("major", [2, 3])
+def test_the_dry_run_says_which_pools_exist_and_which_it_would_create(
+    major, tmp_path: Path, capsys
+):
+    dags = _dag_dir(tmp_path, {POOL: DESCRIPTION, OTHER: OTHER_DESCRIPTION})
+    with FakeAirflow(major) as fake:
+        fake.pools[POOL] = {"slots": 1, "description": "already there"}
+        with patch.object(schedule_sync, "_which_or_raise", side_effect=_which):
+            rc, out = _main(
+                _base(dags, fake, "--destination", str(tmp_path / "d"), "--dry-run"), capsys
+            )
+        assert rc == 0, out
+        assert [p for p in fake.paths() if p.endswith("/pools")] == [
+            f"GET /api/{'v1' if major == 2 else 'v2'}/pools"
+        ]
+        assert _pool_posts(fake) == [] and set(fake.pools) == {"default_pool", POOL}
+    assert f"pools: 1 exist ({POOL}), would create 1 with 1 slot ({OTHER})" in out
+
+
+def test_the_dry_run_says_so_when_it_cannot_read_the_pools(tmp_path: Path, monkeypatch, capsys):
+    dags = _dag_dir(tmp_path, {POOL: DESCRIPTION})
+    monkeypatch.setenv("AF_TEST_CREDENTIAL", "admin:wrong")
+    with FakeAirflow(3) as fake:
+        with patch.object(schedule_sync, "_which_or_raise", side_effect=_which):
+            rc, out = _main(
+                _base(dags, fake, "--destination", str(tmp_path / "d"), "--dry-run"), capsys
+            )
+    assert rc == 0, out
+    assert "the pools were not read" in out and POOL in out
 
 
 def test_without_the_airflow_check_the_report_prints_the_pool_commands(
@@ -178,18 +221,9 @@ def test_a_dags_dir_without_pools_adds_nothing_to_the_report(tmp_path: Path, cap
     assert "pools" not in json.loads(report.read_text(encoding="utf-8"))
 
 
-def test_check_only_and_a_dry_run_create_no_pool(
-    dags_dir: Path, tmp_path: Path, monkeypatch, capsys
-):
+def test_check_only_touches_no_pool(dags_dir: Path, monkeypatch, capsys):
     with FakeAirflow(3) as fake:
         _drive(monkeypatch, fake, _live(fake, dags_dir))
         rc, out = _main(_base(dags_dir, fake, "--check-only"), capsys)
         assert rc == 0, out
-        assert _pool_posts(fake) == [] and not any(p.endswith("/pools") for p in fake.paths())
-    with FakeAirflow(3) as fake:
-        with patch.object(schedule_sync, "_which_or_raise", side_effect=_which):
-            rc, out = _main(
-                _base(dags_dir, fake, "--destination", str(tmp_path / "d"), "--dry-run"), capsys
-            )
-        assert fake.requests == []
-    assert rc == 0 and "would create 1 one-slot pool(s)" in out and POOL in out
+        assert not any(p.endswith("/pools") for p in fake.paths())

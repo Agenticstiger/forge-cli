@@ -6765,9 +6765,6 @@
     },
     "airflowOrchestration": {
       "type": "object",
-      "required": [
-        "dagId"
-      ],
       "properties": {
         "dagId": {
           "type": "string",
@@ -6779,7 +6776,7 @@
         "poolPerOutputTable": {
           "type": "boolean",
           "default": false,
-          "description": "NEW in v0.7.7: When true, the generated DAG puts each task that writes an output table in a one-slot Airflow pool named after the table (pool_slots 1), so two DAGs that write the same table do not run together. The locking is Airflow's own pool. A build that writes several tables takes the pool of the first. `fluid schedule-sync --airflow-url` creates the pools Airflow lacks (and never changes one that exists); without it the generate and sync reports print the `airflow pools set` lines. Off by default: nothing changes in a DAG unless it is set."
+          "description": "NEW in v0.7.7: When true, the generated DAG puts each task that writes an output table in a one-slot Airflow pool named after the table (pool_slots 1), so two DAGs that write the same table do not run together. The locking is Airflow's own pool. A build that writes more than one table (a build with no outputs writes every expose) is refused by validate and by the DAG renderer: declare one output per build or split it. `fluid schedule-sync --airflow-url` creates the pools Airflow lacks (and never changes one that exists); without it the generate and sync reports print the `airflow pools set` lines. Off by default: nothing changes in a DAG unless it is set."
         },
         "dagConfig": {
           "type": "object",

@@ -38,10 +38,10 @@ def test_a_credential_shaped_string_is_masked_and_the_document_still_parses(valu
 
     parsed = json.loads(out)  # the closing quotes are still there
     assert parsed["before"] == 1 and parsed["after"][1] == 2
-    assert "<redacted>" in parsed["text"]
+    assert "redacted" in parsed["text"].lower()
     assert "hunter2" not in out
 
 
 def test_a_document_that_is_not_json_is_still_redacted_as_text():
     out = _emit("name: orders\npassword=hunter2\n")
-    assert "hunter2" not in out and "<redacted>" in out
+    assert "hunter2" not in out and "redacted" in out.lower()
