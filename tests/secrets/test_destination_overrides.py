@@ -57,8 +57,9 @@ def test_the_runner_refuses_an_override_before_reading_the_secret(monkeypatch, k
 
 def test_other_settings_still_pass_through(monkeypatch):
     monkeypatch.setenv("FLUID_DBZ_TEST_PW", "dbz-test-value-1234")
-    cfg = _build({"snapshot.locking.mode": "none", "database.port": "6543"})
+    cfg = _build({"snapshot.locking.mode": "none", "heartbeat.interval.ms": "1000"})
     assert cfg["snapshot.locking.mode"] == "none"
+    assert cfg["heartbeat.interval.ms"] == "1000"
     assert cfg["database.hostname"] == "127.0.0.1"
 
 
