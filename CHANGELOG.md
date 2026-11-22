@@ -475,6 +475,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `variant`, as DuckDB's `UNION` already does, and the schema-drift gate reads the two as one
   type family, so a contract written that way does not fail at apply.
 
+### Security
+
+- An address with an IPv6 zone id, such as `::1%lo0`, is no longer read as this machine. The
+  secret destination policy judges it like any other host, and an OpenBao or Vault address on
+  it needs https.
+- The secret destination policy judges every host a connection names. Beside a `secretRef`,
+  a query-string parameter that names a host (`host` or `hostaddr` in a libpq URI, a host in
+  `jdbc_url_params` or in a Singer tap's `sqlalchemy_url`) is refused unless the reference may
+  go to any host, and so is a database name that holds `?`, `#`, `;`, `&`, `@`, `\` or a
+  control character. The host of an SSH tunnel in use (a tap's `ssh_tunnel`, Airbyte's
+  `tunnel_method`) needs an allowlist entry of its own, and so does a loopback host behind
+  it. A Debezium `extra_config` may no longer set `database.port`, `database.dbname`,
+  `database.names` or `connector.class` beside a `secretRef`. A URI whose authority a
+  database client could read as naming a host the policy does not read is a destination the
+  policy cannot read, and is refused unless the reference may go to any host.
+- A runner that builds a connection URL keeps each field in its own part. dlt's
+  `sql_database` source refuses a host, database or `drivername` that would change how its
+  connection URL is read back, and `drivername` must be a SQLAlchemy dialect name with an
+  optional `+driver`. The Kafka Connect JDBC source and Debezium refuse a host or database
+  that holds URL syntax, and a port that is not a number.
+- A secret-policy refusal no longer prints a value it cannot trace to the contract. At
+  `fluid apply`, where `{{ env.NAME }}` placeholders are rendered, a refusal quotes a host only
+  when the contract wrote it as it stands, and names the placeholder of one it rendered. A
+  keyword connection string (`Server=...;Database=...`) shows its host part only.
+- In `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, `NAME@*` now sends `env://NAME` to any host, as
+  a bare `NAME` and `env://NAME@*` already did. It used to name a literal host `*`, which no
+  destination matches. A refusal's fix names both forms.
+
 ### Upgrade notes
 
 - A Glue table that forge made before this release from a contract over 50 KB carries forge's

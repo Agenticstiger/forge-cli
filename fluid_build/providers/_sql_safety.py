@@ -377,6 +377,54 @@ def build_mysql_dsn(connection: Mapping[str, Any], *, database_key: str = "datab
     return " ".join(parts)
 
 
+#: What a connection URL reads in a host or a database name as more than the
+#: name: ``?`` starts the connection properties (pgjdbc reads ``host=`` there,
+#: after the URL's own host), ``;`` starts SQL Server's, ``&`` and ``#`` delimit
+#: them, and ``@`` and ``\`` end a part in other parsers. A host may not hold a
+#: ``/`` either, which ends it, nor whitespace; it may hold a ``\``, which names a
+#: SQL Server instance (``host\SQLEXPRESS``).
+_URL_NAME_SYNTAX = "?#;&@\\"
+
+
+def reject_url_syntax(connection: Mapping[str, Any], *, where: str) -> None:
+    """Raise ``ValueError`` when ``host``, ``port`` or ``database`` would not stay in its URL part.
+
+    For the runners that build a connection URL from these fields, or hand them
+    to a connector that does: the Kafka Connect JDBC source builds
+    ``jdbc:<protocol>://host:port/database`` itself, and Debezium builds the
+    same URL from ``database.hostname``, ``database.port`` and
+    ``database.dbname``. A field that holds URL syntax would move the
+    connection, so it is refused before the URL is built. ``port`` must be
+    ASCII digits. The message names the field and never its value.
+    """
+    for key, name in (("host", "host name"), ("database", "database name")):
+        value = connection.get(key)
+        shown = None if value is None else _url_syntax_in(str(value), host=key == "host")
+        if shown is not None:
+            raise ValueError(
+                f"Invalid {key} for {where}: {shown} is not permitted, because the "
+                f"connection URL would read it as more than a {name}."
+            )
+    port = connection.get("port")
+    if port not in (None, ""):
+        text = str(port)
+        if not (text.isascii() and text.isdigit()):
+            raise ValueError(f"Invalid port for {where}: connection.port must be a port number.")
+
+
+def _url_syntax_in(text: str, *, host: bool) -> Optional[str]:
+    """The first character of ``text`` a URL would read as more than a name, described."""
+    refused = _URL_NAME_SYNTAX.replace("\\", "/") if host else _URL_NAME_SYNTAX
+    for char in text:
+        if _CONTROL_CHARS.match(char):
+            return "a control character"
+        if host and char.isspace():
+            return "whitespace"
+        if char in refused:
+            return repr(char)
+    return None
+
+
 def mask_dsn_password(text: str, password: Optional[str]) -> str:
     """Replace every quoted form of ``password`` in a driver message with ``***``.
 
