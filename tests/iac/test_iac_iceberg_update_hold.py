@@ -198,8 +198,10 @@ def test_the_note_names_each_held_attribute_with_the_tables_value_and_the_contra
         "column id: bigint in the table, string in the contract",
         "column Amount: written amount in the contract",
         "comment of column amount: old in the table, the amount in the contract",
-        "columns of older Iceberg schemas (legacy): listed by the table, not by the contract "
-        "(Iceberg keeps listing them)",
+        (
+            "columns of older Iceberg schemas (legacy): listed by the table, not by the contract "
+            + "(Iceberg keeps listing them)"
+        ),
         f"location: {LOCATION} in the table, {LOCATION}/v2 in the contract",
         "storage setting compressed: none in the table, True in the contract",
     ]

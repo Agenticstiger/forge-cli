@@ -219,9 +219,11 @@ def review(
             [],
             enforce=enforce,
             remediation=[
-                "Re-run the apply: its plan is made again. If `tofu show -json` still cannot "
-                "read it, check that the OpenTofu version and providers in the workdir can "
-                "read their own plan; no flag lets an unread plan through"
+                (
+                    "Re-run the apply: its plan is made again. If `tofu show -json` still "
+                    + "cannot read it, check that the OpenTofu version and providers in the "
+                    + "workdir can read their own plan; no flag lets an unread plan through"
+                )
             ],
         )
         return []
@@ -322,8 +324,10 @@ def _refuse(
         remediation = [REMEDY]
     if bound:
         remediation = [
-            "Make the plan again with `fluid plan --tofu`: it leaves these tables as they "
-            f"are, or, with the writers paused, updates them with {ALLOW_ICEBERG_UPDATE_FLAG}",
+            (
+                "Make the plan again with `fluid plan --tofu`: it leaves these tables as they "
+                + f"are, or, with the writers paused, updates them with {ALLOW_ICEBERG_UPDATE_FLAG}"
+            ),
             REMEDY,
         ]
     raise CLIError(

@@ -153,8 +153,7 @@ def test_a_hive_table_the_plan_updates_keeps_its_in_place_update(planned, tmp_pa
 
     assert engine.apply_via_opentofu(_args(tmp_path, contract=HIVE_CONTRACT), _LOG) == 0
 
-    (only,) = planned["plans"]
-    assert planned["apply"] == 1
+    assert len(planned["plans"]) == 1 and planned["apply"] == 1
     assert "live Iceberg table" not in capfd.readouterr().out
 
 
