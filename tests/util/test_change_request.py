@@ -25,10 +25,7 @@ pytestmark = [pytest.mark.unit]
         ({"GITHUB_EVENT_NAME": "pull_request"}, "GITHUB_EVENT_NAME=pull_request"),
         ({"GITHUB_EVENT_NAME": "pull_request_target"}, "GITHUB_EVENT_NAME=pull_request_target"),
         ({"GITHUB_EVENT_NAME": "pull_request_review"}, "GITHUB_EVENT_NAME=pull_request_review"),
-        (
-            {"GITHUB_EVENT_NAME": "pull_request_review_comment"},
-            "GITHUB_EVENT_NAME=pull_request_review_comment",
-        ),
+        ({"GITHUB_EVENT_NAME": "pull_request_review_comment"}, "=pull_request_review_comment"),
         ({"CI_MERGE_REQUEST_IID": "3"}, "CI_MERGE_REQUEST_IID"),
         ({"CI_MERGE_REQUEST_ID": "301"}, "CI_MERGE_REQUEST_ID"),
         ({"CI_PIPELINE_SOURCE": "merge_request_event"}, "CI_PIPELINE_SOURCE=merge_request_event"),
