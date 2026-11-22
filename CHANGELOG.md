@@ -660,6 +660,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrote `type: parquet_variant` into a contract that `fluid validate` then rejected. It maps to
   `variant`, as DuckDB's `UNION` already does, and the schema-drift gate reads the two as one
   type family, so a contract written that way does not fail at apply.
+- **`fluid apply` no longer updates a live Iceberg table in place.** hashicorp/aws updates an
+  `aws_glue_catalog_table` with an `UpdateTable` that carries no `VersionId`, after re-reading
+  the table's `metadata_location`, so a commit an Iceberg writer made during the apply could be
+  reverted, and its data dropped from the table. A contract change or drift that would update a
+  live Iceberg Glue table in place now leaves it as it is, whatever brought the table into the
+  plan (a table the state holds, one a fresh state re-attaches, one `--adopt-tables` adopts): the
+  plan is made again with the table's description, owner, retention and storage descriptor left
+  alone, and must leave it with no change. The run prints what the contract wanted and how to
+  apply it, and logs it at WARNING (`iceberg_table_update_held`). `--allow-iceberg-update` on
+  `fluid apply`, `fluid plan --tofu` and `fluid ship` makes the update, audited at WARNING
+  (`iceberg_table_update_accepted`); `fluid plan --tofu` records those tables in
+  `opentofuPlan.icebergUpdates`, under `planDigest`, and `fluid apply plan.json` updates only
+  them. Any other in-place update of a live Iceberg table left in a plan is refused
+  (`iceberg_table_update_in_place`), and `fluid plan --allow-iceberg-update` needs `--tofu`
+  (`plan_allow_iceberg_update_needs_tofu`). Hive tables keep their in-place updates, and a
+  replace stays with the data-loss gate.
 
 ### Security
 
@@ -791,6 +807,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself, without a prompt, and the apply fails; a config that failed is not started again by a
   later `fluid apply` unless `FLUID_SPARK_ACCEPT_FAILED_RELEASE=1` is set for that apply. Set the
   probation to `0` where a scheduler's timeout is shorter than the wait.
+- A contract change to a live Iceberg table's description, column comments or columns no longer
+  reaches Glue through `fluid apply`, Command Center's included: the table is left as it is, and
+  the run prints what waits. To apply it, change the table through its Iceberg catalog (for
+  example `ALTER TABLE ... SET TBLPROPERTIES ('comment' = '...')` or `ALTER TABLE ... ALTER
+  COLUMN ... COMMENT '...'` in Spark), whose commit writes Glue with the version it read; or pause
+  the table's writers and run `fluid apply --allow-iceberg-update` once. A table whose Iceberg
+  schema changed outside the contract (a column a writer added, or a dropped one Iceberg keeps
+  listing) gets the note on every apply while the two differ. A saved plan made before this
+  release that updates a live Iceberg table in place is refused by `fluid apply plan.json`: make
+  the plan again.
 
 ## [0.36.0] — 2026-11-19
 
