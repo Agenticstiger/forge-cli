@@ -4,10 +4,11 @@
 """``fluid import airflow`` records the ids exactly as Airflow spells them when it can.
 
 The schema of the ``fluidVersion`` a proposal declares says what a ``dagId`` and a ``taskId`` may
-hold. The 0.7.7 preview takes Airflow's own rule (ASCII letters of either case, digits, ``_``,
-``.`` and ``-``), so an id is recorded as it is and the report has nothing to say about ids. The
-released schemas (0.7.6 and before) take lower case only, so there an id with capitals is recorded
-under the importer's lower case identifier of it, as before (``test_airflow_ids.py``).
+hold. The 0.7.7 preview takes the ASCII part of Airflow's rule (ASCII letters of either case,
+digits, ``_``, ``.`` and ``-``), so an id is recorded as it is and the report has nothing to say
+about ids. The released schemas (0.7.6 and before) take lower case only, so there an id with
+capitals is recorded under the importer's lower case identifier of it, as before
+(``test_airflow_ids.py``).
 """
 
 from __future__ import annotations
@@ -156,7 +157,7 @@ class TestIdRules:
         assert not rules.lower_case_only
         for taken in ("Sales_Daily_V2", "a", "x" * 250, "a.b-C_d"):
             assert rules.dag(taken) and rules.task(taken)
-        for refused in ("", "Sales Daily", "a/b", "x" * 251, "Salès", "a\n"):
+        for refused in ("", "Sales Daily", "a/b", "x" * 251, "Salès", "a\n", "abc\n"):
             assert not rules.dag(refused) and not rules.task(refused)
 
     @pytest.mark.parametrize("version", ["0.7.6", "0.7.5", "0.7.1"])

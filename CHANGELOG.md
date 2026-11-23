@@ -41,6 +41,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their security scan runs. Each path is checked and written as one quoted shell word, never an
   expansion a run could override.
 
+### Fixed
+
+- **An alert route names a connection only when its kind has no default.** A route kind with
+  `requires_connection` and a `default_connection` (such as a plugin's kind from
+  `fluid_build.alert_notifiers`) refused every route that named no connection, though the kind says
+  which one to use. A connection is now required only when the kind requires one and has no default.
+  A route that names none uses the default, in the notifier's arguments and in the DAG's notes, and
+  a connection the route names still wins. The kind's `check` and `kwargs` both get it as
+  `route.connection`. The built-in kinds are unchanged: `webhook` still needs one.
+
+- **`data-team` is template residue at `metadata.owner.team` only.** `fluid validate` warned
+  (`contract_template_residue`) about any string that was exactly `data-team`, so an alert route's
+  `channel: data-team` or a tag of that name was flagged though no starter writes it there. The value
+  is now matched at the path every starter writes it to, with the same fix text. `starter-product`,
+  `starter_table`, `SELECT 1 AS id` and the other long tokens still match anywhere.
+
+- **A `fluid_build.commands` plugin may add new command names only.** A plugin that added a command
+  named like a core command replaced it without a word on Python 3.10, and on 3.11 and later failed
+  with `conflicting subparser` and left itself half registered. The plugin's entry-point callable now
+  gets the subparsers with an `add_parser` that refuses a core command's name or alias, another
+  plugin's name, or a repeat, with a `PluginCommandShadowError` that behaves the same on every
+  Python from 3.10 to 3.14. The plugin is skipped whole, the commands it had added are taken
+  back, a warning names the plugin and the command and never the exception, and the other plugins
+  still load. `fluid describe --commands`, which loads every plugin, does the same. A core command's
+  name stays reserved when the build profile leaves the command out. `AGENTS.md` now says the entry
+  point is a callable `(subparsers) -> None`, whatever it is named.
+
+- **The 0.7.7 `dagId` and `taskId` patterns end where the value ends.** They ended in `$`, which
+  Python's `re` also matches before a final line break, so a validator that runs `pattern` as it is
+  (stock `jsonschema`) took `"abc\n"` where an ECMA-262 validator refused it; `fluid` already refused
+  it through its own rewrite of `$`. Both now end in `(?![\s\S])`, as 34 other patterns of the file
+  do, with `minLength` 1 and `maxLength` 250 unchanged. The descriptions now say the schema takes the
+  ASCII part of Airflow's rule: Airflow's own pattern is Unicode.
+
 ## [0.38.0] — 2026-11-22
 
 ### Added

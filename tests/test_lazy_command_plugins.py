@@ -5,8 +5,8 @@
 
 Regression suite for ``cli/bootstrap.py::_register_command_plugins`` — the
 argparse adaptation of Click's ``LazyGroup`` recipe. A third-party command
-plugin's module + ``register()`` must be imported ONLY when its command is
-actually being invoked, so a heavy module-scope import a plugin happens to
+plugin's module is imported, and its entry-point callable ``(subparsers) -> None``
+run, ONLY when its command is actually being invoked, so a heavy module-scope import a plugin happens to
 have (e.g. ``jsonschema``) never lands on the ``fluid --help`` /
 ``build_parser()`` cold path (tests/perf/test_startup_budget.py).
 
@@ -19,6 +19,9 @@ Pinned invariants:
   ``func(args, logger)`` calling conventions;
 * (c) a broken plugin entry point is skipped with a type-only WARNING and
   the CLI still builds (fail-isolation), and discovery failures never raise;
+* (d) a plugin adds new command names only: one a core command, a core alias or
+  another plugin already has is refused, the same on every Python, and the plugin is
+  skipped whole;
 * plus argv parsing, operator allow/block governance, and the import-free
   ``fluid --help`` plugin listing.
 """
@@ -26,6 +29,7 @@ Pinned invariants:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import sys
 from typing import Any, Callable, List, Tuple
@@ -489,3 +493,378 @@ def test_global_value_opts_cover_declared_value_options() -> None:
 
 # Silence unused-import lints for helpers referenced only via fixtures.
 _ = (Callable,)
+
+
+# ---------------------------------------------------------------------------
+# (d) a plugin adds new command names only
+# ---------------------------------------------------------------------------
+
+
+def _core_parser() -> Tuple[argparse.ArgumentParser, Any, argparse.ArgumentParser]:
+    """A parser with two core commands (one with an alias and a help line each) and the parser
+    of ``apply``, which a shadowing plugin would replace."""
+    parser = argparse.ArgumentParser(prog="fluid")
+    sp = parser.add_subparsers(dest="cmd")
+    core_apply = sp.add_parser("apply", help="Apply a plan")
+    core_apply.add_argument("--dry-run", action="store_true")
+    sp.add_parser("validate", help="Validate a contract", aliases=["check"])
+    return parser, sp, core_apply
+
+
+def _run_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    sp: Any,
+    plugins: List[FakeEP],
+    argv: List[str],
+    **kwargs: Any,
+) -> Tuple[dict, List[str]]:
+    """``_register_command_plugins(sp, **kwargs)`` with ``plugins`` installed and ``argv``
+    typed: ``(what it returned, the messages it logged)``."""
+    monkeypatch.setattr(bootstrap, "_command_plugin_entry_points", lambda: list(plugins))
+    monkeypatch.setattr(sys, "argv", argv)
+    cap = _capture_bootstrap_log()
+    try:
+        added = bootstrap._register_command_plugins(sp, **kwargs)
+    finally:
+        bootstrap.LOG.removeHandler(cap)
+    return added, [r.getMessage() for r in cap.records]
+
+
+def _shadow_messages(messages: List[str]) -> List[str]:
+    return [m for m in messages if "cli_plugin_command_shadow" in m]
+
+
+def _help_names(sp: Any) -> List[str]:
+    return [action.dest for action in sp._choices_actions]
+
+
+def _add_parser_py310(self: Any, name: str, **kwargs: Any) -> argparse.ArgumentParser:
+    """``_SubParsersAction.add_parser`` as Python 3.10 has it: no check for a name that is
+    already taken, so the second ``add_parser`` of a name replaces the first without a word.
+    (3.11 and later raise ``ArgumentError: conflicting subparser``, bpo-39716.)"""
+    if kwargs.get("prog") is None:
+        kwargs["prog"] = f"{self._prog_prefix} {name}"
+    aliases = kwargs.pop("aliases", ())
+    if "help" in kwargs:
+        help_text = kwargs.pop("help")
+        self._choices_actions.append(self._ChoicesPseudoAction(name, aliases, help_text))
+    parser = self._parser_class(**kwargs)
+    self._name_parser_map[name] = parser
+    for alias in aliases:
+        self._name_parser_map[alias] = parser
+    return parser
+
+
+class TestAPluginAddsNewNamesOnly:
+    def test_a_plugin_adding_a_core_command_is_skipped_whole(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def register(sp: Any) -> None:
+            sp.add_parser("acme-extra", help="Taken back with the plugin")
+            sp.add_parser("apply", help="Shadows the core command")
+            sp.add_parser("acme-later")  # never reached
+
+        ep = FakeEP("acme", register)
+        parser, sp, core_apply = _core_parser()
+
+        added, messages = _run_loader(monkeypatch, sp, [ep], ["fluid", "acme-extra"])
+
+        assert ep.loaded is True
+        choices = _cmd_choices(parser)
+        assert choices["apply"] is core_apply
+        assert set(choices) == {"apply", "validate", "check"}  # nothing of the plugin is left
+        assert _help_names(sp) == ["apply", "validate"]  # nor a line of it in the help
+        assert "acme" not in added
+        assert parser.parse_args(["apply", "--dry-run"]).dry_run is True
+        (warning,) = _shadow_messages(messages)
+        assert "'acme'" in warning and "'apply'" in warning
+
+    @pytest.mark.parametrize(
+        "register",
+        [
+            lambda sp: sp.add_parser("check"),
+            lambda sp: sp.add_parser("fresh", aliases=["validate"]),
+        ],
+        ids=["an alias as the name", "a new name with a core name as its alias"],
+    )
+    def test_a_core_alias_or_name_is_reserved_in_either_position(
+        self, monkeypatch: pytest.MonkeyPatch, register: Callable[[Any], Any]
+    ) -> None:
+        parser, sp, core_apply = _core_parser()
+        validate = _cmd_choices(parser)["validate"]
+
+        added, messages = _run_loader(monkeypatch, sp, [FakeEP("acme", register)], ["fluid", "x"])
+
+        choices = _cmd_choices(parser)
+        assert choices["validate"] is validate and choices["check"] is validate
+        assert "fresh" not in choices and added == {}
+        assert len(_shadow_messages(messages)) == 1
+
+    def test_the_refusal_is_a_typed_cli_error_raised_before_anything_is_registered(self) -> None:
+        _parser, sp, _core_apply = _core_parser()
+        guard, refused = bootstrap._guard_subparsers(sp, "acme", {"apply"})
+
+        with pytest.raises(bootstrap.PluginCommandShadowError) as info:
+            guard.add_parser("apply")
+
+        err = info.value
+        assert isinstance(err, bootstrap.CLIError)
+        assert (err.plugin, err.command) == ("acme", "apply")
+        assert err.error_slug == "ERR_CLI_PLUGIN_COMMAND_SHADOW"
+        assert refused == ["apply"]
+        assert guard.add_parser("fresh", help="ok") is sp.choices["fresh"]  # a new name is fine
+        assert _help_names(sp) == ["apply", "validate", "fresh"]
+
+    def test_a_plugin_that_catches_the_refusal_and_goes_on_is_still_skipped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def register(sp: Any) -> None:
+            sp.add_parser("acme-extra", help="Taken back")
+            with contextlib.suppress(Exception):  # what a careless plugin does
+                sp.add_parser("apply")
+            sp.add_parser("acme-later", help="Taken back too")
+
+        parser, sp, core_apply = _core_parser()
+
+        added, messages = _run_loader(
+            monkeypatch, sp, [FakeEP("careless", register)], ["fluid", "acme-extra"]
+        )
+
+        assert {"acme-extra", "acme-later"}.isdisjoint(_cmd_choices(parser)) and added == {}
+        assert _help_names(sp) == ["apply", "validate"]
+        assert _cmd_choices(parser)["apply"] is core_apply
+        assert len(_shadow_messages(messages)) == 1
+
+    def test_the_plugin_is_handed_the_real_subparsers_state_and_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only ``add_parser`` differs: what a plugin sets on the object it gets is the real
+        action's, and the object still is an ``argparse._SubParsersAction``. Aliases given as a
+        generator survive the check."""
+        seen: dict = {}
+
+        def register(sp: Any) -> None:
+            seen["isinstance"] = isinstance(sp, argparse._SubParsersAction)
+            sp.metavar = "COMMAND"
+            sp.add_parser("acme-new", aliases=(alias for alias in ["acme-nw"]))
+
+        parser, sp, _core_apply = _core_parser()
+
+        added, messages = _run_loader(monkeypatch, sp, [FakeEP("acme", register)], ["fluid", "x"])
+
+        assert seen["isinstance"] is True and sp.metavar == "COMMAND"
+        assert added == {"acme": ["acme-new", "acme-nw"]} and not _shadow_messages(messages)
+        assert parser.parse_args(["acme-nw"]).cmd == "acme-nw"
+
+    def test_the_other_plugins_still_load(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        shadow = FakeEP("shadow", lambda sp: sp.add_parser("apply"))
+        good = FakeEP("good", lambda sp: sp.add_parser("good-new").set_defaults(func=lambda a: 5))
+        parser, sp, core_apply = _core_parser()
+
+        added, messages = _run_loader(monkeypatch, sp, [shadow, good], ["fluid", "good-new"])
+
+        assert added == {"good": ["good-new"]}
+        assert _cmd_choices(parser)["apply"] is core_apply
+        ns = parser.parse_args(["good-new"])
+        assert ns.func(ns, logging.getLogger("test")) == 5  # and its func is adapted
+        assert len(_shadow_messages(messages)) == 1
+
+    def test_the_second_of_two_plugins_with_one_new_name_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def first(sp: Any) -> None:
+            sp.add_parser("shared", help="The first plugin's").set_defaults(func=lambda a: 1)
+
+        def second(sp: Any) -> None:
+            sp.add_parser("second-only", help="Taken back")
+            sp.add_parser("shared", help="Would replace the first plugin's")
+
+        parser, sp, _core_apply = _core_parser()
+
+        added, messages = _run_loader(
+            monkeypatch, sp, [FakeEP("one", first), FakeEP("two", second)], ["fluid", "shared"]
+        )
+
+        choices = _cmd_choices(parser)
+        assert added == {"one": ["shared"]}
+        assert "second-only" not in choices
+        assert parser.parse_args(["shared"]).func(None, logging.getLogger("t")) == 1
+        assert _help_names(sp) == ["apply", "validate", "shared"]
+        (warning,) = _shadow_messages(messages)
+        assert "'two'" in warning and "'shared'" in warning
+
+    def test_a_plugin_cannot_repeat_its_own_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def register(sp: Any) -> None:
+            sp.add_parser("dup")
+            sp.add_parser("dup")
+
+        parser, sp, _core_apply = _core_parser()
+
+        added, messages = _run_loader(
+            monkeypatch, sp, [FakeEP("twice", register)], ["fluid", "dup"]
+        )
+
+        assert "dup" not in _cmd_choices(parser) and added == {}
+        assert len(_shadow_messages(messages)) == 1
+
+    def test_a_core_name_is_reserved_even_when_the_profile_leaves_it_out(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``forge`` is a core command the stable build profile does not register, so it is not
+        in ``choices``; a plugin still may not take it."""
+        parser, sp = _fresh_parser(core=("validate",))
+        assert "forge" not in _cmd_choices(parser)
+
+        added, messages = _run_loader(
+            monkeypatch, sp, [FakeEP("acme", lambda s: s.add_parser("forge"))], ["fluid", "forge"]
+        )
+
+        assert "forge" not in _cmd_choices(parser) and added == {}
+        (warning,) = _shadow_messages(messages)
+        assert "'forge'" in warning
+
+    def test_every_core_name_and_alias_is_reserved(self) -> None:
+        reserved = bootstrap._reserved_command_names()
+        for entry in bootstrap.CORE_COMMANDS:
+            assert set(bootstrap._core_command_names(entry)) <= reserved
+
+    def test_the_warning_carries_the_names_never_the_plugins_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def register(sp: Any) -> None:
+            try:
+                sp.add_parser("apply")
+            except bootstrap.PluginCommandShadowError:
+                raise RuntimeError("boom password=hunter2") from None
+
+        _parser, sp, _core_apply = _core_parser()
+
+        _added, messages = _run_loader(
+            monkeypatch, sp, [FakeEP("acme", register)], ["fluid", "acme-extra"]
+        )
+
+        assert len(_shadow_messages(messages)) == 1
+        assert not any("hunter2" in m or "boom" in m for m in messages)
+
+    def test_a_typed_error_the_plugin_raised_itself_is_a_load_failure_by_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only what the stand-in refused is named in the warning: a plugin that raises the
+        typed error with text of its own gets the type-only message of any failing plugin."""
+
+        def register(_sp: Any) -> None:
+            raise bootstrap.PluginCommandShadowError("x", "token=hunter2")
+
+        _parser, sp, _core_apply = _core_parser()
+
+        _added, messages = _run_loader(
+            monkeypatch, sp, [FakeEP("forger", register)], ["fluid", "acme-extra"]
+        )
+
+        assert not _shadow_messages(messages)
+        assert any(
+            "Failed to load CLI plugin forger: PluginCommandShadowError" in m for m in messages
+        )
+        assert not any("hunter2" in m for m in messages)
+
+    def test_a_refused_plugin_is_neither_loaded_nor_warned_about_twice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runs: List[int] = []
+
+        def register(sp: Any) -> None:
+            runs.append(1)
+            sp.add_parser("apply")
+
+        _parser, sp, _core_apply = _core_parser()
+        ep = FakeEP("acme", register)
+
+        _added, first = _run_loader(monkeypatch, sp, [ep], ["fluid", "acme-extra"])
+        _added, second = _run_loader(monkeypatch, sp, [ep], ["fluid", "acme-extra"], force=True)
+
+        assert runs == [1]
+        assert len(_shadow_messages(first)) == 1 and not _shadow_messages(second)
+
+    def test_force_loads_every_plugin_and_refuses_the_shadowing_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``fluid describe --commands`` loads every plugin whatever command was typed."""
+        shadow = FakeEP("shadow", lambda sp: sp.add_parser("apply"))
+        good = FakeEP("good", lambda sp: sp.add_parser("good-new"))
+        parser, sp, core_apply = _core_parser()
+
+        added, _ = _run_loader(monkeypatch, sp, [shadow, good], ["fluid", "validate"])
+        assert added == {} and not shadow.loaded and not good.loaded  # a core command: no load
+
+        added, messages = _run_loader(
+            monkeypatch, sp, [shadow, good], ["fluid", "validate"], force=True
+        )
+
+        assert added == {"good": ["good-new"]}
+        assert _cmd_choices(parser)["apply"] is core_apply
+        assert len(_shadow_messages(messages)) == 1
+
+    def test_python_310_silent_replacement_is_refused_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(argparse._SubParsersAction, "add_parser", _add_parser_py310)
+        # The stand-in for 3.10 really replaces a taken name without a word ...
+        _p, plain, original = _core_parser()
+        assert plain.add_parser("apply") is not original
+        assert plain.choices["apply"] is not original
+
+        # ... and the loader still refuses it, whatever argparse does.
+        def register(sp: Any) -> None:
+            sp.add_parser("acme-extra", help="Taken back")
+            sp.add_parser("apply", help="Would replace the core command")
+
+        parser, sp, core_apply = _core_parser()
+
+        added, messages = _run_loader(
+            monkeypatch, sp, [FakeEP("acme", register)], ["fluid", "acme-extra"]
+        )
+
+        assert _cmd_choices(parser)["apply"] is core_apply
+        assert "acme-extra" not in _cmd_choices(parser) and added == {}
+        assert _help_names(sp) == ["apply", "validate"]
+        assert len(_shadow_messages(messages)) == 1
+
+
+class TestAShadowingPluginOnTheRealCli:
+    """The real ``build_parser`` and ``fluid describe --commands``, with the plugins faked."""
+
+    def test_build_parser_keeps_the_core_command_and_loads_the_new_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fluid_build.cli import build_parser
+
+        seen: dict = {}
+
+        def shadow_register(sp: Any) -> None:
+            seen["apply"] = sp.choices["apply"]
+            sp.add_parser("apply")
+
+        shadow = FakeEP("shadow", shadow_register)
+        good = FakeEP("good", lambda sp: sp.add_parser("good-new").set_defaults(func=lambda a: 3))
+        monkeypatch.setattr(bootstrap, "_command_plugin_entry_points", lambda: [shadow, good])
+        monkeypatch.setattr(sys, "argv", ["fluid", "good-new"])
+
+        parser = build_parser(["good-new"])
+
+        ns = parser.parse_args(["good-new"])
+        assert ns.func(ns, logging.getLogger("test")) == 3
+        assert _cmd_choices(parser)["apply"] is seen["apply"]
+
+    def test_describe_commands_lists_the_new_name_and_marks_nothing_on_the_core_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fluid_build.describe import command_tree_document
+
+        shadow = FakeEP("shadow", lambda sp: sp.add_parser("apply"))
+        good = FakeEP("good", lambda sp: sp.add_parser("good-new", help="A new command"))
+        monkeypatch.setattr(bootstrap, "_command_plugin_entry_points", lambda: [shadow, good])
+
+        tree = command_tree_document()["commands"]["subcommands"]
+
+        assert tree["good-new"]["plugin"] == "good"
+        assert "plugin" not in tree["apply"]

@@ -54,11 +54,12 @@ class AlertRouteError(ValueError):
 class AlertRoute:
     """One route, read and checked (:func:`fluid_build.alerts.routes.read_alert_plan`).
 
-    ``connection`` is the Airflow connection id, never a URL or a key. ``to`` and ``sender``
-    are email addresses (``sender`` is the contract's ``from``). ``options`` holds a plugin
-    kind's own settings: JSON values whose strings carry no template syntax, no URL and no
-    secret. ``origin`` says where the route came from: ``contract`` or ``org default <entry
-    point name>``.
+    ``connection`` is the Airflow connection id, never a URL or a key; a kind's ``check`` and
+    ``kwargs`` see the kind's ``default_connection`` here when the contract's route names none.
+    ``to`` and ``sender`` are email addresses (``sender`` is the contract's ``from``).
+    ``options`` holds a plugin kind's own settings: JSON values whose strings carry no template
+    syntax, no URL and no secret. ``origin`` says where the route came from: ``contract`` or
+    ``org default <entry point name>``.
     """
 
     name: str
@@ -154,11 +155,13 @@ class AlertNotifier:
     #: The events this kind can send. A route that asks for another is refused.
     events: FrozenSet[str] = frozenset(EVENTS)
 
-    #: Whether a route of this kind must name an Airflow connection.
+    #: Whether a route of this kind must name an Airflow connection: only when this is true and
+    #: :attr:`default_connection` is ``None``.
     requires_connection: bool = True
 
-    #: The Airflow connection the notifier uses when a route names none (the provider's
-    #: default), shown in the DAG's documentation.
+    #: The Airflow connection a route that names none uses, a plain connection id (a provider's
+    #: own, such as ``slack_default``). :meth:`check` and :meth:`kwargs` get it as the route's
+    #: ``connection``, so the kind needs no fallback; a connection the route names wins.
     default_connection: Optional[str] = None
 
     def check(self, route: AlertRoute) -> Sequence[str]:
@@ -173,7 +176,8 @@ class AlertNotifier:
 
         A string may hold Jinja for Airflow's context (``{{ ti.task_id }}``): the notifier
         renders its template fields when it sends. The route's own values are already checked
-        to hold no template syntax, so passing them on is safe.
+        to hold no template syntax, so passing them on is safe. ``route.connection`` is the
+        connection the notifier uses: the route's own, else :attr:`default_connection`.
         """
         raise NotImplementedError(f"{type(self).__name__}.kwargs")
 

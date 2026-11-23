@@ -4,13 +4,14 @@
 """What ``airflowOrchestration.dagId`` and ``airflowTask.taskId`` take, in the schema a proposal
 declares.
 
-Airflow takes ASCII letters of either case, digits, ``_``, ``.`` and ``-`` in a DAG id and a task
-id (250 characters at most). The preview schemas take the same; the released ones up to 0.7.6 take
-lower case only. The importer asks the schema of the ``fluidVersion`` it writes, through the
-validator every command uses, so an id is recorded exactly as Airflow spells it when that schema
-takes it, and under the importer's lower case identifier of it when the schema does not. The day a
-schema that takes Airflow's ids is the one proposals declare, the importer records exact ids
-without a change here.
+Airflow takes letters and digits (of any script), ``_``, ``.`` and ``-`` in a DAG id and a task id
+(250 characters at most). The preview schemas take the ASCII part of that rule (ASCII letters of
+either case, digits, ``_``, ``.`` and ``-``); the released ones up to 0.7.6 take lower case only.
+The importer asks the schema of the ``fluidVersion`` it writes, through the validator every
+command uses, so an id is recorded exactly as Airflow spells it when that schema takes it, and
+under the importer's lower case identifier of it when the schema does not. The day a schema that
+takes Airflow's ids is the one proposals declare, the importer records exact ids without a change
+here.
 """
 
 from __future__ import annotations
