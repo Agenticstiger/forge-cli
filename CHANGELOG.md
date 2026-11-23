@@ -7,7 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`fluid profile --privacy-unit` warns when `rho` is above 1.** The release still runs, and
+  `--rho` still takes any number above zero. The warning cites OpenDP's rule of thumb, an epsilon
+  of at most 1 (rho 0.5), and the rho of about 2.6 to 7.7 that the US Census Bureau's 2020 Census
+  products used. The help also says in one sentence what the privacy unit is.
+
+### Changed
+
+- **`fluid profile --help`'s import ceiling is one higher, 328 modules.** A clean install measures
+  310 to 320 on Python 3.10 to 3.14, one environment with more packages installed measured 327, and
+  none of the modules the command's help imports beyond `fluid --help` can be deferred. A run over
+  the ceiling now lists those modules (`tests/perf/test_startup_budget.py`).
+
 ### Fixed
+
+- **`fluid profile --request` checks the facts of a table together, so that their counts cannot be
+  differenced back to a small cell.** Each fact's own two cells were checked, but facts that overlap
+  give more together than each alone: `A` beside `A OR id = 'x'` differs by the one row `x`, and
+  `A`, `B` and `A OR B` give `|A AND B|` however large each pair's difference is. The profiler now
+  counts every combination of a table's facts' states in one pass, on the exact counts before any
+  rounding, and withholds each fact that touches a combination of 1 to `minimumCell - 1` records
+  or, where zeros are disclosive, an empty combination that the rules' texts do not rule out, until
+  no such combination is left. A fact it withholds is written `C` and counted `D`, and what it
+  withholds does not depend on the order of the facts. A fact whose `when` leaves fewer than
+  `minimumCell` rows uncovered, or none where zeros are disclosive, is withheld too, since the
+  table's `rowCount` less the fact's `k` gives that count, and a withheld fact with a `when` writes
+  the band `{min: 0}` in place of the band of the rows it covers. The check does not cover a fact's
+  overlap with a histogram's cells, a column's counts or a relationship's counts: the release under
+  differential privacy is the way to publish such counts, with noise.
 
 - **An alert route names a connection only when its kind has no default.** A route kind with
   `requires_connection` and a `default_connection` (such as a plugin's kind from
