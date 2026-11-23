@@ -266,6 +266,14 @@ class DesiredRun:
     #: maintains, on its writer build's runtime and role. Its own run name, job config and run
     #: history keep it apart from the build's runs. None for a build's run.
     maintains: Optional[str] = None
+    #: A maintenance run of a table no forge build writes: it runs on the runtime, and as the
+    #: role, its ``iceberg.maintenance.runtime`` names, and :attr:`build` is the name its
+    #: artifacts and tags go by (``spark.names.maintenance_build``), not a build's id.
+    maintenance_runtime: bool = False
+    #: A maintenance run's plugin actions as the plan binds them, each its name, kind,
+    #: distribution, version and the sha256 of its statements
+    #: (:meth:`fluid_build.maintenance.job.CompiledAction.plan_entry`); never their SQL.
+    maintenance_actions: Tuple[Mapping[str, Any], ...] = ()
     #: What the runner stamps on each Iceberg commit beside the product, build and job config
     #: digest: the version of the build's output, the contract's digest, the release the deploy
     #: names and the pipeline's run id (``--fluid-*``). They are sent as runner arguments,
@@ -467,7 +475,17 @@ class DesiredRun:
         }
 
     def _maintain_action(self, step: int) -> Dict[str, Any]:
-        """A backend-spark table maintenance's plan action (:data:`MAINTAIN_ACTION`)."""
+        """A backend-spark table maintenance's plan action (:data:`MAINTAIN_ACTION`). Its
+        ``actions`` name each plugin action, the package and version that shipped its kind and
+        the sha256 of its statements, which ``fluid apply`` compares one by one
+        (``cli/_spark_apply.py``) before the job config's digest."""
+        if self.maintenance_runtime:
+            where = (
+                f"on the runtime exposes[{self.maintains}].iceberg.maintenance.runtime names, as "
+                "its executionRoleArn, beside the writers of the table, which forge does not run"
+            )
+        else:
+            where = f"on build {self.build}'s runtime, beside its runs"
         return {
             "step": step,
             "action_id": f"spark_maintain_{self.maintains}",
@@ -479,7 +497,7 @@ class DesiredRun:
             "payload": {
                 "product": self.product,
                 "expose": self.maintains,
-                "build": self.build,
+                "build": None if self.maintenance_runtime else self.build,
                 "runtime": self.runtime,
                 "region": self.region,
                 "target": dict(self.target),
@@ -488,10 +506,11 @@ class DesiredRun:
                 "jobConfigDigest": self.job_digest,
                 "runnerSha256": self.runner_sha256,
                 "configHash": self.config_hash,
+                "actions": [dict(a) for a in self.maintenance_actions],
                 "stateImpact": (
                     "started by the table's maintenance DAG (fluid apply --mode maintain "
-                    f"--expose-id {self.maintains}) on build {self.build}'s runtime, beside its "
-                    "runs; a plain fluid apply only deploys its job config"
+                    f"--expose-id {self.maintains}) {where}; a plain fluid apply only deploys "
+                    "its job config"
                 ),
             },
         }
@@ -771,11 +790,19 @@ def spark_builds(contract: Mapping[str, Any], build_id: Optional[str] = None) ->
 
 
 def _placement(
-    cfg: Mapping[str, Any], runtime: str, product: str, bid: str, loc: Mapping[str, Any]
+    cfg: Mapping[str, Any],
+    runtime: str,
+    product: str,
+    bid: str,
+    loc: Mapping[str, Any],
+    where: Optional[str] = None,
+    prefix: str = "parameters.spark",
 ) -> Tuple[str, str, Dict[str, str]]:
     """Where a run of the build runs: its region, the role it runs as, and its target (the
     application, cluster, virtual cluster or Glue job). A local run has none of them: it
-    runs with the credentials of the machine it runs on."""
+    runs with the credentials of the machine it runs on. ``cfg`` is the build's
+    ``parameters.spark``, or a table maintenance's ``runtime`` (``where`` and ``prefix`` then
+    name it in a refusal)."""
     if runtime == "local":
         return "", "", {}
     # An undeclared region is the credentials' when the run starts (REGION_TOKEN), so a
@@ -795,8 +822,8 @@ def _placement(
     elif runtime == "emr-ec2":
         if not cfg.get("clusterId"):
             raise ValueError(
-                f"Spark build {bid}: runtime emr-ec2 runs on a cluster that is running; "
-                "set parameters.spark.clusterId (a transient cluster is not supported yet)"
+                f"{where or f'Spark build {bid}'}: runtime emr-ec2 runs on a cluster that is "
+                f"running; set {prefix}.clusterId (a transient cluster is not supported yet)"
             )
         target["clusterId"] = str(cfg["clusterId"])
     elif runtime == "emr-eks":

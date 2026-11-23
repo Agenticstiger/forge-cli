@@ -782,6 +782,44 @@ def _rest_sink(resolved: Any, database: str, table: str, fields: Any) -> dict[st
     return sink
 
 
+def maintenance_sink(
+    contract: Mapping[str, Any], expose_id: str, *, account_ref: str = ""
+) -> dict[str, Any]:
+    """The ``sink`` of a maintenance job config for an Iceberg expose no forge build writes
+    (``iceberg.maintenance.runtime``): the table as a build that wrote it would name it, from
+    the expose's binding alone (a Glue-catalog table on an AWS runtime), with no ``create``:
+    maintenance never creates a table.
+
+    Raises:
+        ValueError: the expose is not one Glue-catalog Iceberg table with one database and
+            table, or names no bucket and no ``account_ref`` was given.
+    """
+    where = f"exposes[{expose_id}].iceberg.maintenance.runtime"
+    targets = [
+        e
+        for e in contract.get("exposes") or []
+        if isinstance(e, Mapping) and str(e.get("exposeId")) == expose_id
+    ]
+    if len(targets) != 1:
+        raise ValueError(f"{where}: exposeId {expose_id!r} must name one expose")
+    binding = _object(targets[0].get("binding"), f"exposes[{expose_id}].binding")
+    if binding.get("format") != "iceberg":
+        raise ValueError(f"{where}: the expose's binding.format must be iceberg")
+    loc = _object(binding.get("location"), f"exposes[{expose_id}].binding.location")
+    if bucket_uses_fallback(loc) and not account_ref:
+        raise ValueError(
+            f"{where}: the expose names no bucket, so its warehouse is the account's "
+            "<account>-fluid-data bucket; pass the account"
+        )
+    resolved = resolve_iceberg_catalog(binding, account_ref=account_ref)
+    _check_catalog(False, binding, catalog_kind_info(resolved.kind).family, where)
+    parts = resolved.fq_table.split(".")
+    if len(parts) != 2 or "None" in parts:
+        raise ValueError(f"{where}: the expose needs one database and table")
+    database, table = (validate_ident(p) for p in parts)
+    return _sink(False, resolved, database, table, ())
+
+
 def compile_job_config(
     contract: Mapping[str, Any],
     build: Mapping[str, Any],
