@@ -28,6 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--out-report PATH` also writes the report to a file, the one file `--check` writes. A product the
   code no longer has leaves its contract file behind, and the check does not look for it.
 
+- **`fluid generate ci --add import-drift` puts that gate in a generated pipeline.** Give it
+  `--import-tool airflow|pyspark` and `--import-source DIR`, and the options the import that wrote the
+  contracts had (`--import-out`, `--import-split-by`, `--import-conventions`, `--import-dags`).
+  Every CI system then runs `fluid import <tool> <source> --check` on every pull or merge request and
+  every push to the default branch, and fails when the contracts have drifted or the check cannot
+  decide. It is not a numbered stage and never advisory: GitHub Actions gets its own workflow,
+  `fluid-import-drift.yml`, with `--format github` so drift shows as annotations; GitLab, Azure
+  DevOps, CircleCI and Tekton run it beside the plan and apply, Jenkins and Bitbucket before apply, as
+  their security scan runs. Each path is checked and written as one quoted shell word, never an
+  expansion a run could override.
+
 ## [0.38.0] — 2026-11-22
 
 ### Added

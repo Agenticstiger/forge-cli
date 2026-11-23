@@ -69,7 +69,7 @@ class BitbucketTemplate(BasePipelineTemplate):
 
     def _pipeline(self, config: PipelineConfig) -> Dict[str, Any]:
         branch = self._branch(config)
-        add_ons = _thin.check_add_ons(config.add_ons)
+        add_ons = _thin.check_add_ons(config.add_ons, config.import_drift)
         custom: Dict[str, Any] = {
             CUSTOM_PIPELINE: [
                 {"variables": self._prompt(config)},
@@ -81,7 +81,10 @@ class BitbucketTemplate(BasePipelineTemplate):
         # (fluid verify, which reaches the cloud, with the same variables apply
         # has) in its own manual pipeline. Bitbucket has no advisory step, so a
         # failed security scan also stops the apply step after it.
-        beside_pr = [self._add_on_step(config, a) for a in add_ons if a == "security"]
+        # The import drift gate sits beside the plan on both, as security does.
+        beside_pr = [
+            self._add_on_step(config, a) for a in add_ons if a in ("security", "import-drift")
+        ]
         beside_branch = [self._add_on_step(config, a) for a in add_ons if a != "compliance"]
         if "compliance" in add_ons:
             custom[f"{CUSTOM_PIPELINE}-compliance"] = [self._add_on_step(config, "compliance")]
@@ -171,21 +174,23 @@ class BitbucketTemplate(BasePipelineTemplate):
     def _add_on_step(self, config: PipelineConfig, add_on: str) -> Dict[str, Any]:
         cd = f'cd "{check_pipeline_workdir(config.workdir)}"\n' if config.workdir else ""
         script = "\n".join(
-            _thin.add_on_script(add_on, config.contract_path or _thin.DEFAULT_CONTRACT)
+            _thin.add_on_script(
+                add_on, config.contract_path or _thin.DEFAULT_CONTRACT, config.import_drift
+            )
         )
         prefix = f"{check_pipeline_workdir(config.workdir).rstrip('/')}/" if config.workdir else ""
-        return {
-            "step": {
-                "name": _thin.ADD_ON_TITLES[add_on],
-                "image": IMAGE,
-                "script": [
-                    _keyless.LiteralStr(self._environment_script(config)),
-                    _keyless.LiteralStr("(\n" + self._render_install_setup(config) + "\n)\n"),
-                    _keyless.LiteralStr(cd + script + "\n"),
-                ],
-                "artifacts": [f"{prefix}runtime/**"],
-            }
+        step: Dict[str, Any] = {
+            "name": _thin.ADD_ON_TITLES[add_on],
+            "image": IMAGE,
+            "script": [
+                _keyless.LiteralStr(self._environment_script(config)),
+                _keyless.LiteralStr("(\n" + self._render_install_setup(config) + "\n)\n"),
+                _keyless.LiteralStr(cd + script + "\n"),
+            ],
         }
+        if add_on != "import-drift":  # the gate writes nothing
+            step["artifacts"] = [f"{prefix}runtime/**"]
+        return {"step": step}
 
     def _deployment(self, config: PipelineConfig) -> str:
         """Bitbucket has test, staging and production until someone adds more."""

@@ -98,6 +98,8 @@ def _generate(tmp_path: Path, monkeypatch, system: str, add_ons: tuple = ()) -> 
         contract="contract.fluid.yaml",
         add=list(add_ons),
         provider=None,
+        import_tool="airflow" if "import-drift" in add_ons else None,
+        import_source="dags" if "import-drift" in add_ons else None,
     )
     assert generate_ci_run(args, _LOG) == 0
     return {

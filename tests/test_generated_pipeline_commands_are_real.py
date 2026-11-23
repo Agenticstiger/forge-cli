@@ -28,7 +28,7 @@ import pytest
 import yaml
 
 from fluid_build.cli import build_parser
-from fluid_build.forge.core.pipeline_systems._thin import ADD_ONS
+from fluid_build.forge.core.pipeline_systems._thin import ADD_ONS, ImportDrift
 from fluid_build.forge.core.pipeline_templates import (
     PipelineConfig,
     PipelineProvider,
@@ -133,7 +133,8 @@ def _generated_documents(provider, add_ons):
     raw text, which over-reads slightly but is far better than the previous
     behaviour of skipping them entirely and reporting the system as clean.
     """
-    config = PipelineConfig(provider=provider, add_ons=add_ons)
+    drift = ImportDrift("airflow", "dags") if "import-drift" in add_ons else None
+    config = PipelineConfig(provider=provider, add_ons=add_ons, import_drift=drift)
     files = PipelineTemplateGenerator().generate_pipeline(config)
     for name, content in files.items():
         text = str(content)

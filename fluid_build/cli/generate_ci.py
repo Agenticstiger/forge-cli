@@ -37,7 +37,22 @@ from ._logging import info
 
 #: The jobs ``--add`` puts beside the pipeline: pipeline_systems._thin.ADD_ONS,
 #: copied so ``fluid --help`` does not import the templates (a test keeps them equal).
-ADD_ONS = ("security", "compliance", "sbom")
+ADD_ONS = ("security", "compliance", "sbom", "import-drift")
+
+#: ``--import-*`` flag -> ``ImportDrift`` field, in the order the command writes them.
+_IMPORT_FLAGS = (
+    ("import_tool", "--import-tool"),
+    ("import_source", "--import-source"),
+    ("import_out", "--import-out"),
+    ("import_split_by", "--import-split-by"),
+    ("import_conventions", "--import-conventions"),
+    ("import_dags", "--import-dags"),
+)
+
+#: What ``--import-tool`` and ``--import-split-by`` take: pipeline_systems._thin.IMPORT_TOOLS
+#: and IMPORT_SPLIT_BY, copied for the same reason as ADD_ONS.
+IMPORT_TOOLS = ("airflow", "pyspark")
+IMPORT_SPLIT_BY = ("table", "job", "dag", "task", "folder", "project")
 
 #: ``fluid apply --mode`` values and stage-11 schedulers, for the option
 #: choices (kept here so ``--help`` does not import the template modules).
@@ -152,8 +167,47 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
         help=(
             "Add a job beside the pipeline; repeatable: security (a daily scan with "
             "OSV-Scanner and fluid policy-check), compliance (a weekly policy report "
-            "and lineage check), sbom (an SBOM of the repository)."
+            "and lineage check), sbom (an SBOM of the repository), import-drift (a gate on "
+            "every pull request and push to the default branch: `fluid import <tool> "
+            "<source> --check` fails when the committed contracts no longer match the "
+            "code; needs --import-tool and --import-source)."
         ),
+    )
+    p.add_argument(
+        "--import-tool",
+        choices=list(IMPORT_TOOLS),
+        default=None,
+        help="With --add import-drift: the importer whose contracts are checked.",
+    )
+    p.add_argument(
+        "--import-source",
+        default=None,
+        metavar="DIR",
+        help="With --add import-drift: the directory the import reads (DAGs or jobs).",
+    )
+    p.add_argument(
+        "--import-out",
+        default=None,
+        metavar="PATH",
+        help="With --add import-drift: where the import wrote its contracts (--out).",
+    )
+    p.add_argument(
+        "--import-split-by",
+        choices=list(IMPORT_SPLIT_BY),
+        default=None,
+        help="With --add import-drift: the product boundary the import used (--split-by).",
+    )
+    p.add_argument(
+        "--import-conventions",
+        default=None,
+        metavar="FILE",
+        help="With --add import-drift: the conventions file the import used.",
+    )
+    p.add_argument(
+        "--import-dags",
+        default=None,
+        metavar="DIR",
+        help="With --add import-drift and --import-tool pyspark: the DAGs directory.",
     )
     p.add_argument(
         "--default-branch",
@@ -654,6 +708,41 @@ def _check_scheduler_destination(raw: str, scheduler: str) -> str:
     return raw
 
 
+def _import_drift_from_args(args: Any, add_ons: Tuple[str, ...]) -> Optional[Any]:
+    """The ``import-drift`` settings from the ``--import-*`` flags: ``None``
+    without the add-on. The flags and the add-on go together."""
+    given = {flag: getattr(args, dest, None) for dest, flag in _IMPORT_FLAGS}
+    if "import-drift" not in add_ons:
+        stray = [flag for flag, value in given.items() if value is not None]
+        if stray:
+            raise CLIError(
+                1,
+                "generate_ci_import_flags_without_add_on",
+                {"flags": stray, "hint": "these belong to --add import-drift"},
+            )
+        return None
+    missing = [flag for flag in ("--import-tool", "--import-source") if given[flag] is None]
+    if missing:
+        raise CLIError(
+            1,
+            "generate_ci_import_drift_incomplete",
+            {"missing": missing, "hint": "--add import-drift needs the tool and the source"},
+        )
+    from fluid_build.forge.core.pipeline_systems._thin import ImportDrift
+
+    try:
+        return ImportDrift(
+            tool=str(given["--import-tool"]),
+            source=str(given["--import-source"]),
+            out=given["--import-out"] or "",
+            split_by=given["--import-split-by"] or "",
+            conventions=given["--import-conventions"] or "",
+            dags=given["--import-dags"] or "",
+        )
+    except ValueError as exc:
+        raise CLIError(1, "generate_ci_invalid_option", {"error": str(exc)})
+
+
 def _check_fluid_env_default(raw: Optional[str]) -> Optional[str]:
     """``--fluid-env-default``, refused at generation time when a stage would
     refuse it at run time. ``None`` when the option is not given: the pipeline
@@ -817,6 +906,7 @@ def run(args, logger: logging.Logger) -> int:
         if getattr(args, "complexity", None) is not None:
             raise CLIError(2, "generate_ci_complexity_removed", {"message": _COMPLEXITY_REMOVED})
         add_ons = tuple(getattr(args, "add", None) or ())
+        import_drift = _import_drift_from_args(args, add_ons)
         from fluid_build.cli._pipeline_files import detect_default_branch, warn_legacy_ci_files
 
         default_branch = getattr(args, "default_branch", None) or detect_default_branch()
@@ -884,6 +974,7 @@ def run(args, logger: logging.Logger) -> int:
         config = PipelineConfig(
             provider=provider,
             add_ons=add_ons,
+            import_drift=import_drift,
             default_branch=default_branch,
             workdir=workdir,
             contract_path=pipeline_contract,

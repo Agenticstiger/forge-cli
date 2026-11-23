@@ -25,7 +25,7 @@ each CI system's quirks stay contained and the file count is bounded.
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fluid_build._env_names import ENV_NAME_RULE, is_env_name
 
@@ -353,8 +353,12 @@ class PipelineConfig:
     # run the plan phase (``fluid generate ci --default-branch``).
     default_branch: str = "main"
     # The opt-in jobs beside the pipeline (``fluid generate ci --add``), from
-    # ``_thin.ADD_ONS``: security, compliance, sbom.
+    # ``_thin.ADD_ONS``: security, compliance, sbom, import-drift. The last needs
+    # ``import_drift``; generation raises ``ValueError`` without it.
     add_ons: Tuple[str, ...] = ()
+    # What the import-drift add-on checks (a ``_thin.ImportDrift``; typed Any
+    # because ``_thin`` imports this module).
+    import_drift: Optional[Any] = None
 
     def __post_init__(self):
         branch = check_pipeline_literal("default branch", self.default_branch or "")
