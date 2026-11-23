@@ -867,7 +867,10 @@
     "icebergMaintenance": {
       "type": "object",
       "additionalProperties": false,
-      "description": "NEW in v0.7.7: What keeps the Iceberg table healthy, run on a schedule. backend spark (the default) runs it with forge's Spark runner, on the runtime and as the role of the engine: spark build that writes the table, from the table's maintenance DAG (fluid apply --mode maintain --expose-id <expose>), while that build's stream keeps running; fluid plan binds its job config. backend glue has fluid apply provision the AWS Glue Data Catalog's table optimizers, which AWS runs. A run takes actions, compaction, rewriteManifests, expireSnapshots and removeOrphanFiles in that order. iceberg.compaction.targetFileSizeMb and iceberg.snapshotRetention are the defaults of the same settings here.",
+      "not": {
+        "required": ["build", "runtime"]
+      },
+      "description": "NEW in v0.7.7: What keeps the Iceberg table healthy, run on a schedule. backend spark (the default) runs it with forge's Spark runner, on the runtime and as the role of the engine: spark build that writes the table, from the table's maintenance DAG (fluid apply --mode maintain --expose-id <expose>), while that build's stream keeps running; fluid plan binds its job config and the sha256 of each action's statements. A table no forge build writes names its own EMR runtime with runtime instead of build (one or the other, never both). backend glue has fluid apply provision the AWS Glue Data Catalog's table optimizers, which AWS runs. A run takes actions, compaction, rewriteManifests, expireSnapshots and removeOrphanFiles in that order. iceberg.compaction.targetFileSizeMb and iceberg.snapshotRetention are the defaults of the same settings here.",
       "properties": {
         "backend": {
           "type": "string",
@@ -893,6 +896,9 @@
           "type": "string",
           "minLength": 1,
           "description": "backend spark: the id of the engine: spark build whose output this expose is, when more than one is; its runtime and role run the maintenance."
+        },
+        "runtime": {
+          "$ref": "#/$defs/sparkRuntime"
         },
         "roleArn": {
           "type": "string",
@@ -4765,6 +4771,87 @@
               }
             },
             "description": "EMR Serverless and EMR on EC2 name the release itself: emr-X.Y.Z"
+          }
+        }
+      ]
+    },
+    "sparkRuntime": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "NEW in v0.7.7 (preview): The EMR runtime that maintains an Iceberg table no forge build writes (exposes[].iceberg.maintenance.runtime, backend spark, in place of build), such as a table whose streams run on its team's own runner. Its keys are a build's parameters.spark keys, under the same operator lists (FLUID_SPARK_EXECUTION_ROLE_ALLOWLIST, FLUID_SPARK_TARGET_ALLOWLIST, FLUID_SPARK_CONF_ALLOWLIST). fluid apply uploads the runner and the maintenance job config under _fluid/spark/<product>/maintain_<expose>/ in the table's bucket, which the role must be able to read; forge provisions no runtime and no role for it. removeOrphanFiles then needs an explicit olderThan, longer than the writer's longest commit delay, which forge cannot see.",
+      "required": [
+        "runtime",
+        "executionRoleArn"
+      ],
+      "properties": {
+        "runtime": {
+          "enum": [
+            "emr-serverless",
+            "emr-ec2",
+            "emr-eks"
+          ],
+          "description": "The EMR runtime the maintenance runs on: an existing EMR Serverless application (applicationId), a running EMR cluster (clusterId) or an EMR on EKS virtual cluster (virtualClusterId), whichever the team's own runner uses."
+        },
+        "applicationId": {
+          "$ref": "#/$defs/sparkParameters/properties/applicationId"
+        },
+        "clusterId": {
+          "$ref": "#/$defs/sparkParameters/properties/clusterId"
+        },
+        "virtualClusterId": {
+          "$ref": "#/$defs/sparkParameters/properties/virtualClusterId"
+        },
+        "releaseLabel": {
+          "$ref": "#/$defs/sparkParameters/properties/releaseLabel"
+        },
+        "executionRoleArn": {
+          "$ref": "#/$defs/sparkParameters/properties/executionRoleArn"
+        },
+        "sparkConf": {
+          "$ref": "#/$defs/sparkParameters/properties/sparkConf"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "runtime": {
+                "const": "emr-serverless"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "applicationId"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "runtime": {
+                "const": "emr-ec2"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "clusterId"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "runtime": {
+                "const": "emr-eks"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "virtualClusterId"
+            ]
           }
         }
       ]

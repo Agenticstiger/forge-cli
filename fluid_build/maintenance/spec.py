@@ -20,7 +20,19 @@
               - {name: erase, kind: gdpr-erasure, options: {requests: gdpr.requests}}
 
 ``backend: spark`` runs it with forge's Spark runner, on the runtime and as the role of the
-``engine: spark`` build that writes the table, while that build's stream keeps running.
+``engine: spark`` build that writes the table, while that build's stream keeps running. A table
+no forge build writes (its streams run on the team's own runner) names its own EMR runtime
+instead, with ``runtime`` in place of ``build``::
+
+    maintenance:
+      schedule: "0 3 * * *"
+      runtime: {runtime: emr-serverless, applicationId: 00f1abcd2345,
+                executionRoleArn: "arn:aws:iam::123456789012:role/orders-maintenance"}
+      compaction: {}
+      removeOrphanFiles: {olderThan: P7D}
+
+forge cannot see that writer's commit delay, so removing orphan files there needs an explicit
+``olderThan`` (one under three days is warned about, :func:`maintenance_warnings`).
 ``backend: glue`` hands compaction, snapshot retention and orphan deletion to the AWS Glue Data
 Catalog's table optimizers (``aws_glue_catalog_table_optimizer``), which ``fluid apply``
 provisions and AWS runs. :mod:`fluid_build.maintenance` says where each part runs.
@@ -55,8 +67,40 @@ ACTION_KEYS: Tuple[str, ...] = (
 )
 
 _BLOCK_KEYS = frozenset(
-    {"backend", "schedule", "timezone", "build", "roleArn", "runEveryHours", *ACTION_KEYS}
+    {
+        "backend",
+        "schedule",
+        "timezone",
+        "build",
+        "runtime",
+        "roleArn",
+        "runEveryHours",
+        *ACTION_KEYS,
+    }
 )
+#: The runtimes a table no forge build writes may be maintained on: the EMR ones, each with a
+#: target the team already runs (Glue's one job is a build's, and a local run writes a REST
+#: catalog's table).
+RUNTIMES: Tuple[str, ...] = ("emr-serverless", "emr-ec2", "emr-eks")
+#: The keys of ``runtime``: the ones of a build's ``parameters.spark`` that say where a run
+#: runs and as whom (``$defs/sparkRuntime``).
+_RUNTIME_KEYS = frozenset(
+    {
+        "runtime",
+        "applicationId",
+        "clusterId",
+        "virtualClusterId",
+        "releaseLabel",
+        "executionRoleArn",
+        "sparkConf",
+    }
+)
+#: The target each runtime needs: a table no forge build writes runs on one the team has.
+_RUNTIME_TARGET = {
+    "emr-serverless": "applicationId",
+    "emr-ec2": "clusterId",
+    "emr-eks": "virtualClusterId",
+}
 _COMPACTION_KEYS = frozenset(
     {
         "enabled",
@@ -93,8 +137,14 @@ DEFAULT_EXPIRE_SECONDS = 5 * 86400
 DEFAULT_RETAIN_LAST = 1
 #: Iceberg's default ``partial-progress.max-commits``.
 DEFAULT_MAX_COMMITS = 10
+#: Iceberg's default ``max-concurrent-file-group-rewrites``, written out so the job config says
+#: how many file groups a run rewrites at once beside a live writer.
+DEFAULT_MAX_CONCURRENT_REWRITES = 5
 #: How many plugin actions one table may declare.
 MAX_ACTIONS = 20
+#: Under this, removing orphan files of a table forge does not write is warned about: its
+#: writer's commit delay is not one forge can see (Iceberg's own default is 3 days).
+WARN_ORPHAN_SECONDS = DEFAULT_ORPHAN_SECONDS
 
 _ROLE_ARN = re.compile(r"arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,512}\Z")
 _ACTION_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}\Z")
@@ -157,6 +207,10 @@ class TableMaintenance:
     #: The ``engine: spark`` build that writes the table (backend spark): its runtime and
     #: role run the maintenance.
     build_id: Optional[str] = None
+    #: The EMR runtime a table no forge build writes is maintained on (backend spark, in place
+    #: of ``build_id``): ``runtime``, its target, ``executionRoleArn``, and optionally
+    #: ``releaseLabel`` and ``sparkConf``, as a build's ``parameters.spark`` spells them.
+    runtime: Optional[Mapping[str, Any]] = field(default=None, hash=False)
     #: The role Glue's optimizers run as (backend glue).
     role_arn: Optional[str] = None
     #: How often Glue runs the retention and orphan optimizers (backend glue).
@@ -626,10 +680,90 @@ def _check_timezone(value: Any, where: str, errors: List[str]) -> str:
         return "UTC"
 
 
+def runtime_build(expose_id: str, runtime: Mapping[str, Any]) -> Dict[str, Any]:
+    """The ``runtime`` of a table no forge build writes, as the Spark build whose
+    ``parameters.spark`` it would be: what the operator's policy and the runtime field checks
+    read (``iac/providers/aws_identity.py``), under the name its artifacts go by
+    (``spark.names.maintenance_build``)."""
+    from fluid_build.spark.names import maintenance_build
+
+    return {
+        "id": maintenance_build(expose_id),
+        "engine": "spark",
+        "outputs": [expose_id],
+        "properties": {"parameters": {"spark": dict(runtime)}},
+    }
+
+
+def runtime_findings(
+    expose_id: str, runtime: Mapping[str, Any], environ: Optional[Mapping[str, str]] = None
+) -> Tuple[List[str], List[str]]:
+    """``(errors, missing operator entries)`` of a table's maintenance ``runtime``: the checks a
+    build's ``parameters.spark`` goes through (its fields' shapes, the release label, a
+    ``sparkConf`` key no contract may set, and the operator's role, target and ``sparkConf``
+    lists), each message naming the runtime block. A missing entry is a warning in ``fluid
+    validate`` and a refusal where a run is compiled or provisioned."""
+    from fluid_build.iac.providers import aws_identity
+
+    build = runtime_build(expose_id, runtime)
+    errors, missing = aws_identity.identity_findings(build, environ)
+    if runtime.get("executionRoleArn"):  # without one, the block's own error says so
+        errors += aws_identity.runtime_errors(build)
+    head = f"Spark build {build['id']}: parameters.spark."
+    at = f"exposes[{expose_id}].iceberg.maintenance.runtime."
+    return [e.replace(head, at) for e in errors], [m.replace(head, at) for m in missing]
+
+
+def _read_runtime(raw: Any, eid: str, where: str, errors: List[str]) -> Optional[Dict[str, Any]]:
+    """A backend-spark block's ``runtime``, checked; None (with ``errors``) when it cannot run."""
+    from fluid_build.build_runners.spark._desired import _placement
+
+    at = f"{where}.runtime"
+    before = len(errors)
+    if not isinstance(raw, Mapping):
+        errors.append(f"{at} must be a mapping")
+        return None
+    _check_keys(raw, _RUNTIME_KEYS, at, errors)
+    runtime = raw.get("runtime")
+    if runtime not in RUNTIMES:
+        errors.append(
+            f"{at}.runtime must be one of {', '.join(RUNTIMES)}: a table no forge build writes "
+            "is maintained on an EMR runtime its team runs (runtime local and glue are a "
+            "build's)"
+        )
+        return None
+    if not isinstance(raw.get("executionRoleArn"), str) or not raw["executionRoleArn"]:
+        errors.append(
+            f"{at}.executionRoleArn is required: no forge build writes the table, so no "
+            "build's role runs its maintenance (on emr-ec2, name the instance-profile role the "
+            "cluster's steps run as)"
+        )
+    target = _RUNTIME_TARGET[runtime]
+    if runtime == "emr-ec2":
+        try:  # the build's own refusal, naming this block
+            _placement(raw, runtime, "", "", {}, at, at)
+        except ValueError as exc:
+            errors.append(str(exc))
+    elif not raw.get(target):
+        errors.append(
+            f"{at}.{target} is required on runtime {runtime}: forge provisions no runtime for "
+            "a table it does not write"
+        )
+    conf = raw.get("sparkConf")
+    if conf is not None and not isinstance(conf, Mapping):
+        errors.append(f"{at}.sparkConf must be a mapping of names to strings")
+    elif conf is not None and any(not isinstance(v, str) for v in conf.values()):
+        errors.append(f"{at}.sparkConf values must be strings")
+    else:
+        errors += runtime_findings(eid, raw)[0]
+    return dict(raw) if len(errors) == before else None
+
+
 def _read_spark_placement(
     contract: Mapping[str, Any], raw: Mapping[str, Any], eid: str, where: str, errors: List[str]
-) -> Tuple[Optional[str], str, Optional[str]]:
-    """``(schedule, timezone, build id)`` of a backend-spark block."""
+) -> Tuple[Optional[str], str, Optional[str], Optional[Dict[str, Any]]]:
+    """``(schedule, timezone, build id, runtime)`` of a backend-spark block: the build that
+    writes the table, or the ``runtime`` a table no forge build writes names."""
     from fluid_build.spark.compiler import spark_parameters
     from fluid_build.streaming.compiler import managed_lane_enabled
 
@@ -643,7 +777,24 @@ def _read_spark_placement(
             f"{where}: backend spark runs with forge's Spark runner, which reads a contract of "
             "fluidVersion 0.7.7 or later"
         )
-        return schedule, timezone, None
+        return schedule, timezone, None, None
+    if "runtime" in raw:
+        if "build" in raw:
+            errors.append(
+                f"{where}: name build (the engine: spark build that writes the table) or "
+                "runtime (the EMR runtime of a table no forge build writes), not both"
+            )
+            return schedule, timezone, None, None
+        writers = _writers(contract, eid)
+        if writers:
+            errors.append(
+                f"{where}.runtime is for a table no forge build writes, and build "
+                f"{writers[0].get('id')} writes {eid}: its runtime and role run the "
+                "maintenance (drop runtime, or name the build with build)"
+            )
+            return schedule, timezone, None, None
+        _check_maintenance_names(contract, eid, where, errors)
+        return schedule, timezone, None, _read_runtime(raw.get("runtime"), eid, where, errors)
     writers = _writers(contract, eid)
     named = raw.get("build")
     if named is not None:
@@ -653,19 +804,36 @@ def _read_spark_placement(
                 f"{where}.build must name an engine: spark build whose output is {eid}: its "
                 "runtime and role run the maintenance"
             )
-            return schedule, timezone, None
+            return schedule, timezone, None, None
     elif len(writers) != 1:
         errors.append(
             f"{where}: backend spark runs on the runtime and role of the engine: spark build "
             f"that writes {eid}, and "
             + (
-                "none does (properties.parameters.spark, outputs[0])"
+                "none does (properties.parameters.spark, outputs[0]); a table no forge build "
+                "writes names its EMR runtime with runtime"
                 if not writers
                 else f"{len(writers)} do; name one with build"
             )
         )
-        return schedule, timezone, None
+        return schedule, timezone, None, None
     build = writers[0]
+    _check_maintenance_names(contract, eid, where, errors)
+    if (spark_parameters(build) or {}).get("runtime") == "glue":
+        errors.append(
+            f"{where}: build {build.get('id')} runs on AWS Glue, whose one job is the build's "
+            "own (one run at a time), so a maintenance run would wait for it; use backend glue "
+            "(the Glue Data Catalog's table optimizers)"
+        )
+    return schedule, timezone, str(build.get("id")), None
+
+
+def _check_maintenance_names(
+    contract: Mapping[str, Any], eid: str, where: str, errors: List[str]
+) -> None:
+    """The names a backend-spark table's maintenance takes after its expose (its DAG
+    ``maintain_<expose>``, its plan action, and for a table no forge build writes its artifacts):
+    an id they take, held by no build."""
     from fluid_build.build_runners._ids import IdentifierViolation, validate_identifier
 
     try:
@@ -687,13 +855,6 @@ def _read_spark_placement(
             f"{where}: build {named_like[0]} has the name this table's maintenance takes "
             f"(its plan action spark_maintain_{eid} and its DAG maintain_{eid}); rename the build"
         )
-    if (spark_parameters(build) or {}).get("runtime") == "glue":
-        errors.append(
-            f"{where}: build {build.get('id')} runs on AWS Glue, whose one job is the build's "
-            "own (one run at a time), so a maintenance run would wait for it; use backend glue "
-            "(the Glue Data Catalog's table optimizers)"
-        )
-    return schedule, timezone, str(build.get("id"))
 
 
 def _read_glue_placement(
@@ -702,7 +863,7 @@ def _read_glue_placement(
     """``(role arn, run every hours)`` of a backend-glue block."""
     from fluid_build.providers._iceberg_catalog import is_glue_cataloged
 
-    for key in ("schedule", "timezone", "build"):
+    for key in ("schedule", "timezone", "build", "runtime"):
         if key in raw:
             errors.append(f"{where}.{key} is backend spark's: Glue runs its optimizers itself")
     role_arn = raw.get("roleArn")
@@ -784,8 +945,13 @@ def read_table(
             "expireSnapshots, removeOrphanFiles or actions"
         )
     schedule, timezone, build_id, role_arn, hours = None, "UTC", None, None, 24
+    runtime: Optional[Dict[str, Any]] = None
     if backend == "spark":
-        schedule, timezone, build_id = _read_spark_placement(contract, raw, eid, where, errors)
+        schedule, timezone, build_id, runtime = _read_spark_placement(
+            contract, raw, eid, where, errors
+        )
+        if "runtime" in raw:
+            _check_unwritten_table(raw, where, errors)
     else:
         role_arn, hours = _read_glue_placement(raw, expose, platform, where, errors)
         if "runEveryHours" in raw and expire is None and orphans is None:
@@ -803,6 +969,7 @@ def read_table(
         schedule=schedule,
         timezone=timezone,
         build_id=build_id,
+        runtime=runtime,
         role_arn=role_arn,
         run_every_hours=hours,
         compaction=compaction,
@@ -811,6 +978,38 @@ def read_table(
         orphans=orphans,
         actions=actions,
     )
+
+
+def _check_unwritten_table(raw: Mapping[str, Any], where: str, errors: List[str]) -> None:
+    """What a table no forge build writes needs beyond a build's: forge cannot see its
+    writer's commits, so removing orphan files there names its ``olderThan`` (no default).
+    Expiring snapshots keeps at least the last one on every table (``_read_expire``)."""
+    orphans = raw.get("removeOrphanFiles")
+    if _enabled(orphans) and orphans.get("olderThan") is None:
+        errors.append(
+            f"{where}.removeOrphanFiles.olderThan is required with runtime: forge does not "
+            "write the table and cannot see how long its writer's commits take, and a file "
+            "younger than that is not an orphan yet; set it longer than the writer's longest "
+            "commit delay (Iceberg's default is P3D)"
+        )
+
+
+def maintenance_warnings(tables: List[TableMaintenance]) -> List[str]:
+    """What ``fluid validate`` warns about in tables that read clean: removing orphan files
+    younger than :data:`WARN_ORPHAN_SECONDS` from a table no forge build writes, whose writer's
+    commit delay forge cannot see."""
+    out: List[str] = []
+    for tm in tables:
+        if tm.runtime is not None and tm.orphans is not None:
+            if tm.orphans.older_than_seconds < WARN_ORPHAN_SECONDS:
+                out.append(
+                    f"exposes[{tm.expose_id}].iceberg.maintenance.removeOrphanFiles.olderThan "
+                    "is under P3D on a table forge does not write: a file its writer has not "
+                    "committed yet (a slow micro-batch, a commit retried after a conflict) is "
+                    "deleted as an orphan and the table loses it; keep it longer than that "
+                    "writer's longest commit delay"
+                )
+    return out
 
 
 def read_maintenance(contract: Mapping[str, Any]) -> Tuple[List[TableMaintenance], List[str]]:
@@ -830,6 +1029,21 @@ def read_maintenance(contract: Mapping[str, Any]) -> Tuple[List[TableMaintenance
         if found is not None:
             tables.append(found)
     return tables, errors
+
+
+def declares_unwritten_maintenance(contract: Mapping[str, Any]) -> bool:
+    """Whether a backend-spark ``iceberg.maintenance`` names a ``runtime``: a table no forge
+    build writes, maintained on its own EMR runtime (no validation)."""
+    for expose in contract.get("exposes") or []:
+        iceberg = expose.get("iceberg") if isinstance(expose, Mapping) else None
+        block = iceberg.get("maintenance") if isinstance(iceberg, Mapping) else None
+        if (
+            isinstance(block, Mapping)
+            and block.get("backend", "spark") == "spark"
+            and block.get("runtime") is not None
+        ):
+            return True
+    return False
 
 
 def declares_maintenance(contract: Mapping[str, Any]) -> bool:
@@ -871,15 +1085,21 @@ __all__ = [
     "DEFAULT_RETAIN_LAST",
     "ExpireSnapshots",
     "MIN_ORPHAN_SECONDS",
+    "RUNTIMES",
     "RemoveOrphanFiles",
     "STRATEGIES",
     "TableMaintenance",
+    "WARN_ORPHAN_SECONDS",
     "declares_maintenance",
+    "declares_unwritten_maintenance",
+    "maintenance_warnings",
     "option_problems",
     "option_text",
     "parse_duration",
     "read_maintenance",
     "read_table",
+    "runtime_build",
+    "runtime_findings",
     "spark_tables",
     "table_location",
 ]
