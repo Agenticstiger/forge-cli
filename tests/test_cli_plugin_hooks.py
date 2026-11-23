@@ -682,14 +682,18 @@ class TestBootstrapCommands:
         assert 'group="fluid_build.commands"' in disc
         assert "is_allowed" in disc
 
-        # Lazy loader: imports + calls ``ep.load()(sp)`` only on invoke, is
+        # Lazy loader: imports + calls ``ep.load()(guard)`` (the subparsers
+        # stand-in that refuses a taken command name) only on invoke, is
         # fail-isolated, and logs by exception TYPE only (no plugin-supplied
         # text ever reaches the handler — the credential-leak guarantee).
         loader = inspect.getsource(bootstrap._register_command_plugins)
-        assert "ep.load()(sp)" in loader
-        assert "Failed to load CLI plugin" in loader
-        assert "type(e).__name__" in loader
+        assert "_load_command_plugin(sp, ep, reserved, skipped)" in loader
         assert "sys.argv" in loader  # argv-peek is what keeps it lazy
+        one = inspect.getsource(bootstrap._load_command_plugin)
+        assert "ep.load()(guard)" in one
+        assert "_guard_subparsers(sp, ep.name, reserved)" in one
+        assert "Failed to load CLI plugin" in one
+        assert "type(e).__name__" in one
 
         # register_core_commands delegates to the lazy loader.
         rcc = inspect.getsource(bootstrap.register_core_commands)

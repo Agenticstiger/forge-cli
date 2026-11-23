@@ -688,7 +688,7 @@ all three (see `SECURITY.md` for the trust model).
 
 | Group | Hook site | Plugin signature | What it does |
 |---|---|---|---|
-| `fluid_build.commands` | `cli/bootstrap.py::register_core_commands` | `register(subparsers: argparse._SubParsersAction) -> None` | Add new `fluid <name>` subcommands. Run once at CLI startup. |
+| `fluid_build.commands` | `cli/bootstrap.py::_register_command_plugins` (from `register_core_commands`) | a callable `(subparsers: argparse._SubParsersAction) -> None`, whatever its name | Add new `fluid <name>` subcommands with `subparsers.add_parser`. Loaded lazily: only when a plugin command is invoked, or by `fluid describe --commands`. A name or alias of a core command, another plugin's name or a repeat is refused (`PluginCommandShadowError`): the plugin is skipped whole with a warning naming it and the command, and the other plugins still load. |
 | `fluid_build.extension_validators` | `cli/validate.py::_run_extension_validators` | `validate(extensions_block: Dict, errors: List[str]) -> None` | Validate sub-keys of `contract.extensions`. Errors fold into `ValidationResult`. |
 | `fluid_build.apply_hooks` | `cli/apply.py::_run_apply_hooks` | `hook(contract_dir: Path, contract: Dict, errors: List[str]) -> None` | Apply-time invariant checks (e.g. scaffold bundle digest drift). |
 
