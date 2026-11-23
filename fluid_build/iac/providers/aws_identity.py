@@ -438,6 +438,63 @@ def refuse_unless_identity_allowed(
     )
 
 
+def refuse_unless_maintenance_runtime_allowed(
+    expose_id: str, runtime: Mapping[str, Any], environ: Optional[Mapping[str, str]] = None
+) -> None:
+    """Raise :class:`~fluid_build.spark.policy.SparkPolicyError` unless the ``runtime`` of a
+    table no forge build writes (``exposes[].iceberg.maintenance.runtime``) passes the
+    operator's policy, as a build's ``parameters.spark`` must: its role, its target and its
+    ``sparkConf`` (:func:`fluid_build.maintenance.spec.runtime_findings`)."""
+    from fluid_build.maintenance.spec import runtime_findings
+    from fluid_build.spark.policy import SparkPolicyError
+
+    errors, missing = runtime_findings(expose_id, runtime, environ)
+    if not errors and not missing:
+        return
+    raise SparkPolicyError(
+        what=(
+            f"exposes[{expose_id}].iceberg.maintenance.runtime names a role, a runtime or "
+            "Spark settings the operator has not allowed"
+        ),
+        why=" ".join(f"{m}." for m in [*errors, *missing])
+        + " The maintenance runs as that role on that runtime and rewrites, expires and "
+        "deletes the table's files; a Spark setting can change what the run loads and as "
+        "whom it runs. Unset lists allow nothing.",
+        fix=(
+            "Once the role, the runtime and the settings are reviewed, have the operator list "
+            f"them {_OPERATOR_ONLY}: {EXECUTION_ROLE_ALLOWLIST_ENV} takes a role ARN or a path "
+            f"prefix ending in '/'; {TARGET_ALLOWLIST_ENV} takes <runtime>:<id> of the "
+            "application, cluster or virtual cluster; "
+            f"{SPARK_CONF_ALLOWLIST_ENV} takes a key or a prefix ending in '*'."
+        ),
+        doc=doc_url(),
+    )
+
+
+def _maintenance_runtimes(
+    contract: Mapping[str, Any], *, remote_only: bool = False
+) -> List[Tuple[str, Mapping[str, Any]]]:
+    """``(expose id, runtime)`` of each table no forge build writes whose maintenance names an
+    EMR runtime or forge's local one (read without the rest of the block's checks, which
+    ``fluid validate`` runs). ``remote_only`` leaves out the local ones: nothing is provisioned
+    for them and the native engine runs them."""
+    out: List[Tuple[str, Mapping[str, Any]]] = []
+    for expose in contract.get("exposes") or []:
+        iceberg = expose.get("iceberg") if isinstance(expose, Mapping) else None
+        block = iceberg.get("maintenance") if isinstance(iceberg, Mapping) else None
+        if not isinstance(block, Mapping) or block.get("backend", "spark") != "spark":
+            continue
+        runtime = block.get("runtime")
+        if isinstance(runtime, Mapping) and runtime.get("runtime") in (
+            "emr-serverless",
+            "emr-ec2",
+            "emr-eks",
+            *(() if remote_only else ("local",)),
+        ):
+            out.append((str(expose.get("exposeId")), runtime))
+    return out
+
+
 def _spark_builds_or_empty(contract: Mapping[str, Any]) -> List[Mapping[str, Any]]:
     from fluid_build.spark.compiler import spark_builds
     from fluid_build.streaming.compiler import managed_lane_enabled
@@ -461,13 +518,28 @@ def validation_errors(contract: Mapping[str, Any]) -> List[str]:
 
 
 def validation_warnings(contract: Mapping[str, Any]) -> List[str]:
-    """The operator entries the contract's Spark builds still need (#818: warn here)."""
+    """The operator entries the contract's Spark builds, and the maintenance runtimes of the
+    tables no forge build writes, still need (warned here, refused where they run)."""
     warnings = [
         f"{m}; the IaC is refused at generate and apply until the operator lists it"
         for b in _spark_builds_or_empty(contract)
         for m in identity_findings(b)[1]
     ]
+    warnings += [
+        f"{m}; the IaC and the maintenance run are refused until the operator lists it"
+        for expose_id, runtime in _maintenance_runtimes(contract)
+        for m in _runtime_missing(expose_id, runtime)
+    ]
     return warnings + _glue_jar_warnings(contract)
+
+
+def _runtime_missing(expose_id: str, runtime: Mapping[str, Any]) -> List[str]:
+    from fluid_build.maintenance.spec import runtime_findings
+
+    try:
+        return runtime_findings(expose_id, runtime)[1]
+    except ValueError:
+        return []  # the maintenance check reports a runtime that does not read
 
 
 def _glue_jar_warnings(contract: Mapping[str, Any]) -> List[str]:

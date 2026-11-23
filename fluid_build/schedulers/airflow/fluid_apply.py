@@ -381,7 +381,9 @@ class ScheduledDag:
     #: A keepalive DAG: its one task reconciles an always-on stream (:data:`KEEPALIVE_APPLY_ARGS`).
     keepalive: bool = False
     #: A maintenance DAG: the expose id of the Iceberg table its one task maintains
-    #: (:data:`MAINTENANCE_APPLY_ARGS`). ``build_id`` is then the build that writes the table.
+    #: (:data:`MAINTENANCE_APPLY_ARGS`). ``build_id`` is then the build that writes the table,
+    #: or ``""`` for a table no forge build writes, maintained on the runtime its
+    #: ``iceberg.maintenance.runtime`` names.
     maintains: Optional[str] = None
 
     @property
@@ -560,7 +562,8 @@ def _maintenance_dags(contract: Dict[str, Any]) -> List[ScheduledDag]:
 
     Its one task runs ``fluid apply --mode maintain --expose-id <expose>`` on the table's
     ``schedule``. The DAG is the writer build's, so it has no outlets and no datasets, and it
-    never retries: the next scheduled run is the retry.
+    never retries: the next scheduled run is the retry. A table no forge build writes has no
+    writer build (``BUILD_ID`` is empty): its run starts on the runtime its maintenance names.
     """
     from fluid_build.maintenance.spec import spark_tables
 
@@ -570,9 +573,13 @@ def _maintenance_dags(contract: Dict[str, Any]) -> List[ScheduledDag]:
         raise ScheduleRenderError(str(exc)) from None
     out: List[ScheduledDag] = []
     for table in tables:
-        build_id = validate_id(table.build_id, kind="build id")
         expose = validate_id(table.expose_id, kind="exposeId")
-        _check_spark_ids(contract, build_id)
+        if table.build_id is None:
+            build_id = ""
+            _check_spark_ids(contract, None)
+        else:
+            build_id = validate_id(table.build_id, kind="build id")
+            _check_spark_ids(contract, build_id)
         out.append(
             ScheduledDag(
                 build_id=build_id,
@@ -770,9 +777,11 @@ _SPARK_BUILD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _SPARK_PRODUCT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
-def _check_spark_ids(contract: Dict[str, Any], build_id: str) -> None:
+def _check_spark_ids(contract: Dict[str, Any], build_id: Optional[str]) -> None:
+    """The Spark build's id (None: a maintenance DAG of a table no forge build writes) and the
+    product id, as forge's Spark runner takes them."""
     product = contract.get("id")
-    if not _SPARK_BUILD_ID.fullmatch(build_id):
+    if build_id is not None and not _SPARK_BUILD_ID.fullmatch(build_id):
         raise ScheduleRenderError(
             f"Spark build id {build_id!r}: forge's Spark runner takes letters, digits, _ and "
             "-, starting with a letter or digit"
@@ -1659,6 +1668,27 @@ _MAINTENANCE_RUN = (
     "the retry.\n"
 )
 
+_MAINTENANCE_RUNTIME_RUN = (
+    "Every run maintains one Iceberg table on the Airflow worker, with the\n"
+    "constants below filled in (`--env` is left out when FLUID_ENV_NAME is empty):\n"
+    "\n"
+    '    cd "$FLUID_PROJECT_DIR"\n'
+    '    fluid apply "$FLUID_PROJECT_DIR/$CONTRACT_PATH" --env "$FLUID_ENV_NAME" \\\\\n'
+    "        " + " ".join(MAINTENANCE_APPLY_ARGS) + ' --expose-id "$EXPOSE_ID" --yes\n'
+    "\n"
+    "It runs no tofu apply. No forge build writes the table (BUILD_ID is empty): it\n"
+    "starts one run of forge's Spark runner on the runtime the table's\n"
+    "exposes[].iceberg.maintenance.runtime names (an EMR runtime as the role it\n"
+    "names, or forge's local runtime on the worker), with the\n"
+    "maintenance job config the last fluid apply deployed. It refuses a config that\n"
+    "differs from what the contract compiles to now: run fluid apply first. The\n"
+    "table's own writers keep running. The run takes the steps the table declares: a\n"
+    "package's actions, compaction, manifests, snapshot expiry and orphan files.\n"
+    "It runs on SCHEDULE (exposes[].iceberg.maintenance.schedule), one run at a\n"
+    "time, with no catch-up, and the task never retries: the next scheduled run is\n"
+    "the retry.\n"
+)
+
 _BUILDS_RUN = (
     "Each task runs one build on the Airflow worker, with the constants below\n"
     "filled in (`--env` is left out when FLUID_ENV_NAME is empty) and the\n"
@@ -1876,8 +1906,9 @@ def _dag_doc(product_id: str, dag: ScheduledDag, extra: Tuple[str, ...] = ()) ->
     """The DAG file's docstring and the DAG's ``description``. ``extra`` are notes of fluid's
     own text (the alerts' notes) that go after the others."""
     if dag.maintains is not None:
+        run = _MAINTENANCE_RUN if dag.build_id else _MAINTENANCE_RUNTIME_RUN
         return (
-            _doc("Scheduled fluid table maintenance", _MAINTENANCE_RUN, list(extra)),
+            _doc("Scheduled fluid table maintenance", run, list(extra)),
             f"maintain fluid table {product_id} {dag.maintains}",
         )
     if dag.keepalive:

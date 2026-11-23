@@ -10,6 +10,15 @@ maintenance run reads and writes what the build may and nothing more. Its job co
 (``spark.maintain``) are its own, so the build's reconcile never takes a maintenance run for one of
 its runs, nor the other way round. It always ends on its own (``scheduled``), and starts no
 service retry: the next scheduled run is the retry.
+
+A table no forge build writes (``iceberg.maintenance.runtime``: its streams run on its team's own
+runner) gets its run from that block instead (:func:`_unwritten_run`): the EMR runtime, target
+and role it names, its job config compiled from the expose's binding, and its artifacts in the
+table's bucket under ``spark.names.maintenance_build``. The operator's role, target and Spark
+setting lists apply to it as to a build's ``parameters.spark``. A ``runtime: local`` block runs
+spark-submit on the machine ``fluid apply`` runs on against a table in an Iceberg REST catalog
+on platform local, as a local build's run does: no role, no target, its artifacts under the
+local root, and the operator's namespace list applies.
 """
 
 from __future__ import annotations
@@ -20,9 +29,12 @@ import os
 from typing import Any, Dict, List, Mapping, Optional
 
 from fluid_build.build_runners.spark._desired import (
+    ACCOUNT_TOKEN,
     LOCAL_ROOT_TOKEN,
     DesiredRun,
+    _placement,
     _sha,
+    _stamp_fields,
     _submit_conf,
     desired_runs,
 )
@@ -56,9 +68,10 @@ def maintenance_runs(
     Raises:
         ValueError: the maintenance or its writer build does not compile.
         MaintenanceActionError: a plugin action cannot be used (a ``ValueError``).
-        FluidUserError: the operator's policy refuses the writer build.
+        FluidUserError: the operator's policy refuses the writer build, or the runtime of a
+            table no forge build writes.
     """
-    from fluid_build.maintenance.job import action_statements, maintenance_config, table_name
+    from fluid_build.maintenance.job import compiled_actions, maintenance_config, table_name
     from fluid_build.maintenance.spec import read_maintenance
     from fluid_build.spark.compiler import SparkJob, spark_builds, spark_parameters
 
@@ -71,6 +84,9 @@ def maintenance_runs(
     for tm in tables:
         if tm.backend != "spark" or (expose_id is not None and tm.expose_id != expose_id):
             continue
+        if tm.runtime is not None:
+            out.append(_unwritten_run(contract, tm, env, policy, stamps, load))
+            continue
         writers = desired_runs(
             contract, build_id=tm.build_id, environ=env, policy=policy, stamps=stamps
         )
@@ -82,8 +98,10 @@ def maintenance_runs(
         writer = writers[0]
         build_config = json.loads(writer.job_text)
         table = table_name(build_config)
-        statements = action_statements(tm, table, load=load)
-        job = SparkJob(maintenance_config(tm, build_config, statements))
+        actions = compiled_actions(tm, table, load=load)
+        job = SparkJob(
+            maintenance_config(tm, build_config, [(a.name, a.statements) for a in actions])
+        )
         cfg = spark_parameters(builds[tm.build_id]) or {}
         where = f"exposes[{tm.expose_id}].iceberg.maintenance (build {tm.build_id})"
         spark_conf = _submit_conf(
@@ -126,9 +144,111 @@ def maintenance_runs(
                 package_entry_point=None,
                 package_uri=None,
                 maintains=tm.expose_id,
+                maintenance_actions=tuple(a.plan_entry() for a in actions),
             )
         )
     return [run.bind(account) for run in out] if account else out
+
+
+def _location(contract: Mapping[str, Any], expose_id: str) -> Mapping[str, Any]:
+    for expose in contract.get("exposes") or []:
+        if isinstance(expose, Mapping) and str(expose.get("exposeId")) == expose_id:
+            return dict((expose.get("binding") or {}).get("location") or {})
+    return {}
+
+
+def _unwritten_run(
+    contract: Mapping[str, Any],
+    tm: Any,
+    env: Mapping[str, str],
+    policy: bool,
+    stamps: Optional[Mapping[str, str]],
+    load: Any,
+) -> DesiredRun:
+    """The maintenance run of a table no forge build writes, on the runtime its ``runtime``
+    names: the job config holds the table as the expose binds it (a Glue-catalog table, or a
+    REST-catalog one on ``local``), the runner and the config sit in the table's bucket (under
+    the local root on ``local``) under the name the run goes by
+    (``spark.names.maintenance_build``), and the role and target are the block's own, checked
+    against the operator's lists when ``policy`` is on (apply and ``--mode maintain``).
+
+    Raises:
+        ValueError: the expose is not a table the runner can maintain.
+        FluidUserError: the operator's policy refuses the role, the target or a Spark setting.
+    """
+    from fluid_build.iac.providers.aws_identity import refuse_unless_maintenance_runtime_allowed
+    from fluid_build.maintenance.job import compiled_actions, maintenance_config, table_name
+    from fluid_build.providers.aws.util.warehouse import normalize_location
+    from fluid_build.spark import runner_source
+    from fluid_build.spark.compiler import CONFIG_VERSION, SparkJob, maintenance_sink
+
+    cfg: Dict[str, Any] = dict(tm.runtime)
+    runtime = str(cfg["runtime"])
+    local = runtime == "local"
+    where = f"exposes[{tm.expose_id}].iceberg.maintenance.runtime"
+    if policy:
+        refuse_unless_maintenance_runtime_allowed(tm.expose_id, cfg, env)
+    product = str(contract.get("id"))
+    bid = _names.maintenance_build(tm.expose_id)
+    loc = _location(contract, tm.expose_id)
+    region, role, target = _placement(cfg, runtime, product, bid, loc, where, where)
+    base = {
+        "configVersion": CONFIG_VERSION,
+        "product": product,
+        "build": bid,
+        "sink": maintenance_sink(
+            contract,
+            tm.expose_id,
+            account_ref=ACCOUNT_TOKEN,
+            local=local,
+            host_gate=policy,
+            environ=env,
+        ),
+    }
+    actions = compiled_actions(tm, table_name(base), load=load)
+    job = SparkJob(maintenance_config(tm, base, [(a.name, a.statements) for a in actions]))
+    spark_conf = _submit_conf(runtime, job.config, cfg.get("sparkConf") or {}, where, env, policy)
+    release = None if local else str(cfg.get("releaseLabel") or _names.default_release(runtime))
+    runner_sha = _sha(runner_source())
+    if local:  # a local run reads its artifacts where the operator keeps them
+        root = LOCAL_ROOT_TOKEN
+    else:
+        root = f"s3://{normalize_location(loc, account_ref=ACCOUNT_TOKEN)[0]}"
+    settings: Dict[str, Any] = {
+        "runtime": runtime,
+        "maintains": tm.expose_id,
+        "target": dict(target),
+        "role": role,
+        "release": release,
+        "glueVersion": None,
+        "sparkConf": spark_conf,
+    }
+    return DesiredRun(
+        product=product,
+        build=bid,
+        runtime=runtime,
+        mode="maintenance",
+        scheduled=True,
+        region=region,
+        config_hash=_sha({"job": job.digest, "runner": runner_sha, "settings": settings}),
+        job_digest=job.digest,
+        runner_sha256=runner_sha,
+        job_uri=_names.maintenance_config_uri(root, product, bid, tm.expose_id),
+        runner_uri=_names.runner_uri(root, product, bid, runner_sha),
+        run_name=_names.maintenance_run_name(product, tm.expose_id),
+        role_arn=role,
+        target=target,
+        release_label=release,
+        glue_version=None,
+        spark_conf=spark_conf,
+        retry_attempts=None,
+        restarts_per_hour=0,
+        job_text=job.text,
+        maintains=tm.expose_id,
+        maintenance_runtime=True,
+        maintenance_actions=tuple(a.plan_entry() for a in actions),
+        **_stamp_fields(contract, {"outputs": [tm.expose_id]}, stamps),
+    )
 
 
 __all__ = ["maintenance_runs"]

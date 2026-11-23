@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Iceberg maintenance for a table forge does not write.** A table whose streams run on its
+  team's own Spark runner can now be maintained by forge on an EMR runtime the contract names:
+  `exposes[].iceberg.maintenance.runtime` (backend spark, in place of `build`; 0.7.7 preview,
+  `$defs/sparkRuntime`) takes `runtime` (`emr-serverless`, `emr-ec2` or `emr-eks`), the
+  runtime's `applicationId`, `clusterId` or `virtualClusterId`, an `executionRoleArn`, and
+  optionally `releaseLabel` and `sparkConf`. `fluid apply` uploads the runner and the
+  maintenance job config to `_fluid/spark/<product>/maintain_<expose>/` in the table's bucket
+  (the role must be able to read them) and adds the runs to the scheduler's caller policy;
+  forge provisions no runtime and no role for it. The table's maintenance DAG runs
+  `fluid apply --mode maintain --expose-id <expose>` on that runtime, and a dry run says where
+  and as whom. The role, the target and the Spark settings go through the operator's
+  `FLUID_SPARK_EXECUTION_ROLE_ALLOWLIST`, `FLUID_SPARK_TARGET_ALLOWLIST` and
+  `FLUID_SPARK_CONF_ALLOWLIST`, as a build's `parameters.spark` does. Because forge cannot see
+  that writer's commit delay, `removeOrphanFiles` there needs an explicit `olderThan`, and
+  `fluid validate` warns when it is under three days. `runtime: local` maintains a table in an
+  Iceberg REST catalog on `binding.platform: local` with forge's local Spark runtime
+  (spark-submit on the machine `fluid apply` runs on): it takes no role and no target, ignores
+  the AWS keys as a local build does, and goes through the operator's local namespace list.
+  A location under `_fluid/` or `_checkpoints/` is refused, since forge keeps its own files
+  there.
+- **The plan binds each maintenance action on its own.** The `spark.maintain` action now lists
+  each plugin action with its kind, the distribution and version that shipped it, and the
+  sha256 of its statements (`actions[].statementsSha256`, never the SQL). When a plugin renders
+  other statements between `fluid plan` and `fluid apply`, the apply refuses with
+  `apply_plan_digest_maintenance_actions_changed` (plan-binding kind
+  `maintenance-actions-changed`), naming the action and the package and version on each side.
+  A new version that renders the same statements is a warning, not a refusal.
 - **`fluid import airflow|pyspark SOURCE --check` is a drift gate for CI.** It reads the DAGs or the
   job files again, compares what they say with the contracts already written where the import writes
   them (give it the `--out`, `--split-by`, `--conventions` and `--dags` of the import that wrote
@@ -57,12 +84,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Compaction in a maintenance run writes `max-concurrent-file-group-rewrites=5` (Iceberg's own
+  default) into the job config unless `compaction.maxConcurrentRewrites` sets another value, so
+  the config says how many file groups a run rewrites at once beside a live writer.
+
 - **`fluid profile --help`'s import ceiling is one higher, 328 modules.** A clean install measures
   310 to 320 on Python 3.10 to 3.14, one environment with more packages installed measured 327, and
   none of the modules the command's help imports beyond `fluid --help` can be deferred. A run over
   the ceiling now lists those modules (`tests/perf/test_startup_budget.py`).
 
 ### Fixed
+
+- A table maintenance run started through spark-submit (`fluid apply --mode maintain`) stopped
+  with `NameError` before its first step: forge's Spark runner ran its script entry point before
+  the maintenance functions were defined. The entry point now comes last.
+- Removing orphan files of a table in an Iceberg REST catalog (such as Lakekeeper) waited on
+  credential lookups: Iceberg listed the location through Hadoop's S3A, which holds none of the
+  credentials the catalog hands the table. The runner now lists through the table's own FileIO,
+  under the table's location and a `/`, so a sibling table whose location starts the same is
+  never listed. A Glue-catalog table keeps the default listing.
 
 - **`fluid profile --request` checks the facts of a table together, so that their counts cannot be
   differenced back to a small cell.** Each fact's own two cells were checked, but facts that overlap
@@ -114,6 +154,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it through its own rewrite of `$`. Both now end in `(?![\s\S])`, as 34 other patterns of the file
   do, with `minLength` 1 and `maxLength` 250 unchanged. The descriptions now say the schema takes the
   ASCII part of Airflow's rule: Airflow's own pattern is Unicode.
+
+### Upgrade notes
+
+- A plan made before this release has no `actions` in its `spark.maintain` payload, and the
+  compaction options of a maintenance job config changed, so `fluid apply` refuses such a plan
+  with `apply_spark_artifact_mismatch`: run `fluid plan` again, then `fluid apply`, before the
+  next `fluid apply --mode maintain`.
 
 ## [0.38.0] — 2026-11-22
 

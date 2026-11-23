@@ -20,7 +20,10 @@ Policy, the operator's (:mod:`fluid_build.plugin_manager`), as for every plugin 
 * ``FLUID_PLUGINS_BLOCKLIST`` and ``FLUID_PLUGINS_ALLOWLIST`` apply before anything is imported;
 * two distributions shipping one name are both refused;
 * a kind that is missing, refused, fails to load or is not an action refuses the contract's
-  action (a declared step never drops out quietly), naming the exception type only.
+  action (a declared step never drops out quietly), naming the exception type only;
+* the distribution that ships a kind, and its version, are read when it loads
+  (:func:`action_origin`): ``fluid plan`` records them beside the hash of the action's
+  statements, so a refused apply names the package that changed.
 
 Borrowed, not depended on: stevedore's ``DriverManager`` and
 :mod:`fluid_build.cli.import_workflow.registry`, which this follows.
@@ -29,6 +32,7 @@ Borrowed, not depended on: stevedore's ``DriverManager`` and
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,6 +45,13 @@ _LOCK = threading.RLock()
 _LOADED: Dict[str, Any] = {}
 _REFUSED: Dict[str, str] = {}
 _INDEX: Dict[str, Tuple[Any, Dict[str, List[Any]]]] = {}
+#: kind -> (distribution, version) of the package that shipped it, read when it loaded.
+_ORIGIN: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+
+#: What a distribution's name and version may be to reach a plan or a message (PEP 508 names,
+#: PEP 440 versions and their local labels): anything else is recorded as unknown.
+_DIST_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?\Z")
+_DIST_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+!_-]{0,63}\Z")
 
 
 class MaintenanceActionError(ValueError):
@@ -58,6 +69,7 @@ def reset_maintenance_plugin_cache() -> None:
         _LOADED.clear()
         _REFUSED.clear()
         _INDEX.clear()
+        _ORIGIN.clear()
 
 
 def _index() -> Dict[str, List[Any]]:
@@ -80,11 +92,30 @@ def _who(ep: Any) -> str:
     return entry_point_distribution(ep) or "<unknown distribution>"
 
 
+def _origin(ep: Any) -> Tuple[Optional[str], Optional[str]]:
+    """``(distribution, version)`` of the package that ships ``ep``
+    (:func:`fluid_build.plugin_manager.entry_point_distribution`), each None when it cannot be
+    told or is not a plain name and version."""
+    from fluid_build.plugin_manager import entry_point_distribution
+
+    text = entry_point_distribution(ep) or ""
+    dist = getattr(ep, "dist", None)
+    version = str(getattr(dist, "version", None) or "")
+    # The name is what precedes " <version>": never split at a space the name itself holds.
+    name = text[: -len(version) - 1] if version and text.endswith(f" {version}") else text
+    return (
+        name if _DIST_NAME.match(name) else None,
+        version if _DIST_VERSION.match(version) else None,
+    )
+
+
 def _is_action(obj: Any) -> bool:
     return callable(getattr(obj, "statements", None))
 
 
 def _load(key: str) -> Tuple[Optional[Any], str]:
+    """The kind ``key`` and ``""``, or None and why it cannot be used. A kind that loads has
+    its origin recorded (:data:`_ORIGIN`)."""
     from fluid_build.plugin_manager import is_allowed
 
     eps = _index().get(key)
@@ -111,6 +142,7 @@ def _load(key: str) -> Tuple[Optional[Any], str]:
         return None, f"building it raised {type(exc).__name__}"
     if not _is_action(obj):
         return None, "it is not a maintenance action: it has no statements(table, options)"
+    _ORIGIN[key] = _origin(eps[0])
     return obj, ""
 
 
@@ -132,10 +164,19 @@ def action_for(name: str) -> Any:
     raise MaintenanceActionError(f"no maintenance action kind {key!r} can be used: {why}")
 
 
+def action_origin(name: str) -> Tuple[Optional[str], Optional[str]]:
+    """``(distribution, version)`` of the package that shipped kind ``name`` when
+    :func:`action_for` loaded it; ``(None, None)`` for a kind it has not loaded (a test's
+    loader) or whose package cannot be told."""
+    with _LOCK:
+        return _ORIGIN.get(normalise_kind(name), (None, None))
+
+
 __all__ = [
     "ACTIONS_GROUP",
     "MaintenanceActionError",
     "action_for",
+    "action_origin",
     "normalise_kind",
     "reset_maintenance_plugin_cache",
 ]

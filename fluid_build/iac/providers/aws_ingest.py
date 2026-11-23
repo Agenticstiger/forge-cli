@@ -195,6 +195,7 @@ def spark_blocks(contract: Mapping[str, Any], cid: str) -> SparkBlocks:
     (:func:`aws_identity.refuse_unless_identity_allowed`), then the compiler's broker,
     registry, secrets and contract-SQL policies.
     """
+    from fluid_build.maintenance.spec import declares_unwritten_maintenance
     from fluid_build.spark.compiler import LOCAL_RUNTIME, spark_builds, spark_parameters
     from fluid_build.streaming.compiler import managed_lane_enabled
 
@@ -207,7 +208,11 @@ def spark_blocks(contract: Mapping[str, Any], cid: str) -> SparkBlocks:
         for b in spark_builds(contract)
         if (spark_parameters(b) or {}).get("runtime") != LOCAL_RUNTIME
     ]
-    if not builds:
+    # A table no forge build writes, maintained on its own EMR runtime: its job config and the
+    # runner are uploaded, and the scheduler may start its runs (_emit_unwritten_maintenance).
+    # One maintained on the local runtime has nothing on AWS.
+    unwritten = declares_unwritten_maintenance(contract, remote_only=True)
+    if not builds and not unwritten:
         return blocks
     account_marker, brokers_marker = _markers(contract)
     ctx = _Ctx(cid, str(contract.get("id")), account_marker, brokers_marker)
@@ -229,7 +234,10 @@ def spark_blocks(contract: Mapping[str, Any], cid: str) -> SparkBlocks:
             )
         keys[key] = bid
         runs.append(_emit_build(blocks, contract, build, ctx, product_tags, applications))
-    _emit_log_key(blocks, ctx, product_tags)
+    if builds:
+        _emit_log_key(blocks, ctx, product_tags)
+    if unwritten:
+        runs += _emit_unwritten_maintenance(blocks, contract, ctx, product_tags, keys)
     if runs:
         _emit_caller_policy(blocks, ctx, runs, product_tags)
     for expose in contract.get("exposes") or []:
@@ -824,6 +832,136 @@ def _emit_maintenance(
         }
         keys.append(key)
     return tuple(keys)
+
+
+#: The key of each runtime's target in a maintenance ``runtime`` (``maintenance/spec.py``).
+_RUNTIME_TARGET = {
+    "emr-serverless": "applicationId",
+    "emr-ec2": "clusterId",
+    "emr-eks": "virtualClusterId",
+}
+
+
+def _emit_unwritten_maintenance(
+    blocks: SparkBlocks,
+    contract: Mapping[str, Any],
+    ctx: _Ctx,
+    product_tags: Mapping[str, str],
+    keys: Dict[str, str],
+) -> List[aws_identity.CallerRun]:
+    """The maintenance of each table no forge build writes (``iceberg.maintenance.runtime``):
+    the runner and the maintenance job config, in the table's bucket under the name its runs go
+    by (``spark.names.maintenance_build``), the bytes ``fluid apply --mode maintain`` checks
+    before it starts a run (``build_runners/spark/_maintenance.py`` compiles the same); and what
+    the scheduler's policy needs to start those runs on the runtime the block names, as the role
+    it names. Nothing else: the runtime, the role and the table are the team's, and the role
+    needs read access to the two objects."""
+    from fluid_build.maintenance.job import action_statements, maintenance_config, table_name
+    from fluid_build.maintenance.plugins import MaintenanceActionError
+    from fluid_build.maintenance.spec import read_maintenance
+    from fluid_build.spark import runner_source
+    from fluid_build.spark.compiler import CONFIG_VERSION, SparkJob, maintenance_sink
+
+    tables, errors = read_maintenance(contract)
+    if errors:
+        raise UnsupportedBindingError(
+            "iceberg-maintenance",
+            f"{errors[0]}.",
+            ("Fix the field the message names; fluid validate reports the same.",),
+        )
+    exposes = {
+        str(e.get("exposeId")): e for e in contract.get("exposes") or [] if isinstance(e, Mapping)
+    }
+    objects = blocks.resources.setdefault("aws_s3_object", {})
+    runner = runner_source()
+    runner_sha = names.runner_sha256(runner)
+    runs: List[aws_identity.CallerRun] = []
+    for tm in tables:
+        if tm.backend != "spark" or tm.runtime is None or tm.runtime["runtime"] == "local":
+            continue  # a local run has nothing for OpenTofu: forge's local runtime publishes it
+        aws_identity.refuse_unless_maintenance_runtime_allowed(tm.expose_id, tm.runtime)
+        bid = names.maintenance_build(tm.expose_id)
+        key = safe_ident(f"{ctx.cid}_{bid}_spark")
+        if key in keys:
+            raise UnsupportedBindingError(
+                "spark-build-id-clash",
+                f"Spark build {keys[key]!r} and the maintenance of {tm.expose_id!r} differ only "
+                "in '-' and '_', so their OpenTofu addresses meet.",
+                ("Give the build an id that differs in a letter or digit.",),
+            )
+        keys[key] = bid
+        expose = exposes[tm.expose_id]
+        loc = (expose.get("binding") or {}).get("location") or {}
+        bucket, _ = _warehouse.normalize_location(loc, account_ref=ctx.account_marker)
+        if not _BUCKET.fullmatch(bucket):  # it reaches the caller policy's S3 and KMS scope
+            raise UnsupportedBindingError(
+                "spark-role-scope",
+                f"exposes[{tm.expose_id}].binding.location.bucket ({ctx.shown(bucket)!r}) is "
+                "not a bucket name, and the scheduler's policy would grant s3:GetObject on "
+                "what it names: a wildcard or a policy variable would reach other buckets.",
+                (
+                    "Set binding.location.bucket to the table's bucket (lower-case letters, "
+                    "digits, '.' and '-').",
+                ),
+            )
+        bucket_ref = _bucket_ref(contract, expose, loc, bucket, ctx)
+        try:
+            sink = maintenance_sink(contract, tm.expose_id, account_ref=ctx.account_marker)
+        except ValueError as exc:
+            raise UnsupportedBindingError(
+                "iceberg-maintenance",
+                f"{exc}.",
+                ("Fix the field the message names; fluid validate reports the same.",),
+            ) from None
+        base = {
+            "configVersion": CONFIG_VERSION,
+            "product": ctx.product,
+            "build": bid,
+            "sink": sink,
+        }
+        try:
+            statements = action_statements(tm, table_name(base))
+        except MaintenanceActionError as exc:
+            raise UnsupportedBindingError(
+                "iceberg-maintenance-action",
+                f"{exc}.",
+                ("Fix the action the message names; fluid validate reports the same.",),
+            ) from None
+        text = SparkJob(maintenance_config(tm, base, statements)).text
+        tags = {**product_tags, **names.tags(ctx.product, bid), "fluid_maintains": tm.expose_id}
+        runner_key = names.runner_key(ctx.product, bid, runner_sha)
+        config_key = names.maintenance_config_key(ctx.product, bid, tm.expose_id)
+        objects[f"{key}_runner"] = {
+            "bucket": bucket_ref,
+            "key": runner_key,
+            "content": runner,
+            "content_type": "text/x-python",
+            "tags": tags,
+        }
+        objects[f"{key}_maintain_{safe_ident(tm.expose_id)}"] = {
+            "bucket": bucket_ref,
+            "key": config_key,
+            "content": _expression(text, {ctx.account_marker: str(ctx.account)}),
+            "content_type": "application/json",
+            "tags": tags,
+        }
+        runtime = str(tm.runtime["runtime"])
+        bucket_arn = aws_identity._join("arn:aws:s3:::", ctx.x(bucket))
+        runs.append(
+            aws_identity.CallerRun(
+                sid=safe_ident(bid).replace("_", "").capitalize()
+                + names.build_key(ctx.product, bid),
+                runtime=runtime,
+                target=str(tm.runtime[_RUNTIME_TARGET[runtime]]),
+                role_arn=str(tm.runtime["executionRoleArn"]),
+                objects=(
+                    aws_identity._join(bucket_arn, "/", config_key),
+                    aws_identity._join(bucket_arn, "/", runner_key),
+                ),
+                bucket=bucket_arn,
+            )
+        )
+    return runs
 
 
 def _emit_role(

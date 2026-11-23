@@ -415,6 +415,11 @@ def inject_digests(
 # ---------------------------------------------------------------------------
 
 
+#: :class:`PlanBindingError` kind: a plugin maintenance action's statements are not the planned
+#: ones (``cli/_spark_apply.py``).
+MAINTENANCE_ACTIONS_CHANGED = "maintenance-actions-changed"
+
+
 class PlanBindingError(ValueError):
     """Raised when a plan.json's digests don't match the bundle or don't
     match the plan body itself. ``kind`` carries one of these stable tags
@@ -456,6 +461,13 @@ class PlanBindingError(ValueError):
       the one ``plan.json`` binds: it is not the plan that was reviewed.
     - ``"tofu-plan-stale"`` — OpenTofu refused the saved plan because the state
       changed after it was made (raised by ``fluid apply``, not by this module).
+    - ``"maintenance-actions-changed"`` — a ``spark.maintain`` action of the plan
+      lists a plugin maintenance action whose statements now hash to another
+      ``statementsSha256``, or that is planned or compiled on one side only: the
+      plugin that renders it changed between ``fluid plan`` and ``fluid apply``
+      (raised by ``fluid apply``, ``cli/_spark_apply.py``, naming the action and
+      the package and version on each side, never the SQL). A changed package or
+      version whose statements hash the same is a warning, not this.
     """
 
     def __init__(self, kind: str, message: str):
@@ -705,6 +717,7 @@ def verify_tofu_plan(record: Mapping[str, Any], data: Optional[bytes]) -> None:
 
 __all__ = [
     "DBT_PROJECTS_FIELD",
+    "MAINTENANCE_ACTIONS_CHANGED",
     "PlanBindingError",
     "TOFU_PLAN_FIELD",
     "dbt_projects_record",

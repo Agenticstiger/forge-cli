@@ -18,7 +18,10 @@ takes in order (``fluid_build/spark/runner/forge_spark_runner.py::run_maintenanc
 
 A plugin action's statements are asked for here, when the config is compiled (``fluid plan``,
 ``fluid apply`` and ``fluid validate``), and land in the config: its digest, which the plan binds
-and the runner checks, covers the SQL that runs, and the runner loads no plugin.
+and the runner checks, covers the SQL that runs, and the runner loads no plugin. Each action is
+also planned on its own (:class:`CompiledAction`): its kind, the distribution and version that
+shipped it, and the sha256 of its statements, so an apply that compiles other SQL can say which
+action and which package changed without showing the SQL.
 
 Compaction always commits with partial progress: each file group is its own commit, retried on
 a concurrent commit, so a stream's appends never wait for it and a group that a concurrent commit
@@ -27,7 +30,9 @@ did conflict with fails alone (the next run takes it again).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+import hashlib
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build.maintenance.spec import TableMaintenance, option_text
 
@@ -45,6 +50,57 @@ def table_name(build_config: Mapping[str, Any]) -> str:
     """The table as the runner's catalog names it (``fluid.<database>.<table>``)."""
     sink = build_config["sink"]
     return f"{sink['catalog']}.{sink['table']}"
+
+
+@dataclass(frozen=True)
+class CompiledAction:
+    """One plugin action as the plan binds it: its statements as forge ships them (sqlglot's
+    canonical rendering, :func:`~fluid_build.maintenance.statements.canonical_statement`) and
+    where its kind came from."""
+
+    name: str
+    kind: str
+    distribution: Optional[str]
+    version: Optional[str]
+    statements: Tuple[str, ...]
+
+    @property
+    def statements_sha256(self) -> str:
+        """The sha256 of the statements in fluid's canonical JSON (``plan_digest._canonical_json``)."""
+        from fluid_build.forge.core.plan_digest import _canonical_json
+
+        return hashlib.sha256(_canonical_json(list(self.statements)).encode("utf-8")).hexdigest()
+
+    def plan_entry(self) -> Dict[str, Any]:
+        """The action in the plan's ``spark.maintain`` payload (``actions[]``): never its SQL."""
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "distribution": self.distribution,
+            "version": self.version,
+            "statementsSha256": self.statements_sha256,
+        }
+
+
+def compiled_actions(tm: TableMaintenance, table: str, *, load: Any = None) -> List[CompiledAction]:
+    """Each of ``tm``'s plugin actions, in order: its kind loaded by name
+    (``fluid_build.maintenance_actions``), its ``check`` run, its statements asked for and
+    checked (:mod:`fluid_build.maintenance.statements`), and the distribution and version that
+    shipped the kind (:func:`~fluid_build.maintenance.plugins.action_origin`; unknown for a
+    ``load`` a test passes).
+
+    Raises:
+        MaintenanceActionError: a kind cannot be used, its ``check`` names a problem, or its
+            statements fail the check (the SQL is never quoted).
+    """
+    from fluid_build.maintenance.plugins import action_origin
+
+    out: List[CompiledAction] = []
+    for name, statements in action_statements(tm, table, load=load):
+        kind = next(a.kind for a in tm.actions if a.name == name)
+        distribution, version = action_origin(kind)
+        out.append(CompiledAction(name, kind, distribution, version, tuple(statements)))
+    return out
 
 
 def action_statements(
@@ -100,13 +156,18 @@ def _call(kind: Any, method: str, where: str, *args: Any) -> Any:
 
 
 def _rewrite_options(tm: TableMaintenance) -> Dict[str, str]:
-    """Iceberg's ``RewriteDataFiles`` options, as strings, as Spark actions take them."""
+    """Iceberg's ``RewriteDataFiles`` options, as strings, as Spark actions take them: partial
+    progress on, at most ``maxCommits`` commits (10) and ``maxConcurrentRewrites`` file groups
+    at a time (5, Iceberg's own defaults) unless the compaction sets others."""
+    from fluid_build.maintenance.spec import DEFAULT_MAX_CONCURRENT_REWRITES
+
     c = tm.compaction
     if c is None:
         return {}
     options = {
         "partial-progress.enabled": "true",
         "partial-progress.max-commits": str(c.max_commits),
+        "max-concurrent-file-group-rewrites": str(DEFAULT_MAX_CONCURRENT_REWRITES),
     }
     if c.target_file_size_mb is not None:
         options["target-file-size-bytes"] = str(c.target_file_size_mb * 1024 * 1024)
@@ -161,4 +222,11 @@ def maintenance_config(
     }
 
 
-__all__ = ["STEPS", "action_statements", "maintenance_config", "table_name"]
+__all__ = [
+    "STEPS",
+    "CompiledAction",
+    "action_statements",
+    "compiled_actions",
+    "maintenance_config",
+    "table_name",
+]

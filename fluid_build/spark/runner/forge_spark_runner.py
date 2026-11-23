@@ -2160,10 +2160,6 @@ def run_package(spark, config: dict, config_uri: str, stamps: dict | None = None
         shutil.rmtree(os.path.dirname(zips[0]), ignore_errors=True)
 
 
-if __name__ == "__main__":
-    sys.exit(main())
-
-
 # --- table maintenance ----------------------------------------------------------------
 #
 # A maintenance config (``mode: maintenance``, compiled by fluid_build/maintenance/job.py)
@@ -2480,10 +2476,23 @@ def run_maintenance(spark, config: dict, stamps: dict | None = None, now=None) -
             if problem:
                 raise JobConfigError(f"remove_orphan_files: {name}'s location {location} {problem}")
             cutoff = int((clock() - step["olderThanSeconds"]) * 1000)
-            result = actions.deleteOrphanFiles(maintained).olderThan(cutoff).execute()
+            action = actions.deleteOrphanFiles(maintained).olderThan(cutoff)
+            if sink.get("type") == "rest":
+                # A REST catalog hands its table's FileIO temporary credentials for the
+                # table's location; Hadoop's S3A, which the action lists through by default,
+                # holds none of them and waits on credential lookups. List through the FileIO,
+                # under the location and a '/': a prefix without one also lists a sibling
+                # table whose location starts the same (s3://b/t and s3://b/t2).
+                scope = location if location.endswith("/") else location + "/"
+                action = action.location(scope).usePrefixListing(True)
+            result = action.execute()
             out = {"deleted": _iterated(result.orphanFileLocations())}
         out = {"step": kind, **out, "seconds": round(clock() - started, 1)}
         log("maintenance_step", table=name, **out)
         done.append(out)
     log("done", table=name)
     return done
+
+
+if __name__ == "__main__":
+    sys.exit(main())

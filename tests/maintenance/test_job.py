@@ -165,6 +165,7 @@ class TestSteps:
             "options": {
                 "partial-progress.enabled": "true",
                 "partial-progress.max-commits": "10",
+                "max-concurrent-file-group-rewrites": "5",
             },
         }
 
@@ -191,6 +192,7 @@ class TestSteps:
         assert set(step["options"]) == {
             "partial-progress.enabled",
             "partial-progress.max-commits",
+            "max-concurrent-file-group-rewrites",
             "min-input-files",
         }
 

@@ -143,6 +143,14 @@ def maintenance_config_uri(root: str, product: str, build: str, expose: str) -> 
     return f"{root}/{maintenance_config_key(product, build, expose)}"
 
 
+def maintenance_build(expose: str) -> str:
+    """What a maintenance run of a table no forge build writes goes by where a build's id would
+    (its artifact prefix, its ``fluid_build`` tag): ``maintain_<expose>``, the name the table's
+    DAG takes, which no build of the contract may have (``maintenance/spec.py`` refuses one
+    that would)."""
+    return f"maintain_{expose}"
+
+
 def maintenance_run_name(product: str, expose: str) -> str:
     """A maintenance run's name on every runtime. It ends in ``-maintain``, which no build's
     run name does (those end in 8 hex characters), so a build's runs and the maintenance runs
