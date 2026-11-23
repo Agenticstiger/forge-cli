@@ -141,7 +141,11 @@ def add_flags(parser: "argparse.ArgumentParser") -> None:
     group.add_argument(
         "--privacy-unit",
         metavar="EXPOSE",
-        help="the expose whose one row is one entity; needs --request, --rho and --release-record",
+        help=(
+            "the expose whose one row is one entity (with --release-table or --unit-key, an "
+            "entity owns every row that belongs to it, and the stated loss holds for each "
+            "entity); needs --request, --rho and --release-record"
+        ),
     )
     group.add_argument(
         "--release-table",
@@ -460,9 +464,6 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 "max_rows_per_cell": args.max_rows_per_cell,
             }
             rho = release.parse_rho(args.rho)
-        notice = release.rho_warning(rho)
-        if notice is not None:
-            console_warning(notice)
         contract = load_contract_with_overlay(str(contract_path), args.env, logger)
         plan = release.plan_release(
             contract,
@@ -481,6 +482,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         record_path = _check_record_path(
             args.release_record, out, [each.source for each in exposes], new=not rederive
         )
+        notice = release.rho_warning(rho)
+        if notice is not None:
+            console_warning(notice)
         cliques = None
         if recorded is not None:
             cliques = release.check_record(plan, recorded)

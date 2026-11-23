@@ -785,3 +785,4 @@ def test_the_command_help_lists_the_flags_and_an_example(capsys):
     text = " ".join(capsys.readouterr().out.split())
     assert "private release (differential privacy)" in text and "--rederive" in text
     assert "a release under differential privacy" in text
+    assert "an entity owns every row that belongs to it" in text
