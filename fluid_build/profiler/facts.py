@@ -30,7 +30,12 @@ read refuses, naming the column and the row and never the value.
 
 The counts :func:`count_fact` returns are exact. They must pass the output checks
 (small cells, zeros, rounding) before any of them leaves the data owner's boundary;
-that is the caller's job.
+that is the caller's job. So must the counts two or more facts of one table give
+together: :func:`fact_states` gives each row's state under a rule, from which the caller
+counts every combination of the facts' states, and :func:`states_together` says which
+combinations the rules' texts rule out on any row, so that an empty one is told apart
+from one the records happen not to hold
+(:func:`fluid_build.profiler.disclosure.suppress_differencing`).
 
 Standard library plus :mod:`fluid_build.fluid_sql`.
 """
@@ -42,14 +47,36 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 from fractions import Fraction
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fluid_build import fluid_sql as fs
 from fluid_build.data_rules._model import Expose, as_list, build, nfc
 from fluid_build.fluid_sql import _nodes as nodes
 from fluid_build.fluid_sql._types import BOOL, DATE, NUMBER, STRING, TIMESTAMP, TIMESTAMPTZ
 
-__all__ = ["FactCount", "FactPlan", "FactRefused", "count_fact", "plan_fact"]
+__all__ = [
+    "FAILS",
+    "HOLDS",
+    "NOT_COVERED",
+    "STATES",
+    "FactCount",
+    "FactPlan",
+    "FactRefused",
+    "count_fact",
+    "fact_states",
+    "plan_fact",
+    "states_together",
+]
+
+#: A rule's state on one row: its ``when`` does not cover the row; the row is covered and
+#: does not satisfy the rule; the row is covered and satisfies it.
+NOT_COVERED, FAILS, HOLDS = 0, 1, 2
+STATES: Tuple[int, ...] = (NOT_COVERED, FAILS, HOLDS)
+
+#: The most parts (comparisons, NULL tests and the like) the rules of facts that share a
+#: part may hold together before :func:`states_together` stops reading them and answers
+#: that their texts rule nothing out: it tries every truth of every part, 2^16 at most.
+_MOST_PARTS = 16
 
 #: The most a decimal's exponent may be before its value is refused (it would be a number
 #: of thousands of digits).
@@ -372,6 +399,33 @@ def count_fact(
     gives, a column that is missing or of another length, and a value that is not its
     column's type.
     """
+    states = fact_states(contract, plan, values)
+    return FactCount(len(states) - states.count(NOT_COVERED), states.count(HOLDS))
+
+
+def fact_states(
+    contract: Mapping[str, Any], plan: FactPlan, values: Mapping[str, Sequence[Any]]
+) -> bytes:
+    """Each row's state under ``plan``'s rule, one byte per row in the rows' order.
+
+    :data:`NOT_COVERED` where the rule's ``when`` is not TRUE, else :data:`HOLDS` where the
+    row satisfies the rule and :data:`FAILS` where it does not. Takes and refuses what
+    :func:`count_fact` does.
+    """
+    prepared, converted, rows = _ready(contract, plan, values)
+    states = bytearray(rows)  # every row NOT_COVERED until its when is read
+    for index in range(rows):
+        row = {name: converted[name][index] for name in plan.columns}
+        if prepared.when is not None and not fs.evaluate(prepared.when, row, predicate=True):
+            continue
+        states[index] = HOLDS if fs.evaluate(prepared.test, row, predicate=True) else FAILS
+    return bytes(states)
+
+
+def _ready(
+    contract: Mapping[str, Any], plan: FactPlan, values: Mapping[str, Sequence[Any]]
+) -> Tuple[_Measure, Dict[str, List[Any]], int]:
+    """The rule to evaluate, its columns' values as the evaluator takes them, and the rows."""
     if plan.reason is not None:
         raise FactRefused(
             "fact-not-measured",
@@ -402,12 +456,135 @@ def count_fact(
             {"fact": plan.name},
         )
     converted = {name: _converted(expose, name, plan.name, values[name]) for name in plan.columns}
-    covered = satisfied = 0
-    for index in range(lengths.pop() if lengths else 0):
-        row = {name: converted[name][index] for name in plan.columns}
-        if prepared.when is not None and not fs.evaluate(prepared.when, row, predicate=True):
+    return prepared, converted, lengths.pop() if lengths else 0
+
+
+# ---------------------------------------------------------------------------
+# What the texts rule out
+# ---------------------------------------------------------------------------
+
+#: A rule's ``when`` or test read as AND, OR and NOT over parts: ``("part", index)``,
+#: ``("const", truth)``, ``("not", f)``, ``("and", f, g)`` or ``("or", f, g)``.
+_Formula = Tuple[Any, ...]
+
+
+def _formula(node: Optional[nodes.Node], parts: Dict[nodes.Node, int]) -> _Formula:
+    """*node* as the evaluator reads it where a predicate is expected.
+
+    The evaluator's AND, OR and NOT take the truth of their operands (a NULL is FALSE), so
+    they are read as Boolean connectives. Every other node is a part, and two texts that
+    hold one part (equal trees: a node's position is not compared) read it alike on a row.
+    No ``when`` is TRUE.
+    """
+    if node is None:
+        return ("const", True)
+    if isinstance(node, nodes.And):
+        return ("and", _formula(node.left, parts), _formula(node.right, parts))
+    if isinstance(node, nodes.Or):
+        return ("or", _formula(node.left, parts), _formula(node.right, parts))
+    if isinstance(node, nodes.Not):
+        return ("not", _formula(node.operand, parts))
+    if isinstance(node, nodes.Bool):
+        return ("const", node.value)
+    if isinstance(node, nodes.Null):
+        return ("const", False)
+    return ("part", parts.setdefault(node, len(parts)))
+
+
+def _truth(formula: _Formula, truths: int) -> bool:
+    """*formula*'s truth when part ``i`` is TRUE exactly where bit ``i`` of *truths* is set."""
+    kind = formula[0]
+    if kind == "part":
+        return bool(truths >> formula[1] & 1)
+    if kind == "const":
+        return bool(formula[1])
+    if kind == "not":
+        return not _truth(formula[1], truths)
+    if kind == "and":
+        return _truth(formula[1], truths) and _truth(formula[2], truths)
+    return _truth(formula[1], truths) or _truth(formula[2], truths)
+
+
+def _parts_of(formula: _Formula) -> Set[int]:
+    if formula[0] == "part":
+        return {formula[1]}
+    if formula[0] == "const":
+        return set()
+    return set().union(*(_parts_of(each) for each in formula[1:]))
+
+
+def states_together(
+    contract: Mapping[str, Any], plans: Sequence[FactPlan]
+) -> Callable[[Mapping[str, int]], bool]:
+    """Whether the rules' texts let facts take given states on one row.
+
+    The answer reads each measured fact's ``when`` and test as AND, OR and NOT over parts
+    it does not open (a comparison, a NULL test, an IN list, a derive's agreement), with
+    every truth of every part allowed. Its ``False`` holds for every row of any records:
+    the texts alone rule the states out, as ``A`` TRUE and ``A OR id = 'x'`` not TRUE,
+    or a ``NOT_COVERED`` state for a rule without a ``when``. Its ``True`` says only that
+    the texts do not rule them out: what the parts mean (``x > 2`` beside ``x > 1``) or
+    the records may. Facts that share no part are read apart; when the facts that share
+    parts hold more than ``_MOST_PARTS`` of them, they are not read and nothing is ruled
+    out. The returned function takes a mapping of fact names to :data:`STATES`.
+    """
+    parts: Dict[nodes.Node, int] = {}
+    readings: Dict[str, Tuple[_Formula, _Formula]] = {}
+    for plan in plans:
+        expose = _expose_of(contract, plan.name, plan.table, plan.rule)
+        prepared = _prepare(expose, _invariant(expose, plan.name, plan.table, plan.rule))
+        if isinstance(prepared, str):
             continue
-        covered += 1
-        if fs.evaluate(prepared.test, row, predicate=True):
-            satisfied += 1
-    return FactCount(covered, satisfied)
+        readings[plan.name] = (_formula(prepared.when, parts), _formula(prepared.test, parts))
+    # Facts that share a part are read together; a part is shared through any chain of them.
+    group_of: Dict[str, int] = {}
+    groups: List[Tuple[List[str], Set[int]]] = []
+    for name, (when, test) in readings.items():
+        own = _parts_of(when) | _parts_of(test)
+        joined = [index for index, (_, held) in enumerate(groups) if held & own]
+        names, held = [name], set(own)
+        for index in joined:
+            names = groups[index][0] + names
+            held |= groups[index][1]
+        groups = [group for index, group in enumerate(groups) if index not in joined]
+        groups.append((names, held))
+    reachable: List[Optional[Set[Tuple[int, ...]]]] = []
+    for index, (names, held) in enumerate(groups):
+        for name in names:
+            group_of[name] = index
+        if len(held) > _MOST_PARTS:
+            reachable.append(None)
+            continue
+        order = sorted(held)
+        found: Set[Tuple[int, ...]] = set()
+        for choice in range(1 << len(order)):
+            truths = sum(1 << part for bit, part in enumerate(order) if choice >> bit & 1)
+            found.add(tuple(_state(*readings[name], truths) for name in names))
+        reachable.append(found)
+    asked: Dict[Tuple[int, Tuple[Tuple[int, int], ...]], bool] = {}
+
+    def together(states: Mapping[str, int]) -> bool:
+        wanted: Dict[int, List[Tuple[int, int]]] = {}
+        for name, state in states.items():
+            index = group_of.get(name)
+            if index is None:  # not measured: its texts are not read, so they rule nothing out
+                continue
+            wanted.setdefault(index, []).append((groups[index][0].index(name), state))
+        for index, pairs in wanted.items():
+            found = reachable[index]
+            if found is None:
+                continue
+            key = (index, tuple(sorted(pairs)))
+            if key not in asked:
+                asked[key] = any(all(seen[at] == state for at, state in pairs) for seen in found)
+            if not asked[key]:
+                return False
+        return True
+
+    return together
+
+
+def _state(when: _Formula, test: _Formula, truths: int) -> int:
+    if not _truth(when, truths):
+        return NOT_COVERED
+    return HOLDS if _truth(test, truths) else FAILS

@@ -840,48 +840,79 @@ def _fact_entries(
     minimum or a zero where zeros are disclosive is withheld, and either cell withheld
     withholds the whole group, since the other cell and the table's published row count would
     give it back. Published counts are rounded as other counts are.
+
+    The facts of one table are then checked together, on the exact counts of every
+    combination of their states (:func:`disclosure.suppress_differencing`): a fact whose
+    counts, with the other facts' and the table's row count, would give back a small or a
+    disclosive zero cell is withheld too, under ``D``. A withheld fact whose rule has a
+    ``when`` writes the band of a statistic of unknown size, ``min`` 0 and no ``max``: the
+    band of the rows it covers would give their number back, for another fact's ``when``
+    to difference against.
     """
-    entries: List[Dict[str, Any]] = []
-    results: List[FactResult] = []
     unmeasured: List[Tuple[str, str]] = []
+    measured: List[facts.FactPlan] = []
+    states: Dict[str, bytes] = {}
     for each in fact_plans:
         if each.reason is not None:
             unmeasured.append((f"fact {each.name}", each.reason))
             continue
         read = reads[each.table]
         try:
-            counted = facts.count_fact(
+            states[each.name] = facts.fact_states(
                 contract, each, {name: read.values[name] for name in each.columns}
             )
         except facts.FactRefused as exc:
             raise _fact_refusal(exc) from None
-        cells = [counted.covered - counted.satisfied, counted.satisfied]
-        verdicts = [_checked_cell(count, rule) for count in cells]
-        refused = next(
-            (each_verdict for each_verdict in verdicts if not each_verdict.published), None
-        )
-        total = counted.covered
+        measured.append(each)
+    cells = {
+        each.name: [states[each.name].count(facts.FAILS), states[each.name].count(facts.HOLDS)]
+        for each in measured
+    }
+    refused: Dict[str, Optional[disclosure.Verdict]] = {}
+    for each in measured:
+        verdicts = [_checked_cell(count, rule) for count in cells[each.name]]
+        refused[each.name] = next((verdict for verdict in verdicts if not verdict.published), None)
+    covers_all: Dict[str, bool] = {}
+    for table in dict.fromkeys(each.table for each in measured):
+        on_table = [each for each in measured if each.table == table]
+        together = facts.states_together(contract, on_table)
+        for each in on_table:
+            covers_all[each.name] = not together({each.name: facts.NOT_COVERED})
+        for name in _differenced(on_table, states, refused, rule, together):
+            refused[name] = disclosure.Verdict(
+                disclosure.SECONDARY,
+                "with the other facts of its table it would give back a small cell",
+            )
+    entries: List[Dict[str, Any]] = []
+    results: List[FactResult] = []
+    for each in measured:
+        counts = cells[each.name]
+        total = sum(counts)
+        verdict = refused[each.name]
         group: Dict[str, Any]
-        if refused is None:
+        band = disclosure.sample_size(total, rule)
+        if verdict is None:
             tally[disclosure.FREE] += 1
             group = {
                 "group": "",
                 "status": disclosure.FREE,
                 "k": disclosure.round_count(total, rule),
-                "levelCounts": [disclosure.round_count(count, rule) for count in cells],
+                "levelCounts": [disclosure.round_count(count, rule) for count in counts],
             }
             results.append(FactResult(each.name, True))
         else:
-            tally[refused.status] += 1
+            tally[verdict.status] += 1
             group = {"group": "", "status": disclosure.WITHHELD}
-            results.append(FactResult(each.name, False, refused.status))
+            results.append(FactResult(each.name, False, verdict.status))
+            if not covers_all[each.name]:
+                band = {"min": 0}
         entries.append(
             {
                 "name": each.name,
                 "statistics": [
                     {
                         "definition": "levelHistogram/1",
-                        "sampleSize": disclosure.sample_size(total, rule),
+                        "sampleSize": band,
                         "disclosure": rule.name,
                         "levels": list(_FACT_LEVELS),
                         "groups": [group],
@@ -890,6 +921,33 @@ def _fact_entries(
             }
         )
     return entries, tuple(results), unmeasured
+
+
+def _differenced(
+    plans: Sequence["facts.FactPlan"],
+    states: Mapping[str, bytes],
+    refused: Mapping[str, Optional[disclosure.Verdict]],
+    rule: disclosure.DisclosureRule,
+    together: Callable[[Mapping[str, int]], bool],
+) -> List[str]:
+    """The facts of one table that passed their own checks and are withheld against differencing.
+
+    One pass over the rows counts every combination of the facts' states, which is the
+    grouped count ``GROUP BY`` the facts' states would give, whatever the number of facts.
+    """
+    names = [each.name for each in plans]
+    passed = [at for at, name in enumerate(names) if refused[name] is None]
+    if not passed:
+        return []
+    combinations: "Counter[Tuple[int, ...]]" = Counter(
+        zip(*(states[name] for name in names), strict=True)
+    )
+
+    def possible(assigned: Mapping[int, int]) -> bool:
+        return together({names[at]: state for at, state in assigned.items()})
+
+    withheld = disclosure.suppress_differencing(combinations, passed, rule, possible, facts.STATES)
+    return [names[at] for at in sorted(withheld)]
 
 
 def _checked_cell(count: int, rule: disclosure.DisclosureRule) -> disclosure.Verdict:
