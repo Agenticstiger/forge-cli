@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.0] — 2026-11-23
+
 ### Added
 
 - **Iceberg maintenance for a table forge does not write.** A table whose streams run on its
@@ -157,10 +159,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
-- A plan made before this release has no `actions` in its `spark.maintain` payload, and the
-  compaction options of a maintenance job config changed, so `fluid apply` refuses such a plan
-  with `apply_spark_artifact_mismatch`: run `fluid plan` again, then `fluid apply`, before the
-  next `fluid apply --mode maintain`.
+- The bundled Spark runner changed, and its hash is part of every Spark build's config hash. So
+  every running Spark stream restarts once on the first `fluid apply` after the upgrade, and a
+  plan made before this release with a `spark.reconcile` or `spark.maintain` action is refused with
+  `apply_spark_artifact_mismatch`. Run `fluid plan` again, then `fluid apply`. A `spark.maintain`
+  plan also lacks the new per-action `actions`, and the compaction options of a maintenance job
+  config changed, so make it again before the next `fluid apply --mode maintain`.
+- A `fluid_build.commands` plugin that registers the name or an alias of a core command is now
+  skipped whole: none of its commands load, and the core command stays. Before, Python 3.10 let
+  it replace the core command and 3.11 and later left it half registered. Give a plugin's
+  commands names of their own.
+- Orphan removal on a table in an Iceberg REST catalog now lists only the table's own folder,
+  through Iceberg's prefix listing. A Spark runtime whose Iceberg has no prefix listing stops that
+  step with an error and deletes nothing; compaction and snapshot expiry still run.
 
 ## [0.38.0] — 2026-11-22
 
