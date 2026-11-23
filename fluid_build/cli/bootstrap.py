@@ -10,7 +10,7 @@ import importlib
 import logging
 import os
 import sys
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Collection, Dict, List, NamedTuple, Optional, Set, Tuple
 
 from fluid_build.cli.console import error as console_error
 
@@ -332,25 +332,137 @@ def _wrap_plugin_parser_funcs(parser: argparse.ArgumentParser) -> None:
                 _wrap_plugin_parser_funcs(sub)
 
 
+class PluginCommandShadowError(CLIError):
+    """A ``fluid_build.commands`` plugin asked for a command name that is already taken.
+
+    The name is a core command's (or one of its aliases), another plugin's, or the plugin's
+    own earlier one. :func:`_guard_subparsers` raises this from ``add_parser`` so the outcome
+    is the same on every Python: 3.10 lets a second ``add_parser`` of a name replace the first
+    without a word, and 3.11 and later raise ``ArgumentError: conflicting subparser``
+    (bpo-39716). It carries the plugin's name and the command's, and nothing else.
+    """
+
+    def __init__(self, plugin: str, command: str) -> None:
+        super().__init__(2, "cli_plugin_command_shadow", {"plugin": plugin, "command": command})
+        self.plugin = plugin
+        self.command = command
+        self.message = (
+            f"CLI plugin {plugin!r} cannot add the command {command!r}: that name is already taken"
+        )
+
+
+def _guard_subparsers(
+    sp: argparse._SubParsersAction, plugin: str, reserved: Collection[str]
+) -> Tuple[argparse._SubParsersAction, List[str]]:
+    """``sp`` as a ``fluid_build.commands`` plugin is handed it, and the names it refused.
+
+    It is the same action (one ``__dict__``: what the plugin reads or sets is ``sp``'s own, and
+    ``isinstance(guard, argparse._SubParsersAction)`` holds), except that ``add_parser`` refuses
+    a name or an alias that is taken: a core command's, one a plugin added before, or the
+    plugin's own earlier one (:class:`PluginCommandShadowError`). The check comes before
+    anything is registered, so a refused call changes nothing, on every Python. The names
+    refused are kept, so the loader knows when a plugin caught the error and went on. It stops a
+    plugin shadowing a command by accident; plugins are in-process Python, and this is not a
+    sandbox.
+    """
+    refused: List[str] = []
+
+    class _Guarded(argparse._SubParsersAction):
+        def add_parser(self, name: str, **kwargs: Any) -> argparse.ArgumentParser:
+            aliases = tuple(kwargs.get("aliases") or ())
+            for command in (name, *aliases):
+                if command in reserved or command in self.choices:
+                    refused.append(command)
+                    raise PluginCommandShadowError(plugin, command)
+            if "aliases" in kwargs:
+                kwargs["aliases"] = aliases  # a generator the check read is not read twice
+            parser: argparse.ArgumentParser = super().add_parser(name, **kwargs)
+            return parser
+
+    guard = object.__new__(_Guarded)
+    guard.__dict__ = sp.__dict__
+    return guard, refused
+
+
+def _reserved_command_names() -> Set[str]:
+    """Every name and alias a core command takes, whatever the build profile leaves out."""
+    return {name for entry in CORE_COMMANDS for name in _core_command_names(entry)}
+
+
+def _forget_plugin_commands(sp: argparse._SubParsersAction, before: Set[str], helps: int) -> None:
+    """Take back what a plugin registered since ``before`` (the names in ``sp.choices``) and
+    ``helps`` (how many help entries ``sp`` had): its parsers and their lines in the help."""
+    for name in set(sp.choices) - before:
+        del sp.choices[name]
+    actions = getattr(sp, "_choices_actions", None)
+    if isinstance(actions, list):
+        del actions[helps:]
+
+
+def _load_command_plugin(
+    sp: argparse._SubParsersAction, ep: Any, reserved: Collection[str], skipped: Set[str]
+) -> Optional[List[str]]:
+    """Run one plugin's entry point on a guarded ``sp``: the commands it added, or ``None`` when
+    it was not loaded.
+
+    A failure is logged by exception TYPE only, never its text. A plugin that asked for a name
+    that is taken (whether the refusal reached the loader or the plugin caught it and went on)
+    is skipped whole: what it had added is taken back, ``skipped`` remembers it, and a warning
+    names the plugin and the command, never the exception.
+    """
+    before = set(sp.choices)
+    helps = len(getattr(sp, "_choices_actions", ()))
+    guard, refused = _guard_subparsers(sp, ep.name, reserved)
+    try:
+        ep.load()(guard)
+    except Exception as e:  # noqa: BLE001 - isolate a bad plugin; type only
+        if not refused:
+            LOG.warning("Failed to load CLI plugin %s: %s", ep.name, type(e).__name__)
+            return None
+    if refused:
+        _forget_plugin_commands(sp, before, helps)
+        skipped.add(ep.name)
+        LOG.warning(
+            "cli_plugin_command_shadow: CLI plugin %r was not loaded: it asked for the "
+            "command %r, which is already taken (a fluid command, or another plugin's). "
+            "A plugin may add new command names only; none of its commands was registered.",
+            ep.name,
+            refused[0],
+            extra={"evt": "cli_plugin_command_shadow"},
+        )
+        return None
+    return [n for n in sp.choices if n not in before]
+
+
 def _register_command_plugins(
     sp: argparse._SubParsersAction, argv: Optional[List[str]] = None, *, force: bool = False
 ) -> Dict[str, List[str]]:
     """Register external ``fluid_build.commands`` plugins LAZILY.
 
-    A plugin's module + ``register()`` is imported only when its command is
-    actually being invoked, detected by peeking ``sys.argv``. On the
-    ``fluid --help`` / core-command / no-command paths NO plugin is imported —
-    installed plugin names are surfaced separately by ``print_main_help`` from
-    entry-point metadata. Discovery and per-plugin load failures are fully
-    isolated and logged by exception TYPE only, so a broken plugin can never
-    crash the CLI and a credential-shaped substring can never leak.
+    An entry point loads to a callable ``(subparsers) -> None``, whatever it is named, that adds
+    its commands with ``subparsers.add_parser``. The plugin's module is imported and that
+    callable is run only when its command is actually being invoked, detected by peeking
+    ``sys.argv``. On the ``fluid --help`` / core-command / no-command paths NO plugin is
+    imported: installed plugin names are surfaced separately by ``print_main_help`` from
+    entry-point metadata. Discovery and per-plugin load failures are fully isolated and logged
+    by exception TYPE only, so a broken plugin can never crash the CLI and a credential-shaped
+    substring can never leak.
+
+    A plugin adds new names only. The callable gets ``subparsers`` with an ``add_parser``
+    (:func:`_guard_subparsers`) that refuses a core command's name or alias, another plugin's
+    name, or the plugin's own repeat (:class:`PluginCommandShadowError`, the same on every
+    Python). A plugin that asks for one is skipped whole, the commands it had
+    already added are taken back, a warning names the plugin and the command, and the other
+    plugins still load (:func:`_load_command_plugin`).
 
     ``force`` loads every allowed plugin regardless of the invoked command; only
     ``fluid describe --commands`` sets it. Returns ``{plugin name: [commands it added]}``.
     """
     # Idempotent per subparsers object: a plugin already registered (the invoked
-    # command was a plugin's) is not loaded twice, and keeps its attribution.
+    # command was a plugin's) is not loaded twice, and keeps its attribution; a plugin
+    # refused for shadowing a command is not loaded, or warned about, twice either.
     added: Dict[str, List[str]] = sp.__dict__.setdefault("_fluid_plugin_commands", {})
+    skipped: Set[str] = sp.__dict__.setdefault("_fluid_plugin_refused", set())
     try:
         eps = _command_plugin_entry_points()
     except Exception as e:  # noqa: BLE001 - discovery must never break the CLI
@@ -367,18 +479,14 @@ def _register_command_plugins(
     if not force and not (requested and requested not in core_names):
         return added
 
+    reserved = core_names | _reserved_command_names()
     for ep in eps:
-        if ep.name in added:
+        if ep.name in added or ep.name in skipped:
             continue
-        before = set(sp.choices)
-        try:
-            ep.load()(sp)
-        except Exception as e:  # noqa: BLE001 - isolate a bad plugin; type only
-            # Type-only — never interpolate plugin-supplied exception text.
-            LOG.warning("Failed to load CLI plugin %s: %s", ep.name, type(e).__name__)
+        new = _load_command_plugin(sp, ep, reserved, skipped)
+        if new is None:
             continue
         # Bridge any newly-registered command funcs to ``func(args, logger)``.
-        new = [n for n in sp.choices if n not in before]
         added[ep.name] = new
         for name in new:
             _wrap_plugin_parser_funcs(sp.choices[name])
@@ -809,12 +917,12 @@ def register_core_commands(
     #     [project.entry-points."fluid_build.commands"]
     #     my-cmd = "my_pkg.cli:register"
     #
-    # The referenced callable must accept the argparse subparser group and call
-    # ``add_parser`` on it. To keep a heavy third-party module-scope import
-    # (e.g. ``jsonschema``) off the ``fluid --help`` / ``build_parser()`` cold
-    # path, the plugin module is imported (and its ``register()`` called) ONLY
-    # when its command is actually being invoked — see
-    # ``_register_command_plugins``. Governance, fail-isolation, and type-only
-    # logging are preserved there.
+    # The referenced callable (any name; ``register`` here is only the usual one) takes the
+    # argparse subparser group, ``(subparsers) -> None``, and calls ``add_parser`` on it for each
+    # NEW command name: one a core command or another plugin already has is refused. To keep a
+    # heavy third-party module-scope import (e.g. ``jsonschema``) off the ``fluid --help`` /
+    # ``build_parser()`` cold path, the plugin module is imported (and its callable run) ONLY
+    # when its command is actually being invoked — see ``_register_command_plugins``.
+    # Governance, fail-isolation, shadow refusal and type-only logging are preserved there.
     # ────────────────────────────────────────────────────────────────────
     _register_command_plugins(sp, argv)

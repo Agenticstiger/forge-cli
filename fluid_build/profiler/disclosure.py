@@ -111,15 +111,18 @@ from __future__ import annotations
 import math
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import (
+    AbstractSet,
     Any,
     Callable,
     Dict,
     FrozenSet,
     Iterable,
     List,
+    Mapping,
     Optional,
     Sequence,
     Set,
@@ -153,6 +156,7 @@ __all__ = [
     "pinned_children_cells",
     "round_count",
     "sample_size",
+    "suppress_differencing",
     "suppress_secondary",
 ]
 
@@ -538,7 +542,8 @@ def suppress_secondary(verdicts: Sequence[Verdict]) -> Tuple[Verdict, ...]:
     not apply to an ungrouped statistic, which has one group, or to a histogram
     or a quantile, whose own cells and ranks are checked as counts. The caller
     adds the records a ``groupBy`` null leaves out of every group as one more
-    group, never written, since the column's own totals hold them too.
+    group, never written, since the column's own totals hold them too. The
+    facts a request lists are checked together by :func:`suppress_differencing`.
     """
     if all(verdict.published for verdict in verdicts) or not any(
         verdict.published for verdict in verdicts
@@ -546,6 +551,173 @@ def suppress_secondary(verdicts: Sequence[Verdict]) -> Tuple[Verdict, ...]:
         return tuple(verdicts)
     withheld = Verdict(SECONDARY, "another group of the statistic is withheld")
     return tuple(withheld if verdict.published else verdict for verdict in verdicts)
+
+
+#: A combination of the states of a table's facts, one state per fact.
+Combination = Tuple[int, ...]
+
+
+#: The facts of a combination in factors: each factor's fact positions, with every
+#: combination of their states that the facts' texts allow (one state per position, in
+#: that order). The combinations the texts allow are every choice of one per factor.
+Factors = Sequence[Tuple[Tuple[int, ...], AbstractSet[Combination]]]
+
+
+def suppress_differencing(
+    cells: Mapping[Combination, int],
+    passed: Iterable[int],
+    rule: DisclosureRule,
+    factors: Callable[[Sequence[int]], Factors],
+    states: Sequence[int],
+) -> FrozenSet[int]:
+    """The facts of one table to withhold so that together they give back no small cell.
+
+    A fact publishes how many of a table's rows its rule covers, and how many of those
+    satisfy it and how many do not; the table publishes its row count. Facts that overlap
+    give more together than each alone: ``A`` and ``A OR id = 'x'`` differ by the one row
+    ``x`` when it lies outside ``A``, and ``A``, ``B`` and ``A OR B`` give
+    ``|A AND B| = |A| + |B| - |A OR B|`` however large each pair's overlap is, so checking
+    facts two at a time is not enough. The check reads every combination of the facts'
+    states at once. *cells* maps each combination that at least one record holds (one of
+    *states* per fact, in the facts' order) to the exact number of records holding it.
+    The counts are read before any rounding: 102 and 103 records round to 100 and 105,
+    and a reader differences those back to one record.
+
+    A combination of the published facts that holds from 1 to ``minimumCell - 1`` records
+    is a small cell. Where zeros are disclosive, every empty combination that the facts'
+    texts allow is a zero cell too, since its emptiness is a containment the records show
+    (no record of the one state has the other), and an empty combination the texts rule
+    out on every row is not (``A`` TRUE beside ``A OR id = 'x'`` not TRUE is no row's, so
+    the texts show that containment already). *factors* gives, for the positions of the
+    facts still published, the factors of :data:`Factors`: facts whose texts are linked,
+    with the combinations of states the texts let them take together. The combinations
+    allowed are every choice of one per factor, and the check looks at each that one
+    factor's change takes to a held combination: if none of those is empty, the held
+    combinations are every allowed one, so it finds an empty one whenever any is left,
+    however many changes of single facts away from a held one it lies.
+
+    A fact touches such a cell when changing that fact's state alone takes the cell to a
+    combination some record holds, so that withholding the fact merges the two. Every
+    fact that touches a small cell is withheld, the combinations of the facts still
+    published are formed again, and so on until no small cell is left; then every fact
+    that touches a zero cell is withheld, and the small cells are looked for again, until
+    neither is left. Small cells go first because the empty combinations around a small
+    cell go when it merges: read in the same round, they would withhold a fact that only
+    the small cell set apart. Each round only withholds more, never brings a fact back,
+    and depends on the facts and the records alone, not on the order the facts are listed
+    in. A small or a zero cell that no one fact's change merges withholds every fact it
+    differs in from its nearest held combinations. *passed* holds the positions of the facts that
+    passed their own checks; the result is those of them to withhold, which the summary
+    counts under ``D`` and the document writes ``C``, as it writes every withheld group of
+    a level histogram.
+
+    The check covers the facts of one table among themselves and against the table's row
+    count, not a fact's overlap with a histogram's cells, a column's counts or a
+    relationship's counts. Two exposes are two tables to it, even when the data owner reads
+    both from the same records, so facts asked of each are not checked together. Noise is
+    what the ONS credits with protecting against
+    differencing, in its comparison of post-tabular methods (2024), and the release under
+    differential privacy (``fluid profile --privacy-unit``) is the profiler's way to
+    publish counts with noise. The pattern is the coordinated secondary suppression of
+    linked tables that the Handbook on Statistical Disclosure Control (2nd edition, section
+    4.3.1) sets out, adapted: tables are linked by the cells they share, and here every
+    combination of the facts' states is held to the threshold, which errs toward
+    withholding, where an audit such as sdcTable's ``attack()`` solves for the bounds a
+    reader can put on each suppressed cell.
+    """
+    candidates = frozenset(passed)
+    shown = set(candidates)
+    width = len(next(iter(cells), ()))
+    while shown:
+        order = sorted(shown)
+        formed: Mapping[Combination, int]
+        if len(order) == width:
+            # Every fact is published: the combinations are the ones given, not formed again.
+            formed = {combination: count for combination, count in cells.items() if count > 0}
+        else:
+            projected: Counter[Combination] = Counter()
+            for combination, count in cells.items():
+                if count > 0:
+                    projected[tuple(combination[at] for at in order)] += count
+            formed = projected
+        touched = _touched(formed, order, rule, factors, states)
+        if not touched:
+            break
+        shown -= touched
+    return candidates - shown
+
+
+def _touched(
+    formed: Mapping[Combination, int],
+    order: Sequence[int],
+    rule: DisclosureRule,
+    factors: Callable[[Sequence[int]], Factors],
+    states: Sequence[int],
+) -> Set[int]:
+    """The facts (positions) that touch a small cell of *formed*, else those touching a zero cell."""
+    width = len(order)
+
+    def changed(cell: Combination, at: int) -> List[Combination]:
+        return [cell[:at] + (state,) + cell[at + 1 :] for state in states if state != cell[at]]
+
+    def touching(cell: Combination) -> Set[int]:
+        return {at for at in range(width) if any(other in formed for other in changed(cell, at))}
+
+    touched: Set[int] = set()
+    for cell, count in formed.items():
+        if len(touched) == width:
+            break
+        if count < rule.minimum_cell:
+            touched |= touching(cell) or _differing_from_nearest(cell, formed)
+    if touched or not rule.zeros_disclosive:
+        return {order[at] for at in touched}
+    local = {position: at for at, position in enumerate(order)}
+    looked_at: Set[Combination] = set()
+    for positions, allowed in factors(order):
+        inside = tuple(local[position] for position in positions)
+        apart = set(inside)
+        seen_beside: Dict[Combination, Set[Combination]] = {}
+        for cell in formed:
+            rest = tuple(state for at, state in enumerate(cell) if at not in apart)
+            seen_beside.setdefault(rest, set()).add(tuple(cell[at] for at in inside))
+        for rest, seen in seen_beside.items():
+            for missing in allowed:
+                if missing in seen:
+                    continue
+                zero = _put_together(rest, inside, missing, width)
+                if zero in looked_at:
+                    continue
+                looked_at.add(zero)
+                touched |= touching(zero) or _differing_from_nearest(zero, formed)
+                if len(touched) == width:
+                    return {order[at] for at in touched}
+    return {order[at] for at in touched}
+
+
+def _put_together(
+    rest: Combination, inside: Tuple[int, ...], states: Combination, width: int
+) -> Combination:
+    """The combination with *states* at the positions *inside* and *rest*, in order, elsewhere."""
+    placed = dict(zip(inside, states, strict=True))
+    others = iter(rest)
+    return tuple(placed[at] if at in placed else next(others) for at in range(width))
+
+
+def _differing_from_nearest(cell: Combination, formed: Iterable[Combination]) -> Set[int]:
+    """Where *cell* differs from the held combinations nearest it; every fact if none is held."""
+    nearest: Optional[int] = None
+    found: Set[int] = set()
+    for other in formed:
+        if other == cell:
+            continue
+        differ = {
+            at for at, (mine, theirs) in enumerate(zip(cell, other, strict=True)) if mine != theirs
+        }
+        if nearest is None or len(differ) < nearest:
+            nearest, found = len(differ), differ
+        elif len(differ) == nearest:
+            found |= differ
+    return found or set(range(len(cell)))
 
 
 def pinned_children_cells(

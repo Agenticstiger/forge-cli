@@ -390,6 +390,7 @@ def test_profile_help_explains_what_leaves(capsys):
     assert "no privacy or anonymity guarantee" in text
     assert "--source" in text and "--table" in text
     assert "--bundle DIR" in text and "answer a Simulation's fidelity block" in text
+    assert "facts of one table are also checked together" in text
 
 
 def test_a_linked_profile_target_is_refused_and_its_target_untouched(workspace, registry, capsys):

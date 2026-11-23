@@ -26,10 +26,12 @@
 A route never carries a secret. ``connection`` names the Airflow connection that holds the
 address, URL or key, and is held to Airflow's connection-id characters: a URL, an address
 with a password or something shaped like a key is refused, and the message never shows the
-value. Every other string a route gives (``options`` included) is held to no template syntax
-(``{`` or ``}``, which Airflow's Jinja would read in a notifier's template fields), no URL
-and nothing the secret redactor would mask, and an option named like a secret (``api_key``,
-``password``, ``routingKey``) is refused whatever its value.
+value. A route may leave it out when its kind has a default connection (``slack_default``);
+it is required only for a kind that needs one and has no default (``webhook``). Every other
+string a route gives (``options`` included) is held to no template syntax (``{`` or ``}``,
+which Airflow's Jinja would read in a notifier's template fields), no URL and nothing the
+secret redactor would mask, and an option named like a secret (``api_key``, ``password``,
+``routingKey``) is refused whatever its value.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ import keyword
 import logging
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fluid_build.alerts.builtin import BUILTIN_KINDS, KIND_KEYS, make_alert
@@ -365,6 +367,26 @@ def _read_route(raw: Any, where: str, origin: str, errors: List[str]) -> Optiona
     )
 
 
+def _lacks_connection(kind: Any, route: AlertRoute) -> bool:
+    """Whether ``route`` must name a connection and names none: its kind requires one and has
+    no ``default_connection`` to stand in."""
+    return bool(
+        getattr(kind, "requires_connection", True)
+        and getattr(kind, "default_connection", None) is None
+        and not route.connection
+    )
+
+
+def _with_default_connection(kind: Any, route: AlertRoute) -> AlertRoute:
+    """``route`` as ``kind`` sees it: a route that names no connection gets the kind's
+    ``default_connection`` (a plain id, checked when the kind loads), and one that names a
+    connection keeps it. So ``route.connection`` is the connection the notifier uses."""
+    default = getattr(kind, "default_connection", None)
+    if route.connection or not isinstance(default, str) or not default:
+        return route
+    return replace(route, connection=default)
+
+
 def _check_kind(
     route: AlertRoute,
     where: str,
@@ -377,7 +399,8 @@ def _check_kind(
     """What the route's kind says about the route: a built-in always, a plugin's only with
     ``plugins`` (its package is imported then, so a phase that runs no plugin skips it). The
     kind's ``kwargs`` run once for each event the route sends, as a DAG would run them, so a
-    route that passes here renders."""
+    route that passes here renders. A route needs to name a connection only when its kind
+    requires one and has no ``default_connection``."""
     if route.kind not in BUILTIN_KINDS and not plugins:
         return
     try:
@@ -385,11 +408,12 @@ def _check_kind(
     except AlertRouteError as exc:
         errors.append(f"{where}.kind: {exc}")
         return
-    if getattr(kind, "requires_connection", True) and not route.connection:
+    if _lacks_connection(kind, route):
         errors.append(
             f"{where}.connection is required for a {route.kind} route: it names the Airflow "
             "connection that holds the URL or key"
         )
+    route = _with_default_connection(kind, route)
     served = set(getattr(kind, "events", EVENTS))
     missing = [e for e in route.events if e not in served]
     if missing:
@@ -628,7 +652,8 @@ def _call(
 ) -> NotifierCall:
     """``route``'s notifier for ``event`` of the DAG ``dag_id``, its arguments checked to be
     literals the DAG can hold. Raises :class:`AlertRouteError` (by the kind's exception type
-    only) when they are not."""
+    only) when they are not. A route that names no connection reaches the kind's ``kwargs``
+    with the kind's ``default_connection``."""
     alert = make_alert(
         event,
         dag_id=dag_id,
@@ -637,7 +662,7 @@ def _call(
         sla_seconds=sla_seconds,
     )
     try:
-        kwargs = dict(kind.kwargs(route, alert))
+        kwargs = dict(kind.kwargs(_with_default_connection(kind, route), alert))
     except Exception as exc:  # noqa: BLE001 - a plugin bug refuses the DAG, type only
         raise AlertRouteError(
             f"alert route {route.name!r}: its {route.kind} kind raised "

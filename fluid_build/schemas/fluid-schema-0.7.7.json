@@ -6873,8 +6873,8 @@
       "properties": {
         "dagId": {
           "type": "string",
-          "description": "The Airflow DAG id, exactly as Airflow spells it. Airflow's own rule: ASCII letters (either case), digits, underscore, dot and dash, at most 250 characters.",
-          "pattern": "^[A-Za-z0-9_.-]+$",
+          "description": "The Airflow DAG id, exactly as Airflow spells it. The ASCII part of Airflow's rule: letters (either case), digits, underscore, dot and dash, at most 250 characters. Airflow's own pattern, ^[\\w.-]+$, also takes the Unicode letters and digits that \\w matches, which an id here may not hold.",
+          "pattern": "^[A-Za-z0-9_.-]+(?![\\s\\S])",
           "minLength": 1,
           "maxLength": 250
         },
@@ -7095,8 +7095,8 @@
       "properties": {
         "taskId": {
           "type": "string",
-          "description": "The Airflow task id, exactly as Airflow spells it. Airflow's own rule: ASCII letters (either case), digits, underscore, dot and dash, at most 250 characters.",
-          "pattern": "^[A-Za-z0-9_.-]+$",
+          "description": "The Airflow task id, exactly as Airflow spells it. The ASCII part of Airflow's rule: letters (either case), digits, underscore, dot and dash, at most 250 characters. Airflow's own pattern, ^[\\w.-]+$, also takes the Unicode letters and digits that \\w matches, which an id here may not hold.",
+          "pattern": "^[A-Za-z0-9_.-]+(?![\\s\\S])",
           "minLength": 1,
           "maxLength": 250
         },

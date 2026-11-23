@@ -37,11 +37,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `maintenance-actions-changed`), naming the action and the package and version on each side.
   A new version that renders the same statements is a warning, not a refusal.
 
+- **`fluid profile --privacy-unit` warns when `rho` is above 1.** The release still runs, and
+  `--rho` still takes any number above zero. The warning cites OpenDP's rule of thumb, an epsilon
+  of at most 1 (rho 0.5), and the rho of about 2.6 to 7.7 that the US Census Bureau's 2020 Census
+  products used. The `--privacy-unit` help also says what the privacy unit is: one row of the
+  unit's expose, or with `--release-table` or `--unit-key` every row that belongs to one entity.
+
 ### Changed
 
 - Compaction in a maintenance run writes `max-concurrent-file-group-rewrites=5` (Iceberg's own
   default) into the job config unless `compaction.maxConcurrentRewrites` sets another value, so
   the config says how many file groups a run rewrites at once beside a live writer.
+
+- **`fluid profile --help`'s import ceiling is one higher, 328 modules.** A clean install measures
+  310 to 320 on Python 3.10 to 3.14, one environment with more packages installed measured 327, and
+  none of the modules the command's help imports beyond `fluid --help` can be deferred. A run over
+  the ceiling now lists those modules (`tests/perf/test_startup_budget.py`).
 
 ### Fixed
 
@@ -53,6 +64,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   credentials the catalog hands the table. The runner now lists through the table's own FileIO,
   under the table's location and a `/`, so a sibling table whose location starts the same is
   never listed. A Glue-catalog table keeps the default listing.
+
+- **`fluid profile --request` checks the facts of a table together, so that their counts cannot be
+  differenced back to a small cell.** Each fact's own two cells were checked, but facts that overlap
+  give more together than each alone: `A` beside `A OR id = 'x'` differs by the one row `x`, and
+  `A`, `B` and `A OR B` give `|A AND B|` however large each pair's difference is. The profiler now
+  counts every combination of a table's facts' states in one pass, on the exact counts before any
+  rounding, and withholds each fact that touches a combination of 1 to `minimumCell - 1` records
+  or, where zeros are disclosive, any empty combination that the rules' texts do not rule out,
+  however many changes of single facts it lies from a combination the records hold, until no such
+  combination is left. A fact it withholds is written `C` and counted `D`, and what it
+  withholds does not depend on the order of the facts. A fact whose `when` leaves fewer than
+  `minimumCell` rows uncovered, or none where zeros are disclosive, is withheld too, since the
+  table's `rowCount` less the fact's `k` gives that count, and a withheld fact with a `when` writes
+  the band `{min: 0}` in place of the band of the rows it covers. Small cells are settled before
+  zero cells, so a fact is not withheld for the empty combinations around a cell that other facts
+  set apart, and rules that share too many parts to read in 2^17 readings are taken to rule
+  nothing out, which withholds more. The check does not cover a fact's overlap with a histogram's
+  cells, a column's counts or a relationship's counts, nor facts of two exposes read from the same
+  records: the release under differential privacy is the way to publish such counts, with noise.
+
+- **An alert route names a connection only when its kind has no default.** A route kind with
+  `requires_connection` and a `default_connection` (such as a plugin's kind from
+  `fluid_build.alert_notifiers`) refused every route that named no connection, though the kind says
+  which one to use. A connection is now required only when the kind requires one and has no default.
+  A route that names none uses the default, in the notifier's arguments and in the DAG's notes, and
+  a connection the route names still wins. The kind's `check` and `kwargs` both get it as
+  `route.connection`. The built-in kinds are unchanged: `webhook` still needs one.
+
+- **`data-team` is template residue at `metadata.owner.team` only.** `fluid validate` warned
+  (`contract_template_residue`) about any string that was exactly `data-team`, so an alert route's
+  `channel: data-team` or a tag of that name was flagged though no starter writes it there. The value
+  is now matched at the path every starter writes it to, with the same fix text. `starter-product`,
+  `starter_table`, `SELECT 1 AS id` and the other long tokens still match anywhere.
+
+- **A `fluid_build.commands` plugin may add new command names only.** A plugin that added a command
+  named like a core command replaced it without a word on Python 3.10, and on 3.11 and later failed
+  with `conflicting subparser` and left itself half registered. The plugin's entry-point callable now
+  gets the subparsers with an `add_parser` that refuses a core command's name or alias, another
+  plugin's name, or a repeat, with a `PluginCommandShadowError` that behaves the same on every
+  Python from 3.10 to 3.14. The plugin is skipped whole, the commands it had added are taken
+  back, a warning names the plugin and the command and never the exception, and the other plugins
+  still load. `fluid describe --commands`, which loads every plugin, does the same. A core command's
+  name stays reserved when the build profile leaves the command out. `AGENTS.md` now says the entry
+  point is a callable `(subparsers) -> None`, whatever it is named.
+
+- **The 0.7.7 `dagId` and `taskId` patterns end where the value ends.** They ended in `$`, which
+  Python's `re` also matches before a final line break, so a validator that runs `pattern` as it is
+  (stock `jsonschema`) took `"abc\n"` where an ECMA-262 validator refused it; `fluid` already refused
+  it through its own rewrite of `$`. Both now end in `(?![\s\S])`, as 34 other patterns of the file
+  do, with `minLength` 1 and `maxLength` 250 unchanged. The descriptions now say the schema takes the
+  ASCII part of Airflow's rule: Airflow's own pattern is Unicode.
 
 ### Upgrade notes
 
