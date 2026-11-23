@@ -316,15 +316,30 @@ def run_import(
     tool: str, source: str, options: Mapping[str, Any]
 ) -> Tuple[List[Dict[str, Any]], ImportReport]:
     """The contracts ``fluid import <tool> <source>`` proposes, and the report."""
-    contracts, report, _sources = run_import_traced(tool, source, options)
-    return contracts, report
+    trace = run_import_traced(tool, source, options)
+    return trace.contracts, trace.report
 
 
-def run_import_traced(
-    tool: str, source: str, options: Mapping[str, Any]
-) -> Tuple[List[Dict[str, Any]], ImportReport, Dict[SourceKey, str]]:
-    """:func:`run_import`, and where in the scanned code each field of the contracts comes from
-    (see :data:`._proposal.SourceKey`). It reads the code and writes nothing."""
+@dataclass
+class ImportTrace:
+    """What :func:`run_import_traced` gives: the contracts and the report of :func:`run_import`,
+    and what a check of the contracts against the code needs besides."""
+
+    contracts: List[Dict[str, Any]]
+    report: ImportReport
+    #: Where in the scanned code each field of the contracts comes from (see
+    #: :data:`._proposal.SourceKey`).
+    sources: Dict[SourceKey, str]
+    #: ``(path, why)`` of each Python file a scan could not read (a syntax error, a file it may not
+    #: open, one past the size or read limits), in scan order. The report lists them as "not read".
+    unreadable: List[Tuple[str, str]]
+    #: The directories the scans read: a job file the contracts name is looked for under them.
+    roots: List[Path]
+
+
+def run_import_traced(tool: str, source: str, options: Mapping[str, Any]) -> ImportTrace:
+    """:func:`run_import`, with where each field of the contracts was read and what could not be
+    read (an :class:`ImportTrace`). It reads the code and writes nothing."""
     split_by = _split(tool, options)
     conv = load_conventions(
         options.get("conventions"), roots=_named_directories(tool, source, options)
@@ -344,6 +359,9 @@ def run_import_traced(
         source, "DAGs directory" if tool == "airflow" else "jobs directory", f"fluid import {tool}"
     )
 
+    # ``verify_syntax`` (a check of the contracts): a DAG-folder file that is not valid Python is
+    # listed as unreadable even when it does not mention a DAG
+    every_file = bool(options.get("verify_syntax"))
     budget = SourceBudget()  # the source this import reads, in all its scans
     scans: List[JobScan] = []
     dag_scan: Optional[DagScan] = None
@@ -356,7 +374,7 @@ def run_import_traced(
         dags_dir = options.get("dags")
         if dags_dir:
             dags_root = _directory(str(dags_dir), "DAGs directory", "--dags")
-            dag_scan = scan_dags(dags_root, conv, budget)
+            dag_scan = scan_dags(dags_root, conv, budget, parse_every_file=every_file)
             linked, unlinked = link_tasks(
                 dag_scan.dags,
                 scans,
@@ -366,7 +384,7 @@ def run_import_traced(
                 budget=budget,
             )
     else:
-        dag_scan = scan_dags(root, conv, budget)
+        dag_scan = scan_dags(root, conv, budget, parse_every_file=every_file)
         roots = _referenced_roots(dag_scan, conv)
         scans = [scan_jobs(directory, conv, budget) for directory in roots]
         linked, unlinked = link_tasks(
@@ -413,7 +431,18 @@ def run_import_traced(
         ) from exc
     _check_valid(proposal.contracts, proposal.report)
     _cap_unsupported(proposal.report)
-    return proposal.contracts, proposal.report, proposal.sources
+    unreadable = [
+        (str(scan.root / rel), why)
+        for scan in scans
+        for rel, why in sorted(scan.unreadable.items())
+    ]
+    roots = [scan.root for scan in scans]
+    if dag_scan is not None:
+        unreadable += [
+            (str(dag_scan.root / rel), why) for rel, why in sorted(dag_scan.unreadable.items())
+        ]
+        roots.append(dag_scan.root)
+    return ImportTrace(proposal.contracts, proposal.report, proposal.sources, unreadable, roots)
 
 
 #: Lines of "unsupported" the report lists one by one; the rest are counted. A large estate has

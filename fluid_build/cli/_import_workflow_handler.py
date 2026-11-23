@@ -431,14 +431,18 @@ def _drift_report(args: Any, tool: str, source: str, paths: List[Path]) -> "Drif
     from fluid_build.cli.import_workflow.schema_registry import REGISTRY_FLAGS
 
     options = _importer_options(args, tool)
+    options["verify_syntax"] = True
     # The columns of a topic are never compared, so the registry is never asked for them: a gate
     # that needed the network for nothing it reports would fail for the wrong reason.
     for dest in REGISTRY_FLAGS:
         options.pop(dest, None)
-    contracts, _report, sources = run_import_traced(tool, source, options)
-    paths.extend(_planned_paths(contracts, getattr(args, "out_path", None)))
+    trace = run_import_traced(tool, source, options)
+    _drift.require_readable(trace.unreadable)
+    paths.extend(
+        _planned_paths(trace.contracts, getattr(args, "out_path", None), existing_dir=True)
+    )
     report = _drift.DriftReport(tool, source, strict=bool(getattr(args, "strict", False)))
-    return _drift.check(contracts, sources, paths, report)
+    return _drift.check(trace.contracts, trace.sources, paths, report, trace.roots)
 
 
 def _file_state(path: Path, data: bytes, *, guarded: bool) -> str:
@@ -481,12 +485,17 @@ def _file_state(path: Path, data: bytes, *, guarded: bool) -> str:
     return "unchanged" if existing.replace(b"\r\n", b"\n") == data else "different"
 
 
-def _planned_paths(contracts: List[Dict[str, Any]], out_arg: Optional[str]) -> List[Path]:
+def _planned_paths(
+    contracts: List[Dict[str, Any]], out_arg: Optional[str], *, existing_dir: bool = False
+) -> List[Path]:
     """Where each contract goes: with one contract ``--out`` names the file, with several it names
-    the directory. What ``--check`` reads, too: the files the import writes, never a glob."""
+    the directory. What ``--check`` reads, too: the files the import writes, never a glob.
+    ``existing_dir`` (``--check``): an ``--out`` that is a directory is the directory of one
+    contract as well, because the contracts it holds may have been written when the code had
+    more products, and the file of this one is in it."""
     if not contracts:
         return []
-    if len(contracts) == 1:
+    if len(contracts) == 1 and not (existing_dir and out_arg and os.path.isdir(out_arg)):
         return [Path(out_arg or _default_out_path(contracts[0]))]
     out_dir = Path(out_arg) if out_arg else Path(".")
     if out_arg and os.path.lexists(out_dir) and not out_dir.is_dir():

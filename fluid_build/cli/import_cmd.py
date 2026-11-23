@@ -154,9 +154,10 @@ def _add_check_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "A drift gate for `fluid import airflow|pyspark`: read the code again, compare it "
             "with the contracts written where this import would write them, and write nothing. "
-            "Exit 0: they match. Exit 1: drift. Exit 2: it cannot decide (an unreadable source, "
-            "no contract written yet, a refusal). What a person completed (descriptions, owners, "
-            "columns) is never drift"
+            "Exit 0: they match. Exit 1: drift, a job or an output no contract holds yet "
+            "included. Exit 2: it cannot decide (no contract written yet, a source file it "
+            "cannot read, a refusal). What a person completed (descriptions, owners, columns) "
+            "is never drift"
         ),
     )
     parser.add_argument(
@@ -183,7 +184,11 @@ def _add_check_arguments(parser: argparse.ArgumentParser) -> None:
         dest="out_report",
         default=None,
         metavar="PATH",
-        help="With --check: also write the report to PATH. The one file --check ever writes",
+        help=(
+            "With --check: also write the report to PATH, the one file --check writes. It "
+            "replaces a file only when that is empty or an earlier report. The path is used as "
+            "given: `../` and a symbolic link in a parent directory are followed, as with --out"
+        ),
     )
 
 

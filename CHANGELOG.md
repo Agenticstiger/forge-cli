@@ -27,8 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report (`github` writes workflow annotations; `json` a document with `"schema": 1`); at most 100
   items are listed and the rest counted, and every value is redacted before it is printed.
   `--out-report PATH` also writes the report to a file, the one file `--check` writes, and replaces
-  an existing file only when it is empty or an earlier report. A product the code no longer has
-  leaves its contract file behind, and the check does not look for it.
+  an existing file only when it is empty or an earlier report (the path is used as given: `../` and
+  a symbolic link in a parent directory are followed, as with `--out`). A source file the scan
+  cannot read (a syntax error, no permission, past the size limits) makes the check exit 2 and
+  names the file: fix or remove it, or list it under `ignore.files` in the conventions. A job file
+  deleted from the code is `job_removed` for the contract the import wrote for it, found among the
+  `contract.*.fluid.yaml` files of the output directory (only a build of the shape the import
+  writes whose script is gone; a deleted DAG file is `coverage_regressed`: the job is still there).
+  When only some of the contract files are missing the exit is 1 (a new job or output); when none
+  exists it is 2. A contract left behind for a job that still exists but no longer writes that
+  output is not looked for.
 
 - **`fluid generate ci --add import-drift` puts that gate in a generated pipeline.** Give it
   `--import-tool airflow|pyspark` and `--import-source DIR`, and the options the import that wrote the

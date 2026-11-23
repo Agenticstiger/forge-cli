@@ -222,10 +222,16 @@ def scan_jobs(
 
 
 def scan_dags(
-    root: Path, conventions: Conventions, budget: Optional[SourceBudget] = None
+    root: Path,
+    conventions: Conventions,
+    budget: Optional[SourceBudget] = None,
+    *,
+    parse_every_file: bool = False,
 ) -> DagScan:
     """Read the DAG files under ``root`` (never importing them), against ``budget`` as
-    :func:`scan_jobs` does.
+    :func:`scan_jobs` does. A file that does not mention a DAG is not parsed, unless
+    ``parse_every_file``: one that is not valid Python is then listed as unreadable too (a check
+    of contracts against the code needs to know a file it cannot read was there).
 
     Raises:
         NotADirectoryError: ``root`` is not a directory.
@@ -247,7 +253,8 @@ def scan_dags(
         except SourceUnreadable as exc:
             scan.unreadable[source.rel] = str(exc)
             continue
-        if not might_contain_dag(data):
+        mentions_dag = might_contain_dag(data)
+        if not mentions_dag and not parse_every_file:
             continue
         try:
             # the path as the job files show theirs, so a DAG's notes name a file a person can open
@@ -255,6 +262,8 @@ def scan_dags(
         except SourceUnreadable as exc:
             scan.unreadable[source.rel] = str(exc)
             continue
+        if not mentions_dag:
+            continue  # valid Python with no DAG in it
         # ... and the one the index knows it by, which its imports are resolved from
         module.index_rel = source.rel
         scan.files += 1

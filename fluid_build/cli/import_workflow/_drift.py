@@ -32,12 +32,13 @@ drift too. Exit codes follow diff(1): 0 in sync, 1 drift, 2 trouble (:data:`EXIT
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
 import stat
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
@@ -72,6 +73,12 @@ SCHEMA_VERSION = 1
 MAX_ITEMS_LISTED = 100
 #: The most a committed contract may hold. A bigger file is refused, not parsed.
 MAX_BASELINE_BYTES = MAX_YAML_BYTES
+#: The files of the import's own naming that are looked at in its output directory, besides the
+#: ones the code proposes: a product whose job the code no longer has is not proposed.
+ORPHAN_NAME = "contract.*.fluid.yaml"
+MAX_ORPHANS = 1000
+#: Source files named one by one in the refusal for the ones a scan could not read.
+MAX_UNREADABLE_NAMED = 5
 
 #: In the order a report lists them within one contract.
 KINDS = (
@@ -547,14 +554,88 @@ def read_baseline(path: Path) -> Optional[Dict[str, Any]]:
     return plain
 
 
+def require_readable(unreadable: Sequence[Tuple[str, str]]) -> None:
+    """Refuse, naming the files, when a scan could not read some of the code. A file it skipped
+    may hold a job, a DAG or a write the contracts record, so nothing can be said about the code:
+    a check that passed over it would pass whatever the file held."""
+    if not unreadable:
+        return
+    named = unreadable[:MAX_UNREADABLE_NAMED]
+    more = len(unreadable) - len(named)
+    names = ", ".join(_display(path, 120) for path, _why in named)
+    reasons = "; ".join(f"{_display(path, 80)}: {_display(why, 100)}" for path, why in named)
+    raise refusal(
+        f"{len(unreadable)} source file(s) could not be read: {names}"
+        + (f", and {more} more" if more > 0 else ""),
+        "A file the scan skipped may hold a job, a DAG or a write that the contracts record, so "
+        f"the check cannot say whether they match the code ({reasons}).",
+        "Fix or remove the file, or list it under `ignore.files` in the conventions if it is not "
+        "part of the estate.",
+        files=[_display(path, 160) for path, _why in unreadable[:20]],
+    )
+
+
+def _script_is_gone(model: str, roots: Sequence[Path]) -> bool:
+    """Whether the job file a contract names is no longer under the working directory or a
+    scanned one. A path that leaves the checkout (absolute, or with ``..``) is not looked for."""
+    parts = PurePosixPath(model)
+    if parts.is_absolute() or ".." in parts.parts:
+        return False
+    return not Path(model).exists() and not any((root / model).exists() for root in roots)
+
+
+def orphan_items(paths: Sequence[Path], roots: Sequence[Path]) -> List[DriftItem]:
+    """``job_removed`` for each job of a committed contract whose job file no longer exists.
+
+    The import proposes no product for a job it no longer finds, so its contract is not among the
+    files the code proposes. The files of the import's own naming in the directory they are in are
+    looked at too, and only a build of the shape the import writes whose script is gone is
+    reported: a contract written by hand, or by an import of other code (whose scripts are still
+    there), is left alone, and so is one that cannot be read.
+    """
+    if not paths:
+        return []
+    directory = paths[0].parent
+    planned = {path.name for path in paths}
+    try:
+        with os.scandir(directory) as entries:
+            names = sorted(
+                entry.name
+                for entry in entries
+                if fnmatch.fnmatchcase(entry.name, ORPHAN_NAME)
+                and entry.name not in planned
+                and entry.is_file(follow_symlinks=False)
+            )
+    except OSError:
+        return []
+    items: List[DriftItem] = []
+    for name in names[:MAX_ORPHANS]:
+        path = directory / name
+        try:
+            document = read_baseline(path)
+        except FluidUserError:
+            continue
+        if document is None:
+            continue
+        scope = _Scope(_ident(document.get("id")) or name, str(path), {})
+        items.extend(
+            scope.item("job_removed", f"builds[{bid}]", job.model, None)
+            for bid, job in project(document).jobs.items()
+            if job.imported and job.model and _script_is_gone(job.model, roots)
+        )
+    return items
+
+
 def check(
     contracts: Sequence[Mapping[str, Any]],
     sources: Mapping[SourceKey, str],
     paths: Sequence[Path],
     report: DriftReport,
+    roots: Sequence[Path] = (),
 ) -> DriftReport:
-    """Compare each contract the code proposes with the file at its path, into ``report``. Reads,
-    and writes nothing; raises a typed refusal when nothing can be decided."""
+    """Compare each contract the code proposes with the file at its path, into ``report`` (and the
+    contracts of jobs whose file is gone: :func:`orphan_items`; ``roots`` are the scanned
+    directories). Reads, and writes nothing; raises a typed refusal when nothing can be decided."""
     if not contracts:
         raise refusal(
             f"`fluid import {report.tool}` proposes no product from {_display(report.source, 100)!r}",
@@ -587,6 +668,7 @@ def check(
             "--split-by, --conventions and --dags here.",
             files=[_display(str(p), 160) for p in paths[:10]],
         )
+    report.items.extend(orphan_items(paths, roots))
     return report
 
 

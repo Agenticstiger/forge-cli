@@ -637,6 +637,149 @@ def test_a_registry_is_never_contacted_by_a_gate(project, monkeypatch):
     assert seen and not any({"registry", "url"} & set(options) for options in seen)
 
 
+# ── source files that cannot be read, and files that are gone ─────────
+
+AIRFLOW = ("airflow", "dags", "--conventions", "conventions.yaml", "--out", "out")
+BROKEN = "def (:\n"
+
+
+@pytest.mark.parametrize(
+    "argv, broken",
+    [
+        (ARGV, "jobs/clicks_clean.py"),
+        (ARGV, "dags/clicks_stream.py"),
+        (AIRFLOW, "dags/clicks_stream.py"),
+    ],
+    ids=["a pyspark job file", "a DAG file of a pyspark import", "a DAG file of an airflow import"],
+)
+def test_a_source_file_with_a_syntax_error_cannot_be_decided(project, capsys, argv, broken):
+    """The scan skips a file it cannot parse, and the contracts it would have led to look like
+    code that is gone: nothing can be said, so the exit is 2 and the file is named."""
+    written(*argv)
+    (project / broken).write_text(BROKEN, encoding="utf-8")
+    capsys.readouterr()
+    assert check(argv=argv) == 2
+    err = capsys.readouterr().err
+    assert "1 source file(s) could not be read" in err and broken in err
+    assert "ignore.files" in err
+    assert check("--strict", argv=argv) == 2
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads anything")
+@pytest.mark.parametrize(
+    "argv, unreadable",
+    [(ARGV, "jobs/clicks_clean.py"), (AIRFLOW, "dags/clicks_stream.py")],
+    ids=["pyspark", "airflow"],
+)
+def test_a_source_file_this_process_may_not_read_cannot_be_decided(
+    project, capsys, argv, unreadable
+):
+    written(*argv)
+    target = project / unreadable
+    target.chmod(0)
+    try:
+        if os.access(target, os.R_OK):
+            pytest.skip("this file system ignores the mode")
+        capsys.readouterr()
+        assert check(argv=argv) == 2
+        assert unreadable in capsys.readouterr().err
+    finally:
+        target.chmod(0o644)
+
+
+def test_the_files_a_scan_could_not_read_are_named_five_at_a_time(project, capsys):
+    written()
+    for number in range(7):
+        (project / f"jobs/broken_{number}.py").write_text(BROKEN, encoding="utf-8")
+    capsys.readouterr()
+    assert check() == 2
+    err = capsys.readouterr().err
+    assert "7 source file(s) could not be read" in err and "and 2 more" in err
+
+
+def test_a_deleted_job_file_is_a_removed_job(project, capsys):
+    """The import proposes nothing for a job it no longer finds, so its contract stays behind: it
+    is found in the output directory, and reported when the script it names is gone."""
+    argv = (*ARGV, "--split-by", "job")
+    written(*argv)
+    (project / "jobs/clicks_clean.py").unlink()
+    code, document = report_of(capsys, argv=argv)
+    assert code == 0 and document["status"] == "in_sync"
+    (item,) = document["items"]
+    assert (item["kind"], item["severity"]) == ("job_removed", "warning")
+    assert item["what"] == "builds[clicks_clean]" and item["before"] == "jobs/clicks_clean.py"
+    assert item["contract_path"] == "out/contract.retail.clicks_clean.fluid.yaml"
+    code, document = report_of(capsys, "--strict", argv=argv)
+    assert code == 1 and document["items"][0]["severity"] == "error"
+
+
+def test_a_deleted_job_file_is_a_removed_job_for_an_airflow_import_too(project, capsys):
+    written(*AIRFLOW)
+    (project / "jobs/clean_orders.py").unlink()
+    code, document = report_of(capsys, argv=AIRFLOW)
+    assert code == 0
+    assert kinds(document) == [("job_removed", "builds[clean_orders]")]
+    assert check("--strict", argv=AIRFLOW) == 1
+
+
+@pytest.mark.parametrize("argv", [ARGV, AIRFLOW], ids=["pyspark", "airflow"])
+def test_a_deleted_dag_file_leaves_the_job_without_its_dag(project, capsys, argv):
+    """The job is still there: what the import no longer finds is the DAG that runs it."""
+    written(*argv)
+    (project / "dags/orders_daily.py").unlink()
+    code, document = report_of(capsys, argv=argv)
+    assert code == 0 and document["counts"]["warning"] == 2
+    assert {kind for kind, _ in kinds(document)} == {"coverage_regressed"}
+    assert all(what.endswith("airflow.dagId") for _kind, what in kinds(document))
+    assert check("--strict", argv=argv) == 1
+
+
+def test_a_contract_that_is_not_the_imports_is_not_a_removed_job(project, capsys):
+    """Beside the contracts of the import: one written by hand, one of another import whose
+    script is still there, one that cannot be read, and one naming a path outside the checkout."""
+    argv = (*ARGV, "--split-by", "job")
+    written(*argv)
+    out = project / "out"
+    shaped = {"pattern": "hybrid-reference", "engine": "spark"}
+    by_hand = {
+        "id": "by.hand",
+        "builds": [{"id": "dbt", "pattern": "embedded-logic", "engine": "dbt"}],
+    }
+    other = {
+        "id": "other",
+        "builds": [{"id": "j", **shaped, "properties": {"model": "jobs/orders_daily.py"}}],
+    }
+    outside = {"id": "up", "builds": [{"id": "j", **shaped, "properties": {"model": "../gone.py"}}]}
+    absolute = {
+        "id": "abs",
+        "builds": [{"id": "j", **shaped, "properties": {"model": "/nowhere/gone.py"}}],
+    }
+    for name, doc in (("by.hand", by_hand), ("other", other), ("up", outside), ("abs", absolute)):
+        (out / f"contract.{name}.fluid.yaml").write_text(yaml.safe_dump(doc), encoding="utf-8")
+    (out / "contract.broken.fluid.yaml").write_text("a: [unclosed", encoding="utf-8")
+    (out / "notes.txt").write_text("not a contract\n", encoding="utf-8")
+    capsys.readouterr()
+    assert check("--strict", argv=argv) == 0
+    assert "In sync: the committed contracts match the code." in capsys.readouterr().out
+
+
+def test_an_out_that_is_a_directory_holds_the_contract_of_a_single_product(project, capsys):
+    """The contracts were written when the code had three jobs; it is down to one, and --out
+    still names the directory they are in."""
+    argv = (*ARGV, "--split-by", "job")
+    written(*argv)
+    (project / "jobs/clicks_clean.py").unlink()
+    (project / "jobs/orders_daily.py").unlink()
+    code, document = report_of(capsys, argv=argv)
+    assert code == 0
+    assert {kind for kind, _ in kinds(document)} == {"job_removed"}
+    assert document["products"] == 1
+    assert {item["contract_path"] for item in document["items"]} == {
+        "out/contract.retail.clicks_clean.fluid.yaml",
+        "out/contract.retail.orders_daily.fluid.yaml",
+    }
+
+
 # ── --out-report ─────────────────────────────────────────────────────
 
 
@@ -937,7 +1080,8 @@ def test_the_proposal_records_where_each_field_was_read(project):
     from fluid_build.cli.import_workflow._pipeline import run_import_traced
 
     options = {"dags": "dags", "conventions": "conventions.yaml"}
-    contracts, _report, sources = run_import_traced("pyspark", "jobs", options)
+    trace = run_import_traced("pyspark", "jobs", options)
+    contracts, sources = trace.contracts, trace.sources
     assert [c["id"] for c in contracts] == [
         "retail.orders_clean",
         "clicks_clean",
@@ -957,8 +1101,9 @@ def test_run_import_still_returns_the_contracts_and_the_report(project):
 
     options = {"dags": "dags", "conventions": "conventions.yaml"}
     contracts, report = run_import("pyspark", "jobs", options)
-    traced, _report, _sources = run_import_traced("pyspark", "jobs", options)
-    assert contracts == traced and report.mapped_one_to_one
+    traced = run_import_traced("pyspark", "jobs", options)
+    assert contracts == traced.contracts and report.mapped_one_to_one
+    assert traced.unreadable == [] and [str(root) for root in traced.roots] == ["jobs", "dags"]
 
 
 def test_the_paths_are_the_ones_the_import_writes_and_never_a_glob(project):

@@ -151,7 +151,7 @@ class ImportDrift:
         ):
             if not value:
                 continue
-            check_pipeline_workdir(value)
+            check_pipeline_workdir(value, what)
             if value.startswith("-") or _SHELL_SYNTAX.search(value):
                 raise ValueError(f"{what} {value!r} is not a path the command can take")
         if self.split_by and self.split_by not in IMPORT_SPLIT_BY:
@@ -177,7 +177,8 @@ def import_drift_command(spec: ImportDrift, fmt: str) -> str:
     cannot decide."""
     if fmt not in ("text", "github"):
         raise ValueError(f"import drift format {fmt!r}: text or github")
-    words = ["fluid", "import", spec.tool, shlex.quote(check_pipeline_workdir(spec.source))]
+    source = shlex.quote(check_pipeline_workdir(spec.source, "import source"))
+    words = ["fluid", "import", spec.tool, source]
     for flag, value in (
         ("--dags", spec.dags),
         ("--conventions", spec.conventions),
@@ -185,7 +186,7 @@ def import_drift_command(spec: ImportDrift, fmt: str) -> str:
         ("--out", spec.out),
     ):
         if value:
-            words += [flag, shlex.quote(check_pipeline_workdir(value))]
+            words += [flag, shlex.quote(check_pipeline_workdir(value, f"import {flag[2:]}"))]
     words += ["--check", "--format", fmt]
     return " ".join(words)
 

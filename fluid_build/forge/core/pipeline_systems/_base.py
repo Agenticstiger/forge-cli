@@ -147,16 +147,20 @@ def check_pipeline_literal(what: str, value: str) -> str:
     return value
 
 
-def check_pipeline_workdir(workdir: str) -> str:
+def check_pipeline_workdir(workdir: str, what: str = "workdir") -> str:
     """``check_pipeline_literal`` for the workdir, which is also written into
     ``archiveArtifacts`` patterns: a glob character or a comma there would
-    archive files the pipeline did not write, or split the pattern list."""
-    check_pipeline_literal("workdir", workdir)
+    archive files the pipeline did not write, or split the pattern list.
+    ``what`` names the value in the refusal (the other paths of a generated
+    command are held to the same rule)."""
+    check_pipeline_literal(what, workdir)
     if re.search(r"[*?,\[\]]", workdir):
-        raise ValueError(
-            f"workdir {workdir!r} contains a glob character or a comma, which an "
-            "archiveArtifacts pattern would read as a pattern"
+        reason = (
+            "which an archiveArtifacts pattern would read as a pattern"
+            if what == "workdir"
+            else "which a path of the generated pipeline does not carry"
         )
+        raise ValueError(f"{what} {workdir!r} contains a glob character or a comma, {reason}")
     return workdir
 
 

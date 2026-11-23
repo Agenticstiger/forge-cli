@@ -522,3 +522,21 @@ def test_the_convenience_wrapper_takes_the_settings_too():
     assert ".github/workflows/fluid-import-drift.yml" in files
     with pytest.raises(ValueError, match="import_drift"):
         generate_pipeline_template("github_actions", (), ("import-drift",))
+
+
+@pytest.mark.parametrize(
+    "field, value, said",
+    [
+        ("source", "da$gs", "import source 'da$gs' contains a character"),
+        ("source", "da*gs", "import source 'da*gs' contains a glob character or a comma"),
+        ("out", "o,ut", "import out 'o,ut' contains a glob character or a comma"),
+        ("conventions", "c'.yaml", "import conventions"),
+        ("dags", "d;d", "import dags 'd;d' is not a path"),
+    ],
+)
+def test_a_refused_path_is_named_for_what_it_is(field, value, said):
+    """It was reported as a "workdir", which is not an option anyone passed."""
+    options = {"source": "dags", "tool": "pyspark", field: value}
+    with pytest.raises(ValueError) as refused:
+        ImportDrift(**options)
+    assert said in str(refused.value) and "workdir" not in str(refused.value)
