@@ -4793,19 +4793,23 @@
           "description": "The runtime the maintenance runs on: an existing EMR Serverless application (applicationId), a running EMR cluster (clusterId) or an EMR on EKS virtual cluster (virtualClusterId), whichever the team's own runner uses; or local, forge's local Spark runtime (spark-submit on the machine fluid apply runs on) maintaining a table in an Iceberg REST catalog on binding.platform local, which takes no role and no target and ignores the AWS keys."
         },
         "applicationId": {
-          "$ref": "#/$defs/sparkParameters/properties/applicationId"
+          "$ref": "#/$defs/sparkParameters/properties/applicationId",
+          "description": "With runtime emr-serverless, required: the EMR Serverless application the team's own runner uses. forge creates none."
         },
         "clusterId": {
-          "$ref": "#/$defs/sparkParameters/properties/clusterId"
+          "$ref": "#/$defs/sparkParameters/properties/clusterId",
+          "description": "With runtime emr-ec2, required: the running EMR cluster (j-...) the maintenance steps go to. forge starts none."
         },
         "virtualClusterId": {
-          "$ref": "#/$defs/sparkParameters/properties/virtualClusterId"
+          "$ref": "#/$defs/sparkParameters/properties/virtualClusterId",
+          "description": "With runtime emr-eks, required: the EMR on EKS virtual cluster."
         },
         "releaseLabel": {
           "$ref": "#/$defs/sparkParameters/properties/releaseLabel"
         },
         "executionRoleArn": {
-          "$ref": "#/$defs/sparkParameters/properties/executionRoleArn"
+          "$ref": "#/$defs/sparkParameters/properties/executionRoleArn",
+          "description": "With an EMR runtime, required: the IAM role named for the maintenance runs. No forge build writes the table, so there is no build role to derive, and forge creates none. It goes through FLUID_SPARK_EXECUTION_ROLE_ALLOWLIST."
         },
         "sparkConf": {
           "$ref": "#/$defs/sparkParameters/properties/sparkConf"
