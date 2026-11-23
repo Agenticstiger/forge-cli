@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Iceberg maintenance for a table forge does not write.** A table whose streams run on its
+  team's own Spark runner can now be maintained by forge on an EMR runtime the contract names:
+  `exposes[].iceberg.maintenance.runtime` (backend spark, in place of `build`; 0.7.7 preview,
+  `$defs/sparkRuntime`) takes `runtime` (`emr-serverless`, `emr-ec2` or `emr-eks`), the
+  runtime's `applicationId`, `clusterId` or `virtualClusterId`, an `executionRoleArn`, and
+  optionally `releaseLabel` and `sparkConf`. `fluid apply` uploads the runner and the
+  maintenance job config to `_fluid/spark/<product>/maintain_<expose>/` in the table's bucket
+  (the role must be able to read them) and adds the runs to the scheduler's caller policy;
+  forge provisions no runtime and no role for it. The table's maintenance DAG runs
+  `fluid apply --mode maintain --expose-id <expose>` on that runtime, and a dry run says where
+  and as whom. The role, the target and the Spark settings go through the operator's
+  `FLUID_SPARK_EXECUTION_ROLE_ALLOWLIST`, `FLUID_SPARK_TARGET_ALLOWLIST` and
+  `FLUID_SPARK_CONF_ALLOWLIST`, as a build's `parameters.spark` does. Because forge cannot see
+  that writer's commit delay, `removeOrphanFiles` there needs an explicit `olderThan`, and
+  `fluid validate` warns when it is under three days.
+- **The plan binds each maintenance action on its own.** The `spark.maintain` action now lists
+  each plugin action with its kind, the distribution and version that shipped it, and the
+  sha256 of its statements (`actions[].statementsSha256`, never the SQL). When a plugin renders
+  other statements between `fluid plan` and `fluid apply`, the apply refuses with
+  `apply_plan_digest_maintenance_actions_changed` (plan-binding kind
+  `maintenance-actions-changed`), naming the action and the package and version on each side.
+  A new version that renders the same statements is a warning, not a refusal.
+
+### Changed
+
+- Compaction in a maintenance run writes `max-concurrent-file-group-rewrites=5` (Iceberg's own
+  default) into the job config unless `compaction.maxConcurrentRewrites` sets another value, so
+  the config says how many file groups a run rewrites at once beside a live writer.
+
+### Upgrade notes
+
+- A plan made before this release has no `actions` in its `spark.maintain` payload, and the
+  compaction options of a maintenance job config changed, so `fluid apply` refuses such a plan
+  with `apply_spark_artifact_mismatch`: run `fluid plan` again, then `fluid apply`, before the
+  next `fluid apply --mode maintain`.
+
 ## [0.38.0] — 2026-11-22
 
 ### Added

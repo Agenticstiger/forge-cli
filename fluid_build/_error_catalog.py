@@ -132,6 +132,16 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "providers",
     ),
+    "apply_plan_digest_maintenance_actions_changed": (
+        [
+            "A maintenance action's statements are not the ones the plan bound: the plugin "
+            + "that renders them changed since fluid plan. Run fluid plan again with the "
+            + "packages apply runs with, then apply that plan",
+            "To see what the action runs now, run fluid apply --mode maintain --expose-id "
+            + "<expose> --dry-run on the contract",
+        ],
+        None,
+    ),
     "apply_plan_runs_outside_forge": (
         [
             (
@@ -1412,7 +1422,11 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
             "Fix the exposes[].iceberg.maintenance field the message names: backend spark "
             + "needs a schedule and runs on the engine: spark build that writes the table (name "
             + "it with build when several do); backend glue needs a roleArn and takes whole "
-            + "days; orphans older than P1D, snapshots older than PT1H",
+            + "days; orphans and snapshots older than P1D",
+            "A table no forge build writes names runtime instead of build: an EMR runtime "
+            + "(emr-serverless, emr-ec2 or emr-eks) with its applicationId, clusterId or "
+            + "virtualClusterId and an executionRoleArn, and removeOrphanFiles then sets "
+            + "olderThan longer than its writer's longest commit delay",
         ],
         "validate",
     ),
