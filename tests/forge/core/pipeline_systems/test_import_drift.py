@@ -511,3 +511,14 @@ def test_the_parser_takes_the_flags():
         parser.parse_args(["generate", "ci", "--import-tool", "dbt"])
     with pytest.raises(SystemExit):
         parser.parse_args(["generate", "ci", "--import-split-by", "group"])
+
+
+def test_the_convenience_wrapper_takes_the_settings_too():
+    from fluid_build.forge.core.pipeline_systems import generate_pipeline_template
+
+    files = generate_pipeline_template(
+        "github_actions", (), ("import-drift",), ImportDrift("airflow", "dags")
+    )
+    assert ".github/workflows/fluid-import-drift.yml" in files
+    with pytest.raises(ValueError, match="import_drift"):
+        generate_pipeline_template("github_actions", (), ("import-drift",))

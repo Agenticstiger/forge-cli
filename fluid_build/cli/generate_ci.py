@@ -128,6 +128,47 @@ _PRIMARY_OUTPUT: Dict[str, str] = {
 }
 
 
+def _add_import_drift_arguments(p: argparse.ArgumentParser) -> None:
+    """The ``--import-*`` flags of ``--add import-drift``: the options of the import that wrote
+    the contracts the gate checks."""
+    p.add_argument(
+        "--import-tool",
+        choices=list(IMPORT_TOOLS),
+        default=None,
+        help="With --add import-drift: the importer whose contracts are checked.",
+    )
+    p.add_argument(
+        "--import-source",
+        default=None,
+        metavar="DIR",
+        help="With --add import-drift: the directory the import reads (DAGs or jobs).",
+    )
+    p.add_argument(
+        "--import-out",
+        default=None,
+        metavar="PATH",
+        help="With --add import-drift: where the import wrote its contracts (--out).",
+    )
+    p.add_argument(
+        "--import-split-by",
+        choices=list(IMPORT_SPLIT_BY),
+        default=None,
+        help="With --add import-drift: the product boundary the import used (--split-by).",
+    )
+    p.add_argument(
+        "--import-conventions",
+        default=None,
+        metavar="FILE",
+        help="With --add import-drift: the conventions file the import used.",
+    )
+    p.add_argument(
+        "--import-dags",
+        default=None,
+        metavar="DIR",
+        help="With --add import-drift and --import-tool pyspark: the DAGs directory.",
+    )
+
+
 def register_subcommand(subparsers: argparse._SubParsersAction):
     """Register as a subcommand of ``fluid generate``."""
     p = subparsers.add_parser(
@@ -173,42 +214,7 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
             "code; needs --import-tool and --import-source)."
         ),
     )
-    p.add_argument(
-        "--import-tool",
-        choices=list(IMPORT_TOOLS),
-        default=None,
-        help="With --add import-drift: the importer whose contracts are checked.",
-    )
-    p.add_argument(
-        "--import-source",
-        default=None,
-        metavar="DIR",
-        help="With --add import-drift: the directory the import reads (DAGs or jobs).",
-    )
-    p.add_argument(
-        "--import-out",
-        default=None,
-        metavar="PATH",
-        help="With --add import-drift: where the import wrote its contracts (--out).",
-    )
-    p.add_argument(
-        "--import-split-by",
-        choices=list(IMPORT_SPLIT_BY),
-        default=None,
-        help="With --add import-drift: the product boundary the import used (--split-by).",
-    )
-    p.add_argument(
-        "--import-conventions",
-        default=None,
-        metavar="FILE",
-        help="With --add import-drift: the conventions file the import used.",
-    )
-    p.add_argument(
-        "--import-dags",
-        default=None,
-        metavar="DIR",
-        help="With --add import-drift and --import-tool pyspark: the DAGs directory.",
-    )
+    _add_import_drift_arguments(p)
     p.add_argument(
         "--default-branch",
         default=None,

@@ -142,6 +142,11 @@ def _add_code_importer_arguments(parser: argparse.ArgumentParser) -> None:
             "importers always overwrite"
         ),
     )
+
+
+def _add_check_arguments(parser: argparse.ArgumentParser) -> None:
+    """``--check``, the drift gate of ``fluid import airflow|pyspark``, and the flags that shape its
+    report."""
     parser.add_argument(
         "--check",
         dest="check",
@@ -254,6 +259,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     _add_code_importer_arguments(parser)
+    _add_check_arguments(parser)
     parser.add_argument(
         "--server-url",
         dest="server_url",
@@ -691,11 +697,15 @@ def run(args: Any, logger: logging.Logger) -> int:
         from fluid_build.cli._import_workflow_handler import run_import_check
 
         return run_import_check(args, logger, tool=tool, source=getattr(args, "source", None))
-    from fluid_build.cli._import_workflow_handler import check_import_flags
+    from fluid_build.cli._import_workflow_handler import (
+        check_import_flags,
+        refuse_report_flags_without_check,
+    )
     from fluid_build.cli.import_workflow.schema_registry import check_flags
 
     check_flags(args, tool)
     check_import_flags(args, tool)
+    refuse_report_flags_without_check(args)
     if tool:
         from fluid_build.cli._import_workflow_handler import run_import_from_tool
 

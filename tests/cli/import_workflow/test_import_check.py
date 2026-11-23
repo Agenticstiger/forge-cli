@@ -73,14 +73,14 @@ FILES: Dict[str, str] = {
         from pyspark.sql import SparkSession
 
         spark = SparkSession.builder.appName("clean_orders").getOrCreate()
-        spark.table("retail.orders_raw").filter("amount > 0").write.mode("overwrite").format("iceberg").saveAsTable("retail.orders_clean")
+        spark.table("retail.orders_raw").filter("amount > 0").write.mode("overwrite").format("iceberg").saveAsTable("glue_catalog.retail.orders_clean")
         """,
     "jobs/orders_daily.py": """
         from pyspark.sql import SparkSession
 
         spark = SparkSession.builder.appName("orders_daily").getOrCreate()
         TARGET = "retail.orders_daily"
-        df = spark.table("retail.orders_clean").join(spark.table("retail.customers"), "customer_id")
+        df = spark.table("glue_catalog.retail.orders_clean").join(spark.table("retail.customers"), "customer_id")
         df.createOrReplaceTempView("joined")
         spark.sql(f"INSERT OVERWRITE TABLE {TARGET} SELECT day, sum(amount) AS total FROM joined GROUP BY day")
         """,
@@ -103,6 +103,8 @@ FILES: Dict[str, str] = {
         script_roots:
           "s3://acme-code/jobs/": jobs
         defaults: {domain: retail, platform: aws}
+        catalogs:
+          glue_catalog: {platform: aws}
         layers: {retail: Silver}
         owners:
           retail-data: {team: retail-data}
@@ -212,6 +214,65 @@ def test_what_a_person_completes_is_never_drift(project):
     reordered = {key: reordered[key] for key in reversed(list(reordered))}
     path.write_text("# completed by hand\n" + yaml.safe_dump(reordered, sort_keys=False), "utf-8")
     assert check() == 0
+
+
+def test_a_build_a_person_added_brings_its_own_exposes_and_none_is_drift(project):
+    written()
+
+    def add_a_dbt_mart(doc: Dict[str, Any]) -> None:
+        doc["builds"].append(
+            {"id": "dbt_mart", "pattern": "embedded-logic", "engine": "dbt", "outputs": ["mart"]}
+        )
+        doc["exposes"].append(
+            {"exposeId": "mart", "kind": "table", "binding": {"platform": "snowflake"}}
+        )
+
+    edit(project / ORDERS_DAILY, add_a_dbt_mart)
+    assert check("--strict") == 0
+
+
+def test_a_binding_the_import_left_at_other_is_the_persons_to_name(project):
+    """Naming the platform changes what the location and the format look like: none of it is
+    compared until the import decides the platform itself."""
+    written()
+
+    def name_the_binding(doc: Dict[str, Any]) -> None:
+        doc["exposes"][0]["binding"] = {
+            "platform": "bigquery",
+            "format": "bigquery_table",
+            "location": {"project": "acme", "dataset": "retail", "table": "orders_daily"},
+        }
+
+    edit(project / ORDERS_DAILY, name_the_binding)
+    assert check("--strict") == 0
+
+
+def test_a_schedule_the_code_does_not_state_as_a_literal_is_the_persons_to_write_down(
+    project, capsys
+):
+    """The DAG of the clicks stream has `schedule=None` and sets no catchup; the orders DAG's
+    schedule is an expression the import copies as written."""
+    sub(project / "dags/orders_daily.py", 'schedule="0 2 * * *"', 'schedule=Variable.get("cron")')
+    written()
+    orders = project / "out/contract.retail.orders_clean.fluid.yaml"
+    assert "Variable" in orders.read_text("utf-8")  # the import wrote the expression as written
+
+    def write_them_down(doc: Dict[str, Any]) -> None:
+        config = doc["builds"][0]["execution"]["orchestration"]["airflow"]["dagConfig"]
+        config["schedule"] = "0 2 * * *"
+
+    edit(orders, write_them_down)
+
+    def pin_the_clicks_dag(doc: Dict[str, Any]) -> None:
+        airflow = doc["builds"][0]["execution"]["orchestration"]["airflow"]
+        airflow["dagConfig"] = {"schedule": "@hourly", "catchup": False}
+
+    edit(project / "out/contract.clicks_clean.fluid.yaml", pin_the_clicks_dag)
+    capsys.readouterr()
+    assert check("--strict") == 0, capsys.readouterr().out
+    # a literal the code states is still compared, with the person's value in its place
+    sub(project / "dags/orders_daily.py", 'schedule=Variable.get("cron")', 'schedule="0 3 * * *"')
+    assert check() == 1
 
 
 def test_the_gate_reads_an_airflow_project_the_same_way(project, capsys):
@@ -594,6 +655,16 @@ def test_out_report_is_never_written_through_a_link_or_into_a_directory(project,
     assert check("--out-report", "out") == 2
 
 
+def test_a_report_path_that_cannot_be_written_is_the_one_thing_said(project, capsys):
+    written()
+    sub(project / "dags/orders_daily.py", "0 2 * * *", "0 3 * * *")
+    capsys.readouterr()
+    assert check("--format", "json", "--out-report", str(ORDERS_DAILY)) == 2
+    document = json.loads(capsys.readouterr().out)  # one document, not the report and an error
+    assert document["status"] == "error"
+    assert "is a contract this check reads" in document["error"]["what"]
+
+
 def test_a_refusal_is_kept_in_the_report_file_too(project):
     assert check("--format", "json", "--out-report", "refusal.json") == 2
     assert json.loads((project / "refusal.json").read_text("utf-8"))["status"] == "error"
@@ -775,6 +846,12 @@ def test_a_yaml_date_in_a_contract_is_a_value_not_a_crash(project):
     text = (project / ORDERS_DAILY).read_text("utf-8")
     (project / ORDERS_DAILY).write_text(
         text.replace("table: orders_daily", "table: 2026-01-01"), encoding="utf-8"
+    )
+    assert check() == 0  # the binding of this table is the person's (platform `other`)
+    clean = project / "out/contract.retail.orders_clean.fluid.yaml"
+    clean.write_text(
+        clean.read_text("utf-8").replace("table: orders_clean", "table: 2026-01-01"),
+        encoding="utf-8",
     )
     assert check() == 1
 

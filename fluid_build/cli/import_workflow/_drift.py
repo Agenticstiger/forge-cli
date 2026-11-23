@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,7 +43,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import yaml
 
 from fluid_build._errors import FluidUserError, SchemaValidationError
-from fluid_build.forge.core.plan_digest import _canonical_json
+from fluid_build.cli._ci_output import escape_data, escape_property
+from fluid_build.forge.core.plan_digest import _canonical_json, coerce_keys_to_str
 from fluid_build.observability.secret_redactor import redact_secret_text
 from fluid_build.util.safe_yaml import (
     MAX_YAML_BYTES,
@@ -97,6 +99,15 @@ _PHRASES = {
 
 #: What the import writes for a job it proposes, and so what a build must look like to be one.
 _IMPORTED_BUILD = {"pattern": "hybrid-reference", "engine": "spark"}
+#: A schedule the code gives as a literal: a cron expression (five to seven fields) or a preset
+#: such as ``@daily``. Anything else the import copies into ``dagConfig.schedule`` is the DAG's
+#: expression as written (``Variable.get(...)``, ``timedelta(...)``), which a person replaces
+#: with the real value.
+_LITERAL_SCHEDULE = re.compile(r"@[A-Za-z]+|[A-Za-z0-9*/,\-?#]+(?: +[A-Za-z0-9*/,\-?#]+){4,6}")
+
+
+def _is_imported(build: Mapping[str, Any]) -> bool:
+    return all(build.get(key) == value for key, value in _IMPORTED_BUILD.items())
 
 
 # ── the projection ───────────────────────────────────────────────────────────────────────────
@@ -108,8 +119,8 @@ class OutputFacts:
     platform: Optional[str]
     format: Optional[str]
     location: Mapping[str, Any]
-    #: Listed in the ``outputs`` of a build: the import links every expose it writes to its job,
-    #: and an expose a person added is not linked.
+    #: Listed in the ``outputs`` of a build of the shape the import writes: the import links every
+    #: expose it writes to its job, and an expose (or a build) a person added is not linked.
     built: bool
 
 
@@ -133,14 +144,8 @@ class Projection:
 
 
 def _plain(value: Any) -> Any:
-    """``value`` as data ``_canonical_json`` takes (a YAML date, for one, is not)."""
-    if value is None or isinstance(value, (str, bool, int, float)):
-        return value
-    if isinstance(value, Mapping):
-        return {str(key): _plain(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_plain(item) for item in value]
-    return str(value)
+    """``value`` as plain JSON data, which ``_canonical_json`` takes: a YAML date, for one, is not."""
+    return json.loads(json.dumps(coerce_keys_to_str(value), default=str))
 
 
 def _same(left: Any, right: Any) -> bool:
@@ -173,6 +178,7 @@ def project(contract: Mapping[str, Any]) -> Projection:
     built = {
         text
         for build in builds
+        if _is_imported(build)
         for text in (_ident(item) for item in _list(build.get("outputs")))
         if text
     }
@@ -214,7 +220,7 @@ def project(contract: Mapping[str, Any]) -> Projection:
         )
         jobs[bid] = JobFacts(
             model=_text(_mapping(build.get("properties")).get("model")),
-            imported=all(build.get(key) == value for key, value in _IMPORTED_BUILD.items()),
+            imported=_is_imported(build),
             dag=_ident(airflow.get("dagId")),
             schedule=_text(config.get("schedule")),
             catchup=catchup if isinstance(catchup, bool) else None,
@@ -247,9 +253,9 @@ class DriftItem:
 class DriftReport:
     tool: str
     source: str
-    strict: bool
-    #: The products the code proposes, each compared with its file.
-    products: int
+    strict: bool = False
+    #: The products the code proposes, each compared with its file (set by :func:`check`).
+    products: int = 0
     items: List[DriftItem] = field(default_factory=list)
 
     def blocking(self, item: DriftItem) -> bool:
@@ -281,23 +287,146 @@ class DriftReport:
 
 
 def _output_diffs(fresh: OutputFacts, held: OutputFacts) -> List[Tuple[str, Any, Any]]:
-    """``(field, held, fresh)`` for each fact of an output the code decides and the contract
-    holds otherwise. A fact the code does not decide (a binding left at ``other``, a location
-    key it does not know) is the person's."""
-    diffs: List[Tuple[str, Any, Any]] = []
+    """``(field, held, fresh)`` for each fact of an output the code decides and the contract holds
+    otherwise. A binding the import left at ``other`` is the person's to name, location included
+    (its keys are a guess until the platform is known); so is any key of the location the import
+    did not write."""
     decided: List[Tuple[str, Any, Any]] = [("kind", fresh.kind, held.kind)]
-    for name, now, then in (
-        ("platform", fresh.platform, held.platform),
-        ("format", fresh.format, held.format),
-    ):
-        if now not in (None, "other"):
-            decided.append((f"binding.{name}", now, then))
-    for key in sorted(fresh.location):
-        decided.append((f"binding.location.{key}", fresh.location[key], held.location.get(key)))
-    for name, now, then in decided:
-        if now is not None and not _same(now, then):
-            diffs.append((name, then, now))
-    return diffs
+    if fresh.platform not in (None, "other"):
+        decided.append(("binding.platform", fresh.platform, held.platform))
+        if fresh.format not in (None, "other"):
+            decided.append(("binding.format", fresh.format, held.format))
+        for key in sorted(fresh.location):
+            decided.append((f"binding.location.{key}", fresh.location[key], held.location.get(key)))
+    return [
+        (name, then, now) for name, now, then in decided if now is not None and not _same(now, then)
+    ]
+
+
+@dataclass(frozen=True)
+class _Scope:
+    """What every item of one product shares."""
+
+    product_id: str
+    contract_path: str
+    sources: Mapping[SourceKey, str]
+
+    def item(
+        self,
+        kind: str,
+        what: str,
+        before: Any = None,
+        after: Any = None,
+        where: Optional[Tuple[str, str]] = None,
+    ) -> DriftItem:
+        ref = self.sources.get((self.product_id, *where)) if where else None
+        return DriftItem(kind, self.product_id, self.contract_path, what, before, after, ref)
+
+
+def _location(facts: OutputFacts) -> Any:
+    return dict(facts.location) or None
+
+
+def _dag_items(scope: _Scope, bid: str, job: JobFacts, held: JobFacts) -> List[DriftItem]:
+    """The DAG that runs a job: which one, and what the code states about it. A schedule the
+    code does not state as a literal (an expression, or none), and a ``catchup`` it does not set,
+    are the person's to write down: they are not compared."""
+    airflow = f"builds[{bid}].execution.orchestration.airflow"
+    if job.dag is None:
+        if held.dag is None:
+            return []
+        return [scope.item("coverage_regressed", f"{airflow}.dagId", held.dag, None)]
+    items: List[DriftItem] = []
+    if held.dag is None or not _same(job.dag, held.dag):
+        items.append(
+            scope.item("schedule_changed", f"{airflow}.dagId", held.dag, job.dag, ("schedule", bid))
+        )
+    if held.dag is None:
+        return items
+    schedule = f"{airflow}.dagConfig.schedule"
+    if job.schedule and _LITERAL_SCHEDULE.fullmatch(job.schedule):
+        if not _same(job.schedule, held.schedule):
+            items.append(
+                scope.item(
+                    "schedule_changed", schedule, held.schedule, job.schedule, ("schedule", bid)
+                )
+            )
+    if job.catchup is not None and not _same(job.catchup, held.catchup):
+        items.append(
+            scope.item(
+                "schedule_changed",
+                f"{airflow}.dagConfig.catchup",
+                held.catchup,
+                job.catchup,
+                ("schedule", bid),
+            )
+        )
+    if _same(job.dag, held.dag):
+        items.extend(
+            scope.item("coverage_regressed", f"{airflow}.tasks[{task}]", task, None)
+            for task in held.tasks
+            if task not in job.tasks
+        )
+    return items
+
+
+def _job_items(scope: _Scope, fresh: Projection, held: Optional[Projection]) -> List[DriftItem]:
+    items: List[DriftItem] = []
+    for bid, job in fresh.jobs.items():
+        held_job = held.jobs.get(bid) if held else None
+        if held_job is None:
+            items.append(
+                scope.item("job_added", f"builds[{bid}]", None, job.model, ("builds", bid))
+            )
+        else:
+            items.extend(_dag_items(scope, bid, job, held_job))
+    if held:
+        items.extend(
+            scope.item("job_removed", f"builds[{bid}]", held_job.model, None)
+            for bid, held_job in held.jobs.items()
+            if bid not in fresh.jobs and held_job.imported
+        )
+    return items
+
+
+def _output_items(scope: _Scope, fresh: Projection, held: Optional[Projection]) -> List[DriftItem]:
+    items: List[DriftItem] = []
+    for eid, out in fresh.outputs.items():
+        held_out = held.outputs.get(eid) if held else None
+        if held_out is None:
+            items.append(
+                scope.item(
+                    "output_added", f"exposes[{eid}]", None, _location(out), ("exposes", eid)
+                )
+            )
+            continue
+        items.extend(
+            scope.item("table_changed", f"exposes[{eid}].{name}", before, after, ("exposes", eid))
+            for name, before, after in _output_diffs(out, held_out)
+        )
+    if held:
+        items.extend(
+            scope.item("output_removed", f"exposes[{eid}]", _location(held_out), None)
+            for eid, held_out in held.outputs.items()
+            if eid not in fresh.outputs and held_out.built
+        )
+    return items
+
+
+def _input_items(scope: _Scope, fresh: Projection, held: Optional[Projection]) -> List[DriftItem]:
+    if not held:
+        return []
+    added = [
+        scope.item("table_changed", f"consumes[{key}]", None, key, ("consumes", key))
+        for key in fresh.inputs
+        if key not in held.inputs
+    ]
+    lost = [
+        scope.item("coverage_regressed", f"consumes[{key}]", key, None)
+        for key, purpose in held.inputs.items()
+        if key not in fresh.inputs and purpose.startswith(READ_PURPOSE_PREFIX)
+    ]
+    return [*added, *lost]
 
 
 def compare_product(
@@ -310,87 +439,12 @@ def compare_product(
 ) -> List[DriftItem]:
     """The drift of one product: ``fresh`` is what the code says, ``held`` what its committed
     contract holds (``None``: there is no such file, so every job and output is new)."""
-    items: List[DriftItem] = []
-
-    def add(
-        kind: str,
-        what: str,
-        before: Any = None,
-        after: Any = None,
-        where: Optional[Tuple[str, str]] = None,
-    ) -> None:
-        ref = sources.get((product_id, *where)) if where else None
-        items.append(DriftItem(kind, product_id, contract_path, what, before, after, ref))
-
-    def location(facts: OutputFacts) -> Any:
-        return dict(facts.location) or None
-
-    # jobs, and where each is run from
-    for bid, job in fresh.jobs.items():
-        held_job = held.jobs.get(bid) if held else None
-        if held_job is None:
-            add("job_added", f"builds[{bid}]", None, job.model, ("builds", bid))
-            continue
-        airflow = f"builds[{bid}].execution.orchestration.airflow"
-        if job.dag is not None:
-            if held_job.dag is None or not _same(job.dag, held_job.dag):
-                add(
-                    "schedule_changed",
-                    f"{airflow}.dagId",
-                    held_job.dag,
-                    job.dag,
-                    ("schedule", bid),
-                )
-            if held_job.dag is not None:
-                if not _same(job.schedule, held_job.schedule):
-                    add(
-                        "schedule_changed",
-                        f"{airflow}.dagConfig.schedule",
-                        held_job.schedule,
-                        job.schedule,
-                        ("schedule", bid),
-                    )
-                if not _same(job.catchup, held_job.catchup):
-                    add(
-                        "schedule_changed",
-                        f"{airflow}.dagConfig.catchup",
-                        held_job.catchup,
-                        job.catchup,
-                        ("schedule", bid),
-                    )
-                if _same(job.dag, held_job.dag):
-                    for task in held_job.tasks:
-                        if task not in job.tasks:
-                            add("coverage_regressed", f"{airflow}.tasks[{task}]", task, None)
-        elif held_job.dag is not None:
-            add("coverage_regressed", f"{airflow}.dagId", held_job.dag, None)
-    if held:
-        for bid, held_job in held.jobs.items():
-            if bid not in fresh.jobs and held_job.imported:
-                add("job_removed", f"builds[{bid}]", held_job.model, None)
-
-    # outputs
-    for eid, out in fresh.outputs.items():
-        held_out = held.outputs.get(eid) if held else None
-        if held_out is None:
-            add("output_added", f"exposes[{eid}]", None, location(out), ("exposes", eid))
-            continue
-        for name, before, after in _output_diffs(out, held_out):
-            add("table_changed", f"exposes[{eid}].{name}", before, after, ("exposes", eid))
-    if held:
-        for eid, held_out in held.outputs.items():
-            if eid not in fresh.outputs and held_out.built:
-                add("output_removed", f"exposes[{eid}]", location(held_out), None)
-
-    # inputs
-    if held:
-        for key in fresh.inputs:
-            if key not in held.inputs:
-                add("table_changed", f"consumes[{key}]", None, key, ("consumes", key))
-        for key, purpose in held.inputs.items():
-            if key not in fresh.inputs and purpose.startswith(READ_PURPOSE_PREFIX):
-                add("coverage_regressed", f"consumes[{key}]", key, None)
-    return items
+    scope = _Scope(product_id, contract_path, sources)
+    return [
+        *_job_items(scope, fresh, held),
+        *_output_items(scope, fresh, held),
+        *_input_items(scope, fresh, held),
+    ]
 
 
 # ── reading the committed contracts ──────────────────────────────────────────────────────────
@@ -488,22 +542,19 @@ def check(
     contracts: Sequence[Mapping[str, Any]],
     sources: Mapping[SourceKey, str],
     paths: Sequence[Path],
-    *,
-    tool: str,
-    source: str,
-    strict: bool = False,
+    report: DriftReport,
 ) -> DriftReport:
-    """Compare each contract the code proposes with the file at its path. Reads, and writes
-    nothing; raises a typed refusal when nothing can be decided."""
+    """Compare each contract the code proposes with the file at its path, into ``report``. Reads,
+    and writes nothing; raises a typed refusal when nothing can be decided."""
     if not contracts:
         raise refusal(
-            f"`fluid import {tool}` proposes no product from {_display(source, 100)!r}",
+            f"`fluid import {report.tool}` proposes no product from {_display(report.source, 100)!r}",
             "There is nothing to compare the committed contracts with, and a gate that passes "
             "because it read nothing would pass whatever the directory held.",
             "Check the source directory and the conventions.",
-            source=_display(source, 120),
+            source=_display(report.source, 120),
         )
-    report = DriftReport(tool=tool, source=source, strict=strict, products=len(contracts))
+    report.products = len(contracts)
     found = 0
     for contract, path in zip(contracts, paths, strict=True):
         document = read_baseline(path)
@@ -560,17 +611,6 @@ def _message(item: DriftItem) -> str:
     if item.source_ref:
         text += f" at {_display(item.source_ref, 200)}"
     return text
-
-
-def escape_data(text: str) -> str:
-    """A workflow command's message, as GitHub reads it (``actions/toolkit``'s ``escapeData``)."""
-    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-
-
-def escape_property(text: str) -> str:
-    """A workflow command's property (``file=``, ``title=``): the message's escapes, and ``:``
-    and ``,``, which end a property."""
-    return escape_data(text).replace(":", "%3A").replace(",", "%2C")
 
 
 def _counts(report: DriftReport) -> str:

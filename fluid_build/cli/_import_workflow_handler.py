@@ -75,19 +75,6 @@ def check_import_flags(args, tool: Optional[str]) -> None:
     """
     from fluid_build.cli.import_workflow import BUILTIN_IMPORTERS
 
-    if not getattr(args, "check", False):
-        for dest, flag in (
-            ("check_format", "--format"),
-            ("strict", "--strict"),
-            ("out_report", "--out-report"),
-        ):
-            if getattr(args, dest, None):
-                raise _flag_refusal(
-                    f"{flag} applies to `fluid import <tool> <source> --check`",
-                    "It shapes the drift report, and there is none without --check.",
-                    f"Add --check, or remove {flag}.",
-                    flag=flag,
-                )
     split = getattr(args, "split_by", None)
     if split in CODE_SPLITS and (
         tool is None or (tool in BUILTIN_IMPORTERS and tool not in PROPOSING_TOOLS)
@@ -138,6 +125,22 @@ def check_import_flags(args, tool: Optional[str]) -> None:
             "Remove --dags, or use `fluid import pyspark <jobs-dir> --dags <dags-dir>`.",
             flag="--dags",
         )
+
+
+def refuse_report_flags_without_check(args: Any) -> None:
+    """``--format``, ``--strict`` and ``--out-report`` shape the drift report of ``--check``."""
+    for dest, flag in (
+        ("check_format", "--format"),
+        ("strict", "--strict"),
+        ("out_report", "--out-report"),
+    ):
+        if getattr(args, dest, None):
+            raise _flag_refusal(
+                f"{flag} applies to `fluid import <tool> <source> --check`",
+                "It shapes the drift report, and there is none without --check.",
+                f"Add --check, or remove {flag}.",
+                flag=flag,
+            )
 
 
 def _require_source(tool: str, source: Optional[str]) -> str:
@@ -360,9 +363,9 @@ def run_import_check(
         _check_mode_flags(args, tool)
         report = _drift_report(args, tool or "", _require_source(tool or "", source), paths)
         text = _drift.render(report, fmt)
-        _emit(text)
-        if out_report:
+        if out_report:  # first: a path that cannot be written is the one thing said, once
             _write_report(out_report, text, protected=paths)
+        _emit(text)
         return report.exit_code
     except Exception as exc:  # noqa: BLE001 - see above: nothing but drift may exit 1
         logger.debug("fluid import --check stopped", exc_info=True)
@@ -393,14 +396,8 @@ def _drift_report(args: Any, tool: str, source: str, paths: List[Path]) -> "Drif
         options.pop(dest, None)
     contracts, _report, sources = run_import_traced(tool, source, options)
     paths.extend(_planned_paths(contracts, getattr(args, "out_path", None)))
-    return _drift.check(
-        contracts,
-        sources,
-        paths,
-        tool=tool,
-        source=source,
-        strict=bool(getattr(args, "strict", False)),
-    )
+    report = _drift.DriftReport(tool, source, strict=bool(getattr(args, "strict", False)))
+    return _drift.check(contracts, sources, paths, report)
 
 
 def _file_state(path: Path, data: bytes, *, guarded: bool) -> str:
