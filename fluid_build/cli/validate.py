@@ -1600,14 +1600,20 @@ def _drop_schema_errors_under(validation_result: ValidationResult, pointer: str)
 
 def _check_maintenance(validation_result: ValidationResult, contract: Mapping[str, Any]) -> None:
     """Each ``exposes[].iceberg.maintenance`` against the contract and its backend's limits
-    (``fluid_build/maintenance/spec.py``). Its plugin actions are the plugin phase's
+    (``fluid_build/maintenance/spec.py``), and a warning for orphan files removed younger than
+    three days from a table no forge build writes. Its plugin actions are the plugin phase's
     (:func:`_check_maintenance_plugins`). Fails closed."""
-    from fluid_build.maintenance.spec import declares_maintenance, read_maintenance
+    from fluid_build.maintenance.spec import (
+        declares_maintenance,
+        maintenance_warnings,
+        read_maintenance,
+    )
 
     if not declares_maintenance(contract):
         return
     try:
-        _tables, errors = read_maintenance(contract)
+        tables, errors = read_maintenance(contract)
+        warnings = maintenance_warnings(tables)
     except Exception as exc:  # noqa: BLE001 — reported, never swallowed
         validation_result.add_error(
             f"Iceberg maintenance check could not run ({type(exc).__name__}); "
@@ -1617,7 +1623,12 @@ def _check_maintenance(validation_result: ValidationResult, contract: Mapping[st
         )
         return
     _add_findings(
-        validation_result, contract, "contract_iceberg_maintenance", errors, anchor="exposes"
+        validation_result,
+        contract,
+        "contract_iceberg_maintenance",
+        errors,
+        warnings,
+        anchor="exposes",
     )
 
 

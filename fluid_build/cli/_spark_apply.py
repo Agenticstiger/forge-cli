@@ -17,7 +17,11 @@ it (:func:`plan_posture`, :func:`warn_cluster_posture`).
 A backend-spark Iceberg table maintenance (``exposes[].iceberg.maintenance``) is planned as a
 ``spark.maintain`` action (:func:`planned_actions`), its job config deployed beside its writer
 build's, and run by ``fluid apply --mode maintain`` (:func:`maintain_only`): no ``tofu``, no
-plan, one run on the writer build's runtime with the config the last apply deployed.
+plan, one run on the writer build's runtime with the config the last apply deployed. A table no
+forge build writes runs on the EMR runtime its ``runtime`` names, its job config and runner
+deployed in the table's bucket. The action lists each plugin action with the sha256 of its
+statements and the package that shipped it: :func:`prepare` names the action whose SQL changed
+(``apply_plan_digest_maintenance_actions_changed``) before it compares the rest.
 
 A build of ``runtime: local`` runs on the machine ``fluid apply`` runs on, with nothing for
 OpenTofu to provision: the native engine (outputs on ``platform: local``) reconciles it the
@@ -27,6 +31,7 @@ same way, and :func:`refuse_without_opentofu` refuses only the AWS runtimes ther
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -105,6 +110,14 @@ def _has_spark(contract: Mapping[str, Any]) -> bool:
         return True  # let the compile report it
 
 
+def _has_spark_work(contract: Mapping[str, Any]) -> bool:
+    """A Spark build, or a table no forge build writes maintained on its own EMR runtime: the
+    contracts whose plan lists Spark actions."""
+    from fluid_build.maintenance.spec import declares_unwritten_maintenance
+
+    return _has_spark(contract) or declares_unwritten_maintenance(contract)
+
+
 def planned_actions(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """``fluid plan``'s ``spark.reconcile`` actions, then its ``spark.maintain`` ones (steps
     renumbered by the caller).
@@ -112,7 +125,7 @@ def planned_actions(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     Raises:
         CLIError: ``plan_spark_invalid`` / ``plan_spark_refused``.
     """
-    if not _has_spark(contract):
+    if not _has_spark_work(contract):
         return []
     # The operator's gates are apply's (fluid validate warns about them); they refuse a
     # build, never change what it compiles to. FLUID_SPARK_MAVEN_REPOSITORY and, on Glue,
@@ -134,6 +147,137 @@ def _comparable(action: Mapping[str, Any]) -> Mapping[str, Any]:
     return {k: v for k, v in action.items() if k not in ("step", "depends_on")}
 
 
+#: What a plugin action's provenance may be to reach a message (a distribution's name and
+#: version, an action's name); anything else is shown as unknown.
+_SHOWN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+!-]{0,98}\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _shown(value: Any) -> str:
+    return value if isinstance(value, str) and _SHOWN.match(value) else "?"
+
+
+def _origin(entry: Mapping[str, Any]) -> str:
+    """``<distribution> <version>`` of a planned or compiled action, for a message."""
+    if entry.get("distribution") is None and entry.get("version") is None:
+        return "an unknown package"
+    return f"{_shown(entry.get('distribution'))} {_shown(entry.get('version'))}"
+
+
+def _digest(entry: Mapping[str, Any]) -> str:
+    sha = entry.get("statementsSha256")
+    return sha[:12] if isinstance(sha, str) and _SHA256.match(sha) else "?"
+
+
+def _maintenance_actions(action: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
+    payload = action.get("payload")
+    entries = payload.get("actions") if isinstance(payload, Mapping) else None
+    if not isinstance(entries, list):
+        return {}
+    return {str(e.get("name")): e for e in entries if isinstance(e, Mapping) and "name" in e}
+
+
+def maintenance_action_changes(
+    planned: List[Mapping[str, Any]], compiled: List[Mapping[str, Any]]
+) -> Tuple[List[str], List[str]]:
+    """``(refusals, warnings)``: the plugin actions of each planned ``spark.maintain`` action
+    against the ones compiled now, by expose and action name. An action whose statements hash
+    to another sha256, or that only one side lists, is a refusal; one whose package or version
+    changed while its statements hash the same is a warning, since the SQL the plan bound is
+    the SQL that runs. Messages name actions, packages, versions and the first 12 characters of
+    each hash, never a statement."""
+    now = {
+        str(a.get("id")): a
+        for a in compiled
+        if isinstance(a, Mapping) and a.get("op") == MAINTAIN_ACTION
+    }
+    refusals: List[str] = []
+    warnings: List[str] = []
+    for action in planned:
+        if not isinstance(action, Mapping) or action.get("op") != MAINTAIN_ACTION:
+            continue
+        current = now.get(str(action.get("id")))
+        if current is None:
+            continue  # the comparison of the whole action reports a table it no longer has
+        before, after = _maintenance_actions(action), _maintenance_actions(current)
+        expose = _shown(str(action.get("id")))
+        for name in sorted(set(before) | set(after)):
+            old, new = before.get(name), after.get(name)
+            where = f"exposes[{expose}].iceberg.maintenance.actions[{_shown(name)}]"
+            if old is None or new is None:
+                refusals.append(
+                    f"{where} is compiled now ({_origin(new)}) and was not planned"
+                    if old is None
+                    else f"{where} was planned ({_origin(old)}) and is not compiled now"
+                )
+            elif old.get("statementsSha256") != new.get("statementsSha256"):
+                refusals.append(
+                    f"{where}: the SQL hash of its statements differs: {_digest(old)} from "
+                    f"{_origin(old)} at plan, {_digest(new)} from {_origin(new)} now"
+                )
+            elif (old.get("distribution"), old.get("version")) != (
+                new.get("distribution"),
+                new.get("version"),
+            ):
+                warnings.append(
+                    f"{where} was planned with {_origin(old)} and compiles with "
+                    f"{_origin(new)} now; its statements hash the same ({_digest(new)}), so "
+                    "the plan still binds the SQL that runs"
+                )
+    return refusals, warnings
+
+
+def _without_provenance(action: Mapping[str, Any]) -> Mapping[str, Any]:
+    """``action`` with its plugin actions' packages and versions left out: what the whole
+    action is compared by once :func:`maintenance_action_changes` has said them."""
+    if action.get("op") != MAINTAIN_ACTION or not isinstance(action.get("payload"), Mapping):
+        return action
+    payload = dict(action["payload"])
+    if isinstance(payload.get("actions"), list):
+        payload["actions"] = [
+            (
+                {k: v for k, v in e.items() if k not in ("distribution", "version")}
+                if isinstance(e, Mapping)
+                else e
+            )
+            for e in payload["actions"]
+        ]
+    return {**action, "payload": payload}
+
+
+def _check_maintenance_actions(planned: List[Mapping[str, Any]], compiled: List[Any]) -> None:
+    """Refuse a bound plan whose maintenance actions' statements differ from the ones compiled
+    now, naming each, and warn about a package that changed under the same statements.
+
+    Raises:
+        CLIError: ``apply_plan_digest_maintenance_actions_changed`` (a
+            :class:`~fluid_build.forge.core.plan_digest.PlanBindingError` kind).
+    """
+    from fluid_build.forge.core.plan_digest import MAINTENANCE_ACTIONS_CHANGED, PlanBindingError
+
+    refusals, warnings = maintenance_action_changes(planned, compiled)
+    if warnings:
+        from rich.markup import escape
+
+        from fluid_build.cli.console import warning
+
+        for line in warnings:
+            warning(escape(line))
+            logging.getLogger(__name__).warning("spark_maintenance_action_provenance %s", line)
+    if refusals:
+        exc = PlanBindingError(
+            MAINTENANCE_ACTIONS_CHANGED,
+            "; ".join(refusals)
+            + "; the plan binds the statements each maintenance action runs, and these are "
+            "not the ones compiled now (a plugin changed, or the plan was made with another). "
+            "Nothing was applied: regenerate the plan with the plugins apply runs with",
+        )
+        raise _cli_error(
+            f"apply_plan_digest_{exc.kind.replace('-', '_')}",
+            {"kind": exc.kind, "error": str(exc)},
+        )
+
+
 def prepare(
     contract: Mapping[str, Any],
     *,
@@ -152,7 +296,7 @@ def prepare(
             compile, or the operator's policy refuses it), ``apply_spark_artifact_mismatch``
             (the bound plan lists other Spark runs), ``apply_aws_sdk_missing``.
     """
-    if not _has_spark(contract):
+    if not _has_spark_work(contract):
         if verified_plan and any(
             a.get("op") in _SPARK_OPS
             for a in verified_plan.get("actions") or []
@@ -181,7 +325,9 @@ def prepare(
             for a in verified_plan.get("actions") or []
             if isinstance(a, Mapping) and a.get("op") in _SPARK_OPS
         ]
-        if planned != [_comparable(r.plan_action(0)) for r in [*runs, *maintained]]:
+        compiled = [_comparable(r.plan_action(0)) for r in [*runs, *maintained]]
+        _check_maintenance_actions(planned, compiled)
+        if [_without_provenance(a) for a in planned] != [_without_provenance(a) for a in compiled]:
             raise _cli_error(
                 "apply_spark_artifact_mismatch",
                 {
@@ -257,9 +403,10 @@ def refuse_without_opentofu(contract: Mapping[str, Any], engine: str) -> None:
     Raises:
         CLIError: ``apply_spark_needs_opentofu``.
     """
-    if not _has_spark(contract):
+    if not _has_spark_work(contract):
         return
     from fluid_build.build_runners.spark._desired import spark_builds
+    from fluid_build.iac.providers.aws_identity import _maintenance_runtimes
     from fluid_build.spark.compiler import LOCAL_RUNTIME, spark_parameters
 
     try:
@@ -270,6 +417,8 @@ def refuse_without_opentofu(contract: Mapping[str, Any], engine: str) -> None:
         ]
     except ValueError:
         remote = ["?"]  # a build that does not parse: refused here as before
+    # A table no forge build writes: its maintenance job config and runner are OpenTofu's.
+    remote += [f"the maintenance of {eid}" for eid, _ in _maintenance_runtimes(contract)]
     if remote:
         raise _cli_error(
             "apply_spark_needs_opentofu",
@@ -520,7 +669,7 @@ def maintain_only(
     host = LocalHost(Path(workspace)) if workspace is not None else None
     failed = False
     for run in runs:
-        head = f"Iceberg {run.maintains} maintenance (build {run.build}, {run.runtime})"
+        head = f"Iceberg {run.maintains} maintenance ({_runs_on(run)})"
         if dry_run:
             say(
                 f"{head}: would start one run and wait up to {int(DEFAULT_RUN_WAIT_S)} s for it "
@@ -529,8 +678,11 @@ def maintain_only(
             for line in _maintenance_steps(contract, run):
                 say(f"  {line}")
             continue
+        as_whom = (
+            f"as {run.role_arn}" if run.maintenance_runtime else f"as build {run.build}'s role"
+        )
         if confirm is not None and not confirm(
-            f"Start {run.maintains}'s maintenance on {run.runtime} as build {run.build}'s role? "
+            f"Start {run.maintains}'s maintenance on {run.runtime} {as_whom}? "
             "It may delete rows, snapshots and files"
         ):
             say(f"{head}: not started")
@@ -547,6 +699,23 @@ def maintain_only(
             raise KeyboardInterrupt  # the run was cancelled; stop the apply, as Ctrl-C does
         failed = failed or bool(outcome.error)
     return 1 if failed else 0
+
+
+#: How a dry run names a maintenance run's target.
+_TARGET_WORDS = {
+    "applicationId": "application",
+    "clusterId": "cluster",
+    "virtualClusterId": "virtual cluster",
+}
+
+
+def _runs_on(run: DesiredRun) -> str:
+    """Where a maintenance run runs, for its lines: the writer build's runtime, or the runtime,
+    target and role a table no forge build writes names."""
+    if not run.maintenance_runtime:
+        return f"build {run.build}, {run.runtime}"
+    target = ", ".join(f"{_TARGET_WORDS.get(k, k)} {v}" for k, v in sorted(run.target.items()))
+    return f"{run.runtime} {target}, as {run.role_arn}"
 
 
 def _ago(seconds: int) -> str:
