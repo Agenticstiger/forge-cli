@@ -115,6 +115,7 @@ from collections import Counter
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import (
+    AbstractSet,
     Any,
     Callable,
     Dict,
@@ -556,11 +557,17 @@ def suppress_secondary(verdicts: Sequence[Verdict]) -> Tuple[Verdict, ...]:
 Combination = Tuple[int, ...]
 
 
+#: The facts of a combination in factors: each factor's fact positions, with every
+#: combination of their states that the facts' texts allow (one state per position, in
+#: that order). The combinations the texts allow are every choice of one per factor.
+Factors = Sequence[Tuple[Tuple[int, ...], AbstractSet[Combination]]]
+
+
 def suppress_differencing(
     cells: Mapping[Combination, int],
     passed: Iterable[int],
     rule: DisclosureRule,
-    possible: Callable[[Mapping[int, int]], bool],
+    factors: Callable[[Sequence[int]], Factors],
     states: Sequence[int],
 ) -> FrozenSet[int]:
     """The facts of one table to withhold so that together they give back no small cell.
@@ -577,12 +584,17 @@ def suppress_differencing(
     and a reader differences those back to one record.
 
     A combination of the published facts that holds from 1 to ``minimumCell - 1`` records
-    is a small cell. Where zeros are disclosive, an empty combination that changing one
-    fact's state takes to a held one is a zero cell too, since it says that every record
-    of the held one has that fact's state: a containment the records show. It is not
-    disclosive when *possible*, which takes a mapping of fact positions to states, says
-    the facts' texts rule it out on every row (``A`` TRUE beside ``A OR id = 'x'`` not
-    TRUE is no row's): then the texts show the containment already.
+    is a small cell. Where zeros are disclosive, every empty combination that the facts'
+    texts allow is a zero cell too, since its emptiness is a containment the records show
+    (no record of the one state has the other), and an empty combination the texts rule
+    out on every row is not (``A`` TRUE beside ``A OR id = 'x'`` not TRUE is no row's, so
+    the texts show that containment already). *factors* gives, for the positions of the
+    facts still published, the factors of :data:`Factors`: facts whose texts are linked,
+    with the combinations of states the texts let them take together. The combinations
+    allowed are every choice of one per factor, and the check looks at each that one
+    factor's change takes to a held combination: if none of those is empty, the held
+    combinations are every allowed one, so it finds an empty one whenever any is left,
+    however many changes of single facts away from a held one it lies.
 
     A fact touches such a cell when changing that fact's state alone takes the cell to a
     combination some record holds, so that withholding the fact merges the two. Every
@@ -593,8 +605,8 @@ def suppress_differencing(
     cell go when it merges: read in the same round, they would withhold a fact that only
     the small cell set apart. Each round only withholds more, never brings a fact back,
     and depends on the facts and the records alone, not on the order the facts are listed
-    in. A small cell that no one fact's change merges withholds every fact it differs in
-    from its nearest held combinations. *passed* holds the positions of the facts that
+    in. A small or a zero cell that no one fact's change merges withholds every fact it
+    differs in from its nearest held combinations. *passed* holds the positions of the facts that
     passed their own checks; the result is those of them to withhold, which the summary
     counts under ``D`` and the document writes ``C``, as it writes every withheld group of
     a level histogram.
@@ -628,7 +640,7 @@ def suppress_differencing(
                 if count > 0:
                     projected[tuple(combination[at] for at in order)] += count
             formed = projected
-        touched = _touched(formed, order, rule, possible, states)
+        touched = _touched(formed, order, rule, factors, states)
         if not touched:
             break
         shown -= touched
@@ -639,7 +651,7 @@ def _touched(
     formed: Mapping[Combination, int],
     order: Sequence[int],
     rule: DisclosureRule,
-    possible: Callable[[Mapping[int, int]], bool],
+    factors: Callable[[Sequence[int]], Factors],
     states: Sequence[int],
 ) -> Set[int]:
     """The facts (positions) that touch a small cell of *formed*, else those touching a zero cell."""
@@ -659,18 +671,36 @@ def _touched(
             touched |= touching(cell) or _differing_from_nearest(cell, formed)
     if touched or not rule.zeros_disclosive:
         return {order[at] for at in touched}
+    local = {position: at for at, position in enumerate(order)}
     looked_at: Set[Combination] = set()
-    for cell in formed:
-        if len(touched) == width:
-            break
-        for at in range(width):
-            for other in changed(cell, at):
-                if other in formed or other in looked_at:
+    for positions, allowed in factors(order):
+        inside = tuple(local[position] for position in positions)
+        apart = set(inside)
+        seen_beside: Dict[Combination, Set[Combination]] = {}
+        for cell in formed:
+            rest = tuple(state for at, state in enumerate(cell) if at not in apart)
+            seen_beside.setdefault(rest, set()).add(tuple(cell[at] for at in inside))
+        for rest, seen in seen_beside.items():
+            for missing in allowed:
+                if missing in seen:
                     continue
-                looked_at.add(other)
-                if possible(dict(zip(order, other, strict=True))):
-                    touched |= touching(other)
+                zero = _put_together(rest, inside, missing, width)
+                if zero in looked_at:
+                    continue
+                looked_at.add(zero)
+                touched |= touching(zero) or _differing_from_nearest(zero, formed)
+                if len(touched) == width:
+                    return {order[at] for at in touched}
     return {order[at] for at in touched}
+
+
+def _put_together(
+    rest: Combination, inside: Tuple[int, ...], states: Combination, width: int
+) -> Combination:
+    """The combination with *states* at the positions *inside* and *rest*, in order, elsewhere."""
+    placed = dict(zip(inside, states, strict=True))
+    others = iter(rest)
+    return tuple(placed[at] if at in placed else next(others) for at in range(width))
 
 
 def _differing_from_nearest(cell: Combination, formed: Iterable[Combination]) -> Set[int]:

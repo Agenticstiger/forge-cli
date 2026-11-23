@@ -30,8 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `A`, `B` and `A OR B` give `|A AND B|` however large each pair's difference is. The profiler now
   counts every combination of a table's facts' states in one pass, on the exact counts before any
   rounding, and withholds each fact that touches a combination of 1 to `minimumCell - 1` records
-  or, where zeros are disclosive, an empty combination that the rules' texts do not rule out, until
-  no such combination is left. A fact it withholds is written `C` and counted `D`, and what it
+  or, where zeros are disclosive, any empty combination that the rules' texts do not rule out,
+  however many changes of single facts it lies from a combination the records hold, until no such
+  combination is left. A fact it withholds is written `C` and counted `D`, and what it
   withholds does not depend on the order of the facts. A fact whose `when` leaves fewer than
   `minimumCell` rows uncovered, or none where zeros are disclosive, is withheld too, since the
   table's `rowCount` less the fact's `k` gives that count, and a withheld fact with a `when` writes

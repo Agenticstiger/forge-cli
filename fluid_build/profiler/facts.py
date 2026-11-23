@@ -47,7 +47,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 from fractions import Fraction
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fluid_build import fluid_sql as fs
 from fluid_build.data_rules._model import Expose, as_list, build, nfc
@@ -59,6 +59,7 @@ __all__ = [
     "HOLDS",
     "NOT_COVERED",
     "STATES",
+    "StatesTogether",
     "FactCount",
     "FactPlan",
     "FactRefused",
@@ -514,23 +515,108 @@ def _parts_of(formula: _Formula) -> Set[int]:
     return set().union(*(_parts_of(each) for each in formula[1:]))
 
 
-def states_together(
-    contract: Mapping[str, Any], plans: Sequence[FactPlan]
-) -> Callable[[Mapping[str, int]], bool]:
-    """Whether the rules' texts let facts take given states on one row.
+class StatesTogether:
+    """What the texts of one table's facts let them be together on one row.
 
-    The answer reads each measured fact's ``when`` and test as AND, OR and NOT over parts
-    it does not open (a comparison, a NULL test, an IN list, a derive's agreement), with
-    every truth of every part allowed. Its ``False`` holds for every row of any records:
-    the texts alone rule the states out, as ``A`` TRUE and ``A OR id = 'x'`` not TRUE,
-    or a ``NOT_COVERED`` state for a rule without a ``when``. Its ``True`` says only that
-    the texts do not rule them out: what the parts mean (``x > 2`` beside ``x > 1``) or
-    the records may. Facts that share no part are read apart. Facts that share parts are
-    read under every truth of those parts, and when that would take more than
-    ``_MOST_READINGS`` readings they are not read and nothing is ruled out for them: the
-    check then holds every empty combination of them to be a zero the records show, which
-    withholds more and never less. The returned function takes a mapping of fact names to
-    :data:`STATES`.
+    Made by :func:`states_together`. Calling it with a mapping of fact names to
+    :data:`STATES` answers whether the texts let those facts take those states on one row;
+    :meth:`factors` gives every combination the texts allow, factor by factor.
+    """
+
+    def __init__(
+        self,
+        groups: Sequence[Sequence[str]],
+        reachable: Sequence[Optional[FrozenSet[Tuple[int, ...]]]],
+        alone: Mapping[str, FrozenSet[int]],
+    ) -> None:
+        self._groups = [list(names) for names in groups]
+        self._reachable = list(reachable)
+        self._alone = dict(alone)
+        self._group_of = {name: index for index, names in enumerate(groups) for name in names}
+        self._asked: Dict[Tuple[int, Tuple[Tuple[int, int], ...]], bool] = {}
+
+    def __call__(self, states: Mapping[str, int]) -> bool:
+        """Whether the texts let the named facts take *states* together on one row.
+
+        ``False`` holds for every row of any records; ``True`` says only that the texts
+        do not rule the states out. A fact not measured rules nothing out.
+        """
+        wanted: Dict[int, List[Tuple[int, int]]] = {}
+        for name, state in states.items():
+            index = self._group_of.get(name)
+            if index is None:  # not measured: its texts are not read, so they rule nothing out
+                continue
+            if self._reachable[index] is None:
+                if state not in self._alone[name]:
+                    return False
+                continue
+            wanted.setdefault(index, []).append((self._groups[index].index(name), state))
+        for index, pairs in wanted.items():
+            found = self._reachable[index]
+            if found is None:  # never: a group that is not read is asked fact by fact above
+                continue
+            key = (index, tuple(sorted(pairs)))
+            if key not in self._asked:
+                self._asked[key] = any(
+                    all(seen[at] == state for at, state in pairs) for seen in found
+                )
+            if not self._asked[key]:
+                return False
+        return True
+
+    def factors(
+        self, names: Sequence[str]
+    ) -> List[Tuple[Tuple[str, ...], FrozenSet[Tuple[int, ...]]]]:
+        """The facts *names* in factors, each with every combination of states it allows.
+
+        A factor is the facts of *names* whose texts share parts, read together, with the
+        combinations of their states the texts allow. Facts that share no part with
+        another are factors of their own, and so are the facts of a group too large to
+        read, each with the states it can take read alone; a fact not measured takes
+        any state. The combinations of all of *names* that the texts allow are every
+        choice of one combination per factor.
+        """
+        wanted = set(names)
+        done: Set[int] = set()
+        out: List[Tuple[Tuple[str, ...], FrozenSet[Tuple[int, ...]]]] = []
+        for name in names:
+            index = self._group_of.get(name)
+            if index is None:
+                out.append(((name,), frozenset((state,) for state in STATES)))
+                continue
+            found = self._reachable[index]
+            if found is None:
+                out.append(((name,), frozenset((state,) for state in self._alone[name])))
+                continue
+            if index in done:
+                continue
+            done.add(index)
+            members = self._groups[index]
+            shown = [at for at, member in enumerate(members) if member in wanted]
+            out.append(
+                (
+                    tuple(members[at] for at in shown),
+                    frozenset(tuple(seen[at] for at in shown) for seen in found),
+                )
+            )
+        return out
+
+
+def states_together(contract: Mapping[str, Any], plans: Sequence[FactPlan]) -> StatesTogether:
+    """What the rules' texts let the facts of *plans* be together on one row.
+
+    It reads each measured fact's ``when`` and test as AND, OR and NOT over parts it does
+    not open (a comparison, a NULL test, an IN list, a derive's agreement), with every
+    truth of every part allowed. What it rules out holds for every row of any records: the
+    texts alone rule the states out, as ``A`` TRUE and ``A OR id = 'x'`` not TRUE, or a
+    ``NOT_COVERED`` state for a rule without a ``when``. What it allows, the texts do not
+    rule out: what the parts mean (``x > 2`` beside ``x > 1``) or the records may. Facts
+    that share no part are read apart. Facts that share parts are read under every truth
+    of those parts, and when that would take more than ``_MOST_READINGS`` readings they are
+    read one by one instead, sharing that limit, each fact under its own parts (or, past
+    its share, as covering every row when it has no ``when`` and taking any state
+    otherwise), so that more combinations are allowed, which withholds more and never
+    less.
     """
     parts: Dict[nodes.Node, int] = {}
     readings: Dict[str, Tuple[_Formula, _Formula]] = {}
@@ -541,7 +627,6 @@ def states_together(
             continue
         readings[plan.name] = (_formula(prepared.when, parts), _formula(prepared.test, parts))
     # Facts that share a part are read together; a part is shared through any chain of them.
-    group_of: Dict[str, int] = {}
     groups: List[Tuple[List[str], Set[int]]] = []
     for name, (when, test) in readings.items():
         own = _parts_of(when) | _parts_of(test)
@@ -552,40 +637,40 @@ def states_together(
             held |= groups[index][1]
         groups = [group for index, group in enumerate(groups) if index not in joined]
         groups.append((names, held))
-    reachable: List[Optional[Set[Tuple[int, ...]]]] = []
-    for index, (names, held) in enumerate(groups):
-        for name in names:
-            group_of[name] = index
+    reachable: List[Optional[FrozenSet[Tuple[int, ...]]]] = []
+    alone: Dict[str, FrozenSet[int]] = {}
+    for names, held in groups:
         if (1 << len(held)) * len(names) > _MOST_READINGS:
             reachable.append(None)
+            for name in names:
+                alone[name] = _alone(*readings[name], _MOST_READINGS // len(names))
             continue
-        order = sorted(held)
-        found: Set[Tuple[int, ...]] = set()
-        for choice in range(1 << len(order)):
-            truths = sum(1 << part for bit, part in enumerate(order) if choice >> bit & 1)
-            found.add(tuple(_state(*readings[name], truths) for name in names))
-        reachable.append(found)
-    asked: Dict[Tuple[int, Tuple[Tuple[int, int], ...]], bool] = {}
+        reachable.append(_reach([readings[name] for name in names], held))
+    return StatesTogether([names for names, _ in groups], reachable, alone)
 
-    def together(states: Mapping[str, int]) -> bool:
-        wanted: Dict[int, List[Tuple[int, int]]] = {}
-        for name, state in states.items():
-            index = group_of.get(name)
-            if index is None:  # not measured: its texts are not read, so they rule nothing out
-                continue
-            wanted.setdefault(index, []).append((groups[index][0].index(name), state))
-        for index, pairs in wanted.items():
-            found = reachable[index]
-            if found is None:
-                continue
-            key = (index, tuple(sorted(pairs)))
-            if key not in asked:
-                asked[key] = any(all(seen[at] == state for at, state in pairs) for seen in found)
-            if not asked[key]:
-                return False
-        return True
 
-    return together
+def _reach(
+    readings: Sequence[Tuple[_Formula, _Formula]], held: Set[int]
+) -> FrozenSet[Tuple[int, ...]]:
+    """The states the facts read as *readings* take together under every truth of *held*."""
+    order = sorted(held)
+    found: Set[Tuple[int, ...]] = set()
+    for choice in range(1 << len(order)):
+        truths = sum(1 << part for bit, part in enumerate(order) if choice >> bit & 1)
+        found.add(tuple(_state(when, test, truths) for when, test in readings))
+    return frozenset(found)
+
+
+def _alone(when: _Formula, test: _Formula, most: int) -> FrozenSet[int]:
+    """The states one fact can take, read alone: under its own parts when they take at most
+    *most* readings (the facts of a group share the limit), else as covering every row when
+    it has no ``when`` and as taking any state when it has one."""
+    own = _parts_of(when) | _parts_of(test)
+    if 1 << len(own) <= most:
+        return frozenset(state for (state,) in _reach([(when, test)], own))
+    if when == ("const", True):
+        return frozenset({FAILS, HOLDS})
+    return frozenset(STATES)
 
 
 def _state(when: _Formula, test: _Formula, truths: int) -> int:

@@ -37,6 +37,10 @@ RULES: Dict[str, Dict[str, str]] = {
     "five": {"check": "amount >= 5"},
     "paid_big": {"when": "status = 'paid'", "check": "amount >= 10"},
     "paid_five": {"when": "status = 'paid'", "check": "amount >= 5"},
+    "paid_small": {"when": "status = 'paid'", "check": "NOT (amount >= 10)"},
+    "xor": {
+        "check": "(amount >= 10 AND NOT (status = 'open')) OR (NOT (amount >= 10) AND status = 'open')"
+    },
     "fifteen": {"check": " OR ".join(f"amount = {n}" for n in range(1, 16))},
     "fifteen_or_open": {
         "check": " OR ".join(f"amount = {n}" for n in range(1, 16)) + " OR status = 'open'"
@@ -171,6 +175,22 @@ def test_rules_that_share_more_parts_than_it_reads_rule_nothing_out():
     assert together({"orders.many": HOLDS, "orders.many_or_open": FAILS})
 
 
+def test_the_factors_are_the_linked_facts_with_what_they_can_be_together():
+    together = _together("big", "big_or_open", "paid_big", "five")
+    linked, alone = together.factors(["orders.big", "orders.big_or_open", "orders.five"])
+    assert linked == (
+        ("orders.big", "orders.big_or_open"),
+        {(HOLDS, HOLDS), (FAILS, HOLDS), (FAILS, FAILS)},
+    )
+    assert alone == (("orders.five",), {(FAILS,), (HOLDS,)})
+
+
+def test_the_facts_of_a_group_too_large_to_read_are_read_one_by_one():
+    names = ["orders.fifteen", "orders.fifteen_or_open", "orders.fifteen_again"]
+    factors = _together("fifteen", "fifteen_or_open", "fifteen_again").factors(names)
+    assert factors == [((name,), {(FAILS,), (HOLDS,)}) for name in names]
+
+
 def test_a_fact_state_is_one_byte_per_row():
     states = facts.fact_states(
         CONTRACT,
@@ -185,14 +205,34 @@ def test_a_fact_state_is_one_byte_per_row():
 # ---------------------------------------------------------------------------
 
 
-def _anything(_: Any) -> bool:
-    return True
+COVERED = {(FAILS,), (HOLDS,)}
+
+
+def _free(order):
+    """Factors of facts free of each other, each covering every row."""
+    return [((position,), COVERED) for position in order]
+
+
+def _linked(*groups):
+    """Factors from ``(positions, allowed)`` groups, each cut down to the positions shown."""
+
+    def factors(order):
+        shown = set(order)
+        out = []
+        for positions, allowed in groups:
+            keep = [at for at, position in enumerate(positions) if position in shown]
+            if keep:
+                kept = tuple(positions[at] for at in keep)
+                out.append((kept, {tuple(states[at] for at in keep) for states in allowed}))
+        return out
+
+    return factors
 
 
 def test_a_small_cell_withholds_the_facts_whose_change_merges_it():
     cells = {(HOLDS, HOLDS, HOLDS): 3, (HOLDS, FAILS, HOLDS): 30, (FAILS, HOLDS, HOLDS): 30}
     cells[(FAILS, FAILS, FAILS)] = 37
-    withheld = disclosure.suppress_differencing(cells, [0, 1, 2], ZEROS_SAFE, _anything, STATES)
+    withheld = disclosure.suppress_differencing(cells, [0, 1, 2], ZEROS_SAFE, _free, STATES)
     assert withheld == {0, 1}
 
 
@@ -204,27 +244,39 @@ def test_a_small_cell_no_one_change_merges_withholds_what_it_differs_in_from_the
         (FAILS, FAILS, HOLDS): 20,
         (FAILS, FAILS, FAILS): 37,
     }
-    withheld = disclosure.suppress_differencing(cells, [0, 1, 2], ZEROS_SAFE, _anything, STATES)
+    withheld = disclosure.suppress_differencing(cells, [0, 1, 2], ZEROS_SAFE, _free, STATES)
     assert withheld == {0, 1, 2}
 
 
 def test_a_zero_cell_counts_only_where_the_texts_allow_it_and_zeros_are_disclosive():
     cells = {(HOLDS, HOLDS): 50, (FAILS, FAILS): 50}
-
-    def covered(both: Dict[int, int]) -> bool:
-        return both[0] != NOT_COVERED and both[1] != NOT_COVERED
-
-    def allows(both: Dict[int, int]) -> bool:
-        return covered(both) and both != {0: HOLDS, 1: FAILS}
-
+    allows = _linked(((0, 1), {(HOLDS, HOLDS), (FAILS, FAILS), (FAILS, HOLDS)}))
     rule = disclosure.ACRO_DEFAULT
     assert disclosure.suppress_differencing(cells, [0, 1], rule, allows, STATES) == {0, 1}
     assert disclosure.suppress_differencing(cells, [0, 1], ZEROS_SAFE, allows, STATES) == set()
-
-    def neither(both: Dict[int, int]) -> bool:
-        return covered(both) and both[0] == both[1]
-
+    neither = _linked(((0, 1), {(HOLDS, HOLDS), (FAILS, FAILS)}))
     assert disclosure.suppress_differencing(cells, [0, 1], rule, neither, STATES) == set()
+
+
+def test_a_zero_cell_no_one_fact_change_reaches_is_still_found():
+    # The texts allow (NOT_COVERED, NOT_COVERED) and neither (HOLDS, NOT_COVERED) nor any
+    # other combination one change from a held one: the zero is two changes away.
+    cells = {(HOLDS, FAILS): 50, (FAILS, HOLDS): 50}
+    texts = _linked(((0, 1), {(NOT_COVERED, NOT_COVERED), (HOLDS, FAILS), (FAILS, HOLDS)}))
+    rule = disclosure.ACRO_DEFAULT
+    assert disclosure.suppress_differencing(cells, [0, 1], rule, texts, STATES) == {0, 1}
+
+
+def test_a_zero_cell_across_factors_is_found():
+    # Two factors, each allowing (NOT_COVERED, NOT_COVERED), (HOLDS, FAILS), (FAILS, HOLDS):
+    # the records hold only the three combinations where both factors agree, so every
+    # combination of one factor's state beside the other's different state is empty,
+    # and no change of one fact reaches a held combination from any of them.
+    pair = {(NOT_COVERED, NOT_COVERED), (HOLDS, FAILS), (FAILS, HOLDS)}
+    cells = {first + first: 40 for first in pair}
+    texts = _linked(((0, 1), pair), ((2, 3), pair))
+    rule = disclosure.ACRO_DEFAULT
+    assert disclosure.suppress_differencing(cells, range(4), rule, texts, STATES) == {0, 1, 2, 3}
 
 
 def test_small_cells_are_settled_before_the_empty_combinations_around_them():
@@ -239,19 +291,15 @@ def test_small_cells_are_settled_before_the_empty_combinations_around_them():
         (FAILS, HOLDS, FAILS): 1,
     }
 
-    def texts(states: Dict[int, int]) -> bool:
-        if NOT_COVERED in states.values():
-            return False
-        return not (states.get(0) == HOLDS and states.get(1) == FAILS)
-
+    texts = _linked(((0, 1), {(HOLDS, HOLDS), (FAILS, FAILS), (FAILS, HOLDS)}), ((2,), COVERED))
     rule = disclosure.ACRO_DEFAULT
     assert disclosure.suppress_differencing(cells, [0, 1, 2], rule, texts, STATES) == {0, 1}
 
 
 def test_a_fact_that_failed_its_own_check_is_left_out_of_the_combinations():
     cells = {(HOLDS, HOLDS): 3, (FAILS, HOLDS): 30, (FAILS, FAILS): 67}
-    assert disclosure.suppress_differencing(cells, [1], ZEROS_SAFE, _anything, STATES) == set()
-    assert disclosure.suppress_differencing(cells, [0, 1], ZEROS_SAFE, _anything, STATES) == {0}
+    assert disclosure.suppress_differencing(cells, [1], ZEROS_SAFE, _free, STATES) == set()
+    assert disclosure.suppress_differencing(cells, [0, 1], ZEROS_SAFE, _free, STATES) == {0}
 
 
 def test_the_fixpoint_does_not_depend_on_the_facts_order():
@@ -266,7 +314,7 @@ def test_the_fixpoint_does_not_depend_on_the_facts_order():
     found = set()
     for order in itertools.permutations(range(4)):
         moved = {tuple(cell[at] for at in order): count for cell, count in cells.items()}
-        withheld = disclosure.suppress_differencing(moved, range(4), ZEROS_SAFE, _anything, STATES)
+        withheld = disclosure.suppress_differencing(moved, range(4), ZEROS_SAFE, _free, STATES)
         found.add(frozenset(names[order[at]] for at in withheld))
     assert found == {frozenset("b")}
 
@@ -295,6 +343,28 @@ def test_a_fact_the_pair_does_not_involve_stays_published(tmp_path):
         "big_or_x": (False, "D"),
         "open": (True, None),
     }
+
+
+def test_two_facts_that_together_cover_every_row_are_withheld_beside_the_row_count(tmp_path):
+    # Every row is paid: alone, paid_big is withheld as its when covers every row. Beside
+    # paid_small, no single change of a fact reaches the empty combination where neither
+    # covers a row, but the texts allow it, so both are withheld.
+    rows = _rows((50, "20.00", "paid"), (50, "1.00", "paid"))
+    assert _fared(_profile(tmp_path, rows, "paid_big")) == {"paid_big": (False, "D")}
+    result = _profile(tmp_path, rows, "paid_big", "paid_small")
+    assert _fared(result) == {"paid_big": (False, "D"), "paid_small": (False, "D")}
+    safe = _profile(tmp_path, rows, "paid_big", "paid_small", rule=ZEROS_SAFE)
+    assert _fared(safe) == {"paid_big": (True, None), "paid_small": (True, None)}
+
+
+def test_an_empty_combination_two_changes_from_every_held_one_is_found(tmp_path):
+    # big, open and their exclusive or: |big AND open| = |big| + |open| - |xor| = 0, and the
+    # texts allow a row that is big and open.
+    rows = _rows((50, "20.00", "paid"), (50, "1.00", "open"), (50, "1.00", "paid"))
+    result = _profile(tmp_path, rows, "big", "open", "xor")
+    assert _fared(result) == {"big": (False, "D"), "open": (False, "D"), "xor": (False, "D")}
+    safe = _profile(tmp_path, rows, "big", "open", "xor", rule=ZEROS_SAFE)
+    assert all(shown for shown, _ in _fared(safe).values())
 
 
 def test_a_fact_beside_the_same_fact_or_one_row_inside_it_is_withheld_where_zeros_are_disclosive(

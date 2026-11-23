@@ -928,7 +928,7 @@ def _differenced(
     states: Mapping[str, bytes],
     refused: Mapping[str, Optional[disclosure.Verdict]],
     rule: disclosure.DisclosureRule,
-    together: Callable[[Mapping[str, int]], bool],
+    together: "facts.StatesTogether",
 ) -> List[str]:
     """The facts of one table that passed their own checks and are withheld against differencing.
 
@@ -942,11 +942,15 @@ def _differenced(
     combinations: "Counter[Tuple[int, ...]]" = Counter(
         zip(*(states[name] for name in names), strict=True)
     )
+    position = {name: at for at, name in enumerate(names)}
 
-    def possible(assigned: Mapping[int, int]) -> bool:
-        return together({names[at]: state for at, state in assigned.items()})
+    def factors(order: Sequence[int]) -> disclosure.Factors:
+        return [
+            (tuple(position[name] for name in members), allowed)
+            for members, allowed in together.factors([names[at] for at in order])
+        ]
 
-    withheld = disclosure.suppress_differencing(combinations, passed, rule, possible, facts.STATES)
+    withheld = disclosure.suppress_differencing(combinations, passed, rule, factors, facts.STATES)
     return [names[at] for at in sorted(withheld)]
 
 
