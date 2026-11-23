@@ -29,7 +29,7 @@ from tests.spark.conftest import CONTRACT
 pytestmark = pytest.mark.unit
 
 ROLE = "arn:aws:iam::123456789012:role/orders-maint"
-APP = "00f1abcd2345"
+APP = "app0000000001"
 
 
 def runtime(**extra: Any) -> Dict[str, Any]:
@@ -101,7 +101,7 @@ def test_declares_unwritten_maintenance() -> None:
         (
             {
                 "runtime": "emr-eks",
-                "virtualClusterId": "abcdefghij0123456789klmno",
+                "virtualClusterId": "vc0000000001",
                 "executionRoleArn": ROLE,
             },
             {},

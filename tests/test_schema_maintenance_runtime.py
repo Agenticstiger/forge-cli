@@ -32,7 +32,7 @@ def manager() -> FluidSchemaManager:
 def runtime(**extra: Any) -> Dict[str, Any]:
     block: Dict[str, Any] = {
         "runtime": "emr-serverless",
-        "applicationId": "00f1abcd2345",
+        "applicationId": "app0000000001",
         "executionRoleArn": ROLE,
     }
     block.update(extra)
@@ -89,7 +89,7 @@ def test_a_valid_runtime_block_passes(manager) -> None:
         {"runtime": "emr-ec2", "clusterId": "j-1ABCDEF", "executionRoleArn": ROLE},
         {
             "runtime": "emr-eks",
-            "virtualClusterId": "abcdefghij0123456789klmno",
+            "virtualClusterId": "vc0000000001",
             "executionRoleArn": ROLE,
         },
         runtime(releaseLabel="emr-7.12.0", sparkConf={"spark.executor.memory": "4g"}),
@@ -131,7 +131,7 @@ def test_each_runtime_needs_its_own_target(manager, rt) -> None:
 
 
 def test_a_target_of_another_runtime_does_not_stand_in(manager) -> None:
-    rt = {"runtime": "emr-ec2", "applicationId": "00f1abcd2345", "executionRoleArn": ROLE}
+    rt = {"runtime": "emr-ec2", "applicationId": "app0000000001", "executionRoleArn": ROLE}
     assert not check(manager, contract(block(rt))).is_valid
 
 

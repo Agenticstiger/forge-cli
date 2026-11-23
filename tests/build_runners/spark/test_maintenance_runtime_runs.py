@@ -31,7 +31,7 @@ from tests.maintenance.conftest import EXPOSE, maintained, spark_block
 pytestmark = pytest.mark.unit
 
 ROLE = "arn:aws:iam::123456789012:role/orders-maint"
-APP = "00f1abcd2345"
+APP = "app0000000001"
 PRODUCT = "commerce.orders-stream"
 BUILD = "maintain_order_lines"
 PREFIX = f"s3://commerce-lake/_fluid/spark/{PRODUCT}/{BUILD}"

@@ -33,7 +33,7 @@ def _contract(**maintenance: Any) -> Dict[str, Any]:
         "schedule": "0 3 * * *",
         "runtime": {
             "runtime": "emr-serverless",
-            "applicationId": "00f1abcd2345",
+            "applicationId": "app0000000001",
             "executionRoleArn": ROLE,
         },
         "compaction": {},
