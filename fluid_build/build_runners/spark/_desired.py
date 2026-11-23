@@ -479,7 +479,13 @@ class DesiredRun:
         ``actions`` name each plugin action, the package and version that shipped its kind and
         the sha256 of its statements, which ``fluid apply`` compares one by one
         (``cli/_spark_apply.py``) before the job config's digest."""
-        if self.maintenance_runtime:
+        if self.maintenance_runtime and self.local:
+            where = (
+                "on this machine, with forge's local runtime, as its user, beside the writers "
+                f"of the table (exposes[{self.maintains}].iceberg.maintenance.runtime), which "
+                "forge does not run"
+            )
+        elif self.maintenance_runtime:
             where = (
                 f"on the runtime exposes[{self.maintains}].iceberg.maintenance.runtime names, as "
                 "its executionRoleArn, beside the writers of the table, which forge does not run"

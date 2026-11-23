@@ -4778,19 +4778,19 @@
     "sparkRuntime": {
       "type": "object",
       "additionalProperties": false,
-      "description": "NEW in v0.7.7 (preview): The EMR runtime that maintains an Iceberg table no forge build writes (exposes[].iceberg.maintenance.runtime, backend spark, in place of build), such as a table whose streams run on its team's own runner. Its keys are a build's parameters.spark keys, under the same operator lists (FLUID_SPARK_EXECUTION_ROLE_ALLOWLIST, FLUID_SPARK_TARGET_ALLOWLIST, FLUID_SPARK_CONF_ALLOWLIST). fluid apply uploads the runner and the maintenance job config under _fluid/spark/<product>/maintain_<expose>/ in the table's bucket, which the role must be able to read; forge provisions no runtime and no role for it. removeOrphanFiles then needs an explicit olderThan, longer than the writer's longest commit delay, which forge cannot see.",
+      "description": "NEW in v0.7.7 (preview): The runtime that maintains an Iceberg table no forge build writes (exposes[].iceberg.maintenance.runtime, backend spark, in place of build), such as a table whose streams run on its team's own runner: an EMR runtime, or forge's local runtime, which maintains a table in an Iceberg REST catalog on platform local. Its keys are a build's parameters.spark keys, under the same operator lists (FLUID_SPARK_EXECUTION_ROLE_ALLOWLIST, FLUID_SPARK_TARGET_ALLOWLIST, FLUID_SPARK_CONF_ALLOWLIST). fluid apply uploads the runner and the maintenance job config under _fluid/spark/<product>/maintain_<expose>/ in the table's bucket, which the role must be able to read; forge provisions no runtime and no role for it. removeOrphanFiles then needs an explicit olderThan, longer than the writer's longest commit delay, which forge cannot see.",
       "required": [
-        "runtime",
-        "executionRoleArn"
+        "runtime"
       ],
       "properties": {
         "runtime": {
           "enum": [
             "emr-serverless",
             "emr-ec2",
-            "emr-eks"
+            "emr-eks",
+            "local"
           ],
-          "description": "The EMR runtime the maintenance runs on: an existing EMR Serverless application (applicationId), a running EMR cluster (clusterId) or an EMR on EKS virtual cluster (virtualClusterId), whichever the team's own runner uses."
+          "description": "The runtime the maintenance runs on: an existing EMR Serverless application (applicationId), a running EMR cluster (clusterId) or an EMR on EKS virtual cluster (virtualClusterId), whichever the team's own runner uses; or local, forge's local Spark runtime (spark-submit on the machine fluid apply runs on) maintaining a table in an Iceberg REST catalog on binding.platform local, which takes no role and no target and ignores the AWS keys."
         },
         "applicationId": {
           "$ref": "#/$defs/sparkParameters/properties/applicationId"
@@ -4812,6 +4812,24 @@
         }
       },
       "allOf": [
+        {
+          "if": {
+            "properties": {
+              "runtime": {
+                "enum": [
+                  "emr-serverless",
+                  "emr-ec2",
+                  "emr-eks"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "executionRoleArn"
+            ]
+          }
+        },
         {
           "if": {
             "properties": {

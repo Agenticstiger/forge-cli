@@ -3,10 +3,10 @@
 
 """Schema pins for ``exposes[].iceberg.maintenance.runtime`` in 0.7.7 (``$defs.sparkRuntime``).
 
-The block names the EMR runtime that maintains a table no forge build writes, in place of
-``build``: one of ``emr-serverless``, ``emr-ec2`` or ``emr-eks``, its target, and the role the
-run executes as. ``build`` and ``runtime`` exclude each other, ``runtime: glue`` and ``local``
-are no runtime of it, and a contract with a writer build and no ``runtime`` stays valid.
+The block names the runtime that maintains a table no forge build writes, in place of
+``build``: one of ``emr-serverless``, ``emr-ec2`` or ``emr-eks`` with its target and the role
+the run executes as, or ``local`` with neither. ``build`` and ``runtime`` exclude each other, ``runtime: glue``
+is no runtime of it, and a contract with a writer build and no ``runtime`` stays valid.
 """
 
 from __future__ import annotations
@@ -105,11 +105,21 @@ def test_build_and_runtime_together_fail(manager) -> None:
     assert not result.is_valid
 
 
-@pytest.mark.parametrize("name", ["local", "glue", "emr-lambda"])
-def test_a_runtime_that_is_not_an_emr_one_fails(manager, name) -> None:
+@pytest.mark.parametrize("name", ["glue", "emr-lambda"])
+def test_a_runtime_that_is_not_a_listed_one_fails(manager, name) -> None:
     rt = runtime()
     rt["runtime"] = name
     assert not check(manager, contract(block(rt))).is_valid
+
+
+def test_local_needs_no_role_and_no_target(manager) -> None:
+    result = check(manager, contract(block({"runtime": "local"})))
+    assert result.is_valid, errors(result)
+
+
+def test_local_accepts_and_ignores_the_aws_keys(manager) -> None:
+    result = check(manager, contract(block(runtime(runtime="local"))))
+    assert result.is_valid, errors(result)
 
 
 def test_a_missing_execution_role_fails(manager) -> None:

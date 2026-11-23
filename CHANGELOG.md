@@ -23,7 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FLUID_SPARK_EXECUTION_ROLE_ALLOWLIST`, `FLUID_SPARK_TARGET_ALLOWLIST` and
   `FLUID_SPARK_CONF_ALLOWLIST`, as a build's `parameters.spark` does. Because forge cannot see
   that writer's commit delay, `removeOrphanFiles` there needs an explicit `olderThan`, and
-  `fluid validate` warns when it is under three days.
+  `fluid validate` warns when it is under three days. `runtime: local` maintains a table in an
+  Iceberg REST catalog on `binding.platform: local` with forge's local Spark runtime
+  (spark-submit on the machine `fluid apply` runs on): it takes no role and no target, ignores
+  the AWS keys as a local build does, and goes through the operator's local namespace list.
+  A location under `_fluid/` or `_checkpoints/` is refused, since forge keeps its own files
+  there.
 - **The plan binds each maintenance action on its own.** The `spark.maintain` action now lists
   each plugin action with its kind, the distribution and version that shipped it, and the
   sha256 of its statements (`actions[].statementsSha256`, never the SQL). When a plugin renders

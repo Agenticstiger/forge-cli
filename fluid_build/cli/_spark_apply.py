@@ -18,8 +18,9 @@ A backend-spark Iceberg table maintenance (``exposes[].iceberg.maintenance``) is
 ``spark.maintain`` action (:func:`planned_actions`), its job config deployed beside its writer
 build's, and run by ``fluid apply --mode maintain`` (:func:`maintain_only`): no ``tofu``, no
 plan, one run on the writer build's runtime with the config the last apply deployed. A table no
-forge build writes runs on the EMR runtime its ``runtime`` names, its job config and runner
-deployed in the table's bucket. The action lists each plugin action with the sha256 of its
+forge build writes runs on the runtime its ``runtime`` names (EMR, or ``local`` on this
+machine), its job config and runner deployed in the table's bucket (under the local root on
+``local``). The action lists each plugin action with the sha256 of its
 statements and the package that shipped it: :func:`prepare` names the action whose SQL changed
 (``apply_plan_digest_maintenance_actions_changed``) before it compares the rest.
 
@@ -111,7 +112,7 @@ def _has_spark(contract: Mapping[str, Any]) -> bool:
 
 
 def _has_spark_work(contract: Mapping[str, Any]) -> bool:
-    """A Spark build, or a table no forge build writes maintained on its own EMR runtime: the
+    """A Spark build, or a table no forge build writes maintained on a runtime of its own: the
     contracts whose plan lists Spark actions."""
     from fluid_build.maintenance.spec import declares_unwritten_maintenance
 
@@ -199,6 +200,9 @@ def maintenance_action_changes(
         current = now.get(str(action.get("id")))
         if current is None:
             continue  # the comparison of the whole action reports a table it no longer has
+        payload = action.get("payload")
+        if not isinstance(payload, Mapping) or "actions" not in payload:
+            continue  # a plan made before per-action binding: the generic compare refuses it
         before, after = _maintenance_actions(action), _maintenance_actions(current)
         expose = _shown(str(action.get("id")))
         for name in sorted(set(before) | set(after)):
@@ -418,7 +422,9 @@ def refuse_without_opentofu(contract: Mapping[str, Any], engine: str) -> None:
     except ValueError:
         remote = ["?"]  # a build that does not parse: refused here as before
     # A table no forge build writes: its maintenance job config and runner are OpenTofu's.
-    remote += [f"the maintenance of {eid}" for eid, _ in _maintenance_runtimes(contract)]
+    remote += [
+        f"the maintenance of {eid}" for eid, _ in _maintenance_runtimes(contract, remote_only=True)
+    ]
     if remote:
         raise _cli_error(
             "apply_spark_needs_opentofu",
@@ -678,9 +684,12 @@ def maintain_only(
             for line in _maintenance_steps(contract, run):
                 say(f"  {line}")
             continue
-        as_whom = (
-            f"as {run.role_arn}" if run.maintenance_runtime else f"as build {run.build}'s role"
-        )
+        if run.maintenance_runtime and run.local:
+            as_whom = "as this machine's user"
+        elif run.maintenance_runtime:
+            as_whom = f"as {run.role_arn}"
+        else:
+            as_whom = f"as build {run.build}'s role"
         if confirm is not None and not confirm(
             f"Start {run.maintains}'s maintenance on {run.runtime} {as_whom}? "
             "It may delete rows, snapshots and files"
@@ -714,6 +723,8 @@ def _runs_on(run: DesiredRun) -> str:
     target and role a table no forge build writes names."""
     if not run.maintenance_runtime:
         return f"build {run.build}, {run.runtime}"
+    if run.local:
+        return "local, on this machine, as this machine's user"
     target = ", ".join(f"{_TARGET_WORDS.get(k, k)} {v}" for k, v in sorted(run.target.items()))
     return f"{run.runtime} {target}, as {run.role_arn}"
 

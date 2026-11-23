@@ -21,8 +21,8 @@
 
 ``backend: spark`` runs it with forge's Spark runner, on the runtime and as the role of the
 ``engine: spark`` build that writes the table, while that build's stream keeps running. A table
-no forge build writes (its streams run on the team's own runner) names its own EMR runtime
-instead, with ``runtime`` in place of ``build``::
+no forge build writes (its streams run on the team's own runner) names its own runtime
+instead, with ``runtime`` in place of ``build``: an EMR one::
 
     maintenance:
       schedule: "0 3 * * *"
@@ -30,6 +30,14 @@ instead, with ``runtime`` in place of ``build``::
                 executionRoleArn: "arn:aws:iam::123456789012:role/orders-maintenance"}
       compaction: {}
       removeOrphanFiles: {olderThan: P7D}
+
+or forge's local runtime, which runs spark-submit on the machine ``fluid apply`` runs on and
+maintains a table in an Iceberg REST catalog on ``binding.platform: local`` (it takes no role and
+no target, and ignores the AWS keys)::
+
+    maintenance:
+      runtime: {runtime: local}
+      compaction: {}
 
 forge cannot see that writer's commit delay, so removing orphan files there needs an explicit
 ``olderThan`` (one under three days is warned about, :func:`maintenance_warnings`).
@@ -78,10 +86,13 @@ _BLOCK_KEYS = frozenset(
         *ACTION_KEYS,
     }
 )
-#: The runtimes a table no forge build writes may be maintained on: the EMR ones, each with a
-#: target the team already runs (Glue's one job is a build's, and a local run writes a REST
-#: catalog's table).
-RUNTIMES: Tuple[str, ...] = ("emr-serverless", "emr-ec2", "emr-eks")
+#: The EMR runtimes a table no forge build writes may be maintained on, each with a target the
+#: team already runs.
+EMR_RUNTIMES: Tuple[str, ...] = ("emr-serverless", "emr-ec2", "emr-eks")
+#: The runtimes a table no forge build writes may be maintained on: the EMR ones and forge's
+#: local runtime, which maintains a REST-catalog table on platform local (Glue's one job is a
+#: build's).
+RUNTIMES: Tuple[str, ...] = (*EMR_RUNTIMES, "local")
 #: The keys of ``runtime``: the ones of a build's ``parameters.spark`` that say where a run
 #: runs and as whom (``$defs/sparkRuntime``).
 _RUNTIME_KEYS = frozenset(
@@ -207,9 +218,10 @@ class TableMaintenance:
     #: The ``engine: spark`` build that writes the table (backend spark): its runtime and
     #: role run the maintenance.
     build_id: Optional[str] = None
-    #: The EMR runtime a table no forge build writes is maintained on (backend spark, in place
-    #: of ``build_id``): ``runtime``, its target, ``executionRoleArn``, and optionally
-    #: ``releaseLabel`` and ``sparkConf``, as a build's ``parameters.spark`` spells them.
+    #: The runtime a table no forge build writes is maintained on (backend spark, in place of
+    #: ``build_id``): ``runtime``, and on EMR its target and ``executionRoleArn`` and optionally
+    #: ``releaseLabel`` and ``sparkConf``, as a build's ``parameters.spark`` spells them. A
+    #: local runtime names no target and no role.
     runtime: Optional[Mapping[str, Any]] = field(default=None, hash=False)
     #: The role Glue's optimizers run as (backend glue).
     role_arn: Optional[str] = None
@@ -714,8 +726,11 @@ def runtime_findings(
     return [e.replace(head, at) for e in errors], [m.replace(head, at) for m in missing]
 
 
-def _read_runtime(raw: Any, eid: str, where: str, errors: List[str]) -> Optional[Dict[str, Any]]:
-    """A backend-spark block's ``runtime``, checked; None (with ``errors``) when it cannot run."""
+def _read_runtime(
+    contract: Mapping[str, Any], raw: Any, eid: str, where: str, errors: List[str]
+) -> Optional[Dict[str, Any]]:
+    """A backend-spark block's ``runtime``, checked; None (with ``errors``) when it cannot run.
+    The expose must be a table the runtime can maintain (:func:`_check_sink`)."""
     from fluid_build.build_runners.spark._desired import _placement
 
     at = f"{where}.runtime"
@@ -728,10 +743,22 @@ def _read_runtime(raw: Any, eid: str, where: str, errors: List[str]) -> Optional
     if runtime not in RUNTIMES:
         errors.append(
             f"{at}.runtime must be one of {', '.join(RUNTIMES)}: a table no forge build writes "
-            "is maintained on an EMR runtime its team runs (runtime local and glue are a "
-            "build's)"
+            "is maintained on an EMR runtime its team runs, or on forge's local runtime "
+            "(runtime glue is a build's)"
         )
         return None
+    if runtime == "local":
+        # As a local build: no role, no target; the AWS keys are accepted and ignored.
+        conf = raw.get("sparkConf")
+        if conf is not None and not isinstance(conf, Mapping):
+            errors.append(f"{at}.sparkConf must be a mapping of names to strings")
+        elif conf is not None and any(not isinstance(v, str) for v in conf.values()):
+            errors.append(f"{at}.sparkConf values must be strings")
+        else:
+            errors += runtime_findings(eid, raw)[0]
+        if len(errors) == before:
+            _check_sink(contract, eid, True, errors)
+        return dict(raw) if len(errors) == before else None
     if not isinstance(raw.get("executionRoleArn"), str) or not raw["executionRoleArn"]:
         errors.append(
             f"{at}.executionRoleArn is required: no forge build writes the table, so no "
@@ -756,7 +783,21 @@ def _read_runtime(raw: Any, eid: str, where: str, errors: List[str]) -> Optional
         errors.append(f"{at}.sparkConf values must be strings")
     else:
         errors += runtime_findings(eid, raw)[0]
+    if len(errors) == before:
+        _check_sink(contract, eid, False, errors)
     return dict(raw) if len(errors) == before else None
+
+
+def _check_sink(contract: Mapping[str, Any], eid: str, local: bool, errors: List[str]) -> None:
+    """The expose's format, catalog and location against the runtime, as the run's job config
+    compiles them (no operator gate): a Glue-catalog table for an EMR runtime, a REST-catalog
+    one on platform local for ``local``."""
+    from fluid_build.spark.compiler import maintenance_sink
+
+    try:
+        maintenance_sink(contract, eid, account_ref="<account>", local=local)
+    except ValueError as exc:
+        errors.append(str(exc))
 
 
 def _read_spark_placement(
@@ -782,7 +823,7 @@ def _read_spark_placement(
         if "build" in raw:
             errors.append(
                 f"{where}: name build (the engine: spark build that writes the table) or "
-                "runtime (the EMR runtime of a table no forge build writes), not both"
+                "runtime (the runtime of a table no forge build writes), not both"
             )
             return schedule, timezone, None, None
         writers = _writers(contract, eid)
@@ -794,7 +835,12 @@ def _read_spark_placement(
             )
             return schedule, timezone, None, None
         _check_maintenance_names(contract, eid, where, errors)
-        return schedule, timezone, None, _read_runtime(raw.get("runtime"), eid, where, errors)
+        return (
+            schedule,
+            timezone,
+            None,
+            _read_runtime(contract, raw.get("runtime"), eid, where, errors),
+        )
     writers = _writers(contract, eid)
     named = raw.get("build")
     if named is not None:
@@ -811,7 +857,7 @@ def _read_spark_placement(
             f"that writes {eid}, and "
             + (
                 "none does (properties.parameters.spark, outputs[0]); a table no forge build "
-                "writes names its EMR runtime with runtime"
+                "writes names its runtime with runtime"
                 if not writers
                 else f"{len(writers)} do; name one with build"
             )
@@ -951,7 +997,7 @@ def read_table(
             contract, raw, eid, where, errors
         )
         if "runtime" in raw:
-            _check_unwritten_table(raw, where, errors)
+            _check_unwritten_table(raw, expose, where, errors)
     else:
         role_arn, hours = _read_glue_placement(raw, expose, platform, where, errors)
         if "runEveryHours" in raw and expire is None and orphans is None:
@@ -980,10 +1026,25 @@ def read_table(
     )
 
 
-def _check_unwritten_table(raw: Mapping[str, Any], where: str, errors: List[str]) -> None:
+def _check_unwritten_table(
+    raw: Mapping[str, Any], expose: Mapping[str, Any], where: str, errors: List[str]
+) -> None:
     """What a table no forge build writes needs beyond a build's: forge cannot see its
     writer's commits, so removing orphan files there names its ``olderThan`` (no default).
-    Expiring snapshots keeps at least the last one on every table (``_read_expire``)."""
+    Expiring snapshots keeps at least the last one on every table (``_read_expire``). Its
+    location is never under the roots forge keeps its own files in (``_fluid/``, which holds
+    the runner and the job config, and ``_checkpoints/``)."""
+    from fluid_build.iac.providers.aws_ingest import _RESERVED_ROOTS
+
+    found = _object_location(expose)
+    if found is not None and found[1] and found[1][0] in _RESERVED_ROOTS:
+        errors.append(
+            f"exposes[{expose.get('exposeId')}].binding.location.path starts with "
+            f"{found[1][0]}/, a root forge keeps its own files in (the runner and the "
+            "maintenance job config sit under _fluid/, checkpoints under _checkpoints/), and "
+            "maintenance of a table there could rewrite or delete them; give the table a "
+            "path of its own"
+        )
     orphans = raw.get("removeOrphanFiles")
     if _enabled(orphans) and orphans.get("olderThan") is None:
         errors.append(
@@ -1031,9 +1092,16 @@ def read_maintenance(contract: Mapping[str, Any]) -> Tuple[List[TableMaintenance
     return tables, errors
 
 
-def declares_unwritten_maintenance(contract: Mapping[str, Any]) -> bool:
+def _runtime_name(runtime: Any) -> Any:
+    return runtime.get("runtime") if isinstance(runtime, Mapping) else None
+
+
+def declares_unwritten_maintenance(
+    contract: Mapping[str, Any], *, remote_only: bool = False
+) -> bool:
     """Whether a backend-spark ``iceberg.maintenance`` names a ``runtime``: a table no forge
-    build writes, maintained on its own EMR runtime (no validation)."""
+    build writes, maintained on a runtime of its own (no validation). ``remote_only`` leaves
+    out a local runtime, which OpenTofu has nothing to emit for."""
     for expose in contract.get("exposes") or []:
         iceberg = expose.get("iceberg") if isinstance(expose, Mapping) else None
         block = iceberg.get("maintenance") if isinstance(iceberg, Mapping) else None
@@ -1041,6 +1109,7 @@ def declares_unwritten_maintenance(contract: Mapping[str, Any]) -> bool:
             isinstance(block, Mapping)
             and block.get("backend", "spark") == "spark"
             and block.get("runtime") is not None
+            and not (remote_only and _runtime_name(block["runtime"]) == "local")
         ):
             return True
     return False
@@ -1085,6 +1154,7 @@ __all__ = [
     "DEFAULT_RETAIN_LAST",
     "ExpireSnapshots",
     "MIN_ORPHAN_SECONDS",
+    "EMR_RUNTIMES",
     "RUNTIMES",
     "RemoveOrphanFiles",
     "STRATEGIES",

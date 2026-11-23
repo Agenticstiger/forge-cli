@@ -1677,8 +1677,9 @@ _MAINTENANCE_RUNTIME_RUN = (
     "        " + " ".join(MAINTENANCE_APPLY_ARGS) + ' --expose-id "$EXPOSE_ID" --yes\n'
     "\n"
     "It runs no tofu apply. No forge build writes the table (BUILD_ID is empty): it\n"
-    "starts one run of forge's Spark runner on the EMR runtime the table's\n"
-    "exposes[].iceberg.maintenance.runtime names, as the role it names, with the\n"
+    "starts one run of forge's Spark runner on the runtime the table's\n"
+    "exposes[].iceberg.maintenance.runtime names (an EMR runtime as the role it\n"
+    "names, or forge's local runtime on the worker), with the\n"
     "maintenance job config the last fluid apply deployed. It refuses a config that\n"
     "differs from what the contract compiles to now: run fluid apply first. The\n"
     "table's own writers keep running. The run takes the steps the table declares: a\n"

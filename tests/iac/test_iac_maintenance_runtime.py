@@ -270,6 +270,22 @@ def test_unset_lists_refuse_emit(unwritten, monkeypatch, name) -> None:
         emit(unwritten)
 
 
+# --- the table's bucket reaches the caller policy ----------------------------------------
+
+
+@pytest.mark.parametrize("bucket", ["*", "a?b", "a$b", "A_B", "ab/../x"])
+def test_an_unusable_bucket_is_refused_before_anything_is_emitted(unwritten, bucket) -> None:
+    unwritten["exposes"][0]["binding"]["location"]["bucket"] = bucket
+    with pytest.raises(aws_ingest.UnsupportedBindingError, match="not a bucket name"):
+        emit(unwritten)
+
+
+def test_an_expose_the_runtime_cannot_maintain_is_an_unsupported_binding(unwritten) -> None:
+    unwritten["exposes"][0]["binding"]["format"] = "parquet"
+    with pytest.raises(aws_ingest.UnsupportedBindingError, match="iceberg"):
+        emit(unwritten)
+
+
 # --- a table a build writes is as it was -------------------------------------------------
 
 

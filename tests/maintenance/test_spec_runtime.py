@@ -142,12 +142,33 @@ def test_backend_glue_with_runtime_is_refused() -> None:
     assert has(errors, "runtime is backend spark's")
 
 
-@pytest.mark.parametrize("name", ["local", "glue", "emr-lambda", None])
-def test_a_runtime_that_is_not_an_emr_one_is_refused(name: Any) -> None:
+@pytest.mark.parametrize("name", ["glue", "emr-lambda", None])
+def test_a_runtime_that_is_not_a_listed_one_is_refused(name: Any) -> None:
     rt = runtime()
     rt["runtime"] = name
     _, errors = read(unwritten(unwritten_block(rt)))
-    assert has(errors, "runtime.runtime must be one of emr-serverless, emr-ec2, emr-eks")
+    assert has(errors, "runtime.runtime must be one of emr-serverless, emr-ec2, emr-eks, local")
+
+
+def test_a_local_runtime_needs_no_role_and_no_target() -> None:
+    _, errors = read(unwritten(unwritten_block({"runtime": "local"})))
+    # the block reads clean; the sink check (a REST table on platform local) is the compile's
+    assert not has(errors, "executionRoleArn") and not has(errors, "applicationId")
+
+
+@pytest.mark.parametrize("root", ["_fluid", "_checkpoints"])
+def test_a_location_under_a_forge_root_is_refused(root: str) -> None:
+    contract = unwritten()
+    contract["exposes"][0]["binding"]["location"]["path"] = f"{root}/spark/x"
+    _, errors = read(contract)
+    assert has(errors, "binding.location.path", f"{root}/", "forge keeps its own files")
+
+
+def test_a_location_beside_a_forge_root_is_not_refused() -> None:
+    contract = unwritten()
+    contract["exposes"][0]["binding"]["location"]["path"] = "_fluidx/orders"
+    _, errors = read(contract)
+    assert not has(errors, "forge keeps its own files")
 
 
 def test_a_runtime_that_is_not_a_mapping_is_refused() -> None:
@@ -292,3 +313,55 @@ def test_runtime_findings_are_clean_when_the_operator_lists_them(monkeypatch) ->
     monkeypatch.setenv("FLUID_SPARK_EXECUTION_ROLE_ALLOWLIST", ROLE)
     monkeypatch.setenv("FLUID_SPARK_TARGET_ALLOWLIST", f"emr-serverless:{APP}")
     assert runtime_findings(EXPOSE, runtime()) == ([], [])
+
+
+def _on(binding: Dict[str, Any], rt: Dict[str, Any]) -> List[str]:
+    contract = unwritten(unwritten_block(rt))
+    contract["exposes"][0]["binding"] = binding
+    return read(contract)[1]
+
+
+def test_an_emr_runtime_on_a_rest_catalog_expose_is_refused() -> None:
+    errors = _on(
+        {
+            "platform": "aws",
+            "format": "iceberg",
+            "location": {
+                "catalog": "rest",
+                "uri": "http://rest.example:8181",
+                "database": "commerce",
+                "table": "order_lines",
+            },
+        },
+        runtime(),
+    )
+    assert has(errors, "Glue-catalog Iceberg tables")
+
+
+def test_an_emr_runtime_on_a_platform_local_expose_is_refused() -> None:
+    errors = _on(
+        {
+            "platform": "local",
+            "format": "iceberg",
+            "location": {"catalog": "lakekeeper", "database": "commerce", "table": "order_lines"},
+        },
+        runtime(),
+    )
+    assert has(errors, "Glue-catalog Iceberg tables")
+
+
+def test_a_local_runtime_on_a_glue_expose_is_refused() -> None:
+    errors = read(unwritten(unwritten_block({"runtime": "local"})))[1]
+    assert has(errors, "runtime local writes a table in an Iceberg REST catalog")
+
+
+def test_a_local_runtime_on_a_lakekeeper_expose_reads_clean() -> None:
+    errors = _on(
+        {
+            "platform": "local",
+            "format": "iceberg",
+            "location": {"catalog": "lakekeeper", "database": "commerce", "table": "order_lines"},
+        },
+        {"runtime": "local"},
+    )
+    assert errors == []

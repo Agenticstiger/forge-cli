@@ -783,16 +783,26 @@ def _rest_sink(resolved: Any, database: str, table: str, fields: Any) -> dict[st
 
 
 def maintenance_sink(
-    contract: Mapping[str, Any], expose_id: str, *, account_ref: str = ""
+    contract: Mapping[str, Any],
+    expose_id: str,
+    *,
+    account_ref: str = "",
+    local: bool = False,
+    host_gate: bool = False,
+    environ: Optional[Mapping[str, str]] = None,
 ) -> dict[str, Any]:
     """The ``sink`` of a maintenance job config for an Iceberg expose no forge build writes
     (``iceberg.maintenance.runtime``): the table as a build that wrote it would name it, from
-    the expose's binding alone (a Glue-catalog table on an AWS runtime), with no ``create``:
-    maintenance never creates a table.
+    the expose's binding alone (a Glue-catalog table on an AWS runtime, a table in an Iceberg
+    REST catalog on platform local for ``local``), with no ``create``: maintenance never
+    creates a table. ``host_gate`` applies the operator's namespace list to a local run, as a
+    local build's compile does (:data:`LOCAL_NAMESPACE_ALLOWLIST_ENV`).
 
     Raises:
-        ValueError: the expose is not one Glue-catalog Iceberg table with one database and
-            table, or names no bucket and no ``account_ref`` was given.
+        ValueError: the expose is not one Iceberg table of the catalog the runtime reads with
+            one database and table, or names no bucket and no ``account_ref`` was given.
+        SparkPolicyError: ``host_gate`` is on and the operator lists the namespace of a local
+            run's table no.
     """
     where = f"exposes[{expose_id}].iceberg.maintenance.runtime"
     targets = [
@@ -806,18 +816,31 @@ def maintenance_sink(
     if binding.get("format") != "iceberg":
         raise ValueError(f"{where}: the expose's binding.format must be iceberg")
     loc = _object(binding.get("location"), f"exposes[{expose_id}].binding.location")
-    if bucket_uses_fallback(loc) and not account_ref:
+    if not local and bucket_uses_fallback(loc) and not account_ref:
         raise ValueError(
             f"{where}: the expose names no bucket, so its warehouse is the account's "
             "<account>-fluid-data bucket; pass the account"
         )
     resolved = resolve_iceberg_catalog(binding, account_ref=account_ref)
-    _check_catalog(False, binding, catalog_kind_info(resolved.kind).family, where)
+    _check_catalog(local, binding, catalog_kind_info(resolved.kind).family, where)
     parts = resolved.fq_table.split(".")
     if len(parts) != 2 or "None" in parts:
         raise ValueError(f"{where}: the expose needs one database and table")
     database, table = (validate_ident(p) for p in parts)
-    return _sink(False, resolved, database, table, ())
+    sink = _sink(local, resolved, database, table, ())
+    if local:
+        sink.pop("create", None)
+        if host_gate:
+            from fluid_build.spark import names as _names
+
+            _refuse_unless_namespace_listed(
+                _names.maintenance_build(expose_id),
+                local_namespace_scope(resolved),
+                database,
+                [f"{database}.{table}"],
+                environ,
+            )
+    return sink
 
 
 def compile_job_config(

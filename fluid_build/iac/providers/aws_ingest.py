@@ -210,7 +210,8 @@ def spark_blocks(contract: Mapping[str, Any], cid: str) -> SparkBlocks:
     ]
     # A table no forge build writes, maintained on its own EMR runtime: its job config and the
     # runner are uploaded, and the scheduler may start its runs (_emit_unwritten_maintenance).
-    unwritten = declares_unwritten_maintenance(contract)
+    # One maintained on the local runtime has nothing on AWS.
+    unwritten = declares_unwritten_maintenance(contract, remote_only=True)
     if not builds and not unwritten:
         return blocks
     account_marker, brokers_marker = _markers(contract)
@@ -876,8 +877,8 @@ def _emit_unwritten_maintenance(
     runner_sha = names.runner_sha256(runner)
     runs: List[aws_identity.CallerRun] = []
     for tm in tables:
-        if tm.backend != "spark" or tm.runtime is None:
-            continue
+        if tm.backend != "spark" or tm.runtime is None or tm.runtime["runtime"] == "local":
+            continue  # a local run has nothing for OpenTofu: forge's local runtime publishes it
         aws_identity.refuse_unless_maintenance_runtime_allowed(tm.expose_id, tm.runtime)
         bid = names.maintenance_build(tm.expose_id)
         key = safe_ident(f"{ctx.cid}_{bid}_spark")
@@ -892,12 +893,31 @@ def _emit_unwritten_maintenance(
         expose = exposes[tm.expose_id]
         loc = (expose.get("binding") or {}).get("location") or {}
         bucket, _ = _warehouse.normalize_location(loc, account_ref=ctx.account_marker)
+        if not _BUCKET.fullmatch(bucket):  # it reaches the caller policy's S3 and KMS scope
+            raise UnsupportedBindingError(
+                "spark-role-scope",
+                f"exposes[{tm.expose_id}].binding.location.bucket ({ctx.shown(bucket)!r}) is "
+                "not a bucket name, and the scheduler's policy would grant s3:GetObject on "
+                "what it names: a wildcard or a policy variable would reach other buckets.",
+                (
+                    "Set binding.location.bucket to the table's bucket (lower-case letters, "
+                    "digits, '.' and '-').",
+                ),
+            )
         bucket_ref = _bucket_ref(contract, expose, loc, bucket, ctx)
+        try:
+            sink = maintenance_sink(contract, tm.expose_id, account_ref=ctx.account_marker)
+        except ValueError as exc:
+            raise UnsupportedBindingError(
+                "iceberg-maintenance",
+                f"{exc}.",
+                ("Fix the field the message names; fluid validate reports the same.",),
+            ) from None
         base = {
             "configVersion": CONFIG_VERSION,
             "product": ctx.product,
             "build": bid,
-            "sink": maintenance_sink(contract, tm.expose_id, account_ref=ctx.account_marker),
+            "sink": sink,
         }
         try:
             statements = action_statements(tm, table_name(base))

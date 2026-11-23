@@ -15,7 +15,10 @@ A table no forge build writes (``iceberg.maintenance.runtime``: its streams run 
 runner) gets its run from that block instead (:func:`_unwritten_run`): the EMR runtime, target
 and role it names, its job config compiled from the expose's binding, and its artifacts in the
 table's bucket under ``spark.names.maintenance_build``. The operator's role, target and Spark
-setting lists apply to it as to a build's ``parameters.spark``.
+setting lists apply to it as to a build's ``parameters.spark``. A ``runtime: local`` block runs
+spark-submit on the machine ``fluid apply`` runs on against a table in an Iceberg REST catalog
+on platform local, as a local build's run does: no role, no target, its artifacts under the
+local root, and the operator's namespace list applies.
 """
 
 from __future__ import annotations
@@ -162,9 +165,10 @@ def _unwritten_run(
     stamps: Optional[Mapping[str, str]],
     load: Any,
 ) -> DesiredRun:
-    """The maintenance run of a table no forge build writes, on the EMR runtime its
-    ``runtime`` names: the job config holds the table as the expose binds it (a Glue-catalog
-    table), the runner and the config sit in the table's bucket under the name the run goes by
+    """The maintenance run of a table no forge build writes, on the runtime its ``runtime``
+    names: the job config holds the table as the expose binds it (a Glue-catalog table, or a
+    REST-catalog one on ``local``), the runner and the config sit in the table's bucket (under
+    the local root on ``local``) under the name the run goes by
     (``spark.names.maintenance_build``), and the role and target are the block's own, checked
     against the operator's lists when ``policy`` is on (apply and ``--mode maintain``).
 
@@ -180,6 +184,7 @@ def _unwritten_run(
 
     cfg: Dict[str, Any] = dict(tm.runtime)
     runtime = str(cfg["runtime"])
+    local = runtime == "local"
     where = f"exposes[{tm.expose_id}].iceberg.maintenance.runtime"
     if policy:
         refuse_unless_maintenance_runtime_allowed(tm.expose_id, cfg, env)
@@ -191,15 +196,24 @@ def _unwritten_run(
         "configVersion": CONFIG_VERSION,
         "product": product,
         "build": bid,
-        "sink": maintenance_sink(contract, tm.expose_id, account_ref=ACCOUNT_TOKEN),
+        "sink": maintenance_sink(
+            contract,
+            tm.expose_id,
+            account_ref=ACCOUNT_TOKEN,
+            local=local,
+            host_gate=policy,
+            environ=env,
+        ),
     }
     actions = compiled_actions(tm, table_name(base), load=load)
     job = SparkJob(maintenance_config(tm, base, [(a.name, a.statements) for a in actions]))
     spark_conf = _submit_conf(runtime, job.config, cfg.get("sparkConf") or {}, where, env, policy)
-    release = str(cfg.get("releaseLabel") or _names.default_release(runtime))
+    release = None if local else str(cfg.get("releaseLabel") or _names.default_release(runtime))
     runner_sha = _sha(runner_source())
-    bucket, _ = normalize_location(loc, account_ref=ACCOUNT_TOKEN)
-    root = f"s3://{bucket}"
+    if local:  # a local run reads its artifacts where the operator keeps them
+        root = LOCAL_ROOT_TOKEN
+    else:
+        root = f"s3://{normalize_location(loc, account_ref=ACCOUNT_TOKEN)[0]}"
     settings: Dict[str, Any] = {
         "runtime": runtime,
         "maintains": tm.expose_id,

@@ -471,9 +471,13 @@ def refuse_unless_maintenance_runtime_allowed(
     )
 
 
-def _maintenance_runtimes(contract: Mapping[str, Any]) -> List[Tuple[str, Mapping[str, Any]]]:
+def _maintenance_runtimes(
+    contract: Mapping[str, Any], *, remote_only: bool = False
+) -> List[Tuple[str, Mapping[str, Any]]]:
     """``(expose id, runtime)`` of each table no forge build writes whose maintenance names an
-    EMR runtime (read without the rest of the block's checks, which ``fluid validate`` runs)."""
+    EMR runtime or forge's local one (read without the rest of the block's checks, which
+    ``fluid validate`` runs). ``remote_only`` leaves out the local ones: nothing is provisioned
+    for them and the native engine runs them."""
     out: List[Tuple[str, Mapping[str, Any]]] = []
     for expose in contract.get("exposes") or []:
         iceberg = expose.get("iceberg") if isinstance(expose, Mapping) else None
@@ -485,6 +489,7 @@ def _maintenance_runtimes(contract: Mapping[str, Any]) -> List[Tuple[str, Mappin
             "emr-serverless",
             "emr-ec2",
             "emr-eks",
+            *(() if remote_only else ("local",)),
         ):
             out.append((str(expose.get("exposeId")), runtime))
     return out
