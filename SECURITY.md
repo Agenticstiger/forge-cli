@@ -66,7 +66,7 @@ FLUID Forge includes several built-in security measures:
 
 | Entry-point group | Where it hooks | What plugins do |
 |---|---|---|
-| `fluid_build.commands` | `cli/bootstrap.py` | Register additional `fluid <name>` subcommands. |
+| `fluid_build.commands` | `cli/bootstrap.py` | Register additional `fluid <name>` subcommands (new names only: a core command's name is refused). |
 | `fluid_build.extension_validators` | `cli/validate.py` | Validate sub-keys of `contract.extensions`. |
 | `fluid_build.apply_hooks` | `cli/apply.py` | Apply-time invariant checks (e.g. scaffold bundle digest drift). |
 

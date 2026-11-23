@@ -14,8 +14,9 @@ value the schema accepts but no real contract ships:
   invented address from a real one; these are the shapes nobody reads.
 * ``contract_template_residue``: a value only the starter template writes
   (``fluid forge --template starter``): ``starter-product``, ``starter_table``,
-  ``SELECT 1 AS id``, the ``data-team`` owner. The agent eval grades the same
-  strings (``tests/agent_evals/harness.py::TEMPLATE_RESIDUE``).
+  ``SELECT 1 AS id``, the ``data-team`` owner (read at ``metadata.owner.team`` only:
+  elsewhere it is an ordinary channel, tag or label). The agent eval grades the
+  same strings (``tests/agent_evals/harness.py::TEMPLATE_RESIDUE``).
 * ``contract_placeholder_value``: TODO, FIXME, TBD, CHANGEME, or a ``<...>``
   stand-in such as ``<your-team>``.
 * ``contract_sdp_joins``: a build of an SDP (Bronze) product that joins. An SDP
@@ -43,7 +44,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
-from typing import Any, Iterator, List, Mapping, Optional, Tuple
+from typing import Any, FrozenSet, Iterator, List, Mapping, Optional, Tuple
 
 from fluid_build._validation_issues import dotted, json_pointer
 from fluid_build._validation_issues import nearest_key as _key
@@ -248,13 +249,22 @@ _RESIDUE_TOKENS = (
 )
 #: Each token on its own, not as part of a longer name (``select 1 as identifier``).
 _RESIDUE_TOKEN_RE = {t: rf"(?<![\w-]){re.escape(t)}(?![\w-])" for t in _RESIDUE_TOKENS}
-#: Residue only as a whole value: a real team's name may contain the word.
-_RESIDUE_VALUES = frozenset({"data-team"})
+#: Residue only as a whole value, and only at the exact path a starter writes it: a real team's
+#: name may contain the word, and ``data-team`` is an ordinary channel, tag or label anywhere
+#: else (``channel: data-team`` in an alert route's options). Every starter writes it as the
+#: owner's team (``build_minimal_contract`` for ``--blank`` and guided mode, ``_v073_builder``
+#: for ``--template``, ``fluid init``'s scan, the data-model emitter), so one path is enough:
+#: the rule names fields, as Helm's ``required`` does, and does not scan every string.
+_RESIDUE_VALUES: Mapping[Path, FrozenSet[str]] = {
+    ("metadata", "owner", "team"): frozenset({"data-team"}),
+}
 
 
-def _residue_token(value: str) -> Optional[str]:
+def _residue_token(value: str, parts: Path = ()) -> Optional[str]:
+    """The starter text ``value`` still holds, or ``None``. The long tokens match in any
+    string; a value in :data:`_RESIDUE_VALUES` matches only at its path ``parts``."""
     text = re.sub(r"\s+", " ", value.strip().lower())
-    if text in _RESIDUE_VALUES:
+    if text in _RESIDUE_VALUES.get(parts, frozenset()):
         return text
     return next((t for t in _RESIDUE_TOKENS if re.search(_RESIDUE_TOKEN_RE[t], text)), None)
 
@@ -268,7 +278,10 @@ def _residue_fix(parts: Path, contract: Mapping[str, Any]) -> str:
     if parts == ("id",):
         domain, name = contract.get("domain"), contract.get("name")
         if isinstance(domain, str) and isinstance(name, str):
-            if _residue_token(domain) is None and _residue_token(name) is None:
+            if (
+                _residue_token(domain, ("domain",)) is None
+                and _residue_token(name, ("name",)) is None
+            ):
                 if _slug(domain) and _slug(name):
                     example = f"{_slug(domain)}.{_slug(name)}"
                     return f"Write the product's own id, <domain>.<name>: {example}."
@@ -291,7 +304,7 @@ def _residue_fix(parts: Path, contract: Mapping[str, Any]) -> str:
 def _template_residue(contract: Mapping[str, Any]) -> Iterator[LintFinding]:
     reported_semantics = set()
     for parts, value in _strings(contract):
-        token = _residue_token(value)
+        token = _residue_token(value, parts)
         if token is None:
             continue
         if "semantics" in parts:

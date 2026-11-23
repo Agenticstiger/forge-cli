@@ -310,13 +310,23 @@ def test_a_starter_template_value_is_a_warning_at_its_place(
     assert issue["fix"] and issue["fix"] in issue["message"]
 
 
-def test_the_starter_id_fix_is_a_valid_id_whatever_the_name(run) -> None:
-    contract = _contract(id="starter-product.x", name="Sales Orders Raw", domain="Sales Ops")
+@pytest.mark.parametrize(
+    ("name", "domain", "fix"),
+    [
+        ("Sales Orders Raw", "Sales Ops", "sales_ops.sales_orders_raw"),
+        # ``data-team`` is residue as the owner's team only: as a domain it is a name like another
+        ("Orders", "data-team", "data_team.orders"),
+    ],
+)
+def test_the_starter_id_fix_is_a_valid_id_whatever_the_name(
+    run, name: str, domain: str, fix: str
+) -> None:
+    contract = _contract(id="starter-product.x", name=name, domain=domain)
 
     _, doc = _json(run, contract)
 
     [issue] = _issues(doc, "ERR_CONTRACT_TEMPLATE_RESIDUE")
-    assert issue["fix"].endswith(": sales_ops.sales_orders_raw.")
+    assert issue["fix"].endswith(f": {fix}.")
 
 
 def test_a_mailto_placeholder_is_flagged() -> None:
@@ -674,6 +684,48 @@ def test_residue_is_reported_whatever_else_the_value_holds() -> None:
     contract = _contract(description="starter-product, contact test@example.com")
 
     assert [f.pointer for f in _lint(contract, "contract_template_residue")] == ["/description"]
+
+
+def test_data_team_is_residue_only_as_the_owners_team() -> None:
+    """The starter writes ``data-team`` as the owner's team. As an alert route's option, a tag
+    or a label it is an ordinary name: the rule reads that field, not every string."""
+    contract = _contract(
+        alerts={
+            "routes": [
+                {"name": "page", "kind": "teams", "options": {"channel": "data-team"}},
+            ]
+        },
+        exposes=[{"tags": ["data-team"]}],
+        labels={"team": "data-team"},
+        metadata={"owner": {"team": "payments", "slack": "data-team"}},
+    )
+
+    assert not _lint(contract, "contract_template_residue")
+
+
+@pytest.mark.parametrize("spelling", ["data-team", "Data-Team", "  data-team "])
+def test_data_team_as_the_owners_team_is_still_residue_with_its_fix(spelling: str) -> None:
+    contract = _contract(metadata={"owner": {"team": spelling}})
+
+    [finding] = _lint(contract, "contract_template_residue")
+
+    assert finding.pointer == "/metadata/owner/team"
+    assert "still holds the starter template's 'data-team'" in finding.message
+    assert finding.fix == "Write the owning team's real name, never a guess."
+
+
+def test_a_distinctive_starter_token_is_residue_wherever_it_sits() -> None:
+    contract = _contract(
+        alerts={
+            "routes": [
+                {"name": "page", "kind": "teams", "options": {"channel": "starter-product"}},
+            ]
+        },
+    )
+
+    assert [f.pointer for f in _lint(contract, "contract_template_residue")] == [
+        "/alerts/routes/0/options/channel"
+    ]
 
 
 @pytest.mark.parametrize(
