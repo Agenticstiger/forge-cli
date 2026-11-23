@@ -138,7 +138,12 @@ column of a counted relationship). A listed fact, a rule of the contract's
 invariants, is measured on the table's records as the share of the rows it covers
 that satisfy it: two counts (the rows that do not, the rows that do) that pass the
 checks as cells do, and either withheld withholds both (format 1-2-0, the
-invariants section); a rule over an aggregate, a dependency or a related row is
+invariants section). The facts of one table are also checked together, on exact
+counts: a fact whose counts, with the other facts' and the row count, would give
+back fewer than minimumCell rows, or where zeros are disclosive an empty
+combination the rules' texts do not rule out, is withheld too (D in the report).
+Rules that share too many parts to be read are taken to rule nothing out, which
+withholds more. A rule over an aggregate, a dependency or a related row is
 not measured, and the report says why. A boolean
 column is asked only its counts by `fluxsim init`, so it gets no level
 histogram this way.
@@ -265,7 +270,9 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         help=(
             "a FLUX profile request `fluxsim init --contract` wrote: measure what it lists "
             "and nothing else, under the same output checks (not with --bundle, --env or "
-            "--expose: the request names the tables, and its grid is the profile's)"
+            "--expose: the request names the tables, and its grid is the profile's); the "
+            "facts of one table are also checked together, and rules that share too many "
+            "parts to be read rule nothing out, which withholds more"
         ),
     )
     p.add_argument("--env", help="environment overlay to apply to the contract first")

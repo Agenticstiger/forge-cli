@@ -216,9 +216,14 @@ _PROVIDERS_CMD_PROBE = (
 
 
 # ``fluid profile --help`` end to end: the command module only, no profiler part,
-# no DuckDB, no statistic registry. Measured 311 modules on 3.12 (2026-11-16);
-# ceiling = measured + 5%, rounded up.
-MAX_PROFILE_HELP_MODULES = 327
+# no DuckDB, no statistic registry. Measured 317 modules on 3.12 (2026-11-23; 310 on
+# 3.10, 314 on 3.13, 320 on 3.14), 16 above the 301 of ``build_parser()``: the command
+# module and its release helper, which import the standard library only; what
+# ``main()`` loads before it parses, the ship token and the credential store's dotenv
+# switch, which must run first; and the help renderer's emoji and cell width tables.
+# None of them can wait. One environment with more packages installed measures 327,
+# so the ceiling is one above that.
+MAX_PROFILE_HELP_MODULES = 328
 FORBIDDEN_ON_PROFILE_HELP = (
     "duckdb",
     "rfc8785",
@@ -304,6 +309,35 @@ def test_fluid_providers_command_stays_light(capsys):
     ), f"`fluid providers` imports {count} modules (budget {MAX_PROVIDERS_CMD_MODULES})."
 
 
+def _loaded_module_names(code):
+    """Names of every module a cold subprocess holds after running ``code``."""
+    out = subprocess.run(
+        [sys.executable, "-c", code + ";print('\\n'.join(sorted(sys.modules)))"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=_clean_env(),
+        timeout=120,
+    ).stdout.splitlines()
+    return set(out[2:])
+
+
+def _profile_help_overage():
+    """Summarise what ``fluid profile --help`` imports beyond ``fluid --help``."""
+    try:
+        extra = _loaded_module_names(_PROFILE_HELP_PROBE) - _loaded_module_names(
+            _BUILD_PARSER_PROBE
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"the modules beyond `fluid --help` could not be listed ({type(exc).__name__})"
+    by_package = {}
+    for name in extra:
+        by_package.setdefault(name.split(".")[0], []).append(name)
+    top = sorted(by_package.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:15]
+    lines = [f"  {pkg}: {len(names)} ({', '.join(sorted(names)[:3])})" for pkg, names in top]
+    return f"{len(extra)} modules beyond `fluid --help`, by top-level package:\n" + "\n".join(lines)
+
+
 def test_fluid_profile_help_stays_light(capsys):
     """``fluid profile --help`` loads neither DuckDB nor the profiler's parts."""
     count, loaded = _probe_discovery(_PROFILE_HELP_PROBE)
@@ -313,9 +347,10 @@ def test_fluid_profile_help_stays_light(capsys):
             f"(budget {MAX_PROFILE_HELP_MODULES})"
         )
     assert not loaded, f"`fluid profile --help` loaded {sorted(loaded)}"
-    assert (
-        count < MAX_PROFILE_HELP_MODULES
-    ), f"`fluid profile --help` imports {count} modules (budget {MAX_PROFILE_HELP_MODULES})."
+    assert count < MAX_PROFILE_HELP_MODULES, (
+        f"`fluid profile --help` imports {count} modules (budget {MAX_PROFILE_HELP_MODULES}); "
+        + _profile_help_overage()
+    )
 
 
 def test_heavy_sdks_not_loaded_on_help():
