@@ -318,9 +318,34 @@ def _emit(text: str, *, stderr: bool = False) -> None:
         cprint_json(text)
 
 
+#: How a report of ``--check`` begins, in each format (and an error in each): the only kind of
+#: existing file ``--out-report`` replaces, besides an empty one.
+_REPORT_STARTS = ('{\n  "schema": ', "Import drift check:", "::error ", "::warning ", "╭", "\x1b[")
+
+
+def _is_an_earlier_report(path: Path) -> bool:
+    """Whether the regular file at ``path`` is empty or begins as a report of ``--check`` does,
+    so the second run of a pipeline replaces the first run's report and nothing else (not a
+    contract, the conventions, or a source file named by mistake)."""
+    try:
+        fd = os.open(
+            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        )
+    except OSError:
+        return False
+    try:
+        head = os.read(fd, 64).decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return head == "" or head.startswith(_REPORT_STARTS)
+
+
 def _write_report(path_arg: str, text: str, *, protected: List[Path]) -> None:
-    """``--out-report``: the report as printed, in a file. The one file ``--check`` writes, and
-    never a contract it reads, a link, a directory or a device."""
+    """``--out-report``: the report as printed, in a file. The one file ``--check`` writes. It
+    replaces a file only when that is an earlier report, and never writes through a link, into a
+    directory or over a device."""
     path = Path(path_arg)
     shown = clean_chars(path_arg)
     if any(path.resolve() == other.resolve() for other in protected):
@@ -336,6 +361,14 @@ def _write_report(path_arg: str, text: str, *, protected: List[Path]) -> None:
             f"cannot write the report to {shown}",
             "It is a link, a directory or a device, or a folder above it cannot be entered; "
             "none is written through.",
+            "Choose another path for the report.",
+            flag="--out-report",
+        )
+    if state == "overwrite" and not _is_an_earlier_report(path):
+        raise _flag_refusal(
+            f"--out-report {shown} is a file that is not a report of this check",
+            "A contract, the conventions or a source file named by mistake would be replaced. "
+            "Only an empty file or an earlier report is.",
             "Choose another path for the report.",
             flag="--out-report",
         )
@@ -363,7 +396,7 @@ def run_import_check(
         _check_mode_flags(args, tool)
         report = _drift_report(args, tool or "", _require_source(tool or "", source), paths)
         text = _drift.render(report, fmt)
-        if out_report:  # first: a path that cannot be written is the one thing said, once
+        if out_report is not None:  # first: a path that cannot be written is said once
             _write_report(out_report, text, protected=paths)
         _emit(text)
         return report.exit_code
@@ -374,7 +407,7 @@ def run_import_check(
         color = sys.stderr.isatty() and not getattr(args, "no_color", False)
         text, to_stderr = _drift.render_error(refused, fmt, color=color)
         _emit(text, stderr=to_stderr)
-        if out_report:
+        if out_report is not None:
             try:
                 _write_report(out_report, text, protected=paths)
             except Exception:  # noqa: BLE001 - the refusal above is the one to act on

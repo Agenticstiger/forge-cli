@@ -128,45 +128,32 @@ _PRIMARY_OUTPUT: Dict[str, str] = {
 }
 
 
-def _add_import_drift_arguments(p: argparse.ArgumentParser) -> None:
-    """The ``--import-*`` flags of ``--add import-drift``: the options of the import that wrote
-    the contracts the gate checks."""
-    p.add_argument(
+#: The ``--import-*`` flags of ``--add import-drift``, with what each takes: the options of the
+#: import that wrote the contracts the gate checks.
+_IMPORT_FLAG_SPECS: Tuple[Tuple[str, Dict[str, Any]], ...] = (
+    (
         "--import-tool",
-        choices=list(IMPORT_TOOLS),
-        default=None,
-        help="With --add import-drift: the importer whose contracts are checked.",
-    )
-    p.add_argument(
+        {"choices": list(IMPORT_TOOLS), "help": "the importer whose contracts are checked"},
+    ),
+    (
         "--import-source",
-        default=None,
-        metavar="DIR",
-        help="With --add import-drift: the directory the import reads (DAGs or jobs).",
-    )
-    p.add_argument(
-        "--import-out",
-        default=None,
-        metavar="PATH",
-        help="With --add import-drift: where the import wrote its contracts (--out).",
-    )
-    p.add_argument(
+        {"metavar": "DIR", "help": "the directory the import reads (DAGs or jobs)"},
+    ),
+    ("--import-out", {"metavar": "PATH", "help": "where the import wrote its contracts (--out)"}),
+    (
         "--import-split-by",
-        choices=list(IMPORT_SPLIT_BY),
-        default=None,
-        help="With --add import-drift: the product boundary the import used (--split-by).",
-    )
-    p.add_argument(
-        "--import-conventions",
-        default=None,
-        metavar="FILE",
-        help="With --add import-drift: the conventions file the import used.",
-    )
-    p.add_argument(
-        "--import-dags",
-        default=None,
-        metavar="DIR",
-        help="With --add import-drift and --import-tool pyspark: the DAGs directory.",
-    )
+        {"choices": list(IMPORT_SPLIT_BY), "help": "the product boundary it used (--split-by)"},
+    ),
+    ("--import-conventions", {"metavar": "FILE", "help": "the conventions file it used"}),
+    ("--import-dags", {"metavar": "DIR", "help": "the DAGs directory (pyspark only)"}),
+)
+
+
+def _add_import_drift_arguments(p: argparse.ArgumentParser) -> None:
+    for flag, spec in _IMPORT_FLAG_SPECS:
+        p.add_argument(
+            flag, default=None, **{**spec, "help": f"With --add import-drift: {spec['help']}."}
+        )
 
 
 def register_subcommand(subparsers: argparse._SubParsersAction):

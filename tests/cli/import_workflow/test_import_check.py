@@ -670,6 +670,37 @@ def test_a_refusal_is_kept_in_the_report_file_too(project):
     assert json.loads((project / "refusal.json").read_text("utf-8"))["status"] == "error"
 
 
+def test_out_report_replaces_an_earlier_report_and_nothing_else(project, capsys):
+    written()
+    sub(project / "dags/orders_daily.py", "0 2 * * *", "0 3 * * *")
+    refused = {
+        "conventions.yaml": "not a report of this check",
+        "jobs/clean_orders.py": "not a report of this check",
+        str(ORDERS_DAILY): "is a contract this check reads",
+        "dags": "cannot write the report",
+    }
+    for target, said in refused.items():
+        before = snapshot(project)
+        capsys.readouterr()
+        assert check("--out-report", target) == 2, target
+        assert said in capsys.readouterr().err, target
+        assert snapshot(project) == before, target
+    # an empty file, a report of any format, and a refusal that was kept are all replaced
+    (project / "report.out").write_text("", encoding="utf-8")
+    for fmt in ("json", "text", "github", "json"):
+        assert check("--format", fmt, "--out-report", "report.out") == 1
+    assert json.loads((project / "report.out").read_text("utf-8"))["status"] == "drift"
+    (project / "report.out").write_text("::error title=import check::kept\n", encoding="utf-8")
+    assert check("--out-report", "report.out") == 1
+
+
+def test_an_empty_out_report_is_refused_not_ignored(project, capsys):
+    written()
+    capsys.readouterr()
+    assert check("--out-report", "") == 2
+    assert "cannot write the report" in capsys.readouterr().err
+
+
 # ── the report ───────────────────────────────────────────────────────
 
 
@@ -811,6 +842,37 @@ def test_a_secret_in_a_committed_value_is_never_printed(project, capsys):
         captured = capsys.readouterr()
         assert "hunter2" not in captured.out + captured.err, fmt
         assert "hunter2" not in (project / f"r.{fmt}").read_text("utf-8"), fmt
+
+
+def test_a_value_too_long_to_be_a_name_is_not_scanned_or_shown(project, capsys, monkeypatch):
+    """The credential scan costs more than linear time on a value made to make it so, so a
+    committed value of hundreds of kilobytes is counted, not scanned."""
+    import time
+
+    written()
+    huge = ";a=b" * 100_000
+    text = (project / ORDERS_DAILY).read_text("utf-8")
+    (project / "out/contract.retail.orders_clean.fluid.yaml").write_text(
+        (project / "out/contract.retail.orders_clean.fluid.yaml")
+        .read_text("utf-8")
+        .replace("table: orders_clean", f"table: '{huge}'"),
+        encoding="utf-8",
+    )
+    assert text  # the file the test left alone
+    seen: List[int] = []
+    real = _drift.safe_text
+
+    def spy(value: Any, limit: int = 200) -> str:
+        seen.append(len(str(value)))
+        return real(value, limit)
+
+    monkeypatch.setattr(_drift, "safe_text", spy)
+    started = time.monotonic()
+    code, document = report_of(capsys)
+    assert code == 1 and time.monotonic() - started < 30
+    assert max(seen) <= _drift.MAX_DISPLAYED
+    (item,) = [i for i in document["items"] if i["what"].endswith("location.table")]
+    assert item["before"] == "<400,000 characters, not shown>"
 
 
 def test_control_characters_in_the_code_cannot_reach_the_terminal(project, capsys):

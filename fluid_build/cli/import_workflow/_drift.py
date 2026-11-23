@@ -450,10 +450,17 @@ def compare_product(
 # ── reading the committed contracts ──────────────────────────────────────────────────────────
 
 
+#: A value longer than this is neither scanned for credentials nor shown: no table, path or
+#: schedule is this long, and the scan costs more than linear time on a value made to make it so.
+MAX_DISPLAYED = 4096
+
+
 def _display(value: Any, limit: int = 160) -> str:
     """``value`` as one printable line: no control or bidirectional character, a credential
     masked, cut at ``limit``. Everything the report prints about a repository goes through it."""
     text = value if isinstance(value, str) else _canonical_json(_plain(value))
+    if len(text) > MAX_DISPLAYED:
+        return f"<{len(text):,} characters, not shown>"
     return redact_secret_text(safe_text(text, limit))
 
 
