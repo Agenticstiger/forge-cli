@@ -37,6 +37,11 @@ RULES: Dict[str, Dict[str, str]] = {
     "five": {"check": "amount >= 5"},
     "paid_big": {"when": "status = 'paid'", "check": "amount >= 10"},
     "paid_five": {"when": "status = 'paid'", "check": "amount >= 5"},
+    "fifteen": {"check": " OR ".join(f"amount = {n}" for n in range(1, 16))},
+    "fifteen_or_open": {
+        "check": " OR ".join(f"amount = {n}" for n in range(1, 16)) + " OR status = 'open'"
+    },
+    "fifteen_again": {"check": " OR ".join(f"amount = {n}" for n in range(15, 0, -1))},
     "many": {"check": " OR ".join(f"amount = {n}" for n in range(1, 18))},
     "many_or_open": {
         "check": " OR ".join(f"amount = {n}" for n in range(1, 18)) + " OR status = 'open'"
@@ -153,6 +158,14 @@ def test_a_when_and_a_check_share_their_parts():
     assert together({"orders.paid_big": HOLDS, "orders.paid_five": FAILS})
 
 
+def test_the_text_check_stops_at_a_number_of_readings_not_of_parts():
+    pair = {"orders.fifteen": HOLDS, "orders.fifteen_or_open": FAILS}
+    # 16 parts, 2^16 truths read for each of 2 facts: within the limit, so ruled out.
+    assert not _together("fifteen", "fifteen_or_open")(pair)
+    # A third fact over the same parts makes 3 x 2^16 readings: not read, nothing ruled out.
+    assert _together("fifteen", "fifteen_or_open", "fifteen_again")(pair)
+
+
 def test_rules_that_share_more_parts_than_it_reads_rule_nothing_out():
     together = _together("many", "many_or_open")
     assert together({"orders.many": HOLDS, "orders.many_or_open": FAILS})
@@ -214,6 +227,27 @@ def test_a_zero_cell_counts_only_where_the_texts_allow_it_and_zeros_are_disclosi
     assert disclosure.suppress_differencing(cells, [0, 1], rule, neither, STATES) == set()
 
 
+def test_small_cells_are_settled_before_the_empty_combinations_around_them():
+    # Facts 0 and 1 set one record apart; fact 2 splits every other cell. The combination
+    # fact 2's other state would make beside that record is empty, but it goes when
+    # facts 0 and 1 are withheld, so it does not withhold fact 2.
+    cells = {
+        (HOLDS, HOLDS, HOLDS): 25,
+        (HOLDS, HOLDS, FAILS): 25,
+        (FAILS, FAILS, HOLDS): 25,
+        (FAILS, FAILS, FAILS): 24,
+        (FAILS, HOLDS, FAILS): 1,
+    }
+
+    def texts(states: Dict[int, int]) -> bool:
+        if NOT_COVERED in states.values():
+            return False
+        return not (states.get(0) == HOLDS and states.get(1) == FAILS)
+
+    rule = disclosure.ACRO_DEFAULT
+    assert disclosure.suppress_differencing(cells, [0, 1, 2], rule, texts, STATES) == {0, 1}
+
+
 def test_a_fact_that_failed_its_own_check_is_left_out_of_the_combinations():
     cells = {(HOLDS, HOLDS): 3, (FAILS, HOLDS): 30, (FAILS, FAILS): 67}
     assert disclosure.suppress_differencing(cells, [1], ZEROS_SAFE, _anything, STATES) == set()
@@ -250,6 +284,17 @@ def test_a_fact_beside_the_same_fact_or_one_row_outside_it_is_withheld(tmp_path)
     assert _fared(result) == {"big": (False, "D"), "big_or_x": (False, "D")}
     for rule in ("big", "big_or_x"):
         assert _statistic(result, rule)["groups"] == [{"group": "", "status": "C"}]
+
+
+def test_a_fact_the_pair_does_not_involve_stays_published(tmp_path):
+    rows = _rows((25, "20.00", "open"), (25, "20.00", "paid"), (25, "1.00", "open"))
+    rows += _rows((24, "1.00", "paid")) + [_x("1.00")]
+    result = _profile(tmp_path, rows, "big", "big_or_x", "open")
+    assert _fared(result) == {
+        "big": (False, "D"),
+        "big_or_x": (False, "D"),
+        "open": (True, None),
+    }
 
 
 def test_a_fact_beside_the_same_fact_or_one_row_inside_it_is_withheld_where_zeros_are_disclosive(

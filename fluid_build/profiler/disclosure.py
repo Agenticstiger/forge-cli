@@ -586,34 +586,48 @@ def suppress_differencing(
 
     A fact touches such a cell when changing that fact's state alone takes the cell to a
     combination some record holds, so that withholding the fact merges the two. Every
-    fact that touches a small or zero cell is withheld, the combinations of the facts
-    still published are formed again, and so on until no such cell is left. Each round
-    only withholds more, never brings a fact back, and depends on the facts and the
-    records alone, not on the order the facts are listed in. A small cell that no one
-    fact's change merges withholds every fact it differs in from its nearest held
-    combinations. *passed* holds the positions of the facts that passed their own checks;
-    the result is those of them to withhold, which the summary counts under ``D`` and the
-    document writes ``C``, as it writes every withheld group of a level histogram.
+    fact that touches a small cell is withheld, the combinations of the facts still
+    published are formed again, and so on until no small cell is left; then every fact
+    that touches a zero cell is withheld, and the small cells are looked for again, until
+    neither is left. Small cells go first because the empty combinations around a small
+    cell go when it merges: read in the same round, they would withhold a fact that only
+    the small cell set apart. Each round only withholds more, never brings a fact back,
+    and depends on the facts and the records alone, not on the order the facts are listed
+    in. A small cell that no one fact's change merges withholds every fact it differs in
+    from its nearest held combinations. *passed* holds the positions of the facts that
+    passed their own checks; the result is those of them to withhold, which the summary
+    counts under ``D`` and the document writes ``C``, as it writes every withheld group of
+    a level histogram.
 
     The check covers the facts of one table among themselves and against the table's row
     count, not a fact's overlap with a histogram's cells, a column's counts or a
-    relationship's counts. A threshold makes differencing harder and cannot rule it out;
-    noise does, as the ONS notes of differencing, and the release under differential
-    privacy (``fluid profile --privacy-unit``) is the profiler's way to publish counts
-    with noise. The pattern is coordinated secondary suppression across linked tables, as
-    the ESSnet Handbook on Statistical Disclosure Control describes it and tau-Argus and
-    sdcTable implement it (sdcTable's ``attack()`` works out the bounds a reader can put on
-    a suppressed cell), adapted: instead of solving for those bounds, every combination is
-    held to the threshold, which errs toward withholding.
+    relationship's counts. Two exposes are two tables to it, even when the data owner reads
+    both from the same records, so facts asked of each are not checked together. Noise is
+    what the ONS credits with protecting against
+    differencing, in its comparison of post-tabular methods (2024), and the release under
+    differential privacy (``fluid profile --privacy-unit``) is the profiler's way to
+    publish counts with noise. The pattern is the coordinated secondary suppression of
+    linked tables that the Handbook on Statistical Disclosure Control (2nd edition, section
+    4.3.1) sets out, adapted: tables are linked by the cells they share, and here every
+    combination of the facts' states is held to the threshold, which errs toward
+    withholding, where an audit such as sdcTable's ``attack()`` solves for the bounds a
+    reader can put on each suppressed cell.
     """
     candidates = frozenset(passed)
     shown = set(candidates)
+    width = len(next(iter(cells), ()))
     while shown:
         order = sorted(shown)
-        formed: Counter[Combination] = Counter()
-        for combination, count in cells.items():
-            if count > 0:
-                formed[tuple(combination[at] for at in order)] += count
+        formed: Mapping[Combination, int]
+        if len(order) == width:
+            # Every fact is published: the combinations are the ones given, not formed again.
+            formed = {combination: count for combination, count in cells.items() if count > 0}
+        else:
+            projected: Counter[Combination] = Counter()
+            for combination, count in cells.items():
+                if count > 0:
+                    projected[tuple(combination[at] for at in order)] += count
+            formed = projected
         touched = _touched(formed, order, rule, possible, states)
         if not touched:
             break
@@ -628,7 +642,7 @@ def _touched(
     possible: Callable[[Mapping[int, int]], bool],
     states: Sequence[int],
 ) -> Set[int]:
-    """The facts (positions) that touch a small or a zero cell of the combinations *formed*."""
+    """The facts (positions) that touch a small cell of *formed*, else those touching a zero cell."""
     width = len(order)
 
     def changed(cell: Combination, at: int) -> List[Combination]:
@@ -638,14 +652,17 @@ def _touched(
         return {at for at in range(width) if any(other in formed for other in changed(cell, at))}
 
     touched: Set[int] = set()
-    looked_at: Set[Combination] = set()
     for cell, count in formed.items():
         if len(touched) == width:
             break
         if count < rule.minimum_cell:
             touched |= touching(cell) or _differing_from_nearest(cell, formed)
-        if not rule.zeros_disclosive:
-            continue
+    if touched or not rule.zeros_disclosive:
+        return {order[at] for at in touched}
+    looked_at: Set[Combination] = set()
+    for cell in formed:
+        if len(touched) == width:
+            break
         for at in range(width):
             for other in changed(cell, at):
                 if other in formed or other in looked_at:

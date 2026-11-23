@@ -12,7 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`fluid profile --privacy-unit` warns when `rho` is above 1.** The release still runs, and
   `--rho` still takes any number above zero. The warning cites OpenDP's rule of thumb, an epsilon
   of at most 1 (rho 0.5), and the rho of about 2.6 to 7.7 that the US Census Bureau's 2020 Census
-  products used. The help also says in one sentence what the privacy unit is.
+  products used. The `--privacy-unit` help also says what the privacy unit is: one row of the
+  unit's expose, or with `--release-table` or `--unit-key` every row that belongs to one entity.
 
 ### Changed
 
@@ -34,9 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   withholds does not depend on the order of the facts. A fact whose `when` leaves fewer than
   `minimumCell` rows uncovered, or none where zeros are disclosive, is withheld too, since the
   table's `rowCount` less the fact's `k` gives that count, and a withheld fact with a `when` writes
-  the band `{min: 0}` in place of the band of the rows it covers. The check does not cover a fact's
-  overlap with a histogram's cells, a column's counts or a relationship's counts: the release under
-  differential privacy is the way to publish such counts, with noise.
+  the band `{min: 0}` in place of the band of the rows it covers. Small cells are settled before
+  zero cells, so a fact is not withheld for the empty combinations around a cell that other facts
+  set apart, and rules that share too many parts to read in 2^17 readings are taken to rule
+  nothing out, which withholds more. The check does not cover a fact's overlap with a histogram's
+  cells, a column's counts or a relationship's counts, nor facts of two exposes read from the same
+  records: the release under differential privacy is the way to publish such counts, with noise.
 
 - **An alert route names a connection only when its kind has no default.** A route kind with
   `requires_connection` and a `default_connection` (such as a plugin's kind from

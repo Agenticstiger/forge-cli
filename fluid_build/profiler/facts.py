@@ -73,10 +73,11 @@ __all__ = [
 NOT_COVERED, FAILS, HOLDS = 0, 1, 2
 STATES: Tuple[int, ...] = (NOT_COVERED, FAILS, HOLDS)
 
-#: The most parts (comparisons, NULL tests and the like) the rules of facts that share a
-#: part may hold together before :func:`states_together` stops reading them and answers
-#: that their texts rule nothing out: it tries every truth of every part, 2^16 at most.
-_MOST_PARTS = 16
+#: The most readings :func:`states_together` makes of the facts that share parts: it reads
+#: each such fact under every truth of their parts (comparisons, NULL tests and the like),
+#: so 2^parts times the facts. Above it those facts' texts are not read and rule nothing
+#: out, which only withholds more: 2^17 readings take about a second.
+_MOST_READINGS = 1 << 17
 
 #: The most a decimal's exponent may be before its value is refused (it would be a number
 #: of thousands of digits).
@@ -524,9 +525,12 @@ def states_together(
     the texts alone rule the states out, as ``A`` TRUE and ``A OR id = 'x'`` not TRUE,
     or a ``NOT_COVERED`` state for a rule without a ``when``. Its ``True`` says only that
     the texts do not rule them out: what the parts mean (``x > 2`` beside ``x > 1``) or
-    the records may. Facts that share no part are read apart; when the facts that share
-    parts hold more than ``_MOST_PARTS`` of them, they are not read and nothing is ruled
-    out. The returned function takes a mapping of fact names to :data:`STATES`.
+    the records may. Facts that share no part are read apart. Facts that share parts are
+    read under every truth of those parts, and when that would take more than
+    ``_MOST_READINGS`` readings they are not read and nothing is ruled out for them: the
+    check then holds every empty combination of them to be a zero the records show, which
+    withholds more and never less. The returned function takes a mapping of fact names to
+    :data:`STATES`.
     """
     parts: Dict[nodes.Node, int] = {}
     readings: Dict[str, Tuple[_Formula, _Formula]] = {}
@@ -552,7 +556,7 @@ def states_together(
     for index, (names, held) in enumerate(groups):
         for name in names:
             group_of[name] = index
-        if len(held) > _MOST_PARTS:
+        if (1 << len(held)) * len(names) > _MOST_READINGS:
             reachable.append(None)
             continue
         order = sorted(held)
