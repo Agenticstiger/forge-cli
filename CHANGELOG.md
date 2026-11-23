@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.0] — 2026-11-23
+
 ### Added
 
 - **Iceberg maintenance for a table forge does not write.** A table whose streams run on its
@@ -157,10 +159,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
-- A plan made before this release has no `actions` in its `spark.maintain` payload, and the
-  compaction options of a maintenance job config changed, so `fluid apply` refuses such a plan
-  with `apply_spark_artifact_mismatch`: run `fluid plan` again, then `fluid apply`, before the
-  next `fluid apply --mode maintain`.
+- The bundled Spark runner changed, and its hash is part of every Spark build's config hash. So
+  every running Spark stream restarts once on the first `fluid apply` after the upgrade, and a
+  plan made before this release with a `spark.reconcile` or `spark.maintain` action is refused with
+  `apply_spark_artifact_mismatch`. Run `fluid plan` again, then `fluid apply`. A `spark.maintain`
+  plan also lacks the new per-action `actions`, and the compaction options of a maintenance job
+  config changed, so make it again before the next `fluid apply --mode maintain`.
 
 ## [0.38.0] — 2026-11-22
 
