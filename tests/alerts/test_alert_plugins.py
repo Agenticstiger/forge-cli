@@ -23,6 +23,7 @@ from fluid_build.alerts import (
     read_alert_plan,
     reset_alert_plugin_cache,
 )
+from fluid_build.alerts.builtin import BUILTIN_KINDS
 from fluid_build.schedulers.airflow._alerts import render_alerts
 
 pytestmark = pytest.mark.unit
@@ -487,3 +488,99 @@ class TestNoSecretInARoutesOptionsOrItsKind:
 
         _install(monkeypatch, kinds=[FakeEP("teams", Defaulted)])
         assert _findings(_contract(_route("teams"))) == ([], [])
+
+
+class _Hooked(AlertNotifier):
+    """A kind that reads ``route.connection`` and keeps no fallback of its own."""
+
+    notifier = "acme_alerts.notifiers:TeamsNotifier"
+
+    def kwargs(self, route: AlertRoute, alert: Alert) -> Dict[str, Any]:
+        return {"teams_conn_id": route.connection, "title": alert.title}
+
+
+class _HookedWithDefault(_Hooked):
+    requires_connection = True
+    default_connection = "teams_default"
+
+
+def _hooked(**attrs: Any) -> type:
+    return type("HookedKind", (_Hooked,), attrs)
+
+
+class TestADefaultConnection:
+    """A route names an Airflow connection only when its kind requires one and has no default:
+    the connection the notifier uses is the route's own, else the kind's default."""
+
+    def test_a_kind_with_a_default_needs_no_connection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install(monkeypatch, kinds=[FakeEP("teams", _HookedWithDefault)])
+        contract = _contract({"name": "r", "kind": "teams"})
+        assert _findings(contract) == ([], [])
+        plan = read_alert_plan(contract)
+        (call,) = notifier_calls(plan, "failure", dag_id="sales.orders__b", product_id="p")
+        assert call.kwargs["teams_conn_id"] == "teams_default"
+        rendered = render_alerts(plan, dag_id="sales.orders__b", product_id="p")
+        assert "teams_conn_id='teams_default'" in rendered.definitions
+        assert "through Airflow connection teams_default" in " ".join(rendered.notes)
+
+    def test_a_kind_without_a_default_still_needs_a_connection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install(monkeypatch, kinds=[FakeEP("teams", _hooked(requires_connection=True))])
+        contract = _contract({"name": "r", "kind": "teams"})
+        errors, _ = _findings(contract)
+        assert any(
+            "alerts.routes[0].connection is required for a teams route" in e for e in errors
+        ), errors
+        with pytest.raises(AlertRouteError, match="connection is required for a teams route"):
+            read_alert_plan(contract)
+
+    def test_a_connection_the_route_names_wins_over_the_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install(monkeypatch, kinds=[FakeEP("teams", _HookedWithDefault)])
+        contract = _contract({"name": "r", "kind": "teams", "connection": "teams_oncall"})
+        assert _findings(contract) == ([], [])
+        plan = read_alert_plan(contract)
+        (call,) = notifier_calls(plan, "failure", dag_id="sales.orders__b", product_id="p")
+        assert call.kwargs["teams_conn_id"] == "teams_oncall"
+        rendered = render_alerts(plan, dag_id="sales.orders__b", product_id="p")
+        assert "teams_conn_id='teams_oncall'" in rendered.definitions
+        assert "teams_default" not in rendered.definitions + " ".join(rendered.notes)
+
+    def test_the_kinds_check_and_kwargs_both_see_the_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: List[Any] = []
+
+        class Checked(_HookedWithDefault):
+            def check(self, route: AlertRoute) -> List[str]:
+                seen.append(route.connection)
+                return [] if route.connection else ["a teams route needs its connection"]
+
+        _install(monkeypatch, kinds=[FakeEP("teams", Checked)])
+        assert _findings(_contract({"name": "r", "kind": "teams"})) == ([], [])
+        assert seen == ["teams_default"]
+
+    def test_a_kind_that_does_not_require_one_and_has_no_default_gets_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install(monkeypatch, kinds=[FakeEP("teams", _hooked(requires_connection=False))])
+        contract = _contract({"name": "r", "kind": "teams"})
+        assert _findings(contract) == ([], [])
+        (call,) = notifier_calls(
+            read_alert_plan(contract), "failure", dag_id="sales.orders__b", product_id="p"
+        )
+        assert call.kwargs["teams_conn_id"] is None
+
+    def test_the_built_in_kinds_keep_their_rule(self) -> None:
+        """webhook is the one built-in kind with no default connection, so it is the one that
+        still needs the route to name one."""
+        needs = {
+            name
+            for name, kind in BUILTIN_KINDS.items()
+            if kind.requires_connection and kind.default_connection is None
+        }
+        assert needs == {"webhook"}
