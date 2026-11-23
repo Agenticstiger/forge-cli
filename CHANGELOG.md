@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`fluid import airflow|pyspark SOURCE --check` is a drift gate for CI.** It reads the DAGs or the
+  job files again, compares what they say with the contracts already written where the import writes
+  them (give it the `--out`, `--split-by`, `--conventions` and `--dags` of the import that wrote
+  them), and writes nothing. It exits 0 when they match, 1 on drift and 2 when it cannot decide (an
+  unreadable source, no contract written yet, a refusal, an error nobody foresaw), so a broken run
+  never reads as drift; `--force` is refused with it. Only what the code decides is compared, per
+  product: which jobs and outputs there are, each output's `kind`, `platform`, `format` and
+  `location` (a binding the import left at `other` is the person's), the reads the import wrote, and
+  the DAG that runs a job with its `schedule`, `catchup` and tasks. What a person completed is never
+  drift: descriptions, owners, columns, tags, and any output, read or build they added; key order and
+  comments do not count. Each difference is typed (`job_added`, `job_removed`, `output_added`,
+  `output_removed`, `schedule_changed`, `table_changed`, `coverage_regressed`) and names the contract
+  file, the field and the line of code. A job that is gone and something the import used to find and
+  no longer does are warnings, and drift with `--strict`. `--format text|json|github` picks the
+  report (`github` writes workflow annotations; `json` a document with `"schema": 1`); at most 100
+  items are listed and the rest counted, and every value is redacted before it is printed.
+  `--out-report PATH` also writes the report to a file, the one file `--check` writes. A product the
+  code no longer has leaves its contract file behind, and the check does not look for it.
+
 ## [0.38.0] — 2026-11-22
 
 ### Added

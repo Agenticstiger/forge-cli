@@ -142,6 +142,44 @@ def _add_code_importer_arguments(parser: argparse.ArgumentParser) -> None:
             "importers always overwrite"
         ),
     )
+    parser.add_argument(
+        "--check",
+        dest="check",
+        action="store_true",
+        help=(
+            "A drift gate for `fluid import airflow|pyspark`: read the code again, compare it "
+            "with the contracts written where this import would write them, and write nothing. "
+            "Exit 0: they match. Exit 1: drift. Exit 2: it cannot decide (an unreadable source, "
+            "no contract written yet, a refusal). What a person completed (descriptions, owners, "
+            "columns) is never drift"
+        ),
+    )
+    parser.add_argument(
+        "--strict",
+        dest="strict",
+        action="store_true",
+        help=(
+            "With --check: a job that is gone from the code, and a link to a DAG, a task or a "
+            "read that the import no longer finds, are drift too (otherwise warnings)"
+        ),
+    )
+    parser.add_argument(
+        "--format",
+        dest="check_format",
+        choices=["text", "json", "github"],
+        default=None,
+        help=(
+            "With --check: how the report is printed. text (the default), json, or github "
+            "(workflow annotations, `::error file=...::message`)"
+        ),
+    )
+    parser.add_argument(
+        "--out-report",
+        dest="out_report",
+        default=None,
+        metavar="PATH",
+        help="With --check: also write the report to PATH. The one file --check ever writes",
+    )
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -175,6 +213,8 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "                                           : Airflow DAGs to products (never imports Airflow)\n"
             "  Any importer plugin installed adds `fluid import <name> <source>`.\n"
             "  Add --dry-run to print the proposal and the report and write nothing.\n"
+            "  Add --check (airflow, pyspark) to exit 1 when the written contracts no longer\n"
+            "  match the code: a CI drift gate that writes nothing.\n"
             "  fluid import [--dir <path>]              — legacy dbt/Terraform/SQL scan"
         ),
     )
@@ -645,6 +685,12 @@ def run(args: Any, logger: logging.Logger) -> int:
     for a recognizable dbt / Terraform / SQL project.
     """
     tool = getattr(args, "tool", None)
+    if getattr(args, "check", False):
+        # The drift gate: its own exit codes (0, 1, 2), so its refusals are answered there, not
+        # by the typed-error handler that exits 1 for them.
+        from fluid_build.cli._import_workflow_handler import run_import_check
+
+        return run_import_check(args, logger, tool=tool, source=getattr(args, "source", None))
     from fluid_build.cli._import_workflow_handler import check_import_flags
     from fluid_build.cli.import_workflow.schema_registry import check_flags
 

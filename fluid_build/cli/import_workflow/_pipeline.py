@@ -22,6 +22,7 @@ from ._fold import NOT_THE_PROJECT, missing_value
 from ._proposal import (
     SPLITS,
     ProposalTooLarge,
+    SourceKey,
     TopicSchema,
     build_proposal,
     safe_text,
@@ -315,6 +316,15 @@ def run_import(
     tool: str, source: str, options: Mapping[str, Any]
 ) -> Tuple[List[Dict[str, Any]], ImportReport]:
     """The contracts ``fluid import <tool> <source>`` proposes, and the report."""
+    contracts, report, _sources = run_import_traced(tool, source, options)
+    return contracts, report
+
+
+def run_import_traced(
+    tool: str, source: str, options: Mapping[str, Any]
+) -> Tuple[List[Dict[str, Any]], ImportReport, Dict[SourceKey, str]]:
+    """:func:`run_import`, and where in the scanned code each field of the contracts comes from
+    (see :data:`._proposal.SourceKey`). It reads the code and writes nothing."""
     split_by = _split(tool, options)
     conv = load_conventions(
         options.get("conventions"), roots=_named_directories(tool, source, options)
@@ -403,7 +413,7 @@ def run_import(
         ) from exc
     _check_valid(proposal.contracts, proposal.report)
     _cap_unsupported(proposal.report)
-    return proposal.contracts, proposal.report
+    return proposal.contracts, proposal.report, proposal.sources
 
 
 #: Lines of "unsupported" the report lists one by one; the rest are counted. A large estate has

@@ -54,6 +54,14 @@ from ._spark_io import TRIGGER_SEPARATOR, Read, Ref, Write, read_key
 from .registry import ImportReport
 
 SPLITS = ("table", "job", "dag", "task", "folder", "project")
+#: How a ``consumes[]`` entry's ``purpose`` begins when the import wrote it ("read by <job>"); an
+#: entry whose purpose says anything else was added or reworded by a person.
+READ_PURPOSE_PREFIX = "read by "
+#: ``(product id, section, key)`` of a field of a proposal: the section is ``exposes``, ``builds``,
+#: ``consumes`` or ``schedule``, and the key is the expose id, the build id, ``<product>.<expose>``
+#: or the build id. What the key is mapped to is where the code says it, ``file:line`` (a job is its
+#: file alone).
+SourceKey = Tuple[str, str, str]
 #: Distinct outputs, and products, one proposal holds. Every product is validated against the
 #: schema and written as a file; a project has hundreds, and a directory of generated code that
 #: names a table per line is not what this reads.
@@ -521,6 +529,8 @@ class Group:
 class Proposal:
     contracts: List[Dict[str, Any]]
     report: ImportReport
+    #: Where in the scanned code each field of the contracts comes from (see :data:`SourceKey`).
+    sources: Dict[SourceKey, str] = field(default_factory=dict)
 
 
 TopicSchema = Callable[[str], Union[List[Dict[str, Any]], str]]
@@ -552,6 +562,8 @@ class _Ctx:
     streams: Dict[Tuple[int, int], Tuple[str, str]] = field(default_factory=dict)
     #: The ``dagId`` and ``taskId`` each DAG and task of the import is recorded under.
     ids: _AirflowIds = field(default_factory=lambda: _AirflowIds(()))
+    #: Where each field of each product comes from (see :data:`SourceKey`).
+    sources: Dict[SourceKey, str] = field(default_factory=dict)
 
 
 def _job_labels(jobs: Sequence[JobRecord]) -> Dict[str, str]:
@@ -1198,7 +1210,7 @@ def build_proposal(
             f"{len(external)} upstream table(s) or topic(s) are read but written by no scanned job; "
             f"consumes[] names them under the id the id rule gives: {listed}{more}"
         )
-    return Proposal(contracts=contracts, report=report)
+    return Proposal(contracts=contracts, report=report, sources=ctx.sources)
 
 
 def _fewer_reads(counts: Sequence[int]) -> Optional[int]:
@@ -1344,6 +1356,7 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
         expose["contract"] = {"schema": columns}
         exposes.append(expose)
         expose_by_key[identity.key] = eid
+        ctx.sources.setdefault((pid, "exposes", eid), f"{output.write.file}:{output.write.line}")
         report.mapped_one_to_one.append(
             f"write {safe_text(identity.shown, 80)} ({output.write.file}:{output.write.line}) → exposes[{eid}] of {pid}"
         )
@@ -1411,12 +1424,14 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
                 continue  # the product's own output, read back
             if identity.key in produced:
                 other_pid, other_eid = produced[identity.key]
-                purpose = f"read by {safe_text(job.shown, 80)}"
+                purpose = f"{READ_PURPOSE_PREFIX}{safe_text(job.shown, 80)}"
                 known = True
             else:
                 other_pid = product_id(identity, conv)
                 other_eid = expose_id(identity)
-                purpose = f"read by {safe_text(job.shown, 80)}; no scanned job writes it"
+                purpose = (
+                    f"{READ_PURPOSE_PREFIX}{safe_text(job.shown, 80)}; no scanned job writes it"
+                )
                 known = False
                 external.setdefault((other_pid, other_eid), identity.shown)
             if other_pid == pid:
@@ -1435,6 +1450,9 @@ def _product(group: Group, pid: str, ctx: _Ctx) -> Dict[str, Any]:
                 unlisted += 1
                 continue
             consumes.append({"productId": other_pid, "exposeId": other_eid, "purpose": purpose})
+            ctx.sources.setdefault(
+                (pid, "consumes", f"{other_pid}.{other_eid}"), f"{read.file}:{read.line}"
+            )
             if len(consumes) <= MAX_READ_LINES:
                 report.mapped_one_to_one.append(
                     f"read {safe_text(identity.shown, 80)} ({read.file}:{read.line}) → consumes[{other_pid}]"
@@ -1504,6 +1522,7 @@ def _build(
         owned = _owned_writes(mine)
         cached = (_stream_text(owned), _trigger(owned))
     stream, trigger = cached
+    ctx.sources.setdefault((pid, "builds", build_ids[id(job)]), job.shown)
     description = f"Existing job {safe_text(job.shown, 120)}; it keeps running where it runs today."
     if stream:
         description += f" Structured Streaming: {stream}."
@@ -1654,6 +1673,7 @@ def _orchestration(
             f"{pid}: the job is submitted from more than one DAG; the build records {dag.dag_id}, "
             f"not {', '.join(safe_text(o, 40) for o in others)}"
         )
+    ctx.sources.setdefault((pid, "schedule", build_id), f"{dag.file}:{dag.line}")
     config: Dict[str, Any] = {}
     if dag.schedule_kind in {"cron", "expression"} and dag.schedule:
         config["schedule"] = safe_text(dag.schedule, 120)
