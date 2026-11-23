@@ -1046,7 +1046,7 @@ def _check_unwritten_table(
             "path of its own"
         )
     orphans = raw.get("removeOrphanFiles")
-    if _enabled(orphans) and orphans.get("olderThan") is None:
+    if isinstance(orphans, Mapping) and _enabled(orphans) and orphans.get("olderThan") is None:
         errors.append(
             f"{where}.removeOrphanFiles.olderThan is required with runtime: forge does not "
             "write the table and cannot see how long its writer's commits take, and a file "
