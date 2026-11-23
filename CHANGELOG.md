@@ -43,6 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default) into the job config unless `compaction.maxConcurrentRewrites` sets another value, so
   the config says how many file groups a run rewrites at once beside a live writer.
 
+### Fixed
+
+- A table maintenance run started through spark-submit (`fluid apply --mode maintain`) stopped
+  with `NameError` before its first step: forge's Spark runner ran its script entry point before
+  the maintenance functions were defined. The entry point now comes last.
+- Removing orphan files of a table in an Iceberg REST catalog (such as Lakekeeper) waited on
+  credential lookups: Iceberg listed the location through Hadoop's S3A, which holds none of the
+  credentials the catalog hands the table. The runner now lists through the table's own FileIO,
+  under the table's location and a `/`, so a sibling table whose location starts the same is
+  never listed. A Glue-catalog table keeps the default listing.
+
 ### Upgrade notes
 
 - A plan made before this release has no `actions` in its `spark.maintain` payload, and the
