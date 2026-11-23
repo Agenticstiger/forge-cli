@@ -320,7 +320,15 @@ def _emit(text: str, *, stderr: bool = False) -> None:
 
 #: How a report of ``--check`` begins, in each format (and an error in each): the only kind of
 #: existing file ``--out-report`` replaces, besides an empty one.
-_REPORT_STARTS = ('{\n  "schema": ', "Import drift check:", "::error ", "::warning ", "╭", "\x1b[")
+_REPORT_STARTS = (
+    '{\n  "schema": ',
+    "Import drift check:",
+    "::error ",
+    "::warning ",
+    "╭",
+    "\x1b[",
+    "✗ ",
+)
 
 
 def _is_an_earlier_report(path: Path) -> bool:

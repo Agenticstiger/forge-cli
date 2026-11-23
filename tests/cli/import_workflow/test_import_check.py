@@ -247,6 +247,24 @@ def test_a_binding_the_import_left_at_other_is_the_persons_to_name(project):
     assert check("--strict") == 0
 
 
+def test_a_binding_nobody_named_is_still_compared_with_what_the_code_says(project, capsys):
+    """Until a person names the platform, the location is the import's: a table that moves to
+    another database is drift (split by job, so the product keeps its id)."""
+    argv = (*ARGV, "--split-by", "job")
+    written(*argv)
+    assert check(argv=argv) == 0
+    sub(
+        project / "jobs/orders_daily.py",
+        'TARGET = "retail.orders_daily"',
+        'TARGET = "mart.orders_daily"',
+    )
+    code, document = report_of(capsys, argv=argv)
+    assert code == 1
+    (item,) = [i for i in document["items"] if i["kind"] == "table_changed"]
+    assert item["what"].endswith("binding.location.database")
+    assert (item["before"], item["after"]) == ("retail", "mart")
+
+
 def test_a_schedule_the_code_does_not_state_as_a_literal_is_the_persons_to_write_down(
     project, capsys
 ):
@@ -908,12 +926,6 @@ def test_a_yaml_date_in_a_contract_is_a_value_not_a_crash(project):
     text = (project / ORDERS_DAILY).read_text("utf-8")
     (project / ORDERS_DAILY).write_text(
         text.replace("table: orders_daily", "table: 2026-01-01"), encoding="utf-8"
-    )
-    assert check() == 0  # the binding of this table is the person's (platform `other`)
-    clean = project / "out/contract.retail.orders_clean.fluid.yaml"
-    clean.write_text(
-        clean.read_text("utf-8").replace("table: orders_clean", "table: 2026-01-01"),
-        encoding="utf-8",
     )
     assert check() == 1
 

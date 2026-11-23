@@ -288,12 +288,14 @@ class DriftReport:
 
 def _output_diffs(fresh: OutputFacts, held: OutputFacts) -> List[Tuple[str, Any, Any]]:
     """``(field, held, fresh)`` for each fact of an output the code decides and the contract holds
-    otherwise. A binding the import left at ``other`` is the person's to name, location included
-    (its keys are a guess until the platform is known); so is any key of the location the import
-    did not write."""
+    otherwise. Where the import left the platform at ``other`` and a person has named it since,
+    the whole binding is theirs (the format and the location keys depend on the platform); a key
+    of the location the import did not write is theirs in any case."""
     decided: List[Tuple[str, Any, Any]] = [("kind", fresh.kind, held.kind)]
-    if fresh.platform not in (None, "other"):
-        decided.append(("binding.platform", fresh.platform, held.platform))
+    named_by_a_person = fresh.platform in (None, "other") and held.platform not in (None, "other")
+    if not named_by_a_person:
+        if fresh.platform not in (None, "other"):
+            decided.append(("binding.platform", fresh.platform, held.platform))
         if fresh.format not in (None, "other"):
             decided.append(("binding.format", fresh.format, held.format))
         for key in sorted(fresh.location):

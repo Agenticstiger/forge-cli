@@ -15,18 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them), and writes nothing. It exits 0 when they match, 1 on drift and 2 when it cannot decide (an
   unreadable source, no contract written yet, a refusal, an error nobody foresaw), so a broken run
   never reads as drift; `--force` is refused with it. Only what the code decides is compared, per
-  product: which jobs and outputs there are, each output's `kind`, `platform`, `format` and
-  `location` (a binding the import left at `other` is the person's), the reads the import wrote, and
-  the DAG that runs a job with its `schedule`, `catchup` and tasks. What a person completed is never
-  drift: descriptions, owners, columns, tags, and any output, read or build they added; key order and
-  comments do not count. Each difference is typed (`job_added`, `job_removed`, `output_added`,
+  product: which jobs and outputs there are, each output's `kind`, `platform`, `format` and `location`
+  (a binding the import left at `other` is the person's once they have named a platform), the reads
+  the import wrote, and the DAG that runs a job with its schedule (when the code gives a
+  literal cron or preset), its `catchup` (when the code sets it) and its tasks. What a person
+  completed is never drift: descriptions, owners, columns, tags, a schedule the code does not state,
+  and any output, read or build they added; key order and comments do not count. Each difference is typed (`job_added`, `job_removed`, `output_added`,
   `output_removed`, `schedule_changed`, `table_changed`, `coverage_regressed`) and names the contract
   file, the field and the line of code. A job that is gone and something the import used to find and
   no longer does are warnings, and drift with `--strict`. `--format text|json|github` picks the
   report (`github` writes workflow annotations; `json` a document with `"schema": 1`); at most 100
   items are listed and the rest counted, and every value is redacted before it is printed.
-  `--out-report PATH` also writes the report to a file, the one file `--check` writes. A product the
-  code no longer has leaves its contract file behind, and the check does not look for it.
+  `--out-report PATH` also writes the report to a file, the one file `--check` writes, and replaces
+  an existing file only when it is empty or an earlier report. A product the code no longer has
+  leaves its contract file behind, and the check does not look for it.
 
 - **`fluid generate ci --add import-drift` puts that gate in a generated pipeline.** Give it
   `--import-tool airflow|pyspark` and `--import-source DIR`, and the options the import that wrote the
