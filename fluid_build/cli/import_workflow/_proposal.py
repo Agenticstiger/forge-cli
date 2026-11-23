@@ -184,12 +184,12 @@ MAX_ID_LINES = 20
 class _AirflowIds:
     """The ``dagId`` and ``taskId`` each DAG and task is recorded under. An Airflow id that the
     schema of the declared ``fluidVersion`` takes is recorded exactly as Airflow spells it (the
-    preview schemas take Airflow's own rule); one that it does not (``Nightly_Orders`` under a
-    schema of lower case ids) is recorded as :func:`ident` of it, made unique among the DAG ids of
-    the import (a task's among the task ids of its DAG) with a number after it. Ids that fit are
-    taken first and never change; the others are mapped in source order, so one import of the same
-    code always records the same ids. The running DAG keeps its own ids: the report says what each
-    recorded id stands for."""
+    preview schemas take the ASCII part of Airflow's rule); one that it does not (``Nightly_Orders``
+    under a schema of lower case ids) is recorded as :func:`ident` of it, made unique among the DAG
+    ids of the import (a task's among the task ids of its DAG) with a number after it. Ids that fit
+    are taken first and never change; the others are mapped in source order, so one import of the
+    same code always records the same ids. The running DAG keeps its own ids: the report says what
+    each recorded id stands for."""
 
     def __init__(self, dags: Sequence[Dag], rules: Optional[IdRules] = None) -> None:
         self._rules = rules or id_rules("")
