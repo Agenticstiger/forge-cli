@@ -98,7 +98,11 @@ def _origin(ep: Any) -> Tuple[Optional[str], Optional[str]]:
     told or is not a plain name and version."""
     from fluid_build.plugin_manager import entry_point_distribution
 
-    name, _, version = (entry_point_distribution(ep) or "").partition(" ")
+    text = entry_point_distribution(ep) or ""
+    dist = getattr(ep, "dist", None)
+    version = str(getattr(dist, "version", None) or "")
+    # The name is what precedes " <version>": never split at a space the name itself holds.
+    name = text[: -len(version) - 1] if version and text.endswith(f" {version}") else text
     return (
         name if _DIST_NAME.match(name) else None,
         version if _DIST_VERSION.match(version) else None,
