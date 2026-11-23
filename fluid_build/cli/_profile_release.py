@@ -65,7 +65,9 @@ exact discrete Gaussian noise whose scale is the least one that spends no more t
 share on the change of one entity. The report adds an informational conversion to (epsilon,
 delta) at delta = 1e-6.
 
-For which unit: each entity contributes at most --max-rows-per-unit N rows of the release
+For which unit: one entity is one row of the unit's expose; with a release table related to
+it, or with a unit key, an entity owns every row that belongs to it, and the stated loss holds
+for each entity. Each entity contributes at most --max-rows-per-unit N rows of the release
 table (default 1) and counts at most --max-rows-per-cell K rows in one cell of a table
 (default N), so the stated loss holds for each entity and for each row of it. Which rows an
 entity keeps is decided by a keyed priority, never by the other entities. Rows with no key
@@ -387,6 +389,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     from fluid_build._console import cprint_literal
     from fluid_build._contract_loader import load_contract_with_overlay
     from fluid_build.cli import profile_cmd
+    from fluid_build.cli.console import warning as console_warning
     from fluid_build.cli.security import validate_cli_path
     from fluid_build.profiler import _stats, runner, sources
     from fluid_build.profiler import request as asked_for
@@ -457,6 +460,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 "max_rows_per_cell": args.max_rows_per_cell,
             }
             rho = release.parse_rho(args.rho)
+        notice = release.rho_warning(rho)
+        if notice is not None:
+            console_warning(notice)
         contract = load_contract_with_overlay(str(contract_path), args.env, logger)
         plan = release.plan_release(
             contract,

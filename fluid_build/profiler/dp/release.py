@@ -97,6 +97,15 @@ _SCALE_PLACES = 6
 _MOST_RHO_DIGITS = 100
 _RHO_TEXT = re.compile(r"[0-9]+(\.[0-9]+)?\Z")
 
+#: A total rho above this draws a warning; the release still runs, at any rho above zero.
+#: OpenDP's guidance: "a common rule-of-thumb is to limit epsilon to 1.0"
+#: (https://docs.opendp.org/en/stable/getting-started/typical-workflow.html), and an
+#: epsilon-DP release is (epsilon^2/2)-zCDP, so epsilon 1 is rho 0.5. The US Census Bureau's
+#: 2020 Census products used rho 2.63 for the redistricting data
+#: (https://arxiv.org/abs/2204.08986) and 4.96 and 7.70 for the two universes of the
+#: demographic and housing characteristics file (https://arxiv.org/abs/2312.10863).
+RHO_WARN = Fraction(1)
+
 #: The delta of the informational conversion to (epsilon, delta).
 DELTA_TEXT = "1e-6"
 
@@ -148,6 +157,18 @@ def parse_rho(text: str) -> Fraction:
             read=True,
         )
     return value
+
+
+def rho_warning(rho: Fraction) -> Optional[str]:
+    """The warning for a total privacy loss above :data:`RHO_WARN`, else None."""
+    if rho <= RHO_WARN:
+        return None
+    return (
+        f"rho {decimal_text(rho)} is above 1, a large privacy loss. OpenDP's rule of thumb "
+        "keeps epsilon at most 1, which is rho 0.5 (an epsilon-DP release is "
+        "(epsilon^2/2)-zCDP); the US Census Bureau's 2020 Census products used rho from "
+        "about 2.6 to 7.7. The release goes ahead."
+    )
 
 
 def decimal_text(value: Fraction) -> str:

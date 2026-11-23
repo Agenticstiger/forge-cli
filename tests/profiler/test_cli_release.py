@@ -236,6 +236,21 @@ def test_a_release_of_each_row_needs_no_bound(workspace, registry, selected, cap
     assert json.loads((workspace / "rec.json").read_text())["unit"]["mode"] == "rows"
 
 
+def test_a_rho_above_one_is_warned_of_once_and_the_release_still_runs(
+    workspace, registry, selected, capsys
+):
+    assert main(_argv(rho="1.5")) == 0
+    out = " ".join(_out(capsys).split())
+    assert out.count("rho 1.5 is above 1, a large privacy loss") == 1
+    assert "The release goes ahead." in out
+    assert (workspace / "rec.json").is_file()
+
+
+def test_a_rho_of_one_is_not_warned_of(workspace, registry, selected, capsys):
+    assert main(_argv(rho="1")) == 0
+    assert "a large privacy loss" not in _out(capsys)
+
+
 # ---- nothing data-dependent leaves outside the noise ---------------------------------------------
 
 
@@ -703,6 +718,7 @@ def test_the_help_has_a_section_on_the_private_release():
     assert "private release (differential privacy)" in text
     assert "What it guarantees" in text and "What it does not do" in text
     assert "for which unit" in text.lower()
+    assert "one entity is one row of the unit's expose" in text
     assert "recorded inside the data owner's boundary" in text
     assert "with it and the profile the noise can be taken off" in text
     assert " ".join(NULL_POOL_SENTENCE.split()) in " ".join(text.split())
