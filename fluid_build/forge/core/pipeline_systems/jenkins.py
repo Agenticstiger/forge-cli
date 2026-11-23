@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import textwrap
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 try:
     import yaml
@@ -171,38 +171,57 @@ _ADD_ON_ARCHIVE = {
     "security": "runtime/osv-results.sarif",
     "compliance": "runtime/compliance-report.json",
     "sbom": "runtime/sbom.spdx.json",
+    "import-drift": "",  # a gate: nothing to archive
 }
 
 
-def _add_on_stage(add_on: str, contract: str, cd: str, prefix: str, on_main: str = "") -> str:
+def _add_on_stage(
+    add_on: str,
+    contract: str,
+    cd: str,
+    prefix: str,
+    on_main: str = "",
+    import_drift: Optional[_thin.ImportDrift] = None,
+) -> str:
     """The stage of one ``--add`` job; ``on_main`` (a ``when`` condition) limits
     it to the default branch. ``prefix`` roots the archive at the workdir."""
     condition = f"            when {{ allOf {{ {on_main} }} }}\n" if on_main else ""
-    script = _sh_step(_thin.add_on_script(add_on, contract), cd)
+    script = _sh_step(_thin.add_on_script(add_on, contract, import_drift), cd)
+    archive = _ADD_ON_ARCHIVE[add_on]
+    keep = (
+        f"\n                archiveArtifacts artifacts: '{prefix}{archive}', allowEmptyArchive: true"
+        if archive
+        else ""
+    )
     return (
         f"        stage('{_thin.ADD_ON_TITLES[add_on]}') {{\n"
         f"{condition}"
         "            steps {\n"
-        f"{script}\n"
-        f"                archiveArtifacts artifacts: '{prefix}{_ADD_ON_ARCHIVE[add_on]}', "
-        "allowEmptyArchive: true\n"
+        f"{script}{keep}\n"
         "            }\n"
         "        }\n\n"
     )
 
 
 def _add_on_stages(
-    add_ons: Sequence[str], contract: str, cd: str, prefix: str, on_main: str
+    add_ons: Sequence[str],
+    contract: str,
+    cd: str,
+    prefix: str,
+    on_main: str,
+    import_drift: Optional[_thin.ImportDrift] = None,
 ) -> Tuple[str, str]:
     """The ``--add`` stages: (before the approval, after apply). Security and
     the SBOM (on the default branch only) come before; compliance after."""
     before = "".join(
-        _add_on_stage(a, contract, cd, prefix, on_main if a == "sbom" else "")
+        _add_on_stage(a, contract, cd, prefix, on_main if a == "sbom" else "", import_drift)
         for a in add_ons
-        if a in ("security", "sbom")
+        if a in ("security", "sbom", "import-drift")
     )
     after = "".join(
-        _add_on_stage(a, contract, cd, prefix, on_main) for a in add_ons if a == "compliance"
+        _add_on_stage(a, contract, cd, prefix, on_main, import_drift)
+        for a in add_ons
+        if a == "compliance"
     )
     return before, after
 
@@ -858,11 +877,12 @@ stage('11 - schedule sync') {{
         # --add: the add-on stages. security and sbom run before the approval
         # (sbom on the default branch only); compliance after apply.
         add_ons_before, add_ons_after = _add_on_stages(
-            _thin.check_add_ons(config.add_ons),
+            _thin.check_add_ons(config.add_ons, config.import_drift),
             config.contract_path or "contract.fluid.yaml",
             CD,
             W,
             on_main,
+            config.import_drift,
         )
         apply_block = f"""        // ═════════════════════════════════════════════════════════════
         // Stages 7-11 change the target, so a change request (a pull

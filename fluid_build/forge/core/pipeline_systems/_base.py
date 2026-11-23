@@ -25,7 +25,7 @@ each CI system's quirks stay contained and the file count is bounded.
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fluid_build._env_names import ENV_NAME_RULE, is_env_name
 
@@ -147,16 +147,20 @@ def check_pipeline_literal(what: str, value: str) -> str:
     return value
 
 
-def check_pipeline_workdir(workdir: str) -> str:
+def check_pipeline_workdir(workdir: str, what: str = "workdir") -> str:
     """``check_pipeline_literal`` for the workdir, which is also written into
     ``archiveArtifacts`` patterns: a glob character or a comma there would
-    archive files the pipeline did not write, or split the pattern list."""
-    check_pipeline_literal("workdir", workdir)
+    archive files the pipeline did not write, or split the pattern list.
+    ``what`` names the value in the refusal (the other paths of a generated
+    command are held to the same rule)."""
+    check_pipeline_literal(what, workdir)
     if re.search(r"[*?,\[\]]", workdir):
-        raise ValueError(
-            f"workdir {workdir!r} contains a glob character or a comma, which an "
-            "archiveArtifacts pattern would read as a pattern"
+        reason = (
+            "which an archiveArtifacts pattern would read as a pattern"
+            if what == "workdir"
+            else "which a path of the generated pipeline does not carry"
         )
+        raise ValueError(f"{what} {workdir!r} contains a glob character or a comma, {reason}")
     return workdir
 
 
@@ -353,8 +357,12 @@ class PipelineConfig:
     # run the plan phase (``fluid generate ci --default-branch``).
     default_branch: str = "main"
     # The opt-in jobs beside the pipeline (``fluid generate ci --add``), from
-    # ``_thin.ADD_ONS``: security, compliance, sbom.
+    # ``_thin.ADD_ONS``: security, compliance, sbom, import-drift. The last needs
+    # ``import_drift``; generation raises ``ValueError`` without it.
     add_ons: Tuple[str, ...] = ()
+    # What the import-drift add-on checks (a ``_thin.ImportDrift``; typed Any
+    # because ``_thin`` imports this module).
+    import_drift: Optional[Any] = None
 
     def __post_init__(self):
         branch = check_pipeline_literal("default branch", self.default_branch or "")

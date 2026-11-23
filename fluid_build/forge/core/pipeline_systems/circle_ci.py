@@ -67,7 +67,7 @@ class CircleCITemplate(BasePipelineTemplate):
     def _config(self, config: PipelineConfig) -> Dict[str, Any]:
         branch = self._branch(config)
         only_default = {"branches": {"only": branch}}
-        add_ons = _thin.check_add_ons(config.add_ons)
+        add_ons = _thin.check_add_ons(config.add_ons, config.import_drift)
         jobs: Dict[str, Any] = {
             "plan": self._plan_job(config),
             "apply": self._apply_job(config),
@@ -81,6 +81,9 @@ class CircleCITemplate(BasePipelineTemplate):
             beside.append("security")
         if "sbom" in add_ons:
             beside.append({"sbom": {"filters": only_default}})
+        # The drift gate: every push, a pull request's branch included.
+        if "import-drift" in add_ons:
+            beside.append("import-drift")
         # A scheduled run starts no plan and parks no approval; a run that asks for
         # the compliance workflow does not start the plan either.
         plan_when: Dict[str, Any] = {"equal": ["scheduled_pipeline", SCHEDULED]}
@@ -164,7 +167,7 @@ class CircleCITemplate(BasePipelineTemplate):
                 "description": f"Passed to fluid ship ({knob}); blank keeps ship's default.",
             }
         # Not a value ship reads: it starts the compliance workflow on a manual run.
-        if "compliance" in _thin.check_add_ons(config.add_ons):
+        if "compliance" in _thin.check_add_ons(config.add_ons, config.import_drift):
             parameters[RUN_COMPLIANCE] = {
                 "type": "boolean",
                 "default": False,
@@ -256,7 +259,19 @@ class CircleCITemplate(BasePipelineTemplate):
         """Install, run the add-on's lines, keep runtime/. The job environment is
         the one apply has, so compliance (fluid verify) reaches the cloud."""
         job = self._job(config)
-        lines = _thin.add_on_script(add_on, config.contract_path or _thin.DEFAULT_CONTRACT)
+        lines = _thin.add_on_script(
+            add_on, config.contract_path or _thin.DEFAULT_CONTRACT, config.import_drift
+        )
+        if add_on == "import-drift":  # a gate: it writes nothing to keep
+            job["steps"] += [
+                {
+                    "run": {
+                        "name": _thin.ADD_ON_TITLES[add_on],
+                        "command": _keyless.LiteralStr(self._cd(config) + "\n".join(lines) + "\n"),
+                    }
+                }
+            ]
+            return job
         job["steps"] += [
             {
                 "run": {

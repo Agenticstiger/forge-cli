@@ -78,7 +78,7 @@ class TektonTemplate(BasePipelineTemplate):
         tasks = [self._task(config)]
         # Each add-on is its own Task and Pipeline, started deliberately like
         # fluid-apply, so it never blocks fluid-plan or fluid-apply.
-        for add_on in _thin.check_add_ons(config.add_ons):
+        for add_on in _thin.check_add_ons(config.add_ons, config.import_drift):
             tasks.append(self._add_on_task(config, add_on))
             pipelines.append(self._add_on_pipeline(config, add_on))
         return {
@@ -204,7 +204,9 @@ class TektonTemplate(BasePipelineTemplate):
         """Install, run the add-on's lines, in the step environment apply has
         (compliance runs fluid verify, which reaches the cloud)."""
         cd = f'cd "{check_pipeline_workdir(config.workdir)}"\n' if config.workdir else ""
-        lines = _thin.add_on_script(add_on, config.contract_path or _thin.DEFAULT_CONTRACT)
+        lines = _thin.add_on_script(
+            add_on, config.contract_path or _thin.DEFAULT_CONTRACT, config.import_drift
+        )
         script = (
             "#!/bin/sh\n"
             "set -eu\n"
@@ -220,7 +222,11 @@ class TektonTemplate(BasePipelineTemplate):
             "kind": "Task",
             "metadata": {"name": f"{TASK_NAME}-{add_on}"},
             "spec": {
-                "description": f"{_thin.ADD_ON_TITLES[add_on]}: reports are written to runtime/.",
+                "description": (
+                    f"{_thin.ADD_ON_TITLES[add_on]}: exits 1 on drift, writes nothing."
+                    if add_on == "import-drift"
+                    else f"{_thin.ADD_ON_TITLES[add_on]}: reports are written to runtime/."
+                ),
                 "params": [
                     {
                         "name": RUN_ID,
@@ -255,7 +261,13 @@ class TektonTemplate(BasePipelineTemplate):
             "kind": "Pipeline",
             "metadata": {"name": f"fluid-{add_on}"},
             "spec": {
-                "description": f"{_thin.ADD_ON_TITLES[add_on]}. Start it on purpose.",
+                "description": (
+                    f"{_thin.ADD_ON_TITLES[add_on]}, a gate: start it from the Triggers of "
+                    "every pull request and every push to the default branch. It never feeds "
+                    "fluid-apply."
+                    if add_on == "import-drift"
+                    else f"{_thin.ADD_ON_TITLES[add_on]}. Start it on purpose."
+                ),
                 "params": self._param_decls(config),
                 "workspaces": [{"name": WORKSPACE}],
                 "tasks": [

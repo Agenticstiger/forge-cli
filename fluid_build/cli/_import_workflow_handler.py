@@ -19,6 +19,11 @@ symbolic link, a directory, a device): it is looked at with ``lstat`` and never 
 written through. A file that is written is written whole to a temporary file next to it and
 renamed over the target, so a failed write leaves the old file as it was. An existing file is
 read only as far as it could equal what would be written.
+
+``--check`` (``airflow``, ``pyspark``) is the other way to run the same import: it reads the code
+again, compares what it proposes with the contracts already written where the import would write
+them, and writes nothing (``--out-report`` names the one file it may). The report and the exit
+codes are in :mod:`fluid_build.cli.import_workflow._drift`.
 """
 
 from __future__ import annotations
@@ -26,18 +31,22 @@ from __future__ import annotations
 import logging
 import os
 import stat
+import sys
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import yaml
 
 from fluid_build.cli._errors import FluidUserError, SchemaValidationError
-from fluid_build.cli.console import cprint, cprint_literal
+from fluid_build.cli.console import cprint, cprint_json, cprint_literal
 from fluid_build.cli.import_workflow import coerce_report, get_importer, importer_names
 from fluid_build.cli.import_workflow._pysource import clean_chars
 from fluid_build.cli.import_workflow.airbyte import SERVER_URL_ENV as AIRBYTE_SERVER_URL_ENV
 from fluid_build.util.atomic_write import atomic_write_bytes
 from fluid_build.util.safe_yaml import read_bounded_file
+
+if TYPE_CHECKING:
+    from fluid_build.cli.import_workflow._drift import DriftReport
 
 #: The importers that propose products from code (one per output by default).
 PROPOSING_TOOLS = ("airflow", "pyspark")
@@ -116,6 +125,22 @@ def check_import_flags(args, tool: Optional[str]) -> None:
             "Remove --dags, or use `fluid import pyspark <jobs-dir> --dags <dags-dir>`.",
             flag="--dags",
         )
+
+
+def refuse_report_flags_without_check(args: Any) -> None:
+    """``--format``, ``--strict`` and ``--out-report`` shape the drift report of ``--check``."""
+    for dest, flag in (
+        ("check_format", "--format"),
+        ("strict", "--strict"),
+        ("out_report", "--out-report"),
+    ):
+        if getattr(args, dest, None):
+            raise _flag_refusal(
+                f"{flag} applies to `fluid import <tool> <source> --check`",
+                "It shapes the drift report, and there is none without --check.",
+                f"Add --check, or remove {flag}.",
+                flag=flag,
+            )
 
 
 def _require_source(tool: str, source: Optional[str]) -> str:
@@ -258,6 +283,168 @@ def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Opt
     return 0
 
 
+def _check_mode_flags(args: Any, tool: Optional[str]) -> None:
+    """The flags ``--check`` refuses: a tool that reads no code, and ``--force`` (``--check``
+    writes nothing, so there is nothing for it to replace)."""
+    if tool not in PROPOSING_TOOLS:
+        raise _flag_refusal(
+            "--check applies to `fluid import airflow` and `fluid import pyspark`",
+            "It reads the code again and compares what it proposes with the contracts already "
+            "written; "
+            + (
+                "the directory scan has no such thing."
+                if tool is None
+                else f"`fluid import {tool}` reads a configuration, not code."
+            ),
+            "Name airflow or pyspark.",
+            flag="--check",
+        )
+    if getattr(args, "force", False):
+        raise _flag_refusal(
+            "--check cannot be used with --force",
+            "--force replaces contract files; --check only reads them and writes nothing.",
+            "Remove --force.",
+            flag="--force",
+        )
+    check_import_flags(args, tool)
+
+
+def _emit(text: str, *, stderr: bool = False) -> None:
+    """A report or a refusal, as it is: no markup, no wrapping (a workflow command or a JSON
+    string cut at the terminal's width is a different command or no JSON)."""
+    if stderr:
+        sys.stderr.write(text if text.endswith("\n") else text + "\n")
+    else:
+        cprint_json(text)
+
+
+#: How a report of ``--check`` begins, in each format (and an error in each): the only kind of
+#: existing file ``--out-report`` replaces, besides an empty one.
+_REPORT_STARTS = (
+    '{\n  "schema": ',
+    "Import drift check:",
+    "::error ",
+    "::warning ",
+    "╭",
+    "\x1b[",
+    "✗ ",
+)
+
+
+def _is_an_earlier_report(path: Path) -> bool:
+    """Whether the regular file at ``path`` is empty or begins as a report of ``--check`` does,
+    so the second run of a pipeline replaces the first run's report and nothing else (not a
+    contract, the conventions, or a source file named by mistake)."""
+    try:
+        fd = os.open(
+            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        )
+    except OSError:
+        return False
+    try:
+        head = os.read(fd, 64).decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return head == "" or head.startswith(_REPORT_STARTS)
+
+
+def _write_report(path_arg: str, text: str, *, protected: List[Path]) -> None:
+    """``--out-report``: the report as printed, in a file. The one file ``--check`` writes. It
+    replaces a file only when that is an earlier report, and never writes through a link, into a
+    directory or over a device."""
+    path = Path(path_arg)
+    shown = clean_chars(path_arg)
+    if any(path.resolve() == other.resolve() for other in protected):
+        raise _flag_refusal(
+            f"--out-report {shown} is a contract this check reads",
+            "The report would replace the file it was compared with.",
+            "Choose another path for the report.",
+            flag="--out-report",
+        )
+    state = _file_state(path, b"", guarded=False)
+    if state in ("special", "inaccessible"):
+        raise _flag_refusal(
+            f"cannot write the report to {shown}",
+            "It is a link, a directory or a device, or a folder above it cannot be entered; "
+            "none is written through.",
+            "Choose another path for the report.",
+            flag="--out-report",
+        )
+    if state == "overwrite" and not _is_an_earlier_report(path):
+        raise _flag_refusal(
+            f"--out-report {shown} is a file that is not a report of this check",
+            "A contract, the conventions or a source file named by mistake would be replaced. "
+            "Only an empty file or an earlier report is.",
+            "Choose another path for the report.",
+            flag="--out-report",
+        )
+    _write_file(path, text if text.endswith("\n") else text + "\n", state)
+
+
+def run_import_check(
+    args: Any, logger: logging.Logger, *, tool: Optional[str], source: Optional[str]
+) -> int:
+    """``fluid import <tool> <source> --check``: does the code still match the contracts that were
+    written from it? Reads the code and the committed contracts; writes nothing, bar the one
+    file ``--out-report`` names.
+
+    Exit 0: in sync. 1: drift. 2: it cannot decide (a refusal, an unreadable source, no contract
+    written yet). Only a decided difference exits 1: a typed refusal and an error nobody foresaw
+    are both 2, whatever the CLI's own handler returns for them (1), so a broken run cannot pass
+    for drift, or a crash for a clean tree.
+    """
+    from fluid_build.cli.import_workflow import _drift
+
+    fmt = getattr(args, "check_format", None) or "text"
+    out_report = getattr(args, "out_report", None)
+    paths: List[Path] = []
+    try:
+        _check_mode_flags(args, tool)
+        report = _drift_report(args, tool or "", _require_source(tool or "", source), paths)
+        text = _drift.render(report, fmt)
+        if out_report is not None:  # first: a path that cannot be written is said once
+            _write_report(out_report, text, protected=paths)
+        _emit(text)
+        return report.exit_code
+    except Exception as exc:  # noqa: BLE001 - see above: nothing but drift may exit 1
+        logger.debug("fluid import --check stopped", exc_info=True)
+        refused = _drift.as_refusal(exc, tool)
+        # colour only for a person at a terminal: a CI log or a pipe gets plain text
+        color = sys.stderr.isatty() and not getattr(args, "no_color", False)
+        text, to_stderr = _drift.render_error(refused, fmt, color=color)
+        _emit(text, stderr=to_stderr)
+        if out_report is not None:
+            try:
+                _write_report(out_report, text, protected=paths)
+            except Exception:  # noqa: BLE001 - the refusal above is the one to act on
+                logger.debug("the report could not be written either", exc_info=True)
+        return _drift.EXIT_ERROR
+
+
+def _drift_report(args: Any, tool: str, source: str, paths: List[Path]) -> "DriftReport":
+    """The code read again, and compared with the contracts at the paths this import writes
+    (``paths`` is filled in, for ``--out-report`` to keep clear of them)."""
+    from fluid_build.cli.import_workflow import _drift
+    from fluid_build.cli.import_workflow._pipeline import run_import_traced
+    from fluid_build.cli.import_workflow.schema_registry import REGISTRY_FLAGS
+
+    options = _importer_options(args, tool)
+    options["verify_syntax"] = True
+    # The columns of a topic are never compared, so the registry is never asked for them: a gate
+    # that needed the network for nothing it reports would fail for the wrong reason.
+    for dest in REGISTRY_FLAGS:
+        options.pop(dest, None)
+    trace = run_import_traced(tool, source, options)
+    _drift.require_readable(trace.unreadable)
+    paths.extend(
+        _planned_paths(trace.contracts, getattr(args, "out_path", None), existing_dir=True)
+    )
+    report = _drift.DriftReport(tool, source, strict=bool(getattr(args, "strict", False)))
+    return _drift.check(trace.contracts, trace.sources, paths, report, trace.roots)
+
+
 def _file_state(path: Path, data: bytes, *, guarded: bool) -> str:
     """What is at ``path``, looked at without following a link:
 
@@ -298,28 +485,37 @@ def _file_state(path: Path, data: bytes, *, guarded: bool) -> str:
     return "unchanged" if existing.replace(b"\r\n", b"\n") == data else "different"
 
 
+def _planned_paths(
+    contracts: List[Dict[str, Any]], out_arg: Optional[str], *, existing_dir: bool = False
+) -> List[Path]:
+    """Where each contract goes: with one contract ``--out`` names the file, with several it names
+    the directory. What ``--check`` reads, too: the files the import writes, never a glob.
+    ``existing_dir`` (``--check``): an ``--out`` that is a directory is the directory of one
+    contract as well, because the contracts it holds may have been written when the code had
+    more products, and the file of this one is in it."""
+    if not contracts:
+        return []
+    if len(contracts) == 1 and not (existing_dir and out_arg and os.path.isdir(out_arg)):
+        return [Path(out_arg or _default_out_path(contracts[0]))]
+    out_dir = Path(out_arg) if out_arg else Path(".")
+    if out_arg and os.path.lexists(out_dir) and not out_dir.is_dir():
+        raise _flag_refusal(
+            f"--out names a file, but this import writes {len(contracts)} files",
+            f"With several products --out is the directory they are written to, and "
+            f"{clean_chars(out_arg)} is an existing file.",
+            "Pass a directory as --out (it is created when it is missing).",
+            out=clean_chars(out_arg),
+        )
+    return [out_dir / _default_out_path(contract) for contract in contracts]
+
+
 def _plan_writes(contracts: list, out_arg: Optional[str], *, guarded: bool = True) -> list:
     """``[(path, yaml text, state)]``: where each contract goes, and what is there now (see
     :func:`_file_state`).
 
     One contract: ``--out`` names the file. Several: ``--out`` names the directory.
     """
-    if not contracts:
-        return []
-    paths: list[Path] = []
-    if len(contracts) == 1:
-        paths.append(Path(out_arg or _default_out_path(contracts[0])))
-    else:
-        out_dir = Path(out_arg) if out_arg else Path(".")
-        if out_arg and os.path.lexists(out_dir) and not out_dir.is_dir():
-            raise _flag_refusal(
-                f"--out names a file, but this import writes {len(contracts)} files",
-                f"With several products --out is the directory they are written to, and "
-                f"{clean_chars(out_arg)} is an existing file.",
-                "Pass a directory as --out (it is created when it is missing).",
-                out=clean_chars(out_arg),
-            )
-        paths.extend(out_dir / _default_out_path(contract) for contract in contracts)
+    paths = _planned_paths(contracts, out_arg)
     planned = []
     for path, contract in zip(paths, contracts, strict=True):
         text = yaml.safe_dump(contract, sort_keys=False)

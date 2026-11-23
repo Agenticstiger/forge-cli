@@ -38,7 +38,7 @@ import yaml
 
 from fluid_build.cli._ship_table import SHIP_VARIABLES, STAGE_TOGGLES
 from fluid_build.forge.core.pipeline_systems import _thin
-from fluid_build.forge.core.pipeline_systems._thin import ADD_ON_TITLES, ADD_ONS
+from fluid_build.forge.core.pipeline_systems._thin import ADD_ON_TITLES, ADD_ONS, ImportDrift
 from fluid_build.forge.core.pipeline_templates import (
     PipelineConfig,
     PipelineProvider,
@@ -77,6 +77,8 @@ _GATE_CONFIGS: Dict[str, Dict[str, Any]] = {
 
 
 def _files(provider: PipelineProvider, **kwargs: Any) -> Dict[str, str]:
+    if "import-drift" in kwargs.get("add_ons", ()) and "import_drift" not in kwargs:
+        kwargs["import_drift"] = ImportDrift("airflow", "dags")
     return PipelineTemplateGenerator().generate_pipeline(
         PipelineConfig(provider=provider, **kwargs)
     )
@@ -181,7 +183,7 @@ def test_with_every_add_on_the_only_other_commands_are_policy_check_and_verify(
 ):
     files = _files(provider, add_ons=ADD_ONS, install_mode=install_mode)
     words = set(_fluid_words(_snippets(provider, files)))
-    allowed = {"ship", "--version", "policy-check", "verify", *_IMPACT.get(provider, ())}
+    allowed = {"ship", "--version", "policy-check", "verify", "import", *_IMPACT.get(provider, ())}
     assert words <= allowed, sorted(words)
     assert {"policy-check", "verify"} <= words
 
@@ -440,7 +442,9 @@ def test_the_workdir_is_honoured(provider):
         ci = _gitlab_body(files[".gitlab-ci.yml"])
         for job in ("fluid-plan", "fluid-apply", *(f"fluid-{a}" for a in ADD_ONS)):
             assert f'cd "{workdir}"' in ci[job]["before_script"], job
-            assert all(p.startswith(f"{workdir}/") for p in ci[job]["artifacts"]["paths"]), job
+            # the drift gate writes nothing, so it keeps nothing
+            paths = ci[job].get("artifacts", {}).get("paths", [])
+            assert all(p.startswith(f"{workdir}/") for p in paths), job
     elif provider is P.TEKTON:
         tasks = [d for p, d in _documents(files) if p == "tekton/tasks.yaml"]
         assert tasks
@@ -715,7 +719,8 @@ def _has_add_on(provider: PipelineProvider, files: Dict[str, str], add_on: str) 
         return f"stage('{ADD_ON_TITLES[add_on]}')" in files["Jenkinsfile"]
     if provider is P.AZURE_DEVOPS:
         stages = yaml.safe_load(files["azure-pipelines.yml"])["stages"]
-        return add_on in {s["stage"] for s in stages}
+        # an Azure stage name takes no hyphen
+        return add_on.replace("-", "_") in {s["stage"] for s in stages}
     if provider is P.BITBUCKET:
         return f"name: {ADD_ON_TITLES[add_on]}\n" in files["bitbucket-pipelines.yml"]
     if provider is P.CIRCLE_CI:
@@ -747,7 +752,7 @@ def test_every_add_on_together(provider):
     files = _files(provider, add_ons=ADD_ONS)
     assert [a for a in ADD_ONS if _has_add_on(provider, files, a)] == list(ADD_ONS)
     # Order and repeats do not matter.
-    again = _files(provider, add_ons=("sbom", "security", "sbom", "compliance"))
+    again = _files(provider, add_ons=("import-drift", "sbom", "security", "sbom", "compliance"))
     assert again == files
 
 
@@ -755,6 +760,7 @@ def test_github_add_ons_add_their_documented_files():
     files = _files(P.GITHUB_ACTIONS, add_ons=ADD_ONS)
     assert sorted(files) == [
         ".github/workflows/fluid-compliance.yml",
+        ".github/workflows/fluid-import-drift.yml",
         ".github/workflows/fluid-pipeline.yml",
         ".github/workflows/fluid-sbom.yml",
         ".github/workflows/fluid-security.yml",
