@@ -76,7 +76,7 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
                 self._apply_stage(config, branch),
                 *[
                     self._add_on_stage(config, branch, add_on)
-                    for add_on in _thin.check_add_ons(config.add_ons)
+                    for add_on in _thin.check_add_ons(config.add_ons, config.import_drift)
                 ],
             ],
         }
@@ -242,6 +242,8 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
         """An add-on runs beside the plan (``dependsOn: []``), so it never
         blocks plan or apply, and keeps ``runtime/``. Compliance runs ``fluid
         verify``, which reaches the cloud: it gets the same variables apply has."""
+        if add_on == "import-drift":
+            return self._import_drift_stage(config)
         when = {
             "security": None,  # every run: pull requests and the default branch
             "sbom": f"eq(variables['Build.SourceBranch'], 'refs/heads/{branch}')",
@@ -279,6 +281,26 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
             stage["condition"] = when
         stage["jobs"] = [{"job": add_on, "pool": {"vmImage": "ubuntu-latest"}, "steps": steps}]
         return stage
+
+    def _import_drift_stage(self, config: PipelineConfig) -> Dict[str, Any]:
+        """The drift gate: a stage of its own (``dependsOn: []``) on every run, a
+        pull request and the default branch included. It is not advisory (a
+        failing exit code fails the stage), writes nothing, and neither waits for
+        plan nor feeds apply."""
+        command = _thin.import_drift_command(_thin.import_drift_of(config), "text")
+        steps = [
+            *self._setup_steps(config),
+            {
+                "bash": _keyless.LiteralStr(self._cd(config) + command + "\n"),
+                "displayName": _thin.ADD_ON_TITLES["import-drift"],
+            },
+        ]
+        return {
+            "stage": "import_drift",
+            "displayName": _thin.ADD_ON_TITLES["import-drift"],
+            "dependsOn": [],
+            "jobs": [{"job": "import_drift", "pool": {"vmImage": "ubuntu-latest"}, "steps": steps}],
+        }
 
     # ------------------------------------------------------------------
     # Header

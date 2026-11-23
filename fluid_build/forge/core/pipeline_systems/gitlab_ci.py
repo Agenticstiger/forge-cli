@@ -100,7 +100,7 @@ class GitLabCITemplate(BasePipelineTemplate):
         return {PIPELINE_PATH: self._header(config) + header + "---\n" + body}
 
     def _pipeline(self, config: PipelineConfig, variables: Dict[str, Any]) -> Dict[str, Any]:
-        add_ons = _thin.check_add_ons(config.add_ons)
+        add_ons = _thin.check_add_ons(config.add_ons, config.import_drift)
         rules: List[Dict[str, str]] = [
             {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'},
             # A branch with an open merge request runs its merge request
@@ -109,7 +109,7 @@ class GitLabCITemplate(BasePipelineTemplate):
             {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"},
             {"if": '$CI_PIPELINE_SOURCE == "web"'},
         ]
-        if add_ons:  # their scheduled runs (Build > Pipeline schedules)
+        if any(a != "import-drift" for a in add_ons):  # their scheduled runs (Pipeline schedules)
             rules.append({"if": '$CI_PIPELINE_SOURCE == "schedule"'})
         pipeline: Dict[str, Any] = {
             "workflow": {"rules": rules},
@@ -139,12 +139,27 @@ class GitLabCITemplate(BasePipelineTemplate):
             {"if": '$CI_PIPELINE_SOURCE == "schedule"'},
             {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"},
         ],
+        # A gate: every merge request and every push to the default branch.
+        "import-drift": [
+            {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'},
+            {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"},
+        ],
     }
 
     def _add_on_job(self, add_on: str, config: PipelineConfig) -> Dict[str, Any]:
         """An add-on runs beside the plan, never blocks it, and keeps what it wrote."""
         job = self._job(config, "plan", "")
-        script = _thin.add_on_script(add_on, self._contract(config))
+        script = _thin.add_on_script(add_on, self._contract(config), config.import_drift)
+        if add_on == "import-drift":
+            # A gate, not a report: it fails the job, writes nothing and neither
+            # waits for fluid-plan nor feeds fluid-apply.
+            job.pop("id_tokens", None)
+            job.pop("variables", None)
+            job.pop("artifacts", None)
+            job["script"] = script
+            job["rules"] = self._ADD_ON_RULES[add_on]
+            job["needs"] = []
+            return job
         auth = _keyless.gitlab_auth_script(config.cloud_auth) if add_on == "compliance" else []
         job["script"] = [*auth, *script]
         if add_on != "compliance":

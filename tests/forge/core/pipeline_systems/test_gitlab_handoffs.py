@@ -41,7 +41,7 @@ _SCHEMA = Path(__file__).parents[3] / "fixtures" / "ci_schemas" / "gitlab-ci.jso
 _CONFIGS: Dict[str, Dict[str, Any]] = {
     "plain": {},
     "workdir+cloud": {"workdir": "sub/dir", "cloud_auth": ("aws", "gcp", "snowflake")},
-    "all-add-ons": {"add_ons": _thin.ADD_ONS},
+    "all-add-ons": {"add_ons": _thin.ADD_ONS, "import_drift": _thin.ImportDrift("airflow", "dags")},
 }
 
 

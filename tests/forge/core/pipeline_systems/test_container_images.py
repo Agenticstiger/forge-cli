@@ -25,7 +25,7 @@ from fluid_build.forge.core.pipeline_systems import (
     PipelineTemplateGenerator,
 )
 from fluid_build.forge.core.pipeline_systems._base import check_image_ref
-from fluid_build.forge.core.pipeline_systems._thin import ADD_ONS
+from fluid_build.forge.core.pipeline_systems._thin import ADD_ONS, ImportDrift
 from fluid_build.forge.core.pipeline_systems.tekton import IMAGE
 
 pytestmark = [pytest.mark.unit]
@@ -139,7 +139,9 @@ def _image_values(node) -> List[str]:
 
 @pytest.mark.parametrize("provider", list(PipelineProvider))
 def test_every_generated_container_image_is_pinned_by_digest(provider):
-    config = PipelineConfig(provider=provider, add_ons=ADD_ONS)
+    config = PipelineConfig(
+        provider=provider, add_ons=ADD_ONS, import_drift=ImportDrift("airflow", "dags")
+    )
     files = PipelineTemplateGenerator().generate_pipeline(config)
     images = [
         image

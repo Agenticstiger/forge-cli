@@ -20,11 +20,12 @@ environment) and the Jenkins ``input`` / ``milestone`` / ``lock`` gate.
 
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
-from ._base import check_pipeline_literal
+from ._base import check_pipeline_literal, check_pipeline_workdir
 
 DEFAULT_CONTRACT = "contract.fluid.yaml"
 PLAN_STAGES: Tuple[int, ...] = (1, 2, 3, 4, 5, 6)
@@ -33,7 +34,7 @@ OPT_IN_STAGES: Tuple[int, ...] = (10, 11)
 
 #: The opt-in jobs ``--add`` puts beside the pipeline. Each carries what the
 #: retired advanced and enterprise tiers emitted.
-ADD_ONS: Tuple[str, ...] = ("security", "compliance", "sbom")
+ADD_ONS: Tuple[str, ...] = ("security", "compliance", "sbom", "import-drift")
 
 #: What a phase keeps for the next one: the frozen bundle and the reviewed
 #: plan (apply refuses anything else), the run report the stages share, and
@@ -107,13 +108,102 @@ ADD_ON_TITLES = {
     "security": "security scan",
     "compliance": "compliance report",
     "sbom": "SBOM",
+    "import-drift": "import drift check",
 }
 
+#: The importers ``fluid import <tool> <source> --check`` gates, and the
+#: product boundaries its ``--split-by`` takes.
+IMPORT_TOOLS: Tuple[str, ...] = ("airflow", "pyspark")
+IMPORT_SPLIT_BY: Tuple[str, ...] = ("table", "job", "dag", "task", "folder", "project")
 
-def add_on_script(add_on: str, contract: str = DEFAULT_CONTRACT) -> List[str]:
+#: Shell syntax a path may not carry, on top of what a pipeline literal refuses.
+#: Every path is quoted as well; this keeps a value that is plainly not a path
+#: out of the file instead of quoting it.
+_SHELL_SYNTAX = re.compile(r"[;&|<>()]")
+
+
+@dataclass(frozen=True)
+class ImportDrift:
+    """What the ``import-drift`` add-on checks: ``fluid import <tool> <source> --check``.
+
+    ``out`` is where the import writes its contracts, ``split_by`` the product
+    boundary, ``conventions`` the layout file and ``dags`` the DAGs directory
+    (pyspark only): the options of the import that wrote the committed contracts.
+    """
+
+    tool: str
+    source: str
+    out: str = ""
+    split_by: str = ""
+    conventions: str = ""
+    dags: str = ""
+
+    def __post_init__(self) -> None:
+        if self.tool not in IMPORT_TOOLS:
+            raise ValueError(f"import tool {self.tool!r}: one of {', '.join(IMPORT_TOOLS)}")
+        if not self.source:
+            raise ValueError("the import source is empty: name the directory the import reads")
+        for what, value in (
+            ("import source", self.source),
+            ("import out", self.out),
+            ("import conventions", self.conventions),
+            ("import dags", self.dags),
+        ):
+            if not value:
+                continue
+            check_pipeline_workdir(value, what)
+            if value.startswith("-") or _SHELL_SYNTAX.search(value):
+                raise ValueError(f"{what} {value!r} is not a path the command can take")
+        if self.split_by and self.split_by not in IMPORT_SPLIT_BY:
+            raise ValueError(
+                f"import split-by {self.split_by!r}: one of {', '.join(IMPORT_SPLIT_BY)}"
+            )
+        if self.dags and self.tool != "pyspark":
+            raise ValueError("--dags belongs to the pyspark importer")
+
+
+def import_drift_of(config: Any) -> ImportDrift:
+    """The config's import drift settings; a ``ValueError`` when there are none."""
+    spec = config.import_drift
+    if not isinstance(spec, ImportDrift):
+        raise ValueError("the import-drift add-on needs import_drift (the tool and the source)")
+    return spec
+
+
+def import_drift_command(spec: ImportDrift, fmt: str) -> str:
+    """The one line the add-on runs. Every value is one quoted shell word, never
+    a ``${NAME:-default}`` expansion: a run must not be able to point the gate
+    at another source. Its exit code is the gate's: 0 in sync, 1 drift, 2 it
+    cannot decide."""
+    if fmt not in ("text", "github"):
+        raise ValueError(f"import drift format {fmt!r}: text or github")
+    source = shlex.quote(check_pipeline_workdir(spec.source, "import source"))
+    words = ["fluid", "import", spec.tool, source]
+    for flag, value in (
+        ("--dags", spec.dags),
+        ("--conventions", spec.conventions),
+        ("--split-by", spec.split_by),
+        ("--out", spec.out),
+    ):
+        if value:
+            words += [flag, shlex.quote(check_pipeline_workdir(value, f"import {flag[2:]}"))]
+    words += ["--check", "--format", fmt]
+    return " ".join(words)
+
+
+def add_on_script(
+    add_on: str,
+    contract: str = DEFAULT_CONTRACT,
+    import_drift: Optional[ImportDrift] = None,
+) -> List[str]:
     """The shell lines of an add-on job, for every system but GitHub (which
     runs the published actions instead). An optional scanner that is not on
-    the runner is skipped with a line saying so, as the retired tiers did."""
+    the runner is skipped with a line saying so, as the retired tiers did.
+    The import drift check is a gate: its exit code is the job's."""
+    if add_on == "import-drift":
+        if import_drift is None:
+            raise ValueError("the import-drift add-on needs import_drift (the tool and the source)")
+        return [import_drift_command(import_drift, "text")]
     target = quoted_contract(contract)
     if add_on == "security":
         return [
@@ -140,12 +230,18 @@ def add_on_script(add_on: str, contract: str = DEFAULT_CONTRACT) -> List[str]:
     raise ValueError(f"unknown add-on {add_on!r}: one of {', '.join(ADD_ONS)}")
 
 
-def check_add_ons(add_ons: Any) -> Tuple[str, ...]:
-    """The add-ons in ``ADD_ONS`` order, without repeats; an unknown one is refused."""
+def check_add_ons(add_ons: Any, import_drift: Any = None) -> Tuple[str, ...]:
+    """The add-ons in ``ADD_ONS`` order, without repeats; an unknown one is
+    refused, and so is ``import-drift`` without its settings."""
     wanted = set(add_ons or ())
     unknown = sorted(wanted - set(ADD_ONS))
     if unknown:
         raise ValueError(f"unknown add-on {', '.join(unknown)}: one of {', '.join(ADD_ONS)}")
+    if "import-drift" in wanted:
+        if import_drift is None:
+            raise ValueError("the import-drift add-on needs import_drift (the tool and the source)")
+        if not isinstance(import_drift, ImportDrift):
+            raise ValueError("import_drift must be an ImportDrift")
     return tuple(a for a in ADD_ONS if a in wanted)
 
 

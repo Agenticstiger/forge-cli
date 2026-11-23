@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid import airflow|pyspark SOURCE --check` is a drift gate for CI.** It reads the DAGs or the
+  job files again, compares what they say with the contracts already written where the import writes
+  them (give it the `--out`, `--split-by`, `--conventions` and `--dags` of the import that wrote
+  them), and writes nothing. It exits 0 when they match, 1 on drift and 2 when it cannot decide (an
+  unreadable source, no contract written yet, a refusal, an error nobody foresaw), so a broken run
+  never reads as drift; `--force` is refused with it. Only what the code decides is compared, per
+  product: which jobs and outputs there are, each output's `kind`, `platform`, `format` and `location`
+  (a binding the import left at `other` is the person's once they have named a platform), the reads
+  the import wrote, and the DAG that runs a job with its schedule (when the code gives a
+  literal cron or preset), its `catchup` (when the code sets it) and its tasks. What a person
+  completed is never drift: descriptions, owners, columns, tags, a schedule the code does not state,
+  and any output, read or build they added; key order and comments do not count. Each difference is typed (`job_added`, `job_removed`, `output_added`,
+  `output_removed`, `schedule_changed`, `table_changed`, `coverage_regressed`) and names the contract
+  file, the field and the line of code. A job that is gone and something the import used to find and
+  no longer does are warnings, and drift with `--strict`. `--format text|json|github` picks the
+  report (`github` writes workflow annotations; `json` a document with `"schema": 1`); at most 100
+  items are listed and the rest counted, and every value is redacted before it is printed.
+  `--out-report PATH` also writes the report to a file, the one file `--check` writes, and replaces
+  an existing file only when it is empty or an earlier report (the path is used as given: `../` and
+  a symbolic link in a parent directory are followed, as with `--out`). A source file the scan
+  cannot read (a syntax error, no permission, past the size limits) makes the check exit 2 and
+  names the file: fix or remove it, or list it under `ignore.files` in the conventions. A job file
+  deleted from the code is `job_removed` for the contract the import wrote for it, found among the
+  `contract.*.fluid.yaml` files of the output directory (only a build of the shape the import
+  writes whose script is gone; a deleted DAG file is `coverage_regressed`: the job is still there).
+  When only some of the contract files are missing the exit is 1 (a new job or output); when none
+  exists it is 2. A contract left behind for a job that still exists but no longer writes that
+  output is not looked for.
+
+- **`fluid generate ci --add import-drift` puts that gate in a generated pipeline.** Give it
+  `--import-tool airflow|pyspark` and `--import-source DIR`, and the options the import that wrote the
+  contracts had (`--import-out`, `--import-split-by`, `--import-conventions`, `--import-dags`).
+  Every CI system then runs `fluid import <tool> <source> --check` on every pull or merge request and
+  every push to the default branch, and fails when the contracts have drifted or the check cannot
+  decide. It is not a numbered stage and never advisory: GitHub Actions gets its own workflow,
+  `fluid-import-drift.yml`, with `--format github` so drift shows as annotations; GitLab, Azure
+  DevOps, CircleCI and Tekton run it beside the plan and apply, Jenkins and Bitbucket before apply, as
+  their security scan runs. Each path is checked and written as one quoted shell word, never an
+  expansion a run could override.
+
 - **`fluid profile --privacy-unit` warns when `rho` is above 1.** The release still runs, and
   `--rho` still takes any number above zero. The warning cites OpenDP's rule of thumb, an epsilon
   of at most 1 (rho 0.5), and the rho of about 2.6 to 7.7 that the US Census Bureau's 2020 Census
