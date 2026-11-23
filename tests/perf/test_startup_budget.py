@@ -317,13 +317,19 @@ def _loaded_module_names(code):
         text=True,
         check=True,
         env=_clean_env(),
+        timeout=120,
     ).stdout.splitlines()
     return set(out[2:])
 
 
 def _profile_help_overage():
     """Summarise what ``fluid profile --help`` imports beyond ``fluid --help``."""
-    extra = _loaded_module_names(_PROFILE_HELP_PROBE) - _loaded_module_names(_BUILD_PARSER_PROBE)
+    try:
+        extra = _loaded_module_names(_PROFILE_HELP_PROBE) - _loaded_module_names(
+            _BUILD_PARSER_PROBE
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"the modules beyond `fluid --help` could not be listed ({type(exc).__name__})"
     by_package = {}
     for name in extra:
         by_package.setdefault(name.split(".")[0], []).append(name)
