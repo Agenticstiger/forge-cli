@@ -44,6 +44,15 @@ def test_a_rho_is_decimal_text_above_zero(text):
     assert release.parse_rho(text) == F(text)
 
 
+def test_a_rho_above_one_draws_a_warning_and_is_still_taken():
+    assert release.parse_rho("1") == 1 and release.parse_rho("1.01") == F("1.01")
+    assert release.rho_warning(release.parse_rho("1")) is None
+    assert release.rho_warning(F("0.5")) is None
+    warned = release.rho_warning(release.parse_rho("1.01"))
+    assert warned is not None and warned.startswith("rho 1.01 is above 1, a large privacy loss")
+    assert "OpenDP" in warned and "2020 Census" in warned
+
+
 @pytest.mark.parametrize(
     "text",
     [
