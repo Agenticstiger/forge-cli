@@ -113,6 +113,9 @@ def _display(path: Path, rel: str) -> str:
     return clean_chars(shown)
 
 
+#: :func:`_display`, for the other modules of the package.
+shown_path = _display
+
 #: Reads and writes kept from one scan, in all the jobs it reads: past it the rest of the files
 #: are left unread (a project has tens of thousands, not millions).
 MAX_REFS_PER_SCAN = 200_000

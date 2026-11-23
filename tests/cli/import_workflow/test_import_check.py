@@ -649,8 +649,14 @@ BROKEN = "def (:\n"
         (ARGV, "jobs/clicks_clean.py"),
         (ARGV, "dags/clicks_stream.py"),
         (AIRFLOW, "dags/clicks_stream.py"),
+        (AIRFLOW, "jobs/clicks_clean.py"),
     ],
-    ids=["a pyspark job file", "a DAG file of a pyspark import", "a DAG file of an airflow import"],
+    ids=[
+        "a pyspark job file",
+        "a DAG file of a pyspark import",
+        "a DAG file of an airflow import",
+        "a job file of an airflow import",
+    ],
 )
 def test_a_source_file_with_a_syntax_error_cannot_be_decided(project, capsys, argv, broken):
     """The scan skips a file it cannot parse, and the contracts it would have led to look like
@@ -668,8 +674,12 @@ def test_a_source_file_with_a_syntax_error_cannot_be_decided(project, capsys, ar
 @pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads anything")
 @pytest.mark.parametrize(
     "argv, unreadable",
-    [(ARGV, "jobs/clicks_clean.py"), (AIRFLOW, "dags/clicks_stream.py")],
-    ids=["pyspark", "airflow"],
+    [
+        (ARGV, "jobs/clicks_clean.py"),
+        (AIRFLOW, "dags/clicks_stream.py"),
+        (AIRFLOW, "jobs/clicks_clean.py"),
+    ],
+    ids=["pyspark job", "airflow DAG", "airflow job"],
 )
 def test_a_source_file_this_process_may_not_read_cannot_be_decided(
     project, capsys, argv, unreadable

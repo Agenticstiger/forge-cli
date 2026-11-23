@@ -38,6 +38,7 @@ from ._scan import (
     path_is,
     scan_dags,
     scan_jobs,
+    shown_path,
 )
 from .registry import Importer, ImportReport
 
@@ -432,14 +433,15 @@ def run_import_traced(tool: str, source: str, options: Mapping[str, Any]) -> Imp
     _check_valid(proposal.contracts, proposal.report)
     _cap_unsupported(proposal.report)
     unreadable = [
-        (str(scan.root / rel), why)
+        (shown_path(scan.root / rel, rel), why)
         for scan in scans
         for rel, why in sorted(scan.unreadable.items())
     ]
     roots = [scan.root for scan in scans]
     if dag_scan is not None:
         unreadable += [
-            (str(dag_scan.root / rel), why) for rel, why in sorted(dag_scan.unreadable.items())
+            (shown_path(dag_scan.root / rel, rel), why)
+            for rel, why in sorted(dag_scan.unreadable.items())
         ]
         roots.append(dag_scan.root)
     return ImportTrace(proposal.contracts, proposal.report, proposal.sources, unreadable, roots)
