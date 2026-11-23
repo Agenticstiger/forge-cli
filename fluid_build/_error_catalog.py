@@ -1425,8 +1425,9 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
             + "days; orphans and snapshots older than P1D",
             "A table no forge build writes names runtime instead of build: an EMR runtime "
             + "(emr-serverless, emr-ec2 or emr-eks) with its applicationId, clusterId or "
-            + "virtualClusterId and an executionRoleArn, and removeOrphanFiles then sets "
-            + "olderThan longer than its writer's longest commit delay",
+            + "virtualClusterId and an executionRoleArn, or local for a REST-catalog table on "
+            + "platform local; removeOrphanFiles then sets olderThan longer than its writer's "
+            + "longest commit delay",
         ],
         "validate",
     ),

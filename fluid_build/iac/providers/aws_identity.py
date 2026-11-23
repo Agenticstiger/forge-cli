@@ -519,7 +519,7 @@ def validation_errors(contract: Mapping[str, Any]) -> List[str]:
 
 def validation_warnings(contract: Mapping[str, Any]) -> List[str]:
     """The operator entries the contract's Spark builds, and the maintenance runtimes of the
-    tables no forge build writes, still need (#818: warn here)."""
+    tables no forge build writes, still need (warned here, refused where they run)."""
     warnings = [
         f"{m}; the IaC is refused at generate and apply until the operator lists it"
         for b in _spark_builds_or_empty(contract)

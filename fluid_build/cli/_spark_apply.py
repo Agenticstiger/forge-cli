@@ -686,6 +686,9 @@ def maintain_only(
             continue
         if run.maintenance_runtime and run.local:
             as_whom = "as this machine's user"
+        elif run.maintenance_runtime and run.runtime == "emr-ec2":
+            # A step runs as the cluster's instance-profile role, which forge cannot check.
+            as_whom = f"as the cluster's instance-profile role (declared {run.role_arn})"
         elif run.maintenance_runtime:
             as_whom = f"as {run.role_arn}"
         else:
@@ -726,6 +729,8 @@ def _runs_on(run: DesiredRun) -> str:
     if run.local:
         return "local, on this machine, as this machine's user"
     target = ", ".join(f"{_TARGET_WORDS.get(k, k)} {v}" for k, v in sorted(run.target.items()))
+    if run.runtime == "emr-ec2":  # its steps run as the cluster's instance-profile role
+        return f"{run.runtime} {target}, as the cluster's role (declared {run.role_arn})"
     return f"{run.runtime} {target}, as {run.role_arn}"
 
 
