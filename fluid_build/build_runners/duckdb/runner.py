@@ -31,6 +31,7 @@ import functools
 import logging
 import os
 import re
+import stat
 import time
 import uuid
 from dataclasses import dataclass
@@ -768,7 +769,9 @@ def _fsync_path(path: str) -> None:
 
 
 def _fsync_dir(path: str) -> None:
-    """Make the rename durable. A directory cannot be opened on Windows: nothing to do there."""
+    """Make the rename durable. Best effort: the file is already replaced when this runs,
+    so no failure here (Windows cannot open a directory; a file system may not sync one)
+    may fail the run, and a retry would append the same rows again."""
     if os.name == "nt":
         return
     try:
@@ -778,10 +781,37 @@ def _fsync_dir(path: str) -> None:
     try:
         os.fsync(fd)
     except OSError as exc:
-        if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EBADF):
-            raise
+        LOG.debug("duckdb.append.dir_fsync_failed errno=%s", exc.errno)
     finally:
         os.close(fd)
+
+
+#: Stale run-named temps (a hard kill leaves one) are removed after this long.
+_STALE_TEMP_SECONDS = 24 * 3600
+
+
+def _remove_stale_temps(path: str) -> None:
+    """Remove ``.<name>.<token>.fluid-append`` files of THIS target, older than a day.
+
+    Only that exact name shape, only regular files (never a link or a directory), one
+    ``os.unlink`` each."""
+    head, name = os.path.split(os.fspath(path))
+    shape = re.compile(r"\." + re.escape(name) + r"\.[A-Za-z0-9_.-]+\.fluid-append")
+    cutoff = time.time() - _STALE_TEMP_SECONDS
+    try:
+        entries = os.listdir(head or ".")
+    except OSError:
+        return
+    for entry in entries:
+        if not shape.fullmatch(entry):
+            continue
+        candidate = os.path.join(head, entry)
+        try:
+            info = os.lstat(candidate)
+            if stat.S_ISREG(info.st_mode) and info.st_mtime < cutoff:
+                os.unlink(candidate)
+        except OSError:
+            continue
 
 
 def _append_tmp_path(path: str, run_id: Optional[str] = None) -> str:
@@ -811,25 +841,17 @@ def _appends_to_file(ctx: RunContext, out_path: str, fmt: str, partitioned: Any)
     )
 
 
-def _union_rewrite(
+def _union_select(
     con: Any,
     out_path: str,
     fmt: str,
     new_relation: str,
     json_columns: Optional[Dict[str, str]] = None,
-    run_id: Optional[str] = None,
-) -> None:
-    """Rewrite ``out_path`` as its rows plus those of ``new_relation`` (a table or view).
-
-    DuckDB's ``COPY`` cannot append to one file, so the union goes to a temp file in
-    the same directory, is fsynced, then replaces the target atomically. A failure
-    leaves the previous file as it was and no temp file behind.
-    Pattern: temp file + fsync + os.replace, as python-atomicwrites; DuckDB COPY
-    cannot append to one file.
-    """
+) -> str:
+    """The SELECT of ``out_path``'s rows plus those of ``new_relation``. Every typed
+    refusal a rewrite can raise (undeclared json columns) is raised here, before anything
+    is written."""
     fmt = (fmt or "parquet").lower()
-    tmp = _append_tmp_path(out_path, run_id)
-    _remove_quietly(tmp)
     path = quote_ansi_string_literal(out_path)
     if fmt == "csv":
         # Text round-trips as text: ``007`` and ``01234`` must not come back as integers.
@@ -882,15 +904,45 @@ def _union_rewrite(
     else:
         old = f"SELECT * FROM read_parquet({path})"
         new = f"SELECT * FROM {new_relation}"
-    union = f"{old} UNION ALL BY NAME {new}"
+    return f"{old} UNION ALL BY NAME {new}"
+
+
+def _commit_select(
+    con: Any, out_path: str, fmt: str, select_sql: str, run_id: Optional[str] = None
+) -> None:
+    """Write ``select_sql`` over ``out_path``: a temp file in the same directory, fsynced,
+    then ``os.replace`` (atomic), then the directory fsynced. A failure leaves the previous
+    file as it was (or no file) and no temp file behind.
+    Pattern: temp file + fsync + os.replace, as python-atomicwrites; DuckDB COPY
+    cannot append to one file."""
+    fmt = (fmt or "parquet").lower()
+    tmp = _append_tmp_path(out_path, run_id)
+    _remove_stale_temps(out_path)
+    _remove_quietly(tmp)
     try:
-        con.execute(_build_copy_destination(tmp, fmt).replace("{select}", union, 1))
+        con.execute(_build_copy_destination(tmp, fmt).replace("{select}", select_sql, 1))
         _fsync_path(tmp)
         os.replace(tmp, out_path)
-        _fsync_dir(out_path)
     except BaseException:
         _remove_quietly(tmp)
         raise
+    _fsync_dir(out_path)
+
+
+def _union_rewrite(
+    con: Any,
+    out_path: str,
+    fmt: str,
+    new_relation: str,
+    json_columns: Optional[Dict[str, str]] = None,
+    run_id: Optional[str] = None,
+) -> None:
+    """Rewrite ``out_path`` as its rows plus those of ``new_relation`` (a table or view).
+
+    DuckDB's ``COPY`` cannot append to one file, so the union is committed through
+    :func:`_commit_select`."""
+    union = _union_select(con, out_path, fmt, new_relation, json_columns)
+    _commit_select(con, out_path, fmt, union, run_id)
 
 
 def _old_rows_sql(path: str, fmt: str, json_columns: Optional[Dict[str, str]]) -> str:
@@ -923,11 +975,32 @@ def _split_new_rows(
     """Split this run's rows (``__fl_append_new``) into ``__fl_append_ontime`` and
     ``__fl_append_late``: a row is late when it is older than the newest event time known
     (the file's rows and the new rows) minus the allowed lateness. Earlier runs' rows are
-    never reclassified: they were judged when they landed."""
+    never reclassified: they were judged when they landed.
+
+    Enforcement is never silently off: a column that is not landed, or is not a date or
+    timestamp (the post-land splitter fails on those too, and warns), is logged.
+    """
     ident = validate_ident(column)
-    types = {r[0]: r[1] for r in con.execute("DESCRIBE SELECT * FROM __fl_append_new").fetchall()}
+    landed = {
+        str(r[0]).lower(): (str(r[0]), str(r[1]))
+        for r in con.execute("DESCRIBE SELECT * FROM __fl_append_new").fetchall()
+    }
     seconds = int(budget_seconds)
-    if ident not in types or seconds <= 0:
+    found = landed.get(ident.lower())
+    skip_reason = ""
+    if seconds <= 0:
+        skip_reason = "no allowed lateness"
+    elif found is None:
+        skip_reason = "the column is not among the landed columns"
+    elif not (found[1] == "DATE" or found[1].startswith("TIMESTAMP")):
+        skip_reason = f"the column is {found[1]}, not a date or timestamp"
+    if skip_reason:
+        if seconds > 0:
+            LOG.warning(
+                "late_arrival_split_skipped: event-time column %s: %s; every row lands on time",
+                ident,
+                skip_reason,
+            )
         con.execute(
             "CREATE OR REPLACE TEMP TABLE __fl_append_ontime AS SELECT * FROM __fl_append_new"
         )
@@ -935,12 +1008,15 @@ def _split_new_rows(
             "CREATE OR REPLACE TEMP TABLE __fl_append_late AS SELECT * FROM __fl_append_new LIMIT 0"
         )
     else:
+        name, col_type = found  # type: ignore[misc]
         old = _old_rows_sql(out_path, fmt, json_columns)
-        watermark = (
-            f'(SELECT max("{ident}") FROM (SELECT "{ident}" FROM __fl_append_new UNION ALL '
-            f'SELECT CAST("{ident}" AS {types[ident]}) FROM ({old})))'
-        )
-        late = f"\"{ident}\" < {watermark} - INTERVAL '{seconds}' SECOND"
+        old_names = {str(r[0]).lower() for r in con.execute(f"DESCRIBE {old}").fetchall()}
+        sources = f'SELECT "{name}" FROM __fl_append_new'
+        if name.lower() in old_names:
+            # A column the contract added later is missing from an older file: no old rows
+            # to take the newest time from.
+            sources += f' UNION ALL SELECT CAST("{name}" AS {col_type}) FROM ({old})'
+        late = f'"{name}" < (SELECT max("{name}") FROM ({sources})) - INTERVAL \'{seconds}\' SECOND'
         con.execute(
             f"CREATE OR REPLACE TEMP TABLE __fl_append_late AS SELECT * FROM __fl_append_new WHERE {late}"
         )
@@ -970,25 +1046,30 @@ def _append_to_file(
     """Append the rows of ``landed_sel`` to the existing file; returns ``(rows appended,)``.
 
     With ``late`` (the event-time column and the allowed lateness) only this run's rows are
-    split: the on-time ones join the main file and the late ones the side file, which is
-    written first so a failure leaves the main file as it was. ``info`` receives the split's
-    counts and, when rows went to the side file, the newest cursor value this run landed.
+    split: the on-time ones join the main file and the late ones the side file. Everything
+    that can refuse (the typed json checks, the cursor) runs before the first write; then
+    the side file is written, then the main file. A genuine I/O failure between the two
+    writes leaves the late rows in the side file of a failed run whose cursor did not move,
+    so a retry appends them again: at-least-once, never a loss. ``info`` receives the
+    split's counts and, when rows went to the side file, the newest cursor value landed.
     """
     con.execute(f"CREATE OR REPLACE TEMP TABLE __fl_append_new AS {landed_sel}")
     try:
         count = first_row(con.execute("SELECT COUNT(*) FROM __fl_append_new"))
         main_rows = "__fl_append_new"
+        side: Optional[Tuple[str, str]] = None
         if late is not None:
+            _remove_stale_temps(_late_file_path(out_path))
             counts = _split_new_rows(con, out_path, fmt, late[0], late[1], json_columns)
             if info is not None:
                 info["late_counts"] = counts
             if counts["late"]:
                 late_path = _late_file_path(out_path)
                 if Path(late_path).is_file():
-                    _union_rewrite(con, late_path, fmt, "__fl_append_late", json_columns, run_id)
+                    select = _union_select(con, late_path, fmt, "__fl_append_late", json_columns)
                 else:
-                    copy = _build_copy_destination(late_path, fmt)
-                    con.execute(copy.replace("{select}", "SELECT * FROM __fl_append_late", 1))
+                    select = "SELECT * FROM __fl_append_late"
+                side = (late_path, select)
                 main_rows = "__fl_append_ontime"
                 if info is not None and cursor_field:
                     top = first_row(
@@ -997,7 +1078,10 @@ def _append_to_file(
                         )
                     )
                     info["cursor_max"] = top[0] if top else None
-        _union_rewrite(con, out_path, fmt, main_rows, json_columns, run_id)
+        main_select = _union_select(con, out_path, fmt, main_rows, json_columns)
+        if side is not None:
+            _commit_select(con, side[0], fmt, side[1], run_id)
+        _commit_select(con, out_path, fmt, main_select, run_id)
         return (int(count[0]) if count else 0,)
     finally:
         for table in ("__fl_append_new", "__fl_append_ontime", "__fl_append_late"):
@@ -1674,7 +1758,11 @@ def _enforce_late_arrival_split(
                     fmt,
                     "__la_side",
                     _json_append_columns(ctx) if fmt in ("json", "ndjson") else None,
+                    ctx.run_id,
                 )
+            elif fmt in _SINK_READERS and not _is_remote_uri(str(late_path_obj)):
+                # Temp file, fsync, rename: a crash never leaves a partial side file.
+                _commit_select(con, str(late_path_obj), fmt, "SELECT * FROM __la_side", ctx.run_id)
             else:
                 con.execute(f"COPY __la_side TO {quoted_late} ({writer_func})")
             con.execute(f"COPY __la_main TO {quoted_main} ({writer_func})")

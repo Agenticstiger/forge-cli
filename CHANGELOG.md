@@ -79,8 +79,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every earlier run's rows into `__late_events`). The cursor takes the newest value this run
   landed, a failed side-file write fails the run and leaves the main file untouched, and a full
   refresh with no late rows deletes an older `__late_events` file. The temp file is named for the
-  run beside the target (two overlapping runs no longer share one) and the directory is fsynced
-  after the rename.
+  run beside the target (two overlapping runs no longer share one), a first-time side file is
+  written through it too, the directory is fsynced (best effort) after the rename, and a temp
+  left by a killed run is removed after a day. The typed json refusals come before the first
+  write, and the event-time column is matched without regard to case; one that is not landed, or
+  is not a date or timestamp, logs a warning (`late_arrival_split_skipped`) and every row lands on
+  time.
 - **`--mode amend-and-build` lands each local SQL build in its own expose.** Every build was
   handed `exposes[0]`, so with two `engine: sql` builds the second overwrote the first build's
   file and its own expose was never written, exit 0. A build now writes the exposes its `outputs`

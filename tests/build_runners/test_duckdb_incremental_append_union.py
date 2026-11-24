@@ -577,3 +577,203 @@ def test_the_first_resolved_output_is_the_one_landed(tmp_path):
     assert _run(tmp_path, contract) == 0
     lake = tmp_path / "lake"
     assert (lake / "other.parquet").is_file() and not (lake / "events.parquet").exists()
+
+
+# ── review round: grants, ordering, atomic side file, stale temps ────────────
+
+import logging  # noqa: E402
+import stat as _stat  # noqa: E402
+import time  # noqa: E402
+
+from fluid_build.build_runners.duckdb.runner import _append_to_file  # noqa: E402
+
+
+def _old_parquet(path: Path, select: str) -> None:
+    con = duckdb.connect()
+    try:
+        con.execute(f"COPY ({select}) TO '{path}' (FORMAT 'parquet')")
+    finally:
+        con.close()
+
+
+NEW_LATE = (
+    "SELECT * FROM (VALUES (3::BIGINT, TIMESTAMP '2024-01-01 12:10:00'), "
+    "(4::BIGINT, TIMESTAMP '2024-01-01 11:00:00')) t(seq, event_time)"
+)
+OLD_ROW = "SELECT 1::BIGINT AS seq, TIMESTAMP '2024-01-01 12:00:00' AS event_time"
+
+
+def test_the_post_land_side_union_runs_inside_the_sandbox(tmp_path, monkeypatch):
+    # Landing outside the contract directory: the sandbox grants file by file, so a temp
+    # name the grant does not name is refused.
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "data"
+    monkeypatch.setenv("FLUID_DUCKDB_ALLOWED_DIRS", str(outside))
+    contract = _contract(project, "parquet", lateness=True)
+    contract["exposes"][0]["binding"]["location"]["path"] = str(outside / "events.parquet")
+    run1 = [(1, "2024-01-01 12:00:00"), (2, "2024-01-01 11:00:00")]
+    _late_run(project, contract, run1)
+    (outside / "events.parquet").unlink()  # the next run is a first run for the main file
+    _late_run(project, contract, run1 + [(3, "2024-01-01 12:10:00"), (4, "2024-01-01 11:20:00")])
+    assert _seqs(outside / "events__late_events.parquet", "parquet") == [2, 4]
+    assert _seqs(outside / "events.parquet", "parquet") == [3]
+
+
+def test_a_typed_refusal_of_the_main_rewrite_writes_no_side_file(tmp_path):
+    main = tmp_path / "events.json"
+    main.write_text('{"seq":1,"event_time":"2024-01-01 12:00:00","extra":7}\n')
+    before = main.read_bytes()
+    con = duckdb.connect()
+    try:
+        with pytest.raises(JsonAppendSchemaError):
+            _append_to_file(
+                con,
+                str(main),
+                "json",
+                NEW_LATE,
+                {"seq": "BIGINT", "event_time": "TIMESTAMP"},
+                late=("event_time", 1800.0),
+            )
+    finally:
+        con.close()
+    assert main.read_bytes() == before
+    assert sorted(os.listdir(tmp_path)) == ["events.json"]
+
+
+def test_an_old_file_without_the_event_column_does_not_stick_the_run(tmp_path):
+    main = tmp_path / "events.parquet"
+    _old_parquet(main, "SELECT 1::BIGINT AS seq")
+    con = duckdb.connect()
+    try:
+        info: dict = {}
+        _append_to_file(con, str(main), "parquet", NEW_LATE, late=("event_time", 1800.0), info=info)
+    finally:
+        con.close()
+    assert info["late_counts"] == {"on_time": 1, "late": 1}
+    assert _seqs(tmp_path / "events__late_events.parquet", "parquet") == [4]
+    assert _seqs(main, "parquet") == [1, 3]
+
+
+def test_a_non_timestamp_event_column_warns_and_lands_every_row(tmp_path, caplog):
+    main = tmp_path / "events.parquet"
+    _old_parquet(main, "SELECT 1::BIGINT AS seq, '2024-01-01' AS event_time")
+    con = duckdb.connect()
+    try:
+        with caplog.at_level(logging.WARNING):
+            _append_to_file(
+                con,
+                str(main),
+                "parquet",
+                "SELECT 2::BIGINT AS seq, '2020-01-01' AS event_time",
+                late=("event_time", 1800.0),
+            )
+    finally:
+        con.close()
+    assert _seqs(main, "parquet") == [1, 2]
+    assert "late_arrival_split_skipped" in caplog.text and "event_time" in caplog.text
+
+
+def test_the_event_column_is_matched_without_regard_to_case(tmp_path):
+    main = tmp_path / "events.parquet"
+    _old_parquet(main, OLD_ROW)
+    con = duckdb.connect()
+    try:
+        info: dict = {}
+        _append_to_file(con, str(main), "parquet", NEW_LATE, late=("Event_Time", 1800.0), info=info)
+    finally:
+        con.close()
+    assert info["late_counts"] == {"on_time": 1, "late": 1}
+
+
+def test_a_missing_event_column_is_logged_not_silent(tmp_path, caplog):
+    main = tmp_path / "events.parquet"
+    _old_parquet(main, OLD_ROW)
+    con = duckdb.connect()
+    try:
+        with caplog.at_level(logging.WARNING):
+            _append_to_file(con, str(main), "parquet", NEW_LATE, late=("nope", 1800.0))
+    finally:
+        con.close()
+    assert "late_arrival_split_skipped" in caplog.text and "nope" in caplog.text
+
+
+def test_a_first_time_side_file_is_written_through_a_temp_and_a_rename(tmp_path, monkeypatch):
+    main = tmp_path / "events.parquet"
+    _old_parquet(main, OLD_ROW)
+    side = tmp_path / "events__late_events.parquet"
+    replaced: List[str] = []
+    real = os.replace
+    monkeypatch.setattr(
+        runner_mod.os, "replace", lambda a, b: (replaced.append(str(b)), real(a, b))[1]
+    )
+    con = duckdb.connect()
+    try:
+        _append_to_file(con, str(main), "parquet", NEW_LATE, late=("event_time", 1800.0))
+    finally:
+        con.close()
+    assert str(side) in replaced and side.is_file()
+
+
+def test_a_crash_before_the_rename_leaves_no_partial_side_file(tmp_path, monkeypatch):
+    main = tmp_path / "events.parquet"
+    _old_parquet(main, OLD_ROW)
+
+    def boom(_path: str) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runner_mod, "_fsync_path", boom)
+    con = duckdb.connect()
+    try:
+        with pytest.raises(OSError):
+            _append_to_file(con, str(main), "parquet", NEW_LATE, late=("event_time", 1800.0))
+    finally:
+        con.close()
+    assert sorted(os.listdir(tmp_path)) == ["events.parquet"]
+
+
+def test_a_directory_fsync_failure_after_the_rename_does_not_fail_the_rewrite(
+    tmp_path, monkeypatch
+):
+    import errno
+
+    target = tmp_path / "t.parquet"
+    _old_parquet(target, "SELECT 1 AS seq")
+    real = os.fsync
+
+    def fsync(fd: int) -> None:
+        if _stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "io error")
+        real(fd)
+
+    monkeypatch.setattr(runner_mod.os, "fsync", fsync)
+    con = duckdb.connect()
+    try:
+        con.execute("CREATE TABLE new_rows AS SELECT 2 AS seq")
+        _union_rewrite(con, str(target), "parquet", "new_rows")
+    finally:
+        con.close()
+    assert _seqs(target, "parquet") == [1, 2]
+    assert os.listdir(tmp_path) == ["t.parquet"]
+
+
+def test_only_this_targets_old_temps_are_removed(tmp_path):
+    target = tmp_path / "t.parquet"
+    _old_parquet(target, "SELECT 1 AS seq")
+    old_mine = tmp_path / ".t.parquet.deadrun.fluid-append"
+    fresh_mine = tmp_path / ".t.parquet.liverun.fluid-append"
+    old_other = tmp_path / ".other.parquet.deadrun.fluid-append"
+    old_odd = tmp_path / ".t.parquet.deadrun.keep"
+    for f in (old_mine, fresh_mine, old_other, old_odd):
+        f.write_bytes(b"x")
+    long_ago = time.time() - 48 * 3600
+    for f in (old_mine, old_other, old_odd):
+        os.utime(f, (long_ago, long_ago))
+    con = duckdb.connect()
+    try:
+        con.execute("CREATE TABLE new_rows AS SELECT 2 AS seq")
+        _union_rewrite(con, str(target), "parquet", "new_rows", run_id="now")
+    finally:
+        con.close()
+    assert not old_mine.exists()
+    assert fresh_mine.exists() and old_other.exists() and old_odd.exists()
