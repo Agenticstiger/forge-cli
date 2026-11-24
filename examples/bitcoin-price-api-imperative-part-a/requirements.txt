@@ -1,2 +1,7 @@
-requests>=2.32.5
+requests>=2.33.0
 pandas>=2.0.0
+
+# Floors for packages installed underneath requests, raised past their
+# published advisories.
+certifi>=2026.10.18
+idna>=3.15
