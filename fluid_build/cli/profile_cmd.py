@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -324,6 +325,17 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
             "ask is named under Not measured"
         ),
     )
+    p.add_argument(
+        "--timings",
+        action="store_true",
+        help=(
+            "after the report, print how long each table took to read, measure and check, and "
+            "how long the document took to write, in seconds; the document is the same bytes "
+            "without it. check: the output checks across a column's statistics "
+            "(counts at edges); a check made metric by metric is counted as measure. Refused "
+            "with a private release, whose output must not follow the row count"
+        ),
+    )
     p.add_argument("--env", help="environment overlay to apply to the contract first")
     from fluid_build.cli import _profile_release
 
@@ -383,6 +395,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 "next": "give --request, or leave --strict out",
             },
         )
+    _refuse_timings_with_release(args)
     if _profile_release.wanted(args):
         return _profile_release.run(args, logger)
     from fluid_build._console import cprint_literal
@@ -451,6 +464,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             if bundle_dir
             else None
         )
+        timings = runner.StageTimings() if getattr(args, "timings", False) else None
+        started = time.perf_counter()
         result = runner.profile_exposes(
             contract,
             exposes,
@@ -460,8 +475,11 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             bundles=blocks,
             request=asked,
             row_floor=getattr(args, "row_floor", None),
+            timings=timings,
         )
+        write_started = time.perf_counter()
         _write(out, result.canonical)
+        _stamp_timings(timings, started, write_started)
     except (
         runner.ProfileError,
         bundle.BundleError,
@@ -480,6 +498,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         answered_block=blocks is not None,
         request=None if asked is None else (Path(str(request_file)).name, digest_matched),
     )
+    _report_timings(cprint_literal, result, timings)
     return 0
 
 
@@ -980,6 +999,51 @@ def _report(
     say("Pin it in the FLUX Simulation:")
     # One line, never wrapped: it is copied as it stands.
     say(f"  profile: {{digest: {result.digest}}}", soft_wrap=True)
+
+
+def _refuse_timings_with_release(args: argparse.Namespace) -> None:
+    """Refuse ``--timings`` with a private release, whose output must not follow the row count."""
+    from fluid_build.cli import _profile_release
+
+    if getattr(args, "timings", False) and _profile_release.wanted(args):
+        raise _refusal(
+            "profile_timings_with_release",
+            "a private release prints nothing that depends on the records outside the noise, "
+            "and timings follow the row count",
+            {
+                "read": "nothing: no record was read",
+                "next": "leave --timings out of a private release",
+            },
+        )
+
+
+def _stamp_timings(timings: Any, started: float, write_started: float) -> None:
+    """Close the document's timings: the write, and the whole run. Nothing without ``--timings``."""
+    if timings is not None:
+        now = time.perf_counter()
+        timings.write += now - write_started
+        timings.total = now - started
+
+
+def _report_timings(say: Any, result: Any, timings: Any) -> None:
+    """One line per table, in profile order, then the document's: seconds, two decimals.
+
+    Nothing without ``--timings`` (*timings* is ``None``).
+    """
+    if timings is None:
+        return
+    for table in result.tables:
+        name = table.plan.expose_id
+        say(
+            f"Timings for {name}: read {timings.read.get(name, 0.0):.2f} s, "
+            f"measure {timings.measure.get(name, 0.0):.2f} s, "
+            f"check {timings.check.get(name, 0.0):.2f} s.",
+            soft_wrap=True,
+        )
+    say(
+        f"Timings for the document: write {timings.write:.2f} s; total {timings.total:.2f} s.",
+        soft_wrap=True,
+    )
 
 
 def _report_rank_correlations(say: Any, result: Any, several: bool) -> None:

@@ -34,7 +34,9 @@ domain, as the levels ``false`` and ``true``, which is how flux-stats reads one.
 from __future__ import annotations
 
 import re
+import time
 from collections import Counter
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import date
 from fractions import Fraction
@@ -44,6 +46,7 @@ from typing import (
     Callable,
     Dict,
     FrozenSet,
+    Iterator,
     List,
     Mapping,
     Optional,
@@ -168,6 +171,49 @@ class ProfileError(Exception):
         super().__init__(message)
         self.event = event
         self.context = dict(context or {})
+
+
+@dataclass
+class StageTimings:
+    """Seconds each stage took, per table, for ``fluid profile --timings``.
+
+    Nothing here depends on a record's value: a duration follows the row count, so a
+    private release never fills one (the command refuses the pair). ``measure`` leaves out
+    the time a ``check`` inside it took, so the two never count a second twice.
+    """
+
+    read: Dict[str, float] = field(default_factory=dict)
+    measure: Dict[str, float] = field(default_factory=dict)
+    check: Dict[str, float] = field(default_factory=dict)
+    write: float = 0.0
+    total: float = 0.0
+
+    def add(self, stage: str, expose_id: str, seconds: float) -> None:
+        held = getattr(self, stage)
+        held[expose_id] = held.get(expose_id, 0.0) + seconds
+
+    def spread(self, stage: str, expose_ids: Sequence[str], seconds: float) -> None:
+        """Share *seconds* of work that spans several tables equally among them."""
+        for expose_id in expose_ids:
+            self.add(stage, expose_id, seconds / len(expose_ids))
+
+    @contextmanager
+    def stage(self, stage: str, expose_id: str) -> Iterator[None]:
+        """Time the block as *stage* of a table; a ``measure`` block drops the checks in it."""
+        checked = self.check.get(expose_id, 0.0)
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            took = time.perf_counter() - started
+            if stage == "measure":
+                took -= self.check.get(expose_id, 0.0) - checked
+            self.add(stage, expose_id, max(took, 0.0))
+
+
+def _timed(timings: Optional[StageTimings], stage: str, expose_id: str) -> Any:
+    """The timing block of a stage, or one that does nothing when nothing is timed."""
+    return nullcontext() if timings is None else timings.stage(stage, expose_id)
 
 
 @dataclass(frozen=True)
@@ -620,6 +666,7 @@ def profile_exposes(
     bundles: Optional[Mapping[str, BundleBlock]] = None,
     request: Optional[Request] = None,
     row_floor: Optional[int] = None,
+    timings: Optional[StageTimings] = None,
 ) -> ProfileResult:
     """Profile each of *exposes* of *contract*, each from its own source, into one document.
 
@@ -636,6 +683,9 @@ def profile_exposes(
     *row_floor*, a count of at least 2, is then written as each one's ``rowFloor``), the
     columns of a table related in pairs, and a relationship's statistics grouped by a parent
     column or a child column grouped through the link (:mod:`fluid_build.profiler.grouped`).
+
+    With *timings*, each table's read, measure and check seconds, and the document's write,
+    are added to it; without, nothing is timed.
     """
     if row_floor is not None and (
         isinstance(row_floor, bool) or not 2 <= row_floor <= disclosure.MAX_COUNT
@@ -723,21 +773,23 @@ def profile_exposes(
     if request is not None:
         relationships = [_with_asks(each, request) for each in relationships]
     keys = _key_columns(relationships)
-    reads = [
-        _dates_read(
-            plan,
-            sources.read_columns(
-                each.source,
-                _read_names(plan, fact_plans),
-                table=each.table,
-                cwd=cwd,
-            ),
-        )
-        for each, plan in zip(exposes, plans, strict=True)
-    ]
+    reads: List[sources.SourceColumns] = []
+    for exposed, plan in zip(exposes, plans, strict=True):
+        with _timed(timings, "read", plan.expose_id):
+            reads.append(
+                _dates_read(
+                    plan,
+                    sources.read_columns(
+                        exposed.source,
+                        _read_names(plan, fact_plans),
+                        table=exposed.table,
+                        cwd=cwd,
+                    ),
+                )
+            )
     spans, no_span = _date_spans(
         contract, plans, reads, blocks, held, _grouping_columns(request, relationships),
-        asked, backend, rule,
+        asked, backend, rule, timings,
     )  # fmt: skip
     for position, plan in enumerate(plans):
         if plan.expose_id not in spans:
@@ -756,6 +808,7 @@ def profile_exposes(
     by_expose = {plan.expose_id: (plan, read) for plan, read in zip(plans, reads, strict=True)}
     answered = _Groupings()
     if request is not None:
+        grouping_started = time.perf_counter() if timings is not None else 0.0
         answered = _answer_groupings(
             request,
             plans,
@@ -768,22 +821,30 @@ def profile_exposes(
             fractional_bits,
         )
         declared = list(answered.declared)
+        if timings is not None:
+            # The groupings span tables: their time is shared among the tables they group.
+            grouped_tables = [
+                plan.expose_id for plan in plans if plan.expose_id in answered.grouped_by
+            ] or [plan.expose_id for plan in plans]
+            timings.spread("measure", grouped_tables, time.perf_counter() - grouping_started)
     tallies: Tuple["Counter[str]", "Counter[str]"] = (Counter(), Counter())
     tables_doc: Dict[str, Dict[str, Any]] = {}
     results: List[TableResult] = []
     for plan, read, found, missing in zip(plans, reads, declared, uncovered, strict=True):
-        table_doc, result = _profile_table(
-            plan,
-            read,
-            found,
-            backend,
-            rule,
-            tallies,
-            fractional_bits,
-            keys.get(plan.expose_id, frozenset()),
-            asked.get(plan.expose_id),
-            answered.grouped_by.get(plan.expose_id, frozenset()),
-        )
+        with _timed(timings, "measure", plan.expose_id):
+            table_doc, result = _profile_table(
+                plan,
+                read,
+                found,
+                backend,
+                rule,
+                tallies,
+                fractional_bits,
+                keys.get(plan.expose_id, frozenset()),
+                asked.get(plan.expose_id),
+                answered.grouped_by.get(plan.expose_id, frozenset()),
+                timings,
+            )
         tables_doc[plan.expose_id] = table_doc
         # A request lists what it asks, so what the defaults leave out is told per listed item.
         spanless = tuple(no_span.get(plan.expose_id, ()))
@@ -801,6 +862,7 @@ def profile_exposes(
             tallies,
             fractional_bits,
             answered.relationship_groupings.get(position, ()),
+            timings,
         )
         for position, each in enumerate(relationships)
         if each.counted
@@ -825,24 +887,32 @@ def profile_exposes(
     invariants: List[Dict[str, Any]] = []
     if request is not None:
         by_table = {plan.expose_id: read for plan, read in zip(plans, reads, strict=True)}
+        fact_started = time.perf_counter() if timings is not None else 0.0
         invariants, fact_results, unmeasured = _fact_entries(
             contract, fact_plans, by_table, rule, tallies[0]
         )
+        if timings is not None:
+            fact_tables = list(
+                dict.fromkeys(each.table for each in fact_plans if each.reason is None)
+            )
+            if fact_tables:
+                timings.spread("measure", fact_tables, time.perf_counter() - fact_started)
         unanswered = (*unanswered, *unmeasured)
         unanswered = (*unanswered, *answered.not_measured)
         for plan, read in zip(plans, reads, strict=True):
             table = asked[plan.expose_id]
-            pairs, missing_pairs = ranks.column_pairs(
-                table,
-                {column.name: column.domain for column in plan.columns},
-                read,
-                backend,
-                rule,
-                tallies[0],
-                fractional_bits,
-                row_floor=row_floor,
-                held=held.get(plan.expose_id, frozenset()),
-            )
+            with _timed(timings, "measure", plan.expose_id):
+                pairs, missing_pairs = ranks.column_pairs(
+                    table,
+                    {column.name: column.domain for column in plan.columns},
+                    read,
+                    backend,
+                    rule,
+                    tallies[0],
+                    fractional_bits,
+                    row_floor=row_floor,
+                    held=held.get(plan.expose_id, frozenset()),
+                )
             if pairs:
                 tables_doc[plan.expose_id]["columnPairs"] = pairs
             unanswered = (*unanswered, *missing_pairs)
@@ -850,6 +920,7 @@ def profile_exposes(
         from fluid_build import __version__
 
         producer = document.producer_uri(__version__)
+    write_started = time.perf_counter() if timings is not None else 0.0
     built = document.build_document(
         producer=producer,
         rule=rule,
@@ -860,6 +931,8 @@ def profile_exposes(
     )
     canonical = document.canonical_bytes(built)
     backend.check_document(canonical.decode("utf-8"))
+    if timings is not None:
+        timings.write += time.perf_counter() - write_started
     tally, cell_tally = tallies
     published = tally.pop(disclosure.FREE, 0)
     return ProfileResult(
@@ -1421,6 +1494,24 @@ def _children_per_parent(
     tallies: Tuple["Counter[str]", "Counter[str]"],
     fractional_bits: int,
     groupings: Sequence[Tuple[str, Grouping]] = (),
+    timings: Optional[StageTimings] = None,
+) -> Tuple[Dict[str, Any], RelationshipResult]:
+    """The ``relationships[]`` entry of one relationship, its time counted for its child."""
+    with _timed(timings, "measure", relationship.child):
+        return _children_counted(
+            relationship, tables, backend, rule, tallies, fractional_bits, groupings, timings
+        )
+
+
+def _children_counted(
+    relationship: Relationship,
+    tables: Mapping[str, Tuple[ExposePlan, sources.SourceColumns]],
+    backend: StatisticsBackend,
+    rule: disclosure.DisclosureRule,
+    tallies: Tuple["Counter[str]", "Counter[str]"],
+    fractional_bits: int,
+    groupings: Sequence[Tuple[str, Grouping]],
+    timings: Optional[StageTimings],
 ) -> Tuple[Dict[str, Any], RelationshipResult]:
     """The ``relationships[]`` entry of one relationship: a histogram with the parent as unit.
 
@@ -1469,13 +1560,14 @@ def _children_per_parent(
         )
         members.append(_members(grouping))
     try:
-        decisions = backend.check_edge_counts(
-            [_edge_statistic(each, measured, rule) for each, measured in formed],
-            total=_column_total(*formed[0]),
-            minimum_cell=rule.minimum_cell,
-            zeros_disclosive=rule.zeros_disclosive,
-            round_count=lambda count: disclosure.round_count(count, rule),
-        )
+        with _timed(timings, "check", relationship.child):
+            decisions = backend.check_edge_counts(
+                [_edge_statistic(each, measured, rule) for each, measured in formed],
+                total=_column_total(*formed[0]),
+                minimum_cell=rule.minimum_cell,
+                zeros_disclosive=rule.zeros_disclosive,
+                round_count=lambda count: disclosure.round_count(count, rule),
+            )
     except ValueError as exc:
         raise ProfileError(
             "profile_edge_counts_refused",
@@ -1718,6 +1810,7 @@ def _date_spans(
     asked: Mapping[str, RequestTable],
     backend: StatisticsBackend,
     rule: disclosure.DisclosureRule,
+    timings: Optional[StageTimings] = None,
 ) -> Tuple[Dict[str, Dict[str, Tuple[str, ...]]], Dict[str, List[Tuple[str, str]]]]:
     """The date spans of each table's records, and why a column has none.
 
@@ -1734,37 +1827,54 @@ def _date_spans(
     for plan, read in zip(plans, reads, strict=True):
         if plan.expose_id in blocks:
             continue
-        expose = next(
-            item for item in iter_exposes(dict(contract)) if item.get("exposeId") == plan.expose_id
-        )
-        held = keys.get(plan.expose_id, frozenset())
-        columns = [column for column in plan.columns if column.name not in held]
-        table = asked.get(plan.expose_id)
-        for name in defaults.ladder_timestamps(expose, columns):
-            # The quartiles stay on the ladder; a request that did not ask them has none to name.
-            tail = _LADDER_STAYS
-            if table is not None:
-                ask = table.column(name)
-                if ask is None or "marginalHistogram/1" not in ask.statistics:
-                    continue  # a quantile alone stays on the type's ladder, as without a span
-                tail = _LADDER_STAYS if "quantile/2" in ask.statistics else ""
-            if name in grouping.get(plan.expose_id, ()):
-                no_span.setdefault(plan.expose_id, []).append((name, _SPAN_GROUPED + tail))
-                continue
-            try:
-                milliseconds = [
-                    backend.read_value("timestamp", value, column=name, row_index=index)
-                    for index, value in enumerate(read.values[name])
-                    if value is not None
-                ]
-            except ReadRefused:  # measuring the column refuses it, naming the row
-                continue
-            edges, reason = defaults.date_span(milliseconds, rule.minimum_cell)
-            if edges is not None:
-                spans.setdefault(plan.expose_id, {})[name] = edges
-            elif reason is not None:
-                no_span.setdefault(plan.expose_id, []).append((name, reason + tail))
+        with _timed(timings, "measure", plan.expose_id):
+            _span_table(contract, plan, read, keys, grouping, asked, backend, rule, spans, no_span)
     return spans, no_span
+
+
+def _span_table(
+    contract: Mapping[str, Any],
+    plan: ExposePlan,
+    read: sources.SourceColumns,
+    keys: Mapping[str, FrozenSet[str]],
+    grouping: Mapping[str, Set[str]],
+    asked: Mapping[str, RequestTable],
+    backend: StatisticsBackend,
+    rule: disclosure.DisclosureRule,
+    spans: Dict[str, Dict[str, Tuple[str, ...]]],
+    no_span: Dict[str, List[Tuple[str, str]]],
+) -> None:
+    """The date spans of one table, added to *spans* and *no_span*."""
+    expose = next(
+        item for item in iter_exposes(dict(contract)) if item.get("exposeId") == plan.expose_id
+    )
+    held = keys.get(plan.expose_id, frozenset())
+    columns = [column for column in plan.columns if column.name not in held]
+    table = asked.get(plan.expose_id)
+    for name in defaults.ladder_timestamps(expose, columns):
+        # The quartiles stay on the ladder; a request that did not ask them has none to name.
+        tail = _LADDER_STAYS
+        if table is not None:
+            ask = table.column(name)
+            if ask is None or "marginalHistogram/1" not in ask.statistics:
+                continue  # a quantile alone stays on the type's ladder, as without a span
+            tail = _LADDER_STAYS if "quantile/2" in ask.statistics else ""
+        if name in grouping.get(plan.expose_id, ()):
+            no_span.setdefault(plan.expose_id, []).append((name, _SPAN_GROUPED + tail))
+            continue
+        try:
+            milliseconds = [
+                backend.read_value("timestamp", value, column=name, row_index=index)
+                for index, value in enumerate(read.values[name])
+                if value is not None
+            ]
+        except ReadRefused:  # measuring the column refuses it, naming the row
+            continue
+        edges, reason = defaults.date_span(milliseconds, rule.minimum_cell)
+        if edges is not None:
+            spans.setdefault(plan.expose_id, {})[name] = edges
+        elif reason is not None:
+            no_span.setdefault(plan.expose_id, []).append((name, reason + tail))
 
 
 def _refuse_repeated(exposes: Sequence[ExposeSource]) -> None:
@@ -1828,6 +1938,7 @@ def _profile_table(
     keys: FrozenSet[str] = frozenset(),
     asked: Optional[RequestTable] = None,
     grouped_by: FrozenSet[str] = frozenset(),
+    timings: Optional[StageTimings] = None,
 ) -> Tuple[Dict[str, Any], TableResult]:
     """One table of the document, from one read of its records, and its summary.
 
@@ -1870,7 +1981,14 @@ def _profile_table(
     if declared is not None:
         left_out.extend(
             _declare_statistics(
-                declared, read, columns_doc, backend, rule, (tally, cell_tally), fractional_bits
+                declared,
+                read,
+                columns_doc,
+                backend,
+                rule,
+                (tally, cell_tally),
+                fractional_bits,
+                (timings, plan.expose_id),
             )
         )
     table_doc: Dict[str, Any] = {"columns": columns_doc}
@@ -2034,6 +2152,7 @@ def _declare_statistics(
     rule: disclosure.DisclosureRule,
     tallies: Tuple["Counter[str]", "Counter[str]"],
     fractional_bits: int,
+    timed: Tuple[Optional[StageTimings], str] = (None, ""),
 ) -> List[Tuple[str, str]]:
     """Form every declared statistic and add it to its column; return those left out.
 
@@ -2085,7 +2204,8 @@ def _declare_statistics(
             left_out.append((statistic.description, "no record forms a group of it"))
             continue
         formed.append((statistic, measured))
-    decided = _edge_decisions(formed, backend, rule)
+    with _timed(timed[0], "check", timed[1]):
+        decided = _edge_decisions(formed, backend, rule)
     for position, (statistic, measured) in enumerate(formed):
         records = None
         if statistic.group_by is not None:

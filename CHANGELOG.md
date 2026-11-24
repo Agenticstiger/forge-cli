@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid profile --timings` says where a profile spends its time.** After the report it prints,
+  for each table in profile order, `Timings for <exposeId>: read X s, measure Y s, check Z s.`,
+  then `Timings for the document: write W s; total T s.`. Read is the source read, measure forms
+  the table's metrics, statistics, date spans, children per parent, facts and rank correlations,
+  and check is the output checks across a column's statistics and a relationship's counts; a
+  check made metric by metric counts as measure. Work that spans tables (facts, groupings) is
+  shared equally among the tables it names. The document's bytes are the same with and without
+  the flag. A private release refuses `--timings` before any record is read, since a duration
+  follows the row count.
 - **`fluid profile` bins a date or timestamp with no declared range on the months it spans.** Such
   a column got only quartiles on a 1900 to 2100 ladder of years, so `fluxsim init` had no run
   window to read. It now publishes a `marginalHistogram/1` over calendar months, or over calendar
