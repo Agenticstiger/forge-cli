@@ -26,11 +26,11 @@ fallback bucket and ``{database}/{table}/`` default prefix are forge-specific).
 
 from __future__ import annotations
 
-import os
 import re
 from typing import Any, Mapping, Optional, Tuple
 
-_ENV_TEMPLATE_RE = re.compile(r"\{\{\s*env\.(\S+?)\s*\}\}")
+from fluid_build.util.env_templates import render_text
+
 # Any ``aws_caller_identity`` account-id interpolation, e.g.
 # ``${data.aws_caller_identity.fluid_lf_caller.account_id}``.
 _ACCOUNT_TOKEN_RE = re.compile(r"\$\{data\.aws_caller_identity\.[^.}]+\.account_id\}")
@@ -40,15 +40,12 @@ def resolve_env_templates(value: Any) -> Any:
     """Resolve ``{{ env.VAR }}`` templates from the environment.
 
     Unresolvable templates (missing env var) are left as-is so the caller can
-    decide whether to error or fall back to the account-derived bucket.
+    decide whether to error or fall back to the account-derived bucket. The
+    single-string primitive of the one resolver (:mod:`fluid_build.util.env_templates`).
     """
-    if not isinstance(value, str) or "{{" not in value:
+    if not isinstance(value, str):
         return value
-
-    def _replacer(m: "re.Match[str]") -> str:
-        return os.environ.get(m.group(1).strip(), m.group(0))
-
-    return _ENV_TEMPLATE_RE.sub(_replacer, value)
+    return render_text(value, strip=False)
 
 
 def normalize_location(

@@ -24,6 +24,7 @@ upstreams.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -193,6 +194,96 @@ class TestAgainstARealGitRepo:
             after = _fetch_digest_via_git(ws, "telco.orders", "1")
 
         assert before != after, "a real column addition must register as drift"
+
+    @staticmethod
+    def _split_upstream(repo: Path, *, fragment_name: str = "orders") -> Path:
+        """``UPSTREAM_CONTRACT`` with its one expose kept in a ``$ref`` fragment."""
+        product = repo / "telco.orders"
+        fragment = product / "fragments" / "exposes" / f"{fragment_name}.yaml"
+        fragment.parent.mkdir(parents=True)
+        fragment.write_text(
+            yaml.safe_dump(UPSTREAM_CONTRACT["exposes"][0], sort_keys=True), encoding="utf-8"
+        )
+        root = {
+            **UPSTREAM_CONTRACT,
+            "exposes": [{"$ref": f"./fragments/exposes/{fragment_name}.yaml"}],
+        }
+        (product / "contract.fluid.yaml").write_text(
+            yaml.safe_dump(root, sort_keys=True), encoding="utf-8"
+        )
+        _git("add", "-A", cwd=repo)
+        _git("commit", "-qm", "split the contract", cwd=repo)
+        return fragment
+
+    def test_a_split_upstream_has_its_flat_twins_digest_and_a_fragment_edit_moves_it(
+        self, upstream_repo: Path, local_cache: Path
+    ):
+        """The digest covers what the upstream deploys, not the file it keeps the refs in.
+
+        Before, only the root was hashed: a split upstream's pin could not see an edit to
+        the fragment holding its schema, so a downstream apply stayed green on a changed
+        upstream. Real clone, a second commit, the real refresh path.
+        """
+        fragment = self._split_upstream(upstream_repo)
+        ws = self._ws()
+        with patch("fluid_build.forge.federation._git_remote_url", return_value=str(upstream_repo)):
+            split = _fetch_digest_via_git(ws, "telco.orders", "1")
+
+            fragment.write_text(fragment.read_text().replace("integer", "bigint"), encoding="utf-8")
+            _git("commit", "-aqm", "widen the id column", cwd=upstream_repo)
+            edited = _fetch_digest_via_git(ws, "telco.orders", "1")
+
+        assert split == compute_contract_digest(UPSTREAM_CONTRACT), "split and flat: one digest"
+        assert edited is not None and edited != split, "a fragment edit must register as drift"
+
+    def test_the_digest_equals_what_the_command_prints_in_the_upstreams_checkout(
+        self, upstream_repo: Path, local_cache: Path, capsys
+    ):
+        """What the upstream's team pins is what the downstream gate computes."""
+        from fluid_build.cli import build_parser
+
+        self._split_upstream(upstream_repo)
+        with patch("fluid_build.forge.federation._git_remote_url", return_value=str(upstream_repo)):
+            fetched = _fetch_digest_via_git(self._ws(), "telco.orders", "1")
+
+        args = build_parser().parse_args(
+            ["contract", "digest", str(upstream_repo / "telco.orders" / "contract.fluid.yaml")]
+        )
+        assert args.func(args, logging.getLogger("test")) == 0
+        assert capsys.readouterr().out.strip().splitlines()[-1] == fetched
+
+    def test_a_missing_fragment_has_no_digest(self, upstream_repo: Path, local_cache: Path, caplog):
+        """An upstream whose ``$ref`` does not resolve fails closed, naming the ref."""
+        fragment = self._split_upstream(upstream_repo)
+        fragment.unlink()
+        _git("commit", "-aqm", "lose the fragment", cwd=upstream_repo)
+        with (
+            patch("fluid_build.forge.federation._git_remote_url", return_value=str(upstream_repo)),
+            caplog.at_level(logging.WARNING, logger="fluid.forge.federation"),
+        ):
+            assert _fetch_digest_via_git(self._ws(), "telco.orders", "1") is None
+        assert "federation_git_contract_unresolvable" in caplog.text
+        assert "fragments/exposes/orders.yaml" in caplog.text
+
+    def test_a_ref_out_of_the_clone_is_refused_whatever_the_operators_ref_root(
+        self, upstream_repo: Path, local_cache: Path, monkeypatch
+    ):
+        """The upstream is another mesh's contract: its refs reach the clone, nothing else.
+
+        ``FLUID_REF_ROOT`` is the operator's own widening for their own contracts. If it
+        applied here, an upstream could ``$ref`` a file next to the cache and have its
+        content hashed into a digest this machine reports.
+        """
+        (local_cache).mkdir(parents=True, exist_ok=True)
+        (local_cache / "secret.yaml").write_text("token: not-for-the-upstream\n", encoding="utf-8")
+        root = {**UPSTREAM_CONTRACT, "exposes": [{"$ref": "../../secret.yaml"}]}
+        (upstream_repo / "telco.orders" / "contract.fluid.yaml").write_text(
+            yaml.safe_dump(root, sort_keys=True), encoding="utf-8"
+        )
+        _git("commit", "-aqm", "reach out of the repository", cwd=upstream_repo)
+        monkeypatch.setenv("FLUID_REF_ROOT", str(local_cache))
+        with patch("fluid_build.forge.federation._git_remote_url", return_value=str(upstream_repo)):
+            assert _fetch_digest_via_git(self._ws(), "telco.orders", "1") is None
 
 
 class TestUnreachableUpstreamIsARowNotAnAbort:

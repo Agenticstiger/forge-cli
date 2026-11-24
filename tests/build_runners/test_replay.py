@@ -18,11 +18,13 @@ mode the loud-drift design is supposed to prevent.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
 import yaml
 
+from fluid_build import contract_refs, loader
 from fluid_build.build_runners._replay import (
     REPLAY_MARKER_FILENAME,
     clear_dirty_marker,
@@ -130,6 +132,48 @@ class TestFindDownstreamProducts:
         broken.write_text("this: is: not: valid: yaml: [\n")
         matches = find_downstream_products(tmp_path, "bronze.crm.customers")
         assert len(matches) == 1
+
+    def test_the_ref_warnings_of_a_contract_it_reads_are_debug_lines(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The walk composes every workspace contract whose ``id`` or ``consumes[]`` is a
+        ``$ref``, other products' too. Their ref warnings are their own authors': a WARNING
+        in this build named another product's file and took the warn-once entry, so
+        composing that contract afterwards said nothing. A DEBUG line here; the contract
+        itself still warns."""
+        monkeypatch.delenv("FLUID_REF_ROOT", raising=False)
+        monkeypatch.setenv("FLUID_IGNORE_WORKSPACE_REF_ROOT", "1")
+        contract_refs._NOTED_REF_WARNINGS.clear()
+        other = tmp_path / "other" / "contract.fluid.yaml"
+        other.parent.mkdir()
+        other.write_text("id: silver.other\nconsumes: {$ref: ./consumes.conf}\n")
+        (other.parent / "consumes.conf").write_text('[{"productId": "bronze.crm.customers"}]')
+
+        with caplog.at_level(logging.DEBUG, logger="fluid.loader"):
+            matches = find_downstream_products(tmp_path, "bronze.crm.customers")
+        walked = [
+            r for r in caplog.records if getattr(r, "event", "") == "ref_target_suffix_unknown"
+        ]
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+            loader.load_contract(other)
+            loader.load_contract(other)
+        composed = [
+            r for r in caplog.records if getattr(r, "event", "") == "ref_target_suffix_unknown"
+        ]
+        contract_refs._NOTED_REF_WARNINGS.clear()
+
+        assert [m["product_id"] for m in matches] == ["silver.other"]
+        assert [r.levelno for r in walked] == [logging.DEBUG]
+        assert (
+            walked[0]
+            .getMessage()
+            .endswith(
+                "A DEBUG line, not a WARNING: the replay walk read this contract only for its id "
+                "and consumes[]."
+            )
+        )
+        assert [r.levelno for r in composed] == [logging.WARNING]
 
 
 class TestMarkerLifecycle:

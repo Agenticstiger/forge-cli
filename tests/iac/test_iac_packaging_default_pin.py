@@ -55,6 +55,7 @@ from fluid_build.iac.packaging import (
     container_kinds_for_platforms,
     resolve_packaging,
 )
+from fluid_build.util.env_templates import placeholder_names
 
 pytestmark = pytest.mark.unit
 
@@ -159,6 +160,16 @@ def _run_generate_iac(contract_path: Path, out_dir: Path) -> bytes:
     return (out_dir / "main.tf.json").read_bytes()
 
 
+def _export_env_of(path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Export the variables ``path`` names: ``generate iac`` refuses an unset one."""
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, UnicodeDecodeError):
+        return
+    for name in placeholder_names(data):
+        monkeypatch.setenv(name, "123456789012" if "ACCOUNT_ID" in name else "example-value")
+
+
 class TestGenerateIacByteIdentity:
     """The release gate: resolver wired in, output byte-identical."""
 
@@ -170,6 +181,7 @@ class TestGenerateIacByteIdentity:
         # dependent) — force the no-actions path on BOTH sides so the pin
         # never depends on the developer's cloud environment.
         monkeypatch.setattr(generate_iac, "native_actions", lambda contract, logger, **_: [])
+        _export_env_of(path, monkeypatch)
         try:
             _, expected = _expected_module_bytes(path)
         except CLIError as exc:
@@ -199,6 +211,7 @@ class TestResolverIsWiredAtTheEntryPoint:
     ):
         example = REPO_ROOT / "examples" / "aws-s3-glue-athena" / "contract.fluid.yaml"
         assert example.is_file()
+        _export_env_of(example, monkeypatch)
         monkeypatch.setattr(generate_iac, "native_actions", lambda contract, logger, **_: [])
         seen = []
 

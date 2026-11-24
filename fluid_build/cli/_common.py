@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -96,14 +95,22 @@ _APPLY_RESOLVE_PURPOSE = (
 )
 
 
-def resolve_env_templates_in_contract(contract: Any, *, purpose: Optional[str] = None) -> Any:
+def resolve_env_templates_in_contract(
+    contract: Any,
+    *,
+    purpose: Optional[str] = None,
+    unset: str = "error",
+    stage: Optional[str] = None,
+) -> Any:
     """Recursively resolve ``{{ env.VAR }}`` placeholders throughout a contract.
 
-    Walks dicts and lists and delegates every string to the canonical
-    ``resolve_env_templates`` (the single-source-of-truth resolver shared by
-    the Snowflake provider and the CLI). Unresolved placeholders are left
-    intact so a missing variable surfaces loudly rather than silently
-    becoming an empty name.
+    Walks dicts and lists and renders every string through the one resolver,
+    :func:`fluid_build.util.env_templates.render_contract`. A variable that is
+    unset or empty is an error: :class:`~fluid_build.util.env_templates.EnvTemplateError`
+    names every such variable and the fields that write it, so a contract never
+    deploys with a bucket called ``{{ env.S3_BUCKET }}`` or a path missing its first
+    half. ``unset="defer"`` is the named escape for a stage that leaves the
+    placeholder for a later one (see that module for the sites that do).
 
     The OpenTofu emit path (``fluid apply`` / ``fluid generate iac``) reads
     the contract's ``exposes[]`` data-plane directly, so env templates must
@@ -117,66 +124,30 @@ def resolve_env_templates_in_contract(contract: Any, *, purpose: Optional[str] =
     Snowsight. So ``{{ env.MY_DB_PASSWORD }}`` written into a free-text field
     used to publish that password verbatim to all three sinks. A placeholder
     whose *name* looks like a credential is therefore left literal and a
-    warning is emitted once per variable — the same policy
-    ``_contract_loader.resolve_contract_env_templates`` already applies on the
-    publish path, kept symmetric here per the CLAUDE.md "extend both" rule.
-    Real credentials reach the provider through its own environment
-    variables, never through contract text.
+    warning is emitted once per variable. It is not "missing": policy refuses
+    it, the same rule the publish path applies. Real credentials reach the
+    provider through its own environment variables, never through contract text.
 
     ``purpose`` names where this caller's resolved contract goes, for the warning; the
-    default is the OpenTofu emit path's sinks (``fluid plan`` passes its own).
+    default is the OpenTofu emit path's sinks (``fluid plan`` passes its own). ``stage``
+    names the command, for the error.
     """
-    from fluid_build.observability.secret_redactor import is_sensitive_key_name
-    from fluid_build.providers.snowflake.util.config import ENV_TEMPLATE_RE, resolve_env_templates
+    from fluid_build.util.env_templates import render_contract
 
-    log = logging.getLogger("fluid.cli")
-    seen_sensitive: set[str] = set()
-
-    def _resolve_string(text: str) -> str:
-        if "{{" not in text:
-            return text
-        sensitive = {
-            name.strip()
-            for name in ENV_TEMPLATE_RE.findall(text)
-            if is_sensitive_key_name(name.strip())
-        }
-        if not sensitive:
-            return resolve_env_templates(text)
-        for name in sorted(sensitive):
-            if name not in seen_sensitive:
-                seen_sensitive.add(name)
-                log.warning(
-                    "Refusing to resolve sensitive-looking env placeholder "
-                    "'{{ env.%s }}' in contract body; leaving it literal. %s — a "
-                    "credential must not ride along. If this value is not a "
-                    "secret, rename the variable outside the "
-                    "password/secret/token/key family.",
-                    name,
-                    purpose or _APPLY_RESOLVE_PURPOSE,
-                )
-
-        # Resolve the non-sensitive placeholders in the same string, leaving
-        # the sensitive ones literal, so a mixed string still works.
-        def _replace(match: "re.Match[str]") -> str:
-            name = match.group(1).strip()
-            if name in sensitive:
-                return match.group(0)
-            return resolve_env_templates(match.group(0))
-
-        # ``.strip()`` mirrors ``resolve_env_templates`` so a partially
-        # resolved string is whitespace-identical to a fully resolved one.
-        return ENV_TEMPLATE_RE.sub(_replace, text).strip()
-
-    def _walk(obj: Any) -> Any:
-        if isinstance(obj, dict):
-            return {key: _walk(value) for key, value in obj.items()}
-        if isinstance(obj, list):
-            return [_walk(item) for item in obj]
-        if isinstance(obj, str):
-            return _resolve_string(obj)
-        return obj
-
-    return _walk(contract)
+    return render_contract(
+        contract,
+        unset=unset,
+        refusal=(
+            "Refusing to resolve sensitive-looking env placeholder "
+            "'{{ env.%s }}' in contract body; leaving it literal. "
+            + (purpose or _APPLY_RESOLVE_PURPOSE).replace("%", "%%")
+            + " \u2014 a credential must not ride along. If this value is not a "
+            "secret, rename the variable outside the "
+            "password/secret/token/key family."
+        ),
+        stage=stage,
+        logger=logging.getLogger("fluid.cli"),
+    )
 
 
 def write_json(path: str, obj: Any) -> None:

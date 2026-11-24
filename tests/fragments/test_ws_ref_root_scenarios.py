@@ -48,7 +48,7 @@ from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Se
 import pytest
 import yaml
 
-from fluid_build import loader
+from fluid_build import contract_refs, loader
 from fluid_build.loader import (
     RefConfinementError,
     RefResolutionError,
@@ -92,6 +92,7 @@ def _clear_registries() -> None:
     for name, value in list(vars(loader).items()):
         if name.startswith("_NOTED_") and isinstance(value, set):
             value.clear()
+    contract_refs._NOTED_REF_WARNINGS.clear()  # the resolver's registry: not a loader attribute
 
 
 @pytest.fixture

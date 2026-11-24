@@ -7,15 +7,16 @@ What a fragment may contain at the byte level and in YAML 1.1's corners: byte-or
 marks, line endings, empty files, size caps, files that are not UTF-8, aliases and
 merge keys, duplicate keys, Unicode, odd keys and odd file names.
 
-Scenarios that cite a SPEC GAP (N-01 JSON, N-09, N-13 collision, N-17, N-22
+Scenarios that cite a SPEC GAP (N-01 JSON, N-13 collision, N-17, N-22
 percent-encoding) pin what the code does today, because the spec gives them no
-oracle. A test marked ``xfail(strict=True)`` asserts the spec and names the bug it
-shows.
+oracle. N-09 (SG-18) is decided: a key written twice is refused. A test marked
+``xfail(strict=True)`` asserts the spec and names the bug it shows.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tarfile
 import unicodedata
@@ -25,7 +26,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import pytest
 import yaml
 
-from fluid_build import loader
+from fluid_build import contract_refs, loader
 from fluid_build.contract_refs import MAX_TEXT_REF_BYTES, ComposeTrace, resolve_file_refs
 from fluid_build.loader import RefResolutionError
 
@@ -38,6 +39,7 @@ def _clear_warn_once_registries() -> None:
     for name, value in vars(loader).items():
         if name.startswith("_NOTED_") and isinstance(value, set):
             value.clear()
+    contract_refs._NOTED_REF_WARNINGS.clear()  # the resolver's registry: not a loader attribute
 
 
 @pytest.fixture(autouse=True)
@@ -116,6 +118,11 @@ def _cli(capsys: pytest.CaptureFixture[str], *argv: str) -> Tuple[int, str]:
     code = main(list(argv))
     captured = capsys.readouterr()
     return code, captured.out + captured.err
+
+
+def _flat(text: str) -> str:
+    """Whitespace-normalised: Rich wraps long lines in the CLI's error panel."""
+    return " ".join(text.split())
 
 
 def _bundle(
@@ -337,24 +344,244 @@ def test_n08_a_merge_key_in_a_fragment_is_applied(tmp_path: Path) -> None:
     assert got["item"] == {"a": 1, "b": 3, "c": 4}
 
 
-def test_n09_a_duplicate_key_keeps_the_last_value_silently_sg18(tmp_path: Path) -> None:
-    """SG-18 characterization: PyYAML's last-wins applies inside fragments."""
-    _write(tmp_path / "dup.yaml", "a: 1\na: 2\n")
-
-    assert _rfr({"x": {"$ref": "./dup.yaml"}}, tmp_path) == {"x": {"a": 2}}
+def _unique(first: int) -> str:
+    """The tail of a YAML duplicate-key error whose first occurrence is at line ``first``."""
+    return f"(first at line {first}; YAML 1.2 requires unique keys); remove one of them"
 
 
-def test_n09_two_ref_keys_in_one_mapping_read_only_the_last_file_sg18(tmp_path: Path) -> None:
-    """SG-18 characterization. The first ``$ref`` is dropped by the YAML parser, so the file
-    a reviewer reads first is never read and nothing says so."""
+def test_n09_a_duplicate_key_in_a_fragment_is_refused_naming_file_line_and_key_sg18(
+    tmp_path: Path,
+) -> None:
+    """SG-18, decided: PyYAML keeps the last value and drops the other without a word; every
+    file the composition reads refuses a key written twice instead."""
+    dup = _write(tmp_path / "dup.yaml", "a: 1\nb: {c: 1}\na: 2\n")
+
+    with pytest.raises(RefResolutionError) as info:
+        _rfr({"x": {"$ref": "./dup.yaml"}}, tmp_path)
+
+    message = str(info.value)
+    assert f"{dup}:3: duplicate key 'a' {_unique(1)}" in message
+    assert "$ref target './dup.yaml' at JSON pointer '/x'" in message
+
+
+def test_n09_two_ref_keys_in_one_mapping_are_a_duplicate_key_and_no_file_is_read_sg18(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SG-18, decided. The parser used to drop the first ``$ref``, so the file a reviewer
+    reads first was never read and nothing said so; now neither is read."""
     _write(tmp_path / "a.yaml", "from: a\n")
     _write(tmp_path / "b.yaml", "from: b\n")
     contract = _write(tmp_path / "contract.fluid.yaml", "x:\n  $ref: ./a.yaml\n  $ref: ./b.yaml\n")
+    reads: List[str] = []
+    from fluid_build.util import safe_yaml
 
-    composed = loader.compose_contract(contract)
+    real = safe_yaml.read_bounded_file
 
-    assert composed.document == {"x": {"from": "b"}}
-    assert [path.name for path in composed.files] == ["contract.fluid.yaml", "b.yaml"]
+    def spy(path: Path, *args: Any, **kwargs: Any) -> Any:
+        reads.append(Path(path).name)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(safe_yaml, "read_bounded_file", spy)
+
+    with pytest.raises(RuntimeError) as info:
+        loader.compose_contract(contract)
+
+    assert str(info.value) == f"{contract}:3: duplicate key '$ref' {_unique(2)}"
+    assert reads == ["contract.fluid.yaml"]
+
+
+_DUP_YAML = "a: 1\nnested:\n  k: 1\n  k: 2\n"
+
+
+@pytest.mark.parametrize(
+    ("where", "name", "text", "shown"),
+    [
+        ("root", "contract.fluid.yaml", "id: x\nname: n\nid: y\n", ":3: duplicate key 'id'"),
+        ("root", "contract.fluid.json", '{"id": "x", "id": "y"}', ": duplicate key 'id'"),
+        ("overlay", "overlays/dev.yaml", "id: x\nid: y\n", ":2: duplicate key 'id'"),
+        ("fragment", "f.yaml", _DUP_YAML, ":4: duplicate key 'k'"),
+        ("fragment", "f.json", '{"a": {"k": 1, "k": 2}}', ": duplicate key 'k'"),
+        ("fragment", "f.avsc", '{"type": "record", "type": "enum"}', ": duplicate key 'type'"),
+        ("fragment", "f.avsc", "# YAML, not JSON\ntype: record\ntype: enum\n", ":3:"),
+    ],
+    ids=[
+        "yaml-root",
+        "json-root",
+        "overlay",
+        "yaml-fragment",
+        "json-fragment",
+        "avsc",
+        "avsc-yaml",
+    ],
+)
+def test_n09_every_file_the_composition_reads_refuses_a_duplicate_key_sg18(
+    tmp_path: Path, where: str, name: str, text: str, shown: str
+) -> None:
+    file = _write(tmp_path / name, text)
+    contract = tmp_path / "contract.fluid.yaml"
+    if where == "fragment":
+        _write(contract, f"id: x\nx: {{$ref: ./{name}}}\n")
+    elif where == "overlay":
+        _write(contract, "id: x\n")
+    else:
+        contract = file
+
+    with pytest.raises((RuntimeError, RefResolutionError)) as info:
+        loader.compose_contract(contract, "dev" if where == "overlay" else None)
+
+    message = str(info.value)
+    assert f"{file}{shown}" in message
+    assert "remove one of them" in message
+    if name.endswith(".json") or (name.endswith(".avsc") and "{" in text):
+        assert "RFC 8259" in message  # JSON gives no line
+    else:
+        assert "YAML 1.2 requires unique keys" in message
+
+
+def test_n09_contract_text_and_a_bundle_refuse_a_duplicate_key_sg18(tmp_path: Path) -> None:
+    """``parse_contract_text`` reads the library's in-memory text and a bundle's resolved
+    contract: the same rule, the error naming the bundle member it was read from."""
+    from fluid_build.api.contract import ContractLoadError, load_contract, load_contract_from_text
+    from fluid_build.forge.core.bundle import build_manifest, write_tgz
+
+    with pytest.raises(ContractLoadError) as text_info:
+        load_contract_from_text("id: x\nid: y\n")
+    assert text_info.value.event == "contract_parse_failed"
+    assert f"line 2: duplicate key 'id' {_unique(1)}" in str(text_info.value)
+    assert "Failed to parse contract text" not in str(text_info.value), "said once"
+
+    files = {"contract.resolved.yaml": b"id: x\nkind: DataProduct\nid: y\n"}
+    tgz = tmp_path / "b.tgz"
+    write_tgz(tgz, {**files, "MANIFEST.json": json.dumps(build_manifest(files)).encode()})
+    with pytest.raises(ContractLoadError) as bundle_info:
+        load_contract(tgz)
+    assert bundle_info.value.event == "bundle_load_failed"
+    assert f"contract.resolved.yaml:3: duplicate key 'id' {_unique(1)}" in str(bundle_info.value)
+    assert "Failed to parse contract text" not in str(bundle_info.value)
+
+
+def test_n09_validate_and_bundle_fail_on_a_duplicate_key_naming_it_sg18(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    doc = _min_doc()
+    doc["metadata"]["owner"] = {"$ref": "./owner.yaml"}
+    contract = _write_contract(tmp_path, doc)
+    owner = _write(tmp_path / "owner.yaml", "team: a\nemail: a@example.com\nteam: b\n")
+    out = tmp_path / "b.yaml"
+
+    code, output = _cli(capsys, "validate", str(contract))
+    assert code == 1, output
+    assert f"{owner}:3: duplicate key 'team'" in _flat(output)
+
+    code, output = _cli(capsys, "bundle", str(contract), "--out", str(out))
+    assert code == 2, output
+    assert f"{owner}:3: duplicate key 'team'" in _flat(output)
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("emit", ["odcs", "odps-bitol", "opds"])
+def test_n09_generate_artifacts_refuses_a_duplicate_key_in_the_root_contract_sg18(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], emit: str
+) -> None:
+    """``fluid generate artifacts`` read a contract without ``$ref`` with PyYAML's
+    last-wins: the second ``accessPolicy``, granting everyone read and write, was the one
+    ``--emit odcs`` and ``odps-bitol`` exported while ``validate`` refused the file, and
+    ``--emit opds`` ended in an unhandled exception. Each now fails as the others do."""
+    text = yaml.safe_dump(_min_doc(), sort_keys=False)
+    text += "accessPolicy: {grants: [{principal: 'group:analysts', permissions: [read]}]}\n"
+    text += "accessPolicy: {grants: [{principal: '*', permissions: [read, write]}]}\n"
+    contract = _write(tmp_path / "contract.fluid.yaml", text)
+    out = tmp_path / "artifacts"
+    second = text.count("\n")
+
+    code, output = _cli(
+        capsys, "generate", "artifacts", str(contract), "--emit", emit, "--out", str(out)
+    )
+
+    assert code == 1, output
+    assert "generate_artifacts_failed" in output
+    assert f"{contract}:{second}: duplicate key 'accessPolicy' (first at line {second - 1};" in (
+        _flat(output)
+    )
+    assert [p for p in out.rglob("*") if p.is_file()] == [], "nothing is exported"
+
+
+def test_n09_a_merged_key_written_again_is_an_override_not_a_duplicate_sg18(
+    tmp_path: Path,
+) -> None:
+    """The keys a mapping writes are checked before ``<<`` expands, so overriding a merged
+    default is not a duplicate, also for a merge source written inline and used again; and
+    a ``<<`` is a merge directive, not a data key, so a mapping may write two."""
+    _write(
+        tmp_path / "m.yaml",
+        "base: &base {a: 1, b: 1}\n"
+        "top:\n  <<: &mid\n    <<: *base\n    a: 2\n  b: 3\n"
+        "again: *mid\n",
+    )
+
+    _write(tmp_path / "two.yaml", "a: &a {x: 1}\nb: &b {y: 2}\nboth:\n  <<: *a\n  <<: *b\n  z: 3\n")
+
+    got = _rfr({"x": {"$ref": "./m.yaml"}, "y": {"$ref": "./two.yaml"}}, tmp_path)
+
+    assert got["x"]["top"] == {"a": 2, "b": 3}
+    assert got["x"]["again"] == {"a": 2, "b": 1}
+    assert got["y"]["both"] == {"x": 1, "y": 2, "z": 3}, "two << lines: both merges apply"
+
+
+def test_n09_a_workspace_file_with_a_duplicate_ref_root_is_refused_naming_the_key_sg18(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """SG-18, decided: ``fluid.workspace.yaml`` is a file the composition reads, held to
+    unique keys. A ``ref_root`` written twice is refused as a file that cannot be parsed
+    is: the contract keeps its own directory, and the WARNING and the escape error name
+    the file, the line and the key, where the last value used to win without a word."""
+    monkeypatch.delenv("FLUID_IGNORE_WORKSPACE_REF_ROOT", raising=False)
+    ws = tmp_path / "ws"
+    _write(ws / "fluid.workspace.yaml", "ref_root: nowhere\nref_root: .\n")
+    _write(ws / "shared" / "team.yaml", "team: shared\n")
+    contract = _write(ws / "p" / "contract.fluid.yaml", "x: {$ref: ../shared/team.yaml}\n")
+    named = f"fluid.workspace.yaml:2: duplicate key 'ref_root' {_unique(1)}"
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        with pytest.raises(RefResolutionError, match="escapes the ref root") as info:
+            loader.load_contract(contract)
+
+    assert named in str(info.value)
+    (warning,) = [r for r in caplog.records if r.event == "workspace_ref_root_ignored"]  # type: ignore[attr-defined]
+    assert named in warning.getMessage()
+
+
+def test_n09_a_workspace_that_declares_environments_with_a_duplicate_key_refuses_sg18(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The workspace's ``expected-environments`` decide whether ``--env`` without an overlay
+    is refused. Written with a key twice, which environments it declares cannot be told:
+    the duplicate is the error, never "nothing declared", which would let the env pass."""
+    monkeypatch.delenv("FLUID_IGNORE_WORKSPACE_REF_ROOT", raising=False)
+    ws = tmp_path / "ws"
+    workspace = _write(
+        ws / "fluid.workspace.yaml",
+        "expected-environments:\n  p: [prod]\n  p: [staging]\n",
+    )
+    contract = _write_contract(ws / "p", _min_doc())
+
+    with pytest.raises(RuntimeError) as info:
+        loader.load_with_overlay(contract, "prod")
+
+    assert str(info.value) == f"{workspace}:3: duplicate key 'p' {_unique(2)}"
+
+
+def test_n09_readers_off_the_composition_path_keep_the_last_value(tmp_path: Path) -> None:
+    """Only what the composition reads is held to unique keys. The other readers of YAML
+    keep PyYAML's last-wins, among them the workspace defaults ``fluid init`` and ``fluid
+    forge`` read (``cli.workspace_config``), which parse the file with ``yaml.safe_load``."""
+    from fluid_build.cli.workspace_config import load_workspace_config
+    from fluid_build.util.safe_yaml import load_yaml_safe
+
+    _write(tmp_path / "fluid.workspace.yaml", "name: first\nname: last\n")
+
+    assert load_yaml_safe("a: 1\na: 2\n") == {"a": 2}
+    assert load_workspace_config(tmp_path).name == "last"
 
 
 def test_n10_tabs_in_a_yaml_fragment_are_an_error_naming_the_file_and_line(
@@ -439,14 +666,14 @@ def test_n12_keys_with_slash_and_tilde_are_literal_and_escape_in_pointers(
     assert "at JSON pointer '/a~1b/~0k'" in str(info.value)
 
 
-_YAML_11_KEYS = "200: a\nyes: b\non: c\nnull: d\n1.5: e\n"
+_YAML_11_KEYS = "200: a\nyes: b\nnull: d\n1.5: e\n"
 
 
 def test_n13_yaml_1_1_keys_in_a_fragment_equal_the_same_keys_written_inline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    expected = {200: "a", True: "c", None: "d", 1.5: "e"}
+    expected = {200: "a", True: "b", None: "d", 1.5: "e"}
     outputs = {}
     for kind in ("inline", "fragment"):
         root = tmp_path / kind
@@ -469,6 +696,24 @@ def test_n13_yaml_1_1_keys_in_a_fragment_equal_the_same_keys_written_inline(
     assert outputs["fragment"] == outputs["inline"]
 
 
+def test_n13_two_yaml_1_1_spellings_of_one_key_are_a_duplicate_inline_and_in_a_fragment_sg18(
+    tmp_path: Path,
+) -> None:
+    """``yes`` and ``on`` are both the key ``True`` in YAML 1.1: a dict keeps one of them, so
+    the pair is refused like any key written twice, naming both spellings."""
+    _write(tmp_path / "keys.yaml", "yes: b\non: c\n")
+    inline = _write(tmp_path / "contract.fluid.yaml", "id: x\nx:\n  yes: b\n  on: c\n")
+
+    with pytest.raises(RefResolutionError) as fragment_info:
+        _rfr({"x": {"$ref": "./keys.yaml"}}, tmp_path)
+    with pytest.raises(RuntimeError) as inline_info:
+        loader.load_contract(inline)
+
+    same = "duplicate key 'on' (the same key as 'yes' at line"
+    assert f"keys.yaml:2: {same} 1;" in str(fragment_info.value)
+    assert f"{inline}:4: {same} 3;" in str(inline_info.value)
+
+
 def test_n13_a_string_sibling_does_not_merge_with_an_int_key_sg03(tmp_path: Path) -> None:
     """SG-03 characterization: ``"200"`` and ``200`` are different keys, so both stay."""
     _write(tmp_path / "k200.yaml", "200: a\nother: 1\n")
@@ -476,6 +721,73 @@ def test_n13_a_string_sibling_does_not_merge_with_an_int_key_sg03(tmp_path: Path
     got = _rfr({"x": {"$ref": "./k200.yaml", "200": "x"}}, tmp_path)["x"]
 
     assert got == {200: "a", "other": 1, "200": "x"}
+
+
+@pytest.mark.parametrize(
+    ("keys", "shown", "name"),
+    [
+        ("200: a\n    '200': b", "200 and '200'", '"200"'),
+        ("true: a\n    'true': b", "true and 'true'", '"true"'),
+        ("'null': a\n    null: b", "'null' and null", '"null"'),
+    ],
+    ids=["int", "bool", "null"],
+)
+def test_n13_bundle_json_refuses_two_keys_json_writes_as_one_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], keys: str, shown: str, name: str
+) -> None:
+    """YAML keeps ``200`` and ``"200"`` apart, and so does the composition; JSON writes both
+    as the name ``"200"``. ``fluid bundle --format json`` wrote that name twice, so every
+    reader of contracts refused the bundle's own output (0.25.0 read one key and dropped
+    the other). It is refused at the writer, naming the keys and where they are, and
+    nothing is written; ``--format yaml`` keeps both keys."""
+    from fluid_build.cli import main
+
+    base = yaml.safe_dump(_min_doc(), sort_keys=False)
+    contract = _write(
+        tmp_path / "contract.fluid.yaml", base + f"extensions:\n  status:\n    {keys}\n"
+    )
+    out = tmp_path / "b.json"
+    refused = (
+        f"the mapping at JSON pointer '/extensions/status' has the keys {shown}, which JSON "
+        f"writes as one name, {name}; a reader keeps only one of them"
+    )
+
+    code, output = _cli(capsys, "bundle", str(contract), "--format", "json", "--out", str(out))
+    assert code == 2, output
+    assert refused in _flat(output) and "Use --format yaml" in output
+    assert not out.exists()
+
+    capsys.readouterr()
+    assert main(["bundle", str(contract), "--format", "json"]) == 2
+    assert '"fluidVersion"' not in capsys.readouterr().out, "nothing written to stdout"
+
+    kept = _bundle(capsys, contract, tmp_path / "b.yaml")["extensions"]["status"]
+    assert kept == loader.load_contract(contract)["extensions"]["status"]
+    assert len(kept) == 2
+    assert loader.load_contract(tmp_path / "b.yaml")["extensions"]["status"] == kept
+
+
+def test_n13_a_plain_equals_key_loads_as_before_and_the_contract_validates(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``=`` is YAML 1.1's "value" key, which PyYAML reads as the string ``"="``:
+    ``{=: eq}`` is ``{"=": "eq"}``, in the contract and in a fragment, as 0.25.0 read
+    it. The unique-key check constructed the key before PyYAML retags it, and refused it."""
+    _write(tmp_path / "ops.yaml", "=: eq\n'!=': ne\n")
+    doc = _min_doc()
+    doc["builds"][0]["properties"]["parameters"] = {
+        "operators": "INLINE",
+        "more": {"$ref": "./ops.yaml"},
+    }
+    text = yaml.safe_dump(doc, sort_keys=False).replace("operators: INLINE", "operators: {=: eq}")
+    assert "operators: {=: eq}" in text
+    contract = _write(tmp_path / "contract.fluid.yaml", text)
+
+    parameters = loader.load_contract(contract)["builds"][0]["properties"]["parameters"]
+
+    assert parameters == {"operators": {"=": "eq"}, "more": {"=": "eq", "!=": "ne"}}
+    code, output = _cli(capsys, "validate", str(contract))
+    assert code == 0, output
 
 
 # ── N-14 .. N-16: ref values, nesting, look-alike keys ─────────────────
@@ -548,6 +860,276 @@ def test_n16_look_alike_keys_are_ordinary_keys(
     code, output = _cli(capsys, "validate", str(closed_contract))
     assert code == 1
     assert "'$REF' was unexpected" in output
+
+
+# ── SG-05: a payload's own $ref keys, written $$ref ─────────────────────
+
+#: A JSON Schema payload with refs of its own. ``#/$defs/...`` names nothing in the
+#: contract, so resolving any of them as a contract ref would fail.
+_PAYLOAD = {
+    "$$ref": "#/$defs/Order",
+    "$defs": {"Order": {"type": "object", "properties": {"id": {"$$ref": "#/$defs/Id"}}}},
+}
+_PAYLOAD_COMPOSED = {
+    "$ref": "#/$defs/Order",
+    "$defs": {"Order": {"type": "object", "properties": {"id": {"$ref": "#/$defs/Id"}}}},
+}
+
+
+def _payload_contract(root: Path) -> Path:
+    """MIN with the payload in ``parameters`` (and a ``$$$ref`` and a list), in a fragment
+    and in the dev overlay."""
+    doc = _min_doc()
+    doc["builds"][0]["properties"]["parameters"] = {
+        "payloadSchema": _PAYLOAD,
+        "literal": {"$$$ref": "two dollars"},
+        "list": [{"$$ref": "./missing.yaml"}],
+    }
+    doc["extensions"] = {"fragment": {"$ref": "./ext.yaml"}}
+    _write(root / "ext.yaml", "schema:\n  $$ref: ./nowhere.yaml\n")
+    _write(root / "overlays" / "dev.yaml", 'extensions: {overlay: {$$ref: "#/none"}}\n')
+    return _write_contract(root, doc)
+
+
+def test_n16_a_double_dollar_key_is_a_literal_ref_key_and_is_never_resolved_sg05(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SG-05, decided: ``$$ref`` is the literal key ``$ref`` in the composed contract, in
+    the root, a fragment and an overlay alike; one ``$`` is dropped per level."""
+    from fluid_build.api.contract import load_contract
+
+    monkeypatch.chdir(tmp_path)
+    contract = _payload_contract(tmp_path)
+
+    composed = loader.compose_contract(contract, "dev")
+
+    params = composed.document["builds"][0]["properties"]["parameters"]
+    assert params == {
+        "payloadSchema": _PAYLOAD_COMPOSED,
+        "literal": {"$$ref": "two dollars"},
+        "list": [{"$ref": "./missing.yaml"}],
+    }
+    assert composed.document["extensions"] == {
+        "fragment": {"schema": {"$ref": "./nowhere.yaml"}},
+        "overlay": {"$ref": "#/none"},
+    }
+    assert [p.name for p in composed.files] == ["contract.fluid.yaml", "ext.yaml", "dev.yaml"]
+    loaded = load_contract(contract, env="dev")
+    assert loaded.contract == composed.document
+    assert loaded.unresolved_refs == (), "a payload's $ref is no unresolved reference"
+    assert loaded.origin_of(["builds", 0, "properties", "parameters", "payloadSchema", "$ref"])
+    code, output = _cli(capsys, "validate", str(contract), "--env", "dev")
+    assert code == 0, output
+
+
+def test_n16_a_payload_ref_is_still_a_contract_reference_unless_escaped_sg05(
+    tmp_path: Path,
+) -> None:
+    doc = _min_doc()
+    doc["builds"][0]["properties"]["parameters"] = {"payloadSchema": {"$ref": "#/$defs/Order"}}
+    contract = _write_contract(tmp_path, doc)
+
+    with pytest.raises(RefResolutionError, match="'/\\$defs/Order' in the composed contract"):
+        loader.load_contract(contract)
+
+
+def test_n16_the_escape_is_read_last_on_every_path_of_the_composition_sg05() -> None:
+    """After the check that no ``$ref`` is left, also for a document without any ``$ref``
+    (the pointer pass returns early), and only for a document that is composed."""
+    from fluid_build.api.contract import load_contract_from_dict
+
+    plain = load_contract_from_dict({"id": "x", "p": {"$$ref": "#/q", "$$$ref": 1}})
+    assert plain.contract == {"id": "x", "p": {"$ref": "#/q", "$$ref": 1}}
+    assert plain.unresolved_refs == ()
+
+    pointed = load_contract_from_dict(
+        {"s": {"$$ref": "#/x", "k": 1}, "copy": {"$ref": "#/s"}, "key": {"$ref": "#/s/$$ref"}}
+    )
+    assert pointed.contract["copy"] == {"$ref": "#/x", "k": 1}
+    assert pointed.contract["key"] == "#/x", "a pointer names an escaped key as written"
+    assert pointed.unresolved_refs == ()
+
+    names_files = load_contract_from_dict({"x": {"$ref": "./f.yaml"}, "p": {"$$ref": "#/q"}})
+    assert names_files.contract == {"x": {"$ref": "./f.yaml"}, "p": {"$$ref": "#/q"}}
+    assert names_files.unresolved_refs == ("./f.yaml",), "nothing is composed, nor unescaped"
+
+
+def _bundle_text(capsys: pytest.CaptureFixture[str], contract: Path, out: Path, *flags: str) -> str:
+    code, output = _cli(capsys, "bundle", str(contract), "--out", str(out), *flags)
+    assert code == 0, output
+    return out.read_text(encoding="utf-8")
+
+
+def test_n16_a_bundle_writes_the_escape_back_and_composes_to_the_same_contract_sg05(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bundle stays contract input: bundle(original) composed again == compose(original),
+    in YAML, JSON and the tgz, and a plan made from any of them carries the payload's
+    ``$ref`` as ``$ref``."""
+    from fluid_build.api.contract import load_contract
+
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / "src"
+    contract = _payload_contract(root)
+    original = loader.compose_contract(contract, "dev").document
+
+    for name, flags in (("b.yaml", ()), ("b.json", ("--format", "json"))):
+        text = _bundle_text(capsys, contract, tmp_path / name, "--env", "dev", *flags)
+        written = json.loads(text) if name.endswith(".json") else yaml.safe_load(text)
+        assert written["builds"][0]["properties"]["parameters"]["payloadSchema"] == _PAYLOAD
+        assert written["builds"][0]["properties"]["parameters"]["literal"] == {
+            "$$$ref": "two dollars"
+        }
+        assert loader.compose_contract(tmp_path / name).document == original
+
+    code, output = _cli(
+        capsys, "bundle", str(contract), "--env", "dev", "--format", "tgz", "--out", "b.tgz"
+    )
+    assert code == 0, output
+    with tarfile.open(tmp_path / "b.tgz") as archive:
+        for member in ("contract.resolved.yaml", "contract.resolved.json"):
+            text = archive.extractfile(member).read().decode()  # type: ignore[union-attr]
+            assert '"#/$defs/Order"' in text or "'#/$defs/Order'" in text
+            assert "$$ref" in text and "$$$ref" in text
+    loaded = load_contract(tmp_path / "b.tgz", env="dev")
+    assert loaded.contract == original
+    assert loaded.unresolved_refs == ()
+    code, output = _cli(capsys, "validate", str(tmp_path / "b.tgz"))
+    assert code == 0, output
+
+    for label, source in (("contract", contract), ("tgz", tmp_path / "b.tgz")):
+        code, output = _cli(capsys, "plan", str(source), "--env", "dev", "--out", f"{label}.json")
+        assert code == 0, output
+        planned = json.loads((tmp_path / f"{label}.json").read_text(encoding="utf-8"))
+        assert planned["contract"]["builds"][0]["properties"]["parameters"] == (
+            original["builds"][0]["properties"]["parameters"]
+        )
+
+
+def test_n16_an_openapi_document_moved_to_sources_keeps_its_own_refs_sg05(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``fluid bundle --format tgz`` moves an expose's inline OpenAPI to ``sources/openapi``
+    after it composes, so that file holds the document as OpenAPI reads it: ``$ref``."""
+    from fluid_build.api.contract import load_contract
+
+    doc = _min_doc()
+    doc["exposes"][0]["openapi"] = {
+        "openapi": "3.1.0",
+        "paths": {"/o": {"get": {"responses": {"200": {"$$ref": "#/components/responses/Ok"}}}}},
+    }
+    contract = _write_contract(tmp_path, doc)
+    tgz = tmp_path / "b.tgz"
+
+    code, output = _cli(capsys, "bundle", str(contract), "--format", "tgz", "--out", str(tgz))
+    assert code == 0, output
+
+    with tarfile.open(tgz) as archive:
+        (moved,) = [n for n in archive.getnames() if n.startswith("sources/openapi/")]
+        source = yaml.safe_load(archive.extractfile(moved))  # type: ignore[arg-type]
+        resolved = yaml.safe_load(archive.extractfile("contract.resolved.yaml"))  # type: ignore[arg-type]
+    ok = {"$ref": "#/components/responses/Ok"}
+    assert source["paths"]["/o"]["get"]["responses"]["200"] == ok
+    assert resolved["exposes"][0]["openapi"] == {"$source": moved}
+    assert load_contract(tgz).contract["exposes"][0]["openapi"]["paths"]["/o"]["get"] == {
+        "responses": {"200": ok}
+    }
+
+
+def test_n16_validate_names_a_bundles_literal_key_as_its_contract_does_sg05(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ``$$ref`` key is the literal key ``$ref``: where the schema allows no such key (an
+    expose is closed), ``validate`` refuses the contract for ``'$ref'``. Its bundle holds
+    the key escaped, and ``validate`` must read it back before the schema check: read as
+    written, the bundle's error named ``'$$ref'``, a key the contract does not have."""
+    doc = _min_doc()
+    doc["exposes"][0]["$$ref"] = "#/exposes/0/kind"
+    contract = _write_contract(tmp_path, doc)
+    tgz = tmp_path / "b.tgz"
+
+    code, output = _cli(capsys, "validate", str(contract))
+    assert code == 1, output
+    assert "'$ref' was unexpected" in output and "'$$ref'" not in output
+
+    code, output = _cli(capsys, "bundle", str(contract), "--format", "tgz", "--out", str(tgz))
+    assert code == 0, output
+    with tarfile.open(tgz) as archive:
+        resolved = yaml.safe_load(archive.extractfile("contract.resolved.yaml"))  # type: ignore[arg-type]
+    assert "$$ref" in resolved["exposes"][0], "the bundle holds the key escaped"
+
+    code, output = _cli(capsys, "validate", str(tgz))
+    assert code == 1, output
+    assert "'$ref' was unexpected" in output
+    assert "'$$ref'" not in output
+
+
+def test_n16_a_moved_openapi_document_keeps_every_escape_level_through_a_bundle_sg05(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``sources/openapi/`` holds the document as the composed contract has it: its ``$ref``
+    (written ``$$ref``) and its literal ``$$ref`` (written ``$$$ref``). The bundle reader
+    unescapes the resolved contract BEFORE it puts the document back; after, the
+    document's ``$$ref`` lost a ``$`` a second time and came back as ``$ref``."""
+    from fluid_build._contract_loader import load_contract_with_overlay
+    from fluid_build.api.contract import load_contract
+
+    doc = _min_doc()
+    doc["exposes"][0]["openapi"] = {
+        "openapi": "3.1.0",
+        "paths": {"/o": {"get": {"responses": {"200": {"$$ref": "#/components/responses/Ok"}}}}},
+        "components": {"x-note": {"$$$ref": "a literal key, two dollars"}},
+    }
+    contract = _write_contract(tmp_path, doc)
+    tgz = tmp_path / "b.tgz"
+    composed = loader.compose_contract(contract).document
+    openapi = composed["exposes"][0]["openapi"]
+    assert openapi["paths"]["/o"]["get"]["responses"]["200"] == {
+        "$ref": "#/components/responses/Ok"
+    }
+    assert openapi["components"]["x-note"] == {"$$ref": "a literal key, two dollars"}
+
+    code, output = _cli(capsys, "bundle", str(contract), "--format", "tgz", "--out", str(tgz))
+    assert code == 0, output
+    with tarfile.open(tgz) as archive:
+        (moved,) = [n for n in archive.getnames() if n.startswith("sources/openapi/")]
+        source = yaml.safe_load(archive.extractfile(moved))  # type: ignore[arg-type]
+    assert source == openapi, "the moved document is written as composed"
+
+    assert load_contract(tgz).contract == composed
+    engine = load_contract_with_overlay(str(tgz), None, logging.getLogger("test"))
+    assert engine["exposes"][0]["openapi"] == openapi
+
+
+def _hand_made_bundle(tmp_path: Path, resolved: str) -> Path:
+    """A tgz with a valid MANIFEST whose ``contract.resolved.yaml`` is ``resolved``."""
+    from fluid_build.forge.core.bundle import build_manifest, write_tgz
+
+    files = {"contract.resolved.yaml": resolved.encode()}
+    tgz = tmp_path / "hand.tgz"
+    write_tgz(tgz, {**files, "MANIFEST.json": json.dumps(build_manifest(files)).encode()})
+    return tgz
+
+
+def test_n16_a_bare_ref_in_a_hand_made_bundle_is_listed_and_one_beside_its_escape_refused(
+    tmp_path: Path,
+) -> None:
+    """``fluid bundle`` never writes a bare ``$ref``: one a bundle holds was written by hand
+    (or by a release before the escape) and resolves nothing. It stays, and is listed."""
+    from fluid_build.api.contract import ContractLoadError, load_contract
+
+    frozen = load_contract(
+        _hand_made_bundle(tmp_path, "id: x\na: {$ref: ./x.yaml}\nb: {$$ref: y}\n")
+    )
+    assert frozen.contract == {"id": "x", "a": {"$ref": "./x.yaml"}, "b": {"$ref": "y"}}
+    assert frozen.unresolved_refs == ("./x.yaml",)
+
+    with pytest.raises(ContractLoadError) as info:
+        load_contract(_hand_made_bundle(tmp_path, "id: x\na: {$ref: ./x.yaml, $$ref: y}\n"))
+    assert info.value.event == "bundle_load_failed"
+    assert "'/a' holds both '$$ref' and '$ref', which both read as the key '$ref'" in str(
+        info.value
+    )
 
 
 # ── N-17, N-18: control characters and whitespace ──────────────────────
@@ -819,17 +1401,29 @@ def test_n24_a_file_name_with_a_hash_cannot_be_named_because_the_ref_splits_at_t
     assert "a#b.yaml" not in reads
 
 
-def test_n24_a_file_refs_pointer_without_a_slash_names_a_key_for_compatibility(
-    tmp_path: Path,
+def test_n24_a_file_refs_pointer_without_a_slash_names_a_key_and_is_deprecated(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Characterization (N24, decided): a file ref's fragment need not start with '/'.
-    ``./a#b.yaml`` reads key ``b.yaml`` of file ``a``, and ``./x.yaml#key`` key ``key``,
-    as contracts 0.24.0 loaded did; only a same-document ``#key`` is refused (C-12)."""
+    """N-24, decided: a file ref's fragment need not start with '/' yet. ``./a#b.yaml``
+    reads key ``b.yaml`` of file ``a``, and ``./x.yaml#key`` key ``key``, as contracts
+    0.24.0 loaded did, each with a deprecation WARNING naming the fix; only a
+    same-document ``#key`` is refused (C-12)."""
     _write(tmp_path / "a", "b.yaml: KEY-OF-A\nother: 1\n")
     _write(tmp_path / "x.yaml", "key: KEY-OF-X\n")
 
-    assert _rfr({"x": {"$ref": "./a#b.yaml"}}, tmp_path) == {"x": "KEY-OF-A"}
-    assert _rfr({"x": {"$ref": "./x.yaml#key"}}, tmp_path) == {"x": "KEY-OF-X"}
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        assert _rfr({"x": {"$ref": "./a#b.yaml"}}, tmp_path) == {"x": "KEY-OF-A"}
+        assert _rfr({"x": {"$ref": "./x.yaml#key"}}, tmp_path) == {"x": "KEY-OF-X"}
+
+    deprecated = {
+        r.ref: r.getMessage()  # type: ignore[attr-defined]
+        for r in caplog.records
+        if getattr(r, "event", None) == "ref_pointer_without_slash"
+    }
+    assert set(deprecated) == {"./a#b.yaml", "./x.yaml#key"}
+    assert "Write './a#/b.yaml'" in deprecated["./a#b.yaml"]
+    assert "Write './x.yaml#/key'" in deprecated["./x.yaml#key"]
+    assert all("a later minor release will refuse it" in m for m in deprecated.values())
 
 
 @pytest.mark.skipif(os.name == "nt", reason="a ? cannot be part of a Windows file name")

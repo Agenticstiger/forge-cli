@@ -30,13 +30,16 @@ memoisation or the boundary logic is caught.
 
 from __future__ import annotations
 
+import logging
+import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional, Tuple
 
+import pytest
 import yaml
 
-from fluid_build import loader
+from fluid_build import contract_refs, engine, loader
 from fluid_build.forge import product_types
 from fluid_build.forge.product_types import (
     _build_product_type_index,
@@ -298,6 +301,361 @@ def test_for_contract_unresolvable_upstream_is_unknown_violation(tmp_path):
     assert out[0].upstream_id == "nowhere.product"
     assert out[0].upstream_type is None
     assert "unknown" in out[0].reason.lower()
+
+
+#: A Jinja template of a contract, as a scaffold keeps one beside real contracts: no file
+#: the scan can read.
+_TEMPLATE = "id: {{ product_id }}\nmetadata: {productType: {{ product_type }}}\n"
+
+#: The composition scan's log: one WARNING for the contract checked, one DEBUG line per file.
+_UNCHECKED = "composition_upstream_unchecked"
+_SKIP = "composition_index_skip"
+
+
+def _check(workspace: Path, *product_ids: str) -> list:
+    """The composition rule for an ADP at ``workspace/me/contract.fluid.yaml`` consuming
+    ``product_ids``."""
+    target = _write_contract(
+        workspace / "me" / "contract.fluid.yaml",
+        product_id="silver.me",
+        product_type="ADP",
+        consumes=[{"productId": pid, "exposeId": "out"} for pid in product_ids],
+    )
+    contract = yaml.safe_load(target.read_text(encoding="utf-8"))
+    return validate_composition_for_contract(
+        contract, workspace_root=workspace, contract_path=target
+    )
+
+
+def _templates(directory: Path, count: int) -> None:
+    directory.mkdir(parents=True)
+    for i in range(count):
+        (directory / f"t{i}.fluid.yaml").write_text(_TEMPLATE, encoding="utf-8")
+
+
+def _records(caplog, event: Optional[str] = None, level: int = logging.DEBUG) -> list:
+    return [
+        r
+        for r in caplog.records
+        if r.levelno >= level and (event is None or getattr(r, "event", None) == event)
+    ]
+
+
+def test_for_contract_warns_when_an_upstream_contract_cannot_be_read(tmp_path, caplog):
+    """An upstream the loader refuses (a key written twice, since SG-18) is missing from the
+    index, so the rule checks its consumer against nothing: an ADP consuming a CDP passed,
+    where 0.25.0, reading the last value, refused it. One WARNING names the consumed product
+    the rule cannot check and says a file could not be read; the DEBUG line names the file
+    and why."""
+    upstream = _write_contract(
+        tmp_path / "up" / "cdp.fluid.yaml", product_id="gold.metrics", product_type="CDP"
+    )
+    text = upstream.read_text(encoding="utf-8") + "name: again\n"
+    upstream.write_text(text, encoding="utf-8")
+
+    with caplog.at_level(logging.DEBUG, logger="fluid.forge.product_types"):
+        out = _check(tmp_path, "gold.metrics")
+
+    assert [v.upstream_type for v in out] == [None], "the rule could not be checked"
+    (warning,) = _records(caplog, level=logging.WARNING)
+    assert warning.event == _UNCHECKED  # type: ignore[attr-defined]
+    assert warning.getMessage() == (
+        "composition_upstream_unchecked: the composition rule cannot check the consumed "
+        "product 'gold.metrics': no contract the workspace scan read defines it, and the scan "
+        "could not read 1 contract file. The DEBUG log (fluid --log-level DEBUG) names each "
+        "file it could not read, and why."
+    )
+    (skip,) = _records(caplog, _SKIP)
+    assert skip.levelno == logging.DEBUG
+    assert f"{upstream} could not be read: " in skip.getMessage()
+    assert "duplicate key 'name' (first at line 4;" in skip.getMessage()
+    assert skip.path == str(upstream)  # type: ignore[attr-defined]
+
+
+def test_for_contract_says_nothing_of_unreadable_files_when_every_consumed_product_is_found(
+    tmp_path, caplog
+):
+    """A file the scan cannot read matters only when a product the contract consumes may be
+    in it. Five templates beside the upstream the rule found: no WARNING. Each file was a
+    WARNING on every run, about files the run has nothing to do with."""
+    _templates(tmp_path / "templates", 5)
+    _write_contract(tmp_path / "up" / "sdp.fluid.yaml", product_id="raw.events", product_type="SDP")
+
+    with caplog.at_level(logging.DEBUG, logger="fluid.forge.product_types"):
+        out = _check(tmp_path, "raw.events")
+
+    assert out == []
+    assert len(_records(caplog, _SKIP)) == 5, "the templates could not be read"
+    assert _records(caplog, level=logging.WARNING) == []
+
+
+def test_for_contract_warns_once_naming_only_the_product_it_cannot_check(tmp_path, caplog):
+    """Five files the scan cannot read, and a contract consuming one product the scan found
+    and one it did not: one WARNING however many files, naming the product the rule cannot
+    check, not the other, and counting the files."""
+    _templates(tmp_path / "templates", 5)
+    _write_contract(tmp_path / "up" / "sdp.fluid.yaml", product_id="raw.events", product_type="SDP")
+
+    with caplog.at_level(logging.WARNING, logger="fluid.forge.product_types"):
+        _check(tmp_path, "raw.events", "gold.missing")
+
+    (warning,) = _records(caplog, level=logging.WARNING)
+    message = warning.getMessage()
+    assert "cannot check the consumed product 'gold.missing': no contract the" in message
+    assert "raw.events" not in message
+    assert "the scan could not read 5 contract files." in message
+    assert warning.product_ids == ["gold.missing"]  # type: ignore[attr-defined]
+    assert warning.unreadable_files == 5  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("count", "named"),
+    [
+        (2, "products 'gold.m0' and 'gold.m1': no contract the workspace scan read defines them"),
+        (
+            8,
+            "products 'gold.m0', 'gold.m1', 'gold.m2', 'gold.m3', 'gold.m4' and 3 more: no "
+            "contract the workspace scan read defines them",
+        ),
+    ],
+    ids=["two", "eight"],
+)
+def test_for_contract_names_five_products_it_cannot_check_and_counts_the_rest(
+    tmp_path, caplog, count, named
+):
+    """A contract may consume hundreds of products: the warning names five, so its size does
+    not grow with the contract's."""
+    _templates(tmp_path / "templates", 1)
+
+    with caplog.at_level(logging.WARNING, logger="fluid.forge.product_types"):
+        _check(tmp_path, *(f"gold.m{i}" for i in range(count)))
+
+    (warning,) = _records(caplog, level=logging.WARNING)
+    assert f"cannot check the consumed {named}, and the scan could not read 1 contract file." in (
+        warning.getMessage()
+    )
+
+
+def test_the_composition_warning_names_no_file_and_quotes_none_of_its_text(tmp_path, caplog):
+    """Security: the scan reads every ``*.fluid.yaml`` under its roots, which climb above the
+    consumer's project when no workspace marker stops them, and a service hands the log back
+    to its caller (``fluid_build.engine.validate`` returns it as ``stderr``). The WARNING
+    named each file the scan could not read and quoted its error, so one tenant's result held
+    another tenant's file name and a line of that file. It quotes the consumer's own product
+    id now, nothing of any other file."""
+    secret = tmp_path / "tenant-b" / "payroll-secret.fluid.yaml"
+    secret.parent.mkdir()
+    secret.write_text(
+        "id: b.x\nwarehouse: acme-payroll-prod.db.internal.corp: 5432\n", encoding="utf-8"
+    )
+
+    with caplog.at_level(logging.WARNING):
+        _check(tmp_path, "up.x")
+
+    (warning,) = _records(caplog, level=logging.WARNING)
+    assert "'up.x'" in warning.getMessage()
+    record = repr(vars(warning))
+    for leaked in ("tenant-b", "payroll-secret", "acme-payroll-prod", str(tmp_path)):
+        assert leaked not in record, leaked
+
+
+def test_each_file_the_scan_cannot_read_is_still_a_debug_line_naming_it_and_why(tmp_path, caplog):
+    """What the WARNING points at: each file the scan could not read is a DEBUG line
+    (``composition_index_skip``), naming the file and why, as it was before the skip was a
+    WARNING."""
+    template = tmp_path / "templates" / "new.fluid.yaml"
+    template.parent.mkdir()
+    template.write_text(_TEMPLATE, encoding="utf-8")
+    broken = _write_contract(
+        tmp_path / "up" / "cdp.fluid.yaml", product_id="gold.metrics", product_type="CDP"
+    )
+    broken.write_text(broken.read_text(encoding="utf-8") + "name: again\n", encoding="utf-8")
+
+    with caplog.at_level(logging.DEBUG, logger="fluid.forge.product_types"):
+        _check(tmp_path, "gold.metrics")
+
+    skips = {r.path: r for r in _records(caplog, _SKIP)}
+    assert sorted(skips) == sorted([str(template), str(broken)])
+    assert {r.levelno for r in skips.values()} == {logging.DEBUG}
+    assert f"{template} could not be read: " in skips[str(template)].getMessage()
+    assert "while constructing a mapping" in skips[str(template)].getMessage()
+    assert f"{broken} could not be read: " in skips[str(broken)].getMessage()
+    assert "duplicate key 'name'" in skips[str(broken)].getMessage()
+
+
+def test_the_debug_line_quotes_a_duplicate_key_in_a_fragment_with_its_file_and_line(
+    tmp_path, caplog
+):
+    """A key written twice in a fragment the upstream refs: the ref error names the ref and
+    the contract first, so the 200 characters it was cut to ended inside a path, before the
+    key and its line. The DEBUG line quotes the duplicate-key error under it, whole, and
+    names the contract whole: a path is bounded, and its end is the file's name."""
+    upstream = tmp_path / ("d" * 200)  # its paths alone run past 200 characters
+    upstream.mkdir()
+    (upstream / "contract.fluid.yaml").write_text(
+        "id: up.y\nmetadata: {$ref: ./m.yaml}\n", encoding="utf-8"
+    )
+    (upstream / "m.yaml").write_text("productType: SDP\nproductType: ADP\n", encoding="utf-8")
+
+    with caplog.at_level(logging.DEBUG, logger="fluid.forge.product_types"):
+        _check(tmp_path, "up.y")
+
+    (skip,) = _records(caplog, _SKIP)
+    assert skip.getMessage() == (
+        f"composition_index_skip: {upstream / 'contract.fluid.yaml'} could not be read: "
+        f"{(upstream / 'm.yaml').resolve()}:2: duplicate key 'productType' (first at line 1; "
+        "YAML 1.2 requires unique keys); remove one of them"
+    )
+
+
+def test_the_debug_line_rewrites_no_path_when_the_workspace_root_is_relative(
+    tmp_path, caplog, monkeypatch
+):
+    """Library use with ``workspace_root=Path(".")``: the scan names the file
+    ``up2/contract.fluid.yaml``, and shortening that inside the reason turned the absolute
+    path a ref error names, ``.../up2/contract.fluid.yaml``, into ``.../contract.fluid.yaml``,
+    a file that does not exist. The reason is quoted as written: here the ref error, as the
+    YAML error under it names no file, and it names the fragment and the line."""
+    (tmp_path / "up2").mkdir()
+    (tmp_path / "up2" / "contract.fluid.yaml").write_text(
+        "id: up.y\nmetadata: {$ref: ./m.yaml}\n", encoding="utf-8"
+    )
+    (tmp_path / "up2" / "m.yaml").write_text("a: [\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    contract = {"metadata": {"productType": "ADP"}, "consumes": [{"productId": "up.y"}]}
+
+    with caplog.at_level(logging.DEBUG, logger="fluid.forge.product_types"):
+        validate_composition_for_contract(contract, workspace_root=Path("."))
+
+    (skip,) = _records(caplog, _SKIP)
+    message = skip.getMessage()
+    contract_file = (tmp_path / "up2" / "contract.fluid.yaml").resolve()
+    assert message.startswith("composition_index_skip: up2/contract.fluid.yaml could not be read: ")
+    assert f" in {contract_file}: while parsing a flow node" in message
+    assert str(contract_file.parent.parent / "contract.fluid.yaml") not in message
+    assert 'in "m.yaml", line 2, column 1' in message
+
+
+#: Why the composition index quiets another product's ref warnings, as its DEBUG line says.
+_QUIETED = (
+    "A DEBUG line, not a WARNING: the composition rule read this contract only for its id "
+    "and productType."
+)
+
+
+@pytest.fixture
+def _fresh_ref_warnings(monkeypatch) -> Iterator[None]:
+    """No ambient ref root, and the ref warnings' warn-once registry, process-wide, empty."""
+    monkeypatch.delenv("FLUID_REF_ROOT", raising=False)
+    monkeypatch.setenv("FLUID_IGNORE_WORKSPACE_REF_ROOT", "1")
+    contract_refs._NOTED_REF_WARNINGS.clear()
+    yield
+    contract_refs._NOTED_REF_WARNINGS.clear()
+
+
+def _neighbours(workspace: Path) -> Tuple[Path, Path]:
+    """Tenant B keeps its metadata in a file whose suffix a ``$ref`` does not know, and
+    tenant C points into its file without the leading ``/``: composed, each logs a ref
+    warning. A consumer elsewhere in the workspace consumes neither."""
+    b = workspace / "tenant-b" / "contract.fluid.yaml"
+    b.parent.mkdir(parents=True)
+    b.write_text("id: b.x\nmetadata: {$ref: ./meta-secret.conf}\n", encoding="utf-8")
+    (b.parent / "meta-secret.conf").write_text("productType: SDP\n", encoding="utf-8")
+    c = workspace / "tenant-c" / "contract.fluid.yaml"
+    c.parent.mkdir(parents=True)
+    c.write_text("id: c.x\nmetadata: {$ref: './m-secret.yaml#meta'}\n", encoding="utf-8")
+    (c.parent / "m-secret.yaml").write_text("meta: {productType: SDP}\n", encoding="utf-8")
+    return b, c
+
+
+class _StderrAtWarning(logging.Handler):
+    """Python's last resort where the host configured no handler (uvicorn's default): each
+    WARNING written to ``sys.stderr`` as it is when the record is made, which
+    ``fluid_build.engine`` redirects into the result's ``stderr``."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        sys.stderr.write(self.format(record) + "\n")
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_fresh_ref_warnings")
+async def test_validating_a_contract_says_nothing_of_another_products_refs(tmp_path):
+    """Security: the composition index composes every workspace contract whose id or
+    productType is a ``$ref``, other tenants' too, and their ref warnings were WARNINGs:
+    ``engine.validate`` of tenant A, which consumes neither, handed A tenant B's file name
+    (``ref_target_suffix_unknown``) and tenant C's ref and path
+    (``ref_pointer_without_slash``) in its ``stderr``."""
+    (tmp_path / ".git").mkdir()
+    _neighbours(tmp_path)
+    consumer = _write_contract(
+        tmp_path / "tenant-a" / "contract.fluid.yaml",
+        product_id="a.x",
+        product_type="ADP",
+        consumes=[{"productId": "up.x", "exposeId": "out"}],
+    )
+    host = _StderrAtWarning()
+    logging.getLogger().addHandler(host)
+    try:
+        result = await engine.validate(str(consumer))
+    finally:
+        logging.getLogger().removeHandler(host)
+
+    shown = result.stdout + result.stderr
+    assert "composition_upstream_unchecked" not in shown, "the index read every file"
+    for leaked in ("tenant-b", "tenant-c", "secret", "ref_target_suffix", "ref_pointer"):
+        assert leaked not in shown, leaked
+
+
+@pytest.mark.usefixtures("_fresh_ref_warnings")
+def test_a_contract_the_index_read_still_warns_once_when_composed_itself(tmp_path, caplog):
+    """The warn-once registry is the contract author's: the index recorded B's and C's
+    warnings when it read them for A, so composing B or C afterwards said nothing. The
+    index leaves the registry alone; each still warns, once."""
+    b, c = _neighbours(tmp_path)
+    _check(tmp_path, "up.x")
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        for path in (b, c, b, c):
+            loader.load_contract(path)
+
+    said = sorted(
+        (r.event, r.levelno)  # type: ignore[attr-defined]
+        for r in caplog.records
+        if getattr(r, "event", "").startswith("ref_")
+    )
+    assert said == [
+        ("ref_pointer_without_slash", logging.WARNING),
+        ("ref_target_suffix_unknown", logging.WARNING),
+    ]
+
+
+@pytest.mark.usefixtures("_fresh_ref_warnings")
+def test_the_ref_warnings_of_a_contract_the_index_reads_are_debug_lines(tmp_path, caplog):
+    """What the index read and quieted is still in the DEBUG log, its paths spelled whole,
+    saying why it is not a WARNING."""
+    b, c = _neighbours(tmp_path)
+
+    with caplog.at_level(logging.DEBUG, logger="fluid.loader"):
+        _check(tmp_path, "up.x")
+
+    quieted = {r.event: r for r in _records(caplog) if hasattr(r, "quieted")}  # type: ignore[attr-defined]
+    assert sorted(quieted) == ["ref_pointer_without_slash", "ref_target_suffix_unknown"]
+    assert {r.levelno for r in quieted.values()} == {logging.DEBUG}
+    suffix = quieted["ref_target_suffix_unknown"].getMessage()
+    assert suffix.startswith(
+        f"ref_target_suffix_unknown: $ref target {(b.parent / 'meta-secret.conf').resolve()} "
+        "has the suffix '.conf', which a $ref does not know"
+    )
+    pointer = quieted["ref_pointer_without_slash"].getMessage()
+    assert pointer.startswith(
+        f"ref_pointer_without_slash: $ref './m-secret.yaml#meta' at JSON pointer '/metadata' "
+        f"in {c.resolve()} has a JSON pointer without a leading '/'"
+    )
+    assert suffix.endswith(_QUIETED) and pointer.endswith(_QUIETED)
 
 
 def test_for_contract_sdp_rejects_any_upstream(tmp_path):

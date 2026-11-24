@@ -1951,6 +1951,7 @@ def resolve_apply_engine(
     is chosen from it rather than from a second read of ``args.contract``.
     """
     from fluid_build.iac.cutover import resolve_engine
+    from fluid_build.util.env_templates import EnvTemplateError
 
     try:
         contract = _load_contract(args, logger, contract)
@@ -1965,6 +1966,11 @@ def resolve_apply_engine(
         if getattr(exc, "event", None) == "generate_iac_provider_mismatch":
             raise
         return "native"
+    except EnvTemplateError:
+        # An unset or empty ``{{ env.* }}`` is not a classification failure. Routing it to
+        # the native engine would apply the contract with the placeholder unrendered, or
+        # with a fallback name, and exit 0: the outcome the strict render exists to stop.
+        raise
     except Exception:  # noqa: BLE001 — cannot classify the contract → safe default
         return "native"
     return resolve_engine(None, provider)

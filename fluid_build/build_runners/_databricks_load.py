@@ -70,7 +70,7 @@ from ..iac.providers.databricks_enforce import (
     scrub,
 )
 from ..providers._sql_safety import validate_ident
-from ..util.binding_paths import ENV_PLACEHOLDER_RE
+from ..util.env_templates import render_text
 
 #: The Unity Catalog volume the run's file is staged in: ``/Volumes/<catalog>/<schema>/<volume>``.
 STAGING_VOLUME_ENV = "DATABRICKS_STAGING_VOLUME"
@@ -148,10 +148,11 @@ def run_prefix(volume: StagingVolume, product_id: Any, build_id: Any, run_id: An
 
 
 def _resolved(value: Any) -> Any:
-    """``{{ env.NAME }}`` in a name, resolved as the runner resolves a bucket; unset ones stay."""
-    if not isinstance(value, str) or "{{" not in value:
+    """``{{ env.NAME }}`` in a name, resolved as the runner resolves a bucket; unset ones stay
+    (the emitter's identifier check then refuses them, naming the field)."""
+    if not isinstance(value, str):
         return value
-    return ENV_PLACEHOLDER_RE.sub(lambda m: os.environ.get(m.group(1), m.group(0)), value)
+    return render_text(value, strip=False)
 
 
 def databricks_load_target(

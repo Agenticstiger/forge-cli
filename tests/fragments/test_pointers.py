@@ -21,6 +21,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import subprocess
+import sys
 import time
 import tracemalloc
 from pathlib import Path
@@ -44,6 +47,7 @@ def _fresh_loader_state(monkeypatch: pytest.MonkeyPatch):
             value = getattr(loader, name)
             if name.startswith("_NOTED_") and isinstance(value, set):
                 value.clear()
+        contract_refs._NOTED_REF_WARNINGS.clear()  # the resolver's registry: not a loader attribute
 
     clear()
     monkeypatch.delenv("FLUID_REF_ROOT", raising=False)
@@ -376,14 +380,176 @@ def test_c12_bare_fragment_without_a_slash_is_not_a_json_pointer(tmp_path: Path)
     )
 
 
-def test_c12_file_ref_with_a_bare_fragment_stays_lenient_for_released_contracts(
-    tmp_path: Path,
+def test_c12_file_ref_with_a_bare_fragment_still_resolves_with_a_deprecation_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Characterisation, deliberate: ``file.yaml#foo`` reads key ``foo`` (not reported)."""
+    """N-24, decided: ``file.yaml#foo`` still reads key ``foo``, for the contracts written
+    that way, and logs a deprecation WARNING that names the ref and the fix: RFC 6901 says
+    a pointer is "" or starts with "/", and a later minor release refuses it."""
     _write(tmp_path / "x.yaml", "foo: 5\nbar: {baz: 6}\n")
 
-    assert _lc(tmp_path, 'a: {$ref: "./x.yaml#foo"}\n')["a"] == 5
-    assert _lc(tmp_path, 'a: {$ref: "./x.yaml#bar/baz"}\n')["a"] == 6
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        assert _lc(tmp_path, 'a: {$ref: "./x.yaml#foo"}\n')["a"] == 5
+        assert _lc(tmp_path, 'a: {$ref: "./x.yaml#bar/baz"}\n')["a"] == 6
+        assert _lc(tmp_path, 'a: {$ref: "./x.yaml#/bar/baz"}\n')["a"] == 6
+
+    warnings = [r for r in caplog.records if getattr(r, "event", None) == _NO_SLASH]
+    assert [(r.ref, r.fix) for r in warnings] == [  # type: ignore[attr-defined]
+        ("./x.yaml#foo", "./x.yaml#/foo"),
+        ("./x.yaml#bar/baz", "./x.yaml#/bar/baz"),
+    ]
+    first = warnings[0].getMessage()
+    assert warnings[0].levelno == logging.WARNING
+    assert "$ref './x.yaml#foo' at JSON pointer '/a' in " in first
+    assert "deprecated: a later minor release will refuse it. Write './x.yaml#/foo'" in first
+    assert "RFC 6901" in first
+
+
+def test_c12_the_deprecation_is_logged_once_per_ref_and_never_for_a_same_document_pointer(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write(tmp_path / "x.yaml", "foo: 5\n")
+    path = _contract(tmp_path, 'a: {$ref: "./x.yaml#foo"}\nb: {$ref: "#/a"}\n')
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        assert load_contract(path) == {"a": 5, "b": 5}
+        assert load_contract(path) == {"a": 5, "b": 5}
+
+    assert len([r for r in caplog.records if getattr(r, "event", None) == _NO_SLASH]) == 1
+
+
+_NO_SLASH = "ref_pointer_without_slash"
+
+
+def test_c12_one_ref_written_in_many_places_is_one_bounded_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Security: the warning is keyed on the ref as written, never on the place, and quotes
+    an excerpt of each value. Keyed on its text, which named the JSON pointer of the place,
+    a contract whose one long key held refs logged one warning per ref, each carrying the
+    key: the review's 448 KB contract wrote 800 MB of log and kept it in the registry."""
+    _write(tmp_path / "t.yaml", "a: 1\n")
+    key = "k" * 50_000
+    doc = {"id": "x", key: [{"$ref": "./t.yaml#a"}] * 100, "again": {"$ref": "./t.yaml#a"}}
+    path = _write(tmp_path / "contract.fluid.json", json.dumps(doc))
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        assert load_contract(path)[key] == [1] * 100
+
+    warnings = [r.getMessage() for r in caplog.records if getattr(r, "event", None) == _NO_SLASH]
+    assert len(warnings) == 1, f"{len(warnings)} warnings for one ref"
+    assert len(warnings[0]) < 1_500, f"a {len(warnings[0]):,}-character warning"
+    # The first place it was met, ``/<key>/0``, cut after 200 characters.
+    assert f"$ref './t.yaml#a' at JSON pointer '/{'k' * 199}... (49,803 more characters)' in " in (
+        warnings[0]
+    )
+    # Once per ref while the registry holds it, which it empties at its cap: never "in this
+    # process".
+    assert warnings[0].endswith("Logged once per ref, however many places write it.")
+    assert len(contract_refs._NOTED_REF_WARNINGS) == 1
+
+
+def test_c12_the_deprecation_registry_is_keyed_on_the_ref_and_stays_bounded(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A long-lived process (the MCP server, a service on ``fluid_build.api``) composes each
+    upload from a fresh temporary directory: the same ref there is the same warning, logged
+    once. And no input grows the registry past its cap: once full, it starts again."""
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        for upload in range(25):
+            root = tmp_path / f"upload-{upload}"
+            _write(root / "t.yaml", "a: 1\n")
+            assert _lc(root, 'x: {$ref: "./t.yaml#a"}\n') == {"x": 1}
+
+    assert len([r for r in caplog.records if getattr(r, "event", None) == _NO_SLASH]) == 1
+    assert len(contract_refs._NOTED_REF_WARNINGS) == 1
+
+    cap = contract_refs._MAX_NOTED_REF_WARNINGS
+    _write(tmp_path / "keys.yaml", "".join(f"k{i}: {i}\n" for i in range(cap + 50)))
+    doc = {f"x{i}": {"$ref": f"./keys.yaml#k{i}"} for i in range(cap + 50)}
+    path = _write(tmp_path / "many.fluid.json", json.dumps(doc))
+
+    assert load_contract(path)[f"x{cap + 49}"] == cap + 49
+    assert len(contract_refs._NOTED_REF_WARNINGS) <= cap
+
+
+#: A pointer that, logged as written, starts a forged log line, clears the terminal's line
+#: and retitles its window.
+_FORGED = "a\n2026-10-29 INFO fluid: validation passed\x1b[2K\x1b]0;owned\x07"
+_FORGED_SPELLED = "a\\n2026-10-29 INFO fluid: validation passed\\x1b[2K\\x1b]0;owned\\x07"
+
+
+def test_c12_the_deprecation_spells_the_control_characters_of_the_ref_and_its_place(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Security: the ref and the JSON pointer of its place are contract text. Logged as
+    written, a line feed in either began a line that read as the CLI's own, and an escape
+    sequence reached the terminal. Each control character is spelled as ``repr`` writes it."""
+    _write(tmp_path / "t.json", json.dumps({_FORGED: 1}))
+    site = "k\x1b]0;x\x07\u202e"
+    path = _write(
+        tmp_path / "contract.fluid.json", json.dumps({site: {"$ref": f"./t.json#{_FORGED}"}})
+    )
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        assert load_contract(path)[site] == 1
+
+    (warning,) = [r for r in caplog.records if getattr(r, "event", None) == _NO_SLASH]
+    message = warning.getMessage()
+    assert message.isprintable(), message
+    assert f"$ref './t.json#{_FORGED_SPELLED}' at JSON pointer '/k\\x1b]0;x\\x07\\u202e' in " in (
+        message
+    )
+    assert f"Write './t.json#/{_FORGED_SPELLED}'" in message
+    assert warning.ref == f"./t.json#{_FORGED}", "the structured field keeps the value"  # type: ignore[attr-defined]
+
+
+def test_c12_the_deprecation_names_the_whole_path_of_the_file_holding_the_ref(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A path is bounded by the file system, and its end is the file's name: quoted as an
+    excerpt, its first 200 characters, the path of a contract deep enough lost the name of
+    the file to fix."""
+    root = tmp_path / ("d" * 200)
+    _write(root / "t.yaml", "a: 1\n")
+    path = _write(root / "contract.fluid.yaml", 'x: {$ref: "./t.yaml#a"}\n')
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        assert load_contract(path) == {"x": 1}
+
+    (warning,) = [r for r in caplog.records if getattr(r, "event", None) == _NO_SLASH]
+    assert f"$ref './t.yaml#a' at JSON pointer '/x' in {path.resolve()} has a JSON pointer" in (
+        warning.getMessage()
+    )
+
+
+def test_c12_a_ref_forges_no_line_in_the_cli_log_file(tmp_path: Path) -> None:
+    """End to end: ``fluid --log-file`` writes each record as ``{"time": ..., "message":
+    "%(message)s"}`` and escapes nothing, so a ref's raw line feed wrote a line of its own
+    that read as one of the CLI's, and its escape sequences reached the terminal."""
+    _write(tmp_path / "t.json", json.dumps({_FORGED: 1}))
+    _write(tmp_path / "contract.fluid.json", json.dumps({"x": {"$ref": f"./t.json#{_FORGED}"}}))
+    env = {key: value for key, value in os.environ.items() if not key.endswith("_API_KEY")}
+    env["PYTHONPATH"] = str(Path(loader.__file__).resolve().parents[1])
+    env["FLUID_IGNORE_WORKSPACE_REF_ROOT"] = "1"
+    env.pop("FLUID_REF_ROOT", None)
+
+    run = subprocess.run(
+        [sys.executable, "-m", "fluid_build.cli", "--log-file", "fluid.log"]
+        + ["bundle", "contract.fluid.json", "--out", "b.yaml"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+    assert run.returncode == 0, run.stderr
+    logged = (tmp_path / "fluid.log").read_text(encoding="utf-8")
+    assert _NO_SLASH in logged and _FORGED_SPELLED in logged
+    assert [line for line in logged.splitlines() if line.startswith("2026-10-29 INFO")] == []
+    assert "\x1b" not in logged and "\x07" not in logged
+    assert "\x1b" not in run.stderr and "\x07" not in run.stderr
 
 
 def test_c13_trailing_and_lone_slash_pointers_sg01(tmp_path: Path) -> None:

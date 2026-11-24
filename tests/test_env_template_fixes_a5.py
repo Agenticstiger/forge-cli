@@ -55,10 +55,8 @@ class TestDltDatasetNameEnvTemplateResolution:
 
         os.environ.pop("NONEXISTENT_DLT_SCHEMA", None)
 
-        from fluid_build.providers.snowflake.util.config import (
-            ENV_TEMPLATE_RE,
-            resolve_env_templates,
-        )
+        from fluid_build.providers.snowflake.util.config import resolve_env_templates
+        from fluid_build.util.env_templates import ENV_TEMPLATE_RE
 
         raw = "{{ env.NONEXISTENT_DLT_SCHEMA }}"
         resolved = resolve_env_templates(raw)
@@ -71,10 +69,8 @@ class TestDltDatasetNameEnvTemplateResolution:
 
     def test_plain_dataset_name_passes_re_check(self) -> None:
         """A plain (non-template) dataset_name passes the ENV_TEMPLATE_RE guard."""
-        from fluid_build.providers.snowflake.util.config import (
-            ENV_TEMPLATE_RE,
-            resolve_env_templates,
-        )
+        from fluid_build.providers.snowflake.util.config import resolve_env_templates
+        from fluid_build.util.env_templates import ENV_TEMPLATE_RE
 
         raw = "fluid_acquire"
         resolved = resolve_env_templates(raw)
@@ -92,10 +88,8 @@ class TestDltDatasetNameEnvTemplateResolution:
         os.environ.pop("MISSING_DLT_SCHEMA", None)
 
         # Directly invoke resolve + check as the runner does.
-        from fluid_build.providers.snowflake.util.config import (
-            ENV_TEMPLATE_RE,
-            resolve_env_templates,
-        )
+        from fluid_build.providers.snowflake.util.config import resolve_env_templates
+        from fluid_build.util.env_templates import ENV_TEMPLATE_RE
 
         raw = "{{ env.MISSING_DLT_SCHEMA }}"
         resolved = resolve_env_templates(raw)

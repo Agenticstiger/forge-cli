@@ -56,6 +56,7 @@ from fluid_build.build_runners.python.runner import (
     resolve_script_path,
 )
 from fluid_build.cli._common import CLIError
+from fluid_build.util.env_templates import EnvTemplateError
 
 # ── resolve_script_path ───────────────────────────────────────────────
 
@@ -316,9 +317,11 @@ class TestResolveEnvPlaceholders:
         monkeypatch.setenv("DB_NAME", "TELCO")
         assert _resolve_env_placeholders("db={{ env.DB_NAME }}") == "db=TELCO"
 
-    def test_missing_env_resolves_to_empty_string(self, monkeypatch):
+    def test_missing_env_is_refused_naming_the_variable(self, monkeypatch):
         monkeypatch.delenv("MISSING_VAR", raising=False)
-        assert _resolve_env_placeholders("x={{ env.MISSING_VAR }}") == "x="
+        with pytest.raises(EnvTemplateError) as caught:
+            _resolve_env_placeholders("x={{ env.MISSING_VAR }}")
+        assert caught.value.extras["missing"] == ["MISSING_VAR"]
 
     def test_recurses_into_nested_dicts_and_lists(self, monkeypatch):
         monkeypatch.setenv("A", "alpha")

@@ -33,6 +33,7 @@ import yaml
 from fluid_build.cli import generate_iac, main
 from fluid_build.cli._common import CLIError
 from fluid_build.providers.aws.util.config import AwsAccountUnresolvedError
+from fluid_build.util.env_templates import placeholder_names
 
 pytestmark = [pytest.mark.unit, pytest.mark.provider]
 
@@ -59,6 +60,14 @@ def no_aws(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", os.devnull)
     monkeypatch.setenv("AWS_CONFIG_FILE", os.devnull)
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+
+@pytest.fixture
+def example_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Export the variables the bundled AWS examples name: the command refuses an unset one."""
+    for contract in AWS_EXAMPLES:
+        for name in placeholder_names(yaml.safe_load(contract.read_text(encoding="utf-8"))):
+            monkeypatch.setenv(name, ACCOUNT if "ACCOUNT_ID" in name else "example-value")
 
 
 @pytest.fixture
@@ -115,7 +124,7 @@ def _lake_formation() -> Dict[str, Any]:
     """Lake Formation grants to another account, on the ``{account}-fluid-data`` fallback."""
     contract = _orders()
     binding = contract["exposes"][0]["binding"]
-    binding["location"]["bucket"] = "{{ env.FLUID_TEST_OFFLINE_BUCKET }}"
+    del binding["location"]["bucket"]
     binding["governance"] = {
         "lakeFormation": {
             "registerLocation": True,
@@ -146,7 +155,9 @@ class TestGenerateIacCallsNoCloudApi:
 
     @pytest.mark.parametrize("flags", [[], ["--shadow"]], ids=["plain", "shadow"])
     @pytest.mark.parametrize("contract", AWS_EXAMPLES, ids=lambda p: f"{p.parent.name}/{p.name}")
-    def test_an_example_constructs_no_boto3_client(self, contract, flags, tmp_path, clients):
+    def test_an_example_constructs_no_boto3_client(
+        self, contract, flags, tmp_path, clients, example_env
+    ):
         rc = main(["generate", "iac", str(contract), "--out", str(tmp_path), *flags])
         assert rc == 0
         assert clients == []
@@ -156,7 +167,6 @@ class TestGenerateIacCallsNoCloudApi:
     def test_lake_formation_on_the_fallback_bucket_constructs_no_client(
         self, tmp_path, clients, monkeypatch
     ):
-        monkeypatch.delenv("FLUID_TEST_OFFLINE_BUCKET", raising=False)
         out = tmp_path / "out"
         rc = main(["generate", "iac", str(_write(tmp_path, _lake_formation())), "--out", str(out)])
         assert rc == 0

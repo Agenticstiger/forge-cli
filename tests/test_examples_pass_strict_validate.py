@@ -22,6 +22,7 @@ import yaml
 
 import fluid_build
 from fluid_build.cli import build_parser, main
+from fluid_build.util.env_templates import placeholder_names
 
 PACKAGE = Path(fluid_build.__file__).resolve().parent
 EXAMPLES_DIR = PACKAGE.parent / "examples"
@@ -69,6 +70,10 @@ LEGACY = [p for p in ALL_EXAMPLES if _rel(p) in INVALID_AT_ANY_LEVEL]
 
 def _validate(contract: Path, monkeypatch: pytest.MonkeyPatch, *, strict: bool = True) -> int:
     monkeypatch.chdir(contract.parent)
+    # ``--strict`` fails a contract that names a variable nobody set, so an example is
+    # validated the way its user runs it: with the variables it names exported.
+    for name in placeholder_names(yaml.safe_load(contract.read_text(encoding="utf-8"))):
+        monkeypatch.setenv(name, "123456789012" if "ACCOUNT_ID" in name else "example-value")
     argv = ["validate", contract.name, *(["--strict"] if strict else [])]
     args = build_parser().parse_args(argv)
     return args.func(args, logging.getLogger("test_strict_scaffolds"))
