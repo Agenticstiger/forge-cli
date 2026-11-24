@@ -487,7 +487,8 @@ class LocalProvider(BaseProvider):
 
             if not is_valid:
                 self._log_error("local_plan_validation_failed", {"errors": errors})
-                # Still return actions - let apply() handle the errors
+                # plan() only reports (``fluid plan`` and ``fluid diff`` read it too);
+                # apply() refuses such a plan before it writes anything.
 
             self._log_info(
                 "local_plan_complete",
@@ -539,9 +540,13 @@ class LocalProvider(BaseProvider):
                         plan
                     )  # treat plan itself as contract
             else:
-                norm_actions = [self._demo_action()]
+                raise TypeError(
+                    "LocalProvider.apply: plan must be a dict with actions or a contract"
+                )
         else:
-            norm_actions = [self._demo_action()]
+            raise ValueError(
+                "LocalProvider.apply needs actions, or a plan with actions or a contract"
+            )
 
         if not isinstance(norm_actions, list):
             raise TypeError("LocalProvider.apply requires a list of action dicts (plan/actions)")
@@ -563,12 +568,39 @@ class LocalProvider(BaseProvider):
                 # Preserve original infra ops as explicit NOOPs for auditability
                 norm_actions = [self._infra_as_noop(a) for a in norm_actions] + derived
             else:
-                self._log_info(
-                    "local_fallback_demo", {"reason": "only_unsupported_ops_no_contract"}
-                )
-                norm_actions = [self._infra_as_noop(a) for a in norm_actions] + [
-                    self._demo_action()
-                ]
+                # No contract to derive SQL from: report each action as skipped. A demo
+                # artifact used to be written here, and counted as the run's output.
+                self._log_info("local_all_actions_skipped", {"reason": "no_supported_op"})
+                norm_actions = [self._infra_as_noop(a) for a in norm_actions]
+
+        # ---- Refuse a plan that cannot be backed with data, before writing anything ----
+        # A planner-shaped action (it carries a ``payload``) that validate_plan rejects, an
+        # expose with no source table for one, used to get a placeholder file and a green
+        # "deployed successfully": the plan was logged as invalid and applied anyway.
+        from .planner import LocalPlanError, validate_plan
+
+        planned = [
+            a for a in norm_actions if isinstance(a, dict) and isinstance(a.get("payload"), dict)
+        ]
+        valid, problems = validate_plan(planned, self.logger, report=False)
+        if not valid:
+            from fluid_build._errors import doc_url
+
+            product = (plan or {}).get("contract", {}).get("id") if isinstance(plan, dict) else None
+            raise LocalPlanError(
+                code="local_plan_invalid",
+                what=(
+                    f"the local plan for {product or 'this contract'!r} has {len(problems)} "
+                    "problem(s); nothing was written"
+                ),
+                why="; ".join(problems),
+                fix=(
+                    "Give each expose a build that names it in builds[].outputs and "
+                    "carries properties.sql, or declare the expose's source_table."
+                ),
+                doc=doc_url(),
+                extras={"errors": list(problems)},
+            )
 
         # ---- Execute ----
         self._declare_run_io(a for a in norm_actions if isinstance(a, dict))
@@ -755,26 +787,34 @@ class LocalProvider(BaseProvider):
         if not exposes:
             output_paths = [{"path": "runtime/out/output.csv", "format": "csv"}]
 
-        # Fallback SQL if none found
+        # No SQL: a build that declares inputs and no SQL passes the first one through;
+        # otherwise there is nothing to write. It used to write ``SELECT 1 AS demo_col``
+        # (or skip, when the declared output already existed) and report success.
         if not sql_text:
             if inputs_spec:
                 tbl = validate_ident(inputs_spec[0].get("table") or "t")
                 sql_text = f"SELECT * FROM {tbl}"
             else:
-                existing = self._existing_outputs(output_paths)
-                if existing:
-                    # No SQL and no inputs: the only thing left to write is a
-                    # one-row ``demo_col`` placeholder, and the declared output
-                    # already holds data (an acquisition build lands it). Now
-                    # that a relative path resolves at the contract's directory,
-                    # that is the file the build wrote; never replace it with a
-                    # placeholder.
-                    self._log_warn(
-                        "local_placeholder_refused",
-                        {"outputs": existing, "reason": "declared output exists; no SQL"},
-                    )
-                    return [{"op": "noop", "skipped": True, "reason": "placeholder_refused"}]
-                sql_text = "SELECT 1 AS demo_col"
+                from fluid_build._errors import doc_url
+
+                from .planner import LocalPlanError
+
+                build_id = (build or {}).get("id") or "?"
+                raise LocalPlanError(
+                    code="build_has_no_sql",
+                    what=f"build {build_id!r} has no SQL for the local engine to run",
+                    why=(
+                        "The local engine runs properties.sql (or a model file); a multi-stage "
+                        "build without it has nothing to write, and a placeholder file would "
+                        "stand in for the rows."
+                    ),
+                    fix=(
+                        f"Give builds[id={build_id}] a properties.sql, one build per expose, "
+                        "or run the build with the engine that owns it."
+                    ),
+                    doc=doc_url(),
+                    extras={"buildId": str(build_id)},
+                )
 
         return [{"op": "sql", "sql": sql_text, "inputs": inputs_spec, "outputs": output_paths}]
 
@@ -822,19 +862,6 @@ class LocalProvider(BaseProvider):
         stem = (contract.get("id") or "product").replace(".", "_")
         ext = ".parquet" if declared_fmt == "parquet" else ".csv"
         return {"path": f"runtime/out/{stem}{ext}", "format": declared_fmt}
-
-    @staticmethod
-    def _existing_outputs(output_paths: List[Any]) -> List[str]:
-        """The output paths in ``output_paths`` that already exist on disk."""
-        found: List[str] = []
-        for spec in output_paths:
-            raw = spec.get("path") if isinstance(spec, dict) else spec
-            if raw and Path(str(raw)).exists():
-                found.append(str(raw))
-        return found
-
-    def _demo_action(self) -> Dict[str, Any]:
-        return {"op": "copy", "out": "runtime/out/demo_artifact.csv"}
 
     def _infra_as_noop(self, action: Dict[str, Any]) -> Dict[str, Any]:
         """Turn infra-only action (e.g., ensure_dataset) into a harmless NOOP report entry."""
@@ -1029,17 +1056,13 @@ class LocalProvider(BaseProvider):
 
         # If an output_table is specified, persist the result as a DuckDB table
         # so downstream materialize/copy steps can reference it.
+        # A failure is an error: it was a warning, and the expose that reads this
+        # table was then written as a placeholder.
         output_table = action.get("output_table") or action.get("table_name")
         if output_table and rel is not None:
-            try:
-                con.execute(
-                    f"CREATE OR REPLACE TABLE {validate_ident(output_table)} AS SELECT * FROM ({sql})"
-                )
-            except Exception as e:
-                self._log_warn(
-                    "local_sql_create_table_warn",
-                    {"table": output_table, "error": redact_secret_text(str(e))},
-                )
+            con.execute(
+                f"CREATE OR REPLACE TABLE {validate_ident(output_table)} AS SELECT * FROM ({sql})"
+            )
 
         written: List[str] = []
         if outputs:
@@ -1222,56 +1245,57 @@ class LocalProvider(BaseProvider):
         dst = Path(str(dst))
         _mkdir(dst.parent)
 
-        # If we have a source_table, try to materialize from DuckDB
         source_table = action.get("source_table")
         fmt = (action.get("format") or _ext(dst) or "csv").lower()
         if source_table:
+            # A failure here is an error. It used to be logged as
+            # ``local_materialize_fallback`` and answered with a placeholder file.
+            con = self._connect(outputs=[dst])
             try:
-                con = self._connect(outputs=[dst])
-                try:
-                    rel = con.sql(f"SELECT * FROM {validate_ident(source_table)}")
-                    self._write_relation(rel, dst, fmt)
-                    rowcount = one_row(rel.count("*"))[0] if hasattr(rel, "count") else -1
-                    del rel
-                finally:
-                    # Closed on every path (see _run_load_data_action).
-                    con.close()
-                self._log_info(
-                    "local_materialize_done",
-                    {"i": idx, "dst": str(dst), "source": source_table, "rows": rowcount},
-                )
-                return {
-                    "op": "materialize",
-                    "dst": str(dst),
-                    "source_table": source_table,
-                    "format": fmt,
-                }
-            except Exception as e:
-                self._log_warn(
-                    "local_materialize_fallback",
-                    {"i": idx, "source_table": source_table, "error": redact_secret_text(str(e))},
-                )
+                rel = con.sql(f"SELECT * FROM {validate_ident(source_table)}")
+                self._write_relation(rel, dst, fmt)
+                rowcount = one_row(rel.count("*"))[0] if hasattr(rel, "count") else -1
+                del rel
+            finally:
+                # Closed on every path (see _run_load_data_action).
+                con.close()
+            self._log_info(
+                "local_materialize_done",
+                {"i": idx, "dst": str(dst), "source": source_table, "rows": rowcount},
+            )
+            return {
+                "op": "materialize",
+                "dst": str(dst),
+                "source_table": source_table,
+                "format": fmt,
+                "written": [str(dst)],
+            }
 
-        if src and not source_table:
+        if src:
             src = Path(str(src))
             if not src.exists():
                 raise FileNotFoundError(f"copy src not found: {src}")
-            data = src.read_bytes()
-            dst.write_bytes(data)
-        elif dst.exists():
-            # Nothing to copy or materialize from, and the destination
-            # already holds data (a build wrote it): writing the
-            # ``id,value`` placeholder would destroy it. Report and skip.
-            self._log_warn(
-                "local_placeholder_refused",
-                {"i": idx, "dst": str(dst), "reason": "destination exists; no source"},
-            )
-            return {"op": "noop", "dst": str(dst), "skipped": True}
-        else:
-            dst.write_text("id,value\n1,materialized\n", encoding="utf-8")
+            dst.write_bytes(src.read_bytes())
+            self._log_info("local_copy_done", {"i": idx, "dst": str(dst)})
+            return {"op": "copy", "dst": str(dst)}
 
-        self._log_info("local_copy_done", {"i": idx, "dst": str(dst)})
-        return {"op": "copy", "dst": str(dst)}
+        landed_by = action.get("landed_by")
+        if landed_by:
+            # A build runner lands this expose (``--mode amend-and-build``): there is
+            # nothing for this action to write, and it says so.
+            self._log_info("local_materialize_landed_by_build", {"i": idx, "dst": str(dst)})
+            return {
+                "op": "noop",
+                "dst": str(dst),
+                "skipped": True,
+                "reason": "landed_by_build",
+                "landed_by": list(landed_by),
+            }
+
+        raise ValueError(
+            f"materialize {dst}: no source table and no build lands it, so there is nothing to "
+            "write (a placeholder file is never written)"
+        )
 
     # -------------------------- Output writing -------------------------- #
 

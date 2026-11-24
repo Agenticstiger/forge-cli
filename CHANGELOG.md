@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The local engine never writes a placeholder file.** `fluid init qs --quickstart --yes`
+  then `fluid apply contract.fluid.yaml --yes` logged "Plan validation failed with 2 errors",
+  then "Data product deployed successfully" with exit 0, and left 24-byte parquet files holding
+  `id,value / 1,materialized`. **Behaviour change:** `LocalProvider.apply` now refuses a plan that
+  `validate_plan` rejects before it writes anything (`local_plan_invalid`, exit 1, naming each
+  problem), a build with no SQL is refused (`build_has_no_sql`) instead of writing
+  `SELECT 1 AS demo_col`, a result table that cannot be created fails the action instead of
+  logging `local_sql_create_table_warn`, a materialize that fails is an error instead of
+  `local_materialize_fallback`, and `apply()` with nothing to run raises instead of writing
+  `runtime/out/demo_artifact.csv`. A materialize that a build runner lands
+  (`payload.landed_by`) is reported as skipped. A build id with a hyphen
+  (`hello-transformation`) no longer lands the placeholder: its result table is `result_<id>`
+  with every character outside `[A-Za-z0-9_]` mapped to `_`. A materialize result now lists the
+  file it wrote under `written`.
+- **The `customer-360` quickstart template runs on the local engine.** Its single multi-stage
+  build had no `properties.sql`, which the local engine runs, so it landed the placeholder. It now
+  has two `embedded-logic` builds, `customer_360_pipeline` (`outputs: [customer_360_master]`) and
+  `high_value_customers_build` (`outputs: [high_value_customers]`), each with self-contained SQL
+  (the former stages as CTEs). `high_value_customers` is empty with the sample data, whose order
+  dates are old for the `CURRENT_DATE`-based recency.
 - **The federation digest check runs on every apply engine.** `validate_federated_consumes` (the
   warn-only gate that reports a drifted `upstreamDigest` pin) was called only below the OpenTofu
   branch and the build modes' early returns, so `fluid apply` on aws / gcp / snowflake and

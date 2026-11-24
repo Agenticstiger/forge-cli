@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
@@ -33,7 +34,7 @@ try:
 except ImportError:
     _HAS_SDK_CONTRACT = False
 
-from fluid_build._errors import doc_url
+from fluid_build._errors import FluidUserError, doc_url
 from fluid_build.util.contract import (
     BuildOutputsError,
     build_output_exposes,
@@ -47,6 +48,19 @@ from fluid_build.util.contract import (
     is_externally_run_build,
     is_spark_job_build,
 )
+
+
+@dataclass
+class LocalPlanError(FluidUserError):
+    """The local engine will not run a plan it cannot back with data.
+
+    ``code`` is the named event: ``local_plan_invalid`` (``validate_plan`` found
+    problems) or ``build_has_no_sql`` (a build the local engine must run has no
+    SQL). Both used to end in a placeholder file (``id,value / 1,materialized``,
+    ``SELECT 1 AS demo_col``) and "Data product deployed successfully".
+    """
+
+    code: str = "local_plan_invalid"
 
 
 def _result_table(build_id: Any) -> str:
@@ -748,7 +762,9 @@ def _topological_sort(
     return sorted_actions
 
 
-def validate_plan(actions: List[Dict[str, Any]], logger=None) -> Tuple[bool, List[str]]:
+def validate_plan(
+    actions: List[Dict[str, Any]], logger=None, *, report: bool = True
+) -> Tuple[bool, List[str]]:
     """
     Validate generated plan for common issues.
 
@@ -790,6 +806,8 @@ def validate_plan(actions: List[Dict[str, Any]], logger=None) -> Tuple[bool, Lis
 
     is_valid = len(errors) == 0
 
+    if not report:
+        return is_valid, errors
     if errors:
         log.error(f"Plan validation failed with {len(errors)} errors:")
         for err in errors:

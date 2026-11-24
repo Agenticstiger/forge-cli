@@ -188,14 +188,15 @@ class _FailingConnection:
 
 def test_no_local_provider_log_call_carries_a_raw_exception_text():
     """Every ``"error": str(e)`` the local provider logs goes through the shared
-    redactor (``local.py`` logs a plan, load, SQL, create-table and copy error)."""
+    redactor (``local.py`` logs a plan, load, SQL and apply-loop error; the create-table
+    and copy-fallback warnings are gone: those failures now raise)."""
     import inspect
 
     from fluid_build.providers.local.local import LocalProvider
 
     source = Path(inspect.getsourcefile(LocalProvider) or "").read_text(encoding="utf-8")
     assert '"error": str(e)' not in source
-    assert source.count("redact_secret_text(str(e))") >= 6
+    assert source.count("redact_secret_text(str(e))") >= 4
 
 
 def test_local_redact_sql_masks_a_postgres_url_password():
