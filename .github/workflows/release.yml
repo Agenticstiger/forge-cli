@@ -10,8 +10,10 @@
 #   2. Every release is cryptographically signed.
 #      `pypa/gh-action-pypi-publish` uploads each wheel with a Sigstore
 #      attestation (`attestations: true`). `actions/attest-build-provenance`
-#      attaches an in-toto SLSA build provenance to every artifact. Both
-#      use GitHub OIDC — no long-lived secrets.
+#      attaches an in-toto SLSA build provenance to the wheel, the sdist and
+#      the GHCR image; the wheel's and sdist's bundles are also attached to the
+#      GitHub Release as `<file>.intoto.jsonl`. All use GitHub OIDC — no
+#      long-lived secrets.
 #
 #   3. Release notes come from CHANGELOG.md, not git log.
 #      The GitHub Release body is extracted from the matching `## [X.Y.Z]`
@@ -268,13 +270,53 @@ jobs:
       - name: Strict metadata check
         run: twine check --strict dist/*
 
-      - name: Attest build provenance (SLSA)
-        # Creates an in-toto attestation proving each dist artifact was built
-        # by this workflow / this commit. Verifiable via `gh attestation verify`
-        # or the Sigstore CLI.
+      # Fails before anything is signed if dist/ is not exactly one wheel and one
+      # sdist, so the two attest steps below each match one file.
+      - name: Check dist/ holds one wheel and one sdist
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          sdists=(dist/*.tar.gz)
+          if [ "${#wheels[@]}" -ne 1 ] || [ "${#sdists[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one wheel and one sdist in dist/"
+            ls -l dist
+            exit 1
+          fi
+
+      # One attestation per distribution file, so each file gets a bundle of its
+      # own that can ride along with it as a release asset. Each is an in-toto
+      # attestation proving the file was built by this workflow / this commit,
+      # verifiable via `gh attestation verify`.
+      - name: Attest build provenance of the wheel (SLSA)
+        id: attest-wheel
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
-          subject-path: "dist/*"
+          subject-path: "dist/*.whl"
+
+      - name: Attest build provenance of the sdist (SLSA)
+        id: attest-sdist
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: "dist/*.tar.gz"
+
+      # The bundle is a Sigstore bundle holding the signed SLSA provenance. It is
+      # named <file>.intoto.jsonl, the name OpenSSF Scorecard's Signed-Releases
+      # check looks for among the release assets, and kept out of dist/ so the
+      # PyPI upload sees only distribution files. Same approach as
+      # pypa/virtualenv's release workflow.
+      - name: Collect the provenance bundles
+        env:
+          WHEEL_BUNDLE: ${{ steps.attest-wheel.outputs.bundle-path }}
+          SDIST_BUNDLE: ${{ steps.attest-sdist.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          wheels=(dist/*.whl)
+          sdists=(dist/*.tar.gz)
+          mkdir provenance
+          cp "${WHEEL_BUNDLE}" "provenance/$(basename "${wheels[0]}").intoto.jsonl"
+          cp "${SDIST_BUNDLE}" "provenance/$(basename "${sdists[0]}").intoto.jsonl"
+          ls -l provenance
 
       - name: Isolated wheel install and verify
         run: |
@@ -329,6 +371,14 @@ jobs:
         with:
           name: dist
           path: dist/
+          retention-days: 30
+
+      - name: Upload provenance bundles
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: provenance
+          path: provenance/
+          if-no-files-found: error
           retention-days: 30
 
   # ──────────────────────────────────────────────────────────────
@@ -619,6 +669,12 @@ jobs:
             echo "gh attestation verify ./dpf/*.whl --repo Agenticstiger/forge-cli"
             echo '```'
             echo
+            echo 'Each distribution file below has its provenance beside it, in a file'
+            echo 'named after it with the suffix .intoto.jsonl. To verify a downloaded file:'
+            echo '```bash'
+            echo 'gh attestation verify <file> --repo Agenticstiger/forge-cli --bundle <file>.intoto.jsonl'
+            echo '```'
+            echo
             echo "$NOTES"
           } > release-notes.md
 
@@ -626,6 +682,12 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: sbom
+
+      - name: Download provenance bundles
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: provenance
+          path: provenance/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3  # v3.0.4
@@ -636,6 +698,7 @@ jobs:
           prerelease: ${{ needs.quality-gate.outputs.is_prerelease == 'true' }}
           files: |
             dist/*
+            provenance/*.intoto.jsonl
             sbom.cdx.json
 
   # ──────────────────────────────────────────────────────────────
