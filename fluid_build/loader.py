@@ -35,6 +35,7 @@ from fluid_build.contract_refs import (
     has_escaped_ref_key,
     is_pointer_node,
     is_ref_node,
+    note_quiet_ref_warning,
     parse_ref,
     pointer_merge_error,
     replaces_pointer,
@@ -1072,15 +1073,16 @@ _NOTED_WORKSPACE_REF_ROOT_IGNORED: Set[str] = set()
 
 def _note_workspace_ref_root_ignored(source: Path, problem: _WorkspaceProblem) -> None:
     key = str(source)
+    text = (
+        f"workspace_ref_root_ignored: {problem.text} ({source}). Contracts under it keep their "
+        f"own directory as the ref root."
+    )
+    extra = {"event": "workspace_ref_root_ignored", "workspace": key, "reason": problem.code}
+    if note_quiet_ref_warning("workspace_ref_root_ignored", key, text, extra):
+        return  # another product's workspace, read for a few values: a DEBUG line
     if not _first_time(_NOTED_WORKSPACE_REF_ROOT_IGNORED, key):
         return
-    LOG.warning(
-        "workspace_ref_root_ignored: %s (%s). Contracts under it keep their own directory "
-        "as the ref root.",
-        problem.text,
-        source,
-        extra={"event": "workspace_ref_root_ignored", "workspace": key, "reason": problem.code},
-    )
+    LOG.warning("%s", text, extra=extra)
 
 
 #: FLUID_REF_ROOT values already reported by :func:`_note_ref_root_env_ignored`
@@ -1106,20 +1108,24 @@ def _note_ref_root_env_ignored(contract_dir: Path, value: str, problem: str) -> 
     """WARN, once per ``FLUID_REF_ROOT`` value per process, that it does not
     apply to this contract and the root it gets without it (``contract_dir``:
     its own directory, or its workspace's ``ref_root``) is used."""
+    extra = {
+        "event": "ref_root_env_ignored",
+        "ref_root_env": value,
+        "contract_dir": str(contract_dir),
+    }
+    text = (
+        f"ref_root_env_ignored: {problem}. Ignoring it for this contract: its $refs are "
+        f"confined to {contract_dir}, the root it gets without the variable."
+    )
+    if note_quiet_ref_warning("ref_root_env_ignored", value, text, extra):
+        return  # another product's contract, read for a few values: a DEBUG line
     if not _first_time(_NOTED_REF_ROOT_ENV_IGNORED, value):
         return
     LOG.warning(
-        "ref_root_env_ignored: %s. Ignoring it for this contract: its $refs are "
-        "confined to %s, the root it gets without the variable. Logged once "
-        "per value in this process; a later contract it is ignored for gets no "
-        "warning, but its escape errors say the variable was ignored and why.",
-        problem,
-        contract_dir,
-        extra={
-            "event": "ref_root_env_ignored",
-            "ref_root_env": value,
-            "contract_dir": str(contract_dir),
-        },
+        "%s Logged once per value in this process; a later contract it is ignored for gets "
+        "no warning, but its escape errors say the variable was ignored and why.",
+        text,
+        extra=extra,
     )
 
 

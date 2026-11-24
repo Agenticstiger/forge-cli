@@ -45,9 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A `$ref` to a file whose suffix fluid does not know logs a warning**
   (`ref_target_suffix_unknown`), once per suffix, naming the first such file, how it was read and
   which suffixes are known. The file is read as before. `.json`, `.yaml`, `.yml` and `.avsc` never
-  warn. A contract read only for another product's sake (by `fluid validate`'s composition rule, or
-  by the replay walk after a cursor rewind) logs it at DEBUG: the warning is that contract's
-  author's, who still gets it when composing it.
+  warn. A contract read only for another product's sake (by `fluid validate`'s composition rule,
+  by the replay walk after a cursor rewind, or by an embedded-SQL build for the upstream it
+  consumes) logs it at DEBUG, and so it does its `workspace_ref_root_ignored` and
+  `ref_root_env_ignored` warnings: they are that contract's author's, who still gets them when
+  composing it.
 
 ### Deprecated
 

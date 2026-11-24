@@ -111,6 +111,7 @@ __all__ = [
     "is_pointer_node",
     "is_ref_node",
     "merge_patch",
+    "note_quiet_ref_warning",
     "parse_ref",
     "pointer_merge_error",
     "quiet_ref_warnings",
@@ -253,6 +254,25 @@ def _log_ref_warning(
             quiet.why,
             extra={**extra, "quieted": quiet.why},
         )
+
+
+def note_quiet_ref_warning(event: str, key: str, text: str, extra: Dict[str, Any]) -> bool:
+    """Say a warning of the loader's ref-root family as a :func:`quiet_ref_warnings` block
+    does; ``False``, with nothing said, outside a block.
+
+    ``workspace_ref_root_ignored`` and ``ref_root_env_ignored`` name another
+    product's workspace file or directory when the contract being composed is
+    another product's. Inside a block that is a DEBUG line saying why, once per
+    ``key`` in the block, and ``True``: the caller then neither logs a WARNING nor
+    records the value in its own warn-once registry, so the contract's own author
+    still hears it when composing it.
+    """
+    quiet = _QUIET_REF_WARNINGS.get()
+    if quiet is None:
+        return False
+    if _first_time(event, key, quiet):
+        _log_ref_warning(quiet, text, "", extra)
+    return True
 
 
 #: Largest text file a ``$ref`` reads: the cap ``util.safe_yaml`` puts on a

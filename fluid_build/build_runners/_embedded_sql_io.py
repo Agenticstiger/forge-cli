@@ -890,10 +890,14 @@ def _upstream_expose(
 ) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
     """``(upstream contract, its expose expose_id)``, as this run's ``env`` overlay leaves them."""
     from fluid_build._contract_loader import load_contract_with_overlay
+    from fluid_build.contract_refs import quiet_ref_warnings
 
     where = _entry(product_id, expose_id)
     try:
-        upstream = load_contract_with_overlay(str(upstream_path), env, log)
+        # Another product's contract, read for one expose: its ref warnings are for its own
+        # author, so they are DEBUG lines here and leave the warn-once registry alone.
+        with quiet_ref_warnings("this build read the upstream contract only for its expose"):
+            upstream = load_contract_with_overlay(str(upstream_path), env, log)
     except Exception as exc:  # noqa: BLE001 - reported as the typed error below
         raise ConsumesResolutionError(
             what=f"{where}: could not load {upstream_path}",

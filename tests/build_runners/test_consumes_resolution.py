@@ -30,6 +30,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+from fluid_build import contract_refs, loader
 from fluid_build.build_runners._embedded_sql_io import (
     ConsumesResolutionError,
     EmbeddedSqlLandingError,
@@ -246,6 +247,36 @@ def test_a_credential_shaped_variable_in_a_location_is_never_resolved(tmp_path, 
     with pytest.raises(ConsumesResolutionError, match="looks like a credential") as err:
         resolve_consumes(contract, contract["builds"][0], _silver_dir(root))
     assert "s3kr1t-value-never-printed" not in err.value.as_json()
+
+
+def test_an_upstreams_ref_warnings_are_debug_lines_and_its_author_still_hears_them(
+    tmp_path, caplog
+):
+    """The upstream is another product's contract, read for one expose: its ref warnings (here
+    a ``$ref`` to a suffix fluid does not know) say nothing at WARNING and leave the warn-once
+    registry as it was, so its own author is still told when composing it."""
+    root = _workspace(tmp_path / "ws")
+    bronze = _bronze(root)
+    (bronze.parent / "settings.conf").write_text("retries: 3\n", encoding="utf-8")
+    _dump(
+        bronze,
+        {**yaml.safe_load(bronze.read_text()), "extensions": {"cfg": {"$ref": "./settings.conf"}}},
+    )
+    contract = _silver(root)
+    contract_refs._NOTED_REF_WARNINGS.clear()
+
+    with caplog.at_level(logging.DEBUG, logger="fluid.loader"):
+        resolve_consumes(contract, contract["builds"][0], _silver_dir(root), env=None)
+
+    said = [r for r in caplog.records if getattr(r, "event", None) == "ref_target_suffix_unknown"]
+    assert [r.levelno for r in said] == [logging.DEBUG]
+    assert contract_refs._NOTED_REF_WARNINGS == set()
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="fluid.loader"):
+        loader.compose_contract(bronze)  # the upstream's own author
+    own = [r for r in caplog.records if getattr(r, "event", None) == "ref_target_suffix_unknown"]
+    assert [r.levelno for r in own] == [logging.WARNING]
 
 
 def test_the_upstream_is_loaded_with_the_same_env_overlay(tmp_path):
