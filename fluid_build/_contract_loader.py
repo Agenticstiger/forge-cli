@@ -676,6 +676,14 @@ def resolve_contract_env_templates(value: Any) -> Any:
     return render_contract(
         value,
         unset=UNSET_DEFER,
-        purpose="Catalog adapters forward contract YAML downstream",
+        # The line is part of what publish and the exports print: byte for byte as it was.
+        refusal=(
+            "Refusing to resolve sensitive-looking env placeholder "
+            "'{{ env.%s }}' in contract body; leaving literal. "
+            "Catalog adapters forward contract YAML downstream \u2014 "
+            "secrets must not ride along. If this value is not a "
+            "secret, rename the env variable to something outside "
+            "the password/secret/token/key family."
+        ),
         logger=logging.getLogger("fluid.cli.publish"),
     )

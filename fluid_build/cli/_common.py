@@ -138,7 +138,14 @@ def resolve_env_templates_in_contract(
     return render_contract(
         contract,
         unset=unset,
-        purpose=purpose or _APPLY_RESOLVE_PURPOSE,
+        refusal=(
+            "Refusing to resolve sensitive-looking env placeholder "
+            "'{{ env.%s }}' in contract body; leaving it literal. "
+            + (purpose or _APPLY_RESOLVE_PURPOSE).replace("%", "%%")
+            + " \u2014 a credential must not ride along. If this value is not a "
+            "secret, rename the variable outside the "
+            "password/secret/token/key family."
+        ),
         stage=stage,
         logger=logging.getLogger("fluid.cli"),
     )

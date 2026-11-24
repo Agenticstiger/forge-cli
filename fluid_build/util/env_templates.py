@@ -180,6 +180,7 @@ def render_contract(
     sensitive: str = SENSITIVE_REFUSE,
     environ: Optional[Mapping[str, str]] = None,
     purpose: Optional[str] = None,
+    refusal: Optional[str] = None,
     stage: Optional[str] = None,
     strip: bool = True,
     logger: Optional[logging.Logger] = None,
@@ -193,8 +194,9 @@ def render_contract(
 
     A credential-shaped name is never rendered in either ``unset`` mode unless the
     caller says ``sensitive=SENSITIVE_RENDER`` (see the module docstring); the
-    warning says where the rendered ``value`` goes, as ``purpose``. ``stage`` names
-    the command, for the error. ``strip`` keeps the historical ``.strip()`` of a string
+    warning says where the rendered ``value`` goes, as ``purpose``; a caller whose log line
+    is part of its output contract gives it whole as ``refusal`` (one ``%s``, the variable
+    name). ``stage`` names the command, for the error. ``strip`` keeps the historical ``.strip()`` of a string
     that holds ``{{``; a caller that renders paths or SQL turns it off. ``value`` is
     not changed.
     """
@@ -215,6 +217,9 @@ def render_contract(
         if name in warned:
             return
         warned.add(name)
+        if refusal is not None:
+            log.warning(refusal, name)
+            return
         log.warning(
             "Refusing to resolve sensitive-looking env placeholder '{{ env.%s }}' in contract "
             "body; leaving it literal. %s: a credential must not ride along. If this value is "

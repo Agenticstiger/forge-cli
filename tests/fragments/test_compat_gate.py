@@ -757,14 +757,33 @@ def _job_list(base: Path, corpus: Sequence[Path], custom: Dict[str, Path]) -> Li
     return jobs
 
 
+_PLACEHOLDER = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+
+
+def _placeholder_values(root: Path) -> Dict[str, str]:
+    """A value for every ``{{ env.NAME }}`` the corpus names, for both sides alike.
+
+    ``fluid validate`` now warns about a variable nobody set, which v0.24.0 never did, so a
+    corpus run without them differs by those warnings for a reason this gate is not about.
+    With the variables set, both sides render the same values and the comparison stays one of
+    how a contract with no ``$ref`` is read.
+    """
+    names = set()
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and path.suffix in {".yaml", ".yml", ".json", ".sql", ".md"}:
+            names.update(_PLACEHOLDER.findall(path.read_text(encoding="utf-8", errors="replace")))
+    return {name: "compat-value" for name in names}
+
+
 def _run_side(
-    tag: str, tree: Path, base: Path, jobs: List[Dict[str, Any]]
+    tag: str, tree: Path, base: Path, jobs: List[Dict[str, Any]], variables: Dict[str, str]
 ) -> "subprocess.Popen[str]":
     (base / "home").mkdir(exist_ok=True)
     (base / "driver.py").write_text(_DRIVER, encoding="utf-8")
     (base / "jobs.json").write_text(json.dumps(jobs), encoding="utf-8")
     env = {k: v for k, v in os.environ.items() if not k.startswith("FLUID_")}
     env.pop("PYTHON_DOTENV_DISABLED", None)
+    env.update(variables)
     env.update(
         PYTHONPATH=str(tree),
         PYTHONDONTWRITEBYTECODE="1",
@@ -813,13 +832,16 @@ def differential(release_tree: Path, tmp_path_factory: pytest.TempPathFactory) -
     corpus = [path for path in _corpus(corpus_root) if not _opened_after(release_tree, path)]
     assert len(corpus) >= 30, f"the corpus shrank to {len(corpus)} contracts"
     before = _tree_state(corpus_root)
+    variables = _placeholder_values(corpus_root)
 
     processes: Dict[str, "subprocess.Popen[str]"] = {}
     bases: Dict[str, Path] = {}
     for tag, tree in (("old", release_tree), ("new", REPO_ROOT)):
         bases[tag] = work / tag
         bases[tag].mkdir()
-        processes[tag] = _run_side(tag, tree, bases[tag], _job_list(bases[tag], corpus, custom))
+        processes[tag] = _run_side(
+            tag, tree, bases[tag], _job_list(bases[tag], corpus, custom), variables
+        )
     sides: Dict[str, Side] = {}
     for tag, process in processes.items():
         try:
