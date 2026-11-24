@@ -53,6 +53,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    Union,
 )
 
 from fluid_build.policy._common import iter_exposes
@@ -71,8 +72,11 @@ __all__ = [
     "EncodedRows",
     "DEFAULT_ROW_FLOOR",
     "MECHANISM",
+    "LINK",
     "Part",
+    "PublicStructures",
     "RANK",
+    "RELATION",
     "RANK_DEFINITIONS",
     "RULE_NAME",
     "Release",
@@ -338,6 +342,11 @@ class ReleasePlan:
     rank_deltas: Tuple[Tuple[str, Fraction], ...] = ()
     #: How the cliques are chosen: one of :data:`selection.METHODS`.
     clique_method: str = "aim"
+    #: A unit that follows its child rows changes at most this many rows of the release table
+    #: (``m_T``, PROFILE-SPEC section 3a), which scales every sensitivity; ``None`` otherwise.
+    reach: Optional[int] = None
+    #: The share a unit that follows its child rows spends choosing this table's cliques.
+    selection_rho: Optional[Fraction] = None
 
     @property
     def categorical(self) -> Tuple[ReleasedColumn, ...]:
@@ -349,12 +358,23 @@ class ReleasePlan:
 
     @property
     def sensitivity(self) -> int:
+        if self.reach is not None:
+            return self.reach * self.reach
         return bounding.sensitivity_squared(self.unit)
 
     @property
     def rows_per_unit(self) -> int:
         """The most records of the release table one unit changes."""
+        if self.reach is not None:
+            return self.reach
         return 1 if self.unit.mode == ROWS else self.unit.max_rows_per_unit
+
+    @property
+    def distance(self) -> int:
+        """The symmetric distance between neighbouring tables, for the selection step."""
+        if self.reach is not None:
+            return self.reach
+        return bounding.selection_distance(self.unit)
 
     def delta(self, definition: str) -> Fraction:
         """The sensitivity of the value of rank correlation *definition* to one unit."""
@@ -387,43 +407,105 @@ def _relationship_columns(expose: Mapping[str, Any]) -> FrozenSet[str]:
     return frozenset(found)
 
 
-def plan_release(
+@dataclass(frozen=True)
+class PublicStructures:
+    """The levels and bins the contract gives the columns of one table, which no record shapes."""
+
+    planned: Any
+    covered: Mapping[str, Mapping[str, Any]]
+    bins_of: Mapping[str, List[str]]
+    uncovered: Mapping[str, str]
+
+    def column(
+        self, column: runner.ColumnPlan, entry: Mapping[str, Any], backend: StatisticsBackend
+    ) -> Union[ReleasedColumn, str]:
+        """The public cells of *column*, or the reason it has none."""
+        if column.domain == runner.CATEGORY:
+            if column.name not in self.covered:
+                return self.uncovered.get(
+                    column.name, "its type declares no levels, as an enum(...) or a boolean does"
+                )
+            declared_type = entry.get("type")
+            found = (
+                BOOLEAN_LEVELS
+                if defaults._is_boolean(declared_type)
+                else tuple(backend.enum_levels(str(declared_type)))
+            )
+            return ReleasedColumn(column.name, column.domain, levels=tuple(sorted(set(found))))
+        if column.name in self.bins_of:
+            texts = self.bins_of[column.name]
+            if column.domain == runner.TIMESTAMP:
+                edges = tuple(
+                    Fraction(backend.read_value("timestamp", text, column=column.name, row_index=0))
+                    for text in texts
+                )
+            else:
+                edges = tuple(Fraction(text) for text in texts)
+            return ReleasedColumn(
+                column.name,
+                column.domain,
+                edges=edges,
+                edge_texts=tuple(decimal_text(edge) for edge in edges),
+                declared=self.planned.ranges.get(column.name),
+            )
+        return self.uncovered.get(
+            column.name, "it has neither a declared range nor a type that bounds it"
+        )
+
+
+def public_structures(
+    expose: Mapping[str, Any],
+    columns: Sequence[runner.ColumnPlan],
+    backend: StatisticsBackend,
+    fractional_bits: int,
+) -> PublicStructures:
+    """The public structure the contract gives *columns* of *expose*, read from the contract alone."""
+    planned = defaults.default_plan(expose, columns, backend.enum_levels, fractional_bits)
+    covered: Mapping[str, Mapping[str, Any]] = (
+        planned.block["columns"] if planned.block is not None else {}
+    )
+    bins_of: Dict[str, List[str]] = {}
+    for each in planned.block["properties"] if planned.block is not None else ():
+        if "bins" in each and each["column"] not in bins_of:
+            bins_of[each["column"]] = list(each["bins"])
+    return PublicStructures(planned, covered, bins_of, dict(planned.uncovered))
+
+
+@dataclass(frozen=True)
+class _TableColumns:
+    """What the release of one table holds, decided from the contract and the request alone."""
+
+    asked: Any
+    expose: Mapping[str, Any]
+    schema: Mapping[str, Mapping[str, Any]]
+    expose_plan: runner.ExposePlan
+    readable: Mapping[str, runner.ColumnPlan]
+    skipped: Mapping[str, str]
+    released: Tuple[ReleasedColumn, ...]
+    why_not: Dict[str, str]
+    keys: FrozenSet[str]
+    eligible: Tuple[ReleasedColumn, ...]
+    selects: bool
+    rank_pairs: Tuple[Tuple[str, str, str], ...]
+    rank_left_out: Tuple[Tuple[str, str], ...]
+
+
+def _plan_columns(
     contract: Mapping[str, Any],
     request: Request,
     backend: StatisticsBackend,
+    table: str,
+    unit_keys: Sequence[str],
     *,
-    unit: str,
-    rho: Fraction,
-    release_table: Optional[str] = None,
-    unit_key: Optional[Sequence[str]] = None,
-    max_rows_per_unit: Optional[int] = None,
-    max_rows_per_cell: Optional[int] = None,
-    row_floor: Optional[int] = None,
-    clique_method: str = "aim",
-) -> ReleasePlan:
-    """Plan a release of one table's requested statistics. Reads no record.
+    nothing_ok: bool = False,
+) -> _TableColumns:
+    """The columns of *table* a release holds, its cliques and its rank correlations.
 
-    Every refusal that does not need a record is made here: the unit, the table, what is
-    released, the cells and the budget.
+    *unit_keys* are the unit's key columns, which are never released. A release of one table
+    refuses when no column is released; with *nothing_ok* the table holds none.
     """
     from fluid_build.profiler import request as asked_for
 
-    if clique_method not in selection.METHODS:
-        raise _refuse(
-            "profile_release_clique_method",
-            f"--clique-method is one of {', '.join(selection.METHODS)}",
-            "name one of them, or leave it out for aim",
-            read=True,
-        )
-    unit_plan = bounding.plan_unit(
-        contract,
-        unit,
-        release_table,
-        unit_key=unit_key,
-        max_rows_per_unit=max_rows_per_unit,
-        max_rows_per_cell=max_rows_per_cell,
-    )
-    table = unit_plan.release_table
     asked_for.check_tables(request, contract)
     asked = request.table(table)
     if asked is None:
@@ -440,7 +522,7 @@ def plan_release(
     readable = {column.name: column for column in plan.columns}
     skipped = dict(plan.skipped)
     keys = (
-        set(unit_plan.key_columns)
+        set(unit_keys)
         | set(bounding._primary_key(table, expose))
         | set(_relationship_columns(expose))
     )
@@ -449,16 +531,7 @@ def plan_release(
         for column in plan.columns
         if asked.column(column.name) is not None and column.name not in keys
     ]
-    fractional_bits = request.fractional_bits
-    planned = defaults.default_plan(expose, candidates, backend.enum_levels, fractional_bits)
-    covered: Mapping[str, Mapping[str, Any]] = (
-        planned.block["columns"] if planned.block is not None else {}
-    )
-    bins_of: Dict[str, List[str]] = {}
-    for each in planned.block["properties"] if planned.block is not None else ():
-        if "bins" in each and each["column"] not in bins_of:
-            bins_of[each["column"]] = list(each["bins"])
-    uncovered = dict(planned.uncovered)
+    known = public_structures(expose, candidates, backend, request.fractional_bits)
 
     released: List[ReleasedColumn] = []
     why_not: Dict[str, str] = {}
@@ -476,44 +549,13 @@ def plan_release(
             )
         elif statistic not in ask.statistics:
             why_not[column.name] = f"the request does not list {statistic} for it"
-        elif column.domain == runner.CATEGORY:
-            if column.name not in covered:
-                why_not[column.name] = uncovered.get(
-                    column.name, "its type declares no levels, as an enum(...) or a boolean does"
-                )
-            else:
-                declared_type = entry.get("type")
-                found = (
-                    BOOLEAN_LEVELS
-                    if defaults._is_boolean(declared_type)
-                    else tuple(backend.enum_levels(str(declared_type)))
-                )
-                released.append(
-                    ReleasedColumn(column.name, column.domain, levels=tuple(sorted(set(found))))
-                )
-        elif column.name in bins_of:
-            texts = bins_of[column.name]
-            if column.domain == runner.TIMESTAMP:
-                edges = tuple(
-                    Fraction(backend.read_value("timestamp", text, column=column.name, row_index=0))
-                    for text in texts
-                )
-            else:
-                edges = tuple(Fraction(text) for text in texts)
-            released.append(
-                ReleasedColumn(
-                    column.name,
-                    column.domain,
-                    edges=edges,
-                    edge_texts=tuple(decimal_text(edge) for edge in edges),
-                    declared=planned.ranges.get(column.name),
-                )
-            )
         else:
-            why_not[column.name] = uncovered.get(
-                column.name, "it has neither a declared range nor a type that bounds it"
-            )
-    if not released:
+            made = known.column(column, entry, backend)
+            if isinstance(made, str):
+                why_not[column.name] = made
+            else:
+                released.append(made)
+    if not released and not nothing_ok:
         raise _refuse(
             "profile_release_nothing_to_release",
             f"no requested column of {table!r} can be released: "
@@ -538,7 +580,6 @@ def plan_release(
             "list fewer columns in the request",
             read=True,
         )
-    categorical = [each for each in released if each.categorical]
     joining = set(asked.clique_columns)
     eligible = tuple(
         each for each in released if (each.name in joining if joining else each.categorical)
@@ -555,6 +596,65 @@ def plan_release(
     for name in sorted(joining - {each.name for each in released}):
         why_not.setdefault(name, "it is not released, so it joins no clique")
     rank_pairs, rank_left_out = _rank_pairs(asked, released, why_not, skipped)
+    return _TableColumns(
+        asked=asked,
+        expose=expose,
+        schema=schema,
+        expose_plan=plan,
+        readable=readable,
+        skipped=skipped,
+        released=tuple(released),
+        why_not=why_not,
+        keys=frozenset(keys),
+        eligible=eligible,
+        selects=selects,
+        rank_pairs=rank_pairs,
+        rank_left_out=tuple(rank_left_out),
+    )
+
+
+def plan_release(
+    contract: Mapping[str, Any],
+    request: Request,
+    backend: StatisticsBackend,
+    *,
+    unit: str,
+    rho: Fraction,
+    release_table: Optional[str] = None,
+    unit_key: Optional[Sequence[str]] = None,
+    max_rows_per_unit: Optional[int] = None,
+    max_rows_per_cell: Optional[int] = None,
+    row_floor: Optional[int] = None,
+    clique_method: str = "aim",
+) -> ReleasePlan:
+    """Plan a release of one table's requested statistics. Reads no record.
+
+    Every refusal that does not need a record is made here: the unit, the table, what is
+    released, the cells and the budget.
+    """
+    if clique_method not in selection.METHODS:
+        raise _refuse(
+            "profile_release_clique_method",
+            f"--clique-method is one of {', '.join(selection.METHODS)}",
+            "name one of them, or leave it out for aim",
+            read=True,
+        )
+    unit_plan = bounding.plan_unit(
+        contract,
+        unit,
+        release_table,
+        unit_key=unit_key,
+        max_rows_per_unit=max_rows_per_unit,
+        max_rows_per_cell=max_rows_per_cell,
+    )
+    table = unit_plan.release_table
+    found = _plan_columns(contract, request, backend, table, unit_plan.key_columns)
+    asked, skipped, released = found.asked, found.skipped, list(found.released)
+    why_not, eligible, selects = found.why_not, found.eligible, found.selects
+    rank_pairs, rank_left_out = found.rank_pairs, list(found.rank_left_out)
+    plan, readable, expose = found.expose_plan, found.readable, found.expose
+    categorical = [each for each in released if each.categorical]
+    fractional_bits = request.fractional_bits
     if row_floor is not None and not rank_pairs:
         raise _refuse(
             "profile_release_row_floor_unused",
@@ -665,6 +765,38 @@ def _rank_pairs(
     return tuple(kept), left_out
 
 
+def _table_not_released(
+    each: Any,
+    table: str,
+    released: FrozenSet[str],
+    why_not: Mapping[str, str],
+    skipped: Mapping[str, str],
+) -> List[Tuple[str, str]]:
+    """Each requested item of the listed table *each* the release does not hold, with why."""
+    found: List[Tuple[str, str]] = []
+    if each.row_count:
+        found.append((f"rowCount of {table}", _NOT_NOISY))
+    for column in each.columns:
+        where = f"{table}.{column.name}"
+        if column.name in skipped:
+            found.append((f"column {where}", f"not profiled: {skipped[column.name]}"))
+            continue
+        if column.metrics:
+            found.append((f"{', '.join(column.metrics)} of {where}", _NOT_NOISY))
+        for identifier in column.statistics:
+            if column.name in released and identifier in (
+                "levelHistogram/1",
+                "marginalHistogram/1",
+            ):
+                continue
+            if identifier in ("levelHistogram/1", "marginalHistogram/1"):
+                reason = why_not.get(column.name, _NOT_NOISY)
+            else:
+                reason = _NOT_NOISY
+            found.append((f"{identifier} of {where}", reason))
+    return found
+
+
 def _not_released(
     request: Request,
     table: str,
@@ -684,26 +816,7 @@ def _not_released(
                 )
             )
             continue
-        if each.row_count:
-            found.append((f"rowCount of {table}", _NOT_NOISY))
-        for column in each.columns:
-            where = f"{table}.{column.name}"
-            if column.name in skipped:
-                found.append((f"column {where}", f"not profiled: {skipped[column.name]}"))
-                continue
-            if column.metrics:
-                found.append((f"{', '.join(column.metrics)} of {where}", _NOT_NOISY))
-            for identifier in column.statistics:
-                if column.name in released and identifier in (
-                    "levelHistogram/1",
-                    "marginalHistogram/1",
-                ):
-                    continue
-                if identifier in ("levelHistogram/1", "marginalHistogram/1"):
-                    reason = why_not.get(column.name, _NOT_NOISY)
-                else:
-                    reason = _NOT_NOISY
-                found.append((f"{identifier} of {where}", reason))
+        found.extend(_table_not_released(each, table, released, why_not, skipped))
     for link in request.relationships:
         found.append(
             (
@@ -780,6 +893,40 @@ def _row_error(event: str, column: str, row: int, what: str) -> ReleaseRefused:
     )
 
 
+def place_values(
+    name: str,
+    column: ReleasedColumn,
+    found: Sequence[Any],
+    backend: StatisticsBackend,
+    fractional_bits: int,
+) -> List[int]:
+    """The level or bin each value of *column* falls in, no value being ``None``.
+
+    A value outside the levels or the range the column declares refuses, naming the column and
+    the row and never the value.
+    """
+    if column.categorical:
+        position = {level: place for place, level in enumerate(column.levels)}
+        placed = []
+        for index, value in enumerate(found):
+            if value not in position:
+                raise _row_error(
+                    _OUTSIDE, name, index, "a value outside the levels its type declares"
+                )
+            placed.append(position[value])
+        return placed
+    for index, value in enumerate(found):
+        inside = column.edges[0] <= value <= column.edges[-1]
+        if not inside or (column.declared is not None and not column.declared.holds(value)):
+            raise _row_error(
+                _OUTSIDE,
+                name,
+                index,
+                "a value outside the range its type or validationRules declare",
+            )
+    return backend.bin_cells(found, column.edges, fractional_bits)
+
+
 def encode_rows(
     plan: ReleasePlan, read: sources.SourceColumns, backend: StatisticsBackend
 ) -> EncodedRows:
@@ -812,27 +959,8 @@ def encode_rows(
                     "no value, and the release needs one in every row",
                 )
         if each.categorical:
-            position = {level: place for place, level in enumerate(each.levels)}
-            placed = []
-            for index, value in enumerate(found):
-                if value not in position:
-                    raise _row_error(
-                        _OUTSIDE, name, index, "a value outside the levels its type declares"
-                    )
-                placed.append(position[value])
             levels[name] = each.levels
-            cells[name] = placed
-        else:
-            for index, value in enumerate(found):
-                inside = each.edges[0] <= value <= each.edges[-1]
-                if not inside or (each.declared is not None and not each.declared.holds(value)):
-                    raise _row_error(
-                        _OUTSIDE,
-                        name,
-                        index,
-                        "a value outside the range its type or validationRules declare",
-                    )
-            cells[name] = backend.bin_cells(found, each.edges, plan.fractional_bits)
+        cells[name] = place_values(name, each, found, backend, plan.fractional_bits)
     unit = plan.unit
     keyed: List[Optional[bytes]] = [None] * rows
     if unit.mode != ROWS or unit.key_columns:
@@ -883,6 +1011,9 @@ def encode_rows(
 # ---------------------------------------------------------------------------
 
 CLIQUE, LEVELS, BINS, RANK = "clique", "levels", "bins", "rank"
+#: The two kinds a unit that follows its child rows adds: a relationship's children-per-parent
+#: histogram and a statistic grouped through a link.
+RELATION, LINK = "relationship", "link"
 
 #: The kinds of count table, which the consistency step makes agree.
 _COUNT_KINDS = (CLIQUE, LEVELS, BINS)
@@ -926,6 +1057,10 @@ class ReleasedTable:
     definition: str = ""
     row_floor: int = 0
     delta: Fraction = Fraction(0)
+    #: A unit that follows its child rows: the table whose rows the part counts, and the squared
+    #: L2 sensitivity of a count table, a relationship histogram or a link statistic to one unit.
+    table: str = ""
+    sensitivity: int = 0
 
     @property
     def cells(self) -> int:
@@ -938,8 +1073,12 @@ class ReleasedTable:
             "scale": self.scale,
             "share": self.share,
         }
+        if self.table:
+            found["table"] = self.table
         if self.kind == RANK:
             found.update({"kind": RANK, "definition": self.definition, "rowFloor": self.row_floor})
+        elif self.kind in (RELATION, LINK):
+            found["kind"] = self.kind
         return found
 
 
@@ -1086,6 +1225,8 @@ def _describe(
 
 def selection_share(plan: ReleasePlan) -> Fraction:
     """A tenth of the total, when two or more columns may join cliques, else nothing."""
+    if plan.selection_rho is not None:
+        return plan.selection_rho if plan.selects else Fraction(0)
     return plan.rho / 10 if plan.selects else Fraction(0)
 
 
@@ -1118,7 +1259,7 @@ def _selected(
             levels,
             _pair_weights(plan),
             selection_share(plan),
-            bounding.selection_distance(plan.unit),
+            plan.distance,
             method=plan.clique_method,
         )
     except selection.SelectionUnavailable:
@@ -1306,13 +1447,19 @@ def _opendp_uri(version: Optional[str]) -> str:
     return f"{base}/{version}/" if version else f"{base}/"
 
 
-def _document(
+def _table_block(
     plan: ReleasePlan,
     tables: Sequence[ReleasedTable],
     values_of: Mapping[str, Sequence[str]],
-    producer: Optional[str],
     selection_version: Optional[str],
+    *,
+    states_selection: bool = False,
 ) -> Dict[str, Any]:
+    """The document's block for the release table of *plan*, from its parts and their values.
+
+    A table that chose cliques states its ``cliqueSelection`` when it holds a form of format
+    1-4-0, names MST, or *states_selection* (a document of format 1-4-0 for another reason).
+    """
     columns: Dict[str, Dict[str, Any]] = {
         name: {"domain": domain} for name, domain in plan.table_columns
     }
@@ -1393,13 +1540,24 @@ def _document(
         ]
     # A release of format 1-2-0 states no selection, and the loss of choosing the cliques is
     # slack below its total. One that holds a 1-4-0 form, or names MST, states it.
-    if plan.selects and (pairs or binned or plan.clique_method != "aim"):
+    if plan.selects and (pairs or binned or plan.clique_method != "aim" or states_selection):
         released["cliqueSelection"] = {
             "method": plan.clique_method,
             "producer": _opendp_uri(selection_version),
             "selection": {"privacyLoss": {"rho": decimal_text(selection_share(plan))}},
             "published": "measured",
         }
+    return released
+
+
+def _document(
+    plan: ReleasePlan,
+    tables: Sequence[ReleasedTable],
+    values_of: Mapping[str, Sequence[str]],
+    producer: Optional[str],
+    selection_version: Optional[str],
+) -> Dict[str, Any]:
+    released = _table_block(plan, tables, values_of, selection_version)
     out_tables: Dict[str, Any] = {plan.table: released}
     for name, listed in plan.other_tables:
         out_tables[name] = {"columns": {column: {"domain": domain} for column, domain in listed}}

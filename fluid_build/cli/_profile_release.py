@@ -39,13 +39,15 @@ _FLAGS = (
     "release_record",
     "rederive",
     "clique_method",
+    "follow",
 )
 
 HELP = """\
 With --request FILE, --privacy-unit EXPOSE, --rho R and --release-record PATH the profile
 is a release under differential privacy: the noisy counts of one table, and the noisy rank
 correlations the request asks for, in profile format 1-2-0 (1-4-0 when it holds a rank
-correlation, a clique with a binned column or a clique selection), which flux-engine grades
+correlation, a clique with a binned column, a clique selection or a unit that follows its
+child rows), which flux-engine grades
 P3. Nothing else of the request is released.
 
 What it releases, from the release table (the privacy unit's expose, or with
@@ -80,6 +82,30 @@ lattice of 2^20 steps per sensitivity, an exact discrete Gaussian is added on th
 sum is written to 12 decimals; the profile states it as a gaussian of the scale, whose variance
 bounds the discrete one's. The report names each part's sensitivity, scale and share, and adds
 an informational conversion to (epsilon, delta) at delta = 1e-6.
+
+A unit that follows its child rows: with --follow PARENT.COL[,COL]=CHILD.COL[,COL]:MAX (repeat
+it for each relationship; each names a relationship the contract declares, MAX is a public cap
+of at least 1) the privacy unit is one row of the --privacy-unit expose together with the rows
+that follow it: at most MAX rows of the child table for each parent row, and so on down the
+tree the entries form, which must be rooted at the expose (a table has one path into it, no
+cycle, the expose is never a child). The release then holds the unit's expose and every table
+it reaches, in format 1-4-0: each table's histograms, cliques and rank correlations with the
+sensitivity of the rows one unit contributes to it (m_T, the product of the caps down to the
+table); each followed relationship's noisy children per parent in the bins 0 to its cap, and a
+relationship asked by the request in a fixed public ladder when its child is reached and its
+parent is not (or the reverse), grouped by the parent columns the request names (a category by
+its levels, a number or timestamp by public bins); and the child columns the request asks to be
+grouped through a relationship (groupByLink) by the parent column's levels, when the unit
+follows the relationship or does not reach the parent. Before anything is measured, at most MAX
+children of each parent row are kept by a keyed priority that reads only that parent's own
+children, so what a unit keeps never depends on another unit or on the order of the records;
+children beyond the cap and rows that follow no kept row are dropped. A table the unit does not
+reach is treated as fixed: its rows are the same in every neighbouring data set, so a statistic
+grouped by its column protects the unit's rows and not that table's, and a labelled column of
+it (pii, restricted, ...) that groups a noisy statistic draws a warning, since the engine
+counts such a column as P1. --follow cannot be used with --release-table, --unit-key or
+--max-rows-per-unit; each parent key must name one row, and every table the release reads
+needs a --source <exposeId>=<location>.
 
 For which unit: one entity is one row of the unit's expose; with a release table related to
 it, or with a unit key, an entity owns every row that belongs to it, and the stated loss holds
@@ -130,6 +156,12 @@ fluid profile orders.fluid.yaml --request orders.profile-request.yml \\
 # the same release again, inside the data owner's boundary
 fluid profile orders.fluid.yaml --request orders.profile-request.yml \\
     --source orders=./orders.csv --release-record orders.release-record.json --rederive
+
+# a unit that follows its child rows: an account with up to 3 invoices, each with up to 2 lines
+fluid profile billing.fluid.yaml --request billing.profile-request.yml \\
+    --source account=./account.csv --source invoice=./invoice.csv --source line=./line.csv \\
+    --privacy-unit account --follow account.id=invoice.account_id:3 \\
+    --follow invoice.invoice_id=line.invoice_id:2 --rho 1 --release-record billing.record.json
 """
 
 
@@ -140,6 +172,15 @@ def _columns(text: str) -> Tuple[str, ...]:
             f"{text!r} is not a list of distinct column names written COL[,COL]"
         )
     return names
+
+
+def _follow(text: str) -> Any:
+    from fluid_build.profiler.dp.follows import parse_follow
+
+    try:
+        return parse_follow(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
 
 
 def _whole(text: str) -> int:
@@ -179,6 +220,18 @@ def add_flags(parser: "argparse.ArgumentParser") -> None:
         help=(
             "the columns of the privacy unit's expose that name an entity, when the release "
             "table is the unit itself and an entity holds several rows"
+        ),
+    )
+    group.add_argument(
+        "--follow",
+        action="append",
+        type=_follow,
+        metavar="PARENT.COL[,COL]=CHILD.COL[,COL]:MAX",
+        help=(
+            "the privacy unit follows its child rows: keep at most MAX children of each parent "
+            "row through this declared relationship, and release the unit's expose and every "
+            "table it reaches; repeat it for each relationship of the tree rooted at "
+            "--privacy-unit. Not with --release-table, --unit-key or --max-rows-per-unit"
         ),
     )
     group.add_argument(
@@ -256,6 +309,24 @@ def check_flags(args: argparse.Namespace) -> None:
             "a private release writes a release record, and --release-record names none",
             next="name a file for the record: it is created, owner-only, and must not exist",
         )
+    if getattr(args, "follow", None):
+        clashes = [
+            flag
+            for flag, value in (
+                ("--release-table", args.release_table),
+                ("--unit-key", args.unit_key),
+                ("--max-rows-per-unit", args.max_rows_per_unit),
+                ("--max-rows-per-cell", args.max_rows_per_cell),
+            )
+            if value is not None
+        ]
+        if clashes:
+            raise _refusal(
+                "profile_release_follow_conflict",
+                f"--follow makes the unit one row with the child rows that follow it, and "
+                f"{clashes[0]} says the rows it contributes in another way",
+                next=f"leave out {', '.join(clashes)}, or leave out --follow",
+            )
     if args.rederive:
         return
     if args.privacy_unit is None:
@@ -382,6 +453,8 @@ def _unit_from_record(unit: Any) -> Dict[str, Any]:
         raise ReleaseRefused(
             "profile_release_record_mismatch", "the record's unit is not an object"
         )
+    if unit.get("mode") == "follows":
+        return _follows_from_record(unit)
     expose, table = unit.get("expose"), unit.get("releaseTable")
     keys, mode = unit.get("keyColumns"), unit.get("mode")
     c, k = unit.get("c"), unit.get("k")
@@ -405,6 +478,48 @@ def _unit_from_record(unit: Any) -> Dict[str, Any]:
         "unit_key": tuple(keys) if mode == "keyed" else None,
         "max_rows_per_unit": None if mode == "rows" else c,
         "max_rows_per_cell": None if mode == "rows" else k,
+        "follows": (),
+    }
+
+
+def _follows_from_record(unit: Dict[str, Any]) -> Dict[str, Any]:
+    """The unit of a record that follows its child rows: the expose and each followed entry."""
+    from fluid_build.profiler.dp.follows import FollowSpec
+    from fluid_build.profiler.dp.release import ReleaseRefused
+
+    listed = unit.get("follows")
+    expose = unit.get("expose")
+    bad = ReleaseRefused(
+        "profile_release_record_mismatch", "the record's unit is not one this release writes"
+    )
+    if not isinstance(expose, str) or not isinstance(listed, list) or not listed:
+        raise bad
+    found = []
+    for entry in listed:
+        if not isinstance(entry, dict):
+            raise bad
+        ends = []
+        for side in ("parent", "child"):
+            end = entry.get(side)
+            if (
+                not isinstance(end, dict)
+                or not isinstance(end.get("table"), str)
+                or not isinstance(end.get("columns"), list)
+                or not all(isinstance(name, str) for name in end["columns"])
+            ):
+                raise bad
+            ends.append((end["table"], tuple(end["columns"])))
+        cap = entry.get("maxChildren")
+        if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+            raise bad
+        found.append(FollowSpec(ends[0][0], ends[0][1], ends[1][0], ends[1][1], cap))
+    return {
+        "unit": expose,
+        "release_table": None,
+        "unit_key": None,
+        "max_rows_per_unit": None,
+        "max_rows_per_cell": None,
+        "follows": tuple(found),
     }
 
 
@@ -420,6 +535,10 @@ def _disagreements(args: argparse.Namespace, stated: Dict[str, Any], rho: Any) -
         "--max-rows-per-cell": (args.max_rows_per_cell, stated["max_rows_per_cell"]),
         "--row-floor": (getattr(args, "row_floor", None), stated["row_floor"]),
         "--clique-method": (args.clique_method, stated["clique_method"]),
+        "--follow": (
+            None if not getattr(args, "follow", None) else tuple(args.follow),
+            stated["follows"],
+        ),
     }
     for flag, (value, recorded) in given.items():
         if value is not None and value != recorded:
@@ -440,13 +559,13 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Release the table under differential privacy and write the profile; return the exit code."""
     from fluid_build._console import cprint_literal
     from fluid_build._contract_loader import load_contract_with_overlay
-    from fluid_build.cli import profile_cmd
+    from fluid_build.cli import _profile_follow, profile_cmd
     from fluid_build.cli.console import warning as console_warning
     from fluid_build.cli.security import validate_cli_path
     from fluid_build.profiler import _stats, runner, sources
     from fluid_build.profiler import request as asked_for
     from fluid_build.profiler.document import DocumentError
-    from fluid_build.profiler.dp import bounding, randomness, release, selection
+    from fluid_build.profiler.dp import bounding, follow_release, randomness, release, selection
     from fluid_build.profiler.dp import record as record_module
 
     check_flags(args)
@@ -515,53 +634,98 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 "max_rows_per_cell": args.max_rows_per_cell,
                 "row_floor": getattr(args, "row_floor", None),
                 "clique_method": args.clique_method or "aim",
+                "follows": tuple(args.follow or ()),
             }
             rho = release.parse_rho(args.rho)
         contract = load_contract_with_overlay(str(contract_path), args.env, logger)
-        plan = release.plan_release(
-            contract,
-            asked,
-            backend,
-            unit=stated["unit"],
-            rho=rho,
-            release_table=stated["release_table"],
-            unit_key=stated["unit_key"],
-            max_rows_per_unit=stated["max_rows_per_unit"],
-            max_rows_per_cell=stated["max_rows_per_cell"],
-            row_floor=stated["row_floor"],
-            clique_method=stated["clique_method"],
-        )
-        _only_the_release_table(args.source, contract, plan.table)
-        exposes = profile_cmd._expose_sources(contract, [plan.table], args.source, args.table)
-        out = profile_cmd._out_path(args.out, plan.table, [each.source for each in exposes])
+        follows = stated["follows"]
+        plan: Any
+        if follows:
+            plan = follow_release.plan_follow_release(
+                contract,
+                asked,
+                backend,
+                unit=stated["unit"],
+                rho=rho,
+                follows=follows,
+                row_floor=stated["row_floor"],
+                clique_method=stated["clique_method"],
+            )
+            read_tables = list(plan.read_tables)
+            named = plan.unit
+        else:
+            plan = release.plan_release(
+                contract,
+                asked,
+                backend,
+                unit=stated["unit"],
+                rho=rho,
+                release_table=stated["release_table"],
+                unit_key=stated["unit_key"],
+                max_rows_per_unit=stated["max_rows_per_unit"],
+                max_rows_per_cell=stated["max_rows_per_cell"],
+                row_floor=stated["row_floor"],
+                clique_method=stated["clique_method"],
+            )
+            read_tables = [plan.table]
+            named = plan.table
+        _only_the_read_tables(args.source, contract, read_tables)
+        exposes = profile_cmd._expose_sources(contract, read_tables, args.source, args.table)
+        out = profile_cmd._out_path(args.out, named, [each.source for each in exposes])
         record_path = _check_record_path(
             args.release_record, out, [each.source for each in exposes], new=not rederive
         )
         notice = release.rho_warning(rho)
         if notice is not None:
             console_warning(notice)
-        cliques = None
+        cliques: Any = None
+        checker = follow_release if follows else release
         if recorded is not None:
-            cliques = release.check_record(plan, recorded)
+            cliques = (
+                follow_release.check_follow_record(plan, recorded)
+                if follows
+                else release.check_record(plan, recorded)
+            )
             seed = recorded.seed
         else:
-            release.check_selection_available(plan)
+            checker.check_selection_available(plan)
             seed = randomness.new_seed()
-        read = sources.read_columns(
-            exposes[0].source,
-            [column.name for column in plan.read],
-            table=exposes[0].table,
-            cwd=Path.cwd(),
-        )
-        rows = release.encode_rows(plan, read, backend)
-        drawn = release.draw(
-            plan,
-            rows,
-            seed,
-            backend,
-            cliques=cliques,
-            selection_version=None if recorded is None else recorded.versions.get("opendp"),
-        )
+        version = None if recorded is None else recorded.versions.get("opendp")
+        drawn: Any
+        if follows:
+            wanted_columns = dict(plan.reads)
+            reads = {
+                each.expose_id: sources.read_columns(
+                    each.source,
+                    [column.name for column in wanted_columns[each.expose_id]],
+                    table=each.table,
+                    cwd=Path.cwd(),
+                )
+                for each in exposes
+            }
+            drawn = follow_release.draw_follow(
+                plan,
+                follow_release.encode_follow_rows(plan, reads, backend),
+                seed,
+                backend,
+                cliques=cliques,
+                selection_version=version,
+            )
+        else:
+            read = sources.read_columns(
+                exposes[0].source,
+                [column.name for column in plan.read],
+                table=exposes[0].table,
+                cwd=Path.cwd(),
+            )
+            drawn = release.draw(
+                plan,
+                release.encode_rows(plan, read, backend),
+                seed,
+                backend,
+                cliques=cliques,
+                selection_version=version,
+            )
         if recorded is not None:
             if drawn.digest != recorded.profile_digest:
                 raise release.ReleaseRefused(
@@ -577,7 +741,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             )
             record_module.write_record(
                 record_path,
-                release.build_record(
+                (follow_release.build_follow_record if follows else release.build_record)(
                     plan,
                     drawn,
                     seed,
@@ -607,7 +771,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             str(exc),
             {"read": "nothing: no record was read", "next": selection.PRIVACY_INSTALL_COMMAND},
         ) from None
-    _report(
+    report = _profile_follow.report if follows else _report
+    report(
         cprint_literal,
         plan,
         drawn,
@@ -619,19 +784,28 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     return 0
 
 
-def _only_the_release_table(given: Sequence[str], contract: Any, table: str) -> None:
-    """Refuse a ``--source`` for a table other than the release table: no other table is read."""
+def _only_the_read_tables(given: Sequence[str], contract: Any, tables: Sequence[str]) -> None:
+    """Refuse a ``--source`` for a table the release does not read.
+
+    A release of one table reads that table only; one whose unit follows its child rows reads the
+    tables it reaches and the others its statistics group by.
+    """
     from fluid_build.profiler import runner
     from fluid_build.profiler.sources import describe_source
 
     ids = runner.expose_ids(contract)
     for value in given:
         head, sep, _ = value.partition("=")
-        if sep and head in ids and head != table:
+        if sep and head in ids and head not in tables:
             raise runner.ProfileError(
                 "profile_release_source_unused",
-                f"--source names exposes[{head}], and a private release reads the release "
-                f"table exposes[{table}] only",
+                (
+                    f"--source names exposes[{head}], and a private release reads the release "
+                    f"table exposes[{tables[0]}] only"
+                    if len(tables) == 1
+                    else f"--source names exposes[{head}], which this release does not read "
+                    f"(it reads {', '.join(tables)})"
+                ),
                 {
                     "read": "nothing: no record was read",
                     "next": f"leave out --source {describe_source(value).partition('=')[0]}=...",

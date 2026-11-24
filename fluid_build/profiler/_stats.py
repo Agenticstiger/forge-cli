@@ -62,6 +62,8 @@ __all__ = [
     "DocumentRefused",
     "EdgeDecision",
     "EdgeStatistic",
+    "FollowEntry",
+    "FollowRefused",
     "Grouping",
     "MeasureRefused",
     "MeasuredGroup",
@@ -94,6 +96,13 @@ class ReadRefused(ValueError):
 
     The message names the column, the row and the value's class, never the
     value: a refusal is printed in the owner's terminal and can travel from there.
+    """
+
+
+class FollowRefused(ValueError):
+    """The registry refused the relationships a unit follows (``FLX-5036``).
+
+    The message names the entry, never a value.
     """
 
 
@@ -144,6 +153,17 @@ class RequestRefused(ValueError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(f"{message} ({code})")
         self.code = code
+
+
+@dataclass(frozen=True)
+class FollowEntry:
+    """One relationship a privacy unit follows, and the cap on its children per parent row."""
+
+    parent_table: str
+    parent_columns: Tuple[str, ...]
+    child_table: str
+    child_columns: Tuple[str, ...]
+    max_children: int
 
 
 @dataclass(frozen=True)
@@ -589,6 +609,14 @@ class StatisticsBackend(Protocol):
 
         ``4 / (floor + 1)`` for ``kendallTau/1`` and ``9 / (floor + 1)`` for ``spearmanRho/1``,
         as the registry charges them.
+        """
+
+    def follow_reach(self, unit: str, follows: Sequence[FollowEntry]) -> Mapping[str, int]:
+        """``m_T`` of every table the followed relationships reach, the *unit* expose included.
+
+        The relationships must form a tree rooted at *unit*, each with a cap of at least 1
+        (PROFILE-SPEC section 3a); the registry's reader checks it, and :class:`FollowRefused`
+        names the entry (``follows[i]``) that breaks it.
         """
 
     def bin_cells(
@@ -1197,6 +1225,24 @@ class _FluxStatsBackend:
         from flux_stats.rank_correlation import rank_sensitivity
 
         return Fraction(rank_sensitivity(identifier, floor))
+
+    def follow_reach(self, unit: str, follows: Sequence[FollowEntry]) -> Mapping[str, int]:
+        from flux_stats.noise import reach_of, read_follows
+
+        where = "follows"
+        listed = [
+            {
+                "parent": {"table": each.parent_table, "columns": list(each.parent_columns)},
+                "child": {"table": each.child_table, "columns": list(each.child_columns)},
+                "maxChildren": each.max_children,
+            }
+            for each in follows
+        ]
+        try:
+            reached = reach_of(unit, read_follows(listed, where), where)
+        except self._refused as error:
+            raise FollowRefused(error.detail or error.code.title) from None
+        return {table: int(count) for table, count in reached.items()}
 
     def bin_cells(
         self, values: Sequence[Any], edges: Sequence[Fraction], fractional_bits: int

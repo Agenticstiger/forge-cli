@@ -255,6 +255,9 @@ class FakeBackend:
         value: Fraction = self._real().rank_sensitivity(identifier, floor)
         return value
 
+    def follow_reach(self, unit: str, follows: Any) -> Any:
+        return self._real().follow_reach(unit, follows)
+
     def metrics(self) -> Tuple[FakeMetric, ...]:
         return METRICS
 
