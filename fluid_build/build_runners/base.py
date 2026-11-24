@@ -1166,11 +1166,19 @@ def _plan_local_sql(
         io = _plan_duckdb_io(unresolved_contract, build, contract_dir, env=env)
         return io is not None, io
     from fluid_build._errors import FluidUserError
+    from fluid_build.providers.local.planner import is_multi_stage_build, validate_stage_build
 
-    from ._embedded_sql_io import refuse_unlandable_first_expose
+    from ._embedded_sql_io import refuse_unlandable_first_expose, refuse_unlandable_stage_exposes
 
     try:
-        refuse_unlandable_first_expose(unresolved_contract, build)
+        if is_multi_stage_build(build):
+            # Everything that needs no data is checked here, so ``--dry-run`` refuses too
+            # and nothing runs before the build is known to be runnable: the stage
+            # structure, what the stages would land, and where.
+            validate_stage_build(unresolved_contract, build)
+            refuse_unlandable_stage_exposes(unresolved_contract, build)
+        else:
+            refuse_unlandable_first_expose(unresolved_contract, build)
     except FluidUserError as exc:
         _print_typed_error(exc)
         LOG.error("embedded_sql_io_refused build_id=%s code=%s", build.get("id"), exc.code)

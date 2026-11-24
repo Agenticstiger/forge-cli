@@ -1435,6 +1435,41 @@ def refuse_unlandable_first_expose(contract: Mapping[str, Any], build: Mapping[s
     )
 
 
+def refuse_unlandable_stage_exposes(contract: Mapping[str, Any], build: Mapping[str, Any]) -> None:
+    """For a multi-stage build on the local engine: refuse what its stages cannot land.
+
+    The stages write the rows of EVERY expose the build lands (``build_output_exposes``)
+    as local files, so each must be a local file (``binding.platform`` unset or
+    ``local``, and no URI path) and none may declare masking, which the stages do not
+    apply (:func:`refuse_unapplied_masking`).
+    """
+    refuse_unapplied_masking(contract, build)
+    for expose in _landed_exposes(contract, build):
+        expose_id = str(expose.get("exposeId") or expose.get("id") or "result")
+        binding = expose.get("binding") if isinstance(expose.get("binding"), Mapping) else {}
+        raw_loc = binding.get("location") if isinstance(binding.get("location"), Mapping) else {}
+        platform = str(binding.get("platform") or "").strip().lower()
+        path = raw_loc.get("path")
+        if platform in {"", "local"} and not (path and is_remote_uri(str(path))):
+            continue
+        raise EmbeddedSqlLandingError(
+            what=(
+                f"expose {expose_id}: multi-stage builds land local files only, and this one "
+                f"is bound to {platform or 'a remote path'}{f' ({path})' if path else ''}"
+            ),
+            why=(
+                "The stages write each expose as a local file of its declared name, which "
+                "would not reach that platform."
+            ),
+            fix=(
+                "Land this expose with an embedded-SQL build (properties.sql), or with "
+                "another engine."
+            ),
+            doc=doc_url(),
+            extras={"exposeId": expose_id, "platform": platform},
+        )
+
+
 def object_store_landing(
     contract: Mapping[str, Any], build: Mapping[str, Any]
 ) -> Optional[Landing]:

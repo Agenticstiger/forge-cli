@@ -104,6 +104,8 @@ def is_multi_stage_build(build: Mapping[str, Any]) -> bool:
     props = build.get("properties")
     return (
         str(build.get("pattern") or "").strip().lower() == "multi-stage"
+        # a build of another engine (dbt, glue, databricks ...) is that engine's to run
+        and str(build.get("engine") or "").strip().lower() in ("", "sql")
         and isinstance(props, Mapping)
         and bool(props.get("stages"))
     )
@@ -478,6 +480,8 @@ def plan_actions(
     expose_ids = {str(get_expose_id(e)) for e in get_exposes(contract) if isinstance(e, dict)}
     written_by: Dict[str, str] = {}  # exposeId -> the table of the last build that names it
     table_owner: Dict[str, str] = {}  # result table -> the build id that keeps it
+    explicit_ids: Set[str] = set()  # exposes a build names in its own builds[].outputs
+    stage_tables: Set[str] = set()  # tables of stages: never an expose's table by name alone
 
     for build_idx, build in enumerate(builds):
         if not build:
@@ -516,7 +520,7 @@ def plan_actions(
 
         # A multi-stage build keeps its SQL in its stages (ordered, or refused, here:
         # before any action of this build is planned).
-        stages = ordered_stages(build) if is_multi_stage_build(build) else None
+        stages = validate_stage_build(contract, build) if is_multi_stage_build(build) else None
 
         # Extract SQL from various formats
         sql_text = None if stages else _extract_sql(build, contract, log)
@@ -572,6 +576,7 @@ def plan_actions(
         # exposes, refuses the plan instead of landing one build's rows in
         # another's file.
         landed = build_output_exposes(contract, build)
+        explicit_outputs = isinstance(build.get("outputs"), list) and bool(build["outputs"])
 
         if stages:
             stage_actions = _plan_stage_actions(
@@ -586,10 +591,19 @@ def plan_actions(
                 actions=actions,
                 dependencies=dependencies,
             )
+            stage_tables.update(t for stage in stages for t in stage.tables)
             produced = {t for stage in stages for t in stage.tables}
             for expose in landed:  # an expose lands from the stage output it is named by
-                if str(get_expose_id(expose)) in produced:
-                    written_by[str(get_expose_id(expose))] = str(get_expose_id(expose))
+                eid = str(get_expose_id(expose))
+                if eid not in produced:
+                    continue
+                # An explicit builds[].outputs mapping beats a stage-derived one, whatever
+                # the build order; a later explicit one still overrides an earlier one.
+                if explicit_outputs:
+                    explicit_ids.add(eid)
+                elif eid in explicit_ids:
+                    continue
+                written_by[eid] = eid
             log.debug(
                 "local planner: build '%s' planned %d stage action(s)", build_id, stage_actions
             )
@@ -653,6 +667,8 @@ def plan_actions(
         dependencies[build_rid] = input_tables
         for expose in landed:  # the last build to name an expose lands it
             written_by[str(get_expose_id(expose))] = output_table
+            if explicit_outputs:
+                explicit_ids.add(str(get_expose_id(expose)))
 
     # ==================== 3. Materialize Actions ====================
     # Write results to exposes[] paths
@@ -708,7 +724,7 @@ def plan_actions(
         source_table = _determine_source_table(
             _ei["_raw"] if isinstance(_ei.get("_raw"), dict) else {},
             builds,
-            loaded_tables,
+            loaded_tables - stage_tables,
             log,
             written_by=written_by,
             expose_id=expose_id,
@@ -781,6 +797,74 @@ def plan_actions(
     log.info(f"Generated {len(sorted_actions)} actions for contract {contract_id}")
 
     return sorted_actions
+
+
+def _stage_input_names(build: Mapping[str, Any]) -> Set[str]:
+    """The relations ``properties.parameters.inputs`` binds as views before a stage runs."""
+    names = set(_explicit_input_names(build))
+    params = (build.get("properties") or {}).get("parameters") or {}
+    for inp in params.get("inputs") or []:
+        if isinstance(inp, dict) and inp.get("path") and not (inp.get("name") or inp.get("id")):
+            names.add(re.sub(r"[^A-Za-z0-9_]+", "_", Path(str(inp["path"])).stem) or "t")
+    return names
+
+
+def validate_stage_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> List[Stage]:
+    """The stages of a multi-stage build, ordered, after every check that needs no data.
+
+    One place for the contract-file route, the amend-and-build route and the
+    pre-run gate, so all refuse the same builds before anything is written:
+    :func:`ordered_stages`'s refusals; a stage output equal to a declared input's name
+    (the inputs are re-registered as views before each stage, so the stage after it
+    would fail once the first had landed); a named expose no stage produces
+    (``local_plan_invalid``); and a build that lands no expose while the contract
+    declares some (``build_stage_lands_nothing``).
+    """
+    stages = ordered_stages(build)
+    build_id = str(build.get("id") or "?")
+    inputs = {n.lower() for n in _stage_input_names(build)}
+    for stage in stages:
+        for table in stage.tables:
+            if table.lower() in inputs:
+                raise _stage_error(
+                    "build_stage_unsupported",
+                    build_id,
+                    f"stage {stage.name!r} of build {build_id!r} writes the table {table!r}, "
+                    "which is also a declared input",
+                    "The input is bound as a view before every stage, so the stage would "
+                    "replace it and a later stage would fail.",
+                    "Give the stage another output name.",
+                    stage=stage.name,
+                    table=table,
+                )
+    exposes = build_output_exposes(contract, build)  # type: ignore[arg-type]
+    produced = {t for stage in stages for t in stage.tables}
+    missing = [str(get_expose_id(e)) for e in exposes if str(get_expose_id(e)) not in produced]
+    if missing:
+        raise _stage_error(
+            "local_plan_invalid",
+            build_id,
+            f"build {build_id!r} names the expose(s) {', '.join(map(repr, missing))} in "
+            "outputs, and no stage produces them; nothing was written",
+            "An expose lands from the stage output of its own name, and a stage output of "
+            "that name does not exist.",
+            f"List {', '.join(missing)} in the outputs of the stage that produces it.",
+            exposeIds=missing,
+        )
+    declared = [str(get_expose_id(e)) for e in contract.get("exposes") or [] if isinstance(e, dict)]
+    if declared and not exposes:
+        raise _stage_error(
+            "build_stage_lands_nothing",
+            build_id,
+            f"no stage output of build {build_id!r} is the id of an expose; nothing would land",
+            "An expose lands from the stage output of its own name. The stage outputs are "
+            f"{', '.join(sorted(map(repr, produced)))}; the contract's exposeIds are "
+            f"{', '.join(map(repr, declared))}.",
+            "Name an exposeId in the outputs of the stage that produces it (check the spelling).",
+            outputs=sorted(produced),
+            exposeIds=declared,
+        )
+    return stages
 
 
 def _plan_stage_actions(

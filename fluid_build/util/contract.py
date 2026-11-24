@@ -129,6 +129,8 @@ def _stage_output_names(build: Mapping[str, Any]) -> Optional[List[str]]:
     stages = props.get("stages") if isinstance(props, Mapping) else None
     if str(build.get("pattern") or "").strip().lower() != "multi-stage" or not stages:
         return None
+    if str(build.get("engine") or "").strip().lower() not in ("", "sql"):
+        return None  # another engine's stages are that engine's to run
     if not isinstance(stages, list):
         return None
     names: List[str] = []

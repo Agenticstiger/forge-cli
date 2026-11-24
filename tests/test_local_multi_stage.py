@@ -398,3 +398,190 @@ def test_a_plan_applied_from_another_directory_runs_the_stages(
     monkeypatch.chdir(elsewhere)
     assert apply_run(_parse("apply", str(project / "plan.json"), "--yes"), LOG) == 0
     assert _landed(project) == {"B": "a\n2\n"}
+
+
+# ------------------- the review's follow-up: landing, gates, precedence ------------------- #
+
+
+def _rc(project: Path, contract: Dict[str, Any], *flags: str) -> int:
+    """The exit code of an apply, a refusal raised as an error included (non-zero)."""
+    try:
+        return _apply(project, contract, *flags)
+    except (FluidUserError, SystemExit, Exception):  # noqa: BLE001 - any refusal is non-zero
+        return 1
+
+
+def _with_binding(contract: Dict[str, Any], expose_id: str, **binding: Any) -> Dict[str, Any]:
+    for expose in contract["exposes"]:
+        if expose["exposeId"] == expose_id:
+            expose["binding"] = {**expose["binding"], **binding}
+    return contract
+
+
+def test_the_amend_route_refuses_a_masked_expose(
+    project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    contract = _contract([_stage("one", "SELECT 1 AS a", ["A"])], ["A"])
+    contract["exposes"][0]["policy"] = {
+        "privacy": {"masking": [{"column": "a", "strategy": "hash"}]}
+    }
+    assert _rc(project, contract, "--mode", "amend-and-build") != 0
+    assert "masking" in capsys.readouterr().out
+    assert not (project / "out").exists()
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        {"platform": "aws", "location": {"path": "s3://bucket/a.parquet"}},
+        {"platform": "local", "location": {"path": "gs://bucket/a.csv"}},
+        {"platform": "gcp", "location": {"table": "t"}},
+        {"platform": "snowflake", "location": {}},
+    ],
+    ids=["aws", "remote-path", "bigquery-no-path", "snowflake-no-path"],
+)
+def test_the_amend_route_refuses_an_expose_that_is_not_a_local_file(
+    project: Path, binding: Dict[str, Any], capsys: pytest.CaptureFixture
+) -> None:
+    stages = [_stage("one", "SELECT 1 AS a", ["A"]), _stage("two", "SELECT 2 AS a", ["B"])]
+    contract = _with_binding(_contract(stages, ["A", "B"]), "B", **binding)
+    assert _rc(project, contract, "--mode", "amend-and-build") != 0
+    assert "land local files only" in " ".join(capsys.readouterr().out.split())
+    assert not (project / "out").exists()
+    assert not (project / "runtime" / "out" / "B.csv").exists()
+
+
+def test_a_non_local_expose_without_a_path_gets_no_default_local_file(project: Path) -> None:
+    provider = LocalProvider(project="t", region="local", anchor_dir=project)
+    expose = {"exposeId": "B", "binding": {"platform": "gcp", "location": {}}}
+    assert provider._stage_expose_spec({}, expose) is None
+    local = {"exposeId": "B", "binding": {"platform": "local", "location": {}}}
+    assert provider._stage_expose_spec({}, local) == {"path": "runtime/out/B.csv", "format": "csv"}
+
+
+@pytest.mark.parametrize("make,code", REFUSALS[:5], ids=[m.__name__[1:] for m, _ in REFUSALS[:5]])
+def test_dry_run_refuses_a_stage_build_and_prints_what_why_fix(
+    project: Path, make: Any, code: str, capsys: pytest.CaptureFixture
+) -> None:
+    assert _rc(project, make(), "--mode", "amend-and-build", "--dry-run") != 0
+    out = capsys.readouterr().out
+    assert "why:" in out and "fix:" in out
+    assert "Traceback" not in out
+    assert not (project / "out").exists()
+
+
+def test_a_stage_output_named_like_a_declared_input_is_refused() -> None:
+    stage = _stage("one", "SELECT 1 AS a", ["Raw"])
+    contract = _contract([stage], ["Raw"])
+    contract["builds"][0]["properties"]["parameters"] = {
+        "inputs": [{"name": "raw", "path": "data/raw.csv"}]
+    }
+    assert _refusal(contract).code == "build_stage_unsupported"
+    provider = LocalProvider(project="t", region="local")
+    with pytest.raises(LocalPlanError) as refused:
+        provider._derive_actions_from_contract(contract)
+    assert refused.value.code == "build_stage_unsupported"
+
+
+def test_a_build_that_lands_no_expose_is_refused_by_name(
+    project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    contract = _contract([_stage("one", "SELECT 1 AS a", ["Aa"])], ["A"])  # misspelt
+    assert _refusal(contract).code == "build_stage_lands_nothing"
+    with pytest.raises(FluidUserError) as refused:
+        _apply(project, contract)
+    assert refused.value.code == "build_stage_lands_nothing"
+    assert "'Aa'" in refused.value.why and "'A'" in refused.value.why
+    assert _rc(project, contract, "--mode", "amend-and-build") != 0
+    out = capsys.readouterr().out
+    assert "nothing would land" in " ".join(out.split()), out
+    assert not (project / "out").exists()
+
+
+def _two_builds(stage_first: bool) -> Dict[str, Any]:
+    staged = {
+        "id": "staged",
+        "pattern": "multi-stage",
+        "engine": "sql",
+        "properties": {
+            "stages": [
+                _stage("mk_a", "SELECT 1 AS a", ["A"]),
+                _stage("mk_b", "SELECT 99 AS a", ["B"], ["mk_a"]),  # B: only intermediate here
+            ]
+        },
+    }
+    explicit = {
+        "id": "explicit",
+        "pattern": "embedded-logic",
+        "engine": "sql",
+        "properties": {"sql": "SELECT 2 AS a"},
+        "outputs": ["B"],
+    }
+    contract = _contract([], ["A", "B"])
+    contract["builds"] = [staged, explicit] if stage_first else [explicit, staged]
+    return contract
+
+
+@pytest.mark.parametrize("stage_first", [True, False], ids=["stage-first", "explicit-first"])
+def test_an_explicit_outputs_mapping_beats_a_stage_derived_one(
+    project: Path, stage_first: bool
+) -> None:
+    assert _apply(project, _two_builds(stage_first)) == 0
+    assert _landed(project)["B"] == "a\n2\n"
+    assert _landed(project)["A"] == "a\n1\n"
+
+
+def test_a_stage_table_named_like_an_expose_the_outputs_omit_does_not_land_it(
+    project: Path,
+) -> None:
+    stages = [_stage("one", "SELECT 1 AS a", ["A"]), _stage("two", "SELECT 2 AS a", ["B"])]
+    contract = _contract(stages, ["A", "B"], outputs=["A"])
+    with pytest.raises(FluidUserError) as refused:
+        _apply(project, contract)
+    assert refused.value.code == "local_plan_invalid"  # as the amend route, B is not landed
+    assert not (project / "out").exists()
+
+
+@pytest.mark.parametrize("derive", [False, True], ids=["plan", "amend"])
+def test_later_stages_of_a_build_do_not_run_after_a_stage_fails(
+    project: Path, derive: bool
+) -> None:
+    stages = [
+        _stage("broken", "SELECT * FROM no_such_table", ["mid"]),
+        _stage("later", "SELECT 5 AS a", ["A"], ["broken"]),
+    ]
+    contract = _contract(stages, ["A"])
+    provider = LocalProvider(project="t", region="local", anchor_dir=project)
+    actions = provider._derive_actions_from_contract(contract) if derive else plan_actions(contract)
+    result = provider.apply(actions=actions, plan={"contract": contract})
+    assert result["failed"] >= 1
+    later = [r for r in result["results"] if r.get("reason") == "earlier_stage_failed"]
+    assert len(later) == 1 and later[0]["skipped"] is True
+    assert not (project / "out" / "A.csv").exists()
+
+
+def test_a_non_stage_action_still_runs_after_a_failure(project: Path) -> None:
+    provider = LocalProvider(project="t", region="local", anchor_dir=project)
+    result = provider.apply(
+        actions=[
+            {"op": "sql", "sql": "SELECT * FROM nope", "output_table": "t1"},
+            {"op": "sql", "sql": "SELECT 1 AS a", "output_table": "t2", "preview": False},
+        ]
+    )
+    assert result["failed"] == 1 and result["results"][1]["status"] == "ok"
+    assert not result["results"][1].get("skipped")
+
+
+def test_stages_of_another_engine_are_left_to_its_runner() -> None:
+    contract = _contract([_stage("a", "SELECT 1 AS a", ["A"])], ["A"], engine="dbt")
+    build = contract["builds"][0]
+    from fluid_build.providers.local.planner import is_multi_stage_build
+
+    assert not is_multi_stage_build(build)
+    assert not [a for a in plan_actions(contract) if a["op"] == "execute_sql"]
+    provider = LocalProvider(project="t", region="local")
+    with pytest.raises(FluidUserError) as derived:
+        provider._derive_actions_from_contract(contract)
+    assert derived.value.code == "build_has_no_sql"  # as before: not the stages' to run
+    for engine in ("SQL", "", None):
+        assert is_multi_stage_build({**build, "engine": engine})

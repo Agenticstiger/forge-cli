@@ -36,8 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cycle (`build_stage_cycle`), a `dependsOn` that names no stage (`build_stage_unknown_dependency`),
   a stage with no SQL (`build_stage_has_no_sql`), an output name that is not a safe identifier
   (`build_stage_unsafe_name`) and a stage shape the engine cannot run (`build_stage_unsupported`)
-  are refused before anything is written. All 13 bundled templates apply locally, in the default
-  mode and under `--mode amend-and-build`; `customer-360` keeps its five stages.
+  are refused before anything is written, as is a multi-stage build that lands no expose while the
+  contract declares some (`build_stage_lands_nothing`) and a stage output named like an input. Under
+  `--mode amend-and-build` the exposes a multi-stage build lands must be local files (a masked
+  expose, or one bound to S3, GCS, BigQuery or another platform, is refused, as for an embedded-SQL
+  build), the stages are checked before anything runs (so `--dry-run` refuses too), and the stages
+  after a failed one do not run. Only a build whose `engine` is unset or `sql` runs its stages
+  here; another engine's `stages` stay with that engine. All 13 bundled templates apply locally,
+  in the default mode and under `--mode amend-and-build`; `customer-360` keeps its five stages.
 - **The federation digest check runs on every apply engine.** `validate_federated_consumes` (the
   warn-only gate that reports a drifted `upstreamDigest` pin) was called only below the OpenTofu
   branch and the build modes' early returns, so `fluid apply` on aws / gcp / snowflake and
@@ -58,7 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file write and the cursor write lands the batch again on the retry (the append is
   at-least-once; the old overwrite was idempotent). A json or ndjson file is unioned the same way,
   with the old rows read back by the expose's declared `contract.schema` types (nothing is
-  re-inferred): an expose with no declared schema is refused before anything is written
+  re-inferred; `float` is a double): an expose with no declared schema is refused before anything is written
   (`incremental_append_json_needs_schema`), as are a column type with no DuckDB equivalent
   (`incremental_append_json_unmapped_type`) and a landed or already stored column the schema does
   not declare (`incremental_append_json_undeclared_column`).

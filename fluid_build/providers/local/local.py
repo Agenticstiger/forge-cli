@@ -609,12 +609,31 @@ class LocalProvider(BaseProvider):
             self._declare_run_io(a for a in norm_actions if isinstance(a, dict))
             results: List[Dict[str, Any]] = []
             error_count = 0
+            failed_builds: set = set()  # builds whose stage failed: their later stages do not run
             for idx, action in enumerate(norm_actions):
+                build_key = self._stage_build(action)
+                if build_key is not None and build_key in failed_builds:
+                    self._log_warn(
+                        "local_stage_skipped",
+                        {"i": idx, "build": build_key, "reason": "earlier_stage_failed"},
+                    )
+                    results.append(
+                        {
+                            "i": idx,
+                            "status": "ok",
+                            "skipped": True,
+                            "reason": "earlier_stage_failed",
+                            "build": build_key,
+                        }
+                    )
+                    continue
                 try:
                     res = self._execute_action(idx, action)
                     results.append({"i": idx, "status": "ok", **res})
                 except Exception as e:
                     error_count += 1
+                    if build_key is not None:
+                        failed_builds.add(build_key)
                     # The error text can carry a value the SQL was templated with
                     # (``CAST('{{ env.X }}' AS INTEGER)`` echoes X's value), and the
                     # result is printed by the build runner and appended to
@@ -837,36 +856,12 @@ class LocalProvider(BaseProvider):
         local engine cannot run (:func:`~.planner.ordered_stages`), and an expose
         the build names that no stage produces (``local_plan_invalid``).
         """
-        from fluid_build._errors import doc_url
         from fluid_build.util.contract import build_output_exposes, get_expose_id
 
-        from .planner import LocalPlanError, ordered_stages
+        from .planner import validate_stage_build
 
-        stages = ordered_stages(build)
+        stages = validate_stage_build(contract, build)
         exposes = build_output_exposes(contract, build)
-        produced = {t for stage in stages for t in stage.tables}
-        missing = [str(get_expose_id(e)) for e in exposes if str(get_expose_id(e)) not in produced]
-        if missing:
-            build_id = build.get("id") or "?"
-            raise LocalPlanError(
-                code="local_plan_invalid",
-                what=(
-                    f"build {build_id!r} names the expose(s) {', '.join(map(repr, missing))} "
-                    "in outputs, and no stage produces them; nothing was written"
-                ),
-                why=(
-                    "An expose lands from the stage output of its own name, and a stage "
-                    "output of that name does not exist."
-                ),
-                fix=f"List {', '.join(missing)} in the outputs of the stage that produces it.",
-                doc=doc_url(),
-                extras={"buildId": str(build_id), "exposeIds": missing},
-            )
-        if not exposes:
-            self._log_warn(
-                "local_stages_land_nothing",
-                {"build": build.get("id"), "reason": "no stage output is the id of an expose"},
-            )
         by_table: Dict[str, List[Dict[str, Any]]] = {}
         for expose in exposes:
             by_table.setdefault(str(get_expose_id(expose)), []).append(expose)
@@ -876,6 +871,7 @@ class LocalProvider(BaseProvider):
             return [spec for spec in found if spec is not None]
 
         inputs_spec = self._param_inputs_spec(build.get("properties") or {})
+        build_key = str(build.get("id") or "?")
         actions: List[Dict[str, Any]] = []
         for stage in stages:
             first = stage.tables[0]
@@ -888,6 +884,7 @@ class LocalProvider(BaseProvider):
                     "output_table": first,
                     "preview": False,
                     "stage": stage.name,
+                    "build": build_key,
                 }
             )
             for extra in stage.tables[1:]:  # the other outputs are copies of the first
@@ -900,6 +897,7 @@ class LocalProvider(BaseProvider):
                         "output_table": extra,
                         "preview": False,
                         "stage": stage.name,
+                        "build": build_key,
                     }
                 )
         return actions
@@ -929,11 +927,24 @@ class LocalProvider(BaseProvider):
             return spec
         binding = expose.get("binding") or {}
         loc = binding.get("location") or expose.get("location") or {}
-        if loc.get("path"):
-            return None
+        if loc.get("path") or str(binding.get("platform") or "").strip().lower() not in {
+            "",
+            "local",
+        }:
+            return None  # another platform's: never a local file of that name
         fmt = str(binding.get("format") or expose.get("format") or "").lower()
         ext = "parquet" if fmt in {"parquet", "pq"} else "csv"
         return {"path": f"runtime/out/{expose.get('exposeId')}.{ext}", "format": ext}
+
+    @staticmethod
+    def _stage_build(action: Any) -> Optional[str]:
+        """The build a stage action belongs to (``build`` beside ``stage``), else ``None``."""
+        if not isinstance(action, dict):
+            return None
+        flat = {**(action.get("payload") or {}), **action}
+        if flat.get("stage") is None or flat.get("build") is None:
+            return None
+        return str(flat["build"])
 
     def _expose_output_spec(
         self, contract: Dict[str, Any], expose: Dict[str, Any], *, first: bool
