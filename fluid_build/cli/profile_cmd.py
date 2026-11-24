@@ -158,7 +158,10 @@ A request of format 1-2-0 may also ask for more, each exact and under the same c
     that reaches no parent is in no group. Each listed item the profile does not answer is named in the report
 with its reason (for example a histogram over a number with no declared range,
 quantiles beside a histogram on one set of bins, a mean of a timestamp, a key
-column of a counted relationship). A listed fact, a rule of the contract's
+column of a counted relationship). A table's date pairs and calendar, a workload,
+a relationship's dates and exposure, and the consumers' queries are not formed: each
+is named under Not measured, and with --strict such a request is refused before any
+record is read. A listed fact, a rule of the contract's
 invariants, is measured on the table's records as the share of the rows it covers
 that satisfy it: two counts (the rows that do not, the rows that do) that pass the
 checks as cells do, and either withheld withholds both (format 1-2-0, the
@@ -311,6 +314,16 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
             "records alone and states no rowFloor"
         ),
     )
+    p.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "refuse a --request that asks for a kind of statistic fluid profile does not form "
+            "(a table's date pairs or calendar, a workload, a relationship's dates or "
+            "exposure, a consumer query), before any record is read; without it each such "
+            "ask is named under Not measured"
+        ),
+    )
     p.add_argument("--env", help="environment overlay to apply to the contract first")
     from fluid_build.cli import _profile_release
 
@@ -360,6 +373,16 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Profile the expose and write the document; return the exit code."""
     from fluid_build.cli import _profile_release
 
+    if getattr(args, "strict", False) and getattr(args, "request", None) is None:
+        raise _refusal(
+            "profile_strict_needs_request",
+            "--strict refuses a request that asks for what fluid profile does not form, and "
+            "--request names none",
+            {
+                "read": "nothing: no record was read",
+                "next": "give --request, or leave --strict out",
+            },
+        )
     if _profile_release.wanted(args):
         return _profile_release.run(args, logger)
     from fluid_build._console import cprint_literal
@@ -407,6 +430,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 validate_cli_path(request_file, mode="read", file_type="request"), backend
             )
             digest_matched = asked_for.check_contract_file(contract_path, asked, backend)
+            if getattr(args, "strict", False):
+                asked_for.refuse_unformed(asked)
         except (runner.ProfileError, _stats.StatisticsUnavailable) as exc:
             raise _as_refusal(exc, args.source) from None
     contract = load_contract_with_overlay(str(contract_path), args.env, logger)

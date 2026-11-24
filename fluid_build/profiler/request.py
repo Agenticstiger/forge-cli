@@ -33,7 +33,7 @@ import os
 import stat
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fluid_build.profiler import runner
 from fluid_build.profiler._stats import (
@@ -56,9 +56,11 @@ __all__ = [
     "filter_block",
     "not_measured",
     "read_request_file",
+    "refuse_unformed",
     "relationship_asks",
     "relationship_filter",
     "restrict_plan",
+    "unformed",
 ]
 
 #: The most a request may hold: the reader's own bound of 8 MiB of characters, and a margin
@@ -72,6 +74,19 @@ _NOT_MEASURED_RELATIONSHIP = (
 )
 _KEY_COLUMN = "a key column of a counted relationship, which its children per parent describe"
 _NO_RECORD = "no non-null record to form it over"
+
+#: Why each kind of ask that ``fluid profile`` does not form is left out. The request's
+#: reader holds every ask of its format, so none is dropped without a word: each is named
+#: with one of these reasons (:func:`unformed`), and ``--strict`` refuses a request that
+#: holds one.
+NO_DATE_PAIRS = "fluid profile does not form a table's date pairs"
+NO_CALENDAR = "fluid profile does not form a calendar"
+NO_WORKLOAD = (
+    "a workload weighs the column sets a private release may join, and this profile joins none"
+)
+NO_DATES = "fluid profile does not form a relationship's dates"
+NO_EXPOSURE = "fluid profile does not form a relationship's exposure"
+NO_QUERIES = "fluid profile runs no consumer query"
 
 
 def _refuse(event: str, message: str, next_step: str) -> ProfileError:
@@ -371,6 +386,68 @@ def _spelled(link: RequestRelationship) -> str:
     )
 
 
+def unformed(request: Request, *, workload: str = NO_WORKLOAD) -> List[Tuple[str, str]]:
+    """Each ask of *request* of a kind ``fluid profile`` does not form, with why: ``(what, reason)``.
+
+    Decided from the request alone, before any record is read: a table's date pairs, a
+    calendar column, a workload entry, a relationship's dates and exposure, and a consumer
+    query. *workload* is the reason a workload entry is not used, which a private release
+    words its own way. Never a value: only tables, columns, names and reasons.
+    """
+    found: List[Tuple[str, str]] = []
+    for table in request.tables:
+        for pair in table.date_pairs:
+            found.append(
+                (f"date pair {pair.start} to {pair.end} of {table.expose_id}", NO_DATE_PAIRS)
+            )
+        for column in table.calendar:
+            found.append((f"calendar of {table.expose_id}.{column}", NO_CALENDAR))
+        for entry in table.workload:
+            found.append((f"workload {', '.join(entry.columns)} of {table.expose_id}", workload))
+    for link in request.relationships:
+        for dates in link.dates:
+            found.append(
+                (
+                    f"dates {link.parent.table}.{dates.parent} to {link.child.table}.{dates.child} "
+                    f"of {_spelled(link)}",
+                    NO_DATES,
+                )
+            )
+        for exposure in link.exposure:
+            span = exposure.start if exposure.end is None else f"{exposure.start} to {exposure.end}"
+            found.append((f"exposure {link.parent.table}.{span} of {_spelled(link)}", NO_EXPOSURE))
+    for name in request.queries:
+        found.append((f"query {name}", NO_QUERIES))
+    return found
+
+
+def refuse_unformed(request: Request) -> None:
+    """``--strict``: refuse *request* when it asks for anything :func:`unformed` names.
+
+    Raised before any record is read, so the refusal says nothing about the records. The
+    message counts the asks and its context names each, grouped by its reason.
+    """
+    found = unformed(request)
+    if not found:
+        return
+    by_reason: Dict[str, List[str]] = {}
+    for what, reason in found:
+        by_reason.setdefault(reason, []).append(what)
+    raise ProfileError(
+        "profile_request_not_formed",
+        f"--strict: the request asks for {len(found)} item{'' if len(found) == 1 else 's'} "
+        "fluid profile does not form",
+        {
+            **{reason: "; ".join(items) for reason, items in by_reason.items()},
+            "read": "nothing: no record was read",
+            "next": (
+                "leave --strict out to profile what fluid profile forms, with each of these "
+                "named under Not measured, or write the request without them"
+            ),
+        },
+    )
+
+
 def not_measured(
     request: Request,
     *,
@@ -450,6 +527,7 @@ def not_measured(
                         _NOT_MEASURED_RELATIONSHIP,
                     )
                 )
+    found.extend(unformed(request))
     return found
 
 

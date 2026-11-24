@@ -18,6 +18,7 @@ fluxsim_init_took`` pins that forge computes the same one.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -28,9 +29,13 @@ from fluid_build.profiler import request as asked_for
 from fluid_build.profiler._stats import (
     Request,
     RequestColumn,
+    RequestDateLink,
+    RequestDatePair,
     RequestEnd,
+    RequestExposure,
     RequestRelationship,
     RequestTable,
+    RequestWorkload,
     load_backend,
 )
 from fluid_build.profiler.runner import ExposeSource, ProfileError, profile_exposes
@@ -226,6 +231,129 @@ def test_a_listed_relationship_the_contract_does_not_declare_is_reported_not_ref
     assert "relationships" not in result.document
     ((what, reason),) = result.not_measured
     assert "children per parent" in what and "declares no such relationship" in reason
+
+
+def _with_asks(text):
+    """The fixture request in format 1-1-0, also asking a calendar of orders and one query."""
+    text = text.replace("/profile-request/1-0-0/", "/profile-request/1-1-0/")
+    marker = '    "rowCount": true\n"relationships":'
+    assert text.count(marker) == 1
+    text = text.replace(
+        marker, '    "rowCount": true\n    "calendar":\n      - "placed_at"\n"relationships":'
+    )
+    return text + (
+        '"queries":\n'
+        '  - "name": "paid_orders"\n'
+        '    "sql": "SELECT order_id FROM orders WHERE paid"\n'
+        '    "unit":\n'
+        '      "table": "orders"\n'
+    )
+
+
+def test_the_reader_keeps_every_ask_of_the_request_format(workspace):
+    asked = FakeBackend().read_request(_with_asks(REQUEST), name="asks.yml")
+    assert asked.table("orders").calendar == ("placed_at",)
+    assert asked.table("customers").calendar == ()
+    # A query is kept by its name alone: its text is the consumers', and never kept.
+    assert asked.queries == ("paid_orders",)
+    assert "SELECT" not in repr(asked)
+
+
+def test_every_ask_fluid_profile_does_not_form_is_named_with_its_reason():
+    asked = Request(
+        contract_digest=None,
+        fractional_bits=16,
+        tables=(
+            RequestTable(
+                "orders",
+                False,
+                (RequestColumn("placed_at", "timestamp"), RequestColumn("status", "category")),
+                date_pairs=(RequestDatePair("placed_at", "shipped_at"),),
+                calendar=("placed_at",),
+                workload=(RequestWorkload(("status",), 3),),
+            ),
+        ),
+        relationships=(
+            RequestRelationship(
+                RequestEnd("customers", ("customer_id",)),
+                RequestEnd("orders", ("customer_id",)),
+                ("marginalHistogram/1",),
+                dates=(RequestDateLink("joined_at", "placed_at"),),
+                exposure=(
+                    RequestExposure("joined_at", "left_at"),
+                    RequestExposure("joined_at"),
+                ),
+            ),
+        ),
+        queries=("paid_orders",),
+    )
+    link = "orders(customer_id) to customers(customer_id)"
+    assert asked_for.unformed(asked) == [
+        ("date pair placed_at to shipped_at of orders", asked_for.NO_DATE_PAIRS),
+        ("calendar of orders.placed_at", asked_for.NO_CALENDAR),
+        ("workload status of orders", asked_for.NO_WORKLOAD),
+        (f"dates customers.joined_at to orders.placed_at of {link}", asked_for.NO_DATES),
+        (f"exposure customers.joined_at to left_at of {link}", asked_for.NO_EXPOSURE),
+        (f"exposure customers.joined_at of {link}", asked_for.NO_EXPOSURE),
+        ("query paid_orders", asked_for.NO_QUERIES),
+    ]
+    assert asked_for.unformed(replace(asked, tables=(), relationships=(), queries=())) == []
+
+
+def test_a_profile_names_what_it_does_not_form_and_holds_none_of_it(workspace):
+    asked = FakeBackend().read_request(_with_asks(REQUEST), name="asks.yml")
+    result = _profile(workspace, asked)
+    said = dict(result.not_measured)
+    assert said["calendar of orders.placed_at"] == asked_for.NO_CALENDAR
+    assert said["query paid_orders"] == asked_for.NO_QUERIES
+    assert "queries" not in result.document
+    assert "calendar" not in result.document["tables"]["orders"]
+    # The rest of the request is answered as it was without the asks.
+    without = _profile(workspace, _asked(workspace))
+    assert result.document["tables"] == without.document["tables"]
+    assert [each for each in result.not_measured if each not in without.not_measured] == [
+        ("calendar of orders.placed_at", asked_for.NO_CALENDAR),
+        ("query paid_orders", asked_for.NO_QUERIES),
+    ]
+
+
+def test_the_cli_names_each_ask_it_does_not_form(workspace, registry, capsys):
+    (workspace / "asks.yml").write_text(_with_asks(REQUEST), encoding="utf-8")
+    rc = main(_argv("--out", "p.json", request="asks.yml"))
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert (
+        "Not measured: calendar of orders.placed_at: fluid profile does not form a calendar." in out
+    )
+    assert "Not measured: query paid_orders: fluid profile runs no consumer query." in out
+    assert "SELECT" not in out
+
+
+def test_strict_refuses_a_request_with_an_ask_it_does_not_form_before_a_read(
+    workspace, registry, capsys
+):
+    (workspace / "asks.yml").write_text(_with_asks(REQUEST), encoding="utf-8")
+    (workspace / "orders.ndjson").unlink()  # a read would be a different refusal
+    out = _refused(
+        capsys,
+        _argv("--strict", "--out", "p.json", request="asks.yml"),
+        "profile_request_not_formed",
+    )
+    assert "asks for 2 items fluid profile does not form" in out
+    assert "calendar of orders.placed_at" in out and "query paid_orders" in out
+    assert "no record was read" in out and "SELECT" not in out
+    assert not (workspace / "p.json").exists()
+
+
+def test_strict_accepts_a_request_that_asks_only_for_what_it_forms(workspace, registry, capsys):
+    rc = main(_argv("--strict", "--out", "p.json"))
+    assert rc == 0, capsys.readouterr().out
+    assert (workspace / "p.json").is_file()
+
+
+def test_strict_needs_a_request(workspace, registry, capsys):
+    argv = ["profile", "shop.fluid.yaml", "--expose", "orders", "--source", "orders.ndjson"]
+    _refused(capsys, [*argv, "--strict"], "profile_strict_needs_request")
 
 
 def test_the_document_reads_back_and_follows_its_content(workspace):

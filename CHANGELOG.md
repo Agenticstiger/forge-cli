@@ -110,6 +110,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid profile --request` names every ask it does not form.** A profile request can ask for a
+  table's date pairs and calendar, a workload, a relationship's dates and exposure, and the
+  consumers' queries. The request was read whole and the asks it did not form were dropped without
+  a word: the profile held none of them and the report did not say so. An ask the profile does not
+  form is now named under "Not measured" (and "Not released" for `--privacy-unit`), with its reason. `--strict` refuses such a request
+  before any record is read, naming each ask; without `--request`, `--strict` is refused. A
+  query is named, never printed: its text is not kept.
 - **A contract's digest covers its `$ref` fragments.** `fluid contract digest` and the federation
   gate's git backend hashed the root file alone, so editing a fragment of a split contract
   (`fragments/exposes/*.yaml`, written by `fluid split`) left the digest, and so every

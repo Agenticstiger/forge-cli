@@ -72,13 +72,17 @@ __all__ = [
     "ReadRefused",
     "Request",
     "RequestColumn",
+    "RequestDateLink",
+    "RequestDatePair",
     "RequestEnd",
+    "RequestExposure",
     "RequestFact",
     "RequestLinked",
     "RequestRankCorrelation",
     "RequestRefused",
     "RequestRelationship",
     "RequestTable",
+    "RequestWorkload",
     "StatisticDefinition",
     "StatisticsBackend",
     "StatisticsUnavailable",
@@ -190,12 +194,31 @@ class RequestRankCorrelation:
 
 
 @dataclass(frozen=True)
+class RequestDatePair:
+    """Two timestamp columns of one table: the days from ``start`` to ``end`` are asked for."""
+
+    start: str
+    end: str
+
+
+@dataclass(frozen=True)
+class RequestWorkload:
+    """Category columns of one table that the consumers' queries read together, and how many do."""
+
+    columns: Tuple[str, ...]
+    weight: int
+
+
+@dataclass(frozen=True)
 class RequestTable:
     """One table (an exposeId) a request lists, whether it asks the row count, and its columns.
 
-    ``rank_correlations`` and ``clique_columns`` are the additions of request format 1-2-0:
-    the rank correlations asked of the table's column pairs, and the columns a profile may
-    relate in pairs or cliques.
+    ``date_pairs``, ``calendar`` and ``workload`` are additions of request format 1-1-0: the
+    pairs of timestamp columns whose days apart are asked for, the timestamp columns whose
+    values are asked by month, day of week and hour of week, and the column sets the
+    consumers' queries read together. ``rank_correlations`` and ``clique_columns`` are the
+    additions of format 1-2-0: the rank correlations asked of the table's column pairs, and
+    the columns a profile may relate in pairs or cliques.
     """
 
     expose_id: str
@@ -203,6 +226,9 @@ class RequestTable:
     columns: Tuple[RequestColumn, ...]
     rank_correlations: Tuple[RequestRankCorrelation, ...] = ()
     clique_columns: Tuple[str, ...] = ()
+    date_pairs: Tuple[RequestDatePair, ...] = ()
+    calendar: Tuple[str, ...] = ()
+    workload: Tuple[RequestWorkload, ...] = ()
 
     def column(self, name: str) -> Optional[RequestColumn]:
         return next((each for each in self.columns if each.name == name), None)
@@ -225,9 +251,27 @@ class RequestLinked:
 
 
 @dataclass(frozen=True)
+class RequestDateLink:
+    """A timestamp column of a relationship's parent and one of its child, asked days apart."""
+
+    parent: str
+    child: str
+
+
+@dataclass(frozen=True)
+class RequestExposure:
+    """The columns that bound a parent row's active days, over which its children are asked."""
+
+    start: str
+    end: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class RequestRelationship:
     """A listed relationship: the statistics asked over each parent's number of children.
 
+    ``dates`` and ``exposure`` are additions of request format 1-1-0: the parent and child
+    dates asked days apart, and the parent lifetimes asked as children per active day.
     ``group_by`` are the parent columns the statistics are asked grouped by and ``linked``
     the child columns asked grouped by a parent column (request format 1-2-0).
     """
@@ -237,6 +281,8 @@ class RequestRelationship:
     statistics: Tuple[str, ...]
     group_by: Tuple[str, ...] = ()
     linked: Tuple[RequestLinked, ...] = ()
+    dates: Tuple[RequestDateLink, ...] = ()
+    exposure: Tuple[RequestExposure, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -252,7 +298,8 @@ class RequestFact:
 class Request:
     """A profile request as the registry reads it: what a profile may measure and publish.
 
-    ``contract_digest`` is ``None`` when the request names none.
+    ``contract_digest`` is ``None`` when the request names none. ``queries`` are the names of
+    the consumers' queries a request of format 1-1-0 asks a rate of; their text is not kept.
     """
 
     contract_digest: Optional[str]
@@ -260,6 +307,7 @@ class Request:
     tables: Tuple[RequestTable, ...]
     relationships: Tuple[RequestRelationship, ...] = ()
     facts: Tuple[RequestFact, ...] = ()
+    queries: Tuple[str, ...] = ()
 
     def table(self, expose_id: str) -> Optional[RequestTable]:
         return next((each for each in self.tables if each.expose_id == expose_id), None)
@@ -879,6 +927,15 @@ class _FluxStatsBackend:
                         for each in _asked(table, "rank_correlations")
                     ),
                     clique_columns=tuple(_asked(table, "clique_columns")),
+                    date_pairs=tuple(
+                        RequestDatePair(each.start, each.end)
+                        for each in _asked(table, "date_pairs")
+                    ),
+                    calendar=tuple(_asked(table, "calendar")),
+                    workload=tuple(
+                        RequestWorkload(tuple(each.columns), each.weight)
+                        for each in _asked(table, "workload")
+                    ),
                 )
                 for table in asked.tables
             ),
@@ -892,10 +949,19 @@ class _FluxStatsBackend:
                         RequestLinked(each.column, each.parent_column)
                         for each in _asked(link, "linked")
                     ),
+                    dates=tuple(
+                        RequestDateLink(each.parent, each.child) for each in _asked(link, "dates")
+                    ),
+                    exposure=tuple(
+                        RequestExposure(each.start, each.end) for each in _asked(link, "exposure")
+                    ),
                 )
                 for link in asked.relationships
             ),
             facts=tuple(RequestFact(fact.name, fact.table, fact.rule) for fact in asked.facts),
+            # The name of each consumer query alone: its text is the consumers', and this
+            # profile neither checks nor runs it.
+            queries=tuple(query.name for query in _asked(asked, "queries")),
         )
 
     def contract_digest(self, text: str, *, name: str) -> str:
@@ -1408,9 +1474,10 @@ def _unavailable(error: ImportError) -> StatisticsUnavailable:
 def _asked(owner: Any, name: str) -> Tuple[Any, ...]:
     """What a request reader holds under ``name``, or nothing.
 
-    The 1-2-0 asks (rank correlations, clique columns, grouping and linked statistics)
-    exist only on a reader from flux-stats 0.11; an earlier reader's objects lack them, and
-    a request it accepts holds none.
+    The asks a request format adds (in 1-1-0 date pairs, a calendar, a workload, a
+    relationship's dates and exposure, and queries; in 1-2-0 rank correlations, clique
+    columns, grouping and linked statistics) exist only on a reader of that format; an
+    earlier reader's objects lack them, and a request it accepts holds none.
     """
     held = getattr(owner, name, None)
     return () if held is None else tuple(held)

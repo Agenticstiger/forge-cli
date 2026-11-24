@@ -171,6 +171,22 @@ def test_a_follows_release_is_accepted_by_the_reader_and_every_noise_block_is_in
     assert "squared L2 sensitivity 18 for one unit" in out
 
 
+def test_a_follows_release_names_an_ask_fluid_profile_does_not_form(workspace, registry, capsys):
+    asked = yaml.safe_load((workspace / "billing.profile-request.yml").read_text("utf-8"))
+    asked["queries"] = [
+        {
+            "name": "large_quantities",
+            "sql": "SELECT qty FROM invoice",
+            "unit": {"table": "invoice"},
+        }
+    ]
+    (workspace / "billing.profile-request.yml").write_text(yaml.safe_dump(asked), encoding="utf-8")
+    assert main(_argv()) == 0
+    out = _out(capsys)
+    assert "Not released (fluid profile runs no consumer query): query large_quantities." in out
+    assert "SELECT" not in out
+
+
 def test_without_follow_the_release_names_no_follows_and_keeps_its_bytes(workspace, registry):
     # a release with no --follow is the release it was: the format and the unit do not change
     asked = yaml.safe_load((workspace / "billing.profile-request.yml").read_text("utf-8"))
