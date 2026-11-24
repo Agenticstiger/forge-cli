@@ -306,7 +306,8 @@ def _authority_end(text: str, start: int) -> int:
 
 def _hosts_of(authority: str) -> List[str]:
     """Every host an authority (or a bare host field) names: userinfo and port dropped, a
-    comma list split, lower-cased. MongoDB and libpq take several and may use any of them."""
+    comma list split, lower-cased, blank elements left out (libpq reads one as its default host).
+    MongoDB and libpq take several and may use any of them."""
     hosts: List[str] = []
     for piece in authority.rpartition("@")[2].split(","):
         piece = piece.strip()
@@ -314,7 +315,9 @@ def _hosts_of(authority: str) -> List[str]:
             host = piece[1:].partition("]")[0]
         else:
             host = piece.partition(":")[0]
-        hosts.append(host.strip().lower().rstrip("."))
+        host = host.strip().lower().rstrip(".")
+        if host:
+            hosts.append(host)
     return hosts
 
 
@@ -475,14 +478,14 @@ def _split_authority(authority: str) -> Tuple[str, str, str]:
     return userinfo, hostname, port
 
 
-def _hosts_named_by(value: str) -> Optional[List[str]]:
+def _hosts_named_by(value: str, key: Any = "") -> Optional[List[str]]:
     """The hosts ``value`` names when a field holds it whole, as the contract would have written
     it: ``None`` when it names none, a path or a store a literal field passes in the same way."""
     url = _URL_START.match(value)
     if url is not None and _control_free(value[: url.end() - 3]).lower() in _STORE_SCHEMES:
         return None
     if url is None:
-        kept = _without_paths(value)
+        kept = _without_paths(value, listed=_lists_hosts(key))
         if kept is None:
             return None  # a path, or a list of them
         value = kept
@@ -528,11 +531,8 @@ def check_host_templates(
             return
         if url is not None and _control_free(text[: url.end() - 3]).lower() in _STORE_SCHEMES:
             return  # a bucket or a container of a store the engine is configured for, not a server
-        if url is None:
-            kept = _without_paths(text)
-            if kept is None:
-                return  # a path (a REST stream's ``endpoint: /v1/users``), not an address
-            text = kept  # a socket directory beside a host is a list: the host is judged
+        if url is None and _is_path(text, listed=_lists_hosts(key)):
+            return  # a path (a REST stream's ``endpoint: /v1/users``), not an address
         for raw in ENV_TEMPLATE_RE.findall(text):
             name = raw.strip()
             if is_sensitive_key_name(name):
@@ -564,7 +564,7 @@ def check_host_templates(
         if project_host is not None and _is_one_template(text.strip()):
             # The field is nothing but that variable, so the project's value is the field. It is
             # judged as the text a contract would have written there: a path or a store names no host.
-            named = _hosts_named_by(env[project_host])
+            named = _hosts_named_by(env[project_host], key)
             if named is None:
                 return
             hosts = named
@@ -697,23 +697,37 @@ def _is_one_path(element: str) -> bool:
     return element.startswith("/") and not element.startswith("//") and "://" not in element
 
 
+#: The fields libpq reads as a comma list of hosts and socket directories: ``host: /sockdir,attacker.example``
+#: is a socket directory and then a TCP host that gets the password. No other field is such a list,
+#: and a file or a REST path may hold a comma (``/data/a,b.csv``).
+_HOST_LIST_FIELDS = frozenset({"host", "hostaddr"})
+
+
+def _lists_hosts(key: Any) -> bool:
+    """Whether field ``key`` is one libpq reads as a list of hosts (:data:`_HOST_LIST_FIELDS`)."""
+    return str(key).strip().lower() in _HOST_LIST_FIELDS
+
+
 def _elements(text: str) -> List[str]:
     """The elements of the comma list ``text``, stripped and not blank."""
     return [part.strip() for part in text.split(",") if part.strip()]
 
 
-def _is_path(text: str) -> bool:
-    """Whether ``text`` is a path, or a list of nothing but paths. libpq reads ``host`` as a list:
-    ``/sockdir,attacker.example`` is a socket directory and then a TCP host that gets the password, so a
-    path in one element hides no host in another."""
+def _is_path(text: str, *, listed: bool = False) -> bool:
+    """Whether ``text`` is a path. In a field libpq reads as a list (``listed``) a value is one only
+    when every element of its comma list is: a path in one element hides no host in another."""
+    if not listed:
+        return _is_one_path(text.strip())
     elements = _elements(text)
     return bool(elements) and all(_is_one_path(element) for element in elements)
 
 
-def _without_paths(text: str) -> Optional[str]:
-    """``text`` without the path elements of its comma list: ``text`` itself when it holds none,
-    ``None`` when nothing but paths is left, else the elements that name a host, joined with ``,``.
-    """
+def _without_paths(text: str, *, listed: bool) -> Optional[str]:
+    """``text`` without the path elements of its list (``listed``: :func:`_is_path`): ``text`` itself
+    when it holds none, ``None`` when nothing but paths is left, else the elements that name a
+    host, joined with ``,``."""
+    if not listed:
+        return None if _is_one_path(text.strip()) else text
     elements = _elements(text)
     kept = [element for element in elements if not _is_one_path(element)]
     if not elements or len(kept) == len(elements):
@@ -748,7 +762,7 @@ def _host_variable(text: str) -> Optional[str]:
     return _whole_variable(hostname)
 
 
-def _rendered_endpoint(text: str, env: Mapping[str, str]) -> Any:
+def _rendered_endpoint(text: str, env: Mapping[str, str], key: Any = "") -> Any:
     """An endpoint field as the secret policy should judge it: its variables rendered, except a
     host that is one whole variable of the operator's, which stands as ``localhost``: the
     operator chose that address and the contract only named the variable
@@ -775,7 +789,7 @@ def _rendered_endpoint(text: str, env: Mapping[str, str]) -> Any:
                 elif end == len(text):
                     return "localhost"
         text = ENV_TEMPLATE_RE.sub(lambda match: env[match.group(1).strip()], text)
-    kept = _without_paths(text)
+    kept = _without_paths(text, listed=_lists_hosts(key) and _URL_START.match(text) is None)
     return _NOT_AN_ENDPOINT if kept is None else kept
 
 
@@ -785,7 +799,9 @@ def _rendered_endpoint(text: str, env: Mapping[str, str]) -> Any:
 _ADDRESS_KEY = re.compile(r"(?:host|hostname|server|broker|address|endpoint|url|uri)s?$|account$")
 
 
-def _names_an_address(text: str, unjudged_schemes: Any, env: Mapping[str, str]) -> bool:
+def _names_an_address(
+    text: str, unjudged_schemes: Any, env: Mapping[str, str], key: Any = ""
+) -> bool:
     """Whether ``text`` may be an address: not blank, not a path, not one whole variable of the
     operator's (their choice), and not a store or a local file (``s3://bucket``, ``sqlite:///x``).
     A variable a project dotenv file supplied is the project's choice, so what it holds is judged.
@@ -796,9 +812,9 @@ def _names_an_address(text: str, unjudged_schemes: Any, env: Mapping[str, str]) 
         if not _project_supplied(name, env):
             return False
         body = str(env.get(name) or "").strip()  # the project's value: judged as the text it holds
-    if not body or _is_path(body):
-        return False
     url = _URL_START.match(body)
+    if not body or _is_path(body, listed=_lists_hosts(key) and url is None):
+        return False
     return url is None or _control_free(body[: url.end() - 3]).lower() not in unjudged_schemes
 
 
@@ -829,7 +845,7 @@ def _unread_addresses(
                 else []
             )
         )
-        if any(_names_an_address(text, _UNJUDGED_SCHEMES, env) for text in texts):
+        if any(_names_an_address(text, _UNJUDGED_SCHEMES, env, key) for text in texts):
             found.append(str(key))
     return found
 
@@ -873,7 +889,8 @@ def _endpoint_view(
         leaf = _value_at(block, path)
         if not isinstance(leaf, str):
             continue
-        text = _rendered_endpoint(leaf, env)
+        field = next((part for part in reversed(path) if isinstance(part, str)), "")
+        text = _rendered_endpoint(leaf, env, field)
         if text is None:
             return None, unread
         if path in tunnels and _operators_choice(leaf, env):

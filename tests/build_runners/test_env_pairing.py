@@ -1629,12 +1629,15 @@ def test_a_socket_directory_alone_or_beside_this_machine_needs_no_pairing(host):
 
 
 @pytest.mark.parametrize(
-    "dotenv_value, host",
-    [("/tmp,attacker.example", "{{ env.ZZZ }}"), ("attacker.example", "/tmp,{{ env.ZZZ }}")],
+    "dotenv_value, host, says_so",
+    [
+        ("/tmp,attacker.example", "{{ env.ZZZ }}", True),
+        ("attacker.example", "/tmp,{{ env.ZZZ }}", False),  # a list, not one whole variable
+    ],
     ids=["the whole host", "beside a socket directory"],
 )
 def test_a_project_dotenv_cannot_hide_a_host_behind_a_socket_directory(
-    dotenv_value, host, project: Path, monkeypatch
+    dotenv_value, host, says_so, project: Path, monkeypatch
 ):
     """The project's file supplies the list, or the host beside the socket directory."""
     _hydrate(project, f"ZZZ={dotenv_value}\n")
@@ -1646,7 +1649,7 @@ def test_a_project_dotenv_cannot_hide_a_host_behind_a_socket_directory(
 
     with pytest.raises(EnvTemplateError) as info:
         both()
-    assert info.value.extras["origin"] == "project-dotenv"
+    assert ("origin" in info.value.extras) is says_so
     assert "attacker.example" not in repr(info.value.__dict__) + str(info.value)
     monkeypatch.setenv(SECRET_REF_ALLOWLIST, "ZZZ@attacker.example,DB_PW@attacker.example")
     both()
@@ -1665,10 +1668,56 @@ def test_an_operators_host_beside_a_socket_directory_is_paired_like_any_other(mo
 def test_the_hosts_a_project_value_names_leave_out_its_socket_directories():
     from fluid_build.util.env_templates import _hosts_named_by
 
-    assert _hosts_named_by("/tmp,attacker.example") == ["attacker.example"]
-    assert _hosts_named_by("attacker.example,/tmp") == ["attacker.example"]
-    assert _hosts_named_by("/var/run/postgresql") is None
-    assert _hosts_named_by("/a,/b") is None
+    assert _hosts_named_by("/tmp,attacker.example", "host") == ["attacker.example"]
+    assert _hosts_named_by("attacker.example,/tmp", "host") == ["attacker.example"]
+    assert _hosts_named_by("/var/run/postgresql", "host") is None
+    assert _hosts_named_by("/a,/b", "host") is None
+    assert _hosts_named_by("/data/a,b.csv", "uri") is None, "not a field libpq reads as a list"
+
+
+@pytest.mark.parametrize(
+    "connection",
+    [
+        {"uri": "postgresql://localhost/db,/x?host=attacker.example"},
+        {"uri": "postgresql://localhost/db?x=1,/y&host=attacker.example"},
+        {"uri": "postgresql://localhost/db?host=attacker.example"},
+        {"connection_string": "postgresql://localhost/db,/x?host=attacker.example"},
+    ],
+)
+def test_a_url_is_never_split_at_a_comma_so_its_query_host_is_still_judged(connection):
+    """Only a field libpq reads as a host list is split: ``,/`` in a URL ends no element."""
+    contract = _airbyte_contract({**connection, "password": "{{ env.DB_PW }}"})
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    assert info.value.extras["variable"] == "DB_PW"
+
+
+@pytest.mark.parametrize(
+    "connection",
+    [
+        {"uri": "/data/a,b.csv"},
+        {"endpoint": "/v1/items,orders"},
+        {"uri": "/data/a,/data/b.csv"},
+    ],
+)
+def test_a_path_with_a_comma_in_a_field_that_is_no_host_list_is_still_a_path(connection):
+    """A file or a REST path may hold a comma; only ``host`` and ``hostaddr`` are lists."""
+    contract = _airbyte_contract({**connection, "password": "{{ env.DB_PW }}"})
+    check_env_pairing(contract)
+    check_host_templates(contract)
+
+
+@pytest.mark.parametrize("host", ["{{ env.ZZZ }},/s", "/s,{{ env.ZZZ }}"])
+def test_both_checks_refuse_an_operators_variable_in_a_list_with_a_path(host, monkeypatch):
+    """A list is not one whole variable, so the operator's own host in it is paired like any other."""
+    monkeypatch.setenv("ZZZ", "attacker.example")
+    contract = _list_contract(host)
+    with pytest.raises(EnvTemplateError):
+        check_host_templates(contract)
+        check_env_pairing(contract)
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "ZZZ@attacker.example,DB_PW@attacker.example")
+    check_host_templates(contract)
+    check_env_pairing(contract)
 
 
 @pytest.mark.parametrize("engine_name", ["duckdb", "meltano", "airbyte"])
