@@ -126,8 +126,9 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
             ),
             (
                 "--provider <name> (or FLUID_PROVIDER) applies the whole contract with the "
-                "provider you name; the local provider writes a binding it does not serve as "
-                "a placeholder file"
+                "provider you name; the local provider writes no file for a binding it does "
+                "not serve: an expose that none of the builds writes is refused "
+                "(local_plan_invalid), and a contract with no builds lands nothing"
             ),
         ],
         "providers",

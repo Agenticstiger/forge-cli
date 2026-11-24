@@ -601,6 +601,38 @@ def _canonical_run_record(result: Any) -> Dict[str, Any]:
     }
 
 
+# Runners that land ONE expose per build: a build naming no outputs beside several exposes
+# is a guess for them, so it refuses. Debezium and Kafka Connect sinks cover every expose.
+_ONE_EXPOSE_PER_BUILD_RUNNERS = frozenset({"duckdb", "dlt", "airbyte", "meltano"})
+
+
+def _contract_exposes(ctx: Any) -> List[Dict[str, Any]]:
+    return [e for e in ctx.contract.get("exposes") or [] if isinstance(e, dict)]
+
+
+def landed_expose(ctx: Any) -> Dict[str, Any]:
+    """The expose this build lands: the first one its ``outputs`` resolves to.
+
+    ``build_output_exposes`` is the one place that maps a build to its exposes; its typed
+    ``BuildOutputsError`` (``build_output_unknown_expose``, ``build_outputs_undeclared``)
+    propagates. A build the contract does not list, or a contract with no exposes, keeps
+    ``exposes[0]`` (``{}`` when there is none).
+    """
+    from fluid_build.util.contract import build_output_exposes, get_builds
+
+    exposes = _contract_exposes(ctx)
+    build_id = getattr(ctx, "build_id", None)
+    build = next(
+        (b for b in get_builds(ctx.contract) if isinstance(b, dict) and b.get("id") == build_id),
+        None,
+    )
+    if build is not None:
+        resolved = build_output_exposes(ctx.contract, build)
+        if resolved:
+            return resolved[0]
+    return exposes[0] if exposes else {}
+
+
 def enforce_schema_policy_or_raise(ctx: Any, runner: Any) -> None:
     """Apply the schema-evolution decision matrix to ``ctx``'s stream.
 
@@ -631,33 +663,23 @@ def enforce_schema_policy_or_raise(ctx: Any, runner: Any) -> None:
     except Exception:  # pragma: no cover — defensive
         return
 
-    # The baseline is the schema of the expose THIS build lands: the first one its
-    # ``outputs`` resolves to (``build_output_exposes``, which refuses an unknown output or
-    # no outputs beside several exposes with its typed ``BuildOutputsError``).
-    all_exposes = [e for e in ctx.contract.get("exposes") or [] if isinstance(e, dict)]
-    from fluid_build.util.contract import build_output_exposes, get_builds
-
-    build = next(
-        (
-            b
-            for b in get_builds(ctx.contract)
-            if isinstance(b, dict) and b.get("id") == getattr(ctx, "build_id", None)
-        ),
-        None,
-    )
+    # The baseline is the schema of the expose THIS build lands (``landed_expose``).
+    # An output that is no exposeId always refuses; a build with no outputs beside several
+    # exposes refuses for the runners that land one expose per build, while the sinks of
+    # Debezium and Kafka Connect cover every expose of a build that names none, so for
+    # them the first expose stays the schema baseline.
     from fluid_build.util.contract import BuildOutputsError
 
     try:
-        resolved = build_output_exposes(ctx.contract, build) if build is not None else []
+        expose = landed_expose(ctx)
     except BuildOutputsError as exc:
-        # An output that is no exposeId always refuses. A build with no outputs beside
-        # several exposes refuses for the DuckDB runner (it lands one file), but the
-        # streaming runners' sinks legitimately cover every expose of a build that names
-        # none, so for them the first expose stays the schema baseline.
-        if exc.code != "build_outputs_undeclared" or getattr(runner, "name", None) == "duckdb":
+        if (
+            exc.code != "build_outputs_undeclared"
+            or getattr(runner, "name", None) in _ONE_EXPOSE_PER_BUILD_RUNNERS
+        ):
             raise
-        resolved = []
-    expose = resolved[0] if resolved else (all_exposes[0] if all_exposes else {})
+        exposes = _contract_exposes(ctx)
+        expose = exposes[0] if exposes else {}
     contract_block = expose.get("contract") or {}
     declared_schema = contract_block.get("schema") or []
     policy_str = contract_block.get("schemaPolicy") or "evolve_safe"

@@ -56,6 +56,7 @@ from fluid_build.api.runner import (
 from fluid_build.api.schema import SchemaFingerprint
 
 from .._acquisition_common import (
+    landed_expose,
     utc_now_iso,
     write_run_record_and_finalize,
 )
@@ -365,7 +366,7 @@ def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
     # discover the field names rather than hardcoding per-destination
     # factories. binding.platform is the canonical signal of where data
     # is being written.
-    expose = (ctx.contract.get("exposes") or [{}])[0]
+    expose = landed_expose(ctx)
     binding = expose.get("binding") or {}
     dest_platform = binding.get("platform")
     # The environment before the bridge copies anything into dlt's names: a
@@ -486,7 +487,7 @@ def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
     # path is set, fall back to the per-build ``.fluid/dlt/...``
     # workdir so contracts without an explicit binding still produce
     # an inspectable output.
-    expose = (ctx.contract.get("exposes") or [{}])[0]
+    expose = landed_expose(ctx)
     binding_loc = (expose.get("binding") or {}).get("location") or {}
     binding_path = binding_loc.get("path")
 
