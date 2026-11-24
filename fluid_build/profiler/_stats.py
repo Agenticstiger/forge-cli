@@ -1375,9 +1375,9 @@ def load_backend() -> StatisticsBackend:
 #: that file once installed, so the install message repeats it;
 #: ``tests/profiler/test_flux_stats_pin.py`` keeps the two equal.
 #: From 0.9 on flux-stats is versioned by its own formats and API, so the range runs to the
-#: next major. 0.9.0 is the first release that holds ``flux_stats.request``, a boolean read
-#: as a category, and profile format 1-2-0 with ``flux_stats.noise``.
-FLUX_STATS_REQUIREMENT = "flux-stats[yaml]>=0.9,<1"
+#: next major. 0.11.0 is the first release that holds request format 1-2-0, rank correlations,
+#: the follows reach of a release and profile format 1-4-0.
+FLUX_STATS_REQUIREMENT = "flux-stats[yaml]>=0.11,<1"
 #: The extra carries the range, and pip replaces a copy outside it (the 0.0.1
 #: placeholder, or a release newer than this module knows).
 FLUX_STATS_INSTALL_COMMAND = "pip install 'data-product-forge[profile]'"

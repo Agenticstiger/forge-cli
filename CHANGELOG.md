@@ -58,9 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a labelled (`pii` or `restricted`) column of one groups a noisy statistic, which flux-engine grades
   P1. `--follow` is not combined with `--release-table`, `--unit-key` or `--max-rows-per-unit`.
   `--rederive` draws the same release again from the record, which now holds each part.
-- **Profile format 1-4-0 needs flux-stats 0.11.** The `[profile]` extra's requirement will be raised
-  to flux-stats 0.11 when it is on PyPI; until then, install flux-stats from the engine's branch to
-  write or read a 1-4-0 profile.
+- **Profile format 1-4-0 needs flux-stats 0.11.** The `[profile]` extra now asks for
+  `flux-stats[yaml]>=0.11,<1`, the first release that holds rank correlations, the follows reach
+  and profile format 1-4-0.
 
 ## [0.39.0] — 2026-11-23
 

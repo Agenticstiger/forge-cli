@@ -3,8 +3,8 @@
 
 """``fluid profile`` on a flux-stats whose reader predates profile format 1-4-0.
 
-The ``[profile]`` extra accepts flux-stats 0.9 and later. A 0.9 or 0.10 request reader
-returns objects without the 1-2-0 asks, and has no rank correlations or follows reach.
+The ``[profile]`` extra asks for flux-stats 0.11 and later; an environment that kept an
+earlier release still gets a clear answer. A 0.9 or 0.10 request reader returns objects without the 1-2-0 asks, and has no rank correlations or follows reach.
 Both cases run here on stand-ins, so they hold on any installed release: an earlier
 request reads as it always did, and a 1-4-0 feature says what it needs.
 """

@@ -426,12 +426,13 @@ lineage = [
 # fluid_build/profiler/_stats.py imports, and the range runs to the next major.
 # That module repeats the requirement in its install message, and
 # tests/profiler/test_flux_stats_pin.py keeps the two equal.
-# 0.9.0 is the first flux-stats release that holds the profile request reader
-# (flux_stats.request), a boolean read as a category, and profile format 1-2-0
-# with its release under differential privacy (flux_stats.noise).
+# 0.11.0 is the first flux-stats release that holds the profile request reader
+# at format 1-2-0 (flux_stats.request), rank correlations
+# (flux_stats.rank_correlation), the follows reach of a release under differential
+# privacy (flux_stats.noise) and profile format 1-4-0.
 profile = [
   "duckdb>=1.5.0",
-  "flux-stats[yaml]>=0.9,<1",
+  "flux-stats[yaml]>=0.11,<1",
 ]
 
 # ``fluid profile`` releasing a table under differential privacy: the choice of
