@@ -7,9 +7,51 @@
   <properties>
     <maven.compiler.release>17</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <flink.version>1.20.1</flink.version>
+    <flink.version>1.20.4</flink.version>
     <iceberg.version>1.10.0</iceberg.version>
+    <!-- Lowest releases that carry the fixes for the advisories raised against the
+         transitive jars below. The pins live here, not on each consumer, so one
+         edit moves every route to the same jar. -->
+    <jackson.version>2.18.11</jackson.version>
+    <commons-lang3.version>3.18.0</commons-lang3.version>
+    <snappy-java.version>1.1.10.9</snappy-java.version>
+    <lz4-java.version>1.11.4</lz4-java.version>
   </properties>
+  <dependencyManagement>
+    <dependencies>
+      <!-- jackson-core, jackson-databind and jackson-annotations arrive through
+           flink-sql-connector-kafka at 2.15.2; the 2.18 line is the earliest that
+           has fixes for the current advisories. -->
+      <dependency>
+        <groupId>com.fasterxml.jackson</groupId>
+        <artifactId>jackson-bom</artifactId>
+        <version>${jackson.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <!-- Arrives through Flink's table API (3.12.0 before this pin). -->
+      <dependency>
+        <groupId>org.apache.commons</groupId>
+        <artifactId>commons-lang3</artifactId>
+        <version>${commons-lang3.version}</version>
+      </dependency>
+      <!-- Arrives through hadoop-client-* (1.1.8.2 before this pin) and through Flink
+           (1.1.10.4 before this pin). -->
+      <dependency>
+        <groupId>org.xerial.snappy</groupId>
+        <artifactId>snappy-java</artifactId>
+        <version>${snappy-java.version}</version>
+      </dependency>
+      <!-- Arrives through Flink's table API at 1.10.3. The project moved from org.lz4
+           to at.yawk.lz4, so the old coordinate has no fixed release; 1.11.4 is the
+           first at.yawk release with every current fix. -->
+      <dependency>
+        <groupId>at.yawk.lz4</groupId>
+        <artifactId>lz4-java</artifactId>
+        <version>${lz4-java.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
   <dependencies>
     <dependency>
       <groupId>org.apache.hadoop</groupId>
