@@ -291,7 +291,6 @@ def test_every_ask_fluid_profile_does_not_form_is_named_with_its_reason():
     # A public profile forms date pairs, dates and exposure; what it cannot it names once it has
     # read the records, with the reason it has.
     assert asked_for.unformed(asked) == [
-        ("calendar of orders.placed_at", asked_for.NO_CALENDAR),
         ("workload status of orders", asked_for.NO_WORKLOAD),
         ("query paid_orders", asked_for.NO_QUERIES),
     ]
@@ -311,31 +310,40 @@ def test_every_ask_fluid_profile_does_not_form_is_named_with_its_reason():
     )
 
 
-def test_a_profile_names_what_it_does_not_form_and_holds_none_of_it(workspace):
+def test_a_profile_forms_the_calendar_a_request_asks_and_names_the_query_it_does_not_run(
+    workspace,
+):
     asked = FakeBackend().read_request(_with_asks(REQUEST), name="asks.yml")
     result = _profile(workspace, asked)
     said = dict(result.not_measured)
-    assert said["calendar of orders.placed_at"] == asked_for.NO_CALENDAR
+    assert "calendar of orders.placed_at" not in said
     assert said["query paid_orders"] == asked_for.NO_QUERIES
     assert "queries" not in result.document
-    assert "calendar" not in result.document["tables"]["orders"]
+    orders = dict(result.document["tables"]["orders"])
+    (entry,) = orders.pop("calendar")
+    assert entry["column"] == "placed_at" and set(entry) == {
+        "column",
+        "month",
+        "dayOfWeek",
+        "hourOfWeek",
+    }
     # The rest of the request is answered as it was without the asks.
     without = _profile(workspace, _asked(workspace))
-    assert result.document["tables"] == without.document["tables"]
+    assert {**result.document["tables"], "orders": orders} == without.document["tables"]
     assert [each for each in result.not_measured if each not in without.not_measured] == [
-        ("calendar of orders.placed_at", asked_for.NO_CALENDAR),
         ("query paid_orders", asked_for.NO_QUERIES),
     ]
 
 
-def test_the_cli_names_each_ask_it_does_not_form(workspace, registry, capsys):
+def test_the_cli_names_the_query_it_does_not_run_and_reports_the_calendar(
+    workspace, registry, capsys
+):
     (workspace / "asks.yml").write_text(_with_asks(REQUEST), encoding="utf-8")
     rc = main(_argv("--out", "p.json", request="asks.yml"))
     out = capsys.readouterr().out
     assert rc == 0, out
-    assert (
-        "Not measured: calendar of orders.placed_at: fluid profile does not form a calendar." in out
-    )
+    assert "Not measured: calendar of orders.placed_at" not in out
+    assert "exposes[orders]: Calendar: " in out
     assert "Not measured: query paid_orders: fluid profile runs no consumer query." in out
     assert "SELECT" not in out
 
@@ -350,8 +358,8 @@ def test_strict_refuses_a_request_with_an_ask_it_does_not_form_before_a_read(
         _argv("--strict", "--out", "p.json", request="asks.yml"),
         "profile_request_not_formed",
     )
-    assert "asks for 2 items fluid profile does not form" in out
-    assert "calendar of orders.placed_at" in out and "query paid_orders" in out
+    assert "asks for 1 item fluid profile does not form" in out
+    assert "query paid_orders" in out and "calendar of" not in out
     assert "no record was read" in out and "SELECT" not in out
     assert not (workspace / "p.json").exists()
 
@@ -374,7 +382,7 @@ def test_the_document_reads_back_and_follows_its_content(workspace):
     load_profile_text(result.canonical.decode("utf-8"))
     FakeBackend().check_document(result.canonical.decode("utf-8"))
     assert result.digest.startswith("sha256:")
-    assert "1-2-0" in result.document["_schemaURL"]  # it holds invariants
+    assert "1-3-0" in result.document["_schemaURL"]  # it holds a statistic counted per entity
 
 
 def test_the_cli_profile_answers_the_request_and_says_what_it_left_out(workspace, registry, capsys):

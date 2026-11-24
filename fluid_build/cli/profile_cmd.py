@@ -159,9 +159,10 @@ A request of format 1-2-0 may also ask for more, each exact and under the same c
     that reaches no parent is in no group. Each listed item the profile does not answer is named in the report
 with its reason (for example a histogram over a number with no declared range,
 quantiles beside a histogram on one set of bins, a mean of a timestamp, a key
-column of a counted relationship). A table's calendar, a workload and the consumers'
-queries are not formed: each is named under Not measured, and with --strict such a
-request is refused before any record is read. A table's date pairs (DATE columns) and
+column of a counted relationship). A workload and the consumers' queries are not
+formed: each is named under Not measured, and with --strict such a request is refused
+before any record is read. A table's calendar is formed, but not by a private release,
+which names it. A table's date pairs (DATE columns) and
 a relationship's dates and exposure are formed (format 1-3-0); a pair's days are
 counted on a fixed ladder of whole days, trimmed to the bins from the first holding a
 record to the last, and are published only when each of those two bins holds at
@@ -325,8 +326,8 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         action="store_true",
         help=(
             "refuse a --request that asks for a kind of statistic fluid profile does not form "
-            "(a table's calendar, a workload, a consumer query), before any record is read; "
-            "without it each such ask is named under Not measured"
+            "(a workload, a consumer query; a table's calendar too, for a private release), "
+            "before any record is read; without it each such ask is named under Not measured"
         ),
     )
     p.add_argument(
@@ -986,6 +987,7 @@ def _report(
         say(f"No children per parent for exposes[{child}] {name!r}: {reason}.", soft_wrap=True)
     _report_rank_correlations(say, result, several)
     _report_dates(say, result)
+    _report_structure(say, result)
     for fact in result.facts:
         say(
             (
@@ -1058,6 +1060,48 @@ def _published_days(entries: Any) -> int:
         for each in entries
         if each["statistics"] and each["statistics"][0]["groups"][0]["status"] == "F"
     )
+
+
+def _published_groups(statistics: Any) -> Tuple[int, int]:
+    """How many of the groups of these statistics are published, and how many there are.
+
+    A group counts as published only when it is and none of its cells is withheld.
+    """
+    groups = [group for each in statistics for group in each["groups"]]
+    whole = [
+        each
+        for each in groups
+        if each["status"] == "F" and all(status == "F" for status in each.get("cellStatus", ()))
+    ]
+    return len(whole), len(groups)
+
+
+def _report_structure(say: Any, result: Any) -> None:
+    """One line for each table's calendar, periods and per-entity statistics: how many published.
+
+    Names tables and how many of the written groups were published, never a count of records.
+    """
+    for expose_id, table in result.document["tables"].items():
+        where = f"exposes[{expose_id}]: "
+        calendar = [
+            each[key] for each in table.get("calendar", ()) for key in each if key != "column"
+        ]
+        if calendar:
+            shown, total = _published_groups(calendar)
+            say(f"{where}Calendar: {shown} of {total} histograms published.", soft_wrap=True)
+        periods = [each for entry in table.get("periods", ()) for each in entry["statistics"]]
+        if periods:
+            shown, total = _published_groups(periods)
+            say(f"{where}Periods: {shown} of {total} monthly groups published.", soft_wrap=True)
+        per = [
+            each
+            for column in table["columns"].values()
+            for each in column.get("statistics", ())
+            if "per" in each
+        ]
+        if per:
+            shown, total = _published_groups(per)
+            say(f"{where}Per-entity statistics: {shown} of {total} published.", soft_wrap=True)
 
 
 def _report_dates(say: Any, result: Any) -> None:

@@ -193,7 +193,9 @@ def test_a_profile_publishes_what_passes_and_withholds_the_rest(tmp_path):
     # The quantiles at 0.25 and 0.75 of amount have a cell of no records below or above
     # their bin, so they are withheld beside the six metrics. placed_at's one month holds
     # every record, so its histogram publishes.
-    assert result.withheld == {"A": 8}
+    # The three groups of placed_at's calendar (month, day and hour of the week) hold 40 records
+    # in all, so each is withheld whole as small.
+    assert result.withheld == {"A": 8 + 3}
     # rowCount, amount's mean/1 and its median's bin, placed_at's one month, and every
     # published metric.
     assert result.published == 1 + 1 + 1 + 1 + sum(

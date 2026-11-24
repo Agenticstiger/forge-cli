@@ -353,7 +353,9 @@ def test_the_days_and_the_order_are_checked_in_one_call_on_one_partition(tmp_pat
     pair_calls = [
         call
         for call in seen
-        if len(call) == 2 and all(each.identifier == "marginalHistogram/1" for each in call)
+        if len(call) == 2
+        and all(each.identifier == "marginalHistogram/1" for each in call)
+        and len(call[0].edges) != 169  # not a calendar's hours and days of the week
     ]
     assert len(pair_calls) == 1  # one call for the one pair: the days and the order together
     (days, order) = pair_calls[0]

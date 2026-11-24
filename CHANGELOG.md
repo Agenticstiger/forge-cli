@@ -31,6 +31,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same parent table is checked on the difference of their days: the parents they treat differently
   must pass the count and sum rules, or its days are withheld. A private release forms none of
   these and names them as before.
+- **`fluid profile` publishes a table's calendar, its monthly periods and statistics counted per
+  entity.** Each DATE and timestamp column (a request lists the columns it wants) gets `month`,
+  `dayOfWeek` and, on a timestamp only, `hourOfWeek` as level histograms read in UTC, counted in
+  one integer pass. The hours and the days of the week are checked in one call, since a day is
+  24 hours. A calendar histogram is published only when no statistic on the column (its own
+  histogram and quantiles, any statistic grouped by its bins, and a relationship's children per
+  parent grouped by them) withholds a group or a cell and each cuts its records only at the start
+  of its unit (a month, a day, an hour): the instants where a published count of the records below
+  lies strictly between 0 and its `k`, so a ladder's outer edges, which cut nothing, do not count.
+  Else it is withheld whole, and a declared range's quantile edges, which fall mid-month, withhold
+  the month.
+  A table that declares `semantics.defaultAggTimeDimension` gets the mean of each
+  number column in each calendar month from the first to the last of the time column's published
+  span or declared range, every month a group, checked with the rows that have no time as one more
+  group, and withheld whole unless the time column's edge statistics all cut at month starts
+  and withhold nothing. A column a `dependency` sets from
+  an entity key gets its histogram counted per entity, each entity at the value its rows most
+  often hold, checked in a call of its own, and withheld whole when the cells it withholds are
+  not the cells the column's row-level histogram withholds, or when no entity holds a known value. The calendar
+  and the per-entity statistics name format
+  1-3-0. A private release forms none of these, and `--strict` no longer refuses a calendar ask on
+  a public profile.
 - **`fluid profile --timings` says where a profile spends its time.** After the report it prints,
   for each table in profile order, `Timings for <exposeId>: read X s, measure Y s, check Z s.`,
   then `Timings for the document: write W s; total T s.`. Read is the source read, measure forms

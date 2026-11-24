@@ -100,7 +100,9 @@ __all__ = [
     "DateStage",
     "PairContext",
     "RelationshipAsks",
+    "checked",
     "declared_empty_levels",
+    "histogram",
     "read_milliseconds",
     "relationship_extras",
     "table_date_pairs",
@@ -384,6 +386,7 @@ def _checked(
     rule: disclosure.DisclosureRule,
     backend: StatisticsBackend,
     timed: Tuple[Optional["StageTimings"], str],
+    what: str = "the days of",
 ) -> Tuple[EdgeDecision, ...]:
     from fluid_build.profiler import runner
 
@@ -399,9 +402,13 @@ def _checked(
     except ValueError as exc:
         raise runner.ProfileError(
             "profile_edge_counts_refused",
-            f"the days of {name} cannot describe one set of records: {exc}",
+            f"{what} {name} cannot describe one set of records: {exc}",
             {"written": "nothing", "next": "report this: the output check refused its input"},
         ) from None
+
+
+checked = _checked
+histogram = _histogram
 
 
 @dataclass(frozen=True)

@@ -87,7 +87,9 @@ __all__ = [
     "StatisticsBackend",
     "StatisticsUnavailable",
     "WITHHELD_ROUNDING",
+    "calendar_levels",
     "load_backend",
+    "most_calendar_entries",
 ]
 
 
@@ -646,6 +648,14 @@ class StatisticsBackend(Protocol):
 
         *cells* are the counts of the bins between *edges* (one fewer than the edges). It is
         :meth:`count_histogram` of values that fall in those cells, without placing each record.
+        """
+
+    def count_levels(
+        self, counts: Sequence[int], levels: Sequence[str], group: str = ""
+    ) -> MeasuredGroup:
+        """``levelHistogram/1`` from the records already counted per level: one group, keyed *group*.
+
+        *counts* are the records of each level, in *levels* order (one count a level).
         """
 
     def rank_group(self, identifier: str, pairs: Sequence[Tuple[int, int]]) -> Dict[str, Any]:
@@ -1280,6 +1290,24 @@ class _FluxStatsBackend:
             cells=tuple(state.cell_counts("marginalHistogram")),
         )
 
+    def count_levels(
+        self, counts: Sequence[int], levels: Sequence[str], group: str = ""
+    ) -> MeasuredGroup:
+        from flux_stats.registry import GroupStatistic
+
+        if len(counts) != len(levels):
+            raise ValueError("a level histogram holds one count for each level")
+        histogram = self._fidelity().definition_named("levelHistogram/1")
+        state = GroupStatistic(group=group, k=sum(counts), level_counts=tuple(counts))
+        spelled: Dict[str, Any] = state.to_document(histogram)
+        return MeasuredGroup(
+            key=group,
+            document=spelled,
+            k=state.k,
+            statistic=state,
+            cells=tuple(state.cell_counts("levelHistogram")),
+        )
+
     def count_histogram(
         self, counts: Sequence[int], edges: Sequence[int], fractional_bits: int, group: str = ""
     ) -> MeasuredGroup:
@@ -1450,6 +1478,25 @@ def _spelled(group: Any, definition: Any) -> Dict[str, Any]:
 _CORRELATION_LEFT_OUT = (
     "a correlation's moments need the exact record count, which the output checks round"
 )
+
+
+def calendar_levels() -> Mapping[str, Tuple[str, ...]]:
+    """The levels of a calendar entry's three histograms, as flux-stats' format fixes them."""
+    try:
+        from flux_stats.profile import CALENDAR_LEVELS
+    except ImportError:
+        raise _needs_newer("a calendar") from None
+    levels: Mapping[str, Tuple[str, ...]] = CALENDAR_LEVELS
+    return levels
+
+
+def most_calendar_entries() -> int:
+    """The most entries a table's ``calendar`` holds (format 1-3-0)."""
+    try:
+        from flux_stats.profile import MAX_CALENDAR_ENTRIES
+    except ImportError:
+        raise _needs_newer("a calendar") from None
+    return int(MAX_CALENDAR_ENTRIES)
 
 
 def load_backend() -> StatisticsBackend:

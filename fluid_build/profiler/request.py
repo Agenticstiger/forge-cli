@@ -79,11 +79,11 @@ _NO_RECORD = "no non-null record to form it over"
 #: Why each kind of ask that ``fluid profile`` does not form is left out. The request's
 #: reader holds every ask of its format, so none is dropped without a word: each is named
 #: with one of these reasons (:func:`unformed`), and ``--strict`` refuses a request that
-#: holds one. A public profile forms a table's date pairs and a relationship's dates and
+#: holds one. A public profile forms a table's date pairs and calendar and a relationship's dates and
 #: exposure (:mod:`fluid_build.profiler.dates`) and names the ones it cannot with a reason of
 #: their own; a private release forms none of them, and names each with the reasons below.
 NO_DATE_PAIRS = "a private release forms no date pair"
-NO_CALENDAR = "fluid profile does not form a calendar"
+NO_CALENDAR = "a private release forms no calendar"
 NO_WORKLOAD = (
     "a workload weighs the column sets a private release may join, and this profile joins none"
 )
@@ -434,8 +434,8 @@ def unformed(
 ) -> List[Tuple[str, str]]:
     """Each ask of *request* of a kind ``fluid profile`` does not form, with why: ``(what, reason)``.
 
-    Decided from the request alone, before any record is read: a calendar column, a workload
-    entry and a consumer query, and, for a *private* release only, a table's date pairs and a
+    Decided from the request alone, before any record is read: a workload entry and a consumer
+    query, and, for a *private* release only, a table's date pairs and calendar and a
     relationship's dates and exposure (a public profile forms those, and names one it cannot
     with the reason it has, once it has read the records). *workload* is the reason a workload
     entry is not used, which a private release words its own way. Never a value: only tables,
@@ -447,7 +447,7 @@ def unformed(
             found.append(
                 (f"date pair {pair.start} to {pair.end} of {table.expose_id}", NO_DATE_PAIRS)
             )
-        for column in table.calendar:
+        for column in table.calendar if private else ():
             found.append((f"calendar of {table.expose_id}.{column}", NO_CALENDAR))
         for entry in table.workload:
             found.append((f"workload {', '.join(entry.columns)} of {table.expose_id}", workload))

@@ -58,6 +58,7 @@ from typing import (
 
 from fluid_build.policy._common import iter_exposes
 from fluid_build.profiler import (
+    calendars,
     dates,
     defaults,
     disclosure,
@@ -871,6 +872,14 @@ def profile_exposes(
         raw_exposes, by_expose, tables_doc, backend, rule, tallies, fractional_bits, held, timings
     )
     date_notes = _date_pair_tables(dated, plans, reads, blocks, asked)
+    date_notes.extend(
+        calendars.form_structure(
+            calendars.Structure(
+                raw_exposes, plans, reads, declared, blocks, tables_doc, backend, rule, tallies,
+                fractional_bits, held, asked, timings,
+            )  # fmt: skip
+        )
+    )
     counted_entries: Dict[int, Tuple[Dict[str, Any], RelationshipResult]] = {
         position: _children_per_parent(
             each,
@@ -886,6 +895,7 @@ def profile_exposes(
         if each.counted
     }
     counted = list(counted_entries.values())
+    calendars.withhold_beside_relationships(tables_doc, [entry for entry, _ in counted], tallies)
     relationship_docs, relationship_notes = _relationship_dates(
         dated, relationships, counted_entries, request
     )

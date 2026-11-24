@@ -18,7 +18,7 @@ is the digest a Simulation pins.
 A profile names the least format that holds it (:func:`schema_url_for`): 1-0-0, unless it
 holds a ``quantile/2`` statistic (1-1-0), an ``invariants`` section (1-2-0), a statistic
 grouped by a link (1-3-0), or a rank correlation, a statistic grouped by the bins of a column
-or a relationship's statistic grouped by a parent column (1-4-0). A table's ``datePairs`` and
+or a relationship's statistic grouped by a parent column (1-4-0). A table's ``datePairs`` and ``calendar`` and
 a relationship's ``dates``, ``structural`` and ``exposure`` are forms of 1-3-0. A profile without one of
 them keeps the bytes it had.
 
@@ -112,13 +112,13 @@ def _statistic_format(statistic: Mapping[str, Any]) -> int:
     """The format, as a number from 0 (1-0-0) to 4 (1-4-0), that one column statistic needs."""
     if "groupByBins" in statistic or "rowFloor" in statistic:
         return 4
-    if "groupByLink" in statistic:
+    if "groupByLink" in statistic or "per" in statistic:
         return 3
     return 1 if statistic.get("definition") in _ADDED_IN_1_1_0 else 0
 
 
 def _table_format(table: Mapping[str, Any]) -> int:
-    needed = 3 if "datePairs" in table else 0
+    needed = 3 if "datePairs" in table or "calendar" in table else 0
     if "cliqueSelection" in table or any(
         each.get("definition") == "cliqueMarginal/2" for each in table.get("cliques", ())
     ):

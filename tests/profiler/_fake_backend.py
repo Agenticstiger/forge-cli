@@ -237,6 +237,9 @@ class FakeBackend:
     def count_cells(self, cells: Any, edges: Any, fractional_bits: int, group: str = "") -> Any:
         return self._real().count_cells(cells, edges, fractional_bits, group)
 
+    def count_levels(self, counts: Any, levels: Any, group: str = "") -> Any:
+        return self._real().count_levels(counts, levels, group)
+
     def rank_group(self, identifier: str, pairs: Sequence[Tuple[int, int]]) -> Dict[str, Any]:
         """``kendallTau/1`` and ``spearmanRho/1`` as PROFILE-SPEC section 5 defines them, pair by pair."""
         k = len(pairs)
