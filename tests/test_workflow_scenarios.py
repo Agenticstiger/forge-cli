@@ -322,11 +322,9 @@ class WorkflowTriggerTests(unittest.TestCase):
                     continue
 
                 checkout_config = step.get("with", {})
-                self.assertEqual(
-                    checkout_config.get("ref"),
-                    "${{ github.event.pull_request.base.sha }}",
-                    relative_path,
-                )
+                # With no ref, checkout fetches the base branch's own revision, so
+                # code from the pull request never runs with this workflow's token.
+                self.assertNotIn("ref", checkout_config, relative_path)
                 self.assertFalse(
                     checkout_config.get("persist-credentials", True),
                     relative_path,

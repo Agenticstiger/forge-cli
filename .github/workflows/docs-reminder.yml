@@ -13,13 +13,12 @@ jobs:
   check-docs:
     runs-on: ubuntu-latest
     steps:
-      # Safe with pull_request_target because we only check out the trusted base
-      # revision and use it to read PR metadata plus update labels/comments
-      # through the GitHub API.
+      # Safe with pull_request_target: with no ref, checkout fetches the base
+      # branch's own revision, never the PR head, and the job only reads PR
+      # metadata and updates labels/comments through the GitHub API.
       - name: Checkout base revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
 
       - name: Check for documentation reference
