@@ -84,6 +84,13 @@ def test_the_plan_holds_each_asked_pair_with_the_default_floor_and_the_units_sen
     assert plan.selects and plan.clique_method == "aim"
 
 
+def test_a_unit_of_one_row_still_moves_a_rank_correlation_as_two_rows_do():
+    # replacing the one kept row of a unit is a removal and an addition
+    plan = ranked.plan(c=1)
+    assert plan.delta(ranked.KENDALL) == F(2 * 4, 1001)
+    assert plan.delta(ranked.SPEARMAN) == F(2 * 9, 1001)
+
+
 def test_a_row_floor_is_taken_and_a_release_of_each_row_has_a_delta_of_one_record():
     plan = ranked.plan(c=None, row_floor=99)
     assert plan.row_floor == 99 and plan.delta(ranked.KENDALL) == F(4, 100)

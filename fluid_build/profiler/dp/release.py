@@ -665,7 +665,10 @@ def plan_release(
             read=True,
         )
     floor = None if not rank_pairs else (DEFAULT_ROW_FLOOR if row_floor is None else row_floor)
-    rows_per_unit = 1 if unit_plan.mode == ROWS else unit_plan.max_rows_per_unit
+    # Adding, removing or replacing one row of a unit can change which kept row of that unit wins,
+    # so a keyed or related unit moves the value as two rows do at the least (see
+    # bounding.selection_distance).
+    rows_per_unit = bounding.selection_distance(unit_plan)
     deltas = tuple(
         (definition, rows_per_unit * backend.rank_sensitivity(definition, floor or 2))
         for definition in RANK_DEFINITIONS
