@@ -65,6 +65,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SNOWFLAKE_AUTHENTICATOR` is paired with it the same way. This covers `fluid verify`,
   `fluid apply` builds,
   `fluid test` and the dlt, Airbyte and Meltano Snowflake destinations. Behaviour change.
+- **A project's dotenv files no longer choose where a dlt pipeline sends data.** Beyond the
+  destination's credentials, which were already pinned, a project `.env` may not set the
+  pipeline's staging (`STAGING_TYPE`, `STAGING_NAME`, under every section dlt reads), the
+  destination's type or name (`DESTINATION__<NAME>__DESTINATION_TYPE`, `DESTINATION_NAME`), the
+  destination's other configuration (lance `storage` and `embeddings`, filesystem `bucket_url`
+  and `kwargs`, `staging_config`, taken from the destination's dlt `spec()`), or the staging
+  destination's settings and credentials. `fluid apply` fails the dlt build and names the
+  variables, never their values. Still allowed from a project `.env`: `environment`, boolean and
+  integer destination settings, and the type of a named destination whose credentials the project
+  itself supplies. What the operator sets (shell, CI, `.dlt` files) applies as before. Behaviour
+  change.
 
 ## [0.39.0] — 2026-11-23
 
