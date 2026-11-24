@@ -76,6 +76,28 @@ def _contract(server_binary: Optional[str]) -> Dict[str, Any]:
     }
 
 
+def _links(cwd: Optional[str]) -> Dict[str, str]:
+    """Every symlink directly under ``cwd`` and under its ``config``, with its target."""
+    out: Dict[str, str] = {}
+    for base in (cwd, os.path.join(cwd, "config") if cwd else None):
+        if base and os.path.isdir(base):
+            for name in os.listdir(base):
+                path = os.path.join(base, name)
+                if os.path.islink(path):
+                    out[os.path.relpath(path, cwd)] = os.readlink(path)
+    return out
+
+
+def _entries(cwd: Optional[str], *parts: str) -> Optional[List[str]]:
+    path = os.path.join(cwd, *parts) if cwd else None
+    return sorted(os.listdir(path)) if path and os.path.isdir(path) else None
+
+
+def _read(cwd: Optional[str], *parts: str) -> Optional[str]:
+    path = os.path.join(cwd, *parts) if cwd else None
+    return Path(path).read_text() if path and os.path.isfile(path) else None
+
+
 class _FakeRun:
     """Stands in for ``subprocess.run``: records the call, then "times out", which
     is how the runner reads a server that booted."""
@@ -93,6 +115,9 @@ class _FakeRun:
                 "cwd_existed": bool(cwd) and os.path.isdir(cwd),
                 "cwd_mode": stat.S_IMODE(os.stat(cwd).st_mode) if cwd else None,
                 "cwd_entries": sorted(os.listdir(cwd)) if cwd and os.path.isdir(cwd) else None,
+                "links": _links(cwd),
+                "config_entries": _entries(cwd, "config"),
+                "config_text": _read(cwd, "config", "application.properties"),
             }
         )
         raise subprocess.TimeoutExpired(argv, 1)
@@ -214,14 +239,35 @@ def test_argv_is_the_real_binary_and_has_no_config_flag(project, tmp_path, fake_
     assert "--config" not in call["argv"]
 
 
-def test_the_working_directory_is_the_install_directory_when_the_runner_jar_is_there(
+def test_for_the_stock_launcher_the_working_directory_links_the_install_and_holds_forges_file(
     project, tmp_path, fake_run
 ):
+    """Debezium Server 3.7 reads its engine settings from config/application.properties
+    under the working directory, and run.sh finds everything else relative to it."""
     script = _install(tmp_path, with_jar=True)
+    install = script.resolve().parent
+    (install / "config").mkdir()
+    (install / "config" / "metrics.yml").write_text("metrics")
+    (install / "config" / "application.properties").write_text("debezium.sink.type=operator\n")
+    (install / "lib").mkdir()
     _run(project, str(script))
     (call,) = fake_run.calls
-    assert call["cwd"] == str(script.resolve().parent)
+    cwd = Path(call["cwd"])
+    assert cwd.name.startswith("fluid-debezium-") and call["cwd_mode"] == 0o700
+    assert cwd != install and project.resolve() not in (cwd, *cwd.parents)
     assert call["env"]["PWD"] == call["cwd"]
+    links = call["links"]
+    assert links["run.sh"] == str(install / "run.sh")
+    assert links["lib"] == str(install / "lib")
+    assert links["debezium-server-3.7.1.Final-runner.jar"] == str(
+        install / "debezium-server-3.7.1.Final-runner.jar"
+    )
+    assert links[os.path.join("config", "metrics.yml")] == str(install / "config" / "metrics.yml")
+    # forge's file, a copy, in place of the install's own application.properties
+    assert os.path.join("config", "application.properties") not in links
+    assert call["config_text"] == _forge_config(project).read_text()
+    assert "debezium.sink.type=http" in call["config_text"]
+    assert not cwd.exists()
 
 
 def test_without_the_runner_jar_the_working_directory_is_a_temporary_one_removed_afterwards(
@@ -236,7 +282,10 @@ def test_without_the_runner_jar_the_working_directory_is_a_temporary_one_removed
     assert project.resolve() not in (cwd, *cwd.parents)
     assert call["cwd_existed"]
     assert call["cwd_mode"] == 0o700
-    assert call["cwd_entries"] == []
+    assert call["cwd_entries"] == ["config"]
+    assert call["config_entries"] == ["application.properties"]
+    assert call["config_text"] == _forge_config(project).read_text()
+    assert call["links"] == {}
     assert not cwd.exists()
 
 
@@ -280,9 +329,13 @@ def _ctx(project: Path):
 # ── environment ────────────────────────────────────────────────────────
 
 
-def _config_uri(project: Path) -> str:
-    path = project / ".fluid" / "debezium" / _CONTRACT_ID / "ingest" / "application.properties"
-    return path.resolve().as_uri()
+def _forge_config(project: Path) -> Path:
+    return project / ".fluid" / "debezium" / _CONTRACT_ID / "ingest" / "application.properties"
+
+
+def _config_uri(call: Dict[str, Any]) -> str:
+    """The URI of forge's file as the server gets it: the copy in its working directory."""
+    return (Path(call["cwd"]).resolve() / "config" / "application.properties").as_uri()
 
 
 def test_java_opts_keeps_the_operators_value_and_ends_with_the_system_property(
@@ -295,7 +348,7 @@ def test_java_opts_keeps_the_operators_value_and_ends_with_the_system_property(
     script = _install(tmp_path, with_jar=True)
     _run(project, str(script))
     (call,) = fake_run.calls
-    uri = _config_uri(project)
+    uri = _config_uri(call)
     java_opts = call["env"]["JAVA_OPTS"]
     assert java_opts.startswith("-Xmx256m -Dsmallrye.config.locations=file:///hostile.properties ")
     assert java_opts.endswith(f"-Dquarkus.config.locations={uri}")
@@ -318,9 +371,14 @@ def test_the_server_gets_the_inherited_environment_and_the_credentials(
     assert call["env"]["FLUID_DBZ_SOURCE_DATABASE_PASSWORD"] == "pw"  # pragma: allowlist secret
 
 
-def test_a_config_path_with_a_space_and_a_comma_is_encoded(tmp_path, fake_run):
-    project = tmp_path / "my project, v2"
-    project.mkdir()
+def test_a_config_path_with_a_space_and_a_comma_is_encoded(
+    project, tmp_path, fake_run, monkeypatch
+):
+    import tempfile
+
+    weird = tmp_path / "tmp dir, v2"
+    weird.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(weird))
     script = _install(tmp_path, with_jar=True)
     _run(project, str(script))
     (call,) = fake_run.calls
@@ -329,8 +387,8 @@ def test_a_config_path_with_a_space_and_a_comma_is_encoded(tmp_path, fake_run):
     assert len(tokens) == 2
     for token in tokens:
         assert token.startswith("-D") and "," not in token.split("=", 1)[1]
-    assert "my%20project%2C%20v2" in tokens[0]
-    assert tokens[0].split("=", 1)[1] == _config_uri(project)
+    assert "tmp%20dir%2C%20v2" in tokens[0]
+    assert tokens[0].split("=", 1)[1] == _config_uri(call)
 
 
 def test_a_uri_that_stays_unsafe_is_refused(tmp_path):

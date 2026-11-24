@@ -294,6 +294,9 @@ def test_server_runs_outside_the_project_and_keeps_its_offsets(
     # The runner kills the server at the time limit, so the offsets must already be
     # on disk: flush after every batch rather than rely on the distribution's default.
     monkeypatch.setenv("DEBEZIUM_SOURCE_OFFSET_FLUSH_INTERVAL_MS", "0")
+    # The http sink reads debezium.format.value and has no default for it (3.7):
+    # the operator names the format, as for any sink that needs one.
+    monkeypatch.setenv("DEBEZIUM_FORMAT_VALUE", "json")
     state_dir = project / ".fluid" / "debezium" / "bronze.dbz_live" / "ingest"
     offsets = state_dir / "offsets.dat"
     try:

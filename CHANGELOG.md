@@ -30,10 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`deployment.mode: embedded`) used to inherit forge's working directory, the project, where
   Quarkus reads `.env` and `config/application.properties` and the stock `run.sh` sources
   `./jmx/*.sh` and loads `config/lib` and `lib/*`; `run.sh` also drops its arguments, so
-  `--config` never reached the JVM. The server now starts from its install directory (the one
-  holding the runner jar), or from an empty temporary directory, and reads forge's
-  `application.properties` through a `smallrye.config.locations` system property in `JAVA_OPTS`
-  and `DEBEZIUM_OPTS`. Offsets and file-based schema history are kept at absolute paths under
+  `--config` never reached the JVM. The server now starts from a fresh directory forge owns,
+  which holds forge's `application.properties` as `config/application.properties` (Debezium
+  Server 3.7 reads its engine settings only from there) and, for the stock launcher, links to the
+  install's own files; a `smallrye.config.locations` system property in `JAVA_OPTS` and
+  `DEBEZIUM_OPTS` names the same file, so its values win over the environment's. Offsets and file-based schema history are kept at absolute paths under
   `.fluid/debezium/<product>/<build>/`; an existing `<project>/data/offsets.dat` is copied there
   once (a regular file in a real `data/` directory) and left in place. Behaviour change: a
   `properties.debezium.server_binary` inside the project or its checkout (by path, symlink or

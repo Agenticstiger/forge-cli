@@ -9,11 +9,12 @@ Two execution modes:
     Debezium connector classes via the Kafka Connect REST API.
   - **Debezium Server** (``embedded``): generates an
     ``application.properties`` file and (when the binary is available)
-    starts ``debezium-server`` as a subprocess, from the install directory of
-    the binary (or an empty temporary one), never from the project, and
-    hands the file to the JVM as a ``smallrye.config.locations`` system
-    property. For tests we stop short of actually running the binary; the
-    live proof is ``tests/integration/test_debezium_server_runner_live.py``.
+    starts ``debezium-server`` as a subprocess from a fresh directory forge
+    owns, never from the project, where the file is
+    ``config/application.properties`` (and a ``smallrye.config.locations``
+    system property names it too). For tests we stop short of actually running
+    the binary; the live proof is
+    ``tests/integration/test_debezium_server_runner_live.py``.
 """
 
 from __future__ import annotations
@@ -836,25 +837,27 @@ def _launch_server(
     # Offsets a server kept at <project>/data/offsets.dat before forge named the file.
     _migrate_project_offsets(Path(ctx.workdir), offsets_path)
 
-    # The working directory is the binary's install directory when the stock
-    # launcher needs it there (it holds the runner jar), else an empty directory
-    # (0700) that is removed afterwards.
-    scratch_dir: Optional[str] = None
-    launch_dir = _launch_directory(real_binary)
-    if launch_dir is None:
-        scratch_dir = tempfile.mkdtemp(prefix="fluid-debezium-")
-        launch_dir = Path(scratch_dir)
+    # The working directory is a fresh one forge owns (0700, removed afterwards),
+    # never the project: it holds forge's file as config/application.properties
+    # and, for the stock launcher, links to the install's own files
+    # (_prepare_launch_directory).
+    scratch_dir = tempfile.mkdtemp(prefix="fluid-debezium-")
+    launch_dir = Path(scratch_dir)
     try:
+        try:
+            server_config = _prepare_launch_directory(launch_dir, real_binary, config_path)
+        except OSError as exc:
+            return _failed(ctx, started_at, t_start, f"could not prepare {launch_dir}: {exc}")
         # The server inherits this process's environment, which is where Iceberg
         # resolves the ``env:<NAME>`` catalog properties ``sink.catalogAuth``
         # emits, and where the preflight checked the variable is set, once the
         # operator had paired it with every host it reaches. The
         # ``FLUID_DBZ_*`` credentials the file refers to are added to it, and
-        # forge's file is named by a system property (the launcher drops
-        # arguments, so ``--config`` would never reach the JVM). No secret is
-        # written to application.properties.
+        # forge's file is also named by a system property, so its values win over
+        # the environment's (the launcher drops arguments, so ``--config`` would
+        # never reach the JVM). No secret is written to application.properties.
         try:
-            server_env = _server_environment(config_path, secret_env, launch_dir)
+            server_env = _server_environment(server_config, secret_env, launch_dir)
         except ValueError as exc:
             return _failed(ctx, started_at, t_start, str(exc))
         try:
@@ -874,8 +877,7 @@ def _launch_server(
                 ctx, started_at, t_start, server_name, snapshot_mode, connector_class
             )
     finally:
-        if scratch_dir is not None:
-            shutil.rmtree(scratch_dir, ignore_errors=True)
+        shutil.rmtree(scratch_dir, ignore_errors=True)
 
     if proc.returncode != 0:
         return _failed(ctx, started_at, t_start, _server_failure(proc, secret_env))
@@ -912,7 +914,7 @@ def _server_failure(proc: "subprocess.CompletedProcess[str]", secret_env: Mappin
 #: The stock launcher (``run.sh``) finds its runner jar with
 #: ``ls debezium-server-*runner.jar`` and sources ``./jmx/*.sh`` and
 #: ``./lib_metrics/*.sh``, and its classpath (``config/lib``, ``lib/*``) is
-#: relative too: it only works from the install directory.
+#: relative too: its working directory must hold those entries.
 _RUNNER_JAR_GLOB = "debezium-server-*runner.jar"
 
 #: Debezium Server's file-based offset and schema-history stores have no default
@@ -985,8 +987,8 @@ def _checkout_root(project_dir: Path) -> Optional[Path]:
 
 
 def _launch_directory(real_binary: Path) -> Optional[Path]:
-    """The install directory of the binary when the stock launcher needs it as the
-    working directory (it holds the runner jar), else ``None``."""
+    """The install directory of the binary when it is the stock launcher (the
+    directory holds the runner jar), else ``None``."""
     install_dir = real_binary.parent
     try:
         for candidate in install_dir.glob(_RUNNER_JAR_GLOB):
@@ -995,6 +997,38 @@ def _launch_directory(real_binary: Path) -> Optional[Path]:
     except OSError:
         pass
     return None
+
+
+def _prepare_launch_directory(launch_dir: Path, real_binary: Path, config_path: Path) -> Path:
+    """Fill the server's working directory and return forge's config file in it.
+
+    Debezium Server (3.7) learns which connector its engine runs while Quarkus is
+    still starting, when only ``config/application.properties`` under the working
+    directory is read: a file named only by ``smallrye.config.locations`` configures
+    the sink, but no engine starts. So forge's file is copied (0600) to
+    ``config/application.properties`` here. For the stock launcher, which finds its
+    runner jar, ``./jmx/*.sh``, ``lib/*`` and ``config/lib`` relative to the working
+    directory, the install's entries are linked in too, and so are its ``config``
+    entries except its own ``application.*`` files. Nothing comes from the project.
+    """
+    install = _launch_directory(real_binary)
+    config_dir = launch_dir / "config"
+    config_dir.mkdir(mode=0o700)
+    if install is not None:
+        for entry in install.iterdir():
+            if entry.name != "config":
+                os.symlink(entry, launch_dir / entry.name)
+        install_config = install / "config"
+        if install_config.is_dir():
+            for entry in install_config.iterdir():
+                if not entry.name.startswith("application."):
+                    os.symlink(entry, config_dir / entry.name)
+    target = config_dir / "application.properties"
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
+    with os.fdopen(fd, "wb") as out:
+        out.write(config_path.read_bytes())
+    return target
 
 
 def _server_environment(
