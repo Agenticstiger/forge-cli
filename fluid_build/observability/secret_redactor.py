@@ -375,6 +375,9 @@ _MIN_REGISTERED_SECRET_LEN = 6
 # cannot grow the registry without limit and turn every log call into an
 # O(registry) scan. Hitting the cap is warned about, loudly and once.
 _MAX_REGISTERED_SECRETS = 1024
+# A value made of these characters only is spelled the same inside a URL, so it
+# has no other spelling to mask (``~`` is left out: Java's URLEncoder escapes it).
+_URL_PLAIN_RE = re.compile(r"[A-Za-z0-9_.-]*")
 
 # Words the PATTERN layer keys on. A secret that is a substring of one of them
 # must NOT be registered, because masking it rewrites the key name itself and
@@ -671,6 +674,10 @@ def redact_known_values(
 ) -> str:
     """Replace every registered (and ``extra``) literal secret in ``text``.
 
+    Each secret is also masked in its URL-encoded spellings
+    (:func:`_url_spellings`), which a log line or an error that prints a URL
+    holding it carries.
+
     ``placeholder`` differs between the two layers (``***REDACTED***``
     globally, ``[REDACTED]`` in the Snowflake twin), so it is a parameter —
     the registry itself is shared, which is what keeps the layers from
@@ -688,8 +695,18 @@ def redact_known_values(
             candidates = tuple(sorted(set(candidates).union(accepted), key=lambda s: (-len(s), s)))
     if not candidates:
         return text
-    for secret in candidates:
-        if len(secret) < _MIN_REGISTERED_SECRET_LEN:
+    forms = [(secret, len(secret) < _MIN_REGISTERED_SECRET_LEN) for secret in candidates]
+    if "%" in text or "+" in text:
+        # A value written into a URL (a password in a connection string, a token in a query)
+        # is printed in its URL-encoded spelling: that spelling is the same secret.
+        forms.extend(
+            (spelling, short)
+            for secret, short in list(forms)
+            for spelling in _url_spellings(secret)
+        )
+        forms.sort(key=lambda form: (-len(form[0]), form[0]))
+    for secret, short in forms:
+        if short:
             # Held under a credential's key, at any length: masked where it stands as a whole
             # word (never inside ``development``), so the line around it survives.
             text = re.sub(
@@ -698,6 +715,32 @@ def redact_known_values(
         elif secret in text:
             text = text.replace(secret, placeholder)
     return text
+
+
+def _url_spellings(secret: str) -> tuple[str, ...]:
+    """How ``secret`` is spelled inside a URL, when that differs from ``secret``.
+
+    Percent-encoded as :func:`urllib.parse.quote` writes it (with ``/`` kept, its
+    default, and escaped, as in a userinfo), and form-encoded as
+    :func:`urllib.parse.quote_plus` and Java's ``URLEncoder`` write it (a space
+    as ``+``; Java keeps ``*`` and escapes ``~``). Each uses upper-case hex.
+    """
+    if _URL_PLAIN_RE.fullmatch(secret):
+        return ()
+    from urllib.parse import quote, quote_plus
+
+    try:
+        spellings = {
+            quote(secret),
+            quote(secret, safe=""),
+            quote_plus(secret),
+            quote_plus(secret, safe="*").replace("~", "%7E"),
+        }
+    except UnicodeError:
+        # A lone surrogate has no UTF-8 bytes, so no URL spelling; the log line must not fail.
+        return ()
+    spellings.discard(secret)
+    return tuple(sorted(spellings))
 
 
 # The pre-2026-10 name, kept so library callers keep working. Internal code

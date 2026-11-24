@@ -546,6 +546,30 @@ def test_a_failure_names_the_error_lines_above_a_long_stack_trace(project, tmp_p
     assert "SRCFG00014: The config property debezium.format.value is required" in error
 
 
+def test_a_failure_masks_the_password_in_its_url_encoded_spellings():
+    """A URL the server prints holds the password escaped: ``quote`` in a path or a userinfo,
+    ``quote_plus`` or Java's ``URLEncoder`` in a query."""
+    from urllib.parse import quote, quote_plus
+
+    held = "".join(("Zk4q@", "R9 tW/", "vL2x~*", "Pn8m"))
+    spellings = [
+        quote(held),
+        quote(held, safe=""),
+        quote_plus(held),
+        quote_plus(held, safe="*").replace("~", "%7E"),
+    ]
+    stdout = "".join(
+        f"ERROR io.debezium: POST http://sink.example/{s}/x refused\n" for s in spellings
+    )
+    proc = subprocess.CompletedProcess(["run.sh"], 1, stdout, "")
+
+    error = dbz._server_failure(proc, {"FLUID_DBZ_SOURCE_PASSWORD": held})
+
+    assert "debezium-server exited with code 1" in error
+    assert error.count("POST http://sink.example/") == 2 * len(spellings)  # errors and tail
+    assert not any(spelling in error for spelling in spellings)
+
+
 # ── the event format ───────────────────────────────────────────────────
 
 

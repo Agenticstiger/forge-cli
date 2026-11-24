@@ -162,6 +162,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once (a regular file in a real `data/` directory) and left in place. Behaviour change: a
   `properties.debezium.server_binary` inside the project or its checkout (by path, symlink or
   `PATH`) is refused.
+- **A credential forge holds is masked in its URL-encoded spellings too.** The exact-value
+  redaction masked a password only as written, so a log line or an error that printed a URL
+  holding it escaped (`p%40ss` for `p@ss`, as `quote`, `quote_plus` or Java's `URLEncoder` write
+  it) showed it. Those spellings are masked now as well: in the global redactor and the
+  Snowflake and local provider loggers, which share the registry, and in the report of a failed
+  Debezium Server run.
 - **An Iceberg sink names a variable only through `sink.catalogAuth`.** Iceberg's REST catalog
   replaces any property value that starts with `env:` by that variable of the process that runs
   the sink, so a contract that wrote `token: env:NAME` beside a catalog `uri` of its choosing sent
