@@ -631,12 +631,11 @@ def enforce_schema_policy_or_raise(ctx: Any, runner: Any) -> None:
     except Exception:  # pragma: no cover — defensive
         return
 
-    # The baseline is the schema of the expose THIS build lands, chosen as the DuckDB
-    # runner chooses it (``_build_expose``): the first expose, in contract order, that
-    # the build names in ``outputs``, else ``exposes[0]``. It used to be ``exposes[0]``
-    # for every build, so a second build was held to the first build's columns.
+    # The baseline is the schema of the expose THIS build lands: the first one its
+    # ``outputs`` resolves to (``build_output_exposes``, which refuses an unknown output or
+    # no outputs beside several exposes with its typed ``BuildOutputsError``).
     all_exposes = [e for e in ctx.contract.get("exposes") or [] if isinstance(e, dict)]
-    from fluid_build.util.contract import get_builds
+    from fluid_build.util.contract import build_output_exposes, get_builds
 
     build = next(
         (
@@ -646,11 +645,19 @@ def enforce_schema_policy_or_raise(ctx: Any, runner: Any) -> None:
         ),
         None,
     )
-    named = {o for o in (build or {}).get("outputs") or [] if isinstance(o, str)}
-    expose = next(
-        (e for e in all_exposes if e.get("exposeId") in named),
-        all_exposes[0] if all_exposes else {},
-    )
+    from fluid_build.util.contract import BuildOutputsError
+
+    try:
+        resolved = build_output_exposes(ctx.contract, build) if build is not None else []
+    except BuildOutputsError as exc:
+        # An output that is no exposeId always refuses. A build with no outputs beside
+        # several exposes refuses for the DuckDB runner (it lands one file), but the
+        # streaming runners' sinks legitimately cover every expose of a build that names
+        # none, so for them the first expose stays the schema baseline.
+        if exc.code != "build_outputs_undeclared" or getattr(runner, "name", None) == "duckdb":
+            raise
+        resolved = []
+    expose = resolved[0] if resolved else (all_exposes[0] if all_exposes else {})
     contract_block = expose.get("contract") or {}
     declared_schema = contract_block.get("schema") or []
     policy_str = contract_block.get("schemaPolicy") or "evolve_safe"

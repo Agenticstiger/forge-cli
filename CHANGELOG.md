@@ -19,7 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logging `local_sql_create_table_warn`, a materialize that fails is an error instead of
   `local_materialize_fallback`, and `apply()` with nothing to run raises instead of writing
   `runtime/out/demo_artifact.csv`. An expose that none of a contract's builds writes is refused
-  with `local_plan_invalid`; a contract with no builds at all lands nothing and applies (removing
+  with `local_plan_invalid`; a planner crash on the contract file exits 1 with
+  `apply_local_plan_failed`, as a plan.json does, instead of falling back to the action parser
+  (which ran the primary build only); a contract with no builds at all lands nothing and applies (removing
   the builds is how a Spark stream is stopped). A planned build the local engine has no SQL for is
   skipped when the plan only held ops this provider does not run. A materialize that a build runner lands
   (`payload.landed_by`) is reported as skipped. A build id with a hyphen
@@ -44,7 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build), the stages are checked before anything runs (so `--dry-run` refuses too), and the stages
   after a failed one do not run. Only a build whose `engine` is unset or `sql` runs its stages
   here; another engine's `stages` stay with that engine. All 13 bundled templates apply locally,
-  in the default mode and under `--mode amend-and-build`; `customer-360` keeps its five stages.
+  in the default mode and under `--mode amend-and-build`; `customer-360` keeps its five stages,
+  and its landed rows no longer depend on the day it runs (`high_value_customers` lands 3 rows):
+  its first two stages measure days since the newest order in the sample data, not `CURRENT_DATE`.
 - **The federation digest check runs on every apply engine.** `validate_federated_consumes` (the
   warn-only gate that reports a drifted `upstreamDigest` pin) was called only below the OpenTofu
   branch and the build modes' early returns, so `fluid apply` on aws / gcp / snowflake and
@@ -69,6 +73,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`incremental_append_json_needs_schema`), as are a column type with no DuckDB equivalent
   (`incremental_append_json_unmapped_type`) and a landed or already stored column the schema does
   not declare (`incremental_append_json_undeclared_column`).
+  Under a late-arrival policy an append judges only this run's own new rows, against the newest
+  event time across the file and the new rows, and writes the late ones to `__late_events` and
+  the on-time ones to the main file; earlier rows are never re-classified (a later run used to move
+  every earlier run's rows into `__late_events`). The cursor takes the newest value this run
+  landed, a failed side-file write fails the run and leaves the main file untouched, and a full
+  refresh with no late rows deletes an older `__late_events` file. The temp file is named for the
+  run beside the target (two overlapping runs no longer share one) and the directory is fsynced
+  after the rename.
 - **`--mode amend-and-build` lands each local SQL build in its own expose.** Every build was
   handed `exposes[0]`, so with two `engine: sql` builds the second overwrote the first build's
   file and its own expose was never written, exit 0. A build now writes the exposes its `outputs`
@@ -78,7 +90,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   several exposes, is refused before the build runs, with `build_output_unknown_expose` or
   `build_outputs_undeclared`. The acquisition schema-drift gate takes its baseline from the first
   expose, in contract order, that the build names in `outputs` (as the DuckDB runner lands it), and
-  from `exposes[0]` when it names none, not from `exposes[0]` for every build.
+  from `exposes[0]` when it names none, not from `exposes[0]` for every build. The DuckDB
+  acquisition runner chooses its expose through the same helper: an `outputs` entry that is no
+  exposeId, or no `outputs` beside several exposes, is refused before anything is written (it used
+  to land in `exposes[0]`), and the drift gate follows; the Debezium and Kafka Connect runners keep
+  owning every expose of a build that names none.
 - **`fluid apply` on the local engine lands each build in the expose its `outputs` name.**
   Applying a `plan.json` with the local provider used to answer the plan's abstract ops
   (`provisionDataset`, `scheduleTask`) by deriving ONE SQL action from the contract, the first

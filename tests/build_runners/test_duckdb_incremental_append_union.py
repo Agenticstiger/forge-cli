@@ -11,6 +11,7 @@ late-arrival side file is unioned the same way.
 
 from __future__ import annotations
 
+import json
 import os
 import types
 from pathlib import Path
@@ -39,10 +40,12 @@ def _source(tmp_path: Path, rows: List[tuple]) -> None:
     (tmp_path / "events.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _contract(tmp_path: Path, fmt: str, *, lateness: bool = False) -> Dict[str, Any]:
+def _contract(
+    tmp_path: Path, fmt: str, *, lateness: bool = False, mode: str = "incremental_append"
+) -> Dict[str, Any]:
     source: Dict[str, Any] = {
         "kind": "filesystem",
-        "mode": "incremental_append",
+        "mode": mode,
         "connection": {"uri": str(tmp_path / "events.csv")},
         "reader": {"format": "csv"},
         "streams": ["events"],
@@ -89,7 +92,7 @@ def _run(tmp_path: Path, contract: Dict[str, Any]) -> int:
 
 
 def _seqs(path: Path, fmt: str) -> List[int]:
-    reader = "read_parquet" if fmt == "parquet" else "read_csv_auto"
+    reader = {"parquet": "read_parquet", "csv": "read_csv_auto"}.get(fmt, "read_json_auto")
     con = duckdb.connect()
     try:
         return [
@@ -178,18 +181,25 @@ def test_late_events_keep_every_runs_late_rows_and_a_clean_run_does_not_truncate
     ]
 
 
-def test_a_failing_side_file_union_leaves_the_late_rows_in_the_main_file(tmp_path):
+def test_a_failing_side_file_union_fails_the_run_and_loses_no_row(tmp_path):
     contract = _contract(tmp_path, "parquet", lateness=True)
     lake = tmp_path / "lake"
     side = lake / "events__late_events.parquet"
     run1 = [(1, "2024-01-01 12:00:00"), (2, "2024-01-01 11:00:00")]
     _source(tmp_path, run1)
     assert _run(tmp_path, contract) == 0
+    good_side = side.read_bytes()
+    main_before = (lake / "events.parquet").read_bytes()
     side.write_bytes(b"corrupt")
-    _source(tmp_path, run1 + [(3, "2024-01-01 12:10:00"), (4, "2024-01-01 11:20:00")])
-    _run(tmp_path, contract)
-    assert side.read_bytes() == b"corrupt"
-    assert 4 in _seqs(lake / "events.parquet", "parquet")
+    run2 = run1 + [(3, "2024-01-01 12:10:00"), (4, "2024-01-01 11:20:00")]
+    _source(tmp_path, run2)
+    assert _run(tmp_path, contract) != 0
+    # The side file goes first: the main file is as it was, the cursor did not move.
+    assert (lake / "events.parquet").read_bytes() == main_before
+    side.write_bytes(good_side)
+    assert _run(tmp_path, contract) == 0
+    assert _seqs(side, "parquet") == [2, 4]
+    assert _seqs(lake / "events.parquet", "parquet") == [1, 3]
 
 
 @pytest.mark.parametrize("old_ids", [("007", "01234"), ("1.50", "2.50")])
@@ -417,3 +427,153 @@ def test_the_early_json_refusal_skips_a_remote_sink(tmp_path):
     assert not _json_append_to_local_file(remote, ["events"], ())
     full = _stub_ctx(tmp_path, "./lake/events.json", mode=runner_mod.AcquisitionMode.FULL_REFRESH)
     assert not _json_append_to_local_file(full, ["events"], ())
+
+
+# ── late arrival: only this run's rows are judged ─────────────────────────────
+
+ALL_FORMATS = ["parquet", "csv", "json", "ndjson"]
+
+
+def _late_run(tmp_path: Path, contract, rows) -> None:
+    _source(tmp_path, rows)
+    assert _run(tmp_path, contract) == 0
+
+
+def _ids(path: Path, fmt: str):
+    return _seqs(path, fmt) if path.exists() else None
+
+
+@pytest.mark.parametrize("fmt", ALL_FORMATS)
+def test_a_later_run_does_not_reclassify_earlier_rows_as_late(tmp_path, fmt):
+    contract = _contract(tmp_path, fmt, lateness=True)
+    run1 = [(1, "2024-01-01 12:00:00"), (2, "2024-01-01 12:01:00")]
+    _late_run(tmp_path, contract, run1)
+    _late_run(tmp_path, contract, run1 + [(3, "2024-01-01 14:00:00")])
+    lake = tmp_path / "lake"
+    assert _ids(lake / f"events.{fmt}", fmt) == [1, 2, 3]
+    assert not (lake / f"events__late_events.{fmt}").exists()
+
+
+@pytest.mark.parametrize("fmt", ALL_FORMATS)
+def test_late_rows_go_to_the_side_file_only_and_every_run_keeps_its_own(tmp_path, fmt):
+    contract = _contract(tmp_path, fmt, lateness=True)
+    run1 = [(1, "2024-01-01 12:00:00"), (2, "2024-01-01 12:01:00")]
+    _late_run(tmp_path, contract, run1)
+    run2 = run1 + [(3, "2024-01-01 12:10:00"), (4, "2024-01-01 11:00:00")]
+    _late_run(tmp_path, contract, run2)
+    lake = tmp_path / "lake"
+    side = lake / f"events__late_events.{fmt}"
+    assert _ids(lake / f"events.{fmt}", fmt) == [1, 2, 3]
+    assert _ids(side, fmt) == [4]
+    run3 = run2 + [(5, "2024-01-01 12:20:00"), (6, "2024-01-01 11:30:00")]
+    _late_run(tmp_path, contract, run3)
+    assert _ids(lake / f"events.{fmt}", fmt) == [1, 2, 3, 5]
+    assert _ids(side, fmt) == [4, 6]
+
+
+def test_a_late_row_with_the_highest_cursor_still_moves_the_cursor_past_it(tmp_path):
+    contract = _contract(tmp_path, "parquet", lateness=True)
+    run1 = [(1, "2024-01-01 12:00:00")]
+    _late_run(tmp_path, contract, run1)
+    run2 = run1 + [(9, "2024-01-01 10:00:00"), (2, "2024-01-01 12:05:00")]
+    _late_run(tmp_path, contract, run2)
+    _late_run(tmp_path, contract, run2)  # nothing new: the late row 9 is not read twice
+    assert _seqs(tmp_path / "lake" / "events__late_events.parquet", "parquet") == [9]
+
+
+@pytest.mark.parametrize("fmt", ["parquet", "csv"])
+def test_a_full_refresh_without_late_rows_removes_a_stale_side_file(tmp_path, fmt):
+    contract = _contract(tmp_path, fmt, lateness=True, mode="full_refresh")
+    lake = tmp_path / "lake"
+    _late_run(tmp_path, contract, [(1, "2024-01-01 12:00:00"), (2, "2024-01-01 11:00:00")])
+    side = lake / f"events__late_events.{fmt}"
+    assert _ids(side, fmt) == [2]
+    _late_run(tmp_path, contract, [(3, "2024-01-01 12:00:00")])
+    assert not side.exists()
+    assert _ids(lake / f"events.{fmt}", fmt) == [3]
+
+
+# ── overlapping rewrites ─────────────────────────────────────────────────────
+
+
+def test_overlapping_rewrites_of_one_target_never_corrupt_it_or_share_a_temp(tmp_path):
+    import threading
+
+    target = tmp_path / "t.parquet"
+    seed = duckdb.connect()
+    seed.execute(f"COPY (SELECT 0 AS seq) TO '{target}' (FORMAT 'parquet')")
+    seed.close()
+    errors: List[BaseException] = []
+
+    def work(worker: int) -> None:
+        con = duckdb.connect()
+        try:
+            con.execute(f"CREATE TABLE new_rows AS SELECT {worker} AS seq")
+            for _ in range(10):
+                _union_rewrite(con, str(target), "parquet", "new_rows")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            con.close()
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in (1, 2, 3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    rows = _seqs(target, "parquet")
+    assert 0 in rows and len(rows) >= 11
+    assert os.listdir(tmp_path) == ["t.parquet"]
+
+
+def test_each_rewrite_uses_its_own_temp_name(tmp_path):
+    from fluid_build.build_runners.duckdb.runner import _append_tmp_path
+
+    path = str(tmp_path / "t.parquet")
+    assert _append_tmp_path(path) != _append_tmp_path(path)
+    assert _append_tmp_path(path, "run-1") == _append_tmp_path(path, "run-1")
+    assert _append_tmp_path(path, "run-1") != _append_tmp_path(path, "run-2")
+
+
+# ── a build's outputs must resolve ───────────────────────────────────────────
+
+
+def _second_expose(contract):
+    other = json.loads(json.dumps(contract["exposes"][0]))
+    other["exposeId"] = "other"
+    other["binding"]["location"]["path"] = "./lake/other.parquet"
+    contract["exposes"].append(other)
+
+
+@pytest.mark.parametrize(
+    "outputs, code",
+    [
+        (None, "build_outputs_undeclared"),
+        (["nope"], "build_output_unknown_expose"),
+    ],
+)
+def test_a_build_whose_outputs_do_not_resolve_is_refused_before_any_write(tmp_path, outputs, code):
+    from fluid_build.util.contract import BuildOutputsError
+
+    contract = _contract(tmp_path, "parquet")
+    _second_expose(contract)
+    if outputs is None:
+        del contract["builds"][0]["outputs"]
+    else:
+        contract["builds"][0]["outputs"] = outputs
+    _source(tmp_path, [(1, "2024-01-01 12:00:00")])
+    with pytest.raises(BuildOutputsError) as caught:
+        _run(tmp_path, contract)
+    assert caught.value.code == code
+    assert not [f for f in (tmp_path / "lake").rglob("*") if f.is_file()]
+
+
+def test_the_first_resolved_output_is_the_one_landed(tmp_path):
+    contract = _contract(tmp_path, "parquet")
+    _second_expose(contract)
+    contract["builds"][0]["outputs"] = ["other", "events"]
+    _source(tmp_path, [(1, "2024-01-01 12:00:00")])
+    assert _run(tmp_path, contract) == 0
+    lake = tmp_path / "lake"
+    assert (lake / "other.parquet").is_file() and not (lake / "events.parquet").exists()

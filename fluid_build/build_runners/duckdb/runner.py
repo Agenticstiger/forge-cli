@@ -26,11 +26,13 @@ when it detects an acquisition build with ``engine: duckdb``.
 from __future__ import annotations
 
 import dataclasses
+import errno
 import functools
 import logging
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -765,6 +767,32 @@ def _fsync_path(path: str) -> None:
         os.close(fd)
 
 
+def _fsync_dir(path: str) -> None:
+    """Make the rename durable. A directory cannot be opened on Windows: nothing to do there."""
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EBADF):
+            raise
+    finally:
+        os.close(fd)
+
+
+def _append_tmp_path(path: str, run_id: Optional[str] = None) -> str:
+    """The temp file of one union rewrite, beside ``path``: unique, so overlapping runs
+    never share (and never unlink) each other's in-flight file. A run's name is derived from
+    its run id, so the sandbox can grant exactly that path before the connection locks."""
+    head, name = os.path.split(os.fspath(path))
+    token = re.sub(r"[^A-Za-z0-9_.-]", "_", str(run_id)) if run_id else uuid.uuid4().hex
+    return os.path.join(head, f".{name}.{token}.fluid-append")
+
+
 def _appends_to_file(ctx: RunContext, out_path: str, fmt: str, partitioned: Any) -> bool:
     """Whether this stream appends to a local single file that already holds rows.
 
@@ -789,6 +817,7 @@ def _union_rewrite(
     fmt: str,
     new_relation: str,
     json_columns: Optional[Dict[str, str]] = None,
+    run_id: Optional[str] = None,
 ) -> None:
     """Rewrite ``out_path`` as its rows plus those of ``new_relation`` (a table or view).
 
@@ -799,7 +828,7 @@ def _union_rewrite(
     cannot append to one file.
     """
     fmt = (fmt or "parquet").lower()
-    tmp = copy_tmp_path(out_path)  # the sibling the sandbox grants beside every landed file
+    tmp = _append_tmp_path(out_path, run_id)
     _remove_quietly(tmp)
     path = quote_ansi_string_literal(out_path)
     if fmt == "csv":
@@ -858,9 +887,72 @@ def _union_rewrite(
         con.execute(_build_copy_destination(tmp, fmt).replace("{select}", union, 1))
         _fsync_path(tmp)
         os.replace(tmp, out_path)
+        _fsync_dir(out_path)
     except BaseException:
         _remove_quietly(tmp)
         raise
+
+
+def _old_rows_sql(path: str, fmt: str, json_columns: Optional[Dict[str, str]]) -> str:
+    """The rows an appended file holds, read back as the union rewrite reads them: csv as
+    text, json by its declared types, parquet as stored."""
+    lit = quote_ansi_string_literal(path)
+    if fmt == "csv":
+        return f"SELECT * FROM read_csv({lit}, header = true, all_varchar = true)"
+    if fmt in ("json", "ndjson"):
+        spec = ", ".join(
+            f"{quote_ansi_string_literal(n)}: '{t}'" for n, t in (json_columns or {}).items()
+        )
+        return f"SELECT * FROM read_json({lit}, format = 'newline_delimited', columns = {{{spec}}})"
+    return f"SELECT * FROM read_parquet({lit})"
+
+
+def _late_file_path(out_path: str) -> str:
+    main = Path(out_path)
+    return str(main.with_name(main.stem + "__late_events" + main.suffix))
+
+
+def _split_new_rows(
+    con: Any,
+    out_path: str,
+    fmt: str,
+    column: str,
+    budget_seconds: float,
+    json_columns: Optional[Dict[str, str]],
+) -> Dict[str, int]:
+    """Split this run's rows (``__fl_append_new``) into ``__fl_append_ontime`` and
+    ``__fl_append_late``: a row is late when it is older than the newest event time known
+    (the file's rows and the new rows) minus the allowed lateness. Earlier runs' rows are
+    never reclassified: they were judged when they landed."""
+    ident = validate_ident(column)
+    types = {r[0]: r[1] for r in con.execute("DESCRIBE SELECT * FROM __fl_append_new").fetchall()}
+    seconds = int(budget_seconds)
+    if ident not in types or seconds <= 0:
+        con.execute(
+            "CREATE OR REPLACE TEMP TABLE __fl_append_ontime AS SELECT * FROM __fl_append_new"
+        )
+        con.execute(
+            "CREATE OR REPLACE TEMP TABLE __fl_append_late AS SELECT * FROM __fl_append_new LIMIT 0"
+        )
+    else:
+        old = _old_rows_sql(out_path, fmt, json_columns)
+        watermark = (
+            f'(SELECT max("{ident}") FROM (SELECT "{ident}" FROM __fl_append_new UNION ALL '
+            f'SELECT CAST("{ident}" AS {types[ident]}) FROM ({old})))'
+        )
+        late = f"\"{ident}\" < {watermark} - INTERVAL '{seconds}' SECOND"
+        con.execute(
+            f"CREATE OR REPLACE TEMP TABLE __fl_append_late AS SELECT * FROM __fl_append_new WHERE {late}"
+        )
+        con.execute(
+            "CREATE OR REPLACE TEMP TABLE __fl_append_ontime AS "
+            f"SELECT * FROM __fl_append_new WHERE NOT COALESCE({late}, false)"
+        )
+    counts = {}
+    for key, table in (("on_time", "__fl_append_ontime"), ("late", "__fl_append_late")):
+        row = first_row(con.execute(f"SELECT COUNT(*) FROM {table}"))
+        counts[key] = int(row[0]) if row else 0
+    return counts
 
 
 def _append_to_file(
@@ -869,15 +961,47 @@ def _append_to_file(
     fmt: str,
     landed_sel: str,
     json_columns: Optional[Dict[str, str]] = None,
+    *,
+    run_id: Optional[str] = None,
+    late: Optional[Tuple[str, float]] = None,
+    cursor_field: Optional[str] = None,
+    info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int]:
-    """Append the rows of ``landed_sel`` to the existing file; returns ``(rows appended,)``."""
+    """Append the rows of ``landed_sel`` to the existing file; returns ``(rows appended,)``.
+
+    With ``late`` (the event-time column and the allowed lateness) only this run's rows are
+    split: the on-time ones join the main file and the late ones the side file, which is
+    written first so a failure leaves the main file as it was. ``info`` receives the split's
+    counts and, when rows went to the side file, the newest cursor value this run landed.
+    """
     con.execute(f"CREATE OR REPLACE TEMP TABLE __fl_append_new AS {landed_sel}")
     try:
         count = first_row(con.execute("SELECT COUNT(*) FROM __fl_append_new"))
-        _union_rewrite(con, out_path, fmt, "__fl_append_new", json_columns)
+        main_rows = "__fl_append_new"
+        if late is not None:
+            counts = _split_new_rows(con, out_path, fmt, late[0], late[1], json_columns)
+            if info is not None:
+                info["late_counts"] = counts
+            if counts["late"]:
+                late_path = _late_file_path(out_path)
+                if Path(late_path).is_file():
+                    _union_rewrite(con, late_path, fmt, "__fl_append_late", json_columns, run_id)
+                else:
+                    copy = _build_copy_destination(late_path, fmt)
+                    con.execute(copy.replace("{select}", "SELECT * FROM __fl_append_late", 1))
+                main_rows = "__fl_append_ontime"
+                if info is not None and cursor_field:
+                    top = first_row(
+                        con.execute(
+                            f'SELECT MAX("{validate_ident(cursor_field)}") FROM __fl_append_new'
+                        )
+                    )
+                    info["cursor_max"] = top[0] if top else None
+        _union_rewrite(con, out_path, fmt, main_rows, json_columns, run_id)
         return (int(count[0]) if count else 0,)
     finally:
-        con.execute("DROP TABLE IF EXISTS __fl_append_new")
+        for table in ("__fl_append_new", "__fl_append_ontime", "__fl_append_late"):
+            con.execute(f"DROP TABLE IF EXISTS {table}")
 
 
 #: The file extension DuckDB gives a partition's files, by reader.
@@ -1049,7 +1173,13 @@ def _grant_destination(
         main = Path(dest)
         late = main.with_name(main.stem + "__late_events" + main.suffix)
         allow = allow.with_declared(
-            str(main), str(late), copy_tmp_path(main), copy_tmp_path(late), within=within
+            str(main),
+            str(late),
+            copy_tmp_path(main),
+            copy_tmp_path(late),
+            _append_tmp_path(str(main), ctx.run_id),
+            _append_tmp_path(str(late), ctx.run_id),
+            within=within,
         )
     return allow
 
@@ -1405,10 +1535,34 @@ def _run_post_land_hooks(
     return findings
 
 
+def _late_split_plan(ctx: RunContext) -> Optional[Tuple[str, float]]:
+    """``(event-time column, allowed lateness in seconds)`` when the build declares a
+    late-arrival policy and the contract names an event-time column, else ``None``."""
+    from .._late_arrival import _detect_event_time_column, extract_late_arrival_policy
+
+    policy = extract_late_arrival_policy(contract_or_source=ctx.source)
+    if not policy.get("enabled"):
+        return None
+    expose_schemas: List[Dict[str, Any]] = []
+    for expose in ctx.contract.get("exposes") or []:
+        sch = (expose.get("contract") or {}).get("schema")
+        if isinstance(sch, list):
+            expose_schemas.extend(sch)
+    column = _detect_event_time_column(expose_schemas)
+    if not column:
+        LOG.debug(
+            "late_arrival_split_skipped: no event-time column found in "
+            "contract.exposes[].contract.schema"
+        )
+        return None
+    return column, float(policy["allowed_lateness_seconds"])
+
+
 def _enforce_late_arrival_split(
     ctx: RunContext,
     stream_results: List[StreamResult],
     sink_format: str,
+    skip: Sequence[str] = (),
 ) -> Dict[str, Dict[str, int]]:
     """Split landed rows into on-time vs late events per the contract's
     ``WatermarkSpec.allowed_lateness``.
@@ -1423,32 +1577,12 @@ def _enforce_late_arrival_split(
     surfacing. Empty dict when no policy is configured (early return)
     or no streams to process.
     """
-    from .._late_arrival import (
-        _detect_event_time_column,
-        extract_late_arrival_policy,
-        split_late_events_in_duckdb,
-    )
+    from .._late_arrival import split_late_events_in_duckdb
 
-    policy = extract_late_arrival_policy(contract_or_source=ctx.source)
-    if not policy.get("enabled"):
+    plan = _late_split_plan(ctx)
+    if plan is None:
         return {}
-
-    # Resolve the event-time column from the contract's first expose
-    # schema. Fall back to the canonical names if the contract doesn't
-    # expose a schema (rare for production contracts).
-    expose_schemas: List[Dict[str, Any]] = []
-    for expose in ctx.contract.get("exposes") or []:
-        contract_block = expose.get("contract") or {}
-        sch = contract_block.get("schema")
-        if isinstance(sch, list):
-            expose_schemas.extend(sch)
-    event_time_column = _detect_event_time_column(expose_schemas)
-    if not event_time_column:
-        LOG.debug(
-            "late_arrival_split_skipped: no event-time column found in "
-            "contract.exposes[].contract.schema"
-        )
-        return {}
+    event_time_column, budget_seconds = plan
 
     import duckdb
 
@@ -1473,13 +1607,11 @@ def _enforce_late_arrival_split(
         )
         return {}
 
-    budget_seconds = float(policy["allowed_lateness_seconds"])
-
     results: Dict[str, Dict[str, int]] = {}
     con = _connect_for_destination(ctx)
     try:
         for stream_result in stream_results:
-            if stream_result.state != RunState.SUCCEEDED:
+            if stream_result.state != RunState.SUCCEEDED or stream_result.name in skip:
                 continue
             stream_name = stream_result.name
             main_path = _resolve_destination_path(ctx, stream_name, fmt, out_dir)
@@ -1515,7 +1647,12 @@ def _enforce_late_arrival_split(
                 continue
 
             if counts["late"] == 0:
-                # Nothing to do — leave the file alone.
+                # Nothing to do — leave the file alone. A full refresh replaced every
+                # row, so a side file an older run left no longer describes this file.
+                if ctx.source.mode is AcquisitionMode.FULL_REFRESH and not _is_remote_uri(
+                    str(late_path_obj)
+                ):
+                    _remove_quietly(str(late_path_obj))
                 results[stream_name] = counts
                 continue
 
@@ -1849,6 +1986,7 @@ def _persist_cursor_after_run(
     stream: str,
     out_path: str,
     sink_format: str,
+    landed_max: Any = None,
 ) -> bool:
     """After a successful incremental run, advance the cursor to the
     MAX value we just landed. Returns True if the cursor advanced.
@@ -1878,13 +2016,18 @@ def _persist_cursor_after_run(
     else:
         return False  # unsupported sink for cursor read-back
 
-    relation = _landed_relation(out_path, reader, _partition_columns(ctx))
-    con = _connect_for_destination(ctx)
-    try:
-        row = first_row(con.execute(f"SELECT MAX({cursor_field_safe}) FROM {relation}"))
-    finally:
-        con.close()
-    new_value = row[0] if row is not None else None
+    if landed_max is not None:
+        # Rows split off to the late-events file are not in the main file, but they are
+        # landed: the cursor must pass them.
+        new_value = landed_max
+    else:
+        relation = _landed_relation(out_path, reader, _partition_columns(ctx))
+        con = _connect_for_destination(ctx)
+        try:
+            row = first_row(con.execute(f"SELECT MAX({cursor_field_safe}) FROM {relation}"))
+        finally:
+            con.close()
+        new_value = row[0] if row is not None else None
     if new_value is None:
         return False
     ctx.state_store.set_cursor(
@@ -1925,6 +2068,9 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     from .._masking import MaskingPolicyError
 
     streams_to_run = list(ctx.source.streams) or runner._infer_streams(ctx)
+    # An output that is no exposeId (or none beside several exposes) refuses here, typed,
+    # before the gate, a write or a run-start event.
+    _build_expose(ctx)
     # Before the schema gate, so a masked column declared with a type its
     # strategy cannot produce is refused with that reason rather than reported
     # as drift; and before anything connects, so a refused run touches nothing.
@@ -2022,6 +2168,12 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     on_error = (quality_config.get("onError") or "fail").strip().lower()
     dlq_writer: Optional[DLQWriter] = None
     dlq_total_records = 0
+    # An append splits its own rows at land time (earlier runs' rows are never
+    # reclassified); the post-land split then skips those streams.
+    append_late_plan = (
+        _late_split_plan(ctx) if ctx.source.mode is AcquisitionMode.INCREMENTAL_APPEND else None
+    )
+    appended_late: Dict[str, Dict[str, int]] = {}
 
     try:
         con = secure_duckdb_connect(
@@ -2084,8 +2236,21 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                 # select re-reads the source, which a live database may have
                 # changed since, and a table holding exactly what the COPY
                 # wrote then failed verify against the larger number.
+                append_info: Dict[str, Any] = {}
                 if _appends_to_file(ctx, out_path, sink_format, partitioned):
-                    written = _append_to_file(con, out_path, sink_format, landed_sel, json_columns)
+                    written = _append_to_file(
+                        con,
+                        out_path,
+                        sink_format,
+                        landed_sel,
+                        json_columns,
+                        run_id=ctx.run_id,
+                        late=append_late_plan,
+                        cursor_field=ctx.source.cursor_field,
+                        info=append_info,
+                    )
+                    if "late_counts" in append_info:
+                        appended_late[stream] = append_info["late_counts"]
                 else:
                     written = first_row(con.execute(copy_sql))
                 if partitioned is not None:
@@ -2151,7 +2316,9 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                         dlq_total_records += bad_records_for_stream
 
                 # Persist cursor for next run (no-op for full refresh).
-                cursor_advanced = _persist_cursor_after_run(ctx, stream, out_path, sink_format)
+                cursor_advanced = _persist_cursor_after_run(
+                    ctx, stream, out_path, sink_format, append_info.get("cursor_max")
+                )
                 stream_results.append(
                     StreamResult(
                         name=stream,
@@ -2223,12 +2390,13 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     if failures == 0 and stream_results:
         try:
             late_arrival_split_results = _enforce_late_arrival_split(
-                ctx, stream_results, sink_format
+                ctx, stream_results, sink_format, skip=tuple(appended_late)
             )
         except Exception as exc:  # noqa: BLE001
             # Defensive: late-arrival split runs DuckDB SQL which may carry
             # DSN content; don't include exc body or full traceback.
             LOG.warning("late_arrival_split_failed: %s", type(exc).__name__)
+    late_arrival_split_results.update(appended_late)
 
     # BigQuery: the file is on local disk now; load it into the table. After
     # the late-arrival split, so the rows loaded are the rows that stayed. A
@@ -2924,22 +3092,24 @@ def _partitioned_write(
 
 
 def _build_expose(ctx: RunContext) -> Optional[Dict[str, Any]]:
-    """The expose this build writes: the first one its ``outputs`` names.
+    """The expose this build writes: the first one its ``outputs`` resolves to.
 
-    This was ``exposes[0]`` whatever the build, so in a contract with two
-    builds the second wrote to the first one's destination. For a BigQuery
-    binding that meant truncating another build's table with this build's rows
-    and reporting success. A build that declares no outputs, or names none that
-    exists, keeps ``exposes[0]``, which every single-expose contract resolves
-    to anyway.
+    It was ``exposes[0]`` whatever the build, so in a contract with two builds the
+    second wrote to the first one's destination (for a BigQuery binding, truncating
+    another build's table). :func:`build_output_exposes` is the one place that maps a
+    build to its exposes: an output that is no exposeId, or no outputs beside several
+    exposes, raises its typed ``BuildOutputsError``. A contract with one expose, or a
+    build the contract does not list, keeps ``exposes[0]``.
     """
+    from fluid_build.util.contract import build_output_exposes
+
     exposes = ctx.contract.get("exposes") or []
     build_id = getattr(ctx, "build_id", None)
     build = next((b for b in ctx.contract.get("builds") or [] if b.get("id") == build_id), None)
-    outputs = set((build or {}).get("outputs") or [])
-    for expose in exposes:
-        if expose.get("exposeId") in outputs:
-            return expose
+    if build is not None:
+        resolved = build_output_exposes(ctx.contract, build)
+        if resolved:
+            return resolved[0]
     return exposes[0] if exposes else None
 
 

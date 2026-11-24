@@ -317,7 +317,10 @@ def _run(contract, tmp_path, build=None):
             lambda c: c["builds"][0]["properties"]["sink"].__setitem__("catalog", "lakekeeper"),
             "disagrees with the expose's catalog 'glue'",
         ),
-        (lambda c: c.__setitem__("exposes", []), "has no expose with binding.format=iceberg"),
+        (
+            lambda c: (c.__setitem__("exposes", []), c["builds"][0].pop("outputs", None)),
+            "has no expose with binding.format=iceberg",
+        ),
     ],
     ids=["missing-uri", "type-and-impl", "sink-vs-expose", "no-expose"],
 )
