@@ -1157,10 +1157,26 @@ def _dlt_pipeline_setting_names(pipeline_name: str) -> FrozenSet[str]:
 
 #: Words that mark a flag or a number about how the connection is secured or
 #: where its socket goes (clickhouse ``staging_use_https``, a ``verify``,
-#: ``insecure`` or ``port`` field): such a field is not a harmless flag or count,
-#: since a project value could turn TLS off or move the connection.
+#: ``insecure``, ``validate_certificate``, ``check_hostname`` or ``port`` field):
+#: such a field is not a harmless flag or count, since a project value could
+#: turn TLS or its certificate check off or move the connection.
 _DLT_TRANSPORT_WORDS = frozenset(
-    {"https", "ssl", "tls", "verify", "insecure", "secure", "cert", "trust", "encrypt", "port"}
+    {
+        "cert",
+        "certificate",
+        "certificates",
+        "certs",
+        "encrypt",
+        "hostname",
+        "https",
+        "insecure",
+        "port",
+        "secure",
+        "ssl",
+        "tls",
+        "trust",
+        "verify",
+    }
 )
 
 

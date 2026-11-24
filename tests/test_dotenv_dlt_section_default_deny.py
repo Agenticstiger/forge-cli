@@ -352,6 +352,10 @@ def test_a_project_flag_that_turns_tls_off_is_refused(project: Path, name: str) 
         ("secure", True),
         ("grpc_port", True),
         ("trust_server_certificate", True),
+        ("validate_certificate", True),
+        ("check_certificates", True),
+        ("skip_certs", True),
+        ("check_hostname", True),
         ("create_indexes", False),
         ("keep_staged_files", False),
         ("info_tables_query_threshold", False),
@@ -362,6 +366,27 @@ def test_the_transport_flags_are_told_from_the_harmless_ones(field: str, weakens
     from fluid_build.build_runners.dlt.runner import _dlt_flag_weakens_transport
 
     assert _dlt_flag_weakens_transport(field) is weakens
+
+
+def test_a_project_flag_that_turns_the_certificate_check_off_is_refused(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No destination of dlt 1.27.2 has such a flag, so clickhouse's spec gets one here: a
+    ``validate_certificate`` the project's ``.env`` sets is refused as ``staging_use_https`` is."""
+    import dlt
+    from dlt.common.configuration import configspec
+
+    factory = dlt.destinations.clickhouse
+
+    @configspec
+    class _WithCertificateCheck(factory.spec):  # the spec the runner reads, one field more
+        validate_certificate: bool = True
+
+    monkeypatch.setattr(factory, "spec", _WithCertificateCheck)
+    name = "DESTINATION__CLICKHOUSE__VALIDATE_CERTIFICATE"
+    dotenv = f"{name}=false\nDESTINATION__CLICKHOUSE__CREATE_INDEXES=false\n"
+
+    assert _settings(project, dotenv, "clickhouse") == [name], "the harmless flag stays allowed"
 
 
 def test_a_harmless_project_flag_beside_it_is_still_allowed(project: Path) -> None:

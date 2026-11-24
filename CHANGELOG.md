@@ -200,9 +200,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reads them). `fluid apply` fails the dlt build and names the
   variables, never their values. Still allowed from a project `.env`: `environment`, boolean and
   integer destination settings other than those about transport security or the socket
-  (`staging_use_https`, a `verify`, `ssl`, `tls` or `port` field), and the type of a named
-  destination whose credentials the project itself supplies. What the operator sets (shell, CI, `.dlt` files) applies as before. Behaviour
-  change.
+  (`staging_use_https`, a `verify`, `ssl`, `tls`, `certificate`, `hostname` or `port` field),
+  and the type of a named destination whose credentials the project itself supplies. What the
+  operator sets (shell, CI, `.dlt` files) applies as before. Behaviour change.
 - **A pinned database attach hides this host's mysql and MariaDB client variables too.** During
   a pinned attach (the duckdb build runner and `fluid init --discover`) `MYSQL_USER`,
   `MYSQL_DATABASE`, `MARIADB_UNIX_PORT`, `MYSQL_HOME`, `MARIADB_HOME`, `LIBMYSQL_PLUGINS`,
