@@ -22,7 +22,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import pytest
 
 from fluid_build.secrets.policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST
-from fluid_build.util.env_templates import EnvTemplateError, check_env_pairing
+from fluid_build.util.env_templates import (
+    EnvTemplateError,
+    check_env_pairing,
+    check_host_templates,
+)
 from tests.build_runners.test_catalog_auth_sink import (
     _catalog,
     _dbz_contract,
@@ -283,7 +287,8 @@ def test_the_refusal_is_typed_and_says_what_to_do():
     assert error.code == "EnvTemplateHostError"
     assert error.extras["reason"] == "unpaired" and error.extras["variable"] == "DB_PW"
     assert error.where == "builds[0].properties.source.connection.password"
-    assert "DB_PW@<that host>" in error.fix and "secretRef" in error.fix
+    assert error.extras["entry"] == "DB_PW@attacker.example"
+    assert "DB_PW@attacker.example" in error.fix and "secretRef" not in error.fix
     assert _PROBE not in repr(error.__dict__)
 
 
@@ -351,15 +356,36 @@ def test_a_keyword_string_is_paired_for_any_host_or_not_at_all(monkeypatch):
     check_env_pairing(contract)
 
 
-def test_a_variable_in_the_sink_is_judged_against_the_exposes_the_build_writes():
+@pytest.mark.parametrize("outputs", [["data"], ["nonexistent"], [], "data", None])
+def test_every_expose_is_judged_whatever_outputs_names(outputs):
+    """Runners pick their own expose (``exposes[0]`` for dlt, airbyte and meltano; the first Iceberg
+    one for the Kafka Connect and Debezium sinks), so ``outputs`` is no promise of what is written.
+    """
+    contract = _airbyte_contract(
+        {"host": "localhost"},
+        exposes=[
+            {
+                "exposeId": "decoy",
+                "binding": {
+                    "location": {"host": "attacker.example", "password": "{{ env.DB_PW }}"}
+                },
+            },
+            {"exposeId": "data", "binding": {"location": {"path": "./out/x.parquet"}}},
+        ],
+    )
+    contract["builds"][0]["outputs"] = outputs
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    assert info.value.where == "exposes[0].binding.location.password"
+
+
+def test_a_variable_in_one_expose_goes_with_the_catalog_of_another():
     contract = _kc_contract(None, location=_catalog(_CATALOG_URI))
     contract["builds"][0]["properties"].pop("source")
     other = copy.deepcopy(contract["exposes"][0])
     other["exposeId"] = "elsewhere"
     other["binding"]["location"]["warehouse"] = "{{ env.DB_PW }}"
     contract["exposes"].append(other)
-    check_env_pairing(contract)  # ``outputs`` is ["data"]: that expose is not this build's
-    contract["builds"][0]["outputs"] = ["data", "elsewhere"]
     with pytest.raises(EnvTemplateError) as info:
         check_env_pairing(contract)
     assert info.value.where == "exposes[1].binding.location.warehouse"
@@ -388,3 +414,251 @@ def test_one_build_on_its_own_is_read_too():
 def test_nothing_to_judge_in_what_is_not_a_contract():
     for value in (None, [], "x", {"builds": "no"}, {"builds": [None, 3]}, {"build": {"id": "x"}}):
         check_env_pairing(value)
+
+
+# ── what the reviews found ───────────────────────────────────────────────────
+
+
+def _airbyte_contract(connection: Dict[str, Any], *, exposes: Optional[List[Any]] = None):
+    return {
+        "builds": [
+            {
+                "id": "b",
+                "engine": "airbyte",
+                "outputs": ["data"],
+                "properties": {"source": {"kind": "postgres", "connection": connection}},
+            }
+        ],
+        "exposes": exposes
+        or [{"exposeId": "data", "binding": {"location": {"path": "./out/x.parquet"}}}],
+    }
+
+
+@pytest.mark.parametrize(
+    "connection",
+    [
+        {"host": "attacker.example"},
+        {"host": "attacker.example:5432"},
+        {"uri": "postgres://u:{{ env.DB_PW }}@attacker.example:5432/db"},
+        {"connection_string": "postgres://attacker.example/db?sslmode={{ env.DB_PW }}"},
+    ],
+)
+def test_the_entry_the_refusal_suggests_clears_it(connection, monkeypatch):
+    """The text names the host as the contract wrote it, and the entry it suggests is the one the
+    policy matches (a bare ``host`` field keeps its port; a URI's does not count)."""
+    contract = _contract()
+    _source(contract).pop("host")
+    _source(contract).update({**connection, "password": "{{ env.DB_PW }}"})
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    error = info.value
+    assert "attacker.example" in error.what and "{{" not in error.what.split("}}", 1)[1]
+    assert "secretRef" not in error.fix
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, error.extras["entry"])
+    check_env_pairing(contract)
+
+
+def test_a_variable_in_a_urls_password_does_not_hide_its_literal_host():
+    contract = _contract()
+    _source(contract).pop("host")
+    _source(contract)["uri"] = "postgres://u:{{ env.DB_PW }}@attacker.example/db"
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    assert "host 'attacker.example'" in info.value.what
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "{{ env.H }}:5432",
+        "{{ env.U }}@{{ env.H }}",
+        "{{ env.U }}:{{ env.P }}@{{ env.H }}:5432",
+    ],
+)
+def test_a_whole_variable_host_keeps_its_port_and_userinfo(host, monkeypatch):
+    """A bare ``host`` field is read whole by the policy; the host part is still the operator's."""
+    for name, value in {"H": "db.internal", "U": "u", "P": "5432"}.items():
+        monkeypatch.setenv(name, value)
+    check_env_pairing(_contract(host=host, password="{{ env.DB_PW }}"))
+
+
+def test_a_tunnel_through_the_operators_own_bastion_needs_no_pairing(monkeypatch):
+    monkeypatch.setenv("H", "db.internal")
+    monkeypatch.setenv("B", "bastion.internal")
+    check_env_pairing(
+        _contract(
+            host="{{ env.H }}",
+            ssh_tunnel={"enable": True, "host": "{{ env.B }}"},
+            password="{{ env.DB_PW }}",
+        )
+    )
+
+
+def test_a_tunnel_through_a_host_the_contract_picks_is_refused_by_name():
+    contract = _contract(
+        host="{{ env.DB_PW }}",
+        ssh_tunnel={"enable": True, "host": "bastion.attacker.example"},
+    )
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    assert "bastion.attacker.example" in info.value.what
+    assert "ssh_tunnel.host" in info.value.what
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [("endpoint", "/v1/users"), ("uri", "/data/in.csv"), ("host", "/var/run/postgresql")],
+)
+def test_a_path_names_no_host(field, value):
+    """A REST ``endpoint: /v1/users``, a file ``uri``, a socket directory: nothing to pair with."""
+    contract = _contract()
+    _source(contract).pop("host")
+    _source(contract).update({field: value, "token": "{{ env.DB_PW }}"})
+    check_env_pairing(contract)
+
+
+def test_a_scheme_relative_uri_is_still_a_host():
+    contract = _contract()
+    _source(contract).pop("host")
+    _source(contract).update({"uri": "//attacker.example/x", "token": "{{ env.DB_PW }}"})
+    with pytest.raises(EnvTemplateError):
+        check_env_pairing(contract)
+
+
+@pytest.mark.parametrize(
+    "exposes, outputs",
+    [
+        ([{"id": ["x"], "binding": {"location": {"host": "a.example"}}}], ["x"]),
+        ([{"exposeId": None, "id": "x", "binding": {"location": {"host": "a.example"}}}], ["x"]),
+        ([{"exposeId": "x", "binding": {"location": {"host": "a.example"}}}], "abc"),
+        ([{"exposeId": 3, "binding": []}, None, "x"], None),
+    ],
+)
+def test_odd_shapes_never_raise_anything_but_a_refusal(exposes, outputs):
+    """A contract with no placeholder in it must reach the dispatcher's own checks unchanged."""
+    contract = {"builds": [{"outputs": outputs, "properties": {}}], "exposes": exposes}
+    check_env_pairing(contract)
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("bootstrap_servers", "attacker.example:9092"),
+        ("brokers", ["a.example:9092", "attacker.example:9092"]),
+        ("db_host", "a.example"),
+        ("HOST", "a.example"),
+        ("Host", "a.example"),
+        ("address", "a.example"),
+        ("account", "acme-org"),
+        ("server_hostname", "a.example"),
+    ],
+)
+def test_an_address_the_policy_does_not_read_needs_an_entry_for_any_host(key, value, monkeypatch):
+    """A pass-through connector may take its host from a field the policy has no name for. The
+    policy refuses a ``secretRef`` in a block that names no host it can read; so does this."""
+    contract = _airbyte_contract({key: value, "password": "{{ env.DB_PW }}"})
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    assert key in info.value.what and "any host" in info.value.fix
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "DB_PW@a.example")
+    with pytest.raises(EnvTemplateError):
+        check_env_pairing(contract)  # an entry for one host reads no host out of this field
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "DB_PW")
+    check_env_pairing(contract)
+
+
+@pytest.mark.parametrize(
+    "connection",
+    [
+        {"brokers": "{{ env.BROKERS }}"},  # the operator's own address
+        {"kind": "csv", "path": "{{ env.DIR }}/in.csv"},  # a local file names no host
+        {"bucket_url": "s3://a-bucket/prefix"},  # a store
+        {"endpoint_url": "/v1/data"},  # a path
+        {"account_id": "123456789012"},  # not an address
+        {"db_host": ""},  # names nothing
+        {"db_host": None},
+    ],
+)
+def test_what_is_not_an_address_is_not_judged_as_one(connection, monkeypatch):
+    monkeypatch.setenv("BROKERS", "kafka.internal:9092")
+    monkeypatch.setenv("DIR", "/data")
+    check_env_pairing(_airbyte_contract({**connection, "password": "{{ env.DB_PW }}"}))
+
+
+def test_a_variable_of_blanks_does_not_switch_the_check_off(monkeypatch):
+    """The build's render keeps a value of blanks, so the check reads it as a value too: an
+    endpoint that names one is judged, and nothing else in the block escapes with it."""
+    monkeypatch.setenv("BLANKVAR", "  ")
+    contract = _contract(
+        host="attacker.example",
+        uri="postgres://attacker.example:5432/db{{ env.BLANKVAR }}",
+        password="{{ env.DB_PW }}",
+    )
+    with pytest.raises(EnvTemplateError):
+        check_env_pairing(contract)
+
+
+def test_a_variable_of_blanks_in_a_host_does_not_hide_its_neighbour(monkeypatch):
+    monkeypatch.setenv("BLANK", "  ")
+    with pytest.raises(EnvTemplateError) as info:
+        check_host_templates({"host": "{{ env.BLANK }}{{ env.DB_PW }}.attacker.example"})
+    assert info.value.extras["reason"] == "unpaired"
+
+
+# ── the pass-through engines, through the dispatcher ─────────────────────────
+
+
+def _fake_airbyte(monkeypatch) -> List[Any]:
+    """Stand in for the Airbyte runner and record what it is handed."""
+    import fluid_build.build_runners.airbyte.runner as runner
+
+    calls: List[Any] = []
+
+    def fake(build, contract, contract_dir, *, dry_run, sample_rows=None):
+        calls.append(build)
+        return 0
+
+    monkeypatch.setattr(runner, "execute_airbyte_build", fake)
+    return calls
+
+
+def test_a_broker_the_contract_picks_gets_no_variable_through_a_pass_through_engine(
+    tmp_path: Path, monkeypatch, capsys
+):
+    from fluid_build.build_runners.base import _execute_acquisition_build
+
+    calls = _fake_airbyte(monkeypatch)
+    monkeypatch.delenv(SECRET_REF_ALLOWLIST, raising=False)
+    monkeypatch.setenv("KAFKA_PW", _PROBE)
+    jaas = 'PlainLoginModule required username="u" password="{{ env.KAFKA_PW }}";'
+    contract = _airbyte_contract(
+        {"bootstrap_servers": "attacker.example:9092", "protocol": {"sasl_jaas_config": jaas}}
+    )
+
+    assert _execute_acquisition_build(contract["builds"][0], contract, tmp_path, dry_run=False) == 1
+    shown = capsys.readouterr()
+    assert calls == [], "the connector was never started"
+    assert "KAFKA_PW" in shown.out + shown.err and _PROBE not in shown.out + shown.err
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "KAFKA_PW")
+    assert _execute_acquisition_build(contract["builds"][0], contract, tmp_path, dry_run=False) == 0
+    assert _PROBE in repr(calls), "once the operator allows it, the value is rendered"
+
+
+def test_a_decoy_expose_ahead_of_the_output_is_judged(engine, tmp_path: Path, monkeypatch, capsys):
+    """The Kafka Connect and Debezium sinks read the first Iceberg expose; ``outputs`` names another."""
+    contract_for, pushed = engine
+    monkeypatch.setenv("DB_PW", _PROBE)
+    contract = contract_for()
+    decoy = copy.deepcopy(contract["exposes"][0])
+    decoy["exposeId"] = "decoy"
+    decoy["binding"]["location"].update(
+        {"uri": "https://catalog.attacker.example/catalog", "warehouse": "{{ env.DB_PW }}"}
+    )
+    contract["exposes"].insert(0, decoy)
+
+    assert _dispatch(contract, tmp_path) == 1
+    shown = capsys.readouterr()
+    assert "catalog.attacker.example" in shown.out + shown.err
+    assert _PROBE not in shown.out + shown.err and _PROBE not in pushed()
+    assert "attacker.example" not in pushed()

@@ -39,6 +39,12 @@ The rules, for every caller:
   address and the contract only named the variable. Rendered into
   ``https://{{ env.TOKEN }}.attacker.example`` a secret would be sent, in the host
   name, to whoever owns the domain.
+* On the same path a variable is not the contract's to send to a host of its own
+  choosing either (:func:`check_env_pairing`). Whatever it is called, a variable in a
+  build's source or sink block renders only when every endpoint of those blocks is this
+  machine, a host written as one whole ``{{ env.* }}``, or a host the operator paired
+  with it: ``host: attacker.example`` beside ``password: "{{ env.DB_PW }}"`` would send DB_PW
+  there, and a name cannot tell DB_PW, PGPASS or DATABASE_URL from a harmless variable.
 
 Borrowed from the strict modes of ``envsubst -no-unset`` (collect every missing
 name, then fail), Docker Compose's ``${VAR:?}`` (unset or empty is an error) and
@@ -238,7 +244,7 @@ def render_contract(
                 refuse_sensitive(name)
                 return match.group(0)
             rendered = env.get(name)
-            if _has_value(rendered, strip):
+            if rendered is not None and _has_value(rendered, strip):
                 return rendered
             missing.setdefault(name, []).append(where)
             return match.group(0)
@@ -467,7 +473,10 @@ def check_host_templates(
         )
         if not names:
             return
-        if any(not _has_value(env.get(raw.strip())) for raw in ENV_TEMPLATE_RE.findall(authority)):
+        if any(
+            not _has_value(env.get(raw.strip()), strip=False)
+            for raw in ENV_TEMPLATE_RE.findall(authority)
+        ):
             return  # render_contract reports the missing variable
         rendered = ENV_TEMPLATE_RE.sub(lambda m: env[m.group(1).strip()], authority)
         hosts = _hosts_of(rendered) or [""]
@@ -539,6 +548,24 @@ def _replaced_at(node: Any, path: Tuple[Any, ...], text: str) -> Any:
     return node
 
 
+def _removed_at(node: Any, path: Tuple[Any, ...]) -> Any:
+    """A copy of ``node`` without what ``path`` names (a list item becomes ``None`` so that the
+    other indexes keep their place); what is not on the path is shared."""
+    head, rest = path[0], path[1:]
+    if isinstance(node, Mapping):
+        mapping = dict(node)
+        if rest:
+            mapping[head] = _removed_at(node[head], rest)
+        else:
+            mapping.pop(head, None)
+        return mapping
+    if isinstance(node, (list, tuple)):
+        items = list(node)
+        items[head] = _removed_at(items[head], rest) if rest else None
+        return items
+    return node
+
+
 def _names_in(node: Any, where: str, found: Dict[str, str]) -> None:
     """Each variable ``node`` names, with the first field that writes it, in the order written."""
     if isinstance(node, str):
@@ -566,30 +593,98 @@ def _authority_span(text: str) -> Optional[Tuple[int, int]]:
     return None if "=" in text[start:end] else (start, end)
 
 
-def _rendered_endpoint(text: str, env: Mapping[str, str]) -> Optional[str]:
+#: What :func:`_rendered_endpoint` returns for a field that names no endpoint at all.
+_NOT_AN_ENDPOINT = object()
+
+
+def _is_path(text: str) -> bool:
+    """Whether ``text`` is a path (a REST ``endpoint: /v1/users``, a file ``uri: /data/in.csv``, a
+    socket directory), which names no host: it starts with ``/`` but not ``//`` and holds no ``://``.
+    """
+    body = text.strip()
+    return body.startswith("/") and not body.startswith("//") and "://" not in body
+
+
+def _split_hostport(hostport: str) -> Tuple[str, str]:
+    """``host:port`` as ``(host, ":port")``; an IPv6 literal keeps its colons."""
+    port_at = hostport.rfind(":")
+    if port_at != -1 and hostport.find("]", port_at) == -1:
+        return hostport[:port_at], hostport[port_at:]
+    return hostport, ""
+
+
+def _rendered_endpoint(text: str, env: Mapping[str, str]) -> Any:
     """An endpoint field as the secret policy should judge it: its variables rendered, except a
     host that is one whole variable, which stands as ``localhost``: the operator chose that
-    address and the contract only named the variable (:func:`check_host_templates`).
+    address and the contract only named the variable (:func:`check_host_templates`). A URL keeps
+    its userinfo, port and path around it; a bare host field, which the policy reads whole, is
+    ``localhost`` whole.
 
-    ``None`` when a variable it names is not set: :func:`render_contract` says which.
+    ``None`` when a variable it names is not set (:func:`render_contract` says which);
+    :data:`_NOT_AN_ENDPOINT` when the field is a path.
     """
     names = [raw.strip() for raw in ENV_TEMPLATE_RE.findall(text)]
-    if not names:
-        return text
-    if any(not _has_value(env.get(name)) for name in names):
+    if any(not _has_value(env.get(name), strip=False) for name in names):
         return None
-    span = _authority_span(text)
-    if span is not None:
-        start, end = span
-        userinfo, at, hostport = text[start:end].rpartition("@")
-        port_at = hostport.rfind(":")
-        if port_at != -1 and hostport.find("]", port_at) == -1:
-            hostname, port = hostport[:port_at], hostport[port_at:]
-        else:
-            hostname, port = hostport, ""
-        if _is_one_template(hostname):
-            text = text[:start] + userinfo + at + "localhost" + port + text[end:]
-    return ENV_TEMPLATE_RE.sub(lambda match: env[match.group(1).strip()], text)
+    if names:
+        span = _authority_span(text)
+        if span is not None:
+            start, end = span
+            userinfo, at, hostport = text[start:end].rpartition("@")
+            hostname, port = _split_hostport(hostport)
+            if _is_one_template(hostname):
+                if _URL_START.match(text) is not None:
+                    text = text[:start] + userinfo + at + "localhost" + port + text[end:]
+                elif end == len(text):
+                    return "localhost"
+        text = ENV_TEMPLATE_RE.sub(lambda match: env[match.group(1).strip()], text)
+    return _NOT_AN_ENDPOINT if _is_path(text) else text
+
+
+#: A field name (lower case, letters and digits only) that says it holds an address: Kafka's
+#: ``bootstrap_servers``, ``brokers``, ``db_host``, ``address``, a Snowflake ``account``. The
+#: policy reads some of these (``host``, ``uri``, ``server``, ``endpoint``) and not the rest.
+_ADDRESS_KEY = re.compile(r"(?:host|hostname|server|broker|address|endpoint|url|uri)s?$|account$")
+
+
+def _names_an_address(text: str, unjudged_schemes: Any) -> bool:
+    """Whether ``text`` may be an address: not blank, not a path, not one whole variable (the
+    operator's choice), and not a store or a local file (``s3://bucket``, ``sqlite:///x``)."""
+    body = text.strip()
+    if not body or _is_path(body) or _is_one_template(body):
+        return False
+    url = _URL_START.match(body)
+    return url is None or _control_free(body[: url.end() - 3]).lower() not in unjudged_schemes
+
+
+def _unread_addresses(block: Mapping[str, Any], targets: Optional[List[Any]]) -> List[str]:
+    """The top-level fields of ``block`` that are named for an address and hold one, but that
+    ``secrets.policy`` read no endpoint from (its walk reads ``host``, ``uri``, ``server``,
+    ``endpoint``, a URI under any name, ...; not ``bootstrap_servers``, ``db_host`` or ``Host``).
+
+    A connector that takes its host from one sends the block's variables there, so the policy's own
+    answer for a block that names no endpoint it can read, refusal, is this check's answer here:
+    only an entry for any host clears it.
+    """
+    from fluid_build.secrets.policy import _UNJUDGED_SCHEMES
+
+    read = {t.path for t in targets or [] if t.path}
+    found: List[str] = []
+    for key, value in block.items():
+        if (key,) in read or not _ADDRESS_KEY.search(re.sub(r"[^a-z0-9]", "", str(key).lower())):
+            continue
+        texts = (
+            [value]
+            if isinstance(value, str)
+            else (
+                [item for item in value if isinstance(item, str)]
+                if isinstance(value, (list, tuple))
+                else []
+            )
+        )
+        if any(_names_an_address(text, _UNJUDGED_SCHEMES) for text in texts):
+            found.append(str(key))
+    return found
 
 
 def _names_no_endpoint(targets: Optional[List[Any]]) -> bool:
@@ -606,8 +701,11 @@ def _names_no_endpoint(targets: Optional[List[Any]]) -> bool:
     )
 
 
-def _endpoint_view(block: Mapping[str, Any], env: Mapping[str, str]) -> Optional[Mapping[str, Any]]:
-    """``block`` with only its endpoint fields rendered, for the secret policy to judge.
+def _endpoint_view(
+    block: Mapping[str, Any], env: Mapping[str, str]
+) -> Tuple[Optional[Mapping[str, Any]], List[str]]:
+    """``block`` with only its endpoint fields rendered, for the secret policy to judge, and the
+    fields named for an address that the policy reads no endpoint from (:func:`_unread_addresses`).
 
     The endpoints are the ones ``secrets.policy`` finds in the block as written (a host, a URI,
     a keyword string, a query string that names a host, a tunnel's host, ...). ``None`` when
@@ -618,21 +716,32 @@ def _endpoint_view(block: Mapping[str, Any], env: Mapping[str, str]) -> Optional
     from fluid_build.secrets.policy import _destination_targets
 
     targets = _destination_targets(block, None)
+    unread = _unread_addresses(block, targets)
     if targets is None or _names_no_endpoint(targets):
-        return None
+        return None, unread
     view: Any = block
+    tunnels = {t.path for t in targets if t.tunnel and t.path}
+    operators_tunnels: List[Any] = []
     for path in dict.fromkeys(t.path for t in targets if t.path):
         leaf = _value_at(block, path)
         if not isinstance(leaf, str):
             continue
         text = _rendered_endpoint(leaf, env)
         if text is None:
-            return None
-        view = _replaced_at(view, path, text)
+            return None, unread
+        if path in tunnels and _is_one_template(leaf):
+            # The operator's own bastion, like any host that is one whole variable.
+            operators_tunnels.append(path[0])
+        elif text is _NOT_AN_ENDPOINT:
+            view = _removed_at(view, path)
+        else:
+            view = _replaced_at(view, path, text)
+    for field in operators_tunnels:
+        view = _removed_at(view, (field,))
     # What the policy reads once the endpoints are rendered: a lone word such as ``localhost``
     # under a nested field names no host there, so a block may have none left to judge.
     after = _destination_targets(view, None)
-    return None if after is None or _names_no_endpoint(after) else view
+    return (None if after is None or _names_no_endpoint(after) else view), unread
 
 
 def _unpaired(name: str, view: Mapping[str, Any], env: Mapping[str, str]) -> bool:
@@ -656,11 +765,28 @@ def _unpaired(name: str, view: Mapping[str, Any], env: Mapping[str, str]) -> boo
     return False
 
 
+def _host_written_literally(written: Any) -> bool:
+    """Whether the host of the field ``written`` is text the contract wrote, whatever a variable
+    in its userinfo, path or query renders to: a URL's scheme and host part, or a bare host whole.
+    """
+    if not isinstance(written, str):
+        return False
+    if "{{" not in written:
+        return True
+    url = _URL_START.match(written)
+    if url is None:
+        return False
+    authority = written[url.end() : _authority_end(written, url.end())]
+    return "{{" not in written[: url.end()] and "{{" not in authority.rpartition("@")[2]
+
+
 def _describe_endpoint(
     name: str, view: Mapping[str, Any], block: Mapping[str, Any], block_where: str, env: Any
-) -> str:
+) -> Tuple[str, Optional[str]]:
     """The endpoint of ``block`` that variable ``name`` is not paired with, as the contract wrote
-    it: a literal host by name, a host a variable makes by its field, never a rendered value."""
+    it, and the host to name in the allowlist entry: a literal host by name (exactly as the policy
+    reads it, a port included in a bare host field), a host a variable makes by its field, never a
+    rendered value. The host is ``None`` for an endpoint no host can be named for."""
     from fluid_build.secrets.policy import _destination_targets, variable_allowed
 
     targets = _destination_targets(view, None) or []
@@ -670,22 +796,44 @@ def _describe_endpoint(
         ):
             continue
         field = _dotted(block_where, target.path) if target.path else block_where
-        written = _value_at(block, target.path) if target.path else None
         if target.host is None or target.quiet or target.keyword_text is not None:
-            return f"a destination this check cannot read ({field})"
-        if isinstance(written, str) and "{{" not in written:
-            return f"host {target.host!r} ({field})"
-        return f"the host that {field} renders to"
-    return f"an endpoint of {block_where}"
+            return f"a destination this check cannot read ({field})", None
+        written = _value_at(block, target.path) if target.path else None
+        if _host_written_literally(written):
+            return f"host {target.host!r} ({field})", target.host
+        return f"the host that {field} renders to", ""
+    return f"an endpoint of {block_where}", None
 
 
 def _pairing_refusal(
-    name: str, written_at: str, endpoint: str, *, stage: Optional[str]
+    name: str, written_at: str, endpoint: Tuple[str, Optional[str]], *, stage: Optional[str]
 ) -> EnvTemplateError:
     """The refusal for variable ``name``, written at ``written_at``, sent to ``endpoint``."""
+    where, host = endpoint
+    placeholder = "{{ env.* }}"
+    if host:
+        entry = f"{name}@{host}"
+        fix = (
+            f"Add {entry} to FLUID_ACQUISITION_SECRET_REF_ALLOWLIST in the operator environment, "
+            f"or write the host as one {placeholder} placeholder."
+        )
+    elif host == "":
+        entry = f"{name}@<the host it renders to>"
+        fix = (
+            f"Add {entry} to FLUID_ACQUISITION_SECRET_REF_ALLOWLIST in the operator environment "
+            "(the host it renders to where fluid apply runs, without a port), or write the host as "
+            f"one {placeholder} placeholder."
+        )
+    else:
+        entry = name
+        fix = (
+            "This check cannot read a host there, so only an entry for any host clears it: add "
+            f"{name} to FLUID_ACQUISITION_SECRET_REF_ALLOWLIST in the operator environment, or "
+            f"write the host as a plain host field or one {placeholder} placeholder."
+        )
     return EnvTemplateError(
         what=(
-            f"{{{{ env.{name} }}}} is sent to {endpoint}, and the operator has not paired "
+            f"{{{{ env.{name} }}}} is sent to {where}, and the operator has not paired "
             f"{name} with that host"
         ),
         where=written_at,
@@ -695,13 +843,15 @@ def _pairing_refusal(
             "have the value sent there. The name cannot tell a secret from any other variable "
             "(DB_PW, PGPASS and DATABASE_URL look like none)." + (f" ({stage})" if stage else "")
         ),
-        fix=(
-            f"Add {name}@<that host> to FLUID_ACQUISITION_SECRET_REF_ALLOWLIST in the operator "
-            "environment (the host, without a port), give the value to the connector as a "
-            "secretRef, or write the host as one {{ env.* }} placeholder."
-        ),
+        fix=fix,
         doc=doc_url(),
-        extras={"variable": name, "field": written_at, "reason": "unpaired", "endpoint": endpoint},
+        extras={
+            "variable": name,
+            "field": written_at,
+            "reason": "unpaired",
+            "endpoint": where,
+            "entry": entry,
+        },
         code="EnvTemplateHostError",
     )
 
@@ -732,9 +882,9 @@ def _blocks_of(contract: Mapping[str, Any], base: str, build: Mapping[str, Any])
     """The groups of a build (:data:`_Group`).
 
     The source: ``properties.source``, judged as a whole and as its ``connection`` (the block a
-    runner hands the policy). The sink: ``properties.sink`` and the ``binding.location`` of each
-    expose the build writes (``outputs``, else every expose), which carry the catalog's address and
-    the settings sent to it, ``catalogAuth`` included.
+    runner hands the policy). The sink: ``properties.sink`` and the ``binding.location`` of every
+    expose, which carry the catalog's address and the settings sent to it, ``catalogAuth``
+    included.
     """
     props = build.get("properties")
     if not isinstance(props, Mapping):
@@ -750,15 +900,15 @@ def _blocks_of(contract: Mapping[str, Any], base: str, build: Mapping[str, Any])
     sink_blocks: List[_Block] = []
     if isinstance(props.get("sink"), Mapping):
         sink_blocks.append((f"{base}.properties.sink", props["sink"]))
+    # Every expose, not only the ones ``outputs`` names: a runner picks its own (``exposes[0]`` for
+    # dlt, airbyte and meltano, the first Iceberg expose for the Kafka Connect and Debezium sinks, and
+    # ``exposes[0]`` again when ``outputs`` names none that exists), so ``outputs`` is no promise of
+    # what is written where.
     exposes = contract.get("exposes")
-    outputs = {o for o in (build.get("outputs") or []) if isinstance(o, str)}
     for index, expose in enumerate(exposes if isinstance(exposes, list) else []):
-        if not isinstance(expose, Mapping):
-            continue
-        expose_id = expose.get("exposeId", expose.get("id"))
-        binding = expose.get("binding")
+        binding = expose.get("binding") if isinstance(expose, Mapping) else None
         location = binding.get("location") if isinstance(binding, Mapping) else None
-        if isinstance(location, Mapping) and (not outputs or expose_id in outputs):
+        if isinstance(location, Mapping):
             sink_blocks.append((f"exposes[{index}].binding.location", location))
     if sink_blocks:
         groups.append((list(sink_blocks), list(sink_blocks)))
@@ -787,30 +937,43 @@ def check_env_pairing(
     ``secretRef`` in the block meets, so its reading of a destination (keyword strings, query
     strings that name a host, tunnels, failover hosts, Snowflake's account) is not repeated
     here, and a blank or unreadable endpoint refuses. A block whose one destination is an object
-    store, or that names no endpoint, passes: that is the gap the policy documents. A variable
-    that is unset is left to :func:`render_contract`, which says so.
+    store, or that names no endpoint and no field named for an address, passes: that is the gap the
+    policy documents, and a local file source. A field named for an address that the policy reads
+    nothing from (``bootstrap_servers``, ``db_host``, ``Host``) is an endpoint this check cannot
+    read, which only an entry for any host clears (:func:`_unread_addresses`). A variable that is
+    unset or empty is left to :func:`render_contract`, which says so.
 
     Raises :class:`EnvTemplateError` (``EnvTemplateHostError``, reason ``unpaired``) naming the
     variable, the field that writes it and the endpoint as written, never a rendered value.
     """
     if not isinstance(contract, Mapping):
         return
+    from fluid_build.secrets.policy import variable_allowed
+
     env = os.environ if environ is None else environ
     for base, build in _builds_of(contract):
         for named, judged in _blocks_of(contract, base, build):
             names: Dict[str, str] = {}
             for where, node in named:
                 _names_in(node, where, names)
-            names = {name: at for name, at in names.items() if _has_value(env.get(name))}
+            # Unset or empty, as the render of a build reads it (it keeps a value of blanks): the
+            # render refuses those by name. A value of blanks is a value, and is judged like one.
+            names = {
+                name: at for name, at in names.items() if _has_value(env.get(name), strip=False)
+            }
             if not names:
                 continue
             for block_where, block in judged:
-                view = _endpoint_view(block, env)
-                if view is None:
-                    continue
+                view, unread = _endpoint_view(block, env)
                 for name, written_at in names.items():
-                    if _unpaired(name, view, env):
+                    if view is not None and _unpaired(name, view, env):
                         endpoint = _describe_endpoint(name, view, block, block_where, env)
+                        raise _pairing_refusal(name, written_at, endpoint, stage=stage)
+                    if unread and not variable_allowed(
+                        name, None, environ=env, loopback_exempt=False
+                    ):
+                        where = _dotted(block_where, (unread[0],))
+                        endpoint = (f"a destination this check cannot read ({where})", None)
                         raise _pairing_refusal(name, written_at, endpoint, stage=stage)
 
 
