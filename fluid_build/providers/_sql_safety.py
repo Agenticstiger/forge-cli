@@ -22,6 +22,43 @@ _SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
 # open a statement or a comment, so the ``;`` / ``--`` / ``/* */`` and
 # blocked-keyword guards below still hold.
 _SAFE_EXPR_CHARS = re.compile(r"^[A-Za-z0-9_\s().,<>=!'+\-*/%|&\"`:\[\]]+\Z")
+
+#: DuckDB functions a caller-supplied statement may not call. The logging functions:
+#: ``enable_logging(storage='file')`` with no path makes a DuckDB 1.5.x process abort at
+#: exit (SIGABRT), and the logs can hold other queries' text. And the table functions
+#: that run a statement given as text (``query``, ``query_table``,
+#: ``json_execute_serialized_sql``): a name assembled at run time, such as
+#: ``query('SEL' || 'ECT * FROM enable_' || 'logging()')``, never shows in the text a
+#: check here reads. Refused as a call, in any case, quoted (``"`` or a backtick, which
+#: DuckDB 2.0 reads as an identifier quote) or schema-qualified; a column
+#: that only shares a name (``enable_logging``, ``query``) is not a call.
+DUCKDB_REFUSED_FUNCTIONS = frozenset(
+    {
+        "disable_logging",
+        "enable_logging",
+        "json_execute_serialized_sql",
+        "query",
+        "query_table",
+        "truncate_duckdb_logs",
+        "write_log",
+    }
+)
+#: DuckDB's log views and functions read as a relation: refused by name, called or not.
+DUCKDB_LOG_RELATIONS = frozenset({"duckdb_log_contexts", "duckdb_logs", "duckdb_logs_parsed"})
+DUCKDB_LOGGING_NAMES = DUCKDB_REFUSED_FUNCTIONS | DUCKDB_LOG_RELATIONS
+
+_DUCKDB_REFUSED_RE = re.compile(
+    r"(?i)\b(?:" + "|".join(sorted(DUCKDB_LOG_RELATIONS)) + r")\b"
+    r"|\b(?:" + "|".join(sorted(DUCKDB_REFUSED_FUNCTIONS)) + r')["`]?\s*\('
+)
+
+
+def names_refused_duckdb_function(sql: str) -> bool:
+    """Whether ``sql`` calls one of :data:`DUCKDB_REFUSED_FUNCTIONS` or names one of
+    :data:`DUCKDB_LOG_RELATIONS`."""
+    return _DUCKDB_REFUSED_RE.search(sql) is not None
+
+
 _BLOCKED_EXPR_TOKENS = re.compile(
     r"(?i)\b("
     r"alter|call|copy|create|delete|drop|execute|grant|insert|merge|put|remove|"
@@ -463,6 +500,8 @@ def validate_sql_expression_allowlist(expr: str) -> str:
         raise ValueError(f"Invalid SQL expression: {expr!r}")
 
     if _BLOCKED_EXPR_TOKENS.search(candidate):
+        raise ValueError(f"Invalid SQL expression: {expr!r}")
+    if names_refused_duckdb_function(candidate):
         raise ValueError(f"Invalid SQL expression: {expr!r}")
 
     return candidate

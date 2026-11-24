@@ -158,14 +158,19 @@ What the sandbox can and cannot promise (and why the floor is DuckDB 1.5.0):
   refused as it should be, but ``SELECT * FROM enable_logging(...)`` is
   accepted, and the sandbox's own path refusal is then thrown from DuckDB's
   logger write path as an uncaught C++ exception that aborts the process
-  (SIGABRT; reproduced on 1.5.1 and 1.5.6, refused cleanly on 2.0.0). So on
-  1.5.x one statement can end the process rather than raise something
-  :func:`is_sandbox_refusal` can classify. It widens no grant -- the failure is
-  availability, not confidentiality -- and the engine's own SQL never spells
-  it; the exposure is a free-form SQL surface, such as the MCP output port's
-  ``query_sql`` under ``policy.allow_free_form_sql``, whose SELECT-only gate a
-  table function passes. Denying those functions belongs in that gate, not
-  here: no connection setting can take back what the lock does not hold.
+  (SIGABRT, return code 134; reproduced on 1.5.1 and 1.5.6, refused cleanly on
+  2.0.0). With ``storage='file'`` and no path the process aborts at exit. It
+  widens no grant -- the failure is availability, not confidentiality -- and the
+  engine's own SQL never spells it. No connection setting can take back what
+  the lock does not hold, so the gates that admit caller-supplied SQL refuse it
+  by name: ``compile_free_form_sql`` (the MCP output port's ``query_sql``),
+  ``validate_sql_expression_allowlist`` and ``guard_against_injection_markers``
+  refuse ``enable_logging``, ``disable_logging``, ``truncate_duckdb_logs``,
+  ``duckdb_logs`` and ``duckdb_logs_parsed`` (any case, as a call or a
+  table, quoted or schema-qualified; ``DUCKDB_LOGGING_NAMES`` in
+  ``_sql_safety``). A statement those gates cannot read is refused too. A
+  caller that runs SQL on a connection from here without one of those gates
+  has no such protection.
 * The DuckDB docs call these settings defense-in-depth, "not a substitute for
   proper sandboxing": a multi-tenant host still runs each contract in its own
   container.

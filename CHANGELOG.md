@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **The SQL gates refuse DuckDB's logging functions and the table functions that run text.**
+  `compile_free_form_sql` (the MCP output port's `query_sql`),
+  `validate_sql_expression_allowlist` and `guard_against_injection_markers` now refuse a call to
+  `enable_logging`, `disable_logging`, `truncate_duckdb_logs` or `write_log`, any reference to
+  the `duckdb_logs`, `duckdb_logs_parsed` and `duckdb_log_contexts` views, and a call to `query`,
+  `query_table` or `json_execute_serialized_sql`, which run a statement given as text that no
+  text check reads; in any case, quoted or schema-qualified. A column that only shares one of
+  these names is not refused. On DuckDB 1.5.x, `enable_logging(storage='file')` with no path
+  aborted the process (SIGABRT), and the logs can hold other queries' text. Behaviour change: a
+  statement that uses these functions or views is refused.
+
 ## [0.39.0] — 2026-11-23
 
 ### Added
