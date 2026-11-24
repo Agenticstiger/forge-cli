@@ -433,3 +433,36 @@ def test_a_symlinked_old_data_directory_is_ignored(project, tmp_path, fake_run):
 def test_a_project_without_an_old_offsets_file_gets_none(project, tmp_path, fake_run):
     _run(project, str(_install(tmp_path, with_jar=True)))
     assert not _offsets_path(project).exists()
+
+
+# ── a server that exits says why ───────────────────────────────────────
+
+
+def test_a_failed_server_reports_its_exit_code_and_output_with_secrets_masked(
+    project, tmp_path, monkeypatch
+):
+    """Quarkus logs to standard output: the failure names the code and both tails."""
+
+    def exits(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            3,
+            stdout="booting\nERROR io.debezium: cannot connect with password pw\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(dbz.subprocess, "run", exits)
+    result = _run(project, str(_install(tmp_path, with_jar=True)))
+
+    assert result.state == RunState.FAILED
+    assert "debezium-server exited with code 3" in result.error
+    assert "cannot connect" in result.error
+    assert " pw" not in result.error  # the source password handed to the server
+
+
+def test_a_failed_server_that_printed_nothing_says_so(project, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        dbz.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "")
+    )
+    result = _run(project, str(_install(tmp_path, with_jar=True)))
+    assert result.error == "debezium-server exited with code 1 and printed nothing"

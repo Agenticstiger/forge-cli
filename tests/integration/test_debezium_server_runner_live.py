@@ -271,6 +271,14 @@ def _run_server(project: Path, port: int, sink_url: str) -> None:
     contract = _contract(port, sink_url)
     ctx = build_acquisition_run_context(contract["builds"][0], contract, project)
     result = DebeziumRunner().run(ctx)
+    if result.state != RunState.SUCCEEDED:
+        config = project / ".fluid" / "debezium" / "bronze.dbz_live" / "ingest"
+        config = config / "application.properties"
+        # The file holds ${FLUID_DBZ_*} references, never a credential.
+        print("--- forge's application.properties ---")
+        print(config.read_text() if config.is_file() else "(not written)")
+        print("--- the run's error ---")
+        print(result.error)
     assert result.state == RunState.SUCCEEDED, result.error
 
 

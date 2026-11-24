@@ -878,8 +878,35 @@ def _launch_server(
             shutil.rmtree(scratch_dir, ignore_errors=True)
 
     if proc.returncode != 0:
-        return _failed(ctx, started_at, t_start, proc.stderr[:500])
+        return _failed(ctx, started_at, t_start, _server_failure(proc, secret_env))
     return _success_embedded(ctx, started_at, t_start, server_name, snapshot_mode, connector_class)
+
+
+#: How much of each stream a failed run reports: the end, where the cause is.
+_FAILURE_TAIL_LINES = 40
+_FAILURE_TAIL_CHARS = 4000
+
+
+def _server_failure(proc: "subprocess.CompletedProcess[str]", secret_env: Mapping[str, str]) -> str:
+    """Why the server stopped: its exit code and the end of what it printed.
+
+    Quarkus logs to standard output, so both streams are read. Every credential
+    this run handed the server is masked, and so is anything else that looks
+    like a secret (:func:`redact_secret_text`).
+    """
+    from ...observability.secret_redactor import redact_secret_text
+
+    parts = []
+    for label, text in (("stderr", proc.stderr), ("stdout", proc.stdout)):
+        lines = (text or "").strip().splitlines()[-_FAILURE_TAIL_LINES:]
+        if lines:
+            tail = "\n".join(lines)[-_FAILURE_TAIL_CHARS:]
+            parts.append(f"--- {label} (last lines) ---\n{tail}")
+    head = f"debezium-server exited with code {proc.returncode}"
+    if not parts:
+        return f"{head} and printed nothing"
+    text = head + "\n" + "\n".join(parts)
+    return redact_secret_text(text, extra_secrets=[v for v in secret_env.values() if v])
 
 
 #: The stock launcher (``run.sh``) finds its runner jar with
