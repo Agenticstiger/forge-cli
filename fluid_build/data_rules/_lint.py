@@ -49,9 +49,10 @@ from typing import Any, DefaultDict, Dict, Iterable, List, Mapping, Optional, Se
 from fluid_build import fluid_sql as fs
 from fluid_build._validation_issues import json_pointer
 from fluid_build.fluid_sql._types import NUMBER, ORDERABLE, STRING, decimal_hint
+from fluid_build.forge_datamodel.semantics_builder import nfc
 
 from . import _masks
-from ._model import Expose, Relationship, as_dict, as_list, build, by_id, nfc
+from ._model import Expose, Relationship, as_dict, as_list, build, by_id
 
 OPERATORS = (
     "mustBe",
@@ -69,7 +70,7 @@ _FIXES = {
     "unknown-column": "name a column of the expose, or rel.col for a relationship's target, spelled "
     "as contract.schema[].name spells it",
     "unknown-relationship": "name one of the expose's semantics.relationships[].name",
-    "validity-window": "FLUID SQL/1 v1 reads no slowly changing dimension through a relationship",
+    "validity-window": fs.VERSIONED_REMEDY,
     "untyped-column": "name a column of a FLUID SQL/1 type",
     "type-mismatch": "compare and combine values of one type",
     "null-literal": "write x IS NULL, or give the NULL literal a typed operand beside it",
@@ -362,6 +363,7 @@ class _Lint:
             node = self.node(expose, relationship, column)
             if node is not None:
                 nodes.add(node)
+            nodes |= _as_of_reads(expose, relationship)
         return nodes
 
     def note_related(self, expose: Expose, checked: Optional[fs.Checked]) -> None:
@@ -463,8 +465,12 @@ class _Lint:
             self.error(
                 f"{label}.via",
                 path + ("via",),
-                f"{parent.label} declares a validity window: FLUID SQL/1 v1 summarizes no slowly "
-                "changing dimension through a relationship",
+                f"{parent.label} declares a validity window: FLUID SQL/1 summarizes no slowly "
+                "changing dimension through a relationship. A relationship into a versioned table "
+                "reads its stable columns by entity or any column as of a date, and a summary "
+                "does neither",
+                "summarize into an expose without a validity window, or copy the column through "
+                "a relationship that reaches the entity",
             )
             return None
         function = agg.get("function")
@@ -838,13 +844,12 @@ class _Lint:
         if not rel.shared_columns:
             return
         where, at = f"{label}.sharedColumns", path + ("sharedColumns",)
-        if target.model.validity_window:
-            self.error(
-                where,
-                at,
-                f"{rel.name} goes to {target.label}, which declares a validity window: FLUID SQL/1 v1 "
-                "copies nothing from a slowly changing dimension through a relationship",
-            )
+        problems = (
+            _versioned_copy_problems(expose, target, rel) if target.model.validity_window else []
+        )
+        for problem in problems:
+            self.error(where, at, problem, fs.VERSIONED_REMEDY)
+        if problems:
             return
         keys = set(rel.from_columns) | set(rel.to_columns)
         for name in rel.shared_columns:
@@ -886,6 +891,7 @@ class _Lint:
             node = (expose.expose_id, name)
             self.sources[node].append(f"sharedColumns of relationship {rel.name}")
             self.edges[node].add((target.expose_id, name))
+            self.edges[node] |= _as_of_reads(expose, rel.name)
 
     # -- 16. shared attributes ------------------------------------------------------------
 
@@ -991,16 +997,18 @@ class _Lint:
                     "so the copy would not say which one it follows",
                 )
                 return
-            hops = self.hops(member, routes[0])
-            for hop_target in hops:
-                if self.by_id[hop_target].model.validity_window:
-                    self.error(
-                        label,
-                        path,
-                        f"the path from {self.by_id[member].label} to the owner of {attribute!r} "
-                        f"passes {self.by_id[hop_target].label}, which declares a validity window",
-                    )
-                    return
+            blocked = _versioned_hop(self.by_id, member, routes[0], owner_name_of(members, owner))
+            if blocked is not None:
+                self.error(
+                    label,
+                    path,
+                    f"the path from {self.by_id[member].label} to the owner of {attribute!r} "
+                    f"passes {self.by_id[blocked[0]].label}, which declares a validity window, "
+                    f"through {blocked[1]}, which reads {blocked[2]} neither as of a date nor by "
+                    "entity",
+                    fs.VERSIONED_REMEDY,
+                )
+                return
         owner_name = next(name for e, name in members if e.expose_id == owner)
         self.routes[attribute] = AttributeRoutes(
             owner=(owner, owner_name),
@@ -1018,6 +1026,9 @@ class _Lint:
                     f"sharedAttribute {attribute} (owned by {owner}.{owner_name})"
                 )
                 self.edges[node].add((owner, owner_name))
+                self.edges[node] |= _as_of_hops(
+                    self.by_id, expose.expose_id, found[expose.expose_id][0]
+                )
 
     def paths(self, start: str, goal: str) -> List[Tuple[str, ...]]:
         """Up to two simple paths of relationship names from ``start`` to ``goal``.
@@ -1077,14 +1088,6 @@ class _Lint:
                     reached.add(source)
                     todo.append(source)
         self.reach_cache[goal] = reached
-        return reached
-
-    def hops(self, start: str, route: Tuple[str, ...]) -> List[str]:
-        """The exposes a route of relationship names reaches, in order."""
-        here, reached = start, []
-        for name in route:
-            here = self.by_id[here].relationships[name].to
-            reached.append(here)
         return reached
 
     # -- 9. one source, 8. cycles -------------------------------------------------------
@@ -1200,6 +1203,82 @@ class _Lint:
                     "check) FLUX and every consumer would read it alike",
                     "move it to contract.invariants[] as a check if FLUX should read it",
                 )
+
+
+def _as_of_reads(expose: Expose, relationship: Optional[str]) -> Set[Node]:
+    """The row's own date column a path through an as-of relationship also depends on: it
+    picks the version read, so deriving it from that path is a cycle."""
+    rel = expose.relationships.get(relationship) if relationship is not None else None
+    if rel is None or rel.as_of is None or rel.as_of not in expose.model.columns:
+        return set()
+    return {(expose.expose_id, rel.as_of)}
+
+
+def _as_of_hops(by_id: Dict[str, Expose], start: str, route: Tuple[str, ...]) -> Set[Node]:
+    """The date columns of every as-of hop of ``route`` from ``start``, each on the expose the
+    hop leaves: a copy that follows the route depends on all of them."""
+    here, nodes = start, set()
+    for name in route:
+        nodes |= _as_of_reads(by_id[here], name)
+        here = by_id[here].relationships[name].to
+    return nodes
+
+
+def _versioned_copy_problems(expose: Expose, target: Expose, rel: Relationship) -> List[str]:
+    """Why ``rel`` may not copy its ``sharedColumns`` from ``target``, which declares a validity
+    window, one message per cause: every column may be copied as of a date, the stable columns
+    by entity (RFC-versioned-relationships §2), and nothing through a link that reaches no
+    entity."""
+    link = expose.model.links.get(rel.name)
+    reach = link.reach() if link is not None else None
+    if reach == fs.AS_OF:
+        return []
+    if reach == fs.BY_ENTITY:
+        keys = set(rel.from_columns) | set(rel.to_columns)
+        return [
+            f"{rel.name} reads {target.label}, which declares a validity window, by entity, and "
+            f"{name} is not stable per entity, so its versions may disagree on the value to copy"
+            for name in rel.shared_columns
+            if isinstance(name, str)
+            and name in target.model.columns
+            and name not in keys
+            and not target.model.reads_by_entity(name)
+        ]
+    assert link is not None
+    return [fs.versioned_refusal(link, "") or f"{rel.name} reaches no entity of {target.label}"]
+
+
+def _hop_reads(target: Expose, route: Tuple[str, ...], step: int, owner_column: str) -> List[str]:
+    """The columns of ``target``, the end of hop ``step`` of ``route``, that the route reads: the
+    next hop's foreign key and date, or the owner's column at the end."""
+    if step + 1 >= len(route):
+        return [owner_column]
+    following = target.relationships[route[step + 1]]
+    return [*following.from_columns, *([following.as_of] if following.as_of else [])]
+
+
+def _versioned_hop(
+    by_id: Dict[str, Expose], start: str, route: Tuple[str, ...], owner_column: str
+) -> Optional[Tuple[str, str, str]]:
+    """The first hop of ``route`` into a target with a validity window that cannot carry what
+    the route reads from it, as ``(target, relationship, column)``, or ``None``: an as-of hop
+    carries every column, a by-entity hop the natural key and stable columns."""
+    here = start
+    for step, name in enumerate(route):
+        rel = by_id[here].relationships[name]
+        target = by_id[rel.to]
+        if target.model.validity_window:
+            link = by_id[here].model.links[name]
+            for column in _hop_reads(target, route, step, owner_column):
+                if fs.versioned_refusal(link, column) is not None:
+                    return (target.expose_id, name, column)
+        here = rel.to
+    return None
+
+
+def owner_name_of(members: List[Tuple[Expose, str]], owner: str) -> str:
+    """The column of the owner ``owner`` among a shared attribute's ``members``."""
+    return next(name for e, name in members if e.expose_id == owner)
 
 
 def _normalized(formats: List[Any]) -> List[Tuple[Tuple[str, ...], Any]]:

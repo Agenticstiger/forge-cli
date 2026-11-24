@@ -24,7 +24,17 @@ Standard library only, and never imported by ``fluid --help``.
 from __future__ import annotations
 
 from ._canonical import canonical, quote_name, quote_string
-from ._checker import PREDICATE, VALUE, Checked, check, check_derive_fit, check_derive_target
+from ._checker import (
+    PREDICATE,
+    VALUE,
+    VERSIONED_REMEDY,
+    Checked,
+    check,
+    check_derive_fit,
+    check_derive_target,
+    versioned_read,
+    versioned_refusal,
+)
 from ._errors import REASONS, FluidSqlError
 from ._evaluate import add_months, evaluate, months_between, round_fraction, years_between
 from ._lexer import FUNCTIONS, KEYWORDS, MAX_CODE_POINTS, MAX_DEPTH, MAX_ROUND_PLACES
@@ -34,8 +44,12 @@ from ._render import (
     DIALECTS,
     MAX_RENDERED_CHARS,
     RenderTooLarge,
+    as_of_columns,
+    as_of_condition,
+    as_of_nonempty,
     column_reader,
     exact_number_type,
+    fresh_name,
     number_literal,
     render_duckdb,
     render_sql,
@@ -43,9 +57,18 @@ from ._render import (
     sql_name,
 )
 from ._render_cel import CelUntranslatable, render_cel
-from ._types import Column, ColumnType, Link, Model, SqlType, column_type
+from ._types import AS_OF, BY_ENTITY, Column, ColumnType, Link, Model, SqlType, column_type
 
 __all__ = [
+    "as_of_columns",
+    "as_of_condition",
+    "as_of_nonempty",
+    "fresh_name",
+    "AS_OF",
+    "BY_ENTITY",
+    "VERSIONED_REMEDY",
+    "versioned_read",
+    "versioned_refusal",
     "DIALECTS",
     "MAX_RENDERED_CHARS",
     "RenderTooLarge",

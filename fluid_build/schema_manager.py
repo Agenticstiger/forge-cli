@@ -158,6 +158,7 @@ _PREVIEW_FIELDS = {
             ("mwaaEnvironment", "MWAA environment"),
         )
     },
+    ("entities", "lifecycle"): ("exposes", "the life cycle of a versioned entity"),
     ("contract", "invariants"): ("exposes", "rules about valid data"),
     ("schema", "identifierFormat"): ("exposes", "the column's identifier formats"),
     ("schema", "placeholders"): ("exposes", "the column's placeholder values"),

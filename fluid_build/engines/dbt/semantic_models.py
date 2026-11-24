@@ -54,7 +54,17 @@ dbt-core 1.11 + dbt-semantic-interfaces):
   primary or unique entity, and measures, beside a window, so those are
   dropped with a warning; a natural entity without a window is dropped too
   (dbt accepts natural entities only with one), as is a window
-  ``fluid validate`` reports as malformed.
+  ``fluid validate`` reports as malformed. The window's conventions ride in
+  ``config.meta.snapshot_config`` in dbt's own snapshot key names (dbt-core
+  1.9+): ``unique_key`` the natural key column, ``snapshot_meta_column_names``
+  the start and end columns (plus ``dbt_is_deleted`` for a boolean
+  ``lifecycle.endMarker``), ``dbt_valid_to_current`` the ``openEnd`` literal cast
+  to the end column's date or timestamp type (only a literal that fully matches
+  an ISO date or timestamp is written, any other is dropped with a warning, so
+  contract text never reaches the YAML unvalidated), and ``hard_deletes:
+  new_record`` with that marker. MetricFlow joins a window on ``[start, end)``,
+  so a ``chain`` of ``dayBefore`` or ``none`` (a version valid on ``[start, end]``)
+  logs a warning: the end day of such a version reads no version there.
 * **Relationships are not exported** (0.7.7): MetricFlow joins by entity
   name, so ``semantics.relationships`` is informational here and
   ``fluid validate`` warns when one has no matching entity pair.
@@ -72,6 +82,7 @@ no file — byte-identical output to the pre-semantics generator.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import re
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
@@ -82,6 +93,7 @@ from fluid_build.forge_datamodel.semantics_builder import (
     declares_validity_params,
     metricflow_name,
     validity_window,
+    version_window,
 )
 from fluid_build.util.dbt_jinja import GeneratedJinja, dbt_name, inert
 
@@ -761,6 +773,118 @@ def _model_window(semantics: Mapping[str, Any], expose_id: Any) -> Optional[Tupl
     return window
 
 
+# ASCII digits only (``\d`` also matches every other script's digits); the calendar is checked
+# by :func:`_is_calendar_date`, the clock by the ranges here.
+_DATE_LITERAL = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_CLOCK = r"([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9](\.[0-9]{1,6})?)?"
+_TIMESTAMP_LITERAL = re.compile(rf"[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}[T ]{_CLOCK}")
+# A timestamp with a zone designator: ``Z`` or a ``+hh:mm`` / ``-hh:mm`` offset.
+_TIMESTAMP_TZ_LITERAL = re.compile(
+    rf"[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}[T ]{_CLOCK}(Z|[+-]([01][0-9]|2[0-3]):[0-5][0-9])?"
+)
+_TIMESTAMP_TZ_TYPES = ("timestamptz", "timestamp_tz", "timestamp with time zone")
+
+
+def _declared_type(expose: Mapping[str, Any], column: str) -> str:
+    """The lower-cased declared type of a schema column, ``""`` when it declares none."""
+    for col in _schema_columns(expose):
+        if col.get("name") == column:
+            return str(col.get("type") or "").strip().lower()
+    return ""
+
+
+def _is_calendar_date(literal: str) -> bool:
+    """Whether the first ten characters of ``literal`` are a real calendar date."""
+    try:
+        datetime.date.fromisoformat(literal[:10])
+    except ValueError:
+        return False
+    return True
+
+
+def _open_end_expression(
+    literal: str, column_type: str, expose_id: Any
+) -> Optional[GeneratedJinja]:
+    """``dbt_valid_to_current`` for an ``openEnd`` literal, ``None`` (warned) when unsafe.
+
+    Only a literal that fully matches an ISO date (date column) or timestamp (timestamp
+    column) is written, so what reaches the YAML holds digits and ``-:.T +Z`` only. A
+    zoned timestamp column (``timestamptz``) also takes a ``Z`` or ``+hh:mm`` offset; a
+    naive timestamp column does not.
+    """
+    sql_type: Optional[str] = None
+    if column_type == "date" and _DATE_LITERAL.fullmatch(literal) and _is_calendar_date(literal):
+        sql_type = "date"
+    elif column_type.startswith(("timestamp", "datetime")):
+        pattern = (
+            _TIMESTAMP_TZ_LITERAL if column_type in _TIMESTAMP_TZ_TYPES else _TIMESTAMP_LITERAL
+        )
+        if pattern.fullmatch(literal) and _is_calendar_date(literal):
+            sql_type = "timestamp"
+    if sql_type is None:
+        logger.warning(
+            "semantic_models: expose %r: openEnd is not an ISO date or timestamp that matches "
+            "its end column's declared type (%s), so dbt_valid_to_current is left out",
+            expose_id,
+            column_type or "undeclared",
+        )
+        return None
+    return GeneratedJinja(f"cast('{literal}' as {sql_type})")
+
+
+def _semantic_model_meta_with_window(
+    semantics: Mapping[str, Any],
+    expose: Mapping[str, Any],
+    expose_id: Any,
+    window: Optional[Tuple[str, str, str]],
+) -> Dict[str, Any]:
+    """The model's ``config.meta``: tags and labels, then the window's ``snapshot_config``."""
+    meta = _semantic_model_meta(semantics)
+    snapshot = _snapshot_config(semantics, expose, expose_id) if window is not None else None
+    if snapshot is not None:
+        meta = {**meta, "snapshot_config": snapshot}
+    return meta
+
+
+def _snapshot_config(
+    semantics: Mapping[str, Any], expose: Mapping[str, Any], expose_id: Any
+) -> Optional[Dict[str, Any]]:
+    """The dbt snapshot configuration that writes the expose's validity window, or ``None``."""
+    win = version_window(semantics)
+    if win is None:
+        return None
+    config: Dict[str, Any] = {"unique_key": win.key}
+    names: Dict[str, str] = {
+        "dbt_valid_from": win.start_column,
+        "dbt_valid_to": win.end_column,
+    }
+    boolean_marker = (
+        win.end_marker is not None
+        and win.end_marker[1] is True
+        and _declared_type(expose, win.end_marker[0]) in ("boolean", "bool")
+    )
+    if boolean_marker and win.end_marker is not None:
+        names["dbt_is_deleted"] = win.end_marker[0]
+    config["snapshot_meta_column_names"] = names
+    if win.open_end is not None:
+        expression = _open_end_expression(
+            win.open_end, _declared_type(expose, win.end_column), expose_id
+        )
+        if expression is not None:
+            config["dbt_valid_to_current"] = expression
+    if boolean_marker:
+        config["hard_deletes"] = "new_record"
+    if win.chain in ("dayBefore", "none"):
+        logger.warning(
+            "semantic_models: expose %r declares chain %r, so a closed version is valid on "
+            "[start, end]; MetricFlow joins a window on [start, end), so the end day of a "
+            "version reads no version there",
+            expose_id,
+            win.chain,
+        )
+    return config
+
+
 def _model_measures(
     semantics: Mapping[str, Any],
     expose: Mapping[str, Any],
@@ -875,7 +999,7 @@ def generate_semantic_models(
         description = semantics.get("description") or expose.get("description")
         if description:
             model_def["description"] = str(description)
-        meta = _semantic_model_meta(semantics)
+        meta = _semantic_model_meta_with_window(semantics, expose, expose_id, window)
         if meta:
             # tags/labels ride in config.meta (dbt-parse-verified on 1.11;
             # round-tripped by the manifest importer via fluid_tags /

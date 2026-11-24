@@ -26,11 +26,15 @@ when the expression is a single aggregate call, and
 
 from __future__ import annotations
 
+import datetime
 import re
+import unicodedata
+from dataclasses import dataclass
 from typing import (
     Any,
     Dict,
     FrozenSet,
+    Iterator,
     List,
     Mapping,
     NamedTuple,
@@ -208,6 +212,13 @@ def validate_semantics_block(contract: Mapping[str, Any]) -> Tuple[List[str], Li
     one ``isStart`` and the other ``isEnd``, and the model declares one
     ``natural`` entity, the key whose versions the window separates. Errors:
     without them no consumer can tell which version applies at a time.
+
+    Checks the versioned members of 0.7.7 (RFC-versioned-relationships §2.4): an
+    ``openEnd`` literal and a ``chain`` on the ``isEnd`` dimension only, ``openEnd`` of
+    the end column's type, ``chain: dayBefore`` on date columns; an entity ``lifecycle``
+    on the natural entity of a model with a window, its columns declared and typed
+    alike; a relationship's ``asOf`` a declared date or time column of the window's
+    type, toward a target with a window, joined on its natural key. Errors.
     """
     errors: List[str] = []
     warnings: List[str] = []
@@ -261,9 +272,11 @@ def validate_semantics_block(contract: Mapping[str, Any]) -> Tuple[List[str], Li
         warnings.extend(_name_collision_warnings(semantics, expose_id))
         warnings.extend(_shared_name_warnings(semantics, _expose_path(expose, position)))
         errors.extend(_validity_window_errors(semantics, _expose_path(expose, position)))
+        errors.extend(_versioned_window_errors(expose, semantics, _expose_path(expose, position)))
     warnings.extend(_element_type_warnings(exposes))
     relationship_errors, relationship_warnings = _relationship_findings(exposes)
     errors.extend(relationship_errors)
+    errors.extend(_as_of_findings(exposes))
     warnings.extend(relationship_warnings)
     return errors, warnings
 
@@ -311,17 +324,18 @@ def _expose_path(expose: Mapping[str, Any], position: int) -> str:
     return f"exposes[{expose_id if isinstance(expose_id, str) and expose_id else position}]"
 
 
-def declared_columns(expose: Mapping[str, Any]) -> List[str]:
-    """The column names ``expose``'s ``contract.schema`` declares, in order."""
+def _schema_columns(expose: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    """The ``contract.schema`` entries of ``expose`` that name a column, in order."""
     contract = expose.get("contract")
     schema = contract.get("schema") if isinstance(contract, Mapping) else None
     if not isinstance(schema, list):
         return []
-    return [
-        column["name"]
-        for column in schema
-        if isinstance(column, Mapping) and isinstance(column.get("name"), str)
-    ]
+    return [c for c in schema if isinstance(c, Mapping) and isinstance(c.get("name"), str)]
+
+
+def declared_columns(expose: Mapping[str, Any]) -> List[str]:
+    """The column names ``expose``'s ``contract.schema`` declares, in order."""
+    return [column["name"] for column in _schema_columns(expose)]
 
 
 def _column_list(value: Any) -> List[str]:
@@ -379,14 +393,52 @@ def _entity_names(
     return names
 
 
+def _exposes_by_id(exposes: Sequence[Any]) -> Dict[str, Tuple[Mapping[str, Any], str]]:
+    """Each expose by its ``exposeId`` (the first of a name), with its path."""
+    named = [
+        (expose["exposeId"], (expose, _expose_path(expose, position)))
+        for position, expose in enumerate(exposes)
+        if isinstance(expose, Mapping) and isinstance(expose.get("exposeId"), str)
+    ]
+    return dict(reversed(named))
+
+
+def _relationships_of(
+    exposes: Sequence[Any],
+) -> Iterator[Tuple[Mapping[str, Any], str, int, Mapping[str, Any]]]:
+    """``(expose, path, index, relationship)`` for each relationship entry of each expose."""
+    for position, expose in enumerate(exposes):
+        semantics = expose.get("semantics") if isinstance(expose, Mapping) else None
+        relationships = semantics.get("relationships") if isinstance(semantics, Mapping) else None
+        if not isinstance(expose, Mapping) or not isinstance(relationships, list):
+            continue
+        for index, relationship in enumerate(relationships):
+            if isinstance(relationship, Mapping):
+                yield expose, _expose_path(expose, position), index, relationship
+
+
+def _as_of_findings(exposes: Sequence[Any]) -> List[str]:
+    """The errors of every relationship's ``asOf`` (RFC-versioned-relationships §2.4), in a
+    pass of their own over the relationships."""
+    by_id = _exposes_by_id(exposes)
+    errors: List[str] = []
+    for expose, path, index, relationship in _relationships_of(exposes):
+        if "asOf" not in relationship:
+            continue
+        to = relationship.get("to")
+        target = by_id.get(to) if isinstance(to, str) else None
+        where = f"{path}.semantics.relationships[{index}]"
+        errors.extend(
+            _as_of_errors(where, relationship, expose, path, target[0] if target else None)
+        )
+    return errors
+
+
 def _relationship_findings(exposes: Sequence[Any]) -> Tuple[List[str], List[str]]:
     """Referential errors and entity-drift warnings for every ``semantics.relationships``."""
     errors: List[str] = []
     warnings: List[str] = []
-    by_id: Dict[str, Tuple[Mapping[str, Any], str]] = {}
-    for position, expose in enumerate(exposes):
-        if isinstance(expose, Mapping) and isinstance(expose.get("exposeId"), str):
-            by_id.setdefault(expose["exposeId"], (expose, _expose_path(expose, position)))
+    by_id = _exposes_by_id(exposes)
     for position, expose in enumerate(exposes):
         if not isinstance(expose, Mapping):
             continue
@@ -510,6 +562,103 @@ def validity_window(semantics: Mapping[str, Any]) -> Optional[Tuple[str, str, st
     return start, end, natural
 
 
+#: How a closed version's end meets the same entity's next start (``validityParams.chain``):
+#: ``nextStart`` (an end equals the next start, as dbt snapshots write it; a version is valid on
+#: ``[start, end)``), ``dayBefore`` (an end is the day before, as Kimball's type 2 writes it) and
+#: ``none`` (versions may leave gaps); under the last two a version is valid on ``[start, end]``.
+WINDOW_CHAINS = ("nextStart", "dayBefore", "none")
+
+
+@dataclass(frozen=True)
+class VersionWindow:
+    """A well-formed validity window and the conventions its model declares
+    (RFC-versioned-relationships §1).
+
+    ``start`` and ``end`` name the bounding dimensions and ``start_column`` and ``end_column``
+    the columns they read (a dimension's ``expr``, else its name, as for an entity); ``entity``
+    names the natural entity and ``key`` its column. ``open_end`` is the literal an open
+    version's end holds, ``None`` for NULL; ``chain`` is one of :data:`WINDOW_CHAINS`. The
+    ``lifecycle`` members are ``None`` when not declared: ``activation`` a column, ``end_marker``
+    and ``current_flag`` a ``(column, value)`` pair. A consumer checks that each column is one
+    the expose declares: the validator reports one that is not.
+    """
+
+    start: str
+    end: str
+    entity: str
+    start_column: str
+    end_column: str
+    key: str
+    open_end: Optional[str] = None
+    chain: str = "nextStart"
+    activation: Optional[str] = None
+    end_marker: Optional[Tuple[str, Any]] = None
+    current_flag: Optional[Tuple[str, Any]] = None
+
+    @property
+    def closed(self) -> bool:
+        """Whether a closed version is valid on its end too: ``[start, end]``, not ``[start, end)``."""
+        return self.chain != "nextStart"
+
+
+def _column_value(raw: Any) -> Optional[Tuple[str, Any]]:
+    """A ``$defs.columnValue`` as ``(column, value)``, or ``None`` when it is not one."""
+    if not isinstance(raw, Mapping) or not isinstance(raw.get("column"), str) or not raw["column"]:
+        return None
+    value = raw.get("value")
+    if value is None or not isinstance(value, (str, int, float, bool)):
+        return None
+    return raw["column"], value
+
+
+def version_window(semantics: Mapping[str, Any]) -> Optional[VersionWindow]:
+    """The model's validity window with its conventions, or ``None``.
+
+    ``None`` where :func:`validity_window` gives none (no window, or one that breaks a rule
+    :func:`validate_semantics_block` reports). A member the schema refuses reads as undeclared:
+    a ``chain`` outside :data:`WINDOW_CHAINS` as ``nextStart``, an ``openEnd`` that is not a
+    string as NULL, and so 0.7.7's meaning holds, ``openEnd: null`` and ``chain: nextStart``.
+    """
+    bounds = validity_window(semantics)
+    if bounds is None:
+        return None
+    start, end, natural = bounds
+    dimensions = {
+        str(d.get("name")): d
+        for d in _as_list(semantics.get("dimensions"))
+        if isinstance(d, Mapping)
+    }
+    entity = next(
+        e
+        for e in _as_list(semantics.get("entities"))
+        if isinstance(e, Mapping) and str(e.get("type") or "").lower() == "natural"
+    )
+    start_column = entity_column(dimensions[start])
+    end_column = entity_column(dimensions[end])
+    key = entity_column(entity)
+    if start_column is None or end_column is None or key is None:
+        return None
+    validity = _validity_params(dimensions[end]) or {}
+    open_end = validity.get("openEnd")
+    chain = validity.get("chain")
+    lifecycle = entity.get("lifecycle")
+    lifecycle = lifecycle if isinstance(lifecycle, Mapping) else {}
+    activation = lifecycle.get("activation")
+    return VersionWindow(
+        start=start,
+        end=end,
+        entity=natural,
+        start_column=start_column,
+        end_column=end_column,
+        key=key,
+        open_end=open_end if isinstance(open_end, str) else None,
+        chain=chain if chain in WINDOW_CHAINS else "nextStart",
+        activation=activation if isinstance(activation, str) and activation else None,
+        end_marker=_column_value(lifecycle.get("endMarker")),
+        current_flag=_column_value(lifecycle.get("currentFlag")),
+    )
+
+
 def _bound_flags(validity: Mapping[str, Any]) -> str:
     """Which ends of the window a ``validityParams`` marks, for a message."""
     flags = [key for key in ("isStart", "isEnd") if validity.get(key) is True]
@@ -575,6 +724,329 @@ def _validity_window_errors(semantics: Mapping[str, Any], expose_path: str) -> L
             f"key, but the model declares {len(naturals)} natural entities "
             f"({', '.join(naturals)}). Keep one."
         )
+    return errors
+
+
+_TEMPORAL_KINDS = ("date", "timestamp", "timestamptz")
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_DATE_TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d")
+
+
+def _type_kind(declared: Any) -> Optional[str]:
+    """The FLUID SQL/1 kind of a declared column type, or ``None`` (imported late: ``--help``)."""
+    from fluid_build.fluid_sql import column_type
+
+    parsed = column_type(declared)
+    return parsed.type.kind if parsed is not None else None
+
+
+def _column_kinds(expose: Mapping[str, Any]) -> Dict[str, Optional[str]]:
+    """Declared column name -> the kind of its declared type (``None`` when it has none)."""
+    return {c["name"]: _type_kind(c.get("type")) for c in _schema_columns(expose)}
+
+
+def _window_type(window: VersionWindow, kinds: Mapping[str, Optional[str]]) -> Optional[str]:
+    """The kind both window columns share, when it is a date or a time; else ``None``."""
+    start = kinds.get(window.start_column)
+    return start if start in _TEMPORAL_KINDS and start == kinds.get(window.end_column) else None
+
+
+def _is_date(value: Any) -> bool:
+    if not isinstance(value, str) or not _DATE_RE.fullmatch(value):
+        return False
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_timestamp(value: Any, with_zone: bool) -> bool:
+    if not isinstance(value, str) or not _DATE_TIME_RE.match(value):
+        return False
+    try:
+        parsed = datetime.datetime.fromisoformat(
+            value[:-1] + "+00:00" if value.endswith("Z") else value
+        )
+    except ValueError:
+        return False
+    return (parsed.tzinfo is not None) == with_zone
+
+
+_KIND_EXPECTS = {
+    "string": "a string",
+    "number": "a number",
+    "bool": "true or false",
+    "date": "a YYYY-MM-DD date",
+    "timestamp": "an ISO date-time without an offset (2024-01-31T23:59:59)",
+    "timestamptz": "an ISO date-time with an offset or Z (2024-01-31T23:59:59Z)",
+}
+
+
+def _value_fits(kind: str, value: Any) -> bool:
+    """Whether the literal ``value`` is one a column of ``kind`` can hold."""
+    if kind == "string":
+        return isinstance(value, str)
+    if kind == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if kind == "bool":
+        return isinstance(value, bool)
+    if kind == "date":
+        return _is_date(value)
+    return _is_timestamp(value, kind == "timestamptz")
+
+
+def _literal_error(where: str, column: str, kind: Optional[str], value: Any) -> Optional[str]:
+    """The error for a literal that its ``column`` of ``kind`` cannot hold, or ``None``."""
+    if kind is None or _value_fits(kind, value):
+        return None
+    return (
+        f"{where}: {value!r} is not a {kind} literal, the type of {column!r}. "
+        f"Write {_KIND_EXPECTS[kind]}."
+    )
+
+
+def _member_path(path: str, index: int, member: str) -> str:
+    """The pointer to ``member`` of dimension ``index``'s ``validityParams``."""
+    return f"{path}.semantics.dimensions[{index}].typeParams.validityParams.{member}"
+
+
+def _window_member_errors(semantics: Mapping[str, Any], path: str) -> List[str]:
+    """``openEnd`` and ``chain`` sit on the ``isEnd`` dimension only (RFC-versioned-relationships)."""
+    errors: List[str] = []
+    for index, dimension in enumerate(_as_list(semantics.get("dimensions"))):
+        validity = _validity_params(dimension)
+        if validity is None or validity.get("isEnd") is True:
+            continue
+        for member in ("openEnd", "chain"):
+            if member in validity:
+                errors.append(
+                    f"{_member_path(path, index, member)}: "
+                    f"{member} describes how a version ends, so it belongs on the isEnd "
+                    f"dimension. Move it there, or remove it."
+                )
+    return errors
+
+
+def _end_validity(semantics: Mapping[str, Any], window: VersionWindow) -> Tuple[int, Any]:
+    """``(index, validityParams)`` of the window's ``isEnd`` dimension."""
+    for index, dimension in enumerate(_as_list(semantics.get("dimensions"))):
+        if isinstance(dimension, Mapping) and str(dimension.get("name")) == window.end:
+            return index, _validity_params(dimension) or {}
+    return -1, {}
+
+
+def _open_end_errors(
+    semantics: Mapping[str, Any],
+    window: VersionWindow,
+    kinds: Mapping[str, Optional[str]],
+    path: str,
+) -> List[str]:
+    """The ``openEnd`` literal must be one the end column can hold."""
+    index, validity = _end_validity(semantics, window)
+    literal = validity.get("openEnd")
+    if not isinstance(literal, str):
+        return []
+    where = _member_path(path, index, "openEnd")
+    kind = kinds.get(window.end_column)
+    if kind not in _TEMPORAL_KINDS:
+        return [
+            f"{where}: {literal!r} has no column type to match: the end column "
+            f"{window.end_column!r} is not a declared date or timestamp column of the expose. "
+            f"Declare it with one of those types, or remove openEnd."
+        ]
+    error = _literal_error(where, window.end_column, kind, literal)
+    return [error] if error else []
+
+
+def _chain_errors(
+    semantics: Mapping[str, Any], window: VersionWindow, wtype: Optional[str], path: str
+) -> List[str]:
+    """``chain: dayBefore`` takes DATE window columns only."""
+    if window.chain != "dayBefore" or wtype == "date":
+        return []
+    index, _ = _end_validity(semantics, window)
+    found = f"are {wtype}" if wtype else "are not both declared columns of one date type"
+    return [
+        f"{_member_path(path, index, 'chain')}: dayBefore "
+        f"ends a version the day before the next starts, which takes date columns, but "
+        f"{window.start_column!r} and {window.end_column!r} {found}. Use chain: nextStart "
+        f"or none, or declare the columns as date."
+    ]
+
+
+def _lifecycle_value_errors(
+    where: str, raw: Any, kinds: Mapping[str, Optional[str]], path: str, declared: Sequence[str]
+) -> List[str]:
+    """A ``{column, value}`` member of a lifecycle: a declared column, a value it can hold."""
+    if not isinstance(raw, Mapping):
+        return []
+    column = raw.get("column")
+    if not isinstance(column, str):
+        return []
+    errors = _column_errors(f"{where}.column", [column], path, declared)
+    if errors or "value" not in raw:
+        return errors
+    error = _literal_error(f"{where}.value", column, kinds.get(column), raw["value"])
+    return [error] if error else []
+
+
+def _lifecycle_errors(
+    where: str,
+    lifecycle: Mapping[str, Any],
+    expose: Mapping[str, Any],
+    window: Optional[VersionWindow],
+    path: str,
+) -> List[str]:
+    """The columns of one entity's ``lifecycle`` are declared and typed like the window."""
+    kinds = _column_kinds(expose)
+    declared = declared_columns(expose)
+    errors: List[str] = []
+    activation = lifecycle.get("activation")
+    if isinstance(activation, str):
+        found = _column_errors(f"{where}.activation", [activation], path, declared)
+        errors.extend(found)
+        wtype = _window_type(window, kinds) if window is not None else None
+        kind = kinds.get(activation)
+        if not found and wtype is not None and kind != wtype:
+            errors.append(
+                f"{where}.activation: {activation!r} is {kind or 'untyped'}, but the window's "
+                f"columns are {wtype}. Name a {wtype} column: an activation meets the window "
+                f"on one type."
+            )
+    for member in ("endMarker", "currentFlag"):
+        errors.extend(
+            _lifecycle_value_errors(
+                f"{where}.{member}", lifecycle.get(member), kinds, path, declared
+            )
+        )
+    return errors
+
+
+def _entity_lifecycle_errors(
+    expose: Mapping[str, Any], semantics: Mapping[str, Any], path: str
+) -> List[str]:
+    """``lifecycle`` belongs on the natural entity of a model that declares a validity window."""
+    errors: List[str] = []
+    declares = declares_validity_params(semantics)
+    window = version_window(semantics)
+    for index, entity in enumerate(_as_list(semantics.get("entities"))):
+        if not isinstance(entity, Mapping) or "lifecycle" not in entity:
+            continue
+        where = f"{path}.semantics.entities[{index}].lifecycle"
+        if str(entity.get("type") or "").lower() != "natural":
+            errors.append(
+                f"{where}: the entity is {entity.get('type')!r}, but a life cycle describes the "
+                f"versions of a natural key. Make it type: natural, or remove lifecycle."
+            )
+        if not declares:
+            errors.append(
+                f"{where}: the model declares no validityParams, so there are no versions for "
+                f"a life cycle to describe. Declare the validity window, or remove lifecycle."
+            )
+        lifecycle = entity["lifecycle"]
+        if isinstance(lifecycle, Mapping):
+            errors.extend(_lifecycle_errors(where, lifecycle, expose, window, path))
+    return errors
+
+
+def _versioned_window_errors(
+    expose: Mapping[str, Any], semantics: Mapping[str, Any], path: str
+) -> List[str]:
+    """The checks of the 0.7.7 members ``openEnd``, ``chain`` and ``lifecycle`` (§2.4)."""
+    errors = _window_member_errors(semantics, path)
+    window = version_window(semantics)
+    if window is not None:
+        kinds = _column_kinds(expose)
+        errors.extend(_open_end_errors(semantics, window, kinds, path))
+        errors.extend(_chain_errors(semantics, window, _window_type(window, kinds), path))
+    errors.extend(_entity_lifecycle_errors(expose, semantics, path))
+    return errors
+
+
+def nfc(value: Any) -> Any:
+    """``value`` NFC-normalized when it is a string: the contract's own texts (names,
+    enum values, placeholders) are compared in NFC, as FLUID SQL/1 texts are (RFC 2.3)."""
+    return unicodedata.normalize("NFC", value) if isinstance(value, str) else value
+
+
+def _as_of_target_errors(
+    where: str, to_columns: Sequence[str], target: Mapping[str, Any]
+) -> Tuple[List[str], Optional[VersionWindow]]:
+    """``asOf`` needs a target with a validity window, joined on that window's natural key."""
+    semantics = target.get("semantics")
+    semantics = semantics if isinstance(semantics, Mapping) else {}
+    if not declares_validity_params(semantics):
+        return [
+            f"{where}: the target expose declares no validity window, so there is no version "
+            f"to pick. Declare validityParams on its time dimensions, or remove asOf."
+        ], None
+    window = version_window(semantics)
+    if window is not None and [nfc(c) for c in to_columns] != [nfc(window.key)]:
+        return [
+            f"{where}: toColumns must be exactly [{window.key!r}], the column of the natural "
+            f"entity {window.entity!r}, since asOf picks one version of one natural key."
+        ], window
+    return [], window
+
+
+def _as_of_column_errors(
+    where: str,
+    as_of: str,
+    expose: Mapping[str, Any],
+    path: str,
+    target_type: Optional[str],
+    has_window: bool,
+) -> List[str]:
+    """The ``asOf`` column is a declared date or time of the same type as the target's window."""
+    declared = declared_columns(expose)
+    errors = _column_errors(where, [as_of], path, declared)
+    if errors:
+        return errors
+    kind = _column_kinds(expose).get(as_of)
+    if kind not in _TEMPORAL_KINDS:
+        return [
+            f"{where}: {as_of!r} is {kind or 'untyped'}, but asOf names the date or time to "
+            f"pick the version at. Name a date, timestamp or timestamptz column."
+        ]
+    if has_window and kind != target_type:
+        meets = (
+            f"the target's window columns are {target_type}"
+            if target_type
+            else (
+                "the target's window columns are not both declared columns of one date or time type"
+            )
+        )
+        return [
+            f"{where}: {as_of!r} is {kind}, but {meets}. A date never meets a timestamp: "
+            f"name a column of the window's type."
+        ]
+    return []
+
+
+def _as_of_errors(
+    where: str,
+    relationship: Mapping[str, Any],
+    expose: Mapping[str, Any],
+    path: str,
+    target: Optional[Mapping[str, Any]],
+) -> List[str]:
+    """The checks of a relationship's ``asOf`` (RFC-versioned-relationships §2.4)."""
+    as_of = relationship.get("asOf")
+    if not isinstance(as_of, str):
+        return []
+    errors: List[str] = []
+    window = None
+    if target is not None:
+        errors, window = _as_of_target_errors(
+            f"{where}.asOf", _column_list(relationship.get("toColumns")), target
+        )
+    target_type = (
+        _window_type(window, _column_kinds(target)) if window is not None and target else None
+    )
+    errors.extend(
+        _as_of_column_errors(f"{where}.asOf", as_of, expose, path, target_type, window is not None)
+    )
     return errors
 
 

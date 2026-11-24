@@ -67,12 +67,20 @@ def build_models(document: Mapping[str, Any]) -> Dict[str, Model]:
                 placeholder_prefixes=tuple(placeholders.get("prefixes") or ()),
             )
         models[name] = Model(
-            name=name, columns=columns, validity_window=bool(spec.get("validityWindow"))
+            name=name,
+            columns=columns,
+            validity_window=bool(spec.get("validityWindow")),
+            natural_key=tuple(spec.get("naturalKey") or ()),
+            stable_columns=frozenset(spec.get("stableColumns") or ()),
         )
     for name, spec in document.get("models", {}).items():
         for link_name, link in (spec.get("relationships") or {}).items():
             models[name].links[link_name] = Link(
-                link_name, models.get(link["to"]), target_name=link["to"]
+                link_name,
+                models.get(link["to"]),
+                target_name=link["to"],
+                to_columns=tuple(link.get("toColumns") or ()),
+                as_of=link.get("asOf"),
             )
     return models
 

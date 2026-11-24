@@ -25,7 +25,9 @@ REASONS: Dict[str, str] = {
     "multi-link-path": "a path over more than one link (rel.rel.col)",
     "unknown-column": "a name that is not a column of the expose, or of the relationship's target",
     "unknown-relationship": "rel.col where rel is not a relationship of the expose",
-    "validity-window": "a path through a relationship whose target declares a validity window",
+    "validity-window": "a path into a target that declares a validity window through a "
+    "relationship that reads it neither as of a date (asOf) nor by entity, for its natural key "
+    "or a column stable per entity",
     "untyped-column": "a column whose type has no FLUID SQL/1 type",
     "type-mismatch": "operands or arguments of the wrong type, or a predicate position "
     "given something other than a bool",

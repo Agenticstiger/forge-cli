@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Rules can read a versioned table through a relationship (0.7.7 preview).** A type II slowly
+  changing dimension's window now states its conventions: `validityParams.openEnd` (what an open
+  version's end holds) and `chain` (`nextStart`, `dayBefore` or `none`), and the natural entity's
+  `lifecycle` (`activation`, `endMarker`, `currentFlag`). A relationship whose `toColumns` are the
+  natural entity reads the target by entity: a FLUID SQL/1 path or a `sharedColumns` entry may name
+  the key and the columns a `dependency` from the key makes stable. A relationship with
+  `asOf: <date column>` reads every column of the version valid on the row's date. Before, every
+  path and copy into such a table was refused, so a rule like "a reading carries its station's
+  network" could not be written. The data rules render both joins in every
+  dialect; an as-of join reaches at most one version per row. `fluid validate` reports a
+  misplaced or mistyped member, and a read that is neither by entity of a stable column nor as of
+  a date names both ways to declare it. The dbt export adds the snapshot configuration of such a
+  table to its semantic model (`dbt_valid_to_current`, `hard_deletes: new_record`,
+  `snapshot_meta_column_names`).
 - **`$$ref` writes a literal `$ref` key.** A JSON Schema or OpenAPI payload inside `parameters` or
   an extension that carries `$ref` keys of its own has failed composition since 0.25.0, because
   every `$ref` key is read as a contract reference (0.25.0's note said to keep such a payload as a

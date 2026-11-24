@@ -1,7 +1,7 @@
 {
- "vectorsVersion": "1.1.0",
+ "vectorsVersion": "1.2.0",
  "language": "FLUID SQL/1",
- "description": "FLUID SQL/1 conformance vectors (forge-cli RFC-data-rules.md section 2.9). They define the language: every implementation (forge-cli's validator, flux-expr/2) parses, checks and evaluates every vector and reaches its verdict, tree, canonical text, type, scale and values. Each vector names a model, one expose: models[name] = {columns: {name: {type, enum?, placeholders?: {values?, prefixes?}}}, relationships?: {name: {to: <model>}}, validityWindow?: true}, where type is the FLUID column type as a contract writes it and validityWindow says the expose declares a validity window, so no path may reach it through a relationship. A vector also names a site: predicate (check, when, aggregate.filter: the text must be a bool, and a NULL result counts as FALSE) or value (expr). With derive, the text is the expr of a derive on that column and must fit it. A refused vector gives one reason from reasonCodes and has exactly one defect. An accepted vector gives its tree (one node per construct; see nodes), its canonical text, its type and, for a number, its static scale (an integer, or unbounded), and eval cases: a row (column -> value), the links (relationship -> the row it reaches, or null for none; a relationship left out reaches none) and the result. A column left out of a row is NULL.",
+ "description": "FLUID SQL/1 conformance vectors (forge-cli RFC-data-rules.md section 2.9). They define the language: every implementation (forge-cli's validator, flux-expr/2) parses, checks and evaluates every vector and reaches its verdict, tree, canonical text, type, scale and values. Each vector names a model, one expose: models[name] = {columns: {name: {type, enum?, placeholders?: {values?, prefixes?}}}, relationships?: {name: {to: <model>, toColumns?: [columns], asOf?: <date column>}}, validityWindow?: true, naturalKey?: [columns], stableColumns?: [columns]}, where type is the FLUID column type as a contract writes it and validityWindow says the expose declares a validity window, and a path through a relationship into a validityWindow model reads only when the relationship's toColumns equal the target's naturalKey: with asOf (a date column of the model that declares the relationship) every column, without it the naturalKey and the stableColumns; every other path is refused. A vector also names a site: predicate (check, when, aggregate.filter: the text must be a bool, and a NULL result counts as FALSE) or value (expr). With derive, the text is the expr of a derive on that column and must fit it. A refused vector gives one reason from reasonCodes and has exactly one defect. An accepted vector gives its tree (one node per construct; see nodes), its canonical text, its type and, for a number, its static scale (an integer, or unbounded), and eval cases: a row (column -> value), the links (relationship -> the row it reaches, or null for none; a relationship left out reaches none) and the result. A column left out of a row is NULL.",
  "encoding": "No JSON number appears anywhere in this file: numbers, scales and limits are strings. A number is a decimal string; a result of static scale s is written with exactly s digits after the point, and one of unbounded scale as its shortest decimal, or as p/q in lowest terms when no decimal is exact (1/3). Compare numbers by value. A bool is true or false, a string is itself (compared by code points, never normalized), a date is YYYY-MM-DD, a timestamp is ISO 8601 without an offset, a timestamp with time zone ISO 8601 with one (compare instants), and NULL is null. A float column's value is the shortest decimal that converts back to the double.",
  "keywords": [
   "AND",
@@ -48,7 +48,7 @@
   "multi-link-path": "a path over more than one link (rel.rel.col)",
   "unknown-column": "a name that is not a column of the expose, or of the relationship's target",
   "unknown-relationship": "rel.col where rel is not a relationship of the expose",
-  "validity-window": "a path through a relationship whose target declares a validity window",
+  "validity-window": "a path into a target that declares a validity window through a relationship that reads it neither as of a date (asOf) nor by entity, for its natural key or a column stable per entity",
   "untyped-column": "a column whose type has no FLUID SQL/1 type",
   "type-mismatch": "operands or arguments of the wrong type, or a predicate position given something other than a bool",
   "null-literal": "the NULL literal where nothing gives it a type: an IN item, an operand of a comparison or BETWEEN, an argument of a date move, or every operand of a construct",
@@ -444,6 +444,96 @@
     },
     "zeros": {
      "type": "decimal(0000, 0)"
+    }
+   }
+  },
+  "station_versions": {
+   "columns": {
+    "station_id": {
+     "type": "string"
+    },
+    "network_id": {
+     "type": "string"
+    },
+    "sensor_model": {
+     "type": "string"
+    },
+    "temperature_c": {
+     "type": "decimal(12,2)"
+    },
+    "valid_from": {
+     "type": "date"
+    },
+    "valid_to": {
+     "type": "date"
+    }
+   },
+   "validityWindow": true,
+   "naturalKey": [
+    "station_id"
+   ],
+   "stableColumns": [
+    "network_id"
+   ]
+  },
+  "unkeyed_versions": {
+   "columns": {
+    "station_id": {
+     "type": "string"
+    },
+    "temperature_c": {
+     "type": "decimal(12,2)"
+    }
+   },
+   "validityWindow": true
+  },
+  "readings": {
+   "columns": {
+    "reading_id": {
+     "type": "string"
+    },
+    "station_id": {
+     "type": "string"
+    },
+    "network_id": {
+     "type": "string"
+    },
+    "sensor_model": {
+     "type": "string"
+    },
+    "reading_date": {
+     "type": "date"
+    },
+    "temperature_c": {
+     "type": "decimal(12,2)"
+    }
+   },
+   "relationships": {
+    "station": {
+     "to": "station_versions",
+     "toColumns": [
+      "station_id"
+     ]
+    },
+    "station_on_date": {
+     "to": "station_versions",
+     "toColumns": [
+      "station_id"
+     ],
+     "asOf": "reading_date"
+    },
+    "by_network": {
+     "to": "station_versions",
+     "toColumns": [
+      "network_id"
+     ]
+    },
+    "unkeyed": {
+     "to": "unkeyed_versions",
+     "toColumns": [
+      "station_id"
+     ],
+     "asOf": "reading_date"
     }
    }
   }
@@ -7795,6 +7885,272 @@
    "expect": {
     "verdict": "refused",
     "reason": "validity-window"
+   }
+  },
+  {
+   "id": "versioned-by-entity-stable",
+   "text": "network_id = station.network_id",
+   "site": "predicate",
+   "model": "readings",
+   "note": "RFC-versioned-relationships 2.1: by entity, a column stable per entity",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "compare",
+     "op": "=",
+     "left": {
+      "node": "column",
+      "name": "network_id"
+     },
+     "right": {
+      "node": "column",
+      "relationship": "station",
+      "name": "network_id"
+     }
+    },
+    "canonical": "network_id = station.network_id",
+    "type": "bool",
+    "eval": [
+     {
+      "row": {
+       "network_id": "net-1"
+      },
+      "links": {
+       "station": {
+        "network_id": "net-1"
+       }
+      },
+      "result": true
+     },
+     {
+      "row": {
+       "network_id": "net-1"
+      },
+      "links": {
+       "station": {
+        "network_id": "net-2"
+       }
+      },
+      "result": false
+     },
+     {
+      "row": {
+       "network_id": "net-1"
+      },
+      "links": {
+       "station": null
+      },
+      "result": false
+     },
+     {
+      "row": {
+       "network_id": null
+      },
+      "links": {
+       "station": {
+        "network_id": "net-1"
+       }
+      },
+      "result": false
+     }
+    ]
+   }
+  },
+  {
+   "id": "versioned-by-entity-key",
+   "text": "station.station_id IS NOT NULL",
+   "site": "predicate",
+   "model": "readings",
+   "note": "RFC-versioned-relationships 2.1: by entity, the natural key",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "is_null",
+     "operand": {
+      "node": "column",
+      "relationship": "station",
+      "name": "station_id"
+     },
+     "negated": true
+    },
+    "canonical": "station.station_id IS NOT NULL",
+    "type": "bool",
+    "eval": [
+     {
+      "row": {},
+      "links": {
+       "station": {
+        "station_id": "ST1"
+       }
+      },
+      "result": true
+     },
+     {
+      "row": {},
+      "links": {
+       "station": null
+      },
+      "result": false
+     }
+    ]
+   }
+  },
+  {
+   "id": "versioned-by-entity-unstable",
+   "text": "station.sensor_model = sensor_model",
+   "site": "predicate",
+   "model": "readings",
+   "note": "RFC-versioned-relationships 2.1: by entity, a column that changes between versions",
+   "expect": {
+    "verdict": "refused",
+    "reason": "validity-window"
+   }
+  },
+  {
+   "id": "versioned-as-of-any-column",
+   "text": "station_on_date.sensor_model = sensor_model",
+   "site": "predicate",
+   "model": "readings",
+   "note": "RFC-versioned-relationships 2.2: as of a date column, every column",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "compare",
+     "op": "=",
+     "left": {
+      "node": "column",
+      "relationship": "station_on_date",
+      "name": "sensor_model"
+     },
+     "right": {
+      "node": "column",
+      "name": "sensor_model"
+     }
+    },
+    "canonical": "station_on_date.sensor_model = sensor_model",
+    "type": "bool",
+    "eval": [
+     {
+      "row": {
+       "sensor_model": "M1"
+      },
+      "links": {
+       "station_on_date": {
+        "sensor_model": "M1"
+       }
+      },
+      "result": true
+     },
+     {
+      "row": {
+       "sensor_model": "M1"
+      },
+      "links": {
+       "station_on_date": {
+        "sensor_model": "M2"
+       }
+      },
+      "result": false
+     },
+     {
+      "row": {
+       "sensor_model": "M1"
+      },
+      "links": {
+       "station_on_date": null
+      },
+      "result": false
+     }
+    ]
+   }
+  },
+  {
+   "id": "versioned-as-of-value",
+   "text": "station_on_date.temperature_c",
+   "site": "value",
+   "model": "readings",
+   "note": "RFC-versioned-relationships 2.2: a value read as of a date",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "column",
+     "relationship": "station_on_date",
+     "name": "temperature_c"
+    },
+    "canonical": "station_on_date.temperature_c",
+    "type": "number",
+    "scale": "2",
+    "eval": [
+     {
+      "row": {},
+      "links": {
+       "station_on_date": {
+        "temperature_c": "21.50"
+       }
+      },
+      "result": "21.50"
+     },
+     {
+      "row": {},
+      "links": {
+       "station_on_date": {
+        "temperature_c": null
+       }
+      },
+      "result": null
+     },
+     {
+      "row": {},
+      "links": {
+       "station_on_date": null
+      },
+      "result": null
+     }
+    ]
+   }
+  },
+  {
+   "id": "versioned-not-the-entity",
+   "text": "by_network.temperature_c > 0",
+   "site": "predicate",
+   "model": "readings",
+   "note": "RFC-versioned-relationships 2.1: toColumns are not the natural key, so the link reaches no entity",
+   "expect": {
+    "verdict": "refused",
+    "reason": "validity-window"
+   }
+  },
+  {
+   "id": "versioned-no-natural-key",
+   "text": "unkeyed.temperature_c > 0",
+   "site": "predicate",
+   "model": "readings",
+   "note": "RFC-versioned-relationships 2.1: the target declares no natural entity",
+   "expect": {
+    "verdict": "refused",
+    "reason": "validity-window"
+   }
+  },
+  {
+   "id": "versioned-as-of-unknown-column",
+   "text": "station_on_date.nope = 1",
+   "site": "predicate",
+   "model": "readings",
+   "note": "RFC-versioned-relationships 2.2: an unknown column through a link that reaches an entity",
+   "expect": {
+    "verdict": "refused",
+    "reason": "unknown-column"
+   }
+  },
+  {
+   "id": "versioned-by-entity-unknown-column",
+   "text": "station.nope IS NULL",
+   "site": "predicate",
+   "model": "readings",
+   "note": "RFC-versioned-relationships 2.1: an unknown column through a link that reaches an entity",
+   "expect": {
+    "verdict": "refused",
+    "reason": "unknown-column"
    }
   },
   {

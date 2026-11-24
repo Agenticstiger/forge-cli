@@ -7637,6 +7637,27 @@
               },
               "description": {
                 "type": "string"
+              },
+              "lifecycle": {
+                "type": "object",
+                "additionalProperties": false,
+                "minProperties": 1,
+                "description": "NEW in v0.7.7 (preview): How the versions of this natural entity begin and end. Only on the natural entity of a model that declares a validity window.",
+                "properties": {
+                  "activation": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "A column of the expose, of the window's type, that holds the same value on every version of an entity: the start of its first version."
+                  },
+                  "endMarker": {
+                    "$ref": "#/$defs/columnValue",
+                    "description": "The entity ends with a final version that holds value in column; that version's start is the entity's end, and no earlier version holds the value (dbt's hard_deletes: new_record)."
+                  },
+                  "currentFlag": {
+                    "$ref": "#/$defs/columnValue",
+                    "description": "The column holds value on exactly one version of each entity: its last one (a current-row indicator)."
+                  }
+                }
               }
             }
           }
@@ -7791,6 +7812,21 @@
                       "isEnd": {
                         "type": "boolean",
                         "description": "This dimension holds the time each version stops applying."
+                      },
+                      "openEnd": {
+                        "type": [
+                          "string",
+                          "null"
+                        ],
+                        "description": "The end an open version holds: null, or a literal of the end column's type. Only on the isEnd dimension."
+                      },
+                      "chain": {
+                        "enum": [
+                          "nextStart",
+                          "dayBefore",
+                          "none"
+                        ],
+                        "description": "How a closed version's end meets the same entity's next start. Only on the isEnd dimension."
                       }
                     }
                   }
@@ -8000,6 +8036,11 @@
             "minLength": 1
           },
           "description": "NEW in v0.7.7 (preview): Columns copied through this relationship (RFC-data-rules.md section 5): each is in both exposes' schemas under one name and of one type, and on every row whose link reaches a target row it IS NOT DISTINCT FROM the target's. Short for a derive of the column with expr <name>.<column> on the rows the link reaches. The relationship's own key columns are never listed: they agree by definition."
+        },
+        "asOf": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A DATE or TIMESTAMP column of this expose; the relationship reaches the version valid on it."
         }
       },
       "examples": [
@@ -8029,6 +8070,28 @@
           "cardinality": "many_to_one"
         }
       ]
+    },
+    "columnValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "column",
+        "value"
+      ],
+      "description": "NEW in v0.7.7 (preview): A column of the expose and a literal of its type.",
+      "properties": {
+        "column": {
+          "type": "string",
+          "minLength": 1
+        },
+        "value": {
+          "type": [
+            "string",
+            "number",
+            "boolean"
+          ]
+        }
+      }
     },
     "invariant": {
       "type": "object",
