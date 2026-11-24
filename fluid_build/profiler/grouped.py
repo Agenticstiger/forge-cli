@@ -18,7 +18,7 @@ as a statistic whose groups are keys the contract fixes, never keys read from a 
 
 The structure of a column is the one its default statistic has (:mod:`~fluid_build.profiler.defaults`):
 the levels an ``enum(...)`` or a boolean declares, or the bins over the range its
-``validationRules`` declare, or, for a date or a timestamp, the bins of its ladder
+``validationRules`` declare, or, for a date or a timestamp, the bins of its declared range, else of its ladder
 (:func:`~fluid_build.profiler.defaults.public_bins`, the bins the release uses). A column with none has no public groups, so no statistic
 groups by it or is grouped by it, and the pair is left out with that reason. The bins of a
 grouping are the bins of the histogram, so a number is grouped on the edges any reader of the

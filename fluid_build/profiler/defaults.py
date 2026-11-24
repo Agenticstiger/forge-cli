@@ -23,6 +23,11 @@ column's edges (FLUX ADR 0012) and the ACRO rules for the rest.
   closed at the top, holds. A side at or past the type's own bound declares
   nothing the type does not, and a range of one side is not closed: ten bins over the rest
   of the type would hold every record in one of them, so such a number takes the ladder.
+- **A date or a timestamp whose** ``validationRules`` **declare both ends of a range**:
+  ``quantile/2`` at the lower quartile, the median and the upper quartile, over about ten
+  bins cut from that range, whose first edge is the declared minimum and last the declared
+  maximum (:func:`timestamp_bins`). The bins come from the contract, never from the records.
+  A range whose ends are not whole seconds, or not both declared, takes the ladder.
 - **Any other number of a bounded type, a date or a timestamp**: ``quantile/2`` at the
   lower quartile, the median and the upper quartile, on a ladder fixed by the type: 0,
   ±1, ±2, ±5, ±10, ±20, ±50 ... within the type's bounds for a number, one bin per year
@@ -62,7 +67,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -75,6 +80,8 @@ __all__ = [
     "declared_range",
     "range_bins",
     "number_ladder",
+    "timestamp_bins",
+    "declared_instants",
 ]
 
 #: The quantile levels declared on every number, date and timestamp: the quartiles and
@@ -96,6 +103,19 @@ _WIDEST = Fraction(10) ** 38
 _FIRST_INSTANT = "0001-01-01T00:00:00Z"
 _LAST_INSTANT = "9999-12-31T23:59:59.999Z"
 _LADDER_YEARS = range(1900, 2101)
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+#: The widths, in seconds, a declared timestamp range is cut by: seconds, minutes, hours,
+#: days, weeks, then years by 1, 2, 5, 10 ... (:func:`timestamp_bins`).
+_YEAR_SECONDS = 365 * 86_400
+_INSTANT_WIDTHS: Tuple[int, ...] = (
+    1, 2, 5, 10, 15, 30,
+    60, 120, 300, 600, 900, 1_800,
+    3_600, 7_200, 10_800, 21_600, 43_200,
+    86_400, 172_800, 604_800, 1_209_600, 2_592_000, 5_184_000, 7_776_000, 15_552_000,
+    _YEAR_SECONDS,
+)  # fmt: skip
 
 #: The smallest sub-unit edge a decimal's ladder takes: 2^-10, and never below the grid.
 _FINEST_SUB_UNIT = 10
@@ -284,6 +304,102 @@ def _instant(year: int) -> str:
     return datetime(year, 1, 1, tzinfo=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+_INSTANT_BOUND = re.compile(
+    r"""^\s*(>=|<=|>|<)\s*(?:'([^']*)'|"([^"]*)"|(\S+))\s*$""",
+)
+_INSTANT_BETWEEN = re.compile(
+    r"""^\s*between\s+(?:'([^']*)'|"([^"]*)"|(\S+))\s+and\s+(?:'([^']*)'|"([^"]*)"|(\S+))\s*$""",
+    re.IGNORECASE,
+)
+
+
+def _read_instant(text: str) -> Optional[int]:
+    """Whole seconds since the epoch of an ISO date or timestamp; ``None`` if it is not one.
+
+    A date is midnight UTC, and a timestamp without an offset is UTC. A text with a
+    fraction of a second, or past the years 1 to 9999, is not read.
+    """
+    try:
+        moment = datetime.fromisoformat(text.strip().replace("Z", "+00:00").replace("z", "+00:00"))
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        if moment.microsecond:
+            return None
+        delta = moment - _EPOCH
+    except (ValueError, OverflowError):
+        return None
+    return delta.days * 86_400 + delta.seconds
+
+
+def declared_instants(column: Mapping[str, Any]) -> Optional[Tuple[int, int]]:
+    """The ``(low, high)`` seconds a date or timestamp's ``range`` validationRules declare.
+
+    The grammar is the number range's, over quoted ISO dates and timestamps: ``">= '2024-01-01'
+    and <= '2024-12-31'"`` or ``"between '2024-01-01' and '2024-12-31'"``. Several rules hold
+    together, so the tightest bound of each side is kept. ``None`` unless both ends are declared,
+    each a whole second, and ``low < high``: such a column takes the ladder.
+    """
+    low: Optional[int] = None
+    high: Optional[int] = None
+    rules = column.get("validationRules")
+    for rule in rules if isinstance(rules, list) else ():
+        if not isinstance(rule, Mapping) or str(rule.get("type") or "").lower() != "range":
+            continue
+        constraint = rule.get("constraint")
+        if not isinstance(constraint, str):
+            continue
+        between = _INSTANT_BETWEEN.match(constraint)
+        pairs: List[Tuple[str, Optional[int]]] = []
+        if between:
+            first = next(t for t in between.groups()[:3] if t is not None)
+            second = next(t for t in between.groups()[3:] if t is not None)
+            pairs = [(">=", _read_instant(first)), ("<=", _read_instant(second))]
+        else:
+            for part in re.split(r"\s+and\s+", constraint.strip(), flags=re.IGNORECASE):
+                bound = _INSTANT_BOUND.match(part)
+                if not bound:
+                    pairs = [("", None)]
+                    break
+                text = next(t for t in bound.groups()[1:] if t is not None)
+                pairs.append((bound.group(1), _read_instant(text)))
+        for operator, seconds in pairs:
+            if seconds is None:
+                return None
+            if operator in (">", ">="):
+                low = seconds if low is None or seconds > low else low
+            else:
+                high = seconds if high is None or seconds < high else high
+    if low is None or high is None or low >= high:
+        return None
+    return low, high
+
+
+def _spell(seconds: int) -> str:
+    return (_EPOCH + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def timestamp_bins(low: int, high: int) -> Tuple[str, ...]:
+    """About :data:`RANGE_BINS` bins over the declared range, as instants, and no wider.
+
+    *low* and *high* are the declared range's ends in seconds since the epoch. The edges are
+    the two ends and the multiples of one width strictly between them: the narrowest of the
+    widths in :data:`_INSTANT_WIDTHS` (then years by 2, 5, 10 ...) that cuts the range into at
+    most :data:`RANGE_BINS` bins. No edge lies outside ``[low, high]``.
+    """
+    widths = iter(_INSTANT_WIDTHS)
+    magnitude = 1
+    while True:
+        width = next(widths, None)
+        if width is None:  # past the years, by 2, 5, 10 ...
+            widths = iter(_YEAR_SECONDS * magnitude * scale for scale in (2, 5, 10))
+            magnitude *= 10
+            continue
+        inner = list(range((low // width + 1) * width, high, width))
+        if len(inner) < RANGE_BINS:  # N inner edges cut N + 1 bins
+            break
+    return tuple(_spell(each) for each in (low, *inner, high))
+
+
 def _decimal(value: Fraction) -> str:
     """An exact edge as a decimal string: every edge here is a terminating decimal."""
     if value.denominator == 1:
@@ -361,9 +477,13 @@ def default_plan(
                 declared[column.name] = {"support": "declared", "maxCardinality": found}
             continue
         if column.domain == "timestamp":
-            declared[column.name] = {"range": {"min": _FIRST_INSTANT, "max": _LAST_INSTANT}}
-            ladder = [_FIRST_INSTANT, *(_instant(year) for year in _LADDER_YEARS), _LAST_INSTANT]
-            properties.extend(_quantiles(column.name, ladder))
+            stamped = declared_instants(entry)
+            if stamped is not None:  # the contract's own range, public, never the records'
+                edges = list(timestamp_bins(*stamped))
+            else:
+                edges = [_FIRST_INSTANT, *(_instant(year) for year in _LADDER_YEARS), _LAST_INSTANT]
+            declared[column.name] = {"range": {"min": edges[0], "max": edges[-1]}}
+            properties.extend(_quantiles(column.name, edges))
             timestamps.append(column.name)
             continue
         bounds, sub_unit = _type_bounds(declared_type)

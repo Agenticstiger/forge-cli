@@ -16,8 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correlation over fewer than the records the group-size check needs is withheld like any other
   group. A table's `cliqueColumns` are answered with one two-way statistic for each pair of the
   first 32 listed columns (the first column's histogram grouped by the second, a category by its
-  levels, a number by the bins of its declared range, a date or timestamp by the bins of its
-  type's ladder, the bins a private release cuts it on); the pairs not measured are
+  levels, a number by the bins of its declared range, a date or timestamp by about ten bins
+  cut from the range its contract declares, else by the bins of its type's ladder, the bins a
+  private release cuts it on); the pairs not measured are
   named in the report with the reason. A relationship's `groupBy` asks its statistics grouped by
   each named parent column, and its `linked` asks a child column's histogram grouped by a column
   of the parent row its key reaches (`groupByLink`); each group of a grouped statistic is checked

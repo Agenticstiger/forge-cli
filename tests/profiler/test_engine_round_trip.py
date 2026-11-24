@@ -162,13 +162,11 @@ def test_a_1_4_0_profile_goes_through_init_and_run_verify(workspace, capsys):
     # request as the engine wrote it, which answers placed_at, a timestamp, as groupByBins
     (workspace / "billing.profile-request.yml").write_text(request, encoding="utf-8")
     # amount and weight hold many values. Neither joins a clique or is grouped by a column of the
-    # parent, so that init draws both from their histograms alone and joins them in a copula; and
-    # placed_at, whose 202 public bins no table of this size counts as large, is left out.
+    # parent, so that init draws both from their histograms alone and joins them in a copula;
+    # placed_at, a timestamp binned on the range its contract declares, joins the clique.
     asked = yaml.safe_load(request)
     invoice = asked["tables"]["invoice"]
-    invoice["cliqueColumns"] = ["status", "qty"]
-    invoice["columns"].pop("placed_at")
-    invoice.pop("calendar", None)
+    invoice["cliqueColumns"] = ["status", "placed_at"]
     for ask in invoice["rankCorrelations"]:
         ask["columns"] = [name for name in ask["columns"] if name != "placed_at"]
     for each in asked["relationships"]:
@@ -209,7 +207,10 @@ def test_a_1_4_0_profile_goes_through_init_and_run_verify(workspace, capsys):
     pairs = private["tables"]["invoice"]["columnPairs"]
     assert len(pairs) == 6
     cliques = private["tables"]["invoice"]["cliques"]
-    assert [each["definition"] for each in cliques] == ["cliqueMarginal/2"]
+    # the clique joins status and placed_at, a timestamp binned on its contract's declared range
+    assert [(each["definition"], each["columns"]) for each in cliques] == [
+        ("cliqueMarginal/2", ["status", "placed_at"])
+    ]
     assert private["tables"]["invoice"]["cliqueSelection"]["method"] == "mst"
     assert all(each["rowFloor"] == 200 for pair in pairs for each in pair["statistics"])
 

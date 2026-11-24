@@ -227,6 +227,82 @@ def test_a_date_gets_quantiles_on_a_ladder_of_years(tmp_path):
     assert group["status"] == "F"
 
 
+def _stamp(text: str) -> int:
+    return defaults._read_instant(text)  # type: ignore[return-value]
+
+
+@pytest.mark.parametrize(
+    "constraint, low, high",
+    [
+        (">= '2024-01-01' and <= '2024-12-31'", "2024-01-01", "2024-12-31"),
+        ("between '2024-01-01T06:00:00Z' and '2024-01-02T18:30:00Z'", "2024-01-01T06:00:00Z", "2024-01-02T18:30:00Z"),
+        (">= '2020-02-29' and < '2030-01-01T00:00:00+02:00'", "2020-02-29", "2029-12-31T22:00:00Z"),
+        (">= '2000-01-01' and <= '2001-01-01' and <= '2000-06-30'", "2000-01-01", "2000-06-30"),
+    ],
+)  # fmt: skip
+def test_timestamp_bins_follow_the_declared_range_and_no_edge_leaves_it(constraint, low, high):
+    column = {"validationRules": [{"type": "range", "constraint": constraint}]}
+    assert defaults.declared_instants(column) == (_stamp(low), _stamp(high))
+    bins = defaults.timestamp_bins(*defaults.declared_instants(column))
+    edges = [_stamp(each) for each in bins]
+    assert edges[0] == _stamp(low) and edges[-1] == _stamp(high)
+    assert edges == sorted(set(edges))
+    assert all(_stamp(low) <= each <= _stamp(high) for each in edges)
+    assert 2 <= len(bins) <= defaults.RANGE_BINS + 1  # N + 1 edges cut N bins
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    [
+        ">= '2024-01-01'",  # one side
+        "<= '2024-12-31'",
+        ">= '2024-12-31' and <= '2024-01-01'",  # inverted
+        ">= '2024-01-01T00:00:00.5Z' and <= '2024-12-31'",  # a fraction of a second
+        ">= 'last year' and <= 'today'",  # not instants
+        ">= 0 and <= 100",  # a number range
+    ],
+)
+def test_a_range_that_is_not_closed_over_whole_instants_declares_none(constraint):
+    column = {"validationRules": [{"type": "range", "constraint": constraint}]}
+    assert defaults.declared_instants(column) is None
+
+
+def test_a_timestamp_with_a_declared_range_is_binned_on_it_not_on_the_ladder(tmp_path):
+    rule = {
+        "validationRules": [{"type": "range", "constraint": ">= '2024-01-01' and <= '2024-12-31'"}]
+    }
+    contract = _contract([("placed_at", "timestamp", rule), ("joined", "date", {})])
+    rows = [
+        {"placed_at": f"2024-0{1 + n % 9}-1{n % 10}T10:00:00Z", "joined": "2021-03-04"}
+        for n in range(300)
+    ]
+    result = _profile(tmp_path, contract, rows)
+    low, high = _stamp("2024-01-01"), _stamp("2024-12-31")
+    for level in defaults.QUANTILE_LEVELS:
+        bins = _one(result, "placed_at", "quantile/2", level=level)["bins"]
+        edges = [int(each) // 1000 for each in bins]  # the document spells an instant in ms
+        assert edges[0] == low and edges[-1] == high
+        assert all(low <= each <= high for each in edges)
+        assert edges == sorted(set(edges))
+        assert len(bins) <= defaults.RANGE_BINS + 1
+    # a date with no declared range keeps the ladder
+    assert len(_one(result, "joined", "quantile/2", level="0.5")["bins"]) == 2 + 201
+
+
+def test_the_timestamp_bins_never_depend_on_the_records(tmp_path):
+    rule = {
+        "validationRules": [
+            {"type": "range", "constraint": "between '2024-01-01' and '2024-12-31'"}
+        ]
+    }
+    contract = _contract([("placed_at", "timestamp", rule)])
+    early = _profile(tmp_path, contract, [{"placed_at": "2024-01-02T00:00:00Z"}] * 40)
+    late = _profile(tmp_path, contract, [{"placed_at": "2024-12-30T00:00:00Z"}] * 3)
+    assert [s.get("bins") for s in _statistics(early, "placed_at")] == [
+        s.get("bins") for s in _statistics(late, "placed_at")
+    ]
+
+
 def test_an_unbounded_number_is_named_and_given_no_statistic(tmp_path):
     result = _profile(tmp_path, _contract([("price", "decimal", {})]), [{"price": "1.5"}] * 20)
     assert [s["definition"] for s in _statistics(result, "price")] == ["mean/1"]
