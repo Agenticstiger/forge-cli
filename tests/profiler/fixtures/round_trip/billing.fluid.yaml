@@ -1,0 +1,61 @@
+fluidVersion: "0.7.7"
+kind: DataProduct
+id: billing.roundtrip
+name: Billing
+metadata:
+  owner:
+    team: billing-team
+exposes:
+  - exposeId: account
+    kind: table
+    binding:
+      platform: local
+      format: parquet
+      location: { path: ./out/account.parquet }
+    contract:
+      schema:
+        - { name: id, type: INT, required: true }
+        - { name: segment, type: "enum('business','personal','public')", required: true }
+        - name: age
+          type: INT
+          required: true
+          validationRules:
+            - { type: range, constraint: ">= 0 and <= 100" }
+    semantics:
+      entities:
+        - { name: account, type: primary, expr: id }
+  - exposeId: invoice
+    kind: table
+    binding:
+      platform: local
+      format: parquet
+      location: { path: ./out/invoice.parquet }
+    contract:
+      schema:
+        - { name: invoice_id, type: INT, required: true }
+        - { name: account_id, type: INT, required: true }
+        - { name: status, type: "enum('open','paid','void')", required: true }
+        - name: qty
+          type: INT
+          required: true
+          validationRules:
+            - { type: range, constraint: ">= 0 and <= 10" }
+        - name: units
+          type: INT
+          required: true
+          validationRules:
+            - { type: range, constraint: ">= 0 and <= 20" }
+        - name: placed_at
+          type: TIMESTAMP
+          required: true
+          validationRules:
+            - { type: range, constraint: ">= '2024-01-01' and <= '2024-12-31'" }
+    semantics:
+      entities:
+        - { name: invoice, type: primary, expr: invoice_id }
+      relationships:
+        - name: placed_by
+          to: account
+          fromColumns: [account_id]
+          toColumns: [id]
+          cardinality: many_to_one
