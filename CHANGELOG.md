@@ -26,6 +26,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Command Center publish without a credential fails with the missing-credential error before the
   health check, which used to send `GET /api/v1/assets?limit=1` first. Behaviour change: pass
   `--target fluid-command-center` (or `--catalog`) to keep publishing there.
+- **Debezium Server is never started in the project directory.** An embedded server
+  (`deployment.mode: embedded`) used to inherit forge's working directory, the project, where
+  Quarkus reads `.env` and `config/application.properties` and the stock `run.sh` sources
+  `./jmx/*.sh` and loads `config/lib` and `lib/*`; `run.sh` also drops its arguments, so
+  `--config` never reached the JVM. The server now starts from its install directory (the one
+  holding the runner jar), or from an empty temporary directory, and reads forge's
+  `application.properties` through a `smallrye.config.locations` system property in `JAVA_OPTS`
+  and `DEBEZIUM_OPTS`. Offsets and file-based schema history are kept at absolute paths under
+  `.fluid/debezium/<product>/<build>/`; an existing `<project>/data/offsets.dat` is copied there
+  once (a regular file in a real `data/` directory) and left in place. Behaviour change: a
+  `properties.debezium.server_binary` inside the project or its checkout (by path, symlink or
+  `PATH`) is refused.
 
 ## [0.39.0] — 2026-11-23
 
