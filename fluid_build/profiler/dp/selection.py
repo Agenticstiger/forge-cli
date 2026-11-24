@@ -4,10 +4,16 @@
 """Choose which clique marginals a release under differential privacy measures.
 
 AIM (McKenna, Mullins, Sheldon and Miklau, "AIM: an adaptive and iterative mechanism for
-differentially private synthetic data", VLDB 2022), run through OpenDP 0.16.0 (MIT), chooses the
-cliques. It spends the selection share of the release's budget. OpenDP's own noisy measurements
-are not released: only which cliques it chose, and that choice is part of the release. The
-released counts are measured again, with the seeded sampler of this package.
+differentially private synthetic data", VLDB 2022) or MST (McKenna, Miklau and Sheldon, "Winning
+the NIST contest", 2021), run through OpenDP 0.16.0 (MIT), chooses the cliques. It spends the
+selection share of the release's budget. OpenDP's own noisy measurements are not released: only
+which cliques it chose, and that choice is part of the release. The released counts are measured
+again, with the seeded sampler of this package.
+
+A column that is a number or a timestamp takes part as a categorical column whose levels are its
+bins' indices: the release maps each value to its bin before OpenDP sees it, because OpenDP's
+cuts are open on the left and FLUX's bins are closed on the left (clique-selection-for-profilers,
+section 3). The bins come from the contract's declared range, so they are public.
 
 The junction tree comes from mbi 1.1.0 (Private-PGM, Apache-2.0), so that flux-engine can draw
 the cliques through one (its ADR 0021): :func:`release_structure` returns the maximal cliques of
@@ -30,6 +36,7 @@ from typing import Any, Dict, Mapping, Sequence, Tuple
 
 __all__ = [
     "MBI_REQUIREMENT",
+    "METHODS",
     "MOST_RELEASE_CELLS",
     "MOST_SELECTION_COLUMNS",
     "MOST_SELECTION_ROUNDS",
@@ -60,6 +67,9 @@ MOST_SELECTION_COLUMNS = 32
 OPENDP_REQUIREMENT = "opendp[mbi]==0.16.0"
 MBI_REQUIREMENT = "mbi==1.1.0"
 PRIVACY_INSTALL_COMMAND = "pip install 'data-product-forge[privacy]'"
+
+#: The methods ``--clique-method`` names, the first being the default.
+METHODS = ("aim", "mst")
 
 Clique = Tuple[str, ...]
 
@@ -169,8 +179,12 @@ def select_cliques(
     contributions: int,
     *,
     max_cells: int = MOST_RELEASE_CELLS,
+    method: str = "aim",
 ) -> Tuple[Clique, ...]:
-    """Run AIM over ``rows`` and return the cliques of two or more columns it measured.
+    """Run AIM (or MST, with ``method="mst"``) and return the cliques of two or more columns it measured.
+
+    MST measures a tree of pairs and ignores ``weights`` and ``max_cells``; the cells of the
+    cliques it leads to are checked by :func:`release_structure`.
 
     ``rows`` holds one tuple of strings per record, one value per column, each one of that
     column's ``levels`` (public, so OpenDP's delta is 0). ``weights`` gives an integer weight to
@@ -185,6 +199,8 @@ def select_cliques(
     are refused with :class:`ValueError` before OpenDP is called; missing packages raise
     :class:`SelectionUnavailable`.
     """
+    if method not in METHODS:
+        raise ValueError(f"the method is one of {', '.join(METHODS)}")
     names = _check_columns(columns)
     if len(names) > MOST_SELECTION_COLUMNS:
         raise ValueError(
@@ -223,7 +239,16 @@ def select_cliques(
         {name: [row[i] for row in rows] for i, name in enumerate(names)},
         schema={name: pl.String for name in names},
     )
-    queries = [dp.mbi.Count(pair, weight) for pair, weight in pair_weights.items()]
+    if method == "aim":
+        queries = [dp.mbi.Count(pair, weight) for pair, weight in pair_weights.items()]
+        algorithm = dp.mbi.AIM(
+            queries=queries,
+            oneway="unkeyed",
+            max_size=max_cells * 8 / 2**20,
+            rounds=min(16 * len(names), MOST_SELECTION_ROUNDS),
+        )
+    else:
+        algorithm = dp.mbi.MST(oneway="unkeyed")
     context = dp.Context.compositor(
         data=frame.lazy(),
         privacy_unit=dp.unit_of(contributions=contributions),
@@ -234,12 +259,7 @@ def select_cliques(
         context.query()
         .contingency_table(
             keys=keys,
-            algorithm=dp.mbi.AIM(
-                queries=queries,
-                oneway="unkeyed",
-                max_size=max_cells * 8 / 2**20,
-                rounds=min(16 * len(names), MOST_SELECTION_ROUNDS),
-            ),
+            algorithm=algorithm,
         )
         .release()
     )

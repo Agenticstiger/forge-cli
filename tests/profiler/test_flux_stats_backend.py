@@ -121,6 +121,10 @@ def test_the_stand_in_registry_writes_the_same_bytes(tmp_path, backend, count):
         ("timestamp", "2026-01-15T09:30:00+01:00", PAID_AT_MS),
         ("category", "Cafe" + chr(0x301), "Caf" + chr(0xE9)),
         ("category", None, None),
+        ("category", True, "true"),
+        ("category", False, "false"),
+        ("category", 7, "7"),
+        ("category", -3, "-3"),
         ("number", None, None),
     ],
 )
@@ -139,7 +143,8 @@ def test_a_value_is_read_as_the_fidelity_check_reads_it(backend, domain, value, 
         ("timestamp", PAID_AT_MS, "value class 'int'", "FLX-5005"),
         ("timestamp", "2026-01-15T08:30:00.0001Z", "sub-millisecond precision", "FLX-5022"),
         ("timestamp", "2026-01-15 08:30:00", "with an offset", "FLX-5022"),
-        ("category", 3, "value class 'int'", "FLX-5005"),
+        ("category", 3.5, "value class 'float'", "FLX-5005"),
+        ("category", ["a"], "value class 'list'", "FLX-5005"),
     ],
 )
 def test_a_refusal_names_the_cell_once_and_never_the_value(backend, domain, value, reason, code):
