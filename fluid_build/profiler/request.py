@@ -56,6 +56,7 @@ __all__ = [
     "filter_block",
     "not_measured",
     "read_request_file",
+    "relationship_asks",
     "relationship_filter",
     "restrict_plan",
 ]
@@ -311,7 +312,7 @@ def relationship_filter(
 
     The test says whether the request lists the declared relationship (child table, parent
     table, key columns of each, pair by pair) with ``marginalHistogram/1``, the one statistic
-    answered over children per parent.
+    answered over children per parent, or with a ``linked`` column (request format 1-2-0).
     """
     matched: Set[int] = set()
 
@@ -327,10 +328,40 @@ def relationship_filter(
                 and each.parent.columns == parent_columns
             ):
                 matched.add(position)
-                found = found or "marginalHistogram/1" in each.statistics
+                found = found or "marginalHistogram/1" in each.statistics or bool(each.linked)
         return found
 
     return wanted, matched
+
+
+def relationship_asks(
+    request: Request, relationship: "runner.Relationship"
+) -> Tuple[bool, Tuple[str, ...], Tuple[Tuple[str, str], ...]]:
+    """What the request asks of one declared relationship: ``(counted, group_by, linked)``.
+
+    *counted* says whether it lists ``marginalHistogram/1`` for the relationship, which is
+    what children per parent is answered with; *group_by* are the parent columns its
+    statistics are asked grouped by and *linked* the ``(child column, parent column)`` pairs
+    asked, each once, in the order listed.
+    """
+    counted = False
+    group_by: List[str] = []
+    linked: List[Tuple[str, str]] = []
+    for each in request.relationships:
+        if (
+            each.child.table == relationship.child
+            and each.parent.table == relationship.parent
+            and each.child.columns == relationship.child_columns
+            and each.parent.columns == relationship.parent_columns
+        ):
+            counted = counted or "marginalHistogram/1" in each.statistics
+            group_by.extend(name for name in each.group_by if name not in group_by)
+            linked.extend(
+                pair
+                for pair in ((item.column, item.parent_column) for item in each.linked)
+                if pair not in linked
+            )
+    return counted, tuple(group_by), tuple(linked)
 
 
 def _spelled(link: RequestRelationship) -> str:
@@ -404,6 +435,13 @@ def not_measured(
                 )
             )
             continue
+        if link.group_by and "marginalHistogram/1" not in link.statistics:
+            found.append(
+                (
+                    f"groupBy of children per parent of {_spelled(link)}",
+                    "children per parent is counted only where marginalHistogram/1 is listed",
+                )
+            )
         for identifier in link.statistics:
             if identifier != "marginalHistogram/1":
                 found.append(
