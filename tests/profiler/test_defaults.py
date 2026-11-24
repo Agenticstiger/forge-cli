@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import tracemalloc
 from fractions import Fraction
 from pathlib import Path
 
@@ -249,6 +250,88 @@ def test_timestamp_bins_follow_the_declared_range_and_no_edge_leaves_it(constrai
     assert edges == sorted(set(edges))
     assert all(_stamp(low) <= each <= _stamp(high) for each in edges)
     assert 2 <= len(bins) <= defaults.RANGE_BINS + 1  # N + 1 edges cut N bins
+
+
+@pytest.mark.parametrize(
+    "low, high, expected",
+    [
+        (1704067200, 1704067290, [
+            "2024-01-01T00:00:00Z", "2024-01-01T00:00:10Z", "2024-01-01T00:00:20Z",
+            "2024-01-01T00:00:30Z", "2024-01-01T00:00:40Z", "2024-01-01T00:00:50Z",
+            "2024-01-01T00:01:00Z", "2024-01-01T00:01:10Z", "2024-01-01T00:01:20Z",
+            "2024-01-01T00:01:30Z",
+        ]),
+        (1704067200, 1704153600, [
+            "2024-01-01T00:00:00Z", "2024-01-01T03:00:00Z", "2024-01-01T06:00:00Z",
+            "2024-01-01T09:00:00Z", "2024-01-01T12:00:00Z", "2024-01-01T15:00:00Z",
+            "2024-01-01T18:00:00Z", "2024-01-01T21:00:00Z", "2024-01-02T00:00:00Z",
+        ]),
+        (1704067200, 1735689600, [
+            "2024-01-01T00:00:00Z", "2024-01-18T00:00:00Z", "2024-03-18T00:00:00Z",
+            "2024-05-17T00:00:00Z", "2024-07-16T00:00:00Z", "2024-09-14T00:00:00Z",
+            "2024-11-13T00:00:00Z", "2025-01-01T00:00:00Z",
+        ]),
+        (0, 1, ["1970-01-01T00:00:00Z", "1970-01-01T00:00:01Z"]),
+    ],
+)  # fmt: skip
+def test_timestamp_bins_of_a_short_range_are_the_same_edges_as_ever(low, high, expected):
+    assert list(defaults.timestamp_bins(low, high)) == expected
+
+
+@pytest.mark.parametrize(
+    "low, high",
+    [
+        ("2020-01-01", "2030-01-01"),  # a decade is 3 * 10**8 seconds
+        ("2000-01-01", "2030-01-01"),
+        ("0001-01-01", "9999-12-31"),  # the widest range a contract can declare
+    ],
+)
+def test_timestamp_bins_of_a_wide_range_are_counted_not_listed(low, high):
+    # Listing every second of a decade, to count the edges, takes some 12 GB: the bins are
+    # worked out from the count alone, and only the edges kept are ever held.
+    tracemalloc.start()
+    try:
+        bins = defaults.timestamp_bins(_stamp(low), _stamp(high))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 1_000_000
+    assert 2 <= len(bins) <= defaults.RANGE_BINS + 1
+    assert bins[0] == f"{low}T00:00:00Z"
+    assert [_stamp(each) for each in bins] == sorted({_stamp(each) for each in bins})
+
+
+@pytest.mark.parametrize(
+    "low, high, years",
+    [
+        ("2020-01-01", "2030-01-01", 2),
+        ("2000-01-01", "2030-01-01", 5),
+        ("1950-01-01", "2030-01-01", 10),
+        ("1900-01-01", "2100-01-01", 50),
+        ("0001-01-01", "9999-12-31", 2000),  # 1000-year rungs cut it into 11 bins
+    ],
+)
+def test_the_year_ladder_steps_by_2_5_10_and_skips_no_rung(low, high, years):
+    # Each rung is at most 2.5 times the one before, so a range the rung before cut into
+    # more than RANGE_BINS bins is cut into at least four by the next one.
+    bins = defaults.timestamp_bins(_stamp(low), _stamp(high))
+    inner = [_stamp(each) for each in bins[1:-1]]
+    steps = {b - a for a, b in zip(inner, inner[1:], strict=False)}
+    assert steps == {years * defaults._YEAR_SECONDS}
+    assert 4 <= len(bins) - 1 <= defaults.RANGE_BINS
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "0001-01-01T00:00:00Z",
+        "0999-12-31T23:59:59Z",
+        "1970-01-01T00:00:00Z",
+        "9999-12-31T00:00:00Z",
+    ],
+)
+def test_an_edge_is_spelled_with_a_four_digit_year_on_every_platform(text):
+    assert defaults._spell(_stamp(text)) == text
 
 
 @pytest.mark.parametrize(

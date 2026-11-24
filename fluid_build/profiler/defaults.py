@@ -375,7 +375,9 @@ def declared_instants(column: Mapping[str, Any]) -> Optional[Tuple[int, int]]:
 
 
 def _spell(seconds: int) -> str:
-    return (_EPOCH + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # isoformat, not strftime: strftime("%Y") leaves a year before 1000 unpadded on some
+    # platforms (glibc under Python 3.11 and older), and "500-01-01T00:00:00Z" is no instant.
+    return (_EPOCH + timedelta(seconds=seconds)).replace(tzinfo=None).isoformat() + "Z"
 
 
 def timestamp_bins(low: int, high: int) -> Tuple[str, ...]:
@@ -391,12 +393,18 @@ def timestamp_bins(low: int, high: int) -> Tuple[str, ...]:
     while True:
         width = next(widths, None)
         if width is None:  # past the years, by 2, 5, 10 ...
-            widths = iter(_YEAR_SECONDS * magnitude * scale for scale in (2, 5, 10))
+            # A tuple, not a generator: a generator would read the magnitude only once the
+            # line below had already raised it, and step by 20, 50, 100 years instead.
+            years = _YEAR_SECONDS * magnitude
+            widths = iter((2 * years, 5 * years, 10 * years))
             magnitude *= 10
             continue
-        inner = list(range((low // width + 1) * width, high, width))
-        if len(inner) < RANGE_BINS:  # N inner edges cut N + 1 bins
+        first = (low // width + 1) * width
+        # Count the multiples before listing them: a decade cut by the second is 3 * 10**8 of
+        # them, and a list of that many integers is gigabytes. N inner edges cut N + 1 bins.
+        if max(0, -((first - high) // width)) < RANGE_BINS:
             break
+    inner = range(first, high, width)
     return tuple(_spell(each) for each in (low, *inner, high))
 
 
