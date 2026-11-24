@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The federation digest check runs on every apply engine.** `validate_federated_consumes` (the
+  warn-only gate that reports a drifted `upstreamDigest` pin) was called only below the OpenTofu
+  branch and the build modes' early returns, so `fluid apply` on aws / gcp / snowflake and
+  `--mode amend-and-build` never reported drift. It now runs once, above the engine dispatch, on
+  the contract the pre-apply gate checked; it still only warns, and `--no-verify-federation` still
+  skips it. A contract changed by `--config-override` is checked as loaded, not as overridden.
 - **`incremental_append` to a single local file keeps every increment.** A run without partition
   keys wrote its rows with a plain `COPY ... TO <file>`, which replaces the file, while the cursor
   had already moved past the previous run's rows: after two runs the file held only the second
