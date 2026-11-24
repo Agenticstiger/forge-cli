@@ -7,7 +7,7 @@ black==24.10.0
 detect-secrets==1.5.0
 build
 twine
-uv==0.11.23
+uv==0.13.9
 pyyaml>=6.0,!=6.0.4
 pytest
 pytest-cov
