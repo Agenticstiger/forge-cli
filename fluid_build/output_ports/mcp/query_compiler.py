@@ -67,6 +67,7 @@ from fluid_build.forge_datamodel import semantics_builder as _semantics_builder
 from fluid_build.output_ports.mcp.auth import MTLS_IDENTITY_ATTRS
 from fluid_build.providers._sql_safety import (
     names_refused_duckdb_function,
+    names_refused_postgres_function,
     validate_ident,
     validate_sql_expression_allowlist,
 )
@@ -401,10 +402,14 @@ def _allowed_columns(index: "_SemanticIndex", restricted: Iterable[str]) -> List
     projected either, so a column added to the table later is never readable by
     default. Fails closed when nothing readable is declared.
     """
+    return _allowed_names(list(index.columns), restricted)
+
+
+def _allowed_names(declared: Iterable[str], restricted: Iterable[str]) -> List[str]:
     denied = {name.casefold() for name in restricted}
     allowed: List[str] = []
     seen: Set[str] = set()
-    for name in index.columns:
+    for name in declared:
         folded = name.casefold()
         if folded in denied or folded in seen:
             continue
@@ -422,9 +427,19 @@ def _allowed_columns(index: "_SemanticIndex", restricted: Iterable[str]) -> List
 
 # The projection's opening, as the compiler renders it: ``(SELECT a, b FROM``. The
 # driver's statement guard refuses a body ``SELECT`` (a union / exfiltration marker);
-# this is the one body ``SELECT`` the compiler itself writes, and only in this shape.
+# this is the one body ``SELECT`` the compiler itself writes. It is recognised at any
+# position, so a caller's own layout around the table reference (a parenthesis, a
+# DuckDB prefix alias ``c: customers``, a keyword before it) does not turn the
+# compiler's output into a refusal. That is safe because a caller's SQL, a contract
+# expression and the table reference all pass ``validate_sql_expression_allowlist``,
+# which refuses the word ``select`` anywhere in them, so this shape can only be the
+# compiler's. Every column is a bare or quoted identifier, never an expression or a
+# nested query.
+_PROJECTION_COLUMN = (
+    r"""(?:[A-Za-z_][A-Za-z0-9_]*|"[A-Za-z_][A-Za-z0-9_]*"|`[A-Za-z_][A-Za-z0-9_]*`)"""
+)
 _PROJECTION_OPEN_RE = re.compile(
-    r"(?<=\nFROM )\(SELECT [A-Za-z_][A-Za-z0-9_]*(?:, [A-Za-z_][A-Za-z0-9_]*)* FROM "
+    r"\(SELECT " + _PROJECTION_COLUMN + r"(?:, " + _PROJECTION_COLUMN + r")* FROM "
 )
 
 
@@ -433,10 +448,12 @@ def strip_projection_open(sql_body: str) -> str:
     rendered statement body, so a driver's body-keyword guard sees only the rest.
 
     The remainder (table reference, row-filter predicate, alias, outer clauses) is
-    still scanned in full. At most one opening is removed, and only the exact shape
-    :func:`compile_semantic_query` renders directly after the outer ``FROM``.
+    still scanned in full: only the opening goes, so a ``SELECT`` anywhere else in the
+    statement (a union branch, a scalar subquery over another column list) is still
+    refused. The shape removed is the one :func:`compile_semantic_query` and
+    :func:`compile_free_form_sql` render for an expose that restricts columns.
     """
-    return _PROJECTION_OPEN_RE.sub("(", sql_body, count=1)
+    return _PROJECTION_OPEN_RE.sub("(", sql_body)
 
 
 def _resolve_measure_alias(
@@ -1450,6 +1467,271 @@ def _validate_rendered_statement(sql: str) -> None:
         raise ValueError(f"Rendered statement contains forbidden marker: {sql!r}")
 
 
+# A table name that is really a file, a glob or a URL (DuckDB reads ``FROM 'x.csv'`` as
+# a file scan). None of these is a catalog table, and one that names the bound file
+# would read it without the projection.
+_FILE_LIKE_TABLE_RE = re.compile(r"[./\\*:]")
+
+
+def _declared_column_names(expose: Mapping[str, Any]) -> List[str]:
+    names: List[str] = []
+    for column in (expose.get("contract") or {}).get("schema") or []:
+        if isinstance(column, Mapping) and isinstance(column.get("name"), str):
+            names.append(validate_ident(column["name"]))
+    return names
+
+
+def _refuse_table_keyword(sql: str, read: Optional[str]) -> None:
+    """Refuse a caller statement that uses the ``TABLE`` keyword.
+
+    ``TABLE <name>`` reads a whole table in the engines that accept it (DuckDB,
+    Postgres, Trino), and ``TABLE(...)`` is a table function in Snowflake. Parsers
+    disagree on both, so the statement is checked at the token level, before it is
+    parsed: no reading of the tree can skip it. A quoted ``"TABLE"`` is an identifier
+    token, not the keyword, and stays allowed.
+    """
+    from sqlglot import TokenType
+    from sqlglot.dialects.dialect import Dialect
+    from sqlglot.errors import SqlglotError
+
+    try:
+        tokens = Dialect.get_or_raise(read).tokenize(sql)
+    except SqlglotError:
+        raise _unreadable_sql() from None
+    if any(token.token_type == TokenType.TABLE for token in tokens):
+        raise QueryValidationError(
+            "sql may not use the TABLE keyword on an expose that restricts columns; "
+            "select from the exposed table by name."
+        )
+
+
+def _unreadable_sql() -> QueryValidationError:
+    return QueryValidationError(
+        "sql could not be rewritten to read only the columns this expose allows; write "
+        "one plain SELECT over the exposed table."
+    )
+
+
+def _is_plain_source(source: Any, *, allow_lateral: bool) -> bool:
+    from sqlglot import exp
+
+    if isinstance(source, exp.Table):
+        return isinstance(source.this, exp.Identifier)
+    if isinstance(source, (exp.Subquery, exp.Unnest, exp.Values)):
+        return True
+    return allow_lateral and isinstance(source, exp.Lateral)
+
+
+def _require_plain_sources(tree: Any) -> None:
+    """Refuse a statement with a source the rewrite does not know how to project.
+
+    Everything in a ``FROM``, a ``JOIN`` or a ``LATERAL`` must be a table named by a
+    plain identifier, a subquery, an ``UNNEST`` or a ``VALUES`` list. Anything else
+    (a table function, ``TABLE(...)``, ``ROWS FROM``, or a node a later parser adds)
+    could read the exposed table without being a table reference the rewrite sees, so
+    it is refused by what it is, not by a list of the forms known today.
+    """
+    from sqlglot import exp
+
+    for node in tree.find_all(exp.From, exp.Join, exp.Lateral):
+        if not _is_plain_source(node.this, allow_lateral=isinstance(node, (exp.From, exp.Join))):
+            raise QueryValidationError(
+                "sql may only read from tables named in the usual way, subqueries, UNNEST "
+                "and VALUES on an expose that restricts columns; query the exposed table "
+                "directly."
+            )
+
+
+def _crosscheck_duckdb_projection(sql: str, exposed_name: str, allowed: Iterable[str]) -> None:
+    """Have DuckDB's own parser confirm the rewritten statement.
+
+    The rewrite is checked with sqlglot, and sqlglot is not the engine: the two can
+    read one statement differently. DuckDB serialises the statement it will run
+    (``json_serialize_sql``, a parse with no execution), and every read of the exposed
+    table in that tree must be the only source of a projection of bare allowed
+    columns. A statement DuckDB cannot serialise is refused.
+    """
+    import json
+
+    try:
+        import duckdb
+    except ImportError:  # pragma: no cover - a duckdb dialect implies duckdb
+        return
+    refusal = QueryValidationError(
+        "sql could not be checked against the columns this expose allows; write one "
+        "plain SELECT over the exposed table."
+    )
+    permitted = {name.casefold() for name in allowed}
+    connection = duckdb.connect(":memory:")
+    try:
+        raw = connection.execute("SELECT json_serialize_sql(?)", [sql]).fetchone()
+        document = json.loads(raw[0]) if raw else {}
+    except (duckdb.Error, ValueError):
+        raise refusal from None
+    finally:
+        connection.close()
+    if document.get("error") or not document.get("statements"):
+        raise refusal
+    nodes: List[Dict[str, Any]] = []
+
+    def _collect(value: Any) -> None:
+        if isinstance(value, dict):
+            nodes.append(value)
+            for child in value.values():
+                _collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                _collect(child)
+
+    _collect(document)
+
+    def _reads_exposed(node: Any) -> bool:
+        return (
+            isinstance(node, dict)
+            and node.get("type") == "BASE_TABLE"
+            and str(node.get("table_name") or "").casefold() == exposed_name
+        )
+
+    def _bare_projection(node: Dict[str, Any]) -> bool:
+        source = node["from_table"]
+        return (
+            not node.get("modifiers")
+            and not node.get("where_clause")
+            and not node.get("group_expressions")
+            and not node.get("group_sets")
+            and not node.get("having")
+            and not node.get("qualify")
+            and not node.get("sample")
+            and not source.get("sample")
+            and not source.get("at_clause")
+            and not (node.get("cte_map") or {}).get("map")
+            and bool(node.get("select_list"))
+            and all(
+                item.get("class") == "COLUMN_REF"
+                and len(item.get("column_names") or []) == 1
+                and str(item["column_names"][0]).casefold() in permitted
+                for item in node["select_list"]
+            )
+        )
+
+    sanctioned = {
+        id(node["from_table"])
+        for node in nodes
+        if node.get("type") == "SELECT_NODE"
+        and _reads_exposed(node.get("from_table"))
+        and _bare_projection(node)
+    }
+    if any(_reads_exposed(node) and id(node) not in sanctioned for node in nodes):
+        raise refusal
+
+
+def _project_exposed_table(
+    sql: str,
+    *,
+    table_reference: str,
+    allowed: List[str],
+    dialect: Optional[str],
+) -> str:
+    """Rewrite caller SQL so every read of the exposed table goes through a projection
+    of the ``allowed`` columns.
+
+    Each reference to the table, wherever it sits (the outer ``FROM``, a join, a
+    self-join, a subquery, a CTE body), becomes
+    ``(SELECT <allowed columns> FROM <table_reference>) AS <the caller's alias>``. A
+    restricted column is then not part of any relation the statement can see, whether
+    it is written as a name, a quoted name, ``COLUMNS(...)``, ``*``, ``alias.*`` or the
+    whole row. A table function or a file path as a table is refused, because it
+    would read the data without the projection. The rewritten statement is parsed
+    again and checked, so a printing quirk cannot leave a bare reference behind.
+
+    ``sqlglot`` is imported here, not at module scope, to keep it off the cold path.
+    """
+    import sqlglot
+    from sqlglot import exp
+    from sqlglot.errors import ErrorLevel, SqlglotError
+
+    read = _SQLGLOT_DIALECTS.get((dialect or "").strip().lower())
+    unreadable = _unreadable_sql()
+    # Before anything is parsed: no reading of the statement can skip this.
+    _refuse_table_keyword(sql, read)
+    try:
+        statements = sqlglot.parse(sql, read=read)
+        exposed = exp.to_table(table_reference, dialect=read)
+    except SqlglotError:
+        raise unreadable from None
+    if len(statements) != 1 or statements[0] is None or not exposed.name:
+        raise unreadable
+    tree = statements[0]
+    _require_plain_sources(tree)
+    exposed_name = exposed.name.casefold()
+    allowed_names = {name.casefold() for name in allowed}
+
+    for cte in tree.find_all(exp.CTE):
+        if cte.alias_or_name.casefold() == exposed_name:
+            raise QueryValidationError(
+                f"sql defines a CTE named {cte.alias_or_name!r}, the name of the exposed "
+                "table; use another name."
+            )
+    tables = list(tree.find_all(exp.Table))
+    for table in tables:
+        if not isinstance(table.this, exp.Identifier) or _FILE_LIKE_TABLE_RE.search(table.name):
+            raise QueryValidationError(
+                "sql may not read from a table function or a file path on an expose that "
+                "restricts columns; query the exposed table directly."
+            )
+    # Splice the projection into the caller's own text, at the source span of each
+    # reference, so everything else in the statement reaches the engine exactly as
+    # written (sqlglot cannot print every engine function it can parse).
+    projection = f"(SELECT {', '.join(allowed)} FROM {table_reference})"
+    splices: List[Tuple[int, int, str]] = []
+    for table in tables:
+        if table.name.casefold() != exposed_name:
+            continue
+        spans = [part.meta for part in table.parts]
+        if any("start" not in span or "end" not in span for span in spans):
+            raise unreadable
+        replacement = projection if table.args.get("alias") else f"{projection} AS {exposed.name}"
+        splices.append((min(m["start"] for m in spans), max(m["end"] for m in spans), replacement))
+    rewritten = sql
+    for begin, finish, replacement in sorted(splices, reverse=True):
+        rewritten = rewritten[:begin] + replacement + rewritten[finish + 1 :]
+    try:
+        checked = sqlglot.parse_one(rewritten, read=read)
+    except SqlglotError:
+        raise unreadable from None
+    _require_plain_sources(checked)
+
+    for table in checked.find_all(exp.Table):
+        if table.name.casefold() != exposed_name:
+            continue
+        select = table.parent.parent if isinstance(table.parent, exp.From) else None
+        # The only place the exposed table may appear is as the sole source of a
+        # projection that selects bare allowed columns and nothing else.
+        if (
+            not isinstance(select, exp.Select)
+            or not isinstance(select.parent, exp.Subquery)
+            or any(
+                select.args.get(key)
+                for key in ("where", "joins", "group", "having", "order", "limit", "distinct")
+            )
+            or not all(
+                isinstance(item, exp.Column)
+                and not item.table
+                and item.name.casefold() in allowed_names
+                for item in select.expressions
+            )
+        ):
+            raise QueryValidationError(
+                "sql reads the exposed table in a form that cannot be limited to the columns "
+                "this expose allows; write one plain SELECT over the exposed table."
+            )
+    if any(marker in rewritten for marker in (";", "--", "/*", "*/")):
+        raise ValueError("Rewritten statement contains a forbidden marker")
+    if read == "duckdb":
+        _crosscheck_duckdb_projection(rewritten, exposed_name, allowed)
+    return rewritten
+
+
 # A caller statement that already ends in ``LIMIT <n>`` (case-insensitive,
 # trailing whitespace tolerated). Used so the server-side ``LIMIT`` is not
 # appended a second time — two trailing LIMITs is a syntax error on most
@@ -1513,10 +1795,17 @@ def compile_free_form_sql(
       missing ``${caller.*}`` attribute still raises
       :class:`RowFilterIdentityMissing` (fail-closed) before the
       rejection check completes.
-    * ``FROM`` references are NOT rewritten — the caller must reference the
-      bound table by its fully-qualified name from the contract. Phase-2 may
-      add an AST-level rewrite so consumers can reference the expose by
-      exposeId rather than the underlying binding.
+    * **Column restrictions.** When ``restricted_columns`` is non-empty, ``expose``
+      is required (it declares the columns to project; without it the call is
+      refused). Every read of the exposed table is then rewritten to a projection
+      of the allowed columns. The statement may not use the ``TABLE`` keyword,
+      and every source in it must be a plain table, a subquery, ``UNNEST`` or
+      ``VALUES``; on DuckDB the engine's own parser checks the rewritten
+      statement too.
+    * ``FROM`` references are NOT rewritten otherwise — the caller must
+      reference the bound table by its fully-qualified name from the contract.
+      Phase-2 may add an AST-level rewrite so consumers can reference the expose
+      by exposeId rather than the underlying binding.
     """
     if not isinstance(sql, str):
         raise QueryValidationError("sql must be a string")
@@ -1541,6 +1830,13 @@ def compile_free_form_sql(
             "duckdb_logs_parsed, duckdb_log_contexts) or run a statement given as text "
             "(query, query_table, json_execute_serialized_sql). Remove the reference and "
             "query the exposed table directly."
+        )
+    if names_refused_postgres_function(candidate):
+        raise QueryValidationError(
+            "sql may not call a function that returns a whole table, schema, database or "
+            "query result as XML (table_to_xml, query_to_xml, cursor_to_xml, "
+            "schema_to_xml, database_to_xml and their variants). Select the columns of the "
+            "exposed table directly."
         )
     body = parts[1]
     validate_sql_expression_allowlist(body)
@@ -1588,6 +1884,25 @@ def compile_free_form_sql(
             "Free-form query_sql is not permitted on an expose that declares "
             "row filters (policy.rowFilters): row-level security cannot be "
             "enforced on arbitrary SQL — use the semantic 'query' tool instead."
+        )
+    # Column restrictions are enforced by structure, not only by the name scan above:
+    # every read of the exposed table is rewritten to a projection of the allowed
+    # columns, so a spelling the scan cannot see (``COLUMNS('..')``, ``*``, ``t.*``,
+    # the whole row, a quoted name) has no restricted column to reach. Callers that
+    # pass no ``expose`` have no declared columns to project, so they are refused (the
+    # MCP ``query_sql`` handler always passes one).
+    restricted = _clean_column_names(restricted_columns)
+    if restricted and expose is None:
+        raise QueryValidationError(
+            "sql cannot be compiled on an expose that restricts columns without the expose "
+            "itself: the columns it declares are what the statement is limited to."
+        )
+    if restricted and expose is not None:
+        candidate = _project_exposed_table(
+            candidate,
+            table_reference=table_reference,
+            allowed=_allowed_names(_declared_column_names(expose), restricted),
+            dialect=dialect,
         )
     # No row filters: append the server-side cap, but only when the caller
     # didn't already supply a trailing ``LIMIT <n>`` (a second one is a syntax

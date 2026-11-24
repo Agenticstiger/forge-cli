@@ -436,6 +436,7 @@ def test_free_form_sql_rejects_a_quoted_restricted_column():
             table_reference="customers",
             limit=5,
             restricted_columns=("region",),
+            expose=_expose(),
             dialect="duckdb",
         )
     # BigQuery reads "region" as a string literal, so it is not a reference there.
@@ -444,6 +445,7 @@ def test_free_form_sql_rejects_a_quoted_restricted_column():
         table_reference="customers",
         limit=5,
         restricted_columns=("region",),
+        expose=_expose(),
         dialect="bigquery",
     )
 
@@ -480,9 +482,14 @@ def test_driver_guard_admits_the_compiled_projection_and_still_refuses_other_sel
     for hostile in (
         compiled.sql.replace("FROM customers", "FROM customers UNION SELECT 1 FROM customers"),
         compiled.sql.replace("(SELECT id", "(SELECT (SELECT region FROM customers) AS id"),
-        "SELECT x FROM (SELECT region FROM customers) AS t",
+        "SELECT x FROM (SELECT * FROM customers) AS t",
+        "SELECT x FROM (SELECT region + 1 FROM customers) AS t",
+        # The guard knows the compiler's own shape (bare columns), not which table it
+        # reads: a caller cannot write a SELECT at all, because the allowlist refuses it
+        # in caller and contract text, so any other SELECT is a regression and is refused.
+        "SELECT x FROM customers WHERE id IN (SELECT id + 1 FROM other)",
         compiled.sql.replace(
-            "AS _fluid_allowed", "AS _fluid_allowed JOIN (SELECT region FROM t) j"
+            "AS _fluid_allowed", "AS _fluid_allowed JOIN (SELECT region + 1 FROM t) j"
         ),
     ):
         with pytest.raises(ValueError):
@@ -529,6 +536,618 @@ def test_end_to_end_through_the_driver_on_a_restricted_expose(tmp_path):
     assert {row["segment"]: float(row["mt"]) for row in payload["rows"]} == {"retail": 30.0}
     with pytest.raises(QueryValidationError):
         tool_query(state, {"metric": "mt", "dimensions": ["d"]})
+
+
+# ---------------------------------------------------------------------
+# Free-form ``query_sql``: the same boundary, on the caller's own SQL
+# ---------------------------------------------------------------------
+
+from fluid_build.output_ports.mcp.query_compiler import compile_free_form_sql  # noqa: E402
+
+
+def _free_form(connection, sql: str, *, restricted: Sequence[str] = ("region",)):
+    """Compile caller SQL and run it. Returns ``(kind, detail)`` where ``detail`` is
+    ``(column_names, rows)`` for ``rows``."""
+    try:
+        compiled = compile_free_form_sql(
+            sql=sql,
+            table_reference="customers",
+            limit=50,
+            restricted_columns=restricted,
+            expose=_expose(),
+            dialect="duckdb",
+        )
+    except QueryValidationError as exc:
+        return "refused", str(exc)
+    try:
+        cursor = connection.execute(compiled.sql)
+        rows = cursor.fetchall()
+        names = [col[0] for col in cursor.description]
+    except duckdb.Error as exc:
+        return "engine_error", str(exc)
+    return "rows", (names, rows)
+
+
+_HOSTILE_FREE_FORM = [
+    pytest.param('SELECT "region" AS x FROM customers', id="quoted-name"),
+    pytest.param('SELECT "REGION" FROM customers', id="quoted-name-upper"),
+    pytest.param("SELECT max(COLUMNS('reg.*')) AS x FROM customers", id="columns-regex"),
+    pytest.param("SELECT approx_top_k(COLUMNS('reg'), 5) AS x FROM customers", id="columns-top-k"),
+    pytest.param(
+        "SELECT id FROM customers WHERE EXISTS(FROM customers c2 WHERE c2.\"region\" = 'DENIED-EU')",
+        id="exists-over-quoted-name",
+    ),
+]
+
+
+_WHOLE_ROW_FREE_FORM = [
+    pytest.param("SELECT to_json(c) AS x FROM customers c", id="alias-as-row"),
+    pytest.param("SELECT to_json(customers) AS x FROM customers", id="table-as-row"),
+    pytest.param(
+        "SELECT a.id, to_json(b) AS x FROM customers a JOIN customers b ON a.id = b.id",
+        id="self-join",
+    ),
+    pytest.param("SELECT to_json(t) AS x FROM (FROM customers) t", id="from-first-subquery"),
+]
+
+
+@pytest.mark.parametrize("sql", _WHOLE_ROW_FREE_FORM)
+def test_free_form_whole_row_value_holds_only_the_allowed_columns(con, sql):
+    kind, detail = _free_form(con, sql)
+    assert kind != "rows" or (
+        "region" not in repr(detail).lower() and not _leaked(detail[1])
+    ), detail
+
+
+@pytest.mark.parametrize("sql", _HOSTILE_FREE_FORM)
+def test_free_form_sql_cannot_read_a_restricted_column(con, sql):
+    kind, detail = _free_form(con, sql)
+    assert kind in ("refused", "engine_error"), f"evaluated: {detail!r}"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        pytest.param("SELECT * FROM customers", id="star"),
+        pytest.param("SELECT c.* FROM customers c", id="alias-star"),
+        pytest.param("SELECT customers.* FROM customers", id="table-star"),
+        pytest.param("SELECT max(COLUMNS(*)) FROM customers", id="columns-star"),
+        pytest.param("SELECT * FROM main.customers", id="schema-qualified-star"),
+    ],
+)
+def test_free_form_star_selects_only_the_allowed_columns(con, sql):
+    kind, detail = _free_form(con, sql)
+    assert kind == "rows", detail
+    names, rows = detail
+    assert "region" not in [n.lower() for n in names], names
+    assert not _leaked(rows)
+
+
+def test_free_form_queries_over_allowed_columns_still_work(con):
+    kind, detail = _free_form(
+        con,
+        "SELECT c.segment, sum(c.amount) AS total FROM customers c "
+        "JOIN customers d ON c.id = d.id WHERE d.id > 0 GROUP BY c.segment ORDER BY c.segment",
+    )
+    assert kind == "rows", detail
+    assert detail[1] == [("retail", 30), ("wholesale", 30)]
+    kind, detail = _free_form(con, "SELECT count(*) AS n FROM customers")
+    assert (kind, detail[1]) == ("rows", [(3,)])
+    kind, detail = _free_form(con, "SELECT segment FROM customers WHERE segment = 'region' LIMIT 1")
+    assert kind == "rows", detail
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM read_csv('customers.csv')",
+        "SELECT * FROM read_parquet('customers.parquet')",
+        "SELECT * FROM 'customers.csv'",
+        "SELECT * FROM range(3)",
+    ],
+)
+def test_free_form_sql_refuses_a_table_function_or_a_file_on_a_restricted_expose(con, sql):
+    kind, detail = _free_form(con, sql)
+    assert kind == "refused", detail
+
+
+def test_a_cte_body_and_a_shadowing_cte_name_see_the_projection(con):
+    """A CTE is not reachable through ``compile_free_form_sql`` (a statement must start
+    with SELECT), but the rewrite handles it so that stays true if that ever changes."""
+    from fluid_build.output_ports.mcp.query_compiler import _project_exposed_table
+
+    allowed = ["id", "segment", "amount", "tenant_id"]
+    rewritten = _project_exposed_table(
+        "SELECT * FROM x",
+        table_reference="customers",
+        allowed=allowed,
+        dialect="duckdb",
+    )
+    assert "customers" not in rewritten
+    with_cte = _project_exposed_table(
+        "WITH x AS (SELECT * FROM customers) SELECT to_json(x) FROM x",
+        table_reference="customers",
+        allowed=allowed,
+        dialect="duckdb",
+    )
+    assert "region" not in con.execute(with_cte).fetchall()[0][0]
+    with pytest.raises(QueryValidationError, match="CTE named"):
+        _project_exposed_table(
+            "WITH customers AS (SELECT 1 AS id) SELECT * FROM customers",
+            table_reference="customers",
+            allowed=allowed,
+            dialect="duckdb",
+        )
+
+
+def test_free_form_projection_applies_to_pii_columns_too(con):
+    """The handler passes restricted + PII columns; none of them is projected."""
+    kind, detail = _free_form(con, "SELECT * FROM customers", restricted=("region", "tenant_id"))
+    assert kind == "rows"
+    assert [n.lower() for n in detail[0]] == ["id", "segment", "amount"]
+
+
+def test_free_form_with_no_declared_readable_column_fails_closed():
+    expose = _expose()
+    expose["contract"]["schema"] = [{"name": "region"}]
+    with pytest.raises(QueryValidationError, match="no readable column"):
+        compile_free_form_sql(
+            sql="SELECT 1 FROM customers",
+            table_reference="customers",
+            limit=5,
+            restricted_columns=("region",),
+            expose=expose,
+        )
+
+
+def test_free_form_without_restrictions_keeps_the_callers_statement():
+    compiled = compile_free_form_sql(
+        sql="SELECT  region FROM customers",
+        table_reference="customers",
+        limit=5,
+        restricted_columns=(),
+        expose=_expose(),
+    )
+    assert compiled.sql == "SELECT  region FROM customers\nLIMIT 5"
+
+
+@pytest.mark.parametrize("dialect,read,table", _DIALECTS, ids=[d[0] for d in _DIALECTS])
+def test_free_form_rewrite_parses_in_every_dialect(dialect, read, table):
+    from sqlglot import exp
+
+    compiled = compile_free_form_sql(
+        sql=f"SELECT c.segment, SUM(c.amount) AS total FROM {table} c "
+        f"JOIN {table} d ON c.id = d.id GROUP BY c.segment",
+        table_reference=table,
+        limit=5,
+        restricted_columns=("region", "tenant_id"),
+        expose=_expose(),
+        dialect=dialect,
+    )
+    tree = sqlglot.parse_one(compiled.sql, read=read)
+    subqueries = [s for s in tree.find_all(exp.Subquery)]
+    assert len(subqueries) == 2
+    for sub in subqueries:
+        assert [c.name for c in sub.this.expressions] == ["id", "segment", "amount"]
+    assert not {c.name.lower() for c in tree.find_all(exp.Column)} & {"region", "tenant_id"}
+    assert compiled.sql.rstrip().endswith("LIMIT 5")
+
+
+def test_driver_guard_admits_the_free_form_projection_in_joins_and_lists():
+    from fluid_build.output_ports.mcp.drivers.base import guard_against_injection_markers
+
+    compiled = compile_free_form_sql(
+        sql="SELECT a.id FROM customers a JOIN customers b ON a.id = b.id, customers c",
+        table_reference="customers",
+        limit=5,
+        restricted_columns=("region",),
+        expose=_expose(),
+        dialect="duckdb",
+    )
+    guard_against_injection_markers(compiled.sql)
+    with pytest.raises(ValueError):
+        guard_against_injection_markers(compiled.sql + " UNION SELECT 1")
+
+
+def test_free_form_end_to_end_through_the_driver(tmp_path):
+    from types import SimpleNamespace
+
+    from fluid_build.output_ports.mcp._handlers import tool_query_sql
+    from fluid_build.output_ports.mcp.drivers import build_driver
+
+    csv = tmp_path / "customers.csv"
+    csv.write_text(
+        "id,region,segment,amount,tenant_id\n"
+        "1,DENIED-EU,retail,10,t1\n"
+        "2,DENIED-US,retail,20,t1\n"
+    )
+    expose = _expose()
+    expose["binding"] = {
+        "platform": "local",
+        "format": "csv",
+        "location": {"path": str(csv), "table": "customers"},
+    }
+    expose["policy"] = {
+        "authz": {
+            "columnRestrictions": [{"principal": "*", "columns": ["region"], "access": "deny"}]
+        }
+    }
+    driver = build_driver(expose=expose, contract={"exposes": [expose]})
+    state = SimpleNamespace(
+        expose=expose,
+        caller_attributes={},
+        policy=SimpleNamespace(max_sample_rows=100),
+        query_timeout_seconds=None,
+        get_driver=lambda: driver,
+    )
+    ok = tool_query_sql(
+        state, {"sql": "SELECT segment, sum(amount) AS total FROM customers GROUP BY segment"}
+    )
+    assert ok["rows"] == [{"segment": "retail", "total": 30}]
+    star = tool_query_sql(state, {"sql": "SELECT * FROM customers"})
+    assert "region" not in star["columns"] and LEAK_MARKER not in repr(star)
+    whole_row = tool_query_sql(state, {"sql": "SELECT to_json(c) AS x FROM customers c"})
+    assert "region" not in repr(whole_row) and LEAK_MARKER not in repr(whole_row)
+    for sql in (
+        "SELECT max(COLUMNS('reg.*')) AS x FROM customers",
+        'SELECT "region" AS x FROM customers',
+        f"SELECT * FROM read_csv('{csv.as_posix()}')",
+    ):
+        with pytest.raises(Exception) as caught:
+            result = tool_query_sql(state, {"sql": sql})
+            pytest.fail(f"evaluated: {result!r}")
+        assert not isinstance(caught.value, pytest.fail.Exception)
+
+
+def test_free_form_keeps_the_callers_text_outside_the_table_reference(con):
+    """Only the table reference is replaced, so engine functions sqlglot cannot print
+    back (approx_top_k on DuckDB) and the caller's own layout still reach the engine."""
+    from fluid_build.output_ports.mcp.drivers.base import guard_against_injection_markers
+
+    compiled = compile_free_form_sql(
+        sql="select approx_top_k(segment, 2) AS x\nfrom\n  main.customers",
+        table_reference="customers",
+        limit=5,
+        restricted_columns=("region",),
+        expose=_expose(),
+        dialect="duckdb",
+    )
+    assert compiled.sql.startswith("select approx_top_k(segment, 2) AS x\nfrom\n  (SELECT id,")
+    guard_against_injection_markers(compiled.sql)
+    assert con.execute(compiled.sql).fetchall() == [(["retail", "wholesale"],)]
+
+
+# ---------------------------------------------------------------------
+# ``query_sql``: a table reference the rewrite cannot see is refused, not skipped
+# ---------------------------------------------------------------------
+
+
+@pytest.fixture()
+def con_s2(con):
+    con.execute("CREATE SCHEMA s2")
+    con.execute("CREATE TABLE s2.other AS SELECT 1 AS k")
+    return con
+
+
+def _free_form_guarded(connection, sql: str, *, restricted: Sequence[str] = ("region",)):
+    """Like ``_free_form``, and runs the driver's statement guard on the compiled SQL
+    first, the way every driver does before it executes."""
+    from fluid_build.output_ports.mcp.drivers.base import guard_against_injection_markers
+
+    try:
+        compiled = compile_free_form_sql(
+            sql=sql,
+            table_reference="customers",
+            limit=50,
+            restricted_columns=restricted,
+            expose=_expose(),
+            dialect="duckdb",
+        )
+    except QueryValidationError as exc:
+        return "refused", str(exc)
+    try:
+        guard_against_injection_markers(compiled.sql)
+    except ValueError as exc:
+        return "guard", str(exc)
+    try:
+        cursor = connection.execute(compiled.sql)
+        rows = cursor.fetchall()
+        names = [col[0] for col in cursor.description]
+    except duckdb.Error as exc:
+        return "engine_error", str(exc)
+    return "rows", (names, rows)
+
+
+_TABLE_KEYWORD_FORMS = [
+    pytest.param("SELECT to_json(x) AS j FROM (TABLE customers) x", id="alias-as-row"),
+    pytest.param("SELECT * FROM s2.other, (TABLE customers)", id="comma-list"),
+    pytest.param("SELECT * FROM s2.other JOIN (TABLE customers) ON true", id="join"),
+    pytest.param('SELECT * FROM (TABLE "customers") x', id="quoted-name"),
+    pytest.param("SELECT * FROM (TABLE main.customers) x", id="schema-qualified"),
+    pytest.param("SELECT * FROM (table customers) x", id="lower-case"),
+]
+
+
+@pytest.mark.parametrize("sql", _TABLE_KEYWORD_FORMS)
+def test_the_table_keyword_is_refused_on_a_restricted_expose(con_s2, sql):
+    kind, detail = _free_form(con_s2, sql)
+    assert kind == "refused", detail
+    assert "TABLE" in detail
+    assert not _leaked(detail)
+
+
+def test_the_table_keyword_refusal_does_not_depend_on_the_rewrite(monkeypatch):
+    """The token check runs before the caller's statement is parsed, so a parser that
+    reads the form some other way cannot skip it."""
+    import sqlglot as _sqlglot
+
+    statement = "SELECT * FROM s2.other, (TABLE customers)"
+    parse, parse_one = _sqlglot.parse, _sqlglot.parse_one
+
+    def _guarded(real):
+        def _call(sql, *args, **kwargs):
+            # sqlglot parses small snippets of its own while it loads a dialect; only
+            # the caller's statement must not reach a parser.
+            assert statement not in str(sql), "the statement was parsed before the token check"
+            return real(sql, *args, **kwargs)
+
+        return _call
+
+    monkeypatch.setattr(_sqlglot, "parse", _guarded(parse))
+    monkeypatch.setattr(_sqlglot, "parse_one", _guarded(parse_one))
+    with pytest.raises(QueryValidationError, match="TABLE"):
+        compile_free_form_sql(
+            sql=statement,
+            table_reference="customers",
+            limit=5,
+            restricted_columns=("region",),
+            expose=_expose(),
+            dialect="duckdb",
+        )
+
+
+def test_a_quoted_table_identifier_is_not_the_table_keyword():
+    compiled = compile_free_form_sql(
+        sql='SELECT "TABLE" FROM customers',
+        table_reference="customers",
+        limit=5,
+        restricted_columns=("region",),
+        expose=_expose(),
+        dialect="duckdb",
+    )
+    assert compiled.sql.startswith('SELECT "TABLE" FROM (SELECT id, segment')
+
+
+def test_a_table_name_that_merely_contains_the_word_is_not_the_keyword(con):
+    kind, detail = _free_form(con, "SELECT segment AS table_name, tables.id FROM customers tables")
+    assert kind == "rows", detail
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        pytest.param("SELECT * FROM TABLE('CUSTOMERS')", id="table-function"),
+        pytest.param("SELECT * FROM TABLE(IDENTIFIER('CUSTOMERS'))", id="table-identifier"),
+        pytest.param("SELECT * FROM TABLE ( 'CUSTOMERS' ) t", id="table-spaced-alias"),
+    ],
+)
+def test_snowflake_table_forms_are_refused(sql):
+    with pytest.raises(QueryValidationError):
+        compile_free_form_sql(
+            sql=sql,
+            table_reference="CUSTOMERS",
+            limit=5,
+            restricted_columns=("REGION",),
+            expose=_expose(),
+            dialect="snowflake",
+        )
+
+
+def test_snowflake_identifier_function_as_a_table_is_refused():
+    with pytest.raises(QueryValidationError):
+        compile_free_form_sql(
+            sql="SELECT * FROM IDENTIFIER('CUSTOMERS')",
+            table_reference="CUSTOMERS",
+            limit=5,
+            restricted_columns=("REGION",),
+            expose=_expose(),
+            dialect="snowflake",
+        )
+
+
+# A source the compiler does not know how to project is refused, whatever the node is
+# called, so a form added to the parser later does not become a way around the rewrite.
+@pytest.mark.parametrize(
+    "dialect,sql",
+    [
+        pytest.param("snowflake", "SELECT * FROM TABLE('X')", id="table-from-rows"),
+        pytest.param("snowflake", "SELECT * FROM a, TABLE(IDENTIFIER('X'))", id="join-list"),
+        pytest.param(
+            "postgres", "SELECT * FROM ROWS FROM (generate_series(1, 2)) r", id="rows-from"
+        ),
+        pytest.param("postgres", "SELECT * FROM generate_series(1, 3) g", id="function-table"),
+    ],
+)
+def test_a_source_that_is_not_a_plain_table_is_refused(dialect, sql):
+    import sqlglot as _sqlglot
+
+    from fluid_build.output_ports.mcp.query_compiler import _require_plain_sources
+
+    with pytest.raises(QueryValidationError):
+        _require_plain_sources(_sqlglot.parse_one(sql, read=dialect))
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM customers",
+        "SELECT * FROM main.customers c JOIN s2.other o ON true",
+        "SELECT * FROM unnest([1, 2]) AS u(x)",
+        "SELECT * FROM (VALUES (1)) AS v(a)",
+        "SELECT * FROM customers, LATERAL (SELECT 1 AS one) l",
+        "SELECT * FROM (SELECT 1 AS one) s",
+    ],
+)
+def test_the_plain_sources_stay_accepted(sql):
+    import sqlglot as _sqlglot
+
+    from fluid_build.output_ports.mcp.query_compiler import _require_plain_sources
+
+    _require_plain_sources(_sqlglot.parse_one(sql, read="duckdb"))
+
+
+def test_a_values_list_and_an_unnest_still_work_beside_the_exposed_table(con):
+    kind, detail = _free_form(
+        con, "SELECT c.id, v.a FROM customers c, (VALUES (1), (2)) AS v(a) WHERE c.id = v.a"
+    )
+    assert kind == "rows", detail
+    assert sorted(detail[1]) == [(1, 1), (2, 2)]
+    kind, detail = _free_form(con, "SELECT c.id, u.x FROM customers c, unnest([7]) AS u(x)")
+    assert kind == "rows", detail
+    assert len(detail[1]) == 3
+
+
+# DuckDB's own parser reads the rewritten statement too.
+def test_the_engine_parser_cross_check_refuses_a_bare_read_of_the_exposed_table():
+    from fluid_build.output_ports.mcp.query_compiler import _crosscheck_duckdb_projection
+
+    allowed = {"id", "segment", "amount", "tenant_id"}
+    for bare in (
+        "SELECT to_json(x) FROM (TABLE customers) x",
+        "SELECT * FROM customers",
+        "SELECT * FROM main.customers c",
+        "SELECT * FROM (FROM customers) t",
+        "SELECT * FROM s2.other, (TABLE customers)",
+        # the projection itself is wrong: a restricted column, a star, an expression
+        "SELECT * FROM (SELECT id, region FROM customers) AS customers",
+        "SELECT * FROM (SELECT * FROM customers) AS customers",
+        "SELECT * FROM (SELECT id + 1 FROM customers) AS customers",
+        "SELECT * FROM (SELECT id FROM customers WHERE id > 0) AS customers",
+        "SELECT * FROM (SELECT id FROM customers, s2.other) AS customers",
+    ):
+        with pytest.raises(QueryValidationError):
+            _crosscheck_duckdb_projection(bare, "customers", allowed)
+    for fine in (
+        "SELECT * FROM (SELECT id, segment FROM customers) AS customers",
+        "SELECT * FROM c: (SELECT id, amount FROM customers)",
+        "SELECT a.id FROM (SELECT id FROM customers) AS a JOIN (SELECT id FROM customers) AS b ON true",
+        "SELECT * FROM s2.other",
+    ):
+        _crosscheck_duckdb_projection(fine, "customers", allowed)
+
+
+def test_the_engine_parser_cross_check_runs_on_the_rewritten_statement(monkeypatch):
+    from fluid_build.output_ports.mcp import query_compiler
+
+    seen: List[str] = []
+    real = query_compiler._crosscheck_duckdb_projection
+
+    def spy(sql, name, allowed):
+        seen.append(sql)
+        return real(sql, name, allowed)
+
+    monkeypatch.setattr(query_compiler, "_crosscheck_duckdb_projection", spy)
+    compile_free_form_sql(
+        sql="SELECT id FROM customers",
+        table_reference="customers",
+        limit=5,
+        restricted_columns=("region",),
+        expose=_expose(),
+        dialect="duckdb",
+    )
+    assert len(seen) == 1 and "(SELECT id, segment, amount, tenant_id FROM customers)" in seen[0]
+    seen.clear()
+    compile_free_form_sql(
+        sql="SELECT id FROM customers",
+        table_reference="customers",
+        limit=5,
+        restricted_columns=("REGION",),
+        expose=_expose(),
+        dialect="snowflake",
+    )
+    assert seen == []
+
+
+# ---------------------------------------------------------------------
+# ``query_sql`` and the driver guard: the compiler's projection at any position
+# ---------------------------------------------------------------------
+
+
+def test_driver_guard_admits_the_projection_wherever_the_compiler_writes_it():
+    from fluid_build.output_ports.mcp.drivers.base import guard_against_injection_markers
+
+    for sql in (
+        "SELECT * FROM ((SELECT id, segment FROM customers) AS customers)\nLIMIT 5",
+        "SELECT * FROM c: (SELECT id, segment FROM customers)\nLIMIT 5",
+        "SELECT a.id FROM (SELECT id FROM customers) AS a JOIN "
+        "((SELECT id FROM customers) AS b) ON a.id = b.id\nLIMIT 5",
+        "SELECT * FROM (SUMMARIZE (SELECT id, segment FROM customers))\nLIMIT 5",
+    ):
+        guard_against_injection_markers(sql)
+    for hostile in (
+        "SELECT * FROM ((SELECT id FROM customers) UNION SELECT 1)\nLIMIT 5",
+        "SELECT * FROM c: (SELECT id + 1 FROM customers)\nLIMIT 5",
+        "SELECT * FROM (SELECT * FROM customers) AS t\nLIMIT 5",
+        "SELECT * FROM ((SELECT (SELECT region FROM customers) AS id FROM customers) AS t)",
+        "SELECT x FROM customers WHERE id IN (SELECT id + 1 FROM other)",
+    ):
+        with pytest.raises(ValueError):
+            guard_against_injection_markers(hostile)
+
+
+def test_a_prefix_alias_reads_the_allowed_columns(con):
+    kind, detail = _free_form_guarded(con, "SELECT * FROM c: customers")
+    assert kind == "rows", detail
+    names, rows = detail
+    assert "region" not in [n.lower() for n in names]
+    assert not _leaked(rows)
+    assert len(rows) == 3
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        pytest.param("SELECT * FROM (customers)", id="parenthesised-name"),
+        pytest.param("SELECT * FROM (SUMMARIZE customers)", id="summarize"),
+        pytest.param("SELECT * FROM (DESCRIBE customers)", id="describe"),
+        pytest.param("SELECT * FROM (PIVOT customers ON segment USING sum(amount))", id="pivot"),
+    ],
+)
+def test_forms_beyond_a_plain_select_run_over_the_allowed_columns_or_are_refused_clearly(con, sql):
+    kind, detail = _free_form_guarded(con, sql)
+    assert kind in ("rows", "refused"), f"{kind}: {detail!r}"
+    if kind == "rows":
+        names, rows = detail
+        assert "region" not in repr(detail).lower() and not _leaked(rows)
+    else:
+        # A refusal says what to do; it is not the driver guard's "compiler safety
+        # regression" text, and it is a typed validation error.
+        assert "regression" not in detail
+        assert "query" in detail.lower() or "select" in detail.lower()
+
+
+# ---------------------------------------------------------------------
+# ``query_sql`` with column restrictions needs the expose to project from
+# ---------------------------------------------------------------------
+
+
+def test_free_form_sql_with_restricted_columns_and_no_expose_fails_closed():
+    with pytest.raises(QueryValidationError, match="expose"):
+        compile_free_form_sql(
+            sql="SELECT id FROM customers",
+            table_reference="customers",
+            limit=5,
+            restricted_columns=("region",),
+        )
+
+
+def test_free_form_sql_without_restrictions_needs_no_expose():
+    compiled = compile_free_form_sql(
+        sql="SELECT id FROM customers",
+        table_reference="customers",
+        limit=5,
+    )
+    assert compiled.sql == "SELECT id FROM customers\nLIMIT 5"
 
 
 # ---------------------------------------------------------------------

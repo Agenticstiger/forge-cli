@@ -62,6 +62,42 @@ def names_refused_duckdb_function(sql: str) -> bool:
     return _DUCKDB_REFUSED_RE.search(sql) is not None
 
 
+#: Postgres functions that return a whole table, schema, database or query result as
+#: XML. They take the relation or the statement as a string argument, so no table node
+#: and no column name shows in the text a check here reads, and the engine reads past
+#: any column projection the caller's statement was limited to. Refused as a call, in
+#: any case, quoted or schema-qualified, on every dialect; a column that only shares a
+#: name is not a call.
+POSTGRES_REFUSED_FUNCTIONS = frozenset(
+    {
+        "cursor_to_xml",
+        "cursor_to_xmlschema",
+        "query_to_xml",
+        "query_to_xml_and_xmlschema",
+        "query_to_xmlschema",
+        "table_to_xml",
+        "table_to_xml_and_xmlschema",
+        "table_to_xmlschema",
+    }
+)
+#: ``schema_to_xml*`` and ``database_to_xml*`` are a family: every member is refused.
+POSTGRES_REFUSED_FUNCTION_PREFIXES = ("schema_to_xml", "database_to_xml")
+
+_POSTGRES_REFUSED_RE = re.compile(
+    r"(?i)\b(?:"
+    + "|".join(sorted(POSTGRES_REFUSED_FUNCTIONS))
+    + "|"
+    + "|".join(rf"{prefix}\w*" for prefix in POSTGRES_REFUSED_FUNCTION_PREFIXES)
+    + r')["`]?\s*\('
+)
+
+
+def names_refused_postgres_function(sql: str) -> bool:
+    """Whether ``sql`` calls one of :data:`POSTGRES_REFUSED_FUNCTIONS` or a
+    ``schema_to_xml*`` / ``database_to_xml*`` function."""
+    return _POSTGRES_REFUSED_RE.search(sql) is not None
+
+
 _BLOCKED_EXPR_TOKENS = re.compile(
     r"(?i)\b("
     r"alter|call|copy|create|delete|drop|execute|grant|insert|merge|put|remove|"
@@ -504,7 +540,7 @@ def validate_sql_expression_allowlist(expr: str) -> str:
 
     if _BLOCKED_EXPR_TOKENS.search(candidate):
         raise ValueError(f"Invalid SQL expression: {expr!r}")
-    if names_refused_duckdb_function(candidate):
+    if names_refused_duckdb_function(candidate) or names_refused_postgres_function(candidate):
         raise ValueError(f"Invalid SQL expression: {expr!r}")
 
     return candidate

@@ -29,7 +29,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-from fluid_build.providers._sql_safety import names_refused_duckdb_function
+from fluid_build.providers._sql_safety import (
+    names_refused_duckdb_function,
+    names_refused_postgres_function,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from pathlib import Path
@@ -89,6 +92,11 @@ def guard_against_injection_markers(sql: str) -> None:
         raise ValueError(
             "Refusing to execute statement that calls a DuckDB logging function, reads a "
             "log view or runs a statement given as text"
+        )
+    if names_refused_postgres_function(sql):
+        raise ValueError(
+            "Refusing to execute statement that calls a function which returns a whole "
+            "table, schema, database or query result as XML"
         )
     # The one body SELECT the compiler writes itself: the allowed-column projection
     # an expose with column restrictions is read through.
