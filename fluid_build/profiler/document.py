@@ -18,7 +18,8 @@ is the digest a Simulation pins.
 A profile names the least format that holds it (:func:`schema_url_for`): 1-0-0, unless it
 holds a ``quantile/2`` statistic (1-1-0), an ``invariants`` section (1-2-0), a statistic
 grouped by a link (1-3-0), or a rank correlation, a statistic grouped by the bins of a column
-or a relationship's statistic grouped by a parent column (1-4-0). A profile without one of
+or a relationship's statistic grouped by a parent column (1-4-0). A table's ``datePairs`` and
+a relationship's ``dates``, ``structural`` and ``exposure`` are forms of 1-3-0. A profile without one of
 them keeps the bytes it had.
 
 A document that breaks a rule is refused here, before anything is written. The
@@ -117,7 +118,7 @@ def _statistic_format(statistic: Mapping[str, Any]) -> int:
 
 
 def _table_format(table: Mapping[str, Any]) -> int:
-    needed = 0
+    needed = 3 if "datePairs" in table else 0
     if "cliqueSelection" in table or any(
         each.get("definition") == "cliqueMarginal/2" for each in table.get("cliques", ())
     ):
@@ -131,10 +132,13 @@ def _table_format(table: Mapping[str, Any]) -> int:
 
 
 def _relationship_format(relationship: Mapping[str, Any]) -> int:
-    """A relationship's statistic grouped by a parent column is a form of format 1-4-0."""
+    """A relationship's statistic grouped by a parent column is a form of format 1-4-0; its
+    ``dates``, ``structural`` classes and ``exposure`` are forms of 1-3-0."""
     for statistic in relationship.get("statistics", ()):
         if "groupBy" in statistic or "groupByBins" in statistic:
             return 4
+    if any(key in relationship for key in ("dates", "structural", "exposure")):
+        return 3
     return 0
 
 

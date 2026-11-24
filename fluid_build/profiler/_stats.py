@@ -639,6 +639,15 @@ class StatisticsBackend(Protocol):
         bins' whole-number edges, placed on the grid as the registry places any edge.
         """
 
+    def count_cells(
+        self, cells: Sequence[int], edges: Sequence[int], fractional_bits: int, group: str = ""
+    ) -> MeasuredGroup:
+        """``marginalHistogram/1`` from the records already counted per bin: one group, keyed *group*.
+
+        *cells* are the counts of the bins between *edges* (one fewer than the edges). It is
+        :meth:`count_histogram` of values that fall in those cells, without placing each record.
+        """
+
     def rank_group(self, identifier: str, pairs: Sequence[Tuple[int, int]]) -> Dict[str, Any]:
         """The ungrouped group of ``kendallTau/1`` or ``spearmanRho/1`` over *pairs*, as spelled.
 
@@ -1252,6 +1261,24 @@ class _FluxStatsBackend:
             rows, indices, column, partial(reading.encode_value, column=column, grid=parsed.grid)
         )
         return replace(group, values=tuple(values), encoded=tuple(encoded))
+
+    def count_cells(
+        self, cells: Sequence[int], edges: Sequence[int], fractional_bits: int, group: str = ""
+    ) -> MeasuredGroup:
+        from flux_stats.registry import GroupStatistic
+
+        if len(cells) != len(edges) - 1:
+            raise ValueError("a histogram holds one cell between each two edges")
+        histogram = self._fidelity().definition_named("marginalHistogram/1")
+        state = GroupStatistic(group=group, k=sum(cells), bin_counts=tuple(cells))
+        spelled: Dict[str, Any] = state.to_document(histogram)
+        return MeasuredGroup(
+            key=group,
+            document=spelled,
+            k=state.k,
+            statistic=state,
+            cells=tuple(state.cell_counts("marginalHistogram")),
+        )
 
     def count_histogram(
         self, counts: Sequence[int], edges: Sequence[int], fractional_bits: int, group: str = ""

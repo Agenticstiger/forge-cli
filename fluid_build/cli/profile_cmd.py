@@ -159,10 +159,15 @@ A request of format 1-2-0 may also ask for more, each exact and under the same c
     that reaches no parent is in no group. Each listed item the profile does not answer is named in the report
 with its reason (for example a histogram over a number with no declared range,
 quantiles beside a histogram on one set of bins, a mean of a timestamp, a key
-column of a counted relationship). A table's date pairs and calendar, a workload,
-a relationship's dates and exposure, and the consumers' queries are not formed: each
-is named under Not measured, and with --strict such a request is refused before any
-record is read. A listed fact, a rule of the contract's
+column of a counted relationship). A table's calendar, a workload and the consumers'
+queries are not formed: each is named under Not measured, and with --strict such a
+request is refused before any record is read. A table's date pairs (DATE columns) and
+a relationship's dates and exposure are formed (format 1-3-0); a pair's days are
+counted on a fixed ladder of whole days, trimmed to the bins from the first holding a
+record to the last, and are published only when each of those two bins holds at
+least minimumCell records. One that cannot be formed (a pair with a timestamp
+column, an exposure with no window, days with a small end bin) is named under
+Not measured with its reason. A listed fact, a rule of the contract's
 invariants, is measured on the table's records as the share of the rows it covers
 that satisfy it: two counts (the rows that do not, the rows that do) that pass the
 checks as cells do, and either withheld withholds both (format 1-2-0, the
@@ -320,9 +325,8 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         action="store_true",
         help=(
             "refuse a --request that asks for a kind of statistic fluid profile does not form "
-            "(a table's date pairs or calendar, a workload, a relationship's dates or "
-            "exposure, a consumer query), before any record is read; without it each such "
-            "ask is named under Not measured"
+            "(a table's calendar, a workload, a consumer query), before any record is read; "
+            "without it each such ask is named under Not measured"
         ),
     )
     p.add_argument(
@@ -981,6 +985,7 @@ def _report(
     for child, name, reason in result.relationships_left_out:
         say(f"No children per parent for exposes[{child}] {name!r}: {reason}.", soft_wrap=True)
     _report_rank_correlations(say, result, several)
+    _report_dates(say, result)
     for fact in result.facts:
         say(
             (
@@ -1044,6 +1049,50 @@ def _report_timings(say: Any, result: Any, timings: Any) -> None:
         f"Timings for the document: write {timings.write:.2f} s; total {timings.total:.2f} s.",
         soft_wrap=True,
     )
+
+
+def _published_days(entries: Any) -> int:
+    """How many pairs publish their day histogram: one is left out when an end bin is small."""
+    return sum(
+        1
+        for each in entries
+        if each["statistics"] and each["statistics"][0]["groups"][0]["status"] == "F"
+    )
+
+
+def _report_dates(say: Any, result: Any) -> None:
+    """The lines about a profile's date pairs, relationship dates, structural classes and exposure.
+
+    Each names tables, columns and how many entries were published, never a count of records.
+    """
+    for expose_id, table in result.document["tables"].items():
+        pairs = table.get("datePairs", ())
+        if pairs:
+            say(
+                f"exposes[{expose_id}]: Date pairs: {_published_days(pairs)} of {len(pairs)} published."
+            )
+    for entry in result.document.get("relationships", ()):
+        where = f"exposes[{entry['parent']['table']}] in exposes[{entry['child']['table']}]"
+        dates = entry.get("dates", ())
+        if dates:
+            say(
+                f"Dates of {where}: {_published_days(dates)} of {len(dates)} published.",
+                soft_wrap=True,
+            )
+        if "structural" in entry:
+            say(
+                f"Structural classes of {where}: {', '.join(entry['structural'])}, "
+                "stated by the contract.",
+                soft_wrap=True,
+            )
+        exposure = entry.get("exposure", ())
+        if exposure:
+            published = sum(
+                1
+                for each in exposure
+                if each["children"]["status"] == "F" and each["activeDays"]["status"] == "F"
+            )
+            say(f"Exposure of {where}: {published} of {len(exposure)} published.", soft_wrap=True)
 
 
 def _report_rank_correlations(say: Any, result: Any, several: bool) -> None:

@@ -835,7 +835,7 @@ def _not_released(
         found.append((f"fact {fact.name}", _NOT_NOISY))
     from fluid_build.profiler import request as asked_for
 
-    found.extend(asked_for.unformed(request, workload=WORKLOAD_UNUSED))
+    found.extend(asked_for.unformed(request, workload=WORKLOAD_UNUSED, private=True))
     return tuple(found)
 
 

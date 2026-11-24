@@ -686,7 +686,7 @@ def plan_follow_release(
             )
     for fact in request.facts:
         not_released.append((f"fact {fact.name}", _NOT_NOISY))
-    not_released.extend(asked_for.unformed(request, workload=WORKLOAD_UNUSED))
+    not_released.extend(asked_for.unformed(request, workload=WORKLOAD_UNUSED, private=True))
 
     # -- each reached table's plan, now that its keys and structure columns are known
     tables: List[TablePlan] = []

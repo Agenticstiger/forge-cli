@@ -19,7 +19,7 @@ CI lane, so this double cannot drift from it unnoticed.
 The fidelity grammar has no stand-in: it is flux-stats' own (ADR 0009), and the
 profile every run answers without ``--bundle`` is a fidelity block the profiler
 declares from the contract (``fluid_build/profiler/defaults.py``). So ``read_block``,
-``measure``, ``bin_cells``, ``check_edge_counts``, ``count_histogram`` and ``enum_levels``
+``measure``, ``bin_cells``, ``check_edge_counts``, ``count_histogram``, ``count_cells`` and ``enum_levels``
 hand the work to flux-stats.
 """
 
@@ -233,6 +233,9 @@ class FakeBackend:
         self, counts: Any, edges: Any, fractional_bits: int, group: str = ""
     ) -> Any:
         return self._real().count_histogram(counts, edges, fractional_bits, group)
+
+    def count_cells(self, cells: Any, edges: Any, fractional_bits: int, group: str = "") -> Any:
+        return self._real().count_cells(cells, edges, fractional_bits, group)
 
     def rank_group(self, identifier: str, pairs: Sequence[Tuple[int, int]]) -> Dict[str, Any]:
         """``kendallTau/1`` and ``spearmanRho/1`` as PROFILE-SPEC section 5 defines them, pair by pair."""

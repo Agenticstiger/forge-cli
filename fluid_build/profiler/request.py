@@ -58,6 +58,7 @@ __all__ = [
     "read_request_file",
     "refuse_unformed",
     "relationship_asks",
+    "relationship_dates_asks",
     "relationship_filter",
     "restrict_plan",
     "unformed",
@@ -78,14 +79,16 @@ _NO_RECORD = "no non-null record to form it over"
 #: Why each kind of ask that ``fluid profile`` does not form is left out. The request's
 #: reader holds every ask of its format, so none is dropped without a word: each is named
 #: with one of these reasons (:func:`unformed`), and ``--strict`` refuses a request that
-#: holds one.
-NO_DATE_PAIRS = "fluid profile does not form a table's date pairs"
+#: holds one. A public profile forms a table's date pairs and a relationship's dates and
+#: exposure (:mod:`fluid_build.profiler.dates`) and names the ones it cannot with a reason of
+#: their own; a private release forms none of them, and names each with the reasons below.
+NO_DATE_PAIRS = "a private release forms no date pair"
 NO_CALENDAR = "fluid profile does not form a calendar"
 NO_WORKLOAD = (
     "a workload weighs the column sets a private release may join, and this profile joins none"
 )
-NO_DATES = "fluid profile does not form a relationship's dates"
-NO_EXPOSURE = "fluid profile does not form a relationship's exposure"
+NO_DATES = "a private release forms no relationship dates"
+NO_EXPOSURE = "a private release forms no exposure"
 NO_QUERIES = "fluid profile runs no consumer query"
 
 
@@ -343,10 +346,28 @@ def relationship_filter(
                 and each.parent.columns == parent_columns
             ):
                 matched.add(position)
-                found = found or "marginalHistogram/1" in each.statistics or bool(each.linked)
+                found = (
+                    found
+                    or "marginalHistogram/1" in each.statistics
+                    or bool(each.linked)
+                    or bool(each.dates)
+                    or bool(each.exposure)
+                )
         return found
 
     return wanted, matched
+
+
+def _links_of(request: Request, relationship: "runner.Relationship") -> List[RequestRelationship]:
+    """The links the request lists for one declared relationship: the same tables and keys."""
+    return [
+        each
+        for each in request.relationships
+        if each.child.table == relationship.child
+        and each.parent.table == relationship.parent
+        and each.child.columns == relationship.child_columns
+        and each.parent.columns == relationship.parent_columns
+    ]
 
 
 def relationship_asks(
@@ -362,21 +383,38 @@ def relationship_asks(
     counted = False
     group_by: List[str] = []
     linked: List[Tuple[str, str]] = []
-    for each in request.relationships:
-        if (
-            each.child.table == relationship.child
-            and each.parent.table == relationship.parent
-            and each.child.columns == relationship.child_columns
-            and each.parent.columns == relationship.parent_columns
-        ):
-            counted = counted or "marginalHistogram/1" in each.statistics
-            group_by.extend(name for name in each.group_by if name not in group_by)
-            linked.extend(
-                pair
-                for pair in ((item.column, item.parent_column) for item in each.linked)
-                if pair not in linked
-            )
+    for each in _links_of(request, relationship):
+        counted = counted or "marginalHistogram/1" in each.statistics
+        group_by.extend(name for name in each.group_by if name not in group_by)
+        linked.extend(
+            pair
+            for pair in ((item.column, item.parent_column) for item in each.linked)
+            if pair not in linked
+        )
     return counted, tuple(group_by), tuple(linked)
+
+
+def relationship_dates_asks(
+    request: Request, relationship: "runner.Relationship"
+) -> Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[str, Optional[str]], ...]]:
+    """The dates and exposure the request asks of one declared relationship.
+
+    ``(dates, exposure)``: the ``(parent column, child column)`` pairs asked days apart and the
+    ``(start, end)`` parent lifetimes asked as children per active day (``end`` is ``None`` for a
+    lifetime with no end column), each once, in the order listed.
+    """
+    dates: List[Tuple[str, str]] = []
+    exposure: List[Tuple[str, Optional[str]]] = []
+    for each in _links_of(request, relationship):
+        dates.extend(
+            pair for pair in ((item.parent, item.child) for item in each.dates) if pair not in dates
+        )
+        exposure.extend(
+            pair
+            for pair in ((item.start, item.end) for item in each.exposure)
+            if pair not in exposure
+        )
+    return tuple(dates), tuple(exposure)
 
 
 def _spelled(link: RequestRelationship) -> str:
@@ -386,17 +424,26 @@ def _spelled(link: RequestRelationship) -> str:
     )
 
 
-def unformed(request: Request, *, workload: str = NO_WORKLOAD) -> List[Tuple[str, str]]:
+def _exposure_name(link: RequestRelationship, exposure: Any) -> str:
+    span = exposure.start if exposure.end is None else f"{exposure.start} to {exposure.end}"
+    return f"exposure {link.parent.table}.{span} of {_spelled(link)}"
+
+
+def unformed(
+    request: Request, *, workload: str = NO_WORKLOAD, private: bool = False
+) -> List[Tuple[str, str]]:
     """Each ask of *request* of a kind ``fluid profile`` does not form, with why: ``(what, reason)``.
 
-    Decided from the request alone, before any record is read: a table's date pairs, a
-    calendar column, a workload entry, a relationship's dates and exposure, and a consumer
-    query. *workload* is the reason a workload entry is not used, which a private release
-    words its own way. Never a value: only tables, columns, names and reasons.
+    Decided from the request alone, before any record is read: a calendar column, a workload
+    entry and a consumer query, and, for a *private* release only, a table's date pairs and a
+    relationship's dates and exposure (a public profile forms those, and names one it cannot
+    with the reason it has, once it has read the records). *workload* is the reason a workload
+    entry is not used, which a private release words its own way. Never a value: only tables,
+    columns, names and reasons.
     """
     found: List[Tuple[str, str]] = []
     for table in request.tables:
-        for pair in table.date_pairs:
+        for pair in table.date_pairs if private else ():
             found.append(
                 (f"date pair {pair.start} to {pair.end} of {table.expose_id}", NO_DATE_PAIRS)
             )
@@ -404,7 +451,7 @@ def unformed(request: Request, *, workload: str = NO_WORKLOAD) -> List[Tuple[str
             found.append((f"calendar of {table.expose_id}.{column}", NO_CALENDAR))
         for entry in table.workload:
             found.append((f"workload {', '.join(entry.columns)} of {table.expose_id}", workload))
-    for link in request.relationships:
+    for link in request.relationships if private else ():
         for dates in link.dates:
             found.append(
                 (
@@ -414,20 +461,23 @@ def unformed(request: Request, *, workload: str = NO_WORKLOAD) -> List[Tuple[str
                 )
             )
         for exposure in link.exposure:
-            span = exposure.start if exposure.end is None else f"{exposure.start} to {exposure.end}"
-            found.append((f"exposure {link.parent.table}.{span} of {_spelled(link)}", NO_EXPOSURE))
+            found.append((_exposure_name(link, exposure), NO_EXPOSURE))
     for name in request.queries:
         found.append((f"query {name}", NO_QUERIES))
     return found
 
 
-def refuse_unformed(request: Request) -> None:
+def refuse_unformed(request: Request, *, private: bool = False) -> None:
     """``--strict``: refuse *request* when it asks for anything :func:`unformed` names.
+
+    A public profile forms date pairs, dates and exposure, so ``--strict`` leaves them: whether
+    one can be formed depends on its columns' types and, for an exposure, on a window the
+    records give, and the profile names each it cannot under Not measured.
 
     Raised before any record is read, so the refusal says nothing about the records. The
     message counts the asks and its context names each, grouped by its reason.
     """
-    found = unformed(request)
+    found = unformed(request, private=private)
     if not found:
         return
     by_reason: Dict[str, List[str]] = {}
@@ -468,66 +518,98 @@ def not_measured(
     """
     found: List[Tuple[str, str]] = []
     for table in request.tables:
-        document = tables.get(table.expose_id, {})
-        if table.row_count and "rowCount" not in document:
-            found.append((f"rowCount of {table.expose_id}", "the output check withholds it"))
-        for column in table.columns:
-            if column.name not in document.get("columns", {}):
-                continue  # not read at all: the report names it, with why, as not profiled
-            entry = document["columns"][column.name]
-            for name in column.metrics:
-                if name in entry.get("metrics", {}):
-                    continue
-                reason = (
-                    _NO_RECORD
-                    if name in metric_names
-                    else "fluid profile has no output check for it"
-                )
-                found.append((f"{name} of {table.expose_id}.{column.name}", reason))
-            published = {each["definition"] for each in entry.get("statistics", ())}
-            default_block = defaults.get(table.expose_id)
-            default_ids = {
-                each.identifier
-                for each in (default_block.statistics if default_block else ())
-                if each.column == column.name and each.group_by is None
-            }
-            for identifier in column.statistics:
-                if identifier in published:
-                    continue
-                reason = _why(
-                    identifier,
-                    column.domain,
-                    column.name,
-                    default_ids,
-                    uncovered.get(table.expose_id, {}),
-                    keys.get(table.expose_id, frozenset()),
-                )
-                found.append((f"{identifier} of {table.expose_id}.{column.name}", reason))
+        found.extend(_table_not_measured(table, tables, defaults, uncovered, keys, metric_names))
     for position, link in enumerate(request.relationships):
-        if position not in matched:
-            found.append(
-                (
-                    f"children per parent of {_spelled(link)}",
-                    "the contract declares no such relationship",
-                )
-            )
-            continue
-        if link.group_by and "marginalHistogram/1" not in link.statistics:
-            found.append(
-                (
-                    f"groupBy of children per parent of {_spelled(link)}",
-                    "children per parent is counted only where marginalHistogram/1 is listed",
-                )
-            )
-        for identifier in link.statistics:
-            if identifier != "marginalHistogram/1":
-                found.append(
-                    (
-                        f"{identifier} of children per parent of {_spelled(link)}",
-                        _NOT_MEASURED_RELATIONSHIP,
-                    )
-                )
+        found.extend(_link_not_measured(link, declared=position in matched))
     found.extend(unformed(request))
+    return found
+
+
+def _table_not_measured(
+    table: RequestTable,
+    tables: Mapping[str, Mapping[str, Any]],
+    defaults: Mapping[str, Optional[DeclaredBlock]],
+    uncovered: Mapping[str, Mapping[str, str]],
+    keys: Mapping[str, FrozenSet[str]],
+    metric_names: FrozenSet[str],
+) -> List[Tuple[str, str]]:
+    """Each item a request lists of one table that the profile does not hold, with why."""
+    found: List[Tuple[str, str]] = []
+    document = tables.get(table.expose_id, {})
+    if table.row_count and "rowCount" not in document:
+        found.append((f"rowCount of {table.expose_id}", "the output check withholds it"))
+    for column in table.columns:
+        if column.name not in document.get("columns", {}):
+            continue  # not read at all: the report names it, with why, as not profiled
+        entry = document["columns"][column.name]
+        for name in column.metrics:
+            if name in entry.get("metrics", {}):
+                continue
+            reason = (
+                _NO_RECORD if name in metric_names else "fluid profile has no output check for it"
+            )
+            found.append((f"{name} of {table.expose_id}.{column.name}", reason))
+        published = {each["definition"] for each in entry.get("statistics", ())}
+        default_block = defaults.get(table.expose_id)
+        default_ids = {
+            each.identifier
+            for each in (default_block.statistics if default_block else ())
+            if each.column == column.name and each.group_by is None
+        }
+        for identifier in column.statistics:
+            if identifier in published:
+                continue
+            reason = _why(
+                identifier,
+                column.domain,
+                column.name,
+                default_ids,
+                uncovered.get(table.expose_id, {}),
+                keys.get(table.expose_id, frozenset()),
+            )
+            found.append((f"{identifier} of {table.expose_id}.{column.name}", reason))
+    return found
+
+
+def _undeclared_not_measured(link: RequestRelationship) -> List[Tuple[str, str]]:
+    """Each ask of a listed relationship the contract does not declare, with why."""
+    undeclared = "the contract declares no such relationship"
+    found: List[Tuple[str, str]] = []
+    if link.statistics or link.group_by or link.linked or not (link.dates or link.exposure):
+        found.append((f"children per parent of {_spelled(link)}", undeclared))
+    for dates in link.dates:
+        found.append(
+            (
+                f"dates {link.parent.table}.{dates.parent} to "
+                f"{link.child.table}.{dates.child} of {_spelled(link)}",
+                undeclared,
+            )
+        )
+    for exposure in link.exposure:
+        found.append((_exposure_name(link, exposure), undeclared))
+    return found
+
+
+def _link_not_measured(link: RequestRelationship, *, declared: bool) -> List[Tuple[str, str]]:
+    """Each ask of one listed relationship that the profile does not hold, with why."""
+    if not declared:
+        return _undeclared_not_measured(link)
+    found: List[Tuple[str, str]] = []
+    if link.group_by and "marginalHistogram/1" not in link.statistics:
+        found.append(
+            (
+                f"groupBy of children per parent of {_spelled(link)}",
+                "children per parent is counted only where marginalHistogram/1 is listed",
+            )
+        )
+    for identifier in link.statistics:
+        if identifier != "marginalHistogram/1":
+            found.append(
+                (
+                    f"{identifier} of children per parent of {_spelled(link)}",
+                    _NOT_MEASURED_RELATIONSHIP,
+                )
+            )
     return found
 
 

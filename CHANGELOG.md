@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid profile` states how far apart two dates lie, and how many children a parent has per
+  active day.** Each pair of DATE columns of a table (a request lists the pairs it wants) gets a
+  histogram of the whole days from the earlier to the later on one fixed ladder of bins, trimmed
+  to the bins from the first holding a record to the last, and the order of the two (after,
+  before, same), checked together in one pass on the same outer edges. The days are published
+  only when each of those two end bins holds at least `minimumCell` records, so no single record
+  places an outer edge, as for a date span; an order level wholly outside the outer edges is
+  published as zero, and with no day histogram the order is checked alone. Each declared relationship
+  gets the same for every parent and child DATE pair, and an `exposure`: the child rows whose
+  parent's start is known and the days those parents are active inside a window, taken from the
+  start column's published date span or the range the contract declares for it. The document
+  names format 1-3-0. A cell that a contract rule empties, as `closed IS NULL OR closed >=
+  opened` empties "before", is published as a zero only when the records leave it empty; the rule
+  never makes a zero out of data, and a rule the records break changes nothing. A relationship
+  states `structural: ["childless"]` only when the contract derives the parent's count of the
+  children and checks it is at least 1, and no parent lacks a child. A pair with a timestamp
+  column, a value that is not a whole day, and an exposure with no window are named under Not
+  measured with the reason. A pair no record holds both dates of is written like a small one, its
+  order withheld whole, so the list of pairs says nothing about it. An exposure beside another of the
+  same parent table is checked on the difference of their days: the parents they treat differently
+  must pass the count and sum rules, or its days are withheld. A private release forms none of
+  these and names them as before.
 - **`fluid profile --timings` says where a profile spends its time.** After the report it prints,
   for each table in profile order, `Timings for <exposeId>: read X s, measure Y s, check Z s.`,
   then `Timings for the document: write W s; total T s.`. Read is the source read, measure forms

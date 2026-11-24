@@ -288,7 +288,14 @@ def test_every_ask_fluid_profile_does_not_form_is_named_with_its_reason():
         queries=("paid_orders",),
     )
     link = "orders(customer_id) to customers(customer_id)"
+    # A public profile forms date pairs, dates and exposure; what it cannot it names once it has
+    # read the records, with the reason it has.
     assert asked_for.unformed(asked) == [
+        ("calendar of orders.placed_at", asked_for.NO_CALENDAR),
+        ("workload status of orders", asked_for.NO_WORKLOAD),
+        ("query paid_orders", asked_for.NO_QUERIES),
+    ]
+    assert asked_for.unformed(asked, private=True) == [
         ("date pair placed_at to shipped_at of orders", asked_for.NO_DATE_PAIRS),
         ("calendar of orders.placed_at", asked_for.NO_CALENDAR),
         ("workload status of orders", asked_for.NO_WORKLOAD),
@@ -298,6 +305,10 @@ def test_every_ask_fluid_profile_does_not_form_is_named_with_its_reason():
         ("query paid_orders", asked_for.NO_QUERIES),
     ]
     assert asked_for.unformed(replace(asked, tables=(), relationships=(), queries=())) == []
+    assert (
+        asked_for.unformed(replace(asked, tables=(), relationships=(), queries=()), private=True)
+        == []
+    )
 
 
 def test_a_profile_names_what_it_does_not_form_and_holds_none_of_it(workspace):

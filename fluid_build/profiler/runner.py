@@ -57,7 +57,16 @@ from typing import (
 )
 
 from fluid_build.policy._common import iter_exposes
-from fluid_build.profiler import defaults, disclosure, document, facts, grouped, ranks, sources
+from fluid_build.profiler import (
+    dates,
+    defaults,
+    disclosure,
+    document,
+    facts,
+    grouped,
+    ranks,
+    sources,
+)
 from fluid_build.profiler._stats import (
     WITHHELD_ROUNDING,
     BlockRefused,
@@ -853,8 +862,17 @@ def profile_exposes(
             if request is not None
             else replace(result, uncovered=missing, no_span=spanless)
         )
-    counted = [
-        _children_per_parent(
+    raw_exposes = {
+        str(item.get("exposeId")): item
+        for item in iter_exposes(dict(contract))
+        if item.get("exposeId")
+    }
+    dated = dates.DateStage(
+        raw_exposes, by_expose, tables_doc, backend, rule, tallies, fractional_bits, held, timings
+    )
+    date_notes = _date_pair_tables(dated, plans, reads, blocks, asked)
+    counted_entries: Dict[int, Tuple[Dict[str, Any], RelationshipResult]] = {
+        position: _children_per_parent(
             each,
             by_expose,
             backend,
@@ -866,7 +884,12 @@ def profile_exposes(
         )
         for position, each in enumerate(relationships)
         if each.counted
-    ]
+    }
+    counted = list(counted_entries.values())
+    relationship_docs, relationship_notes = _relationship_dates(
+        dated, relationships, counted_entries, request
+    )
+    date_notes.extend(relationship_notes)
     unanswered: Tuple[Tuple[str, str], ...] = ()
     if request is not None:
         unanswered = tuple(
@@ -916,6 +939,9 @@ def profile_exposes(
             if pairs:
                 tables_doc[plan.expose_id]["columnPairs"] = pairs
             unanswered = (*unanswered, *missing_pairs)
+    unanswered = (*unanswered, *date_notes)
+    if request is not None:
+        unanswered = (*unanswered, *_unread_date_asks(request, relationships, matched))
     if producer is None:
         from fluid_build import __version__
 
@@ -926,7 +952,7 @@ def profile_exposes(
         rule=rule,
         tables=tables_doc,
         fractional_bits=fractional_bits,
-        relationships=[entry for entry, _ in counted],
+        relationships=relationship_docs,
         invariants=invariants,
     )
     canonical = document.canonical_bytes(built)
@@ -949,6 +975,103 @@ def profile_exposes(
         not_measured=unanswered,
         facts=fact_results,
     )
+
+
+def _date_pair_tables(
+    stage: dates.DateStage,
+    plans: Sequence[ExposePlan],
+    reads: Sequence[sources.SourceColumns],
+    blocks: Mapping[str, BundleBlock],
+    asked: Mapping[str, RequestTable],
+) -> List[Tuple[str, str]]:
+    """Write each table's ``datePairs`` into its document; the asks left out, with why."""
+    notes: List[Tuple[str, str]] = []
+    for plan, read in zip(plans, reads, strict=True):
+        if plan.expose_id in blocks:
+            continue  # a bundle's profile answers its fidelity block alone
+        with _timed(stage.timings, "measure", plan.expose_id):
+            pairs, pair_notes = dates.table_date_pairs(stage, plan, read, asked.get(plan.expose_id))
+        if pairs:
+            stage.tables_doc[plan.expose_id]["datePairs"] = pairs
+        notes.extend(pair_notes)
+    return notes
+
+
+def _relationship_dates(
+    stage: dates.DateStage,
+    relationships: Sequence[Relationship],
+    counted_entries: Mapping[int, Tuple[Dict[str, Any], "RelationshipResult"]],
+    request: Optional[Request],
+) -> Tuple[List[Dict[str, Any]], List[Tuple[str, str]]]:
+    """The ``relationships[]`` entries, each with its dates, structural classes and exposure.
+
+    A relationship the profile counts keeps its counted entry; one only a request asks dates or
+    exposure of gets an entry of its own. The asks left out come back with why.
+    """
+    from fluid_build.profiler import request as asked_for
+
+    docs: List[Dict[str, Any]] = []
+    notes: List[Tuple[str, str]] = []
+    for position, rel in enumerate(relationships):
+        entry = counted_entries[position][0] if position in counted_entries else None
+        asked_dates, asked_exposure = (
+            asked_for.relationship_dates_asks(request, rel) if request is not None else (None, None)
+        )
+        if request is not None and not (asked_dates or asked_exposure or entry is not None):
+            continue
+        with _timed(stage.timings, "measure", rel.child):
+            extras, extra_notes = dates.relationship_extras(
+                stage,
+                rel,
+                dates.RelationshipAsks(asked_dates, asked_exposure, counted=entry is not None),
+            )
+        notes.extend(extra_notes)
+        if entry is None and extras:
+            entry = {
+                "parent": {"table": rel.parent, "columns": list(rel.parent_columns)},
+                "child": {"table": rel.child, "columns": list(rel.child_columns)},
+                "statistics": [],
+            }
+        if entry is not None:
+            docs.append({**entry, **extras})
+    return docs, notes
+
+
+def _unread_date_asks(
+    request: Request, relationships: Sequence[Relationship], matched: Set[int]
+) -> List[Tuple[str, str]]:
+    """The dates and exposure a request asks of a declared relationship the profile does not read.
+
+    A relationship the contract declares and the profile cannot read both sides of (its parent
+    is not profiled, its keys are in different domains) has no entry to hold them, and its
+    own line (``No children per parent for ...``) says why; each ask is named here.
+    """
+    read = {
+        (each.child, each.parent, each.child_columns, each.parent_columns) for each in relationships
+    }
+    found: List[Tuple[str, str]] = []
+    for position, link in enumerate(request.relationships):
+        if position not in matched:
+            continue  # not declared: the request's own line says so
+        if (link.child.table, link.parent.table, link.child.columns, link.parent.columns) in read:
+            continue
+        where = (
+            f"{link.child.table}({', '.join(link.child.columns)}) to "
+            f"{link.parent.table}({', '.join(link.parent.columns)})"
+        )
+        reason = "the relationship is not one whose two tables and keys the profile reads"
+        for pair in link.dates:
+            found.append(
+                (
+                    f"dates {link.parent.table}.{pair.parent} to {link.child.table}.{pair.child} "
+                    f"of {where}",
+                    reason,
+                )
+            )
+        for lifetime in link.exposure:
+            span = lifetime.start if lifetime.end is None else f"{lifetime.start} to {lifetime.end}"
+            found.append((f"exposure {link.parent.table}.{span} of {where}", reason))
+    return found
 
 
 def _with_asks(relationship: Relationship, request: Request) -> Relationship:
@@ -1702,15 +1825,20 @@ def _keys(
 ) -> List[Tuple[Any, ...]]:
     """Each row's key over *names*, every part read as the registry reads its column."""
     plan, read = table
-    domains = {column.name: column.domain for column in plan.columns}
-    columns = [
-        [
-            backend.read_value(domains[name], value, column=name, row_index=index)
-            for index, value in enumerate(read.values[name])
+    kept = ("keys", tuple(names))
+    found: Optional[List[Tuple[Any, ...]]] = read.decoded.get(kept)
+    if found is None:
+        domains = {column.name: column.domain for column in plan.columns}
+        columns = [
+            [
+                backend.read_value(domains[name], value, column=name, row_index=index)
+                for index, value in enumerate(read.values[name])
+            ]
+            for name in names
         ]
-        for name in names
-    ]
-    return list(zip(*columns, strict=True)) if columns else []
+        found = list(zip(*columns, strict=True)) if columns else []
+        read.decoded[kept] = found
+    return found
 
 
 def _default_block(
@@ -1864,9 +1992,7 @@ def _span_table(
             continue
         try:
             milliseconds = [
-                backend.read_value("timestamp", value, column=name, row_index=index)
-                for index, value in enumerate(read.values[name])
-                if value is not None
+                value for value in dates.read_milliseconds(read, name, backend) if value is not None
             ]
         except ReadRefused:  # measuring the column refuses it, naming the row
             continue

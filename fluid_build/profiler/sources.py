@@ -45,7 +45,7 @@ from __future__ import annotations
 import json
 import unicodedata
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -103,6 +103,10 @@ class SourceColumns:
     description: str
     row_count: int
     values: Mapping[str, List[Any]]
+    #: What the registry read out of ``values``, kept so a column is read once however many
+    #: statistics ask for it (a date span, a date pair and a relationship's keys read the same
+    #: values). Never part of what a read is.
+    decoded: Dict[Any, Any] = field(default_factory=dict, repr=False, compare=False)
 
 
 def _scheme(source: str) -> str:
