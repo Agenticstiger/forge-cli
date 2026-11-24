@@ -187,3 +187,23 @@ def test_a_plan_with_an_unresolved_output_is_refused_with_a_named_event(project:
         apply_run(_parse("apply", "contract.fluid.yaml", "--yes"), LOG)
     assert refused.value.code == "build_outputs_undeclared"
     assert _landed(project) == {}
+
+
+def test_a_planner_crash_on_the_contract_file_is_refused_not_answered_by_the_action_parser(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The fallback to the 0.7.1 action parser ran only the primary build, whatever else the
+    # contract held, and reported success.
+    from fluid_build._contract_loader import CLIError
+    from fluid_build.providers.local.local import LocalProvider
+
+    def boom(self: Any, contract: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("planner exploded")
+
+    monkeypatch.setattr(LocalProvider, "plan", boom)
+    _write(project, _contract())
+    with pytest.raises(CLIError) as refused:
+        apply_run(_parse("apply", "contract.fluid.yaml", "--yes"), LOG)
+    assert refused.value.event == "apply_local_plan_failed"
+    assert "planner exploded" in refused.value.context["error"]
+    assert _landed(project) == {}

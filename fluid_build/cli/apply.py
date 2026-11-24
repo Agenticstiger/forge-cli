@@ -1005,6 +1005,14 @@ def _actions_from_source(
         except FluidUserError:
             raise  # a refusal the provider named: the action parser must not paper over it
         except Exception as e:
+            if getattr(provider, "name", None) == "local":
+                from fluid_build.observability.secret_redactor import redact_secret_text
+
+                # As for a plan.json: the parser's abstract actions would be answered by the
+                # local provider running the primary build only, whatever else the contract has.
+                raise CLIError(
+                    1, "apply_local_plan_failed", {"error": redact_secret_text(str(e))}
+                ) from e
             logger.warning(f"Provider planner failed ({e}), falling back to action parser")
 
     # Fallback: use 0.7.1 ProviderActionParser (high-level actions)
