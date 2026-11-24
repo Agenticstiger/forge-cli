@@ -67,6 +67,7 @@ from fluid_build.profiler._stats import (
     MeasuredStatistic,
     MeasureRefused,
     MetricDefinition,
+    ReadRefused,
     Request,
     RequestColumn,
     RequestTable,
@@ -219,6 +220,9 @@ class TableResult:
     #: Each number, date or timestamp column the contract gives no default statistic,
     #: with why (:mod:`fluid_build.profiler.defaults`).
     uncovered: Tuple[Tuple[str, str], ...] = ()
+    #: Each date or timestamp column with no declared range that has no date span, with why:
+    #: it keeps the ladder's quantiles (:func:`_date_spans`).
+    no_span: Tuple[Tuple[str, str], ...] = ()
 
 
 #: The bins a parent's number of children is counted in: 0, 1, 2, 3 to 4, 5 to 9, 10 to 19,
@@ -731,6 +735,24 @@ def profile_exposes(
         )
         for each, plan in zip(exposes, plans, strict=True)
     ]
+    spans, no_span = _date_spans(
+        contract, plans, reads, blocks, held, _grouping_columns(request, relationships),
+        asked, backend, rule,
+    )  # fmt: skip
+    for position, plan in enumerate(plans):
+        if plan.expose_id not in spans:
+            continue
+        declared[position], uncovered[position] = _default_block(
+            contract,
+            plan,
+            backend,
+            fractional_bits,
+            held.get(plan.expose_id, frozenset()),
+            spans[plan.expose_id],
+        )
+        if request is not None:
+            unfiltered[plan.expose_id] = declared[position]
+            declared[position] = asked_for.filter_block(declared[position], asked[plan.expose_id])
     by_expose = {plan.expose_id: (plan, read) for plan, read in zip(plans, reads, strict=True)}
     answered = _Groupings()
     if request is not None:
@@ -764,10 +786,11 @@ def profile_exposes(
         )
         tables_doc[plan.expose_id] = table_doc
         # A request lists what it asks, so what the defaults leave out is told per listed item.
+        spanless = tuple(no_span.get(plan.expose_id, ()))
         results.append(
-            replace(result, uncovered=(), left_out=())
+            replace(result, uncovered=(), left_out=(), no_span=spanless)
             if request is not None
-            else replace(result, uncovered=missing)
+            else replace(result, uncovered=missing, no_span=spanless)
         )
     counted = [
         _children_per_parent(
@@ -1604,12 +1627,15 @@ def _default_block(
     backend: StatisticsBackend,
     fractional_bits: int,
     keys: FrozenSet[str] = frozenset(),
+    spans: Optional[Mapping[str, Sequence[str]]] = None,
 ) -> Tuple[Optional[DeclaredBlock], Tuple[Tuple[str, str], ...]]:
     """The block the profiler declares for *plan* from the contract alone, read by the registry.
 
     ``(None, ...)`` when the contract declares nothing to answer. The block is the
     profiler's own, so a grammar refusal of it is a defect, and says so. The *keys* of
-    counted relationships take no statistic in it (:func:`_relationship_keys`).
+    counted relationships take no statistic in it (:func:`_relationship_keys`). *spans* are
+    the bins of the date spans the records gave (:func:`_date_spans`), which the block holds
+    only once they have been read.
     """
     expose = next(
         item for item in iter_exposes(dict(contract)) if item.get("exposeId") == plan.expose_id
@@ -1620,7 +1646,7 @@ def _default_block(
         for column in plan.columns
         if column.name in keys
     )
-    planned = defaults.default_plan(expose, columns, backend.enum_levels, fractional_bits)
+    planned = defaults.default_plan(expose, columns, backend.enum_levels, fractional_bits, spans)
     if planned.block is None:
         return None, planned.uncovered + held
     extended = defaults.with_timestamp_histograms(planned)
@@ -1639,7 +1665,7 @@ def _default_block(
     _check_declared_columns(declared, plan)
     # The histograms of the timestamp columns are the public bins of a grouping, not statistics
     # the profile writes.
-    stamps = frozenset(planned.timestamps)
+    stamps = frozenset(planned.timestamps) - frozenset(planned.spanned)
     own = [
         each
         for each in declared.statistics
@@ -1653,6 +1679,92 @@ def _default_block(
         declared_ranges=planned.ranges,
     )
     return block, planned.uncovered + held
+
+
+def _grouping_columns(
+    request: Optional[Request], relationships: Sequence[Relationship]
+) -> Dict[str, Set[str]]:
+    """The columns of each table another statistic of a request groups by or groups.
+
+    A pair statistic of ``cliqueColumns`` groups each of its two columns by the other, a
+    relationship's ``groupBy`` groups its parent's column, and a ``linked`` column is grouped
+    by a parent column. Their groups are counted on the column's ladder bins.
+    """
+    found: Dict[str, Set[str]] = {}
+    if request is None:
+        return found
+    for table in request.tables:
+        if table.clique_columns:
+            found.setdefault(table.expose_id, set()).update(table.clique_columns)
+    for each in relationships:
+        found.setdefault(each.parent, set()).update(each.group_by)
+        for column, parent_column in each.linked:
+            found.setdefault(each.child, set()).add(column)
+            found.setdefault(each.parent, set()).add(parent_column)
+    return found
+
+
+_SPAN_GROUPED = "a statistic of the profile groups by it or is grouped by it"
+_LADDER_STAYS = "; its quartiles stay on the type's ladder"
+
+
+def _date_spans(
+    contract: Mapping[str, Any],
+    plans: Sequence[ExposePlan],
+    reads: Sequence[sources.SourceColumns],
+    blocks: Mapping[str, BundleBlock],
+    keys: Mapping[str, FrozenSet[str]],
+    grouping: Mapping[str, Set[str]],
+    asked: Mapping[str, RequestTable],
+    backend: StatisticsBackend,
+    rule: disclosure.DisclosureRule,
+) -> Tuple[Dict[str, Dict[str, Tuple[str, ...]]], Dict[str, List[Tuple[str, str]]]]:
+    """The date spans of each table's records, and why a column has none.
+
+    A date or timestamp column with no declared range gets a histogram on the calendar
+    months or years its records span (:func:`defaults.date_span`) in place of the ladder's
+    quartiles. The span depends on the records, so it is decided from the one read of each
+    table, before anything is measured. A column another statistic groups by or groups keeps
+    the ladder: its groups on ladder bins beside month cells would difference. A key column of
+    a counted relationship holds no default statistic at all. With a request, only a column
+    whose ask lists ``marginalHistogram/1`` is considered: a quantile alone stays on the ladder.
+    """
+    spans: Dict[str, Dict[str, Tuple[str, ...]]] = {}
+    no_span: Dict[str, List[Tuple[str, str]]] = {}
+    for plan, read in zip(plans, reads, strict=True):
+        if plan.expose_id in blocks:
+            continue
+        expose = next(
+            item for item in iter_exposes(dict(contract)) if item.get("exposeId") == plan.expose_id
+        )
+        held = keys.get(plan.expose_id, frozenset())
+        columns = [column for column in plan.columns if column.name not in held]
+        table = asked.get(plan.expose_id)
+        for name in defaults.ladder_timestamps(expose, columns):
+            # The quartiles stay on the ladder; a request that did not ask them has none to name.
+            tail = _LADDER_STAYS
+            if table is not None:
+                ask = table.column(name)
+                if ask is None or "marginalHistogram/1" not in ask.statistics:
+                    continue  # a quantile alone stays on the type's ladder, as without a span
+                tail = _LADDER_STAYS if "quantile/2" in ask.statistics else ""
+            if name in grouping.get(plan.expose_id, ()):
+                no_span.setdefault(plan.expose_id, []).append((name, _SPAN_GROUPED + tail))
+                continue
+            try:
+                milliseconds = [
+                    backend.read_value("timestamp", value, column=name, row_index=index)
+                    for index, value in enumerate(read.values[name])
+                    if value is not None
+                ]
+            except ReadRefused:  # measuring the column refuses it, naming the row
+                continue
+            edges, reason = defaults.date_span(milliseconds, rule.minimum_cell)
+            if edges is not None:
+                spans.setdefault(plan.expose_id, {})[name] = edges
+            elif reason is not None:
+                no_span.setdefault(plan.expose_id, []).append((name, reason + tail))
+    return spans, no_span
 
 
 def _refuse_repeated(exposes: Sequence[ExposeSource]) -> None:

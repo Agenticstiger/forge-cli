@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid profile` bins a date or timestamp with no declared range on the months it spans.** Such
+  a column got only quartiles on a 1900 to 2100 ladder of years, so `fluxsim init` had no run
+  window to read. It now publishes a `marginalHistogram/1` over calendar months, or over calendar
+  years when the span is longer than 240 months, from the start of the month holding the earliest
+  record to the start of the month after the latest. The grain needs its first and last bin to
+  each hold at least the disclosure rule's minimum cell (10 under ACRO), and the span at most 240
+  bins; with neither the column keeps the ladder's quartiles and the report says why. A column
+  with both ends of a range declared, a column a request groups by or is grouped by, and a key of
+  a counted relationship are unchanged.
 - **Rules can read a versioned table through a relationship (0.7.7 preview).** A type II slowly
   changing dimension's window now states its conventions: `validityParams.openEnd` (what an open
   version's end holds) and `chain` (`nextStart`, `dayBefore` or `none`), and the natural entity's

@@ -1035,3 +1035,8 @@ def _report_table(say: Any, table: Any, prefix: str, grid: str) -> None:
             f"{prefix}Left out of the default statistics: column {name!r}: {reason}.",
             soft_wrap=True,
         )
+    for name, reason in table.no_span:
+        say(
+            f"{prefix}{table.plan.expose_id}.{name}: no date span: {reason}.",
+            soft_wrap=True,
+        )

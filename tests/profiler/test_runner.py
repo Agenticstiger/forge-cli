@@ -190,11 +190,13 @@ def test_a_profile_publishes_what_passes_and_withholds_the_rest(tmp_path):
 
     # The four nullCounts (three zeros and a 4), and the distinctCount of market and
     # placed_at (2 values each, which round to 0).
-    # The quantiles at 0.25 and 0.75 of amount, and all three of placed_at, have a cell of
-    # no records below or above their bin, so they are withheld beside the six metrics.
-    assert result.withheld == {"A": 11}
-    # rowCount, amount's mean/1 and its median's bin, and every published metric.
-    assert result.published == 1 + 1 + 1 + sum(
+    # The quantiles at 0.25 and 0.75 of amount have a cell of no records below or above
+    # their bin, so they are withheld beside the six metrics. placed_at's one month holds
+    # every record, so its histogram publishes.
+    assert result.withheld == {"A": 8}
+    # rowCount, amount's mean/1 and its median's bin, placed_at's one month, and every
+    # published metric.
+    assert result.published == 1 + 1 + 1 + 1 + sum(
         1
         for col in table["columns"].values()
         for m in col["metrics"].values()
@@ -219,7 +221,7 @@ def test_a_number_column_carries_mean_1_on_the_documents_grid(tmp_path):
             "groups": [{"group": "", "k": 40, "Sx": str(620 * 2**16), "status": "F"}],
         }
     ]
-    # A timestamp gets only the default quantiles, and a string without levels nothing.
+    # A timestamp gets a histogram of the months it spans, and a string without levels nothing.
     definitions = {
         name: sorted({s["definition"] for s in column.get("statistics", ())})
         for name, column in columns.items()
@@ -227,7 +229,7 @@ def test_a_number_column_carries_mean_1_on_the_documents_grid(tmp_path):
     assert definitions == {
         "amount": ["mean/1", "quantile/2"],
         "market": [],
-        "placed_at": ["quantile/2"],
+        "placed_at": ["marginalHistogram/1"],
         "note": [],
     }
     assert ("amount", "mean/1", None, None) in result.tables[0].statistics
