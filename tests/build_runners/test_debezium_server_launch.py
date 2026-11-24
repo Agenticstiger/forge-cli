@@ -72,7 +72,26 @@ def _contract(server_binary: Optional[str]) -> Dict[str, Any]:
                 "outputs": ["data"],
             }
         ],
-        "exposes": [],
+        # The expose the build's ``outputs`` name: an output must be an exposeId
+        # (``build_output_exposes``). The hand-written http sink ``config`` keeps
+        # Iceberg derivation off, so the binding only has to pass the sink preflight.
+        "exposes": [
+            {
+                "exposeId": "data",
+                "kind": "table",
+                "binding": {
+                    "platform": "local",
+                    "format": "iceberg",
+                    "location": {
+                        "database": "bronze",
+                        "table": "orders",
+                        "uri": "http://rest:8181/catalog",
+                        "warehouse": "analytics",
+                    },
+                },
+                "contract": {"schema": [], "schemaPolicy": "discover_and_freeze"},
+            }
+        ],
     }
 
 
