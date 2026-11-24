@@ -568,9 +568,10 @@ def test_a16_a_quiet_block_quiets_only_the_composition_in_its_own_context_sg16(
                 inside.set()
                 assert release.wait(timeout=60)
                 assert _rfr({"x": {"$ref": "./x.conf"}}, theirs) == {"x": {"a": 1}}
-        except BaseException as exc:  # noqa: BLE001 - reported below, in the test's thread
+        except Exception as exc:  # noqa: BLE001 - reported below, in the test's thread
             errors.append(exc)
-            inside.set()
+        finally:
+            inside.set()  # a failure before the signal above must not hang the main thread
 
     with caplog.at_level(logging.DEBUG, logger="fluid.loader"):
         other = threading.Thread(target=read_theirs)

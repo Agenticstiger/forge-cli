@@ -38,7 +38,6 @@ from typing import Any, Dict, List, Optional
 import pytest
 
 from fluid_build.cli.verify import register, run
-from fluid_build.util.env_templates import EnvTemplateError
 
 try:
     import boto3

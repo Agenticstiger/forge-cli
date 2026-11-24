@@ -39,8 +39,6 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import logging
-import os
-import re
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple

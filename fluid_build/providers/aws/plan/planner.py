@@ -10,8 +10,6 @@ Converts FLUID contract specifications into concrete AWS resource operations.
 """
 
 import logging
-import os
-import re
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 

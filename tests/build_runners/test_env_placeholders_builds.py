@@ -128,7 +128,8 @@ def test_the_build_resolver_raises_a_typed_error_not_an_empty_string():
 def test_the_build_resolver_still_renders_a_credential_shaped_name(monkeypatch):
     """A connection's ``password: "{{ env.PGPASSWORD }}"`` reaches the engine that connects."""
     monkeypatch.setenv("PGPASSWORD", "pw")
-    assert _resolve_env_placeholders({"password": "{{ env.PGPASSWORD }}"}) == {"password": "pw"}
+    rendered = _resolve_env_placeholders({"password": "{{ env.PGPASSWORD }}"})
+    assert rendered == {"password": "pw"}  # pragma: allowlist secret
 
 
 def test_a_dbt_target_variable_that_is_unset_is_refused(tmp_path: Path):

@@ -15,15 +15,12 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
 from fluid_build.observability.secret_redactor import register_secrets
-from fluid_build.util.env_templates import ENV_TEMPLATE_RE, render_text
+from fluid_build.util.env_templates import render_text
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_WAREHOUSE = "COMPUTE_WH"
 DEFAULT_SCHEMA = "PUBLIC"
-# The one pattern lives in ``fluid_build.util.env_templates``; these names stay for the
-# provider's own callers and the modules that import them from here.
-_ENV_TEMPLATE_RE = ENV_TEMPLATE_RE
 _ACCOUNT_HOST_RE = re.compile(r"\.snowflakecomputing\.com$", re.IGNORECASE)
 _ACCOUNT_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+\Z")
 _ACCOUNT_REGION_SEGMENT_RE = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\Z")

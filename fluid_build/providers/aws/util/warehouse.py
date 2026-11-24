@@ -29,11 +29,8 @@ from __future__ import annotations
 import re
 from typing import Any, Mapping, Optional, Tuple
 
-from fluid_build.util.env_templates import ENV_TEMPLATE_RE, render_text
+from fluid_build.util.env_templates import render_text
 
-# The one pattern lives in ``fluid_build.util.env_templates``; the private name stays for the
-# modules that import it from here (``providers/_iceberg_catalog.py``).
-_ENV_TEMPLATE_RE = ENV_TEMPLATE_RE
 # Any ``aws_caller_identity`` account-id interpolation, e.g.
 # ``${data.aws_caller_identity.fluid_lf_caller.account_id}``.
 _ACCOUNT_TOKEN_RE = re.compile(r"\$\{data\.aws_caller_identity\.[^.}]+\.account_id\}")

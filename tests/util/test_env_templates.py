@@ -134,11 +134,11 @@ def test_a_credential_shaped_name_is_not_missing_policy_refuses_it():
 def test_the_build_path_renders_a_credential_shaped_name_like_any_other():
     out = render_contract(
         {"password": "{{ env.PGPASSWORD }}"},
-        environ={"PGPASSWORD": "pw"},
+        environ={"PGPASSWORD": "pw"},  # pragma: allowlist secret
         sensitive=SENSITIVE_RENDER,
         strip=False,
     )
-    assert out == {"password": "pw"}
+    assert out == {"password": "pw"}  # pragma: allowlist secret
 
 
 def test_a_string_with_braces_is_stripped_as_it_always_was_unless_asked_not_to():
