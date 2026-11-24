@@ -524,3 +524,40 @@ def test_a_failed_server_that_printed_nothing_says_so(project, tmp_path, monkeyp
     )
     result = _run(project, str(_install(tmp_path, with_jar=True)))
     assert result.error == "debezium-server exited with code 1 and printed nothing"
+
+
+def test_a_failure_names_the_error_lines_above_a_long_stack_trace(project, tmp_path, monkeypatch):
+    """The exception message comes before its frames, far above the end of the output."""
+    frames = "".join(f"\tat io.example.Frame{i}.call(Frame.java:{i})\n" for i in range(100))
+    stdout = (
+        "2026-11-24 10:04:23,267 ERROR [io.quarkus.runtime.Application] (main) Failed to start\n"
+        "Caused by: java.util.NoSuchElementException: SRCFG00014: The config property "
+        "debezium.format.value is required but it could not be found in any config source\n"
+        + frames
+    )
+    monkeypatch.setattr(
+        dbz.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout, "")
+    )
+    result = _run(project, str(_install(tmp_path, with_jar=True)))
+
+    error = result.error or ""
+    assert error.index("--- errors ---") < error.index("--- stdout (last lines) ---")
+    assert "ERROR [io.quarkus.runtime.Application] (main) Failed to start" in error
+    assert "SRCFG00014: The config property debezium.format.value is required" in error
+
+
+# ── the event format ───────────────────────────────────────────────────
+
+
+def test_the_generated_file_names_the_json_event_format():
+    """The http sink reads debezium.format.value with no default: forge names it."""
+    from fluid_build.build_runners.debezium.runner import render_application_properties
+
+    text, _env = render_application_properties(
+        {"connector.class": "io.debezium.connector.postgresql.PostgresConnector"},
+        "http",
+        {"url": "http://recorder.example/"},
+    )
+    lines = text.splitlines()
+    assert "debezium.format.key=json" in lines
+    assert "debezium.format.value=json" in lines

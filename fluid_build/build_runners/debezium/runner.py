@@ -635,6 +635,11 @@ def render_application_properties(
 
     lines = [line(f"debezium.source.{k}", v) for k, v in source_config.items()]
     lines.append("quarkus.log.console.json=false")
+    # The event format, set rather than left to a default: the http sink reads
+    # debezium.format.value with no default (Debezium Server 3.7) and fails at
+    # startup without it, and the sinks forge derives read JSON.
+    lines.append("debezium.format.key=json")
+    lines.append("debezium.format.value=json")
     lines.append(_properties_line("debezium.sink.type", sink_type))
     lines += [
         line(f"debezium.sink.{sink_type}.{k}", v, env_refs=True) for k, v in sink_config.items()
@@ -887,6 +892,10 @@ def _launch_server(
 #: How much of each stream a failed run reports: the end, where the cause is.
 _FAILURE_TAIL_LINES = 40
 _FAILURE_TAIL_CHARS = 4000
+#: The log lines and exception lines that name the cause.
+_FAILURE_CAUSE_RE = re.compile(r"\bERROR\b|Caused by:|\b\w+(?:Exception|Error)\b:")
+_FAILURE_CAUSE_LINES = 12
+_FAILURE_CAUSE_CHARS = 600
 
 
 def _server_failure(proc: "subprocess.CompletedProcess[str]", secret_env: Mapping[str, str]) -> str:
@@ -899,6 +908,21 @@ def _server_failure(proc: "subprocess.CompletedProcess[str]", secret_env: Mappin
     from ...observability.secret_redactor import redact_secret_text
 
     parts = []
+    # The cause is usually far above the end: a Java stack trace prints the
+    # exception message first, then its frames. So the ERROR log lines and the
+    # exception lines come first, then the end of each stream.
+    causes: List[str] = []
+    for text in (proc.stderr, proc.stdout):
+        for line in (text or "").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("at ") or stripped in causes:
+                continue
+            if _FAILURE_CAUSE_RE.search(stripped):
+                causes.append(stripped[:_FAILURE_CAUSE_CHARS])
+            if len(causes) >= _FAILURE_CAUSE_LINES:
+                break
+    if causes:
+        parts.append("--- errors ---\n" + "\n".join(causes))
     for label, text in (("stderr", proc.stderr), ("stdout", proc.stdout)):
         lines = (text or "").strip().splitlines()[-_FAILURE_TAIL_LINES:]
         if lines:
