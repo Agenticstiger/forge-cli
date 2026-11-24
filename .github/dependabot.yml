@@ -10,6 +10,48 @@ updates:
       prefix: "chore(deps)"
     labels:
       - dependencies
+  - package-ecosystem: pip
+    directory: /examples/bitcoin-price-api-imperative-part-a
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+  - package-ecosystem: maven
+    directory: /examples/flink-iceberg/runtime
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+    ignore:
+      # The Flink line is chosen together with the Iceberg and Kafka connector
+      # builds (both are named for 1.20) and with the image tag in the Dockerfile,
+      # so a Flink minor or major is a deliberate change, not a weekly bump.
+      - dependency-name: "org.apache.flink:*"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+  - package-ecosystem: docker
+    directory: /examples/flink-iceberg/runtime
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+    ignore:
+      - dependency-name: "flink"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
   - package-ecosystem: github-actions
     directory: /
     schedule:
