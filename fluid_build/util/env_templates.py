@@ -481,9 +481,11 @@ def _hosts_named_by(value: str) -> Optional[List[str]]:
     url = _URL_START.match(value)
     if url is not None and _control_free(value[: url.end() - 3]).lower() in _STORE_SCHEMES:
         return None
-    body = value.strip()
-    if url is None and body.startswith("/") and not body.startswith("//"):
-        return None
+    if url is None:
+        kept = _without_paths(value)
+        if kept is None:
+            return None  # a path, or a list of them
+        value = kept
     authority = _authority_of(value, url)
     hosts = [host for host in (_hosts_of(authority) if authority is not None else []) if host]
     return hosts or None
@@ -527,9 +529,10 @@ def check_host_templates(
         if url is not None and _control_free(text[: url.end() - 3]).lower() in _STORE_SCHEMES:
             return  # a bucket or a container of a store the engine is configured for, not a server
         if url is None:
-            body = text.strip()
-            if body.startswith("/") and not body.startswith("//"):
+            kept = _without_paths(text)
+            if kept is None:
                 return  # a path (a REST stream's ``endpoint: /v1/users``), not an address
+            text = kept  # a socket directory beside a host is a list: the host is judged
         for raw in ENV_TEMPLATE_RE.findall(text):
             name = raw.strip()
             if is_sensitive_key_name(name):
@@ -687,12 +690,35 @@ def _authority_span(text: str) -> Optional[Tuple[int, int]]:
 _NOT_AN_ENDPOINT = object()
 
 
-def _is_path(text: str) -> bool:
-    """Whether ``text`` is a path (a REST ``endpoint: /v1/users``, a file ``uri: /data/in.csv``, a
+def _is_one_path(element: str) -> bool:
+    """Whether ``element`` is a path (a REST ``endpoint: /v1/users``, a file ``uri: /data/in.csv``, a
     socket directory), which names no host: it starts with ``/`` but not ``//`` and holds no ``://``.
     """
-    body = text.strip()
-    return body.startswith("/") and not body.startswith("//") and "://" not in body
+    return element.startswith("/") and not element.startswith("//") and "://" not in element
+
+
+def _elements(text: str) -> List[str]:
+    """The elements of the comma list ``text``, stripped and not blank."""
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def _is_path(text: str) -> bool:
+    """Whether ``text`` is a path, or a list of nothing but paths. libpq reads ``host`` as a list:
+    ``/sockdir,attacker.example`` is a socket directory and then a TCP host that gets the password, so a
+    path in one element hides no host in another."""
+    elements = _elements(text)
+    return bool(elements) and all(_is_one_path(element) for element in elements)
+
+
+def _without_paths(text: str) -> Optional[str]:
+    """``text`` without the path elements of its comma list: ``text`` itself when it holds none,
+    ``None`` when nothing but paths is left, else the elements that name a host, joined with ``,``.
+    """
+    elements = _elements(text)
+    kept = [element for element in elements if not _is_one_path(element)]
+    if not elements or len(kept) == len(elements):
+        return text
+    return ",".join(kept) if kept else None
 
 
 def _split_hostport(hostport: str) -> Tuple[str, str]:
@@ -749,7 +775,8 @@ def _rendered_endpoint(text: str, env: Mapping[str, str]) -> Any:
                 elif end == len(text):
                     return "localhost"
         text = ENV_TEMPLATE_RE.sub(lambda match: env[match.group(1).strip()], text)
-    return _NOT_AN_ENDPOINT if _is_path(text) else text
+    kept = _without_paths(text)
+    return _NOT_AN_ENDPOINT if kept is None else kept
 
 
 #: A field name (lower case, letters and digits only) that says it holds an address: Kafka's
