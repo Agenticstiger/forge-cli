@@ -496,35 +496,56 @@ def test_a_full_refresh_without_late_rows_removes_a_stale_side_file(tmp_path, fm
 # ── overlapping rewrites ─────────────────────────────────────────────────────
 
 
-def test_overlapping_rewrites_of_one_target_never_corrupt_it_or_share_a_temp(tmp_path):
+@pytest.mark.parametrize(
+    "name, fmt",
+    [
+        ("t.parquet", "parquet"),
+        ("t.csv", "csv"),
+        ("t.ndjson", "ndjson"),
+        ("t__late_events.parquet", "parquet"),
+        ("t__late_events.csv", "csv"),
+    ],
+)
+def test_overlapping_rewrites_of_one_target_lose_no_row(tmp_path, name, fmt):
     import threading
 
-    target = tmp_path / "t.parquet"
+    target = tmp_path / name
     seed = duckdb.connect()
-    seed.execute(f"COPY (SELECT 0 AS seq) TO '{target}' (FORMAT 'parquet')")
+    options = {"parquet": "FORMAT 'parquet'", "csv": "FORMAT 'csv', HEADER"}.get(
+        fmt, "FORMAT 'json'"
+    )
+    seed.execute(f"COPY (SELECT 0 AS seq) TO '{target}' ({options})")
     seed.close()
+    columns = {"seq": "BIGINT"} if fmt == "ndjson" else None
     errors: List[BaseException] = []
+    workers, rounds = 3, 10
 
     def work(worker: int) -> None:
         con = duckdb.connect()
         try:
-            con.execute(f"CREATE TABLE new_rows AS SELECT {worker} AS seq")
-            for _ in range(10):
-                _union_rewrite(con, str(target), "parquet", "new_rows")
+            for i in range(rounds):
+                con.execute(f"CREATE OR REPLACE TABLE new_rows AS SELECT {worker * 100 + i} AS seq")
+                _union_rewrite(con, str(target), fmt, "new_rows", columns)
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
         finally:
             con.close()
 
-    threads = [threading.Thread(target=work, args=(i,)) for i in (1, 2, 3)]
+    threads = [threading.Thread(target=work, args=(w,)) for w in range(1, workers + 1)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
     assert not errors
-    rows = _seqs(target, "parquet")
-    assert 0 in rows and len(rows) >= 11
-    assert os.listdir(tmp_path) == ["t.parquet"]
+    expected = sorted([0] + [w * 100 + i for w in range(1, workers + 1) for i in range(rounds)])
+    reader = {"parquet": "read_parquet", "csv": "read_csv_auto"}.get(fmt, "read_json_auto")
+    con = duckdb.connect()
+    try:
+        rows = [r[0] for r in con.execute(f"SELECT seq FROM {reader}('{target}')").fetchall()]
+    finally:
+        con.close()
+    assert sorted(int(r) for r in rows) == expected
+    assert os.listdir(tmp_path) == [name]
 
 
 def test_each_rewrite_uses_its_own_temp_name(tmp_path):

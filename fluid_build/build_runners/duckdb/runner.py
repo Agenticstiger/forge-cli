@@ -25,13 +25,16 @@ when it detects an acquisition build with ``engine: duckdb``.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import errno
 import functools
+import hashlib
 import logging
 import os
 import re
 import stat
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -823,6 +826,99 @@ def _append_tmp_path(path: str, run_id: Optional[str] = None) -> str:
     return os.path.join(head, f".{name}.{token}.fluid-append")
 
 
+@dataclass
+class AppendLockError(FluidUserError):
+    """The lock on a landed file could not be taken."""
+
+    code: str = "incremental_append_lock_unavailable"
+
+
+#: How long a Windows run waits for another run's rewrite of the same file.
+_LOCK_TIMEOUT_SECONDS = 600.0
+
+
+def _lock_dir_for(ctx: RunContext) -> str:
+    """Where this project's rewrite locks live: ``<workdir>/.fluid/locks``."""
+    return os.path.join(str(ctx.workdir), ".fluid", "locks")
+
+
+def _private_dir(path: str) -> str:
+    """``path`` as a directory only this user can use: created 0o700, not a link, ours."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise AppendLockError(
+            what=f"the lock directory {path} is a link or not a directory",
+            why="A lock under a link could be placed where another user chooses.",
+            fix="Remove it, so the runner can create its own.",
+            doc=doc_url(),
+        )
+    if hasattr(os, "getuid") and (info.st_uid != os.getuid() or info.st_mode & 0o022):
+        raise AppendLockError(
+            what=f"the lock directory {path} is not private to this user",
+            why="Another user could hold or replace the locks that order rewrites of a file.",
+            fix="Remove it, so the runner can create its own.",
+            doc=doc_url(),
+        )
+    return path
+
+
+def _locks_dir(lock_dir: Optional[str]) -> str:
+    if lock_dir:
+        return _private_dir(lock_dir)
+    who = str(os.getuid()) if hasattr(os, "getuid") else re.sub(r"\W", "_", os.getlogin())
+    return _private_dir(os.path.join(tempfile.gettempdir(), f"fluid-locks-{who}"))
+
+
+@contextlib.contextmanager
+def _target_lock(path: str, lock_dir: Optional[str] = None) -> Any:
+    """An exclusive lock on ``path`` for a whole read-modify-write of it.
+
+    The lock file is named by the sha256 of the target's real path and lives outside the
+    output directory. POSIX ``flock`` on a descriptor of its own, so two threads of one
+    process exclude each other too; Windows ``msvcrt.locking`` on one byte, retried up
+    to :data:`_LOCK_TIMEOUT_SECONDS`. The lock is on the open descriptor, so a leftover
+    lock file blocks nobody. Take the main file's lock before the side file's, never
+    the reverse.
+    """
+    key = hashlib.sha256(os.path.realpath(path).encode("utf-8")).hexdigest()
+    lock_path = os.path.join(_locks_dir(lock_dir), key + ".lock")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        if os.name == "nt":  # pragma: no cover - exercised on Windows only
+            import msvcrt
+
+            deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() > deadline:
+                        raise AppendLockError(
+                            what=f"another run kept {path} locked for {_LOCK_TIMEOUT_SECONDS:.0f}s",
+                            why="Rewrites of one file run one at a time.",
+                            fix="Wait for the other run, or stop it, then run again.",
+                            doc=doc_url(),
+                        ) from None
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":  # pragma: no cover
+                import msvcrt
+
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    finally:
+        os.close(fd)  # closing releases a flock
+
+
 def _appends_to_file(ctx: RunContext, out_path: str, fmt: str, partitioned: Any) -> bool:
     """Whether this stream appends to a local single file that already holds rows.
 
@@ -936,13 +1032,16 @@ def _union_rewrite(
     new_relation: str,
     json_columns: Optional[Dict[str, str]] = None,
     run_id: Optional[str] = None,
+    lock_dir: Optional[str] = None,
 ) -> None:
     """Rewrite ``out_path`` as its rows plus those of ``new_relation`` (a table or view).
 
     DuckDB's ``COPY`` cannot append to one file, so the union is committed through
-    :func:`_commit_select`."""
-    union = _union_select(con, out_path, fmt, new_relation, json_columns)
-    _commit_select(con, out_path, fmt, union, run_id)
+    :func:`_commit_select`, with the target locked from the first read of the old file
+    to the rename: concurrent rewrites of one file run one at a time and lose no row."""
+    with _target_lock(out_path, lock_dir):
+        union = _union_select(con, out_path, fmt, new_relation, json_columns)
+        _commit_select(con, out_path, fmt, union, run_id)
 
 
 def _old_rows_sql(path: str, fmt: str, json_columns: Optional[Dict[str, str]]) -> str:
@@ -1042,8 +1141,13 @@ def _append_to_file(
     late: Optional[Tuple[str, float]] = None,
     cursor_field: Optional[str] = None,
     info: Optional[Dict[str, Any]] = None,
+    lock_dir: Optional[str] = None,
 ) -> Tuple[int]:
     """Append the rows of ``landed_sel`` to the existing file; returns ``(rows appended,)``.
+
+    The main file stays locked from the first read of its old rows (the lateness
+    watermark) to the rename, and the side file is locked, inside it, around its own
+    rewrite: the order is always main, then side.
 
     With ``late`` (the event-time column and the allowed lateness) only this run's rows are
     split: the on-time ones join the main file and the late ones the side file. Everything
@@ -1055,34 +1159,40 @@ def _append_to_file(
     """
     con.execute(f"CREATE OR REPLACE TEMP TABLE __fl_append_new AS {landed_sel}")
     try:
-        count = first_row(con.execute("SELECT COUNT(*) FROM __fl_append_new"))
-        main_rows = "__fl_append_new"
-        side: Optional[Tuple[str, str]] = None
-        if late is not None:
-            _remove_stale_temps(_late_file_path(out_path))
-            counts = _split_new_rows(con, out_path, fmt, late[0], late[1], json_columns)
-            if info is not None:
-                info["late_counts"] = counts
-            if counts["late"]:
-                late_path = _late_file_path(out_path)
-                if Path(late_path).is_file():
-                    select = _union_select(con, late_path, fmt, "__fl_append_late", json_columns)
-                else:
-                    select = "SELECT * FROM __fl_append_late"
-                side = (late_path, select)
-                main_rows = "__fl_append_ontime"
-                if info is not None and cursor_field:
-                    top = first_row(
-                        con.execute(
-                            f'SELECT MAX("{validate_ident(cursor_field)}") FROM __fl_append_new'
+        with _target_lock(out_path, lock_dir):
+            count = first_row(con.execute("SELECT COUNT(*) FROM __fl_append_new"))
+            main_rows = "__fl_append_new"
+            side: Optional[str] = None
+            if late is not None:
+                _remove_stale_temps(_late_file_path(out_path))
+                counts = _split_new_rows(con, out_path, fmt, late[0], late[1], json_columns)
+                if info is not None:
+                    info["late_counts"] = counts
+                if counts["late"]:
+                    late_path = _late_file_path(out_path)
+                    if Path(late_path).is_file():
+                        # Only to refuse early; the select is built again under the lock.
+                        _union_select(con, late_path, fmt, "__fl_append_late", json_columns)
+                    side = late_path
+                    main_rows = "__fl_append_ontime"
+                    if info is not None and cursor_field:
+                        top = first_row(
+                            con.execute(
+                                f'SELECT MAX("{validate_ident(cursor_field)}") FROM __fl_append_new'
+                            )
                         )
+                        info["cursor_max"] = top[0] if top else None
+            main_select = _union_select(con, out_path, fmt, main_rows, json_columns)
+            if side is not None:
+                with _target_lock(side, lock_dir):
+                    select = (
+                        _union_select(con, side, fmt, "__fl_append_late", json_columns)
+                        if Path(side).is_file()
+                        else "SELECT * FROM __fl_append_late"
                     )
-                    info["cursor_max"] = top[0] if top else None
-        main_select = _union_select(con, out_path, fmt, main_rows, json_columns)
-        if side is not None:
-            _commit_select(con, side[0], fmt, side[1], run_id)
-        _commit_select(con, out_path, fmt, main_select, run_id)
-        return (int(count[0]) if count else 0,)
+                    _commit_select(con, side, fmt, select, run_id)
+            _commit_select(con, out_path, fmt, main_select, run_id)
+            return (int(count[0]) if count else 0,)
     finally:
         for table in ("__fl_append_new", "__fl_append_ontime", "__fl_append_late"):
             con.execute(f"DROP TABLE IF EXISTS {table}")
@@ -1692,6 +1802,7 @@ def _enforce_late_arrival_split(
         return {}
 
     results: Dict[str, Dict[str, int]] = {}
+    lock_dir = _lock_dir_for(ctx)
     con = _connect_for_destination(ctx)
     try:
         for stream_result in stream_results:
@@ -1706,74 +1817,79 @@ def _enforce_late_arrival_split(
                 main_path_obj.stem + "__late_events" + main_path_obj.suffix
             )
 
-            # Stage data into temp tables, run the SQL split, then
-            # overwrite the main file + write the late-events file.
-            quoted_main = quote_ansi_string_literal(str(main_path_obj))
-            quoted_late = quote_ansi_string_literal(str(late_path_obj))
-            con.execute(
-                f"CREATE OR REPLACE TABLE __la_main AS SELECT * FROM {reader_func}({quoted_main})"
-            )
-
-            try:
-                counts = split_late_events_in_duckdb(
-                    con=con,
-                    source_relation="__la_main",
-                    side_output_relation="__la_side",
-                    event_time_column=event_time_column,
-                    allowed_lateness_seconds=budget_seconds,
+            with _target_lock(str(main_path_obj), lock_dir):
+                # Stage data into temp tables, run the SQL split, then
+                # overwrite the main file + write the late-events file.
+                quoted_main = quote_ansi_string_literal(str(main_path_obj))
+                quoted_late = quote_ansi_string_literal(str(late_path_obj))
+                con.execute(
+                    f"CREATE OR REPLACE TABLE __la_main AS SELECT * FROM {reader_func}({quoted_main})"
                 )
-            except Exception as exc:  # noqa: BLE001
-                LOG.warning(
-                    "late_arrival_split_sql_failed: stream=%s err=%s",
-                    stream_name,
-                    exc,
-                )
-                continue
 
-            if counts["late"] == 0:
-                # Nothing to do — leave the file alone. A full refresh replaced every
-                # row, so a side file an older run left no longer describes this file.
-                if ctx.source.mode is AcquisitionMode.FULL_REFRESH and not _is_remote_uri(
-                    str(late_path_obj)
+                try:
+                    counts = split_late_events_in_duckdb(
+                        con=con,
+                        source_relation="__la_main",
+                        side_output_relation="__la_side",
+                        event_time_column=event_time_column,
+                        allowed_lateness_seconds=budget_seconds,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning(
+                        "late_arrival_split_sql_failed: stream=%s err=%s",
+                        stream_name,
+                        exc,
+                    )
+                    continue
+
+                if counts["late"] == 0:
+                    # Nothing to do — leave the file alone. A full refresh replaced every
+                    # row, so a side file an older run left no longer describes this file.
+                    if ctx.source.mode is AcquisitionMode.FULL_REFRESH and not _is_remote_uri(
+                        str(late_path_obj)
+                    ):
+                        _remove_quietly(str(late_path_obj))
+                    results[stream_name] = counts
+                    continue
+
+                # Overwrite the main file (now without late rows) and emit
+                # the side-output file. Use COPY ... TO ... so duckdb
+                # handles the format details.
+                # The side file goes first: if it fails, the late rows are still in the
+                # main file, not only in memory.
+                if (
+                    ctx.source.mode is AcquisitionMode.INCREMENTAL_APPEND
+                    and fmt in _SINK_READERS
+                    and not _is_remote_uri(str(late_path_obj))
+                    and late_path_obj.is_file()
                 ):
-                    _remove_quietly(str(late_path_obj))
+                    # An earlier run's late rows stay: this run's join them.
+                    _union_rewrite(
+                        con,
+                        str(late_path_obj),
+                        fmt,
+                        "__la_side",
+                        _json_append_columns(ctx) if fmt in ("json", "ndjson") else None,
+                        ctx.run_id,
+                        lock_dir,
+                    )
+                elif fmt in _SINK_READERS and not _is_remote_uri(str(late_path_obj)):
+                    # Temp file, fsync, rename: a crash never leaves a partial side file.
+                    with _target_lock(str(late_path_obj), lock_dir):
+                        _commit_select(
+                            con, str(late_path_obj), fmt, "SELECT * FROM __la_side", ctx.run_id
+                        )
+                else:
+                    con.execute(f"COPY __la_side TO {quoted_late} ({writer_func})")
+                con.execute(f"COPY __la_main TO {quoted_main} ({writer_func})")
                 results[stream_name] = counts
-                continue
-
-            # Overwrite the main file (now without late rows) and emit
-            # the side-output file. Use COPY ... TO ... so duckdb
-            # handles the format details.
-            # The side file goes first: if it fails, the late rows are still in the
-            # main file, not only in memory.
-            if (
-                ctx.source.mode is AcquisitionMode.INCREMENTAL_APPEND
-                and fmt in _SINK_READERS
-                and not _is_remote_uri(str(late_path_obj))
-                and late_path_obj.is_file()
-            ):
-                # An earlier run's late rows stay: this run's join them.
-                _union_rewrite(
-                    con,
-                    str(late_path_obj),
-                    fmt,
-                    "__la_side",
-                    _json_append_columns(ctx) if fmt in ("json", "ndjson") else None,
-                    ctx.run_id,
+                LOG.info(
+                    "late_arrival_split: stream=%s on_time=%d late=%d side_output=%s",
+                    stream_name,
+                    counts["on_time"],
+                    counts["late"],
+                    late_path_obj,
                 )
-            elif fmt in _SINK_READERS and not _is_remote_uri(str(late_path_obj)):
-                # Temp file, fsync, rename: a crash never leaves a partial side file.
-                _commit_select(con, str(late_path_obj), fmt, "SELECT * FROM __la_side", ctx.run_id)
-            else:
-                con.execute(f"COPY __la_side TO {quoted_late} ({writer_func})")
-            con.execute(f"COPY __la_main TO {quoted_main} ({writer_func})")
-            results[stream_name] = counts
-            LOG.info(
-                "late_arrival_split: stream=%s on_time=%d late=%d side_output=%s",
-                stream_name,
-                counts["on_time"],
-                counts["late"],
-                late_path_obj,
-            )
     finally:
         con.close()
     return results
@@ -2336,6 +2452,7 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                         late=append_late_plan,
                         cursor_field=ctx.source.cursor_field,
                         info=append_info,
+                        lock_dir=_lock_dir_for(ctx),
                     )
                     if "late_counts" in append_info:
                         appended_late[stream] = append_info["late_counts"]
