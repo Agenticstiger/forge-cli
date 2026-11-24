@@ -264,11 +264,11 @@ def test_an_unset_variable_in_a_host_is_left_for_the_render_to_name():
     assert info.value.extras["missing"] == ["NOPE"]
 
 
-def test_skip_leaves_a_top_level_key_unread():
-    contract = {"builds": [{"uri": "https://{{ env.H }}.example/x"}]}
-    with pytest.raises(EnvTemplateError):
+def test_every_build_of_a_contract_is_read():
+    contract = {"builds": [{"id": "a"}, {"id": "a", "uri": "https://{{ env.H }}.example/x"}]}
+    with pytest.raises(EnvTemplateError) as info:
         check_host_templates(contract, environ={"H": "lake"})
-    check_host_templates(contract, environ={"H": "lake"}, skip=("builds",))
+    assert info.value.extras["field"] == "builds[1].uri"
 
 
 def test_a_placeholder_written_without_spaces_is_still_read_one_at_a_time():
@@ -314,7 +314,8 @@ def test_these_values_are_urls_wherever_they_sit(value):
 @pytest.mark.parametrize(
     "key",
     ["host", "iceberg.catalog.uri", "bootstrap_servers", "catalog_url", "jdbc_url", "brokers"]
-    + ["server_hostname", "connection_string", "sqlalchemy_url", "Endpoint"],
+    + ["server_hostname", "connection_string", "sqlalchemy_url", "Endpoint", "hosts"]
+    + ["instance_type.server_addresses", "cluster_url"],
 )
 def test_a_field_is_a_host_field_by_its_last_word(key):
     assert is_host_field(key)

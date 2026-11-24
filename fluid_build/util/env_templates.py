@@ -48,7 +48,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from fluid_build._errors import FluidUserError, doc_url
 
@@ -253,7 +253,8 @@ def render_contract(
 #: (``host``, ``catalog_uri``, ``iceberg.catalog.uri``, ``bootstrap_servers``, ``server_url``):
 #: the destination fields of ``secrets.policy`` plus the spellings connectors use.
 HOST_FIELD_WORDS = frozenset(
-    {"host", "hostname", "uri", "url", "endpoint", "server", "servers", "brokers"}
+    {"host", "hostname", "hosts", "uri", "url", "endpoint", "server", "servers", "brokers"}
+    | {"address", "addresses"}
 )
 #: Whole field names that hold one, whatever their last word.
 HOST_FIELD_NAMES = frozenset({"connection_string", "sqlalchemy_url"})
@@ -364,7 +365,6 @@ def check_host_templates(
     *,
     environ: Optional[Mapping[str, str]] = None,
     stage: Optional[str] = None,
-    skip: Iterable[str] = (),
 ) -> None:
     """Refuse an ``{{ env.NAME }}`` that would put the operator's environment into an address.
 
@@ -380,14 +380,12 @@ def check_host_templates(
       is unset is left to :func:`render_contract`, which says so.
 
     Raises :class:`EnvTemplateError` naming the variable and the field, never the
-    rendered value. ``skip`` names top-level keys not to read (the contract's
-    ``builds``, when the build is checked beside it).
+    rendered value.
     """
     from fluid_build.observability.secret_redactor import is_sensitive_key_name
     from fluid_build.secrets.policy import variable_allowed
 
     env = os.environ if environ is None else environ
-    skipped = set(skip)
 
     def check(text: str, where: str, key: str) -> None:
         if "{{" not in text or ENV_TEMPLATE_RE.search(text) is None:
@@ -433,8 +431,6 @@ def check_host_templates(
                 walk(item, f"{where}[{index}]", key)
         elif isinstance(node, dict):
             for field, item in node.items():
-                if not where and field in skipped:
-                    continue
                 walk(item, f"{where}.{field}" if where else str(field), str(field))
 
     walk(value, "", "")

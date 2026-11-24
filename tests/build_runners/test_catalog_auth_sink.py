@@ -562,3 +562,54 @@ def test_an_unpaired_host_variable_in_the_build_is_refused_on_the_path_apply_run
     shown = capsys.readouterr()
     assert "SRC_PREFIX" in shown.out + shown.err
     assert "internal" not in shown.out + shown.err, "never the rendered host"
+
+
+@pytest.mark.parametrize("ids", ["same-id", "no-id"])
+def test_a_second_build_with_the_same_id_cannot_hide_behind_the_first(
+    sink_engine, tmp_path: Path, monkeypatch, capsys, ids
+):
+    """The written twin of a running build is not found by its id: two builds may share one (or
+    have none), and the one that runs is the one whose host must be judged."""
+    import copy
+
+    contract_for, pushed = sink_engine
+    monkeypatch.setenv("OPERATOR_SYNTH_SECRET", _PROBE)
+    contract = contract_for(_catalog("https://lakekeeper:8443/catalog"))
+    benign = contract["builds"][0]
+    hostile = copy.deepcopy(benign)
+    hostile["properties"]["source"]["connection"]["host"] = "{{ env.OPERATOR_SYNTH_SECRET }}.evil"
+    if ids == "no-id":
+        del benign["id"], hostile["id"]
+    contract["builds"] = [benign, hostile]
+
+    from fluid_build.build_runners.base import _execute_acquisition_build
+
+    rc = _execute_acquisition_build(hostile, contract, tmp_path, dry_run=False, as_written=contract)
+
+    shown = capsys.readouterr()
+    assert rc == 1
+    assert _PROBE not in shown.out + shown.err and _PROBE not in pushed()
+
+
+def test_a_host_in_the_first_build_is_judged_when_another_build_runs(
+    sink_engine, tmp_path: Path, monkeypatch, capsys
+):
+    """dlt, airbyte and meltano read ``builds[0]`` whichever build they run."""
+    import copy
+
+    contract_for, pushed = sink_engine
+    monkeypatch.setenv("OPERATOR_SYNTH_SECRET", _PROBE)
+    contract = contract_for(_catalog("https://lakekeeper:8443/catalog"))
+    first = contract["builds"][0]
+    second = copy.deepcopy(first)
+    second["id"] = "second"
+    first["properties"]["source"]["connection"]["host"] = "{{ env.OPERATOR_SYNTH_SECRET }}.evil"
+    contract["builds"] = [first, second]
+
+    from fluid_build.build_runners.base import _execute_acquisition_build
+
+    rc = _execute_acquisition_build(second, contract, tmp_path, dry_run=False, as_written=contract)
+
+    shown = capsys.readouterr()
+    assert rc == 1 and "builds[0]" in shown.out + shown.err
+    assert _PROBE not in shown.out + shown.err and _PROBE not in pushed()
