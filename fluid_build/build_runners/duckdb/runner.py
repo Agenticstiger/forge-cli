@@ -3307,16 +3307,9 @@ def _build_expose(ctx: RunContext) -> Optional[Dict[str, Any]]:
     exposes, raises its typed ``BuildOutputsError``. A contract with one expose, or a
     build the contract does not list, keeps ``exposes[0]``.
     """
-    from fluid_build.util.contract import build_output_exposes
+    from .._acquisition_common import landed_expose
 
-    exposes = ctx.contract.get("exposes") or []
-    build_id = getattr(ctx, "build_id", None)
-    build = next((b for b in ctx.contract.get("builds") or [] if b.get("id") == build_id), None)
-    if build is not None:
-        resolved = build_output_exposes(ctx.contract, build)
-        if resolved:
-            return resolved[0]
-    return exposes[0] if exposes else None
+    return landed_expose(ctx) or None
 
 
 # ── Top-level entry point used by build_runners.base ────────────────────

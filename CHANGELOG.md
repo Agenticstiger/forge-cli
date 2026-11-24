@@ -223,6 +223,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   newer backports) from `Distribution.name` and `.version`, which `getattr`'s default does not
   catch. `granted_distribution` and `entry_point_distribution` now treat such a distribution as
   unnamed. This was the intermittent failure of `tests/iac/test_state_migration_safety.py` in CI.
+- **The dlt, Airbyte and Meltano runners land in the expose their build's `outputs` name.** They
+  loaded into `exposes[0]` whichever build ran, so with two exposes a build with `outputs: [second]`
+  was held to the second expose's schema (the drift gate) yet loaded into the first one's
+  destination. They now pick the expose the way the DuckDB runner does, through
+  `build_output_exposes` (a shared `landed_expose`): an `outputs` entry that is no exposeId, or no
+  `outputs` beside several exposes, is refused before anything runs, with the typed
+  `build_output_unknown_expose` / `build_outputs_undeclared`. The Debezium and Kafka Connect runners
+  keep owning every expose of a build that names none. An Airbyte run now lets that refusal escape
+  typed (code and exit status intact) instead of recording a failed run without a code.
 
 ### Security
 

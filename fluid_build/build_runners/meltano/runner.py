@@ -48,6 +48,7 @@ from fluid_build.providers._sql_safety import quote_ansi_string_literal, validat
 
 from .._acquisition_common import (
     extract_source_schemas,
+    landed_expose,
     resolve_connection_secrets,
     utc_now_iso,
     write_run_record_and_finalize,
@@ -739,7 +740,7 @@ def _execute(ctx: RunContext, runner: MeltanoRunner) -> RunResult:
     #     introspector) → invoke target-<platform> via Singer stdin pipe.
     #  2. anything else → fall back to the built-in DuckDB writer (matches
     #     the historical default; useful for local dev / tests).
-    expose = (ctx.contract.get("exposes") or [{}])[0]
+    expose = landed_expose(ctx)
     binding = expose.get("binding") or {}
     binding_loc = binding.get("location") or {}
     sink_platform = (binding.get("platform") or "").lower()

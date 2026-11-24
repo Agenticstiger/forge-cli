@@ -41,6 +41,7 @@ from .._acquisition_common import (
     adapt_source_config,
     apply_loopback_host_override,
     extract_source_schemas,
+    landed_expose,
     resolve_connection_secrets,
     utc_now_iso,
     write_run_record_and_finalize,
@@ -345,7 +346,7 @@ def _execute_rest_mode(
             )
 
     workspace_id = airbyte_props.get("workspace_id", "default-workspace")
-    expose = (ctx.contract.get("exposes") or [{}])[0]
+    expose = landed_expose(ctx)
     binding = expose.get("binding", {}) or {}
 
     client = AirbyteRestClient(server_url, api_token=api_token)
@@ -630,7 +631,7 @@ def _execute_embedded_mode(
         # DuckDB cache + warning when no cache class matches the platform.
         from .._credentials import make_destination
 
-        binding = (ctx.contract.get("exposes") or [{}])[0].get("binding") or {}
+        binding = landed_expose(ctx).get("binding") or {}
         platform = binding.get("platform", "local")
         cache = make_destination(
             "airbyte",
@@ -804,6 +805,13 @@ def execute_airbyte_build(
     try:
         result = runner.run(ctx)
     except Exception as exc:
+        # A build whose ``outputs`` resolve to no expose is a contract error, refused
+        # before anything runs: it escapes typed (code and exit status intact, as for
+        # the DuckDB runner) instead of becoming a failed run record with no code.
+        from fluid_build.util.contract import BuildOutputsError
+
+        if isinstance(exc, BuildOutputsError):
+            raise
         # Image-signature / supply-chain failures raise typed errors
         # from inside ``_execute``; the operator's contract is "non-zero
         # exit when the build aborts", not "trace-back surfaced". The
