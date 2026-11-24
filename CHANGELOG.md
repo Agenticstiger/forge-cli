@@ -71,8 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pipeline's staging (`STAGING_TYPE`, `STAGING_NAME`, under every section dlt reads), the
   destination's type or name (`DESTINATION__<NAME>__DESTINATION_TYPE`, `DESTINATION_NAME`), the
   destination's other configuration (lance `storage` and `embeddings`, filesystem `bucket_url`
-  and `kwargs`, `staging_config`, taken from the destination's dlt `spec()`), or the staging
-  destination's settings and credentials. `fluid apply` fails the dlt build and names the
+  and `kwargs`, `staging_config`, taken from the destination's dlt `spec()`), the staging
+  destination's settings and credentials, or the URLs the run reports to (`RUNTIME__SENTRY_DSN`,
+  `RUNTIME__SLACK_INCOMING_HOOK`, `RUNTIME__DLTHUB_TELEMETRY_ENDPOINT`, under every section dlt
+  reads them). `fluid apply` fails the dlt build and names the
   variables, never their values. Still allowed from a project `.env`: `environment`, boolean and
   integer destination settings, and the type of a named destination whose credentials the project
   itself supplies. What the operator sets (shell, CI, `.dlt` files) applies as before. Behaviour

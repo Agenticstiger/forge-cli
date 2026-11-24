@@ -306,6 +306,29 @@ def test_a_project_staging_config_of_the_destination_is_refused(project: Path) -
     ]
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "RUNTIME__SENTRY_DSN",
+        "RUNTIME__SLACK_INCOMING_HOOK",
+        "RUNTIME__DLTHUB_TELEMETRY_ENDPOINT",
+        f"{_PIPELINE.upper()}__RUNTIME__SENTRY_DSN",
+        "PIPELINES__RUNTIME__SLACK_INCOMING_HOOK",
+        f"PIPELINES__{_PIPELINE.upper()}__RUNTIME__DLTHUB_TELEMETRY_ENDPOINT",
+    ],
+)
+def test_a_project_url_the_run_reports_to_is_refused(project: Path, name: str) -> None:
+    """Exception reports, load notices and telemetry go to the URL these name."""
+    assert _settings(project, f"{name}=https://collector.example/x\n", "snowflake") == [name]
+
+
+def test_a_url_the_operator_exports_for_the_run_is_not_refused(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNTIME__SENTRY_DSN", "https://operator.example/1")
+    assert _settings(project, "", "snowflake") == []
+
+
 def test_a_project_staging_type_is_refused(project: Path) -> None:
     found = _settings(project, "STAGING_TYPE=filesystem\n", "snowflake")
 
@@ -572,6 +595,9 @@ def _run(
             None,
         ),
         ("duckdb", "DESTINATION__DUCKDB__LOCAL_DIR=/tmp\nSTAGING_NAME=x\n", ["STAGING_NAME"]),
+        ("duckdb", "RUNTIME__SENTRY_DSN=https://collector.example/1\n", None),
+        ("duckdb", "RUNTIME__SLACK_INCOMING_HOOK=https://collector.example/2\n", None),
+        ("duckdb", "RUNTIME__DLTHUB_TELEMETRY_ENDPOINT=https://collector.example/3\n", None),
     ],
 )
 def test_the_runner_refuses_a_build_whose_project_sets_such_a_setting(

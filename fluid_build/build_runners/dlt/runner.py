@@ -1113,6 +1113,30 @@ _DLT_PROJECT_SETTINGS_ALLOWED: FrozenSet[str] = frozenset({"environment"})
 _DLT_PIPELINE_SETTINGS = ("STAGING_TYPE", "STAGING_NAME", "DESTINATION_TYPE", "DESTINATION_NAME")
 
 
+# dlt's run settings that send a run's data, errors or telemetry to a URL
+# (dlt/common/configuration/specs/runtime_configuration.py, dlt 1.27.2):
+# exception reports to Sentry, load notices to a Slack hook, usage telemetry to
+# its endpoint. Read under the ``runtime`` section, with or without the
+# pipeline's sections.
+_DLT_RUNTIME_ENDPOINTS = ("SENTRY_DSN", "SLACK_INCOMING_HOOK", "DLTHUB_TELEMETRY_ENDPOINT")
+
+
+def _dlt_runtime_endpoint_names(pipeline_name: str) -> FrozenSet[str]:
+    """The variables dlt reads :data:`_DLT_RUNTIME_ENDPOINTS` from in the pipeline
+    ``pipeline_name``: ``RUNTIME__<SETTING>``, ``PIPELINES__RUNTIME__<SETTING>``
+    and ``PIPELINES__<PIPELINE>__RUNTIME__<SETTING>``, each also behind the
+    pipeline name (observed with dlt 1.27.2)."""
+    pipeline = pipeline_name.upper()
+    heads = (f"{pipeline}__", "") if pipeline else ("",)
+    sections = ((f"PIPELINES__{pipeline}__",) if pipeline else ()) + ("PIPELINES__", "")
+    return frozenset(
+        head + section + "RUNTIME__" + setting
+        for head in heads
+        for section in sections
+        for setting in _DLT_RUNTIME_ENDPOINTS
+    )
+
+
 def _dlt_pipeline_setting_names(pipeline_name: str) -> FrozenSet[str]:
     """The variables dlt reads the pipeline settings of
     :data:`_DLT_PIPELINE_SETTINGS` from in the pipeline ``pipeline_name``:
@@ -1252,8 +1276,9 @@ def _project_dlt_settings(
 ) -> List[str]:
     """The variables a project dotenv file supplied (in effect) that set a dlt
     setting of the pipeline ``pipeline_name`` beyond the destination's
-    credentials: the pipeline's staging and destination settings, and the
-    destination's other configuration (:data:`_DLT_PIPELINE_SETTINGS`,
+    credentials: the pipeline's staging and destination settings, the URLs the
+    run reports to, and the destination's other configuration
+    (:data:`_DLT_PIPELINE_SETTINGS`, :data:`_DLT_RUNTIME_ENDPOINTS`,
     :func:`_dlt_destination_setting_names`). The contract's destination
     ``destination`` is read as :func:`_dlt_destination` reads it.
 
@@ -1275,6 +1300,7 @@ def _project_dlt_settings(
     below: Set[str] = set()
     if staging is None:
         exact.update(_dlt_pipeline_setting_names(pipeline_name))
+        exact.update(_dlt_runtime_endpoint_names(pipeline_name))
         names, prefixes = _dlt_destination_setting_names(
             section, kind, pipeline_name, credentials=False
         )
