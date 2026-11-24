@@ -23,7 +23,12 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install ruff "black==24.10.0"
+          cache-dependency-path: requirements/ci-tools.txt
+      # Hash-locked: requirements/ci-tools.in names the tools (ruff, black,
+      # detect-secrets, ...) and ci-tools.txt carries every wheel hash.
+      # --require-hashes refuses anything that is not in the file.
+      - name: Install CI tools (hash-locked)
+        run: python -m pip install --require-hashes -r requirements/ci-tools.txt
       - name: Ruff check
         run: ruff check fluid_build/ tests/
       - name: Dead-code gate for staged forge modules
@@ -70,7 +75,6 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          pip install "detect-secrets==1.5.0"
           if [ -z "${BASE_SHA}" ]; then
             echo "Not a pull request — nothing to diff against; skipping."
             exit 0
@@ -161,7 +165,11 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install "mypy>=1.10" types-PyYAML
+          cache-dependency-path: requirements/ci-typecheck.txt
+      # Hash-locked, and deliberately only mypy and stubs: the gate runs in a
+      # bare environment, so every third-party module is Any.
+      - name: Install mypy and stubs (hash-locked)
+        run: python -m pip install --require-hashes -r requirements/ci-typecheck.txt
       - name: mypy --strict on hotspot allowlist (derived from pyproject.toml)
         run: python scripts/mypy_strict.py
 
@@ -584,9 +592,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements/ci-tools.txt
       - name: Build wheel and sdist
         run: |
-          pip install --upgrade pip build twine
+          python -m pip install --require-hashes -r requirements/ci-tools.txt
           python -m build
       - name: Strict metadata check
         run: twine check --strict dist/*
@@ -933,30 +942,43 @@ jobs:
     permissions:
       contents: read
       security-events: write  # upload Semgrep SARIF to GitHub code scanning
+    env:
+      # Where the hash-locked auditors and scanners are installed: a virtual
+      # environment of their own, never the project's.
+      SECURITY_TOOLS: /tmp/security-tools
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install project + pip-audit
+          cache-dependency-path: requirements/ci-security.txt
+      - name: Install project
         run: |
           pip install --upgrade pip
           pip install -e ".[dev]"
-          pip install pip-audit
+      # pip-audit, bandit and semgrep are named in requirements/ci-security.in
+      # and hash-locked in ci-security.txt. They go into their own virtual
+      # environment, so nothing they depend on lands in the set the audit
+      # below reads.
+      - name: Install security tools (hash-locked, separate environment)
+        run: |
+          python -m venv "${SECURITY_TOOLS}"
+          "${SECURITY_TOOLS}/bin/python" -m pip install --require-hashes -r requirements/ci-security.txt
       - name: pip-audit dependency CVE scan
         # Fails the build on any known-vulnerable dependency. Keeps the
         # litellm / jinja2 / h11 / cryptography CVE floors honest over time.
         #
-        # ORDER MATTERS — this audits the project's REAL resolved closure
-        # BEFORE bandit/semgrep are installed. semgrep==1.163.0 pins
-        # mcp==1.23.3, which caps pyjwt at 2.12.1 — below pyjwt's own CVE
-        # floor (PYSEC-2026-175/177/178/179, fixed in 2.13.0). Installing the
-        # SAST scanners into the same env therefore drags a known-vulnerable
-        # pyjwt we don't even ship into the audited set and turns this gate
-        # permanently red. The project alone resolves pyjwt>=2.13.0, so
-        # auditing first keeps the gate honest. Do NOT fold the scanner
-        # install back into the step above.
+        # This audits the project's REAL resolved closure and nothing else.
+        # semgrep==1.163.0 pins mcp==1.23.3, which caps pyjwt at 2.12.1 —
+        # below pyjwt's own CVE floor (PYSEC-2026-175/177/178/179, fixed in
+        # 2.13.0). Installing the SAST scanners into the project's env would
+        # therefore drag a known-vulnerable pyjwt we don't even ship into the
+        # audited set and turn this gate permanently red. The project alone
+        # resolves pyjwt>=2.13.0. So the scanners and pip-audit live in their
+        # own environment ($SECURITY_TOOLS) and pip-audit is pointed at the
+        # project's site-packages with --path. Do NOT install them into the
+        # project's environment.
         #
         # filelock: every advisory whose only fix is filelock >= 4.0 is shown as
         # a warning, not a failure (founder decision 2026-10-29). Thirteen were
@@ -984,7 +1006,9 @@ jobs:
         #     | python -c "import json,sys;print([r for r in json.load(sys.stdin)['info']['requires_dist'] if 'filelock' in r])"
         run: |
           set +e
-          pip-audit --desc --format json --output pip-audit.json
+          "${SECURITY_TOOLS}/bin/pip-audit" \
+            --path "$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
+            --desc --format json --output pip-audit.json
           audit_rc=$?
           set -e
           python - "$audit_rc" <<'PY'
@@ -999,6 +1023,19 @@ jobs:
               sys.exit(f"pip-audit gave no report (exit {audit_rc}): {exc}")
           if audit_rc not in (0, 1):
               sys.exit(f"pip-audit failed (exit {audit_rc})")
+
+          # Fail closed. --path audits whatever it finds under the project's
+          # site-packages; a wrong path (or an empty one) would report "no
+          # vulnerabilities" for nothing at all. These three are base
+          # dependencies of the project, so a report that lacks any of them
+          # did not audit the project's closure.
+          audited = {dep["name"].lower().replace("_", "-") for dep in report.get("dependencies", [])}
+          missing = sorted({"litellm", "jinja2", "cryptography"} - audited)
+          if missing:
+              sys.exit(
+                  "pip-audit report is missing " + ", ".join(missing)
+                  + f" ({len(audited)} packages audited): it did not read the project's environment"
+              )
 
 
           def major(version):
@@ -1026,23 +1063,21 @@ jobs:
           print(f"{len(failing)} failing, {len(allowed)} filelock advisories allowed until the cap lifts")
           sys.exit(1 if failing else 0)
           PY
-      - name: Install SAST scanners
-        run: pip install bandit "semgrep==1.163.0"
       - name: Bandit security scan
-        run: bandit -r fluid_build/ -c pyproject.toml --severity-level medium -q
+        run: '"${SECURITY_TOOLS}/bin/bandit" -r fluid_build/ -c pyproject.toml --severity-level medium -q'
       # Semgrep custom rules — forge-cli repo-specific invariants from
       # CLAUDE.md (deleted-module imports, SQL-safety helper bypass,
       # copilot workspace_root confinement). Generic SAST is CodeQL's job.
       - name: Semgrep custom-rule gate
         env:
           SEMGREP_SEND_METRICS: "off"
-        run: semgrep scan --config .semgrep/fluid-rules.yml --error fluid_build/
+        run: '"${SECURITY_TOOLS}/bin/semgrep" scan --config .semgrep/fluid-rules.yml --error fluid_build/'
       - name: Semgrep SARIF (advisory — code-scanning surface)
         if: always()
         env:
           SEMGREP_SEND_METRICS: "off"
         run: |
-          semgrep scan --config .semgrep/fluid-rules.yml \
+          "${SECURITY_TOOLS}/bin/semgrep" scan --config .semgrep/fluid-rules.yml \
             --sarif --output semgrep.sarif fluid_build/ || true
       - name: Upload Semgrep SARIF
         # Skipped on fork PRs — their GITHUB_TOKEN cannot write

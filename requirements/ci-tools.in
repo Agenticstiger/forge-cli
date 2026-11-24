@@ -1,0 +1,15 @@
+# Source for requirements/ci-tools.txt: the lint, secret-scan, build and test
+# runner tools the CI jobs and the Jenkins runtime script install. Pins that were
+# inline in the workflows move here unchanged. Regenerate with
+# scripts/ci/compile_requirements.sh and review the diff.
+ruff
+black==24.10.0
+detect-secrets==1.5.0
+build
+twine
+uv==0.11.23
+pyyaml>=6.0,!=6.0.4
+pytest
+pytest-cov
+pytest-html
+coverage

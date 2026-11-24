@@ -5,8 +5,11 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "   CLI: Code Quality Analysis"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# Install dependencies
-python3 -m pip install --user --break-system-packages --quiet ruff black
+# Install dependencies. Hash-locked: requirements/ci-tools.in names the tools,
+# ci-tools.txt carries every wheel hash, and --require-hashes refuses anything
+# not in it.
+python3 -m pip install --user --break-system-packages --quiet \
+    --require-hashes -r "$(dirname "$0")/../requirements/ci-tools.txt"
 export PATH="$HOME/.local/bin:$PATH"
 
 # Ruff

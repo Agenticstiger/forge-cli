@@ -703,13 +703,13 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         with:
           node-version: "20"
+      # npm ci installs exactly what scripts/conformance/package-lock.json
+      # records (with integrity hashes) and fails if it disagrees with
+      # package.json. Bump the SDK by editing package.json and re-running
+      # `npm install --package-lock-only` in that directory.
       - name: Install MCP TypeScript SDK + tsx
         if: steps.gate.outputs.enabled == 'true'
-        run: |
-          npm install --no-save \
-            @modelcontextprotocol/sdk \
-            tsx \
-            typescript
+        run: npm ci --prefix scripts/conformance
       - name: TS conformance
         if: steps.gate.outputs.enabled == 'true'
         env:
@@ -720,7 +720,7 @@ jobs:
           POSTGRES_USER: forge_mcp_test
           POSTGRES_PASSWORD: forge_mcp_test_pwd
         run: |
-          npx tsx scripts/conformance/conformance_test.ts \
+          scripts/conformance/node_modules/.bin/tsx scripts/conformance/conformance_test.ts \
             examples/mcp-output-port-docker/contract.fluid.yaml
 
       # ── Go / Rust conformance: DISABLED — see issue #583 ───────────────

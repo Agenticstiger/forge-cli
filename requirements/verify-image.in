@@ -1,0 +1,28 @@
+# Source for requirements/verify-image.txt: what Dockerfile.verify installs.
+# The image is Python 3.12; the bounds below are the ones the Dockerfile carried.
+# pyyaml 6.0.4 is excluded as in pyproject.toml (yaml/pyyaml#953).
+pip
+setuptools
+wheel
+click>=8.1
+pyyaml>=6.0,!=6.0.4
+jsonschema>=4.22
+rich>=13.7
+pydantic>=2.7
+typing-extensions>=4.8
+jinja2>=3.1
+httpx>=0.27
+requests>=2.32.5
+python-dotenv>=1.0
+cryptography>=42.0
+keyring>=24.0
+duckdb>=1.0
+pandas>=2.2
+psycopg[binary]>=3.1
+pytest
+pytest-cov
+# dlt for in-process Python ingestion verification: the runner imports from
+# dlt.sources.sql_database, which only ships under the sql_database extra.
+dlt[postgres,duckdb,sql_database]>=0.5
+pyarrow
+sqlalchemy>=2.0

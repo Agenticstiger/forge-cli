@@ -43,9 +43,9 @@ installation.
 # Python (always present)
 .venv/bin/python -m pytest tests/output_ports/test_extensibility_and_runtime.py -v
 
-# TypeScript
-npm install --no-save @modelcontextprotocol/sdk ts-node typescript
-node --loader ts-node/esm scripts/conformance/conformance_test.ts \
+# TypeScript (installs the versions in scripts/conformance/package-lock.json)
+npm ci --prefix scripts/conformance
+scripts/conformance/node_modules/.bin/tsx scripts/conformance/conformance_test.ts \
   examples/mcp-output-port-docker/contract.fluid.yaml
 
 # Go

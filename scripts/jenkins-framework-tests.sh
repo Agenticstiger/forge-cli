@@ -10,8 +10,10 @@ cd "$(dirname "$0")/.." || exit 1
 CLI_ROOT=$(pwd)
 
 # Install test dependencies
+# Hash-locked: requirements/ci-tools.in names the tools, ci-tools.txt carries
+# every wheel hash, and --require-hashes refuses anything not in it.
 python3 -m pip install --user --break-system-packages --quiet \
-    pytest pytest-cov coverage pytest-html
+    --require-hashes -r "${CLI_ROOT}/requirements/ci-tools.txt"
 export PATH="$HOME/.local/bin:$PATH"
 
 # Create output directories

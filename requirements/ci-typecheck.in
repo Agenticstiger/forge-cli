@@ -1,0 +1,6 @@
+# Source for requirements/ci-typecheck.txt: the strict type-check gate runs in a
+# bare environment (mypy and stubs, no project install), so every third-party
+# module is Any there. Keep this file to mypy and stub packages only.
+# Regenerate with scripts/ci/compile_requirements.sh.
+mypy>=1.10
+types-PyYAML

@@ -5,9 +5,11 @@ on:
     - cron: '0 6 * * 1'  # Every Monday at 6am UTC
   workflow_dispatch: {}  # Manual trigger via GitHub UI
 
-# `contents: write` to push the proposal branch, and nothing else.
+# Read-only by default. The one job that pushes the proposal branch asks for
+# `contents: write` itself, below, so a step added to any other job later
+# cannot inherit write access to the repository.
 #
-# `pull-requests: write` used to be here for peter-evans/create-pull-request.
+# `pull-requests: write` used to be granted for peter-evans/create-pull-request.
 # It never worked: this repository has `can_approve_pull_request_reviews:
 # false`, so every run ended with
 #
@@ -18,11 +20,14 @@ on:
 # a branch and a human opens the pull request, so Actions is never granted
 # rights to create one.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   update-catalog:
     runs-on: ubuntu-latest
+    # Pushes auto/update-model-catalog with the checkout's token; nothing else.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
