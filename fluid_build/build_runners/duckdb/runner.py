@@ -622,8 +622,106 @@ def _build_copy_destination(
 
 
 #: The reader that reads a sink format back, for the union rewrite of an appended file.
-#: json sinks still replace the file: re-reading them re-infers types.
-_SINK_READERS = {"parquet": "read_parquet", "csv": "read_csv"}
+#: json is read with the expose's declared column types, never re-inferred.
+_SINK_READERS = {
+    "parquet": "read_parquet",
+    "csv": "read_csv",
+    "json": "read_json",
+    "ndjson": "read_json",
+}
+
+_JSON_INT_TYPES = {
+    "tinyint": "TINYINT",
+    "smallint": "SMALLINT",
+    "int2": "SMALLINT",
+    "int": "INTEGER",
+    "integer": "INTEGER",
+    "int4": "INTEGER",
+    "int32": "INTEGER",
+    "bigint": "BIGINT",
+    "long": "BIGINT",
+    "longint": "BIGINT",
+    "int8": "BIGINT",
+    "int64": "BIGINT",
+}
+_JSON_SIMPLE_TYPES = {
+    **dict.fromkeys(
+        ("string", "text", "varchar", "nvarchar", "char", "nchar", "character", "clob"), "VARCHAR"
+    ),
+    **_JSON_INT_TYPES,
+    **dict.fromkeys(("float", "float4", "float32", "real"), "FLOAT"),
+    **dict.fromkeys(("double", "float8", "float64", "double precision"), "DOUBLE"),
+    **dict.fromkeys(("boolean", "bool"), "BOOLEAN"),
+    "date": "DATE",
+    "time": "TIME",
+    "uuid": "UUID",
+    **dict.fromkeys(("timestamp", "datetime", "timestamp_ntz", "timestampntz"), "TIMESTAMP"),
+    **dict.fromkeys(("timestamptz", "timestamp_tz", "timestamp_ltz"), "TIMESTAMPTZ"),
+}
+
+
+@dataclass
+class JsonAppendSchemaError(FluidUserError):
+    """``incremental_append`` to a json sink needs the expose's declared column types."""
+
+    code: str = "incremental_append_json_needs_schema"
+
+
+def _json_column_type(column: str, declared: str) -> str:
+    """The DuckDB type of a declared FLUID column type, or a refusal (never a guess)."""
+    from fluid_build.util.column_type import split_type_params
+
+    base, params = split_type_params(str(declared).lower())
+    base = " ".join(base.split())
+    if base in ("decimal", "dec", "numeric", "number"):
+        match = re.fullmatch(r"\s*(\d{1,2})\s*(?:,\s*(\d{1,2})\s*)?", params or "")
+        if match and int(match.group(1)) <= 38 and int(match.group(2) or 0) <= int(match.group(1)):
+            return f"DECIMAL({int(match.group(1))},{int(match.group(2) or 0)})"
+    elif params is None and base in _JSON_SIMPLE_TYPES:
+        return _JSON_SIMPLE_TYPES[base]
+    elif params is not None and base in ("varchar", "char", "nvarchar", "nchar", "string"):
+        return "VARCHAR"
+    elif base == "timestamp with time zone":
+        return "TIMESTAMPTZ"
+    elif base == "timestamp without time zone":
+        return "TIMESTAMP"
+    raise JsonAppendSchemaError(
+        what=f"incremental_append to a json sink cannot read column '{column}' back as {declared}",
+        why=(
+            "DuckDB's COPY cannot append to one file, so the runner rewrites it, and it reads "
+            "the old rows with the declared column types rather than re-inferring them. This "
+            "type has no DuckDB type the runner is sure of."
+        ),
+        fix="Declare the column as string, a number, boolean, date, time, timestamp or "
+        "decimal(p,s), or land to parquet or csv.",
+        doc=doc_url(),
+        code="incremental_append_json_unmapped_type",
+    )
+
+
+def _json_append_columns(ctx: RunContext) -> Dict[str, str]:
+    """``{column: DuckDB type}`` for the expose a json ``incremental_append`` lands."""
+    expose = _build_expose(ctx) or {}
+    contract = expose.get("contract") if isinstance(expose.get("contract"), dict) else {}
+    columns = {
+        str(c["name"]): _json_column_type(str(c["name"]), c.get("type") or "")
+        for c in (contract.get("schema") or [])
+        if isinstance(c, dict) and c.get("name")
+    }
+    if not columns:
+        raise JsonAppendSchemaError(
+            what="incremental_append to a json sink needs the expose to declare contract.schema",
+            why=(
+                "DuckDB's COPY cannot append to one file, so each run rewrites it with the old "
+                "rows read back. Without declared column types a timestamp, a decimal or a "
+                "zero-padded id would be re-inferred and changed."
+            ),
+            fix="Declare the expose's contract.schema (name and type per column), or land to "
+            "parquet or csv.",
+            doc=doc_url(),
+            where=str(expose.get("exposeId") or ""),
+        )
+    return columns
 
 
 def _remove_quietly(path: str) -> None:
@@ -659,7 +757,13 @@ def _appends_to_file(ctx: RunContext, out_path: str, fmt: str, partitioned: Any)
     )
 
 
-def _union_rewrite(con: Any, out_path: str, fmt: str, new_relation: str) -> None:
+def _union_rewrite(
+    con: Any,
+    out_path: str,
+    fmt: str,
+    new_relation: str,
+    json_columns: Optional[Dict[str, str]] = None,
+) -> None:
     """Rewrite ``out_path`` as its rows plus those of ``new_relation`` (a table or view).
 
     DuckDB's ``COPY`` cannot append to one file, so the union goes to a temp file in
@@ -681,6 +785,45 @@ def _union_rewrite(con: Any, out_path: str, fmt: str, new_relation: str) -> None
             for n in names
         )
         new = f"SELECT {cols} FROM {new_relation}"
+    elif fmt in ("json", "ndjson"):
+        declared = json_columns or {}
+        names = [d[0] for d in con.execute(f"SELECT * FROM {new_relation} LIMIT 0").description]
+        unknown = [n for n in names if n not in declared]
+        if unknown:
+            raise JsonAppendSchemaError(
+                what=f"column '{unknown[0]}' is landed but not declared in contract.schema",
+                why="The old rows are read back by the declared columns, so an undeclared "
+                "column would be dropped from the file.",
+                fix="Declare every landed column in the expose's contract.schema.",
+                doc=doc_url(),
+                code="incremental_append_json_undeclared_column",
+            )
+        # A column the old file holds and the schema no longer declares would be dropped by
+        # the typed read below: refuse before the file is rewritten (names only; the types
+        # always come from the declaration).
+        try:
+            old_names = [
+                r[0]
+                for r in con.execute(f"DESCRIBE SELECT * FROM read_json_auto({path})").fetchall()
+            ]
+        except Exception:  # noqa: BLE001 - an empty or unreadable old file: the read below decides
+            old_names = []
+        dropped = [n for n in old_names if n not in declared]
+        if dropped:
+            raise JsonAppendSchemaError(
+                what=f"the file already holds column '{dropped[0]}', which contract.schema does not declare",
+                why="The old rows are read back by the declared columns, so the rewrite would "
+                "silently drop that column from every earlier row.",
+                fix="Declare the column in the expose's contract.schema, or move the file aside.",
+                doc=doc_url(),
+                code="incremental_append_json_undeclared_column",
+            )
+        spec = ", ".join(f"{quote_ansi_string_literal(n)}: '{t}'" for n, t in declared.items())
+        old = (
+            f"SELECT * FROM read_json({path}, format = 'newline_delimited', "
+            f"columns = {{{spec}}})"
+        )
+        new = f"SELECT * FROM {new_relation}"
     else:
         old = f"SELECT * FROM read_parquet({path})"
         new = f"SELECT * FROM {new_relation}"
@@ -694,12 +837,18 @@ def _union_rewrite(con: Any, out_path: str, fmt: str, new_relation: str) -> None
         raise
 
 
-def _append_to_file(con: Any, out_path: str, fmt: str, landed_sel: str) -> Tuple[int]:
+def _append_to_file(
+    con: Any,
+    out_path: str,
+    fmt: str,
+    landed_sel: str,
+    json_columns: Optional[Dict[str, str]] = None,
+) -> Tuple[int]:
     """Append the rows of ``landed_sel`` to the existing file; returns ``(rows appended,)``."""
     con.execute(f"CREATE OR REPLACE TEMP TABLE __fl_append_new AS {landed_sel}")
     try:
         count = first_row(con.execute("SELECT COUNT(*) FROM __fl_append_new"))
-        _union_rewrite(con, out_path, fmt, "__fl_append_new")
+        _union_rewrite(con, out_path, fmt, "__fl_append_new", json_columns)
         return (int(count[0]) if count else 0,)
     finally:
         con.execute("DROP TABLE IF EXISTS __fl_append_new")
@@ -1356,7 +1505,13 @@ def _enforce_late_arrival_split(
                 and late_path_obj.is_file()
             ):
                 # An earlier run's late rows stay: this run's join them.
-                _union_rewrite(con, str(late_path_obj), fmt, "__la_side")
+                _union_rewrite(
+                    con,
+                    str(late_path_obj),
+                    fmt,
+                    "__la_side",
+                    _json_append_columns(ctx) if fmt in ("json", "ndjson") else None,
+                )
             else:
                 con.execute(f"COPY __la_side TO {quoted_late} ({writer_func})")
             con.execute(f"COPY __la_main TO {quoted_main} ({writer_func})")
@@ -1760,6 +1915,17 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
         started_at = emit_start_lineage_event(ctx)
         return _refused_run(ctx, streams_to_run, started_at, time.time(), refused_layout)
     partition_by = _partition_columns(ctx)
+    # A json append reads the old rows back by declared type: refuse before any write
+    # (and before the run opens) when the expose declares none.
+    json_columns: Optional[Dict[str, str]] = None
+    if (
+        ctx.source.mode is AcquisitionMode.INCREMENTAL_APPEND
+        and (ctx.sink.format or "parquet").lower() in ("json", "ndjson")
+        and not partition_by
+        and _bigquery_target(ctx) is None
+        and not _is_databricks_binding(ctx)
+    ):
+        json_columns = _json_append_columns(ctx)
 
     # Shared run-opening chokepoint: timestamp + schema-evolution gate +
     # duration clock + the OpenLineage START event. duckdb previously
@@ -1899,7 +2065,7 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                 # changed since, and a table holding exactly what the COPY
                 # wrote then failed verify against the larger number.
                 if _appends_to_file(ctx, out_path, sink_format, partitioned):
-                    written = _append_to_file(con, out_path, sink_format, landed_sel)
+                    written = _append_to_file(con, out_path, sink_format, landed_sel, json_columns)
                 else:
                     written = first_row(con.execute(copy_sql))
                 if partitioned is not None:

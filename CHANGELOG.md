@@ -50,8 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the main file; a run with no late rows leaves it alone. **Behaviour change:** each such run now
   reads and rewrites the whole file (DuckDB has no single-file append), and a failure between the
   file write and the cursor write lands the batch again on the retry (the append is
-  at-least-once; the old overwrite was idempotent). A json or ndjson sink still replaces the file:
-  reading it back re-infers types.
+  at-least-once; the old overwrite was idempotent). A json or ndjson file is unioned the same way,
+  with the old rows read back by the expose's declared `contract.schema` types (nothing is
+  re-inferred): an expose with no declared schema is refused before anything is written
+  (`incremental_append_json_needs_schema`), as are a column type with no DuckDB equivalent
+  (`incremental_append_json_unmapped_type`) and a landed or already stored column the schema does
+  not declare (`incremental_append_json_undeclared_column`).
 - **`--mode amend-and-build` lands each local SQL build in its own expose.** Every build was
   handed `exposes[0]`, so with two `engine: sql` builds the second overwrote the first build's
   file and its own expose was never written, exit 0. A build now writes the exposes its `outputs`

@@ -21,6 +21,7 @@ duckdb = pytest.importorskip("duckdb")
 
 from fluid_build.build_runners.duckdb import runner as runner_mod  # noqa: E402
 from fluid_build.build_runners.duckdb.runner import (  # noqa: E402
+    JsonAppendSchemaError,
     _union_rewrite,
     execute_duckdb_build,
 )
@@ -223,3 +224,144 @@ def test_csv_text_columns_round_trip_verbatim(tmp_path, old_ids):
     assert _run(tmp_path, contract) == 0
     text = (tmp_path / "lake" / "events.csv").read_text()
     assert all(f"{v}," in text for v in (*old_ids, "5"))
+
+
+# ── json and ndjson: the old rows are read back by the declared types ────────
+
+JSON_SCHEMA = [
+    {"name": "seq", "type": "bigint"},
+    {"name": "event_time", "type": "timestamp"},
+    {"name": "amount", "type": "decimal(10,2)"},
+    {"name": "zip", "type": "string"},
+]
+RUN1 = "(1::BIGINT, TIMESTAMP '2024-01-01 12:00:00', 1.50::DECIMAL(10,2), '01234')"
+RUN2 = "(2::BIGINT, TIMESTAMP '2024-01-01 12:01:00', 20.00::DECIMAL(10,2), '007')"
+
+
+def _json_contract(tmp_path: Path, fmt: str, *, schema=JSON_SCHEMA, lateness=False):
+    contract = _contract(tmp_path, fmt, lateness=lateness)
+    source = contract["builds"][0]["properties"]["source"]
+    source.update(
+        {
+            "connection": {"uri": str(tmp_path / "events.parquet")},
+            "reader": {"format": "parquet"},
+        }
+    )
+    contract["exposes"][0]["contract"]["schema"] = schema
+    return contract
+
+
+def _land(tmp_path: Path, *rows: str) -> None:
+    con = duckdb.connect()
+    try:
+        con.execute(
+            f"COPY (SELECT * FROM (VALUES {', '.join(rows)}) t(seq, event_time, amount, zip)) "
+            f"TO '{tmp_path / 'events.parquet'}' (FORMAT 'parquet')"
+        )
+    finally:
+        con.close()
+
+
+def _typed_rows(path: Path):
+    con = duckdb.connect()
+    try:
+        return con.execute(
+            "SELECT seq, CAST(event_time AS VARCHAR), CAST(amount AS VARCHAR), zip, "
+            "typeof(event_time), typeof(amount) FROM read_json("
+            f"'{path}', format = 'newline_delimited', columns = {{'seq': 'BIGINT', "
+            "'event_time': 'TIMESTAMP', 'amount': 'DECIMAL(10,2)', 'zip': 'VARCHAR'}) "
+            "ORDER BY seq"
+        ).fetchall()
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_json_sinks_keep_both_runs_with_declared_types(tmp_path, fmt):
+    contract = _json_contract(tmp_path, fmt)
+    _land(tmp_path, RUN1)
+    assert _run(tmp_path, contract) == 0
+    _land(tmp_path, RUN1, RUN2)
+    assert _run(tmp_path, contract) == 0
+    target = tmp_path / "lake" / f"events.{fmt}"
+    assert _typed_rows(target) == [
+        (1, "2024-01-01 12:00:00", "1.50", "01234", "TIMESTAMP", "DECIMAL(10,2)"),
+        (2, "2024-01-01 12:01:00", "20.00", "007", "TIMESTAMP", "DECIMAL(10,2)"),
+    ]
+    assert '"zip":"01234"' in target.read_text()
+    assert sorted(p.name for p in target.parent.iterdir()) == [f"events.{fmt}"]
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_a_corrupt_old_json_file_stays_and_leaves_no_temp(tmp_path, fmt):
+    target = tmp_path / f"t.{fmt}"
+    target.write_bytes(b"{not json")
+    con = duckdb.connect()
+    try:
+        con.execute("CREATE TABLE new_rows AS SELECT 2 AS seq")
+        with pytest.raises(Exception):  # noqa: B017 - the corrupt old file fails the COPY
+            _union_rewrite(con, str(target), fmt, "new_rows", {"seq": "BIGINT"})
+    finally:
+        con.close()
+    assert target.read_bytes() == b"{not json"
+    assert os.listdir(tmp_path) == [f"t.{fmt}"]
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_an_old_json_column_the_schema_no_longer_declares_is_refused_not_dropped(tmp_path, fmt):
+    target = tmp_path / f"t.{fmt}"
+    old_rows = b'{"seq":1,"legacy":"keep me"}\n'
+    target.write_bytes(old_rows)
+    con = duckdb.connect()
+    try:
+        con.execute("CREATE TABLE new_rows AS SELECT 2 AS seq")
+        with pytest.raises(JsonAppendSchemaError) as caught:
+            _union_rewrite(con, str(target), fmt, "new_rows", {"seq": "BIGINT"})
+    finally:
+        con.close()
+    assert caught.value.code == "incremental_append_json_undeclared_column"
+    assert "legacy" in caught.value.what
+    assert target.read_bytes() == old_rows
+    assert os.listdir(tmp_path) == [f"t.{fmt}"]
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+@pytest.mark.parametrize("schema", [[], None])
+def test_a_json_append_without_a_declared_schema_is_refused_before_any_write(tmp_path, fmt, schema):
+    contract = _json_contract(tmp_path, fmt)
+    if schema is None:
+        del contract["exposes"][0]["contract"]["schema"]
+    else:
+        contract["exposes"][0]["contract"]["schema"] = schema
+    _land(tmp_path, RUN1)
+    with pytest.raises(JsonAppendSchemaError) as caught:
+        _run(tmp_path, contract)
+    assert caught.value.code == "incremental_append_json_needs_schema"
+    assert not (tmp_path / "lake").exists()
+
+
+def test_a_json_type_with_no_duckdb_mapping_is_refused(tmp_path):
+    schema = JSON_SCHEMA[:3] + [{"name": "zip", "type": "geometry"}]
+    contract = _json_contract(tmp_path, "json", schema=schema)
+    _land(tmp_path, RUN1)
+    with pytest.raises(JsonAppendSchemaError) as caught:
+        _run(tmp_path, contract)
+    assert caught.value.code == "incremental_append_json_unmapped_type"
+    assert not (tmp_path / "lake").exists()
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_json_late_events_keep_both_runs_late_rows(tmp_path, fmt):
+    contract = _json_contract(tmp_path, fmt, lateness=True)
+
+    def row(seq: int, at: str) -> str:
+        return f"({seq}::BIGINT, TIMESTAMP '2024-01-01 {at}', 1.50::DECIMAL(10,2), '0{seq}')"
+
+    run1 = [row(1, "12:00:00"), row(2, "11:00:00")]
+    _land(tmp_path, *run1)
+    assert _run(tmp_path, contract) == 0
+    _land(tmp_path, *run1, row(3, "12:10:00"), row(4, "11:20:00"))
+    assert _run(tmp_path, contract) == 0
+    lake = tmp_path / "lake"
+    assert [r[0] for r in _typed_rows(lake / f"events__late_events.{fmt}")] == [2, 4]
+    assert [r[0] for r in _typed_rows(lake / f"events.{fmt}")] == [1, 3]
