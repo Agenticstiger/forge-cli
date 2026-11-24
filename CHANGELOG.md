@@ -76,6 +76,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   integer destination settings, and the type of a named destination whose credentials the project
   itself supplies. What the operator sets (shell, CI, `.dlt` files) applies as before. Behaviour
   change.
+- **A pinned database attach hides this host's mysql and MariaDB client variables too.** During
+  a pinned attach (the duckdb build runner and `fluid init --discover`) `MYSQL_USER`,
+  `MYSQL_DATABASE`, `MARIADB_UNIX_PORT`, `MYSQL_HOME`, `MARIADB_HOME`, `LIBMYSQL_PLUGINS`,
+  `LIBMYSQL_PLUGIN_DIR`, `MARIADB_PLUGIN_DIR`, `MYSQL_DEBUG`,
+  `MARIADB_TLS_DISABLE_PEER_VERIFICATION`, `USER`, `LOGNAME` and `LOGIN` are hidden as well and
+  restored afterwards. Behaviour change: a mysql source with no `user` in the contract no longer
+  takes the login name from `USER`, `LOGNAME` or `LOGIN`. libpq's `require_auth` is not set: the
+  libpq bundled in duckdb 1.5.1's postgres extension predates it (it needs libpq 16).
 
 ## [0.39.0] — 2026-11-23
 

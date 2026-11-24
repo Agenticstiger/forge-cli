@@ -450,6 +450,20 @@ class TestHostCredentialEnvSuppression:
         "MYSQL_TCP_PORT": "3307",
         "MYSQL_UNIX_PORT": "/fake/host/mysqld.sock",
         "MYSQL_GROUP_SUFFIX": "_fakehost",
+        # The rest of the mysql / MariaDB client's environment.
+        "MYSQL_USER": "fake-host-user",
+        "MYSQL_DATABASE": "fake_host_db",
+        "MARIADB_UNIX_PORT": "/fake/host/mariadb.sock",
+        "MYSQL_HOME": "/fake/host/mysql-home",
+        "MARIADB_HOME": "/fake/host/mariadb-home",
+        "LIBMYSQL_PLUGINS": "fake_plugin",
+        "LIBMYSQL_PLUGIN_DIR": "/fake/host/plugins",
+        "MARIADB_PLUGIN_DIR": "/fake/host/mariadb-plugins",
+        "MYSQL_DEBUG": "d:t:O,/fake/host/trace",
+        "MARIADB_TLS_DISABLE_PEER_VERIFICATION": "1",
+        # The user name Connector/C takes when the DSN names none.
+        "USER": "fake-host-login",
+        "LOGNAME": "fake-host-login",
     }
 
     @pytest.mark.parametrize("name", sorted(_CREDENTIAL_VARS))
