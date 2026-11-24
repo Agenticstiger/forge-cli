@@ -537,6 +537,16 @@ def plan_follow_release(
                 l1 = squared = 0
             if squared:
                 cap = None if followed is None else followed.max_children
+                if followed is not None and cap + 1 > selection.MOST_RELEASE_CELLS:
+                    # One bin for each count from 0 to the cap; refuse before the edges are built.
+                    raise _refuse(
+                        "profile_release_too_many_cells",
+                        f"--follow {followed.spec.text()} asks for {cap + 1:,} bins of children "
+                        f"per parent, more than the {selection.MOST_RELEASE_CELLS:,} cells a "
+                        "release may measure",
+                        "lower the cap of that --follow entry, or leave the relationship's "
+                        "histogram out of the request",
+                    )
                 edges = tuple(range(cap + 2)) if cap is not None else CHILDREN_LADDER
                 base = RelationStat(
                     each.parent,

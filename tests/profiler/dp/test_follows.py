@@ -320,6 +320,14 @@ def test_the_bins_of_children_per_parent_are_the_caps_or_a_public_ladder():
     assert by["relationship/product.product_id/invoice.product_id"].edges == fr.CHILDREN_LADDER
 
 
+def test_a_cap_with_more_bins_than_the_cell_limit_refuses_naming_the_entry():
+    entry = "account.id=invoice.account_id:1000000000"
+    with pytest.raises(release.ReleaseRefused) as refused:
+        fd.plan(follows=(entry, fd.FOLLOW_LINES))
+    assert refused.value.event == "profile_release_too_many_cells"
+    assert entry in str(refused.value)
+
+
 def test_a_count_beyond_the_ladder_refuses_naming_the_relationship_only():
     plan = fd.plan()
     relation = next(
