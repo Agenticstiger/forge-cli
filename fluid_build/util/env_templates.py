@@ -1036,13 +1036,15 @@ def _builds_of(contract: Mapping[str, Any]) -> List[_Block]:
 #: ``source``: merged into the config of the connector that reads (Debezium's ``extra_config``, over
 #: the settings derived from the source block). ``sink``: merged into the config of the connector that
 #: writes, over the settings derived from the sink block and the exposes (Kafka Connect's
-#: ``sink_connector_config``, Debezium Server's ``sink.config``, Meltano's ``target_config``).
+#: ``sink_connector_config`` and ``iceberg_catalog_overrides``, which is forwarded last so that it
+#: wins, Debezium Server's ``sink.config``, Meltano's ``target_config``).
 #: ``own``: sent as it is, in place of anything derived, so judged on its own (Airbyte's
 #: ``destination_config``).
 _ENGINE_MAPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("source", ("debezium", "extra_config")),
     ("sink", ("debezium", "server", "sink", "config")),
     ("sink", ("kafka-connect", "sink_connector_config")),
+    ("sink", ("kafka-connect", "iceberg_catalog_overrides")),
     ("sink", ("meltano", "target_config")),
     ("own", ("airbyte", "destination_config")),
 )

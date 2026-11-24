@@ -1172,6 +1172,7 @@ _MAPS = [
     ("debezium", ("debezium", "extra_config")),
     ("debezium", ("debezium", "server", "sink", "config")),
     ("kafka-connect", ("kafka-connect", "sink_connector_config")),
+    ("kafka-connect", ("kafka-connect", "iceberg_catalog_overrides")),
     ("meltano", ("meltano", "target_config")),
     ("airbyte", ("airbyte", "destination_config")),
 ]
