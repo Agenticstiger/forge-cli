@@ -252,6 +252,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as written, `fluid status` among them, read it as before.
 - **A payload with `$ref` keys of its own:** write them `$$ref` instead of keeping the payload as a
   string.
+- **An embedded Debezium Server no longer reads the install's own `config/application.properties`.**
+  The server starts in a directory forge owns, whose `config/application.properties` is forge's
+  file; the install's `config/application.*` files are not linked there. Put an operator setting
+  that lived in the install's file and that forge's file does not set, such as a log level or the
+  HTTP port, in the environment fluid runs in (`QUARKUS_LOG_LEVEL`, `QUARKUS_HTTP_PORT`) or in
+  `JAVA_OPTS` (`-Dquarkus.log.level=DEBUG`).
 
 ## [0.40.1] — 2026-11-24
 
