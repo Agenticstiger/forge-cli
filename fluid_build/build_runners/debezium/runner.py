@@ -1018,8 +1018,9 @@ def _launch_directory(real_binary: Path) -> Optional[Path]:
         for candidate in install_dir.glob(_RUNNER_JAR_GLOB):
             if candidate.is_file():
                 return install_dir
-    except OSError:
-        pass
+    except OSError as exc:
+        # A directory that cannot be listed holds no jar to link: forge's file alone is laid out.
+        LOG.debug("debezium.install_dir.unreadable dir=%s err=%s", install_dir, exc)
     return None
 
 
@@ -1128,8 +1129,14 @@ def _migrate_project_offsets(project_dir: Path, offsets_path: Path) -> None:
         if created:
             try:
                 os.unlink(offsets_path)
-            except OSError:
-                pass
+            except OSError as unlink_exc:
+                # Not fatal, but the next run would read the partial copy: say where it is.
+                LOG.warning(
+                    "debezium.offsets.partial_copy_left path=%s err=%s (delete it before the "
+                    "next run)",
+                    offsets_path,
+                    unlink_exc,
+                )
         LOG.warning("debezium.offsets.migrate_failed from=%s to=%s err=%s", old, offsets_path, exc)
         return
     LOG.info("debezium.offsets.migrated from=%s to=%s (old file left in place)", old, offsets_path)

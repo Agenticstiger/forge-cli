@@ -340,7 +340,7 @@ def _no_target_message(config: FluidConfig, contract: str = "contract.fluid.yaml
     """
     import shlex
 
-    import fluid_build.providers.catalogs  # noqa: F401  (registers every backend)
+    import fluid_build.build_runners.catalog_registrars  # noqa: F401  (registers every backend)
     from fluid_build.api.catalog_backend import all_catalog_backend_specs
 
     names = sorted(
@@ -377,7 +377,7 @@ def _command_center_disabled(catalog_name: str) -> bool:
 
 
 def _command_center_disabled_result(catalog_name: str, asset_id: str) -> "PublishResult":
-    from fluid_build.cli.publish import PublishResult
+    from fluid_build.providers.catalogs import PublishResult
 
     return PublishResult(
         success=False,

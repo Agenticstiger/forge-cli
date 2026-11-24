@@ -50,9 +50,7 @@ ALLOWLIST = "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST"
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
-    import fluid_build.credentials as credentials_pkg
-
-    monkeypatch.setattr(credentials_pkg, "_adapters", {})
+    monkeypatch.setattr("fluid_build.credentials._adapters", {})
     before = hermetic_env(monkeypatch, tmp_path / "home")
     refuse_outbound_dns(monkeypatch)
     reset_dotenv_load_log()
@@ -758,9 +756,8 @@ def test_acquisition_path_takes_only_the_environment_for_a_contract_account(
 
 
 def _interactive(monkeypatch: pytest.MonkeyPatch) -> None:
-    import fluid_build.providers.snowflake.util.config as config
-
-    monkeypatch.setattr(config.os, "isatty", lambda _fd: True)
+    # config.py asks os.isatty(0) whether a browser sign-in could run here.
+    monkeypatch.setattr("os.isatty", lambda _fd: True)
 
 
 @pytest.mark.parametrize(
