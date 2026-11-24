@@ -1660,17 +1660,29 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         # A variable the expose names that is unset or empty here is that expose's result, as any
         # other failure to look is: the strict resolver would otherwise end the whole run, and
         # lose the other exposes' results and the --out report.
-        from fluid_build.util.env_templates import missing_fields
-
-        unset = missing_fields(
-            {key: expose_config.get(key) for key in ("binding", "location", "properties")}
+        from fluid_build.util.env_templates import (
+            SENSITIVE_RENDER,
+            EnvTemplateError,
+            render_contract,
         )
-        if unset:
+
+        try:
+            # The keys verify reads, rendered as the readers render them (a credential-shaped
+            # name too), only to see whether one of them names a variable nobody set.
+            render_contract(
+                {
+                    key: expose_config.get(key)
+                    for key in ("binding", "location", "properties", "path")
+                },
+                sensitive=SENSITIVE_RENDER,
+                strip=False,
+            )
+        except EnvTemplateError as exc:
             results[expose_name] = {
                 "status": "error",
                 "error": (
                     "the expose names {{ env.NAME }} variables that are unset or empty here: "
-                    + ", ".join(unset)
+                    + ", ".join(exc.extras.get("missing", []))
                     + ". Export them where fluid verify runs, as fluid apply needs them"
                 ),
                 "exists": False,

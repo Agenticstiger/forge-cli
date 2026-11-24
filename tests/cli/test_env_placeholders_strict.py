@@ -210,6 +210,9 @@ def test_verify_makes_an_unset_variable_that_exposes_result_and_checks_the_rest(
     or the --out report."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "data.csv").write_text("id,name\n1,a\n", encoding="utf-8")
+    monkeypatch.delenv("DATA_KEY_DIR", raising=False)
+    monkeypatch.delenv("OUTDIR", raising=False)
+    schema = {"schema": [{"name": "id", "type": "integer", "required": True}]}
     doc = {
         **_BASE,
         "exposes": [
@@ -218,9 +221,24 @@ def test_verify_makes_an_unset_variable_that_exposes_result_and_checks_the_rest(
                 "kind": "table",
                 "version": "1.0.0",
                 "binding": {"platform": "local", "format": "csv", "location": {"path": path}},
-                "contract": {"schema": [{"name": "id", "type": "integer", "required": True}]},
+                "contract": schema,
             }
-            for expose_id, path in (("unset_one", "{{ env.DIR }}/x.csv"), ("fine_one", "data.csv"))
+            for expose_id, path in (
+                ("unset_one", "{{ env.DIR }}/x.csv"),
+                ("credential_shaped", "{{ env.DATA_KEY_DIR }}/x.csv"),
+                ("fine_one", "data.csv"),
+            )
+        ]
+        # the older dialect: the path beside the format, no binding
+        + [
+            {
+                "exposeId": "legacy",
+                "kind": "table",
+                "version": "1.0.0",
+                "format": "csv",
+                "path": "{{ env.OUTDIR }}/x.csv",
+                "contract": schema,
+            }
         ],
     }
     contract = tmp_path / "two.fluid.yaml"
@@ -230,10 +248,15 @@ def test_verify_makes_an_unset_variable_that_exposes_result_and_checks_the_rest(
     rc, shown = _run(["verify", str(contract), "--out", str(report)], capsys)
 
     assert rc == 1
-    assert "unset_one" in shown and "DIR" in shown and "fine_one" in shown
+    assert all(name in shown for name in ("unset_one", "credential_shaped", "legacy", "fine_one"))
+    assert "DIR" in shown and "DATA_KEY_DIR" in shown and "OUTDIR" in shown
     assert report.exists()
-    results = json.loads(report.read_text())
-    assert "fine_one" in json.dumps(results) and "unset_one" in json.dumps(results)
+    results = json.loads(report.read_text())["results"]
+    assert set(results) == {"unset_one", "credential_shaped", "legacy", "fine_one"}
+    assert results["fine_one"].get("status") != "error"
+    assert all(
+        results[name]["status"] == "error" for name in ("unset_one", "credential_shaped", "legacy")
+    )
 
 
 # ── readers of a local path ────────────────────────────────────────────────

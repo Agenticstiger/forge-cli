@@ -368,3 +368,14 @@ def test_a_variable_of_only_blanks_is_missing_too(blank):
         render_contract({"bucket": "{{ env.B }}"}, environ={"B": blank})
     assert missing_fields({"bucket": "{{ env.B }}"}, environ={"B": blank}) == {"B": ["bucket"]}
     assert render_contract("{{ env.B }}", unset=UNSET_DEFER, environ={"B": blank}) == "{{ env.B }}"
+
+
+def test_blanks_are_a_value_where_the_string_is_not_stripped():
+    """A build's ``delimiter: "{{ env.CSV_DELIM }}"`` may be a space: nothing strips it there."""
+    assert render_contract("a{{ env.D }}b", environ={"D": " "}, strip=False) == "a b"
+
+
+def test_a_query_string_in_a_host_field_is_not_a_keyword_connection_string():
+    where = {"host": "{{ env.REGION }}.attacker.example?a=b"}
+    with pytest.raises(EnvTemplateError):
+        check_host_templates(where, environ={"REGION": "eu"})

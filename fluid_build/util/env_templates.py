@@ -81,10 +81,10 @@ _PATHS_SHOWN = 6
 _DEFAULT_LOG = logging.getLogger("fluid.env_templates")
 
 
-def _has_value(value: Optional[str]) -> bool:
-    """Whether a variable holds something: not unset, not empty, not only blanks (which the
-    ``.strip()`` of a rendered string would turn into an empty name)."""
-    return value is not None and bool(value.strip())
+def _has_value(value: Optional[str], strip: bool = True) -> bool:
+    """Whether a variable holds something: not unset, not empty and, where the rendered string
+    is stripped, not only blanks (which the ``.strip()`` would turn into an empty name)."""
+    return value is not None and bool(value.strip() if strip else value)
 
 
 @dataclass
@@ -233,7 +233,7 @@ def render_contract(
                 refuse_sensitive(name)
                 return match.group(0)
             rendered = env.get(name)
-            if rendered is not None and _has_value(rendered):
+            if _has_value(rendered, strip):
                 return rendered
             missing.setdefault(name, []).append(where)
             return match.group(0)
@@ -328,10 +328,11 @@ def _authority_of(text: str, url: Optional["re.Match[str]"]) -> Optional[str]:
     body = text.strip()
     if body.startswith("//"):
         body = body[2:]
-    if "=" in body:
-        keyword = _KEYWORD_HOST.search(body)
+    head = body[: _authority_end(body, 0)]
+    if "=" in head:  # a keyword/value connection string: ``host=db1 dbname=x``
+        keyword = _KEYWORD_HOST.search(head)
         return keyword.group(1) if keyword else None
-    return body[: _authority_end(body, 0)]
+    return head
 
 
 def _host_refusal(
