@@ -224,6 +224,7 @@ def test_the_clique_selection_states_the_method_the_producer_and_the_share(mixed
 
 
 def test_the_producer_names_the_opendp_version_that_ran(monkeypatch):
+    need("opendp")  # the producer names the OpenDP version installed
     plan = ranked.plan()
     drawn = ranked.draw(
         plan, data.orders(), cliques=None, select=lambda *a, **k: MIXED, structure=run.keep

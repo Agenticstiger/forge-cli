@@ -18,6 +18,7 @@ from fluid_build.profiler.dp import release
 from fluid_build.profiler.dp.follows import parse_follow, plan_follows
 from tests.profiler._fake_backend import FakeBackend
 from tests.profiler.dp import _follow_data as fd
+from tests.profiler.dp._privacy import need
 
 pytestmark = pytest.mark.unit
 
@@ -659,6 +660,7 @@ def _rich_plan(**options):
 
 
 def test_a_rank_correlation_of_a_reached_table_is_charged_its_reach_times_the_registrys():
+    need("mbi")  # the draw checks the [privacy] extra before it selects
     plan = _rich_plan(row_floor=100)
     invoice = plan.table("invoice")
     assert invoice.reach == 3 and plan.row_floor == 100
@@ -689,6 +691,7 @@ def _choose_status_channel(rows, names, levels, weights, rho, distance, method="
 
 
 def test_cliques_are_chosen_on_the_tables_the_unit_changes_with_the_distance_of_their_reach():
+    need("mbi")  # the draw checks the [privacy] extra before it selects
     SELECTION_CALLS.clear()
     plan = _rich_plan()
     assert plan.selects
