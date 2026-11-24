@@ -216,6 +216,84 @@ def test_granted_distribution_reads_the_real_name_and_validates_it(name, expecte
     assert PM.granted_distribution(_EP("aws", None)) is None
 
 
+class _NoMetadataDist:
+    """A distribution whose METADATA file is missing.
+
+    ``importlib.metadata`` builds ``name`` and ``version`` from the METADATA
+    header, so with no header they raise instead of returning ``None``:
+    ``TypeError`` (``metadata`` is ``None``) or ``KeyError`` (newer backports).
+    ``getattr(dist, "name", None)`` only swallows ``AttributeError``.
+    """
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    @property
+    def name(self):
+        raise self._exc("Name")
+
+    @property
+    def version(self):
+        raise self._exc("Version")
+
+    @property
+    def metadata(self):
+        return None
+
+
+@pytest.mark.parametrize("exc", [TypeError, KeyError, AttributeError])
+def test_a_distribution_without_metadata_has_no_name_and_never_raises(exc):
+    ep = _EP("aws", _NoMetadataDist(exc))
+    assert PM.granted_distribution(ep) is None
+    assert PM.entry_point_distribution(ep) is None
+    assert PM.override_granted(ep) is False
+
+
+def test_a_dist_info_directory_without_a_metadata_file_is_survived(tmp_path, monkeypatch):
+    """The real shape of the flake: ``*.dist-info`` holding only ``entry_points.txt``."""
+    import importlib
+
+    group = "fluid_build.test_ghost_group"
+    info = tmp_path / "ghost_plugin-1.0.dist-info"
+    info.mkdir()
+    (info / "entry_points.txt").write_text(f"[{group}]\nghost = os.path:join\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    eps = PM._entry_points(group)
+    assert [ep.name for ep in eps] == ["ghost"]
+    assert PM.granted_distribution(eps[0]) is None
+    assert PM.entry_point_distribution(eps[0]) is None
+
+
+def test_a_distribution_name_survives_a_version_that_raises():
+    """The name is still the operator's handle when only the version is unreadable."""
+
+    class _NameOnly:
+        name = "acme-fluid-aws"
+
+        @property
+        def version(self):
+            raise TypeError("'NoneType' object is not subscriptable")
+
+    assert PM.entry_point_distribution(_EP("aws", _NameOnly())) == "acme-fluid-aws"
+
+
+def test_the_metadata_header_is_the_name_fallback_when_name_raises():
+    class _Header(dict):
+        pass
+
+    class _HeaderOnly:
+        version = "2.0"
+        metadata = _Header(Name="acme-fluid-aws")
+
+        @property
+        def name(self):
+            raise TypeError("'NoneType' object is not subscriptable")
+
+    assert PM.entry_point_distribution(_EP("aws", _HeaderOnly())) == "acme-fluid-aws 2.0"
+
+
 def test_override_granted_uses_the_distribution_name_not_the_display_string(monkeypatch):
     monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "acme-fluid-aws:aws")
     assert PM.override_granted(_EP("aws", _Dist("acme-fluid-aws"))) is True

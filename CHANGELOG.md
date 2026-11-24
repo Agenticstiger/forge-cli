@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A plugin distribution without metadata no longer breaks a plugin walk.** A `*.dist-info`
+  directory with no METADATA file made `importlib.metadata` raise `TypeError` (or `KeyError` on
+  newer backports) from `Distribution.name` and `.version`, which `getattr`'s default does not
+  catch. `granted_distribution` and `entry_point_distribution` now treat such a distribution as
+  unnamed. This was the intermittent failure of `tests/iac/test_state_migration_safety.py` in CI.
+
 ## [0.39.0] — 2026-11-23
 
 ### Added
