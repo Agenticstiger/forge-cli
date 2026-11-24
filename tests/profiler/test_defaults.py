@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import tracemalloc
 from fractions import Fraction
 from pathlib import Path
 
@@ -225,6 +226,184 @@ def test_a_date_gets_quantiles_on_a_ladder_of_years(tmp_path):
     assert len(quantile["bins"]) == 2 + 201  # the range's two ends and 1900 to 2100
     (group,) = quantile["groups"]
     assert group["status"] == "F"
+
+
+def _stamp(text: str) -> int:
+    return defaults._read_instant(text)  # type: ignore[return-value]
+
+
+@pytest.mark.parametrize(
+    "constraint, low, high",
+    [
+        (">= '2024-01-01' and <= '2024-12-31'", "2024-01-01", "2024-12-31"),
+        ("between '2024-01-01T06:00:00Z' and '2024-01-02T18:30:00Z'", "2024-01-01T06:00:00Z", "2024-01-02T18:30:00Z"),
+        (">= '2020-02-29' and < '2030-01-01T00:00:00+02:00'", "2020-02-29", "2029-12-31T22:00:00Z"),
+        (">= '2000-01-01' and <= '2001-01-01' and <= '2000-06-30'", "2000-01-01", "2000-06-30"),
+    ],
+)  # fmt: skip
+def test_timestamp_bins_follow_the_declared_range_and_no_edge_leaves_it(constraint, low, high):
+    column = {"validationRules": [{"type": "range", "constraint": constraint}]}
+    assert defaults.declared_instants(column) == (_stamp(low), _stamp(high))
+    bins = defaults.timestamp_bins(*defaults.declared_instants(column))
+    edges = [_stamp(each) for each in bins]
+    assert edges[0] == _stamp(low) and edges[-1] == _stamp(high)
+    assert edges == sorted(set(edges))
+    assert all(_stamp(low) <= each <= _stamp(high) for each in edges)
+    assert 2 <= len(bins) <= defaults.RANGE_BINS + 1  # N + 1 edges cut N bins
+
+
+@pytest.mark.parametrize(
+    "low, high, expected",
+    [
+        (1704067200, 1704067290, [
+            "2024-01-01T00:00:00Z", "2024-01-01T00:00:10Z", "2024-01-01T00:00:20Z",
+            "2024-01-01T00:00:30Z", "2024-01-01T00:00:40Z", "2024-01-01T00:00:50Z",
+            "2024-01-01T00:01:00Z", "2024-01-01T00:01:10Z", "2024-01-01T00:01:20Z",
+            "2024-01-01T00:01:30Z",
+        ]),
+        (1704067200, 1704153600, [
+            "2024-01-01T00:00:00Z", "2024-01-01T03:00:00Z", "2024-01-01T06:00:00Z",
+            "2024-01-01T09:00:00Z", "2024-01-01T12:00:00Z", "2024-01-01T15:00:00Z",
+            "2024-01-01T18:00:00Z", "2024-01-01T21:00:00Z", "2024-01-02T00:00:00Z",
+        ]),
+        (1704067200, 1735689600, [
+            "2024-01-01T00:00:00Z", "2024-01-18T00:00:00Z", "2024-03-18T00:00:00Z",
+            "2024-05-17T00:00:00Z", "2024-07-16T00:00:00Z", "2024-09-14T00:00:00Z",
+            "2024-11-13T00:00:00Z", "2025-01-01T00:00:00Z",
+        ]),
+        (0, 1, ["1970-01-01T00:00:00Z", "1970-01-01T00:00:01Z"]),
+    ],
+)  # fmt: skip
+def test_timestamp_bins_of_a_short_range_are_the_same_edges_as_ever(low, high, expected):
+    assert list(defaults.timestamp_bins(low, high)) == expected
+
+
+@pytest.mark.parametrize(
+    "low, high",
+    [
+        ("2020-01-01", "2030-01-01"),  # a decade is 3 * 10**8 seconds
+        ("2000-01-01", "2030-01-01"),
+        ("0001-01-01", "9999-12-31"),  # the widest range a contract can declare
+    ],
+)
+def test_timestamp_bins_of_a_wide_range_are_counted_not_listed(low, high):
+    # Listing every second of a decade, to count the edges, takes some 12 GB: the bins are
+    # worked out from the count alone, and only the edges kept are ever held.
+    tracemalloc.start()
+    try:
+        bins = defaults.timestamp_bins(_stamp(low), _stamp(high))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 1_000_000
+    assert 2 <= len(bins) <= defaults.RANGE_BINS + 1
+    assert bins[0] == f"{low}T00:00:00Z"
+    assert [_stamp(each) for each in bins] == sorted({_stamp(each) for each in bins})
+
+
+@pytest.mark.parametrize(
+    "low, high, years",
+    [
+        ("2020-01-01", "2030-01-01", 2),
+        ("2000-01-01", "2030-01-01", 5),
+        ("1950-01-01", "2030-01-01", 10),
+        ("1900-01-01", "2100-01-01", 50),
+        ("0001-01-01", "9999-12-31", 2000),  # 1000-year rungs cut it into 11 bins
+    ],
+)
+def test_the_year_ladder_steps_by_2_5_10_and_skips_no_rung(low, high, years):
+    # Each rung is at most 2.5 times the one before, so a range the rung before cut into
+    # more than RANGE_BINS bins is cut into at least four by the next one.
+    bins = defaults.timestamp_bins(_stamp(low), _stamp(high))
+    inner = [_stamp(each) for each in bins[1:-1]]
+    steps = {b - a for a, b in zip(inner, inner[1:], strict=False)}
+    assert steps == {years * defaults._YEAR_SECONDS}
+    assert 4 <= len(bins) - 1 <= defaults.RANGE_BINS
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "0001-01-01T00:00:00Z",
+        "0999-12-31T23:59:59Z",
+        "1970-01-01T00:00:00Z",
+        "9999-12-31T00:00:00Z",
+    ],
+)
+def test_an_edge_is_spelled_with_a_four_digit_year_on_every_platform(text):
+    assert defaults._spell(_stamp(text)) == text
+
+
+@pytest.mark.parametrize(
+    "text, seconds",
+    [
+        ("0001-01-01", -62_135_596_800),
+        ("9999-12-31T23:59:59Z", 253_402_300_799),
+        ("9999-12-31T09:59:59-14:00", 253_402_300_799),
+        ("9999-12-31T23:59:59-14:00", None),  # 10000-01-01 in UTC
+        ("0001-01-01T00:00:00+14:00", None),  # before the year 1 in UTC
+    ],
+)
+def test_an_instant_an_offset_carries_past_the_years_1_to_9999_is_not_read(text, seconds):
+    assert defaults._read_instant(text) == seconds
+
+
+def test_a_range_an_offset_carries_past_the_years_keeps_the_ladder():
+    constraint = "between '2024-01-01' and '9999-12-31T23:59:59-14:00'"
+    column = {"validationRules": [{"type": "range", "constraint": constraint}]}
+    assert defaults.declared_instants(column) is None
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    [
+        ">= '2024-01-01'",  # one side
+        "<= '2024-12-31'",
+        ">= '2024-12-31' and <= '2024-01-01'",  # inverted
+        ">= '2024-01-01T00:00:00.5Z' and <= '2024-12-31'",  # a fraction of a second
+        ">= 'last year' and <= 'today'",  # not instants
+        ">= 0 and <= 100",  # a number range
+    ],
+)
+def test_a_range_that_is_not_closed_over_whole_instants_declares_none(constraint):
+    column = {"validationRules": [{"type": "range", "constraint": constraint}]}
+    assert defaults.declared_instants(column) is None
+
+
+def test_a_timestamp_with_a_declared_range_is_binned_on_it_not_on_the_ladder(tmp_path):
+    rule = {
+        "validationRules": [{"type": "range", "constraint": ">= '2024-01-01' and <= '2024-12-31'"}]
+    }
+    contract = _contract([("placed_at", "timestamp", rule), ("joined", "date", {})])
+    rows = [
+        {"placed_at": f"2024-0{1 + n % 9}-1{n % 10}T10:00:00Z", "joined": "2021-03-04"}
+        for n in range(300)
+    ]
+    result = _profile(tmp_path, contract, rows)
+    low, high = _stamp("2024-01-01"), _stamp("2024-12-31")
+    for level in defaults.QUANTILE_LEVELS:
+        bins = _one(result, "placed_at", "quantile/2", level=level)["bins"]
+        edges = [int(each) // 1000 for each in bins]  # the document spells an instant in ms
+        assert edges[0] == low and edges[-1] == high
+        assert all(low <= each <= high for each in edges)
+        assert edges == sorted(set(edges))
+        assert len(bins) <= defaults.RANGE_BINS + 1
+    # a date with no declared range keeps the ladder
+    assert len(_one(result, "joined", "quantile/2", level="0.5")["bins"]) == 2 + 201
+
+
+def test_the_timestamp_bins_never_depend_on_the_records(tmp_path):
+    rule = {
+        "validationRules": [
+            {"type": "range", "constraint": "between '2024-01-01' and '2024-12-31'"}
+        ]
+    }
+    contract = _contract([("placed_at", "timestamp", rule)])
+    early = _profile(tmp_path, contract, [{"placed_at": "2024-01-02T00:00:00Z"}] * 40)
+    late = _profile(tmp_path, contract, [{"placed_at": "2024-12-30T00:00:00Z"}] * 3)
+    assert [s.get("bins") for s in _statistics(early, "placed_at")] == [
+        s.get("bins") for s in _statistics(late, "placed_at")
+    ]
 
 
 def test_an_unbounded_number_is_named_and_given_no_statistic(tmp_path):

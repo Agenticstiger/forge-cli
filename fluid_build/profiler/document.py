@@ -1,7 +1,7 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""The profile document: PROFILE-SPEC formats 1-0-0 and 1-1-0, its canonical bytes and digest.
+"""The profile document: PROFILE-SPEC formats 1-0-0 to 1-4-0, its canonical bytes and digest.
 
 flux-engine ``docs/spec/PROFILE-SPEC.md`` §1 fixes the shape: the OpenLineage
 facet envelope (``_producer``, ``_schemaURL``), the grid (``encoding``), the
@@ -15,9 +15,11 @@ Trail of Bits implementation flux-engine digests with, so both sides compute one
 digest from one implementation. The file holds exactly those bytes, so its sha256
 is the digest a Simulation pins.
 
-A profile names format 1-0-0, unless it holds a ``quantile/2`` statistic, which only
-format 1-1-0 carries (:func:`schema_url_for`): a profile without one keeps the bytes it
-had.
+A profile names the least format that holds it (:func:`schema_url_for`): 1-0-0, unless it
+holds a ``quantile/2`` statistic (1-1-0), an ``invariants`` section (1-2-0), a statistic
+grouped by a link (1-3-0), or a rank correlation, a statistic grouped by the bins of a column
+or a relationship's statistic grouped by a parent column (1-4-0). A profile without one of
+them keeps the bytes it had.
 
 A document that breaks a rule is refused here, before anything is written. The
 refusal names where in the document the problem is, never a value.
@@ -39,6 +41,8 @@ __all__ = [
     "SCHEMA_URL",
     "SCHEMA_URL_1_1_0",
     "SCHEMA_URL_1_2_0",
+    "SCHEMA_URL_1_3_0",
+    "SCHEMA_URL_1_4_0",
     "build_document",
     "canonical_bytes",
     "check_fractional_bits",
@@ -57,6 +61,14 @@ SCHEMA_URL_1_1_0 = "https://agenticstiger.github.io/flux/engine/spec/profile/1-1
 #: Format 1-2-0, which adds the ``invariants`` section (``flux_stats.profile.SCHEMA_URL_1_2_0``;
 #: a test keeps the two equal).
 SCHEMA_URL_1_2_0 = "https://agenticstiger.github.io/flux/engine/spec/profile/1-2-0/FluxProfile.json"
+
+#: Format 1-3-0, which adds ``groupByLink`` among other forms (``flux_stats.profile.SCHEMA_URL_1_3_0``;
+#: a test keeps the two equal).
+SCHEMA_URL_1_3_0 = "https://agenticstiger.github.io/flux/engine/spec/profile/1-3-0/FluxProfile.json"
+#: Format 1-4-0, which adds the rank correlations, ``rowFloor``, ``groupByBins``, the cliques of
+#: ``cliqueMarginal/2`` and a ``groupBy`` on a relationship's statistic
+#: (``flux_stats.profile.SCHEMA_URL_1_4_0``; a test keeps the two equal).
+SCHEMA_URL_1_4_0 = "https://agenticstiger.github.io/flux/engine/spec/profile/1-4-0/FluxProfile.json"
 
 #: The statistics only format 1-1-0 holds.
 _ADDED_IN_1_1_0 = frozenset({"quantile/2"})
@@ -91,16 +103,64 @@ def producer_uri(version: str) -> str:
     return f"{PRODUCER_REPOSITORY}/tree/v{version}/fluid_build/profiler"
 
 
-def schema_url_for(tables: Mapping[str, Mapping[str, Any]], *, invariants: bool = False) -> str:
-    """The format *tables* need: 1-2-0 with ``invariants``, 1-1-0 when any statistic is ``quantile/2``, else 1-0-0."""
-    if invariants:
-        return SCHEMA_URL_1_2_0
+#: The definitions of a ``columnPairs`` entry that only format 1-4-0 holds.
+_RANK_DEFINITIONS = frozenset({"kendallTau/1", "spearmanRho/1"})
+
+
+def _statistic_format(statistic: Mapping[str, Any]) -> int:
+    """The format, as a number from 0 (1-0-0) to 4 (1-4-0), that one column statistic needs."""
+    if "groupByBins" in statistic or "rowFloor" in statistic:
+        return 4
+    if "groupByLink" in statistic:
+        return 3
+    return 1 if statistic.get("definition") in _ADDED_IN_1_1_0 else 0
+
+
+def _table_format(table: Mapping[str, Any]) -> int:
+    needed = 0
+    if "cliqueSelection" in table or any(
+        each.get("definition") == "cliqueMarginal/2" for each in table.get("cliques", ())
+    ):
+        needed = 4
+    for column in table.get("columns", {}).values():
+        needed = max([needed, *(_statistic_format(each) for each in column.get("statistics", ()))])
+    for pair in table.get("columnPairs", ()):
+        if any(each.get("definition") in _RANK_DEFINITIONS for each in pair.get("statistics", ())):
+            needed = 4
+    return needed
+
+
+def _relationship_format(relationship: Mapping[str, Any]) -> int:
+    """A relationship's statistic grouped by a parent column is a form of format 1-4-0."""
+    for statistic in relationship.get("statistics", ()):
+        if "groupBy" in statistic or "groupByBins" in statistic:
+            return 4
+    return 0
+
+
+_FORMATS = (SCHEMA_URL, SCHEMA_URL_1_1_0, SCHEMA_URL_1_2_0, SCHEMA_URL_1_3_0, SCHEMA_URL_1_4_0)
+
+
+def schema_url_for(
+    tables: Mapping[str, Mapping[str, Any]],
+    *,
+    invariants: bool = False,
+    relationships: Sequence[Mapping[str, Any]] = (),
+) -> str:
+    """The least format that holds *tables*, *relationships* and any ``invariants``.
+
+    1-4-0 with a rank correlation, a ``groupByBins``, a ``rowFloor`` or a relationship's
+    statistic grouped by a parent column (and with cliques of ``cliqueMarginal/2`` or a
+    ``cliqueSelection``); 1-3-0 with a ``groupByLink``; 1-2-0 with ``invariants``; 1-1-0
+    when any statistic is ``quantile/2``; else 1-0-0. Each format holds everything the
+    ones before it do.
+    """
+    needed = 2 if invariants else 0
     for table in tables.values():
-        for column in table.get("columns", {}).values():
-            for statistic in column.get("statistics", ()):
-                if statistic.get("definition") in _ADDED_IN_1_1_0:
-                    return SCHEMA_URL_1_1_0
-    return SCHEMA_URL
+        needed = max(needed, _table_format(table))
+    for relationship in relationships:
+        needed = max(needed, _relationship_format(relationship))
+    return _FORMATS[needed]
 
 
 def build_document(
@@ -125,7 +185,9 @@ def build_document(
         raise DocumentError("tables holds at least one table")
     built: Dict[str, Any] = {
         "_producer": producer,
-        "_schemaURL": schema_url_for(tables, invariants=bool(invariants)),
+        "_schemaURL": schema_url_for(
+            tables, invariants=bool(invariants), relationships=relationships
+        ),
         "encoding": {"fractionalBits": fractional_bits, "rounding": "floor"},
         "disclosureRules": {rule.name: rule.to_document()},
         "tables": {expose_id: dict(table) for expose_id, table in tables.items()},
