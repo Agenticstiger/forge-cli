@@ -20,6 +20,7 @@ from fluid_build.util.env_templates import (
     SENSITIVE_RENDER,
     UNSET_DEFER,
     EnvTemplateError,
+    check_host_templates,
     missing_fields,
     placeholder_names,
     render_contract,
@@ -159,3 +160,111 @@ def test_placeholder_names_come_in_the_order_first_written_each_once():
 def test_missing_fields_names_what_validate_warns_about():
     got = missing_fields(CONTRACT, environ={"PREFIX": "p"})
     assert got == {"S3_BUCKET": ["exposes[0].binding.location.bucket"]}
+
+
+# ── hosts ───────────────────────────────────────────────────────────────────
+
+ALLOWLIST = "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST"
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        {"location": {"uri": "https://{{ env.H }}.example/c"}},
+        {"connection": {"host": "db-{{ env.H }}"}},
+        {"endpoint": "https://{{ env.H }}@db.example/x"},
+        {"endpoint": "https://db.example:{{ env.H }}/x"},
+        {"connection": {"host": "{{ env.H }}{{ env.H2 }}"}},
+    ],
+    ids=["suffix", "prefix", "userinfo", "port", "two-variables"],
+)
+def test_a_variable_in_a_host_needs_the_operators_pairing(where):
+    env = {"H": "lake", "H2": "keeper"}
+    with pytest.raises(EnvTemplateError) as info:
+        check_host_templates(where, environ=env)
+    assert info.value.code == "EnvTemplateHostError" and info.value.extras["variable"] == "H"
+    assert "lake" not in info.value.render(color=False), "the rendered host is never printed"
+    check_host_templates(where, environ={**env, ALLOWLIST: "H,H2"})
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        {"connection": {"host": "{{ env.PGHOST }}"}},
+        {"location": {"uri": "https://{{ env.PGHOST }}/catalog"}},
+        {"location": {"uri": "https://user@{{ env.PGHOST }}:8443/catalog"}},
+        {"uri": "{{ env.PGHOST }}"},
+    ],
+    ids=["host-field", "authority", "authority-with-port", "whole-uri"],
+)
+def test_a_variable_that_is_the_whole_host_needs_no_pairing(where):
+    """``host: "{{ env.PGHOST }}"`` is how the shipped contracts name the address: the operator
+    chose it, and the contract only says which variable holds it."""
+    check_host_templates(where, environ={"PGHOST": "db.internal"})
+
+
+def test_the_pairing_names_the_host_the_value_renders_to():
+    where = {"location": {"uri": "https://{{ env.H }}.example/c"}}
+    check_host_templates(where, environ={"H": "lake", ALLOWLIST: "H@lake.example"})
+    with pytest.raises(EnvTemplateError):
+        check_host_templates(where, environ={"H": "other", ALLOWLIST: "H@lake.example"})
+
+
+def test_a_comma_list_of_hosts_needs_every_host_paired():
+    where = {"connection_string": "mongodb://u:{{ env.H }}@h1.example,h2.example/db"}
+    env = {"H": "pw"}
+    with pytest.raises(EnvTemplateError):
+        check_host_templates(where, environ={**env, ALLOWLIST: "H@h1.example"})
+    check_host_templates(where, environ={**env, ALLOWLIST: "H@h1.example,H@h2.example"})
+
+
+def test_a_loopback_host_needs_no_pairing():
+    check_host_templates({"uri": "http://{{ env.U }}@localhost:8181/c"}, environ={"U": "u"})
+    check_host_templates({"uri": "http://{{ env.U }}@127.0.0.1/c"}, environ={"U": "u"})
+    with pytest.raises(EnvTemplateError):
+        check_host_templates({"uri": "http://{{ env.U }}@remote.example/c"}, environ={"U": "u"})
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        {"uri": "https://{{ env.API_TOKEN }}.attacker.example/c"},
+        {"uri": "https://catalog.example/{{ env.API_TOKEN }}/c"},
+        {"uri": "https://u:{{ env.API_TOKEN }}@catalog.example/c"},
+        {"host": "{{ env.API_TOKEN }}"},
+    ],
+    ids=["authority", "path", "userinfo", "host-field"],
+)
+def test_a_credential_shaped_variable_never_goes_into_a_url_or_host(where):
+    env = {"API_TOKEN": "s3cr3t", ALLOWLIST: "API_TOKEN"}  # paired, and still refused
+    with pytest.raises(EnvTemplateError) as info:
+        check_host_templates(where, environ=env)
+    assert info.value.extras["reason"] == "credential"
+    assert "s3cr3t" not in info.value.render(color=False)
+
+
+def test_a_template_outside_the_authority_of_a_url_is_not_a_host():
+    check_host_templates(
+        {"uri": "https://catalog.example/{{ env.TENANT }}/c?r={{ env.REGION }}"},
+        environ={"TENANT": "acme", "REGION": "eu"},
+    )
+
+
+def test_a_field_that_is_not_an_address_is_left_alone():
+    check_host_templates(
+        {"description": "see {{ env.H }}", "bucket": "{{ env.B }}"}, environ={"H": "x", "B": "y"}
+    )
+
+
+def test_an_unset_variable_in_a_host_is_left_for_the_render_to_name():
+    check_host_templates({"host": "{{ env.NOPE }}"}, environ={})
+    with pytest.raises(EnvTemplateError) as info:
+        render_contract({"host": "{{ env.NOPE }}"}, environ={})
+    assert info.value.extras["missing"] == ["NOPE"]
+
+
+def test_skip_leaves_a_top_level_key_unread():
+    contract = {"builds": [{"uri": "https://{{ env.H }}.example/x"}]}
+    with pytest.raises(EnvTemplateError):
+        check_host_templates(contract, environ={"H": "lake"})
+    check_host_templates(contract, environ={"H": "lake"}, skip=("builds",))

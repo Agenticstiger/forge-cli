@@ -730,16 +730,30 @@ def _execute_acquisition_build(
     # properties.<engine>.*, sink.*, delivery.*, schemaEvolution.*, …) so
     # operators don't need to memorise which fields support templating.
     #
-    # Secrets policy: this is the runtime path; values stay in process
-    # memory and never get serialised to a remote catalog, so we resolve
-    # everything (including secret-shaped vars). Catalog-export paths use
-    # ``_contract_loader.resolve_contract_env_templates`` instead, which
-    # leaves sensitive placeholders literal.
+    # Secrets policy: this is the runtime path. A value is not written to a
+    # catalog or a file, but a connector can send it to a host (an Iceberg sink
+    # sends its catalog URI and token there), so the fields that name a host are
+    # judged first, below. Elsewhere we resolve everything, secret-shaped
+    # variables included: a connection's ``password: "{{ env.PGPASSWORD }}"``
+    # reaches the engine that connects. Catalog-export paths use
+    # ``_contract_loader.resolve_contract_env_templates`` instead, which leaves
+    # sensitive placeholders literal.
     unresolved_contract = contract if as_written is None else as_written
     unresolved_build = build
-    from fluid_build.util.env_templates import EnvTemplateError
+    # A host is not the contract's to take from the operator's environment: a template in a
+    # URL's authority or a host field renders only for a variable the operator paired with
+    # that host, and a credential-shaped one never renders there. Read as written, before
+    # anything is expanded. A variable that is unset or empty is refused by the render below.
+    from fluid_build.util.env_templates import EnvTemplateError, check_host_templates
 
     try:
+        check_host_templates(
+            unresolved_contract, stage="fluid apply, acquisition build", skip=("builds",)
+        )
+        if as_written is None:
+            check_host_templates(
+                {"build": unresolved_build}, stage="fluid apply, acquisition build"
+            )
         build = _resolve_env_placeholders(build)
         contract = _resolve_env_placeholders(contract)
     except EnvTemplateError as exc:

