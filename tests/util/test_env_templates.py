@@ -21,6 +21,7 @@ from fluid_build.util.env_templates import (
     UNSET_DEFER,
     EnvTemplateError,
     check_host_templates,
+    is_host_field,
     missing_fields,
     placeholder_names,
     render_contract,
@@ -268,3 +269,62 @@ def test_skip_leaves_a_top_level_key_unread():
     with pytest.raises(EnvTemplateError):
         check_host_templates(contract, environ={"H": "lake"})
     check_host_templates(contract, environ={"H": "lake"}, skip=("builds",))
+
+
+def test_a_placeholder_written_without_spaces_is_still_read_one_at_a_time():
+    """``{{env.A}}.attacker.example{{env.HOME}}`` is two placeholders, as the renderer reads it,
+    not one that "is the whole host"."""
+    where = {"location": {"uri": "https://{{env.A}}.attacker.example{{env.HOME}}/catalog"}}
+    env = {"A": "tenant-1234", "HOME": "/home/operator"}
+    with pytest.raises(EnvTemplateError) as info:
+        check_host_templates(where, environ=env)
+    assert "tenant-1234" not in info.value.render(color=False)
+    check_host_templates(where, environ={**env, ALLOWLIST: "A,HOME"})
+
+
+def test_a_backslash_in_the_authority_is_judged_with_both_readings_of_it():
+    """Some clients end the authority at a backslash (``a\\@b`` is host ``a``), others read on
+    to the ``@`` (host ``b``, the value as userinfo): the variable must be paired with both."""
+    where = {"uri": "https://{{ env.H }}\\@evil.example/x"}
+    env = {"H": "lake"}
+    with pytest.raises(EnvTemplateError):
+        check_host_templates(where, environ=env)
+    with pytest.raises(EnvTemplateError):
+        check_host_templates(where, environ={**env, ALLOWLIST: "H@evil.example"})
+    check_host_templates(where, environ={**env, ALLOWLIST: "H@evil.example,H@lake"})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "jdbc:postgresql://{{ env.H }}.attacker.example/db",
+        "mysql:loadbalance://{{ env.H }}.attacker.example/db",
+        "\x01https://{{ env.H }}.attacker.example/c",
+        " \t https://{{ env.H }}.attacker.example/c",
+        "{{ env.SCHEME }}://{{ env.H }}.attacker.example/c",
+    ],
+    ids=["jdbc", "multi-part-scheme", "control-char", "whitespace", "templated-scheme"],
+)
+def test_these_values_are_urls_wherever_they_sit(value):
+    env = {"H": "lake", "SCHEME": "https"}
+    with pytest.raises(EnvTemplateError):
+        check_host_templates({"anything": value}, environ=env)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["host", "iceberg.catalog.uri", "bootstrap_servers", "catalog_url", "jdbc_url", "brokers"]
+    + ["server_hostname", "connection_string", "sqlalchemy_url", "Endpoint"],
+)
+def test_a_field_is_a_host_field_by_its_last_word(key):
+    assert is_host_field(key)
+    with pytest.raises(EnvTemplateError):
+        check_host_templates({key: "{{ env.H }}.attacker.example:9092"}, environ={"H": "x"})
+
+
+@pytest.mark.parametrize(
+    "key", ["description", "server_side_encryption", "hostname_prefix", "bucket", "uri_template"]
+)
+def test_other_fields_are_not_host_fields(key):
+    assert not is_host_field(key)
+    check_host_templates({key: "{{ env.H }}.example"}, environ={"H": "x"})

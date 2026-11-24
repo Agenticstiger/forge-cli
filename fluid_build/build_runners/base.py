@@ -674,6 +674,18 @@ _ACQUISITION_RUNNER_REGISTRY: Dict[str, tuple] = {
 }
 
 
+def _build_as_written(
+    build: Dict[str, Any], as_written: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """``build`` as its contract wrote it: with ``as_written`` (a plan's contract, rendered before
+    it reaches the dispatcher), the entry of its ``builds`` with the same id; else ``build``."""
+    if as_written is not None:
+        for entry in as_written.get("builds") or []:
+            if isinstance(entry, dict) and entry.get("id") == build.get("id"):
+                return entry
+    return build
+
+
 def _execute_acquisition_build(
     build: Dict[str, Any],
     contract: Dict[str, Any],
@@ -750,10 +762,9 @@ def _execute_acquisition_build(
         check_host_templates(
             unresolved_contract, stage="fluid apply, acquisition build", skip=("builds",)
         )
-        if as_written is None:
-            check_host_templates(
-                {"build": unresolved_build}, stage="fluid apply, acquisition build"
-            )
+        check_host_templates(
+            {"build": _build_as_written(build, as_written)}, stage="fluid apply, acquisition build"
+        )
         build = _resolve_env_placeholders(build)
         contract = _resolve_env_placeholders(contract)
     except EnvTemplateError as exc:

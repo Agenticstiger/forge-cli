@@ -17,7 +17,8 @@ The rules, for every caller:
 * A stage that deliberately leaves the placeholder for a later one says so by
   name: ``unset=UNSET_DEFER``. The call sites that do are the publish and export
   paths (a catalog shows the template), the preload of a contract embedded in a
-  plan (each build renders it strictly when it runs), and the validation report.
+  plan (each build renders it strictly when it runs), the validation report, and
+  ``generate artifacts`` (it runs where the bundle is built, not where it is deployed).
   ``tests/test_env_templates_defer_sites.py`` pins the list, so nothing passes
   through unresolved by accident.
 * A credential-shaped name (:func:`~fluid_build.observability.secret_redactor.is_sensitive_key_name`)
@@ -146,7 +147,6 @@ def render_text(
     placeholder of an unset variable as written (the :data:`UNSET_DEFER` rule).
 
     The single-string primitive for a caller that decides for itself what an
-    The single-string primitive for a caller that decides for itself what an
     unrendered placeholder means (a provider's optional field with a default). A
     string with ``{{`` in it comes back stripped, as it always did, unless ``strip``
     is false.
@@ -183,9 +183,10 @@ def render_contract(
 
     A credential-shaped name is never rendered in either ``unset`` mode unless the
     caller says ``sensitive=SENSITIVE_RENDER`` (see the module docstring); the
-    warning says where the rendered ``value`` goes, as ``purpose``. ``stage`` names the command for the error. ``strip`` keeps the
-    historical ``.strip()`` of a string that holds ``{{``; a caller that renders
-    paths or SQL turns it off. ``value`` is not changed.
+    warning says where the rendered ``value`` goes, as ``purpose``. ``stage`` names
+    the command, for the error. ``strip`` keeps the historical ``.strip()`` of a string
+    that holds ``{{``; a caller that renders paths or SQL turns it off. ``value`` is
+    not changed.
     """
     if unset not in (UNSET_ERROR, UNSET_DEFER):
         raise ValueError(f"unset must be {UNSET_ERROR!r} or {UNSET_DEFER!r}, not {unset!r}")
@@ -248,25 +249,24 @@ def render_contract(
     return rendered_value
 
 
-#: Field names that hold a host, or a URL whose authority is one. The destination fields of
-#: ``secrets.policy`` plus the spellings connectors use.
-HOST_FIELD_NAMES = frozenset(
-    {
-        "host",
-        "hostname",
-        "uri",
-        "url",
-        "server",
-        "server_url",
-        "endpoint",
-        "instance_url",
-        "connection_string",
-        "sqlalchemy_url",
-    }
+#: The last word of a field name that holds a host, or a URL whose authority is one
+#: (``host``, ``catalog_uri``, ``iceberg.catalog.uri``, ``bootstrap_servers``, ``server_url``):
+#: the destination fields of ``secrets.policy`` plus the spellings connectors use.
+HOST_FIELD_WORDS = frozenset(
+    {"host", "hostname", "uri", "url", "endpoint", "server", "servers", "brokers"}
 )
+#: Whole field names that hold one, whatever their last word.
+HOST_FIELD_NAMES = frozenset({"connection_string", "sqlalchemy_url"})
+
+
+def is_host_field(key: str) -> bool:
+    """Whether a field called ``key`` holds a host or a URL."""
+    lowered = key.lower()
+    return lowered in HOST_FIELD_NAMES or re.split(r"[._\-]", lowered)[-1] in HOST_FIELD_WORDS
+
 
 #: A value read as a URL: a scheme (or a placeholder for it) and ``://``.
-_URL_START = re.compile(r"\s*(?:[A-Za-z][\w+.\-]*|\{\{[^{}]*\}\})://")
+_URL_START = re.compile(r"[\s\x00-\x1f\x7f-\x9f]*(?:[A-Za-z][\w+.\-:]*|\{\{[^{}]*\}\})://")
 
 
 def _authority_end(text: str, start: int) -> int:
@@ -333,7 +333,10 @@ def _host_refusal(
     )
 
 
-_WHOLE_TEMPLATE = re.compile(r"\s*\{\{\s*env\.\S+?\s*\}\}\s*")
+def _is_one_template(text: str) -> bool:
+    """Whether ``text`` is exactly one placeholder, read as :func:`render_contract` reads it
+    (the shortest ``{{ env.NAME }}`` each time), so ``{{env.A}}.x{{env.B}}`` is two."""
+    return len(ENV_TEMPLATE_RE.findall(text)) == 1 and not ENV_TEMPLATE_RE.sub("", text).strip()
 
 
 def _pairing_names(authority: str) -> List[str]:
@@ -351,7 +354,7 @@ def _pairing_names(authority: str) -> List[str]:
     else:
         hostname, port = hostport, ""
     names = [raw.strip() for raw in ENV_TEMPLATE_RE.findall(userinfo + port)]
-    if _WHOLE_TEMPLATE.fullmatch(hostname):
+    if _is_one_template(hostname):
         return names
     return names + [raw.strip() for raw in ENV_TEMPLATE_RE.findall(hostname)]
 
@@ -366,7 +369,7 @@ def check_host_templates(
     """Refuse an ``{{ env.NAME }}`` that would put the operator's environment into an address.
 
     Run on the contract as written, before :func:`render_contract` expands it, and
-    for a string that is a URL or sits in a host field (:data:`HOST_FIELD_NAMES`):
+    for a string that is a URL or sits in a host field (:func:`is_host_field`):
 
     * a credential-shaped name (anywhere in that value) is refused;
     * any other name in the URL's authority, or in a host field, is refused unless
@@ -390,7 +393,7 @@ def check_host_templates(
         if "{{" not in text or ENV_TEMPLATE_RE.search(text) is None:
             return
         url = _URL_START.match(text)
-        if url is None and key.lower() not in HOST_FIELD_NAMES:
+        if url is None and not is_host_field(key):
             return
         for raw in ENV_TEMPLATE_RE.findall(text):
             name = raw.strip()
@@ -400,13 +403,23 @@ def check_host_templates(
         start = url.end() if url else 0
         stop = _authority_end(text, start) if url else len(text)
         authority = text[start:stop]
-        names = _pairing_names(authority)
+        # A client that reads a backslash as a slash ends the authority there; one that does not
+        # reads on to the ``@``. Either could be the one that connects, so with a backslash in
+        # the authority every variable in it is paired, with both hosts.
+        slashed = "\\" in authority
+        names = (
+            [raw.strip() for raw in ENV_TEMPLATE_RE.findall(authority)]
+            if slashed
+            else _pairing_names(authority)
+        )
         if not names:
             return
         if any(not env.get(raw.strip()) for raw in ENV_TEMPLATE_RE.findall(authority)):
             return  # render_contract reports the missing variable
         rendered = ENV_TEMPLATE_RE.sub(lambda m: env[m.group(1).strip()], authority)
         hosts = _hosts_of(rendered) or [""]
+        if slashed:
+            hosts += _hosts_of(rendered.partition("\\")[0]) or [""]
         for name in names:
             for host in hosts:
                 if not variable_allowed(name, host or None, environ=env):
@@ -461,6 +474,7 @@ def missing_fields(value: Any, environ: Optional[Mapping[str, str]] = None) -> D
 __all__ = [
     "ENV_TEMPLATE_RE",
     "HOST_FIELD_NAMES",
+    "HOST_FIELD_WORDS",
     "EnvTemplateError",
     "SENSITIVE_REFUSE",
     "SENSITIVE_RENDER",

