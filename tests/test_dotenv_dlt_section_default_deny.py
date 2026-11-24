@@ -329,6 +329,45 @@ def test_a_url_the_operator_exports_for_the_run_is_not_refused(
     assert _settings(project, "", "snowflake") == []
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "DESTINATION__CLICKHOUSE__STAGING_USE_HTTPS",
+        "DESTINATION__STAGING_USE_HTTPS",
+        f"{_PIPELINE.upper()}__DESTINATION__CLICKHOUSE__STAGING_USE_HTTPS",
+    ],
+)
+def test_a_project_flag_that_turns_tls_off_is_refused(project: Path, name: str) -> None:
+    """A boolean is not a harmless flag when it chooses whether the connection uses TLS."""
+    assert _settings(project, f"{name}=false\n", "clickhouse") == [name]
+
+
+@pytest.mark.parametrize(
+    "field, weakens",
+    [
+        ("staging_use_https", True),
+        ("verify_ssl", True),
+        ("tls_verify", True),
+        ("insecure", True),
+        ("secure", True),
+        ("grpc_port", True),
+        ("trust_server_certificate", True),
+        ("create_indexes", False),
+        ("keep_staged_files", False),
+        ("info_tables_query_threshold", False),
+        ("truncate_tables_on_staging_destination_before_load", False),
+    ],
+)
+def test_the_transport_flags_are_told_from_the_harmless_ones(field: str, weakens: bool) -> None:
+    from fluid_build.build_runners.dlt.runner import _dlt_flag_weakens_transport
+
+    assert _dlt_flag_weakens_transport(field) is weakens
+
+
+def test_a_harmless_project_flag_beside_it_is_still_allowed(project: Path) -> None:
+    assert _settings(project, "DESTINATION__CLICKHOUSE__CREATE_INDEXES=false\n", "clickhouse") == []
+
+
 def test_a_project_staging_type_is_refused(project: Path) -> None:
     found = _settings(project, "STAGING_TYPE=filesystem\n", "snowflake")
 

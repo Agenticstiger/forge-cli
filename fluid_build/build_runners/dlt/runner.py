@@ -1089,7 +1089,9 @@ def _project_endpoints_for_destination(
 #   * every destination field that is a boolean or an integer
 #     (``create_indexes``, ``enable_dataset_name_normalization``,
 #     ``info_tables_query_threshold``, ``truncate_tables_on_staging_destination_before_load``
-#     ...): a flag or a count cannot name a place or a credential;
+#     ...): a flag or a count cannot name a place or a credential; but not one
+#     about transport security or the socket (``staging_use_https``, a
+#     ``verify`` or ``port`` field: :func:`_dlt_flag_weakens_transport`);
 #   * ``DESTINATION__<NAME>__DESTINATION_TYPE`` of the contract's own
 #     destination while the project's credentials pin it
 #     (:func:`_project_endpoints_for_destination`): the destination is then the
@@ -1153,6 +1155,22 @@ def _dlt_pipeline_setting_names(pipeline_name: str) -> FrozenSet[str]:
         for section in sections
         for setting in _DLT_PIPELINE_SETTINGS
     )
+
+
+#: Words that mark a flag or a number about how the connection is secured or
+#: where its socket goes (clickhouse ``staging_use_https``, a ``verify``,
+#: ``insecure`` or ``port`` field): such a field is not a harmless flag or count,
+#: since a project value could turn TLS off or move the connection.
+_DLT_TRANSPORT_WORDS = frozenset(
+    {"https", "ssl", "tls", "verify", "insecure", "secure", "cert", "trust", "encrypt", "port"}
+)
+
+
+def _dlt_flag_weakens_transport(field: str) -> bool:
+    """Whether the boolean or integer destination field ``field`` is about the
+    connection's transport security or its socket (:data:`_DLT_TRANSPORT_WORDS`,
+    matched on the parts of its snake_case name)."""
+    return any(part in _DLT_TRANSPORT_WORDS for part in field.lower().split("_"))
 
 
 def _dlt_is_flag_or_count(hint: Any) -> bool:
@@ -1255,7 +1273,7 @@ def _dlt_destination_setting_names(
             continue
         if field.lower() in _DLT_PROJECT_SETTINGS_ALLOWED or _dlt_is_not_resolved(hint):
             continue
-        if _dlt_is_flag_or_count(hint):
+        if _dlt_is_flag_or_count(hint) and not _dlt_flag_weakens_transport(field):
             continue
         if _dlt_config_classes(hint):
             read = nested(field)
