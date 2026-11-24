@@ -12,6 +12,11 @@ K3S=forge-verify-k3s
 NAMESPACE=airbyte
 RELEASE=airbyte
 CHART_VERSION="${AIRBYTE_CHART_VERSION:-0.422.0}"
+# Helm 3 line (the airbyte chart is installed with `helm upgrade --install`).
+# A constant, not an environment override: the SHA-256 values in the helm
+# install step below belong to exactly this version. Bumping it means
+# re-pinning BOTH hashes (linux-amd64 and linux-arm64) from the release page.
+HELM_VERSION=v3.22.1
 
 echo "── waiting for k3s control plane ──"
 until docker exec "$K3S" kubectl get nodes 2>/dev/null | grep -q " Ready "; do
@@ -19,8 +24,46 @@ until docker exec "$K3S" kubectl get nodes 2>/dev/null | grep -q " Ready "; do
 done
 echo "k3s ready"
 
+echo "── helm install (${HELM_VERSION}) ──"
+# Download the pinned Helm release tarball from get.helm.sh and check it
+# against the SHA-256 pinned in this script (not one fetched from the same
+# host), and only then unpack and install it. Nothing downloaded is executed
+# before it is verified. Runs inside the k3s container (Alpine, so busybox
+# sha256sum); shasum covers a macOS shell.
+# shellcheck disable=SC2016  # the script is deliberately expanded in the container
+docker exec -e HELM_VERSION="$HELM_VERSION" "$K3S" sh -c '
+  set -eu
+  if helm version >/dev/null 2>&1; then
+    exit 0
+  fi
+  apk add --no-cache curl >/dev/null
+  case "$(uname -m)" in
+    x86_64)
+      arch=amd64
+      sha=896cf63684a42a723d61c980369d6e588330927deb13676ca0d85006dd6da0ea
+      ;;
+    aarch64)
+      arch=arm64
+      sha=4c29e286b279d170fa048ddfc3e4e83dcd069ca9c52102766ba672d7149e694d
+      ;;
+    *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+  esac
+  archive="helm-${HELM_VERSION}-linux-${arch}.tar.gz"
+  workdir="$(mktemp -d)"
+  trap '"'"'rm -rf "$workdir"'"'"' EXIT
+  cd "$workdir"
+  curl -fsSLO "https://get.helm.sh/${archive}"
+  if command -v sha256sum >/dev/null 2>&1; then
+    echo "${sha}  ${archive}" | sha256sum -c -
+  else
+    echo "${sha}  ${archive}" | shasum -a 256 -c -
+  fi
+  tar -xzf "$archive"
+  mv "linux-${arch}/helm" /usr/local/bin/helm
+  chmod 0755 /usr/local/bin/helm
+  helm version --short
+'
 echo "── helm repo add ──"
-docker exec "$K3S" sh -c "helm version >/dev/null 2>&1 || (apk add --no-cache curl bash && curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash)"
 docker exec "$K3S" helm repo add airbyte https://airbytehq.github.io/helm-charts >/dev/null 2>&1 || true
 docker exec "$K3S" helm repo update >/dev/null
 
