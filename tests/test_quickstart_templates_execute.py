@@ -50,13 +50,11 @@ GEN_DIR = "__fluid_ci_gen"
 #: "read nothing". These are ratchets, not equalities: adding a template or
 #: a stage raises the real number and stays green.
 MIN_TEMPLATES = 13
-#: Lowered from 30 and 25 when the customer-360 template became two embedded-SQL builds
-#: (its five stages were five scripts and five views; two builds are two of each).
-MIN_SCRIPTS = 25
+MIN_SCRIPTS = 30
 #: The floor with teeth for the materialisation. If stages silently stopped
 #: becoming views, the template and file counts would be unchanged and only
 #: this would collapse.
-MIN_MATERIALISED_VIEWS = 19
+MIN_MATERIALISED_VIEWS = 25
 
 #: Set by the CI leg that exists to run this gate. When set, a missing
 #: duckdb is a FAILURE, not a skip -- a `.[dev]` install (a contributor's,

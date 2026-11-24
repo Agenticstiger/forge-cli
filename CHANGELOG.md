@@ -26,12 +26,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`hello-transformation`) no longer lands the placeholder: its result table is `result_<id>`
   with every character outside `[A-Za-z0-9_]` mapped to `_`. A materialize result now lists the
   file it wrote under `written`.
-- **The `customer-360` quickstart template runs on the local engine.** Its single multi-stage
-  build had no `properties.sql`, which the local engine runs, so it landed the placeholder. It now
-  has two `embedded-logic` builds, `customer_360_pipeline` (`outputs: [customer_360_master]`) and
-  `high_value_customers_build` (`outputs: [high_value_customers]`), each with self-contained SQL
-  (the former stages as CTEs). `high_value_customers` is empty with the sample data, whose order
-  dates are old for the `CURRENT_DATE`-based recency.
+- **The local engine runs `pattern: multi-stage` builds.** The local planner read only a build's
+  top-level `properties.sql`, so the eight bundled multi-stage templates and the quickstart landed
+  the placeholder (and, with the placeholder writers gone, would be refused). It now runs
+  `properties.stages[]` in `dependsOn` order (stdlib `graphlib`; independent stages keep their
+  listed order), materialises each stage's SQL as a table under its `outputs` names so a later
+  stage reads an earlier one, and lands each expose from the stage output it maps to
+  (`build_output_exposes` reads the stages' `outputs` when a multi-stage build declares none). A
+  cycle (`build_stage_cycle`), a `dependsOn` that names no stage (`build_stage_unknown_dependency`),
+  a stage with no SQL (`build_stage_has_no_sql`), an output name that is not a safe identifier
+  (`build_stage_unsafe_name`) and a stage shape the engine cannot run (`build_stage_unsupported`)
+  are refused before anything is written. All 13 bundled templates apply locally, in the default
+  mode and under `--mode amend-and-build`; `customer-360` keeps its five stages.
 - **The federation digest check runs on every apply engine.** `validate_federated_consumes` (the
   warn-only gate that reports a drifted `upstreamDigest` pin) was called only below the OpenTofu
   branch and the build modes' early returns, so `fluid apply` on aws / gcp / snowflake and

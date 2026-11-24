@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
+from fluid_build.providers._sql_safety import validate_ident
+
 # SDK contract helper (optional)
 try:
     from fluid_provider_sdk import ContractHelper as _ContractHelper
@@ -58,9 +60,276 @@ class LocalPlanError(FluidUserError):
     problems) or ``build_has_no_sql`` (a build the local engine must run has no
     SQL). Both used to end in a placeholder file (``id,value / 1,materialized``,
     ``SELECT 1 AS demo_col``) and "Data product deployed successfully".
+
+    The stages of a ``pattern: multi-stage`` build add ``build_stage_cycle``,
+    ``build_stage_unknown_dependency``, ``build_stage_has_no_sql``,
+    ``build_stage_unsupported`` and ``build_stage_unsafe_name``
+    (:func:`ordered_stages`).
     """
 
     code: str = "local_plan_invalid"
+
+
+# ───────────────────── multi-stage builds ─────────────────────
+#
+# A ``pattern: multi-stage`` build keeps its SQL in ``properties.stages[]``, each
+# stage ``{name, outputs, dependsOn, properties: {sql}}``: the same fields the dbt
+# and sql engines read (``engines/_stages.py``). The local engine runs the stages
+# in ``dependsOn`` order in one session and keeps each as a DuckDB table under
+# its ``outputs`` names, because a stage's SQL refers to an earlier stage by its
+# OUTPUT name (``FROM customer_base``), never by the stage's own name. A stage
+# that names no output is kept under its stage name, with every character that is
+# no letter, digit or ``_`` mapped to ``_`` (and a ``_`` in front when that would
+# start with a digit).
+
+#: The keys a stage may carry (schema ``multiStagePattern.stages[]``).
+_STAGE_KEYS = frozenset({"name", "pattern", "properties", "dependsOn", "outputs", "tags", "labels"})
+#: ``properties.language`` values that are DuckDB SQL.
+_SQL_LANGUAGES = frozenset({"sql", "duckdb", "duckdb_sql", "duckdb-sql"})
+
+
+@dataclass(frozen=True)
+class Stage:
+    """One stage the local engine runs: ``sql`` creates ``tables[0]``; every other
+    table is a copy of it."""
+
+    name: str
+    sql: str
+    tables: Tuple[str, ...]
+    depends_on: Tuple[str, ...]
+
+
+def is_multi_stage_build(build: Mapping[str, Any]) -> bool:
+    """``pattern: multi-stage`` with a non-empty ``properties.stages``."""
+    props = build.get("properties")
+    return (
+        str(build.get("pattern") or "").strip().lower() == "multi-stage"
+        and isinstance(props, Mapping)
+        and bool(props.get("stages"))
+    )
+
+
+def _stage_error(code: str, build_id: str, what: str, why: str, fix: str, **extras: Any):
+    return LocalPlanError(
+        code=code,
+        what=what,
+        why=why,
+        fix=fix,
+        doc=doc_url(),
+        extras={"buildId": build_id, **extras},
+    )
+
+
+def _default_stage_table(name: str) -> str:
+    table = re.sub(r"[^0-9A-Za-z_]", "_", name)
+    return table if re.match(r"[A-Za-z_]", table) else f"_{table}"
+
+
+def _parse_stage(build_id: str, idx: int, raw: Any) -> Stage:
+    """One stage, or the named refusal for a shape the local engine cannot run."""
+
+    def unsupported(what: str, why: str, fix: str) -> LocalPlanError:
+        return _stage_error("build_stage_unsupported", build_id, what, why, fix, stage=idx)
+
+    if not isinstance(raw, Mapping):
+        raise unsupported(
+            f"build {build_id!r} stage {idx} is not a mapping",
+            "A stage is {name, outputs, dependsOn, properties: {sql}}.",
+            "Write each stage as a mapping.",
+        )
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise unsupported(
+            f"build {build_id!r} stage {idx} has no name",
+            "dependsOn and the stage's table name refer to a stage by its name.",
+            "Give the stage a name.",
+        )
+    where = f"build {build_id!r} stage {name!r}"
+    unknown = sorted(str(k) for k in raw if k not in _STAGE_KEYS)
+    if unknown:
+        raise unsupported(
+            f"{where} carries {', '.join(unknown)}",
+            "The local engine runs a stage's properties.sql; it does not know these keys.",
+            "Remove them, or run the build with the engine that owns them.",
+        )
+    props = raw.get("properties")
+    if props is None:
+        props = {}
+    if not isinstance(props, Mapping):
+        raise unsupported(
+            f"{where} has properties that are not a mapping", "properties holds sql.", "Fix it."
+        )
+    language = props.get("language")
+    if language is not None and str(language).strip().lower() not in _SQL_LANGUAGES:
+        raise unsupported(
+            f"{where} has properties.language {language!r}",
+            "The local engine runs SQL on DuckDB only.",
+            "Run this build with the engine for that language.",
+        )
+    if props.get("parameters"):
+        raise unsupported(
+            f"{where} declares properties.parameters",
+            "A stage's inputs are not bound by the local engine: it binds the build's own "
+            "properties.parameters.inputs.",
+            "Move the inputs to the build's properties.parameters.inputs, or read the files "
+            "in the stage's SQL.",
+        )
+    sql = props.get("sql")
+    if sql is not None and not isinstance(sql, str):
+        raise unsupported(
+            f"{where} has a properties.sql that is not text",
+            "The local engine runs the SQL string as written.",
+            "Write the SQL inline.",
+        )
+    if not (sql or "").strip():
+        other = sorted(
+            str(k) for k, v in props.items() if k != "sql" and v not in (None, "", [], {})
+        )
+        if other:
+            raise unsupported(
+                f"{where} has no properties.sql, only {', '.join(other)}",
+                "The local engine runs inline SQL; it does not read these.",
+                "Write the stage's SQL in properties.sql.",
+            )
+        raise _stage_error(
+            "build_stage_has_no_sql",
+            build_id,
+            f"{where} has no SQL",
+            "A stage with no SQL has nothing to run, and a placeholder table would let the "
+            "stages after it run against a dummy relation.",
+            "Give the stage a properties.sql, or remove it.",
+            stage=name,
+        )
+    outputs = raw.get("outputs")
+    if outputs is None:
+        outputs = []
+    if not isinstance(outputs, list) or not all(isinstance(o, str) and o for o in outputs):
+        raise unsupported(
+            f"{where} has outputs that are not a list of names",
+            "outputs lists the names the stage's result is kept under.",
+            "Write outputs as a list of names.",
+        )
+    tables = tuple(dict.fromkeys(outputs)) or (_default_stage_table(name),)
+    for table in tables:
+        try:
+            validate_ident(table)
+        except ValueError:
+            raise _stage_error(
+                "build_stage_unsafe_name",
+                build_id,
+                f"{where} names the output {table!r}, which is no safe SQL identifier",
+                "Later stages refer to an output by this name, so it is used as written: "
+                "letters, digits and '_', not starting with a digit.",
+                "Rename the output.",
+                stage=name,
+                output=table,
+            ) from None
+    depends = raw.get("dependsOn")
+    if depends is None:
+        depends = []
+    if not isinstance(depends, list) or not all(isinstance(d, str) for d in depends):
+        raise unsupported(
+            f"{where} has dependsOn that is not a list of stage names",
+            "dependsOn orders the stages.",
+            "Write dependsOn as a list of stage names.",
+        )
+    return Stage(name=name, sql=sql, tables=tables, depends_on=tuple(dict.fromkeys(depends)))
+
+
+def ordered_stages(build: Mapping[str, Any]) -> List[Stage]:
+    """The stages of a multi-stage build in ``dependsOn`` order.
+
+    ``graphlib.TopologicalSorter`` orders them; of the stages ready at one point
+    the one listed first goes first, so stages that are independent keep the
+    order they are listed in. Raises :class:`LocalPlanError`: ``build_stage_cycle``,
+    ``build_stage_unknown_dependency``, ``build_stage_has_no_sql``,
+    ``build_stage_unsupported`` or ``build_stage_unsafe_name``. Nothing is
+    written before this returns.
+    """
+    import graphlib  # stdlib; kept off the ``fluid --help`` import path
+
+    build_id = str(build.get("id") or "?")
+    props = build.get("properties") or {}
+    raw = props.get("stages")
+    if str(props.get("sql") or "").strip():
+        raise _stage_error(
+            "build_stage_unsupported",
+            build_id,
+            f"build {build_id!r} has both properties.sql and properties.stages",
+            "Which of the two the local engine should run is a guess.",
+            "Keep the stages, or the SQL.",
+        )
+    if not isinstance(raw, list):
+        raise _stage_error(
+            "build_stage_unsupported",
+            build_id,
+            f"build {build_id!r} has properties.stages that is not a list",
+            "stages is a list of {name, outputs, dependsOn, properties}.",
+            "Write stages as a list.",
+        )
+    parsed = [_parse_stage(build_id, i, item) for i, item in enumerate(raw)]
+    by_name: Dict[str, Stage] = {}
+    for stage in parsed:
+        if stage.name in by_name:
+            raise _stage_error(
+                "build_stage_unsupported",
+                build_id,
+                f"build {build_id!r} has two stages named {stage.name!r}",
+                "dependsOn refers to a stage by its name.",
+                "Rename one of them.",
+                stage=stage.name,
+            )
+        by_name[stage.name] = stage
+    writer: Dict[str, str] = {}
+    for stage in parsed:
+        for table in stage.tables:
+            other = writer.setdefault(table.lower(), stage.name)
+            if other != stage.name:  # DuckDB identifiers are case-insensitive
+                raise _stage_error(
+                    "build_stage_unsupported",
+                    build_id,
+                    f"stages {other!r} and {stage.name!r} both write the table {table!r}",
+                    "The second would replace the first's rows.",
+                    "Give one of them another output name.",
+                    table=table,
+                )
+        for dep in stage.depends_on:
+            if dep not in by_name:
+                raise _stage_error(
+                    "build_stage_unknown_dependency",
+                    build_id,
+                    f"stage {stage.name!r} of build {build_id!r} depends on {dep!r}, "
+                    "which is no stage",
+                    "dependsOn names stages, not their outputs. The stages are "
+                    f"{', '.join(repr(n) for n in by_name)}.",
+                    "Name an existing stage in dependsOn, or add the stage.",
+                    stage=stage.name,
+                    dependsOn=dep,
+                )
+    position = {stage.name: i for i, stage in enumerate(parsed)}
+    sorter = graphlib.TopologicalSorter({s.name: list(s.depends_on) for s in parsed})
+    try:
+        sorter.prepare()
+    except graphlib.CycleError as exc:
+        cycle = [str(n) for n in exc.args[1]]
+        raise _stage_error(
+            "build_stage_cycle",
+            build_id,
+            f"the stages of build {build_id!r} depend on each other in a cycle: "
+            f"{' -> '.join(cycle)}",
+            "No stage of a cycle can run first.",
+            "Remove one dependsOn edge of the cycle.",
+            cycle=cycle,
+        ) from None
+    ordered: List[Stage] = []
+    ready: List[str] = []
+    while sorter.is_active():
+        ready.extend(sorter.get_ready())
+        ready.sort(key=position.__getitem__)
+        name = ready.pop(0)
+        ordered.append(by_name[name])
+        sorter.done(name)
+    return ordered
 
 
 def _result_table(build_id: Any) -> str:
@@ -245,10 +514,14 @@ def plan_actions(
             log.debug("local planner: build '%s' runs on forge's Spark runner", build_id)
             continue
 
-        # Extract SQL from various formats
-        sql_text = _extract_sql(build, contract, log)
+        # A multi-stage build keeps its SQL in its stages (ordered, or refused, here:
+        # before any action of this build is planned).
+        stages = ordered_stages(build) if is_multi_stage_build(build) else None
 
-        if not sql_text:
+        # Extract SQL from various formats
+        sql_text = None if stages else _extract_sql(build, contract, log)
+
+        if not stages and not sql_text:
             log.warning(f"Build {build_id} has no SQL, skipping")
             continue
 
@@ -299,6 +572,28 @@ def plan_actions(
         # exposes, refuses the plan instead of landing one build's rows in
         # another's file.
         landed = build_output_exposes(contract, build)
+
+        if stages:
+            stage_actions = _plan_stage_actions(
+                stages,
+                build_id=build_id,
+                is_destructive=is_destructive,
+                input_tables=input_tables,
+                input_specs=input_specs if input_specs else sorted(_explicit_input_names(build)),
+                taken={*expose_ids, *loaded_tables, *(a.get("resource_id") for a in actions)},
+                loaded_tables=loaded_tables,
+                table_owner=table_owner,
+                actions=actions,
+                dependencies=dependencies,
+            )
+            produced = {t for stage in stages for t in stage.tables}
+            for expose in landed:  # an expose lands from the stage output it is named by
+                if str(get_expose_id(expose)) in produced:
+                    written_by[str(get_expose_id(expose))] = str(get_expose_id(expose))
+            log.debug(
+                "local planner: build '%s' planned %d stage action(s)", build_id, stage_actions
+            )
+            continue
 
         # Determine output table name (temp table for intermediate results)
         output_table = build.get("output_table") or _result_table(build_id)
@@ -465,14 +760,16 @@ def plan_actions(
     # dependencies like "result_clean_customers" resolve to the resource_id
     # "clean_customers" that produces that table.
     table_to_resource: Dict[str, str] = {}
+    # A resource_id maps to itself (some actions depend on resource_ids directly), but a
+    # table name maps to the action that PRODUCES it, and wins: a stage's table can be
+    # named like the expose it lands (``customer_360_master``), and the expose's own
+    # action must not become its own dependency.
     for action in actions:
-        rid = action.get("resource_id")
-        tname = action.get("table_name")
-        if rid and tname:
-            table_to_resource[tname] = rid
-        # Also map resource_id to itself (some actions depend on resource_ids directly)
-        if rid:
-            table_to_resource[rid] = rid
+        if action.get("resource_id"):
+            table_to_resource[action["resource_id"]] = action["resource_id"]
+    for action in actions:
+        if action.get("resource_id") and action.get("table_name"):
+            table_to_resource[action["table_name"]] = action["resource_id"]
 
     # Normalize dependencies to use resource_ids
     normalized_deps: Dict[str, Set[str]] = {}
@@ -484,6 +781,106 @@ def plan_actions(
     log.info(f"Generated {len(sorted_actions)} actions for contract {contract_id}")
 
     return sorted_actions
+
+
+def _plan_stage_actions(
+    stages: List[Stage],
+    *,
+    build_id: str,
+    is_destructive: bool,
+    input_tables: Set[str],
+    input_specs: List[Any],
+    taken: Set[str],
+    loaded_tables: Set[str],
+    table_owner: Dict[str, str],
+    actions: List[Dict[str, Any]],
+    dependencies: Dict[str, Set[str]],
+) -> int:
+    """Append the actions of a multi-stage build's ``stages`` (already in order).
+
+    Each stage is an ``execute_sql`` creating its first output table; every other
+    output is a second ``execute_sql`` copying it. A stage depends on the build's
+    input tables, on every table of the stages in its ``dependsOn``, and on the
+    stage before it, so the plan's order is the stage order exactly. Resource ids
+    (``<build>__stage__<name>``) are made unique against ``taken``: the exposes',
+    the inputs' and the other actions'. Returns the number of actions appended.
+    """
+    taken_lower = {t.lower() for t in loaded_tables} | {t.lower() for t in table_owner}
+    tables_of = {stage.name: stage.tables for stage in stages}
+
+    def fresh(base: str) -> str:
+        rid, n = base, 2
+        while rid in taken:
+            rid, n = f"{base}_{n}", n + 1
+        taken.add(rid)
+        return rid
+
+    before = len(actions)
+    previous: Set[str] = set()
+    for stage in stages:
+        for table in stage.tables:
+            if table.lower() in taken_lower:
+                owner = table_owner.get(table.lower())
+                raise _stage_error(
+                    "build_stage_unsupported",
+                    build_id,
+                    f"stage {stage.name!r} of build {build_id!r} writes the table {table!r}, "
+                    "which an input or another build already uses"
+                    + (f" ({owner!r})" if owner else ""),
+                    "The stage would replace its rows.",
+                    "Give the stage another output name.",
+                    stage=stage.name,
+                    table=table,
+                )
+            taken_lower.add(table.lower())
+            table_owner[table.lower()] = build_id
+        first = stage.tables[0]
+        rid = fresh(f"{build_id}__stage__{stage.name}")
+        upstream = {t for dep in stage.depends_on for t in tables_of[dep]}
+        actions.append(
+            {
+                "op": "execute_sql",
+                "resource_type": "transformation",
+                "resource_id": rid,
+                "table_name": first,
+                "depends_on": sorted(input_tables | upstream | previous),
+                "mode": "replace" if is_destructive else "amend",
+                "payload": {
+                    "sql": stage.sql,
+                    "inputs": list(input_specs),
+                    "output_table": first,
+                    # An intermediate table: no preview file under runtime/out.
+                    "preview": False,
+                    "build": build_id,
+                    "stage": stage.name,
+                },
+            }
+        )
+        dependencies[rid] = input_tables | upstream | previous
+        for extra in stage.tables[1:]:  # the other outputs are copies of the first
+            copy_rid = fresh(f"{rid}__copy__{extra}")
+            actions.append(
+                {
+                    "op": "execute_sql",
+                    "resource_type": "transformation",
+                    "resource_id": copy_rid,
+                    "table_name": extra,
+                    "depends_on": [first],
+                    "mode": "replace" if is_destructive else "amend",
+                    "payload": {
+                        "sql": f"SELECT * FROM {validate_ident(first)}",
+                        "inputs": [],
+                        "output_table": extra,
+                        "preview": False,
+                        "build": build_id,
+                        "stage": stage.name,
+                    },
+                }
+            )
+            dependencies[copy_rid] = {first}
+        previous = set(stage.tables)
+        loaded_tables.update(stage.tables)
+    return len(actions) - before
 
 
 def _infer_format(path: str, explicit_format: Optional[str] = None) -> str:

@@ -592,9 +592,8 @@ class LocalProvider(BaseProvider):
                 why="; ".join(problems),
                 fix=(
                     "Give each expose a build that names it in builds[].outputs and "
-                    "carries properties.sql, or declare the expose's source_table. The local "
-                    "engine runs a build's properties.sql only: the stages of a "
-                    "pattern: multi-stage build are not run."
+                    "carries properties.sql (or, for a pattern: multi-stage build, a stage "
+                    "whose outputs name it), or declare the expose's source_table."
                 ),
                 doc=doc_url(),
                 extras={"errors": list(problems)},
@@ -701,6 +700,11 @@ class LocalProvider(BaseProvider):
             # spark.reconcile) and writes its Iceberg output.
             self._log_info("local_build_runs_on_spark_runner", {"build": build.get("id")})
             return [{"op": "noop", "skipped": True, "reason": "build_runs_on_spark_runner"}]
+        from .planner import is_multi_stage_build
+
+        if build and is_multi_stage_build(build):
+            return self._derive_stage_actions(contract, build)
+
         sql_text: Optional[str] = None
         inputs_spec: List[Any] = []
 
@@ -715,18 +719,7 @@ class LocalProvider(BaseProvider):
                 self._log_info("local_sql_inline", {"length": len(sql_text)})
 
                 # Get inputs from parameters.inputs (v0.7.x)
-                params = props.get("parameters") or {}
-                param_inputs = params.get("inputs") or []
-                for inp in param_inputs:
-                    if isinstance(inp, dict):
-                        path = inp.get("path")
-                        name = (
-                            inp.get("name") or _guess_table_name_from_path(Path(path))
-                            if path
-                            else None
-                        )
-                        if path and name:
-                            inputs_spec.append({"path": path, "table": name})
+                inputs_spec.extend(self._param_inputs_spec(props))
             else:
                 # Try model file path (legacy, dropped)
                 trans = build.get("transformation") or {}
@@ -816,12 +809,13 @@ class LocalProvider(BaseProvider):
                     code="build_has_no_sql",
                     what=f"build {build_id!r} has no SQL for the local engine to run",
                     why=(
-                        "The local engine runs properties.sql (or a model file); a multi-stage "
-                        "build without it has nothing to write, and a placeholder file would "
-                        "stand in for the rows."
+                        "The local engine runs properties.sql (or a model file, or the "
+                        "properties.stages of a multi-stage build); this build has none of them, "
+                        "so there is nothing to write, and a placeholder file would stand in "
+                        "for the rows."
                     ),
                     fix=(
-                        f"Give builds[id={build_id}] a properties.sql, one build per expose, "
+                        f"Give builds[id={build_id}] a properties.sql (or properties.stages), "
                         "or run the build with the engine that owns it."
                     ),
                     doc=doc_url(),
@@ -829,6 +823,117 @@ class LocalProvider(BaseProvider):
                 )
 
         return [{"op": "sql", "sql": sql_text, "inputs": inputs_spec, "outputs": output_paths}]
+
+    def _derive_stage_actions(
+        self, contract: Dict[str, Any], build: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """The actions of a ``pattern: multi-stage`` build: one SQL action per stage
+        (and per extra output of a stage), in ``dependsOn`` order.
+
+        They run in the one ``apply`` call, so every stage reads the tables the
+        stages before it created by their output names. The action that creates the
+        table an expose is named by also writes that expose's file
+        (:meth:`_stage_expose_spec`). Refuses before anything runs: a stage the
+        local engine cannot run (:func:`~.planner.ordered_stages`), and an expose
+        the build names that no stage produces (``local_plan_invalid``).
+        """
+        from fluid_build._errors import doc_url
+        from fluid_build.util.contract import build_output_exposes, get_expose_id
+
+        from .planner import LocalPlanError, ordered_stages
+
+        stages = ordered_stages(build)
+        exposes = build_output_exposes(contract, build)
+        produced = {t for stage in stages for t in stage.tables}
+        missing = [str(get_expose_id(e)) for e in exposes if str(get_expose_id(e)) not in produced]
+        if missing:
+            build_id = build.get("id") or "?"
+            raise LocalPlanError(
+                code="local_plan_invalid",
+                what=(
+                    f"build {build_id!r} names the expose(s) {', '.join(map(repr, missing))} "
+                    "in outputs, and no stage produces them; nothing was written"
+                ),
+                why=(
+                    "An expose lands from the stage output of its own name, and a stage "
+                    "output of that name does not exist."
+                ),
+                fix=f"List {', '.join(missing)} in the outputs of the stage that produces it.",
+                doc=doc_url(),
+                extras={"buildId": str(build_id), "exposeIds": missing},
+            )
+        if not exposes:
+            self._log_warn(
+                "local_stages_land_nothing",
+                {"build": build.get("id"), "reason": "no stage output is the id of an expose"},
+            )
+        by_table: Dict[str, List[Dict[str, Any]]] = {}
+        for expose in exposes:
+            by_table.setdefault(str(get_expose_id(expose)), []).append(expose)
+
+        def specs_for(table: str) -> List[Dict[str, str]]:
+            found = (self._stage_expose_spec(contract, e) for e in by_table.get(table, []))
+            return [spec for spec in found if spec is not None]
+
+        inputs_spec = self._param_inputs_spec(build.get("properties") or {})
+        actions: List[Dict[str, Any]] = []
+        for stage in stages:
+            first = stage.tables[0]
+            actions.append(
+                {
+                    "op": "sql",
+                    "sql": stage.sql,
+                    "inputs": list(inputs_spec),
+                    "outputs": specs_for(first),
+                    "output_table": first,
+                    "preview": False,
+                    "stage": stage.name,
+                }
+            )
+            for extra in stage.tables[1:]:  # the other outputs are copies of the first
+                actions.append(
+                    {
+                        "op": "sql",
+                        "sql": f"SELECT * FROM {validate_ident(first)}",
+                        "inputs": [],
+                        "outputs": specs_for(extra),
+                        "output_table": extra,
+                        "preview": False,
+                        "stage": stage.name,
+                    }
+                )
+        return actions
+
+    @staticmethod
+    def _param_inputs_spec(props: Dict[str, Any]) -> List[Any]:
+        """The files ``properties.parameters.inputs`` declares, as ``{path, table}`` specs."""
+        inputs_spec: List[Any] = []
+        params = props.get("parameters") or {}
+        for inp in params.get("inputs") or []:
+            if isinstance(inp, dict):
+                path = inp.get("path")
+                name = inp.get("name") or _guess_table_name_from_path(Path(path)) if path else None
+                if path and name:
+                    inputs_spec.append({"path": path, "table": name})
+        return inputs_spec
+
+    def _stage_expose_spec(
+        self, contract: Dict[str, Any], expose: Dict[str, Any]
+    ) -> Optional[Dict[str, str]]:
+        """Where a stage writes ``expose``: its declared local path and format, else
+        ``runtime/out/<exposeId>.csv`` (``.parquet`` for a parquet one). ``None`` for
+        one bound to another platform, which another stage delivers
+        (:meth:`_expose_output_spec` warns)."""
+        spec = self._expose_output_spec(contract, expose, first=False)
+        if spec is not None:
+            return spec
+        binding = expose.get("binding") or {}
+        loc = binding.get("location") or expose.get("location") or {}
+        if loc.get("path"):
+            return None
+        fmt = str(binding.get("format") or expose.get("format") or "").lower()
+        ext = "parquet" if fmt in {"parquet", "pq"} else "csv"
+        return {"path": f"runtime/out/{expose.get('exposeId')}.{ext}", "format": ext}
 
     def _expose_output_spec(
         self, contract: Dict[str, Any], expose: Dict[str, Any], *, first: bool
@@ -1085,7 +1190,7 @@ class LocalProvider(BaseProvider):
         if outputs:
             for out_spec in outputs:
                 written.append(self._write_output(con, rel, out_spec))
-        else:
+        elif action.get("preview", True):  # a stage's intermediate table asks for none
             p = Path(f"runtime/out/preview_{idx}.csv")
 
             def _write_preview():

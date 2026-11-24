@@ -118,6 +118,27 @@ class BuildOutputsError(FluidUserError):
     code: str = "build_outputs_undeclared"
 
 
+def _stage_output_names(build: Mapping[str, Any]) -> Optional[List[str]]:
+    """Every name the stages of a ``pattern: multi-stage`` build list in their
+    ``outputs``, in stage order; ``None`` for any other build.
+
+    Read leniently: a malformed stage is the local planner's to refuse
+    (``build_stage_unsupported``), not this lookup's.
+    """
+    props = build.get("properties")
+    stages = props.get("stages") if isinstance(props, Mapping) else None
+    if str(build.get("pattern") or "").strip().lower() != "multi-stage" or not stages:
+        return None
+    if not isinstance(stages, list):
+        return None
+    names: List[str] = []
+    for stage in stages:
+        outs = stage.get("outputs") if isinstance(stage, Mapping) else None
+        if isinstance(outs, list):
+            names.extend(n for n in outs if isinstance(n, str))
+    return names
+
+
 def build_output_exposes(
     contract: Mapping[str, Any], build: Mapping[str, Any]
 ) -> List[Dict[str, Any]]:
@@ -132,14 +153,21 @@ def build_output_exposes(
 
     * ``outputs`` lists exposeIds: each must be an ``exposeId`` of the contract
       (:class:`BuildOutputsError`, ``build_output_unknown_expose``, otherwise).
-    * ``outputs`` unset or empty: a contract with one expose (or none) keeps
-      that one; a contract with several refuses
+    * ``outputs`` unset or empty on a ``pattern: multi-stage`` build with
+      ``properties.stages``: the exposes whose ``exposeId`` some stage names in
+      its own ``outputs`` (in the order the stages name them). A stage output
+      that is no exposeId is an intermediate table, and an expose no stage
+      names is not this build's: nothing is guessed, so a contract with several
+      exposes does not refuse here.
+    * ``outputs`` unset or empty otherwise: a contract with one expose (or
+      none) keeps that one; a contract with several refuses
       (``build_outputs_undeclared``), because which build writes which expose
       is then a guess.
     """
     exposes = [e for e in contract.get("exposes") or [] if isinstance(e, Mapping)]
     build_id = str(build.get("id") or "?")
     outputs = build.get("outputs")
+    stage_outputs = _stage_output_names(build)
     if isinstance(outputs, list) and outputs:
         by_id: Dict[str, Dict[str, Any]] = {}
         for expose in exposes:
@@ -169,6 +197,13 @@ def build_output_exposes(
             if not any(expose is done for done in resolved):
                 resolved.append(expose)
         return resolved
+    if stage_outputs is not None:
+        by_stage_name: Dict[str, Dict[str, Any]] = {}
+        for expose in exposes:
+            expose_id = get_expose_id(expose)
+            if isinstance(expose_id, str):
+                by_stage_name.setdefault(expose_id, expose)  # type: ignore[arg-type]
+        return [by_stage_name[n] for n in dict.fromkeys(stage_outputs) if n in by_stage_name]
     if len(exposes) > 1:
         raise BuildOutputsError(
             code="build_outputs_undeclared",

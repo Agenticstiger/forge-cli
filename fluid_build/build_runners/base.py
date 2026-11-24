@@ -1156,7 +1156,8 @@ def _plan_local_sql(
     """``(planned, io)`` for a build on the local DuckDB engine; ``planned`` False if refused.
 
     Only a build carrying inline SQL reads the views (``io``): one without it
-    (a multi-stage ``engine: sql`` build) keeps the provider's old handling,
+    (a multi-stage ``engine: sql`` build, whose stages the provider runs in
+    ``dependsOn`` order in this one apply) keeps the provider's handling,
     except that a first expose it would write as a local file of the wrong
     kind (a BigQuery table, a ``gs://`` path) is refused.
     """

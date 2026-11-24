@@ -6,7 +6,8 @@
 ``fluid init <dir> --quickstart --yes && fluid apply contract.fluid.yaml --yes`` used to
 report success while writing 24-byte parquet files holding a placeholder row, because the
 template's single ``multi-stage`` build carried no ``properties.sql`` the local engine runs.
-The template now has one self-contained SQL build per expose.
+The local engine now runs the stages of a ``multi-stage`` build, so the template is that
+build again.
 """
 
 from __future__ import annotations
