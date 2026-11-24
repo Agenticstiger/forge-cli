@@ -26,9 +26,13 @@ import httpx
 import pytest
 import respx
 
-from fluid_build.forge.core.plan_digest import compute_contract_digest
+from fluid_build.forge.core.plan_digest import (
+    compute_contract_digest,
+    compute_contract_file_digest,
+)
 from fluid_build.forge.federation import (
     FederatedWorkspace,
+    _ClonedContract,
     _fetch_digest_via_catalog,
     _fetch_digest_via_git,
     _fetch_digest_via_http,
@@ -36,6 +40,15 @@ from fluid_build.forge.federation import (
     store_cached_digest,
 )
 from fluid_build.util.safe_yaml import load_yaml_safe
+
+
+def _cloned(directory: Path, text: str) -> _ClonedContract:
+    """A contract file holding ``text`` in ``directory``, as the clone's file lookup returns it."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "contract.fluid.yaml"
+    path.write_text(text, encoding="utf-8")
+    return _ClonedContract(path, directory)
+
 
 # The federation HTTP/catalog backends were migrated off
 # ``urllib.request.urlopen`` (which followed up to 10 redirects and
@@ -175,9 +188,9 @@ class TestCatalogBackend:
 
 
 class TestGitBackend:
-    """The git backend reads a contract via gitpython / shell-out then
-    hashes it. Patch :func:`_git_read_contract` so we don't need a real
-    repo on disk for the happy path."""
+    """The git backend finds the contract in the cloned repo, composes it and
+    hashes it. Patch :func:`_git_contract_file` so we don't need a real
+    repo on disk for the happy path (``test_federation_resilience`` runs real git)."""
 
     def _ws(self, **overrides) -> FederatedWorkspace:
         defaults = dict(
@@ -188,7 +201,7 @@ class TestGitBackend:
         defaults.update(overrides)
         return FederatedWorkspace(**defaults)
 
-    def test_happy_path_uses_compute_contract_digest(self):
+    def test_happy_path_uses_compute_contract_digest(self, tmp_path: Path):
         """The digest MUST be the canonical contract digest.
 
         Asserting only ``startswith("sha256:")`` is not enough — the
@@ -199,15 +212,15 @@ class TestGitBackend:
         ws = self._ws()
         contract_text = "fluidVersion: 0.7.3\nid: external.orders\nexposes:\n  - id: orders\n"
         with patch(
-            "fluid_build.forge.federation._git_read_contract",
-            return_value=contract_text,
+            "fluid_build.forge.federation._git_contract_file",
+            return_value=_cloned(tmp_path, contract_text),
         ):
             result = _fetch_digest_via_git(ws, "external.orders", "1")
         assert result == compute_contract_digest(load_yaml_safe(contract_text))
 
     def test_missing_repo_returns_none(self):
         ws = self._ws()
-        with patch("fluid_build.forge.federation._git_read_contract", return_value=None):
+        with patch("fluid_build.forge.federation._git_contract_file", return_value=None):
             result = _fetch_digest_via_git(ws, "external.orders", "1")
         assert result is None
 
@@ -242,8 +255,10 @@ class TestGitBackend:
                 return_value=True,
             ) as mock_sh,
             patch(
-                "fluid_build.forge.federation._read_first_existing_contract",
-                return_value="fluidVersion: 0.7.3\nid: ext.x\n",
+                "fluid_build.forge.federation._first_existing_contract_path",
+                return_value=_cloned(
+                    tmp_path / "home_cache" / "ext-sh", "fluidVersion: 0.7.3\nid: ext.x\n"
+                ).path,
             ),
         ):
             result = _fetch_digest_via_git(ws, "ext.x", "1")
@@ -388,14 +403,18 @@ class TestGitBackendDigestIsCanonicalNotRawText:
     )
     _CRLF = _CANONICAL.replace("\n", "\r\n")
 
+    @pytest.fixture(autouse=True)
+    def _clone_dir(self, tmp_path: Path) -> None:
+        self.clone = tmp_path / "clone"
+
     def _digest_for(self, contract_text: str):
         with patch(
-            "fluid_build.forge.federation._git_read_contract",
-            return_value=contract_text,
+            "fluid_build.forge.federation._git_contract_file",
+            return_value=_cloned(self.clone, contract_text),
         ):
             return _fetch_digest_via_git(self._ws(), "external.orders", "1")
 
-    def test_compute_contract_digest_actually_exists(self):
+    def test_compute_contract_file_digest_actually_exists(self):
         """The symbol the git backend imports must be real.
 
         This is the root-cause pin: the original bug was an import of a
@@ -404,7 +423,7 @@ class TestGitBackendDigestIsCanonicalNotRawText:
         """
         from fluid_build.forge import federation as _fed
 
-        assert _fed.compute_contract_digest is compute_contract_digest
+        assert _fed.compute_contract_file_digest is compute_contract_file_digest
 
     def test_digest_is_not_the_raw_text_hash(self):
         """The old fallback hashed ``contract_text`` directly. Assert the
@@ -452,11 +471,11 @@ class TestGitBackendDigestIsCanonicalNotRawText:
         """
         with (
             patch(
-                "fluid_build.forge.federation._git_read_contract",
-                return_value=self._CANONICAL,
+                "fluid_build.forge.federation._git_contract_file",
+                return_value=_cloned(self.clone, self._CANONICAL),
             ),
             patch(
-                "fluid_build.forge.federation.compute_contract_digest",
+                "fluid_build.forge.federation.compute_contract_file_digest",
                 side_effect=ImportError("boom"),
             ),
             pytest.raises(ImportError),

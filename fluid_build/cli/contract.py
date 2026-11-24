@@ -212,9 +212,16 @@ def _run_digest(args, logger: logging.Logger) -> int:
     those look like upstream drift. It is the same function ``fluid
     apply``'s federation gate compares against, so what this prints is
     exactly what that gate expects to see.
+
+    The contract is digested with its ``$ref`` fragments resolved, as
+    ``fluid bundle`` and every other stage read it: a contract split into
+    ``fragments/`` and the same contract in one file have one digest, and an
+    edit to a fragment moves it. A ``$ref`` that cannot be resolved fails
+    the command (``digest_contract_unresolvable``) rather than hashing what
+    could be read.
     """
     # Lazy import — keeps `fluid contract apply-suggestion` cold-start cheap.
-    from fluid_build.forge.core.plan_digest import compute_contract_digest
+    from fluid_build.forge.core.plan_digest import compute_contract_file_digest
 
     path = Path(args.contract)
     if not path.is_file():
@@ -257,7 +264,20 @@ def _run_digest(args, logger: logging.Logger) -> int:
     if not contract:
         raise CLIError(1, "digest_contract_empty", {"path": str(path)})
 
-    digest = compute_contract_digest(contract)
+    # The root above is read only to tell an empty or non-mapping file apart;
+    # the digest is of the composed contract, the one every stage reads.
+    from fluid_build.loader import RefResolutionError
+
+    try:
+        digest = compute_contract_file_digest(path)
+    except RefResolutionError as exc:
+        raise CLIError(
+            1, "digest_contract_unresolvable", {"path": str(path), "error": str(exc)}
+        ) from exc
+    except Exception as exc:
+        raise CLIError(
+            1, "digest_contract_unreadable", {"path": str(path), "error": str(exc)}
+        ) from exc
 
     # Written to stdout rather than through ``cprint``: this is a value to
     # be piped, not a message to be read, and the console layer is free to

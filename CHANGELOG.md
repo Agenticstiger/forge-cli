@@ -59,13 +59,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starting with `/`. The same-document `#key` stays refused. As with `ref_target_suffix_unknown`, a
   contract read only for another product's sake logs it at DEBUG.
 
+### Fixed
+
+- **A contract's digest covers its `$ref` fragments.** `fluid contract digest` and the federation
+  gate's git backend hashed the root file alone, so editing a fragment of a split contract
+  (`fragments/exposes/*.yaml`, written by `fluid split`) left the digest, and so every
+  `consumes[].upstreamDigest` pin on it, unchanged while the deployed contract was different. Both
+  now digest the composed contract, as `fluid bundle` reads it, with `{{ env.* }}` left as
+  written. A contract and its split twin have one digest, whatever the layout. A `$ref` that
+  cannot be resolved, one that loops, one outside the contract's tree, a remote one, an empty
+  contract and a key written twice are errors (`digest_contract_unresolvable`,
+  `digest_contract_unreadable`, `digest_contract_empty`), never a digest of what could be read.
+  For an upstream fetched from git, `$ref`s reach files inside the clone only, whatever
+  `FLUID_REF_ROOT` or a workspace file in the clone say.
+
 ### Upgrade notes
 
+- **A split contract's digest changes once.** If an upstream keeps parts of its contract in `$ref`
+  fragments, the digest that `fluid contract digest` prints, and that `fluid apply`'s federation
+  gate computes, is now of the composed contract. Re-pin `consumes[].upstreamDigest` for such an
+  upstream with `fluid contract digest`. A contract with no `$ref` in it keeps its digest.
 - **Duplicate keys now fail.** A contract, overlay, fragment or workspace file that writes a key
   twice (often a copy-paste slip, which kept the second value) fails every command that composes
   the contract, `validate`, `plan`, `apply`, `bundle` and `generate artifacts` among them, naming
-  the place: remove the copy you do not want. A few commands that only summarise or hash the file
-  as written, `fluid status` and `fluid contract digest` among them, read it as before.
+  the place: remove the copy you do not want. A few commands that only summarise the file
+  as written, `fluid status` among them, read it as before.
 - **A payload with `$ref` keys of its own:** write them `$$ref` instead of keeping the payload as a
   string.
 

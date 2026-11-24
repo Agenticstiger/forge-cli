@@ -51,6 +51,11 @@ The same canonicalisation (``_canonical_json``) also backs
 after parsing it. Keeping both digests on one canonicaliser is the point:
 peers that format the same contract differently must still agree, so a
 raw-text hash is never an acceptable substitute.
+
+What a contract digest covers is the contract as deployed: its ``$ref``
+fragments resolved (:func:`compute_contract_file_digest`), so the same
+contract split across files or kept in one has one digest, and an edit to
+a fragment moves it.
 """
 
 from __future__ import annotations
@@ -59,7 +64,7 @@ import hashlib
 import json
 import unicodedata
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Union
 
 # Plan fields excluded from the planDigest hash input.
 #
@@ -181,9 +186,16 @@ def compute_contract_digest(contract: Mapping[str, Any]) -> str:
     Canonicalisation is *exactly* :func:`compute_plan_digest`'s, shared
     via ``_canonical_json`` so the two cannot drift apart: NFC-normalised
     strings, ``str``-coerced keys, ``sort_keys=True`` compact JSON.
-    Operators can reproduce it externally with::
+    For a contract with no ``$ref`` in it, operators can reproduce it
+    externally with::
 
         yq -o=json '.' contract.fluid.yaml | jq -cSj '.' | shasum -a 256
+
+    ``contract`` is hashed as given: a caller that starts from a file uses
+    :func:`compute_contract_file_digest`, which resolves its ``$ref``
+    fragments first, and one that holds a contract the loader already
+    composed (``LoadedContract``) passes that, so a ref is never resolved
+    twice.
 
     Unlike the plan digest, **nothing is masked out**. A contract has no
     derived digest field and no volatile timestamp, so every key is part
@@ -204,6 +216,41 @@ def compute_contract_digest(contract: Mapping[str, Any]) -> str:
         )
     canonical = _canonical_json(dict(contract))
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def compute_contract_file_digest(
+    path: Union[str, Path], *, ref_root: Optional[Union[str, Path]] = None
+) -> str:
+    """:func:`compute_contract_digest` of the contract file at ``path``, as every command reads it.
+
+    A contract may keep parts of itself in ``$ref`` fragments (``fluid split``
+    writes them), and what is deployed is the composed document. Hashing the
+    root file alone left an edit to a fragment invisible to a downstream
+    ``upstreamDigest`` pin. So the file is composed by
+    :func:`fluid_build.loader.compose_contract`, the one composition behind
+    ``validate``, ``plan``, ``apply`` and ``bundle``, with no environment
+    overlay and every ``{{ env.* }}`` left as written. The digest does not
+    depend on the layout: a contract and its split twin have the same one.
+
+    ``ref_root`` confines the files the refs may reach, as ``ref_root=`` does
+    for the loader; without it the contract's own directory (or its
+    workspace's ``ref_root``) is the root. A caller that composes an upstream
+    it does not control passes the root it trusts: an explicit root wins over
+    ``FLUID_REF_ROOT`` and the workspace file.
+
+    Raises what :func:`~fluid_build.loader.compose_contract` raises: a ``$ref``
+    that cannot be resolved, one that loops, one outside the ref root
+    (:class:`~fluid_build.loader.RefResolutionError`), a file that cannot be
+    read or parsed, a key written twice, a contract with nothing in it
+    (:class:`ValueError`: a truncated download would otherwise be pinned as the
+    digest of ``{}``). Never the digest of what could be read.
+    """
+    from fluid_build.loader import compose_contract
+
+    document = compose_contract(path, ref_root=ref_root).document
+    if not document:
+        raise ValueError(f"{path}: the contract is empty, so it has no digest worth pinning")
+    return compute_contract_digest(document)
 
 
 def read_bundle_digest(tgz_path: Path) -> str:
@@ -723,6 +770,7 @@ __all__ = [
     "dbt_projects_record",
     "coerce_keys_to_str",
     "compute_contract_digest",
+    "compute_contract_file_digest",
     "compute_plan_digest",
     "inject_digests",
     "is_bundle_path",
