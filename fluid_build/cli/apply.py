@@ -940,6 +940,8 @@ def _actions_from_source(
     that don't accept ``mode`` (older signatures) fall back to the
     mode-less call.
     """
+    from fluid_build.util.env_templates import EnvTemplateError
+
     if plan_data is not None:
         # When a destructive mode is in play, re-translate the embedded
         # contract via the provider's native planner so the actions are
@@ -958,6 +960,8 @@ def _actions_from_source(
                 native_actions = provider.plan(contract, mode=mode)
             except TypeError:
                 native_actions = None
+            except EnvTemplateError:
+                raise  # an unset variable is the contract's, not the planner's, to fix
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "plan_retranslation_failed: falling back to recorded actions (%s)",
@@ -986,6 +990,8 @@ def _actions_from_source(
             if actions:
                 logger.info(f"Provider planner generated {len(actions)} actions")
                 return actions
+        except EnvTemplateError:
+            raise  # an unset variable is the contract's, not the planner's, to fix
         except Exception as e:
             logger.warning(f"Provider planner failed ({e}), falling back to action parser")
 

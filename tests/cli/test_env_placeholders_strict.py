@@ -161,6 +161,81 @@ def test_apply_on_the_native_engine_refuses_an_unset_variable_instead_of_writing
     assert not (tmp_path / "x.parquet").exists()
 
 
+def test_apply_on_a_cloud_contract_refuses_an_unset_variable_instead_of_routing_to_the_native_engine(
+    tmp_path, capsys
+):
+    """Choosing the engine renders the contract: a failure to classify it falls back to the
+    native engine, which applied the contract with the placeholder unrendered and exit 0."""
+    rc, shown = _run(["apply", str(_aws(tmp_path)), "--dry-run", "--yes"], capsys)
+
+    assert rc == 1
+    assert "S3_BUCKET" in shown and "not set or empty" in shown
+
+
+def test_the_engine_choice_does_not_swallow_an_unset_variable(tmp_path):
+    from fluid_build.cli._apply_opentofu_engine import resolve_apply_engine
+    from fluid_build.util.env_templates import EnvTemplateError
+
+    args = Namespace(contract=str(_aws(tmp_path)), env=None, provider=None)
+    with pytest.raises(EnvTemplateError):
+        resolve_apply_engine(args, logging.getLogger("test"))
+
+
+def test_a_dry_run_on_the_native_engine_refuses_an_unset_variable_too(
+    tmp_path, capsys, monkeypatch
+):
+    """The provider's planner failure is not a reason to fall back and show a plan for a
+    contract whose path has its first half missing."""
+    monkeypatch.chdir(tmp_path)
+    rc, shown = _run(["apply", str(_local(tmp_path)), "--dry-run", "--yes"], capsys)
+
+    assert rc == 1
+    assert "DIR" in shown and "not set or empty" in shown
+
+
+def test_generate_vector_keeps_the_error_whole(tmp_path, capsys):
+    """The field list and the fix are in what the user sees, not only the first line."""
+    rc, shown = _run(
+        ["generate", "vector", str(_aws(tmp_path)), "--out", str(tmp_path / "v")], capsys
+    )
+
+    assert rc == 1
+    assert "exposes[0].binding.location.bucket" in shown and "Export S3_BUCKET" in shown
+
+
+def test_verify_makes_an_unset_variable_that_exposes_result_and_checks_the_rest(
+    tmp_path, capsys, monkeypatch
+):
+    """One expose naming an unset variable does not end the run, lose the other exposes' results
+    or the --out report."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data.csv").write_text("id,name\n1,a\n", encoding="utf-8")
+    doc = {
+        **_BASE,
+        "exposes": [
+            {
+                "exposeId": expose_id,
+                "kind": "table",
+                "version": "1.0.0",
+                "binding": {"platform": "local", "format": "csv", "location": {"path": path}},
+                "contract": {"schema": [{"name": "id", "type": "integer", "required": True}]},
+            }
+            for expose_id, path in (("unset_one", "{{ env.DIR }}/x.csv"), ("fine_one", "data.csv"))
+        ],
+    }
+    contract = tmp_path / "two.fluid.yaml"
+    contract.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+    report = tmp_path / "report.json"
+
+    rc, shown = _run(["verify", str(contract), "--out", str(report)], capsys)
+
+    assert rc == 1
+    assert "unset_one" in shown and "DIR" in shown and "fine_one" in shown
+    assert report.exists()
+    results = json.loads(report.read_text())
+    assert "fine_one" in json.dumps(results) and "unset_one" in json.dumps(results)
+
+
 # ── readers of a local path ────────────────────────────────────────────────
 
 

@@ -96,8 +96,9 @@ _LOSSY_EVENTS = frozenset(
 )
 
 #: Warnings that name what only the live run decides: a secret reference whose
-#: resolver is not installed here, or whose host is judged only at apply.
-_LIVE_EVENTS = frozenset({"contract_secret_ref"})
+#: resolver is not installed here, or whose host is judged only at apply, or a
+#: ``{{ env.NAME }}`` variable the deploy environment holds and this one does not.
+_LIVE_EVENTS = frozenset({"contract_secret_ref", "contract_env_placeholder_unset"})
 
 #: Cloud -> the extra that installs its SDKs.
 _CLOUD_EXTRAS = {

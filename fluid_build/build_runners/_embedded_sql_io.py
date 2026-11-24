@@ -333,10 +333,11 @@ def _resolve_env(value: Any, *, field_name: str, where: str) -> Optional[str]:
     """``{{ env.NAME }}`` resolved, refusing a variable that is unset or empty.
 
     The runtime resolver (``base._resolve_env_placeholders``, and
-    ``util.binding_paths.resolve_env_placeholders_in_path`` after it) turns an
-    unset variable into ``""``, which for a path like
-    ``{{ env.FLUID_DATA_DIR }}/orders.parquet`` would read ``/orders.parquet``
-    at the filesystem root. A location is not a place to guess.
+    ``util.binding_paths.resolve_env_placeholders_in_path`` after it) refuses an
+    unset or empty variable too, where it used to turn it into ``""``, which for
+    a path like ``{{ env.FLUID_DATA_DIR }}/orders.parquet`` read ``/orders.parquet``
+    at the filesystem root. A location is not a place to guess; this one also
+    refuses a credential-shaped variable, which the runtime resolver renders.
 
     A credential-shaped variable (``is_sensitive_key_name``: password, secret,
     token, key ...) is refused too. The resolved location is printed in the

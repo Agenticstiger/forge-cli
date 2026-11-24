@@ -1290,10 +1290,11 @@ def test_a_templated_region_whose_variable_is_unset_is_refused_naming_it(
     overlay = AWS_OVERLAY.replace("region: eu-north-1", "region: '{{ env.DEMO_REGION }}'")
     contract = _write_contract(tmp_path, overlay=overlay)
 
-    with pytest.raises(EnvTemplateError) as caught:
-        _verify(tmp_path, contract)
+    code, report = _verify(tmp_path, contract)
 
-    assert caught.value.extras["missing"] == ["DEMO_REGION"]
+    error = report["results"]["subscriptions"]["error"]
+    assert code == 1
+    assert "DEMO_REGION" in error and "unset or empty" in error
     assert aws.requested == []
 
 
@@ -1436,10 +1437,11 @@ def test_a_template_whose_variable_is_unset_is_refused_naming_it(tmp_path, aws, 
     monkeypatch.setenv("DEMO_REGION", REGION)
     contract = _write_contract(tmp_path, overlay=_TEMPLATED_OVERLAY)  # GLUE_TABLE unset
 
-    with pytest.raises(EnvTemplateError) as caught:
-        _verify(tmp_path, contract)
+    code, report = _verify(tmp_path, contract)
 
-    assert caught.value.extras["missing"] == ["GLUE_TABLE"]
+    error = report["results"]["subscriptions"]["error"]
+    assert code == 1
+    assert "GLUE_TABLE" in error and "unset or empty" in error
     assert aws.requested == []
 
 

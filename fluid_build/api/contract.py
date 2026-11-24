@@ -178,9 +178,10 @@ class LoadedContract:
         count.
 
         It is **not** the value ``fluid contract digest`` prints or a
-        federation ``upstreamDigest`` pins: those hash the file as parsed,
-        before any rewrite, ``$ref`` or overlay, so they differ whenever the
-        file uses one.
+        federation ``upstreamDigest`` pins: those hash the file's composed
+        contract (its ``$ref`` fragments resolved), before any rewrite or
+        overlay, so they differ whenever the file uses an alias, a legacy
+        ``build:`` or an overlay.
 
         Raises:
             ContractLoadError: ``contract_not_serialisable`` when JSON cannot

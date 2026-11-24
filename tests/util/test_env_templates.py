@@ -329,3 +329,42 @@ def test_a_field_is_a_host_field_by_its_last_word(key):
 def test_other_fields_are_not_host_fields(key):
     assert not is_host_field(key)
     check_host_templates({key: "{{ env.H }}.example"}, environ={"H": "x"})
+
+
+@pytest.mark.parametrize(
+    "where, env",
+    [
+        ({"endpoint": "/v1/users/{{ env.TENANT }}"}, {"TENANT": "acme"}),
+        ({"base_url": "{{ env.API_BASE }}/v1"}, {"API_BASE": "https://api.example.com"}),
+        ({"connection_string": "host={{ env.PGHOST }} dbname=x user=u"}, {"PGHOST": "db.internal"}),
+        ({"connection_string": "dbname={{ env.DB }} user=u"}, {"DB": "orders"}),
+        ({"location": {"path": "s3://{{ env.ENV }}-lake/orders"}}, {"ENV": "dev"}),
+        (
+            {"url": "abfss://{{ env.C }}@{{ env.ACCOUNT }}.dfs.core.windows.net/p"},
+            {"C": "raw", "ACCOUNT": "lake"},
+        ),
+        ({"uri": "gs://{{ env.API_KEY_ID }}-bucket/x"}, {"API_KEY_ID": "k1"}),
+    ],
+    ids=["path", "variable-is-the-base", "keyword-host", "keyword-no-host", "s3", "abfss", "gs"],
+)
+def test_these_are_not_a_host_the_contract_picks(where, env):
+    """A REST stream's endpoint is a path, a variable that is the whole base URL is the
+    operator's, a keyword connection string is judged by its host, and a bucket or a container
+    names a place in a store the engine is configured for."""
+    check_host_templates(where, environ=env)
+
+
+def test_a_keyword_connection_string_is_judged_by_its_host():
+    where = {"connection_string": "host={{ env.PGHOST }}.attacker.example dbname=x"}
+    with pytest.raises(EnvTemplateError):
+        check_host_templates(where, environ={"PGHOST": "db"})
+    check_host_templates(where, environ={"PGHOST": "db", ALLOWLIST: "PGHOST"})
+
+
+@pytest.mark.parametrize("blank", [" ", "   ", "\t", "\n "])
+def test_a_variable_of_only_blanks_is_missing_too(blank):
+    """``.strip()`` would turn it into an empty name: the deploy the resolver exists to stop."""
+    with pytest.raises(EnvTemplateError):
+        render_contract({"bucket": "{{ env.B }}"}, environ={"B": blank})
+    assert missing_fields({"bucket": "{{ env.B }}"}, environ={"B": blank}) == {"B": ["bucket"]}
+    assert render_contract("{{ env.B }}", unset=UNSET_DEFER, environ={"B": blank}) == "{{ env.B }}"

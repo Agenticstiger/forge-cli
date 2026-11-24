@@ -495,3 +495,22 @@ class TestGitBackendDigestIsCanonicalNotRawText:
         """A malformed upstream contract yields ``None`` (escalated to a
         violation by the caller) — never a fallback digest."""
         assert self._digest_for(bad_text) is None
+
+
+class TestTheDigestCacheDoesNotServeTheOldAlgorithm:
+    """A cache written before the digest covered ``$ref`` fragments holds root-file digests: served
+    after the upstream's pin is re-made from the composed contract, every apply would report drift.
+    """
+
+    def test_an_old_cache_is_not_served_and_is_not_extended(self, tmp_path: Path):
+        from fluid_build.forge.federation import get_cached_digest, store_cached_digest
+
+        cache = tmp_path / ".fluid" / "federation" / "ws.digest-cache.json"
+        cache.parent.mkdir(parents=True)
+        cache.write_text('{"p@1": "sha256:old", "__updated_at": "2026-01-01T00:00:00Z"}')
+
+        assert get_cached_digest(tmp_path, "ws", "p", "1") is None
+
+        store_cached_digest(tmp_path, "ws", "p", "2", "sha256:new")
+        assert get_cached_digest(tmp_path, "ws", "p", "2") == "sha256:new"
+        assert get_cached_digest(tmp_path, "ws", "p", "1") is None, "the old entry is gone"

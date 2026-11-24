@@ -686,6 +686,12 @@ def _write_cache(path: Path, payload: Mapping[str, Any]) -> None:
         )
 
 
+#: What a digest in the cache hashes. A cache written before the digest covered ``$ref``
+#: fragments holds root-file digests, which no longer match what a pin is made from.
+_CACHE_FORMAT_KEY = "__digest_of"
+_CACHE_FORMAT = "composed-contract"
+
+
 def get_cached_digest(
     workspace_root: Path,
     workspace_id: str,
@@ -695,6 +701,8 @@ def get_cached_digest(
     """Return the cached digest for ``product_id@version`` from
     ``workspace_id``, or ``None`` when the cache is empty / stale."""
     cache = _read_cache(_cache_path(workspace_root, workspace_id))
+    if cache.get(_CACHE_FORMAT_KEY) != _CACHE_FORMAT:
+        return None  # made by the algorithm that hashed the root file alone
     return cache.get(f"{product_id}@{version}")
 
 
@@ -708,6 +716,9 @@ def store_cached_digest(
     """Persist a freshly-fetched digest into the per-workspace cache."""
     path = _cache_path(workspace_root, workspace_id)
     cache = _read_cache(path)
+    if cache.get(_CACHE_FORMAT_KEY) != _CACHE_FORMAT:
+        cache = {}  # digests of the old algorithm would be served beside the new ones
+    cache[_CACHE_FORMAT_KEY] = _CACHE_FORMAT
     cache[f"{product_id}@{version}"] = digest
     cache["__updated_at"] = (
         datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")

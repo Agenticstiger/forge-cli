@@ -1778,7 +1778,7 @@ def _env_placeholder_warning(name: str, places: Sequence[str]) -> str:
     shown = ", ".join(places[:3]) + (f" and {len(places) - 3} more" if len(places) > 3 else "")
     return (
         f"{{{{ env.{name} }}}} at {shown}: the variable is unset or empty here. "
-        "`fluid plan`, `fluid apply`, `fluid diff` and `fluid generate iac` refuse a contract "
+        "`fluid apply`, `fluid diff` and `fluid generate iac` refuse a contract "
         f"that names it. Export {name} where they run, or correct the placeholder."
     )
 

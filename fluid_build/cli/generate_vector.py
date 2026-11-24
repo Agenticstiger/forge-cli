@@ -19,6 +19,7 @@ import json
 import logging
 import os
 
+from fluid_build._errors import FluidUserError
 from fluid_build.cli.console import cprint, cprint_literal
 
 from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
@@ -95,6 +96,8 @@ def run(args, logger: logging.Logger) -> int:
             f.write("\n")
     except CLIError:
         raise
+    except FluidUserError:
+        raise  # typed: its field list and fix reach the user whole
     except Exception as e:
         raise CLIError(1, "generate_vector_failed", {"error": str(e)})
 

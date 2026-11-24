@@ -111,7 +111,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variable rendering as nothing (an optional prefix, a path whose variable was never exported) now
   fails naming it: export the variable, or delete the placeholder. That includes a region written
   as `{{ env.AWS_REGION }}`, which deployed in the environment's own region when the variable was
-  unset. `fluid validate` shows the same list as a warning ahead of time.
+  unset. `fluid validate` shows the same list as a warning ahead of time, and `fluid verify`
+  reports an expose that names an unset variable as that expose's error and checks the others.
 - **Acquisition builds: a variable beside text in a URL's authority needs the operator's pairing.**
   `https://{{ env.TENANT }}.db.example/x` or `{{ env.H }}@db.example` needs
   `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST=TENANT@<the host it renders to>` (or the bare variable
@@ -120,7 +121,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A split contract's digest changes once.** If an upstream keeps parts of its contract in `$ref`
   fragments, the digest that `fluid contract digest` prints, and that `fluid apply`'s federation
   gate computes, is now of the composed contract. Re-pin `consumes[].upstreamDigest` for such an
-  upstream with `fluid contract digest`. A contract with no `$ref` in it keeps its digest.
+  upstream with `fluid contract digest`. A contract with no `$ref` in it keeps its digest. The
+  federation digest cache an earlier forge wrote (`.fluid/federation/<workspace>.digest-cache.json`)
+  is ignored and rewritten on the next fetch, so it cannot serve a root-file digest beside the pin.
 - **Duplicate keys now fail.** A contract, overlay, fragment or workspace file that writes a key
   twice (often a copy-paste slip, which kept the second value) fails every command that composes
   the contract, `validate`, `plan`, `apply`, `bundle` and `generate artifacts` among them, naming

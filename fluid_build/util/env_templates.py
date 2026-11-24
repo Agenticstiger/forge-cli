@@ -11,9 +11,13 @@ decides.
 
 The rules, for every caller:
 
-* A name is **missing** when the variable is unset or empty. :func:`render_contract`
-  raises :class:`EnvTemplateError`, which lists every missing name and where it is
-  written, before anything is deployed.
+* A name is **missing** when the variable is unset, empty or only blanks.
+  :func:`render_contract` raises :class:`EnvTemplateError`, which lists every missing
+  name and where it is written, before anything is deployed. The one exception is
+  :func:`render_text`, the single-string primitive for a provider's optional field
+  with a default: it leaves an unset variable's placeholder and renders an empty
+  variable as empty, so that the field's fallback applies. The stages that deploy
+  render a contract strictly before they reach it.
 * A stage that deliberately leaves the placeholder for a later one says so by
   name: ``unset=UNSET_DEFER``. The call sites that do are the publish and export
   paths (a catalog shows the template), the preload of a contract embedded in a
@@ -75,6 +79,12 @@ SENSITIVE_RENDER = "render"
 _PATHS_SHOWN = 6
 
 _DEFAULT_LOG = logging.getLogger("fluid.env_templates")
+
+
+def _has_value(value: Optional[str]) -> bool:
+    """Whether a variable holds something: not unset, not empty, not only blanks (which the
+    ``.strip()`` of a rendered string would turn into an empty name)."""
+    return value is not None and bool(value.strip())
 
 
 @dataclass
@@ -223,7 +233,7 @@ def render_contract(
                 refuse_sensitive(name)
                 return match.group(0)
             rendered = env.get(name)
-            if rendered:
+            if rendered is not None and _has_value(rendered):
                 return rendered
             missing.setdefault(name, []).append(where)
             return match.group(0)
@@ -288,6 +298,40 @@ def _hosts_of(authority: str) -> List[str]:
             host = piece.partition(":")[0]
         hosts.append(host.strip().lower().rstrip("."))
     return hosts
+
+
+#: The schemes whose "authority" is a bucket or a container, not a server a contract can point a
+#: credential at: the engine is configured for the store, and the name only picks within it.
+_STORE_SCHEMES = frozenset(
+    {"s3", "s3a", "s3n", "gs", "gcs", "az", "azure", "abfs", "abfss", "wasb", "wasbs", "file"}
+)
+_CONTROL = re.compile(r"[\s\x00-\x1f\x7f-\x9f]")
+#: The host in a keyword/value connection string (libpq, ODBC): ``host=db1 dbname=x``.
+_KEYWORD_HOST = re.compile(
+    r"(?:^|[\s;])(?:host|hostaddr|server|data source)\s*=\s*((?:\{\{[^{}]*\}\}|[^\s;{])+)", re.I
+)
+
+
+def _control_free(text: str) -> str:
+    return _CONTROL.sub("", text)
+
+
+def _authority_of(text: str, url: Optional["re.Match[str]"]) -> Optional[str]:
+    """The part of ``text`` where a variable makes the host, or ``None`` when it names none.
+
+    A URL's authority; for a value that is not a URL, the host it starts with (``host``,
+    ``host:port``, ``//host/path``) or the host of a keyword/value connection string.
+    """
+    if url is not None:
+        start = url.end()
+        return text[start : _authority_end(text, start)]
+    body = text.strip()
+    if body.startswith("//"):
+        body = body[2:]
+    if "=" in body:
+        keyword = _KEYWORD_HOST.search(body)
+        return keyword.group(1) if keyword else None
+    return body[: _authority_end(body, 0)]
 
 
 def _host_refusal(
@@ -393,14 +437,19 @@ def check_host_templates(
         url = _URL_START.match(text)
         if url is None and not is_host_field(key):
             return
+        if url is not None and _control_free(text[: url.end() - 3]).lower() in _STORE_SCHEMES:
+            return  # a bucket or a container of a store the engine is configured for, not a server
+        if url is None:
+            body = text.strip()
+            if body.startswith("/") and not body.startswith("//"):
+                return  # a path (a REST stream's ``endpoint: /v1/users``), not an address
         for raw in ENV_TEMPLATE_RE.findall(text):
             name = raw.strip()
             if is_sensitive_key_name(name):
                 raise _host_refusal(name, where, credential=True, stage=stage)
-        # The authority of a URL, or the whole of a host field: where a variable makes the host.
-        start = url.end() if url else 0
-        stop = _authority_end(text, start) if url else len(text)
-        authority = text[start:stop]
+        authority = _authority_of(text, url)
+        if authority is None:
+            return
         # A client that reads a backslash as a slash ends the authority there; one that does not
         # reads on to the ``@``. Either could be the one that connects, so with a backslash in
         # the authority every variable in it is paired, with both hosts.
@@ -412,7 +461,7 @@ def check_host_templates(
         )
         if not names:
             return
-        if any(not env.get(raw.strip()) for raw in ENV_TEMPLATE_RE.findall(authority)):
+        if any(not _has_value(env.get(raw.strip())) for raw in ENV_TEMPLATE_RE.findall(authority)):
             return  # render_contract reports the missing variable
         rendered = ENV_TEMPLATE_RE.sub(lambda m: env[m.group(1).strip()], authority)
         hosts = _hosts_of(rendered) or [""]
@@ -454,7 +503,7 @@ def missing_fields(value: Any, environ: Optional[Mapping[str, str]] = None) -> D
             if "{{" in node:
                 for raw in ENV_TEMPLATE_RE.findall(node):
                     name = raw.strip()
-                    if not is_sensitive_key_name(name) and not env.get(name):
+                    if not is_sensitive_key_name(name) and not _has_value(env.get(name)):
                         found.setdefault(name, []).append(where)
         elif isinstance(node, list):
             for index, item in enumerate(node):

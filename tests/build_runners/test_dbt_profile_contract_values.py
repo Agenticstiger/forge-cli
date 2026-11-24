@@ -514,6 +514,35 @@ class TestDatabricksNames:
 
 
 class TestRunner:
+    def test_an_unset_variable_ends_the_build_not_the_run(
+        self,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Like a refused profile: the build reports it and returns 1, so the summary, the run
+        report and the hooks after the builds still happen."""
+        from fluid_build.build_runners.dbt import runner
+
+        (tmp_path / "dbt_project.yml").write_text("name: p\nprofile: p\n", encoding="utf-8")
+        monkeypatch.delenv("UNSET_CATALOG", raising=False)
+
+        def _must_not_run(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("dbt must not be prepared or run")
+
+        monkeypatch.setattr(runner, "build_dbt_command", _must_not_run)
+        monkeypatch.setattr(runner.subprocess, "run", _must_not_run)
+
+        result = runner.execute_dbt_build(
+            _build("databricks", catalog="{{ env.UNSET_CATALOG }}"),
+            tmp_path,
+            tmp_path,
+            dry_run=False,
+        )
+
+        assert result == 1
+        assert "UNSET_CATALOG" in capsys.readouterr().out
+
     @pytest.mark.parametrize("dry_run", [False, True])
     def test_the_build_is_refused_before_dbt_starts(
         self,

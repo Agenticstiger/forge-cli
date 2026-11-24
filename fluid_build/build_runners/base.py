@@ -1105,8 +1105,9 @@ def _execute_embedded_sql_build(
     import time
 
     build_id = build.get("id", "unknown")
-    # Kept before resolution: the S3 landing refuses a bucket or path whose
-    # ``{{ env.X }}`` is unset instead of resolving it to "" (a local write).
+    # Kept before resolution: the S3 landing judges a bucket or path by its
+    # ``{{ env.X }}`` templates as written (an unset one is refused there, and by
+    # the resolver below).
     unresolved_contract = contract
     # Runtime path: resolve every placeholder, secrets included — the value
     # stays in process memory and is never serialised to a catalog. See the
@@ -1739,7 +1740,8 @@ def run_builds_from_args(
         if is_acquisition_build(build):
             sample_rows = getattr(args, "sample_rows", None)
             # A plan's contract had its ``{{ env.* }}`` templates resolved
-            # above, with an empty variable rendered to "": the Iceberg sink
+            # above (an unset or empty variable stays as written, for the
+            # dispatcher to refuse): the Iceberg sink
             # preflight reads the bucket template from the plan as written.
             result = _execute_acquisition_build(
                 build,

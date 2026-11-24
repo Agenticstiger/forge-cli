@@ -1516,8 +1516,8 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     ),
     "contract_env_placeholder_unset": (
         [
-            "Export the variable the message names where fluid plan, apply, diff and generate "
-            + "iac run (an empty value counts as unset), or correct the placeholder in the contract",
+            "Export the variable the message names where fluid apply, diff and generate iac "
+            + "run (an empty value counts as unset), or correct the placeholder in the contract",
         ],
         "validate",
     ),
@@ -1705,7 +1705,7 @@ _EXAMPLES: Dict[str, str] = {
     "contract_continuous_trigger": _BUILD,
     "contract_env_placeholder_unset": (
         "# exposes[].binding\nplatform: aws\nformat: parquet\nlocation:\n"
-        '  bucket: "{{ env.LAKE_BUCKET }}"  # export LAKE_BUCKET before plan and apply\n'
+        '  bucket: "{{ env.LAKE_BUCKET }}"  # export LAKE_BUCKET before apply\n'
         "  path: orders/\n"
     ),
     "contract_build_id": "id: sales.orders_raw\n",
