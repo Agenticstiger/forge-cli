@@ -353,6 +353,9 @@ class DeclaredBlock:
     left_out: Tuple[Tuple[str, str], ...] = ()
     every_declared_group: bool = False
     declared_ranges: Mapping[str, "DeclaredRange"] = field(default_factory=dict, compare=False)
+    #: Histograms of the columns the block gives only a ladder of quantiles. They are never
+    #: written: they hold the public bins a grouping by such a column, or of it, uses.
+    structure: Tuple["DeclaredStatistic", ...] = field(default=(), compare=False)
     _block: Any = field(default=None, repr=False, compare=False)
 
     @property

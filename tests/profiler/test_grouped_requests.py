@@ -173,6 +173,39 @@ def test_a_column_with_no_public_structure_or_a_key_is_left_out_with_its_reason(
     assert "units grouped by amount of orders" in said
 
 
+def _release_bins(column):
+    """The edges, as the document spells them, the private release cuts *column* on."""
+    from fluid_build.profiler import runner
+    from fluid_build.profiler.dp import release
+
+    backend = load_backend()
+    expose = next(each for each in shop.CONTRACT["exposes"] if each["exposeId"] == "orders")
+    plan = runner.plan_expose(shop.CONTRACT, "orders")
+    structures = release.public_structures(expose, plan.columns, backend, 16)
+    entry = next(each for each in expose["contract"]["schema"] if each["name"] == column)
+    each = next(each for each in plan.columns if each.name == column)
+    return list(structures.column(each, entry, backend).edge_texts)
+
+
+def test_a_timestamp_is_grouped_on_the_public_bins_the_release_uses(tmp_path):
+    asked = shop.request(clique=("status", "placed_at"), relationship=False)
+    result = shop.profile(tmp_path, asked, load_backend())
+    assert not [each for each in result.not_measured if "placed_at" in each[0]]
+    (statistic,) = _grouped(result.document, "orders", "status", "groupByBins")
+    bins = statistic["groupByBins"]
+    assert bins["column"] == "placed_at"
+    # the ladder is one bin for each year from 1900 to 2100, between the first and last instants
+    assert len(bins["bins"]) == 203
+    assert bins["bins"] == _release_bins("placed_at")
+    assert [each["group"] for each in statistic["groups"]] == sorted(bins["bins"][:-1])
+    # and the profile writes no histogram of the timestamp of its own
+    assert not [
+        each
+        for each in _statistics(result.document, "orders", "placed_at")
+        if each["definition"] == "marginalHistogram/1" and "groupBy" not in each
+    ]
+
+
 def test_a_pair_past_the_first_32_columns_is_left_out_and_named(tmp_path):
     names = tuple(f"c{index}" for index in range(34))
     table = RequestTable("orders", False, (), clique_columns=names)

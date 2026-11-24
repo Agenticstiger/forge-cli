@@ -147,6 +147,8 @@ class DefaultPlan:
     block: Optional[Dict[str, Any]]
     uncovered: Tuple[Tuple[str, str], ...] = ()
     ranges: Mapping[str, DeclaredRange] = field(default_factory=dict)
+    #: The date and timestamp columns the block holds, whose bins are a ladder.
+    timestamps: Tuple[str, ...] = ()
 
 
 def declared_range(column: Mapping[str, Any]) -> Tuple[Optional[Fraction], Optional[Fraction]]:
@@ -337,6 +339,7 @@ def default_plan(
     properties: List[Dict[str, Any]] = []
     uncovered: List[Tuple[str, str]] = []
     levels: Dict[str, int] = {}
+    timestamps: List[str] = []
     for column in columns:
         entry = schema.get(column.name, {})
         declared_type = entry.get("type")
@@ -361,6 +364,7 @@ def default_plan(
             declared[column.name] = {"range": {"min": _FIRST_INSTANT, "max": _LAST_INSTANT}}
             ladder = [_FIRST_INSTANT, *(_instant(year) for year in _LADDER_YEARS), _LAST_INSTANT]
             properties.extend(_quantiles(column.name, ladder))
+            timestamps.append(column.name)
             continue
         bounds, sub_unit = _type_bounds(declared_type)
         (low, low_strict), (high, high_strict) = _declared_sides(entry)
@@ -440,7 +444,48 @@ def default_plan(
         "columns": declared,
         "properties": properties,
     }
-    return DefaultPlan(block=block, uncovered=tuple(uncovered), ranges=ranges)
+    return DefaultPlan(
+        block=block, uncovered=tuple(uncovered), ranges=ranges, timestamps=tuple(timestamps)
+    )
+
+
+def public_bins(block: Optional[Mapping[str, Any]]) -> Dict[str, List[str]]:
+    """The bin edges, as spelled, the contract gives each column of the declared *block*.
+
+    A column has the edges of its first property that holds bins: its histogram when it has
+    one, else the ladder of its quantiles. Every part of the profiler that cuts a number, a
+    date or a timestamp into public bins takes them from here.
+    """
+    found: Dict[str, List[str]] = {}
+    for each in block["properties"] if block is not None else ():
+        if "bins" in each and each["column"] not in found:
+            found[each["column"]] = list(each["bins"])
+    return found
+
+
+def with_timestamp_histograms(plan: DefaultPlan) -> Dict[str, Any]:
+    """The block of *plan* with a histogram on the public bins of each timestamp column.
+
+    The block the profile writes declares no histogram of a timestamp, only the quantiles on
+    its ladder. The histograms added here are never written: they give a grouping by a
+    timestamp, or of one, the same public bins the release uses (:func:`public_bins`). The
+    block the profile writes holds none of its own, so they are the histograms of these columns.
+    """
+    assert plan.block is not None
+    properties = list(plan.block["properties"])
+    bins = public_bins(plan.block)
+    for name in plan.timestamps:
+        if name not in bins:
+            continue
+        properties.append(
+            {
+                "property": "marginalHistogram",
+                "column": name,
+                "bins": list(bins[name]),
+                "tolerance": dict(_DISTANCE),
+            }
+        )
+    return {**plan.block, "properties": properties}
 
 
 def _is_boolean(declared_type: Any) -> bool:

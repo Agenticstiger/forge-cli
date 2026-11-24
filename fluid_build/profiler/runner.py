@@ -991,7 +991,8 @@ def _linked_statistic(
     if base is None:
         return (
             f"{column}: it has no public levels or bins: it is neither an enum(...) or a "
-            "boolean column nor a number whose validationRules declare both ends of a range"
+            "boolean column nor a number whose validationRules declare both ends of a range, nor "
+            "a date or a timestamp"
         )
     if parent_column not in domains[parent]:
         return f"{parent_column}: it is a column fluid profile does not read"
@@ -1622,8 +1623,9 @@ def _default_block(
     planned = defaults.default_plan(expose, columns, backend.enum_levels, fractional_bits)
     if planned.block is None:
         return None, planned.uncovered + held
+    extended = defaults.with_timestamp_histograms(planned)
     try:
-        declared = backend.read_block(planned.block, contract, plan.expose_id)
+        declared = backend.read_block(extended, contract, plan.expose_id)
     except BlockRefused as exc:
         raise ProfileError(
             "profile_default_block_refused",
@@ -1635,7 +1637,21 @@ def _default_block(
             },
         ) from None
     _check_declared_columns(declared, plan)
-    block = replace(declared, every_declared_group=True, declared_ranges=planned.ranges)
+    # The histograms of the timestamp columns are the public bins of a grouping, not statistics
+    # the profile writes.
+    stamps = frozenset(planned.timestamps)
+    own = [
+        each
+        for each in declared.statistics
+        if not (each.kind == "marginalHistogram" and each.column in stamps)
+    ]
+    block = replace(
+        declared,
+        statistics=tuple(own),
+        structure=tuple(each for each in declared.statistics if each not in own),
+        every_declared_group=True,
+        declared_ranges=planned.ranges,
+    )
     return block, planned.uncovered + held
 
 

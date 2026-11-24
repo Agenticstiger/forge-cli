@@ -464,10 +464,7 @@ def public_structures(
     covered: Mapping[str, Mapping[str, Any]] = (
         planned.block["columns"] if planned.block is not None else {}
     )
-    bins_of: Dict[str, List[str]] = {}
-    for each in planned.block["properties"] if planned.block is not None else ():
-        if "bins" in each and each["column"] not in bins_of:
-            bins_of[each["column"]] = list(each["bins"])
+    bins_of = defaults.public_bins(planned.block)
     return PublicStructures(planned, covered, bins_of, dict(planned.uncovered))
 
 

@@ -18,7 +18,8 @@ as a statistic whose groups are keys the contract fixes, never keys read from a 
 
 The structure of a column is the one its default statistic has (:mod:`~fluid_build.profiler.defaults`):
 the levels an ``enum(...)`` or a boolean declares, or the bins over the range its
-``validationRules`` declare. A column with neither has no public groups, so no statistic
+``validationRules`` declare, or, for a date or a timestamp, the bins of its ladder
+(:func:`~fluid_build.profiler.defaults.public_bins`, the bins the release uses). A column with none has no public groups, so no statistic
 groups by it or is grouped by it, and the pair is left out with that reason. The bins of a
 grouping are the bins of the histogram, so a number is grouped on the edges any reader of the
 contract can state. The group keys of a ``groupByBins`` are the canonical decimal text of each
@@ -61,7 +62,7 @@ MOST_PAIR_COLUMNS = 32
 
 _NO_STRUCTURE = (
     "it has no public levels or bins: it is neither an enum(...) or a boolean column nor a "
-    "number whose validationRules declare both ends of a range"
+    "number whose validationRules declare both ends of a range, nor a date or a timestamp"
 )
 _NOT_READ = "it is a column fluid profile does not read"
 _KEY = "a key of a counted relationship, which its children per parent describe"
@@ -75,7 +76,7 @@ def histogram_of(declared: Optional[DeclaredBlock], column: str) -> Optional[Dec
     """
     if declared is None:
         return None
-    for each in declared.statistics:
+    for each in (*declared.statistics, *declared.structure):
         if (
             each.column == column
             and each.group_by is None
