@@ -29,24 +29,15 @@ RUN groupadd -o -g "${GID}" fluid \
 WORKDIR /repo
 
 # Pre-install runtime deps so the editable install is fast.
-# We copy only pyproject.toml + README so deps are cached across edits.
-# pyyaml 6.0.4 is excluded as in pyproject.toml (yaml/pyyaml#953).
+# We copy only pyproject.toml + README + the lock file so deps are cached
+# across edits. Every package (pip, setuptools and wheel included, and dlt with
+# its sql_database extra for the Python ingestion runner) is named in
+# requirements/verify-image.in and hash-locked in verify-image.txt;
+# --require-hashes refuses anything not in the lock. Regenerate it with
+# scripts/ci/compile_requirements.sh verify-image.
 COPY pyproject.toml README.md ./
-RUN python -m pip install --upgrade pip setuptools wheel \
- && python -m pip install \
-      "click>=8.1" "pyyaml>=6.0,!=6.0.4" "jsonschema>=4.22" "rich>=13.7" \
-      "pydantic>=2.7" "typing-extensions>=4.8" "jinja2>=3.1" \
-      "httpx>=0.27" "requests>=2.32.5" "python-dotenv>=1.0" \
-      "cryptography>=42.0" "keyring>=24.0" \
-      "duckdb>=1.0" "pandas>=2.2" "psycopg[binary]>=3.1" \
-      pytest pytest-cov
-
-# dlt for in-process Python ingestion verification. The runner imports
-# from dlt.sources.sql_database, which only ships under the sql_database
-# extra (pulls in sqlalchemy + the configured dialect).
-RUN python -m pip install \
-      "dlt[postgres,duckdb,sql_database]>=0.5" \
-      pyarrow "sqlalchemy>=2.0"
+COPY requirements/verify-image.txt requirements/verify-image.txt
+RUN python -m pip install --require-hashes -r requirements/verify-image.txt
 
 # Singer tap-postgres binary for the meltano runner's "embedded Singer"
 # default mode (the runner spawns the tap via subprocess and routes

@@ -100,6 +100,16 @@ jobs:
           check integration-emulated-heavy.yml integration-emulated
           [ "$fail" -eq 0 ]
 
+      # PyYAML comes from the hash-locked CI tools file rather than from
+      # whatever the runner image happens to carry.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/ci-tools.txt
+      - name: Install CI tools (hash-locked)
+        run: python -m pip install --require-hashes -r requirements/ci-tools.txt
+
       # Sanity check: the environment scopes WHICH secret the lane can read;
       # what gates un-reviewed PR code is the `ci:integration-emulated` label,
       # re-earned per push by integration-label-guard.yml.
@@ -117,8 +127,7 @@ jobs:
       # pins that case.
       - name: Check the emulated lane still gates PR code on its label
         run: |
-          python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
-          python3 scripts/ci/check_env_label_gate.py \
+          python scripts/ci/check_env_label_gate.py \
             --workflow .github/workflows/integration-emulated-heavy.yml \
             --environment integration-emulated \
             --label ci:integration-emulated \
