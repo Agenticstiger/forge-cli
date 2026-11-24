@@ -200,6 +200,7 @@ Docs pages are relative to https://agenticstiger.github.io/forge_docs/
 | `ERR_CONTRACT_GOVERNANCE` | Change the governance or access-policy field the message names, or bind the expose to a platform that enforces it. | cli/validate.html |
 | `ERR_CONTRACT_VECTOR_BINDING` | Fix the pgvector binding field the message names (binding.vectorConfig and the columns it reads). | cli/validate.html |
 | `ERR_CONTRACT_CONTINUOUS_TRIGGER` | Give a batch build a schedule trigger (type: schedule and a cron), or use an engine that runs continuously. | cli/validate.html |
+| `ERR_CONTRACT_ENV_PLACEHOLDER_UNSET` | Export the variable the message names where fluid apply, diff and generate iac run (an empty value counts as unset), or correct the placeholder in the contract. | cli/validate.html |
 | `ERR_CONTRACT_BUILD_ID` | Rename the id the message names: a letter or _ first, then at most 127 letters, digits, _, - or . | cli/validate.html |
 | `ERR_CONTRACT_PACKAGING` | Fix the packaging block as the message says; plan, generate iac and apply decide from the same block. | cli/validate.html |
 | `ERR_CONTRACT_SEMANTICS` | Write a measure's expr as the column it aggregates (agg: sum, expr: amount), never as an aggregate (SUM(amount)), which aggregates twice. | cli/validate.html |

@@ -1803,16 +1803,20 @@ def run_build(
     """
     import copy
 
-    from fluid_build._contract_loader import resolve_contract_env_templates
     from fluid_build.build_runners.spark._desired import desired_runs, stamps_from
     from fluid_build.spark.compiler import run_timeout_seconds
+    from fluid_build.util.env_templates import render_contract
 
     bid = str(build.get("id"))
     refusal = run_refusal(contract, build)
     if refusal:
         raise ValueError(refusal)
-    # As fluid plan and fluid apply read it: ``{{ env.* }}`` resolved.
-    resolved = resolve_contract_env_templates(copy.deepcopy(dict(contract)))
+    # As fluid plan and fluid apply read it: ``{{ env.* }}`` resolved, an unset one an error.
+    resolved = render_contract(
+        copy.deepcopy(dict(contract)),
+        purpose="The Spark job config is uploaded to the table's bucket",
+        stage="fluid apply",
+    )
     stamps = stamps_from(contract, run_id=run_id, source=stamp_source)
     runs = desired_runs(resolved, build_id=bid, stamps=stamps)
     if not runs:

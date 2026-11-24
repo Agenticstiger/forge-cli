@@ -644,6 +644,8 @@ def _run_fragment_validation(
                 )
             },
         )
+    # Checked as it composes: a payload's ``$$ref`` key is its literal ``$ref``.
+    document = contract_refs.unescape_ref_keys(document)
 
     # The fragment is composed before a schema version is asked for: what is wrong with the file
     # itself (it cannot be read, its refs escape the root) is reported first.
@@ -1278,6 +1280,30 @@ def _run_contract_rules(
             if args.verbose:
                 info(logger, f"Vector binding check skipped: {exc}")
 
+        # --- {{ env.NAME }} naming a variable that is unset or empty (WARNING) --
+        # plan, apply, diff and generate iac refuse such a contract before they
+        # deploy anything. Validate often runs where the deploy environment is
+        # not (a CI job), so it warns, and --strict makes it an error. A crash in
+        # the check is reported, never swallowed.
+        try:
+            from fluid_build.util.env_templates import missing_fields
+
+            for name, places in missing_fields(contract).items():
+                _add_findings(
+                    validation_result,
+                    contract,
+                    "contract_env_placeholder_unset",
+                    warnings=[_env_placeholder_warning(name, places)],
+                    anchor=places[0].split(".")[0].split("[")[0],
+                )
+        except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+            validation_result.add_warning(
+                f"Environment-placeholder check could not run ({type(exc).__name__}: {exc}); "
+                "the contract was NOT checked for {{ env.NAME }} variables that are unset",
+                event="contract_check_failed",
+                pointer="",
+            )
+
         # --- A continuous trigger on a batch build (WARNING) ---------------
         # trigger.type continuous (0.7.6) says the job's platform keeps it
         # running, so no scheduler starts the build. forge-cli runs dbt,
@@ -1745,6 +1771,16 @@ def _check_glue_layout(
     except Exception as exc:  # pragma: no cover — defensive
         if args.verbose:
             info(logger, f"Glue table layout check skipped: {exc}")
+
+
+def _env_placeholder_warning(name: str, places: Sequence[str]) -> str:
+    """What ``fluid validate`` says of a variable the contract names and this environment lacks."""
+    shown = ", ".join(places[:3]) + (f" and {len(places) - 3} more" if len(places) > 3 else "")
+    return (
+        f"{{{{ env.{name} }}}} at {shown}: the variable is unset or empty here. "
+        "`fluid apply`, `fluid diff` and `fluid generate iac` refuse a contract "
+        f"that names it. Export {name} where they run, or correct the placeholder."
+    )
 
 
 def _add_findings(

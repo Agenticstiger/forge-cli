@@ -30,6 +30,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from fluid_build.build_runners.base import (
     LOCAL_SQL_PLATFORMS,
     _execute_embedded_sql_build,
@@ -37,6 +39,12 @@ from fluid_build.build_runners.base import (
 )
 
 _SQL = 'CREATE OR REPLACE TABLE "{{ env.FX_DB }}"."S"."T" AS SELECT 1'
+
+
+@pytest.fixture(autouse=True)
+def _fx_db(monkeypatch):
+    # The SQL names {{ env.FX_DB }}; an unset variable is refused before the engine runs.
+    monkeypatch.setenv("FX_DB", "FLUID_TEST")
 
 
 def _build(platform=None, sql=_SQL, resources=None):

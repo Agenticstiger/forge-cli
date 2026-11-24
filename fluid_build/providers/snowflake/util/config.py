@@ -15,15 +15,12 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
 from fluid_build.observability.secret_redactor import register_secrets
+from fluid_build.util.env_templates import render_text
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_WAREHOUSE = "COMPUTE_WH"
 DEFAULT_SCHEMA = "PUBLIC"
-_ENV_TEMPLATE_RE = re.compile(r"\{\{\s*env\.(\S+?)\s*\}\}")
-# Public alias so cross-module callers (cli/_common.py contract walker) can
-# share the canonical pattern without redefining or importing a private name.
-ENV_TEMPLATE_RE = _ENV_TEMPLATE_RE
 _ACCOUNT_HOST_RE = re.compile(r"\.snowflakecomputing\.com$", re.IGNORECASE)
 _ACCOUNT_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+\Z")
 _ACCOUNT_REGION_SEGMENT_RE = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\Z")
@@ -51,21 +48,18 @@ def _is_present(value: Any) -> bool:
 
 def resolve_env_templates(value: Any) -> Any:
     """
-    Resolve ``{{ env.VAR }}`` placeholders from environment variables.
+    Resolve ``{{ env.VAR }}`` placeholders in one string from environment variables.
 
-    Unresolved placeholders are left intact so callers can decide whether to
-    error, warn, or fall back. This is the single source of truth for env
-    template resolution across the Snowflake provider and CLI — other modules
-    should import this rather than redefining the regex.
+    The single-string primitive of the one resolver
+    (:mod:`fluid_build.util.env_templates`): the placeholder of an unset variable
+    is left intact, so a provider can decide for an optional field whether to
+    fall back. It is not for a stage that renders a contract: that is
+    :func:`fluid_build.util.env_templates.render_contract`, which raises for an
+    unset or empty variable. A value that is not a string comes back as it is.
     """
-    if not isinstance(value, str) or "{{" not in value:
+    if not isinstance(value, str):
         return value
-
-    def _replace(match: re.Match[str]) -> str:
-        var_name = match.group(1).strip()
-        return os.environ.get(var_name, match.group(0))
-
-    return _ENV_TEMPLATE_RE.sub(_replace, value).strip()
+    return render_text(value)
 
 
 # Backwards-compatible private alias for existing internal call sites.

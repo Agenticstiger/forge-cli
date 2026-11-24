@@ -25,7 +25,6 @@ provider, the build runners and ``fluid verify``.
 from __future__ import annotations
 
 import copy
-import os
 import re
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
@@ -40,29 +39,32 @@ PathLike = Union[str, Path]
 ENV_PLACEHOLDER_RE = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 
 
-def resolve_env_placeholders_in_path(path: str) -> str:
+def resolve_env_placeholders_in_path(path: str, *, unset: str = "error") -> str:
     """``path`` with each ``{{ env.NAME }}`` replaced by the variable's value.
 
-    A variable that is not set becomes the empty string, exactly as the build
-    runner resolves it when it writes, so reader and writer still agree.
+    A variable that is unset or empty is an error, as it is when the build
+    runner resolves the contract before it writes, so reader and writer still
+    agree and a path never loses its first half and names a different file.
+    ``unset="defer"`` is the named escape (see
+    :func:`fluid_build.util.env_templates.render_contract`).
     """
-    return ENV_PLACEHOLDER_RE.sub(lambda m: os.getenv(m.group(1), ""), path)
+    return resolve_env_placeholders(path, unset=unset)
 
 
-def resolve_env_placeholders(value: Any) -> Any:
+def resolve_env_placeholders(value: Any, *, unset: str = "error") -> Any:
     """``value`` with every ``{{ env.NAME }}`` in its strings rendered, through lists and dicts.
 
-    How ``fluid apply`` renders a contract before a runner reads it: a variable
-    that is not set becomes the empty string, and any value other than a
-    string, a list or a dict is returned as it is.
+    How ``fluid apply`` renders a contract before a runner reads it, by the one
+    resolver (:func:`fluid_build.util.env_templates.render_contract`): a variable
+    that is unset or empty raises :class:`~fluid_build.util.env_templates.EnvTemplateError`
+    naming every one, and any value other than a string, a list or a dict is
+    returned as it is. A credential-shaped name renders like any other (a
+    connection's ``password: "{{ env.PGPASSWORD }}"`` reaches the engine that
+    connects), and nothing is stripped.
     """
-    if isinstance(value, str):
-        return resolve_env_placeholders_in_path(value)
-    if isinstance(value, list):
-        return [resolve_env_placeholders(item) for item in value]
-    if isinstance(value, dict):
-        return {key: resolve_env_placeholders(item) for key, item in value.items()}
-    return value
+    from fluid_build.util.env_templates import SENSITIVE_RENDER, render_contract
+
+    return render_contract(value, unset=unset, sensitive=SENSITIVE_RENDER, strip=False)
 
 
 def is_remote_uri(path: str) -> bool:

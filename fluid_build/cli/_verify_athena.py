@@ -1236,7 +1236,7 @@ def _resolved_binding(binding: Any) -> Dict[str, Any]:
 def _unresolved_template(field: str, value: Any) -> Optional[str]:
     """Why ``value`` is still a template after resolution; ``None`` when it is not."""
     from fluid_build.observability.secret_redactor import is_sensitive_key_name
-    from fluid_build.providers.snowflake.util.config import ENV_TEMPLATE_RE
+    from fluid_build.util.env_templates import ENV_TEMPLATE_RE
 
     text = str(value or "")
     if "{{" not in text:

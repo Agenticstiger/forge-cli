@@ -77,14 +77,18 @@ class TestDigestMatchesTheFederationGate:
         printed = capsys.readouterr().out.strip().splitlines()[-1]
         assert rc == 0
 
-        from fluid_build.forge.federation import FederatedWorkspace, _fetch_digest_via_git
+        from fluid_build.forge.federation import (
+            FederatedWorkspace,
+            _ClonedContract,
+            _fetch_digest_via_git,
+        )
 
         ws = FederatedWorkspace(
             id="telco", kind="git_registry", endpoint="https://git.example.invalid/telco"
         )
         with patch(
-            "fluid_build.forge.federation._git_read_contract",
-            return_value=upstream_file.read_text(encoding="utf-8"),
+            "fluid_build.forge.federation._git_contract_file",
+            return_value=_ClonedContract(upstream_file, upstream_file.parent),
         ):
             fetched = _fetch_digest_via_git(ws, "telco.orders", "1")
 
@@ -223,3 +227,130 @@ class TestFailureModes:
         with pytest.raises(CLIError) as exc:
             _run(["contract", "digest", str(bad)], tmp_path)
         assert exc.value.event == "digest_contract_not_a_mapping"
+
+
+# ── $ref fragments: the digest is of the contract as deployed ──────────────
+
+
+def _write_split(root: Path, *, fragment_dir: str = "fragments", ext: str = "yaml") -> Path:
+    """UPSTREAM with its one expose kept in a fragment, under ``root``."""
+    expose = UPSTREAM["exposes"][0]
+    frag = root / fragment_dir / f"orders.{ext}"
+    frag.parent.mkdir(parents=True, exist_ok=True)
+    frag.write_text(yaml.safe_dump(expose, sort_keys=True), encoding="utf-8")
+    contract = {**UPSTREAM, "exposes": [{"$ref": f"./{fragment_dir}/orders.{ext}"}]}
+    path = root / "contract.fluid.yaml"
+    path.write_text(yaml.safe_dump(contract, sort_keys=True), encoding="utf-8")
+    return path
+
+
+def _digest(path: Path, capsys) -> str:
+    _run(["contract", "digest", str(path)], path.parent)
+    return capsys.readouterr().out.strip().splitlines()[-1]
+
+
+class TestDigestCoversFragments:
+    """``fluid split`` moves parts of a contract into ``$ref`` files. The digest
+    used to hash the root alone, so an edit to a fragment left a downstream
+    ``upstreamDigest`` pin green while the deployed contract had changed."""
+
+    def test_an_edit_to_a_fragment_moves_the_digest(self, tmp_path, capsys):
+        path = _write_split(tmp_path)
+        before = _digest(path, capsys)
+
+        fragment = tmp_path / "fragments" / "orders.yaml"
+        fragment.write_text(fragment.read_text().replace("integer", "bigint"), encoding="utf-8")
+
+        assert _digest(path, capsys) != before
+
+    def test_a_split_contract_and_its_flat_twin_have_one_digest(
+        self, tmp_path, upstream_file, capsys
+    ):
+        split = _write_split(tmp_path / "split")
+        assert _digest(split, capsys) == _digest(upstream_file, capsys)
+
+    def test_the_digest_does_not_depend_on_where_the_fragments_are_kept(self, tmp_path, capsys):
+        one = _write_split(tmp_path / "one", fragment_dir="fragments")
+        other = _write_split(tmp_path / "other", fragment_dir="parts/exposes", ext="yml")
+        assert _digest(one, capsys) == _digest(other, capsys)
+
+    def test_a_ref_that_cannot_be_resolved_is_an_error_not_a_digest_of_the_root(self, tmp_path):
+        from fluid_build.cli._common import CLIError
+
+        path = _write_split(tmp_path)
+        (tmp_path / "fragments" / "orders.yaml").unlink()
+        with pytest.raises(CLIError) as exc:
+            _run(["contract", "digest", str(path)], tmp_path)
+        assert exc.value.event == "digest_contract_unresolvable"
+        assert "fragments/orders.yaml" in str(exc.value.context["error"])
+
+    def test_a_ref_that_loops_is_an_error(self, tmp_path):
+        from fluid_build.cli._common import CLIError
+
+        (tmp_path / "a.yaml").write_text("x: {$ref: ./b.yaml}\n", encoding="utf-8")
+        (tmp_path / "b.yaml").write_text("y: {$ref: ./a.yaml}\n", encoding="utf-8")
+        path = tmp_path / "contract.fluid.yaml"
+        path.write_text("id: loop\nname: Loop\nz: {$ref: ./a.yaml}\n", encoding="utf-8")
+        with pytest.raises(CLIError) as exc:
+            _run(["contract", "digest", str(path)], tmp_path)
+        assert exc.value.event == "digest_contract_unresolvable"
+        assert "ircular" in str(exc.value.context["error"])
+
+    def test_a_ref_outside_the_contracts_tree_is_refused(self, tmp_path):
+        from fluid_build.cli._common import CLIError
+
+        (tmp_path / "outside.yaml").write_text("secret: s\n", encoding="utf-8")
+        product = tmp_path / "product"
+        product.mkdir()
+        path = product / "contract.fluid.yaml"
+        path.write_text("id: p\nname: P\nx: {$ref: ../outside.yaml}\n", encoding="utf-8")
+        with pytest.raises(CLIError) as exc:
+            _run(["contract", "digest", str(path)], tmp_path)
+        assert exc.value.event == "digest_contract_unresolvable"
+
+    def test_a_remote_ref_is_never_fetched(self, tmp_path):
+        from fluid_build.cli._common import CLIError
+
+        path = tmp_path / "contract.fluid.yaml"
+        path.write_text(
+            'id: p\nname: P\nx: {$ref: "https://example.invalid/frag.yaml"}\n', encoding="utf-8"
+        )
+        with pytest.raises(CLIError) as exc:
+            _run(["contract", "digest", str(path)], tmp_path)
+        assert exc.value.event == "digest_contract_unresolvable"
+
+    def test_a_key_written_twice_in_a_fragment_is_refused(self, tmp_path):
+        from fluid_build.cli._common import CLIError
+
+        path = _write_split(tmp_path)
+        fragment = tmp_path / "fragments" / "orders.yaml"
+        fragment.write_text(fragment.read_text() + "kind: view\n", encoding="utf-8")
+        with pytest.raises(CLIError) as exc:
+            _run(["contract", "digest", str(path)], tmp_path)
+        assert exc.value.event == "digest_contract_unresolvable"
+        assert "duplicate key" in str(exc.value.context["error"])
+
+    def test_a_key_written_twice_in_the_root_is_refused(self, tmp_path):
+        from fluid_build.cli._common import CLIError
+
+        path = tmp_path / "contract.fluid.yaml"
+        path.write_text("id: p\nname: P\nname: Q\n", encoding="utf-8")
+        with pytest.raises(CLIError) as exc:
+            _run(["contract", "digest", str(path)], tmp_path)
+        assert exc.value.event == "digest_contract_unreadable"
+        assert "duplicate key" in str(exc.value.context["error"])
+
+    def test_an_env_placeholder_is_digested_as_written(self, tmp_path, monkeypatch, capsys):
+        """The digest is of the contract, not of an operator's environment."""
+        path = tmp_path / "contract.fluid.yaml"
+        path.write_text("id: p\nname: P\nbucket: '{{ env.UPSTREAM_BUCKET }}'\n", encoding="utf-8")
+        monkeypatch.delenv("UPSTREAM_BUCKET", raising=False)
+        unset = _digest(path, capsys)
+        monkeypatch.setenv("UPSTREAM_BUCKET", "somewhere")
+        assert _digest(path, capsys) == unset
+
+    def test_the_json_form_names_the_digest_of_a_split_contract(self, tmp_path, capsys):
+        path = _write_split(tmp_path)
+        _run(["contract", "digest", str(path), "--json"], tmp_path)
+        out = json.loads(capsys.readouterr().out)
+        assert out["digest"] == _digest(path, capsys)

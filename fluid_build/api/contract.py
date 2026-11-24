@@ -178,9 +178,10 @@ class LoadedContract:
         count.
 
         It is **not** the value ``fluid contract digest`` prints or a
-        federation ``upstreamDigest`` pins: those hash the file as parsed,
-        before any rewrite, ``$ref`` or overlay, so they differ whenever the
-        file uses one.
+        federation ``upstreamDigest`` pins: those hash the file's composed
+        contract (its ``$ref`` fragments resolved), before any rewrite or
+        overlay, so they differ whenever the file uses an alias, a legacy
+        ``build:`` or an overlay.
 
         Raises:
             ContractLoadError: ``contract_not_serialisable`` when JSON cannot
@@ -243,7 +244,10 @@ def load_contract(
 
     if _contract_loader._is_bundle_path(str(resolved)):
         try:
-            contract = _contract_loader.load_contract_with_overlay(str(resolved), env, log)
+            # The bundle branch of the engine loader, and the refs the bundle
+            # holds as written. A payload's literal ``$ref`` key is written
+            # ``$$ref`` in a bundle: it is no reference, so it is not listed.
+            contract, frozen = _contract_loader._load_bundle(str(resolved), env, log)
         except Exception as exc:  # noqa: BLE001 - every failure is mapped to one typed error
             raise _as_load_error(exc, resolved) from exc
         if not isinstance(contract, dict):
@@ -254,7 +258,7 @@ def load_contract(
             source=resolved,
             env=env,
             files=(resolved,),
-            unresolved_refs=_ref_values(contract),
+            unresolved_refs=frozen,
         )
 
     # The engine loader's composition, then its rewrites in its order: the
@@ -271,7 +275,9 @@ def load_contract(
         env=env,
         overlay=composed.overlay.resolve() if composed.overlay is not None else None,
         files=composed.files,
-        unresolved_refs=_ref_values(contract),
+        # The composition leaves no ref or fails; a ``$ref`` key it leaves is a
+        # payload's literal key, written ``$$ref``.
+        unresolved_refs=(),
         _origins=composed.origins,
     )
 
@@ -360,6 +366,7 @@ def load_contract_from_dict(
 
     files: Tuple[Path, ...] = ()
     origins = None
+    composed_refs = True
     if base_dir is not None:
         base = _resolve_input_path(base_dir, "base_dir")
         layer_dir = _resolve_input_path(overlay_dir, "overlay_dir") if overlay_dir else None
@@ -380,20 +387,26 @@ def load_contract_from_dict(
         files = composed.files
         origins = composed.origins
     else:
-        contract = _compose_without_files(document, overlay)
+        contract, composed_refs = _compose_without_files(document, overlay)
+    # A composed document holds no ref: a ``$ref`` key left in it is a
+    # payload's literal key, written ``$$ref``. One that names files and has
+    # no ``base_dir`` is not composed, its escapes included.
+    unresolved = () if composed_refs else _ref_values(contract)
     return LoadedContract(
         contract=_replay_engine_rewrites(contract),
         origin="memory",
         files=files,
-        unresolved_refs=_ref_values(contract),
+        unresolved_refs=unresolved,
         _origins=origins,
     )
 
 
 def _compose_without_files(
     document: Mapping[str, Any], overlay: Optional[Mapping[str, Any]]
-) -> Dict[str, Any]:
-    """``document`` (and ``overlay``) composed with no directory to read files from."""
+) -> Tuple[Dict[str, Any], bool]:
+    """``document`` (and ``overlay``) composed with no directory to read files from,
+    and whether it was: a document that names files is returned as written,
+    every ``$ref`` (and every ``$$ref`` escape) left in place."""
     from fluid_build import contract_refs, loader
 
     # The engine's composition rebuilds every dict and list, so no two places
@@ -413,14 +426,14 @@ def _compose_without_files(
             "contract's directory) to load it as fluid plan does",
         )
     if names_files:
-        return contract
+        return contract, False
     # The merge and the pointer pass share a trace, as in the engine: a
     # pointer the overlay puts over a bare pointer is checked once composed.
     trace = contract_refs.ComposeTrace()
     try:
         if layer is not None:
             contract = loader._deep_merge(contract, layer, _trace=trace)
-        return contract_refs.resolve_pointer_refs(contract, trace=trace)
+        return contract_refs.resolve_pointer_refs(contract, trace=trace), True
     except loader.OverlayMergeError as exc:
         raise ContractLoadError("contract_load_failed", f"overlay: {exc}") from exc
     except Exception as exc:  # noqa: BLE001 - mapped to one typed error
@@ -573,24 +586,12 @@ def _as_load_error(exc: BaseException, path: Optional[Path]) -> ContractLoadErro
 
 
 def _ref_values(node: Any) -> Tuple[str, ...]:
-    """Every ``$ref`` value left in ``node``, in document order, deduplicated.
+    """Every ``$ref`` value left in ``node``, in document order, deduplicated
+    (:func:`fluid_build.contract_refs.ref_values`).
 
-    Iterative, and each container is visited once, so neither depth nor a
-    YAML alias that makes the document self-referential can stop it short.
+    Only for a document nothing composed: in a composed one, a ``$ref`` key is
+    a payload's literal key, written ``$$ref`` (``contract_refs.unescape_ref_keys``).
     """
-    out: List[str] = []
-    seen: Set[int] = set()
-    stack: List[Any] = [node]
-    while stack:
-        n = stack.pop()
-        if not isinstance(n, (dict, list)) or id(n) in seen:
-            continue
-        seen.add(id(n))
-        if isinstance(n, dict):
-            ref = n.get("$ref")
-            if isinstance(ref, str) and ref not in out:
-                out.append(ref)
-            stack.extend(reversed(list(n.values())))
-        else:
-            stack.extend(reversed(n))
-    return tuple(out)
+    from fluid_build.contract_refs import ref_values
+
+    return ref_values(node)

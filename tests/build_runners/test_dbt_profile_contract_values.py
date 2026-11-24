@@ -25,6 +25,7 @@ from fluid_build.build_runners.dbt.profiles import (
     _build_generated_dbt_profile,
     _create_temp_dbt_profiles_dir,
 )
+from fluid_build.util.env_templates import EnvTemplateError
 
 pytestmark = pytest.mark.unit
 
@@ -210,7 +211,7 @@ REFUSED_NAMES = [
     # past where a pattern would end it, and reads the token.
     ("{{ env_var('DATABRICKS_SCHEMA', 'x\\') }}') ~ env_var('DATABRICKS_TOKEN') ~ ('') }}", {}),
     ("{{ env_var('DBX_CATALOG', '$DATABRICKS_TOKEN') }}", {}),
-    ("{{ env_var('DATABRICKS_TOKEN', 'a{{ env.UNSET_PART }}b') }}", {}),
+    ("{{ env_var('DATABRICKS_TOKEN', 'a{{ env.UNSET_PART }}b') }}", {"UNSET_PART": "x"}),
     # A placeholder may name the variable env_var reads.
     ("{{ env_var('{{ env.WHICH }}') }}", {"WHICH": "DATABRICKS_TOKEN"}),
     # Credentials whose names the redactor's rule misses; the dotenv policy's
@@ -456,12 +457,23 @@ class TestDatabricksNames:
 
     def test_no_value_keeps_the_environment_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("DATABRICKS_CATALOG", "operator_catalog")
-        # An unset placeholder resolves to nothing, as before.
-        build = _build("databricks", catalog="{{ env.UNSET_CATALOG }}", schema="")
+        build = _build("databricks", catalog="", schema="")
 
         output = _output(_build_generated_dbt_profile(build, {}))
 
         assert (output["catalog"], output["schema"]) == ("operator_catalog", "default")
+
+    def test_an_unset_placeholder_is_refused_naming_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("DATABRICKS_CATALOG", "operator_catalog")
+        monkeypatch.delenv("UNSET_CATALOG", raising=False)
+        build = _build("databricks", catalog="{{ env.UNSET_CATALOG }}", schema="")
+
+        with pytest.raises(EnvTemplateError) as caught:
+            _build_generated_dbt_profile(build, {})
+
+        assert caught.value.extras["missing"] == ["UNSET_CATALOG"]
 
     @pytest.mark.parametrize("value,env,rendered", [(v, e, r) for v, e, _, r in ALLOWED_NAMES])
     def test_dbt_reads_an_allowed_form_as_the_name_it_says(
@@ -502,6 +514,35 @@ class TestDatabricksNames:
 
 
 class TestRunner:
+    def test_an_unset_variable_ends_the_build_not_the_run(
+        self,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Like a refused profile: the build reports it and returns 1, so the summary, the run
+        report and the hooks after the builds still happen."""
+        from fluid_build.build_runners.dbt import runner
+
+        (tmp_path / "dbt_project.yml").write_text("name: p\nprofile: p\n", encoding="utf-8")
+        monkeypatch.delenv("UNSET_CATALOG", raising=False)
+
+        def _must_not_run(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("dbt must not be prepared or run")
+
+        monkeypatch.setattr(runner, "build_dbt_command", _must_not_run)
+        monkeypatch.setattr(runner.subprocess, "run", _must_not_run)
+
+        result = runner.execute_dbt_build(
+            _build("databricks", catalog="{{ env.UNSET_CATALOG }}"),
+            tmp_path,
+            tmp_path,
+            dry_run=False,
+        )
+
+        assert result == 1
+        assert "UNSET_CATALOG" in capsys.readouterr().out
+
     @pytest.mark.parametrize("dry_run", [False, True])
     def test_the_build_is_refused_before_dbt_starts(
         self,

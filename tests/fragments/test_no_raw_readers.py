@@ -49,7 +49,7 @@ from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Set, Tuple
 import pytest
 import yaml
 
-from fluid_build import loader
+from fluid_build import contract_refs, loader
 
 _CHECKOUT = Path(__file__).resolve().parents[2]
 _PACKAGE = Path(loader.__file__).resolve().parent
@@ -64,6 +64,7 @@ def _clear_loader_registries() -> None:
     for name, value in vars(loader).items():
         if name.startswith("_NOTED_") and isinstance(value, set):
             value.clear()
+    contract_refs._NOTED_REF_WARNINGS.clear()  # the resolver's registry: not a loader attribute
 
 
 @pytest.fixture(autouse=True)
@@ -362,7 +363,7 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
         LOADER,
         "a bundle holds the contract already composed: it parses contract.resolved.* from the "
         "tarball after the MANIFEST check, and there is no $ref left to follow",
-        *_site("_contract_loader.py", "_load_contract_from_bundle"),
+        *_site("_contract_loader.py", "_read_bundle_contract"),
     ),
     # ── read something other than a contract ──
     **_register(

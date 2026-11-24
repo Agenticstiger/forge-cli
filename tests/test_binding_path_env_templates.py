@@ -20,6 +20,7 @@ import pytest
 
 from fluid_build.build_runners.base import _resolve_env_placeholders
 from fluid_build.util.binding_paths import anchor_binding_paths, resolve_binding_path
+from fluid_build.util.env_templates import EnvTemplateError
 
 TEMPLATED = "{{ env.FLUID_TEST_DATA_DIR }}/product/product.parquet"
 
@@ -40,17 +41,26 @@ def test_a_relative_value_is_anchored_after_it_is_resolved(tmp_path, monkeypatch
     assert resolved == str(tmp_path / "out" / "product" / "product.parquet")
 
 
-@pytest.mark.parametrize("value", ["/srv/lake", "rel/dir", None, "s3://bucket/prefix"])
+@pytest.mark.parametrize("value", ["/srv/lake", "rel/dir", "s3://bucket/prefix"])
 def test_readers_resolve_exactly_as_the_build_runner_writes(tmp_path, monkeypatch, value):
-    if value is None:
-        monkeypatch.delenv("FLUID_TEST_DATA_DIR", raising=False)
-    else:
-        monkeypatch.setenv("FLUID_TEST_DATA_DIR", value)
+    monkeypatch.setenv("FLUID_TEST_DATA_DIR", value)
 
     written = resolve_binding_path(_resolve_env_placeholders(TEMPLATED), tmp_path)
     read = resolve_binding_path(TEMPLATED, tmp_path)
 
     assert read == written
+
+
+def test_readers_and_the_build_runner_both_refuse_an_unset_variable(tmp_path, monkeypatch):
+    monkeypatch.delenv("FLUID_TEST_DATA_DIR", raising=False)
+
+    with pytest.raises(EnvTemplateError) as written:
+        _resolve_env_placeholders(TEMPLATED)
+    with pytest.raises(EnvTemplateError) as read:
+        resolve_binding_path(TEMPLATED, tmp_path)
+
+    assert written.value.extras["missing"] == read.value.extras["missing"]
+    assert "FLUID_TEST_DATA_DIR" in read.value.extras["missing"]
 
 
 def test_anchor_binding_paths_resolves_the_expose_path(tmp_path, monkeypatch):

@@ -39,6 +39,7 @@ from fluid_build.util.contract import (
     is_continuous_build,
     trigger_type_of,
 )
+from fluid_build.util.env_templates import EnvTemplateError
 
 from .._path_safety import confine_to_workspace
 from ..base import (
@@ -1321,7 +1322,7 @@ def execute_dbt_build(
         profiles_dir, temp_profiles_dir = resolve_dbt_profiles_dir(
             build, project_dir, project_config
         )
-    except DbtProfileError as exc:
+    except (DbtProfileError, EnvTemplateError) as exc:
         # Refused before the profile is written, and before dbt starts.
         _print_typed_error(exc)
         LOG.error("dbt_profile_refused build_id=%s code=%s", build_id, exc.code)
@@ -1336,7 +1337,7 @@ def execute_dbt_build(
             project_config=project_config,
             apply_mode=apply_mode,
         )
-    except (RuntimeError, OSError, yaml.YAMLError) as exc:
+    except (RuntimeError, OSError, yaml.YAMLError, EnvTemplateError) as exc:
         if temp_profiles_dir:
             temp_profiles_dir.cleanup()
         console_error(f"Unable to prepare dbt build '{build_id}': {exc}")

@@ -2,10 +2,14 @@
 
 A contract can pull any part of itself from another file with `$ref`: a
 value from a YAML or JSON file (an object, a list, a scalar), or the text of a
-`.sql`, `.md`, `.markdown`, `.txt`, `.py`, `.scala` or `.r` file, read as a
-string and never parsed. `fluid validate`, `plan`, `apply`, `bundle` and every
-other command resolve every ref before they do anything else, so the rest of
-the pipeline sees one document.
+`.sql`, `.md`, `.markdown`, `.txt`, `.py`, `.scala`, `.r`, `.hql`, `.ddl`,
+`.cql`, `.j2`, `.jinja` or `.sh` file, read as a string and never parsed.
+`fluid validate`, `plan`, `apply`, `bundle` and every other command resolve
+every ref before they do anything else, so the rest of the pipeline sees one
+document.
+
+`.json`, `.yaml`, `.yml` and `.avsc` files are parsed as JSON or YAML; a file
+with any other suffix is parsed too, with a `ref_target_suffix_unknown` warning.
 
 ```text
 orders/
@@ -38,6 +42,10 @@ fluid bundle   orders/contract.fluid.yaml   # print the single resolved document
 A ref is resolved relative to the file that contains it, so
 `fragments/builds/ingest.yaml` may itself say `$ref: ../policy.yaml`.
 
+A file ref's pointer without its leading `/` (`fragments/policy.yaml#gold`)
+is deprecated: it still reads `/gold`, with a `ref_pointer_without_slash`
+warning, and a later minor release will refuse it.
+
 Keys written beside `$ref` are merged over a copy of what it names, as a
 [JSON Merge Patch](https://www.rfc-editor.org/rfc/rfc7386): objects merge, a
 list or a scalar replaces, `null` removes a key. A target that is not an
@@ -46,6 +54,12 @@ object takes no keys beside its `$ref`. A same-document ref
 overlay is merged, whichever file it is written in. A `$ref` in an overlay
 resolves relative to the overlay file. No `$ref` is left after composition: one
 that cannot be resolved fails the command and names the file it was written in.
+A payload with `$ref` keys of its own (a JSON Schema, say) writes them `$$ref`:
+such a key is never resolved, and the composed contract holds the literal key
+`$ref` (`$$$ref` gives `$$ref`); `fluid bundle` writes it `$$ref` again.
+
+A key written twice in one mapping of the contract, an overlay or a fragment
+fails the command, naming the file, the key and, in YAML, the lines.
 
 ---
 
@@ -93,8 +107,8 @@ A workspace can widen it once for every product under it: `ref_root: .` in
 `fluid.workspace.yaml`, relative to that file. The root must stay inside the
 workspace file's own directory, contain the contract, and not be a home, a
 temporary directory, `/` or above the contract's repository; otherwise the
-setting is ignored with a warning. `FLUID_IGNORE_WORKSPACE_REF_ROOT=1` turns it
-off.
+setting is ignored with a warning, as it is when the file writes a key twice.
+`FLUID_IGNORE_WORKSPACE_REF_ROOT=1` turns it off.
 
 To share fragments between products, set the ref root to a directory that
 contains both the contracts and the shared fragments:

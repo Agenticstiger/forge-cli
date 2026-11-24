@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from fluid_build import loader
+from fluid_build import contract_refs, loader
 from fluid_build.loader import (
     REF_ROOT_ENV,
     RefConfinementError,
@@ -392,6 +392,30 @@ class TestEnvRootOutsideTheContract:
         message = warnings[0].getMessage()
         assert f"{REF_ROOT_ENV}=" in message
         assert str(contract.resolve().parent) in message
+
+    def test_a_neighbours_ignored_env_root_is_a_debug_line_inside_a_quiet_block(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The warning names the contract's directory: for another product's contract, read for
+        a few values, that is a DEBUG line and the warn-once record is left for its own author."""
+        (tmp_path / "elsewhere").mkdir()
+        contract = self._fragment_contract(tmp_path)
+        monkeypatch.setenv(REF_ROOT_ENV, str(tmp_path / "elsewhere"))
+        why = "a test reads this contract for another product"
+
+        with caplog.at_level(logging.DEBUG, logger="fluid.loader"):
+            with contract_refs.quiet_ref_warnings(why):
+                assert loader.load_contract(contract)["labels"] == {"team": "orders"}
+        (said,) = [r for r in caplog.records if getattr(r, "event", None) == "ref_root_env_ignored"]
+        assert said.levelno == logging.DEBUG
+        assert f"A DEBUG line, not a WARNING: {why}." in said.getMessage()
+        assert loader._NOTED_REF_ROOT_ENV_IGNORED == set()
+
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="fluid.loader"):
+            loader.load_contract(contract)  # its own author, composing it for themselves
+        (own,) = [r for r in caplog.records if getattr(r, "event", None) == "ref_root_env_ignored"]
+        assert own.levelno == logging.WARNING
 
     def test_fallback_is_the_default_root_not_a_wider_one(self, tmp_path, monkeypatch):
         elsewhere = tmp_path / "elsewhere"
