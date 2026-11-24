@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correlation over fewer than the records the group-size check needs is withheld like any other
   group. A table's `cliqueColumns` are answered with one two-way statistic for each pair of the
   first 32 listed columns (the first column's histogram grouped by the second, a category by its
-  levels, a number or timestamp by the bins of its declared range); the pairs not measured are
+  levels, a number by the bins of its declared range, a date or timestamp by the bins of its
+  type's ladder, the bins a private release cuts it on); the pairs not measured are
   named in the report with the reason. A relationship's `groupBy` asks its statistics grouped by
   each named parent column, and its `linked` asks a child column's histogram grouped by a column
   of the parent row its key reaches (`groupByLink`); each group of a grouped statistic is checked
@@ -28,7 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`fluid profile --privacy-unit` releases rank correlations and clique marginals over numbers and
   timestamps.** Each noisy rank correlation carries `--row-floor` (default 1000) as its public
   `rowFloor`. Its sensitivity for one row is 4 / (floor + 1) for Kendall's tau and 9 / (floor + 1)
-  for Spearman's rho, times the rows one unit contributes; the value is rounded onto a lattice of
+  for Spearman's rho, times the rows one unit contributes (at least two in a keyed or related
+  release, since replacing a row can change which row of a unit is kept); the value is rounded onto a lattice of
   2^20 steps per sensitivity and an exact discrete Gaussian is added on it, so no floating-point
   noise is drawn. The profile states a Gaussian of the scale that spends the statistic's share,
   which is its charge, sensitivity squared over twice the scale squared, and the stated variance
@@ -48,7 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a unit keeps depends on the seed and that unit alone. The release holds every table the unit
   reaches, each charged for the rows one unit contributes to it (counts, cliques and rank
   correlations alike), a noisy children-per-parent histogram for each declared relationship (bins
-  0 to MAX when followed, a fixed public ladder when not), grouped by parent columns, and
+  0 to MAX when followed, and a cap whose bins pass the release's cell limit is refused by name; a
+  fixed public ladder when not), grouped by parent columns, and
   histograms grouped through a link by the contract's levels, each charged as a count table of the
   child. A table the unit does not reach is treated as fixed: the report names those tables and warns when
   a labelled (`pii` or `restricted`) column of one groups a noisy statistic, which flux-engine grades
