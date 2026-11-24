@@ -649,8 +649,10 @@ _JSON_SIMPLE_TYPES = {
         ("string", "text", "varchar", "nvarchar", "char", "nchar", "character", "clob"), "VARCHAR"
     ),
     **_JSON_INT_TYPES,
-    **dict.fromkeys(("float", "float4", "float32", "real"), "FLOAT"),
-    **dict.fromkeys(("double", "float8", "float64", "double precision"), "DOUBLE"),
+    # ``float`` is a 64-bit double here, as in the AWS planner; only the explicitly narrow
+    # names are 32-bit.
+    **dict.fromkeys(("float4", "float32", "real"), "FLOAT"),
+    **dict.fromkeys(("float", "double", "float8", "float64", "double precision"), "DOUBLE"),
     **dict.fromkeys(("boolean", "bool"), "BOOLEAN"),
     "date": "DATE",
     "time": "TIME",
@@ -697,6 +699,23 @@ def _json_column_type(column: str, declared: str) -> str:
         doc=doc_url(),
         code="incremental_append_json_unmapped_type",
     )
+
+
+def _json_append_to_local_file(ctx: RunContext, streams: List[str], partition_by: Any) -> bool:
+    """Whether this run appends to a local json/ndjson file, the one case that rewrites it
+    (and so needs declared types). An object store, a staged BigQuery/Databricks file and a
+    partitioned table do not go through the union rewrite."""
+    fmt = (ctx.sink.format or "parquet").lower()
+    if (
+        ctx.source.mode is not AcquisitionMode.INCREMENTAL_APPEND
+        or fmt not in ("json", "ndjson")
+        or partition_by
+        or _bigquery_target(ctx) is not None
+        or _is_databricks_binding(ctx)
+    ):
+        return False
+    out_dir = Path(ctx.workdir) / "out"
+    return not any(_is_remote_uri(_resolve_destination_path(ctx, s, fmt, out_dir)) for s in streams)
 
 
 def _json_append_columns(ctx: RunContext) -> Dict[str, str]:
@@ -1918,13 +1937,7 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     # A json append reads the old rows back by declared type: refuse before any write
     # (and before the run opens) when the expose declares none.
     json_columns: Optional[Dict[str, str]] = None
-    if (
-        ctx.source.mode is AcquisitionMode.INCREMENTAL_APPEND
-        and (ctx.sink.format or "parquet").lower() in ("json", "ndjson")
-        and not partition_by
-        and _bigquery_target(ctx) is None
-        and not _is_databricks_binding(ctx)
-    ):
+    if _json_append_to_local_file(ctx, streams_to_run, partition_by):
         json_columns = _json_append_columns(ctx)
 
     # Shared run-opening chokepoint: timestamp + schema-evolution gate +

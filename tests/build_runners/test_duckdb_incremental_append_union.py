@@ -12,6 +12,7 @@ late-arrival side file is unioned the same way.
 from __future__ import annotations
 
 import os
+import types
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -22,6 +23,7 @@ duckdb = pytest.importorskip("duckdb")
 from fluid_build.build_runners.duckdb import runner as runner_mod  # noqa: E402
 from fluid_build.build_runners.duckdb.runner import (  # noqa: E402
     JsonAppendSchemaError,
+    _json_append_to_local_file,
     _union_rewrite,
     execute_duckdb_build,
 )
@@ -337,7 +339,7 @@ def test_a_json_append_without_a_declared_schema_is_refused_before_any_write(tmp
     with pytest.raises(JsonAppendSchemaError) as caught:
         _run(tmp_path, contract)
     assert caught.value.code == "incremental_append_json_needs_schema"
-    assert not (tmp_path / "lake").exists()
+    assert not [f for f in (tmp_path / "lake").rglob("*") if f.is_file()]
 
 
 def test_a_json_type_with_no_duckdb_mapping_is_refused(tmp_path):
@@ -347,7 +349,7 @@ def test_a_json_type_with_no_duckdb_mapping_is_refused(tmp_path):
     with pytest.raises(JsonAppendSchemaError) as caught:
         _run(tmp_path, contract)
     assert caught.value.code == "incremental_append_json_unmapped_type"
-    assert not (tmp_path / "lake").exists()
+    assert not [f for f in (tmp_path / "lake").rglob("*") if f.is_file()]
 
 
 @pytest.mark.parametrize("fmt", ["json", "ndjson"])
@@ -365,3 +367,53 @@ def test_json_late_events_keep_both_runs_late_rows(tmp_path, fmt):
     lake = tmp_path / "lake"
     assert [r[0] for r in _typed_rows(lake / f"events__late_events.{fmt}")] == [2, 4]
     assert [r[0] for r in _typed_rows(lake / f"events.{fmt}")] == [1, 3]
+
+
+@pytest.mark.parametrize("declared", ["float", "double"])
+def test_a_json_float_is_a_double_and_keeps_its_value(tmp_path, declared):
+    schema = [{"name": "seq", "type": "bigint"}, {"name": "ratio", "type": declared}]
+    contract = _json_contract(tmp_path, "json", schema=schema)
+
+    def land(*rows: str) -> None:
+        con = duckdb.connect()
+        try:
+            con.execute(
+                f"COPY (SELECT * FROM (VALUES {', '.join(rows)}) t(seq, ratio)) "
+                f"TO '{tmp_path / 'events.parquet'}' (FORMAT 'parquet')"
+            )
+        finally:
+            con.close()
+
+    land("(1::BIGINT, 0.1::DOUBLE)")
+    assert _run(tmp_path, contract) == 0
+    land("(1::BIGINT, 0.1::DOUBLE)", "(2::BIGINT, 0.2::DOUBLE)")
+    assert _run(tmp_path, contract) == 0
+    text = (tmp_path / "lake" / "events.json").read_text()
+    assert '"ratio":0.1}' in text and '"ratio":0.2}' in text
+    assert "0.1000" not in text
+
+
+def _stub_ctx(tmp_path: Path, location_path: str, **over: Any) -> Any:
+    expose = {
+        "exposeId": "events",
+        "binding": {"platform": "local", "location": {"path": location_path}},
+    }
+    return types.SimpleNamespace(
+        source=types.SimpleNamespace(
+            mode=over.get("mode", runner_mod.AcquisitionMode.INCREMENTAL_APPEND),
+            streams=["events"],
+        ),
+        sink=types.SimpleNamespace(format="json"),
+        contract={"exposes": [expose], "builds": [{"id": "b", "outputs": ["events"]}]},
+        build_id="b",
+        workdir=str(tmp_path),
+    )
+
+
+def test_the_early_json_refusal_skips_a_remote_sink(tmp_path):
+    local = _stub_ctx(tmp_path, "./lake/events.json")
+    remote = _stub_ctx(tmp_path, "s3://bucket/events.json")
+    assert _json_append_to_local_file(local, ["events"], ())
+    assert not _json_append_to_local_file(remote, ["events"], ())
+    full = _stub_ctx(tmp_path, "./lake/events.json", mode=runner_mod.AcquisitionMode.FULL_REFRESH)
+    assert not _json_append_to_local_file(full, ["events"], ())
