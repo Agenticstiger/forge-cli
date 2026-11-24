@@ -332,8 +332,14 @@ def _command_center_dry_run(
     )
 
 
-def _no_target_message(config: FluidConfig) -> str:
-    """Why ``fluid publish`` with no target does nothing, and how to name one."""
+def _no_target_message(config: FluidConfig, contract: str = "contract.fluid.yaml") -> str:
+    """Why ``fluid publish`` with no target does nothing, and how to name one.
+
+    The commands it suggests run as written: ``contract`` is the first contract
+    the user passed (``--list-catalogs`` needs one too).
+    """
+    import shlex
+
     import fluid_build.providers.catalogs  # noqa: F401  (registers every backend)
     from fluid_build.api.catalog_backend import all_catalog_backend_specs
 
@@ -345,9 +351,9 @@ def _no_target_message(config: FluidConfig) -> str:
     return (
         "No publish target given, so nothing was published and nothing was sent. "
         "Name one with --target NAME (repeatable), for example "
-        "'fluid publish contract.fluid.yaml --target fluid-command-center'. "
+        f"'fluid publish {shlex.quote(contract)} --target fluid-command-center'. "
         f"Available targets: {', '.join(names)}. "
-        "'fluid publish --list-catalogs' shows the configured ones."
+        f"'fluid publish {shlex.quote(contract)} --list-catalogs' shows the configured ones."
     )
 
 
@@ -1041,7 +1047,7 @@ async def run_async(args, logger: logging.Logger) -> int:
         )
         targets.append((args.catalog, None))
     if not targets:
-        logger.error(_no_target_message(config))
+        logger.error(_no_target_message(config, str(contract_paths[0])))
         return 1
 
     if not args.quiet:

@@ -250,6 +250,25 @@ def test_no_target_sends_nothing_and_names_the_choices(
     assert "datahub" in message
 
 
+def test_the_no_target_hints_are_commands_that_run(
+    checkout, contract, listener, monkeypatch, caplog
+):
+    """The message names the user's own contract, and its --list-catalogs hint runs."""
+    import shlex
+
+    url, seen = listener
+    _operator_endpoint(monkeypatch, url, key=True)
+    with caplog.at_level(logging.ERROR, logger="test.publish"):
+        assert _publish(str(contract)) == 1
+    message = " ".join(r.getMessage() for r in caplog.records)
+    quoted = shlex.quote(str(contract))
+    assert f"'fluid publish {quoted} --target fluid-command-center'" in message
+    assert f"'fluid publish {quoted} --list-catalogs'" in message
+
+    assert _publish(str(contract), "--list-catalogs") == 0
+    assert seen == []
+
+
 def test_no_target_sends_nothing_to_the_built_in_endpoint(checkout, contract, monkeypatch):
     """Nothing is opened toward ``http://localhost:8000``, the built-in endpoint."""
     import httpx

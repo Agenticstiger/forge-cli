@@ -21,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   aborted the process (SIGABRT), and the logs can hold other queries' text. Behaviour change: a
   statement that uses these functions or views is refused.
 - **`fluid publish` sends nothing to the Command Center unasked.** With neither `--target` nor
-  `--catalog` it now exits 1 and lists the targets, where it used to publish to
-  `fluid-command-center`. With `FLUID_COMMAND_CENTER_ENABLED` off (the switch `fluid apply`
+  `--catalog` it now exits 1 and lists the targets (its suggested commands name the contract
+  given), where it used to publish to `fluid-command-center`. With `FLUID_COMMAND_CENTER_ENABLED` off (the switch `fluid apply`
   already honours), a Command Center target is refused before any request, in every mode. A
   Command Center publish without a credential fails with the missing-credential error before the
   health check, which used to send `GET /api/v1/assets?limit=1` first. Behaviour change: pass
