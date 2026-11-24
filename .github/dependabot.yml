@@ -52,6 +52,24 @@ updates:
         update-types:
           - "version-update:semver-major"
           - "version-update:semver-minor"
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+    ignore:
+      # The base image's Python line is chosen with pyproject's classifiers, the
+      # CI matrix and the release image's CVE gate (see the comment above FROM in
+      # the Dockerfile), so a minor or major is a deliberate change. Patch
+      # releases and digest refreshes still arrive weekly.
+      - dependency-name: "python"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
   - package-ecosystem: github-actions
     directory: /
     schedule:
