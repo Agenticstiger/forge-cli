@@ -24,13 +24,13 @@ compile_one() {
 
 targets=("$@")
 if [ "${#targets[@]}" -eq 0 ]; then
-  targets=(ci-tools ci-security ci-typecheck verify-image)
+  targets=(ci-tools ci-security ci-typecheck verify-image release-tools)
 fi
 
 for target in "${targets[@]}"; do
   case "${target}" in
     ci-tools | ci-security | ci-typecheck) compile_one "${target}" 3.10 ;;
-    verify-image) compile_one "${target}" 3.12 ;;
+    verify-image | release-tools) compile_one "${target}" 3.12 ;;
     *)
       echo "unknown lock file: ${target}" >&2
       exit 2

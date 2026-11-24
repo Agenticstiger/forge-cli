@@ -54,9 +54,13 @@
 #   gh workflow run release.yml --ref vX.Y.Z -f tag=vX.Y.Z -f skip_testpypi=true
 #
 # A tag cut before this input existed (v0.19.0 and earlier) has no skip_testpypi
-# in its own release.yml, so it is dispatched with --ref main instead. The gate
-# refuses a start ref that does not contain the tag's commit, and warns that
-# the provenance names the start ref when it is not the tag.
+# in its own release.yml. It was once dispatched with --ref main, but main's
+# release.yml installs its build tools from requirements/release-tools.txt, and
+# a tag cut before that file existed does not have it. Such a tag is dispatched
+# with --ref <tag> instead, which runs the tag's own release.yml (and so cannot
+# skip TestPyPI). The gate refuses a start ref that does not contain the tag's
+# commit, and warns that the provenance names the start ref when it is not the
+# tag.
 #
 # verify-pypi (install + smoke from real PyPI) still runs; it is the only
 # index install check on that path.
@@ -249,9 +253,12 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install build tools
-        run: |
-          pip install --upgrade pip build twine
+      # Hash-locked: requirements/release-tools.in names pip, build, twine and
+      # cyclonedx-bom, and release-tools.txt carries every wheel hash.
+      # --require-hashes refuses anything that is not in the file. The SBOM step
+      # below uses cyclonedx-bom from the same file.
+      - name: Install build tools (hash-locked)
+        run: python -m pip install --require-hashes -r requirements/release-tools.txt
 
       - name: Build wheel and sdist
         env:
@@ -307,7 +314,6 @@ jobs:
         # venv built above). Shipped as a release artifact for supply-chain
         # transparency — what JFrog Xray / CRA-minded consumers expect.
         run: |
-          pip install "cyclonedx-bom==7.3.0"
           cyclonedx-py environment /tmp/test-install \
             --of JSON --output-file sbom.cdx.json
 
