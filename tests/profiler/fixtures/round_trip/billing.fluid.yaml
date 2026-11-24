@@ -45,6 +45,16 @@ exposes:
           required: true
           validationRules:
             - { type: range, constraint: ">= 0 and <= 20" }
+        - name: amount
+          type: INT
+          required: true
+          validationRules:
+            - { type: range, constraint: ">= 0 and <= 100000" }
+        - name: weight
+          type: INT
+          required: true
+          validationRules:
+            - { type: range, constraint: ">= 0 and <= 50000" }
         - name: placed_at
           type: TIMESTAMP
           required: true
