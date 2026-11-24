@@ -4,8 +4,8 @@
 """``fluid profile``: an output-checked profile of a data product, read where its records live.
 
 The command reads each expose's records once, inside the environment that holds
-them, and writes one FLUX profile document (PROFILE-SPEC format 1-0-0, or 1-1-0
-when it holds a quantile with bins) of aggregates that passed the disclosure
+them, and writes one FLUX profile document (PROFILE-SPEC, in the least format
+that holds it, 1-0-0 to 1-4-0) of aggregates that passed the disclosure
 rules. A FLUX Simulation pins the document by the digest this prints. See
 :mod:`fluid_build.profiler` for the parts.
 
@@ -30,8 +30,10 @@ Several exposes of the data product go into one document: give each one its
 records as --source <exposeId>=<location> (and a database's table as --table
 <exposeId>=<table>); the document is then named after the contract's id.
 
-The document follows FLUX PROFILE-SPEC (format 1-0-0, or 1-1-0 when it holds a
-quantile with bins) and holds only aggregates that passed the output checks: no
+The document follows FLUX PROFILE-SPEC and names the least format that holds it:
+1-0-0, or 1-1-0 when it holds a quantile with bins, 1-2-0 with facts, 1-3-0 with a
+statistic grouped through a link, 1-4-0 with a rank correlation or a statistic grouped
+by bins. It holds only aggregates that passed the output checks: no
 record, no sample, no per-record value. The checks are ACRO 1.1.0's defaults, named
 "acro-default" in the document:
   - a count below 10 records is withheld, and so is a zero;
@@ -129,9 +131,31 @@ and the request's grid is the profile's. The request's contract digest, when it
 has one, must be the contract file's (run `fluxsim init` again otherwise). Per
 table it holds only the columns, metrics and statistics listed, and the row
 count only when asked; of the statistics, those the contract's declarations give
-and the request lists, ungrouped (a request asks for no grouping). Children per
+and the request lists, ungrouped. Children per
 parent are counted for a listed relationship the contract declares, as a
-histogram. Each listed item the profile does not answer is named in the report
+histogram.
+
+A request of format 1-2-0 may also ask for more, each exact and under the same checks:
+  - rankCorrelations: for a table, Kendall's tau (kendallTau/1) or Spearman's rho
+    (spearmanRho/1) of each pair of the columns listed, the one listed first first,
+    as columnPairs entries (format 1-4-0). Each holds the number of records whose two
+    values are known, with the sum S of the signs of the pairs' differences or A4, four
+    times the sum of the products of the mid-ranks, over values floored onto the
+    grid; neither is the Pearson correlation of the ranks. A group of fewer than 10
+    records is withheld. With --row-floor N the statistic also states rowFloor N and
+    its value is formed over max(records, N);
+  - cliqueColumns: this profile has no cliques, so for each pair of the first 32
+    columns listed it holds the first column's histogram grouped by the second, by
+    groupBy where the second is an enum or boolean column and by groupByBins (format
+    1-4-0) where it is a number with a declared range. Every level or bin is a group,
+    so the groups never depend on the records, and the output check for counts at
+    edges decides what each may publish. A column with no public levels or bins, and
+    a pair past the 32 columns, is named in the report with its reason;
+  - a relationship's groupBy: the children per parent of the parents in each level or
+    bin of a parent column (format 1-4-0), a parent whose value is null in no group;
+  - a relationship's linked: a child column's histogram grouped by an enum or boolean
+    column of the parent row its key reaches, as groupByLink (format 1-3-0); a child
+    that reaches no parent is in no group. Each listed item the profile does not answer is named in the report
 with its reason (for example a histogram over a number with no declared range,
 quantiles beside a histogram on one set of bins, a mean of a timestamp, a key
 column of a counted relationship). A listed fact, a rule of the contract's
@@ -275,6 +299,18 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
             "parts to be read rule nothing out, which withholds more"
         ),
     )
+    p.add_argument(
+        "--row-floor",
+        type=_row_floor,
+        default=None,
+        metavar="N",
+        help=(
+            "the row floor of the rank correlations a --request asks for: a public count of "
+            "2 or more, written as the statistic's rowFloor and used to form its value "
+            "(N = max(records, floor)); without it a rank correlation is formed over its "
+            "records alone and states no rowFloor"
+        ),
+    )
     p.add_argument("--env", help="environment overlay to apply to the contract first")
     from fluid_build.cli import _profile_release
 
@@ -298,6 +334,17 @@ def _fractional_bits(text: str) -> int:
     if not 0 <= bits <= _MAX_FRACTIONAL_BITS:
         raise argparse.ArgumentTypeError(f"{bits} is outside 0 to {_MAX_FRACTIONAL_BITS}")
     return bits
+
+
+def _row_floor(text: str) -> int:
+    """``--row-floor``: a whole number of 2 or more, as PROFILE-SPEC section 5 allows."""
+    try:
+        floor = int(text, 10)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number") from None
+    if not 2 <= floor <= 2**53 - 1:
+        raise argparse.ArgumentTypeError(f"{floor} is outside 2 to {2**53 - 1}")
+    return floor
 
 
 def _refusal(event: str, detail: str, context: Dict[str, str]) -> Any:
@@ -327,6 +374,15 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             asked_for.check_flags(bundle=args.bundle, env=args.env, exposes=args.expose_id)
         except runner.ProfileError as exc:
             raise _as_refusal(exc, args.source) from None
+    elif getattr(args, "row_floor", None) is not None:
+        raise _refusal(
+            "profile_row_floor_needs_request",
+            "--row-floor is the floor of the rank correlations a request asks for",
+            {
+                "read": "nothing: no record was read",
+                "next": "give --request, or leave --row-floor out",
+            },
+        )
     try:
         backend = _stats.load_backend()
     except _stats.StatisticsUnavailable as exc:
@@ -378,6 +434,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             fractional_bits=args.fractional_bits,
             bundles=blocks,
             request=asked,
+            row_floor=getattr(args, "row_floor", None),
         )
         _write(out, result.canonical)
     except (
@@ -879,6 +936,7 @@ def _report(
         )
     for child, name, reason in result.relationships_left_out:
         say(f"No children per parent for exposes[{child}] {name!r}: {reason}.", soft_wrap=True)
+    _report_rank_correlations(say, result, several)
     for fact in result.facts:
         say(
             (
@@ -897,6 +955,27 @@ def _report(
     say("Pin it in the FLUX Simulation:")
     # One line, never wrapped: it is copied as it stands.
     say(f"  profile: {{digest: {result.digest}}}", soft_wrap=True)
+
+
+def _report_rank_correlations(say: Any, result: Any, several: bool) -> None:
+    """One line for each table that holds rank correlations: how many were published."""
+    for expose_id, table in result.document["tables"].items():
+        statistics = [
+            statistic
+            for pair in table.get("columnPairs", ())
+            for statistic in pair["statistics"]
+            if statistic["definition"] in ("kendallTau/1", "spearmanRho/1")
+        ]
+        if not statistics:
+            continue
+        published = sum(1 for each in statistics if each["groups"][0]["status"] == "F")
+        floors = {each["rowFloor"] for each in statistics if "rowFloor" in each}
+        floor = f", each with rowFloor {floors.pop()}" if len(floors) == 1 else ""
+        where = f"exposes[{expose_id}]: " if several else ""
+        say(
+            f"{where}Rank correlations: {published} of {len(statistics)} published{floor}.",
+            soft_wrap=True,
+        )
 
 
 def _report_table(say: Any, table: Any, prefix: str, grid: str) -> None:

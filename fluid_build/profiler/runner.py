@@ -39,10 +39,22 @@ from dataclasses import dataclass, field, replace
 from datetime import date
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 from fluid_build.policy._common import iter_exposes
-from fluid_build.profiler import defaults, disclosure, document, facts, sources
+from fluid_build.profiler import defaults, disclosure, document, facts, grouped, ranks, sources
 from fluid_build.profiler._stats import (
     WITHHELD_ROUNDING,
     BlockRefused,
@@ -50,6 +62,7 @@ from fluid_build.profiler._stats import (
     DeclaredStatistic,
     EdgeDecision,
     EdgeStatistic,
+    Grouping,
     MeasuredGroup,
     MeasuredStatistic,
     MeasureRefused,
@@ -223,6 +236,12 @@ class Relationship:
     parent: str
     child_columns: Tuple[str, ...]
     parent_columns: Tuple[str, ...]
+    #: Answering a request (format 1-2-0): whether its children per parent are published, the
+    #: parent columns they are grouped by, and the ``(child column, parent column)`` pairs
+    #: whose child histogram is grouped by the parent column through the relationship.
+    counted: bool = True
+    group_by: Tuple[str, ...] = ()
+    linked: Tuple[Tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -596,6 +615,7 @@ def profile_exposes(
     fractional_bits: Optional[int] = None,
     bundles: Optional[Mapping[str, BundleBlock]] = None,
     request: Optional[Request] = None,
+    row_floor: Optional[int] = None,
 ) -> ProfileResult:
     """Profile each of *exposes* of *contract*, each from its own source, into one document.
 
@@ -607,8 +627,23 @@ def profile_exposes(
     record is read, and each expose's records are read once.
 
     With a *request* the profile measures what it lists and nothing else
-    (:mod:`fluid_build.profiler.request`); its grid is the profile's.
+    (:mod:`fluid_build.profiler.request`); its grid is the profile's. A request of format
+    1-2-0 may also ask rank correlations of column pairs (:mod:`fluid_build.profiler.ranks`;
+    *row_floor*, a count of at least 2, is then written as each one's ``rowFloor``), the
+    columns of a table related in pairs, and a relationship's statistics grouped by a parent
+    column or a child column grouped through the link (:mod:`fluid_build.profiler.grouped`).
     """
+    if row_floor is not None and (
+        isinstance(row_floor, bool) or not 2 <= row_floor <= disclosure.MAX_COUNT
+    ):
+        raise ProfileError(
+            "profile_row_floor_invalid",
+            f"a row floor is a count from 2 to {disclosure.MAX_COUNT}",
+            {
+                "read": "nothing: no record was read",
+                "next": "give --row-floor a count of 2 or more",
+            },
+        )
     fact_plans: List[facts.FactPlan] = []
     if request is not None:
         from fluid_build.profiler import request as asked_for
@@ -681,6 +716,8 @@ def profile_exposes(
     relationships, relationships_left_out = _keys_not_counted_at_edges(
         relationships, relationships_left_out, edges
     )
+    if request is not None:
+        relationships = [_with_asks(each, request) for each in relationships]
     keys = _key_columns(relationships)
     reads = [
         _dates_read(
@@ -694,6 +731,21 @@ def profile_exposes(
         )
         for each, plan in zip(exposes, plans, strict=True)
     ]
+    by_expose = {plan.expose_id: (plan, read) for plan, read in zip(plans, reads, strict=True)}
+    answered = _Groupings()
+    if request is not None:
+        answered = _answer_groupings(
+            request,
+            plans,
+            reads,
+            declared,
+            unfiltered,
+            relationships,
+            held,
+            backend,
+            fractional_bits,
+        )
+        declared = list(answered.declared)
     tallies: Tuple["Counter[str]", "Counter[str]"] = (Counter(), Counter())
     tables_doc: Dict[str, Dict[str, Any]] = {}
     results: List[TableResult] = []
@@ -708,6 +760,7 @@ def profile_exposes(
             fractional_bits,
             keys.get(plan.expose_id, frozenset()),
             asked.get(plan.expose_id),
+            answered.grouped_by.get(plan.expose_id, frozenset()),
         )
         tables_doc[plan.expose_id] = table_doc
         # A request lists what it asks, so what the defaults leave out is told per listed item.
@@ -716,10 +769,18 @@ def profile_exposes(
             if request is not None
             else replace(result, uncovered=missing)
         )
-    by_expose = {plan.expose_id: (plan, read) for plan, read in zip(plans, reads, strict=True)}
     counted = [
-        _children_per_parent(each, by_expose, backend, rule, tallies, fractional_bits)
-        for each in relationships
+        _children_per_parent(
+            each,
+            by_expose,
+            backend,
+            rule,
+            tallies,
+            fractional_bits,
+            answered.relationship_groupings.get(position, ()),
+        )
+        for position, each in enumerate(relationships)
+        if each.counted
     ]
     unanswered: Tuple[Tuple[str, str], ...] = ()
     if request is not None:
@@ -745,6 +806,23 @@ def profile_exposes(
             contract, fact_plans, by_table, rule, tallies[0]
         )
         unanswered = (*unanswered, *unmeasured)
+        unanswered = (*unanswered, *answered.not_measured)
+        for plan, read in zip(plans, reads, strict=True):
+            table = asked[plan.expose_id]
+            pairs, missing_pairs = ranks.column_pairs(
+                table,
+                {column.name: column.domain for column in plan.columns},
+                read,
+                backend,
+                rule,
+                tallies[0],
+                fractional_bits,
+                row_floor=row_floor,
+                held=held.get(plan.expose_id, frozenset()),
+            )
+            if pairs:
+                tables_doc[plan.expose_id]["columnPairs"] = pairs
+            unanswered = (*unanswered, *missing_pairs)
     if producer is None:
         from fluid_build import __version__
 
@@ -774,6 +852,180 @@ def profile_exposes(
         relationships_left_out=tuple(relationships_left_out),
         not_measured=unanswered,
         facts=fact_results,
+    )
+
+
+def _with_asks(relationship: Relationship, request: Request) -> Relationship:
+    """*relationship* with what the request asks of it (:func:`request.relationship_asks`)."""
+    from fluid_build.profiler import request as asked_for
+
+    counted, group_by, linked = asked_for.relationship_asks(request, relationship)
+    return replace(relationship, counted=counted, group_by=group_by, linked=linked)
+
+
+@dataclass
+class _Groupings:
+    """The grouped statistics a request asks for, formed before any table is measured.
+
+    ``declared`` are the tables' blocks with the two-way statistics of ``cliqueColumns`` and
+    the child histograms grouped through a link added, ``relationship_groupings`` each counted
+    relationship's parent groupings (by its position), ``grouped_by`` the columns of each
+    table a grouping uses, and ``not_measured`` each grouping the profile does not hold, with
+    why.
+    """
+
+    declared: Sequence[Optional[DeclaredBlock]] = ()
+    relationship_groupings: Dict[int, List[Tuple[str, Grouping]]] = field(default_factory=dict)
+    grouped_by: Dict[str, FrozenSet[str]] = field(default_factory=dict)
+    not_measured: List[Tuple[str, str]] = field(default_factory=list)
+
+
+def _answer_groupings(
+    request: Request,
+    plans: Sequence[ExposePlan],
+    reads: Sequence[sources.SourceColumns],
+    declared: Sequence[Optional[DeclaredBlock]],
+    structures: Mapping[str, Optional[DeclaredBlock]],
+    relationships: Sequence[Relationship],
+    held: Mapping[str, FrozenSet[str]],
+    backend: StatisticsBackend,
+    fractional_bits: int,
+) -> _Groupings:
+    """Form the groupings a request asks for, from the one read of each table.
+
+    *structures* are the tables' default blocks, which hold each column's public levels and
+    bins. Everything here is chosen from them and from the contract; the records only say
+    which group each row is in. A grouping a column's structure does not allow is named in
+    ``not_measured`` with the reason.
+    """
+    by_expose = {plan.expose_id: (plan, read) for plan, read in zip(plans, reads, strict=True)}
+    domains = {
+        plan.expose_id: {column.name: column.domain for column in plan.columns} for plan in plans
+    }
+    added: Dict[str, List[DeclaredStatistic]] = {}
+    grouped_by: Dict[str, Set[str]] = {}
+    result = _Groupings()
+    for plan, read in zip(plans, reads, strict=True):
+        table = request.table(plan.expose_id)
+        if table is None or not table.clique_columns:
+            continue
+        found, missing = grouped.pair_statistics(
+            table,
+            domains[plan.expose_id],
+            read,
+            structures.get(plan.expose_id),
+            backend=backend,
+            fractional_bits=fractional_bits,
+            held=held.get(plan.expose_id, frozenset()),
+        )
+        added.setdefault(plan.expose_id, []).extend(found)
+        result.not_measured.extend(missing)
+    for position, each in enumerate(relationships):
+        spelled = f"{each.child}({', '.join(each.child_columns)}) to {each.parent}"
+        if each.counted and each.group_by:
+            chosen, missing = grouped.parent_groupings(
+                each.group_by,
+                parent=each.parent,
+                domains=domains[each.parent],
+                read=by_expose[each.parent][1],
+                structures=structures.get(each.parent),
+                backend=backend,
+                fractional_bits=fractional_bits,
+            )
+            result.relationship_groupings[position] = chosen
+            grouped_by.setdefault(each.parent, set()).update(name for name, _ in chosen)
+            result.not_measured.extend(
+                (f"children per parent of {spelled} {what}", why) for what, why in missing
+            )
+        for column, parent_column in each.linked:
+            made = _linked_statistic(
+                each,
+                column,
+                parent_column,
+                by_expose,
+                domains,
+                structures,
+                backend,
+                fractional_bits,
+            )
+            what = f"{column} of {each.child} grouped by {each.parent}.{parent_column}"
+            if isinstance(made, str):
+                result.not_measured.append((what, made))
+                continue
+            added.setdefault(each.child, []).append(made)
+            grouped_by.setdefault(each.parent, set()).add(parent_column)
+    result.declared = [
+        (
+            replace(found, statistics=(*found.statistics, *added.get(plan.expose_id, ())))
+            if found is not None
+            else None
+        )
+        for plan, found in zip(plans, declared, strict=True)
+    ]
+    result.grouped_by = {expose: frozenset(names) for expose, names in grouped_by.items()}
+    return result
+
+
+def _linked_statistic(
+    relationship: Relationship,
+    column: str,
+    parent_column: str,
+    by_expose: Mapping[str, Tuple[ExposePlan, sources.SourceColumns]],
+    domains: Mapping[str, Mapping[str, str]],
+    structures: Mapping[str, Optional[DeclaredBlock]],
+    backend: StatisticsBackend,
+    fractional_bits: int,
+) -> Union[DeclaredStatistic, str]:
+    """The histogram of a child column grouped by a parent column through *relationship*.
+
+    The groups are the parent column's levels, which the contract declares: a parent column
+    whose values are not public levels is not a grouping, and the reason is returned instead.
+    A child row is in the group of the parent row its key reaches, and in none when it reaches
+    none (:func:`grouped.link_assignment`).
+    """
+    child, parent = relationship.child, relationship.parent
+    base = grouped.histogram_of(structures.get(child), column)
+    by = grouped.histogram_of(structures.get(parent), parent_column)
+    if column not in domains[child]:
+        return f"{column}: it is a column fluid profile does not read"
+    if base is None:
+        return (
+            f"{column}: it has no public levels or bins: it is neither an enum(...) or a "
+            "boolean column nor a number whose validationRules declare both ends of a range"
+        )
+    if parent_column not in domains[parent]:
+        return f"{parent_column}: it is a column fluid profile does not read"
+    if by is None or by.kind != "levelHistogram":
+        return (
+            f"{parent_column}: a group is keyed by the parent column's value, and only the "
+            "levels an enum(...) or a boolean column declares are public"
+        )
+    if not set(relationship.child_columns) <= set(domains[child]) or not set(
+        relationship.parent_columns
+    ) <= set(domains[parent]):
+        return "a key column of the relationship is not a column the profile holds"
+    parent_read = by_expose[parent][1]
+    parent_groups = grouped.assignment(
+        by,
+        domains[parent][parent_column],
+        parent_read.values[parent_column],
+        name=parent_column,
+        backend=backend,
+        fractional_bits=fractional_bits,
+    )
+    assigned = grouped.link_assignment(
+        _keys(by_expose[child], relationship.child_columns, backend),
+        _keys(by_expose[parent], relationship.parent_columns, backend),
+        parent_groups,
+    )
+    return grouped.child_groupings(
+        base,
+        by,
+        parent=parent,
+        parent_column=parent_column,
+        parent_columns=relationship.parent_columns,
+        child_columns=relationship.child_columns,
+        assigned=assigned,
     )
 
 
@@ -1144,6 +1396,7 @@ def _children_per_parent(
     rule: disclosure.DisclosureRule,
     tallies: Tuple["Counter[str]", "Counter[str]"],
     fractional_bits: int,
+    groupings: Sequence[Tuple[str, Grouping]] = (),
 ) -> Tuple[Dict[str, Any], RelationshipResult]:
     """The ``relationships[]`` entry of one relationship: a histogram with the parent as unit.
 
@@ -1152,6 +1405,12 @@ def _children_per_parent(
     none). The counts go through the output check for counts at edges in a call of their
     own, as ``check_edge_counts`` documents for a relationship's count of children, and
     are spelled as a column's histogram is.
+
+    A request's *groupings* (request format 1-2-0, PROFILE-SPEC format 1-4-0) are the parent
+    columns the same histogram is asked grouped by: each parent counts in the group of its
+    value, and a parent whose value is null in none. Every statistic of the relationship goes
+    through the one call, so the output check sees the partition the groups share, and the
+    audit of withheld cells runs group by group, on the parents and children of each.
     """
     parents = _keys(tables[relationship.parent], relationship.parent_columns, backend)
     children = Counter(
@@ -1171,13 +1430,24 @@ def _children_per_parent(
         read_as={},
         edges=tuple(encode(Fraction(edge)) for edge in CHILDREN_EDGES),
     )
-    measured = MeasuredStatistic(
-        groups=(backend.count_histogram(counts, CHILDREN_EDGES, fractional_bits),)
-    )
+    formed: List[Tuple[DeclaredStatistic, MeasuredStatistic]] = [
+        (
+            statistic,
+            MeasuredStatistic(
+                groups=(backend.count_histogram(counts, CHILDREN_EDGES, fractional_bits),)
+            ),
+        )
+    ]
+    members: List[Dict[str, List[int]]] = [{}]
+    for name, grouping in groupings:
+        formed.append(
+            _grouped_children(statistic, name, grouping, counts, backend, fractional_bits)
+        )
+        members.append(_members(grouping))
     try:
-        (decision,) = backend.check_edge_counts(
-            [_edge_statistic(statistic, measured, rule)],
-            total=_column_total(statistic, measured),
+        decisions = backend.check_edge_counts(
+            [_edge_statistic(each, measured, rule) for each, measured in formed],
+            total=_column_total(*formed[0]),
             minimum_cell=rule.minimum_cell,
             zeros_disclosive=rule.zeros_disclosive,
             round_count=lambda count: disclosure.round_count(count, rule),
@@ -1189,10 +1459,29 @@ def _children_per_parent(
             f"parents: {exc}",
             {"written": "nothing", "next": "report this: the output check refused its input"},
         ) from None
-    childless = sum(1 for key in parents if None in key)
-    decision = _audited_children(decision, measured.groups[0], sum(counts), childless, rule)
-    entry = _declared_entry(statistic, measured, rule, tallies, fractional_bits, decision)
-    (group,) = entry["groups"]
+    childless_at = [position for position, key in enumerate(parents) if None in key]
+    entries: List[Dict[str, Any]] = []
+    for (each, measured), decision, held in zip(formed, decisions, members, strict=True):
+        if each.grouping is None:
+            decision = _audited_children(
+                decision, measured.groups[0], sum(counts), len(childless_at), rule
+            )
+        else:
+            for group in measured.groups:
+                at = held[group.key]
+                decision = _audited_children(
+                    decision,
+                    group,
+                    sum(counts[position] for position in at),
+                    sum(1 for position in at if None in parents[position]),
+                    rule,
+                )
+        entries.append(
+            _declared_entry(
+                each, measured, rule, tallies, fractional_bits, decision, records=len(parents)
+            )
+        )
+    (group,) = entries[0]["groups"]
     published = (
         sum(1 for count in group["binCounts"] if count is not None)
         if group["status"] == disclosure.FREE
@@ -1201,11 +1490,46 @@ def _children_per_parent(
     document_entry = {
         "parent": {"table": relationship.parent, "columns": list(relationship.parent_columns)},
         "child": {"table": relationship.child, "columns": list(relationship.child_columns)},
-        "statistics": [entry],
+        "statistics": entries,
     }
     return document_entry, RelationshipResult(
         relationship, published=published, cells=len(CHILDREN_EDGES) - 1
     )
+
+
+def _members(grouping: Grouping) -> Dict[str, List[int]]:
+    """The positions of the units in each group of *grouping*."""
+    held: Dict[str, List[int]] = {key: [] for key in grouping.keys}
+    for position, key in enumerate(grouping.assigned):
+        if key is not None:
+            held[key].append(position)
+    return held
+
+
+def _grouped_children(
+    base: DeclaredStatistic,
+    name: str,
+    grouping: Grouping,
+    counts: Sequence[int],
+    backend: StatisticsBackend,
+    fractional_bits: int,
+) -> Tuple[DeclaredStatistic, MeasuredStatistic]:
+    """Children per parent grouped by the parent column *name*, one group for each public key.
+
+    The parents whose value is null are measured as one more group, never written.
+    """
+    held = _members(grouping)
+    groups = tuple(
+        backend.count_histogram(
+            [counts[at] for at in held[key]], CHILDREN_EDGES, fractional_bits, key
+        )
+        for key in grouping.keys
+    )
+    outside = [counts[position] for position, key in enumerate(grouping.assigned) if key is None]
+    left_out = (
+        backend.count_histogram(outside, CHILDREN_EDGES, fractional_bits) if outside else None
+    )
+    return replace(base, group_by=name, grouping=grouping), MeasuredStatistic(groups, left_out)
 
 
 #: Why the audit of children per parent withholds a cell the output check let through.
@@ -1375,17 +1699,29 @@ def _profile_table(
     fractional_bits: int,
     keys: FrozenSet[str] = frozenset(),
     asked: Optional[RequestTable] = None,
+    grouped_by: FrozenSet[str] = frozenset(),
 ) -> Tuple[Dict[str, Any], TableResult]:
     """One table of the document, from one read of its records, and its summary.
 
-    *keys* are the table's foreign-key columns whose children per parent are counted.
+    *keys* are the table's foreign-key columns whose children per parent are counted, and
+    *grouped_by* its columns a relationship's statistics are grouped by: the sizes of their
+    groups are published, so each is withheld what a level or a binned number is.
     """
     tally, cell_tally = tallies
+    domains = {column.name: column.domain for column in plan.columns}
     # A foreign key's own values are each parent's children, key by key: its sum, extremes
     # and quantiles describe them as a binned number's do its bins, so it withholds them too.
-    binned = _binned_numbers(declared, plan) | keys
+    binned = (
+        _binned_numbers(declared, plan)
+        | keys
+        | {name for name in grouped_by if domains.get(name) == NUMBER}
+    )
     replaced = _ungrouped_means(declared) | binned
-    counted = _counted_levels(declared) | keys
+    counted = (
+        _counted_levels(declared)
+        | keys
+        | {name for name in grouped_by if domains.get(name) != NUMBER}
+    )
     columns_doc = {
         column.name: _column(
             column,
@@ -1487,11 +1823,21 @@ def _binned_numbers(declared: Optional[DeclaredBlock], plan: ExposePlan) -> Froz
     if declared is None or not declared.every_declared_group:
         return frozenset()
     numbers = {column.name for column in plan.columns if column.domain == NUMBER}
-    return frozenset(
+    found = {
         each.column
         for each in declared.statistics
         if each.column in numbers and each.kind == "marginalHistogram"
+    }
+    # A number the statistics are grouped by the bins of has its bins' counts published too.
+    found.update(
+        each.group_by
+        for each in declared.statistics
+        if each.grouping is not None
+        and each.grouping.form == "groupByBins"
+        and each.group_by is not None
+        and each.group_by in numbers
     )
+    return frozenset(found)
 
 
 def _counted_levels(declared: Optional[DeclaredBlock]) -> FrozenSet[str]:
@@ -1582,7 +1928,16 @@ def _declare_statistics(
                 for record in zip(*(read.values[name] for name in names), strict=True)
             ]
         try:
-            measured = backend.measure(declared, statistic, rows[statistic.columns])
+            if statistic.grouping is not None:
+                measured = backend.measure_keyed(
+                    declared,
+                    statistic,
+                    rows[statistic.columns],
+                    statistic.grouping.assigned,
+                    statistic.grouping.keys,
+                )
+            else:
+                measured = backend.measure(declared, statistic, rows[statistic.columns])
         except MeasureRefused as exc:
             if declared.every_declared_group:  # the block the contract's declarations give
                 raise ProfileError(
@@ -1805,7 +2160,9 @@ def _declared_entry(
         **statistic.shape,
         "groups": written,
     }
-    if statistic.group_by is not None:
+    if statistic.grouping is not None:
+        entry.update(statistic.grouping.document)
+    elif statistic.group_by is not None:
         entry["groupBy"] = statistic.group_by
     return entry
 
@@ -1972,6 +2329,17 @@ def _row_count(rows: int, rule: disclosure.DisclosureRule, tally: "Counter[str]"
     return disclosure.round_count(rows, rule) if verdict.published else None
 
 
+def _grouped_by(statistic: Mapping[str, Any]) -> Optional[str]:
+    """What a statistic is grouped by, as the report names it: a column, its bins, or a link."""
+    if "groupByBins" in statistic:
+        return f"{statistic['groupByBins']['column']} bins"
+    if "groupByLink" in statistic:
+        link = statistic["groupByLink"]
+        return f"{link['parent']['table']}.{link['column']} through its link"
+    group: Optional[str] = statistic.get("groupBy")
+    return group
+
+
 def _shape(statistic: Mapping[str, Any]) -> Optional[str]:
     """What tells two statistics of one column and definition apart in the report."""
     parts = []
@@ -2000,7 +2368,7 @@ def _statistic_summaries(
         (
             name,
             statistic["definition"],
-            statistic.get("groupBy"),
+            _grouped_by(statistic),
             _shape(statistic),
             sum(1 for group in statistic["groups"] if group["status"] == disclosure.FREE),
             len(statistic["groups"]),

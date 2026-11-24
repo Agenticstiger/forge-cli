@@ -1009,6 +1009,8 @@ module = [
     "fluid_build.profiler.disclosure",
     "fluid_build.profiler.document",
     "fluid_build.profiler.facts",
+    "fluid_build.profiler.grouped",
+    "fluid_build.profiler.ranks",
     "fluid_build.profiler.request",
     "fluid_build.profiler.runner",
     "fluid_build.profiler.sources",

@@ -62,6 +62,7 @@ __all__ = [
     "DocumentRefused",
     "EdgeDecision",
     "EdgeStatistic",
+    "Grouping",
     "MeasureRefused",
     "MeasuredGroup",
     "MeasuredStatistic",
@@ -71,6 +72,8 @@ __all__ = [
     "RequestColumn",
     "RequestEnd",
     "RequestFact",
+    "RequestLinked",
+    "RequestRankCorrelation",
     "RequestRefused",
     "RequestRelationship",
     "RequestTable",
@@ -154,12 +157,32 @@ class RequestColumn:
 
 
 @dataclass(frozen=True)
+class RequestRankCorrelation:
+    """A rank correlation a table asks for: its definition and the columns it pairs, in order.
+
+    ``definition`` is ``kendallTau/1`` or ``spearmanRho/1``; ``columns`` are two or more
+    number or timestamp columns, and the correlation is asked of each unordered pair of
+    them, the one listed first first.
+    """
+
+    definition: str
+    columns: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RequestTable:
-    """One table (an exposeId) a request lists, whether it asks the row count, and its columns."""
+    """One table (an exposeId) a request lists, whether it asks the row count, and its columns.
+
+    ``rank_correlations`` and ``clique_columns`` are the additions of request format 1-2-0:
+    the rank correlations asked of the table's column pairs, and the columns a profile may
+    relate in pairs or cliques.
+    """
 
     expose_id: str
     row_count: bool
     columns: Tuple[RequestColumn, ...]
+    rank_correlations: Tuple[RequestRankCorrelation, ...] = ()
+    clique_columns: Tuple[str, ...] = ()
 
     def column(self, name: str) -> Optional[RequestColumn]:
         return next((each for each in self.columns if each.name == name), None)
@@ -174,12 +197,26 @@ class RequestEnd:
 
 
 @dataclass(frozen=True)
+class RequestLinked:
+    """A child column asked grouped by a column of the parent row its relationship names."""
+
+    column: str
+    parent_column: str
+
+
+@dataclass(frozen=True)
 class RequestRelationship:
-    """A listed relationship: the statistics asked over each parent's number of children."""
+    """A listed relationship: the statistics asked over each parent's number of children.
+
+    ``group_by`` are the parent columns the statistics are asked grouped by and ``linked``
+    the child columns asked grouped by a parent column (request format 1-2-0).
+    """
 
     parent: RequestEnd
     child: RequestEnd
     statistics: Tuple[str, ...]
+    group_by: Tuple[str, ...] = ()
+    linked: Tuple[RequestLinked, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -222,6 +259,27 @@ class MeasureRefused(ValueError):
 
 
 @dataclass(frozen=True)
+class Grouping:
+    """How a statistic is grouped when the groups are not the registry's own ``groupBy``.
+
+    A table's statistic grouped by a category column (``groupBy``) or by the bins of a number
+    column (``groupByBins``), and a child column's grouped by a column of its parent row
+    (``groupByLink``), form their groups from keys the profiler gives each row, since the
+    registry's parser reads no such block. ``keys`` is every group key, one a record holds or
+    not, sorted; each is a level the contract declares or the lower edge of a public bin, so no
+    key comes from a record. ``assigned`` is the key of each row, or ``None`` for a row no group
+    holds (a null grouping value, a child no parent row reaches). ``document`` is the key the
+    statistic is written with and its value: ``{"groupBy": name}``, ``{"groupByBins": {...}}``
+    or ``{"groupByLink": {...}}``.
+    """
+
+    form: str
+    document: Mapping[str, Any]
+    keys: Tuple[str, ...]
+    assigned: Tuple[Optional[str], ...] = field(default=(), compare=False, repr=False)
+
+
+@dataclass(frozen=True)
 class DeclaredStatistic:
     """One statistic the fidelity block asks the profile to carry.
 
@@ -242,6 +300,9 @@ class DeclaredStatistic:
     columns: Tuple[str, ...]
     read_as: Mapping[str, str]
     edges: Tuple[int, ...] = ()
+    #: The groups the profiler forms itself (:class:`Grouping`); ``None`` for a statistic the
+    #: registry groups, or none.
+    grouping: Optional[Grouping] = field(default=None, repr=False, compare=False)
     #: The registry's parsed declaration; only the registry's own seam reads it.
     _declaration: Any = field(default=None, repr=False, compare=False)
 
@@ -481,13 +542,38 @@ class StatisticsBackend(Protocol):
         record the block's declaration refuses.
         """
 
+    def measure_keyed(
+        self,
+        block: DeclaredBlock,
+        statistic: DeclaredStatistic,
+        rows: Sequence[Mapping[str, Any]],
+        assigned: Sequence[Optional[str]],
+        keys: Sequence[str],
+    ) -> MeasuredStatistic:
+        """Form a histogram of *statistic*'s column over groups the profiler chose.
+
+        *rows* hold the raw value of the statistic's column, *assigned* the key of the group
+        each row belongs to (``None``: no group), and *keys* every group, in this order, one
+        no row belongs to included. The rows no group holds are measured as one more group
+        (:attr:`MeasuredStatistic.left_out`). Raises :class:`MeasureRefused` for a record the
+        block's declaration refuses.
+        """
+
     def count_histogram(
-        self, counts: Sequence[int], edges: Sequence[int], fractional_bits: int
+        self, counts: Sequence[int], edges: Sequence[int], fractional_bits: int, group: str = ""
     ) -> MeasuredGroup:
-        """``marginalHistogram/1`` over whole numbers, one per unit: the ungrouped group.
+        """``marginalHistogram/1`` over whole numbers, one per unit: one group, keyed *group*.
 
         *counts* are one value per unit (a parent's number of children), and *edges* the
         bins' whole-number edges, placed on the grid as the registry places any edge.
+        """
+
+    def rank_group(self, identifier: str, pairs: Sequence[Tuple[int, int]]) -> Dict[str, Any]:
+        """The ungrouped group of ``kendallTau/1`` or ``spearmanRho/1`` over *pairs*, as spelled.
+
+        *pairs* are the two values of each record whose two values are known, floored onto
+        the grid. The group is ``{"group": "", "k": n, "S": ...}`` or ``{..., "A4": ...}``,
+        exact, with no ``status``.
         """
 
     def bin_cells(
@@ -742,6 +828,11 @@ class _FluxStatsBackend:
                         )
                         for column in table.columns
                     ),
+                    rank_correlations=tuple(
+                        RequestRankCorrelation(each.definition, tuple(each.columns))
+                        for each in table.rank_correlations
+                    ),
+                    clique_columns=tuple(table.clique_columns),
                 )
                 for table in asked.tables
             ),
@@ -750,6 +841,10 @@ class _FluxStatsBackend:
                     parent=RequestEnd(link.parent.table, tuple(link.parent.columns)),
                     child=RequestEnd(link.child.table, tuple(link.child.columns)),
                     statistics=tuple(link.statistics),
+                    group_by=tuple(link.group_by),
+                    linked=tuple(
+                        RequestLinked(each.column, each.parent_column) for each in link.linked
+                    ),
                 )
                 for link in asked.relationships
             ),
@@ -949,6 +1044,43 @@ class _FluxStatsBackend:
         except self._refused as error:
             raise MeasureRefused(error.code.code, error.detail or error.code.title) from None
         grouped = {index for _, indices in keys for index in indices}
+        return self._with_left_out(grammar, block, statistic, rows, groups, grouped)
+
+    def measure_keyed(
+        self,
+        block: DeclaredBlock,
+        statistic: DeclaredStatistic,
+        rows: Sequence[Mapping[str, Any]],
+        assigned: Sequence[Optional[str]],
+        keys: Sequence[str],
+    ) -> MeasuredStatistic:
+        grammar = self._fidelity()
+        parsed = block._block
+        declaration = statistic._declaration
+        members: Dict[str, List[int]] = {key: [] for key in keys}
+        for index, key in enumerate(assigned):
+            if key is not None:
+                members[key].append(index)
+        try:
+            groups = tuple(
+                self._measured(grammar, parsed, declaration, statistic, rows, key, members[key])
+                for key in keys
+            )
+        except self._refused as error:
+            raise MeasureRefused(error.code.code, error.detail or error.code.title) from None
+        grouped = {index for indices in members.values() for index in indices}
+        return self._with_left_out(grammar, block, statistic, rows, groups, grouped)
+
+    def _with_left_out(
+        self,
+        grammar: Any,
+        block: DeclaredBlock,
+        statistic: DeclaredStatistic,
+        rows: Sequence[Mapping[str, Any]],
+        groups: Tuple[MeasuredGroup, ...],
+        grouped: "set[int]",
+    ) -> MeasuredStatistic:
+        """*groups*, with the rows of *rows* that hold a value and are in no group as one more."""
         # A row that holds a value of the statistic's column and is in no group: the
         # column's ungrouped figures hold it, and the groups do not.
         outside = [
@@ -959,7 +1091,9 @@ class _FluxStatsBackend:
         if not outside:
             return MeasuredStatistic(groups)
         try:
-            left_out = self._measured(grammar, parsed, declaration, statistic, rows, "", outside)
+            left_out = self._measured(
+                grammar, block._block, statistic._declaration, statistic, rows, "", outside
+            )
         except self._refused:
             # Never written, so not refused either: the profile cannot vouch for rows
             # the block's reading refuses, and the caller withholds the groups.
@@ -1007,25 +1141,33 @@ class _FluxStatsBackend:
         return replace(group, values=tuple(values), encoded=tuple(encoded))
 
     def count_histogram(
-        self, counts: Sequence[int], edges: Sequence[int], fractional_bits: int
+        self, counts: Sequence[int], edges: Sequence[int], fractional_bits: int, group: str = ""
     ) -> MeasuredGroup:
         grammar = self._fidelity()
         grid = self._grid(fractional_bits)
         histogram = grammar.definition_named("marginalHistogram/1")
         encoded = tuple(grid.quantise(Fraction(edge), subject="bin edge") for edge in edges)
         state = histogram.measure(
-            "",
+            group,
             [grid.quantise(Fraction(count), subject="count") for count in counts],
             self._parameters(edges=encoded),
         )
         spelled: Dict[str, Any] = state.to_document(histogram)
         return MeasuredGroup(
-            key="",
+            key=group,
             document=spelled,
             k=state.k,
             statistic=state,
             cells=tuple(state.cell_counts("marginalHistogram")),
         )
+
+    def rank_group(self, identifier: str, pairs: Sequence[Tuple[int, int]]) -> Dict[str, Any]:
+        from flux_stats.rank_correlation import RANK_DEFINITIONS
+
+        definition = RANK_DEFINITIONS[identifier]
+        state = definition.measure("", list(pairs), self._parameters())
+        spelled: Dict[str, Any] = state.to_document(definition)
+        return spelled
 
     def bin_cells(
         self, values: Sequence[Any], edges: Sequence[Fraction], fractional_bits: int

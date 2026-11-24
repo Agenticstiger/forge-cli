@@ -17,11 +17,14 @@ from fluid_build.profiler.document import (
     SCHEMA_URL,
     SCHEMA_URL_1_1_0,
     SCHEMA_URL_1_2_0,
+    SCHEMA_URL_1_3_0,
+    SCHEMA_URL_1_4_0,
     DocumentError,
     build_document,
     canonical_bytes,
     digest_of,
     producer_uri,
+    schema_url_for,
 )
 from tests.profiler._fake_backend import FIXTURES, SCHEMA_PATH, SCHEMA_SHA256
 
@@ -109,11 +112,80 @@ def test_a_document_with_invariants_needs_format_1_2_0():
     assert "invariants" not in _document()
 
 
+def _with_pair(*definitions):
+    table = _table()
+    table["columnPairs"] = [
+        {
+            "columns": ["a", "b"],
+            "statistics": [{"definition": each, "groups": []} for each in definitions],
+        }
+    ]
+    return table
+
+
+def _with_grouping(**grouping):
+    table = _table()
+    table["columns"]["amount"]["statistics"] = [
+        {"definition": "levelHistogram/1", "groups": [], **grouping}
+    ]
+    return table
+
+
+_LINK = {"parent": {"table": "p", "columns": ["k"]}, "columns": ["k"], "column": "c"}
+_BINS = {"column": "c", "bins": ["0", "1"]}
+
+
+@pytest.mark.parametrize(
+    ("tables", "relationships", "expected"),
+    [
+        ({"orders": _with_pair("correlation/1")}, [], SCHEMA_URL),
+        ({"orders": _with_pair("kendallTau/1")}, [], SCHEMA_URL_1_4_0),
+        ({"orders": _with_pair("correlation/1", "spearmanRho/1")}, [], SCHEMA_URL_1_4_0),
+        ({"orders": _with_grouping(groupBy="c")}, [], SCHEMA_URL),
+        ({"orders": _with_grouping(groupByLink=_LINK)}, [], SCHEMA_URL_1_3_0),
+        ({"orders": _with_grouping(groupByBins=_BINS)}, [], SCHEMA_URL_1_4_0),
+        ({"orders": _with_grouping(rowFloor=5)}, [], SCHEMA_URL_1_4_0),
+        ({"orders": {**_table(), "cliqueSelection": {}}}, [], SCHEMA_URL_1_4_0),
+        (
+            {"orders": {**_table(), "cliques": [{"definition": "cliqueMarginal/2"}]}},
+            [],
+            SCHEMA_URL_1_4_0,
+        ),
+        (
+            {"orders": {**_table(), "cliques": [{"definition": "cliqueMarginal/1"}]}},
+            [],
+            SCHEMA_URL,
+        ),
+        (
+            {"orders": _table()},
+            [{"statistics": [{"definition": "marginalHistogram/1"}]}],
+            SCHEMA_URL,
+        ),
+        ({"orders": _table()}, [{"statistics": [{"groupBy": "c"}]}], SCHEMA_URL_1_4_0),
+        ({"orders": _table()}, [{"statistics": [{"groupByBins": _BINS}]}], SCHEMA_URL_1_4_0),
+        # Each format holds the ones before it, so the least is the latest any form needs.
+        ({"orders": _with_statistic("quantile/2")}, [], SCHEMA_URL_1_1_0),
+        (
+            {"orders": _with_grouping(groupByLink=_LINK, definition="quantile/2")},
+            [],
+            SCHEMA_URL_1_3_0,
+        ),
+    ],
+)
+def test_a_document_names_the_least_format_that_holds_it(tables, relationships, expected):
+    assert schema_url_for(tables, relationships=relationships) == expected
+    assert schema_url_for(tables, relationships=relationships, invariants=True) == (
+        expected if expected not in (SCHEMA_URL, SCHEMA_URL_1_1_0) else SCHEMA_URL_1_2_0
+    )
+
+
 def test_the_formats_are_the_ones_flux_stats_reads():
     profile = pytest.importorskip("flux_stats.profile")
     assert SCHEMA_URL == profile.SCHEMA_URL
     assert SCHEMA_URL_1_1_0 == profile.SCHEMA_URL_1_1_0
     assert SCHEMA_URL_1_2_0 == profile.SCHEMA_URL_1_2_0
+    assert SCHEMA_URL_1_3_0 == profile.SCHEMA_URL_1_3_0
+    assert SCHEMA_URL_1_4_0 == profile.SCHEMA_URL_1_4_0
 
 
 def test_the_producer_names_this_repository_at_the_release():

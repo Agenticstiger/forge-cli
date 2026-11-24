@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, List, Sequence, Tuple
 
@@ -148,6 +149,20 @@ class FakeStatistic:
 STATISTICS = (FakeStatistic("mean/1", lambda units: {"Sx": str(sum(units))}),)
 
 
+def _sign(value: int) -> int:
+    return (value > 0) - (value < 0)
+
+
+def _mid_ranks(values: Sequence[int]) -> List[Fraction]:
+    """The mid-rank of each value: the mean of the positions (from 1) its ties hold."""
+    return [
+        Fraction(
+            sum(1 for other in values if other < v) * 2 + sum(1 for o in values if o == v) + 1, 2
+        )
+        for v in values
+    ]
+
+
 def _exact(value: Any, where: str) -> Fraction:
     if isinstance(value, (bool, float)):
         raise ReadRefused(f"{where}: value class {type(value).__name__!r}")
@@ -211,8 +226,26 @@ class FakeBackend:
     def check_edge_counts(self, statistics: Any, **checks: Any) -> Any:
         return self._real().check_edge_counts(statistics, **checks)
 
-    def count_histogram(self, counts: Any, edges: Any, fractional_bits: int) -> Any:
-        return self._real().count_histogram(counts, edges, fractional_bits)
+    def measure_keyed(self, block: Any, statistic: Any, rows: Any, assigned: Any, keys: Any) -> Any:
+        return self._real().measure_keyed(block, statistic, rows, assigned, keys)
+
+    def count_histogram(
+        self, counts: Any, edges: Any, fractional_bits: int, group: str = ""
+    ) -> Any:
+        return self._real().count_histogram(counts, edges, fractional_bits, group)
+
+    def rank_group(self, identifier: str, pairs: Sequence[Tuple[int, int]]) -> Dict[str, Any]:
+        """``kendallTau/1`` and ``spearmanRho/1`` as PROFILE-SPEC section 5 defines them, pair by pair."""
+        k = len(pairs)
+        if identifier == "kendallTau/1":
+            total = sum(_sign(a[0] - b[0]) * _sign(a[1] - b[1]) for a, b in combinations(pairs, 2))
+            return {"group": "", "k": k, "S": str(total)}
+        if identifier == "spearmanRho/1":
+            left, right = _mid_ranks([x for x, _ in pairs]), _mid_ranks([y for _, y in pairs])
+            centre = Fraction(k + 1, 2)
+            a = sum((r - centre) * (q - centre) for r, q in zip(left, right, strict=True))
+            return {"group": "", "k": k, "A4": str(int(4 * a))}
+        raise KeyError(identifier)
 
     def metrics(self) -> Tuple[FakeMetric, ...]:
         return METRICS
@@ -233,6 +266,8 @@ class FakeBackend:
             return _milliseconds(value, where)
         if isinstance(value, bool):  # a boolean reads as the category it names, as flux-stats does
             return "true" if value else "false"
+        if isinstance(value, int):  # a whole number reads as its decimal text, as flux-stats does
+            return str(value)
         if not isinstance(value, str):
             raise ReadRefused(f"{where}: value class {type(value).__name__!r}")
         return unicodedata.normalize("NFC", value)
