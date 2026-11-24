@@ -9,15 +9,19 @@ DB_PW to attacker.example, and a name cannot tell a secret from any other variab
 DATABASE_URL look like none). So the key is the destination, as ``secrets.policy`` judges it for a
 ``secretRef``: a variable in a source or a sink block renders only when every endpoint of that block
 is this machine, a host written as one whole ``{{ env.* }}`` (the operator chose the address), or a
-host the operator paired with it (``NAME@host`` in FLUID_ACQUISITION_SECRET_REF_ALLOWLIST).
+host the operator paired with it (``NAME@host`` in FLUID_ACQUISITION_SECRET_REF_ALLOWLIST). A host
+variable counts as the operator's only while its value is theirs: one a project dotenv file supplied
+(``ZZZ=attacker.example`` in ``.env``) is the project's choice, and is paired like a literal host.
 """
 
 from __future__ import annotations
 
+import argparse
 import copy
 import logging
+import os
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import pytest
 
@@ -275,8 +279,13 @@ def _contract(**source: Any) -> Dict[str, Any]:
 
 @pytest.fixture(autouse=True)
 def _no_operator_pairing(monkeypatch):
+    from fluid_build.credentials.dotenv_store import reset_dotenv_load_log
+
     monkeypatch.delenv(SECRET_REF_ALLOWLIST, raising=False)
     monkeypatch.setenv("DB_PW", _PROBE)
+    reset_dotenv_load_log()  # what an earlier test's project files exported is not this test's
+    yield
+    reset_dotenv_load_log()
 
 
 def test_the_refusal_is_typed_and_says_what_to_do():
@@ -662,3 +671,323 @@ def test_a_decoy_expose_ahead_of_the_output_is_judged(engine, tmp_path: Path, mo
     assert "catalog.attacker.example" in shown.out + shown.err
     assert _PROBE not in shown.out + shown.err and _PROBE not in pushed()
     assert "attacker.example" not in pushed()
+
+
+# ── a host variable a project dotenv file supplies is the project's choice ───
+#
+# ``fluid apply`` loads the project's ``.env`` before it renders anything, and that file may set any
+# name that is not on the credential policy's list. ``ZZZ=attacker.example`` in it, beside the
+# contract's ``host: "{{ env.ZZZ }}"``, made the host look like the operator's own choice (the
+# whole-variable exemption) and the operator's DB_PW went to attacker.example with exit 0. The
+# project ships the contract too, so the exemption holds only while the value is the operator's:
+# from the shell, the CI environment or ``FLUID_SECRETS_FILE``.
+
+
+@pytest.fixture
+def project(tmp_path: Path, monkeypatch) -> Iterator[Path]:
+    """The project directory (``tmp_path``, where the dispatcher runs too). A test writes its
+    ``.env`` and hydrates it with the real ``hydrate_dotenv``; what the store exported leaves with
+    the test."""
+    from fluid_build.credentials.dotenv_store import reset_dotenv_load_log
+
+    monkeypatch.delenv("FLUID_SECRETS_FILE", raising=False)
+    monkeypatch.delenv("FLUID_ENV", raising=False)
+    reset_dotenv_load_log()
+    before = set(os.environ)
+    yield tmp_path
+    for name in set(os.environ) - before:
+        del os.environ[name]
+    reset_dotenv_load_log()
+
+
+def _dotenv(project: Path, text: str) -> None:
+    env_file = project / ".env"
+    env_file.write_text(text, encoding="utf-8")
+    env_file.chmod(0o600)
+
+
+def _hydrate(project: Path, text: str) -> None:
+    """Write the project's ``.env`` and load it as ``fluid apply`` does."""
+    from fluid_build.cli._common import hydrate_dotenv
+
+    _dotenv(project, text)
+    hydrate_dotenv(project)
+
+
+def _picks_the_host(contract: Dict[str, Any]) -> Dict[str, Any]:
+    _source(contract).update({"host": "{{ env.ZZZ }}", "password": "{{ env.DB_PW }}"})
+    return contract
+
+
+@_SHAPES
+def test_a_host_variable_a_project_dotenv_supplies_is_the_projects_choice(
+    engine, project: Path, capsys, caplog, shape
+):
+    """The probe: the project's ``.env`` names the host, the operator's own DB_PW goes with it."""
+    contract_for, pushed = engine
+    _hydrate(project, "ZZZ=attacker.example\n")
+    assert os.environ["ZZZ"] == "attacker.example", "the store exported it, as apply's does"
+    contract = _picks_the_host(contract_for())
+
+    with caplog.at_level(logging.DEBUG):
+        rc = _run(contract, project, shape)
+
+    shown = capsys.readouterr()
+    everything = shown.out + shown.err + caplog.text
+    assert rc == 1
+    assert "ZZZ" in everything and "project dotenv" in everything
+    assert "source.connection.host" in everything, "and its field"
+    assert "attacker.example" not in everything + pushed(), "neither printed nor started"
+    assert _PROBE not in everything + pushed()
+
+
+@_SHAPES
+def test_pairing_the_project_supplied_host_does_not_pair_what_goes_to_it(
+    engine, project: Path, monkeypatch, capsys, shape
+):
+    contract_for, pushed = engine
+    _hydrate(project, "ZZZ=attacker.example\n")
+    contract = _picks_the_host(contract_for())
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "ZZZ@attacker.example")
+    assert _run(contract, project, shape) == 1
+    shown = capsys.readouterr()
+    text = shown.out + shown.err
+    assert "DB_PW" in text and "ZZZ" in text and "DB_PW@" in text
+    assert _PROBE not in text + pushed() and "attacker.example" not in pushed()
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "ZZZ@attacker.example,DB_PW@attacker.example")
+    assert _run(contract, project, shape) == 0, "the operator decides, with both entries"
+    assert "attacker.example" in pushed()
+
+
+@_SHAPES
+def test_a_host_variable_the_operator_exports_stays_theirs(
+    engine, project: Path, monkeypatch, shape
+):
+    """The project's file does not replace a value the operator holds: the shell's value is the
+    one in effect, and the exemption holds."""
+    contract_for, pushed = engine
+    monkeypatch.setenv("ZZZ", "db.internal")
+    _hydrate(project, "ZZZ=attacker.example\n")
+    assert os.environ["ZZZ"] == "db.internal"
+    contract = _picks_the_host(contract_for())
+
+    assert _run(contract, project, shape) == 0
+    assert "db.internal" in pushed() and "attacker.example" not in pushed()
+
+
+@_SHAPES
+def test_a_host_variable_from_the_operators_secrets_file_stays_theirs(
+    engine, project: Path, monkeypatch, shape
+):
+    """``FLUID_SECRETS_FILE`` loads after the project's files and wins: the operator's file."""
+    contract_for, pushed = engine
+    secrets = project / "operator" / "secrets.env"
+    secrets.parent.mkdir()
+    secrets.write_text("ZZZ=db.internal\n", encoding="utf-8")
+    monkeypatch.setenv("FLUID_SECRETS_FILE", str(secrets))
+    _hydrate(project, "ZZZ=attacker.example\n")
+    assert os.environ["ZZZ"] == "db.internal"
+    contract = _picks_the_host(contract_for())
+
+    assert _run(contract, project, shape) == 0
+    assert "db.internal" in pushed() and "attacker.example" not in pushed()
+
+
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1"])
+def test_a_project_dotenv_that_points_at_this_machine_needs_no_pairing(
+    engine, project: Path, tmp_path: Path, host
+):
+    """A developer's ``.env`` with ``DB_HOST=localhost`` is the common case; nothing leaves."""
+    contract_for, pushed = engine
+    _hydrate(project, f"ZZZ={host}\n")
+    assert _run(_picks_the_host(contract_for()), project, "direct") == 0
+    assert host in pushed()
+
+
+def test_the_record_tells_the_projects_value_from_the_operators(project: Path, monkeypatch):
+    """What the check reads: the store records the names it exported from the project's files, and
+    leaves out a name the shell or ``FLUID_SECRETS_FILE`` already held."""
+    from fluid_build.credentials.dotenv_store import project_value_in_effect
+
+    secrets = project / "operator" / "secrets.env"
+    secrets.parent.mkdir()
+    secrets.write_text("FROM_OPERATOR_FILE=db.opsfile.example\n", encoding="utf-8")
+    monkeypatch.setenv("FLUID_SECRETS_FILE", str(secrets))
+    monkeypatch.setenv("FROM_SHELL", "db.shell.example")
+    monkeypatch.delenv("FROM_PROJECT", raising=False)
+    _hydrate(
+        project,
+        "FROM_PROJECT=attacker.example\nFROM_SHELL=attacker.example\nFROM_OPERATOR_FILE=attacker.example\n",
+    )
+    assert os.environ["FROM_PROJECT"] == "attacker.example"
+    assert os.environ["FROM_SHELL"] == "db.shell.example"
+    assert os.environ["FROM_OPERATOR_FILE"] == "db.opsfile.example"
+    assert project_value_in_effect("FROM_PROJECT") is True
+    assert project_value_in_effect("FROM_SHELL") is False
+    assert project_value_in_effect("FROM_OPERATOR_FILE") is False
+    assert project_value_in_effect("NEVER_SET") is False
+
+
+@pytest.mark.parametrize(
+    "connection",
+    [
+        {"host": "{{ env.ZZZ }}"},
+        {"host": "{{ env.ZZZ }}:5432"},
+        {"host": "u@{{ env.ZZZ }}:5432"},
+        {"uri": "postgres://u@{{ env.ZZZ }}:5432/db"},
+        {"uri": "postgres://u:{{ env.DB_PW }}@{{ env.ZZZ }}/db"},
+        {"connection_string": "postgres://{{ env.ZZZ }}/db"},
+    ],
+)
+def test_every_form_of_a_project_supplied_host_is_judged_as_the_host_it_renders_to(
+    connection, project: Path
+):
+    _hydrate(project, "ZZZ=attacker.example\n")
+    contract = _contract()
+    _source(contract).pop("host")
+    _source(contract).update({**connection, "password": "{{ env.DB_PW }}"})
+
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract, stage="fluid apply")
+
+    error = info.value
+    assert error.code == "EnvTemplateHostError" and error.extras["reason"] == "unpaired"
+    assert error.extras["origin"] == "project-dotenv" and error.extras["host_variable"] == "ZZZ"
+    assert "project dotenv" in error.what and "export ZZZ" in error.fix
+    assert "attacker.example" not in repr(error.__dict__) and _PROBE not in repr(error.__dict__)
+
+
+def test_a_project_supplied_host_in_a_url_or_a_host_field_is_paired_like_any_other(
+    project: Path, monkeypatch
+):
+    _hydrate(project, "ZZZ=attacker.example\n")
+    values = [
+        {"host": "{{ env.ZZZ }}"},
+        {"url": "https://{{ env.ZZZ }}/catalog"},
+        {"endpoint": "{{ env.ZZZ }}:9092"},
+    ]
+    for value in values:
+        with pytest.raises(EnvTemplateError) as info:
+            check_host_templates(value, stage="fluid apply")
+        error = info.value
+        assert error.code == "EnvTemplateHostError" and error.extras["variable"] == "ZZZ"
+        assert error.extras["reason"] == "unpaired" and error.extras["origin"] == "project-dotenv"
+        assert "project dotenv" in error.what and "Export ZZZ" in error.fix
+        assert "ZZZ@" in error.fix and "attacker.example" not in repr(error.__dict__)
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "ZZZ@attacker.example")
+    for value in values:
+        check_host_templates(value)
+
+
+def test_a_host_variable_the_operator_holds_needs_no_pairing_in_a_url_or_a_host_field(
+    project: Path, monkeypatch
+):
+    monkeypatch.setenv("ZZZ", "db.internal")
+    _hydrate(project, "ZZZ=attacker.example\n")
+    check_host_templates({"host": "{{ env.ZZZ }}", "url": "https://{{ env.ZZZ }}/catalog"})
+
+
+def test_the_refusal_names_the_host_variable_for_a_variable_sent_to_it(project: Path, monkeypatch):
+    _hydrate(project, "ZZZ=attacker.example\n")
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "ZZZ@attacker.example")
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(_picks_the_host(_contract()), stage="fluid apply")
+    error = info.value
+    assert error.extras["variable"] == "DB_PW" and error.extras["host_variable"] == "ZZZ"
+    assert error.extras["origin"] == "project-dotenv"
+    assert "ZZZ, which a project dotenv file supplied" in error.what
+    assert "export ZZZ" in error.fix and "DB_PW@" in error.fix
+    assert error.where == "builds[0].properties.source.connection.password"
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "ZZZ@attacker.example,DB_PW@attacker.example")
+    check_env_pairing(_picks_the_host(_contract()))
+
+
+def test_a_tunnel_through_a_bastion_a_project_dotenv_names_is_refused(project: Path, monkeypatch):
+    """The operator's own bastion needs no pairing; one the project's file picks does."""
+    monkeypatch.setenv("H", "db.internal")
+    _hydrate(project, "B=bastion.attacker.example\n")
+    contract = _contract(
+        host="{{ env.H }}",
+        ssh_tunnel={"enable": True, "host": "{{ env.B }}"},
+        password="{{ env.DB_PW }}",
+    )
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    assert info.value.extras["origin"] == "project-dotenv"
+    assert info.value.extras["host_variable"] == "B"
+    assert "bastion.attacker.example" not in repr(info.value.__dict__)
+
+
+def test_an_address_the_policy_does_not_read_is_the_operators_only_while_the_value_is(
+    project: Path, monkeypatch
+):
+    """``brokers: "{{ env.BROKERS }}"`` is the operator's address when they hold BROKERS; a value
+    the project's file supplied is an address the contract picked, which only a bare entry clears.
+    """
+    contract = _airbyte_contract({"brokers": "{{ env.BROKERS }}", "password": "{{ env.DB_PW }}"})
+    monkeypatch.setenv("BROKERS", "kafka.internal:9092")
+    check_env_pairing(contract)
+
+    monkeypatch.delenv("BROKERS")
+    _hydrate(project, "BROKERS=kafka.attacker.example:9092\n")
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    assert "brokers" in info.value.what and "any host" in info.value.fix
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "BROKERS,DB_PW")
+    check_env_pairing(contract)
+
+
+# The real command: ``fluid apply``'s own ``run`` reads the working directory's ``.env`` with the
+# real ``hydrate_dotenv``, then reaches the dispatcher.
+
+
+def _apply(project: Path, contract: Dict[str, Any], monkeypatch) -> int:
+    import yaml
+
+    from fluid_build.cli.apply import register as register_apply
+    from fluid_build.cli.apply import run as apply_run
+
+    kafka_connect = contract["builds"][0]["properties"].get("kafka-connect")
+    if kafka_connect is not None:  # what the schema asks of a worker the operator runs
+        kafka_connect["deployment"].setdefault("mode", "bring-your-own")
+    path = project / "contract.fluid.yaml"
+    path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
+    monkeypatch.chdir(project)
+    parser = argparse.ArgumentParser(prog="fluid")
+    parser.add_argument("--env", default=None)
+    register_apply(parser.add_subparsers(dest="cmd"))
+    args = parser.parse_args(["apply", str(path), "--mode", "amend-and-build"])
+    return apply_run(args, logging.getLogger("test.env_pairing.apply"))
+
+
+def test_apply_refuses_a_host_the_project_dotenv_picks(
+    engine, project: Path, monkeypatch, capsys, caplog
+):
+    contract_for, pushed = engine
+    _dotenv(project, "ZZZ=attacker.example\n")
+    contract = _picks_the_host(contract_for())
+
+    with caplog.at_level(logging.DEBUG):
+        rc = _apply(project, contract, monkeypatch)
+
+    shown = capsys.readouterr()
+    everything = shown.out + shown.err + caplog.text
+    assert os.environ.get("ZZZ") == "attacker.example", "apply loaded the project's file"
+    assert rc == 1
+    assert "ZZZ" in everything and "project dotenv" in everything
+    assert "attacker.example" not in everything + pushed(), "neither printed nor started"
+    assert _PROBE not in everything + pushed()
+
+
+def test_apply_runs_a_host_the_operator_exports(engine, project: Path, monkeypatch):
+    contract_for, pushed = engine
+    monkeypatch.setenv("ZZZ", "db.internal")
+    _dotenv(project, "ZZZ=attacker.example\n")  # the project's file does not replace it
+    contract = _picks_the_host(contract_for())
+
+    assert _apply(project, contract, monkeypatch) == 0
+    assert "db.internal" in pushed() and "attacker.example" not in pushed()
