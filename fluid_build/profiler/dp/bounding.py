@@ -388,8 +388,11 @@ def bound_rows(
     contents: Sequence[bytes],
     seed: bytes,
     max_rows: int,
+    label: str = _LABEL,
 ) -> List[int]:
     """The indices of the rows kept, ascending: at most *max_rows* per unit.
+
+    The priorities are keyed by *label*, so two bindings of one release draw independently.
 
     Row ``i`` belongs to unit ``units[i]``; ``None`` is a unit of its own and always
     keeps its row (own-rows mode). Rows with no key value are given :data:`NULL_KEY`, one
@@ -406,7 +409,7 @@ def bound_rows(
             kept.append(i)
             continue
         key = len(unit).to_bytes(8, "big") + unit + contents[i]
-        groups.setdefault(unit, []).append((priority(seed, _LABEL, key), contents[i], i))
+        groups.setdefault(unit, []).append((priority(seed, label, key), contents[i], i))
     for rows in groups.values():
         rows.sort()
         kept.extend(i for _, _, i in rows[:max_rows])

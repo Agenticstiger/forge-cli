@@ -426,12 +426,13 @@ lineage = [
 # fluid_build/profiler/_stats.py imports, and the range runs to the next major.
 # That module repeats the requirement in its install message, and
 # tests/profiler/test_flux_stats_pin.py keeps the two equal.
-# 0.9.0 is the first flux-stats release that holds the profile request reader
-# (flux_stats.request), a boolean read as a category, and profile format 1-2-0
-# with its release under differential privacy (flux_stats.noise).
+# 0.11.0 is the first flux-stats release that holds the profile request reader
+# at format 1-2-0 (flux_stats.request), rank correlations
+# (flux_stats.rank_correlation), the follows reach of a release under differential
+# privacy (flux_stats.noise) and profile format 1-4-0.
 profile = [
   "duckdb>=1.5.0",
-  "flux-stats[yaml]>=0.9,<1",
+  "flux-stats[yaml]>=0.11,<1",
 ]
 
 # ``fluid profile`` releasing a table under differential privacy: the choice of
@@ -1009,17 +1010,23 @@ module = [
     "fluid_build.profiler.disclosure",
     "fluid_build.profiler.document",
     "fluid_build.profiler.facts",
+    "fluid_build.profiler.grouped",
+    "fluid_build.profiler.ranks",
     "fluid_build.profiler.request",
     "fluid_build.profiler.runner",
     "fluid_build.profiler.sources",
     "fluid_build.profiler.dp.bounding",
     "fluid_build.profiler.dp.consistency",
     "fluid_build.profiler.dp.discrete_gaussian",
+    "fluid_build.profiler.dp.follow_release",
+    "fluid_build.profiler.dp.follows",
     "fluid_build.profiler.dp.randomness",
+    "fluid_build.profiler.dp.rank_noise",
     "fluid_build.profiler.dp.record",
     "fluid_build.profiler.dp.release",
     "fluid_build.profiler.dp.selection",
     "fluid_build.cli.profile_cmd",
+    "fluid_build.cli._profile_follow",
     "fluid_build.cli._profile_release",
     # --adopt-tables: whether forge takes over a table a team's jobs made and fill,
     # read from the saved plan. A silent Any is a silent take-over.

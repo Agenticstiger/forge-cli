@@ -85,6 +85,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   takes the login name from `USER`, `LOGNAME` or `LOGIN`. libpq's `require_auth` is not set: the
   libpq bundled in duckdb 1.5.1's postgres extension predates it (it needs libpq 16).
 
+## [0.40.0] — 2026-11-24
+
+### Added
+
+- **`fluid profile --request` answers the asks of a profile request in format 1-2-0, in a profile
+  of format 1-4-0.** A table's `rankCorrelations` are answered with one `kendallTau/1` or
+  `spearmanRho/1` entry (`columnPairs`) for each pair of the listed columns, in the order the
+  request lists them; the value is formed by the registry on the fixed-point grid, and a
+  correlation over fewer than the records the group-size check needs is withheld like any other
+  group. A table's `cliqueColumns` are answered with one two-way statistic for each pair of the
+  first 32 listed columns (the first column's histogram grouped by the second, a category by its
+  levels, a number by the bins of its declared range, a date or timestamp by about ten bins
+  cut from the range its contract declares, else by the bins of its type's ladder, the bins a
+  private release cuts it on); the pairs not measured are
+  named in the report with the reason. A relationship's `groupBy` asks its statistics grouped by
+  each named parent column, and its `linked` asks a child column's histogram grouped by a column
+  of the parent row its key reaches (`groupByLink`); each group of a grouped statistic is checked
+  on its own, and the rows of a parent with no value in the column are never a group. A profile
+  names the least format that holds it: a profile with none of these keeps the format and the bytes
+  it had. `--row-floor N` (a public count of 2 or more) is written as the `rowFloor` of each rank
+  correlation and the records are counted as the larger of their number and N; without it a rank
+  correlation states no floor.
+- **`fluid profile --privacy-unit` releases rank correlations and clique marginals over numbers and
+  timestamps.** Each noisy rank correlation carries `--row-floor` (default 1000) as its public
+  `rowFloor`. Its sensitivity for one row is 4 / (floor + 1) for Kendall's tau and 9 / (floor + 1)
+  for Spearman's rho, times the rows one unit contributes (at least two in a keyed or related
+  release, since replacing a row can change which row of a unit is kept); the value is rounded onto a lattice of
+  2^20 steps per sensitivity and an exact discrete Gaussian is added on it, so no floating-point
+  noise is drawn. The profile states a Gaussian of the scale that spends the statistic's share,
+  which is its charge, sensitivity squared over twice the scale squared, and the stated variance
+  bounds the noise from above. A clique that holds a number or timestamp column is released as
+  `cliqueMarginal/2` on the public bins of the column's declared range, with the same counts
+  sensitivity as a clique of categories; the bins are never chosen from the data. The cliques are
+  chosen with OpenDP's AIM or, with `--clique-method mst`, its MST, and the profile records the
+  method, the OpenDP version and the tenth of `rho` the choice cost in `cliqueSelection`. Each
+  noisy statistic is one part with an equal share of the rest, and every noise block is in the
+  profile's account once.
+- **`fluid profile --privacy-unit --follow PARENT.COL[,COL]=CHILD.COL[,COL]:MAX` makes the unit follow
+  its child rows.** The unit is a row of the privacy unit's expose with at most MAX of its children
+  through each followed relationship (repeat the flag for a tree), and the profile names it in
+  `privacy.privacyUnit.follows` (format 1-4-0). The tree is checked before any record is read.
+  A parent's children are cut to MAX by a keyed priority that reads only that parent's children, a
+  child that is dropped takes its descendants, and a row that follows no kept row is dropped, so what
+  a unit keeps depends on the seed and that unit alone. The release holds every table the unit
+  reaches, each charged for the rows one unit contributes to it (counts, cliques and rank
+  correlations alike), a noisy children-per-parent histogram for each declared relationship (bins
+  0 to MAX when followed, and a cap whose bins pass the release's cell limit is refused by name; a
+  fixed public ladder when not), grouped by parent columns, and
+  histograms grouped through a link by the contract's levels, each charged as a count table of the
+  child. A table the unit does not reach is treated as fixed: the report names those tables and warns when
+  a labelled (`pii` or `restricted`) column of one groups a noisy statistic, which flux-engine grades
+  P1. `--follow` is not combined with `--release-table`, `--unit-key` or `--max-rows-per-unit`.
+  `--rederive` draws the same release again from the record, which now holds each part.
+- **Profile format 1-4-0 needs flux-stats 0.11.** The `[profile]` extra now asks for
+  `flux-stats[yaml]>=0.11,<1`, the first release that holds rank correlations, the follows reach
+  and profile format 1-4-0.
+
 ## [0.39.0] — 2026-11-23
 
 ### Added

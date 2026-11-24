@@ -4,8 +4,9 @@
 """The owner-only record of a differentially private profile release.
 
 The record holds the seed of the release's randomness source and the parameters
-of the release (the privacy unit, the privacy loss, the selection and each
-count table), so the release can be re-derived inside the data owner's
+of the release (the privacy unit, the privacy loss, the selection, each noisy
+part and the options that shape them: the clique method and the row floor of the
+rank correlations), so the release can be re-derived inside the data owner's
 boundary. Whoever holds the record and the profile can take the noise off, so
 the record is written readable by its owner alone and must stay where the data
 is. It is never part of the profile.
@@ -37,6 +38,9 @@ MOST_RECORD_BYTES = 4 * 1024 * 1024
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _SEED_HEX = re.compile(r"[0-9a-f]{%d}" % (2 * SEED_BYTES))
 _DECIMAL = re.compile(r"-?[0-9]+(\.[0-9]+)?")
+#: Present only when the release has an option to state; a record without it is a release with
+#: the defaults, so a record written before the key existed is still read.
+_OPTIONS = "options"
 _KEYS = frozenset(
     (
         "format",
@@ -132,6 +136,14 @@ def _texts(value: Any) -> Dict[str, Optional[str]]:
     return versions
 
 
+def _option_values(value: Any) -> Dict[str, Any]:
+    options = _object(value, "options")
+    for key, item in options.items():
+        if isinstance(item, bool) or not isinstance(item, (str, int)):
+            _invalid(f"options {key} is not a string or a whole number")
+    return options
+
+
 @dataclass(frozen=True)
 class ReleaseRecord:
     """Everything needed to re-derive one release inside the data owner's boundary."""
@@ -145,6 +157,9 @@ class ReleaseRecord:
     selection: Optional[Mapping[str, Any]]
     tables: Tuple[Mapping[str, Any], ...]
     versions: Mapping[str, Optional[str]]
+    #: What shapes the parts besides the request and the unit: ``cliqueMethod`` (when it is not
+    #: ``aim``) and ``rowFloor`` (when the release holds a rank correlation).
+    options: Mapping[str, Any] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         return "ReleaseRecord(seed=<withheld>, ...)"
@@ -163,7 +178,8 @@ class ReleaseRecord:
             _invalid("tables holds an entry that is not an object")
         selection = None if self.selection is None else _plain(self.selection, "selection")
         unit = _object(_plain(self.unit, "unit"), "unit")
-        return {
+        options = _option_values(_plain(dict(self.options), "options"))
+        found: Dict[str, Any] = {
             "format": RECORD_FORMAT,
             "seed": bytes(self.seed).hex(),
             "profile": {"digest": self.profile_digest},
@@ -175,6 +191,9 @@ class ReleaseRecord:
             "tables": tables,
             "versions": versions,
         }
+        if options:
+            found[_OPTIONS] = options
+        return found
 
     @classmethod
     def from_document(cls, value: Any) -> "ReleaseRecord":
@@ -182,7 +201,7 @@ class ReleaseRecord:
         doc = _object(value, "the document")
         if doc.get("format") != RECORD_FORMAT:
             raise RecordRefused("profile_record_wrong_format", "it is of another format")
-        if set(doc) != _KEYS:
+        if set(doc) - {_OPTIONS} != _KEYS:
             _invalid("the keys are not the expected ones")
         seed = doc["seed"]
         if not isinstance(seed, str) or not _SEED_HEX.fullmatch(seed):
@@ -209,6 +228,7 @@ class ReleaseRecord:
             selection=selection,
             tables=tuple(tables),
             versions=versions,
+            options=_option_values(doc[_OPTIONS]) if _OPTIONS in doc else {},
         )
 
 
