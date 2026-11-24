@@ -244,6 +244,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   password and sent it to attacker.example, and a variable's name cannot tell `DB_PW`, `PGPASS` or
   `DATABASE_URL` from a harmless one. Each variable now renders only for the endpoints of its
   block that the operator paired it with (see Changed).
+- **The SQL gates refuse DuckDB's logging functions and the table functions that run text.**
+  `compile_free_form_sql` (the MCP output port's `query_sql`),
+  `validate_sql_expression_allowlist` and `guard_against_injection_markers` now refuse a call to
+  `enable_logging`, `disable_logging`, `truncate_duckdb_logs` or `write_log`, any reference to
+  the `duckdb_logs`, `duckdb_logs_parsed` and `duckdb_log_contexts` views, and a call to `query`,
+  `query_table`, `json_execute_serialized_sql` or `histogram_values` (a built-in table macro over
+  `query_table`), which run a statement or read a relation given as text that no text check
+  reads; in any case, quoted or schema-qualified. A column that only shares one of
+  these names is not refused. On DuckDB 1.5.x, `enable_logging(storage='file')` with no path
+  aborted the process (SIGABRT), and the logs can hold other queries' text. Behaviour change: a
+  statement that uses these functions or views is refused.
+- **`fluid publish` sends nothing to the Command Center unasked.** With neither `--target` nor
+  `--catalog` it now exits 1 and lists the targets (its suggested commands name the contract
+  given), where it used to publish to `fluid-command-center`. With `FLUID_COMMAND_CENTER_ENABLED` off (the switch `fluid apply`
+  already honours), a Command Center target is refused before any request, in every mode. A
+  Command Center publish without a credential fails with the missing-credential error before the
+  health check, which used to send `GET /api/v1/assets?limit=1` first. Behaviour change: pass
+  `--target fluid-command-center` (or `--catalog`) to keep publishing there.
+- **Debezium Server is never started in the project directory.** An embedded server
+  (`deployment.mode: embedded`) used to inherit forge's working directory, the project, where
+  Quarkus reads `.env` and `config/application.properties` and the stock `run.sh` sources
+  `./jmx/*.sh` and loads `config/lib` and `lib/*`; `run.sh` also drops its arguments, so
+  `--config` never reached the JVM. The server now starts from a fresh directory forge owns,
+  which holds forge's `application.properties` as `config/application.properties` (Debezium
+  Server 3.7 reads its engine settings only from there) and, for the stock launcher, links to the
+  install's own files; a `smallrye.config.locations` system property in `JAVA_OPTS` and
+  `DEBEZIUM_OPTS` names the same file, so its values win over the environment's. The file now
+  sets `debezium.format.key` and `debezium.format.value` to `json` (the http sink requires the
+  value and has no default, so it could not start before), and a failed run reports the
+  server's exit code, its `ERROR` and exception lines and the end of its output, redacted. Offsets and file-based schema history are kept at absolute paths under
+  `.fluid/debezium/<product>/<build>/`; an existing `<project>/data/offsets.dat` is copied there
+  once (a regular file in a real `data/` directory) and left in place. Behaviour change: a
+  `properties.debezium.server_binary` inside the project or its checkout (by path, symlink or
+  `PATH`) is refused.
+- **A credential forge holds is masked in its URL-encoded spellings too.** The exact-value
+  redaction masked a password only as written, so a log line or an error that printed a URL
+  holding it escaped (`p%40ss` for `p@ss`, as `quote`, `quote_plus` or Java's `URLEncoder` write
+  it) showed it. Those spellings are masked now as well: in the global redactor and the
+  Snowflake and local provider loggers, which share the registry, and in the report of a failed
+  Debezium Server run.
+- **An Iceberg sink names a variable only through `sink.catalogAuth`.** Iceberg's REST catalog
+  replaces any property value that starts with `env:` by that variable of the process that runs
+  the sink, so a contract that wrote `token: env:NAME` beside a catalog `uri` of its choosing sent
+  the operator's variable there. An `env:` value, or a `${` the worker's config providers or
+  SmallRye Config would expand, is now refused in `iceberg_catalog_overrides`,
+  `sink_connector_config` and a Debezium Server `server.sink.config` whether or not
+  `sink.catalogAuth` is set, also for a hand-written sink config without `sink.format: iceberg`,
+  by `fluid validate` and by both runners before anything is pushed, written or started. The
+  variable `sink.catalogAuth` names is the one the operator pairs with the hosts it reaches. The
+  literal-credential warning no longer suggests `env:<VARIABLE>`. A Debezium Server
+  `server.sink.config` that is not a mapping is refused. Behaviour change.
+- **A contract no longer chooses the Snowflake login, or the stored credentials an account
+  gets.** A `user` or `authenticator` set in a Snowflake binding's `location` or `properties`
+  (the contract's or an expose's), a Snowflake build's `resources` or a build binding is refused
+  with `ContractLoginSettingError`, which names the path: set `SNOWFLAKE_USER` and
+  `SNOWFLAKE_AUTHENTICATOR` in the operator's environment. A contract may still name the
+  `account`. While the account in effect is one the contract named and the operator did not (not
+  an explicit argument, not their own `SNOWFLAKE_ACCOUNT` or `SF_ACCOUNT`), credentials come from
+  the environment and the project's files only, never from the keyring or
+  `FLUID_CREDENTIAL_STORE`, unless the operator pairs the variable with the account's host
+  (`SNOWFLAKE_PASSWORD@<account>.snowflakecomputing.com` in
+  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`), and forge does not sign in to it through this
+  machine's browser session (`externalbrowser` or `oauth_authorization_code`, as a
+  fallback or from the environment) unless
+  `SNOWFLAKE_AUTHENTICATOR` is paired with it the same way. This covers `fluid verify`,
+  `fluid apply` builds,
+  `fluid test` and the dlt, Airbyte and Meltano Snowflake destinations. Behaviour change.
+- **A project's dotenv files no longer choose where a dlt pipeline sends data.** Beyond the
+  destination's credentials, which were already pinned, a project `.env` may not set the
+  pipeline's staging (`STAGING_TYPE`, `STAGING_NAME`, under every section dlt reads), the
+  destination's type or name (`DESTINATION__<NAME>__DESTINATION_TYPE`, `DESTINATION_NAME`), the
+  destination's other configuration (lance `storage` and `embeddings`, filesystem `bucket_url`
+  and `kwargs`, `staging_config`, taken from the destination's dlt `spec()`), the staging
+  destination's settings and credentials, or the URLs the run reports to (`RUNTIME__SENTRY_DSN`,
+  `RUNTIME__SLACK_INCOMING_HOOK`, `RUNTIME__DLTHUB_TELEMETRY_ENDPOINT`, under every section dlt
+  reads them). `fluid apply` fails the dlt build and names the
+  variables, never their values. Still allowed from a project `.env`: `environment`, boolean and
+  integer destination settings other than those about transport security or the socket
+  (`staging_use_https`, a `verify`, `ssl`, `tls`, `certificate`, `hostname` or `port` field),
+  and the type of a named destination whose credentials the project itself supplies. What the
+  operator sets (shell, CI, `.dlt` files) applies as before. Behaviour change.
+- **A pinned database attach hides this host's mysql and MariaDB client variables too.** During
+  a pinned attach (the duckdb build runner and `fluid init --discover`) `MYSQL_USER`,
+  `MYSQL_DATABASE`, `MARIADB_UNIX_PORT`, `MYSQL_HOME`, `MARIADB_HOME`, `LIBMYSQL_PLUGINS`,
+  `LIBMYSQL_PLUGIN_DIR`, `MARIADB_PLUGIN_DIR`, `MYSQL_DEBUG`,
+  `MARIADB_TLS_DISABLE_PEER_VERIFICATION`, `USER`, `LOGNAME` and `LOGIN` are hidden as well and
+  restored afterwards. Behaviour change: a mysql source with no `user` in the contract no longer
+  takes the login name from `USER`, `LOGNAME` or `LOGIN`. libpq's `require_auth` is not set: the
+  libpq bundled in duckdb 1.5.1's postgres extension predates it (it needs libpq 16).
 
 ### Upgrade notes
 
@@ -279,6 +368,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as written, `fluid status` among them, read it as before.
 - **A payload with `$ref` keys of its own:** write them `$$ref` instead of keeping the payload as a
   string.
+- **An embedded Debezium Server no longer reads the install's own `config/application.properties`.**
+  The server starts in a directory forge owns, whose `config/application.properties` is forge's
+  file; the install's `config/application.*` files are not linked there. Put an operator setting
+  that lived in the install's file and that forge's file does not set, such as a log level or the
+  HTTP port, in the environment fluid runs in (`QUARKUS_LOG_LEVEL`, `QUARKUS_HTTP_PORT`) or in
+  `JAVA_OPTS` (`-Dquarkus.log.level=DEBUG`).
 
 ## [0.40.1] — 2026-11-24
 

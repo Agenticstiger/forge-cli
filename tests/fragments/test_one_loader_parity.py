@@ -1319,7 +1319,15 @@ def test_g17_docs_show_the_port_by_its_exposeid_with_its_columns(
 #: which is why only the composition is checked.
 _G16_COMMANDS = {
     "verify": lambda c, o: ["verify", c, "--env", "prod"],
-    "publish": lambda c, o: ["publish", c, "--env", "prod", "--dry-run"],
+    "publish": lambda c, o: [
+        "publish",
+        c,
+        "--env",
+        "prod",
+        "--dry-run",
+        "--target",
+        "fluid-command-center",
+    ],
     "datamesh-manager": lambda c, o: ["datamesh-manager", "publish", c, "--dry-run"],
     "scaffold-composer": lambda c, o: ["scaffold-composer", c, "--env", "prod", "--out", o / "c"],
     "dbt-tests": lambda c, o: ["generate", "dbt-tests", c, "--env", "prod", "--out", o / "d"],
@@ -1383,7 +1391,16 @@ def test_g16_the_command_composes_through_the_one_entry_point(
     [
         pytest.param(["verify", "contract.fluid.yaml", "--env", "prod"], id="verify"),
         pytest.param(
-            ["publish", "contract.fluid.yaml", "--env", "prod", "--dry-run"], id="publish"
+            [
+                "publish",
+                "contract.fluid.yaml",
+                "--env",
+                "prod",
+                "--dry-run",
+                "--target",
+                "fluid-command-center",
+            ],
+            id="publish",
         ),
         pytest.param(
             ["mcp", "output-port", "list", "contract.fluid.yaml", "--env", "prod"], id="mcp"
@@ -1638,7 +1655,9 @@ _MATRIX: Dict[str, Command] = {
         lambda c: ["viz-graph", c, "--env", "prod", "--out", "o/g"], ("o/g.dot", "o/g")
     ),
     "verify": Command(lambda c: ["verify", c, "--env", "prod"]),
-    "publish": Command(lambda c: ["publish", c, "--env", "prod", "--dry-run"]),
+    "publish": Command(
+        lambda c: ["publish", c, "--env", "prod", "--dry-run", "--target", "fluid-command-center"]
+    ),
     "scaffold-composer": Command(
         lambda c: ["scaffold-composer", c, "--env", "prod", "--out", "o/sc"], ("o/sc",)
     ),

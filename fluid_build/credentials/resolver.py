@@ -12,7 +12,9 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
+
+from fluid_build._errors import FluidUserError, doc_url
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,59 @@ class CredentialError(Exception):
         self.suggestions = suggestions or []
 
 
+#: Snowflake settings only the operator sets: who signs in and how. A contract is
+#: project content, so a value written there would sign the operator in to the
+#: account the contract names with the operator's identity or login.
+SNOWFLAKE_OPERATOR_ONLY_FIELDS = ("authenticator", "user")
+
+
+@dataclass
+class ContractLoginSettingError(FluidUserError, ValueError):
+    """A contract sets the Snowflake user or authenticator.
+
+    A ``ValueError`` as well, so the callers that already treat a bad Snowflake
+    setting as one (the connection builders) see it the same way. Names the
+    field's path in the contract, never a value.
+    """
+
+    code: str = "ContractLoginSettingError"
+
+    def __str__(self) -> str:
+        return f"{self.what}. {self.why} Fix: {self.fix}"
+
+
+def refuse_contract_login_settings(section: Any, path: str) -> None:
+    """Raise :class:`ContractLoginSettingError` when ``section`` sets a Snowflake
+    ``user`` or ``authenticator``.
+
+    ``section`` is a ``location``, ``properties`` or ``resources`` mapping of the
+    contract and ``path`` is where it sits (``exposes[0].binding.properties``).
+    Anything that is not a mapping, and a blank value, is left alone.
+    """
+    if not isinstance(section, Mapping):
+        return
+    for name in SNOWFLAKE_OPERATOR_ONLY_FIELDS:
+        value = section.get(name)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        variable = f"SNOWFLAKE_{name.upper()}"
+        raise ContractLoginSettingError(
+            what=f"The contract sets the Snowflake {name} at {path}.{name}",
+            why=(
+                f"Who signs in to Snowflake, and how, is the operator's to choose. A contract "
+                f"that names its own {name} (it may also name the account) would sign the "
+                "operator in to that account with the operator's own identity or login."
+            ),
+            fix=(
+                f"Remove {path}.{name} from the contract and set {variable} in the "
+                "environment of the process that runs fluid."
+            ),
+            doc=doc_url("secrets"),
+            where=f"{path}.{name}",
+            extras={"field": name, "path": f"{path}.{name}"},
+        )
+
+
 class BaseCredentialResolver(ABC):
     """
     Base credential resolver with common resolution logic.
@@ -89,7 +144,13 @@ class BaseCredentialResolver(ABC):
         logger.debug(f"Initialized {provider} credential resolver")
 
     def get_credential(
-        self, key: str, required: bool = True, cli_value: Optional[str] = None, **kwargs
+        self,
+        key: str,
+        required: bool = True,
+        cli_value: Optional[str] = None,
+        *,
+        pin_to_project: bool = False,
+        **kwargs,
     ) -> Optional[str]:
         """
         Resolve credential using priority chain.
@@ -113,6 +174,12 @@ class BaseCredentialResolver(ABC):
             key: Credential key (e.g., "password", "account")
             required: Whether credential is required
             cli_value: Value from CLI argument (highest priority)
+            pin_to_project: Read only the CLI argument, the environment and the
+                project's files, as for an endpoint the project's files chose
+                (see :meth:`_project_endpoint_in_effect`). For a caller whose
+                endpoint came from the contract and that the operator did not
+                choose: no keyring, no secret store, no provider default, no
+                prompt and no cache.
             **kwargs: Additional provider-specific parameters
 
         Returns:
@@ -125,7 +192,7 @@ class BaseCredentialResolver(ABC):
         # the project's credentials: the CLI argument, the environment and
         # those files. Nothing from the operator's stores below, and nothing
         # cached, which may have come from them.
-        pinned = self._project_endpoint_in_effect()
+        pinned = pin_to_project or self._project_endpoint_in_effect()
 
         # Check cache first — honor the configured TTL.
         cache_key = f"{self.provider}.{key}"

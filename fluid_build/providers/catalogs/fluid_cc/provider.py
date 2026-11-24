@@ -341,6 +341,25 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
             self.endpoint, self.auth, env_fallback=self.project_endpoint_file is None
         )
 
+    def require_credential(self) -> None:
+        """Raise :class:`CommandCenterCredentialMissingError` when no credential is set.
+
+        Nothing is sent to the endpoint first: the Command Center answers an
+        anonymous request, and every asset create, with 401, so the probe would
+        only tell an endpoint it is not talking to the operator's key.
+        """
+        headers = self._auth_headers()
+        if not (headers.get("X-API-Key") or headers.get("Authorization")):
+            raise CommandCenterCredentialMissingError(
+                "No Command Center credential is configured, so its organizations cannot "
+                "be listed and no asset can be created. Set FLUID_API_KEY (or "
+                "FLUID_BEARER_TOKEN with auth type bearer).",
+                suggestions=[
+                    "export FLUID_API_KEY=<Command Center API key>",
+                    "or set catalogs.fluid-command-center.auth.api_key in the FLUID config",
+                ],
+            )
+
     def _headers(self) -> Dict[str, str]:
         """Auth headers plus ``X-Organization-Id`` once the organization is known."""
         headers = self._auth_headers()
@@ -398,6 +417,8 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
             return self._organization_id
 
         configured = self._configured_organization()
+        # Every request after this one carries the credential: with none, send nothing.
+        self.require_credential()
         if configured is not None:
             self._organization_id = configured
             return self._organization_id
@@ -477,17 +498,8 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
         server listed in all, so the caller can tell a dropped entry from a
         missing one.
         """
+        self.require_credential()
         headers = self._auth_headers()
-        if not (headers.get("X-API-Key") or headers.get("Authorization")):
-            raise CommandCenterCredentialMissingError(
-                "No Command Center credential is configured, so its organizations cannot "
-                "be listed and no asset can be created. Set FLUID_API_KEY (or "
-                "FLUID_BEARER_TOKEN with auth type bearer).",
-                suggestions=[
-                    "export FLUID_API_KEY=<Command Center API key>",
-                    "or set catalogs.fluid-command-center.auth.api_key in the FLUID config",
-                ],
-            )
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.get(
@@ -555,6 +567,12 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
         """
         start_time = time.time()
         metrics_collector.record_publish_request(self.name)
+
+        # No credential, no request: the health check below is one.
+        try:
+            self.require_credential()
+        except CommandCenterCredentialMissingError as e:
+            return self._organization_failure(asset, e)
 
         # Pre-publish health check
         if not await self.health_check():
@@ -1047,6 +1065,14 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
         does not trigger the organization lookup itself, so an ambiguous
         organization is reported as that, not as an unreachable endpoint.
         """
+        try:
+            # The probe carries the credential, so with none there is nothing
+            # to send it for; ``publish`` and the CLI name the missing
+            # credential before they get here.
+            self.require_credential()
+        except CommandCenterCredentialMissingError:
+            self.logger.warning("Health check not sent: no Command Center credential is configured")
+            return False
         try:
             headers = self._headers()
             async with httpx.AsyncClient(timeout=5.0) as client:

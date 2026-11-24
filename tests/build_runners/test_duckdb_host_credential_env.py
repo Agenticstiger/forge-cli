@@ -43,6 +43,35 @@ def test_the_variables_libpq_and_mysql_read_are_covered(name: str) -> None:
     assert name in HOST_CREDENTIAL_ENV, f"{name} is not suppressed"
 
 
+#: The mysql / MariaDB client variables a pinned attach must not inherit.
+MYSQL_CLIENT_ENV = (
+    "MYSQL_USER",
+    "MYSQL_DATABASE",
+    "MARIADB_UNIX_PORT",
+    "MYSQL_HOME",
+    "MARIADB_HOME",
+    "LIBMYSQL_PLUGINS",
+    "LIBMYSQL_PLUGIN_DIR",
+    "MARIADB_PLUGIN_DIR",
+    "MYSQL_DEBUG",
+    "MARIADB_TLS_DISABLE_PEER_VERIFICATION",
+    "USER",
+    "LOGNAME",
+    "LOGIN",
+)
+
+
+@pytest.mark.parametrize("name", MYSQL_CLIENT_ENV)
+def test_mysql_client_variables_are_hidden_in_the_window_and_restored(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    assert name in HOST_CREDENTIAL_ENV
+    monkeypatch.setenv(name, SENTINEL)
+    with host_credential_env_suppressed(ATTACH_HOST_ENV):
+        assert name not in os.environ
+    assert os.environ[name] == SENTINEL
+
+
 def test_the_window_hides_and_restores(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PGPASSWORD", SENTINEL)
     monkeypatch.setenv("MYSQL_PWD", SENTINEL)

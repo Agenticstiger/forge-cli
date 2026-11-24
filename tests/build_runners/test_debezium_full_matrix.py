@@ -653,14 +653,15 @@ class TestEmbeddedBinaryNotExecuted:
         rc = execute_debezium_build(contract["builds"][0], contract, tmp_path, dry_run=False)
         assert rc != 0
 
-    def test_valid_binary_is_executed(self, tmp_path: Path, monkeypatch):
+    def test_valid_binary_is_executed(self, tmp_path: Path, tmp_path_factory, monkeypatch):
         """Positive path: a normal binary name that resolves on PATH reaches
-        subprocess.run (proves the guard does not break legitimate use)."""
+        subprocess.run (proves the guard does not break legitimate use). The
+        binary is outside the project: one inside it is refused."""
         import subprocess as real_subprocess
 
         import fluid_build.build_runners.debezium.runner as mod
 
-        fake_bin = tmp_path / "debezium-server"
+        fake_bin = tmp_path_factory.mktemp("dbz-install") / "debezium-server"
         fake_bin.write_text("#!/bin/sh\nexit 0\n")
         import stat as _stat
 
@@ -678,8 +679,9 @@ class TestEmbeddedBinaryNotExecuted:
         contract = self._embedded_contract(str(fake_bin))
         rc = execute_debezium_build(contract["builds"][0], contract, tmp_path, dry_run=False)
         assert rc == 0  # TimeoutExpired → _success_embedded
-        assert spawned["cmd"][0] == str(fake_bin)
-        assert spawned["cmd"][1:3] == ["--config", spawned["cmd"][2]]
+        # The launcher drops its arguments: forge's file reaches the JVM through
+        # a system property, so there is no --config.
+        assert spawned["cmd"] == [str(fake_bin.resolve())]
 
 
 class TestDispatcher:

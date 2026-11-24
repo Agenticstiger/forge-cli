@@ -9,9 +9,12 @@ Two execution modes:
     Debezium connector classes via the Kafka Connect REST API.
   - **Debezium Server** (``embedded``): generates an
     ``application.properties`` file and (when the binary is available)
-    starts ``debezium-server`` as a subprocess. For tests we stop short of
-    actually running the binary; that path lives behind the
-    ``FLUID_TEST_DEBEZIUM_SERVER`` env gate.
+    starts ``debezium-server`` as a subprocess from a fresh directory forge
+    owns, never from the project, where the file is
+    ``config/application.properties`` (and a ``smallrye.config.locations``
+    system property names it too). For tests we stop short of actually running
+    the binary; the live proof is
+    ``tests/integration/test_debezium_server_runner_live.py``.
 """
 
 from __future__ import annotations
@@ -20,7 +23,9 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -630,6 +635,11 @@ def render_application_properties(
 
     lines = [line(f"debezium.source.{k}", v) for k, v in source_config.items()]
     lines.append("quarkus.log.console.json=false")
+    # The event format, set rather than left to a default: the http sink reads
+    # debezium.format.value with no default (Debezium Server 3.7) and fails at
+    # startup without it, and the sinks forge derives read JSON.
+    lines.append("debezium.format.key=json")
+    lines.append("debezium.format.value=json")
     lines.append(_properties_line("debezium.sink.type", sink_type))
     lines += [
         line(f"debezium.sink.{sink_type}.{k}", v, env_refs=True) for k, v in sink_config.items()
@@ -669,9 +679,31 @@ def _execute_debezium_server(
         )
     except ValueError as exc:  # reject_url_syntax: a field that would not stay in its part
         return _failed(ctx, started_at, t_start, str(exc))
+    # Absolute, under forge's own work directory: the server's working directory
+    # is not the project. They take effect only for the file-based stores
+    # (FileOffsetBackingStore, FileSchemaHistory); a server set up with another
+    # store, such as Kafka's, ignores them.
+    state_dir = workdir.resolve()
+    offsets_path = state_dir / _OFFSETS_FILE
+    source_config = {
+        **source_config,
+        "offset.storage.file.filename": str(offsets_path),
+        "schema.history.internal.file.filename": str(state_dir / _SCHEMA_HISTORY_FILE),
+    }
     sink_block = (dbz_props.get("server") or {}).get("sink") or {}
     sink_type = sink_block.get("type", "iceberg")
-    handwritten = dict(sink_block.get("config") or {})
+    raw_config = sink_block.get("config")
+    if raw_config is not None and not isinstance(raw_config, Mapping):
+        # dict() would turn a list of pairs into a config that the checks below,
+        # which read a mapping (the env: reference scan among them), never saw.
+        return _failed(
+            ctx,
+            started_at,
+            t_start,
+            "properties.debezium.server.sink.config must be a mapping of sink property names "
+            "to values",
+        )
+    handwritten = dict(raw_config or {})
 
     # Iceberg sink: derive the bare-key config from the contract's iceberg expose
     # binding so the embedded server lands in the SAME table the static Glue
@@ -696,6 +728,22 @@ def _execute_debezium_server(
         preflight_error = iceberg_sink_preflight(ctx.contract, ctx.build_id, log=LOG)
         if preflight_error:
             return _failed(ctx, started_at, t_start, preflight_error)
+    else:
+        # No Iceberg plan (no sink.format: iceberg), yet a hand-written config
+        # for the default iceberg sink is written as it is, and Iceberg resolves
+        # an env: value in it from the server's environment: refused before
+        # application.properties is written, as `fluid validate` refuses it.
+        from ..kafka_connect.iceberg_sink_validation import unplanned_sink_reference_errors
+
+        reference_errors = unplanned_sink_reference_errors(build)
+        if reference_errors:
+            return _failed(
+                ctx,
+                started_at,
+                t_start,
+                "iceberg sink preflight failed (see `fluid validate`): "
+                + "; ".join(reference_errors),
+            )
     if sink_plan is not None and sink_plan.derives:
         from ...providers._iceberg_catalog import resolve_iceberg_catalog
         from ...providers._iceberg_catalog_auth import catalog_auth_of
@@ -741,6 +789,33 @@ def _execute_debezium_server(
     except OSError as exc:
         return _failed(ctx, started_at, t_start, f"could not write {config_path}: {exc}")
 
+    return _launch_server(
+        ctx,
+        dbz_props,
+        config_path,
+        offsets_path,
+        secret_env,
+        server_name,
+        snapshot_mode,
+        connector_class,
+        started_at,
+        t_start,
+    )
+
+
+def _launch_server(
+    ctx: RunContext,
+    dbz_props: Dict[str, Any],
+    config_path: Path,
+    offsets_path: Path,
+    secret_env: Mapping[str, str],
+    server_name: str,
+    snapshot_mode: str,
+    connector_class: str,
+    started_at: str,
+    t_start: float,
+) -> RunResult:
+    """Verify the server binary, start it outside the project and report the result."""
     # Validate any contract-supplied ``server_binary`` before it becomes
     # ``argv[0]`` (arbitrary-binary-execution guard). A value with a path
     # separator must resolve to an existing executable file; a bare name must
@@ -756,32 +831,315 @@ def _execute_debezium_server(
             "or set properties.debezium.server_binary to a valid executable "
             "(bare name on PATH, or an absolute path to an executable file)",
         )
+    # The server is never started in the project: Quarkus reads ``.env`` and
+    # ``config/application.properties`` from its working directory and the stock
+    # launcher runs ``./jmx/*.sh`` and loads jars from there. A binary inside the
+    # project is refused outright, as is a PATH entry or symlink that leads there.
+    real_binary, refusal = _locate_server_binary(binary, Path(ctx.workdir))
+    if real_binary is None:
+        return _failed(ctx, started_at, t_start, refusal or "debezium-server binary rejected")
 
-    # The server inherits this process's environment, which is where Iceberg
-    # resolves the ``env:<NAME>`` catalog properties ``sink.catalogAuth``
-    # emits, and where the preflight checked the variable is set, once the
-    # operator had paired it with every host it reaches. The
-    # ``FLUID_DBZ_*`` credentials the file refers to are added to it. No
-    # secret is written to application.properties.
+    # Offsets a server kept at <project>/data/offsets.dat before forge named the file.
+    _migrate_project_offsets(Path(ctx.workdir), offsets_path)
+
+    # The working directory is a fresh one forge owns (0700, removed afterwards),
+    # never the project: it holds forge's file as config/application.properties
+    # and, for the stock launcher, links to the install's own files
+    # (_prepare_launch_directory).
+    scratch_dir = tempfile.mkdtemp(prefix="fluid-debezium-")
+    launch_dir = Path(scratch_dir)
     try:
-        proc = subprocess.run(
-            [binary, "--config", str(config_path)],
-            env={**os.environ, **secret_env} if secret_env else None,
-            capture_output=True,
-            text=True,
-            timeout=int(dbz_props.get("timeout_seconds", 60)),
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        # Debezium Server is long-running; a timeout is the expected exit when
-        # we want to verify the binary boots successfully.
-        return _success_embedded(
-            ctx, started_at, t_start, server_name, snapshot_mode, connector_class
-        )
+        try:
+            server_config = _prepare_launch_directory(launch_dir, real_binary, config_path)
+        except OSError as exc:
+            return _failed(ctx, started_at, t_start, f"could not prepare {launch_dir}: {exc}")
+        # The server inherits this process's environment, which is where Iceberg
+        # resolves the ``env:<NAME>`` catalog properties ``sink.catalogAuth``
+        # emits, and where the preflight checked the variable is set, once the
+        # operator had paired it with every host it reaches. The
+        # ``FLUID_DBZ_*`` credentials the file refers to are added to it, and
+        # forge's file is also named by a system property, so its values win over
+        # the environment's (the launcher drops arguments, so ``--config`` would
+        # never reach the JVM). No secret is written to application.properties.
+        try:
+            server_env = _server_environment(server_config, secret_env, launch_dir)
+        except ValueError as exc:
+            return _failed(ctx, started_at, t_start, str(exc))
+        try:
+            proc = subprocess.run(
+                [str(real_binary)],
+                env=server_env,
+                cwd=str(launch_dir),
+                capture_output=True,
+                text=True,
+                timeout=int(dbz_props.get("timeout_seconds", 60)),
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            # Debezium Server is long-running; a timeout is the expected exit when
+            # we want to verify the binary boots successfully.
+            return _success_embedded(
+                ctx, started_at, t_start, server_name, snapshot_mode, connector_class
+            )
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
 
     if proc.returncode != 0:
-        return _failed(ctx, started_at, t_start, proc.stderr[:500])
+        return _failed(ctx, started_at, t_start, _server_failure(proc, secret_env))
     return _success_embedded(ctx, started_at, t_start, server_name, snapshot_mode, connector_class)
+
+
+#: How much of each stream a failed run reports: the end, where the cause is.
+_FAILURE_TAIL_LINES = 40
+_FAILURE_TAIL_CHARS = 4000
+#: The log lines and exception lines that name the cause.
+_FAILURE_CAUSE_RE = re.compile(r"\bERROR\b|Caused by:|\b\w+(?:Exception|Error)\b:")
+_FAILURE_CAUSE_LINES = 12
+_FAILURE_CAUSE_CHARS = 600
+
+
+def _server_failure(proc: "subprocess.CompletedProcess[str]", secret_env: Mapping[str, str]) -> str:
+    """Why the server stopped: its exit code and the end of what it printed.
+
+    Quarkus logs to standard output, so both streams are read. Every credential
+    this run handed the server is masked, and so is anything else that looks
+    like a secret (:func:`redact_secret_text`).
+    """
+    from ...observability.secret_redactor import redact_secret_text
+
+    parts = []
+    # The cause is usually far above the end: a Java stack trace prints the
+    # exception message first, then its frames. So the ERROR log lines and the
+    # exception lines come first, then the end of each stream.
+    causes: List[str] = []
+    for text in (proc.stderr, proc.stdout):
+        for line in (text or "").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("at ") or stripped in causes:
+                continue
+            if _FAILURE_CAUSE_RE.search(stripped):
+                causes.append(stripped[:_FAILURE_CAUSE_CHARS])
+            if len(causes) >= _FAILURE_CAUSE_LINES:
+                break
+    if causes:
+        parts.append("--- errors ---\n" + "\n".join(causes))
+    for label, text in (("stderr", proc.stderr), ("stdout", proc.stdout)):
+        lines = (text or "").strip().splitlines()[-_FAILURE_TAIL_LINES:]
+        if lines:
+            tail = "\n".join(lines)[-_FAILURE_TAIL_CHARS:]
+            parts.append(f"--- {label} (last lines) ---\n{tail}")
+    head = f"debezium-server exited with code {proc.returncode}"
+    if not parts:
+        return f"{head} and printed nothing"
+    text = head + "\n" + "\n".join(parts)
+    return redact_secret_text(text, extra_secrets=[v for v in secret_env.values() if v])
+
+
+#: The stock launcher (``run.sh``) finds its runner jar with
+#: ``ls debezium-server-*runner.jar`` and sources ``./jmx/*.sh`` and
+#: ``./lib_metrics/*.sh``, and its classpath (``config/lib``, ``lib/*``) is
+#: relative too: its working directory must hold those entries.
+_RUNNER_JAR_GLOB = "debezium-server-*runner.jar"
+
+#: Debezium Server's file-based offset and schema-history stores have no default
+#: file name; the documented example (``data/offsets.dat``) is relative to the
+#: working directory. Forge names both under its own work directory instead.
+_OFFSETS_FILE = "offsets.dat"
+_SCHEMA_HISTORY_FILE = "schema_history.dat"
+
+
+def _path_is_inside(path: Path, root: Path) -> bool:
+    """True when ``path`` is ``root`` or below it. Falls back to ``samefile`` for
+    each parent, so a case-insensitive filesystem or a bind mount cannot hide it."""
+    if path == root or path.is_relative_to(root):
+        return True
+    for parent in path.parents:
+        try:
+            if os.path.samefile(parent, root):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _locate_server_binary(binary: str, project_dir: Path) -> Tuple[Optional[Path], Optional[str]]:
+    """The real path of the verified server binary, or ``(None, message)``.
+
+    A Debezium Server started from the project would read project files
+    (Quarkus loads ``.env`` and ``config/application.properties`` from the
+    working directory, and the stock ``run.sh`` sources ``./jmx/*.sh`` and
+    puts ``config/lib`` and ``lib/*`` on the classpath), so a binary that lives
+    in the project is refused, whether it was named by path, found on ``PATH``
+    or reached through a symlink. The project is the contract's directory and
+    the checkout it sits in (:func:`_checkout_root`), so a binary elsewhere in
+    the same repository is refused too.
+    """
+    try:
+        real = Path(binary).resolve()
+        project = project_dir.resolve()
+    except (OSError, RuntimeError) as exc:
+        return None, f"debezium-server binary {binary!r} could not be resolved: {exc}"
+    roots = [project]
+    checkout = _checkout_root(project)
+    if checkout is not None and checkout != project:
+        roots.append(checkout)
+    for root in roots:
+        if _path_is_inside(real, root):
+            return None, (
+                f"properties.debezium.server_binary resolves to {real}, which is inside the "
+                f"project directory {root}: Debezium Server would run files the project "
+                "holds. Install Debezium Server outside the project, then put it on PATH or "
+                "set properties.debezium.server_binary to its absolute path."
+            )
+    return real, None
+
+
+def _checkout_root(project_dir: Path) -> Optional[Path]:
+    """The checkout ``project_dir`` sits in: the nearest directory at or above it that
+    holds ``.git`` (a clone's directory, a worktree's file), or ``None``. The search
+    stops below the home directory, which a dotfiles repository can make a checkout."""
+    try:
+        home: Optional[Path] = Path.home().resolve()
+    except (OSError, RuntimeError):
+        home = None
+    for candidate in (project_dir, *project_dir.parents):
+        if home is not None and candidate == home:
+            return None
+        if os.path.lexists(candidate / ".git"):
+            return candidate
+    return None
+
+
+def _launch_directory(real_binary: Path) -> Optional[Path]:
+    """The install directory of the binary when it is the stock launcher (the
+    directory holds the runner jar), else ``None``."""
+    install_dir = real_binary.parent
+    try:
+        for candidate in install_dir.glob(_RUNNER_JAR_GLOB):
+            if candidate.is_file():
+                return install_dir
+    except OSError as exc:
+        # A directory that cannot be listed holds no jar to link: forge's file alone is laid out.
+        LOG.debug("debezium.install_dir.unreadable dir=%s err=%s", install_dir, exc)
+    return None
+
+
+def _prepare_launch_directory(launch_dir: Path, real_binary: Path, config_path: Path) -> Path:
+    """Fill the server's working directory and return forge's config file in it.
+
+    Debezium Server (3.7) learns which connector its engine runs while Quarkus is
+    still starting, when only ``config/application.properties`` under the working
+    directory is read: a file named only by ``smallrye.config.locations`` configures
+    the sink, but no engine starts. So forge's file is copied (0600) to
+    ``config/application.properties`` here. For the stock launcher, which finds its
+    runner jar, ``./jmx/*.sh``, ``lib/*`` and ``config/lib`` relative to the working
+    directory, the install's entries are linked in too, and so are its ``config``
+    entries except its own ``application.*`` files. Nothing comes from the project.
+    """
+    install = _launch_directory(real_binary)
+    config_dir = launch_dir / "config"
+    config_dir.mkdir(mode=0o700)
+    if install is not None:
+        for entry in install.iterdir():
+            if entry.name != "config":
+                os.symlink(entry, launch_dir / entry.name)
+        install_config = install / "config"
+        if install_config.is_dir():
+            for entry in install_config.iterdir():
+                if not entry.name.startswith("application."):
+                    os.symlink(entry, config_dir / entry.name)
+    target = config_dir / "application.properties"
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
+    with os.fdopen(fd, "wb") as out:
+        out.write(config_path.read_bytes())
+    return target
+
+
+def _server_environment(
+    config_path: Path, secret_env: Mapping[str, str], cwd: Path
+) -> Dict[str, str]:
+    """The server's environment: this process's, the credentials the file refers
+    to, and forge's file as a system property.
+
+    ``run.sh`` drops its arguments (so ``--config`` never reaches the JVM) and
+    passes ``$DEBEZIUM_OPTS $JAVA_OPTS`` to ``java``. A ``smallrye.config.locations``
+    system property loads the file at ordinal 400, above ``.env`` (295) and
+    ``config/application.properties`` (260). The property goes into both
+    variables, last, because the launcher's ``jmx/enable_jmx.sh`` replaces
+    ``JAVA_OPTS`` when ``JMX_HOST`` and ``JMX_PORT`` are set. ``quarkus.config.locations``
+    is the same setting under Quarkus's name. A last ``-D`` for a key wins,
+    so the operator's own value for it is overridden.
+
+    Raises ``ValueError`` when the file's URI holds whitespace or a comma: the
+    launcher word-splits the variables and the locations are comma-separated.
+    ``Path.as_uri`` percent-encodes both, so this holds only for a value it
+    could not encode.
+    """
+    uri = config_path.resolve().as_uri()
+    if re.search(r"[\s,]", uri):
+        raise ValueError(
+            "the debezium config file's path cannot be passed to the server (it holds "
+            "whitespace or a comma after encoding); run from a project path without them"
+        )
+    prop = f"-Dsmallrye.config.locations={uri} -Dquarkus.config.locations={uri}"
+    env = {**os.environ, **secret_env}
+    for name in ("JAVA_OPTS", "DEBEZIUM_OPTS"):
+        env[name] = " ".join(part for part in (os.environ.get(name, "").strip(), prop) if part)
+    env["PWD"] = str(cwd)
+    return env
+
+
+def _migrate_project_offsets(project_dir: Path, offsets_path: Path) -> None:
+    """Copy ``<project>/data/offsets.dat`` to forge's offsets file, once.
+
+    Before forge named the offsets file, a server that kept its offsets in a file
+    kept them at the documented ``data/offsets.dat`` under the working directory,
+    which was the project. The old file stays where it is. Nothing is copied when
+    the new file exists, when the old one is not a regular file (a symlink is
+    not followed) or when the copy fails (a partial file is removed).
+    """
+    old = project_dir / "data" / _OFFSETS_FILE
+    try:
+        # Neither the directory nor the file may be a link: only a file the
+        # project holds itself is the server's old store.
+        if not stat.S_ISDIR(os.lstat(old.parent).st_mode):
+            return
+        if not stat.S_ISREG(os.lstat(old).st_mode):
+            return
+    except OSError:
+        return
+    try:
+        os.lstat(offsets_path)
+        return  # the new file exists: it is never overwritten
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    created = False
+    try:
+        src_fd = os.open(old, os.O_RDONLY | nofollow)
+        with os.fdopen(src_fd, "rb") as src:
+            dst_fd = os.open(offsets_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
+            created = True
+            with os.fdopen(dst_fd, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+    except OSError as exc:
+        if created:
+            try:
+                os.unlink(offsets_path)
+            except OSError as unlink_exc:
+                # Not fatal, but the next run would read the partial copy: say where it is.
+                LOG.warning(
+                    "debezium.offsets.partial_copy_left path=%s err=%s (delete it before the "
+                    "next run)",
+                    offsets_path,
+                    unlink_exc,
+                )
+        LOG.warning("debezium.offsets.migrate_failed from=%s to=%s err=%s", old, offsets_path, exc)
+        return
+    LOG.info("debezium.offsets.migrated from=%s to=%s (old file left in place)", old, offsets_path)
 
 
 def _success_embedded(

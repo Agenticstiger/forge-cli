@@ -66,6 +66,7 @@ from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Set,
 from fluid_build.forge_datamodel import semantics_builder as _semantics_builder
 from fluid_build.output_ports.mcp.auth import MTLS_IDENTITY_ATTRS
 from fluid_build.providers._sql_safety import (
+    names_refused_duckdb_function,
     validate_ident,
     validate_sql_expression_allowlist,
 )
@@ -1115,6 +1116,8 @@ def _validate_rendered_statement(sql: str) -> None:
 # ``LIMIT`` with an expression / placeholder is left for the caller to own.
 _TRAILING_LIMIT_RE = re.compile(r"(?is)\blimit\s+(\d+)\s*$")
 
+# A reference to a DuckDB logging function or view, in any case, quoted or qualified.
+
 
 def compile_free_form_sql(
     *,
@@ -1184,6 +1187,14 @@ def compile_free_form_sql(
     parts = candidate.split(None, 1)
     if len(parts) < 2:
         raise QueryValidationError("sql must contain a SELECT body")
+    if names_refused_duckdb_function(candidate):
+        raise QueryValidationError(
+            "sql may not use DuckDB's logging functions or views (enable_logging, "
+            "disable_logging, truncate_duckdb_logs, write_log, duckdb_logs, "
+            "duckdb_logs_parsed, duckdb_log_contexts) or run a statement given as text "
+            "(query, query_table, json_execute_serialized_sql). Remove the reference and "
+            "query the exposed table directly."
+        )
     body = parts[1]
     validate_sql_expression_allowlist(body)
     if not isinstance(limit, int) or limit < 1 or limit > 1_000_000:

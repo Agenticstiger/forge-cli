@@ -411,16 +411,9 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
     # it; when both are set the merge lets operator keys win (derived first).
     sink_config = kc_props.get("sink_connector_config")
     sink_plan = iceberg_sink_plan(build)
-    if sink_plan is not None:
-        # Fail closed BEFORE any Connect REST call, for a derived AND a
-        # hand-written Iceberg sink: the same checks `fluid validate` runs, so
-        # a sink it rejects (a Lakekeeper binding with no uri, both catalog
-        # selectors set) never reaches the cluster.
-        from .iceberg_sink_validation import iceberg_sink_preflight
-
-        preflight_error = iceberg_sink_preflight(ctx.contract, ctx.build_id, log=LOG)
-        if preflight_error:
-            return _failed(ctx, started_at, t_start, preflight_error)
+    preflight_error = _iceberg_sink_preflight_error(ctx, build, sink_plan)
+    if preflight_error:
+        return _failed(ctx, started_at, t_start, preflight_error)
     if sink_plan is not None and sink_plan.derives:
         binding = _find_iceberg_expose_binding(ctx.contract, build)
         if binding is not None:
@@ -662,6 +655,32 @@ def _map_acquisition_mode_to_kc(mode: str) -> str:
         "cdc": "timestamp",
         "streaming": "incrementing",
     }.get(mode, "bulk")
+
+
+def _iceberg_sink_preflight_error(
+    ctx: RunContext, build: Mapping[str, Any], sink_plan: Any
+) -> Optional[str]:
+    """The error text of the Iceberg sink checks `fluid validate` runs, else ``None``."""
+    if sink_plan is not None:
+        # Fail closed BEFORE any Connect REST call, for a derived AND a
+        # hand-written Iceberg sink: the same checks `fluid validate` runs, so
+        # a sink it rejects (a Lakekeeper binding with no uri, both catalog
+        # selectors set) never reaches the cluster.
+        from .iceberg_sink_validation import iceberg_sink_preflight
+
+        return iceberg_sink_preflight(ctx.contract, ctx.build_id, log=LOG) or None
+    # No Iceberg plan, yet a hand-written sink_connector_config is pushed as
+    # written, and the Iceberg sink resolves an env: value in it from the
+    # worker's environment: refused before any Connect REST call, as
+    # `fluid validate` refuses it.
+    from .iceberg_sink_validation import unplanned_sink_reference_errors
+
+    reference_errors = unplanned_sink_reference_errors(build)
+    if reference_errors:
+        return "iceberg sink preflight failed (see `fluid validate`): " + "; ".join(
+            reference_errors
+        )
+    return None
 
 
 def _failed(ctx: RunContext, started_at: str, t_start: float, err: str) -> RunResult:

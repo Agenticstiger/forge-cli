@@ -34,6 +34,17 @@ from typing import Iterator, Tuple
 # ~/.mylogin.cnf, ~/my.cnf, /etc/my.cnf, /etc/mysql/my.cnf, $MYSQL_HOME/my.cnf),
 # with or without that suffix, so clearing it is a precaution: there is no
 # option-file fallback for it to close.
+#
+# The MYSQL_* and MARIADB_* names after MYSQL_GROUP_SUFFIX are the other
+# variables the mysql client libraries read: the user and database (the scanner
+# reads MYSQL_USER and MYSQL_DATABASE; ``build_mysql_dsn`` names the user and the
+# database only when the connection has them), where option files and client
+# plugins are looked up (MYSQL_HOME, MARIADB_HOME, LIBMYSQL_PLUGINS,
+# LIBMYSQL_PLUGIN_DIR, MARIADB_PLUGIN_DIR), a debug trace, and MariaDB
+# Connector/C's switch that turns off peer verification. USER, LOGNAME and LOGIN
+# are the user name Connector/C falls back to when the DSN names none. libpq's
+# ``require_auth`` is not here: the libpq in duckdb 1.5.1's postgres extension
+# predates it (it needs libpq 16).
 HOST_CREDENTIAL_ENV = (
     "PGPASSWORD",
     "PGPASSFILE",
@@ -49,6 +60,19 @@ HOST_CREDENTIAL_ENV = (
     "MYSQL_TCP_PORT",
     "MYSQL_UNIX_PORT",
     "MYSQL_GROUP_SUFFIX",
+    "MYSQL_USER",
+    "MYSQL_DATABASE",
+    "MARIADB_UNIX_PORT",
+    "MYSQL_HOME",
+    "MARIADB_HOME",
+    "LIBMYSQL_PLUGINS",
+    "LIBMYSQL_PLUGIN_DIR",
+    "MARIADB_PLUGIN_DIR",
+    "MYSQL_DEBUG",
+    "MARIADB_TLS_DISABLE_PEER_VERIFICATION",
+    "USER",
+    "LOGNAME",
+    "LOGIN",
 )
 
 # libpq's variables that choose WHERE it connects (PGHOSTADDR wins over a host

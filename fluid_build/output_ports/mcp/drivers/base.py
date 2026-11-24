@@ -29,6 +29,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
+from fluid_build.providers._sql_safety import names_refused_duckdb_function
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from pathlib import Path
 
@@ -79,6 +81,11 @@ def guard_against_injection_markers(sql: str) -> None:
     if any(marker in sql for marker in _INJECTION_MARKERS):
         raise ValueError(f"Refusing to execute statement with injection marker: {sql!r}")
     parts = sql.split(None, 1)
+    if names_refused_duckdb_function(sql):
+        raise ValueError(
+            "Refusing to execute statement that calls a DuckDB logging function, reads a "
+            "log view or runs a statement given as text"
+        )
     if len(parts) >= 2 and _TAIL_BLOCKED_TOKENS.search(parts[1]):
         raise ValueError(
             "Refusing to execute statement: rendered SQL body contains a "

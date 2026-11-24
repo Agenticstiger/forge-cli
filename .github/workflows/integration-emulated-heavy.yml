@@ -652,3 +652,105 @@ jobs:
         run: |
           docker rm -f "$SR_REGISTRY" "$SR_KAFKA" || true
           docker network rm "$SR_NETWORK" || true
+
+  # ────────────────────────────────────────────────────────────────────
+  # Debezium Server lane: the embedded runner on a stock distribution.
+  #
+  # What tests/integration/test_debezium_server_runner_live.py proves, with
+  # forge's real runner (`DebeziumRunner.run`) starting the stock `run.sh`
+  # against a real Postgres, from a project that holds a `.env`, a
+  # `config/application.properties` and a `jmx/enable_jmx.sh` a server started
+  # in the project would read or run:
+  #   - the server reads forge's file (its HTTP sink URL exists only there);
+  #   - the planted settings do not apply and the planted script does not run;
+  #   - a second run sends no snapshot rows, so the offsets survived;
+  #   - after the offsets file is moved to `<project>/data/offsets.dat`, a third
+  #     run still sends none: the runner copied the old file across.
+  #
+  # The distribution is the stock `debezium-server-dist` tarball from Maven
+  # Central, pinned by version and sha256. 3.7.1.Final's classes are Java 21
+  # (class file version 65), so the job uses the runner's preinstalled JDK 21
+  # through JAVA_HOME_21_X64 rather than a new action.
+  #
+  # Keyless and self-contained: one Postgres container this job removes, the
+  # recorder is in the test, and nothing here is a secret, so there is no
+  # `environment:` and no deployment record. It still gates on the same label
+  # as its siblings so un-vouched PR code gets no runner.
+  debezium-server-runner:
+    name: Debezium Server + runner integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'ci:integration-emulated')
+    permissions:
+      contents: read
+    env:
+      DEBEZIUM_SERVER_VERSION: "3.7.1.Final"
+      # The tarball's sha256, not a credential.
+      DEBEZIUM_SERVER_SHA256: 388ff55f51228f9f975f5b2eb2bbb95df56f100876f2f9e199fa4f3903a5e9c0  # pragma: allowlist secret
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # The test imports forge's runner and drives Postgres through `docker`;
+      # the base install plus the pytest plugin pyproject.toml configures is
+      # all it needs.
+      - name: Install fluid-build
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . "pytest>=7.4" "pytest-timeout>=2.3"
+
+      - name: Select the runner's JDK 21
+        run: |
+          if [ -z "${JAVA_HOME_21_X64:-}" ] || [ ! -x "$JAVA_HOME_21_X64/bin/java" ]; then
+            echo "::error::JAVA_HOME_21_X64 is not set on this runner image, so Debezium Server cannot start."
+            exit 1
+          fi
+          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          "$JAVA_HOME_21_X64/bin/java" -version
+
+      - name: Download and unpack Debezium Server
+        run: |
+          url="https://repo1.maven.org/maven2/io/debezium/debezium-server-dist/${DEBEZIUM_SERVER_VERSION}/debezium-server-dist-${DEBEZIUM_SERVER_VERSION}.tar.gz"
+          dest="$RUNNER_TEMP/debezium-server-dist"
+          mkdir -p "$dest"
+          curl -fsSL --retry 5 --retry-delay 5 -o "$dest/dist.tar.gz" "$url"
+          echo "${DEBEZIUM_SERVER_SHA256}  $dest/dist.tar.gz" | sha256sum -c -
+          tar -xzf "$dest/dist.tar.gz" -C "$dest"
+          rm "$dest/dist.tar.gz"
+          test -x "$dest/debezium-server/run.sh"
+          echo "FLUID_TEST_DEBEZIUM_SERVER_HOME=$dest/debezium-server" >> "$GITHUB_ENV"
+
+      - name: Run the Debezium Server runner live test
+        timeout-minutes: 20
+        run: |
+          python -m pytest -v -m emulated_heavy \
+            tests/integration/test_debezium_server_runner_live.py \
+            --junitxml=debezium-server-runner.xml
+
+      # pytest exits 0 on an all-skipped run. This does not.
+      - name: Assert the lane actually ran Debezium Server
+        if: always()
+        run: |
+          python scripts/ci/assert_lane_coverage.py debezium-server-runner.xml \
+            --require "Debezium Server runner=tests/integration/test_debezium_server_runner_live.py"
+
+      - name: Upload JUnit
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: debezium-server-runner-junit
+          path: debezium-server-runner.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # The test removes its container; this catches a run killed before that.
+      - name: Remove a Postgres left behind
+        if: always()
+        run: |
+          docker ps -aq --filter "name=fluid-dbz-runner-live-" | xargs -r docker rm -f

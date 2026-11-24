@@ -332,7 +332,9 @@ def test_two_properties_on_one_env_name_fail_closed():
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes and a shell script")
-def test_embedded_server_file_holds_no_password_and_server_gets_it(tmp_path, monkeypatch):
+def test_embedded_server_file_holds_no_password_and_server_gets_it(
+    tmp_path, tmp_path_factory, monkeypatch
+):
     from fluid_build.build_runners.debezium import runner as dbz
 
     monkeypatch.setenv("PG_PASSWORD_T211", _SECRET)
@@ -344,7 +346,8 @@ def test_embedded_server_file_holds_no_password_and_server_gets_it(tmp_path, mon
     monkeypatch.setenv("FLUID_ACQUISITION_SECRET_REF_ALLOWLIST", "PG_PASSWORD_T211")
     monkeypatch.setenv("LAKEKEEPER_CREDENTIAL_T211", "inherited")
     captured = tmp_path / "server-env.txt"
-    server = tmp_path / "debezium-server"
+    # The binary lives outside the project: a server binary inside it is refused.
+    server = tmp_path_factory.mktemp("dbz-install") / "debezium-server"
     server.write_text(
         "#!/bin/sh\n"
         'printf \'%s|%s\' "$FLUID_DBZ_SOURCE_DATABASE_PASSWORD" "$LAKEKEEPER_CREDENTIAL_T211"'

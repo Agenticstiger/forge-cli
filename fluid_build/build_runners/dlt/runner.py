@@ -490,6 +490,20 @@ def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
     binding_loc = (expose.get("binding") or {}).get("location") or {}
     binding_path = binding_loc.get("path")
 
+    # Default-deny for the project's other dlt settings: _refuse_project_dlt_settings.
+    endpoints = (
+        []
+        if dest_name in ("duckdb", "filesystem")
+        else _project_endpoints_for_destination(
+            dest_name, pipeline_name, binding, environ_before_bridge
+        )
+    )
+    failed = _refuse_project_dlt_settings(
+        ctx, started_at, t_start, dest_name, pipeline_name, pinned=bool(endpoints)
+    )
+    if failed is not None:
+        return failed
+
     if dest_name == "duckdb":
         if binding_path:
             dest_path = Path(binding_path)
@@ -525,9 +539,6 @@ def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
             out_dir.mkdir(parents=True, exist_ok=True)
             destination = fs_dest(bucket_url=str(out_dir))
     else:
-        endpoints = _project_endpoints_for_destination(
-            dest_name, pipeline_name, binding, environ_before_bridge
-        )
         if endpoints:
             try:
                 destination = _destination_with_project_credentials(
@@ -547,6 +558,11 @@ def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
         destination=destination,
         dataset_name=dataset_name,
     )
+    failed = _refuse_project_dlt_settings(
+        ctx, started_at, t_start, dest_name, pipeline_name, staging_of=pipeline
+    )
+    if failed is not None:
+        return failed
     # NOTE: per-record hook chain (DLQ + alerter) is not currently
     # plumbed into dlt because dlt's source factory returns lazy
     # generators that materialize at ``pipeline.run`` time. Wiring
@@ -1051,6 +1067,340 @@ def _project_endpoints_for_destination(
     return found + [
         name for name in project_endpoints_in_effect(service) if name.strip().upper() in read
     ]
+
+
+# Default-deny for the rest of the dlt settings a project could use to move the
+# data or the credentials the pipeline sends. Beyond a destination's
+# credentials (above) dlt reads, from the same environment and under the same
+# section paths, the destination's other configuration (lance's ``storage``
+# bucket and its credentials, ``embeddings`` credentials, the filesystem's
+# ``bucket_url`` and ``kwargs``, ``staging_config``), the type and name the
+# destination is resolved under (``DESTINATION__<NAME>__DESTINATION_TYPE``,
+# ``destination_name``), and the pipeline's staging destination
+# (``staging_type``, ``staging_name``, then that destination's own
+# configuration and credentials). A project value for one of them would be
+# layered on the operator's own configuration: a bucket the operator's keys
+# write to, an endpoint they are sent to, a staging area that gets a copy of
+# the data, a destination of another type that reads the operator's secrets.
+# So a project dotenv file may set none of them, but:
+#   * the fields of :data:`_DLT_PROJECT_SETTINGS_ALLOWED`;
+#   * every destination field that is a boolean or an integer
+#     (``create_indexes``, ``enable_dataset_name_normalization``,
+#     ``info_tables_query_threshold``, ``truncate_tables_on_staging_destination_before_load``
+#     ...): a flag or a count cannot name a place or a credential; but not one
+#     about transport security or the socket (``staging_use_https``, a
+#     ``verify`` or ``port`` field: :func:`_dlt_flag_weakens_transport`);
+#   * ``DESTINATION__<NAME>__DESTINATION_TYPE`` of the contract's own
+#     destination while the project's credentials pin it
+#     (:func:`_project_endpoints_for_destination`): the destination is then the
+#     project's wholly, built from its values only
+#     (:func:`_destination_with_project_credentials`).
+# Everything the operator sets themselves (shell, CI, ``FLUID_SECRETS_FILE``,
+# ``.dlt/secrets.toml`` and ``config.toml``) applies as before: only a value a
+# project dotenv file supplied (``dotenv_store.project_values_in_effect``) is
+# looked at. dlt's own mechanisms are used, no internal API of it: the field
+# names come from the destination's ``spec()``
+# (tests/test_dotenv_dlt_section_default_deny.py checks them against the names
+# dlt looks up).
+#   environment   a label dlt keeps on the configuration and never reads again;
+#                 ``ENVIRONMENT=production`` is also a common project variable.
+_DLT_PROJECT_SETTINGS_ALLOWED: FrozenSet[str] = frozenset({"environment"})
+
+# The pipeline's own settings that choose a destination (dlt/pipeline/
+# configuration.py): the staging destination, and the type and name the
+# destination is resolved under (a name moves the section dlt reads its
+# configuration from).
+_DLT_PIPELINE_SETTINGS = ("STAGING_TYPE", "STAGING_NAME", "DESTINATION_TYPE", "DESTINATION_NAME")
+
+
+# dlt's run settings that send a run's data, errors or telemetry to a URL
+# (dlt/common/configuration/specs/runtime_configuration.py, dlt 1.27.2):
+# exception reports to Sentry, load notices to a Slack hook, usage telemetry to
+# its endpoint. Read under the ``runtime`` section, with or without the
+# pipeline's sections.
+_DLT_RUNTIME_ENDPOINTS = ("SENTRY_DSN", "SLACK_INCOMING_HOOK", "DLTHUB_TELEMETRY_ENDPOINT")
+
+
+def _dlt_runtime_endpoint_names(pipeline_name: str) -> FrozenSet[str]:
+    """The variables dlt reads :data:`_DLT_RUNTIME_ENDPOINTS` from in the pipeline
+    ``pipeline_name``: ``RUNTIME__<SETTING>``, ``PIPELINES__RUNTIME__<SETTING>``
+    and ``PIPELINES__<PIPELINE>__RUNTIME__<SETTING>``, each also behind the
+    pipeline name (observed with dlt 1.27.2)."""
+    pipeline = pipeline_name.upper()
+    heads = (f"{pipeline}__", "") if pipeline else ("",)
+    sections = ((f"PIPELINES__{pipeline}__",) if pipeline else ()) + ("PIPELINES__", "")
+    return frozenset(
+        head + section + "RUNTIME__" + setting
+        for head in heads
+        for section in sections
+        for setting in _DLT_RUNTIME_ENDPOINTS
+    )
+
+
+def _dlt_pipeline_setting_names(pipeline_name: str) -> FrozenSet[str]:
+    """The variables dlt reads the pipeline settings of
+    :data:`_DLT_PIPELINE_SETTINGS` from in the pipeline ``pipeline_name``:
+    ``STAGING_TYPE``, ``PIPELINES__STAGING_TYPE``,
+    ``PIPELINES__<PIPELINE>__STAGING_TYPE``, each also behind the pipeline name
+    (``dlt.pipeline`` takes the ``pipelines`` section and the pipeline's name,
+    dlt/pipeline/__init__.py, dlt 1.27.2)."""
+    pipeline = pipeline_name.upper()
+    heads = (f"{pipeline}__", "") if pipeline else ("",)
+    sections = ((f"PIPELINES__{pipeline}__",) if pipeline else ()) + ("PIPELINES__", "")
+    return frozenset(
+        head + section + setting
+        for head in heads
+        for section in sections
+        for setting in _DLT_PIPELINE_SETTINGS
+    )
+
+
+#: Words that mark a flag or a number about how the connection is secured or
+#: where its socket goes (clickhouse ``staging_use_https``, a ``verify``,
+#: ``insecure``, ``validate_certificate``, ``check_hostname`` or ``port`` field):
+#: such a field is not a harmless flag or count, since a project value could
+#: turn TLS or its certificate check off or move the connection.
+_DLT_TRANSPORT_WORDS = frozenset(
+    {
+        "cert",
+        "certificate",
+        "certificates",
+        "certs",
+        "encrypt",
+        "hostname",
+        "https",
+        "insecure",
+        "port",
+        "secure",
+        "ssl",
+        "tls",
+        "trust",
+        "verify",
+    }
+)
+
+
+def _dlt_flag_weakens_transport(field: str) -> bool:
+    """Whether the boolean or integer destination field ``field`` is about the
+    connection's transport security or its socket (:data:`_DLT_TRANSPORT_WORDS`,
+    matched on the parts of its snake_case name)."""
+    return any(part in _DLT_TRANSPORT_WORDS for part in field.lower().split("_"))
+
+
+def _dlt_is_flag_or_count(hint: Any) -> bool:
+    """Whether ``hint`` is a ``bool`` or an ``int`` (optionally ``Optional``,
+    ``Final`` or ``Annotated``)."""
+    import typing
+
+    pending = [hint]
+    found = False
+    while pending:
+        current = pending.pop()
+        if current is type(None):
+            continue
+        if current in (bool, int):
+            found = True
+            continue
+        if typing.get_origin(current) is typing.Annotated:
+            pending.append(typing.get_args(current)[0])
+            continue
+        args = typing.get_args(current)
+        if not args:
+            return False
+        pending.extend(args)
+    return found
+
+
+def _dlt_is_not_resolved(hint: Any) -> bool:
+    """Whether ``hint`` is marked ``NotResolved``: dlt never reads the field from
+    its providers."""
+    import typing
+
+    try:
+        from dlt.common.configuration.specs.base_configuration import NotResolved
+    except ImportError:  # a dlt without the marker: the field counts (fail closed)
+        return False
+
+    if typing.get_origin(hint) is not typing.Annotated:
+        return False
+    return any(
+        item is NotResolved or isinstance(item, NotResolved) for item in typing.get_args(hint)[1:]
+    )
+
+
+def _dlt_destination_setting_names(
+    section: str, kind: str, pipeline_name: str, *, credentials: bool
+) -> Tuple[FrozenSet[str], Tuple[str, ...]]:
+    """The variables dlt reads the configuration of the destination under
+    ``section`` (type ``kind``) from in the pipeline ``pipeline_name`` besides
+    the credentials (:func:`_dlt_credentials_names` and what
+    :data:`_DLT_PROJECT_SETTINGS_ALLOWED` and the boolean and integer fields
+    leave out): ``(names, prefixes)``, upper-cased; a name under one of
+    ``prefixes`` is one of them too. With ``credentials`` the destination's
+    credentials count as well (a staging destination, whose credentials
+    :func:`_project_endpoints_for_destination` does not look at).
+
+    A top-level field is looked up under ``DESTINATION__<NAME>__<FIELD>``,
+    ``DESTINATION__<FIELD>`` and ``<FIELD>``, a field of a configuration nested
+    in it under that configuration's section path and each shorter one
+    (:func:`_dlt_credentials_names`), all also behind the pipeline name. A
+    nested configuration counts as a whole: every name below it. When dlt
+    cannot introspect ``kind``, every name under ``DESTINATION__<NAME>__``
+    counts: fail closed.
+    """
+    import dlt
+
+    pipeline = pipeline_name.upper()
+    heads = (f"{pipeline}__", "") if pipeline else ("",)
+    upper = section.upper()
+
+    def top(field: str) -> List[str]:
+        sections = ["DESTINATION", upper]
+        return [
+            head + "__".join((*sections[:kept], field.upper()))
+            for head in heads
+            for kept in range(len(sections), -1, -1)
+        ]
+
+    def nested(field: str) -> List[str]:
+        # the nested configuration's own spellings, as _dlt_credentials_names
+        # gives a configuration of the credentials
+        full = ["DESTINATION", upper, field.upper()]
+        sections, own = full[:-1], full[-1]
+        return [
+            head + "__".join((*sections[:kept], own))
+            for head in heads
+            for kept in range(len(sections), -1, -1)
+        ]
+
+    names: Set[str] = set()
+    prefixes: Set[str] = set()
+    try:
+        spec = getattr(dlt.destinations, kind.lower())().spec()
+        hints = spec.get_resolvable_fields()
+    except Exception as exc:  # noqa: BLE001 — dlt missing, or a spec it cannot build: pin
+        LOG.debug("dlt.destination.settings.unknown kind=%s err=%s", kind, exc)
+        prefixes.update(f"{head}DESTINATION__{upper}__" for head in heads)
+        return frozenset(), tuple(sorted(prefixes))
+    for field, hint in hints.items():
+        if field == "credentials" and not credentials:
+            continue
+        if field.lower() in _DLT_PROJECT_SETTINGS_ALLOWED or _dlt_is_not_resolved(hint):
+            continue
+        if _dlt_is_flag_or_count(hint) and not _dlt_flag_weakens_transport(field):
+            continue
+        if _dlt_config_classes(hint):
+            read = nested(field)
+            names.update(read)
+            prefixes.update(f"{name}__" for name in read)
+        else:
+            names.update(top(field))
+    return frozenset(names), tuple(sorted(prefixes))
+
+
+def _project_dlt_settings(
+    destination: str,
+    pipeline_name: str,
+    *,
+    pinned: bool = False,
+    staging: Optional[Tuple[str, str]] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> List[str]:
+    """The variables a project dotenv file supplied (in effect) that set a dlt
+    setting of the pipeline ``pipeline_name`` beyond the destination's
+    credentials: the pipeline's staging and destination settings, the URLs the
+    run reports to, and the destination's other configuration
+    (:data:`_DLT_PIPELINE_SETTINGS`, :data:`_DLT_RUNTIME_ENDPOINTS`,
+    :func:`_dlt_destination_setting_names`). The contract's destination
+    ``destination`` is read as :func:`_dlt_destination` reads it.
+
+    ``pinned`` is whether the project's credentials pin the destination
+    (:func:`_project_endpoints_for_destination` found one): its
+    ``DESTINATION__<NAME>__DESTINATION_TYPE`` is then the project's own to set.
+    ``staging`` is the pipeline's staging destination, ``(section, type)``, once
+    ``dlt.pipeline`` has resolved it: its credentials and configuration count
+    too. Names compare upper-cased and stripped, as everywhere here; never
+    parsed. Over-matching only refuses more, never less.
+    """
+    from fluid_build.credentials.dotenv_store import project_values_in_effect
+
+    project = [name for name in project_values_in_effect(environ) if name.strip()]
+    if not project:
+        return []
+    section, kind = _dlt_destination(destination)
+    exact: Set[str] = set()
+    below: Set[str] = set()
+    if staging is None:
+        exact.update(_dlt_pipeline_setting_names(pipeline_name))
+        exact.update(_dlt_runtime_endpoint_names(pipeline_name))
+        names, prefixes = _dlt_destination_setting_names(
+            section, kind, pipeline_name, credentials=False
+        )
+        exact.update(names)
+        below.update(prefixes)
+        if pinned:
+            type_name = f"DESTINATION__{section.upper()}__DESTINATION_TYPE"
+            exact.discard(type_name)
+            if pipeline_name:
+                exact.discard(f"{pipeline_name.upper()}__{type_name}")
+    else:
+        names, prefixes = _dlt_destination_setting_names(
+            staging[0], staging[1], pipeline_name, credentials=True
+        )
+        exact.update(names)
+        below.update(prefixes)
+    prefix = tuple(sorted(below))
+    return [
+        name
+        for name in project
+        if name.strip().upper() in exact or (prefix and name.strip().upper().startswith(prefix))
+    ]
+
+
+def _refused_dlt_settings_message(destination: str, names: Sequence[str]) -> str:
+    """What the runner reports for the variables of :func:`_project_dlt_settings`."""
+    return (
+        f"dlt destination {destination!r}: the project's dotenv files set dlt settings that "
+        f"choose where the data goes or which account it uses ({', '.join(sorted(names))}), "
+        "and a project file may not set them. Remove them from the project's .env and "
+        "export them in your shell or CI environment (or set them in your own .dlt "
+        "configuration) if you want them."
+    )
+
+
+def _refuse_project_dlt_settings(
+    ctx: RunContext,
+    started_at: str,
+    t_start: float,
+    dest_name: str,
+    pipeline_name: str,
+    *,
+    pinned: bool = False,
+    staging_of: Any = None,
+) -> Optional[RunResult]:
+    """The failed result when a project dotenv file sets dlt settings that choose
+    the destination (:func:`_project_dlt_settings`), else ``None``. With
+    ``staging_of`` (the resolved pipeline) its staging destination is checked
+    instead of the pipeline's own settings (dlt resolves it with the pipeline, so it
+    is looked at before anything is sent to it)."""
+    if staging_of is None:
+        refused = _project_dlt_settings(dest_name, pipeline_name, pinned=pinned)
+        label = dest_name
+    else:
+        staging = getattr(staging_of, "staging", None)
+        if staging is None:
+            return None
+        staging_section = str(getattr(staging, "destination_name", "") or "")
+        staging_kind = str(getattr(staging, "destination_type", "") or "").rsplit(".", 1)[-1]
+        refused = _project_dlt_settings(
+            dest_name, pipeline_name, staging=(staging_section, staging_kind)
+        )
+        label = f"{dest_name} (staging)"
+    if not refused:
+        return None
+    message = _refused_dlt_settings_message(label, refused)
+    LOG.error("dlt.settings.project.refused names=%s", ",".join(sorted(refused)))
+    return _failed_result(ctx, started_at, message, t_start)
 
 
 def _destination_with_project_credentials(

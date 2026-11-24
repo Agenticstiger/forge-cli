@@ -289,7 +289,20 @@ def get_credentials_for(platform: str, binding: Optional[Dict[str, Any]] = None)
 
     ``None`` values are stripped from the returned dict so engine introspectors
     can use ``setdefault``-style population without overwriting with None.
+
+    A Snowflake binding may name the ``account`` but not the ``user`` or
+    ``authenticator``: either one, in ``location`` or ``properties``, raises
+    ``ContractLoginSettingError``. Everything else here comes from the process
+    environment (the classes read nothing else), so an account the contract
+    named is never signed in to with a credential from the operator's keyring
+    or secret store (``resolve_snowflake_settings`` pins those lookups).
     """
+    if platform.lower() == "snowflake":
+        from fluid_build.credentials.resolver import refuse_contract_login_settings
+
+        refuse_contract_login_settings((binding or {}).get("location"), "binding.location")
+        refuse_contract_login_settings((binding or {}).get("properties"), "binding.properties")
+
     cls = _CREDENTIAL_CLASSES.get(platform.lower())
     if cls is None:
         # Unknown platform — return whatever the binding supplied, no env

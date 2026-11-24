@@ -110,23 +110,24 @@ The publish command registers your FLUID data products in enterprise catalogs,
 making them discoverable for other teams, AI agents, and data consumers.
 
 Examples:
-  # Publish to default catalog (FLUID Command Center)
-  fluid publish contract.fluid.yaml
+  # Publish to the FLUID Command Center (name a target: there is no default)
+  fluid publish contract.fluid.yaml --target fluid-command-center
 
   # Publish with the aws overlay (overlays/aws.yaml), as apply --env aws does
   fluid publish contract.fluid.yaml --target command-center --env aws
 
   # Publish multiple contracts
-  fluid publish customer-*.fluid.yaml
+  fluid publish customer-*.fluid.yaml --target fluid-command-center
 
   # Dry run: the request bodies and lineage edges, no network call
-  fluid publish contract.fluid.yaml --dry-run --format json
+  fluid publish contract.fluid.yaml --target fluid-command-center --dry-run --format json
 
   # Verify publication without publishing again
-  fluid publish contract.fluid.yaml --verify-only
+  fluid publish contract.fluid.yaml --target fluid-command-center --verify-only
 
   # Publish with custom endpoint
-  FLUID_CC_ENDPOINT=https://catalog.company.com fluid publish contract.fluid.yaml
+  FLUID_CC_ENDPOINT=https://catalog.company.com \\
+    fluid publish contract.fluid.yaml --target fluid-command-center
 
 Workflow:
   1. validate → Ensure contract is valid
@@ -178,10 +179,13 @@ The publish command enables the full data product lifecycle: develop → deploy 
             "Target catalog to publish to. Format: ``<name>`` or "
             "``<name>:<endpoint>`` (endpoint override for this target only). "
             "Repeatable — ``--target command-center --target datahub`` "
-            "publishes to both. Default: fluid-command-center. Per the "
-            "11-stage pipeline design (perfect-pipeline.html), this is the "
-            "canonical flag going forward; ``--catalog`` is a deprecated "
-            "alias kept for one release."
+            "publishes to both. Required: with neither --target nor "
+            "--catalog nothing is published and nothing is sent anywhere. "
+            "The Command Center targets (fluid-command-center, fluid_cc, "
+            "command-center) are refused when FLUID_COMMAND_CENTER_ENABLED "
+            "is off. Per the 11-stage pipeline design (perfect-pipeline.html), "
+            "this is the canonical flag going forward; ``--catalog`` is a "
+            "deprecated alias kept for one release."
         ),
     )
     catalog_group.add_argument(
@@ -328,6 +332,99 @@ def _command_center_dry_run(
     )
 
 
+def _no_target_message(config: FluidConfig, contract: str = "contract.fluid.yaml") -> str:
+    """Why ``fluid publish`` with no target does nothing, and how to name one.
+
+    The commands it suggests run as written: ``contract`` is the first contract
+    the user passed (``--list-catalogs`` needs one too).
+    """
+    import shlex
+
+    import fluid_build.build_runners.catalog_registrars  # noqa: F401  (registers every backend)
+    from fluid_build.api.catalog_backend import all_catalog_backend_specs
+
+    names = sorted(
+        {"fluid-command-center"}
+        | set(config.get_catalog_config())
+        | {spec.name for spec in all_catalog_backend_specs()}
+    )
+    return (
+        "No publish target given, so nothing was published and nothing was sent. "
+        "Name one with --target NAME (repeatable), for example "
+        f"'fluid publish {shlex.quote(contract)} --target fluid-command-center'. "
+        f"Available targets: {', '.join(names)}. "
+        f"'fluid publish {shlex.quote(contract)} --list-catalogs' shows the configured ones."
+    )
+
+
+def _command_center_switch_off() -> bool:
+    """True while ``FLUID_COMMAND_CENTER_ENABLED`` is off.
+
+    The same switch, and the same off values, ``fluid apply`` honours before its
+    Command Center report (``cli/_apply_cc_report.py``).
+    """
+    from fluid_build.cli._apply_cc_report import _OFF_VALUES
+
+    enabled = os.environ.get("FLUID_COMMAND_CENTER_ENABLED")
+    return enabled is not None and enabled.strip().lower() in _OFF_VALUES
+
+
+def _command_center_disabled(catalog_name: str) -> bool:
+    """True for a Command Center target while ``FLUID_COMMAND_CENTER_ENABLED`` is off."""
+    from fluid_build.config_manager import COMMAND_CENTER_CATALOG_NAMES
+
+    return catalog_name in COMMAND_CENTER_CATALOG_NAMES and _command_center_switch_off()
+
+
+def _command_center_disabled_result(catalog_name: str, asset_id: str) -> "PublishResult":
+    from fluid_build.providers.catalogs import PublishResult
+
+    return PublishResult(
+        success=False,
+        catalog_id=catalog_name,
+        asset_id=asset_id,
+        error=(
+            "FLUID_COMMAND_CENTER_ENABLED is off, so nothing was sent to the Command "
+            "Center. Unset it (or set it to true) to publish there, or name another "
+            "target with --target."
+        ),
+        details={"error_code": "cc_disabled"},
+    )
+
+
+def _command_center_alias_refusal(
+    is_command_center: bool, catalog_name: str, asset_id: str
+) -> "Optional[PublishResult]":
+    """The refusal for a backend that is the Command Center provider under another
+    name while the switch is off, before anything is sent; else ``None``."""
+    if is_command_center and _command_center_switch_off():
+        return _command_center_disabled_result(catalog_name, asset_id)
+    return None
+
+
+def _command_center_credential_refusal(
+    provider: Any, is_command_center: bool, catalog_name: str, asset_id: str
+) -> "Optional[PublishResult]":
+    """A Command Center publish without a credential fails here, by name, before
+    the health check sends anything (the credential-less probe goes nowhere)."""
+    if not is_command_center:
+        return None
+    from fluid_build.providers.catalogs import PublishResult
+    from fluid_build.providers.catalogs.fluid_cc import CommandCenterCredentialMissingError
+
+    try:
+        provider.require_credential()
+    except CommandCenterCredentialMissingError as e:
+        return PublishResult(
+            success=False,
+            catalog_id=catalog_name,
+            asset_id=asset_id,
+            error=e.message,
+            details=e.result_details(),
+        )
+    return None
+
+
 async def publish_contract(
     contract_path: Path,
     catalog_name: str,
@@ -379,6 +476,11 @@ async def publish_contract(
             error=f"Invalid environment name {env!r}: use letters, digits, '.', '_' and '-'",
         )
 
+    # Refused before the contract is read or a provider built, whatever the mode:
+    # a switch that is off means nothing reaches the Command Center.
+    if _command_center_disabled(catalog_name):
+        return _command_center_disabled_result(catalog_name, str(contract_path))
+
     # Load contract, merged with its --env overlay the way ``fluid apply``
     # loads it, so an ``--env aws`` publish describes the aws binding.
     try:
@@ -427,6 +529,9 @@ async def publish_contract(
     from fluid_build.providers.catalogs.fluid_cc import FluidCommandCenterProvider
 
     is_command_center = isinstance(provider, FluidCommandCenterProvider)
+    refused = _command_center_alias_refusal(is_command_center, catalog_name, str(contract_path))
+    if refused is not None:
+        return refused
     if force and is_command_center:
         provider.force_contract_sync = True
 
@@ -483,6 +588,12 @@ async def publish_contract(
             error=error_msg,
             details=details,
         )
+
+    refused = _command_center_credential_refusal(
+        provider, is_command_center, catalog_name, asset.id
+    )
+    if refused is not None:
+        return refused
 
     # Health check (unless skipped)
     if not skip_health_check:
@@ -918,10 +1029,10 @@ async def run_async(args, logger: logging.Logger) -> int:
         return 1
 
     # Resolve the target list from --target (new) + --catalog (deprecated).
-    # Format: list of (name, endpoint_override or None). If neither flag is
-    # set, default to a single fluid-command-center target — matches the
-    # pre-11-stage-pipeline behavior so existing ``fluid publish X.yaml``
-    # invocations keep working.
+    # Format: list of (name, endpoint_override or None). Neither flag set is an
+    # error, not a Command Center publish: no setting names a default target
+    # (the project config is the checkout's, and a checkout does not choose
+    # where the operator's credential goes).
     targets: List[Tuple[str, Optional[str]]] = []
     if args.target:
         for raw in args.target:
@@ -936,7 +1047,8 @@ async def run_async(args, logger: logging.Logger) -> int:
         )
         targets.append((args.catalog, None))
     if not targets:
-        targets.append(("fluid-command-center", None))
+        logger.error(_no_target_message(config, str(contract_paths[0])))
+        return 1
 
     if not args.quiet:
         target_summary = ", ".join(f"{n}{':' + e if e else ''}" for n, e in targets)

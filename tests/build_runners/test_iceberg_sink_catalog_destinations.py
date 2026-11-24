@@ -831,12 +831,13 @@ def test_a_kafka_level_override_keeps_its_config_provider(monkeypatch):
     assert not any("consumer.override" in e for e in errors), errors
 
 
-def test_without_catalog_auth_an_override_is_unchanged():
+def test_without_catalog_auth_an_override_that_names_a_variable_is_refused():
+    """A variable is named only through ``sink.catalogAuth``, which the operator pairs."""
     contract = _kc_contract(
         None, iceberg_catalog_overrides={"iceberg.catalog.header.X": "${file:/run/h:x}"}
     )
     errors, _warnings = validate_iceberg_sink(contract)
-    assert not any("header.X" in e for e in errors), errors
+    assert any("header.X" in e and "sink.catalogAuth" in e for e in errors), errors
 
 
 def test_the_control_topic_kafka_clients_keep_their_config_providers(monkeypatch):
