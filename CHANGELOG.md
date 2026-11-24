@@ -101,6 +101,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catch. `granted_distribution` and `entry_point_distribution` now treat such a distribution as
   unnamed. This was the intermittent failure of `tests/iac/test_state_migration_safety.py` in CI.
 
+## [0.40.1] — 2026-11-24
+
+### Fixed
+
+- **The container image is published again.** The release's image scan stopped the 0.40.0
+  image on CVE-2026-119170, a regression in how CPython 3.14.10's `hashlib` enforces FIPS
+  algorithms, which matters only where OpenSSL runs in FIPS mode. The image does not run it
+  so, and the fix ships in CPython 3.14.11, which is not released yet. `.grype.yaml` lists
+  the CVE with that reason until a `python:3.14-slim` with CPython 3.14.11 ships. The PyPI
+  package holds no CPython and is the same as 0.40.0 apart from the line below.
+
+### Changed
+
+- Five names that nothing read are gone from the profiler and its tests (`_COUNT_KINDS`, and
+  the `itertools`, `math`, `_stats` and `selection` imports), as GitHub code quality found.
+
 ## [0.40.0] — 2026-11-24
 
 ### Added

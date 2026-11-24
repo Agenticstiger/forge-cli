@@ -37,8 +37,6 @@ list of parts (:func:`follow_parts`).
 from __future__ import annotations
 
 import hashlib
-import itertools
-import math
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
