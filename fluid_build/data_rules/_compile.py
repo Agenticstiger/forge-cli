@@ -27,23 +27,33 @@ template. ``table_sql(exposeId)`` is the caller's: the ODCS exporter answers
 **Links.** A path ``rel.col``, a shared column and each hop of a shared attribute's
 route are a ``LEFT JOIN`` to the target's rows whose key occurs once (a window count
 over the target's key), so a missing row and a key two target rows hold both read as
-NULL, and a source row is never counted twice.
+NULL, and a source row is never counted twice. Into a target that declares a validity
+window (RFC-versioned-relationships §2), a link that reaches the entity joins one row
+per entity: the distinct key and stable columns, an entity whose versions disagree on
+them reading as NULL. A link with ``asOf`` joins the version valid on the row's date,
+as MetricFlow joins a type II dimension (``start <= date AND (end IS NULL OR date <
+end)``, ``<=`` under ``chain: dayBefore`` or ``none``, ``end = <openEnd>`` for an open-end
+literal), and at most one: the version that starts last on or before the date, as an
+as-of join (DuckDB's ``ASOF JOIN``) reads it, two versions starting together reaching
+none. On versions that never overlap, as §1.1 requires, that is the version valid on it.
 """
 
 from __future__ import annotations
 
 import datetime
+import functools
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fluid_build import fluid_sql as fs
 from fluid_build.fluid_sql import _nodes as n
-from fluid_build.fluid_sql._types import NUMBER, STRING
+from fluid_build.fluid_sql._types import DATE, NUMBER, STRING, TIMESTAMP, TIMESTAMPTZ
+from fluid_build.forge_datamodel.semantics_builder import nfc
 
 from . import _masks
-from ._lint import OPERATORS, AttributeRoutes, Finding, analyze
-from ._model import Expose, as_dict, as_list, build, nfc
+from ._lint import OPERATORS, AttributeRoutes, Finding, _is_date_text, analyze
+from ._model import Expose, as_dict, as_list, build
 
 EXECUTABLE = "executable"
 INFORMATIONAL = "informational"
@@ -624,11 +634,14 @@ class _Compiler:
             target = self.by_id[rel.to]
             self.same_dialect(dialect, target, f"through {name}")
             last = step == len(hops) - 1
-            following = () if last else target.relationships[hops[step + 1]].from_columns
+            following: List[str] = []
+            if not last:
+                after = target.relationships[hops[step + 1]]
+                following = list(after.from_columns) + ([after.as_of] if after.as_of else [])
             needed = list(rel.to_columns) + [c for c in following if c not in rel.to_columns]
             if last and owner[1] not in needed:
                 needed.append(owner[1])
-            joins.append(_link_join(dialect, previous, f"l{step + 1}", rel, target, needed))
+            joins.append(_join(dialect, previous, f"l{step + 1}", rel, here, target, needed))
             reads.append(target.expose_id)
             here, previous = target, f"l{step + 1}"
         mine, theirs = f"{q('t')}.{q(column)}", f"{q(previous)}.{q(owner[1])}"
@@ -665,11 +678,32 @@ class _Names:
         self.taken: Set[str] = {c.casefold() for group in columns for c in group}
 
     def fresh(self, base: str) -> str:
-        name = base
-        while name.casefold() in self.taken:
-            name += "_"
-        self.taken.add(name.casefold())
-        return name
+        return fs.fresh_name(base, self.taken)
+
+
+def _key_on(q: Callable[[str], str], source_alias: str, alias: str, rel: Any) -> str:
+    """The key equality of a join through ``rel``, refusing a relationship whose columns do
+    not pair."""
+    if not rel.from_columns or len(rel.from_columns) != len(rel.to_columns):
+        raise _Refused(f"{rel.name} pairs no fromColumns with its toColumns")
+    return " AND ".join(
+        f"{q(source_alias)}.{q(f)} = {q(alias)}.{q(t)}"
+        for f, t in zip(rel.from_columns, rel.to_columns, strict=True)
+    )
+
+
+def _join_parts(
+    q: Callable[[str], str],
+    rel: Any,
+    target: Expose,
+    columns: Sequence[str],
+    extra: Sequence[str] = (),
+) -> Tuple[str, str, _Names]:
+    """What every join to ``target`` shares: the quoted output ``columns`` and ``extra``, the
+    quoted key (a window's ``PARTITION BY``) and the names taken in the target."""
+    selected = ", ".join(q(c) for c in dict.fromkeys([*columns, *extra]))
+    partition = ", ".join(q(c) for c in rel.to_columns)
+    return selected, partition, _Names(target.model.columns)
 
 
 def _link_join(
@@ -681,22 +715,149 @@ def _link_join(
     columns: Sequence[str],
 ) -> Callable[[TableSql], str]:
     """A ``LEFT JOIN`` to ``target``'s rows whose key occurs once, as ``alias``."""
-    q = lambda name: fs.sql_name(dialect, name)  # noqa: E731
-    if not rel.from_columns or len(rel.from_columns) != len(rel.to_columns):
-        raise _Refused(f"{rel.name} pairs no fromColumns with its toColumns")
-    matches = _Names(target.model.columns).fresh("fluid_matches")
-    selected = ", ".join(q(c) for c in dict.fromkeys(columns))
-    partition = ", ".join(q(c) for c in rel.to_columns)
-    on = " AND ".join(
-        f"{q(source_alias)}.{q(f)} = {q(alias)}.{q(t)}"
-        for f, t in zip(rel.from_columns, rel.to_columns, strict=True)
-    )
+    q = _quoter(dialect)
+    on = _key_on(q, source_alias, alias, rel)
+    selected, partition, names = _join_parts(q, rel, target, columns)
+    matches = names.fresh("fluid_matches")
 
     def join(table_sql: TableSql) -> str:
         return (
             f"LEFT JOIN (SELECT {selected}, COUNT(*) OVER (PARTITION BY {partition}) "
             f"AS {q(matches)} FROM {table_sql(target.expose_id)}) AS {q(alias)} "
             f"ON {on} AND {q(alias)}.{q(matches)} = 1"
+        )
+
+    return join
+
+
+def _quoter(dialect: str) -> Callable[[str], str]:
+    """``name`` as a quoted identifier of ``dialect``, typed (a lambda is not)."""
+    return functools.partial(fs.sql_name, dialect)
+
+
+def _join(
+    dialect: str,
+    source_alias: str,
+    alias: str,
+    rel: Any,
+    source: Expose,
+    target: Expose,
+    columns: Sequence[str],
+) -> Callable[[TableSql], str]:
+    """The ``LEFT JOIN`` that reads ``target`` through ``rel`` as ``alias``: by key, or, into a
+    target with a validity window, by entity or as of the source row's date."""
+    if not target.model.validity_window:
+        return _link_join(dialect, source_alias, alias, rel, target, columns)
+    link = source.model.links.get(rel.name)
+    reach = link.reach() if link is not None else None
+    if reach == fs.BY_ENTITY:
+        return _entity_join(dialect, source_alias, alias, rel, target, columns)
+    if reach == fs.AS_OF:
+        return _as_of_join(dialect, source_alias, alias, rel, source, target, columns)
+    raise _Refused(
+        f"{rel.name} goes to {target.label}, which declares a validity window, and reads it "
+        "neither by entity nor as of a date"
+    )
+
+
+def _entity_join(
+    dialect: str,
+    source_alias: str,
+    alias: str,
+    rel: Any,
+    target: Expose,
+    columns: Sequence[str],
+) -> Callable[[TableSql], str]:
+    """A ``LEFT JOIN`` to one row per entity of a versioned ``target``: its distinct key and
+    stable columns, kept where the key occurs once, so an entity whose versions disagree on a
+    column reads as NULL (RFC-versioned-relationships §2.1)."""
+    unstable = [c for c in columns if not target.model.reads_by_entity(c)]
+    if unstable:
+        raise _Refused(
+            f"{', '.join(unstable)} is not stable per entity of {target.label}, so {rel.name} "
+            "cannot read it by entity"
+        )
+    q = _quoter(dialect)
+    on = _key_on(q, source_alias, alias, rel)
+    selected, partition, names = _join_parts(q, rel, target, columns)
+    matches, entities = names.fresh("fluid_matches"), names.fresh("fluid_entities")
+
+    def join(table_sql: TableSql) -> str:
+        return (
+            f"LEFT JOIN (SELECT {selected}, COUNT(*) OVER (PARTITION BY {partition}) "
+            f"AS {q(matches)} FROM (SELECT DISTINCT {selected} "
+            f"FROM {table_sql(target.expose_id)}) AS {q(entities)}) AS {q(alias)} "
+            f"ON {on} AND {q(alias)}.{q(matches)} = 1"
+        )
+
+    return join
+
+
+#: The FLUID SQL/1 kinds an ``asOf`` column and a validity window's bounds take.
+_WINDOW_KINDS = frozenset({DATE, TIMESTAMP, TIMESTAMPTZ})
+
+
+def _kind(expose: Expose, column: Optional[str]) -> Optional[str]:
+    found = expose.model.columns.get(column) if isinstance(column, str) else None
+    return found.type.type.kind if found is not None and found.type is not None else None
+
+
+def _as_of_join(
+    dialect: str,
+    source_alias: str,
+    alias: str,
+    rel: Any,
+    source: Expose,
+    target: Expose,
+    columns: Sequence[str],
+) -> Callable[[TableSql], str]:
+    """A ``LEFT JOIN`` to the version of the entity valid on the source row's ``asOf`` date
+    (RFC-versioned-relationships §2.2), at most one per row: the version that starts last on
+    or before the date, where no other version of the entity starts on its start."""
+    q = _quoter(dialect)
+    window = target.window
+    if window is None:
+        raise _Refused(f"{target.label} declares no well-formed validity window")
+    start, end, date = nfc(window.start_column), nfc(window.end_column), rel.as_of
+    kind = _kind(source, date)
+    if kind not in _WINDOW_KINDS or {_kind(target, start), _kind(target, end)} != {kind}:
+        raise _Refused(
+            f"{rel.name}'s asOf column {date!r} and the window of {target.label} "
+            f"({start}, {end}) are not date or timestamp columns of one type"
+        )
+    if window.chain == "dayBefore" and kind != DATE:
+        raise _Refused("chain: dayBefore takes date columns only")
+    a, s = q(alias), q(source_alias)
+    open_end: Optional[str] = None
+    if window.open_end is None:
+        pass
+    elif kind == DATE and _is_date_text(window.open_end):
+        open_end = f"DATE {fs.sql_literal(dialect, window.open_end)}"
+    else:
+        raise _Refused(
+            f"the open end {window.open_end!r} of {target.label} is not a date literal, and "
+            "FLUID SQL/1 writes no other literal of the window's type"
+        )
+    on = _key_on(q, source_alias, alias, rel)
+    selected, partition, names = _join_parts(q, rel, target, columns, (start, end))
+    matches, following = names.fresh("fluid_matches"), names.fresh("fluid_next_start")
+    next_start, starts = fs.as_of_columns(q(start), partition)
+    versions = fs.as_of_nonempty(q(start), q(end), open_end, window.closed)
+    valid = fs.as_of_condition(
+        date=f"{s}.{q(date)}",
+        start=f"{a}.{q(start)}",
+        end=f"{a}.{q(end)}",
+        following=f"{a}.{q(following)}",
+        matches=f"{a}.{q(matches)}",
+        open_end=open_end,
+        closed=window.closed,
+    )
+
+    def join(table_sql: TableSql) -> str:
+        return (
+            f"LEFT JOIN (SELECT {selected}, {next_start} AS {q(following)}, "
+            f"{starts} AS {q(matches)} FROM {table_sql(target.expose_id)} "
+            f"WHERE {versions}) AS {a} ON {on} AND {valid}"
         )
 
     return join
@@ -913,7 +1074,7 @@ class _RowQuery:
             self.compiler.same_dialect(self.dialect, target, f"through {relationship}")
             needed = list(rel.to_columns) + [c for c in columns if c not in rel.to_columns]
             joins.append(
-                _link_join(self.dialect, "t", self.alias(relationship), rel, target, needed)
+                _join(self.dialect, "t", self.alias(relationship), rel, self.expose, target, needed)
             )
         return _counts(self.dialect, self.expose.expose_id, joins, covered, violated)
 

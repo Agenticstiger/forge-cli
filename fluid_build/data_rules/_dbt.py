@@ -248,8 +248,9 @@ def placeholder_where(column: str, values: List[str], prefixes: List[str]) -> Op
     adapter forge writes no SQL for keeps every row (no exemption, never a looser test)."""
     if not values and not prefixes:
         return None
+    from fluid_build.forge_datamodel.semantics_builder import nfc
+
     from ._compile import placeholder_sql
-    from ._model import nfc
 
     # Contract texts are compared in NFC (RFC 2.3), as the compiled placeholder rule reads them.
     column = nfc(column)

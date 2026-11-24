@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from typing import Dict, FrozenSet, Optional, Tuple
 
 from fluid_build.util.column_type import split_type_params
 
@@ -169,13 +169,34 @@ class Column:
         )
 
 
+#: How a path reads a target with a validity window (RFC-versioned-relationships §2):
+#: by entity, a column every version of the entity agrees on, or as of the row's date.
+BY_ENTITY, AS_OF = "entity", "as-of"
+
+
 @dataclass
 class Link:
-    """A relationship of a model: ``target`` is ``None`` when its target is missing."""
+    """A relationship of a model: ``target`` is ``None`` when its target is missing.
+
+    ``to_columns`` are the target's key columns the relationship names and ``as_of`` the
+    column of the declaring row whose date picks the target's version (``asOf``)."""
 
     name: str
     target: Optional["Model"]
     target_name: str = ""
+    to_columns: Tuple[str, ...] = ()
+    as_of: Optional[str] = None
+
+    def reach(self) -> Optional[str]:
+        """How the link reads a target that declares a validity window: :data:`AS_OF`,
+        :data:`BY_ENTITY` (its ``to_columns`` are the target's natural key), or ``None`` when
+        it reaches no entity (no path reads such a target through it)."""
+        target = self.target
+        if target is None or not target.validity_window or not target.natural_key:
+            return None
+        if self.to_columns != target.natural_key:
+            return None
+        return AS_OF if self.as_of else BY_ENTITY
 
 
 @dataclass
@@ -185,6 +206,15 @@ class Model:
     name: str
     columns: Dict[str, Column] = field(default_factory=dict)
     links: Dict[str, Link] = field(default_factory=dict)
-    #: The expose declares a validity window (a slowly changing dimension): no path,
-    #: summary or shared attribute reaches it through a relationship in v1 (§2.2).
+    #: The expose declares a validity window (a slowly changing dimension): a path reaches
+    #: it only through a link that reaches an entity (§2.2, RFC-versioned-relationships §2).
     validity_window: bool = False
+    #: The natural key of a well-formed window, ``()`` without one.
+    natural_key: Tuple[str, ...] = ()
+    #: The columns every version of an entity agrees on: the ``to`` of a dependency whose
+    #: ``from`` is the natural key. A link that reaches an entity reads them, and the key.
+    stable_columns: FrozenSet[str] = frozenset()
+
+    def reads_by_entity(self, column: str) -> bool:
+        """Whether a path reads ``column`` of this versioned model by entity."""
+        return column in self.natural_key or column in self.stable_columns

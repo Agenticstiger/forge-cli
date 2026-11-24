@@ -7,24 +7,23 @@ Each holds the expose's raw blocks (for paths and pointers) and its
 :class:`~fluid_build.fluid_sql.Model`: the top-level columns of
 ``contract.schema`` with their FLUID SQL/1 types, enums and placeholders, and
 the relationships of ``semantics.relationships`` resolved to their targets.
+A model whose semantics declare a well-formed validity window also carries its
+natural key and the columns stable per entity (the ``to`` of a dependency whose
+``from`` is that key), and each link its ``toColumns`` and ``asOf``, so a path
+through a link that reaches an entity reads as RFC-versioned-relationships §2 says.
 Reads a contract of any shape without raising: an entry the schema refuses is
 left out, so the lint still reports on the rest.
 """
 
 from __future__ import annotations
 
-import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Set, Tuple
 
 from fluid_build import fluid_sql as fs
+from fluid_build.forge_datamodel.semantics_builder import VersionWindow, version_window
+from fluid_build.forge_datamodel.semantics_builder import nfc as nfc  # explicit re-export
 from fluid_build.util.column_type import read_enum_list
-
-
-def nfc(value: Any) -> Any:
-    """``value`` NFC-normalized when it is a string: the contract's own texts (names,
-    enum values, placeholders) are compared in NFC, as FLUID SQL/1 texts are (RFC 2.3)."""
-    return unicodedata.normalize("NFC", value) if isinstance(value, str) else value
 
 
 def as_list(value: Any) -> List[Any]:
@@ -44,6 +43,8 @@ class Relationship:
     to_columns: Tuple[str, ...]
     shared_columns: Tuple[Any, ...]
     raw: Mapping[str, Any]
+    #: The column whose date picks the target's version (``asOf``), or ``None``.
+    as_of: Optional[str] = None
 
 
 @dataclass
@@ -54,6 +55,8 @@ class Expose:
     model: fs.Model
     columns: Dict[str, Tuple[int, Mapping[str, Any]]] = field(default_factory=dict)
     relationships: Dict[str, Relationship] = field(default_factory=dict)
+    #: The well-formed validity window of the expose's semantics, with its conventions.
+    window: Optional[VersionWindow] = None
 
     @property
     def label(self) -> str:
@@ -112,6 +115,52 @@ def declares_validity_window(expose: Mapping[str, Any]) -> bool:
     return False
 
 
+def stable_columns(expose: Mapping[str, Any], key: Tuple[str, ...]) -> FrozenSet[str]:
+    """The columns a dependency of ``expose`` makes stable per entity: its ``to`` where its
+    ``from`` is exactly ``key``, the natural key (RFC-versioned-relationships §2.1)."""
+    stable: Set[str] = set()
+    for inv in as_list(as_dict(expose.get("contract")).get("invariants")):
+        dep = as_dict(as_dict(inv).get("dependency"))
+        sides = [
+            [nfc(c) for c in as_list(dep.get(side)) if isinstance(c, str)]
+            for side in ("from", "to")
+        ]
+        if sides[0] and sorted(sides[0]) == sorted(key):
+            stable.update(sides[1])
+    return frozenset(stable - set(key))
+
+
+def _window(expose: Expose) -> None:
+    """Attach the expose's well-formed window, its natural key and its stable columns."""
+    window = version_window(as_dict(expose.raw.get("semantics")))
+    if window is None:
+        return
+    expose.window = window
+    key = nfc(window.key)
+    if key in expose.columns:
+        expose.model.natural_key = (key,)
+        expose.model.stable_columns = stable_columns(expose.raw, (key,))
+
+
+def _relationship(position: int, name: str, rel: Mapping[str, Any]) -> Relationship:
+    """The :class:`Relationship` of one raw entry of ``semantics.relationships``, named
+    ``name``: its columns and its ``asOf`` in NFC, a column list without its non-strings."""
+
+    def names(key: str) -> Tuple[str, ...]:
+        return tuple(nfc(c) for c in as_list(rel.get(key)) if isinstance(c, str))
+
+    return Relationship(
+        index=position,
+        name=name,
+        to=rel.get("to") if isinstance(rel.get("to"), str) else "",
+        from_columns=names("fromColumns"),
+        to_columns=names("toColumns"),
+        shared_columns=tuple(nfc(c) for c in as_list(rel.get("sharedColumns"))),
+        raw=rel,
+        as_of=nfc(rel["asOf"]) if isinstance(rel.get("asOf"), str) else None,
+    )
+
+
 def build(contract: Mapping[str, Any]) -> List[Expose]:
     """Every expose of ``contract`` with an ``exposeId``, its model's links resolved."""
     exposes: List[Expose] = []
@@ -147,26 +196,19 @@ def build(contract: Mapping[str, Any]) -> List[Expose]:
             name = nfc(rel["name"])
             if name in expose.relationships:
                 continue
-            expose.relationships[name] = Relationship(
-                index=position,
-                name=name,
-                to=rel.get("to") if isinstance(rel.get("to"), str) else "",
-                from_columns=tuple(
-                    nfc(c) for c in as_list(rel.get("fromColumns")) if isinstance(c, str)
-                ),
-                to_columns=tuple(
-                    nfc(c) for c in as_list(rel.get("toColumns")) if isinstance(c, str)
-                ),
-                shared_columns=tuple(nfc(c) for c in as_list(rel.get("sharedColumns"))),
-                raw=rel,
-            )
+            expose.relationships[name] = _relationship(position, name, rel)
+        _window(expose)
         exposes.append(expose)
     by_id = {e.expose_id: e for e in exposes if e.expose_id}
     for expose in exposes:
         for rel in expose.relationships.values():
             target = by_id.get(rel.to)
             expose.model.links[rel.name] = fs.Link(
-                rel.name, target.model if target else None, target_name=rel.to
+                rel.name,
+                target.model if target else None,
+                target_name=rel.to,
+                to_columns=rel.to_columns,
+                as_of=rel.as_of,
             )
     return exposes
 

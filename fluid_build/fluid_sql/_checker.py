@@ -6,8 +6,11 @@
 Names (§2.2), types (§2.3) and static scales (§2.4) of ``RFC-data-rules.md``:
 
 - A bare name is a column of the model; ``rel.col`` is a column of the target of
-  the model's relationship ``rel``, never through a target that declares a
-  validity window. A column with no FLUID SQL/1 type cannot be named.
+  the model's relationship ``rel``. Through a target that declares a validity
+  window, only a relationship that reaches an entity reads: as of a date
+  (``asOf``) every column, by entity the natural key and the columns stable per
+  entity (RFC-versioned-relationships §2). A column with no FLUID SQL/1 type
+  cannot be named.
 - ``=``, ``<>``, ``IS [NOT] DISTINCT FROM`` and ``IN`` take one type;
   ``<``, ``<=``, ``>``, ``>=`` and ``BETWEEN`` take one orderable type;
   arithmetic takes numbers; the date differences take dates; the branches of
@@ -43,7 +46,20 @@ from fluid_build.util.column_type import write_enum_list
 from . import _nodes as n
 from ._canonical import canonical
 from ._errors import FluidSqlError
-from ._types import BOOL, DATE, NUMBER, ORDERABLE, STRING, Column, Model, SqlType, decimal_hint
+from ._types import (
+    AS_OF,
+    BOOL,
+    BY_ENTITY,
+    DATE,
+    NUMBER,
+    ORDERABLE,
+    STRING,
+    Column,
+    Link,
+    Model,
+    SqlType,
+    decimal_hint,
+)
 
 PREDICATE = "predicate"
 VALUE = "value"
@@ -175,6 +191,53 @@ def check_derive_fit(target: Column, value: SqlType, pos: Optional[int] = None) 
             )
 
 
+#: The two ways a column of a versioned table is read through a relationship, for messages.
+VERSIONED_REMEDY = (
+    "declare the column stable per entity (a dependency from the natural key to it), or name "
+    "an asOf column on the relationship"
+)
+
+
+def versioned_refusal(link: Link, column: str) -> Optional[str]:
+    """Why a path may not read ``column`` through ``link``, whose target declares a validity
+    window, or ``None`` when it may (RFC-versioned-relationships §2): every column through an
+    ``asOf`` link, and the natural key and the stable columns through a link whose
+    ``toColumns`` are the natural key. A column the target lacks is left to the
+    unknown-column check when the link reaches an entity."""
+    target = link.target
+    assert target is not None and target.validity_window
+    reach = link.reach()
+    if reach is not None and column not in target.columns:
+        return None
+    if reach == AS_OF or (reach == BY_ENTITY and target.reads_by_entity(column)):
+        return None
+    if reach == BY_ENTITY:
+        return (
+            f"{link.name} reads {target.name}, which declares a validity window, by entity, and "
+            f"{column} is not stable per entity, so its versions may disagree on it"
+        )
+    if not target.natural_key:
+        return (
+            f"{link.name} goes to {target.name}, which declares a validity window with no "
+            "natural entity a relationship can name (its window is not well formed, or its "
+            "natural entity names no column of contract.schema), so no relationship reaches "
+            "its entities"
+        )
+    return (
+        f"{link.name} goes to {target.name}, which declares a validity window, and its "
+        f"toColumns are not the natural entity ({', '.join(target.natural_key)}), so it reaches "
+        "no entity"
+    )
+
+
+def versioned_read(link: Link, column: str, pos: Optional[int] = None) -> None:
+    """Refuse reading ``column`` through ``link`` (reason ``validity-window``) where
+    :func:`versioned_refusal` gives a reason, naming both remedies."""
+    detail = versioned_refusal(link, column)
+    if detail is not None:
+        raise FluidSqlError("validity-window", f"{detail}: {VERSIONED_REMEDY}", pos)
+
+
 def _short(node: n.Node) -> str:
     text = canonical(node)
     return text if len(text) <= 60 else text[:57] + "..."
@@ -238,12 +301,7 @@ class _Checker:
                     node.pos,
                 )
             if link.target.validity_window:
-                raise FluidSqlError(
-                    "validity-window",
-                    f"{link.name} goes to {link.target.name}, which declares a validity window: "
-                    "FLUID SQL/1 v1 reads no slowly changing dimension through a relationship",
-                    node.pos,
-                )
+                versioned_read(link, node.name, node.pos)
             model = link.target
         column = model.columns.get(node.name)
         if column is None:

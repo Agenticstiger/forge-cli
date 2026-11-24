@@ -49,7 +49,7 @@ rendered once and its text reused, and a rendering longer than
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from fluid_build.providers._sql_safety import quote_identifier_for, quote_string_literal_for
 
@@ -103,6 +103,66 @@ def number_literal(dialect: str, text: str) -> str:
     if dialect == "bigquery" and "." in text:
         return f"BIGNUMERIC {sql_literal(dialect, text)}"
     return text
+
+
+def as_of_columns(start: str, partition: str) -> Tuple[str, str]:
+    """The two window columns an as-of join reads beside a versioned table's rows, as SQL:
+    the start of the entity's next version, and how many versions of the entity start on this
+    version's start. ``start`` and ``partition`` (the natural key) are quoted references."""
+    return (
+        f"LEAD({start}) OVER (PARTITION BY {partition} ORDER BY {start})",
+        f"COUNT(*) OVER (PARTITION BY {partition}, {start})",
+    )
+
+
+def fresh_name(base: str, taken: Set[str]) -> str:
+    """``base``, with ``_`` added until it differs, case folded, from every name in ``taken``
+    (BigQuery and Snowflake fold unquoted names, so ``n`` and ``N`` would collide there); the
+    name is then added to ``taken`` folded."""
+    name = base
+    while name.casefold() in taken:
+        name += "_"
+    taken.add(name.casefold())
+    return name
+
+
+def _is_open(end: str, open_end: Optional[str]) -> str:
+    return f"{end} IS NULL" if open_end is None else f"{end} = {open_end}"
+
+
+def as_of_nonempty(
+    start: str, end: str, open_end: Optional[str] = None, closed: bool = False
+) -> str:
+    """The ``WHERE`` of the versions an as-of join reads: those that can be valid on some date,
+    an open one (``end IS NULL``, or ``end = <open_end>``) or one whose interval is not empty
+    (``start < end``, or ``start <= end`` when ``closed``). A version that is never valid
+    would otherwise count as a version starting on its start, or as the next start, in
+    :func:`as_of_columns`, and hide the real version. Every argument is quoted SQL."""
+    return f"({_is_open(end, open_end)} OR {start} {'<=' if closed else '<'} {end})"
+
+
+def as_of_condition(
+    date: str,
+    start: str,
+    end: str,
+    following: str,
+    matches: str,
+    open_end: Optional[str] = None,
+    closed: bool = False,
+) -> str:
+    """The part of an as-of join's ``ON`` after the key equality (RFC-versioned-relationships
+    §2.2): the version is valid on ``date`` (``start <= date``, and the end not yet reached:
+    ``date < end``, or ``date <= end`` when ``closed``; an open version, ``end IS NULL`` or
+    ``end = <open_end>``, never ends), and it is the one version of the entity that starts last
+    on or before ``date`` where no other starts with it (``matches``, ``following`` from
+    :func:`as_of_columns`). So a row reaches at most one version, and on versions that never
+    overlap, the one valid on its date. Every argument is quoted SQL."""
+    is_open = _is_open(end, open_end)
+    return (
+        f"{matches} = 1 AND {start} <= {date} "
+        f"AND ({following} IS NULL OR {date} < {following}) "
+        f"AND ({is_open} OR {date} {'<=' if closed else '<'} {end})"
+    )
 
 
 def column_reader(dialect: str, alias: str = "t") -> ColumnSql:
