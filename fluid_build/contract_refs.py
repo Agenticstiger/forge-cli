@@ -11,9 +11,12 @@ whatever it names:
 1. **Read the target.** ``./part.yaml`` reads a file. Its root may be any
    JSON or YAML value (an object, a list, a scalar), and a file with a text
    suffix (:data:`TEXT_REF_SUFFIXES`: ``.sql``, ``.md`` and so on) is its
-   text, as a string, never parsed.
+   text, as a string, never parsed. A file with a suffix neither list knows
+   is read as JSON, or else a YAML object, with a warning that names it.
 2. **Apply the pointer.** ``./part.yaml#/rules`` selects inside the target.
-   A pointer cannot select inside a text file.
+   A pointer cannot select inside a text file. One without its leading ``/``
+   (``./part.yaml#rules``) is read as ``/rules`` and logs a deprecation
+   warning: RFC 6901 pointers start with ``/``, and a later release refuses it.
 3. **Merge the siblings.** Keys written next to ``$ref`` are merged over a
    copy of the target as a JSON Merge Patch (RFC 7386): objects merge key by
    key, any other value (a list included) replaces, ``null`` removes the key.
@@ -33,6 +36,14 @@ known at the merge, and is refused (:func:`pointer_merge_error`). Where no
 object stands, it replaces. After both passes no ``$ref`` is left: one that
 cannot be resolved is an error that says where it was written.
 
+A payload that carries ``$ref`` keys of its own (a JSON Schema or an OpenAPI
+document inside ``parameters`` or an extension) writes them ``$$ref``: a key
+that is ``$`` written two or more times, then ``ref``, is never resolved, and
+loses one ``$`` at the very end of the composition, after the check that no
+``$ref`` is left (:func:`unescape_ref_keys`). ``$$$ref`` reads as ``$$ref``, so
+any key is expressible. A composed contract written back out as contract input
+(``fluid bundle``) has every such key escaped again (:func:`escape_ref_keys`).
+
 The work is bounded as well as the result: every file is a regular file of
 at most 5 MiB, read with that bound
 (:func:`fluid_build.util.safe_yaml.read_bounded_file`) and parsed once per
@@ -50,10 +61,15 @@ dependency for it, so the resolver is this module.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import copy
 import functools
-import json
+import hashlib
+import logging
 import os
+import re
+import threading
 from pathlib import Path
 from typing import (
     Any,
@@ -61,6 +77,7 @@ from typing import (
     Dict,
     FrozenSet,
     Iterable,
+    Iterator,
     List,
     NamedTuple,
     Optional,
@@ -86,17 +103,23 @@ __all__ = [
     "ComposeTrace",
     "ContractOrigins",
     "Origin",
+    "DATA_REF_SUFFIXES",
     "RefBudget",
+    "escape_ref_keys",
     "find_ref_node",
+    "has_escaped_ref_key",
     "is_pointer_node",
     "is_ref_node",
     "merge_patch",
     "parse_ref",
     "pointer_merge_error",
+    "quiet_ref_warnings",
+    "ref_values",
     "replaces_pointer",
     "resolve_file_refs",
     "resolve_pointer",
     "resolve_pointer_refs",
+    "unescape_ref_keys",
 ]
 
 
@@ -108,11 +131,129 @@ Pointer = Tuple[Union[str, int], ...]
 MAX_REF_DEPTH = 20
 
 #: Suffixes a ``$ref`` reads as text. The value is the file's content as a
-#: string, never parsed: SQL and Markdown, and the other languages an
+#: string, never parsed: SQL and Markdown, the other languages an
 #: embedded-logic build's ``properties.sql`` may be written in (its
-#: ``language``: pyspark and python, scala, r). Any other suffix is parsed as
-#: JSON or YAML.
-TEXT_REF_SUFFIXES = frozenset({".sql", ".md", ".markdown", ".txt", ".py", ".scala", ".r"})
+#: ``language``: pyspark and python, scala, r), and the other text a contract
+#: keeps beside it: HiveQL, DDL, CQL, Jinja templates and shell. Any other
+#: suffix is parsed as JSON or YAML.
+TEXT_REF_SUFFIXES = frozenset(
+    {
+        ".sql",
+        ".md",
+        ".markdown",
+        ".txt",
+        ".py",
+        ".scala",
+        ".r",
+        ".hql",
+        ".ddl",
+        ".cql",
+        ".j2",
+        ".jinja",
+        ".sh",
+    }
+)
+
+#: Suffixes a ``$ref`` parses as JSON or YAML without a word: a JSON or YAML
+#: document's own, and ``.avsc`` (an Avro schema is JSON). A file with any
+#: other suffix, or none, is parsed too, as before, but logs
+#: ``ref_target_suffix_unknown``: text under a suffix this table lacks would
+#: otherwise become a mapping without anyone seeing it.
+DATA_REF_SUFFIXES = frozenset({".json", ".yaml", ".yml", ".avsc"})
+
+#: The composition logs under the loader's name: the resolver was split out
+#: of :mod:`fluid_build.loader`, and its warnings belong with the loader's.
+LOG = logging.getLogger("fluid.loader")
+
+#: The warnings this module logged in this process, each as its event and the
+#: value it is about (a ``$ref`` as written, a suffix), never the place it was
+#: met: a contract can write one ref in thousands of places, and a service
+#: composes each upload from a fresh temporary directory, so a key naming the
+#: place or the file would log the same warning once per place and per upload
+#: and grow without bound (``loader`` keys its ``FLUID_REF_ROOT`` registry on
+#: the value for the same reason). The value is kept as a digest, so a long
+#: ref costs no more than a short one, and the registry is emptied when it
+#: holds :data:`_MAX_NOTED_REF_WARNINGS` entries, so no input can grow it
+#: past that; a value then warns once more. Tests reset it with ``.clear()``.
+_NOTED_REF_WARNINGS: Set[Tuple[str, bytes]] = set()
+_NOTED_REF_WARNINGS_LOCK = threading.Lock()
+_MAX_NOTED_REF_WARNINGS = 1024
+
+
+class _QuietRefWarnings(NamedTuple):
+    """A :func:`quiet_ref_warnings` block: why its ref warnings are DEBUG lines, and
+    the values it has logged, so a ref written in many places is still one line."""
+
+    why: str
+    noted: Set[Tuple[str, bytes]]
+    lock: threading.Lock
+
+
+#: The :func:`quiet_ref_warnings` block running in this context, ``None`` outside
+#: one. A context variable, as ``loader._OVERLAY_WARNING_SINK`` is, so a
+#: composition in another thread or task, the user's own among them, still warns.
+_QUIET_REF_WARNINGS: contextvars.ContextVar[Optional[_QuietRefWarnings]] = contextvars.ContextVar(
+    "quiet_ref_warnings", default=None
+)
+
+
+@contextlib.contextmanager
+def quiet_ref_warnings(why: str) -> Iterator[None]:
+    """Compose another product's contract without its ref warnings reaching WARNING.
+
+    A reader that scans the workspace for a few values of every contract in it
+    (the composition rule's product index) composes contracts the run is not
+    about. Their ``ref_pointer_without_slash`` and ``ref_target_suffix_unknown``
+    are for whoever composes them for themselves: as WARNINGs they named other
+    products' files and refs to this run, and to another tenant where a service
+    hands its log back to its caller; and recorded in
+    :data:`_NOTED_REF_WARNINGS`, they were not said again to the contract's own
+    author. Inside the block each is a DEBUG line that says ``why``, once per
+    value, and the registry is left as it was.
+    """
+    token = _QUIET_REF_WARNINGS.set(_QuietRefWarnings(why, set(), threading.Lock()))
+    try:
+        yield
+    finally:
+        _QUIET_REF_WARNINGS.reset(token)
+
+
+def _first_time(event: str, value: str, quiet: Optional[_QuietRefWarnings] = None) -> bool:
+    """Record ``value`` for ``event`` in :data:`_NOTED_REF_WARNINGS`, or in ``quiet``'s
+    own record when a :func:`quiet_ref_warnings` block is running; ``True`` when that
+    record does not hold it yet: the first time, and once more after the record is
+    emptied at :data:`_MAX_NOTED_REF_WARNINGS` entries. Checked before the warning is
+    worded, so a value met again costs a digest, never a message."""
+    key = (event, hashlib.sha256(value.encode("utf-8", "surrogatepass")).digest())
+    noted, lock = (
+        (_NOTED_REF_WARNINGS, _NOTED_REF_WARNINGS_LOCK)
+        if quiet is None
+        else (quiet.noted, quiet.lock)
+    )
+    with lock:
+        if key in noted:
+            return False
+        if len(noted) >= _MAX_NOTED_REF_WARNINGS:
+            noted.clear()
+        noted.add(key)
+        return True
+
+
+def _log_ref_warning(
+    quiet: Optional[_QuietRefWarnings], text: str, once: str, extra: Dict[str, Any]
+) -> None:
+    """Log the ref warning ``text``: a WARNING ending in ``once``, which says how often
+    it is logged, or inside a :func:`quiet_ref_warnings` block a DEBUG line saying why."""
+    if quiet is None:
+        LOG.warning("%s %s", text, once, extra=extra)
+    else:
+        LOG.debug(
+            "%s A DEBUG line, not a WARNING: %s.",
+            text,
+            quiet.why,
+            extra={**extra, "quieted": quiet.why},
+        )
+
 
 #: Largest text file a ``$ref`` reads: the cap ``util.safe_yaml`` puts on a
 #: YAML document, which every other file the composition reads (the root
@@ -641,6 +782,8 @@ class _FileRefs:
         try:
             read_before = _file_key(target) in self.budget.targets
             value, is_text = _read_target(target, ref, pointer, where, self.budget.targets)
+            if pointer and not pointer.startswith("/"):
+                _note_pointer_without_slash(ref, pointer, loc, source)
             origins = self.origins
             self.trace.add_file(target)
             if origins is not None:
@@ -802,6 +945,44 @@ def _read_target(
     return value, False
 
 
+def _note_pointer_without_slash(
+    ref: str, pointer: str, loc: Pointer, source: Optional[Path]
+) -> None:
+    """WARN, once per ref as written, that a file ref's pointer lacks its leading ``/`` (N-24).
+
+    RFC 6901: a JSON pointer is ``""`` or starts with ``/``. A file ref's
+    pointer without one (``./x.yaml#foo``) has always named ``/foo`` and still
+    does, for the contracts written that way; it is deprecated, and a later
+    minor release will refuse it, as a same-document ``#foo`` is refused now.
+    The warning names the first place the ref was met (``loc`` in ``source``),
+    each value it quotes cut to an excerpt: a ref written in a thousand places
+    is one warning, whatever the size of its key or its path. The file is named
+    whole, its control characters spelled: a path is bounded, and its end is the
+    file's name. Inside a :func:`quiet_ref_warnings` block it is a DEBUG line.
+    """
+    event = "ref_pointer_without_slash"
+    quiet = _QUIET_REF_WARNINGS.get()
+    if not _first_time(event, ref, quiet):
+        return
+    # Imported here, as below: the composition is on the path ``fluid --help``
+    # imports, and only a warning needs it.
+    from fluid_build.util.excerpt import excerpt, spelled
+
+    fix = f"{parse_ref(ref)[0]}#/{pointer}"
+    site = ref_location(excerpt(format_pointer(loc)), None)
+    if source is not None:
+        site = f"{site} in {spelled(str(source))}"
+    _log_ref_warning(
+        quiet,
+        f"{event}: $ref '{excerpt(ref)}' {site} has a JSON pointer without a leading '/', "
+        f"which is deprecated: a later minor release will refuse it. Write "
+        f"'{excerpt(fix)}'. A JSON pointer is '' or starts with '/' (RFC 6901); until then "
+        f"this one is read as '/{excerpt(pointer)}'.",
+        "Logged once per ref, however many places write it.",
+        {"event": event, "ref": ref, "fix": fix},
+    )
+
+
 def _parse(target: Path, ref: str, where: str) -> Any:
     """:func:`_parse_target`, its failure a ref error that names the ref."""
     try:
@@ -846,33 +1027,74 @@ def _parse_target(path: Path) -> Any:
     rules or columns can live in a file of their own as a list; a file with
     another suffix keeps the old rule. An empty YAML file is ``{}``, as before.
     Whatever the suffix, the file is read with the cap of a YAML document
-    (:func:`fluid_build.util.safe_yaml.read_bounded_text`).
+    (:func:`fluid_build.util.safe_yaml.read_bounded_text`), and a key written
+    twice in one mapping is refused, as in every file the composition reads
+    (:class:`fluid_build.util.safe_yaml.DuplicateKeyError`).
     """
-    from fluid_build.util.safe_yaml import read_bounded_text
+    from fluid_build.util.safe_yaml import DuplicateKeyError, load_json_unique, read_bounded_text
 
     text = read_bounded_text(path)
     suffix = path.suffix.lower()
+    name = str(path)
     if suffix == ".json":
-        return json.loads(text)
+        return load_json_unique(text, name=name)
     if suffix in (".yaml", ".yml"):
-        return _yaml(text)
-    try:
-        return json.loads(text)
-    except ValueError:
-        pass
+        return _yaml(text, name)
     # Any other suffix (``.avsc``, none at all) parses as JSON, or else as a
     # YAML object, as before: a dotfile or a key file inside the root reads
     # as a YAML string, and a ref must not hand that out.
-    value = _yaml(text)
-    if not isinstance(value, dict):
-        raise ValueError(f"YAML root must be an object/dict: {path}")
+    try:
+        value = load_json_unique(text, name=name)
+        how = "JSON"
+    except DuplicateKeyError:
+        raise
+    except ValueError:
+        value = _yaml(text, name)
+        if not isinstance(value, dict):
+            raise ValueError(f"YAML root must be an object/dict: {path}")
+        how = "a YAML object"
+    if suffix not in DATA_REF_SUFFIXES:
+        _note_unknown_suffix(path, suffix, how)
     return value
 
 
-def _yaml(text: str) -> Any:
+def _note_unknown_suffix(path: Path, suffix: str, how: str) -> None:
+    """WARN, once per suffix, that ``path`` was parsed for want of a suffix that says
+    what it holds (SG-16): its text could be a mapping by accident.
+
+    Keyed on the suffix, not the file: a service composes each upload from a
+    fresh temporary directory, so a file's path would warn once per upload.
+    The warning names the first file met with that suffix, whole, its control
+    characters spelled. Inside a :func:`quiet_ref_warnings` block it is a DEBUG
+    line.
+    """
+    event = "ref_target_suffix_unknown"
+    quiet = _QUIET_REF_WARNINGS.get()
+    if not _first_time(event, suffix, quiet):
+        return
+    from fluid_build.util.excerpt import excerpt, spelled
+
+    has = f"the suffix '{excerpt(suffix)}'" if suffix else "no suffix"
+    _log_ref_warning(
+        quiet,
+        f"{event}: $ref target {spelled(str(path))} has {has}, which a $ref does not know, "
+        f"so it was read as {how}. A $ref parses {', '.join(sorted(DATA_REF_SUFFIXES))} as "
+        f"JSON or YAML and reads {', '.join(sorted(TEXT_REF_SUFFIXES))} as text; rename the "
+        f"file to the suffix that says which it is.",
+        "Logged once per suffix.",
+        {
+            "event": event,
+            "file": str(path),
+            "suffix": suffix,
+            "read_as": "json" if how == "JSON" else "yaml",
+        },
+    )
+
+
+def _yaml(text: str, name: str) -> Any:
     from fluid_build.util.safe_yaml import load_yaml_safe
 
-    value = load_yaml_safe(text)
+    value = load_yaml_safe(text, unique_keys=True, name=name)
     return {} if value is None else value
 
 
@@ -893,12 +1115,18 @@ def resolve_pointer_refs(
     are merged over its target as for a file ref. A document without a
     ``$ref`` is returned as it is.
 
+    This is the last step of every composition, so it also drops one ``$``
+    from every escaped key (:func:`unescape_ref_keys`): a payload's ``$$ref``
+    becomes its literal ``$ref``, after the check that no ``$ref`` is left, so
+    neither that check nor any pointer ever reads it as a reference. A
+    document with no such key is returned as it is.
+
     Raises:
         RefResolutionError: a pointer names nothing, is not a JSON pointer,
             names a place that contains it (a cycle), or a ``$ref`` is left.
     """
     if find_ref_node(document) is None:
-        return document
+        return unescape_ref_keys(document)
     pointers = _PointerRefs(document, trace, budget if budget is not None else RefBudget())
     try:
         resolved = pointers.resolve(document, (), ())
@@ -910,7 +1138,32 @@ def resolve_pointer_refs(
             f"a $ref is left at JSON pointer '{format_pointer(left)}' of the composed contract "
             f"after every ref was resolved"
         )
-    return resolved
+    return unescape_ref_keys(resolved)
+
+
+def ref_values(document: Any) -> Tuple[str, ...]:
+    """Every ``$ref`` value in ``document``, in document order, deduplicated.
+
+    Iterative, and each container is visited once, so neither depth nor a
+    YAML alias that makes the document self-referential can stop it short.
+    A value that is not a string resolves nothing and is left out.
+    """
+    out: Dict[str, None] = {}
+    seen: Set[int] = set()
+    stack: List[Any] = [document]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, (dict, list)) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str):
+                out.setdefault(ref)
+            stack.extend(reversed(list(node.values())))
+        else:
+            stack.extend(reversed(node))
+    return tuple(out)
 
 
 def find_ref_node(document: Any) -> Optional[Pointer]:
@@ -933,6 +1186,132 @@ def find_ref_node(document: Any) -> Optional[Pointer]:
         else:
             stack.extend(((*path, i), v) for i, v in reversed(list(enumerate(node))))
     return None
+
+
+# ── literal ``$ref`` keys: the ``$$ref`` escape ─────────────────────────
+
+#: A key that is ``$`` written once or more, then ``ref``: ``$ref`` itself, and
+#: the escapes of a literal key (``$$ref`` reads as ``$ref``, ``$$$ref`` as
+#: ``$$ref``), each one ``$`` longer than the key it reads as. No standard
+#: escapes a ``$ref`` key (JSON Pointer escapes only ``~`` and ``/`` in a
+#: pointer); a doubled sigil is the convention Docker Compose uses for ``$``.
+_REF_FAMILY = re.compile(r"\$+ref")
+
+
+def escape_ref_keys(document: Any) -> Any:
+    """``document`` written back out as contract input: one more ``$`` on every key of
+    the ``$ref`` family, so ``$ref`` becomes ``$$ref`` and ``$$ref`` becomes ``$$$ref``.
+
+    A composed contract holds no reference: a ``$ref`` key left in it is a
+    payload's own (:func:`unescape_ref_keys`). Written as it is, the next
+    composition would resolve it; escaped, that composition gives this
+    document back. ``fluid bundle`` writes its YAML, JSON and tgz output with
+    it. ``document`` is not modified; a document with no such key is
+    returned as it is.
+    """
+    return _shift_ref_keys(document, 1)
+
+
+def unescape_ref_keys(document: Any) -> Any:
+    """``document`` with one ``$`` dropped from every escaped ``$ref`` key: ``$$ref``
+    reads as ``$ref``, ``$$$ref`` as ``$$ref``.
+
+    ``$$ref`` is how a contract writes a literal ``$ref`` key, one a JSON
+    Schema or OpenAPI payload carries: never resolved, it is unescaped as the
+    last step of the composition (:func:`resolve_pointer_refs`), and by a
+    reader of a ``fluid bundle``, which wrote it escaped
+    (:func:`escape_ref_keys`). ``document`` is not modified; a document with no
+    such key is returned as it is.
+
+    Raises:
+        ValueError: an object holds a ``$ref`` beside its escape (``$ref`` and
+            ``$$ref``): both would read as the key ``$ref``. A composition
+            never gets here with a ``$ref`` left; a bundle written by hand can.
+    """
+    return _shift_ref_keys(document, -1)
+
+
+def has_escaped_ref_key(document: Any) -> bool:
+    """True when ``document`` holds a key :func:`unescape_ref_keys` would change.
+
+    For a reader that skips the composition of a document without a ``$ref``
+    (:func:`find_ref_node`): that document still differs from its composition
+    when it holds an escaped key.
+    """
+    return _holds_ref_key(document, 2)
+
+
+def _holds_ref_key(document: Any, dollars: int) -> bool:
+    """True when a key of ``document`` is ``$`` written at least ``dollars`` times, then
+    ``ref``. Iterative, each container visited once."""
+    seen: Set[int] = set()
+    stack: List[Any] = [document]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, (dict, list)) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, dict):
+            if any(_ref_key_dollars(key) >= dollars for key in node):
+                return True
+            stack.extend(node.values())
+        else:
+            stack.extend(node)
+    return False
+
+
+def _ref_key_dollars(key: Any) -> int:
+    """How many ``$`` the ``$ref``-family key ``key`` starts with; 0 for any other key."""
+    if isinstance(key, str) and _REF_FAMILY.fullmatch(key):
+        return len(key) - 3
+    return 0
+
+
+def _shift_ref_keys(document: Any, by: int) -> Any:
+    """``document`` rebuilt with ``by`` (``1`` or ``-1``) ``$`` on every ``$ref``-family
+    key that can take it: every one to escape, those with two ``$`` or more to
+    unescape. Returned as it is when no key changes.
+
+    Iterative, so depth costs no stack; a container met twice (a YAML alias)
+    becomes one copy met twice, and one inside itself stays inside its copy.
+    """
+    lowest = 1 if by > 0 else 2
+    if not _holds_ref_key(document, lowest):
+        return document
+
+    def shifted(key: Any) -> Any:
+        if _ref_key_dollars(key) < lowest:
+            return key
+        return key[1:] if by < 0 else f"${key}"
+
+    copies: Dict[int, Any] = {}
+    todo: List[Tuple[Any, Any, Pointer]] = []
+
+    def copy_of(node: Any, at: Pointer) -> Any:
+        if not isinstance(node, (dict, list)):
+            return node
+        if id(node) not in copies:
+            copies[id(node)] = {} if isinstance(node, dict) else []
+            todo.append((node, copies[id(node)], at))
+        return copies[id(node)]
+
+    result = copy_of(document, ())
+    while todo:
+        source, target, at = todo.pop()
+        if isinstance(source, list):
+            target.extend(copy_of(item, (*at, i)) for i, item in enumerate(source))
+            continue
+        for key, value in source.items():
+            new = shifted(key)
+            if new in target:
+                both = sorted(k for k in source if shifted(k) == new)
+                raise ValueError(
+                    f"the object at JSON pointer '{format_pointer(at)}' holds both "
+                    f"{both[0]!r} and {both[1]!r}, which both read as the key {new!r}: a key "
+                    f"written '$$ref' is the literal key '$ref', never a reference"
+                )
+            target[new] = copy_of(value, (*at, key))
+    return result
 
 
 class _PointerRefs:
@@ -1154,6 +1533,10 @@ class ContractOrigins:
         ``None`` when nothing recorded covers ``path``. With ``definition``,
         the file that wrote the object at ``path`` is preferred over one that
         only merged keys into it: the place to add a key that is missing.
+
+        A ``$ref``-family key of ``path`` is looked up as written, one ``$``
+        longer: the composition unescapes ``$$ref`` to ``$ref`` after it
+        records where each part came from (:func:`unescape_ref_keys`).
         """
         found = self.locate_span(path, definition=definition)
         return None if found is None else (found[0], found[1])
@@ -1166,7 +1549,7 @@ class ContractOrigins:
         The column is where the key (or list item) starts on its line; both are
         ``None`` when the file gives no line.
         """
-        key = tuple(path)
+        key = tuple(f"${token}" if _ref_key_dollars(token) else token for token in path)
         if definition:
             return self._locate(key, 0, True) or self._locate(key, 0, False)
         return self._locate(key, 0, False)
@@ -1252,8 +1635,8 @@ class ContractOrigins:
 
     def _child(self, node: Any, token: Union[str, int]) -> Optional[Tuple[int, int, Any]]:
         """:func:`_node_child`, with a mapping's keys indexed once, so n errors in
-        one mapping cost n lookups, not n scans of it. A key written twice is
-        found where it was written last, the value the loader keeps."""
+        one mapping cost n lookups, not n scans of it. No key is written twice in
+        a file the composition read: it refuses one that is."""
         import yaml
 
         if not isinstance(node, yaml.MappingNode):

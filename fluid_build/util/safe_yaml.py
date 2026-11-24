@@ -42,14 +42,26 @@ process: LLM output, network/catalog responses, and bundle contents. A file
 that holds it is read with :func:`read_bounded_file`, which refuses anything
 but a regular file and never reads past the cap, so the cap bounds the read
 too, not only the parse.
+
+``unique_keys=True`` refuses a key written twice in one mapping, which PyYAML
+otherwise keeps silently, the last value winning (yaml/pyyaml#165); YAML 1.2
+requires unique keys. The contract composition reads every file with it, and
+:func:`load_json_unique` is its JSON twin. The keys a mapping writes are
+checked before a ``<<`` merge expands, so a merged key the mapping writes
+again is an override, not a duplicate: the rule of yamllint's
+``key-duplicates`` and of the PyYAML #165 loaders (torchgen, salt). A ``<<``
+is a merge directive, not a data key: a mapping may write it more than once,
+every merge applies as PyYAML applies it and nothing is dropped, as yamllint
+allows by default.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
 
@@ -74,7 +86,90 @@ MAX_YAML_ALIAS_EXPANSION_CHARS = MAX_YAML_BYTES
 
 
 class UnsafeYamlError(ValueError):
-    """Raised when untrusted YAML exceeds the size or alias-expansion caps."""
+    """Raised when untrusted YAML is refused: over the size or alias-expansion
+    caps, or, read with ``unique_keys``, a key written twice (:class:`DuplicateKeyError`)."""
+
+
+class DuplicateKeyError(UnsafeYamlError):
+    """A key written twice in one YAML mapping or JSON object, read with ``unique_keys``.
+
+    ``key`` is the key as written the second time, ``name`` how the message
+    names the document (a file path), ``line`` the 1-based line of the second
+    key, and ``first`` the key as it was first written with its line: the same
+    spelling, or another one of the same key (YAML 1.1 ``on`` and ``yes`` are
+    both ``True``). JSON has neither line: ``json.loads`` reports no position
+    for a name, and the message says so. Each key is quoted as an excerpt
+    (:func:`fluid_build.util.excerpt.excerpt`): a key may be megabytes long.
+    Pickled or copied, the error keeps every field.
+    """
+
+    def __init__(
+        self,
+        key: Any,
+        *,
+        name: Optional[str] = None,
+        line: Optional[int] = None,
+        first: Optional[Tuple[Any, int]] = None,
+        json_object: bool = False,
+    ) -> None:
+        self.key = key
+        self.name = name
+        self.line = line
+        self.first = first
+        self.json_object = json_object
+        super().__init__(_duplicate_key_message(key, name, line, first, json_object))
+
+    def __reduce__(self) -> Tuple[Any, ...]:
+        # Rebuilt from its fields: the default rebuilds an exception from ``args``,
+        # here the message, which this ``__init__`` would read as the key.
+        fields = (type(self), self.key, self.name, self.line, self.first, self.json_object)
+        return _rebuild_duplicate_key_error, fields, self.__dict__
+
+
+def _rebuild_duplicate_key_error(
+    cls: Any,
+    key: Any,
+    name: Optional[str],
+    line: Optional[int],
+    first: Optional[Tuple[Any, int]],
+    json_object: bool,
+) -> DuplicateKeyError:
+    """A :class:`DuplicateKeyError` unpickled or copied (its ``__reduce__``)."""
+    error: DuplicateKeyError = cls(key, name=name, line=line, first=first, json_object=json_object)
+    return error
+
+
+def _duplicate_key_message(
+    key: Any,
+    name: Optional[str],
+    line: Optional[int],
+    first: Optional[Tuple[Any, int]],
+    json_object: bool,
+) -> str:
+    """What :class:`DuplicateKeyError` says: the place, the key, and the first one."""
+    # Imported here: this module is on the path ``fluid --help`` imports.
+    from fluid_build.util.excerpt import excerpt
+
+    if name is not None:
+        place = f"{name}:{line}: " if line is not None else f"{name}: "
+    else:
+        place = f"line {line}: " if line is not None else ""
+    if json_object:
+        why = (
+            "RFC 8259 section 4: the names within an object SHOULD be unique, and what a "
+            "reader does with a repeated one is unpredictable, so it is refused; JSON "
+            "parsing gives no line"
+        )
+    elif first is None:
+        why = "YAML 1.2 requires unique keys"
+    elif first[0] == key:
+        why = f"first at line {first[1]}; YAML 1.2 requires unique keys"
+    else:
+        why = (
+            f"the same key as {excerpt(repr(first[0]))} at line {first[1]}; YAML 1.2 "
+            f"requires unique keys"
+        )
+    return f"{place}duplicate key {excerpt(repr(key))} ({why}); remove one of them"
 
 
 def load_yaml_safe(
@@ -86,6 +181,8 @@ def load_yaml_safe(
     max_alias_expansion_chars: int = MAX_YAML_ALIAS_EXPANSION_CHARS,
     max_depth: int = MAX_YAML_DEPTH,
     loader: type = yaml.SafeLoader,
+    unique_keys: bool = False,
+    name: Optional[str] = None,
 ) -> Any:
     """``yaml.safe_load`` with billion-laughs (anchor-expansion) protection.
 
@@ -100,19 +197,119 @@ def load_yaml_safe(
     composed and refused if its aliases add more than ``max_alias_expansion``
     nodes or ``max_alias_expansion_chars`` scalar characters, or grow it past
     the ratio cap.
+
+    ``unique_keys`` refuses a key written twice in one mapping with
+    :class:`DuplicateKeyError`, whose message names the document by ``name``,
+    the line, the key and the line of its first occurrence. Off by default:
+    only the contract composition opts in, and every other reader keeps
+    PyYAML's last-wins. It builds with its own loader, so it cannot be
+    combined with ``loader``.
     """
+    if unique_keys and loader is not yaml.SafeLoader:
+        raise ValueError("unique_keys builds with its own loader: pass it or loader, not both")
     if source is None:
         return None
     source = _bounded_text(source, max_bytes)
-    if _count_aliases(source, max_aliases, max_depth) == 0:
+    aliases = _count_aliases(source, max_aliases, max_depth)
+    if aliases == 0 and not unique_keys:
         instance = loader(source)  # what ``yaml.load(source, loader)`` does
         try:
             return instance.get_single_data()
         finally:
             instance.dispose()
     return _checked_document(
-        source, True, max_alias_expansion, max_alias_expansion_chars, construct=True, loader=loader
+        source,
+        bool(aliases),
+        max_alias_expansion,
+        max_alias_expansion_chars,
+        construct=True,
+        loader=loader,
+        unique_keys=unique_keys,
+        name=name,
     )
+
+
+def load_json_unique(text: str, *, name: Optional[str] = None) -> Any:
+    """``json.loads(text)``, refusing a name written twice in one object.
+
+    ``json.loads`` keeps the last value, as PyYAML does. RFC 8259 section 4
+    says the names within an object SHOULD be unique and that what a reader
+    does with a repeated one is unpredictable, so it is refused. The twin of
+    ``load_yaml_safe(..., unique_keys=True)``: :class:`DuplicateKeyError` names
+    the document by ``name`` and the key; ``json.loads`` gives no line.
+    """
+
+    def unique(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise DuplicateKeyError(key, name=name, json_object=True)
+            result[key] = value
+        return result
+
+    return json.loads(text, object_pairs_hook=unique)
+
+
+#: The tag PyYAML gives a ``<<`` merge key: a directive, never a data key.
+_MERGE_TAG = "tag:yaml.org,2002:merge"
+
+#: The tag PyYAML gives a plain ``=`` (YAML 1.1's "value" key type). SafeLoader
+#: has no constructor for it: ``flatten_mapping`` makes such a key the string
+#: ``"="`` before the mapping is constructed, so ``{=: 1}`` loads as ``{"=": 1}``.
+_VALUE_TAG = "tag:yaml.org,2002:value"
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """A ``SafeLoader`` that refuses a key written twice in one mapping (yaml/pyyaml#165).
+
+    The check sits in ``flatten_mapping``, before the ``<<`` merges of a
+    mapping are expanded into it: a merged key the mapping writes again is an
+    override, not a duplicate. Not in ``construct_mapping``, as the usual
+    PyYAML #165 loaders put it: a mapping that is itself merged into another is
+    flattened there first, in place, so a mapping defined inline as a merge
+    source (``<<: &mid {<<: *base, a: 2}``) and used again (``*mid``) would hold
+    a merged ``a`` beside its own by the time it is constructed. Each mapping is
+    checked once, the first time it is flattened, which is before any change.
+    Keys are compared as they are constructed (YAML 1.1 ``on`` and ``yes`` are
+    the one key ``True``, and a plain ``=`` is the string ``"="`` it becomes in
+    ``flatten_mapping``), so every key a dict would silently drop is refused.
+    A ``<<`` is not compared: it is a merge directive, not a data key, so a
+    mapping may write several and each merge applies, later ones winning a key
+    two of them bring, as PyYAML merges them.
+    """
+
+    def __init__(self, stream: Any, name: Optional[str] = None) -> None:
+        super().__init__(stream)
+        self._document_name = name
+        self._keys_checked: Set[int] = set()
+
+    def flatten_mapping(self, node: yaml.MappingNode) -> None:
+        if id(node) not in self._keys_checked:
+            self._keys_checked.add(id(node))
+            self._refuse_duplicate_keys(node)
+        super().flatten_mapping(node)
+
+    def _refuse_duplicate_keys(self, node: yaml.MappingNode) -> None:
+        seen: Dict[Any, Tuple[Any, int]] = {}
+        for key_node, _ in node.value:
+            if key_node.tag == _MERGE_TAG:
+                continue  # a merge directive: every one of them applies
+            if not isinstance(key_node, yaml.ScalarNode):
+                continue  # a collection as a key: construction refuses it as unhashable
+            if key_node.tag == _VALUE_TAG:
+                # Checked before ``flatten_mapping`` retags it: the key it becomes.
+                key: Any = key_node.value
+            else:
+                key = self.construct_object(key_node)
+            try:
+                first = seen.get(key)
+            except TypeError:
+                continue  # unhashable: construction refuses it
+            written = key_node.value
+            line = key_node.start_mark.line + 1
+            if first is not None:
+                raise DuplicateKeyError(written, name=self._document_name, line=line, first=first)
+            seen[key] = (written, line)
 
 
 def compose_yaml_safe(source: Any) -> Any:
@@ -139,11 +336,15 @@ def _checked_document(
     *,
     construct: bool = False,
     loader: type = yaml.SafeLoader,
+    unique_keys: bool = False,
+    name: Optional[str] = None,
 ) -> Any:
     """The single document in ``source``: its node, or its value when
     ``construct``; ``None`` when empty. A document with aliases is refused
-    when they expand it past the caps (:func:`_check_alias_expansion`)."""
-    instance = loader(source)
+    when they expand it past the caps (:func:`_check_alias_expansion`), and,
+    with ``unique_keys``, one with a key written twice in a mapping
+    (:class:`_UniqueKeySafeLoader`, which is then the loader)."""
+    instance = _UniqueKeySafeLoader(source, name) if unique_keys else loader(source)
     try:
         node = instance.get_single_node()
         if node is None:

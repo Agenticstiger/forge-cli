@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`$$ref` writes a literal `$ref` key.** A JSON Schema or OpenAPI payload inside `parameters` or
+  an extension that carries `$ref` keys of its own has failed composition since 0.25.0, because
+  every `$ref` key is read as a contract reference (0.25.0's note said to keep such a payload as a
+  string). Write those keys `$$ref`: the composed contract has `$ref` there, never resolved, and
+  `$$$ref` gives `$$ref`. `fluid bundle` writes the escape back, so a bundle stays a contract input;
+  the library and the exports see `$ref`.
+- **`.hql`, `.ddl`, `.cql`, `.j2`, `.jinja` and `.sh` are text suffixes:** a `$ref` to such a file
+  becomes its text. Before, `q.hql` holding `SELECT 'a: b' FROM t` was parsed as YAML and became
+  the mapping `{"SELECT 'a": "b' FROM t"}`.
+
+### Changed
+
+- **A key written twice in a contract file is refused.** In the root contract, an overlay, a
+  `$ref` fragment, a bundle's contract and `fluid.workspace.yaml`, a duplicate key kept its last
+  value without a word, and two `$ref` keys in one mapping read only the second file. It now fails,
+  naming the file and the key, and in YAML the line of each copy:
+  `contract.fluid.yaml:26: duplicate key 'name' (first at line 3; YAML 1.2 requires unique keys)`.
+  A JSON file gets no line: Python's JSON parser reports none.
+  A key a `<<` merge brings in and the mapping writes itself is not a duplicate, and `<<` may be
+  written more than once. In `fluid.workspace.yaml` a duplicate key makes its `ref_root` ignored
+  (with a warning naming the key) and its `expected-environments` an error.
+- **The composition rule says when it cannot check an upstream.** `fluid validate` checks a
+  `consumes[]` entry against the productType of the workspace contract that defines it. A contract
+  there that cannot be read, one that writes a key twice among them, was skipped with a DEBUG line,
+  so a consumer of it passed unchecked without a word. When a consumed product is defined by no
+  contract the scan read and a file could not be read, one `composition_upstream_unchecked`
+  WARNING now names the product and counts the files; the DEBUG line (`fluid --log-level DEBUG`)
+  still names each file and why.
+- **`fluid bundle --format json` refuses keys JSON cannot keep apart.** YAML keeps `200` and
+  `"200"` (`true` and `"true"`, `null` and `"null"`) as two keys; JSON writes both as the one name
+  `"200"`, so the output held it twice: a JSON reader kept one value, and fluid refused the file.
+  The command now fails before it writes, naming the keys and the JSON pointer of their mapping;
+  `--format yaml` keeps both.
+- **A `$ref` to a file whose suffix fluid does not know logs a warning**
+  (`ref_target_suffix_unknown`), once per suffix, naming the first such file, how it was read and
+  which suffixes are known. The file is read as before. `.json`, `.yaml`, `.yml` and `.avsc` never
+  warn. A contract read only for another product's sake (by `fluid validate`'s composition rule, or
+  by the replay walk after a cursor rewind) logs it at DEBUG: the warning is that contract's
+  author's, who still gets it when composing it.
+
+### Deprecated
+
+- **A file ref's pointer without a leading `/`** (`./x.yaml#key`) resolves as before but logs a
+  warning (`ref_pointer_without_slash`) naming the fix, `./x.yaml#/key`, once per ref however many
+  places write it; a later minor release will refuse it, as RFC 6901 has a JSON pointer empty or
+  starting with `/`. The same-document `#key` stays refused. As with `ref_target_suffix_unknown`, a
+  contract read only for another product's sake logs it at DEBUG.
+
+### Upgrade notes
+
+- **Duplicate keys now fail.** A contract, overlay, fragment or workspace file that writes a key
+  twice (often a copy-paste slip, which kept the second value) fails every command that composes
+  the contract, `validate`, `plan`, `apply`, `bundle` and `generate artifacts` among them, naming
+  the place: remove the copy you do not want. A few commands that only summarise or hash the file
+  as written, `fluid status` and `fluid contract digest` among them, read it as before.
+- **A payload with `$ref` keys of its own:** write them `$$ref` instead of keeping the payload as a
+  string.
+
 ## [0.39.0] — 2026-11-23
 
 ### Added

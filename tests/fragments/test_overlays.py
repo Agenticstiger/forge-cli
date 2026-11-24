@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pytest
 import yaml
 
-from fluid_build import loader
+from fluid_build import contract_refs, loader
 from fluid_build.forge.core.bundle import read_bundle_source
 from fluid_build.loader import RefConfinementError, RefResolutionError
 
@@ -50,6 +50,7 @@ def _clear_loader_registries() -> None:
     for name, value in vars(loader).items():
         if name.startswith("_NOTED_") and isinstance(value, set):
             value.clear()
+    contract_refs._NOTED_REF_WARNINGS.clear()  # the resolver's registry: not a loader attribute
 
 
 @pytest.fixture(scope="module", autouse=True)

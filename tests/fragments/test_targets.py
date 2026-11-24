@@ -17,15 +17,17 @@ marked ``xfail(strict=True)`` asserts the spec and names the bug it shows.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tarfile
+import threading
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pytest
 import yaml
 
-from fluid_build import loader
+from fluid_build import contract_refs, loader
 from fluid_build.contract_refs import resolve_file_refs
 from fluid_build.loader import RefResolutionError
 
@@ -36,6 +38,7 @@ def _clear_warn_once_registries() -> None:
     for name, value in vars(loader).items():
         if name.startswith("_NOTED_") and isinstance(value, set):
             value.clear()
+    contract_refs._NOTED_REF_WARNINGS.clear()  # the resolver's registry: not a loader attribute
 
 
 @pytest.fixture(autouse=True)
@@ -439,23 +442,166 @@ def test_a15_siblings_on_a_text_target_are_refused_naming_them(tmp_path: Path) -
     assert "./t.sql" in message
 
 
-def test_a16_unlisted_text_like_suffixes_are_parsed_as_yaml_sg16(tmp_path: Path) -> None:
-    """SG-16 characterization. Only the seven listed suffixes are text; any other name is
-    JSON or YAML. A ``.hql`` file whose text has a ``': '`` therefore becomes a one-key
-    mapping, silently; text that is not a YAML object is refused with the file named."""
-    _write(tmp_path / "q.hql", "SELECT 'a: b' FROM t")
-    assert _rfr({"x": {"$ref": "./q.hql"}}, tmp_path) == {"x": {"SELECT 'a": "b' FROM t"}}
+#: The ``event`` of the warning a target with a suffix the composition does not know logs.
+_UNKNOWN_SUFFIX = "ref_target_suffix_unknown"
 
-    for name, text in [("notes", "Hello\nworld # tail"), ("run.sh", "echo hi\n")]:
-        _write(tmp_path / name, text)
+
+def _suffix_warnings(caplog: pytest.LogCaptureFixture) -> List[logging.LogRecord]:
+    return [r for r in caplog.records if getattr(r, "event", None) == _UNKNOWN_SUFFIX]
+
+
+@pytest.mark.parametrize("suffix", [".hql", ".ddl", ".cql", ".j2", ".jinja", ".sh", ".HQL"])
+def test_a16_query_template_and_script_suffixes_are_text_sg16(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, suffix: str
+) -> None:
+    """SG-16, decided: HiveQL, DDL, CQL, Jinja and shell files are text, never parsed. Read as
+    YAML, ``SELECT 'a: b'`` was a one-key mapping and ``{{ a }}: b`` a parse error."""
+    text = "SELECT 'a: b' FROM t\n{{ a }}: b\n"
+    _write(tmp_path / f"q{suffix}", text)
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        assert _rfr({"x": {"$ref": f"./q{suffix}"}}, tmp_path) == {"x": text}
+
+    assert _suffix_warnings(caplog) == []
+
+
+@pytest.mark.parametrize(
+    ("name", "text", "how", "expected"),
+    [
+        ("settings.conf", "retries: 3\n", "a YAML object", {"retries": 3}),
+        ("data.jsonl", '{"retries": 3}', "JSON", {"retries": 3}),
+        ("values", "retries: 3\n", "a YAML object", {"retries": 3}),
+    ],
+    ids=["yaml", "json", "no-suffix"],
+)
+def test_a16_an_unknown_suffix_is_still_parsed_and_warns_once_per_suffix_sg16(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    name: str,
+    text: str,
+    how: str,
+    expected: Any,
+) -> None:
+    """SG-16, decided: a suffix the composition knows neither as data nor as text is parsed
+    as before (JSON, or else a YAML object), and one WARNING names the first file, how it
+    was read and the suffixes a ref accepts. A file named twice, composed again, another
+    file with that suffix, or the same file in a fresh directory, warns no more."""
+    target = _write(tmp_path / name, text)
+    _write(tmp_path / f"other-{name}", text)
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        doc = {"x": {"$ref": f"./{name}"}, "y": {"$ref": f"./{name}"}}
+        assert _rfr(doc, tmp_path) == {"x": expected, "y": expected}
+        assert _rfr(doc, tmp_path) == {"x": expected, "y": expected}
+        assert _rfr({"z": {"$ref": f"./other-{name}"}}, tmp_path) == {"z": expected}
+        for upload in range(5):
+            root = _write(tmp_path / f"upload-{upload}" / name, text).parent
+            assert _rfr({"x": {"$ref": f"./{name}"}}, root) == {"x": expected}
+
+    (warning,) = _suffix_warnings(caplog)
+    message = warning.getMessage()
+    assert warning.levelno == logging.WARNING
+    assert f"$ref target {target.resolve()} has " in message
+    assert f"so it was read as {how}." in message
+    assert ".json, .yaml, .yml" in message and ".hql" in message and ".sql" in message
+    assert "Logged once per suffix." in message
+    assert warning.file == str(target.resolve())  # type: ignore[attr-defined]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a Windows file name cannot hold a control character")
+def test_a16_the_unknown_suffix_warning_spells_control_characters_of_the_file_name_sg16(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Security: a file name is input too. Logged as written, its line feed began a forged
+    log line and its escape sequences reached the terminal; each is spelled as ``repr``
+    writes it, in the path and in the suffix."""
+    name = "t\n2026-10-29 INFO fluid: ok\x1b]0;owned\x07.c\x1bnf"
+    try:
+        _write(tmp_path / name, "retries: 3\n")
+    except OSError:
+        pytest.skip("this file system refuses a control character in a file name")
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        assert _rfr({"x": {"$ref": f"./{name}"}}, tmp_path) == {"x": {"retries": 3}}
+
+    (warning,) = _suffix_warnings(caplog)
+    message = warning.getMessage()
+    assert message.isprintable(), message
+    assert (
+        "/t\\n2026-10-29 INFO fluid: ok\\x1b]0;owned\\x07.c\\x1bnf has the suffix '.c\\x1bnf'"
+    ) in message
+
+
+def test_a16_the_unknown_suffix_warning_names_the_whole_path_of_a_deep_file_sg16(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A path is bounded by the file system, and its end is the file's name: quoted as an
+    excerpt, its first 200 characters, the path of a file deep enough lost the name, the one
+    thing the warning asks to change."""
+    deep = "d" * 200
+    target = _write(tmp_path / deep / "settings.conf", "retries: 3\n")
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        got = _rfr({"x": {"$ref": f"./{deep}/settings.conf"}}, tmp_path)
+
+    assert got == {"x": {"retries": 3}}
+    (warning,) = _suffix_warnings(caplog)
+    assert f"$ref target {target.resolve()} has the suffix '.conf'" in warning.getMessage()
+
+
+def test_a16_a_quiet_block_quiets_only_the_composition_in_its_own_context_sg16(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``quiet_ref_warnings`` holds for its own thread or task, as the loader's overlay
+    sink does: while one thread reads another product's contract in a block, an ordinary
+    composition in another thread, the user's own, still warns. A module-wide flag would
+    have quieted it. Deterministic: the user's composition runs while the other thread is
+    held inside its block."""
+    theirs = _write(tmp_path / "theirs" / "x.conf", "a: 1\n").parent
+    mine = _write(tmp_path / "mine" / "y.ini", "a: 1\n").parent
+    inside, release = threading.Event(), threading.Event()
+    errors: List[BaseException] = []
+
+    def read_theirs() -> None:
+        try:
+            with contract_refs.quiet_ref_warnings("a test reads it for another product"):
+                inside.set()
+                assert release.wait(timeout=60)
+                assert _rfr({"x": {"$ref": "./x.conf"}}, theirs) == {"x": {"a": 1}}
+        except BaseException as exc:  # noqa: BLE001 - reported below, in the test's thread
+            errors.append(exc)
+            inside.set()
+
+    with caplog.at_level(logging.DEBUG, logger="fluid.loader"):
+        other = threading.Thread(target=read_theirs)
+        other.start()
+        assert inside.wait(timeout=60)
+        assert _rfr({"y": {"$ref": "./y.ini"}}, mine) == {"y": {"a": 1}}
+        release.set()
+        other.join(timeout=60)
+
+    assert errors == []
+    levels = {Path(r.file).name: r.levelno for r in _suffix_warnings(caplog)}  # type: ignore[attr-defined]
+    assert levels == {"y.ini": logging.WARNING, "x.conf": logging.DEBUG}
+
+
+def test_a16_a_known_suffix_and_a_file_that_fails_to_parse_do_not_warn_sg16(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``.avsc`` is a JSON data suffix (an Avro schema): parsed without a word. A file whose
+    text is not a YAML object is refused as before, the error naming it."""
+    _write(tmp_path / "s.avsc", '{"type": "record", "name": "A", "fields": []}')
+    _write(tmp_path / "v.yml", "k: v\n")
+    _write(tmp_path / "notes", "Hello\nworld # tail")
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        got = _rfr({"a": {"$ref": "./s.avsc"}, "b": {"$ref": "./v.yml"}}, tmp_path)
         with pytest.raises(RefResolutionError, match="must be an object") as info:
-            _rfr({"x": {"$ref": f"./{name}"}}, tmp_path)
-        assert f"./{name}" in str(info.value)
+            _rfr({"x": {"$ref": "./notes"}}, tmp_path)
 
-    _write(tmp_path / "t.j2", "{{ a }}: b\n")
-    with pytest.raises(RefResolutionError, match="Failed to parse") as info:
-        _rfr({"x": {"$ref": "./t.j2"}}, tmp_path)
-    assert "t.j2" in str(info.value)
+    assert got["a"]["name"] == "A" and got["b"] == {"k": "v"}
+    assert "./notes" in str(info.value)
+    assert _suffix_warnings(caplog) == []
 
 
 @pytest.mark.parametrize(
@@ -760,22 +906,28 @@ def test_a24_a_directory_is_never_a_target(tmp_path: Path, ref: str) -> None:
     assert f"'{ref}'" in str(info.value)
 
 
-def test_a25_the_suffix_is_the_last_one_and_a_dotfile_has_none_sg16(tmp_path: Path) -> None:
-    """SG-16 characterization: ``x.sql.yaml`` is YAML, ``x.yaml.sql`` is text, and a file named
-    exactly ``.sql`` has no suffix, so it is parsed (``Path('.sql').suffix == ''``)."""
+def test_a25_the_suffix_is_the_last_one_and_a_dotfile_has_none_sg16(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """SG-16: ``x.sql.yaml`` is YAML, ``x.yaml.sql`` is text, and a file named exactly
+    ``.sql`` has no suffix (``Path('.sql').suffix == ''``), so it is parsed, with the
+    warning every file without a suffix the composition knows gets."""
     for name in ("x.sql.yaml", "x.yaml.sql", ".sql"):
         _write(tmp_path / name, "k: v\n")
 
-    got = _rfr(
-        {
-            "a": {"$ref": "./x.sql.yaml"},
-            "b": {"$ref": "./x.yaml.sql"},
-            "c": {"$ref": "./.sql"},
-        },
-        tmp_path,
-    )
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        got = _rfr(
+            {
+                "a": {"$ref": "./x.sql.yaml"},
+                "b": {"$ref": "./x.yaml.sql"},
+                "c": {"$ref": "./.sql"},
+            },
+            tmp_path,
+        )
 
     assert got == {"a": {"k": "v"}, "b": "k: v\n", "c": {"k": "v"}}
+    (warning,) = _suffix_warnings(caplog)
+    assert f"{(tmp_path / '.sql').resolve()} has no suffix" in warning.getMessage()
 
 
 def test_a26_a_symlink_is_read_by_the_suffix_of_its_target_sg16(tmp_path: Path) -> None:

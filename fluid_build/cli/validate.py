@@ -644,6 +644,8 @@ def _run_fragment_validation(
                 )
             },
         )
+    # Checked as it composes: a payload's ``$$ref`` key is its literal ``$ref``.
+    document = contract_refs.unescape_ref_keys(document)
 
     # The fragment is composed before a schema version is asked for: what is wrong with the file
     # itself (it cannot be read, its refs escape the root) is reported first.
