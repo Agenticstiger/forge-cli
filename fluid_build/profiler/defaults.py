@@ -106,6 +106,11 @@ _LADDER_YEARS = range(1900, 2101)
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
+#: The first and the last whole second of the years 1 to 9999 in UTC, since the epoch: the
+#: instants a bin edge can be spelled at.
+_FIRST_SECOND = (datetime(1, 1, 1, tzinfo=timezone.utc) - _EPOCH).days * 86_400
+_LAST_SECOND = (datetime(9999, 12, 31, tzinfo=timezone.utc) - _EPOCH).days * 86_400 + 86_399
+
 #: The widths, in seconds, a declared timestamp range is cut by: seconds, minutes, hours,
 #: days, weeks, then years by 1, 2, 5, 10 ... (:func:`timestamp_bins`).
 _YEAR_SECONDS = 365 * 86_400
@@ -328,7 +333,12 @@ def _read_instant(text: str) -> Optional[int]:
         delta = moment - _EPOCH
     except (ValueError, OverflowError):
         return None
-    return delta.days * 86_400 + delta.seconds
+    seconds = delta.days * 86_400 + delta.seconds
+    # An offset can carry a bound past the years 1 to 9999 in UTC, where no edge is spelled:
+    # "9999-12-31T23:59:59-14:00" is 10000-01-01 in UTC.
+    if not _FIRST_SECOND <= seconds <= _LAST_SECOND:
+        return None
+    return seconds
 
 
 def declared_instants(column: Mapping[str, Any]) -> Optional[Tuple[int, int]]:

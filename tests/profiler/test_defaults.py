@@ -335,6 +335,26 @@ def test_an_edge_is_spelled_with_a_four_digit_year_on_every_platform(text):
 
 
 @pytest.mark.parametrize(
+    "text, seconds",
+    [
+        ("0001-01-01", -62_135_596_800),
+        ("9999-12-31T23:59:59Z", 253_402_300_799),
+        ("9999-12-31T09:59:59-14:00", 253_402_300_799),
+        ("9999-12-31T23:59:59-14:00", None),  # 10000-01-01 in UTC
+        ("0001-01-01T00:00:00+14:00", None),  # before the year 1 in UTC
+    ],
+)
+def test_an_instant_an_offset_carries_past_the_years_1_to_9999_is_not_read(text, seconds):
+    assert defaults._read_instant(text) == seconds
+
+
+def test_a_range_an_offset_carries_past_the_years_keeps_the_ladder():
+    constraint = "between '2024-01-01' and '9999-12-31T23:59:59-14:00'"
+    column = {"validationRules": [{"type": "range", "constraint": constraint}]}
+    assert defaults.declared_instants(column) is None
+
+
+@pytest.mark.parametrize(
     "constraint",
     [
         ">= '2024-01-01'",  # one side
