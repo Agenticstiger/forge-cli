@@ -49,6 +49,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variable `sink.catalogAuth` names is the one the operator pairs with the hosts it reaches. The
   literal-credential warning no longer suggests `env:<VARIABLE>`. A Debezium Server
   `server.sink.config` that is not a mapping is refused. Behaviour change.
+- **A contract no longer chooses the Snowflake login, or the stored credentials an account
+  gets.** A `user` or `authenticator` set in a Snowflake binding's `location` or `properties`
+  (the contract's or an expose's), a Snowflake build's `resources` or a build binding is refused
+  with `ContractLoginSettingError`, which names the path: set `SNOWFLAKE_USER` and
+  `SNOWFLAKE_AUTHENTICATOR` in the operator's environment. A contract may still name the
+  `account`. While the account in effect is one the contract named and the operator did not (not
+  an explicit argument, not their own `SNOWFLAKE_ACCOUNT` or `SF_ACCOUNT`), credentials come from
+  the environment and the project's files only, never from the keyring or
+  `FLUID_CREDENTIAL_STORE`, unless the operator pairs the variable with the account's host
+  (`SNOWFLAKE_PASSWORD@<account>.snowflakecomputing.com` in
+  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`), and forge does not sign in to it through this
+  machine's browser session (`externalbrowser` or `oauth_authorization_code`, as a
+  fallback or from the environment) unless
+  `SNOWFLAKE_AUTHENTICATOR` is paired with it the same way. This covers `fluid verify`,
+  `fluid apply` builds,
+  `fluid test` and the dlt, Airbyte and Meltano Snowflake destinations. Behaviour change.
 
 ## [0.39.0] — 2026-11-23
 

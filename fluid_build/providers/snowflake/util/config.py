@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
+from fluid_build.credentials.resolver import refuse_contract_login_settings
 from fluid_build.observability.secret_redactor import register_secrets
 
 logger = logging.getLogger(__name__)
@@ -204,6 +205,42 @@ def _iter_snowflake_bindings(
     return bindings
 
 
+def _refuse_contract_login_settings(
+    contract: Mapping[str, Any],
+    binding_candidates: list[tuple[str, Dict[str, Any], Dict[str, Any]]],
+) -> None:
+    """Refuse a contract that sets the Snowflake ``user`` or ``authenticator``.
+
+    Wherever it is written: the ``location`` or ``properties`` of a Snowflake
+    binding (the contract's own or an expose's), or the resources (or binding)
+    of a build that runs on Snowflake. Both settings come from the operator's
+    environment (``SNOWFLAKE_USER``, ``SNOWFLAKE_AUTHENTICATOR``) only.
+    Raises ``ContractLoginSettingError`` (``credentials.resolver``), which names the path
+    and no value.
+    """
+    for binding_path, binding, location in binding_candidates:
+        refuse_contract_login_settings(location, f"{binding_path}.location")
+        refuse_contract_login_settings(binding.get("properties"), f"{binding_path}.properties")
+
+    for index, build in enumerate(contract.get("builds", []) or []):
+        if not isinstance(build, Mapping):
+            continue
+        execution = build.get("execution", {})
+        runtime = execution.get("runtime", {}) if isinstance(execution, Mapping) else {}
+        if isinstance(runtime, Mapping) and runtime.get("platform") == "snowflake":
+            refuse_contract_login_settings(
+                runtime.get("resources"), f"builds[{index}].execution.runtime.resources"
+            )
+        binding = build.get("binding")
+        if isinstance(binding, Mapping) and binding.get("platform") == "snowflake":
+            refuse_contract_login_settings(
+                binding.get("location"), f"builds[{index}].binding.location"
+            )
+            refuse_contract_login_settings(
+                binding.get("properties"), f"builds[{index}].binding.properties"
+            )
+
+
 def _extract_contract_settings(
     contract: Optional[Mapping[str, Any]],
 ) -> tuple[Dict[str, Any], Dict[str, str]]:
@@ -214,6 +251,7 @@ def _extract_contract_settings(
     sources: Dict[str, str] = {}
 
     binding_candidates = _iter_snowflake_bindings(contract)
+    _refuse_contract_login_settings(contract, binding_candidates)
 
     def _pick(key: str, *candidates: tuple[Any, str]) -> None:
         value, source = _first_present(list(candidates))
@@ -255,6 +293,7 @@ def _resolve_with_adapter(
     *,
     project_root: Path,
     environment: Optional[str],
+    pin_to_project: bool = False,
 ) -> tuple[Any, Optional[str]]:
     try:
         from fluid_build.credentials import CredentialConfig, get_snowflake_adapter
@@ -262,7 +301,9 @@ def _resolve_with_adapter(
         adapter = get_snowflake_adapter(
             CredentialConfig(project_root=project_root, environment=environment or "dev")
         )
-        value = adapter.get_credential(key, required=False, cli_value=cli_value)
+        value = adapter.get_credential(
+            key, required=False, cli_value=cli_value, pin_to_project=pin_to_project
+        )
         if _is_present(value):
             source = "explicit_or_contract" if _is_present(cli_value) else "credential_resolver"
             return value, source
@@ -273,6 +314,78 @@ def _resolve_with_adapter(
         # adapter errors can echo credential values.
         logger.debug("Snowflake credential adapter unavailable")
         return None, None
+
+
+def _operator_accounts() -> set[str]:
+    """The accounts the operator named in their own environment, lower case.
+
+    ``SNOWFLAKE_ACCOUNT`` and ``SF_ACCOUNT``, unless the value in effect came
+    from the project's dotenv files: that is the project's choice, not theirs.
+    """
+    from fluid_build.credentials.dotenv_store import project_value_in_effect
+
+    found: set[str] = set()
+    for name in ("SNOWFLAKE_ACCOUNT", "SF_ACCOUNT"):
+        raw = os.environ.get(name)
+        if not raw or not raw.strip() or project_value_in_effect(name):
+            continue
+        try:
+            account = _normalize_account_identifier(raw)
+        except ValueError:
+            continue
+        if account:
+            found.add(account.lower())
+    return found
+
+
+def _contract_account_unchosen(account: Any) -> bool:
+    """Whether the operator did not choose ``account``, which the contract named.
+
+    Compared as the connector reads it: a YAML number (``account: 12345``) is its
+    text, as the resolved account is. A value that is no account identifier is
+    not one the operator chose; the resolution refuses it afterwards.
+    """
+    try:
+        normalized = _normalize_account_identifier(account)
+    except ValueError:
+        return True
+    return str(normalized or "").lower() not in _operator_accounts()
+
+
+def _credential_paired(env_names: list[str], account: Optional[str]) -> bool:
+    """Whether the operator paired one of ``env_names`` with ``account``'s host.
+
+    Paired in ``FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`` as ``NAME@<host>`` (or
+    unrestricted, as a bare name or ``NAME@*``): the same entry that lets a
+    secret reference send that variable to the host. Loopback is no exception:
+    a Snowflake account is never this machine.
+    """
+    from fluid_build.secrets.policy import variable_allowed
+
+    # The host the connector reaches: the account identifier as it normalizes it,
+    # so a contract that wrote the full hostname matches the operator's entry.
+    try:
+        normalized = _normalize_account_identifier(account)
+    except ValueError:
+        return False
+    if not normalized or "{{" in normalized:
+        return False
+    host = f"{normalized.lower()}.snowflakecomputing.com"
+    return any(variable_allowed(name, host, loopback_exempt=False) for name in env_names)
+
+
+def _pinned_to_project(
+    pin_to_project: bool,
+    explicit_values: Mapping[str, Any],
+    contract_values: Mapping[str, Any],
+) -> bool:
+    """Whether the account in effect is the contract's and the operator did not choose it."""
+    if pin_to_project:
+        return True
+    if _is_present(_normalize_value("account", explicit_values.get("account"))):
+        return False
+    contract_account = _normalize_value("account", contract_values.get("account"))
+    return _is_present(contract_account) and _contract_account_unchosen(contract_account)
 
 
 def resolve_snowflake_settings(
@@ -293,6 +406,7 @@ def resolve_snowflake_settings(
     token_file_path: Optional[str] = None,
     project_root: Optional[Path] = None,
     environment: Optional[str] = None,
+    pin_to_project: bool = False,
 ) -> Dict[str, Any]:
     """
     Resolve Snowflake connection settings with one consistent precedence order.
@@ -302,6 +416,18 @@ def resolve_snowflake_settings(
     2. Contract binding / runtime values
     3. Credential adapter and environment variables
     4. Safe defaults (warehouse/schema only)
+
+    A contract may name the ``account`` but not the ``user`` or ``authenticator``
+    (``ContractLoginSettingError``). While the account in effect is the
+    contract's and the operator did not choose it (it is not an explicit
+    argument and not the account in their own ``SNOWFLAKE_ACCOUNT``), each
+    credential is read from the environment and the project's files only: not
+    from the keyring or a secret store the operator keeps, unless the operator
+    paired that variable with the account's host (``NAME@<account>.snowflakecomputing.com``
+    in ``FLUID_ACQUISITION_SECRET_REF_ALLOWLIST``). ``pin_to_project`` applies
+    that rule when the caller already holds an account the contract named: it
+    got it from a resolution of the contract and passes it on as an argument.
+    The result's ``_pinned_to_project`` says whether the rule applied.
     """
 
     project_root = project_root or Path.cwd()
@@ -345,6 +471,8 @@ def resolve_snowflake_settings(
     resolved: Dict[str, Any] = {}
     sources: Dict[str, str] = {}
 
+    pinned = _pinned_to_project(pin_to_project, explicit_values, contract_values)
+
     for key in explicit_values:
         explicit = _normalize_value(key, explicit_values.get(key))
         contract_value = _normalize_value(key, contract_values.get(key))
@@ -374,6 +502,8 @@ def resolve_snowflake_settings(
             None,
             project_root=project_root,
             environment=environment,
+            pin_to_project=pinned
+            and not _credential_paired(env_fallbacks.get(key, []), resolved.get("account")),
         )
         adapter_value = _normalize_value(key, adapter_value)
         if _is_present(adapter_value):
@@ -405,6 +535,7 @@ def resolve_snowflake_settings(
     # into logs or auth reports. The raw secret values are still carried
     # through `resolved` for downstream connection building.
     resolved["_sources"] = {k: v for k, v in sources.items() if k not in SECRET_KEYS}
+    resolved["_pinned_to_project"] = pinned
     return resolved
 
 
@@ -467,6 +598,23 @@ def _workload_identity_params(resolved: Mapping[str, Any]) -> Dict[str, Any]:
     return params
 
 
+#: The authenticators that sign in through this machine's browser session: the SAML
+#: flow and the OAuth authorization-code flow, both opened at the account's own URL.
+_BROWSER_AUTHENTICATORS = frozenset({"externalbrowser", "oauth_authorization_code"})
+
+
+def _browser_sign_in_refusal(account: Any) -> str:
+    return (
+        f"The Snowflake account {account} comes from the contract, and you have not chosen "
+        "it (SNOWFLAKE_ACCOUNT) or paired it, so forge does not sign in to it through this "
+        "machine's browser session. Set a credential for it in the environment "
+        "(SNOWFLAKE_PRIVATE_KEY_PATH, SNOWFLAKE_OAUTH_TOKEN or SNOWFLAKE_PASSWORD), set "
+        "SNOWFLAKE_ACCOUNT to it, or pair it: "
+        f"SNOWFLAKE_AUTHENTICATOR@{account}.snowflakecomputing.com in "
+        "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST."
+    )
+
+
 def get_connection_params(
     account: Optional[str] = None,
     warehouse: Optional[str] = None,
@@ -490,7 +638,9 @@ def get_connection_params(
         database: Optional database name
         schema: Schema name (default: PUBLIC)
         user: Optional username (resolved via credential chain if not provided)
-        **kwargs: Additional parameters and credential overrides
+        **kwargs: Additional parameters and credential overrides; ``pin_to_project``
+            is what :func:`resolve_snowflake_settings` takes (set it when ``account``
+            is one a contract named)
 
     Returns:
         Connection parameters dict for snowflake-connector-python
@@ -512,6 +662,7 @@ def get_connection_params(
         token_file_path=kwargs.get("token_file_path"),
         project_root=kwargs.get("project_root"),
         environment=kwargs.get("environment"),
+        pin_to_project=bool(kwargs.get("pin_to_project")),
     )
 
     if not resolved.get("account"):
@@ -539,6 +690,15 @@ def get_connection_params(
     if resolved.get("role"):
         params["role"] = resolved["role"]
 
+    # An account the contract named and the operator neither chose nor paired
+    # gets no sign-in through this machine's browser session, which would follow
+    # that account to an identity provider of its choosing: the credential
+    # adapter never does it for a project's endpoint either. Pairing
+    # SNOWFLAKE_AUTHENTICATOR with the account's host allows it.
+    no_browser_sign_in = bool(resolved.get("_pinned_to_project")) and not _credential_paired(
+        ["SNOWFLAKE_AUTHENTICATOR", "SF_AUTHENTICATOR"], resolved.get("account")
+    )
+
     # Authentication preference (highest to lowest trust for automation):
     #   0. Workload identity federation (an explicit authenticator, so it
     #      outranks anything else the environment holds)
@@ -557,6 +717,11 @@ def get_connection_params(
         params["oauth_token"] = resolved["oauth_token"]
         params["authenticator"] = "oauth"
     elif resolved.get("authenticator"):
+        if (
+            no_browser_sign_in
+            and str(resolved["authenticator"]).strip().lower() in _BROWSER_AUTHENTICATORS
+        ):
+            raise ValueError(_browser_sign_in_refusal(resolved["account"]))
         params["authenticator"] = resolved["authenticator"]
         if resolved.get("password"):
             params["password"] = resolved["password"]
@@ -571,6 +736,8 @@ def get_connection_params(
         # No explicit credential material — only acceptable when a human is
         # at the terminal to complete the SSO browser flow. In CI or any
         # non-TTY context this should fail fast rather than hang.
+        if no_browser_sign_in:
+            raise ValueError(_browser_sign_in_refusal(resolved["account"]))
         if not os.isatty(0):
             raise ValueError(
                 "No Snowflake credentials found and stdin is not a TTY. "

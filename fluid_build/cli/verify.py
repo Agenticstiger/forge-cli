@@ -803,8 +803,13 @@ def verify_snowflake_table(
     private_key_path: Optional[str] = None,
     private_key_passphrase: Optional[str] = None,
     oauth_token: Optional[str] = None,
+    pin_to_project: bool = False,
 ) -> Dict[str, Any]:
     """Verify a Snowflake table's shape and constraints.
+
+    ``pin_to_project`` is set when ``account`` is one the contract named and the
+    operator did not choose: a credential not passed in is then read from the
+    environment and the project's files only (``resolve_snowflake_settings``).
 
     All SQL identifiers are validated via ``validate_ident`` before any
     statement is issued, so a malicious database/schema/table value (for
@@ -835,6 +840,7 @@ def verify_snowflake_table(
             private_key_path=private_key_path,
             private_key_passphrase=private_key_passphrase,
             oauth_token=oauth_token,
+            pin_to_project=pin_to_project,
         )
 
         with SnowflakeConnection(**params) as conn:
@@ -1806,6 +1812,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 private_key_path=snowflake_settings.get("private_key_path"),
                 private_key_passphrase=snowflake_settings.get("private_key_passphrase"),
                 oauth_token=snowflake_settings.get("oauth_token"),
+                pin_to_project=bool(snowflake_settings.get("_pinned_to_project")),
             )
             results[expose_name] = result
         elif gcp_kind == _GCP_NO_VERIFIER:
