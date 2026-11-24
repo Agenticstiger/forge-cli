@@ -876,9 +876,9 @@ class _FluxStatsBackend:
                     ),
                     rank_correlations=tuple(
                         RequestRankCorrelation(each.definition, tuple(each.columns))
-                        for each in table.rank_correlations
+                        for each in _asked(table, "rank_correlations")
                     ),
-                    clique_columns=tuple(table.clique_columns),
+                    clique_columns=tuple(_asked(table, "clique_columns")),
                 )
                 for table in asked.tables
             ),
@@ -887,9 +887,10 @@ class _FluxStatsBackend:
                     parent=RequestEnd(link.parent.table, tuple(link.parent.columns)),
                     child=RequestEnd(link.child.table, tuple(link.child.columns)),
                     statistics=tuple(link.statistics),
-                    group_by=tuple(link.group_by),
+                    group_by=tuple(_asked(link, "group_by")),
                     linked=tuple(
-                        RequestLinked(each.column, each.parent_column) for each in link.linked
+                        RequestLinked(each.column, each.parent_column)
+                        for each in _asked(link, "linked")
                     ),
                 )
                 for link in asked.relationships
@@ -1208,7 +1209,10 @@ class _FluxStatsBackend:
         )
 
     def rank_group(self, identifier: str, pairs: Sequence[Tuple[int, int]]) -> Dict[str, Any]:
-        from flux_stats.rank_correlation import RANK_DEFINITIONS
+        try:
+            from flux_stats.rank_correlation import RANK_DEFINITIONS
+        except ImportError:
+            raise _needs_newer("a rank correlation") from None
 
         definition = RANK_DEFINITIONS[identifier]
         state = definition.measure("", list(pairs), self._parameters())
@@ -1216,21 +1220,30 @@ class _FluxStatsBackend:
         return spelled
 
     def rank_value(self, identifier: str, pairs: Sequence[Tuple[int, int]], floor: int) -> Fraction:
-        from flux_stats import rank_correlation as ranks
+        try:
+            ranks = import_module("flux_stats.rank_correlation")
+        except ImportError:
+            raise _needs_newer("a rank correlation") from None
 
         if identifier == ranks.KENDALL_TAU_ID:
-            return ranks.kendall_tau(ranks.kendall_s(pairs), len(pairs), floor)
+            return Fraction(ranks.kendall_tau(ranks.kendall_s(pairs), len(pairs), floor))
         if identifier == ranks.SPEARMAN_RHO_ID:
-            return ranks.spearman_rho(ranks.spearman_a4(pairs), len(pairs), floor)
+            return Fraction(ranks.spearman_rho(ranks.spearman_a4(pairs), len(pairs), floor))
         raise KeyError(identifier)
 
     def rank_sensitivity(self, identifier: str, floor: int) -> Fraction:
-        from flux_stats.rank_correlation import rank_sensitivity
+        try:
+            from flux_stats.rank_correlation import rank_sensitivity
+        except ImportError:
+            raise _needs_newer("a rank correlation") from None
 
         return Fraction(rank_sensitivity(identifier, floor))
 
     def follow_reach(self, unit: str, follows: Sequence[FollowEntry]) -> Mapping[str, int]:
-        from flux_stats.noise import reach_of, read_follows
+        try:
+            from flux_stats.noise import reach_of, read_follows
+        except ImportError:
+            raise _needs_newer("--follow") from None
 
         where = "follows"
         listed = [
@@ -1389,6 +1402,31 @@ def _unavailable(error: ImportError) -> StatisticsUnavailable:
         "fluid profile forms every statistic with flux-stats, the statistic registry "
         f"FLUX shares with its fidelity check, and flux-stats {state}. It needs "
         f"{FLUX_STATS_REQUIREMENT}; install it with: {FLUX_STATS_INSTALL_COMMAND}"
+    )
+
+
+def _asked(owner: Any, name: str) -> Tuple[Any, ...]:
+    """What a request reader holds under ``name``, or nothing.
+
+    The 1-2-0 asks (rank correlations, clique columns, grouping and linked statistics)
+    exist only on a reader from flux-stats 0.11; an earlier reader's objects lack them, and
+    a request it accepts holds none.
+    """
+    held = getattr(owner, name, None)
+    return () if held is None else tuple(held)
+
+
+def _needs_newer(feature: str) -> StatisticsUnavailable:
+    """The refusal for a profile feature that needs flux-stats 0.11 (profile format 1-4-0)."""
+    from importlib import metadata
+
+    try:
+        installed = f"flux-stats {metadata.version('flux-stats')}"
+    except metadata.PackageNotFoundError:
+        installed = "this flux-stats"
+    return StatisticsUnavailable(
+        f"{feature} needs flux-stats 0.11 (profile format 1-4-0), and {installed} does not "
+        "hold it. Upgrade flux-stats, or leave this option out."
     )
 
 

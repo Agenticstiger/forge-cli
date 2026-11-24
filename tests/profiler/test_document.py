@@ -27,6 +27,7 @@ from fluid_build.profiler.document import (
     schema_url_for,
 )
 from tests.profiler._fake_backend import FIXTURES, SCHEMA_PATH, SCHEMA_SHA256
+from tests.profiler._needs_011 import needs_flux_stats_011
 
 pytestmark = pytest.mark.unit
 
@@ -185,6 +186,11 @@ def test_the_formats_are_the_ones_flux_stats_reads():
     assert SCHEMA_URL_1_1_0 == profile.SCHEMA_URL_1_1_0
     assert SCHEMA_URL_1_2_0 == profile.SCHEMA_URL_1_2_0
     assert SCHEMA_URL_1_3_0 == profile.SCHEMA_URL_1_3_0
+
+
+@needs_flux_stats_011
+def test_the_newest_format_is_the_one_flux_stats_reads():
+    profile = pytest.importorskip("flux_stats.profile")
     assert SCHEMA_URL_1_4_0 == profile.SCHEMA_URL_1_4_0
 
 

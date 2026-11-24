@@ -16,6 +16,7 @@ import yaml
 from fluid_build.cli import main
 from fluid_build.profiler import _stats, document
 from tests.profiler._fake_backend import FakeBackend
+from tests.profiler._needs_011 import needs_flux_stats_011
 from tests.profiler.dp import _rank_run as ranked
 from tests.profiler.dp import _release_data as data
 from tests.profiler.dp._privacy import need
@@ -113,6 +114,7 @@ def _need_selection():
 
 
 @pytest.mark.parametrize("method", ["aim", "mst"])
+@needs_flux_stats_011
 def test_a_release_of_ranks_and_mixed_cliques_is_drawn_again_to_the_same_bytes(
     workspace, registry, capsys, method
 ):
@@ -157,6 +159,7 @@ def test_a_release_of_ranks_and_mixed_cliques_is_drawn_again_to_the_same_bytes(
     assert "profile_release_rederive_disagrees" in _out(capsys)
 
 
+@needs_flux_stats_011
 def test_the_default_row_floor_of_a_release_is_a_thousand(workspace, registry, capsys):
     _need_selection()
     assert main(_argv()) == 0
@@ -166,6 +169,7 @@ def test_the_default_row_floor_of_a_release_is_a_thousand(workspace, registry, c
     assert json.loads((workspace / "rec.json").read_text("utf-8"))["options"] == {"rowFloor": 1000}
 
 
+@needs_flux_stats_011
 def test_a_row_floor_is_refused_in_a_rederivation_of_a_release_that_has_none(
     workspace, registry, capsys
 ):

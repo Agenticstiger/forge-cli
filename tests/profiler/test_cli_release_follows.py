@@ -16,6 +16,7 @@ from fluid_build.cli import main
 from fluid_build.cli._profile_release import HELP
 from fluid_build.profiler import _stats, document
 from tests.profiler._fake_backend import FakeBackend
+from tests.profiler._needs_011 import needs_flux_stats_011
 from tests.profiler.dp import _follow_data as fd
 from tests.profiler.dp._privacy import need
 
@@ -127,6 +128,7 @@ def _read(profile_bytes):
 # ---------------------------------------------------------------------------
 
 
+@needs_flux_stats_011
 def test_a_follows_release_is_accepted_by_the_reader_and_every_noise_block_is_in_its_account(
     workspace, registry, capsys
 ):
@@ -171,6 +173,7 @@ def test_a_follows_release_is_accepted_by_the_reader_and_every_noise_block_is_in
     assert "squared L2 sensitivity 18 for one unit" in out
 
 
+@needs_flux_stats_011
 def test_without_follow_the_release_names_no_follows_and_keeps_its_bytes(workspace, registry):
     # a release with no --follow is the release it was: the format and the unit do not change
     asked = yaml.safe_load((workspace / "billing.profile-request.yml").read_text("utf-8"))
@@ -202,6 +205,7 @@ def test_without_follow_the_release_names_no_follows_and_keeps_its_bytes(workspa
     assert "relationships" not in body
 
 
+@needs_flux_stats_011
 def test_the_reader_refuses_a_follow_edited_into_a_non_tree_as_the_profiler_does(
     workspace, registry
 ):
@@ -245,6 +249,7 @@ def test_the_reader_refuses_a_follow_edited_into_a_non_tree_as_the_profiler_does
         _read(json.dumps(edited).encode("utf-8"))
 
 
+@needs_flux_stats_011
 def test_a_follows_release_is_drawn_again_to_the_same_bytes(workspace, registry, capsys):
     assert main(_argv()) == 0
     first = (workspace / "account.profile.json").read_bytes()
@@ -265,6 +270,7 @@ def test_a_follows_release_is_drawn_again_to_the_same_bytes(workspace, registry,
     assert (workspace / "account.profile.json").read_bytes() == first
 
 
+@needs_flux_stats_011
 def test_a_record_whose_follows_or_parts_were_edited_is_refused(workspace, registry, capsys):
     assert main(_argv()) == 0
     capsys.readouterr()
@@ -284,6 +290,7 @@ def test_a_record_whose_follows_or_parts_were_edited_is_refused(workspace, regis
         assert not (workspace / "never.json").exists()
 
 
+@needs_flux_stats_011
 def test_follow_is_exclusive_with_the_other_ways_of_naming_a_unit_and_refuses_before_a_read(
     workspace, registry, capsys
 ):
@@ -314,6 +321,7 @@ def test_a_malformed_follow_is_refused_by_the_parser(workspace, registry, capsys
     assert "MAX" in capsys.readouterr().err
 
 
+@needs_flux_stats_011
 def test_every_table_the_release_reads_needs_its_source(workspace, registry, capsys):
     argv = _argv()
     at = argv.index("product=product.csv")
@@ -323,6 +331,7 @@ def test_every_table_the_release_reads_needs_its_source(workspace, registry, cap
     assert not (workspace / "rec.json").exists()
 
 
+@needs_flux_stats_011
 def test_a_repeated_parent_key_refuses_the_release_naming_the_table_and_no_value(
     workspace, registry, capsys
 ):
@@ -336,6 +345,7 @@ def test_a_repeated_parent_key_refuses_the_release_naming_the_table_and_no_value
     assert not (workspace / "account.profile.json").exists()
 
 
+@needs_flux_stats_011
 def test_a_record_outside_a_declared_domain_refuses_naming_table_column_and_row(
     workspace, registry, capsys
 ):
@@ -371,6 +381,7 @@ def test_fluid_profile_help_lists_the_flag_and_an_example(capsys):
 # ---------------------------------------------------------------------------
 
 
+@needs_flux_stats_011
 def test_cliques_and_ranks_of_a_reached_table_are_released_and_drawn_again(
     rich_workspace, registry, capsys
 ):

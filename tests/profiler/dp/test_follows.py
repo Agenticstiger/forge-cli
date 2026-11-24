@@ -17,6 +17,7 @@ from fluid_build.profiler.dp import follow_release as fr
 from fluid_build.profiler.dp import release
 from fluid_build.profiler.dp.follows import parse_follow, plan_follows
 from tests.profiler._fake_backend import FakeBackend
+from tests.profiler._needs_011 import needs_flux_stats_011
 from tests.profiler.dp import _follow_data as fd
 
 pytestmark = pytest.mark.unit
@@ -87,6 +88,7 @@ def test_a_follow_flag_is_read_and_a_malformed_one_is_refused():
             parse_follow(bad)
 
 
+@needs_flux_stats_011
 def test_the_reach_is_the_product_of_the_caps_along_the_path():
     tree = _plan_follows(*fd.FOLLOWS)
     assert dict(tree.reach) == {"account": 1, "invoice": 3, "line": 6}
@@ -132,6 +134,7 @@ def test_the_reach_is_the_product_of_the_caps_along_the_path():
         ),
     ],
 )
+@needs_flux_stats_011
 def test_a_follow_that_is_not_a_tree_rooted_at_the_expose_is_refused_naming_the_entry(follows, why):
     with pytest.raises(release.ReleaseRefused) as refused:
         _plan_follows(*follows)
@@ -142,6 +145,7 @@ def test_a_follow_that_is_not_a_tree_rooted_at_the_expose_is_refused_naming_the_
     assert refused.value.context["read"] == "nothing: no record was read"
 
 
+@needs_flux_stats_011
 def test_the_refusal_names_the_entry_that_breaks_the_tree():
     with pytest.raises(release.ReleaseRefused) as refused:
         _plan_follows(
@@ -156,6 +160,7 @@ def test_the_unit_must_be_an_expose_of_the_contract():
     assert refused.value.event == "profile_release_unit_unknown"
 
 
+@needs_flux_stats_011
 def test_the_seam_names_the_entry_of_the_registrys_refusal():
     entries = [e.entry() for e in fd.specs(fd.FOLLOW_INVOICES, fd.FOLLOW_INVOICES)]
     with pytest.raises(_stats.FollowRefused) as refused:
@@ -180,6 +185,7 @@ def _kept(plan, data, seed=fd.SEED):
     return fr.truncated(plan, _rows(plan, data), seed)
 
 
+@needs_flux_stats_011
 def test_truncation_keeps_at_most_the_cap_of_each_parents_children_and_cascades():
     plan = fd.plan()
     data = fd.tables(40, heavy=15)
@@ -199,6 +205,7 @@ def test_truncation_keeps_at_most_the_cap_of_each_parents_children_and_cascades(
     assert len(kept["account"]) == len(data["account"])
 
 
+@needs_flux_stats_011
 def test_rows_that_follow_no_kept_row_are_dropped():
     plan = fd.plan()
     data = fd.tables(20)
@@ -212,6 +219,7 @@ def test_rows_that_follow_no_kept_row_are_dropped():
     assert not {9001, 9002} & set(_ids(data, kept, "line", "line_id"))
 
 
+@needs_flux_stats_011
 def test_what_a_unit_keeps_depends_on_the_seed_and_on_that_unit_alone():
     plan = fd.plan()
     data = fd.tables(30, heavy=12)
@@ -251,6 +259,7 @@ def test_what_a_unit_keeps_depends_on_the_seed_and_on_that_unit_alone():
     assert any(each != _ids(data, base, "invoice", "invoice_id") for each in changed)
 
 
+@needs_flux_stats_011
 def test_what_a_unit_keeps_does_not_depend_on_the_order_of_the_records():
     plan = fd.plan()
     data = fd.tables(30, heavy=12)
@@ -284,6 +293,7 @@ def _parts(plan):
     return {each.part.label: each for each in fr.follow_parts(plan, {})}
 
 
+@needs_flux_stats_011
 def test_each_table_is_charged_its_reach_and_each_relationship_its_case():
     plan = fd.plan()
     assert dict(plan.reach) == {"account": 1, "invoice": 3, "line": 6}
@@ -309,6 +319,7 @@ def test_each_table_is_charged_its_reach_and_each_relationship_its_case():
     assert (other.l1, other.sensitivity) == (3, 9)
 
 
+@needs_flux_stats_011
 def test_the_bins_of_children_per_parent_are_the_caps_or_a_public_ladder():
     plan = fd.plan()
     by = {each.label: each for each in plan.relations}
@@ -320,6 +331,7 @@ def test_the_bins_of_children_per_parent_are_the_caps_or_a_public_ladder():
     assert by["relationship/product.product_id/invoice.product_id"].edges == fr.CHILDREN_LADDER
 
 
+@needs_flux_stats_011
 def test_a_cap_with_more_bins_than_the_cell_limit_refuses_naming_the_entry():
     entry = "account.id=invoice.account_id:1000000000"
     with pytest.raises(release.ReleaseRefused) as refused:
@@ -328,6 +340,7 @@ def test_a_cap_with_more_bins_than_the_cell_limit_refuses_naming_the_entry():
     assert entry in str(refused.value)
 
 
+@needs_flux_stats_011
 def test_a_count_beyond_the_ladder_refuses_naming_the_relationship_only():
     plan = fd.plan()
     relation = next(
@@ -342,6 +355,7 @@ def test_a_count_beyond_the_ladder_refuses_naming_the_relationship_only():
     assert "1000000001" not in str(refused.value)
 
 
+@needs_flux_stats_011
 def test_a_reached_table_is_never_charged_less_than_its_reach_and_a_fixed_one_not_at_all():
     plan = fd.plan()
     labels = [each.part.label for each in fr.follow_parts(plan, {})]
@@ -354,6 +368,7 @@ def test_a_reached_table_is_never_charged_less_than_its_reach_and_a_fixed_one_no
     }
 
 
+@needs_flux_stats_011
 def test_the_groups_of_a_noisy_statistic_are_contract_levels_or_public_bins():
     release_plan = fd.plan()
     drawn = fd.draw(release_plan, fd.tables())
@@ -378,6 +393,7 @@ def _walk(value):
             yield from _walk(each)
 
 
+@needs_flux_stats_011
 def test_a_parent_column_with_no_public_levels_is_not_released_and_a_labelled_one_warns():
     plan = fd.plan()
     # the product's category is labelled pii and the product table is fixed
@@ -401,6 +417,7 @@ def test_a_parent_column_with_no_public_levels_is_not_released_and_a_labelled_on
     assert plan.warnings == ()
 
 
+@needs_flux_stats_011
 def test_a_link_under_a_parent_the_unit_reaches_without_following_it_is_not_released():
     contract = _contract()
     exposes = {each["exposeId"]: each for each in contract["exposes"]}
@@ -443,6 +460,7 @@ def test_a_link_under_a_parent_the_unit_reaches_without_following_it_is_not_rele
     assert not plan.relations and not plan.links
 
 
+@needs_flux_stats_011
 def test_without_a_part_to_release_the_plan_refuses_before_a_record_is_read():
     document = fd.request_document(relationships=[])
     for table in document["tables"].values():
@@ -456,6 +474,7 @@ def test_without_a_part_to_release_the_plan_refuses_before_a_record_is_read():
     assert refused.value.event == "profile_release_nothing_to_release"
 
 
+@needs_flux_stats_011
 def test_a_row_floor_is_refused_when_no_reached_table_holds_a_rank_correlation():
     with pytest.raises(release.ReleaseRefused) as refused:
         fd.plan(row_floor=100)
@@ -587,6 +606,7 @@ def _check_every_neighbour(plan, units, bases, fresh):
     return worst
 
 
+@needs_flux_stats_011
 def test_one_unit_moves_every_table_by_at_most_what_it_is_charged_two_tables():
     plan = fd.plan(follows=(fd.FOLLOW_INVOICES,))
     fresh = 100
@@ -615,6 +635,7 @@ def _product_sequences(products: Sequence[int], count: int):
             yield (head, *rest)
 
 
+@needs_flux_stats_011
 def test_one_unit_moves_every_table_by_at_most_what_it_is_charged_three_tables():
     plan = fd.plan(
         follows=("account.id=invoice.account_id:2", "invoice.invoice_id=line.invoice_id:2")
@@ -634,6 +655,7 @@ def test_one_unit_moves_every_table_by_at_most_what_it_is_charged_three_tables()
     assert max(sensitivity for _, sensitivity in worst.values()) >= 4
 
 
+@needs_flux_stats_011
 def test_a_unit_that_is_one_row_with_no_children_moves_the_tables_by_one():
     plan = fd.plan(follows=(fd.FOLLOW_INVOICES,))
     before, _ = _measure(plan, _bases(100)[0])
@@ -658,6 +680,7 @@ def _rich_plan(**options):
     return fd.plan(asked=fd.request(rich=True), **options)
 
 
+@needs_flux_stats_011
 def test_a_rank_correlation_of_a_reached_table_is_charged_its_reach_times_the_registrys():
     plan = _rich_plan(row_floor=100)
     invoice = plan.table("invoice")
@@ -688,6 +711,7 @@ def _choose_status_channel(rows, names, levels, weights, rho, distance, method="
     return [("status", "channel")]
 
 
+@needs_flux_stats_011
 def test_cliques_are_chosen_on_the_tables_the_unit_changes_with_the_distance_of_their_reach():
     SELECTION_CALLS.clear()
     plan = _rich_plan()
@@ -710,6 +734,7 @@ def test_cliques_are_chosen_on_the_tables_the_unit_changes_with_the_distance_of_
     assert drawn.selected == {"invoice": (("status", "channel"),)}
 
 
+@needs_flux_stats_011
 def test_the_tenth_spent_choosing_is_split_over_the_tables_that_choose_cliques():
     contract = copy.deepcopy(fd.CONTRACT)
     exposes = {each["exposeId"]: each for each in contract["exposes"]}
