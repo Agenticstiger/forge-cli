@@ -964,7 +964,9 @@ def test_a_further_remote_output_is_refused(bq, tmp_path, binding):
     assert _build(contract, root) == 1 and fake.loads == []
 
 
-def test_a_further_local_output_is_warned_about_not_dropped_silently(bq, tmp_path, capsys):
+def test_a_further_local_output_is_written_beside_the_load(bq, tmp_path, capsys):
+    # It used to be warned about as "not written by this build": the local
+    # provider wrote the first expose only. Each output the build names lands.
     fake = bq()
     _seed(fake)
     root = _workspace(tmp_path / "ws")
@@ -979,7 +981,8 @@ def test_a_further_local_output_is_warned_about_not_dropped_silently(bq, tmp_pat
     contract["builds"][0]["outputs"] = ["status_summary", "extra"]
     assert _build(contract, root) == 0
     out = " ".join(capsys.readouterr().out.split())
-    assert "extra is not written by this build" in out
+    assert "not written by this build" not in out
+    assert (_silver_dir(root) / "x.pq").is_file()
     assert [load["table"] for load in fake.loads] == [SILVER_TABLE]
 
 

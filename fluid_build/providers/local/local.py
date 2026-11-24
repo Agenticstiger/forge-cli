@@ -732,44 +732,27 @@ class LocalProvider(BaseProvider):
                 },
             )
 
-        # Decide output — honour the declared path AND format from the first expose.
+        # Decide output: the exposes THIS build names in ``outputs``
+        # (``build_output_exposes``), each at its declared path and format. It
+        # used to be ``exposes[0]`` whichever build ran, so a second build
+        # overwrote the first build's file and its own expose was never written.
+        # A contract with one expose (or none) keeps it; several exposes and a
+        # build that names none is refused (``BuildOutputsError``).
         # A contract that declares ``format: parquet`` at an ``output/*.parquet``
-        # path previously had apply silently write a CSV to the wrong (default)
-        # path. Fix: read format from ``binding.format`` / ``format`` fields and
-        # use the binding ``location.path`` or ``path`` field as declared.
-        output_paths: List[str] = []
-        exposes = contract.get("exposes") or []
-        if exposes:
-            first_expose = exposes[0]
-            # Resolve location from binding (v0.7.x) or direct location key (legacy).
-            binding = first_expose.get("binding") or {}
-            loc = binding.get("location") or first_expose.get("location") or {}
-            out_path = loc.get("path")
+        # path used to get a CSV at the wrong (default) path: the format is read
+        # from ``binding.format`` / ``format`` and the path from the binding
+        # ``location.path`` or ``path``, as declared.
+        from fluid_build.util.contract import build_output_exposes
 
-            # Resolve declared output format so parquet contracts write parquet.
-            fmt_raw = (binding.get("format") or first_expose.get("format") or "").lower()
-            # Normalise aliases.
-            if fmt_raw in {"parquet", "pq"}:
-                declared_fmt = "parquet"
-            else:
-                declared_fmt = "csv"
-
-            if out_path:
-                # The file name and format come from the one helper the
-                # consumes[] reader also uses (``local_provider_landing``), so
-                # a downstream build reads this file where, and as what, it was
-                # written: a parquet binding whose path lacks the suffix gets
-                # ``.parquet``, and any non-parquet format is written as CSV.
-                from fluid_build.util.binding_paths import local_provider_landing
-
-                out_path, declared_fmt = local_provider_landing(str(out_path), fmt_raw)
-                output_paths = [{"path": out_path, "format": declared_fmt}]
-            else:
-                cid = contract.get("id") or "product"
-                stem = cid.replace(".", "_")
-                ext = ".parquet" if declared_fmt == "parquet" else ".csv"
-                output_paths = [{"path": f"runtime/out/{stem}{ext}", "format": declared_fmt}]
-        else:
+        exposes = (
+            build_output_exposes(contract, build) if build else (contract.get("exposes") or [])[:1]
+        )
+        output_paths: List[Any] = []
+        for position, expose in enumerate(exposes):
+            spec = self._expose_output_spec(contract, expose, first=position == 0)
+            if spec is not None:
+                output_paths.append(spec)
+        if not exposes:
             output_paths = [{"path": "runtime/out/output.csv", "format": "csv"}]
 
         # Fallback SQL if none found
@@ -794,6 +777,51 @@ class LocalProvider(BaseProvider):
                 sql_text = "SELECT 1 AS demo_col"
 
         return [{"op": "sql", "sql": sql_text, "inputs": inputs_spec, "outputs": output_paths}]
+
+    def _expose_output_spec(
+        self, contract: Dict[str, Any], expose: Dict[str, Any], *, first: bool
+    ) -> Optional[Dict[str, str]]:
+        """``{"path", "format"}`` this provider writes ``expose`` to, or ``None``.
+
+        The first expose of a build is always written: at its declared path, or
+        under ``runtime/out/`` when it declares none. A further expose the build
+        names is written beside it only when it is a local file (a local
+        platform and a path); one bound to another platform is delivered by
+        another stage, and this provider must not write a local file of that
+        name (``further_outputs`` refuses a remote one).
+        """
+        binding = expose.get("binding") or {}
+        loc = binding.get("location") or expose.get("location") or {}
+        out_path = loc.get("path")
+        # Resolve declared output format so parquet contracts write parquet.
+        fmt_raw = (binding.get("format") or expose.get("format") or "").lower()
+        if out_path:
+            platform = str(binding.get("platform") or "").strip().lower()
+            if not first and platform not in {"", "local"}:
+                self._log_warn(
+                    "local_output_not_written",
+                    {
+                        "expose": expose.get("exposeId"),
+                        "platform": platform,
+                        "reason": "bound to another platform: delivered by another stage",
+                    },
+                )
+                return None
+            # The file name and format come from the one helper the
+            # consumes[] reader also uses (``local_provider_landing``), so
+            # a downstream build reads this file where, and as what, it was
+            # written: a parquet binding whose path lacks the suffix gets
+            # ``.parquet``, and any non-parquet format is written as CSV.
+            from fluid_build.util.binding_paths import local_provider_landing
+
+            path, fmt = local_provider_landing(str(out_path), fmt_raw)
+            return {"path": path, "format": fmt}
+        if not first:
+            return None
+        declared_fmt = "parquet" if fmt_raw in {"parquet", "pq"} else "csv"
+        stem = (contract.get("id") or "product").replace(".", "_")
+        ext = ".parquet" if declared_fmt == "parquet" else ".csv"
+        return {"path": f"runtime/out/{stem}{ext}", "format": declared_fmt}
 
     @staticmethod
     def _existing_outputs(output_paths: List[Any]) -> List[str]:

@@ -132,3 +132,58 @@ def test_skipped_actions_are_not_counted_as_applied(tmp_path: Path) -> None:
     )
     assert (result["applied"], result["failed"]) == (1, 0)
     assert sum(1 for r in result["results"] if r.get("skipped")) == 2
+
+
+# ── --mode amend-and-build: the build runner's own path ───────────────────
+
+
+def test_amend_and_build_lands_each_build_in_its_own_expose(project: Path) -> None:
+    # build_b used to overwrite out/A.csv, and out/B.csv was never written.
+    _write(project, _contract())
+    args = _parse("apply", "contract.fluid.yaml", "--mode", "amend-and-build", "--yes")
+    assert apply_run(args, LOG) == 0
+    assert _landed(project) == {"A.csv": "a\n1\n", "B.csv": "b\n2\n"}
+
+
+def test_a_build_naming_two_local_outputs_lands_both(project: Path) -> None:
+    contract = _contract()
+    contract["builds"] = [dict(contract["builds"][0], outputs=["A", "B"])]
+    _write(project, contract)
+    args = _parse("apply", "contract.fluid.yaml", "--mode", "amend-and-build", "--yes")
+    assert apply_run(args, LOG) == 0
+    assert _landed(project) == {"A.csv": "a\n1\n", "B.csv": "a\n1\n"}
+
+
+@pytest.mark.parametrize(
+    ("edit", "event"),
+    [
+        (lambda c: c["builds"][1].pop("outputs"), "build_outputs_undeclared"),
+        (lambda c: c["builds"][1].update(outputs=["Z"]), "build_output_unknown_expose"),
+    ],
+    ids=["no-outputs-beside-two-exposes", "unknown-output"],
+)
+def test_amend_and_build_refuses_a_build_with_an_unresolved_output_and_writes_nothing_for_it(
+    project: Path, caplog: pytest.LogCaptureFixture, edit: Any, event: str
+) -> None:
+    contract = _contract()
+    edit(contract)
+    _write(project, contract)
+    caplog.set_level(logging.ERROR)
+    args = _parse("apply", "contract.fluid.yaml", "--mode", "amend-and-build", "--yes")
+    assert apply_run(args, LOG) != 0
+    assert event in caplog.text  # the named event
+    # build_a, which resolves, still lands its own expose; the refused build
+    # writes nothing, and never into build_a's file.
+    assert _landed(project) == {"A.csv": "a\n1\n"}
+
+
+def test_a_plan_with_an_unresolved_output_is_refused_with_a_named_event(project: Path) -> None:
+    from fluid_build._errors import FluidUserError
+
+    contract = _contract()
+    contract["builds"][1].pop("outputs")
+    _write(project, contract)
+    with pytest.raises(FluidUserError) as refused:
+        apply_run(_parse("apply", "contract.fluid.yaml", "--yes"), LOG)
+    assert refused.value.code == "build_outputs_undeclared"
+    assert _landed(project) == {}

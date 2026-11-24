@@ -631,7 +631,31 @@ def enforce_schema_policy_or_raise(ctx: Any, runner: Any) -> None:
     except Exception:  # pragma: no cover — defensive
         return
 
-    expose = (ctx.contract.get("exposes") or [{}])[0]
+    # The baseline is the schema of the expose THIS build writes. It used to be
+    # exposes[0], so a second build was held to the first build's columns.
+    from fluid_build.util.contract import BuildOutputsError, build_output_exposes, get_builds
+
+    build = next(
+        (
+            b
+            for b in get_builds(ctx.contract)
+            if isinstance(b, dict) and b.get("id") == getattr(ctx, "build_id", None)
+        ),
+        None,
+    )
+    try:
+        exposes = (
+            build_output_exposes(ctx.contract, build)
+            if build is not None
+            else (ctx.contract.get("exposes") or [])
+        )
+    except BuildOutputsError:
+        # Which expose is this build's baseline cannot be told (no outputs beside
+        # several exposes, or an output that is no exposeId): no gate, rather than
+        # holding the stream to another expose's columns. Validation names the
+        # contract error.
+        return
+    expose = (exposes or [{}])[0]
     contract_block = expose.get("contract") or {}
     declared_schema = contract_block.get("schema") or []
     policy_str = contract_block.get("schemaPolicy") or "evolve_safe"

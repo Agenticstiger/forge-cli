@@ -104,6 +104,7 @@ from fluid_build.util.binding_paths import (
     local_provider_landing,
     resolve_binding_path,
 )
+from fluid_build.util.contract import build_output_exposes
 
 LOG = logging.getLogger("fluid.build_runners.embedded_sql")
 
@@ -1032,13 +1033,14 @@ def resolve_consumes(
 def _landed_exposes(
     contract: Mapping[str, Any], build: Mapping[str, Any]
 ) -> List[Mapping[str, Any]]:
-    """The first expose (what the local provider writes) plus any the build names."""
-    exposes = [e for e in contract.get("exposes") or [] if isinstance(e, Mapping)]
-    if not exposes:
-        return []
-    named = {str(o) for o in build.get("outputs") or [] if isinstance(o, str)}
-    extra = [e for e in exposes[1:] if (e.get("exposeId") or e.get("id")) in named]
-    return [exposes[0], *extra]
+    """The exposes this build writes: the ones its ``outputs`` name, first one first.
+
+    :func:`~fluid_build.util.contract.build_output_exposes` (a contract with one
+    expose keeps it; an unknown output id, or no outputs beside several exposes,
+    is refused). It used to be the first expose of the contract plus any the
+    build named, so a second build was handed the first build's landing.
+    """
+    return build_output_exposes(contract, build)
 
 
 def refuse_unapplied_masking(contract: Mapping[str, Any], build: Mapping[str, Any]) -> None:
@@ -1197,17 +1199,17 @@ _REMOTE_OUTPUT_PLATFORMS = frozenset({"aws"}) | _UNLANDABLE_PLATFORMS
 
 
 def further_outputs(contract: Mapping[str, Any], build: Mapping[str, Any]) -> List[str]:
-    """Refuse a further output this path would not land remotely; warn about a local one.
+    """Refuse a further output this path cannot land; warn about one another stage delivers.
 
-    The local provider writes one result, the first expose's
-    (``LocalProvider._derive_actions_from_contract``), and this path lands
-    that one only: in S3, in a BigQuery table, or as a local file. Every
-    other expose the build names in ``outputs`` is written nowhere. One bound
-    to a cloud store or a warehouse (a BigQuery table, a ``gs://`` or S3
-    prefix, another platform's binding) is refused: the build would report
-    success with nothing where that contract says. A local one, or an output
-    port another stage delivers (pgvector, kafka, ...), is returned as a
-    warning to print, which is what the build did before, said out loud.
+    The build lands the exposes it names in ``outputs``: the first through this
+    path's own landing (S3, a BigQuery table or a local file), a further one as a
+    local file the local provider writes beside it
+    (``LocalProvider._expose_output_spec``). A further output bound to a cloud
+    store or a warehouse (a BigQuery table, a ``gs://`` or S3 prefix, another
+    platform's binding) is refused: the build would report success with nothing
+    where that contract says. One bound to an output port another stage
+    delivers (pgvector, kafka, ...) is returned as a warning to print: this
+    build does not write it.
     """
     exposes = _landed_exposes(contract, build)
     first_id = str(exposes[0].get("exposeId") or exposes[0].get("id") or "?") if exposes else "?"
@@ -1224,7 +1226,7 @@ def further_outputs(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Li
             raise EmbeddedSqlLandingError(
                 what=(
                     f"expose {extra_id}: the embedded-SQL path lands one result, the first "
-                    f"expose's ({first_id})"
+                    f"expose's ({first_id}), in a remote location"
                 ),
                 why=(
                     f"The build names {extra_id!r} in outputs and binds it to "
@@ -1235,9 +1237,12 @@ def further_outputs(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Li
                 doc=doc_url(),
                 extras={"exposeId": extra_id, "platform": platform or "unset"},
             )
+        if platform in _LOCAL_PLATFORMS and path:
+            continue  # written as a local file beside the first expose
         warnings.append(
-            f"expose {extra_id} is named in the build's outputs, but this path writes only "
-            f"the first expose ({first_id}); {extra_id} is not written by this build"
+            f"expose {extra_id} is named in the build's outputs, but binds "
+            f"{platform or 'no platform'}: another stage delivers it, and this build does not "
+            "write it"
         )
     return warnings
 
@@ -1391,14 +1396,14 @@ def write_bigquery_run_record(
     return run_id
 
 
-def refuse_unlandable_first_expose(contract: Mapping[str, Any]) -> None:
+def refuse_unlandable_first_expose(contract: Mapping[str, Any], build: Mapping[str, Any]) -> None:
     """For a DuckDB SQL build with no inline SQL: refuse what it would land locally.
 
     Such a build keeps the provider's old handling (no consumes resolution and
     no remote landing), so a BigQuery table, a GCS path or another platform's
     binding would be written as a local file of that name.
     """
-    exposes = [e for e in contract.get("exposes") or [] if isinstance(e, Mapping)]
+    exposes = _landed_exposes(contract, build)
     if not exposes:
         return
     expose = exposes[0]
@@ -1446,7 +1451,7 @@ def object_store_landing(
     """
     from .duckdb.runner import _file_within_prefix, _object_store_uri
 
-    exposes = [e for e in contract.get("exposes") or [] if isinstance(e, Mapping)]
+    exposes = _landed_exposes(contract, build)
     if not exposes:
         return None
     expose = exposes[0]

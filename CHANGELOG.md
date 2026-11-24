@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--mode amend-and-build` lands each local SQL build in its own expose.** Every build was
+  handed `exposes[0]`, so with two `engine: sql` builds the second overwrote the first build's
+  file and its own expose was never written, exit 0. A build now writes the exposes its `outputs`
+  name (all of them, when it names several local ones; `further_outputs` no longer warns "not
+  written by this build" about a local one), through the same `build_output_exposes` helper as the
+  planner. A remote further output is still refused. An unknown output id, or no `outputs` beside
+  several exposes, is refused before the build runs, with `build_output_unknown_expose` or
+  `build_outputs_undeclared`. The acquisition schema-drift gate takes the baseline from the
+  expose the build writes, not `exposes[0]`, and is skipped when that cannot be told.
 - **`fluid apply` on the local engine lands each build in the expose its `outputs` name.**
   Applying a `plan.json` with the local provider used to answer the plan's abstract ops
   (`provisionDataset`, `scheduleTask`) by deriving ONE SQL action from the contract, the first

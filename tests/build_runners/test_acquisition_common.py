@@ -451,6 +451,45 @@ class TestEnforceSchemaPolicySkipsPlaceholders:
             self._make_ctx(self._baseline_contract()), PlaceholderRunner()
         )
 
+    def test_the_baseline_is_the_expose_this_build_writes(self):
+        # exposes[0] was the baseline for every build, so a second build was
+        # held to the first build's columns.
+        from fluid_build.build_runners._acquisition_common import (
+            enforce_schema_policy_or_raise,
+        )
+
+        def expose(expose_id: str, column: str) -> Dict[str, Any]:
+            return {
+                "exposeId": expose_id,
+                "contract": {
+                    "schema": [{"name": column, "type": "STRING", "nullable": False}],
+                    "schemaPolicy": "strict",
+                },
+            }
+
+        contract = {
+            "id": "p",
+            "builds": [
+                {"id": "build_a", "outputs": ["A"]},
+                {"id": "build_b", "outputs": ["B"]},
+            ],
+            "exposes": [expose("A", "A_COL"), expose("B", "B_COL")],
+        }
+
+        class Runner:
+            def __init__(self, column: str):
+                self._column = column
+
+            def fingerprint(self, ctx):
+                return SchemaFingerprint.of([SchemaColumn(name=self._column, type="STRING")])
+
+        ctx = self._make_ctx(contract)
+        ctx.build_id = "build_b"
+        enforce_schema_policy_or_raise(ctx, Runner("B_COL"))  # B's columns: no drift
+        with pytest.raises(Exception) as drift:  # A's columns: drift against B
+            enforce_schema_policy_or_raise(ctx, Runner("A_COL"))
+        assert type(drift.value).__name__ == "SchemaDriftError"
+
     def test_strict_policy_still_fires_for_real_drift(self):
         # A runner that returns a REAL fingerprint with mismatched columns
         # under strict policy should still raise (or at least not silently
