@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid apply` on the local engine lands each build in the expose its `outputs` name.**
+  Applying a `plan.json` with the local provider used to answer the plan's abstract ops
+  (`provisionDataset`, `scheduleTask`) by deriving ONE SQL action from the contract, the first
+  build's SQL into the first expose's file, and report success: with two builds only the first
+  expose was written and "Actions Applied" read 5 for a 4-action plan. A local plan is now
+  re-planned from its embedded contract by the local planner, as the contract file is. **Behaviour
+  change:** `builds[].outputs` is resolved in one place (`util.contract.build_output_exposes`):
+  an output id that is no `exposeId` is refused (`build_output_unknown_expose`), a build that
+  names no output in a contract with several exposes is refused (`build_outputs_undeclared`), and
+  two build ids that map to one result table are refused (`build_ids_collide`). The planner no
+  longer lands "the last build's table" or the first loaded table in an expose no build names, and
+  a later build no longer gets the earlier build's result table as an input file ("Input file not
+  found: result_build_a"). A build id with a hyphen keeps its result in `result_<id>` with `-`
+  mapped to `_`. "Actions Applied" counts only applied actions, and "Actions Skipped" is shown
+  beside it. `apply_plan_runs_outside_forge` is gone: a plan beside a Flink job now lands only
+  what the local planner plans and leaves that job's expose to it; `apply_local_plan_failed`
+  (exit 1) reports a plan the local planner cannot plan.
 - **A plugin distribution without metadata no longer breaks a plugin walk.** A `*.dist-info`
   directory with no METADATA file made `importlib.metadata` raise `TypeError` (or `KeyError` on
   newer backports) from `Distribution.name` and `.version`, which `getattr`'s default does not

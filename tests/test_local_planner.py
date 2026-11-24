@@ -91,22 +91,31 @@ class TestDetermineSourceTable:
         result = _determine_source_table(expose, [], set(), self._logger())
         assert result == "src"
 
-    def test_last_build_output(self):
-        builds = [{"id": "b1", "output_table": "result_b1"}]
-        loaded = {"result_b1"}
-        result = _determine_source_table({}, builds, loaded, self._logger())
-        assert result == "result_b1"
+    def test_the_table_of_the_build_that_names_the_expose(self):
+        written_by = {"A": "result_build_a", "B": "result_build_b"}
+        for expose_id, table in written_by.items():
+            result = _determine_source_table(
+                {"exposeId": expose_id},
+                [],
+                set(written_by.values()),
+                self._logger(),
+                written_by=written_by,
+            )
+            assert result == table  # never "the last build's table" for both
 
     def test_match_by_expose_id(self):
-        expose = {"id": "my_output"}
+        expose = {"exposeId": "my_output"}
         loaded = {"my_output", "other"}
         result = _determine_source_table(expose, [], loaded, self._logger())
         assert result == "my_output"
 
-    def test_fallback_first_sorted(self):
+    def test_an_expose_no_build_names_gets_no_table(self):
+        # The first loaded table, sorted, used to be landed under its name.
         loaded = {"z_table", "a_table"}
-        result = _determine_source_table({}, [], loaded, self._logger())
-        assert result == "a_table"
+        result = _determine_source_table(
+            {"exposeId": "orphan"}, [], loaded, self._logger(), written_by={"other": "a_table"}
+        )
+        assert result is None
 
     def test_no_tables_returns_none(self):
         result = _determine_source_table({}, [], set(), self._logger())
@@ -257,3 +266,97 @@ class TestValidatePlan:
         valid, errors = validate_plan([])
         assert valid is True
         assert errors == []
+
+
+# ── plan_actions: each build lands in the expose its outputs name ─────
+def _two_build_contract(*, a_id: str = "build_a", b_id: str = "build_b") -> dict:
+    def build(build_id: str, sql: str, out: str) -> dict:
+        return {
+            "id": build_id,
+            "engine": "sql",
+            "pattern": "embedded-logic",
+            "properties": {"sql": sql},
+            "outputs": [out],
+        }
+
+    def expose(expose_id: str) -> dict:
+        return {
+            "exposeId": expose_id,
+            "binding": {
+                "platform": "local",
+                "format": "csv",
+                "location": {"path": f"out/{expose_id}.csv"},
+            },
+        }
+
+    return {
+        "id": "repro.two_builds",
+        "builds": [build(a_id, "SELECT 1 AS a", "A"), build(b_id, "SELECT 2 AS b", "B")],
+        "exposes": [expose("A"), expose("B")],
+    }
+
+
+class TestPlanActionsMultipleBuilds:
+    def _plan(self, contract: dict) -> list:
+        from fluid_build.providers.local.planner import plan_actions
+
+        return plan_actions(contract, logger=logging.getLogger("test"))
+
+    def test_each_expose_is_materialized_from_its_own_builds_table(self):
+        actions = self._plan(_two_build_contract())
+        landed = {
+            a["resource_id"]: a["payload"]["source_table"]
+            for a in actions
+            if a["op"] == "materialize"
+        }
+        assert landed == {"A": "result_build_a", "B": "result_build_b"}
+
+    def test_a_later_build_registers_no_file_for_an_earlier_builds_table(self):
+        # "Input file not found: result_build_a": the implicit dependency was
+        # listed as an input to register.
+        actions = self._plan(_two_build_contract())
+        sql = {a["resource_id"]: a for a in actions if a["op"] == "execute_sql"}
+        assert sql["build_b"]["payload"]["inputs"] == []
+        assert (
+            "build_a" in sql["build_b"]["depends_on"]
+            or "result_build_a" in sql["build_b"]["depends_on"]
+        )
+
+    def test_a_hyphenated_build_id_keeps_its_result_in_a_safe_table_name(self):
+        from fluid_build.providers._sql_safety import validate_ident
+
+        actions = self._plan(_two_build_contract(a_id="hello-transformation"))
+        tables = [a["table_name"] for a in actions if a["op"] == "execute_sql"]
+        assert tables[0] == "result_hello_transformation"
+        assert all(validate_ident(t) for t in tables)
+
+    def test_two_build_ids_that_map_to_one_table_are_refused(self):
+        import pytest
+
+        from fluid_build.util.contract import BuildOutputsError
+
+        with pytest.raises(BuildOutputsError) as refused:
+            self._plan(_two_build_contract(a_id="a-b", b_id="a_b"))
+        assert refused.value.code == "build_ids_collide"
+
+    def test_an_unknown_output_refuses_the_plan(self):
+        import pytest
+
+        from fluid_build.util.contract import BuildOutputsError
+
+        contract = _two_build_contract()
+        contract["builds"][1]["outputs"] = ["Z"]
+        with pytest.raises(BuildOutputsError) as refused:
+            self._plan(contract)
+        assert refused.value.code == "build_output_unknown_expose"
+
+    def test_an_expose_no_build_names_is_not_given_another_builds_table(self):
+        contract = _two_build_contract()
+        contract["builds"][1]["outputs"] = ["A"]  # nothing writes B
+        actions = self._plan(contract)
+        landed = {
+            a["resource_id"]: a["payload"]["source_table"]
+            for a in actions
+            if a["op"] == "materialize"
+        }
+        assert landed == {"A": "result_build_b", "B": None}  # the last build to name A wins

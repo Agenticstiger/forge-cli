@@ -591,9 +591,13 @@ class LocalProvider(BaseProvider):
                 )
                 results.append({"i": idx, "status": "error", "error": error_text})
 
+        # A skipped action (a no-op, an op this provider does not run) did not apply:
+        # counting it made a 4-action plan report "Actions Applied 5". Each result
+        # carries ``skipped``, so the CLI shows the two counts apart.
+        skipped_count = sum(1 for r in results if r.get("status") == "ok" and r.get("skipped"))
         summary = ApplyResult(
             provider="local",
-            applied=len(norm_actions) - error_count,
+            applied=len(norm_actions) - error_count - skipped_count,
             failed=error_count,
             duration_sec=round(time.time() - start_ts, 3),
             timestamp=_now_iso(),

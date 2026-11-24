@@ -11,7 +11,10 @@ supported.
 
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+from fluid_build._errors import FluidUserError, doc_url
 
 
 def get_expose_id(expose: Mapping[str, Any]) -> Optional[str]:
@@ -101,6 +104,88 @@ def get_primary_build(contract: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """
     builds = get_builds(contract)
     return builds[0] if builds else None
+
+
+@dataclass
+class BuildOutputsError(FluidUserError):
+    """A build's ``outputs`` cannot be resolved to this contract's exposes.
+
+    ``code`` is the named event: ``build_output_unknown_expose`` (an output id
+    that is no ``exposeId``) or ``build_outputs_undeclared`` (a build that
+    names no output beside several exposes).
+    """
+
+    code: str = "build_outputs_undeclared"
+
+
+def build_output_exposes(
+    contract: Mapping[str, Any], build: Mapping[str, Any]
+) -> List[Dict[str, Any]]:
+    """The exposes ``build`` writes, in the order its ``outputs`` name them.
+
+    One place maps a build to what it lands, so the local planner, the local
+    provider, the embedded-SQL landing and the acquisition drift gate cannot
+    disagree (they used to take ``exposes[0]`` or the last build's table, which
+    wrote one build's rows into another build's file). The rule is Dagster's
+    multi-asset one: each output is a name checked against the declared set,
+    never a silent skip.
+
+    * ``outputs`` lists exposeIds: each must be an ``exposeId`` of the contract
+      (:class:`BuildOutputsError`, ``build_output_unknown_expose``, otherwise).
+    * ``outputs`` unset or empty: a contract with one expose (or none) keeps
+      that one; a contract with several refuses
+      (``build_outputs_undeclared``), because which build writes which expose
+      is then a guess.
+    """
+    exposes = [e for e in contract.get("exposes") or [] if isinstance(e, Mapping)]
+    build_id = str(build.get("id") or "?")
+    outputs = build.get("outputs")
+    if isinstance(outputs, list) and outputs:
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for expose in exposes:
+            expose_id = get_expose_id(expose)
+            if isinstance(expose_id, str):
+                by_id.setdefault(expose_id, expose)  # type: ignore[arg-type]
+        resolved: List[Dict[str, Any]] = []
+        for name in outputs:
+            expose = by_id.get(name) if isinstance(name, str) else None
+            if expose is None:
+                raise BuildOutputsError(
+                    code="build_output_unknown_expose",
+                    what=f"build {build_id!r} names the output {name!r}, which is no exposeId",
+                    why=(
+                        "builds[].outputs lists the exposes a build writes, and an id that "
+                        "matches none would leave that output unwritten while apply reports "
+                        "success. This contract's exposes are "
+                        f"{', '.join(repr(k) for k in sorted(by_id)) or 'none'}."
+                    ),
+                    fix=(
+                        f"Name an existing exposeId in builds[id={build_id}].outputs, "
+                        "or add the expose."
+                    ),
+                    doc=doc_url(),
+                    extras={"buildId": build_id, "output": str(name), "exposeIds": sorted(by_id)},
+                )
+            if not any(expose is done for done in resolved):
+                resolved.append(expose)
+        return resolved
+    if len(exposes) > 1:
+        raise BuildOutputsError(
+            code="build_outputs_undeclared",
+            what=(
+                f"build {build_id!r} declares no outputs, and the contract has "
+                f"{len(exposes)} exposes"
+            ),
+            why=(
+                "Which expose a build writes cannot be told from the contract alone, and "
+                "writing the first one (or the last build's table) put one build's rows "
+                "into another build's file."
+            ),
+            fix=f"Add builds[id={build_id}].outputs, listing the exposeIds this build writes.",
+            doc=doc_url(),
+            extras={"buildId": build_id, "exposeCount": len(exposes)},
+        )
+    return exposes  # type: ignore[return-value]
 
 
 def get_build_engine(build: Mapping[str, Any]) -> Optional[str]:

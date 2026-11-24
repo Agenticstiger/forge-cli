@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fluid_build._console import literal_error_text
+from fluid_build._errors import FluidUserError
 from fluid_build.cli.console import cprint, success, warning
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 
@@ -926,7 +927,12 @@ def _actions_from_source(
 
     For a plan, the actions are its recorded ``actions``. A destructive mode
     (``replace`` / ``replace-and-build``) instead re-plans ``contract``, the
-    plan's verified embedded copy, with the provider's native planner.
+    plan's verified embedded copy, with the provider's native planner. So does
+    the local provider in every mode: ``fluid plan`` records abstract ops
+    (``provisionDataset``, ``scheduleTask``) it cannot dispatch, and it used to
+    answer them by deriving ONE SQL action from the contract (the first build's
+    SQL into the first expose's file), whatever else the plan held. Planned
+    like the contract file, each build lands in the expose its ``outputs`` name.
 
     For a contract, a provider with a ``plan()`` method (like AwsProvider,
     GcpProvider) generates service-level actions it can dispatch (e.g.
@@ -948,21 +954,31 @@ def _actions_from_source(
         # plan.json would dispatch via the abstract handler which only emits
         # ``INSERT INTO`` regardless of mode.
         is_destructive = (mode or "").lower() in ("replace", "replace-and-build")
+        is_local = getattr(provider, "name", None) == "local"
         if (
             contract
-            and is_destructive
+            and (is_destructive or is_local)
             and hasattr(provider, "plan")
             and callable(getattr(provider, "plan", None))
         ):
             try:
                 native_actions = provider.plan(contract, mode=mode)
-            except TypeError:
-                native_actions = None
+            except FluidUserError:
+                raise  # a refusal (an unresolved build output, say), not a planner failure
             except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "plan_retranslation_failed: falling back to recorded actions (%s)",
-                    exc,
-                )
+                if is_local:
+                    from fluid_build.observability.secret_redactor import redact_secret_text
+
+                    # No fallback to the recorded actions: the local provider would
+                    # answer them by deriving its own SQL, which is what this avoids.
+                    raise CLIError(
+                        1, "apply_local_plan_failed", {"error": redact_secret_text(str(exc))}
+                    ) from exc
+                if not isinstance(exc, TypeError):
+                    logger.warning(
+                        "plan_retranslation_failed: falling back to recorded actions (%s)",
+                        exc,
+                    )
                 native_actions = None
             if native_actions:
                 logger.info(
@@ -971,6 +987,8 @@ def _actions_from_source(
                     len(native_actions),
                 )
                 return native_actions
+            if is_local:
+                return []  # nothing to land: the recorded abstract ops are no actions
         return plan_data.get("actions", [])
 
     # Prefer provider.plan() when available — it generates service-level
@@ -986,6 +1004,8 @@ def _actions_from_source(
             if actions:
                 logger.info(f"Provider planner generated {len(actions)} actions")
                 return actions
+        except FluidUserError:
+            raise  # a refusal the provider named: the action parser must not paper over it
         except Exception as e:
             logger.warning(f"Provider planner failed ({e}), falling back to action parser")
 
@@ -1546,6 +1566,14 @@ def _confirm_reconcile(question: str) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
+def _skipped_count(result: dict) -> int:
+    """The actions the provider reported but did not run (``results[*].skipped``)."""
+    results = result.get("results")
+    if not isinstance(results, list):
+        return 0
+    return sum(1 for r in results if isinstance(r, dict) and r.get("skipped"))
+
+
 def _render_apply_result(
     *,
     success: bool,
@@ -1575,6 +1603,8 @@ def _render_apply_result(
 
             if "applied" in result:
                 summary_table.add_row("Actions Applied", str(result["applied"]))
+            if _skipped_count(result):
+                summary_table.add_row("Actions Skipped", str(_skipped_count(result)))
 
             total_time = time.time() - start_time
             summary_table.add_row("Duration", f"{total_time:.2f}s")
@@ -1625,6 +1655,8 @@ def _render_apply_result(
             logger.info("✅ Data product deployed successfully")
             if "applied" in result:
                 logger.info(f"Applied {result['applied']} action(s)")
+            if _skipped_count(result):
+                logger.info(f"Skipped {_skipped_count(result)} action(s)")
         elif no_outputs:
             logger.warning("⚠️  Apply ran but produced no output files.")
             if "applied" in result:
@@ -1714,34 +1746,6 @@ def _write_apply_report(
 
 #: How many unsupported platform fields ``apply_platform_unsupported`` names.
 _PLATFORMS_SHOWN = 10
-
-
-def _refuse_local_plan_beside_outside_jobs(contract: Dict[str, Any]) -> None:
-    """Refuse to apply a plan.json with the local provider when a build of its
-    contract runs outside forge-cli.
-
-    ``fluid plan`` records abstract ops the local provider does not dispatch, so
-    for a plan it derives its own actions from the contract: the first build's
-    SQL into the first expose's file. Beside a job that runs outside forge-cli
-    that lands the wrong rows, over the job's own output. In the default mode
-    the contract file is planned by the local planner instead, which leaves
-    that job's output to it.
-    """
-    from fluid_build.util.contract import is_externally_run_build
-
-    for i, build in enumerate(contract.get("builds") or []):
-        if isinstance(build, dict) and is_externally_run_build(build):
-            raise CLIError(
-                2,
-                "apply_plan_runs_outside_forge",
-                {
-                    "error": (
-                        f"builds[{i}] runs outside forge-cli, and the local provider "
-                        "applies a plan.json by deriving its own actions from the "
-                        "contract, which would land what that job writes"
-                    ),
-                },
-            )
 
 
 #: A platform a contract declares: (field, provider key, run by a job outside forge-cli).
@@ -1924,8 +1928,6 @@ def _run_simple_apply(
     if str(requested or "").strip().lower() == "auto":  # as --provider auto means elsewhere
         requested = None
     provider_name = requested or _simple_apply_provider(contract, logger)
-    if plan_data is not None and str(provider_name).strip().lower() == "local":
-        _refuse_local_plan_beside_outside_jobs(contract)
     if getattr(args, "project", None):
         project = args.project
     if getattr(args, "region", None):

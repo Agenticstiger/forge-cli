@@ -21,6 +21,7 @@ runs in-memory.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
@@ -32,7 +33,10 @@ try:
 except ImportError:
     _HAS_SDK_CONTRACT = False
 
+from fluid_build._errors import doc_url
 from fluid_build.util.contract import (
+    BuildOutputsError,
+    build_output_exposes,
     builds_writing_expose,
     get_builds,
     get_consumes,
@@ -43,6 +47,17 @@ from fluid_build.util.contract import (
     is_externally_run_build,
     is_spark_job_build,
 )
+
+
+def _result_table(build_id: Any) -> str:
+    """The DuckDB table a build's result is kept in: ``result_<build id>``.
+
+    A build id is a contract identifier (``hello-transformation`` is one), and
+    ``-`` is not a SQL identifier character: the table could not be created
+    (``validate_ident``), the failure was swallowed, and the expose was written
+    as a placeholder. Every other character is mapped to ``_`` too.
+    """
+    return "result_" + re.sub(r"[^0-9A-Za-z_]", "_", str(build_id))
 
 
 def plan_actions(
@@ -174,6 +189,8 @@ def plan_actions(
     # Run all build transformations
 
     builds = get_builds(contract)
+    written_by: Dict[str, str] = {}  # exposeId -> the table of the last build that names it
+    table_owner: Dict[str, str] = {}  # result table -> the build id that keeps it
 
     for build_idx, build in enumerate(builds):
         if not build:
@@ -259,8 +276,31 @@ def plan_actions(
                 elif name:
                     input_specs.append(name)
 
+        # The exposes this build lands (builds[].outputs). Resolved before anything
+        # runs, so an unknown output id, or a build that names none beside several
+        # exposes, refuses the plan instead of landing one build's rows in
+        # another's file.
+        landed = build_output_exposes(contract, build)
+
         # Determine output table name (temp table for intermediate results)
-        output_table = build.get("output_table") or f"result_{build_id}"
+        output_table = build.get("output_table") or _result_table(build_id)
+        if table_owner.setdefault(output_table, build_id) != build_id:
+            raise BuildOutputsError(
+                code="build_ids_collide",
+                what=(
+                    f"builds {table_owner[output_table]!r} and {build_id!r} both keep their "
+                    f"result in the table {output_table!r}"
+                ),
+                why=(
+                    "A build id is written into a table name with every character that is "
+                    "not a letter, digit or underscore mapped to '_', so two ids that differ "
+                    "only in those characters share one table, and the second would replace "
+                    "the first's rows."
+                ),
+                fix="Rename one build id, or set output_table on one of the builds.",
+                doc=doc_url(),
+                extras={"table": output_table},
+            )
 
         actions.append(
             {
@@ -277,7 +317,12 @@ def plan_actions(
                 "mode": "replace" if is_destructive else "amend",
                 "payload": {
                     "sql": sql_text,
-                    "inputs": input_specs if input_specs else list(input_tables),
+                    # What the build declares, as files to register. The implicit
+                    # "after every loaded table" dependency orders the actions
+                    # (depends_on) and is no input: it used to be listed here, and
+                    # a second build then failed on "Input file not found:
+                    # result_<first build>".
+                    "inputs": input_specs if input_specs else sorted(_explicit_input_names(build)),
                     "output_table": output_table,
                 },
             }
@@ -286,6 +331,8 @@ def plan_actions(
         # This transformation's output can be consumed by others
         loaded_tables.add(output_table)
         dependencies[build_id] = input_tables
+        for expose in landed:  # the last build to name an expose lands it
+            written_by[str(get_expose_id(expose))] = output_table
 
     # ==================== 3. Materialize Actions ====================
     # Write results to exposes[] paths
@@ -344,7 +391,12 @@ def plan_actions(
 
         # Determine source table (from last build or explicit)
         source_table = _determine_source_table(
-            _ei["_raw"] if isinstance(_ei.get("_raw"), dict) else {}, builds, loaded_tables, log
+            _ei["_raw"] if isinstance(_ei.get("_raw"), dict) else {},
+            builds,
+            loaded_tables,
+            log,
+            written_by=written_by,
+            expose_id=expose_id,
         )
         landed_by = [] if source_table else _landed_by_runner(expose_id, builds)
 
@@ -458,18 +510,10 @@ def _extract_sql(build: Dict[str, Any], contract: Dict[str, Any], logger) -> Opt
     return None
 
 
-def _extract_input_tables(
-    build: Dict[str, Any], contract: Dict[str, Any], loaded_tables: Set[str]
-) -> Set[str]:
-    """
-    Determine which tables this build depends on.
-
-    Checks:
-    1. build.properties.parameters.inputs (v0.7.x)
-    2. build.inputs (explicit)
-    3. All loaded tables (conservative default)
-    """
-    inputs = set()
+def _explicit_input_names(build: Dict[str, Any]) -> Set[str]:
+    """The input names a build declares: ``properties.parameters.inputs`` (v0.7.x)
+    and ``build.inputs``. Empty when it declares none."""
+    inputs: Set[str] = set()
 
     # Check explicit inputs (v0.7.x format)
     props = build.get("properties") or {}
@@ -494,12 +538,22 @@ def _extract_input_tables(
             if name:
                 inputs.add(name)
 
-    # If no explicit inputs, assume depends on all loaded tables
-    # (conservative - ensures execution order)
-    if not inputs:
-        inputs = loaded_tables.copy()
-
     return inputs
+
+
+def _extract_input_tables(
+    build: Dict[str, Any], contract: Dict[str, Any], loaded_tables: Set[str]
+) -> Set[str]:
+    """
+    Determine which tables this build must run after.
+
+    Checks:
+    1. The inputs the build declares (:func:`_explicit_input_names`)
+    2. All loaded tables (conservative default: this orders the actions only;
+       a build that declares no inputs reads none, so the executor registers
+       no file for them)
+    """
+    return _explicit_input_names(build) or loaded_tables.copy()
 
 
 def _produced_outside_forge(expose_id: Any, builds: List[Dict[str, Any]], log: Any) -> bool:
@@ -571,41 +625,42 @@ def _landed_by_runner(expose_id: Any, builds: List[Dict[str, Any]]) -> List[str]
 
 
 def _determine_source_table(
-    expose: Dict[str, Any], builds: List[Dict[str, Any]], loaded_tables: Set[str], logger
+    expose: Dict[str, Any],
+    builds: List[Dict[str, Any]],
+    loaded_tables: Set[str],
+    logger,
+    *,
+    written_by: Optional[Mapping[str, str]] = None,
+    expose_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Determine which table to materialize for this expose.
 
     Priority:
     1. expose.source_table (explicit)
-    2. The output table of the last build that produced one
-    3. Table matching expose ID
+    2. The table of the build that names this expose in ``outputs``
+       (``written_by``, from :func:`build_output_exposes`; the last one wins)
+    3. A table named like the expose
     4. None: an acquisition build's runner lands the expose (logged at
        debug), or nothing backs it (warned, and validate_plan reports it)
+
+    There is no step that lands "the last build's table" or "the first loaded
+    table" for an expose no build names: that wrote one build's rows (or an
+    input, raw) into another expose's file.
     """
     # Check explicit source
     source = expose.get("source_table") or expose.get("source")
     if source:
         return source
 
-    # The last build that produced a table: one this planner skipped (a Flink
-    # job, a dbt model) produced none, and taking its absence for "no build
-    # output" landed the first loaded input, raw, in the expose.
-    for build in reversed(builds):
-        if not isinstance(build, dict):
-            continue
-        output_table = build.get("output_table") or f"result_{build.get('id', '0')}"
-        if output_table in loaded_tables:
-            return output_table
+    expose_id = expose_id if expose_id is not None else get_expose_id(expose)
+    table = (written_by or {}).get(str(expose_id))
+    if table:
+        return table
 
     # Try to match by ID
-    expose_id = get_expose_id(expose)
     if expose_id in loaded_tables:
         return expose_id
-
-    # Fallback to first available table (sorted for determinism)
-    if loaded_tables:
-        return sorted(loaded_tables)[0]
 
     landed_by = _landed_by_runner(expose_id, builds)
     if landed_by:
