@@ -97,7 +97,11 @@ def _assert_real_outputs(project: Path) -> None:
     master_ids = _ids(master)
     assert _count(project, f"'{master.as_posix()}'") == expected
     assert len(master_ids) == expected, "customer_360_master has one row per customer"
-    assert _ids(high_value) <= master_ids
+    # The SQL measures recency against the newest order in the sample data, not today's date,
+    # so the VIP segment is the same on any day.
+    high_value_ids = _ids(high_value)
+    assert high_value_ids, "high_value_customers landed no rows"
+    assert high_value_ids <= master_ids
 
     _assert_no_placeholder(master)
     _assert_no_placeholder(high_value)
