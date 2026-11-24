@@ -1055,6 +1055,11 @@ _SCHEMA_REGISTRY = ("kafka-connect", "schema_registry")
 _CONVERTER_KEYS = ("key.converter.", "value.converter.", "header.converter.")
 
 
+def _converter_settings(config: Mapping[Any, Any]) -> Dict[Any, Any]:
+    """The settings of ``config`` that a Kafka Connect worker gives the converters (:data:`_CONVERTER_KEYS`)."""
+    return {k: v for k, v in config.items() if str(k).lower().startswith(_CONVERTER_KEYS)}
+
+
 def _map_at(node: Any, path: Tuple[str, ...]) -> Optional[Mapping[str, Any]]:
     """The map ``node`` holds at ``path``: a runner merges with ``dict.update``, which takes a list of
     key/value pairs as well, so a list is the map it makes. What is no map, and no list of pairs,
@@ -1130,18 +1135,20 @@ def _blocks_of(contract: Mapping[str, Any], base: str, build: Mapping[str, Any])
         label = _dotted(properties, path)
         if side == "sink":
             sink_blocks.append((label, written))
-            if path[0] == "kafka-connect":  # its sink config carries the converters' settings
-                reaches = {
-                    k: v for k, v in written.items() if str(k).lower().startswith(_CONVERTER_KEYS)
-                }
-                if reaches:
-                    converters.append((label, reaches))
+            if path[0] == "kafka-connect" and _converter_settings(written):
+                converters.append((label, _converter_settings(written)))
         else:
             groups.append(([(label, written)], [(label, written)]))
     if sink_blocks:
         groups.append((list(sink_blocks), list(sink_blocks)))
     registry = _map_at(props, _SCHEMA_REGISTRY)
     if registry is not None:
+        # A source kind that is no JDBC kind has its connection passed into the source connector config
+        # as it is, the registry's URL beside it: its converter keys reach the registry too.
+        connection = source.get("connection") if isinstance(source, Mapping) else None
+        reaches = _converter_settings(connection) if isinstance(connection, Mapping) else {}
+        if reaches:
+            converters.append((f"{properties}.source.connection", reaches))
         label = _dotted(properties, _SCHEMA_REGISTRY)
         groups.append(([(label, registry), *converters], [(label, registry)]))
     return groups

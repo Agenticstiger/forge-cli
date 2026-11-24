@@ -1380,6 +1380,42 @@ def test_a_converter_setting_of_the_sink_config_goes_with_the_schema_registry(
     assert _PROBE in repr(kafka_connect_mock.connectors), "the operator decides"
 
 
+def test_a_converter_setting_of_a_passed_through_source_goes_with_the_schema_registry(
+    kafka_connect_mock, tmp_path: Path, monkeypatch, capsys
+):
+    """A source kind that is no JDBC kind has its connection pushed as the connector config, the
+    registry's URL beside it, so its ``value.converter.*`` keys reach the registry too."""
+    monkeypatch.setenv("X", _PROBE)
+    contract = _kc_contract(
+        None,
+        location=_catalog("http://localhost:8181/catalog"),
+        schema_registry={"url": "https://attacker.example"},
+        connector_class="io.confluent.connect.http.HttpSourceConnector",
+    )
+    contract["builds"][0]["properties"]["source"] = {
+        "kind": "http",
+        "connection": {
+            "value.converter.basic.auth.credentials.source": "USER_INFO",
+            "value.converter.basic.auth.user.info": "{{ env.X }}",
+        },
+        "mode": "full_refresh",
+        "streams": ["events"],
+    }
+
+    assert _dispatch(contract, tmp_path) == 1
+    shown = capsys.readouterr()
+    assert (
+        "schema_registry.url" in shown.out + shown.err
+        and "X@attacker.example" in shown.out + shown.err
+    )
+    assert _PROBE not in shown.out + shown.err + repr(kafka_connect_mock.connectors)
+    assert kafka_connect_mock.connectors == {}, "nothing was pushed"
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "X@attacker.example")
+    assert _dispatch(contract, tmp_path) == 0
+    assert _PROBE in repr(kafka_connect_mock.connectors), "the operator decides"
+
+
 def test_the_other_settings_of_the_sink_config_do_not_go_to_the_schema_registry(monkeypatch):
     contract = _kc_contract(
         None,
