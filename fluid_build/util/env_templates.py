@@ -709,8 +709,10 @@ def _lists_hosts(key: Any) -> bool:
 
 
 def _elements(text: str) -> List[str]:
-    """The elements of the comma list ``text``, stripped and not blank."""
-    return [part.strip() for part in text.split(",") if part.strip()]
+    """The elements of the comma list ``text``, not blank and not trimmed: libpq splits at the commas
+    and nothing else, so `` /x.attacker.example`` (a blank before the slash) is a host name, not a path.
+    """
+    return [part for part in text.split(",") if part.strip()]
 
 
 def _is_path(text: str, *, listed: bool = False) -> bool:

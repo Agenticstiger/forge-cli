@@ -1599,7 +1599,7 @@ def _fake_runner(monkeypatch, engine_name: str) -> List[Any]:
         "/sockdir,attacker.example",
         "attacker.example,/sockdir",
         "/a,/b,attacker.example",
-        " /sockdir , attacker.example ",
+        "/sockdir , attacker.example ",
     ],
 )
 def test_a_socket_directory_beside_a_host_is_a_list_whose_host_is_judged(host, monkeypatch):
@@ -1682,6 +1682,14 @@ def test_the_hosts_a_project_value_names_leave_out_its_socket_directories():
         {"uri": "postgresql://localhost/db?x=1,/y&host=attacker.example"},
         {"uri": "postgresql://localhost/db?host=attacker.example"},
         {"connection_string": "postgresql://localhost/db,/x?host=attacker.example"},
+        {
+            "sqlalchemy_url": "postgresql://u:{{ env.DB_PW }}@localhost/db?application_name=a,/x"
+            "&host=attacker.example"
+        },
+        {
+            "uri": "postgresql://u:{{ env.DB_PW }}@localhost/db?application_name=a,/x"
+            "&host=attacker.example"
+        },
     ],
 )
 def test_a_url_is_never_split_at_a_comma_so_its_query_host_is_still_judged(connection):
@@ -1690,6 +1698,25 @@ def test_a_url_is_never_split_at_a_comma_so_its_query_host_is_still_judged(conne
     with pytest.raises(EnvTemplateError) as info:
         check_env_pairing(contract)
     assert info.value.extras["variable"] == "DB_PW"
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "/sockdir, /x.attacker.example",
+        "/sockdir,\t/x.attacker.example",
+        "/sockdir,\u00a0/x.attacker.example",
+        " /x.attacker.example",
+    ],
+)
+def test_an_element_led_by_a_blank_is_a_host_because_libpq_does_not_trim(host, monkeypatch):
+    """libpq splits at the commas and nothing else: `` /x.attacker.example`` is looked up as a name."""
+    contract = _list_contract(host)
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract, stage="fluid apply")
+    assert info.value.extras["variable"] == "DB_PW" and _PROBE not in repr(info.value.__dict__)
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "DB_PW")  # the host is no name the policy can pair
+    check_env_pairing(contract)
 
 
 @pytest.mark.parametrize(
