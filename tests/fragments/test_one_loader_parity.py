@@ -1840,22 +1840,22 @@ def test_g24_an_error_in_a_shared_fragment_fails_each_product_in_both_forms(
 # ── G-25 · the contract digest (SG-24) ─────────────────────────────────────
 
 
-def test_g25_the_contract_digest_is_unchanged_by_a_fragment_edit(
+def test_g25_the_contract_digest_follows_a_fragment_edit(
     fx: Path, flat: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """SG-24, characterization. ``fluid contract digest`` hashes the root file as parsed, so
-    removing a column inside a fragment leaves the digest, and any upstream pin made from
-    it, as it was. Reported as a finding."""
+    """SG-24, fixed. ``fluid contract digest`` hashes the composed contract, as every stage reads
+    it, so removing a column inside a fragment moves the digest, and so every upstream pin made
+    from it. It was a finding while the digest hashed the root file as parsed."""
     before = run_in(fx.parent, ["contract", "digest", "contract.fluid.yaml"], capsys, monkeypatch)
-    _write(fx.parent / "schemas" / "out-columns.yaml", _dump(SCHEMA[:1]))
-    after = run_in(fx.parent, ["contract", "digest", "contract.fluid.yaml"], capsys, monkeypatch)
     from_flat = run_in(
         flat.parent, ["contract", "digest", "contract.fluid.yaml"], capsys, monkeypatch
     )
+    _write(fx.parent / "schemas" / "out-columns.yaml", _dump(SCHEMA[:1]))
+    after = run_in(fx.parent, ["contract", "digest", "contract.fluid.yaml"], capsys, monkeypatch)
 
     assert before[0] == after[0] == from_flat[0] == 0
-    assert before[1].strip() == after[1].strip()
-    assert from_flat[1].strip() != before[1].strip()
+    assert before[1].strip() == from_flat[1].strip(), "split and flat: one digest"
+    assert after[1].strip() != before[1].strip()
 
 
 def test_g25_the_library_digest_is_the_composed_contracts_and_does_change(fx: Path) -> None:
