@@ -517,7 +517,7 @@ def test_overlapping_rewrites_of_one_target_lose_no_row(tmp_path, name, fmt):
     seed.execute(f"COPY (SELECT 0 AS seq) TO '{target}' ({options})")
     seed.close()
     columns = {"seq": "BIGINT"} if fmt == "ndjson" else None
-    errors: List[BaseException] = []
+    errors: List[Exception] = []
     workers, rounds = 3, 10
 
     def work(worker: int) -> None:
@@ -526,7 +526,7 @@ def test_overlapping_rewrites_of_one_target_lose_no_row(tmp_path, name, fmt):
             for i in range(rounds):
                 con.execute(f"CREATE OR REPLACE TABLE new_rows AS SELECT {worker * 100 + i} AS seq")
                 _union_rewrite(con, str(target), fmt, "new_rows", columns)
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - the worker reports any failure to the test
             errors.append(exc)
         finally:
             con.close()

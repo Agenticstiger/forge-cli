@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import errno
 import functools
 import hashlib
 import logging
@@ -760,6 +759,8 @@ def _remove_quietly(path: str) -> None:
     try:
         os.unlink(path)
     except OSError:
+        # Cleanup is best effort: a temp that is already gone, or cannot be removed, must
+        # not replace the error (or the result) of the rewrite that is being cleaned up after.
         pass
 
 
