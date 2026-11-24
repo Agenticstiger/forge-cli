@@ -622,8 +622,12 @@ def validate_bundle(
         dialect: Optional[str] = None
         if "contract.resolved.yaml" in declared_files:
             try:
+                from fluid_build.contract_refs import unescape_ref_keys
+
                 raw_doc = load_yaml_safe(_read_tgz_file(tar, "contract.resolved.yaml"))
-                resolved_contract = unwrap_source_pointers(raw_doc, _resolve)
+                # Checked as the contract it holds: ``fluid bundle`` writes a
+                # payload's literal ``$ref`` key ``$$ref``, read back here first.
+                resolved_contract = unwrap_source_pointers(unescape_ref_keys(raw_doc), _resolve)
                 dialect = infer_sqlglot_dialect(resolved_contract)
             except (yaml.YAMLError, ValueError) as exc:
                 issues.append(

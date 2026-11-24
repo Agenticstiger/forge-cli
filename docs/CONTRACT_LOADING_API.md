@@ -119,12 +119,14 @@ or an overlay that names files itself, raises
 
 In the engine's order:
 
-1. **Parse**: JSON, or YAML through the engine's billion-laughs guard.
+1. **Parse**: JSON, or YAML through the engine's billion-laughs guard. A key
+   written twice in one mapping is refused, in every file composed.
 2. **`$ref` composition**: each `{"$ref": "./file.yaml#/pointer"}` replaced by
    its target, resolved against the contract's directory (or `base_dir`) by the
    engine's resolver and under its path rules (see `docs/contract-refs.md`):
    a text file (`.sql`, `.md`, ...) is its text, keys beside `$ref` are merged
-   over the target, and a fragment may have any root.
+   over the target, and a fragment may have any root. A key written `$$ref` is
+   never resolved: it is the literal key `$ref` in the result.
 3. **Overlay**: for `env`, the first of `overlays/<env>.yaml|yml|json`,
    `<env>.yaml|yml|json`, `<contract-stem>.<env>.yaml|yml|json` next to the
    contract, its own `$ref` values composed relative to the overlay file,
@@ -180,7 +182,7 @@ A frozen dataclass.
 | `env` | `str \| None` | The env requested. |
 | `overlay` | `Path \| None` | The overlay file merged for `env` (never set for a bundle). A matching overlay is always applied; one that cannot be is a load error. |
 | `files` | `tuple[Path, ...]` | Every file composed: the source, each `$ref` target in first-read order (text files included), the overlay and its `$ref` targets. |
-| `unresolved_refs` | `tuple[str, ...]` | `$ref` values left in `contract`, in document order: only an in-memory load without `base_dir` of a document that names other files leaves any. |
+| `unresolved_refs` | `tuple[str, ...]` | `$ref` values left in `contract`, in document order: only an in-memory load without `base_dir` of a document that names other files leaves any, or a bundle written by hand. A literal `$ref` key (written `$$ref`) is not listed. |
 | `digest` | `str` (property) | `sha256:<hex>` of the planned contract via `compute_contract_digest`, the plan digest's canonicalisation. Not the `fluid contract digest` / `upstreamDigest` value. Raises `contract_not_serialisable` when JSON cannot represent the contract. |
 
 ### `ContractLoadError`
@@ -191,7 +193,7 @@ there is one, and the engine's exception as `__cause__`:
 | `event` | When |
 |---|---|
 | `contract_not_found` | The contract file does not exist, or `path` / `base_dir` cannot name a file (it holds a NUL byte). |
-| `contract_parse_failed` | The text is not valid JSON/YAML, is not UTF-8, or trips the YAML size/anchor guard. |
+| `contract_parse_failed` | The text is not valid JSON/YAML, is not UTF-8, writes a key twice in one mapping, or trips the YAML size/anchor guard. |
 | `contract_not_a_mapping` | The document (or overlay) root is not an object, from a file (with or without `env`, an overlay or not) or from text. |
 | `contract_ref_unresolved` | A `$ref` target is missing, cyclic, blocked, or its pointer does not resolve. |
 | `contract_env_invalid` | `env` is not a single path component: it is empty, `.` or `..`, holds `/`, `\` or NUL, or is drive-qualified (`C:prod`, on every platform). |

@@ -11,9 +11,11 @@ import logging
 from pathlib import Path
 
 import pytest
+import yaml
 
 from fluid_build.cli import generate_iac
 from fluid_build.cli._common import CLIError
+from fluid_build.util.env_templates import EnvTemplateError, placeholder_names
 
 pytestmark = [pytest.mark.unit, pytest.mark.provider]
 
@@ -234,6 +236,16 @@ class TestGenerateIacValidate:
         assert generate_iac.run(args, logging.getLogger("test")) == 0
 
 
+@pytest.fixture
+def aws_example_env(monkeypatch):
+    """Export the variables the AWS examples below name: a command refuses an unset one."""
+    for example in ("aws-iceberg-lakehouse", "aws-s3-glue-athena"):
+        text = (_EXAMPLES / example / "contract.fluid.yaml").read_text(encoding="utf-8")
+        for name in placeholder_names(yaml.safe_load(text)):
+            monkeypatch.setenv(name, "123456789012" if "ACCOUNT_ID" in name else "example-value")
+
+
+@pytest.mark.usefixtures("aws_example_env")
 class TestProviderMismatchEndToEnd:
     """The reported reproduction, driven through ``generate_iac.run``.
 
@@ -299,6 +311,7 @@ class TestProviderMismatchEndToEnd:
         assert doc.get("resource")
 
 
+@pytest.mark.usefixtures("aws_example_env")
 class TestEmptyModuleGate:
     """A module with no resources provisions nothing — that is a failure.
 
@@ -369,12 +382,13 @@ class TestEnvTemplateResolution:
         out = resolve_env_templates_in_contract(contract)
         assert out["exposes"][0]["binding"]["location"]["database"] == "ANALYTICS_PROD"
 
-    def test_unresolved_template_is_left_intact(self, monkeypatch):
+    def test_unresolved_template_is_refused_by_name(self, monkeypatch):
         from fluid_build.cli._common import resolve_env_templates_in_contract
 
         monkeypatch.delenv("FLUID_NO_SUCH_VAR", raising=False)
-        out = resolve_env_templates_in_contract({"x": "{{ env.FLUID_NO_SUCH_VAR }}"})
-        assert out["x"] == "{{ env.FLUID_NO_SUCH_VAR }}"
+        with pytest.raises(EnvTemplateError) as excinfo:
+            resolve_env_templates_in_contract({"x": "{{ env.FLUID_NO_SUCH_VAR }}"})
+        assert excinfo.value.extras["missing"] == ["FLUID_NO_SUCH_VAR"]
 
     def test_generate_iac_resolves_env_templates_in_emitted_module(self, tmp_path, monkeypatch):
         monkeypatch.setenv("FLUID_TEST_DATASET", "analytics_prod")

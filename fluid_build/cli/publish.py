@@ -727,7 +727,7 @@ def _publish_catalog_config(
 
 def _warn_env_templates_kept(catalog_name: str, project_file: str, contract: Any) -> None:
     """Say that ``{{ env.* }}`` stays literal for an endpoint the checkout named."""
-    from fluid_build.providers.snowflake.util.config import ENV_TEMPLATE_RE
+    from fluid_build.util.env_templates import ENV_TEMPLATE_RE
 
     names: List[str] = []
 

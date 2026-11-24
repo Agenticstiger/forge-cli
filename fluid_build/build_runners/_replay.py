@@ -114,14 +114,20 @@ def find_downstream_products(
     whose ``consumes[]`` lives in a fragment is found too.
     Errors during a single contract read (a file that does not parse,
     a ref that does not resolve) do NOT abort the walk — broken
-    contracts get logged + skipped.
+    contracts get logged + skipped. The contracts are other products',
+    read for two values, so their ref warnings are DEBUG lines here, left
+    for their own authors (:func:`fluid_build.contract_refs.quiet_ref_warnings`).
     """
+    from fluid_build.contract_refs import quiet_ref_warnings
     from fluid_build.loader import load_contract_fields
 
     matches: List[Dict[str, Any]] = []
     for path in sorted(workspace_root.rglob("*.fluid.yaml")):
         try:
-            contract = load_contract_fields(path, "id", "consumes")
+            with quiet_ref_warnings(
+                "the replay walk read this contract only for its id and consumes[]"
+            ):
+                contract = load_contract_fields(path, "id", "consumes")
         except Exception as exc:  # noqa: BLE001 - one broken contract must not stop the walk
             LOG.debug("downstream_walk_skip: path=%s error=%s", path, exc)
             continue

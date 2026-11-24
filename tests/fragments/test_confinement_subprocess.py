@@ -25,7 +25,7 @@ from typing import Any, Dict, Iterator, List, Optional
 import pytest
 import yaml
 
-from fluid_build import loader
+from fluid_build import contract_refs, loader
 
 CHECKOUT = Path(__file__).resolve().parents[2]
 SECRET = "SECRET-1"  # pragma: allowlist secret
@@ -76,6 +76,7 @@ def _fresh_loader_state() -> Iterator[None]:
         for name, value in vars(loader).items()
         if name.startswith("_NOTED_") and isinstance(value, set)
     ]
+    registries.append(contract_refs._NOTED_REF_WARNINGS)  # not a loader attribute
     for registry in registries:
         registry.clear()
     yield

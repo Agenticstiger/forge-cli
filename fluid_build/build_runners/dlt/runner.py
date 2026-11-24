@@ -433,10 +433,8 @@ def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
     # ``resolve_env_templates`` (leaves the placeholder intact on miss) rather
     # than the base runner's ``_resolve_env_placeholders`` (replaces with "")
     # so the error message clearly identifies the missing variable name.
-    from fluid_build.providers.snowflake.util.config import (
-        ENV_TEMPLATE_RE,
-        resolve_env_templates,
-    )
+    from fluid_build.providers.snowflake.util.config import resolve_env_templates
+    from fluid_build.util.env_templates import ENV_TEMPLATE_RE
 
     _raw_dataset = dlt_props.get("dataset_name") or "fluid_acquire"
     dataset_name = resolve_env_templates(_raw_dataset)

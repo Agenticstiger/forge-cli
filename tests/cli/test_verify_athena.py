@@ -1258,12 +1258,6 @@ def test_a_table_holding_what_the_copy_wrote_passes_though_the_source_grew(
             "(Glue + Athena, eu-north-1)",
             id="template-resolved",
         ),
-        pytest.param(
-            {"AWS_REGION": "eu-north-1"},
-            "eu-north-1",
-            "(Glue + Athena, eu-north-1 from AWS_REGION)",
-            id="template-unset-falls-back-like-apply",
-        ),
     ],
 )
 def test_a_templated_region_is_resolved_not_refused(
@@ -1285,6 +1279,22 @@ def test_a_templated_region_is_resolved_not_refused(
     assert result["status"] == "match"
     assert set(aws.requested) == {("glue", region), ("athena", region)}
     assert result["target"].endswith(target)
+
+
+def test_a_templated_region_whose_variable_is_unset_is_refused_naming_it(
+    tmp_path, aws, monkeypatch
+):
+    monkeypatch.setenv("AWS_REGION", "eu-north-1")
+    monkeypatch.delenv("DEMO_REGION", raising=False)
+    overlay = AWS_OVERLAY.replace("region: eu-north-1", "region: '{{ env.DEMO_REGION }}'")
+    contract = _write_contract(tmp_path, overlay=overlay)
+
+    code, report = _verify(tmp_path, contract)
+
+    error = report["results"]["subscriptions"]["error"]
+    assert code == 1
+    assert "DEMO_REGION" in error and "unset or empty" in error
+    assert aws.requested == []
 
 
 def test_the_region_in_the_aws_config_profile_is_used(tmp_path, aws, monkeypatch):
@@ -1430,7 +1440,7 @@ def test_a_template_whose_variable_is_unset_is_refused_naming_it(tmp_path, aws, 
 
     error = report["results"]["subscriptions"]["error"]
     assert code == 1
-    assert "binding.location.table" in error and "GLUE_TABLE is not set" in error
+    assert "GLUE_TABLE" in error and "unset or empty" in error
     assert aws.requested == []
 
 

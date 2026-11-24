@@ -29,6 +29,7 @@ from fluid_build.build_runners.kafka_connect.iceberg_sink_validation import (
     iceberg_sink_preflight,
     validate_iceberg_sink,
 )
+from fluid_build.util.env_templates import EnvTemplateError
 
 pytestmark = [pytest.mark.unit]
 
@@ -144,8 +145,22 @@ def _run_plan(contract: Dict[str, Any], tmp_path: Path, monkeypatch) -> int:
     )
 
 
-def _log(caplog) -> str:
-    return "\n".join(r.getMessage() for r in caplog.records)
+def _refused(contract: Dict[str, Any], tmp_path: Path, monkeypatch, capsys) -> str:
+    """Run the plan path and return what refused it, which must name the variable.
+
+    An unset variable reaches the dispatcher, which prints the typed error and returns 1; an
+    empty one is refused earlier, while the plan's contract is resolved, and raises it.
+    """
+    try:
+        rc = _run_plan(contract, tmp_path, monkeypatch)
+    except EnvTemplateError as exc:
+        assert exc.extras["missing"] == [_VAR]
+        return str(exc.what)
+    assert rc == 1
+    captured = capsys.readouterr()
+    text = captured.out + captured.err
+    assert _VAR in text, text
+    return text
 
 
 def _props_path(tmp_path: Path) -> Path:
@@ -161,21 +176,15 @@ def _props_path(tmp_path: Path) -> Path:
 @pytest.mark.parametrize("bucket", [_PARTIAL, _FULL], ids=["partial", "full"])
 @pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
 def test_kc_plan_path_refuses_a_bucket_that_does_not_resolve(
-    fake_connect, tmp_path, monkeypatch, caplog, catalog, bucket, value
+    fake_connect, tmp_path, monkeypatch, capsys, catalog, bucket, value
 ):
     _set(monkeypatch, value)
-    # A Kafka Connect BigQuery sink is refused only with auto-create on.
     contract = _contract("kafka-connect", catalog, bucket, auto_create=catalog == "bigquery")
     if catalog == "jdbc":
         contract["exposes"][0]["binding"]["location"]["uri"] = "jdbc:postgresql://pg/ice"
-    with caplog.at_level(logging.INFO):
-        rc = _run_plan(contract, tmp_path, monkeypatch)
-    assert rc == 1
+    text = _refused(contract, tmp_path, monkeypatch, capsys)
     # Nothing reached the cluster: no sink in a bucket the contract does not name.
     assert fake_connect == []
-    text = _log(caplog)
-    assert "iceberg sink preflight failed" in text
-    assert f"{_VAR} is unset or empty in the runner's environment" in text
     assert "acme--lake" not in text
 
 
@@ -190,16 +199,12 @@ def test_kc_plan_path_derives_from_the_resolved_bucket(fake_connect, tmp_path, m
 
 @pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
 def test_debezium_plan_path_refuses_a_bucket_that_does_not_resolve(
-    tmp_path, monkeypatch, caplog, value
+    tmp_path, monkeypatch, capsys, value
 ):
     _set(monkeypatch, value)
-    with caplog.at_level(logging.INFO):
-        rc = _run_plan(_contract("debezium", "dynamodb", _PARTIAL), tmp_path, monkeypatch)
-    assert rc == 1
+    contract = _contract("debezium", "dynamodb", _PARTIAL)
+    text = _refused(contract, tmp_path, monkeypatch, capsys)
     assert not _props_path(tmp_path).exists()
-    text = _log(caplog)
-    assert "iceberg sink preflight failed" in text
-    assert f"{_VAR} is unset or empty in the runner's environment" in text
     assert "acme--lake" not in text
 
 
@@ -212,16 +217,13 @@ def test_debezium_plan_path_derives_from_the_resolved_bucket(tmp_path, monkeypat
 
 
 def test_plan_path_matches_a_binding_the_plan_resolver_stripped(
-    fake_connect, tmp_path, monkeypatch, caplog
+    fake_connect, tmp_path, monkeypatch, capsys
 ):
-    # ``resolve_contract_env_templates`` strips every string it renders; the
-    # binding is still found in the plan as written.
+    # The binding is padded with spaces in the plan; the refusal still names the variable.
     _set(monkeypatch, "")
     contract = _contract("kafka-connect", "dynamodb", " %s " % _PARTIAL)
-    with caplog.at_level(logging.INFO):
-        assert _run_plan(contract, tmp_path, monkeypatch) == 1
+    _refused(contract, tmp_path, monkeypatch, capsys)
     assert fake_connect == []
-    assert f"{_VAR} is unset or empty in the runner's environment" in _log(caplog)
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +263,9 @@ def test_handwritten_kc_config_ignores_an_unset_bucket_variable(
     assert not [w for w in warnings if _VAR in w], warnings
     assert iceberg_sink_preflight(contract, "b1") is None
 
+    # A run still needs the variable the contract names; once it is set, the sink gets the
+    # config as written, not one derived from the bucket.
+    _set(monkeypatch, "prod")
     monkeypatch.chdir(tmp_path)
     rc = base._execute_acquisition_build(contract["builds"][0], contract, tmp_path, dry_run=False)
     assert rc == 0

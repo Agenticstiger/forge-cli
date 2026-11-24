@@ -153,6 +153,7 @@ def _hermetic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         for name, value in vars(loader).items()
         if name.startswith("_NOTED_") and isinstance(value, set)
     ]
+    registries.append(contract_refs._NOTED_REF_WARNINGS)  # not a loader attribute
     for registry in registries:
         registry.clear()
     yield

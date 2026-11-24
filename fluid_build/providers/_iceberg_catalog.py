@@ -21,9 +21,10 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from fluid_build.util.env_templates import ENV_TEMPLATE_RE
+
 from ._sql_safety import validate_ident
 from .aws.util.warehouse import (
-    _ENV_TEMPLATE_RE,
     get_iceberg_warehouse,
     normalize_location,
     resolve_env_templates,
@@ -730,14 +731,14 @@ def _rendered_bucket(loc: Mapping[str, Any]) -> str:
     contract does not name.
     """
     raw = str(loc.get("bucket") or "").strip()
-    if not raw or _unset_env_vars(raw) or "{{" in _ENV_TEMPLATE_RE.sub("", raw):
+    if not raw or _unset_env_vars(raw) or "{{" in ENV_TEMPLATE_RE.sub("", raw):
         return ""
     return str(resolve_env_templates(raw)).strip()
 
 
 def _unset_env_vars(raw: str) -> Tuple[str, ...]:
     """The ``{{ env.* }}`` variables ``raw`` names that are unset or empty here."""
-    found = (name.strip() for name in _ENV_TEMPLATE_RE.findall(raw))
+    found = (name.strip() for name in ENV_TEMPLATE_RE.findall(raw))
     return tuple(dict.fromkeys(name for name in found if not os.environ.get(name)))
 
 
@@ -767,7 +768,7 @@ def unset_bucket_env_vars(binding: Mapping[str, Any], kind: str) -> Tuple[str, .
         # :func:`iceberg_storage_uri` reads the bucket unless the warehouse
         # carries a scheme.
         reads_bucket = kind == "bigquery" and not warehouse.startswith(_WAREHOUSE_SCHEMES)
-    if not raw or not reads_bucket or "{{" in _ENV_TEMPLATE_RE.sub("", raw):
+    if not raw or not reads_bucket or "{{" in ENV_TEMPLATE_RE.sub("", raw):
         return ()
     return _unset_env_vars(raw)
 

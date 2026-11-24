@@ -78,7 +78,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
 import yaml
@@ -96,7 +96,7 @@ from fluid_build._net import _hostname_is_private
 # formatting the same contract differently disagree *silently*, which is
 # exactly the drift ``upstreamDigest`` pinning exists to catch. Safe for
 # the light-CLI cold path — ``plan_digest`` imports stdlib only.
-from fluid_build.forge.core.plan_digest import compute_contract_digest
+from fluid_build.forge.core.plan_digest import compute_contract_file_digest
 from fluid_build.util.safe_http import MAX_REMOTE_BYTES
 from fluid_build.util.safe_yaml import MAX_YAML_BYTES, UnsafeYamlError, load_yaml_safe
 
@@ -686,6 +686,12 @@ def _write_cache(path: Path, payload: Mapping[str, Any]) -> None:
         )
 
 
+#: What a digest in the cache hashes. A cache written before the digest covered ``$ref``
+#: fragments holds root-file digests, which no longer match what a pin is made from.
+_CACHE_FORMAT_KEY = "__digest_of"
+_CACHE_FORMAT = "composed-contract"
+
+
 def get_cached_digest(
     workspace_root: Path,
     workspace_id: str,
@@ -695,6 +701,8 @@ def get_cached_digest(
     """Return the cached digest for ``product_id@version`` from
     ``workspace_id``, or ``None`` when the cache is empty / stale."""
     cache = _read_cache(_cache_path(workspace_root, workspace_id))
+    if cache.get(_CACHE_FORMAT_KEY) != _CACHE_FORMAT:
+        return None  # made by the algorithm that hashed the root file alone
     return cache.get(f"{product_id}@{version}")
 
 
@@ -708,6 +716,9 @@ def store_cached_digest(
     """Persist a freshly-fetched digest into the per-workspace cache."""
     path = _cache_path(workspace_root, workspace_id)
     cache = _read_cache(path)
+    if cache.get(_CACHE_FORMAT_KEY) != _CACHE_FORMAT:
+        cache = {}  # digests of the old algorithm would be served beside the new ones
+    cache[_CACHE_FORMAT_KEY] = _CACHE_FORMAT
     cache[f"{product_id}@{version}"] = digest
     cache["__updated_at"] = (
         datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -1267,55 +1278,74 @@ def _fetch_digest_via_git(
 ) -> Optional[str]:
     """Git-registry backend.
 
-    Two paths, in order:
-
-    1. **gitpython** (if installed) — clone (or open existing cache)
-       the repo at ``workspace.endpoint``, read the file at the
-       resolved product path, and recompute its digest via
-       :func:`fluid_build.forge.core.plan_digest.compute_contract_digest`.
-    2. **shell-out to git** — for environments where gitpython isn't
-       available; same logic, ``subprocess.run(["git", "clone", ...])``.
+    Clones (or refreshes the cached clone of) the repo at
+    ``workspace.endpoint`` with a bounded ``git`` shell-out, finds the product's
+    contract in it, and returns its digest
+    (:func:`fluid_build.forge.core.plan_digest.compute_contract_file_digest`).
 
     The product path resolves from ``workspace.endpoint`` +
     ``product_id`` + the conventional file ``contract.fluid.yaml``.
 
-    The contract is **parsed and canonicalised** before hashing — never
+    The contract is **composed and canonicalised** before hashing, never
     hashed as raw text. Peers format the same contract differently (key
     order, indentation, quoting, comments, CRLF), and a text hash would
-    make every one of those look like upstream drift. Returns ``None``
-    on an unreadable or malformed upstream contract, which the caller
-    escalates to a violation — federation fails closed, never on a
-    weaker digest.
+    make every one of those look like upstream drift. Composed, because an
+    upstream may keep parts of its contract in ``$ref`` fragments, and what
+    it deploys is the whole: the same digest ``fluid contract digest`` prints
+    for the contract in the upstream's own checkout. The refs may reach only
+    files inside the clone, whatever ``FLUID_REF_ROOT`` or a workspace file in
+    the clone say: the upstream is another mesh's, and its contract must not
+    read the operator's files. Returns ``None`` on an unreadable or malformed
+    upstream contract, or one whose ``$ref`` does not resolve, which the caller
+    escalates to a violation: federation fails closed, never on a weaker digest.
     """
-    contract_text = _git_read_contract(workspace, product_id)
-    if not contract_text:
+    found = _git_contract_file(workspace, product_id)
+    if found is None:
         return None
 
+    from fluid_build.contract_refs import quiet_ref_warnings
+    from fluid_build.loader import RefResolutionError
+
     try:
-        contract = load_yaml_safe(contract_text)
-    except (UnsafeYamlError, yaml.YAMLError) as exc:
+        # Another mesh's contract, read only for its digest: its ref warnings are
+        # for its own authors, and name files of a cache the caller cannot see.
+        with quiet_ref_warnings(
+            "the federation gate read this upstream contract only for its digest"
+        ):
+            return compute_contract_file_digest(found.path, ref_root=found.root)
+    except RefResolutionError as exc:
+        from fluid_build.util.excerpt import excerpt
+
+        LOG.warning(
+            "federation_git_contract_unresolvable: workspace=%s product=%s err=%s",
+            workspace.id,
+            product_id,
+            excerpt(str(exc)),
+        )
+    except (RuntimeError, ValueError, OSError, yaml.YAMLError) as exc:
+        # The file cannot be read, parsed or digested: the loader raises RuntimeError for a
+        # file it cannot parse, ValueError for an empty or non-object contract. Anything else
+        # is a defect in forge, and surfaces.
         LOG.warning(
             "federation_git_contract_unparseable: workspace=%s product=%s err=%s",
             workspace.id,
             product_id,
             type(exc).__name__,
         )
-        return None
-
-    if not isinstance(contract, Mapping):
-        LOG.warning(
-            "federation_git_contract_not_a_mapping: workspace=%s product=%s got=%s",
-            workspace.id,
-            product_id,
-            type(contract).__name__,
-        )
-        return None
-
-    return compute_contract_digest(contract)
+    return None
 
 
-def _git_read_contract(workspace: FederatedWorkspace, product_id: str) -> Optional[str]:
-    """Read the contract file text from the federated git repo.
+class _ClonedContract(NamedTuple):
+    """A product's contract file in the federation clone, and the clone itself: the
+    root its ``$ref`` fragments are confined to."""
+
+    path: Path
+    root: Path
+
+
+def _git_refresh_clone(workspace: FederatedWorkspace) -> Optional[Path]:
+    """Clone or refresh the federated git repo; its cache directory, or ``None``
+    when it cannot be reached.
 
     Tries gitpython first (in-process — no fork, surfaces detailed
     errors), then shells out to ``git`` as a fallback. Caches the
@@ -1367,7 +1397,31 @@ def _git_read_contract(workspace: FederatedWorkspace, product_id: str) -> Option
     ):
         return None
 
+    return cache_dir
+
+
+def _git_read_contract(workspace: FederatedWorkspace, product_id: str) -> Optional[str]:
+    """The text of the product's contract file in the federated git repo, or ``None``.
+
+    The digest is not taken from this text: the contract's ``$ref`` fragments are
+    files too, so :func:`_git_contract_file` gives the path they resolve from.
+    Raises what :func:`_git_refresh_clone` raises.
+    """
+    cache_dir = _git_refresh_clone(workspace)
+    if cache_dir is None:
+        return None
     return _read_first_existing_contract(cache_dir, workspace, product_id)
+
+
+def _git_contract_file(workspace: FederatedWorkspace, product_id: str) -> Optional[_ClonedContract]:
+    """The product's contract file in the refreshed clone, with the clone as its ref
+    root, or ``None`` when the clone or the file is missing.
+    Raises what :func:`_git_refresh_clone` raises."""
+    cache_dir = _git_refresh_clone(workspace)
+    if cache_dir is None:
+        return None
+    path = _first_existing_contract_path(cache_dir, workspace, product_id)
+    return None if path is None else _ClonedContract(path, cache_dir.resolve())
 
 
 def _git_remote_url(workspace: FederatedWorkspace) -> str:
@@ -1931,12 +1985,13 @@ def _git_repair_origin(
 _PRODUCT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 
 
-def _read_first_existing_contract(
+def _first_existing_contract_path(
     cache_dir: Path, workspace: FederatedWorkspace, product_id: str
-) -> Optional[str]:
+) -> Optional[Path]:
     """Resolve the product path inside a cloned repo. Convention:
     ``<product_id>/contract.fluid.yaml``. Tolerates dot-paths that
-    map to nested directories."""
+    map to nested directories. ``None`` when no candidate is a regular file
+    inside the clone, or the one found is over :data:`MAX_YAML_BYTES`."""
     if not _PRODUCT_ID_RE.fullmatch(product_id or ""):
         LOG.warning(
             "federation_git_contract_rejected: workspace=%s — product_id is not "
@@ -1971,7 +2026,7 @@ def _read_first_existing_contract(
                         MAX_YAML_BYTES,
                     )
                     return None
-                return resolved.read_text(encoding="utf-8")
+                return resolved
             except OSError as exc:  # pragma: no cover
                 LOG.warning(
                     "federation_git_contract_read_failed: path=%s err=%s",
@@ -1987,6 +2042,20 @@ def _read_first_existing_contract(
         [str(p.relative_to(cache_dir)) for p in candidate_paths],
     )
     return None
+
+
+def _read_first_existing_contract(
+    cache_dir: Path, workspace: FederatedWorkspace, product_id: str
+) -> Optional[str]:
+    """The text of the file :func:`_first_existing_contract_path` finds, or ``None``."""
+    path = _first_existing_contract_path(cache_dir, workspace, product_id)
+    if path is None:
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:  # pragma: no cover
+        LOG.warning("federation_git_contract_read_failed: path=%s err=%s", path, exc)
+        return None
 
 
 @dataclass

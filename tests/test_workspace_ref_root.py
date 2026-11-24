@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from fluid_build import loader
+from fluid_build import contract_refs, loader
 from fluid_build.loader import RefConfinementError, load_contract
 
 _CONTRACT = """\
@@ -224,3 +224,34 @@ def test_an_unreadable_workspace_file_declares_nothing(
     assert str(source.resolve()) in warned.getMessage()
     assert "cannot be parsed" in warned.getMessage()
     assert "cannot be parsed" in str(err.value)
+
+
+def test_a_neighbours_ignored_workspace_root_is_a_debug_line_inside_a_quiet_block(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Read for a few values of another product (the composition rule, the replay walk, a
+    build's upstream), the contract's workspace warning names that workspace's file: a DEBUG
+    line, and the warn-once registry is left alone so the contract's own author still hears it."""
+    path = _workspace(tmp_path, "ref_root: shared")
+    why = "a test reads this contract for another product"
+
+    with caplog.at_level(logging.DEBUG, logger="fluid.loader"):
+        with contract_refs.quiet_ref_warnings(why):
+            with pytest.raises(RefConfinementError, match="escapes the ref root"):
+                load_contract(path)
+
+    (said,) = [
+        r for r in caplog.records if getattr(r, "event", None) == "workspace_ref_root_ignored"
+    ]
+    assert said.levelno == logging.DEBUG
+    assert f"A DEBUG line, not a WARNING: {why}." in said.getMessage()
+    assert loader._NOTED_WORKSPACE_REF_ROOT_IGNORED == set()
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="fluid.loader"):
+        with pytest.raises(RefConfinementError, match="escapes the ref root"):
+            load_contract(path)  # the contract's own author, composing it for themselves
+    (own,) = [
+        r for r in caplog.records if getattr(r, "event", None) == "workspace_ref_root_ignored"
+    ]
+    assert own.levelno == logging.WARNING

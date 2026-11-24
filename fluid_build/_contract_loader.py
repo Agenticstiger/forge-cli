@@ -17,9 +17,10 @@ contracts and raises ``CLIError``), so it must never import from
 Two rules keep that invariant true, and both are load-bearing:
 
 * Every ``fluid_build.*`` dependency here is either (a) imported *inside* a
-  function (lazy) and known not to reach ``cli`` — ``forge.core.bundle`` /
-  ``forge.core.validators`` / ``observability.secret_redactor`` /
-  ``providers.snowflake.util.config`` — or (b) resolved dynamically by name
+  function (lazy) and known not to reach ``cli`` — ``contract_refs`` /
+  ``forge.core.bundle`` / ``forge.core.validators`` /
+  ``observability.secret_redactor`` / ``providers.snowflake.util.config`` —
+  or (b) resolved dynamically by name
   through :func:`_imp` so the static import graph carries no edge.
 * ``fluid_build.loader`` is reached **only** through :func:`_imp` (never a
   literal ``import``), because ``loader`` itself lazily reaches
@@ -38,8 +39,6 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import logging
-import os
-import re
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -120,6 +119,17 @@ def _is_bundle_path(path: str) -> bool:
 def _load_contract_from_bundle(path: str, logger: logging.Logger) -> Dict[str, Any]:
     """Load the resolved contract from inside a ``.tgz`` / ``.tar.gz`` bundle.
 
+    :func:`_read_bundle_contract`'s contract.
+    """
+    return _read_bundle_contract(path, logger)[0]
+
+
+def _read_bundle_contract(
+    path: str, logger: logging.Logger
+) -> Tuple[Dict[str, Any], Tuple[str, ...]]:
+    """The resolved contract inside a ``.tgz`` / ``.tar.gz`` bundle, and the ``$ref``
+    values it holds as written.
+
     ``fluid bundle`` (pipeline stage 1) emits a gzip tarball whose payload
     includes ``contract.resolved.{yaml,json}`` plus a tamper-evident
     ``MANIFEST.json``. ``fluid validate`` already understands this layout
@@ -137,10 +147,17 @@ def _load_contract_from_bundle(path: str, logger: logging.Logger) -> Dict[str, A
          is read with the bounded reader (decompression-bomb cap) and
          parsed via ``loader.parse_contract_text`` — same billion-laughs
          guard as the on-disk path.
-      3. ``unwrap_source_pointers`` resolves any ``{"$source": "sources/…"}``
+      3. Its escaped keys are read (``contract_refs.unescape_ref_keys``):
+         ``fluid bundle`` writes a payload's literal ``$ref`` key as
+         ``$$ref`` so that the resolved contract stays contract input, and
+         this reader, which composes nothing, reads it back as ``$ref``. A
+         ``$ref`` the file holds as written is a reference nothing resolved
+         (one ``fluid bundle`` never writes); it is kept, and listed.
+      4. ``unwrap_source_pointers`` resolves any ``{"$source": "sources/…"}``
          sentinels (inline SQL / OpenAPI that ``fluid bundle`` extracts into
          ``sources/``) back into real values, so downstream planners see a
-         fully-materialised contract — never a bare sentinel dict.
+         fully-materialised contract — never a bare sentinel dict. A file in
+         ``sources/`` is written as the contract held it, unescaped.
 
     The returned contract is exactly what the planner / apply path would
     have seen had the operator passed the original ``contract.fluid.yaml``,
@@ -148,6 +165,7 @@ def _load_contract_from_bundle(path: str, logger: logging.Logger) -> Dict[str, A
     """
     import tarfile
 
+    from fluid_build.contract_refs import ref_values, unescape_ref_keys
     from fluid_build.forge.core.bundle import read_tar_member_bounded, validate_manifest
     from fluid_build.forge.core.validators import unwrap_source_pointers
 
@@ -213,8 +231,11 @@ def _load_contract_from_bundle(path: str, logger: logging.Logger) -> Dict[str, A
                         )
                 return source_cache[src_path]
 
-            doc = loader.parse_contract_text(raw_bytes.decode("utf-8"), suffix=suffix)
-            contract = unwrap_source_pointers(doc, _resolve_source)
+            doc = loader.parse_contract_text(
+                raw_bytes.decode("utf-8"), suffix=suffix, name=member_name
+            )
+            frozen = ref_values(doc)
+            contract = unwrap_source_pointers(unescape_ref_keys(doc), _resolve_source)
     except CLIError:
         raise
     except (tarfile.TarError, OSError, ValueError, RuntimeError) as exc:
@@ -235,7 +256,17 @@ def _load_contract_from_bundle(path: str, logger: logging.Logger) -> Dict[str, A
         )
 
     logger.debug("bundle_contract_loaded: %s (member=%s)", bundle_path, member_name)
-    return contract
+    return contract, frozen
+
+
+def _load_bundle(
+    path: str, env: Optional[str], logger: logging.Logger
+) -> Tuple[Dict[str, Any], Tuple[str, ...]]:
+    """What :func:`load_contract_with_overlay` loads from the bundle at ``path``, and
+    the ``$ref`` values it holds unresolved (:func:`_read_bundle_contract`)."""
+    contract, frozen = _read_bundle_contract(path, logger)
+    check_bundle_env(path, env, logger)
+    return _normalize_contract_aliases(contract), frozen
 
 
 def load_contract_with_overlay(
@@ -256,9 +287,7 @@ def load_contract_with_overlay(
     # to be ignored, so ``fluid plan base.tgz --env aws`` planned the base
     # contract while the operator believed they were planning AWS.
     if _is_bundle_path(path):
-        contract = _load_contract_from_bundle(path, logger)
-        check_bundle_env(path, env, logger)
-        return _normalize_contract_aliases(contract)
+        return _load_bundle(path, env, logger)[0]
 
     try:
         loader = _imp("fluid_build.loader")
@@ -616,17 +645,19 @@ def _normalize_contract_aliases(contract: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def resolve_contract_env_templates(value: Any) -> Any:
-    """Recursively resolve ``{{ env.VAR }}`` placeholders in every string leaf.
+    """Recursively resolve ``{{ env.VAR }}`` placeholders in every string leaf, deferring
+    the ones whose variable is unset.
 
-    ``plan``/``apply``/``verify`` resolve these per-string at the Snowflake
-    provider boundary (``providers/snowflake/plan/planner.py``), but ``publish``
-    forwards the raw contract dict to the catalog adapter — so without this
-    pass, raw placeholders like ``{{ env.SNOWFLAKE_DATABASE }}`` land in the
-    DMM server block and render in the UI as-is.
-
-    Unresolved placeholders (env var missing) are left intact so callers can
-    decide whether to error, warn, or fall back — matching the per-string
-    helper's behavior.
+    ``plan``/``apply``/``verify`` render a contract strictly
+    (:func:`fluid_build.cli._common.resolve_env_templates_in_contract`), but
+    ``publish`` forwards the raw contract dict to the catalog adapter, and a
+    catalog shows the template of a variable this machine does not hold. So
+    without this pass raw placeholders like ``{{ env.SNOWFLAKE_DATABASE }}``
+    land in the DMM server block and render in the UI as-is, and with it an
+    unset variable's placeholder is left as written: the named
+    ``UNSET_DEFER`` of :mod:`fluid_build.util.env_templates`, which is the one
+    resolver. Also the preload of a contract a plan embeds, whose builds render
+    it strictly when they run, and the validation report.
 
     Defense-in-depth: placeholders whose *name* looks like a credential
     (``{{ env.SNOWFLAKE_PASSWORD }}``, ``{{ env.DMM_API_KEY }}``, etc.) are
@@ -636,43 +667,21 @@ def resolve_contract_env_templates(value: Any) -> Any:
     per-variable-per-call so operators notice the unresolved placeholder
     rather than assume resolution succeeded.
     """
-    # Lazy imports keep the CLI startup graph lean — this helper is only
+    # Lazy import keeps the CLI startup graph lean — this helper is only
     # called from publish/apply/verify paths, not from `fluid --help`.
-    from fluid_build.observability.secret_redactor import is_sensitive_key_name
-    from fluid_build.providers.snowflake.util.config import ENV_TEMPLATE_RE
+    from fluid_build.util.env_templates import UNSET_DEFER, render_contract
 
-    publish_logger = logging.getLogger("fluid.cli.publish")
-    seen_sensitive: set[str] = set()
-
-    def _replace(match: re.Match[str]) -> str:
-        var_name = match.group(1).strip()
-        if is_sensitive_key_name(var_name):
-            if var_name not in seen_sensitive:
-                seen_sensitive.add(var_name)
-                publish_logger.warning(
-                    "Refusing to resolve sensitive-looking env placeholder "
-                    "'{{ env.%s }}' in contract body; leaving literal. "
-                    "Catalog adapters forward contract YAML downstream — "
-                    "secrets must not ride along. If this value is not a "
-                    "secret, rename the env variable to something outside "
-                    "the password/secret/token/key family.",
-                    var_name,
-                )
-            return match.group(0)
-        return os.environ.get(var_name, match.group(0))
-
-    def _resolve_string(text: str) -> str:
-        if "{{" not in text:
-            return text
-        return ENV_TEMPLATE_RE.sub(_replace, text).strip()
-
-    def _walk(node: Any) -> Any:
-        if isinstance(node, dict):
-            return {k: _walk(v) for k, v in node.items()}
-        if isinstance(node, list):
-            return [_walk(item) for item in node]
-        if isinstance(node, str):
-            return _resolve_string(node)
-        return node
-
-    return _walk(value)
+    return render_contract(
+        value,
+        unset=UNSET_DEFER,
+        # The line is part of what publish and the exports print: byte for byte as it was.
+        refusal=(
+            "Refusing to resolve sensitive-looking env placeholder "
+            "'{{ env.%s }}' in contract body; leaving literal. "
+            "Catalog adapters forward contract YAML downstream \u2014 "
+            "secrets must not ride along. If this value is not a "
+            "secret, rename the env variable to something outside "
+            "the password/secret/token/key family."
+        ),
+        logger=logging.getLogger("fluid.cli.publish"),
+    )

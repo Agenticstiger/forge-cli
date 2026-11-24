@@ -387,8 +387,19 @@ def build_bundle_tgz(
     :data:`MAX_DBT_SOURCE_BYTES` of dbt files, a file over
     :data:`MAX_BUNDLE_MEMBER_BYTES`, more than :data:`MAX_BUNDLE_MEMBERS`
     entries, or a path the tar format cannot hold.
+
+    ``resolved_contract`` is composed: every ``$ref`` key it holds is a literal
+    key, written ``$$ref`` in ``contract.resolved.*``
+    (:func:`fluid_build.contract_refs.escape_ref_keys`).
     """
+    from fluid_build.contract_refs import escape_ref_keys
+
     rewritten, sources = extract_fragments(resolved_contract)
+    # ``contract.resolved.*`` stays contract input: a payload's literal ``$ref``
+    # key (one the composition read from ``$$ref``) is written ``$$ref`` again,
+    # and the bundle reader reads it back. After the extraction, so a payload
+    # moved to ``sources/`` (an OpenAPI document) keeps its own ``$ref`` keys.
+    rewritten = escape_ref_keys(rewritten)
 
     # Canonical YAML + JSON serialisations of the rewritten contract.
     yaml_bytes = _canonicalize_yaml(rewritten)
