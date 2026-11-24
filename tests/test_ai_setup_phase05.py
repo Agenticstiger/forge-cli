@@ -166,7 +166,7 @@ def test_shape_detect_classifies_known_prefixes():
 
     assert _classify_key_shape("sk-1234567890abcdef") == "openai"
     assert _classify_key_shape("sk-ant-1234abcd") == "anthropic"
-    assert _classify_key_shape("AIzaSyA12345678901234567890123456789012") == "gemini"
+    assert _classify_key_shape("AIza" + "0" * 35) == "gemini"
     assert _classify_key_shape("gibberish") == "unknown"
     assert _classify_key_shape("") == "unknown"
 
