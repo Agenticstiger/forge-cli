@@ -460,16 +460,33 @@ def _pairing_names(authority: str, env: Mapping[str, str]) -> List[str]:
     text beside it (``{{ env.H }}.example``, ``db-{{ env.H }}``), nor a second variable, nor one
     that a project dotenv file supplied.
     """
-    userinfo, at, hostport = authority.rpartition("@")
-    port_at = hostport.rfind(":")
-    if port_at != -1 and hostport.find("]", port_at) == -1:
-        hostname, port = hostport[:port_at], hostport[port_at:]
-    else:
-        hostname, port = hostport, ""
+    userinfo, hostname, port = _split_authority(authority)
     names = [raw.strip() for raw in ENV_TEMPLATE_RE.findall(userinfo + port)]
     if _operators_choice(hostname, env):
         return names
     return names + [raw.strip() for raw in ENV_TEMPLATE_RE.findall(hostname)]
+
+
+def _split_authority(authority: str) -> Tuple[str, str, str]:
+    """``user@host:port`` as ``(userinfo, host, port)``: the port keeps its colon, and an IPv6
+    literal keeps its own."""
+    userinfo, _at, hostport = authority.rpartition("@")
+    hostname, port = _split_hostport(hostport)
+    return userinfo, hostname, port
+
+
+def _hosts_named_by(value: str) -> Optional[List[str]]:
+    """The hosts ``value`` names when a field holds it whole, as the contract would have written
+    it: ``None`` when it names none, a path or a store a literal field passes in the same way."""
+    url = _URL_START.match(value)
+    if url is not None and _control_free(value[: url.end() - 3]).lower() in _STORE_SCHEMES:
+        return None
+    body = value.strip()
+    if url is None and body.startswith("/") and not body.startswith("//"):
+        return None
+    authority = _authority_of(value, url)
+    hosts = [host for host in (_hosts_of(authority) if authority is not None else []) if host]
+    return hosts or None
 
 
 def check_host_templates(
@@ -536,19 +553,28 @@ def check_host_templates(
             for raw in ENV_TEMPLATE_RE.findall(authority)
         ):
             return  # render_contract reports the missing variable
-        rendered = ENV_TEMPLATE_RE.sub(lambda m: env[m.group(1).strip()], authority)
-        hosts = _hosts_of(rendered) or [""]
-        if slashed:
-            hosts += _hosts_of(rendered.partition("\\")[0]) or [""]
+        # The one variable that is the whole host and that a project dotenv file supplied: only
+        # exporting it makes the address the operator's, so only its refusal says so.
+        project_host = None if slashed else _whole_variable(_split_authority(authority)[1])
+        if project_host is not None and not _project_supplied(project_host, env):
+            project_host = None
+        if project_host is not None and _is_one_template(text.strip()):
+            # The field is nothing but that variable, so the project's value is the field. It is
+            # judged as the text a contract would have written there: a path or a store names no host.
+            named = _hosts_named_by(env[project_host])
+            if named is None:
+                return
+            hosts = named
+        else:
+            rendered = ENV_TEMPLATE_RE.sub(lambda m: env[m.group(1).strip()], authority)
+            hosts = _hosts_of(rendered) or [""]
+            if slashed:
+                hosts += _hosts_of(rendered.partition("\\")[0]) or [""]
         for name in names:
             for host in hosts:
                 if not variable_allowed(name, host or None, environ=env):
                     raise _host_refusal(
-                        name,
-                        where,
-                        credential=False,
-                        stage=stage,
-                        project=_project_supplied(name, env),
+                        name, where, credential=False, stage=stage, project=name == project_host
                     )
 
     def walk(node: Any, where: str, key: str) -> None:
@@ -677,6 +703,16 @@ def _split_hostport(hostport: str) -> Tuple[str, str]:
     return hostport, ""
 
 
+def _project_host(written: Any, env: Mapping[str, str]) -> Optional[str]:
+    """The variable that is the whole host of the field ``written`` (each item of a list), when a
+    project dotenv file supplied its value: what a refusal tells the operator to export."""
+    for text in written if isinstance(written, (list, tuple)) else [written]:
+        name = _host_variable(text) if isinstance(text, str) else None
+        if name is not None and _project_supplied(name, env):
+            return name
+    return None
+
+
 def _host_variable(text: str) -> Optional[str]:
     """The variable that is the whole host of ``text`` (a URL, or a bare host field), if one is."""
     span = _authority_span(text)
@@ -724,10 +760,16 @@ _ADDRESS_KEY = re.compile(r"(?:host|hostname|server|broker|address|endpoint|url|
 
 def _names_an_address(text: str, unjudged_schemes: Any, env: Mapping[str, str]) -> bool:
     """Whether ``text`` may be an address: not blank, not a path, not one whole variable of the
-    operator's (their choice; one a project dotenv file supplied is the project's), and not a
-    store or a local file (``s3://bucket``, ``sqlite:///x``)."""
+    operator's (their choice), and not a store or a local file (``s3://bucket``, ``sqlite:///x``).
+    A variable a project dotenv file supplied is the project's choice, so what it holds is judged.
+    """
     body = text.strip()
-    if not body or _is_path(body) or _operators_choice(body, env):
+    name = _whole_variable(body)
+    if name is not None:
+        if not _project_supplied(name, env):
+            return False
+        body = str(env.get(name) or "").strip()  # the project's value: judged as the text it holds
+    if not body or _is_path(body):
         return False
     url = _URL_START.match(body)
     return url is None or _control_free(body[: url.end() - 3]).lower() not in unjudged_schemes
@@ -886,14 +928,12 @@ def _describe_endpoint(
         ):
             continue
         field = _dotted(block_where, target.path) if target.path else block_where
-        if target.host is None or target.quiet or target.keyword_text is not None:
-            return _Endpoint(f"a destination this check cannot read ({field})", None)
         written = _value_at(block, target.path) if target.path else None
+        via = _project_host(written, env)
+        if target.host is None or target.quiet or target.keyword_text is not None:
+            return _Endpoint(f"a destination this check cannot read ({field})", None, via)
         if _host_written_literally(written):
             return _Endpoint(f"host {target.host!r} ({field})", target.host)
-        via = _host_variable(written) if isinstance(written, str) else None
-        if via is not None and not _project_supplied(via, env):
-            via = None
         return _Endpoint(f"the host that {field} renders to", "", via)
     return _Endpoint(f"an endpoint of {block_where}", None)
 
@@ -927,7 +967,12 @@ def _pairing_refusal(
         fix = (
             "This check cannot read a host there, so only an entry for any host clears it: add "
             f"{name} to FLUID_ACQUISITION_SECRET_REF_ALLOWLIST in the operator environment, or "
-            f"write the host as a plain host field or one {placeholder} placeholder."
+            + (
+                f"export {via} in the operator environment (the shell, CI or FLUID_SECRETS_FILE), "
+                "which makes the address yours."
+                if via
+                else f"write the host as a plain host field or one {placeholder} placeholder."
+            )
         )
     return EnvTemplateError(
         what=(
@@ -985,25 +1030,55 @@ def _builds_of(contract: Mapping[str, Any]) -> List[_Block]:
     return out
 
 
+#: The maps of an engine's own settings that a contract writes by hand and a runner pushes to the
+#: engine as they are: ``(side, path under properties)``. A variable in one goes to every endpoint
+#: the map names (a URL under any key, a host field), so it is judged like a source or a sink block.
+#: ``source``: merged into the config of the connector that reads (Debezium's ``extra_config``, over
+#: the settings derived from the source block). ``sink``: merged into the config of the connector that
+#: writes, over the settings derived from the sink block and the exposes (Kafka Connect's
+#: ``sink_connector_config``, Debezium Server's ``sink.config``, Meltano's ``target_config``).
+#: ``own``: sent as it is, in place of anything derived, so judged on its own (Airbyte's
+#: ``destination_config``).
+_ENGINE_MAPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("source", ("debezium", "extra_config")),
+    ("sink", ("debezium", "server", "sink", "config")),
+    ("sink", ("kafka-connect", "sink_connector_config")),
+    ("sink", ("meltano", "target_config")),
+    ("own", ("airbyte", "destination_config")),
+)
+
+
 def _blocks_of(contract: Mapping[str, Any], base: str, build: Mapping[str, Any]) -> List[_Group]:
     """The groups of a build (:data:`_Group`).
 
     The source: ``properties.source``, judged as a whole and as its ``connection`` (the block a
     runner hands the policy). The sink: ``properties.sink`` and the ``binding.location`` of every
     expose, which carry the catalog's address and the settings sent to it, ``catalogAuth``
-    included.
+    included. The engine's hand-written maps join the side the runner merges them into, and one it
+    sends alone is a group of its own (:data:`_ENGINE_MAPS`).
     """
     props = build.get("properties")
     if not isinstance(props, Mapping):
         return []
+    engine_maps: Dict[str, List[_Block]] = {"source": [], "sink": [], "own": []}
+    for side, path in _ENGINE_MAPS:
+        written = _value_at(props, path)
+        if isinstance(written, Mapping):
+            engine_maps[side].append((_dotted(f"{base}.properties", path), written))
     groups: List[_Group] = []
+    named: List[_Block] = []
+    judged: List[_Block] = []
     source = props.get("source")
     if isinstance(source, Mapping):
         where = f"{base}.properties.source"
-        judged: List[_Block] = [(where, source)]
+        named.append((where, source))
+        judged.append((where, source))
         if isinstance(source.get("connection"), Mapping):
             judged.append((f"{where}.connection", source["connection"]))
-        groups.append(([(where, source)], judged))
+    named.extend(engine_maps["source"])
+    judged.extend(engine_maps["source"])
+    if named:
+        groups.append((named, judged))
     sink_blocks: List[_Block] = []
     if isinstance(props.get("sink"), Mapping):
         sink_blocks.append((f"{base}.properties.sink", props["sink"]))
@@ -1017,8 +1092,10 @@ def _blocks_of(contract: Mapping[str, Any], base: str, build: Mapping[str, Any])
         location = binding.get("location") if isinstance(binding, Mapping) else None
         if isinstance(location, Mapping):
             sink_blocks.append((f"exposes[{index}].binding.location", location))
+    sink_blocks.extend(engine_maps["sink"])
     if sink_blocks:
         groups.append((list(sink_blocks), list(sink_blocks)))
+    groups.extend(([block], [block]) for block in engine_maps["own"])
     return groups
 
 
@@ -1036,7 +1113,9 @@ def check_env_pairing(
     endpoint of its blocks is one of:
 
     * this machine (loopback, a local socket), or
-    * a host written as one whole ``{{ env.* }}`` (the operator chose the address), or
+    * a host written as one whole ``{{ env.* }}`` whose value is the operator's own (the operator
+      chose the address; a value that a project dotenv file supplied is the project's choice,
+      :func:`_project_supplied`), or
     * a host the operator paired with the variable (``NAME@host`` in
       ``FLUID_ACQUISITION_SECRET_REF_ALLOWLIST``).
 
@@ -1081,7 +1160,9 @@ def check_env_pairing(
                     ):
                         where = _dotted(block_where, (unread[0],))
                         endpoint = _Endpoint(
-                            f"a destination this check cannot read ({where})", None
+                            f"a destination this check cannot read ({where})",
+                            None,
+                            _project_host(block.get(unread[0]), env),
                         )
                         raise _pairing_refusal(name, written_at, endpoint, stage=stage)
 

