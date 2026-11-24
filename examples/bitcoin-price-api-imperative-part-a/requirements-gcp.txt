@@ -18,4 +18,4 @@ google-cloud-logging>=3.5.0
 tenacity>=8.2.0
 
 # Optional: Data validation
-pydantic>=2.4.0
+pydantic>=2.14.4
