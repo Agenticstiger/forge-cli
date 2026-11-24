@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fluid_build._console import literal_error_text
+from fluid_build._errors import FluidUserError
 from fluid_build.cli.console import cprint, success, warning
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 
@@ -926,7 +927,12 @@ def _actions_from_source(
 
     For a plan, the actions are its recorded ``actions``. A destructive mode
     (``replace`` / ``replace-and-build``) instead re-plans ``contract``, the
-    plan's verified embedded copy, with the provider's native planner.
+    plan's verified embedded copy, with the provider's native planner. So does
+    the local provider in every mode: ``fluid plan`` records abstract ops
+    (``provisionDataset``, ``scheduleTask``) it cannot dispatch, and it used to
+    answer them by deriving ONE SQL action from the contract (the first build's
+    SQL into the first expose's file), whatever else the plan held. Planned
+    like the contract file, each build lands in the expose its ``outputs`` name.
 
     For a contract, a provider with a ``plan()`` method (like AwsProvider,
     GcpProvider) generates service-level actions it can dispatch (e.g.
@@ -940,8 +946,6 @@ def _actions_from_source(
     that don't accept ``mode`` (older signatures) fall back to the
     mode-less call.
     """
-    from fluid_build.util.env_templates import EnvTemplateError
-
     if plan_data is not None:
         # When a destructive mode is in play, re-translate the embedded
         # contract via the provider's native planner so the actions are
@@ -950,23 +954,31 @@ def _actions_from_source(
         # plan.json would dispatch via the abstract handler which only emits
         # ``INSERT INTO`` regardless of mode.
         is_destructive = (mode or "").lower() in ("replace", "replace-and-build")
+        is_local = getattr(provider, "name", None) == "local"
         if (
             contract
-            and is_destructive
+            and (is_destructive or is_local)
             and hasattr(provider, "plan")
             and callable(getattr(provider, "plan", None))
         ):
             try:
                 native_actions = provider.plan(contract, mode=mode)
-            except TypeError:
-                native_actions = None
-            except EnvTemplateError:
-                raise  # an unset variable is the contract's, not the planner's, to fix
+            except FluidUserError:
+                raise  # a refusal (an unresolved build output, say), not a planner failure
             except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "plan_retranslation_failed: falling back to recorded actions (%s)",
-                    exc,
-                )
+                if is_local:
+                    from fluid_build.observability.secret_redactor import redact_secret_text
+
+                    # No fallback to the recorded actions: the local provider would
+                    # answer them by deriving its own SQL, which is what this avoids.
+                    raise CLIError(
+                        1, "apply_local_plan_failed", {"error": redact_secret_text(str(exc))}
+                    ) from exc
+                if not isinstance(exc, TypeError):
+                    logger.warning(
+                        "plan_retranslation_failed: falling back to recorded actions (%s)",
+                        exc,
+                    )
                 native_actions = None
             if native_actions:
                 logger.info(
@@ -990,9 +1002,17 @@ def _actions_from_source(
             if actions:
                 logger.info(f"Provider planner generated {len(actions)} actions")
                 return actions
-        except EnvTemplateError:
-            raise  # an unset variable is the contract's, not the planner's, to fix
+        except FluidUserError:
+            raise  # a refusal the provider named: the action parser must not paper over it
         except Exception as e:
+            if getattr(provider, "name", None) == "local":
+                from fluid_build.observability.secret_redactor import redact_secret_text
+
+                # As for a plan.json: the parser's abstract actions would be answered by the
+                # local provider running the primary build only, whatever else the contract has.
+                raise CLIError(
+                    1, "apply_local_plan_failed", {"error": redact_secret_text(str(e))}
+                ) from e
             logger.warning(f"Provider planner failed ({e}), falling back to action parser")
 
     # Fallback: use 0.7.1 ProviderActionParser (high-level actions)
@@ -1402,6 +1422,111 @@ def _check_build_id_mode(build_id: Optional[str], resolved_mode) -> None:
         )
 
 
+def _warn_on_federated_consumes_drift(
+    args: argparse.Namespace, contract: Dict[str, Any], logger: logging.Logger
+) -> None:
+    """The cross-mesh federation digest gate (stage-7 apply gate), warn-only.
+
+    Called once from ``run()`` above the engine dispatch, so it covers every
+    engine: it used to sit below the OpenTofu branch and the build modes'
+    early returns, so ``upstreamDigest`` drift was only ever reported for the
+    native engine's contract-file route.
+    """
+    # --- Cross-mesh federation digest gate (stage-7 apply gate) ---
+    # When ``consumes[]`` declares an ``upstreamWorkspace``, the
+    # federation validator fetches the live upstream digest and
+    # compares it against the pinned ``upstreamDigest``.
+    #
+    # This WARNS, it does not abort. Unlike the plan-binding gate --
+    # which compares two artifacts we produced ourselves and so can
+    # only disagree if one was tampered with -- this gate's verdict
+    # depends on somebody else's registry being up and honest. A hard
+    # failure would mean another team's git server going down blocks
+    # our production applies, and the first thing anyone would reach
+    # for is ``--no-verify-federation``, permanently. A warning that
+    # names the workspace keeps the signal and keeps the escape hatch
+    # unused. Enforcement becomes reasonable once the fetch path has
+    # a track record; the payload shape below is already the one an
+    # enforcing version would raise with.
+    if not getattr(args, "no_verify_federation", False):
+        fed_violations = []
+        try:
+            from fluid_build.forge.federation import validate_federated_consumes
+
+            fed_violations = validate_federated_consumes(contract, workspace_root=Path.cwd())
+        except Exception as exc:  # noqa: BLE001 - gate must never break apply
+            # Reaching here means the validator itself failed, not
+            # that an upstream was unreachable (that is a violation
+            # row, below). A contract with no federated consumes
+            # returns an empty list without raising, and an absent
+            # ``federation/upstreams.yaml`` loads as an empty
+            # manifest -- so neither of the two normal quiet cases
+            # lands here, and this is worth saying out loud rather
+            # than swallowing at DEBUG the way it used to be.
+            logger.warning(
+                "federation_gate_error: the federated-consumes check could not "
+                "run (%s: %s). consumes[] pins were NOT verified for this apply.",
+                type(exc).__name__,
+                exc,
+            )
+        if fed_violations:
+            # Stable, machine-parseable payload mirroring
+            # PlanBindingError's contract so CI templates can match
+            # both gates with one regex.
+            # Count by kind rather than picking two out of five:
+            # "unpinned", "unknown-workspace" and "not-wired" are
+            # violations too, and a summary that counts only drift
+            # and unreachability reports "0 drifted, 0 unreachable"
+            # while listing N findings.
+            counts: Dict[str, int] = {}
+            for v in fed_violations:
+                counts[v.kind] = counts.get(v.kind, 0) + 1
+            breakdown = ", ".join(f"{n} {k}" for k, n in sorted(counts.items()))
+            payload = {
+                "kind": "upstream-mismatch",
+                "violations": [
+                    {
+                        "consume_index": v.consume_index,
+                        "upstream_workspace_id": v.upstream_workspace_id,
+                        "upstream_product_id": v.upstream_product_id,
+                        "expected_digest": v.expected_digest,
+                        "actual_digest": v.actual_digest,
+                        "reason": v.reason,
+                        "violation_kind": v.kind,
+                    }
+                    for v in fed_violations
+                ],
+                "first_violation": fed_violations[0].reason,
+                "counts_by_kind": counts,
+                "drift_count": counts.get("drift", 0),
+                "unreachable_count": counts.get("unreachable", 0),
+            }
+            logger.warning(
+                "apply_consumes_drift: %d federated consumes[] %s could not "
+                "be confirmed in sync (%s). Applying anyway. Details: %s",
+                len(fed_violations),
+                "entry" if len(fed_violations) == 1 else "entries",
+                breakdown,
+                json.dumps(payload, sort_keys=True),
+            )
+            for v in fed_violations:
+                logger.warning(
+                    "  consumes[%d] %s/%s [%s]: %s",
+                    v.consume_index,
+                    v.upstream_workspace_id,
+                    v.upstream_product_id,
+                    v.kind,
+                    v.reason,
+                )
+    else:
+        logger.warning(
+            "--no-verify-federation: federation digest gate was SKIPPED. "
+            "Federated consumes[] entries with drifted upstreams will "
+            "apply against stale data. Make sure this is recorded in "
+            "the change log."
+        )
+
+
 def _run_reconcile_mode(
     args: argparse.Namespace,
     logger: logging.Logger,
@@ -1552,6 +1677,14 @@ def _confirm_reconcile(question: str) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
+def _skipped_count(result: dict) -> int:
+    """The actions the provider reported but did not run (``results[*].skipped``)."""
+    results = result.get("results")
+    if not isinstance(results, list):
+        return 0
+    return sum(1 for r in results if isinstance(r, dict) and r.get("skipped"))
+
+
 def _render_apply_result(
     *,
     success: bool,
@@ -1581,6 +1714,8 @@ def _render_apply_result(
 
             if "applied" in result:
                 summary_table.add_row("Actions Applied", str(result["applied"]))
+            if _skipped_count(result):
+                summary_table.add_row("Actions Skipped", str(_skipped_count(result)))
 
             total_time = time.time() - start_time
             summary_table.add_row("Duration", f"{total_time:.2f}s")
@@ -1631,6 +1766,8 @@ def _render_apply_result(
             logger.info("✅ Data product deployed successfully")
             if "applied" in result:
                 logger.info(f"Applied {result['applied']} action(s)")
+            if _skipped_count(result):
+                logger.info(f"Skipped {_skipped_count(result)} action(s)")
         elif no_outputs:
             logger.warning("⚠️  Apply ran but produced no output files.")
             if "applied" in result:
@@ -1720,34 +1857,6 @@ def _write_apply_report(
 
 #: How many unsupported platform fields ``apply_platform_unsupported`` names.
 _PLATFORMS_SHOWN = 10
-
-
-def _refuse_local_plan_beside_outside_jobs(contract: Dict[str, Any]) -> None:
-    """Refuse to apply a plan.json with the local provider when a build of its
-    contract runs outside forge-cli.
-
-    ``fluid plan`` records abstract ops the local provider does not dispatch, so
-    for a plan it derives its own actions from the contract: the first build's
-    SQL into the first expose's file. Beside a job that runs outside forge-cli
-    that lands the wrong rows, over the job's own output. In the default mode
-    the contract file is planned by the local planner instead, which leaves
-    that job's output to it.
-    """
-    from fluid_build.util.contract import is_externally_run_build
-
-    for i, build in enumerate(contract.get("builds") or []):
-        if isinstance(build, dict) and is_externally_run_build(build):
-            raise CLIError(
-                2,
-                "apply_plan_runs_outside_forge",
-                {
-                    "error": (
-                        f"builds[{i}] runs outside forge-cli, and the local provider "
-                        "applies a plan.json by deriving its own actions from the "
-                        "contract, which would land what that job writes"
-                    ),
-                },
-            )
 
 
 #: A platform a contract declares: (field, provider key, run by a job outside forge-cli).
@@ -1930,8 +2039,6 @@ def _run_simple_apply(
     if str(requested or "").strip().lower() == "auto":  # as --provider auto means elsewhere
         requested = None
     provider_name = requested or _simple_apply_provider(contract, logger)
-    if plan_data is not None and str(provider_name).strip().lower() == "local":
-        _refuse_local_plan_beside_outside_jobs(contract)
     if getattr(args, "project", None):
         project = args.project
     if getattr(args, "region", None):
@@ -2589,6 +2696,8 @@ def run(args, logger: logging.Logger) -> int:
     except CLIError as exc:
         _log_apply_failure(logger, start_time, exc)
         raise
+    # Warn-only, on every engine (OpenTofu, the build modes, the native engine).
+    _warn_on_federated_consumes_drift(args, source_contract, logger)
     # Simple mode plans its actions from this copy: the contract exactly as
     # the gate above checked it (for a plan.json, its verified embedded
     # contract). ``source_contract`` is shared and can still change before
@@ -2824,100 +2933,6 @@ def run(args, logger: logging.Logger) -> int:
                 error.message = "Invalid --config-override JSON"
                 raise error from exc
             contract.update(override_config)
-
-        # --- Cross-mesh federation digest gate (stage-7 apply gate) ---
-        # When ``consumes[]`` declares an ``upstreamWorkspace``, the
-        # federation validator fetches the live upstream digest and
-        # compares it against the pinned ``upstreamDigest``.
-        #
-        # This WARNS, it does not abort. Unlike the plan-binding gate --
-        # which compares two artifacts we produced ourselves and so can
-        # only disagree if one was tampered with -- this gate's verdict
-        # depends on somebody else's registry being up and honest. A hard
-        # failure would mean another team's git server going down blocks
-        # our production applies, and the first thing anyone would reach
-        # for is ``--no-verify-federation``, permanently. A warning that
-        # names the workspace keeps the signal and keeps the escape hatch
-        # unused. Enforcement becomes reasonable once the fetch path has
-        # a track record; the payload shape below is already the one an
-        # enforcing version would raise with.
-        if not getattr(args, "no_verify_federation", False):
-            fed_violations = []
-            try:
-                from fluid_build.forge.federation import validate_federated_consumes
-
-                fed_violations = validate_federated_consumes(contract, workspace_root=Path.cwd())
-            except Exception as exc:  # noqa: BLE001 - gate must never break apply
-                # Reaching here means the validator itself failed, not
-                # that an upstream was unreachable (that is a violation
-                # row, below). A contract with no federated consumes
-                # returns an empty list without raising, and an absent
-                # ``federation/upstreams.yaml`` loads as an empty
-                # manifest -- so neither of the two normal quiet cases
-                # lands here, and this is worth saying out loud rather
-                # than swallowing at DEBUG the way it used to be.
-                logger.warning(
-                    "federation_gate_error: the federated-consumes check could not "
-                    "run (%s: %s). consumes[] pins were NOT verified for this apply.",
-                    type(exc).__name__,
-                    exc,
-                )
-            if fed_violations:
-                # Stable, machine-parseable payload mirroring
-                # PlanBindingError's contract so CI templates can match
-                # both gates with one regex.
-                # Count by kind rather than picking two out of five:
-                # "unpinned", "unknown-workspace" and "not-wired" are
-                # violations too, and a summary that counts only drift
-                # and unreachability reports "0 drifted, 0 unreachable"
-                # while listing N findings.
-                counts: Dict[str, int] = {}
-                for v in fed_violations:
-                    counts[v.kind] = counts.get(v.kind, 0) + 1
-                breakdown = ", ".join(f"{n} {k}" for k, n in sorted(counts.items()))
-                payload = {
-                    "kind": "upstream-mismatch",
-                    "violations": [
-                        {
-                            "consume_index": v.consume_index,
-                            "upstream_workspace_id": v.upstream_workspace_id,
-                            "upstream_product_id": v.upstream_product_id,
-                            "expected_digest": v.expected_digest,
-                            "actual_digest": v.actual_digest,
-                            "reason": v.reason,
-                            "violation_kind": v.kind,
-                        }
-                        for v in fed_violations
-                    ],
-                    "first_violation": fed_violations[0].reason,
-                    "counts_by_kind": counts,
-                    "drift_count": counts.get("drift", 0),
-                    "unreachable_count": counts.get("unreachable", 0),
-                }
-                logger.warning(
-                    "apply_consumes_drift: %d federated consumes[] %s could not "
-                    "be confirmed in sync (%s). Applying anyway. Details: %s",
-                    len(fed_violations),
-                    "entry" if len(fed_violations) == 1 else "entries",
-                    breakdown,
-                    json.dumps(payload, sort_keys=True),
-                )
-                for v in fed_violations:
-                    logger.warning(
-                        "  consumes[%d] %s/%s [%s]: %s",
-                        v.consume_index,
-                        v.upstream_workspace_id,
-                        v.upstream_product_id,
-                        v.kind,
-                        v.reason,
-                    )
-        else:
-            logger.warning(
-                "--no-verify-federation: federation digest gate was SKIPPED. "
-                "Federated consumes[] entries with drifted upstreams will "
-                "apply against stale data. Make sure this is recorded in "
-                "the change log."
-            )
 
         # NOTE: the data-loss safety gate (``check_data_loss_gate``) used to
         # live here. It was hoisted to run BEFORE the apply-engine dispatch

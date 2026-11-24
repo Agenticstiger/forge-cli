@@ -108,6 +108,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   For an upstream fetched from git, `$ref`s reach files inside the clone only, whatever
   `FLUID_REF_ROOT` or a workspace file in the clone say.
 
+- **The local engine never writes a placeholder file.** `fluid init qs --quickstart --yes`
+  then `fluid apply contract.fluid.yaml --yes` logged "Plan validation failed with 2 errors",
+  then "Data product deployed successfully" with exit 0, and left 24-byte parquet files holding
+  `id,value / 1,materialized`. **Behaviour change:** `LocalProvider.apply` now refuses a plan that
+  `validate_plan` rejects before it writes anything (`local_plan_invalid`, exit 1, naming each
+  problem), a build with no SQL is refused (`build_has_no_sql`) instead of writing
+  `SELECT 1 AS demo_col`, a result table that cannot be created fails the action instead of
+  logging `local_sql_create_table_warn`, a materialize that fails is an error instead of
+  `local_materialize_fallback`, and `apply()` with nothing to run raises instead of writing
+  `runtime/out/demo_artifact.csv`. An expose that none of a contract's builds writes is refused
+  with `local_plan_invalid`; a planner crash on the contract file exits 1 with
+  `apply_local_plan_failed`, as a plan.json does, instead of falling back to the action parser
+  (which ran the primary build only); a contract with no builds at all lands nothing and applies (removing
+  the builds is how a Spark stream is stopped). A planned build the local engine has no SQL for is
+  skipped when the plan only held ops this provider does not run. A materialize that a build runner lands
+  (`payload.landed_by`) is reported as skipped. A build id with a hyphen
+  (`hello-transformation`) no longer lands the placeholder: its result table is `result_<id>`
+  with every character outside `[A-Za-z0-9_]` mapped to `_`. A materialize result now lists the
+  file it wrote under `written`.
+- **The local engine runs `pattern: multi-stage` builds.** The local planner read only a build's
+  top-level `properties.sql`, so the eight bundled multi-stage templates and the quickstart landed
+  the placeholder (and, with the placeholder writers gone, would be refused). It now runs
+  `properties.stages[]` in `dependsOn` order (stdlib `graphlib`; independent stages keep their
+  listed order), materialises each stage's SQL as a table under its `outputs` names so a later
+  stage reads an earlier one, and lands each expose from the stage output it maps to
+  (`build_output_exposes` reads the stages' `outputs` when a multi-stage build declares none). A
+  cycle (`build_stage_cycle`), a `dependsOn` that names no stage (`build_stage_unknown_dependency`),
+  a stage with no SQL (`build_stage_has_no_sql`), an output name that is not a safe identifier
+  (`build_stage_unsafe_name`) and a stage shape the engine cannot run (`build_stage_unsupported`)
+  are refused before anything is written, as is a multi-stage build that lands no expose while no
+  other build of the contract writes one the contract declares (`build_stage_lands_nothing`) and a
+  stage output named like an input. Under
+  `--mode amend-and-build` the exposes a multi-stage build lands must be local files (a masked
+  expose, or one bound to S3, GCS, BigQuery or another platform, is refused, as for an embedded-SQL
+  build), the stages are checked before anything runs (so `--dry-run` refuses too), and the stages
+  after a failed one do not run. Only a build whose `engine` is unset or `sql` runs its stages
+  here; another engine's `stages` stay with that engine. All 13 bundled templates apply locally,
+  in the default mode and under `--mode amend-and-build`; `customer-360` keeps its five stages,
+  and its landed rows no longer depend on the day it runs (`high_value_customers` lands 3 rows):
+  its first two stages measure days since the newest order in the sample data, not `CURRENT_DATE`.
+- **The federation digest check runs on every apply engine.** `validate_federated_consumes` (the
+  warn-only gate that reports a drifted `upstreamDigest` pin) was called only below the OpenTofu
+  branch and the build modes' early returns, so `fluid apply` on aws / gcp / snowflake and
+  `--mode amend-and-build` never reported drift. It now runs once, above the engine dispatch, on
+  the contract the pre-apply gate checked; it still only warns, and `--no-verify-federation` still
+  skips it. A contract changed by `--config-override` is checked as loaded, not as overridden.
+- **`incremental_append` to a single local file keeps every increment.** A run without partition
+  keys wrote its rows with a plain `COPY ... TO <file>`, which replaces the file, while the cursor
+  had already moved past the previous run's rows: after two runs the file held only the second
+  run's rows. For a parquet or csv file the run now writes the union of the file and its new rows
+  (`UNION ALL BY NAME`, so a new column is NULL-filled in the old rows) to a temp file in the same
+  directory, fsyncs it and replaces the target with `os.replace`; a failed write leaves the
+  previous file as it was and no temp file behind. A csv file is read back as text, so a value such
+  as `007` is rewritten as it was landed. The late-arrival side file (`<stem>__late_events`) is
+  unioned the same way and written before the main file, so a failed union leaves the late rows in
+  the main file; a run with no late rows leaves it alone. **Behaviour change:** each such run now
+  reads and rewrites the whole file (DuckDB has no single-file append), and a failure between the
+  file write and the cursor write lands the batch again on the retry (the append is
+  at-least-once; the old overwrite was idempotent). A json or ndjson file is unioned the same way,
+  with the old rows read back by the expose's declared `contract.schema` types (nothing is
+  re-inferred; `float` is a double): an expose with no declared schema is refused before anything is written
+  (`incremental_append_json_needs_schema`), as are a column type with no DuckDB equivalent
+  (`incremental_append_json_unmapped_type`) and a landed or already stored column the schema does
+  not declare (`incremental_append_json_undeclared_column`).
+  Under a late-arrival policy an append judges only this run's own new rows, against the newest
+  event time across the file and the new rows, and writes the late ones to `__late_events` and
+  the on-time ones to the main file; earlier rows are never re-classified (a later run used to move
+  every earlier run's rows into `__late_events`). The cursor takes the newest value this run
+  landed, a failed side-file write fails the run and leaves the main file untouched, and a full
+  refresh with no late rows deletes an older `__late_events` file. The temp file is named for the
+  run beside the target, and each rewrite holds an exclusive per-file lock (`flock`, a byte lock
+  on Windows; the lock file lives under `<project>/.fluid/locks`, never in the output
+  directory) from the first read of the old file to the rename, so two overlapping runs no
+  longer lose each other's rows; a first-time side file is
+  written through it too, the directory is fsynced (best effort) after the rename, and a temp
+  left by a killed run is removed after a day. The typed json refusals come before the first
+  write, and the event-time column is matched without regard to case; one that is not landed, or
+  is not a date or timestamp, logs a warning (`late_arrival_split_skipped`) and every row lands on
+  time.
+- **`--mode amend-and-build` lands each local SQL build in its own expose.** Every build was
+  handed `exposes[0]`, so with two `engine: sql` builds the second overwrote the first build's
+  file and its own expose was never written, exit 0. A build now writes the exposes its `outputs`
+  name (all of them, when it names several local ones; `further_outputs` no longer warns "not
+  written by this build" about a local one), through the same `build_output_exposes` helper as the
+  planner. A remote further output is still refused. An unknown output id, or no `outputs` beside
+  several exposes, is refused before the build runs, with `build_output_unknown_expose` or
+  `build_outputs_undeclared`. The acquisition schema-drift gate takes its baseline from the first
+  expose, in contract order, that the build names in `outputs` (as the DuckDB runner lands it), and
+  from `exposes[0]` when it names none, not from `exposes[0]` for every build. The DuckDB
+  acquisition runner chooses its expose through the same helper: an `outputs` entry that is no
+  exposeId, or no `outputs` beside several exposes, is refused before anything is written (it used
+  to land in `exposes[0]`), and the drift gate follows; the Debezium and Kafka Connect runners keep
+  owning every expose of a build that names none.
+- **`fluid apply` on the local engine lands each build in the expose its `outputs` name.**
+  Applying a `plan.json` with the local provider used to answer the plan's abstract ops
+  (`provisionDataset`, `scheduleTask`) by deriving ONE SQL action from the contract, the first
+  build's SQL into the first expose's file, and report success: with two builds only the first
+  expose was written and "Actions Applied" read 5 for a 4-action plan. A local plan is now
+  re-planned from its embedded contract by the local planner, as the contract file is. **Behaviour
+  change:** `builds[].outputs` is resolved in one place (`util.contract.build_output_exposes`):
+  an output id that is no `exposeId` is refused (`build_output_unknown_expose`), a build that
+  names no output in a contract with several exposes is refused (`build_outputs_undeclared`), and
+  two build ids that map to one result table are refused (`build_ids_collide`). The planner no
+  longer lands "the last build's table" or the first loaded table in an expose no build names, and
+  a later build no longer gets the earlier build's result table as an input file ("Input file not
+  found: result_build_a"). A build id with a hyphen keeps its result in `result_<id>` with `-`
+  mapped to `_`. "Actions Applied" counts only applied actions, and "Actions Skipped" is shown
+  beside it. `apply_plan_runs_outside_forge` is gone: a plan beside a Flink job now lands only
+  what the local planner plans and leaves that job's expose to it; `apply_local_plan_failed`
+  (exit 1) reports a plan the local planner cannot plan.
+- **A plugin distribution without metadata no longer breaks a plugin walk.** A `*.dist-info`
+  directory with no METADATA file made `importlib.metadata` raise `TypeError` (or `KeyError` on
+  newer backports) from `Distribution.name` and `.version`, which `getattr`'s default does not
+  catch. `granted_distribution` and `entry_point_distribution` now treat such a distribution as
+  unnamed. This was the intermittent failure of `tests/iac/test_state_migration_safety.py` in CI.
+
 ### Security
 
 - **`{{ env.* }}` on the acquisition path no longer renders the operator's environment into a host

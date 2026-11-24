@@ -21,8 +21,12 @@ runs in-memory.
 from __future__ import annotations
 
 import logging
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
+
+from fluid_build.providers._sql_safety import validate_ident
 
 # SDK contract helper (optional)
 try:
@@ -32,7 +36,10 @@ try:
 except ImportError:
     _HAS_SDK_CONTRACT = False
 
+from fluid_build._errors import FluidUserError, doc_url
 from fluid_build.util.contract import (
+    BuildOutputsError,
+    build_output_exposes,
     builds_writing_expose,
     get_builds,
     get_consumes,
@@ -43,6 +50,299 @@ from fluid_build.util.contract import (
     is_externally_run_build,
     is_spark_job_build,
 )
+
+
+@dataclass
+class LocalPlanError(FluidUserError):
+    """The local engine will not run a plan it cannot back with data.
+
+    ``code`` is the named event: ``local_plan_invalid`` (``validate_plan`` found
+    problems) or ``build_has_no_sql`` (a build the local engine must run has no
+    SQL). Both used to end in a placeholder file (``id,value / 1,materialized``,
+    ``SELECT 1 AS demo_col``) and "Data product deployed successfully".
+
+    The stages of a ``pattern: multi-stage`` build add ``build_stage_cycle``,
+    ``build_stage_unknown_dependency``, ``build_stage_has_no_sql``,
+    ``build_stage_unsupported`` and ``build_stage_unsafe_name``
+    (:func:`ordered_stages`).
+    """
+
+    code: str = "local_plan_invalid"
+
+
+# ───────────────────── multi-stage builds ─────────────────────
+#
+# A ``pattern: multi-stage`` build keeps its SQL in ``properties.stages[]``, each
+# stage ``{name, outputs, dependsOn, properties: {sql}}``: the same fields the dbt
+# and sql engines read (``engines/_stages.py``). The local engine runs the stages
+# in ``dependsOn`` order in one session and keeps each as a DuckDB table under
+# its ``outputs`` names, because a stage's SQL refers to an earlier stage by its
+# OUTPUT name (``FROM customer_base``), never by the stage's own name. A stage
+# that names no output is kept under its stage name, with every character that is
+# no letter, digit or ``_`` mapped to ``_`` (and a ``_`` in front when that would
+# start with a digit).
+
+#: The keys a stage may carry (schema ``multiStagePattern.stages[]``).
+_STAGE_KEYS = frozenset({"name", "pattern", "properties", "dependsOn", "outputs", "tags", "labels"})
+#: ``properties.language`` values that are DuckDB SQL.
+_SQL_LANGUAGES = frozenset({"sql", "duckdb", "duckdb_sql", "duckdb-sql"})
+
+
+@dataclass(frozen=True)
+class Stage:
+    """One stage the local engine runs: ``sql`` creates ``tables[0]``; every other
+    table is a copy of it."""
+
+    name: str
+    sql: str
+    tables: Tuple[str, ...]
+    depends_on: Tuple[str, ...]
+
+
+def is_multi_stage_build(build: Mapping[str, Any]) -> bool:
+    """``pattern: multi-stage`` with a non-empty ``properties.stages``."""
+    props = build.get("properties")
+    return (
+        str(build.get("pattern") or "").strip().lower() == "multi-stage"
+        # a build of another engine (dbt, glue, databricks ...) is that engine's to run
+        and str(build.get("engine") or "").strip().lower() in ("", "sql")
+        and isinstance(props, Mapping)
+        and bool(props.get("stages"))
+    )
+
+
+def _stage_error(code: str, build_id: str, what: str, why: str, fix: str, **extras: Any):
+    return LocalPlanError(
+        code=code,
+        what=what,
+        why=why,
+        fix=fix,
+        doc=doc_url(),
+        extras={"buildId": build_id, **extras},
+    )
+
+
+def _default_stage_table(name: str) -> str:
+    table = re.sub(r"[^0-9A-Za-z_]", "_", name)
+    return table if re.match(r"[A-Za-z_]", table) else f"_{table}"
+
+
+def _parse_stage(build_id: str, idx: int, raw: Any) -> Stage:
+    """One stage, or the named refusal for a shape the local engine cannot run."""
+
+    def unsupported(what: str, why: str, fix: str) -> LocalPlanError:
+        return _stage_error("build_stage_unsupported", build_id, what, why, fix, stage=idx)
+
+    if not isinstance(raw, Mapping):
+        raise unsupported(
+            f"build {build_id!r} stage {idx} is not a mapping",
+            "A stage is {name, outputs, dependsOn, properties: {sql}}.",
+            "Write each stage as a mapping.",
+        )
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise unsupported(
+            f"build {build_id!r} stage {idx} has no name",
+            "dependsOn and the stage's table name refer to a stage by its name.",
+            "Give the stage a name.",
+        )
+    where = f"build {build_id!r} stage {name!r}"
+    unknown = sorted(str(k) for k in raw if k not in _STAGE_KEYS)
+    if unknown:
+        raise unsupported(
+            f"{where} carries {', '.join(unknown)}",
+            "The local engine runs a stage's properties.sql; it does not know these keys.",
+            "Remove them, or run the build with the engine that owns them.",
+        )
+    props = raw.get("properties")
+    if props is None:
+        props = {}
+    if not isinstance(props, Mapping):
+        raise unsupported(
+            f"{where} has properties that are not a mapping", "properties holds sql.", "Fix it."
+        )
+    language = props.get("language")
+    if language is not None and str(language).strip().lower() not in _SQL_LANGUAGES:
+        raise unsupported(
+            f"{where} has properties.language {language!r}",
+            "The local engine runs SQL on DuckDB only.",
+            "Run this build with the engine for that language.",
+        )
+    if props.get("parameters"):
+        raise unsupported(
+            f"{where} declares properties.parameters",
+            "A stage's inputs are not bound by the local engine: it binds the build's own "
+            "properties.parameters.inputs.",
+            "Move the inputs to the build's properties.parameters.inputs, or read the files "
+            "in the stage's SQL.",
+        )
+    sql = props.get("sql")
+    if sql is not None and not isinstance(sql, str):
+        raise unsupported(
+            f"{where} has a properties.sql that is not text",
+            "The local engine runs the SQL string as written.",
+            "Write the SQL inline.",
+        )
+    if not (sql or "").strip():
+        other = sorted(
+            str(k) for k, v in props.items() if k != "sql" and v not in (None, "", [], {})
+        )
+        if other:
+            raise unsupported(
+                f"{where} has no properties.sql, only {', '.join(other)}",
+                "The local engine runs inline SQL; it does not read these.",
+                "Write the stage's SQL in properties.sql.",
+            )
+        raise _stage_error(
+            "build_stage_has_no_sql",
+            build_id,
+            f"{where} has no SQL",
+            "A stage with no SQL has nothing to run, and a placeholder table would let the "
+            "stages after it run against a dummy relation.",
+            "Give the stage a properties.sql, or remove it.",
+            stage=name,
+        )
+    outputs = raw.get("outputs")
+    if outputs is None:
+        outputs = []
+    if not isinstance(outputs, list) or not all(isinstance(o, str) and o for o in outputs):
+        raise unsupported(
+            f"{where} has outputs that are not a list of names",
+            "outputs lists the names the stage's result is kept under.",
+            "Write outputs as a list of names.",
+        )
+    tables = tuple(dict.fromkeys(outputs)) or (_default_stage_table(name),)
+    for table in tables:
+        try:
+            validate_ident(table)
+        except ValueError:
+            raise _stage_error(
+                "build_stage_unsafe_name",
+                build_id,
+                f"{where} names the output {table!r}, which is no safe SQL identifier",
+                "Later stages refer to an output by this name, so it is used as written: "
+                "letters, digits and '_', not starting with a digit.",
+                "Rename the output.",
+                stage=name,
+                output=table,
+            ) from None
+    depends = raw.get("dependsOn")
+    if depends is None:
+        depends = []
+    if not isinstance(depends, list) or not all(isinstance(d, str) for d in depends):
+        raise unsupported(
+            f"{where} has dependsOn that is not a list of stage names",
+            "dependsOn orders the stages.",
+            "Write dependsOn as a list of stage names.",
+        )
+    return Stage(name=name, sql=sql, tables=tables, depends_on=tuple(dict.fromkeys(depends)))
+
+
+def ordered_stages(build: Mapping[str, Any]) -> List[Stage]:
+    """The stages of a multi-stage build in ``dependsOn`` order.
+
+    ``graphlib.TopologicalSorter`` orders them; of the stages ready at one point
+    the one listed first goes first, so stages that are independent keep the
+    order they are listed in. Raises :class:`LocalPlanError`: ``build_stage_cycle``,
+    ``build_stage_unknown_dependency``, ``build_stage_has_no_sql``,
+    ``build_stage_unsupported`` or ``build_stage_unsafe_name``. Nothing is
+    written before this returns.
+    """
+    import graphlib  # stdlib; kept off the ``fluid --help`` import path
+
+    build_id = str(build.get("id") or "?")
+    props = build.get("properties") or {}
+    raw = props.get("stages")
+    if str(props.get("sql") or "").strip():
+        raise _stage_error(
+            "build_stage_unsupported",
+            build_id,
+            f"build {build_id!r} has both properties.sql and properties.stages",
+            "Which of the two the local engine should run is a guess.",
+            "Keep the stages, or the SQL.",
+        )
+    if not isinstance(raw, list):
+        raise _stage_error(
+            "build_stage_unsupported",
+            build_id,
+            f"build {build_id!r} has properties.stages that is not a list",
+            "stages is a list of {name, outputs, dependsOn, properties}.",
+            "Write stages as a list.",
+        )
+    parsed = [_parse_stage(build_id, i, item) for i, item in enumerate(raw)]
+    by_name: Dict[str, Stage] = {}
+    for stage in parsed:
+        if stage.name in by_name:
+            raise _stage_error(
+                "build_stage_unsupported",
+                build_id,
+                f"build {build_id!r} has two stages named {stage.name!r}",
+                "dependsOn refers to a stage by its name.",
+                "Rename one of them.",
+                stage=stage.name,
+            )
+        by_name[stage.name] = stage
+    writer: Dict[str, str] = {}
+    for stage in parsed:
+        for table in stage.tables:
+            other = writer.setdefault(table.lower(), stage.name)
+            if other != stage.name:  # DuckDB identifiers are case-insensitive
+                raise _stage_error(
+                    "build_stage_unsupported",
+                    build_id,
+                    f"stages {other!r} and {stage.name!r} both write the table {table!r}",
+                    "The second would replace the first's rows.",
+                    "Give one of them another output name.",
+                    table=table,
+                )
+        for dep in stage.depends_on:
+            if dep not in by_name:
+                raise _stage_error(
+                    "build_stage_unknown_dependency",
+                    build_id,
+                    f"stage {stage.name!r} of build {build_id!r} depends on {dep!r}, "
+                    "which is no stage",
+                    "dependsOn names stages, not their outputs. The stages are "
+                    f"{', '.join(repr(n) for n in by_name)}.",
+                    "Name an existing stage in dependsOn, or add the stage.",
+                    stage=stage.name,
+                    dependsOn=dep,
+                )
+    position = {stage.name: i for i, stage in enumerate(parsed)}
+    sorter = graphlib.TopologicalSorter({s.name: list(s.depends_on) for s in parsed})
+    try:
+        sorter.prepare()
+    except graphlib.CycleError as exc:
+        cycle = [str(n) for n in exc.args[1]]
+        raise _stage_error(
+            "build_stage_cycle",
+            build_id,
+            f"the stages of build {build_id!r} depend on each other in a cycle: "
+            f"{' -> '.join(cycle)}",
+            "No stage of a cycle can run first.",
+            "Remove one dependsOn edge of the cycle.",
+            cycle=cycle,
+        ) from None
+    ordered: List[Stage] = []
+    ready: List[str] = []
+    while sorter.is_active():
+        ready.extend(sorter.get_ready())
+        ready.sort(key=position.__getitem__)
+        name = ready.pop(0)
+        ordered.append(by_name[name])
+        sorter.done(name)
+    return ordered
+
+
+def _result_table(build_id: Any) -> str:
+    """The DuckDB table a build's result is kept in: ``result_<build id>``.
+
+    A build id is a contract identifier (``hello-transformation`` is one), and
+    ``-`` is not a SQL identifier character: the table could not be created
+    (``validate_ident``), the failure was swallowed, and the expose was written
+    as a placeholder. Every other character is mapped to ``_`` too.
+    """
+    return "result_" + re.sub(r"[^0-9A-Za-z_]", "_", str(build_id))
 
 
 def plan_actions(
@@ -174,6 +474,14 @@ def plan_actions(
     # Run all build transformations
 
     builds = get_builds(contract)
+    # Actions are keyed by resource_id, and a build's action shares the keyspace with
+    # the exposes' (materialize) and the loaded inputs' (load_data): a build with the
+    # same id as the expose it writes would overwrite that action and depend on itself.
+    expose_ids = {str(get_expose_id(e)) for e in get_exposes(contract) if isinstance(e, dict)}
+    written_by: Dict[str, str] = {}  # exposeId -> the table of the last build that names it
+    table_owner: Dict[str, str] = {}  # result table -> the build id that keeps it
+    explicit_ids: Set[str] = set()  # exposes a build names in its own builds[].outputs
+    stage_tables: Set[str] = set()  # tables of stages: never an expose's table by name alone
 
     for build_idx, build in enumerate(builds):
         if not build:
@@ -210,10 +518,14 @@ def plan_actions(
             log.debug("local planner: build '%s' runs on forge's Spark runner", build_id)
             continue
 
-        # Extract SQL from various formats
-        sql_text = _extract_sql(build, contract, log)
+        # A multi-stage build keeps its SQL in its stages (ordered, or refused, here:
+        # before any action of this build is planned).
+        stages = validate_stage_build(contract, build) if is_multi_stage_build(build) else None
 
-        if not sql_text:
+        # Extract SQL from various formats
+        sql_text = None if stages else _extract_sql(build, contract, log)
+
+        if not stages and not sql_text:
             log.warning(f"Build {build_id} has no SQL, skipping")
             continue
 
@@ -259,14 +571,76 @@ def plan_actions(
                 elif name:
                     input_specs.append(name)
 
-        # Determine output table name (temp table for intermediate results)
-        output_table = build.get("output_table") or f"result_{build_id}"
+        # The exposes this build lands (builds[].outputs). Resolved before anything
+        # runs, so an unknown output id, or a build that names none beside several
+        # exposes, refuses the plan instead of landing one build's rows in
+        # another's file.
+        landed = build_output_exposes(contract, build)
+        explicit_outputs = isinstance(build.get("outputs"), list) and bool(build["outputs"])
 
+        if stages:
+            stage_actions = _plan_stage_actions(
+                stages,
+                build_id=build_id,
+                is_destructive=is_destructive,
+                input_tables=input_tables,
+                input_specs=input_specs if input_specs else sorted(_explicit_input_names(build)),
+                taken={*expose_ids, *loaded_tables, *(a.get("resource_id") for a in actions)},
+                loaded_tables=loaded_tables,
+                table_owner=table_owner,
+                actions=actions,
+                dependencies=dependencies,
+            )
+            stage_tables.update(t for stage in stages for t in stage.tables)
+            produced = {t for stage in stages for t in stage.tables}
+            for expose in landed:  # an expose lands from the stage output it is named by
+                eid = str(get_expose_id(expose))
+                if eid not in produced:
+                    continue
+                # An explicit builds[].outputs mapping beats a stage-derived one, whatever
+                # the build order; a later explicit one still overrides an earlier one.
+                if explicit_outputs:
+                    explicit_ids.add(eid)
+                elif eid in explicit_ids:
+                    continue
+                written_by[eid] = eid
+            log.debug(
+                "local planner: build '%s' planned %d stage action(s)", build_id, stage_actions
+            )
+            continue
+
+        # Determine output table name (temp table for intermediate results)
+        output_table = build.get("output_table") or _result_table(build_id)
+        # DuckDB identifiers are case-insensitive: ``result_Load`` and ``result_load`` are
+        # one table.
+        if table_owner.setdefault(output_table.lower(), build_id) != build_id:
+            raise BuildOutputsError(
+                code="build_ids_collide",
+                what=(
+                    f"builds {table_owner[output_table.lower()]!r} and {build_id!r} both keep their "
+                    f"result in the table {output_table!r}"
+                ),
+                why=(
+                    "A build id is written into a table name with every character that is "
+                    "not a letter, digit or underscore mapped to '_', so two ids that differ "
+                    "only in those characters share one table, and the second would replace "
+                    "the first's rows."
+                ),
+                fix="Rename one build id, or set output_table on one of the builds.",
+                doc=doc_url(),
+                extras={"table": output_table},
+            )
+
+        build_rid = (
+            f"{build_id}__build"
+            if (build_id in expose_ids or build_id in loaded_tables)
+            else build_id
+        )
         actions.append(
             {
                 "op": "execute_sql",
                 "resource_type": "transformation",
-                "resource_id": build_id,
+                "resource_id": build_rid,
                 "table_name": output_table,
                 "depends_on": list(input_tables),
                 # ``mode`` is read by the executor — when "replace",
@@ -277,7 +651,12 @@ def plan_actions(
                 "mode": "replace" if is_destructive else "amend",
                 "payload": {
                     "sql": sql_text,
-                    "inputs": input_specs if input_specs else list(input_tables),
+                    # What the build declares, as files to register. The implicit
+                    # "after every loaded table" dependency orders the actions
+                    # (depends_on) and is no input: it used to be listed here, and
+                    # a second build then failed on "Input file not found:
+                    # result_<first build>".
+                    "inputs": input_specs if input_specs else sorted(_explicit_input_names(build)),
                     "output_table": output_table,
                 },
             }
@@ -285,7 +664,11 @@ def plan_actions(
 
         # This transformation's output can be consumed by others
         loaded_tables.add(output_table)
-        dependencies[build_id] = input_tables
+        dependencies[build_rid] = input_tables
+        for expose in landed:  # the last build to name an expose lands it
+            written_by[str(get_expose_id(expose))] = output_table
+            if explicit_outputs:
+                explicit_ids.add(str(get_expose_id(expose)))
 
     # ==================== 3. Materialize Actions ====================
     # Write results to exposes[] paths
@@ -337,16 +720,28 @@ def plan_actions(
         if _produced_outside_forge(expose_id, builds, log):
             continue
 
+        # Determine source table (from last build or explicit)
+        source_table = _determine_source_table(
+            _ei["_raw"] if isinstance(_ei.get("_raw"), dict) else {},
+            builds,
+            loaded_tables - stage_tables,
+            log,
+            written_by=written_by,
+            expose_id=expose_id,
+        )
+        landed_by = [] if source_table else _landed_by_runner(expose_id, builds)
+        if not source_table and not landed_by and not any(isinstance(b, dict) for b in builds):
+            # A contract with no builds writes nothing: apply has nothing to land for this
+            # expose (removing the builds is how a Spark stream is stopped). It used to get
+            # a placeholder file; with builds present, an expose none of them writes is
+            # refused by validate_plan instead.
+            log.warning(f"Expose {expose_id} has no build to write it; nothing to land")
+            continue
+
         if not out_path:
             # Generate default path
             out_path = f"runtime/out/{expose_id}.csv"
             log.warning(f"Expose output missing path, using default: {out_path}")
-
-        # Determine source table (from last build or explicit)
-        source_table = _determine_source_table(
-            _ei["_raw"] if isinstance(_ei.get("_raw"), dict) else {}, builds, loaded_tables, log
-        )
-        landed_by = [] if source_table else _landed_by_runner(expose_id, builds)
 
         # Infer format
         fmt = _infer_format(out_path, _ei["_format"])
@@ -381,14 +776,16 @@ def plan_actions(
     # dependencies like "result_clean_customers" resolve to the resource_id
     # "clean_customers" that produces that table.
     table_to_resource: Dict[str, str] = {}
+    # A resource_id maps to itself (some actions depend on resource_ids directly), but a
+    # table name maps to the action that PRODUCES it, and wins: a stage's table can be
+    # named like the expose it lands (``customer_360_master``), and the expose's own
+    # action must not become its own dependency.
     for action in actions:
-        rid = action.get("resource_id")
-        tname = action.get("table_name")
-        if rid and tname:
-            table_to_resource[tname] = rid
-        # Also map resource_id to itself (some actions depend on resource_ids directly)
-        if rid:
-            table_to_resource[rid] = rid
+        if action.get("resource_id"):
+            table_to_resource[action["resource_id"]] = action["resource_id"]
+    for action in actions:
+        if action.get("resource_id") and action.get("table_name"):
+            table_to_resource[action["table_name"]] = action["resource_id"]
 
     # Normalize dependencies to use resource_ids
     normalized_deps: Dict[str, Set[str]] = {}
@@ -400,6 +797,191 @@ def plan_actions(
     log.info(f"Generated {len(sorted_actions)} actions for contract {contract_id}")
 
     return sorted_actions
+
+
+def _stage_input_names(build: Mapping[str, Any]) -> Set[str]:
+    """The relations ``properties.parameters.inputs`` binds as views before a stage runs."""
+    names = set(_explicit_input_names(build))
+    props = build.get("properties")
+    params = props.get("parameters") if isinstance(props, Mapping) else None
+    inputs = params.get("inputs") if isinstance(params, Mapping) else None
+    for inp in inputs if isinstance(inputs, list) else []:
+        if isinstance(inp, dict) and inp.get("path") and not (inp.get("name") or inp.get("id")):
+            names.add(re.sub(r"[^A-Za-z0-9_]+", "_", Path(str(inp["path"])).stem) or "t")
+    return names
+
+
+def validate_stage_build(
+    contract: Mapping[str, Any], build: Mapping[str, Any], *, whole_contract: bool = True
+) -> List[Stage]:
+    """The stages of a multi-stage build, ordered, after every check that needs no data.
+
+    One place for the contract-file route, the amend-and-build route and the
+    pre-run gate, so all refuse the same builds before anything is written:
+    :func:`ordered_stages`'s refusals; a stage output equal to a declared input's name
+    (the inputs are re-registered as views before each stage, so the stage after it
+    would fail once the first had landed); a named expose no stage produces
+    (``local_plan_invalid``); and a build that lands no expose while the contract
+    declares some (``build_stage_lands_nothing``).
+    """
+    stages = ordered_stages(build)
+    build_id = str(build.get("id") or "?")
+    inputs = {n.lower() for n in _stage_input_names(build)}
+    for stage in stages:
+        for table in stage.tables:
+            if table.lower() in inputs:
+                raise _stage_error(
+                    "build_stage_unsupported",
+                    build_id,
+                    f"stage {stage.name!r} of build {build_id!r} writes the table {table!r}, "
+                    "which is also a declared input",
+                    "The input is bound as a view before every stage, so the stage would "
+                    "replace it and a later stage would fail.",
+                    "Give the stage another output name.",
+                    stage=stage.name,
+                    table=table,
+                )
+    exposes = build_output_exposes(contract, build)  # type: ignore[arg-type]
+    produced = {t for stage in stages for t in stage.tables}
+    missing = [str(get_expose_id(e)) for e in exposes if str(get_expose_id(e)) not in produced]
+    if missing:
+        raise _stage_error(
+            "local_plan_invalid",
+            build_id,
+            f"build {build_id!r} names the expose(s) {', '.join(map(repr, missing))} in "
+            "outputs, and no stage produces them; nothing was written",
+            "An expose lands from the stage output of its own name, and a stage output of "
+            "that name does not exist.",
+            f"List {', '.join(missing)} in the outputs of the stage that produces it.",
+            exposeIds=missing,
+        )
+    declared = [str(get_expose_id(e)) for e in contract.get("exposes") or [] if isinstance(e, dict)]
+    # A helper build that lands nothing is fine while the contract's other builds land every
+    # expose: refuse only when an expose is left that no build of the contract writes.
+    landed_elsewhere: Set[str] = set()
+    for other in contract.get("builds") or []:
+        if isinstance(other, dict) and other is not build:
+            try:
+                landed_elsewhere.update(
+                    str(get_expose_id(e)) for e in build_output_exposes(contract, other)
+                )
+            except BuildOutputsError:
+                continue  # that build is refused on its own account; it lands nothing
+    unwritten = [e for e in declared if e not in landed_elsewhere]
+    if whole_contract and unwritten and not exposes:
+        raise _stage_error(
+            "build_stage_lands_nothing",
+            build_id,
+            f"no stage output of build {build_id!r} is the id of an expose; nothing would land",
+            "An expose lands from the stage output of its own name. The stage outputs are "
+            f"{', '.join(sorted(map(repr, produced)))}; the contract's exposeIds are "
+            f"{', '.join(map(repr, declared))}, and no other build writes "
+            f"{', '.join(map(repr, unwritten))}.",
+            "Name an exposeId in the outputs of the stage that produces it (check the spelling).",
+            outputs=sorted(produced),
+            exposeIds=declared,
+        )
+    return stages
+
+
+def _plan_stage_actions(
+    stages: List[Stage],
+    *,
+    build_id: str,
+    is_destructive: bool,
+    input_tables: Set[str],
+    input_specs: List[Any],
+    taken: Set[str],
+    loaded_tables: Set[str],
+    table_owner: Dict[str, str],
+    actions: List[Dict[str, Any]],
+    dependencies: Dict[str, Set[str]],
+) -> int:
+    """Append the actions of a multi-stage build's ``stages`` (already in order).
+
+    Each stage is an ``execute_sql`` creating its first output table; every other
+    output is a second ``execute_sql`` copying it. A stage depends on the build's
+    input tables, on every table of the stages in its ``dependsOn``, and on the
+    stage before it, so the plan's order is the stage order exactly. Resource ids
+    (``<build>__stage__<name>``) are made unique against ``taken``: the exposes',
+    the inputs' and the other actions'. Returns the number of actions appended.
+    """
+    taken_lower = {t.lower() for t in loaded_tables} | {t.lower() for t in table_owner}
+    tables_of = {stage.name: stage.tables for stage in stages}
+
+    def fresh(base: str) -> str:
+        rid, n = base, 2
+        while rid in taken:
+            rid, n = f"{base}_{n}", n + 1
+        taken.add(rid)
+        return rid
+
+    before = len(actions)
+    previous: Set[str] = set()
+    for stage in stages:
+        for table in stage.tables:
+            if table.lower() in taken_lower:
+                owner = table_owner.get(table.lower())
+                raise _stage_error(
+                    "build_stage_unsupported",
+                    build_id,
+                    f"stage {stage.name!r} of build {build_id!r} writes the table {table!r}, "
+                    "which an input or another build already uses"
+                    + (f" ({owner!r})" if owner else ""),
+                    "The stage would replace its rows.",
+                    "Give the stage another output name.",
+                    stage=stage.name,
+                    table=table,
+                )
+            taken_lower.add(table.lower())
+            table_owner[table.lower()] = build_id
+        first = stage.tables[0]
+        rid = fresh(f"{build_id}__stage__{stage.name}")
+        upstream = {t for dep in stage.depends_on for t in tables_of[dep]}
+        actions.append(
+            {
+                "op": "execute_sql",
+                "resource_type": "transformation",
+                "resource_id": rid,
+                "table_name": first,
+                "depends_on": sorted(input_tables | upstream | previous),
+                "mode": "replace" if is_destructive else "amend",
+                "payload": {
+                    "sql": stage.sql,
+                    "inputs": list(input_specs),
+                    "output_table": first,
+                    # An intermediate table: no preview file under runtime/out.
+                    "preview": False,
+                    "build": build_id,
+                    "stage": stage.name,
+                },
+            }
+        )
+        dependencies[rid] = input_tables | upstream | previous
+        for extra in stage.tables[1:]:  # the other outputs are copies of the first
+            copy_rid = fresh(f"{rid}__copy__{extra}")
+            actions.append(
+                {
+                    "op": "execute_sql",
+                    "resource_type": "transformation",
+                    "resource_id": copy_rid,
+                    "table_name": extra,
+                    "depends_on": [first],
+                    "mode": "replace" if is_destructive else "amend",
+                    "payload": {
+                        "sql": f"SELECT * FROM {validate_ident(first)}",
+                        "inputs": [],
+                        "output_table": extra,
+                        "preview": False,
+                        "build": build_id,
+                        "stage": stage.name,
+                    },
+                }
+            )
+            dependencies[copy_rid] = {first}
+        previous = set(stage.tables)
+        loaded_tables.update(stage.tables)
+    return len(actions) - before
 
 
 def _infer_format(path: str, explicit_format: Optional[str] = None) -> str:
@@ -458,18 +1040,10 @@ def _extract_sql(build: Dict[str, Any], contract: Dict[str, Any], logger) -> Opt
     return None
 
 
-def _extract_input_tables(
-    build: Dict[str, Any], contract: Dict[str, Any], loaded_tables: Set[str]
-) -> Set[str]:
-    """
-    Determine which tables this build depends on.
-
-    Checks:
-    1. build.properties.parameters.inputs (v0.7.x)
-    2. build.inputs (explicit)
-    3. All loaded tables (conservative default)
-    """
-    inputs = set()
+def _explicit_input_names(build: Dict[str, Any]) -> Set[str]:
+    """The input names a build declares: ``properties.parameters.inputs`` (v0.7.x)
+    and ``build.inputs``. Empty when it declares none."""
+    inputs: Set[str] = set()
 
     # Check explicit inputs (v0.7.x format)
     props = build.get("properties") or {}
@@ -494,12 +1068,22 @@ def _extract_input_tables(
             if name:
                 inputs.add(name)
 
-    # If no explicit inputs, assume depends on all loaded tables
-    # (conservative - ensures execution order)
-    if not inputs:
-        inputs = loaded_tables.copy()
-
     return inputs
+
+
+def _extract_input_tables(
+    build: Dict[str, Any], contract: Dict[str, Any], loaded_tables: Set[str]
+) -> Set[str]:
+    """
+    Determine which tables this build must run after.
+
+    Checks:
+    1. The inputs the build declares (:func:`_explicit_input_names`)
+    2. All loaded tables (conservative default: this orders the actions only;
+       a build that declares no inputs reads none, so the executor registers
+       no file for them)
+    """
+    return _explicit_input_names(build) or loaded_tables.copy()
 
 
 def _produced_outside_forge(expose_id: Any, builds: List[Dict[str, Any]], log: Any) -> bool:
@@ -571,41 +1155,42 @@ def _landed_by_runner(expose_id: Any, builds: List[Dict[str, Any]]) -> List[str]
 
 
 def _determine_source_table(
-    expose: Dict[str, Any], builds: List[Dict[str, Any]], loaded_tables: Set[str], logger
+    expose: Dict[str, Any],
+    builds: List[Dict[str, Any]],
+    loaded_tables: Set[str],
+    logger,
+    *,
+    written_by: Optional[Mapping[str, str]] = None,
+    expose_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Determine which table to materialize for this expose.
 
     Priority:
     1. expose.source_table (explicit)
-    2. The output table of the last build that produced one
-    3. Table matching expose ID
+    2. The table of the build that names this expose in ``outputs``
+       (``written_by``, from :func:`build_output_exposes`; the last one wins)
+    3. A table named like the expose
     4. None: an acquisition build's runner lands the expose (logged at
        debug), or nothing backs it (warned, and validate_plan reports it)
+
+    There is no step that lands "the last build's table" or "the first loaded
+    table" for an expose no build names: that wrote one build's rows (or an
+    input, raw) into another expose's file.
     """
     # Check explicit source
     source = expose.get("source_table") or expose.get("source")
     if source:
         return source
 
-    # The last build that produced a table: one this planner skipped (a Flink
-    # job, a dbt model) produced none, and taking its absence for "no build
-    # output" landed the first loaded input, raw, in the expose.
-    for build in reversed(builds):
-        if not isinstance(build, dict):
-            continue
-        output_table = build.get("output_table") or f"result_{build.get('id', '0')}"
-        if output_table in loaded_tables:
-            return output_table
+    expose_id = expose_id if expose_id is not None else get_expose_id(expose)
+    table = (written_by or {}).get(str(expose_id))
+    if table:
+        return table
 
     # Try to match by ID
-    expose_id = get_expose_id(expose)
     if expose_id in loaded_tables:
         return expose_id
-
-    # Fallback to first available table (sorted for determinism)
-    if loaded_tables:
-        return sorted(loaded_tables)[0]
 
     landed_by = _landed_by_runner(expose_id, builds)
     if landed_by:
@@ -693,7 +1278,9 @@ def _topological_sort(
     return sorted_actions
 
 
-def validate_plan(actions: List[Dict[str, Any]], logger=None) -> Tuple[bool, List[str]]:
+def validate_plan(
+    actions: List[Dict[str, Any]], logger=None, *, report: bool = True
+) -> Tuple[bool, List[str]]:
     """
     Validate generated plan for common issues.
 
@@ -735,6 +1322,8 @@ def validate_plan(actions: List[Dict[str, Any]], logger=None) -> Tuple[bool, Lis
 
     is_valid = len(errors) == 0
 
+    if not report:
+        return is_valid, errors
     if errors:
         log.error(f"Plan validation failed with {len(errors)} errors:")
         for err in errors:

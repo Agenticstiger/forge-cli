@@ -25,12 +25,17 @@ when it detects an acquisition build with ``engine: duckdb``.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
+import hashlib
 import logging
 import os
 import re
+import stat
+import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -621,6 +626,579 @@ def _build_copy_destination(
     return f"COPY ({{select}}) TO {quoted_path} ({options})"
 
 
+#: The reader that reads a sink format back, for the union rewrite of an appended file.
+#: json is read with the expose's declared column types, never re-inferred.
+_SINK_READERS = {
+    "parquet": "read_parquet",
+    "csv": "read_csv",
+    "json": "read_json",
+    "ndjson": "read_json",
+}
+
+_JSON_INT_TYPES = {
+    "tinyint": "TINYINT",
+    "smallint": "SMALLINT",
+    "int2": "SMALLINT",
+    "int": "INTEGER",
+    "integer": "INTEGER",
+    "int4": "INTEGER",
+    "int32": "INTEGER",
+    "bigint": "BIGINT",
+    "long": "BIGINT",
+    "longint": "BIGINT",
+    "int8": "BIGINT",
+    "int64": "BIGINT",
+}
+_JSON_SIMPLE_TYPES = {
+    **dict.fromkeys(
+        ("string", "text", "varchar", "nvarchar", "char", "nchar", "character", "clob"), "VARCHAR"
+    ),
+    **_JSON_INT_TYPES,
+    # ``float`` is a 64-bit double here, as in the AWS planner; only the explicitly narrow
+    # names are 32-bit.
+    **dict.fromkeys(("float4", "float32", "real"), "FLOAT"),
+    **dict.fromkeys(("float", "double", "float8", "float64", "double precision"), "DOUBLE"),
+    **dict.fromkeys(("boolean", "bool"), "BOOLEAN"),
+    "date": "DATE",
+    "time": "TIME",
+    "uuid": "UUID",
+    **dict.fromkeys(("timestamp", "datetime", "timestamp_ntz", "timestampntz"), "TIMESTAMP"),
+    **dict.fromkeys(("timestamptz", "timestamp_tz", "timestamp_ltz"), "TIMESTAMPTZ"),
+}
+
+
+@dataclass
+class JsonAppendSchemaError(FluidUserError):
+    """``incremental_append`` to a json sink needs the expose's declared column types."""
+
+    code: str = "incremental_append_json_needs_schema"
+
+
+def _json_column_type(column: str, declared: str) -> str:
+    """The DuckDB type of a declared FLUID column type, or a refusal (never a guess)."""
+    from fluid_build.util.column_type import split_type_params
+
+    base, params = split_type_params(str(declared).lower())
+    base = " ".join(base.split())
+    if base in ("decimal", "dec", "numeric", "number"):
+        match = re.fullmatch(r"\s*(\d{1,2})\s*(?:,\s*(\d{1,2})\s*)?", params or "")
+        if match and int(match.group(1)) <= 38 and int(match.group(2) or 0) <= int(match.group(1)):
+            return f"DECIMAL({int(match.group(1))},{int(match.group(2) or 0)})"
+    elif params is None and base in _JSON_SIMPLE_TYPES:
+        return _JSON_SIMPLE_TYPES[base]
+    elif params is not None and base in ("varchar", "char", "nvarchar", "nchar", "string"):
+        return "VARCHAR"
+    elif base == "timestamp with time zone":
+        return "TIMESTAMPTZ"
+    elif base == "timestamp without time zone":
+        return "TIMESTAMP"
+    raise JsonAppendSchemaError(
+        what=f"incremental_append to a json sink cannot read column '{column}' back as {declared}",
+        why=(
+            "DuckDB's COPY cannot append to one file, so the runner rewrites it, and it reads "
+            "the old rows with the declared column types rather than re-inferring them. This "
+            "type has no DuckDB type the runner is sure of."
+        ),
+        fix="Declare the column as string, a number, boolean, date, time, timestamp or "
+        "decimal(p,s), or land to parquet or csv.",
+        doc=doc_url(),
+        code="incremental_append_json_unmapped_type",
+    )
+
+
+def _json_append_to_local_file(ctx: RunContext, streams: List[str], partition_by: Any) -> bool:
+    """Whether this run appends to a local json/ndjson file, the one case that rewrites it
+    (and so needs declared types). An object store, a staged BigQuery/Databricks file and a
+    partitioned table do not go through the union rewrite."""
+    fmt = (ctx.sink.format or "parquet").lower()
+    if (
+        ctx.source.mode is not AcquisitionMode.INCREMENTAL_APPEND
+        or fmt not in ("json", "ndjson")
+        or partition_by
+        or _bigquery_target(ctx) is not None
+        or _is_databricks_binding(ctx)
+    ):
+        return False
+    out_dir = Path(ctx.workdir) / "out"
+    try:
+        return not any(
+            _is_remote_uri(_resolve_destination_path(ctx, s, fmt, out_dir)) for s in streams
+        )
+    except OSError:
+        # Resolving a destination creates its directory; if it cannot, the run's own
+        # per-stream handling reports it, and this early check stays out of the way.
+        return False
+
+
+def _json_append_columns(ctx: RunContext) -> Dict[str, str]:
+    """``{column: DuckDB type}`` for the expose a json ``incremental_append`` lands."""
+    expose = _build_expose(ctx) or {}
+    contract = expose.get("contract") if isinstance(expose.get("contract"), dict) else {}
+    columns = {
+        str(c["name"]): _json_column_type(str(c["name"]), c.get("type") or "")
+        for c in (contract.get("schema") or [])
+        if isinstance(c, dict) and c.get("name")
+    }
+    if not columns:
+        raise JsonAppendSchemaError(
+            what="incremental_append to a json sink needs the expose to declare contract.schema",
+            why=(
+                "DuckDB's COPY cannot append to one file, so each run rewrites it with the old "
+                "rows read back. Without declared column types a timestamp, a decimal or a "
+                "zero-padded id would be re-inferred and changed."
+            ),
+            fix="Declare the expose's contract.schema (name and type per column), or land to "
+            "parquet or csv.",
+            doc=doc_url(),
+            where=str(expose.get("exposeId") or ""),
+        )
+    return columns
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        # Cleanup is best effort: a temp that is already gone, or cannot be removed, must
+        # not replace the error (or the result) of the rewrite that is being cleaned up after.
+        pass
+
+
+def _fsync_path(path: str) -> None:
+    fd = os.open(path, os.O_RDWR)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_dir(path: str) -> None:
+    """Make the rename durable. Best effort: the file is already replaced when this runs,
+    so no failure here (Windows cannot open a directory; a file system may not sync one)
+    may fail the run, and a retry would append the same rows again."""
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        LOG.debug("duckdb.append.dir_fsync_failed errno=%s", exc.errno)
+    finally:
+        os.close(fd)
+
+
+#: Stale run-named temps (a hard kill leaves one) are removed after this long.
+_STALE_TEMP_SECONDS = 24 * 3600
+
+
+def _remove_stale_temps(path: str) -> None:
+    """Remove ``.<name>.<token>.fluid-append`` files of THIS target, older than a day.
+
+    Only that exact name shape, only regular files (never a link or a directory), one
+    ``os.unlink`` each."""
+    head, name = os.path.split(os.fspath(path))
+    shape = re.compile(r"\." + re.escape(name) + r"\.[A-Za-z0-9_.-]+\.fluid-append")
+    cutoff = time.time() - _STALE_TEMP_SECONDS
+    try:
+        entries = os.listdir(head or ".")
+    except OSError:
+        return
+    for entry in entries:
+        if not shape.fullmatch(entry):
+            continue
+        candidate = os.path.join(head, entry)
+        try:
+            info = os.lstat(candidate)
+            if stat.S_ISREG(info.st_mode) and info.st_mtime < cutoff:
+                os.unlink(candidate)
+        except OSError:
+            continue
+
+
+def _append_tmp_path(path: str, run_id: Optional[str] = None) -> str:
+    """The temp file of one union rewrite, beside ``path``: unique, so overlapping runs
+    never share (and never unlink) each other's in-flight file. A run's name is derived from
+    its run id, so the sandbox can grant exactly that path before the connection locks."""
+    head, name = os.path.split(os.fspath(path))
+    token = re.sub(r"[^A-Za-z0-9_.-]", "_", str(run_id)) if run_id else uuid.uuid4().hex
+    return os.path.join(head, f".{name}.{token}.fluid-append")
+
+
+@dataclass
+class AppendLockError(FluidUserError):
+    """The lock on a landed file could not be taken."""
+
+    code: str = "incremental_append_lock_unavailable"
+
+
+#: How long a Windows run waits for another run's rewrite of the same file.
+_LOCK_TIMEOUT_SECONDS = 600.0
+
+
+def _lock_dir_for(ctx: RunContext) -> str:
+    """Where this project's rewrite locks live: ``<workdir>/.fluid/locks``."""
+    return os.path.join(str(ctx.workdir), ".fluid", "locks")
+
+
+def _private_dir(path: str) -> str:
+    """``path`` as a directory only this user can use: created 0o700, not a link, ours."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise AppendLockError(
+            what=f"the lock directory {path} is a link or not a directory",
+            why="A lock under a link could be placed where another user chooses.",
+            fix="Remove it, so the runner can create its own.",
+            doc=doc_url(),
+        )
+    if hasattr(os, "getuid") and (info.st_uid != os.getuid() or info.st_mode & 0o022):
+        raise AppendLockError(
+            what=f"the lock directory {path} is not private to this user",
+            why="Another user could hold or replace the locks that order rewrites of a file.",
+            fix="Remove it, so the runner can create its own.",
+            doc=doc_url(),
+        )
+    return path
+
+
+def _locks_dir(lock_dir: Optional[str]) -> str:
+    if lock_dir:
+        return _private_dir(lock_dir)
+    who = str(os.getuid()) if hasattr(os, "getuid") else re.sub(r"\W", "_", os.getlogin())
+    return _private_dir(os.path.join(tempfile.gettempdir(), f"fluid-locks-{who}"))
+
+
+@contextlib.contextmanager
+def _target_lock(path: str, lock_dir: Optional[str] = None) -> Any:
+    """An exclusive lock on ``path`` for a whole read-modify-write of it.
+
+    The lock file is named by the sha256 of the target's real path and lives outside the
+    output directory. POSIX ``flock`` on a descriptor of its own, so two threads of one
+    process exclude each other too; Windows ``msvcrt.locking`` on one byte, retried up
+    to :data:`_LOCK_TIMEOUT_SECONDS`. The lock is on the open descriptor, so a leftover
+    lock file blocks nobody. Take the main file's lock before the side file's, never
+    the reverse.
+    """
+    key = hashlib.sha256(os.path.realpath(path).encode("utf-8")).hexdigest()
+    lock_path = os.path.join(_locks_dir(lock_dir), key + ".lock")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        if os.name == "nt":  # pragma: no cover - exercised on Windows only
+            import msvcrt
+
+            deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() > deadline:
+                        raise AppendLockError(
+                            what=f"another run kept {path} locked for {_LOCK_TIMEOUT_SECONDS:.0f}s",
+                            why="Rewrites of one file run one at a time.",
+                            fix="Wait for the other run, or stop it, then run again.",
+                            doc=doc_url(),
+                        ) from None
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":  # pragma: no cover
+                import msvcrt
+
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    finally:
+        os.close(fd)  # closing releases a flock
+
+
+def _appends_to_file(ctx: RunContext, out_path: str, fmt: str, partitioned: Any) -> bool:
+    """Whether this stream appends to a local single file that already holds rows.
+
+    Only ``incremental_append`` to one existing local file: a full refresh, a
+    partitioned table (it appends by new file), an object store and a staged
+    BigQuery/Databricks file keep writing as before.
+    """
+    return (
+        ctx.source.mode is AcquisitionMode.INCREMENTAL_APPEND
+        and partitioned is None
+        and (fmt or "parquet").lower() in _SINK_READERS
+        and not _is_remote_uri(out_path)
+        and _bigquery_target(ctx) is None
+        and not _is_databricks_binding(ctx)
+        and Path(out_path).is_file()
+    )
+
+
+def _union_select(
+    con: Any,
+    out_path: str,
+    fmt: str,
+    new_relation: str,
+    json_columns: Optional[Dict[str, str]] = None,
+) -> str:
+    """The SELECT of ``out_path``'s rows plus those of ``new_relation``. Every typed
+    refusal a rewrite can raise (undeclared json columns) is raised here, before anything
+    is written."""
+    fmt = (fmt or "parquet").lower()
+    path = quote_ansi_string_literal(out_path)
+    if fmt == "csv":
+        # Text round-trips as text: ``007`` and ``01234`` must not come back as integers.
+        old = f"SELECT * FROM read_csv({path}, header = true, all_varchar = true)"
+        names = [d[0] for d in con.execute(f"SELECT * FROM {new_relation} LIMIT 0").description]
+        cols = ", ".join(
+            f'CAST("{n.replace(chr(34), chr(34) * 2)}" AS VARCHAR) AS "{n.replace(chr(34), chr(34) * 2)}"'
+            for n in names
+        )
+        new = f"SELECT {cols} FROM {new_relation}"
+    elif fmt in ("json", "ndjson"):
+        declared = json_columns or {}
+        names = [d[0] for d in con.execute(f"SELECT * FROM {new_relation} LIMIT 0").description]
+        unknown = [n for n in names if n not in declared]
+        if unknown:
+            raise JsonAppendSchemaError(
+                what=f"column '{unknown[0]}' is landed but not declared in contract.schema",
+                why="The old rows are read back by the declared columns, so an undeclared "
+                "column would be dropped from the file.",
+                fix="Declare every landed column in the expose's contract.schema.",
+                doc=doc_url(),
+                code="incremental_append_json_undeclared_column",
+            )
+        # A column the old file holds and the schema no longer declares would be dropped by
+        # the typed read below: refuse before the file is rewritten (names only; the types
+        # always come from the declaration).
+        try:
+            old_names = [
+                r[0]
+                for r in con.execute(f"DESCRIBE SELECT * FROM read_json_auto({path})").fetchall()
+            ]
+        except Exception:  # noqa: BLE001 - an empty or unreadable old file: the read below decides
+            old_names = []
+        dropped = [n for n in old_names if n not in declared]
+        if dropped:
+            raise JsonAppendSchemaError(
+                what=f"the file already holds column '{dropped[0]}', which contract.schema does not declare",
+                why="The old rows are read back by the declared columns, so the rewrite would "
+                "silently drop that column from every earlier row.",
+                fix="Declare the column in the expose's contract.schema, or move the file aside.",
+                doc=doc_url(),
+                code="incremental_append_json_undeclared_column",
+            )
+        spec = ", ".join(f"{quote_ansi_string_literal(n)}: '{t}'" for n, t in declared.items())
+        old = (
+            f"SELECT * FROM read_json({path}, format = 'newline_delimited', "
+            f"columns = {{{spec}}})"
+        )
+        new = f"SELECT * FROM {new_relation}"
+    else:
+        old = f"SELECT * FROM read_parquet({path})"
+        new = f"SELECT * FROM {new_relation}"
+    return f"{old} UNION ALL BY NAME {new}"
+
+
+def _commit_select(
+    con: Any, out_path: str, fmt: str, select_sql: str, run_id: Optional[str] = None
+) -> None:
+    """Write ``select_sql`` over ``out_path``: a temp file in the same directory, fsynced,
+    then ``os.replace`` (atomic), then the directory fsynced. A failure leaves the previous
+    file as it was (or no file) and no temp file behind.
+    Pattern: temp file + fsync + os.replace, as python-atomicwrites; DuckDB COPY
+    cannot append to one file."""
+    fmt = (fmt or "parquet").lower()
+    tmp = _append_tmp_path(out_path, run_id)
+    _remove_stale_temps(out_path)
+    _remove_quietly(tmp)
+    try:
+        con.execute(_build_copy_destination(tmp, fmt).replace("{select}", select_sql, 1))
+        _fsync_path(tmp)
+        os.replace(tmp, out_path)
+    except BaseException:
+        _remove_quietly(tmp)
+        raise
+    _fsync_dir(out_path)
+
+
+def _union_rewrite(
+    con: Any,
+    out_path: str,
+    fmt: str,
+    new_relation: str,
+    json_columns: Optional[Dict[str, str]] = None,
+    run_id: Optional[str] = None,
+    lock_dir: Optional[str] = None,
+) -> None:
+    """Rewrite ``out_path`` as its rows plus those of ``new_relation`` (a table or view).
+
+    DuckDB's ``COPY`` cannot append to one file, so the union is committed through
+    :func:`_commit_select`, with the target locked from the first read of the old file
+    to the rename: concurrent rewrites of one file run one at a time and lose no row."""
+    with _target_lock(out_path, lock_dir):
+        union = _union_select(con, out_path, fmt, new_relation, json_columns)
+        _commit_select(con, out_path, fmt, union, run_id)
+
+
+def _old_rows_sql(path: str, fmt: str, json_columns: Optional[Dict[str, str]]) -> str:
+    """The rows an appended file holds, read back as the union rewrite reads them: csv as
+    text, json by its declared types, parquet as stored."""
+    lit = quote_ansi_string_literal(path)
+    if fmt == "csv":
+        return f"SELECT * FROM read_csv({lit}, header = true, all_varchar = true)"
+    if fmt in ("json", "ndjson"):
+        spec = ", ".join(
+            f"{quote_ansi_string_literal(n)}: '{t}'" for n, t in (json_columns or {}).items()
+        )
+        return f"SELECT * FROM read_json({lit}, format = 'newline_delimited', columns = {{{spec}}})"
+    return f"SELECT * FROM read_parquet({lit})"
+
+
+def _late_file_path(out_path: str) -> str:
+    main = Path(out_path)
+    return str(main.with_name(main.stem + "__late_events" + main.suffix))
+
+
+def _split_new_rows(
+    con: Any,
+    out_path: str,
+    fmt: str,
+    column: str,
+    budget_seconds: float,
+    json_columns: Optional[Dict[str, str]],
+) -> Dict[str, int]:
+    """Split this run's rows (``__fl_append_new``) into ``__fl_append_ontime`` and
+    ``__fl_append_late``: a row is late when it is older than the newest event time known
+    (the file's rows and the new rows) minus the allowed lateness. Earlier runs' rows are
+    never reclassified: they were judged when they landed.
+
+    Enforcement is never silently off: a column that is not landed, or is not a date or
+    timestamp (the post-land splitter fails on those too, and warns), is logged.
+    """
+    ident = validate_ident(column)
+    landed = {
+        str(r[0]).lower(): (str(r[0]), str(r[1]))
+        for r in con.execute("DESCRIBE SELECT * FROM __fl_append_new").fetchall()
+    }
+    seconds = int(budget_seconds)
+    found = landed.get(ident.lower())
+    skip_reason = ""
+    if seconds <= 0:
+        skip_reason = "no allowed lateness"
+    elif found is None:
+        skip_reason = "the column is not among the landed columns"
+    elif not (found[1] == "DATE" or found[1].startswith("TIMESTAMP")):
+        skip_reason = f"the column is {found[1]}, not a date or timestamp"
+    if skip_reason:
+        if seconds > 0:
+            LOG.warning(
+                "late_arrival_split_skipped: event-time column %s: %s; every row lands on time",
+                ident,
+                skip_reason,
+            )
+        con.execute(
+            "CREATE OR REPLACE TEMP TABLE __fl_append_ontime AS SELECT * FROM __fl_append_new"
+        )
+        con.execute(
+            "CREATE OR REPLACE TEMP TABLE __fl_append_late AS SELECT * FROM __fl_append_new LIMIT 0"
+        )
+    else:
+        name, col_type = found  # type: ignore[misc]
+        old = _old_rows_sql(out_path, fmt, json_columns)
+        old_names = {str(r[0]).lower() for r in con.execute(f"DESCRIBE {old}").fetchall()}
+        sources = f'SELECT "{name}" FROM __fl_append_new'
+        if name.lower() in old_names:
+            # A column the contract added later is missing from an older file: no old rows
+            # to take the newest time from.
+            sources += f' UNION ALL SELECT CAST("{name}" AS {col_type}) FROM ({old})'
+        late = f'"{name}" < (SELECT max("{name}") FROM ({sources})) - INTERVAL \'{seconds}\' SECOND'
+        con.execute(
+            f"CREATE OR REPLACE TEMP TABLE __fl_append_late AS SELECT * FROM __fl_append_new WHERE {late}"
+        )
+        con.execute(
+            "CREATE OR REPLACE TEMP TABLE __fl_append_ontime AS "
+            f"SELECT * FROM __fl_append_new WHERE NOT COALESCE({late}, false)"
+        )
+    counts = {}
+    for key, table in (("on_time", "__fl_append_ontime"), ("late", "__fl_append_late")):
+        row = first_row(con.execute(f"SELECT COUNT(*) FROM {table}"))
+        counts[key] = int(row[0]) if row else 0
+    return counts
+
+
+def _append_to_file(
+    con: Any,
+    out_path: str,
+    fmt: str,
+    landed_sel: str,
+    json_columns: Optional[Dict[str, str]] = None,
+    *,
+    run_id: Optional[str] = None,
+    late: Optional[Tuple[str, float]] = None,
+    cursor_field: Optional[str] = None,
+    info: Optional[Dict[str, Any]] = None,
+    lock_dir: Optional[str] = None,
+) -> Tuple[int]:
+    """Append the rows of ``landed_sel`` to the existing file; returns ``(rows appended,)``.
+
+    The main file stays locked from the first read of its old rows (the lateness
+    watermark) to the rename, and the side file is locked, inside it, around its own
+    rewrite: the order is always main, then side.
+
+    With ``late`` (the event-time column and the allowed lateness) only this run's rows are
+    split: the on-time ones join the main file and the late ones the side file. Everything
+    that can refuse (the typed json checks, the cursor) runs before the first write; then
+    the side file is written, then the main file. A genuine I/O failure between the two
+    writes leaves the late rows in the side file of a failed run whose cursor did not move,
+    so a retry appends them again: at-least-once, never a loss. ``info`` receives the
+    split's counts and, when rows went to the side file, the newest cursor value landed.
+    """
+    con.execute(f"CREATE OR REPLACE TEMP TABLE __fl_append_new AS {landed_sel}")
+    try:
+        with _target_lock(out_path, lock_dir):
+            count = first_row(con.execute("SELECT COUNT(*) FROM __fl_append_new"))
+            main_rows = "__fl_append_new"
+            side: Optional[str] = None
+            if late is not None:
+                _remove_stale_temps(_late_file_path(out_path))
+                counts = _split_new_rows(con, out_path, fmt, late[0], late[1], json_columns)
+                if info is not None:
+                    info["late_counts"] = counts
+                if counts["late"]:
+                    late_path = _late_file_path(out_path)
+                    if Path(late_path).is_file():
+                        # Only to refuse early; the select is built again under the lock.
+                        _union_select(con, late_path, fmt, "__fl_append_late", json_columns)
+                    side = late_path
+                    main_rows = "__fl_append_ontime"
+                    if info is not None and cursor_field:
+                        top = first_row(
+                            con.execute(
+                                f'SELECT MAX("{validate_ident(cursor_field)}") FROM __fl_append_new'
+                            )
+                        )
+                        info["cursor_max"] = top[0] if top else None
+            main_select = _union_select(con, out_path, fmt, main_rows, json_columns)
+            if side is not None:
+                with _target_lock(side, lock_dir):
+                    select = (
+                        _union_select(con, side, fmt, "__fl_append_late", json_columns)
+                        if Path(side).is_file()
+                        else "SELECT * FROM __fl_append_late"
+                    )
+                    _commit_select(con, side, fmt, select, run_id)
+            _commit_select(con, out_path, fmt, main_select, run_id)
+            return (int(count[0]) if count else 0,)
+    finally:
+        for table in ("__fl_append_new", "__fl_append_ontime", "__fl_append_late"):
+            con.execute(f"DROP TABLE IF EXISTS {table}")
+
+
 #: The file extension DuckDB gives a partition's files, by reader.
 _READER_EXT = {"read_parquet": "parquet", "read_csv_auto": "csv", "read_json_auto": "json"}
 
@@ -790,7 +1368,13 @@ def _grant_destination(
         main = Path(dest)
         late = main.with_name(main.stem + "__late_events" + main.suffix)
         allow = allow.with_declared(
-            str(main), str(late), copy_tmp_path(main), copy_tmp_path(late), within=within
+            str(main),
+            str(late),
+            copy_tmp_path(main),
+            copy_tmp_path(late),
+            _append_tmp_path(str(main), ctx.run_id),
+            _append_tmp_path(str(late), ctx.run_id),
+            within=within,
         )
     return allow
 
@@ -1146,10 +1730,34 @@ def _run_post_land_hooks(
     return findings
 
 
+def _late_split_plan(ctx: RunContext) -> Optional[Tuple[str, float]]:
+    """``(event-time column, allowed lateness in seconds)`` when the build declares a
+    late-arrival policy and the contract names an event-time column, else ``None``."""
+    from .._late_arrival import _detect_event_time_column, extract_late_arrival_policy
+
+    policy = extract_late_arrival_policy(contract_or_source=ctx.source)
+    if not policy.get("enabled"):
+        return None
+    expose_schemas: List[Dict[str, Any]] = []
+    for expose in ctx.contract.get("exposes") or []:
+        sch = (expose.get("contract") or {}).get("schema")
+        if isinstance(sch, list):
+            expose_schemas.extend(sch)
+    column = _detect_event_time_column(expose_schemas)
+    if not column:
+        LOG.debug(
+            "late_arrival_split_skipped: no event-time column found in "
+            "contract.exposes[].contract.schema"
+        )
+        return None
+    return column, float(policy["allowed_lateness_seconds"])
+
+
 def _enforce_late_arrival_split(
     ctx: RunContext,
     stream_results: List[StreamResult],
     sink_format: str,
+    skip: Sequence[str] = (),
 ) -> Dict[str, Dict[str, int]]:
     """Split landed rows into on-time vs late events per the contract's
     ``WatermarkSpec.allowed_lateness``.
@@ -1164,32 +1772,12 @@ def _enforce_late_arrival_split(
     surfacing. Empty dict when no policy is configured (early return)
     or no streams to process.
     """
-    from .._late_arrival import (
-        _detect_event_time_column,
-        extract_late_arrival_policy,
-        split_late_events_in_duckdb,
-    )
+    from .._late_arrival import split_late_events_in_duckdb
 
-    policy = extract_late_arrival_policy(contract_or_source=ctx.source)
-    if not policy.get("enabled"):
+    plan = _late_split_plan(ctx)
+    if plan is None:
         return {}
-
-    # Resolve the event-time column from the contract's first expose
-    # schema. Fall back to the canonical names if the contract doesn't
-    # expose a schema (rare for production contracts).
-    expose_schemas: List[Dict[str, Any]] = []
-    for expose in ctx.contract.get("exposes") or []:
-        contract_block = expose.get("contract") or {}
-        sch = contract_block.get("schema")
-        if isinstance(sch, list):
-            expose_schemas.extend(sch)
-    event_time_column = _detect_event_time_column(expose_schemas)
-    if not event_time_column:
-        LOG.debug(
-            "late_arrival_split_skipped: no event-time column found in "
-            "contract.exposes[].contract.schema"
-        )
-        return {}
+    event_time_column, budget_seconds = plan
 
     import duckdb
 
@@ -1214,13 +1802,12 @@ def _enforce_late_arrival_split(
         )
         return {}
 
-    budget_seconds = float(policy["allowed_lateness_seconds"])
-
     results: Dict[str, Dict[str, int]] = {}
+    lock_dir = _lock_dir_for(ctx)
     con = _connect_for_destination(ctx)
     try:
         for stream_result in stream_results:
-            if stream_result.state != RunState.SUCCEEDED:
+            if stream_result.state != RunState.SUCCEEDED or stream_result.name in skip:
                 continue
             stream_name = stream_result.name
             main_path = _resolve_destination_path(ctx, stream_name, fmt, out_dir)
@@ -1231,48 +1818,79 @@ def _enforce_late_arrival_split(
                 main_path_obj.stem + "__late_events" + main_path_obj.suffix
             )
 
-            # Stage data into temp tables, run the SQL split, then
-            # overwrite the main file + write the late-events file.
-            quoted_main = quote_ansi_string_literal(str(main_path_obj))
-            quoted_late = quote_ansi_string_literal(str(late_path_obj))
-            con.execute(
-                f"CREATE OR REPLACE TABLE __la_main AS SELECT * FROM {reader_func}({quoted_main})"
-            )
-
-            try:
-                counts = split_late_events_in_duckdb(
-                    con=con,
-                    source_relation="__la_main",
-                    side_output_relation="__la_side",
-                    event_time_column=event_time_column,
-                    allowed_lateness_seconds=budget_seconds,
+            with _target_lock(str(main_path_obj), lock_dir):
+                # Stage data into temp tables, run the SQL split, then
+                # overwrite the main file + write the late-events file.
+                quoted_main = quote_ansi_string_literal(str(main_path_obj))
+                quoted_late = quote_ansi_string_literal(str(late_path_obj))
+                con.execute(
+                    f"CREATE OR REPLACE TABLE __la_main AS SELECT * FROM {reader_func}({quoted_main})"
                 )
-            except Exception as exc:  # noqa: BLE001
-                LOG.warning(
-                    "late_arrival_split_sql_failed: stream=%s err=%s",
-                    stream_name,
-                    exc,
-                )
-                continue
 
-            if counts["late"] == 0:
-                # Nothing to do — leave the file alone.
+                try:
+                    counts = split_late_events_in_duckdb(
+                        con=con,
+                        source_relation="__la_main",
+                        side_output_relation="__la_side",
+                        event_time_column=event_time_column,
+                        allowed_lateness_seconds=budget_seconds,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning(
+                        "late_arrival_split_sql_failed: stream=%s err=%s",
+                        stream_name,
+                        exc,
+                    )
+                    continue
+
+                if counts["late"] == 0:
+                    # Nothing to do — leave the file alone. A full refresh replaced every
+                    # row, so a side file an older run left no longer describes this file.
+                    if ctx.source.mode is AcquisitionMode.FULL_REFRESH and not _is_remote_uri(
+                        str(late_path_obj)
+                    ):
+                        _remove_quietly(str(late_path_obj))
+                    results[stream_name] = counts
+                    continue
+
+                # Overwrite the main file (now without late rows) and emit
+                # the side-output file. Use COPY ... TO ... so duckdb
+                # handles the format details.
+                # The side file goes first: if it fails, the late rows are still in the
+                # main file, not only in memory.
+                if (
+                    ctx.source.mode is AcquisitionMode.INCREMENTAL_APPEND
+                    and fmt in _SINK_READERS
+                    and not _is_remote_uri(str(late_path_obj))
+                    and late_path_obj.is_file()
+                ):
+                    # An earlier run's late rows stay: this run's join them.
+                    _union_rewrite(
+                        con,
+                        str(late_path_obj),
+                        fmt,
+                        "__la_side",
+                        _json_append_columns(ctx) if fmt in ("json", "ndjson") else None,
+                        ctx.run_id,
+                        lock_dir,
+                    )
+                elif fmt in _SINK_READERS and not _is_remote_uri(str(late_path_obj)):
+                    # Temp file, fsync, rename: a crash never leaves a partial side file.
+                    with _target_lock(str(late_path_obj), lock_dir):
+                        _commit_select(
+                            con, str(late_path_obj), fmt, "SELECT * FROM __la_side", ctx.run_id
+                        )
+                else:
+                    con.execute(f"COPY __la_side TO {quoted_late} ({writer_func})")
+                con.execute(f"COPY __la_main TO {quoted_main} ({writer_func})")
                 results[stream_name] = counts
-                continue
-
-            # Overwrite the main file (now without late rows) and emit
-            # the side-output file. Use COPY ... TO ... so duckdb
-            # handles the format details.
-            con.execute(f"COPY __la_main TO {quoted_main} ({writer_func})")
-            con.execute(f"COPY __la_side TO {quoted_late} ({writer_func})")
-            results[stream_name] = counts
-            LOG.info(
-                "late_arrival_split: stream=%s on_time=%d late=%d side_output=%s",
-                stream_name,
-                counts["on_time"],
-                counts["late"],
-                late_path_obj,
-            )
+                LOG.info(
+                    "late_arrival_split: stream=%s on_time=%d late=%d side_output=%s",
+                    stream_name,
+                    counts["on_time"],
+                    counts["late"],
+                    late_path_obj,
+                )
     finally:
         con.close()
     return results
@@ -1573,6 +2191,7 @@ def _persist_cursor_after_run(
     stream: str,
     out_path: str,
     sink_format: str,
+    landed_max: Any = None,
 ) -> bool:
     """After a successful incremental run, advance the cursor to the
     MAX value we just landed. Returns True if the cursor advanced.
@@ -1602,13 +2221,18 @@ def _persist_cursor_after_run(
     else:
         return False  # unsupported sink for cursor read-back
 
-    relation = _landed_relation(out_path, reader, _partition_columns(ctx))
-    con = _connect_for_destination(ctx)
-    try:
-        row = first_row(con.execute(f"SELECT MAX({cursor_field_safe}) FROM {relation}"))
-    finally:
-        con.close()
-    new_value = row[0] if row is not None else None
+    if landed_max is not None:
+        # Rows split off to the late-events file are not in the main file, but they are
+        # landed: the cursor must pass them.
+        new_value = landed_max
+    else:
+        relation = _landed_relation(out_path, reader, _partition_columns(ctx))
+        con = _connect_for_destination(ctx)
+        try:
+            row = first_row(con.execute(f"SELECT MAX({cursor_field_safe}) FROM {relation}"))
+        finally:
+            con.close()
+        new_value = row[0] if row is not None else None
     if new_value is None:
         return False
     ctx.state_store.set_cursor(
@@ -1649,6 +2273,9 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     from .._masking import MaskingPolicyError
 
     streams_to_run = list(ctx.source.streams) or runner._infer_streams(ctx)
+    # An output that is no exposeId (or none beside several exposes) refuses here, typed,
+    # before the gate, a write or a run-start event.
+    _build_expose(ctx)
     # Before the schema gate, so a masked column declared with a type its
     # strategy cannot produce is refused with that reason rather than reported
     # as drift; and before anything connects, so a refused run touches nothing.
@@ -1665,6 +2292,11 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
         started_at = emit_start_lineage_event(ctx)
         return _refused_run(ctx, streams_to_run, started_at, time.time(), refused_layout)
     partition_by = _partition_columns(ctx)
+    # A json append reads the old rows back by declared type: refuse before any write
+    # (and before the run opens) when the expose declares none.
+    json_columns: Optional[Dict[str, str]] = None
+    if _json_append_to_local_file(ctx, streams_to_run, partition_by):
+        json_columns = _json_append_columns(ctx)
 
     # Shared run-opening chokepoint: timestamp + schema-evolution gate +
     # duration clock + the OpenLineage START event. duckdb previously
@@ -1741,6 +2373,12 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     on_error = (quality_config.get("onError") or "fail").strip().lower()
     dlq_writer: Optional[DLQWriter] = None
     dlq_total_records = 0
+    # An append splits its own rows at land time (earlier runs' rows are never
+    # reclassified); the post-land split then skips those streams.
+    append_late_plan = (
+        _late_split_plan(ctx) if ctx.source.mode is AcquisitionMode.INCREMENTAL_APPEND else None
+    )
+    appended_late: Dict[str, Dict[str, int]] = {}
 
     try:
         con = secure_duckdb_connect(
@@ -1803,7 +2441,24 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                 # select re-reads the source, which a live database may have
                 # changed since, and a table holding exactly what the COPY
                 # wrote then failed verify against the larger number.
-                written = first_row(con.execute(copy_sql))
+                append_info: Dict[str, Any] = {}
+                if _appends_to_file(ctx, out_path, sink_format, partitioned):
+                    written = _append_to_file(
+                        con,
+                        out_path,
+                        sink_format,
+                        landed_sel,
+                        json_columns,
+                        run_id=ctx.run_id,
+                        late=append_late_plan,
+                        cursor_field=ctx.source.cursor_field,
+                        info=append_info,
+                        lock_dir=_lock_dir_for(ctx),
+                    )
+                    if "late_counts" in append_info:
+                        appended_late[stream] = append_info["late_counts"]
+                else:
+                    written = first_row(con.execute(copy_sql))
                 if partitioned is not None:
                     _refuse_null_partitions(con, ctx, out_path, partitioned, sink_format)
                 if written is not None and isinstance(written[0], int):
@@ -1867,7 +2522,9 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                         dlq_total_records += bad_records_for_stream
 
                 # Persist cursor for next run (no-op for full refresh).
-                cursor_advanced = _persist_cursor_after_run(ctx, stream, out_path, sink_format)
+                cursor_advanced = _persist_cursor_after_run(
+                    ctx, stream, out_path, sink_format, append_info.get("cursor_max")
+                )
                 stream_results.append(
                     StreamResult(
                         name=stream,
@@ -1939,12 +2596,13 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     if failures == 0 and stream_results:
         try:
             late_arrival_split_results = _enforce_late_arrival_split(
-                ctx, stream_results, sink_format
+                ctx, stream_results, sink_format, skip=tuple(appended_late)
             )
         except Exception as exc:  # noqa: BLE001
             # Defensive: late-arrival split runs DuckDB SQL which may carry
             # DSN content; don't include exc body or full traceback.
             LOG.warning("late_arrival_split_failed: %s", type(exc).__name__)
+    late_arrival_split_results.update(appended_late)
 
     # BigQuery: the file is on local disk now; load it into the table. After
     # the late-arrival split, so the rows loaded are the rows that stayed. A
@@ -2640,22 +3298,24 @@ def _partitioned_write(
 
 
 def _build_expose(ctx: RunContext) -> Optional[Dict[str, Any]]:
-    """The expose this build writes: the first one its ``outputs`` names.
+    """The expose this build writes: the first one its ``outputs`` resolves to.
 
-    This was ``exposes[0]`` whatever the build, so in a contract with two
-    builds the second wrote to the first one's destination. For a BigQuery
-    binding that meant truncating another build's table with this build's rows
-    and reporting success. A build that declares no outputs, or names none that
-    exists, keeps ``exposes[0]``, which every single-expose contract resolves
-    to anyway.
+    It was ``exposes[0]`` whatever the build, so in a contract with two builds the
+    second wrote to the first one's destination (for a BigQuery binding, truncating
+    another build's table). :func:`build_output_exposes` is the one place that maps a
+    build to its exposes: an output that is no exposeId, or no outputs beside several
+    exposes, raises its typed ``BuildOutputsError``. A contract with one expose, or a
+    build the contract does not list, keeps ``exposes[0]``.
     """
+    from fluid_build.util.contract import build_output_exposes
+
     exposes = ctx.contract.get("exposes") or []
     build_id = getattr(ctx, "build_id", None)
     build = next((b for b in ctx.contract.get("builds") or [] if b.get("id") == build_id), None)
-    outputs = set((build or {}).get("outputs") or [])
-    for expose in exposes:
-        if expose.get("exposeId") in outputs:
-            return expose
+    if build is not None:
+        resolved = build_output_exposes(ctx.contract, build)
+        if resolved:
+            return resolved[0]
     return exposes[0] if exposes else None
 
 

@@ -434,22 +434,22 @@ class TestFluidApply:
         assert _landed(workspace) == []
 
     @pytest.mark.parametrize("shape", ["engine", "language"])
-    def test_a_local_plan_beside_a_flink_job_is_refused_and_overwrites_nothing(
+    def test_a_local_plan_beside_a_flink_job_leaves_its_output_alone(
         self, workspace: Path, shape: str
     ) -> None:
-        # The local provider applies a plan.json by deriving its own actions from
-        # the contract: the first build's SQL into the first expose's file, which
-        # here is the Flink job's. It overwrote that file and reported success.
+        # The local provider used to answer a plan.json by deriving its own
+        # actions from the contract: the first build's SQL into the first
+        # expose's file, which here is the Flink job's. A plan is now planned
+        # like the contract file, which leaves what a job outside forge-cli
+        # writes to that job and lands the local product's own expose.
         plan = _plan(_flink_beside_a_local_product(shape))
         (workspace / "out").mkdir()
         (workspace / "out" / "flink_out.csv").write_text("written-by-flink\n", "utf-8")
         for flags in ((), ("--provider", "local")):
-            with pytest.raises(CLIError) as exc:
-                apply_run(build_parser().parse_args(["apply", plan, *flags, "--yes"]), LOG)
-            assert exc.value.event == "apply_plan_runs_outside_forge"
-            assert "builds[1]" in exc.value.context["error"]
-            assert exc.value.suggestions  # the catalog's guidance came with it
+            args = build_parser().parse_args(["apply", plan, *flags, "--yes"])
+            assert apply_run(args, LOG) == 0
         assert (workspace / "out" / "flink_out.csv").read_text("utf-8") == "written-by-flink\n"
+        assert "orders.csv" in _landed(workspace)
 
     def test_the_contract_file_applies_and_leaves_the_flink_output_alone(
         self, workspace: Path
@@ -470,5 +470,9 @@ class TestFluidApply:
         assert _apply(contract, "--provider", "auto") == 0
 
     def test_provider_still_overrides(self, workspace: Path) -> None:
+        # --provider local is honoured: the local planner runs and finds nothing to land
+        # (no build writes the topic), where it used to write a placeholder CSV and
+        # report the product deployed.
         contract = _contract([_expose("events_out", "kafka")])
         assert _apply(copy.deepcopy(contract), "--provider", "local") == 0
+        assert _landed(workspace) == []

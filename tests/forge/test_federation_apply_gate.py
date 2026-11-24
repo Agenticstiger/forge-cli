@@ -265,3 +265,90 @@ def test_federation_gate_bypassed_with_no_verify_federation(monkeypatch, tmp_pat
     assert any(
         "federation digest gate was SKIPPED" in m for m in warning_messages
     ), f"Expected WARNING about skip; got {warning_messages!r}"
+
+
+# ── The gate runs on every engine, not only the native contract-file route ──
+
+
+def _drift_violation() -> FederatedConsumeViolation:
+    return FederatedConsumeViolation(
+        consume_index=0,
+        upstream_workspace_id="telco",
+        upstream_product_id="ext.upstream",
+        expected_digest="sha256:STALE",
+        actual_digest="sha256:LIVE",
+        reason="cached drift detected",
+        kind="drift",
+    )
+
+
+@pytest.mark.parametrize("engine", ["opentofu", "build-modes"])
+def test_federation_gate_warns_on_the_opentofu_engine_and_the_build_modes(
+    monkeypatch, tmp_path, sample_args, engine
+):
+    """``apply_via_opentofu`` and ``--mode amend-and-build`` returned before the only
+    ``validate_federated_consumes`` call, so a drifted ``upstreamDigest`` pin was
+    never reported there. The (mocked) engines still run: it is warn-only."""
+    from fluid_build.cli import apply as apply_mod
+
+    monkeypatch.chdir(tmp_path)
+    sample_args.dry_run = False
+    sample_args.yes = True
+    if engine == "build-modes":
+        sample_args.mode = "amend-and-build"
+        engine_patch = patch("fluid_build.build_runners.run_builds_from_args", return_value=0)
+    else:
+        engine_patch = patch(
+            "fluid_build.cli._apply_opentofu_engine.apply_via_opentofu", return_value=0
+        )
+    logger, records, restore = _capture_warnings(f"fluid.test.federation_gate_{engine}")
+    try:
+        with (
+            patch(
+                "fluid_build.cli._apply_opentofu_engine.resolve_apply_engine",
+                return_value="opentofu" if engine == "opentofu" else "native",
+            ),
+            patch(
+                "fluid_build.forge.federation.validate_federated_consumes",
+                return_value=[_drift_violation()],
+            ) as gate,
+            engine_patch as ran,
+        ):
+            assert apply_mod.run(sample_args, logger) == 0
+    finally:
+        restore()
+
+    assert ran.call_count == 1  # warn-only: the engine still ran
+    assert gate.call_count == 1  # once, not once per engine layer
+    messages = [r.getMessage() for r in records]
+    assert any("apply_consumes_drift" in m for m in messages), messages
+    assert any("telco/ext.upstream" in m for m in messages), messages
+
+
+def test_no_verify_federation_skips_the_gate_on_the_opentofu_engine(
+    monkeypatch, tmp_path, sample_args
+):
+    from fluid_build.cli import apply as apply_mod
+
+    monkeypatch.chdir(tmp_path)
+    sample_args.dry_run = False
+    sample_args.yes = True
+    sample_args.no_verify_federation = True
+    logger, records, restore = _capture_warnings("fluid.test.federation_gate_skip_tofu")
+    try:
+        with (
+            patch(
+                "fluid_build.cli._apply_opentofu_engine.resolve_apply_engine",
+                return_value="opentofu",
+            ),
+            patch(
+                "fluid_build.forge.federation.validate_federated_consumes",
+                return_value=[_drift_violation()],
+            ) as gate,
+            patch("fluid_build.cli._apply_opentofu_engine.apply_via_opentofu", return_value=0),
+        ):
+            assert apply_mod.run(sample_args, logger) == 0
+    finally:
+        restore()
+    assert gate.call_count == 0
+    assert any("--no-verify-federation" in r.getMessage() for r in records)

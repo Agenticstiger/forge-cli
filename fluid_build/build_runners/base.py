@@ -937,14 +937,20 @@ def _bind_embedded_sql_io(actions: List[Dict[str, Any]], io: Any) -> None:
             *(action.get("inputs") or []),
             *(r.as_input_spec() for r in io.inputs),
         ]
+        # The landing replaces the first output; a further local output the build
+        # names stays, written beside it.
+        further = list(action.get("outputs") or [])[1:]
         if io.landing is not None:
-            action["outputs"] = [io.landing.as_output_spec()]
+            action["outputs"] = [io.landing.as_output_spec(), *further]
         if io.bigquery_landing is not None:
             # The staged file the load reads, never the binding's own
             # location.path (a gs:// staging prefix is not a local file).
             if io.bigquery_landing.staged is None:
                 raise RuntimeError("the BigQuery landing was not staged before the SQL ran")
-            action["outputs"] = [{"path": io.bigquery_landing.staged, "format": "parquet"}]
+            action["outputs"] = [
+                {"path": io.bigquery_landing.staged, "format": "parquet"},
+                *further,
+            ]
 
 
 def _local_sql_actions(
@@ -971,7 +977,7 @@ def _local_sql_actions(
         "consumes": consumes,
         "exposes": contract.get("exposes", []),
     }
-    actions = provider._derive_actions_from_contract(mini_contract)
+    actions = provider._derive_actions_from_contract(mini_contract, prevalidated=True)
     if io is not None:
         _bind_embedded_sql_io(actions, io)
     return mini_contract, actions
@@ -1187,7 +1193,8 @@ def _plan_local_sql(
     """``(planned, io)`` for a build on the local DuckDB engine; ``planned`` False if refused.
 
     Only a build carrying inline SQL reads the views (``io``): one without it
-    (a multi-stage ``engine: sql`` build) keeps the provider's old handling,
+    (a multi-stage ``engine: sql`` build, whose stages the provider runs in
+    ``dependsOn`` order in this one apply) keeps the provider's handling,
     except that a first expose it would write as a local file of the wrong
     kind (a BigQuery table, a ``gs://`` path) is refused.
     """
@@ -1196,11 +1203,19 @@ def _plan_local_sql(
         io = _plan_duckdb_io(unresolved_contract, build, contract_dir, env=env)
         return io is not None, io
     from fluid_build._errors import FluidUserError
+    from fluid_build.providers.local.planner import is_multi_stage_build, validate_stage_build
 
-    from ._embedded_sql_io import refuse_unlandable_first_expose
+    from ._embedded_sql_io import refuse_unlandable_first_expose, refuse_unlandable_stage_exposes
 
     try:
-        refuse_unlandable_first_expose(unresolved_contract)
+        if is_multi_stage_build(build):
+            # Everything that needs no data is checked here, so ``--dry-run`` refuses too
+            # and nothing runs before the build is known to be runnable: the stage
+            # structure, what the stages would land, and where.
+            validate_stage_build(unresolved_contract, build)
+            refuse_unlandable_stage_exposes(unresolved_contract, build)
+        else:
+            refuse_unlandable_first_expose(unresolved_contract, build)
     except FluidUserError as exc:
         _print_typed_error(exc)
         LOG.error("embedded_sql_io_refused build_id=%s code=%s", build.get("id"), exc.code)

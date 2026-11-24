@@ -493,16 +493,15 @@ def test_the_copy_sibling_is_one_more_file_confined_like_the_landing(layout, mon
     contract = _acquisition_contract(str(layout["contract_dir"] / "data" / "orders.csv"), out)
     ctx = build_acquisition_run_context(contract["builds"][0], contract, layout["contract_dir"])
 
+    from fluid_build.build_runners.duckdb.runner import _append_tmp_path
+
     allow = _run_allowlist(ctx, _run_streams(ctx), "parquet")
-    assert sorted(p for p in allow.paths if Path(p).parent == shared) == [
-        str(shared / name)
-        for name in (
-            "orders.parquet",
-            "orders__late_events.parquet",
-            "tmp_orders.parquet",
-            "tmp_orders__late_events.parquet",
-        )
-    ]
+    landed = ("orders.parquet", "orders__late_events.parquet")
+    expected = [str(shared / name) for name in landed]
+    expected += [str(shared / f"tmp_{name}") for name in landed]  # the COPY sibling
+    # and the run's own union temp beside each file (the connection locks before it is named)
+    expected += [_append_tmp_path(str(shared / name), ctx.run_id) for name in landed]
+    assert sorted(p for p in allow.paths if Path(p).parent == shared) == sorted(expected)
     assert not any(Path(d).is_relative_to(shared) for d in allow.dirs)
 
     (shared / "tmp_orders.parquet").symlink_to(layout["outside"] / "secret.csv")

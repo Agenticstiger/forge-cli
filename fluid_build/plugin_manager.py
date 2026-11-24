@@ -37,7 +37,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 # role tag (fluid_sdk.BasePlugin.role) -> entry-point group. Single source of truth.
 ROLE_GROUPS: Dict[str, str] = {
@@ -169,6 +169,23 @@ def _norm_dist(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name.strip()).lower()
 
 
+def _dist_field(read: Callable[[], Any]) -> Any:
+    """``read()``, or ``None`` when the distribution cannot answer.
+
+    ``importlib.metadata`` builds ``Distribution.name`` and ``.version`` from
+    the METADATA header. A ``*.dist-info`` directory without that file (an
+    interrupted uninstall, a stray fixture) makes the lookup raise ``TypeError``
+    (``metadata`` is ``None``) or ``KeyError`` (newer backports) instead of
+    returning nothing, and ``getattr(dist, "name", None)`` only swallows
+    ``AttributeError``. One such directory on ``sys.path`` broke every
+    plugin walk that read a name. This is the one place that tolerates it.
+    """
+    try:
+        return read()
+    except (TypeError, KeyError, AttributeError):
+        return None
+
+
 def granted_distribution(ep: Any) -> Optional[str]:
     """The name of the distribution that ships ``ep``, when it is a valid project name.
 
@@ -178,7 +195,7 @@ def granted_distribution(ep: Any) -> Optional[str]:
     ``acme-fluid-aws:aws``. ``None``, so no grant is possible, for anything else.
     """
     dist = getattr(ep, "dist", None)
-    name = getattr(dist, "name", None) if dist is not None else None
+    name = _dist_field(lambda: dist.name) if dist is not None else None
     if isinstance(name, str) and _DIST_NAME.fullmatch(name):
         return name
     return None
@@ -233,15 +250,13 @@ def entry_point_distribution(ep: Any) -> Optional[str]:
     dist = getattr(ep, "dist", None)
     if dist is None:
         return None
-    name = getattr(dist, "name", None)
+    name = _dist_field(lambda: dist.name)
     if not name:
         # ``Distribution.name`` is 3.10+; fall back to the METADATA header.
-        metadata = getattr(dist, "metadata", None)
-        get = getattr(metadata, "get", None)
-        name = get("Name") if callable(get) else None
+        name = _dist_field(lambda: dist.metadata.get("Name"))
     if not name:
         return None
-    version = getattr(dist, "version", None)
+    version = _dist_field(lambda: dist.version)
     return f"{name} {version}" if version else str(name)
 
 

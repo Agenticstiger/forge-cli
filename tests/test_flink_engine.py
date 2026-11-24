@@ -263,18 +263,22 @@ class TestPlanners:
             for name in ("customers_full", "customers_public")
         ]
         caplog.set_level(logging.INFO, logger="t")
+        if not sql_outputs:
+            # Either build may write either expose: the plan is refused, so
+            # nothing is guessed and nothing is written.
+            from fluid_build.util.contract import BuildOutputsError
+
+            with pytest.raises(BuildOutputsError) as refused:
+                plan_actions(contract, logger=logging.getLogger("t"))
+            assert refused.value.code == "build_outputs_undeclared"
+            return
         actions = plan_actions(contract, logger=logging.getLogger("t"))
         landed = {
             a["resource_id"]: a["payload"]["source_table"]
             for a in actions
             if a.get("op") == "materialize"
         }
-        if sql_outputs:
-            assert landed == {"customers_full": "result_full"}
-        else:
-            # Either build may write either expose: neither is guessed.
-            assert landed == {}
-            assert "Declare builds[].outputs" in caplog.text
+        assert landed == {"customers_full": "result_full"}
 
     def test_a_null_build_does_not_crash_the_local_planner(self, shape: tuple) -> None:
         from fluid_build.providers.local.planner import plan_actions

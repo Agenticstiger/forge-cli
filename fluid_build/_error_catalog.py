@@ -142,13 +142,13 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         None,
     ),
-    "apply_plan_runs_outside_forge": (
+    "apply_local_plan_failed": (
         [
             (
-                "In the default mode, apply the contract file instead (fluid apply "
-                "contract.fluid.yaml): the local planner plans it, and leaves what a job "
-                "outside forge-cli writes to that job"
+                "The local planner could not plan this plan.json's contract; fix the contract "
+                "(fluid validate contract.fluid.yaml) and run fluid plan again"
             ),
+            "To see the planner's own message, run fluid apply with --debug",
         ],
         None,
     ),
