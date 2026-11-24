@@ -686,7 +686,18 @@ def _execute_debezium_server(
     }
     sink_block = (dbz_props.get("server") or {}).get("sink") or {}
     sink_type = sink_block.get("type", "iceberg")
-    handwritten = dict(sink_block.get("config") or {})
+    raw_config = sink_block.get("config")
+    if raw_config is not None and not isinstance(raw_config, Mapping):
+        # dict() would turn a list of pairs into a config that the checks below,
+        # which read a mapping (the env: reference scan among them), never saw.
+        return _failed(
+            ctx,
+            started_at,
+            t_start,
+            "properties.debezium.server.sink.config must be a mapping of sink property names "
+            "to values",
+        )
+    handwritten = dict(raw_config or {})
 
     # Iceberg sink: derive the bare-key config from the contract's iceberg expose
     # binding so the embedded server lands in the SAME table the static Glue
@@ -711,6 +722,22 @@ def _execute_debezium_server(
         preflight_error = iceberg_sink_preflight(ctx.contract, ctx.build_id, log=LOG)
         if preflight_error:
             return _failed(ctx, started_at, t_start, preflight_error)
+    else:
+        # No Iceberg plan (no sink.format: iceberg), yet a hand-written config
+        # for the default iceberg sink is written as it is, and Iceberg resolves
+        # an env: value in it from the server's environment: refused before
+        # application.properties is written, as `fluid validate` refuses it.
+        from ..kafka_connect.iceberg_sink_validation import unplanned_sink_reference_errors
+
+        reference_errors = unplanned_sink_reference_errors(build)
+        if reference_errors:
+            return _failed(
+                ctx,
+                started_at,
+                t_start,
+                "iceberg sink preflight failed (see `fluid validate`): "
+                + "; ".join(reference_errors),
+            )
     if sink_plan is not None and sink_plan.derives:
         from ...providers._iceberg_catalog import resolve_iceberg_catalog
         from ...providers._iceberg_catalog_auth import catalog_auth_of

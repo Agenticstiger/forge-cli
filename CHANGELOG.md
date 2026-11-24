@@ -38,6 +38,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once (a regular file in a real `data/` directory) and left in place. Behaviour change: a
   `properties.debezium.server_binary` inside the project or its checkout (by path, symlink or
   `PATH`) is refused.
+- **An Iceberg sink names a variable only through `sink.catalogAuth`.** Iceberg's REST catalog
+  replaces any property value that starts with `env:` by that variable of the process that runs
+  the sink, so a contract that wrote `token: env:NAME` beside a catalog `uri` of its choosing sent
+  the operator's variable there. An `env:` value, or a `${` the worker's config providers or
+  SmallRye Config would expand, is now refused in `iceberg_catalog_overrides`,
+  `sink_connector_config` and a Debezium Server `server.sink.config` whether or not
+  `sink.catalogAuth` is set, also for a hand-written sink config without `sink.format: iceberg`,
+  by `fluid validate` and by both runners before anything is pushed, written or started. The
+  variable `sink.catalogAuth` names is the one the operator pairs with the hosts it reaches. The
+  literal-credential warning no longer suggests `env:<VARIABLE>`. A Debezium Server
+  `server.sink.config` that is not a mapping is refused. Behaviour change.
 
 ## [0.39.0] — 2026-11-23
 

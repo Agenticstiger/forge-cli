@@ -133,6 +133,7 @@ from ...providers._iceberg_catalog_auth import (
     AUTHORIZATION_HEADER_PROPERTY,
     CATALOG_AUTH_FIELD,
     CONTROL_RE,
+    EXPRESSION_RE,
     FORBIDDEN_TEXT_PATTERN,
     INLINE_CHECKED_KEYS,
     CatalogAuth,
@@ -376,8 +377,11 @@ def _validate(contract: Mapping[str, Any], *, builds: Optional[Iterable[Any]] = 
             continue
         runtime = iceberg_sink_plan(build)
         if runtime is None:
-            # Not a build that writes an Iceberg sink, so nothing reads it.
+            # Not a build that writes an Iceberg sink forge-cli knows of, so
+            # nothing reads its catalogAuth. A hand-written sink config it
+            # pushes anyway is still read for a variable reference.
             _check_unread_catalog_auth(build, errors)
+            errors.extend(unplanned_sink_reference_errors(build))
             continue
         _check_build(contract, build, runtime, iceberg_exposes, expose_ids, errors, warnings)
 
@@ -453,6 +457,7 @@ def _check_build(
         )
 
     _check_catalog_auth(bid, sink, runtime, targets, errors, warnings)
+    _check_unpaired_references(bid, sink, runtime, errors)
     _check_inlined_secrets(bid, sink, runtime, warnings)
 
     # The catalog checks read each expose the sink writes. A Debezium Server
@@ -1292,6 +1297,106 @@ def _check_override_references(
             )
 
 
+#: A value Iceberg resolves from the environment (``env:``) or a config
+#: provider / SmallRye expression (``${``): a reference to a variable.
+_REFERENCE_PATTERN = f"{EXPRESSION_RE.pattern}|^\\s*env:"
+
+
+def _check_unpaired_references(
+    bid: Any,
+    sink: Mapping[str, Any],
+    runtime: IcebergSinkPlan,
+    errors: List[str],
+) -> None:
+    """Without ``sink.catalogAuth``, no value Iceberg reads may name a variable. HARD.
+
+    Iceberg's REST catalog replaces any property value that starts with
+    ``env:`` by that variable of the process that runs the sink
+    (``RESTSessionCatalog.initialize`` calls ``EnvironmentUtil.resolveAll``),
+    and the catalog ``uri`` is another property of the same map. A contract
+    that writes ``token: env:NAME`` and picks the ``uri`` would send the
+    operator's variable to a host the contract chose. ``sink.catalogAuth`` is
+    the one place a variable is named: the operator pairs it with the hosts it
+    reaches (:func:`_check_catalog_auth_destinations`). Every override map the
+    plan carries (``iceberg_catalog_overrides``, ``sink_connector_config``, a
+    Debezium ``server.sink.config``) is read here, derived or hand-written;
+    with ``sink.catalogAuth`` set :func:`_check_override_references` reads
+    them instead, so the two never report the same key. A ``${`` that the
+    worker's config providers or SmallRye Config would expand is refused in the
+    same keys: only what Iceberg reads (:func:`_read_by_iceberg`), as there.
+    """
+    if raw_catalog_auth(sink) is not None or runtime.engine not in _CATALOG_AUTH_ENGINES:
+        return
+    head = f"iceberg sink (build {bid!r})"
+    for label, mapping in runtime.overrides:
+        for key, value in mapping.items():
+            if value is None:
+                continue
+            text = str(value)
+            if not _read_by_iceberg(runtime, key) or not re.search(_REFERENCE_PATTERN, text):
+                continue
+            errors.append(
+                f"{head}: {label} {key} starts with env:, or holds ${{ (the value is not "
+                f"shown). The sink config hands it to {_REFERENCES_RESOLVED_BY[runtime.engine]}, "
+                "after these checks, so it could send any variable of that environment to the "
+                "catalog host this contract names. Name a variable only through "
+                f"sink.{CATALOG_AUTH_FIELD}, which the operator pairs with the hosts it "
+                f"reaches, and remove the value from {label}"
+            )
+
+
+def unplanned_sink_reference_errors(build: Mapping[str, Any]) -> List[str]:
+    """The ``env:`` errors of a sink config a build pushes without an :class:`IcebergSinkPlan`.
+
+    :func:`iceberg_sink_plan` is ``None`` for a build that neither declares
+    ``sink.format: iceberg`` nor derives, yet an embedded Debezium Server
+    whose sink type is the default ``iceberg`` still writes the hand-written
+    ``server.sink.config``, and a Kafka Connect build pushes its hand-written
+    ``sink_connector_config``. Iceberg resolves ``env:`` in either, so the
+    rule of :func:`_check_unpaired_references` holds without the plan. Empty when the build has a plan (:func:`_validate` and
+    :func:`iceberg_sink_preflight` read that case) or no such config.
+    """
+    if iceberg_sink_plan(build) is not None:
+        return []
+    props = build.get("properties") or {}
+    engine = str(build.get("engine") or "").strip().lower()
+    if engine == "debezium":
+        dbz = props.get("debezium") or {}
+        if (dbz.get("deployment") or {}).get("mode", "bring-your-own") != "embedded":
+            return []
+        server_sink = (dbz.get("server") or {}).get("sink") or {}
+        config = server_sink.get("config")
+        sink_type = str(server_sink.get("type") or "iceberg").strip().lower()
+        if sink_type != "iceberg" or not isinstance(config, Mapping):
+            return []
+        label, key_type, impl = "debezium.server.sink.config", "type", "catalog-impl"
+    elif engine == "kafka-connect":
+        config = (props.get("kafka-connect") or {}).get("sink_connector_config")
+        if not isinstance(config, Mapping):
+            return []
+        label, key_type, impl = (
+            "kafka-connect.sink_connector_config",
+            "iceberg.catalog.type",
+            "iceberg.catalog.catalog-impl",
+        )
+    else:
+        return []
+    plan = IcebergSinkPlan(
+        engine=engine,
+        derives=False,
+        type_key=key_type,
+        impl_key=impl,
+        overrides=((label, config),),
+        warehouse_override=(label, None),
+    )
+    errors: List[str] = []
+    # A build without a plan never reads sink.catalogAuth (``fluid validate``
+    # refuses one there, _check_unread_catalog_auth), and no other check reads
+    # its config at run time: the scan runs whatever the sink block holds.
+    _check_unpaired_references(build.get("id", "?"), {}, plan, errors)
+    return [_redacted(e) for e in errors]
+
+
 def _check_catalog_auth_env_at_run(
     head: str, auth: Optional[CatalogAuth], runtime: IcebergSinkPlan, errors: List[str]
 ) -> None:
@@ -1667,8 +1772,8 @@ def _check_inlined_secrets(
             warnings.append(
                 f"iceberg sink (build {bid!r}): {label} sets {key} to a literal value (not "
                 f"shown), so the secret is inlined into the sink config forge-cli {where}. "
-                f"Use sink.{CATALOG_AUTH_FIELD}, or set {key} to env:<VARIABLE>, which Iceberg "
-                "resolves from the environment of the process that runs the sink"
+                f"Use sink.{CATALOG_AUTH_FIELD}: it names the environment variable that holds "
+                "the credential, and the operator pairs that variable with the hosts it reaches"
             )
 
 
