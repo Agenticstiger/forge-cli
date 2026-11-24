@@ -692,7 +692,7 @@ class LocalProvider(BaseProvider):
     # ------------------- Plan → Actions (from contract) ------------------ #
 
     def _derive_actions_from_contract(
-        self, contract: Dict[str, Any], *, strict: bool = True
+        self, contract: Dict[str, Any], *, strict: bool = True, prevalidated: bool = False
     ) -> List[Dict[str, Any]]:
         """
         Build a single runnable SQL action for local execution:
@@ -722,7 +722,7 @@ class LocalProvider(BaseProvider):
         from .planner import is_multi_stage_build
 
         if build and is_multi_stage_build(build):
-            return self._derive_stage_actions(contract, build)
+            return self._derive_stage_actions(contract, build, prevalidated=prevalidated)
 
         sql_text: Optional[str] = None
         inputs_spec: List[Any] = []
@@ -844,7 +844,7 @@ class LocalProvider(BaseProvider):
         return [{"op": "sql", "sql": sql_text, "inputs": inputs_spec, "outputs": output_paths}]
 
     def _derive_stage_actions(
-        self, contract: Dict[str, Any], build: Dict[str, Any]
+        self, contract: Dict[str, Any], build: Dict[str, Any], *, prevalidated: bool = False
     ) -> List[Dict[str, Any]]:
         """The actions of a ``pattern: multi-stage`` build: one SQL action per stage
         (and per extra output of a stage), in ``dependsOn`` order.
@@ -860,7 +860,10 @@ class LocalProvider(BaseProvider):
 
         from .planner import validate_stage_build
 
-        stages = validate_stage_build(contract, build)
+        # The build runner wraps one build in a mini-contract and has already validated it
+        # against the whole contract (``_plan_local_sql``): the "lands nothing" rule needs the
+        # other builds, which the mini-contract does not carry.
+        stages = validate_stage_build(contract, build, whole_contract=not prevalidated)
         exposes = build_output_exposes(contract, build)
         by_table: Dict[str, List[Dict[str, Any]]] = {}
         for expose in exposes:
@@ -941,7 +944,8 @@ class LocalProvider(BaseProvider):
         """The build a stage action belongs to (``build`` beside ``stage``), else ``None``."""
         if not isinstance(action, dict):
             return None
-        flat = {**(action.get("payload") or {}), **action}
+        payload = action.get("payload")
+        flat = {**(payload if isinstance(payload, dict) else {}), **action}
         if flat.get("stage") is None or flat.get("build") is None:
             return None
         return str(flat["build"])

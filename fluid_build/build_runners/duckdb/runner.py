@@ -715,7 +715,14 @@ def _json_append_to_local_file(ctx: RunContext, streams: List[str], partition_by
     ):
         return False
     out_dir = Path(ctx.workdir) / "out"
-    return not any(_is_remote_uri(_resolve_destination_path(ctx, s, fmt, out_dir)) for s in streams)
+    try:
+        return not any(
+            _is_remote_uri(_resolve_destination_path(ctx, s, fmt, out_dir)) for s in streams
+        )
+    except OSError:
+        # Resolving a destination creates its directory; if it cannot, the run's own
+        # per-stream handling reports it, and this early check stays out of the way.
+        return False
 
 
 def _json_append_columns(ctx: RunContext) -> Dict[str, str]:

@@ -802,14 +802,18 @@ def plan_actions(
 def _stage_input_names(build: Mapping[str, Any]) -> Set[str]:
     """The relations ``properties.parameters.inputs`` binds as views before a stage runs."""
     names = set(_explicit_input_names(build))
-    params = (build.get("properties") or {}).get("parameters") or {}
-    for inp in params.get("inputs") or []:
+    props = build.get("properties")
+    params = props.get("parameters") if isinstance(props, Mapping) else None
+    inputs = params.get("inputs") if isinstance(params, Mapping) else None
+    for inp in inputs if isinstance(inputs, list) else []:
         if isinstance(inp, dict) and inp.get("path") and not (inp.get("name") or inp.get("id")):
             names.add(re.sub(r"[^A-Za-z0-9_]+", "_", Path(str(inp["path"])).stem) or "t")
     return names
 
 
-def validate_stage_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> List[Stage]:
+def validate_stage_build(
+    contract: Mapping[str, Any], build: Mapping[str, Any], *, whole_contract: bool = True
+) -> List[Stage]:
     """The stages of a multi-stage build, ordered, after every check that needs no data.
 
     One place for the contract-file route, the amend-and-build route and the
@@ -852,14 +856,27 @@ def validate_stage_build(contract: Mapping[str, Any], build: Mapping[str, Any]) 
             exposeIds=missing,
         )
     declared = [str(get_expose_id(e)) for e in contract.get("exposes") or [] if isinstance(e, dict)]
-    if declared and not exposes:
+    # A helper build that lands nothing is fine while the contract's other builds land every
+    # expose: refuse only when an expose is left that no build of the contract writes.
+    landed_elsewhere: Set[str] = set()
+    for other in contract.get("builds") or []:
+        if isinstance(other, dict) and other is not build:
+            try:
+                landed_elsewhere.update(
+                    str(get_expose_id(e)) for e in build_output_exposes(contract, other)
+                )
+            except BuildOutputsError:
+                continue  # that build is refused on its own account; it lands nothing
+    unwritten = [e for e in declared if e not in landed_elsewhere]
+    if whole_contract and unwritten and not exposes:
         raise _stage_error(
             "build_stage_lands_nothing",
             build_id,
             f"no stage output of build {build_id!r} is the id of an expose; nothing would land",
             "An expose lands from the stage output of its own name. The stage outputs are "
             f"{', '.join(sorted(map(repr, produced)))}; the contract's exposeIds are "
-            f"{', '.join(map(repr, declared))}.",
+            f"{', '.join(map(repr, declared))}, and no other build writes "
+            f"{', '.join(map(repr, unwritten))}.",
             "Name an exposeId in the outputs of the stage that produces it (check the spelling).",
             outputs=sorted(produced),
             exposeIds=declared,

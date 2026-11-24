@@ -36,8 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cycle (`build_stage_cycle`), a `dependsOn` that names no stage (`build_stage_unknown_dependency`),
   a stage with no SQL (`build_stage_has_no_sql`), an output name that is not a safe identifier
   (`build_stage_unsafe_name`) and a stage shape the engine cannot run (`build_stage_unsupported`)
-  are refused before anything is written, as is a multi-stage build that lands no expose while the
-  contract declares some (`build_stage_lands_nothing`) and a stage output named like an input. Under
+  are refused before anything is written, as is a multi-stage build that lands no expose while no
+  other build of the contract writes one the contract declares (`build_stage_lands_nothing`) and a
+  stage output named like an input. Under
   `--mode amend-and-build` the exposes a multi-stage build lands must be local files (a masked
   expose, or one bound to S3, GCS, BigQuery or another platform, is refused, as for an embedded-SQL
   build), the stages are checked before anything runs (so `--dry-run` refuses too), and the stages

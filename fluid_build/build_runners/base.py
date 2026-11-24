@@ -947,7 +947,7 @@ def _local_sql_actions(
         "consumes": consumes,
         "exposes": contract.get("exposes", []),
     }
-    actions = provider._derive_actions_from_contract(mini_contract)
+    actions = provider._derive_actions_from_contract(mini_contract, prevalidated=True)
     if io is not None:
         _bind_embedded_sql_io(actions, io)
     return mini_contract, actions

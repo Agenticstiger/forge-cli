@@ -585,3 +585,47 @@ def test_stages_of_another_engine_are_left_to_its_runner() -> None:
     assert derived.value.code == "build_has_no_sql"  # as before: not the stages' to run
     for engine in ("SQL", "", None):
         assert is_multi_stage_build({**build, "engine": engine})
+
+
+# ------------- a helper stage build beside a build that lands the exposes ------------- #
+
+
+def _helper_beside_a_writer() -> Dict[str, Any]:
+    """A multi-stage build that only prepares an intermediate table, beside an
+    embedded-SQL build that names and lands the one expose."""
+    contract = _contract([_stage("prep", "SELECT 1 AS a", outputs=["tmp"])], ["X"])
+    contract["builds"].append(
+        {
+            "id": "writer",
+            "pattern": "embedded-logic",
+            "engine": "sql",
+            "properties": {"sql": "SELECT 7 AS a"},
+            "outputs": ["X"],
+        }
+    )
+    return contract
+
+
+@pytest.mark.parametrize("flags", ROUTES, ids=["contract-file", "amend-and-build"])
+def test_a_helper_stage_build_is_not_refused_while_another_build_lands_the_exposes(
+    project: Path, flags: tuple
+) -> None:
+    # build_stage_lands_nothing is for an expose NO build writes (a misspelt output), not for a
+    # build that prepares tables while another build lands the exposes.
+    assert _apply(project, _helper_beside_a_writer(), *flags) == 0
+    assert _landed(project) == {"X": "a\n7\n"}
+
+
+def test_a_stage_build_that_lands_nothing_is_still_refused_when_no_other_build_lands_the_expose() -> (
+    None
+):
+    contract = _contract([_stage("prep", "SELECT 1 AS a", outputs=["tmp"])], ["X"])
+    assert _refusal(contract).code == "build_stage_lands_nothing"
+
+
+def test_a_stage_action_with_a_non_mapping_payload_is_a_per_action_error_not_a_crash(
+    project: Path,
+) -> None:
+    provider = LocalProvider(project="t", region="local", anchor_dir=project)
+    result = provider.apply(actions=[{"op": "execute_sql", "payload": "not a mapping"}])
+    assert result["failed"] == 1 and result["applied"] == 0
