@@ -45,3 +45,14 @@ ignore:
   # local, MANIFEST-attested file. EPSS 0.4% (35th percentile). Remove once a
   # stable python:3.13-slim ships the backport (re-run grype to confirm).
   - vulnerability: CVE-2026-11972
+
+  # High (CVSS 4.0 8.2) — CVE-2026-119170: a regression in how hashlib enforces
+  # FIPS algorithms (published 2026-11-06). It affects CPython 3.14.10 only, and
+  # only where OpenSSL runs in FIPS mode. Fixed in CPython 3.14.11, which is not
+  # released yet, so no python:3.14-slim carries the fix; it stopped the 0.40.0
+  # image. NOT REACHABLE in this image: the Debian slim base does not run OpenSSL
+  # in FIPS mode (the Dockerfile installs and configures no FIPS provider, and
+  # fluid_build never asks for one), so hashlib's FIPS enforcement is never in
+  # play. EPSS 0.5% (42nd percentile). Remove once python:3.14-slim ships CPython
+  # 3.14.11 (re-run grype to confirm).
+  - vulnerability: CVE-2026-119170

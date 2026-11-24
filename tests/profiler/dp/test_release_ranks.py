@@ -12,9 +12,9 @@ from typing import Any, List
 
 import pytest
 
-from fluid_build.profiler import _stats, document
+from fluid_build.profiler import document
 from fluid_build.profiler.dp import record as record_module
-from fluid_build.profiler.dp import release, selection
+from fluid_build.profiler.dp import release
 from fluid_build.profiler.dp.release import ReleaseRefused
 from tests.profiler._fake_backend import FakeBackend
 from tests.profiler.dp import _rank_run as ranked

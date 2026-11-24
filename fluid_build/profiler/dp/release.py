@@ -1015,9 +1015,6 @@ CLIQUE, LEVELS, BINS, RANK = "clique", "levels", "bins", "rank"
 #: histogram and a statistic grouped through a link.
 RELATION, LINK = "relationship", "link"
 
-#: The kinds of count table, which the consistency step makes agree.
-_COUNT_KINDS = (CLIQUE, LEVELS, BINS)
-
 
 @dataclass(frozen=True)
 class Part:
