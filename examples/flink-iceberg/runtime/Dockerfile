@@ -1,10 +1,16 @@
-FROM maven:3.9-eclipse-temurin-17 AS build
+# Both base images are pinned by digest so a rebuild cannot pick up a changed tag;
+# the tag stays in the reference so the digest remains readable and Dependabot's
+# docker ecosystem can move the two together. The Flink tag must match
+# flink.version in pom.xml.
+# maven:3.9-eclipse-temurin-17
+FROM maven:3.9-eclipse-temurin-17@sha256:1a352420f7aba21f5ad08df31bab55f74c013fb491f1ae8ab1dd7ff9ed698584 AS build
 WORKDIR /build
 COPY pom.xml .
 COPY src src
 RUN mvn --batch-mode --no-transfer-progress package
 
-FROM flink:1.20.4-scala_2.12-java17
+# flink:1.20.4-scala_2.12-java17
+FROM flink:1.20.4-scala_2.12-java17@sha256:da329fbe16821e8b4749513f4b86eac2172f395c2d5f050017ea8396a7fa98f9
 COPY --from=build /build/target/forge-sql-runner.jar /opt/flink/usrlib/forge-sql-runner.jar
 COPY --from=build /build/target/dependency/*.jar /opt/flink/lib/
 RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
