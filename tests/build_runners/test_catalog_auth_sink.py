@@ -481,12 +481,20 @@ def test_a_variable_that_is_the_whole_catalog_host_needs_no_pairing(
     assert "https://lakekeeper:8443/catalog" in pushed()
 
 
-def test_a_template_in_the_path_of_a_url_needs_no_pairing_but_a_secret_one_is_refused(
+def test_a_template_in_the_path_of_a_url_goes_with_its_host_and_a_secret_one_is_refused(
     sink_engine, tmp_path: Path, monkeypatch, capsys
 ):
+    """A path is not an address, so a variable in it makes no host and needs no pairing as one.
+    Its value is sent to the host of the URL it is in, so the operator pairs it with that host."""
     contract_for, pushed = sink_engine
     monkeypatch.setenv("CATALOG_TENANT", "acme")
     contract = contract_for(_catalog("https://lakekeeper:8443/{{ env.CATALOG_TENANT }}/catalog"))
+    assert _dispatch(contract, tmp_path) == 1
+    shown = capsys.readouterr()
+    assert "CATALOG_TENANT" in shown.out + shown.err
+    assert "acme" not in shown.out + shown.err and "acme" not in pushed()
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "CATALOG_TENANT@lakekeeper")
     assert _dispatch(contract, tmp_path) == 0
     assert "https://lakekeeper:8443/acme/catalog" in pushed()
 

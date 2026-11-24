@@ -28,6 +28,7 @@ from fluid_build.build_runners.kafka_connect.iceberg_sink_validation import (
     validate_iceberg_sink,
 )
 from fluid_build.providers._iceberg_catalog import resolve_iceberg_catalog
+from fluid_build.secrets.policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST
 from fluid_build.util.env_templates import EnvTemplateError
 
 pytestmark = [pytest.mark.unit]
@@ -130,6 +131,10 @@ def _set(monkeypatch, value: Optional[str]) -> None:
         monkeypatch.delenv(_VAR, raising=False)
     else:
         monkeypatch.setenv(_VAR, value)
+        # The operator pairs the bucket variable with the catalog's host (a JDBC URL names one
+        # this policy cannot read, so the entry is for any host). Where a variable may go is
+        # pinned in test_env_pairing.py.
+        monkeypatch.setenv(SECRET_REF_ALLOWLIST, _VAR)
 
 
 def _dispatch(contract: Dict[str, Any], tmp_path: Path, monkeypatch) -> int:

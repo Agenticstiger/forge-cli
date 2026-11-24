@@ -742,17 +742,25 @@ def _execute_acquisition_build(
     unresolved_build = build
     # A host is not the contract's to take from the operator's environment: a template in a
     # URL's authority or a host field renders only for a variable the operator paired with
-    # that host, and a credential-shaped one never renders there. Read as written, before
-    # anything is expanded. A variable that is unset or empty is refused by the render below.
-    from fluid_build.util.env_templates import EnvTemplateError, check_host_templates
+    # that host, and a credential-shaped one never renders there. Nor is a variable's
+    # destination: a variable renders into a source or a sink block only for the endpoints of
+    # that block the operator paired it with, whatever the variable is called. Read as written,
+    # before anything is expanded. A variable that is unset or empty is refused by the render below.
+    from fluid_build.util.env_templates import (
+        EnvTemplateError,
+        check_env_pairing,
+        check_host_templates,
+    )
 
     try:
         # The whole contract as written, every build in it: a runner reads ``builds[0]`` whichever
         # build it runs, a plan renders its contract before it gets here, and two builds may share
         # an id, so no build is matched to its written twin. A build passed on its own is read too.
         check_host_templates(unresolved_contract, stage="fluid apply, acquisition build")
+        check_env_pairing(unresolved_contract, stage="fluid apply, acquisition build")
         if as_written is None:
             check_host_templates({"build": build}, stage="fluid apply, acquisition build")
+            check_env_pairing({"build": build}, stage="fluid apply, acquisition build")
         build = _resolve_env_placeholders(build)
         contract = _resolve_env_placeholders(contract)
     except EnvTemplateError as exc:
