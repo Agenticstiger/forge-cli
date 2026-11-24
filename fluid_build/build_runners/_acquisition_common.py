@@ -631,9 +631,12 @@ def enforce_schema_policy_or_raise(ctx: Any, runner: Any) -> None:
     except Exception:  # pragma: no cover — defensive
         return
 
-    # The baseline is the schema of the expose THIS build writes. It used to be
-    # exposes[0], so a second build was held to the first build's columns.
-    from fluid_build.util.contract import BuildOutputsError, build_output_exposes, get_builds
+    # The baseline is the schema of the expose THIS build lands, chosen as the DuckDB
+    # runner chooses it (``_build_expose``): the first expose, in contract order, that
+    # the build names in ``outputs``, else ``exposes[0]``. It used to be ``exposes[0]``
+    # for every build, so a second build was held to the first build's columns.
+    all_exposes = [e for e in ctx.contract.get("exposes") or [] if isinstance(e, dict)]
+    from fluid_build.util.contract import get_builds
 
     build = next(
         (
@@ -643,19 +646,11 @@ def enforce_schema_policy_or_raise(ctx: Any, runner: Any) -> None:
         ),
         None,
     )
-    try:
-        exposes = (
-            build_output_exposes(ctx.contract, build)
-            if build is not None
-            else (ctx.contract.get("exposes") or [])
-        )
-    except BuildOutputsError:
-        # Which expose is this build's baseline cannot be told (no outputs beside
-        # several exposes, or an output that is no exposeId): no gate, rather than
-        # holding the stream to another expose's columns. Validation names the
-        # contract error.
-        return
-    expose = (exposes or [{}])[0]
+    named = {o for o in (build or {}).get("outputs") or [] if isinstance(o, str)}
+    expose = next(
+        (e for e in all_exposes if e.get("exposeId") in named),
+        all_exposes[0] if all_exposes else {},
+    )
     contract_block = expose.get("contract") or {}
     declared_schema = contract_block.get("schema") or []
     policy_str = contract_block.get("schemaPolicy") or "evolve_safe"

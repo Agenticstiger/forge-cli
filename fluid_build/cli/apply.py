@@ -987,8 +987,6 @@ def _actions_from_source(
                     len(native_actions),
                 )
                 return native_actions
-            if is_local:
-                return []  # nothing to land: the recorded abstract ops are no actions
         return plan_data.get("actions", [])
 
     # Prefer provider.plan() when available — it generates service-level

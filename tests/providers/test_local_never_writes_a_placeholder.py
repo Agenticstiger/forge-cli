@@ -167,3 +167,65 @@ def test_a_materialize_a_build_runner_lands_is_skipped_not_applied(project: Path
     assert (result["applied"], result["failed"]) == (0, 0)
     assert result["results"][0]["skipped"] is True
     assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    "sql", ["SELECT 1 AS a;", "SELECT 1 AS a; ", "SELECT 1 AS a -- the answer", "SELECT 1 AS a;\n"]
+)
+def test_sql_with_a_trailing_semicolon_or_comment_lands_real_rows(project: Path, sql: str) -> None:
+    # The result table is created from the author's SQL wrapped in a subquery: a ``;`` or a
+    # line comment at its end broke the wrapper, and the failure was only a warning.
+    contract = _contract()
+    contract["builds"][0]["properties"]["sql"] = sql
+    assert _apply(project, contract) == 0
+    assert (project / "out" / "A.csv").read_text("utf-8") == "a\n1\n"
+
+
+def test_a_refused_plan_leaves_no_session_directory_behind(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tempfile
+
+    scratch = project / "tmpdir"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    provider = LocalProvider(project="t", region="local", anchor_dir=project)
+    planned = [{"op": "materialize", "resource_id": "B", "payload": {"path": "x.csv"}}]
+    with pytest.raises(FluidUserError):
+        provider.apply(actions=planned)
+    assert list(scratch.iterdir()) == []
+    ok = provider.apply(actions=[{"op": "noop", "skipped": True}])
+    assert ok["failed"] == 0
+    assert list(scratch.iterdir()) == []  # and a normal run removes its own
+
+
+def test_a_non_first_expose_an_embedded_sql_build_names_is_read_as_the_provider_wrote_it(
+    project: Path,
+) -> None:
+    from fluid_build.build_runners._embedded_sql_io import _landed_by_local_provider
+
+    contract = _contract()
+    second = dict(contract["exposes"][0], exposeId="B")
+    contract["exposes"].append(second)
+    contract["builds"][0]["outputs"] = ["B"]
+    first, named = contract["exposes"]
+    assert _landed_by_local_provider(contract, named) is True
+    assert _landed_by_local_provider(contract, first) is False
+
+
+def test_a_contract_with_no_builds_lands_nothing_and_applies(project: Path) -> None:
+    # Removing the builds is how a Spark stream is stopped: the expose has nothing to land.
+    contract = _contract()
+    contract["builds"] = []
+    assert _apply(project, contract) == 0
+    assert _files(project) == []
+
+
+def test_a_plan_of_ops_the_provider_does_not_run_skips_a_build_with_no_sql(project: Path) -> None:
+    contract = _contract()
+    contract["builds"][0].update(pattern="multi-stage", properties={"stages": []})
+    provider = LocalProvider(project="t", region="local", anchor_dir=project)
+    result = provider.apply(actions=[{"op": "provisionDataset"}], plan={"contract": contract})
+    assert (result["applied"], result["failed"]) == (0, 0)
+    assert all(r.get("skipped") for r in result["results"])
+    assert _files(project) == []

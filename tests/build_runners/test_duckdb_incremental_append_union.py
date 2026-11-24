@@ -173,3 +173,53 @@ def test_late_events_keep_every_runs_late_rows_and_a_clean_run_does_not_truncate
         "events.parquet",
         "events__late_events.parquet",
     ]
+
+
+def test_a_failing_side_file_union_leaves_the_late_rows_in_the_main_file(tmp_path):
+    contract = _contract(tmp_path, "parquet", lateness=True)
+    lake = tmp_path / "lake"
+    side = lake / "events__late_events.parquet"
+    run1 = [(1, "2024-01-01 12:00:00"), (2, "2024-01-01 11:00:00")]
+    _source(tmp_path, run1)
+    assert _run(tmp_path, contract) == 0
+    side.write_bytes(b"corrupt")
+    _source(tmp_path, run1 + [(3, "2024-01-01 12:10:00"), (4, "2024-01-01 11:20:00")])
+    _run(tmp_path, contract)
+    assert side.read_bytes() == b"corrupt"
+    assert 4 in _seqs(lake / "events.parquet", "parquet")
+
+
+@pytest.mark.parametrize("old_ids", [("007", "01234"), ("1.50", "2.50")])
+def test_csv_text_columns_round_trip_verbatim(tmp_path, old_ids):
+    src = tmp_path / "events.parquet"
+
+    def land(values: str) -> None:
+        con = duckdb.connect()
+        try:
+            con.execute(
+                f"COPY (SELECT * FROM (VALUES {values}) t(seq, event_time)) "
+                f"TO '{src}' (FORMAT 'parquet')"
+            )
+        finally:
+            con.close()
+
+    contract = _contract(tmp_path, "csv")
+    source = contract["builds"][0]["properties"]["source"]
+    source.update(
+        {
+            "connection": {"uri": str(src)},
+            "reader": {"format": "parquet"},
+            "cursor_field": "event_time",
+        }
+    )
+    contract["exposes"][0]["contract"]["schema"][0]["type"] = "string"
+    first = (
+        f"('{old_ids[0]}', TIMESTAMP '2024-01-01 12:00:00'), "
+        f"('{old_ids[1]}', TIMESTAMP '2024-01-01 12:01:00')"
+    )
+    land(first)
+    assert _run(tmp_path, contract) == 0
+    land(first + ", ('5', TIMESTAMP '2024-01-01 12:02:00')")
+    assert _run(tmp_path, contract) == 0
+    text = (tmp_path / "lake" / "events.csv").read_text()
+    assert all(f"{v}," in text for v in (*old_ids, "5"))

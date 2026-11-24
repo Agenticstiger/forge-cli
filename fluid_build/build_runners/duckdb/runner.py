@@ -622,12 +622,8 @@ def _build_copy_destination(
 
 
 #: The reader that reads a sink format back, for the union rewrite of an appended file.
-_SINK_READERS = {
-    "parquet": "read_parquet",
-    "csv": "read_csv_auto",
-    "json": "read_json_auto",
-    "ndjson": "read_json_auto",
-}
+#: json sinks still replace the file: re-reading them re-infers types.
+_SINK_READERS = {"parquet": "read_parquet", "csv": "read_csv"}
 
 
 def _remove_quietly(path: str) -> None:
@@ -638,7 +634,7 @@ def _remove_quietly(path: str) -> None:
 
 
 def _fsync_path(path: str) -> None:
-    fd = os.open(path, os.O_RDONLY)
+    fd = os.open(path, os.O_RDWR)
     try:
         os.fsync(fd)
     finally:
@@ -675,8 +671,20 @@ def _union_rewrite(con: Any, out_path: str, fmt: str, new_relation: str) -> None
     fmt = (fmt or "parquet").lower()
     tmp = copy_tmp_path(out_path)  # the sibling the sandbox grants beside every landed file
     _remove_quietly(tmp)
-    old = f"SELECT * FROM {_SINK_READERS[fmt]}({quote_ansi_string_literal(out_path)})"
-    union = f"{old} UNION ALL BY NAME SELECT * FROM {new_relation}"
+    path = quote_ansi_string_literal(out_path)
+    if fmt == "csv":
+        # Text round-trips as text: ``007`` and ``01234`` must not come back as integers.
+        old = f"SELECT * FROM read_csv({path}, header = true, all_varchar = true)"
+        names = [d[0] for d in con.execute(f"SELECT * FROM {new_relation} LIMIT 0").description]
+        cols = ", ".join(
+            f'CAST("{n.replace(chr(34), chr(34) * 2)}" AS VARCHAR) AS "{n.replace(chr(34), chr(34) * 2)}"'
+            for n in names
+        )
+        new = f"SELECT {cols} FROM {new_relation}"
+    else:
+        old = f"SELECT * FROM read_parquet({path})"
+        new = f"SELECT * FROM {new_relation}"
+    union = f"{old} UNION ALL BY NAME {new}"
     try:
         con.execute(_build_copy_destination(tmp, fmt).replace("{select}", union, 1))
         _fsync_path(tmp)
@@ -1339,9 +1347,11 @@ def _enforce_late_arrival_split(
             # Overwrite the main file (now without late rows) and emit
             # the side-output file. Use COPY ... TO ... so duckdb
             # handles the format details.
-            con.execute(f"COPY __la_main TO {quoted_main} ({writer_func})")
+            # The side file goes first: if it fails, the late rows are still in the
+            # main file, not only in memory.
             if (
                 ctx.source.mode is AcquisitionMode.INCREMENTAL_APPEND
+                and fmt in _SINK_READERS
                 and not _is_remote_uri(str(late_path_obj))
                 and late_path_obj.is_file()
             ):
@@ -1349,6 +1359,7 @@ def _enforce_late_arrival_split(
                 _union_rewrite(con, str(late_path_obj), fmt, "__la_side")
             else:
                 con.execute(f"COPY __la_side TO {quoted_late} ({writer_func})")
+            con.execute(f"COPY __la_main TO {quoted_main} ({writer_func})")
             results[stream_name] = counts
             LOG.info(
                 "late_arrival_split: stream=%s on_time=%d late=%d side_output=%s",

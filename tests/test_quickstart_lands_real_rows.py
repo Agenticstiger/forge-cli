@@ -1,3 +1,6 @@
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
+
 """The bundled quickstart template lands real rows with ``fluid apply`` (local engine).
 
 ``fluid init <dir> --quickstart --yes && fluid apply contract.fluid.yaml --yes`` used to

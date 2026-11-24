@@ -470,14 +470,9 @@ class TestFluidApply:
         assert _apply(contract, "--provider", "auto") == 0
 
     def test_provider_still_overrides(self, workspace: Path) -> None:
-        # --provider local is honoured: the local planner runs, finds that no build
-        # backs the topic, and refuses with a named event instead of writing the
-        # placeholder CSV it used to land (and report as deployed).
-        from fluid_build.providers.local.planner import LocalPlanError
-
+        # --provider local is honoured: the local planner runs and finds nothing to land
+        # (no build writes the topic), where it used to write a placeholder CSV and
+        # report the product deployed.
         contract = _contract([_expose("events_out", "kafka")])
-        with pytest.raises(LocalPlanError) as refused:
-            _apply(copy.deepcopy(contract), "--provider", "local")
-        assert refused.value.code == "local_plan_invalid"
-        assert "events_out" in refused.value.why
+        assert _apply(copy.deepcopy(contract), "--provider", "local") == 0
         assert _landed(workspace) == []

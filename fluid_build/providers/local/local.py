@@ -521,10 +521,6 @@ class LocalProvider(BaseProvider):
         start_ts = time.time()
         self._log_info("local_apply_start", {"project": self.project, "region": self.region})
 
-        # Use a session-scoped DB file so tables persist across actions
-        session_dir = tempfile.mkdtemp(prefix="fluid_")
-        self._session_db = str(Path(session_dir) / "session.duckdb")
-
         # ---- Normalize actions from inputs ----
         norm_actions: Optional[List[Dict[str, Any]]] = None
         if isinstance(actions, list):
@@ -564,7 +560,7 @@ class LocalProvider(BaseProvider):
                 self._log_info(
                     "local_fallback_contract_actions", {"reason": "only_unsupported_ops"}
                 )
-                derived = self._derive_actions_from_contract(contract)
+                derived = self._derive_actions_from_contract(contract, strict=False)
                 # Preserve original infra ops as explicit NOOPs for auditability
                 norm_actions = [self._infra_as_noop(a) for a in norm_actions] + derived
             else:
@@ -596,62 +592,65 @@ class LocalProvider(BaseProvider):
                 why="; ".join(problems),
                 fix=(
                     "Give each expose a build that names it in builds[].outputs and "
-                    "carries properties.sql, or declare the expose's source_table."
+                    "carries properties.sql, or declare the expose's source_table. The local "
+                    "engine runs a build's properties.sql only: the stages of a "
+                    "pattern: multi-stage build are not run."
                 ),
                 doc=doc_url(),
                 extras={"errors": list(problems)},
             )
 
         # ---- Execute ----
-        self._declare_run_io(a for a in norm_actions if isinstance(a, dict))
-        results: List[Dict[str, Any]] = []
-        error_count = 0
-        for idx, action in enumerate(norm_actions):
-            try:
-                res = self._execute_action(idx, action)
-                results.append({"i": idx, "status": "ok", **res})
-            except Exception as e:
-                error_count += 1
-                # The error text can carry a value the SQL was templated with
-                # (``CAST('{{ env.X }}' AS INTEGER)`` echoes X's value), and the
-                # result is printed by the build runner and appended to
-                # ``runtime/out/local_apply_log.jsonl``: both get it redacted.
-                error_text = redact_secret_text(str(e))
-                self._log_error(
-                    "local_apply_action_error",
-                    {"i": idx, "error": error_text, "action": redact_value(action)},
-                )
-                results.append({"i": idx, "status": "error", "error": error_text})
+        # A session-scoped DB file, so tables persist across actions. Created only
+        # once the plan is accepted (a refused plan leaves nothing behind) and
+        # removed whatever happens to the actions.
+        session_dir = tempfile.mkdtemp(prefix="fluid_")
+        self._session_db = str(Path(session_dir) / "session.duckdb")
+        try:
+            self._declare_run_io(a for a in norm_actions if isinstance(a, dict))
+            results: List[Dict[str, Any]] = []
+            error_count = 0
+            for idx, action in enumerate(norm_actions):
+                try:
+                    res = self._execute_action(idx, action)
+                    results.append({"i": idx, "status": "ok", **res})
+                except Exception as e:
+                    error_count += 1
+                    # The error text can carry a value the SQL was templated with
+                    # (``CAST('{{ env.X }}' AS INTEGER)`` echoes X's value), and the
+                    # result is printed by the build runner and appended to
+                    # ``runtime/out/local_apply_log.jsonl``: both get it redacted.
+                    error_text = redact_secret_text(str(e))
+                    self._log_error(
+                        "local_apply_action_error",
+                        {"i": idx, "error": error_text, "action": redact_value(action)},
+                    )
+                    results.append({"i": idx, "status": "error", "error": error_text})
 
-        # A skipped action (a no-op, an op this provider does not run) did not apply:
-        # counting it made a 4-action plan report "Actions Applied 5". Each result
-        # carries ``skipped``, so the CLI shows the two counts apart.
-        skipped_count = sum(1 for r in results if r.get("status") == "ok" and r.get("skipped"))
-        summary = ApplyResult(
-            provider="local",
-            applied=len(norm_actions) - error_count - skipped_count,
-            failed=error_count,
-            duration_sec=round(time.time() - start_ts, 3),
-            timestamp=_now_iso(),
-            results=results,
-        )
+            # A skipped action (a no-op, an op this provider does not run) did not apply:
+            # counting it made a 4-action plan report "Actions Applied 5". Each result
+            # carries ``skipped``, so the CLI shows the two counts apart.
+            skipped_count = sum(1 for r in results if r.get("status") == "ok" and r.get("skipped"))
+            summary = ApplyResult(
+                provider="local",
+                applied=len(norm_actions) - error_count - skipped_count,
+                failed=error_count,
+                duration_sec=round(time.time() - start_ts, 3),
+                timestamp=_now_iso(),
+                results=results,
+            )
 
-        if out:
-            self._write_text_or_stdout(out, summary.to_json() + "\n")
+            if out:
+                self._write_text_or_stdout(out, summary.to_json() + "\n")
 
-        self._append_jsonl("runtime/out/local_apply_log.jsonl", results)
-        self._log_info(
-            "local_apply_end", {"applied": summary["applied"], "failed": summary["failed"]}
-        )
-
-        # Clean up session DB
-        if hasattr(self, "_session_db"):
-            try:
-                session_dir = str(Path(self._session_db).parent)
-                shutil.rmtree(session_dir, ignore_errors=True)
-            except OSError:
-                pass
-            del self._session_db
+            self._append_jsonl("runtime/out/local_apply_log.jsonl", results)
+            self._log_info(
+                "local_apply_end", {"applied": summary["applied"], "failed": summary["failed"]}
+            )
+        finally:
+            if hasattr(self, "_session_db"):
+                shutil.rmtree(str(Path(self._session_db).parent), ignore_errors=True)
+                del self._session_db
 
         return summary
 
@@ -674,7 +673,9 @@ class LocalProvider(BaseProvider):
 
     # ------------------- Plan → Actions (from contract) ------------------ #
 
-    def _derive_actions_from_contract(self, contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _derive_actions_from_contract(
+        self, contract: Dict[str, Any], *, strict: bool = True
+    ) -> List[Dict[str, Any]]:
         """
         Build a single runnable SQL action for local execution:
           - Load SQL from build (v0.7.x canonical only formats).
@@ -794,6 +795,17 @@ class LocalProvider(BaseProvider):
             if inputs_spec:
                 tbl = validate_ident(inputs_spec[0].get("table") or "t")
                 sql_text = f"SELECT * FROM {tbl}"
+            elif not build:
+                # No build at all: there is nothing to run, and nothing to write.
+                self._log_info("local_no_build", {"contract_id": contract.get("id")})
+                return [{"op": "noop", "skipped": True, "reason": "no_build"}]
+            elif not strict:
+                # Reached from apply()'s fallback for a plan of ops this provider does not
+                # run: the planner found nothing for this build (another runner owns it), so
+                # it is reported as skipped, not refused. A build the local engine itself is
+                # asked to run (the build runner's path) is refused below.
+                self._log_info("local_build_without_sql_skipped", {"build": build.get("id")})
+                return [{"op": "noop", "skipped": True, "reason": "build_has_no_sql"}]
             else:
                 from fluid_build._errors import doc_url
 
@@ -1060,8 +1072,13 @@ class LocalProvider(BaseProvider):
         # table was then written as a placeholder.
         output_table = action.get("output_table") or action.get("table_name")
         if output_table and rel is not None:
+            # The author's SQL is wrapped on its own lines and without its trailing ``;``:
+            # a statement terminator or a ``-- comment`` at its end must not break (or
+            # swallow) the closing parenthesis.
+            body = sql.strip().rstrip(";").rstrip()
             con.execute(
-                f"CREATE OR REPLACE TABLE {validate_ident(output_table)} AS SELECT * FROM ({sql})"
+                f"CREATE OR REPLACE TABLE {validate_ident(output_table)} "
+                f"AS SELECT * FROM (\n{body}\n)"
             )
 
         written: List[str] = []

@@ -203,6 +203,10 @@ def plan_actions(
     # Run all build transformations
 
     builds = get_builds(contract)
+    # Actions are keyed by resource_id, and a build's action shares the keyspace with
+    # the exposes' (materialize) and the loaded inputs' (load_data): a build with the
+    # same id as the expose it writes would overwrite that action and depend on itself.
+    expose_ids = {str(get_expose_id(e)) for e in get_exposes(contract) if isinstance(e, dict)}
     written_by: Dict[str, str] = {}  # exposeId -> the table of the last build that names it
     table_owner: Dict[str, str] = {}  # result table -> the build id that keeps it
 
@@ -298,11 +302,13 @@ def plan_actions(
 
         # Determine output table name (temp table for intermediate results)
         output_table = build.get("output_table") or _result_table(build_id)
-        if table_owner.setdefault(output_table, build_id) != build_id:
+        # DuckDB identifiers are case-insensitive: ``result_Load`` and ``result_load`` are
+        # one table.
+        if table_owner.setdefault(output_table.lower(), build_id) != build_id:
             raise BuildOutputsError(
                 code="build_ids_collide",
                 what=(
-                    f"builds {table_owner[output_table]!r} and {build_id!r} both keep their "
+                    f"builds {table_owner[output_table.lower()]!r} and {build_id!r} both keep their "
                     f"result in the table {output_table!r}"
                 ),
                 why=(
@@ -316,11 +322,16 @@ def plan_actions(
                 extras={"table": output_table},
             )
 
+        build_rid = (
+            f"{build_id}__build"
+            if (build_id in expose_ids or build_id in loaded_tables)
+            else build_id
+        )
         actions.append(
             {
                 "op": "execute_sql",
                 "resource_type": "transformation",
-                "resource_id": build_id,
+                "resource_id": build_rid,
                 "table_name": output_table,
                 "depends_on": list(input_tables),
                 # ``mode`` is read by the executor — when "replace",
@@ -344,7 +355,7 @@ def plan_actions(
 
         # This transformation's output can be consumed by others
         loaded_tables.add(output_table)
-        dependencies[build_id] = input_tables
+        dependencies[build_rid] = input_tables
         for expose in landed:  # the last build to name an expose lands it
             written_by[str(get_expose_id(expose))] = output_table
 
@@ -398,11 +409,6 @@ def plan_actions(
         if _produced_outside_forge(expose_id, builds, log):
             continue
 
-        if not out_path:
-            # Generate default path
-            out_path = f"runtime/out/{expose_id}.csv"
-            log.warning(f"Expose output missing path, using default: {out_path}")
-
         # Determine source table (from last build or explicit)
         source_table = _determine_source_table(
             _ei["_raw"] if isinstance(_ei.get("_raw"), dict) else {},
@@ -413,6 +419,18 @@ def plan_actions(
             expose_id=expose_id,
         )
         landed_by = [] if source_table else _landed_by_runner(expose_id, builds)
+        if not source_table and not landed_by and not any(isinstance(b, dict) for b in builds):
+            # A contract with no builds writes nothing: apply has nothing to land for this
+            # expose (removing the builds is how a Spark stream is stopped). It used to get
+            # a placeholder file; with builds present, an expose none of them writes is
+            # refused by validate_plan instead.
+            log.warning(f"Expose {expose_id} has no build to write it; nothing to land")
+            continue
+
+        if not out_path:
+            # Generate default path
+            out_path = f"runtime/out/{expose_id}.csv"
+            log.warning(f"Expose output missing path, using default: {out_path}")
 
         # Infer format
         fmt = _infer_format(out_path, _ei["_format"])

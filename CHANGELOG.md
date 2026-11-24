@@ -18,7 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SELECT 1 AS demo_col`, a result table that cannot be created fails the action instead of
   logging `local_sql_create_table_warn`, a materialize that fails is an error instead of
   `local_materialize_fallback`, and `apply()` with nothing to run raises instead of writing
-  `runtime/out/demo_artifact.csv`. A materialize that a build runner lands
+  `runtime/out/demo_artifact.csv`. An expose that none of a contract's builds writes is refused
+  with `local_plan_invalid`; a contract with no builds at all lands nothing and applies (removing
+  the builds is how a Spark stream is stopped). A planned build the local engine has no SQL for is
+  skipped when the plan only held ops this provider does not run. A materialize that a build runner lands
   (`payload.landed_by`) is reported as skipped. A build id with a hyphen
   (`hello-transformation`) no longer lands the placeholder: its result table is `result_<id>`
   with every character outside `[A-Za-z0-9_]` mapped to `_`. A materialize result now lists the
@@ -38,14 +41,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`incremental_append` to a single local file keeps every increment.** A run without partition
   keys wrote its rows with a plain `COPY ... TO <file>`, which replaces the file, while the cursor
   had already moved past the previous run's rows: after two runs the file held only the second
-  run's rows (parquet, csv and json alike). The run now writes the union of the file and its new
-  rows (`UNION ALL BY NAME`, so a new column is NULL-filled in the old rows) to a temp file in the
-  same directory, fsyncs it and replaces the target with `os.replace`; a failed write leaves the
-  previous file as it was and no temp file behind. The late-arrival side file
-  (`<stem>__late_events`) is unioned the same way, so it keeps every run's late rows, and a run
-  with no late rows leaves it alone. **Behaviour change:** each such run now reads and rewrites the
-  whole file (DuckDB has no single-file append); rows are appended again if the same source rows
-  are landed twice (no de-duplication).
+  run's rows. For a parquet or csv file the run now writes the union of the file and its new rows
+  (`UNION ALL BY NAME`, so a new column is NULL-filled in the old rows) to a temp file in the same
+  directory, fsyncs it and replaces the target with `os.replace`; a failed write leaves the
+  previous file as it was and no temp file behind. A csv file is read back as text, so a value such
+  as `007` is rewritten as it was landed. The late-arrival side file (`<stem>__late_events`) is
+  unioned the same way and written before the main file, so a failed union leaves the late rows in
+  the main file; a run with no late rows leaves it alone. **Behaviour change:** each such run now
+  reads and rewrites the whole file (DuckDB has no single-file append), and a failure between the
+  file write and the cursor write lands the batch again on the retry (the append is
+  at-least-once; the old overwrite was idempotent). A json or ndjson sink still replaces the file:
+  reading it back re-infers types.
 - **`--mode amend-and-build` lands each local SQL build in its own expose.** Every build was
   handed `exposes[0]`, so with two `engine: sql` builds the second overwrote the first build's
   file and its own expose was never written, exit 0. A build now writes the exposes its `outputs`
@@ -53,8 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written by this build" about a local one), through the same `build_output_exposes` helper as the
   planner. A remote further output is still refused. An unknown output id, or no `outputs` beside
   several exposes, is refused before the build runs, with `build_output_unknown_expose` or
-  `build_outputs_undeclared`. The acquisition schema-drift gate takes the baseline from the
-  expose the build writes, not `exposes[0]`, and is skipped when that cannot be told.
+  `build_outputs_undeclared`. The acquisition schema-drift gate takes its baseline from the first
+  expose, in contract order, that the build names in `outputs` (as the DuckDB runner lands it), and
+  from `exposes[0]` when it names none, not from `exposes[0]` for every build.
 - **`fluid apply` on the local engine lands each build in the expose its `outputs` name.**
   Applying a `plan.json` with the local provider used to answer the plan's abstract ops
   (`provisionDataset`, `scheduleTask`) by deriving ONE SQL action from the contract, the first

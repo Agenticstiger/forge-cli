@@ -585,22 +585,30 @@ def _read_uri(
 
 
 def _landed_by_local_provider(upstream: Mapping[str, Any], expose: Mapping[str, Any]) -> bool:
-    """Whether the local provider writes ``expose``: an embedded-SQL build lands it.
+    """Whether the local provider writes ``expose``: an embedded-SQL build names it.
 
-    That provider writes the FIRST expose of a contract with an embedded-SQL
-    build on DuckDB (``base._execute_embedded_sql_build``), under its own file
+    That provider writes every local expose an embedded-SQL build on DuckDB names
+    in its ``outputs`` (``base._execute_embedded_sql_build``), under its own file
     name and format rule. Any other local expose (an acquisition build's, or a
     file nothing in the workspace builds) is where and as what it is declared.
     """
+    from fluid_build.util.contract import BuildOutputsError
+
     from .base import LOCAL_SQL_PLATFORMS, embedded_sql_platform, is_embedded_sql_build
 
-    exposes = [e for e in upstream.get("exposes") or [] if isinstance(e, Mapping)]
-    if not exposes or exposes[0] is not expose:
-        return False
     builds = [b for b in upstream.get("builds") or [] if isinstance(b, dict)]
-    return any(
-        is_embedded_sql_build(b) and embedded_sql_platform(b) in LOCAL_SQL_PLATFORMS for b in builds
-    )
+    for build in builds:
+        if not (
+            is_embedded_sql_build(build) and embedded_sql_platform(build) in LOCAL_SQL_PLATFORMS
+        ):
+            continue
+        try:
+            written = _landed_exposes(upstream, build)
+        except BuildOutputsError:
+            continue  # that build is refused when it runs; it lands nothing
+        if any(e is expose for e in written):
+            return True
+    return False
 
 
 def _read_local(

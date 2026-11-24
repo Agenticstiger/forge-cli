@@ -490,6 +490,27 @@ class TestEnforceSchemaPolicySkipsPlaceholders:
             enforce_schema_policy_or_raise(ctx, Runner("A_COL"))
         assert type(drift.value).__name__ == "SchemaDriftError"
 
+    def test_a_build_with_no_outputs_is_held_to_the_first_expose_as_the_runner_lands_it(self):
+        # Several exposes and no ``outputs``: the runner lands exposes[0], and the gate
+        # must not switch itself off (it was skipped when the helper refused).
+        from fluid_build.build_runners._acquisition_common import (
+            enforce_schema_policy_or_raise,
+        )
+
+        contract = self._baseline_contract()
+        contract["exposes"].append({"exposeId": "other", "contract": {"schema": []}})
+        contract["builds"] = [{"id": "ingest"}]
+
+        class Drifted:
+            def fingerprint(self, ctx):
+                return SchemaFingerprint.of([SchemaColumn(name="UNKNOWN_COL", type="STRING")])
+
+        ctx = self._make_ctx(contract)
+        ctx.build_id = "ingest"
+        with pytest.raises(Exception) as drift:
+            enforce_schema_policy_or_raise(ctx, Drifted())
+        assert type(drift.value).__name__ == "SchemaDriftError"
+
     def test_strict_policy_still_fires_for_real_drift(self):
         # A runner that returns a REAL fingerprint with mismatched columns
         # under strict policy should still raise (or at least not silently

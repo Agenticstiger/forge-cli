@@ -360,3 +360,21 @@ class TestPlanActionsMultipleBuilds:
             if a["op"] == "materialize"
         }
         assert landed == {"A": "result_build_b", "B": None}  # the last build to name A wins
+
+    def test_build_ids_that_differ_only_in_case_share_one_table_and_are_refused(self):
+        import pytest
+
+        from fluid_build.util.contract import BuildOutputsError
+
+        # DuckDB identifiers are case-insensitive: result_Load and result_load are one table.
+        with pytest.raises(BuildOutputsError) as refused:
+            self._plan(_two_build_contract(a_id="Load", b_id="load"))
+        assert refused.value.code == "build_ids_collide"
+
+    def test_a_build_with_the_id_of_the_expose_it_writes_runs_before_its_materialize(self):
+        # Both actions were keyed "daily": the materialize depended on itself and ran first.
+        contract = _two_build_contract(a_id="A", b_id="B")  # build A writes expose A
+        actions = self._plan(contract)
+        order = [(a["op"], a["resource_id"]) for a in actions if a["op"] != "load_data"]
+        assert order.index(("execute_sql", "A__build")) < order.index(("materialize", "A"))
+        assert order.index(("execute_sql", "B__build")) < order.index(("materialize", "B"))

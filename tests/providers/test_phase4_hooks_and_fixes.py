@@ -467,16 +467,15 @@ class TestBugfixM4ResolveProviderTopLevel:
 
 
 class TestBugfixM6DeterministicSourceTable:
-    """M6: _determine_source_table should use sorted() for deterministic fallback."""
+    """M6: _determine_source_table is deterministic (it used to pick the first loaded table)."""
 
     def test_deterministic_fallback(self):
         from fluid_build.providers.local.planner import _determine_source_table
 
         logger = logging.getLogger("test")
-        # With unordered set, sorted() should always pick alphabetically first
+        # No build names the expose: no table is guessed, whatever order the set iterates in.
         loaded = {"zebra", "alpha", "mango"}
-        result = _determine_source_table({}, [], loaded, logger)
-        assert result == "alpha"
+        assert _determine_source_table({"exposeId": "orphan"}, [], loaded, logger) is None
 
     def test_explicit_source_preferred(self):
         from fluid_build.providers.local.planner import _determine_source_table
