@@ -38,12 +38,15 @@ _FLAGS = (
     "max_rows_per_cell",
     "release_record",
     "rederive",
+    "clique_method",
 )
 
 HELP = """\
 With --request FILE, --privacy-unit EXPOSE, --rho R and --release-record PATH the profile
-is a release under differential privacy: the noisy counts of one table, in profile format
-1-2-0, which flux-engine grades P3. Nothing else of the request is released.
+is a release under differential privacy: the noisy counts of one table, and the noisy rank
+correlations the request asks for, in profile format 1-2-0 (1-4-0 when it holds a rank
+correlation, a clique with a binned column or a clique selection), which flux-engine grades
+P3. Nothing else of the request is released.
 
 What it releases, from the release table (the privacy unit's expose, or with
 --release-table a child of it through one declared relationship, or with --unit-key the rows
@@ -51,19 +54,32 @@ of the unit's expose that name one entity by COL[,COL]):
   - a noisy levelHistogram/1 of each required enum column the request lists;
   - a noisy marginalHistogram/1 of each required number, date or timestamp column the request
     lists, on the bins the contract's declared range gives (else the type's ladder);
-  - noisy cliqueMarginal/1 tables over categorical columns, the cliques chosen with AIM
-    (OpenDP, from the [privacy] extra) when two or more are released.
+  - noisy cliqueMarginal/1 tables over categorical columns, the cliques chosen with AIM or,
+    with --clique-method mst, MST (OpenDP, from the [privacy] extra) when two or more columns
+    may join them. A request that lists cliqueColumns lets those released columns join, a
+    number or timestamp column by its public bins: such a clique is a cliqueMarginal/2, and
+    the table states its cliqueSelection (method, producer and the share spent choosing);
+  - a noisy kendallTau/1 or spearmanRho/1 of each pair of released number or timestamp
+    columns a rankCorrelations entry of the request lists, each value formed with the public
+    row floor --row-floor N (default 1000, a count of 2 or more, written as its rowFloor).
 The levels and bins are public: they come from the contract, never from the records. A key
 column, a column that may hold a null and a column with no public levels or bins is not
 released, and neither is a row count, a column metric, a quantile, a mean, a relationship or
 a fact. The report names each requested item that is not released, with the reason.
 
 What it guarantees: zero-concentrated differential privacy with total privacy loss rho = R,
-for one release of one table. A tenth of R chooses the cliques when two or more categorical
-columns are released; the rest is split equally over the count tables. Each table gets
-exact discrete Gaussian noise whose scale is the least one that spends no more than its
-share on the change of one entity. The report adds an informational conversion to (epsilon,
-delta) at delta = 1e-6.
+for one release of one table. A tenth of R chooses the cliques when two or more columns
+may join them; the rest is split equally over the parts, each count table and each rank
+correlation one part. A count table gets exact discrete Gaussian noise whose scale is the
+least one that spends no more than its share on the change of one entity: its sensitivity
+to one row is 1. A rank correlation's value moves by at most 4/(f+1) (Kendall) or 9/(f+1)
+(Spearman) when one record is added or removed, f being the row floor, so by at most that
+times the rows an entity contributes when an entity does. The value is floored onto a public
+lattice of 2^20 steps per sensitivity, an exact discrete Gaussian is added on the lattice
+(Canonne, Kamath and Steinke 2020, so no floating-point noise leaks, Mironov 2012), and the
+sum is written to 12 decimals; the profile states it as a gaussian of the scale, whose variance
+bounds the discrete one's. The report names each part's sensitivity, scale and share, and adds
+an informational conversion to (epsilon, delta) at delta = 1e-6.
 
 For which unit: one entity is one row of the unit's expose; with a release table related to
 it, or with a unit key, an entity owns every row that belongs to it, and the stated loss holds
@@ -82,7 +98,7 @@ then be unique, and a null in it refuses the release.
 What the guarantee rests on: the noise is pseudorandom, drawn from HMAC-SHA256 keyed by the
 recorded seed, so the guarantee holds as long as HMAC-SHA256 behaves as a pseudorandom
 function. Choosing the cliques uses OpenDP's AIM, which OpenDP ships behind its contrib
-flag. The guarantee covers data that meets the contract (required columns hold a value,
+flag (with --clique-method mst, its MST, shipped the same way). The guarantee covers data that meets the contract (required columns hold a value,
 values lie in their declared levels and ranges, and in rows mode the primary key is
 unique); data that does not is refused, releases nothing, and the refusal is for the data
 owner (it names a column and a row): a refusal is not covered by the guarantee.
@@ -98,7 +114,8 @@ rows, entities or dropped rows. A table that has relationships cannot ship on fl
 Re-derivation: the noise is drawn from a seeded randomness source recorded inside the data
 owner's boundary, so the release can be re-derived there. --release-record PATH is created
 exclusively, readable by you alone, and must not exist; --rederive with the existing
-record draws the same release again, takes the privacy loss and the rest from the record,
+record draws the same release again, takes the privacy loss, the clique method, the row floor
+and the rest from the record,
 and writes the profile only when its digest equals the recorded one. Keep the record inside the data
 owner's boundary: with it and the profile the noise can be taken off. Never reuse a record
 for another release.
@@ -183,6 +200,15 @@ def add_flags(parser: "argparse.ArgumentParser") -> None:
         type=_whole,
         metavar="K",
         help="the most rows one entity counts in one cell of a table (default N)",
+    )
+    group.add_argument(
+        "--clique-method",
+        choices=("aim", "mst"),
+        metavar="aim|mst",
+        help=(
+            "how the cliques are chosen when two or more columns may join them: aim (the "
+            "default) or mst, both OpenDP's (from the [privacy] extra); a new release"
+        ),
     )
     group.add_argument(
         "--release-record",
@@ -328,6 +354,26 @@ def _read_request(path: Path, backend: Any) -> Tuple[bytes, Any]:
         raise asked_for._refuse("profile_request_refused", f"{path.name}: {exc}", again) from None
 
 
+def _options_from_record(options: Any) -> Dict[str, Any]:
+    """The clique method and the row floor a record states, read strictly."""
+    from fluid_build.profiler.dp import release, selection
+
+    if not isinstance(options, dict) or not set(options) <= {"cliqueMethod", "rowFloor"}:
+        raise release.ReleaseRefused(
+            "profile_release_record_mismatch",
+            "the record's options are not ones this release writes",
+        )
+    method, floor = options.get("cliqueMethod", "aim"), options.get("rowFloor")
+    if method not in selection.METHODS or (
+        floor is not None and (isinstance(floor, bool) or not isinstance(floor, int) or floor < 2)
+    ):
+        raise release.ReleaseRefused(
+            "profile_release_record_mismatch",
+            "the record's options are not ones this release writes",
+        )
+    return {"clique_method": method, "row_floor": floor}
+
+
 def _unit_from_record(unit: Any) -> Dict[str, Any]:
     """The plan inputs a record states, read strictly: a record is not trusted."""
     from fluid_build.profiler.dp.release import ReleaseRefused
@@ -372,6 +418,8 @@ def _disagreements(args: argparse.Namespace, stated: Dict[str, Any], rho: Any) -
         "--unit-key": (args.unit_key, stated["unit_key"]),
         "--max-rows-per-unit": (args.max_rows_per_unit, stated["max_rows_per_unit"]),
         "--max-rows-per-cell": (args.max_rows_per_cell, stated["max_rows_per_cell"]),
+        "--row-floor": (getattr(args, "row_floor", None), stated["row_floor"]),
+        "--clique-method": (args.clique_method, stated["clique_method"]),
     }
     for flag, (value, recorded) in given.items():
         if value is not None and value != recorded:
@@ -452,7 +500,10 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                     "the release record was made from another request or contract",
                     {"next": "name the request and the contract the release was made from"},
                 )
-            stated = _unit_from_record(recorded.unit)
+            stated = {
+                **_unit_from_record(recorded.unit),
+                **_options_from_record(dict(recorded.options)),
+            }
             rho = release.parse_rho(str(recorded.privacy_loss.get("rho")))
             _disagreements(args, stated, rho)
         else:
@@ -462,6 +513,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 "unit_key": args.unit_key,
                 "max_rows_per_unit": args.max_rows_per_unit,
                 "max_rows_per_cell": args.max_rows_per_cell,
+                "row_floor": getattr(args, "row_floor", None),
+                "clique_method": args.clique_method or "aim",
             }
             rho = release.parse_rho(args.rho)
         contract = load_contract_with_overlay(str(contract_path), args.env, logger)
@@ -475,6 +528,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             unit_key=stated["unit_key"],
             max_rows_per_unit=stated["max_rows_per_unit"],
             max_rows_per_cell=stated["max_rows_per_cell"],
+            row_floor=stated["row_floor"],
+            clique_method=stated["clique_method"],
         )
         _only_the_release_table(args.source, contract, plan.table)
         exposes = profile_cmd._expose_sources(contract, [plan.table], args.source, args.table)
@@ -499,7 +554,14 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             cwd=Path.cwd(),
         )
         rows = release.encode_rows(plan, read, backend)
-        drawn = release.draw(plan, rows, seed, backend, cliques=cliques)
+        drawn = release.draw(
+            plan,
+            rows,
+            seed,
+            backend,
+            cliques=cliques,
+            selection_version=None if recorded is None else recorded.versions.get("opendp"),
+        )
         if recorded is not None:
             if drawn.digest != recorded.profile_digest:
                 raise release.ReleaseRefused(
@@ -608,7 +670,12 @@ def _words(plan: Any) -> List[str]:
     ]
 
 
-_KIND = {"clique": "clique of", "levels": "level histogram of", "bins": "histogram of"}
+_KIND = {
+    "clique": "clique of",
+    "levels": "level histogram of",
+    "bins": "histogram of",
+    "rank": "rank correlation",
+}
 
 
 def _report(
@@ -642,7 +709,11 @@ def _report(
         soft_wrap=True,
     )
     total = release.decimal_text(plan.rho)
-    spent = f"{release.decimal_text(drawn.measurement_rho)} measuring {len(drawn.tables)} tables"
+    ranked = len(drawn.rank_tables)
+    measured = f"{len(drawn.count_tables)} tables"
+    if ranked:
+        measured += f" and {ranked} rank correlation{'s' if ranked != 1 else ''}"
+    spent = f"{release.decimal_text(drawn.measurement_rho)} measuring {measured}"
     if drawn.selection_rho:
         spent = f"{release.decimal_text(drawn.selection_rho)} choosing the cliques, " + spent
     say(f"Privacy loss: rho {total} in all (zero-concentrated): {spent}.", soft_wrap=True)
@@ -659,7 +730,8 @@ def _report(
     )
     if plan.selects:
         rests += (
-            " Choosing the cliques uses OpenDP's AIM, which OpenDP ships behind its contrib flag."
+            f" Choosing the cliques uses OpenDP's {plan.clique_method.upper()}, which OpenDP "
+            "ships behind its contrib flag."
         )
     rests += (
         " The guarantee covers data that meets the contract (required columns hold a value, "
@@ -669,16 +741,36 @@ def _report(
     )
     say(rests, soft_wrap=True)
     for table in drawn.tables:
+        if table.kind == "rank":
+            first, second = table.columns
+            say(
+                f"  {_KIND[table.kind]} {table.definition} of {first} and {second}: noise scale "
+                f"{table.scale}, share rho {table.share}, row floor {table.row_floor}, "
+                f"sensitivity {table.delta} for one entity",
+                soft_wrap=True,
+            )
+            continue
         say(
             f"  {_KIND[table.kind]} {', '.join(table.columns)}: noise scale {table.scale}, "
-            f"share rho {table.share}",
+            f"share rho {table.share}, squared L2 sensitivity {plan.sensitivity} for one entity",
+            soft_wrap=True,
+        )
+    if ranked:
+        say(
+            "A rank correlation's value is formed exactly with its row floor, floored onto a "
+            f"public lattice of {2**20:,} steps per sensitivity, and an exact discrete Gaussian "
+            "is added on the lattice (Canonne, Kamath and Steinke 2020; no floating-point noise "
+            "leaks, Mironov 2012). The profile states it as a gaussian of the scale shown: the "
+            "variance of the discrete Gaussian does not exceed its square.",
             soft_wrap=True,
         )
     if plan.selects:
         chosen = (
             "; ".join(", ".join(clique) for clique in drawn.cliques) if drawn.cliques else "none"
         )
-        origin = "from the release record" if rederived else "chosen with AIM"
+        origin = (
+            "from the release record" if rederived else f"chosen with {plan.clique_method.upper()}"
+        )
         say(f"Cliques {origin}: {chosen}.", soft_wrap=True)
     by_reason: Dict[str, List[str]] = {}
     for what, reason in plan.not_released:

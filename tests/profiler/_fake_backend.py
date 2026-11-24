@@ -247,6 +247,14 @@ class FakeBackend:
             return {"group": "", "k": k, "A4": str(int(4 * a))}
         raise KeyError(identifier)
 
+    def rank_value(self, identifier: str, pairs: Any, floor: int) -> Fraction:
+        value: Fraction = self._real().rank_value(identifier, pairs, floor)
+        return value
+
+    def rank_sensitivity(self, identifier: str, floor: int) -> Fraction:
+        value: Fraction = self._real().rank_sensitivity(identifier, floor)
+        return value
+
     def metrics(self) -> Tuple[FakeMetric, ...]:
         return METRICS
 

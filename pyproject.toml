@@ -1018,6 +1018,7 @@ module = [
     "fluid_build.profiler.dp.consistency",
     "fluid_build.profiler.dp.discrete_gaussian",
     "fluid_build.profiler.dp.randomness",
+    "fluid_build.profiler.dp.rank_noise",
     "fluid_build.profiler.dp.record",
     "fluid_build.profiler.dp.release",
     "fluid_build.profiler.dp.selection",

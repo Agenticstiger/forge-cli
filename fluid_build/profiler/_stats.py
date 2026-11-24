@@ -576,6 +576,21 @@ class StatisticsBackend(Protocol):
         exact, with no ``status``.
         """
 
+    def rank_value(self, identifier: str, pairs: Sequence[Tuple[int, int]], floor: int) -> Fraction:
+        """The value ``tau`` or ``rho`` of ``kendallTau/1`` or ``spearmanRho/1`` over *pairs*, exact.
+
+        *pairs* are the two values of each record whose two values are known, floored onto the
+        grid, and *floor* the statistic's ``rowFloor``, a count of at least 2: the value is
+        formed with ``N = max(records, floor)``.
+        """
+
+    def rank_sensitivity(self, identifier: str, floor: int) -> Fraction:
+        """The L1 and the L2 sensitivity of the value of a rank correlation under one record.
+
+        ``4 / (floor + 1)`` for ``kendallTau/1`` and ``9 / (floor + 1)`` for ``spearmanRho/1``,
+        as the registry charges them.
+        """
+
     def bin_cells(
         self, values: Sequence[Any], edges: Sequence[Fraction], fractional_bits: int
     ) -> List[int]:
@@ -1168,6 +1183,20 @@ class _FluxStatsBackend:
         state = definition.measure("", list(pairs), self._parameters())
         spelled: Dict[str, Any] = state.to_document(definition)
         return spelled
+
+    def rank_value(self, identifier: str, pairs: Sequence[Tuple[int, int]], floor: int) -> Fraction:
+        from flux_stats import rank_correlation as ranks
+
+        if identifier == ranks.KENDALL_TAU_ID:
+            return ranks.kendall_tau(ranks.kendall_s(pairs), len(pairs), floor)
+        if identifier == ranks.SPEARMAN_RHO_ID:
+            return ranks.spearman_rho(ranks.spearman_a4(pairs), len(pairs), floor)
+        raise KeyError(identifier)
+
+    def rank_sensitivity(self, identifier: str, floor: int) -> Fraction:
+        from flux_stats.rank_correlation import rank_sensitivity
+
+        return Fraction(rank_sensitivity(identifier, floor))
 
     def bin_cells(
         self, values: Sequence[Any], edges: Sequence[Fraction], fractional_bits: int
