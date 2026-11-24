@@ -1117,10 +1117,9 @@ def _blocks_of(contract: Mapping[str, Any], base: str, build: Mapping[str, Any])
     sink_blocks: List[_Block] = []
     if isinstance(props.get("sink"), Mapping):
         sink_blocks.append((f"{properties}.sink", props["sink"]))
-    # Every expose, not only the ones ``outputs`` names: a runner picks its own (``exposes[0]`` for
-    # dlt, airbyte and meltano, the first Iceberg expose for the Kafka Connect and Debezium sinks, and
-    # ``exposes[0]`` again when ``outputs`` names none that exists), so ``outputs`` is no promise of
-    # what is written where.
+    # Every expose, not only the ones ``outputs`` names: the Kafka Connect and Debezium sinks cover every
+    # expose of a build that names none, and the other runners land the one their ``outputs`` resolves to
+    # (``landed_expose``), so no runner is left to pick the expose that is judged.
     exposes = contract.get("exposes")
     for index, expose in enumerate(exposes if isinstance(exposes, list) else []):
         binding = expose.get("binding") if isinstance(expose, Mapping) else None
