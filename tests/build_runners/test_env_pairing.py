@@ -1253,9 +1253,24 @@ def test_a_hand_written_engine_map_is_the_projects_choice_when_its_host_variable
     assert "sink.attacker.example" not in repr(info.value.__dict__)
 
 
-@pytest.mark.parametrize("value", ["a string", ["a", "list"], None, 5])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://attacker.example/x {{ env.X }}",
+        ["https://attacker.example/x", "{{ env.X }}", "z"],
+        [1, 2],
+        5,
+    ],
+    ids=["string", "list of three", "list of numbers", "number"],
+)
 @pytest.mark.parametrize("engine_name, path", _MAPS, ids=_MAP_IDS)
-def test_what_is_not_a_map_is_left_alone(engine_name, path, value):
+def test_what_is_not_a_map_is_left_alone(engine_name, path, value, monkeypatch):
+    """What no runner can merge fails there. The same URL and variable in a map are refused, so this
+    is not a pass for want of anything to judge."""
+    monkeypatch.setenv("X", _PROBE)
+    as_a_map = {"url": "https://attacker.example/x", "headers": "{{ env.X }}"}
+    with pytest.raises(EnvTemplateError):
+        check_env_pairing(_with_a_map(engine_name, path, as_a_map))
     check_env_pairing(_with_a_map(engine_name, path, value))
 
 
@@ -1281,6 +1296,100 @@ def test_a_variable_in_the_source_does_not_go_to_the_sinks_url_and_the_other_way
     with pytest.raises(EnvTemplateError) as info:
         check_env_pairing(contract)
     assert info.value.extras["variable"] == "DB_PW"
+
+
+def test_the_sources_password_does_not_go_to_the_brokers_the_extra_config_names(monkeypatch):
+    """The canonical use of ``extra_config``: the Kafka brokers of the schema history. They get no
+    database password, so the source's variables need no entry for them."""
+    contract = _with_a_map(
+        "debezium",
+        ("debezium", "extra_config"),
+        {
+            "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+            "schema.history.internal.kafka.topic": "history",
+        },
+        password="{{ env.PGPASSWORD }}",
+    )
+    monkeypatch.setenv("PGPASSWORD", _PROBE)
+    check_env_pairing(contract)
+
+
+def test_a_variable_in_the_extra_config_goes_with_the_addresses_the_extra_config_names(monkeypatch):
+    jaas = 'PlainLoginModule required username="u" password="{{ env.KAFKA_PW }}";'
+    contract = _with_a_map(
+        "debezium",
+        ("debezium", "extra_config"),
+        {
+            "schema.history.internal.kafka.bootstrap.servers": "kafka.attacker.example:9092",
+            "schema.history.internal.producer.sasl.jaas.config": jaas,
+        },
+    )
+    monkeypatch.setenv("KAFKA_PW", _PROBE)
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    assert "bootstrap.servers" in info.value.what and "any host" in info.value.fix
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "KAFKA_PW")
+    check_env_pairing(contract)
+
+
+def test_a_credential_the_extra_config_gives_the_connector_goes_with_the_sources_host(monkeypatch):
+    """``database.password`` in ``extra_config`` replaces the one built from the source, and is sent
+    to the source's host."""
+    contract = _with_a_map(
+        "debezium",
+        ("debezium", "extra_config"),
+        {"database.password": "{{ env.OTHER_PW }}"},
+        host="db.example",
+    )
+    monkeypatch.setenv("OTHER_PW", _PROBE)
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    assert info.value.extras["variable"] == "OTHER_PW" and "db.example" in info.value.what
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "OTHER_PW@db.example")
+    check_env_pairing(contract)
+
+
+def test_a_converter_setting_of_the_sink_config_goes_with_the_schema_registry(
+    kafka_connect_mock, tmp_path: Path, monkeypatch, capsys
+):
+    """The registry's URL is copied into the sink connector config, and a hand-written
+    ``value.converter.*`` key is the converter's, which sends it to the registry."""
+    monkeypatch.setenv("X", _PROBE)
+    contract = _kc_contract(
+        None,
+        location=_catalog("http://localhost:8181/catalog"),
+        schema_registry={"url": "https://attacker.example"},
+        iceberg_sink_enabled=True,
+        sink_connector_config={
+            "value.converter.basic.auth.credentials.source": "USER_INFO",
+            "value.converter.basic.auth.user.info": "{{ env.X }}",
+        },
+    )
+
+    assert _dispatch(contract, tmp_path) == 1
+    shown = capsys.readouterr()
+    assert (
+        "schema_registry.url" in shown.out + shown.err
+        and "X@attacker.example" in shown.out + shown.err
+    )
+    assert _PROBE not in shown.out + shown.err + repr(kafka_connect_mock.connectors)
+    assert kafka_connect_mock.connectors == {}, "nothing was pushed"
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "X@attacker.example")
+    assert _dispatch(contract, tmp_path) == 0
+    assert _PROBE in repr(kafka_connect_mock.connectors), "the operator decides"
+
+
+def test_the_other_settings_of_the_sink_config_do_not_go_to_the_schema_registry(monkeypatch):
+    contract = _kc_contract(
+        None,
+        location=_catalog("http://localhost:8181/catalog"),
+        schema_registry={"url": "https://schema-registry.example:8081"},
+        iceberg_sink_enabled=True,
+        sink_connector_config={"iceberg.catalog.warehouse": "{{ env.WH }}"},
+    )
+    monkeypatch.setenv("WH", _PROBE)
+    check_env_pairing(contract)  # WH goes to the catalog, which is this machine
 
 
 def test_a_destination_airbyte_is_given_is_judged_on_its_own(monkeypatch):
@@ -1346,8 +1455,17 @@ def test_a_list_of_pairs_is_merged_as_a_map_so_it_is_judged_as_one(pairs, monkey
     check_env_pairing(contract)
 
 
-@pytest.mark.parametrize("pairs", [["a", "b", "c"], [1, 2], [["a"]], [["a", "b", "c"]]])
-def test_a_list_that_is_no_list_of_pairs_is_left_to_the_runner(pairs):
+@pytest.mark.parametrize(
+    "pairs",
+    [
+        ["https://attacker.example/x", "{{ env.X }}", "z"],
+        [1, 2],
+        [["https://attacker.example/x"]],
+        [["url", "https://attacker.example/x", "{{ env.X }}"]],
+    ],
+)
+def test_a_list_that_is_no_list_of_pairs_is_left_to_the_runner(pairs, monkeypatch):
+    monkeypatch.setenv("X", _PROBE)
     check_env_pairing(_with_a_map("debezium", ("debezium", "extra_config"), pairs))
 
 

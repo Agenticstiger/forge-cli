@@ -1033,23 +1033,39 @@ def _builds_of(contract: Mapping[str, Any]) -> List[_Block]:
 #: The maps of an engine's own settings that a contract writes by hand and a runner pushes to the
 #: engine as they are: ``(side, path under properties)``. A variable in one goes to every endpoint
 #: the map names (a URL under any key, a host field), so it is judged like a source or a sink block.
-#: ``source``: merged into the config of the connector that reads (Debezium's ``extra_config``, over
-#: the settings derived from the source block). ``sink``: merged into the config of the connector that
-#: writes, over the settings derived from the sink block and the exposes (Kafka Connect's
-#: ``sink_connector_config`` and ``iceberg_catalog_overrides``, which is forwarded last so that it
-#: wins, Debezium Server's ``sink.config``, Meltano's ``target_config``).
-#: ``own``: sent as it is, in place of anything derived, or a block that pairs an address with its own
-#: credentials, so judged on its own (Airbyte's ``destination_config``, Kafka Connect's
-#: ``schema_registry``, whose URL is copied into the source and the sink config).
+#: ``sink``: merged into the config of the connector that writes, over the settings derived from the
+#: sink block and the exposes (Kafka Connect's ``sink_connector_config`` and
+#: ``iceberg_catalog_overrides``, which is forwarded last so that it wins, Debezium Server's
+#: ``sink.config``, Meltano's ``target_config``). ``own``: sent as it is, in place of anything
+#: derived, so judged on its own (Airbyte's ``destination_config``). Two more are read by
+#: :func:`_blocks_of` itself: Debezium's ``extra_config`` and Kafka Connect's ``schema_registry``.
 _ENGINE_MAPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
-    ("source", ("debezium", "extra_config")),
     ("sink", ("debezium", "server", "sink", "config")),
     ("sink", ("kafka-connect", "sink_connector_config")),
     ("sink", ("kafka-connect", "iceberg_catalog_overrides")),
     ("sink", ("meltano", "target_config")),
     ("own", ("airbyte", "destination_config")),
-    ("own", ("kafka-connect", "schema_registry")),
 )
+
+#: The Debezium map a runner merges over the source connector's settings, and the Kafka Connect block
+#: whose URL it copies into the source and the sink connector config as the converters' registry.
+_EXTRA_CONFIG = ("debezium", "extra_config")
+_SCHEMA_REGISTRY = ("kafka-connect", "schema_registry")
+#: The sink settings a Kafka Connect worker gives the converters, which send them to the registry.
+_CONVERTER_KEYS = ("key.converter.", "value.converter.", "header.converter.")
+
+
+def _map_at(node: Any, path: Tuple[str, ...]) -> Optional[Mapping[str, Any]]:
+    """The map ``node`` holds at ``path``: a runner merges with ``dict.update``, which takes a list of
+    key/value pairs as well, so a list is the map it makes. What is no map, and no list of pairs,
+    fails in the runner."""
+    written = _value_at(node, path)
+    if isinstance(written, (list, tuple)):
+        try:
+            written = dict(written)
+        except (TypeError, ValueError):
+            return None
+    return written if isinstance(written, Mapping) else None
 
 
 def _blocks_of(contract: Mapping[str, Any], base: str, build: Mapping[str, Any]) -> List[_Group]:
@@ -1058,42 +1074,44 @@ def _blocks_of(contract: Mapping[str, Any], base: str, build: Mapping[str, Any])
     The source: ``properties.source``, judged as a whole and as its ``connection`` (the block a
     runner hands the policy). The sink: ``properties.sink`` and the ``binding.location`` of every
     expose, which carry the catalog's address and the settings sent to it, ``catalogAuth``
-    included. The engine's hand-written maps join the side the runner merges them into, and one it
-    sends alone is a group of its own (:data:`_ENGINE_MAPS`).
+    included. The engine's hand-written maps join the sink, or are a group of their own
+    (:data:`_ENGINE_MAPS`).
+
+    Debezium's ``extra_config`` is a group of its own, and what in it moves the source's destination
+    or credential (:func:`~fluid_build.secrets.policy._moves_destination`) joins the source: the
+    source's password never goes to the Kafka brokers it names for the schema history. The registry
+    block of Kafka Connect is a group with the converter settings of its sink map, which are the
+    ones that reach it.
     """
+    from fluid_build.secrets.policy import _moves_destination
+
     props = build.get("properties")
     if not isinstance(props, Mapping):
         return []
-    engine_maps: Dict[str, List[_Block]] = {"source": [], "sink": [], "own": []}
-    for side, path in _ENGINE_MAPS:
-        written = _value_at(props, path)
-        if isinstance(written, (list, tuple)):
-            # A runner merges with ``dict.update``, which takes a list of key/value pairs as well
-            # (Debezium's ``extra_config``): judged as the map it makes. What is no list of pairs fails
-            # in the runner.
-            try:
-                written = dict(written)
-            except (TypeError, ValueError):
-                written = None
-        if isinstance(written, Mapping):
-            engine_maps[side].append((_dotted(f"{base}.properties", path), written))
+    properties = f"{base}.properties"
     groups: List[_Group] = []
     named: List[_Block] = []
     judged: List[_Block] = []
     source = props.get("source")
     if isinstance(source, Mapping):
-        where = f"{base}.properties.source"
+        where = f"{properties}.source"
         named.append((where, source))
         judged.append((where, source))
         if isinstance(source.get("connection"), Mapping):
             judged.append((f"{where}.connection", source["connection"]))
-    named.extend(engine_maps["source"])
-    judged.extend(engine_maps["source"])
+    extra = _map_at(props, _EXTRA_CONFIG)
+    if extra is not None:
+        where = _dotted(properties, _EXTRA_CONFIG)
+        groups.append(([(where, extra)], [(where, extra)]))
+        moving = {key: value for key, value in extra.items() if _moves_destination(str(key))}
+        if moving:
+            named.append((where, moving))
+            judged.append((where, moving))
     if named:
         groups.append((named, judged))
     sink_blocks: List[_Block] = []
     if isinstance(props.get("sink"), Mapping):
-        sink_blocks.append((f"{base}.properties.sink", props["sink"]))
+        sink_blocks.append((f"{properties}.sink", props["sink"]))
     # Every expose, not only the ones ``outputs`` names: a runner picks its own (``exposes[0]`` for
     # dlt, airbyte and meltano, the first Iceberg expose for the Kafka Connect and Debezium sinks, and
     # ``exposes[0]`` again when ``outputs`` names none that exists), so ``outputs`` is no promise of
@@ -1104,10 +1122,28 @@ def _blocks_of(contract: Mapping[str, Any], base: str, build: Mapping[str, Any])
         location = binding.get("location") if isinstance(binding, Mapping) else None
         if isinstance(location, Mapping):
             sink_blocks.append((f"exposes[{index}].binding.location", location))
-    sink_blocks.extend(engine_maps["sink"])
+    converters: List[_Block] = []
+    for side, path in _ENGINE_MAPS:
+        written = _map_at(props, path)
+        if written is None:
+            continue
+        label = _dotted(properties, path)
+        if side == "sink":
+            sink_blocks.append((label, written))
+            if path[0] == "kafka-connect":  # its sink config carries the converters' settings
+                reaches = {
+                    k: v for k, v in written.items() if str(k).lower().startswith(_CONVERTER_KEYS)
+                }
+                if reaches:
+                    converters.append((label, reaches))
+        else:
+            groups.append(([(label, written)], [(label, written)]))
     if sink_blocks:
         groups.append((list(sink_blocks), list(sink_blocks)))
-    groups.extend(([block], [block]) for block in engine_maps["own"])
+    registry = _map_at(props, _SCHEMA_REGISTRY)
+    if registry is not None:
+        label = _dotted(properties, _SCHEMA_REGISTRY)
+        groups.append(([(label, registry), *converters], [(label, registry)]))
     return groups
 
 
