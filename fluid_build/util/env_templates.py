@@ -1038,8 +1038,9 @@ def _builds_of(contract: Mapping[str, Any]) -> List[_Block]:
 #: writes, over the settings derived from the sink block and the exposes (Kafka Connect's
 #: ``sink_connector_config`` and ``iceberg_catalog_overrides``, which is forwarded last so that it
 #: wins, Debezium Server's ``sink.config``, Meltano's ``target_config``).
-#: ``own``: sent as it is, in place of anything derived, so judged on its own (Airbyte's
-#: ``destination_config``).
+#: ``own``: sent as it is, in place of anything derived, or a block that pairs an address with its own
+#: credentials, so judged on its own (Airbyte's ``destination_config``, Kafka Connect's
+#: ``schema_registry``, whose URL is copied into the source and the sink config).
 _ENGINE_MAPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("source", ("debezium", "extra_config")),
     ("sink", ("debezium", "server", "sink", "config")),
@@ -1047,6 +1048,7 @@ _ENGINE_MAPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("sink", ("kafka-connect", "iceberg_catalog_overrides")),
     ("sink", ("meltano", "target_config")),
     ("own", ("airbyte", "destination_config")),
+    ("own", ("kafka-connect", "schema_registry")),
 )
 
 
@@ -1065,6 +1067,14 @@ def _blocks_of(contract: Mapping[str, Any], base: str, build: Mapping[str, Any])
     engine_maps: Dict[str, List[_Block]] = {"source": [], "sink": [], "own": []}
     for side, path in _ENGINE_MAPS:
         written = _value_at(props, path)
+        if isinstance(written, (list, tuple)):
+            # A runner merges with ``dict.update``, which takes a list of key/value pairs as well
+            # (Debezium's ``extra_config``): judged as the map it makes. What is no list of pairs fails
+            # in the runner.
+            try:
+                written = dict(written)
+            except (TypeError, ValueError):
+                written = None
         if isinstance(written, Mapping):
             engine_maps[side].append((_dotted(f"{base}.properties", path), written))
     groups: List[_Group] = []
