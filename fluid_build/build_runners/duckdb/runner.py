@@ -621,6 +621,82 @@ def _build_copy_destination(
     return f"COPY ({{select}}) TO {quoted_path} ({options})"
 
 
+#: The reader that reads a sink format back, for the union rewrite of an appended file.
+_SINK_READERS = {
+    "parquet": "read_parquet",
+    "csv": "read_csv_auto",
+    "json": "read_json_auto",
+    "ndjson": "read_json_auto",
+}
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _fsync_path(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _appends_to_file(ctx: RunContext, out_path: str, fmt: str, partitioned: Any) -> bool:
+    """Whether this stream appends to a local single file that already holds rows.
+
+    Only ``incremental_append`` to one existing local file: a full refresh, a
+    partitioned table (it appends by new file), an object store and a staged
+    BigQuery/Databricks file keep writing as before.
+    """
+    return (
+        ctx.source.mode is AcquisitionMode.INCREMENTAL_APPEND
+        and partitioned is None
+        and (fmt or "parquet").lower() in _SINK_READERS
+        and not _is_remote_uri(out_path)
+        and _bigquery_target(ctx) is None
+        and not _is_databricks_binding(ctx)
+        and Path(out_path).is_file()
+    )
+
+
+def _union_rewrite(con: Any, out_path: str, fmt: str, new_relation: str) -> None:
+    """Rewrite ``out_path`` as its rows plus those of ``new_relation`` (a table or view).
+
+    DuckDB's ``COPY`` cannot append to one file, so the union goes to a temp file in
+    the same directory, is fsynced, then replaces the target atomically. A failure
+    leaves the previous file as it was and no temp file behind.
+    Pattern: temp file + fsync + os.replace, as python-atomicwrites; DuckDB COPY
+    cannot append to one file.
+    """
+    fmt = (fmt or "parquet").lower()
+    tmp = copy_tmp_path(out_path)  # the sibling the sandbox grants beside every landed file
+    _remove_quietly(tmp)
+    old = f"SELECT * FROM {_SINK_READERS[fmt]}({quote_ansi_string_literal(out_path)})"
+    union = f"{old} UNION ALL BY NAME SELECT * FROM {new_relation}"
+    try:
+        con.execute(_build_copy_destination(tmp, fmt).replace("{select}", union, 1))
+        _fsync_path(tmp)
+        os.replace(tmp, out_path)
+    except BaseException:
+        _remove_quietly(tmp)
+        raise
+
+
+def _append_to_file(con: Any, out_path: str, fmt: str, landed_sel: str) -> Tuple[int]:
+    """Append the rows of ``landed_sel`` to the existing file; returns ``(rows appended,)``."""
+    con.execute(f"CREATE OR REPLACE TEMP TABLE __fl_append_new AS {landed_sel}")
+    try:
+        count = first_row(con.execute("SELECT COUNT(*) FROM __fl_append_new"))
+        _union_rewrite(con, out_path, fmt, "__fl_append_new")
+        return (int(count[0]) if count else 0,)
+    finally:
+        con.execute("DROP TABLE IF EXISTS __fl_append_new")
+
+
 #: The file extension DuckDB gives a partition's files, by reader.
 _READER_EXT = {"read_parquet": "parquet", "read_csv_auto": "csv", "read_json_auto": "json"}
 
@@ -1264,7 +1340,15 @@ def _enforce_late_arrival_split(
             # the side-output file. Use COPY ... TO ... so duckdb
             # handles the format details.
             con.execute(f"COPY __la_main TO {quoted_main} ({writer_func})")
-            con.execute(f"COPY __la_side TO {quoted_late} ({writer_func})")
+            if (
+                ctx.source.mode is AcquisitionMode.INCREMENTAL_APPEND
+                and not _is_remote_uri(str(late_path_obj))
+                and late_path_obj.is_file()
+            ):
+                # An earlier run's late rows stay: this run's join them.
+                _union_rewrite(con, str(late_path_obj), fmt, "__la_side")
+            else:
+                con.execute(f"COPY __la_side TO {quoted_late} ({writer_func})")
             results[stream_name] = counts
             LOG.info(
                 "late_arrival_split: stream=%s on_time=%d late=%d side_output=%s",
@@ -1803,7 +1887,10 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                 # select re-reads the source, which a live database may have
                 # changed since, and a table holding exactly what the COPY
                 # wrote then failed verify against the larger number.
-                written = first_row(con.execute(copy_sql))
+                if _appends_to_file(ctx, out_path, sink_format, partitioned):
+                    written = _append_to_file(con, out_path, sink_format, landed_sel)
+                else:
+                    written = first_row(con.execute(copy_sql))
                 if partitioned is not None:
                     _refuse_null_partitions(con, ctx, out_path, partitioned, sink_format)
                 if written is not None and isinstance(written[0], int):

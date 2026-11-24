@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`incremental_append` to a single local file keeps every increment.** A run without partition
+  keys wrote its rows with a plain `COPY ... TO <file>`, which replaces the file, while the cursor
+  had already moved past the previous run's rows: after two runs the file held only the second
+  run's rows (parquet, csv and json alike). The run now writes the union of the file and its new
+  rows (`UNION ALL BY NAME`, so a new column is NULL-filled in the old rows) to a temp file in the
+  same directory, fsyncs it and replaces the target with `os.replace`; a failed write leaves the
+  previous file as it was and no temp file behind. The late-arrival side file
+  (`<stem>__late_events`) is unioned the same way, so it keeps every run's late rows, and a run
+  with no late rows leaves it alone. **Behaviour change:** each such run now reads and rewrites the
+  whole file (DuckDB has no single-file append); rows are appended again if the same source rows
+  are landed twice (no de-duplication).
 - **`--mode amend-and-build` lands each local SQL build in its own expose.** Every build was
   handed `exposes[0]`, so with two `engine: sql` builds the second overwrote the first build's
   file and its own expose was never written, exit 0. A build now writes the exposes its `outputs`
