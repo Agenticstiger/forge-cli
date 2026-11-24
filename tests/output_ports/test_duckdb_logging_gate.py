@@ -55,6 +55,7 @@ def _statements():
     # A statement given as text never shows the name it runs to a text check.
     out.append("SELECT * FROM query('SEL' || 'ECT * FROM enable_' || 'logging()')")
     out.append("SELECT * FROM query_table('duckdb_' || 'logs')")
+    out.append("SELECT * FROM histogram_values('duckdb_' || 'logs', 'type')")
     out.append("SELECT * FROM `query`('SEL' || 'ECT * FROM duckdb_' || 'logs')")
     out.append("SELECT write_log('x')")
     return out
@@ -100,7 +101,8 @@ def test_gate_still_accepts_an_ordinary_select(gate):
 def test_gate_accepts_a_column_that_only_shares_a_name(gate):
     call, _ = GATES[gate]
     call(
-        "SELECT enable_logging, disable_logging, query, write_log FROM analytics.events "
+        "SELECT enable_logging, disable_logging, query, write_log, histogram_values "
+        "FROM analytics.events "
         "WHERE enable_logging = 1"
     )
 

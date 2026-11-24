@@ -36,6 +36,9 @@ DUCKDB_REFUSED_FUNCTIONS = frozenset(
     {
         "disable_logging",
         "enable_logging",
+        # a built-in table macro over query_table (DuckDB 1.5 and 2.0): it reads
+        # any relation whose name is assembled at run time
+        "histogram_values",
         "json_execute_serialized_sql",
         "query",
         "query_table",
