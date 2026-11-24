@@ -52,8 +52,8 @@ class TestTargetFlagParsing:
 
     def test_target_default_is_none(self):
         """Default is None (not empty list) so run_async can distinguish
-        'user passed nothing' from 'user passed an empty list'. Falls back
-        to fluid-command-center when neither --target nor --catalog is set."""
+        'user passed nothing' from 'user passed an empty list'. Neither
+        --target nor --catalog is an error in run_async, not a default."""
         args = self._parser().parse_args(["publish", "x.yaml"])
         assert args.target is None
         assert args.catalog is None
@@ -240,14 +240,16 @@ class TestTargetResolution:
         names = {r["catalog_name"] for r in recorded}
         assert names == {"new-target", "old-catalog"}
 
-    def test_no_flags_falls_back_to_default(self):
+    def test_no_flags_publishes_nowhere(self):
+        """No --target and no --catalog is an error, not a Command Center
+        publish: nothing names the catalog that gets the operator's key.
+        ``tests/cli/test_publish_no_unasked_requests.py`` pins the no-request
+        side."""
         recorded = []
         args = self._make_args()  # no target, no catalog
         rc = self._run_and_capture(args, recorded)
-        assert rc == 0
-        # Falls back to fluid-command-center — preserves pre-pipeline
-        # default behavior so existing ``fluid publish X.yaml`` keeps working.
-        assert recorded[0]["catalog_name"] == "fluid-command-center"
+        assert rc == 1
+        assert recorded == []
 
 
 # ---------------------------------------------------------------------------
