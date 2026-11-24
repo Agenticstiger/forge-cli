@@ -39,6 +39,11 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cd "$work"
 FLUID="$VENV/bin/fluid"
+# The example's Lake Formation grants name {{ env.AWS_ACCOUNT_ID }} (its README says
+# to set it before validate, plan or apply). An unset or empty variable is an error in
+# every stage that renders a contract, so the pipeline gets a placeholder account
+# number: not a credential, and nothing here calls AWS.
+export AWS_ACCOUNT_ID=123456789012
 "$FLUID" validate "$CONTRACT"
 "$FLUID" plan "$CONTRACT" --out plan.json
 "$FLUID" bundle "$CONTRACT" --format tgz --out bundle.tgz
@@ -85,6 +90,12 @@ expect_once() { # expect_once <label> <wanted-rc> <needle> <command...>
   fi
   echo "ok: $label"
 }
+
+# The strict render needs no extra either: an unset variable stops the stage, names the
+# variable and writes nothing.
+expect "unset variable stops generate iac" 1 "AWS_ACCOUNT_ID" \
+  env -u AWS_ACCOUNT_ID "$FLUID" generate iac "$CONTRACT" --out iac-unset
+[ ! -e iac-unset ] || { echo "::error::generate iac wrote files with a variable unset"; exit 1; }
 
 expect "mcp serve" 1 "pip install 'data-product-forge[mcp]'" "$FLUID" mcp serve
 expect "scaffold-ide" 1 "pip install 'data-product-forge[mcp]'" \
